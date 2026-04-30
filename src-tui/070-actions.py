@@ -224,6 +224,75 @@ def _suspend(ctx):
     os.kill(os.getpid(), signal.SIGTSTP)
 
 
+def _select_toggle_down(ctx):
+    """Toggle selection of the cursor item, then move the cursor down.
+
+    The dispatcher gates this on ``requires='cursor'`` so we can assume
+    a normal-row cursor when called. After flipping membership in
+    ``state.selected`` we nudge the cursor like ``_nav_down`` does — the
+    common workflow in plan-tui is hold-space to mark a run of rows.
+    """
+    state = ctx._browser._state
+    item = ctx.cursor
+    if item is None:
+        return
+    if item.id in state.selected:
+        state.selected.discard(item.id)
+    else:
+        state.selected.add(item.id)
+    vis = visible_items(state)
+    if state.cursor < len(vis) - 1:
+        state.cursor += 1
+    ctx._browser._needs_redraw.add('list')
+    ctx._browser._needs_redraw.add('info')
+
+
+def _select_toggle_up(ctx):
+    """Toggle selection of the cursor item, then move the cursor up.
+
+    Symmetric to ``_select_toggle_down``; bound to ``alt-space`` so the
+    user can sweep selections in either direction without releasing the
+    modifier.
+    """
+    state = ctx._browser._state
+    item = ctx.cursor
+    if item is None:
+        return
+    if item.id in state.selected:
+        state.selected.discard(item.id)
+    else:
+        state.selected.add(item.id)
+    if state.cursor > 0:
+        state.cursor -= 1
+    ctx._browser._needs_redraw.add('list')
+    ctx._browser._needs_redraw.add('info')
+
+
+def _select_all_visible(ctx):
+    """Add every ``kind='normal'`` row in the visible list to the selection.
+
+    Placeholder rows (``kind='pending'``) and the synthetic scope-root row
+    are skipped — selecting a placeholder would smuggle the sentinel id
+    into the selection set and confuse downstream consumers.
+    """
+    state = ctx._browser._state
+    vis = visible_items(state)
+    for entry in vis:
+        if entry.kind == 'normal':
+            state.selected.add(entry.item.id)
+    ctx._browser._needs_redraw.add('list')
+    ctx._browser._needs_redraw.add('info')
+
+
+def _select_clear(ctx):
+    """Empty the selection set. No-op on an already-empty selection."""
+    state = ctx._browser._state
+    if state.selected:
+        state.selected.clear()
+        ctx._browser._needs_redraw.add('list')
+        ctx._browser._needs_redraw.add('info')
+
+
 def _search_start(ctx):
     """Enter search-text-entry mode."""
     ctx._browser._search_mode = True
@@ -267,6 +336,15 @@ def default_actions():
         Action('pgup',      'Page up',        _nav_pgup,        'none'),
         Action('right',     'Expand',         _nav_right,       'cursor'),
         Action('left',      'Collapse',       _nav_left,        'cursor'),
+        # Multi-select bindings. ``read_key`` returns ``'space'`` for the
+        # bare spacebar (special-cased in 020-terminal) but Alt+Space
+        # arrives as ESC + ' ' which the alt-prefix branch turns into the
+        # literal string ``'alt- '`` (alt-prefix + space character). Bind
+        # accordingly.
+        Action('space',     'Toggle select',  _select_toggle_down, 'cursor'),
+        Action('alt- ',     'Toggle select up', _select_toggle_up, 'cursor'),
+        Action('ctrl-a',    'Select all',     _select_all_visible, 'none'),
+        Action('ctrl-n',    'Deselect all',   _select_clear,       'none'),
         Action('ctrl-p',    'Toggle preview', _toggle_preview,  'none'),
         Action('ctrl-r',    'Reload',         _reload,          'none'),
         Action('ctrl-l',    'Redraw',         _redraw,          'none'),
