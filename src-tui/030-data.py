@@ -12,7 +12,16 @@ class Item:
     ``str(id)`` via ``__post_init__``), ``tag``, ``tag_style``,
     ``has_children``. Arbitrary extra attributes are permitted —
     ``Item`` is non-slotted by design so recipes can attach
-    domain-specific fields like ``size``, ``mtime``, ``path``.
+    domain-specific fields like ``size``, ``mtime``, ``path``. Those
+    extras survive across the full pipeline (rendering, search, action
+    env vars).
+
+    ``tag_style`` accepts one of ``'green'``, ``'red'``, ``'yellow'``,
+    ``'gray'``, ``'cyan'``, ``'blue'``, ``'magenta'``, ``'dim'`` — or
+    the empty string for no styling. Unknown names render as plain text.
+
+    ``has_children`` controls the ``▼/▶`` marker and whether expansion
+    is offered on the row.
     """
 
     id: Any
@@ -21,12 +30,12 @@ class Item:
     tag_style: str = ''
     has_children: bool = False
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if not self.title:
             self.title = str(self.id)
 
 
-def to_item(x):
+def to_item(x: Any) -> Item:
     """Coerce a flexible input shape into an ``Item``.
 
     Accepted shapes:

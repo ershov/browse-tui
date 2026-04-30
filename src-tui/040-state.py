@@ -6,7 +6,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable, Optional
 
 
 class Pending:
@@ -34,17 +34,19 @@ class Pending:
 
     __slots__ = ('_done', '_cancelled', '_chain')
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._done = False
         self._cancelled = False
-        self._chain = []
+        self._chain: list = []
 
     @property
     def done(self) -> bool:
+        """``True`` once the underlying op has resolved (or been resolved)."""
         return self._done
 
     @property
     def cancelled(self) -> bool:
+        """``True`` once :meth:`cancel` has been called."""
         return self._cancelled
 
     def cancel(self) -> None:
@@ -61,7 +63,17 @@ class Pending:
         # Drop queued callbacks eagerly so they cannot leak references.
         self._chain.clear()
 
-    def then(self, callback) -> 'Pending':
+    def then(self, callback: Callable[[], None]) -> 'Pending':
+        """Append ``callback`` to the resolve chain.
+
+        If the Pending is already resolved, ``callback`` runs synchronously
+        inside ``then()``. If cancelled, ``then()`` is a no-op (still
+        returns self for ergonomics — chains can be built before or after
+        ``cancel`` without branching).
+
+        Callbacks always run on the main thread, after the worker's
+        result has been applied to the cache.
+        """
         if self._cancelled:
             # Silently no-op. Returning self preserves chain ergonomics:
             # ``p.then(a).then(b)`` keeps working even after cancel.
@@ -550,19 +562,62 @@ class Browser:
     """
 
     def __init__(self, *,
-                 title='browse-tui',
-                 get_children=None,
-                 get_preview=None,
-                 actions=None,
-                 on_enter=None,
-                 format_item=None,
-                 root_id=None,
-                 initial_scope=None,
-                 show_preview=True,
-                 show_children_pane=True,
-                 multi_select=True,
-                 print_format='{id}',
-                 _headless=False):
+                 title: str = 'browse-tui',
+                 get_children: Optional[Callable[[Any], Any]] = None,
+                 get_preview: Optional[Callable[[Any], Optional[str]]] = None,
+                 actions: Optional[list] = None,
+                 on_enter: Any = None,
+                 format_item: Optional[Callable] = None,
+                 root_id: Any = None,
+                 initial_scope: Any = None,
+                 show_preview: bool = True,
+                 show_children_pane: bool = True,
+                 multi_select: bool = True,
+                 print_format: str = '{id}',
+                 _headless: bool = False) -> None:
+        """Construct a Browser.
+
+        All keyword arguments are optional; sensible defaults yield a
+        Browser that displays nothing (empty ``get_children``) but still
+        boots cleanly for tests and smoke checks.
+
+        Args:
+            title: Window title shown in the header bar.
+            get_children: ``(parent_id) -> Iterable[Item|str|tuple|dict]``
+                Called per parent-being-expanded on a worker thread.
+                Returned values are coerced via :func:`to_item`. Errors
+                raised here are caught at the worker boundary: the
+                parent's children become ``[]``, the error is surfaced
+                via the info bar, and any ``Pending`` waiting on the
+                fetch still resolves.
+            get_preview: ``(item_id) -> str | None`` Optional preview
+                callback; runs on a worker thread with latest-wins
+                coalescing. ``None`` from the callback is treated as
+                ``''``. Errors are rendered as
+                ``[error] ExceptionName: message``.
+            actions: List of :class:`Action` keybindings registered at
+                construction. User-supplied actions override defaults
+                bound to the same key.
+            on_enter: What pressing ``Enter`` (outside search mode) does.
+                ``None`` / ``'print-exit'`` formats ``ctx.targets`` via
+                ``print_format`` and exits 0; ``'action:KEY'`` runs the
+                bound action; ``'noop'`` does nothing; a callable is
+                invoked with the Context.
+            format_item: Optional ``(item, ctx) -> [(text, fg, bold)…]``
+                hook overriding the default per-row layout.
+            root_id: Initial id passed to the first ``get_children``
+                call. ``None`` is the default.
+            initial_scope: If set, pushed onto ``scope_stack`` at
+                construction so the UI starts inside that scope.
+            show_preview: Whether the preview pane starts visible.
+            show_children_pane: Whether the children-grid pane starts
+                visible.
+            multi_select: Whether multi-selection is enabled. Phase 1
+                stores this opaquely; the action layer reads it.
+            print_format: ``str.format``-style template applied to each
+                target when ``on_enter`` resolves to print-exit.
+            _headless: Skip terminal init/teardown — used by tests.
+        """
         # --- user-supplied data callbacks -------------------------------
         # Default get_children to "no children" so a Browser constructed
         # with no kwargs still works (tests, smoke checks). get_preview
@@ -694,7 +749,7 @@ class Browser:
 
     # ---- action registration -------------------------------------------
 
-    def add_action(self, action) -> None:
+    def add_action(self, action: 'Action') -> None:
         """Register a custom Action.
 
         If an existing entry (built-in or earlier custom) binds the
@@ -709,7 +764,8 @@ class Browser:
 
     # ---- public, thread-safe API ---------------------------------------
 
-    def refresh(self, id=None, on_complete=None) -> 'Pending':
+    def refresh(self, id: Any = None,
+                on_complete: Optional[Callable[[], None]] = None) -> 'Pending':
         """Schedule a refetch of one parent's children (or the full root).
 
         Returns a Pending that resolves on the main thread once the worker
@@ -727,7 +783,7 @@ class Browser:
         self.post(lambda: self._do_refresh(id, pending))
         return pending
 
-    def post(self, fn) -> None:
+    def post(self, fn: Callable[[], None]) -> None:
         """Schedule ``fn`` to run on the main thread on the next drain.
 
         The callable runs with no arguments and its return value is
@@ -739,7 +795,7 @@ class Browser:
         self._main_queue.put(fn)
         notify_wake()
 
-    def message(self, text) -> None:
+    def message(self, text: str) -> None:
         """Surface ``text`` as a transient status message.
 
         Stored on Browser; the renderer in ticket #10 picks it up. Safe
@@ -748,19 +804,22 @@ class Browser:
         """
         self.post(lambda: setattr(self, '_message_text', text))
 
-    def error(self, text) -> None:
+    def error(self, text: str) -> None:
         """Surface ``text`` as an error message. Same lane as ``message``."""
         self.post(lambda: setattr(self, '_error_text', text))
 
     @property
     def error_text(self) -> str:
+        """Most recent error message surfaced via :meth:`error`."""
         return self._error_text
 
     @property
     def message_text(self) -> str:
+        """Most recent transient status message surfaced via :meth:`message`."""
         return self._message_text
 
-    def cursor_to(self, id, on_complete=None) -> 'Pending':
+    def cursor_to(self, id: Any,
+                  on_complete: Optional[Callable[[], None]] = None) -> 'Pending':
         """Move cursor to the item with the given id, expanding ancestors as needed.
 
         Asynchronous because we may need to fetch ancestor children. The
@@ -776,7 +835,8 @@ class Browser:
         self.post(lambda: self._do_cursor_to(id, pending))
         return pending
 
-    def expand(self, id, on_complete=None) -> 'Pending':
+    def expand(self, id: Any,
+               on_complete: Optional[Callable[[], None]] = None) -> 'Pending':
         """Add ``id`` to expanded; trigger fetch if not cached.
 
         Pending resolves when children are cached (or immediately on the
@@ -788,7 +848,7 @@ class Browser:
         self.post(lambda: self._do_expand(id, pending))
         return pending
 
-    def cancel(self, *pendings) -> None:
+    def cancel(self, *pendings: 'Pending') -> None:
         """Mark one or more Pendings cancelled (sugar for ``p.cancel()``).
 
         Idempotent on already-cancelled or already-resolved Pendings.
@@ -800,7 +860,7 @@ class Browser:
         for p in pendings:
             p.cancel()
 
-    def select(self, ids, replace=False) -> None:
+    def select(self, ids, replace: bool = False) -> None:
         """Add ``ids`` to ``selected`` (or replace existing selection if ``replace``).
 
         Thread-safe; the actual mutation runs on the main thread so the
@@ -812,7 +872,7 @@ class Browser:
         ids_list = list(ids)
         self.post(lambda: self._do_select(ids_list, replace))
 
-    def quit(self, code=0, output='') -> None:
+    def quit(self, code: int = 0, output: str = '') -> None:
         """Request the main loop to exit with the given exit code.
 
         Thread-safe. Phase 1 stores ``_quit_requested``/``_quit_code``/
@@ -821,7 +881,8 @@ class Browser:
         """
         self.post(lambda: self._do_quit(code, output))
 
-    def watch(self, callback, interval=None) -> threading.Thread:
+    def watch(self, callback: Callable[['Browser'], None],
+              interval: Optional[float] = None) -> threading.Thread:
         """Spawn a daemon thread that calls ``callback(self)`` repeatedly.
 
         If ``interval`` is set, sleep ``interval`` seconds between calls.
@@ -1187,7 +1248,7 @@ class Browser:
 
     # ---- internal: preview request slot ---------------------------------
 
-    def request_preview(self, id_) -> None:
+    def request_preview(self, id_: Any) -> None:
         """Set the latest-wins preview request slot.
 
         Called on the main thread (typically by cursor-move handlers in
@@ -1368,7 +1429,8 @@ class Browser:
     # ---- eager adapter -------------------------------------------------
 
     @classmethod
-    def from_flat_tree(cls, rows, *, root_id=None, **browser_kwargs):
+    def from_flat_tree(cls, rows, *, root_id: Any = None,
+                       **browser_kwargs) -> 'Browser':
         """Build a Browser whose ``_children`` cache is pre-populated from ``rows``.
 
         Each row may be ``Item``, ``str``, ``tuple``, or ``dict`` (per

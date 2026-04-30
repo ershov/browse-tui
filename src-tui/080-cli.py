@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from typing import Optional
 
 
 # ---- parsers --------------------------------------------------------------
@@ -27,7 +28,7 @@ _TRUTHY = {'1', 'true', 'yes', 'y', 'on'}
 _FALSY = {'0', 'false', 'no', 'n', 'off', ''}
 
 
-def coerce_has_children(raw):
+def coerce_has_children(raw) -> bool:
     """Coerce a string/None/bool to bool for the has_children field.
 
     Truthy: ``'1'``, ``'true'``, ``'yes'``, ``'y'``, ``'on'``
@@ -323,7 +324,8 @@ def parse_match(data, record_sep=b'\n', *, pattern, strict=False):
         yield _coerce_dict(d)
 
 
-def parse_input(data, *, fmt, fields=None, record_sep=b'\n', strict=False):
+def parse_input(data: bytes, *, fmt: str, fields=None,
+                record_sep: bytes = b'\n', strict: bool = False):
     """Parse raw bytes into an iterator of candidate Item-kwargs dicts.
 
     ``fmt``        — ``'tsv'`` | ``'csv'`` | ``'json'`` | ``'json-array'``
@@ -412,7 +414,7 @@ def _validate_input_format(value):
     )
 
 
-def build_argparser():
+def build_argparser() -> argparse.ArgumentParser:
     """Construct the argparse parser for the CLI surface.
 
     ``add_help=False`` — we manage ``-h``/``--help`` by hand because the
@@ -480,7 +482,7 @@ def build_argparser():
     return p
 
 
-def parse_args(argv):
+def parse_args(argv: list) -> tuple:
     """Parse ``argv`` (list[str], excluding program name).
 
     Returns ``(args, extras)``: ``args`` is the namespace; ``extras`` is
@@ -635,7 +637,7 @@ def run_action_cmd(cmd, item, *,
 # ---- --action 'KEY:LABEL:CMD' parsing -------------------------------------
 
 
-def parse_action_spec(spec):
+def parse_action_spec(spec: str) -> tuple:
     """Parse ``'KEY:LABEL:CMD'`` into ``(key, label, cmd)``.
 
     Splits on the first two colons only — the CMD may itself contain
@@ -649,7 +651,8 @@ def parse_action_spec(spec):
     return parts[0], parts[1], parts[2]
 
 
-def make_cli_action(spec, *, bin_path=None, timeout=600.0):
+def make_cli_action(spec: str, *, bin_path=None,
+                    timeout: float = 600.0) -> 'Action':
     """Build an ``Action`` whose handler runs the CLI-supplied bash CMD.
 
     Action runs only when ``ctx.targets`` is non-empty (gate
@@ -713,7 +716,7 @@ def _install_path(target):
     raise SystemExit(f'unknown install target: {target!r}')
 
 
-def cmd_install(target, force=False):
+def cmd_install(target: str, force: bool = False) -> int:
     """Install (copy) the running binary to the target path.
 
     Returns 0 on success or no-op (already-installed identical binary),
@@ -751,7 +754,7 @@ def cmd_install(target, force=False):
     return 0
 
 
-def cmd_uninstall(target):
+def cmd_uninstall(target: str) -> int:
     """Remove the installed binary at ``target``. Returns exit code."""
     dst = _install_path(target)
     if not os.path.exists(dst):
@@ -768,7 +771,7 @@ def cmd_uninstall(target):
 # ---- --python loader ------------------------------------------------------
 
 
-def cmd_python(script, extras, *, version=None):
+def cmd_python(script: str, extras: list, *, version: Optional[str] = None) -> int:
     """Run a Python recipe with the running binary self-injected as ``browse_tui``.
 
     The recipe imports ``from browse_tui import Browser, Item, Action`` and
@@ -848,9 +851,8 @@ def _build_lazy_browser(args, fields, record_sep):
             proc.stdout, fmt=fmt, fields=fields, record_sep=record_sep,
         ))
 
-    get_preview = None
     if preview_cmd:
-        def get_preview(item_id):
+        def _get_preview(item_id):
             env = {**os.environ, 'TUI_ID': str(item_id) if item_id is not None else ''}
             try:
                 proc = subprocess.run(
@@ -863,6 +865,9 @@ def _build_lazy_browser(args, fields, record_sep):
             except Exception as e:
                 return f'[error] {type(e).__name__}: {e}'
             return proc.stdout.decode('utf-8', errors='replace')
+        get_preview = _get_preview
+    else:
+        get_preview = None
 
     return Browser(
         title=args.title,
@@ -973,7 +978,7 @@ def run_tui(args):
 # ---- top-level entry point ------------------------------------------------
 
 
-def main(argv=None):
+def main(argv=None) -> int:
     """Top-level dispatcher: parse argv, route to the right mode, return rc."""
     if argv is None:
         argv = sys.argv[1:]
@@ -982,6 +987,12 @@ def main(argv=None):
 
     if args.help:
         build_argparser().print_help()
+        print()
+        print('Default keybindings (from the in-app help screen):')
+        print()
+        # _HELP_TEXT is defined in 050-render.py — accessible here in the
+        # concatenated build's unified namespace.
+        print(_HELP_TEXT)
         return 0
     if args.version:
         print(__version__)

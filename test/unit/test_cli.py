@@ -249,6 +249,32 @@ class TestInstallDryRun(unittest.TestCase):
         self.assertIn('already installed', buf.getvalue())
 
 
+class TestHelpOutput(unittest.TestCase):
+    """``--help`` includes the in-app keybindings reference."""
+
+    def test_help_includes_keybindings(self):
+        # Run the concatenated build directly so _HELP_TEXT (defined in
+        # 050-render.py) is in scope alongside the CLI dispatcher.
+        import subprocess
+        root = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        )
+        binary = os.path.join(root, 'browse-tui')
+        if not os.path.exists(binary):
+            self.skipTest('browse-tui binary not built (run ./build-tui.sh)')
+        proc = subprocess.run(
+            [binary, '--help'],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn('Default keybindings', proc.stdout)
+        # Spot-check a couple of well-known bindings show up.
+        self.assertIn('NAVIGATION', proc.stdout)
+        self.assertIn('Quit', proc.stdout)
+
+
 class TestPythonLoader(unittest.TestCase):
     """``cmd_python`` self-injects the module as ``browse_tui`` and runs the script."""
 

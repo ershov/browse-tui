@@ -10,15 +10,16 @@ split is deliberate:
   keys synchronously or suspend the terminal to launch external
   processes; they are *not* safe to call from a worker thread.
 
-Phase 1 affordances exposed on Context: ``cursor``, ``selected``,
-``targets``, plus pass-through versions of ``refresh / cursor_to /
-expand / select / message / error / quit`` and the main-thread sub-flows
-listed above. ``pick`` and ``insert`` are deferred to phase 2 (#20, #21).
+Affordances exposed on Context: ``cursor``, ``selected``, ``targets``,
+plus pass-through versions of ``refresh / cursor_to / expand / select /
+message / error / quit`` and the main-thread sub-flows ``run_external``,
+``page``, ``input``, ``confirm``, ``pick``, ``insert``.
 """
 
 import os
 import shutil
 import subprocess
+from typing import Any, Callable, Optional
 
 
 class Context:
@@ -30,13 +31,13 @@ class Context:
     main-thread-aware affordances.
     """
 
-    def __init__(self, browser):
+    def __init__(self, browser) -> None:
         self._browser = browser
 
     # ---- selection helpers --------------------------------------------
 
     @property
-    def cursor(self):
+    def cursor(self) -> Optional['Item']:
         """Return the Item under the cursor, or None.
 
         ``None`` when the visible list is empty *or* when the row under
@@ -53,7 +54,7 @@ class Context:
         return None
 
     @property
-    def selected(self):
+    def selected(self) -> list:
         """Return the list of Items currently in ``state.selected``.
 
         Walks the visible list first (cheapest) then the cached
@@ -78,7 +79,7 @@ class Context:
         return result
 
     @property
-    def targets(self):
+    def targets(self) -> list:
         """``selected`` if non-empty, else ``[cursor]`` if any, else ``[]``.
 
         Most actions operate on this — ``ctx.selected or [ctx.cursor]``
@@ -99,31 +100,47 @@ class Context:
     # later (e.g. routing through a different queue) only needs editing
     # one place.
 
-    def refresh(self, id=None, on_complete=None):
-        """Refetch one parent's children, or the full root if ``id`` is None."""
+    def refresh(self, id: Any = None,
+                on_complete: Optional[Callable[[], None]] = None) -> 'Pending':
+        """Refetch one parent's children, or the full root if ``id`` is None.
+
+        Returns a :class:`Pending` that resolves once the worker has
+        delivered the new children list. Safe to call from any thread.
+        """
         return self._browser.refresh(id, on_complete)
 
-    def cursor_to(self, id, on_complete=None):
-        """Move the cursor onto the item with ``id``."""
+    def cursor_to(self, id: Any,
+                  on_complete: Optional[Callable[[], None]] = None) -> 'Pending':
+        """Move the cursor onto the item with ``id``.
+
+        Returns a :class:`Pending` that resolves once the cursor is
+        positioned. Best-effort for ids not currently visible — see
+        :meth:`Browser.cursor_to`.
+        """
         return self._browser.cursor_to(id, on_complete)
 
-    def expand(self, id, on_complete=None):
-        """Expand and fetch the children of ``id``."""
+    def expand(self, id: Any,
+               on_complete: Optional[Callable[[], None]] = None) -> 'Pending':
+        """Expand and fetch the children of ``id``.
+
+        Returns a :class:`Pending` that resolves once children are
+        cached (or immediately if already cached).
+        """
         return self._browser.expand(id, on_complete)
 
-    def select(self, ids, replace=False):
+    def select(self, ids, replace: bool = False) -> None:
         """Add ``ids`` to the selection set (or replace it)."""
         return self._browser.select(ids, replace)
 
-    def message(self, text):
+    def message(self, text: str) -> None:
         """Surface ``text`` as a transient status message."""
         self._browser.message(text)
 
-    def error(self, text):
+    def error(self, text: str) -> None:
         """Surface ``text`` as an error message."""
         self._browser.error(text)
 
-    def quit(self, code=0, output=''):
+    def quit(self, code: int = 0, output: str = '') -> None:
         """Request the main loop to exit with ``code`` and stdout ``output``."""
         self._browser.quit(code, output)
 
@@ -160,7 +177,7 @@ class Context:
                 term_resume()
             self._browser._needs_redraw.add('all')
 
-    def page(self, text, lang=''):
+    def page(self, text: str, lang: str = '') -> None:
         """Pipe ``text`` into bat/batcat/less, suspending the terminal first.
 
         Detects bat or batcat in PATH; falls back to ``$PAGER`` (or
@@ -200,7 +217,7 @@ class Context:
                 term_resume()
             self._browser._needs_redraw.add('all')
 
-    def input(self, prompt, default=''):
+    def input(self, prompt: str, default: str = '') -> Optional[str]:
         """Read a single-line string from the user on the info bar.
 
         Returns the text typed (empty string if the user just hit
@@ -215,7 +232,7 @@ class Context:
             return default
         return _read_line_on_info_bar(self._browser, prompt, default)
 
-    def confirm(self, prompt):
+    def confirm(self, prompt: str) -> bool:
         """Show ``prompt`` and read y/n on the info bar.
 
         Returns ``True`` for ``y``/``Y``, ``False`` for ``n``/``N`` or
@@ -226,7 +243,8 @@ class Context:
             return False
         return _confirm_on_info_bar(self._browser, prompt)
 
-    def insert(self, label, on_confirm):
+    def insert(self, label: str,
+               on_confirm: Callable[[str, Any], None]) -> None:
         """Enter insert mode for placing a new item. (ticket #21)
 
         The user moves a placement marker through the visible tree:
@@ -279,7 +297,7 @@ class Context:
         self._browser._insert_callback = on_confirm
         self._browser._needs_redraw.add('all')
 
-    def pick(self, label, options):
+    def pick(self, label: str, options) -> Optional[str]:
         """fzf-style filterable picker overlaid on the preview pane.
 
         Renders a ``label> `` prompt on the info bar and the filtered

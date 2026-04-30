@@ -31,21 +31,24 @@ class Action:
       * ``key``: key name as produced by ``020-terminal.read_key`` —
         e.g. ``'e'``, ``'ctrl-r'``, ``'alt-down'``, ``'shift-enter'``.
       * ``label``: short text used in help screens and the info-bar
-        hints in phase 2.
+        hints.
       * ``handler``: callable taking a single ``Context`` argument; run
         when the key is pressed in normal mode (i.e. not in search-mode
         text-entry).
       * ``requires``: precondition gate. The dispatcher silently skips
         handlers whose precondition is unmet:
-          - ``'none'``     — always callable (default).
-          - ``'cursor'``   — ``ctx.cursor`` must be non-None.
+          - ``'none'``      — always callable (default).
+          - ``'cursor'``    — ``ctx.cursor`` must be non-None.
           - ``'selection'`` — ``ctx.selected`` must be non-empty.
-          - ``'targets'`` — either selection or cursor (most common).
+          - ``'targets'``   — either selection or cursor is non-empty.
+
+    An unknown ``requires`` value behaves like ``'none'`` so a typo
+    doesn't silently disable the action.
     """
 
     key: str
     label: str = ''
-    handler: Optional[Callable] = None
+    handler: Optional[Callable[['Context'], None]] = None
     requires: str = 'none'
 
 
@@ -540,7 +543,7 @@ def _preview_page_up(ctx):
 # ---- default keybindings list ---------------------------------------------
 
 
-def default_actions():
+def default_actions() -> list:
     """Return the list of default Action objects (built-in keybindings).
 
     Returned fresh on each call so tests can mutate the list without
@@ -600,7 +603,7 @@ def default_actions():
 # ---- dispatch --------------------------------------------------------------
 
 
-def build_keymap(browser):
+def build_keymap(browser) -> dict:
     """Return ``dict[key, Action]`` — defaults overridden by ``browser.actions``.
 
     Custom user actions take precedence over defaults: if a recipe binds
@@ -617,7 +620,7 @@ def build_keymap(browser):
     return keymap
 
 
-def dispatch_key(browser, ctx, key) -> bool:
+def dispatch_key(browser, ctx: 'Context', key: str) -> bool:
     """Dispatch ``key`` to the matching action; return True if handled.
 
     Search-mode (``browser._search_mode is True``) intercepts most keys:
@@ -701,7 +704,7 @@ def dispatch_key(browser, ctx, key) -> bool:
     return False
 
 
-def _handle_insert_key(browser, ctx, key) -> bool:
+def _handle_insert_key(browser, ctx: 'Context', key: str) -> bool:
     """Dispatch one keypress while ``browser._insert_mode`` is True.
 
     Mirrors plan-tui's ``_handle_insert_key`` (plan-source/src-tui/
