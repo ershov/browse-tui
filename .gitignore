@@ -1,0 +1,4 @@
+browse-tui
+*.pyc
+__pycache__/
+.PLAN.md.bak
