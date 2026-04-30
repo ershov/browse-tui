@@ -59,6 +59,13 @@ _MARKER_COLOR = 4   # blue for the ▼/▶ expand glyph
 _PENDING_FG = 242   # dim for the ⧗ loading… placeholder
 _SCOPE_ROOT_FG = None   # default fg, bolded by the segment's bold=True
 
+# Insert-mode marker — sentinel id used by the synthetic ``VisibleEntry``
+# injected into the rendered list when ``browser._insert_mode`` is True.
+# We use ``object()`` so the sentinel never equals any user-supplied id
+# (mirrors ``_PENDING_PLACEHOLDER_ID`` in 040-state.py). plan-tui used
+# ``id == -1`` for the same purpose.
+_INSERT_MARKER_ID = object()
+
 
 # ---------------------------------------------------------------------------
 # Pure helpers — unit-testable, no terminal I/O
@@ -534,6 +541,11 @@ def render_list(browser, top, height, cols):
     Reads cursor / selected / expanded / scope state from
     ``browser._state`` via ``visible_items``. Maintains
     ``browser._list_scroll`` to keep the cursor on-screen.
+
+    When ``browser._insert_mode`` is True, injects a synthetic
+    ``-- {label} --`` marker row at ``browser._insert_pos`` and
+    treats the marker as the cursor row (so scroll-tracking keeps it
+    on-screen as the user moves it).
     """
     if height <= 0:
         return
@@ -541,6 +553,30 @@ def render_list(browser, top, height, cols):
     state = browser._state
     visible = visible_items(state)
     cursor_pos = state.cursor
+
+    # Insert-mode: inject a synthetic marker row at insert_pos and pin
+    # the on-screen "cursor" to it so scroll tracking follows the
+    # marker, not the underlying real cursor.
+    if browser._insert_mode:
+        marker_item = Item(
+            id=_INSERT_MARKER_ID,
+            title=' -- {} -- '.format(browser._insert_label or 'here'),
+        )
+        marker_entry = VisibleEntry(
+            item=marker_item,
+            depth=browser._insert_depth,
+            kind='insert_marker',
+        )
+        # Copy so we don't mutate the cached list (visible_items
+        # returns the cached object identity-stable).
+        visible = list(visible)
+        pos = browser._insert_pos
+        if pos < 0:
+            pos = 0
+        if pos > len(visible):
+            pos = len(visible)
+        visible.insert(pos, marker_entry)
+        cursor_pos = pos
 
     # Adjust scroll offset to keep the cursor on-screen.
     scroll = browser._list_scroll
@@ -574,6 +610,23 @@ def render_list(browser, top, height, cols):
         is_selected = (
             entry.kind == 'normal' and item.id in state.selected
         )
+
+        # Insert-mode marker — render distinctively (yellow on blue,
+        # bold) and skip the regular segment / cursor / search logic
+        # entirely. Mirrors plan-tui's _id == -1 branch.
+        if entry.kind == 'insert_marker':
+            rel_depth = entry.depth - base_depth
+            if rel_depth < 0:
+                rel_depth = 0
+            line = '  ' + '  ' * rel_depth + '  # ' + item.title
+            if len(line) > cols:
+                line = line[:cols]
+            set_style(fg=11, bg=4, bold=True)
+            write(line)
+            if len(line) < cols:
+                write(' ' * (cols - len(line)))
+            reset_style()
+            continue
 
         segments = format_item_segments(
             item,

@@ -516,6 +516,204 @@ def dispatch_key(browser, ctx, key) -> bool:
     return False
 
 
+def _handle_insert_key(browser, ctx, key) -> bool:
+    """Dispatch one keypress while ``browser._insert_mode`` is True.
+
+    Mirrors plan-tui's ``_handle_insert_key`` (plan-source/src-tui/
+    070-main.py:98-249). The marker moves through the visible list with
+    j/k/up/down, jumps with home/end/pgup/pgdn, indents with right,
+    outdents with left, confirms with enter, cancels with esc/ctrl-c/q.
+
+    Returns ``True`` always (the insert-mode loop swallows every key —
+    even unhandled ones — so the regular dispatcher doesn't see them).
+
+    plan-tui's version forwards unhandled keys back to the normal-mode
+    handler so e.g. ``alt-down`` (scope-in) still works during insert
+    mode. browse-tui takes the conservative path: ignore unhandled keys
+    inside insert mode. Recipes that want richer behaviour can extend
+    via the standard action surface once they exit insert mode.
+    """
+    state = browser._state
+    vis = visible_items(state)
+    max_pos = len(vis)
+    # min_pos = 1 always — gap 0 sits above the first row, which is the
+    # scope_root row when scoped (and a regular row otherwise). Either
+    # way the marker starts at gap 1 and never goes lower.
+    min_pos = 1
+
+    def _set_pos(new_pos):
+        # Clamp + auto-depth + flag list redraw. Used by every movement
+        # key. Captures `vis` from the enclosing scope so a single call
+        # site keeps the contract single-sourced.
+        if new_pos < min_pos:
+            new_pos = min_pos
+        if new_pos > max_pos:
+            new_pos = max_pos
+        browser._insert_pos = new_pos
+        browser._insert_depth = auto_insert_depth(new_pos, vis)
+        browser._needs_redraw.add('list')
+
+    if key in ('j', 'down'):
+        if browser._insert_pos < max_pos:
+            _set_pos(browser._insert_pos + 1)
+        return True
+    if key in ('k', 'up'):
+        if browser._insert_pos > min_pos:
+            _set_pos(browser._insert_pos - 1)
+        return True
+    if key in ('g', 'home'):
+        _set_pos(min_pos)
+        return True
+    if key in ('G', 'end'):
+        _set_pos(max_pos)
+        return True
+    if key == 'pgdn':
+        # Page size = list-pane height; fall back to a sensible default
+        # in headless contexts where the layout helpers aren't wired.
+        page = _list_pane_height(browser)
+        _set_pos(browser._insert_pos + page)
+        return True
+    if key == 'pgup':
+        page = _list_pane_height(browser)
+        _set_pos(browser._insert_pos - page)
+        return True
+    if key == 'right':
+        # Indent: make the marker a child of the row above. If that row
+        # has not-yet-expanded children, expand them first so they
+        # become visible to the marker walk.
+        pos = browser._insert_pos
+        if 0 < pos <= len(vis):
+            above = vis[pos - 1]
+            if (above.kind == 'normal'
+                    and browser._insert_depth <= above.depth):
+                if (above.item.has_children
+                        and above.item.id not in state.expanded):
+                    state.expanded.add(above.item.id)
+                    mark_visible_dirty(state)
+                    # Refresh the visible list and find above's new index;
+                    # position the marker right after it so it lands at
+                    # the start of the now-revealed subtree.
+                    new_vis = visible_items(state)
+                    for idx, e in enumerate(new_vis):
+                        if (e.kind == 'normal'
+                                and e.item.id == above.item.id):
+                            browser._insert_pos = idx + 1
+                            break
+                    browser._insert_depth = above.depth + 1
+                    browser._needs_redraw.add('all')
+                    return True
+                browser._insert_depth = above.depth + 1
+                browser._needs_redraw.add('all')
+        return True
+    if key == 'left':
+        # First case: the row directly *below* the marker is at the
+        # marker's depth, has children, and is expanded → collapse it
+        # (mirrors nav-mode left-collapses-current-row).
+        pos = browser._insert_pos
+        depth = browser._insert_depth
+        if pos < len(vis):
+            after = vis[pos]
+            if (after.kind == 'normal'
+                    and after.depth == depth
+                    and after.item.has_children
+                    and after.item.id in state.expanded):
+                state.expanded.discard(after.item.id)
+                mark_visible_dirty(state)
+                # Re-derive the visible list size — collapsing may have
+                # cut rows below us; clamp insert_pos.
+                new_vis = visible_items(state)
+                if browser._insert_pos > len(new_vis):
+                    browser._insert_pos = max(min_pos, len(new_vis))
+                browser._needs_redraw.add('all')
+                return True
+        # Second case: outdent and reposition before the parent. We use
+        # base = base depth of the current scope. visible_items emits
+        # the scope_root at depth 0 when scoped, so children start at
+        # depth 1 → base = 1; otherwise base = 0.
+        base = 1 if state.scope_stack else 0
+        if depth > base:
+            new_depth = depth - 1
+            # Find the parent row at new_depth by walking back.
+            parent_idx = None
+            for p in range(pos - 1, -1, -1):
+                if vis[p].depth == new_depth:
+                    parent_idx = p
+                    break
+                if vis[p].depth < new_depth:
+                    break
+            if parent_idx is not None:
+                # Already after all children of the parent? If so, slide
+                # the marker to after the entire subtree (otherwise jump
+                # before the parent row).
+                after_last_child = True
+                for s in range(pos, len(vis)):
+                    if vis[s].depth <= new_depth:
+                        break
+                    if vis[s].depth == depth:
+                        after_last_child = False
+                        break
+                if after_last_child:
+                    sub_end = parent_idx + 1
+                    for s in range(parent_idx + 1, len(vis)):
+                        if vis[s].depth > new_depth:
+                            sub_end = s + 1
+                        else:
+                            break
+                    browser._insert_pos = sub_end
+                else:
+                    browser._insert_pos = parent_idx
+            browser._insert_depth = new_depth
+            browser._needs_redraw.add('list')
+        return True
+    if key == 'enter':
+        relation, dest_id = resolve_insert(
+            browser._insert_pos, browser._insert_depth, vis,
+            scope_root_id=current_scope(state),
+        )
+        cb = browser._insert_callback
+        browser._insert_mode = False
+        browser._insert_callback = None
+        browser._needs_redraw.add('all')
+        if relation is not None and dest_id is not None and cb is not None:
+            cb(relation, dest_id)
+        return True
+    if key in ('esc', 'ctrl-c', 'q'):
+        browser._insert_mode = False
+        browser._insert_callback = None
+        browser._needs_redraw.add('all')
+        return True
+    if key == '_notify':
+        browser.drain_main_queue()
+        browser.apply_children_results()
+        browser.apply_preview_result()
+        return True
+    # Unhandled — swallow silently. plan-tui forwards to the normal-mode
+    # handler here; phase-2 simplification is to ignore. Recipes that
+    # want extended insert-mode bindings can layer them in a later phase.
+    return True
+
+
+def _list_pane_height(browser):
+    """Compute the list-pane height for pgup/pgdn jumps.
+
+    Headless / unwired test contexts fall back to ``_PAGE_ROWS`` (the
+    same default the regular nav handlers use). In production we read
+    the geometry from ``layout_panes`` so the page jump matches the
+    visible viewport exactly.
+    """
+    try:
+        cols, rows = term_size()
+        layout = layout_panes(
+            cols, rows,
+            show_preview=browser.show_preview,
+            show_children_pane=browser.show_children_pane,
+        )
+        h = layout['list_height']
+        return h if h > 0 else _PAGE_ROWS
+    except Exception:
+        return _PAGE_ROWS
+
+
 def _handle_enter(browser, ctx) -> bool:
     """Implement ``on_enter`` semantics: print-exit | action:KEY | noop | callable.
 

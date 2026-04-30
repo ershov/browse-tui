@@ -301,6 +301,92 @@ def _find_item(state, item_id):
     return None
 
 
+# ---- insert-mode placement helpers (ticket #21) -------------------------
+#
+# These mirror plan-tui's ``_auto_insert_depth`` and ``_resolve_insert``
+# (see plan-source/src-tui/070-main.py:50-96). Pure functions: take a
+# position + depth + visible list, return the resolved depth or
+# ``(relation, dest_id)`` describing how to place the new item.
+#
+# Difference from plan-tui: we don't carry a ``parent`` field on
+# ``VisibleEntry`` (browse-tui's lazy children cache doesn't track
+# parent ids). To find an outdent ancestor we walk the visible list
+# itself — by tree-DFS construction, the parent of any row at depth
+# ``d`` is the most recent earlier row at depth ``d - 1`` (or smaller).
+
+
+def auto_insert_depth(pos, vis):
+    """Compute the natural depth for an insertion marker at gap position pos.
+
+    Mirrors plan-tui's ``_auto_insert_depth``. ``pos`` is a *gap* in the
+    visible list: gap 0 sits above the first row, gap ``len(vis)`` sits
+    below the last row. The auto-depth is:
+
+    * ``vis[0].depth`` (or 0) when the list is empty / pos at top.
+    * The *below* row's depth when it's deeper than the *above* row —
+      i.e. the marker "lands inside" the parent's subtree by default.
+    * Otherwise the *above* row's depth — sibling-after.
+    """
+    if not vis:
+        return 0
+    if pos <= 0:
+        return vis[0].depth if vis else 0
+    above = vis[pos - 1]
+    if pos < len(vis):
+        below = vis[pos]
+        if below.depth > above.depth:
+            return below.depth
+    return above.depth
+
+
+def resolve_insert(pos, depth, vis, *, scope_root_id=None):
+    """Convert (insert_pos, insert_depth) into ``(relation, dest_id)``.
+
+    Mirrors plan-tui's ``_resolve_insert``. Returns ``(None, None)`` if
+    the position is invalid.
+
+    ``relation`` is one of ``'before'``, ``'after'``, ``'first'``;
+    ``dest_id`` is the item id the relation references.
+
+    plan-tui has an explicit ``parent`` field on every ticket and uses
+    an id_map of all_tickets to walk up ancestors. browse-tui's lazy
+    model doesn't carry ``parent`` on ``VisibleEntry``, so we walk the
+    visible list itself to find the ancestor at the target depth — by
+    tree-DFS construction the most-recent earlier row at depth ``d`` is
+    the unique ancestor at that depth.
+    """
+    if not vis or pos <= 0:
+        return (None, None)
+
+    above = vis[pos - 1]
+
+    # Skip the synthetic scope_root row — it isn't a valid insertion
+    # reference. Mirror plan-tui's "id == 0" branch: if the row directly
+    # above the gap is the scope root, fall through to a "before vis[pos]"
+    # placement (or give up if there's no row below either).
+    if above.kind == 'scope_root':
+        if pos < len(vis):
+            return ('before', vis[pos].item.id)
+        return (None, None)
+
+    if depth > above.depth:
+        # Inserting as child of above.
+        return ('first', above.item.id)
+    if depth == above.depth:
+        # Inserting as sibling after above.
+        return ('after', above.item.id)
+
+    # depth < above.depth — outdented. Walk back through ``vis`` until
+    # we hit a row at the target depth; that's the ancestor we want to
+    # become a sibling of (relation 'after').
+    i = pos - 1
+    while i >= 0 and vis[i].depth > depth:
+        i -= 1
+    if i >= 0 and vis[i].depth == depth and vis[i].kind != 'scope_root':
+        return ('after', vis[i].item.id)
+    return (None, None)
+
+
 # ---- Browser engine ------------------------------------------------------
 
 # Phase 1 (ticket #7) implements the threading core: workers, post queue,
@@ -469,6 +555,25 @@ class Browser:
         # from_flat_tree() get the cache populated up front so cursor_to
         # always finds the id immediately.
         self._pending_cursor = None  # tuple (id, Pending) or None
+
+        # --- insert-mode bookkeeping (ticket #21) ----------------------
+        # Insert mode is entered by ``ctx.insert(label, on_confirm)``.
+        # The user moves a placement marker through the visible tree and
+        # confirms a position; on confirm, ``_insert_callback`` is invoked
+        # with ``(relation, dest_id)`` describing how to place the new
+        # item. While ``_insert_mode`` is True the main loop routes keys
+        # through ``_handle_insert_key`` instead of the regular dispatch.
+        #
+        # ``_insert_pos`` is a *gap* position in the visible list: 1
+        # means "insert before the first row after the scope_root",
+        # ``len(vis)`` means "insert at the very end". ``_insert_depth``
+        # is the indentation level for the placement marker (controlled
+        # by the user via right/left).
+        self._insert_mode = False
+        self._insert_pos = 0
+        self._insert_depth = 0
+        self._insert_callback = None
+        self._insert_label = ''
 
     # ---- action registration -------------------------------------------
 
@@ -1029,9 +1134,14 @@ class Browser:
                     # Worker delivered something; loop and drain.
                     continue
 
-                # Dispatch the key to the action layer. Search-mode and
-                # normal-mode dispatch live in dispatch_key.
-                dispatch_key(self, ctx, key)
+                # Dispatch the key to the action layer. Insert-mode is
+                # the most-special branch (placement marker movement),
+                # then search-mode + normal-mode dispatch live in
+                # dispatch_key.
+                if self._insert_mode:
+                    _handle_insert_key(self, ctx, key)
+                else:
+                    dispatch_key(self, ctx, key)
 
                 # Trigger preview + children fetches for the (possibly
                 # moved) cursor before the next render pass. The

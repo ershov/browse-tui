@@ -226,6 +226,59 @@ class Context:
             return False
         return _confirm_on_info_bar(self._browser, prompt)
 
+    def insert(self, label, on_confirm):
+        """Enter insert mode for placing a new item. (ticket #21)
+
+        The user moves a placement marker through the visible tree:
+
+          * ``up/k``, ``down/j``: move marker up/down by one row
+          * ``home/g``, ``end/G``: jump to top/bottom (within scope)
+          * ``pgup``, ``pgdn``: page-sized jumps
+          * ``right``: indent — make child of entry above (expanding it
+                       if it has un-shown children)
+          * ``left``: outdent — collapse a sibling-above-with-children,
+                     or move marker before the parent ancestor
+          * ``enter``: confirm — invokes ``on_confirm(relation, dest_id)``
+                       where ``relation`` is one of ``'before'``,
+                       ``'after'``, ``'first'``
+          * ``esc/ctrl-c/q``: cancel — does *not* invoke the callback
+
+        ``label`` is shown on the marker row (``-- {label} --``) so the
+        user can see what they're placing (e.g. ``'create'``, ``'move'``).
+
+        ``ctx.insert`` returns immediately after configuring insert
+        state; the actual key handling happens in the main loop's
+        dispatch (which routes through ``_handle_insert_key`` while
+        ``_insert_mode`` is True).
+
+        Headless Browsers are a no-op (state stays unmodified, callback
+        never fires) — unit tests exercise the key handler directly.
+        """
+        if self._browser._headless:
+            return
+        state = self._browser._state
+        vis = visible_items(state)
+        if not vis:
+            return
+        # Default placement: gap right after the cursor item. visible_items
+        # builds the list with the scope_root row at index 0 when scoped,
+        # so cursor + 1 always lands at a real-row gap.
+        pos = state.cursor + 1
+        # Clamp to [min_pos, len(vis)]; min_pos is 1 (skip the
+        # scope_root gap at index 0 when present).
+        max_pos = len(vis)
+        min_pos = 1 if vis and vis[0].kind == 'scope_root' else 1
+        if pos > max_pos:
+            pos = max_pos
+        if pos < min_pos:
+            pos = min_pos
+        self._browser._insert_mode = True
+        self._browser._insert_pos = pos
+        self._browser._insert_depth = auto_insert_depth(pos, vis)
+        self._browser._insert_label = label
+        self._browser._insert_callback = on_confirm
+        self._browser._needs_redraw.add('all')
+
     def pick(self, label, options):
         """fzf-style filterable picker overlaid on the preview pane.
 
