@@ -1,6 +1,13 @@
 """browse-tui: CLI parser, format parsers, --python loader, --install hooks."""
 
+import argparse
 import json
+import os
+import re as _re
+import shutil
+import subprocess
+import sys
+import tempfile
 
 
 # ---- parsers --------------------------------------------------------------
@@ -162,3 +169,425 @@ def parse_input(data, *, fmt, fields=None, record_sep=b'\n', strict=False):
         yield from parse_json_array(data, strict=strict)
     else:
         raise ValueError(f'unknown input format: {fmt!r}')
+
+
+# ---- argument parsing -----------------------------------------------------
+#
+# The argument surface mirrors the design spec's "CLI surface" table.
+# Phase 1 ships TSV / JSON / JSON-array input formats; csv / ifs / split /
+# match come in #23. Most action plumbing lives below; parsing here just
+# captures raw strings and lets the caller wire things up.
+
+
+def build_argparser():
+    """Construct the argparse parser for the CLI surface.
+
+    ``add_help=False`` — we manage ``-h``/``--help`` by hand because the
+    standard argparse help action calls ``sys.exit(0)`` directly which
+    bypasses our ``main()`` return-code contract (and our test harness).
+    """
+    p = argparse.ArgumentParser(
+        prog='browse-tui',
+        description='Generic hierarchical browser TUI. See docs for the API.',
+        add_help=False,
+    )
+    # Data source
+    p.add_argument('-c', '--children-cmd', metavar='CMD',
+                   help='Bash command listing children of $TUI_ID (lazy mode).')
+    p.add_argument('--root-id', metavar='ID', default='',
+                   help='Initial id passed to --children-cmd (default empty).')
+    p.add_argument('-p', '--preview-cmd', metavar='CMD',
+                   help='Bash command for the preview pane.')
+    p.add_argument('--root-cmd', metavar='CMD',
+                   help='Eager mode — emits the entire tree on stdout.')
+    # Input format
+    p.add_argument('-i', '--input', metavar='FMT', default='tsv',
+                   choices=('tsv', 'json', 'json-array'),
+                   help='Input parser (phase 1: tsv|json|json-array).')
+    p.add_argument('--fields', metavar='LIST', default='id,title',
+                   help='Comma-separated field names for tsv/csv/ifs/split.')
+    p.add_argument('--record-sep', metavar='SEP', default='nl',
+                   help='Record separator: nl (default) | null | LITERAL.')
+    # Actions
+    p.add_argument('-a', '--action', metavar='KEY:LABEL:CMD',
+                   action='append', default=[],
+                   help='Register a custom action; repeatable.')
+    p.add_argument('--action-timeout', metavar='SECS', type=float, default=600.0,
+                   help='Per-action timeout in seconds (default 600).')
+    p.add_argument('--on-enter', metavar='MODE', default='print-exit',
+                   help='What Enter does: print-exit | action:KEY | noop.')
+    p.add_argument('--print-format', metavar='FMT', default='{id}',
+                   help='Format for print-exit. str.format syntax over Item attrs.')
+    # Layout
+    p.add_argument('--no-preview', action='store_true',
+                   help='Start with preview pane hidden.')
+    p.add_argument('--no-multi-select', action='store_true',
+                   help='Disable selection.')
+    p.add_argument('--title', metavar='TITLE', default='browse-tui')
+    p.add_argument('--initial-scope', metavar='ID', default=None,
+                   help='Start scoped to this id.')
+    # Install / uninstall
+    p.add_argument('--install', metavar='TARGET',
+                   choices=('local', 'user', 'system', 'env'))
+    p.add_argument('--uninstall', metavar='TARGET',
+                   choices=('local', 'user', 'system', 'env'))
+    p.add_argument('--force', action='store_true',
+                   help='Overwrite existing installed binary if it differs.')
+    # --python loader
+    p.add_argument('--python', metavar='SCRIPT', default=None,
+                   help='Run a Python recipe. Remaining args become sys.argv.')
+    # Debug / ops
+    p.add_argument('--command-log', action='store_true',
+                   help='Show command log on quit.')
+    p.add_argument('--version', action='store_true', help='Print version and exit.')
+    p.add_argument('-h', '--help', action='store_true', help='Show help and exit.')
+    return p
+
+
+def parse_args(argv):
+    """Parse ``argv`` (list[str], excluding program name).
+
+    Returns ``(args, extras)``: ``args`` is the namespace; ``extras`` is
+    everything after a literal ``--`` (forwarded to ``--python`` script as
+    ``sys.argv``). The ``--`` token itself is consumed, never forwarded.
+    """
+    if '--' in argv:
+        idx = argv.index('--')
+        head, extras = argv[:idx], argv[idx + 1:]
+    else:
+        head, extras = argv, []
+    p = build_argparser()
+    args = p.parse_args(head)
+    return args, extras
+
+
+# ---- record separator decoding --------------------------------------------
+
+
+def decode_record_sep(s: str) -> bytes:
+    """Translate the ``--record-sep`` flag value into raw bytes.
+
+    ``'nl'`` → ``b'\\n'``; ``'null'`` → ``b'\\0'``; anything else is a
+    literal sequence (UTF-8 encoded). The parsers in #4 already accept
+    arbitrary byte separators.
+    """
+    if s == 'nl':
+        return b'\n'
+    if s == 'null':
+        return b'\0'
+    return s.encode('utf-8')
+
+
+# ---- TUI_* env-var helpers ------------------------------------------------
+#
+# Action templates run as ``bash -c CMD`` with a curated environment.
+# Standard fields export under ``TUI_<UPPERCASE>``; arbitrary recipe-set
+# attributes follow the same rule when they're valid identifiers, except
+# the four reserved names below — those are owned by the dispatcher and
+# must never be clobbered by an item.
+
+_RESERVED_TUI_NAMES = {
+    'TUI_BIN', 'TUI_IDS_FILE', 'TUI_IDS_COUNT', 'TUI_TARGETS',
+}
+
+_IDENT = _re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+
+_STANDARD_FIELDS = ('id', 'title', 'tag', 'tag_style', 'has_children')
+
+
+def item_env(item, *, ids_file=None, ids_count=0, targets='cursor', bin_path=None):
+    """Build the env-var dict for running an action's bash CMD.
+
+    Inherits ``os.environ``, then overlays ``TUI_<FIELD>`` for each of the
+    standard ``Item`` fields plus any extra attributes whose names are
+    valid Python identifiers. Reserved ``TUI_*`` slots (``TUI_BIN``,
+    ``TUI_IDS_FILE``, ``TUI_IDS_COUNT``, ``TUI_TARGETS``) are *only* set
+    by this function, never by an item attribute — a recipe that defines
+    ``Item.bin = '...'`` will not leak into ``$TUI_BIN``.
+    """
+    env = dict(os.environ)
+    # Standard fields first.
+    for fname in _STANDARD_FIELDS:
+        v = getattr(item, fname, '')
+        if isinstance(v, bool):
+            v = '1' if v else '0'
+        env[f'TUI_{fname.upper()}'] = '' if v is None else str(v)
+    # Arbitrary attributes (recipe-set extras on the Item).
+    for name in dir(item):
+        if name.startswith('_'):
+            continue
+        if not _IDENT.match(name):
+            continue
+        if name in _STANDARD_FIELDS:
+            continue
+        env_name = f'TUI_{name.upper()}'
+        if env_name in _RESERVED_TUI_NAMES:
+            # Reserved names are dispatcher-owned; never let an item
+            # attribute (e.g. ``bin``, ``ids_file``) clobber them.
+            continue
+        try:
+            v = getattr(item, name)
+        except Exception:
+            continue
+        if callable(v) or isinstance(v, type):
+            continue
+        if isinstance(v, bool):
+            v = '1' if v else '0'
+        env[env_name] = '' if v is None else str(v)
+    # Reserved fields — written last so item attrs cannot override them.
+    if bin_path is not None:
+        env['TUI_BIN'] = bin_path
+    if ids_file is not None:
+        env['TUI_IDS_FILE'] = ids_file
+    env['TUI_IDS_COUNT'] = str(ids_count)
+    env['TUI_TARGETS'] = targets
+    return env
+
+
+def write_ids_file(ids):
+    """Persist ``ids`` as a NUL-separated file. Caller deletes; returns path.
+
+    The NUL separator is unambiguous for arbitrary id strings (paths,
+    titles with newlines, etc.). Action CMDs read it via ``$TUI_IDS_FILE``
+    plus e.g. ``xargs -0`` or ``readarray -d ''``.
+    """
+    fd, path = tempfile.mkstemp(prefix='browse-tui-ids-', suffix='.bin')
+    try:
+        data = b'\0'.join(str(i).encode('utf-8') for i in ids)
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+    return path
+
+
+def run_action_cmd(cmd, item, *,
+                   targets='cursor', target_ids=None, bin_path=None,
+                   timeout=600.0):
+    """Execute ``bash -c CMD`` with TUI_* env vars set. Returns exit code.
+
+    Creates and cleans up the ``$TUI_IDS_FILE`` temp file; honours the
+    per-action ``timeout`` (returning 124 — GNU-timeout convention — on
+    expiry). Stdout/stderr are inherited; the caller is responsible for
+    suspending/resuming the terminal around this call when running under
+    a real TTY.
+    """
+    target_ids = target_ids or []
+    ids_path = write_ids_file(target_ids) if target_ids else None
+    try:
+        env = item_env(item,
+                       ids_file=ids_path,
+                       ids_count=len(target_ids),
+                       targets=targets,
+                       bin_path=bin_path)
+        try:
+            result = subprocess.run(
+                ['/bin/bash', '-c', cmd],
+                env=env,
+                timeout=timeout,
+            )
+            return result.returncode
+        except subprocess.TimeoutExpired:
+            return 124  # GNU timeout convention.
+    finally:
+        if ids_path is not None:
+            try:
+                os.unlink(ids_path)
+            except OSError:
+                pass
+
+
+# ---- --action 'KEY:LABEL:CMD' parsing -------------------------------------
+
+
+def parse_action_spec(spec):
+    """Parse ``'KEY:LABEL:CMD'`` into ``(key, label, cmd)``.
+
+    Splits on the first two colons only — the CMD may itself contain
+    colons freely (paths, sed expressions, URLs, …). LABEL may be empty
+    (``'k::echo hi'`` is fine). Raises ``ValueError`` if the spec has
+    fewer than two colons.
+    """
+    parts = spec.split(':', 2)
+    if len(parts) < 3:
+        raise ValueError(f'--action {spec!r}: expected KEY:LABEL:CMD')
+    return parts[0], parts[1], parts[2]
+
+
+def make_cli_action(spec, *, bin_path=None, timeout=600.0):
+    """Build an ``Action`` whose handler runs the CLI-supplied bash CMD.
+
+    Action runs only when ``ctx.targets`` is non-empty (gate
+    ``'targets'``). The handler suspends the terminal in non-headless
+    mode, calls ``run_action_cmd`` (which manages the temp ids file),
+    then resumes and triggers a full redraw. Non-zero exit codes are
+    surfaced via ``ctx.error``.
+
+    ``Action`` is referenced by name — the test harness injects it (the
+    concatenated build resolves it from earlier modules).
+    """
+    key, label, cmd = parse_action_spec(spec)
+
+    def _handler(ctx):
+        primary = ctx.cursor or (ctx.selected[0] if ctx.selected else None)
+        if primary is None:
+            ctx.error(f'action {key!r}: no target')
+            return
+        target_ids = [t.id for t in ctx.targets]
+        targets_label = 'selection' if ctx.selected else 'cursor'
+        if not ctx._browser._headless:
+            term_suspend()
+        try:
+            rc = run_action_cmd(cmd, primary,
+                                targets=targets_label,
+                                target_ids=target_ids,
+                                bin_path=bin_path,
+                                timeout=timeout)
+        finally:
+            if not ctx._browser._headless:
+                term_resume()
+                ctx._browser._needs_redraw.add('all')
+        ctx.refresh()
+        if rc != 0:
+            ctx.error(f'action {key!r} exited with code {rc}')
+
+    return Action(key=key, label=label, handler=_handler, requires='targets')
+
+
+# ---- --install / --uninstall ----------------------------------------------
+#
+# Four targets, mapping to four common installation paths. ``env`` requires
+# an active virtualenv (``$VIRTUAL_ENV``); ``system`` requires root and
+# emits a sudo hint when run unprivileged. ``local`` writes alongside the
+# CWD (handy for testing); ``user`` lands in ``~/.local/bin``.
+
+
+def _install_path(target):
+    """Resolve install ``target`` (local|user|system|env) to an absolute path."""
+    if target == 'local':
+        return os.path.abspath('./browse-tui')
+    if target == 'user':
+        return os.path.expanduser('~/.local/bin/browse-tui')
+    if target == 'system':
+        return '/usr/local/bin/browse-tui'
+    if target == 'env':
+        venv = os.environ.get('VIRTUAL_ENV')
+        if not venv:
+            raise SystemExit('--install env: $VIRTUAL_ENV is not set')
+        return os.path.join(venv, 'bin', 'browse-tui')
+    raise SystemExit(f'unknown install target: {target!r}')
+
+
+def cmd_install(target, force=False):
+    """Install (copy) the running binary to the target path.
+
+    Returns 0 on success or no-op (already-installed identical binary),
+    2 if the destination exists with different content and ``--force``
+    wasn't passed, 3 if the target requires privileges we don't have
+    (with a sudo hint printed). The running binary is read from
+    ``sys.argv[0]``.
+    """
+    src = os.path.abspath(sys.argv[0])
+    dst = _install_path(target)
+    parent = os.path.dirname(dst)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    if os.path.exists(dst):
+        try:
+            with open(src, 'rb') as a, open(dst, 'rb') as b:
+                same = a.read() == b.read()
+        except OSError:
+            same = False
+        if same:
+            print(f'browse-tui already installed at {dst} (identical)')
+            return 0
+        if not force:
+            print(f'{dst} exists and differs; pass --force to overwrite')
+            return 2
+    if target == 'system' and os.geteuid() != 0:
+        # Don't escalate privileges silently — print sudo hint instead.
+        print(f'system target requires root. Run:\n'
+              f'  sudo cp {src} {dst}\n  sudo chmod 755 {dst}')
+        return 3
+    shutil.copy2(src, dst)
+    os.chmod(dst, 0o755)
+    print(f'installed: {dst}')
+    print(f'run with: {os.path.basename(dst)} --help')
+    return 0
+
+
+def cmd_uninstall(target):
+    """Remove the installed binary at ``target``. Returns exit code."""
+    dst = _install_path(target)
+    if not os.path.exists(dst):
+        print(f'browse-tui not present at {dst}')
+        return 0
+    if target == 'system' and os.geteuid() != 0:
+        print(f'system target requires root. Run:\n  sudo rm {dst}')
+        return 3
+    os.unlink(dst)
+    print(f'uninstalled: {dst}')
+    return 0
+
+
+# ---- --python loader ------------------------------------------------------
+
+
+def cmd_python(script, extras, *, version=None):
+    """Run a Python recipe with the running binary self-injected as ``browse_tui``.
+
+    The recipe imports ``from browse_tui import Browser, Item, Action`` and
+    gets back the running interpreter's globals — same module that
+    backed the concatenated build. ``sys.argv`` is rewritten so the
+    script sees its own name and any extra args after a ``--`` token.
+    ``SystemExit`` raised by the recipe is converted to the matching
+    return code.
+    """
+    import runpy
+    # In the concatenated-build case, ``__name__`` is ``'__main__'``;
+    # in the test/embedded case it's the loader-given module name.
+    # Either way, ``sys.modules[__name__]`` resolves to *this* module.
+    sys.modules['browse_tui'] = sys.modules[__name__]
+    sys.argv = [script] + list(extras)
+    try:
+        runpy.run_path(script, run_name='__main__')
+    except SystemExit as e:
+        return int(e.code) if e.code is not None else 0
+    return 0
+
+
+# ---- TUI mode stub (wired in #13) -----------------------------------------
+
+
+def run_tui(args):
+    """Wire Browser from CLI args and run the TUI. Implemented in #13."""
+    raise NotImplementedError('TUI run not yet wired — ticket #13')
+
+
+# ---- top-level entry point ------------------------------------------------
+
+
+def main(argv=None):
+    """Top-level dispatcher: parse argv, route to the right mode, return rc."""
+    if argv is None:
+        argv = sys.argv[1:]
+
+    args, extras = parse_args(argv)
+
+    if args.help:
+        build_argparser().print_help()
+        return 0
+    if args.version:
+        print(__version__)
+        return 0
+
+    # Special modes are mutually exclusive with TUI mode; checked in order
+    # of "least-likely-to-also-want-TUI" so a user can't accidentally
+    # launch the TUI when they meant to install.
+    if args.install:
+        return cmd_install(args.install, force=args.force)
+    if args.uninstall:
+        return cmd_uninstall(args.uninstall)
+    if args.python:
+        return cmd_python(args.python, extras, version=__version__)
+
+    return run_tui(args)
