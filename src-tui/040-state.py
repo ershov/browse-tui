@@ -425,6 +425,31 @@ class Browser:
         self._error_text = ''
         self._message_text = ''
 
+        # --- render-layer bookkeeping (ticket #10) ----------------------
+        # Selective-redraw flag set; values are strings: 'list', 'preview',
+        # 'info', 'all'. ``render_full`` clears it; ``render_partial`` reads
+        # it and clears as it goes. The render layer treats an empty set
+        # as "nothing to do".
+        self._needs_redraw = set()
+        # Search state — phase 1 stores the strings; key handlers in #11
+        # set them. The renderer reads ``_search_query`` for highlight
+        # spans and ``_search_mode`` for the search prompt in the info
+        # bar. Phase-2 ticket #22 wires the actual highlight pass.
+        self._search_query = ''
+        self._search_mode = False
+        # Preview pane scroll offset (lines from top of preview content).
+        # Reset whenever the preview content changes; nudged by the
+        # shift-up/shift-down handlers in the action layer (#12).
+        self._preview_scroll = 0
+        # Help-mode toggle — when True, the preview pane shows _HELP_TEXT
+        # instead of the per-item preview. The actual key handler lives
+        # in the action layer (#12); the renderer just observes the flag.
+        self._help_mode = False
+        # List-pane scroll offset (rows from top of the visible list).
+        # Maintained by render_list to keep the cursor on-screen; lives
+        # on Browser so partial redraws remember it across calls.
+        self._list_scroll = 0
+
         # --- quit bookkeeping (read by the main loop in #13) ------------
         # quit() flips _quit_requested; the main loop watches the flag
         # and exits with _quit_code, printing _quit_output if non-empty.
