@@ -555,12 +555,181 @@ def cmd_python(script, extras, *, version=None):
     return 0
 
 
-# ---- TUI mode stub (wired in #13) -----------------------------------------
+# ---- TUI mode -------------------------------------------------------------
+
+
+def _reopen_stdin_from_tty():
+    """Replace ``sys.stdin`` with /dev/tty so the TUI can read keystrokes.
+
+    Called after ``--root-cmd cat`` has consumed the original stdin (a
+    pipe in the common case — ``printf '…' | browse-tui --root-cmd
+    cat``). Without this, ``read_key`` would see EOF immediately and the
+    UI would exit. If /dev/tty isn't openable (e.g. running detached) we
+    leave sys.stdin alone — the TUI then exits cleanly via EOF→esc.
+    """
+    try:
+        tty_in = open('/dev/tty', 'rb', buffering=0)
+    except OSError:
+        return
+    try:
+        os.dup2(tty_in.fileno(), 0)
+    finally:
+        tty_in.close()
+    # Refresh sys.stdin to point at the new fd 0 — the io stack caches
+    # the previous file descriptor in sys.stdin.buffer.
+    sys.stdin = os.fdopen(0, 'r', buffering=1)
+
+
+def _build_lazy_browser(args, fields, record_sep):
+    """Build a Browser whose children/preview lookups shell out lazily.
+
+    Used when ``--children-cmd`` is set. Each ``get_children`` call runs
+    the command with ``$TUI_ID`` set; ``--preview-cmd`` (if any) drives
+    the preview pane the same way. Errors and non-zero exits map to an
+    empty list / inline error string so a flaky child doesn't crash the
+    UI.
+    """
+    children_cmd = args.children_cmd
+    preview_cmd = args.preview_cmd
+    timeout = args.action_timeout
+    fmt = args.input
+
+    def get_children(parent_id):
+        env = {**os.environ, 'TUI_ID': str(parent_id) if parent_id is not None else ''}
+        try:
+            proc = subprocess.run(
+                ['/bin/bash', '-c', children_cmd],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+            )
+        except Exception:
+            return []
+        if proc.returncode != 0:
+            return []
+        return list(parse_input(
+            proc.stdout, fmt=fmt, fields=fields, record_sep=record_sep,
+        ))
+
+    get_preview = None
+    if preview_cmd:
+        def get_preview(item_id):
+            env = {**os.environ, 'TUI_ID': str(item_id) if item_id is not None else ''}
+            try:
+                proc = subprocess.run(
+                    ['/bin/bash', '-c', preview_cmd],
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=timeout,
+                )
+            except Exception as e:
+                return f'[error] {type(e).__name__}: {e}'
+            return proc.stdout.decode('utf-8', errors='replace')
+
+    return Browser(
+        title=args.title,
+        get_children=get_children,
+        get_preview=get_preview,
+        root_id=args.root_id,
+        initial_scope=args.initial_scope,
+        show_preview=not args.no_preview,
+        multi_select=not args.no_multi_select,
+        on_enter=args.on_enter,
+        print_format=args.print_format,
+    )
+
+
+def _build_eager_browser(args, fields, record_sep):
+    """Build a Browser whose root data was produced eagerly by ``--root-cmd``.
+
+    The special-case ``--root-cmd cat`` reads stdin verbatim (so a pipe
+    like ``printf 'a\\nb\\nc\\n' | browse-tui --root-cmd cat`` works
+    without spawning anything). Any other value runs the command via
+    bash and consumes its stdout. The parsed rows feed
+    ``Browser.from_flat_tree`` — hierarchy detection (parent / depth /
+    flat) is handled there.
+    """
+    if args.root_cmd == 'cat':
+        data = sys.stdin.buffer.read()
+        # The TUI's read_key reads from sys.stdin; if stdin was a pipe
+        # (the common case — ``printf '...' | browse-tui --root-cmd cat``)
+        # it's now closed, which would make read_key return EOF
+        # immediately. Reopen stdin from /dev/tty so keystrokes work.
+        _reopen_stdin_from_tty()
+    else:
+        try:
+            proc = subprocess.run(
+                ['/bin/bash', '-c', args.root_cmd],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=args.action_timeout,
+            )
+        except subprocess.TimeoutExpired:
+            sys.stderr.write(f'error: --root-cmd timed out after {args.action_timeout}s\n')
+            return None
+        except Exception as e:
+            sys.stderr.write(f'error: --root-cmd failed: {type(e).__name__}: {e}\n')
+            return None
+        if proc.returncode != 0:
+            sys.stderr.write(
+                f'error: --root-cmd exited with code {proc.returncode}\n'
+            )
+            return None
+        data = proc.stdout
+
+    rows = list(parse_input(
+        data, fmt=args.input, fields=fields, record_sep=record_sep,
+    ))
+
+    return Browser.from_flat_tree(
+        rows,
+        root_id=args.root_id,
+        title=args.title,
+        initial_scope=args.initial_scope,
+        show_preview=not args.no_preview,
+        multi_select=not args.no_multi_select,
+        on_enter=args.on_enter,
+        print_format=args.print_format,
+    )
 
 
 def run_tui(args):
-    """Wire Browser from CLI args and run the TUI. Implemented in #13."""
-    raise NotImplementedError('TUI run not yet wired — ticket #13')
+    """Build a Browser from CLI args and run the TUI main loop.
+
+    Returns the exit code propagated from ``Browser.run`` (or 2 when the
+    arguments are insufficient — exactly one of ``--children-cmd`` and
+    ``--root-cmd`` must be given).
+    """
+    fields = [f.strip() for f in args.fields.split(',') if f.strip()]
+    record_sep = decode_record_sep(args.record_sep)
+
+    if args.children_cmd:
+        b = _build_lazy_browser(args, fields, record_sep)
+    elif args.root_cmd:
+        b = _build_eager_browser(args, fields, record_sep)
+        if b is None:
+            return 2
+    else:
+        sys.stderr.write(
+            'error: --children-cmd or --root-cmd is required\n'
+        )
+        return 2
+
+    # Wire CLI ``--action`` specs onto the Browser. The bin path lets
+    # action CMDs invoke the running binary recursively (``$TUI_BIN``).
+    bin_path = os.path.abspath(sys.argv[0])
+    for spec in args.action:
+        try:
+            b.add_action(make_cli_action(
+                spec, bin_path=bin_path, timeout=args.action_timeout,
+            ))
+        except ValueError as e:
+            sys.stderr.write(f'error: {e}\n')
+            return 2
+
+    return b.run()
 
 
 # ---- top-level entry point ------------------------------------------------

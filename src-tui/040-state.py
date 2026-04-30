@@ -1,6 +1,7 @@
 """browse-tui: state layer (visible tree, cursor/scope, async workers, post queue, Pending)."""
 
 import queue
+import sys
 import threading
 import time
 from collections import deque
@@ -914,6 +915,131 @@ class Browser:
         """
         self._preview_req = id_
         self._preview_event.set()
+
+    # ---- main loop ------------------------------------------------------
+
+    def run(self) -> int:
+        """Run the TUI main loop until quit. Returns exit code.
+
+        Drives workers + post queue + render. Sets up terminal in
+        non-headless mode; tears down at exit. Honours SIGTSTP/SIGCONT
+        via the signal handlers in 020-terminal.
+
+        Returns the exit code stored by ctx.quit() (or browser.quit()),
+        plus prints any captured ``_quit_output`` to stdout after
+        ``term_restore``.
+
+        Cross-module symbols (``term_init``/``term_restore``/``read_key``/
+        ``g_resize_flag``/``Context``/``dispatch_key``/``render_full``/
+        ``render_partial``) are resolved as bare globals — in the
+        concatenated production build that's the unified namespace; in
+        tests the loader injects them onto this module.
+        """
+        self.start_workers()
+        if not self._headless:
+            term_init()
+        ctx = Context(self)
+        self._ctx = ctx
+
+        # Initial fetch + render. We post a refresh of the root so the
+        # children worker populates the cache (or leverages an already-
+        # populated cache from from_flat_tree). Wait briefly for the
+        # first results before painting so the user doesn't flash a
+        # ``loading…`` placeholder for callbacks that resolve in <500ms.
+        self.refresh()
+        if not self._headless:
+            try:
+                self.run_until_idle(timeout=0.5)
+            except TimeoutError:
+                pass  # slow callback; render the loading state
+            self._update_preview_for_cursor()
+            try:
+                self.run_until_idle(timeout=0.2)
+            except TimeoutError:
+                pass
+            render_full(self)
+
+        try:
+            while not self._quit_requested:
+                # Drain pending updates from any thread, then render if
+                # something is dirty. Pre-key drain so a worker result
+                # that landed before this iteration is visible by the
+                # next read_key wake.
+                self.drain_main_queue()
+                self.apply_children_results()
+                self.apply_preview_result()
+
+                # Resize flag — set by SIGWINCH handler in 020-terminal.
+                # Bare-name access works in the concatenated build; in
+                # tests this attribute is injected onto the module.
+                if globals().get('g_resize_flag', False):
+                    globals()['g_resize_flag'] = False
+                    self._needs_redraw.add('all')
+
+                if self._needs_redraw and not self._headless:
+                    if 'all' in self._needs_redraw:
+                        render_full(self)
+                    else:
+                        render_partial(self)
+
+                if self._quit_requested:
+                    break
+
+                try:
+                    key = read_key()
+                except KeyboardInterrupt:
+                    key = 'ctrl-c'
+
+                if globals().get('g_resize_flag', False):
+                    globals()['g_resize_flag'] = False
+                    self._needs_redraw.add('all')
+
+                if key == '_notify':
+                    # Worker delivered something; loop and drain.
+                    continue
+
+                # Dispatch the key to the action layer. Search-mode and
+                # normal-mode dispatch live in dispatch_key.
+                dispatch_key(self, ctx, key)
+
+                # Trigger preview fetch for the (possibly moved) cursor
+                # before the next render pass.
+                self._update_preview_for_cursor()
+        finally:
+            if not self._headless:
+                term_restore()
+            self.stop_workers()
+
+        # After teardown — print captured output (e.g. from on_enter
+        # print-exit). Done outside the alternate screen so the user's
+        # shell sees the result.
+        if self._quit_output:
+            sys.stdout.write(self._quit_output)
+            sys.stdout.flush()
+
+        return self._quit_code
+
+    def _update_preview_for_cursor(self) -> None:
+        """Request a preview fetch for the current cursor item.
+
+        No-op when previews are disabled or when the cursor is on a
+        non-normal entry (placeholder / scope-root). Called by the main
+        loop after every dispatched key so cursor moves trigger
+        latest-wins preview fetches.
+        """
+        if not self.show_preview:
+            return
+        state = self._state
+        vis = visible_items(state)
+        if not (0 <= state.cursor < len(vis)):
+            self._preview_req = None
+            return
+        entry = vis[state.cursor]
+        if entry.kind != 'normal':
+            self._preview_req = None
+            return
+        if entry.item.id != self._preview_req:
+            self.request_preview(entry.item.id)
 
     # ---- eager adapter -------------------------------------------------
 

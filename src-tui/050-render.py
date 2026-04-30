@@ -390,7 +390,7 @@ def render_list(browser, top, height, cols):
             expanded=item.id in state.expanded,
             selected=is_selected,
             kind=entry.kind,
-            search_query=state._search_query,
+            search_query=browser._search_query,
             format_item=browser.format_item,
             ctx=None,
         )
@@ -403,7 +403,7 @@ def render_list(browser, top, height, cols):
                 line = line[:cols]
             _write_highlighted(
                 line, reverse=True, pad_to=cols,
-                search_query=state._search_query,
+                search_query=browser._search_query,
             )
         else:
             # Regular row: write segments directly, truncating at ``cols``.
@@ -495,7 +495,7 @@ def render_separator(row, cols, label, *, info=False, browser=None):
 
     if info and browser is not None:
         sel_count = len(browser._state.selected)
-        search = browser._state._search_query if browser._state._search_mode else None
+        search = browser._search_query if browser._search_mode else None
     else:
         sel_count = 0
         search = None
