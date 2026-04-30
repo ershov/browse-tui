@@ -176,5 +176,105 @@ class TestPendingChainCallbackOrderUnderResolve(unittest.TestCase):
         self.assertEqual(calls, ['a', 'c', 'b'])
 
 
+class TestPendingCancel(unittest.TestCase):
+    """Pending.cancel() suppresses chain firing without killing the worker.
+
+    Cancellation is non-strict: ``_resolve`` may still run on the main
+    thread (worker fetch completed, cache populated), but no chained
+    callbacks fire after cancel -- neither those queued pre-cancel nor
+    those registered post-cancel.
+    """
+
+    def test_cancel_marks_cancelled(self):
+        p = Pending()
+        self.assertFalse(p.cancelled)
+        p.cancel()
+        self.assertTrue(p.cancelled)
+
+    def test_then_after_cancel_does_not_fire(self):
+        p = Pending()
+        calls = []
+        p.cancel()
+        p.then(lambda: calls.append('a'))
+        p._resolve()
+        self.assertEqual(calls, [])
+
+    def test_queued_callbacks_dropped_on_cancel(self):
+        p = Pending()
+        calls = []
+        p.then(lambda: calls.append('a'))
+        p.then(lambda: calls.append('b'))
+        p.cancel()
+        p._resolve()
+        self.assertEqual(calls, [])
+
+    def test_resolve_after_cancel_marks_done_but_no_callbacks(self):
+        p = Pending()
+        p.cancel()
+        self.assertFalse(p.done)
+        p._resolve()
+        self.assertTrue(p.done)
+        self.assertTrue(p.cancelled)
+
+    def test_cancel_after_resolve_is_idempotent(self):
+        p = Pending()
+        calls = []
+        p.then(lambda: calls.append('a'))
+        p._resolve()
+        self.assertEqual(calls, ['a'])
+        # Cancel after resolve doesn't undo callbacks already fired.
+        p.cancel()
+        self.assertTrue(p.cancelled)
+        self.assertEqual(calls, ['a'])
+
+    def test_then_returns_self_even_when_cancelled(self):
+        # Chaining .then() after cancel is allowed for ergonomics, just
+        # silently no-ops. The returned value is still the same Pending.
+        p = Pending()
+        p.cancel()
+        result = p.then(lambda: None).then(lambda: None)
+        self.assertIs(result, p)
+
+    def test_cancel_is_idempotent(self):
+        p = Pending()
+        p.cancel()
+        p.cancel()
+        self.assertTrue(p.cancelled)
+
+    def test_cancel_clears_queued_callbacks_eagerly(self):
+        # Eagerly clearing _chain means queued callbacks are released for
+        # GC at cancel-time rather than waiting for _resolve.
+        p = Pending()
+        p.then(lambda: None)
+        p.then(lambda: None)
+        p.cancel()
+        self.assertEqual(p._chain, [])
+
+    def test_cancel_during_resolve_iteration_suppresses_later_then(self):
+        # Edge case: a callback fires during _resolve and calls cancel()
+        # on the same Pending. Already-snapshotted callbacks continue to
+        # run (we don't bail mid-loop), but any .then() registered by a
+        # later callback becomes a no-op because _cancelled is now True.
+        p = Pending()
+        calls = []
+
+        def cb_a():
+            calls.append('a')
+            p.cancel()
+            # Registering after cancel should no-op.
+            p.then(lambda: calls.append('post-cancel'))
+
+        def cb_b():
+            # cb_b was queued before cancel; the snapshot loop still
+            # invokes it because we don't abort mid-iteration.
+            calls.append('b')
+
+        p.then(cb_a)
+        p.then(cb_b)
+        p._resolve()
+        self.assertEqual(calls, ['a', 'b'])
+        self.assertTrue(p.cancelled)
+
+
 if __name__ == '__main__':
     unittest.main()

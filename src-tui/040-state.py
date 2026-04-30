@@ -22,19 +22,50 @@ class Pending:
         its execution; because _done is already True, those callbacks fire
         synchronously inside the inner ``.then()`` call rather than being
         queued -- see the snapshot-and-clear pattern below.
+
+    Cancellation: ``Pending.cancel()`` marks the handle cancelled. Chained
+    callbacks registered via ``.then()`` will NOT fire after cancel --
+    neither callbacks queued before cancel nor those registered after.
+    The underlying worker fetch still runs to completion (we never kill
+    in-flight subprocesses); cancellation only suppresses chain firing.
+    Cancel is non-strict: caches may still be populated by the completing
+    worker; only the user-visible chain is suppressed.
     """
 
-    __slots__ = ('_done', '_chain')
+    __slots__ = ('_done', '_cancelled', '_chain')
 
     def __init__(self):
         self._done = False
+        self._cancelled = False
         self._chain = []
 
     @property
     def done(self) -> bool:
         return self._done
 
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled
+
+    def cancel(self) -> None:
+        """Mark this Pending cancelled.
+
+        Subsequent ``.then()`` calls become no-ops (still return self for
+        ergonomic chaining). Any callbacks queued via ``.then()`` before
+        cancel are dropped eagerly and will NOT fire when ``_resolve``
+        eventually runs. Idempotent: calling ``cancel()`` on an already-
+        cancelled or already-resolved Pending is harmless and does not
+        undo any callbacks that already fired.
+        """
+        self._cancelled = True
+        # Drop queued callbacks eagerly so they cannot leak references.
+        self._chain.clear()
+
     def then(self, callback) -> 'Pending':
+        if self._cancelled:
+            # Silently no-op. Returning self preserves chain ergonomics:
+            # ``p.then(a).then(b)`` keeps working even after cancel.
+            return self
         if self._done:
             callback()
         else:
@@ -45,6 +76,10 @@ class Pending:
         if self._done:
             return  # idempotent -- second resolve is a no-op
         self._done = True
+        if self._cancelled:
+            # Worker completed (e.g. cache populated) but the chain was
+            # cancelled -- don't fire any callbacks.
+            return
         # Snapshot-and-clear before iterating: a callback that registers
         # further callbacks via .then() during iteration will see _done=True
         # and have its callback fire synchronously inside .then(), bypassing
@@ -752,6 +787,18 @@ class Browser:
             pending.then(on_complete)
         self.post(lambda: self._do_expand(id, pending))
         return pending
+
+    def cancel(self, *pendings) -> None:
+        """Mark one or more Pendings cancelled (sugar for ``p.cancel()``).
+
+        Idempotent on already-cancelled or already-resolved Pendings.
+        Worker fetches are not killed -- cancellation is non-strict and
+        only suppresses chained ``.then()`` callbacks from firing. Useful
+        when the user has moved on and a stale chain (e.g. cursor-to a
+        no-longer-relevant id) should not fire.
+        """
+        for p in pendings:
+            p.cancel()
 
     def select(self, ids, replace=False) -> None:
         """Add ``ids`` to ``selected`` (or replace existing selection if ``replace``).
