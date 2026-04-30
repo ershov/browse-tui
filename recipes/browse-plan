@@ -1,0 +1,393 @@
+#!/usr/bin/env -S browse-tui --python
+"""browse-plan — drop-in replacement for plan-tui on the browse-tui core.
+
+Targets parity with plan-tui's keybindings: status picker becomes
+``ctx.pick``, edit/view become ``ctx.run_external`` / ``ctx.page``,
+create/move become ``ctx.insert``. The recipe shells out to the
+``plan`` CLI (matching plan-tui's pattern) so the on-disk format and
+business logic stay single-sourced.
+
+Usage:  browse-plan [TICKET_ID]   # TICKET_ID drills into a subtree.
+"""
+
+import os
+import shutil
+import subprocess
+import sys
+
+from browse_tui import Action, Browser, Item
+
+
+# ``plan`` is on PATH in normal use; fall back to the sandvault
+# binary so the recipe still runs in the test fixture / CI environment
+# where PATH may not include it.
+PLAN_BIN = (
+    shutil.which('plan')
+    or shutil.which('plan.py')
+    or '/home/ubuntu/sandvault/bin/plan'
+)
+
+# Status -> tag style, mirroring plan-tui's _STATUS_STYLE.
+_STATUS_TAG_STYLE = {
+    'in-progress': 'green',
+    'open':        'green',
+    'blocked':     'red',
+    'assigned':    'cyan',
+    'reviewing':   'magenta',
+    'testing':     'magenta',
+    'backlog':     'yellow',
+    'deferred':    'yellow',
+    'paused':      'yellow',
+    'on-hold':     'yellow',
+    'future':      'yellow',
+    'someday':     'yellow',
+    'wishlist':    'yellow',
+    'done':        'gray',
+    'wontfix':     'gray',
+}
+
+# fzf-style status options — same order plan-tui uses (active first).
+_KNOWN_STATUSES = [
+    'in-progress', 'open', 'blocked', 'assigned', 'reviewing', 'testing',
+    'backlog', 'deferred', 'paused', 'on-hold', 'future', 'someday', 'wishlist',
+    'done', 'wontfix',
+]
+
+# Tab-separated ticket format — id, parent, status, has_children, depth, title.
+_LIST_FORMAT = (
+    'f"{id}\\t{parent}\\t{status}\\t'
+    '{1 if children() else 0}\\t{depth}\\t{title}"'
+)
+
+
+# ---- subprocess helpers --------------------------------------------------
+
+
+def _run_plan(*args, capture=True):
+    """Run ``plan`` with argv ``args`` and return ``CompletedProcess``.
+
+    A 30s timeout matches plan-tui; in the rare timeout case we return
+    a synthetic non-zero result so callers can surface the error
+    uniformly via the ``ctx.error`` channel.
+    """
+    full = [PLAN_BIN] + list(args)
+    try:
+        return subprocess.run(
+            full,
+            capture_output=capture,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=30,
+        )
+    except Exception as e:
+        return subprocess.CompletedProcess(
+            args=full, returncode=1, stdout='', stderr=str(e),
+        )
+
+
+def _parse_ticket_line(line):
+    """Parse one line of ``_LIST_FORMAT`` into an ``Item`` (or None)."""
+    parts = line.split('\t', 5)
+    if len(parts) < 6:
+        return None
+    try:
+        tid = int(parts[0])
+    except ValueError:
+        return None
+    status = parts[2]
+    title = parts[5]
+    has_children = parts[3] == '1'
+    return Item(
+        id=tid,
+        title=title,
+        tag=status,
+        tag_style=_STATUS_TAG_STYLE.get(status, ''),
+        has_children=has_children,
+    )
+
+
+# ---- data callbacks ------------------------------------------------------
+#
+# ``parent_id`` maps as follows:
+#   - ``None`` (Browser root)        -> the synthetic Project + root tickets.
+#   - ``0`` (Project synthetic id)   -> all root-level tickets via plan list.
+#   - any positive int               -> direct children of ticket ``parent_id``.
+
+
+def get_children(parent_id):
+    """Lazy children fetch via the ``plan`` CLI.
+
+    Plan-tui's behaviour for the root scope: synthesize a "Project" entry
+    at id=0 above the real root tickets so the user can ``view`` /
+    ``edit`` the project preamble. We do the same — see ``visible_tickets``
+    in plan-source/src-tui/040-state.py.
+    """
+    if parent_id is None:
+        # Top of the Browser tree: insert the synthetic Project entry as
+        # a non-expandable header, followed by every root-level ticket.
+        # Plan-tui renders the Project this way — the row exists so the
+        # user can ``v``/``e`` (view/edit) the project preamble, but the
+        # actual root tickets render as flat siblings beneath it (they
+        # are NOT children of the Project entry).
+        items = [Item(
+            id=0,
+            title='Project',
+            tag='',
+            tag_style='',
+            has_children=False,
+        )]
+        items.extend(_list_root_tickets())
+        return items
+
+    # Real ticket id — fetch its direct children. plan-tui uses ``-r list``
+    # and post-filters by depth (the parent always sits at the smallest
+    # depth in the result; direct children are at parent_depth + 1).
+    result = _run_plan(str(parent_id), '-r', 'list', '--format', _LIST_FORMAT)
+    if result.returncode != 0:
+        return []
+    lines = [ln for ln in result.stdout.splitlines() if ln.strip()]
+    if not lines:
+        return []
+    parsed = [(_parse_ticket_line(ln), _depth_of(ln)) for ln in lines]
+    parsed = [(it, d) for (it, d) in parsed if it is not None]
+    if not parsed:
+        return []
+    parent_depth = parsed[0][1]
+    child_depth = parent_depth + 1
+    return [it for (it, d) in parsed if d == child_depth and it.id != parent_id]
+
+
+def _depth_of(line):
+    """Return the depth column from a ``_LIST_FORMAT`` line, or -1."""
+    parts = line.split('\t', 5)
+    if len(parts) < 6:
+        return -1
+    try:
+        return int(parts[4])
+    except ValueError:
+        return -1
+
+
+def _list_root_tickets():
+    """Return the root-level tickets as ``Item`` objects."""
+    result = _run_plan('list', '--format', _LIST_FORMAT)
+    if result.returncode != 0:
+        return []
+    items = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Filter to the topmost depth — plan list emits the entire tree
+        # and we only want the roots here. Any deeper rows are reachable
+        # via expansion (which calls get_children with the real id).
+        try:
+            depth = int(line.split('\t', 5)[4])
+        except (ValueError, IndexError):
+            continue
+        if depth != 0:
+            continue
+        it = _parse_ticket_line(line)
+        if it is not None:
+            items.append(it)
+    return items
+
+
+def get_preview(item_id):
+    """Preview pane content = ``plan get`` output for the ticket / project."""
+    if item_id == 0:
+        result = _run_plan('project', 'get')
+    else:
+        result = _run_plan(str(item_id), 'get')
+    if result.returncode != 0:
+        return result.stderr.strip() or '(no preview)'
+    return result.stdout
+
+
+# ---- actions -------------------------------------------------------------
+
+
+def _selected_real_ids(ctx):
+    """Return the targets, dropping the synthetic Project (id=0) entry.
+
+    Status / move / etc. don't apply to the Project pseudo-ticket; we
+    silently strip it so a stray space-select on row 0 doesn't cause
+    a "no such ticket" error.
+    """
+    return [t.id for t in ctx.targets if t.id != 0]
+
+
+def _action_status(ctx):
+    """Pop a fzf-style picker, then run ``plan IDS status NEW`` on targets."""
+    ids = _selected_real_ids(ctx)
+    if not ids:
+        return
+    options = list(_KNOWN_STATUSES) + ['custom...']
+    chosen = ctx.pick('status', options)
+    if chosen is None:
+        return
+    if chosen == 'custom...':
+        custom = ctx.input('Status: ')
+        if custom is None:
+            return
+        custom = custom.strip()
+        if not custom:
+            return
+        chosen = custom
+    args = [str(i) for i in ids] + ['status', chosen]
+    result = _run_plan(*args)
+    if result.returncode != 0:
+        ctx.error(result.stderr.strip() or 'status command failed')
+        return
+    ctx.refresh()
+
+
+def _action_edit(ctx, recursive=False):
+    """Open ``$EDITOR`` on the cursor ticket via ``plan edit``."""
+    if ctx.cursor is None:
+        return
+    cmd = [PLAN_BIN, 'edit']
+    if recursive:
+        cmd.append('-r')
+    cmd.append('project' if ctx.cursor.id == 0 else str(ctx.cursor.id))
+    rc = ctx.run_external(cmd)
+    if rc != 0:
+        ctx.error(f'edit exited {rc}')
+    ctx.refresh()
+
+
+def _action_view(ctx, recursive=False):
+    """Pipe ``plan get`` output into ``ctx.page`` (bat/less)."""
+    if ctx.cursor is None:
+        return
+    cid = ctx.cursor.id
+    if cid == 0:
+        args = ('project', 'get')
+    elif recursive:
+        args = (str(cid), '-r', 'get')
+    else:
+        args = (str(cid), 'get')
+    result = _run_plan(*args)
+    if result.returncode != 0:
+        ctx.error(result.stderr.strip() or 'view command failed')
+        return
+    ctx.page(result.stdout, lang='md')
+
+
+def _action_create(ctx, recursive=False):
+    """Enter insert mode; on confirm, ``plan create -e`` at the chosen position."""
+    if ctx.cursor is None:
+        return
+    label = 'create -r' if recursive else 'create'
+
+    def on_confirm(relation, dest_id):
+        cmd = [PLAN_BIN, 'create', '-e']
+        if recursive:
+            cmd.append('-r')
+        cmd.append(f'title="New ticket", move="{relation} {dest_id}"')
+        rc = ctx.run_external(cmd)
+        if rc != 0:
+            ctx.error(f'create exited {rc}')
+        ctx.refresh()
+
+    ctx.insert(label, on_confirm)
+
+
+def _action_move(ctx):
+    """Enter insert mode; on confirm, ``plan IDS move RELATION DEST``."""
+    ids = _selected_real_ids(ctx)
+    if not ids:
+        return
+
+    def on_confirm(relation, dest_id):
+        if dest_id in ids:
+            ctx.error('cannot move into self')
+            return
+        args = [str(i) for i in ids] + ['move', relation, str(dest_id)]
+        result = _run_plan(*args)
+        if result.returncode != 0:
+            ctx.error(result.stderr.strip() or 'move command failed')
+            return
+        ctx.refresh()
+
+    ctx.insert('move', on_confirm)
+
+
+def _action_close(ctx):
+    """``plan IDS close`` — closes the targets, refreshes the view."""
+    ids = _selected_real_ids(ctx)
+    if not ids:
+        return
+    args = [str(i) for i in ids] + ['close']
+    result = _run_plan(*args)
+    if result.returncode != 0:
+        ctx.error(result.stderr.strip() or 'close command failed')
+        return
+    ctx.refresh()
+
+
+def _action_reopen(ctx):
+    """``plan IDS reopen`` — reopens the targets, refreshes the view."""
+    ids = _selected_real_ids(ctx)
+    if not ids:
+        return
+    args = [str(i) for i in ids] + ['reopen']
+    result = _run_plan(*args)
+    if result.returncode != 0:
+        ctx.error(result.stderr.strip() or 'reopen command failed')
+        return
+    ctx.refresh()
+
+
+def _action_command_log(ctx):
+    """browse-plan equivalent of plan-tui's ``~`` command-log.
+
+    plan-tui keeps a per-process audit log of every ``plan`` call it
+    runs; that surface is plan-tui-internal and not generalisable, so
+    browse-plan instead surfaces the project's overall state via
+    ``plan project get``. The ticket spec calls this out explicitly.
+    """
+    result = _run_plan('project', 'get')
+    text = result.stdout if result.returncode == 0 else (
+        result.stderr.strip() or '(no project content)'
+    )
+    ctx.page(text, lang='md')
+
+
+# ---- entry point ---------------------------------------------------------
+
+
+def main():
+    initial_scope = None
+    if len(sys.argv) > 1:
+        try:
+            initial_scope = int(sys.argv[1])
+        except ValueError:
+            sys.stderr.write(f'browse-plan: invalid ticket id {sys.argv[1]!r}\n')
+            sys.exit(2)
+
+    b = Browser(
+        title='browse-plan',
+        get_children=get_children,
+        get_preview=get_preview,
+        root_id=None,
+        initial_scope=initial_scope,
+        actions=[
+            Action('s', 'Status',          _action_status,                       'targets'),
+            Action('e', 'Edit',            lambda ctx: _action_edit(ctx),        'cursor'),
+            Action('E', 'Edit recursive',  lambda ctx: _action_edit(ctx, True),  'cursor'),
+            Action('v', 'View',            lambda ctx: _action_view(ctx),        'cursor'),
+            Action('V', 'View recursive',  lambda ctx: _action_view(ctx, True),  'cursor'),
+            Action('c', 'Create',          lambda ctx: _action_create(ctx),      'cursor'),
+            Action('C', 'Create bulk',     lambda ctx: _action_create(ctx, True), 'cursor'),
+            Action('m', 'Move',            _action_move,                         'targets'),
+            Action('x', 'Close',           _action_close,                        'targets'),
+            Action('o', 'Reopen',          _action_reopen,                       'targets'),
+            Action('~', 'Command log',     _action_command_log,                  'none'),
+        ],
+    )
+    sys.exit(b.run())
+
+
+if __name__ == '__main__':
+    main()

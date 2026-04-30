@@ -1176,11 +1176,17 @@ NAVIGATION
   PgUp, PgDn       Page up/down
   Right            Expand node / move to first child
   Left             Collapse node / move to parent
+  Alt-Right        Expand siblings recursively
+  Alt-Left         Collapse siblings recursively
+  Alt-Down         Scope down into item
+  Alt-Up           Scope up to parent
 
 PREVIEW
   Ctrl-P           Toggle preview pane
   Shift-Down       Scroll preview line down
   Shift-Up         Scroll preview line up
+  Alt-PgDn         Scroll preview page down
+  Alt-PgUp         Scroll preview page up
 
 SEARCH
   /                Enter search mode

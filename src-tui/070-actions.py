@@ -401,6 +401,142 @@ def _search_prev(ctx):
         browser._needs_redraw.add('children')
 
 
+# ---- recursive expand/collapse + preview scroll ---------------------------
+#
+# The four "missing" plan-tui keybindings (alt-right/alt-left expand-or-
+# collapse-siblings-recursively; shift-up/shift-down + alt-pgup/alt-pgdn
+# scroll the preview pane) are core navigation aids — every recipe that
+# shows a tree or a preview will want them. They live as built-in
+# defaults so recipes can lean on them without re-implementing the
+# tree-walk every time.
+
+
+def _expand_recursive(ctx):
+    """alt-right — expand siblings (and their descendants) at cursor depth.
+
+    The "siblings" here are the children of the cursor's parent: we walk
+    back through the visible list to find the first row at a shallower
+    depth (that's the parent), then recursively expand every cached
+    descendant of that parent that has children. For uncached branches
+    we kick a fetch via ``ctx.expand`` so they resolve on the next
+    drain.
+
+    No-op when the cursor row isn't a normal item (placeholder /
+    scope_root / empty list).
+    """
+    state = ctx._browser._state
+    if ctx.cursor is None:
+        return
+    vis = visible_items(state)
+    cur_idx = state.cursor
+    if not (0 <= cur_idx < len(vis)):
+        return
+    cur_entry = vis[cur_idx]
+    if cur_entry.kind != 'normal':
+        return
+    cur_depth = cur_entry.depth
+    # Walk back to the parent row (first shallower depth) — fall back to
+    # the current scope root when we don't find one (cursor at root).
+    parent_id = current_scope(state)
+    for i in range(cur_idx - 1, -1, -1):
+        if vis[i].depth < cur_depth:
+            if vis[i].kind == 'normal':
+                parent_id = vis[i].item.id
+            break
+
+    def _expand_subtree(pid):
+        children = state._children.get(pid)
+        if children is None:
+            # Not cached — kick a fetch; the placeholder row resolves
+            # asynchronously and the user can press alt-right again to
+            # drill deeper once it lands.
+            ctx.expand(pid)
+            return
+        for c in children:
+            if getattr(c, 'has_children', False):
+                state.expanded.add(c.id)
+                _expand_subtree(c.id)
+
+    _expand_subtree(parent_id)
+    mark_visible_dirty(state)
+    ctx._browser._needs_redraw.add('all')
+
+
+def _collapse_recursive(ctx):
+    """alt-left — collapse siblings (and their descendants) at cursor depth.
+
+    Mirror of ``_expand_recursive``: find the parent row, then drop
+    every cached descendant of that parent from ``state.expanded``.
+    """
+    state = ctx._browser._state
+    if ctx.cursor is None:
+        return
+    vis = visible_items(state)
+    cur_idx = state.cursor
+    if not (0 <= cur_idx < len(vis)):
+        return
+    cur_entry = vis[cur_idx]
+    if cur_entry.kind != 'normal':
+        return
+    cur_depth = cur_entry.depth
+    parent_id = current_scope(state)
+    for i in range(cur_idx - 1, -1, -1):
+        if vis[i].depth < cur_depth:
+            if vis[i].kind == 'normal':
+                parent_id = vis[i].item.id
+            break
+
+    def _collect_descendants(pid, out):
+        children = state._children.get(pid, [])
+        for c in children:
+            out.add(c.id)
+            _collect_descendants(c.id, out)
+
+    descendants = set()
+    _collect_descendants(parent_id, descendants)
+    if descendants:
+        state.expanded -= descendants
+        mark_visible_dirty(state)
+        ctx._browser._needs_redraw.add('all')
+
+
+def _preview_scroll_down(ctx):
+    """shift-down — scroll preview by one line.
+
+    The high-end clamp is enforced by ``render_preview`` (it skips any
+    src_idx beyond the wrapped-line count). We just bump the offset and
+    let the renderer ignore it gracefully when off-end.
+    """
+    ctx._browser._preview_scroll += 1
+    ctx._browser._needs_redraw.add('preview')
+
+
+def _preview_scroll_up(ctx):
+    """shift-up — scroll preview up by one line (clamped at 0)."""
+    if ctx._browser._preview_scroll > 0:
+        ctx._browser._preview_scroll -= 1
+        ctx._browser._needs_redraw.add('preview')
+
+
+def _preview_page_down(ctx):
+    """alt-pgdn — scroll preview down by ``_PAGE_ROWS`` lines.
+
+    Same off-end semantics as ``_preview_scroll_down``: the renderer
+    gracefully ignores out-of-range offsets so we don't need to thread
+    layout geometry through every action.
+    """
+    ctx._browser._preview_scroll += _PAGE_ROWS
+    ctx._browser._needs_redraw.add('preview')
+
+
+def _preview_page_up(ctx):
+    """alt-pgup — scroll preview up by ``_PAGE_ROWS`` lines (clamped at 0)."""
+    ctx._browser._preview_scroll = max(
+        0, ctx._browser._preview_scroll - _PAGE_ROWS
+    )
+    ctx._browser._needs_redraw.add('preview')
+
+
 # ---- default keybindings list ---------------------------------------------
 
 
@@ -424,11 +560,21 @@ def default_actions():
         Action('pgup',      'Page up',        _nav_pgup,        'none'),
         Action('right',     'Expand',         _nav_right,       'cursor'),
         Action('left',      'Collapse',       _nav_left,        'cursor'),
+        # Recursive expand/collapse — gate on 'cursor' so we don't run the
+        # tree walk on an empty visible list.
+        Action('alt-right', 'Expand siblings',   _expand_recursive,   'cursor'),
+        Action('alt-left',  'Collapse siblings', _collapse_recursive, 'cursor'),
         # Scoping. alt-down requires a cursor (and silently no-ops on
         # leaves inside the handler); alt-up is gated 'none' because the
         # root-state no-op is also handled inside the handler.
         Action('alt-down',  'Scope in',       _scope_down,      'cursor'),
         Action('alt-up',    'Scope out',      _scope_up,        'none'),
+        # Preview scroll — gate 'none' so they work even when the visible
+        # list is empty (help/error pages still want scrolling).
+        Action('shift-down', 'Preview scroll down', _preview_scroll_down, 'none'),
+        Action('shift-up',   'Preview scroll up',   _preview_scroll_up,   'none'),
+        Action('alt-pgdn',   'Preview page down',   _preview_page_down,   'none'),
+        Action('alt-pgup',   'Preview page up',     _preview_page_up,     'none'),
         # Multi-select bindings. ``read_key`` returns ``'space'`` for the
         # bare spacebar (special-cased in 020-terminal) but Alt+Space
         # arrives as ESC + ' ' which the alt-prefix branch turns into the

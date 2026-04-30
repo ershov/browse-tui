@@ -29,6 +29,7 @@ _state.notify_wake = _term.notify_wake
 
 _actions.visible_items = _state.visible_items
 _actions.mark_visible_dirty = _state.mark_visible_dirty
+_actions.current_scope = _state.current_scope
 _actions._search_find = _state._search_find
 _actions._search_jump_nearest = _state._search_jump_nearest
 
@@ -423,6 +424,114 @@ class TestAddAction(unittest.TestCase):
             es = [a for a in b.actions if a.key == 'e']
             self.assertEqual(len(es), 1)
             self.assertEqual(es[0].label, 'second')
+        finally:
+            b.stop_workers()
+
+
+# --- recursive expand/collapse + preview scroll ---------------------------
+
+
+class TestExpandCollapseRecursive(unittest.TestCase):
+    """alt-right / alt-left expand-or-collapse all sibling subtrees."""
+
+    def _tree(self):
+        # A two-level tree:
+        #   root: [A (kids), B (kids), C (leaf)]
+        #   A: [A1 (kids), A2]; A1: [A1a]
+        #   B: [B1]
+        b = _make_browser()
+        s = b._state
+        s._children[None] = [
+            Item(id='A', has_children=True),
+            Item(id='B', has_children=True),
+            Item(id='C'),
+        ]
+        s._children['A'] = [
+            Item(id='A1', has_children=True),
+            Item(id='A2'),
+        ]
+        s._children['A1'] = [Item(id='A1a')]
+        s._children['B'] = [Item(id='B1')]
+        return b
+
+    def test_expand_recursive_expands_all_branch_siblings(self):
+        b = self._tree()
+        try:
+            ctx = _ctx_for(b)
+            # Start with cursor on A — its parent is the root.
+            self.assertTrue(dispatch_key(b, ctx, 'alt-right'))
+            # Branches A, A1, B should all be in expanded; leaves C, A2,
+            # A1a, B1 must not.
+            self.assertIn('A', b._state.expanded)
+            self.assertIn('A1', b._state.expanded)
+            self.assertIn('B', b._state.expanded)
+            self.assertNotIn('C', b._state.expanded)
+            self.assertNotIn('A2', b._state.expanded)
+            self.assertNotIn('A1a', b._state.expanded)
+        finally:
+            b.stop_workers()
+
+    def test_collapse_recursive_drops_all_descendants(self):
+        b = self._tree()
+        # Pre-expand the tree so we have something to collapse.
+        b._state.expanded = {'A', 'A1', 'B'}
+        try:
+            ctx = _ctx_for(b)
+            self.assertTrue(dispatch_key(b, ctx, 'alt-left'))
+            # Everything below the (root) parent collapses.
+            self.assertEqual(b._state.expanded, set())
+        finally:
+            b.stop_workers()
+
+
+class TestPreviewScrollActions(unittest.TestCase):
+    """shift-up/down + alt-pgup/pgdn drive ``_preview_scroll``."""
+
+    def test_shift_down_increments_scroll(self):
+        b = _make_browser()
+        try:
+            ctx = _ctx_for(b)
+            self.assertEqual(b._preview_scroll, 0)
+            dispatch_key(b, ctx, 'shift-down')
+            self.assertEqual(b._preview_scroll, 1)
+            dispatch_key(b, ctx, 'shift-down')
+            self.assertEqual(b._preview_scroll, 2)
+        finally:
+            b.stop_workers()
+
+    def test_shift_up_decrements_clamped(self):
+        b = _make_browser()
+        try:
+            ctx = _ctx_for(b)
+            b._preview_scroll = 2
+            dispatch_key(b, ctx, 'shift-up')
+            self.assertEqual(b._preview_scroll, 1)
+            dispatch_key(b, ctx, 'shift-up')
+            self.assertEqual(b._preview_scroll, 0)
+            # Already 0 — clamps; doesn't go negative.
+            dispatch_key(b, ctx, 'shift-up')
+            self.assertEqual(b._preview_scroll, 0)
+        finally:
+            b.stop_workers()
+
+    def test_alt_pgdn_jumps_by_page(self):
+        b = _make_browser()
+        try:
+            ctx = _ctx_for(b)
+            dispatch_key(b, ctx, 'alt-pgdn')
+            # Default _PAGE_ROWS is 10.
+            self.assertEqual(b._preview_scroll, 10)
+        finally:
+            b.stop_workers()
+
+    def test_alt_pgup_jumps_by_page_clamped(self):
+        b = _make_browser()
+        try:
+            ctx = _ctx_for(b)
+            b._preview_scroll = 7
+            dispatch_key(b, ctx, 'alt-pgup')
+            # Clamped at 0.
+            self.assertEqual(b._preview_scroll, 0)
         finally:
             b.stop_workers()
 
