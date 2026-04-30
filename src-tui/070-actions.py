@@ -224,6 +224,59 @@ def _suspend(ctx):
     os.kill(os.getpid(), signal.SIGTSTP)
 
 
+def _scope_down(ctx):
+    """Drill into the cursor item — push it onto ``scope_stack``.
+
+    Branches only: leaves are silently ignored (phase-2 simplification —
+    there's nothing to descend into). The new scope's expanded set is
+    restored from ``_expanded_by_scope`` automatically by ``scope_into``;
+    if its children weren't cached we kick a fetch so the placeholder
+    row resolves promptly.
+    """
+    state = ctx._browser._state
+    item = ctx.cursor
+    if item is None:
+        return
+    if not getattr(item, 'has_children', False):
+        return  # don't scope into leaves; phase-2 simplification
+    scope_into(state, item.id)
+    # Land the cursor on the scope_root row at the top of the new view.
+    state.cursor = 0
+    if item.id not in state._children:
+        # Trigger a fetch — ``expand`` is the cheapest entry point;
+        # adds id to expanded and enqueues the children fetch. The
+        # scope_root row is rendered regardless; the placeholder under
+        # it shows ``loading…`` until results land.
+        ctx.expand(item.id)
+    ctx._browser._needs_redraw.add('all')
+
+
+def _scope_up(ctx):
+    """Pop the top of ``scope_stack``; cursor lands on the popped id.
+
+    No-op when already at the root (``scope_stack`` empty). After
+    popping, walks the new visible tree to find the id we just left
+    and parks the cursor on it — so the user feels "I came back from
+    there" rather than landing arbitrarily.
+    """
+    state = ctx._browser._state
+    popped = scope_out(state)
+    if popped is None:
+        return  # already at root
+    # Place cursor on the row we drilled into earlier.
+    vis = visible_items(state)
+    placed = False
+    for i, entry in enumerate(vis):
+        if entry.kind == 'normal' and entry.item.id == popped:
+            state.cursor = i
+            placed = True
+            break
+    if not placed:
+        # Fallback: clamp to a sensible position.
+        state.cursor = 0
+    ctx._browser._needs_redraw.add('all')
+
+
 def _select_toggle_down(ctx):
     """Toggle selection of the cursor item, then move the cursor down.
 
@@ -336,6 +389,11 @@ def default_actions():
         Action('pgup',      'Page up',        _nav_pgup,        'none'),
         Action('right',     'Expand',         _nav_right,       'cursor'),
         Action('left',      'Collapse',       _nav_left,        'cursor'),
+        # Scoping. alt-down requires a cursor (and silently no-ops on
+        # leaves inside the handler); alt-up is gated 'none' because the
+        # root-state no-op is also handled inside the handler.
+        Action('alt-down',  'Scope in',       _scope_down,      'cursor'),
+        Action('alt-up',    'Scope out',      _scope_up,        'none'),
         # Multi-select bindings. ``read_key`` returns ``'space'`` for the
         # bare spacebar (special-cased in 020-terminal) but Alt+Space
         # arrives as ESC + ' ' which the alt-prefix branch turns into the

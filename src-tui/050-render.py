@@ -479,15 +479,44 @@ _SB_BG = 236   # dark gray status-bar background
 _SB_FG = 252   # light gray status-bar text
 
 
+def _scope_crumb_text(browser):
+    """Return the scope-crumb plain-text string (or '' when unscoped).
+
+    Format: ``' ▸ a ▸ b ▸ c '`` — one ``▸ <id>`` segment per stack
+    entry, with leading and trailing single spaces. Returns empty
+    string when ``scope_stack`` is empty so callers can short-circuit.
+
+    Phase-2 deliberately renders the full crumb without truncation —
+    on narrow terminals the crumb may eat hint space or the label
+    fillers (the renderer still clamps writes at ``cols`` so nothing
+    spills off-screen, just hint/label visibility degrades). Phase-3
+    can layer adaptive truncation on top.
+    """
+    if browser is None:
+        return ''
+    stack = browser._state.scope_stack
+    if not stack:
+        return ''
+    return ' ' + ' '.join('▸ {}'.format(sid) for sid in stack) + ' '
+
+
 def render_separator(row, cols, label, *, info=False, browser=None):
     """Render the info-bar / pane-separator row.
 
     When ``info=True`` the separator additionally shows:
       * ``[N]`` selection count (if non-zero) in bold cyan;
+      * a scope crumb path (when ``scope_stack`` is non-empty) — one
+        ``▸ <id>`` segment per stack entry in bright cyan;
       * the search prompt + query (when ``browser._search_mode``);
       * a dim hint string about navigation keys (when not searching).
 
     The right edge ends with the pane label (``Preview``, ``Help``, …).
+
+    No truncation is applied to the scope crumb in this phase — on a
+    narrow terminal the crumb may push the hint text out of view (or
+    eat into the trailing filler before the label). Writes are still
+    clamped at ``cols`` so nothing spills off-screen; only hint/filler
+    visibility degrades. Phase-3 can layer adaptive truncation.
     """
     S = '─'  # ─
     move(row, 1)
@@ -496,9 +525,11 @@ def render_separator(row, cols, label, *, info=False, browser=None):
     if info and browser is not None:
         sel_count = len(browser._state.selected)
         search = browser._search_query if browser._search_mode else None
+        crumb = _scope_crumb_text(browser)
     else:
         sel_count = 0
         search = None
+        crumb = ''
 
     label_str = ' {} '.format(label)
     pos = 0
@@ -515,6 +546,16 @@ def render_separator(row, cols, label, *, info=False, browser=None):
         set_style(fg=6, bold=True)
         write(sel_str[:cols - pos])
         pos += len(sel_str)
+        set_style(fg=8)
+
+    # Scope crumb (between selection count and the spacer-to-7). Bright
+    # cyan, no bold — distinguishable from the selection count without
+    # being shouty. Written *before* the spacer so the crumb sits
+    # adjacent to the selection count when both are present.
+    if crumb and pos < cols:
+        set_style(fg=14)  # bright cyan
+        write(crumb[:cols - pos])
+        pos += min(len(crumb), cols - pos)
         set_style(fg=8)
 
     # Spacer to position 7 (where the search prompt / hints start).

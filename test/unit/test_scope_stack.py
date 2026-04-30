@@ -10,18 +10,45 @@ import unittest
 
 from test.unit._loader import load
 
+_term = load('_browse_tui_term', '020-terminal.py')
 _data = load('_browse_tui_data', '030-data.py')
 _state = load('_browse_tui_state', '040-state.py')
+_actions = load('_browse_tui_actions', '070-actions.py')
 
 # Inject Item — see test_visible_tree.py for explanation.
 _state.Item = _data.Item
+_state.to_item = _data.to_item
+_state.notify_wake = _term.notify_wake
+
+# The actions module references ``visible_items``, ``mark_visible_dirty``,
+# ``scope_into``, ``scope_out`` from globals — production builds get them
+# via concatenation; the test loader injects them by hand.
+_actions.visible_items = _state.visible_items
+_actions.mark_visible_dirty = _state.mark_visible_dirty
+_actions.scope_into = _state.scope_into
+_actions.scope_out = _state.scope_out
 
 Item = _data.Item
 State = _state.State
+Browser = _state.Browser
 visible_items = _state.visible_items
 scope_into = _state.scope_into
 scope_out = _state.scope_out
 current_scope = _state.current_scope
+dispatch_key = _actions.dispatch_key
+
+
+def _ctx_for(browser):
+    """Build a real Context for the given browser (matches test_actions)."""
+    _context = load('_browse_tui_context', '060-context.py')
+    _context.visible_items = _state.visible_items
+    return _context.Context(browser)
+
+
+def _make_browser(**kw):
+    """Build a headless Browser; tests call stop_workers in tearDown."""
+    kw.setdefault('_headless', True)
+    return Browser(**kw)
 
 
 def _kid(id_, has_children=False):
@@ -148,6 +175,175 @@ class TestScopeMarksDirty(unittest.TestCase):
         self.assertFalse(s._visible_dirty)
         scope_out(s)
         self.assertTrue(s._visible_dirty)
+
+
+# --- dispatch path: alt-down / alt-up -------------------------------------
+
+
+class TestAltDownDispatch(unittest.TestCase):
+    """Dispatching 'alt-down' pushes scope when cursor is on a branch."""
+
+    def test_alt_down_pushes_scope(self):
+        b = _make_browser()
+        try:
+            b._state._children[None] = [
+                Item(id='A', has_children=True),
+                Item(id='B'),
+            ]
+            b._state._children['A'] = [Item(id='a1'), Item(id='a2')]
+            ctx = _ctx_for(b)
+            self.assertTrue(dispatch_key(b, ctx, 'alt-down'))
+            # ``ctx.expand`` posts; drain so the in-flight expand resolves
+            # against the cached children.
+            b.drain_main_queue()
+            self.assertEqual(b._state.scope_stack, ['A'])
+            self.assertEqual(b._state.cursor, 0)
+        finally:
+            b.stop_workers()
+
+    def test_alt_down_on_leaf_is_noop(self):
+        b = _make_browser()
+        try:
+            b._state._children[None] = [Item(id='A'), Item(id='B')]
+            ctx = _ctx_for(b)
+            # Cursor on 'A' (a leaf — has_children defaults to False).
+            self.assertTrue(dispatch_key(b, ctx, 'alt-down'))
+            self.assertEqual(b._state.scope_stack, [])
+        finally:
+            b.stop_workers()
+
+    def test_alt_down_at_no_cursor_is_noop(self):
+        # Empty visible list — cursor resolves to None; the gate
+        # 'cursor' on the alt-down Action should swallow the dispatch
+        # silently with no scope change and no error.
+        b = _make_browser()
+        try:
+            ctx = _ctx_for(b)
+            # dispatch returns True (gated) but does not run the handler.
+            dispatch_key(b, ctx, 'alt-down')
+            self.assertEqual(b._state.scope_stack, [])
+        finally:
+            b.stop_workers()
+
+
+class TestAltUpDispatch(unittest.TestCase):
+    """Dispatching 'alt-up' pops scope and re-positions the cursor."""
+
+    def test_alt_up_pops_scope_and_places_cursor_on_popped_id(self):
+        b = _make_browser()
+        try:
+            b._state._children[None] = [
+                Item(id='A', has_children=True),
+                Item(id='B'),
+            ]
+            b._state._children['A'] = [Item(id='a1')]
+            scope_into(b._state, 'A')
+            ctx = _ctx_for(b)
+            self.assertTrue(dispatch_key(b, ctx, 'alt-up'))
+            self.assertEqual(b._state.scope_stack, [])
+            # Cursor lands on 'A' in the now-current root view.
+            vis = visible_items(b._state)
+            self.assertEqual(vis[b._state.cursor].item.id, 'A')
+        finally:
+            b.stop_workers()
+
+    def test_alt_up_at_root_is_noop(self):
+        b = _make_browser()
+        try:
+            b._state._children[None] = [Item(id='A'), Item(id='B')]
+            b._state.cursor = 1
+            ctx = _ctx_for(b)
+            dispatch_key(b, ctx, 'alt-up')
+            self.assertEqual(b._state.scope_stack, [])
+            self.assertEqual(b._state.cursor, 1)
+        finally:
+            b.stop_workers()
+
+
+class TestPerScopeExpandedRoundTrip(unittest.TestCase):
+    """Per-scope expanded sets survive scope-out/scope-in cycles."""
+
+    def test_per_scope_expanded_preserved_round_trip(self):
+        b = _make_browser()
+        try:
+            b._state._children[None] = [
+                Item(id='A', has_children=True),
+                Item(id='X', has_children=True),
+            ]
+            b._state._children['A'] = [Item(id='a1', has_children=True)]
+            b._state._children['a1'] = [Item(id='a1a')]
+            b._state._children['X'] = [Item(id='x1')]
+            ctx = _ctx_for(b)
+            # At root: expand X (a sibling of A whose children are cached).
+            b._state.expanded.add('X')
+            # Cursor is on 'A' (index 0 in the visible list).
+            self.assertEqual(b._state.cursor, 0)
+            # Drill into A.
+            self.assertTrue(dispatch_key(b, ctx, 'alt-down'))
+            b.drain_main_queue()
+            self.assertEqual(b._state.scope_stack, ['A'])
+            # Inside A: expand a1.
+            b._state.expanded.add('a1')
+            # Pop back to root.
+            self.assertTrue(dispatch_key(b, ctx, 'alt-up'))
+            self.assertEqual(b._state.scope_stack, [])
+            # Root's expanded set is preserved (X was set there originally,
+            # a1 was set in A's scope and must NOT bleed).
+            self.assertEqual(b._state.expanded, {'X'})
+            # Cursor sits on A in the now-current view.
+            vis = visible_items(b._state)
+            self.assertEqual(vis[b._state.cursor].item.id, 'A')
+            # Drill into A again.
+            self.assertTrue(dispatch_key(b, ctx, 'alt-down'))
+            b.drain_main_queue()
+            # A's expanded set is restored to what we set last time.
+            self.assertEqual(b._state.expanded, {'a1'})
+        finally:
+            b.stop_workers()
+
+
+# --- scope crumb rendering ------------------------------------------------
+
+
+class TestScopeCrumbText(unittest.TestCase):
+    """The plain-text scope-crumb helper used by the renderer."""
+
+    def setUp(self):
+        # Lazy-load render module + Item injection (mirrors test_render).
+        self._render = load('_browse_tui_render2', '050-render.py')
+        self._render.Item = Item
+
+    def test_unscoped_returns_empty_string(self):
+        b = _make_browser()
+        try:
+            self.assertEqual(self._render._scope_crumb_text(b), '')
+        finally:
+            b.stop_workers()
+
+    def test_one_level_scope_renders_single_segment(self):
+        b = _make_browser()
+        try:
+            scope_into(b._state, 'A')
+            crumb = self._render._scope_crumb_text(b)
+            self.assertIn('▸ A', crumb)
+            # Leading and trailing single space — see helper docstring.
+            self.assertTrue(crumb.startswith(' '))
+            self.assertTrue(crumb.endswith(' '))
+        finally:
+            b.stop_workers()
+
+    def test_nested_scope_renders_multiple_segments(self):
+        b = _make_browser()
+        try:
+            scope_into(b._state, 'A')
+            scope_into(b._state, 'B')
+            crumb = self._render._scope_crumb_text(b)
+            self.assertIn('▸ A', crumb)
+            self.assertIn('▸ B', crumb)
+            # Order: A before B.
+            self.assertLess(crumb.index('A'), crumb.index('B'))
+        finally:
+            b.stop_workers()
 
 
 if __name__ == '__main__':
