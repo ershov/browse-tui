@@ -93,6 +93,13 @@ class State:
     _children_pending: set = field(default_factory=set)
     _visible_dirty: bool = True
     _visible_cache: list = field(default_factory=list)
+    # Cursor index into the visible-tree list, and the user-selected ids
+    # (rendered with a ``*`` marker by the renderer in ticket #10). Both
+    # live on State so unit tests can construct one without spinning up
+    # a Browser, and so the visible-tree builder can read ``selected``
+    # later when it wires marker columns.
+    cursor: int = 0
+    selected: set = field(default_factory=set)
 
 
 # ---- scope management ----------------------------------------------------
@@ -316,27 +323,59 @@ class Browser:
     schedule work without taking locks -- the main thread drains the
     queue on every wake.
 
-    Construction kwargs (others arrive in ticket #8):
-      get_children: callable (parent_id) -> Iterable[Item|str|tuple|dict]
-      get_preview:  callable (item_id) -> str | None
-      root_id:      Any (default None)
-      _headless:    bool (skip terminal init; default False) -- the flag
-                    is observable here for tests; the actual terminal
-                    init/teardown branches on it once #9 lands.
+    Construction kwargs (full spec'd surface):
+      title:              window title (renderer in #10).
+      get_children:       (parent_id) -> Iterable[Item|str|tuple|dict].
+      get_preview:        (item_id) -> str | None.
+      actions:            list of Action objects (Action lands in #11;
+                          phase 1 stores the list opaquely).
+      on_enter:           default-action handler; #13 wires fall-back
+                          print+exit when None.
+      format_item:        (item, ctx) -> [(text, fg, bold), …]; renderer
+                          consumes in #10.
+      root_id:            Any (default None).
+      initial_scope:      if set, pushed onto scope_stack at construction.
+      show_preview:       enable the preview pane (renderer in #10).
+      show_children_pane: enable the right-hand children-as-list pane.
+      multi_select:       allow multi-selection (action layer in #12).
+      print_format:       output format string used when on_enter is None
+                          and the user picks the default action.
+      _headless:          skip terminal init (default False) -- observable
+                          here for tests; the real terminal init/teardown
+                          branches on it once #9 lands.
     """
 
     def __init__(self, *,
+                 title='browse-tui',
                  get_children=None,
                  get_preview=None,
+                 actions=None,
+                 on_enter=None,
+                 format_item=None,
                  root_id=None,
+                 initial_scope=None,
+                 show_preview=True,
+                 show_children_pane=True,
+                 multi_select=True,
+                 print_format='{id}',
                  _headless=False):
         # --- user-supplied data callbacks -------------------------------
         # Default get_children to "no children" so a Browser constructed
         # with no kwargs still works (tests, smoke checks). get_preview
         # stays None -- the preview worker treats None as "always returns
         # ''" rather than calling a no-op lambda needlessly.
+        self.title = title
         self.get_children = get_children or (lambda _id: [])
         self.get_preview = get_preview
+        # actions/on_enter/format_item are stored opaquely in phase 1;
+        # tickets #11 (Context) and #12 (action keymap) read them.
+        self.actions = list(actions) if actions is not None else []
+        self.on_enter = on_enter
+        self.format_item = format_item
+        self.show_preview = show_preview
+        self.show_children_pane = show_children_pane
+        self.multi_select = multi_select
+        self.print_format = print_format
         self._headless = _headless
 
         # --- domain state ------------------------------------------------
@@ -346,6 +385,11 @@ class Browser:
         # everything per item id).
         self._state = State(root_id=root_id)
         self._state._preview = {}  # item_id -> preview text
+        # Apply ``initial_scope`` after State is built so scope_into can
+        # do its bookkeeping (saving the empty pre-scope expanded set
+        # under the prior scope key).
+        if initial_scope is not None:
+            scope_into(self._state, initial_scope)
 
         # --- cross-thread plumbing --------------------------------------
         # main_queue: any thread -> main thread. Drained by drain_main_queue
@@ -380,6 +424,25 @@ class Browser:
         # --- surfaced state for the renderer (filled in by ticket #10) ---
         self._error_text = ''
         self._message_text = ''
+
+        # --- quit bookkeeping (read by the main loop in #13) ------------
+        # quit() flips _quit_requested; the main loop watches the flag
+        # and exits with _quit_code, printing _quit_output if non-empty.
+        self._quit_requested = False
+        self._quit_code = 0
+        self._quit_output = ''
+
+        # --- cursor_to deferred resolution -----------------------------
+        # cursor_to(id) for an id not currently visible parks the request
+        # here; whenever a future cache delivery rebuilds the visible
+        # list, ``apply_children_results`` retries the placement and
+        # resolves the parked Pending if the id appeared. Phase 1
+        # acceptable simplification: we only retry once per delivery,
+        # we don't walk the parent chain to expand ancestors (that would
+        # need parent metadata on items). Production recipes that use
+        # from_flat_tree() get the cache populated up front so cursor_to
+        # always finds the id immediately.
+        self._pending_cursor = None  # tuple (id, Pending) or None
 
     # ---- public, thread-safe API ---------------------------------------
 
@@ -433,6 +496,95 @@ class Browser:
     @property
     def message_text(self) -> str:
         return self._message_text
+
+    def cursor_to(self, id, on_complete=None) -> 'Pending':
+        """Move cursor to the item with the given id, expanding ancestors as needed.
+
+        Asynchronous because we may need to fetch ancestor children. The
+        returned Pending resolves once the cursor is positioned -- after
+        all required fetches complete, or on the next drain if the id is
+        already visible. For not-yet-visible ids, phase 1 best-effort:
+        the Pending resolves with the cursor unmoved (full ancestor walk
+        is phase-2 territory, requires parent metadata on items).
+        """
+        pending = Pending()
+        if on_complete is not None:
+            pending.then(on_complete)
+        self.post(lambda: self._do_cursor_to(id, pending))
+        return pending
+
+    def expand(self, id, on_complete=None) -> 'Pending':
+        """Add ``id`` to expanded; trigger fetch if not cached.
+
+        Pending resolves when children are cached (or immediately on the
+        next drain if already cached). Safe to call from any thread.
+        """
+        pending = Pending()
+        if on_complete is not None:
+            pending.then(on_complete)
+        self.post(lambda: self._do_expand(id, pending))
+        return pending
+
+    def select(self, ids, replace=False) -> None:
+        """Add ``ids`` to ``selected`` (or replace existing selection if ``replace``).
+
+        Thread-safe; the actual mutation runs on the main thread so the
+        renderer never sees a torn set. Phase 1 stores the ids verbatim;
+        the renderer in #10 reads the set when emitting ``*`` markers.
+        """
+        # Snapshot the iterable on the calling thread so the lambda
+        # doesn't capture a mutating live source.
+        ids_list = list(ids)
+        self.post(lambda: self._do_select(ids_list, replace))
+
+    def quit(self, code=0, output='') -> None:
+        """Request the main loop to exit with the given exit code.
+
+        Thread-safe. Phase 1 stores ``_quit_requested``/``_quit_code``/
+        ``_quit_output`` on Browser; the main loop in #13 reads these
+        and shuts down once the current drain finishes.
+        """
+        self.post(lambda: self._do_quit(code, output))
+
+    def watch(self, callback, interval=None) -> threading.Thread:
+        """Spawn a daemon thread that calls ``callback(self)`` repeatedly.
+
+        If ``interval`` is set, sleep ``interval`` seconds between calls.
+        If ``None``, callback is called once and the user is responsible
+        for any internal loop. Either way the returned thread is daemon
+        so the process exits cleanly.
+
+        Uncaught exceptions in the callback don't crash the process --
+        they're surfaced via ``self.error('watcher: ...')``. The watcher
+        thread itself dies on the exception (no auto-restart) so authors
+        learn about the bug quickly. We deliver the error via ``post``
+        rather than writing ``self._error_text`` directly so the message
+        lands on the main thread alongside any other errors.
+        """
+        def _runner():
+            try:
+                if interval is None:
+                    callback(self)
+                else:
+                    while not self._stop:
+                        callback(self)
+                        # Use a short-poll sleep so stop_workers can wake
+                        # us promptly; one big sleep would block exit by
+                        # up to ``interval`` seconds.
+                        end = time.monotonic() + interval
+                        while time.monotonic() < end and not self._stop:
+                            time.sleep(min(0.05, end - time.monotonic()))
+            except Exception as e:
+                self.error(f'watcher: {type(e).__name__}: {e}')
+                # Fall through -- thread exits, no auto-restart.
+
+        t = threading.Thread(
+            target=_runner,
+            daemon=True,
+            name='browse-tui-watcher',
+        )
+        t.start()
+        return t
 
     # ---- worker lifecycle ----------------------------------------------
 
@@ -586,6 +738,66 @@ class Browser:
         self._children_queue.append(id_)
         self._children_event.set()
 
+    def _do_cursor_to(self, id_, pending):
+        """Main-thread: position the cursor at ``id_`` and resolve ``pending``.
+
+        Phase 1 simplification: we walk the current visible-tree list
+        and, if ``id_`` is found, set ``self._state.cursor`` to its
+        index. If not found, we resolve the Pending anyway (best-effort)
+        so chained ``.then()`` callbacks don't strand. A future phase
+        could expand the parent chain via parent metadata on Items;
+        recipes that need it today should use ``from_flat_tree`` to
+        pre-populate the cache, in which case every id is visible.
+        """
+        # Build/refresh the visible list; visible_items honours the
+        # dirty bit so this is a no-op if nothing changed.
+        vis = visible_items(self._state)
+        for i, entry in enumerate(vis):
+            if entry.item.id == id_:
+                self._state.cursor = i
+                pending._resolve()
+                return
+        # Not visible. Best-effort: leave cursor alone and resolve.
+        # (Documented in cursor_to's docstring.)
+        pending._resolve()
+
+    def _do_expand(self, id_, pending):
+        """Main-thread: add ``id_`` to expanded; fetch if not cached.
+
+        If children are already cached, mark visible-tree dirty and
+        resolve immediately. Otherwise register the Pending as a waiter
+        and enqueue the fetch -- ``apply_children_results`` resolves it
+        once the worker delivers.
+        """
+        self._state.expanded.add(id_)
+        if id_ in self._state._children:
+            mark_visible_dirty(self._state)
+            pending._resolve()
+            return
+        self._state._children_pending.add(id_)
+        self._children_in_flight.setdefault(id_, []).append(pending)
+        self._children_queue.append(id_)
+        self._children_event.set()
+        mark_visible_dirty(self._state)
+
+    def _do_select(self, ids, replace):
+        """Main-thread: update ``selected`` set."""
+        if replace:
+            self._state.selected = set(ids)
+        else:
+            self._state.selected.update(ids)
+        mark_visible_dirty(self._state)
+
+    def _do_quit(self, code, output):
+        """Main-thread: flip the quit flag and stash exit code/output."""
+        self._quit_code = code
+        self._quit_output = output
+        self._quit_requested = True
+        # Wake the main loop so it observes _quit_requested promptly. In
+        # headless mode notify_wake is a no-op; in production it writes
+        # one byte to the self-pipe.
+        notify_wake()
+
     # ---- workers --------------------------------------------------------
 
     def _children_worker(self):
@@ -662,3 +874,79 @@ class Browser:
         """
         self._preview_req = id_
         self._preview_event.set()
+
+    # ---- eager adapter -------------------------------------------------
+
+    @classmethod
+    def from_flat_tree(cls, rows, *, root_id=None, **browser_kwargs):
+        """Build a Browser whose ``_children`` cache is pre-populated from ``rows``.
+
+        Each row may be ``Item``, ``str``, ``tuple``, or ``dict`` (per
+        ``to_item`` rules). Hierarchy detection looks at the coerced
+        Items:
+
+        * **parent-pointer mode** -- if any row has a ``parent`` field
+          (or attribute) other than ``None``, every row is grouped under
+          its parent's id; rows with no parent (or ``parent is None``)
+          go under ``root_id``.
+        * **depth-coded mode** -- otherwise, if any row has a ``depth``
+          field, walk rows in iteration order maintaining a stack of
+          ``(depth, item)``: a row at depth ``d+1`` is a child of the
+          most recent row at depth ``d``; depth-0 rows go under
+          ``root_id``.
+        * **flat mode** -- if neither hint is present, all rows become
+          direct children of ``root_id``.
+
+        The synthesised ``get_children`` reads from the pre-populated
+        cache, so no user callback runs at runtime. Recipes wanting
+        true laziness should pass their own ``get_children`` instead.
+        """
+        items = [to_item(r) for r in rows]
+        has_parent = any(
+            getattr(it, 'parent', None) is not None for it in items
+        )
+        has_depth = (
+            not has_parent
+            and any(getattr(it, 'depth', None) is not None for it in items)
+        )
+
+        children_by_parent: dict = {}
+
+        if has_parent:
+            for it in items:
+                p = getattr(it, 'parent', None)
+                if p is None:
+                    p = root_id
+                children_by_parent.setdefault(p, []).append(it)
+        elif has_depth:
+            # Walk in iteration order, maintaining a stack of
+            # (depth, item). For each row at depth d: pop frames with
+            # depth >= d, then the parent is the top-of-stack item (or
+            # root_id if the stack is empty).
+            stack: list = []
+            for it in items:
+                d = getattr(it, 'depth', 0) or 0
+                while stack and stack[-1][0] >= d:
+                    stack.pop()
+                parent = stack[-1][1].id if stack else root_id
+                children_by_parent.setdefault(parent, []).append(it)
+                stack.append((d, it))
+        else:
+            if items:
+                children_by_parent[root_id] = list(items)
+
+        # Synthesise the get_children callback to read from the cache.
+        # Captures children_by_parent rather than self._state._children
+        # so a later cache_invalidate_all() doesn't strand the recipe
+        # (we still want eager reads to win).
+        def _get_children_eager(pid):
+            return children_by_parent.get(pid, [])
+
+        browser_kwargs.setdefault('get_children', _get_children_eager)
+        browser_kwargs.setdefault('root_id', root_id)
+        b = cls(**browser_kwargs)
+        # Pre-populate the cache so visible_items() and apply_*_results
+        # see it immediately; no fetch happens at runtime unless the
+        # caller invokes ``refresh`` explicitly.
+        b._state._children.update(children_by_parent)
+        return b
