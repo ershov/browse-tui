@@ -1,0 +1,7 @@
+{
+  "name": "claude-plan",
+  "description": "Integrate the plan CLI ticket tracker with Claude Code for structured planning and team coordination",
+  "version": "1.0.129",
+  "license": "MIT",
+  "keywords": ["planning", "tickets", "task-tracking", "team-coordination"]
+}
