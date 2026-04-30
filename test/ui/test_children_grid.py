@@ -56,6 +56,30 @@ class TestChildrenGrid(unittest.TestCase):
             # 'Children' separator label gone.
             self.assertNotIn('Children', screen)
 
+    def test_grid_renders_tag_colors(self):
+        """Grid uses styled tags — a1 has tag='running' tag_style='green'.
+
+        Capture with ANSI escape passthrough (``-e``) and confirm the
+        renderer emitted a 256-colour fg-2 (green) SGR sequence somewhere
+        on screen and that the tag text 'running' is present.
+        """
+        with TmuxFixture(cols=120, rows=40) as t:
+            t.launch(_BIN, '--python', _RECIPE)
+            t.wait_for('#parent parent')
+            t.redraw()
+            t.wait_for('#a1', timeout=3.0)
+            t.wait_stable()
+            screen = t.capture(colors=True)
+            # The 'running' tag must be visible in the grid.
+            self.assertIn('running', screen,
+                          f'tag text not present:\n{screen}')
+            # set_style emits SGR 38;5;<n> for 256-colour fg. green = 2.
+            self.assertIn('\x1b[', screen,
+                          'no ANSI escape sequences in colour capture')
+            self.assertRegex(
+                screen, r'\x1b\[[0-9;]*38;5;2[m;]',
+                f'green (256-colour fg=2) not emitted:\n{screen!r}')
+
     def test_no_children_pane_flag_hides_it(self):
         """``--no-children-pane`` keeps the grid hidden even on a branch."""
         with TmuxFixture(cols=120, rows=40) as t:

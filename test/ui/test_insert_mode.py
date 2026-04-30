@@ -77,6 +77,68 @@ class TestInsertMode(unittest.TestCase):
             # (between 'a' and 'b'); both at depth 0 → ('after', 'a').
             self.assertEqual(content, 'after:a')
 
+    def test_marker_indents_on_right_and_outdents_on_left(self):
+        """Right pushes the marker into the row above's subtree; Left undoes.
+
+        Cursor starts on 'a' (a branch). Insert mode places the marker
+        between 'a' and 'b' at depth 0 (rendered with the standard 2-col
+        gutter). Right indents the marker into a's subtree (a expands;
+        marker becomes a child of 'a' at depth 1, with an extra 2 cols
+        of indentation). Left outdents and the marker moves above 'a'
+        (depth 0 again, sitting at gap 0 since a's expanded children
+        no longer host it).
+
+        We assert on column position of the ``--`` marker token to keep
+        the test resilient to surrounding text changes (id/title format).
+        """
+        with TmuxFixture(cols=120, rows=40) as t:
+            t.launch(_BIN, '--python', _RECIPE)
+            t.wait_for('#a')
+            t.wait_stable()
+            t.send('c')
+            t.wait_for('-- create --')
+            initial = t.wait_stable()
+            base_col = self._marker_col(initial)
+
+            # Right indents — marker moves rightward.
+            t.send('Right')
+            indented = t.wait_stable()
+            indent_col = self._marker_col(indented)
+            self.assertGreater(
+                indent_col, base_col,
+                f'Right did not indent marker: base={base_col} '
+                f'after_right={indent_col}\n{indented}')
+            # Right also expanded 'a' (▼), so its kids should now show.
+            self.assertIn('#a1', indented)
+
+            # Left outdents — marker moves back leftward (to ≤ base col).
+            t.send('Left')
+            outdented = t.wait_stable()
+            outdent_col = self._marker_col(outdented)
+            self.assertLess(
+                outdent_col, indent_col,
+                f'Left did not outdent marker: '
+                f'after_right={indent_col} after_left={outdent_col}\n{outdented}')
+
+            # Cancel + quit.
+            t.send_bytes('\x1b')
+            t.send('x')
+
+    @staticmethod
+    def _marker_col(screen):
+        """Column index (0-based) of the '--' opener of the create marker.
+
+        Searches each line for the substring ' -- create -- ' the
+        renderer emits (note the leading and trailing spaces — those
+        come from the marker title's literal format ``' -- {} -- '``)
+        and returns the column of the first ``-`` of the leading dashes.
+        """
+        for line in screen.splitlines():
+            idx = line.find('-- create --')
+            if idx >= 0:
+                return idx
+        raise AssertionError(f'create marker not found in screen:\n{screen}')
+
     def test_esc_cancels(self):
         """Esc cancels insert mode without firing the callback."""
         with tempfile.TemporaryDirectory() as tmp:

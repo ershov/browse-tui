@@ -93,6 +93,44 @@ class TestSearchHighlight(unittest.TestCase):
             # the row 0 default.
             self.assertIn('baz', screen)
 
+    def test_match_span_emits_yellow_bold_ansi(self):
+        """A non-cursor match row gets ANSI bold + yellow (SGR 1, then fg=3).
+
+        Captures the pane with ANSI escape passthrough (``-e``) and
+        confirms that the bold + 256-colour-yellow style precedes a
+        ``foo`` substring on a non-cursor row. We use a tree with three
+        ``foo``-matching rows; after typing the query the cursor sits
+        on the first match, so the second and third matches render with
+        the plain (non-cursor) yellow+bold highlight rather than the
+        reverse+underline cursor variant.
+
+        The renderer in 050-render.py emits these as two adjacent SGRs:
+        ``\x1b[1m`` (bold) then ``\x1b[38;5;3m`` (256-colour fg = 3).
+        """
+        with TmuxFixture(cols=80, rows=24) as t:
+            t.launch('bash', '-c',
+                     f"printf 'foo-a\\nbar\\nfoo-b\\nfoo-c\\n' | "
+                     f"{_BIN} --root-cmd cat")
+            t.wait_for('#foo-a foo-a')
+            t.wait_stable()
+            t.send('/')
+            t.type('foo')
+            # Confirm the search query reached the info bar before we
+            # capture (the highlight is applied as part of the same
+            # render pass).
+            t.wait_for('/foo', timeout=2.0)
+            t.wait_stable()
+            screen = t.capture(colors=True)
+            # Non-cursor matches should carry the bold + yellow combo
+            # immediately before the matched fragment. Tolerate any
+            # number of intervening SGR resets/segments between the
+            # two style escapes by allowing zero or more ``\x1b[…m``
+            # tokens between them.
+            self.assertRegex(
+                screen,
+                r'\x1b\[1m(\x1b\[[0-9;]*m)*\x1b\[38;5;3mfoo',
+                f'no yellow+bold ANSI before non-cursor match:\n{screen!r}')
+
     def test_enter_advances_to_next_match(self):
         """With multiple matches, Enter cycles through them in order."""
         with TmuxFixture(cols=80, rows=24) as t:

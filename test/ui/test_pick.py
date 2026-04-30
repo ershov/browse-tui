@@ -76,6 +76,28 @@ class TestPick(unittest.TestCase):
                 content = _read_log_when_ready(log)
             self.assertEqual(content, '<cancelled>')
 
+    def test_pick_filter_narrows_to_unique_match(self):
+        """Type 'do' — only 'done' matches; Enter selects it.
+
+        The pick recipe offers ['open', 'in-progress', 'done', 'wontfix'].
+        'do' is a substring of 'done' only (not 'open' / 'in-progress' /
+        'wontfix'), so the picker filters to one row and Enter picks it.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, 'pick.log')
+            with TmuxFixture(cols=120, rows=40, env={'PICK_LOG': log}) as t:
+                t.launch(_BIN, '--python', _RECIPE)
+                t.wait_for('#item')
+                t.send('s')
+                t.wait_for('Status>')
+                t.type('do')
+                # Wait for query echo so subsequent Enter applies to the
+                # filtered list (not the unfiltered one).
+                t.wait_for('Status> do', timeout=2.0)
+                t.send('Enter')
+                content = _read_log_when_ready(log)
+            self.assertEqual(content, 'done')
+
     def test_pick_navigate_with_arrows(self):
         """Arrow keys reposition the picker cursor before enter."""
         with tempfile.TemporaryDirectory() as tmp:

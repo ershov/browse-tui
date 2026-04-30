@@ -97,6 +97,34 @@ class TestMultiSelect(unittest.TestCase):
             self.assertNotRegex(screen, r'\*\s+#c c')
             t.send('q')
 
+    def test_ctrl_a_after_ctrl_n_reselects_all(self):
+        """Ctrl-N clears, then Ctrl-A reselects every visible row.
+
+        Confirms the selection set is reset cleanly by Ctrl-N (and not
+        merely hidden) — a subsequent Ctrl-A produces the [3] badge from
+        scratch on a tree of three rows.
+        """
+        with TmuxFixture(cols=80, rows=24) as t:
+            t.launch('bash', '-c',
+                     f"printf 'a\\nb\\nc\\n' | {_BIN} --root-cmd cat")
+            t.wait_for('#a a')
+            t.wait_stable()
+            t.send('C-a')
+            t.wait_for('[3]')
+            t.send('C-n')
+            # After clear, no selection badge.
+            screen = t.wait_stable()
+            self.assertNotIn('[3]', screen)
+            self.assertNotRegex(screen, r'\*\s+#a a')
+            # Re-select all — count must come back to [3] and every row
+            # gets its '*' marker.
+            t.send('C-a')
+            screen = t.wait_for('[3]')
+            self.assertRegex(screen, r'\*\s+#a a')
+            self.assertRegex(screen, r'\*\s+#b b')
+            self.assertRegex(screen, r'\*\s+#c c')
+            t.send('q')
+
     def test_targets_action_uses_selection(self):
         """A CLI --action (requires='targets') sees the full selection."""
         with tempfile.TemporaryDirectory() as tmp:

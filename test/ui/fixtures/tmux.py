@@ -108,21 +108,45 @@ class TmuxFixture:
         out = self.tmux('display-message', '-p', '#{pane_pid}').stdout.strip()
         return int(out)
 
-    def fg_pid(self):
-        """Return PID of bash's foreground child (the running program)."""
+    def fg_pid(self, name=None):
+        """Return PID of bash's foreground child (the running program).
+
+        With ``name`` set, returns the first child whose ``ps comm`` field
+        contains the substring (useful when the launch line wraps the
+        target in another shell, e.g. ``bash -c '… | browse-tui …'`` —
+        the immediate child is the wrapper bash, not browse-tui).
+        Returns ``None`` if no matching child is found.
+        """
         bash_pid = self.pane_pid()
         try:
             out = subprocess.run(
-                ['ps', '-o', 'pid=', '--ppid', str(bash_pid)],
+                ['ps', '-o', 'pid=,comm=', '--ppid', str(bash_pid)],
                 check=True, capture_output=True, text=True).stdout
         except subprocess.CalledProcessError:
             return None
-        children = [int(p) for p in out.split() if p.strip()]
-        return children[0] if children else None
+        children = []
+        for line in out.splitlines():
+            parts = line.split(None, 1)
+            if not parts:
+                continue
+            pid = int(parts[0])
+            comm = parts[1] if len(parts) > 1 else ''
+            children.append((pid, comm))
+        if not children:
+            return None
+        if name is None:
+            return children[0][0]
+        for pid, comm in children:
+            if name in comm:
+                return pid
+        return None
 
-    def signal(self, sig):
-        """Send signal to the foreground child process (e.g., browse-tui)."""
-        pid = self.fg_pid()
+    def signal(self, sig, name=None):
+        """Send signal to the foreground child process (e.g., browse-tui).
+
+        ``name`` is forwarded to ``fg_pid`` for child selection.
+        """
+        pid = self.fg_pid(name=name)
         if pid is None:
             raise RuntimeError('no foreground child to signal')
         os.kill(pid, sig)
