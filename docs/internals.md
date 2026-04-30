@@ -341,14 +341,38 @@ test/
 ### Running tests
 
 ```bash
-./run-tests.sh                                 # all 527 tests
+./run-tests.sh                                 # all tests, serial
+./run-tests-parallel.sh                        # same tests, 4 workers
+./run-tests-parallel.sh -j 8                   # 8 workers
 python3 -m unittest test.unit.test_item        # one module
 python3 -m unittest discover -s test/unit      # one layer
 python3 -m unittest discover -s test/ui        # tmux only
 ```
 
 The runner is plain stdlib `unittest`. No pytest, no extra dependencies.
-Total runtime is around 17s (dominated by the tmux UI suite).
+Total runtime is around 18s serial; the parallel runner (`tools/parallel-test.py`,
+wrapped by `run-tests-parallel.sh`) fans out per-module subprocesses through a
+`ProcessPoolExecutor` and finishes in ~7s with 4 workers — about a 2.5x speedup,
+mostly absorbed by the tmux UI suite. Each `TmuxFixture` allocates a unique
+socket per instance, so parallel UI tests don't collide. The serial runner stays
+the canonical CI entry point; the parallel runner is for fast local iteration.
+
+### Snapshot UI tests
+
+`test/ui/test_snapshots.py` runs ~5 full-screen capture tests against goldens
+in `test/ui/snapshots/`. Each test pins `cols`/`rows`, drives a deterministic
+launch, captures the stable screen with trailing whitespace stripped, and
+diffs against the golden text file.
+
+To regenerate goldens after an intentional rendering change:
+
+```bash
+BROWSE_TUI_UPDATE_SNAPSHOTS=1 python3 -m unittest test.ui.test_snapshots -v
+git diff test/ui/snapshots/      # inspect before committing
+```
+
+The `BROWSE_TUI_UPDATE_SNAPSHOTS=1` env var makes each test rewrite its own
+golden in addition to comparing — so a single run regenerates the whole set.
 
 ### Tmux fixture
 

@@ -1,0 +1,24 @@
+*   #one one
+*   #two two
+    #three three
+    #four four
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+──[2]── /:search  ?:help  q:quit ───────────────────────────────────── Preview ─
