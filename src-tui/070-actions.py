@@ -17,6 +17,8 @@ and the pick/insert flows is deferred to phase 2 — phase 1 keeps the
 dispatcher minimal and explicit.
 """
 
+import os
+import signal
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -209,6 +211,19 @@ def _quit(ctx):
     ctx.quit(code=1)
 
 
+def _suspend(ctx):
+    """Raise SIGTSTP on this process so the ``020-terminal`` handler runs.
+
+    The terminal layer enters raw mode via ``tty.setraw`` which clears
+    ISIG, so the kernel no longer translates the keyboard ``\\x1a`` byte
+    into SIGTSTP. ``read_key`` therefore surfaces it as the ``ctrl-z``
+    key name, and we route it back through the signal so the existing
+    handler (``_handle_sigtstp``) can restore the terminal, drop the
+    process to the shell, and re-enter raw mode on SIGCONT.
+    """
+    os.kill(os.getpid(), signal.SIGTSTP)
+
+
 def _search_start(ctx):
     """Enter search-text-entry mode."""
     ctx._browser._search_mode = True
@@ -261,6 +276,7 @@ def default_actions():
         Action('q',         'Quit',           _quit,            'none'),
         Action('esc',       'Quit',           _quit,            'none'),
         Action('ctrl-c',    'Quit',           _quit,            'none'),
+        Action('ctrl-z',    'Suspend',        _suspend,         'none'),
     ]
 
 

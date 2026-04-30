@@ -701,6 +701,11 @@ class Browser:
         the pending bit, resolve all in-flight Pendings registered for
         that id (Phase 1 does not coalesce -- two refresh()es of the
         same id produce two cache writes and two resolved Pendings).
+
+        Also flags the list pane for redraw so the next render pass
+        surfaces the freshly-delivered children without waiting for the
+        next user keystroke -- otherwise the screen lags behind the
+        cache when ``_notify`` is the only thing waking the loop.
         """
         n = 0
         while self._children_results:
@@ -711,18 +716,24 @@ class Browser:
             for p in self._children_in_flight.pop(id_, []):
                 p._resolve()
             n += 1
+        if n:
+            self._needs_redraw.add('list')
         return n
 
     def apply_preview_result(self) -> bool:
         """Move the worker-produced preview text into the cache.
 
         Returns True if a result was applied, False if the slot was empty.
+        Also flags the preview pane dirty so the loop renders it on the
+        next pass (without this the worker delivery only becomes visible
+        after the next keystroke that triggers a ``_needs_redraw`` add).
         """
         if self._preview_result is None:
             return False
         id_, text = self._preview_result
         self._preview_result = None
         self._state._preview[id_] = text
+        self._needs_redraw.add('preview')
         return True
 
     def run_until_idle(self, timeout: float = 2.0) -> None:
@@ -809,10 +820,17 @@ class Browser:
         resolve immediately. Otherwise register the Pending as a waiter
         and enqueue the fetch -- ``apply_children_results`` resolves it
         once the worker delivers.
+
+        In both cases mark the list pane dirty so the next render pass
+        surfaces the new sub-tree (or the ``⧗ loading…`` placeholder
+        while the fetch is in flight) -- otherwise the loop renders
+        nothing until the worker completes and the placeholder is
+        invisibly skipped.
         """
         self._state.expanded.add(id_)
         if id_ in self._state._children:
             mark_visible_dirty(self._state)
+            self._needs_redraw.add('list')
             pending._resolve()
             return
         self._state._children_pending.add(id_)
@@ -820,14 +838,16 @@ class Browser:
         self._children_queue.append(id_)
         self._children_event.set()
         mark_visible_dirty(self._state)
+        self._needs_redraw.add('list')
 
     def _do_select(self, ids, replace):
-        """Main-thread: update ``selected`` set."""
+        """Main-thread: update ``selected`` set + flag list-pane redraw."""
         if replace:
             self._state.selected = set(ids)
         else:
             self._state.selected.update(ids)
         mark_visible_dirty(self._state)
+        self._needs_redraw.add('list')
 
     def _do_quit(self, code, output):
         """Main-thread: flip the quit flag and stash exit code/output."""
