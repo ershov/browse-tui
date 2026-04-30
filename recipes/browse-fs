@@ -1,0 +1,129 @@
+#!/usr/bin/env -S browse-tui --python
+"""browse-fs — filesystem browser. Lazy os.scandir; preview = file head
+or os.listdir; actions e:Edit ($EDITOR), o:Open (xdg-open), d:Delete
+(with ctx.confirm); background mtime watcher refreshes changed dirs.
+
+Usage:  browse-fs [PATH]   # PATH defaults to the current directory.
+"""
+
+import os
+import stat
+import sys
+import time
+
+from browse_tui import Action, Browser, Item
+
+
+def human_size(n):
+    for unit in ('B', 'K', 'M', 'G', 'T'):
+        if n < 1024:
+            return f'{n}{unit}'
+        n //= 1024
+    return f'{n}P'
+
+
+def _is_dir(dirent):
+    try:
+        return dirent.is_dir(follow_symlinks=False)
+    except OSError:
+        return False
+
+
+def get_children(path):
+    if not path:
+        path = os.getcwd()
+    try:
+        entries = list(os.scandir(path))
+    except OSError as e:
+        return [Item(id=f'__err__:{path}', title=f'[error] {e}',
+                     tag='err', tag_style='red')]
+    entries.sort(key=lambda d: (not _is_dir(d), d.name.lower()))
+    items = []
+    for d in entries:
+        try:
+            st = d.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        is_dir = stat.S_ISDIR(st.st_mode)
+        title = d.name + ('/' if is_dir else '')
+        tag, tag_style = ('', 'cyan') if is_dir else (human_size(st.st_size), 'dim')
+        item = Item(id=d.path, title=title, tag=tag, tag_style=tag_style,
+                    has_children=is_dir)
+        item.size, item.mode, item.mtime = st.st_size, stat.S_IMODE(st.st_mode), st.st_mtime
+        items.append(item)
+    return items
+
+
+def get_preview(path):
+    if isinstance(path, str) and path.startswith('__err__:'):
+        return path
+    try:
+        if os.path.isdir(path):
+            return '\n'.join(sorted(os.listdir(path))[:200])
+        with open(path, 'rb') as f:
+            return f.read(4096).decode('utf-8', errors='replace')
+    except OSError as e:
+        return f'[error] {e}'
+
+
+def edit(ctx):
+    editor = os.environ.get('EDITOR', 'vi')
+    ctx.run_external([editor, ctx.cursor.id])
+
+
+def open_(ctx):
+    for it in ctx.targets:
+        ctx.run_external(['xdg-open', it.id])
+
+
+def delete(ctx):
+    targets = ctx.targets
+    label = targets[0].id if len(targets) == 1 else f'{len(targets)} items'
+    if not ctx.confirm(f'delete {label}?'):
+        return
+    for it in targets:
+        try:
+            (os.rmdir if os.path.isdir(it.id) else os.remove)(it.id)
+        except OSError as e:
+            ctx.error(f'{it.id}: {e}')
+            return
+    ctx.refresh()
+
+
+def mtime_watcher(browser):
+    """Poll mtime of each currently-cached directory; refresh on change."""
+    last = {}
+    while True:
+        time.sleep(1.0)
+        for d in list(browser._state._children.keys()):
+            if not isinstance(d, str):
+                continue
+            try:
+                m = os.stat(d).st_mtime
+            except OSError:
+                continue
+            if d in last and last[d] != m:
+                browser.refresh(d)
+            last[d] = m
+
+
+def main():
+    root = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.getcwd()
+    b = Browser(
+        title='browse-fs',
+        get_children=get_children,
+        get_preview=get_preview,
+        root_id=root,
+        actions=[
+            Action('e', 'Edit',   edit,   'cursor'),
+            Action('o', 'Open',   open_,  'targets'),
+            Action('d', 'Delete', delete, 'targets'),
+        ],
+        on_enter='action:e',
+    )
+    b.watch(mtime_watcher)
+    sys.exit(b.run())
+
+
+if __name__ == '__main__':
+    main()
