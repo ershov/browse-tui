@@ -106,8 +106,10 @@ class TestChildrenWorkerFifo(unittest.TestCase):
             b.stop_workers()
 
     def test_two_threads_same_id_both_resolve(self):
-        # Phase 1 does NOT coalesce: both fetches happen, both Pendings
-        # resolve. Coalescing lands in phase 3.
+        # Phase 3 (ticket #29) coalesces: only one fetch happens, but
+        # both Pendings still resolve. Dedicated coalescing tests live
+        # in test_coalesce.py; this one keeps the cross-thread "submit
+        # from another thread" coverage.
         calls = []
         def get_children(id_):
             calls.append(id_)
@@ -124,7 +126,12 @@ class TestChildrenWorkerFifo(unittest.TestCase):
             t.start()
             t.join()
             b.run_until_idle()
-            self.assertEqual(calls, ['A', 'A'])
+            # Coalescing — exactly one fetch even though two Pendings
+            # asked for it. The race between "main posts then drains"
+            # and "thread posts then main drains" can land them in
+            # either order, but in either case the second arrives while
+            # the first is still pending and joins the in-flight list.
+            self.assertEqual(calls, ['A'])
             self.assertTrue(p_main.done)
             self.assertEqual(sorted(results), ['main', 'thread'])
         finally:

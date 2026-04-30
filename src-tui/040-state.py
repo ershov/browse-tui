@@ -886,8 +886,9 @@ class Browser:
         Called on the main thread after a wake. For each delivered
         ``(id, items)``: store in cache, mark visible-tree dirty, drop
         the pending bit, resolve all in-flight Pendings registered for
-        that id (Phase 1 does not coalesce -- two refresh()es of the
-        same id produce two cache writes and two resolved Pendings).
+        that id. Phase 3 (ticket #29) coalesces duplicate enqueues in
+        ``_do_refresh``, so a single delivery resolves every Pending
+        that asked for ``id_`` while the fetch was in flight.
 
         Also flags the list pane for redraw so the next render pass
         surfaces the freshly-delivered children without waiting for the
@@ -976,16 +977,31 @@ class Browser:
         Posted by ``refresh`` so concurrent callers don't race on the
         cache or the in-flight registry. ``id=None`` means full refresh
         (clear all caches and refetch the root).
+
+        Phase 3 (ticket #29) coalesces duplicate enqueues: if a fetch is
+        already pending for ``id_``, the new ``pending`` is registered in
+        ``_children_in_flight[id_]`` and resolves with the existing
+        fetch's result -- no second worker fetch is triggered. Freshness
+        note: a second ``refresh`` arriving while a fetch is in flight
+        sees the in-flight result, even if data mutated between the two
+        calls. Callers that need a guaranteed re-fetch can chain a
+        further ``refresh`` after the first resolves (the
+        ``_children_pending`` gate is cleared in ``apply_children_results``).
         """
         if id_ is None:
             cache_invalidate_all(self._state)
             id_ = self._state.root_id
         else:
             cache_invalidate_subtree(self._state, id_)
-        self._state._children_pending.add(id_)
+        # Always register the waiter so it resolves with the fetch result.
         self._children_in_flight.setdefault(id_, []).append(pending)
-        self._children_queue.append(id_)
-        self._children_event.set()
+        # Only enqueue + flag pending the first time -- a fetch already in
+        # flight for this id will deliver one result that resolves every
+        # registered waiter together.
+        if id_ not in self._state._children_pending:
+            self._state._children_pending.add(id_)
+            self._children_queue.append(id_)
+            self._children_event.set()
 
     def _do_cursor_to(self, id_, pending):
         """Main-thread: position the cursor at ``id_`` and resolve ``pending``.
