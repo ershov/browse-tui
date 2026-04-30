@@ -469,6 +469,21 @@ class Browser:
         # always finds the id immediately.
         self._pending_cursor = None  # tuple (id, Pending) or None
 
+    # ---- action registration -------------------------------------------
+
+    def add_action(self, action) -> None:
+        """Register a custom Action.
+
+        If an existing entry (built-in or earlier custom) binds the
+        same key, that entry is replaced — recipes can override one
+        default keybinding without rebuilding the full list. Not
+        thread-safe by design: recipes call this during construction
+        before ``start_workers`` / the main loop start.
+        """
+        # Replace any existing entry for the same key, then append.
+        self.actions = [a for a in self.actions if a.key != action.key]
+        self.actions.append(action)
+
     # ---- public, thread-safe API ---------------------------------------
 
     def refresh(self, id=None, on_complete=None) -> 'Pending':
