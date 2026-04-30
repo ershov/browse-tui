@@ -201,7 +201,12 @@ class TestFormatItemFormatHook(unittest.TestCase):
 
 
 class TestLayoutPanes(unittest.TestCase):
-    """Pane geometry: list+preview when show_preview, list-only otherwise."""
+    """Pane geometry: list+preview when show_preview, list-only otherwise.
+
+    Convention: ``prev_height`` is the *total* preview pane height
+    including its leading separator (mirrors plan-tui). The grid pane
+    is hidden when ``children_rows_needed=0`` (default).
+    """
 
     def test_two_pane_typical_terminal(self):
         layout = layout_panes(80, 24, show_preview=True)
@@ -210,19 +215,17 @@ class TestLayoutPanes(unittest.TestCase):
         # 30% of 24 = 7.2 -> 7 (per the spec); leave wiggle room ±1.
         self.assertGreaterEqual(layout['list_height'], 6)
         self.assertLessEqual(layout['list_height'], 8)
-        # info_row sits between list and preview.
+        # No grid pane requested → sub_height=0; info_row sits on the
+        # preview separator.
+        self.assertEqual(layout['sub_height'], 0)
         self.assertEqual(
             layout['info_row'],
             layout['list_top'] + layout['list_height'],
         )
-        # preview gets the rest.
+        self.assertEqual(layout['prev_top'], layout['info_row'])
+        # list + preview (incl. sep) = 24 rows total.
         self.assertEqual(
-            layout['prev_top'],
-            layout['info_row'] + 1,
-        )
-        # list + 1 separator + preview = 24 rows total.
-        self.assertEqual(
-            layout['list_height'] + 1 + layout['prev_height'],
+            layout['list_height'] + layout['prev_height'],
             24,
         )
 
@@ -231,6 +234,7 @@ class TestLayoutPanes(unittest.TestCase):
         self.assertEqual(layout['list_top'], 1)
         self.assertEqual(layout['list_height'], 23)
         self.assertEqual(layout['prev_height'], 0)
+        self.assertEqual(layout['sub_height'], 0)
         # Info bar at the bottom row (24).
         self.assertEqual(layout['info_row'], 24)
 
@@ -240,8 +244,9 @@ class TestLayoutPanes(unittest.TestCase):
         # must fit inside ``rows``.
         self.assertGreaterEqual(layout['list_height'], 1)
         self.assertGreaterEqual(layout['prev_height'], 0)
+        self.assertEqual(layout['sub_height'], 0)
         self.assertLessEqual(
-            layout['list_height'] + 1 + layout['prev_height'],
+            layout['list_height'] + layout['prev_height'],
             5,
         )
 

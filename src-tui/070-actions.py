@@ -89,6 +89,7 @@ def _nav_down(ctx):
     if state.cursor < len(vis) - 1:
         state.cursor += 1
         ctx._browser._needs_redraw.add('list')
+        ctx._browser._needs_redraw.add('children')
         ctx._browser._needs_redraw.add('preview')
 
 
@@ -98,6 +99,7 @@ def _nav_up(ctx):
     if state.cursor > 0:
         state.cursor -= 1
         ctx._browser._needs_redraw.add('list')
+        ctx._browser._needs_redraw.add('children')
         ctx._browser._needs_redraw.add('preview')
 
 
@@ -106,6 +108,7 @@ def _nav_home(ctx):
     state = ctx._browser._state
     state.cursor = 0
     ctx._browser._needs_redraw.add('list')
+    ctx._browser._needs_redraw.add('children')
     ctx._browser._needs_redraw.add('preview')
 
 
@@ -115,6 +118,7 @@ def _nav_end(ctx):
     vis = visible_items(state)
     state.cursor = max(0, len(vis) - 1)
     ctx._browser._needs_redraw.add('list')
+    ctx._browser._needs_redraw.add('children')
     ctx._browser._needs_redraw.add('preview')
 
 
@@ -124,6 +128,7 @@ def _nav_pgdn(ctx):
     vis = visible_items(state)
     state.cursor = min(max(0, len(vis) - 1), state.cursor + _PAGE_ROWS)
     ctx._browser._needs_redraw.add('list')
+    ctx._browser._needs_redraw.add('children')
     ctx._browser._needs_redraw.add('preview')
 
 
@@ -132,6 +137,7 @@ def _nav_pgup(ctx):
     state = ctx._browser._state
     state.cursor = max(0, state.cursor - _PAGE_ROWS)
     ctx._browser._needs_redraw.add('list')
+    ctx._browser._needs_redraw.add('children')
     ctx._browser._needs_redraw.add('preview')
 
 
@@ -154,6 +160,7 @@ def _nav_right(ctx):
         # Already expanded; step onto the first child if it follows.
         state.cursor += 1
         ctx._browser._needs_redraw.add('list')
+        ctx._browser._needs_redraw.add('children')
         ctx._browser._needs_redraw.add('preview')
 
 
@@ -171,6 +178,7 @@ def _nav_left(ctx):
         state.expanded.discard(item.id)
         mark_visible_dirty(state)
         ctx._browser._needs_redraw.add('list')
+        ctx._browser._needs_redraw.add('children')
         ctx._browser._needs_redraw.add('preview')
         return
     # Walk back to the first row at a shallower depth — that's the parent.
@@ -186,6 +194,12 @@ def _nav_left(ctx):
 def _toggle_preview(ctx):
     """Flip ``show_preview``. Forces a full redraw (layout changes)."""
     ctx._browser.show_preview = not ctx._browser.show_preview
+    ctx._browser._needs_redraw.add('all')
+
+
+def _toggle_children_pane(ctx):
+    """Flip ``show_children_pane``. Forces a full redraw (layout changes)."""
+    ctx._browser.show_children_pane = not ctx._browser.show_children_pane
     ctx._browser._needs_redraw.add('all')
 
 

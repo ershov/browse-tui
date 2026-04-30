@@ -76,7 +76,10 @@ class TestNavigation(unittest.TestCase):
             # then a small fixed list when expanded. A small delay keeps
             # the fetch fast for tests but is still long enough that any
             # latent loading state is observable on slower hosts.
-            t.launch(_BIN, '--python', _NAV_RECIPE, '--', '0.05')
+            # ``--no-children-pane`` disables the grid pane so this test
+            # only inspects the list-pane collapse behaviour.
+            t.launch(_BIN, '--python', _NAV_RECIPE, '--',
+                     '0.05', '--no-children-pane')
             t.wait_for('#parent parent')
             t.send('Right')
             t.wait_for('#alpha', timeout=3.0)

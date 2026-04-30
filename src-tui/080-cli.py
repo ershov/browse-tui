@@ -221,6 +221,8 @@ def build_argparser():
     # Layout
     p.add_argument('--no-preview', action='store_true',
                    help='Start with preview pane hidden.')
+    p.add_argument('--no-children-pane', action='store_true',
+                   help='Start with children-grid pane hidden.')
     p.add_argument('--no-multi-select', action='store_true',
                    help='Disable selection.')
     p.add_argument('--title', metavar='TITLE', default='browse-tui')
@@ -635,6 +637,7 @@ def _build_lazy_browser(args, fields, record_sep):
         root_id=args.root_id,
         initial_scope=args.initial_scope,
         show_preview=not args.no_preview,
+        show_children_pane=not args.no_children_pane,
         multi_select=not args.no_multi_select,
         on_enter=args.on_enter,
         print_format=args.print_format,
@@ -689,6 +692,7 @@ def _build_eager_browser(args, fields, record_sep):
         title=args.title,
         initial_scope=args.initial_scope,
         show_preview=not args.no_preview,
+        show_children_pane=not args.no_children_pane,
         multi_select=not args.no_multi_select,
         on_enter=args.on_enter,
         print_format=args.print_format,

@@ -16,7 +16,11 @@ from browse_tui import Browser, Item
 
 
 def main():
+    # First positional argv is the delay; remaining argv are passed
+    # through as flags (e.g. ``--no-children-pane``). Only one flag is
+    # interpreted today; everything else is silently ignored.
     delay = float(sys.argv[1]) if len(sys.argv) > 1 else 1.0
+    show_children_pane = '--no-children-pane' not in sys.argv[2:]
 
     def get_children(parent_id):
         if parent_id in (None, ''):
@@ -26,7 +30,10 @@ def main():
         return [Item(id='alpha', title='alpha'),
                 Item(id='beta', title='beta')]
 
-    b = Browser(get_children=get_children)
+    b = Browser(
+        get_children=get_children,
+        show_children_pane=show_children_pane,
+    )
     sys.exit(b.run())
 
 

@@ -1,10 +1,14 @@
-"""browse-tui: render layer (list + preview, item formatting, status bar).
+"""browse-tui: render layer (list + children-grid + preview, status bar).
 
-Phase 1 subset of plan-tui's renderer:
+Renderer layout:
 
-  * Two panes — a scrolling list and a preview pane — separated by an
-    info bar that doubles as a separator. ``show_preview=False`` collapses
-    to a single full-screen list with the info bar at the bottom row.
+  * Up to three panes — a scrolling list, a multi-column children grid
+    (between the list and the preview), and a preview pane — each
+    separated by an info bar that doubles as a separator.
+    ``show_preview=False`` collapses to a single full-screen list with
+    the info bar at the bottom row. ``show_children_pane=False`` (or
+    a cursor on a leaf, or no cached children) hides the children grid
+    entirely; the preview pane then takes that space.
   * Item rows are built as a list of ``(text, fg, bold)`` segments by
     ``format_item_segments``. Recipes can override the whole row layout
     by supplying a ``format_item=lambda item, ctx: …`` hook on Browser
@@ -15,15 +19,18 @@ Phase 1 subset of plan-tui's renderer:
     styling) are recognised; unknown names fall back to ``''``.
   * ``⧗ loading…`` placeholder rows render dimmed without the usual
     selection / expand markers.
+  * The children-grid pane shows the cursor item's direct children in a
+    flowed multi-column layout (ported from plan-tui). Each entry uses
+    the per-item tag colour from ``_TAG_STYLE``. Hidden when the
+    terminal is too small (< 20 rows) or the cursor item has no
+    children to display.
   * ``render_full`` paints the entire screen; ``render_partial`` redraws
     only the regions named in ``Browser._needs_redraw``. Both flush
     once at the end.
   * Help screen is shown by toggling ``Browser._help_mode``; the preview
     pane displays ``_HELP_TEXT`` instead of the per-item preview.
 
-Out of scope (deferred to phase 2):
-  * Children-grid pane (the multi-column ``render_subtickets`` from
-    plan-tui — ticket #19).
+Out of scope (deferred to phase 2/3):
   * Insert-mode marker — ticket #21.
   * Search-fragment highlight in the *list* — ticket #22 fills in
     ``_write_highlighted`` with a non-empty search query. The hook is
@@ -142,36 +149,57 @@ def format_item_segments(item, *, depth=0, base_depth=0, expanded=False,
     return segments
 
 
-def layout_panes(cols, rows, *, show_preview=True):
-    """Return geometry dict for the two-pane layout.
+def layout_panes(cols, rows, *, show_preview=True,
+                 show_children_pane=True, children_rows_needed=0):
+    """Return geometry dict for the three-pane layout.
 
     Keys returned:
       * ``cols``        — terminal width (for callers).
       * ``list_top``    — first row of the list pane (1-based).
       * ``list_height`` — rows in the list pane.
-      * ``info_row``    — row of the info-bar separator (0 if none).
-      * ``prev_top``    — first row of the preview pane.
-      * ``prev_height`` — rows in the preview pane (incl. separator? no
-                          — separator is the info_row, content starts at
-                          ``prev_top + 1``; ``prev_height`` is the content
-                          row count).
+      * ``sub_top``     — first row of the children grid (when shown).
+                          This is the grid's *separator* row; content
+                          starts at ``sub_top + 1``. Only meaningful
+                          when ``sub_height > 0``.
+      * ``sub_height``  — total rows the children grid occupies,
+                          *including* its leading separator. 0 when
+                          hidden (no children, terminal too small,
+                          or ``show_children_pane=False``).
+      * ``prev_top``    — first row of the preview pane: this is the
+                          preview's separator row; content starts at
+                          ``prev_top + 1``. Only meaningful when
+                          ``prev_height > 1`` (we always reserve at
+                          least the separator when ``show_preview=True``).
+      * ``prev_height`` — total rows the preview occupies, *including*
+                          its leading separator. So
+                          ``list_height + sub_height + prev_height``
+                          equals ``rows`` exactly when ``show_preview``
+                          is True.
+      * ``info_row``    — row of the *active* info-bar separator. When
+                          the children-grid is visible, this is the
+                          grid's separator (``sub_top``); otherwise the
+                          preview's separator (``prev_top``). Carries the
+                          ``[N]`` selection count, search prompt, hints.
 
-    Two-pane (show_preview=True):
-      * ``list_height``  ≈ 30% of rows, minimum 1.
-      * ``info_row``     = ``list_top + list_height`` (the separator).
-      * ``prev_top``     = ``info_row + 1`` (preview content starts the
-                            row after the separator). The separator
-                            itself is owned by ``render_full`` /
-                            ``render_partial`` via ``render_separator``.
-      * ``prev_height``  = remaining rows (≥ 0); content-only count.
+    Layout (all three panes, big terminal):
+        rows 1..list_height                   — list
+        row sub_top                           — children-grid separator
+                                                 (also the active info row)
+        rows sub_top+1..sub_top+sub_height-1  — children-grid content
+        row prev_top                          — preview separator
+        rows prev_top+1..prev_top+prev_height-1 — preview content
 
-    One-pane (show_preview=False):
-      * ``list_height``  = ``rows - 1`` (last row reserved for info bar).
-      * ``info_row``     = ``rows``.
-      * ``prev_height``  = 0.
+    Sizing:
+      * ``list_height`` ≈ 30% of rows, minimum 1.
+      * ``sub_height`` is bounded by ``min(30% of rows, 1 + children_rows_needed)``;
+        zero when the cursor item has no children to display, or when
+        the terminal is too small (rows < 20), or when
+        ``show_children_pane`` is False.
+      * ``prev_height`` gets the remainder (non-negative).
 
-    All returned heights are clamped non-negative; very small terminals
-    get a degenerate but valid layout.
+    show_preview=False collapses to a single full-screen list with the
+    info bar at the bottom row; the children grid is also suppressed in
+    this mode so the list stays full-height.
     """
     cols = max(1, int(cols))
     rows = max(1, int(rows))
@@ -184,26 +212,46 @@ def layout_panes(cols, rows, *, show_preview=True):
             'cols': cols,
             'list_top': list_top,
             'list_height': list_height,
+            'sub_top': info_row,
+            'sub_height': 0,
             'info_row': info_row,
             'prev_top': info_row,
             'prev_height': 0,
         }
 
-    # ~30% of rows for the list, separator on the boundary, remainder
-    # for preview content.
+    # ~30% of rows for the list. Make sure we leave at least one row for
+    # the preview separator below.
     list_height = max(1, int(rows * 0.30))
-    # Make sure the separator + at least the preview-separator row fit.
     if list_height + 1 > rows:
         list_height = max(1, rows - 1)
-    info_row = list_top + list_height
-    # Separator at info_row, content starts at info_row+1.
-    prev_top = info_row + 1
-    prev_height = max(0, rows - list_height - 1)
+
+    # Children grid sizing — cap at 30% of total rows, shrink to fit
+    # children content. ``children_rows_needed`` is the *content* row
+    # count; we add 1 for the grid's leading separator.
+    sub_top = list_top + list_height
+    if (not show_children_pane) or rows < 20:
+        sub_height = 0
+    else:
+        sub_max = max(1, int(rows * 0.30))
+        needed = (1 + children_rows_needed) if children_rows_needed > 0 else 0
+        sub_height = min(sub_max, needed) if needed > 0 else 0
+
+    # Preview separator sits immediately after the grid (or after the
+    # list when the grid is hidden); ``prev_height`` covers the
+    # separator + content together, mirroring plan-tui's geometry.
+    prev_top = sub_top + sub_height
+    prev_height = max(0, rows - list_height - sub_height)
+
+    # The active info row is the grid's separator when shown, else the
+    # preview's separator. Both are the first separator below the list.
+    info_row = sub_top if sub_height > 0 else prev_top
 
     return {
         'cols': cols,
         'list_top': list_top,
         'list_height': list_height,
+        'sub_top': sub_top,
+        'sub_height': sub_height,
         'info_row': info_row,
         'prev_top': prev_top,
         'prev_height': prev_height,
@@ -332,6 +380,150 @@ def _write_highlighted(line, base_fg=None, base_bold=False, reverse=False,
 
 
 # ---------------------------------------------------------------------------
+# Children-grid pane — multi-column flowed layout helpers
+# ---------------------------------------------------------------------------
+
+
+_SUB_WRAP = 80   # wrap child entries at this width
+_SUB_INDENT = '    '   # continuation indent for wrapped lines
+
+
+def _fmt_child(item):
+    """Format a child Item for the children grid.
+
+    Layout: ``'#{id} [{tag}] {title}'`` when ``item.tag`` is non-empty,
+    otherwise ``'#{id} {title}'``. The renderer in ``render_children_grid``
+    re-emits each entry through ``_write_segments`` so the tag picks up
+    its colour from ``_TAG_STYLE``; this helper produces the *plain*
+    text used for column-width measurement and wrapping.
+    """
+    if item.tag:
+        return '#{} [{}] {}'.format(item.id, item.tag, item.title)
+    return '#{} {}'.format(item.id, item.title)
+
+
+def _wrap_entry(text, width):
+    """Wrap ``text`` at ``width`` columns; continuation lines are indented.
+
+    Returns a list of one or more lines. The first line keeps the full
+    width; subsequent lines start with ``_SUB_INDENT`` and consume
+    ``width - len(_SUB_INDENT)`` characters per line. If the indent
+    would leave too little room (< 10 chars), we drop the indent and
+    use the full width instead.
+    """
+    if len(text) <= width:
+        return [text]
+    lines = [text[:width]]
+    rest = text[width:]
+    indent = _SUB_INDENT
+    cont_w = width - len(indent)
+    if cont_w < 10:
+        cont_w = width
+        indent = ''
+    while rest:
+        lines.append(indent + rest[:cont_w])
+        rest = rest[cont_w:]
+    return lines
+
+
+def _sub_layout(children, cols):
+    """Compute the multi-column grid layout.
+
+    Each entry is wrapped at ``_SUB_WRAP``. Column width is derived from
+    the *capped* per-entry width (``min(actual, _SUB_WRAP)``) so a single
+    extra-long title doesn't force the entire grid into one column.
+
+    Returns ``(num_cols, col_width, slot_rows, entry_lines)``:
+      * ``slot_rows[i]``    — number of display rows entry ``i`` occupies.
+      * ``entry_lines[i]``  — list of wrapped lines for entry ``i``.
+      * ``num_cols``        — column count for the layout.
+      * ``col_width``       — width of each column (incl. inter-column gap).
+    """
+    if not children:
+        return (1, cols, [], [])
+
+    raw = [_fmt_child(c) for c in children]
+    entry_lines = [_wrap_entry(e, _SUB_WRAP) for e in raw]
+    slot_rows = [len(lines) for lines in entry_lines]
+
+    max_w = min(max(len(e) for e in raw), _SUB_WRAP)
+    gap = 2
+    col_width = max_w + gap
+    # Allow one extra partial column — it'll be truncated at the screen
+    # edge but uses the leftover width effectively.
+    full_cols = max(1, (cols + gap) // col_width)
+    num_cols = min(full_cols + 1, len(children))
+
+    return (num_cols, col_width, slot_rows, entry_lines)
+
+
+def _distribute_to_columns(num_cols, slot_rows):
+    """Distribute entries across columns balancing by *display lines*.
+
+    Returns a list of ``(start, end)`` index ranges, one per column.
+    Each column accumulates entries until adding one more would push
+    past the per-column target; the final column gets the remainder.
+    """
+    n = len(slot_rows)
+    if n == 0 or num_cols == 0:
+        return []
+    total_lines = sum(slot_rows)
+    target = (total_lines + num_cols - 1) // num_cols  # ideal lines per column
+    out = []
+    start = 0
+    for c in range(num_cols):
+        if c == num_cols - 1:
+            out.append((start, n))
+            break
+        col_h = 0
+        end = start
+        while end < n:
+            if col_h + slot_rows[end] > target and col_h > 0:
+                break
+            col_h += slot_rows[end]
+            end += 1
+        out.append((start, end))
+        start = end
+    return out
+
+
+def _sub_total_rows(num_cols, slot_rows):
+    """Total display rows for a column-major layout with multi-row entries."""
+    if not slot_rows or num_cols == 0:
+        return 0
+    ranges = _distribute_to_columns(num_cols, slot_rows)
+    return max(sum(slot_rows[s:e]) for s, e in ranges) if ranges else 0
+
+
+def _sub_needed_rows(children, cols):
+    """Number of content rows the grid would need to render ``children``.
+
+    Returns 0 when there are no children. Caller adds 1 for the
+    separator to compute the total pane height (see ``layout_panes``).
+    """
+    if not children:
+        return 0
+    num_cols, _, slot_rows, _ = _sub_layout(children, cols)
+    return _sub_total_rows(num_cols, slot_rows)
+
+
+def _child_segments(item, max_width):
+    """Build the ``(text, fg, bold)`` segment list for one grid entry.
+
+    Mirrors the per-line layout produced by ``_fmt_child`` but with
+    individual style spans so the id gets ``_ID_COLOR`` and the tag
+    picks up its style from ``_TAG_STYLE``. Truncation is left to the
+    caller (``_write_segments`` clamps at ``max_width``).
+    """
+    segs = [('#{} '.format(item.id), _ID_COLOR, False)]
+    if item.tag:
+        sfg, sbold = _TAG_STYLE.get(item.tag_style, _TAG_STYLE[''])
+        segs.append(('[{}] '.format(item.tag), sfg, sbold))
+    segs.append((item.title, None, False))
+    return segs
+
+
+# ---------------------------------------------------------------------------
 # Pane renderers — each owns a region, takes Browser + geometry
 # ---------------------------------------------------------------------------
 
@@ -415,20 +607,29 @@ def render_list(browser, top, height, cols):
 
 
 def render_preview(browser, top, height, cols, *, info=False):
-    """Render the preview pane content at rows ``top .. top+height-1``.
+    """Render the preview pane (separator + content).
 
-    The separator/info-bar above is *not* drawn here — that's owned by
-    ``render_full`` / ``render_partial`` (they call ``render_separator``
-    at ``info_row`` independently). This function paints content rows
-    only.
+    ``height`` includes the separator row at ``top`` plus
+    ``height - 1`` rows of wrapped content below it. The separator
+    label adapts to ``browser._error_text`` / ``browser._help_mode``
+    (``Error`` / ``Help`` / ``Preview``). When ``info=True`` the
+    separator carries the active info-bar decorations (``[N]`` /
+    search prompt / hints).
 
-    Source priority:
+    Source priority for the content:
       1. ``browser._error_text`` if set      → display the error text
       2. ``browser._help_mode`` if True      → display ``_HELP_TEXT``
       3. ``browser._state._preview[id]``     → per-item preview
       4. fallthrough — empty preview         → blank rows
     """
     if height <= 0:
+        return
+
+    label = _preview_label(browser)
+    render_separator(top, cols, label, info=info, browser=browser)
+
+    content_lines = height - 1
+    if content_lines <= 0:
         return
 
     if browser._error_text:
@@ -458,8 +659,8 @@ def render_preview(browser, top, height, cols, *, info=False):
     scroll = browser._preview_scroll
     if scroll < 0:
         scroll = 0
-    for i in range(height):
-        move(top + i, 1)
+    for i in range(content_lines):
+        move(top + 1 + i, 1)
         clear_line()
         src_idx = i + scroll
         if src_idx < len(wrapped):
@@ -473,6 +674,131 @@ def _cursor_id(browser):
     if 0 <= cur < len(vis):
         return vis[cur].item.id
     return None
+
+
+def _cursor_item(browser):
+    """Return the Item under the cursor (only for ``kind='normal'``).
+
+    Returns None for placeholder rows / scope-root rows / empty visible
+    list — the children grid only meaningfully renders for a cursor on
+    a real item.
+    """
+    vis = visible_items(browser._state)
+    cur = browser._state.cursor
+    if not (0 <= cur < len(vis)):
+        return None
+    entry = vis[cur]
+    if entry.kind != 'normal':
+        return None
+    return entry.item
+
+
+def render_children_grid(browser, top, height, cols, *, info=False):
+    """Render the children-grid pane (with its leading separator).
+
+    ``height`` includes the 1-row separator at ``top``; content lines
+    occupy ``height - 1`` rows below it. The children come from
+    ``browser._state._children.get(cursor_item.id, [])`` — direct
+    children of the cursor item, fetched lazily by the children worker.
+
+    Behaviour:
+      * Cursor on a leaf or empty cached children → blank content area
+        (the layout normally already set ``sub_height = 0`` to elide
+        the pane entirely; we render defensively).
+      * Cursor on a branch whose children aren't cached yet → single
+        ``⧗ loading…`` row in dim, mirroring the placeholder used in
+        the list pane.
+      * Cached children → multi-column flowed layout via ``_sub_layout``
+        / ``_distribute_to_columns``. Each entry's tag picks up its
+        colour from ``_TAG_STYLE``.
+    """
+    if height <= 0:
+        return
+
+    render_separator(top, cols, 'Children', info=info, browser=browser)
+
+    content_lines = height - 1
+    if content_lines <= 0:
+        return
+
+    cursor = _cursor_item(browser)
+    if cursor is None:
+        for i in range(content_lines):
+            move(top + 1 + i, 1)
+            clear_line()
+        return
+
+    state = browser._state
+    children = state._children.get(cursor.id)
+
+    # Pending: cursor on a branch whose children aren't cached yet.
+    if children is None and cursor.has_children:
+        move(top + 1, 1)
+        clear_line()
+        set_style(fg=_PENDING_FG)
+        write('⧗ loading…'[:cols])
+        reset_style()
+        for i in range(1, content_lines):
+            move(top + 1 + i, 1)
+            clear_line()
+        return
+
+    # Cached but empty (or a leaf) — nothing to draw, blank rows.
+    if not children:
+        for i in range(content_lines):
+            move(top + 1 + i, 1)
+            clear_line()
+        return
+
+    # Cached non-empty children — multi-column flowed layout.
+    num_cols, col_width, slot_rows, entry_lines = _sub_layout(children, cols)
+    ranges = _distribute_to_columns(num_cols, slot_rows)
+
+    # Build per-column flat line lists + maps from row -> source entry
+    # index (so we know which entry owns each first-line row, for
+    # coloured-segment rendering).
+    col_lines = []
+    col_entry_at = []   # list of dict: row_idx_in_col -> source entry idx
+    for start, end in ranges:
+        lines = []
+        entry_at = {}
+        for src_idx in range(start, end):
+            entry_at[len(lines)] = src_idx
+            lines.extend(entry_lines[src_idx])
+        col_lines.append(lines)
+        col_entry_at.append(entry_at)
+
+    total_rows = max((len(cl) for cl in col_lines), default=0)
+
+    for row in range(content_lines):
+        move(top + 1 + row, 1)
+        clear_line()
+        if row >= total_rows:
+            continue
+        col_pos = 0
+        for c in range(num_cols):
+            cl = col_lines[c]
+            cell = cl[row] if row < len(cl) else ''
+            if c < num_cols - 1:
+                width = col_width
+            else:
+                width = cols - col_pos
+            if width <= 0:
+                break
+            src_idx = col_entry_at[c].get(row)
+            if src_idx is not None:
+                # First line of an entry — render with coloured segments.
+                child = children[src_idx]
+                segs = _child_segments(child, width)
+                used = _write_segments(segs, min(width, len(cell)))
+                pad = width - used
+                if pad > 0:
+                    write(' ' * pad)
+            else:
+                # Continuation line — plain text, no colour.
+                chunk = cell[:width].ljust(width)[:width]
+                write(chunk)
+            col_pos += width
 
 
 _SB_BG = 236   # dark gray status-bar background
@@ -613,9 +939,58 @@ def render_separator(row, cols, label, *, info=False, browser=None):
 
 
 def _layout_for(browser):
-    """Build the geometry dict from current terminal size + browser flags."""
+    """Build the geometry dict from current terminal size + browser flags.
+
+    Cursor-aware: if ``show_children_pane`` is set and the cursor is on
+    a branch whose children are cached, we ask the multi-column layout
+    helpers how many content rows it would need and pass the answer to
+    ``layout_panes`` so the grid pane shrinks to fit. A cursor on a
+    leaf, or on a branch whose children haven't been fetched yet,
+    yields ``children_rows_needed=0`` *unless* the branch has children
+    (in which case we reserve one row for the ``⧗ loading…`` hint).
+    """
     cols, rows = term_size()
-    return layout_panes(cols, rows, show_preview=browser.show_preview)
+    children_rows = 0
+    if browser.show_children_pane and not browser._headless:
+        cursor = _cursor_item(browser)
+        if cursor is not None and cursor.has_children:
+            cached = browser._state._children.get(cursor.id)
+            if cached:
+                children_rows = _sub_needed_rows(cached, cols)
+            elif cached is None:
+                # Branch with not-yet-cached children — reserve one row
+                # for the loading hint so the grid is visible while the
+                # fetch is in flight.
+                children_rows = 1
+            # cached == [] (empty list): leaf-like, no rows reserved.
+    return layout_panes(
+        cols, rows,
+        show_preview=browser.show_preview,
+        show_children_pane=browser.show_children_pane,
+        children_rows_needed=children_rows,
+    )
+
+
+def _pane_info_flags(layout):
+    """Return ``(sub_info, prev_info)``: which separator owns the info row.
+
+    Mirrors plan-tui's helper of the same name. The info row always
+    sits on a separator; this picks which pane that separator belongs
+    to so the renderer knows where to draw the ``[N]`` / search prompt
+    / hints.
+    """
+    ir = layout['info_row']
+    sub_info = layout['sub_height'] > 0 and layout['sub_top'] == ir
+    prev_info = (
+        layout['prev_height'] > 0 and layout['prev_top'] == ir
+        and not sub_info
+    )
+    # When show_preview=False, prev_height is 0 but the info row still
+    # sits at prev_top. Treat that case as prev_info to keep
+    # render_separator drawing the bottom info bar.
+    if not sub_info and not prev_info and ir > 0:
+        prev_info = True
+    return sub_info, prev_info
 
 
 def render_full(browser):
@@ -627,20 +1002,29 @@ def render_full(browser):
     """
     write('\033[2J')
     layout = _layout_for(browser)
+    sub_info, prev_info = _pane_info_flags(layout)
     render_list(
         browser,
         layout['list_top'], layout['list_height'], layout['cols'],
     )
-    label = _preview_label(browser)
-    if layout['info_row'] > 0:
-        render_separator(
-            layout['info_row'], layout['cols'], label,
-            info=True, browser=browser,
+    if layout['sub_height'] > 0:
+        render_children_grid(
+            browser,
+            layout['sub_top'], layout['sub_height'], layout['cols'],
+            info=sub_info,
         )
     if browser.show_preview and layout['prev_height'] > 0:
+        # render_preview draws its own separator (label + info bar).
         render_preview(
             browser,
             layout['prev_top'], layout['prev_height'], layout['cols'],
+            info=prev_info,
+        )
+    elif not browser.show_preview and layout['info_row'] > 0:
+        # show_preview=False — bottom info bar.
+        render_separator(
+            layout['info_row'], layout['cols'], _preview_label(browser),
+            info=True, browser=browser,
         )
     flush()
     browser._needs_redraw = set()
@@ -649,10 +1033,10 @@ def render_full(browser):
 def render_partial(browser):
     """Selective redraw based on ``browser._needs_redraw``.
 
-    Recognised flags: ``'list'``, ``'preview'``, ``'info'``, ``'all'``.
-    ``'all'`` short-circuits to ``render_full``. Unknown flags are
-    ignored (no error) so callers can stuff "hint" tokens in the set
-    without crashing the renderer.
+    Recognised flags: ``'list'``, ``'children'``, ``'preview'``,
+    ``'info'``, ``'all'``. ``'all'`` short-circuits to ``render_full``.
+    Unknown flags are ignored (no error) so callers can stuff "hint"
+    tokens in the set without crashing the renderer.
     """
     needs = browser._needs_redraw
     if 'all' in needs:
@@ -662,23 +1046,39 @@ def render_partial(browser):
         return
 
     layout = _layout_for(browser)
+    sub_info, prev_info = _pane_info_flags(layout)
     if 'list' in needs:
         render_list(
             browser,
             layout['list_top'], layout['list_height'], layout['cols'],
         )
+    if 'children' in needs:
+        if layout['sub_height'] > 0:
+            render_children_grid(
+                browser,
+                layout['sub_top'], layout['sub_height'], layout['cols'],
+                info=sub_info,
+            )
     if 'preview' in needs:
         if browser.show_preview and layout['prev_height'] > 0:
             render_preview(
                 browser,
                 layout['prev_top'], layout['prev_height'], layout['cols'],
+                info=prev_info,
             )
     if 'info' in needs:
-        if layout['info_row'] > 0:
-            render_separator(
-                layout['info_row'], layout['cols'], _preview_label(browser),
-                info=True, browser=browser,
-            )
+        ir = layout['info_row']
+        if ir > 0:
+            if sub_info:
+                render_separator(
+                    ir, layout['cols'], 'Children',
+                    info=True, browser=browser,
+                )
+            else:
+                render_separator(
+                    ir, layout['cols'], _preview_label(browser),
+                    info=True, browser=browser,
+                )
     flush()
     browser._needs_redraw = set()
 

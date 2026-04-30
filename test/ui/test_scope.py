@@ -47,11 +47,18 @@ def setUpModule():
 class TestScope(unittest.TestCase):
 
     def _launch(self, t):
-        """Launch browse-tui with the hierarchical children-cmd."""
+        """Launch browse-tui with the hierarchical children-cmd.
+
+        The grid pane is disabled here so the assertions can talk about
+        the list pane in isolation — otherwise the cursor item's
+        children show up in the grid even when the list pane has them
+        collapsed, breaking the ``not in screen`` assertions.
+        """
         t.launch(
             _BIN,
             '--children-cmd', _CHILDREN_CMD,
             '--fields', 'id,title,has_children',
+            '--no-children-pane',
         )
 
     def test_alt_down_drills_into_cursor(self):

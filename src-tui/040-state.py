@@ -718,6 +718,16 @@ class Browser:
             n += 1
         if n:
             self._needs_redraw.add('list')
+            # The cache may have just filled the cursor item's
+            # children — flag the grid pane for redraw too. Render-time
+            # checks gate the actual paint so this is harmless when the
+            # grid is hidden / disabled.
+            self._needs_redraw.add('children')
+            # Layout depends on grid sizing: when the grid was hidden
+            # waiting for children to arrive, the preview now needs to
+            # shrink to make room. A full repaint is cheaper than
+            # tracking that delta by hand.
+            self._needs_redraw.add('all')
         return n
 
     def apply_preview_result(self) -> bool:
@@ -973,6 +983,7 @@ class Browser:
             except TimeoutError:
                 pass  # slow callback; render the loading state
             self._update_preview_for_cursor()
+            self._update_children_for_cursor()
             try:
                 self.run_until_idle(timeout=0.2)
             except TimeoutError:
@@ -1022,9 +1033,11 @@ class Browser:
                 # normal-mode dispatch live in dispatch_key.
                 dispatch_key(self, ctx, key)
 
-                # Trigger preview fetch for the (possibly moved) cursor
-                # before the next render pass.
+                # Trigger preview + children fetches for the (possibly
+                # moved) cursor before the next render pass. The
+                # children fetch populates the children-grid pane.
                 self._update_preview_for_cursor()
+                self._update_children_for_cursor()
         finally:
             if not self._headless:
                 term_restore()
@@ -1060,6 +1073,42 @@ class Browser:
             return
         if entry.item.id != self._preview_req:
             self.request_preview(entry.item.id)
+
+    def _update_children_for_cursor(self) -> None:
+        """Kick a children fetch for the cursor item if it's an unfetched branch.
+
+        The children-grid pane (ticket #19) wants the cursor item's
+        direct children even when the cursor row itself isn't expanded
+        in the list pane. Plan-tui drives this with a separate
+        ``plan_children(tid)`` round-trip; browse-tui has only one
+        children worker, so we re-use it: enqueue the cursor id without
+        touching ``state.expanded`` (so the visible-tree builder doesn't
+        descend into it). The cache fills, the grid renders, and the
+        list pane stays unchanged.
+
+        No-op when the children-grid pane is disabled, when the cursor
+        is on a non-normal entry, when the cursor item has no children,
+        or when its children are already cached / in flight.
+        """
+        if not self.show_children_pane:
+            return
+        state = self._state
+        vis = visible_items(state)
+        if not (0 <= state.cursor < len(vis)):
+            return
+        entry = vis[state.cursor]
+        if entry.kind != 'normal':
+            return
+        item = entry.item
+        if not item.has_children:
+            return
+        if item.id in state._children:
+            return  # already cached
+        if item.id in state._children_pending:
+            return  # already in flight
+        state._children_pending.add(item.id)
+        self._children_queue.append(item.id)
+        self._children_event.set()
 
     # ---- eager adapter -------------------------------------------------
 
