@@ -226,6 +226,31 @@ class Context:
             return False
         return _confirm_on_info_bar(self._browser, prompt)
 
+    def pick(self, label, options):
+        """fzf-style filterable picker overlaid on the preview pane.
+
+        Renders a ``label> `` prompt on the info bar and the filtered
+        list of ``options`` in the preview pane area. The user can:
+
+          * type to filter (case-insensitive substring match);
+          * up / down / ctrl-p / ctrl-n to move the picker cursor;
+          * home / end to jump to the first / last filtered match;
+          * enter to select the highlighted option;
+          * esc / ctrl-c to cancel;
+          * backspace to edit the filter.
+
+        Returns the selected option string, or ``None`` if cancelled.
+        Headless Browsers return ``None`` immediately so unit tests can
+        rely on the cancel outcome without driving a key stream.
+
+        The picker is **not re-entrant** — calling ``ctx.pick`` from
+        inside another ``ctx.pick`` handler is unsupported and will
+        produce undefined screen state.
+        """
+        if self._browser._headless:
+            return None
+        return _pick_on_info_bar(self._browser, label, list(options))
+
 
 # ---- info-bar prompt helpers ----------------------------------------------
 #
@@ -324,3 +349,153 @@ def _confirm_on_info_bar(browser, prompt):
             return True
         if key in ('n', 'N', 'esc', 'ctrl-c'):
             return False
+
+
+# ---- pick / picker overlay ------------------------------------------------
+#
+# fzf-style sub-flow: prompt 'label> ' on the info bar, filtered list of
+# options overlaid in the preview pane area. Mirrors plan-tui's
+# ``action_status`` (see plan-source/src-tui/060-actions.py:134) — same
+# key dispatch, simpler cancel/return contract. Resize handling inside
+# the picker is deferred to phase 3 (the helper just continues the loop
+# on ``_notify`` / SIGWINCH; the next iteration re-reads geometry and
+# repaints).
+
+
+def _pick_on_info_bar(browser, label, options, *, _read_key=None):
+    """Run the fzf-style picker loop. Returns the chosen string or None.
+
+    ``_read_key`` is an injection seam for unit tests — when None we
+    defer to the module-level ``read_key`` from ``020-terminal``. Tests
+    pass an iterator-backed callable to drive a deterministic key stream
+    without a real TTY.
+
+    Layout:
+      * filter prompt on ``info_row`` (yellow-on-blue label, then the
+        current filter string, then dim filler ─);
+      * filtered options overlaid on the preview-pane area starting at
+        ``prev_top`` (note: ``prev_top`` is the preview's *separator*
+        row in the regular renderer; the picker repurposes it as the
+        first option row, which is fine because exiting the picker
+        always sets ``_needs_redraw = {'all'}`` so the next render
+        repaints the separator over the leftover row).
+
+    On exit (enter or esc) we mark the layout dirty so the main loop
+    repaints the regular UI on its next pass.
+    """
+    rk = _read_key if _read_key is not None else read_key
+
+    filter_query = ''
+    cursor = 0
+
+    def _filtered():
+        if not filter_query:
+            return list(options)
+        q = filter_query.lower()
+        return [o for o in options if q in o.lower()]
+
+    while True:
+        # Re-derive layout each iteration so a SIGWINCH-triggered redraw
+        # picks up the new terminal size on the next paint.
+        cols, rows_total = term_size()
+        layout = layout_panes(
+            cols, rows_total,
+            show_preview=browser.show_preview,
+        )
+        cols = layout['cols']
+        prev_top = layout['prev_top']
+        prev_height = layout['prev_height']
+        info_row = layout['info_row']
+
+        # When the info row coincides with the preview's top (i.e. no
+        # children-grid pane), the filter prompt and the options list
+        # would otherwise overdraw the same row. Reserve the top row
+        # for the prompt and slide the options down by one.
+        if info_row > 0 and info_row == prev_top and prev_height > 0:
+            options_top = prev_top + 1
+            options_height = prev_height - 1
+        else:
+            options_top = prev_top
+            options_height = prev_height
+
+        visible = _filtered()
+        if cursor >= len(visible):
+            cursor = max(0, len(visible) - 1)
+
+        # ---- filter prompt on the info row ------------------------
+        if info_row > 0:
+            move(info_row, 1)
+            clear_line()
+            S = '─'
+            prompt = ' {}> '.format(label)
+            set_style(fg=11, bg=4, bold=True)
+            write(prompt[:cols])
+            pos = min(len(prompt), cols)
+            if pos < cols:
+                set_style(fg=252, bg=236)
+                write(filter_query[:cols - pos])
+                pos += min(len(filter_query), cols - pos)
+            if pos < cols:
+                set_style(fg=8)
+                write(S * (cols - pos))
+            reset_style()
+
+        # ---- options list in the preview-pane area ----------------
+        if options_height > 0:
+            for i in range(options_height):
+                move(options_top + i, 1)
+                clear_line()
+                if i < len(visible):
+                    label_text = visible[i]
+                    if i == cursor:
+                        set_style(reverse=True)
+                        line = ('  ' + label_text).ljust(cols)[:cols]
+                        write(line)
+                        reset_style()
+                    else:
+                        write(('  ' + label_text)[:cols])
+
+        flush()
+
+        key = rk()
+
+        if key == '_notify':
+            # Background workers nudged us — drain main-thread work and
+            # re-render on the next iteration. Resize is handled
+            # implicitly by re-deriving the layout above.
+            browser.drain_main_queue()
+            browser.apply_children_results()
+            browser.apply_preview_result()
+            continue
+
+        if key in ('down', 'ctrl-n'):
+            if visible:
+                cursor = (cursor + 1) % len(visible)
+        elif key in ('up', 'ctrl-p'):
+            if visible:
+                cursor = (cursor - 1) % len(visible)
+        elif key == 'home':
+            cursor = 0
+        elif key == 'end':
+            if visible:
+                cursor = len(visible) - 1
+        elif key == 'enter':
+            if visible:
+                browser._needs_redraw.add('all')
+                return visible[cursor]
+            # No matches; ignore enter.
+        elif key in ('esc', 'ctrl-c'):
+            browser._needs_redraw.add('all')
+            return None
+        elif key == 'backspace':
+            if filter_query:
+                filter_query = filter_query[:-1]
+                cursor = 0
+        elif key == 'space':
+            filter_query += ' '
+            cursor = 0
+        elif len(key) == 1 and key.isprintable():
+            filter_query += key
+            cursor = 0
+        # Other keys (alt-*, ctrl-* not handled, mouse, function keys) —
+        # silently ignored, loop continues.
