@@ -1,0 +1,450 @@
+#!/usr/bin/env -S browse-tui --python
+"""browse-claude — Claude Code project / session / message browser.
+
+Lazily walks ``~/.claude/projects/<encoded-path>/<session>.jsonl`` files,
+exposing a three-level hierarchy:
+
+  level 0: projects    (the encoded-path subdirs of ~/.claude/projects)
+  level 1: sessions    (the .jsonl files within a project)
+  level 2: messages    (records within a session)
+
+Identifiers are kept simple and dispatchable purely by shape:
+  * project ids are absolute paths to the project directory.
+  * session ids are absolute paths to the .jsonl file.
+  * message ids are ``'<session_path>#<line_number>'`` strings.
+
+Phase-3 simplifications (intentionally out of scope):
+  * No delete-session action — too dangerous with no undo.
+  * No inotify watch — refresh is manual via ctrl-r.
+  * Message lists are capped at 200 entries per session — large sessions
+    truncate so the UI stays responsive. Full content is reachable via
+    the ``e`` action which opens the underlying ``.jsonl`` in $EDITOR.
+"""
+
+import datetime
+import json
+import os
+import sys
+
+from browse_tui import Action, Browser, Item
+
+
+CLAUDE_ROOT = os.path.join(
+    os.environ.get('HOME', os.path.expanduser('~')), '.claude', 'projects',
+)
+
+# Cap on messages enumerated per session (rest reachable via $EDITOR on
+# the .jsonl). Keeps the UI from stalling on multi-MB transcripts.
+_MESSAGE_LIMIT = 200
+
+
+# ---- helpers --------------------------------------------------------------
+
+
+def _decode_project_path(name):
+    """Convert a Claude-encoded directory name back to a real path.
+
+    Claude Code names a project directory by replacing every ``/`` in
+    the original cwd with ``-``, so ``/home/ubuntu/sandvault/src`` becomes
+    ``-home-ubuntu-sandvault-src``. We invert that for the display title.
+
+    Names that don't start with ``-`` are returned verbatim — better to
+    show *something* than to crash on an unexpected layout.
+    """
+    if not name.startswith('-'):
+        return name
+    return '/' + name[1:].replace('-', '/')
+
+
+def _human_time(epoch):
+    """Compact relative-time formatter (``2m ago``, ``3d ago``, …)."""
+    if not epoch:
+        return ''
+    delta = datetime.datetime.now().timestamp() - epoch
+    if delta < 0:
+        return 'just now'
+    if delta < 60:
+        return f'{int(delta)}s ago'
+    if delta < 3600:
+        return f'{int(delta // 60)}m ago'
+    if delta < 86400:
+        return f'{int(delta // 3600)}h ago'
+    return f'{int(delta // 86400)}d ago'
+
+
+# ---- get_children: dispatches by id shape --------------------------------
+#
+# The Browser passes the raw item id back into ``get_children``. We use the
+# id's shape (None / dir-path / file-path / ``'…#N'``) to pick the right
+# enumeration without threading any extra state through.
+
+
+def get_children(item_id):
+    if item_id is None:
+        return _list_projects()
+    if isinstance(item_id, str) and item_id.endswith('.jsonl') and os.path.isfile(item_id):
+        return _list_messages(item_id)
+    if isinstance(item_id, str) and os.path.isdir(item_id):
+        return _list_sessions(item_id)
+    # Messages have no children; anything else is unknown — return empty.
+    return []
+
+
+def _list_projects():
+    if not os.path.isdir(CLAUDE_ROOT):
+        return []
+    out = []
+    for name in os.listdir(CLAUDE_ROOT):
+        full = os.path.join(CLAUDE_ROOT, name)
+        if not os.path.isdir(full):
+            continue
+        try:
+            mtime = os.stat(full).st_mtime
+        except OSError:
+            mtime = 0
+        try:
+            sessions = sum(
+                1 for n in os.listdir(full) if n.endswith('.jsonl')
+            )
+        except OSError:
+            sessions = 0
+        item = Item(
+            id=full,
+            title=_decode_project_path(name),
+            tag=f'{sessions} sess · {_human_time(mtime)}',
+            tag_style='dim',
+            has_children=sessions > 0,
+        )
+        item.kind = 'project'
+        item.encoded_name = name
+        item.session_count = sessions
+        item.mtime = mtime
+        out.append(item)
+    # Most-recently-touched project first — matches what people actually
+    # want to look at when opening the browser cold.
+    out.sort(key=lambda it: -it.mtime)
+    return out
+
+
+def _list_sessions(project_dir):
+    out = []
+    try:
+        names = os.listdir(project_dir)
+    except OSError:
+        return []
+    for name in names:
+        if not name.endswith('.jsonl'):
+            continue
+        full = os.path.join(project_dir, name)
+        try:
+            st = os.stat(full)
+        except OSError:
+            continue
+        # Line count is a fast O(file-size) proxy for message count and
+        # subsumes the "is this session non-empty?" check we need for
+        # has_children. Cheaper than json-parsing every line just to count.
+        try:
+            with open(full, 'rb') as f:
+                count = sum(1 for _ in f)
+        except OSError:
+            count = 0
+        sid = name[:-len('.jsonl')]
+        item = Item(
+            id=full,
+            title=sid,
+            tag=f'{count} msg · {_human_time(st.st_mtime)}',
+            tag_style='dim',
+            has_children=count > 0,
+        )
+        item.kind = 'session'
+        item.line_count = count
+        item.mtime = st.st_mtime
+        out.append(item)
+    out.sort(key=lambda it: -it.mtime)
+    return out
+
+
+def _list_messages(jsonl_path, limit=_MESSAGE_LIMIT):
+    out = []
+    try:
+        f = open(jsonl_path, 'r', encoding='utf-8', errors='replace')
+    except OSError as e:
+        return [Item(
+            id=f'__err__:{jsonl_path}',
+            title=f'[error] {e}',
+            tag='err',
+            tag_style='red',
+        )]
+    with f:
+        for n, line in enumerate(f):
+            if n >= limit:
+                # Marker row so the user knows the list is truncated.
+                out.append(Item(
+                    id=f'{jsonl_path}#__truncated__',
+                    title=f'(more — only first {limit} shown; press e to view file)',
+                    tag='…',
+                    tag_style='dim',
+                ))
+                break
+            line = line.rstrip('\n')
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                # Malformed line — surface it but stay scrolling.
+                out.append(Item(
+                    id=f'{jsonl_path}#{n}',
+                    title=f'[invalid json] {line[:80]}',
+                    tag='err',
+                    tag_style='red',
+                ))
+                continue
+            kind = _kind_of(obj)
+            item = Item(
+                id=f'{jsonl_path}#{n}',
+                title=_summarise_message(obj),
+                tag=kind,
+                tag_style=_TAG_STYLE_FOR_KIND.get(kind, ''),
+                has_children=False,
+            )
+            item.kind = 'message'
+            item.line_no = n
+            item.session_path = jsonl_path
+            item.message_kind = kind
+            out.append(item)
+    return out
+
+
+# ---- message classification + summary ------------------------------------
+#
+# Claude Code .jsonl files mix several record shapes:
+#   1. ``type=last-prompt``     — bookmark for the most recent prompt.
+#   2. ``type=permission-mode`` — permission-mode change events.
+#   3. ``type=user``            — user turn (string or content-list).
+#   4. ``type=assistant``       — assistant turn (always content-list).
+#   5. anything else            — fall back to ``message``.
+#
+# The summary is one line, capped at 80 chars, and is intentionally lossy:
+# the preview pane shows the full pretty-printed JSON, so we optimise the
+# title for fast visual scanning.
+
+
+_TAG_STYLE_FOR_KIND = {
+    'last-prompt':     'magenta',
+    'permission-mode': 'gray',
+    'user':            'cyan',
+    'assistant':       'green',
+    'system':          'gray',
+    'tool_use':        'yellow',
+    'tool_result':     'yellow',
+}
+
+
+def _kind_of(obj):
+    """Best-effort classifier for one JSONL record."""
+    t = obj.get('type')
+    if t:
+        return t
+    msg = obj.get('message') or {}
+    if isinstance(msg, dict) and msg.get('role'):
+        return msg['role']
+    return 'message'
+
+
+def _summarise_message(obj):
+    """One-line summary of a JSONL entry, capped at 80 chars."""
+    t = obj.get('type', '')
+    if t == 'last-prompt':
+        leaf = str(obj.get('leafUuid', ''))[:8]
+        return f'last-prompt {leaf}' if leaf else 'last-prompt'
+    if t == 'permission-mode':
+        return f"permission-mode: {obj.get('permissionMode', '')}"
+
+    msg = obj.get('message') if isinstance(obj.get('message'), dict) else {}
+    role = msg.get('role') or obj.get('role') or t or ''
+    content = msg.get('content', obj.get('content', ''))
+    text = _extract_text(content)
+    text = ' '.join(text.split())[:80]
+    if role:
+        return f'{role}: {text}' if text else role
+    return text or '(empty)'
+
+
+def _extract_text(content):
+    """Pull the first useful text fragment out of a content payload.
+
+    Claude Code stores message content in three flavours:
+      * a bare string — return as-is.
+      * a list of parts, each a dict with ``type=text|thinking|
+        tool_use|tool_result`` — return the first ``text`` part's text,
+        falling back to a ``[<type>]`` placeholder for non-text parts so
+        the user can at least see *what* the message contained.
+      * anything else — best-effort ``str()``.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            ptype = part.get('type')
+            if ptype == 'text':
+                return part.get('text', '') or ''
+            if ptype == 'thinking':
+                # Thinking blocks are usually long; show a marker so the
+                # user knows the turn was a thinking-only step before any
+                # tool_use parts.
+                continue
+            if ptype == 'tool_use':
+                name = part.get('name', '?')
+                return f'[tool_use {name}]'
+            if ptype == 'tool_result':
+                return f'[tool_result]'
+        # Nothing matched — describe the shape rather than the content.
+        return f'<{len(content)} parts>'
+    if content is None:
+        return ''
+    return str(content)
+
+
+# ---- get_preview ---------------------------------------------------------
+
+
+def get_preview(item_id):
+    """Preview-pane content for the cursor item.
+
+    * project (dir):  human-readable summary + session list
+    * session (file): first 20 lines of the .jsonl (truncated)
+    * message (#N):   pretty-printed JSON of the line
+    """
+    if not isinstance(item_id, str) or item_id.startswith('__err__:'):
+        return ''
+    if '#' in item_id:
+        path, _, lineno = item_id.rpartition('#')
+        if lineno == '__truncated__':
+            return (
+                f'(only the first {_MESSAGE_LIMIT} messages are listed)\n'
+                f'press e on this row to open the full file in $EDITOR'
+            )
+        try:
+            n = int(lineno)
+        except ValueError:
+            return ''
+        return _preview_message(path, n)
+    if os.path.isdir(item_id):
+        return _preview_project(item_id)
+    if os.path.isfile(item_id) and item_id.endswith('.jsonl'):
+        return _preview_session(item_id)
+    return ''
+
+
+def _preview_project(path):
+    try:
+        names = sorted(
+            n for n in os.listdir(path) if n.endswith('.jsonl')
+        )
+    except OSError as e:
+        return f'[error] {e}'
+    header = (
+        f'project: {_decode_project_path(os.path.basename(path))}\n'
+        f'path:    {path}\n'
+        f'\n{len(names)} session(s):'
+    )
+    body = '\n'.join(f'  {n}' for n in names[:50])
+    if len(names) > 50:
+        body += f'\n  … and {len(names) - 50} more'
+    return f'{header}\n{body}' if body else header
+
+
+def _preview_session(path):
+    try:
+        lines = []
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            for n, line in enumerate(f):
+                if n >= 20:
+                    lines.append(f'… ({n}+ lines total)')
+                    break
+                lines.append(f'L{n + 1}: {line.rstrip()[:200]}')
+        return '\n'.join(lines) if lines else '(empty session)'
+    except OSError as e:
+        return f'[error] {e}'
+
+
+def _preview_message(path, n):
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            for i, line in enumerate(f):
+                if i == n:
+                    line = line.rstrip('\n')
+                    try:
+                        obj = json.loads(line)
+                        return json.dumps(obj, indent=2, ensure_ascii=False)
+                    except json.JSONDecodeError:
+                        return line
+    except OSError as e:
+        return f'[error] {e}'
+    return ''
+
+
+# ---- actions -------------------------------------------------------------
+
+
+def _resolve_path(item):
+    """Strip the ``#N`` suffix from a message id; return the .jsonl path."""
+    if item is None:
+        return None
+    iid = item.id
+    if not isinstance(iid, str):
+        return None
+    if '#' in iid:
+        iid, _, _ = iid.rpartition('#')
+    return iid
+
+
+def _action_edit(ctx):
+    """Open the cursor row's underlying file in $EDITOR.
+
+    For a project (a directory) we open the directory itself — most
+    editors handle that gracefully (vim opens netrw, code opens the
+    folder). For sessions and messages it's the .jsonl file.
+    """
+    if ctx.cursor is None:
+        return
+    path = _resolve_path(ctx.cursor)
+    if not path or not os.path.exists(path):
+        ctx.error(f'no such path: {path!r}')
+        return
+    editor = os.environ.get('EDITOR') or 'less'
+    ctx.run_external([editor, path])
+
+
+def _action_show_id(ctx):
+    """Surface the cursor row's id on the info bar (handy for debugging)."""
+    if ctx.cursor is None:
+        return
+    ctx.message(f'id: {ctx.cursor.id}')
+
+
+# ---- entry point ---------------------------------------------------------
+
+
+def main():
+    initial_scope = sys.argv[1] if len(sys.argv) > 1 else None
+    b = Browser(
+        title='browse-claude',
+        get_children=get_children,
+        get_preview=get_preview,
+        root_id=None,
+        initial_scope=initial_scope,
+        actions=[
+            Action('e', 'Edit/view', _action_edit,    'cursor'),
+            Action('o', 'Edit/view', _action_edit,    'cursor'),
+            Action('y', 'Show id',   _action_show_id, 'cursor'),
+        ],
+    )
+    sys.exit(b.run())
+
+
+if __name__ == '__main__':
+    main()
