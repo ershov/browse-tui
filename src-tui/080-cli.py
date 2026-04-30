@@ -1,6 +1,7 @@
 """browse-tui: CLI parser, format parsers, --python loader, --install hooks."""
 
 import argparse
+import csv as _csv
 import json
 import os
 import re as _re
@@ -146,12 +147,193 @@ def parse_json_array(data, strict=False):
             )
 
 
+def parse_csv(data, fields=None, record_sep=b'\n', strict=False):
+    """Yield dicts from RFC 4180 CSV-encoded bytes.
+
+    Records are split on ``record_sep`` (default ``b'\\n'``) at the bytes
+    level; each record is decoded as UTF-8 and parsed by the stdlib
+    ``csv`` module so quoted fields, embedded commas, and embedded
+    quotes (``""``) are handled correctly. Limitation: because record
+    splitting happens at the bytes layer first, a quoted CSV field that
+    contains a literal newline matching ``record_sep`` will break the
+    record into two — proper CSV-aware record splitting is a future
+    enhancement.
+
+    Columns map to ``fields`` positionally; columns beyond ``len(fields)``
+    are silently dropped, mirroring ``parse_tsv``.
+    """
+    if fields is None:
+        fields = ['id', 'title']
+    for record in _split_records(data, record_sep):
+        if not record:
+            continue
+        try:
+            line = record.decode('utf-8')
+        except UnicodeDecodeError:
+            if strict:
+                raise
+            continue
+        try:
+            row = next(_csv.reader([line]))
+        except (_csv.Error, StopIteration):
+            if strict:
+                raise
+            continue
+        d = {}
+        for i, name in enumerate(fields):
+            if i < len(row):
+                d[name] = row[i]
+        yield _coerce_dict(d)
+
+
+def _ifs_split(line, ifs_chars, *, collapse):
+    """Split ``line`` on any character in ``ifs_chars``.
+
+    ``collapse=True`` mimics bash IFS=' \\t\\n' behaviour: consecutive
+    delimiter characters act as a single boundary, and leading/trailing
+    delimiters are stripped (no empty fields produced).
+
+    ``collapse=False`` (the non-whitespace IFS case) treats each
+    delimiter as a real boundary, yielding empty strings for runs of
+    consecutive delimiters and for leading/trailing delimiters.
+    """
+    if collapse:
+        cur = []
+        cols = []
+        for ch in line:
+            if ch in ifs_chars:
+                if cur:
+                    cols.append(''.join(cur))
+                    cur = []
+            else:
+                cur.append(ch)
+        if cur:
+            cols.append(''.join(cur))
+        return cols
+    cur = []
+    cols = []
+    for ch in line:
+        if ch in ifs_chars:
+            cols.append(''.join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    cols.append(''.join(cur))
+    return cols
+
+
+def parse_ifs(data, fields=None, record_sep=b'\n', *, ifs_chars, strict=False):
+    """Split each record on any character in ``ifs_chars`` (bash-IFS style).
+
+    ``ifs_chars`` is a string of single-character delimiters. If every
+    char in ``ifs_chars`` is whitespace (``str.isspace()``), runs of
+    delimiters collapse into one boundary and leading/trailing
+    delimiters are stripped — matching ``IFS=' \\t\\n'`` in bash.
+    Otherwise each delimiter is a real boundary and consecutive
+    delimiters yield empty fields — matching ``IFS=':'`` for
+    ``/etc/passwd``.
+
+    ``ifs_chars`` must be non-empty; an empty value raises
+    ``ValueError`` because there is no sensible split rule for it.
+    """
+    if fields is None:
+        fields = ['id', 'title']
+    if not ifs_chars:
+        raise ValueError('parse_ifs: ifs_chars cannot be empty')
+    is_whitespace_only = all(c.isspace() for c in ifs_chars)
+    for record in _split_records(data, record_sep):
+        if not record:
+            continue
+        try:
+            line = record.decode('utf-8').rstrip('\r')
+        except UnicodeDecodeError:
+            if strict:
+                raise
+            continue
+        cols = _ifs_split(line, ifs_chars, collapse=is_whitespace_only)
+        d = {}
+        for i, name in enumerate(fields):
+            if i < len(cols):
+                d[name] = cols[i]
+        yield _coerce_dict(d)
+
+
+def parse_split(data, fields=None, record_sep=b'\n', *, pattern, strict=False):
+    """Split each record using a regex pattern (``re.split`` semantics).
+
+    ``pattern`` may be a compiled regex or a string (compiled lazily).
+    Columns map to ``fields`` positionally as with ``parse_tsv`` /
+    ``parse_csv`` / ``parse_ifs``. Useful for awk-style splitting on
+    e.g. ``\\s+``.
+    """
+    if isinstance(pattern, str):
+        pattern = _re.compile(pattern)
+    if fields is None:
+        fields = ['id', 'title']
+    for record in _split_records(data, record_sep):
+        if not record:
+            continue
+        try:
+            line = record.decode('utf-8').rstrip('\r')
+        except UnicodeDecodeError:
+            if strict:
+                raise
+            continue
+        cols = pattern.split(line)
+        d = {}
+        for i, name in enumerate(fields):
+            if i < len(cols):
+                d[name] = cols[i]
+        yield _coerce_dict(d)
+
+
+def parse_match(data, record_sep=b'\n', *, pattern, strict=False):
+    """Match each record against a named-group regex; groups become fields.
+
+    ``pattern`` may be a compiled regex or a string. Each record is
+    matched with ``re.match`` (anchored at the start). Named groups
+    (``(?P<name>...)``) become keys in the yielded dict. Records that
+    don't match are skipped (``strict=False``) or raise
+    ``ValueError`` (``strict=True``). Optional groups that didn't
+    capture (``None``) are excluded from the dict so downstream
+    layers don't see ``None`` where they expect a string.
+
+    Field-mapping is implicit through the named groups, so this
+    parser does not take a ``fields`` argument.
+    """
+    if isinstance(pattern, str):
+        pattern = _re.compile(pattern)
+    for record in _split_records(data, record_sep):
+        if not record:
+            continue
+        try:
+            line = record.decode('utf-8').rstrip('\r')
+        except UnicodeDecodeError:
+            if strict:
+                raise
+            continue
+        m = pattern.match(line)
+        if m is None:
+            if strict:
+                raise ValueError(
+                    f'parse_match: line did not match pattern: {line!r}'
+                )
+            continue
+        d = {k: v for k, v in m.groupdict().items() if v is not None}
+        yield _coerce_dict(d)
+
+
 def parse_input(data, *, fmt, fields=None, record_sep=b'\n', strict=False):
     """Parse raw bytes into an iterator of candidate Item-kwargs dicts.
 
-    ``fmt``        — ``'tsv'`` | ``'json'`` | ``'json-array'``.
-    ``fields``     — for tsv only; column names (default ``['id', 'title']``).
-                     Extra columns beyond ``len(fields)`` are dropped silently.
+    ``fmt``        — ``'tsv'`` | ``'csv'`` | ``'json'`` | ``'json-array'``
+                     | ``'ifs:CHARS'`` | ``'split:REGEX'`` | ``'match:REGEX'``.
+                     The colon-separated formats embed their argument
+                     directly (e.g. ``'ifs::'`` for ``/etc/passwd``).
+    ``fields``     — for tsv/csv/ifs/split; column names (default
+                     ``['id', 'title']``). Extra columns beyond
+                     ``len(fields)`` are dropped silently. Ignored by
+                     ``match:`` (named groups define the fields).
     ``record_sep`` — ``b'\\n'`` (default) or ``b'\\0'`` (or other literal).
                      Ignored for ``'json-array'`` (whole input is one array).
     ``strict``     — ``False`` (default) skips malformed records silently;
@@ -161,12 +343,33 @@ def parse_input(data, *, fmt, fields=None, record_sep=b'\n', strict=False):
         yield from parse_tsv(
             data, fields=fields, record_sep=record_sep, strict=strict,
         )
+    elif fmt == 'csv':
+        yield from parse_csv(
+            data, fields=fields, record_sep=record_sep, strict=strict,
+        )
     elif fmt == 'json':
         yield from parse_json_lines(
             data, record_sep=record_sep, strict=strict,
         )
     elif fmt == 'json-array':
         yield from parse_json_array(data, strict=strict)
+    elif fmt.startswith('ifs:'):
+        ifs_chars = fmt[len('ifs:'):]
+        yield from parse_ifs(
+            data, fields=fields, record_sep=record_sep,
+            ifs_chars=ifs_chars, strict=strict,
+        )
+    elif fmt.startswith('split:'):
+        pat = fmt[len('split:'):]
+        yield from parse_split(
+            data, fields=fields, record_sep=record_sep,
+            pattern=pat, strict=strict,
+        )
+    elif fmt.startswith('match:'):
+        pat = fmt[len('match:'):]
+        yield from parse_match(
+            data, record_sep=record_sep, pattern=pat, strict=strict,
+        )
     else:
         raise ValueError(f'unknown input format: {fmt!r}')
 
@@ -174,9 +377,39 @@ def parse_input(data, *, fmt, fields=None, record_sep=b'\n', strict=False):
 # ---- argument parsing -----------------------------------------------------
 #
 # The argument surface mirrors the design spec's "CLI surface" table.
-# Phase 1 ships TSV / JSON / JSON-array input formats; csv / ifs / split /
-# match come in #23. Most action plumbing lives below; parsing here just
-# captures raw strings and lets the caller wire things up.
+# All seven input formats (tsv, csv, json, json-array, ifs:CHARS,
+# split:REGEX, match:REGEX) ship in phase 2 (#23). Most action plumbing
+# lives below; parsing here just captures raw strings and lets the caller
+# wire things up.
+
+
+_BARE_INPUT_FORMATS = ('tsv', 'csv', 'json', 'json-array')
+_PREFIX_INPUT_FORMATS = ('ifs:', 'split:', 'match:')
+
+
+def _validate_input_format(value):
+    """argparse ``type=`` callback for ``--input``.
+
+    Accepts the four bare format names (``tsv``/``csv``/``json``/
+    ``json-array``) and the three colon-prefixed forms
+    (``ifs:CHARS``/``split:REGEX``/``match:REGEX``); the prefix forms
+    require a non-empty argument after the colon. Anything else raises
+    ``argparse.ArgumentTypeError`` so argparse emits a clean error.
+    """
+    if value in _BARE_INPUT_FORMATS:
+        return value
+    for prefix in _PREFIX_INPUT_FORMATS:
+        if value.startswith(prefix):
+            if not value[len(prefix):]:
+                raise argparse.ArgumentTypeError(
+                    f'{value!r}: format {prefix!r} requires an argument '
+                    f'after the colon'
+                )
+            return value
+    raise argparse.ArgumentTypeError(
+        f'invalid --input value {value!r}; expected '
+        f'tsv|csv|json|json-array|ifs:CHARS|split:REGEX|match:REGEX'
+    )
 
 
 def build_argparser():
@@ -202,8 +435,9 @@ def build_argparser():
                    help='Eager mode — emits the entire tree on stdout.')
     # Input format
     p.add_argument('-i', '--input', metavar='FMT', default='tsv',
-                   choices=('tsv', 'json', 'json-array'),
-                   help='Input parser (phase 1: tsv|json|json-array).')
+                   type=_validate_input_format,
+                   help='Input parser: '
+                        'tsv|csv|json|json-array|ifs:CHARS|split:REGEX|match:REGEX.')
     p.add_argument('--fields', metavar='LIST', default='id,title',
                    help='Comma-separated field names for tsv/csv/ifs/split.')
     p.add_argument('--record-sep', metavar='SEP', default='nl',

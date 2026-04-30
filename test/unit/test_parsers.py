@@ -1,6 +1,9 @@
-"""Tests for browse-tui input format parsers (tsv, json, json-array)."""
+"""Tests for browse-tui input format parsers (tsv, csv, json, json-array,
+ifs, split, match)."""
 
+import argparse
 import json
+import re
 import unittest
 
 from test.unit._loader import load
@@ -12,9 +15,14 @@ Item = _data.Item
 to_item = _data.to_item
 parse_input = _cli.parse_input
 parse_tsv = _cli.parse_tsv
+parse_csv = _cli.parse_csv
+parse_ifs = _cli.parse_ifs
+parse_split = _cli.parse_split
+parse_match = _cli.parse_match
 parse_json_lines = _cli.parse_json_lines
 parse_json_array = _cli.parse_json_array
 coerce_has_children = _cli.coerce_has_children
+_validate_input_format = _cli._validate_input_format
 
 
 class TestCoerceHasChildren(unittest.TestCase):
@@ -314,6 +322,265 @@ class TestFieldMapping(unittest.TestCase):
         self.assertEqual(item.title, 'X')
         self.assertEqual(item.size, '1024')
         self.assertEqual(item.mode, '0755')
+
+
+class TestParseCsv(unittest.TestCase):
+    """parse_csv: RFC 4180 CSV records → dicts using positional fields."""
+
+    def test_simple_two_records(self):
+        data = b'a,A\nb,B\n'
+        out = list(parse_csv(data, fields=['id', 'title']))
+        self.assertEqual(out, [
+            {'id': 'a', 'title': 'A'},
+            {'id': 'b', 'title': 'B'},
+        ])
+
+    def test_quoted_field_with_embedded_comma(self):
+        data = b'a,"hello, world"\n'
+        out = list(parse_csv(data, fields=['id', 'title']))
+        self.assertEqual(out, [{'id': 'a', 'title': 'hello, world'}])
+
+    def test_quoted_field_with_embedded_quote(self):
+        # RFC 4180 escapes a literal quote by doubling it.
+        data = b'a,"she said ""hi"""\n'
+        out = list(parse_csv(data, fields=['id', 'title']))
+        self.assertEqual(out, [{'id': 'a', 'title': 'she said "hi"'}])
+
+    def test_embedded_newline_breaks_record(self):
+        # Limitation: bytes-level record splitting fires before CSV parsing,
+        # so a quoted field containing the record separator splits the
+        # logical row into two physical records. The first record opens a
+        # quote that's never closed, so the csv module raises csv.Error
+        # which we swallow in non-strict mode (no record yielded). The
+        # second record starts with the orphan tail and parses as a normal
+        # row. Document this for users who need multi-line CSV support.
+        data = b'a,"line1\nline2"\nb,B\n'
+        out = list(parse_csv(data, fields=['id', 'title']))
+        # The third record (b,B) is well-formed; earlier broken halves
+        # may parse as best-effort rows.
+        self.assertIn({'id': 'b', 'title': 'B'}, out)
+
+    def test_mixed_widths(self):
+        # Row 1 short, row 2 wider than fields — extras dropped.
+        data = b'a\nb,B,extra1,extra2\n'
+        out = list(parse_csv(data, fields=['id', 'title']))
+        self.assertEqual(out, [
+            {'id': 'a'},
+            {'id': 'b', 'title': 'B'},
+        ])
+
+    def test_has_children_coerced_from_csv_cell(self):
+        data = b'x,1\n'
+        out = list(parse_csv(data, fields=['id', 'has_children']))
+        self.assertEqual(out, [{'id': 'x', 'has_children': True}])
+        self.assertIs(out[0]['has_children'], True)
+
+
+class TestParseIfs(unittest.TestCase):
+    """parse_ifs: split each record on any IFS character (bash-style)."""
+
+    def test_etc_passwd_style(self):
+        data = b'root:x:0:0:root:/root:/bin/bash\n'
+        out = list(parse_ifs(
+            data,
+            fields=['user', 'pw', 'uid', 'gid', 'gecos', 'home', 'shell'],
+            ifs_chars=':',
+        ))
+        self.assertEqual(out, [{
+            'user': 'root', 'pw': 'x', 'uid': '0', 'gid': '0',
+            'gecos': 'root', 'home': '/root', 'shell': '/bin/bash',
+        }])
+
+    def test_whitespace_collapses_runs(self):
+        # IFS=' \t': consecutive whitespace acts like one delimiter.
+        # Leading/trailing whitespace stripped — no empty fields produced.
+        data = b'   foo \t  bar\t\tbaz   \n'
+        out = list(parse_ifs(
+            data, fields=['a', 'b', 'c'], ifs_chars=' \t',
+        ))
+        self.assertEqual(out, [{'a': 'foo', 'b': 'bar', 'c': 'baz'}])
+
+    def test_consecutive_delimiters_yield_empty_field(self):
+        # IFS=':' with '::' produces an empty middle field (not collapsed).
+        data = b'a::c\n'
+        out = list(parse_ifs(
+            data, fields=['a', 'b', 'c'], ifs_chars=':',
+        ))
+        self.assertEqual(out, [{'a': 'a', 'b': '', 'c': 'c'}])
+
+    def test_leading_delimiter_yields_empty_first(self):
+        data = b':b:c\n'
+        out = list(parse_ifs(
+            data, fields=['a', 'b', 'c'], ifs_chars=':',
+        ))
+        self.assertEqual(out, [{'a': '', 'b': 'b', 'c': 'c'}])
+
+    def test_trailing_delimiter_yields_empty_last(self):
+        data = b'a:b:\n'
+        out = list(parse_ifs(
+            data, fields=['a', 'b', 'c'], ifs_chars=':',
+        ))
+        self.assertEqual(out, [{'a': 'a', 'b': 'b', 'c': ''}])
+
+    def test_empty_ifs_chars_raises(self):
+        with self.assertRaises(ValueError):
+            list(parse_ifs(b'x\n', fields=['id'], ifs_chars=''))
+
+
+class TestParseSplit(unittest.TestCase):
+    """parse_split: split each record on a regex pattern."""
+
+    def test_whitespace_runs(self):
+        # Awk-style \s+ split.
+        data = b'  hello   world\tfoo\n'
+        out = list(parse_split(
+            data, fields=['a', 'b', 'c'], pattern=r'\s+',
+        ))
+        # Leading whitespace yields a leading empty field with re.split.
+        self.assertEqual(out[0]['a'], '')
+        self.assertEqual(out[0]['b'], 'hello')
+        self.assertEqual(out[0]['c'], 'world')
+
+    def test_complex_regex(self):
+        # Split on comma OR semicolon, optionally followed by spaces.
+        data = b'apple, banana; cherry,date\n'
+        out = list(parse_split(
+            data, fields=['a', 'b', 'c', 'd'], pattern=r'[,;]\s*',
+        ))
+        self.assertEqual(out, [{
+            'a': 'apple', 'b': 'banana', 'c': 'cherry', 'd': 'date',
+        }])
+
+    def test_compiled_pattern_accepted(self):
+        compiled = re.compile(r'\s+')
+        data = b'foo bar\n'
+        out = list(parse_split(
+            data, fields=['a', 'b'], pattern=compiled,
+        ))
+        self.assertEqual(out, [{'a': 'foo', 'b': 'bar'}])
+
+
+class TestParseMatch(unittest.TestCase):
+    """parse_match: anchored regex with named groups → dict fields."""
+
+    def test_two_field_pattern(self):
+        data = b'apple A red fruit\nbanana A yellow fruit\n'
+        out = list(parse_match(
+            data, pattern=r'^(?P<id>\S+)\s+(?P<title>.+)$',
+        ))
+        self.assertEqual(out, [
+            {'id': 'apple', 'title': 'A red fruit'},
+            {'id': 'banana', 'title': 'A yellow fruit'},
+        ])
+
+    def test_non_matching_line_skipped_when_not_strict(self):
+        # First line lacks the expected second field — silently skipped.
+        data = b'apple\nbanana yellow\n'
+        out = list(parse_match(
+            data, pattern=r'^(?P<id>\S+)\s+(?P<title>.+)$',
+        ))
+        self.assertEqual(out, [{'id': 'banana', 'title': 'yellow'}])
+
+    def test_non_matching_line_raises_when_strict(self):
+        data = b'apple\n'
+        with self.assertRaises(ValueError):
+            list(parse_match(
+                data,
+                pattern=r'^(?P<id>\S+)\s+(?P<title>.+)$',
+                strict=True,
+            ))
+
+    def test_optional_group_excluded_when_none(self):
+        # The `(?P<title>...)` group is optional; when absent it's None
+        # and must not appear in the dict.
+        data = b'apple\n'
+        out = list(parse_match(
+            data, pattern=r'^(?P<id>\S+)(?:\s+(?P<title>.+))?$',
+        ))
+        self.assertEqual(out, [{'id': 'apple'}])
+        self.assertNotIn('title', out[0])
+
+    def test_ls_lA_style_pattern(self):
+        # Mimic the ls -lA pattern from the design spec example.
+        data = (
+            b'-rw-r--r--  1 root root  1024 Apr 30 12:00 README.md\n'
+            b'drwxr-xr-x  2 root root  4096 Apr 30 12:01 src\n'
+        )
+        pattern = (
+            r'^(?P<mode>\S+)\s+\d+\s+(?P<owner>\S+)\s+\S+\s+'
+            r'(?P<size>\d+)\s+\S+\s+\S+\s+\S+\s+(?P<id>.+)$'
+        )
+        out = list(parse_match(data, pattern=pattern))
+        self.assertEqual(len(out), 2)
+        self.assertEqual(out[0]['mode'], '-rw-r--r--')
+        self.assertEqual(out[0]['owner'], 'root')
+        self.assertEqual(out[0]['size'], '1024')
+        self.assertEqual(out[0]['id'], 'README.md')
+        self.assertEqual(out[1]['id'], 'src')
+
+
+class TestParseInputDispatchExtended(unittest.TestCase):
+    """parse_input dispatches the new formats correctly."""
+
+    def test_dispatch_csv(self):
+        out = list(parse_input(
+            b'a,A\n', fmt='csv', fields=['id', 'title'],
+        ))
+        self.assertEqual(out, [{'id': 'a', 'title': 'A'}])
+
+    def test_dispatch_ifs_colon(self):
+        out = list(parse_input(
+            b'root:0\n', fmt='ifs::', fields=['user', 'uid'],
+        ))
+        self.assertEqual(out, [{'user': 'root', 'uid': '0'}])
+
+    def test_dispatch_ifs_whitespace(self):
+        out = list(parse_input(
+            b'foo\tbar\n', fmt='ifs: \t', fields=['a', 'b'],
+        ))
+        self.assertEqual(out, [{'a': 'foo', 'b': 'bar'}])
+
+    def test_dispatch_split(self):
+        out = list(parse_input(
+            b'foo bar\n', fmt=r'split:\s+', fields=['a', 'b'],
+        ))
+        self.assertEqual(out, [{'a': 'foo', 'b': 'bar'}])
+
+    def test_dispatch_match(self):
+        out = list(parse_input(
+            b'apple red\n',
+            fmt=r'match:^(?P<id>\S+)\s+(?P<title>.+)$',
+        ))
+        self.assertEqual(out, [{'id': 'apple', 'title': 'red'}])
+
+    def test_unknown_format_still_raises(self):
+        with self.assertRaises(ValueError):
+            list(parse_input(b'x', fmt='nope:foo'))
+
+
+class TestValidateInputFormat(unittest.TestCase):
+    """_validate_input_format: argparse type callback for --input."""
+
+    def test_bare_formats_accepted(self):
+        for v in ('tsv', 'csv', 'json', 'json-array'):
+            self.assertEqual(_validate_input_format(v), v)
+
+    def test_prefix_formats_accepted(self):
+        self.assertEqual(_validate_input_format('ifs::'), 'ifs::')
+        self.assertEqual(_validate_input_format('split:re'), 'split:re')
+        self.assertEqual(_validate_input_format('match:re'), 'match:re')
+
+    def test_ifs_without_charset_raises(self):
+        with self.assertRaises(argparse.ArgumentTypeError):
+            _validate_input_format('ifs:')
+
+    def test_unknown_value_raises(self):
+        with self.assertRaises(argparse.ArgumentTypeError):
+            _validate_input_format('unknown')
+
+    def test_incomplete_value_raises(self):
+        with self.assertRaises(argparse.ArgumentTypeError):
+            _validate_input_format('json-')
 
 
 if __name__ == '__main__':
