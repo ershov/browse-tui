@@ -301,6 +301,88 @@ def _find_item(state, item_id):
     return None
 
 
+# ---- search helpers (ticket #22) ----------------------------------------
+#
+# Mirrors plan-tui's ``_search_text`` / ``_search_matches`` / ``_search_next``
+# / ``_search_jump_nearest`` (see plan-source/src-tui/070-main.py:6-46).
+# These live in the state layer rather than the action layer so the
+# renderer (050-render.py) can call ``_search_text`` / ``_search_matches``
+# while highlighting non-cursor rows — both the renderer and the
+# action-mode key dispatcher need the same matcher, and putting it next
+# to ``visible_items`` keeps state-driven helpers in one module.
+
+
+def _search_text(item):
+    """Return the searchable haystack for an Item.
+
+    Includes the id and (when present) the bracketed tag so a query like
+    ``open`` matches ``#5 [open] foo`` even when ``open`` is the tag and
+    not a substring of the title. Mirrors plan-tui's ``_search_text``
+    (which embeds the status string the user sees on screen).
+    """
+    parts = [str(item.id)]
+    if item.title:
+        parts.append(item.title)
+    if item.tag:
+        parts.append('[{}]'.format(item.tag))
+    return ' '.join(parts)
+
+
+def _search_matches(text, query):
+    """Fragment-AND match: every space-separated piece of ``query`` in ``text``.
+
+    Case-insensitive. Empty query (or whitespace-only) does not match.
+    Mirrors plan-tui's ``_search_matches`` logic with the search query as
+    a parameter rather than a module global.
+    """
+    if not query:
+        return False
+    fragments = query.lower().split()
+    if not fragments:
+        return False
+    low = text.lower()
+    return all(f in low for f in fragments)
+
+
+def _search_find(state, query, start_idx, direction=1):
+    """Find the next/prev visible item matching ``query``.
+
+    Walks the visible list starting from ``start_idx`` in ``direction``
+    (1 forward, -1 backward), wrapping around. Skips non-``'normal'``
+    entries (placeholders / scope_root) so search never lands on a
+    synthetic row. Returns the visible-list index of the match, or
+    ``None`` if no match exists.
+    """
+    vis = visible_items(state)
+    if not vis or not query:
+        return None
+    n = len(vis)
+    for step in range(1, n + 1):
+        idx = (start_idx + step * direction) % n
+        entry = vis[idx]
+        if entry.kind == 'normal' and _search_matches(
+                _search_text(entry.item), query):
+            return idx
+    return None
+
+
+def _search_jump_nearest(browser):
+    """Jump cursor to the nearest match (forward search from current pos).
+
+    Used by the search-mode key dispatcher: each keystroke that mutates
+    the query nudges the cursor onto the first match at-or-after the
+    current cursor (passing ``cursor - 1`` so the cursor *itself* can
+    match, mirroring plan-tui).
+    """
+    state = browser._state
+    idx = _search_find(state, browser._search_query, state.cursor - 1, 1)
+    if idx is not None:
+        state.cursor = idx
+        browser._needs_redraw.add('list')
+        browser._needs_redraw.add('preview')
+        browser._needs_redraw.add('children')
+
+
 # ---- insert-mode placement helpers (ticket #21) -------------------------
 #
 # These mirror plan-tui's ``_auto_insert_depth`` and ``_resolve_insert``

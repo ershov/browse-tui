@@ -651,12 +651,25 @@ def render_list(browser, top, height, cols):
                 search_query=browser._search_query,
             )
         else:
-            # Regular row: write segments directly, truncating at ``cols``.
-            # Search-highlight is wired here for phase-2 #22; phase 1's
-            # empty search_query short-circuits to the no-op fast path
-            # in ``_write_highlighted``, so we keep the multi-segment
-            # write for proper colouring.
-            _write_segments(segments, cols)
+            # Non-cursor row. When a search query is active and this row
+            # matches, render via ``_write_highlighted`` (yellow/bold
+            # spans on top of plain base style) so the user sees every
+            # match across the visible list, not only the cursor row.
+            # Non-matches (and the no-query case) keep the per-segment
+            # writer so tag colours and the #id segment stay coloured.
+            if (browser._search_query
+                    and entry.kind == 'normal'
+                    and _search_matches(
+                        _search_text(item), browser._search_query)):
+                line = ''.join(s[0] for s in segments)
+                if len(line) > cols:
+                    line = line[:cols]
+                _write_highlighted(
+                    line, pad_to=0,
+                    search_query=browser._search_query,
+                )
+            else:
+                _write_segments(segments, cols)
 
 
 def render_preview(browser, top, height, cols, *, info=False):

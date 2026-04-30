@@ -29,6 +29,8 @@ _state.notify_wake = _term.notify_wake
 
 _actions.visible_items = _state.visible_items
 _actions.mark_visible_dirty = _state.mark_visible_dirty
+_actions._search_find = _state._search_find
+_actions._search_jump_nearest = _state._search_jump_nearest
 
 
 Item = _data.Item

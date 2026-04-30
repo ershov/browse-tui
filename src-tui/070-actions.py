@@ -368,16 +368,37 @@ def _search_start(ctx):
 
 
 def _search_next(ctx):
-    """Search-next is a phase-1 stub; ticket #22 wires fragment matching."""
-    # Intentionally a no-op in phase 1. The dispatcher only invokes us
-    # when ``_search_mode`` is True (after enter is pressed); in phase 2
-    # this will jump the cursor to the next match.
-    pass
+    """Jump cursor to the next match (forward, wrap-around).
+
+    Bound to ``enter`` while ``_search_mode`` is True. ``_search_find``
+    starts the walk *after* the current cursor, so repeated presses
+    advance through every match in turn before wrapping back to the
+    first.
+    """
+    browser = ctx._browser
+    state = browser._state
+    idx = _search_find(state, browser._search_query, state.cursor, 1)
+    if idx is not None:
+        state.cursor = idx
+        browser._needs_redraw.add('list')
+        browser._needs_redraw.add('preview')
+        browser._needs_redraw.add('children')
 
 
 def _search_prev(ctx):
-    """Search-previous is a phase-1 stub; ticket #22 wires fragment matching."""
-    pass
+    """Jump cursor to the previous match (backward, wrap-around).
+
+    Symmetric counterpart to ``_search_next`` — bound to ``shift-enter``
+    while ``_search_mode`` is True.
+    """
+    browser = ctx._browser
+    state = browser._state
+    idx = _search_find(state, browser._search_query, state.cursor, -1)
+    if idx is not None:
+        state.cursor = idx
+        browser._needs_redraw.add('list')
+        browser._needs_redraw.add('preview')
+        browser._needs_redraw.add('children')
 
 
 # ---- default keybindings list ---------------------------------------------
@@ -467,12 +488,23 @@ def dispatch_key(browser, ctx, key) -> bool:
     caller (main loop in #13) uses the return to decide whether to log
     the key or pass it through to a fallback.
     """
-    # Search-mode special handling — phase 1 keeps it minimal.
+    # Search-mode special handling.
+    #
+    # Esc clears the query and exits search mode (matches plan-tui — the
+    # query is *not* preserved across exits; the cursor stays put on the
+    # last match so the user keeps the row they searched up).
+    #
+    # Each keystroke that mutates the query also calls ``_search_jump_nearest``
+    # to nudge the cursor onto the nearest match in real time (so the
+    # user sees results filter under the cursor as they type), and adds
+    # ``'list'`` to the redraw set so highlight spans repaint
+    # immediately.
     if browser._search_mode:
         if key == 'esc':
             browser._search_mode = False
             browser._search_query = ''
             browser._needs_redraw.add('info')
+            browser._needs_redraw.add('list')
             return True
         if key == 'enter':
             _search_next(ctx)
@@ -483,6 +515,9 @@ def dispatch_key(browser, ctx, key) -> bool:
         if key == 'backspace':
             browser._search_query = browser._search_query[:-1]
             browser._needs_redraw.add('info')
+            browser._needs_redraw.add('list')
+            if browser._search_query:
+                _search_jump_nearest(browser)
             return True
         # Single printable characters extend the query. ``space`` is the
         # special name read_key returns for the spacebar; treat it like a
@@ -490,10 +525,14 @@ def dispatch_key(browser, ctx, key) -> bool:
         if key == 'space':
             browser._search_query += ' '
             browser._needs_redraw.add('info')
+            browser._needs_redraw.add('list')
+            _search_jump_nearest(browser)
             return True
         if len(key) == 1 and key.isprintable():
             browser._search_query += key
             browser._needs_redraw.add('info')
+            browser._needs_redraw.add('list')
+            _search_jump_nearest(browser)
             return True
         # Other keys (arrows, ctrl-* etc.) are ignored while typing a
         # search query — phase 2 may wire some of them (e.g. up/down to
