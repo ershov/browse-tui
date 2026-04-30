@@ -1,0 +1,111 @@
+#!/usr/bin/env -S browse-tui --python
+"""browse-git — drill from recent commits into changed files into diffs.
+
+Three levels:
+
+  level 0: recent commits        (``git log --oneline -n 50``)
+  level 1: files changed         (``git show --name-only <sha>``)
+  level 2: per-file unified diff (``git show <sha> -- <path>``)
+
+Identifiers are dispatched by shape:
+  * commit ids look like ``<sha>`` (no colon)
+  * file ids look like ``<sha>:<path>`` (one colon, sha is the prefix)
+  * preview at level 2 = the unified diff for that file in that commit.
+
+Demonstrates: subprocess-driven hierarchy, three levels via id-shape
+dispatch, large preview text, and graceful degradation when ``git`` is
+absent or the cwd isn't a repo.
+"""
+
+import shutil
+import subprocess
+import sys
+
+from browse_tui import Browser, Item
+
+
+_LOG_LIMIT = 50
+
+
+def _run_git(*args):
+    """Run ``git args…``; return CompletedProcess (returncode + stdout/err).
+
+    Uses ``check=False`` so the recipe can branch on ``returncode``
+    rather than raise. Errors surface as Items / preview text.
+    """
+    return subprocess.run(['git'] + list(args), check=False,
+                          capture_output=True, text=True)
+
+
+def _err_item(msg):
+    """Return a single non-expandable error Item to render in the list."""
+    return [Item(id='__error__', title=msg, tag='err', tag_style='red')]
+
+
+def get_children(item_id):
+    if not shutil.which('git'):
+        return _err_item('git CLI not found on PATH')
+
+    if item_id is None:
+        # Verify we're inside a git working tree.
+        rc = _run_git('rev-parse', '--is-inside-work-tree')
+        if rc.returncode != 0:
+            return _err_item('not a git repository (or git not available)')
+        result = _run_git('log', '--oneline', '-n', str(_LOG_LIMIT))
+        if result.returncode != 0:
+            return _err_item(f'git log failed: {result.stderr.strip()}')
+        items = []
+        for line in result.stdout.splitlines():
+            parts = line.split(None, 1)
+            if not parts:
+                continue
+            sha = parts[0]
+            msg = parts[1] if len(parts) > 1 else ''
+            item = Item(id=sha, title=msg, tag=sha[:7],
+                        tag_style='yellow', has_children=True)
+            items.append(item)
+        return items
+
+    if isinstance(item_id, str) and item_id != '__error__' and ':' not in item_id:
+        # Commit sha -> changed files.
+        result = _run_git('show', '--name-only', '--format=', item_id)
+        if result.returncode != 0:
+            return _err_item(f'git show failed: {result.stderr.strip()}')
+        items = []
+        for path in result.stdout.splitlines():
+            path = path.strip()
+            if not path:
+                continue
+            items.append(Item(id=f'{item_id}:{path}', title=path,
+                              has_children=False))
+        return items
+
+    # Files (level 2) and __error__ have no children.
+    return []
+
+
+def get_preview(item_id):
+    if item_id is None or item_id == '__error__':
+        return ''
+    if not isinstance(item_id, str):
+        return ''
+    if ':' in item_id:
+        # File-in-commit -> unified diff for just that path.
+        sha, _, path = item_id.partition(':')
+        result = _run_git('show', sha, '--', path)
+        return result.stdout if result.returncode == 0 else result.stderr
+    # Commit -> stat + message.
+    result = _run_git('show', '--stat', item_id)
+    return result.stdout if result.returncode == 0 else result.stderr
+
+
+def main():
+    sys.exit(Browser(
+        title='browse-git',
+        get_children=get_children,
+        get_preview=get_preview,
+    ).run())
+
+
+if __name__ == '__main__':
+    main()

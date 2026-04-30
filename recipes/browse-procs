@@ -1,0 +1,139 @@
+#!/usr/bin/env -S browse-tui --python
+"""browse-procs — interactive process tree.
+
+Builds a hierarchy from ``ps -eo pid,ppid,user,comm``. Each process is
+an Item; children are processes whose ``ppid == this pid``. The root
+of the tree is PID 1 (init / systemd) on Linux; everything else is
+descendants. Kernel threads (ppid == 0, except PID 1) are skipped to
+keep the tree readable.
+
+Reload with ctrl-r. Custom action ``k:Kill`` sends SIGTERM to the
+selected pid (with a y/n confirmation).
+
+Demonstrates: live system data, hierarchical children built from an
+external CLI, /proc-based preview, and a destructive custom Action.
+"""
+
+import os
+import signal
+import subprocess
+import sys
+
+from browse_tui import Action, Browser, Item
+
+
+def _list_procs():
+    """Return ``[(pid, ppid, user, comm), …]`` from ``ps``.
+
+    Errors are swallowed: on a platform where ``ps`` is missing or the
+    output is malformed we return ``[]`` rather than crash the UI.
+    """
+    try:
+        out = subprocess.run(
+            ['ps', '-eo', 'pid=,ppid=,user=,comm='],
+            check=True, capture_output=True, text=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    procs = []
+    for line in out.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        procs.append((pid, ppid, parts[2], parts[3]))
+    return procs
+
+
+def _by_ppid(procs):
+    """Group ``procs`` by parent pid: ``{ppid: [proc, …]}``."""
+    out = {}
+    for p in procs:
+        out.setdefault(p[1], []).append(p)
+    return out
+
+
+def get_children(parent_id):
+    """Children of ``parent_id``.
+
+    ``None`` (root): return the init process — PID 1 on Linux. If
+    we somehow can't find it (non-Linux, restricted environment), fall
+    back to processes with ppid == 0 minus the kernel-thread PID 2.
+    Otherwise: direct children of ``parent_id``.
+    """
+    procs = _list_procs()
+    if not procs:
+        return []
+    by_ppid = _by_ppid(procs)
+
+    if parent_id is None:
+        init = next((p for p in procs if p[0] == 1), None)
+        if init is not None:
+            targets = [init]
+        else:
+            targets = [p for p in by_ppid.get(0, []) if p[0] != 2]
+    else:
+        targets = by_ppid.get(parent_id, [])
+
+    items = []
+    for pid, _ppid, user, comm in sorted(targets, key=lambda p: p[0]):
+        item = Item(
+            id=pid,
+            title=comm,
+            tag=f'{user} pid={pid}',
+            tag_style='dim',
+            has_children=bool(by_ppid.get(pid)),
+        )
+        item.user = user
+        item.pid = pid
+        items.append(item)
+    return items
+
+
+def get_preview(pid):
+    """Dump a snippet of ``/proc/<pid>/status``.
+
+    The first ~4 KB is plenty for the interactive case (Name, State,
+    Pid, PPid, Uid, Gid, VmRSS, …). Errors (process gone, permissions)
+    surface as a short hint.
+    """
+    if not isinstance(pid, int):
+        return ''
+    try:
+        with open(f'/proc/{pid}/status') as f:
+            return f.read(4096)
+    except OSError as e:
+        return f'[error] {e}'
+
+
+def kill_proc(ctx):
+    """Send SIGTERM to the cursor pid, with y/n confirm."""
+    if not ctx.cursor:
+        return
+    pid = ctx.cursor.id
+    if not ctx.confirm(f'send SIGTERM to pid {pid} ({ctx.cursor.title})?'):
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+        ctx.message(f'sent SIGTERM to pid {pid}')
+    except OSError as e:
+        ctx.error(f'kill {pid}: {e}')
+    ctx.refresh()
+
+
+def main():
+    sys.exit(Browser(
+        title='browse-procs',
+        get_children=get_children,
+        get_preview=get_preview,
+        actions=[
+            Action('k', 'Kill (SIGTERM)', kill_proc, 'cursor'),
+        ],
+    ).run())
+
+
+if __name__ == '__main__':
+    main()

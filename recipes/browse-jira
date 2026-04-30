@@ -1,0 +1,128 @@
+#!/usr/bin/env -S browse-tui --python
+"""browse-jira — Jira tickets via the ``jira`` CLI (sketch).
+
+Lists open tickets assigned to the current user. Each ticket is an
+Item; the ``tag`` is the status; preview is the description fetched
+via ``jira view <KEY>``.
+
+Requires the ``jira`` CLI on PATH (``go-jira`` or ``jira-cli``). If
+the CLI is missing or auth fails, the recipe shows a single friendly
+error item rather than crashing — this lets recipes/browse-jira ship
+on machines without Jira tooling, where it degrades gracefully.
+
+This recipe is **environment-dependent**: the ``jira list`` output
+format varies across CLI flavours and templates, so the parser below
+is intentionally lenient and may need adapting to your setup. Tweak
+``_parse_list`` if the table columns differ from what we expect.
+
+Demonstrates: external CLI behind unreliable preconditions, graceful
+no-op error rendering, lazy preview fetching, and an ``o:Open``
+custom action that punts to ``$BROWSER`` / ``xdg-open``.
+"""
+
+import os
+import shutil
+import subprocess
+import sys
+
+from browse_tui import Action, Browser, Item
+
+
+_ERROR_ID = '__error__'
+
+
+def _err(msg):
+    return [Item(id=_ERROR_ID, title=msg, tag='err', tag_style='red')]
+
+
+def _parse_list(text):
+    """Parse ``jira list --template table`` output into Items.
+
+    Looks for ``KEY | STATUS | SUMMARY``-shaped rows. Skips header /
+    separator lines. This is intentionally tolerant — different ``jira``
+    CLIs (go-jira, jira-cli, atlassian-cli) produce different layouts;
+    callers can swap this out for a JSON template if their CLI supports
+    one.
+    """
+    items = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith('-') or line.startswith('+'):
+            continue
+        # Common shapes: pipe-separated table, tab-separated, or
+        # "KEY  STATUS  SUMMARY" with 2+ spaces between cols.
+        if '|' in line:
+            cols = [c.strip() for c in line.split('|') if c.strip()]
+        elif '\t' in line:
+            cols = [c.strip() for c in line.split('\t') if c.strip()]
+        else:
+            # "KEY  STATUS  rest of summary"
+            cols = line.split(None, 2)
+        if len(cols) < 3:
+            continue
+        key, status, summary = cols[0], cols[1], cols[2]
+        # Skip the header row, which has the literal column names.
+        if key.lower() in ('key', 'issue', 'issuekey'):
+            continue
+        items.append(Item(id=key, title=summary, tag=status,
+                          tag_style='cyan', has_children=False))
+    return items
+
+
+def get_children(_):
+    if not shutil.which('jira'):
+        return _err('jira CLI not found — see https://github.com/go-jira/jira')
+    try:
+        result = subprocess.run(
+            ['jira', 'list', '--query',
+             'assignee = currentUser() AND statusCategory != Done',
+             '--template', 'table'],
+            check=False, capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return _err(f'jira list: {type(e).__name__}: {e}')
+    if result.returncode != 0:
+        msg = (result.stderr or result.stdout).strip().splitlines()
+        head = msg[0] if msg else 'unknown error'
+        return _err(f'jira list failed: {head}')
+    items = _parse_list(result.stdout)
+    if not items:
+        return _err('jira list: no open tickets (or unrecognised output format)')
+    return items
+
+
+def get_preview(key):
+    if not isinstance(key, str) or key == _ERROR_ID:
+        return ''
+    try:
+        result = subprocess.run(
+            ['jira', 'view', key],
+            check=False, capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f'[error] {type(e).__name__}: {e}'
+    return result.stdout if result.returncode == 0 else result.stderr
+
+
+def open_in_browser(ctx):
+    """Hand the ticket key off to ``$BROWSER`` / ``xdg-open``."""
+    if not ctx.cursor or ctx.cursor.id == _ERROR_ID:
+        return
+    key = ctx.cursor.id
+    # Prefer $BROWSER for an explicit user choice; fall back to
+    # xdg-open which most desktop environments already configure.
+    cmd = os.environ.get('BROWSER') or 'xdg-open'
+    ctx.run_external([cmd, key])
+
+
+def main():
+    sys.exit(Browser(
+        title='browse-jira',
+        get_children=get_children,
+        get_preview=get_preview,
+        actions=[
+            Action('o', 'Open in browser', open_in_browser, 'cursor'),
+        ],
+    ).run())
+
+
+if __name__ == '__main__':
+    main()

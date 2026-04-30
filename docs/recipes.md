@@ -1,8 +1,11 @@
 # browse-tui — Recipes
 
-`browse-tui` ships with three production-quality recipes. Each is a
-single-file Python script with a `#!/usr/bin/env -S browse-tui --python`
-shebang — make them executable and run them directly, or invoke as
+`browse-tui` ships with six recipes — three production-quality
+(`browse-fs`, `browse-plan`, `browse-claude`) plus three short bonus
+recipes (`browse-procs`, `browse-git`, `browse-jira`) demonstrating
+additional data-source patterns. Each is a single-file Python script
+with a `#!/usr/bin/env -S browse-tui --python` shebang — make them
+executable and run them directly, or invoke as
 `browse-tui --python recipes/<name>`.
 
 This page is the recipe index plus a "writing your own" walkthrough.
@@ -118,6 +121,104 @@ JSON pretty-print preview.
 Keys: `e` / `o` open in `$EDITOR`, `y` show id (debugging).
 
 **Source:** [`recipes/browse-claude`](../recipes/browse-claude) (~450 lines)
+
+---
+
+## `recipes/browse-procs`
+
+Live process tree from `ps` with kill action.
+
+**One-line summary:** builds a hierarchy from
+`ps -eo pid,ppid,user,comm`, with PID 1 as the root and per-process
+`/proc/<pid>/status` previews; custom `k:Kill` action sends SIGTERM
+after a y/n confirm.
+
+**Demonstrates:**
+
+- Hierarchical children synthesised from a flat external CLI — group
+  by `ppid` once, dispatch by `parent_id`.
+- Live system data with manual reload (`ctrl-r`) — no watcher needed
+  because process state changes faster than any polling cadence.
+- Reading auxiliary metadata from `/proc/<pid>/status` for the
+  preview pane.
+- A destructive custom `Action` guarded by `ctx.confirm`, with
+  `ctx.refresh` to redraw after the kill lands.
+
+**Usage:**
+
+```bash
+./recipes/browse-procs
+```
+
+Keys: `k` send SIGTERM (with confirmation), `ctrl-r` reload tree.
+
+**Source:** [`recipes/browse-procs`](../recipes/browse-procs) (~140 lines)
+
+---
+
+## `recipes/browse-git`
+
+Recent commits → changed files → per-file diff.
+
+**One-line summary:** three-level hierarchy via id-shape dispatch — top
+level lists `git log --oneline -n 50`, expanding a commit lists its
+changed files via `git show --name-only`, and the preview pane shows
+the unified diff for that file.
+
+**Demonstrates:**
+
+- Multiple subprocess invocations behind a single `get_children` —
+  commits at level 0, file lists at level 1, diff text in `get_preview`.
+- Id-shape dispatch (`<sha>` vs `<sha>:<path>`) without threading
+  extra state through the Browser.
+- Graceful degradation when `git` is missing or the cwd isn't a
+  repository — surfaces a single error Item instead of crashing.
+
+**Usage:**
+
+```bash
+cd /path/to/your/repo
+./recipes/browse-git
+```
+
+No custom actions — drill in with `Right`, view diffs in the preview
+pane, leave with `q`.
+
+**Source:** [`recipes/browse-git`](../recipes/browse-git) (~110 lines)
+
+---
+
+## `recipes/browse-jira`
+
+Open Jira tickets via the `jira` CLI (sketch).
+
+**One-line summary:** lists open tickets assigned to the current user
+through the `jira list` CLI, with `jira view` driving the preview
+pane and an `o:Open` action that hands the ticket key to `$BROWSER`.
+Environment-dependent — adapt the parser if your CLI's table layout
+differs.
+
+**Demonstrates:**
+
+- An external CLI behind unreliable preconditions (auth, install,
+  network) — degrades to a single friendly error Item rather than a
+  traceback.
+- Lazy preview fetch (`jira view <KEY>`) — no upfront cost for the
+  list of tickets, only the cursor's description is fetched.
+- A custom `Action` that punts to `$BROWSER` / `xdg-open` via
+  `ctx.run_external`.
+
+**Usage:**
+
+```bash
+./recipes/browse-jira
+```
+
+Requires the `jira` CLI on PATH (e.g. `go-jira`). If it's missing or
+auth fails, the recipe shows a single error item explaining what's
+wrong. Keys: `o` open ticket in `$BROWSER` / `xdg-open`.
+
+**Source:** [`recipes/browse-jira`](../recipes/browse-jira) (~130 lines)
 
 ---
 
