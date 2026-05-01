@@ -19,6 +19,7 @@ from test.unit._loader import load
 _term = load('_browse_tui_term', '020-terminal.py')
 _data = load('_browse_tui_data', '030-data.py')
 _state = load('_browse_tui_state', '040-state.py')
+_render = load('_browse_tui_render', '050-render.py')
 _actions = load('_browse_tui_actions', '070-actions.py')
 
 # Wire up cross-module names — production builds get them via
@@ -26,12 +27,19 @@ _actions = load('_browse_tui_actions', '070-actions.py')
 _state.Item = _data.Item
 _state.to_item = _data.to_item
 _state.notify_wake = _term.notify_wake
+_render.Item = _data.Item
+_render.VisibleEntry = _state.VisibleEntry
 
 _actions.visible_items = _state.visible_items
 _actions.mark_visible_dirty = _state.mark_visible_dirty
 _actions.current_scope = _state.current_scope
 _actions._search_find = _state._search_find
 _actions._search_jump_nearest = _state._search_jump_nearest
+# term_size / layout_panes are deliberately NOT wired at module scope:
+# the existing TestPreviewScrollActions cases verify the headless
+# fallback path. The TestPageSizesTrackTerminalHeight cases below
+# patch the symbols on _actions inside try/finally to exercise the
+# wired path.
 
 
 Item = _data.Item
@@ -519,8 +527,10 @@ class TestPreviewScrollActions(unittest.TestCase):
         try:
             ctx = _ctx_for(b)
             dispatch_key(b, ctx, 'alt-pgdn')
-            # Default _PAGE_ROWS is 10.
-            self.assertEqual(b._preview_scroll, 10)
+            # Headless fallback page size is _DEFAULT_PAGE_ROWS (20) —
+            # term_size / layout_panes aren't wired in this test module
+            # so _preview_pane_height returns the documented default.
+            self.assertEqual(b._preview_scroll, 20)
         finally:
             b.stop_workers()
 
@@ -533,6 +543,226 @@ class TestPreviewScrollActions(unittest.TestCase):
             # Clamped at 0.
             self.assertEqual(b._preview_scroll, 0)
         finally:
+            b.stop_workers()
+
+
+# --- ticket #75: page sizes track terminal height -------------------------
+
+
+class TestPageSizesTrackTerminalHeight(unittest.TestCase):
+    """``_nav_pgdn`` / ``_nav_pgup`` / ``_preview_page_*`` track viewport.
+
+    The page jump used to be a hard-coded 10 rows; ticket #75 wires it to
+    the actual list-pane / preview-pane height returned by
+    ``layout_panes``. Headless contexts where ``term_size`` raises (or
+    isn't wired) fall back to the documented default
+    ``_DEFAULT_PAGE_ROWS`` (= 20).
+    """
+
+    def _patch_term(self, cols, rows):
+        """Patch term_size / layout_panes onto _actions; return restorer."""
+        prev_ts = getattr(_actions, 'term_size', None)
+        prev_lp = getattr(_actions, 'layout_panes', None)
+        _actions.term_size = lambda: (cols, rows)
+        _actions.layout_panes = _render.layout_panes
+
+        def restore():
+            if prev_ts is None:
+                if hasattr(_actions, 'term_size'):
+                    del _actions.term_size
+            else:
+                _actions.term_size = prev_ts
+            if prev_lp is None:
+                if hasattr(_actions, 'layout_panes'):
+                    del _actions.layout_panes
+            else:
+                _actions.layout_panes = prev_lp
+
+        return restore
+
+    def test_list_pane_height_matches_layout_at_24_rows(self):
+        """Helper returns the same list_height that layout_panes reports."""
+        b = _make_browser()
+        restore = self._patch_term(80, 24)
+        try:
+            expected = _render.layout_panes(
+                80, 24,
+                show_preview=b.show_preview,
+                show_children_pane=b.show_children_pane,
+            )['list_height']
+            self.assertEqual(_actions._list_pane_height(b), expected)
+        finally:
+            restore()
+            b.stop_workers()
+
+    def test_list_pane_height_matches_layout_at_60_rows(self):
+        """Larger terminals → larger page size."""
+        b = _make_browser()
+        restore = self._patch_term(120, 60)
+        try:
+            expected = _render.layout_panes(
+                120, 60,
+                show_preview=b.show_preview,
+                show_children_pane=b.show_children_pane,
+            )['list_height']
+            self.assertEqual(_actions._list_pane_height(b), expected)
+            # And it should genuinely be bigger than the 24-row case.
+            small = _render.layout_panes(
+                80, 24,
+                show_preview=b.show_preview,
+                show_children_pane=b.show_children_pane,
+            )['list_height']
+            self.assertGreater(expected, small)
+        finally:
+            restore()
+            b.stop_workers()
+
+    def test_headless_falls_back_to_default(self):
+        """No term_size wired → returns _DEFAULT_PAGE_ROWS (20)."""
+        b = _make_browser()
+        # Make sure no patched term_size leaks in from a prior test.
+        prev_ts = getattr(_actions, 'term_size', None)
+        if prev_ts is not None:
+            del _actions.term_size
+        try:
+            self.assertEqual(
+                _actions._list_pane_height(b),
+                _actions._DEFAULT_PAGE_ROWS,
+            )
+            self.assertEqual(
+                _actions._preview_pane_height(b),
+                _actions._DEFAULT_PAGE_ROWS,
+            )
+        finally:
+            if prev_ts is not None:
+                _actions.term_size = prev_ts
+            b.stop_workers()
+
+    def test_headless_term_size_raises_falls_back(self):
+        """term_size wired but raising OSError → fallback path."""
+        b = _make_browser()
+
+        def _raise():
+            raise OSError('not a tty')
+
+        prev_ts = getattr(_actions, 'term_size', None)
+        prev_lp = getattr(_actions, 'layout_panes', None)
+        _actions.term_size = _raise
+        _actions.layout_panes = _render.layout_panes
+        try:
+            self.assertEqual(
+                _actions._list_pane_height(b),
+                _actions._DEFAULT_PAGE_ROWS,
+            )
+        finally:
+            if prev_ts is None:
+                del _actions.term_size
+            else:
+                _actions.term_size = prev_ts
+            if prev_lp is None:
+                del _actions.layout_panes
+            else:
+                _actions.layout_panes = prev_lp
+            b.stop_workers()
+
+    def test_pgdn_moves_cursor_by_list_pane_height(self):
+        """``pgdn`` advances cursor by the wired list_height (not 10)."""
+        b = _make_browser()
+        # Populate enough items that the page jump can't be clamped to
+        # the end of the list.
+        b._state._children[None] = [Item(id=f'i{i}') for i in range(100)]
+        restore = self._patch_term(80, 24)
+        try:
+            ctx = _ctx_for(b)
+            expected_page = _render.layout_panes(
+                80, 24,
+                show_preview=b.show_preview,
+                show_children_pane=b.show_children_pane,
+            )['list_height']
+            self.assertEqual(b._state.cursor, 0)
+            dispatch_key(b, ctx, 'pgdn')
+            self.assertEqual(b._state.cursor, expected_page)
+            # The whole point of the ticket: this is NOT the old hard-
+            # coded 10. (At 24 rows, list_height is ~7, so the assertion
+            # below catches a regression where the literal 10 sneaks
+            # back in.)
+            self.assertNotEqual(b._state.cursor, 10)
+        finally:
+            restore()
+            b.stop_workers()
+
+    def test_pgdn_uses_bigger_page_at_taller_terminal(self):
+        """Resizing the terminal taller → ``pgdn`` jumps further."""
+        b = _make_browser()
+        b._state._children[None] = [Item(id=f'i{i}') for i in range(200)]
+
+        # Small terminal first.
+        restore = self._patch_term(80, 24)
+        try:
+            ctx = _ctx_for(b)
+            small_page = _render.layout_panes(
+                80, 24,
+                show_preview=b.show_preview,
+                show_children_pane=b.show_children_pane,
+            )['list_height']
+            dispatch_key(b, ctx, 'pgdn')
+            small_landing = b._state.cursor
+            self.assertEqual(small_landing, small_page)
+        finally:
+            restore()
+
+        # Reset cursor; bigger terminal.
+        b._state.cursor = 0
+        restore = self._patch_term(80, 60)
+        try:
+            ctx = _ctx_for(b)
+            big_page = _render.layout_panes(
+                80, 60,
+                show_preview=b.show_preview,
+                show_children_pane=b.show_children_pane,
+            )['list_height']
+            dispatch_key(b, ctx, 'pgdn')
+            self.assertEqual(b._state.cursor, big_page)
+            self.assertGreater(big_page, small_page)
+        finally:
+            restore()
+            b.stop_workers()
+
+    def test_pgup_moves_cursor_by_list_pane_height(self):
+        """Symmetric: ``pgup`` retreats cursor by list_height."""
+        b = _make_browser()
+        b._state._children[None] = [Item(id=f'i{i}') for i in range(100)]
+        restore = self._patch_term(80, 40)
+        try:
+            ctx = _ctx_for(b)
+            expected_page = _render.layout_panes(
+                80, 40,
+                show_preview=b.show_preview,
+                show_children_pane=b.show_children_pane,
+            )['list_height']
+            b._state.cursor = 50
+            dispatch_key(b, ctx, 'pgup')
+            self.assertEqual(b._state.cursor, 50 - expected_page)
+        finally:
+            restore()
+            b.stop_workers()
+
+    def test_alt_pgdn_uses_preview_pane_height(self):
+        """``alt-pgdn`` advances preview_scroll by preview pane content rows."""
+        b = _make_browser()
+        restore = self._patch_term(80, 40)
+        try:
+            ctx = _ctx_for(b)
+            layout = _render.layout_panes(
+                80, 40,
+                show_preview=b.show_preview,
+                show_children_pane=b.show_children_pane,
+            )
+            expected = layout['prev_height'] - 1  # excludes separator
+            dispatch_key(b, ctx, 'alt-pgdn')
+            self.assertEqual(b._preview_scroll, expected)
+        finally:
+            restore()
             b.stop_workers()
 
 

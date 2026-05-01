@@ -78,11 +78,13 @@ def _gate_passes(action, ctx) -> bool:
 # effects come through ``_needs_redraw`` flags or state mutation that the
 # next render pass picks up.
 #
-# Page size for pgup/pgdn is hard-coded to 10 for phase 1; ticket #13 wires
-# the real list-pane height from ``layout_panes`` once the main loop owns
-# the geometry.
+# Page size for pgup/pgdn comes from ``_list_pane_height`` /
+# ``_preview_pane_height`` — both query ``term_size`` + ``layout_panes`` so
+# the jump matches the visible viewport. Headless / unwired contexts (where
+# ``term_size`` raises) fall back to ``_DEFAULT_PAGE_ROWS`` so the handlers
+# stay usable in tests and pipelines.
 
-_PAGE_ROWS = 10
+_DEFAULT_PAGE_ROWS = 20
 
 
 def _nav_down(ctx):
@@ -126,22 +128,33 @@ def _nav_end(ctx):
 
 
 def _nav_pgdn(ctx):
-    """Move cursor down by a page (clamped)."""
-    state = ctx._browser._state
+    """Move cursor down by a page (clamped).
+
+    Page size = list-pane height from ``layout_panes`` so the jump
+    matches the viewport. Falls back to ``_DEFAULT_PAGE_ROWS`` headless.
+    """
+    browser = ctx._browser
+    state = browser._state
     vis = visible_items(state)
-    state.cursor = min(max(0, len(vis) - 1), state.cursor + _PAGE_ROWS)
-    ctx._browser._needs_redraw.add('list')
-    ctx._browser._needs_redraw.add('children')
-    ctx._browser._needs_redraw.add('preview')
+    page = _list_pane_height(browser)
+    state.cursor = min(max(0, len(vis) - 1), state.cursor + page)
+    browser._needs_redraw.add('list')
+    browser._needs_redraw.add('children')
+    browser._needs_redraw.add('preview')
 
 
 def _nav_pgup(ctx):
-    """Move cursor up by a page (clamped to 0)."""
-    state = ctx._browser._state
-    state.cursor = max(0, state.cursor - _PAGE_ROWS)
-    ctx._browser._needs_redraw.add('list')
-    ctx._browser._needs_redraw.add('children')
-    ctx._browser._needs_redraw.add('preview')
+    """Move cursor up by a page (clamped to 0).
+
+    Page size = list-pane height; same source as ``_nav_pgdn``.
+    """
+    browser = ctx._browser
+    state = browser._state
+    page = _list_pane_height(browser)
+    state.cursor = max(0, state.cursor - page)
+    browser._needs_redraw.add('list')
+    browser._needs_redraw.add('children')
+    browser._needs_redraw.add('preview')
 
 
 def _nav_right(ctx):
@@ -522,20 +535,26 @@ def _preview_scroll_up(ctx):
 
 
 def _preview_page_down(ctx):
-    """alt-pgdn — scroll preview down by ``_PAGE_ROWS`` lines.
+    """alt-pgdn — scroll preview down by one preview-pane page.
 
     Same off-end semantics as ``_preview_scroll_down``: the renderer
     gracefully ignores out-of-range offsets so we don't need to thread
     layout geometry through every action.
+
+    Page size = preview-pane height from ``layout_panes`` (so the jump
+    matches the visible viewport). Headless contexts fall back to
+    ``_DEFAULT_PAGE_ROWS``.
     """
-    ctx._browser._preview_scroll += _PAGE_ROWS
+    page = _preview_pane_height(ctx._browser)
+    ctx._browser._preview_scroll += page
     ctx._browser._needs_redraw.add('preview')
 
 
 def _preview_page_up(ctx):
-    """alt-pgup — scroll preview up by ``_PAGE_ROWS`` lines (clamped at 0)."""
+    """alt-pgup — scroll preview up by one preview-pane page (clamped at 0)."""
+    page = _preview_pane_height(ctx._browser)
     ctx._browser._preview_scroll = max(
-        0, ctx._browser._preview_scroll - _PAGE_ROWS
+        0, ctx._browser._preview_scroll - page
     )
     ctx._browser._needs_redraw.add('preview')
 
@@ -884,9 +903,10 @@ def _handle_insert_key(browser, ctx: 'Context', key: str) -> bool:
 def _list_pane_height(browser):
     """Compute the list-pane height for pgup/pgdn jumps.
 
-    Headless / unwired test contexts fall back to ``_PAGE_ROWS`` (the
-    same default the regular nav handlers use). In production we read
-    the geometry from ``layout_panes`` so the page jump matches the
+    Headless / unwired test contexts fall back to ``_DEFAULT_PAGE_ROWS``
+    (``term_size`` raises ``OSError`` when stdout isn't a tty, and the
+    cross-module name may not be wired in unit tests). In production we
+    read the geometry from ``layout_panes`` so the page jump matches the
     visible viewport exactly.
     """
     try:
@@ -897,9 +917,32 @@ def _list_pane_height(browser):
             show_children_pane=browser.show_children_pane,
         )
         h = layout['list_height']
-        return h if h > 0 else _PAGE_ROWS
+        return h if h > 0 else _DEFAULT_PAGE_ROWS
     except Exception:
-        return _PAGE_ROWS
+        return _DEFAULT_PAGE_ROWS
+
+
+def _preview_pane_height(browser):
+    """Compute the preview-pane content height for alt-pgup/pgdn.
+
+    ``layout_panes`` returns ``prev_height`` *including* the separator
+    row, so the actual scrollable content area is ``prev_height - 1``.
+    Headless / unwired contexts (and configurations where the preview
+    pane is hidden) fall back to ``_DEFAULT_PAGE_ROWS`` — the renderer
+    clamps off-end offsets gracefully so the alt-pgdn key still feels
+    responsive even when no preview is showing.
+    """
+    try:
+        cols, rows = term_size()
+        layout = layout_panes(
+            cols, rows,
+            show_preview=browser.show_preview,
+            show_children_pane=browser.show_children_pane,
+        )
+        h = layout['prev_height'] - 1  # exclude separator row
+        return h if h > 0 else _DEFAULT_PAGE_ROWS
+    except Exception:
+        return _DEFAULT_PAGE_ROWS
 
 
 def _handle_enter(browser, ctx) -> bool:

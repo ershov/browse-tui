@@ -89,3 +89,62 @@ class TestNavigation(unittest.TestCase):
             screen = t.wait_stable()
             self.assertNotIn('#alpha', screen)
             self.assertIn('#parent', screen)
+
+    def test_page_down_jump_size_tracks_terminal_height(self):
+        """PageDown jumps by list-pane height (ticket #75), not a fixed 10.
+
+        At 24 rows the list pane is ~7 rows tall, so PageDown advances
+        the cursor onto roughly the 8th item (index 7). At 40 rows the
+        list pane grows to ~12 rows, so PageDown advances further.
+
+        We feed many items (i00..i49) so the page jump can't be clamped
+        to the end of the list, and check that the reverse-video cursor
+        row contains a different item id at each height — and crucially
+        that the bigger terminal jumped further than the smaller one.
+        """
+        items_input = ''.join(f'i{i:02d}\\n' for i in range(50))
+        cmd = f"printf '{items_input}' | {_BIN} --root-cmd cat --no-children-pane --no-preview"
+
+        # 24-row run.
+        with TmuxFixture(cols=80, rows=24) as t:
+            t.launch('bash', '-c', cmd)
+            t.wait_for('#i00 i00')
+            t.wait_stable()
+            t.send('PageDown')
+            t.wait_stable()
+            screen_small = t.capture(colors=True)
+
+        # 40-row run.
+        with TmuxFixture(cols=80, rows=40) as t:
+            t.launch('bash', '-c', cmd)
+            t.wait_for('#i00 i00')
+            t.wait_stable()
+            t.send('PageDown')
+            t.wait_stable()
+            screen_big = t.capture(colors=True)
+
+        # Extract the item id sitting on the cursor (reverse-video row)
+        # in each screen. The cursor is rendered with ESC[7m + row text.
+        def _cursor_id(screen):
+            self.assertIn('\x1b[7m', screen, 'no cursor marker found')
+            idx = screen.index('\x1b[7m')
+            window = screen[idx:idx + 200]
+            # Find #iNN in the window — the rendered row format is
+            # "  #iNN iNN ..." with possibly intervening style codes.
+            import re
+            m = re.search(r'#i(\d{2})', window)
+            self.assertIsNotNone(m, f'no item id on cursor row: {window!r}')
+            return int(m.group(1))
+
+        cursor_small = _cursor_id(screen_small)
+        cursor_big = _cursor_id(screen_big)
+
+        # The 40-row terminal must have jumped strictly further than the
+        # 24-row one — the whole point of ticket #75. Both must be > 0
+        # (PageDown actually moved) and the small case must not be 10
+        # (the old hard-coded value would always land on i10).
+        self.assertGreater(cursor_small, 0,
+                           'PageDown did not move on 24-row terminal')
+        self.assertGreater(cursor_big, cursor_small,
+                           f'PageDown on 40-row ({cursor_big}) did not '
+                           f'jump further than on 24-row ({cursor_small})')
