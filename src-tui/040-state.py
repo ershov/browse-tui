@@ -1121,6 +1121,13 @@ class Browser:
         could expand the parent chain via parent metadata on Items;
         recipes that need it today should use ``from_flat_tree`` to
         pre-populate the cache, in which case every id is visible.
+
+        Flags ``list`` / ``children`` / ``preview`` for redraw on a
+        successful move so the next render pass surfaces the new
+        cursor position -- without this, an external thread's
+        ``cursor_to`` would silently move the cursor but the screen
+        wouldn't update until the next user keystroke (regression
+        guarded by ticket #77's stress tests).
         """
         # Build/refresh the visible list; visible_items honours the
         # dirty bit so this is a no-op if nothing changed.
@@ -1128,6 +1135,9 @@ class Browser:
         for i, entry in enumerate(vis):
             if entry.item.id == id_:
                 self._state.cursor = i
+                self._needs_redraw.add('list')
+                self._needs_redraw.add('children')
+                self._needs_redraw.add('preview')
                 pending._resolve()
                 return
         # Not visible. Best-effort: leave cursor alone and resolve.
