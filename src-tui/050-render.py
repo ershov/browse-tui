@@ -28,7 +28,11 @@ Renderer layout:
     only the regions named in ``Browser._needs_redraw``. Both flush
     once at the end.
   * Help screen is shown by toggling ``Browser._help_mode``; the preview
-    pane displays ``_HELP_TEXT`` instead of the per-item preview.
+    pane displays the output of ``compose_help_text(browser)`` instead
+    of the per-item preview. The composer pulls section-tagged
+    ``default_actions()`` plus the recipe's own ``browser.actions``
+    (under CUSTOM ACTIONS), wrapped by optional ``help_intro`` /
+    ``help_outro`` prose.
 
 Out of scope (deferred to phase 2/3):
   * Insert-mode marker — ticket #21.
@@ -684,7 +688,7 @@ def render_preview(browser, top, height, cols, *, info=False):
 
     Source priority for the content:
       1. ``browser._error_text`` if set      → display the error text
-      2. ``browser._help_mode`` if True      → display ``_HELP_TEXT``
+      2. ``browser._help_mode`` if True      → display ``compose_help_text``
       3. ``browser._state._preview[id]``     → per-item preview
       4. fallthrough — empty preview         → blank rows
     """
@@ -701,7 +705,7 @@ def render_preview(browser, top, height, cols, *, info=False):
     if browser._error_text:
         text = browser._error_text
     elif browser._help_mode:
-        text = _HELP_TEXT
+        text = compose_help_text(browser, include_usage=False)
     else:
         cursor_id = _cursor_id(browser)
         text = (
@@ -1159,47 +1163,123 @@ def _preview_label(browser):
 
 
 # ---------------------------------------------------------------------------
-# Help text shown in the preview pane when ``browser._help_mode`` is True.
-# Kept short and generic — recipes surface their own action keys via the
-# help screen in phase 3 (#32).
+# Help text composer — dynamic ``--help`` and in-app ``?`` body.
+#
+# The text is built by ``compose_help_text(browser, …)`` from
+# ``default_actions()`` (each tagged with a section name) plus the
+# recipe's own ``browser.actions`` (rendered under CUSTOM ACTIONS).
+# Optional ``browser.help_intro`` / ``browser.help_outro`` prose blocks
+# wrap the key list. ``_HELP_TEXT`` is kept as a static emergency
+# fallback only — production rendering goes through the composer.
 # ---------------------------------------------------------------------------
 
 
+_HELP_SECTIONS = ('NAVIGATION', 'PREVIEW', 'SEARCH', 'SELECTION', 'OTHER')
+
+# Static fallback used only if the composer can't be reached (e.g. a
+# test loading 050-render in isolation without the action layer wired).
 _HELP_TEXT = """\
 browse-tui — generic hierarchical browser
 
-NAVIGATION
-  j, Down          Cursor down
-  k, Up            Cursor up
-  g, Home          First item
-  G, End           Last item
-  PgUp, PgDn       Page up/down
-  Right            Expand node / move to first child
-  Left             Collapse node / move to parent
-  Alt-Right        Expand siblings recursively
-  Alt-Left         Collapse siblings recursively
-  Alt-Down         Scope down into item
-  Alt-Up           Scope up to parent
-
-PREVIEW
-  Ctrl-P           Toggle preview pane
-  Shift-Down       Scroll preview line down
-  Shift-Up         Scroll preview line up
-  Alt-PgDn         Scroll preview page down
-  Alt-PgUp         Scroll preview page up
-
-SEARCH
-  /                Enter search mode
-  Enter            Next match
-  Shift-Enter      Previous match
-  Esc              Exit search mode
-
-ACTIONS
-  Custom           Recipe-specific (see app's --help)
-
-OTHER
-  ?                Help (toggle)
-  q, Esc, Ctrl-C   Quit
-  Ctrl-R           Reload
-  Ctrl-L           Redraw
+(See `--help` or press `?` in the running TUI for the full keymap.)
 """
+
+
+def _format_help_section(name, rows):
+    """Render one section: the header line + an aligned list of rows.
+
+    ``rows`` is a list of ``(key, label)`` tuples. Keys are padded to a
+    fixed column so labels line up across rows. Sections with no rows
+    are caller-elided — this helper assumes ``rows`` is non-empty.
+    """
+    lines = [name]
+    # Pad keys so labels align. 16 cols handles the longest built-in
+    # ('shift-down'); recipes that use longer keys get a wider key
+    # column for that one row but the rest stay aligned.
+    key_width = 16
+    for key, label in rows:
+        keystr = key
+        if len(keystr) > key_width:
+            # Long key — emit key on its own and label on the next line
+            # so it doesn't squish the label.
+            lines.append('  {}'.format(keystr))
+            lines.append('  {} {}'.format(' ' * key_width, label))
+        else:
+            lines.append('  {:<{w}} {}'.format(keystr, label, w=key_width))
+    return '\n'.join(lines)
+
+
+def compose_help_text(browser, *, include_usage: bool = False) -> str:
+    """Compose the help text shown by ``--help`` and the in-app ``?``.
+
+    Output structure::
+
+        [help_intro]              (omitted when None / empty)
+
+        NAVIGATION                (built-in default actions, grouped)
+          ...
+        PREVIEW
+          ...
+        SEARCH
+          ...
+        SELECTION
+          ...
+        OTHER
+          ...
+
+        CUSTOM ACTIONS            (only when browser.actions is non-empty)
+          e   Edit in $EDITOR     (action.label)
+          d   Delete with confirm
+
+        [help_outro]              (omitted when None / empty)
+
+    Sections without content are omitted: no empty CUSTOM ACTIONS
+    header, no leading or trailing blank lines.
+
+    ``include_usage`` is currently unused inside the composer — the
+    argparse usage block is prepended by ``main()`` at the CLI layer
+    when ``--help`` runs. The flag is reserved for future uses (e.g.
+    embedding usage when called from a non-CLI entrypoint).
+    """
+    # Suppress unused-arg lint without surprising the caller.
+    _ = include_usage
+    parts = []
+
+    intro = getattr(browser, 'help_intro', None)
+    if intro:
+        parts.append(intro.rstrip())
+
+    # Group default actions by section, preserving the order
+    # ``default_actions()`` declared (so ``j, down, k, up`` stay
+    # adjacent — declaration order is the docstring's narrative order).
+    sections = {}   # section_name -> list[(key, label)]
+    for a in default_actions():
+        if not a.section or not a.label:
+            continue
+        sections.setdefault(a.section, []).append((a.key, a.label))
+
+    for name in _HELP_SECTIONS:
+        rows = sections.get(name, [])
+        if rows:
+            parts.append(_format_help_section(name, rows))
+
+    # Recipe-defined actions — single CUSTOM ACTIONS section in this
+    # phase. Per-recipe sections (e.g. browse-plan grouping its own
+    # status / edit / move bindings) are a future feature; the
+    # composer ignores ``Action.section`` on user-supplied actions.
+    custom = []
+    for a in (getattr(browser, 'actions', None) or []):
+        # Skip entries with no label — no helpful text to show. Also
+        # skip duplicates (recipes occasionally bind the same handler
+        # to two keys; surface them once with both keys joined).
+        if not getattr(a, 'label', ''):
+            continue
+        custom.append((a.key, a.label))
+    if custom:
+        parts.append(_format_help_section('CUSTOM ACTIONS', custom))
+
+    outro = getattr(browser, 'help_outro', None)
+    if outro:
+        parts.append(outro.rstrip())
+
+    return '\n\n'.join(parts) + '\n' if parts else ''

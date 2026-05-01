@@ -99,11 +99,21 @@ def get_preview(item_id):
     return result.stdout if result.returncode == 0 else result.stderr
 
 
+_HELP_INTRO = """\
+browse-git — drill from recent commits into changed files into diffs.
+
+Three levels: a recent ``git log -n 50``; the files changed in the
+selected commit; and the per-file unified diff for that commit.
+Read-only — preview shows the diff (or stat / message at level 0).\
+"""
+
+
 def main():
     sys.exit(Browser(
         title='browse-git',
         get_children=get_children,
         get_preview=get_preview,
+        help_intro=_HELP_INTRO,
     ).run())
 
 

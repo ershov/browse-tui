@@ -253,8 +253,9 @@ class TestHelpOutput(unittest.TestCase):
     """``--help`` includes the in-app keybindings reference."""
 
     def test_help_includes_keybindings(self):
-        # Run the concatenated build directly so _HELP_TEXT (defined in
-        # 050-render.py) is in scope alongside the CLI dispatcher.
+        # Run the concatenated build directly so the help composer
+        # (defined in 050-render.py) is in scope alongside the CLI
+        # dispatcher.
         import subprocess
         root = os.path.dirname(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -269,9 +270,13 @@ class TestHelpOutput(unittest.TestCase):
             timeout=10,
         )
         self.assertEqual(proc.returncode, 0)
-        self.assertIn('Default keybindings', proc.stdout)
-        # Spot-check a couple of well-known bindings show up.
+        # Spot-check the section headers and a couple of well-known
+        # bindings — emitted by ``compose_help_text``.
+        self.assertIn('usage:', proc.stdout)
         self.assertIn('NAVIGATION', proc.stdout)
+        self.assertIn('PREVIEW', proc.stdout)
+        self.assertIn('SEARCH', proc.stdout)
+        self.assertIn('OTHER', proc.stdout)
         self.assertIn('Quit', proc.stdout)
 
 

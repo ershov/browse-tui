@@ -124,14 +124,25 @@ def kill_proc(ctx):
     ctx.refresh()
 
 
+_HELP_INTRO = """\
+browse-procs — interactive process tree.
+
+Builds the hierarchy from ``ps -eo pid,ppid,user,comm``: each row is
+a process, children are processes whose ppid equals this pid. Reload
+the tree with Ctrl-R; preview reads /proc/<pid>/status.\
+"""
+
+
 def main():
     sys.exit(Browser(
         title='browse-procs',
         get_children=get_children,
         get_preview=get_preview,
         actions=[
-            Action('k', 'Kill (SIGTERM)', kill_proc, 'cursor'),
+            Action('k', 'Kill cursor pid (SIGTERM, with confirm)',
+                   kill_proc, 'cursor'),
         ],
+        help_intro=_HELP_INTRO,
     ).run())
 
 

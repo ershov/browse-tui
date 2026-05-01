@@ -6,19 +6,19 @@
 
 
 ─────── /:search  ?:help  q:quit ──────────────────────────────────────── Help ─
-browse-tui — generic hierarchical browser
-
 NAVIGATION
-  j, Down          Cursor down
-  k, Up            Cursor up
-  g, Home          First item
-  G, End           Last item
-  PgUp, PgDn       Page up/down
-  Right            Expand node / move to first child
-  Left             Collapse node / move to parent
-  Alt-Right        Expand siblings recursively
-  Alt-Left         Collapse siblings recursively
-  Alt-Down         Scope down into item
-  Alt-Up           Scope up to parent
-
-PREVIEW
+  j                Cursor down
+  down             Cursor down
+  k                Cursor up
+  up               Cursor up
+  g                First item
+  home             First item
+  G                Last item
+  end              Last item
+  pgdn             Page down
+  pgup             Page up
+  right            Expand node / move to first child
+  left             Collapse node / move to parent
+  alt-right        Expand siblings recursively
+  alt-left         Collapse siblings recursively
+  alt-down         Scope down into item

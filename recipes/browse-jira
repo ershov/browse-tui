@@ -113,14 +113,27 @@ def open_in_browser(ctx):
     ctx.run_external([cmd, key])
 
 
+_HELP_INTRO = """\
+browse-jira — list open Jira tickets via the ``jira`` CLI (sketch).
+
+Shells out to ``jira list`` for the row list and ``jira view <KEY>``
+for previews. Requires the ``jira`` CLI on PATH; the output parser is
+intentionally lenient and may need tweaking for non-standard
+templates. If auth fails or the CLI is missing the recipe shows a
+single error row.\
+"""
+
+
 def main():
     sys.exit(Browser(
         title='browse-jira',
         get_children=get_children,
         get_preview=get_preview,
         actions=[
-            Action('o', 'Open in browser', open_in_browser, 'cursor'),
+            Action('o', 'Open ticket in $BROWSER (or xdg-open)',
+                   open_in_browser, 'cursor'),
         ],
+        help_intro=_HELP_INTRO,
     ).run())
 
 

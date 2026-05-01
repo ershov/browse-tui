@@ -656,6 +656,16 @@ def _action_show_id(ctx):
 # ---- entry point ---------------------------------------------------------
 
 
+_HELP_INTRO = """\
+browse-claude — Claude Code project / session / message browser.
+
+Walks ~/.claude/projects/ to surface a four-level tree: projects ->
+sessions -> messages (or subagents) -> subagent messages. Drill into
+a transcript with Right/Alt-Down; preview shows the rendered turn.
+Edit (or 'o') opens the source .jsonl in $EDITOR at the right line.\
+"""
+
+
 def main():
     initial_scope = sys.argv[1] if len(sys.argv) > 1 else None
     b = Browser(
@@ -665,10 +675,11 @@ def main():
         root_id=None,
         initial_scope=initial_scope,
         actions=[
-            Action('e', 'Edit/view', _action_edit,    'cursor'),
-            Action('o', 'Edit/view', _action_edit,    'cursor'),
-            Action('y', 'Show id',   _action_show_id, 'cursor'),
+            Action('e', 'Edit/view source in $EDITOR',    _action_edit,    'cursor'),
+            Action('o', 'Edit/view source in $EDITOR',    _action_edit,    'cursor'),
+            Action('y', 'Show full id (paste-friendly)',  _action_show_id, 'cursor'),
         ],
+        help_intro=_HELP_INTRO,
     )
     sys.exit(b.run())
 

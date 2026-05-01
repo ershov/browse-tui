@@ -30,8 +30,10 @@ class Action:
     Fields:
       * ``key``: key name as produced by ``020-terminal.read_key`` —
         e.g. ``'e'``, ``'ctrl-r'``, ``'alt-down'``, ``'shift-enter'``.
-      * ``label``: short text used in help screens and the info-bar
-        hints.
+      * ``label``: Short, one-line description of what this action
+        does. Shown in the auto-generated CUSTOM ACTIONS section of
+        ``--help`` and ``?``. Keep under ~60 characters; use
+        ``help_outro`` for anything longer.
       * ``handler``: callable taking a single ``Context`` argument; run
         when the key is pressed in normal mode (i.e. not in search-mode
         text-entry).
@@ -41,6 +43,12 @@ class Action:
           - ``'cursor'``    — ``ctx.cursor`` must be non-None.
           - ``'selection'`` — ``ctx.selected`` must be non-empty.
           - ``'targets'``   — either selection or cursor is non-empty.
+      * ``section``: optional grouping hint used by the help composer.
+        Built-in default actions tag themselves with one of
+        ``'NAVIGATION'`` / ``'PREVIEW'`` / ``'SEARCH'`` / ``'SELECTION'``
+        / ``'OTHER'``. Recipe-supplied actions leave it empty (the
+        default) and are listed together under ``CUSTOM ACTIONS``;
+        per-recipe sectioning is a future feature.
 
     An unknown ``requires`` value behaves like ``'none'`` so a typo
     doesn't silently disable the action.
@@ -50,6 +58,7 @@ class Action:
     label: str = ''
     handler: Optional[Callable[['Context'], None]] = None
     requires: str = 'none'
+    section: str = ''
 
 
 # ---- precondition gate -----------------------------------------------------
@@ -570,52 +579,54 @@ def default_actions() -> list:
     per dispatch — negligible).
     """
     return [
-        Action('j',         'Down',           _nav_down,        'none'),
-        Action('down',      'Down',           _nav_down,        'none'),
-        Action('k',         'Up',             _nav_up,          'none'),
-        Action('up',        'Up',             _nav_up,          'none'),
-        Action('g',         'First',          _nav_home,        'none'),
-        Action('home',      'First',          _nav_home,        'none'),
-        Action('G',         'Last',           _nav_end,         'none'),
-        Action('end',       'Last',           _nav_end,         'none'),
-        Action('pgdn',      'Page down',      _nav_pgdn,        'none'),
-        Action('pgup',      'Page up',        _nav_pgup,        'none'),
-        Action('right',     'Expand',         _nav_right,       'cursor'),
-        Action('left',      'Collapse',       _nav_left,        'cursor'),
+        Action('j',         'Cursor down',    _nav_down,        'none', 'NAVIGATION'),
+        Action('down',      'Cursor down',    _nav_down,        'none', 'NAVIGATION'),
+        Action('k',         'Cursor up',      _nav_up,          'none', 'NAVIGATION'),
+        Action('up',        'Cursor up',      _nav_up,          'none', 'NAVIGATION'),
+        Action('g',         'First item',     _nav_home,        'none', 'NAVIGATION'),
+        Action('home',      'First item',     _nav_home,        'none', 'NAVIGATION'),
+        Action('G',         'Last item',      _nav_end,         'none', 'NAVIGATION'),
+        Action('end',       'Last item',      _nav_end,         'none', 'NAVIGATION'),
+        Action('pgdn',      'Page down',      _nav_pgdn,        'none', 'NAVIGATION'),
+        Action('pgup',      'Page up',        _nav_pgup,        'none', 'NAVIGATION'),
+        Action('right',     'Expand node / move to first child', _nav_right, 'cursor', 'NAVIGATION'),
+        Action('left',      'Collapse node / move to parent',    _nav_left,  'cursor', 'NAVIGATION'),
         # Recursive expand/collapse — gate on 'cursor' so we don't run the
         # tree walk on an empty visible list.
-        Action('alt-right', 'Expand siblings',   _expand_recursive,   'cursor'),
-        Action('alt-left',  'Collapse siblings', _collapse_recursive, 'cursor'),
+        Action('alt-right', 'Expand siblings recursively',   _expand_recursive,   'cursor', 'NAVIGATION'),
+        Action('alt-left',  'Collapse siblings recursively', _collapse_recursive, 'cursor', 'NAVIGATION'),
         # Scoping. alt-down requires a cursor (and silently no-ops on
         # leaves inside the handler); alt-up is gated 'none' because the
         # root-state no-op is also handled inside the handler.
-        Action('alt-down',  'Scope in',       _scope_down,      'cursor'),
-        Action('alt-up',    'Scope out',      _scope_up,        'none'),
+        Action('alt-down',  'Scope down into item', _scope_down, 'cursor', 'NAVIGATION'),
+        Action('alt-up',    'Scope up to parent',   _scope_up,   'none',   'NAVIGATION'),
         # Preview scroll — gate 'none' so they work even when the visible
         # list is empty (help/error pages still want scrolling).
-        Action('shift-down', 'Preview scroll down', _preview_scroll_down, 'none'),
-        Action('shift-up',   'Preview scroll up',   _preview_scroll_up,   'none'),
-        Action('alt-pgdn',   'Preview page down',   _preview_page_down,   'none'),
-        Action('alt-pgup',   'Preview page up',     _preview_page_up,     'none'),
+        Action('ctrl-p',     'Toggle preview pane',     _toggle_preview,      'none', 'PREVIEW'),
+        Action('shift-down', 'Scroll preview line down', _preview_scroll_down, 'none', 'PREVIEW'),
+        Action('shift-up',   'Scroll preview line up',   _preview_scroll_up,   'none', 'PREVIEW'),
+        Action('alt-pgdn',   'Scroll preview page down', _preview_page_down,   'none', 'PREVIEW'),
+        Action('alt-pgup',   'Scroll preview page up',   _preview_page_up,     'none', 'PREVIEW'),
+        # Search.
+        Action('/',         'Enter search mode', _search_start, 'none', 'SEARCH'),
         # Multi-select bindings. ``read_key`` returns ``'space'`` for the
         # bare spacebar (special-cased in 020-terminal) but Alt+Space
         # arrives as ESC + ' ' which the alt-prefix branch turns into the
         # literal string ``'alt- '`` (alt-prefix + space character). Bind
         # accordingly.
-        Action('space',     'Toggle select',  _select_toggle_down, 'cursor'),
-        Action('alt- ',     'Toggle select up', _select_toggle_up, 'cursor'),
-        Action('ctrl-a',    'Select all',     _select_all_visible, 'none'),
-        Action('ctrl-n',    'Deselect all',   _select_clear,       'none'),
-        Action('ctrl-p',    'Toggle preview', _toggle_preview,  'none'),
-        Action('ctrl-r',    'Reload',         _reload,          'none'),
-        Action('ctrl-l',    'Redraw',         _redraw,          'none'),
-        Action('?',         'Help',           _toggle_help,     'none'),
-        Action('f1',        'Help',           _toggle_help,     'none'),
-        Action('/',         'Search',         _search_start,    'none'),
-        Action('q',         'Quit',           _quit,            'none'),
-        Action('esc',       'Quit',           _quit,            'none'),
-        Action('ctrl-c',    'Quit',           _quit,            'none'),
-        Action('ctrl-z',    'Suspend',        _suspend,         'none'),
+        Action('space',     'Toggle select (cursor down)', _select_toggle_down, 'cursor', 'SELECTION'),
+        Action('alt- ',     'Toggle select (cursor up)',   _select_toggle_up,   'cursor', 'SELECTION'),
+        Action('ctrl-a',    'Select all visible',          _select_all_visible, 'none',   'SELECTION'),
+        Action('ctrl-n',    'Deselect all',                _select_clear,       'none',   'SELECTION'),
+        # Other.
+        Action('?',         'Toggle help',    _toggle_help, 'none', 'OTHER'),
+        Action('f1',        'Toggle help',    _toggle_help, 'none', 'OTHER'),
+        Action('ctrl-r',    'Reload',         _reload,      'none', 'OTHER'),
+        Action('ctrl-l',    'Redraw',         _redraw,      'none', 'OTHER'),
+        Action('q',         'Quit',           _quit,        'none', 'OTHER'),
+        Action('esc',       'Quit',           _quit,        'none', 'OTHER'),
+        Action('ctrl-c',    'Quit',           _quit,        'none', 'OTHER'),
+        Action('ctrl-z',    'Suspend',        _suspend,     'none', 'OTHER'),
     ]
 
 

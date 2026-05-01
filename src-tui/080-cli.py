@@ -464,6 +464,17 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument('--title', metavar='TITLE', default='browse-tui')
     p.add_argument('--initial-scope', metavar='ID', default=None,
                    help='Start scoped to this id.')
+    # Help-screen prose. ``@PATH`` loads from a file (handy when the
+    # blurb is long enough to bump up against shell length limits);
+    # ``@@text`` escapes a literal leading ``@``. See
+    # ``_resolve_help_text``.
+    p.add_argument('--help-intro', metavar='TEXT_OR_@PATH', default=None,
+                   help='Prose shown at the top of --help and ?. '
+                        'Use @PATH to load from a file. '
+                        '@@text escapes a literal leading @.')
+    p.add_argument('--help-outro', metavar='TEXT_OR_@PATH', default=None,
+                   help='Prose shown at the bottom of --help and ?. '
+                        'Same @PATH rules as --help-intro.')
     # Install / uninstall
     p.add_argument('--install', metavar='TARGET',
                    choices=('local', 'user', 'system', 'env'))
@@ -692,6 +703,67 @@ def make_cli_action(spec: str, *, bin_path=None,
     return Action(key=key, label=label, handler=_handler, requires='targets')
 
 
+# ---- help-screen prose: --help-intro / --help-outro ----------------------
+#
+# Each flag accepts either a literal string or ``@PATH`` (where PATH is
+# read from disk). ``@@`` escapes a literal leading ``@`` so prose that
+# really wants to start with one isn't accidentally treated as a path.
+# File-not-found is fatal — the user passed an explicit path, surfacing
+# the error early is much friendlier than silently treating it as text.
+
+
+def _resolve_help_text(value: str) -> str:
+    """Resolve a ``--help-intro`` / ``--help-outro`` flag value.
+
+    * ``'@@foo'`` → literal ``'@foo'`` (escape).
+    * ``'@PATH'`` → ``open(PATH).read()``; ``SystemExit`` on failure.
+    * anything else → returned verbatim.
+    """
+    if value.startswith('@@'):
+        return value[1:]   # @@foo -> @foo
+    if value.startswith('@'):
+        path = value[1:]
+        try:
+            with open(path, encoding='utf-8') as f:
+                return f.read()
+        except OSError as e:
+            raise SystemExit(
+                f'error: could not read help text from {path!r}: {e}'
+            )
+    return value
+
+
+def _build_browser_for_help(args) -> 'Browser':
+    """Build a transient headless Browser populated from CLI ``args``.
+
+    Used by ``--help`` so the composed help text reflects whatever
+    ``--action`` / ``--help-intro`` / ``--help-outro`` flags were on
+    the command line, *without* actually launching the TUI. Recipes
+    that ship custom actions get a tailored ``--help`` for free.
+    """
+    intro = _resolve_help_text(args.help_intro) if args.help_intro else None
+    outro = _resolve_help_text(args.help_outro) if args.help_outro else None
+    bin_path = os.path.abspath(sys.argv[0])
+    actions = []
+    for spec in args.action:
+        try:
+            actions.append(make_cli_action(
+                spec, bin_path=bin_path, timeout=args.action_timeout,
+            ))
+        except ValueError:
+            # The TUI path will reject malformed specs with a clear
+            # error; for --help we keep going so the rest of the help
+            # still renders even if a spec is busted.
+            continue
+    return Browser(
+        title=args.title,
+        actions=actions,
+        help_intro=intro,
+        help_outro=outro,
+        _headless=True,
+    )
+
+
 # ---- --install / --uninstall ----------------------------------------------
 #
 # Four targets, mapping to four common installation paths. ``env`` requires
@@ -880,6 +952,8 @@ def _build_lazy_browser(args, fields, record_sep):
         multi_select=not args.no_multi_select,
         on_enter=args.on_enter,
         print_format=args.print_format,
+        help_intro=_resolve_help_text(args.help_intro) if args.help_intro else None,
+        help_outro=_resolve_help_text(args.help_outro) if args.help_outro else None,
     )
 
 
@@ -935,6 +1009,8 @@ def _build_eager_browser(args, fields, record_sep):
         multi_select=not args.no_multi_select,
         on_enter=args.on_enter,
         print_format=args.print_format,
+        help_intro=_resolve_help_text(args.help_intro) if args.help_intro else None,
+        help_outro=_resolve_help_text(args.help_outro) if args.help_outro else None,
     )
 
 
@@ -988,11 +1064,14 @@ def main(argv=None) -> int:
     if args.help:
         build_argparser().print_help()
         print()
-        print('Default keybindings (from the in-app help screen):')
-        print()
-        # _HELP_TEXT is defined in 050-render.py — accessible here in the
-        # concatenated build's unified namespace.
-        print(_HELP_TEXT)
+        # Build a transient Browser-like proxy so the composed help
+        # reflects whatever keys/intro/outro were on the command line
+        # (e.g. ``browse-tui --help -a 'e:Edit:true'`` shows ``Edit``
+        # under CUSTOM ACTIONS without spinning up the TUI).
+        b = _build_browser_for_help(args)
+        text = compose_help_text(b, include_usage=True)
+        if text:
+            sys.stdout.write(text)
         return 0
     if args.version:
         print(__version__)

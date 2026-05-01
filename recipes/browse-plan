@@ -357,6 +357,16 @@ def _action_command_log(ctx):
 # ---- entry point ---------------------------------------------------------
 
 
+_HELP_INTRO = """\
+browse-plan — drop-in replacement for plan-tui on the browse-tui core.
+
+Browse the active plan-CLI tree by status, drill into subtrees, edit
+or view tickets, and bulk-pick statuses across selections. The cursor
+or selection seeds the actions below; the recipe shells out to the
+``plan`` CLI so the on-disk format stays single-sourced.\
+"""
+
+
 def main():
     initial_scope = None
     if len(sys.argv) > 1:
@@ -373,18 +383,19 @@ def main():
         root_id=None,
         initial_scope=initial_scope,
         actions=[
-            Action('s', 'Status',          _action_status,                       'targets'),
-            Action('e', 'Edit',            lambda ctx: _action_edit(ctx),        'cursor'),
-            Action('E', 'Edit recursive',  lambda ctx: _action_edit(ctx, True),  'cursor'),
-            Action('v', 'View',            lambda ctx: _action_view(ctx),        'cursor'),
-            Action('V', 'View recursive',  lambda ctx: _action_view(ctx, True),  'cursor'),
-            Action('c', 'Create',          lambda ctx: _action_create(ctx),      'cursor'),
-            Action('C', 'Create bulk',     lambda ctx: _action_create(ctx, True), 'cursor'),
-            Action('m', 'Move',            _action_move,                         'targets'),
-            Action('x', 'Close',           _action_close,                        'targets'),
-            Action('o', 'Reopen',          _action_reopen,                       'targets'),
-            Action('~', 'Command log',     _action_command_log,                  'none'),
+            Action('s', 'Change status (fzf-style picker)',     _action_status,                        'targets'),
+            Action('e', 'Edit ticket body',                     lambda ctx: _action_edit(ctx),         'cursor'),
+            Action('E', 'Edit ticket body (recursive subtree)', lambda ctx: _action_edit(ctx, True),   'cursor'),
+            Action('v', 'View ticket (rendered)',               lambda ctx: _action_view(ctx),         'cursor'),
+            Action('V', 'View ticket recursively',              lambda ctx: _action_view(ctx, True),   'cursor'),
+            Action('c', 'Create child ticket',                  lambda ctx: _action_create(ctx),       'cursor'),
+            Action('C', 'Create children in bulk',              lambda ctx: _action_create(ctx, True), 'cursor'),
+            Action('m', 'Move (re-parent or reorder)',          _action_move,                          'targets'),
+            Action('x', 'Close ticket',                         _action_close,                         'targets'),
+            Action('o', 'Reopen closed ticket',                 _action_reopen,                        'targets'),
+            Action('~', 'Show recent plan-CLI command log',     _action_command_log,                   'none'),
         ],
+        help_intro=_HELP_INTRO,
     )
     sys.exit(b.run())
 

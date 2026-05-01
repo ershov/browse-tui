@@ -107,6 +107,16 @@ def mtime_watcher(browser):
             last[d] = m
 
 
+_HELP_INTRO = """\
+browse-fs — interactive filesystem browser.
+
+Lazily walks directories with os.scandir; the preview pane shows file
+heads or directory listings. The selection / cursor seeds $TUI_IDS_FILE
+for the actions below; mtime changes refresh the affected directory
+automatically. Press Enter (or 'e') to open the cursor row in $EDITOR.\
+"""
+
+
 def main():
     root = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.getcwd()
     b = Browser(
@@ -115,11 +125,12 @@ def main():
         get_preview=get_preview,
         root_id=root,
         actions=[
-            Action('e', 'Edit',   edit,   'cursor'),
-            Action('o', 'Open',   open_,  'targets'),
-            Action('d', 'Delete', delete, 'targets'),
+            Action('e', 'Edit cursor in $EDITOR',     edit,   'cursor'),
+            Action('o', 'Open with xdg-open',         open_,  'targets'),
+            Action('d', 'Delete (with confirmation)', delete, 'targets'),
         ],
         on_enter='action:e',
+        help_intro=_HELP_INTRO,
     )
     b.watch(mtime_watcher)
     sys.exit(b.run())

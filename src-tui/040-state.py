@@ -556,6 +556,13 @@ class Browser:
       multi_select:       allow multi-selection (action layer in #12).
       print_format:       output format string used when on_enter is None
                           and the user picks the default action.
+      help_intro:         optional prose shown at the top of the help
+                          screen (and ``--help``); recipes use it to
+                          describe what the tool does. ``None`` elides
+                          the section.
+      help_outro:         optional prose shown at the bottom of the help
+                          screen (and ``--help``); good for examples or
+                          links. ``None`` elides the section.
       _headless:          skip terminal init (default False) -- observable
                           here for tests; the real terminal init/teardown
                           branches on it once #9 lands.
@@ -574,6 +581,8 @@ class Browser:
                  show_children_pane: bool = True,
                  multi_select: bool = True,
                  print_format: str = '{id}',
+                 help_intro: Optional[str] = None,
+                 help_outro: Optional[str] = None,
                  _headless: bool = False) -> None:
         """Construct a Browser.
 
@@ -616,6 +625,11 @@ class Browser:
                 stores this opaquely; the action layer reads it.
             print_format: ``str.format``-style template applied to each
                 target when ``on_enter`` resolves to print-exit.
+            help_intro: Optional prose shown at the top of ``--help``
+                and the in-app help screen (``?``). Recipes use it to
+                describe what their tool does.
+            help_outro: Optional prose shown at the bottom of ``--help``
+                and the in-app help screen.
             _headless: Skip terminal init/teardown — used by tests.
         """
         # --- user-supplied data callbacks -------------------------------
@@ -635,6 +649,12 @@ class Browser:
         self.show_children_pane = show_children_pane
         self.multi_select = multi_select
         self.print_format = print_format
+        # help_intro/help_outro are prose blurbs shown above/below the
+        # auto-generated key list in --help and the in-app help screen
+        # (?). Recipes set them to explain what their tool does;
+        # ``None`` (the default) elides the corresponding section.
+        self.help_intro = help_intro
+        self.help_outro = help_outro
         self._headless = _headless
 
         # --- domain state ------------------------------------------------
@@ -700,9 +720,11 @@ class Browser:
         # Reset whenever the preview content changes; nudged by the
         # shift-up/shift-down handlers in the action layer (#12).
         self._preview_scroll = 0
-        # Help-mode toggle — when True, the preview pane shows _HELP_TEXT
-        # instead of the per-item preview. The actual key handler lives
-        # in the action layer (#12); the renderer just observes the flag.
+        # Help-mode toggle — when True, the preview pane shows the
+        # composed help text (``compose_help_text(self)`` from the
+        # render layer) instead of the per-item preview. The handler
+        # lives in the action layer (#12); the renderer just observes
+        # the flag.
         self._help_mode = False
         # List-pane scroll offset (rows from top of the visible list).
         # Maintained by render_list to keep the cursor on-screen; lives
