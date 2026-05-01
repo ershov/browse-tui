@@ -76,6 +76,32 @@ _INSERT_MARKER_ID = object()
 # ---------------------------------------------------------------------------
 
 
+# Translation table: every char with code < 32 becomes '?', except tab
+# (\x09) and newline (\x0a) which are preserved (tab is later expanded
+# to spaces by the renderer; LF is the line separator). Also map DEL
+# (0x7f) to '?': the spec doesn't require it but it's safer because
+# legacy terminals occasionally treat it as a destructive control char.
+# Used to defang ANSI escape sequences (\x1b[31m, …) and other control
+# bytes that arrive from untrusted file content (preview, error text).
+_PREVIEW_SANITIZE_TABLE = {
+    i: '?' for i in range(32) if i not in (0x09, 0x0a)
+}
+_PREVIEW_SANITIZE_TABLE[0x7f] = '?'
+
+
+def _sanitize_preview(text):
+    """Replace control chars (codes < 32 except \\t/\\n) with '?'.
+
+    Also replaces DEL (0x7f). Used to defang ANSI escape sequences and
+    binary noise in untrusted file content before it hits the terminal.
+    Tab is preserved (the renderer expands it to spaces); newline is
+    preserved (line separator).
+    """
+    if not text:
+        return text
+    return text.translate(_PREVIEW_SANITIZE_TABLE)
+
+
 def format_item_segments(item, *, depth=0, base_depth=0, expanded=False,
                          selected=False, kind='normal', search_query='',
                          format_item=None, ctx=None):
@@ -712,6 +738,14 @@ def render_preview(browser, top, height, cols, *, info=False):
             browser._state._preview.get(cursor_id, '')
             if cursor_id is not None else ''
         )
+
+    # Strip control chars before they hit the terminal. Covers all three
+    # sources (per-item preview, error text, help) so anything that
+    # reaches this pane is safe — preview data and action errors can
+    # carry attacker-controlled bytes (binary files, raw terminal
+    # captures, command stderr); help is composed in-process but cheap
+    # to filter and recipes may supply ``help_intro`` / ``help_outro``.
+    text = _sanitize_preview(text)
 
     # Wrap content to terminal width.
     raw = text.split('\n') if text else []
