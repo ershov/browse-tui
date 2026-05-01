@@ -1,0 +1,19 @@
+#!/bin/bash
+# browse-files — fzf-like single-directory file picker with preview.
+# Usage: browse-files [DIR]   (DIR defaults to ".")
+# Prints the selected path on stdout (default --on-enter print-exit).
+set -euo pipefail
+
+# Locate the browse-tui binary: PATH first, else sibling of this script.
+BIN="$(command -v browse-tui || true)"
+[ -n "$BIN" ] && [ -x "$BIN" ] || \
+    BIN="$(dirname "$(realpath "$0")")/../browse-tui"
+
+DIR="${1:-.}"
+
+exec "$BIN" \
+    --title "browse-files: $DIR" \
+    --root-cmd "ls -1A '$DIR'" \
+    --input tsv --fields id \
+    --preview-cmd '[[ -d "'"$DIR"'/$TUI_ID" ]] && ls -lA "'"$DIR"'/$TUI_ID" || head -200 "'"$DIR"'/$TUI_ID" 2>/dev/null' \
+    --print-format "$DIR/{id}"

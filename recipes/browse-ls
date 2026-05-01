@@ -1,0 +1,20 @@
+#!/bin/bash
+# browse-ls — `ls -lA` browser with mode/owner/size/date/name columns parsed
+# via a named-group regex.
+# Usage: browse-ls [DIR]   (DIR defaults to ".")
+# Tested against GNU ls; BSD ls output may differ slightly (adapt the regex).
+set -euo pipefail
+
+BIN="$(command -v browse-tui || true)"
+[ -n "$BIN" ] && [ -x "$BIN" ] || \
+    BIN="$(dirname "$(realpath "$0")")/../browse-tui"
+
+DIR="${1:-.}"
+
+# ls -lA emits a "total N" header; tail -n +2 strips it.
+exec "$BIN" \
+    --title "browse-ls: $DIR" \
+    --root-cmd "ls -lA '$DIR' | tail -n +2" \
+    --input 'match:^(?P<mode>\S+)\s+\d+\s+(?P<owner>\S+)\s+\S+\s+(?P<size>\d+)\s+(?P<date>\S+\s+\S+\s+\S+)\s+(?P<id>.+)$' \
+    --preview-cmd '[[ -d "'"$DIR"'/$TUI_ID" ]] && ls -lA "'"$DIR"'/$TUI_ID" || head -200 "'"$DIR"'/$TUI_ID" 2>/dev/null' \
+    --print-format "$DIR/{id}"

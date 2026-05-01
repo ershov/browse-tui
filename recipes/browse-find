@@ -1,0 +1,26 @@
+#!/bin/bash
+# browse-find — recursive file picker over `find -print0`. NUL-safe; works
+# correctly with paths that contain spaces or newlines.
+# Usage: browse-find [ROOT [find-args...]]   (ROOT defaults to ".")
+# Extra args are passed through to find (e.g. -type f -name '*.py').
+set -euo pipefail
+
+BIN="$(command -v browse-tui || true)"
+[ -n "$BIN" ] && [ -x "$BIN" ] || \
+    BIN="$(dirname "$(realpath "$0")")/../browse-tui"
+
+ROOT="${1:-.}"
+shift || true
+
+# Build a properly-quoted find command since --root-cmd runs as `bash -c CMD`
+# and cannot receive positional arguments.
+QROOT=$(printf '%q' "$ROOT")
+QARGS=""
+for a in "$@"; do QARGS+=" $(printf '%q' "$a")"; done
+
+exec "$BIN" \
+    --title "browse-find: $ROOT" \
+    --root-cmd "find $QROOT -mindepth 1 $QARGS -print0" \
+    --input tsv --fields id \
+    --record-sep null \
+    --preview-cmd '[[ -d "$TUI_ID" ]] && ls -lA "$TUI_ID" || head -200 "$TUI_ID" 2>/dev/null'
