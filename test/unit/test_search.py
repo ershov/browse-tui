@@ -258,6 +258,21 @@ class TestSearchModeDispatch(unittest.TestCase):
         finally:
             b.stop_workers()
 
+    def test_ctrl_c_in_search_mode_exits_and_clears_query(self):
+        # ctrl-c is treated as a synonym for esc inside search mode —
+        # universal abort. Clears the query and exits search mode.
+        b = self._browser_with_items(['foo', 'bar'])
+        b._search_mode = True
+        b._search_query = 'fo'
+        try:
+            ctx = _ctx_for(b)
+            handled = dispatch_key(b, ctx, 'ctrl-c')
+            self.assertTrue(handled)
+            self.assertFalse(b._search_mode)
+            self.assertEqual(b._search_query, '')
+        finally:
+            b.stop_workers()
+
     def test_backspace_re_jumps_to_match(self):
         # After deleting a char, the cursor should land on a match for
         # the trimmed query. ``_search_jump_nearest`` passes ``cursor-1``

@@ -41,6 +41,24 @@ class TestSearch(unittest.TestCase):
             screen = t.capture()
             self.assertNotIn('/bar', screen)
 
+    def test_ctrl_c_exits_search_mode(self):
+        """Ctrl-C inside search mode acts as a synonym for Esc — clears
+        query, exits search mode, returns to normal navigation."""
+        with TmuxFixture(cols=80, rows=24) as t:
+            t.launch('bash', '-c',
+                     f"printf 'foo\\nbar\\nbaz\\n' | {_BIN} --root-cmd cat --no-children-pane")
+            t.wait_for('#foo foo')
+            t.send('/')
+            t.type('ba')
+            t.wait_for('/ba')
+            t.send_bytes('\x03')   # ctrl-c
+            # search prompt gone, query cleared
+            import time; time.sleep(0.1)
+            cap = t.wait_stable()
+            self.assertNotIn('/ba', cap)
+            # back at normal mode — q quits
+            t.send('q')
+
     def test_search_query_extends_with_each_keystroke(self):
         """Each printable key extends the query; backspace trims it."""
         with TmuxFixture(cols=80, rows=24) as t:

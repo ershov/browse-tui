@@ -649,7 +649,7 @@ def dispatch_key(browser, ctx: 'Context', key: str) -> bool:
     # ``'list'`` to the redraw set so highlight spans repaint
     # immediately.
     if browser._search_mode:
-        if key == 'esc':
+        if key in ('esc', 'ctrl-c'):
             browser._search_mode = False
             browser._search_query = ''
             browser._needs_redraw.add('info')
