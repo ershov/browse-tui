@@ -2,16 +2,32 @@
 """browse-claude — Claude Code project / session / message browser.
 
 Lazily walks ``~/.claude/projects/<encoded-path>/<session>.jsonl`` files,
-exposing a three-level hierarchy:
+exposing a four-level hierarchy:
 
   level 0: projects    (the encoded-path subdirs of ~/.claude/projects)
   level 1: sessions    (the .jsonl files within a project)
   level 2: messages    (records within a session)
+       OR  subagents   (when the session has dispatched subagents)
+  level 3: subagent messages (records within a subagent .jsonl)
+
+Subagents (sidechain transcripts) live on disk at
+``~/.claude/projects/<encoded-path>/<session-id>/subagents/agent-<id>.jsonl``,
+optionally accompanied by an ``agent-<id>.meta.json`` describing the
+``agentType`` and ``description``. They appear as sibling rows alongside
+the session's top-level messages — pick one to drill into its own
+transcript.
 
 Identifiers are kept simple and dispatchable purely by shape:
   * project ids are absolute paths to the project directory.
   * session ids are absolute paths to the .jsonl file.
-  * message ids are ``'<session_path>#<line_number>'`` strings.
+  * message ids are ``'<session_path>#<line_number>'`` strings — this
+    holds for both top-level session messages (where ``<session_path>``
+    is the main jsonl) and subagent messages (where it's the
+    ``agent-<id>.jsonl`` path). The shape collapse means $EDITOR
+    actions and message previews work uniformly across both.
+  * subagent group ids are ``'<session_path>#agent:<agent_id>'`` —
+    distinct shape so ``get_children`` can route them to the subagent's
+    own line listing.
 
 Phase-3 simplifications (intentionally out of scope):
   * No delete-session action — too dangerous with no undo.
@@ -75,15 +91,21 @@ def _human_time(epoch):
 # ---- get_children: dispatches by id shape --------------------------------
 #
 # The Browser passes the raw item id back into ``get_children``. We use the
-# id's shape (None / dir-path / file-path / ``'…#N'``) to pick the right
-# enumeration without threading any extra state through.
+# id's shape (None / dir-path / file-path / ``'…#N'`` / ``'…#agent:NAME'``)
+# to pick the right enumeration without threading any extra state through.
+#
+# Order matters: subagent-group ids (``'<sess>#agent:<id>'``) end with
+# ``.jsonl`` only on the prefix and contain ``'#agent:'``, so we test for
+# that shape before the plain-jsonl branch.
 
 
 def get_children(item_id):
     if item_id is None:
         return _list_projects()
+    if isinstance(item_id, str) and '#agent:' in item_id:
+        return _list_subagent_messages(item_id)
     if isinstance(item_id, str) and item_id.endswith('.jsonl') and os.path.isfile(item_id):
-        return _list_messages(item_id)
+        return _list_session_children(item_id)
     if isinstance(item_id, str) and os.path.isdir(item_id):
         return _list_sessions(item_id)
     # Messages have no children; anything else is unknown — return empty.
@@ -149,19 +171,153 @@ def _list_sessions(project_dir):
         except OSError:
             count = 0
         sid = name[:-len('.jsonl')]
+        n_subs = _count_subagents(project_dir, sid)
+        tag = f'{count} msg'
+        if n_subs:
+            tag += f' · {n_subs} sub'
+        tag += f' · {_human_time(st.st_mtime)}'
         item = Item(
             id=full,
             title=sid,
-            tag=f'{count} msg · {_human_time(st.st_mtime)}',
+            tag=tag,
             tag_style='dim',
-            has_children=count > 0,
+            has_children=count > 0 or n_subs > 0,
         )
         item.kind = 'session'
         item.line_count = count
+        item.subagent_count = n_subs
         item.mtime = st.st_mtime
         out.append(item)
     out.sort(key=lambda it: -it.mtime)
     return out
+
+
+# ---- subagent discovery --------------------------------------------------
+#
+# Claude Code stores each session's subagent transcripts at
+# ``<project_dir>/<session_id>/subagents/agent-<agent_id>.jsonl``,
+# optionally with an adjacent ``agent-<agent_id>.meta.json`` containing
+# ``{agentType, description}``. We surface them as sibling rows of the
+# top-level messages so a session list reads as one flat timeline of
+# what happened in that session — main-thread messages interleaved
+# with the subagent groups it dispatched.
+
+
+def _subagents_dir(session_jsonl_path):
+    """Return the ``<session_id>/subagents`` dir path for a session's .jsonl.
+
+    Doesn't check existence — caller decides what to do if it's absent.
+    """
+    base, _ = os.path.splitext(session_jsonl_path)
+    return os.path.join(base, 'subagents')
+
+
+def _count_subagents(project_dir, sid):
+    """Cheap count of subagent .jsonl files for one session."""
+    sub_dir = os.path.join(project_dir, sid, 'subagents')
+    try:
+        return sum(
+            1 for n in os.listdir(sub_dir)
+            if n.startswith('agent-') and n.endswith('.jsonl')
+        )
+    except OSError:
+        return 0
+
+
+def _read_subagent_meta(meta_path):
+    """Return ``{agentType, description}`` from a subagent meta.json or ``{}``."""
+    try:
+        with open(meta_path, 'r', encoding='utf-8', errors='replace') as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
+def _list_subagents_for_session(session_jsonl_path):
+    """Enumerate subagent group items for one session.
+
+    Each subagent gets one row whose id encodes both the parent session
+    and the agent id, so ``get_children`` can route it without needing
+    to remember any per-row state.
+    """
+    sub_dir = _subagents_dir(session_jsonl_path)
+    if not os.path.isdir(sub_dir):
+        return []
+    out = []
+    try:
+        names = os.listdir(sub_dir)
+    except OSError:
+        return []
+    for name in names:
+        if not (name.startswith('agent-') and name.endswith('.jsonl')):
+            continue
+        agent_id = name[len('agent-'):-len('.jsonl')]
+        agent_path = os.path.join(sub_dir, name)
+        try:
+            st = os.stat(agent_path)
+        except OSError:
+            continue
+        try:
+            with open(agent_path, 'rb') as f:
+                count = sum(1 for _ in f)
+        except OSError:
+            count = 0
+        meta = _read_subagent_meta(
+            os.path.join(sub_dir, f'agent-{agent_id}.meta.json'),
+        )
+        agent_type = meta.get('agentType') or 'agent'
+        description = meta.get('description') or ''
+        # Title surfaces the description (what the agent was asked to do)
+        # since the agent_id is opaque. Falls back to the id for agents
+        # without a meta file.
+        title = description or f'agent {agent_id}'
+        item = Item(
+            id=f'{session_jsonl_path}#agent:{agent_id}',
+            title=title,
+            tag=f'{agent_type} · {count} msg',
+            tag_style='magenta',
+            has_children=count > 0,
+        )
+        item.kind = 'subagent'
+        item.agent_id = agent_id
+        item.agent_type = agent_type
+        item.agent_description = description
+        item.session_path = session_jsonl_path
+        item.subagent_path = agent_path
+        item.line_count = count
+        item.mtime = st.st_mtime
+        out.append(item)
+    # Newest-first ordering matches the rest of the recipe.
+    out.sort(key=lambda it: -it.mtime)
+    return out
+
+
+def _list_session_children(jsonl_path):
+    """Return subagent groups + top-level messages for a session.
+
+    Subagents come first (most users want to see what was dispatched
+    before scrolling through hundreds of main-thread messages).
+    Sessions without any subagents render exactly as before.
+    """
+    subs = _list_subagents_for_session(jsonl_path)
+    msgs = _list_messages(jsonl_path)
+    return subs + msgs
+
+
+def _list_subagent_messages(item_id):
+    """Children for a subagent group: the lines of its .jsonl."""
+    session_path, _, suffix = item_id.partition('#agent:')
+    if not suffix:
+        return []
+    agent_id = suffix
+    sub_dir = _subagents_dir(session_path)
+    agent_path = os.path.join(sub_dir, f'agent-{agent_id}.jsonl')
+    if not os.path.isfile(agent_path):
+        return []
+    return _list_messages(agent_path)
 
 
 def _list_messages(jsonl_path, limit=_MESSAGE_LIMIT):
@@ -314,12 +470,15 @@ def _extract_text(content):
 def get_preview(item_id):
     """Preview-pane content for the cursor item.
 
-    * project (dir):  human-readable summary + session list
-    * session (file): first 20 lines of the .jsonl (truncated)
-    * message (#N):   pretty-printed JSON of the line
+    * project (dir):       human-readable summary + session list
+    * session (file):      first 20 lines of the .jsonl (truncated)
+    * subagent (#agent:X): meta.json + first-prompt preview
+    * message (#N):        pretty-printed JSON of the line
     """
     if not isinstance(item_id, str) or item_id.startswith('__err__:'):
         return ''
+    if '#agent:' in item_id:
+        return _preview_subagent(item_id)
     if '#' in item_id:
         path, _, lineno = item_id.rpartition('#')
         if lineno == '__truncated__':
@@ -371,6 +530,61 @@ def _preview_session(path):
         return f'[error] {e}'
 
 
+def _preview_subagent(item_id):
+    """Preview a subagent group: type/description + opening prompt.
+
+    The opening prompt is the first user-text record in the agent's
+    .jsonl, which tells you what task the parent dispatched. We cap it
+    at 800 chars to avoid blowing out the preview pane on the bigger
+    multi-paragraph briefings.
+    """
+    session_path, _, suffix = item_id.partition('#agent:')
+    if not suffix:
+        return ''
+    agent_id = suffix
+    sub_dir = _subagents_dir(session_path)
+    agent_path = os.path.join(sub_dir, f'agent-{agent_id}.jsonl')
+    meta = _read_subagent_meta(
+        os.path.join(sub_dir, f'agent-{agent_id}.meta.json'),
+    )
+    header_lines = [
+        f'subagent: {agent_id}',
+        f'type:     {meta.get("agentType", "?")}',
+    ]
+    desc = meta.get('description') or ''
+    if desc:
+        header_lines.append(f'desc:     {desc}')
+    line_count = 0
+    first_prompt = ''
+    try:
+        with open(agent_path, 'r', encoding='utf-8', errors='replace') as f:
+            for n, line in enumerate(f):
+                line_count = n + 1
+                if first_prompt:
+                    continue
+                line = line.rstrip('\n')
+                if not line.strip():
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                msg = obj.get('message') if isinstance(obj.get('message'), dict) else None
+                if not msg or msg.get('role') != 'user':
+                    continue
+                first_prompt = _extract_text(msg.get('content', ''))
+    except OSError as e:
+        return f'[error] {e}'
+    header_lines.append(f'lines:    {line_count}')
+    out = '\n'.join(header_lines)
+    if first_prompt:
+        snippet = first_prompt.strip()
+        if len(snippet) > 800:
+            snippet = snippet[:800] + ' …'
+        out += '\n\nopening prompt:\n' + snippet
+    return out
+
+
 def _preview_message(path, n):
     try:
         with open(path, 'r', encoding='utf-8', errors='replace') as f:
@@ -391,12 +605,25 @@ def _preview_message(path, n):
 
 
 def _resolve_path(item):
-    """Strip the ``#N`` suffix from a message id; return the .jsonl path."""
+    """Resolve the cursor row to the file you want $EDITOR to open.
+
+    * message id (``<path>#<line>``): return ``<path>``.
+    * subagent group id (``<sess>#agent:<aid>``): return the agent's
+      ``.jsonl`` file (subagents have their own transcript on disk).
+    * project / session id: return the id verbatim — it's the path.
+    """
     if item is None:
         return None
     iid = item.id
     if not isinstance(iid, str):
         return None
+    if '#agent:' in iid:
+        session_path, _, suffix = iid.partition('#agent:')
+        if not suffix:
+            return session_path
+        return os.path.join(
+            _subagents_dir(session_path), f'agent-{suffix}.jsonl',
+        )
     if '#' in iid:
         iid, _, _ = iid.rpartition('#')
     return iid
