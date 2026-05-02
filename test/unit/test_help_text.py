@@ -1,6 +1,6 @@
-"""Tests for the recipe-pluggable help-text composer (#79).
+"""Tests for the recipe-pluggable help-text composer (#79, #91).
 
-Covers three surfaces:
+Covers four surfaces:
 
   * ``Action.section`` — the new field on the dataclass and the values
     that ``default_actions()`` tags onto each built-in binding.
@@ -10,11 +10,17 @@ Covers three surfaces:
   * ``_resolve_help_text(value)`` — the ``--help-intro`` /
     ``--help-outro`` flag-value resolver: literal strings, ``@PATH``
     file loads, ``@@`` escapes, and missing-file fatal handling.
+  * ``Browser.run()`` auto-detect of ``-h`` / ``--help`` in
+    ``sys.argv`` — recipes that don't argparse their own argv get
+    recipe-aware help for free without entering the TUI loop (#91).
 """
 
+import io
 import os
+import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from test.unit._loader import load
 
@@ -31,6 +37,9 @@ _cli = load('_browse_tui_cli', '080-cli.py')
 _state.Item = _data.Item
 _state.to_item = _data.to_item
 _state.notify_wake = _term.notify_wake
+# Browser.run() looks up compose_help_text as a bare global for the
+# -h/--help auto-detect short-circuit (#91); inject it for tests.
+_state.compose_help_text = _render.compose_help_text
 _render.Item = _data.Item
 _render.VisibleEntry = _state.VisibleEntry
 _render.default_actions = _actions.default_actions
@@ -54,6 +63,15 @@ def _make_browser(**kw):
     """Build a headless Browser; tests don't run workers."""
     kw.setdefault('_headless', True)
     return Browser(**kw)
+
+
+class _StopRun(Exception):
+    """Sentinel raised by patched ``start_workers`` to abort ``run()``.
+
+    Lets the test verify the auto-detect predicate without dragging in
+    the rest of the TUI loop (Context, dispatch_key, render_full, …)
+    which aren't all wired in this test loader.
+    """
 
 
 # ---- Action.section --------------------------------------------------------
@@ -227,6 +245,138 @@ class TestResolveHelpText(unittest.TestCase):
     def test_empty_string_returned_verbatim(self):
         # Edge case: empty doesn't start with @, so it round-trips.
         self.assertEqual(_resolve_help_text(''), '')
+
+
+# ---- Browser.run() -h/--help auto-detect (#91) ----------------------------
+
+
+class TestRunDetectsHelpFlag(unittest.TestCase):
+    """``Browser.run()`` short-circuits on ``-h`` / ``--help`` in sys.argv.
+
+    Recipes that don't argparse their own argv (the common case) need
+    the help flag to surface recipe-aware help instead of dropping the
+    user into the TUI with the flag as a meaningless arg. Recipes that
+    do argparse first are unaffected — argparse strips the flag from
+    sys.argv before ``run()`` is called.
+    """
+
+    def _run_with_argv(self, browser, argv):
+        """Invoke ``browser.run()`` with sys.argv set to ``argv``.
+
+        Captures stdout and restores sys.argv on exit.
+        """
+        old_argv = sys.argv
+        sys.argv = argv
+        try:
+            with patch('sys.stdout', new_callable=io.StringIO) as out:
+                rc = browser.run()
+            return rc, out.getvalue()
+        finally:
+            sys.argv = old_argv
+
+    def test_run_returns_0_when_h_in_argv(self):
+        b = _make_browser()
+        rc, out = self._run_with_argv(b, ['recipe', '-h'])
+        self.assertEqual(rc, 0)
+        # Composed help text always carries the default section headers.
+        self.assertIn('NAVIGATION', out)
+        self.assertIn('OTHER', out)
+
+    def test_run_returns_0_when_long_help_in_argv(self):
+        b = _make_browser()
+        rc, out = self._run_with_argv(b, ['recipe', '--help'])
+        self.assertEqual(rc, 0)
+        self.assertIn('NAVIGATION', out)
+
+    def test_run_with_custom_action_shows_in_help(self):
+        # The whole point of #91: recipes' own actions surface in -h
+        # output. Without the auto-detect, the recipe's run() would
+        # enter the TUI and the custom action labels would be lost.
+        b = _make_browser(actions=[
+            Action('z', 'My custom thing', lambda c: None, 'cursor'),
+        ])
+        rc, out = self._run_with_argv(b, ['recipe', '-h'])
+        self.assertEqual(rc, 0)
+        self.assertIn('CUSTOM ACTIONS', out)
+        self.assertIn('My custom thing', out)
+
+    def test_run_with_help_intro_shows_intro(self):
+        # Recipe-supplied help_intro must appear when -h is auto-detected.
+        b = _make_browser(help_intro='RECIPE-INTRO-MARKER')
+        rc, out = self._run_with_argv(b, ['recipe', '-h'])
+        self.assertEqual(rc, 0)
+        self.assertIn('RECIPE-INTRO-MARKER', out)
+
+    def test_run_with_help_outro_shows_outro(self):
+        b = _make_browser(help_outro='RECIPE-OUTRO-MARKER')
+        rc, out = self._run_with_argv(b, ['recipe', '--help'])
+        self.assertEqual(rc, 0)
+        self.assertIn('RECIPE-OUTRO-MARKER', out)
+
+    def test_run_help_in_middle_position(self):
+        # ``recipe /tmp -h`` — the help flag isn't necessarily the
+        # first argv entry; auto-detect must scan all positions.
+        b = _make_browser()
+        rc, out = self._run_with_argv(b, ['recipe', '/tmp', '-h'])
+        self.assertEqual(rc, 0)
+        self.assertIn('NAVIGATION', out)
+
+    def test_run_no_help_flag_does_not_short_circuit(self):
+        # Sanity: without -h/--help, the auto-detect must not fire.
+        # Calling run() directly here would proceed to start_workers
+        # and then to the TUI loop body whose cross-module symbols
+        # (Context, dispatch_key, render_full, …) aren't all wired in
+        # this test loader. So we test the detection at the boundary
+        # by patching start_workers to raise — if auto-detect fired,
+        # start_workers would never be called and the exception
+        # wouldn't propagate.
+        b = _make_browser()
+        called = []
+
+        def _raise():
+            called.append(True)
+            raise _StopRun()
+
+        with patch.object(b, 'start_workers', side_effect=_raise):
+            old_argv = sys.argv
+            sys.argv = ['recipe']
+            try:
+                with patch('sys.stdout', new_callable=io.StringIO) as out:
+                    try:
+                        b.run()
+                    except _StopRun:
+                        pass
+            finally:
+                sys.argv = old_argv
+        # start_workers was called → auto-detect did NOT fire.
+        self.assertTrue(called)
+        # And no help text was printed.
+        self.assertNotIn('NAVIGATION', out.getvalue())
+
+    def test_run_does_not_match_h_inside_other_args(self):
+        # ``--help-intro`` and other strings containing 'h' must NOT
+        # trigger the short-circuit: we match exact ``-h`` / ``--help``
+        # tokens via membership, not substring.
+        b = _make_browser()
+        called = []
+
+        def _raise():
+            called.append(True)
+            raise _StopRun()
+
+        with patch.object(b, 'start_workers', side_effect=_raise):
+            old_argv = sys.argv
+            sys.argv = ['recipe', '--help-intro', 'text', '--mode', 'h']
+            try:
+                with patch('sys.stdout', new_callable=io.StringIO) as out:
+                    try:
+                        b.run()
+                    except _StopRun:
+                        pass
+            finally:
+                sys.argv = old_argv
+        self.assertTrue(called)
+        self.assertNotIn('NAVIGATION', out.getvalue())
 
 
 if __name__ == '__main__':

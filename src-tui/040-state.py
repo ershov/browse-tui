@@ -1302,12 +1302,30 @@ class Browser:
         plus prints any captured ``_quit_output`` to stdout after
         ``term_restore``.
 
+        Auto-detects ``-h`` / ``--help`` in ``sys.argv[1:]`` so recipes
+        that call ``Browser.run()`` without their own argparse get
+        recipe-aware help (intro/outro + custom actions) for free,
+        rather than dropping the user into the TUI with the help flag
+        as a meaningless argv entry. Recipes that consume ``-h`` /
+        ``--help`` themselves before calling ``run()`` are unaffected
+        (their argparse strips the flag from sys.argv first).
+
         Cross-module symbols (``term_init``/``term_restore``/``read_key``/
         ``g_resize_flag``/``Context``/``dispatch_key``/``render_full``/
-        ``render_partial``) are resolved as bare globals — in the
-        concatenated production build that's the unified namespace; in
-        tests the loader injects them onto this module.
+        ``render_partial``/``compose_help_text``) are resolved as bare
+        globals — in the concatenated production build that's the
+        unified namespace; in tests the loader injects them onto this
+        module.
         """
+        # Help flag short-circuit: print composed help (intro + sections
+        # + CUSTOM ACTIONS + outro) and exit without entering the loop.
+        # Honours -h and --help as exact tokens; ``--help=foo`` style
+        # bundling is not relevant here (argparse-using recipes consume
+        # it first; the auto-detect target is recipes that don't argparse).
+        if any(arg in ('-h', '--help') for arg in sys.argv[1:]):
+            sys.stdout.write(compose_help_text(self, include_usage=False))
+            return 0
+
         self.start_workers()
         if not self._headless:
             term_init()

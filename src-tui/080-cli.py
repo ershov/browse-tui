@@ -1061,7 +1061,12 @@ def main(argv=None) -> int:
 
     args, extras = parse_args(argv)
 
-    if args.help:
+    # When ``--python`` is set, defer help to the recipe: the recipe's
+    # ``Browser.run()`` auto-detects ``-h`` / ``--help`` in sys.argv
+    # and prints recipe-aware help (intro/outro + custom actions). If
+    # we handled it here, we'd show *binary* help and the recipe's
+    # contributions would never appear.
+    if args.help and not args.python:
         build_argparser().print_help()
         print()
         # Build a transient Browser-like proxy so the composed help
@@ -1085,6 +1090,13 @@ def main(argv=None) -> int:
     if args.uninstall:
         return cmd_uninstall(args.uninstall)
     if args.python:
-        return cmd_python(args.python, extras, version=__version__)
+        # Preserve the help flag so the recipe's ``Browser.run()``
+        # auto-detects it and prints recipe-aware help. Without this
+        # the binary would have stripped ``-h`` / ``--help`` during
+        # argparse and the recipe would launch into the TUI instead.
+        recipe_extras = list(extras)
+        if args.help:
+            recipe_extras.append('--help')
+        return cmd_python(args.python, recipe_extras, version=__version__)
 
     return run_tui(args)
