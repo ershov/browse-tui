@@ -1231,6 +1231,13 @@ def main(argv=None) -> int:
     if argv is None:
         argv = sys.argv[1:]
 
+    # ``browse-tui`` with no arguments prints help and exits 0 — there's
+    # no useful default action (TUI mode needs a data source), so the
+    # friendly thing is to show the user what's available rather than
+    # surface argparse's "argument required" error.
+    if not argv:
+        argv = ['--help']
+
     args, extras = parse_args(argv)
 
     # Recipe mode (--run / --run-py / --run-cli / bare positional) is

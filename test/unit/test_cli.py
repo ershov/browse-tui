@@ -386,6 +386,26 @@ class TestInstallDryRun(unittest.TestCase):
 class TestHelpOutput(unittest.TestCase):
     """``--help`` includes the in-app keybindings reference."""
 
+    def test_bare_invocation_prints_help_with_zero_exit(self):
+        # ``browse-tui`` (no args) — there's no useful default action,
+        # so we print --help and exit 0 instead of erroring.
+        import subprocess
+        root = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        )
+        binary = os.path.join(root, 'browse-tui')
+        if not os.path.exists(binary):
+            self.skipTest('browse-tui binary not built (run ./build-tui.sh)')
+        proc = subprocess.run(
+            [binary], capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn('usage:', proc.stdout)
+        self.assertIn('NAVIGATION', proc.stdout)
+        # Negative: the old error path must not surface.
+        self.assertNotIn('--children-cmd or --root-cmd is required',
+                         proc.stderr + proc.stdout)
+
     def test_help_includes_keybindings(self):
         # Run the concatenated build directly so the help composer
         # (defined in 050-render.py) is in scope alongside the CLI
