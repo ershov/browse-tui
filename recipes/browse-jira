@@ -1,4 +1,4 @@
-#!/usr/bin/env -S browse-tui --python
+#!/usr/bin/env -S browse-tui --run-py
 """browse-jira — Jira tickets via the ``jira`` CLI (sketch).
 
 Lists open tickets assigned to the current user. Each ticket is an

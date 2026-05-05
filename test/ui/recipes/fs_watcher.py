@@ -1,7 +1,7 @@
 """Recipe: list lines of a file, refresh on file change via watcher.
 
 Usage:
-    browse-tui --python fs_watcher.py PATH
+    browse-tui --run-py fs_watcher.py PATH
 
 The browser shows one Item per non-blank line of ``PATH``; a watcher
 thread polls the file every 0.2s and triggers a refresh whenever the

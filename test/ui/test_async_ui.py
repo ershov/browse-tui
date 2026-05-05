@@ -28,7 +28,7 @@ class TestAsyncUI(unittest.TestCase):
         """Expanding a parent with a slow get_children shows ⧗ loading…
         until results arrive, then content replaces the placeholder."""
         with TmuxFixture(cols=80, rows=24) as t:
-            t.launch(_BIN, '--python', _SLOW_RECIPE, '--', '1.2')
+            t.launch(_BIN, '--run-py', _SLOW_RECIPE, '1.2')
             # Recipe items have id == title, so the rendered row is
             # just the title (auto-suppressed id segment).
             t.wait_for('parent')
@@ -53,7 +53,7 @@ class TestAsyncUI(unittest.TestCase):
             with open(data_path, 'w') as f:
                 f.write('initial\n')
             with TmuxFixture(cols=80, rows=24) as t:
-                t.launch(_BIN, '--python', _WATCH_RECIPE, '--', data_path)
+                t.launch(_BIN, '--run-py', _WATCH_RECIPE, data_path)
                 t.wait_for('initial', timeout=3.0)
                 # Mutate the file from outside the TUI.
                 with open(data_path, 'w') as f:

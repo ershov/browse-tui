@@ -1,4 +1,4 @@
-#!/usr/bin/env -S browse-tui --python
+#!/usr/bin/env -S browse-tui --run-py
 """browse-procs — interactive process tree.
 
 Builds a hierarchy from ``ps -eo pid,ppid,user,comm``. Each process is

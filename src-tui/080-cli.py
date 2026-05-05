@@ -1,4 +1,4 @@
-"""browse-tui: CLI parser, format parsers, --python loader, --install hooks."""
+"""browse-tui: CLI parser, format parsers, recipe runners, --install hooks."""
 
 import argparse
 import csv as _csv
@@ -424,6 +424,16 @@ def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog='browse-tui',
         description='Generic hierarchical browser TUI. See docs for the API.',
+        epilog=(
+            'recipe runners (must be the first argument, no other flags):\n'
+            '  browse-tui SCRIPT [args…]            auto-detect (same as --run)\n'
+            '  browse-tui --run SCRIPT [args…]      auto-detect by shebang/+x\n'
+            '  browse-tui --run-py SCRIPT [args…]   run as a Python recipe (in-process)\n'
+            '  browse-tui --run-cli SCRIPT [args…]  exec the script (TUI_BIN exported,\n'
+            '                                       browse-tui dir prepended to PATH)\n'
+            'Args after SCRIPT are forwarded to the recipe as sys.argv.\n'
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         add_help=False,
     )
     # Data source
@@ -487,13 +497,11 @@ def build_argparser() -> argparse.ArgumentParser:
                    choices=('local', 'user', 'system', 'env'))
     p.add_argument('--force', action='store_true',
                    help='Overwrite existing installed binary if it differs.')
-    # --python loader
-    p.add_argument('--python', metavar='SCRIPT', default=None,
-                   help='Run a Python recipe. Every argument after '
-                        'SCRIPT is passed to the recipe as sys.argv. '
-                        'A leading "--" between SCRIPT and the recipe '
-                        'args is allowed for compatibility but no '
-                        'longer required.')
+    # Recipe runners — described in build_argparser's epilog rather than
+    # as argparse arguments because they take a recipe path AND swallow
+    # everything after it. The pre-scan in parse_args handles dispatch
+    # before argparse runs; argparse never sees these flags. They are
+    # listed in --help via the epilog text below.
     # Debug / ops
     p.add_argument('--command-log', action='store_true',
                    help='Show command log on quit.')
@@ -502,57 +510,77 @@ def build_argparser() -> argparse.ArgumentParser:
     return p
 
 
+_RECIPE_FLAGS = ('--run', '--run-py', '--run-cli')
+
+
 def parse_args(argv: list) -> tuple:
     """Parse ``argv`` (list[str], excluding program name).
 
-    Returns ``(args, extras)``: ``args`` is the namespace; ``extras`` is
-    the recipe's argv (forwarded to ``--python`` script as ``sys.argv``).
+    Returns ``(args, extras)``. In TUI mode ``args`` is the argparse
+    namespace and ``extras`` is empty. In recipe mode argparse is
+    bypassed entirely and ``args`` is a small namespace carrying
+    ``run`` (the script path) and ``run_mode`` (one of ``'auto'``,
+    ``'py'``, ``'cli'``); ``extras`` is the recipe's argv.
 
-    Splitting rules:
+    Recipe-mode dispatch (must be first):
 
-    * If ``--python SCRIPT`` (or ``--python=SCRIPT``) appears in argv,
-      everything after the script path goes to the recipe verbatim. No
-      ``--`` separator is required. A single leading ``--`` in the
-      recipe argv is stripped for backward compatibility — the old
-      contract required a ``--`` and existing recipes / docs still
-      use it.
-    * If ``--python`` is absent, the legacy ``--`` split applies:
-      everything after ``--`` goes to ``extras``. Without ``--python``,
-      ``extras`` is currently ignored by ``main()`` — kept for back-
-      compat in case anything in the wild relies on it.
+    * ``argv[0]`` is one of ``--run``, ``--run-py``, ``--run-cli`` —
+      ``argv[1]`` is the script path; ``argv[2:]`` are recipe args.
+    * ``argv[0]`` is a non-flag token — treated as a recipe path in
+      auto-detect mode (``--run``); ``argv[1:]`` are recipe args.
+
+    No browse-tui flags may precede a recipe path. The constraint is
+    deliberate: most binary flags would silently no-op (the recipe
+    builds its own Browser) and the ones that take shell commands
+    would be a security smell. If the user wants to mix, they put the
+    flag *inside* the recipe code.
+
+    Otherwise (``argv[0]`` is a flag), argparse handles the whole argv
+    in TUI mode and ``extras`` stays empty.
     """
-    head, extras = argv, []
-    for i, tok in enumerate(argv):
-        if tok == '--python':
-            # ``--python SCRIPT`` — script is at argv[i+1]; everything
-            # after is recipe argv. If the user typed just ``--python``
-            # with no value, fall through to argparse so it surfaces
-            # the error.
-            if i + 1 < len(argv):
-                head = argv[: i + 2]
-                extras = argv[i + 2:]
-            break
-        if tok.startswith('--python='):
-            # ``--python=SCRIPT`` — single token; everything after goes
-            # to the recipe.
-            head = argv[: i + 1]
-            extras = argv[i + 1:]
-            break
-    else:
-        # No ``--python`` present: legacy ``--`` split.
-        if '--' in argv:
-            idx = argv.index('--')
-            head, extras = argv[:idx], argv[idx + 1:]
+    if argv:
+        first = argv[0]
 
-    # Back-compat: ``browse-tui --python foo -- arg`` used to be the
-    # only way to forward args. Strip one leading ``--`` so existing
-    # invocations keep working unchanged.
-    if extras and extras[0] == '--':
-        extras = extras[1:]
+        if first in _RECIPE_FLAGS:
+            mode = {'--run': 'auto', '--run-py': 'py', '--run-cli': 'cli'}[first]
+            if len(argv) < 2 or argv[1].startswith('-'):
+                sys.stderr.write(
+                    f'browse-tui: {first} requires a recipe path '
+                    f'as the next argument\n'
+                )
+                sys.exit(2)
+            return _recipe_namespace(mode, argv[1]), list(argv[2:])
 
+        # Bare positional → auto-detect mode.
+        if not first.startswith('-'):
+            return _recipe_namespace('auto', first), list(argv[1:])
+
+    # TUI mode — full argparse.
     p = build_argparser()
-    args = p.parse_args(head)
-    return args, extras
+    args = p.parse_args(argv)
+    args.run = None
+    args.run_mode = None
+    return args, []
+
+
+def _recipe_namespace(mode: str, script: str) -> argparse.Namespace:
+    """Build a minimal namespace for recipe-mode dispatch.
+
+    Carries just the fields ``main()`` checks; argparse-only fields
+    (``--children-cmd`` etc.) are absent on purpose so any downstream
+    code that touches them in recipe mode raises ``AttributeError``
+    rather than silently using a stale default.
+    """
+    return argparse.Namespace(
+        run=script,
+        run_mode=mode,
+        # main()'s special-mode dispatch reads these — keep them False/None.
+        help=False,
+        version=False,
+        install=None,
+        uninstall=None,
+        force=False,
+    )
 
 
 # ---- record separator decoding --------------------------------------------
@@ -886,23 +914,49 @@ def cmd_uninstall(target: str) -> int:
     return 0
 
 
-# ---- --python loader ------------------------------------------------------
+# ---- recipe runners (--run / --run-py / --run-cli) -----------------------
 
 
-def cmd_python(script: str, extras: list, *, version: Optional[str] = None) -> int:
+_PY_SHEBANG_RE = _re.compile(r'\bpython\d*\b')
+
+
+def _detect_recipe_mode(script: str) -> str:
+    """Auto-detect mode for ``--run SCRIPT``: returns 'py', 'cli', or 'error'.
+
+    A ``python`` word in the shebang (matched at word boundaries to skip
+    false positives like ``/opt/cpython/...``) wins regardless of the
+    executable bit — Python recipes work in-process via ``runpy`` and
+    don't need ``+x``. Otherwise the file must be executable for the
+    exec path. Anything else is an error the caller surfaces with a
+    helpful message.
+    """
+    try:
+        with open(script, 'rb') as f:
+            first = f.readline(256)
+    except OSError:
+        return 'error'
+    if first.startswith(b'#!'):
+        try:
+            line = first.decode('utf-8', errors='replace')
+        except Exception:
+            line = ''
+        if _PY_SHEBANG_RE.search(line):
+            return 'py'
+    if os.access(script, os.X_OK):
+        return 'cli'
+    return 'error'
+
+
+def cmd_run_py(script: str, extras: list, *, version: Optional[str] = None) -> int:
     """Run a Python recipe with the running binary self-injected as ``browse_tui``.
 
     The recipe imports ``from browse_tui import Browser, Item, Action`` and
     gets back the running interpreter's globals — same module that
-    backed the concatenated build. ``sys.argv`` is rewritten so the
-    script sees its own name and any extra args after a ``--`` token.
-    ``SystemExit`` raised by the recipe is converted to the matching
-    return code.
+    backed the concatenated build. ``sys.argv`` is rewritten to
+    ``[script, *extras]`` so the recipe sees its own argv. ``SystemExit``
+    raised by the recipe is converted to the matching return code.
     """
     import runpy
-    # In the concatenated-build case, ``__name__`` is ``'__main__'``;
-    # in the test/embedded case it's the loader-given module name.
-    # Either way, ``sys.modules[__name__]`` resolves to *this* module.
     sys.modules['browse_tui'] = sys.modules[__name__]
     sys.argv = [script] + list(extras)
     try:
@@ -910,6 +964,76 @@ def cmd_python(script: str, extras: list, *, version: Optional[str] = None) -> i
     except SystemExit as e:
         return int(e.code) if e.code is not None else 0
     return 0
+
+
+def cmd_run_cli(script: str, extras: list, *, version: Optional[str] = None) -> int:
+    """Exec a non-Python recipe with the binary's dir on PATH.
+
+    Exports ``TUI_BIN`` to the absolute path of the running binary and
+    prepends its containing directory to ``PATH`` so a recipe that
+    invokes ``browse-tui`` by name resolves to *this* build (handy
+    when running from a build tree without installing). Replaces the
+    process via ``os.execvpe``; if the file is missing or not
+    executable we emit a clear error and return 2 instead of letting
+    a raw OSError surface.
+    """
+    if not os.path.exists(script):
+        sys.stderr.write(f'browse-tui: recipe not found: {script}\n')
+        return 2
+    if not os.access(script, os.X_OK):
+        sys.stderr.write(
+            f'browse-tui: {script}: not executable. '
+            f"Run 'chmod +x {script}', or pass --run-py if it's Python.\n"
+        )
+        return 2
+
+    # Resolve the absolute path of the running binary (sys.argv[0]) so
+    # the child can find us even if invoked via a relative path or
+    # symlink. realpath collapses symlinks; a missing argv[0] (e.g.
+    # under runpy) leaves both knobs untouched.
+    env = dict(os.environ)
+    own = sys.argv[0] if sys.argv else None
+    if own:
+        own_real = os.path.realpath(own)
+        env['TUI_BIN'] = own_real
+        own_dir = os.path.dirname(own_real)
+        if own_dir:
+            existing = env.get('PATH', '')
+            env['PATH'] = own_dir + os.pathsep + existing if existing else own_dir
+
+    abs_script = os.path.abspath(script)
+    try:
+        os.execvpe(abs_script, [abs_script, *extras], env)
+    except OSError as e:
+        sys.stderr.write(f'browse-tui: cannot exec {script}: {e}\n')
+        return 2
+
+
+def cmd_run(script: str, mode: str, extras: list,
+            *, version: Optional[str] = None) -> int:
+    """Dispatch a recipe by mode ('auto', 'py', 'cli')."""
+    if mode == 'py':
+        if not os.path.exists(script):
+            sys.stderr.write(f'browse-tui: recipe not found: {script}\n')
+            return 2
+        return cmd_run_py(script, extras, version=version)
+    if mode == 'cli':
+        return cmd_run_cli(script, extras, version=version)
+    # auto
+    if not os.path.exists(script):
+        sys.stderr.write(f'browse-tui: recipe not found: {script}\n')
+        return 2
+    detected = _detect_recipe_mode(script)
+    if detected == 'py':
+        return cmd_run_py(script, extras, version=version)
+    if detected == 'cli':
+        return cmd_run_cli(script, extras, version=version)
+    sys.stderr.write(
+        f'browse-tui: cannot run {script}: not executable and shebang '
+        f"doesn't name python. Run 'chmod +x {script}', or pass "
+        f'--run-py / --run-cli explicitly.\n'
+    )
+    return 2
 
 
 # ---- TUI mode -------------------------------------------------------------
@@ -1109,12 +1233,14 @@ def main(argv=None) -> int:
 
     args, extras = parse_args(argv)
 
-    # When ``--python`` is set, defer help to the recipe: the recipe's
-    # ``Browser.run()`` auto-detects ``-h`` / ``--help`` in sys.argv
-    # and prints recipe-aware help (intro/outro + custom actions). If
-    # we handled it here, we'd show *binary* help and the recipe's
-    # contributions would never appear.
-    if args.help and not args.python:
+    # Recipe mode (--run / --run-py / --run-cli / bare positional) is
+    # checked first. parse_args has already enforced "recipe must be
+    # the first argument with no other binary flags" — there is no
+    # mixing to negotiate here.
+    if getattr(args, 'run', None):
+        return cmd_run(args.run, args.run_mode, extras, version=__version__)
+
+    if args.help:
         build_argparser().print_help()
         print()
         # Build a transient Browser-like proxy so the composed help
@@ -1137,14 +1263,5 @@ def main(argv=None) -> int:
         return cmd_install(args.install, force=args.force)
     if args.uninstall:
         return cmd_uninstall(args.uninstall)
-    if args.python:
-        # Preserve the help flag so the recipe's ``Browser.run()``
-        # auto-detects it and prints recipe-aware help. Without this
-        # the binary would have stripped ``-h`` / ``--help`` during
-        # argparse and the recipe would launch into the TUI instead.
-        recipe_extras = list(extras)
-        if args.help:
-            recipe_extras.append('--help')
-        return cmd_python(args.python, recipe_extras, version=__version__)
 
     return run_tui(args)

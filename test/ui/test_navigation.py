@@ -83,7 +83,7 @@ class TestNavigation(unittest.TestCase):
             # latent loading state is observable on slower hosts.
             # ``--no-children-pane`` disables the grid pane so this test
             # only inspects the list-pane collapse behaviour.
-            t.launch(_BIN, '--python', _NAV_RECIPE, '--',
+            t.launch(_BIN, '--run-py', _NAV_RECIPE,
                      '0.05', '--no-children-pane')
             # The recipe sets id == title for every Item, so show_ids
             # auto-mode renders just the title (no leading id segment).

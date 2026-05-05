@@ -1,4 +1,4 @@
-#!/usr/bin/env -S browse-tui --python
+#!/usr/bin/env -S browse-tui --run-py
 """browse-git — drill from recent commits into changed files into diffs.
 
 Three levels:

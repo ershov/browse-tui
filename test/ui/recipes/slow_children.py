@@ -6,7 +6,7 @@ sleeps DELAY seconds before returning. This makes the ``⧗ loading…``
 placeholder visible in the rendered list while the fetch is in-flight.
 
 Usage:
-    browse-tui --python slow_children.py [DELAY]
+    browse-tui --run-py slow_children.py [DELAY]
 """
 
 import sys

@@ -54,7 +54,7 @@ class TestResize(unittest.TestCase):
           * Restore to 120x40 — full expanded layout reappears.
         """
         with TmuxFixture(cols=120, rows=40) as t:
-            t.launch(_BIN, '--python', _GRID_RECIPE)
+            t.launch(_BIN, '--run-py', _GRID_RECIPE)
             # The recipe pre-renders 'parent' on first row; flush async
             # children-fetch into the screen with a redraw. The recipe
             # pins show_ids='always' so each row has its id segment.

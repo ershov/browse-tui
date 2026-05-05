@@ -13,7 +13,7 @@ back to ``$PICK_LOG`` and finally to ``/tmp/pick.log`` so the recipe
 is also runnable by hand.
 
 Usage:
-    ./browse-tui --python pick_demo.py -- /tmp/x.log
+    ./browse-tui --run-py pick_demo.py -- /tmp/x.log
 """
 
 import os

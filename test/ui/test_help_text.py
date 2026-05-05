@@ -230,9 +230,9 @@ class TestRecipeHelpFlag(unittest.TestCase):
         # browse-fs is a recipe with help_intro AND custom actions —
         # exercises both surfaces in a single run.
         out = subprocess.run(
-            [_BIN, '--python',
+            [_BIN, '--run-py',
              os.path.join(_REPO, 'recipes/browse-fs'),
-             '--', '-h'],
+             '-h'],
             capture_output=True, text=True, timeout=5,
         )
         self.assertEqual(out.returncode, 0)
@@ -246,9 +246,9 @@ class TestRecipeHelpFlag(unittest.TestCase):
 
     def test_recipe_dash_dash_help_long_form_shows_help(self):
         out = subprocess.run(
-            [_BIN, '--python',
+            [_BIN, '--run-py',
              os.path.join(_REPO, 'recipes/browse-fs'),
-             '--', '--help'],
+             '--help'],
             capture_output=True, text=True, timeout=5,
         )
         self.assertEqual(out.returncode, 0)
@@ -256,13 +256,12 @@ class TestRecipeHelpFlag(unittest.TestCase):
         self.assertIn('Delete (with confirmation)', out.stdout)
 
     def test_recipe_help_via_top_level_h_flag(self):
-        # When invoking ``browse-tui --python <recipe> -h`` (no ``--``
-        # separator), argparse claims the ``-h`` and sets args.help.
-        # The dispatcher must forward it to the recipe — without that
-        # forwarding, the recipe's Browser.run() would never see the
-        # flag and the user would land in the TUI.
+        # ``browse-tui --run-py <recipe> -h`` — every arg after the
+        # recipe path is forwarded as the recipe's argv. The recipe's
+        # ``Browser.run()`` auto-detects -h/--help and prints recipe-
+        # aware help.
         out = subprocess.run(
-            [_BIN, '--python',
+            [_BIN, '--run-py',
              os.path.join(_REPO, 'recipes/browse-fs'),
              '-h'],
             capture_output=True, text=True, timeout=5,
@@ -273,7 +272,7 @@ class TestRecipeHelpFlag(unittest.TestCase):
 
     def test_recipe_help_via_top_level_long_help_flag(self):
         out = subprocess.run(
-            [_BIN, '--python',
+            [_BIN, '--run-py',
              os.path.join(_REPO, 'recipes/browse-fs'),
              '--help'],
             capture_output=True, text=True, timeout=5,
@@ -298,7 +297,7 @@ class TestRecipeHelpFlag(unittest.TestCase):
                     "sys.exit(b.run())\n"
                 )
             out = subprocess.run(
-                [_BIN, '--python', script, '--', '-h'],
+                [_BIN, '--run-py', script, '-h'],
                 capture_output=True, text=True, timeout=5,
             )
             self.assertEqual(out.returncode, 0)

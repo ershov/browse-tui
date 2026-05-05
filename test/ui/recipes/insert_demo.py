@@ -10,7 +10,7 @@ back to ``$INSERT_LOG`` and finally to ``/tmp/insert.log`` so the
 recipe is also runnable by hand.
 
 Usage:
-    ./browse-tui --python insert_demo.py -- /tmp/x.log
+    ./browse-tui --run-py insert_demo.py -- /tmp/x.log
 """
 
 import os

@@ -53,7 +53,7 @@ class TestInsertMode(unittest.TestCase):
     def test_insert_marker_appears(self):
         """Press 'c' — the '-- create --' marker shows up in the list."""
         with TmuxFixture(cols=120, rows=40) as t:
-            t.launch(_BIN, '--python', _RECIPE)
+            t.launch(_BIN, '--run-py', _RECIPE)
             t.wait_for('a a')
             t.send('c')
             # Marker appears.
@@ -65,7 +65,7 @@ class TestInsertMode(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             log = os.path.join(tmp, 'insert.log')
             with TmuxFixture(cols=120, rows=40, env={'INSERT_LOG': log}) as t:
-                t.launch(_BIN, '--python', _RECIPE)
+                t.launch(_BIN, '--run-py', _RECIPE)
                 t.wait_for('a a')
                 t.send('c')
                 t.wait_for('-- create --')
@@ -92,7 +92,7 @@ class TestInsertMode(unittest.TestCase):
         the test resilient to surrounding text changes (id/title format).
         """
         with TmuxFixture(cols=120, rows=40) as t:
-            t.launch(_BIN, '--python', _RECIPE)
+            t.launch(_BIN, '--run-py', _RECIPE)
             t.wait_for('a a')
             t.wait_stable()
             t.send('c')
@@ -144,7 +144,7 @@ class TestInsertMode(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             log = os.path.join(tmp, 'insert.log')
             with TmuxFixture(cols=120, rows=40, env={'INSERT_LOG': log}) as t:
-                t.launch(_BIN, '--python', _RECIPE)
+                t.launch(_BIN, '--run-py', _RECIPE)
                 t.wait_for('a a')
                 t.send('c')
                 t.wait_for('-- create --')

@@ -4,19 +4,26 @@ Every flag, every input format, with worked examples.
 
 ```
 USAGE
-  browse-tui [OPTIONS]
+  browse-tui [OPTIONS]                         # TUI mode
+  browse-tui SCRIPT [args…]                    # auto-detect recipe (same as --run)
+  browse-tui --run     SCRIPT [args…]          # auto-detect by shebang/+x
+  browse-tui --run-py  SCRIPT [args…]          # run as a Python recipe (in-process)
+  browse-tui --run-cli SCRIPT [args…]          # exec the script (TUI_BIN exported,
+                                               # browse-tui dir prepended to PATH)
 ```
 
 `browse-tui` has three top-level modes:
 
 1. **TUI mode** — `--children-cmd CMD` (lazy) or `--root-cmd CMD` (eager).
    Exactly one of these must be present.
-2. **`--python SCRIPT`** — run a Python recipe; the binary self-injects as
-   the `browse_tui` module.
+2. **Recipe mode** — `--run SCRIPT`, `--run-py SCRIPT`, `--run-cli SCRIPT`,
+   or a bare positional. The recipe must be the first argument; every arg
+   after `SCRIPT` is forwarded to the recipe as its `sys.argv`.
 3. **`--install`/`--uninstall`** — copy the binary in/out of standard paths;
    never enters TUI mode.
 
-`--version`, `-h`/`--help`, `--command-log` are orthogonal.
+`--version`, `-h`/`--help`, `--command-log` are orthogonal — but only in TUI
+mode. In recipe mode, no other browse-tui flags are accepted.
 
 ---
 
@@ -287,50 +294,82 @@ Install / uninstall mode never enters the TUI; the action runs and exits.
 
 ---
 
-## `--python` mode
+## Recipe mode
 
-`--python SCRIPT [args…]` runs a Python recipe. The running binary
-self-injects into `sys.modules['browse_tui']` before exec, so the recipe can
-`from browse_tui import Browser, Item, Action` with no install.
+`browse-tui` can run a recipe — either a Python script that builds a
+`Browser` directly, or any executable file (typically a shell script
+that wraps `browse-tui` with a particular configuration). Pick the
+right form for the job:
+
+| Form                          | Use                                                  |
+| ----------------------------- | ---------------------------------------------------- |
+| `browse-tui SCRIPT [args…]`   | Auto-detect (same as `--run`).                       |
+| `browse-tui --run SCRIPT …`   | Auto-detect by shebang / executable bit.             |
+| `browse-tui --run-py SCRIPT …`| Force Python; runs in-process via `runpy`.           |
+| `browse-tui --run-cli SCRIPT …`| Force exec; replaces the process with the script.   |
+
+**Recipe must be the first argument.** No other browse-tui flag is
+accepted in recipe mode — every arg after `SCRIPT` becomes the recipe's
+`sys.argv`. If you need `browse-tui`-level configuration, put it inside
+the recipe code (Python recipes pass kwargs to `Browser`; binary recipes
+build their own command line for the `browse-tui` they exec).
 
 ```bash
-browse-tui --python recipes/browse-fs ~
-browse-tui --python ./my-recipe.py --my-flag value
+browse-tui recipes/browse-fs ~                 # bare positional → --run
+browse-tui --run-py ./my-recipe.py --my-flag v # explicit Python recipe
+browse-tui --run-cli ./wrapper.sh ~/projects   # explicit exec
 ```
 
-**Argument routing.** Every argument that appears *after* `SCRIPT` is
-forwarded to the recipe verbatim — it becomes `sys.argv[1:]` of the
-recipe (with `sys.argv[0]` set to the script path). Flags that should
-be consumed by `browse-tui` itself must therefore appear *before*
-`--python`. A leading `--` between `SCRIPT` and the recipe args is
-accepted for backward compatibility but no longer required:
+### Auto-detection rules (`--run` and bare positional)
 
-```bash
-# Equivalent — the leading `--` is optional.
-browse-tui --python ./my-recipe.py -- --my-flag value
-browse-tui --python ./my-recipe.py    --my-flag value
+1. If the file's first line is a shebang containing the word `python`
+   (matched at word boundaries — `/opt/cpython/...` does not match),
+   it's run as a Python recipe via `--run-py`. Executable bit is not
+   required: `runpy` runs the file in-process.
+2. Otherwise, if the file is executable, it's `exec`'d via `--run-cli`.
+3. Otherwise — error. Use `chmod +x SCRIPT`, or pass `--run-py` /
+   `--run-cli` explicitly.
 
-# Binary flag goes first; recipe flag goes after the script.
-browse-tui --command-log --python ./my-recipe.py --my-flag value
-```
+### Python recipes (`--run-py`)
+
+The running binary self-injects into `sys.modules['browse_tui']` before
+the recipe executes, so the recipe can `from browse_tui import Browser,
+Item, Action` with no install. `sys.argv` is rewritten to
+`[script, *recipe_args]` and the recipe runs in the same Python process
+as the binary itself.
+
+### Binary recipes (`--run-cli`)
+
+The recipe is `exec`'d, replacing the browse-tui process. Two
+environment knobs are set up first:
+
+* `TUI_BIN` is set to the absolute path of the running binary.
+* The directory containing the binary is prepended to `PATH` so a
+  recipe that calls `browse-tui` by name resolves to *this* build —
+  handy when running from a build tree without installing.
+
+A typical bash recipe uses `${TUI_BIN:-$(command -v browse-tui)}` to
+invoke the binary deterministically.
 
 ### Shebang trick
 
 Recipes can be made directly executable with the env-trick shebang:
 
 ```python
-#!/usr/bin/env -S browse-tui --python
+#!/usr/bin/env -S browse-tui --run-py
 from browse_tui import Browser, Item, Action
 …
 ```
 
 `-S` lets `env` parse multiple args; the kernel runs
-`browse-tui --python /path/to/script ARGS…`. Make the file `chmod +x` and run
-it directly. This is how the shipped `recipes/browse-fs`, `recipes/browse-plan`,
-`recipes/browse-claude` work.
+`browse-tui --run-py /path/to/script ARGS…`. Make the file `chmod +x`
+and run it directly. This is how the shipped `recipes/browse-fs`,
+`recipes/browse-plan`, `recipes/browse-claude`, `recipes/browse-git`,
+`recipes/browse-jira`, and `recipes/browse-procs` work.
 
-When `--python` is set, the data-source flags (`--children-cmd`,
-`--root-cmd`, `--input`, …) are ignored — the recipe owns the Browser.
+In recipe mode the data-source flags (`--children-cmd`, `--root-cmd`,
+`--input`, …) are not accepted on the binary — the recipe is fully in
+charge of how the Browser is configured.
 
 ---
 
@@ -447,11 +486,14 @@ browse-tui --root-cmd 'ls -lA' \
            --input 'match:^(?P<mode>\S+)\s+\d+\s+(?P<owner>\S+)\s+\S+\s+(?P<size>\d+)\s+(?P<date>\S+\s+\S+\s+\S+)\s+(?P<id>.+)$'
 ```
 
-### 6. Run a Python recipe directly
+### 6. Run a recipe directly
 
 ```bash
-browse-tui --python recipes/browse-fs ~
-# or, with the recipe's own shebang:
+# Auto-detect by shebang (Python recipe runs in-process via runpy):
+browse-tui recipes/browse-fs ~
+# Force mode (in-process Python):
+browse-tui --run-py recipes/browse-fs ~
+# Or via the recipe's own shebang:
 ./recipes/browse-fs ~
 ```
 

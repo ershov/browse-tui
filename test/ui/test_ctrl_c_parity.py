@@ -79,7 +79,7 @@ class TestCtrlCParity(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             log = os.path.join(tmp, 'insert.log')
             with TmuxFixture(cols=120, rows=40, env={'INSERT_LOG': log}) as t:
-                t.launch(_BIN, '--python', recipe_path)
+                t.launch(_BIN, '--run-py', recipe_path)
                 t.wait_for('a a')
                 t.send('c')
                 t.wait_for('-- create --')
@@ -106,7 +106,7 @@ class TestCtrlCParity(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             log = os.path.join(tmp, 'pick.log')
             with TmuxFixture(cols=120, rows=40, env={'PICK_LOG': log}) as t:
-                t.launch(_BIN, '--python', recipe_path)
+                t.launch(_BIN, '--run-py', recipe_path)
                 t.wait_for('item one')
                 t.send('s')
                 t.wait_for('Status>')
@@ -134,7 +134,7 @@ class TestCtrlCParity(unittest.TestCase):
                     "show_ids='always')\n"
                     "sys.exit(b.run())\n")
             with TmuxFixture(cols=80, rows=24) as t:
-                t.launch(_BIN, '--python', recipe)
+                t.launch(_BIN, '--run-py', recipe)
                 t.wait_for('a a')
                 t.send('i')
                 t.wait_for('Name:')
@@ -162,7 +162,7 @@ class TestCtrlCParity(unittest.TestCase):
                     "show_ids='always')\n"
                     "sys.exit(b.run())\n")
             with TmuxFixture(cols=80, rows=24) as t:
-                t.launch(_BIN, '--python', recipe)
+                t.launch(_BIN, '--run-py', recipe)
                 t.wait_for('a a')
                 t.send('d')
                 t.wait_for('Sure?')

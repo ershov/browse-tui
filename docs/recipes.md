@@ -4,9 +4,9 @@
 (`browse-fs`, `browse-plan`, `browse-claude`) plus three short bonus
 recipes (`browse-procs`, `browse-git`, `browse-jira`) demonstrating
 additional data-source patterns. Each is a single-file Python script
-with a `#!/usr/bin/env -S browse-tui --python` shebang — make them
+with a `#!/usr/bin/env -S browse-tui --run-py` shebang — make them
 executable and run them directly, or invoke as
-`browse-tui --python recipes/<name>`.
+`browse-tui --run-py recipes/<name>`.
 
 There are also three lightweight **shell-script** recipes
 (`browse-files`, `browse-find`, `browse-ls`) that use the binary's CLI
@@ -310,7 +310,7 @@ A useful recipe is around 30-100 lines. The pattern:
 ### Skeleton
 
 ```python
-#!/usr/bin/env -S browse-tui --python
+#!/usr/bin/env -S browse-tui --run-py
 """my-recipe — short docstring."""
 
 import os
@@ -469,7 +469,7 @@ after terminal teardown so it integrates with shell pipelines.
   press Right to expand and the browser won't fetch grandchildren.
 - **The `tag` field is for short labels** (status, size, count) shown in
   brackets after the title. Use `tag_style` to colour it.
-- **Shebang gotcha:** the `-S` flag in `#!/usr/bin/env -S browse-tui --python`
+- **Shebang gotcha:** the `-S` flag in `#!/usr/bin/env -S browse-tui --run-py`
   is what lets `env` parse multiple args. Without it your shebang only
   resolves the first word. (Linux 4.18+, macOS 10.15+ have `-S`.)
 
@@ -479,5 +479,5 @@ after terminal teardown so it integrates with shell pipelines.
 
 - [docs/api.md](api.md) — full Python API.
 - [docs/cli.md](cli.md) — CLI flags (also runnable from a recipe via
-  `browse-tui --python …`).
+  `browse-tui --run-py …`).
 - [README.md](../README.md) — quickstart.

@@ -26,7 +26,7 @@ class TestChildrenGrid(unittest.TestCase):
     def test_grid_appears_when_cursor_on_branch(self):
         """Cursor on the 'parent' branch reveals its children in the grid."""
         with TmuxFixture(cols=120, rows=40) as t:
-            t.launch(_BIN, '--python', _RECIPE)
+            t.launch(_BIN, '--run-py', _RECIPE)
             t.wait_for('parent parent')
             # The cursor lands on 'parent' (the first row) at startup.
             # The grid pane should populate with a1 and a2 once the
@@ -42,7 +42,7 @@ class TestChildrenGrid(unittest.TestCase):
     def test_grid_hidden_for_leaf(self):
         """Cursor on a leaf hides the grid; the preview takes the space."""
         with TmuxFixture(cols=120, rows=40) as t:
-            t.launch(_BIN, '--python', _RECIPE)
+            t.launch(_BIN, '--run-py', _RECIPE)
             t.wait_for('parent parent')
             t.redraw()
             t.wait_for('a1 [running] alpha', timeout=3.0)
@@ -64,7 +64,7 @@ class TestChildrenGrid(unittest.TestCase):
         on screen and that the tag text 'running' is present.
         """
         with TmuxFixture(cols=120, rows=40) as t:
-            t.launch(_BIN, '--python', _RECIPE)
+            t.launch(_BIN, '--run-py', _RECIPE)
             t.wait_for('parent parent')
             t.redraw()
             t.wait_for('a1 [running] alpha', timeout=3.0)
@@ -83,7 +83,7 @@ class TestChildrenGrid(unittest.TestCase):
     def test_no_children_pane_flag_hides_it(self):
         """``--no-children-pane`` keeps the grid hidden even on a branch."""
         with TmuxFixture(cols=120, rows=40) as t:
-            t.launch(_BIN, '--python', _RECIPE, '--', '--no-children-pane')
+            t.launch(_BIN, '--run-py', _RECIPE, '--no-children-pane')
             t.wait_for('parent parent')
             t.redraw()
             t.wait_stable()

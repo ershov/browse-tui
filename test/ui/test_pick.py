@@ -51,7 +51,7 @@ class TestPick(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             log = os.path.join(tmp, 'pick.log')
             with TmuxFixture(cols=120, rows=40, env={'PICK_LOG': log}) as t:
-                t.launch(_BIN, '--python', _RECIPE)
+                t.launch(_BIN, '--run-py', _RECIPE)
                 t.wait_for('item one')
                 t.send('s')
                 # Wait for the picker prompt to appear on the info bar.
@@ -68,7 +68,7 @@ class TestPick(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             log = os.path.join(tmp, 'pick.log')
             with TmuxFixture(cols=120, rows=40, env={'PICK_LOG': log}) as t:
-                t.launch(_BIN, '--python', _RECIPE)
+                t.launch(_BIN, '--run-py', _RECIPE)
                 t.wait_for('item one')
                 t.send('s')
                 t.wait_for('Status>')
@@ -86,7 +86,7 @@ class TestPick(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             log = os.path.join(tmp, 'pick.log')
             with TmuxFixture(cols=120, rows=40, env={'PICK_LOG': log}) as t:
-                t.launch(_BIN, '--python', _RECIPE)
+                t.launch(_BIN, '--run-py', _RECIPE)
                 t.wait_for('item one')
                 t.send('s')
                 t.wait_for('Status>')
@@ -103,7 +103,7 @@ class TestPick(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             log = os.path.join(tmp, 'pick.log')
             with TmuxFixture(cols=120, rows=40, env={'PICK_LOG': log}) as t:
-                t.launch(_BIN, '--python', _RECIPE)
+                t.launch(_BIN, '--run-py', _RECIPE)
                 t.wait_for('item one')
                 t.send('s')
                 t.wait_for('Status>')

@@ -23,7 +23,7 @@ src-tui/
   050-render.py     3-pane layout, item formatting, search highlight, status bar, _HELP_TEXT
   060-context.py    Context (main-thread-only sub-flows: input/confirm/pick/insert/run_external/page)
   070-actions.py    Action dataclass, default keymap, dispatch_key, _handle_insert_key
-  080-cli.py        argparse, format parsers, --python loader, --install/--uninstall
+  080-cli.py        argparse, format parsers, recipe runners, --install/--uninstall
   090-main.py       entry point: main() → cli.main()
 ```
 
@@ -47,7 +47,7 @@ In practice the layer boundaries are:
 | render   | painting; reads state, never writes                      | no — pure-ish |
 | context  | main-thread sub-flows wrapping Browser                   | no — wraps Browser |
 | actions  | keymap + dispatch                                        | no           |
-| cli      | argparse, parsers, install, --python                     | no           |
+| cli      | argparse, parsers, install, recipe runners                     | no           |
 | main     | thin wrapper; delegates to `cli.main`                    | no           |
 
 ### File sizing (current)

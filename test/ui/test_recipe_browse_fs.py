@@ -4,9 +4,9 @@ Drives the recipe under tmux against a temp directory, verifying that
 entries render and that the background mtime watcher picks up an
 external file creation.
 
-The shebang ``#!/usr/bin/env -S browse-tui --python`` requires the
+The shebang ``#!/usr/bin/env -S browse-tui --run-py`` requires the
 binary to be on PATH, which is fragile in tests; instead we invoke
-``./browse-tui --python recipes/browse-fs -- <tmp>`` directly so the
+``./browse-tui --run-py recipes/browse-fs -- <tmp>`` directly so the
 test is independent of the user's PATH.
 """
 
@@ -43,7 +43,7 @@ class TestBrowseFs(unittest.TestCase):
             with open(os.path.join(tmp, 'b.txt'), 'w') as f:
                 f.write('world')
             with TmuxFixture(cols=120, rows=30) as t:
-                t.launch(_BIN, '--python', _RECIPE, '--', tmp)
+                t.launch(_BIN, '--run-py', _RECIPE, tmp)
                 t.wait_for('a.txt')
                 t.wait_for('b.txt')
                 t.wait_for('sub/')
@@ -55,7 +55,7 @@ class TestBrowseFs(unittest.TestCase):
             with open(os.path.join(tmp, 'one.txt'), 'w') as f:
                 f.write('1')
             with TmuxFixture(cols=120, rows=30) as t:
-                t.launch(_BIN, '--python', _RECIPE, '--', tmp)
+                t.launch(_BIN, '--run-py', _RECIPE, tmp)
                 t.wait_for('one.txt')
                 # The watcher captures its mtime baseline on its first
                 # tick (~1s after start); any dir mutation before then is

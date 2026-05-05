@@ -1,4 +1,4 @@
-#!/usr/bin/env -S browse-tui --python
+#!/usr/bin/env -S browse-tui --run-py
 """browse-claude — Claude Code project / session / message browser.
 
 Lazily walks ``~/.claude/projects/<encoded-path>/<session>.jsonl`` files,

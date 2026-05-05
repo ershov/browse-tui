@@ -7,7 +7,7 @@ Recipes import them directly:
 from browse_tui import Browser, Item, Action
 ```
 
-The same import works whether the recipe is run via `browse-tui --python …`
+The same import works whether the recipe is run via `browse-tui --run-py …`
 (in which case `browse_tui` is the running binary, self-injected at startup)
 or as part of a regular Python project that has the binary on `sys.path`.
 
@@ -655,7 +655,7 @@ stable enough that recipes occasionally use them directly.
 Minimal but full-featured recipe:
 
 ```python
-#!/usr/bin/env -S browse-tui --python
+#!/usr/bin/env -S browse-tui --run-py
 """mini — a 30-line filesystem browser."""
 import os, sys
 from browse_tui import Action, Browser, Item

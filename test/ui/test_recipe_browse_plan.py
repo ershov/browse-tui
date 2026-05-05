@@ -2,7 +2,7 @@
 
 Drives the recipe under tmux against a temporary ``.PLAN.md`` file
 with a known ticket structure. Like the browse-fs tests, we invoke
-``./browse-tui --python recipes/browse-plan`` directly so the tests
+``./browse-tui --run-py recipes/browse-plan`` directly so the tests
 don't depend on having ``browse-tui`` on PATH.
 
 Skipped when ``tmux`` or the ``plan`` binary aren't available.
@@ -55,7 +55,7 @@ class TestBrowsePlan(unittest.TestCase):
             with TmuxFixture(cols=120, rows=30) as t:
                 t.launch(
                     'env', f'PLAN_MD={tmp}/.PLAN.md',
-                    _BIN, '--python', _RECIPE,
+                    _BIN, '--run-py', _RECIPE,
                 )
                 t.wait_for('Project', timeout=5.0)
                 t.wait_for('First task', timeout=5.0)
@@ -70,7 +70,7 @@ class TestBrowsePlan(unittest.TestCase):
             with TmuxFixture(cols=120, rows=30) as t:
                 t.launch(
                     'env', f'PLAN_MD={tmp}/.PLAN.md',
-                    _BIN, '--python', _RECIPE,
+                    _BIN, '--run-py', _RECIPE,
                 )
                 # Move past the synthetic Project entry onto ticket #1.
                 t.wait_for('Solo', timeout=5.0)
@@ -96,7 +96,7 @@ class TestBrowsePlan(unittest.TestCase):
                 t.launch(
                     'bash', '-c',
                     f'env PLAN_MD={tmp}/.PLAN.md '
-                    f'{_BIN} --python {_RECIPE}; echo BPEXIT=$?',
+                    f'{_BIN} --run-py {_RECIPE}; echo BPEXIT=$?',
                 )
                 t.wait_for('Just one', timeout=5.0)
                 t.send('q')

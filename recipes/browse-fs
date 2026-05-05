@@ -1,4 +1,4 @@
-#!/usr/bin/env -S browse-tui --python
+#!/usr/bin/env -S browse-tui --run-py
 """browse-fs — filesystem browser. Lazy os.scandir; preview = file head
 or os.listdir; actions e:Edit ($EDITOR), o:Open (xdg-open), d:Delete
 (with ctx.confirm); background mtime watcher refreshes changed dirs.

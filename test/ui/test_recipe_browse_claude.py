@@ -6,9 +6,9 @@ hermetic we point ``HOME`` at a temp directory pre-populated with a
 fake project / session / messages tree, then drive the recipe under
 tmux and assert that each level renders.
 
-The shebang ``#!/usr/bin/env -S browse-tui --python`` requires the
+The shebang ``#!/usr/bin/env -S browse-tui --run-py`` requires the
 binary to be on PATH, which is fragile in tests; instead we invoke
-``./browse-tui --python recipes/browse-claude`` directly so the tests
+``./browse-tui --run-py recipes/browse-claude`` directly so the tests
 are independent of the user's PATH.
 """
 
@@ -124,7 +124,7 @@ class TestBrowseClaude(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             _make_fake_claude(tmp)
             with TmuxFixture(cols=120, rows=30, env=self._launch_env(tmp)) as t:
-                t.launch(_BIN, '--python', _RECIPE)
+                t.launch(_BIN, '--run-py', _RECIPE)
                 t.wait_for('/home/test/project')
                 t.send('q')
 
@@ -133,7 +133,7 @@ class TestBrowseClaude(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             _make_fake_claude(tmp)
             with TmuxFixture(cols=120, rows=30, env=self._launch_env(tmp)) as t:
-                t.launch(_BIN, '--python', _RECIPE)
+                t.launch(_BIN, '--run-py', _RECIPE)
                 t.wait_for('/home/test/project')
                 t.send('Right')
                 t.wait_for('abcd1234-deadbeef', timeout=3.0)
@@ -144,7 +144,7 @@ class TestBrowseClaude(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             _make_fake_claude(tmp)
             with TmuxFixture(cols=120, rows=30, env=self._launch_env(tmp)) as t:
-                t.launch(_BIN, '--python', _RECIPE)
+                t.launch(_BIN, '--run-py', _RECIPE)
                 t.wait_for('/home/test/project')
                 t.send('Right')
                 t.wait_for('abcd1234-deadbeef')
@@ -166,7 +166,7 @@ class TestBrowseClaude(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             _make_fake_claude(tmp, with_subagents=True)
             with TmuxFixture(cols=140, rows=30, env=self._launch_env(tmp)) as t:
-                t.launch(_BIN, '--python', _RECIPE)
+                t.launch(_BIN, '--run-py', _RECIPE)
                 t.wait_for('/home/test/project')
                 t.send('Right')
                 t.wait_for('abcd1234-deadbeef')
@@ -186,7 +186,7 @@ class TestBrowseClaude(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             _make_fake_claude(tmp, with_subagents=True)
             with TmuxFixture(cols=140, rows=30, env=self._launch_env(tmp)) as t:
-                t.launch(_BIN, '--python', _RECIPE)
+                t.launch(_BIN, '--run-py', _RECIPE)
                 t.wait_for('/home/test/project')
                 t.send('Right')
                 t.wait_for('abcd1234-deadbeef')

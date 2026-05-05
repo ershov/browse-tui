@@ -5,9 +5,9 @@ hermetic we initialise a small temp repo with two commits, ``cd`` into
 it via the tmux fixture's launch line, and assert that the commit
 list and per-commit file lists render.
 
-The shebang ``#!/usr/bin/env -S browse-tui --python`` requires the
+The shebang ``#!/usr/bin/env -S browse-tui --run-py`` requires the
 binary to be on PATH, which is fragile in tests; instead we invoke
-``./browse-tui --python recipes/browse-git`` directly so the tests
+``./browse-tui --run-py recipes/browse-git`` directly so the tests
 are independent of the user's PATH.
 """
 
@@ -73,7 +73,7 @@ class TestBrowseGit(unittest.TestCase):
                 # cd into the repo before launching so git operations
                 # use it as the working tree.
                 t.send_line(f'cd {tmp}')
-                t.launch(_BIN, '--python', _RECIPE)
+                t.launch(_BIN, '--run-py', _RECIPE)
                 t.wait_for('first commit add alpha', timeout=5.0)
                 t.wait_for('second commit add beta', timeout=5.0)
                 t.send('q')
@@ -84,7 +84,7 @@ class TestBrowseGit(unittest.TestCase):
             _make_repo(tmp)
             with TmuxFixture(cols=120, rows=30) as t:
                 t.send_line(f'cd {tmp}')
-                t.launch(_BIN, '--python', _RECIPE)
+                t.launch(_BIN, '--run-py', _RECIPE)
                 t.wait_for('second commit add beta', timeout=5.0)
                 # Cursor starts on the newest commit; expand it.
                 t.send('Right')

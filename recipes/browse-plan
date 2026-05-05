@@ -1,4 +1,4 @@
-#!/usr/bin/env -S browse-tui --python
+#!/usr/bin/env -S browse-tui --run-py
 """browse-plan — drop-in replacement for plan-tui on the browse-tui core.
 
 Targets parity with plan-tui's keybindings: status picker becomes

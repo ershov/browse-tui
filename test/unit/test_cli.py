@@ -1,8 +1,10 @@
-"""Unit tests for ``080-cli.py``: argparser, install/uninstall, --python loader.
+"""Unit tests for ``080-cli.py``: argparser, install/uninstall, recipe runners.
 
-These exercise the CLI surface added in ticket #12. The argparse layer is
-trivial; the real load-bearing parts are the env-var assembly, the
-install dry-run, and the --python self-injection contract.
+These exercise the CLI surface added in ticket #12 plus the recipe
+runners (``--run`` / ``--run-py`` / ``--run-cli`` and the bare-positional
+shorthand). The argparse layer is trivial; the real load-bearing parts
+are the env-var assembly, the install dry-run, the recipe-mode dispatch
+in ``parse_args``, and the ``cmd_run_py`` self-injection contract.
 """
 
 import contextlib
@@ -68,70 +70,145 @@ class TestArgParser(unittest.TestCase):
         self.assertEqual(args.install, 'user')
         self.assertEqual(args.children_cmd, 'ls')
 
-    def test_python_passthrough(self):
-        # ``--`` separates browse-tui args from the recipe's argv.
-        args, extras = _cli.parse_args([
-            '--python', 'recipe.py', '--', '-x', 'arg',
-        ])
-        self.assertEqual(args.python, 'recipe.py')
-        self.assertEqual(extras, ['-x', 'arg'])
-
-    def test_python_passthrough_no_dashes(self):
-        # New contract: everything after ``--python SCRIPT`` becomes the
-        # recipe's argv, no ``--`` separator required.
-        args, extras = _cli.parse_args([
-            '--python', 'recipe.py', '-x', 'arg',
-        ])
-        self.assertEqual(args.python, 'recipe.py')
-        self.assertEqual(extras, ['-x', 'arg'])
-
-    def test_python_passthrough_with_recipe_path_arg(self):
-        # The motivating case: ``browse-tui --python recipes/browse-fs ~/foo``
-        # used to crash because ``~/foo`` was parsed as a binary positional.
-        args, extras = _cli.parse_args([
-            '--python', 'recipes/browse-fs', '/tmp/some/dir',
-        ])
-        self.assertEqual(args.python, 'recipes/browse-fs')
-        self.assertEqual(extras, ['/tmp/some/dir'])
-
-    def test_python_passthrough_recipe_flags_not_consumed(self):
-        # Flag names that overlap with browse-tui's own should reach the
-        # recipe untouched when they appear after --python SCRIPT.
-        args, extras = _cli.parse_args([
-            '--python', 'recipe.py',
-            '--no-preview', '--children-cmd', 'ls',
-        ])
-        # Binary defaults — the recipe owns these flags now.
-        self.assertFalse(args.no_preview)
-        self.assertIsNone(args.children_cmd)
-        self.assertEqual(extras, ['--no-preview', '--children-cmd', 'ls'])
-
-    def test_python_equals_form_passes_args(self):
-        # ``--python=SCRIPT`` is a single token; following args still go
-        # to the recipe.
-        args, extras = _cli.parse_args([
-            '--python=recipe.py', '-x', 'arg',
-        ])
-        self.assertEqual(args.python, 'recipe.py')
-        self.assertEqual(extras, ['-x', 'arg'])
-
-    def test_python_no_args(self):
-        # Bare ``--python SCRIPT`` with nothing after is fine.
-        args, extras = _cli.parse_args(['--python', 'recipe.py'])
-        self.assertEqual(args.python, 'recipe.py')
+    def test_no_run_field_in_tui_mode(self):
+        # In normal TUI mode the namespace still carries run/run_mode
+        # set to None — main()'s recipe gate keys off ``args.run``.
+        args, extras = _cli.parse_args([])
+        self.assertIsNone(args.run)
+        self.assertIsNone(args.run_mode)
         self.assertEqual(extras, [])
 
-    def test_binary_flags_before_python_still_parsed(self):
-        # Flags that come BEFORE --python are owned by the binary as
-        # always; only flags AFTER the script path go to the recipe.
+
+class TestRecipeDispatch(unittest.TestCase):
+    """parse_args recipe-mode rules: bare positional + --run/--run-py/--run-cli."""
+
+    def test_bare_positional_is_auto_run(self):
+        args, extras = _cli.parse_args(['my-recipe', 'arg1', 'arg2'])
+        self.assertEqual(args.run, 'my-recipe')
+        self.assertEqual(args.run_mode, 'auto')
+        self.assertEqual(extras, ['arg1', 'arg2'])
+
+    def test_run_flag_explicit_auto(self):
+        args, extras = _cli.parse_args(['--run', 'my-recipe', 'arg1'])
+        self.assertEqual(args.run, 'my-recipe')
+        self.assertEqual(args.run_mode, 'auto')
+        self.assertEqual(extras, ['arg1'])
+
+    def test_run_py_explicit_python(self):
+        args, extras = _cli.parse_args(['--run-py', 'recipe.py', '-x'])
+        self.assertEqual(args.run, 'recipe.py')
+        self.assertEqual(args.run_mode, 'py')
+        self.assertEqual(extras, ['-x'])
+
+    def test_run_cli_explicit_exec(self):
+        args, extras = _cli.parse_args(['--run-cli', 'recipe.sh', '-x'])
+        self.assertEqual(args.run, 'recipe.sh')
+        self.assertEqual(args.run_mode, 'cli')
+        self.assertEqual(extras, ['-x'])
+
+    def test_run_no_args_after_recipe(self):
+        args, extras = _cli.parse_args(['--run-py', 'recipe.py'])
+        self.assertEqual(args.run, 'recipe.py')
+        self.assertEqual(extras, [])
+
+    def test_recipe_args_are_passed_verbatim(self):
+        # Args that look like browse-tui flags must land in the
+        # recipe's argv, not be parsed by argparse.
         args, extras = _cli.parse_args([
-            '--command-log',
-            '--python', 'recipe.py',
-            '--recipe-flag',
+            '--run', 'my-recipe',
+            '--no-preview', '--children-cmd', 'ls',
         ])
-        self.assertTrue(args.command_log)
-        self.assertEqual(args.python, 'recipe.py')
-        self.assertEqual(extras, ['--recipe-flag'])
+        # No argparse fields populated — namespace doesn't carry them.
+        self.assertFalse(hasattr(args, 'no_preview'))
+        self.assertFalse(hasattr(args, 'children_cmd'))
+        self.assertEqual(extras, ['--no-preview', '--children-cmd', 'ls'])
+
+    def test_run_with_path_like_recipe(self):
+        # The motivating case: ``browse-tui recipes/browse-fs ~/foo``
+        # used to crash because ``~/foo`` was an unknown positional.
+        args, extras = _cli.parse_args([
+            'recipes/browse-fs', '/tmp/some/dir',
+        ])
+        self.assertEqual(args.run, 'recipes/browse-fs')
+        self.assertEqual(extras, ['/tmp/some/dir'])
+
+    def test_flag_before_recipe_path_falls_through_to_argparse(self):
+        # ``browse-tui --children-cmd ls my-recipe`` → argparse sees
+        # ``my-recipe`` as an unknown positional and rejects it. parse_args
+        # itself just builds a normal TUI namespace; argparse's own error
+        # path takes over.
+        with self.assertRaises(SystemExit):
+            with contextlib.redirect_stderr(io.StringIO()):
+                _cli.parse_args(['--children-cmd', 'ls', 'my-recipe'])
+
+    def test_run_flag_without_script_errors(self):
+        # ``--run`` with nothing after errors with exit code 2.
+        with self.assertRaises(SystemExit) as cm:
+            with contextlib.redirect_stderr(io.StringIO()):
+                _cli.parse_args(['--run'])
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_run_flag_with_flag_argument_errors(self):
+        # ``--run --foo`` is a misuse, not a recipe path — error.
+        with self.assertRaises(SystemExit):
+            with contextlib.redirect_stderr(io.StringIO()):
+                _cli.parse_args(['--run', '--foo'])
+
+
+class TestRecipeAutoDetect(unittest.TestCase):
+    """``_detect_recipe_mode`` classifies recipes by shebang + +x bit."""
+
+    def _write(self, content: str, executable: bool):
+        fd, path = tempfile.mkstemp(prefix='recipe_')
+        with os.fdopen(fd, 'w') as f:
+            f.write(content)
+        if executable:
+            os.chmod(path, 0o755)
+        else:
+            os.chmod(path, 0o644)
+        self.addCleanup(os.unlink, path)
+        return path
+
+    def test_python_shebang_classified_as_py(self):
+        path = self._write('#!/usr/bin/env python3\nprint("hi")\n',
+                           executable=False)
+        self.assertEqual(_cli._detect_recipe_mode(path), 'py')
+
+    def test_python_shebang_with_browse_tui_run_py(self):
+        # The recipe-style shebang our shipped recipes use.
+        path = self._write(
+            '#!/usr/bin/env -S browse-tui --run-py\nprint(1)\n',
+            executable=False,
+        )
+        # No literal "python" in the shebang — must classify as cli (or
+        # error if not +x). The shebang chain handles routing through
+        # browse-tui --run-py at the kernel level.
+        # Here we test +x → cli.
+        os.chmod(path, 0o755)
+        self.assertEqual(_cli._detect_recipe_mode(path), 'cli')
+
+    def test_python_word_boundary_avoids_false_positive(self):
+        # ``cpython`` in a path should NOT match — \bpython\b only.
+        path = self._write(
+            '#!/opt/cpython3/bin/foo\nprint(1)\n',
+            executable=True,
+        )
+        self.assertEqual(_cli._detect_recipe_mode(path), 'cli')
+
+    def test_executable_bash_shebang_is_cli(self):
+        path = self._write('#!/bin/bash\necho hi\n', executable=True)
+        self.assertEqual(_cli._detect_recipe_mode(path), 'cli')
+
+    def test_no_shebang_not_executable_is_error(self):
+        path = self._write('print("hi")\n', executable=False)
+        self.assertEqual(_cli._detect_recipe_mode(path), 'error')
+
+    def test_no_shebang_executable_is_cli(self):
+        path = self._write('print("hi")\n', executable=True)
+        self.assertEqual(_cli._detect_recipe_mode(path), 'cli')
+
+    def test_missing_file_is_error(self):
+        self.assertEqual(_cli._detect_recipe_mode('/nope/missing'), 'error')
 
 
 class TestRecordSepDecoding(unittest.TestCase):
@@ -337,8 +414,8 @@ class TestHelpOutput(unittest.TestCase):
         self.assertIn('Quit', proc.stdout)
 
 
-class TestPythonLoader(unittest.TestCase):
-    """``cmd_python`` self-injects the module as ``browse_tui`` and runs the script."""
+class TestRunPyLoader(unittest.TestCase):
+    """``cmd_run_py`` self-injects the module as ``browse_tui`` and runs the script."""
 
     def test_self_injection(self):
         # The recipe script imports ``browse_tui`` and pokes a marker.
@@ -349,7 +426,7 @@ class TestPythonLoader(unittest.TestCase):
             f.write('browse_tui._test_marker = "OK"\n')
             script = f.name
         try:
-            # ``cmd_python`` does ``sys.modules['browse_tui'] = sys.modules[__name__]``;
+            # ``cmd_run_py`` does ``sys.modules['browse_tui'] = sys.modules[__name__]``;
             # _loader.py doesn't register the module in ``sys.modules`` so we
             # do it here to mirror the runtime invariant (in the concatenated
             # build, ``__name__`` is ``'__main__'`` which is always present).
@@ -358,7 +435,7 @@ class TestPythonLoader(unittest.TestCase):
             saved_self = sys.modules.get(_cli.__name__)
             sys.modules[_cli.__name__] = _cli
             try:
-                rc = _cli.cmd_python(script, [], version='0.1.0')
+                rc = _cli.cmd_run_py(script, [], version='0.1.0')
             finally:
                 sys.argv[:] = saved_argv
                 if saved_browse is None:

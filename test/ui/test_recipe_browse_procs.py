@@ -6,9 +6,9 @@ fixture setup. We just launch under tmux and assert that the root
 process (PID 1) renders, plus that the preview pane shows the expected
 ``/proc/1/status`` snippet.
 
-The shebang ``#!/usr/bin/env -S browse-tui --python`` requires the
+The shebang ``#!/usr/bin/env -S browse-tui --run-py`` requires the
 binary to be on PATH, which is fragile in tests; instead we invoke
-``./browse-tui --python recipes/browse-procs`` directly so the tests
+``./browse-tui --run-py recipes/browse-procs`` directly so the tests
 are independent of the user's PATH.
 """
 
@@ -41,7 +41,7 @@ class TestBrowseProcs(unittest.TestCase):
     def test_lists_root_process(self):
         """Top-level renders PID 1 and quits cleanly."""
         with TmuxFixture(cols=120, rows=30) as t:
-            t.launch(_BIN, '--python', _RECIPE)
+            t.launch(_BIN, '--run-py', _RECIPE)
             # PID 1 always exists on Linux. ``pid=1`` is in the tag we
             # render for every row, so it's a uniquely cheap match.
             t.wait_for('pid=1', timeout=5.0)
@@ -50,7 +50,7 @@ class TestBrowseProcs(unittest.TestCase):
     def test_preview_shows_proc_status(self):
         """The preview pane renders /proc/<pid>/status content."""
         with TmuxFixture(cols=120, rows=30) as t:
-            t.launch(_BIN, '--python', _RECIPE)
+            t.launch(_BIN, '--run-py', _RECIPE)
             t.wait_for('pid=1', timeout=5.0)
             # /proc/<pid>/status always begins with a ``Name:`` line —
             # the cheapest signal that the preview worker fired.

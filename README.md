@@ -49,7 +49,7 @@ inherited unchanged.
 ### Python recipe — same idea, full API:
 
 ```python
-#!/usr/bin/env -S browse-tui --python
+#!/usr/bin/env -S browse-tui --run-py
 import os
 from browse_tui import Browser, Item, Action
 

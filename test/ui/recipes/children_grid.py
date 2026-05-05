@@ -12,7 +12,7 @@ populate with ``a1`` and ``a2`` (and a tag in green for ``a1``).
 When the cursor lands on ``leaf`` the grid should disappear.
 
 Usage:
-    browse-tui --python children_grid.py
+    browse-tui --run-py children_grid.py
 """
 
 import sys
