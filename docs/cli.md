@@ -415,6 +415,15 @@ Recipes can override any of these via `--action` (CLI) or
 In **search mode** (after `/`), every printable key extends the query and the
 cursor jumps to the nearest match in real time. Backspace trims; Esc cancels.
 
+**Mouse:** when running in a terminal that supports SGR mouse reporting,
+left-click on a list row positions the cursor there. The wheel scrolls
+the pane under the mouse: 3 lines per notch on the list (cursor stays
+put — viewport-decoupled), or on the preview pane (same channel as
+Shift-Up / Shift-Down). The next cursor-moving key snaps the list
+viewport so the cursor is visible again. Click on the preview while the
+help screen is up dismisses it. Mouse events are ignored in search /
+insert / picker modes.
+
 ---
 
 ## Environment variables

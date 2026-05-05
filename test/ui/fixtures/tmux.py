@@ -79,6 +79,17 @@ class TmuxFixture:
         """Send raw bytes (for Ctrl-codes)."""
         self.tmux('send-keys', '-t', 'main', raw)
 
+    def send_literal_bytes(self, raw):
+        """Send a multi-byte escape sequence verbatim.
+
+        ``send-keys`` without ``-l`` does key-name lookup, which mangles
+        sequences containing printable characters (e.g. SGR mouse). The
+        ``-l`` flag bypasses lookup and sends literal UTF-8 bytes —
+        required for injecting raw VT100 / SGR sequences into the
+        program under test.
+        """
+        self.tmux('send-keys', '-l', '-t', 'main', raw)
+
     def type(self, text):
         """Send literal text without translating special key names."""
         self.tmux('send-keys', '-l', '-t', 'main', text)

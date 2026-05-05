@@ -837,5 +837,340 @@ class TestPageSizesTrackTerminalHeight(unittest.TestCase):
             b.stop_workers()
 
 
+# --- ticket #117: mouse support ------------------------------------------
+
+
+class TestMouseDispatch(unittest.TestCase):
+    """Mouse click + wheel events route to the pane under the cursor.
+
+    The terminal layer decodes SGR sequences to ``mouse-click:R:C`` /
+    ``scroll-up:R:C`` / ``scroll-down:R:C`` strings; the dispatcher
+    parses those and looks up the pane via ``layout_panes``. These
+    tests patch ``term_size`` + ``layout_panes`` onto ``_actions`` to
+    control the geometry, then drive ``dispatch_key`` directly.
+    """
+
+    def _patch_term(self, cols, rows):
+        prev_ts = getattr(_actions, 'term_size', None)
+        prev_lp = getattr(_actions, 'layout_panes', None)
+        _actions.term_size = lambda: (cols, rows)
+        _actions.layout_panes = _render.layout_panes
+
+        def restore():
+            if prev_ts is None:
+                if hasattr(_actions, 'term_size'):
+                    del _actions.term_size
+            else:
+                _actions.term_size = prev_ts
+            if prev_lp is None:
+                if hasattr(_actions, 'layout_panes'):
+                    del _actions.layout_panes
+            else:
+                _actions.layout_panes = prev_lp
+
+        return restore
+
+    def _browser_with_n_items(self, n):
+        b = _make_browser()
+        b._state._children[None] = [Item(id=f'I{i}') for i in range(n)]
+        return b
+
+    # ---- click ----------------------------------------------------------
+
+    def test_click_on_list_row_moves_cursor(self):
+        b = self._browser_with_n_items(10)
+        restore = self._patch_term(80, 40)
+        try:
+            ctx = _ctx_for(b)
+            layout = _render.layout_panes(80, 40, show_preview=True,
+                                          show_children_pane=True)
+            # Click on the third row of the list (list_top + 2).
+            target_row = layout['list_top'] + 2
+            dispatch_key(b, ctx, f'mouse-click:{target_row}:5')
+            self.assertEqual(b._state.cursor, 2)
+        finally:
+            restore()
+            b.stop_workers()
+
+    def test_click_respects_list_scroll(self):
+        """Click row reflects scroll offset: clicking row 1 with scroll=4 → idx 4."""
+        b = self._browser_with_n_items(20)
+        restore = self._patch_term(80, 40)
+        try:
+            b._list_scroll = 4
+            ctx = _ctx_for(b)
+            layout = _render.layout_panes(80, 40, show_preview=True,
+                                          show_children_pane=True)
+            target_row = layout['list_top']  # first visible row
+            dispatch_key(b, ctx, f'mouse-click:{target_row}:5')
+            self.assertEqual(b._state.cursor, 4)
+        finally:
+            restore()
+            b.stop_workers()
+
+    def test_click_past_end_is_noop(self):
+        """Click on a row beyond the visible items leaves cursor unchanged."""
+        b = self._browser_with_n_items(3)
+        restore = self._patch_term(80, 40)
+        try:
+            b._state.cursor = 1
+            ctx = _ctx_for(b)
+            layout = _render.layout_panes(80, 40, show_preview=True,
+                                          show_children_pane=True)
+            # Click well past the end.
+            dispatch_key(b, ctx, f'mouse-click:{layout["list_top"] + 8}:5')
+            self.assertEqual(b._state.cursor, 1)
+        finally:
+            restore()
+            b.stop_workers()
+
+    def test_click_on_preview_dismisses_help_mode(self):
+        b = self._browser_with_n_items(3)
+        restore = self._patch_term(80, 40)
+        try:
+            b._help_mode = True
+            ctx = _ctx_for(b)
+            layout = _render.layout_panes(80, 40, show_preview=True,
+                                          show_children_pane=True)
+            target_row = layout['prev_top'] + 2  # inside preview content
+            dispatch_key(b, ctx, f'mouse-click:{target_row}:5')
+            self.assertFalse(b._help_mode)
+        finally:
+            restore()
+            b.stop_workers()
+
+    def test_click_on_separator_is_noop(self):
+        b = self._browser_with_n_items(3)
+        restore = self._patch_term(80, 40)
+        try:
+            ctx = _ctx_for(b)
+            layout = _render.layout_panes(80, 40, show_preview=True,
+                                          show_children_pane=False)
+            cursor_before = b._state.cursor
+            scroll_before = b._list_scroll
+            # Preview separator row (sub_height==0 → info_row == prev_top).
+            dispatch_key(b, ctx, f'mouse-click:{layout["prev_top"]}:5')
+            self.assertEqual(b._state.cursor, cursor_before)
+            self.assertEqual(b._list_scroll, scroll_before)
+        finally:
+            restore()
+            b.stop_workers()
+
+    # ---- wheel: list pane ----------------------------------------------
+
+    def test_wheel_down_on_list_advances_scroll_not_cursor(self):
+        b = self._browser_with_n_items(50)
+        restore = self._patch_term(80, 40)
+        try:
+            ctx = _ctx_for(b)
+            layout = _render.layout_panes(80, 40, show_preview=True,
+                                          show_children_pane=True)
+            cursor_before = b._state.cursor
+            target_row = layout['list_top'] + 2
+            dispatch_key(b, ctx, f'scroll-down:{target_row}:5')
+            self.assertEqual(b._list_scroll, 3)
+            self.assertEqual(b._state.cursor, cursor_before)
+        finally:
+            restore()
+            b.stop_workers()
+
+    def test_wheel_up_on_list_decreases_scroll(self):
+        b = self._browser_with_n_items(50)
+        restore = self._patch_term(80, 40)
+        try:
+            b._list_scroll = 10
+            ctx = _ctx_for(b)
+            layout = _render.layout_panes(80, 40, show_preview=True,
+                                          show_children_pane=True)
+            target_row = layout['list_top'] + 2
+            dispatch_key(b, ctx, f'scroll-up:{target_row}:5')
+            self.assertEqual(b._list_scroll, 7)
+        finally:
+            restore()
+            b.stop_workers()
+
+    def test_wheel_up_on_list_clamps_at_zero(self):
+        b = self._browser_with_n_items(50)
+        restore = self._patch_term(80, 40)
+        try:
+            b._list_scroll = 1
+            ctx = _ctx_for(b)
+            layout = _render.layout_panes(80, 40, show_preview=True,
+                                          show_children_pane=True)
+            target_row = layout['list_top'] + 2
+            dispatch_key(b, ctx, f'scroll-up:{target_row}:5')
+            self.assertEqual(b._list_scroll, 0)
+        finally:
+            restore()
+            b.stop_workers()
+
+    # ---- wheel: preview pane -------------------------------------------
+
+    def test_wheel_down_on_preview_advances_preview_scroll(self):
+        b = self._browser_with_n_items(3)
+        restore = self._patch_term(80, 40)
+        try:
+            ctx = _ctx_for(b)
+            layout = _render.layout_panes(80, 40, show_preview=True,
+                                          show_children_pane=True)
+            target_row = layout['prev_top'] + 2
+            dispatch_key(b, ctx, f'scroll-down:{target_row}:5')
+            self.assertEqual(b._preview_scroll, 3)
+        finally:
+            restore()
+            b.stop_workers()
+
+    def test_wheel_up_on_preview_clamps_at_zero(self):
+        b = self._browser_with_n_items(3)
+        restore = self._patch_term(80, 40)
+        try:
+            b._preview_scroll = 1
+            ctx = _ctx_for(b)
+            layout = _render.layout_panes(80, 40, show_preview=True,
+                                          show_children_pane=True)
+            target_row = layout['prev_top'] + 2
+            dispatch_key(b, ctx, f'scroll-up:{target_row}:5')
+            self.assertEqual(b._preview_scroll, 0)
+        finally:
+            restore()
+            b.stop_workers()
+
+    def test_wheel_on_list_does_not_touch_preview_scroll(self):
+        b = self._browser_with_n_items(50)
+        restore = self._patch_term(80, 40)
+        try:
+            b._preview_scroll = 5
+            ctx = _ctx_for(b)
+            layout = _render.layout_panes(80, 40, show_preview=True,
+                                          show_children_pane=True)
+            dispatch_key(b, ctx, f'scroll-down:{layout["list_top"]}:5')
+            self.assertEqual(b._preview_scroll, 5)
+        finally:
+            restore()
+            b.stop_workers()
+
+    # ---- modal-state interactions --------------------------------------
+
+    def test_search_mode_swallows_mouse_events(self):
+        """Mouse click in search mode does not extend the query, does not move cursor."""
+        b = self._browser_with_n_items(10)
+        restore = self._patch_term(80, 40)
+        try:
+            b._search_mode = True
+            b._search_query = 'foo'
+            ctx = _ctx_for(b)
+            layout = _render.layout_panes(80, 40, show_preview=True,
+                                          show_children_pane=True)
+            cursor_before = b._state.cursor
+            dispatch_key(b, ctx, f'mouse-click:{layout["list_top"] + 3}:5')
+            self.assertEqual(b._search_query, 'foo')
+            self.assertEqual(b._state.cursor, cursor_before)
+        finally:
+            restore()
+            b.stop_workers()
+
+    # ---- headless / unwired fallback -----------------------------------
+
+    def test_headless_no_term_size_is_noop(self):
+        """Without term_size patched, mouse events fall through cleanly."""
+        b = self._browser_with_n_items(10)
+        # Ensure term_size is not on _actions.
+        prev_ts = getattr(_actions, 'term_size', None)
+        if prev_ts is not None:
+            del _actions.term_size
+        try:
+            ctx = _ctx_for(b)
+            cursor_before = b._state.cursor
+            scroll_before = b._list_scroll
+            dispatch_key(b, ctx, 'mouse-click:5:5')
+            dispatch_key(b, ctx, 'scroll-down:5:5')
+            self.assertEqual(b._state.cursor, cursor_before)
+            self.assertEqual(b._list_scroll, scroll_before)
+        finally:
+            if prev_ts is not None:
+                _actions.term_size = prev_ts
+            b.stop_workers()
+
+
+class TestListScrollDecoupledFromCursor(unittest.TestCase):
+    """``_list_scroll`` is independent of ``state.cursor`` after a wheel scroll.
+
+    Pre-fix, ``render_list`` auto-snapped the scroll offset to keep the
+    cursor on screen, which fought wheel-scroll. Post-fix, the renderer
+    only bounds-clamps; the cursor-on-screen guarantee fires from
+    ``Browser._snap_list_scroll_to_row`` driven by the main loop.
+    """
+
+    def _browser_with_n_items(self, n):
+        b = _make_browser()
+        b._state._children[None] = [Item(id=f'I{i}') for i in range(n)]
+        return b
+
+    def test_snap_to_row_below_viewport_advances_scroll(self):
+        b = self._browser_with_n_items(50)
+        # Patch term_size onto _state so the helper can resolve height.
+        _state.term_size = lambda: (80, 40)
+        _state.layout_panes = _render.layout_panes
+        try:
+            b._list_scroll = 0
+            b._snap_list_scroll_to_row(35)
+            self.assertGreater(b._list_scroll, 0)
+            self.assertLessEqual(b._list_scroll, 35)
+        finally:
+            del _state.term_size
+            del _state.layout_panes
+            b.stop_workers()
+
+    def test_snap_to_row_above_viewport_rewinds_scroll(self):
+        b = self._browser_with_n_items(50)
+        _state.term_size = lambda: (80, 40)
+        _state.layout_panes = _render.layout_panes
+        try:
+            b._list_scroll = 30
+            b._snap_list_scroll_to_row(2)
+            self.assertEqual(b._list_scroll, 2)
+        finally:
+            del _state.term_size
+            del _state.layout_panes
+            b.stop_workers()
+
+    def test_snap_no_change_when_row_already_visible(self):
+        b = self._browser_with_n_items(50)
+        _state.term_size = lambda: (80, 40)
+        _state.layout_panes = _render.layout_panes
+        try:
+            b._list_scroll = 5
+            scroll_before = b._list_scroll
+            b._snap_list_scroll_to_row(7)  # within [5, 5+list_height)
+            self.assertEqual(b._list_scroll, scroll_before)
+        finally:
+            del _state.term_size
+            del _state.layout_panes
+            b.stop_workers()
+
+    def test_snap_headless_is_noop(self):
+        """No term_size wired → snap silently does nothing."""
+        b = self._browser_with_n_items(50)
+        b._list_scroll = 10
+        b._snap_list_scroll_to_row(0)
+        # Without term_size, height is 0 → snap returns early.
+        self.assertEqual(b._list_scroll, 10)
+        b.stop_workers()
+
+    def test_active_list_row_normal_mode_returns_cursor(self):
+        b = self._browser_with_n_items(5)
+        b._state.cursor = 3
+        self.assertEqual(b._active_list_row(), 3)
+        b.stop_workers()
+
+    def test_active_list_row_insert_mode_returns_insert_pos(self):
+        b = self._browser_with_n_items(5)
+        b._insert_mode = True
+        b._insert_pos = 2
+        b._state.cursor = 4
+        self.assertEqual(b._active_list_row(), 2)
+        b.stop_workers()
+
+
 if __name__ == '__main__':
     unittest.main()

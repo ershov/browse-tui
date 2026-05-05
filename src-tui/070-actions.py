@@ -667,6 +667,18 @@ def dispatch_key(browser, ctx: 'Context', key: str) -> bool:
     caller (main loop in #13) uses the return to decide whether to log
     the key or pass it through to a fallback.
     """
+    # Mouse events (clicks + wheel) are dispatched first when not in
+    # search mode. ``_dispatch_mouse`` parses the row/col, looks up the
+    # pane via ``layout_panes``, and applies the per-pane behaviour.
+    # Search mode silently swallows mouse events along with other
+    # unhandled keys (the multi-char ``mouse-click:R:C`` form bypasses
+    # the printable-char branch of the search-mode handler).
+    if not browser._search_mode and (
+            key.startswith('mouse-click:')
+            or key.startswith('scroll-up:')
+            or key.startswith('scroll-down:')):
+        return _dispatch_mouse(browser, ctx, key)
+
     # Search-mode special handling.
     #
     # Esc clears the query and exits search mode (matches plan-tui — the
@@ -954,6 +966,134 @@ def _preview_pane_height(browser):
         return h if h > 0 else _DEFAULT_PAGE_ROWS
     except Exception:
         return _DEFAULT_PAGE_ROWS
+
+
+# ---- mouse dispatch -------------------------------------------------------
+#
+# read_key() (020-terminal.py) decodes SGR mouse sequences to:
+#
+#   * 'mouse-click:R:C' — left-button press at 1-based (row, col)
+#   * 'scroll-up:R:C'   — wheel notch up
+#   * 'scroll-down:R:C' — wheel notch down
+#
+# We dispatch these to the pane under (R, C):
+#
+#   * Click on list pane    → set state.cursor to that row.
+#   * Click on preview pane → dismiss help mode if active, else no-op.
+#   * Click elsewhere       → no-op.
+#   * Wheel on list pane    → ±_WHEEL_LINES on _list_scroll. Cursor
+#                             unchanged (decoupled from the viewport).
+#   * Wheel on preview pane → ±_WHEEL_LINES on _preview_scroll.
+#   * Wheel elsewhere       → no-op.
+#
+# In modal modes we do nothing: search-mode swallows all unhandled keys,
+# insert-mode runs in _handle_insert_key (and silently ignores what it
+# doesn't recognize), pickers in _pick_on_info_bar swallow unknowns. So
+# this dispatcher only fires from the normal-mode branch of dispatch_key.
+
+_WHEEL_LINES = 3
+
+
+def _dispatch_mouse(browser, ctx, key):
+    """Route a mouse event ``key`` to the pane it lands on.
+
+    Always returns ``True`` (the event has been consumed). Malformed
+    payloads, or contexts where the pane geometry can't be resolved
+    (headless tests without ``term_size``/``layout_panes`` injected),
+    silently no-op rather than raising.
+    """
+    parts = key.split(':')
+    if len(parts) != 3:
+        return True
+    kind = parts[0]
+    try:
+        row = int(parts[1])
+    except ValueError:
+        return True
+
+    ts = globals().get('term_size')
+    lp = globals().get('layout_panes')
+    if ts is None or lp is None:
+        return True
+    try:
+        cols, rows_total = ts()
+    except Exception:
+        return True
+    layout = lp(
+        cols, rows_total,
+        show_preview=browser.show_preview,
+        show_children_pane=browser.show_children_pane,
+    )
+    pane = _pane_at(layout, row)
+
+    if kind == 'mouse-click':
+        if pane == 'list':
+            _click_list_row(browser, layout, row)
+        elif pane == 'preview':
+            if browser._help_mode:
+                browser._help_mode = False
+                browser._needs_redraw.add('preview')
+        # children grid / info row / separator → no-op
+        return True
+    if kind in ('scroll-up', 'scroll-down'):
+        delta = -_WHEEL_LINES if kind == 'scroll-up' else _WHEEL_LINES
+        if pane == 'list':
+            _scroll_list(browser, delta)
+        elif pane == 'preview':
+            _scroll_preview(browser, delta)
+        return True
+    return True
+
+
+def _pane_at(layout, row):
+    """Return ``'list'``, ``'children'``, ``'preview'``, or ``None`` for ``row``.
+
+    The separator rows themselves (info row, preview separator) return
+    ``None`` — clicks on dividers are deliberately no-ops.
+    """
+    list_top = layout['list_top']
+    list_height = layout['list_height']
+    sub_top = layout['sub_top']
+    sub_height = layout['sub_height']
+    prev_top = layout['prev_top']
+    prev_height = layout['prev_height']
+
+    if list_top <= row < list_top + list_height:
+        return 'list'
+    if sub_height > 0 and sub_top + 1 <= row < sub_top + sub_height:
+        return 'children'
+    if prev_height > 0 and prev_top + 1 <= row < prev_top + prev_height:
+        return 'preview'
+    return None
+
+
+def _click_list_row(browser, layout, row):
+    """Move ``state.cursor`` to the visible-list row at terminal ``row``."""
+    state = browser._state
+    visible = visible_items(state)
+    new_idx = browser._list_scroll + (row - layout['list_top'])
+    if 0 <= new_idx < len(visible) and state.cursor != new_idx:
+        state.cursor = new_idx
+        browser._needs_redraw.add('list')
+
+
+def _scroll_list(browser, delta):
+    """Adjust ``_list_scroll`` by ``delta`` rows. Cursor unchanged."""
+    state = browser._state
+    visible = visible_items(state)
+    soft_max = max(0, len(visible) - 1)
+    new_scroll = max(0, min(browser._list_scroll + delta, soft_max))
+    if new_scroll != browser._list_scroll:
+        browser._list_scroll = new_scroll
+        browser._needs_redraw.add('list')
+
+
+def _scroll_preview(browser, delta):
+    """Adjust ``_preview_scroll`` by ``delta`` rows (mirrors shift-up/-down)."""
+    new_scroll = max(0, browser._preview_scroll + delta)
+    if new_scroll != browser._preview_scroll:
+        browser._preview_scroll = new_scroll
+        browser._needs_redraw.add('preview')
 
 
 def _handle_enter(browser, ctx) -> bool:

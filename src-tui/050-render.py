@@ -634,14 +634,14 @@ def render_list(browser, top, height, cols):
         visible.insert(pos, marker_entry)
         cursor_pos = pos
 
-    # Adjust scroll offset to keep the cursor on-screen.
-    scroll = browser._list_scroll
-    if cursor_pos < scroll:
-        scroll = cursor_pos
-    if cursor_pos >= scroll + height:
-        scroll = cursor_pos - height + 1
-    if scroll < 0:
-        scroll = 0
+    # Bounds-clamp the scroll offset against the list extent. The
+    # cursor-on-screen guarantee lives separately in
+    # ``Browser._snap_list_scroll_to_row``, called from the main loop
+    # whenever a key changes the active row — keeping the renderer
+    # passive lets wheel-scroll move the viewport past the cursor
+    # without it snapping back on the next paint.
+    max_scroll = max(0, len(visible) - height)
+    scroll = max(0, min(browser._list_scroll, max_scroll))
     browser._list_scroll = scroll
 
     # base_depth: the scope-root row sits at depth 0 by construction

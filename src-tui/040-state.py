@@ -1420,10 +1420,21 @@ class Browser:
                 # the most-special branch (placement marker movement),
                 # then search-mode + normal-mode dispatch live in
                 # dispatch_key.
+                #
+                # Snapshot the active list row before dispatch so we
+                # can snap the viewport back to follow the cursor when
+                # a key actually moved it. Wheel-scroll handlers leave
+                # the cursor alone, so the comparison is False and
+                # ``_list_scroll`` keeps the user's scrolled position.
+                prev_row = self._active_list_row()
+                prev_insert = self._insert_mode
                 if self._insert_mode:
                     _handle_insert_key(self, ctx, key)
                 else:
                     dispatch_key(self, ctx, key)
+                new_row = self._active_list_row()
+                if prev_insert != self._insert_mode or new_row != prev_row:
+                    self._snap_list_scroll_to_row(new_row)
 
                 # Trigger preview + children fetches for the (possibly
                 # moved) cursor before the next render pass. The
@@ -1480,6 +1491,65 @@ class Browser:
             return
         if new_id != self._preview_req:
             self.request_preview(new_id)
+
+    def _list_pane_height_safe(self) -> int:
+        """Return the list pane's height, or 0 if it can't be determined.
+
+        Mirrors ``_list_pane_height`` in 070-actions.py but lives here
+        so it can be called from state-layer methods without crossing
+        the module boundary. Falls back to 0 when ``term_size`` /
+        ``layout_panes`` aren't available (headless tests, no tty); the
+        snap helper treats 0 as "give up gracefully."
+        """
+        try:
+            ts = globals().get('term_size')
+            lp = globals().get('layout_panes')
+            if ts is None or lp is None:
+                return 0
+            cols, rows = ts()
+            layout = lp(
+                cols, rows,
+                show_preview=self.show_preview,
+                show_children_pane=self.show_children_pane,
+            )
+            h = layout.get('list_height', 0)
+            return h if h > 0 else 0
+        except Exception:
+            return 0
+
+    def _snap_list_scroll_to_row(self, row: int) -> None:
+        """Adjust ``_list_scroll`` so visible-list ``row`` is on-screen.
+
+        Called from the main loop whenever a key changes the active row
+        (cursor in normal mode, ``_insert_pos`` in insert mode). Wheel
+        scrolling does *not* call this — that's the whole point of the
+        decoupling: a wheel scroll can move the viewport past the
+        cursor and the next render keeps it there. The renderer's
+        bounds-only clamp prevents nonsense (negative or past-end)
+        offsets, but doesn't drag scroll back to the cursor.
+        """
+        height = self._list_pane_height_safe()
+        if height <= 0:
+            return
+        if row < self._list_scroll:
+            self._list_scroll = max(0, row)
+            self._needs_redraw.add('list')
+        elif row >= self._list_scroll + height:
+            self._list_scroll = max(0, row - height + 1)
+            self._needs_redraw.add('list')
+
+    def _active_list_row(self) -> int:
+        """Return the row currently considered the 'cursor' on-screen.
+
+        In insert mode the marker (``_insert_pos``) is what the user
+        controls and what we want to keep visible. Outside insert mode
+        it's ``state.cursor``. The main loop uses this to detect
+        active-row changes after a dispatched key and call
+        ``_snap_list_scroll_to_row`` accordingly.
+        """
+        if self._insert_mode:
+            return self._insert_pos
+        return self._state.cursor
 
     def _update_children_for_cursor(self) -> None:
         """Kick a children fetch for the cursor item if it's an unfetched branch.
