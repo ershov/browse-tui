@@ -1,0 +1,340 @@
+#!/usr/bin/env -S browse-tui --run-py
+"""browse-jira-mcp — Jira tickets via the Atlassian MCP server.
+
+Lists tickets matching a JQL query. With no argument the default is
+``assignee = currentUser() AND statusCategory != Done`` (open tickets
+assigned to the current user). Pass any JQL string as a positional
+argument to override:
+
+    ./browse-jira-mcp                                   # default: my open tickets
+    ./browse-jira-mcp 'project = WT AND status = Open'  # custom JQL
+
+Each ticket is an Item; the ``tag`` is the status; preview is the
+issue detail fetched via the MCP ``jira_get_issue`` tool.
+
+Talks to the ``mcp-atlassian`` MCP server over stdio (JSON-RPC). The
+server is launched on demand via ``uvx mcp-atlassian`` and kept alive
+for the life of the session so subsequent tool calls reuse the same
+process. Credentials are read from the environment:
+
+    JIRA_URL          e.g. https://jira.example.com/
+    JIRA_USERNAME     e.g. you@example.com
+    JIRA_API_TOKEN    Atlassian API token
+
+If any of those are unset, or if the server fails to start / authenticate,
+the recipe shows a single friendly error item rather than crashing.
+
+Demonstrates: a long-lived helper subprocess speaking JSON-RPC behind
+``get_children`` / ``get_preview``, lazy preview fetching, and an
+``o:Open`` custom action that punts to ``$BROWSER`` / ``xdg-open``.
+"""
+
+import atexit
+import json
+import os
+import shutil
+import subprocess
+import sys
+import threading
+
+from browse_tui import Action, Browser, Item
+
+
+_ERROR_ID = '__error__'
+
+_REQUIRED_ENV = ('JIRA_URL', 'JIRA_USERNAME', 'JIRA_API_TOKEN')
+
+_MCP_CMD = ['uvx', 'mcp-atlassian@v0.21.1']
+
+_JQL_DEFAULT = 'assignee = currentUser() AND statusCategory != Done'
+
+
+def _resolve_jql():
+    """Return the JQL to query. argv[1] overrides the default.
+
+    Flag-shaped argv (``-h``, ``--help``) is left for Browser.run() to
+    auto-detect; treating it as JQL would put ``-h`` into the help
+    intro and confuse the user reading their own help text.
+    """
+    if len(sys.argv) > 1 and sys.argv[1].strip() and not sys.argv[1].startswith('-'):
+        return sys.argv[1]
+    return _JQL_DEFAULT
+
+
+def _err(msg):
+    return [Item(id=_ERROR_ID, title=msg, tag='err', tag_style='red')]
+
+
+class _MCPClient:
+    """Minimal MCP stdio JSON-RPC client.
+
+    Spawns the server lazily on first use, performs the ``initialize``
+    handshake, then exposes ``call_tool``. Not thread-safe by design —
+    browse-tui calls ``get_children`` / ``get_preview`` from one thread
+    so a single lock around request/response is enough.
+    """
+
+    def __init__(self, cmd, env):
+        self._cmd = cmd
+        self._env = env
+        self._proc = None
+        self._lock = threading.Lock()
+        self._next_id = 0
+        self._init_error = None
+
+    def _ensure_started(self):
+        if self._proc is not None or self._init_error is not None:
+            return
+        if not shutil.which(self._cmd[0]):
+            self._init_error = f'{self._cmd[0]!r} not found on PATH'
+            return
+        try:
+            self._proc = subprocess.Popen(
+                self._cmd,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env={**os.environ, **self._env},
+                text=True, bufsize=1)
+        except OSError as e:
+            self._init_error = f'failed to start MCP server: {e}'
+            return
+        atexit.register(self.close)
+        try:
+            self._request('initialize', {
+                'protocolVersion': '2024-11-05',
+                'capabilities': {},
+                'clientInfo': {'name': 'browse-jira-mcp', 'version': '1.0'},
+            })
+            self._notify('notifications/initialized', {})
+        except Exception as e:
+            self._init_error = f'MCP initialize failed: {e}'
+
+    def _send(self, msg):
+        self._proc.stdin.write(json.dumps(msg) + '\n')
+        self._proc.stdin.flush()
+
+    def _read_response(self, expected_id):
+        # The server may emit log/notification messages; skip until we
+        # find the response with the matching id.
+        while True:
+            line = self._proc.stdout.readline()
+            if not line:
+                raise RuntimeError('MCP server closed stdout')
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if msg.get('id') == expected_id:
+                return msg
+
+    def _request(self, method, params):
+        self._next_id += 1
+        rid = self._next_id
+        self._send({'jsonrpc': '2.0', 'id': rid,
+                    'method': method, 'params': params})
+        msg = self._read_response(rid)
+        if 'error' in msg:
+            err = msg['error']
+            raise RuntimeError(f"{err.get('code')}: {err.get('message')}")
+        return msg.get('result')
+
+    def _notify(self, method, params):
+        self._send({'jsonrpc': '2.0', 'method': method, 'params': params})
+
+    def call_tool(self, name, arguments, timeout=30):
+        with self._lock:
+            self._ensure_started()
+            if self._init_error:
+                raise RuntimeError(self._init_error)
+            result = self._request('tools/call',
+                                   {'name': name, 'arguments': arguments})
+        if result.get('isError'):
+            text = _result_text(result) or 'tool returned error'
+            raise RuntimeError(text)
+        return result
+
+    def close(self):
+        if self._proc is None:
+            return
+        try:
+            self._proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            self._proc.wait(timeout=2)
+        except Exception:
+            self._proc.kill()
+        self._proc = None
+
+
+def _result_text(result):
+    """Pull the text payload out of an MCP tool result."""
+    for block in result.get('content') or []:
+        if block.get('type') == 'text':
+            return block.get('text', '')
+    return ''
+
+
+def _check_env():
+    missing = [k for k in _REQUIRED_ENV if not os.environ.get(k)]
+    if missing:
+        return f'missing env: {", ".join(missing)}'
+    return None
+
+
+_client = _MCPClient(_MCP_CMD, env={k: os.environ.get(k, '')
+                                    for k in _REQUIRED_ENV})
+
+
+def _status_style(category):
+    return {
+        'To Do': 'yellow',
+        'In Progress': 'cyan',
+        'Done': 'green',
+    }.get(category, 'white')
+
+
+def get_children(parent_id):
+    if parent_id is not None:
+        return []
+    bad = _check_env()
+    if bad:
+        return _err(bad)
+    try:
+        result = _client.call_tool('jira_search', {
+            'jql': _resolve_jql(),
+            'fields': 'summary,status',
+            'limit': 50,
+        })
+    except RuntimeError as e:
+        return _err(f'jira_search: {e}')
+    try:
+        payload = json.loads(_result_text(result))
+    except json.JSONDecodeError as e:
+        return _err(f'jira_search: bad JSON: {e}')
+    issues = payload.get('issues') or []
+    if not issues:
+        return _err(f'no tickets matched: {_resolve_jql()}')
+    items = []
+    for issue in issues:
+        key = issue.get('key', '?')
+        summary = issue.get('summary') or '(no summary)'
+        status = issue.get('status') or {}
+        items.append(Item(id=key, title=summary,
+                          tag=status.get('name', '?'),
+                          tag_style=_status_style(status.get('category', '')),
+                          has_children=False))
+    return items
+
+
+def get_preview(key):
+    if not isinstance(key, str) or key == _ERROR_ID:
+        return ''
+    try:
+        result = _client.call_tool('jira_get_issue', {
+            'issue_key': key,
+            'fields': 'summary,status,assignee,reporter,priority,labels,created,updated,description',
+            'comment_limit': 0,
+        })
+    except RuntimeError as e:
+        return f'[error] {e}'
+    try:
+        issue = json.loads(_result_text(result))
+    except json.JSONDecodeError as e:
+        return f'[error] bad JSON: {e}'
+    return _format_issue(issue)
+
+
+def _format_issue(issue):
+    """Render a Jira issue dict into a plain-text preview."""
+    def _name(field):
+        v = issue.get(field)
+        if isinstance(v, dict):
+            return v.get('display_name') or v.get('name') or v.get('email_address') or ''
+        return v or ''
+
+    lines = [
+        f"{issue.get('key', '?')}  {issue.get('summary', '')}",
+        '',
+        f"Status:    {(issue.get('status') or {}).get('name', '?')}",
+        f"Priority:  {(issue.get('priority') or {}).get('name', '-')}",
+        f"Assignee:  {_name('assignee') or '-'}",
+        f"Reporter:  {_name('reporter') or '-'}",
+        f"Labels:    {', '.join(issue.get('labels') or []) or '-'}",
+        f"Created:   {issue.get('created', '-')}",
+        f"Updated:   {issue.get('updated', '-')}",
+        '',
+        '--- Description ---',
+        issue.get('description') or '(no description)',
+    ]
+    return '\n'.join(lines)
+
+
+def _ticket_url(key):
+    base = os.environ.get('JIRA_URL', '').rstrip('/')
+    return f'{base}/browse/{key}' if base else key
+
+
+def open_in_browser(ctx):
+    """Hand the ticket URL off to ``$BROWSER`` / ``xdg-open``."""
+    if not ctx.cursor or ctx.cursor.id == _ERROR_ID:
+        return
+    url = _ticket_url(ctx.cursor.id)
+    cmd = os.environ.get('BROWSER') or 'xdg-open'
+    ctx.run_external([cmd, url])
+
+
+_HELP_INTRO_TMPL = """\
+browse-jira-mcp — list Jira tickets via the Atlassian MCP server.
+
+Usage: browse-jira-mcp [JQL]
+  JQL    Optional JQL query string. Quote it. Defaults to
+         "assignee = currentUser() AND statusCategory != Done"
+         (open tickets assigned to the current user).
+
+Active JQL: {jql}
+
+Rows: one ticket per row — tag = status, coloured by category
+  (yellow=To Do, cyan=In Progress, green=Done); title = summary.
+  Up to 50 results.
+Preview: ticket card (status, priority, assignee, reporter, labels,
+  dates, description), fetched on cursor change via the MCP
+  jira_get_issue tool.
+Action o: open the ticket URL ($JIRA_URL/browse/<KEY>) in $BROWSER,
+  falling back to xdg-open.
+
+Server: spawned on demand as `uvx mcp-atlassian` and kept alive for
+the session, so subsequent tool calls reuse the same process.
+
+Credentials (read from the environment, all required):
+  JIRA_URL          e.g. https://jira.example.com/
+  JIRA_USERNAME     e.g. you@example.com
+  JIRA_API_TOKEN    Atlassian API token
+
+If any are unset, or if the server fails to start / authenticate, the
+recipe shows a single friendly error row instead of a traceback.
+
+Examples:
+  browse-jira-mcp
+  browse-jira-mcp 'project = WT AND status = "In Code Review"'
+  browse-jira-mcp 'reporter = currentUser() AND updated >= -7d'\
+"""
+
+
+def main():
+    jql = _resolve_jql()
+    title = 'browse-jira-mcp' if jql == _JQL_DEFAULT else f'browse-jira-mcp: {jql}'
+    sys.exit(Browser(
+        title=title,
+        get_children=get_children,
+        get_preview=get_preview,
+        actions=[
+            Action('o', 'Open ticket in $BROWSER (or xdg-open)',
+                   open_in_browser, 'cursor'),
+        ],
+        help_intro=_HELP_INTRO_TMPL.format(jql=jql),
+    ).run())
+
+
+if __name__ == '__main__':
+    main()
