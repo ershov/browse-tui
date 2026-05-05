@@ -1,0 +1,310 @@
+#!/usr/bin/env -S browse-tui --run-py
+"""browse-mcp — list tools exposed by any MCP (stdio) server.
+
+Spawns the given command as an MCP server, performs the standard
+``initialize`` handshake, calls ``tools/list``, and presents each tool
+as an Item. The preview pane shows the tool's description plus its
+JSON input schema, pretty-printed.
+
+Usage:
+
+    ./browse-mcp <command> [args...]
+
+Examples:
+
+    ./browse-mcp uvx mcp-atlassian@v0.21.1
+    ./browse-mcp npx -y @modelcontextprotocol/server-filesystem /tmp
+    ./browse-mcp python -m my_mcp_server
+
+Credentials / configuration are read from the parent environment —
+export whatever the chosen server expects (e.g. ``JIRA_API_TOKEN``)
+before launching.
+
+Demonstrates: a generic stdio JSON-RPC client behind ``get_children``
+and ``get_preview``, and an ``a:About`` action that pages the server's
+``serverInfo`` (name + version) for orientation.
+"""
+
+import atexit
+import json
+import os
+import shutil
+import subprocess
+import sys
+import threading
+
+from browse_tui import Action, Browser, Item
+
+
+_ERROR_ID = '__error__'
+
+
+def _err(msg):
+    return [Item(id=_ERROR_ID, title=msg, tag='err', tag_style='red')]
+
+
+class _MCPClient:
+    """Minimal MCP stdio JSON-RPC client (single-server, lazy-start)."""
+
+    def __init__(self, cmd):
+        self._cmd = cmd
+        self._proc = None
+        self._lock = threading.Lock()
+        self._next_id = 0
+        self._init_error = None
+        self._server_info = {}
+
+    def _ensure_started(self):
+        if self._proc is not None or self._init_error is not None:
+            return
+        if not shutil.which(self._cmd[0]):
+            self._init_error = f'{self._cmd[0]!r} not found on PATH'
+            return
+        try:
+            self._proc = subprocess.Popen(
+                self._cmd,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True, bufsize=1)
+        except OSError as e:
+            self._init_error = f'failed to start MCP server: {e}'
+            return
+        atexit.register(self.close)
+        try:
+            init = self._request('initialize', {
+                'protocolVersion': '2024-11-05',
+                'capabilities': {},
+                'clientInfo': {'name': 'browse-mcp', 'version': '1.0'},
+            })
+            self._server_info = (init or {}).get('serverInfo') or {}
+            self._notify('notifications/initialized', {})
+        except Exception as e:
+            self._init_error = f'MCP initialize failed: {e}'
+
+    def _send(self, msg):
+        self._proc.stdin.write(json.dumps(msg) + '\n')
+        self._proc.stdin.flush()
+
+    def _read_response(self, expected_id):
+        while True:
+            line = self._proc.stdout.readline()
+            if not line:
+                raise RuntimeError('MCP server closed stdout')
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if msg.get('id') == expected_id:
+                return msg
+
+    def _request(self, method, params):
+        self._next_id += 1
+        rid = self._next_id
+        self._send({'jsonrpc': '2.0', 'id': rid,
+                    'method': method, 'params': params})
+        msg = self._read_response(rid)
+        if 'error' in msg:
+            err = msg['error']
+            raise RuntimeError(f"{err.get('code')}: {err.get('message')}")
+        return msg.get('result')
+
+    def _notify(self, method, params):
+        self._send({'jsonrpc': '2.0', 'method': method, 'params': params})
+
+    def request(self, method, params=None):
+        with self._lock:
+            self._ensure_started()
+            if self._init_error:
+                raise RuntimeError(self._init_error)
+            return self._request(method, params or {})
+
+    @property
+    def server_info(self):
+        return self._server_info
+
+    @property
+    def init_error(self):
+        return self._init_error
+
+    def close(self):
+        if self._proc is None:
+            return
+        try:
+            self._proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            self._proc.wait(timeout=2)
+        except Exception:
+            self._proc.kill()
+        self._proc = None
+
+
+# Populated by main() once we know the server command.
+_client = None
+_tools_cache = None
+
+
+def _list_tools():
+    """Fetch tools/list with simple pagination, return list of dicts."""
+    global _tools_cache
+    if _tools_cache is not None:
+        return _tools_cache
+    tools = []
+    cursor = None
+    while True:
+        params = {'cursor': cursor} if cursor else {}
+        result = _client.request('tools/list', params)
+        tools.extend(result.get('tools') or [])
+        cursor = result.get('nextCursor')
+        if not cursor:
+            break
+    _tools_cache = tools
+    return tools
+
+
+def _short_desc(tool):
+    """First non-empty line of the tool's description, trimmed."""
+    desc = tool.get('description') or ''
+    for line in desc.splitlines():
+        line = line.strip()
+        if line:
+            return line[:120]
+    return ''
+
+
+def _tool_tag(tool):
+    """Pick a short tag for the row — readOnly / destructive / write."""
+    ann = tool.get('annotations') or {}
+    if ann.get('readOnlyHint'):
+        return ('read', 'green')
+    if ann.get('destructiveHint'):
+        return ('destruct', 'red')
+    if ann.get('idempotentHint') is False:
+        return ('write', 'yellow')
+    # Fall back to fastmcp tags if present.
+    meta = (tool.get('_meta') or {}).get('_fastmcp') or {}
+    tags = meta.get('tags') or []
+    for t in tags:
+        if t in ('read', 'write'):
+            return (t, 'green' if t == 'read' else 'yellow')
+    return ('tool', 'cyan')
+
+
+def get_children(parent_id):
+    if parent_id is not None:
+        return []
+    if _client.init_error:
+        return _err(_client.init_error)
+    try:
+        tools = _list_tools()
+    except RuntimeError as e:
+        return _err(f'tools/list: {e}')
+    if not tools:
+        return _err('server returned no tools')
+    items = []
+    for tool in tools:
+        name = tool.get('name', '?')
+        tag, style = _tool_tag(tool)
+        items.append(Item(
+            id=name,
+            title=tool.get('title') or name,
+            tag=tag, tag_style=style,
+            has_children=False,
+        ))
+        items[-1]._tool = tool  # stash for preview / actions
+    return items
+
+
+def get_preview(name):
+    if not isinstance(name, str) or name == _ERROR_ID:
+        return ''
+    try:
+        tools = _list_tools()
+    except RuntimeError as e:
+        return f'[error] {e}'
+    tool = next((t for t in tools if t.get('name') == name), None)
+    if tool is None:
+        return f'[error] tool {name!r} not in tools/list'
+    return _format_tool(tool)
+
+
+def _format_tool(tool):
+    name = tool.get('name', '?')
+    title = tool.get('title') or ''
+    ann = tool.get('annotations') or {}
+    flags = []
+    for k, label in (('readOnlyHint', 'read-only'),
+                     ('destructiveHint', 'destructive'),
+                     ('idempotentHint', 'idempotent'),
+                     ('openWorldHint', 'open-world')):
+        if k in ann:
+            flags.append(f'{label}={ann[k]}')
+    header = name
+    if title and title != name:
+        header += f'  ({title})'
+    out = [header, '=' * min(len(header), 80), '']
+    if flags:
+        out.append('Annotations: ' + ', '.join(flags))
+        out.append('')
+    out.append('--- Description ---')
+    out.append(tool.get('description') or '(no description)')
+    out.append('')
+    out.append('--- Input schema ---')
+    out.append(json.dumps(tool.get('inputSchema') or {}, indent=2))
+    if 'outputSchema' in tool:
+        out.append('')
+        out.append('--- Output schema ---')
+        out.append(json.dumps(tool['outputSchema'], indent=2))
+    return '\n'.join(out)
+
+
+def show_about(ctx):
+    """Page the server's serverInfo for orientation."""
+    info = _client.server_info or {}
+    text = json.dumps(info, indent=2) if info else '(no serverInfo)'
+    ctx.page(text)
+
+
+_HELP_INTRO = """\
+browse-mcp — list tools from any MCP (stdio) server.
+
+The recipe spawns the command passed on its argv as an MCP server,
+performs the JSON-RPC ``initialize`` handshake, calls ``tools/list``,
+and shows each tool as a row. The preview pane renders the tool's
+description and its JSON input schema (plus output schema if the
+server provides one). Tag colour summarises annotations: green
+read-only, red destructive, yellow non-idempotent, cyan otherwise.\
+"""
+
+
+def _usage_error():
+    sys.stderr.write(
+        'usage: browse-mcp <command> [args...]\n'
+        '\n'
+        'Examples:\n'
+        '  browse-mcp uvx mcp-atlassian@v0.21.1\n'
+        '  browse-mcp npx -y @modelcontextprotocol/server-filesystem /tmp\n')
+    sys.exit(2)
+
+
+def main():
+    global _client
+    if len(sys.argv) < 2:
+        _usage_error()
+    cmd = sys.argv[1:]
+    _client = _MCPClient(cmd)
+    title = f'browse-mcp: {" ".join(cmd)}'
+    sys.exit(Browser(
+        title=title,
+        get_children=get_children,
+        get_preview=get_preview,
+        actions=[
+            Action('a', 'About server (serverInfo)', show_about, 'none'),
+        ],
+        help_intro=_HELP_INTRO,
+    ).run())
+
+
+if __name__ == '__main__':
+    main()
