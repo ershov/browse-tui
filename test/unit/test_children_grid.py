@@ -54,15 +54,35 @@ _wrap_entry = _render._wrap_entry
 
 
 class TestFmtChild(unittest.TestCase):
-    """Format a child item as ``'#id [tag] title'`` or ``'#id title'``."""
+    """Format a child item as ``'id [tag] title'`` or ``'id title'``.
+
+    The id is gated on ``show_ids`` (default ``'auto'``: suppressed when
+    ``str(id) == title``).
+    """
 
     def test_with_tag(self):
         item = Item(id='42', title='hello', tag='running')
-        self.assertEqual(_fmt_child(item), '#42 [running] hello')
+        self.assertEqual(_fmt_child(item), '42 [running] hello')
 
     def test_without_tag(self):
         item = Item(id='x', title='leaf')
-        self.assertEqual(_fmt_child(item), '#x leaf')
+        self.assertEqual(_fmt_child(item), 'x leaf')
+
+    def test_auto_suppresses_id_when_equal_to_title(self):
+        item = Item(id='README.md')  # title defaults to 'README.md'
+        self.assertEqual(_fmt_child(item), 'README.md')
+
+    def test_show_ids_always_keeps_duplicated_id(self):
+        item = Item(id='README.md')
+        self.assertEqual(
+            _fmt_child(item, show_ids='always'), 'README.md README.md',
+        )
+
+    def test_show_ids_never_drops_distinct_id(self):
+        item = Item(id='42', title='hello', tag='running')
+        self.assertEqual(
+            _fmt_child(item, show_ids='never'), '[running] hello',
+        )
 
 
 class TestWrapEntry(unittest.TestCase):

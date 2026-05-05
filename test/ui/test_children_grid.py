@@ -27,15 +27,15 @@ class TestChildrenGrid(unittest.TestCase):
         """Cursor on the 'parent' branch reveals its children in the grid."""
         with TmuxFixture(cols=120, rows=40) as t:
             t.launch(_BIN, '--python', _RECIPE)
-            t.wait_for('#parent parent')
+            t.wait_for('parent parent')
             # The cursor lands on 'parent' (the first row) at startup.
             # The grid pane should populate with a1 and a2 once the
             # children fetch completes. Force a redraw to flush any
             # late worker delivery into the screen.
             t.redraw()
-            screen = t.wait_for('#a1', timeout=3.0)
-            self.assertIn('#a1', screen)
-            self.assertIn('#a2', screen)
+            screen = t.wait_for('a1 [running] alpha', timeout=3.0)
+            self.assertIn('a1 [running] alpha', screen)
+            self.assertIn('a2 bravo', screen)
             # The "Children" label sits on the grid's separator.
             self.assertIn('Children', screen)
 
@@ -43,16 +43,16 @@ class TestChildrenGrid(unittest.TestCase):
         """Cursor on a leaf hides the grid; the preview takes the space."""
         with TmuxFixture(cols=120, rows=40) as t:
             t.launch(_BIN, '--python', _RECIPE)
-            t.wait_for('#parent parent')
+            t.wait_for('parent parent')
             t.redraw()
-            t.wait_for('#a1', timeout=3.0)
+            t.wait_for('a1 [running] alpha', timeout=3.0)
             # Move cursor to the second row ('leaf').
             t.send('Down')
             t.redraw()
             # The grid should disappear — no Children label visible.
             screen = t.wait_stable()
-            self.assertNotIn('#a1', screen)
-            self.assertNotIn('#a2', screen)
+            self.assertNotIn('a1 [running] alpha', screen)
+            self.assertNotIn('a2 bravo', screen)
             # 'Children' separator label gone.
             self.assertNotIn('Children', screen)
 
@@ -65,9 +65,9 @@ class TestChildrenGrid(unittest.TestCase):
         """
         with TmuxFixture(cols=120, rows=40) as t:
             t.launch(_BIN, '--python', _RECIPE)
-            t.wait_for('#parent parent')
+            t.wait_for('parent parent')
             t.redraw()
-            t.wait_for('#a1', timeout=3.0)
+            t.wait_for('a1 [running] alpha', timeout=3.0)
             t.wait_stable()
             screen = t.capture(colors=True)
             # The 'running' tag must be visible in the grid.
@@ -84,14 +84,14 @@ class TestChildrenGrid(unittest.TestCase):
         """``--no-children-pane`` keeps the grid hidden even on a branch."""
         with TmuxFixture(cols=120, rows=40) as t:
             t.launch(_BIN, '--python', _RECIPE, '--', '--no-children-pane')
-            t.wait_for('#parent parent')
+            t.wait_for('parent parent')
             t.redraw()
             t.wait_stable()
             screen = t.capture()
             # Grid is suppressed: no Children separator, no a1/a2.
             self.assertNotIn('Children', screen)
-            self.assertNotIn('#a1', screen)
-            self.assertNotIn('#a2', screen)
+            self.assertNotIn('a1 [running] alpha', screen)
+            self.assertNotIn('a2 bravo', screen)
 
 
 if __name__ == '__main__':

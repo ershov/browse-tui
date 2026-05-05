@@ -332,8 +332,22 @@ Browser(
     show_children_pane=True,
     multi_select=True,
     print_format='{id}',
+    show_ids='auto',                      # 'always' | 'auto' | 'never'
 )
 ```
+
+#### `show_ids`
+
+Controls whether the per-row id segment is rendered in front of the title.
+
+| Value      | Behaviour                                                              |
+| ---------- | ---------------------------------------------------------------------- |
+| `'always'` | Always emit `'<id> <title>'` (yellow id, then title).                  |
+| `'auto'`   | Default. Emit the id only when `str(item.id) != item.title`. The line-based CLI shape (`Item(id='README.md')`) renders as just `'README.md'`; tracker-style sources (`Item(id=42, title='Implement feature')`) render as `'42 Implement feature'`. |
+| `'never'`  | Never emit the id segment.                                             |
+
+A `format_item` hook overrides this entirely — the hook's segments are
+emitted verbatim.
 
 ### Callbacks
 

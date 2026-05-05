@@ -51,9 +51,9 @@ class TestCtrlCParity(unittest.TestCase):
         """At top level, ctrl-c exits the app with the cancel code (1)."""
         with TmuxFixture(cols=80, rows=24) as t:
             t.launch('bash', '-c',
-                     f"printf 'a\\nb\\n' | {_BIN} --root-cmd cat --no-children-pane ; "
+                     f"printf 'a\\nb\\n' | {_BIN} --show-ids always --root-cmd cat --no-children-pane ; "
                      f"echo EXIT=$?")
-            t.wait_for('#a a')
+            t.wait_for('a a')
             t.send_bytes('\x03')
             t.wait_for('EXIT=1', timeout=3.0)
 
@@ -61,8 +61,8 @@ class TestCtrlCParity(unittest.TestCase):
         """Ctrl-C inside search mode clears the query and returns to nav."""
         with TmuxFixture(cols=80, rows=24) as t:
             t.launch('bash', '-c',
-                     f"printf 'foo\\nbar\\n' | {_BIN} --root-cmd cat --no-children-pane")
-            t.wait_for('#foo foo')
+                     f"printf 'foo\\nbar\\n' | {_BIN} --show-ids always --root-cmd cat --no-children-pane")
+            t.wait_for('foo foo')
             t.send('/')
             t.type('ba')
             t.wait_for('/ba')
@@ -80,7 +80,7 @@ class TestCtrlCParity(unittest.TestCase):
             log = os.path.join(tmp, 'insert.log')
             with TmuxFixture(cols=120, rows=40, env={'INSERT_LOG': log}) as t:
                 t.launch(_BIN, '--python', recipe_path)
-                t.wait_for('#a')
+                t.wait_for('a a')
                 t.send('c')
                 t.wait_for('-- create --')
                 t.send_bytes('\x03')
@@ -107,7 +107,7 @@ class TestCtrlCParity(unittest.TestCase):
             log = os.path.join(tmp, 'pick.log')
             with TmuxFixture(cols=120, rows=40, env={'PICK_LOG': log}) as t:
                 t.launch(_BIN, '--python', recipe_path)
-                t.wait_for('#item')
+                t.wait_for('item one')
                 t.send('s')
                 t.wait_for('Status>')
                 t.send_bytes('\x03')
@@ -130,11 +130,12 @@ class TestCtrlCParity(unittest.TestCase):
                     f"    open({log!r}, 'w').write('NONE' if val is None else 'VAL:' + repr(val))\n"
                     "    ctx.quit()\n"
                     "b = Browser(get_children=get_children, "
-                    "actions=[Action('i', 'Input', go, 'cursor')])\n"
+                    "actions=[Action('i', 'Input', go, 'cursor')], "
+                    "show_ids='always')\n"
                     "sys.exit(b.run())\n")
             with TmuxFixture(cols=80, rows=24) as t:
                 t.launch(_BIN, '--python', recipe)
-                t.wait_for('#a a')
+                t.wait_for('a a')
                 t.send('i')
                 t.wait_for('Name:')
                 t.send_bytes('\x03')
@@ -157,11 +158,12 @@ class TestCtrlCParity(unittest.TestCase):
                     f"    open({log!r}, 'w').write('YES' if val else 'NO')\n"
                     "    ctx.quit()\n"
                     "b = Browser(get_children=get_children, "
-                    "actions=[Action('d', 'Delete', go, 'cursor')])\n"
+                    "actions=[Action('d', 'Delete', go, 'cursor')], "
+                    "show_ids='always')\n"
                     "sys.exit(b.run())\n")
             with TmuxFixture(cols=80, rows=24) as t:
                 t.launch(_BIN, '--python', recipe)
-                t.wait_for('#a a')
+                t.wait_for('a a')
                 t.send('d')
                 t.wait_for('Sure?')
                 t.send_bytes('\x03')

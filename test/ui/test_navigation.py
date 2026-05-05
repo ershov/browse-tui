@@ -23,22 +23,26 @@ def setUpModule():
 class TestNavigation(unittest.TestCase):
 
     def test_initial_render_three_items(self):
-        """A flat 3-item tree renders as #a/#b/#c."""
+        """A flat 3-item tree renders as a/b/c."""
+        # --show-ids always pins the row layout to 'id title' so the
+        # 'a a' / 'b b' / 'c c' substrings reliably anchor each row.
         with TmuxFixture(cols=80, rows=24) as t:
             t.launch('bash', '-c',
-                     f"printf 'a\\nb\\nc\\n' | {_BIN} --root-cmd cat")
-            screen = t.wait_for('#a a')
+                     f"printf 'a\\nb\\nc\\n' | {_BIN} "
+                     f"--show-ids always --root-cmd cat")
+            screen = t.wait_for('a a')
             screen = t.wait_stable()
-            self.assertIn('#a a', screen)
-            self.assertIn('#b b', screen)
-            self.assertIn('#c c', screen)
+            self.assertIn('a a', screen)
+            self.assertIn('b b', screen)
+            self.assertIn('c c', screen)
 
     def test_down_arrow_moves_cursor(self):
         """Pressing Down moves the cursor (verified via reverse-video region)."""
         with TmuxFixture(cols=80, rows=24) as t:
             t.launch('bash', '-c',
-                     f"printf 'a\\nb\\nc\\n' | {_BIN} --root-cmd cat")
-            t.wait_for('#a a')
+                     f"printf 'a\\nb\\nc\\n' | {_BIN} "
+                     f"--show-ids always --root-cmd cat")
+            t.wait_for('a a')
             t.wait_stable()
             # In a plain capture the cursor is invisible; capture with
             # ANSI codes shows the [7m reverse-video sequence on the
@@ -51,21 +55,22 @@ class TestNavigation(unittest.TestCase):
                                 'cursor did not move on Down arrow')
             # b should now be on the reverse-video row. The pattern is
             # ESC [ 7 m followed by the row text; we check the cursor
-            # marker is on a line that contains "#b".
+            # marker is on a line that contains 'b'.
             self.assertIn('\x1b[7m', after_color)
             # Find the [7m chunk and confirm "b" follows shortly.
             idx = after_color.index('\x1b[7m')
             window = after_color[idx:idx + 80]
-            self.assertIn('#b', window,
-                          f'cursor row does not contain #b: {window!r}')
+            self.assertIn('b', window,
+                          f'cursor row does not contain b: {window!r}')
 
     def test_q_quits_with_cancel_code(self):
         """q exits the TUI with the cancel exit code (1)."""
         with TmuxFixture(cols=80, rows=24) as t:
             t.launch('bash', '-c',
-                     f"printf 'a\\nb\\n' | {_BIN} --root-cmd cat ; "
+                     f"printf 'a\\nb\\n' | {_BIN} "
+                     f"--show-ids always --root-cmd cat ; "
                      f"echo EXIT=$?")
-            t.wait_for('#a a')
+            t.wait_for('a a')
             t.send('q')
             t.wait_for('EXIT=1', timeout=3.0)
 
@@ -80,15 +85,17 @@ class TestNavigation(unittest.TestCase):
             # only inspects the list-pane collapse behaviour.
             t.launch(_BIN, '--python', _NAV_RECIPE, '--',
                      '0.05', '--no-children-pane')
-            t.wait_for('#parent parent')
+            # The recipe sets id == title for every Item, so show_ids
+            # auto-mode renders just the title (no leading id segment).
+            t.wait_for('parent')
             t.send('Right')
-            t.wait_for('#alpha', timeout=3.0)
+            t.wait_for('alpha', timeout=3.0)
             t.send('Left')
             # Left collapse happens synchronously on the main thread —
             # no worker round-trip. wait_stable settles the cell-diff.
             screen = t.wait_stable()
-            self.assertNotIn('#alpha', screen)
-            self.assertIn('#parent', screen)
+            self.assertNotIn('alpha', screen)
+            self.assertIn('parent', screen)
 
     def test_page_down_jump_size_tracks_terminal_height(self):
         """PageDown jumps by list-pane height (ticket #75), not a fixed 10.
@@ -103,12 +110,14 @@ class TestNavigation(unittest.TestCase):
         that the bigger terminal jumped further than the smaller one.
         """
         items_input = ''.join(f'i{i:02d}\\n' for i in range(50))
-        cmd = f"printf '{items_input}' | {_BIN} --root-cmd cat --no-children-pane --no-preview"
+        cmd = (f"printf '{items_input}' | {_BIN} "
+               f"--show-ids always --root-cmd cat "
+               f"--no-children-pane --no-preview")
 
         # 24-row run.
         with TmuxFixture(cols=80, rows=24) as t:
             t.launch('bash', '-c', cmd)
-            t.wait_for('#i00 i00')
+            t.wait_for('i00 i00')
             t.wait_stable()
             t.send('PageDown')
             t.wait_stable()
@@ -117,7 +126,7 @@ class TestNavigation(unittest.TestCase):
         # 40-row run.
         with TmuxFixture(cols=80, rows=40) as t:
             t.launch('bash', '-c', cmd)
-            t.wait_for('#i00 i00')
+            t.wait_for('i00 i00')
             t.wait_stable()
             t.send('PageDown')
             t.wait_stable()
@@ -129,10 +138,11 @@ class TestNavigation(unittest.TestCase):
             self.assertIn('\x1b[7m', screen, 'no cursor marker found')
             idx = screen.index('\x1b[7m')
             window = screen[idx:idx + 200]
-            # Find #iNN in the window — the rendered row format is
-            # "  #iNN iNN ..." with possibly intervening style codes.
+            # Find iNN in the window — the rendered row format is
+            # "  iNN iNN ..." (with --show-ids always) with possibly
+            # intervening style codes.
             import re
-            m = re.search(r'#i(\d{2})', window)
+            m = re.search(r'i(\d{2})', window)
             self.assertIsNotNone(m, f'no item id on cursor row: {window!r}')
             return int(m.group(1))
 

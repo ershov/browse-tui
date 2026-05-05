@@ -39,6 +39,9 @@ def main():
     b = Browser(
         get_children=get_children,
         show_children_pane=show_children_pane,
+        # Force the id segment on every row so UI tests can assert on a
+        # stable shape regardless of whether id == title.
+        show_ids='always',
     )
     sys.exit(b.run())
 

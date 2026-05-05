@@ -29,7 +29,9 @@ class TestAsyncUI(unittest.TestCase):
         until results arrive, then content replaces the placeholder."""
         with TmuxFixture(cols=80, rows=24) as t:
             t.launch(_BIN, '--python', _SLOW_RECIPE, '--', '1.2')
-            t.wait_for('#parent parent')
+            # Recipe items have id == title, so the rendered row is
+            # just the title (auto-suppressed id segment).
+            t.wait_for('parent')
             t.send('Right')
             # The placeholder appears as soon as the main loop renders
             # the post-Right state (cursor moved, tree dirty). The fetch
@@ -37,11 +39,11 @@ class TestAsyncUI(unittest.TestCase):
             t.wait_for('loading', timeout=1.5)
             # Once children land, the worker-result delivery flips
             # _needs_redraw['list'] and the loop renders them.
-            t.wait_for('#alpha', timeout=2.5)
+            t.wait_for('alpha', timeout=2.5)
             screen = t.wait_stable()
             self.assertNotIn('loading', screen)
-            self.assertIn('#alpha', screen)
-            self.assertIn('#beta', screen)
+            self.assertIn('alpha', screen)
+            self.assertIn('beta', screen)
 
     def test_background_watcher_refreshes_list(self):
         """File-watching recipe picks up an external mutation and the UI
@@ -52,7 +54,7 @@ class TestAsyncUI(unittest.TestCase):
                 f.write('initial\n')
             with TmuxFixture(cols=80, rows=24) as t:
                 t.launch(_BIN, '--python', _WATCH_RECIPE, '--', data_path)
-                t.wait_for('#initial', timeout=3.0)
+                t.wait_for('initial', timeout=3.0)
                 # Mutate the file from outside the TUI.
                 with open(data_path, 'w') as f:
                     f.write('updated\n')
@@ -60,7 +62,7 @@ class TestAsyncUI(unittest.TestCase):
                 # contents change; the worker round-trip then flips the
                 # list-dirty bit so the next loop pass renders the new
                 # rows. Two seconds is plenty headroom on a busy host.
-                t.wait_for('#updated', timeout=2.5)
+                t.wait_for('updated', timeout=2.5)
                 screen = t.wait_stable()
-                self.assertNotIn('#initial', screen)
-                self.assertIn('#updated', screen)
+                self.assertNotIn('initial', screen)
+                self.assertIn('updated', screen)

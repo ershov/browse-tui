@@ -85,9 +85,9 @@ class TestHelpScreenInTui(unittest.TestCase):
     def test_help_screen_shows_section_headers(self):
         with TmuxFixture(cols=80, rows=80) as t:
             t.launch('bash', '-c',
-                     f"printf 'a\\n' | {_BIN} --root-cmd cat "
+                     f"printf 'a\\n' | {_BIN} --show-ids always --root-cmd cat "
                      f"--no-children-pane")
-            t.wait_for('#a a')
+            t.wait_for('a a')
             t.send('?')
             t.wait_for('NAVIGATION')
             cap = t.capture()
@@ -98,11 +98,11 @@ class TestHelpScreenInTui(unittest.TestCase):
     def test_help_screen_shows_custom_actions(self):
         with TmuxFixture(cols=80, rows=80) as t:
             t.launch('bash', '-c',
-                     f"printf 'a\\n' | {_BIN} --root-cmd cat "
+                     f"printf 'a\\n' | {_BIN} --show-ids always --root-cmd cat "
                      f"--no-children-pane "
                      f"-a 'e:Edit cursor in editor:true' "
                      f"-a 'd:Delete with confirm:true'")
-            t.wait_for('#a a')
+            t.wait_for('a a')
             t.send('?')
             t.wait_for('CUSTOM ACTIONS')
             cap = t.capture()
@@ -114,11 +114,11 @@ class TestHelpScreenInTui(unittest.TestCase):
     def test_help_intro_and_outro_in_help_screen(self):
         with TmuxFixture(cols=80, rows=80) as t:
             t.launch('bash', '-c',
-                     f"printf 'a\\n' | {_BIN} --root-cmd cat "
+                     f"printf 'a\\n' | {_BIN} --show-ids always --root-cmd cat "
                      f"--no-children-pane "
                      f"--help-intro 'PROJECT-INTRO-MARKER' "
                      f"--help-outro 'project-outro-marker'")
-            t.wait_for('#a a')
+            t.wait_for('a a')
             t.send('?')
             t.wait_for('PROJECT-INTRO-MARKER')
             t.wait_for('project-outro-marker')
@@ -132,10 +132,10 @@ class TestHelpScreenInTui(unittest.TestCase):
                 f.write('FROM-FILE-INTRO\n')
             with TmuxFixture(cols=80, rows=80) as t:
                 t.launch('bash', '-c',
-                         f"printf 'a\\n' | {_BIN} --root-cmd cat "
+                         f"printf 'a\\n' | {_BIN} --show-ids always --root-cmd cat "
                          f"--no-children-pane "
                          f"--help-intro '@{intro}'")
-                t.wait_for('#a a')
+                t.wait_for('a a')
                 t.send('?')
                 t.wait_for('FROM-FILE-INTRO')
                 t.send('?')

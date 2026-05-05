@@ -57,12 +57,12 @@ class TestSuspend(unittest.TestCase):
             # is a one-level child of bash and the shell job-control
             # framework can suspend / resume it cleanly.
             t.send_line(
-                f"printf 'a\\nb\\nc\\n' | {_BIN} --root-cmd cat")
-            t.wait_for('#a a')
+                f"printf 'a\\nb\\nc\\n' | {_BIN} --show-ids always --root-cmd cat")
+            t.wait_for('a a')
             before = t.wait_stable()
-            self.assertIn('#a a', before)
-            self.assertIn('#b b', before)
-            self.assertIn('#c c', before)
+            self.assertIn('a a', before)
+            self.assertIn('b b', before)
+            self.assertIn('c c', before)
 
             pid = t.fg_pid()
             self.assertIsNotNone(pid, 'browse-tui process not found')
@@ -124,8 +124,8 @@ class TestSuspend(unittest.TestCase):
         """
         with TmuxFixture(cols=80, rows=24) as t:
             t.send_line(
-                f"printf 'a\\nb\\nc\\n' | {_BIN} --root-cmd cat")
-            t.wait_for('#a a')
+                f"printf 'a\\nb\\nc\\n' | {_BIN} --show-ids always --root-cmd cat")
+            t.wait_for('a a')
             t.wait_stable()
 
             pid = t.fg_pid()

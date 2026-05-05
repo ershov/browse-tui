@@ -187,6 +187,40 @@ class TestRunTuiArgsToBrowser(unittest.TestCase):
         b = self._captured[0]
         self.assertFalse(b.show_preview)
 
+    def test_show_ids_default_is_auto(self):
+        args = _make_args(root_cmd='printf "a\\n"')
+        rc = _cli.run_tui(args)
+        self.assertEqual(rc, 42)
+        self.assertEqual(self._captured[0].show_ids, 'auto')
+
+    def test_show_ids_flag_propagates(self):
+        for mode in ('always', 'auto', 'never'):
+            with self.subTest(mode=mode):
+                self._captured.clear()
+                args = _make_args(root_cmd='printf "a\\n"', show_ids=mode)
+                rc = _cli.run_tui(args)
+                self.assertEqual(rc, 42)
+                self.assertEqual(self._captured[0].show_ids, mode)
+
+    def test_show_ids_lazy_path_propagates(self):
+        # --children-cmd path also forwards the flag.
+        args = _make_args(children_cmd='printf "a\\n"', show_ids='never')
+        rc = _cli.run_tui(args)
+        self.assertEqual(rc, 42)
+        self.assertEqual(self._captured[0].show_ids, 'never')
+
+
+class TestBrowserShowIdsValidation(unittest.TestCase):
+    """Browser rejects invalid show_ids values at construction."""
+
+    def test_invalid_value_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            Browser(show_ids='sometimes', _headless=True)
+
+    def test_default_is_auto(self):
+        b = Browser(_headless=True)
+        self.assertEqual(b.show_ids, 'auto')
+
 
 class TestRunTuiNeedsDataSource(unittest.TestCase):
     """run_tui exits 2 with a clear error when no data source is given."""

@@ -253,6 +253,7 @@ When a placeholder doesn't resolve, `browse-tui` falls back to the bare id.
 | `--no-preview`        | Start with the preview pane hidden. Toggle live with Ctrl-P. |
 | `--no-children-pane`  | Start with the children-grid pane hidden.                    |
 | `--no-multi-select`   | Disable the selection set (Space/Alt-Space/Ctrl-A become no-ops). |
+| `--show-ids MODE`     | Whether to render the id segment in front of each row's title: `always` / `auto` (default) / `never`. In `auto` mode the id is suppressed when `str(item.id) == item.title` — useful for line-based CLI sources (filenames, `seq`, `xargs`) where showing both is duplication. |
 | `--title TITLE`       | Window title shown in the info bar.                          |
 | `--initial-scope ID`  | Start scoped to this id (Alt-Up to leave).                   |
 

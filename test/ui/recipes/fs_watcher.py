@@ -25,7 +25,9 @@ def main():
         except OSError:
             return []
 
-    b = Browser(get_children=get_children)
+    # show_ids='always' keeps the rendered shape stable for UI tests
+    # even though the recipe sets id == title.
+    b = Browser(get_children=get_children, show_ids='always')
 
     def watcher(browser):
         last = None

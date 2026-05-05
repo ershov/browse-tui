@@ -25,15 +25,18 @@ class TestResize(unittest.TestCase):
     def test_resize_reflows_and_does_not_crash(self):
         """Shrinking the window from 120x40 to 60x20 reflows without crash."""
         with TmuxFixture(cols=120, rows=40) as t:
+            # --show-ids always pins the row layout so 'a a' is a stable
+            # substring even though the input has id == title.
             t.launch('bash', '-c',
-                     f"printf 'a\\nb\\nc\\n' | {_BIN} --root-cmd cat")
-            t.wait_for('#a a')
+                     f"printf 'a\\nb\\nc\\n' | {_BIN} "
+                     f"--show-ids always --root-cmd cat")
+            t.wait_for('a a')
             t.resize(60, 20)
             # SIGWINCH propagation + redraw is asynchronous; wait_stable
             # blocks until two consecutive captures match — i.e. the
             # render has settled at the new dimensions.
             screen = t.wait_stable(timeout=3.0)
-            self.assertIn('#a a', screen)
+            self.assertIn('a a', screen)
             # Every line must fit the new width (with a small slack for
             # the trailing-pad behaviour on some terminals).
             longest = max(len(line) for line in screen.splitlines())
@@ -53,15 +56,16 @@ class TestResize(unittest.TestCase):
         with TmuxFixture(cols=120, rows=40) as t:
             t.launch(_BIN, '--python', _GRID_RECIPE)
             # The recipe pre-renders 'parent' on first row; flush async
-            # children-fetch into the screen with a redraw.
-            t.wait_for('#parent parent')
+            # children-fetch into the screen with a redraw. The recipe
+            # pins show_ids='always' so each row has its id segment.
+            t.wait_for('parent parent')
             t.redraw()
-            t.wait_for('#a1', timeout=3.0)
+            t.wait_for('a1', timeout=3.0)
             wide = t.wait_stable()
             # Sanity: the grid is up — Children separator + both kids.
             self.assertIn('Children', wide)
-            self.assertIn('#a1', wide)
-            self.assertIn('#a2', wide)
+            self.assertIn('a1', wide)
+            self.assertIn('a2', wide)
 
             # Shrink. SIGWINCH triggers reflow; renderer must handle the
             # narrower geometry without raising or producing oversized
@@ -70,7 +74,7 @@ class TestResize(unittest.TestCase):
             # assert only that nothing crashes and lines fit.
             t.resize(60, 20)
             narrow = t.wait_stable(timeout=3.0)
-            self.assertIn('#parent', narrow,
+            self.assertIn('parent', narrow,
                           f'cursor item disappeared after shrink:\n{narrow}')
             longest = max(len(line) for line in narrow.splitlines())
             self.assertLessEqual(longest, 65,
@@ -81,8 +85,8 @@ class TestResize(unittest.TestCase):
             t.resize(120, 40)
             t.redraw()
             restored = t.wait_stable(timeout=3.0)
-            self.assertIn('#parent parent', restored)
-            self.assertIn('#a1', restored)
-            self.assertIn('#a2', restored)
+            self.assertIn('parent parent', restored)
+            self.assertIn('a1', restored)
+            self.assertIn('a2', restored)
             self.assertIn('Children', restored)
             t.send('q')

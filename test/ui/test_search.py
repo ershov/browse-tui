@@ -30,8 +30,8 @@ class TestSearch(unittest.TestCase):
         """/ then text shows the query in the info bar; Esc clears it."""
         with TmuxFixture(cols=80, rows=24) as t:
             t.launch('bash', '-c',
-                     f"printf 'foo\\nbar\\nbaz\\n' | {_BIN} --root-cmd cat")
-            t.wait_for('#foo foo')
+                     f"printf 'foo\\nbar\\nbaz\\n' | {_BIN} --show-ids always --root-cmd cat")
+            t.wait_for('foo foo')
             t.send('/')
             t.type('bar')
             t.wait_for('/bar', timeout=2.0)
@@ -46,8 +46,8 @@ class TestSearch(unittest.TestCase):
         query, exits search mode, returns to normal navigation."""
         with TmuxFixture(cols=80, rows=24) as t:
             t.launch('bash', '-c',
-                     f"printf 'foo\\nbar\\nbaz\\n' | {_BIN} --root-cmd cat --no-children-pane")
-            t.wait_for('#foo foo')
+                     f"printf 'foo\\nbar\\nbaz\\n' | {_BIN} --show-ids always --root-cmd cat --no-children-pane")
+            t.wait_for('foo foo')
             t.send('/')
             t.type('ba')
             t.wait_for('/ba')
@@ -63,8 +63,8 @@ class TestSearch(unittest.TestCase):
         """Each printable key extends the query; backspace trims it."""
         with TmuxFixture(cols=80, rows=24) as t:
             t.launch('bash', '-c',
-                     f"printf 'foo\\nbar\\nbaz\\n' | {_BIN} --root-cmd cat")
-            t.wait_for('#foo foo')
+                     f"printf 'foo\\nbar\\nbaz\\n' | {_BIN} --show-ids always --root-cmd cat")
+            t.wait_for('foo foo')
             t.send('/')
             t.type('xy')
             t.wait_for('/xy', timeout=2.0)
@@ -93,8 +93,8 @@ class TestSearchHighlight(unittest.TestCase):
         """Press / then type a query; the cursor lands on the matching row."""
         with TmuxFixture(cols=80, rows=24) as t:
             t.launch('bash', '-c',
-                     f"printf 'foo\\nbar\\nbaz\\nqux\\n' | {_BIN} --root-cmd cat")
-            t.wait_for('#foo foo')
+                     f"printf 'foo\\nbar\\nbaz\\nqux\\n' | {_BIN} --show-ids always --root-cmd cat")
+            t.wait_for('foo foo')
             t.send('/')
             t.type('baz')
             # The query shows in the info bar; the cursor has jumped to
@@ -128,8 +128,8 @@ class TestSearchHighlight(unittest.TestCase):
         with TmuxFixture(cols=80, rows=24) as t:
             t.launch('bash', '-c',
                      f"printf 'foo-a\\nbar\\nfoo-b\\nfoo-c\\n' | "
-                     f"{_BIN} --root-cmd cat")
-            t.wait_for('#foo-a foo-a')
+                     f"{_BIN} --show-ids always --root-cmd cat")
+            t.wait_for('foo-a foo-a')
             t.wait_stable()
             t.send('/')
             t.type('foo')
@@ -154,8 +154,8 @@ class TestSearchHighlight(unittest.TestCase):
         with TmuxFixture(cols=80, rows=24) as t:
             # Four rows; three of them match 'foo'.
             t.launch('bash', '-c',
-                     f"printf 'foo-a\\nbar\\nfoo-b\\nfoo-c\\n' | {_BIN} --root-cmd cat")
-            t.wait_for('#foo-a foo-a')
+                     f"printf 'foo-a\\nbar\\nfoo-b\\nfoo-c\\n' | {_BIN} --show-ids always --root-cmd cat")
+            t.wait_for('foo-a foo-a')
             t.send('/')
             t.type('foo')
             t.wait_for('/foo', timeout=2.0)

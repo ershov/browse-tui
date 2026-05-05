@@ -65,6 +65,9 @@ def main():
             Action('c', 'Create', _do_insert, 'cursor'),
             Action('x', 'Cancel-marker', _confirm_or_cancel, 'none'),
         ],
+        # Force the id segment on every row so UI tests can assert on a
+        # stable shape regardless of whether id == title.
+        show_ids='always',
     )
     sys.exit(b.run())
 

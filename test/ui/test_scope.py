@@ -59,42 +59,43 @@ class TestScope(unittest.TestCase):
             '--children-cmd', _CHILDREN_CMD,
             '--fields', 'id,title,has_children',
             '--no-children-pane',
+            '--show-ids', 'always',
         )
 
     def test_alt_down_drills_into_cursor(self):
         """M-Down drills into the cursor item; siblings become hidden."""
         with TmuxFixture(cols=80, rows=24) as t:
             self._launch(t)
-            t.wait_for('#A A')
+            t.wait_for('A A')
             t.wait_stable()
             # Cursor starts on A. Drill in.
             t.send('M-Down')
             # After drilling, A's children should appear; B should not.
-            t.wait_for('#a1', timeout=3.0)
+            t.wait_for('a1 a1', timeout=3.0)
             screen = t.wait_stable()
-            self.assertIn('#A', screen)
-            self.assertIn('#a1', screen)
-            self.assertIn('#a2', screen)
-            self.assertNotIn('#B', screen)
-            self.assertNotIn('#b1', screen)
+            self.assertIn('A A', screen)
+            self.assertIn('a1 a1', screen)
+            self.assertIn('a2 a2', screen)
+            self.assertNotIn('B B', screen)
+            self.assertNotIn('b1 b1', screen)
             t.send('q')
 
     def test_alt_up_returns_to_root(self):
         """M-Up after drilling into A returns to the root view."""
         with TmuxFixture(cols=80, rows=24) as t:
             self._launch(t)
-            t.wait_for('#A A')
+            t.wait_for('A A')
             t.wait_stable()
             t.send('M-Down')
-            t.wait_for('#a1', timeout=3.0)
+            t.wait_for('a1 a1', timeout=3.0)
             t.wait_stable()
             t.send('M-Up')
             # Back at root: B is visible again, a1 is not (collapsed).
-            t.wait_for('#B B', timeout=3.0)
+            t.wait_for('B B', timeout=3.0)
             screen = t.wait_stable()
-            self.assertIn('#A', screen)
-            self.assertIn('#B', screen)
-            self.assertNotIn('#a1', screen)
+            self.assertIn('A A', screen)
+            self.assertIn('B B', screen)
+            self.assertNotIn('a1 a1', screen)
             t.send('q')
 
     def test_nested_scope_drill_in_and_out_twice(self):
@@ -119,53 +120,54 @@ class TestScope(unittest.TestCase):
                 '--children-cmd', nested_cmd,
                 '--fields', 'id,title,has_children',
                 '--no-children-pane',
+                '--show-ids', 'always',
             )
-            t.wait_for('#A A')
+            t.wait_for('A A')
             t.wait_stable()
             # Drill into A.
             t.send('M-Down')
-            t.wait_for('#a1', timeout=3.0)
+            t.wait_for('a1 a1', timeout=3.0)
             t.wait_stable()
             # Position cursor on a1 (first child) — drill-in uses cursor.
             t.send('Down')
             t.wait_stable()
             # Drill into a1: scope=a1, children a1x / a1y appear.
             t.send('M-Down')
-            t.wait_for('#a1x', timeout=3.0)
+            t.wait_for('a1x a1x', timeout=3.0)
             screen = t.wait_stable()
             # Crumb shows the full chain. Renderer formats nested
             # crumbs as '▸ A ▸ a1' (or similar) in the info bar.
             self.assertIn('▸ A', screen)
             self.assertIn('a1', screen)
-            self.assertNotIn('#B', screen)
-            self.assertNotIn('#a2', screen)
+            self.assertNotIn('B B', screen)
+            self.assertNotIn('a2 a2', screen)
             # Pop one level: scope=A, a1's children hidden again,
             # siblings (a2) visible.
             t.send('M-Up')
-            t.wait_for('#a2', timeout=3.0)
+            t.wait_for('a2 a2', timeout=3.0)
             screen = t.wait_stable()
-            self.assertIn('#A', screen)
-            self.assertIn('#a1', screen)
-            self.assertIn('#a2', screen)
-            self.assertNotIn('#a1x', screen)
-            self.assertNotIn('#B', screen)
+            self.assertIn('A A', screen)
+            self.assertIn('a1 a1', screen)
+            self.assertIn('a2 a2', screen)
+            self.assertNotIn('a1x a1x', screen)
+            self.assertNotIn('B B', screen)
             # Pop the second level: back at root, B visible.
             t.send('M-Up')
-            t.wait_for('#B B', timeout=3.0)
+            t.wait_for('B B', timeout=3.0)
             screen = t.wait_stable()
-            self.assertIn('#A', screen)
-            self.assertIn('#B', screen)
-            self.assertNotIn('#a1', screen)
+            self.assertIn('A A', screen)
+            self.assertIn('B B', screen)
+            self.assertNotIn('a1 a1', screen)
             t.send('q')
 
     def test_scope_crumb_appears_in_info_bar(self):
         """The info bar shows a '▸ A' crumb after drilling into A."""
         with TmuxFixture(cols=80, rows=24) as t:
             self._launch(t)
-            t.wait_for('#A A')
+            t.wait_for('A A')
             t.wait_stable()
             t.send('M-Down')
-            t.wait_for('#a1', timeout=3.0)
+            t.wait_for('a1 a1', timeout=3.0)
             screen = t.wait_stable()
             # Crumb glyph + id should appear somewhere on the screen
             # (the renderer puts it on the info-bar row between the

@@ -5,9 +5,17 @@ effects: the ``*`` row marker, the ``[N]`` selection-count badge in the
 info bar, ctrl-a / ctrl-n bulk operations, and that a CLI-installed
 ``--action`` (which uses ``requires='targets'``) sees the multi-row
 selection in ``$TUI_IDS_FILE`` / ``$TUI_IDS_COUNT``.
+
+Note on row layout: the ``--root-cmd cat`` path produces ``Item(id=X,
+title=X)`` from each line, so ``show_ids`` auto-mode suppresses the
+per-row id segment. A non-selected leaf row at depth 0 reads as
+``'    a'`` (2-space gutter + 2-space leaf-expand-marker + title);
+a selected row reads as ``'*   a'`` (the gutter's first two chars
+become ``'* '``).
 """
 
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -15,6 +23,14 @@ import time
 import unittest
 
 from test.ui.fixtures.tmux import TmuxFixture
+
+
+# Regexes used as anchored row matchers below. ``re.M`` lets ``^`` /
+# ``$`` match at line boundaries inside the multiline screen capture.
+_RE_ROW_A = re.compile(r'^ +a$', re.M)
+_RE_SEL_A = re.compile(r'^\*\s+a$', re.M)
+_RE_SEL_B = re.compile(r'^\*\s+b$', re.M)
+_RE_SEL_C = re.compile(r'^\*\s+c$', re.M)
 
 
 _BIN = os.path.abspath('./browse-tui')
@@ -35,13 +51,13 @@ class TestMultiSelect(unittest.TestCase):
         with TmuxFixture(cols=80, rows=24) as t:
             t.launch('bash', '-c',
                      f"printf 'a\\nb\\nc\\n' | {_BIN} --root-cmd cat")
-            t.wait_for('#a a')
+            t.wait_for(_RE_ROW_A)
             t.wait_stable()
             t.send('Space')
             screen = t.wait_for('* ')
             # The '* ' marker must appear on the #a row (first row).
             # Renderer uses two-space gutter so '*   #a' is the layout.
-            self.assertRegex(screen, r'\*\s+#a a')
+            self.assertRegex(screen, _RE_SEL_A)
             # Selection count badge appears in the info bar.
             self.assertIn('[1]', screen)
             t.send('q')
@@ -51,15 +67,15 @@ class TestMultiSelect(unittest.TestCase):
         with TmuxFixture(cols=80, rows=24) as t:
             t.launch('bash', '-c',
                      f"printf 'a\\nb\\nc\\n' | {_BIN} --root-cmd cat")
-            t.wait_for('#a a')
+            t.wait_for(_RE_ROW_A)
             t.wait_stable()
             t.send('Space')
             t.wait_for('[1]')
             t.send('Space')
             screen = t.wait_for('[2]')
             # Both first two rows have a marker.
-            self.assertRegex(screen, r'\*\s+#a a')
-            self.assertRegex(screen, r'\*\s+#b b')
+            self.assertRegex(screen, _RE_SEL_A)
+            self.assertRegex(screen, _RE_SEL_B)
             t.send('q')
 
     def test_ctrl_a_marks_all_visible(self):
@@ -67,13 +83,13 @@ class TestMultiSelect(unittest.TestCase):
         with TmuxFixture(cols=80, rows=24) as t:
             t.launch('bash', '-c',
                      f"printf 'a\\nb\\nc\\n' | {_BIN} --root-cmd cat")
-            t.wait_for('#a a')
+            t.wait_for(_RE_ROW_A)
             t.wait_stable()
             t.send('C-a')
             screen = t.wait_for('[3]')
-            self.assertRegex(screen, r'\*\s+#a a')
-            self.assertRegex(screen, r'\*\s+#b b')
-            self.assertRegex(screen, r'\*\s+#c c')
+            self.assertRegex(screen, _RE_SEL_A)
+            self.assertRegex(screen, _RE_SEL_B)
+            self.assertRegex(screen, _RE_SEL_C)
             t.send('q')
 
     def test_ctrl_n_clears_selection(self):
@@ -81,20 +97,20 @@ class TestMultiSelect(unittest.TestCase):
         with TmuxFixture(cols=80, rows=24) as t:
             t.launch('bash', '-c',
                      f"printf 'a\\nb\\nc\\n' | {_BIN} --root-cmd cat")
-            t.wait_for('#a a')
+            t.wait_for(_RE_ROW_A)
             t.wait_stable()
             t.send('C-a')
             t.wait_for('[3]')
             t.send('C-n')
-            # After clear, neither the badge nor any '* '+'#' marker is
-            # present on a row. wait_stable settles the cell-diff.
+            # After clear, neither the badge nor any '*' selection
+            # marker on the data rows. wait_stable settles the cell-diff.
             screen = t.wait_stable()
             self.assertNotIn('[3]', screen)
             self.assertNotIn('[2]', screen)
             self.assertNotIn('[1]', screen)
-            self.assertNotRegex(screen, r'\*\s+#a a')
-            self.assertNotRegex(screen, r'\*\s+#b b')
-            self.assertNotRegex(screen, r'\*\s+#c c')
+            self.assertNotRegex(screen, _RE_SEL_A)
+            self.assertNotRegex(screen, _RE_SEL_B)
+            self.assertNotRegex(screen, _RE_SEL_C)
             t.send('q')
 
     def test_ctrl_a_after_ctrl_n_reselects_all(self):
@@ -107,7 +123,7 @@ class TestMultiSelect(unittest.TestCase):
         with TmuxFixture(cols=80, rows=24) as t:
             t.launch('bash', '-c',
                      f"printf 'a\\nb\\nc\\n' | {_BIN} --root-cmd cat")
-            t.wait_for('#a a')
+            t.wait_for(_RE_ROW_A)
             t.wait_stable()
             t.send('C-a')
             t.wait_for('[3]')
@@ -115,14 +131,14 @@ class TestMultiSelect(unittest.TestCase):
             # After clear, no selection badge.
             screen = t.wait_stable()
             self.assertNotIn('[3]', screen)
-            self.assertNotRegex(screen, r'\*\s+#a a')
+            self.assertNotRegex(screen, _RE_SEL_A)
             # Re-select all — count must come back to [3] and every row
             # gets its '*' marker.
             t.send('C-a')
             screen = t.wait_for('[3]')
-            self.assertRegex(screen, r'\*\s+#a a')
-            self.assertRegex(screen, r'\*\s+#b b')
-            self.assertRegex(screen, r'\*\s+#c c')
+            self.assertRegex(screen, _RE_SEL_A)
+            self.assertRegex(screen, _RE_SEL_B)
+            self.assertRegex(screen, _RE_SEL_C)
             t.send('q')
 
     def test_targets_action_uses_selection(self):
@@ -142,7 +158,7 @@ class TestMultiSelect(unittest.TestCase):
                          f"printf 'a\\nb\\nc\\n' | "
                          f"{_BIN} --root-cmd cat "
                          f"--action 'e:Edit:{action_cmd}'")
-                t.wait_for('#a a')
+                t.wait_for(_RE_ROW_A)
                 t.wait_stable()
                 # Select two rows with space-space, then press 'e'.
                 t.send('Space')

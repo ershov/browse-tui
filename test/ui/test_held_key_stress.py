@@ -45,15 +45,22 @@ def _list_rows_until_separator(cap):
 
 
 def _assert_no_mid_list_blanks(test, cap):
-    """Fail when a non-data row sits between two data rows in the list pane."""
+    """Fail when a non-data row sits between two data rows in the list pane.
+
+    A "data row" is any row with non-whitespace content. The held-key
+    bug's signature is a fully blank row sandwiched between two
+    populated rows — so detecting it via ``bool(line.strip())`` is
+    independent of how items render (no longer keyed on a leading '#'
+    sigil since show_ids='auto' suppresses ids when id == title).
+    """
     list_rows = _list_rows_until_separator(cap)
-    data_idx = [i for i, ln in enumerate(list_rows) if ln.strip().startswith('#')]
+    data_idx = [i for i, ln in enumerate(list_rows) if ln.strip()]
     if not data_idx:
         return  # no data on screen — nothing to assert
     first, last = data_idx[0], data_idx[-1]
     blanks = [
         i for i in range(first, last + 1)
-        if not list_rows[i].strip().startswith('#')
+        if not list_rows[i].strip()
     ]
     test.assertEqual(
         blanks, [],
@@ -68,8 +75,8 @@ class TestHeldKeyStress(unittest.TestCase):
     def test_200_down_presses_no_blank_rows(self):
         with TmuxFixture(cols=80, rows=24) as t:
             t.launch('bash', '-c',
-                     f'seq 1 100 | {_BIN} --root-cmd cat --no-children-pane')
-            t.wait_for('#1 1')
+                     f'seq 1 100 | {_BIN} --show-ids always --root-cmd cat --no-children-pane')
+            t.wait_for('1 1')
             t.wait_stable()
             # Send all 200 in a single tmux send-keys call so they queue
             # in stdin and exercise the read_key/render race.
@@ -81,8 +88,8 @@ class TestHeldKeyStress(unittest.TestCase):
     def test_200_alternating_keys_no_blank_rows(self):
         with TmuxFixture(cols=80, rows=24) as t:
             t.launch('bash', '-c',
-                     f'seq 1 200 | {_BIN} --root-cmd cat --no-children-pane')
-            t.wait_for('#1 1')
+                     f'seq 1 200 | {_BIN} --show-ids always --root-cmd cat --no-children-pane')
+            t.wait_for('1 1')
             t.wait_stable()
             keys = (
                 ['Down'] * 30
@@ -109,9 +116,9 @@ class TestHeldKeyStress(unittest.TestCase):
         """
         with TmuxFixture(cols=80, rows=40) as t:
             t.launch('bash', '-c',
-                     f'seq 1 300 | {_BIN} --root-cmd cat --no-children-pane '
+                     f'seq 1 300 | {_BIN} --show-ids always --root-cmd cat --no-children-pane '
                      f'--preview-cmd "echo preview \\$TUI_ID"')
-            t.wait_for('#1 1')
+            t.wait_for('1 1')
             t.wait_stable()
             t.send(*(['Down'] * 300))
             time.sleep(0.5)

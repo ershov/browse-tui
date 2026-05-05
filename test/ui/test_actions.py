@@ -35,9 +35,9 @@ class TestActions(unittest.TestCase):
             with TmuxFixture(cols=80, rows=24) as t:
                 t.launch('bash', '-c',
                          f"printf 'a\\nb\\n' | "
-                         f"{_BIN} --root-cmd cat "
+                         f"{_BIN} --show-ids always --root-cmd cat "
                          f"--action 'e:Edit:{action_cmd}'")
-                t.wait_for('#a a')
+                t.wait_for('a a')
                 t.send('e')
                 # Poll for the action's sentinel — far more reliable than
                 # a fixed sleep, especially under CI load.
@@ -59,9 +59,9 @@ class TestActions(unittest.TestCase):
         """An action that exits non-zero displays the error in the preview."""
         with TmuxFixture(cols=80, rows=24) as t:
             t.launch('bash', '-c',
-                     f"printf 'a\\n' | {_BIN} --root-cmd cat "
-                     f"--action 'x:Bad:false'")
-            t.wait_for('#a a')
+                     f"printf 'a\\n' | {_BIN} --show-ids always "
+                     f"--root-cmd cat --action 'x:Bad:false'")
+            t.wait_for('a a')
             t.send('x')
             # The action layer posts the error back to the main thread
             # which adds 'preview' to _needs_redraw, so wait_for finds

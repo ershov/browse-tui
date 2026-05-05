@@ -106,10 +106,10 @@ class TestSnapshots(unittest.TestCase):
         self._run_snapshot(
             'initial_three_items.txt',
             ('bash', '-c',
-             f"printf 'a\\nb\\nc\\n' | {_BIN} --root-cmd cat "
+             f"printf 'a\\nb\\nc\\n' | {_BIN} --show-ids always --root-cmd cat "
              f"--no-children-pane --no-preview"),
             cols=80, rows=24,
-            wait_for='#a a',
+            wait_for='a a',
         )
 
     def test_search_active(self):
@@ -122,10 +122,10 @@ class TestSnapshots(unittest.TestCase):
         self._run_snapshot(
             'search_active.txt',
             ('bash', '-c',
-             f"printf 'foo\\nbar\\nbaz\\n' | {_BIN} --root-cmd cat "
+             f"printf 'foo\\nbar\\nbaz\\n' | {_BIN} --show-ids always --root-cmd cat "
              f"--no-children-pane --no-preview"),
             cols=80, rows=24,
-            wait_for='#foo foo',
+            wait_for='foo foo',
             after=after,
         )
 
@@ -140,10 +140,10 @@ class TestSnapshots(unittest.TestCase):
         self._run_snapshot(
             'multiselect_two.txt',
             ('bash', '-c',
-             f"printf 'one\\ntwo\\nthree\\nfour\\n' | {_BIN} --root-cmd cat "
+             f"printf 'one\\ntwo\\nthree\\nfour\\n' | {_BIN} --show-ids always --root-cmd cat "
              f"--no-children-pane --no-preview"),
             cols=80, rows=24,
-            wait_for='#one one',
+            wait_for='one one',
             after=after,
         )
 
@@ -158,9 +158,9 @@ class TestSnapshots(unittest.TestCase):
         self._run_snapshot(
             'help_mode.txt',
             ('bash', '-c',
-             f"printf 'a\\n' | {_BIN} --root-cmd cat --no-children-pane"),
+             f"printf 'a\\n' | {_BIN} --show-ids always --root-cmd cat --no-children-pane"),
             cols=80, rows=24,
-            wait_for='#a a',
+            wait_for='a a',
             after=after,
         )
 
@@ -176,15 +176,16 @@ class TestSnapshots(unittest.TestCase):
 
         def after(t):
             t.send('M-Down')   # scope-down into 'A'
-            t.wait_for('#a1', timeout=3.0)
+            t.wait_for('a1 a1', timeout=3.0)
 
         self._run_snapshot(
             'scoped_view.txt',
             (_BIN, '--children-cmd', children_cmd,
              '--fields', 'id,title,has_children',
-             '--no-children-pane', '--no-preview'),
+             '--no-children-pane', '--no-preview',
+             '--show-ids', 'always'),
             cols=80, rows=24,
-            wait_for='#A A',
+            wait_for='A A',
             after=after,
         )
 

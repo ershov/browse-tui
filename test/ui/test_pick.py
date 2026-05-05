@@ -52,7 +52,7 @@ class TestPick(unittest.TestCase):
             log = os.path.join(tmp, 'pick.log')
             with TmuxFixture(cols=120, rows=40, env={'PICK_LOG': log}) as t:
                 t.launch(_BIN, '--python', _RECIPE)
-                t.wait_for('#item')
+                t.wait_for('item one')
                 t.send('s')
                 # Wait for the picker prompt to appear on the info bar.
                 t.wait_for('Status>')
@@ -69,7 +69,7 @@ class TestPick(unittest.TestCase):
             log = os.path.join(tmp, 'pick.log')
             with TmuxFixture(cols=120, rows=40, env={'PICK_LOG': log}) as t:
                 t.launch(_BIN, '--python', _RECIPE)
-                t.wait_for('#item')
+                t.wait_for('item one')
                 t.send('s')
                 t.wait_for('Status>')
                 t.send('Escape')
@@ -87,7 +87,7 @@ class TestPick(unittest.TestCase):
             log = os.path.join(tmp, 'pick.log')
             with TmuxFixture(cols=120, rows=40, env={'PICK_LOG': log}) as t:
                 t.launch(_BIN, '--python', _RECIPE)
-                t.wait_for('#item')
+                t.wait_for('item one')
                 t.send('s')
                 t.wait_for('Status>')
                 t.type('do')
@@ -104,7 +104,7 @@ class TestPick(unittest.TestCase):
             log = os.path.join(tmp, 'pick.log')
             with TmuxFixture(cols=120, rows=40, env={'PICK_LOG': log}) as t:
                 t.launch(_BIN, '--python', _RECIPE)
-                t.wait_for('#item')
+                t.wait_for('item one')
                 t.send('s')
                 t.wait_for('Status>')
                 # Down twice from 'open' lands on 'done' (3rd item).

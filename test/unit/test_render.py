@@ -79,19 +79,46 @@ def _joined(segs):
 
 
 class TestFormatItemSegmentsDefault(unittest.TestCase):
-    """Default item formatting: marker + indent + expand + #id + [tag] + title."""
+    """Default item formatting: marker + indent + expand + [id] + [tag] + title."""
 
     def test_leaf_no_tag_no_selection(self):
         item = Item(id='a')
         segs = format_item_segments(item)
         joined = _joined(segs)
         # Selection marker (2 chars), expand-marker (2 chars for a leaf),
-        # then '#a ' then title 'a'.
+        # then title 'a'. Auto-suppression hides the id segment when
+        # ``str(id) == title`` (the default for ``Item(id='a')``).
         self.assertIn('  ', joined[:2])      # selection marker
-        self.assertIn('#a', joined)
         self.assertIn('a', joined)
+        # No '#' sigil — that's plan-tui-specific and was dropped.
+        self.assertNotIn('#', joined)
         # No '[' — no tag.
         self.assertNotIn('[', joined)
+
+    def test_leaf_id_visible_when_title_differs(self):
+        # When title differs from id, the id segment is emitted (no '#').
+        item = Item(id='a', title='Alpha')
+        segs = format_item_segments(item)
+        joined = _joined(segs)
+        self.assertIn('a ', joined)
+        self.assertIn('Alpha', joined)
+        self.assertNotIn('#', joined)
+
+    def test_show_ids_always_emits_id_even_when_equal_to_title(self):
+        item = Item(id='a')  # title defaults to 'a'
+        segs = format_item_segments(item, show_ids='always')
+        joined = _joined(segs)
+        # The id segment is present (and matches the title text); look
+        # for the trailing ' ' separator that distinguishes it from the
+        # title at end-of-string.
+        self.assertIn('a a', joined)
+
+    def test_show_ids_never_hides_id_even_when_different_from_title(self):
+        item = Item(id='a', title='Alpha')
+        segs = format_item_segments(item, show_ids='never')
+        joined = _joined(segs)
+        self.assertNotIn('a ', joined)
+        self.assertIn('Alpha', joined)
 
     def test_collapsed_parent_uses_right_arrow(self):
         item = Item(id='a', has_children=True)
@@ -150,15 +177,24 @@ class TestFormatItemSegmentsKinds(unittest.TestCase):
         item = Item(id='proj', title='My Project')
         segs = format_item_segments(item, kind='scope_root')
         joined = _joined(segs)
-        # No star marker, no expand arrow for the scope row.
+        # No star marker, no expand arrow for the scope row. The id
+        # is rendered (id != title) without the '#' sigil.
         self.assertNotIn('* ', joined)
-        self.assertIn('#proj', joined)
+        self.assertIn('proj ', joined)
         self.assertIn('My Project', joined)
+        self.assertNotIn('#', joined)
         # At least one segment must be bold (signalling scope-root style).
         self.assertTrue(
             any(seg[2] for seg in segs),
             'scope_root row should have at least one bold segment',
         )
+
+    def test_scope_root_auto_suppresses_id_when_equal_to_title(self):
+        item = Item(id='proj')  # title defaults to 'proj'
+        segs = format_item_segments(item, kind='scope_root')
+        joined = _joined(segs)
+        # Only the title is rendered; no leading id segment, no '#'.
+        self.assertEqual(joined, 'proj')
 
 
 # --- format_item override hook ---------------------------------------------

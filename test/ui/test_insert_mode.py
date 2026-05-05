@@ -54,7 +54,7 @@ class TestInsertMode(unittest.TestCase):
         """Press 'c' — the '-- create --' marker shows up in the list."""
         with TmuxFixture(cols=120, rows=40) as t:
             t.launch(_BIN, '--python', _RECIPE)
-            t.wait_for('#a')
+            t.wait_for('a a')
             t.send('c')
             # Marker appears.
             screen = t.wait_for('-- create --')
@@ -66,7 +66,7 @@ class TestInsertMode(unittest.TestCase):
             log = os.path.join(tmp, 'insert.log')
             with TmuxFixture(cols=120, rows=40, env={'INSERT_LOG': log}) as t:
                 t.launch(_BIN, '--python', _RECIPE)
-                t.wait_for('#a')
+                t.wait_for('a a')
                 t.send('c')
                 t.wait_for('-- create --')
                 t.send('Enter')
@@ -93,7 +93,7 @@ class TestInsertMode(unittest.TestCase):
         """
         with TmuxFixture(cols=120, rows=40) as t:
             t.launch(_BIN, '--python', _RECIPE)
-            t.wait_for('#a')
+            t.wait_for('a a')
             t.wait_stable()
             t.send('c')
             t.wait_for('-- create --')
@@ -109,7 +109,7 @@ class TestInsertMode(unittest.TestCase):
                 f'Right did not indent marker: base={base_col} '
                 f'after_right={indent_col}\n{indented}')
             # Right also expanded 'a' (▼), so its kids should now show.
-            self.assertIn('#a1', indented)
+            self.assertIn('a1 a1', indented)
 
             # Left outdents — marker moves back leftward (to ≤ base col).
             t.send('Left')
@@ -145,7 +145,7 @@ class TestInsertMode(unittest.TestCase):
             log = os.path.join(tmp, 'insert.log')
             with TmuxFixture(cols=120, rows=40, env={'INSERT_LOG': log}) as t:
                 t.launch(_BIN, '--python', _RECIPE)
-                t.wait_for('#a')
+                t.wait_for('a a')
                 t.send('c')
                 t.wait_for('-- create --')
                 t.send_bytes('\x1b')

@@ -102,9 +102,25 @@ def _sanitize_preview(text):
     return text.translate(_PREVIEW_SANITIZE_TABLE)
 
 
+def _id_visible(item, show_ids):
+    """Decide whether the id segment should be emitted for ``item``.
+
+    ``show_ids`` is one of ``'always'``, ``'auto'``, ``'never'``. In
+    ``'auto'`` mode the id is suppressed when ``str(item.id) ==
+    item.title`` — the common shape for line-based CLI input where the
+    id and title are the same string and showing both is pure
+    duplication.
+    """
+    if show_ids == 'always':
+        return True
+    if show_ids == 'never':
+        return False
+    return str(item.id) != item.title
+
+
 def format_item_segments(item, *, depth=0, base_depth=0, expanded=False,
                          selected=False, kind='normal', search_query='',
-                         format_item=None, ctx=None):
+                         format_item=None, ctx=None, show_ids='auto'):
     """Compute the (text, fg, bold) segment list for one row.
 
     Returns a list of ``(text, fg, bold)`` triples. When the user-supplied
@@ -118,7 +134,8 @@ def format_item_segments(item, *, depth=0, base_depth=0, expanded=False,
       - indentation:      ``2 * (depth - base_depth)`` spaces
       - expand marker:    ``'▼ '`` if ``expanded``,
                           ``'▶ '`` if ``item.has_children`` else ``'  '``
-      - id segment:       ``'#{id} '`` in yellow
+      - id segment:       ``'{id} '`` in yellow (gated on ``show_ids``;
+                          ``'auto'`` suppresses it when ``str(id) == title``)
       - tag segment:      ``'[{tag}] '`` styled per ``_TAG_STYLE`` (omitted
                           when ``item.tag`` is empty)
       - title segment:    ``item.title``
@@ -129,10 +146,9 @@ def format_item_segments(item, *, depth=0, base_depth=0, expanded=False,
         synthetic and don't participate in selection/expansion.
 
     Default layout for ``kind='scope_root'``:
-      - bolded ``'#{id} {title}'`` — the scope row at the top of the
-        list. No selection marker (the scope item itself isn't part of
-        the user's selection), no expand marker (it's always "expanded"
-        by definition of being the scope root).
+      - bolded ``'{id} {title}'`` (id segment gated on ``show_ids``,
+        same auto-suppression rule as the normal kind). No selection
+        marker, no expand marker.
 
     ``search_query`` is accepted for forward-compatibility with phase-2
     ticket #22; phase 1 ignores it (highlighting is applied later by
@@ -158,10 +174,11 @@ def format_item_segments(item, *, depth=0, base_depth=0, expanded=False,
         ]
 
     if kind == 'scope_root':
-        return [
-            ('#{} '.format(item.id), _ID_COLOR, True),
-            (item.title, _SCOPE_ROOT_FG, True),
-        ]
+        segs = []
+        if _id_visible(item, show_ids):
+            segs.append(('{} '.format(item.id), _ID_COLOR, True))
+        segs.append((item.title, _SCOPE_ROOT_FG, True))
+        return segs
 
     # ----- normal kind ------------------------------------------------
     sel_marker = '* ' if selected else '  '
@@ -175,8 +192,9 @@ def format_item_segments(item, *, depth=0, base_depth=0, expanded=False,
         (sel_marker, None, False),
         (indent, None, False),
         (expand_marker, _MARKER_COLOR, False),
-        ('#{} '.format(item.id), _ID_COLOR, False),
     ]
+    if _id_visible(item, show_ids):
+        segments.append(('{} '.format(item.id), _ID_COLOR, False))
 
     if item.tag:
         sfg, sbold = _TAG_STYLE.get(item.tag_style, _TAG_STYLE[''])
@@ -425,18 +443,24 @@ _SUB_WRAP = 80   # wrap child entries at this width
 _SUB_INDENT = '    '   # continuation indent for wrapped lines
 
 
-def _fmt_child(item):
+def _fmt_child(item, show_ids='auto'):
     """Format a child Item for the children grid.
 
-    Layout: ``'#{id} [{tag}] {title}'`` when ``item.tag`` is non-empty,
-    otherwise ``'#{id} {title}'``. The renderer in ``render_children_grid``
-    re-emits each entry through ``_write_segments`` so the tag picks up
-    its colour from ``_TAG_STYLE``; this helper produces the *plain*
-    text used for column-width measurement and wrapping.
+    Layout: ``'{id} [{tag}] {title}'`` when ``item.tag`` is non-empty,
+    otherwise ``'{id} {title}'``. The id prefix is gated on
+    ``show_ids`` (auto-suppresses when ``str(id) == title``). The
+    renderer in ``render_children_grid`` re-emits each entry through
+    ``_write_segments`` so the tag picks up its colour from
+    ``_TAG_STYLE``; this helper produces the *plain* text used for
+    column-width measurement and wrapping.
     """
+    parts = []
+    if _id_visible(item, show_ids):
+        parts.append('{} '.format(item.id))
     if item.tag:
-        return '#{} [{}] {}'.format(item.id, item.tag, item.title)
-    return '#{} {}'.format(item.id, item.title)
+        parts.append('[{}] '.format(item.tag))
+    parts.append(item.title)
+    return ''.join(parts)
 
 
 def _wrap_entry(text, width):
@@ -463,7 +487,7 @@ def _wrap_entry(text, width):
     return lines
 
 
-def _sub_layout(children, cols):
+def _sub_layout(children, cols, show_ids='auto'):
     """Compute the multi-column grid layout.
 
     Each entry is wrapped at ``_SUB_WRAP``. Column width is derived from
@@ -479,7 +503,7 @@ def _sub_layout(children, cols):
     if not children:
         return (1, cols, [], [])
 
-    raw = [_fmt_child(c) for c in children]
+    raw = [_fmt_child(c, show_ids=show_ids) for c in children]
     entry_lines = [_wrap_entry(e, _SUB_WRAP) for e in raw]
     slot_rows = [len(lines) for lines in entry_lines]
 
@@ -532,7 +556,7 @@ def _sub_total_rows(num_cols, slot_rows):
     return max(sum(slot_rows[s:e]) for s, e in ranges) if ranges else 0
 
 
-def _sub_needed_rows(children, cols):
+def _sub_needed_rows(children, cols, show_ids='auto'):
     """Number of content rows the grid would need to render ``children``.
 
     Returns 0 when there are no children. Caller adds 1 for the
@@ -540,11 +564,11 @@ def _sub_needed_rows(children, cols):
     """
     if not children:
         return 0
-    num_cols, _, slot_rows, _ = _sub_layout(children, cols)
+    num_cols, _, slot_rows, _ = _sub_layout(children, cols, show_ids=show_ids)
     return _sub_total_rows(num_cols, slot_rows)
 
 
-def _child_segments(item, max_width):
+def _child_segments(item, max_width, show_ids='auto'):
     """Build the ``(text, fg, bold)`` segment list for one grid entry.
 
     Mirrors the per-line layout produced by ``_fmt_child`` but with
@@ -552,7 +576,9 @@ def _child_segments(item, max_width):
     picks up its style from ``_TAG_STYLE``. Truncation is left to the
     caller (``_write_segments`` clamps at ``max_width``).
     """
-    segs = [('#{} '.format(item.id), _ID_COLOR, False)]
+    segs = []
+    if _id_visible(item, show_ids):
+        segs.append(('{} '.format(item.id), _ID_COLOR, False))
     if item.tag:
         sfg, sbold = _TAG_STYLE.get(item.tag_style, _TAG_STYLE[''])
         segs.append(('[{}] '.format(item.tag), sfg, sbold))
@@ -668,6 +694,7 @@ def render_list(browser, top, height, cols):
             search_query=browser._search_query,
             format_item=browser.format_item,
             ctx=None,
+            show_ids=browser.show_ids,
         )
 
         if is_cursor_line:
@@ -855,7 +882,9 @@ def render_children_grid(browser, top, height, cols, *, info=False):
         return
 
     # Cached non-empty children — multi-column flowed layout.
-    num_cols, col_width, slot_rows, entry_lines = _sub_layout(children, cols)
+    num_cols, col_width, slot_rows, entry_lines = _sub_layout(
+        children, cols, show_ids=browser.show_ids,
+    )
     ranges = _distribute_to_columns(num_cols, slot_rows)
 
     # Build per-column flat line lists + maps from row -> source entry
@@ -893,7 +922,7 @@ def render_children_grid(browser, top, height, cols, *, info=False):
             if src_idx is not None:
                 # First line of an entry — render with coloured segments.
                 child = children[src_idx]
-                segs = _child_segments(child, width)
+                segs = _child_segments(child, width, show_ids=browser.show_ids)
                 used = _write_segments(segs, min(width, len(cell)))
                 pad = width - used
                 if pad > 0:
@@ -1060,7 +1089,9 @@ def _layout_for(browser):
         if cursor is not None and cursor.has_children:
             cached = browser._state._children.get(cursor.id)
             if cached:
-                children_rows = _sub_needed_rows(cached, cols)
+                children_rows = _sub_needed_rows(
+                    cached, cols, show_ids=browser.show_ids,
+                )
             elif cached is None:
                 # Branch with not-yet-cached children — reserve one row
                 # for the loading hint so the grid is visible while the

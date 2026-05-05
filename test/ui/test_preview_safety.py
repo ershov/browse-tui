@@ -51,8 +51,9 @@ class TestPreviewSafety(unittest.TestCase):
                 '--children-cmd', 'echo /bin/ls',
                 '--preview-cmd', 'head -c 500 "$TUI_ID"',
                 '--no-children-pane',
+                '--show-ids', 'always',
             )
-            t.wait_for('#/bin/ls /bin/ls')
+            t.wait_for('/bin/ls /bin/ls')
             # Wait for the preview worker to deliver. ``ELF`` is the
             # first three bytes of any /bin/ls binary on Linux — a cheap
             # signal that the sanitised preview content has reached the
@@ -61,7 +62,7 @@ class TestPreviewSafety(unittest.TestCase):
             cap = t.wait_stable()
             # The list-pane cursor row is intact (raw control bytes
             # would have rewritten it).
-            self.assertIn('#/bin/ls /bin/ls', cap)
+            self.assertIn('/bin/ls /bin/ls', cap)
             # The preview body must contain '?' markers — a binary blob
             # of 500 bytes will have many control chars to sanitise.
             # We don't count the '?:help' substring in the info bar:
@@ -86,8 +87,9 @@ class TestPreviewSafety(unittest.TestCase):
                 '--children-cmd', 'echo file',
                 '--preview-cmd', r'printf "\x1b[31mRED\x1b[0m"',
                 '--no-children-pane',
+                '--show-ids', 'always',
             )
-            t.wait_for('#file file')
+            t.wait_for('file file')
             # Wait for the preview to land — looking for the sanitised
             # marker tells us both that the preview rendered AND that
             # the ESC byte was replaced with '?'.

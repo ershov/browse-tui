@@ -563,6 +563,10 @@ class Browser:
       help_outro:         optional prose shown at the bottom of the help
                           screen (and ``--help``); good for examples or
                           links. ``None`` elides the section.
+      show_ids:           one of 'always' / 'auto' (default) / 'never';
+                          controls whether the per-row id segment is
+                          shown. 'auto' suppresses id when it equals the
+                          title.
       _headless:          skip terminal init (default False) -- observable
                           here for tests; the real terminal init/teardown
                           branches on it once #9 lands.
@@ -583,6 +587,7 @@ class Browser:
                  print_format: str = '{id}',
                  help_intro: Optional[str] = None,
                  help_outro: Optional[str] = None,
+                 show_ids: str = 'auto',
                  _headless: bool = False) -> None:
         """Construct a Browser.
 
@@ -630,8 +635,21 @@ class Browser:
                 describe what their tool does.
             help_outro: Optional prose shown at the bottom of ``--help``
                 and the in-app help screen.
+            show_ids: One of ``'always'``, ``'auto'`` (default),
+                ``'never'``. Controls whether the per-row id segment is
+                rendered before the title. ``'auto'`` suppresses the id
+                when ``str(item.id) == item.title`` (the common shape
+                for line-based CLI input where showing both is pure
+                duplication); ``'always'`` forces it; ``'never'`` hides
+                it. Recipes can pin this value at construction; the CLI
+                exposes ``--show-ids``.
             _headless: Skip terminal init/teardown — used by tests.
         """
+        if show_ids not in ('always', 'auto', 'never'):
+            raise ValueError(
+                "show_ids must be one of 'always', 'auto', 'never'; "
+                f"got {show_ids!r}"
+            )
         # --- user-supplied data callbacks -------------------------------
         # Default get_children to "no children" so a Browser constructed
         # with no kwargs still works (tests, smoke checks). get_preview
@@ -655,6 +673,7 @@ class Browser:
         # ``None`` (the default) elides the corresponding section.
         self.help_intro = help_intro
         self.help_outro = help_outro
+        self.show_ids = show_ids
         self._headless = _headless
 
         # --- domain state ------------------------------------------------
