@@ -141,6 +141,80 @@ class TestHelpScreenInTui(unittest.TestCase):
                 t.send('?')
                 t.send('q')
 
+    def test_cursor_move_resets_preview_scroll(self):
+        """Scrolling the preview, then moving cursor, lands at top of new preview.
+
+        Without the reset, the new item's preview would scroll on with
+        the previous item's offset, hiding the first lines of content.
+
+        Markers ``HEAD_a``/``HEAD_b`` only appear on line 1 of each
+        preview; using a distinctive token (rather than ``line 1``)
+        avoids substring collisions with ``line 10``, ``line 11`` …
+        when the scroll ticks past ten.
+        """
+        with TmuxFixture(cols=80, rows=24) as t:
+            t.launch(
+                _BIN,
+                '--children-cmd', 'printf "a\\nb\\n"',
+                '--preview-cmd',
+                'printf "HEAD_%s\\n" "$TUI_ID"; '
+                'i=2; while [ $i -le 30 ]; do '
+                '  printf "%s mid %d\\n" "$TUI_ID" "$i"; '
+                '  i=$((i+1)); '
+                'done',
+                '--no-children-pane',
+                '--show-ids', 'always',
+            )
+            t.wait_for('a a')
+            t.wait_for('HEAD_a', timeout=5.0)
+            # Push the preview pane down by several lines. The
+            # browse-tui ``shift-down`` action is bound to the terminal's
+            # S-Down sequence.
+            for _ in range(5):
+                t.send('S-Down')
+            # Confirm we actually scrolled — line 1 leaves the visible
+            # window once enough lines have shifted up.
+            cap_scrolled = t.wait_stable()
+            self.assertNotIn('HEAD_a', cap_scrolled)
+            # Move cursor to b — preview pane should reset to the top.
+            t.send('j')
+            t.wait_for('HEAD_b', timeout=5.0)
+            cap = t.wait_stable()
+            self.assertIn('HEAD_b', cap)
+            t.send('q')
+
+    def test_cursor_move_dismisses_help_and_shows_preview(self):
+        """Navigating with the cursor closes the help overlay.
+
+        Open ``?``, move down, and confirm the help body is gone and
+        the per-item preview for the new cursor row took its place.
+        Without the fix, the help overlay stayed put even after the
+        cursor moved — leaving the user staring at a stale screen.
+
+        Uses ``--children-cmd`` (lazy mode) so the initial preview
+        fetch fires on startup; eager mode (``--root-cmd``) leaves the
+        first preview unrequested until a cursor move, which would
+        muddy this test's "before" state.
+        """
+        with TmuxFixture(cols=80, rows=24) as t:
+            t.launch(
+                _BIN,
+                '--children-cmd', 'printf "a\\nb\\n"',
+                '--preview-cmd', 'printf "PREVIEW-FOR-%s" "$TUI_ID"',
+                '--no-children-pane',
+                '--show-ids', 'always',
+            )
+            t.wait_for('a a')
+            t.wait_for('PREVIEW-FOR-a', timeout=5.0)
+            t.send('?')
+            t.wait_for('NAVIGATION')
+            t.send('j')   # cursor → b
+            t.wait_for('PREVIEW-FOR-b', timeout=5.0)
+            cap = t.wait_stable()
+            self.assertNotIn('NAVIGATION', cap)
+            self.assertIn('PREVIEW-FOR-b', cap)
+            t.send('q')
+
 
 class TestRecipeHelpFlag(unittest.TestCase):
     """Recipes that don't argparse their own argv get -h/--help for free.

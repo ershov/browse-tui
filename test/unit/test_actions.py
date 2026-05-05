@@ -546,6 +546,77 @@ class TestPreviewScrollActions(unittest.TestCase):
             b.stop_workers()
 
 
+class TestPreviewResetOnCursorMove(unittest.TestCase):
+    """Cursor moves reset ``_preview_scroll`` and dismiss ``_help_mode``.
+
+    The contract: each cursor move begins a fresh preview view. Stale
+    scroll offset from the previous item must not bleed in, and a
+    help overlay opened with ``?`` must dismiss as soon as the user
+    navigates — they expect the new item's preview, not stale state.
+    """
+
+    def _three_root_items(self):
+        b = _make_browser()
+        b._state._children[None] = [Item(id='A'), Item(id='B'), Item(id='C')]
+        # Prime _preview_cursor_id by pretending the preview pipeline
+        # has already settled on the cursor row (mirrors the main loop's
+        # initial _update_preview_for_cursor call before the user
+        # touches the keyboard).
+        b._update_preview_for_cursor()
+        return b
+
+    def test_cursor_move_resets_preview_scroll(self):
+        b = self._three_root_items()
+        try:
+            ctx = _ctx_for(b)
+            b._preview_scroll = 5
+            dispatch_key(b, ctx, 'j')
+            b._update_preview_for_cursor()
+            self.assertEqual(b._preview_scroll, 0)
+        finally:
+            b.stop_workers()
+
+    def test_cursor_move_dismisses_help_mode(self):
+        b = self._three_root_items()
+        try:
+            ctx = _ctx_for(b)
+            b._help_mode = True
+            dispatch_key(b, ctx, 'j')
+            b._update_preview_for_cursor()
+            self.assertFalse(b._help_mode)
+        finally:
+            b.stop_workers()
+
+    def test_no_movement_preserves_scroll_and_help(self):
+        """Same cursor item across calls → no reset (idempotent re-fire)."""
+        b = self._three_root_items()
+        try:
+            b._preview_scroll = 4
+            b._help_mode = True
+            b._update_preview_for_cursor()
+            # Cursor didn't change between primer call and this one.
+            self.assertEqual(b._preview_scroll, 4)
+            self.assertTrue(b._help_mode)
+        finally:
+            b.stop_workers()
+
+    def test_cursor_move_marks_preview_dirty(self):
+        b = self._three_root_items()
+        try:
+            ctx = _ctx_for(b)
+            b._needs_redraw.clear()
+            dispatch_key(b, ctx, 'j')
+            # ``j`` itself adds 'preview'; clear and re-fire the helper
+            # to confirm the helper alone dirties the preview when the
+            # cursor identity changes.
+            b._needs_redraw.clear()
+            b._state.cursor = 2
+            b._update_preview_for_cursor()
+            self.assertIn('preview', b._needs_redraw)
+        finally:
+            b.stop_workers()
+
+
 # --- ticket #75: page sizes track terminal height -------------------------
 
 

@@ -745,6 +745,13 @@ class Browser:
         # lives in the action layer (#12); the renderer just observes
         # the flag.
         self._help_mode = False
+        # Last cursor item id we drove the preview pane to. Set by
+        # _update_preview_for_cursor; when the cursor lands on a
+        # different (or no) item we treat that as a navigation event
+        # and reset the preview pane: scroll back to the top and
+        # dismiss the help overlay so the user sees the new item's
+        # preview, not stale state from the previous one.
+        self._preview_cursor_id = None
         # List-pane scroll offset (rows from top of the visible list).
         # Maintained by render_list to keep the cursor on-screen; lives
         # on Browser so partial redraws remember it across calls.
@@ -1444,20 +1451,35 @@ class Browser:
         non-normal entry (placeholder / scope-root). Called by the main
         loop after every dispatched key so cursor moves trigger
         latest-wins preview fetches.
+
+        When the cursor lands on a different item (or off any normal
+        item) since the last call, the preview pane is reset: scroll
+        offset returns to 0 and help mode (if active) is dismissed so
+        the user sees the new item's preview, not stale state.
         """
         if not self.show_preview:
             return
         state = self._state
         vis = visible_items(state)
-        if not (0 <= state.cursor < len(vis)):
+
+        new_id = None
+        if 0 <= state.cursor < len(vis):
+            entry = vis[state.cursor]
+            if entry.kind == 'normal':
+                new_id = entry.item.id
+
+        if new_id != self._preview_cursor_id:
+            self._preview_cursor_id = new_id
+            self._preview_scroll = 0
+            if self._help_mode:
+                self._help_mode = False
+            self._needs_redraw.add('preview')
+
+        if new_id is None:
             self._preview_req = None
             return
-        entry = vis[state.cursor]
-        if entry.kind != 'normal':
-            self._preview_req = None
-            return
-        if entry.item.id != self._preview_req:
-            self.request_preview(entry.item.id)
+        if new_id != self._preview_req:
+            self.request_preview(new_id)
 
     def _update_children_for_cursor(self) -> None:
         """Kick a children fetch for the cursor item if it's an unfetched branch.
