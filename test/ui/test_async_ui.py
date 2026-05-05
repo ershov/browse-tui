@@ -13,6 +13,9 @@ _BIN = os.path.abspath('./browse-tui')
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _SLOW_RECIPE = os.path.join(_REPO, 'test', 'ui', 'recipes', 'slow_children.py')
 _WATCH_RECIPE = os.path.join(_REPO, 'test', 'ui', 'recipes', 'fs_watcher.py')
+_SLOW_ROOT_RECIPE = os.path.join(
+    _REPO, 'test', 'ui', 'recipes', 'slow_root_with_preview.py'
+)
 
 
 def setUpModule():
@@ -44,6 +47,25 @@ class TestAsyncUI(unittest.TestCase):
             self.assertNotIn('loading', screen)
             self.assertIn('alpha', screen)
             self.assertIn('beta', screen)
+
+    def test_preview_appears_after_slow_root_without_keypress(self):
+        """When root children resolve after the startup wait, the preview
+        pane fills automatically — no key press required.
+
+        Regression for ticket #124: ``_update_preview_for_cursor`` used to
+        run only after key dispatch in the main loop, so a slow root
+        fetch left the preview blank until the user pressed something.
+        Now it also runs at the top of every iteration, after applying
+        worker results.
+        """
+        with TmuxFixture(cols=80, rows=24) as t:
+            # 1.2s root fetch (well past Browser.run()'s 500ms startup).
+            t.launch(_BIN, '--run-py', _SLOW_ROOT_RECIPE, '1.2')
+            # First wait for the recipe's items to land.
+            t.wait_for('alpha', timeout=3.0)
+            # Then the preview content should appear *without* any
+            # keystroke. The recipe's preview text is "PREVIEW:alpha".
+            t.wait_for('PREVIEW:alpha', timeout=2.0)
 
     def test_background_watcher_refreshes_list(self):
         """File-watching recipe picks up an external mutation and the UI

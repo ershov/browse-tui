@@ -1387,6 +1387,17 @@ class Browser:
                 self.apply_children_results()
                 self.apply_preview_result()
 
+                # Re-derive preview / children fetches for the current
+                # cursor *after* applying worker deliveries — when a
+                # slow get_children resolves long after the startup
+                # wait, the cursor-on-row-0 finally points at a real
+                # item and we need to kick the preview now (otherwise
+                # the preview pane stays blank until the user presses
+                # a key, since the bottom-of-loop call only fires
+                # after key dispatch). Both helpers are idempotent.
+                self._update_preview_for_cursor()
+                self._update_children_for_cursor()
+
                 # Resize flag — set by SIGWINCH handler in 020-terminal.
                 # Bare-name access works in the concatenated build; in
                 # tests this attribute is injected onto the module.
