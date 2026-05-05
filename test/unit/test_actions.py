@@ -1172,5 +1172,59 @@ class TestListScrollDecoupledFromCursor(unittest.TestCase):
         b.stop_workers()
 
 
+class TestApplyChildrenResultsClampsCursor(unittest.TestCase):
+    """``apply_children_results`` clamps ``state.cursor`` to the new list size.
+
+    Regression for ticket #125: a watcher-driven refresh could deliver a
+    smaller children list, leaving ``state.cursor`` past the visible
+    list end. The renderer then skips the cursor row (no crash) but the
+    cursor effectively disappears until the user presses j/k.
+    """
+
+    def _browser_with_root(self, ids):
+        b = _make_browser()
+        b._state._children[None] = [Item(id=i) for i in ids]
+        return b
+
+    def test_cursor_clamped_when_list_shrinks(self):
+        b = self._browser_with_root(['A', 'B', 'C'])
+        b._state.cursor = 2
+        # Simulate a worker delivery that shrinks the root.
+        b._children_results.append((None, [Item(id='A')]))
+        applied = b.apply_children_results()
+        self.assertEqual(applied, 1)
+        self.assertEqual(b._state.cursor, 0)
+        b.stop_workers()
+
+    def test_cursor_clamped_to_zero_when_list_empties(self):
+        b = self._browser_with_root(['A', 'B'])
+        b._state.cursor = 1
+        b._children_results.append((None, []))
+        b.apply_children_results()
+        self.assertEqual(b._state.cursor, 0)
+        b.stop_workers()
+
+    def test_cursor_unchanged_when_still_valid(self):
+        b = self._browser_with_root(['A', 'B', 'C', 'D', 'E'])
+        b._state.cursor = 1
+        b._children_results.append(
+            (None, [Item(id=x) for x in ('A', 'B', 'C')])
+        )
+        b.apply_children_results()
+        # Cursor was within the new list — stays put.
+        self.assertEqual(b._state.cursor, 1)
+        b.stop_workers()
+
+    def test_cursor_unchanged_when_list_grows(self):
+        b = self._browser_with_root(['A', 'B'])
+        b._state.cursor = 1
+        b._children_results.append(
+            (None, [Item(id=x) for x in ('A', 'B', 'C', 'D')])
+        )
+        b.apply_children_results()
+        self.assertEqual(b._state.cursor, 1)
+        b.stop_workers()
+
+
 if __name__ == '__main__':
     unittest.main()

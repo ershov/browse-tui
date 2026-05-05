@@ -1061,6 +1061,17 @@ class Browser:
                 p._resolve()
             n += 1
         if n:
+            # If the apply shrank the visible list past the cursor,
+            # clamp it so the cursor still indexes a real row. Without
+            # this, a watcher-driven refresh that removes items can
+            # leave state.cursor past len(visible) — the renderer
+            # skips the row (no crash) but the cursor effectively
+            # disappears until the user presses j/k.
+            vis = visible_items(self._state)
+            if vis and self._state.cursor >= len(vis):
+                self._state.cursor = len(vis) - 1
+            elif not vis:
+                self._state.cursor = 0
             self._needs_redraw.add('list')
             # The cache may have just filled the cursor item's
             # children — flag the grid pane for redraw too. Render-time
