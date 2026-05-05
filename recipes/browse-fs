@@ -110,6 +110,9 @@ def mtime_watcher(browser):
 _HELP_INTRO = """\
 browse-fs — interactive filesystem browser.
 
+Usage: browse-fs [ROOT]
+  ROOT    Directory to start in. Defaults to the current working directory.
+
 Lazily walks directories with os.scandir; the preview pane shows file
 heads or directory listings. The selection / cursor seeds $TUI_IDS_FILE
 for the actions below; mtime changes refresh the affected directory

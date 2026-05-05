@@ -5,6 +5,22 @@
 # Extra args are passed through to find (e.g. -type f -name '*.py').
 set -euo pipefail
 
+case "${1:-}" in
+    -h|--help)
+        cat <<'EOF'
+browse-find — recursive file picker over `find -print0`.
+
+Usage: browse-find [ROOT [find-args...]]
+  ROOT         Directory to walk. Defaults to the current directory.
+  find-args    Extra arguments forwarded verbatim to `find` after ROOT,
+               e.g. `-type f -name '*.py'`.
+
+NUL-safe: works correctly with paths containing spaces or newlines.
+EOF
+        exit 0
+        ;;
+esac
+
 BIN="$(command -v browse-tui || true)"
 [ -n "$BIN" ] && [ -x "$BIN" ] || \
     BIN="$(dirname "$(realpath "$0")")/../browse-tui"

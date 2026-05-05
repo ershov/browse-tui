@@ -5,6 +5,21 @@
 # Tested against GNU ls; BSD ls output may differ slightly (adapt the regex).
 set -euo pipefail
 
+case "${1:-}" in
+    -h|--help)
+        cat <<'EOF'
+browse-ls — `ls -lA` browser with mode/owner/size/date/name columns.
+
+Usage: browse-ls [DIR]
+  DIR    Directory to list. Defaults to the current directory.
+
+Tested against GNU ls; BSD ls output may differ slightly (adapt the
+regex inside the script if needed).
+EOF
+        exit 0
+        ;;
+esac
+
 BIN="$(command -v browse-tui || true)"
 [ -n "$BIN" ] && [ -x "$BIN" ] || \
     BIN="$(dirname "$(realpath "$0")")/../browse-tui"

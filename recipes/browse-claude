@@ -659,6 +659,11 @@ def _action_show_id(ctx):
 _HELP_INTRO = """\
 browse-claude — Claude Code project / session / message browser.
 
+Usage: browse-claude [PROJECT]
+  PROJECT    Project directory name under ~/.claude/projects/ to drill into
+             on launch (sets the initial scope). Without a name, the tree
+             opens at the project list.
+
 Walks ~/.claude/projects/ to surface a four-level tree: projects ->
 sessions -> messages (or subagents) -> subagent messages. Drill into
 a transcript with Right/Alt-Down; preview shows the rendered turn.

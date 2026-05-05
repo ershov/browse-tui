@@ -360,6 +360,10 @@ def _action_command_log(ctx):
 _HELP_INTRO = """\
 browse-plan — drop-in replacement for plan-tui on the browse-tui core.
 
+Usage: browse-plan [TICKET_ID]
+  TICKET_ID    Numeric ticket id to drill into on launch (sets the initial
+               scope). Without an id, the tree opens at the project root.
+
 Browse the active plan-CLI tree by status, drill into subtrees, edit
 or view tickets, and bulk-pick statuses across selections. The cursor
 or selection seeds the actions below; the recipe shells out to the
@@ -369,7 +373,11 @@ or selection seeds the actions below; the recipe shells out to the
 
 def main():
     initial_scope = None
-    if len(sys.argv) > 1:
+    # Skip argv[1] when it's a flag (e.g. -h / --help) — Browser.run()'s
+    # auto-detect short-circuits to print recipe-aware help, and parsing
+    # '--help' as an int would otherwise produce a misleading
+    # "invalid ticket id" error.
+    if len(sys.argv) > 1 and not sys.argv[1].startswith('-'):
         try:
             initial_scope = int(sys.argv[1])
         except ValueError:

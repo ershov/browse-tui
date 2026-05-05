@@ -4,6 +4,21 @@
 # Prints the selected path on stdout (default --on-enter print-exit).
 set -euo pipefail
 
+case "${1:-}" in
+    -h|--help)
+        cat <<'EOF'
+browse-files — fzf-like single-directory file picker with preview.
+
+Usage: browse-files [DIR]
+  DIR    Directory to list. Defaults to the current directory.
+
+Prints the selected path on stdout. Pipe-friendly:
+  EDITOR=vi $(browse-files .)
+EOF
+        exit 0
+        ;;
+esac
+
 # Locate the browse-tui binary: PATH first, else sibling of this script.
 BIN="$(command -v browse-tui || true)"
 [ -n "$BIN" ] && [ -x "$BIN" ] || \
