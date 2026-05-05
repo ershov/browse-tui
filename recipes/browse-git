@@ -3,7 +3,7 @@
 
 Three levels:
 
-  level 0: recent commits        (``git log --oneline -n 50``)
+  level 0: recent commits        (``git log --oneline -n 500``)
   level 1: files changed         (``git show --name-only <sha>``)
   level 2: per-file unified diff (``git show <sha> -- <path>``)
 
@@ -24,7 +24,7 @@ import sys
 from browse_tui import Browser, Item
 
 
-_LOG_LIMIT = 50
+_LOG_LIMIT = 500
 
 
 def _run_git(*args):
@@ -102,7 +102,7 @@ def get_preview(item_id):
 _HELP_INTRO = """\
 browse-git — drill from recent commits into changed files into diffs.
 
-Three levels: a recent ``git log -n 50``; the files changed in the
+Three levels: a recent ``git log -n 500``; the files changed in the
 selected commit; and the per-file unified diff for that commit.
 Read-only — preview shows the diff (or stat / message at level 0).\
 """
