@@ -1160,6 +1160,12 @@ class Browser:
             id_ = self._state.root_id
         else:
             cache_invalidate_subtree(self._state, id_)
+        # Force the next ``_update_preview_for_cursor`` to re-fetch.
+        # The ``_preview_cursor_id`` gate (#126) skips re-requests when
+        # the cursor stays on the same item, but a refresh just
+        # invalidated the underlying data, so the cached preview text
+        # is stale and a re-fetch is the correct action.
+        self._preview_cursor_id = None
         # Always register the waiter so it resolves with the fetch result.
         self._children_in_flight.setdefault(id_, []).append(pending)
         # Only enqueue + flag pending the first time -- a fetch already in
@@ -1482,13 +1488,19 @@ class Browser:
 
         No-op when previews are disabled or when the cursor is on a
         non-normal entry (placeholder / scope-root). Called by the main
-        loop after every dispatched key so cursor moves trigger
-        latest-wins preview fetches.
+        loop at the top of every iteration (post-#124) so cursor moves
+        and worker deliveries both trigger latest-wins preview fetches.
 
         When the cursor lands on a different item (or off any normal
         item) since the last call, the preview pane is reset: scroll
         offset returns to 0 and help mode (if active) is dismissed so
         the user sees the new item's preview, not stale state.
+
+        Idempotency note: the gate is ``_preview_cursor_id`` (only
+        updated when the cursor moves to a different item), NOT
+        ``_preview_req`` (cleared by the worker after each fetch). A
+        ``_preview_req`` gate would cause a hot fetch loop now that
+        this runs every iteration — see ticket #126.
         """
         if not self.show_preview:
             return
@@ -1501,18 +1513,22 @@ class Browser:
             if entry.kind == 'normal':
                 new_id = entry.item.id
 
-        if new_id != self._preview_cursor_id:
-            self._preview_cursor_id = new_id
-            self._preview_scroll = 0
-            if self._help_mode:
-                self._help_mode = False
-            self._needs_redraw.add('preview')
+        if new_id == self._preview_cursor_id:
+            # Cursor still on the same item — already requested in a
+            # prior call, the worker either resolved or is in flight.
+            # Re-firing now would kick a redundant fetch every iteration.
+            return
+
+        self._preview_cursor_id = new_id
+        self._preview_scroll = 0
+        if self._help_mode:
+            self._help_mode = False
+        self._needs_redraw.add('preview')
 
         if new_id is None:
             self._preview_req = None
             return
-        if new_id != self._preview_req:
-            self.request_preview(new_id)
+        self.request_preview(new_id)
 
     def _list_pane_height_safe(self) -> int:
         """Return the list pane's height, or 0 if it can't be determined.

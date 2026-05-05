@@ -101,11 +101,30 @@ def _handle_sigwinch(signum, frame):
     notify_wake()
 
 def _handle_sigtstp(signum, frame):
-    """Restore terminal, then re-raise SIGTSTP with the default handler."""
+    """Restore terminal, then re-raise SIGTSTP with the default handler.
+
+    The trailing ``signal.signal(SIGCONT, ...)`` after ``os.kill`` is
+    deliberate, NOT redundant. Python's signal handler dispatch only
+    runs Python-level handlers at certain bytecode checkpoints — bare
+    ``RETURN_VALUE`` after the ``os.kill`` call does not always trigger
+    the check, so on resume from SIGTSTP the queued ``_handle_sigcont``
+    handler can be deferred until the main loop's next ``read_key``
+    select wakes for some other reason. By the time it does run, the
+    test fixture has often already captured a stale (bash-prompt)
+    screen.
+    A trailing function call after ``os.kill`` reliably yields a
+    bytecode checkpoint, so SIGCONT runs synchronously on the resume
+    path, ``_enter_raw`` re-paints the alt screen, and the next render
+    pass shows the TUI state.
+    """
     _leave_raw()
     # Temporarily set default handler so re-raise actually stops the process
     signal.signal(signal.SIGTSTP, signal.SIG_DFL)
     os.kill(os.getpid(), signal.SIGTSTP)
+    # Trailing CALL bytecode — see docstring above. Re-asserting the
+    # SIGCONT handler is also harmless and self-documents the intent
+    # ("on resume, this is the handler we want").
+    signal.signal(signal.SIGCONT, _handle_sigcont)
 
 def _handle_sigcont(signum, frame):
     """Re-enter raw mode after being resumed from a SIGTSTP stop."""
