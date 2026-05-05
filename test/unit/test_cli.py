@@ -76,6 +76,63 @@ class TestArgParser(unittest.TestCase):
         self.assertEqual(args.python, 'recipe.py')
         self.assertEqual(extras, ['-x', 'arg'])
 
+    def test_python_passthrough_no_dashes(self):
+        # New contract: everything after ``--python SCRIPT`` becomes the
+        # recipe's argv, no ``--`` separator required.
+        args, extras = _cli.parse_args([
+            '--python', 'recipe.py', '-x', 'arg',
+        ])
+        self.assertEqual(args.python, 'recipe.py')
+        self.assertEqual(extras, ['-x', 'arg'])
+
+    def test_python_passthrough_with_recipe_path_arg(self):
+        # The motivating case: ``browse-tui --python recipes/browse-fs ~/foo``
+        # used to crash because ``~/foo`` was parsed as a binary positional.
+        args, extras = _cli.parse_args([
+            '--python', 'recipes/browse-fs', '/tmp/some/dir',
+        ])
+        self.assertEqual(args.python, 'recipes/browse-fs')
+        self.assertEqual(extras, ['/tmp/some/dir'])
+
+    def test_python_passthrough_recipe_flags_not_consumed(self):
+        # Flag names that overlap with browse-tui's own should reach the
+        # recipe untouched when they appear after --python SCRIPT.
+        args, extras = _cli.parse_args([
+            '--python', 'recipe.py',
+            '--no-preview', '--children-cmd', 'ls',
+        ])
+        # Binary defaults — the recipe owns these flags now.
+        self.assertFalse(args.no_preview)
+        self.assertIsNone(args.children_cmd)
+        self.assertEqual(extras, ['--no-preview', '--children-cmd', 'ls'])
+
+    def test_python_equals_form_passes_args(self):
+        # ``--python=SCRIPT`` is a single token; following args still go
+        # to the recipe.
+        args, extras = _cli.parse_args([
+            '--python=recipe.py', '-x', 'arg',
+        ])
+        self.assertEqual(args.python, 'recipe.py')
+        self.assertEqual(extras, ['-x', 'arg'])
+
+    def test_python_no_args(self):
+        # Bare ``--python SCRIPT`` with nothing after is fine.
+        args, extras = _cli.parse_args(['--python', 'recipe.py'])
+        self.assertEqual(args.python, 'recipe.py')
+        self.assertEqual(extras, [])
+
+    def test_binary_flags_before_python_still_parsed(self):
+        # Flags that come BEFORE --python are owned by the binary as
+        # always; only flags AFTER the script path go to the recipe.
+        args, extras = _cli.parse_args([
+            '--command-log',
+            '--python', 'recipe.py',
+            '--recipe-flag',
+        ])
+        self.assertTrue(args.command_log)
+        self.assertEqual(args.python, 'recipe.py')
+        self.assertEqual(extras, ['--recipe-flag'])
+
 
 class TestRecordSepDecoding(unittest.TestCase):
     """Translation of ``--record-sep`` flag values to raw bytes."""

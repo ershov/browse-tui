@@ -289,18 +289,30 @@ Install / uninstall mode never enters the TUI; the action runs and exits.
 
 ## `--python` mode
 
-`--python SCRIPT [-- args…]` runs a Python recipe. The running binary
+`--python SCRIPT [args…]` runs a Python recipe. The running binary
 self-injects into `sys.modules['browse_tui']` before exec, so the recipe can
 `from browse_tui import Browser, Item, Action` with no install.
 
 ```bash
 browse-tui --python recipes/browse-fs ~
-browse-tui --python ./my-recipe.py -- --my-flag value
+browse-tui --python ./my-recipe.py --my-flag value
 ```
 
-Anything before `--` is parsed as `browse-tui`'s args; anything after `--`
-becomes `sys.argv[1:]` of the recipe (with `sys.argv[0]` set to the script
-path).
+**Argument routing.** Every argument that appears *after* `SCRIPT` is
+forwarded to the recipe verbatim — it becomes `sys.argv[1:]` of the
+recipe (with `sys.argv[0]` set to the script path). Flags that should
+be consumed by `browse-tui` itself must therefore appear *before*
+`--python`. A leading `--` between `SCRIPT` and the recipe args is
+accepted for backward compatibility but no longer required:
+
+```bash
+# Equivalent — the leading `--` is optional.
+browse-tui --python ./my-recipe.py -- --my-flag value
+browse-tui --python ./my-recipe.py    --my-flag value
+
+# Binary flag goes first; recipe flag goes after the script.
+browse-tui --command-log --python ./my-recipe.py --my-flag value
+```
 
 ### Shebang trick
 

@@ -489,7 +489,11 @@ def build_argparser() -> argparse.ArgumentParser:
                    help='Overwrite existing installed binary if it differs.')
     # --python loader
     p.add_argument('--python', metavar='SCRIPT', default=None,
-                   help='Run a Python recipe. Remaining args become sys.argv.')
+                   help='Run a Python recipe. Every argument after '
+                        'SCRIPT is passed to the recipe as sys.argv. '
+                        'A leading "--" between SCRIPT and the recipe '
+                        'args is allowed for compatibility but no '
+                        'longer required.')
     # Debug / ops
     p.add_argument('--command-log', action='store_true',
                    help='Show command log on quit.')
@@ -502,14 +506,50 @@ def parse_args(argv: list) -> tuple:
     """Parse ``argv`` (list[str], excluding program name).
 
     Returns ``(args, extras)``: ``args`` is the namespace; ``extras`` is
-    everything after a literal ``--`` (forwarded to ``--python`` script as
-    ``sys.argv``). The ``--`` token itself is consumed, never forwarded.
+    the recipe's argv (forwarded to ``--python`` script as ``sys.argv``).
+
+    Splitting rules:
+
+    * If ``--python SCRIPT`` (or ``--python=SCRIPT``) appears in argv,
+      everything after the script path goes to the recipe verbatim. No
+      ``--`` separator is required. A single leading ``--`` in the
+      recipe argv is stripped for backward compatibility — the old
+      contract required a ``--`` and existing recipes / docs still
+      use it.
+    * If ``--python`` is absent, the legacy ``--`` split applies:
+      everything after ``--`` goes to ``extras``. Without ``--python``,
+      ``extras`` is currently ignored by ``main()`` — kept for back-
+      compat in case anything in the wild relies on it.
     """
-    if '--' in argv:
-        idx = argv.index('--')
-        head, extras = argv[:idx], argv[idx + 1:]
+    head, extras = argv, []
+    for i, tok in enumerate(argv):
+        if tok == '--python':
+            # ``--python SCRIPT`` — script is at argv[i+1]; everything
+            # after is recipe argv. If the user typed just ``--python``
+            # with no value, fall through to argparse so it surfaces
+            # the error.
+            if i + 1 < len(argv):
+                head = argv[: i + 2]
+                extras = argv[i + 2:]
+            break
+        if tok.startswith('--python='):
+            # ``--python=SCRIPT`` — single token; everything after goes
+            # to the recipe.
+            head = argv[: i + 1]
+            extras = argv[i + 1:]
+            break
     else:
-        head, extras = argv, []
+        # No ``--python`` present: legacy ``--`` split.
+        if '--' in argv:
+            idx = argv.index('--')
+            head, extras = argv[:idx], argv[idx + 1:]
+
+    # Back-compat: ``browse-tui --python foo -- arg`` used to be the
+    # only way to forward args. Strip one leading ``--`` so existing
+    # invocations keep working unchanged.
+    if extras and extras[0] == '--':
+        extras = extras[1:]
+
     p = build_argparser()
     args = p.parse_args(head)
     return args, extras
