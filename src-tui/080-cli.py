@@ -1061,6 +1061,37 @@ def _reopen_stdin_from_tty():
     sys.stdin = os.fdopen(0, 'r', buffering=1)
 
 
+def _make_preview_fetcher(preview_cmd, timeout):
+    """Return a ``get_preview(item_id)`` closure for ``--preview-cmd``, or None.
+
+    Each invocation runs ``/bin/bash -c <preview_cmd>`` with
+    ``TUI_ID=<item_id>`` in the environment and returns stdout as text.
+    Errors and timeouts surface as inline ``[error] ...`` strings rather
+    than raising, so a flaky preview doesn't crash the UI.
+
+    Used by both the eager (``--root-cmd``) and lazy (``--children-cmd``)
+    browser builders so ``--preview-cmd`` works regardless of how the
+    children were sourced.
+    """
+    if not preview_cmd:
+        return None
+
+    def _get_preview(item_id):
+        env = {**os.environ, 'TUI_ID': str(item_id) if item_id is not None else ''}
+        try:
+            proc = subprocess.run(
+                ['/bin/bash', '-c', preview_cmd],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+            )
+        except Exception as e:
+            return f'[error] {type(e).__name__}: {e}'
+        return proc.stdout.decode('utf-8', errors='replace')
+    return _get_preview
+
+
 def _build_lazy_browser(args, fields, record_sep):
     """Build a Browser whose children/preview lookups shell out lazily.
 
@@ -1071,7 +1102,6 @@ def _build_lazy_browser(args, fields, record_sep):
     UI.
     """
     children_cmd = args.children_cmd
-    preview_cmd = args.preview_cmd
     timeout = args.action_timeout
     fmt = args.input
 
@@ -1093,23 +1123,7 @@ def _build_lazy_browser(args, fields, record_sep):
             proc.stdout, fmt=fmt, fields=fields, record_sep=record_sep,
         ))
 
-    if preview_cmd:
-        def _get_preview(item_id):
-            env = {**os.environ, 'TUI_ID': str(item_id) if item_id is not None else ''}
-            try:
-                proc = subprocess.run(
-                    ['/bin/bash', '-c', preview_cmd],
-                    env=env,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=timeout,
-                )
-            except Exception as e:
-                return f'[error] {type(e).__name__}: {e}'
-            return proc.stdout.decode('utf-8', errors='replace')
-        get_preview = _get_preview
-    else:
-        get_preview = None
+    get_preview = _make_preview_fetcher(args.preview_cmd, timeout)
 
     return Browser(
         title=args.title,
@@ -1183,6 +1197,7 @@ def _build_eager_browser(args, fields, record_sep):
         help_intro=_resolve_help_text(args.help_intro) if args.help_intro else None,
         help_outro=_resolve_help_text(args.help_outro) if args.help_outro else None,
         show_ids=args.show_ids,
+        get_preview=_make_preview_fetcher(args.preview_cmd, args.action_timeout),
     )
 
 

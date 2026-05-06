@@ -17,12 +17,18 @@ from test.unit._loader import load
 
 
 _data = load('_browse_tui_data', '030-data.py')
+_term = load('_browse_tui_term', '020-terminal.py')
+_state = load('_browse_tui_state', '040-state.py')
 _actions = load('_browse_tui_actions', '070-actions.py')
 _cli = load('_browse_tui_cli', '080-cli.py')
 
-# ``make_cli_action`` references ``Action`` by bare name — in the
-# concatenated build that's resolved across modules; for tests we inject.
+# Cross-module name wiring (concatenated builds resolve these naturally).
+_state.Item = _data.Item
+_state.to_item = _data.to_item
+_state.notify_wake = _term.notify_wake
 _cli.Action = _actions.Action
+_cli.Browser = _state.Browser
+_cli.Item = _data.Item
 # Headless tests don't have a real terminal; stub the suspend/resume hooks.
 _cli.term_suspend = lambda: None
 _cli.term_resume = lambda: None
@@ -472,6 +478,84 @@ class TestRunPyLoader(unittest.TestCase):
             self.assertEqual(getattr(_cli, '_test_marker', None), 'OK')
         finally:
             os.unlink(script)
+
+
+class TestPreviewFetcherWiring(unittest.TestCase):
+    """``--preview-cmd`` must wire ``browser.get_preview`` for both builders.
+
+    Regression: ``_build_eager_browser`` (the ``--root-cmd`` path) used
+    to drop ``args.preview_cmd`` on the floor — only the lazy
+    ``--children-cmd`` path constructed the fetcher. As a result the v/e
+    bindings reported "No preview available" when launched with a
+    ``--root-cmd`` recipe, even when ``--preview-cmd`` was supplied.
+    """
+
+    def test_make_preview_fetcher_returns_none_when_unset(self):
+        self.assertIsNone(_cli._make_preview_fetcher('', timeout=5))
+        self.assertIsNone(_cli._make_preview_fetcher(None, timeout=5))
+
+    def test_make_preview_fetcher_runs_command_with_tui_id(self):
+        # Smoke: a real shell invocation. ``echo $TUI_ID`` produces the
+        # id followed by a newline.
+        get_preview = _cli._make_preview_fetcher('echo "$TUI_ID"', timeout=5)
+        self.assertIsNotNone(get_preview)
+        self.assertEqual(get_preview('item-42'), 'item-42\n')
+
+    def test_make_preview_fetcher_returns_error_string_on_timeout(self):
+        # subprocess.TimeoutExpired must surface as an inline error, not
+        # a raise — a flaky preview shouldn't crash the UI.
+        get_preview = _cli._make_preview_fetcher('sleep 5', timeout=0.1)
+        result = get_preview('x')
+        self.assertTrue(result.startswith('[error]'),
+                        f'expected [error] prefix, got: {result!r}')
+
+    def test_eager_builder_wires_preview_fetcher(self):
+        # Build via parse_args → _build_eager_browser; verify get_preview
+        # is set when --preview-cmd is supplied alongside --root-cmd.
+        # Use a heredoc-ish argv that produces 2 rows.
+        args, _ = _cli.parse_args([
+            '--root-cmd', "printf 'a\\nb\\n'",
+            '--preview-cmd', 'echo PREVIEW-OF-$TUI_ID',
+        ])
+        b = _cli._build_eager_browser(args, fields=['id', 'title'], record_sep=b'\n')
+        try:
+            self.assertIsNotNone(b)
+            self.assertIsNotNone(
+                b.get_preview,
+                '--root-cmd + --preview-cmd should produce a get_preview',
+            )
+            self.assertEqual(b.get_preview('a'), 'PREVIEW-OF-a\n')
+        finally:
+            if b is not None:
+                b.stop_workers()
+
+    def test_eager_builder_no_preview_cmd_yields_none(self):
+        # Without --preview-cmd, browser.get_preview stays None (as
+        # before — this is the v/e "No preview available" path).
+        args, _ = _cli.parse_args([
+            '--root-cmd', "printf 'a\\n'",
+        ])
+        b = _cli._build_eager_browser(args, fields=['id', 'title'], record_sep=b'\n')
+        try:
+            self.assertIsNotNone(b)
+            self.assertIsNone(b.get_preview)
+        finally:
+            if b is not None:
+                b.stop_workers()
+
+    def test_lazy_builder_still_wires_preview_fetcher(self):
+        # Sanity: refactor of the lazy builder didn't break the existing
+        # path.
+        args, _ = _cli.parse_args([
+            '--children-cmd', "printf 'a\\nb\\n'",
+            '--preview-cmd', 'echo LAZY-$TUI_ID',
+        ])
+        b = _cli._build_lazy_browser(args, fields=['id', 'title'], record_sep=b'\n')
+        try:
+            self.assertIsNotNone(b.get_preview)
+            self.assertEqual(b.get_preview('z'), 'LAZY-z\n')
+        finally:
+            b.stop_workers()
 
 
 if __name__ == '__main__':
