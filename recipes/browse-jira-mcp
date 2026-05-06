@@ -48,6 +48,37 @@ _MCP_CMD = ['uvx', 'mcp-atlassian@v0.21.1']
 
 _JQL_DEFAULT = 'assignee = currentUser() AND statusCategory != Done'
 
+_SEARCH_LIMIT = 1000
+
+
+def _pop_limit_arg(default):
+    """Pop ``-n NUMBER`` (or ``-n=NUMBER``) out of ``sys.argv`` and return it.
+
+    Removed before Browser.run() and ``_resolve_jql`` see argv. Falls
+    back to ``default`` if absent or non-int.
+    """
+    i = 1
+    while i < len(sys.argv):
+        a = sys.argv[i]
+        if a == '-n' and i + 1 < len(sys.argv):
+            try:
+                n = int(sys.argv[i + 1])
+            except ValueError:
+                i += 1
+                continue
+            del sys.argv[i:i + 2]
+            return n
+        if a.startswith('-n='):
+            try:
+                n = int(a[3:])
+            except ValueError:
+                i += 1
+                continue
+            del sys.argv[i]
+            return n
+        i += 1
+    return default
+
 
 def _resolve_jql():
     """Return the JQL to query. argv[1] overrides the default.
@@ -204,7 +235,7 @@ def get_children(parent_id):
         result = _client.call_tool('jira_search', {
             'jql': _resolve_jql(),
             'fields': 'summary,status',
-            'limit': 50,
+            'limit': _search_limit,
         })
     except RuntimeError as e:
         return _err(f'jira_search: {e}')
@@ -287,16 +318,17 @@ def open_in_browser(ctx):
 _HELP_INTRO_TMPL = """\
 browse-jira-mcp — list Jira tickets via the Atlassian MCP server.
 
-Usage: browse-jira-mcp [JQL]
-  JQL    Optional JQL query string. Quote it. Defaults to
-         "assignee = currentUser() AND statusCategory != Done"
-         (open tickets assigned to the current user).
+Usage: browse-jira-mcp [-n NUMBER] [JQL]
+  -n NUMBER  Cap the number of tickets fetched (default: {default}).
+  JQL        Optional JQL query string. Quote it. Defaults to
+             "assignee = currentUser() AND statusCategory != Done"
+             (open tickets assigned to the current user).
 
 Active JQL: {jql}
 
 Rows: one ticket per row — tag = status, coloured by category
   (yellow=To Do, cyan=In Progress, green=Done); title = summary.
-  Up to 50 results.
+  Up to {limit} results.
 Preview: ticket card (status, priority, assignee, reporter, labels,
   dates, description), fetched on cursor change via the MCP
   jira_get_issue tool.
@@ -321,7 +353,12 @@ Examples:
 """
 
 
+_search_limit = _SEARCH_LIMIT
+
+
 def main():
+    global _search_limit
+    _search_limit = _pop_limit_arg(_SEARCH_LIMIT)
     jql = _resolve_jql()
     title = 'browse-jira-mcp' if jql == _JQL_DEFAULT else f'browse-jira-mcp: {jql}'
     sys.exit(Browser(
@@ -332,7 +369,9 @@ def main():
             Action('o', 'Open ticket in $BROWSER (or xdg-open)',
                    open_in_browser, 'cursor'),
         ],
-        help_intro=_HELP_INTRO_TMPL.format(jql=jql),
+        help_intro=_HELP_INTRO_TMPL.format(
+            jql=jql, default=_SEARCH_LIMIT, limit=_search_limit,
+        ),
     ).run())
 
 

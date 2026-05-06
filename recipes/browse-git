@@ -3,9 +3,12 @@
 
 Three levels:
 
-  level 0: recent commits        (``git log --oneline -n 500``)
+  level 0: recent commits        (``git log --oneline -n 1000``)
   level 1: files changed         (``git show --name-only <sha>``)
   level 2: per-file unified diff (``git show <sha> -- <path>``)
+
+The level-0 commit cap defaults to 1000; pass ``-n NUMBER`` to
+override.
 
 Identifiers are dispatched by shape:
   * commit ids look like ``<sha>`` (no colon)
@@ -24,7 +27,38 @@ import sys
 from browse_tui import Browser, Item
 
 
-_LOG_LIMIT = 500
+_LOG_LIMIT = 1000
+
+
+def _pop_limit_arg(default):
+    """Pop ``-n NUMBER`` (or ``-n=NUMBER``) out of ``sys.argv`` and return it.
+
+    Removed before Browser.run() sees the argv so the recipe's own knob
+    doesn't leak into the help-flag auto-detect or the recipe's other
+    positional parsing. Falls back to ``default`` if the flag is absent
+    or its value isn't an int.
+    """
+    i = 1
+    while i < len(sys.argv):
+        a = sys.argv[i]
+        if a == '-n' and i + 1 < len(sys.argv):
+            try:
+                n = int(sys.argv[i + 1])
+            except ValueError:
+                i += 1
+                continue
+            del sys.argv[i:i + 2]
+            return n
+        if a.startswith('-n='):
+            try:
+                n = int(a[3:])
+            except ValueError:
+                i += 1
+                continue
+            del sys.argv[i]
+            return n
+        i += 1
+    return default
 
 
 def _run_git(*args):
@@ -51,7 +85,7 @@ def get_children(item_id):
         rc = _run_git('rev-parse', '--is-inside-work-tree')
         if rc.returncode != 0:
             return _err_item('not a git repository (or git not available)')
-        result = _run_git('log', '--oneline', '-n', str(_LOG_LIMIT))
+        result = _run_git('log', '--oneline', '-n', str(_log_limit))
         if result.returncode != 0:
             return _err_item(f'git log failed: {result.stderr.strip()}')
         items = []
@@ -99,21 +133,30 @@ def get_preview(item_id):
     return result.stdout if result.returncode == 0 else result.stderr
 
 
-_HELP_INTRO = """\
+_HELP_INTRO_TMPL = """\
 browse-git — drill from recent commits into changed files into diffs.
 
-Three levels: a recent ``git log -n 500``; the files changed in the
+Usage: browse-git [-n NUMBER]
+  -n NUMBER  Cap the recent-commit list to this many entries
+             (default: {default}).
+
+Three levels: a recent ``git log -n {limit}``; the files changed in the
 selected commit; and the per-file unified diff for that commit.
 Read-only — preview shows the diff (or stat / message at level 0).\
 """
 
 
+_log_limit = _LOG_LIMIT
+
+
 def main():
+    global _log_limit
+    _log_limit = _pop_limit_arg(_LOG_LIMIT)
     sys.exit(Browser(
         title='browse-git',
         get_children=get_children,
         get_preview=get_preview,
-        help_intro=_HELP_INTRO,
+        help_intro=_HELP_INTRO_TMPL.format(default=_LOG_LIMIT, limit=_log_limit),
     ).run())
 
 

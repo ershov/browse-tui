@@ -32,9 +32,10 @@ Identifiers are kept simple and dispatchable purely by shape:
 Phase-3 simplifications (intentionally out of scope):
   * No delete-session action — too dangerous with no undo.
   * No inotify watch — refresh is manual via ctrl-r.
-  * Message lists are capped at 200 entries per session — large sessions
-    truncate so the UI stays responsive. Full content is reachable via
-    the ``e`` action which opens the underlying ``.jsonl`` in $EDITOR.
+  * Message lists are capped at 1000 entries per session by default —
+    large sessions truncate so the UI stays responsive. Override the
+    cap with ``-n NUMBER``. Full content is reachable via the ``e``
+    action which opens the underlying ``.jsonl`` in $EDITOR.
 """
 
 import datetime
@@ -51,7 +52,37 @@ CLAUDE_ROOT = os.path.join(
 
 # Cap on messages enumerated per session (rest reachable via $EDITOR on
 # the .jsonl). Keeps the UI from stalling on multi-MB transcripts.
-_MESSAGE_LIMIT = 200
+# Overridable via the ``-n NUMBER`` argv flag.
+_MESSAGE_LIMIT = 1000
+
+
+def _pop_limit_arg(default):
+    """Pop ``-n NUMBER`` (or ``-n=NUMBER``) out of ``sys.argv`` and return it.
+
+    Removed before Browser.run() and the recipe's positional parsing
+    see argv. Falls back to ``default`` if absent or non-int.
+    """
+    i = 1
+    while i < len(sys.argv):
+        a = sys.argv[i]
+        if a == '-n' and i + 1 < len(sys.argv):
+            try:
+                n = int(sys.argv[i + 1])
+            except ValueError:
+                i += 1
+                continue
+            del sys.argv[i:i + 2]
+            return n
+        if a.startswith('-n='):
+            try:
+                n = int(a[3:])
+            except ValueError:
+                i += 1
+                continue
+            del sys.argv[i]
+            return n
+        i += 1
+    return default
 
 
 # ---- helpers --------------------------------------------------------------
@@ -320,7 +351,9 @@ def _list_subagent_messages(item_id):
     return _list_messages(agent_path)
 
 
-def _list_messages(jsonl_path, limit=_MESSAGE_LIMIT):
+def _list_messages(jsonl_path, limit=None):
+    if limit is None:
+        limit = _message_limit
     out = []
     try:
         f = open(jsonl_path, 'r', encoding='utf-8', errors='replace')
@@ -351,7 +384,7 @@ def _list_messages(jsonl_path, limit=_MESSAGE_LIMIT):
                 # Malformed line — surface it but stay scrolling.
                 out.append(Item(
                     id=f'{jsonl_path}#{n}',
-                    title=f'[invalid json] {line[:80]}',
+                    title=f'[invalid json] {line[:400]}',
                     tag='err',
                     tag_style='red',
                 ))
@@ -421,7 +454,7 @@ def _summarise_message(obj):
     role = msg.get('role') or obj.get('role') or t or ''
     content = msg.get('content', obj.get('content', ''))
     text = _extract_text(content)
-    text = ' '.join(text.split())[:80]
+    text = ' '.join(text.split())[:400]
     if role:
         return f'{role}: {text}' if text else role
     return text or '(empty)'
@@ -483,7 +516,7 @@ def get_preview(item_id):
         path, _, lineno = item_id.rpartition('#')
         if lineno == '__truncated__':
             return (
-                f'(only the first {_MESSAGE_LIMIT} messages are listed)\n'
+                f'(only the first {_message_limit} messages are listed)\n'
                 f'press e on this row to open the full file in $EDITOR'
             )
         try:
@@ -510,7 +543,7 @@ def _preview_project(path):
         f'path:    {path}\n'
         f'\n{len(names)} session(s):'
     )
-    body = '\n'.join(f'  {n}' for n in names[:50])
+    body = '\n'.join(f'  {n}' for n in names[:1000])
     if len(names) > 50:
         body += f'\n  … and {len(names) - 50} more'
     return f'{header}\n{body}' if body else header
@@ -521,10 +554,10 @@ def _preview_session(path):
         lines = []
         with open(path, 'r', encoding='utf-8', errors='replace') as f:
             for n, line in enumerate(f):
-                if n >= 20:
+                if n >= 1000:
                     lines.append(f'… ({n}+ lines total)')
                     break
-                lines.append(f'L{n + 1}: {line.rstrip()[:200]}')
+                lines.append(f'L{n + 1}: {line.rstrip()[:400]}')
         return '\n'.join(lines) if lines else '(empty session)'
     except OSError as e:
         return f'[error] {e}'
@@ -580,7 +613,7 @@ def _preview_subagent(item_id):
     if first_prompt:
         snippet = first_prompt.strip()
         if len(snippet) > 800:
-            snippet = snippet[:800] + ' …'
+            snippet = snippet[:1000] + ' …'
         out += '\n\nopening prompt:\n' + snippet
     return out
 
@@ -656,10 +689,11 @@ def _action_show_id(ctx):
 # ---- entry point ---------------------------------------------------------
 
 
-_HELP_INTRO = """\
+_HELP_INTRO_TMPL = """\
 browse-claude — Claude Code project / session / message browser.
 
-Usage: browse-claude [PROJECT]
+Usage: browse-claude [-n NUMBER] [PROJECT]
+  -n NUMBER  Cap messages enumerated per session (default: {default}).
   PROJECT    Project directory name under ~/.claude/projects/ to drill into
              on launch (sets the initial scope). Without a name, the tree
              opens at the project list.
@@ -671,7 +705,12 @@ Edit (or 'o') opens the source .jsonl in $EDITOR at the right line.\
 """
 
 
+_message_limit = _MESSAGE_LIMIT
+
+
 def main():
+    global _message_limit
+    _message_limit = _pop_limit_arg(_MESSAGE_LIMIT)
     initial_scope = sys.argv[1] if len(sys.argv) > 1 else None
     b = Browser(
         title='browse-claude',
@@ -685,7 +724,7 @@ def main():
             Action('o', 'Edit/view source in $EDITOR',    _action_edit,    'cursor'),
             Action('y', 'Show full id (paste-friendly)',  _action_show_id, 'cursor'),
         ],
-        help_intro=_HELP_INTRO,
+        help_intro=_HELP_INTRO_TMPL.format(default=_MESSAGE_LIMIT),
     )
     sys.exit(b.run())
 
