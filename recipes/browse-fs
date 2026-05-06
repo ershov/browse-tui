@@ -125,6 +125,7 @@ def main():
     b = Browser(
         title='browse-fs',
         show_ids="never",
+        show_children_pane=False,
         get_children=get_children,
         get_preview=get_preview,
         root_id=root,

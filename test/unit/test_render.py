@@ -1402,5 +1402,165 @@ class TestRenderChildrenList(unittest.TestCase):
         self.assertIn('loading', flat)
 
 
+# --- render_partial separator regression (#180) -----------------------------
+
+
+class TestRenderPartialRedrawsSeparators(unittest.TestCase):
+    """Regression for #180: ``render_partial`` redraws ``sep_main`` /
+    ``sep_inner`` whenever any pane is repainted.
+
+    Cursor moves in the list pane flag ``{'list', 'children', 'preview'}``
+    in ``_needs_redraw``. In Alt-1 vertical layout (``split='v'``) the
+    children pane appears/disappears as the cursor crosses leaf/branch
+    boundaries — when it appears, the layout's ``sep_inner`` column is
+    new (the previous render didn't have one). If the partial redraw
+    leaves separators alone, that column shows nothing where it should
+    show ``│``. The fix paints both separators on any pane redraw.
+    """
+
+    def setUp(self):
+        self.cap = _TermCapture()
+        self.cap.install(_render)
+        self._saved_visible = getattr(_render, 'visible_items', None)
+        self._saved_render_info_bar = getattr(_render, 'render_info_bar', None)
+        self._saved_layout_for = getattr(_render, '_layout_for', None)
+        self._saved_render_list = getattr(_render, 'render_list', None)
+        self._saved_render_children_list = getattr(
+            _render, 'render_children_list', None)
+        self._saved_render_preview = getattr(_render, 'render_preview', None)
+        self._saved_flush = getattr(_render, 'flush', None)
+        # Silence sub-renderers that aren't under test — we only want
+        # to observe the separator draws.
+        _render.render_info_bar = lambda *a, **kw: None
+        _render.render_list = lambda *a, **kw: None
+        _render.render_children_list = lambda *a, **kw: None
+        _render.render_preview = lambda *a, **kw: None
+        _render.flush = lambda: None
+
+    def tearDown(self):
+        self.cap.restore(_render)
+        for name, saved in (
+            ('visible_items', self._saved_visible),
+            ('render_info_bar', self._saved_render_info_bar),
+            ('_layout_for', self._saved_layout_for),
+            ('render_list', self._saved_render_list),
+            ('render_children_list', self._saved_render_children_list),
+            ('render_preview', self._saved_render_preview),
+            ('flush', self._saved_flush),
+        ):
+            if saved is None:
+                if hasattr(_render, name):
+                    delattr(_render, name)
+            else:
+                setattr(_render, name, saved)
+
+    def _stub_layout(self, *, with_children):
+        """Stub ``_layout_for`` to return a v-split layout shape.
+
+        ``with_children=True`` includes both ``sep_main`` and
+        ``sep_inner`` (children pane present); ``False`` omits
+        ``sep_inner`` (children pane absent — leaf cursor case).
+        """
+        body_top, body_bottom = 1, 39
+        sep_main = Rect(left=70, top=body_top, right=71, bottom=body_bottom)
+        list_rect = Rect(left=1, top=body_top, right=70, bottom=body_bottom)
+        info_bar = Rect(left=1, top=39, right=241, bottom=40)
+        if with_children:
+            children_rect = Rect(left=72, top=body_top,
+                                 right=92, bottom=body_bottom)
+            sep_inner = Rect(left=92, top=body_top,
+                             right=93, bottom=body_bottom)
+            preview_rect = Rect(left=93, top=body_top,
+                                right=241, bottom=body_bottom)
+        else:
+            children_rect = None
+            sep_inner = None
+            preview_rect = Rect(left=72, top=body_top,
+                                right=241, bottom=body_bottom)
+        layout = {
+            'list': list_rect,
+            'children': children_rect,
+            'preview': preview_rect,
+            'sep_main': sep_main,
+            'sep_inner': sep_inner,
+            'info_bar': info_bar,
+            'cols': 240,
+            'rows': 40,
+        }
+        _render._layout_for = lambda b: layout
+        return layout
+
+    def _make_browser(self, needs):
+        state = _MockState(visible=[], cursor=0)
+        browser = _MockBrowser(state, split='v', show_children_pane=True)
+        browser._needs_redraw = set(needs)
+        return browser
+
+    def _separator_writes(self):
+        """Extract ``│`` writes (the vertical-separator glyph)."""
+        return [e for e in self.cap.events
+                if e[0] == 'write' and e[1] == '│']
+
+    def test_cursor_move_redraws_both_separators_when_present(self):
+        """`{list, children, preview}` flags + children present → both
+        sep_main and sep_inner are repainted.
+        """
+        layout = self._stub_layout(with_children=True)
+        browser = self._make_browser({'list', 'children', 'preview'})
+        _render.render_partial(browser)
+        # Each separator paints ``│`` once per row of its rect.
+        sep_main = layout['sep_main']
+        sep_inner = layout['sep_inner']
+        # Collect (row, col) of every '│' write — preceding 'move' event
+        # gives the position.
+        bars = []
+        prev_pos = None
+        for e in self.cap.events:
+            if e[0] == 'move':
+                prev_pos = (e[1], e[2])
+            elif e[0] == 'write' and e[1] == '│':
+                bars.append(prev_pos)
+        # sep_main column: every body row from top..bottom-1.
+        main_rows = sorted({r for (r, c) in bars if c == sep_main.left})
+        inner_rows = sorted({r for (r, c) in bars if c == sep_inner.left})
+        expected_rows = list(range(sep_main.top, sep_main.bottom))
+        self.assertEqual(
+            main_rows, expected_rows,
+            f'sep_main missing rows; got {main_rows}, expected {expected_rows}',
+        )
+        self.assertEqual(
+            inner_rows, expected_rows,
+            f'sep_inner missing rows; got {inner_rows}, expected {expected_rows}',
+        )
+
+    def test_cursor_move_redraws_sep_main_when_no_children(self):
+        """Leaf cursor → no sep_inner, but sep_main must still paint."""
+        layout = self._stub_layout(with_children=False)
+        browser = self._make_browser({'list', 'children', 'preview'})
+        _render.render_partial(browser)
+        sep_main = layout['sep_main']
+        bars = []
+        prev_pos = None
+        for e in self.cap.events:
+            if e[0] == 'move':
+                prev_pos = (e[1], e[2])
+            elif e[0] == 'write' and e[1] == '│':
+                bars.append(prev_pos)
+        main_rows = sorted({r for (r, c) in bars if c == sep_main.left})
+        expected_rows = list(range(sep_main.top, sep_main.bottom))
+        self.assertEqual(main_rows, expected_rows)
+        # No separator draws at any other column.
+        other_cols = {c for (r, c) in bars if c != sep_main.left}
+        self.assertEqual(other_cols, set())
+
+    def test_no_pane_redraw_leaves_separators_alone(self):
+        """Empty needs set / 'info'-only redraw doesn't touch separators."""
+        self._stub_layout(with_children=True)
+        browser = self._make_browser(set())
+        _render.render_partial(browser)
+        # Empty needs → early return, no events at all.
+        self.assertEqual(self._separator_writes(), [])
+
+
 if __name__ == '__main__':
     unittest.main()

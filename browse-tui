@@ -4333,6 +4333,13 @@ def render_partial(browser):
     ``'info'``, ``'all'``. ``'all'`` short-circuits to ``render_full``.
     Unknown flags are ignored (no error) so callers can stuff "hint"
     tokens in the set without crashing the renderer.
+
+    Pane separators (``sep_main`` / ``sep_inner``) are redrawn whenever
+    any pane is repainted. They're cheap (a single column / row of
+    box-drawing chars) and the layout can change shape between paints
+    (e.g. children pane appearing when the cursor moves onto a branch
+    in Alt-1 vertical layout) — keeping them passive on partial redraws
+    leaves stale gaps where the new separator should be (#180).
     """
     needs = browser._needs_redraw
     if 'all' in needs:
@@ -4348,8 +4355,10 @@ def render_partial(browser):
     children_rect = layout['children']
     preview_rect = layout['preview']
     info_bar = layout['info_bar']
+    pane_repainted = False
     if 'list' in needs:
         render_list(browser, list_rect)
+        pane_repainted = True
     if 'children' in needs:
         if children_rect is not None:
             if getattr(browser, 'split', 'h') == 'v':
@@ -4364,6 +4373,7 @@ def render_partial(browser):
                     info=sub_info,
                     has_header=not info_separate,
                 )
+        pane_repainted = True
     if 'preview' in needs:
         if browser.show_preview and preview_rect is not None:
             render_preview(
@@ -4371,6 +4381,7 @@ def render_partial(browser):
                 info=prev_info,
                 has_header=not info_separate,
             )
+        pane_repainted = True
     if 'info' in needs:
         ir = info_bar.top if info_bar is not None else 0
         if ir > 0:
@@ -4384,6 +4395,19 @@ def render_partial(browser):
                     ir, layout['cols'], _preview_label(browser),
                     info=True, browser=browser,
                 )
+    # Repaint pane separators whenever any pane was repainted. The
+    # children pane in Alt-1 (#176) appears/disappears as the cursor
+    # crosses leaf/branch boundaries, which moves sep_inner in and out
+    # of the layout; without redrawing here, the separator is missing
+    # on the row where the previous render didn't have one (#180).
+    # Cheap: a single column of ``│`` (or row of ``─``) per separator.
+    if pane_repainted:
+        sep_main = layout.get('sep_main')
+        sep_inner = layout.get('sep_inner')
+        if sep_main is not None:
+            render_separator(sep_main)
+        if sep_inner is not None:
+            render_separator(sep_inner)
     flush()
     browser._needs_redraw = set()
 
