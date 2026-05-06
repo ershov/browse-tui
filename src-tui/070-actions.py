@@ -214,6 +214,7 @@ def _nav_left(ctx):
         if vis[i].depth < cur_depth:
             state.cursor = i
             ctx._browser._needs_redraw.add('list')
+            ctx._browser._needs_redraw.add('children')
             ctx._browser._needs_redraw.add('preview')
             return
 

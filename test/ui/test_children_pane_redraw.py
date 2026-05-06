@@ -129,6 +129,75 @@ class TestChildrenPaneRedraw(unittest.TestCase):
                     f'separator column {col} missing after A→B→A '
                     f'(was at {sep_cols0}, now {sep_cols_a}):\n{screen_a}')
 
+    def test_children_pane_redraws_after_left_to_parent(self):
+        """Cursor A → Right → Down (a1) → Left: a1/a2 must reappear in pane.
+
+        Regression for ticket #183 — `_nav_left`'s parent-jump branch
+        (when cursor is on a leaf and Left jumps back to its parent) only
+        flagged 'list' and 'preview' for redraw, not 'children'. After
+        the jump, the children pane retained whatever it was showing
+        while the cursor sat on a1 (often empty or stale), instead of
+        re-rendering A's children list.
+        """
+        with TmuxFixture(cols=240, rows=40) as t:
+            self._launch(t)
+
+            # The launch left A collapsed (the children pane shows A's
+            # children as a side-preview without expanding A in the
+            # list). Expand A explicitly so a1/a2 become rows in the
+            # list, then Down onto a1.
+            t.send('Right')
+            t.wait_stable(timeout=3.0)
+            # After Right, the list shows A / a1 / a2 / B / C; cursor is
+            # still on A. One Down moves it onto a1 (a leaf).
+            t.send('Down')
+            t.wait_stable(timeout=3.0)
+            screen_a1 = t.capture()
+            self.assertIn(
+                'a1', screen_a1,
+                f'a1 missing entirely after expanding A and Down:\n'
+                f'{screen_a1}')
+
+            # Press Left — cursor should jump back to A. Children pane
+            # MUST now show A's children (a1, a2) again.
+            t.send('Left')
+            t.wait_stable(timeout=3.0)
+            screen_back = t.capture()
+
+            # The children-pane column lives between the first and
+            # second vertical-separator columns. Pull that slice out of
+            # each body row and join — that's the children-pane content.
+            body = _body_lines(screen_back)
+            sep_cols = _vertical_separator_columns(screen_back)
+            self.assertGreaterEqual(
+                len(sep_cols), 2,
+                f'expected two separators (list│children│preview) in v '
+                f'layout after Left-to-parent:\n{screen_back}')
+            cp_lo, cp_hi = sep_cols[0] + 1, sep_cols[1]
+            children_pane = '\n'.join(line[cp_lo:cp_hi] for line in body)
+
+            # With the fix: children pane shows A's children (a1, a2).
+            # Without the fix: children pane retains a1's preview text
+            # (e.g. "preview:a1") because no redraw was scheduled.
+            self.assertIn(
+                'a1', children_pane,
+                f'a1 missing from children pane after Left-to-parent — '
+                f'children pane was not redrawn.\n'
+                f'children-pane slice ({cp_lo}..{cp_hi}):\n{children_pane}\n'
+                f'full screen:\n{screen_back}')
+            self.assertIn(
+                'a2', children_pane,
+                f'a2 missing from children pane after Left-to-parent — '
+                f'children pane was not redrawn.\n'
+                f'children-pane slice ({cp_lo}..{cp_hi}):\n{children_pane}\n'
+                f'full screen:\n{screen_back}')
+            self.assertNotIn(
+                'preview:a1', children_pane,
+                f'stale "preview:a1" still in children pane after '
+                f'Left-to-parent — pane was not redrawn.\n'
+                f'children-pane slice ({cp_lo}..{cp_hi}):\n{children_pane}\n'
+                f'full screen:\n{screen_back}')
+
     def test_children_pane_survives_repeated_bounce(self):
         """Bouncing A → B → A → B → A several times still ends clean."""
         with TmuxFixture(cols=240, rows=40) as t:
