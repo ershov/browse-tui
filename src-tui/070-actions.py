@@ -18,7 +18,9 @@ dispatcher minimal and explicit.
 """
 
 import os
+import shlex
 import signal
+import tempfile
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -261,6 +263,105 @@ def _suspend(ctx):
     process to the shell, and re-enter raw mode on SIGCONT.
     """
     os.kill(os.getpid(), signal.SIGTSTP)
+
+
+def _view_in_pager(ctx):
+    """``v`` — open the cursor item's preview text in ``$PAGER``.
+
+    The pager command comes from ``$PAGER`` (default ``less -R``); the
+    string is shell-split so values like ``less -R`` or ``bat --paging=always``
+    work without quoting. The preview text is written to a tempfile with
+    UTF-8 + ``surrogateescape`` so non-printable bytes round-trip
+    faithfully (control characters, lone surrogates from filesystem
+    reads, etc. — no question-mark replacements).
+
+    Works whether the preview pane is visible or not: cached entries are
+    used as-is; on cache miss the recipe's ``get_preview`` is invoked
+    synchronously and the result cached. Silent no-op when the cursor
+    is on a placeholder / scope_root row (no item to preview).
+    """
+    _run_external_on_preview(ctx, env_var='PAGER', default='less -R')
+
+
+def _edit_in_editor(ctx):
+    """``e`` — open the cursor item's preview text in ``$EDITOR``.
+
+    Same temp-file plumbing as :func:`_view_in_pager`. The editor command
+    comes from ``$EDITOR`` (default ``vi``).
+
+    **Edits are discarded by default.** Recipes that want to persist
+    changes must override ``e`` in their ``actions`` list with a handler
+    that writes the buffer back to its data source — there is no
+    cross-cutting save hook because the storage model varies per recipe
+    (filesystem path, MCP tool call, plan ticket id, …).
+    """
+    _run_external_on_preview(ctx, env_var='EDITOR', default='vi')
+
+
+def _run_external_on_preview(ctx, *, env_var, default):
+    """Shared body for ``_view_in_pager`` / ``_edit_in_editor``.
+
+    Resolves the preview text for the cursor item, writes it to a
+    NamedTemporaryFile (``surrogateescape`` so bytes round-trip), then
+    runs ``$<env_var> <tempfile>`` via :meth:`Context.run_external`. The
+    tempfile is deleted in a ``finally`` so a crashed editor still
+    cleans up.
+
+    Resolution order for the preview text:
+
+      1. ``state._preview[item.id]`` — used as-is when present, including
+         the empty string (legitimate empty content).
+      2. Synchronous fetch via ``browser.get_preview(item.id)`` — works
+         even when the preview pane is hidden or the async worker has
+         not delivered yet. The result is cached so a subsequent toggle
+         of the preview pane skips the refetch.
+      3. If neither is available — ``browser.get_preview`` is ``None``
+         or the fetcher returned ``None``/raised — surface a message
+         and skip the external command.
+    """
+    state = ctx._browser._state
+    item = ctx.cursor
+    if item is None:
+        return
+    # When the recipe has no preview source, the preview worker fills
+    # the cache with '' as a placeholder (see ``_preview_worker`` in
+    # 040-state). That placeholder is not meaningful content, so bail
+    # before reading the cache rather than opening an empty pager.
+    get_preview = getattr(ctx._browser, 'get_preview', None)
+    if get_preview is None:
+        ctx.message('No preview available')
+        return
+    text = None
+    if hasattr(state, '_preview'):
+        text = state._preview.get(item.id)
+    if text is None:
+        # Cache miss — fetch synchronously. The preview pane may be
+        # hidden, or the async worker may not have run yet; either way
+        # the user pressed v/e meaning "I want this now", so blocking
+        # briefly on the recipe's get_preview is acceptable.
+        try:
+            text = get_preview(item.id)
+        except Exception as e:
+            ctx.error(f'preview: {type(e).__name__}: {e}')
+            return
+        if text is None:
+            ctx.message('No preview available')
+            return
+        # Cache so the preview pane (if shown later) skips the refetch.
+        if hasattr(state, '_preview'):
+            state._preview[item.id] = text
+    cmd = os.environ.get(env_var) or default
+    with tempfile.NamedTemporaryFile(
+            mode='wb', prefix='browse-tui-', suffix='.txt', delete=False) as f:
+        f.write(text.encode('utf-8', errors='surrogateescape'))
+        path = f.name
+    try:
+        ctx.run_external(f'{cmd} {shlex.quote(path)}')
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 def _scope_down(ctx):
@@ -623,6 +724,10 @@ def default_actions() -> list:
         Action('f1',        'Toggle help',    _toggle_help, 'none', 'OTHER'),
         Action('ctrl-r',    'Reload',         _reload,      'none', 'OTHER'),
         Action('ctrl-l',    'Redraw',         _redraw,      'none', 'OTHER'),
+        # View / edit the cursor item's preview text. Recipes override
+        # 'e' to make edits actually persist (the default discards).
+        Action('v',         'View preview in $PAGER',  _view_in_pager,   'cursor', 'OTHER'),
+        Action('e',         'Edit preview in $EDITOR (changes discarded)', _edit_in_editor, 'cursor', 'OTHER'),
         Action('q',         'Quit',           _quit,        'none', 'OTHER'),
         Action('esc',       'Quit',           _quit,        'none', 'OTHER'),
         Action('ctrl-c',    'Quit',           _quit,        'none', 'OTHER'),

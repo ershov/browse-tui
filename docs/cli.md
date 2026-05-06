@@ -400,6 +400,8 @@ charge of how the Browser is configured.
 | Ctrl-N         | Clear the selection                                         |
 | Ctrl-R         | Reload (refresh entire tree)                                |
 | Ctrl-L         | Force redraw                                                |
+| `v`            | View cursor item's preview in `$PAGER` (default `less -R`)  |
+| `e`            | Edit cursor item's preview in `$EDITOR` (default `vi`)      |
 | `/`            | Enter search mode                                           |
 | Enter          | In search mode → next match; otherwise → `--on-enter`       |
 | Shift-Enter    | In search mode → previous match                             |
@@ -411,6 +413,23 @@ charge of how the Browser is configured.
 
 Recipes can override any of these via `--action` (CLI) or
 `Action(key, …)` (Python). The custom binding wins.
+
+The default `e` opens the preview in `$EDITOR` against a tempfile and
+**discards** any changes when the editor exits — there is no
+cross-cutting save hook because the storage model varies per recipe
+(filesystem path, MCP tool call, plan ticket id, …). Recipes that want
+edits to persist override `e` with a handler that writes the buffer
+back to its data source. Both `v` and `e` write the preview as UTF-8
+with `surrogateescape` so non-printable bytes (control chars, lone
+surrogates from filesystem reads) round-trip faithfully — no
+question-mark replacements.
+
+`v` and `e` work whether the preview pane is visible or not. The
+preview text comes from the cache when present; on cache miss the
+recipe's `--preview-cmd` (or `Browser.get_preview` callable) is
+invoked synchronously and the result is cached. If the recipe has no
+preview source at all, an info message is shown and no external
+process is launched.
 
 In **search mode** (after `/`), every printable key extends the query and the
 cursor jumps to the nearest match in real time. Backspace trims; Esc cancels.
@@ -430,8 +449,8 @@ insert / picker modes.
 
 | Variable | Read by                                                                         |
 | -------- | ------------------------------------------------------------------------------- |
-| `EDITOR` | Recipes that template `$EDITOR` in actions; `Context.run_external` callers.     |
-| `PAGER`  | Fallback when neither `bat` nor `batcat` is on PATH (used by `Context.page`).   |
+| `EDITOR` | Default `e` action (edit preview); recipes that template `$EDITOR` in actions; `Context.run_external` callers. |
+| `PAGER`  | Default `v` action (view preview); fallback when neither `bat` nor `batcat` is on PATH (used by `Context.page`). |
 | `VIRTUAL_ENV` | Required for `--install env`.                                              |
 
 `browse-tui` does not read or write any other environment variables.

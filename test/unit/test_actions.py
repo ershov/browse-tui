@@ -11,6 +11,7 @@ Tests load ``020-terminal``, ``030-data``, ``040-state``, and
 production single-file build resolves via concatenation.
 """
 
+import os
 import unittest
 
 from test.unit._loader import load
@@ -1224,6 +1225,384 @@ class TestApplyChildrenResultsClampsCursor(unittest.TestCase):
         b.apply_children_results()
         self.assertEqual(b._state.cursor, 1)
         b.stop_workers()
+
+
+# --- v / e default actions ------------------------------------------------
+
+
+class TestViewEditDefaults(unittest.TestCase):
+    """``v`` views and ``e`` edits the cursor item's preview text.
+
+    The handlers write the cached preview to a tempfile (UTF-8 +
+    surrogateescape so non-printable bytes round-trip) and shell out to
+    ``$PAGER`` / ``$EDITOR``. Tests stub ``ctx.run_external`` to capture
+    the constructed command and read the tempfile while it still exists
+    (the handler unlinks in a ``finally``).
+    """
+
+    _DEFAULT_GET_PREVIEW = object()  # sentinel for "use a default fetcher"
+
+    def _setup(self, preview_text=None, get_preview=_DEFAULT_GET_PREVIEW,
+               show_preview=True):
+        # Default to a stub get_preview so the cache-hit path is exercised
+        # without each test needing to wire one. Tests that need to
+        # exercise the no-fetcher path pass ``get_preview=None`` explicitly.
+        if get_preview is self._DEFAULT_GET_PREVIEW:
+            get_preview = lambda item_id: f'GENERATED:{item_id}'
+        b = _make_browser(show_preview=show_preview, get_preview=get_preview)
+        b._state._children[None] = [Item(id='x', title='X')]
+        b._state.cursor = 0
+        if preview_text is not None:
+            b._state._preview = {'x': preview_text}
+        ctx = _ctx_for(b)
+
+        captured = {'cmd': None, 'bytes': None, 'existed': None,
+                    'messages': [], 'errors': []}
+
+        def stub_run_external(cmd, env=None):
+            captured['cmd'] = cmd
+            import shlex
+            parts = shlex.split(cmd)
+            path = parts[-1]
+            captured['existed'] = os.path.exists(path)
+            if captured['existed']:
+                with open(path, 'rb') as f:
+                    captured['bytes'] = f.read()
+            return 0
+
+        def stub_message(text):
+            captured['messages'].append(text)
+
+        def stub_error(text):
+            captured['errors'].append(text)
+
+        ctx.run_external = stub_run_external
+        b.message = stub_message
+        b.error = stub_error
+        return b, ctx, captured
+
+    def test_v_pages_preview_with_default_pager_when_unset(self):
+        b, ctx, cap = self._setup(preview_text='hello world\n')
+        try:
+            old = os.environ.pop('PAGER', None)
+            try:
+                _actions._view_in_pager(ctx)
+            finally:
+                if old is not None:
+                    os.environ['PAGER'] = old
+            self.assertIsNotNone(cap['cmd'])
+            self.assertTrue(cap['cmd'].startswith('less -R '))
+            self.assertTrue(cap['existed'])
+            self.assertEqual(cap['bytes'], b'hello world\n')
+        finally:
+            b.stop_workers()
+
+    def test_v_uses_pager_env_var(self):
+        b, ctx, cap = self._setup(preview_text='hi')
+        try:
+            os.environ['PAGER'] = 'cat'
+            try:
+                _actions._view_in_pager(ctx)
+            finally:
+                del os.environ['PAGER']
+            self.assertTrue(cap['cmd'].startswith('cat '))
+        finally:
+            b.stop_workers()
+
+    def test_e_uses_editor_env_var(self):
+        b, ctx, cap = self._setup(preview_text='draft')
+        try:
+            os.environ['EDITOR'] = 'nano'
+            try:
+                _actions._edit_in_editor(ctx)
+            finally:
+                del os.environ['EDITOR']
+            self.assertTrue(cap['cmd'].startswith('nano '))
+            self.assertEqual(cap['bytes'], b'draft')
+        finally:
+            b.stop_workers()
+
+    def test_e_falls_back_to_vi_when_unset(self):
+        b, ctx, cap = self._setup(preview_text='x')
+        try:
+            old = os.environ.pop('EDITOR', None)
+            try:
+                _actions._edit_in_editor(ctx)
+            finally:
+                if old is not None:
+                    os.environ['EDITOR'] = old
+            self.assertTrue(cap['cmd'].startswith('vi '))
+        finally:
+            b.stop_workers()
+
+    def test_v_noop_when_cursor_is_none(self):
+        # Empty visible list → ctx.cursor is None → handler returns silently.
+        b = _make_browser()
+        ctx = _ctx_for(b)
+        called = []
+        ctx.run_external = lambda cmd, env=None: called.append(cmd) or 0
+        try:
+            _actions._view_in_pager(ctx)
+            self.assertEqual(called, [])
+        finally:
+            b.stop_workers()
+
+    def test_v_messages_when_no_get_preview_and_no_cache(self):
+        # No cache + no get_preview fetcher → 'No preview available'.
+        b, ctx, cap = self._setup(preview_text=None, get_preview=None)
+        try:
+            _actions._view_in_pager(ctx)
+            self.assertIsNone(cap['cmd'])
+            self.assertEqual(cap['messages'], ['No preview available'])
+        finally:
+            b.stop_workers()
+
+    def test_e_messages_when_no_get_preview_and_no_cache(self):
+        b, ctx, cap = self._setup(preview_text=None, get_preview=None)
+        try:
+            _actions._edit_in_editor(ctx)
+            self.assertIsNone(cap['cmd'])
+            self.assertEqual(cap['messages'], ['No preview available'])
+        finally:
+            b.stop_workers()
+
+    def test_v_falls_back_to_get_preview_on_cache_miss(self):
+        # Cache miss + recipe-supplied get_preview → synchronous fetch,
+        # tempfile gets the generated text, and the result is cached.
+        called = []
+
+        def get_preview(item_id):
+            called.append(item_id)
+            return f'GENERATED:{item_id}'
+
+        b, ctx, cap = self._setup(preview_text=None, get_preview=get_preview)
+        try:
+            os.environ['PAGER'] = 'cat'
+            try:
+                _actions._view_in_pager(ctx)
+            finally:
+                del os.environ['PAGER']
+            self.assertEqual(called, ['x'])
+            self.assertEqual(cap['bytes'], b'GENERATED:x')
+            # Cached for next time.
+            self.assertEqual(b._state._preview.get('x'), 'GENERATED:x')
+        finally:
+            b.stop_workers()
+
+    def test_e_falls_back_to_get_preview_on_cache_miss(self):
+        def get_preview(item_id):
+            return f'EDIT:{item_id}'
+
+        b, ctx, cap = self._setup(preview_text=None, get_preview=get_preview)
+        try:
+            os.environ['EDITOR'] = 'cat'
+            try:
+                _actions._edit_in_editor(ctx)
+            finally:
+                del os.environ['EDITOR']
+            self.assertEqual(cap['bytes'], b'EDIT:x')
+            self.assertEqual(b._state._preview.get('x'), 'EDIT:x')
+        finally:
+            b.stop_workers()
+
+    def test_works_when_preview_pane_hidden(self):
+        # User has the preview pane disabled. Cache miss falls through
+        # to get_preview just like when the pane is visible.
+        b, ctx, cap = self._setup(
+            preview_text=None,
+            get_preview=lambda i: f'HIDDEN:{i}',
+            show_preview=False,
+        )
+        try:
+            os.environ['PAGER'] = 'cat'
+            try:
+                _actions._view_in_pager(ctx)
+            finally:
+                del os.environ['PAGER']
+            self.assertFalse(b.show_preview)
+            self.assertEqual(cap['bytes'], b'HIDDEN:x')
+        finally:
+            b.stop_workers()
+
+    def test_cache_hit_skips_get_preview(self):
+        # Cached entry takes precedence over the fetcher.
+        called = []
+
+        def get_preview(item_id):
+            called.append(item_id)
+            return 'SHOULD-NOT-BE-USED'
+
+        b, ctx, cap = self._setup(
+            preview_text='from-cache',
+            get_preview=get_preview,
+        )
+        try:
+            os.environ['PAGER'] = 'cat'
+            try:
+                _actions._view_in_pager(ctx)
+            finally:
+                del os.environ['PAGER']
+            self.assertEqual(called, [])
+            self.assertEqual(cap['bytes'], b'from-cache')
+        finally:
+            b.stop_workers()
+
+    def test_get_preview_returns_none_messages(self):
+        # get_preview returned None → no content to show.
+        b, ctx, cap = self._setup(
+            preview_text=None,
+            get_preview=lambda i: None,
+        )
+        try:
+            _actions._view_in_pager(ctx)
+            self.assertIsNone(cap['cmd'])
+            self.assertEqual(cap['messages'], ['No preview available'])
+        finally:
+            b.stop_workers()
+
+    def test_get_preview_raises_surfaces_error(self):
+        def boom(item_id):
+            raise RuntimeError('connection refused')
+
+        b, ctx, cap = self._setup(preview_text=None, get_preview=boom)
+        try:
+            _actions._view_in_pager(ctx)
+            self.assertIsNone(cap['cmd'])
+            self.assertEqual(len(cap['errors']), 1)
+            self.assertIn('RuntimeError', cap['errors'][0])
+            self.assertIn('connection refused', cap['errors'][0])
+        finally:
+            b.stop_workers()
+
+    def test_empty_string_cache_is_used_not_treated_as_miss(self):
+        # An empty preview ('') is a legitimate cached result and must
+        # not trigger a refetch.
+        called = []
+
+        def get_preview(item_id):
+            called.append(item_id)
+            return 'SHOULD-NOT-BE-USED'
+
+        b, ctx, cap = self._setup(preview_text='', get_preview=get_preview)
+        try:
+            os.environ['PAGER'] = 'cat'
+            try:
+                _actions._view_in_pager(ctx)
+            finally:
+                del os.environ['PAGER']
+            self.assertEqual(called, [])
+            self.assertEqual(cap['bytes'], b'')
+        finally:
+            b.stop_workers()
+
+    def test_no_get_preview_takes_precedence_over_empty_cache(self):
+        # The preview worker fills the cache with '' when get_preview is
+        # None (see ``_preview_worker``). That placeholder must NOT be
+        # treated as a legitimate empty preview — bail with a message
+        # rather than open an empty pager / editor.
+        b, ctx, cap = self._setup(preview_text='', get_preview=None)
+        try:
+            _actions._view_in_pager(ctx)
+            self.assertIsNone(cap['cmd'])
+            self.assertEqual(cap['messages'], ['No preview available'])
+        finally:
+            b.stop_workers()
+
+    def test_preview_with_control_chars_roundtrips(self):
+        # Non-printable bytes (NUL, BEL, ESC, DEL) must reach the
+        # tempfile verbatim — no replacement '?'s.
+        text = 'A\x00B\x07C\x1bD\x7fE'
+        b, ctx, cap = self._setup(preview_text=text)
+        try:
+            os.environ['PAGER'] = 'cat'
+            try:
+                _actions._view_in_pager(ctx)
+            finally:
+                del os.environ['PAGER']
+            self.assertEqual(
+                cap['bytes'],
+                b'A\x00B\x07C\x1bD\x7fE',
+                'control chars should be preserved verbatim',
+            )
+        finally:
+            b.stop_workers()
+
+    def test_preview_with_surrogate_escape_roundtrips(self):
+        # Non-decodable bytes (e.g. 0xff in a "UTF-8" filesystem read)
+        # become lone surrogates U+DCFF when decoded with surrogateescape;
+        # encoding back with surrogateescape must restore the original
+        # byte rather than replace it with '?'.
+        raw = b'before \xff\xfe after'
+        decoded = raw.decode('utf-8', errors='surrogateescape')
+        b, ctx, cap = self._setup(preview_text=decoded)
+        try:
+            os.environ['PAGER'] = 'cat'
+            try:
+                _actions._view_in_pager(ctx)
+            finally:
+                del os.environ['PAGER']
+            self.assertEqual(cap['bytes'], raw)
+        finally:
+            b.stop_workers()
+
+    def test_tempfile_unlinked_after_run(self):
+        b, ctx, cap = self._setup(preview_text='hi')
+        try:
+            seen_path = []
+
+            def stub(cmd, env=None):
+                import shlex
+                seen_path.append(shlex.split(cmd)[-1])
+                return 0
+
+            ctx.run_external = stub
+            os.environ['PAGER'] = 'cat'
+            try:
+                _actions._view_in_pager(ctx)
+            finally:
+                del os.environ['PAGER']
+            # File existed during the call; no longer exists after.
+            self.assertEqual(len(seen_path), 1)
+            self.assertFalse(os.path.exists(seen_path[0]))
+        finally:
+            b.stop_workers()
+
+    def test_tempfile_unlinked_even_if_run_external_raises(self):
+        # The handler wraps the run in try/finally; an exception from
+        # run_external must not leak the tempfile.
+        b, ctx, cap = self._setup(preview_text='hi')
+        try:
+            seen_path = []
+
+            def boom(cmd, env=None):
+                import shlex
+                seen_path.append(shlex.split(cmd)[-1])
+                raise RuntimeError('nope')
+
+            ctx.run_external = boom
+            os.environ['PAGER'] = 'cat'
+            try:
+                with self.assertRaises(RuntimeError):
+                    _actions._view_in_pager(ctx)
+            finally:
+                del os.environ['PAGER']
+            self.assertEqual(len(seen_path), 1)
+            self.assertFalse(os.path.exists(seen_path[0]))
+        finally:
+            b.stop_workers()
+
+    def test_v_and_e_in_default_actions(self):
+        # Sanity: both keys are wired into default_actions() with the
+        # expected handlers, in the OTHER section, gated on cursor.
+        keys = {a.key: a for a in default_actions()}
+        self.assertIn('v', keys)
+        self.assertIn('e', keys)
+        self.assertIs(keys['v'].handler, _actions._view_in_pager)
+        self.assertIs(keys['e'].handler, _actions._edit_in_editor)
+        self.assertEqual(keys['v'].requires, 'cursor')
+        self.assertEqual(keys['e'].requires, 'cursor')
+        self.assertEqual(keys['v'].section, 'OTHER')
+        self.assertEqual(keys['e'].section, 'OTHER')
 
 
 if __name__ == '__main__':
