@@ -1158,6 +1158,35 @@ class TestListScrollDecoupledFromCursor(unittest.TestCase):
         self.assertEqual(b._list_scroll, 10)
         b.stop_workers()
 
+    def test_snap_uses_current_list_ratio_after_resize(self):
+        """Regression: after the user resizes the split, snap math must
+        use the new list_ratio. Pre-fix ``_list_pane_height_safe`` called
+        ``layout_panes`` without ``list_ratio=`` so it always produced the
+        default 30% pane height — pgup/pgdn and cursor-snap then used the
+        wrong height after a -/= resize.
+        """
+        b = self._browser_with_n_items(200)
+        _state.term_size = lambda: (80, 40)
+        _state.layout_panes = _render.layout_panes
+        try:
+            # Default 30% of 40 rows = 12 list rows. Snap to row 50 from
+            # scroll=0: scroll should land at 50 - 12 + 1 = 39.
+            b._list_scroll = 0
+            b._snap_list_scroll_to_row(50)
+            self.assertEqual(b._list_scroll, 39)
+            # Now grow the list to 80% of 40 = 32 rows. Snap to row 50
+            # from scroll=0 should now land at 50 - 32 + 1 = 19.
+            b.list_ratio = 0.80
+            b._list_scroll = 0
+            b._snap_list_scroll_to_row(50)
+            self.assertEqual(b._list_scroll, 19,
+                             '_list_pane_height_safe must reflect '
+                             'the current list_ratio')
+        finally:
+            del _state.term_size
+            del _state.layout_panes
+            b.stop_workers()
+
     def test_active_list_row_normal_mode_returns_cursor(self):
         b = self._browser_with_n_items(5)
         b._state.cursor = 3

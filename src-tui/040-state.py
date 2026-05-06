@@ -1596,6 +1596,7 @@ class Browser:
                 cols, rows,
                 show_preview=self.show_preview,
                 show_children_pane=self.show_children_pane,
+                list_ratio=self.list_ratio,
             )
             h = layout.get('list_height', 0)
             return h if h > 0 else 0
