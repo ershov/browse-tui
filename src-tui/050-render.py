@@ -247,6 +247,41 @@ class Rect:
                 .format(self.left, self.top, self.right, self.bottom))
 
 
+# Sentinel rect for marking a PaneCache whose pane disappeared between
+# paints (e.g. layout 'v'/'m'/'pc' children/sep_inner panes when the
+# cursor moves onto a no-children item). Stored in ``cache.rect`` so
+# the next ``ensure(real_rect)`` sees a mismatch and runs ``invalidate``,
+# which routes ``end_row`` through the "rect changed → full pad" path
+# and clears the cells the preview pane overwrote while the children
+# pane was hidden. The negative-coordinate values can never collide
+# with a real screen rect (which uses 1-based positive coords).
+_SENTINEL_RECT = Rect(-1, -1, -1, -1)
+
+
+def _mark_disappeared_panes(browser, layout):
+    """Invalidate caches for panes absent from ``layout`` but cached previously.
+
+    In layouts 'v' / 'm' / 'pc' the ``children`` and ``sep_inner`` panes
+    appear and disappear as the cursor crosses leaf/branch boundaries.
+    When they disappear the preview pane expands to overwrite their
+    cells. If they then reappear with the same geometry as before, the
+    differential renderer would otherwise see ``cache.rect == new_rect``
+    in ``PaneCache.ensure`` and the steady-state ``end_row`` path would
+    cache-hit on unchanged content, emitting nothing — leaving the
+    preview's leftover cells visible.
+
+    Force the next reappear to take the full-pad path by stamping the
+    cache's ``rect`` with ``_SENTINEL_RECT``: the next ``ensure`` finds
+    ``self.rect != new_rect`` and calls ``invalidate``.
+    """
+    for name in ('children', 'sep_inner'):
+        if layout.get(name) is None:
+            cache = browser._pane_cache.get(name)
+            if cache is not None and cache.rect is not None and cache.rect != _SENTINEL_RECT:
+                cache.rect = _SENTINEL_RECT
+                cache.lines = []
+
+
 def point_in_rect(row, col, rect):
     """Return True iff ``(row, col)`` lies inside ``rect``.
 
@@ -2016,6 +2051,7 @@ def render_full(browser):
     """
     begin_sync()
     layout = _layout_for(browser)
+    _mark_disappeared_panes(browser, layout)
     sub_info, prev_info = _pane_info_flags(layout)
     info_separate = _info_bar_is_separate(layout)
     list_rect = layout['list']
@@ -2104,6 +2140,7 @@ def render_partial(browser):
 
     begin_sync()
     layout = _layout_for(browser)
+    _mark_disappeared_panes(browser, layout)
     sub_info, prev_info = _pane_info_flags(layout)
     info_separate = _info_bar_is_separate(layout)
     list_rect = layout['list']

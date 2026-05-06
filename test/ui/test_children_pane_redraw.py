@@ -1,0 +1,165 @@
+"""UI tests: children-pane stale-cache regression in vertical layout (#201).
+
+After the row-cache + synchronized-output landing (commit 88265a9), in
+``v`` (vertical) layout, navigating cursor → no-children item → back to
+a with-children item leaves stale preview text in the children-pane
+columns. The PaneCache emits nothing because ``cache.rect`` matches and
+the cached content matches — but the screen no longer holds the children
+content (preview overwrote it while the pane was hidden).
+
+These tests reproduce the regression. They should FAIL on the buggy
+build and PASS once the cache is invalidated correctly when a pane
+re-emerges after a hidden round-trip.
+"""
+
+import os
+import shutil
+import subprocess
+import unittest
+
+from test.ui.fixtures.tmux import TmuxFixture
+
+
+_BIN = os.path.abspath('./browse-tui')
+_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_RECIPE = os.path.join(_REPO, 'test', 'ui', 'recipes',
+                       'children_pane_redraw.py')
+
+
+def setUpModule():
+    if not shutil.which('tmux'):
+        raise unittest.SkipTest('tmux not available; UI tests skipped')
+    if not os.path.exists(_BIN):
+        subprocess.run([os.path.join(_REPO, 'build-tui.sh')], check=True)
+
+
+def _body_lines(screen: str):
+    """Return the body of the screen (drop the trailing info bar row)."""
+    lines = screen.splitlines()
+    if not lines:
+        return []
+    return lines[:-1]
+
+
+def _vertical_separator_columns(screen: str):
+    """Return a sorted set of columns (0-indexed) holding ``│`` in the body.
+
+    A column shared by enough body rows to look like a real separator
+    (i.e. a vertical run of ``│`` glyphs) is included.
+    """
+    body = _body_lines(screen)
+    if not body:
+        return []
+    counts = {}
+    for line in body:
+        for col, ch in enumerate(line):
+            if ch == '│':
+                counts[col] = counts.get(col, 0) + 1
+    threshold = max(3, len(body) // 4)
+    return sorted(c for c, n in counts.items() if n >= threshold)
+
+
+class TestChildrenPaneRedraw(unittest.TestCase):
+    """Regression tests for the children-pane stale-cache bug."""
+
+    def _launch(self, t: TmuxFixture):
+        t.launch(_BIN, '--run-py', _RECIPE, '--split-type=v')
+        # Wait until the initial render has the three root items.
+        t.wait_for('A A')
+        t.wait_for('B B')
+        t.wait_for('C C')
+        # Wait until the children pane for A has populated.
+        t.redraw()
+        t.wait_for('a1', timeout=3.0)
+        t.wait_for('a2', timeout=3.0)
+        t.wait_stable(timeout=3.0)
+
+    def test_children_pane_redraws_after_returning_from_no_children(self):
+        """Cursor A → B → A: a1/a2 must reappear; no stale BBBBPREVIEW."""
+        with TmuxFixture(cols=240, rows=40) as t:
+            self._launch(t)
+
+            # Initial state: cursor on A, children visible.
+            screen0 = t.capture()
+            self.assertIn('a1', screen0,
+                          f'a1 missing from initial screen:\n{screen0}')
+            self.assertIn('a2', screen0,
+                          f'a2 missing from initial screen:\n{screen0}')
+            sep_cols0 = _vertical_separator_columns(screen0)
+            self.assertTrue(
+                sep_cols0,
+                f'no vertical separator columns at startup:\n{screen0}')
+
+            # Move cursor to B (no children) → preview expands.
+            t.send('Down')
+            t.wait_stable(timeout=3.0)
+            screen_b = t.capture()
+            self.assertIn(
+                'BBBBPREVIEW', screen_b,
+                f'preview for B not visible after Down:\n{screen_b}')
+
+            # Move cursor back to A → children pane should redraw.
+            t.send('Up')
+            t.wait_stable(timeout=3.0)
+            screen_a = t.capture()
+
+            # a1/a2 must be back in the children pane.
+            self.assertIn(
+                'a1', screen_a,
+                f'a1 missing after returning to A (children pane stale):\n'
+                f'{screen_a}')
+            self.assertIn(
+                'a2', screen_a,
+                f'a2 missing after returning to A (children pane stale):\n'
+                f'{screen_a}')
+
+            # No leftover BBBBPREVIEW from B's preview should remain.
+            self.assertNotIn(
+                'BBBBPREVIEW', screen_a,
+                f'stale preview text from B remains after returning to A:\n'
+                f'{screen_a}')
+
+            # Vertical separators must include the original sep columns
+            # (the inner sep between children and preview re-appeared at
+            # the same column it had before).
+            sep_cols_a = _vertical_separator_columns(screen_a)
+            for col in sep_cols0:
+                self.assertIn(
+                    col, sep_cols_a,
+                    f'separator column {col} missing after A→B→A '
+                    f'(was at {sep_cols0}, now {sep_cols_a}):\n{screen_a}')
+
+    def test_children_pane_survives_repeated_bounce(self):
+        """Bouncing A → B → A → B → A several times still ends clean."""
+        with TmuxFixture(cols=240, rows=40) as t:
+            self._launch(t)
+
+            sep_cols0 = _vertical_separator_columns(t.capture())
+
+            for _ in range(3):
+                t.send('Down')
+                t.wait_stable(timeout=3.0)
+                t.send('Up')
+                t.wait_stable(timeout=3.0)
+
+            screen = t.capture()
+            self.assertIn(
+                'a1', screen,
+                f'a1 missing after repeated A↔B bounce:\n{screen}')
+            self.assertIn(
+                'a2', screen,
+                f'a2 missing after repeated A↔B bounce:\n{screen}')
+            self.assertNotIn(
+                'BBBBPREVIEW', screen,
+                f'stale preview text from B after repeated bounce:\n'
+                f'{screen}')
+            sep_cols = _vertical_separator_columns(screen)
+            for col in sep_cols0:
+                self.assertIn(
+                    col, sep_cols,
+                    f'separator column {col} missing after repeated '
+                    f'bounce (was {sep_cols0}, now {sep_cols}):\n{screen}')
+
+
+if __name__ == '__main__':
+    unittest.main()
