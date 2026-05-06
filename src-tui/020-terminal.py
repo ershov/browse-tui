@@ -34,14 +34,47 @@ import tty
 _saved_termios = None
 _orig_sigtstp_handler = None
 g_resize_flag = False
+# Set when the alt-screen content has been blown away externally —
+# e.g. resume from SIGTSTP+SIGCONT (the kernel/shell re-enters the alt
+# screen with a blank canvas). The main loop observes this flag and
+# clears ``Browser._pane_cache`` so the next ``render_full`` actually
+# emits content (cache-hit short-circuits in ``end_row`` would
+# otherwise leave the screen blank because the cache still holds the
+# pre-suspend bytes).
+g_screen_lost_flag = False
 _notify_r = -1    # read end of self-pipe for waking up read_key
 _notify_w = -1    # write end
+
+# ---- row-buffer shim state ------------------------------------------------
+#
+# The row-buffer shim lets renderers stay nearly unchanged while their
+# per-row writes get diffed against a per-pane line cache. While a row
+# capture is active (``_row_capture_active=True``), every ``write()``
+# (including indirect calls via ``set_style`` / ``move`` / ``clear_line``
+# / ``clear_columns``) is appended to ``_row_buf`` instead of flushed
+# to stdout. ``end_row`` then compares the accumulated bytes against
+# ``pane_cache.lines[rel_row]`` and emits only on a cache miss.
+#
+# Captures cannot nest: ``begin_row`` asserts the flag is False. Pair
+# every ``begin_row`` with exactly one ``end_row``.
+
+_row_capture_active = False
+_row_buf = []          # list[str], appended to by write()
+_row_meta = None       # dict | None: pane_cache, rel_row, abs_row, left, right, rightmost
 
 # ---- output helpers -------------------------------------------------------
 
 def write(s):
-    """Write string to stdout without flushing."""
-    sys.stdout.write(s)
+    """Write string to stdout without flushing.
+
+    When a row capture is active (see :func:`begin_row`), appends to the
+    capture buffer instead of stdout; the captured bytes are diffed
+    against the pane's line cache by :func:`end_row`.
+    """
+    if _row_capture_active:
+        _row_buf.append(s)
+    else:
+        sys.stdout.write(s)
 
 def flush():
     """Flush stdout."""
@@ -101,6 +134,163 @@ def set_style(fg=None, bg=None, bold=False, reverse=False, underline=False):
 def reset_style():
     """Reset all text attributes."""
     write('\033[0m')
+
+# ---- row-buffer shim: capture + diff against per-pane line cache ---------
+
+def _visible_len(s):
+    """Count visible cells in ``s``, ignoring SGR escape sequences.
+
+    Mirrors the SGR-skipping logic in :func:`_truncate_visible` (in
+    050-render.py). Counts characters outside ``\\033[...m`` sequences;
+    other CSI finals (cursor moves) shouldn't appear in captured row
+    output but are also skipped defensively.
+    """
+    visible = 0
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if ch == '\033' and i + 1 < n and s[i + 1] == '[':
+            j = i + 2
+            while j < n:
+                cj = s[j]
+                if '@' <= cj <= '~':
+                    break
+                j += 1
+            if j < n:
+                i = j + 1
+                continue
+            # Unterminated escape — stop counting.
+            break
+        visible += 1
+        i += 1
+    return visible
+
+
+def begin_row(pane_cache, rel_row, abs_row, left, right, *, rightmost):
+    """Start capturing writes into the row buffer.
+
+    Subsequent ``write()`` / ``set_style()`` / ``reset_style()`` /
+    ``move()`` / ``clear_line()`` / ``clear_columns()`` calls accumulate
+    into the module-level ``_row_buf`` instead of going to stdout. Pair
+    with :func:`end_row`. Captures cannot nest.
+
+    ``pane_cache`` is duck-typed: ``end_row`` reads ``pane_cache.rect``,
+    ``pane_cache.prev_rect`` and reads/writes ``pane_cache.lines[rel_row]``.
+    The state-layer ``PaneCache`` type defined in 040-state.py is the
+    expected concrete shape; tests can pass a ``SimpleNamespace`` with
+    the same attrs.
+    """
+    global _row_capture_active, _row_buf, _row_meta
+    if _row_capture_active:
+        raise RuntimeError('begin_row: row capture already active (no nesting)')
+    _row_capture_active = True
+    _row_buf = []
+    _row_meta = {
+        'pane_cache': pane_cache,
+        'rel_row': rel_row,
+        'abs_row': abs_row,
+        'left': left,
+        'right': right,
+        'rightmost': rightmost,
+    }
+
+
+def end_row():
+    """Finish a row capture; emit only on a cache miss.
+
+    Cache HIT (same captured bytes as ``pane_cache.lines[rel_row]``,
+    same rect, prev_rect != None): emit nothing.
+
+    Cache MISS: emit ``\\e[<abs_row>;<left>H`` + buffered bytes +
+    ``\\e[m`` + (pad-or-``\\e[K``), then update the cache. Padding rules:
+
+      * ``prev_rect is None`` (first paint in this rect): no padding.
+      * ``prev_rect != rect`` (rect just changed): pad to pane width
+        (or ``\\e[K`` when ``rightmost``); cache stores
+        ``visible_len = pane_width``.
+      * Steady state, new visible_len < cached visible_len: pad to
+        cached visible_len (or ``\\e[K`` when rightmost); cache stores
+        the displayed visible_len.
+      * Else: no padding; cache stores new visible_len.
+    """
+    global _row_capture_active, _row_buf, _row_meta
+    if not _row_capture_active:
+        raise RuntimeError('end_row: no active row capture')
+
+    meta = _row_meta
+    buf = ''.join(_row_buf)
+    pane_cache = meta['pane_cache']
+    rel_row = meta['rel_row']
+    abs_row = meta['abs_row']
+    left = meta['left']
+    right = meta['right']
+    rightmost = meta['rightmost']
+    pane_width = right - left
+
+    # Reset capture state BEFORE emitting so direct stdout writes below
+    # actually go to stdout (they call write(), which checks the flag).
+    _row_capture_active = False
+    _row_buf = []
+    _row_meta = None
+
+    rect = pane_cache.rect
+    prev_rect = pane_cache.prev_rect
+    cached = pane_cache.lines[rel_row] if rel_row < len(pane_cache.lines) else None
+
+    new_visible = _visible_len(buf)
+
+    # Cache hit: same content + same rect + not first paint → emit nothing.
+    if (cached is not None
+            and prev_rect is not None
+            and prev_rect == rect
+            and cached[1] == buf):
+        return
+
+    # Cache miss path — emit.
+    write('\033[{};{}H'.format(abs_row, left))
+    write(buf)
+    write('\033[m')
+
+    if prev_rect is None:
+        # First paint in this rect — no padding.
+        stored_visible = new_visible
+    elif prev_rect != rect:
+        # Rect changed — pad to full pane width (or \e[K if rightmost).
+        if rightmost:
+            write('\033[K')
+        else:
+            pad = pane_width - new_visible
+            if pad > 0:
+                write(' ' * pad)
+        stored_visible = pane_width
+    else:
+        # Steady state, same rect.
+        cached_visible = cached[0] if cached is not None else 0
+        if new_visible < cached_visible:
+            if rightmost:
+                write('\033[K')
+                # \e[K clears to end-of-line; the displayed visible
+                # length is effectively new_visible (rest is blank).
+                stored_visible = new_visible
+            else:
+                pad = cached_visible - new_visible
+                write(' ' * pad)
+                stored_visible = cached_visible
+        else:
+            stored_visible = new_visible
+
+    pane_cache.lines[rel_row] = (stored_visible, buf)
+
+
+def begin_sync():
+    """Begin a synchronized output region (DEC mode 2026)."""
+    write('\033[?2026h')
+
+
+def end_sync():
+    """End a synchronized output region (DEC mode 2026)."""
+    write('\033[?2026l')
 
 # ---- terminal size --------------------------------------------------------
 
@@ -162,12 +352,17 @@ def _handle_sigtstp(signum, frame):
 
 def _handle_sigcont(signum, frame):
     """Re-enter raw mode after being resumed from a SIGTSTP stop."""
-    global g_resize_flag
+    global g_resize_flag, g_screen_lost_flag
     _enter_raw()
     # Re-register SIGTSTP handler (it was set to SIG_DFL before stop)
     signal.signal(signal.SIGTSTP, _handle_sigtstp)
-    # Force a full redraw
+    # Force a full redraw. ``g_screen_lost_flag`` tells the main loop
+    # to also drop the per-pane row cache: the alt-screen content was
+    # destroyed while we were stopped, so cache-hit short-circuits in
+    # ``end_row`` would otherwise emit nothing and leave the screen
+    # blank.
     g_resize_flag = True
+    g_screen_lost_flag = True
 
 # ---- raw mode / alternate screen -----------------------------------------
 
@@ -232,9 +427,14 @@ def term_suspend():
 
 def term_resume():
     """Re-enter raw mode and alternate screen after an external command."""
-    global g_resize_flag
+    global g_resize_flag, g_screen_lost_flag
     _enter_raw()
     g_resize_flag = True
+    # Shelling out to an editor/pager scrolled the user's content into
+    # the primary screen and left the alt screen blank on re-entry —
+    # same as resume from SIGTSTP. Drop the row cache so the next
+    # ``render_full`` actually re-emits every pane.
+    g_screen_lost_flag = True
 
 # ---- keystroke reader -----------------------------------------------------
 

@@ -17,18 +17,26 @@ This test file therefore covers the pure helpers only. The placeholder
 ``Item`` injection follows the same pattern used in ``test_visible_tree.py``.
 """
 
+import io
+import sys
 import unittest
 
+from test.unit import _loader
 from test.unit._loader import load
 
 
 _data = load('_browse_tui_data', '030-data.py')
+_state = load('_browse_tui_state', '040-state.py')
 _render = load('_browse_tui_render', '050-render.py')
 
 # The render module references ``Item`` for synthetic placeholder rows
 # (mirrors the state module's pattern). Inject the real class so the
 # default formatter can introspect.
 _render.Item = _data.Item
+# PaneCache is referenced by the four content renderers (#187) — they
+# call ``browser._pane_cache.setdefault(name, PaneCache())``. Inject the
+# state-layer type the same way Item is injected.
+_render.PaneCache = _state.PaneCache
 
 Item = _data.Item
 format_item_segments = _render.format_item_segments
@@ -56,7 +64,7 @@ class _TermCapture:
     def install(self, mod):
         self._saved = {}
         for name in ('move', 'write', 'set_style', 'reset_style',
-                     'clear_line', 'clear_columns'):
+                     'clear_line', 'clear_columns', 'begin_row', 'end_row'):
             self._saved[name] = getattr(mod, name, None)
         mod.move = self._move
         mod.write = self._write
@@ -64,6 +72,13 @@ class _TermCapture:
         mod.reset_style = self._reset_style
         mod.clear_line = self._clear_line
         mod.clear_columns = self._clear_columns
+        # Row-shim stubs (#187): begin_row emits a move + clear-columns
+        # equivalent to the pre-shim per-row prologue so existing tests
+        # that count moves/clears still see the row-start activity.
+        # end_row is a no-op — the real shim's cache-diff path is
+        # exercised separately in test_terminal_row_shim.py.
+        mod.begin_row = self._begin_row
+        mod.end_row = self._end_row
 
     def restore(self, mod):
         for name, value in self._saved.items():
@@ -91,6 +106,19 @@ class _TermCapture:
 
     def _clear_columns(self, row, left, right):
         self.events.append(('clear_columns', row, left, right))
+
+    def _begin_row(self, pane_cache, rel_row, abs_row, left, right, *,
+                   rightmost):
+        # Mimic the row-prologue the renderer used to do explicitly:
+        # clear the pane's column range, then move to (abs_row, left).
+        # Tests that count clears/moves keep their assertions valid.
+        self.events.append(('begin_row', rel_row, abs_row, left, right,
+                            rightmost))
+        self._clear_columns(abs_row, left, right)
+        self._move(abs_row, left)
+
+    def _end_row(self):
+        self.events.append(('end_row',))
 
 
 # --- _TAG_STYLE map ---------------------------------------------------------
@@ -1189,6 +1217,8 @@ class _MockBrowser:
         self._help_mode = False
         self._preview_scroll = 0
         self._needs_redraw = set()
+        # Per-pane row cache used by the differential renderer (#187).
+        self._pane_cache = {}
         self.show_ids = 'auto'
         self.show_preview = True
         self.show_children_pane = False
@@ -1451,6 +1481,8 @@ class TestRenderPartialRedrawsSeparators(unittest.TestCase):
             _render, 'render_children_list', None)
         self._saved_render_preview = getattr(_render, 'render_preview', None)
         self._saved_flush = getattr(_render, 'flush', None)
+        self._saved_begin_sync = getattr(_render, 'begin_sync', None)
+        self._saved_end_sync = getattr(_render, 'end_sync', None)
         # Silence sub-renderers that aren't under test — we only want
         # to observe the separator draws.
         _render.render_info_bar = lambda *a, **kw: None
@@ -1458,6 +1490,11 @@ class TestRenderPartialRedrawsSeparators(unittest.TestCase):
         _render.render_children_list = lambda *a, **kw: None
         _render.render_preview = lambda *a, **kw: None
         _render.flush = lambda: None
+        # render_partial brackets its body with begin_sync / end_sync
+        # (#186); when 050-render is loaded standalone these names
+        # aren't present, so stub them out.
+        _render.begin_sync = lambda: None
+        _render.end_sync = lambda: None
 
     def tearDown(self):
         self.cap.restore(_render)
@@ -1469,6 +1506,8 @@ class TestRenderPartialRedrawsSeparators(unittest.TestCase):
             ('render_children_list', self._saved_render_children_list),
             ('render_preview', self._saved_render_preview),
             ('flush', self._saved_flush),
+            ('begin_sync', self._saved_begin_sync),
+            ('end_sync', self._saved_end_sync),
         ):
             if saved is None:
                 if hasattr(_render, name):
@@ -1582,6 +1621,247 @@ class TestRenderPartialRedrawsSeparators(unittest.TestCase):
         _render.render_partial(browser)
         # Empty needs → early return, no events at all.
         self.assertEqual(self._separator_writes(), [])
+
+
+# --- BSU/ESU brackets + no \e[2J (#186) ------------------------------------
+
+
+class TestSynchronizedOutputBrackets(unittest.TestCase):
+    """``render_full`` / ``render_partial`` bracket their output with
+    DEC mode 2026 begin/end synchronized output and never emit ``\\e[2J``.
+
+    Pre-#186, ``render_full`` started with ``\\e[2J`` to clear the
+    screen. The differential renderer in #185–#188 replaces that with
+    a row-cache-aware repaint, so the blanket clear is gone. Both
+    entry points now bracket their writes with ``\\e[?2026h`` (BSU)
+    and ``\\e[?2026l`` (ESU) so terminals that support it swap in the
+    new frame atomically.
+    """
+
+    def setUp(self):
+        self.cap = _TermCapture()
+        self.cap.install(_render)
+        self._saved_layout_for = getattr(_render, '_layout_for', None)
+        self._saved_render_list = getattr(_render, 'render_list', None)
+        self._saved_render_children_grid = getattr(
+            _render, 'render_children_grid', None)
+        self._saved_render_children_list = getattr(
+            _render, 'render_children_list', None)
+        self._saved_render_preview = getattr(_render, 'render_preview', None)
+        self._saved_render_separator = getattr(
+            _render, 'render_separator', None)
+        self._saved_render_info_bar = getattr(_render, 'render_info_bar', None)
+        self._saved_flush = getattr(_render, 'flush', None)
+        self._saved_begin_sync = getattr(_render, 'begin_sync', None)
+        self._saved_end_sync = getattr(_render, 'end_sync', None)
+        # Silence the inner renderers — we observe only the brackets.
+        _render.render_list = lambda *a, **kw: None
+        _render.render_children_grid = lambda *a, **kw: None
+        _render.render_children_list = lambda *a, **kw: None
+        _render.render_preview = lambda *a, **kw: None
+        _render.render_separator = lambda *a, **kw: None
+        _render.render_info_bar = lambda *a, **kw: None
+        _render.flush = lambda: None
+        # Real BSU/ESU bytes flow through the captured ``write`` so the
+        # tests can assert on the escape sequences.
+        _render.begin_sync = lambda: _render.write('\033[?2026h')
+        _render.end_sync = lambda: _render.write('\033[?2026l')
+
+    def tearDown(self):
+        self.cap.restore(_render)
+        for name, saved in (
+            ('_layout_for', self._saved_layout_for),
+            ('render_list', self._saved_render_list),
+            ('render_children_grid', self._saved_render_children_grid),
+            ('render_children_list', self._saved_render_children_list),
+            ('render_preview', self._saved_render_preview),
+            ('render_separator', self._saved_render_separator),
+            ('render_info_bar', self._saved_render_info_bar),
+            ('flush', self._saved_flush),
+            ('begin_sync', self._saved_begin_sync),
+            ('end_sync', self._saved_end_sync),
+        ):
+            if saved is None:
+                if hasattr(_render, name):
+                    delattr(_render, name)
+            else:
+                setattr(_render, name, saved)
+
+    def _stub_layout(self):
+        body_top, body_bottom = 1, 23
+        layout = {
+            'list': Rect(left=1, top=body_top, right=25, bottom=body_bottom),
+            'children': None,
+            'preview': Rect(left=25, top=body_top, right=81, bottom=body_bottom),
+            'sep_main': None,
+            'sep_inner': None,
+            'info_bar': Rect(left=1, top=body_top, right=81, bottom=body_top + 1),
+            'cols': 80,
+            'rows': 24,
+            'list_rightmost': False,
+            'children_rightmost': False,
+            'preview_rightmost': True,
+            'info_bar_rightmost': True,
+            'sep_main_rightmost': False,
+            'sep_inner_rightmost': False,
+        }
+        _render._layout_for = lambda b: layout
+
+    def _make_browser(self, needs=None):
+        state = _MockState(visible=[], cursor=0)
+        browser = _MockBrowser(state)
+        browser._needs_redraw = set(needs or ())
+        return browser
+
+    def test_render_full_does_not_emit_2J(self):
+        self._stub_layout()
+        browser = self._make_browser()
+        _render.render_full(browser)
+        joined = ''.join(self.cap.flat)
+        self.assertNotIn('\033[2J', joined,
+                         'render_full must not blanket-clear the screen')
+
+    def test_render_full_brackets_output_with_BSU_ESU(self):
+        self._stub_layout()
+        browser = self._make_browser()
+        _render.render_full(browser)
+        # First captured write is BSU; last is ESU.
+        self.assertTrue(self.cap.flat, 'render_full produced no output')
+        self.assertEqual(self.cap.flat[0], '\033[?2026h')
+        self.assertEqual(self.cap.flat[-1], '\033[?2026l')
+
+    def test_render_partial_brackets_output_with_BSU_ESU(self):
+        self._stub_layout()
+        browser = self._make_browser(needs={'list'})
+        _render.render_partial(browser)
+        self.assertTrue(self.cap.flat, 'render_partial produced no output')
+        self.assertEqual(self.cap.flat[0], '\033[?2026h')
+        self.assertEqual(self.cap.flat[-1], '\033[?2026l')
+
+    def test_render_partial_empty_needs_is_silent(self):
+        # Empty needs → render_partial returns before begin_sync; no BSU.
+        self._stub_layout()
+        browser = self._make_browser(needs=set())
+        _render.render_partial(browser)
+        joined = ''.join(self.cap.flat)
+        self.assertNotIn('\033[?2026h', joined)
+        self.assertNotIn('\033[?2026l', joined)
+
+
+class TestSeparatorCacheZeroBytes(unittest.TestCase):
+    """Separator + info-bar repaints with unchanged rect emit zero bytes.
+
+    Wires the real ``begin_row`` / ``end_row`` shim from 020-terminal.py
+    against a stdout capture, then paints a vertical separator and an
+    info bar twice and verifies the second paint emits no bytes (the
+    "skip separator redraw when layout unchanged" optimization promised
+    by #188 — falls out automatically from the row-buffer cache).
+    """
+
+    def setUp(self):
+        # Load the real terminal module and graft its shim onto _render
+        # so render_separator / render_info_bar exercise the cache path.
+        self._terminal = _loader.load(
+            '_browse_tui_terminal_188', '020-terminal.py')
+        self._saved = {}
+        for name in ('move', 'write', 'set_style', 'reset_style',
+                     'clear_line', 'clear_columns', 'begin_row', 'end_row'):
+            self._saved[name] = getattr(_render, name, None)
+            setattr(_render, name, getattr(self._terminal, name))
+        # Stdout capture: real shim emits via sys.stdout.write on miss.
+        self._orig_stdout = sys.stdout
+        self._stdout = io.StringIO()
+        sys.stdout = self._stdout
+        # Defensive: clear shim capture state.
+        self._terminal._row_capture_active = False
+        self._terminal._row_buf = []
+        self._terminal._row_meta = None
+
+    def tearDown(self):
+        sys.stdout = self._orig_stdout
+        for name, value in self._saved.items():
+            if value is None:
+                if hasattr(_render, name):
+                    delattr(_render, name)
+            else:
+                setattr(_render, name, value)
+
+    def _drain(self):
+        text = self._stdout.getvalue()
+        self._stdout.truncate(0)
+        self._stdout.seek(0)
+        return text
+
+    def test_vertical_separator_zero_bytes_on_second_paint(self):
+        browser = _MockBrowser(_MockState([]))
+        rect = Rect(left=20, top=2, right=21, bottom=8)  # height=6, width=1
+
+        # First paint: cache empty → emits.
+        _render.render_separator(rect, cache_key='sep_main', browser=browser)
+        first = self._drain()
+        self.assertIn('│', first, 'first paint must emit the bar glyphs')
+
+        # Cache populated for all 6 rows.
+        cache = browser._pane_cache['sep_main']
+        self.assertEqual(len(cache.lines), 6)
+        for i, line in enumerate(cache.lines):
+            self.assertIsNotNone(line, f'lines[{i}] should be cached')
+
+        # Second paint with the same rect → zero bytes.
+        _render.render_separator(rect, cache_key='sep_main', browser=browser)
+        second = self._drain()
+        self.assertEqual(second, '',
+                         f'second paint must emit nothing, got {second!r}')
+
+    def test_horizontal_separator_zero_bytes_on_second_paint(self):
+        browser = _MockBrowser(_MockState([]))
+        rect = Rect(left=1, top=10, right=21, bottom=11)  # height=1, width=20
+
+        _render.render_separator(rect, cache_key='sep_main', browser=browser)
+        self.assertIn('─', self._drain())
+        cache = browser._pane_cache['sep_main']
+        self.assertIsNotNone(cache.lines[0])
+
+        _render.render_separator(rect, cache_key='sep_main', browser=browser)
+        self.assertEqual(self._drain(), '')
+
+    def test_info_bar_zero_bytes_on_second_paint(self):
+        browser = _MockBrowser(_MockState([]))
+
+        # First paint at row 24, cols=80.
+        _render.render_info_bar(
+            24, 80, 'Preview', info=False, browser=browser,
+            rightmost=True, manage_cache=True,
+        )
+        first = self._drain()
+        self.assertIn('Preview', first,
+                      'first paint must emit the label')
+        cache = browser._pane_cache['info_bar']
+        self.assertIsNotNone(cache.lines[0],
+                             'info_bar cache must be populated')
+
+        # Second paint, same row/cols/label/state → zero bytes.
+        _render.render_info_bar(
+            24, 80, 'Preview', info=False, browser=browser,
+            rightmost=True, manage_cache=True,
+        )
+        self.assertEqual(self._drain(), '')
+
+    def test_separator_rect_change_invalidates_cache(self):
+        """Sanity check: changing the rect drops the zero-byte invariant.
+
+        Confirms the cache-hit gate keys on rect (height) — a new height
+        means the cache is reshaped and the next paint emits.
+        """
+        browser = _MockBrowser(_MockState([]))
+        rect_a = Rect(left=20, top=2, right=21, bottom=8)
+        rect_b = Rect(left=20, top=2, right=21, bottom=10)  # taller
+
+        _render.render_separator(rect_a, cache_key='sep_main', browser=browser)
+        self._drain()
+        _render.render_separator(rect_b, cache_key='sep_main', browser=browser)
+        self.assertNotEqual(self._drain(), '',
+                            'rect change must force emission')
 
 
 if __name__ == '__main__':

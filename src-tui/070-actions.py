@@ -243,7 +243,21 @@ def _reload(ctx):
 
 
 def _redraw(ctx):
-    """Force a full redraw of every pane."""
+    """Force a full redraw of every pane.
+
+    Emits ``\\e[2J`` to clear the screen, drops the per-pane line cache,
+    and flags every pane dirty. The next ``render_full`` then takes the
+    empty-screen first-paint path: content-only writes with no trailing
+    space pads and no ``\\e[K`` clear-to-EOL sequences, since each
+    pane's ``prev_rect`` starts as ``None`` and ``end_row`` skips the
+    padding/erase work in that case.
+
+    Distinct from the screen-lost recovery in ``020-terminal`` (which
+    handles SIGTSTP/SIGCONT) — that path lives at the loop layer; this
+    is the user-initiated explicit-redraw action bound to Ctrl-L.
+    """
+    write('\033[2J')
+    ctx._browser._pane_cache.clear()
     ctx._browser._needs_redraw.add('all')
 
 

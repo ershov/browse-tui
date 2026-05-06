@@ -1032,8 +1032,15 @@ def _child_segments(item, max_width, show_ids='auto'):
 # ---------------------------------------------------------------------------
 
 
-def render_list(browser, rect):
+def render_list(browser, rect, *, rightmost: bool = False):
     """Render the list pane for ``browser`` at the given :class:`Rect`.
+
+    The ``rightmost`` keyword flag indicates whether the pane reaches the
+    terminal's right edge (``rect.right == cols + 1``). It is plumbed
+    through here in #186 so the differential renderer in #187/#188 can
+    pass it into ``begin_row`` / ``end_row`` for the trailing-clear
+    decision. Callers in earlier revisions may omit it; the default
+    preserves the pre-#186 behaviour.
 
     Reads cursor / selected / expanded / scope state from
     ``browser._state`` via ``visible_items``. Maintains
@@ -1057,6 +1064,9 @@ def render_list(browser, rect):
     width = rect.width
     left = rect.left
     right = rect.right
+
+    cache = browser._pane_cache.setdefault('list', PaneCache())
+    cache.ensure(rect)
 
     state = browser._state
     visible = visible_items(state)
@@ -1107,13 +1117,10 @@ def render_list(browser, rect):
     for row_idx in range(height):
         vis_idx = scroll + row_idx
         row = top + row_idx
-        # Clear only this pane's column range — preserves other panes
-        # painted on the same row (e.g. the list pane on the left of
-        # the preview pane in layouts v/m/pc).
-        clear_columns(row, left, right)
-        move(row, left)
+        begin_row(cache, row_idx, row, left, right, rightmost=rightmost)
 
         if vis_idx >= len(visible):
+            end_row()
             continue
 
         entry = visible[vis_idx]
@@ -1138,6 +1145,7 @@ def render_list(browser, rect):
             if len(line) < width:
                 write(' ' * (width - len(line)))
             reset_style()
+            end_row()
             continue
 
         segments = format_item_segments(
@@ -1183,10 +1191,22 @@ def render_list(browser, rect):
                 )
             else:
                 _write_segments(segments, width)
+        end_row()
+
+    # Commit the rect: after a complete paint of this geometry, the
+    # next paint may hit the cache. ``prev_rect`` becoming equal to
+    # ``rect`` is the gate end_row uses to enable cache hits.
+    cache.prev_rect = cache.rect
 
 
-def render_preview(browser, rect, *, info=False, has_header=True):
+def render_preview(browser, rect, *, info=False, has_header=True,
+                   rightmost: bool = False):
     """Render the preview pane (header + content) within ``rect``.
+
+    ``rightmost`` is the pane-touches-right-edge flag plumbed through in
+    #186 for the differential renderer (#187/#188). It defaults to False
+    so existing callers continue to work; ``render_full`` /
+    ``render_partial`` pass the value computed by ``_layout_for``.
 
     When ``has_header=True`` the first row of ``rect`` is the info-bar
     header (label + optional ``[N]`` / search prompt / hints when
@@ -1217,19 +1237,30 @@ def render_preview(browser, rect, *, info=False, has_header=True):
     left = rect.left
     right = rect.right
 
+    cache = browser._pane_cache.setdefault('preview', PaneCache())
+    cache.ensure(rect)
+
     if has_header:
         label = _preview_label(browser)
         # In 'h' layout the preview's first row IS the full-width info
         # bar (left=1, right=cols+1). For other layouts the info bar
         # is drawn separately on the bottom row by render_full and we
         # take the ``has_header=False`` branch.
+        # Header row uses begin_row/end_row to participate in the cache;
+        # the info-bar writer emits its own move/clear via the captured
+        # primitives so cache hits silence repeat paints.
+        begin_row(cache, 0, top, left, right, rightmost=rightmost)
         render_info_bar(top, right - 1, label, info=info, browser=browser)
+        end_row()
         content_top = top + 1
         content_lines = height - 1
+        content_row_offset = 1
     else:
         content_top = top
         content_lines = height
+        content_row_offset = 0
     if content_lines <= 0:
+        cache.prev_rect = cache.rect
         return
 
     if browser._error_text:
@@ -1269,11 +1300,14 @@ def render_preview(browser, rect, *, info=False, has_header=True):
         scroll = 0
     for i in range(content_lines):
         row = content_top + i
-        clear_columns(row, left, right)
+        rel_row = content_row_offset + i
+        begin_row(cache, rel_row, row, left, right, rightmost=rightmost)
         src_idx = i + scroll
         if src_idx < len(wrapped):
-            move(row, left)
             write(wrapped[src_idx])
+        end_row()
+
+    cache.prev_rect = cache.rect
 
 
 def _cursor_id(browser):
@@ -1302,8 +1336,14 @@ def _cursor_item(browser):
     return entry.item
 
 
-def render_children_grid(browser, rect, *, info=False, has_header=True):
+def render_children_grid(browser, rect, *, info=False, has_header=True,
+                         rightmost: bool = False):
     """Render the children-grid pane (header + content) within ``rect``.
+
+    ``rightmost`` is the pane-touches-right-edge flag plumbed through in
+    #186 for the differential renderer (#187/#188). It defaults to False
+    so existing callers continue to work; ``render_full`` /
+    ``render_partial`` pass the value computed by ``_layout_for``.
 
     When ``has_header=True`` the first row of ``rect`` is the info-bar
     header (label ``Children`` plus optional ``[N]`` / search prompt /
@@ -1339,20 +1379,32 @@ def render_children_grid(browser, rect, *, info=False, has_header=True):
     left = rect.left
     right = rect.right
 
+    cache = browser._pane_cache.setdefault('children', PaneCache())
+    cache.ensure(rect)
+
     if has_header:
+        # Header row participates in the cache so a static info bar
+        # doesn't repaint on every keystroke.
+        begin_row(cache, 0, top, left, right, rightmost=rightmost)
         render_info_bar(top, right - 1, 'Children', info=info, browser=browser)
+        end_row()
         content_top = top + 1
         content_lines = height - 1
+        content_row_offset = 1
     else:
         content_top = top
         content_lines = height
+        content_row_offset = 0
     if content_lines <= 0:
         return
 
     cursor = _cursor_item(browser)
     if cursor is None:
         for i in range(content_lines):
-            clear_columns(content_top + i, left, right)
+            row = content_top + i
+            rel_row = content_row_offset + i
+            begin_row(cache, rel_row, row, left, right, rightmost=rightmost)
+            end_row()
         return
 
     state = browser._state
@@ -1360,19 +1412,26 @@ def render_children_grid(browser, rect, *, info=False, has_header=True):
 
     # Pending: cursor on a branch whose children aren't cached yet.
     if children is None and cursor.has_children:
-        clear_columns(content_top, left, right)
-        move(content_top, left)
+        begin_row(cache, content_row_offset, content_top, left, right,
+                  rightmost=rightmost)
         set_style(fg=_PENDING_FG)
         write('⧗ loading…'[:width])
         reset_style()
+        end_row()
         for i in range(1, content_lines):
-            clear_columns(content_top + i, left, right)
+            row = content_top + i
+            rel_row = content_row_offset + i
+            begin_row(cache, rel_row, row, left, right, rightmost=rightmost)
+            end_row()
         return
 
     # Cached but empty (or a leaf) — nothing to draw, blank rows.
     if not children:
         for i in range(content_lines):
-            clear_columns(content_top + i, left, right)
+            row = content_top + i
+            rel_row = content_row_offset + i
+            begin_row(cache, rel_row, row, left, right, rightmost=rightmost)
+            end_row()
         return
 
     # Cached non-empty children — multi-column flowed layout.
@@ -1397,22 +1456,24 @@ def render_children_grid(browser, rect, *, info=False, has_header=True):
 
     total_rows = max((len(cl) for cl in col_lines), default=0)
 
-    for row in range(content_lines):
-        clear_columns(content_top + row, left, right)
-        move(content_top + row, left)
-        if row >= total_rows:
+    for row_offset in range(content_lines):
+        abs_row = content_top + row_offset
+        rel_row = content_row_offset + row_offset
+        begin_row(cache, rel_row, abs_row, left, right, rightmost=rightmost)
+        if row_offset >= total_rows:
+            end_row()
             continue
         col_pos = 0
         for c in range(num_cols):
             cl = col_lines[c]
-            cell = cl[row] if row < len(cl) else ''
+            cell = cl[row_offset] if row_offset < len(cl) else ''
             if c < num_cols - 1:
                 cell_w = col_width
             else:
                 cell_w = width - col_pos
             if cell_w <= 0:
                 break
-            src_idx = col_entry_at[c].get(row)
+            src_idx = col_entry_at[c].get(row_offset)
             if src_idx is not None:
                 # First line of an entry — render with coloured segments.
                 child = children[src_idx]
@@ -1426,10 +1487,17 @@ def render_children_grid(browser, rect, *, info=False, has_header=True):
                 chunk = cell[:cell_w].ljust(cell_w)[:cell_w]
                 write(chunk)
             col_pos += cell_w
+        end_row()
 
 
-def render_children_list(browser, rect, *, info=False, has_header=True):
+def render_children_list(browser, rect, *, info=False, has_header=True,
+                         rightmost: bool = False):
     """Render the children pane as a one-per-row vertical list (Alt-1).
+
+    ``rightmost`` is the pane-touches-right-edge flag plumbed through in
+    #186 for the differential renderer (#187/#188). It defaults to False
+    so existing callers continue to work; ``render_full`` /
+    ``render_partial`` pass the value computed by ``_layout_for``.
 
     Used by the vertical (``split='v'``) layout per #176, where the
     children column sits between the list and the preview, occupying the
@@ -1450,20 +1518,33 @@ def render_children_list(browser, rect, *, info=False, has_header=True):
     left = rect.left
     right = rect.right
 
+    # render_children_list and render_children_grid share the 'children'
+    # cache key — the rect-based ensure() invalidates the buffer on
+    # layout style switches (vertical ↔ flowed grid) automatically.
+    cache = browser._pane_cache.setdefault('children', PaneCache())
+    cache.ensure(rect)
+
     if has_header:
+        begin_row(cache, 0, top, left, right, rightmost=rightmost)
         render_info_bar(top, right - 1, 'Children', info=info, browser=browser)
+        end_row()
         content_top = top + 1
         content_lines = height - 1
+        content_row_offset = 1
     else:
         content_top = top
         content_lines = height
+        content_row_offset = 0
     if content_lines <= 0:
         return
 
     cursor = _cursor_item(browser)
     if cursor is None:
         for i in range(content_lines):
-            clear_columns(content_top + i, left, right)
+            row = content_top + i
+            rel_row = content_row_offset + i
+            begin_row(cache, rel_row, row, left, right, rightmost=rightmost)
+            end_row()
         return
 
     state = browser._state
@@ -1471,30 +1552,40 @@ def render_children_list(browser, rect, *, info=False, has_header=True):
 
     # Pending: cursor on a branch whose children aren't cached yet.
     if children is None and cursor.has_children:
-        clear_columns(content_top, left, right)
-        move(content_top, left)
+        begin_row(cache, content_row_offset, content_top, left, right,
+                  rightmost=rightmost)
         set_style(fg=_PENDING_FG)
         write('⧗ loading…'[:width])
         reset_style()
+        end_row()
         for i in range(1, content_lines):
-            clear_columns(content_top + i, left, right)
+            row = content_top + i
+            rel_row = content_row_offset + i
+            begin_row(cache, rel_row, row, left, right, rightmost=rightmost)
+            end_row()
         return
 
     # Cached but empty (or a leaf) — nothing to draw, blank rows.
     if not children:
         for i in range(content_lines):
-            clear_columns(content_top + i, left, right)
+            row = content_top + i
+            rel_row = content_row_offset + i
+            begin_row(cache, rel_row, row, left, right, rightmost=rightmost)
+            end_row()
         return
 
     # Render each child on its own row using the coloured segments path.
     for row_idx in range(content_lines):
-        clear_columns(content_top + row_idx, left, right)
-        move(content_top + row_idx, left)
+        abs_row = content_top + row_idx
+        rel_row = content_row_offset + row_idx
+        begin_row(cache, rel_row, abs_row, left, right, rightmost=rightmost)
         if row_idx >= len(children):
+            end_row()
             continue
         child = children[row_idx]
         segs = _child_segments(child, width, show_ids=browser.show_ids)
         _write_segments(segs, width)
+        end_row()
 
 
 _SB_BG = 236   # dark gray status-bar background
@@ -1522,8 +1613,22 @@ def _scope_crumb_text(browser):
     return ' ' + ' '.join('▸ {}'.format(sid) for sid in stack) + ' '
 
 
-def render_separator(rect, *, orientation=None, content=None):
+def render_separator(rect, *, orientation=None, content=None,
+                     rightmost: bool = False, cache_key=None, browser=None):
     """Render a plain pane-separator view.
+
+    ``rightmost`` is the pane-touches-right-edge flag plumbed through in
+    #186 for the differential renderer (#187/#188). Internal vertical
+    separators in v/m/pc layouts never touch the right edge, so the
+    default of False is correct for nearly all call sites; the
+    ``render_full`` / ``render_partial`` orchestrators still pass the
+    value explicitly for symmetry with the other renderers.
+
+    ``cache_key`` + ``browser`` (added in #188) wire the separator into
+    the per-pane row cache so unchanged-rect repaints emit zero bytes.
+    Production callers in ``render_full`` / ``render_partial`` pass
+    ``cache_key='sep_main'`` / ``'sep_inner'`` plus ``browser``; legacy
+    / test callers may omit both, falling back to the direct-write path.
 
     ``rect`` is a :class:`Rect`. ``orientation`` is ``'h'`` (horizontal,
     fills with ``─``) or ``'v'`` (vertical, fills with ``│``); when
@@ -1561,23 +1666,47 @@ def render_separator(rect, *, orientation=None, content=None):
             # (clipped to the first row).
             orientation = 'h'
 
-    set_style(fg=8)
+    use_cache = cache_key is not None and browser is not None
+    if use_cache:
+        cache = browser._pane_cache.setdefault(cache_key, PaneCache())
+        cache.ensure(rect)
+
     if orientation == 'v':
         # Draw the vertical bar down the rect's left column. Most
         # callers pass a 1-col-wide rect; if wider, only the leftmost
         # column is filled (the rest is the pane content's
         # responsibility — the renderer doesn't repaint pane interiors).
-        for r in range(rect.top, rect.bottom):
-            move(r, rect.left)
-            write('│')
-        reset_style()
+        if use_cache:
+            left = rect.left
+            right = rect.right
+            for rel_row in range(rect.height):
+                abs_row = rect.top + rel_row
+                begin_row(cache, rel_row, abs_row, left, right,
+                          rightmost=rightmost)
+                set_style(fg=8)
+                write('│')
+                reset_style()
+                end_row()
+            cache.prev_rect = cache.rect
+        else:
+            set_style(fg=8)
+            for r in range(rect.top, rect.bottom):
+                move(r, rect.left)
+                write('│')
+            reset_style()
         return
 
     # Horizontal — write on the first row of the rect (separators are
     # 1-thick by construction; multi-row rects are clipped to the top
     # row to keep the API forgiving).
     width = rect.width
-    move(rect.top, rect.left)
+    if use_cache:
+        begin_row(cache, 0, rect.top, rect.left, rect.right,
+                  rightmost=rightmost)
+    else:
+        move(rect.top, rect.left)
+
+    set_style(fg=8)
     if content:
         # Truncate content to leave a 1-col padding on each side, then
         # centre it between two ``─`` runs.
@@ -1602,9 +1731,29 @@ def render_separator(rect, *, orientation=None, content=None):
         write('─' * width)
     reset_style()
 
+    if use_cache:
+        end_row()
+        cache.prev_rect = cache.rect
 
-def render_info_bar(row, cols, label, *, info=False, browser=None):
+
+def render_info_bar(row, cols, label, *, info=False, browser=None,
+                    rightmost: bool = False, manage_cache: bool = False):
     """Render the info-bar / pane-separator row with rich decoration.
+
+    ``rightmost`` is the pane-touches-right-edge flag plumbed through in
+    #186 for the differential renderer (#187/#188). The info bar always
+    spans the full terminal width in current layouts, so production
+    callers always pass True; the default of False is conservative for
+    legacy/test call sites.
+
+    ``manage_cache`` (added in #188): when True (and ``browser`` is
+    provided), wrap the writes in a ``begin_row`` / ``end_row`` pair
+    backed by ``browser._pane_cache['info_bar']`` so unchanged repaints
+    emit zero bytes. Folded callers — ``render_preview`` /
+    ``render_children_grid`` / ``render_children_list`` — leave it
+    False because they already drive their own pane cache around the
+    info-bar header row (the row participates in the parent pane's
+    cache, not its own).
 
     Historically this function was called ``render_separator``; it was
     promoted to a dedicated ``render_info_bar`` in #147 so the simpler
@@ -1625,6 +1774,15 @@ def render_info_bar(row, cols, label, *, info=False, browser=None):
     clamped at ``cols`` so nothing spills off-screen; only hint/filler
     visibility degrades. Phase-3 can layer adaptive truncation.
     """
+    use_cache = manage_cache and browser is not None and cols > 0
+    if use_cache:
+        # Build a one-row pane Rect spanning [1, cols+1) at row ``row``.
+        # ``Rect.right`` and ``Rect.bottom`` are exclusive per convention.
+        rect = Rect(left=1, top=row, right=cols + 1, bottom=row + 1)
+        cache = browser._pane_cache.setdefault('info_bar', PaneCache())
+        cache.ensure(rect)
+        begin_row(cache, 0, row, 1, cols + 1, rightmost=rightmost)
+
     S = '─'  # ─
     move(row, 1)
     clear_line()
@@ -1713,6 +1871,10 @@ def render_info_bar(row, cols, label, *, info=False, browser=None):
 
     reset_style()
 
+    if use_cache:
+        end_row()
+        cache.prev_rect = cache.rect
+
 
 # ---------------------------------------------------------------------------
 # Top-level orchestration
@@ -1749,7 +1911,7 @@ def _layout_for(browser):
                 # fetch is in flight.
                 children_rows = 1
             # cached == [] (empty list): leaf-like, no rows reserved.
-    return layout_panes(
+    layout = layout_panes(
         cols, rows,
         split=getattr(browser, 'split', 'h'),
         show_preview=browser.show_preview,
@@ -1757,6 +1919,32 @@ def _layout_for(browser):
         children_rows_needed=children_rows,
         list_ratio=browser.list_ratio,
     )
+    # Per-pane "rightmost" flags for the differential renderer (#186).
+    # A pane is rightmost iff its right edge coincides with the layout's
+    # right edge. ``Rect.right`` is exclusive, so for ``cols=80`` a pane
+    # reaching column 80 has ``right == 81 == cols + 1``. The flags ride
+    # alongside each pane rect under a sibling ``*_rightmost`` key so the
+    # ``render_full`` / ``render_partial`` call sites have the bool
+    # ready at zero per-row cost. Hidden panes (None rect) get False.
+    right_edge = layout['cols'] + 1
+
+    def _is_rightmost(rect):
+        return rect is not None and rect.right == right_edge
+
+    layout['list_rightmost'] = _is_rightmost(layout.get('list'))
+    layout['children_rightmost'] = _is_rightmost(layout.get('children'))
+    layout['preview_rightmost'] = _is_rightmost(layout.get('preview'))
+    # The info bar always spans the full width in current layouts (the
+    # pane separator that owns it is full-width by construction), so
+    # it's rightmost whenever it exists.
+    layout['info_bar_rightmost'] = _is_rightmost(layout.get('info_bar'))
+    # Separators in v/m/pc layouts are vertical bars splitting the body;
+    # they sit at internal column boundaries and never reach the right
+    # edge. Compute the flag explicitly for symmetry — the differential
+    # renderer treats every paint target uniformly.
+    layout['sep_main_rightmost'] = _is_rightmost(layout.get('sep_main'))
+    layout['sep_inner_rightmost'] = _is_rightmost(layout.get('sep_inner'))
+    return layout
 
 
 def _pane_info_flags(layout):
@@ -1816,16 +2004,22 @@ def _info_bar_is_separate(layout):
 def render_full(browser):
     """Repaint the whole screen.
 
-    Clears the screen, lays out the panes, paints each, then flushes.
+    Lays out the panes, paints each, then flushes. The whole sequence is
+    bracketed by a DEC mode 2026 "begin synchronized output" / "end
+    synchronized output" pair so terminals that support BSU/ESU swap the
+    new frame in atomically without tearing.
+
     Resets ``browser._needs_redraw`` so subsequent partial-render calls
-    start from a clean slate.
+    start from a clean slate. The historical ``\\e[2J`` blanket-clear
+    is gone (#185–#188): the differential renderer relies on the row
+    cache to detect stale columns rather than forcing a flash repaint.
     """
-    write('\033[2J')
+    begin_sync()
     layout = _layout_for(browser)
     sub_info, prev_info = _pane_info_flags(layout)
     info_separate = _info_bar_is_separate(layout)
     list_rect = layout['list']
-    render_list(browser, list_rect)
+    render_list(browser, list_rect, rightmost=layout.get('list_rightmost', False))
     children_rect = layout['children']
     if children_rect is not None:
         # Alt-1 (vertical) renders children as a one-per-row list; the
@@ -1835,12 +2029,14 @@ def render_full(browser):
                 browser, children_rect,
                 info=sub_info,
                 has_header=not info_separate,
+                rightmost=layout.get('children_rightmost', False),
             )
         else:
             render_children_grid(
                 browser, children_rect,
                 info=sub_info,
                 has_header=not info_separate,
+                rightmost=layout.get('children_rightmost', False),
             )
     preview_rect = layout['preview']
     if browser.show_preview and preview_rect is not None:
@@ -1848,6 +2044,7 @@ def render_full(browser):
             browser, preview_rect,
             info=prev_info,
             has_header=not info_separate,
+            rightmost=layout.get('preview_rightmost', False),
         )
     if (info_separate or not browser.show_preview) and layout['info_bar'] is not None:
         # Non-'h' layouts (or show_preview=False) — info bar is a
@@ -1855,6 +2052,8 @@ def render_full(browser):
         render_info_bar(
             layout['info_bar'].top, layout['cols'], _preview_label(browser),
             info=True, browser=browser,
+            rightmost=layout.get('info_bar_rightmost', False),
+            manage_cache=True,
         )
     # Draw plain separators between panes (vertical sep_main / sep_inner
     # in v/m/pc layouts). For layout 'h' both are None — separators are
@@ -1865,9 +2064,18 @@ def render_full(browser):
     sep_main = layout.get('sep_main')
     sep_inner = layout.get('sep_inner')
     if sep_main is not None:
-        render_separator(sep_main)
+        render_separator(
+            sep_main,
+            rightmost=layout.get('sep_main_rightmost', False),
+            cache_key='sep_main', browser=browser,
+        )
     if sep_inner is not None:
-        render_separator(sep_inner)
+        render_separator(
+            sep_inner,
+            rightmost=layout.get('sep_inner_rightmost', False),
+            cache_key='sep_inner', browser=browser,
+        )
+    end_sync()
     flush()
     browser._needs_redraw = set()
 
@@ -1894,6 +2102,7 @@ def render_partial(browser):
     if not needs:
         return
 
+    begin_sync()
     layout = _layout_for(browser)
     sub_info, prev_info = _pane_info_flags(layout)
     info_separate = _info_bar_is_separate(layout)
@@ -1903,7 +2112,8 @@ def render_partial(browser):
     info_bar = layout['info_bar']
     pane_repainted = False
     if 'list' in needs:
-        render_list(browser, list_rect)
+        render_list(browser, list_rect,
+                    rightmost=layout.get('list_rightmost', False))
         pane_repainted = True
     if 'children' in needs:
         if children_rect is not None:
@@ -1912,12 +2122,14 @@ def render_partial(browser):
                     browser, children_rect,
                     info=sub_info,
                     has_header=not info_separate,
+                    rightmost=layout.get('children_rightmost', False),
                 )
             else:
                 render_children_grid(
                     browser, children_rect,
                     info=sub_info,
                     has_header=not info_separate,
+                    rightmost=layout.get('children_rightmost', False),
                 )
         pane_repainted = True
     if 'preview' in needs:
@@ -1926,6 +2138,7 @@ def render_partial(browser):
                 browser, preview_rect,
                 info=prev_info,
                 has_header=not info_separate,
+                rightmost=layout.get('preview_rightmost', False),
             )
         pane_repainted = True
     if 'info' in needs:
@@ -1935,11 +2148,15 @@ def render_partial(browser):
                 render_info_bar(
                     ir, layout['cols'], 'Children',
                     info=True, browser=browser,
+                    rightmost=layout.get('info_bar_rightmost', False),
+                    manage_cache=True,
                 )
             else:
                 render_info_bar(
                     ir, layout['cols'], _preview_label(browser),
                     info=True, browser=browser,
+                    rightmost=layout.get('info_bar_rightmost', False),
+                    manage_cache=True,
                 )
     # Repaint pane separators whenever any pane was repainted. The
     # children pane in Alt-1 (#176) appears/disappears as the cursor
@@ -1951,9 +2168,18 @@ def render_partial(browser):
         sep_main = layout.get('sep_main')
         sep_inner = layout.get('sep_inner')
         if sep_main is not None:
-            render_separator(sep_main)
+            render_separator(
+                sep_main,
+                rightmost=layout.get('sep_main_rightmost', False),
+                cache_key='sep_main', browser=browser,
+            )
         if sep_inner is not None:
-            render_separator(sep_inner)
+            render_separator(
+                sep_inner,
+                rightmost=layout.get('sep_inner_rightmost', False),
+                cache_key='sep_inner', browser=browser,
+            )
+    end_sync()
     flush()
     browser._needs_redraw = set()
 

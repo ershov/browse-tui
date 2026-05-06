@@ -53,6 +53,7 @@ _state.term_init = lambda: None
 _state.term_restore = lambda: None
 _state.read_key = lambda: 'q'  # tests override per-case
 _state.g_resize_flag = False
+_state.g_screen_lost_flag = False
 _state.Context = _context.Context
 _state.dispatch_key = _actions.dispatch_key
 _state.render_full = lambda *a, **kw: None

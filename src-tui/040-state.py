@@ -102,6 +102,73 @@ class Pending:
             cb()
 
 
+# Per-pane row cache for the differential renderer (#185–#188).
+#
+# Holds the geometry of the pane during the most recent paint plus a
+# parallel list of cached rows. Each ``lines`` slot is either ``None``
+# (never painted, or invalidated and not yet repainted) or a tuple
+# ``(visible_len, bytes)`` produced by ``end_row`` in 020-terminal.
+#
+# The cache is duck-typed against ``begin_row`` / ``end_row``: those
+# helpers read ``.rect`` / ``.prev_rect`` and read/write ``.lines[i]``.
+# We deliberately leave ``rect`` / ``prev_rect`` un-typed because the
+# concatenated build order puts ``Rect`` (in 050-render.py) AFTER this
+# file at module load time — a forward annotation would dangle when
+# 040-state is loaded in isolation by the unit-test loader.
+@dataclass
+class PaneCache:
+    """Per-pane row cache used by the synchronized-output renderer.
+
+    Fields:
+      * ``rect`` — geometry of the pane during the most recent paint.
+      * ``prev_rect`` — geometry of the pane during the prior paint.
+        ``begin_row`` / ``end_row`` consult this to decide whether a
+        cached row from the previous paint is still positionally valid.
+      * ``lines`` — list of length ``rect.height`` of cached row
+        entries; each entry is ``None`` or ``(visible_len, bytes)``.
+
+    The renderer migrations in #187/#188 will drive the cache; this
+    ticket (#186) only wires the structure onto Browser.
+    """
+
+    rect: Any = None
+    prev_rect: Any = None
+    lines: list = field(default_factory=list)
+
+    def invalidate(self, new_rect) -> None:
+        """Rotate ``rect`` -> ``prev_rect``, install ``new_rect``, reset lines.
+
+        The line buffer is sized to the new rect's height so per-row
+        access is straight-line indexing.
+        """
+        self.prev_rect = self.rect
+        self.rect = new_rect
+        self.lines = [None] * new_rect.height
+
+    def ensure(self, new_rect) -> None:
+        """Idempotent ``invalidate`` — only rotates when geometry changes.
+
+        Callers (the per-pane renderers) hit this on every paint;
+        identical geometry means the cached row buffer is reusable.
+
+        On the second paint with the same rect, roll ``prev_rect`` forward
+        so ``end_row`` transitions from the "first paint after rect change"
+        regime (no padding — drawing on a clean slate) to the steady-state
+        regime (pad to cached visible length so shrinking content overwrites
+        stale cells from previous paints). Without this roll, ``prev_rect``
+        stays at its post-invalidate value (``None`` after the first ever
+        paint, or the prior rect after a resize) forever, and stale
+        content from prior renders never gets cleared.
+        """
+        if self.rect != new_rect:
+            self.invalidate(new_rect)
+        elif self.prev_rect != self.rect:
+            # The rect-change signal was consumed by the prior paint's
+            # padding pass. Roll ``prev_rect`` forward so subsequent paints
+            # take the steady-state branch in ``end_row``.
+            self.prev_rect = self.rect
+
+
 # A single rendered row produced by ``visible_items``.
 @dataclass
 class VisibleEntry:
@@ -835,6 +902,14 @@ class Browser:
         # Maintained by render_list to keep the cursor on-screen; lives
         # on Browser so partial redraws remember it across calls.
         self._list_scroll = 0
+        # Per-pane row caches for the differential renderer (#186). Keys
+        # are pane names ('list', 'children', 'preview', 'info_bar',
+        # 'sep_main', 'sep_inner', …); values are ``PaneCache`` objects
+        # carrying current/previous rect plus a parallel ``lines`` buffer
+        # of cached ``(visible_len, bytes)`` tuples. The renderer
+        # migrations in #187/#188 will populate these via the row-buffer
+        # shim in 020-terminal; this ticket just wires the dict.
+        self._pane_cache: dict = {}
 
         # --- quit bookkeeping (read by the main loop in #13) ------------
         # quit() flips _quit_requested; the main loop watches the flag
@@ -1526,6 +1601,14 @@ class Browser:
                 if globals().get('g_resize_flag', False):
                     globals()['g_resize_flag'] = False
                     self._needs_redraw.add('all')
+                # Screen-lost flag — set by SIGCONT / term_resume after the
+                # alt-screen content was destroyed externally. Drop the
+                # per-pane row caches so ``end_row`` doesn't cache-hit
+                # against the now-stale (and invisible) pre-suspend state.
+                if globals().get('g_screen_lost_flag', False):
+                    globals()['g_screen_lost_flag'] = False
+                    self._pane_cache.clear()
+                    self._needs_redraw.add('all')
 
                 if self._needs_redraw and not self._headless:
                     if 'all' in self._needs_redraw:
@@ -1543,6 +1626,10 @@ class Browser:
 
                 if globals().get('g_resize_flag', False):
                     globals()['g_resize_flag'] = False
+                    self._needs_redraw.add('all')
+                if globals().get('g_screen_lost_flag', False):
+                    globals()['g_screen_lost_flag'] = False
+                    self._pane_cache.clear()
                     self._needs_redraw.add('all')
 
                 if key == '_notify':

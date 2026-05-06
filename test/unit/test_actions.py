@@ -11,7 +11,9 @@ Tests load ``020-terminal``, ``030-data``, ``040-state``, and
 production single-file build resolves via concatenation.
 """
 
+import io
 import os
+import sys
 import unittest
 
 from test.unit._loader import load
@@ -31,6 +33,7 @@ _state.notify_wake = _term.notify_wake
 _render.Item = _data.Item
 _render.VisibleEntry = _state.VisibleEntry
 
+_actions.write = _term.write
 _actions.visible_items = _state.visible_items
 _actions.mark_visible_dirty = _state.mark_visible_dirty
 _actions.current_scope = _state.current_scope
@@ -2428,6 +2431,71 @@ class TestLayoutSplitActions(unittest.TestCase):
             self.assertEqual(b.split, 'h')
         finally:
             b.stop_workers()
+
+
+class TestRedrawAction(unittest.TestCase):
+    """Ctrl-L (``_redraw``): clear screen, drop pane cache, flag 'all' dirty.
+
+    Ticket #189. The action is the user-initiated explicit redraw bound
+    to Ctrl-L. It must replicate the empty-screen first-paint path on
+    the next render — so it emits ``\\e[2J``, clears ``_pane_cache``
+    (so each pane's ``prev_rect`` resets to ``None``), and adds
+    ``'all'`` to ``_needs_redraw`` so the next loop tick runs
+    ``render_full``.
+    """
+
+    def test_redraw_emits_clear_screen(self):
+        b = _make_browser()
+        try:
+            ctx = _ctx_for(b)
+            saved = sys.stdout
+            buf = io.StringIO()
+            sys.stdout = buf
+            try:
+                _actions._redraw(ctx)
+            finally:
+                sys.stdout = saved
+            self.assertIn('\033[2J', buf.getvalue())
+        finally:
+            b.stop_workers()
+
+    def test_redraw_clears_pane_cache(self):
+        b = _make_browser()
+        try:
+            ctx = _ctx_for(b)
+            # Seed the cache with a sentinel so we can confirm it's wiped.
+            b._pane_cache['list'] = object()
+            b._pane_cache['preview'] = object()
+            saved = sys.stdout
+            sys.stdout = io.StringIO()
+            try:
+                _actions._redraw(ctx)
+            finally:
+                sys.stdout = saved
+            self.assertEqual(b._pane_cache, {})
+        finally:
+            b.stop_workers()
+
+    def test_redraw_marks_all_dirty(self):
+        b = _make_browser()
+        try:
+            ctx = _ctx_for(b)
+            b._needs_redraw.clear()
+            saved = sys.stdout
+            sys.stdout = io.StringIO()
+            try:
+                _actions._redraw(ctx)
+            finally:
+                sys.stdout = saved
+            self.assertIn('all', b._needs_redraw)
+        finally:
+            b.stop_workers()
+
+    def test_redraw_dispatched_via_ctrl_l(self):
+        # Pin the keybinding so the action stays wired to Ctrl-L.
+        keys = {a.key: a for a in default_actions()}
+        self.assertIn('ctrl-l', keys)
+        self.assertIs(keys['ctrl-l'].handler, _actions._redraw)
 
 
 class TestAltDigitParsing(unittest.TestCase):
