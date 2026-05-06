@@ -558,5 +558,64 @@ class TestPreviewFetcherWiring(unittest.TestCase):
             b.stop_workers()
 
 
+class TestResolveListSize(unittest.TestCase):
+    """``--list-size`` parses ``N`` (lines) or ``N%`` (percentage)."""
+
+    def test_none_returns_default(self):
+        self.assertAlmostEqual(_cli._resolve_list_size(None), 0.30)
+        self.assertAlmostEqual(_cli._resolve_list_size(''), 0.30)
+
+    def test_percent_form(self):
+        self.assertAlmostEqual(_cli._resolve_list_size('30%'), 0.30)
+        self.assertAlmostEqual(_cli._resolve_list_size('50%'), 0.50)
+        self.assertAlmostEqual(_cli._resolve_list_size('100%'), 0.999, places=2)
+
+    def test_percent_clamped_to_safe_range(self):
+        # 0% / 100% would give degenerate panes; clamped just inside.
+        self.assertGreater(_cli._resolve_list_size('0%'), 0.0)
+        self.assertLess(_cli._resolve_list_size('100%'), 1.0)
+
+    def test_absolute_lines_uses_terminal_height(self):
+        # Stub get_terminal_size to a known value.
+        import os as _os
+        saved = _os.get_terminal_size
+        _os.get_terminal_size = lambda: type('S', (), {'lines': 100})()
+        try:
+            self.assertAlmostEqual(_cli._resolve_list_size('40'), 0.40)
+            self.assertAlmostEqual(_cli._resolve_list_size('25'), 0.25)
+        finally:
+            _os.get_terminal_size = saved
+
+    def test_absolute_lines_falls_back_when_no_terminal(self):
+        import os as _os
+
+        def boom():
+            raise OSError('no tty')
+
+        saved = _os.get_terminal_size
+        _os.get_terminal_size = boom
+        try:
+            self.assertAlmostEqual(_cli._resolve_list_size('40'), 0.30)
+        finally:
+            _os.get_terminal_size = saved
+
+    def test_invalid_input_falls_back_with_warning(self):
+        # Not numeric, not N% — fall back to default; stderr warning.
+        import io as _io
+        import contextlib as _ctx
+        buf = _io.StringIO()
+        with _ctx.redirect_stderr(buf):
+            r = _cli._resolve_list_size('garbage')
+        self.assertAlmostEqual(r, 0.30)
+        self.assertIn('warning', buf.getvalue().lower())
+
+    def test_zero_or_negative_lines_falls_back(self):
+        import io as _io
+        import contextlib as _ctx
+        with _ctx.redirect_stderr(_io.StringIO()):
+            self.assertAlmostEqual(_cli._resolve_list_size('0'), 0.30)
+            self.assertAlmostEqual(_cli._resolve_list_size('-5'), 0.30)
+
+
 if __name__ == '__main__':
     unittest.main()

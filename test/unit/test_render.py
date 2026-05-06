@@ -287,5 +287,67 @@ class TestLayoutPanes(unittest.TestCase):
         )
 
 
+class TestLayoutPanesListRatio(unittest.TestCase):
+    """Custom ``list_ratio`` parameter — drives the resizable split."""
+
+    def test_default_ratio_matches_legacy_30_percent(self):
+        # Omitting list_ratio reproduces the historic 30% behaviour.
+        legacy = layout_panes(80, 100, show_preview=True)
+        explicit = layout_panes(80, 100, show_preview=True, list_ratio=0.30)
+        self.assertEqual(legacy['list_height'], explicit['list_height'])
+
+    def test_50_percent_ratio_splits_evenly(self):
+        layout = layout_panes(80, 100, show_preview=True, list_ratio=0.50)
+        self.assertEqual(layout['list_height'], 50)
+        # Preview gets remainder including separator: 50 = sep(1) + 49 content.
+        self.assertEqual(layout['prev_height'], 50)
+        self.assertEqual(
+            layout['list_height'] + layout['prev_height'], 100
+        )
+
+    def test_high_ratio_clamped_to_leave_preview_min(self):
+        # 99% would give list=99 of 100 rows, preview=1 (separator only,
+        # no content). The min-2 preview rule squeezes list down so 1
+        # preview content row is always visible.
+        layout = layout_panes(80, 100, show_preview=True, list_ratio=0.99)
+        self.assertGreaterEqual(layout['prev_height'], 2,
+                                'preview must keep separator + 1 content')
+        self.assertLessEqual(layout['list_height'], 98)
+
+    def test_low_ratio_floors_list_at_one_row(self):
+        layout = layout_panes(80, 100, show_preview=True, list_ratio=0.001)
+        self.assertGreaterEqual(layout['list_height'], 1)
+
+    def test_ratio_preserved_across_terminal_resizes(self):
+        # Same ratio at different terminal heights → proportional list size.
+        small = layout_panes(80, 50, show_preview=True, list_ratio=0.40)
+        big = layout_panes(80, 100, show_preview=True, list_ratio=0.40)
+        self.assertEqual(small['list_height'], 20)
+        self.assertEqual(big['list_height'], 40)
+
+    def test_tiny_terminal_degrades_gracefully(self):
+        # Below the prev_min=2 threshold, layout shouldn't crash; it
+        # falls back to "leave 1 row for the separator".
+        layout = layout_panes(40, 2, show_preview=True, list_ratio=0.50)
+        self.assertGreaterEqual(layout['list_height'], 1)
+        self.assertLessEqual(
+            layout['list_height'] + layout['prev_height'], 2
+        )
+
+    def test_with_children_grid_ratio_applies_to_total_rows(self):
+        # Per model (a): list_ratio is list / (list+children+preview).
+        # Children stays content-driven; preview absorbs the rest.
+        layout = layout_panes(
+            80, 100, show_preview=True, show_children_pane=True,
+            children_rows_needed=5, list_ratio=0.30,
+        )
+        # Children grid: 1 sep + 5 content rows = 6 (capped at 30 by 30%
+        # rule, so 6 is fine).
+        self.assertEqual(layout['sub_height'], 6)
+        self.assertEqual(layout['list_height'], 30)
+        # Preview: 100 - 30 - 6 = 64.
+        self.assertEqual(layout['prev_height'], 64)
+
+
 if __name__ == '__main__':
     unittest.main()

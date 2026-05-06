@@ -471,6 +471,13 @@ def build_argparser() -> argparse.ArgumentParser:
                    help='Start with children-grid pane hidden.')
     p.add_argument('--no-multi-select', action='store_true',
                    help='Disable selection.')
+    p.add_argument('--list-size', metavar='N|N%', default=None,
+                   help='Initial list-pane size. Either an integer line '
+                        'count (interpreted relative to startup terminal '
+                        'height — and therefore scales when the terminal '
+                        'resizes) or a percentage with a trailing %% '
+                        '(e.g. 30%%). Default: 30%% of rows. Adjustable '
+                        'at runtime with - / _ (shrink) and = / + (grow).')
     p.add_argument('--show-ids', metavar='MODE', default='auto',
                    choices=('always', 'auto', 'never'),
                    help='Whether to render the per-row id before the '
@@ -1061,6 +1068,60 @@ def _reopen_stdin_from_tty():
     sys.stdin = os.fdopen(0, 'r', buffering=1)
 
 
+def _resolve_list_size(spec, default=0.30):
+    """Resolve a ``--list-size`` spec to a list-pane ratio (float in (0, 1)).
+
+    Accepted forms:
+      * ``None`` / empty — return ``default``.
+      * ``"N%"`` — percentage form; ``ratio = N / 100``.
+      * ``"N"`` — absolute line count; ``ratio = N / startup_rows``
+        using the current terminal height. The ratio (not the line
+        count) is what persists, so a later resize scales the list
+        proportionally — pass a percentage to lock the proportion.
+
+    Invalid input falls back to ``default`` and writes a warning to
+    stderr so the user knows their flag was ignored. Headless contexts
+    where ``os.get_terminal_size`` fails on absolute-line input also
+    fall back to ``default`` (the user can retune at runtime with
+    -/=).
+    """
+    if not spec:
+        return default
+    s = str(spec).strip()
+    if s.endswith('%'):
+        try:
+            pct = float(s[:-1])
+        except ValueError:
+            sys.stderr.write(
+                f'warning: --list-size {spec!r}: invalid percentage; '
+                f'using default\n'
+            )
+            return default
+        return max(0.001, min(0.999, pct / 100.0))
+    try:
+        lines = int(s)
+    except ValueError:
+        sys.stderr.write(
+            f'warning: --list-size {spec!r}: not an integer or N%; '
+            f'using default\n'
+        )
+        return default
+    if lines < 1:
+        sys.stderr.write(
+            f'warning: --list-size {spec!r}: must be at least 1; '
+            f'using default\n'
+        )
+        return default
+    try:
+        rows = os.get_terminal_size().lines
+    except OSError:
+        # Headless / piped — can't resolve absolute lines; fall back.
+        return default
+    if rows < 2:
+        return default
+    return max(0.001, min(0.999, lines / float(rows)))
+
+
 def _make_preview_fetcher(preview_cmd, timeout):
     """Return a ``get_preview(item_id)`` closure for ``--preview-cmd``, or None.
 
@@ -1133,6 +1194,7 @@ def _build_lazy_browser(args, fields, record_sep):
         initial_scope=args.initial_scope,
         show_preview=not args.no_preview,
         show_children_pane=not args.no_children_pane,
+        list_ratio=_resolve_list_size(args.list_size),
         multi_select=not args.no_multi_select,
         on_enter=args.on_enter,
         print_format=args.print_format,
@@ -1191,6 +1253,7 @@ def _build_eager_browser(args, fields, record_sep):
         initial_scope=args.initial_scope,
         show_preview=not args.no_preview,
         show_children_pane=not args.no_children_pane,
+        list_ratio=_resolve_list_size(args.list_size),
         multi_select=not args.no_multi_select,
         on_enter=args.on_enter,
         print_format=args.print_format,

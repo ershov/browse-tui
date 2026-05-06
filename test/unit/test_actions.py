@@ -1605,5 +1605,221 @@ class TestViewEditDefaults(unittest.TestCase):
         self.assertEqual(keys['e'].section, 'OTHER')
 
 
+# --- list/preview split resize -------------------------------------------
+
+
+class TestResizeStepFormula(unittest.TestCase):
+    """``_resize_step(list_h, prev_content) = (min(list, prev) // 5) + 1``."""
+
+    def test_user_examples(self):
+        # 40-line list, 50-line preview content: (40 // 5) + 1 = 9.
+        # (User's spec moved from 10% to 20% with the +1 floor.)
+        self.assertEqual(_actions._resize_step(40, 50), 9)
+        self.assertEqual(_actions._resize_step(30, 60), 7)
+
+    def test_floor_at_one(self):
+        # Tiny panes still nudge by at least 1 row.
+        self.assertEqual(_actions._resize_step(0, 100), 1)
+        self.assertEqual(_actions._resize_step(1, 1), 1)
+        self.assertEqual(_actions._resize_step(4, 100), 1)
+
+    def test_uses_smaller_pane(self):
+        # min(list, prev) drives the step regardless of which is smaller.
+        self.assertEqual(_actions._resize_step(10, 80), 3)  # 10//5 + 1
+        self.assertEqual(_actions._resize_step(80, 10), 3)
+
+
+class TestShrinkGrowList(unittest.TestCase):
+    """``_shrink_list`` / ``_grow_list`` mutate ``browser.list_ratio``.
+
+    The handlers read the current layout to compute the step. Tests
+    inject ``term_size`` and ``layout_panes`` on the actions module so
+    the headless Browser produces a deterministic geometry.
+    """
+
+    def setUp(self):
+        # Inject layout dependencies on the actions module.
+        self._saved_term_size = getattr(_actions, 'term_size', None)
+        self._saved_layout_panes = getattr(_actions, 'layout_panes', None)
+        _actions.term_size = lambda: (80, 100)
+        _actions.layout_panes = _render.layout_panes
+        # The clamp helper is normally injected via concatenation; tests
+        # need it for the post-resize sanity clamp inside _resize_list.
+        _actions._clamp_list_ratio = _state._clamp_list_ratio
+
+    def tearDown(self):
+        if self._saved_term_size is not None:
+            _actions.term_size = self._saved_term_size
+        else:
+            _actions.term_size = None
+        if self._saved_layout_panes is not None:
+            _actions.layout_panes = self._saved_layout_panes
+        else:
+            _actions.layout_panes = None
+
+    def test_shrink_decreases_list_ratio(self):
+        b = _make_browser(list_ratio=0.50)
+        try:
+            ctx = _ctx_for(b)
+            before = b.list_ratio
+            _actions._shrink_list(ctx)
+            self.assertLess(b.list_ratio, before)
+        finally:
+            b.stop_workers()
+
+    def test_grow_increases_list_ratio(self):
+        b = _make_browser(list_ratio=0.30)
+        try:
+            ctx = _ctx_for(b)
+            before = b.list_ratio
+            _actions._grow_list(ctx)
+            self.assertGreater(b.list_ratio, before)
+        finally:
+            b.stop_workers()
+
+    def test_step_matches_user_formula(self):
+        # 80×100 terminal, ratio 0.50 → list=50, prev=50 (sep+49 content).
+        # Step = (min(50, 49) // 5) + 1 = 10. Shrink → list_h goes 50→40.
+        b = _make_browser(list_ratio=0.50)
+        try:
+            ctx = _ctx_for(b)
+            _actions._shrink_list(ctx)
+            # New ratio reflects 40/100 = 0.40.
+            self.assertAlmostEqual(b.list_ratio, 0.40, places=4)
+        finally:
+            b.stop_workers()
+
+    def test_shrink_floors_at_one_list_row(self):
+        # Repeated shrinking should never push list_h below 1.
+        b = _make_browser(list_ratio=0.50)
+        try:
+            ctx = _ctx_for(b)
+            for _ in range(50):
+                _actions._shrink_list(ctx)
+            cols, rows = (80, 100)
+            layout = _render.layout_panes(
+                cols, rows, show_preview=True, list_ratio=b.list_ratio,
+            )
+            self.assertGreaterEqual(layout['list_height'], 1)
+        finally:
+            b.stop_workers()
+
+    def test_grow_caps_to_leave_preview_content(self):
+        # Repeated growing should leave at least 1 preview content row.
+        b = _make_browser(list_ratio=0.50)
+        try:
+            ctx = _ctx_for(b)
+            for _ in range(50):
+                _actions._grow_list(ctx)
+            cols, rows = (80, 100)
+            layout = _render.layout_panes(
+                cols, rows, show_preview=True, list_ratio=b.list_ratio,
+            )
+            self.assertGreaterEqual(layout['prev_height'], 2)
+        finally:
+            b.stop_workers()
+
+    def test_noop_when_preview_hidden(self):
+        # show_preview=False → -/= are no-ops; ratio untouched.
+        b = _make_browser(list_ratio=0.50, show_preview=False)
+        try:
+            ctx = _ctx_for(b)
+            before = b.list_ratio
+            _actions._shrink_list(ctx)
+            _actions._grow_list(ctx)
+            self.assertEqual(b.list_ratio, before)
+        finally:
+            b.stop_workers()
+
+    def test_minus_underscore_equals_plus_all_bound(self):
+        keys = {a.key: a for a in default_actions()}
+        for k in ('-', '_'):
+            self.assertIn(k, keys)
+            self.assertIs(keys[k].handler, _actions._shrink_list)
+        for k in ('=', '+'):
+            self.assertIn(k, keys)
+            self.assertIs(keys[k].handler, _actions._grow_list)
+
+    def test_dispatch_minus_resizes(self):
+        # End-to-end via dispatch_key: pressing '-' shrinks the list.
+        b = _make_browser(list_ratio=0.50)
+        try:
+            ctx = _ctx_for(b)
+            before = b.list_ratio
+            self.assertTrue(dispatch_key(b, ctx, '-'))
+            self.assertLess(b.list_ratio, before)
+        finally:
+            b.stop_workers()
+
+    def test_dispatch_equals_resizes(self):
+        b = _make_browser(list_ratio=0.30)
+        try:
+            ctx = _ctx_for(b)
+            before = b.list_ratio
+            self.assertTrue(dispatch_key(b, ctx, '='))
+            self.assertGreater(b.list_ratio, before)
+        finally:
+            b.stop_workers()
+
+    def test_resize_persists_across_simulated_terminal_resize(self):
+        # The ratio (not the line count) is what's stored. After a
+        # simulated terminal resize, the same ratio yields a
+        # proportionally-different list height.
+        b = _make_browser(list_ratio=0.50)
+        try:
+            ctx = _ctx_for(b)
+            _actions._shrink_list(ctx)
+            ratio = b.list_ratio
+            # Now ask layout for the size at a smaller terminal.
+            small = _render.layout_panes(80, 50, show_preview=True,
+                                         list_ratio=ratio)
+            big = _render.layout_panes(80, 200, show_preview=True,
+                                       list_ratio=ratio)
+            # 0.40 ratio → 50 rows = 20 list, 200 rows = 80 list.
+            self.assertEqual(small['list_height'], int(50 * ratio))
+            self.assertEqual(big['list_height'], int(200 * ratio))
+        finally:
+            b.stop_workers()
+
+
+class TestSetListRatio(unittest.TestCase):
+    """``Browser.set_list_ratio`` clamps to the safe range."""
+
+    def test_in_range_value_set_verbatim(self):
+        b = _make_browser()
+        try:
+            b.set_list_ratio(0.42)
+            self.assertEqual(b.list_ratio, 0.42)
+        finally:
+            b.stop_workers()
+
+    def test_above_max_clamped(self):
+        b = _make_browser()
+        try:
+            b.set_list_ratio(5.0)
+            self.assertLess(b.list_ratio, 1.0)
+            self.assertGreaterEqual(b.list_ratio, _state._LIST_RATIO_MAX)
+        finally:
+            b.stop_workers()
+
+    def test_below_min_clamped(self):
+        b = _make_browser()
+        try:
+            b.set_list_ratio(-0.5)
+            self.assertGreater(b.list_ratio, 0.0)
+            self.assertLessEqual(b.list_ratio, _state._LIST_RATIO_MIN)
+        finally:
+            b.stop_workers()
+
+    def test_invalid_input_falls_back_to_default(self):
+        # Non-numeric input shouldn't crash; use sentinel default.
+        b = _make_browser()
+        try:
+            b.set_list_ratio('not a number')  # type: ignore[arg-type]
+            self.assertAlmostEqual(b.list_ratio, 0.30)
+        finally:
+            b.stop_workers()
+
+
 if __name__ == '__main__':
     unittest.main()

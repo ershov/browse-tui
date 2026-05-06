@@ -341,7 +341,8 @@ def _info_bar_geometry(browser):
     too small to host the info bar.
     """
     cols, rows = term_size()
-    layout = layout_panes(cols, rows, show_preview=browser.show_preview)
+    layout = layout_panes(cols, rows, show_preview=browser.show_preview,
+                          list_ratio=browser.list_ratio)
     return layout['info_row'], layout['cols']
 
 
@@ -472,6 +473,7 @@ def _pick_on_info_bar(browser, label, options, *, _read_key=None):
         layout = layout_panes(
             cols, rows_total,
             show_preview=browser.show_preview,
+            list_ratio=browser.list_ratio,
         )
         cols = layout['cols']
         prev_top = layout['prev_top']

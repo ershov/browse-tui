@@ -529,6 +529,32 @@ def resolve_insert(pos, depth, vis, *, scope_root_id=None):
 #   #13 — CLI parsing + entry-point glue.
 
 
+# Reasonable bounds for ``list_ratio``. The lower bound is 1/200 (≈0.5%)
+# and upper bound 199/200 — outside this range the layout produces
+# degenerate panes (zero list or zero preview) regardless of terminal
+# size, which the user can't recover from with hotkey nudges. The
+# layout itself enforces a minimum-1 list and minimum-2 preview when
+# the terminal is large enough; this clamp is just a guardrail against
+# bad CLI input.
+_LIST_RATIO_MIN = 0.005
+_LIST_RATIO_MAX = 0.995
+
+
+def _clamp_list_ratio(r: float) -> float:
+    """Pin ``r`` into the valid ratio range. NaN / non-numeric → default."""
+    try:
+        f = float(r)
+    except (TypeError, ValueError):
+        return 0.30
+    if f != f:  # NaN
+        return 0.30
+    if f < _LIST_RATIO_MIN:
+        return _LIST_RATIO_MIN
+    if f > _LIST_RATIO_MAX:
+        return _LIST_RATIO_MAX
+    return f
+
+
 class Browser:
     """The TUI engine and async coordinator.
 
@@ -583,6 +609,7 @@ class Browser:
                  initial_scope: Any = None,
                  show_preview: bool = True,
                  show_children_pane: bool = True,
+                 list_ratio: float = 0.30,
                  multi_select: bool = True,
                  print_format: str = '{id}',
                  help_intro: Optional[str] = None,
@@ -665,6 +692,13 @@ class Browser:
         self.format_item = format_item
         self.show_preview = show_preview
         self.show_children_pane = show_children_pane
+        # Fraction of total terminal rows allocated to the list pane.
+        # Stored as a float so it survives terminal resizes without
+        # rounding drift; clamped to a usable range by ``set_list_ratio``.
+        # The ratio covers list / (list + children-grid + preview) per
+        # the model: children pane stays content-driven, preview gets
+        # the remainder.
+        self.list_ratio = _clamp_list_ratio(list_ratio)
         self.multi_select = multi_select
         self.print_format = print_format
         # help_intro/help_outro are prose blurbs shown above/below the
@@ -907,6 +941,19 @@ class Browser:
         """
         for p in pendings:
             p.cancel()
+
+    def set_list_ratio(self, ratio: float) -> None:
+        """Set the list pane's share of total terminal rows (clamped).
+
+        The clamp range is ``[_LIST_RATIO_MIN, _LIST_RATIO_MAX]`` —
+        outside that range the layout produces degenerate panes and
+        the user can't recover with hotkey nudges. The layout
+        independently enforces a minimum-1 list / minimum-2 preview
+        when the terminal has room; this method's clamp is a sanity
+        guardrail, not the live floor.
+        """
+        self.list_ratio = _clamp_list_ratio(ratio)
+        self._needs_redraw.add('all')
 
     def select(self, ids, replace: bool = False) -> None:
         """Add ``ids`` to ``selected`` (or replace existing selection if ``replace``).

@@ -205,7 +205,8 @@ def format_item_segments(item, *, depth=0, base_depth=0, expanded=False,
 
 
 def layout_panes(cols, rows, *, show_preview=True,
-                 show_children_pane=True, children_rows_needed=0):
+                 show_children_pane=True, children_rows_needed=0,
+                 list_ratio=0.30):
     """Return geometry dict for the three-pane layout.
 
     Keys returned:
@@ -274,16 +275,15 @@ def layout_panes(cols, rows, *, show_preview=True,
             'prev_height': 0,
         }
 
-    # ~30% of rows for the list. Make sure we leave at least one row for
-    # the preview separator below.
-    list_height = max(1, int(rows * 0.30))
-    if list_height + 1 > rows:
-        list_height = max(1, rows - 1)
+    # List height comes from ``list_ratio`` (caller-supplied; defaults to
+    # the historic 30%). Floor at 1 row. The preview's minimum is 2 rows
+    # (separator + 1 content) and is enforced *only when the terminal has
+    # room* — tiny terminals degrade gracefully to whatever fits.
+    list_height = max(1, int(rows * list_ratio))
 
     # Children grid sizing — cap at 30% of total rows, shrink to fit
     # children content. ``children_rows_needed`` is the *content* row
     # count; we add 1 for the grid's leading separator.
-    sub_top = list_top + list_height
     if (not show_children_pane) or rows < 20:
         sub_height = 0
     else:
@@ -291,9 +291,24 @@ def layout_panes(cols, rows, *, show_preview=True,
         needed = (1 + children_rows_needed) if children_rows_needed > 0 else 0
         sub_height = min(sub_max, needed) if needed > 0 else 0
 
+    # Honour preview min (separator + 1 content row) when the terminal
+    # is large enough to host both panes plus children. Squeeze the list
+    # rather than the preview — the user controls list size via -/= and
+    # would be surprised by a short preview at small ratios.
+    _PREV_MIN = 2  # separator + 1 content row
+    if rows - sub_height >= 1 + _PREV_MIN:
+        max_list = rows - sub_height - _PREV_MIN
+        if list_height > max_list:
+            list_height = max_list
+    elif list_height + 1 > rows:
+        # Tiny terminal: preserve the original "leave at least 1 row
+        # below the list" behaviour so the info-bar separator is visible.
+        list_height = max(1, rows - 1)
+
     # Preview separator sits immediately after the grid (or after the
     # list when the grid is hidden); ``prev_height`` covers the
     # separator + content together, mirroring plan-tui's geometry.
+    sub_top = list_top + list_height
     prev_top = sub_top + sub_height
     prev_height = max(0, rows - list_height - sub_height)
 
@@ -1103,6 +1118,7 @@ def _layout_for(browser):
         show_preview=browser.show_preview,
         show_children_pane=browser.show_children_pane,
         children_rows_needed=children_rows,
+        list_ratio=browser.list_ratio,
     )
 
 

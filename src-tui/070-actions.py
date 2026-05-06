@@ -669,6 +669,96 @@ def _preview_page_up(ctx):
     ctx._browser._needs_redraw.add('preview')
 
 
+# ---- list/preview split resize -------------------------------------------
+
+
+def _resize_step(list_h, prev_content):
+    """Step size for one ``-`` or ``=`` keypress.
+
+    ``(min(list, preview_content) // 5) + 1`` — i.e. roughly 20% of the
+    smaller pane's content, with a +1 floor so resizing always nudges
+    by at least 1 row even when one pane is tiny. Both inputs are
+    *content* row counts (the preview separator does not count).
+    """
+    smaller = min(list_h, prev_content)
+    if smaller < 0:
+        smaller = 0
+    return (smaller // 5) + 1
+
+
+def _shrink_list(ctx):
+    """``-`` / ``_`` — shrink the list pane by one resize step.
+
+    Updates ``browser.list_ratio`` so the new size is preserved across
+    terminal resizes. No-op when the preview pane is hidden — the
+    ratio doesn't apply in that mode.
+    """
+    _resize_list(ctx, direction=-1)
+
+
+def _grow_list(ctx):
+    """``=`` / ``+`` — grow the list pane by one resize step.
+
+    Symmetric counterpart to ``_shrink_list``. Capped by the layout
+    invariants: at least 1 list row and 1 row of preview content remain
+    after the resize.
+    """
+    _resize_list(ctx, direction=+1)
+
+
+def _resize_list(ctx, *, direction):
+    """Shared implementation for ``-`` / ``=``.
+
+    Reads the current layout to determine pane sizes, computes the
+    step, applies the new list height, and converts back to a ratio
+    so terminal resizes preserve the user's choice. Headless / unwired
+    contexts fall back gracefully (silent no-op).
+    """
+    browser = ctx._browser
+    if not browser.show_preview:
+        return  # ratio doesn't apply when preview is hidden
+    ts = globals().get('term_size')
+    lp = globals().get('layout_panes')
+    if ts is None or lp is None:
+        return
+    try:
+        cols, rows = ts()
+    except Exception:
+        return
+    layout = lp(
+        cols, rows,
+        show_preview=True,
+        show_children_pane=browser.show_children_pane,
+        list_ratio=browser.list_ratio,
+    )
+    list_h = layout['list_height']
+    sub_h = layout['sub_height']
+    # ``prev_height`` includes the separator row; the user-visible
+    # preview content is one less.
+    prev_content = max(0, layout['prev_height'] - 1)
+    step = _resize_step(list_h, prev_content)
+    new_list_h = list_h + direction * step
+    # Clamp: at least 1 list row, and leave room for sub + preview min
+    # (separator + 1 content) when the terminal has the room.
+    if new_list_h < 1:
+        new_list_h = 1
+    max_list = rows - sub_h - 2  # sep + 1 content
+    if max_list < 1:
+        max_list = max(1, rows - sub_h - 1)
+    if new_list_h > max_list:
+        new_list_h = max_list
+    if new_list_h == list_h:
+        return  # at the boundary; nothing to do
+    browser.list_ratio = new_list_h / float(rows)
+    # Clamp ratio into [_LIST_RATIO_MIN, _LIST_RATIO_MAX]; the layout
+    # already enforces visible-row floors, but the stored ratio must
+    # stay sane for future resizes.
+    clamp = globals().get('_clamp_list_ratio')
+    if clamp is not None:
+        browser.list_ratio = clamp(browser.list_ratio)
+    browser._needs_redraw.add('all')
+
+
 # ---- default keybindings list ---------------------------------------------
 
 
@@ -708,6 +798,14 @@ def default_actions() -> list:
         Action('shift-up',   'Scroll preview line up',   _preview_scroll_up,   'none', 'PREVIEW'),
         Action('alt-pgdn',   'Scroll preview page down', _preview_page_down,   'none', 'PREVIEW'),
         Action('alt-pgup',   'Scroll preview page up',   _preview_page_up,     'none', 'PREVIEW'),
+        # Resize the list/preview split. Both pairs (``-``/``_`` and
+        # ``=``/``+``) are bound for keyboard ergonomics — `-` and `=`
+        # are unshifted, `_` and `+` are their shifted counterparts on
+        # US layouts so users don't have to release shift mid-resize.
+        Action('-',          'Shrink list pane',         _shrink_list,         'none', 'PREVIEW'),
+        Action('_',          'Shrink list pane',         _shrink_list,         'none', 'PREVIEW'),
+        Action('=',          'Grow list pane',           _grow_list,           'none', 'PREVIEW'),
+        Action('+',          'Grow list pane',           _grow_list,           'none', 'PREVIEW'),
         # Search.
         Action('/',         'Enter search mode', _search_start, 'none', 'SEARCH'),
         # Multi-select bindings. ``read_key`` returns ``'space'`` for the
@@ -1043,6 +1141,7 @@ def _list_pane_height(browser):
             cols, rows,
             show_preview=browser.show_preview,
             show_children_pane=browser.show_children_pane,
+            list_ratio=getattr(browser, 'list_ratio', 0.30),
         )
         h = layout['list_height']
         return h if h > 0 else _DEFAULT_PAGE_ROWS
@@ -1066,6 +1165,7 @@ def _preview_pane_height(browser):
             cols, rows,
             show_preview=browser.show_preview,
             show_children_pane=browser.show_children_pane,
+            list_ratio=getattr(browser, 'list_ratio', 0.30),
         )
         h = layout['prev_height'] - 1  # exclude separator row
         return h if h > 0 else _DEFAULT_PAGE_ROWS
@@ -1128,6 +1228,7 @@ def _dispatch_mouse(browser, ctx, key):
         cols, rows_total,
         show_preview=browser.show_preview,
         show_children_pane=browser.show_children_pane,
+        list_ratio=getattr(browser, 'list_ratio', 0.30),
     )
     pane = _pane_at(layout, row)
 
