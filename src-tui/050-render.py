@@ -364,19 +364,22 @@ def _layout_vertical(cols, rows, *, list_ratio, show_preview, show_children,
     (vertical list) by ``render_children_list`` — distinct from the grid
     layout used by the other splits.
 
-    Children column width:
-      * Provided by ``children_cols_needed`` (longest child name + small
-        padding, computed by ``_layout_for`` from cached children).
-      * When ``children_cols_needed`` is 0 but ``children_rows_needed >
-        0`` we fall back to a sensible default (``max(8, …)``) so the
-        column is still visible during the brief loading window.
-      * Capped at 25% of the right-of-list area width and at
-        ``right_area_width - 1`` so the preview always retains at least
-        one content column.
+    Children column width (per #180): CONTENT-INDEPENDENT. Whenever the
+    children column is shown, its width is fixed at
+    ``max(8, right_area_width // 4)`` (capped at ``right_area_width - 2``
+    so sep_inner + at least 1 col of preview content always fit). The
+    ``children_cols_needed`` parameter is ignored — kept only for API
+    compatibility with callers that still pass it. This prevents the
+    column from shifting as the cursor moves between branches with
+    different child name lengths, which used to overdraw the inner
+    separator (#180). Long child names are truncated by the renderer.
 
     Falls back to layout 'h' when preview is hidden (a vertical split
     with no preview would just be the list).
     """
+    # children_cols_needed kept in signature for compat; explicitly
+    # ignored per #180.
+    del children_cols_needed
     full_left, full_right = 1, cols + 1
     info_top = rows
     info_bar = Rect(full_left, info_top, full_right, info_top + 1)
@@ -420,19 +423,17 @@ def _layout_vertical(cols, rows, *, list_ratio, show_preview, show_children,
     #     1 col of preview content within the right area.
     if (show_children and children_rows_needed > 0
             and body_height >= 1 and right_area_width >= 3):
-        # Width budget — start from the requested cols, fall back to a
-        # default when the caller didn't measure (e.g. ``loading…``).
-        if children_cols_needed > 0:
-            requested_w = children_cols_needed
-        else:
-            requested_w = max(8, right_area_width // 4)
-        # Cap at 25% of right area width (at least 1).
-        cap_w = max(1, right_area_width // 4)
-        # And ensure 1 col for sep_inner + 1 col of preview content.
+        # Per #180: width is content-INDEPENDENT and fixed at 25% of the
+        # right area (with a small minimum so the column is usable even
+        # at narrow terminal widths). This avoids the inner separator
+        # shifting between cursor moves on items with different child
+        # name lengths.
+        desired = max(8, right_area_width // 4)
+        # Reserve 1 col for sep_inner + 1 col of preview content.
         max_w = right_area_width - 2
         if max_w < 1:
             max_w = 0
-        ch_w = min(requested_w, cap_w, max_w)
+        ch_w = min(desired, max_w)
         if ch_w >= 1:
             children_left = right_area_left
             children_right = children_left + ch_w
@@ -1006,21 +1007,6 @@ def _sub_needed_rows(children, cols, show_ids='auto'):
         return 0
     num_cols, _, slot_rows, _ = _sub_layout(children, cols, show_ids=show_ids)
     return _sub_total_rows(num_cols, slot_rows)
-
-
-def _children_list_cols_needed(children, show_ids='auto', *, padding=2):
-    """Width hint for the vertical (Alt-1) one-per-row children column.
-
-    Returns the longest formatted child width plus a small padding so
-    short names don't sit flush against the separator. Returns 0 when
-    ``children`` is empty so the layout helper can elide the column.
-    The caller (``_layout_vertical`` via ``layout_panes``) caps this
-    against 25% of the right area's width.
-    """
-    if not children:
-        return 0
-    longest = max(len(_fmt_child(c, show_ids=show_ids)) for c in children)
-    return longest + padding
 
 
 def _child_segments(item, max_width, show_ids='auto'):
@@ -1746,7 +1732,6 @@ def _layout_for(browser):
     """
     cols, rows = term_size()
     children_rows = 0
-    children_cols = 0
     if browser.show_children_pane and not browser._headless:
         cursor = _cursor_item(browser)
         if cursor is not None and cursor.has_children:
@@ -1755,19 +1740,14 @@ def _layout_for(browser):
                 children_rows = _sub_needed_rows(
                     cached, cols, show_ids=browser.show_ids,
                 )
-                # For the vertical (Alt-1) layout the children pane is a
-                # full-height column with one item per row — its width
-                # comes from the longest formatted child name. Other
-                # layouts ignore this hint.
-                children_cols = _children_list_cols_needed(
-                    cached, show_ids=browser.show_ids,
-                )
+                # Per #180 the vertical (Alt-1) children column width is
+                # CONTENT-INDEPENDENT (fixed at 25% of the right area),
+                # so we no longer compute a per-cursor width hint.
             elif cached is None:
                 # Branch with not-yet-cached children — reserve one row
                 # for the loading hint so the grid is visible while the
                 # fetch is in flight.
                 children_rows = 1
-                children_cols = 0   # let _layout_vertical pick a default
             # cached == [] (empty list): leaf-like, no rows reserved.
     return layout_panes(
         cols, rows,
@@ -1775,7 +1755,6 @@ def _layout_for(browser):
         show_preview=browser.show_preview,
         show_children_pane=browser.show_children_pane,
         children_rows_needed=children_rows,
-        children_cols_needed=children_cols,
         list_ratio=browser.list_ratio,
     )
 

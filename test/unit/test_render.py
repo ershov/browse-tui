@@ -546,9 +546,10 @@ class TestLayoutChildrenSubPane(unittest.TestCase):
         self.assertIsNone(layout['sep_inner'])
 
     def test_v_children_fits(self):
-        # cols=80, list_ratio=0.30 → list_w=24, sep_main=1 col, right
-        # area = 80 - 25 = 55. cap = floor(55/4) = 13. Requested 10 →
-        # fits at 10. Children height = full body height = 29.
+        # Per #180: width is CONTENT-INDEPENDENT — always 25% of the
+        # right area (with a max(8, ...) floor). cols=80, list_ratio=0.30
+        # → list_w=24, sep_main=1 col, right area = 80 - 25 = 55.
+        # desired = max(8, 55//4) = 13 regardless of children_cols_needed.
         layout = layout_panes(
             80, 30, split='v', show_preview=True,
             show_children_pane=True, children_rows_needed=3,
@@ -557,14 +558,14 @@ class TestLayoutChildrenSubPane(unittest.TestCase):
         children = layout['children']
         info_bar = layout['info_bar']
         self.assertIsNotNone(children)
-        # Width-based sizing; full body height.
-        self.assertEqual(children.width, 10)
+        self.assertEqual(children.width, 13)
         self.assertEqual(children.top, 1)
         self.assertEqual(children.bottom, info_bar.top)
 
     def test_v_children_clamped_to_25pct(self):
-        # right_area = 55 cols, cap = floor(55/4) = 13. Requested 100 →
-        # clamped to 13.
+        # Per #180: width is fixed at max(8, right_area_width // 4)
+        # regardless of children_cols_needed. right_area = 55, so the
+        # column is 13 cols wide whether the longest child is 10 or 100.
         layout = layout_panes(
             80, 30, split='v', show_preview=True,
             show_children_pane=True, children_rows_needed=30,
@@ -573,6 +574,27 @@ class TestLayoutChildrenSubPane(unittest.TestCase):
         children = layout['children']
         self.assertIsNotNone(children)
         self.assertEqual(children.width, 13)
+
+    def test_v_children_width_is_content_independent(self):
+        # Regression for #180: the children column width must not depend
+        # on what's in cached children. Two layouts at the same terminal
+        # size must produce IDENTICAL children rects regardless of the
+        # children_cols_needed hint (short names vs. long names).
+        short = layout_panes(
+            80, 30, split='v', show_preview=True,
+            show_children_pane=True, children_rows_needed=3,
+            children_cols_needed=3,
+        )
+        long_ = layout_panes(
+            80, 30, split='v', show_preview=True,
+            show_children_pane=True, children_rows_needed=3,
+            children_cols_needed=42,
+        )
+        self.assertIsNotNone(short['children'])
+        self.assertIsNotNone(long_['children'])
+        self.assertEqual(short['children'], long_['children'])
+        self.assertEqual(short['sep_inner'], long_['sep_inner'])
+        self.assertEqual(short['preview'], long_['preview'])
 
     def test_v_children_min_terminal(self):
         # Right area too narrow for children (sep_inner + children +

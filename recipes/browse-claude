@@ -675,6 +675,7 @@ def main():
     initial_scope = sys.argv[1] if len(sys.argv) > 1 else None
     b = Browser(
         title='browse-claude',
+        show_children_pane=False,
         get_children=get_children,
         get_preview=get_preview,
         root_id=None,

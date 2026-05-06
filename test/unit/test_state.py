@@ -35,10 +35,12 @@ class TestClampSplit(unittest.TestCase):
         self.assertEqual(_clamp_split('zz'), 'h')
         self.assertEqual(_clamp_split(''), 'h')
 
-    def test_auto_shorthand_is_invalid_at_state_layer(self):
-        # 'a' is a CLI-parse-time shorthand; by the time it reaches
-        # Browser state it should already be resolved. Treat as invalid.
+    def test_auto_shorthand_resolves_via_term_size(self):
+        # 'auto'/'a' resolve against term_size: <230 cols → 'h', else 'v'.
+        # In headless tests term_size falls back to 80, so 'a'/'auto' → 'h'.
         self.assertEqual(_clamp_split('a'), 'h')
+        self.assertEqual(_clamp_split('auto'), 'h')
+        self.assertEqual(_clamp_split('Auto'), 'h')
 
     def test_none_defaults_to_h(self):
         self.assertEqual(_clamp_split(None), 'h')
@@ -52,7 +54,9 @@ class TestClampSplit(unittest.TestCase):
 class TestBrowserSplitConstructor(unittest.TestCase):
     """Browser.__init__ accepts ``split=`` and stores it (clamped)."""
 
-    def test_default_split_is_h(self):
+    def test_default_split_resolves_auto(self):
+        # Default is 'auto' which resolves via term_size; in headless
+        # 80-col tests that yields 'h'.
         b = Browser(_headless=True)
         self.assertEqual(b.split, 'h')
 
@@ -62,7 +66,7 @@ class TestBrowserSplitConstructor(unittest.TestCase):
             self.assertEqual(b.split, code)
 
     def test_invalid_split_defaults_to_h(self):
-        for bad in ('zz', '', 'a', 'horizontal'):
+        for bad in ('zz', '', 'horizontal'):
             b = Browser(split=bad, _headless=True)
             self.assertEqual(b.split, 'h')
 

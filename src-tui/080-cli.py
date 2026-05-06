@@ -1466,6 +1466,11 @@ def run_tui(args):
     except ValueError as e:
         sys.stderr.write(f'error: {e}\n')
         return 2
+    if os.environ.get('BROWSE_TUI_DEBUG_AUTO') == '1':
+        sys.stderr.write(
+            f'[browse-tui auto] spec={getattr(args, "split_type", None)!r} '
+            f'cols={cols} -> split={split!r}\n'
+        )
 
     if args.children_cmd:
         b = _build_lazy_browser(args, fields, record_sep, split=split)

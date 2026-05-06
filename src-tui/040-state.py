@@ -571,16 +571,25 @@ _VALID_SPLITS = ('v', 'h', 'm', 'pc')
 def _clamp_split(s) -> str:
     """Validate ``s`` against ``_VALID_SPLITS``. Unknown / non-string → 'h'.
 
-    Defensive: handles ``None`` and non-string values by falling back to
-    the historic default ``'h'``. The CLI parser is responsible for
-    resolving the ``'a'`` (auto) shorthand before it reaches this
-    function — we treat ``'a'`` as invalid so a stale value doesn't slip
-    into Browser state.
+    Resolves ``'auto'`` / ``'a'`` against the live terminal width via
+    ``term_size``: ``>=230`` cols → ``'v'``, else ``'h'``. This makes
+    Python recipes (which construct ``Browser`` directly without going
+    through the CLI's ``_resolve_split_type``) get the same auto
+    behaviour as ``--split-type=auto``.
     """
     if not isinstance(s, str):
         return 'h'
     if s in _VALID_SPLITS:
         return s
+    if s.lower() in ('a', 'auto'):
+        ts = globals().get('term_size')
+        if ts is not None:
+            try:
+                cols, _ = ts()
+                return 'v' if cols >= 230 else 'h'
+            except Exception:
+                pass
+        return 'h'
     return 'h'
 
 
@@ -639,7 +648,7 @@ class Browser:
                  show_preview: bool = True,
                  show_children_pane: bool = True,
                  list_ratio: float = 0.30,
-                 split: str = 'h',
+                 split: str = 'auto',
                  multi_select: bool = True,
                  print_format: str = '{id}',
                  help_intro: Optional[str] = None,
@@ -730,12 +739,10 @@ class Browser:
         # the remainder.
         self.list_ratio = _clamp_list_ratio(list_ratio)
         # Split-layout selector — controls which family of pane geometries
-        # ``layout_panes`` produces (see ``_VALID_SPLITS`` and the
-        # 050-render layout helpers). Defaults to ``'h'`` so existing
-        # recipes / tests that don't pass ``split=`` keep the historic
-        # horizontal-stack behaviour. Hotkey + CLI plumbing lands in
-        # later tickets (#150, #151); for now this is a passive state
-        # bit that the layout call sites consult.
+        # ``layout_panes`` produces. Default ``'auto'`` resolves at
+        # construction time via ``_clamp_split`` (vertical at >=230 cols,
+        # else horizontal) so Python recipes that construct Browser
+        # directly get the same auto behaviour as ``--split-type=auto``.
         self.split = _clamp_split(split)
         self.multi_select = multi_select
         self.print_format = print_format
