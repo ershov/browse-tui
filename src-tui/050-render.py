@@ -261,23 +261,28 @@ _SENTINEL_RECT = Rect(-1, -1, -1, -1)
 def _mark_disappeared_panes(browser, layout):
     """Invalidate caches for panes absent from ``layout`` but cached previously.
 
-    In layouts 'v' / 'm' / 'pc' the ``children`` and ``sep_inner`` panes
-    appear and disappear as the cursor crosses leaf/branch boundaries.
-    When they disappear the preview pane expands to overwrite their
-    cells. If they then reappear with the same geometry as before, the
-    differential renderer would otherwise see ``cache.rect == new_rect``
-    in ``PaneCache.ensure`` and the steady-state ``end_row`` path would
+    Panes appear and disappear across layouts (e.g. ``children`` /
+    ``sep_inner`` go None when the cursor crosses leaf/branch
+    boundaries; ``sep_main`` is None in layout ``h`` but a Rect in
+    ``v``/``m``/``pc``; ``preview`` toggles via the show-preview key).
+    When a pane disappears, neighbouring panes expand to overwrite its
+    cells. If it then reappears with the same geometry, the
+    differential renderer sees ``cache.rect == new_rect`` in
+    ``PaneCache.ensure`` and the steady-state ``end_row`` path would
     cache-hit on unchanged content, emitting nothing — leaving the
-    preview's leftover cells visible.
+    overwritten cells stale.
 
     Force the next reappear to take the full-pad path by stamping the
     cache's ``rect`` with ``_SENTINEL_RECT``: the next ``ensure`` finds
-    ``self.rect != new_rect`` and calls ``invalidate``.
+    ``self.rect != new_rect`` and calls ``invalidate``. Iterates over
+    every cache so any pane whose rect transitioned non-None → None is
+    handled (not just children/sep_inner). Already-sentinel caches are
+    skipped to avoid redundant work.
     """
-    for name in ('children', 'sep_inner'):
+    for name in list(browser._pane_cache.keys()):
         if layout.get(name) is None:
-            cache = browser._pane_cache.get(name)
-            if cache is not None and cache.rect is not None and cache.rect != _SENTINEL_RECT:
+            cache = browser._pane_cache[name]
+            if cache.rect is not None and cache.rect != _SENTINEL_RECT:
                 cache.rect = _SENTINEL_RECT
                 cache.lines = []
 

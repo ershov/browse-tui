@@ -198,6 +198,50 @@ class TestChildrenPaneRedraw(unittest.TestCase):
                 f'children-pane slice ({cp_lo}..{cp_hi}):\n{children_pane}\n'
                 f'full screen:\n{screen_back}')
 
+    def test_sep_main_redraws_after_layout_round_trip(self):
+        """v → h → v: sep_main column must contain a vertical run again.
+
+        Regression for ticket #216 — `_mark_disappeared_panes` only
+        invalidated `children` and `sep_inner`, but `sep_main` is also
+        absent in layout 'h'. After v→h the list pane expands full-width
+        and overwrites the sep_main column. On the second v paint, the
+        cache rect matches and the cached `│` matches → no diff emitted,
+        leaving blanks where sep_main belongs.
+        """
+        with TmuxFixture(cols=240, rows=40) as t:
+            self._launch(t)
+
+            # Initial vertical layout: capture sep columns.
+            screen_v0 = t.capture()
+            sep_cols0 = _vertical_separator_columns(screen_v0)
+            self.assertTrue(
+                sep_cols0,
+                f'no vertical separator columns at startup:\n{screen_v0}')
+
+            # Switch to horizontal — Alt-2.
+            t.send('M-2')
+            t.wait_stable(timeout=3.0)
+            screen_h = t.capture()
+            self.assertFalse(
+                _vertical_separator_columns(screen_h),
+                f'expected no vertical separators in horizontal layout '
+                f'after Alt-2:\n{screen_h}')
+
+            # Switch back to vertical — Alt-1.
+            t.send('M-1')
+            t.wait_stable(timeout=3.0)
+            screen_v1 = t.capture()
+
+            # Vertical separator runs must be present again at the
+            # original sep columns. Without the fix, sep_main is blank
+            # because its cache hit prevented re-emission.
+            sep_cols1 = _vertical_separator_columns(screen_v1)
+            for col in sep_cols0:
+                self.assertIn(
+                    col, sep_cols1,
+                    f'separator column {col} missing after v→h→v '
+                    f'(was {sep_cols0}, now {sep_cols1}):\n{screen_v1}')
+
     def test_children_pane_survives_repeated_bounce(self):
         """Bouncing A → B → A → B → A several times still ends clean."""
         with TmuxFixture(cols=240, rows=40) as t:
