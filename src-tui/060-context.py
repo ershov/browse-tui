@@ -333,17 +333,26 @@ class Context:
 
 
 def _info_bar_geometry(browser):
-    """Return ``(row, cols)`` for the info bar, or ``(0, 0)`` if no room.
+    """Return ``(row, left, width)`` for the info bar, or ``(0, 0, 0)`` if no room.
 
     The render layer owns ``layout_panes`` and the actual geometry; we
     re-derive it here so the prompt helpers don't have to thread layout
-    state through every call. Returns ``(0, 0)`` when the terminal is
-    too small to host the info bar.
+    state through every call. Returns ``(0, 0, 0)`` when the terminal is
+    too small to host the info bar. ``left`` and ``width`` come from the
+    info-bar Rect so non-'h' layouts (v/m/pc) — where the info bar is a
+    standalone bottom row, currently full-width — still resolve to the
+    right span; if a future layout makes the info bar narrower this
+    helper will track that automatically.
     """
     cols, rows = term_size()
-    layout = layout_panes(cols, rows, show_preview=browser.show_preview,
+    layout = layout_panes(cols, rows,
+                          split=getattr(browser, 'split', 'h'),
+                          show_preview=browser.show_preview,
                           list_ratio=browser.list_ratio)
-    return layout['info_row'], layout['cols']
+    info_bar = layout.get('info_bar')
+    if info_bar is None:
+        return 0, 0, 0
+    return info_bar.top, info_bar.left, info_bar.width
 
 
 def _draw_info_prompt(browser, prompt, buf):
@@ -353,23 +362,28 @@ def _draw_info_prompt(browser, prompt, buf):
     blue, buf in normal text, fill rest of the row with separator
     characters in gray. Doesn't read input — callers loop with
     ``read_key`` and call this after each key.
+
+    Uses the info-bar Rect (``left``..``left+width``) rather than the
+    full screen width so the prompt overlays exactly the info-bar row,
+    leaving the rest of the screen alone.
     """
-    row, cols = _info_bar_geometry(browser)
-    if row <= 0 or cols <= 0:
+    row, left, width = _info_bar_geometry(browser)
+    if row <= 0 or width <= 0:
         return
-    move(row, 1)
-    clear_line()
+    move(row, left)
+    clear_columns(row, left, left + width)
+    move(row, left)
     set_style(fg=11, bg=4, bold=True)
-    write(prompt[:cols])
-    pos = len(prompt)
-    if pos < cols:
+    write(prompt[:width])
+    pos = len(prompt) if len(prompt) < width else width
+    if pos < width:
         set_style()
-        remaining = cols - pos
+        remaining = width - pos
         write(buf[:remaining])
         pos += min(len(buf), remaining)
-    if pos < cols:
+    if pos < width:
         set_style(fg=8)
-        write('─' * (cols - pos))
+        write('─' * (width - pos))
     set_style()
     flush()
 
@@ -472,18 +486,27 @@ def _pick_on_info_bar(browser, label, options, *, _read_key=None):
         cols, rows_total = term_size()
         layout = layout_panes(
             cols, rows_total,
+            split=getattr(browser, 'split', 'h'),
             show_preview=browser.show_preview,
             list_ratio=browser.list_ratio,
         )
         cols = layout['cols']
-        prev_top = layout['prev_top']
-        prev_height = layout['prev_height']
-        info_row = layout['info_row']
+        preview_rect = layout.get('preview')
+        info_bar = layout.get('info_bar')
+        prev_top = preview_rect.top if preview_rect is not None else 0
+        prev_left = preview_rect.left if preview_rect is not None else 1
+        prev_right = preview_rect.right if preview_rect is not None else cols + 1
+        prev_height = preview_rect.height if preview_rect is not None else 0
+        info_row = info_bar.top if info_bar is not None else 0
+        info_left = info_bar.left if info_bar is not None else 1
+        info_width = info_bar.width if info_bar is not None else 0
 
         # When the info row coincides with the preview's top (i.e. no
-        # children-grid pane), the filter prompt and the options list
-        # would otherwise overdraw the same row. Reserve the top row
-        # for the prompt and slide the options down by one.
+        # children-grid pane, layout 'h'), the filter prompt and the
+        # options list would otherwise overdraw the same row. Reserve
+        # the top row for the prompt and slide the options down by
+        # one. In v/m/pc layouts the info bar is a standalone bottom
+        # row and never overlaps the preview rect.
         if info_row > 0 and info_row == prev_top and prev_height > 0:
             options_top = prev_top + 1
             options_height = prev_height - 1
@@ -495,38 +518,48 @@ def _pick_on_info_bar(browser, label, options, *, _read_key=None):
         if cursor >= len(visible):
             cursor = max(0, len(visible) - 1)
 
-        # ---- filter prompt on the info row ------------------------
-        if info_row > 0:
-            move(info_row, 1)
-            clear_line()
+        # ---- filter prompt on the info bar ------------------------
+        # Use the info-bar Rect's left/width so the prompt overlays
+        # exactly the info bar in any layout (today the info bar is
+        # full-width in every layout, but using the rect keeps this
+        # robust to future narrower info bars).
+        if info_row > 0 and info_width > 0:
+            move(info_row, info_left)
+            clear_columns(info_row, info_left, info_left + info_width)
+            move(info_row, info_left)
             S = '─'
             prompt = ' {}> '.format(label)
             set_style(fg=11, bg=4, bold=True)
-            write(prompt[:cols])
-            pos = min(len(prompt), cols)
-            if pos < cols:
+            write(prompt[:info_width])
+            pos = min(len(prompt), info_width)
+            if pos < info_width:
                 set_style(fg=252, bg=236)
-                write(filter_query[:cols - pos])
-                pos += min(len(filter_query), cols - pos)
-            if pos < cols:
+                write(filter_query[:info_width - pos])
+                pos += min(len(filter_query), info_width - pos)
+            if pos < info_width:
                 set_style(fg=8)
-                write(S * (cols - pos))
+                write(S * (info_width - pos))
             reset_style()
 
         # ---- options list in the preview-pane area ----------------
-        if options_height > 0:
+        # Use the preview rect's left/right so options overlay only the
+        # preview pane (not the whole row) in v/m/pc layouts where the
+        # preview pane is narrower than the screen.
+        prev_width = max(0, prev_right - prev_left)
+        if options_height > 0 and prev_width > 0:
             for i in range(options_height):
-                move(options_top + i, 1)
-                clear_line()
+                move(options_top + i, prev_left)
+                clear_columns(options_top + i, prev_left, prev_right)
                 if i < len(visible):
+                    move(options_top + i, prev_left)
                     label_text = visible[i]
                     if i == cursor:
                         set_style(reverse=True)
-                        line = ('  ' + label_text).ljust(cols)[:cols]
+                        line = ('  ' + label_text).ljust(prev_width)[:prev_width]
                         write(line)
                         reset_style()
                     else:
-                        write(('  ' + label_text)[:cols])
+                        write(('  ' + label_text)[:prev_width])
 
         flush()
 

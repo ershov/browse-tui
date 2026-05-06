@@ -261,9 +261,46 @@ When a placeholder doesn't resolve, `browse-tui` falls back to the bare id.
 | `--no-children-pane`  | Start with the children-grid pane hidden.                    |
 | `--no-multi-select`   | Disable the selection set (Space/Alt-Space/Ctrl-A become no-ops). |
 | `--list-size N\|N%`    | Initial list pane size. `N` is a line count (proportional to startup terminal — scales on resize); `N%` locks the proportion. Default `30%`. Adjust live with `-`/`_` (shrink) and `=`/`+` (grow); the ratio is preserved across terminal resizes. |
+| `--split-type TYPE`   | Initial pane layout. Accepts `h`/`horizontal`, `v`/`vertical`, `m`/`mixed`, `pc`/`preview-children`, or `a`/`auto` (default). `auto` picks `v` when terminal width >= 230 columns, else `h`; resolved once at startup and not recomputed on resize. Switch live with `\` (cycles `v`→`h`→`m`→`pc`) or Alt-1/2/3/4. See [Layouts](#layouts) below. |
 | `--show-ids MODE`     | Whether to render the id segment in front of each row's title: `always` / `auto` (default) / `never`. In `auto` mode the id is suppressed when `str(item.id) == item.title` — useful for line-based CLI sources (filenames, `seq`, `xargs`) where showing both is duplication. |
 | `--title TITLE`       | Window title shown in the info bar.                          |
 | `--initial-scope ID`  | Start scoped to this id (Alt-Up to leave).                   |
+
+### Layouts
+
+Four pane layouts are available; switch live with `\` (cycle) or Alt-1/2/3/4
+(direct select). All layouts include a single-line info bar across the bottom.
+
+```
+Vertical (`v`, Alt-1):           Horizontal (`h`, Alt-2):
++------+--------------+          +----------------+
+|      |   children   |          |      list      |
+| list +--------------+          +----------------+
+|      |              |          |    children    |
+|      |   preview    |          +----------------+
++------+--------------+          |    preview     |
+|      info bar       |          +----------------+
++---------------------+          |    info bar    |
+                                 +----------------+
+
+Mixed (`m`, Alt-3):              Preview-children (`pc`, Alt-4):
++----------+----------+          +------+--------------+
+|   list   |          |          |      |   children   |
++----------+ preview  |          | list +--------------+
+| children |          |          |      |   preview    |
++----------+----------+          +------+--------------+
+|      info bar       |          |      info bar       |
++---------------------+          +---------------------+
+```
+
+* **Horizontal** — list, children, preview stacked vertically. Best for
+  narrow terminals; the historical default.
+* **Vertical** — list on the left; children-above-preview on the right
+  (children gets ~25% of the right-side height). Best for wide terminals.
+* **Mixed** — list and children stacked on the left; preview spans the
+  full height on the right. Children gets ~25% of the left-side height.
+* **Preview-children** — currently the same shape as Vertical; reserved
+  as a distinct slot for future tweaks (and may be consolidated later).
 
 ---
 
@@ -397,6 +434,11 @@ charge of how the Browser is configured.
 | Alt-PgUp       | Scroll preview up by a page                                 |
 | `-` / `_`      | Shrink list pane (no-op when preview hidden)                |
 | `=` / `+`      | Grow list pane (no-op when preview hidden)                  |
+| `\`            | Cycle pane layout (`v`→`h`→`m`→`pc`→`v`)                    |
+| Alt-1          | Switch to vertical layout (`v`)                             |
+| Alt-2          | Switch to horizontal layout (`h`)                           |
+| Alt-3          | Switch to mixed layout (`m`)                                |
+| Alt-4          | Switch to preview-children layout (`pc`)                    |
 | Space          | Toggle selection of cursor; advance cursor                  |
 | Alt-Space      | Toggle selection of cursor; move cursor up                  |
 | Ctrl-A         | Select all visible normal rows                              |

@@ -617,5 +617,253 @@ class TestResolveListSize(unittest.TestCase):
             self.assertAlmostEqual(_cli._resolve_list_size('-5'), 0.30)
 
 
+class TestResolveSplitType(unittest.TestCase):
+    """``--split-type`` long/short forms, case-insensitivity, auto threshold."""
+
+    def test_long_forms_map_to_short(self):
+        self.assertEqual(_cli._resolve_split_type('horizontal', 80), 'h')
+        self.assertEqual(_cli._resolve_split_type('vertical', 300), 'v')
+        self.assertEqual(_cli._resolve_split_type('mixed', 80), 'm')
+        self.assertEqual(_cli._resolve_split_type('preview-children', 80), 'pc')
+
+    def test_short_forms_pass_through(self):
+        self.assertEqual(_cli._resolve_split_type('h', 80), 'h')
+        self.assertEqual(_cli._resolve_split_type('v', 80), 'v')
+        self.assertEqual(_cli._resolve_split_type('m', 80), 'm')
+        self.assertEqual(_cli._resolve_split_type('pc', 80), 'pc')
+
+    def test_mixed_case(self):
+        self.assertEqual(_cli._resolve_split_type('Horizontal', 80), 'h')
+        self.assertEqual(_cli._resolve_split_type('VERTICAL', 300), 'v')
+        self.assertEqual(_cli._resolve_split_type('Auto', 300), 'v')
+        self.assertEqual(_cli._resolve_split_type('AUTO', 80), 'h')
+        self.assertEqual(_cli._resolve_split_type('PC', 80), 'pc')
+        self.assertEqual(_cli._resolve_split_type('Preview-Children', 80), 'pc')
+
+    def test_invalid_raises(self):
+        with self.assertRaises(ValueError):
+            _cli._resolve_split_type('nope', 80)
+        with self.assertRaises(ValueError):
+            _cli._resolve_split_type('', 80)
+        with self.assertRaises(ValueError):
+            _cli._resolve_split_type(42, 80)
+
+    def test_auto_threshold_below(self):
+        # 229 cols → horizontal stack.
+        self.assertEqual(_cli._resolve_split_type('auto', 229), 'h')
+        self.assertEqual(_cli._resolve_split_type('a', 80), 'h')
+        self.assertEqual(_cli._resolve_split_type('auto', 0), 'h')
+
+    def test_auto_threshold_at_and_above(self):
+        # 230 cols (the boundary) → vertical; wider also vertical.
+        self.assertEqual(_cli._resolve_split_type('auto', 230), 'v')
+        self.assertEqual(_cli._resolve_split_type('auto', 300), 'v')
+        self.assertEqual(_cli._resolve_split_type('a', 500), 'v')
+
+    def test_none_defaults_to_auto(self):
+        # None → treated as 'auto'; threshold rules apply.
+        self.assertEqual(_cli._resolve_split_type(None, 80), 'h')
+        self.assertEqual(_cli._resolve_split_type(None, 230), 'v')
+
+
+class TestSplitTypeArgparse(unittest.TestCase):
+    """``--split-type`` is captured on the namespace; default is 'auto'."""
+
+    def test_default_is_auto(self):
+        args, _ = _cli.parse_args([])
+        self.assertEqual(args.split_type, 'auto')
+
+    def test_short_value(self):
+        args, _ = _cli.parse_args(['--split-type', 'h'])
+        self.assertEqual(args.split_type, 'h')
+
+    def test_long_value(self):
+        args, _ = _cli.parse_args(['--split-type', 'preview-children'])
+        self.assertEqual(args.split_type, 'preview-children')
+
+    def test_invalid_value_accepted_by_argparse_then_rejected_by_resolver(self):
+        # We deliberately don't use argparse choices=, so parsing succeeds
+        # and the resolver raises a clean ValueError instead.
+        args, _ = _cli.parse_args(['--split-type', 'bogus'])
+        self.assertEqual(args.split_type, 'bogus')
+        with self.assertRaises(ValueError):
+            _cli._resolve_split_type(args.split_type, 100)
+
+
+class TestSplitTypeWiring(unittest.TestCase):
+    """``--split-type`` flows through both builders to ``Browser.split``."""
+
+    def test_lazy_builder_passes_split_h(self):
+        args, _ = _cli.parse_args([
+            '--children-cmd', "printf 'a\\n'",
+            '--split-type', 'h',
+        ])
+        b = _cli._build_lazy_browser(
+            args, fields=['id', 'title'], record_sep=b'\n', split='h',
+        )
+        try:
+            self.assertEqual(b.split, 'h')
+        finally:
+            b.stop_workers()
+
+    def test_lazy_builder_passes_split_v(self):
+        args, _ = _cli.parse_args([
+            '--children-cmd', "printf 'a\\n'",
+            '--split-type', 'v',
+        ])
+        b = _cli._build_lazy_browser(
+            args, fields=['id', 'title'], record_sep=b'\n', split='v',
+        )
+        try:
+            self.assertEqual(b.split, 'v')
+        finally:
+            b.stop_workers()
+
+    def test_eager_builder_passes_split_m(self):
+        args, _ = _cli.parse_args([
+            '--root-cmd', "printf 'a\\n'",
+            '--split-type', 'mixed',
+        ])
+        b = _cli._build_eager_browser(
+            args, fields=['id', 'title'], record_sep=b'\n', split='m',
+        )
+        try:
+            self.assertIsNotNone(b)
+            self.assertEqual(b.split, 'm')
+        finally:
+            if b is not None:
+                b.stop_workers()
+
+    def test_eager_builder_passes_split_pc(self):
+        args, _ = _cli.parse_args([
+            '--root-cmd', "printf 'a\\n'",
+            '--split-type', 'pc',
+        ])
+        b = _cli._build_eager_browser(
+            args, fields=['id', 'title'], record_sep=b'\n', split='pc',
+        )
+        try:
+            self.assertIsNotNone(b)
+            self.assertEqual(b.split, 'pc')
+        finally:
+            if b is not None:
+                b.stop_workers()
+
+    def test_auto_wide_terminal_resolves_to_v(self):
+        # Drive the resolver at the boundary used in run_tui.
+        self.assertEqual(_cli._resolve_split_type('auto', 300), 'v')
+        # And confirm a Browser built with that value sticks.
+        args, _ = _cli.parse_args([
+            '--root-cmd', "printf 'a\\n'",
+            '--split-type', 'auto',
+        ])
+        b = _cli._build_eager_browser(
+            args, fields=['id', 'title'], record_sep=b'\n', split='v',
+        )
+        try:
+            self.assertEqual(b.split, 'v')
+        finally:
+            if b is not None:
+                b.stop_workers()
+
+    def test_auto_narrow_terminal_resolves_to_h(self):
+        self.assertEqual(_cli._resolve_split_type('auto', 80), 'h')
+        args, _ = _cli.parse_args([
+            '--root-cmd', "printf 'a\\n'",
+            '--split-type', 'auto',
+        ])
+        b = _cli._build_eager_browser(
+            args, fields=['id', 'title'], record_sep=b'\n', split='h',
+        )
+        try:
+            self.assertEqual(b.split, 'h')
+        finally:
+            if b is not None:
+                b.stop_workers()
+
+
+class TestTerminalColsForAuto(unittest.TestCase):
+    """``_terminal_cols_for_auto`` falls back gracefully across sources."""
+
+    def test_returns_positive_int(self):
+        # Whatever the runner is using, the result is a positive int —
+        # we don't pin a value because tests run under varying TTY shapes
+        # (unittest, pytest, CI VMs without a pty, etc.).
+        cols = _cli._terminal_cols_for_auto()
+        self.assertIsInstance(cols, int)
+        self.assertGreater(cols, 0)
+
+    def test_explicit_default_when_all_sources_fail(self):
+        # Force every detection branch to raise/return a non-positive
+        # value so the fallback is the only return path. Patches:
+        #   * ``builtins.open`` so /dev/tty (used by both the ioctl
+        #     probe and the stty fallback) raises OSError;
+        #   * ``os.get_terminal_size`` so all three fd-keyed probes
+        #     raise (and shutil's internal call falls back to its
+        #     default 80,24);
+        #   * ``shutil.get_terminal_size`` so its 80-fallback doesn't
+        #     swallow the chain;
+        #   * ``subprocess.run`` so the stty probe never spawns a real
+        #     ``stty`` (would otherwise return live tty dimensions).
+        import builtins
+        from unittest import mock
+        real_open = builtins.open
+
+        def fake_open(path, *a, **kw):
+            if path == '/dev/tty':
+                raise OSError('no tty in test')
+            return real_open(path, *a, **kw)
+
+        def fake_size(*_a, **_kw):
+            raise OSError('no terminal')
+
+        def fake_run(*_a, **_kw):
+            raise OSError('no stty in test')
+
+        with mock.patch('builtins.open', side_effect=fake_open), \
+             mock.patch.object(_cli.os, 'get_terminal_size',
+                               side_effect=fake_size), \
+             mock.patch.object(_cli.shutil, 'get_terminal_size',
+                               side_effect=fake_size), \
+             mock.patch.object(_cli.subprocess, 'run',
+                               side_effect=fake_run):
+            self.assertEqual(_cli._terminal_cols_for_auto(default=42), 42)
+
+    def test_falls_back_through_chain_when_tty_ioctl_fails(self):
+        """When /dev/tty ioctl fails, falls through to fd-based probes.
+
+        Regression for ticket #167: in some environments /dev/tty
+        returns 0 cols or fails, and the previous fallback was just
+        ``os.get_terminal_size()`` (default fd=stdout). If stdout was
+        piped that also failed, dropping to default=80 → narrow split
+        even on a wide terminal. The detector must keep searching:
+        try stdin/stderr fds, then shutil, then stty.
+        """
+        import builtins
+        from unittest import mock
+        real_open = builtins.open
+
+        def fake_open(path, *a, **kw):
+            if path == '/dev/tty':
+                raise OSError('no tty in test')
+            return real_open(path, *a, **kw)
+
+        # Make stdout (fd=1) fail but stderr (fd=2) succeed. This
+        # simulates ``browse-tui … | tee out.log`` on a wide terminal:
+        # stdout is a pipe, but stderr still points at the tty.
+        from collections import namedtuple
+        Size = namedtuple('Size', ('columns', 'lines'))
+
+        def fake_size(fd=1):
+            if fd == 2:
+                return Size(242, 40)
+            raise OSError(f'fd {fd} not a tty')
+
+        with mock.patch('builtins.open', side_effect=fake_open), \
+             mock.patch.object(_cli.os, 'get_terminal_size',
+                               side_effect=fake_size):
+            self.assertEqual(_cli._terminal_cols_for_auto(default=80), 242)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -35,6 +35,7 @@ _context.term_resume = _term.term_resume
 _context.term_size = _term.term_size
 _context.move = _term.move
 _context.clear_line = _term.clear_line
+_context.clear_columns = _term.clear_columns
 _context.set_style = _term.set_style
 _context.reset_style = _term.reset_style
 _context.write = _term.write

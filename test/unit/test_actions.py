@@ -36,6 +36,9 @@ _actions.mark_visible_dirty = _state.mark_visible_dirty
 _actions.current_scope = _state.current_scope
 _actions._search_find = _state._search_find
 _actions._search_jump_nearest = _state._search_jump_nearest
+_actions.point_in_rect = _render.point_in_rect
+_actions._sub_needed_rows = _render._sub_needed_rows
+_actions._fmt_child = _render._fmt_child
 # term_size / layout_panes are deliberately NOT wired at module scope:
 # the existing TestPreviewScrollActions cases verify the headless
 # fallback path. The TestPageSizesTrackTerminalHeight cases below
@@ -661,7 +664,7 @@ class TestPageSizesTrackTerminalHeight(unittest.TestCase):
                 80, 24,
                 show_preview=b.show_preview,
                 show_children_pane=b.show_children_pane,
-            )['list_height']
+            )['list'].height
             self.assertEqual(_actions._list_pane_height(b), expected)
         finally:
             restore()
@@ -676,14 +679,14 @@ class TestPageSizesTrackTerminalHeight(unittest.TestCase):
                 120, 60,
                 show_preview=b.show_preview,
                 show_children_pane=b.show_children_pane,
-            )['list_height']
+            )['list'].height
             self.assertEqual(_actions._list_pane_height(b), expected)
             # And it should genuinely be bigger than the 24-row case.
             small = _render.layout_panes(
                 80, 24,
                 show_preview=b.show_preview,
                 show_children_pane=b.show_children_pane,
-            )['list_height']
+            )['list'].height
             self.assertGreater(expected, small)
         finally:
             restore()
@@ -750,7 +753,7 @@ class TestPageSizesTrackTerminalHeight(unittest.TestCase):
                 80, 24,
                 show_preview=b.show_preview,
                 show_children_pane=b.show_children_pane,
-            )['list_height']
+            )['list'].height
             self.assertEqual(b._state.cursor, 0)
             dispatch_key(b, ctx, 'pgdn')
             self.assertEqual(b._state.cursor, expected_page)
@@ -776,7 +779,7 @@ class TestPageSizesTrackTerminalHeight(unittest.TestCase):
                 80, 24,
                 show_preview=b.show_preview,
                 show_children_pane=b.show_children_pane,
-            )['list_height']
+            )['list'].height
             dispatch_key(b, ctx, 'pgdn')
             small_landing = b._state.cursor
             self.assertEqual(small_landing, small_page)
@@ -792,7 +795,7 @@ class TestPageSizesTrackTerminalHeight(unittest.TestCase):
                 80, 60,
                 show_preview=b.show_preview,
                 show_children_pane=b.show_children_pane,
-            )['list_height']
+            )['list'].height
             dispatch_key(b, ctx, 'pgdn')
             self.assertEqual(b._state.cursor, big_page)
             self.assertGreater(big_page, small_page)
@@ -811,7 +814,7 @@ class TestPageSizesTrackTerminalHeight(unittest.TestCase):
                 80, 40,
                 show_preview=b.show_preview,
                 show_children_pane=b.show_children_pane,
-            )['list_height']
+            )['list'].height
             b._state.cursor = 50
             dispatch_key(b, ctx, 'pgup')
             self.assertEqual(b._state.cursor, 50 - expected_page)
@@ -830,7 +833,7 @@ class TestPageSizesTrackTerminalHeight(unittest.TestCase):
                 show_preview=b.show_preview,
                 show_children_pane=b.show_children_pane,
             )
-            expected = layout['prev_height'] - 1  # excludes separator
+            expected = layout['preview'].height - 1  # excludes separator
             dispatch_key(b, ctx, 'alt-pgdn')
             self.assertEqual(b._preview_scroll, expected)
         finally:
@@ -886,7 +889,7 @@ class TestMouseDispatch(unittest.TestCase):
             layout = _render.layout_panes(80, 40, show_preview=True,
                                           show_children_pane=True)
             # Click on the third row of the list (list_top + 2).
-            target_row = layout['list_top'] + 2
+            target_row = layout['list'].top + 2
             dispatch_key(b, ctx, f'mouse-click:{target_row}:5')
             self.assertEqual(b._state.cursor, 2)
         finally:
@@ -902,7 +905,7 @@ class TestMouseDispatch(unittest.TestCase):
             ctx = _ctx_for(b)
             layout = _render.layout_panes(80, 40, show_preview=True,
                                           show_children_pane=True)
-            target_row = layout['list_top']  # first visible row
+            target_row = layout['list'].top  # first visible row
             dispatch_key(b, ctx, f'mouse-click:{target_row}:5')
             self.assertEqual(b._state.cursor, 4)
         finally:
@@ -919,7 +922,7 @@ class TestMouseDispatch(unittest.TestCase):
             layout = _render.layout_panes(80, 40, show_preview=True,
                                           show_children_pane=True)
             # Click well past the end.
-            dispatch_key(b, ctx, f'mouse-click:{layout["list_top"] + 8}:5')
+            dispatch_key(b, ctx, f'mouse-click:{layout["list"].top + 8}:5')
             self.assertEqual(b._state.cursor, 1)
         finally:
             restore()
@@ -933,7 +936,7 @@ class TestMouseDispatch(unittest.TestCase):
             ctx = _ctx_for(b)
             layout = _render.layout_panes(80, 40, show_preview=True,
                                           show_children_pane=True)
-            target_row = layout['prev_top'] + 2  # inside preview content
+            target_row = layout['preview'].top + 2  # inside preview content
             dispatch_key(b, ctx, f'mouse-click:{target_row}:5')
             self.assertFalse(b._help_mode)
         finally:
@@ -950,7 +953,7 @@ class TestMouseDispatch(unittest.TestCase):
             cursor_before = b._state.cursor
             scroll_before = b._list_scroll
             # Preview separator row (sub_height==0 → info_row == prev_top).
-            dispatch_key(b, ctx, f'mouse-click:{layout["prev_top"]}:5')
+            dispatch_key(b, ctx, f'mouse-click:{layout["preview"].top}:5')
             self.assertEqual(b._state.cursor, cursor_before)
             self.assertEqual(b._list_scroll, scroll_before)
         finally:
@@ -967,7 +970,7 @@ class TestMouseDispatch(unittest.TestCase):
             layout = _render.layout_panes(80, 40, show_preview=True,
                                           show_children_pane=True)
             cursor_before = b._state.cursor
-            target_row = layout['list_top'] + 2
+            target_row = layout['list'].top + 2
             dispatch_key(b, ctx, f'scroll-down:{target_row}:5')
             self.assertEqual(b._list_scroll, 3)
             self.assertEqual(b._state.cursor, cursor_before)
@@ -983,7 +986,7 @@ class TestMouseDispatch(unittest.TestCase):
             ctx = _ctx_for(b)
             layout = _render.layout_panes(80, 40, show_preview=True,
                                           show_children_pane=True)
-            target_row = layout['list_top'] + 2
+            target_row = layout['list'].top + 2
             dispatch_key(b, ctx, f'scroll-up:{target_row}:5')
             self.assertEqual(b._list_scroll, 7)
         finally:
@@ -998,7 +1001,7 @@ class TestMouseDispatch(unittest.TestCase):
             ctx = _ctx_for(b)
             layout = _render.layout_panes(80, 40, show_preview=True,
                                           show_children_pane=True)
-            target_row = layout['list_top'] + 2
+            target_row = layout['list'].top + 2
             dispatch_key(b, ctx, f'scroll-up:{target_row}:5')
             self.assertEqual(b._list_scroll, 0)
         finally:
@@ -1014,7 +1017,7 @@ class TestMouseDispatch(unittest.TestCase):
             ctx = _ctx_for(b)
             layout = _render.layout_panes(80, 40, show_preview=True,
                                           show_children_pane=True)
-            target_row = layout['prev_top'] + 2
+            target_row = layout['preview'].top + 2
             dispatch_key(b, ctx, f'scroll-down:{target_row}:5')
             self.assertEqual(b._preview_scroll, 3)
         finally:
@@ -1029,7 +1032,7 @@ class TestMouseDispatch(unittest.TestCase):
             ctx = _ctx_for(b)
             layout = _render.layout_panes(80, 40, show_preview=True,
                                           show_children_pane=True)
-            target_row = layout['prev_top'] + 2
+            target_row = layout['preview'].top + 2
             dispatch_key(b, ctx, f'scroll-up:{target_row}:5')
             self.assertEqual(b._preview_scroll, 0)
         finally:
@@ -1044,7 +1047,7 @@ class TestMouseDispatch(unittest.TestCase):
             ctx = _ctx_for(b)
             layout = _render.layout_panes(80, 40, show_preview=True,
                                           show_children_pane=True)
-            dispatch_key(b, ctx, f'scroll-down:{layout["list_top"]}:5')
+            dispatch_key(b, ctx, f'scroll-down:{layout["list"].top}:5')
             self.assertEqual(b._preview_scroll, 5)
         finally:
             restore()
@@ -1063,7 +1066,7 @@ class TestMouseDispatch(unittest.TestCase):
             layout = _render.layout_panes(80, 40, show_preview=True,
                                           show_children_pane=True)
             cursor_before = b._state.cursor
-            dispatch_key(b, ctx, f'mouse-click:{layout["list_top"] + 3}:5')
+            dispatch_key(b, ctx, f'mouse-click:{layout["list"].top + 3}:5')
             self.assertEqual(b._search_query, 'foo')
             self.assertEqual(b._state.cursor, cursor_before)
         finally:
@@ -1090,6 +1093,284 @@ class TestMouseDispatch(unittest.TestCase):
         finally:
             if prev_ts is not None:
                 _actions.term_size = prev_ts
+            b.stop_workers()
+
+
+class TestDispatchMouseLayouts(unittest.TestCase):
+    """Mouse dispatch in 2D layouts (v / m / pc).
+
+    Pre-#152, ``_pane_at`` did row-only hit-testing — fine for layout
+    'h' (full-width panes stacked vertically) but wrong for any 2D
+    layout where panes occupy partial-width columns. These tests drive
+    each layout family and assert that clicks in each pane region
+    route to the correct handler.
+    """
+
+    def _patch_term(self, cols, rows):
+        prev_ts = getattr(_actions, 'term_size', None)
+        prev_lp = getattr(_actions, 'layout_panes', None)
+        _actions.term_size = lambda: (cols, rows)
+        _actions.layout_panes = _render.layout_panes
+
+        def restore():
+            if prev_ts is None:
+                if hasattr(_actions, 'term_size'):
+                    del _actions.term_size
+            else:
+                _actions.term_size = prev_ts
+            if prev_lp is None:
+                if hasattr(_actions, 'layout_panes'):
+                    del _actions.layout_panes
+            else:
+                _actions.layout_panes = prev_lp
+
+        return restore
+
+    def _browser(self, n=10, *, split='h', show_children=True):
+        b = _make_browser()
+        b._state._children[None] = [Item(id=f'I{i}') for i in range(n)]
+        b.split = split
+        b.show_children_pane = show_children
+        return b
+
+    # ---- layout 'h' (sanity, regression coverage) ----------------------
+
+    def test_dispatch_mouse_horizontal(self):
+        b = self._browser(20, split='h', show_children=False)
+        restore = self._patch_term(80, 40)
+        try:
+            ctx = _ctx_for(b)
+            layout = _render.layout_panes(
+                80, 40, split='h', show_preview=True, show_children_pane=False,
+            )
+            # Click in list pane.
+            r = layout['list'].top + 3
+            dispatch_key(b, ctx, f'mouse-click:{r}:5')
+            self.assertEqual(b._state.cursor, 3)
+            # Click in preview content (below the separator row).
+            b._help_mode = True
+            r = layout['preview'].top + 2
+            dispatch_key(b, ctx, f'mouse-click:{r}:40')
+            self.assertFalse(b._help_mode)
+        finally:
+            restore()
+            b.stop_workers()
+
+    # ---- layout 'v' (side-by-side: list | preview) ---------------------
+
+    def test_dispatch_mouse_vertical(self):
+        b = self._browser(20, split='v', show_children=False)
+        restore = self._patch_term(80, 40)
+        try:
+            ctx = _ctx_for(b)
+            layout = _render.layout_panes(
+                80, 40, split='v', show_preview=True, show_children_pane=False,
+            )
+            list_rect = layout['list']
+            preview_rect = layout['preview']
+            # Click in list (left column).
+            r = list_rect.top + 4
+            c = list_rect.left + 2
+            dispatch_key(b, ctx, f'mouse-click:{r}:{c}')
+            self.assertEqual(b._state.cursor, 4)
+            # Click in preview (right column) → dismisses help.
+            b._help_mode = True
+            r = preview_rect.top + 2
+            c = preview_rect.left + 2
+            dispatch_key(b, ctx, f'mouse-click:{r}:{c}')
+            self.assertFalse(b._help_mode)
+            # Wheel-scroll in list (left column) bumps list_scroll only.
+            preview_before = b._preview_scroll
+            r = list_rect.top + 4
+            c = list_rect.left + 2
+            dispatch_key(b, ctx, f'scroll-down:{r}:{c}')
+            self.assertEqual(b._list_scroll, 3)
+            self.assertEqual(b._preview_scroll, preview_before)
+            # Wheel-scroll in preview (right column) bumps preview_scroll.
+            r = preview_rect.top + 2
+            c = preview_rect.left + 2
+            dispatch_key(b, ctx, f'scroll-down:{r}:{c}')
+            self.assertEqual(b._preview_scroll, 3)
+        finally:
+            restore()
+            b.stop_workers()
+
+    def test_dispatch_mouse_vertical_with_children(self):
+        # Per #166 layout 'v' is structurally identical to 'pc':
+        # ``list | (children-above-preview)`` — children is a ROW at the
+        # top of the right column, preview below.
+        b = self._browser(5, split='v', show_children=True)
+        b._state._children['I0'] = [
+            Item(id=f'C{i}') for i in range(3)
+        ]
+        b._state._children[None] = [
+            Item(id='I0', has_children=True),
+            *[Item(id=f'I{i}') for i in range(1, 5)],
+        ]
+        b._state.cursor = 0
+        restore = self._patch_term(120, 40)
+        try:
+            ctx = _ctx_for(b)
+            layout = _render.layout_panes(
+                120, 40, split='v', show_preview=True, show_children_pane=True,
+                children_rows_needed=3,
+            )
+            children_rect = layout.get('children')
+            if children_rect is None:
+                # Geometry may degrade to no-children at this size; skip
+                # the children-row assertion. Still verify list and
+                # preview hit-testing.
+                preview_rect = layout['preview']
+                list_rect = layout['list']
+                dispatch_key(b, ctx, f'mouse-click:{list_rect.top + 1}:'
+                             f'{list_rect.left + 1}')
+                self.assertEqual(b._state.cursor, 1)
+                b._help_mode = True
+                dispatch_key(b, ctx,
+                             f'mouse-click:{preview_rect.top + 2}:'
+                             f'{preview_rect.left + 1}')
+                self.assertFalse(b._help_mode)
+                return
+            preview_rect = layout['preview']
+            list_rect = layout['list']
+            # Click in children (top of right column) → no list-cursor
+            # change, no help dismiss (children clicks are no-ops).
+            cursor_before = b._state.cursor
+            dispatch_key(b, ctx,
+                         f'mouse-click:{children_rect.top}:'
+                         f'{children_rect.left + 1}')
+            self.assertEqual(b._state.cursor, cursor_before)
+            # Click in left (list) column moves cursor.
+            dispatch_key(b, ctx,
+                         f'mouse-click:{list_rect.top + 2}:'
+                         f'{list_rect.left + 1}')
+            self.assertEqual(b._state.cursor, 2)
+            # Click in preview (bottom of right column) dismisses help.
+            b._help_mode = True
+            dispatch_key(b, ctx,
+                         f'mouse-click:{preview_rect.top + 2}:'
+                         f'{preview_rect.left + 1}')
+            self.assertFalse(b._help_mode)
+        finally:
+            restore()
+            b.stop_workers()
+
+    # ---- layout 'm' (list+children left, preview right) ----------------
+
+    def test_dispatch_mouse_mixed(self):
+        b = self._browser(5, split='m', show_children=True)
+        b._state._children['I0'] = [Item(id=f'C{i}') for i in range(3)]
+        b._state._children[None] = [
+            Item(id='I0', has_children=True),
+            *[Item(id=f'I{i}') for i in range(1, 5)],
+        ]
+        b._state.cursor = 0
+        restore = self._patch_term(120, 60)
+        try:
+            ctx = _ctx_for(b)
+            layout = _render.layout_panes(
+                120, 60, split='m', show_preview=True, show_children_pane=True,
+                children_rows_needed=3,
+            )
+            list_rect = layout['list']
+            preview_rect = layout['preview']
+            children_rect = layout.get('children')
+            # Click in top-left (list).
+            dispatch_key(b, ctx,
+                         f'mouse-click:{list_rect.top + 1}:'
+                         f'{list_rect.left + 1}')
+            self.assertEqual(b._state.cursor, 1)
+            # Click in right (preview) column dismisses help.
+            b._help_mode = True
+            dispatch_key(b, ctx,
+                         f'mouse-click:{preview_rect.top + 2}:'
+                         f'{preview_rect.left + 1}')
+            self.assertFalse(b._help_mode)
+            # Click in bottom-left (children) → no-op for cursor.
+            if children_rect is not None:
+                cursor_before = b._state.cursor
+                dispatch_key(b, ctx,
+                             f'mouse-click:{children_rect.top + 0}:'
+                             f'{children_rect.left + 1}')
+                self.assertEqual(b._state.cursor, cursor_before)
+        finally:
+            restore()
+            b.stop_workers()
+
+    # ---- layout 'pc' (list left, children+preview stacked right) ------
+
+    def test_dispatch_mouse_preview_children(self):
+        b = self._browser(5, split='pc', show_children=True)
+        b._state._children['I0'] = [Item(id=f'C{i}') for i in range(3)]
+        b._state._children[None] = [
+            Item(id='I0', has_children=True),
+            *[Item(id=f'I{i}') for i in range(1, 5)],
+        ]
+        b._state.cursor = 0
+        restore = self._patch_term(120, 60)
+        try:
+            ctx = _ctx_for(b)
+            layout = _render.layout_panes(
+                120, 60, split='pc', show_preview=True,
+                show_children_pane=True, children_rows_needed=3,
+            )
+            list_rect = layout['list']
+            preview_rect = layout['preview']
+            children_rect = layout.get('children')
+            # Click left → list. Land on row 0 (item I0) so the cursor
+            # stays on the branch with children — the dispatcher
+            # re-derives the layout per click using the cursor's children
+            # to size the grid, so a click that moved the cursor onto a
+            # leaf would collapse the children pane.
+            dispatch_key(b, ctx,
+                         f'mouse-click:{list_rect.top + 0}:'
+                         f'{list_rect.left + 1}')
+            self.assertEqual(b._state.cursor, 0)
+            # Click bottom-right → preview (dismiss help).
+            b._help_mode = True
+            dispatch_key(b, ctx,
+                         f'mouse-click:{preview_rect.top + 1}:'
+                         f'{preview_rect.left + 1}')
+            self.assertFalse(b._help_mode)
+            # Click top-right → children (no-op for help / cursor).
+            if children_rect is not None:
+                b._help_mode = True
+                cursor_before = b._state.cursor
+                dispatch_key(b, ctx,
+                             f'mouse-click:{children_rect.top + 0}:'
+                             f'{children_rect.left + 1}')
+                # Click in children pane should NOT dismiss help (only
+                # clicks in preview do).
+                self.assertTrue(b._help_mode)
+                self.assertEqual(b._state.cursor, cursor_before)
+        finally:
+            restore()
+            b.stop_workers()
+
+    # ---- click outside any pane rect (e.g. info bar) -------------------
+
+    def test_dispatch_mouse_outside_rects(self):
+        b = self._browser(10, split='v', show_children=False)
+        restore = self._patch_term(80, 40)
+        try:
+            ctx = _ctx_for(b)
+            layout = _render.layout_panes(
+                80, 40, split='v', show_preview=True, show_children_pane=False,
+            )
+            info_bar = layout['info_bar']
+            cursor_before = b._state.cursor
+            scroll_before = b._list_scroll
+            preview_before = b._preview_scroll
+            # Click in the bottom info-bar row → recognised as info_bar
+            # but no-op for cursor / scroll.
+            dispatch_key(b, ctx,
+                         f'mouse-click:{info_bar.top}:'
+                         f'{info_bar.left + 5}')
+            self.assertEqual(b._state.cursor, cursor_before)
+            self.assertEqual(b._list_scroll, scroll_before)
+            self.assertEqual(b._preview_scroll, preview_before)
+        finally:
+            restore()
             b.stop_workers()
 
 
@@ -1185,6 +1466,97 @@ class TestListScrollDecoupledFromCursor(unittest.TestCase):
         finally:
             del _state.term_size
             del _state.layout_panes
+            b.stop_workers()
+
+    def test_snap_uses_current_layout_after_split_switch(self):
+        """Regression (mirrors ``test_snap_uses_current_list_ratio_after_resize``):
+        after the user switches the split layout (alt-1..alt-4), snap math
+        must use the new layout's list-pane height. In ``'h'`` the list
+        takes a fraction (30% default) of the body; in ``'v'`` / ``'m'`` /
+        ``'pc'`` it spans the full body height. If
+        ``_list_pane_height_safe`` cached or hard-coded the 'h' geometry,
+        cursor-snap (and pgup/pgdn) would land at the wrong scroll
+        position immediately after a layout switch.
+        """
+        b = self._browser_with_n_items(200)
+        _state.term_size = lambda: (80, 40)
+        _state.layout_panes = _render.layout_panes
+        try:
+            # 'h' default: list is 30% of 40 = 12 rows. Snap row 50 from
+            # scroll=0 → 50 - 12 + 1 = 39.
+            b.set_split('h')
+            b._list_scroll = 0
+            b._snap_list_scroll_to_row(50)
+            self.assertEqual(b._list_scroll, 39,
+                             "snap in 'h' must use 12-row list pane")
+
+            # Switch to 'v': list spans the full 39-row body. Snap row
+            # 50 from scroll=0 → 50 - 39 + 1 = 12.
+            b.set_split('v')
+            b._list_scroll = 0
+            b._snap_list_scroll_to_row(50)
+            self.assertEqual(b._list_scroll, 12,
+                             "snap after switch to 'v' must use the new "
+                             "(taller) list pane height")
+
+            # Switch back to 'h': scroll math reverts to 12-row list.
+            b.set_split('h')
+            b._list_scroll = 0
+            b._snap_list_scroll_to_row(50)
+            self.assertEqual(b._list_scroll, 39,
+                             "snap after switching back to 'h' must use "
+                             "the 12-row list pane again")
+
+            # 'm' and 'pc' also span full body; sanity-check both.
+            for code in ('m', 'pc'):
+                b.set_split(code)
+                b._list_scroll = 0
+                b._snap_list_scroll_to_row(50)
+                self.assertEqual(
+                    b._list_scroll, 12,
+                    f"snap in {code!r} must use the full-body list pane",
+                )
+        finally:
+            del _state.term_size
+            del _state.layout_panes
+            b.stop_workers()
+
+    def test_pgdn_page_size_tracks_layout_switch(self):
+        """Regression: ``pgdn`` jump distance must reflect the current
+        layout's list-pane height, not a stale value from the previous
+        split. Companion to ``test_snap_uses_current_layout_after_split_switch``;
+        both flow through ``_list_pane_height`` (actions) /
+        ``_list_pane_height_safe`` (state) which read ``browser.split``
+        live.
+        """
+        b = self._browser_with_n_items(200)
+        # Wire term_size + layout_panes onto _actions so _list_pane_height
+        # uses the real geometry (matches TestPageSizesTrackTerminalHeight).
+        _actions.term_size = lambda: (80, 40)
+        _actions.layout_panes = _render.layout_panes
+        try:
+            b.set_split('h')
+            self.assertEqual(_actions._list_pane_height(b), 12,
+                             "h: 30%% of 40 rows = 12")
+
+            b.set_split('v')
+            self.assertEqual(_actions._list_pane_height(b), 39,
+                             "v: list pane spans the full body height")
+
+            b.set_split('m')
+            self.assertEqual(_actions._list_pane_height(b), 39,
+                             "m: list pane spans the full body height")
+
+            b.set_split('pc')
+            self.assertEqual(_actions._list_pane_height(b), 39,
+                             "pc: list pane spans the full body height")
+
+            b.set_split('h')
+            self.assertEqual(_actions._list_pane_height(b), 12,
+                             "back to h: 12-row list pane again")
+        finally:
+            del _actions.term_size
+            del _actions.layout_panes
             b.stop_workers()
 
     def test_active_list_row_normal_mode_returns_cursor(self):
@@ -1729,7 +2101,7 @@ class TestShrinkGrowList(unittest.TestCase):
             layout = _render.layout_panes(
                 cols, rows, show_preview=True, list_ratio=b.list_ratio,
             )
-            self.assertGreaterEqual(layout['list_height'], 1)
+            self.assertGreaterEqual(layout['list'].height, 1)
         finally:
             b.stop_workers()
 
@@ -1744,7 +2116,7 @@ class TestShrinkGrowList(unittest.TestCase):
             layout = _render.layout_panes(
                 cols, rows, show_preview=True, list_ratio=b.list_ratio,
             )
-            self.assertGreaterEqual(layout['prev_height'], 2)
+            self.assertGreaterEqual(layout['preview'].height, 2)
         finally:
             b.stop_workers()
 
@@ -1805,8 +2177,68 @@ class TestShrinkGrowList(unittest.TestCase):
             big = _render.layout_panes(80, 200, show_preview=True,
                                        list_ratio=ratio)
             # 0.40 ratio → 50 rows = 20 list, 200 rows = 80 list.
-            self.assertEqual(small['list_height'], int(50 * ratio))
-            self.assertEqual(big['list_height'], int(200 * ratio))
+            self.assertEqual(small['list'].height, int(50 * ratio))
+            self.assertEqual(big['list'].height, int(200 * ratio))
+        finally:
+            b.stop_workers()
+
+    # ---- axis-aware resize (#166) ------------------------------------
+
+    def test_resize_list_uses_rows_in_horizontal(self):
+        # Regression: in layout 'h' the resize step is computed from
+        # rows (list height vs preview content height) and the new
+        # ratio is new_list_h / rows.
+        b = _make_browser(list_ratio=0.50, split='h')
+        try:
+            ctx = _ctx_for(b)
+            # 80×100, ratio 0.50 → list_h=50, prev=50 (sep+49 content).
+            # Step = (min(50,49)//5)+1 = 10. Shrink → 50→40 → 0.40.
+            _actions._shrink_list(ctx)
+            self.assertAlmostEqual(b.list_ratio, 0.40, places=4)
+        finally:
+            b.stop_workers()
+
+    def test_resize_list_uses_cols_in_vertical(self):
+        # In layout 'v' the primary axis is cols. With cols=80, ratio
+        # 0.50 → list_w=40, sep_main=1, preview_w=39. Step =
+        # (min(40,39)//5)+1 = 8. Shrink → 40→32 → ratio 32/80 = 0.40.
+        b = _make_browser(list_ratio=0.50, split='v')
+        try:
+            ctx = _ctx_for(b)
+            _actions._shrink_list(ctx)
+            self.assertAlmostEqual(b.list_ratio, 0.40, places=4)
+        finally:
+            b.stop_workers()
+
+    def test_resize_list_uses_cols_in_mixed(self):
+        # Same col-based math for layout 'm': list_w=40, preview_w=39,
+        # step=8. Shrink → 40→32 → ratio 0.40.
+        b = _make_browser(list_ratio=0.50, split='m')
+        try:
+            ctx = _ctx_for(b)
+            _actions._shrink_list(ctx)
+            self.assertAlmostEqual(b.list_ratio, 0.40, places=4)
+        finally:
+            b.stop_workers()
+
+    def test_resize_list_uses_cols_in_preview_children(self):
+        # Same col-based math for layout 'pc'.
+        b = _make_browser(list_ratio=0.50, split='pc')
+        try:
+            ctx = _ctx_for(b)
+            _actions._shrink_list(ctx)
+            self.assertAlmostEqual(b.list_ratio, 0.40, places=4)
+        finally:
+            b.stop_workers()
+
+    def test_grow_list_uses_cols_in_vertical(self):
+        # Symmetric grow in 'v': start at 0.30 → list_w=24, preview_w=55.
+        # step = (min(24,55)//5)+1 = 5. Grow → 24→29 → 29/80 = 0.3625.
+        b = _make_browser(list_ratio=0.30, split='v')
+        try:
+            ctx = _ctx_for(b)
+            _actions._grow_list(ctx)
+            self.assertAlmostEqual(b.list_ratio, 29 / 80.0, places=4)
         finally:
             b.stop_workers()
 
@@ -1848,6 +2280,193 @@ class TestSetListRatio(unittest.TestCase):
             self.assertAlmostEqual(b.list_ratio, 0.30)
         finally:
             b.stop_workers()
+
+
+class TestLayoutSplitActions(unittest.TestCase):
+    """Alt-1..4 set ``browser.split`` directly; ``\\`` cycles v→h→m→pc→v.
+
+    All five handlers route through ``Browser.set_split``, which clamps
+    invalid values and adds ``'all'`` to ``_needs_redraw`` — so the tests
+    exercise both the state mutation and the redraw flag.
+    """
+
+    def test_set_layout_v_updates_browser_split(self):
+        b = _make_browser(split='h')
+        try:
+            ctx = _ctx_for(b)
+            b._needs_redraw.clear()
+            _actions._set_layout_v(ctx)
+            self.assertEqual(b.split, 'v')
+            self.assertIn('all', b._needs_redraw)
+        finally:
+            b.stop_workers()
+
+    def test_set_layout_h_updates_browser_split(self):
+        b = _make_browser(split='v')
+        try:
+            ctx = _ctx_for(b)
+            b._needs_redraw.clear()
+            _actions._set_layout_h(ctx)
+            self.assertEqual(b.split, 'h')
+            self.assertIn('all', b._needs_redraw)
+        finally:
+            b.stop_workers()
+
+    def test_set_layout_m_updates_browser_split(self):
+        b = _make_browser(split='h')
+        try:
+            ctx = _ctx_for(b)
+            b._needs_redraw.clear()
+            _actions._set_layout_m(ctx)
+            self.assertEqual(b.split, 'm')
+            self.assertIn('all', b._needs_redraw)
+        finally:
+            b.stop_workers()
+
+    def test_set_layout_pc_updates_browser_split(self):
+        b = _make_browser(split='h')
+        try:
+            ctx = _ctx_for(b)
+            b._needs_redraw.clear()
+            _actions._set_layout_pc(ctx)
+            self.assertEqual(b.split, 'pc')
+            self.assertIn('all', b._needs_redraw)
+        finally:
+            b.stop_workers()
+
+    def test_cycle_layout_cycles_in_order(self):
+        # Starting at 'v', four cycles should return: h, m, pc, v.
+        b = _make_browser(split='v')
+        try:
+            ctx = _ctx_for(b)
+            seq = []
+            for _ in range(4):
+                _actions._cycle_layout(ctx)
+                seq.append(b.split)
+            self.assertEqual(seq, ['h', 'm', 'pc', 'v'])
+        finally:
+            b.stop_workers()
+
+    def test_cycle_layout_from_each_starting_point(self):
+        # Symmetry check: every layout, when cycled once, lands on the
+        # documented next one.
+        next_of = {'v': 'h', 'h': 'm', 'm': 'pc', 'pc': 'v'}
+        for start, expected in next_of.items():
+            b = _make_browser(split=start)
+            try:
+                ctx = _ctx_for(b)
+                _actions._cycle_layout(ctx)
+                self.assertEqual(
+                    b.split, expected,
+                    f'{start!r} should cycle to {expected!r}, got {b.split!r}',
+                )
+            finally:
+                b.stop_workers()
+
+    def test_cycle_layout_from_unknown_state_falls_back(self):
+        # Defensive: if browser.split somehow holds a value outside the
+        # cycle (set_split clamps inputs, but tests can poke directly),
+        # cycle should land on the first entry rather than raise.
+        b = _make_browser()
+        try:
+            ctx = _ctx_for(b)
+            b.split = 'bogus'  # bypass set_split's clamp on purpose
+            _actions._cycle_layout(ctx)
+            self.assertEqual(b.split, _actions._LAYOUT_CYCLE[0])
+        finally:
+            b.stop_workers()
+
+    def test_layout_keys_all_bound(self):
+        keys = {a.key: a for a in default_actions()}
+        self.assertIs(keys['\\'].handler, _actions._cycle_layout)
+        self.assertIs(keys['alt-1'].handler, _actions._set_layout_v)
+        self.assertIs(keys['alt-2'].handler, _actions._set_layout_h)
+        self.assertIs(keys['alt-3'].handler, _actions._set_layout_m)
+        self.assertIs(keys['alt-4'].handler, _actions._set_layout_pc)
+
+    def test_dispatch_alt_1_sets_layout_v(self):
+        b = _make_browser(split='h')
+        try:
+            ctx = _ctx_for(b)
+            self.assertTrue(dispatch_key(b, ctx, 'alt-1'))
+            self.assertEqual(b.split, 'v')
+        finally:
+            b.stop_workers()
+
+    def test_dispatch_alt_2_sets_layout_h(self):
+        b = _make_browser(split='v')
+        try:
+            ctx = _ctx_for(b)
+            self.assertTrue(dispatch_key(b, ctx, 'alt-2'))
+            self.assertEqual(b.split, 'h')
+        finally:
+            b.stop_workers()
+
+    def test_dispatch_alt_3_sets_layout_m(self):
+        b = _make_browser(split='h')
+        try:
+            ctx = _ctx_for(b)
+            self.assertTrue(dispatch_key(b, ctx, 'alt-3'))
+            self.assertEqual(b.split, 'm')
+        finally:
+            b.stop_workers()
+
+    def test_dispatch_alt_4_sets_layout_pc(self):
+        b = _make_browser(split='h')
+        try:
+            ctx = _ctx_for(b)
+            self.assertTrue(dispatch_key(b, ctx, 'alt-4'))
+            self.assertEqual(b.split, 'pc')
+        finally:
+            b.stop_workers()
+
+    def test_dispatch_backslash_cycles_layout(self):
+        b = _make_browser(split='v')
+        try:
+            ctx = _ctx_for(b)
+            self.assertTrue(dispatch_key(b, ctx, '\\'))
+            self.assertEqual(b.split, 'h')
+        finally:
+            b.stop_workers()
+
+
+class TestAltDigitParsing(unittest.TestCase):
+    """``read_key`` (020-terminal) maps ``ESC + 'N'`` → ``'alt-N'``.
+
+    The Alt-1..4 layout keybindings rely on this Meta-prefix encoding —
+    if it ever regressed, the layout-switch keys would silently stop
+    routing. Pin the contract here so the link is explicit.
+    """
+
+    def _read_key_from_bytes(self, payload: bytes) -> str:
+        # ``read_key`` reads from ``sys.stdin.fileno()`` directly; a pipe
+        # dup'd over fd 0 is the simplest way to feed canned bytes
+        # through the production parser without monkey-patching the
+        # module's internals.
+        import sys
+        r, w = os.pipe()
+        os.write(w, payload)
+        os.close(w)
+        saved_stdin_fd = os.dup(0)
+        try:
+            os.dup2(r, 0)
+            # ``sys.stdin`` caches the underlying fd object; clear any
+            # buffered state by ensuring we read via fileno() (read_key
+            # uses os.read on the bare fd, so the cache is irrelevant).
+            return _term.read_key()
+        finally:
+            os.dup2(saved_stdin_fd, 0)
+            os.close(saved_stdin_fd)
+            try:
+                os.close(r)
+            except OSError:
+                pass
+
+    def test_alt_digit_parsing(self):
+        for digit in ('1', '2', '3', '4'):
+            with self.subTest(digit=digit):
+                key = self._read_key_from_bytes(b'\x1b' + digit.encode())
+                self.assertEqual(key, 'alt-' + digit)
 
 
 if __name__ == '__main__':

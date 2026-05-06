@@ -55,6 +55,22 @@ def clear_line():
     """Erase the entire current line."""
     write('\033[2K')
 
+def clear_columns(row, left, right):
+    """Clear columns ``left`` through ``right - 1`` (inclusive/exclusive) on ``row``.
+
+    Mirrors the Rect convention used by the render layer (``right`` is
+    exclusive). Emits a cursor move and a single space-fill — that's
+    cheaper than scoped ``\\033[K`` variants when the column range is
+    small and avoids clobbering content in adjacent panes.
+
+    No-op when the range is empty (``right <= left``).
+    """
+    width = right - left
+    if width <= 0:
+        return
+    move(row, left)
+    write(' ' * width)
+
 def set_scroll_region(top, bottom):
     """Set the scrolling region to rows top..bottom (1-based, inclusive)."""
     write(f'\033[{top};{bottom}r')
@@ -89,9 +105,27 @@ def reset_style():
 # ---- terminal size --------------------------------------------------------
 
 def term_size():
-    """Return (cols, rows) tuple for the current terminal."""
-    sz = os.get_terminal_size()
-    return (sz.columns, sz.lines)
+    """Return (cols, rows) tuple for the current terminal.
+
+    Tries each std fd in turn, then /dev/tty, so the function works even
+    when stdin/stdout/stderr are pipes. Falls back to (80, 24) if all
+    probes fail.
+    """
+    for fd in (1, 2, 0):
+        try:
+            sz = os.get_terminal_size(fd)
+            if sz.columns > 0 and sz.lines > 0:
+                return (sz.columns, sz.lines)
+        except OSError:
+            pass
+    try:
+        with open('/dev/tty') as _tty:
+            sz = os.get_terminal_size(_tty.fileno())
+            if sz.columns > 0 and sz.lines > 0:
+                return (sz.columns, sz.lines)
+    except OSError:
+        pass
+    return (80, 24)
 
 # ---- signal handlers ------------------------------------------------------
 

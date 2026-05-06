@@ -555,6 +555,35 @@ def _clamp_list_ratio(r: float) -> float:
     return f
 
 
+# Valid split-layout codes recognised by ``layout_panes`` (050-render.py).
+# Mirrors the four families described there:
+#   'h'  — horizontal stack (list / children / preview, info bar in
+#          the topmost active separator). Historic default.
+#   'v'  — vertical side-by-side (list | children | preview).
+#   'm'  — mixed: list+children stacked left, preview right.
+#   'pc' — list left, children+preview stacked right.
+# CLI parsing also accepts ``'a'`` (auto) but resolves it to one of the
+# above before reaching Browser, so the runtime state is always one of
+# these four.
+_VALID_SPLITS = ('v', 'h', 'm', 'pc')
+
+
+def _clamp_split(s) -> str:
+    """Validate ``s`` against ``_VALID_SPLITS``. Unknown / non-string → 'h'.
+
+    Defensive: handles ``None`` and non-string values by falling back to
+    the historic default ``'h'``. The CLI parser is responsible for
+    resolving the ``'a'`` (auto) shorthand before it reaches this
+    function — we treat ``'a'`` as invalid so a stale value doesn't slip
+    into Browser state.
+    """
+    if not isinstance(s, str):
+        return 'h'
+    if s in _VALID_SPLITS:
+        return s
+    return 'h'
+
+
 class Browser:
     """The TUI engine and async coordinator.
 
@@ -610,6 +639,7 @@ class Browser:
                  show_preview: bool = True,
                  show_children_pane: bool = True,
                  list_ratio: float = 0.30,
+                 split: str = 'h',
                  multi_select: bool = True,
                  print_format: str = '{id}',
                  help_intro: Optional[str] = None,
@@ -699,6 +729,14 @@ class Browser:
         # the model: children pane stays content-driven, preview gets
         # the remainder.
         self.list_ratio = _clamp_list_ratio(list_ratio)
+        # Split-layout selector — controls which family of pane geometries
+        # ``layout_panes`` produces (see ``_VALID_SPLITS`` and the
+        # 050-render layout helpers). Defaults to ``'h'`` so existing
+        # recipes / tests that don't pass ``split=`` keep the historic
+        # horizontal-stack behaviour. Hotkey + CLI plumbing lands in
+        # later tickets (#150, #151); for now this is a passive state
+        # bit that the layout call sites consult.
+        self.split = _clamp_split(split)
         self.multi_select = multi_select
         self.print_format = print_format
         # help_intro/help_outro are prose blurbs shown above/below the
@@ -953,6 +991,19 @@ class Browser:
         guardrail, not the live floor.
         """
         self.list_ratio = _clamp_list_ratio(ratio)
+        self._needs_redraw.add('all')
+
+    def set_split(self, s: str) -> None:
+        """Set the split-layout selector (clamped to ``_VALID_SPLITS``).
+
+        Invalid values (unknown codes, non-strings, ``None``) fall back
+        to the historic default ``'h'``. Mirrors ``set_list_ratio``: the
+        clamp is a guardrail, not a live floor — the layout helpers in
+        050-render produce sane geometries even at degenerate sizes.
+        Marks the full screen for redraw so the next render pass picks
+        up the new layout family.
+        """
+        self.split = _clamp_split(s)
         self._needs_redraw.add('all')
 
     def select(self, ids, replace: bool = False) -> None:
@@ -1594,11 +1645,15 @@ class Browser:
             cols, rows = ts()
             layout = lp(
                 cols, rows,
+                split=self.split,
                 show_preview=self.show_preview,
                 show_children_pane=self.show_children_pane,
                 list_ratio=self.list_ratio,
             )
-            h = layout.get('list_height', 0)
+            list_rect = layout.get('list')
+            if list_rect is None:
+                return 0
+            h = list_rect.height
             return h if h > 0 else 0
         except Exception:
             return 0

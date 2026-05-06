@@ -710,9 +710,17 @@ def _resize_list(ctx, *, direction):
     """Shared implementation for ``-`` / ``=``.
 
     Reads the current layout to determine pane sizes, computes the
-    step, applies the new list height, and converts back to a ratio
-    so terminal resizes preserve the user's choice. Headless / unwired
+    step, applies the new list size, and converts back to a ratio so
+    terminal resizes preserve the user's choice. Headless / unwired
     contexts fall back gracefully (silent no-op).
+
+    Axis-aware (#166): in the horizontal layout (``'h'``) the resize
+    nudges the list HEIGHT in rows; in the vertical / mixed /
+    preview-children layouts (``'v'``, ``'m'``, ``'pc'``) the primary
+    split axis is columns, so the resize nudges the list WIDTH in cols
+    instead. ``list_ratio`` is interpreted by the layout helpers as
+    "ratio along the primary split axis", so the conversion back to a
+    ratio uses ``cols`` instead of ``rows`` for those layouts.
     """
     browser = ctx._browser
     if not browser.show_preview:
@@ -725,38 +733,125 @@ def _resize_list(ctx, *, direction):
         cols, rows = ts()
     except Exception:
         return
+    split = getattr(browser, 'split', 'h')
     layout = lp(
         cols, rows,
+        split=split,
         show_preview=True,
         show_children_pane=browser.show_children_pane,
         list_ratio=browser.list_ratio,
     )
-    list_h = layout['list_height']
-    sub_h = layout['sub_height']
-    # ``prev_height`` includes the separator row; the user-visible
-    # preview content is one less.
-    prev_content = max(0, layout['prev_height'] - 1)
-    step = _resize_step(list_h, prev_content)
-    new_list_h = list_h + direction * step
-    # Clamp: at least 1 list row, and leave room for sub + preview min
-    # (separator + 1 content) when the terminal has the room.
-    if new_list_h < 1:
-        new_list_h = 1
-    max_list = rows - sub_h - 2  # sep + 1 content
-    if max_list < 1:
-        max_list = max(1, rows - sub_h - 1)
-    if new_list_h > max_list:
-        new_list_h = max_list
-    if new_list_h == list_h:
-        return  # at the boundary; nothing to do
-    browser.list_ratio = new_list_h / float(rows)
+    list_rect = layout['list']
+    preview_rect = layout.get('preview')
+
+    if split == 'h':
+        # Primary axis is rows. Resize list HEIGHT.
+        children_rect = layout.get('children')
+        list_h = list_rect.height
+        sub_h = children_rect.height if children_rect is not None else 0
+        # The preview Rect's first row IS the separator (in layout 'h');
+        # user-visible content is height - 1.
+        prev_total = preview_rect.height if preview_rect is not None else 0
+        prev_content = max(0, prev_total - 1)
+        step = _resize_step(list_h, prev_content)
+        new_list_h = list_h + direction * step
+        if new_list_h < 1:
+            new_list_h = 1
+        max_list = rows - sub_h - 2  # sep + 1 content
+        if max_list < 1:
+            max_list = max(1, rows - sub_h - 1)
+        if new_list_h > max_list:
+            new_list_h = max_list
+        if new_list_h == list_h:
+            return  # at the boundary; nothing to do
+        new_ratio = new_list_h / float(rows)
+    else:
+        # Primary axis is cols (layouts 'v', 'm', 'pc'). Resize list
+        # WIDTH. The layout helpers reserve 1 col for sep_main and at
+        # least 1 col of preview content on the right; mirror that
+        # clamp here so the stored ratio is always realisable.
+        list_w = list_rect.width
+        prev_total_w = preview_rect.width if preview_rect is not None else 0
+        # No separator-row deduction in col-based layouts: sep_main is
+        # its own 1-col Rect and preview.width is content cols.
+        prev_content_w = max(0, prev_total_w)
+        step = _resize_step(list_w, prev_content_w)
+        new_list_w = list_w + direction * step
+        if new_list_w < 1:
+            new_list_w = 1
+        # Reserve 1 col for sep_main and 1 col for preview content.
+        max_list_w = cols - 2
+        if max_list_w < 1:
+            max_list_w = 1
+        if new_list_w > max_list_w:
+            new_list_w = max_list_w
+        if new_list_w == list_w:
+            return  # at the boundary; nothing to do
+        new_ratio = new_list_w / float(cols)
+
+    browser.list_ratio = new_ratio
     # Clamp ratio into [_LIST_RATIO_MIN, _LIST_RATIO_MAX]; the layout
-    # already enforces visible-row floors, but the stored ratio must
+    # already enforces visible minimums, but the stored ratio must
     # stay sane for future resizes.
     clamp = globals().get('_clamp_list_ratio')
     if clamp is not None:
         browser.list_ratio = clamp(browser.list_ratio)
     browser._needs_redraw.add('all')
+
+
+# ---- layout split selection -----------------------------------------------
+#
+# Five actions select / cycle between the four split layouts produced by
+# ``layout_panes`` in 050-render. ``Browser.set_split`` (040-state) clamps
+# unknown values back to ``'h'`` and adds ``'all'`` to ``_needs_redraw``, so
+# the handlers can stay one-liners — no need to re-add ``'all'`` here.
+#
+# Alt-N keybindings rely on ``read_key`` (020-terminal) emitting ``'alt-1'``
+# … ``'alt-4'`` for ``ESC + '1'`` … ``ESC + '4'``: the standard "Meta-prefix"
+# encoding used by alacritty, kitty, gnome-terminal, iTerm2, xterm and
+# vt100-class emulators by default. Terminals running with xterm's
+# ``modifyOtherKeys`` (e.g. ``CSI 27;3;49~`` style) or kitty's full keyboard
+# protocol won't hit this path — for those we fall back to ``\`` (cycle),
+# which has no modifier and is universally reachable.
+
+_LAYOUT_CYCLE = ('v', 'h', 'm', 'pc')
+
+
+def _set_layout_v(ctx):
+    """Alt-1 — vertical split (list left, preview right)."""
+    ctx._browser.set_split('v')
+
+
+def _set_layout_h(ctx):
+    """Alt-2 — horizontal split (list top, preview bottom)."""
+    ctx._browser.set_split('h')
+
+
+def _set_layout_m(ctx):
+    """Alt-3 — mixed split (children pane + preview)."""
+    ctx._browser.set_split('m')
+
+
+def _set_layout_pc(ctx):
+    """Alt-4 — preview-children split."""
+    ctx._browser.set_split('pc')
+
+
+def _cycle_layout(ctx):
+    """``\\`` — cycle through layouts in order ``v → h → m → pc → v``.
+
+    The cycle list is the canonical ordering documented in the Alt-N
+    bindings. If ``browser.split`` somehow holds a value outside the
+    cycle (defensive — ``set_split`` clamps inputs) we fall back to the
+    first entry so the next press lands on a known layout.
+    """
+    cur = getattr(ctx._browser, 'split', 'h')
+    try:
+        idx = _LAYOUT_CYCLE.index(cur)
+        nxt = _LAYOUT_CYCLE[(idx + 1) % len(_LAYOUT_CYCLE)]
+    except ValueError:
+        nxt = _LAYOUT_CYCLE[0]
+    ctx._browser.set_split(nxt)
 
 
 # ---- default keybindings list ---------------------------------------------
@@ -806,6 +901,22 @@ def default_actions() -> list:
         Action('_',          'Shrink list pane',         _shrink_list,         'none', 'PREVIEW'),
         Action('=',          'Grow list pane',           _grow_list,           'none', 'PREVIEW'),
         Action('+',          'Grow list pane',           _grow_list,           'none', 'PREVIEW'),
+        # Layout split selection. Alt-1..4 jump directly to a layout; ``\``
+        # cycles in canonical order (v → h → m → pc → v). The Alt-N bindings
+        # rely on the ``ESC + digit`` Meta-prefix encoding (see notes near
+        # ``_set_layout_v`` for terminal coverage); ``\`` is the universally
+        # reachable fallback for terminals that swallow Alt-modified keys.
+        # The four alt-N direct-jump bindings carry an empty ``label``
+        # so the help composer (050-render._format_help_section) skips
+        # them — their meaning is folded into the ``\`` line below to
+        # keep the help screen compact (see #163). The bindings remain
+        # fully functional in the dispatcher; they just don't take five
+        # lines of help-screen real estate apiece.
+        Action('\\',         '\\ / alt-1..4: cycle layouts (v/h/m/pc) or jump direct', _cycle_layout, 'none', 'PREVIEW'),
+        Action('alt-1',      '', _set_layout_v,  'none', 'PREVIEW'),
+        Action('alt-2',      '', _set_layout_h,  'none', 'PREVIEW'),
+        Action('alt-3',      '', _set_layout_m,  'none', 'PREVIEW'),
+        Action('alt-4',      '', _set_layout_pc, 'none', 'PREVIEW'),
         # Search.
         Action('/',         'Enter search mode', _search_start, 'none', 'SEARCH'),
         # Multi-select bindings. ``read_key`` returns ``'space'`` for the
@@ -1139,11 +1250,13 @@ def _list_pane_height(browser):
         cols, rows = term_size()
         layout = layout_panes(
             cols, rows,
+            split=getattr(browser, 'split', 'h'),
             show_preview=browser.show_preview,
             show_children_pane=browser.show_children_pane,
             list_ratio=getattr(browser, 'list_ratio', 0.30),
         )
-        h = layout['list_height']
+        list_rect = layout.get('list')
+        h = list_rect.height if list_rect is not None else 0
         return h if h > 0 else _DEFAULT_PAGE_ROWS
     except Exception:
         return _DEFAULT_PAGE_ROWS
@@ -1163,11 +1276,14 @@ def _preview_pane_height(browser):
         cols, rows = term_size()
         layout = layout_panes(
             cols, rows,
+            split=getattr(browser, 'split', 'h'),
             show_preview=browser.show_preview,
             show_children_pane=browser.show_children_pane,
             list_ratio=getattr(browser, 'list_ratio', 0.30),
         )
-        h = layout['prev_height'] - 1  # exclude separator row
+        preview_rect = layout.get('preview')
+        prev_total = preview_rect.height if preview_rect is not None else 0
+        h = prev_total - 1  # exclude separator row
         return h if h > 0 else _DEFAULT_PAGE_ROWS
     except Exception:
         return _DEFAULT_PAGE_ROWS
@@ -1199,8 +1315,37 @@ def _preview_pane_height(browser):
 _WHEEL_LINES = 3
 
 
+def _cursor_item_for_dispatch(browser):
+    """Return the Item under the cursor for dispatch's layout sizing.
+
+    Mirrors render.py's ``_cursor_item`` (only ``kind='normal'`` rows
+    have an Item). Returns ``None`` for placeholder / scope-root rows
+    or when the visible list is empty. The dispatcher uses this only
+    to size the children grid when computing the layout for hit-testing
+    — a None result simply collapses the grid the same way it does in
+    the renderer.
+    """
+    state = browser._state
+    vis = visible_items(state)
+    cur = state.cursor
+    if not (0 <= cur < len(vis)):
+        return None
+    entry = vis[cur]
+    if entry.kind != 'normal':
+        return None
+    return entry.item
+
+
 def _dispatch_mouse(browser, ctx, key):
     """Route a mouse event ``key`` to the pane it lands on.
+
+    The event payload is ``kind:R:C`` (1-based). We resolve the layout
+    via the injected ``layout_panes`` helper and walk panes in defined
+    order — ``list``, ``children``, ``preview``, ``info_bar`` — picking
+    the first whose Rect contains ``(row, col)``. This is correct for
+    all four layout families (h/v/m/pc): the row-only hit-test that
+    pre-#152 used assumed full-width panes, which only holds for layout
+    'h'.
 
     Always returns ``True`` (the event has been consumed). Malformed
     payloads, or contexts where the pane geometry can't be resolved
@@ -1213,6 +1358,7 @@ def _dispatch_mouse(browser, ctx, key):
     kind = parts[0]
     try:
         row = int(parts[1])
+        col = int(parts[2])
     except ValueError:
         return True
 
@@ -1224,13 +1370,41 @@ def _dispatch_mouse(browser, ctx, key):
         cols, rows_total = ts()
     except Exception:
         return True
+    # Match the rendered layout exactly: the children grid sizes itself
+    # from the cursor item's cached children (see ``_layout_for`` in
+    # 050-render). The dispatcher must use the same children_rows_needed
+    # so a click on a column the user can see actually routes to the
+    # pane that's drawn there. Falling back to 0 (no children) matches
+    # the conservative pre-#152 behaviour for headless tests where the
+    # render helpers aren't injected.
+    children_rows_needed = 0
+    if browser.show_children_pane:
+        cur_item = _cursor_item_for_dispatch(browser)
+        if cur_item is not None and getattr(cur_item, 'has_children', False):
+            cached = browser._state._children.get(cur_item.id)
+            sub_needed = globals().get('_sub_needed_rows')
+            if cached:
+                if sub_needed is not None:
+                    try:
+                        children_rows_needed = sub_needed(
+                            cached, cols,
+                            show_ids=getattr(browser, 'show_ids', 'auto'),
+                        )
+                    except Exception:
+                        children_rows_needed = 1
+                else:
+                    children_rows_needed = 1
+            elif cached is None:
+                children_rows_needed = 1
     layout = lp(
         cols, rows_total,
+        split=getattr(browser, 'split', 'h'),
         show_preview=browser.show_preview,
         show_children_pane=browser.show_children_pane,
+        children_rows_needed=children_rows_needed,
         list_ratio=getattr(browser, 'list_ratio', 0.30),
     )
-    pane = _pane_at(layout, row)
+    pane = _pane_at(layout, row, col)
 
     if kind == 'mouse-click':
         if pane == 'list':
@@ -1239,7 +1413,7 @@ def _dispatch_mouse(browser, ctx, key):
             if browser._help_mode:
                 browser._help_mode = False
                 browser._needs_redraw.add('preview')
-        # children grid / info row / separator → no-op
+        # children grid / info bar / separator → no-op
         return True
     if kind in ('scroll-up', 'scroll-down'):
         delta = -_WHEEL_LINES if kind == 'scroll-up' else _WHEEL_LINES
@@ -1251,25 +1425,52 @@ def _dispatch_mouse(browser, ctx, key):
     return True
 
 
-def _pane_at(layout, row):
-    """Return ``'list'``, ``'children'``, ``'preview'``, or ``None`` for ``row``.
+def _pane_at(layout, row, col):
+    """Return the pane name containing ``(row, col)``, or ``None``.
 
-    The separator rows themselves (info row, preview separator) return
-    ``None`` — clicks on dividers are deliberately no-ops.
+    Walks the panes in fixed order — ``list``, ``children``,
+    ``preview``, ``info_bar`` — and returns the first whose Rect
+    contains the point. Uses :func:`point_in_rect` from 050-render so
+    the same rect convention (inclusive-top, exclusive-right/bottom,
+    1-based) applies everywhere.
+
+    The separator rows themselves are excluded from the children /
+    preview hit-area in layout 'h' (where the pane's first row IS the
+    separator row carrying the rich info-bar decoration). The info_bar
+    Rect is returned distinctly so a click on the bottom info bar in
+    v/m/pc layouts is recognised (currently the dispatcher treats it
+    as a no-op, but recipes may want to overlay a prompt there).
     """
-    list_top = layout['list_top']
-    list_height = layout['list_height']
-    sub_top = layout['sub_top']
-    sub_height = layout['sub_height']
-    prev_top = layout['prev_top']
-    prev_height = layout['prev_height']
+    list_rect = layout.get('list')
+    children_rect = layout.get('children')
+    preview_rect = layout.get('preview')
+    info_bar = layout.get('info_bar')
 
-    if list_top <= row < list_top + list_height:
+    if point_in_rect(row, col, list_rect):
         return 'list'
-    if sub_height > 0 and sub_top + 1 <= row < sub_top + sub_height:
-        return 'children'
-    if prev_height > 0 and prev_top + 1 <= row < prev_top + prev_height:
-        return 'preview'
+    # In layout 'h' the children / preview Rect's first row IS that
+    # pane's info-bar separator (full-width); exclude it from the
+    # clickable area so clicks on the divider are no-ops. In v/m/pc
+    # layouts the info bar is its own bottom Rect and doesn't overlap
+    # with children/preview, so the +1 carve-out is harmless there.
+    if children_rect is not None and children_rect.height > 0:
+        carve = 1 if (info_bar is not None
+                      and info_bar.top == children_rect.top
+                      and info_bar.left == children_rect.left
+                      and info_bar.right == children_rect.right) else 0
+        if (children_rect.top + carve <= row < children_rect.bottom
+                and children_rect.left <= col < children_rect.right):
+            return 'children'
+    if preview_rect is not None and preview_rect.height > 0:
+        carve = 1 if (info_bar is not None
+                      and info_bar.top == preview_rect.top
+                      and info_bar.left == preview_rect.left
+                      and info_bar.right == preview_rect.right) else 0
+        if (preview_rect.top + carve <= row < preview_rect.bottom
+                and preview_rect.left <= col < preview_rect.right):
+            return 'preview'
+    if point_in_rect(row, col, info_bar):
+        return 'info_bar'
     return None
 
 
@@ -1277,7 +1478,8 @@ def _click_list_row(browser, layout, row):
     """Move ``state.cursor`` to the visible-list row at terminal ``row``."""
     state = browser._state
     visible = visible_items(state)
-    new_idx = browser._list_scroll + (row - layout['list_top'])
+    list_rect = layout['list']
+    new_idx = browser._list_scroll + (row - list_rect.top)
     if 0 <= new_idx < len(visible) and state.cursor != new_idx:
         state.cursor = new_idx
         browser._needs_redraw.add('list')

@@ -188,46 +188,48 @@ class TestLayoutPanesThreePane(unittest.TestCase):
         layout = layout_panes(80, 24, show_preview=True,
                               show_children_pane=True,
                               children_rows_needed=5)
-        self.assertGreater(layout['sub_height'], 0)
-        # sub_height = 1 (sep) + content_rows up to 30% cap.
-        self.assertEqual(layout['sub_height'], 1 + 5)
+        children = layout['children']
+        list_rect = layout['list']
+        preview = layout['preview']
+        self.assertIsNotNone(children)
+        # children.height = 1 (sep) + content_rows up to 25% cap.
+        self.assertEqual(children.height, 1 + 5)
         # Total height rows = list + grid + preview (each incl. its sep).
         self.assertEqual(
-            layout['list_height'] + layout['sub_height']
-            + layout['prev_height'],
+            list_rect.height + children.height + preview.height,
             24,
         )
-        # info_row sits on the grid's separator (the active one).
-        self.assertEqual(layout['info_row'], layout['sub_top'])
+        # info bar sits on the grid's separator (the active one).
+        self.assertEqual(layout['info_bar'].top, children.top)
 
     def test_grid_hidden_when_no_children(self):
         layout = layout_panes(80, 24, show_preview=True,
                               show_children_pane=True,
                               children_rows_needed=0)
-        self.assertEqual(layout['sub_height'], 0)
-        # info_row falls back to the preview separator.
-        self.assertEqual(layout['info_row'], layout['prev_top'])
+        self.assertIsNone(layout['children'])
+        # info bar falls back to the preview separator.
+        self.assertEqual(layout['info_bar'].top, layout['preview'].top)
 
     def test_grid_hidden_when_terminal_too_small(self):
         # rows < 20 hides the grid even if children are requested.
         layout = layout_panes(80, 18, show_preview=True,
                               show_children_pane=True,
                               children_rows_needed=10)
-        self.assertEqual(layout['sub_height'], 0)
+        self.assertIsNone(layout['children'])
 
     def test_no_children_pane_kwarg_hides_grid(self):
         layout = layout_panes(80, 40, show_preview=True,
                               show_children_pane=False,
                               children_rows_needed=5)
-        self.assertEqual(layout['sub_height'], 0)
+        self.assertIsNone(layout['children'])
 
-    def test_grid_capped_at_30_percent(self):
-        # 40-row terminal: 30% cap = 12 rows. Request 100 children rows;
-        # the grid should top out at 12.
+    def test_grid_capped_at_25_percent(self):
+        # 40-row terminal: 25% cap = 10 rows. Request 100 children rows;
+        # the grid should top out at 10.
         layout = layout_panes(80, 40, show_preview=True,
                               show_children_pane=True,
                               children_rows_needed=100)
-        self.assertEqual(layout['sub_height'], 12)
+        self.assertEqual(layout['children'].height, 10)
 
     def test_show_preview_false_suppresses_grid(self):
         # When the preview is hidden, the grid is also suppressed —
@@ -235,9 +237,9 @@ class TestLayoutPanesThreePane(unittest.TestCase):
         layout = layout_panes(80, 40, show_preview=False,
                               show_children_pane=True,
                               children_rows_needed=5)
-        self.assertEqual(layout['sub_height'], 0)
-        self.assertEqual(layout['prev_height'], 0)
-        self.assertEqual(layout['info_row'], 40)
+        self.assertIsNone(layout['children'])
+        self.assertIsNone(layout['preview'])
+        self.assertEqual(layout['info_bar'].top, 40)
 
 
 # ---------------------------------------------------------------------------

@@ -478,6 +478,13 @@ def build_argparser() -> argparse.ArgumentParser:
                         'resizes) or a percentage with a trailing %% '
                         '(e.g. 30%%). Default: 30%% of rows. Adjustable '
                         'at runtime with - / _ (shrink) and = / + (grow).')
+    p.add_argument('--split-type', metavar='TYPE', default='auto',
+                   help='Initial layout split type. Values: '
+                        'h|horizontal, v|vertical, m|mixed, '
+                        'pc|preview-children, a|auto (default). auto '
+                        'picks vertical if terminal is at least 230 '
+                        'columns wide, else horizontal. Resolved at '
+                        'startup; not auto-recomputed on resize.')
     p.add_argument('--show-ids', metavar='MODE', default='auto',
                    choices=('always', 'auto', 'never'),
                    help='Whether to render the per-row id before the '
@@ -1122,6 +1129,180 @@ def _resolve_list_size(spec, default=0.30):
     return max(0.001, min(0.999, lines / float(rows)))
 
 
+# ---- --split-type resolution ---------------------------------------------
+#
+# The CLI flag accepts long-forms (``horizontal``, ``vertical``, ``mixed``,
+# ``preview-children``, ``auto``) and their short codes (``h``, ``v``,
+# ``m``, ``pc``, ``a``). ``auto`` is resolved at startup by terminal width:
+# wide terminals (>=230 cols) get the vertical side-by-side layout, narrow
+# ones get the historic horizontal stack. Resolution is one-shot; later
+# resizes do NOT re-pick — the user can switch interactively.
+
+_SPLIT_ALIASES = {
+    'h': 'h', 'horizontal': 'h',
+    'v': 'v', 'vertical': 'v',
+    'm': 'm', 'mixed': 'm',
+    'pc': 'pc', 'preview-children': 'pc',
+    'a': 'a', 'auto': 'a',
+}
+
+
+def _terminal_cols_for_auto(default=80):
+    """Best-effort terminal width for ``--split-type=auto`` resolution.
+
+    Order of attempts (each is checked for ``cols > 0`` before being
+    accepted — a zero return from the OS is as good as a failure):
+
+    1. ``/dev/tty`` via ``TIOCGWINSZ`` — works even when stdin AND
+       stdout are both pipes (e.g.
+       ``printf … | browse-tui --root-cmd cat | cat``), because the
+       controlling terminal is independent of the standard streams.
+       This is the only source that reliably reflects the real
+       interactive terminal in piped scenarios.
+    2. Each of the three standard fds (stdin, stdout, stderr) via
+       ``os.get_terminal_size(fd)`` — covers cases where /dev/tty
+       isn't openable but at least one std stream is still a TTY
+       (e.g. some sandboxed / containerised environments where
+       /dev/tty is restricted).
+    3. ``shutil.get_terminal_size()`` — honours ``$COLUMNS`` /
+       ``$LINES`` and runs its own fd-fallback chain.
+    4. ``stty size`` via subprocess against ``/dev/tty`` — last-resort
+       external probe; some restricted environments expose tty info
+       via stty even when ioctl is filtered.
+    5. ``default`` (80) — last resort. Auto then resolves to
+       horizontal, which is the safer choice for a narrow display.
+
+    Set ``BROWSE_TUI_DEBUG_AUTO=1`` in the environment to print a
+    one-line trace of which probes succeeded / failed (and the value
+    finally chosen) to stderr — handy when diagnosing a wrong split
+    pick on a user's terminal.
+
+    Returning the default when no source agrees is acceptable: the
+    user can override with ``--split-type=v`` (or cycle with ``\\``)
+    at runtime.
+    """
+    debug = os.environ.get('BROWSE_TUI_DEBUG_AUTO') == '1'
+    trace = [] if debug else None
+
+    def _record(source, value, err=None):
+        if debug:
+            if err is not None:
+                trace.append(f'{source}=ERR({type(err).__name__}:{err})')
+            else:
+                trace.append(f'{source}={value}')
+
+    # 1. /dev/tty via TIOCGWINSZ (most reliable in piped scenarios).
+    try:
+        import fcntl
+        import struct
+        import termios
+        with open('/dev/tty', 'rb') as f:
+            buf = fcntl.ioctl(f.fileno(), termios.TIOCGWINSZ, b'\0' * 8)
+            _rows, cols, _, _ = struct.unpack('HHHH', buf)
+            _record('tty_ioctl', cols)
+            if cols > 0:
+                if debug:
+                    sys.stderr.write(
+                        f'[browse-tui auto] {" ".join(trace)} -> {cols}\n'
+                    )
+                return cols
+    except Exception as e:
+        _record('tty_ioctl', None, err=e)
+
+    # 2. os.get_terminal_size on each std fd. The default fd is 1
+    # (stdout); if stdout is piped it raises OSError or returns 0.
+    # Try each std fd in turn so we still get a useful answer when
+    # only one of them is a TTY.
+    for fd, name in ((0, 'stdin'), (1, 'stdout'), (2, 'stderr')):
+        try:
+            size = os.get_terminal_size(fd)
+            _record(f'os_termsize_{name}', size.columns)
+            if size.columns > 0:
+                if debug:
+                    sys.stderr.write(
+                        f'[browse-tui auto] {" ".join(trace)} -> '
+                        f'{size.columns}\n'
+                    )
+                return size.columns
+        except OSError as e:
+            _record(f'os_termsize_{name}', None, err=e)
+
+    # 3. shutil.get_terminal_size — honours $COLUMNS, has its own
+    # fallback chain. Returns the fallback (default 80,24) rather
+    # than raising, so accept its answer only if it looks plausible.
+    try:
+        size = shutil.get_terminal_size()
+        _record('shutil_termsize', size.columns)
+        if size.columns > 0:
+            if debug:
+                sys.stderr.write(
+                    f'[browse-tui auto] {" ".join(trace)} -> '
+                    f'{size.columns}\n'
+                )
+            return size.columns
+    except Exception as e:
+        _record('shutil_termsize', None, err=e)
+
+    # 4. stty size — external probe against /dev/tty. Spawning a
+    # subprocess is expensive, but this only runs once at startup and
+    # only when the cheaper probes have all failed.
+    try:
+        with open('/dev/tty', 'rb') as tty_in:
+            proc = subprocess.run(
+                ['stty', 'size'],
+                stdin=tty_in,
+                capture_output=True,
+                text=True,
+                timeout=1.0,
+            )
+        if proc.returncode == 0:
+            parts = proc.stdout.strip().split()
+            if len(parts) == 2 and parts[1].isdigit():
+                cols = int(parts[1])
+                _record('stty_size', cols)
+                if cols > 0:
+                    if debug:
+                        sys.stderr.write(
+                            f'[browse-tui auto] {" ".join(trace)} -> '
+                            f'{cols}\n'
+                        )
+                    return cols
+        else:
+            _record('stty_size', None, err=RuntimeError(
+                f'rc={proc.returncode}'))
+    except Exception as e:
+        _record('stty_size', None, err=e)
+
+    if debug:
+        sys.stderr.write(
+            f'[browse-tui auto] {" ".join(trace)} -> default={default}\n'
+        )
+    return default
+
+
+def _resolve_split_type(spec, term_cols):
+    """Resolve ``--split-type`` ``spec`` to one of ``'h'|'v'|'m'|'pc'``.
+
+    Accepts long-forms (``horizontal``/``vertical``/``mixed``/
+    ``preview-children``/``auto``) and short codes (``h``/``v``/``m``/
+    ``pc``/``a``); case-insensitive. ``None`` is treated as ``auto``.
+    Anything else raises ``ValueError``.
+
+    ``auto`` resolves to ``'v'`` when ``term_cols >= 230`` (wide enough
+    for a comfortable side-by-side layout), else ``'h'``.
+    """
+    if spec is None:
+        spec = 'auto'
+    if not isinstance(spec, str):
+        raise ValueError(f'invalid --split-type: {spec!r}')
+    short = _SPLIT_ALIASES.get(spec.lower())
+    if short is None:
+        raise ValueError(f'invalid --split-type: {spec!r}')
+    if short == 'a':
+        return 'v' if term_cols >= 230 else 'h'
+    return short
+
+
 def _make_preview_fetcher(preview_cmd, timeout):
     """Return a ``get_preview(item_id)`` closure for ``--preview-cmd``, or None.
 
@@ -1153,7 +1334,7 @@ def _make_preview_fetcher(preview_cmd, timeout):
     return _get_preview
 
 
-def _build_lazy_browser(args, fields, record_sep):
+def _build_lazy_browser(args, fields, record_sep, *, split='h'):
     """Build a Browser whose children/preview lookups shell out lazily.
 
     Used when ``--children-cmd`` is set. Each ``get_children`` call runs
@@ -1201,10 +1382,11 @@ def _build_lazy_browser(args, fields, record_sep):
         help_intro=_resolve_help_text(args.help_intro) if args.help_intro else None,
         help_outro=_resolve_help_text(args.help_outro) if args.help_outro else None,
         show_ids=args.show_ids,
+        split=split,
     )
 
 
-def _build_eager_browser(args, fields, record_sep):
+def _build_eager_browser(args, fields, record_sep, *, split='h'):
     """Build a Browser whose root data was produced eagerly by ``--root-cmd``.
 
     The special-case ``--root-cmd cat`` reads stdin verbatim (so a pipe
@@ -1261,6 +1443,7 @@ def _build_eager_browser(args, fields, record_sep):
         help_outro=_resolve_help_text(args.help_outro) if args.help_outro else None,
         show_ids=args.show_ids,
         get_preview=_make_preview_fetcher(args.preview_cmd, args.action_timeout),
+        split=split,
     )
 
 
@@ -1274,10 +1457,20 @@ def run_tui(args):
     fields = [f.strip() for f in args.fields.split(',') if f.strip()]
     record_sep = decode_record_sep(args.record_sep)
 
+    # Resolve --split-type once at startup. Width is read here (not in
+    # the builders) so the auto threshold is evaluated against the
+    # actual launching terminal; later resizes don't re-pick.
+    cols = _terminal_cols_for_auto()
+    try:
+        split = _resolve_split_type(getattr(args, 'split_type', None), cols)
+    except ValueError as e:
+        sys.stderr.write(f'error: {e}\n')
+        return 2
+
     if args.children_cmd:
-        b = _build_lazy_browser(args, fields, record_sep)
+        b = _build_lazy_browser(args, fields, record_sep, split=split)
     elif args.root_cmd:
-        b = _build_eager_browser(args, fields, record_sep)
+        b = _build_eager_browser(args, fields, record_sep, split=split)
         if b is None:
             return 2
     else:
