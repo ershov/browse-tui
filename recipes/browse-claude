@@ -56,6 +56,48 @@ CLAUDE_ROOT = os.path.join(
 _MESSAGE_LIMIT = 1000
 
 
+# ---- ANSI palette --------------------------------------------------------
+#
+# Renderers below splice these into f-strings directly. To re-theme,
+# change the constants. To turn color off, ``_init_color()`` zeroes them
+# (which makes every f'{COLOR}…{RESET}' a no-op).
+#
+# 256-color codes chosen to read on a dark background; tweak if you live
+# on a light terminal. browse-tui's preview pane learned to pass ANSI
+# through in #240; older builds will sanitize these to '?'.
+
+RESET = '\x1b[0m'
+BOLD  = '\x1b[1m'
+DIM   = '\x1b[2m'
+ITAL  = '\x1b[3m'
+
+RED     = '\x1b[38;5;167m'
+GREEN   = '\x1b[38;5;108m'
+YELLOW  = '\x1b[38;5;179m'
+BLUE    = '\x1b[38;5;110m'
+MAGENTA = '\x1b[38;5;176m'
+CYAN    = '\x1b[38;5;109m'
+GRAY    = '\x1b[38;5;244m'
+MUTE    = '\x1b[38;5;240m'
+WHITE   = '\x1b[38;5;253m'
+
+
+def _init_color():
+    """Disable ANSI when ``NO_COLOR`` is set or stdout isn't a tty.
+
+    ``FORCE_COLOR`` overrides both. Idempotent — once a constant has
+    been zeroed it stays zeroed for the process.
+    """
+    if os.environ.get('FORCE_COLOR'):
+        return
+    if os.environ.get('NO_COLOR') or not sys.stdout.isatty():
+        g = globals()
+        for n in ('RESET', 'BOLD', 'DIM', 'ITAL',
+                  'RED', 'GREEN', 'YELLOW', 'BLUE', 'MAGENTA', 'CYAN',
+                  'GRAY', 'MUTE', 'WHITE'):
+            g[n] = ''
+
+
 def _pop_limit_arg(default):
     """Pop ``-n NUMBER`` (or ``-n=NUMBER``) out of ``sys.argv`` and return it.
 

@@ -76,36 +76,52 @@ _INSERT_MARKER_ID = object()
 # ---------------------------------------------------------------------------
 
 
-# Translation table: every char with code < 32 becomes '?', except tab
+# Translation tables: every char with code < 32 becomes '?', except tab
 # (\x09) and newline (\x0a) which are preserved (tab is later expanded
 # to spaces by the renderer; LF is the line separator). Also map DEL
 # (0x7f) to '?': the spec doesn't require it but it's safer because
 # legacy terminals occasionally treat it as a destructive control char.
-# ESC (\x1b) is also preserved — the wrap-aware SGR walker
-# (``_wrap_preview_line``, ticket #242) tokenises CSI sequences and
-# either re-emits them (ANSI-on path) or strips them (ANSI-off /
-# search-highlight). Stripping ESC here would defeat the walker.
-_PREVIEW_SANITIZE_TABLE = {
+#
+# Two tables, gated by ANSI mode:
+#   * ``_PREVIEW_SANITIZE_TABLE_ANSI`` keeps ESC (\x1b) — the wrap-aware
+#     SGR walker (``_wrap_preview_line``, ticket #242) tokenises CSI
+#     sequences and re-emits SGR / drops other CSI.
+#   * ``_PREVIEW_SANITIZE_TABLE_RAW`` maps ESC to '?' — matches the
+#     pre-#243 behaviour where untrusted content can never inject any
+#     escape sequence into the screen, so ``\x1b[31mRED\x1b[0m`` shows
+#     as ``?[31mRED?[0m``. Selected when ``preview_ansi`` is False.
+_PREVIEW_SANITIZE_TABLE_ANSI = {
     i: '?' for i in range(32) if i not in (0x09, 0x0a, 0x1b)
 }
-_PREVIEW_SANITIZE_TABLE[0x7f] = '?'
+_PREVIEW_SANITIZE_TABLE_ANSI[0x7f] = '?'
+
+_PREVIEW_SANITIZE_TABLE_RAW = {
+    i: '?' for i in range(32) if i not in (0x09, 0x0a)
+}
+_PREVIEW_SANITIZE_TABLE_RAW[0x7f] = '?'
 
 
-def _sanitize_preview(text):
-    """Replace control chars (codes < 32 except \\t/\\n/\\e) with '?'.
+def _sanitize_preview(text, *, ansi_on=True):
+    """Replace control chars (codes < 32 except \\t/\\n) with '?'.
 
     Also replaces DEL (0x7f). Used to defang binary noise in untrusted
     file content before it hits the terminal. Tab is preserved (the
     renderer expands it to spaces); newline is preserved (line
-    separator); ESC (\\x1b) is preserved so the wrap-aware SGR walker
-    in ``_wrap_preview_line`` can tokenise CSI sequences and either
-    re-emit them in ANSI mode or strip them in ANSI-off /
-    search-highlight mode. Non-SGR CSI (cursor moves, erase) is dropped
-    by the walker, so the final output is still safe.
+    separator).
+
+    ``ansi_on`` controls ESC (\\x1b):
+      * True  — ESC passes through; the wrap-aware SGR walker
+        (``_wrap_preview_line``) tokenises and re-emits SGR or strips
+        non-SGR CSI.
+      * False — ESC is replaced with '?', mirroring the pre-#243
+        contract so untrusted content can never inject a sequence
+        into the user's screen.
     """
     if not text:
         return text
-    return text.translate(_PREVIEW_SANITIZE_TABLE)
+    table = (_PREVIEW_SANITIZE_TABLE_ANSI if ansi_on
+             else _PREVIEW_SANITIZE_TABLE_RAW)
+    return text.translate(table)
 
 
 def _id_visible(item, show_ids):
@@ -1448,13 +1464,22 @@ def render_preview(browser, rect, *, info=False, has_header=True,
             if cursor_id is not None else ''
         )
 
+    # ``preview_ansi`` is stored on Browser since #244; the attribute is
+    # always present, no defensive default required.
+    ansi_on = browser.preview_ansi
+
     # Strip control chars before they hit the terminal. Covers all three
     # sources (per-item preview, error text, help) so anything that
     # reaches this pane is safe — preview data and action errors can
     # carry attacker-controlled bytes (binary files, raw terminal
     # captures, command stderr); help is composed in-process but cheap
     # to filter and recipes may supply ``help_intro`` / ``help_outro``.
-    text = _sanitize_preview(text)
+    #
+    # In raw mode (``ansi_on=False``) the sanitiser also maps ESC to
+    # '?' so untrusted content can never inject SGR or other escape
+    # sequences. The walker below sees no ESC bytes in that case and
+    # falls through to plain wrap.
+    text = _sanitize_preview(text, ansi_on=ansi_on)
 
     # Wrap content to the rect's width.
     #
@@ -1463,10 +1488,6 @@ def render_preview(browser, rect, *, info=False, has_header=True,
     # re-opened at row start, trailing ``\e[m`` iff the row carries any
     # SGR). Plain rows are byte-identical whether ``ansi_on`` is True or
     # False — preserves the cache-hit invariant for plain content.
-    #
-    # ``preview_ansi`` is stored on Browser since #244; the attribute is
-    # always present, no defensive default required.
-    ansi_on = browser.preview_ansi
     query = getattr(browser, '_search_query', '')
     raw = text.split('\n') if text else []
     wrapped = []

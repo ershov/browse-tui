@@ -25,16 +25,28 @@ class TestSanitizePreview(unittest.TestCase):
     def test_null_byte_replaced(self):
         self.assertEqual(_sanitize_preview('a\x00b'), 'a?b')
 
-    def test_ansi_escape_preserved(self):
-        # ESC (\x1b) is preserved post-#243: the wrap-aware SGR walker
-        # in ``_wrap_preview_line`` tokenises CSI sequences and either
-        # re-emits them (ANSI-on) or strips them (ANSI-off /
-        # search-highlight). Sanitising at this layer would defeat the
-        # walker. Non-SGR CSI is dropped by the walker, so the final
-        # output is still safe.
+    def test_ansi_escape_preserved_when_ansi_on(self):
+        # In ANSI-on mode (the default), ESC (\x1b) passes through so
+        # the wrap-aware SGR walker in ``_wrap_preview_line`` can
+        # tokenise CSI sequences. Non-SGR CSI is dropped by the walker;
+        # SGR is re-emitted.
         self.assertEqual(
             _sanitize_preview('\x1b[31mRED\x1b[0m'),
             '\x1b[31mRED\x1b[0m',
+        )
+        self.assertEqual(
+            _sanitize_preview('\x1b[31mRED\x1b[0m', ansi_on=True),
+            '\x1b[31mRED\x1b[0m',
+        )
+
+    def test_ansi_escape_replaced_when_ansi_off(self):
+        # Raw mode (``--no-preview-ansi`` or capital-R toggled off):
+        # mirrors the pre-#243 contract — every ESC is mapped to '?'
+        # so untrusted content can never inject a sequence into the
+        # screen. ``\x1b[31mRED\x1b[0m`` shows up as ``?[31mRED?[0m``.
+        self.assertEqual(
+            _sanitize_preview('\x1b[31mRED\x1b[0m', ansi_on=False),
+            '?[31mRED?[0m',
         )
 
     def test_tab_preserved(self):
@@ -70,7 +82,7 @@ class TestSanitizePreview(unittest.TestCase):
         # we don't crash on any falsy input the caller might pass.
         self.assertEqual(_sanitize_preview(''), '')
 
-    def test_all_low_control_chars_at_once(self):
+    def test_all_low_control_chars_at_once_ansi_on(self):
         # All 32 codes 0..31 in one string. 29 should become '?'
         # (everything except tab, LF, and ESC), 3 should remain.
         cc = ''.join(chr(i) for i in range(32))
@@ -80,6 +92,17 @@ class TestSanitizePreview(unittest.TestCase):
         self.assertIn('\t', result)
         self.assertIn('\n', result)
         self.assertIn('\x1b', result)
+
+    def test_all_low_control_chars_at_once_ansi_off(self):
+        # Raw mode: 30 codes become '?' (tab + LF preserved; ESC also
+        # mapped). Two chars in the keep-set instead of three.
+        cc = ''.join(chr(i) for i in range(32))
+        result = _sanitize_preview(cc, ansi_on=False)
+        self.assertEqual(len(result), 32)
+        self.assertEqual(result.count('?'), 30)
+        self.assertIn('\t', result)
+        self.assertIn('\n', result)
+        self.assertNotIn('\x1b', result)
 
     def test_form_feed_and_vertical_tab_replaced(self):
         # \x0b (VT) and \x0c (FF) are control chars; renderer column

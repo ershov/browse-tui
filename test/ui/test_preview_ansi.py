@@ -89,11 +89,15 @@ class TestPreviewAnsiToggle(unittest.TestCase):
             )
 
             # (2) Press capital-R: next paint shows "RED" with no SGR.
+            # In raw mode every ESC byte is replaced with '?' (matches
+            # the pre-#243 contract — no escape can ever inject), so
+            # ``\x1b[31mRED\x1b[0m`` shows up as ``?[31mRED?[0m``.
             t.send('R')
             t.wait_stable(timeout=3.0)
             cap_off = t.capture(colors=True)
-            self.assertIn('RED', cap_off,
-                          f'"RED" missing after R toggled colours off:\n{cap_off}')
+            self.assertIn('?[31mRED?[0m', cap_off,
+                          f'expected ?[31mRED?[0m sanitised marker after R '
+                          f'toggled colours off; capture:\n{cap_off!r}')
             self.assertFalse(
                 _has_red_sgr(cap_off),
                 f'red SGR still present after capital-R; '
@@ -117,8 +121,9 @@ class TestPreviewAnsiToggle(unittest.TestCase):
             self._launch(t, '--no-preview-ansi')
 
             cap = t.capture(colors=True)
-            self.assertIn('RED', cap,
-                          f'"RED" missing in --no-preview-ansi startup capture:\n{cap}')
+            self.assertIn('?[31mRED?[0m', cap,
+                          f'expected ?[31mRED?[0m sanitised marker on '
+                          f'--no-preview-ansi startup; capture:\n{cap!r}')
             self.assertFalse(
                 _has_red_sgr(cap),
                 f'red SGR present despite --no-preview-ansi; '
