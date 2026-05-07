@@ -25,6 +25,7 @@ _state.notify_wake = _term.notify_wake
 # via concatenation; the test loader injects them by hand.
 _actions.visible_items = _state.visible_items
 _actions.mark_visible_dirty = _state.mark_visible_dirty
+_actions.mark_cursor_changed = _state.mark_cursor_changed
 _actions.scope_into = _state.scope_into
 _actions.scope_out = _state.scope_out
 

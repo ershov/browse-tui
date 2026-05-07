@@ -104,9 +104,7 @@ def _nav_down(ctx):
     vis = visible_items(state)
     if state.cursor < len(vis) - 1:
         state.cursor += 1
-        ctx._browser._needs_redraw.add('list')
-        ctx._browser._needs_redraw.add('children')
-        ctx._browser._needs_redraw.add('preview')
+        mark_cursor_changed(ctx._browser)
 
 
 def _nav_up(ctx):
@@ -114,18 +112,14 @@ def _nav_up(ctx):
     state = ctx._browser._state
     if state.cursor > 0:
         state.cursor -= 1
-        ctx._browser._needs_redraw.add('list')
-        ctx._browser._needs_redraw.add('children')
-        ctx._browser._needs_redraw.add('preview')
+        mark_cursor_changed(ctx._browser)
 
 
 def _nav_home(ctx):
     """Jump cursor to the first row."""
     state = ctx._browser._state
     state.cursor = 0
-    ctx._browser._needs_redraw.add('list')
-    ctx._browser._needs_redraw.add('children')
-    ctx._browser._needs_redraw.add('preview')
+    mark_cursor_changed(ctx._browser)
 
 
 def _nav_end(ctx):
@@ -133,9 +127,7 @@ def _nav_end(ctx):
     state = ctx._browser._state
     vis = visible_items(state)
     state.cursor = max(0, len(vis) - 1)
-    ctx._browser._needs_redraw.add('list')
-    ctx._browser._needs_redraw.add('children')
-    ctx._browser._needs_redraw.add('preview')
+    mark_cursor_changed(ctx._browser)
 
 
 def _nav_pgdn(ctx):
@@ -149,9 +141,7 @@ def _nav_pgdn(ctx):
     vis = visible_items(state)
     page = _list_pane_height(browser)
     state.cursor = min(max(0, len(vis) - 1), state.cursor + page)
-    browser._needs_redraw.add('list')
-    browser._needs_redraw.add('children')
-    browser._needs_redraw.add('preview')
+    mark_cursor_changed(browser)
 
 
 def _nav_pgup(ctx):
@@ -163,9 +153,7 @@ def _nav_pgup(ctx):
     state = browser._state
     page = _list_pane_height(browser)
     state.cursor = max(0, state.cursor - page)
-    browser._needs_redraw.add('list')
-    browser._needs_redraw.add('children')
-    browser._needs_redraw.add('preview')
+    mark_cursor_changed(browser)
 
 
 def _nav_right(ctx):
@@ -186,9 +174,7 @@ def _nav_right(ctx):
             and vis[state.cursor + 1].depth > entry.depth):
         # Already expanded; step onto the first child if it follows.
         state.cursor += 1
-        ctx._browser._needs_redraw.add('list')
-        ctx._browser._needs_redraw.add('children')
-        ctx._browser._needs_redraw.add('preview')
+        mark_cursor_changed(ctx._browser)
 
 
 def _nav_left(ctx):
@@ -204,18 +190,14 @@ def _nav_left(ctx):
     if item.id in state.expanded:
         state.expanded.discard(item.id)
         mark_visible_dirty(state)
-        ctx._browser._needs_redraw.add('list')
-        ctx._browser._needs_redraw.add('children')
-        ctx._browser._needs_redraw.add('preview')
+        mark_cursor_changed(ctx._browser)
         return
     # Walk back to the first row at a shallower depth — that's the parent.
     cur_depth = entry.depth
     for i in range(state.cursor - 1, -1, -1):
         if vis[i].depth < cur_depth:
             state.cursor = i
-            ctx._browser._needs_redraw.add('list')
-            ctx._browser._needs_redraw.add('children')
-            ctx._browser._needs_redraw.add('preview')
+            mark_cursor_changed(ctx._browser)
             return
 
 
@@ -521,9 +503,7 @@ def _search_next(ctx):
     idx = _search_find(state, browser._search_query, state.cursor, 1)
     if idx is not None:
         state.cursor = idx
-        browser._needs_redraw.add('list')
-        browser._needs_redraw.add('preview')
-        browser._needs_redraw.add('children')
+        mark_cursor_changed(browser)
 
 
 def _search_prev(ctx):
@@ -537,9 +517,7 @@ def _search_prev(ctx):
     idx = _search_find(state, browser._search_query, state.cursor, -1)
     if idx is not None:
         state.cursor = idx
-        browser._needs_redraw.add('list')
-        browser._needs_redraw.add('preview')
-        browser._needs_redraw.add('children')
+        mark_cursor_changed(browser)
 
 
 # ---- recursive expand/collapse + preview scroll ---------------------------
@@ -1497,7 +1475,7 @@ def _click_list_row(browser, layout, row):
     new_idx = browser._list_scroll + (row - list_rect.top)
     if 0 <= new_idx < len(visible) and state.cursor != new_idx:
         state.cursor = new_idx
-        browser._needs_redraw.add('list')
+        mark_cursor_changed(browser)
 
 
 def _scroll_list(browser, delta):

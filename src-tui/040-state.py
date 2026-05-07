@@ -545,6 +545,26 @@ def _search_find(state, query, start_idx, direction=1):
     return None
 
 
+def mark_cursor_changed(browser) -> None:
+    """Flag the redraw set for a cursor-position change.
+
+    Any code path that moves ``state.cursor`` MUST call this helper —
+    the list pane needs to repaint the new selected row, the children
+    grid needs to refresh to reflect the new cursor item's children,
+    and the preview pane needs to re-render the new cursor item's
+    preview text. Forgetting any one of those leaves a stale pane
+    until the next user keystroke (regression in #206 / commit
+    0c8769d, fix tracked under #223).
+
+    Centralising the set here means new cursor-move sites just call
+    one function instead of recopying a hand-written triplet.
+    """
+    rd = browser._needs_redraw
+    rd.add('list')
+    rd.add('children')
+    rd.add('preview')
+
+
 def _search_jump_nearest(browser):
     """Jump cursor to the nearest match (forward search from current pos).
 
@@ -557,9 +577,7 @@ def _search_jump_nearest(browser):
     idx = _search_find(state, browser._search_query, state.cursor - 1, 1)
     if idx is not None:
         state.cursor = idx
-        browser._needs_redraw.add('list')
-        browser._needs_redraw.add('preview')
-        browser._needs_redraw.add('children')
+        mark_cursor_changed(browser)
 
 
 # ---- insert-mode placement helpers (ticket #21) -------------------------
@@ -1445,9 +1463,7 @@ class Browser:
         for i, entry in enumerate(vis):
             if entry.item.id == id_:
                 self._state.cursor = i
-                self._needs_redraw.add('list')
-                self._needs_redraw.add('children')
-                self._needs_redraw.add('preview')
+                mark_cursor_changed(self)
                 pending._resolve()
                 return
         # Not visible. Best-effort: leave cursor alone and resolve.

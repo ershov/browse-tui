@@ -39,6 +39,7 @@ _actions.mark_visible_dirty = _state.mark_visible_dirty
 _actions.current_scope = _state.current_scope
 _actions._search_find = _state._search_find
 _actions._search_jump_nearest = _state._search_jump_nearest
+_actions.mark_cursor_changed = _state.mark_cursor_changed
 _actions.point_in_rect = _render.point_in_rect
 _actions._sub_needed_rows = _render._sub_needed_rows
 _actions._fmt_child = _render._fmt_child

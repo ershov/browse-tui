@@ -32,6 +32,7 @@ _actions.visible_items = _state.visible_items
 _actions.mark_visible_dirty = _state.mark_visible_dirty
 _actions._search_find = _state._search_find
 _actions._search_jump_nearest = _state._search_jump_nearest
+_actions.mark_cursor_changed = _state.mark_cursor_changed
 
 
 Item = _data.Item
