@@ -52,6 +52,10 @@ _render.PaneCache = _state.PaneCache
 _render.visible_items = _state.visible_items
 _render._search_matches = _state._search_matches
 _render._search_text = _state._search_text
+# Wrap-aware SGR walker (#242) needs the ANSI primitives from 020-terminal.
+_render._ANSI_CSI_RE = _term._ANSI_CSI_RE
+_render.SgrState = _term.SgrState
+_render._char_width = _term._char_width
 for _name in ('write', 'move', 'set_style', 'reset_style', 'clear_line',
               'clear_columns', 'begin_row', 'end_row', 'begin_sync',
               'end_sync', 'flush', 'term_size'):
@@ -573,6 +577,148 @@ class TestTrailingContentShrink(_RenderCacheBase):
         self.assertIn(
             '   ', body,  # 3+ spaces is enough to detect a pad run
             f'shrink must emit a trailing-space pad; got {body!r}',
+        )
+
+
+# --- 10. render_preview ANSI integration (#243) ---------------------------
+
+
+class TestRenderPreviewAnsiIntegration(_RenderCacheBase):
+    """``render_preview`` wires ``_wrap_preview_line`` (the SGR walker).
+
+    These tests exercise the integration end-to-end through ``render_full``
+    so we see the actual byte stream produced by the preview pane:
+
+      * Plain text → byte-identical pre/post-#243 (cache invariant).
+      * Coloured line → SGR codes survive, trailing ``\\e[m`` only on
+        rows that carry SGR.
+      * Long coloured line wraps with each row self-contained
+        (re-emit + reset).
+      * Search match in a coloured line → SGR stripped (highlight wins).
+      * Cache hit on second paint with no changes.
+    """
+
+    def _make(self, preview_text, **browser_kw):
+        # Layout 'v' makes the preview pane rightmost so we can inspect
+        # exactly the preview's emitted bytes; the list is on the left.
+        items = [Item(id='a', title='alpha')]
+        browser_kw.setdefault('split', 'v')
+        browser_kw.setdefault('show_preview', True)
+        browser_kw.setdefault('show_children_pane', False)
+        b = _make_browser(items, **browser_kw)
+        b._state._preview['a'] = preview_text
+        return b
+
+    def test_plain_text_byte_identical_to_pre_ansi(self):
+        """Plain preview pre/post-#243: identical byte stream.
+
+        Two paints in succession with the same plain text must produce
+        a cache hit on the second paint — the regression check that
+        plain content didn't grow extra SGR bytes from the new walker.
+        """
+        self.browser = self._make('hello world\nsecond line')
+        _render.render_full(self.browser)
+        first = self.cap.drain()
+        # Plain text path: row content for 'hello world' carries no SGR
+        # added by the walker. (The row's outer \e[m terminator comes
+        # from end_row's row-shim, not the wrap walker — that one we
+        # accept.) Confirm there's no INNER \e[31m / \e[1m / etc from
+        # the walker, by searching for the body text and checking the
+        # surrounding bytes don't include a non-reset SGR.
+        self.assertIn('hello world', first)
+        self.assertIn('second line', first)
+        # No coloured SGR injected on plain rows.
+        idx = first.index('hello world')
+        # The 32 bytes before 'hello world' should NOT contain a CSI
+        # other than the cursor-position move + (possibly) a reset.
+        prelude = first[max(0, idx - 32):idx]
+        # No colour-foreground / bold openers in plain prelude.
+        for opener in ('\x1b[31m', '\x1b[32m', '\x1b[1m', '\x1b[7m'):
+            self.assertNotIn(
+                opener, prelude,
+                f'plain row prelude must not carry {opener!r}; '
+                f'got {prelude!r}',
+            )
+        # Second paint with identical state → cache hit (BSU+ESU only).
+        _render.render_full(self.browser)
+        second = self.cap.drain()
+        bsu = '\033[?2026h'
+        esu = '\033[?2026l'
+        self.assertEqual(
+            second, bsu + esu,
+            f'plain preview second paint must be cache-hit; got {second!r}',
+        )
+
+    def test_coloured_line_emits_sgr_with_trailing_reset(self):
+        """A red-coloured preview line carries the SGR codes through."""
+        self.browser = self._make('\x1b[31mfoo\x1b[m')
+        _render.render_full(self.browser)
+        body = _strip_bsu_esu(self.cap.drain())
+        # \e[31m should reach the terminal because preview_ansi defaults
+        # to True via getattr.
+        self.assertIn('\x1b[31mfoo', body)
+        # The walker re-emits a trailing \e[m only when SGR state is
+        # non-empty at end-of-row. Here the input itself ends in \e[m so
+        # the state IS empty by row-end and no extra reset is needed.
+        # The original \e[m still appears in the output.
+        self.assertIn('\x1b[m', body)
+
+    def test_long_coloured_line_wraps_with_self_contained_rows(self):
+        """Wrapping a long red line: each visual row carries its own SGR."""
+        # The preview pane in the default 'v' layout / 80-col terminal
+        # is ~55 cols wide. 200 'R's guarantees multiple wrapped rows.
+        self.browser = self._make('\x1b[31m' + 'R' * 200)
+        _render.render_full(self.browser)
+        body = _strip_bsu_esu(self.cap.drain())
+        # The colour opens at least once (first row's start).
+        self.assertIn('\x1b[31m', body)
+        # And there's a corresponding reset (state non-empty at row end).
+        self.assertIn('\x1b[m', body)
+        # More than one occurrence of \e[31m proves multi-row re-emit:
+        # each wrapped row re-opens \e[31m at its start.
+        self.assertGreaterEqual(
+            body.count('\x1b[31m'), 2,
+            'long coloured line must re-emit SGR on each wrapped row; '
+            f'got {body!r}',
+        )
+
+    def test_search_match_in_coloured_line_drops_sgr(self):
+        """Search match → highlight wins, source SGR stripped."""
+        # Red 'alpha' as the preview text. With search query 'alpha'
+        # the matched line must drop SGR — the walker is told
+        # drop_sgr=True for that line.
+        self.browser = self._make('\x1b[31malpha\x1b[m')
+        self.browser._search_query = 'alpha'
+        _render.render_full(self.browser)
+        body = _strip_bsu_esu(self.cap.drain())
+        # The preview content 'alpha' appears.
+        self.assertIn('alpha', body)
+        # And the source colour (\e[31m) is NOT present in the preview
+        # row because drop_sgr=True dropped it. (The list pane / info
+        # bar may emit other SGR for highlighting, so search for the
+        # specific \e[31m which only the source colour would emit.)
+        # NOTE: if any other code path emits \e[31m as a coincidence
+        # this assertion would over-trigger. The list-pane's
+        # ``_write_highlighted`` uses yellow/bold (\e[33;1m), not red.
+        self.assertNotIn(
+            '\x1b[31m', body,
+            'search-matched line must drop source SGR; '
+            f'got {body!r}',
+        )
+
+    def test_cache_hit_on_second_paint(self):
+        """Second paint with same preview state → BSU+ESU only."""
+        self.browser = self._make('\x1b[31mhello\x1b[m world')
+        _render.render_full(self.browser)
+        self.cap.drain()
+        # Second paint, no state change: every row hits cache.
+        _render.render_full(self.browser)
+        out = self.cap.drain()
+        bsu = '\033[?2026h'
+        esu = '\033[?2026l'
+        self.assertEqual(
+            out, bsu + esu,
+            f'expected BSU+ESU only on no-op repaint; got {out!r}',
         )
 
 

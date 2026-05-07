@@ -81,21 +81,27 @@ _INSERT_MARKER_ID = object()
 # to spaces by the renderer; LF is the line separator). Also map DEL
 # (0x7f) to '?': the spec doesn't require it but it's safer because
 # legacy terminals occasionally treat it as a destructive control char.
-# Used to defang ANSI escape sequences (\x1b[31m, …) and other control
-# bytes that arrive from untrusted file content (preview, error text).
+# ESC (\x1b) is also preserved — the wrap-aware SGR walker
+# (``_wrap_preview_line``, ticket #242) tokenises CSI sequences and
+# either re-emits them (ANSI-on path) or strips them (ANSI-off /
+# search-highlight). Stripping ESC here would defeat the walker.
 _PREVIEW_SANITIZE_TABLE = {
-    i: '?' for i in range(32) if i not in (0x09, 0x0a)
+    i: '?' for i in range(32) if i not in (0x09, 0x0a, 0x1b)
 }
 _PREVIEW_SANITIZE_TABLE[0x7f] = '?'
 
 
 def _sanitize_preview(text):
-    """Replace control chars (codes < 32 except \\t/\\n) with '?'.
+    """Replace control chars (codes < 32 except \\t/\\n/\\e) with '?'.
 
-    Also replaces DEL (0x7f). Used to defang ANSI escape sequences and
-    binary noise in untrusted file content before it hits the terminal.
-    Tab is preserved (the renderer expands it to spaces); newline is
-    preserved (line separator).
+    Also replaces DEL (0x7f). Used to defang binary noise in untrusted
+    file content before it hits the terminal. Tab is preserved (the
+    renderer expands it to spaces); newline is preserved (line
+    separator); ESC (\\x1b) is preserved so the wrap-aware SGR walker
+    in ``_wrap_preview_line`` can tokenise CSI sequences and either
+    re-emit them in ANSI mode or strip them in ANSI-off /
+    search-highlight mode. Non-SGR CSI (cursor moves, erase) is dropped
+    by the walker, so the final output is still safe.
     """
     if not text:
         return text
@@ -1451,17 +1457,31 @@ def render_preview(browser, rect, *, info=False, has_header=True,
     text = _sanitize_preview(text)
 
     # Wrap content to the rect's width.
+    #
+    # The wrap goes through ``_wrap_preview_line`` (#242) which tokenises
+    # SGR sequences and emits self-contained visual rows (active SGR
+    # re-opened at row start, trailing ``\e[m`` iff the row carries any
+    # SGR). Plain rows are byte-identical whether ``ansi_on`` is True or
+    # False — preserves the cache-hit invariant for plain content.
+    #
+    # ``preview_ansi`` lands in ticket #244; default to True via getattr
+    # so this integration works before the attribute exists.
+    ansi_on = getattr(browser, 'preview_ansi', True)
+    query = getattr(browser, '_search_query', '')
     raw = text.split('\n') if text else []
     wrapped = []
     for line in raw:
         line = line.replace('\t', '    ')
-        if not line:
-            wrapped.append('')
-            continue
-        while len(line) > width:
-            wrapped.append(line[:width])
-            line = line[width:]
-        wrapped.append(line)
+        # Search-highlight gate: a line that matches the active search
+        # query renders with highlight (yellow/bold) downstream, which
+        # wins over any inline SGR — strip SGR for that line. Match
+        # against the SGR-stripped text so the codes don't interfere.
+        drop_sgr = False
+        if query:
+            stripped = _ANSI_CSI_RE.sub('', line) if '\x1b' in line else line
+            drop_sgr = _search_matches(stripped, query)
+        wrapped.extend(_wrap_preview_line(
+            line, width, ansi_on=ansi_on, drop_sgr=drop_sgr))
 
     scroll = browser._preview_scroll
     if scroll < 0:

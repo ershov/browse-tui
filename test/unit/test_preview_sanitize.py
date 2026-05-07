@@ -25,12 +25,16 @@ class TestSanitizePreview(unittest.TestCase):
     def test_null_byte_replaced(self):
         self.assertEqual(_sanitize_preview('a\x00b'), 'a?b')
 
-    def test_ansi_escape_replaced(self):
-        # \x1b is the SGR-introducer ESC byte; replacing it neuters the
-        # whole escape sequence into harmless text.
+    def test_ansi_escape_preserved(self):
+        # ESC (\x1b) is preserved post-#243: the wrap-aware SGR walker
+        # in ``_wrap_preview_line`` tokenises CSI sequences and either
+        # re-emits them (ANSI-on) or strips them (ANSI-off /
+        # search-highlight). Sanitising at this layer would defeat the
+        # walker. Non-SGR CSI is dropped by the walker, so the final
+        # output is still safe.
         self.assertEqual(
             _sanitize_preview('\x1b[31mRED\x1b[0m'),
-            '?[31mRED?[0m',
+            '\x1b[31mRED\x1b[0m',
         )
 
     def test_tab_preserved(self):
@@ -67,14 +71,15 @@ class TestSanitizePreview(unittest.TestCase):
         self.assertEqual(_sanitize_preview(''), '')
 
     def test_all_low_control_chars_at_once(self):
-        # All 32 codes 0..31 in one string. 30 should become '?'
-        # (everything except tab and LF), 2 should remain.
+        # All 32 codes 0..31 in one string. 29 should become '?'
+        # (everything except tab, LF, and ESC), 3 should remain.
         cc = ''.join(chr(i) for i in range(32))
         result = _sanitize_preview(cc)
         self.assertEqual(len(result), 32)
-        self.assertEqual(result.count('?'), 30)
+        self.assertEqual(result.count('?'), 29)
         self.assertIn('\t', result)
         self.assertIn('\n', result)
+        self.assertIn('\x1b', result)
 
     def test_form_feed_and_vertical_tab_replaced(self):
         # \x0b (VT) and \x0c (FF) are control chars; renderer column
@@ -87,7 +92,8 @@ class TestSanitizePreview(unittest.TestCase):
 
     def test_mixed_content_idempotent(self):
         # Sanitising sanitised text is a no-op (table only matches
-        # codes < 32 or 0x7f, neither of which '?' is).
+        # codes < 32 or 0x7f — none of '?', '\x1b', '[', or ASCII letters
+        # are in that set).
         once = _sanitize_preview('\x1b[31mhi\x00\x01')
         twice = _sanitize_preview(once)
         self.assertEqual(once, twice)

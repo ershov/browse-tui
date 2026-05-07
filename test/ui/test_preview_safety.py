@@ -73,13 +73,17 @@ class TestPreviewSafety(unittest.TestCase):
                 'sanitiser may be inactive',
             )
 
-    def test_ansi_in_preview_does_not_color_screen(self):
-        """A literal ANSI escape in preview text becomes harmless '?[…]m'.
+    def test_ansi_in_preview_passes_through_to_terminal(self):
+        """ANSI SGR in preview content reaches the terminal as colour codes.
 
-        Without sanitisation the preview-cmd output ``\\x1b[31mRED\\x1b[0m``
-        would set the terminal's foreground to red, write 'RED', then
-        reset — a textbook injection. The sanitiser swaps each ESC
-        (\\x1b) for '?' so the rendered text is just "?[31mRED?[0m".
+        Per ticket #240 the preview pane intentionally renders SGR
+        sequences. The default contract is: preview-cmd output
+        ``\\x1b[31mRED\\x1b[0m`` colours "RED" red on the user's screen.
+        Non-SGR escapes are still stripped by the walker (tested in
+        the unit suite); other control bytes are still sanitised by
+        ``_sanitize_preview`` (covered by the binary-preview test
+        above). Toggling colours off via ``--no-preview-ansi`` /
+        capital-R is covered by the dedicated ANSI UI tests.
         """
         with TmuxFixture(cols=80, rows=24) as t:
             t.launch(
@@ -90,20 +94,16 @@ class TestPreviewSafety(unittest.TestCase):
                 '--show-ids', 'always',
             )
             t.wait_for('file file')
-            # Wait for the preview to land — looking for the sanitised
-            # marker tells us both that the preview rendered AND that
-            # the ESC byte was replaced with '?'.
-            t.wait_for('?[31mRED?[0m', timeout=5.0)
+            # The text reaches the screen — tmux's emulator interprets
+            # the SGR codes, so they don't appear as literal characters
+            # in the captured pane content.
+            t.wait_for('RED', timeout=5.0)
             cap = t.wait_stable()
-            self.assertIn('?[31mRED?[0m', cap)
-            # Negative check: the raw ESC byte must NOT appear anywhere
-            # in the captured output (a real ESC there would have been
-            # interpreted as an SGR sequence by tmux's emulator and not
-            # captured as text — but if it were rendered before the
-            # sanitiser sees it, we'd find at least the literal "[31m"
-            # without a leading '?'). The positive check above is the
-            # primary assertion.
-            self.assertNotIn('\x1b[31m', cap)
+            self.assertIn('RED', cap)
+            # The old sanitised marker must NOT appear: ESC is no
+            # longer mapped to '?'.
+            self.assertNotIn('?[31m', cap)
+            self.assertNotIn('?[0m', cap)
 
 
 if __name__ == '__main__':
