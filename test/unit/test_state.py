@@ -293,5 +293,21 @@ class TestBrowserPaneCacheInit(unittest.TestCase):
         self.assertIsInstance(b._pane_cache, dict)
 
 
+class TestBrowserPreviewAnsi(unittest.TestCase):
+    """Browser.__init__ accepts ``preview_ansi`` (default True) — #244."""
+
+    def test_default_is_true(self):
+        b = Browser(_headless=True)
+        self.assertTrue(b.preview_ansi)
+
+    def test_explicit_false_stored(self):
+        b = Browser(preview_ansi=False, _headless=True)
+        self.assertFalse(b.preview_ansi)
+
+    def test_explicit_true_stored(self):
+        b = Browser(preview_ansi=True, _headless=True)
+        self.assertTrue(b.preview_ansi)
+
+
 if __name__ == '__main__':
     unittest.main()

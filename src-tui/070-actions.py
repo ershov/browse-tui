@@ -220,6 +220,20 @@ def _toggle_help(ctx):
     ctx._browser._needs_redraw.add('preview')
 
 
+def _toggle_preview_ansi(ctx):
+    """Flip ``preview_ansi`` (capital-R) and flag the preview pane dirty.
+
+    The per-row line cache naturally handles invalidation: rows
+    carrying SGR escape sequences emit different bytes when ANSI
+    re-emit is suppressed (or re-enabled), so the byte-stream
+    comparison in ``end_row`` drives a redraw on those rows; plain
+    rows produce identical bytes and stay cache-hit. No explicit
+    ``_pane_cache`` surgery is required (#240 design note).
+    """
+    ctx._browser.preview_ansi = not ctx._browser.preview_ansi
+    ctx._browser._needs_redraw.add('preview')
+
+
 def _reload(ctx):
     """Trigger a full refresh of the children cache."""
     ctx.refresh()
@@ -882,6 +896,7 @@ def default_actions() -> list:
         # Preview scroll — gate 'none' so they work even when the visible
         # list is empty (help/error pages still want scrolling).
         Action('ctrl-p',     'Toggle preview pane',     _toggle_preview,      'none', 'PREVIEW'),
+        Action('R',          'Toggle preview ANSI colours', _toggle_preview_ansi, 'none', 'PREVIEW'),
         Action('shift-down', 'Scroll preview line down', _preview_scroll_down, 'none', 'PREVIEW'),
         Action('shift-up',   'Scroll preview line up',   _preview_scroll_up,   'none', 'PREVIEW'),
         Action('alt-pgdn',   'Scroll preview page down', _preview_page_down,   'none', 'PREVIEW'),

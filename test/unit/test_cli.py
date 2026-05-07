@@ -63,6 +63,26 @@ class TestArgParser(unittest.TestCase):
         args, _ = _cli.parse_args(['--no-preview'])
         self.assertTrue(args.no_preview)
 
+    def test_preview_ansi_default_true(self):
+        # #245: default is ANSI-on so existing behaviour is preserved.
+        args, _ = _cli.parse_args([])
+        self.assertTrue(args.preview_ansi)
+
+    def test_no_preview_ansi_flag_sets_false(self):
+        args, _ = _cli.parse_args(['--no-preview-ansi'])
+        self.assertFalse(args.preview_ansi)
+
+    def test_preview_ansi_flag_sets_true(self):
+        args, _ = _cli.parse_args(['--preview-ansi'])
+        self.assertTrue(args.preview_ansi)
+
+    def test_preview_ansi_in_help(self):
+        # The flag should be advertised in --help so users discover it.
+        parser = _cli.build_argparser()
+        help_text = parser.format_help()
+        self.assertIn('--preview-ansi', help_text)
+        self.assertIn('--no-preview-ansi', help_text)
+
     def test_initial_scope(self):
         args, _ = _cli.parse_args(['--initial-scope', 'x'])
         self.assertEqual(args.initial_scope, 'x')

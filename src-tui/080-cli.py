@@ -469,6 +469,12 @@ def build_argparser() -> argparse.ArgumentParser:
                    help='Start with preview pane hidden.')
     p.add_argument('--no-children-pane', action='store_true',
                    help='Start with children-grid pane hidden.')
+    p.add_argument('--preview-ansi', default=True,
+                   action=argparse.BooleanOptionalAction,
+                   help='Honour ANSI SGR escape sequences in the '
+                        'preview pane (default: enabled). Use '
+                        '--no-preview-ansi to strip colours from '
+                        'preview output. Toggled at runtime with R.')
     p.add_argument('--no-multi-select', action='store_true',
                    help='Disable selection.')
     p.add_argument('--list-size', metavar='N|N%', default=None,
@@ -1375,6 +1381,7 @@ def _build_lazy_browser(args, fields, record_sep, *, split='h'):
         initial_scope=args.initial_scope,
         show_preview=not args.no_preview,
         show_children_pane=not args.no_children_pane,
+        preview_ansi=args.preview_ansi,
         list_ratio=_resolve_list_size(args.list_size),
         multi_select=not args.no_multi_select,
         on_enter=args.on_enter,
@@ -1435,6 +1442,7 @@ def _build_eager_browser(args, fields, record_sep, *, split='h'):
         initial_scope=args.initial_scope,
         show_preview=not args.no_preview,
         show_children_pane=not args.no_children_pane,
+        preview_ansi=args.preview_ansi,
         list_ratio=_resolve_list_size(args.list_size),
         multi_select=not args.no_multi_select,
         on_enter=args.on_enter,

@@ -1464,9 +1464,9 @@ def render_preview(browser, rect, *, info=False, has_header=True,
     # SGR). Plain rows are byte-identical whether ``ansi_on`` is True or
     # False — preserves the cache-hit invariant for plain content.
     #
-    # ``preview_ansi`` lands in ticket #244; default to True via getattr
-    # so this integration works before the attribute exists.
-    ansi_on = getattr(browser, 'preview_ansi', True)
+    # ``preview_ansi`` is stored on Browser since #244; the attribute is
+    # always present, no defensive default required.
+    ansi_on = browser.preview_ansi
     query = getattr(browser, '_search_query', '')
     raw = text.split('\n') if text else []
     wrapped = []

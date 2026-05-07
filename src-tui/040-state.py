@@ -767,6 +767,9 @@ class Browser:
       initial_scope:      if set, pushed onto scope_stack at construction.
       show_preview:       enable the preview pane (renderer in #10).
       show_children_pane: enable the right-hand children-as-list pane.
+      preview_ansi:       honour ANSI SGR sequences in preview text
+                          (default True). Toggled at runtime via
+                          capital-R.
       multi_select:       allow multi-selection (action layer in #12).
       print_format:       output format string used when on_enter is None
                           and the user picks the default action.
@@ -797,6 +800,7 @@ class Browser:
                  initial_scope: Any = None,
                  show_preview: bool = True,
                  show_children_pane: bool = True,
+                 preview_ansi: bool = True,
                  list_ratio: float = 0.30,
                  split: str = 'auto',
                  multi_select: bool = True,
@@ -842,6 +846,10 @@ class Browser:
             show_preview: Whether the preview pane starts visible.
             show_children_pane: Whether the children-grid pane starts
                 visible.
+            preview_ansi: Whether the preview pane honours ANSI SGR
+                escape sequences in source text (default ``True``).
+                When ``False``, escape sequences are stripped from the
+                preview output. Toggled at runtime with capital-R.
             multi_select: Whether multi-selection is enabled. Phase 1
                 stores this opaquely; the action layer reads it.
             print_format: ``str.format``-style template applied to each
@@ -881,6 +889,14 @@ class Browser:
         self.format_item = format_item
         self.show_preview = show_preview
         self.show_children_pane = show_children_pane
+        # Honour ANSI SGR escapes in the preview pane (default True).
+        # Toggled at runtime via capital-R; see ``_toggle_preview_ansi``
+        # in 070-actions.py. The cache invalidation is naturally handled
+        # by the per-row byte-stream comparison in the differential
+        # renderer — colour-bearing rows produce different bytes when
+        # SGR re-emit is suppressed, so they redraw; plain rows produce
+        # identical bytes and stay cache-hit (#240 design note).
+        self.preview_ansi = preview_ansi
         # Fraction of total terminal rows allocated to the list pane.
         # Stored as a float so it survives terminal resizes without
         # rounding drift; clamped to a usable range by ``set_list_ratio``.

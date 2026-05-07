@@ -135,6 +135,13 @@ class TestComposeHelpText(unittest.TestCase):
         self.assertIn('Enter search mode', text)
         self.assertIn('Quit', text)
 
+    def test_default_help_includes_preview_ansi_toggle(self):
+        # The capital-R binding registered in #244 should surface in the
+        # PREVIEW section of the auto-generated help body.
+        b = _make_browser()
+        text = compose_help_text(b)
+        self.assertIn('Toggle preview ANSI colours', text)
+
     def test_no_actions_no_custom_section(self):
         b = _make_browser()
         text = compose_help_text(b)

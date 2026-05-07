@@ -2499,6 +2499,63 @@ class TestRedrawAction(unittest.TestCase):
         self.assertIs(keys['ctrl-l'].handler, _actions._redraw)
 
 
+class TestTogglePreviewAnsi(unittest.TestCase):
+    """Capital-R (``_toggle_preview_ansi``) flips ``preview_ansi`` and
+    flags the preview pane dirty (#244).
+
+    The action does NOT clear ``_pane_cache`` — invalidation is driven by
+    the per-row byte-stream comparison in ``end_row``: colour-bearing
+    rows produce different bytes and redraw, plain rows stay cache-hit.
+    """
+
+    def test_toggle_flips_flag_true_to_false(self):
+        b = _make_browser()
+        try:
+            self.assertTrue(b.preview_ansi)
+            ctx = _ctx_for(b)
+            _actions._toggle_preview_ansi(ctx)
+            self.assertFalse(b.preview_ansi)
+        finally:
+            b.stop_workers()
+
+    def test_toggle_flips_flag_false_to_true(self):
+        b = _make_browser(preview_ansi=False)
+        try:
+            self.assertFalse(b.preview_ansi)
+            ctx = _ctx_for(b)
+            _actions._toggle_preview_ansi(ctx)
+            self.assertTrue(b.preview_ansi)
+        finally:
+            b.stop_workers()
+
+    def test_toggle_marks_preview_dirty(self):
+        b = _make_browser()
+        try:
+            ctx = _ctx_for(b)
+            b._needs_redraw.clear()
+            _actions._toggle_preview_ansi(ctx)
+            self.assertIn('preview', b._needs_redraw)
+        finally:
+            b.stop_workers()
+
+    def test_capital_r_dispatches_toggle(self):
+        b = _make_browser()
+        try:
+            ctx = _ctx_for(b)
+            self.assertTrue(b.preview_ansi)
+            self.assertTrue(dispatch_key(b, ctx, 'R'))
+            self.assertFalse(b.preview_ansi)
+            self.assertIn('preview', b._needs_redraw)
+        finally:
+            b.stop_workers()
+
+    def test_capital_r_keybinding_registered(self):
+        # Pin the keybinding so the action stays wired to capital-R.
+        keys = {a.key: a for a in default_actions()}
+        self.assertIn('R', keys)
+        self.assertIs(keys['R'].handler, _actions._toggle_preview_ansi)
+
+
 class TestAltDigitParsing(unittest.TestCase):
     """``read_key`` (020-terminal) maps ``ESC + 'N'`` → ``'alt-N'``.
 
