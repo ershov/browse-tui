@@ -190,6 +190,19 @@ class SgrState:
         self._buf = ''
 
 
+def _char_width(ch):
+    """Return display columns for one character: 2 for wide/fullwidth, else 1.
+
+    Shared definition of "one char's column count" used by the visible-
+    length helpers and the preview-line wrap walker. Mirrors the same
+    East Asian Width classification :func:`_visible_len` applies, hoisted
+    out as a single-char primitive so the wrap walker (050-render.py
+    :func:`_wrap_preview_line`) can fall through to a per-char column
+    fit on cuts that contain wide characters.
+    """
+    return 2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1
+
+
 def _visible_len(s):
     """Count visible cells in ``s``, ignoring ANSI CSI escape sequences.
 
@@ -209,7 +222,7 @@ def _visible_len(s):
     stripped = _ANSI_CSI_RE.sub('', s)
     visible = 0
     for ch in stripped:
-        visible += 2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1
+        visible += _char_width(ch)
     return visible
 
 

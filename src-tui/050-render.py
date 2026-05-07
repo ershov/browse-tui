@@ -1236,6 +1236,139 @@ def render_list(browser, rect, *, rightmost: bool = False):
         end_row()
 
 
+def _tokenise_line(line):
+    """Yield alternating ``('text', s)`` / ``('csi', s)`` tokens for ``line``.
+
+    Single ``_ANSI_CSI_RE.finditer`` pass — escape sequences come out as
+    one ``csi`` token apiece, the runs of plain text between them come
+    out as ``text`` tokens. Either kind may be absent (a line with no
+    escapes is one ``text`` token; a line that's all escapes yields only
+    ``csi`` tokens). Empty lines yield nothing.
+    """
+    pos = 0
+    for m in _ANSI_CSI_RE.finditer(line):
+        if m.start() > pos:
+            yield ('text', line[pos:m.start()])
+        yield ('csi', m.group(0))
+        pos = m.end()
+    if pos < len(line):
+        yield ('text', line[pos:])
+
+
+def _wrap_preview_line(line, width, *, ansi_on, drop_sgr=False):
+    """Wrap a logical preview line into visual rows of <= ``width`` cols.
+
+    ``ansi_on``  — keep SGR codes inline. False → strip all CSI (raw mode).
+    ``drop_sgr`` — strip all SGR even in ANSI mode (used when a line
+                   contains a search highlight; highlight wins).
+
+    Each yielded row is self-contained: any active SGR is re-emitted at
+    its start, and a trailing ``\\e[m`` is appended iff the row contains
+    any SGR. Plain rows produce identical bytes whether ``ansi_on`` is
+    True or False — preserves cache-hit invariants.
+
+    Algorithm: regex-tokenised (one ``_ANSI_CSI_RE`` pass via
+    :func:`_tokenise_line`), with a three-tier ASCII fast path on text
+    tokens — the whole token, the current cut, then a per-char column
+    fit only when wide chars are actually present in the cut.
+    """
+    if width <= 0:
+        # Defensive: a zero-or-negative width can't fit anything.
+        # Always emit at least one (empty) row so the caller's row
+        # accounting matches the input.
+        return ['']
+
+    keep_sgr = ansi_on and not drop_sgr
+    state = SgrState()
+    rows = []
+    seg = []          # current row's pieces
+    seg_vis = 0       # visible cols accumulated in current row
+
+    def end_row():
+        # Trailing \e[m goes on iff the row's terminal SGR state would
+        # bleed into the next pane / next row's pad — i.e. ``state`` is
+        # non-empty. A row that opened a colour and explicitly reset it
+        # mid-line (state empty at end) needs no extra reset.
+        nonlocal seg, seg_vis
+        if not state.is_empty():
+            seg.append('\033[m')
+        rows.append(''.join(seg))
+        # Open the next row by re-emitting active SGR (if any).
+        seg = []
+        seg_vis = 0
+        if keep_sgr:
+            active = state.render()
+            if active:
+                seg.append(active)
+
+    for kind, tok in _tokenise_line(line):
+        if kind == 'csi':
+            # SGR sequences (final byte 'm') feed the state when we're
+            # keeping them; non-SGR CSI is always dropped (cursor moves
+            # / erases shouldn't survive into preview output).
+            if tok.endswith('m') and keep_sgr:
+                seg.append(tok)
+                state.feed(tok)
+            # Else: drop. Non-SGR CSI, ansi_on=False, or drop_sgr=True.
+            continue
+
+        # text token
+        token_is_ascii = tok.isascii()
+        i = 0
+        n = len(tok)
+        while i < n:
+            avail = width - seg_vis
+            if avail <= 0:
+                end_row()
+                continue
+
+            end = i + avail
+            if end > n:
+                end = n
+
+            if token_is_ascii or tok[i:end].isascii():
+                # Fast path: ASCII cut → one col per char.
+                seg.append(tok[i:end])
+                seg_vis += end - i
+                i = end
+            else:
+                # Slow path: wide chars in this cut. Char-by-char fit.
+                j = i
+                taken = 0
+                while j < end:
+                    w = _char_width(tok[j])
+                    if taken + w > avail:
+                        break
+                    taken += w
+                    j += 1
+                if j == i:
+                    # Single wide char into avail<2 (or width=1): take it
+                    # anyway — it would never fit otherwise. Caller's
+                    # downstream truncation handles overflow visually.
+                    j = i + 1
+                    taken = _char_width(tok[i])
+                seg.append(tok[i:j])
+                seg_vis += taken
+                i = j
+
+            if seg_vis >= width:
+                end_row()
+
+    # Flush — always emit at least one row, even for an empty input line.
+    # The "seg_vis > 0" check skips the dangling row that ``end_row``
+    # opens when the input ended exactly at a wrap boundary: ``end_row``
+    # re-emits the active SGR for the next segment, but if no text
+    # follows we'd otherwise emit a content-free row of just the SGR
+    # bytes. Always emit at least one row, though, so an empty input
+    # line still produces a single empty row.
+    if seg_vis > 0 or not rows:
+        if not state.is_empty():
+            seg.append('\033[m')
+        rows.append(''.join(seg))
+
+    return rows
+
+
 def render_preview(browser, rect, *, info=False, has_header=True,
                    rightmost: bool = False):
     """Render the preview pane (header + content) within ``rect``.
