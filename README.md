@@ -88,6 +88,7 @@ Make it executable, run it directly: `chmod +x my-recipe && ./my-recipe`.
 | Ctrl-A / Ctrl-N           | Select all / clear                  |
 | `/`                       | Search; Enter=next, Shift-Enter=prev|
 | Ctrl-P                    | Toggle preview pane                 |
+| `R`                       | Toggle preview ANSI colours         |
 | Shift-Up/Down, Alt-PgUp/Dn| Scroll preview                      |
 | Ctrl-R / Ctrl-L           | Reload / redraw                     |
 | `?` / F1                  | Help                                |

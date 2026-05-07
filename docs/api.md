@@ -333,6 +333,7 @@ Browser(
     multi_select=True,
     print_format='{id}',
     show_ids='auto',                      # 'always' | 'auto' | 'never'
+    preview_ansi=True,                    # honour SGR colour codes in preview
 )
 ```
 

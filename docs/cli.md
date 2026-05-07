@@ -259,6 +259,7 @@ When a placeholder doesn't resolve, `browse-tui` falls back to the bare id.
 | --------------------- | ------------------------------------------------------------ |
 | `--no-preview`        | Start with the preview pane hidden. Toggle live with Ctrl-P. |
 | `--no-children-pane`  | Start with the children-grid pane hidden.                    |
+| `--preview-ansi` / `--no-preview-ansi` | Honour ANSI SGR colour codes in the preview pane (default on). Other escape sequences are stripped either way. Toggle live with capital `R`. |
 | `--no-multi-select`   | Disable the selection set (Space/Alt-Space/Ctrl-A become no-ops). |
 | `--list-size N\|N%`    | Initial list pane size. `N` is a line count (proportional to startup terminal — scales on resize); `N%` locks the proportion. Default `30%`. Adjust live with `-`/`_` (shrink) and `=`/`+` (grow); the ratio is preserved across terminal resizes. |
 | `--split-type TYPE`   | Initial pane layout. Accepts `h`/`horizontal`, `v`/`vertical`, `m`/`mixed`, `pc`/`preview-children`, or `a`/`auto` (default). `auto` picks `v` when terminal width >= 230 columns, else `h`; resolved once at startup and not recomputed on resize. Switch live with `\` (cycles `v`→`h`→`m`→`pc`) or Alt-1/2/3/4. See [Layouts](#layouts) below. |
@@ -428,6 +429,7 @@ charge of how the Browser is configured.
 | Alt-Down       | Scope into cursor item                                      |
 | Alt-Up         | Scope out                                                   |
 | Ctrl-P         | Toggle preview pane                                         |
+| `R`            | Toggle preview ANSI colours (override `--preview-ansi`)     |
 | Shift-Down     | Scroll preview down by 1 line                               |
 | Shift-Up       | Scroll preview up by 1 line                                 |
 | Alt-PgDn       | Scroll preview down by a page                               |
