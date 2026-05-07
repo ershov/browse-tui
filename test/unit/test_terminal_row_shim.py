@@ -103,6 +103,14 @@ class VisibleLenTests(unittest.TestCase):
         # SGR stripped, single wide char counts as 2 cells.
         self.assertEqual(_terminal._visible_len('\033[31m東\033[m'), 2)
 
+    def test_strips_non_sgr_csi(self):
+        # \e[2J (erase display) is non-SGR CSI; must be stripped too.
+        self.assertEqual(_terminal._visible_len('\033[2Jhello'), 5)
+
+    def test_strips_cursor_move_csi(self):
+        # \e[1;1H (cursor position) is non-SGR CSI; must be stripped too.
+        self.assertEqual(_terminal._visible_len('\033[1;1Hhi'), 2)
+
     def test_steady_state_shrink_with_wide_chars_pads_columns(self):
         """End-to-end: shrinking past a wide-char row pads display columns,
         not code points. Without the fix, '東京' would count as 2 instead
@@ -398,6 +406,80 @@ class SyncTests(unittest.TestCase):
         with _StdoutCapture() as cap:
             _terminal.end_sync()
         self.assertEqual(cap.text, '\033[?2026l')
+
+
+class SgrStateTests(unittest.TestCase):
+    """``SgrState`` accumulates SGR sequences and renders the active state."""
+
+    def test_initial_state_is_empty(self):
+        s = _terminal.SgrState()
+        self.assertEqual(s.render(), '')
+        self.assertTrue(s.is_empty())
+
+    def test_feed_single_sequence(self):
+        s = _terminal.SgrState()
+        s.feed('\033[31m')
+        self.assertEqual(s.render(), '\033[31m')
+        self.assertFalse(s.is_empty())
+
+    def test_feed_concatenates(self):
+        # First iteration explicitly does NOT collapse.
+        s = _terminal.SgrState()
+        s.feed('\033[31m')
+        s.feed('\033[1m')
+        self.assertEqual(s.render(), '\033[31m\033[1m')
+        self.assertFalse(s.is_empty())
+
+    def test_feed_reset_no_params_clears(self):
+        s = _terminal.SgrState()
+        s.feed('\033[31m')
+        s.feed('\033[m')
+        self.assertEqual(s.render(), '')
+        self.assertTrue(s.is_empty())
+
+    def test_feed_reset_zero_param_clears(self):
+        s = _terminal.SgrState()
+        s.feed('\033[31m')
+        s.feed('\033[0m')
+        self.assertEqual(s.render(), '')
+        self.assertTrue(s.is_empty())
+
+    def test_feed_multiple_zero_params_is_reset(self):
+        # \e[0;0m and \e[;m are also resets.
+        s = _terminal.SgrState()
+        s.feed('\033[31m')
+        s.feed('\033[0;0m')
+        self.assertEqual(s.render(), '')
+        s.feed('\033[31m')
+        s.feed('\033[;m')
+        self.assertEqual(s.render(), '')
+
+    def test_feed_10m_is_not_reset(self):
+        # \e[10m is a font-selection code, NOT a reset.
+        s = _terminal.SgrState()
+        s.feed('\033[10m')
+        self.assertEqual(s.render(), '\033[10m')
+        self.assertFalse(s.is_empty())
+
+    def test_reset_method_clears(self):
+        s = _terminal.SgrState()
+        s.feed('\033[31m')
+        s.feed('\033[1m')
+        s.reset()
+        self.assertEqual(s.render(), '')
+        self.assertTrue(s.is_empty())
+
+    def test_is_empty_round_trip(self):
+        s = _terminal.SgrState()
+        self.assertTrue(s.is_empty())
+        s.feed('\033[31m')
+        self.assertFalse(s.is_empty())
+        s.feed('\033[m')
+        self.assertTrue(s.is_empty())
+        s.feed('\033[1m')
+        self.assertFalse(s.is_empty())
+        s.reset()
+        self.assertTrue(s.is_empty())
 
 
 # Make _visible_len accessible at module top-level (tests reference it).

@@ -20,6 +20,7 @@ the full Browser through scripted key streams.
 
 import errno
 import os
+import re
 import select
 import signal
 import sys
@@ -138,13 +139,64 @@ def reset_style():
 
 # ---- row-buffer shim: capture + diff against per-pane line cache ---------
 
-def _visible_len(s):
-    """Count visible cells in ``s``, ignoring SGR escape sequences.
+# Match any ANSI CSI sequence: ESC '[' <intermediate bytes> <final letter>.
+# Final byte is any ASCII letter (A-Z / a-z), which covers SGR ('m'), cursor
+# moves ('H', 'A', etc.), erase ('J', 'K'), and other CSI commands. We use
+# the broader CSI form (rather than SGR-only) so non-SGR sequences embedded
+# in captured row content don't leak into width math.
+_ANSI_CSI_RE = re.compile(r'\x1b\[[^a-zA-Z]*[a-zA-Z]')
 
-    Mirrors the SGR-skipping logic in :func:`_truncate_visible` (in
-    050-render.py). Counts characters outside ``\\033[...m`` sequences;
-    other CSI finals (cursor moves) shouldn't appear in captured row
-    output but are also skipped defensively.
+
+class SgrState:
+    """Accumulates SGR sequences seen in a stream; renders the active state.
+
+    First iteration: concatenates all fed sequences verbatim, dropping
+    on ``\\e[m`` / ``\\e[0m``. Future improvement (TODO): track separate
+    fg / bg / attrs slots so :meth:`render` can emit a single minimal
+    combined sequence (e.g. fg overwrite drops the previous fg code).
+    """
+
+    def __init__(self):
+        # Concatenated SGR sequences seen since last reset.
+        self._buf = ''
+
+    def feed(self, sgr_seq):
+        """Apply one ``\\e[...m`` sequence. ``\\e[m`` or ``\\e[0m`` clears.
+
+        Reset detection: extract the parameter portion (between ``[`` and
+        ``m``), split on ``;``, and treat as a reset iff every component
+        is empty or ``'0'``. This handles ``\\e[m``, ``\\e[0m``,
+        ``\\e[0;0m``, ``\\e[;m`` as resets while leaving ``\\e[10m`` (a
+        font-selection code, NOT a reset) alone.
+        """
+        # Defensive: only handle SGR sequences (ending in 'm' with the
+        # CSI prefix). Anything else is a no-op.
+        if not (sgr_seq.startswith('\033[') and sgr_seq.endswith('m')):
+            return
+        params = sgr_seq[2:-1].split(';')
+        if all(p == '' or p == '0' for p in params):
+            self._buf = ''
+            return
+        self._buf += sgr_seq
+
+    def render(self):
+        """Return the active state as bytes (or ``''`` if empty)."""
+        return self._buf
+
+    def is_empty(self):
+        return not self._buf
+
+    def reset(self):
+        self._buf = ''
+
+
+def _visible_len(s):
+    """Count visible cells in ``s``, ignoring ANSI CSI escape sequences.
+
+    Mirrors the escape-skipping logic in :func:`_truncate_visible` (in
+    050-render.py). Strips any CSI sequence (``\\033[...<final>``) before
+    counting -- not just SGR -- so cursor moves, erase commands, etc.
+    embedded in captured row output don't leak into width math.
 
     Returns display columns rather than code points: characters whose
     East Asian Width is Wide (``W``) or Fullwidth (``F``) -- e.g. CJK
@@ -154,25 +206,10 @@ def _visible_len(s):
     under-count and trailing ghost cells could remain on screen when
     content shrinks in a non-rightmost pane.
     """
+    stripped = _ANSI_CSI_RE.sub('', s)
     visible = 0
-    i = 0
-    n = len(s)
-    while i < n:
-        ch = s[i]
-        if ch == '\033' and i + 1 < n and s[i + 1] == '[':
-            j = i + 2
-            while j < n:
-                cj = s[j]
-                if '@' <= cj <= '~':
-                    break
-                j += 1
-            if j < n:
-                i = j + 1
-                continue
-            # Unterminated escape — stop counting.
-            break
+    for ch in stripped:
         visible += 2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1
-        i += 1
     return visible
 
 
