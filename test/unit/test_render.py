@@ -1201,6 +1201,29 @@ class _MockState:
         self._children = {}
 
 
+class _AutoPaneCache(dict):
+    """Auto-populating ``_pane_cache`` for tests that bypass the orchestrator.
+
+    After ticket #228 the per-pane renderers no longer self-create their
+    cache entries — ``_reconcile_pane_caches`` (called from
+    ``render_full`` / ``render_partial``) is the single dispatch site.
+    Tests that call renderers directly (without going through the
+    orchestrator) used to rely on the renderer's ``setdefault`` to
+    create the entry; this stand-in restores that convenience by
+    auto-creating an empty ``PaneCache`` on missing-key lookup.
+
+    Note: the resulting cache has ``rect=None``, so ``begin_row`` /
+    ``end_row`` would fail to size ``cache.lines``. Tests that exercise
+    the cache-state path must still seed the cache via ``update_rect``
+    (see ``_seed_pane_cache``).
+    """
+
+    def __missing__(self, key):
+        cache = _state.PaneCache()
+        self[key] = cache
+        return cache
+
+
 class _MockBrowser:
     """Minimal Browser stand-in for render_list."""
 
@@ -1218,7 +1241,11 @@ class _MockBrowser:
         self._preview_scroll = 0
         self._needs_redraw = set()
         # Per-pane row cache used by the differential renderer (#187).
-        self._pane_cache = {}
+        # Auto-populating dict (#228) — renderers post-refactor no longer
+        # ``setdefault`` their entries; production wiring goes through
+        # ``_reconcile_pane_caches`` upstream. Tests calling renderers
+        # directly get an empty ``PaneCache`` on first lookup.
+        self._pane_cache = _AutoPaneCache()
         self.show_ids = 'auto'
         self.show_preview = True
         self.show_children_pane = False
@@ -1792,11 +1819,23 @@ class TestSeparatorCacheZeroBytes(unittest.TestCase):
         self._stdout.seek(0)
         return text
 
+    def _reconcile(self, browser, name, rect):
+        """Mimic the orchestrator's per-frame ``_reconcile_pane_caches``.
+
+        Post-#228 the renderers no longer self-reconcile their cache
+        rect — that's the single dispatch site's job. Tests that
+        exercise the renderer in isolation must do the equivalent
+        ``update_rect`` step before each paint.
+        """
+        cache = browser._pane_cache.setdefault(name, _state.PaneCache())
+        cache.update_rect(rect)
+
     def test_vertical_separator_zero_bytes_on_second_paint(self):
         browser = _MockBrowser(_MockState([]))
         rect = Rect(left=20, top=2, right=21, bottom=8)  # height=6, width=1
 
         # First paint: cache empty → emits.
+        self._reconcile(browser, 'sep_main', rect)
         _render.render_separator(rect, cache_key='sep_main', browser=browser)
         first = self._drain()
         self.assertIn('│', first, 'first paint must emit the bar glyphs')
@@ -1808,6 +1847,7 @@ class TestSeparatorCacheZeroBytes(unittest.TestCase):
             self.assertIsNotNone(line, f'lines[{i}] should be cached')
 
         # Second paint with the same rect → zero bytes.
+        self._reconcile(browser, 'sep_main', rect)
         _render.render_separator(rect, cache_key='sep_main', browser=browser)
         second = self._drain()
         self.assertEqual(second, '',
@@ -1817,18 +1857,23 @@ class TestSeparatorCacheZeroBytes(unittest.TestCase):
         browser = _MockBrowser(_MockState([]))
         rect = Rect(left=1, top=10, right=21, bottom=11)  # height=1, width=20
 
+        self._reconcile(browser, 'sep_main', rect)
         _render.render_separator(rect, cache_key='sep_main', browser=browser)
         self.assertIn('─', self._drain())
         cache = browser._pane_cache['sep_main']
         self.assertIsNotNone(cache.lines[0])
 
+        self._reconcile(browser, 'sep_main', rect)
         _render.render_separator(rect, cache_key='sep_main', browser=browser)
         self.assertEqual(self._drain(), '')
 
     def test_info_bar_zero_bytes_on_second_paint(self):
         browser = _MockBrowser(_MockState([]))
 
-        # First paint at row 24, cols=80.
+        # First paint at row 24, cols=80. ``render_info_bar`` builds an
+        # implicit one-row rect spanning [1, cols+1).
+        rect = Rect(left=1, top=24, right=81, bottom=25)
+        self._reconcile(browser, 'info_bar', rect)
         _render.render_info_bar(
             24, 80, 'Preview', info=False, browser=browser,
             rightmost=True, manage_cache=True,
@@ -1841,6 +1886,7 @@ class TestSeparatorCacheZeroBytes(unittest.TestCase):
                              'info_bar cache must be populated')
 
         # Second paint, same row/cols/label/state → zero bytes.
+        self._reconcile(browser, 'info_bar', rect)
         _render.render_info_bar(
             24, 80, 'Preview', info=False, browser=browser,
             rightmost=True, manage_cache=True,
@@ -1857,8 +1903,10 @@ class TestSeparatorCacheZeroBytes(unittest.TestCase):
         rect_a = Rect(left=20, top=2, right=21, bottom=8)
         rect_b = Rect(left=20, top=2, right=21, bottom=10)  # taller
 
+        self._reconcile(browser, 'sep_main', rect_a)
         _render.render_separator(rect_a, cache_key='sep_main', browser=browser)
         self._drain()
+        self._reconcile(browser, 'sep_main', rect_b)
         _render.render_separator(rect_b, cache_key='sep_main', browser=browser)
         self.assertNotEqual(self._drain(), '',
                             'rect change must force emission')

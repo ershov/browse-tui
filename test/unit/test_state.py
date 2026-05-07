@@ -242,6 +242,110 @@ class TestPaneCache(unittest.TestCase):
         self.assertEqual(c.prev_rect, r2)
 
 
+class TestPaneCacheUpdateRect(unittest.TestCase):
+    """``PaneCache.update_rect`` is the single per-frame entry point
+    introduced in ticket #228. It subsumes both the old per-renderer
+    ``ensure`` call AND the orchestrator-level ``_mark_disappeared_panes``
+    sentinel stamp.
+    """
+
+    def test_update_rect_none_on_populated_cache_stamps_sentinel(self):
+        c = PaneCache()
+        r1 = _FakeRect(1, 1, 81, 25)
+        c.update_rect(r1)
+        c.lines[0] = (10, 'hello world')
+        # Pane disappeared this frame.
+        c.update_rect(None)
+        self.assertEqual(c.lines, [])
+        # Cache.rect is now the sentinel (compares unequal to any real rect).
+        self.assertNotEqual(c.rect, r1)
+        self.assertNotEqual(c.rect, _FakeRect(1, 1, 81, 25))
+        # And a real-rect update_rect on the sentinel-stamped cache
+        # takes the rect-changed (invalidate) branch on reappear.
+        r1_again = _FakeRect(1, 1, 81, 25)
+        c.update_rect(r1_again)
+        self.assertEqual(c.rect, r1_again)
+        # prev_rect after invalidate is the prior rect (the sentinel) —
+        # NOT equal to the new rect, so end_row routes through the
+        # "rect changed → full pad" path. This is the regression the
+        # ticket targets (#221).
+        self.assertNotEqual(c.prev_rect, c.rect)
+
+    def test_update_rect_none_on_unpainted_cache_is_noop(self):
+        """An empty cache stays empty when ``update_rect(None)`` runs.
+
+        No populated state to invalidate; the sentinel stamp is skipped
+        so we don't accumulate phantom history.
+        """
+        c = PaneCache()
+        c.update_rect(None)
+        self.assertIsNone(c.rect)
+        self.assertIsNone(c.prev_rect)
+        self.assertEqual(c.lines, [])
+
+    def test_update_rect_none_on_already_sentinel_is_noop(self):
+        """Repeated ``update_rect(None)`` doesn't churn the cache."""
+        c = PaneCache()
+        r1 = _FakeRect(1, 1, 81, 25)
+        c.update_rect(r1)
+        c.update_rect(None)
+        sentinel_rect = c.rect
+        sentinel_lines = c.lines
+        c.update_rect(None)
+        self.assertIs(c.rect, sentinel_rect,
+                      'sentinel rect should not be re-stamped')
+        self.assertIs(c.lines, sentinel_lines,
+                      'lines should not be re-cleared')
+
+    def test_update_rect_same_rect_is_noop_after_invalidate(self):
+        """First call after invalidate does NOT roll prev_rect forward.
+
+        Mirrors the old ``ensure`` semantics: the FIRST paint at a new
+        rect is in "rect changed" regime (prev_rect != rect). The
+        single-call-per-frame contract means the renderer paints
+        between this call and the next ``update_rect``.
+        """
+        c = PaneCache()
+        r1 = _FakeRect(1, 1, 81, 25)
+        c.update_rect(r1)
+        # State: rect=r1, prev_rect=None — first paint regime.
+        self.assertEqual(c.rect, r1)
+        self.assertIsNone(c.prev_rect)
+
+    def test_update_rect_same_rect_rolls_prev_rect_on_second_call(self):
+        """Second call with the same rect rolls prev_rect to rect.
+
+        Steady-state engagement: end_row pads to cached visible length
+        from the second paint onwards.
+        """
+        c = PaneCache()
+        r1 = _FakeRect(1, 1, 81, 25)
+        c.update_rect(r1)
+        c.update_rect(_FakeRect(1, 1, 81, 25))
+        self.assertEqual(c.rect, r1)
+        self.assertEqual(c.prev_rect, r1)
+        # Third call is a true no-op.
+        c.update_rect(_FakeRect(1, 1, 81, 25))
+        self.assertEqual(c.rect, r1)
+        self.assertEqual(c.prev_rect, r1)
+
+    def test_update_rect_new_rect_invalidates_with_prev_old_rect(self):
+        """A different rect invalidates and rotates: prev_rect = old rect."""
+        c = PaneCache()
+        r1 = _FakeRect(1, 1, 81, 25)
+        r2 = _FakeRect(1, 1, 81, 30)
+        # Establish steady state at r1.
+        c.update_rect(r1)
+        c.update_rect(r1)
+        self.assertEqual(c.prev_rect, r1)
+        # Resize: prev_rect rotates to r1, rect becomes r2, lines reset.
+        c.update_rect(r2)
+        self.assertEqual(c.rect, r2)
+        self.assertEqual(c.prev_rect, r1)
+        self.assertEqual(len(c.lines), 29)
+        self.assertTrue(all(line is None for line in c.lines))
+
+
 class TestBrowserPaneCacheInit(unittest.TestCase):
     """Browser.__init__ initialises ``_pane_cache`` to an empty dict."""
 

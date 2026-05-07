@@ -247,44 +247,47 @@ class Rect:
                 .format(self.left, self.top, self.right, self.bottom))
 
 
-# Sentinel rect for marking a PaneCache whose pane disappeared between
-# paints (e.g. layout 'v'/'m'/'pc' children/sep_inner panes when the
-# cursor moves onto a no-children item). Stored in ``cache.rect`` so
-# the next ``ensure(real_rect)`` sees a mismatch and runs ``invalidate``,
-# which routes ``end_row`` through the "rect changed → full pad" path
-# and clears the cells the preview pane overwrote while the children
-# pane was hidden. The negative-coordinate values can never collide
-# with a real screen rect (which uses 1-based positive coords).
-_SENTINEL_RECT = Rect(-1, -1, -1, -1)
+def _reconcile_pane_caches(browser, layout):
+    """Reconcile per-pane row caches with the layout for this frame.
 
+    Single dispatch site that owns the layout→cache mapping. Replaces
+    the old per-renderer ``cache.ensure(rect)`` call AND the
+    orchestrator-level ``_mark_disappeared_panes`` pass (see ticket
+    #228). Called once from ``render_full`` / ``render_partial``
+    immediately after ``_layout_for``.
 
-def _mark_disappeared_panes(browser, layout):
-    """Invalidate caches for panes absent from ``layout`` but cached previously.
+    For each known cache key, picks the corresponding rect from the
+    layout (``None`` for hidden panes) and routes it through
+    :meth:`PaneCache.update_rect`, which handles all three transitions
+    (hidden, steady, geometry-changed) in one place.
 
-    Panes appear and disappear across layouts (e.g. ``children`` /
-    ``sep_inner`` go None when the cursor crosses leaf/branch
-    boundaries; ``sep_main`` is None in layout ``h`` but a Rect in
-    ``v``/``m``/``pc``; ``preview`` toggles via the show-preview key).
-    When a pane disappears, neighbouring panes expand to overwrite its
-    cells. If it then reappears with the same geometry, the
-    differential renderer sees ``cache.rect == new_rect`` in
-    ``PaneCache.ensure`` and the steady-state ``end_row`` path would
-    cache-hit on unchanged content, emitting nothing — leaving the
-    overwritten cells stale.
+    The 'info_bar' cache uses ``layout.get('info_bar')`` directly even
+    though the layout entry is non-None in BOTH 'h' (where the bar is
+    folded into the preview/children pane header at row R_h) AND
+    v/m/pc (standalone bottom row at row R_v). The two rects differ
+    (different rows), so ``update_rect`` invalidates correctly across
+    layout switches — the centralized rect transition catches the
+    case the old per-renderer ``cache.ensure(rect)`` missed when
+    intermediate layouts didn't paint through this cache. This closes
+    ticket #221 (info_bar v→h→v stale).
 
-    Force the next reappear to take the full-pad path by stamping the
-    cache's ``rect`` with ``_SENTINEL_RECT``: the next ``ensure`` finds
-    ``self.rect != new_rect`` and calls ``invalidate``. Iterates over
-    every cache so any pane whose rect transitioned non-None → None is
-    handled (not just children/sep_inner). Already-sentinel caches are
-    skipped to avoid redundant work.
+    Critical invariant: ``update_rect`` must be called EXACTLY ONCE per
+    cache per frame. The renderers no longer touch ``cache.ensure`` /
+    ``cache.prev_rect`` themselves — they look up the already-reconciled
+    cache from ``browser._pane_cache``.
     """
-    for name in list(browser._pane_cache.keys()):
-        if layout.get(name) is None:
-            cache = browser._pane_cache[name]
-            if cache.rect is not None and cache.rect != _SENTINEL_RECT:
-                cache.rect = _SENTINEL_RECT
-                cache.lines = []
+    cache_rects = {
+        'list':      layout.get('list'),
+        'preview':   layout.get('preview'),
+        'children':  layout.get('children'),
+        'sep_main':  layout.get('sep_main'),
+        'sep_inner': layout.get('sep_inner'),
+        'info_bar':  layout.get('info_bar'),
+    }
+
+    for name, rect in cache_rects.items():
+        cache = browser._pane_cache.setdefault(name, PaneCache())
+        cache.update_rect(rect)
 
 
 def point_in_rect(row, col, rect):
@@ -1105,8 +1108,10 @@ def render_list(browser, rect, *, rightmost: bool = False):
     left = rect.left
     right = rect.right
 
-    cache = browser._pane_cache.setdefault('list', PaneCache())
-    cache.ensure(rect)
+    # Cache state was reconciled by ``_reconcile_pane_caches`` upstream
+    # (single per-frame entry point — see ticket #228). The renderer
+    # just looks the cache up by name.
+    cache = browser._pane_cache['list']
 
     state = browser._state
     visible = visible_items(state)
@@ -1233,12 +1238,6 @@ def render_list(browser, rect, *, rightmost: bool = False):
                 _write_segments(segments, width)
         end_row()
 
-    # Commit the rect: after a complete paint of this geometry, the
-    # next paint may hit the cache. ``prev_rect`` becoming equal to
-    # ``rect`` is the gate end_row uses to enable cache hits.
-    cache.prev_rect = cache.rect
-
-
 def render_preview(browser, rect, *, info=False, has_header=True,
                    rightmost: bool = False):
     """Render the preview pane (header + content) within ``rect``.
@@ -1277,8 +1276,7 @@ def render_preview(browser, rect, *, info=False, has_header=True,
     left = rect.left
     right = rect.right
 
-    cache = browser._pane_cache.setdefault('preview', PaneCache())
-    cache.ensure(rect)
+    cache = browser._pane_cache['preview']
 
     if has_header:
         label = _preview_label(browser)
@@ -1300,7 +1298,6 @@ def render_preview(browser, rect, *, info=False, has_header=True,
         content_lines = height
         content_row_offset = 0
     if content_lines <= 0:
-        cache.prev_rect = cache.rect
         return
 
     if browser._error_text:
@@ -1346,8 +1343,6 @@ def render_preview(browser, rect, *, info=False, has_header=True,
         if src_idx < len(wrapped):
             write(wrapped[src_idx])
         end_row()
-
-    cache.prev_rect = cache.rect
 
 
 def _cursor_id(browser):
@@ -1419,8 +1414,7 @@ def render_children_grid(browser, rect, *, info=False, has_header=True,
     left = rect.left
     right = rect.right
 
-    cache = browser._pane_cache.setdefault('children', PaneCache())
-    cache.ensure(rect)
+    cache = browser._pane_cache['children']
 
     if has_header:
         # Header row participates in the cache so a static info bar
@@ -1559,10 +1553,10 @@ def render_children_list(browser, rect, *, info=False, has_header=True,
     right = rect.right
 
     # render_children_list and render_children_grid share the 'children'
-    # cache key — the rect-based ensure() invalidates the buffer on
-    # layout style switches (vertical ↔ flowed grid) automatically.
-    cache = browser._pane_cache.setdefault('children', PaneCache())
-    cache.ensure(rect)
+    # cache key — the rect-based update_rect() invalidates the buffer on
+    # layout style switches (vertical ↔ flowed grid) automatically. The
+    # cache state is reconciled by ``_reconcile_pane_caches`` upstream.
+    cache = browser._pane_cache['children']
 
     if has_header:
         begin_row(cache, 0, top, left, right, rightmost=rightmost)
@@ -1708,8 +1702,9 @@ def render_separator(rect, *, orientation=None, content=None,
 
     use_cache = cache_key is not None and browser is not None
     if use_cache:
-        cache = browser._pane_cache.setdefault(cache_key, PaneCache())
-        cache.ensure(rect)
+        # Cache state was reconciled by ``_reconcile_pane_caches``
+        # upstream (#228). The renderer just looks the cache up.
+        cache = browser._pane_cache[cache_key]
 
     if orientation == 'v':
         # Draw the vertical bar down the rect's left column. Most
@@ -1727,7 +1722,6 @@ def render_separator(rect, *, orientation=None, content=None,
                 write('│')
                 reset_style()
                 end_row()
-            cache.prev_rect = cache.rect
         else:
             set_style(fg=8)
             for r in range(rect.top, rect.bottom):
@@ -1773,7 +1767,6 @@ def render_separator(rect, *, orientation=None, content=None,
 
     if use_cache:
         end_row()
-        cache.prev_rect = cache.rect
 
 
 def render_info_bar(row, cols, label, *, info=False, browser=None,
@@ -1816,11 +1809,9 @@ def render_info_bar(row, cols, label, *, info=False, browser=None,
     """
     use_cache = manage_cache and browser is not None and cols > 0
     if use_cache:
-        # Build a one-row pane Rect spanning [1, cols+1) at row ``row``.
-        # ``Rect.right`` and ``Rect.bottom`` are exclusive per convention.
-        rect = Rect(left=1, top=row, right=cols + 1, bottom=row + 1)
-        cache = browser._pane_cache.setdefault('info_bar', PaneCache())
-        cache.ensure(rect)
+        # Cache state was reconciled by ``_reconcile_pane_caches``
+        # upstream (#228) — the renderer just looks the cache up.
+        cache = browser._pane_cache['info_bar']
         begin_row(cache, 0, row, 1, cols + 1, rightmost=rightmost)
 
     S = '─'  # ─
@@ -1913,7 +1904,6 @@ def render_info_bar(row, cols, label, *, info=False, browser=None,
 
     if use_cache:
         end_row()
-        cache.prev_rect = cache.rect
 
 
 # ---------------------------------------------------------------------------
@@ -2056,7 +2046,7 @@ def render_full(browser):
     """
     begin_sync()
     layout = _layout_for(browser)
-    _mark_disappeared_panes(browser, layout)
+    _reconcile_pane_caches(browser, layout)
     sub_info, prev_info = _pane_info_flags(layout)
     info_separate = _info_bar_is_separate(layout)
     list_rect = layout['list']
@@ -2145,7 +2135,7 @@ def render_partial(browser):
 
     begin_sync()
     layout = _layout_for(browser)
-    _mark_disappeared_panes(browser, layout)
+    _reconcile_pane_caches(browser, layout)
     sub_info, prev_info = _pane_info_flags(layout)
     info_separate = _info_bar_is_separate(layout)
     list_rect = layout['list']

@@ -242,6 +242,62 @@ class TestChildrenPaneRedraw(unittest.TestCase):
                     f'separator column {col} missing after v→h→v '
                     f'(was {sep_cols0}, now {sep_cols1}):\n{screen_v1}')
 
+    def test_info_bar_redraws_after_v_h_v_round_trip(self):
+        """v → h → v: the standalone bottom info bar must contain ``Preview``.
+
+        Regression for ticket #221 (closed by #228). In layout 'h' the
+        info bar is folded into the preview pane's first row (drawn by
+        ``render_preview``); in v/m/pc it's a standalone row at the
+        bottom of the screen (drawn by ``render_info_bar`` with its own
+        cache). The old ``_mark_disappeared_panes`` predicate looked
+        only at ``layout.get('info_bar') is None`` which is never true
+        — the layout key is non-None in both cases, but the standalone
+        ``info_bar`` cache is only USED in the v/m/pc case. After v→h
+        the bottom row is overwritten by the list pane's expansion;
+        after h→v the cache hit on the (still-cached) "Preview" label
+        emits nothing, leaving blank cells.
+
+        ``_reconcile_pane_caches`` (#228) handles this conditionally:
+        when ``_info_bar_is_separate(layout)`` is False (h layout), the
+        standalone ``info_bar`` cache is reconciled with ``rect=None``,
+        stamping the sentinel so the next reappear goes through the
+        full-pad path.
+        """
+        with TmuxFixture(cols=240, rows=40) as t:
+            self._launch(t)
+
+            # Initial vertical layout: bottom row should contain "Preview"
+            # (the standalone info bar's label).
+            screen_v0 = t.capture()
+            v0_lines = screen_v0.splitlines()
+            self.assertTrue(
+                v0_lines, f'empty initial screen capture:\n{screen_v0}')
+            self.assertIn(
+                'Preview', v0_lines[-1],
+                f'expected "Preview" in bottom row at startup; got:\n{screen_v0}')
+
+            # Switch to horizontal — Alt-2.
+            t.send('M-2')
+            t.wait_stable(timeout=3.0)
+            t.capture()  # discard intermediate state
+
+            # Switch back to vertical — Alt-1.
+            t.send('M-1')
+            t.wait_stable(timeout=3.0)
+            screen_v1 = t.capture()
+            v1_lines = screen_v1.splitlines()
+            self.assertTrue(
+                v1_lines, f'empty post-bounce screen capture:\n{screen_v1}')
+            # The bottom row must again contain "Preview" — this is the
+            # standalone bottom info bar in v layout. Without the fix in
+            # #228, the info_bar cache hit on its still-cached label
+            # emits nothing; the cells were overwritten while the bar
+            # was folded into the preview pane's header in h layout.
+            self.assertIn(
+                'Preview', v1_lines[-1],
+                f'expected "Preview" in bottom row after v→h→v; '
+                f'final capture:\n{screen_v1}')
+
     def test_children_pane_survives_repeated_bounce(self):
         """Bouncing A → B → A → B → A several times still ends clean."""
         with TmuxFixture(cols=240, rows=40) as t:

@@ -159,6 +159,12 @@ class PaneCache:
         stays at its post-invalidate value (``None`` after the first ever
         paint, or the prior rect after a resize) forever, and stale
         content from prior renders never gets cleared.
+
+        DEPRECATED in favour of :meth:`update_rect`, which centralises
+        the per-frame cache-state transition (including the "pane
+        disappeared this frame" case, formerly handled by a separate
+        orchestrator-level pass — see ticket #228). Retained for unit
+        tests that still exercise the old per-renderer API.
         """
         if self.rect != new_rect:
             self.invalidate(new_rect)
@@ -167,6 +173,94 @@ class PaneCache:
             # padding pass. Roll ``prev_rect`` forward so subsequent paints
             # take the steady-state branch in ``end_row``.
             self.prev_rect = self.rect
+
+    def update_rect(self, rect) -> None:
+        """Reconcile cache state with the pane's geometry for this frame.
+
+        Single per-frame entry point that subsumes both the old
+        per-renderer ``ensure`` call and the orchestrator-level
+        "disappeared pane" stamp (formerly ``_mark_disappeared_panes``
+        in 050-render.py). See ticket #228 for the motivation.
+
+        Three branches:
+
+          * ``rect is None`` — the pane is hidden this frame. If the
+            cache currently holds a real geometry (not the sentinel and
+            not unpainted), stamp the sentinel so the next ``update_rect``
+            with a real rect is forced through the rect-changed path
+            (full pad on reappear, clearing cells overwritten by
+            neighbouring panes while the pane was hidden).
+          * ``rect == self.rect`` — steady state. On the second call
+            after an ``invalidate`` (where ``prev_rect != rect``), roll
+            ``prev_rect`` forward so subsequent paints take the
+            steady-state branch in ``end_row``. Otherwise no-op.
+          * ``rect != self.rect`` — geometry changed (resize, move, or
+            reappear after hide). Invalidate to the new rect.
+
+        Critical invariant: this method must be called EXACTLY ONCE per
+        cache per frame. Calling it twice on a fresh-rect frame would
+        roll ``prev_rect`` forward inside that same frame, putting
+        ``end_row`` into steady-state regime and under-padding the row.
+        """
+        if rect is None:
+            if self.rect is not None and self.rect != _SENTINEL_RECT:
+                self.rect = _SENTINEL_RECT
+                self.lines = []
+            return
+        if self.rect != rect:
+            self.invalidate(rect)
+        elif self.prev_rect != self.rect:
+            # The rect-change signal was consumed by the prior paint's
+            # padding pass. Roll ``prev_rect`` forward so subsequent paints
+            # take the steady-state branch in ``end_row``.
+            self.prev_rect = self.rect
+
+
+# Sentinel rect used by :meth:`PaneCache.update_rect` to mark a cache
+# whose pane was hidden between paints (e.g. layout 'v'/'m'/'pc'
+# children/sep_inner panes when the cursor moves onto a no-children
+# item). Stored in ``cache.rect`` so the next ``update_rect(real_rect)``
+# sees a mismatch and runs ``invalidate``, routing ``end_row`` through
+# the "rect changed → full pad" path and clearing cells the neighbour
+# overwrote while the pane was hidden. The negative-coordinate values
+# can never collide with a real screen rect (which uses 1-based positive
+# coords). The sentinel is constructed from a duck-typed shim with the
+# same surface area as ``Rect`` (``__eq__`` / ``__hash__`` / ``height``)
+# because the concatenated build order puts ``Rect`` (in 050-render.py)
+# AFTER this file at module load time — depending on it here would
+# crash the unit-test loader, which loads 040-state.py standalone.
+class _SentinelRect:
+    """Duck-typed Rect stand-in for the disappeared-pane sentinel.
+
+    Implements the minimal surface PaneCache needs (``__eq__`` /
+    ``__hash__`` / ``height``). Compares unequal to any real ``Rect``
+    so ``update_rect`` always takes the rect-changed branch on the
+    next reappear.
+    """
+
+    __slots__ = ('left', 'top', 'right', 'bottom')
+
+    def __init__(self, left, top, right, bottom):
+        self.left = left
+        self.top = top
+        self.right = right
+        self.bottom = bottom
+
+    @property
+    def height(self):
+        return self.bottom - self.top
+
+    def __eq__(self, other):
+        return self is other
+
+    def __hash__(self):
+        return id(self)
+
+    def __repr__(self):
+        return '_SENTINEL_RECT'
+
+
+_SENTINEL_RECT = _SentinelRect(-1, -1, -1, -1)
 
 
 # A single rendered row produced by ``visible_items``.
