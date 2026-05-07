@@ -351,7 +351,17 @@ def _handle_sigtstp(signum, frame):
     signal.signal(signal.SIGCONT, _handle_sigcont)
 
 def _handle_sigcont(signum, frame):
-    """Re-enter raw mode after being resumed from a SIGTSTP stop."""
+    """Re-enter raw mode after being resumed from a SIGTSTP stop.
+
+    Note: ``_enter_raw`` performs buffered stdio (``sys.stdout.buffer.write``
+    + ``flush``), which is safe here BECAUSE Python dispatches signal
+    handlers only at bytecode checkpoints between interpreter ops — not
+    inside arbitrary C calls — so we cannot re-enter stdio mid-write. See
+    ``_handle_sigtstp``'s docstring for the fuller discussion of Python's
+    bytecode-checkpoint signal dispatch model. A future port to a stricter
+    signal-safety regime (ctypes trampolines, asyncio signal integration,
+    etc.) would need to revisit this.
+    """
     global g_resize_flag, g_screen_lost_flag
     _enter_raw()
     # Re-register SIGTSTP handler (it was set to SIG_DFL before stop)
