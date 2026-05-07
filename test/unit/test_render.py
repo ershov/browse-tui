@@ -1202,26 +1202,40 @@ class _MockState:
 
 
 class _AutoPaneCache(dict):
-    """Auto-populating ``_pane_cache`` for tests that bypass the orchestrator.
+    """``_pane_cache`` stand-in that fails loud on un-reconciled lookups.
 
-    After ticket #228 the per-pane renderers no longer self-create their
-    cache entries — ``_reconcile_pane_caches`` (called from
-    ``render_full`` / ``render_partial``) is the single dispatch site.
+    After ticket #228 the per-pane renderers no longer self-create
+    their cache entries — ``_reconcile_pane_caches`` (called from
+    ``render_full`` / ``render_partial``) is the single dispatch site
+    that runs ``cache.update_rect(rect)`` once per frame.
+
     Tests that call renderers directly (without going through the
-    orchestrator) used to rely on the renderer's ``setdefault`` to
-    create the entry; this stand-in restores that convenience by
-    auto-creating an empty ``PaneCache`` on missing-key lookup.
-
-    Note: the resulting cache has ``rect=None``, so ``begin_row`` /
-    ``end_row`` would fail to size ``cache.lines``. Tests that exercise
-    the cache-state path must still seed the cache via ``update_rect``
-    (see ``_seed_pane_cache``).
+    orchestrator) must seed the cache themselves — typically via the
+    ``_reconcile`` helper on the test class. Forgetting that step used
+    to surface as an opaque ``IndexError`` deep inside ``end_row`` (an
+    auto-created cache has ``lines == []`` so ``lines[rel_row] = …``
+    blows up). The loud ``KeyError`` here points the test author at
+    the discipline they missed instead.
     """
 
     def __missing__(self, key):
-        cache = _state.PaneCache()
-        self[key] = cache
-        return cache
+        raise KeyError(
+            f"PaneCache {key!r} not reconciled — call "
+            f"_reconcile(browser, {key!r}, rect) (or run through "
+            "_reconcile_pane_caches) before invoking the renderer."
+        )
+
+
+def _reconcile(browser, name, rect):
+    """Mimic the orchestrator's per-frame ``_reconcile_pane_caches``.
+
+    Tests that drive a renderer in isolation (without going through
+    ``render_full`` / ``render_partial``) must seed the relevant
+    cache via this helper before each paint, since post-#228 the
+    renderers no longer self-create their entries.
+    """
+    cache = browser._pane_cache.setdefault(name, _state.PaneCache())
+    cache.update_rect(rect)
 
 
 class _MockBrowser:
@@ -1241,10 +1255,10 @@ class _MockBrowser:
         self._preview_scroll = 0
         self._needs_redraw = set()
         # Per-pane row cache used by the differential renderer (#187).
-        # Auto-populating dict (#228) — renderers post-refactor no longer
-        # ``setdefault`` their entries; production wiring goes through
-        # ``_reconcile_pane_caches`` upstream. Tests calling renderers
-        # directly get an empty ``PaneCache`` on first lookup.
+        # Tests that call renderers directly must reconcile the cache
+        # via ``self._reconcile(...)`` before each paint; otherwise the
+        # ``__missing__`` hook on ``_AutoPaneCache`` raises a pointed
+        # ``KeyError`` instead of a confusing downstream ``IndexError``.
         self._pane_cache = _AutoPaneCache()
         self.show_ids = 'auto'
         self.show_preview = True
@@ -1313,6 +1327,7 @@ class TestRenderListRectClipping(unittest.TestCase):
         browser = self._make_browser_with_items(items)
         # Pane offset to the right (column 41 onwards).
         rect = Rect(left=41, top=1, right=81, bottom=3)
+        _reconcile(browser, 'list', rect)
         _render.render_list(browser, rect)
         moves = [e for e in self.cap.events if e[0] == 'move']
         # Every move should be to column 41 (or further right within
@@ -1335,6 +1350,7 @@ class TestRenderListRectClipping(unittest.TestCase):
         items = [Item(id='a')]
         browser = self._make_browser_with_items(items)
         rect = Rect(left=41, top=1, right=81, bottom=3)
+        _reconcile(browser, 'list', rect)
         _render.render_list(browser, rect)
         clear_calls = [e for e in self.cap.events if e[0] == 'clear_columns']
         # We expect at least one clear_columns call per rendered row,
@@ -1416,6 +1432,7 @@ class TestRenderChildrenList(unittest.TestCase):
         ]
         browser = self._browser_with_children(parent, children)
         rect = Rect(left=10, top=1, right=30, bottom=10)
+        _reconcile(browser, 'children', rect)
         _render.render_children_list(browser, rect, has_header=False)
 
         # Each child name must appear exactly once in the flat output.
@@ -1443,6 +1460,7 @@ class TestRenderChildrenList(unittest.TestCase):
         browser = self._browser_with_children(parent, children)
         # Width = 30 - 10 = 20 cols.
         rect = Rect(left=10, top=1, right=30, bottom=5)
+        _reconcile(browser, 'children', rect)
         _render.render_children_list(browser, rect, has_header=False)
         flat = ''.join(self.cap.flat)
         # The 'X' run was truncated — fewer than the original 200.
@@ -1453,6 +1471,7 @@ class TestRenderChildrenList(unittest.TestCase):
         children = [Item(id='c', title='only')]
         browser = self._browser_with_children(parent, children)
         rect = Rect(left=10, top=1, right=30, bottom=5)
+        _reconcile(browser, 'children', rect)
         _render.render_children_list(browser, rect, has_header=False)
         clear_calls = [e for e in self.cap.events if e[0] == 'clear_columns']
         self.assertTrue(clear_calls)
@@ -1476,6 +1495,7 @@ class TestRenderChildrenList(unittest.TestCase):
         _render.visible_items = lambda s: state._visible
         browser = _MockBrowser(state, split='v', show_children_pane=True)
         rect = Rect(left=10, top=1, right=30, bottom=5)
+        _reconcile(browser, 'children', rect)
         _render.render_children_list(browser, rect, has_header=False)
         flat = ''.join(self.cap.flat)
         self.assertIn('loading', flat)
@@ -1819,16 +1839,7 @@ class TestSeparatorCacheZeroBytes(unittest.TestCase):
         self._stdout.seek(0)
         return text
 
-    def _reconcile(self, browser, name, rect):
-        """Mimic the orchestrator's per-frame ``_reconcile_pane_caches``.
-
-        Post-#228 the renderers no longer self-reconcile their cache
-        rect — that's the single dispatch site's job. Tests that
-        exercise the renderer in isolation must do the equivalent
-        ``update_rect`` step before each paint.
-        """
-        cache = browser._pane_cache.setdefault(name, _state.PaneCache())
-        cache.update_rect(rect)
+    _reconcile = staticmethod(_reconcile)
 
     def test_vertical_separator_zero_bytes_on_second_paint(self):
         browser = _MockBrowser(_MockState([]))

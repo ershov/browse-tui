@@ -145,42 +145,13 @@ class PaneCache:
         self.rect = new_rect
         self.lines = [None] * new_rect.height
 
-    def ensure(self, new_rect) -> None:
-        """Idempotent ``invalidate`` — only rotates when geometry changes.
-
-        Callers (the per-pane renderers) hit this on every paint;
-        identical geometry means the cached row buffer is reusable.
-
-        On the second paint with the same rect, roll ``prev_rect`` forward
-        so ``end_row`` transitions from the "first paint after rect change"
-        regime (no padding — drawing on a clean slate) to the steady-state
-        regime (pad to cached visible length so shrinking content overwrites
-        stale cells from previous paints). Without this roll, ``prev_rect``
-        stays at its post-invalidate value (``None`` after the first ever
-        paint, or the prior rect after a resize) forever, and stale
-        content from prior renders never gets cleared.
-
-        DEPRECATED in favour of :meth:`update_rect`, which centralises
-        the per-frame cache-state transition (including the "pane
-        disappeared this frame" case, formerly handled by a separate
-        orchestrator-level pass — see ticket #228). Retained for unit
-        tests that still exercise the old per-renderer API.
-        """
-        if self.rect != new_rect:
-            self.invalidate(new_rect)
-        elif self.prev_rect != self.rect:
-            # The rect-change signal was consumed by the prior paint's
-            # padding pass. Roll ``prev_rect`` forward so subsequent paints
-            # take the steady-state branch in ``end_row``.
-            self.prev_rect = self.rect
-
     def update_rect(self, rect) -> None:
         """Reconcile cache state with the pane's geometry for this frame.
 
-        Single per-frame entry point that subsumes both the old
-        per-renderer ``ensure`` call and the orchestrator-level
-        "disappeared pane" stamp (formerly ``_mark_disappeared_panes``
-        in 050-render.py). See ticket #228 for the motivation.
+        Single per-frame entry point covering both the per-pane
+        cache rotation AND the orchestrator-level "disappeared pane"
+        stamp (formerly ``_mark_disappeared_panes`` in 050-render.py).
+        See ticket #228 for the motivation.
 
         Three branches:
 

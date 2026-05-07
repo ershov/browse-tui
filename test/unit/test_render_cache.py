@@ -272,10 +272,10 @@ class TestFirstPaint(_RenderCacheBase):
     """A fresh Browser's render_full emits visible bytes only.
 
     Each PaneCache starts with ``rect=None, prev_rect=None``. After
-    ``ensure(new_rect)`` runs in the per-pane renderers, ``rect=new_rect``
-    and ``prev_rect=None`` — ``end_row`` takes the first-paint branch
-    (no padding, no \\e[K). We assert the absence of \\e[K and the
-    absence of multi-space trailing runs.
+    ``update_rect(new_rect)`` runs in ``_reconcile_pane_caches``,
+    ``rect=new_rect`` and ``prev_rect=None`` — ``end_row`` takes the
+    first-paint branch (no padding, no \\e[K). We assert the absence
+    of \\e[K and the absence of multi-space trailing runs.
     """
 
     def test_no_clear_to_eol_or_trailing_pad(self):

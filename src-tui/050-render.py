@@ -250,10 +250,8 @@ class Rect:
 def _reconcile_pane_caches(browser, layout):
     """Reconcile per-pane row caches with the layout for this frame.
 
-    Single dispatch site that owns the layout→cache mapping. Replaces
-    the old per-renderer ``cache.ensure(rect)`` call AND the
-    orchestrator-level ``_mark_disappeared_panes`` pass (see ticket
-    #228). Called once from ``render_full`` / ``render_partial``
+    Single dispatch site that owns the layout→cache mapping (see
+    ticket #228). Called once from ``render_full`` / ``render_partial``
     immediately after ``_layout_for``.
 
     For each known cache key, picks the corresponding rect from the
@@ -267,12 +265,11 @@ def _reconcile_pane_caches(browser, layout):
     v/m/pc (standalone bottom row at row R_v). The two rects differ
     (different rows), so ``update_rect`` invalidates correctly across
     layout switches — the centralized rect transition catches the
-    case the old per-renderer ``cache.ensure(rect)`` missed when
-    intermediate layouts didn't paint through this cache. This closes
-    ticket #221 (info_bar v→h→v stale).
+    case that intermediate layouts didn't paint through this cache.
+    This closes ticket #221 (info_bar v→h→v stale).
 
-    Critical invariant: ``update_rect`` must be called EXACTLY ONCE per
-    cache per frame. The renderers no longer touch ``cache.ensure`` /
+    Critical invariant: ``update_rect`` must be called EXACTLY ONCE
+    per cache per frame. The renderers no longer touch
     ``cache.prev_rect`` themselves — they look up the already-reconciled
     cache from ``browser._pane_cache``.
     """
@@ -1237,6 +1234,7 @@ def render_list(browser, rect, *, rightmost: bool = False):
             else:
                 _write_segments(segments, width)
         end_row()
+
 
 def render_preview(browser, rect, *, info=False, has_header=True,
                    rightmost: bool = False):

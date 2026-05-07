@@ -171,82 +171,11 @@ class TestPaneCache(unittest.TestCase):
         self.assertEqual(c.prev_rect, r1)
         self.assertEqual(len(c.lines), 29)
 
-    def test_ensure_is_idempotent_when_geometry_unchanged(self):
-        c = PaneCache()
-        r1 = _FakeRect(1, 1, 81, 25)
-        c.ensure(r1)
-        # Mark a slot as painted; ensure() with the same rect must
-        # not clobber the buffer.
-        c.lines[0] = (10, 'hello world')
-        c.ensure(_FakeRect(1, 1, 81, 25))
-        self.assertEqual(c.lines[0], (10, 'hello world'))
-
-    def test_ensure_invalidates_on_geometry_change(self):
-        c = PaneCache()
-        c.ensure(_FakeRect(1, 1, 81, 25))
-        c.lines[0] = (10, 'hello world')
-        new_rect = _FakeRect(1, 1, 81, 30)
-        c.ensure(new_rect)
-        # New geometry resets the buffer.
-        self.assertEqual(c.rect, new_rect)
-        self.assertEqual(len(c.lines), 29)
-        self.assertTrue(all(line is None for line in c.lines))
-
-    def test_second_ensure_with_same_rect_rolls_prev_rect_forward(self):
-        """The second ensure() with the same rect should roll prev_rect
-        forward so subsequent paints take ``end_row``'s steady-state
-        branch instead of the "first paint after rect change" branch.
-
-        The renderers call ensure() once per paint. After invalidate(),
-        prev_rect lags behind rect by one paint (None on first ever
-        paint, or the prior rect after a resize). end_row consumes that
-        lag once; ensure must then advance prev_rect on the next paint
-        so stale-cell padding kicks in for steady-state writes.
-        """
-        c = PaneCache()
-        r1 = _FakeRect(1, 1, 81, 25)
-        # First ensure — invalidate path: rect=r1, prev_rect=None.
-        c.ensure(r1)
-        self.assertEqual(c.rect, r1)
-        self.assertIsNone(c.prev_rect)
-        # Second ensure with the same rect — same-rect branch should roll
-        # prev_rect forward to match rect (steady-state regime).
-        c.ensure(_FakeRect(1, 1, 81, 25))
-        self.assertEqual(c.rect, r1)
-        self.assertEqual(c.prev_rect, r1)
-        # Third ensure — already in steady state; nothing changes.
-        c.ensure(_FakeRect(1, 1, 81, 25))
-        self.assertEqual(c.rect, r1)
-        self.assertEqual(c.prev_rect, r1)
-
-    def test_ensure_after_resize_rolls_prev_rect_on_next_paint(self):
-        """After a resize, the first paint with the new rect runs in
-        "rect changed" regime (prev_rect = old rect != rect). The
-        second paint with the same new rect must roll prev_rect to
-        new rect so steady-state padding applies thereafter.
-        """
-        c = PaneCache()
-        r1 = _FakeRect(1, 1, 81, 25)
-        r2 = _FakeRect(1, 1, 81, 30)
-        # Establish steady state at r1.
-        c.ensure(r1)
-        c.ensure(r1)
-        self.assertEqual(c.prev_rect, r1)
-        # Resize: prev_rect rotates to old r1, rect becomes r2.
-        c.ensure(r2)
-        self.assertEqual(c.rect, r2)
-        self.assertEqual(c.prev_rect, r1)
-        # Second paint at r2: prev_rect rolls forward to r2.
-        c.ensure(_FakeRect(1, 1, 81, 30))
-        self.assertEqual(c.rect, r2)
-        self.assertEqual(c.prev_rect, r2)
-
-
 class TestPaneCacheUpdateRect(unittest.TestCase):
     """``PaneCache.update_rect`` is the single per-frame entry point
     introduced in ticket #228. It subsumes both the old per-renderer
-    ``ensure`` call AND the orchestrator-level ``_mark_disappeared_panes``
-    sentinel stamp.
+    cache-rotation call AND the orchestrator-level
+    ``_mark_disappeared_panes`` sentinel stamp.
     """
 
     def test_update_rect_none_on_populated_cache_stamps_sentinel(self):
@@ -300,10 +229,10 @@ class TestPaneCacheUpdateRect(unittest.TestCase):
     def test_update_rect_same_rect_is_noop_after_invalidate(self):
         """First call after invalidate does NOT roll prev_rect forward.
 
-        Mirrors the old ``ensure`` semantics: the FIRST paint at a new
-        rect is in "rect changed" regime (prev_rect != rect). The
-        single-call-per-frame contract means the renderer paints
-        between this call and the next ``update_rect``.
+        The FIRST paint at a new rect is in "rect changed" regime
+        (prev_rect != rect). The single-call-per-frame contract means
+        the renderer paints between this call and the next
+        ``update_rect``.
         """
         c = PaneCache()
         r1 = _FakeRect(1, 1, 81, 25)
@@ -311,6 +240,15 @@ class TestPaneCacheUpdateRect(unittest.TestCase):
         # State: rect=r1, prev_rect=None — first paint regime.
         self.assertEqual(c.rect, r1)
         self.assertIsNone(c.prev_rect)
+
+    def test_update_rect_same_rect_preserves_lines_buffer(self):
+        """A no-op same-rect call must not clobber painted entries."""
+        c = PaneCache()
+        r1 = _FakeRect(1, 1, 81, 25)
+        c.update_rect(r1)
+        c.lines[0] = (10, 'hello world')
+        c.update_rect(_FakeRect(1, 1, 81, 25))
+        self.assertEqual(c.lines[0], (10, 'hello world'))
 
     def test_update_rect_same_rect_rolls_prev_rect_on_second_call(self):
         """Second call with the same rect rolls prev_rect to rect.
