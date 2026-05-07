@@ -486,5 +486,70 @@ class SgrStateTests(unittest.TestCase):
 _visible_len = _terminal._visible_len
 
 
+# ---- _read_csi parser tests -----------------------------------------------
+#
+# These cover the bug fix for "Alt+key tears down the app": the CSI
+# parser used to fall back to ``return 'esc'`` for any unrecognised
+# sequence, and ``'esc'`` is bound to _quit. Now it returns
+# ``'_unknown'`` (a sentinel the action dispatcher silently ignores)
+# and recognises bare + modified Home/End that some terminals emit.
+
+
+class _CsiFakeStream:
+    """Drives ``_read_csi`` with a pre-recorded byte stream."""
+
+    def __init__(self, bytes_str):
+        self._buf = list(bytes_str)
+
+    def read1(self):
+        return self._buf.pop(0) if self._buf else ''
+
+    def peek(self, timeout=0.05):
+        return bool(self._buf)
+
+
+def _csi(rest):
+    """Run ``_read_csi`` against ``rest`` (everything after ``ESC [``)."""
+    s = _CsiFakeStream(rest)
+    return _terminal._read_csi(0, s.read1, s.peek)
+
+
+class TestReadCsi(unittest.TestCase):
+    """The CSI parser recognises bare and modified Home/End and never
+    falls through to 'esc' on an unknown sequence."""
+
+    def test_bare_home_and_end(self):
+        # Some terminals send Home/End as ESC [ H / ESC [ F (no tilde).
+        self.assertEqual(_csi('H'), 'home')
+        self.assertEqual(_csi('F'), 'end')
+
+    def test_alt_home_and_end_via_modifier(self):
+        # ESC [ 1 ; 3 H == Alt-Home; ESC [ 1 ; 3 F == Alt-End.
+        self.assertEqual(_csi('1;3H'), 'alt-home')
+        self.assertEqual(_csi('1;3F'), 'alt-end')
+
+    def test_shift_ctrl_home_end(self):
+        self.assertEqual(_csi('1;2H'), 'shift-home')
+        self.assertEqual(_csi('1;5F'), 'ctrl-end')
+        self.assertEqual(_csi('1;6H'), 'ctrl-shift-home')
+
+    def test_alt_ctrl_home_end(self):
+        # mod=7 is the conventional Alt+Ctrl combination.
+        self.assertEqual(_csi('1;7H'), 'alt-ctrl-home')
+        self.assertEqual(_csi('1;7F'), 'alt-ctrl-end')
+
+    def test_modified_arrows_still_work(self):
+        # Regression: don't break the existing arrow + modifier table.
+        self.assertEqual(_csi('1;3A'), 'alt-up')
+        self.assertEqual(_csi('1;5D'), 'ctrl-left')
+
+    def test_unknown_csi_returns_unknown_sentinel(self):
+        # A garbage CSI must NOT return 'esc' (which would quit the app).
+        self.assertEqual(_csi('99~'), '_unknown')
+        # Unknown final byte (no handler for ESC [ X or ESC [ 1;2x).
+        self.assertEqual(_csi('X'), '_unknown')
+        self.assertEqual(_csi('1;2x'), '_unknown')
+
+
 if __name__ == '__main__':
     unittest.main()

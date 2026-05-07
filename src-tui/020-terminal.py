@@ -591,10 +591,12 @@ def read_key():
         # Some terminals send Alt+Up as ESC ESC [ A instead of ESC [ 1;3 A
         if ch2 == '\x1b':
             if not _peek():
-                return 'esc'
+                return 'esc'  # double-Esc with no follow-up — keep as Esc
             ch3 = _read1()
             if ch3 == '[':
                 inner = _read_csi(fd, _read1, _peek)
+                if inner == '_unknown':
+                    return '_unknown'
                 # Prepend alt- if not already modified
                 if inner.startswith(('shift-', 'ctrl-', 'alt-', 'ctrl-shift-')):
                     return inner  # already has a modifier
@@ -602,11 +604,11 @@ def read_key():
             if ch3 == 'O':
                 ch4 = _read1()
                 ss3_map = {'P': 'f1', 'Q': 'f2', 'R': 'f3', 'S': 'f4'}
-                inner = ss3_map.get(ch4, 'esc')
-                if inner != 'esc':
+                inner = ss3_map.get(ch4)
+                if inner is not None:
                     return 'alt-' + inner
-                return 'esc'
-            return 'esc'
+                return '_unknown'
+            return '_unknown'
 
         # CSI sequence: ESC [
         if ch2 == '[':
@@ -623,18 +625,34 @@ def read_key():
                 return 'f3'
             if ch3 == 'S':
                 return 'f4'
-            # Unknown SS3 — return what we can
-            return 'esc'
+            # Unknown SS3 — silently ignore (don't fall through to
+            # 'esc' which would tear down the app via _quit).
+            return '_unknown'
 
         # Alt-combo: ESC + printable char
         if ' ' <= ch2 <= '~':
             return 'alt-' + ch2
 
-        # Alt + control char (e.g. Alt-Enter = ESC + CR)
+        # Alt + Enter (ESC + CR / LF) is the conventional shape; named
+        # without the explicit ``ctrl-`` prefix because every terminal
+        # sends it via this path.
         if ch2 == '\r' or ch2 == '\n':
             return 'alt-enter'
 
-        return 'esc'
+        # Alt + Ctrl-X (e.g. Alt-Ctrl-P = ESC + 0x10). Without this
+        # branch, the bare ``return 'esc'`` below would fire and
+        # ``'esc'`` is bound to _quit — pressing Alt-Ctrl-anything in
+        # certain terminals would tear the app down. Return the
+        # ``alt-ctrl-x`` form so action bindings can match it (or
+        # silently ignore if no binding exists).
+        ch2_o = ord(ch2)
+        if 1 <= ch2_o <= 26:
+            return 'alt-ctrl-' + chr(ch2_o + 96)
+
+        # Truly unknown ESC + byte: return a sentinel that the dispatch
+        # layer ignores, NOT 'esc'. 'esc' is bound to quit, so hitting
+        # an unrecognised escape sequence used to teardown the app.
+        return '_unknown'
 
     # ---- Ctrl-A through Ctrl-Z (except those handled above) ---------------
     if 1 <= o <= 26:
@@ -666,6 +684,12 @@ def _read_csi(fd, _read1, _peek):
         return 'right'
     if buf == 'D':
         return 'left'
+
+    # Bare Home / End (some terminals send these without a tilde).
+    if buf == 'H':
+        return 'home'
+    if buf == 'F':
+        return 'end'
 
     # Shift-Tab: ESC [ Z
     if buf == 'Z':
@@ -733,25 +757,32 @@ def _read_csi(fd, _read1, _peek):
         if num == '24':
             return 'f12'
 
-    # Shift/Ctrl modified arrows: ESC [ 1 ; <mod> <A-D>
-    if len(buf) >= 3 and buf[-1] in 'ABCD' and ';' in buf:
-        direction = {'A': 'up', 'B': 'down', 'C': 'right', 'D': 'left'}[buf[-1]]
+    # Shift/Ctrl/Alt modified arrows + Home/End: ESC [ 1 ; <mod> <A-D|H|F>
+    # Same encoding for arrows and Home/End — modifier in the second
+    # parameter, terminal letter selects the key.
+    if len(buf) >= 3 and buf[-1] in 'ABCDHF' and ';' in buf:
+        key_name = {
+            'A': 'up', 'B': 'down', 'C': 'right', 'D': 'left',
+            'H': 'home', 'F': 'end',
+        }[buf[-1]]
         # Extract modifier: 2=shift, 3=alt, 5=ctrl, etc.
         parts = buf[:-1].split(';')
         if len(parts) == 2:
             try:
                 mod = int(parts[1])
             except ValueError:
-                return direction
+                return key_name
             if mod == 2:
-                return 'shift-' + direction
+                return 'shift-' + key_name
             if mod == 3:
-                return 'alt-' + direction
+                return 'alt-' + key_name
             if mod == 5:
-                return 'ctrl-' + direction
+                return 'ctrl-' + key_name
             if mod == 6:
-                return 'ctrl-shift-' + direction
-        return direction
+                return 'ctrl-shift-' + key_name
+            if mod == 7:
+                return 'alt-ctrl-' + key_name
+        return key_name
 
     # SGR mouse: ESC [ < Cb ; Cx ; Cy M/m
     if buf.startswith('<') and buf[-1] in ('M', 'm'):
@@ -786,5 +817,8 @@ def _read_csi(fd, _read1, _peek):
                     if mod == 3:
                         return 'alt-enter'
 
-    # Fallback: unknown CSI sequence
-    return 'esc'
+    # Fallback: unknown CSI sequence. Return a sentinel the action
+    # dispatcher ignores rather than 'esc', which is bound to _quit —
+    # an unrecognised modifier-key combination must not tear the app
+    # down.
+    return '_unknown'
