@@ -25,6 +25,7 @@ import signal
 import sys
 import termios
 import tty
+import unicodedata
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +145,14 @@ def _visible_len(s):
     050-render.py). Counts characters outside ``\\033[...m`` sequences;
     other CSI finals (cursor moves) shouldn't appear in captured row
     output but are also skipped defensively.
+
+    Returns display columns rather than code points: characters whose
+    East Asian Width is Wide (``W``) or Fullwidth (``F``) -- e.g. CJK
+    ideographs -- count as 2 cells. Other characters count as 1. This
+    keeps the steady-state pad math in :func:`end_row` correct for
+    rows containing non-ASCII content; otherwise wide chars would
+    under-count and trailing ghost cells could remain on screen when
+    content shrinks in a non-rightmost pane.
     """
     visible = 0
     i = 0
@@ -162,7 +171,7 @@ def _visible_len(s):
                 continue
             # Unterminated escape — stop counting.
             break
-        visible += 1
+        visible += 2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1
         i += 1
     return visible
 

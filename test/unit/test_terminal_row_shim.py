@@ -88,6 +88,48 @@ class VisibleLenTests(unittest.TestCase):
         s = '\033[31ma\033[0m\033[1mbc\033[0md'
         self.assertEqual(_terminal._visible_len(s), 4)
 
+    def test_cjk_wide_chars_count_as_two_cells(self):
+        # Two CJK ideographs render as 2 cells each → 4 columns.
+        self.assertEqual(_terminal._visible_len('東京'), 4)
+
+    def test_mixed_ascii_and_wide(self):
+        # 'a' (1) + '東' (2) + 'b' (1) → 4 columns.
+        self.assertEqual(_terminal._visible_len('a東b'), 4)
+
+    def test_ascii_no_regression(self):
+        self.assertEqual(_terminal._visible_len('ascii'), 5)
+
+    def test_sgr_stripped_around_wide_char(self):
+        # SGR stripped, single wide char counts as 2 cells.
+        self.assertEqual(_terminal._visible_len('\033[31m東\033[m'), 2)
+
+    def test_steady_state_shrink_with_wide_chars_pads_columns(self):
+        """End-to-end: shrinking past a wide-char row pads display columns,
+        not code points. Without the fix, '東京' would count as 2 instead
+        of 4 and trailing ghost cells would remain on a non-rightmost pane.
+        """
+        rect = _rect(1, 1, 41, 25)
+        cache = _make_cache(rect, height=10, prev_rect=None)
+
+        # Paint 1: '東京' = 4 columns (2 code points), first paint, no pad.
+        with _StdoutCapture():
+            _terminal.begin_row(cache, 0, 1, 1, 41, rightmost=False)
+            _terminal.write('東京')
+            _terminal.end_row()
+        # Cache stores column count, not code-point count.
+        self.assertEqual(cache.lines[0], (4, '東京'))
+        cache.prev_rect = cache.rect
+
+        # Paint 2: 'hi' = 2 columns; pad must be 4 - 2 = 2.
+        with _StdoutCapture() as cap:
+            _terminal.begin_row(cache, 0, 1, 1, 41, rightmost=False)
+            _terminal.write('hi')
+            _terminal.end_row()
+
+        expected = '\033[1;1Hhi\033[m' + ' ' * 2
+        self.assertEqual(cap.text, expected)
+        self.assertEqual(cache.lines[0], (4, 'hi'))
+
 
 class RowShimTests(unittest.TestCase):
     """begin_row / end_row capture, diff, and emit semantics."""
