@@ -1813,8 +1813,15 @@ def render_info_bar(row, cols, label, *, info=False, browser=None,
         begin_row(cache, 0, row, 1, cols + 1, rightmost=rightmost)
 
     S = '─'  # ─
-    move(row, 1)
-    clear_line()
+    if not use_cache:
+        # In the cached path, ``begin_row`` records (row, left) and
+        # ``end_row`` emits ``\e[<abs_row>;<left>H`` itself, then handles
+        # trailing-cell clearing via its pad / ``\e[K`` logic — so the
+        # explicit move + clear_line would be captured into the row
+        # buffer and re-emitted on every cache miss as redundant bytes.
+        # The legacy non-cached call sites still rely on them.
+        move(row, 1)
+        clear_line()
 
     if info and browser is not None:
         sel_count = len(browser._state.selected)

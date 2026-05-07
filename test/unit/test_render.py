@@ -1904,6 +1904,88 @@ class TestSeparatorCacheZeroBytes(unittest.TestCase):
         )
         self.assertEqual(self._drain(), '')
 
+    def test_info_bar_no_redundant_clear_in_captured_row(self):
+        """Cache-miss info-bar paint must not include `\\e[2K` in its row.
+
+        Regression test for #225: ``render_info_bar`` used to call
+        ``move(row, 1)`` + ``clear_line()`` unconditionally. Inside a
+        ``begin_row`` capture those calls land in the row buffer, so
+        the emitted bytes for a cache miss carried a redundant
+        ``\\e[24;1H\\e[2K`` prefix — wasted bytes on every miss. The
+        fix gates them behind ``if not use_cache:``.
+        """
+        browser = _MockBrowser(_MockState([]))
+        rect = Rect(left=1, top=24, right=81, bottom=25)
+        self._reconcile(browser, 'info_bar', rect)
+        _render.render_info_bar(
+            24, 80, 'Preview', info=False, browser=browser,
+            rightmost=True, manage_cache=True,
+        )
+        emitted = self._drain()
+        self.assertIn('Preview', emitted,
+                      'first paint must emit the label')
+        # The leading position cue is end_row's `\e[24;1H`, not a
+        # second cursor-move from inside the captured buffer.
+        self.assertEqual(
+            emitted.count('\033[24;1H'), 1,
+            f'expected exactly one cursor-move to (24,1); got {emitted!r}',
+        )
+        self.assertNotIn(
+            '\033[2K', emitted,
+            f'captured row must not carry a redundant \\e[2K; got {emitted!r}',
+        )
+
+    def test_info_bar_relabel_overwrites_prior_cells_without_clear_line(self):
+        """End-to-end: a different-label repaint replaces the prior cells.
+
+        The info bar always fills to ``cols`` (label + ``─`` glyphs), so
+        the captured visible_len is constant and ``end_row``'s shrink
+        branch doesn't fire. The safety property here is simpler: the
+        new buffer overwrites the same cells the old one occupied, so
+        removing the captured ``\\e[2K`` is a pure-bytes win — no stale
+        characters can survive.
+        """
+        browser = _MockBrowser(_MockState([]))
+        rect = Rect(left=1, top=24, right=81, bottom=25)
+
+        # First paint with a long pane label.
+        self._reconcile(browser, 'info_bar', rect)
+        _render.render_info_bar(
+            24, 80, 'A Very Long Label', info=False, browser=browser,
+            rightmost=True, manage_cache=True,
+        )
+        first = self._drain()
+        self.assertIn('A Very Long Label', first)
+
+        # Second paint with a different label — cache miss, but the new
+        # buffer covers the same cells.
+        self._reconcile(browser, 'info_bar', rect)
+        _render.render_info_bar(
+            24, 80, 'Hi', info=False, browser=browser,
+            rightmost=True, manage_cache=True,
+        )
+        second = self._drain()
+        self.assertIn('Hi', second)
+        self.assertNotIn(
+            'A Very Long Label', second,
+            'relabel repaint must not contain the prior longer label',
+        )
+        # No stray \e[2K in the captured payload — the whole point of
+        # the fix.
+        self.assertNotIn(
+            '\033[2K', second,
+            f'captured row must not carry \\e[2K; got {second!r}',
+        )
+        # Cache stores the visible_len and it equals ``cols`` (the bar
+        # always pads to full width), confirming end_row's shrink
+        # branch can't surface a stale-cell window in the steady state.
+        cache = browser._pane_cache['info_bar']
+        stored_visible, _stored_buf = cache.lines[0]
+        self.assertEqual(
+            stored_visible, 80,
+            f'info_bar visible_len should equal cols=80; got {stored_visible}',
+        )
+
     def test_separator_rect_change_invalidates_cache(self):
         """Sanity check: changing the rect drops the zero-byte invariant.
 
