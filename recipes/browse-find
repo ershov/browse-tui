@@ -39,4 +39,4 @@ exec "$BIN" \
     --root-cmd "find $QROOT -mindepth 1 $QARGS -print0" \
     --input tsv --fields id \
     --record-sep null \
-    --preview-cmd '[[ -d "$TUI_ID" ]] && ls -lA "$TUI_ID" || head -200 "$TUI_ID" 2>/dev/null'
+    --preview-cmd '[[ -d "$TUI_ID" ]] && ls -lA --color=always "$TUI_ID" || head -1000 "$TUI_ID" 2>/dev/null'

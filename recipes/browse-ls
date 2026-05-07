@@ -31,5 +31,5 @@ exec "$BIN" \
     --title "browse-ls: $DIR" \
     --root-cmd "ls -lA '$DIR' | tail -n +2" \
     --input 'match:^(?P<mode>\S+)\s+\d+\s+(?P<owner>\S+)\s+\S+\s+(?P<size>\d+)\s+(?P<date>\S+\s+\S+\s+\S+)\s+(?P<id>.+)$' \
-    --preview-cmd '[[ -d "'"$DIR"'/$TUI_ID" ]] && ls -lA "'"$DIR"'/$TUI_ID" || head -200 "'"$DIR"'/$TUI_ID" 2>/dev/null' \
+    --preview-cmd '[[ -d "'"$DIR"'/$TUI_ID" ]] && ls -lA --color=always "'"$DIR"'/$TUI_ID" || head -1000 "'"$DIR"'/$TUI_ID" 2>/dev/null' \
     --print-format "$DIR/{id}"
