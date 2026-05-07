@@ -722,5 +722,52 @@ class TestRenderPreviewAnsiIntegration(_RenderCacheBase):
         )
 
 
+class TestPreviewScrollClamp(_RenderCacheBase):
+    """``_preview_scroll`` is clamped at render time so at least one
+    content row stays visible no matter how many shift-down / page-down
+    presses pile up while the preview is short."""
+
+    def _make(self, preview_text):
+        items = [Item(id='a', title='alpha')]
+        b = _make_browser(items, split='v', show_preview=True,
+                          show_children_pane=False)
+        b._state._preview['a'] = preview_text
+        return b
+
+    def test_scroll_past_end_clamps_to_last_row(self):
+        """A scroll offset past the wrapped-line count is reduced so the
+        last content row is visible (as the topmost preview row).
+        """
+        self.browser = self._make('one\ntwo\nthree')
+        # Pile up an absurd offset.
+        self.browser._preview_scroll = 100
+        _render.render_full(self.browser)
+        out = self.cap.drain()
+        # Renderer clamped: at least one of the three lines is visible,
+        # and ``_preview_scroll`` is now in range.
+        self.assertTrue(
+            'one' in out or 'two' in out or 'three' in out,
+            f'no content visible after off-end scroll: {out!r}',
+        )
+        self.assertLessEqual(self.browser._preview_scroll, 2,
+                             '_preview_scroll must be clamped to '
+                             'len(wrapped) - 1')
+
+    def test_scroll_clamp_does_not_shrink_in_range_offsets(self):
+        """An in-range offset must not be touched by the clamp."""
+        self.browser = self._make('one\ntwo\nthree\nfour\nfive\nsix')
+        self.browser._preview_scroll = 2
+        _render.render_full(self.browser)
+        self.assertEqual(self.browser._preview_scroll, 2,
+                         'in-range scroll offset must not be clamped')
+
+    def test_empty_preview_clamps_scroll_to_zero(self):
+        """No preview text at all → clamp to 0 (no row to show)."""
+        self.browser = self._make('')
+        self.browser._preview_scroll = 50
+        _render.render_full(self.browser)
+        self.assertEqual(self.browser._preview_scroll, 0)
+
+
 if __name__ == '__main__':
     unittest.main()

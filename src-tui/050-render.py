@@ -1504,9 +1504,16 @@ def render_preview(browser, rect, *, info=False, has_header=True,
         wrapped.extend(_wrap_preview_line(
             line, width, ansi_on=ansi_on, drop_sgr=drop_sgr))
 
-    scroll = browser._preview_scroll
-    if scroll < 0:
-        scroll = 0
+    # Clamp ``_preview_scroll`` so at least one content row is visible.
+    # ``_preview_scroll_down`` / ``_preview_page_down`` (070-actions.py)
+    # bump the offset without an upper bound — the wrap geometry isn't
+    # known there. We clamp here, where ``wrapped`` is in hand, and
+    # write the clamped value back so subsequent shift-up presses don't
+    # have to pump down through a phantom count.
+    max_scroll = max(0, len(wrapped) - 1)
+    scroll = max(0, min(browser._preview_scroll, max_scroll))
+    if scroll != browser._preview_scroll:
+        browser._preview_scroll = scroll
     for i in range(content_lines):
         row = content_top + i
         rel_row = content_row_offset + i
