@@ -426,7 +426,7 @@ def _list_messages(jsonl_path, limit=None):
                 # Malformed line — surface it but stay scrolling.
                 out.append(Item(
                     id=f'{jsonl_path}#{n}',
-                    title=f'[invalid json] {line[:400]}',
+                    title=f'[invalid json] {line[:1000]}',
                     tag='err',
                     tag_style='red',
                 ))
@@ -462,13 +462,36 @@ def _list_messages(jsonl_path, limit=None):
 
 
 _TAG_STYLE_FOR_KIND = {
-    'last-prompt':     'magenta',
-    'permission-mode': 'gray',
-    'user':            'cyan',
-    'assistant':       'green',
-    'system':          'gray',
-    'tool_use':        'yellow',
-    'tool_result':     'yellow',
+    # Conversation
+    'user':                'cyan',
+    'assistant':           'green',
+    'attachment':          'blue',
+    'system':              'gray',
+    'tool_use':            'yellow',
+    'tool_result':         'yellow',
+    # Bookmarks / state changes
+    'last-prompt':         'magenta',
+    'permission-mode':     'yellow',
+    'pr-link':             'blue',
+    'mode':                'red',
+    'speculation-accept':  'green',
+    'queue-operation':     'cyan',
+    # Bookkeeping (folded into card; kept dim in the row list)
+    'ai-title':                   'dim',
+    'custom-title':               'dim',
+    'tag':                        'dim',
+    'agent-name':                 'dim',
+    'agent-color':                'dim',
+    'agent-setting':              'dim',
+    'task-summary':               'dim',
+    'summary':                    'dim',
+    'file-history-snapshot':      'dim',
+    'attribution-snapshot':       'dim',
+    'content-replacement':        'dim',
+    'worktree-state':             'dim',
+    'marble-origami-commit':      'dim',
+    'marble-origami-snapshot':    'dim',
+    'progress':                   'dim',
 }
 
 
@@ -484,22 +507,204 @@ def _kind_of(obj):
 
 
 def _summarise_message(obj):
-    """One-line summary of a JSONL entry, capped at 80 chars."""
-    t = obj.get('type', '')
-    if t == 'last-prompt':
-        leaf = str(obj.get('leafUuid', ''))[:8]
-        return f'last-prompt {leaf}' if leaf else 'last-prompt'
-    if t == 'permission-mode':
-        return f"permission-mode: {obj.get('permissionMode', '')}"
+    """One-line summary of a JSONL entry, capped at 400 chars.
 
+    Per-type formatters peel off the salient field without re-parsing
+    the record — every input field comes from ``obj`` directly so this
+    stays O(line) inside ``_list_messages``.
+    """
+    t = obj.get('type', '')
+
+    # Metadata records — surface the salient field.
+    if t == 'last-prompt':
+        prompt = ' '.join(str(obj.get('lastPrompt', '')).split())[:5000]
+        return f'last-prompt: {prompt}' if prompt else 'last-prompt'
+    if t == 'permission-mode':
+        return f'permission-mode: {obj.get("permissionMode", "")}'
+    if t == 'mode':
+        return f'mode: {obj.get("mode", "")}'
+    if t == 'ai-title':
+        return f'ai-title: {obj.get("aiTitle", "")}'
+    if t == 'custom-title':
+        return f'custom-title: {obj.get("customTitle", "")}'
+    if t == 'tag':
+        return f'tag: {obj.get("tag", "")}'
+    if t == 'agent-name':
+        return f'agent-name: {obj.get("agentName", "")}'
+    if t == 'agent-color':
+        return f'agent-color: {obj.get("agentColor", "")}'
+    if t == 'agent-setting':
+        return f'agent-setting: {obj.get("agentSetting", "")}'
+    if t == 'task-summary':
+        s = ' '.join(str(obj.get('summary', '')).split())[:5000]
+        return f'task-summary: {s}'
+    if t == 'summary':
+        s = ' '.join(str(obj.get('summary', '')).split())[:5000]
+        return f'summary: {s}'
+    if t == 'pr-link':
+        return f'PR {obj.get("prRepository", "")}#{obj.get("prNumber", "")}'
+    if t == 'worktree-state':
+        ws = obj.get('worktreeSession')
+        if ws is None:
+            return 'worktree: (exited)'
+        if isinstance(ws, dict):
+            return (f'worktree: {ws.get("worktreePath", "")}'
+                    f' @ {ws.get("worktreeBranch", "")}')
+        return 'worktree-state'
+    if t == 'speculation-accept':
+        ms = obj.get('timeSavedMs', 0)
+        return f'speculation-accept: +{ms/1000:.1f}s saved'
+    if t == 'queue-operation':
+        c = ' '.join(str(obj.get('content', '')).split())[:5000]
+        return f'queue {obj.get("operation", "?")}: {c}'
+    if t == 'file-history-snapshot':
+        snap = obj.get('snapshot') or {}
+        n = len(snap) if isinstance(snap, dict) else '?'
+        return (f'file-history-snapshot: {n} files'
+                + (' (update)' if obj.get('isSnapshotUpdate') else ''))
+    if t == 'attribution-snapshot':
+        states = obj.get('fileStates') or {}
+        return f'attribution-snapshot: {len(states)} files'
+    if t == 'content-replacement':
+        rep = obj.get('replacements') or []
+        return f'content-replacement: {len(rep)} blocks'
+    if t == 'marble-origami-commit':
+        s = ' '.join(str(obj.get('summary', '')).split())[:5000]
+        return f'collapse-commit: {s}'
+    if t == 'marble-origami-snapshot':
+        return f'collapse-snapshot: {len(obj.get("staged") or [])} staged'
+    if t == 'progress':
+        d = obj.get('data') or {}
+        dt = d.get('type', '?') if isinstance(d, dict) else '?'
+        return f'progress: {dt}'
+
+    # System events.
+    if t == 'system':
+        sub = obj.get('subtype', '')
+        if sub == 'turn_duration':
+            ms = obj.get('durationMs', 0)
+            return f'⏱ turn {ms/1000:.2f}s · {obj.get("messageCount", 0)} msgs'
+        if sub == 'api_error':
+            return f'‼ api_error'
+        if sub == 'local_command':
+            cmd = ' '.join(str(obj.get('content') or
+                               obj.get('command', '')).split())[:5000]
+            return f'$ {cmd}' if cmd else 'local_command'
+        return f'system: {sub}' if sub else 'system'
+
+    # Attachment — pick the most salient field per subtype.
+    if t == 'attachment':
+        a = obj.get('attachment') if isinstance(obj.get('attachment'), dict) else {}
+        sub = a.get('type', '?')
+        if sub == 'file':
+            return f'📎 file: {a.get("displayPath", a.get("filename", ""))}'
+        if sub == 'queued_command':
+            p = ' '.join(str(a.get('prompt', '')).split())[:5000]
+            return f'📥 queued: {p}'
+        if sub == 'hook_success':
+            ok = a.get('exitCode', 0) == 0
+            return (f'{"✓" if ok else "✗"} hook {a.get("hookName", "?")} '
+                    f'({a.get("hookEvent", "?")})')
+        if sub == 'hook_additional_context':
+            return f'+ ctx from {a.get("hookName", "?")}'
+        if sub == 'task_reminder':
+            return f'🔔 reminder ({a.get("itemCount", 0)})'
+        if sub == 'skill_listing':
+            return f'📚 skills: {a.get("skillCount", 0)}'
+        if sub == 'mcp_instructions_delta':
+            return (f'mcp Δ: +{len(a.get("addedNames") or [])}'
+                    f' -{len(a.get("removedNames") or [])}')
+        if sub == 'deferred_tools_delta':
+            return (f'tools Δ: +{len(a.get("addedNames") or [])}'
+                    f' -{len(a.get("removedNames") or [])}')
+        if sub == 'date_change':
+            return f'📅 date: {a.get("newDate", "?")}'
+        if sub == 'diagnostics':
+            n = len(a.get('files') or [])
+            return f'diagnostics: {n} files'
+        if sub == 'command_permissions':
+            return f'allowed: {", ".join(a.get("allowedTools") or [])}'
+        if sub == 'ultrathink_effort':
+            return '🧠 ultrathink'
+        return f'📎 {sub}'
+
+    # User / assistant — peek into content for salient fragment.
     msg = obj.get('message') if isinstance(obj.get('message'), dict) else {}
     role = msg.get('role') or obj.get('role') or t or ''
     content = msg.get('content', obj.get('content', ''))
+
+    # Assistant with only tool_use parts → format as the tool call.
+    if role == 'assistant' and isinstance(content, list):
+        only_tool = [p for p in content
+                     if isinstance(p, dict) and p.get('type') == 'tool_use']
+        any_text = any(isinstance(p, dict) and p.get('type') == 'text'
+                       and (p.get('text') or '').strip()
+                       for p in content)
+        if only_tool and not any_text:
+            tu = only_tool[0]
+            name = tu.get('name', '?')
+            inp = tu.get('input') or {}
+            extra = _tool_use_one_line(name, inp)
+            return f'🔧 {name}({extra})' if extra else f'🔧 {name}'
+
+    # User with tool_result → distinct prefix + a glance at the output.
+    if role == 'user' and isinstance(content, list):
+        for p in content:
+            if isinstance(p, dict) and p.get('type') == 'tool_result':
+                return f'↳ tool_result: {_tool_result_one_line(obj, p)}'
+
     text = _extract_text(content)
-    text = ' '.join(text.split())[:400]
+    text = ' '.join(text.split())[:5000]
+    if obj.get('isMeta') and role:
+        role = f'{role}/meta'
     if role:
         return f'{role}: {text}' if text else role
     return text or '(empty)'
+
+
+def _tool_use_one_line(name, inp):
+    """Compact one-line summary of a tool's input for the row title."""
+    if name == 'Bash':
+        return ' '.join(str(inp.get('command', '')).split())[:5000]
+    if name in ('Read', 'Edit', 'Write'):
+        return inp.get('file_path', '')
+    if name == 'Grep':
+        return f'/{inp.get("pattern", "")}/'
+    if name == 'Glob':
+        return inp.get('pattern', '')
+    if name in ('Agent', 'Task'):
+        return inp.get('subagent_type', '?')
+    if name == 'Skill':
+        return inp.get('skill', '?')
+    return ''
+
+
+def _tool_result_one_line(obj, part):
+    """One-liner peek at a tool_result for the row title."""
+    tur = obj.get('toolUseResult')
+    if isinstance(tur, dict):
+        if 'stdout' in tur:
+            return ' '.join(str(tur.get('stdout', '')).split())[:5000] or '(no output)'
+        if 'numFiles' in tur:
+            return f'{tur["numFiles"]} files'
+        if 'agentType' in tur:
+            return f'{tur["agentType"]} → {tur.get("status", "?")}'
+        if 'taskId' in tur:
+            sc = tur.get('statusChange') or {}
+            return f'#{tur["taskId"]} {sc.get("from", "?")}→{sc.get("to", "?")}'
+        if 'commandName' in tur:
+            return tur['commandName']
+    if isinstance(tur, str):
+        return ' '.join(tur.split())[:5000]
+    # Fall back to the raw content text.
+    content = part.get('content')
+    if isinstance(content, str):
+        return ' '.join(content.split())[:5000]
+    if isinstance(content, list):
+        for p in content:
+            if isinstance(p, dict) and p.get('type') == 'text':
+                return ' '.join(p.get('text', '').split())[:5000]
+    return ''
 
 
 def _extract_text(content):
@@ -537,6 +742,855 @@ def _extract_text(content):
     if content is None:
         return ''
     return str(content)
+
+
+# ---- preview rendering ---------------------------------------------------
+#
+# Per-line preview is built by:
+#
+#     parse JSONL line  ->  _classify(obj) -> renderer key
+#                       ->  _RENDERERS[key](obj) -> body str
+#                       ->  body + _fmt_chrome(obj)
+#
+# Renderers are flat free functions. Each takes the parsed obj and
+# returns a ready-to-display string with ANSI inlined via the palette
+# constants above. No abstractions: changing a color means editing the
+# constant; adding a type means writing _render_X and registering it.
+
+
+# Color associated with the row tag for each kind (mirrors what the row
+# title uses, but applied inside the preview header). Single source of
+# truth for the kind→color decision.
+_KIND_HEADER_COLOR = {
+    'user':            CYAN,
+    'assistant':       GREEN,
+    'attachment':      BLUE,
+    'system':          GRAY,
+    'last-prompt':     MAGENTA,
+    'permission-mode': YELLOW,
+    'pr-link':         BLUE,
+    'mode':            RED,
+    'speculation-accept': GREEN,
+    'queue-operation': CYAN,
+}
+
+_STOP_COLOR = {
+    'end_turn':      GREEN,
+    'tool_use':      YELLOW,
+    'max_tokens':    RED,
+    'stop_sequence': MUTE,
+    'pause_turn':    YELLOW,
+}
+
+_PERM_COLOR = {
+    'default':           MUTE,
+    'plan':              BLUE,
+    'acceptEdits':       YELLOW,
+    'bypassPermissions': RED,
+}
+
+
+def _read_jsonl_line(path, n):
+    """Return the parsed object for line ``n`` of ``path`` or ``None``."""
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            for i, line in enumerate(f):
+                if i == n:
+                    line = line.rstrip('\n')
+                    if not line.strip():
+                        return None
+                    try:
+                        return json.loads(line)
+                    except json.JSONDecodeError:
+                        return {'__raw__': line}
+    except OSError:
+        return None
+    return None
+
+
+_METADATA_TYPES = frozenset([
+    'summary', 'ai-title', 'custom-title', 'last-prompt', 'task-summary',
+    'tag', 'agent-name', 'agent-color', 'agent-setting', 'pr-link',
+    'mode', 'permission-mode', 'worktree-state', 'content-replacement',
+    'file-history-snapshot', 'attribution-snapshot', 'speculation-accept',
+    'queue-operation', 'marble-origami-commit', 'marble-origami-snapshot',
+    'progress',
+])
+
+
+def _classify(obj):
+    """Map a parsed JSONL record to a renderer key."""
+    if not isinstance(obj, dict):
+        return 'unknown'
+    if '__raw__' in obj:
+        return 'unknown'
+    t = obj.get('type')
+    if t == 'user':       return 'user'
+    if t == 'assistant':  return 'assistant'
+    if t == 'attachment': return 'attachment'
+    if t == 'system':     return 'system'
+    if t in _METADATA_TYPES:
+        return 'metadata'
+    return 'unknown'
+
+
+# ---- per-record renderers ------------------------------------------------
+
+
+def _render_user(obj):
+    """User turn: plain prompt, tool_result, or synthetic meta entry."""
+    msg = obj.get('message') if isinstance(obj.get('message'), dict) else {}
+    content = msg.get('content', '')
+    is_meta = bool(obj.get('isMeta'))
+
+    # Tool-result branch — an item in content has type=='tool_result'.
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict) and part.get('type') == 'tool_result':
+                return _render_tool_result(obj, part)
+
+    head = f'{WHITE}{BOLD}▶ user{RESET}'
+    chips = []
+    if is_meta:
+        chips.append(f'{MUTE}[meta]{RESET}')
+    pmode = obj.get('permissionMode')
+    if pmode:
+        chips.append(f'{_PERM_COLOR.get(pmode, MUTE)}[{pmode}]{RESET}')
+    out = ['  '.join([head] + chips)]
+    out.append('')
+    out.append(_user_body_text(content))
+    return '\n'.join(out)
+
+
+def _user_body_text(content):
+    """Render the textual portion of a user content payload."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        chunks = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            t = part.get('type')
+            if t == 'text':
+                chunks.append(part.get('text', '') or '')
+            # tool_result handled in _render_tool_result; tool_use not
+            # expected on a user record.
+        return '\n\n'.join(c for c in chunks if c)
+    return str(content) if content is not None else ''
+
+
+def _render_assistant(obj):
+    """Assistant turn: text / thinking / tool_use parts in source order."""
+    msg = obj.get('message') if isinstance(obj.get('message'), dict) else {}
+    parts = msg.get('content') if isinstance(msg.get('content'), list) else []
+    model = msg.get('model', '?')
+    stop  = msg.get('stop_reason') or ''
+    usage = msg.get('usage') or {}
+
+    head = f'{WHITE}{BOLD}◀ assistant{RESET}  {MAGENTA}{model}{RESET}'
+    if stop:
+        head += f'  {_STOP_COLOR.get(stop, MUTE)}[{stop}]{RESET}'
+    out = [head, '']
+
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        t = part.get('type')
+        if t == 'text':
+            out.append(part.get('text', '') or '')
+            out.append('')
+        elif t == 'thinking':
+            text = part.get('thinking', '') or ''
+            if not text.strip():
+                continue   # signature-only/empty thinking — silent skip
+            out.append(_rule('thinking'))
+            out.append(f'{GRAY}{ITAL}{text}{RESET}')
+            out.append('')
+        elif t == 'tool_use':
+            out.append(_fmt_tool_use_part(part))
+            out.append('')
+
+    if usage:
+        out.append(_rule('usage'))
+        out.append(_fmt_usage(usage))
+    return '\n'.join(out).rstrip() + '\n'
+
+
+def _rule(title=''):
+    """A muted '── title ──' separator line."""
+    bar = '─' * max(0, 60 - len(title) - 4)
+    body = f'── {title} {bar}' if title else '─' * 60
+    return f'{MUTE}{body}{RESET}'
+
+
+def _fmt_usage(u):
+    """Aligned key/value block for ``message.usage``."""
+    rows = [
+        ('input',      u.get('input_tokens', 0)),
+        ('output',     u.get('output_tokens', 0)),
+        ('cache read', u.get('cache_read_input_tokens', 0)),
+        ('cache new',  u.get('cache_creation_input_tokens', 0)),
+    ]
+    w = max(len(k) for k, _ in rows)
+    return '\n'.join(
+        f'{MUTE}{k.ljust(w)}:{RESET} {v:,}' for k, v in rows
+    )
+
+
+# ---- tool_use rendering --------------------------------------------------
+
+
+def _fmt_tool_use_part(part):
+    """One ``tool_use`` content part — header + per-tool body."""
+    name = part.get('name', '?')
+    inp  = part.get('input') or {}
+    head = f'{YELLOW}{BOLD}🔧 {name}{RESET}'
+
+    formatter = _TOOL_USE_FORMATTERS.get(name)
+    body = formatter(inp) if formatter else _fmt_tool_use_default(inp)
+    if not body:
+        return head
+    return head + '\n' + body
+
+
+def _fmt_tool_use_default(inp):
+    """JSON dump of the tool input, dimmed."""
+    if not inp:
+        return ''
+    try:
+        text = json.dumps(inp, indent=2, ensure_ascii=False)
+    except (TypeError, ValueError):
+        text = str(inp)
+    return f'{GRAY}{text}{RESET}'
+
+
+def _fmt_tool_use_bash(inp):
+    cmd = inp.get('command', '')
+    desc = inp.get('description', '')
+    timeout = inp.get('timeout')
+    bg = inp.get('run_in_background')
+    out = []
+    if desc:
+        out.append(f'{MUTE}# {desc}{RESET}')
+    out.append(f'{WHITE}$ {cmd}{RESET}')
+    extras = []
+    if timeout: extras.append(f'timeout={timeout}ms')
+    if bg:      extras.append('background')
+    if extras:
+        out.append(f'{MUTE}({" ".join(extras)}){RESET}')
+    return '\n'.join(out)
+
+
+def _fmt_tool_use_read(inp):
+    path = inp.get('file_path', '')
+    offset = inp.get('offset')
+    limit = inp.get('limit')
+    suffix = ''
+    if offset is not None or limit is not None:
+        suffix = f'  {MUTE}[{offset or 0}..+{limit or "eof"}]{RESET}'
+    return f'{CYAN}{path}{RESET}{suffix}'
+
+
+def _fmt_tool_use_edit(inp):
+    path = inp.get('file_path', '')
+    old = inp.get('old_string', '')
+    new = inp.get('new_string', '')
+    out = [f'{CYAN}{path}{RESET}']
+    if inp.get('replace_all'):
+        out.append(f'{MUTE}(replace_all){RESET}')
+    if old or new:
+        out.append(_rule('change'))
+        for line in old.splitlines() or ['']:
+            out.append(f'{RED}- {line}{RESET}')
+        for line in new.splitlines() or ['']:
+            out.append(f'{GREEN}+ {line}{RESET}')
+    return '\n'.join(out)
+
+
+def _fmt_tool_use_write(inp):
+    path = inp.get('file_path', '')
+    content = inp.get('content', '')
+    return f'{CYAN}{path}{RESET}\n{GRAY}{content}{RESET}'
+
+
+def _fmt_tool_use_grep(inp):
+    pattern = inp.get('pattern', '')
+    path = inp.get('path') or '.'
+    out = [f'{WHITE}/{pattern}/{RESET}  {MUTE}in{RESET} {CYAN}{path}{RESET}']
+    extras = []
+    for k in ('glob', 'type', 'output_mode', '-i', '-n', 'multiline', 'head_limit'):
+        if k in inp:
+            extras.append(f'{k}={inp[k]}')
+    if extras:
+        out.append(f'{MUTE}{"  ".join(extras)}{RESET}')
+    return '\n'.join(out)
+
+
+def _fmt_tool_use_glob(inp):
+    pattern = inp.get('pattern', '')
+    path = inp.get('path') or '.'
+    return f'{WHITE}{pattern}{RESET}  {MUTE}in{RESET} {CYAN}{path}{RESET}'
+
+
+def _fmt_tool_use_agent(inp):
+    subtype = inp.get('subagent_type', '?')
+    desc = inp.get('description', '')
+    prompt = inp.get('prompt', '')
+    head = (prompt.splitlines()[0] if prompt else '').strip()
+    out = [f'{MAGENTA}{subtype}{RESET}  {MUTE}—{RESET} {desc}']
+    if head:
+        out.append('')
+        out.append(head[:400])
+    return '\n'.join(out)
+
+
+def _fmt_tool_use_skill(inp):
+    skill = inp.get('skill', '?')
+    args = inp.get('args', '')
+    return f'{MAGENTA}{skill}{RESET}' + (f'  {MUTE}args:{RESET} {args}' if args else '')
+
+
+_TOOL_USE_FORMATTERS = {
+    'Bash':  _fmt_tool_use_bash,
+    'Read':  _fmt_tool_use_read,
+    'Edit':  _fmt_tool_use_edit,
+    'Write': _fmt_tool_use_write,
+    'Grep':  _fmt_tool_use_grep,
+    'Glob':  _fmt_tool_use_glob,
+    'Agent': _fmt_tool_use_agent,
+    'Task':  _fmt_tool_use_agent,
+    'Skill': _fmt_tool_use_skill,
+}
+
+
+# ---- tool_result rendering -----------------------------------------------
+
+
+def _render_tool_result(obj, part):
+    """User record carrying a tool_result content part.
+
+    Header derived from the part; body dispatched on the toolUseResult
+    shape (the structured record Claude Code stashes alongside the raw
+    content for the renderer).
+    """
+    is_error = bool(part.get('is_error'))
+    tu_id = part.get('tool_use_id', '')
+    tur = obj.get('toolUseResult')
+
+    head = f'{WHITE}{BOLD}↳ tool_result{RESET}'
+    if is_error:
+        head += f'  {RED}[error]{RESET}'
+    if tu_id:
+        head += f'  {MUTE}id={tu_id[:8]}{RESET}'
+    out = [head, '']
+
+    body = _fmt_tool_use_result(tur, part.get('content'))
+    if body:
+        out.append(body)
+    return '\n'.join(out).rstrip() + '\n'
+
+
+def _fmt_tool_use_result(tur, raw_content):
+    """Pick a shape-specific formatter for ``toolUseResult``."""
+    if tur is None:
+        return _fmt_tur_raw_content(raw_content)
+    if isinstance(tur, str):
+        return tur
+    if not isinstance(tur, dict):
+        return str(tur)
+    keys = set(tur.keys())
+    if {'stdout', 'stderr', 'interrupted'}.issubset(keys):
+        return _fmt_tur_bash(tur)
+    if 'structuredPatch' in keys:
+        return _fmt_tur_edit(tur)
+    if tur.get('type') == 'text' and 'file' in keys:
+        return _fmt_tur_read(tur)
+    if 'numMatches' in keys or ('matches' in keys and 'query' in keys):
+        return _fmt_tur_grep_or_search(tur)
+    if {'filenames', 'numFiles'}.issubset(keys) and 'numLines' not in keys:
+        return _fmt_tur_glob(tur)
+    if {'filenames', 'numFiles', 'numLines'}.issubset(keys):
+        return _fmt_tur_grep_content(tur)
+    if 'statusChange' in keys and 'taskId' in keys:
+        return _fmt_tur_task_update(tur)
+    if 'task' in keys and len(keys) == 1:
+        return _fmt_tur_task_dump(tur)
+    if 'agentId' in keys and 'agentType' in keys:
+        return _fmt_tur_subagent(tur)
+    if 'commandName' in keys and 'success' in keys:
+        return _fmt_tur_skill(tur)
+    return _fmt_tur_default(tur)
+
+
+def _fmt_tur_raw_content(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        chunks = []
+        for p in content:
+            if isinstance(p, dict) and p.get('type') == 'text':
+                chunks.append(p.get('text', '') or '')
+        return '\n'.join(chunks)
+    return ''
+
+
+def _fmt_tur_bash(tur):
+    out = []
+    if tur.get('interrupted'):
+        out.append(f'{RED}{BOLD}[interrupted]{RESET}')
+    bg = tur.get('backgroundTaskId')
+    if bg:
+        out.append(f'{MUTE}background task: {bg}{RESET}')
+    persisted = tur.get('persistedOutputPath')
+    if persisted:
+        size = tur.get('persistedOutputSize', '?')
+        out.append(f'{MUTE}persisted: {size}B → {persisted}{RESET}')
+    stdout = tur.get('stdout', '')
+    stderr = tur.get('stderr', '')
+    if stdout:
+        out.append(stdout.rstrip())
+    if stderr:
+        if stdout:
+            out.append('')
+        out.append(_rule('stderr'))
+        out.append(f'{RED}{stderr.rstrip()}{RESET}')
+    return '\n'.join(out)
+
+
+def _fmt_tur_edit(tur):
+    """Edit/Write result — show the structured patch as a unified diff."""
+    patch = tur.get('structuredPatch')
+    out = []
+    if tur.get('userModified'):
+        out.append(f'{YELLOW}[user-modified]{RESET}')
+    if isinstance(patch, list):
+        for hunk in patch:
+            if not isinstance(hunk, dict):
+                continue
+            old_start = hunk.get('oldStart', '?')
+            new_start = hunk.get('newStart', '?')
+            out.append(f'{MUTE}@@ -{old_start} +{new_start} @@{RESET}')
+            for line in hunk.get('lines') or []:
+                if line.startswith('+'):   out.append(f'{GREEN}{line}{RESET}')
+                elif line.startswith('-'): out.append(f'{RED}{line}{RESET}')
+                else:                      out.append(f'{MUTE}{line}{RESET}')
+    elif tur.get('content'):
+        # Write tool — no patch, just the new content.
+        out.append(f'{CYAN}{tur.get("filePath", "")}{RESET}')
+        out.append(f'{GRAY}{tur["content"]}{RESET}')
+    return '\n'.join(out)
+
+
+def _fmt_tur_read(tur):
+    f = tur.get('file') or {}
+    out = [f'{CYAN}{f.get("filePath", "")}{RESET}  '
+           f'{MUTE}{f.get("numLines", "?")} lines{RESET}']
+    content = f.get('content', '')
+    if content:
+        out.append('')
+        out.append(content.rstrip())
+    return '\n'.join(out)
+
+
+def _fmt_tur_glob(tur):
+    out = [f'{MUTE}{tur.get("numFiles", 0)} files'
+           f'{(" — truncated" if tur.get("truncated") else "")}{RESET}']
+    for n in tur.get('filenames') or []:
+        out.append(f'{CYAN}{n}{RESET}')
+    return '\n'.join(out)
+
+
+def _fmt_tur_grep_content(tur):
+    """Grep with content output mode."""
+    head = f'{MUTE}{tur.get("numFiles", 0)} files · {tur.get("numLines", 0)} lines{RESET}'
+    if tur.get('appliedLimit'):
+        head += f'  {YELLOW}[limit applied]{RESET}'
+    out = [head, '']
+    if tur.get('content'):
+        out.append(tur['content'].rstrip())
+    return '\n'.join(out)
+
+
+def _fmt_tur_grep_or_search(tur):
+    """Grep count mode or ToolSearch result."""
+    if 'query' in tur and 'matches' in tur:
+        # ToolSearch
+        out = [f'{MUTE}query:{RESET} {WHITE}{tur["query"]}{RESET}',
+               f'{MUTE}deferred tools:{RESET} {tur.get("total_deferred_tools", "?")}',
+               '']
+        for m in tur.get('matches') or []:
+            if isinstance(m, dict):
+                out.append(f'{YELLOW}{m.get("name", "?")}{RESET}  '
+                           f'{MUTE}{m.get("description", "")}{RESET}')
+        return '\n'.join(out)
+    return f'{MUTE}{tur.get("numFiles", 0)} files · ' \
+           f'{tur.get("numMatches", 0)} matches{RESET}'
+
+
+def _fmt_tur_task_update(tur):
+    sc = tur.get('statusChange') or {}
+    fields = tur.get('updatedFields') or {}
+    head = f'{MUTE}task {RESET}{WHITE}#{tur.get("taskId", "?")}{RESET}'
+    if sc:
+        head += f'  {sc.get("from", "?")} → {GREEN if tur.get("success") else RED}{sc.get("to", "?")}{RESET}'
+    out = [head]
+    for k, v in fields.items():
+        out.append(f'{MUTE}{k}:{RESET} {v}')
+    if tur.get('verificationNudgeNeeded'):
+        out.append(f'{YELLOW}verification needed{RESET}')
+    return '\n'.join(out)
+
+
+def _fmt_tur_task_dump(tur):
+    """Plan/TaskList result — just dump the task body."""
+    task = tur.get('task')
+    try:
+        return f'{GRAY}{json.dumps(task, indent=2, ensure_ascii=False)}{RESET}'
+    except (TypeError, ValueError):
+        return f'{GRAY}{task}{RESET}'
+
+
+def _fmt_tur_subagent(tur):
+    status = tur.get('status', '?')
+    color = {'completed': GREEN, 'success': GREEN,
+             'failed': RED, 'error': RED}.get(status, YELLOW)
+    head = (f'{MAGENTA}🤖 {tur.get("agentType", "?")}{RESET}  '
+            f'{color}[{status}]{RESET}  '
+            f'{MUTE}id={tur.get("agentId", "")[:8]}{RESET}')
+    dur_ms = tur.get('totalDurationMs', 0)
+    tokens = tur.get('totalTokens', 0)
+    n_tools = tur.get('totalToolUseCount', 0)
+    stats = (f'{MUTE}{dur_ms/1000:.1f}s · {n_tools} tools · '
+             f'{tokens:,} tokens{RESET}')
+    out = [head, stats, '']
+    content = tur.get('content')
+    if isinstance(content, list):
+        for p in content:
+            if isinstance(p, dict) and p.get('type') == 'text':
+                out.append(p.get('text', ''))
+    elif isinstance(content, str):
+        out.append(content)
+    return '\n'.join(out).rstrip()
+
+
+def _fmt_tur_skill(tur):
+    name = tur.get('commandName', '?')
+    ok = bool(tur.get('success'))
+    color = GREEN if ok else RED
+    return f'{MAGENTA}{name}{RESET}  {color}[{"ok" if ok else "fail"}]{RESET}'
+
+
+def _fmt_tur_default(tur):
+    try:
+        return f'{GRAY}{json.dumps(tur, indent=2, ensure_ascii=False)}{RESET}'
+    except (TypeError, ValueError):
+        return f'{GRAY}{tur}{RESET}'
+
+
+# ---- attachment rendering ------------------------------------------------
+
+
+def _render_attachment(obj):
+    a = obj.get('attachment') if isinstance(obj.get('attachment'), dict) else {}
+    sub = a.get('type', '?')
+    head = f'{BLUE}{BOLD}📎 attachment{RESET}  {MAGENTA}{sub}{RESET}'
+    formatter = _ATTACH_FORMATTERS.get(sub, _fmt_attach_default)
+    body = formatter(a)
+    return head + ('\n\n' + body if body else '')
+
+
+def _fmt_attach_file(a):
+    out = [f'{CYAN}{a.get("displayPath", a.get("filename", ""))}{RESET}']
+    if a.get('filename') and a.get('filename') != a.get('displayPath'):
+        out.append(f'{MUTE}{a["filename"]}{RESET}')
+    content = a.get('content', '')
+    if content:
+        out.append('')
+        out.append(content.rstrip())
+    return '\n'.join(out)
+
+
+def _fmt_attach_diagnostics(a):
+    out = []
+    if a.get('isNew'):
+        out.append(f'{YELLOW}[new]{RESET}')
+    for entry in a.get('files') or []:
+        if not isinstance(entry, dict):
+            continue
+        out.append(f'{CYAN}{entry.get("file", "?")}{RESET}')
+        for d in entry.get('diagnostics') or []:
+            if not isinstance(d, dict):
+                continue
+            sev = d.get('severity', '')
+            color = {'error': RED, 'warning': YELLOW}.get(sev, MUTE)
+            line = d.get('range', {}).get('start', {}).get('line', '?')
+            out.append(f'  {color}{sev}{RESET} '
+                       f'{MUTE}L{line}:{RESET} {d.get("message", "")}')
+    return '\n'.join(out)
+
+
+def _fmt_attach_command_permissions(a):
+    tools = a.get('allowedTools') or []
+    return f'{MUTE}allowed:{RESET} {", ".join(tools) if tools else "(none)"}'
+
+
+def _fmt_attach_queued_command(a):
+    mode = a.get('commandMode', '')
+    head = f'{CYAN}📥 queued{RESET}'
+    if mode:
+        head += f'  {MUTE}({mode}){RESET}'
+    return head + '\n\n' + (a.get('prompt', '') or '')
+
+
+def _fmt_attach_hook_success(a):
+    name = a.get('hookName', '?')
+    event = a.get('hookEvent', '?')
+    code = a.get('exitCode', 0)
+    dur = a.get('durationMs', 0)
+    color = GREEN if code == 0 else RED
+    out = [f'{color}✓ {name}{RESET}  '
+           f'{MUTE}{event} · exit={code} · {dur}ms{RESET}']
+    for label, key, col in (('stdout', 'stdout', None),
+                            ('stderr', 'stderr', RED)):
+        v = a.get(key, '')
+        if v:
+            out.append('')
+            out.append(_rule(label))
+            out.append(f'{col}{v.rstrip()}{RESET}' if col else v.rstrip())
+    return '\n'.join(out)
+
+
+def _fmt_attach_hook_context(a):
+    return (f'{MUTE}+ context from {RESET}{MAGENTA}{a.get("hookName", "?")}{RESET}'
+            f'  {MUTE}({a.get("hookEvent", "?")}){RESET}\n\n'
+            f'{a.get("content", "")}')
+
+
+def _fmt_attach_task_reminder(a):
+    return (f'{YELLOW}🔔 reminder{RESET}  '
+            f'{MUTE}{a.get("itemCount", 0)} items{RESET}\n\n'
+            f'{a.get("content", "")}')
+
+
+def _fmt_attach_skill_listing(a):
+    head = f'{MUTE}📚 {a.get("skillCount", 0)} skills'
+    if a.get('isInitial'):
+        head += ' (initial)'
+    head += f'{RESET}'
+    return head + '\n\n' + (a.get('content', '') or '')
+
+
+def _fmt_attach_delta(a):
+    """mcp_instructions_delta and deferred_tools_delta — same shape."""
+    out = []
+    for n in a.get('addedNames') or []:
+        out.append(f'{GREEN}+ {n}{RESET}')
+    for n in a.get('removedNames') or []:
+        out.append(f'{RED}- {n}{RESET}')
+    return '\n'.join(out)
+
+
+def _fmt_attach_date_change(a):
+    return f'{CYAN}📅 date{RESET} → {WHITE}{a.get("newDate", "?")}{RESET}'
+
+
+def _fmt_attach_ultrathink(a):
+    return f'{MAGENTA}🧠 ultrathink{RESET}'
+
+
+def _fmt_attach_default(a):
+    try:
+        return f'{GRAY}{json.dumps(a, indent=2, ensure_ascii=False)}{RESET}'
+    except (TypeError, ValueError):
+        return f'{GRAY}{a}{RESET}'
+
+
+_ATTACH_FORMATTERS = {
+    'file':                   _fmt_attach_file,
+    'diagnostics':            _fmt_attach_diagnostics,
+    'command_permissions':    _fmt_attach_command_permissions,
+    'queued_command':         _fmt_attach_queued_command,
+    'hook_success':           _fmt_attach_hook_success,
+    'hook_additional_context': _fmt_attach_hook_context,
+    'task_reminder':          _fmt_attach_task_reminder,
+    'skill_listing':          _fmt_attach_skill_listing,
+    'mcp_instructions_delta': _fmt_attach_delta,
+    'deferred_tools_delta':   _fmt_attach_delta,
+    'date_change':            _fmt_attach_date_change,
+    'ultrathink_effort':      _fmt_attach_ultrathink,
+}
+
+
+# ---- system rendering ----------------------------------------------------
+
+
+def _render_system(obj):
+    sub = obj.get('subtype') or ''
+    if sub == 'turn_duration':
+        ms = obj.get('durationMs', 0)
+        return (f'{MUTE}⏱ turn{RESET}  '
+                f'{WHITE}{ms/1000:.2f}s{RESET}  '
+                f'{MUTE}· {obj.get("messageCount", 0)} msgs{RESET}')
+    if sub == 'stop_hook_summary':
+        return f'{GRAY}■ stop_hook_summary{RESET}'
+    if sub == 'local_command':
+        cmd = obj.get('content') or obj.get('command') or ''
+        return f'{GRAY}$ {cmd}{RESET}'
+    if sub == 'scheduled_task_fire':
+        return f'{CYAN}⏲ scheduled fire{RESET}'
+    if sub == 'api_error':
+        try:
+            body = json.dumps(obj, indent=2, ensure_ascii=False)
+        except (TypeError, ValueError):
+            body = str(obj)
+        return f'{RED}{BOLD}‼ api_error{RESET}\n\n{RED}{body}{RESET}'
+    return f'{GRAY}system{RESET}  {MUTE}{sub or "(no subtype)"}{RESET}'
+
+
+# ---- metadata rendering --------------------------------------------------
+
+
+def _render_metadata(obj):
+    t = obj.get('type', '?')
+    color = _KIND_HEADER_COLOR.get(t, MUTE)
+    head = f'{color}{BOLD}{t}{RESET}'
+
+    # Type-specific salient fields. Everything falls through to a generic
+    # key/value dump of the remaining fields so power users still get the
+    # full record.
+    if t in ('ai-title', 'custom-title'):
+        title = obj.get('aiTitle') or obj.get('customTitle') or ''
+        return f'{head}\n\n{WHITE}{title}{RESET}'
+    if t == 'last-prompt':
+        return f'{head}\n\n{obj.get("lastPrompt", "")}'
+    if t == 'task-summary':
+        return f'{head}\n\n{obj.get("summary", "")}'
+    if t == 'tag':
+        return f'{head}  {YELLOW}{obj.get("tag", "")}{RESET}'
+    if t == 'agent-name':
+        return f'{head}  {MAGENTA}{obj.get("agentName", "")}{RESET}'
+    if t == 'agent-color':
+        return f'{head}  {obj.get("agentColor", "")}'
+    if t == 'agent-setting':
+        return f'{head}  {obj.get("agentSetting", "")}'
+    if t == 'permission-mode':
+        pm = obj.get('permissionMode', '')
+        col = _PERM_COLOR.get(pm, MUTE)
+        return f'{head}  {col}[{pm}]{RESET}'
+    if t == 'mode':
+        return f'{head}  {RED if obj.get("mode") == "coordinator" else MUTE}' \
+               f'[{obj.get("mode", "")}]{RESET}'
+    if t == 'pr-link':
+        return (f'{head}\n\n'
+                f'{WHITE}{obj.get("prRepository", "")}'
+                f'#{obj.get("prNumber", "")}{RESET}\n'
+                f'{BLUE}{obj.get("prUrl", "")}{RESET}\n'
+                f'{MUTE}linked: {obj.get("timestamp", "")}{RESET}')
+    if t == 'worktree-state':
+        ws = obj.get('worktreeSession')
+        if ws is None:
+            return f'{head}  {MUTE}(exited){RESET}'
+        return (f'{head}\n\n'
+                f'{CYAN}{ws.get("worktreePath", "")}{RESET}  '
+                f'{MUTE}@{RESET} {GREEN}{ws.get("worktreeBranch", "")}{RESET}\n'
+                f'{MUTE}original:{RESET} {ws.get("originalCwd", "")} '
+                f'{MUTE}(branch {ws.get("originalBranch", "")}){RESET}')
+    if t == 'file-history-snapshot':
+        snap = obj.get('snapshot') or {}
+        n = len(snap) if isinstance(snap, dict) else '?'
+        return (f'{head}  {MUTE}{n} files'
+                f'{(" (update)" if obj.get("isSnapshotUpdate") else "")}{RESET}')
+    if t == 'attribution-snapshot':
+        states = obj.get('fileStates') or {}
+        chars = sum(s.get('claudeContribution', 0)
+                    for s in states.values() if isinstance(s, dict))
+        return (f'{head}  {MUTE}{len(states)} files · '
+                f'{chars:,} chars by Claude{RESET}')
+    if t == 'content-replacement':
+        rep = obj.get('replacements') or []
+        agent = obj.get('agentId', '')
+        return (f'{head}  {MUTE}{len(rep)} replacements'
+                f'{(f" (agent={agent[:8]})" if agent else "")}{RESET}')
+    if t == 'speculation-accept':
+        ms = obj.get('timeSavedMs', 0)
+        return f'{head}  {GREEN}+{ms/1000:.1f}s saved{RESET}'
+    if t == 'queue-operation':
+        op = obj.get('operation', '?')
+        return (f'{head}  {WHITE}{op}{RESET}\n\n'
+                f'{obj.get("content", "")}')
+    if t == 'marble-origami-commit':
+        return (f'{head}  {MUTE}id={obj.get("collapseId", "")}{RESET}\n\n'
+                f'{obj.get("summary", "")}')
+    if t == 'marble-origami-snapshot':
+        staged = obj.get('staged') or []
+        return (f'{head}  {MUTE}{len(staged)} staged · '
+                f'armed={obj.get("armed")} · '
+                f'lastSpawnTokens={obj.get("lastSpawnTokens", 0)}{RESET}')
+    if t == 'progress':
+        d = obj.get('data') or {}
+        dt = d.get('type', '?') if isinstance(d, dict) else '?'
+        return f'{head}  {MUTE}{dt}{RESET}'
+    if t == 'summary':
+        return f'{head}\n\n{obj.get("summary", "")}'
+    return f'{head}\n{GRAY}{json.dumps(obj, indent=2, ensure_ascii=False)}{RESET}'
+
+
+def _render_unknown(obj):
+    """Forward-compat fallback — unchanged from the pre-refactor preview."""
+    try:
+        return json.dumps(obj, indent=2, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(obj)
+
+
+# ---- chrome footer -------------------------------------------------------
+
+
+def _fmt_chrome(obj):
+    """Common metadata footer appended to every per-message preview."""
+    if not isinstance(obj, dict):
+        return ''
+    rows = []
+    for key, label in (('uuid', 'uuid'),
+                       ('parentUuid', 'parentUuid'),
+                       ('sessionId', 'sessionId'),
+                       ('promptId', 'promptId'),
+                       ('forkedFrom', 'forkedFrom')):
+        v = obj.get(key)
+        if v:
+            rows.append((label, str(v)))
+    cwd = obj.get('cwd', '')
+    branch = obj.get('gitBranch', '')
+    if cwd or branch:
+        rows.append(('cwd', f'{cwd}  {MUTE}branch:{RESET} {branch}' if branch else cwd))
+    ts = obj.get('timestamp', '')
+    ver = obj.get('version', '')
+    if ts or ver:
+        rows.append(('timestamp', f'{ts}  {MUTE}version:{RESET} {ver}' if ver else ts))
+    flags = []
+    if obj.get('isSidechain'): flags.append('sidechain')
+    if obj.get('isMeta'):      flags.append('meta')
+    if flags:
+        rows.append(('flags', ', '.join(flags)))
+
+    if not rows:
+        return ''
+    w = max(len(k) for k, _ in rows)
+    body = '\n'.join(
+        f'{MUTE}{k.ljust(w)}:{RESET} {v}' for k, v in rows
+    )
+    return _rule() + '\n' + body
+
+
+_RENDERERS = {
+    'user':       _render_user,
+    'assistant':  _render_assistant,
+    'attachment': _render_attachment,
+    'system':     _render_system,
+    'metadata':   _render_metadata,
+    'unknown':    _render_unknown,
+}
 
 
 # ---- get_preview ---------------------------------------------------------
@@ -592,26 +1646,260 @@ def _preview_project(path):
 
 
 def _preview_session(path):
+    """Structured session preview: metadata card + recent timeline.
+
+    One pass over the .jsonl folds metadata records (titles, modes,
+    permission state, PR link, worktree, counts) into a compact card,
+    then renders the most recent ``_TIMELINE_TAIL`` events as one-liners.
+    """
     try:
-        lines = []
-        with open(path, 'r', encoding='utf-8', errors='replace') as f:
-            for n, line in enumerate(f):
-                if n >= 1000:
-                    lines.append(f'… ({n}+ lines total)')
-                    break
-                lines.append(f'L{n + 1}: {line.rstrip()[:400]}')
-        return '\n'.join(lines) if lines else '(empty session)'
+        meta, timeline_rows = _scan_session(path)
     except OSError as e:
         return f'[error] {e}'
+    if not meta and not timeline_rows:
+        return '(empty session)'
+    return _fmt_session_card(meta) + '\n\n' + _fmt_timeline(timeline_rows)
+
+
+# How many events to show in the timeline tail (first/last halves on
+# longer sessions). Cheap to bump — the scan already walks the whole
+# file; the cost is how much fits in the preview pane.
+_TIMELINE_TAIL = 1000
+
+
+def _scan_session(path):
+    """Walk the .jsonl once. Return ``(meta_dict, timeline_rows)``.
+
+    ``meta_dict`` collapses last-wins metadata (title, mode, permission)
+    plus aggregates (counts, first/last timestamp, tags, etc.).
+    ``timeline_rows`` is a list of ``(line_no, obj)`` for events worth
+    showing in the timeline; metadata-only records are excluded so the
+    timeline reads as "what happened" rather than "what got bookkept".
+    """
+    meta = {
+        'path': path,
+        'session_id': os.path.basename(path)[:-len('.jsonl')]
+                      if path.endswith('.jsonl') else os.path.basename(path),
+        'tags': [],
+        'counts': {
+            'total': 0, 'user': 0, 'assistant': 0,
+            'tool_use': 0, 'tool_result': 0, 'attachment': 0,
+            'system': 0, 'errors': 0, 'subagent_msgs': 0,
+        },
+    }
+    timeline = []
+    first_ts = None
+    last_ts = None
+    with open(path, 'r', encoding='utf-8', errors='replace') as f:
+        for n, line in enumerate(f):
+            line = line.rstrip('\n')
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            t = obj.get('type')
+            ts = obj.get('timestamp')
+            if ts:
+                first_ts = first_ts or ts
+                last_ts = ts
+            meta['counts']['total'] += 1
+            if obj.get('isSidechain'):
+                meta['counts']['subagent_msgs'] += 1
+
+            # Last-wins metadata
+            if t == 'custom-title':
+                meta['custom_title'] = obj.get('customTitle', '')
+            elif t == 'ai-title':
+                meta['ai_title'] = obj.get('aiTitle', '')
+            elif t == 'last-prompt':
+                meta['last_prompt'] = obj.get('lastPrompt', '')
+            elif t == 'tag':
+                tag = obj.get('tag')
+                if tag and tag not in meta['tags']:
+                    meta['tags'].append(tag)
+            elif t == 'agent-name':
+                meta['agent_name'] = obj.get('agentName', '')
+            elif t == 'agent-color':
+                meta['agent_color'] = obj.get('agentColor', '')
+            elif t == 'agent-setting':
+                meta['agent_setting'] = obj.get('agentSetting', '')
+            elif t == 'permission-mode':
+                meta['permission_mode'] = obj.get('permissionMode', '')
+            elif t == 'mode':
+                meta['mode'] = obj.get('mode', '')
+            elif t == 'pr-link':
+                meta['pr'] = {
+                    'repo':   obj.get('prRepository', ''),
+                    'number': obj.get('prNumber', ''),
+                    'url':    obj.get('prUrl', ''),
+                }
+            elif t == 'worktree-state':
+                meta['worktree'] = obj.get('worktreeSession')
+            elif t == 'task-summary':
+                meta['task_summary'] = obj.get('summary', '')
+            elif t == 'summary':
+                meta['summary'] = obj.get('summary', '')
+
+            # Aggregate counts on conversation records
+            if t == 'user':
+                meta['counts']['user'] += 1
+                content = (obj.get('message') or {}).get('content')
+                if isinstance(content, list):
+                    if any(isinstance(p, dict) and p.get('type') == 'tool_result'
+                           for p in content):
+                        meta['counts']['tool_result'] += 1
+                timeline.append((n, obj))
+            elif t == 'assistant':
+                meta['counts']['assistant'] += 1
+                content = (obj.get('message') or {}).get('content')
+                if isinstance(content, list):
+                    if any(isinstance(p, dict) and p.get('type') == 'tool_use'
+                           for p in content):
+                        meta['counts']['tool_use'] += 1
+                timeline.append((n, obj))
+            elif t == 'attachment':
+                meta['counts']['attachment'] += 1
+                timeline.append((n, obj))
+            elif t == 'system':
+                meta['counts']['system'] += 1
+                if obj.get('subtype') == 'api_error':
+                    meta['counts']['errors'] += 1
+                timeline.append((n, obj))
+            # metadata records are NOT added to the timeline — they're
+            # already folded into the card above.
+
+    meta['first_ts'] = first_ts
+    meta['last_ts'] = last_ts
+
+    # Pick the timeline to display: last N events, since the cursor's
+    # most common need is "what happened recently".
+    return meta, timeline[-_TIMELINE_TAIL:]
+
+
+def _fmt_session_card(m):
+    """Compact metadata card for the session preview header.
+
+    Used both for top-level sessions and for subagent transcripts —
+    the latter populate ``session_id`` with ``"agent <id>"`` and may
+    set ``agent_type`` / ``agent_description`` from the sidecar
+    ``meta.json`` so those surface near the top of the card.
+    """
+    rows = []
+    sid = m.get('session_id', '')
+    rows.append(('session', f'{WHITE}{sid}{RESET}'))
+
+    if m.get('agent_type'):
+        rows.append(('type', f'{MAGENTA}{m["agent_type"]}{RESET}'))
+    if m.get('agent_description'):
+        rows.append(('desc', f'{WHITE}{m["agent_description"]}{RESET}'))
+
+    title = m.get('custom_title') or m.get('ai_title')
+    if title:
+        rows.append(('title', f'{WHITE}{BOLD}{title}{RESET}'))
+
+    chips = []
+    mode = m.get('mode')
+    if mode:
+        col = RED if mode == 'coordinator' else MUTE
+        chips.append(f'{col}[{mode}]{RESET}')
+    pmode = m.get('permission_mode')
+    if pmode:
+        col = _PERM_COLOR.get(pmode, MUTE)
+        chips.append(f'{col}[{pmode}]{RESET}')
+    if chips:
+        rows.append(('mode', '  '.join(chips)))
+
+    pr = m.get('pr')
+    if pr:
+        rows.append(('PR',
+                     f'{WHITE}{pr["repo"]}#{pr["number"]}{RESET}  '
+                     f'{BLUE}{pr["url"]}{RESET}'))
+
+    wt = m.get('worktree')
+    if wt is not None:
+        if wt is None or wt == {}:
+            rows.append(('worktree', f'{MUTE}(exited){RESET}'))
+        elif isinstance(wt, dict):
+            wpath = wt.get('worktreePath', '')
+            wbranch = wt.get('worktreeBranch', '')
+            rows.append(('worktree',
+                         f'{CYAN}{wpath}{RESET}  '
+                         f'{MUTE}@{RESET} {GREEN}{wbranch}{RESET}'))
+
+    last_prompt = m.get('last_prompt')
+    if last_prompt:
+        snippet = ' '.join(str(last_prompt).split())[:200]
+        rows.append(('last', snippet))
+
+    if m.get('tags'):
+        rows.append(('tags', f'{YELLOW}{", ".join(m["tags"])}{RESET}'))
+
+    if m.get('agent_name'):
+        rows.append(('agent', f'{MAGENTA}{m["agent_name"]}{RESET}'))
+
+    if m.get('task_summary'):
+        snippet = ' '.join(str(m['task_summary']).split())[:200]
+        rows.append(('now', f'{ITAL}{snippet}{RESET}'))
+
+    if m.get('summary'):
+        snippet = ' '.join(str(m['summary']).split())[:200]
+        rows.append(('summary', snippet))
+
+    if m.get('first_ts'):
+        rows.append(('started', f'{MUTE}{m["first_ts"]}{RESET}'))
+    if m.get('last_ts') and m.get('last_ts') != m.get('first_ts'):
+        rows.append(('ended',   f'{MUTE}{m["last_ts"]}{RESET}'))
+
+    c = m['counts']
+    counts_line = (
+        f'{c["total"]} msg · {c["user"]} user · {c["assistant"]} asst · '
+        f'{c["tool_use"]} tool_use · {c["tool_result"]} tool_result · '
+        f'{c["attachment"]} attach'
+    )
+    if c['errors']:
+        counts_line += f'  {RED}· {c["errors"]} errors{RESET}'
+    rows.append(('counts', counts_line))
+
+    if c['subagent_msgs']:
+        rows.append(('sidechain', f'{MUTE}{c["subagent_msgs"]} msgs{RESET}'))
+
+    w = max(len(k) for k, _ in rows)
+    return '\n'.join(
+        f'{MUTE}{k.ljust(w)}:{RESET} {v}' for k, v in rows
+    )
+
+
+def _fmt_timeline(rows):
+    """Render the trailing event rows as one-liners.
+
+    Reuses ``_summarise_message`` (existing row-title formatter) so the
+    timeline reads identically to what the user sees in the message list.
+    """
+    if not rows:
+        return f'{MUTE}(no events){RESET}'
+    out = [_rule('timeline')]
+    for n, obj in rows:
+        kind = _kind_of(obj)
+        color = _KIND_HEADER_COLOR.get(kind, MUTE)
+        title = _summarise_message(obj)
+        out.append(f'{MUTE}L{n+1:>4}{RESET} '
+                   f'{color}{kind:<14}{RESET} {title}')
+    return '\n'.join(out)
 
 
 def _preview_subagent(item_id):
-    """Preview a subagent group: type/description + opening prompt.
+    """Preview a subagent group as a full session.
 
-    The opening prompt is the first user-text record in the agent's
-    .jsonl, which tells you what task the parent dispatched. We cap it
-    at 800 chars to avoid blowing out the preview pane on the bigger
-    multi-paragraph briefings.
+    The agent's ``.jsonl`` file is structurally identical to a top-level
+    session transcript, so we reuse the same ``_scan_session`` +
+    ``_fmt_session_card`` + ``_fmt_timeline`` pipeline. The only extras
+    are the fields stored in ``agent-<id>.meta.json`` (agentType,
+    description) which we layer onto the scanned metadata before
+    rendering.
     """
     session_path, _, suffix = item_id.partition('#agent:')
     if not suffix:
@@ -619,61 +1907,39 @@ def _preview_subagent(item_id):
     agent_id = suffix
     sub_dir = _subagents_dir(session_path)
     agent_path = os.path.join(sub_dir, f'agent-{agent_id}.jsonl')
-    meta = _read_subagent_meta(
+    sidecar = _read_subagent_meta(
         os.path.join(sub_dir, f'agent-{agent_id}.meta.json'),
     )
-    header_lines = [
-        f'subagent: {agent_id}',
-        f'type:     {meta.get("agentType", "?")}',
-    ]
-    desc = meta.get('description') or ''
-    if desc:
-        header_lines.append(f'desc:     {desc}')
-    line_count = 0
-    first_prompt = ''
     try:
-        with open(agent_path, 'r', encoding='utf-8', errors='replace') as f:
-            for n, line in enumerate(f):
-                line_count = n + 1
-                if first_prompt:
-                    continue
-                line = line.rstrip('\n')
-                if not line.strip():
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                msg = obj.get('message') if isinstance(obj.get('message'), dict) else None
-                if not msg or msg.get('role') != 'user':
-                    continue
-                first_prompt = _extract_text(msg.get('content', ''))
+        meta, timeline_rows = _scan_session(agent_path)
     except OSError as e:
         return f'[error] {e}'
-    header_lines.append(f'lines:    {line_count}')
-    out = '\n'.join(header_lines)
-    if first_prompt:
-        snippet = first_prompt.strip()
-        if len(snippet) > 800:
-            snippet = snippet[:1000] + ' …'
-        out += '\n\nopening prompt:\n' + snippet
-    return out
+    # Surface the subagent-specific identity in the card. ``session_id``
+    # for a top-level session is the .jsonl basename; for a subagent the
+    # agent_id is what the user actually thinks of as "this thing".
+    meta['session_id'] = f'agent {agent_id}'
+    if sidecar.get('agentType'):
+        meta['agent_type'] = sidecar['agentType']
+    if sidecar.get('description'):
+        meta['agent_description'] = sidecar['description']
+    return _fmt_session_card(meta) + '\n\n' + _fmt_timeline(timeline_rows)
 
 
 def _preview_message(path, n):
-    try:
-        with open(path, 'r', encoding='utf-8', errors='replace') as f:
-            for i, line in enumerate(f):
-                if i == n:
-                    line = line.rstrip('\n')
-                    try:
-                        obj = json.loads(line)
-                        return json.dumps(obj, indent=2, ensure_ascii=False)
-                    except json.JSONDecodeError:
-                        return line
-    except OSError as e:
-        return f'[error] {e}'
-    return ''
+    """Per-line preview: classify the record, dispatch to a renderer.
+
+    Each renderer returns a body str with ANSI inlined. The chrome
+    footer (uuid, cwd, timestamp, …) is uniform and appended here.
+    """
+    obj = _read_jsonl_line(path, n)
+    if obj is None:
+        return ''
+    if '__raw__' in obj:
+        return f'{RED}[invalid json]{RESET} {obj["__raw__"]}'
+    kind = _classify(obj)
+    body = _RENDERERS.get(kind, _render_unknown)(obj)
+    chrome = _fmt_chrome(obj)
+    return body + ('\n' + chrome if chrome else '')
 
 
 # ---- actions -------------------------------------------------------------
@@ -752,6 +2018,7 @@ _message_limit = _MESSAGE_LIMIT
 
 def main():
     global _message_limit
+    _init_color()
     _message_limit = _pop_limit_arg(_MESSAGE_LIMIT)
     initial_scope = sys.argv[1] if len(sys.argv) > 1 else None
     b = Browser(
