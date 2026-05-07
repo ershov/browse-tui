@@ -1504,13 +1504,15 @@ def render_preview(browser, rect, *, info=False, has_header=True,
         wrapped.extend(_wrap_preview_line(
             line, width, ansi_on=ansi_on, drop_sgr=drop_sgr))
 
-    # Clamp ``_preview_scroll`` so at least one content row is visible.
-    # ``_preview_scroll_down`` / ``_preview_page_down`` (070-actions.py)
-    # bump the offset without an upper bound — the wrap geometry isn't
-    # known there. We clamp here, where ``wrapped`` is in hand, and
-    # write the clamped value back so subsequent shift-up presses don't
-    # have to pump down through a phantom count.
-    max_scroll = max(0, len(wrapped) - 1)
+    # Clamp ``_preview_scroll`` so the last content row lands at the
+    # bottom of the pane when fully scrolled — conventional viewport
+    # semantics. ``_preview_scroll_down`` / ``_preview_page_down``
+    # (070-actions.py) bump the offset without an upper bound (they
+    # don't have wrap geometry in scope), so we clamp here where
+    # ``wrapped`` and ``content_lines`` are both in hand and write the
+    # clamped value back so subsequent shift-up presses don't have to
+    # pump down through a phantom count.
+    max_scroll = max(0, len(wrapped) - content_lines)
     scroll = max(0, min(browser._preview_scroll, max_scroll))
     if scroll != browser._preview_scroll:
         browser._preview_scroll = scroll
