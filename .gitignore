@@ -1,3 +1,6 @@
 *.pyc
 __pycache__/
 .PLAN.md.bak
+.worktrees
+.tmp
+tmp

@@ -1878,6 +1878,46 @@ class TestSeparatorCacheZeroBytes(unittest.TestCase):
         _render.render_separator(rect, cache_key='sep_main', browser=browser)
         self.assertEqual(self._drain(), '')
 
+    def test_horizontal_separator_multi_row_paints_every_row(self):
+        """Regression for #226: tall horizontal rect paints all rows.
+
+        Pre-fix the cached horizontal path called ``begin_row`` only
+        for ``rel_row=0``; rows 1..n-1 of the cache stayed ``None``,
+        which both leaks the zero-byte invariant on subsequent paints
+        and silently swallows any future multi-row caller's bar
+        glyphs. The fix loops over ``rect.height`` and paints every
+        row, mirroring the vertical-cached branch.
+        """
+        browser = _MockBrowser(_MockState([]))
+        # height=2, width=10 — every row should carry ``─`` glyphs.
+        rect = Rect(left=1, top=5, right=11, bottom=7)
+
+        self._reconcile(browser, 'sep_main', rect)
+        _render.render_separator(rect, cache_key='sep_main', browser=browser)
+        first = self._drain()
+        self.assertEqual(
+            first.count('─'), 20,
+            f'both rows of a height=2 rect must emit 10 bar glyphs '
+            f'each (20 total); got {first.count("─")} in {first!r}',
+        )
+
+        cache = browser._pane_cache['sep_main']
+        self.assertEqual(len(cache.lines), 2)
+        for i, line in enumerate(cache.lines):
+            self.assertIsNotNone(
+                line, f'cache.lines[{i}] must be populated after first paint',
+            )
+
+        # Second paint with the same rect → zero bytes, proving every
+        # row is in the cache (otherwise rows 1..n-1 would re-emit).
+        self._reconcile(browser, 'sep_main', rect)
+        _render.render_separator(rect, cache_key='sep_main', browser=browser)
+        self.assertEqual(
+            self._drain(), '',
+            'second paint of a multi-row horizontal separator must emit '
+            'zero bytes (all rows must participate in the cache)',
+        )
+
     def test_info_bar_zero_bytes_on_second_paint(self):
         browser = _MockBrowser(_MockState([]))
 

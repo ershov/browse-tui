@@ -4536,43 +4536,57 @@ def render_separator(rect, *, orientation=None, content=None,
             reset_style()
         return
 
-    # Horizontal — write on the first row of the rect (separators are
-    # 1-thick by construction; multi-row rects are clipped to the top
-    # row to keep the API forgiving).
+    # Horizontal — production callers always pass a 1-row rect (the
+    # separator is conceptually 1-thick), but the renderer paints every
+    # row of the rect with the same ``─`` content so that:
+    #   * the cache is fully populated (rows 1..n-1 can't be left
+    #     uninitialised, which would defeat the zero-byte invariant on
+    #     the next paint), and
+    #   * any future multi-row caller gets a consistent thicker bar
+    #     instead of a half-painted rect.
+    # This mirrors the vertical-cached branch above, which already loops
+    # over all rows and writes the same ``│`` glyph on each.
     width = rect.width
-    if use_cache:
-        begin_row(cache, 0, rect.top, rect.left, rect.right,
-                  rightmost=rightmost)
-    else:
-        move(rect.top, rect.left)
+    left = rect.left
+    right = rect.right
+    for rel_row in range(rect.height):
+        abs_row = rect.top + rel_row
+        if use_cache:
+            begin_row(cache, rel_row, abs_row, left, right,
+                      rightmost=rightmost)
+        else:
+            move(abs_row, left)
 
-    set_style(fg=8)
-    if content:
-        # Truncate content to leave a 1-col padding on each side, then
-        # centre it between two ``─`` runs.
-        max_content = max(0, width - 2)
-        ctext = content if len(content) <= max_content else content[:max_content]
-        ctext_len = len(ctext)
-        # Surrounding ``─`` runs split the leftover width.
-        leftover = width - ctext_len
-        left_run = leftover // 2
-        right_run = leftover - left_run
-        if left_run > 0:
-            write('─' * left_run)
-        if ctext:
-            # Reset to default fg for the content so it reads clearly,
-            # then return to the dim separator colour.
-            reset_style()
-            write(ctext)
-            set_style(fg=8)
-        if right_run > 0:
-            write('─' * right_run)
-    else:
-        write('─' * width)
-    reset_style()
+        set_style(fg=8)
+        if content:
+            # Truncate content to leave a 1-col padding on each side,
+            # then centre it between two ``─`` runs. The content is
+            # repeated on every row of a multi-row rect (consistent
+            # with the bar-glyph treatment for vertical separators).
+            max_content = max(0, width - 2)
+            ctext = (content if len(content) <= max_content
+                     else content[:max_content])
+            ctext_len = len(ctext)
+            # Surrounding ``─`` runs split the leftover width.
+            leftover = width - ctext_len
+            left_run = leftover // 2
+            right_run = leftover - left_run
+            if left_run > 0:
+                write('─' * left_run)
+            if ctext:
+                # Reset to default fg for the content so it reads
+                # clearly, then return to the dim separator colour.
+                reset_style()
+                write(ctext)
+                set_style(fg=8)
+            if right_run > 0:
+                write('─' * right_run)
+        else:
+            write('─' * width)
+        reset_style()
 
-    if use_cache:
-        end_row()
+        if use_cache:
+            end_row()
 
 
 def render_info_bar(row, cols, label, *, info=False, browser=None,
