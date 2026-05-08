@@ -4,3 +4,4 @@ __pycache__/
 .worktrees
 .tmp
 tmp
+.claude/scheduled_tasks.lock

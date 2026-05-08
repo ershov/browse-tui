@@ -1489,6 +1489,7 @@ class TestListScrollDecoupledFromCursor(unittest.TestCase):
             # 'h' default: list is 30% of 40 = 12 rows. Snap row 50 from
             # scroll=0 → 50 - 12 + 1 = 39.
             b.set_split('h')
+            b.drain_main_queue()
             b._list_scroll = 0
             b._snap_list_scroll_to_row(50)
             self.assertEqual(b._list_scroll, 39,
@@ -1497,6 +1498,7 @@ class TestListScrollDecoupledFromCursor(unittest.TestCase):
             # Switch to 'v': list spans the full 39-row body. Snap row
             # 50 from scroll=0 → 50 - 39 + 1 = 12.
             b.set_split('v')
+            b.drain_main_queue()
             b._list_scroll = 0
             b._snap_list_scroll_to_row(50)
             self.assertEqual(b._list_scroll, 12,
@@ -1505,6 +1507,7 @@ class TestListScrollDecoupledFromCursor(unittest.TestCase):
 
             # Switch back to 'h': scroll math reverts to 12-row list.
             b.set_split('h')
+            b.drain_main_queue()
             b._list_scroll = 0
             b._snap_list_scroll_to_row(50)
             self.assertEqual(b._list_scroll, 39,
@@ -1514,6 +1517,7 @@ class TestListScrollDecoupledFromCursor(unittest.TestCase):
             # 'm' and 'pc' also span full body; sanity-check both.
             for code in ('m', 'pc'):
                 b.set_split(code)
+                b.drain_main_queue()
                 b._list_scroll = 0
                 b._snap_list_scroll_to_row(50)
                 self.assertEqual(
@@ -1540,22 +1544,27 @@ class TestListScrollDecoupledFromCursor(unittest.TestCase):
         _actions.layout_panes = _render.layout_panes
         try:
             b.set_split('h')
+            b.drain_main_queue()
             self.assertEqual(_actions._list_pane_height(b), 12,
                              "h: 30%% of 40 rows = 12")
 
             b.set_split('v')
+            b.drain_main_queue()
             self.assertEqual(_actions._list_pane_height(b), 39,
                              "v: list pane spans the full body height")
 
             b.set_split('m')
+            b.drain_main_queue()
             self.assertEqual(_actions._list_pane_height(b), 39,
                              "m: list pane spans the full body height")
 
             b.set_split('pc')
+            b.drain_main_queue()
             self.assertEqual(_actions._list_pane_height(b), 39,
                              "pc: list pane spans the full body height")
 
             b.set_split('h')
+            b.drain_main_queue()
             self.assertEqual(_actions._list_pane_height(b), 12,
                              "back to h: 12-row list pane again")
         finally:
@@ -2254,6 +2263,7 @@ class TestSetListRatio(unittest.TestCase):
         b = _make_browser()
         try:
             b.set_list_ratio(0.42)
+            b.drain_main_queue()
             self.assertEqual(b.list_ratio, 0.42)
         finally:
             b.stop_workers()
@@ -2262,6 +2272,7 @@ class TestSetListRatio(unittest.TestCase):
         b = _make_browser()
         try:
             b.set_list_ratio(5.0)
+            b.drain_main_queue()
             self.assertLess(b.list_ratio, 1.0)
             self.assertGreaterEqual(b.list_ratio, _state._LIST_RATIO_MAX)
         finally:
@@ -2271,6 +2282,7 @@ class TestSetListRatio(unittest.TestCase):
         b = _make_browser()
         try:
             b.set_list_ratio(-0.5)
+            b.drain_main_queue()
             self.assertGreater(b.list_ratio, 0.0)
             self.assertLessEqual(b.list_ratio, _state._LIST_RATIO_MIN)
         finally:
@@ -2281,6 +2293,7 @@ class TestSetListRatio(unittest.TestCase):
         b = _make_browser()
         try:
             b.set_list_ratio('not a number')  # type: ignore[arg-type]
+            b.drain_main_queue()
             self.assertAlmostEqual(b.list_ratio, 0.30)
         finally:
             b.stop_workers()
@@ -2300,6 +2313,7 @@ class TestLayoutSplitActions(unittest.TestCase):
             ctx = _ctx_for(b)
             b._needs_redraw.clear()
             _actions._set_layout_v(ctx)
+            b.drain_main_queue()
             self.assertEqual(b.split, 'v')
             self.assertIn('all', b._needs_redraw)
         finally:
@@ -2311,6 +2325,7 @@ class TestLayoutSplitActions(unittest.TestCase):
             ctx = _ctx_for(b)
             b._needs_redraw.clear()
             _actions._set_layout_h(ctx)
+            b.drain_main_queue()
             self.assertEqual(b.split, 'h')
             self.assertIn('all', b._needs_redraw)
         finally:
@@ -2322,6 +2337,7 @@ class TestLayoutSplitActions(unittest.TestCase):
             ctx = _ctx_for(b)
             b._needs_redraw.clear()
             _actions._set_layout_m(ctx)
+            b.drain_main_queue()
             self.assertEqual(b.split, 'm')
             self.assertIn('all', b._needs_redraw)
         finally:
@@ -2333,6 +2349,7 @@ class TestLayoutSplitActions(unittest.TestCase):
             ctx = _ctx_for(b)
             b._needs_redraw.clear()
             _actions._set_layout_pc(ctx)
+            b.drain_main_queue()
             self.assertEqual(b.split, 'pc')
             self.assertIn('all', b._needs_redraw)
         finally:
@@ -2346,6 +2363,7 @@ class TestLayoutSplitActions(unittest.TestCase):
             seq = []
             for _ in range(4):
                 _actions._cycle_layout(ctx)
+                b.drain_main_queue()
                 seq.append(b.split)
             self.assertEqual(seq, ['h', 'm', 'pc', 'v'])
         finally:
@@ -2360,6 +2378,7 @@ class TestLayoutSplitActions(unittest.TestCase):
             try:
                 ctx = _ctx_for(b)
                 _actions._cycle_layout(ctx)
+                b.drain_main_queue()
                 self.assertEqual(
                     b.split, expected,
                     f'{start!r} should cycle to {expected!r}, got {b.split!r}',
@@ -2376,6 +2395,7 @@ class TestLayoutSplitActions(unittest.TestCase):
             ctx = _ctx_for(b)
             b.split = 'bogus'  # bypass set_split's clamp on purpose
             _actions._cycle_layout(ctx)
+            b.drain_main_queue()
             self.assertEqual(b.split, _actions._LAYOUT_CYCLE[0])
         finally:
             b.stop_workers()
@@ -2393,6 +2413,7 @@ class TestLayoutSplitActions(unittest.TestCase):
         try:
             ctx = _ctx_for(b)
             self.assertTrue(dispatch_key(b, ctx, 'alt-1'))
+            b.drain_main_queue()
             self.assertEqual(b.split, 'v')
         finally:
             b.stop_workers()
@@ -2402,6 +2423,7 @@ class TestLayoutSplitActions(unittest.TestCase):
         try:
             ctx = _ctx_for(b)
             self.assertTrue(dispatch_key(b, ctx, 'alt-2'))
+            b.drain_main_queue()
             self.assertEqual(b.split, 'h')
         finally:
             b.stop_workers()
@@ -2411,6 +2433,7 @@ class TestLayoutSplitActions(unittest.TestCase):
         try:
             ctx = _ctx_for(b)
             self.assertTrue(dispatch_key(b, ctx, 'alt-3'))
+            b.drain_main_queue()
             self.assertEqual(b.split, 'm')
         finally:
             b.stop_workers()
@@ -2420,6 +2443,7 @@ class TestLayoutSplitActions(unittest.TestCase):
         try:
             ctx = _ctx_for(b)
             self.assertTrue(dispatch_key(b, ctx, 'alt-4'))
+            b.drain_main_queue()
             self.assertEqual(b.split, 'pc')
         finally:
             b.stop_workers()
@@ -2429,6 +2453,7 @@ class TestLayoutSplitActions(unittest.TestCase):
         try:
             ctx = _ctx_for(b)
             self.assertTrue(dispatch_key(b, ctx, '\\'))
+            b.drain_main_queue()
             self.assertEqual(b.split, 'h')
         finally:
             b.stop_workers()

@@ -1063,154 +1063,13 @@ class Browser:
         self.actions = [a for a in self.actions if a.key != action.key]
         self.actions.append(action)
 
-    # ---- public, thread-safe API ---------------------------------------
-
-    def refresh(self, id: Any = None,
-                on_complete: Optional[Callable[[], None]] = None) -> 'Pending':
-        """Schedule a refetch of one parent's children (or the full root).
-
-        Returns a Pending that resolves on the main thread once the worker
-        has delivered the new children list. Safe to call from any thread
-        -- the actual cache invalidation runs on the main thread (in
-        ``_do_refresh``) so visible-tree state stays consistent.
-
-        ``id=None`` invalidates the entire cache and refetches the root.
-        ``on_complete`` is wired via ``.then`` so callers may chain in
-        either style.
-        """
-        pending = Pending()
-        if on_complete is not None:
-            pending.then(on_complete)
-        self.post(lambda: self._do_refresh(id, pending))
-        return pending
-
-    def post(self, fn: Callable[[], None]) -> None:
-        """Schedule ``fn`` to run on the main thread on the next drain.
-
-        The callable runs with no arguments and its return value is
-        ignored. Exceptions inside ``fn`` propagate to the drain loop --
-        callers should catch their own exceptions if they want to keep
-        the drain going. (We may revisit and wrap in try/except once the
-        renderer can surface a status line.)
-        """
-        self._main_queue.put(fn)
-        notify_wake()
-
-    def message(self, text: str) -> None:
-        """Surface ``text`` as a transient status message.
-
-        Stored on Browser; the renderer in ticket #10 picks it up. Safe
-        to call from any thread (uses ``post`` under the hood so the
-        write happens on the main thread).
-        """
-        self.post(lambda: setattr(self, '_message_text', text))
-
-    def error(self, text: str) -> None:
-        """Surface ``text`` as an error message. Same lane as ``message``."""
-        self.post(lambda: setattr(self, '_error_text', text))
-
-    @property
-    def error_text(self) -> str:
-        """Most recent error message surfaced via :meth:`error`."""
-        return self._error_text
-
-    @property
-    def message_text(self) -> str:
-        """Most recent transient status message surfaced via :meth:`message`."""
-        return self._message_text
-
-    def cursor_to(self, id: Any,
-                  on_complete: Optional[Callable[[], None]] = None) -> 'Pending':
-        """Move cursor to the item with the given id, expanding ancestors as needed.
-
-        Asynchronous because we may need to fetch ancestor children. The
-        returned Pending resolves once the cursor is positioned -- after
-        all required fetches complete, or on the next drain if the id is
-        already visible. For not-yet-visible ids, phase 1 best-effort:
-        the Pending resolves with the cursor unmoved (full ancestor walk
-        is phase-2 territory, requires parent metadata on items).
-        """
-        pending = Pending()
-        if on_complete is not None:
-            pending.then(on_complete)
-        self.post(lambda: self._do_cursor_to(id, pending))
-        return pending
-
-    def expand(self, id: Any,
-               on_complete: Optional[Callable[[], None]] = None) -> 'Pending':
-        """Add ``id`` to expanded; trigger fetch if not cached.
-
-        Pending resolves when children are cached (or immediately on the
-        next drain if already cached). Safe to call from any thread.
-        """
-        pending = Pending()
-        if on_complete is not None:
-            pending.then(on_complete)
-        self.post(lambda: self._do_expand(id, pending))
-        return pending
-
-    def cancel(self, *pendings: 'Pending') -> None:
-        """Mark one or more Pendings cancelled (sugar for ``p.cancel()``).
-
-        Idempotent on already-cancelled or already-resolved Pendings.
-        Worker fetches are not killed -- cancellation is non-strict and
-        only suppresses chained ``.then()`` callbacks from firing. Useful
-        when the user has moved on and a stale chain (e.g. cursor-to a
-        no-longer-relevant id) should not fire.
-        """
-        for p in pendings:
-            p.cancel()
-
-    def set_list_ratio(self, ratio: float) -> None:
-        """Set the list pane's share of total terminal rows (clamped).
-
-        The clamp range is ``[_LIST_RATIO_MIN, _LIST_RATIO_MAX]`` —
-        outside that range the layout produces degenerate panes and
-        the user can't recover with hotkey nudges. The layout
-        independently enforces a minimum-1 list / minimum-2 preview
-        when the terminal has room; this method's clamp is a sanity
-        guardrail, not the live floor.
-        """
-        self.list_ratio = _clamp_list_ratio(ratio)
-        self._needs_redraw.add('all')
-
-    def set_split(self, s: str) -> None:
-        """Set the split-layout selector (clamped to ``_VALID_SPLITS``).
-
-        Invalid values (unknown codes, non-strings, ``None``) fall back
-        to the historic default ``'h'``. Mirrors ``set_list_ratio``: the
-        clamp is a guardrail, not a live floor — the layout helpers in
-        050-render produce sane geometries even at degenerate sizes.
-        Marks the full screen for redraw so the next render pass picks
-        up the new layout family.
-        """
-        self.split = _clamp_split(s)
-        self._needs_redraw.add('all')
-
-    def select(self, ids, replace: bool = False) -> None:
-        """Add ``ids`` to ``selected`` (or replace existing selection if ``replace``).
-
-        Thread-safe; the actual mutation runs on the main thread so the
-        renderer never sees a torn set. Phase 1 stores the ids verbatim;
-        the renderer in #10 reads the set when emitting ``*`` markers.
-        """
-        # Snapshot the iterable on the calling thread so the lambda
-        # doesn't capture a mutating live source.
-        ids_list = list(ids)
-        self.post(lambda: self._do_select(ids_list, replace))
-
-    def quit(self, code: int = 0, output: str = '') -> None:
-        """Request the main loop to exit with the given exit code.
-
-        Thread-safe. Phase 1 stores ``_quit_requested``/``_quit_code``/
-        ``_quit_output`` on Browser; the main loop in #13 reads these
-        and shuts down once the current drain finishes.
-        """
-        self.post(lambda: self._do_quit(code, output))
-
     def watch(self, callback: Callable[['Browser'], None],
               interval: Optional[float] = None) -> threading.Thread:
         """Spawn a daemon thread that calls ``callback(self)`` repeatedly.
+
+        Construction-time helper, not a runtime/thread-safe API: recipes
+        wire watchers up before ``start_workers`` / the main loop runs.
+        Lives next to ``add_action`` because both are setup affordances.
 
         If ``interval`` is set, sleep ``interval`` seconds between calls.
         If ``None``, callback is called once and the user is responsible
@@ -1248,6 +1107,204 @@ class Browser:
         )
         t.start()
         return t
+
+    # =========================================================================
+    # Public, thread-safe API
+    # =========================================================================
+    # Every method in this block is safe to call from any thread.
+    # Mutations are deferred to the main loop's drain via post(),
+    # the children-results deque, or the preview-result slot.
+    #
+    #   post(fn)                    — schedule fn() on the next main-thread drain
+    #   message(text) / error(text) — surface a status / error
+    #   refresh(id)                 — schedule re-fetch of children
+    #   cursor_to(id)               — move cursor (expanding ancestors)
+    #   expand(id)                  — expand a parent (and fetch if needed)
+    #   set_children(id, items)     — inject pre-fetched children
+    #   set_preview(id, text)       — inject pre-fetched preview text
+    #   set_list_ratio(ratio)       — resize the list pane
+    #   set_split(s)                — change the split layout
+    #   select(ids, replace=False)  — set the multi-select set
+    #   cancel(*pendings)           — cancel one or more Pending handles
+    #   quit(code=0, output='')     — exit the run loop
+    #
+    # Methods OUTSIDE this block are main-thread-only.
+    # =========================================================================
+
+    def post(self, fn: Callable[[], None]) -> None:
+        """(thread-safe) Schedule ``fn`` to run on the main thread on the next drain.
+
+        The callable runs with no arguments and its return value is
+        ignored. Exceptions inside ``fn`` propagate to the drain loop --
+        callers should catch their own exceptions if they want to keep
+        the drain going. (We may revisit and wrap in try/except once the
+        renderer can surface a status line.)
+        """
+        self._main_queue.put(fn)
+        notify_wake()
+
+    def message(self, text: str) -> None:
+        """(thread-safe) Surface ``text`` as a transient status message.
+
+        Stored on Browser; the renderer in ticket #10 picks it up. Uses
+        ``post`` under the hood so the write happens on the main thread.
+        """
+        self.post(lambda: setattr(self, '_message_text', text))
+
+    def error(self, text: str) -> None:
+        """(thread-safe) Surface ``text`` as an error message. Same lane as ``message``."""
+        self.post(lambda: setattr(self, '_error_text', text))
+
+    @property
+    def error_text(self) -> str:
+        """Most recent error message surfaced via :meth:`error`."""
+        return self._error_text
+
+    @property
+    def message_text(self) -> str:
+        """Most recent transient status message surfaced via :meth:`message`."""
+        return self._message_text
+
+    def refresh(self, id: Any = None,
+                on_complete: Optional[Callable[[], None]] = None) -> 'Pending':
+        """(thread-safe) Schedule a refetch of one parent's children (or the full root).
+
+        Returns a Pending that resolves on the main thread once the worker
+        has delivered the new children list. The actual cache invalidation
+        runs on the main thread (in ``_do_refresh``) so visible-tree state
+        stays consistent.
+
+        ``id=None`` invalidates the entire cache and refetches the root.
+        ``on_complete`` is wired via ``.then`` so callers may chain in
+        either style.
+        """
+        pending = Pending()
+        if on_complete is not None:
+            pending.then(on_complete)
+        self.post(lambda: self._do_refresh(id, pending))
+        return pending
+
+    def cursor_to(self, id: Any,
+                  on_complete: Optional[Callable[[], None]] = None) -> 'Pending':
+        """(thread-safe) Move cursor to the item with the given id, expanding ancestors as needed.
+
+        Asynchronous because we may need to fetch ancestor children. The
+        returned Pending resolves once the cursor is positioned -- after
+        all required fetches complete, or on the next drain if the id is
+        already visible. For not-yet-visible ids, phase 1 best-effort:
+        the Pending resolves with the cursor unmoved (full ancestor walk
+        is phase-2 territory, requires parent metadata on items).
+        """
+        pending = Pending()
+        if on_complete is not None:
+            pending.then(on_complete)
+        self.post(lambda: self._do_cursor_to(id, pending))
+        return pending
+
+    def expand(self, id: Any,
+               on_complete: Optional[Callable[[], None]] = None) -> 'Pending':
+        """(thread-safe) Add ``id`` to expanded; trigger fetch if not cached.
+
+        Pending resolves when children are cached (or immediately on the
+        next drain if already cached).
+        """
+        pending = Pending()
+        if on_complete is not None:
+            pending.then(on_complete)
+        self.post(lambda: self._do_expand(id, pending))
+        return pending
+
+    def set_children(self, id_, items) -> None:
+        """(thread-safe) Inject pre-fetched children for ``id_`` from any thread.
+
+        Equivalent to what the built-in children worker does after a
+        successful fetch — but lets recipe-owned threads (any threading
+        model: native threads, asyncio bridges, IPC daemons) deliver
+        results without going through ``request_children``. Items are
+        coerced via ``to_item`` so the recipe can pass plain dicts.
+
+        A recipe that manages all fetching itself can pass
+        ``get_children=None`` to disable the built-in worker.
+        """
+        coerced = [to_item(x) for x in items]
+        self._children_results.append((id_, coerced))
+        notify_wake()
+
+    def set_preview(self, id_, text) -> None:
+        """(thread-safe) Inject pre-fetched preview text for ``id_`` from any thread.
+
+        Latest-wins: a later ``set_preview`` overwrites an unconsumed
+        earlier one. Recipes using this should construct the Browser
+        with ``get_preview=None`` so the built-in worker doesn't race.
+        ``text`` is coerced to ``''`` if None.
+        """
+        if text is None:
+            text = ''
+        self._preview_result = (id_, text)
+        notify_wake()
+
+    def set_list_ratio(self, ratio: float) -> None:
+        """(thread-safe) Set the list pane's share of total terminal rows (clamped).
+
+        The clamp range is ``[_LIST_RATIO_MIN, _LIST_RATIO_MAX]`` —
+        outside that range the layout produces degenerate panes and
+        the user can't recover with hotkey nudges. The layout
+        independently enforces a minimum-1 list / minimum-2 preview
+        when the terminal has room; this method's clamp is a sanity
+        guardrail, not the live floor. Mutation is deferred to the
+        main thread via ``post`` (see ``_do_set_list_ratio``).
+        """
+        self.post(lambda: self._do_set_list_ratio(ratio))
+
+    def set_split(self, s: str) -> None:
+        """(thread-safe) Set the split-layout selector (clamped to ``_VALID_SPLITS``).
+
+        Invalid values (unknown codes, non-strings, ``None``) fall back
+        to the historic default ``'h'``. Mirrors ``set_list_ratio``: the
+        clamp is a guardrail, not a live floor — the layout helpers in
+        050-render produce sane geometries even at degenerate sizes.
+        Marks the full screen for redraw so the next render pass picks
+        up the new layout family. Mutation is deferred to the main
+        thread via ``post`` (see ``_do_set_split``).
+        """
+        self.post(lambda: self._do_set_split(s))
+
+    def select(self, ids, replace: bool = False) -> None:
+        """(thread-safe) Add ``ids`` to ``selected`` (or replace existing selection if ``replace``).
+
+        The actual mutation runs on the main thread so the renderer
+        never sees a torn set. Phase 1 stores the ids verbatim; the
+        renderer in #10 reads the set when emitting ``*`` markers.
+        """
+        # Snapshot the iterable on the calling thread so the lambda
+        # doesn't capture a mutating live source.
+        ids_list = list(ids)
+        self.post(lambda: self._do_select(ids_list, replace))
+
+    def cancel(self, *pendings: 'Pending') -> None:
+        """(thread-safe) Mark one or more Pendings cancelled (sugar for ``p.cancel()``).
+
+        Idempotent on already-cancelled or already-resolved Pendings.
+        Worker fetches are not killed -- cancellation is non-strict and
+        only suppresses chained ``.then()`` callbacks from firing. Useful
+        when the user has moved on and a stale chain (e.g. cursor-to a
+        no-longer-relevant id) should not fire.
+        """
+        for p in pendings:
+            p.cancel()
+
+    def quit(self, code: int = 0, output: str = '') -> None:
+        """(thread-safe) Request the main loop to exit with the given exit code.
+
+        Phase 1 stores ``_quit_requested``/``_quit_code``/
+        ``_quit_output`` on Browser; the main loop in #13 reads these
+        and shuts down once the current drain finishes.
+        """
+        self.post(lambda: self._do_quit(code, output))
+
+    # =========================================================================
+    # End of public, thread-safe API
+    # =========================================================================
 
     # ---- worker lifecycle ----------------------------------------------
 
@@ -1531,6 +1588,16 @@ class Browser:
         # headless mode notify_wake is a no-op; in production it writes
         # one byte to the self-pipe.
         notify_wake()
+
+    def _do_set_list_ratio(self, ratio):
+        """Main-thread: clamp + apply list_ratio, flag full redraw."""
+        self.list_ratio = _clamp_list_ratio(ratio)
+        self._needs_redraw.add('all')
+
+    def _do_set_split(self, s):
+        """Main-thread: clamp + apply split selector, flag full redraw."""
+        self.split = _clamp_split(s)
+        self._needs_redraw.add('all')
 
     # ---- workers --------------------------------------------------------
 

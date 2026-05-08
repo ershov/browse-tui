@@ -358,6 +358,7 @@ class TestLayoutSwitch(_RenderCacheBase):
 
         # Switch layout. set_split flags 'all' on _needs_redraw.
         self.browser.set_split('v')
+        self.browser.drain_main_queue()
         _render.render_partial(self.browser)
         out = self.cap.drain()
 
