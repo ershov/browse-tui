@@ -161,6 +161,51 @@ def _human_time(epoch):
     return f'{int(delta // 86400)}d ago'
 
 
+def _trim(s, n):
+    """Strip surrounding whitespace and truncate, preserving inner newlines.
+
+    Replaces the older ``' '.join(s.split())[:n]`` pattern that flattened
+    all whitespace. We want multi-line strings (user prompts, agent
+    responses, diffs, file contents) to render as multiple lines in the
+    session preview rather than one mashed-together blob. Callers that
+    must produce a single-line title (the message-list rows) collapse
+    further on top of this with ``_oneline``.
+    """
+    if not isinstance(s, str):
+        s = str(s) if s is not None else ''
+    return s.strip()[:n]
+
+
+def _oneline(s):
+    """Collapse all whitespace runs to a single space.
+
+    Used for row titles in the message list — the browser renders each
+    Item.title on one line, so embedded ``\\n`` would either get
+    sanitised or break the row layout.
+    """
+    return ' '.join(s.split())
+
+
+def _indent_continuations(text, indent):
+    """Prefix every line *after* the first with ``indent``.
+
+    Lets a key/value or label/title pair render as::
+
+        last:    line one
+                 line two
+                 line three
+
+    by computing the indent (typically the visible width of the label
+    chrome) and re-emitting subsequent lines flush-aligned under the
+    value column. The first line is left untouched so the caller stays
+    in control of *its* prefix.
+    """
+    if '\n' not in text:
+        return text
+    head, _, rest = text.partition('\n')
+    return head + '\n' + '\n'.join(indent + line for line in rest.split('\n'))
+
+
 # ---- get_children: dispatches by id shape --------------------------------
 #
 # The Browser passes the raw item id back into ``get_children``. We use the
@@ -434,7 +479,10 @@ def _list_messages(jsonl_path, limit=None):
             kind = _kind_of(obj)
             item = Item(
                 id=f'{jsonl_path}#{n}',
-                title=_summarise_message(obj),
+                # Row titles must be single-line — _summarise_message
+                # now preserves newlines for the session-preview timeline,
+                # so collapse here for the list view.
+                title=_oneline(_summarise_message(obj)),
                 tag=kind,
                 tag_style=_TAG_STYLE_FOR_KIND.get(kind, ''),
                 has_children=False,
@@ -517,7 +565,7 @@ def _summarise_message(obj):
 
     # Metadata records — surface the salient field.
     if t == 'last-prompt':
-        prompt = ' '.join(str(obj.get('lastPrompt', '')).split())[:5000]
+        prompt = _trim(obj.get('lastPrompt', ''), 5000)
         return f'last-prompt: {prompt}' if prompt else 'last-prompt'
     if t == 'permission-mode':
         return f'permission-mode: {obj.get("permissionMode", "")}'
@@ -536,10 +584,10 @@ def _summarise_message(obj):
     if t == 'agent-setting':
         return f'agent-setting: {obj.get("agentSetting", "")}'
     if t == 'task-summary':
-        s = ' '.join(str(obj.get('summary', '')).split())[:5000]
+        s = _trim(obj.get('summary', ''), 5000)
         return f'task-summary: {s}'
     if t == 'summary':
-        s = ' '.join(str(obj.get('summary', '')).split())[:5000]
+        s = _trim(obj.get('summary', ''), 5000)
         return f'summary: {s}'
     if t == 'pr-link':
         return f'PR {obj.get("prRepository", "")}#{obj.get("prNumber", "")}'
@@ -555,7 +603,7 @@ def _summarise_message(obj):
         ms = obj.get('timeSavedMs', 0)
         return f'speculation-accept: +{ms/1000:.1f}s saved'
     if t == 'queue-operation':
-        c = ' '.join(str(obj.get('content', '')).split())[:5000]
+        c = _trim(obj.get('content', ''), 5000)
         return f'queue {obj.get("operation", "?")}: {c}'
     if t == 'file-history-snapshot':
         snap = obj.get('snapshot') or {}
@@ -569,7 +617,7 @@ def _summarise_message(obj):
         rep = obj.get('replacements') or []
         return f'content-replacement: {len(rep)} blocks'
     if t == 'marble-origami-commit':
-        s = ' '.join(str(obj.get('summary', '')).split())[:5000]
+        s = _trim(obj.get('summary', ''), 5000)
         return f'collapse-commit: {s}'
     if t == 'marble-origami-snapshot':
         return f'collapse-snapshot: {len(obj.get("staged") or [])} staged'
@@ -587,8 +635,7 @@ def _summarise_message(obj):
         if sub == 'api_error':
             return f'‼ api_error'
         if sub == 'local_command':
-            cmd = ' '.join(str(obj.get('content') or
-                               obj.get('command', '')).split())[:5000]
+            cmd = _trim(obj.get('content') or obj.get('command', ''), 5000)
             return f'$ {cmd}' if cmd else 'local_command'
         return f'system: {sub}' if sub else 'system'
 
@@ -599,7 +646,7 @@ def _summarise_message(obj):
         if sub == 'file':
             return f'📎 file: {a.get("displayPath", a.get("filename", ""))}'
         if sub == 'queued_command':
-            p = ' '.join(str(a.get('prompt', '')).split())[:5000]
+            p = _trim(a.get('prompt', ''), 5000)
             return f'📥 queued: {p}'
         if sub == 'hook_success':
             ok = a.get('exitCode', 0) == 0
@@ -654,7 +701,7 @@ def _summarise_message(obj):
                 return f'↳ tool_result: {_tool_result_one_line(obj, p)}'
 
     text = _extract_text(content)
-    text = ' '.join(text.split())[:5000]
+    text = _trim(text, 5000)
     if obj.get('isMeta') and role:
         role = f'{role}/meta'
     if role:
@@ -665,7 +712,7 @@ def _summarise_message(obj):
 def _tool_use_one_line(name, inp):
     """Compact one-line summary of a tool's input for the row title."""
     if name == 'Bash':
-        return ' '.join(str(inp.get('command', '')).split())[:5000]
+        return _trim(inp.get('command', ''), 5000)
     if name in ('Read', 'Edit', 'Write'):
         return inp.get('file_path', '')
     if name == 'Grep':
@@ -684,7 +731,7 @@ def _tool_result_one_line(obj, part):
     tur = obj.get('toolUseResult')
     if isinstance(tur, dict):
         if 'stdout' in tur:
-            return ' '.join(str(tur.get('stdout', '')).split())[:5000] or '(no output)'
+            return _trim(tur.get('stdout', ''), 5000) or '(no output)'
         if 'numFiles' in tur:
             return f'{tur["numFiles"]} files'
         if 'agentType' in tur:
@@ -695,15 +742,15 @@ def _tool_result_one_line(obj, part):
         if 'commandName' in tur:
             return tur['commandName']
     if isinstance(tur, str):
-        return ' '.join(tur.split())[:5000]
+        return _trim(tur, 5000)
     # Fall back to the raw content text.
     content = part.get('content')
     if isinstance(content, str):
-        return ' '.join(content.split())[:5000]
+        return _trim(content, 5000)
     if isinstance(content, list):
         for p in content:
             if isinstance(p, dict) and p.get('type') == 'text':
-                return ' '.join(p.get('text', '').split())[:5000]
+                return _trim(p.get('text', ''), 5000)
     return ''
 
 
@@ -1832,7 +1879,7 @@ def _fmt_session_card(m):
 
     last_prompt = m.get('last_prompt')
     if last_prompt:
-        snippet = ' '.join(str(last_prompt).split())[:200]
+        snippet = _trim(last_prompt, 200)
         rows.append(('last', snippet))
 
     if m.get('tags'):
@@ -1842,11 +1889,11 @@ def _fmt_session_card(m):
         rows.append(('agent', f'{MAGENTA}{m["agent_name"]}{RESET}'))
 
     if m.get('task_summary'):
-        snippet = ' '.join(str(m['task_summary']).split())[:200]
+        snippet = _trim(m['task_summary'], 200)
         rows.append(('now', f'{ITAL}{snippet}{RESET}'))
 
     if m.get('summary'):
-        snippet = ' '.join(str(m['summary']).split())[:200]
+        snippet = _trim(m['summary'], 200)
         rows.append(('summary', snippet))
 
     if m.get('first_ts'):
@@ -1868,24 +1915,37 @@ def _fmt_session_card(m):
         rows.append(('sidechain', f'{MUTE}{c["subagent_msgs"]} msgs{RESET}'))
 
     w = max(len(k) for k, _ in rows)
+    indent = ' ' * (w + 2)   # label width + ':' + ' '
     return '\n'.join(
-        f'{MUTE}{k.ljust(w)}:{RESET} {v}' for k, v in rows
+        f'{MUTE}{k.ljust(w)}:{RESET} {_indent_continuations(v, indent)}'
+        for k, v in rows
     )
 
 
-def _fmt_timeline(rows):
-    """Render the trailing event rows as one-liners.
+# Visible width of the ``L#### kind             `` prefix that
+# ``_fmt_timeline`` emits. Used to indent multi-line titles so
+# subsequent lines align under the title column.
+#
+#  ``L`` + 4-wide line number + ' ' + kind padded to 14 + ' ' = 21.
+_TIMELINE_PREFIX_WIDTH = 21
 
-    Reuses ``_summarise_message`` (existing row-title formatter) so the
-    timeline reads identically to what the user sees in the message list.
+
+def _fmt_timeline(rows):
+    """Render the trailing events.
+
+    Each event is one logical row, but if its summary spans multiple
+    lines (multi-paragraph user prompts, tool stdout, structured diffs,
+    …) those extra lines render flush-aligned under the title column
+    rather than collapsed to a single space-separated blob.
     """
     if not rows:
         return f'{MUTE}(no events){RESET}'
     out = [_rule('timeline')]
+    indent = ' ' * _TIMELINE_PREFIX_WIDTH
     for n, obj in rows:
         kind = _kind_of(obj)
         color = _KIND_HEADER_COLOR.get(kind, MUTE)
-        title = _summarise_message(obj)
+        title = _indent_continuations(_summarise_message(obj), indent)
         out.append(f'{MUTE}L{n+1:>4}{RESET} '
                    f'{color}{kind:<14}{RESET} {title}')
     return '\n'.join(out)

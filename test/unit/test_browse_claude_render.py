@@ -796,6 +796,109 @@ class TestSubagentPreview(unittest.TestCase):
         self.assertIn('hi', out)
 
 
+class TestMultilinePreservation(unittest.TestCase):
+    """Session preview should preserve newlines, not collapse them."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_summarise_keeps_newlines(self):
+        out = self.r._summarise_message({
+            'type': 'user',
+            'message': {'role': 'user',
+                        'content': 'line one\nline two\nline three'},
+        })
+        # _summarise_message no longer collapses — newlines stay.
+        self.assertIn('\n', out)
+        for needle in ('line one', 'line two', 'line three'):
+            self.assertIn(needle, out)
+
+    def test_oneline_collapses_for_row_titles(self):
+        s = 'foo\nbar\n  baz '
+        self.assertEqual(self.r._oneline(s), 'foo bar baz')
+
+    def test_indent_continuations_aligns(self):
+        out = self.r._indent_continuations('a\nb\nc', '   ')
+        self.assertEqual(out, 'a\n   b\n   c')
+
+    def test_indent_continuations_one_line_unchanged(self):
+        self.assertEqual(self.r._indent_continuations('hi', '   '), 'hi')
+
+    def test_card_renders_multiline_value(self):
+        # task-summary with embedded newlines should appear multi-line
+        # in the card, indented under the value column.
+        path = self._write_session([
+            {'type': 'task-summary',
+             'summary': 'planning:\n  - step 1\n  - step 2',
+             'sessionId': 'abc'},
+        ])
+        try:
+            out = self.r._preview_session(path)
+            self.assertIn('planning:', out)
+            self.assertIn('step 1', out)
+            self.assertIn('step 2', out)
+            # Continuation indent: the `now:` row's label is followed by
+            # ': ' and the indent matches that width — verify by checking
+            # the full alignment exists.
+            lines = out.split('\n')
+            now_idx = next((i for i, l in enumerate(lines)
+                            if 'now' in l and ':' in l), None)
+            self.assertIsNotNone(now_idx)
+            # Subsequent lines from the multi-line value should start
+            # with whitespace (the indent).
+            self.assertTrue(lines[now_idx + 1].startswith(' '))
+        finally:
+            os.unlink(path)
+
+    def test_timeline_multiline_title_indents(self):
+        path = self._write_session([
+            {'type': 'user',
+             'message': {'role': 'user',
+                         'content': 'first line\nsecond line\nthird line'},
+             'timestamp': '2026-05-08T00:00:01Z'},
+        ])
+        try:
+            out = self.r._preview_session(path)
+            self.assertIn('first line', out)
+            self.assertIn('second line', out)
+            self.assertIn('third line', out)
+            # Continuation lines indented to align under the title column.
+            lines = out.split('\n')
+            first_idx = next((i for i, l in enumerate(lines)
+                              if 'first line' in l), None)
+            self.assertIsNotNone(first_idx)
+            cont = lines[first_idx + 1]
+            # Continuations indented by _TIMELINE_PREFIX_WIDTH (21) spaces.
+            self.assertTrue(cont.startswith(' ' * 21),
+                            f'continuation should be indented: {cont!r}')
+            self.assertIn('second line', cont)
+        finally:
+            os.unlink(path)
+
+    def test_row_list_title_is_single_line(self):
+        # The list-row title must be single-line, even when the
+        # underlying content is multi-line.
+        # _list_messages applies _oneline; just verify _oneline-of-summary
+        # has no newlines for a multi-line user prompt.
+        obj = {'type': 'user',
+               'message': {'role': 'user', 'content': 'hi\nbye'}}
+        title = self.r._oneline(self.r._summarise_message(obj))
+        self.assertNotIn('\n', title)
+        self.assertIn('hi', title)
+        self.assertIn('bye', title)
+
+    def _write_session(self, records):
+        import json as _json
+        import tempfile
+        f = tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False,
+                                        prefix='abc1234-')
+        for r in records:
+            f.write(_json.dumps(r) + '\n')
+        f.close()
+        return f.name
+
+
 class TestSummariseTitles(unittest.TestCase):
     """Per-type one-line titles that drive the message list rows."""
 
