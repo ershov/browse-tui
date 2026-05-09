@@ -331,6 +331,13 @@ def point_in_rect(row, col, rect):
 # Used by every layout variant to drop the preview when room is too tight.
 _PREV_MIN = 2
 
+# #274: demand-signal threshold. When the bottom of the visible preview
+# window is within this many wrapped rows of the buffered tail AND a
+# preview generator is paused for the cursored id, the renderer wakes
+# the worker to keep pulling. Sized to roughly half a typical pane so
+# the resume kicks in well before the user scrolls into blank space.
+_PREVIEW_DEMAND_THRESHOLD = 12
+
 # Children pane is capped at this fraction of its sub-area along the
 # relevant axis (height for h/m/pc, width for v).
 _CHILDREN_CAP_FRAC = 0.25
@@ -1516,6 +1523,32 @@ def render_preview(browser, rect, *, info=False, has_header=True,
     scroll = max(0, min(browser._preview_scroll, max_scroll))
     if scroll != browser._preview_scroll:
         browser._preview_scroll = scroll
+
+    # #274: demand-pull signal. If the cursored id's preview generator
+    # is paused at the cap and the user has scrolled near the buffered
+    # tail, wake the worker to resume pulling. Skip when showing
+    # error/help content (text source isn't the per-item preview).
+    if (not browser._error_text and not browser._help_mode
+            and len(wrapped) > 0):
+        cursor_id = _cursor_id(browser)
+        if cursor_id is not None:
+            visible_end = scroll + content_lines  # exclusive row index
+            rows_below = len(wrapped) - visible_end
+            if rows_below < _PREVIEW_DEMAND_THRESHOLD:
+                # Debounce: only fire when scroll has moved since the
+                # last signal for this id. Re-fires unconditionally on
+                # id-change so a fresh cursor-and-scroll combination
+                # always gets one wake.
+                state = browser._preview_demand_signal_state
+                if state is None or state != (cursor_id, scroll):
+                    paused = browser._preview_paused
+                    if (paused is not None
+                            and paused.get('id') == cursor_id):
+                        browser._preview_demand_signal_state = (
+                            cursor_id, scroll
+                        )
+                        browser.signal_preview_demand(cursor_id)
+
     for i in range(content_lines):
         row = content_top + i
         rel_row = content_row_offset + i

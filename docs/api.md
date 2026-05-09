@@ -206,6 +206,31 @@ ctx.quit(code=0, output='')           -> None
 | `error`      | Surface an error message (red, sticks until next message).           |
 | `quit`       | Exit the main loop with `code`; print `output` to stdout afterwards. |
 
+### Push-API pass-throughs
+
+Mirror the `Browser` push surface so action handlers can mutate the tree
+without keeping a separate `browser` reference:
+
+```python
+ctx.update_data(ops)                  -> None
+ctx.upsert(id, parent_id, **fields)   -> None    # one-op convenience
+ctx.set_item(id, parent_id, **fields) -> None    # one-op convenience
+ctx.remove(id)                        -> None    # one-op convenience
+ctx.set_preview(id, text)             -> None
+ctx.append_preview(id, chunk)         -> None
+ctx.clear_preview(id)                 -> None
+ctx.run_in_worker(fn)                 -> threading.Thread
+```
+
+`upsert` / `set_item` / `remove` are convenience wrappers for the single-op
+case (each routes through `update_data` with a one-element list); for
+multiple ops, prefer `update_data` directly so the batch stays atomic.
+
+`run_in_worker(fn)` spawns a one-shot daemon thread, surfacing any
+uncaught exception via `browser.error`. The thread handle is mostly
+informational — synchronisation should be done via `Pending` or
+`threading.Event` inside `fn`.
+
 ### Main-thread sub-flows
 
 These read keystrokes synchronously and must only be called from a handler
@@ -352,7 +377,7 @@ emitted verbatim.
 
 ### Callbacks
 
-#### `get_children(parent_id) -> Iterable[Item|str|tuple|dict]`
+#### `get_children(parent_id) -> Iterable[Item|str|tuple|dict] | Generator | None`
 
 Required (in practice). Called per parent-being-expanded, on a worker thread.
 Return any iterable of items in any of the four shapes accepted by `to_item`.
@@ -375,7 +400,35 @@ def get_children(parent_id):
             for n in sorted(os.listdir(parent_id))]
 ```
 
-#### `get_preview(item_id) -> str`
+##### Return-shape contract
+
+| Return                       | Behaviour                                                                                                                                              |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| any iterable (incl. `[]`)    | All items are upserted under `parent_id` in one atomic batch with a trailing `complete(parent_id)` op (clears the loading flag).                       |
+| generator                    | Each `yield` is delivered as its own `update_data` batch — the UI keeps showing "loading…" between yields. On `StopIteration` a final `complete(parent_id)` clears it. A mid-stream raise surfaces via `browser.error(...)`; loading stays set so the recipe can clear it explicitly. |
+| `None`                       | No batch is posted; the loading flag stays set. The recipe is expected to push from elsewhere (e.g. via `browser.update_data` from a watcher).         |
+
+Per-yield, `isinstance(chunk, list)` is treated as a batch of items; anything
+else (`Item`, `tuple`, `dict`, `str`) is a single item coerced via `to_item` —
+same flexibility as today's mixed return lists, applied per-yield.
+
+```python
+def get_children(parent_id):
+    page = 0
+    while True:
+        rows = jira_search(parent_id, offset=page * 100, limit=100)
+        if not rows:
+            return
+        yield [Item(id=r.key, title=r.summary, tag=r.status) for r in rows]
+        page += 1
+```
+
+The auto-clear on return-with-iterable is unconditional. A recipe that
+returns initial data *and* expects later watcher pushes to keep showing
+"loading…" must explicitly call
+`browser.update_data([incomplete(parent_id)])` after returning.
+
+#### `get_preview(item_id) -> str | Generator[str] | None`
 
 Optional. Called per cursor-move, on a worker thread (latest-wins:
 rapid moves coalesce to one in-flight fetch). Return any string; it's shown
@@ -391,6 +444,30 @@ def get_preview(item_id):
             return f.read(4096).decode('utf-8', errors='replace')
     except OSError as e:
         return f'[error] {e}'
+```
+
+##### Generator support
+
+`get_preview` may also return a generator yielding string chunks. Each yield
+is appended to the per-id preview cache via `append_preview`. The worker
+eager-pulls until the buffered content reaches a configurable cap
+(`Browser(preview_buffer_cap_chars=100_000, preview_buffer_cap_lines=1000)`),
+then pauses without closing the generator. When the user scrolls within
+~12 wrapped rows of the buffered tail, the renderer signals demand and the
+worker resumes pulling for one more cap window.
+
+A cursor-move closes the paused generator (firing the recipe's `finally`
+block, useful for releasing file handles or sockets). A mid-stream raise
+appends `[error] ExceptionName: message` to whatever is already buffered.
+
+```python
+def get_preview(item_id):
+    with open(item_id) as f:
+        try:
+            for line in f:
+                yield line
+        finally:
+            pass  # f's context manager closes on cursor-move
 ```
 
 #### `on_enter` modes
@@ -480,7 +557,67 @@ browser.error(text)
 browser.quit(code=0, output='')
 browser.cancel(*pendings)                  # sugar for p.cancel()
 browser.post(callable_)                    # schedule fn on main thread
+browser.update_data(ops)                   # batched tree mutations
+browser.set_preview(id, text)
+browser.append_preview(id, chunk)
+browser.clear_preview(id)
 ```
+
+`update_data`, `append_preview`, and `clear_preview` schedule a callable on
+the post queue that mutates state on the main thread; their writes become
+visible (and trigger a paint) on the next drain — no keystroke required.
+`set_preview` routes through the single-slot preview-result lane instead of
+the post queue. Both land on the main thread, but recipes mixing
+`set_preview` with `append_preview`/`clear_preview` for the same id should
+pick one path — see `browser.append_preview` for the ordering caveat.
+
+#### `browser.update_data(ops) -> None`
+
+Apply a batched list of tree-mutation ops on the main thread. Snapshots
+`ops` to a list on the calling thread and posts a single callable that
+runs `apply_ops`. The whole batch is atomic with respect to render; two
+separate `update_data` calls are not — each is its own post-queue task.
+
+| Op                                          | Effect                                                                                                                                                                                          |
+| ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `("upsert", id, parent_id, fields)`         | Insert under `parent_id` if new; **patch-merge** in place if known (matching keys override `Item` fields, others land as custom attrs). Reparents if `parent_id` differs from the existing parent. `parent_id=None` patches fields only (silent no-op if `id` is unknown and `state.root_id` is not None). |
+| `("set", id, parent_id, fields)`            | Insert-or-replace. `fields` is the entire record; unspecified `Item` fields revert to dataclass defaults; custom attrs are dropped. A new `Item` instance is constructed. Children stored under `_children[id]` are preserved.                                |
+| `("remove", id)`                            | Remove the item. Cascades: `_children[id]` is also dropped along with all descendant index entries.                                                                                              |
+| `("clear_children", parent_id)`             | Drop all known children of `parent_id`; cache entry reverts to "no fetch yet"; `_loading[parent_id]` flips to False.                                                                             |
+| `("complete", parent_id)`                   | Clear the loading flag (`_loading[parent_id] = False`).                                                                                                                                          |
+| `("incomplete", parent_id)`                 | Set the loading flag (`_loading[parent_id] = True`).                                                                                                                                             |
+
+Ops apply in list order; reparenting in one op is visible to subsequent
+ops in the same batch. Unknown ops raise `ValueError` (no silent drop).
+
+Use the helper constructors (see *Helper functions* below) rather than
+hand-rolling tuples:
+
+```python
+from browse_tui import upsert, remove
+
+def cpu_pulse(browser):
+    while True:
+        time.sleep(1.0)
+        ops = []
+        for p in psutil.process_iter():
+            try:
+                cpu = p.cpu_percent()
+            except psutil.NoSuchProcess:
+                ops.append(remove(str(p.pid)))
+                continue
+            ops.append(upsert(str(p.pid), None,
+                              tag=f'{cpu:.0f}%',
+                              tag_style='red' if cpu > 50 else 'dim'))
+        browser.update_data(ops)        # one batch, one render
+```
+
+##### Behavioural change vs. pre-streaming API
+
+If a recipe has a `get_children(p)` callback **and** a watcher pushing into
+the same parent, today the `get_children` return *appends* (rather than
+clobbers) the watcher's pushes. Items may interleave; none are lost. Recipes
+needing atomic replace can use `update_data([clear_children(p), …upserts…])`.
 
 #### `browser.watch(callback, interval=None) -> threading.Thread`
 
@@ -579,6 +716,28 @@ All three are equivalent.
 
 A short tour of the helpers worth knowing.
 
+### Op constructors for `update_data`
+
+Six tagged-tuple constructors so recipes don't hand-roll op shapes:
+
+```python
+from browse_tui import upsert, set_item, remove, clear_children, complete, incomplete
+```
+
+| Helper                                 | Returns                                       |
+| -------------------------------------- | --------------------------------------------- |
+| `upsert(id, parent_id, **fields)`      | `("upsert", id, parent_id, fields)`           |
+| `set_item(id, parent_id, **fields)`    | `("set", id, parent_id, fields)`              |
+| `remove(id)`                           | `("remove", id)`                              |
+| `clear_children(parent_id)`            | `("clear_children", parent_id)`               |
+| `complete(parent_id)`                  | `("complete", parent_id)`                     |
+| `incomplete(parent_id)`                | `("incomplete", parent_id)`                   |
+
+The `set` helper is named `set_item` because shadowing the built-in via
+`from browse_tui import set` would be hostile to recipes.
+
+See `browser.update_data` above for the per-op semantics.
+
 ### `to_item(x) -> Item`
 
 Coerces `Item | str | tuple | dict` to an `Item`. Raises `TypeError` on
@@ -640,6 +799,12 @@ What actually lives at `browse_tui.<name>`:
 | `to_item`                 | function    |
 | `parse_input`             | function    |
 | `coerce_has_children`     | function    |
+| `upsert`                  | function    |
+| `set_item`                | function    |
+| `remove`                  | function    |
+| `clear_children`          | function    |
+| `complete`                | function    |
+| `incomplete`              | function    |
 | `__version__`             | str         |
 
 The internal terminal layer, renderer, and state-builder helpers are also in
@@ -711,3 +876,4 @@ the [recipes index](recipes.md) walks through each.
 - [docs/recipes.md](recipes.md) — shipped recipes.
 - [docs/internals.md](internals.md) — module layout, threading model.
 - [docs/superpowers/specs/2026-04-30-browse-tui-design.md](superpowers/specs/2026-04-30-browse-tui-design.md) — original design spec.
+- [docs/superpowers/specs/2026-05-08-streaming-push-api-design.md](superpowers/specs/2026-05-08-streaming-push-api-design.md) — streaming / push API design rationale.

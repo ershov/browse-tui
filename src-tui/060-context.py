@@ -19,6 +19,7 @@ message / error / quit`` and the main-thread sub-flows ``run_external``,
 import os
 import shutil
 import subprocess
+import threading
 from typing import Any, Callable, Optional
 
 
@@ -143,6 +144,108 @@ class Context:
     def quit(self, code: int = 0, output: str = '') -> None:
         """Request the main loop to exit with ``code`` and stdout ``output``."""
         self._browser.quit(code, output)
+
+    # ---- push API pass-throughs / convenience -------------------------
+    #
+    # These mirror the streaming-push surface (Section 3 of the design
+    # doc): ``update_data`` for batched ops, plus single-op convenience
+    # wrappers (``upsert`` / ``set_item`` / ``remove``) for the common
+    # case of one mutation at a time. The preview methods forward to
+    # Browser; ``run_in_worker`` spawns a one-shot daemon thread.
+
+    def update_data(self, ops) -> None:
+        """Apply a batched list of tree-mutation ops on the main thread.
+
+        Pass-through to :meth:`Browser.update_data`. ``ops`` is an
+        iterable of op tuples produced by the module-level helpers
+        (``upsert`` / ``set_item`` / ``remove`` / ``clear_children`` /
+        ``complete`` / ``incomplete``). Returns ``None``.
+        """
+        return self._browser.update_data(ops)
+
+    def upsert(self, id, parent_id, **fields) -> None:
+        """Single-op convenience: ``update_data([upsert(id, parent_id, **fields)])``.
+
+        Routes through ``Browser.update_data`` so the mutation lands on
+        the main thread atomically with respect to render. Returns
+        ``None``. For multiple ops, prefer ``update_data`` directly to
+        keep them in one batch.
+        """
+        return self._browser.update_data([upsert(id, parent_id, **fields)])
+
+    def set_item(self, id, parent_id, **fields) -> None:
+        """Single-op convenience: ``update_data([set_item(id, parent_id, **fields)])``.
+
+        Insert-or-replace shape — see ``apply_ops`` semantics for ``set``.
+        Returns ``None``.
+        """
+        return self._browser.update_data([set_item(id, parent_id, **fields)])
+
+    def remove(self, id) -> None:
+        """Single-op convenience: ``update_data([remove(id)])``.
+
+        Removes the item with this id (cascades to its cached children).
+        Returns ``None``.
+        """
+        return self._browser.update_data([remove(id)])
+
+    def set_preview(self, id, text) -> None:
+        """Pass-through to :meth:`Browser.set_preview`.
+
+        Replaces the preview content for ``id``. ``None`` is coerced
+        to ``''``.
+        """
+        return self._browser.set_preview(id, text)
+
+    def append_preview(self, id, chunk) -> None:
+        """Pass-through to :meth:`Browser.append_preview`.
+
+        Appends ``chunk`` to the per-id preview cache. See the Browser
+        method's docstring for ordering caveats versus ``set_preview``.
+        """
+        return self._browser.append_preview(id, chunk)
+
+    def clear_preview(self, id) -> None:
+        """Pass-through to :meth:`Browser.clear_preview`.
+
+        Drops the cached preview text for ``id``.
+        """
+        return self._browser.clear_preview(id)
+
+    def run_in_worker(self, fn: Callable[[], Any]) -> threading.Thread:
+        """Run ``fn()`` on a fresh daemon thread, surfacing exceptions.
+
+        The function takes no arguments and its return value is ignored.
+        Uncaught exceptions are routed to ``browser.error`` (matching
+        :meth:`Browser.watch`'s pattern) so a failing one-shot doesn't
+        crash the process — the thread dies on the exception and the
+        message lands on the main thread alongside other errors.
+
+        The returned thread handle is mostly informational; recipes
+        that need synchronisation should use ``threading.Event`` /
+        ``Pending`` inside ``fn`` itself.
+
+        Design note: the existing ``_children_worker`` is a FIFO of
+        parent-ids, not a callable runner, so reusing it would conflate
+        unrelated traffic. A dedicated daemon thread per submission
+        keeps the surface small and matches ``Browser.watch``'s
+        approach for arbitrary callables.
+        """
+        browser = self._browser
+
+        def _runner():
+            try:
+                fn()
+            except Exception as e:
+                browser.error(f'run_in_worker: {type(e).__name__}: {e}')
+
+        t = threading.Thread(
+            target=_runner,
+            daemon=True,
+            name='browse-tui-ctx-worker',
+        )
+        t.start()
+        return t
 
     # ---- main-thread sub-flows ----------------------------------------
 

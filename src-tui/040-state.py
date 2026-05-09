@@ -1,11 +1,12 @@
 """browse-tui: state layer (visible tree, cursor/scope, async workers, post queue, Pending)."""
 
+import inspect
 import queue
 import sys
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields as _dc_fields
 from typing import Any, Callable, Optional
 
 
@@ -271,6 +272,27 @@ class State:
     _expanded_by_scope: dict = field(default_factory=dict)
     _children: dict = field(default_factory=dict)
     _children_pending: set = field(default_factory=set)
+    # Bookkeeping indexes maintained alongside ``_children``. Foundation
+    # for the upcoming ``update_data`` push API (see
+    # docs/superpowers/specs/2026-05-08-streaming-push-api-design.md).
+    # Today they are write-only — no public API reads from them yet —
+    # but every mutation site of ``_children`` keeps them in lockstep so
+    # later tickets can layer push-mode ops on top without retrofitting
+    # invariants.
+    #
+    # ``_items_by_id``: primary id -> Item. Every Item that lives in any
+    #     ``_children[parent].list`` is reachable here.
+    # ``_parent_of_id``: child id -> parent id. Reverse index used by
+    #     ``update_data`` to detect reparenting.
+    # ``_loading``: parent id -> bool. Explicit "fetch in flight" flag.
+    #     Today's UX hint is implied by ``_children_pending`` membership;
+    #     ``_loading`` makes it addressable so ops like
+    #     ``("complete", parent_id)`` / ``("incomplete", parent_id)``
+    #     can flip it directly. ``_children_pending`` stays as the
+    #     dispatch tracker.
+    _items_by_id: dict = field(default_factory=dict)
+    _parent_of_id: dict = field(default_factory=dict)
+    _loading: dict = field(default_factory=dict)
     _visible_dirty: bool = True
     _visible_cache: list = field(default_factory=list)
     # Cursor index into the visible-tree list, and the user-selected ids
@@ -329,19 +351,400 @@ def mark_visible_dirty(state: State) -> None:
     state._visible_dirty = True
 
 
+def _index_drop_children(state: State, parent_id) -> None:
+    """Drop ``_items_by_id`` / ``_parent_of_id`` entries for one parent's children.
+
+    Called whenever ``_children[parent_id]`` is being dropped or replaced
+    (cache invalidation, fresh worker delivery). Idempotent: safe to call
+    for a parent with no cache entry. Doesn't touch ``_loading`` — that
+    flag is owned by dispatch / delivery, not by index maintenance.
+    """
+    items = state._children.get(parent_id)
+    if not items:
+        return
+    for child in items:
+        # Only drop the reverse index if it still points at this parent
+        # — the item may have been reparented in-batch by a later op
+        # (forward-compat with ``update_data``); today's mutation paths
+        # always satisfy the guard.
+        if state._parent_of_id.get(child.id) == parent_id:
+            state._parent_of_id.pop(child.id, None)
+            state._items_by_id.pop(child.id, None)
+
+
+def _index_add_children(state: State, parent_id, items) -> None:
+    """Add ``_items_by_id`` / ``_parent_of_id`` entries for one parent's children.
+
+    Called whenever a list is being installed under ``_children[parent_id]``
+    (worker delivery, eager pre-population). Doesn't touch ``_loading``
+    — that flag is owned by dispatch / delivery.
+    """
+    for child in items:
+        state._items_by_id[child.id] = child
+        state._parent_of_id[child.id] = parent_id
+
+
 def cache_invalidate_subtree(state: State, item_id) -> None:
     """Drop one parent's children entry and mark the visible-tree dirty.
 
     Safe to call for a never-cached id — the missing key is simply ignored.
+    Also drops the corresponding ``_items_by_id`` / ``_parent_of_id``
+    entries for the children being evicted, and clears the ``_loading``
+    flag for the parent (a fresh dispatch will re-set it).
     """
+    _index_drop_children(state, item_id)
     state._children.pop(item_id, None)
+    state._loading.pop(item_id, None)
     state._visible_dirty = True
 
 
 def cache_invalidate_all(state: State) -> None:
-    """Clear the entire children cache and mark the visible-tree dirty."""
+    """Clear the entire children cache and mark the visible-tree dirty.
+
+    Also clears the auxiliary indexes (``_items_by_id``,
+    ``_parent_of_id``, ``_loading``) so they stay in lockstep with
+    ``_children``.
+    """
     state._children.clear()
+    state._items_by_id.clear()
+    state._parent_of_id.clear()
+    state._loading.clear()
     state._visible_dirty = True
+
+
+# ---- update_data ops (push API) ------------------------------------------
+#
+# The six tuple-op apply functions plus their module-level helper
+# constructors. See
+# ``docs/superpowers/specs/2026-05-08-streaming-push-api-design.md`` —
+# Section 2 for full semantics.
+#
+# These are pure state-mutation helpers: no threading, no public API on
+# ``Browser`` yet (that lands in ticket #269). ``apply_ops(state, ops)``
+# walks the list and mutates ``state`` in place, in order. Reparenting in
+# one op is visible to subsequent ops in the same batch — within-batch
+# atomicity is the contract.
+
+
+# Module-level helper constructors. These are exported from ``browse_tui``
+# in #269; for now they are simply available next to ``apply_ops`` so unit
+# tests and the eventual public-API wiring can both reach them. ``set_item``
+# is named that way (not ``set``) because shadowing the builtin via
+# ``from browse_tui import set`` would be hostile to recipes.
+
+def upsert(id, parent_id, **fields):
+    """Construct an ``("upsert", id, parent_id, fields)`` op tuple."""
+    return ('upsert', id, parent_id, fields)
+
+
+def set_item(id, parent_id, **fields):
+    """Construct a ``("set", id, parent_id, fields)`` op tuple."""
+    return ('set', id, parent_id, fields)
+
+
+def remove(id):
+    """Construct a ``("remove", id)`` op tuple."""
+    return ('remove', id)
+
+
+def clear_children(parent_id):
+    """Construct a ``("clear_children", parent_id)`` op tuple."""
+    return ('clear_children', parent_id)
+
+
+def complete(parent_id):
+    """Construct a ``("complete", parent_id)`` op tuple."""
+    return ('complete', parent_id)
+
+
+def incomplete(parent_id):
+    """Construct an ``("incomplete", parent_id)`` op tuple."""
+    return ('incomplete', parent_id)
+
+
+def _item_field_names():
+    """Return the set of declared dataclass field names on ``Item``.
+
+    ``Item`` is resolved from this module's globals at call time —
+    production builds concatenate ``030-data.py`` ahead of this file so
+    the name is bound; standalone test loads inject it after import via
+    ``_state.Item = _data.Item``. Computing this each call keeps the
+    helper safe to call at any point in the load sequence.
+    """
+    return {f.name for f in _dc_fields(Item)}
+
+
+def _drop_subtree_indexes(state: State, item_id) -> None:
+    """Recursively drop ``_items_by_id`` / ``_parent_of_id`` for a subtree.
+
+    Used by ``remove`` and ``clear_children``: when an item is being
+    discarded we also drop every descendant whose subtree is going with
+    it. Each level's ``_children`` entry (if any) is popped along the
+    way. Safe for unknown ids — recursion bottoms out at ids without
+    a ``_children`` entry.
+    """
+    children = state._children.pop(item_id, None)
+    state._loading.pop(item_id, None)
+    if not children:
+        return
+    for child in children:
+        cid = child.id
+        # Drop the reverse index only if it still points at this parent
+        # — guards against stale rows after a reparent earlier in the
+        # same batch.
+        if state._parent_of_id.get(cid) == item_id:
+            state._parent_of_id.pop(cid, None)
+            state._items_by_id.pop(cid, None)
+        _drop_subtree_indexes(state, cid)
+
+
+def _apply_upsert(state: State, id_, parent_id, fields) -> bool:
+    """Apply one ``upsert`` op. Returns True if structure changed."""
+    known = _item_field_names()
+    existing = state._items_by_id.get(id_)
+
+    if existing is None:
+        # New id. ``parent_id is None`` with an unknown id is a silent
+        # debug-level drop per spec — patch-only upserts targeting
+        # unknown ids are tolerated (out-of-order pushes from background
+        # sources hit this naturally).
+        #
+        # Exception: when ``state.root_id is None`` (the framework
+        # default), ``parent_id=None`` *is* the root and the upsert is
+        # meant to insert under root — used by the children worker
+        # delivering for a None-rooted Browser (#271). Disambiguate via
+        # ``state.root_id``: only treat ``parent_id=None`` as patch-only
+        # when the root id is something else.
+        if parent_id is None and state.root_id is not None:
+            return False
+        # Construct a fresh Item with the known fields, then attach
+        # any unknown keys as custom attrs (mirrors ``to_item`` for
+        # dicts).
+        item_kwargs = {k: v for k, v in fields.items() if k in known}
+        extras = {k: v for k, v in fields.items() if k not in known}
+        # ``id`` always comes from the op tuple, not from ``fields``.
+        item_kwargs['id'] = id_
+        item = Item(**item_kwargs)
+        for k, v in extras.items():
+            setattr(item, k, v)
+        # Insert under parent. Orphan upserts (unknown parent) are
+        # allowed — the cache entry is created on demand.
+        state._children.setdefault(parent_id, []).append(item)
+        state._items_by_id[id_] = item
+        state._parent_of_id[id_] = parent_id
+        return True
+
+    # Existing id. Patch-merge: matching keys override Item fields,
+    # unmatched keys land as custom attrs. Mutate in place so other
+    # references (visible cache, selection set) keep working.
+    for k, v in fields.items():
+        setattr(existing, k, v)
+
+    if parent_id is None:
+        # Patch-only: leave parent unchanged. Mutating fields like
+        # ``has_children`` / ``title`` affects what the visible-tree
+        # builder emits, so this is structural too.
+        return True
+
+    old_parent = state._parent_of_id.get(id_)
+    if old_parent != parent_id:
+        # Reparent: remove from old parent's child list (if cached),
+        # append to the new parent's, update the reverse index.
+        old_list = state._children.get(old_parent)
+        if old_list:
+            for i, child in enumerate(old_list):
+                if child.id == id_:
+                    del old_list[i]
+                    break
+        state._children.setdefault(parent_id, []).append(existing)
+        state._parent_of_id[id_] = parent_id
+    return True
+
+
+def _apply_set(state: State, id_, parent_id, fields) -> bool:
+    """Apply one ``set`` op. Returns True if structure changed."""
+    known = _item_field_names()
+    # Full replace: ``fields`` is the entire record. Unspecified Item
+    # fields revert to dataclass defaults; custom attrs are dropped. A
+    # NEW Item instance is constructed (identity changes).
+    item_kwargs = {k: v for k, v in fields.items() if k in known}
+    extras = {k: v for k, v in fields.items() if k not in known}
+    item_kwargs['id'] = id_
+    item = Item(**item_kwargs)
+    for k, v in extras.items():
+        setattr(item, k, v)
+
+    old_parent = state._parent_of_id.get(id_)
+    if old_parent is None and id_ not in state._items_by_id:
+        # Insert under the supplied parent_id.
+        state._children.setdefault(parent_id, []).append(item)
+        state._items_by_id[id_] = item
+        state._parent_of_id[id_] = parent_id
+        return True
+
+    # Replace existing. The id keeps its place in the parent's child
+    # list when the parent is unchanged; on reparent it moves to the
+    # new parent's tail.
+    if old_parent == parent_id:
+        old_list = state._children.get(old_parent)
+        if old_list is not None:
+            for i, child in enumerate(old_list):
+                if child.id == id_:
+                    old_list[i] = item
+                    break
+            else:
+                old_list.append(item)
+        else:
+            state._children[parent_id] = [item]
+    else:
+        old_list = state._children.get(old_parent)
+        if old_list:
+            for i, child in enumerate(old_list):
+                if child.id == id_:
+                    del old_list[i]
+                    break
+        state._children.setdefault(parent_id, []).append(item)
+        state._parent_of_id[id_] = parent_id
+
+    state._items_by_id[id_] = item
+    # ``_children[id_]`` (the children OF this id, as a parent) is
+    # preserved — they belong to the id, not to the Item instance.
+    return True
+
+
+def _apply_remove(state: State, id_) -> bool:
+    """Apply one ``remove`` op. Returns True if structure changed."""
+    if id_ not in state._items_by_id:
+        # Unknown id — silent no-op. ``remove`` is the natural way for
+        # streaming sources to retract items, so out-of-order pushes
+        # may target ids we've already dropped.
+        return False
+    parent_id = state._parent_of_id.pop(id_, None)
+    state._items_by_id.pop(id_, None)
+    parent_list = state._children.get(parent_id)
+    if parent_list:
+        for i, child in enumerate(parent_list):
+            if child.id == id_:
+                del parent_list[i]
+                break
+    # Cascade: drop the item's own subtree (children of ``id_`` as a
+    # parent), recursively cleaning up indexes for descendants.
+    _drop_subtree_indexes(state, id_)
+    return True
+
+
+def _apply_clear_children(state: State, parent_id) -> bool:
+    """Apply one ``clear_children`` op. Returns True if structure changed."""
+    children = state._children.get(parent_id)
+    if children:
+        # Recursively drop indexes for each child's subtree. We can't
+        # rely on ``_index_drop_children`` here because we also need to
+        # cascade into grandchildren (their subtrees go away too).
+        for child in list(children):
+            cid = child.id
+            if state._parent_of_id.get(cid) == parent_id:
+                state._parent_of_id.pop(cid, None)
+                state._items_by_id.pop(cid, None)
+            _drop_subtree_indexes(state, cid)
+    # Cache entry reverts to "no fetch yet" — drop the dict entry
+    # entirely so the visible-tree builder shows a placeholder if the
+    # parent is expanded (matches the pre-fetch state).
+    had_entry = parent_id in state._children
+    state._children.pop(parent_id, None)
+    # Spec: "loading flag is reset accordingly" — we set False (the
+    # parent is in a known not-loading state; any future fetch will
+    # flip it back to True via dispatch).
+    state._loading[parent_id] = False
+    return had_entry or bool(children)
+
+
+def apply_ops(state: State, ops) -> None:
+    """Apply a list of ``update_data`` ops to ``state`` in order.
+
+    Pure state mutation — no threading, no rendering. Each op is a
+    tagged tuple; see Section 2 of the streaming-push design doc for
+    the vocabulary. Ops apply in list order; reparenting in one op is
+    visible to subsequent ops in the same batch. Flips
+    ``_visible_dirty`` if any op affected the visible structure
+    (anything that touched ``_children``).
+
+    Unknown ops raise ``ValueError`` — silent drops would mask recipe
+    typos.
+    """
+    structural = False
+    for op in ops:
+        kind = op[0]
+        if kind == 'upsert':
+            _, id_, parent_id, fields = op
+            if _apply_upsert(state, id_, parent_id, fields):
+                structural = True
+        elif kind == 'set':
+            _, id_, parent_id, fields = op
+            if _apply_set(state, id_, parent_id, fields):
+                structural = True
+        elif kind == 'remove':
+            _, id_ = op
+            if _apply_remove(state, id_):
+                structural = True
+        elif kind == 'clear_children':
+            _, parent_id = op
+            if _apply_clear_children(state, parent_id):
+                structural = True
+        elif kind == 'complete':
+            _, parent_id = op
+            state._loading[parent_id] = False
+        elif kind == 'incomplete':
+            _, parent_id = op
+            state._loading[parent_id] = True
+        else:
+            raise ValueError(f'apply_ops: unknown op kind {kind!r}')
+    if structural:
+        state._visible_dirty = True
+
+
+# ---- helpers for the children-worker → update_data delivery (#271) -------
+
+
+def _fields_of_item(item) -> dict:
+    """Materialise the patchable fields of an Item for an ``upsert`` op.
+
+    Returns a dict of every dataclass field on Item PLUS any custom
+    attributes the recipe attached (recipes commonly stick ``size`` /
+    ``mtime`` / ``path`` / ``parent`` / ``depth`` etc. on Items via
+    ``to_item`` dict-mode or direct ``setattr``). ``id`` is excluded
+    (it's the op key, not a patched field). ``parent_id`` is also
+    excluded if present as a custom attr — the tuple-op carries the
+    parent separately, and a stray ``parent`` field would shadow the
+    op's parent_id and confuse downstream readers.
+
+    Reads ``item.__dict__`` directly so non-slotted Items (the default)
+    surface both dataclass fields and recipe-attached extras in one
+    pass.
+    """
+    out = {}
+    for k, v in item.__dict__.items():
+        if k == 'id':
+            continue
+        out[k] = v
+    return out
+
+
+def _build_children_batch(parent_id, items) -> list:
+    """Build the worker delivery batch: upserts followed by ``complete``.
+
+    Per the streaming-push design (Section 3), the children worker's
+    delivery is one atomic batch: every item is upserted under
+    ``parent_id`` (preserving custom attrs), then a trailing
+    ``complete(parent_id)`` op flips ``_loading[parent_id]`` to False
+    in the same drain. An empty ``items`` yields just
+    ``[complete(parent_id)]`` — the trailing clear is unconditional.
+    """
+    batch = [
+        ('upsert', it.id, parent_id, _fields_of_item(it))
+        for it in items
+    ]
+    batch.append(('complete', parent_id))
+    return batch
 
 
 # ---- placeholder for pending state ---------------------------------------
@@ -808,6 +1211,8 @@ class Browser:
                  help_intro: Optional[str] = None,
                  help_outro: Optional[str] = None,
                  show_ids: str = 'auto',
+                 preview_buffer_cap_chars: int = 100_000,
+                 preview_buffer_cap_lines: int = 1000,
                  _headless: bool = False) -> None:
         """Construct a Browser.
 
@@ -867,6 +1272,16 @@ class Browser:
                 duplication); ``'always'`` forces it; ``'never'`` hides
                 it. Recipes can pin this value at construction; the CLI
                 exposes ``--show-ids``.
+            preview_buffer_cap_chars: Soft cap on buffered preview chars
+                produced by a ``get_preview`` generator before the worker
+                pauses pulling. Default 100_000 (~100 KB). The pause holds
+                the generator alive (no ``gen.close()``) so a future
+                demand signal (#274) can resume it. A cursor-move
+                meanwhile abandons the paused generator. Whichever cap
+                hits first (chars or lines) triggers the pause.
+            preview_buffer_cap_lines: Soft cap on buffered preview lines
+                (``\\n`` count) before the worker pauses pulling. Default
+                1000. Counterpart to ``preview_buffer_cap_chars``.
             _headless: Skip terminal init/teardown — used by tests.
         """
         if show_ids not in ('always', 'auto', 'never'):
@@ -941,12 +1356,18 @@ class Browser:
         self._main_queue = queue.Queue()
 
         # children worker: FIFO of parent ids to fetch. The worker pops
-        # from the left, fetches, appends to _children_results. Both
-        # deques are safe for single-producer / single-consumer use under
-        # the GIL (deque ops are individually atomic).
+        # from the left, fetches, and posts the result on the main
+        # thread via ``update_data`` + a follow-up housekeeping
+        # callable (#271). Deque ops are individually atomic under the
+        # GIL — safe for single-producer / single-consumer use.
+        #
+        # ``_children_results`` is the legacy delivery deque used only
+        # by ``set_children`` / ``apply_children_results`` (the public
+        # thread-safe injection path for recipes that bypass the
+        # worker). The worker itself no longer touches it.
         self._children_queue = deque()
         self._children_in_flight = {}     # id -> list[Pending] awaiting this fetch
-        self._children_results = deque()  # FIFO of (id, items, error_or_none)
+        self._children_results = deque()  # FIFO of (id, items) — set_children only
         self._children_event = threading.Event()
 
         # preview worker: single-slot latest-wins. The worker reads
@@ -957,6 +1378,44 @@ class Browser:
         self._preview_req = None
         self._preview_result = None  # (id, text)
         self._preview_event = threading.Event()
+
+        # Preview generator support (#273). When ``get_preview`` returns
+        # a generator, the worker eagerly pulls each yield, calls
+        # ``append_preview``, and tracks running buffer size. When the
+        # buffer hits ``preview_buffer_cap_chars`` or
+        # ``preview_buffer_cap_lines``, the worker pauses without
+        # closing the generator. ``_preview_paused`` records the paused
+        # generator so:
+        #
+        #   * a cursor-move (newer request lands in ``_preview_req``)
+        #     calls ``gen.close()`` and pivots to the new id.
+        #   * #274 (renderer demand signal) can resume by clearing
+        #     ``_preview_paused`` + setting ``_preview_resume_event``.
+        #
+        # ``_preview_lock`` serialises mutations across the worker
+        # thread and the main thread (request_preview uses it to
+        # observe / clear the paused state when superseding).
+        self._preview_buffer_cap_chars = int(preview_buffer_cap_chars)
+        self._preview_buffer_cap_lines = int(preview_buffer_cap_lines)
+        self._preview_lock = threading.Lock()
+        self._preview_paused = None  # dict(id, gen, chars, lines) or None
+        # #274: demand-resume flag. Set by ``signal_preview_demand``
+        # under ``_preview_lock`` to tell the paused worker "keep
+        # pulling" rather than "abandon." Distinguishes the resume
+        # path from the cursor-move/abandon path inside the pause-wait
+        # loop. The worker clears it when it observes the signal.
+        self._preview_resume_pull = False
+        # Wakes the worker out of its paused-wait. Set by:
+        #   * cursor-move (request_preview) — worker re-checks
+        #     ``_preview_req`` and abandons if it now points elsewhere.
+        #   * stop_workers — worker re-checks ``_stop``.
+        #   * #274 — consumer-near-end demand signal (resume pulling).
+        self._preview_resume_event = threading.Event()
+        # #274: debounce — last ``_preview_scroll`` value at which the
+        # renderer signalled demand for the currently-paused id, so
+        # repeated renders without scroll-motion don't re-fire.
+        # Reset whenever the paused id changes.
+        self._preview_demand_signal_state = None  # (id, scroll) or None
 
         # --- worker lifecycle bookkeeping --------------------------------
         self._stop = False
@@ -1121,7 +1580,10 @@ class Browser:
     #   cursor_to(id)               — move cursor (expanding ancestors)
     #   expand(id)                  — expand a parent (and fetch if needed)
     #   set_children(id, items)     — inject pre-fetched children
+    #   update_data(ops)            — apply a batched list of tree-mutation ops
     #   set_preview(id, text)       — inject pre-fetched preview text
+    #   append_preview(id, chunk)   — append to per-id preview cache
+    #   clear_preview(id)           — drop per-id preview cache entry
     #   set_list_ratio(ratio)       — resize the list pane
     #   set_split(s)                — change the split layout
     #   select(ids, replace=False)  — set the multi-select set
@@ -1230,6 +1692,46 @@ class Browser:
         self._children_results.append((id_, coerced))
         notify_wake()
 
+    def update_data(self, ops) -> None:
+        """(thread-safe) Apply a batched list of tree-mutation ops on the main thread.
+
+        ``ops`` is an iterable of op tuples produced by the
+        ``upsert`` / ``set_item`` / ``remove`` / ``clear_children`` /
+        ``complete`` / ``incomplete`` helpers (see Section 2 of the
+        streaming-push design doc for the vocabulary). The whole batch is
+        scheduled as a single callable on the post queue, so ``apply_ops``
+        runs inside one drain of the main queue — the renderer never
+        observes a torn intermediate state mid-batch, and exactly one
+        render is needed afterward (the callable also flags
+        ``_needs_redraw`` so the main loop repaints without waiting for
+        the next keystroke; see streaming-push spec Section 1).
+
+        Returns ``None`` rather than a Pending: there is nothing to await.
+        Two separate ``update_data`` calls — even from the same thread —
+        are not atomic with respect to one another; each is its own
+        post-queue task. Recipes that need cross-call atomicity should
+        merge their ops into a single list.
+
+        Snapshots ``ops`` to a ``list`` on the calling thread so the
+        scheduled callable doesn't capture a mutating live source.
+        """
+        ops_list = list(ops)
+
+        def _apply():
+            apply_ops(self._state, ops_list)
+            # Flag list/children for redraw so background pushes (e.g.
+            # from a watcher or a websocket bridge) become visible
+            # without waiting for the user to press a key. ``apply_ops``
+            # already flipped ``_visible_dirty`` if anything structural
+            # changed; the missing piece is converting that into a
+            # ``_needs_redraw`` signal the main loop polls. Children
+            # pane is included because tag/title patches on the cursor
+            # row affect what the grid shows.
+            self._needs_redraw.add('list')
+            self._needs_redraw.add('children')
+
+        self.post(_apply)
+
     def set_preview(self, id_, text) -> None:
         """(thread-safe) Inject pre-fetched preview text for ``id_`` from any thread.
 
@@ -1242,6 +1744,57 @@ class Browser:
             text = ''
         self._preview_result = (id_, text)
         notify_wake()
+
+    def append_preview(self, id_, chunk) -> None:
+        """(thread-safe) Append ``chunk`` to the cached preview for ``id_``.
+
+        The append is scheduled on the main thread via ``post()`` so the
+        read-modify-write of ``_state._preview[id_]`` is race-free. If
+        ``id_`` has no cached entry yet, the chunk becomes the entire
+        preview. ``chunk`` is coerced to ``''`` if None.
+
+        Marks the preview pane dirty so the next render pass picks up
+        the new content.
+
+        Cache shape note: ``_state._preview`` is a per-id ``dict``, so
+        appending to one id does not affect any other. The renderer reads
+        ``_state._preview.get(cursor_id, '')`` so an append for a
+        non-cursor id is buffered silently until the user navigates to
+        that item.
+
+        Ordering caveat: ``set_preview`` (above) routes through the
+        single-slot worker pipeline (``_preview_result`` + ``apply_preview_result``)
+        while ``append_preview`` / ``clear_preview`` route through the
+        post queue. Both land on the main thread, but the post queue
+        drains before ``apply_preview_result`` each iteration, so a
+        ``set_preview`` posted *after* an ``append_preview`` may still
+        land *after* the append on the same iteration — i.e. the set
+        wins. Recipes that need strict ordering should pick one path
+        per id (typically ``append_preview`` + ``clear_preview`` for
+        streaming, ``set_preview`` for one-shot replacements).
+        """
+        if chunk is None:
+            chunk = ''
+        def _apply():
+            self._state._preview[id_] = (
+                self._state._preview.get(id_, '') + chunk
+            )
+            self._needs_redraw.add('preview')
+        self.post(_apply)
+
+    def clear_preview(self, id_) -> None:
+        """(thread-safe) Drop cached preview text for ``id_``.
+
+        Scheduled on the main thread via ``post()``. Idempotent — a
+        clear for an unknown id is a silent no-op. Marks the preview
+        pane dirty so the next render shows the cleared state (which,
+        for the cursor item, is rendered as an empty pane until a
+        worker fetch or push repopulates the entry).
+        """
+        def _apply():
+            self._state._preview.pop(id_, None)
+            self._needs_redraw.add('preview')
+        self.post(_apply)
 
     def set_list_ratio(self, ratio: float) -> None:
         """(thread-safe) Set the list pane's share of total terminal rows (clamped).
@@ -1344,8 +1897,11 @@ class Browser:
         # Both workers wait on their own event; set both so neither
         # blocks indefinitely. The inner ``while`` in each worker also
         # checks ``_stop`` so any in-progress fetch finishes naturally.
+        # ``_preview_resume_event`` wakes a paused preview generator
+        # so it can observe ``_stop`` and exit cleanly.
         self._children_event.set()
         self._preview_event.set()
+        self._preview_resume_event.set()
         if self._children_thread:
             self._children_thread.join(timeout=timeout)
         if self._preview_thread:
@@ -1390,8 +1946,18 @@ class Browser:
         n = 0
         while self._children_results:
             id_, items = self._children_results.popleft()
+            # Replace the cached list — drop the old entries from the
+            # auxiliary indexes first so a refresh that swaps the item
+            # set under ``id_`` doesn't leave stale ``_items_by_id`` /
+            # ``_parent_of_id`` rows pointing at the previous list.
+            _index_drop_children(self._state, id_)
             self._state._children[id_] = items
+            _index_add_children(self._state, id_, items)
             self._state._children_pending.discard(id_)
+            # Worker delivered → no longer loading. Stays addressable
+            # via ``_loading`` rather than implied membership in
+            # ``_children_pending`` (foundation for ``update_data``).
+            self._state._loading[id_] = False
             mark_visible_dirty(self._state)
             for p in self._children_in_flight.pop(id_, []):
                 p._resolve()
@@ -1445,6 +2011,13 @@ class Browser:
         _preview_result is None AND no in-flight pendings. Polls every
         5ms and raises ``TimeoutError`` if not idle within ``timeout``.
 
+        Per #273: a preview-generator-paused state (worker holding a
+        live generator, waiting for cursor-move or demand signal)
+        counts as idle — the worker has voluntarily stopped pulling
+        and won't make progress until an external signal arrives.
+        ``_preview_req`` will still equal the paused id; the test
+        affordance cross-checks ``_preview_paused`` to recognise this.
+
         Safe to call repeatedly. Production code uses the real main loop
         (ticket #13); this exists only so tests don't have to invent
         their own pump.
@@ -1454,10 +2027,16 @@ class Browser:
             self.drain_main_queue()
             self.apply_children_results()
             self.apply_preview_result()
+            paused = self._preview_paused
+            preview_busy = (
+                self._preview_req is not None
+                and not (paused is not None
+                         and paused.get('id') == self._preview_req)
+            )
             if (self._main_queue.empty()
                     and not self._children_queue
                     and not self._children_results
-                    and self._preview_req is None
+                    and not preview_busy
                     and self._preview_result is None
                     and not self._children_in_flight):
                 return
@@ -1469,6 +2048,7 @@ class Browser:
             f'children_results={len(self._children_results)}, '
             f'preview_req={self._preview_req!r}, '
             f'preview_result={self._preview_result!r}, '
+            f'preview_paused={self._preview_paused!r}, '
             f'in_flight={list(self._children_in_flight)})'
         )
 
@@ -1504,6 +2084,13 @@ class Browser:
         self._preview_cursor_id = None
         # Always register the waiter so it resolves with the fetch result.
         self._children_in_flight.setdefault(id_, []).append(pending)
+        # Keep ``_loading`` in lockstep with the dispatch tracker so the
+        # upcoming ``update_data`` ops (and any future readers) can rely
+        # on the flag rather than peeking at ``_children_pending``. We
+        # set this even on a coalesced re-dispatch: ``cache_invalidate_*``
+        # above just dropped any pre-existing entry, and an in-flight
+        # fetch is still loading by definition.
+        self._state._loading[id_] = True
         # Only enqueue + flag pending the first time -- a fetch already in
         # flight for this id will deliver one result that resolves every
         # registered waiter together.
@@ -1564,6 +2151,8 @@ class Browser:
             pending._resolve()
             return
         self._state._children_pending.add(id_)
+        # Keep ``_loading`` in lockstep with dispatch (see ``_do_refresh``).
+        self._state._loading[id_] = True
         self._children_in_flight.setdefault(id_, []).append(pending)
         self._children_queue.append(id_)
         self._children_event.set()
@@ -1604,29 +2193,238 @@ class Browser:
     def _children_worker(self):
         """FIFO worker thread: drain ``_children_queue`` one id at a time.
 
+        Per ticket #271, delivery now goes through ``update_data`` rather
+        than the legacy ``_children_results`` deque. Per ticket #272, a
+        generator return is iterated and each yield is delivered as its
+        own ``update_data`` batch. The worker calls the user's
+        ``get_children``, coerces the return via ``to_item``, and posts:
+
+        * ``None`` return → no batch is posted; ``_loading`` stays True
+          (the recipe will push from elsewhere). Pendings still resolve
+          via ``_post_children_delivery`` so ``refresh().then()`` chains
+          fire after the worker call returned.
+        * generator return → each yielded chunk becomes its own
+          ``update_data`` batch (no trailing ``complete`` per chunk).
+          A ``list`` yield is treated as a batch of items; anything
+          else (``Item``, ``tuple``, ``dict``, ``str``) is treated as a
+          single item, coerced via ``to_item``. On clean exhaustion
+          (``StopIteration``) the worker emits a final
+          ``[complete(parent_id)]`` batch to clear loading. On a
+          mid-stream exception the partial deliveries stay in place,
+          ``_loading`` is NOT cleared (per the streaming-push spec:
+          "loading stays unless caller cleared explicitly"), and the
+          error is surfaced via ``self.error(...)``.
+        * iterable (incl. ``[]``) return → batch is
+          ``[upsert(it.id, parent_id, **fields_of(it)) for it in items]``
+          followed by a trailing ``complete(parent_id)`` op (atomic with
+          the data: the trailing ``complete`` clears
+          ``_loading[parent_id]`` in the same drain). For ``[]``, the
+          batch is just ``[complete(parent_id)]``.
+
+        The Pending registry (``_children_in_flight``) is resolved on
+        the main thread by ``_post_children_delivery``, posted *after*
+        the ``update_data`` callable so ``apply_ops`` has run by the
+        time chains fire — a ``then`` callback observes the post-batch
+        cache state. For generators the housekeeping is scheduled when
+        the generator EXHAUSTS (or raises); mid-stream batches do NOT
+        fire the pending chain.
+
         Errors caught at the boundary -- a misbehaving ``get_children``
-        must not crash the worker thread (which would leave Pendings
-        unresolved forever). On error: cache becomes ``[]``, error_text
-        is updated, the Pending still resolves so chains keep firing.
+        must not crash the worker thread. On error during the initial
+        call or while coercing a non-generator iterable: ``error_text``
+        is updated, no batch is posted (an empty synthesised delivery
+        is sent so the placeholder clears), and the post-delivery
+        housekeeping still runs. On a generator mid-stream error the
+        items already yielded survive, ``_loading`` stays True, and
+        ``_post_children_delivery`` still runs to resolve Pendings.
         """
         while not self._stop:
             self._children_event.wait()
             self._children_event.clear()
             while self._children_queue and not self._stop:
                 id_ = self._children_queue.popleft()
+                items = None
+                gen = None
+                error = False
                 try:
                     raw = self.get_children(id_)
-                    items = [to_item(x) for x in raw]
                 except Exception as e:
-                    items = []
+                    error = True
                     # Cross-thread write to a Python str attribute is
                     # safe under the GIL; the renderer reads it later
                     # on the main thread.
                     self._error_text = (
                         f'get_children({id_!r}): {type(e).__name__}: {e}'
                     )
-                self._children_results.append((id_, items))
+                else:
+                    if raw is None:
+                        items = None
+                    elif inspect.isgenerator(raw):
+                        # Generator branch: stream yields as separate
+                        # ``update_data`` batches. Materialise here only
+                        # to mark ``items`` so the post-loop dispatch
+                        # below routes to the streaming path.
+                        gen = raw
+                    else:
+                        try:
+                            items = [to_item(x) for x in raw]
+                        except Exception as e:
+                            error = True
+                            self._error_text = (
+                                f'get_children({id_!r}): '
+                                f'{type(e).__name__}: {e}'
+                            )
+
+                if error:
+                    # Synthesise an empty delivery so the placeholder
+                    # row clears and ``_loading`` flips to False; the
+                    # error is surfaced via ``_error_text``.
+                    items = []
+
+                if gen is not None:
+                    self._stream_children_from_generator(id_, gen)
+                elif items is None:
+                    # ``None`` return: no batch posted, ``_loading``
+                    # stays True. Still post the housekeeping so
+                    # Pendings resolve and the ``_children_pending``
+                    # dispatch tracker clears for this parent.
+                    self.post(lambda pid=id_: self._post_children_delivery(pid))
+                else:
+                    batch = _build_children_batch(id_, items)
+                    self.update_data(batch)
+                    # Schedule housekeeping AFTER ``update_data``'s post
+                    # so ``apply_ops`` has run by the time Pendings fire
+                    # — chained ``.then`` callbacks observe the post-
+                    # batch state (queue.Queue is FIFO).
+                    self.post(lambda pid=id_: self._post_children_delivery(pid))
                 notify_wake()
+
+    def _stream_children_from_generator(self, parent_id, gen):
+        """Drain a ``get_children`` generator, posting one batch per yield.
+
+        Per ticket #272 / streaming-push spec Section 3:
+
+        * Each yielded chunk becomes one ``update_data`` batch with NO
+          trailing ``complete`` — partial deliveries leave the loading
+          flag intact so the UI keeps showing "loading…" between
+          chunks.
+        * ``isinstance(chunk, list)`` → treat as a batch of items;
+          coerce each via ``to_item``.
+        * Anything else (``Item``, ``tuple``, ``dict``, ``str`` — all
+          ``to_item`` accepts) → single-item batch.
+        * On clean ``StopIteration`` → emit a final
+          ``[complete(parent_id)]`` batch to clear loading, then post
+          the housekeeping callback (resolves Pendings, marks dirty).
+        * On a mid-stream exception → record via ``self.error(...)``;
+          do NOT emit a trailing ``complete`` (loading stays True so
+          the recipe can clear it explicitly via a later push). The
+          housekeeping callback still runs so Pendings resolve and
+          the dispatch tracker clears.
+
+        Items already delivered before an exception remain in the
+        cache — the worker only stops pulling from the generator; it
+        does not roll back prior batches.
+        """
+        # TODO: future pagination — yield-cap of ~500 + sentinel "more…" action
+        try:
+            for chunk in gen:
+                if isinstance(chunk, list):
+                    items = [to_item(x) for x in chunk]
+                else:
+                    items = [to_item(chunk)]
+                if not items:
+                    # An empty list yield is a no-op: nothing to upsert,
+                    # no trailing complete (mid-stream). Skip the post
+                    # to avoid an empty drain.
+                    continue
+                batch = [
+                    ('upsert', it.id, parent_id, _fields_of_item(it))
+                    for it in items
+                ]
+                self.update_data(batch)
+                notify_wake()
+        except Exception as e:
+            # Mid-stream exception: per spec, loading stays unless the
+            # caller cleared it explicitly. We surface the error via
+            # ``self.error(...)`` (routed through ``post``) so the
+            # status line reflects the failure but partial deliveries
+            # remain in the cache.
+            self.error(
+                f'get_children({parent_id!r}) [generator]: '
+                f'{type(e).__name__}: {e}'
+            )
+            # Pending chain still fires — the worker has finished its
+            # job (it stopped pulling from the generator). Loading is
+            # NOT cleared.
+            self.post(
+                lambda pid=parent_id: self._post_children_delivery(pid)
+            )
+            return
+        # Clean exhaustion: trailing ``complete`` clears loading in
+        # the same drain as the post-delivery housekeeping is queued.
+        self.update_data([('complete', parent_id)])
+        self.post(lambda pid=parent_id: self._post_children_delivery(pid))
+
+    def _post_children_delivery(self, parent_id) -> None:
+        """Main-thread housekeeping after a ``_children_worker`` delivery.
+
+        Runs after ``update_data`` (or directly, for the ``None`` return
+        path) so the cache is fully populated by the time chained
+        ``.then`` callbacks observe state. Three jobs:
+
+        1. Ensure ``_children[parent_id]`` exists as at least an empty
+           list — the trailing ``complete`` op alone doesn't create a
+           cache entry, and the visible-tree builder distinguishes
+           "absent" (placeholder) from "empty list" (no rows). Without
+           this, an empty-iterable return would leave a placeholder
+           dangling because ``cache_invalidate_subtree`` had dropped
+           the entry up front in ``_do_refresh``.
+        2. Discard ``_children_pending`` so a future ``refresh`` for
+           the same parent dispatches a fresh worker fetch (the
+           dispatch tracker is the gate, not the loading flag).
+        3. Resolve every Pending registered under ``parent_id`` in
+           ``_children_in_flight``. Resolution is in-order; chained
+           ``.then`` callbacks see the post-batch cache.
+
+        Also marks the visible tree dirty + flags list/children/all
+        for redraw so the next render pass surfaces the freshly-
+        delivered children without waiting for the next user keystroke.
+        Cursor clamp guards against a watcher-driven shrink leaving
+        ``state.cursor`` past the end of the visible list (regression
+        for #125, preserved here).
+        """
+        state = self._state
+        # Ensure cache entry exists. The visible-tree builder treats
+        # absent entries as "fetch in flight, render placeholder"; an
+        # empty list means "really empty, render nothing under this
+        # parent". After the worker has finished its job we want the
+        # latter unless a recipe explicitly invalidates again.
+        state._children.setdefault(parent_id, [])
+        state._children_pending.discard(parent_id)
+        mark_visible_dirty(state)
+        # Clamp cursor when the visible list shrank past it (e.g.
+        # watcher-driven refresh that removes items, or empty
+        # delivery). Without this, the renderer skips the row (no
+        # crash) but the cursor effectively disappears until the user
+        # presses j/k. Regression guard from #125.
+        vis = visible_items(state)
+        if vis and state.cursor >= len(vis):
+            state.cursor = len(vis) - 1
+        elif not vis:
+            state.cursor = 0
+        self._needs_redraw.add('list')
+        # Cache may have just filled the cursor item's children — flag
+        # the grid pane for redraw too. Render-time checks gate the
+        # actual paint so this is harmless when the grid is hidden.
+        self._needs_redraw.add('children')
+        # Layout depends on grid sizing: when the grid was hidden
+        # waiting for children to arrive, the preview now needs to
+        # shrink to make room. A full repaint is cheaper than tracking
+        # that delta by hand.
+        self._needs_redraw.add('all')
+        # Resolve waiters in the order they were registered.
+        for p in self._children_in_flight.pop(parent_id, []):
+            p._resolve()
 
     def _preview_worker(self):
         """Latest-wins single-slot worker (ported from plan-tui).
@@ -1636,6 +2434,14 @@ class Browser:
         clears it only after confirming no newer request landed during
         the fetch. If a newer request did land, we loop immediately to
         serve it without blocking on the event.
+
+        Per #273: when ``get_preview`` returns a generator, the worker
+        switches to a streaming branch — see
+        ``_stream_preview_from_generator``. Each yield is delivered via
+        ``append_preview``; when the running buffer hits the configured
+        cap, the worker pauses (without closing the generator). A
+        cursor-move closes the generator and pivots; a future #274
+        demand signal will resume it.
         """
         while not self._stop:
             self._preview_event.wait()
@@ -1644,26 +2450,276 @@ class Browser:
                 req_id = self._preview_req
                 if req_id is None:
                     break
+                # If a paused generator from an earlier request is
+                # still alive (cursor moved between yields), close it
+                # so its recipe's ``finally`` runs before we serve the
+                # new request.
+                self._abandon_paused_preview_if_any(except_id=req_id)
                 try:
                     if self.get_preview is not None:
-                        text = self.get_preview(req_id)
-                        if text is None:
-                            text = ''
+                        result = self.get_preview(req_id)
                     else:
-                        text = ''
+                        result = ''
                 except Exception as e:
-                    text = f'[error] {type(e).__name__}: {e}'
-                self._preview_result = (req_id, text)
-                notify_wake()
-                # Latest-wins: only clear the slot if no newer request
-                # landed during the fetch. Otherwise loop immediately to
-                # serve the newer one (we'll overwrite _preview_result
-                # on the next iteration -- the main thread may have
-                # already consumed the previous one, or it may not; either
-                # way the latest result is what wins).
-                if self._preview_req == req_id:
-                    self._preview_req = None
-                # else: keep looping with the new req_id
+                    self._preview_result = (
+                        req_id, f'[error] {type(e).__name__}: {e}'
+                    )
+                    notify_wake()
+                    if self._preview_req == req_id:
+                        self._preview_req = None
+                    continue
+
+                if inspect.isgenerator(result):
+                    # Streaming branch: drain into ``append_preview``
+                    # until cap or exhaustion. Returns when the
+                    # generator is exhausted, errored, abandoned, or
+                    # left paused. ``_preview_req`` is cleared inside
+                    # the streamer at appropriate points (matching the
+                    # latest-wins semantics).
+                    self._stream_preview_from_generator(req_id, result)
+                else:
+                    if result is None:
+                        result = ''
+                    self._preview_result = (req_id, result)
+                    notify_wake()
+                    # Latest-wins: only clear the slot if no newer
+                    # request landed during the fetch. Otherwise loop
+                    # immediately to serve the newer one (we'll
+                    # overwrite _preview_result on the next iteration
+                    # -- the main thread may have already consumed the
+                    # previous one, or it may not; either way the
+                    # latest result is what wins).
+                    if self._preview_req == req_id:
+                        self._preview_req = None
+                    # else: keep looping with the new req_id
+
+    def _abandon_paused_preview_if_any(self, except_id=None):
+        """Close any paused preview generator whose id != ``except_id``.
+
+        Called from the preview worker before serving a new request.
+        Closing a generator triggers its ``finally`` blocks via
+        ``GeneratorExit`` — recipes use this for resource cleanup
+        (file handles, network sockets, etc.).
+
+        Defensive: ``gen.close()`` itself catches generator-internal
+        exceptions, but we still wrap to keep the worker thread alive
+        on a misbehaving recipe.
+        """
+        with self._preview_lock:
+            paused = self._preview_paused
+            if paused is None:
+                return
+            if except_id is not None and paused['id'] == except_id:
+                # Caller is the same id we're paused on — keep the
+                # paused generator (resume path will pick it up). Only
+                # used by the resume signal codepath in #274.
+                return
+            self._preview_paused = None
+            # Clear any stale demand-resume request — that paused
+            # generator is going away.
+            self._preview_resume_pull = False
+            self._preview_demand_signal_state = None
+        try:
+            paused['gen'].close()
+        except Exception:
+            # ``gen.close()`` should swallow exceptions raised inside
+            # the generator (per Python semantics) but we belt-and-
+            # braces in case a recipe re-raises in ``finally``.
+            pass
+
+    def _stream_preview_from_generator(self, item_id, gen):
+        """Drain a ``get_preview`` generator into ``append_preview``.
+
+        Per ticket #273 / streaming-push spec Section 3:
+
+        * Each yielded chunk is coerced to ``str`` and appended via
+          ``append_preview`` (post-queue, race-free read-modify-write).
+        * Tracks running buffer size locally (chars + lines). Reading
+          back from ``_state._preview`` would race with the main-thread
+          drain — the local counter is authoritative for the cap check.
+        * When cap is reached → pauses (does NOT close the generator)
+          and waits on ``_preview_resume_event``. Wake conditions:
+            - cursor-move (``_preview_req`` changed) → close generator,
+              pivot to new request.
+            - ``_stop`` → exit cleanly.
+            - #274 demand signal → resume pulling (TODO; the wait wakes
+              but no resume path is implemented this ticket; on wake we
+              currently re-loop and only abandon-if-superseded paths
+              exit, leaving the paused state intact for #274 to drive).
+        * On ``StopIteration`` → done. The buffered content IS the
+          preview; do not auto-clear. ``_preview_req`` is cleared so
+          the slot frees for the next cursor-move.
+        * On any other exception → surface as
+          ``[error] ExceptionName: message`` appended to the buffer;
+          partial buffered preview is retained.
+
+        ``_preview_result`` is NOT used in this branch — the streaming
+        path writes directly through the per-id ``_state._preview``
+        cache via ``append_preview``. The single-slot result lane is
+        only for non-generator returns.
+        """
+        chars = 0
+        lines = 0
+        cap_chars = self._preview_buffer_cap_chars
+        cap_lines = self._preview_buffer_cap_lines
+        # Cumulative caps grow by one window per #274 demand-resume so
+        # the local counters can stay running totals (matching the
+        # reported ``_preview_paused['chars']`` / ``['lines']``
+        # semantics from #273 — the dict records the buffer size at
+        # pause time).
+        next_cap_chars = cap_chars
+        next_cap_lines = cap_lines
+        try:
+            while not self._stop:
+                # Cursor-move abandon check before pulling: if the
+                # request slot has moved off our id, drop the
+                # generator (its ``finally`` fires via ``gen.close()``)
+                # and let the outer worker pick up the new request.
+                if self._preview_req != item_id:
+                    try:
+                        gen.close()
+                    except Exception:
+                        pass
+                    return
+                try:
+                    chunk = next(gen)
+                except StopIteration:
+                    # Clean exhaustion. Buffered content is final.
+                    if self._preview_req == item_id:
+                        self._preview_req = None
+                    notify_wake()
+                    return
+                except Exception as e:
+                    # Mid-stream raise: surface inline so the user sees
+                    # the partial preview followed by the error tag.
+                    self.append_preview(
+                        item_id,
+                        f'\n[error] {type(e).__name__}: {e}',
+                    )
+                    if self._preview_req == item_id:
+                        self._preview_req = None
+                    notify_wake()
+                    return
+
+                if not isinstance(chunk, str):
+                    chunk = str(chunk) if chunk is not None else ''
+                if chunk:
+                    self.append_preview(item_id, chunk)
+                    chars += len(chunk)
+                    lines += chunk.count('\n')
+                    notify_wake()
+
+                if chars >= next_cap_chars or lines >= next_cap_lines:
+                    # Pause. Record the live generator so a cursor-move
+                    # can abandon it (closing fires recipe ``finally``)
+                    # and so #274 can resume. ``_preview_req`` keeps
+                    # pointing at ``item_id`` while paused — the
+                    # cursor-move signal IS "``_preview_req`` no longer
+                    # equals our id" (either set to a different id, or
+                    # cleared to ``None`` when the cursor left any
+                    # normal item). ``run_until_idle`` recognises the
+                    # paused state explicitly so tests don't time out.
+                    with self._preview_lock:
+                        self._preview_paused = {
+                            'id': item_id,
+                            'gen': gen,
+                            'chars': chars,
+                            'lines': lines,
+                        }
+                        # New paused window — let the renderer signal
+                        # demand again now that the cap window has
+                        # advanced.
+                        self._preview_demand_signal_state = None
+                    notify_wake()
+                    # Wait for: cursor-move (``_preview_req`` no longer
+                    # equals our id), ``_stop``, or #274 demand signal
+                    # (consumer scrolled near the buffered tail).
+                    self._preview_resume_event.clear()
+                    resumed = False
+                    while not self._stop:
+                        # Cursor moved? Either a different id landed in
+                        # ``_preview_req`` (new request) or it was
+                        # cleared to ``None`` (cursor left any normal
+                        # item). Either way, abandon — close the
+                        # generator so the recipe's ``finally`` fires.
+                        if self._preview_req != item_id:
+                            with self._preview_lock:
+                                still_paused = (
+                                    self._preview_paused is not None
+                                    and self._preview_paused.get('gen')
+                                    is gen
+                                )
+                                if still_paused:
+                                    self._preview_paused = None
+                                self._preview_resume_pull = False
+                            if still_paused:
+                                try:
+                                    gen.close()
+                                except Exception:
+                                    pass
+                            return
+                        # #274 demand signal — renderer asked us to
+                        # keep pulling. Clear paused state + the
+                        # resume-pull flag under the lock; reset our
+                        # local cap counters so we accumulate a fresh
+                        # cap window before re-pausing; break out so
+                        # the outer ``while`` resumes ``next(gen)``.
+                        with self._preview_lock:
+                            if self._preview_resume_pull:
+                                self._preview_resume_pull = False
+                                if (self._preview_paused is not None
+                                        and self._preview_paused.get('gen')
+                                        is gen):
+                                    self._preview_paused = None
+                                self._preview_demand_signal_state = None
+                                resumed = True
+                        if resumed:
+                            # Advance cap thresholds by one window so
+                            # the running ``chars``/``lines`` totals
+                            # stay cumulative across resume cycles.
+                            next_cap_chars = chars + cap_chars
+                            next_cap_lines = lines + cap_lines
+                            break
+                        # Was the paused state cleared from outside?
+                        # (e.g. ``_abandon_paused_preview_if_any``
+                        # called by the outer worker on a new request.
+                        # That path also called ``gen.close()`` already.)
+                        with self._preview_lock:
+                            externally_cleared = (
+                                self._preview_paused is None
+                                or self._preview_paused.get('gen') is not gen
+                            )
+                        if externally_cleared:
+                            return
+                        # Block until something wakes us. Short timeout
+                        # keeps the loop responsive to ``_stop`` even
+                        # when no event landed.
+                        if self._preview_resume_event.wait(timeout=0.5):
+                            self._preview_resume_event.clear()
+                            # Re-check all wake conditions on the next
+                            # iteration of this loop:
+                            #   * cursor-move (handled at top)
+                            #   * demand-resume (handled above)
+                            #   * external clear (handled below)
+                            #   * ``_stop`` (handled by outer ``while``)
+                            continue
+                    if resumed:
+                        # Outer loop resumes pulling.
+                        continue
+                    # ``_stop`` woke us — exit without closing (the
+                    # daemon thread is going away anyway).
+                    return
+        finally:
+            # Belt-and-braces: if anything escaped (shouldn't), make
+            # sure the paused state isn't dangling pointing at this
+            # generator. ``gen.close()`` is idempotent.
+            with self._preview_lock:
+                if (self._preview_paused is not None
+                        and self._preview_paused.get('gen') is gen):
+                    self._preview_paused = None
+                # Whichever way we exited, no future resume applies.
+                self._preview_resume_pull = False
+                self._preview_demand_signal_state = None
 
     # ---- internal: preview request slot ---------------------------------
 
@@ -1672,9 +2728,47 @@ class Browser:
 
         Called on the main thread (typically by cursor-move handlers in
         ticket #8). Idempotent for the same id.
+
+        Also wakes any paused preview generator so it can observe the
+        new request and abandon (closing the generator, which fires the
+        recipe's ``finally``). The cursor-move signal travels through
+        the same ``_preview_req`` slot the worker already polls; the
+        ``_preview_resume_event`` is purely a wake mechanism for the
+        in-pause wait — see ``_preview_worker``.
         """
         self._preview_req = id_
         self._preview_event.set()
+        self._preview_resume_event.set()
+
+    def signal_preview_demand(self, item_id: Any) -> None:
+        """#274: tell the paused preview worker to resume pulling.
+
+        Called from the renderer (``render_preview`` in 050-render.py)
+        when the user scrolls the preview within ``DEMAND_THRESHOLD``
+        rows of the buffered tail. No-op when:
+
+          * No preview is paused (already exhausted, never paused, or
+            mid-pull).
+          * The paused id differs from ``item_id`` (cursor-move race —
+            the cursor-move path already handles abandon).
+
+        Otherwise: set ``_preview_resume_pull`` under
+        ``_preview_lock`` and wake the worker via
+        ``_preview_resume_event``. The worker observes the flag,
+        clears the paused state, and breaks back out to its outer
+        pull loop. Pulling continues until the next cap, then
+        re-pauses; the renderer can re-signal as the buffer grows.
+
+        Idempotent and cheap — safe to call from every preview render.
+        Debounce lives at the call site (``render_preview`` tracks the
+        last scroll value at which it signalled).
+        """
+        with self._preview_lock:
+            paused = self._preview_paused
+            if paused is None or paused.get('id') != item_id:
+                return
+            self._preview_resume_pull = True
+        self._preview_resume_event.set()
 
     # ---- main loop ------------------------------------------------------
 
@@ -1883,6 +2977,12 @@ class Browser:
 
         if new_id is None:
             self._preview_req = None
+            # Wake any paused preview generator so it observes the
+            # cursor-off-item state and abandons. Without this, a
+            # paused generator from the previously-cursored item would
+            # stay alive (and its recipe ``finally`` wouldn't fire)
+            # until the cursor lands on a new normal item.
+            self._preview_resume_event.set()
             return
         self.request_preview(new_id)
 
@@ -1983,6 +3083,8 @@ class Browser:
         if item.id in state._children_pending:
             return  # already in flight
         state._children_pending.add(item.id)
+        # Keep ``_loading`` in lockstep with dispatch (see ``_do_refresh``).
+        state._loading[item.id] = True
         self._children_queue.append(item.id)
         self._children_event.set()
 
@@ -2057,8 +3159,27 @@ class Browser:
         browser_kwargs.setdefault('get_children', _get_children_eager)
         browser_kwargs.setdefault('root_id', root_id)
         b = cls(**browser_kwargs)
-        # Pre-populate the cache so visible_items() and apply_*_results
-        # see it immediately; no fetch happens at runtime unless the
-        # caller invokes ``refresh`` explicitly.
-        b._state._children.update(children_by_parent)
+        # Pre-populate the cache via a single ``update_data`` batch so
+        # visible_items() and apply_*_results see it immediately; no
+        # fetch happens at runtime unless the caller invokes ``refresh``
+        # explicitly. The batch is one ``upsert`` per row followed by
+        # one ``complete`` per distinct parent (which flips
+        # ``_loading[parent_id]`` to False) — same vocabulary the
+        # children-worker delivery uses, so the eager-built tree
+        # behaves identically to a worker-delivered one and the
+        # auxiliary indexes (``_items_by_id`` / ``_parent_of_id``)
+        # land via the shared op machinery.
+        #
+        # Constructor-time pre-population is single-threaded (no other
+        # thread is touching state yet), so we apply the batch
+        # synchronously via ``apply_ops`` instead of routing through
+        # ``update_data`` + a post-queue drain.
+        batch = []
+        for parent_id, kids in children_by_parent.items():
+            for it in kids:
+                batch.append(upsert(it.id, parent_id, **_fields_of_item(it)))
+        for parent_id in children_by_parent:
+            batch.append(complete(parent_id))
+        if batch:
+            apply_ops(b._state, batch)
         return b

@@ -133,18 +133,23 @@ line.
                 main thread
                     │
                     ├── post queue ◀── worker threads
-                    │                     ├── _children_worker (FIFO)
-                    │                     └── _preview_worker  (latest-wins)
+                    │                     ├── _children_worker (FIFO; delivers via update_data)
+                    │                     └── _preview_worker  (latest-wins; streams via append_preview)
                     │
                     └── watcher threads ─▶ post queue
-                        (recipe-spawned via browser.watch)
+                        (recipe-spawned via browser.watch;
+                         typically calls browser.update_data)
 ```
+
+The post-queue funnel runs every closure (including the one
+`update_data` builds, which calls `apply_ops` on `state`) on the main
+thread.
 
 | Thread             | Purpose                                          | Pattern               |
 | ------------------ | ------------------------------------------------ | --------------------- |
 | main               | run loop, render, key dispatch, all state mutation | blocking `read_key()` |
-| `_children_worker` | call `get_children`, deliver to results FIFO     | FIFO of parent ids    |
-| `_preview_worker`  | call `get_preview`, deliver to single-slot       | single-slot, latest-wins |
+| `_children_worker` | call `get_children`, deliver via `update_data`   | FIFO of parent ids    |
+| `_preview_worker`  | call `get_preview`, deliver to single-slot or stream via `append_preview` | single-slot, latest-wins |
 | watcher (per recipe) | call user's polling callback                   | daemon, recipe-defined |
 
 ### The post queue
@@ -172,6 +177,72 @@ def drain_main_queue(self):
 This is the **only** path background threads use to mutate Browser state.
 No locks anywhere — the GIL gives us single-op atomicity, and the
 post-queue funnel keeps multi-op sequences single-threaded.
+
+### `update_data` → post → `apply_ops`
+
+`Browser.update_data(ops)` is the push-API entry point (see
+`docs/superpowers/specs/2026-05-08-streaming-push-api-design.md`). It
+snapshots `ops` to a list on the calling thread (so a mutating live
+source isn't captured), then posts a single closure:
+
+```python
+def update_data(self, ops):
+    ops_list = list(ops)
+    def _apply():
+        apply_ops(self._state, ops_list)
+        self._needs_redraw.add('list')
+        self._needs_redraw.add('children')
+    self.post(_apply)
+```
+
+`apply_ops(state, ops)` (in `040-state.py`) walks the op list in order,
+mutating `_children`, `_items_by_id`, `_parent_of_id`, `_loading` in
+place and flipping `_visible_dirty` if anything structural changed.
+The whole batch is one drain — atomic with respect to render. The
+`_needs_redraw` flags ensure a watcher-driven push paints without
+waiting for the user to press a key (regression guard #290).
+
+The six op kinds — `upsert`, `set`, `remove`, `clear_children`,
+`complete`, `incomplete` — are each implemented by a small `_apply_*`
+helper plus a module-level helper constructor (`upsert`, `set_item`,
+`remove`, `clear_children`, `complete`, `incomplete`). Exported from
+`browse_tui` for recipes; see [docs/api.md](api.md) for the
+reference table.
+
+`Context` exposes pass-throughs (`update_data`, `upsert`, `set_item`,
+`remove`, `set_preview`, `append_preview`, `clear_preview`,
+`run_in_worker`) so action handlers don't need a separate `browser`
+reference.
+
+### Worker delivery
+
+The `_children_worker` is built on top of `update_data`:
+
+| User return                  | Worker delivery                                                                                                                    |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| iterable (incl. `[]`)        | One batch: `[upsert(...) for it in items] + [complete(parent_id)]` — atomic with the trailing loading-clear.                       |
+| generator                    | One batch per `yield` (no `complete`); `_stream_children_from_generator` drains, posting each chunk. On `StopIteration` a final `[complete(parent_id)]` clears loading. |
+| generator, mid-stream raise  | Partial batches stay; loading stays True; error surfaced via `browser.error(...)`. No `complete` op is emitted.                    |
+| `None`                       | No batch posted; `_loading[parent_id]` stays True (recipe pushes from elsewhere). Pendings still resolve via `_post_children_delivery`. |
+
+After the data batch, the worker schedules `_post_children_delivery`
+which (1) ensures `_children[parent_id]` exists as at least an empty
+list, (2) clears `_children_pending`, (3) marks visible dirty + clamps
+the cursor, and (4) resolves every Pending registered for the parent.
+
+Generator `get_preview` follows the same shape but uses
+`append_preview` per yield — see *Caches and invalidation* below.
+
+### `_apply_upsert` carve-out
+
+`_apply_upsert(state, id, parent_id, fields)` treats `parent_id=None`
+on an unknown id as a silent debug-level drop (out-of-order patches
+from background sources are normal). The exception: when
+`state.root_id is None` (the framework default), `parent_id=None` *is*
+the root, so the upsert really is meant to insert under root — the
+`_children_worker` delivering for a None-rooted Browser depends on
+this. Disambiguation is `state.root_id is not None`: only treat
+`parent_id=None` as patch-only when the Browser has a non-None root.
 
 ### Self-pipe wakeup
 
@@ -206,16 +277,82 @@ moves coalesce — only the final one's fetch survives.
 identity-stable across reads — the renderer can compare by `is` to detect
 "nothing has changed" between paints.
 
+### Auxiliary indexes (push-API bookkeeping)
+
+Three side-tables maintained alongside `_children` so `apply_ops` can do
+O(1) lookups:
+
+| Field                    | Maps                       | Purpose                                                        |
+| ------------------------ | -------------------------- | -------------------------------------------------------------- |
+| `state._items_by_id`     | id → `Item`                | Primary index for `update_data` lookups by id.                 |
+| `state._parent_of_id`    | child id → parent id       | Reverse index for reparenting in `("upsert", id, new_parent)`. |
+| `state._loading`         | parent id → bool           | Explicit loading flag, addressable by `complete`/`incomplete`. |
+
+These are kept in lockstep with `_children` by every mutation site
+(`_apply_upsert` / `_apply_set` / `_apply_remove` / `_apply_clear_children`
+in `040-state.py`, plus `_index_drop_children` / `_index_add_children` for
+the legacy delivery paths). `_drop_subtree_indexes` recursively cleans
+descendants on remove/clear-children.
+
 ### Invalidation rules
 
-- `cache_invalidate_subtree(state, id)` drops one key from `_children`,
-  flips `_visible_dirty`. Used by `ctx.refresh(id)`.
-- `cache_invalidate_all(state)` clears `_children`, flips `_visible_dirty`.
-  Used by `ctx.refresh()` (no id).
+- `cache_invalidate_subtree(state, id)` drops one key from `_children`
+  (and the corresponding `_items_by_id` / `_parent_of_id` entries plus
+  `_loading[id]`), flips `_visible_dirty`. Used by `ctx.refresh(id)`.
+- `cache_invalidate_all(state)` clears `_children`, `_items_by_id`,
+  `_parent_of_id`, `_loading`, flips `_visible_dirty`. Used by
+  `ctx.refresh()` (no id).
 - `mark_visible_dirty(state)` flips `_visible_dirty` only — used after
   `expanded`/`scope_stack`/`selected` mutations.
 
 The next call to `visible_items(state)` rebuilds the visible cache.
+
+### Preview generator pause/resume
+
+`get_preview` returning a generator switches the preview worker into
+`_stream_preview_from_generator`. Each yield is appended via
+`append_preview` (post-queue, race-free); the worker tracks running
+`chars` / `lines` against the configurable caps
+(`Browser(preview_buffer_cap_chars=100_000, preview_buffer_cap_lines=1000)`).
+
+When a cap is hit, the generator is **paused** (not closed) and the
+worker waits on `_preview_resume_event`. The pause/resume state lives
+on Browser:
+
+| Field                                  | Purpose                                                                                          |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `_preview_paused`                      | Dict `{id, gen, chars, lines}` describing the paused generator, or `None`. Locked by `_preview_lock`. |
+| `_preview_resume_pull`                 | One-shot flag set by `signal_preview_demand`; the worker checks this on wake to decide whether to resume. |
+| `_preview_resume_event`                | `threading.Event` the worker blocks on; set by `request_preview` (cursor-move) or `signal_preview_demand`. |
+| `_preview_demand_signal_state`         | `(id, scroll)` tuple — the renderer's debounce so it only fires the wake once per id+scroll combination. |
+| `_preview_lock`                        | Guards mutations across `_preview_paused` / `_preview_resume_pull` / `_preview_demand_signal_state`. |
+
+Wake conditions while paused:
+
+* **Cursor-move** — `_preview_req` no longer equals the paused id.
+  Worker closes the generator (firing recipe `finally`) and returns.
+* **Demand resume** — `_preview_resume_pull == True`. Worker clears
+  the paused state, advances cap thresholds by one window, and
+  resumes pulling.
+* **Stop** — `_stop == True`. Worker exits without closing (the
+  daemon thread is going away anyway).
+
+`_abandon_paused_preview_if_any(except_id)` is the path the outer
+preview worker uses to close a stale paused generator before serving a
+new request.
+
+### Demand signal (renderer → worker)
+
+`render_preview` (`050-render.py`) tracks `_PREVIEW_DEMAND_THRESHOLD` (12
+wrapped rows). When the visible window is within that many rows of the
+buffered tail AND the cursored id matches the paused id, it calls
+`browser.signal_preview_demand(item_id)` — sets `_preview_resume_pull`
+under the lock and signals `_preview_resume_event`. Idempotent and
+debounced via `_preview_demand_signal_state`.
+
+`signal_preview_demand` is technically public (no leading underscore)
+so a recipe could drive it manually, but in practice it's the renderer's
+hook — recipes use `append_preview` / generator caps directly.
 
 ---
 
@@ -506,3 +643,4 @@ concentrated in `080-cli.py`:
 - [docs/cli.md](cli.md) — full CLI surface.
 - [docs/recipes.md](recipes.md) — shipped recipes + writing-your-own walkthrough.
 - [docs/superpowers/specs/2026-04-30-browse-tui-design.md](superpowers/specs/2026-04-30-browse-tui-design.md) — original architectural spec.
+- [docs/superpowers/specs/2026-05-08-streaming-push-api-design.md](superpowers/specs/2026-05-08-streaming-push-api-design.md) — streaming / push API design rationale.
