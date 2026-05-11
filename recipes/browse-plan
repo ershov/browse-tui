@@ -15,7 +15,7 @@ import shutil
 import subprocess
 import sys
 
-from browse_tui import Action, Browser, Item
+from browse_tui import Action, Browser, Item, upsert
 
 
 # ``plan`` is on PATH in normal use; fall back to the sandvault
@@ -239,7 +239,9 @@ def _action_status(ctx):
     if result.returncode != 0:
         ctx.error(result.stderr.strip() or 'status command failed')
         return
-    ctx.refresh()
+    # Patch the affected rows in place — preserves cursor + expansion.
+    style = _STATUS_TAG_STYLE.get(chosen, '')
+    ctx.update_data([upsert(i, None, tag=chosen, tag_style=style) for i in ids])
 
 
 def _action_edit(ctx, recursive=False):
@@ -314,7 +316,7 @@ def _action_move(ctx):
 
 
 def _action_close(ctx):
-    """``plan IDS close`` — closes the targets, refreshes the view."""
+    """``plan IDS close`` — closes the targets to status ``done``."""
     ids = _selected_real_ids(ctx)
     if not ids:
         return
@@ -323,11 +325,13 @@ def _action_close(ctx):
     if result.returncode != 0:
         ctx.error(result.stderr.strip() or 'close command failed')
         return
-    ctx.refresh()
+    # ``close`` (no resolution arg) always sets status to ``done``.
+    style = _STATUS_TAG_STYLE.get('done', '')
+    ctx.update_data([upsert(i, None, tag='done', tag_style=style) for i in ids])
 
 
 def _action_reopen(ctx):
-    """``plan IDS reopen`` — reopens the targets, refreshes the view."""
+    """``plan IDS reopen`` — sets status back to ``open``."""
     ids = _selected_real_ids(ctx)
     if not ids:
         return
@@ -336,7 +340,9 @@ def _action_reopen(ctx):
     if result.returncode != 0:
         ctx.error(result.stderr.strip() or 'reopen command failed')
         return
-    ctx.refresh()
+    # ``reopen`` always sets status to ``open`` (per ``plan --help``).
+    style = _STATUS_TAG_STYLE.get('open', '')
+    ctx.update_data([upsert(i, None, tag='open', tag_style=style) for i in ids])
 
 
 def _action_command_log(ctx):
