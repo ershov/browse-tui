@@ -896,6 +896,7 @@ def default_actions() -> list:
         # Preview scroll — gate 'none' so they work even when the visible
         # list is empty (help/error pages still want scrolling).
         Action('ctrl-p',     'Toggle preview pane',     _toggle_preview,      'none', 'PREVIEW'),
+        Action('alt-p',      'Toggle children pane',    _toggle_children_pane, 'none', 'PREVIEW'),
         Action('R',          'Toggle preview ANSI colours', _toggle_preview_ansi, 'none', 'PREVIEW'),
         Action('shift-down', 'Scroll preview line down', _preview_scroll_down, 'none', 'PREVIEW'),
         Action('shift-up',   'Scroll preview line up',   _preview_scroll_up,   'none', 'PREVIEW'),

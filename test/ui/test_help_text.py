@@ -96,7 +96,7 @@ class TestHelpScreenInTui(unittest.TestCase):
             t.send('q')
 
     def test_help_screen_shows_custom_actions(self):
-        with TmuxFixture(cols=80, rows=80) as t:
+        with TmuxFixture(cols=80, rows=100) as t:
             t.launch('bash', '-c',
                      f"printf 'a\\n' | {_BIN} --show-ids always --root-cmd cat "
                      f"--no-children-pane "
@@ -112,7 +112,7 @@ class TestHelpScreenInTui(unittest.TestCase):
             t.send('q')
 
     def test_help_intro_and_outro_in_help_screen(self):
-        with TmuxFixture(cols=80, rows=80) as t:
+        with TmuxFixture(cols=80, rows=100) as t:
             t.launch('bash', '-c',
                      f"printf 'a\\n' | {_BIN} --show-ids always --root-cmd cat "
                      f"--no-children-pane "

@@ -2581,6 +2581,60 @@ class TestTogglePreviewAnsi(unittest.TestCase):
         self.assertIs(keys['R'].handler, _actions._toggle_preview_ansi)
 
 
+class TestToggleChildrenPane(unittest.TestCase):
+    """Alt-P (``_toggle_children_pane``) flips ``show_children_pane`` and
+    forces a full redraw (the children pane appearing/disappearing
+    reshapes the layout, so every pane may shift).
+    """
+
+    def test_toggle_flips_flag_true_to_false(self):
+        b = _make_browser()
+        try:
+            self.assertTrue(b.show_children_pane)
+            ctx = _ctx_for(b)
+            _actions._toggle_children_pane(ctx)
+            self.assertFalse(b.show_children_pane)
+        finally:
+            b.stop_workers()
+
+    def test_toggle_flips_flag_false_to_true(self):
+        b = _make_browser(show_children_pane=False)
+        try:
+            self.assertFalse(b.show_children_pane)
+            ctx = _ctx_for(b)
+            _actions._toggle_children_pane(ctx)
+            self.assertTrue(b.show_children_pane)
+        finally:
+            b.stop_workers()
+
+    def test_toggle_marks_all_dirty(self):
+        b = _make_browser()
+        try:
+            ctx = _ctx_for(b)
+            b._needs_redraw.clear()
+            _actions._toggle_children_pane(ctx)
+            self.assertIn('all', b._needs_redraw)
+        finally:
+            b.stop_workers()
+
+    def test_alt_p_dispatches_toggle(self):
+        b = _make_browser()
+        try:
+            ctx = _ctx_for(b)
+            self.assertTrue(b.show_children_pane)
+            self.assertTrue(dispatch_key(b, ctx, 'alt-p'))
+            self.assertFalse(b.show_children_pane)
+            self.assertIn('all', b._needs_redraw)
+        finally:
+            b.stop_workers()
+
+    def test_alt_p_keybinding_registered(self):
+        # Pin the keybinding so the action stays wired to Alt-P.
+        keys = {a.key: a for a in default_actions()}
+        self.assertIn('alt-p', keys)
+        self.assertIs(keys['alt-p'].handler, _actions._toggle_children_pane)
+
+
 class TestAltDigitParsing(unittest.TestCase):
     """``read_key`` (020-terminal) maps ``ESC + 'N'`` → ``'alt-N'``.
 
