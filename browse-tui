@@ -2986,7 +2986,10 @@ class Browser:
 
         Posted by ``refresh`` so concurrent callers don't race on the
         cache or the in-flight registry. ``id=None`` means full refresh
-        (clear all caches and refetch the root).
+        (clear all caches and refetch the root **plus every expanded
+        sub-parent and the current scope root**, so previously-visible
+        sub-trees don't strand on a ``⧗ loading…`` placeholder until
+        the cursor happens to navigate onto them — #294).
 
         Phase 3 (ticket #29) coalesces duplicate enqueues: if a fetch is
         already pending for ``id_``, the new ``pending`` is registered in
@@ -2999,10 +3002,21 @@ class Browser:
         ``_children_pending`` gate is cleared in ``apply_children_results``).
         """
         if id_ is None:
+            # Snapshot expanded set + scope root BEFORE invalidation so
+            # we can re-dispatch fetches for them too. Without this,
+            # ``visible_items`` would emit a placeholder for each
+            # expanded parent missing from ``_children`` and the only
+            # auto-dispatch (``_update_children_for_cursor``) only fires
+            # for the cursor item — leaving siblings/ancestors stuck.
+            extra = set(self._state.expanded)
+            if self._state.scope_stack:
+                extra.add(current_scope(self._state))
             cache_invalidate_all(self._state)
             id_ = self._state.root_id
+            extra.discard(id_)
         else:
             cache_invalidate_subtree(self._state, id_)
+            extra = ()
         # Force the next ``_update_preview_for_cursor`` to re-fetch.
         # The ``_preview_cursor_id`` gate (#126) skips re-requests when
         # the cursor stays on the same item, but a refresh just
@@ -3024,7 +3038,17 @@ class Browser:
         if id_ not in self._state._children_pending:
             self._state._children_pending.add(id_)
             self._children_queue.append(id_)
-            self._children_event.set()
+        # Re-dispatch every previously-expanded parent (and the scope
+        # root) so their sub-trees don't strand on the loading
+        # placeholder. These are fire-and-forget — nobody specific is
+        # waiting on them, so no Pending registration. Same coalescing
+        # rules: skip ids already in flight.
+        for x in extra:
+            self._state._loading[x] = True
+            if x not in self._state._children_pending:
+                self._state._children_pending.add(x)
+                self._children_queue.append(x)
+        self._children_event.set()
 
     def _do_cursor_to(self, id_, pending):
         """Main-thread: position the cursor at ``id_`` and resolve ``pending``.
