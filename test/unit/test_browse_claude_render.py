@@ -796,6 +796,185 @@ class TestSubagentPreview(unittest.TestCase):
         self.assertIn('hi', out)
 
 
+class TestRunningSessions(unittest.TestCase):
+    """``_pid_alive`` + the running-session helpers, and --running filtering."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_pid_alive_self(self):
+        self.assertTrue(self.r._pid_alive(os.getpid()))
+
+    def test_pid_alive_garbage_pid(self):
+        self.assertFalse(self.r._pid_alive(0))
+        self.assertFalse(self.r._pid_alive(-1))
+        self.assertFalse(self.r._pid_alive('not a pid'))
+
+    def test_pid_alive_dead(self):
+        # PID 2^22 - 1 is well above the default Linux max_pid; if it
+        # happened to be live this test would flake, but that's a 1-in-4M
+        # corner case and the function correctly handles either outcome.
+        self.assertFalse(self.r._pid_alive(2**22 - 1))
+
+    def test_scan_populates_index(self):
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sdir = os.path.join(tmp, '.claude', 'sessions')
+            os.makedirs(sdir)
+            with open(os.path.join(sdir, f'{os.getpid()}.json'), 'w') as f:
+                _json.dump({'sessionId': 'sess-live', 'pid': os.getpid(),
+                            'cwd': '/x', 'status': 'idle'}, f)
+            with open(os.path.join(sdir, '9999999.json'), 'w') as f:
+                _json.dump({'sessionId': 'sess-dead', 'pid': 9999999,
+                            'cwd': '/x'}, f)
+            saved = os.environ.get('HOME')
+            try:
+                os.environ['HOME'] = tmp
+                self.r._scan_running_sessions()
+                self.assertIn('sess-live', self.r._RUNNING_INDEX)
+                self.assertNotIn('sess-dead', self.r._RUNNING_INDEX)
+            finally:
+                if saved is None: os.environ.pop('HOME', None)
+                else: os.environ['HOME'] = saved
+                self.r._RUNNING_INDEX.clear()
+
+    def test_find_session_by_id(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, '-home-x')
+            os.makedirs(proj)
+            target = os.path.join(proj, 'sess-foo.jsonl')
+            open(target, 'w').close()
+            saved = self.r.CLAUDE_ROOT
+            try:
+                self.r.CLAUDE_ROOT = tmp
+                self.assertEqual(self.r._find_session_by_id('sess-foo'), target)
+                self.assertIsNone(self.r._find_session_by_id('nope'))
+            finally:
+                self.r.CLAUDE_ROOT = saved
+
+    def test_find_session_by_pid(self):
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            # Lay out the session-meta + a matching jsonl
+            sdir = os.path.join(tmp, '.claude', 'sessions')
+            os.makedirs(sdir)
+            with open(os.path.join(sdir, '1234.json'), 'w') as f:
+                _json.dump({'sessionId': 'sid-1', 'pid': 1234}, f)
+            projects = os.path.join(tmp, '.claude', 'projects')
+            os.makedirs(os.path.join(projects, '-x'))
+            target = os.path.join(projects, '-x', 'sid-1.jsonl')
+            open(target, 'w').close()
+            saved_home = os.environ.get('HOME')
+            saved_root = self.r.CLAUDE_ROOT
+            try:
+                os.environ['HOME'] = tmp
+                self.r.CLAUDE_ROOT = projects
+                self.assertEqual(self.r._find_session_by_pid(1234), target)
+                self.assertIsNone(self.r._find_session_by_pid(99999))
+            finally:
+                if saved_home is None: os.environ.pop('HOME', None)
+                else: os.environ['HOME'] = saved_home
+                self.r.CLAUDE_ROOT = saved_root
+
+    def test_running_only_filters_sessions(self):
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, 'live-proj'))
+            live_path = os.path.join(tmp, 'live-proj', 'live-sid.jsonl')
+            dead_path = os.path.join(tmp, 'live-proj', 'dead-sid.jsonl')
+            with open(live_path, 'w') as f: f.write('{}\n')
+            with open(dead_path, 'w') as f: f.write('{}\n')
+            self.r._RUNNING_INDEX.clear()
+            self.r._RUNNING_INDEX['live-sid'] = {
+                'sessionId': 'live-sid', 'pid': os.getpid(),
+                'cwd': '/x', 'status': 'idle',
+            }
+            saved_only = self.r._RUNNING_ONLY
+            try:
+                self.r._RUNNING_ONLY = True
+                rows = self.r._list_sessions(os.path.join(tmp, 'live-proj'))
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0].title, 'live-sid')
+                self.assertIn('pid', rows[0].tag)
+                # Without --running, both surface.
+                self.r._RUNNING_ONLY = False
+                rows = self.r._list_sessions(os.path.join(tmp, 'live-proj'))
+                self.assertEqual(len(rows), 2)
+            finally:
+                self.r._RUNNING_ONLY = saved_only
+                self.r._RUNNING_INDEX.clear()
+
+
+class TestArgPoppers(unittest.TestCase):
+    """``_pop_value`` / ``_pop_flag`` parse the recipe's hand-rolled CLI."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _with_argv(self, argv):
+        import sys as _sys
+        saved = _sys.argv
+        _sys.argv = ['browse-claude'] + argv
+        return saved
+
+    def _restore_argv(self, saved):
+        import sys as _sys
+        _sys.argv = saved
+
+    def test_pop_value_space_form(self):
+        saved = self._with_argv(['--session', 'abc'])
+        try:
+            self.assertEqual(self.r._pop_value('--session'), 'abc')
+            import sys as _sys
+            self.assertEqual(_sys.argv, ['browse-claude'])
+        finally:
+            self._restore_argv(saved)
+
+    def test_pop_value_equals_form(self):
+        saved = self._with_argv(['--session=abc'])
+        try:
+            self.assertEqual(self.r._pop_value('--session'), 'abc')
+        finally:
+            self._restore_argv(saved)
+
+    def test_pop_value_int_conv(self):
+        saved = self._with_argv(['--pid', '4242'])
+        try:
+            self.assertEqual(self.r._pop_value('--pid', int), 4242)
+        finally:
+            self._restore_argv(saved)
+
+    def test_pop_value_bad_int(self):
+        saved = self._with_argv(['--pid', 'banana'])
+        try:
+            self.assertIs(self.r._pop_value('--pid', int), False)
+        finally:
+            self._restore_argv(saved)
+
+    def test_pop_value_absent(self):
+        saved = self._with_argv(['--other', 'x'])
+        try:
+            self.assertIsNone(self.r._pop_value('--session'))
+        finally:
+            self._restore_argv(saved)
+
+    def test_pop_flag(self):
+        saved = self._with_argv(['--running', 'extra'])
+        try:
+            self.assertTrue(self.r._pop_flag('--running'))
+            self.assertFalse(self.r._pop_flag('--running'))   # already popped
+            import sys as _sys
+            self.assertEqual(_sys.argv, ['browse-claude', 'extra'])
+        finally:
+            self._restore_argv(saved)
+
+
 class TestDecodeProjectPath(unittest.TestCase):
     """``~`` substitution and edge cases for the project-name decoder."""
 

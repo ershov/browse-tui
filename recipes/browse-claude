@@ -127,6 +127,46 @@ def _pop_limit_arg(default):
     return default
 
 
+def _pop_value(name, conv=str):
+    """Pop ``--name VALUE`` (or ``--name=VALUE``) and return the value.
+
+    Returns ``None`` if the flag is absent. Returns the sentinel
+    ``False`` if the flag is present but the value can't be converted
+    via ``conv`` — letting the caller report a useful error.
+    """
+    eq_prefix = f'{name}='
+    i = 1
+    while i < len(sys.argv):
+        a = sys.argv[i]
+        if a == name and i + 1 < len(sys.argv):
+            raw = sys.argv[i + 1]
+            del sys.argv[i:i + 2]
+            try:
+                return conv(raw)
+            except (ValueError, TypeError):
+                return False
+        if a.startswith(eq_prefix):
+            raw = a[len(eq_prefix):]
+            del sys.argv[i]
+            try:
+                return conv(raw)
+            except (ValueError, TypeError):
+                return False
+        i += 1
+    return None
+
+
+def _pop_flag(name):
+    """Pop the bare flag ``--name`` and return ``True`` if it was present."""
+    i = 1
+    while i < len(sys.argv):
+        if sys.argv[i] == name:
+            del sys.argv[i]
+            return True
+        i += 1
+    return False
+
+
 # ---- helpers --------------------------------------------------------------
 
 
@@ -194,6 +234,113 @@ def _oneline(s):
     return ' '.join(s.split())
 
 
+def _pid_alive(pid):
+    """True iff a process with PID ``pid`` is currently alive.
+
+    ``PermissionError`` (signalling a process owned by another user)
+    counts as alive — we can see it via ``kill -0`` semantics.
+    """
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+# Populated by ``_scan_running_sessions`` at startup; indexed by
+# sessionId → {pid, cwd, status, …} read from ``~/.claude/sessions/*.json``.
+_RUNNING_INDEX = {}
+_RUNNING_ONLY = False   # --running flag — filter to live sessions only.
+
+
+def _claude_sessions_dir():
+    """Sibling of CLAUDE_ROOT that holds per-PID live-session metadata."""
+    return os.path.join(
+        os.environ.get('HOME', os.path.expanduser('~')),
+        '.claude', 'sessions',
+    )
+
+
+def _scan_running_sessions():
+    """Refresh ``_RUNNING_INDEX`` from on-disk session metadata.
+
+    Each running ``claude`` process writes ``~/.claude/sessions/<pid>.json``
+    with at least ``{sessionId, pid, cwd, status}``. We keep only those
+    whose pid is currently alive — stale files from crashed processes
+    silently disappear.
+    """
+    _RUNNING_INDEX.clear()
+    sdir = _claude_sessions_dir()
+    if not os.path.isdir(sdir):
+        return
+    try:
+        names = os.listdir(sdir)
+    except OSError:
+        return
+    for name in names:
+        if not name.endswith('.json'):
+            continue
+        path = os.path.join(sdir, name)
+        try:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        pid = data.get('pid')
+        sid = data.get('sessionId')
+        if not isinstance(pid, int) or not isinstance(sid, str):
+            continue
+        if not _pid_alive(pid):
+            continue
+        _RUNNING_INDEX[sid] = data
+
+
+def _find_session_by_id(sid):
+    """Return the absolute .jsonl path for ``sid``, or ``None``.
+
+    Linear scan across project dirs — there's no central index. Each
+    project directory contains its own ``<sid>.jsonl`` files; the same
+    session id never appears in two project dirs simultaneously, so the
+    first hit wins.
+    """
+    if not isinstance(sid, str) or not sid:
+        return None
+    if not os.path.isdir(CLAUDE_ROOT):
+        return None
+    target = f'{sid}.jsonl'
+    try:
+        names = os.listdir(CLAUDE_ROOT)
+    except OSError:
+        return None
+    for project in names:
+        proj_dir = os.path.join(CLAUDE_ROOT, project)
+        candidate = os.path.join(proj_dir, target)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _find_session_by_pid(pid):
+    """Return the .jsonl path for the live session owned by ``pid``."""
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    path = os.path.join(_claude_sessions_dir(), f'{pid}.json')
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return _find_session_by_id(data.get('sessionId'))
+
+
 def _indent_continuations(text, indent):
     """Prefix every line *after* the first with ``indent``.
 
@@ -254,11 +401,15 @@ def _list_projects():
         # talking to one of the existing sessions.
         latest = 0.0
         sessions = 0
+        running = 0
         try:
             for n in os.listdir(full):
                 if not n.endswith('.jsonl'):
                     continue
                 sessions += 1
+                sid = n[:-len('.jsonl')]
+                if sid in _RUNNING_INDEX:
+                    running += 1
                 try:
                     m = os.stat(os.path.join(full, n)).st_mtime
                 except OSError:
@@ -267,16 +418,23 @@ def _list_projects():
                     latest = m
         except OSError:
             pass
+        # --running: hide projects with no live sessions.
+        if _RUNNING_ONLY and not running:
+            continue
+        tag = f'{sessions} sess · {_human_time(latest)}'
+        if running:
+            tag = f'{running}/{sessions} live · {_human_time(latest)}'
         item = Item(
             id=full,
             title=_decode_project_path(name),
-            tag=f'{sessions} sess · {_human_time(latest)}',
-            tag_style='dim',
+            tag=tag,
+            tag_style=('green' if running else 'dim'),
             has_children=sessions > 0,
         )
         item.kind = 'project'
         item.encoded_name = name
         item.session_count = sessions
+        item.running_count = running
         item.mtime = latest
         out.append(item)
     # Most-recently-active project first — matches what people actually
@@ -308,22 +466,30 @@ def _list_sessions(project_dir):
         except OSError:
             count = 0
         sid = name[:-len('.jsonl')]
+        running_meta = _RUNNING_INDEX.get(sid)
+        # --running: hide sessions whose claude process isn't alive.
+        if _RUNNING_ONLY and not running_meta:
+            continue
         n_subs = _count_subagents(project_dir, sid)
         tag = f'{count} msg'
         if n_subs:
             tag += f' · {n_subs} sub'
         tag += f' · {_human_time(st.st_mtime)}'
+        if running_meta:
+            tag = f'pid {running_meta["pid"]} · ' + tag
         item = Item(
             id=full,
             title=sid,
             tag=tag,
-            tag_style='dim',
+            tag_style=('green' if running_meta else 'dim'),
             has_children=count > 0 or n_subs > 0,
         )
         item.kind = 'session'
         item.line_count = count
         item.subagent_count = n_subs
         item.mtime = st.st_mtime
+        item.pid = running_meta['pid'] if running_meta else None
+        item.status = running_meta.get('status') if running_meta else None
         out.append(item)
     out.sort(key=lambda it: -it.mtime)
     return out
@@ -2100,11 +2266,17 @@ def _action_show_id(ctx):
 _HELP_INTRO_TMPL = """\
 browse-claude — Claude Code project / session / message browser.
 
-Usage: browse-claude [-n NUMBER] [PROJECT]
-  -n NUMBER  Cap messages enumerated per session (default: {default}).
-  PROJECT    Project directory name under ~/.claude/projects/ to drill into
-             on launch (sets the initial scope). Without a name, the tree
-             opens at the project list.
+Usage: browse-claude [OPTIONS] [PROJECT]
+  -n NUMBER       Cap messages enumerated per session (default: {default}).
+  --session ID    Open the .jsonl for that sessionId directly.
+  --pid PID       Open the .jsonl owned by the running Claude PID.
+  --file PATH     Open an arbitrary .jsonl file directly.
+  --running       Filter projects/sessions to those with a live PID.
+  --item N        After --session/--pid/--file, position the cursor on
+                  line N (1-based) of the resolved transcript.
+  PROJECT         Project directory name under ~/.claude/projects/ to
+                  drill into on launch. Ignored when --session / --pid /
+                  --file is given.
 
 Walks ~/.claude/projects/ to surface a four-level tree: projects ->
 sessions -> messages (or subagents) -> subagent messages. Drill into
@@ -2117,10 +2289,64 @@ _message_limit = _MESSAGE_LIMIT
 
 
 def main():
-    global _message_limit
+    global _message_limit, _RUNNING_ONLY
     _init_color()
     _message_limit = _pop_limit_arg(_MESSAGE_LIMIT)
-    initial_scope = sys.argv[1] if len(sys.argv) > 1 else None
+
+    # Discovery flags — order doesn't matter, all extracted before the
+    # positional PROJECT arg is read.
+    session_id = _pop_value('--session')
+    pid_arg    = _pop_value('--pid', int)
+    file_arg   = _pop_value('--file')
+    item_arg   = _pop_value('--item', int)
+    _RUNNING_ONLY = _pop_flag('--running')
+
+    # --running needs the running index regardless of which target we open;
+    # tagging sessions with PIDs also depends on it.
+    _scan_running_sessions()
+
+    # Resolve the initial scope: --file / --session / --pid are mutually
+    # exclusive (claude-data semantics). Fall back to positional PROJECT.
+    targets = sum(1 for v in (session_id, pid_arg, file_arg) if v)
+    if targets > 1:
+        print('browse-claude: --session, --pid, and --file are mutually '
+              'exclusive', file=sys.stderr)
+        sys.exit(2)
+
+    initial_scope = None
+    target_jsonl = None
+    if file_arg is False or session_id is False or pid_arg is False or \
+            item_arg is False:
+        print('browse-claude: invalid argument value', file=sys.stderr)
+        sys.exit(2)
+    if file_arg:
+        target_jsonl = os.path.abspath(file_arg)
+        if not os.path.isfile(target_jsonl):
+            print(f'browse-claude: no such file: {file_arg}', file=sys.stderr)
+            sys.exit(2)
+        initial_scope = target_jsonl
+    elif session_id:
+        target_jsonl = _find_session_by_id(session_id)
+        if not target_jsonl:
+            print(f'browse-claude: no session with id {session_id!r}',
+                  file=sys.stderr)
+            sys.exit(2)
+        initial_scope = target_jsonl
+    elif pid_arg:
+        target_jsonl = _find_session_by_pid(pid_arg)
+        if not target_jsonl:
+            print(f'browse-claude: no live session for pid {pid_arg}',
+                  file=sys.stderr)
+            sys.exit(2)
+        initial_scope = target_jsonl
+    elif len(sys.argv) > 1:
+        initial_scope = sys.argv[1]
+
+    if item_arg is not None and not target_jsonl:
+        print('browse-claude: --item requires --session/--pid/--file',
+              file=sys.stderr)
+        sys.exit(2)
+
     b = Browser(
         title='browse-claude',
         show_children_pane=False,
@@ -2141,6 +2367,14 @@ def main():
         ],
         help_intro=_HELP_INTRO_TMPL.format(default=_MESSAGE_LIMIT),
     )
+
+    # --item N: queue a cursor-move so the browser lands on the requested
+    # message during initialisation. The id shape matches what
+    # ``_list_messages`` builds (``<path>#<lineno_0based>``).
+    if item_arg is not None and target_jsonl:
+        n0 = max(1, item_arg) - 1
+        b.cursor_to(f'{target_jsonl}#{n0}')
+
     sys.exit(b.run())
 
 
