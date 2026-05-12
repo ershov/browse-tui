@@ -238,29 +238,40 @@ def _list_projects():
         full = os.path.join(CLAUDE_ROOT, name)
         if not os.path.isdir(full):
             continue
+        # Project mtime = max(.jsonl mtime) inside it, NOT the dir mtime.
+        # Directory mtime only changes on file create/delete/rename — it
+        # doesn't update when an existing session is appended to. Using
+        # dir mtime would freeze the ordering as soon as a project's
+        # session set stabilises, even while the user is actively
+        # talking to one of the existing sessions.
+        latest = 0.0
+        sessions = 0
         try:
-            mtime = os.stat(full).st_mtime
+            for n in os.listdir(full):
+                if not n.endswith('.jsonl'):
+                    continue
+                sessions += 1
+                try:
+                    m = os.stat(os.path.join(full, n)).st_mtime
+                except OSError:
+                    continue
+                if m > latest:
+                    latest = m
         except OSError:
-            mtime = 0
-        try:
-            sessions = sum(
-                1 for n in os.listdir(full) if n.endswith('.jsonl')
-            )
-        except OSError:
-            sessions = 0
+            pass
         item = Item(
             id=full,
             title=_decode_project_path(name),
-            tag=f'{sessions} sess · {_human_time(mtime)}',
+            tag=f'{sessions} sess · {_human_time(latest)}',
             tag_style='dim',
             has_children=sessions > 0,
         )
         item.kind = 'project'
         item.encoded_name = name
         item.session_count = sessions
-        item.mtime = mtime
+        item.mtime = latest
         out.append(item)
-    # Most-recently-touched project first — matches what people actually
+    # Most-recently-active project first — matches what people actually
     # want to look at when opening the browser cold.
     out.sort(key=lambda it: -it.mtime)
     return out

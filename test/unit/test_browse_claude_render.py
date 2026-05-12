@@ -796,6 +796,51 @@ class TestSubagentPreview(unittest.TestCase):
         self.assertIn('hi', out)
 
 
+class TestProjectOrdering(unittest.TestCase):
+    """Projects sort by latest .jsonl mtime, not directory mtime."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_active_project_bubbles_up(self):
+        # Two projects: ``stale`` was created later but its .jsonl is
+        # older; ``active`` was created first but its .jsonl is fresh.
+        # Sorting by dir mtime would put ``stale`` first — sorting by
+        # latest .jsonl mtime must put ``active`` first.
+        import tempfile, time
+        with tempfile.TemporaryDirectory() as tmp:
+            saved = self.r.CLAUDE_ROOT
+            try:
+                self.r.CLAUDE_ROOT = tmp
+                # active: dir created first, .jsonl recent.
+                active_dir = os.path.join(tmp, '-home-active')
+                os.makedirs(active_dir)
+                active_jsonl = os.path.join(active_dir, 'a.jsonl')
+                with open(active_jsonl, 'w') as f:
+                    f.write('{}\n')
+                os.utime(active_jsonl, (1000000.0, 1000000.0))
+                # stale: dir created later, .jsonl is older.
+                stale_dir = os.path.join(tmp, '-home-stale')
+                os.makedirs(stale_dir)
+                stale_jsonl = os.path.join(stale_dir, 'b.jsonl')
+                with open(stale_jsonl, 'w') as f:
+                    f.write('{}\n')
+                os.utime(stale_jsonl, (500000.0, 500000.0))
+                # Force the dir mtimes to invert: stale dir is "newer".
+                os.utime(active_dir, (500000.0, 500000.0))
+                os.utime(stale_dir, (2000000.0, 2000000.0))
+                # Now nudge the active .jsonl to be the freshest signal.
+                os.utime(active_jsonl, (3000000.0, 3000000.0))
+
+                projects = self.r._list_projects()
+                titles = [p.title for p in projects]
+                self.assertEqual(titles[0], '/home/active',
+                                 f'active project should sort first, got {titles}')
+            finally:
+                self.r.CLAUDE_ROOT = saved
+
+
 class TestMultilinePreservation(unittest.TestCase):
     """Session preview should preserve newlines, not collapse them."""
 
