@@ -796,6 +796,111 @@ class TestSubagentPreview(unittest.TestCase):
         self.assertIn('hi', out)
 
 
+class TestDecodeProjectPath(unittest.TestCase):
+    """``~`` substitution and edge cases for the project-name decoder."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_home_collapsed(self):
+        saved = os.environ.get('HOME')
+        try:
+            os.environ['HOME'] = '/home/ubuntu'
+            self.assertEqual(
+                self.r._decode_project_path('-home-ubuntu-sandvault-src'),
+                '~/sandvault/src',
+            )
+        finally:
+            if saved is None: os.environ.pop('HOME', None)
+            else: os.environ['HOME'] = saved
+
+    def test_home_exact(self):
+        saved = os.environ.get('HOME')
+        try:
+            os.environ['HOME'] = '/home/ubuntu'
+            self.assertEqual(
+                self.r._decode_project_path('-home-ubuntu'), '~',
+            )
+        finally:
+            if saved is None: os.environ.pop('HOME', None)
+            else: os.environ['HOME'] = saved
+
+    def test_outside_home_unchanged(self):
+        saved = os.environ.get('HOME')
+        try:
+            os.environ['HOME'] = '/home/ubuntu'
+            self.assertEqual(
+                self.r._decode_project_path('-tmp-foo'), '/tmp/foo',
+            )
+        finally:
+            if saved is None: os.environ.pop('HOME', None)
+            else: os.environ['HOME'] = saved
+
+    def test_non_path_returned_verbatim(self):
+        self.assertEqual(self.r._decode_project_path('weird'), 'weird')
+
+
+class TestMessageOrderReverse(unittest.TestCase):
+    """``_list_messages`` returns newest-first with a trailing truncation marker."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _write(self, records):
+        import json as _json
+        import tempfile
+        f = tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False)
+        for r in records:
+            f.write(_json.dumps(r) + '\n')
+        f.close()
+        return f.name
+
+    def test_newest_first(self):
+        path = self._write([
+            {'type': 'user', 'message': {'role': 'user', 'content': 'one'}},
+            {'type': 'user', 'message': {'role': 'user', 'content': 'two'}},
+            {'type': 'user', 'message': {'role': 'user', 'content': 'three'}},
+        ])
+        try:
+            items = self.r._list_messages(path)
+            titles = [it.title for it in items]
+            self.assertIn('three', titles[0])
+            self.assertIn('two',   titles[1])
+            self.assertIn('one',   titles[2])
+        finally:
+            os.unlink(path)
+
+    def test_truncation_marker_at_end(self):
+        path = self._write([
+            {'type': 'user', 'message': {'role': 'user', 'content': f'msg{i}'}}
+            for i in range(10)
+        ])
+        try:
+            items = self.r._list_messages(path, limit=3)
+            # Three real items + one truncation marker at the END.
+            self.assertEqual(len(items), 4)
+            self.assertIn('older entries hidden', items[-1].title)
+            # First three should be the *latest* three (msg9, msg8, msg7).
+            self.assertIn('msg9', items[0].title)
+            self.assertIn('msg8', items[1].title)
+            self.assertIn('msg7', items[2].title)
+        finally:
+            os.unlink(path)
+
+    def test_no_marker_when_under_cap(self):
+        path = self._write([
+            {'type': 'user', 'message': {'role': 'user', 'content': 'only'}},
+        ])
+        try:
+            items = self.r._list_messages(path, limit=10)
+            self.assertEqual(len(items), 1)
+            self.assertNotIn('older entries hidden', items[0].title)
+        finally:
+            os.unlink(path)
+
+
 class TestProjectOrdering(unittest.TestCase):
     """Projects sort by latest .jsonl mtime, not directory mtime."""
 

@@ -135,14 +135,22 @@ def _decode_project_path(name):
 
     Claude Code names a project directory by replacing every ``/`` in
     the original cwd with ``-``, so ``/home/ubuntu/sandvault/src`` becomes
-    ``-home-ubuntu-sandvault-src``. We invert that for the display title.
+    ``-home-ubuntu-sandvault-src``. We invert that for the display title
+    and collapse the user's HOME prefix to ``~`` so the column stays
+    readable (``~/sandvault/src`` rather than ``/home/ubuntu/sandvault/src``).
 
     Names that don't start with ``-`` are returned verbatim — better to
     show *something* than to crash on an unexpected layout.
     """
     if not name.startswith('-'):
         return name
-    return '/' + name[1:].replace('-', '/')
+    p = '/' + name[1:].replace('-', '/')
+    home = os.environ.get('HOME') or os.path.expanduser('~')
+    if home and p == home:
+        return '~'
+    if home and p.startswith(home + '/'):
+        return '~' + p[len(home):]
+    return p
 
 
 def _human_time(epoch):
@@ -450,9 +458,20 @@ def _list_subagent_messages(item_id):
 
 
 def _list_messages(jsonl_path, limit=None):
+    """List messages newest-first, capped at ``limit`` lines.
+
+    JSONL files are written in chronological order (append-only), but
+    users almost always want to see what happened *recently* — so we
+    walk the file with a sliding window that keeps just the last
+    ``limit + 1`` lines, then emit them in reverse. The ``+1`` is a
+    truncation sentinel: if the deque ever overflowed we know there
+    are older entries we didn't yield, and we append a marker row at
+    the bottom to make that visible.
+    """
+    from collections import deque
+
     if limit is None:
         limit = _message_limit
-    out = []
     try:
         f = open(jsonl_path, 'r', encoding='utf-8', errors='replace')
     except OSError as e:
@@ -462,47 +481,57 @@ def _list_messages(jsonl_path, limit=None):
             tag='err',
             tag_style='red',
         )]
+    window = deque(maxlen=limit + 1)
+    total = 0
     with f:
         for n, line in enumerate(f):
-            if n >= limit:
-                # Marker row so the user knows the list is truncated.
-                out.append(Item(
-                    id=f'{jsonl_path}#__truncated__',
-                    title=f'(more — only first {limit} shown; press e to view file)',
-                    tag='…',
-                    tag_style='dim',
-                ))
-                break
-            line = line.rstrip('\n')
-            if not line.strip():
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                # Malformed line — surface it but stay scrolling.
-                out.append(Item(
-                    id=f'{jsonl_path}#{n}',
-                    title=f'[invalid json] {line[:1000]}',
-                    tag='err',
-                    tag_style='red',
-                ))
-                continue
-            kind = _kind_of(obj)
-            item = Item(
+            window.append((n, line))
+            total = n + 1
+    truncated = len(window) > limit
+    if truncated:
+        window.popleft()
+
+    out = []
+    for n, line in reversed(window):
+        line = line.rstrip('\n')
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            # Malformed line — surface it but stay scrolling.
+            out.append(Item(
                 id=f'{jsonl_path}#{n}',
-                # Row titles must be single-line — _summarise_message
-                # now preserves newlines for the session-preview timeline,
-                # so collapse here for the list view.
-                title=_oneline(_summarise_message(obj)),
-                tag=kind,
-                tag_style=_TAG_STYLE_FOR_KIND.get(kind, ''),
-                has_children=False,
-            )
-            item.kind = 'message'
-            item.line_no = n
-            item.session_path = jsonl_path
-            item.message_kind = kind
-            out.append(item)
+                title=f'[invalid json] {line[:1000]}',
+                tag='err',
+                tag_style='red',
+            ))
+            continue
+        kind = _kind_of(obj)
+        item = Item(
+            id=f'{jsonl_path}#{n}',
+            # Row titles must be single-line — _summarise_message
+            # now preserves newlines for the session-preview timeline,
+            # so collapse here for the list view.
+            title=_oneline(_summarise_message(obj)),
+            tag=kind,
+            tag_style=_TAG_STYLE_FOR_KIND.get(kind, ''),
+            has_children=False,
+        )
+        item.kind = 'message'
+        item.line_no = n
+        item.session_path = jsonl_path
+        item.message_kind = kind
+        out.append(item)
+
+    if truncated:
+        older = total - limit
+        out.append(Item(
+            id=f'{jsonl_path}#__truncated__',
+            title=f'({older} older entries hidden; press e to view file)',
+            tag='…',
+            tag_style='dim',
+        ))
     return out
 
 
@@ -2095,6 +2124,12 @@ def main():
     b = Browser(
         title='browse-claude',
         show_children_pane=False,
+        # Item ids are file paths (project) / .jsonl paths (session) /
+        # ``<path>#<n>`` (message). They duplicate or contradict the
+        # title in every case, so suppress them from the row chrome —
+        # the title alone identifies the row. ``y`` action still surfaces
+        # the full id on demand.
+        show_ids='never',
         get_children=get_children,
         get_preview=get_preview,
         root_id=None,
