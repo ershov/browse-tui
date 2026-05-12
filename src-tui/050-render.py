@@ -828,8 +828,40 @@ def _truncate_visible(s, max_cols):
     return ''.join(out)
 
 
+def _truncate_by_cells(s, max_cols):
+    """Truncate plain text ``s`` to at most ``max_cols`` *visible cells*.
+
+    Wide-char aware: East Asian Wide/Fullwidth chars count as 2 cells.
+    When a wide char would straddle the budget (1 cell left, 2-cell char
+    incoming), the char is dropped and a single space fills the remaining
+    cell so the caller's pad / pane-boundary math stays exact.
+
+    Plain text only — does not skip ANSI escapes. The list renderer
+    collapses styled segments to a plain string before truncating, so
+    this restriction matches the call sites. (For mixed text/SGR
+    truncation see ``_truncate_visible``.)
+
+    Returns ``(truncated, cells)`` — ``cells`` is the exact cell count
+    of the returned string and is always ``<= max_cols``.
+    """
+    if max_cols <= 0:
+        return ('', 0)
+    out = []
+    cells = 0
+    for ch in s:
+        w = _char_width(ch)
+        if cells + w > max_cols:
+            if cells < max_cols:
+                out.append(' ')
+                cells += 1
+            break
+        out.append(ch)
+        cells += w
+    return (''.join(out), cells)
+
+
 def _write_segments(segments, max_width, *, pad_to=0):
-    """Emit ``segments`` to the terminal, truncating at ``max_width`` columns.
+    """Emit ``segments`` to the terminal, truncating at ``max_width`` cells.
 
     Each segment is a ``(text, fg, bold)`` triple. ``fg=None`` and
     ``bold=False`` means use the terminal's current style (no SGR
@@ -837,15 +869,19 @@ def _write_segments(segments, max_width, *, pad_to=0):
     chunk in ``set_style`` / ``reset_style`` so adjacent segments don't
     bleed colours.
 
-    Returns the number of characters written (so callers can pad to a
-    fixed column).
+    Width is measured in *visible cells* (wide-char aware) so rows
+    containing CJK / emoji / other East Asian wide chars truncate and
+    pad on cell boundaries instead of overflowing the pane into the
+    neighbour on the right.
+
+    Returns the number of cells written.
     """
     pos = 0
     for text, fg, bold in segments:
         if pos >= max_width:
             break
         remaining = max_width - pos
-        chunk = text[:remaining]
+        chunk, chunk_cells = _truncate_by_cells(text, remaining)
         if not chunk:
             continue
         if fg is not None or bold:
@@ -854,7 +890,7 @@ def _write_segments(segments, max_width, *, pad_to=0):
             reset_style()
         else:
             write(chunk)
-        pos += len(chunk)
+        pos += chunk_cells
     if pad_to > pos:
         write(' ' * (pad_to - pos))
         pos = pad_to
@@ -874,12 +910,17 @@ def _write_highlighted(line, base_fg=None, base_bold=False, reverse=False,
     highlight branch lights up in phase-2 ticket #22 (search highlight
     in the list).
     """
+    # Visible-cell count drives the pad math — wide chars (CJK / emoji)
+    # consume two cells each, so ``len(line)`` under-counts and would
+    # leave the row short or overflow into the next pane. Callers are
+    # expected to have already truncated ``line`` to ``pad_to`` cells.
+    visible = _visible_len(line)
     if not search_query:
         if base_fg is not None or base_bold or reverse:
             set_style(fg=base_fg, bold=base_bold, reverse=reverse)
         write(line)
-        if pad_to > len(line):
-            write(' ' * (pad_to - len(line)))
+        if pad_to > visible:
+            write(' ' * (pad_to - visible))
         if base_fg is not None or base_bold or reverse:
             reset_style()
         return
@@ -889,8 +930,8 @@ def _write_highlighted(line, base_fg=None, base_bold=False, reverse=False,
         if base_fg is not None or base_bold or reverse:
             set_style(fg=base_fg, bold=base_bold, reverse=reverse)
         write(line)
-        if pad_to > len(line):
-            write(' ' * (pad_to - len(line)))
+        if pad_to > visible:
+            write(' ' * (pad_to - visible))
         if base_fg is not None or base_bold or reverse:
             reset_style()
         return
@@ -936,10 +977,10 @@ def _write_highlighted(line, base_fg=None, base_bold=False, reverse=False,
                 reset_style()
             i = j
 
-    if pad_to > len(line):
+    if pad_to > visible:
         if reverse:
             set_style(reverse=True)
-        write(' ' * (pad_to - len(line)))
+        write(' ' * (pad_to - visible))
         if reverse:
             reset_style()
 
@@ -1209,12 +1250,11 @@ def render_list(browser, rect, *, rightmost: bool = False):
             if rel_depth < 0:
                 rel_depth = 0
             line = '  ' + '  ' * rel_depth + '  # ' + item.title
-            if len(line) > width:
-                line = line[:width]
+            line, line_cells = _truncate_by_cells(line, width)
             set_style(fg=11, bg=4, bold=True)
             write(line)
-            if len(line) < width:
-                write(' ' * (width - len(line)))
+            if line_cells < width:
+                write(' ' * (width - line_cells))
             reset_style()
             end_row()
             continue
@@ -1236,8 +1276,7 @@ def render_list(browser, rect, *, rightmost: bool = False):
             # Reverse video for the cursor line — collapse segments to a
             # plain line so the search-highlighter can overlay it.
             line = ''.join(s[0] for s in segments)
-            if len(line) > width:
-                line = line[:width]
+            line, _ = _truncate_by_cells(line, width)
             _write_highlighted(
                 line, reverse=True, pad_to=width,
                 search_query=browser._search_query,
@@ -1254,8 +1293,7 @@ def render_list(browser, rect, *, rightmost: bool = False):
                     and _search_matches(
                         _search_text(item), browser._search_query)):
                 line = ''.join(s[0] for s in segments)
-                if len(line) > width:
-                    line = line[:width]
+                line, _ = _truncate_by_cells(line, width)
                 _write_highlighted(
                     line, pad_to=0,
                     search_query=browser._search_query,

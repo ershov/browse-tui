@@ -27,6 +27,7 @@ from test.unit._loader import load
 
 _data = load('_browse_tui_data', '030-data.py')
 _state = load('_browse_tui_state', '040-state.py')
+_term = load('_browse_tui_term_render', '020-terminal.py')
 _render = load('_browse_tui_render', '050-render.py')
 
 # The render module references ``Item`` for synthetic placeholder rows
@@ -37,6 +38,11 @@ _render.Item = _data.Item
 # call ``browser._pane_cache.setdefault(name, PaneCache())``. Inject the
 # state-layer type the same way Item is injected.
 _render.PaneCache = _state.PaneCache
+# Wide-char primitives — used by the list-pane cell-budget truncation in
+# ``render_list`` (CJK / emoji width). Production builds get them via
+# the concatenated build; the test loader has to wire them in.
+_render._char_width = _term._char_width
+_render._visible_len = _term._visible_len
 
 Item = _data.Item
 format_item_segments = _render.format_item_segments

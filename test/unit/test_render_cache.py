@@ -56,6 +56,7 @@ _render._search_text = _state._search_text
 _render._ANSI_CSI_RE = _term._ANSI_CSI_RE
 _render.SgrState = _term.SgrState
 _render._char_width = _term._char_width
+_render._visible_len = _term._visible_len
 for _name in ('write', 'move', 'set_style', 'reset_style', 'clear_line',
               'clear_columns', 'begin_row', 'end_row', 'begin_sync',
               'end_sync', 'flush', 'term_size'):
