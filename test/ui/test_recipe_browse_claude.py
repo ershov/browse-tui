@@ -175,6 +175,37 @@ class TestBrowseClaude(unittest.TestCase):
                 t.wait_for('PROBE-DESC', timeout=3.0)
                 t.send('q')
 
+    def test_pid_lands_on_session_with_preview(self):
+        """``--pid PID`` should show the session preview, not a blank pane.
+
+        Regression test for the bug where scoping directly into the
+        .jsonl made the session a ``scope_root`` entry, which the
+        framework skips for preview updates. The fix scopes into the
+        parent dir and moves the cursor onto the session row, so its
+        preview (card + timeline) renders.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_fake_claude(tmp)
+            # Layer a sessions/<pid>.json sidecar pointing at the fake
+            # session we created. Use this process's PID so the recipe's
+            # liveness check passes.
+            pid = os.getpid()
+            sdir = os.path.join(tmp, '.claude', 'sessions')
+            os.makedirs(sdir)
+            with open(os.path.join(sdir, f'{pid}.json'), 'w') as f:
+                json.dump({'sessionId': 'abcd1234-deadbeef', 'pid': pid,
+                           'cwd': '/home/test/project', 'status': 'idle'}, f)
+            with TmuxFixture(cols=140, rows=30, env=self._launch_env(tmp)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE, '--pid', str(pid))
+                # The session row's preview should include the
+                # session-card "session:" line.
+                t.wait_for('session:', timeout=3.0)
+                # And the user message we put in the fake jsonl should
+                # land in the timeline (proving we did a full session
+                # scan, not just rendered the breadcrumb).
+                t.wait_for('hello world', timeout=3.0)
+                t.send('q')
+
     def test_drills_into_subagent(self):
         """Expanding a subagent reveals its own transcript lines.
 

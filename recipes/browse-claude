@@ -2324,21 +2324,18 @@ def main():
         if not os.path.isfile(target_jsonl):
             print(f'browse-claude: no such file: {file_arg}', file=sys.stderr)
             sys.exit(2)
-        initial_scope = target_jsonl
     elif session_id:
         target_jsonl = _find_session_by_id(session_id)
         if not target_jsonl:
             print(f'browse-claude: no session with id {session_id!r}',
                   file=sys.stderr)
             sys.exit(2)
-        initial_scope = target_jsonl
     elif pid_arg:
         target_jsonl = _find_session_by_pid(pid_arg)
         if not target_jsonl:
             print(f'browse-claude: no live session for pid {pid_arg}',
                   file=sys.stderr)
             sys.exit(2)
-        initial_scope = target_jsonl
     elif len(sys.argv) > 1:
         initial_scope = sys.argv[1]
 
@@ -2346,6 +2343,29 @@ def main():
         print('browse-claude: --item requires --session/--pid/--file',
               file=sys.stderr)
         sys.exit(2)
+
+    # Initial scope strategy when a target jsonl was resolved:
+    #
+    #   --item N (any target):  scope INTO the jsonl, cursor on message N.
+    #                           The user explicitly wants to see message N,
+    #                           and the message row is a normal entry so
+    #                           preview works.
+    #
+    #   no --item:              scope into the *parent* directory and put
+    #                           the cursor on the session row. Scoping
+    #                           directly into the jsonl would make the
+    #                           session a ``scope_root`` entry, which the
+    #                           framework intentionally skips for preview
+    #                           updates — you'd land on the file with no
+    #                           preview pane. With the parent as scope and
+    #                           the session row as a ``normal`` entry, the
+    #                           session preview (card + timeline) renders
+    #                           immediately and the user can drill in.
+    if target_jsonl:
+        if item_arg is not None:
+            initial_scope = target_jsonl
+        else:
+            initial_scope = os.path.dirname(target_jsonl) or '/'
 
     b = Browser(
         title='browse-claude',
@@ -2368,12 +2388,23 @@ def main():
         help_intro=_HELP_INTRO_TMPL.format(default=_MESSAGE_LIMIT),
     )
 
-    # --item N: queue a cursor-move so the browser lands on the requested
-    # message during initialisation. The id shape matches what
-    # ``_list_messages`` builds (``<path>#<lineno_0based>``).
-    if item_arg is not None and target_jsonl:
-        n0 = max(1, item_arg) - 1
-        b.cursor_to(f'{target_jsonl}#{n0}')
+    # Post-construction cursor positioning:
+    #
+    #   With --item N: cursor lands on ``<jsonl>#<N-1>``. The scope is
+    #     already the jsonl, so messages render on first paint.
+    #
+    #   Without --item: scope is the parent dir; we need to (a) fetch its
+    #     children to populate the session-row list, then (b) move the
+    #     cursor onto the target session row. ``expand(parent).then(...)``
+    #     gives us that ordering for free — the .then fires once the
+    #     worker has cached the children list.
+    if target_jsonl:
+        if item_arg is not None:
+            n0 = max(1, item_arg) - 1
+            b.cursor_to(f'{target_jsonl}#{n0}')
+        else:
+            parent = os.path.dirname(target_jsonl) or '/'
+            b.expand(parent).then(lambda: b.cursor_to(target_jsonl))
 
     sys.exit(b.run())
 
