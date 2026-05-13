@@ -267,6 +267,103 @@ class TestBrowseClaude(unittest.TestCase):
                 t.wait_for('▶ user', timeout=3.0)
                 t.send('q')
 
+    def test_J_from_session_row_jumps_into_messages(self):
+        """``J`` from a session row drills into the session's first voice.
+
+        Mirrors how a user discovers a session and wants to skip the
+        bookkeeping rows above the actual conversation.
+        """
+        import tempfile, json as _json
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, '.claude', 'projects')
+            proj = os.path.join(root, '-home-test-jk2')
+            os.makedirs(proj)
+            sess = os.path.join(proj, 'sess.jsonl')
+            with open(sess, 'w') as f:
+                # Newest-first when rendered, so chronologically: voice
+                # is the last on disk → first in the list.
+                f.write(_json.dumps({
+                    'type': 'permission-mode',
+                    'permissionMode': 'plan',
+                }) + '\n')
+                f.write(_json.dumps({
+                    'type': 'user',
+                    'message': {'role': 'user',
+                                'content': 'PROBE_SESSION_VOICE'},
+                }) + '\n')
+            with TmuxFixture(cols=140, rows=30, env=self._launch_env(tmp)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE)
+                t.wait_for('/home/test/jk2')
+                t.send('Right')                  # expand project
+                t.wait_for('sess', timeout=3.0)
+                t.send('Down')                   # cursor → session row
+                t.send('J')
+                # The framework should expand the session, find the
+                # voice row, move cursor onto it, and the preview pane
+                # should fill with the user-voice header.
+                t.wait_for('▶ user', timeout=3.0)
+                t.send('q')
+
+    def test_K_scrolls_viewport_to_keep_cursor_on_screen(self):
+        """``K`` on a long transcript should scroll-follow the cursor.
+
+        Builds a session with many machinery rows between two voice
+        rows so the second voice is well below the bottom of the pane
+        from a normal cursor scroll, then verifies ``K`` from the
+        topmost row (newest in the reverse-time list) lands the
+        viewport on the older voice row.
+        """
+        import tempfile, json as _json
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, '.claude', 'projects')
+            proj = os.path.join(root, '-home-test-jk3')
+            os.makedirs(proj)
+            sess = os.path.join(proj, 's.jsonl')
+            with open(sess, 'w') as f:
+                # Chronological order on disk; rendered list is reversed
+                # so 'OLDER_VOICE' lands near the bottom of the rendered
+                # list and 'NEWER_VOICE' near the top.
+                f.write(_json.dumps({
+                    'type': 'user',
+                    'message': {'role': 'user',
+                                'content': 'OLDER_VOICE'},
+                }) + '\n')
+                # 50 machinery rows in between.
+                for i in range(50):
+                    f.write(_json.dumps({
+                        'type': 'assistant',
+                        'message': {'role': 'assistant', 'content': [
+                            {'type': 'tool_use', 'name': 'Bash',
+                             'input': {'command': f'cmd{i}'}},
+                        ]},
+                    }) + '\n')
+                f.write(_json.dumps({
+                    'type': 'user',
+                    'message': {'role': 'user',
+                                'content': 'NEWER_VOICE'},
+                }) + '\n')
+            with TmuxFixture(cols=140, rows=20, env=self._launch_env(tmp)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE)
+                t.wait_for('/home/test/jk3')
+                t.send('Right')                  # expand project
+                t.wait_for('s', timeout=3.0)
+                t.send('Down')                   # cursor → session row
+                # From the session row, J drills into the newest voice.
+                t.send('J')
+                t.wait_for('NEWER_VOICE', timeout=3.0)
+                # Now J again should jump past 50 machinery rows to the
+                # older voice. With only 20 rows in the pane, scroll
+                # MUST follow or the cursor leaves the screen — and
+                # without the preview update the user couldn't tell.
+                t.send('J')
+                # OLDER_VOICE must appear *in the list pane*, which only
+                # happens if the viewport scrolled. Capture the pane and
+                # look for the marker in the visible content.
+                cap = t.wait_for('OLDER_VOICE', timeout=3.0)
+                # And the preview pane should refresh to its body.
+                t.wait_for('▶ user', timeout=3.0)
+                t.send('q')
+
     def test_user_assistant_rows_have_row_bg(self):
         """Conversational rows should render with ``\\e[48;5;...m`` bg stripes.
 

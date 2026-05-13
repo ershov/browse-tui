@@ -3067,6 +3067,14 @@ class Browser:
         ``cursor_to`` would silently move the cursor but the screen
         wouldn't update until the next user keystroke (regression
         guarded by ticket #77's stress tests).
+
+        Also snaps the list viewport so the new cursor row is on-screen.
+        The main loop's automatic snap (in ``run()``) only fires when a
+        synchronous key handler moves ``state.cursor``; ``cursor_to``
+        defers the move via ``post`` so it lands *after* that snap
+        check. Without an explicit snap here, programmatic moves would
+        slide the cursor off-screen and force the user to scroll
+        manually — surprising for what reads as a navigation API.
         """
         # Build/refresh the visible list; visible_items honours the
         # dirty bit so this is a no-op if nothing changed.
@@ -3075,6 +3083,7 @@ class Browser:
             if entry.item.id == id_:
                 self._state.cursor = i
                 mark_cursor_changed(self)
+                self._snap_list_scroll_to_row(i)
                 pending._resolve()
                 return
         # Not visible. Best-effort: leave cursor alone and resolve.
