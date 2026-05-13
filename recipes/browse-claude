@@ -2314,72 +2314,26 @@ def _jump_to_voice(ctx, direction):
     matches the list ordering — ``+1`` walks down (older messages,
     since the list is newest-first), ``-1`` walks up (newer).
 
-    Cross-level navigation: works from session and subagent rows too,
-    not just from a message row. In those cases we know which child
-    list to search (the session's messages or the subagent's messages)
-    so we re-list it directly, find the first/last voice row, then
-    ``expand(parent).then(cursor_to(target))`` so the framework
-    surfaces the destination before the cursor jumps.
+    Walks the *visible* item list, not the on-disk tree. That means
+    jumps cross expanded subtree boundaries naturally — if two
+    sessions are expanded in the same project view, J keeps walking
+    past the end of one session's messages into the next session's.
+    Collapsed subtrees are simply skipped (their voice rows aren't
+    visible); the user can expand them with ``Right`` first if they
+    want to navigate inside.
     """
-    cur = ctx.cursor
-    if cur is None:
+    rows = ctx.visible_items
+    if not rows:
         return
-
-    kind = getattr(cur, 'kind', None)
-
-    # --- Message row: walk siblings from current position. ----------
-    if kind == 'message' or hasattr(cur, 'session_path'):
-        parent_id = cur.session_path
-        items = _list_messages(parent_id)
-        cur_n = getattr(cur, 'line_no', None)
-        start = next((i for i, it in enumerate(items)
-                      if getattr(it, 'line_no', None) == cur_n), None)
-        if start is None:
-            return
-        rng = (range(start + 1, len(items)) if direction > 0
-               else range(start - 1, -1, -1))
-        _cursor_to_first_voice(ctx, items, rng, parent_id=None)
-        return
-
-    # --- Session row (.jsonl): scan its messages. -------------------
-    if kind == 'session':
-        parent_id = cur.id
-        items = _list_messages(parent_id)
-        rng = (range(len(items)) if direction > 0
-               else range(len(items) - 1, -1, -1))
-        _cursor_to_first_voice(ctx, items, rng, parent_id=parent_id)
-        return
-
-    # --- Subagent group row: scan the agent's transcript. -----------
-    if kind == 'subagent':
-        parent_id = cur.id   # e.g. ``<session_path>#agent:<agent_id>``
-        items = _list_subagent_messages(parent_id)
-        rng = (range(len(items)) if direction > 0
-               else range(len(items) - 1, -1, -1))
-        _cursor_to_first_voice(ctx, items, rng, parent_id=parent_id)
-        return
-
-    # Project row or unknown — no useful voice target without diving
-    # into every nested session.
-    ctx.message('no voice to navigate from here')
-
-
-def _cursor_to_first_voice(ctx, items, rng, parent_id):
-    """Find the first item with ``row_bg`` in ``rng`` and move there.
-
-    When ``parent_id`` is non-None the target lives one level below
-    the cursor; we expand it first so the row is visible by the time
-    ``cursor_to`` runs. ``expand`` on an already-cached id resolves
-    immediately, so it's safe to call even when the row is in the
-    current visible list (the message-siblings case).
-    """
-    for j in rng:
-        if getattr(items[j], 'row_bg', None) is not None:
-            target = items[j].id
-            if parent_id is not None:
-                ctx.expand(parent_id).then(lambda: ctx.cursor_to(target))
-            else:
-                ctx.cursor_to(target)
+    start = ctx.cursor_index
+    rng = (range(start + 1, len(rows)) if direction > 0
+           else range(start - 1, -1, -1))
+    for i in rng:
+        item, kind = rows[i]
+        if kind != 'normal':
+            continue
+        if getattr(item, 'row_bg', None) is not None:
+            ctx.cursor_to(item.id)
             return
     ctx.message('no more voice messages this way')
 

@@ -267,41 +267,172 @@ class TestBrowseClaude(unittest.TestCase):
                 t.wait_for('▶ user', timeout=3.0)
                 t.send('q')
 
-    def test_J_from_session_row_jumps_into_messages(self):
-        """``J`` from a session row drills into the session's first voice.
+    def _make_two_sessions(self, tmp, *, expand_b=True):
+        """Project with two sessions, each holding 2 voice rows + machinery.
 
-        Mirrors how a user discovers a session and wants to skip the
-        bookkeeping rows above the actual conversation.
+        Layout chronologically (on disk) for each session:
+            voice_FIRST  →  tool_use  →  tool_result  →  voice_LAST
+
+        After reverse-time rendering, each session's children read:
+            voice_LAST, tool_result, tool_use, voice_FIRST
+
+        ``A`` is the older session, ``B`` is the newer. The list sorts
+        newest-first so B appears above A; ``expand_b`` controls whether
+        the B subtree is opened too (the cross-subtree tests need it,
+        the collapsed-tail test does not).
         """
-        import tempfile, json as _json
-        with tempfile.TemporaryDirectory() as tmp:
-            root = os.path.join(tmp, '.claude', 'projects')
-            proj = os.path.join(root, '-home-test-jk2')
-            os.makedirs(proj)
-            sess = os.path.join(proj, 'sess.jsonl')
-            with open(sess, 'w') as f:
-                # Newest-first when rendered, so chronologically: voice
-                # is the last on disk → first in the list.
+        import json as _json
+        root = os.path.join(tmp, '.claude', 'projects')
+        proj = os.path.join(root, '-home-test-jk-multi')
+        os.makedirs(proj)
+
+        def _write_session(path, label, mtime):
+            with open(path, 'w') as f:
                 f.write(_json.dumps({
-                    'type': 'permission-mode',
-                    'permissionMode': 'plan',
+                    'type': 'user',
+                    'message': {'role': 'user',
+                                'content': f'{label}_VOICE_FIRST'},
+                }) + '\n')
+                f.write(_json.dumps({
+                    'type': 'assistant',
+                    'message': {'role': 'assistant', 'content': [
+                        {'type': 'tool_use', 'name': 'Bash',
+                         'input': {'command': f'{label}_TOOLCALL'}},
+                    ]},
+                }) + '\n')
+                f.write(_json.dumps({
+                    'type': 'user',
+                    'message': {'role': 'user', 'content': [
+                        {'type': 'tool_result', 'tool_use_id': 'x',
+                         'content': f'{label}_TOOLRESULT'},
+                    ]},
+                    'toolUseResult': f'{label}_TOOLRESULT',
                 }) + '\n')
                 f.write(_json.dumps({
                     'type': 'user',
                     'message': {'role': 'user',
-                                'content': 'PROBE_SESSION_VOICE'},
+                                'content': f'{label}_VOICE_LAST'},
                 }) + '\n')
-            with TmuxFixture(cols=140, rows=30, env=self._launch_env(tmp)) as t:
+            os.utime(path, (mtime, mtime))
+
+        sess_a = os.path.join(proj, 'A-sess.jsonl')
+        sess_b = os.path.join(proj, 'B-sess.jsonl')
+        _write_session(sess_a, 'A', mtime=1000.0)
+        _write_session(sess_b, 'B', mtime=2000.0)   # newer → top
+        return proj, sess_a, sess_b
+
+    def test_J_forward_from_top_lands_on_first_voice(self):
+        """(1) Two expanded sessions; J from the top of the tree finds first voice.
+
+        Expand project → expand B (newer, top) → expand A. Then ``g``
+        sends cursor to the very first row (the project row); ``J``
+        walks forward across both session-row breadcrumbs and B's
+        machinery rows and lands on B's newest voice — the first voice
+        in display order.
+        """
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj, sess_a, sess_b = self._make_two_sessions(tmp)
+            with TmuxFixture(cols=160, rows=40, env=self._launch_env(tmp)) as t:
                 t.launch(_BIN, '--run-py', _RECIPE)
-                t.wait_for('/home/test/jk2')
+                t.wait_for('/home/test/jk/multi')
                 t.send('Right')                  # expand project
-                t.wait_for('sess', timeout=3.0)
-                t.send('Down')                   # cursor → session row
+                t.wait_for('B-sess')
+                t.send('Down')                   # cursor → B-sess
+                t.send('Right')                  # expand B
+                t.wait_for('B_VOICE_LAST')
+                # Walk down past B's 4 expanded rows to A-sess, expand A.
+                for _ in range(5):
+                    t.send('Down')
+                t.send('Right')                  # expand A
+                t.wait_for('A_VOICE_LAST')
+                # Cursor back to the top of the visible list.
+                t.send('g')
+                # First voice forward from the project row is B's newest
+                # message (B_VOICE_LAST — B's last on disk, first in
+                # the reverse-time render). cursor_to lands on it; the
+                # preview pane refreshes to the user voice renderer.
                 t.send('J')
-                # The framework should expand the session, find the
-                # voice row, move cursor onto it, and the preview pane
-                # should fill with the user-voice header.
+                cap = t.wait_for('▶ user', timeout=3.0)
+                self.assertIn('B_VOICE_LAST', cap)
+                t.send('q')
+
+    def test_K_backward_from_collapsed_tail_lands_on_last_voice(self):
+        """(2) Last visible row is a collapsed subtree; K skips back to last voice.
+
+        Cursor sits on A-sess (collapsed, bottom row). K walks upward
+        through B's expanded subtree and stops at the most recent voice
+        row above the cursor — which is B's *oldest* voice row
+        (B_VOICE_FIRST), since the list within B is newest-first and
+        we're walking up.
+        """
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj, sess_a, sess_b = self._make_two_sessions(tmp)
+            with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE)
+                t.wait_for('/home/test/jk/multi')
+                t.send('Right')                  # expand project
+                t.wait_for('A-sess')
+                t.send('Down')                   # cursor → B-sess (newer, top)
+                t.send('Right')                  # expand B
+                t.wait_for('B_VOICE_LAST')
+                # Now cursor is on B-sess (still). End jumps to last
+                # visible row, which is A-sess (collapsed at the bottom).
+                t.send('End')
+                t.wait_for('A-sess')             # already visible — just settle
+                # K should walk up past A-sess (kind=session, no row_bg),
+                # past B's tool_use/tool_result/older-text-rows, and
+                # land on the *closest voice above the cursor*, which is
+                # B_VOICE_FIRST (B's oldest voice row, appearing near
+                # the bottom of B's expansion).
+                t.send('K')
                 t.wait_for('▶ user', timeout=3.0)
+                cap = t.capture()
+                self.assertIn('B_VOICE_FIRST', cap)
+                t.send('q')
+
+    def test_JK_across_expanded_subtrees(self):
+        """(3) Both A and B expanded; J/K cross the subtree boundary."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj, sess_a, sess_b = self._make_two_sessions(tmp)
+            with TmuxFixture(cols=160, rows=40, env=self._launch_env(tmp)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE)
+                t.wait_for('/home/test/jk/multi')
+                t.send('Right')                  # expand project
+                t.wait_for('B-sess')
+                t.send('Down')                   # cursor → B-sess
+                t.send('Right')                  # expand B
+                t.wait_for('B_VOICE_LAST')
+                # Walk down past B's 4 rows to A-sess, then expand.
+                # B's expansion: 4 visible message rows. Down 5 times
+                # lands on A-sess. Down 1 more would go past it.
+                for _ in range(5):
+                    t.send('Down')
+                t.send('Right')                  # expand A
+                t.wait_for('A_VOICE_LAST')
+
+                # Now cursor is on A-sess. Move into B's oldest voice
+                # (B_VOICE_FIRST) — closest to the boundary between
+                # B's subtree and A-sess.
+                t.send('K')                      # K from A-sess
+                cap = t.wait_for('▶ user', timeout=3.0)
+                self.assertIn('B_VOICE_FIRST', cap)
+
+                # Forward across the boundary: J from B's last voice
+                # should cross A-sess (kind=session, skipped) and land
+                # on A's first voice in display order = A_VOICE_LAST
+                # (A's newest message, top of its expansion).
+                t.send('J')
+                cap = t.wait_for('A_VOICE_LAST', timeout=3.0)
+                # Preview pane should also have refreshed.
+                self.assertIn('▶ user', cap)
+
+                # And K from A_VOICE_LAST should return us to B_VOICE_FIRST.
+                t.send('K')
+                cap = t.wait_for('B_VOICE_FIRST', timeout=3.0)
+                self.assertIn('▶ user', cap)
                 t.send('q')
 
     def test_K_scrolls_viewport_to_keep_cursor_on_screen(self):
@@ -348,9 +479,13 @@ class TestBrowseClaude(unittest.TestCase):
                 t.send('Right')                  # expand project
                 t.wait_for('s', timeout=3.0)
                 t.send('Down')                   # cursor → session row
-                # From the session row, J drills into the newest voice.
+                t.send('Right')                  # expand session (J only walks visible)
+                t.wait_for('NEWER_VOICE')
+                # From the session row, J walks down through the
+                # visible expansion and lands on the first voice row
+                # (NEWER_VOICE, newest in reverse-time order).
                 t.send('J')
-                t.wait_for('NEWER_VOICE', timeout=3.0)
+                t.wait_for('▶ user', timeout=3.0)
                 # Now J again should jump past 50 machinery rows to the
                 # older voice. With only 20 rows in the pane, scroll
                 # MUST follow or the cursor leaves the screen — and

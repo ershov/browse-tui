@@ -6872,6 +6872,33 @@ class Context:
         return result
 
     @property
+    def visible_items(self) -> list:
+        """Visible rows in display order, as ``(Item, kind)`` tuples.
+
+        ``kind`` is one of ``'normal'``, ``'scope_root'``, ``'pending'``.
+        Reflects the current state of expanded / scoped subtrees, so a
+        row expanded by an earlier ``Right`` press shows up with its
+        children inline. ``ctx.cursor_index`` indexes this same list.
+
+        Useful for cross-subtree navigation primitives — e.g. an action
+        that wants to "jump to the next voice message anywhere visible"
+        walks this list rather than re-fetching a particular parent's
+        children.
+        """
+        state = self._browser._state
+        return [(e.item, e.kind) for e in visible_items(state)]
+
+    @property
+    def cursor_index(self) -> int:
+        """Index of the cursor row in ``visible_items``.
+
+        Returns the raw ``state.cursor`` value. Out-of-range or
+        on-a-placeholder cases are not filtered here — pair with
+        ``visible_items`` and check ``kind`` if you care.
+        """
+        return self._browser._state.cursor
+
+    @property
     def targets(self) -> list:
         """``selected`` if non-empty, else ``[cursor]`` if any, else ``[]``.
 
