@@ -206,6 +206,67 @@ class TestBrowseClaude(unittest.TestCase):
                 t.wait_for('hello world', timeout=3.0)
                 t.send('q')
 
+    def test_J_K_jump_between_voice_rows(self):
+        """``J``/``K`` skip over tool_use / tool_result / metadata rows.
+
+        Fixture mixes (newest-first as the list renders): asst-text,
+        asst-tool_use, user-tool_result, user-text. From the top
+        (asst-text, the newest voice row), one ``J`` should land on
+        user-text — skipping the two machinery rows between them.
+        """
+        import tempfile, json as _json
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, '.claude', 'projects')
+            proj = os.path.join(root, '-home-test-jk')
+            os.makedirs(proj)
+            sess = os.path.join(proj, 'jk1234.jsonl')
+            # Chronological order on disk; rendered list is reversed.
+            records = [
+                {'type': 'user',
+                 'message': {'role': 'user',
+                             'content': 'PROBE_USER_VOICE'}},
+                {'type': 'user',
+                 'message': {'role': 'user', 'content': [
+                     {'type': 'tool_result', 'tool_use_id': 'x',
+                      'content': 'PROBE_TOOL_RESULT'},
+                 ]},
+                 'toolUseResult': 'PROBE_TOOL_RESULT'},
+                {'type': 'assistant',
+                 'message': {'role': 'assistant', 'content': [
+                     {'type': 'tool_use', 'name': 'Bash',
+                      'input': {'command': 'PROBE_TOOL_USE'}},
+                 ]}},
+                {'type': 'assistant',
+                 'message': {'role': 'assistant', 'content': [
+                     {'type': 'text', 'text': 'PROBE_ASST_VOICE'},
+                 ]}},
+            ]
+            with open(sess, 'w') as f:
+                for r in records:
+                    f.write(_json.dumps(r) + '\n')
+            with TmuxFixture(cols=140, rows=30, env=self._launch_env(tmp)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE)
+                t.wait_for('/home/test/jk')
+                t.send('Right')
+                t.wait_for('jk1234')
+                t.send('Down')
+                t.send('Right')
+                # All four rows visible.
+                t.wait_for('PROBE_ASST_VOICE')
+                t.wait_for('PROBE_USER_VOICE')
+                # Move cursor onto the assistant voice row (newest, first).
+                t.send('Down')
+                # Now press J — should skip the two machinery rows below
+                # and land on the user voice row. We assert by reading the
+                # preview pane (which the recipe updates to match cursor)
+                # for the user prompt body.
+                t.send('J')
+                # The preview pane should now show the user's text body
+                # — "▶ user" header is in the renderer, the body is the
+                # PROBE marker.
+                t.wait_for('▶ user', timeout=3.0)
+                t.send('q')
+
     def test_user_assistant_rows_have_row_bg(self):
         """Conversational rows should render with ``\\e[48;5;...m`` bg stripes.
 

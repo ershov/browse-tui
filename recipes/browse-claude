@@ -2306,6 +2306,44 @@ def _action_show_id(ctx):
     ctx.message(f'id: {ctx.cursor.id}')
 
 
+def _jump_to_voice(ctx, direction):
+    """Move the cursor to the next/prev row with a row-bg highlight.
+
+    "Voice" rows are user prompts and assistant text replies (the
+    speech-only rows ``_is_voice`` marks via ``row_bg``). Direction
+    matches the list ordering — ``+1`` walks down (older messages,
+    since the list is newest-first), ``-1`` walks up (newer).
+    """
+    cur = ctx.cursor
+    if cur is None or not hasattr(cur, 'session_path'):
+        return
+    cur_n = getattr(cur, 'line_no', None)
+    if cur_n is None:
+        return
+    items = _list_messages(cur.session_path)
+    idx = next((i for i, it in enumerate(items)
+                if getattr(it, 'line_no', None) == cur_n), None)
+    if idx is None:
+        return
+    rng = (range(idx + 1, len(items)) if direction > 0
+           else range(idx - 1, -1, -1))
+    for j in rng:
+        if getattr(items[j], 'row_bg', None) is not None:
+            ctx.cursor_to(items[j].id)
+            return
+    ctx.message('no more voice messages this way')
+
+
+def _action_next_voice(ctx):
+    """Jump cursor down to the next user/assistant text row."""
+    _jump_to_voice(ctx, +1)
+
+
+def _action_prev_voice(ctx):
+    """Jump cursor up to the previous user/assistant text row."""
+    _jump_to_voice(ctx, -1)
+
+
 # ---- entry point ---------------------------------------------------------
 
 
@@ -2427,9 +2465,11 @@ def main():
         root_id=None,
         initial_scope=initial_scope,
         actions=[
-            Action('e', 'Edit/view source in $EDITOR',    _action_edit,    'cursor'),
-            Action('o', 'Edit/view source in $EDITOR',    _action_edit,    'cursor'),
-            Action('y', 'Show full id (paste-friendly)',  _action_show_id, 'cursor'),
+            Action('e', 'Edit/view source in $EDITOR',    _action_edit,       'cursor'),
+            Action('o', 'Edit/view source in $EDITOR',    _action_edit,       'cursor'),
+            Action('y', 'Show full id (paste-friendly)',  _action_show_id,    'cursor'),
+            Action('J', 'Jump to next voice (user/asst)', _action_next_voice, 'cursor'),
+            Action('K', 'Jump to prev voice (user/asst)', _action_prev_voice, 'cursor'),
         ],
         help_intro=_HELP_INTRO_TMPL.format(default=_MESSAGE_LIMIT),
     )
