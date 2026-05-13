@@ -14,6 +14,7 @@ NO_COLOR pathway is asserted by re-loading the module with the
 constants zeroed.
 """
 
+import datetime
 import importlib.util
 import os
 import sys
@@ -1078,6 +1079,42 @@ class TestMessageOrderReverse(unittest.TestCase):
             self.assertNotIn('older entries hidden', items[0].title)
         finally:
             os.unlink(path)
+
+
+class TestSubagentRowTag(unittest.TestCase):
+    """Subagent rows surface type · msg count · time-ago."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_tag_includes_relative_time(self):
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, '-x')
+            os.makedirs(proj)
+            sess_path = os.path.join(proj, 'parent-sid.jsonl')
+            open(sess_path, 'w').close()
+            sub_dir = os.path.join(proj, 'parent-sid', 'subagents')
+            os.makedirs(sub_dir)
+            agent_path = os.path.join(sub_dir, 'agent-A1.jsonl')
+            with open(agent_path, 'w') as f:
+                f.write('{}\n')
+            with open(os.path.join(sub_dir, 'agent-A1.meta.json'), 'w') as f:
+                _json.dump({'agentType': 'general-purpose',
+                            'description': 'do the thing'}, f)
+            # Pin mtime so the relative-time formatter is deterministic.
+            ts = datetime.datetime.now().timestamp() - 3 * 3600  # 3h ago
+            os.utime(agent_path, (ts, ts))
+
+            rows = self.r._list_subagents_for_session(sess_path)
+            self.assertEqual(len(rows), 1)
+            row = rows[0]
+            # Tag should still carry type and msg count, plus the time.
+            self.assertIn('general-purpose', row.tag)
+            self.assertIn('1 msg', row.tag)
+            self.assertIn('3h ago', row.tag)
 
 
 class TestRowBgForKind(unittest.TestCase):

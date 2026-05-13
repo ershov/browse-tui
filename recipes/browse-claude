@@ -580,7 +580,7 @@ def _list_subagents_for_session(session_jsonl_path):
         item = Item(
             id=f'{session_jsonl_path}#agent:{agent_id}',
             title=title,
-            tag=f'{agent_type} · {count} msg',
+            tag=f'{agent_type} · {count} msg · {_human_time(st.st_mtime)}',
             tag_style='magenta',
             has_children=count > 0,
         )
