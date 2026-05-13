@@ -1135,6 +1135,68 @@ class TestRowBgForKind(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_assistant_tool_use_only_has_no_bg(self):
+        # Tool calls are machinery, not voice — even though kind=='assistant'.
+        path = self._write([
+            {'type': 'assistant',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'name': 'Bash',
+                  'input': {'command': 'ls'}},
+             ]}},
+        ])
+        try:
+            items = self.r._list_messages(path)
+            self.assertIsNone(getattr(items[0], 'row_bg', None))
+        finally:
+            os.unlink(path)
+
+    def test_user_tool_result_only_has_no_bg(self):
+        # Tool results are machinery too — kind=='user' but no speech.
+        path = self._write([
+            {'type': 'user',
+             'message': {'role': 'user', 'content': [
+                 {'type': 'tool_result', 'tool_use_id': 'x',
+                  'content': 'output'},
+             ]},
+             'toolUseResult': 'output'},
+        ])
+        try:
+            items = self.r._list_messages(path)
+            self.assertIsNone(getattr(items[0], 'row_bg', None))
+        finally:
+            os.unlink(path)
+
+    def test_assistant_with_text_and_tool_use_gets_bg(self):
+        # Mixed content (text + tool_use) still counts as voice.
+        path = self._write([
+            {'type': 'assistant',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'text', 'text': "I'll run this."},
+                 {'type': 'tool_use', 'name': 'Bash',
+                  'input': {'command': 'ls'}},
+             ]}},
+        ])
+        try:
+            items = self.r._list_messages(path)
+            self.assertEqual(getattr(items[0], 'row_bg', None), 17)
+        finally:
+            os.unlink(path)
+
+    def test_assistant_thinking_only_has_no_bg(self):
+        # A thinking-only assistant step (no text yielded) isn't speech.
+        path = self._write([
+            {'type': 'assistant',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'thinking', 'thinking': 'pondering...',
+                  'signature': 'sig'},
+             ]}},
+        ])
+        try:
+            items = self.r._list_messages(path)
+            self.assertIsNone(getattr(items[0], 'row_bg', None))
+        finally:
+            os.unlink(path)
+
 
 class TestProjectOrdering(unittest.TestCase):
     """Projects sort by latest .jsonl mtime, not directory mtime."""

@@ -688,13 +688,15 @@ def _list_messages(jsonl_path, limit=None):
         item.line_no = n
         item.session_path = jsonl_path
         item.message_kind = kind
-        # Stripe user/assistant turns so the conversational pulse is
-        # readable at a glance. tag_style + the colored kind already
-        # mark every row; the row-bg adds a softer ambient signal that
-        # survives even when the kind/tag is cropped.
-        bg = _ROW_BG_FOR_KIND.get(kind)
-        if bg is not None:
-            item.row_bg = bg
+        # Stripe rows that carry actual *speech* — the user typing, or
+        # the assistant's text reply. Tool calls (assistant tool_use)
+        # and tool results (user tool_result) are machinery, not voice,
+        # so they keep the default no-bg look even though their record
+        # type is user/assistant.
+        if _is_voice(obj):
+            bg = _ROW_BG_FOR_KIND.get(kind)
+            if bg is not None:
+                item.row_bg = bg
         out.append(item)
 
     if truncated:
@@ -766,6 +768,31 @@ _ROW_BG_FOR_KIND = {
     'user':      235,
     'assistant':  17,
 }
+
+
+def _is_voice(obj):
+    """True iff this record carries actual *speech* (text content).
+
+    The conversational stripe should highlight only what the user or
+    assistant literally *said*. A user record whose content is just a
+    tool_result wrapper, or an assistant record whose only content is
+    a tool_use call, is machinery — kind/tag already calls it out, we
+    don't want to dye those rows.
+    """
+    t = obj.get('type')
+    if t not in ('user', 'assistant'):
+        return False
+    msg = obj.get('message') if isinstance(obj.get('message'), dict) else {}
+    content = msg.get('content', '')
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        for p in content:
+            if isinstance(p, dict) and p.get('type') == 'text':
+                if (p.get('text') or '').strip():
+                    return True
+        return False
+    return False
 
 
 def _kind_of(obj):
