@@ -8499,7 +8499,9 @@ def dispatch_key(browser, ctx: 'Context', key: str) -> bool:
         if key == 'enter':
             _search_next(ctx)
             return True
-        if key == 'shift-enter':
+        # Alt-Enter is offered alongside Shift-Enter for terminals that
+        # swallow Shift+Enter (many of them do).
+        if key in ('shift-enter', 'alt-enter'):
             _search_prev(ctx)
             return True
         if key == 'backspace':
@@ -8508,6 +8510,29 @@ def dispatch_key(browser, ctx: 'Context', key: str) -> bool:
             browser._needs_redraw.add('list')
             if browser._search_query:
                 _search_jump_nearest(browser)
+            return True
+        # Ctrl-W kills the last whitespace-delimited word (readline
+        # convention): strip trailing spaces, then strip the trailing
+        # run of non-space chars. Idempotent on an empty / all-space
+        # query.
+        if key == 'ctrl-w':
+            q = browser._search_query
+            i = len(q)
+            while i > 0 and q[i - 1] == ' ':
+                i -= 1
+            while i > 0 and q[i - 1] != ' ':
+                i -= 1
+            browser._search_query = q[:i]
+            browser._needs_redraw.add('info')
+            browser._needs_redraw.add('list')
+            if browser._search_query:
+                _search_jump_nearest(browser)
+            return True
+        # Ctrl-U clears the whole query (line-kill).
+        if key == 'ctrl-u':
+            browser._search_query = ''
+            browser._needs_redraw.add('info')
+            browser._needs_redraw.add('list')
             return True
         # Single printable characters extend the query. ``space`` is the
         # special name read_key returns for the spacebar; treat it like a
@@ -8524,10 +8549,14 @@ def dispatch_key(browser, ctx: 'Context', key: str) -> bool:
             browser._needs_redraw.add('list')
             _search_jump_nearest(browser)
             return True
-        # Other keys (arrows, ctrl-* etc.) are ignored while typing a
-        # search query — phase 2 may wire some of them (e.g. up/down to
-        # navigate match results) but phase 1 is conservative.
-        return False
+        # Multi-char key names (arrows, pgdn/pgup, home/end, ctrl-*,
+        # alt-*, etc.) fall through to the normal-mode dispatch below so
+        # the list-pane navigation keys keep working while the user is
+        # composing a query. Mouse events fall through harmlessly — the
+        # mouse-dispatch branch above is gated on ``not _search_mode``
+        # and the keymap has no binding for ``mouse-click:R:C``, so the
+        # event ends up silently dropped (preserves the prior
+        # search-mode-swallows-mouse contract).
 
     # Enter handling — outside search mode this falls to on_enter.
     if key == 'enter':

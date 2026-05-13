@@ -274,6 +274,121 @@ class TestSearchModeDispatch(unittest.TestCase):
         finally:
             b.stop_workers()
 
+    def test_alt_enter_jumps_to_previous_like_shift_enter(self):
+        # Alt-Enter is bound alongside Shift-Enter (terminals that swallow
+        # the latter still have a way to walk matches backwards).
+        b = self._browser_with_items(['foo-a', 'bar', 'foo-b', 'foo-c'])
+        b._search_mode = True
+        b._search_query = 'foo'
+        b._state.cursor = 2
+        try:
+            ctx = _ctx_for(b)
+            dispatch_key(b, ctx, 'alt-enter')
+            # Previous match before idx 2 is idx 0.
+            self.assertEqual(b._state.cursor, 0)
+            dispatch_key(b, ctx, 'alt-enter')
+            # Wraps to idx 3.
+            self.assertEqual(b._state.cursor, 3)
+        finally:
+            b.stop_workers()
+
+    def test_ctrl_w_kills_trailing_word(self):
+        b = self._browser_with_items(['foo'])
+        b._search_mode = True
+        b._search_query = 'foo bar'
+        try:
+            ctx = _ctx_for(b)
+            self.assertTrue(dispatch_key(b, ctx, 'ctrl-w'))
+            # Strip trailing 'bar' — trailing-space convention keeps the
+            # ' ' before so the user can keep typing a new fragment.
+            self.assertEqual(b._search_query, 'foo ')
+            self.assertTrue(dispatch_key(b, ctx, 'ctrl-w'))
+            # Now strip the lone trailing space + 'foo'.
+            self.assertEqual(b._search_query, '')
+        finally:
+            b.stop_workers()
+
+    def test_ctrl_w_strips_trailing_spaces_then_word(self):
+        # Readline convention: ctrl-w on "foo bar   " (trailing spaces)
+        # consumes the spaces AND the next word in one stroke.
+        b = self._browser_with_items(['foo'])
+        b._search_mode = True
+        b._search_query = 'foo bar   '
+        try:
+            ctx = _ctx_for(b)
+            dispatch_key(b, ctx, 'ctrl-w')
+            self.assertEqual(b._search_query, 'foo ')
+        finally:
+            b.stop_workers()
+
+    def test_ctrl_w_on_empty_query_is_noop(self):
+        b = self._browser_with_items(['foo'])
+        b._search_mode = True
+        b._search_query = ''
+        try:
+            ctx = _ctx_for(b)
+            self.assertTrue(dispatch_key(b, ctx, 'ctrl-w'))
+            self.assertEqual(b._search_query, '')
+        finally:
+            b.stop_workers()
+
+    def test_ctrl_u_clears_query(self):
+        b = self._browser_with_items(['foo'])
+        b._search_mode = True
+        b._search_query = 'foo bar baz'
+        try:
+            ctx = _ctx_for(b)
+            self.assertTrue(dispatch_key(b, ctx, 'ctrl-u'))
+            self.assertEqual(b._search_query, '')
+            # Stays in search mode (just the line was killed).
+            self.assertTrue(b._search_mode)
+        finally:
+            b.stop_workers()
+
+    def test_arrow_down_navigates_during_search(self):
+        # Non-letter navigation keys fall through to the normal dispatch
+        # so the user can still walk the list while a query is composed.
+        b = self._browser_with_items(['a', 'b', 'c', 'd'])
+        b._search_mode = True
+        b._search_query = ''
+        b._state.cursor = 0
+        try:
+            ctx = _ctx_for(b)
+            self.assertTrue(dispatch_key(b, ctx, 'down'))
+            self.assertEqual(b._state.cursor, 1)
+            self.assertTrue(dispatch_key(b, ctx, 'down'))
+            self.assertEqual(b._state.cursor, 2)
+            # Query stays empty — arrow keys do not extend it.
+            self.assertEqual(b._search_query, '')
+            # Still in search mode.
+            self.assertTrue(b._search_mode)
+        finally:
+            b.stop_workers()
+
+    def test_pgdn_navigates_during_search(self):
+        b = self._browser_with_items([f'item-{i}' for i in range(50)])
+        b._search_mode = True
+        b._state.cursor = 0
+        try:
+            ctx = _ctx_for(b)
+            self.assertTrue(dispatch_key(b, ctx, 'pgdn'))
+            # PgDn moves by a page. Cursor must have advanced past 0.
+            self.assertGreater(b._state.cursor, 0)
+            self.assertTrue(b._search_mode)
+        finally:
+            b.stop_workers()
+
+    def test_home_navigates_during_search(self):
+        b = self._browser_with_items(['a', 'b', 'c', 'd'])
+        b._search_mode = True
+        b._state.cursor = 3
+        try:
+            ctx = _ctx_for(b)
+            self.assertTrue(dispatch_key(b, ctx, 'home'))
+            self.assertEqual(b._state.cursor, 0)
+        finally:
+            b.stop_workers()
+
     def test_backspace_re_jumps_to_match(self):
         # After deleting a char, the cursor should land on a match for
         # the trimmed query. ``_search_jump_nearest`` passes ``cursor-1``
