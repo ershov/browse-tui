@@ -206,6 +206,31 @@ class TestBrowseClaude(unittest.TestCase):
                 t.wait_for('hello world', timeout=3.0)
                 t.send('q')
 
+    def test_user_assistant_rows_have_row_bg(self):
+        """Conversational rows should render with ``\\e[48;5;...m`` bg stripes.
+
+        Verifies the recipe's ``_ROW_BG_FOR_KIND`` + the framework's
+        ``_write_segments(row_bg=…)`` plumbing end-to-end. Captures
+        the tmux pane with ``-e`` (colors) and asserts the 256-color
+        background SGR for user (235) appears in the output.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            # Fixture has a user message; drill in to see it as a row.
+            _make_fake_claude(tmp)
+            with TmuxFixture(cols=140, rows=30, env=self._launch_env(tmp)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE)
+                t.wait_for('/home/test/project')
+                t.send('Right')
+                t.wait_for('abcd1234-deadbeef')
+                t.send('Down')
+                t.send('Right')
+                t.wait_for('hello world', timeout=3.0)
+                colored = t.capture(colors=True)
+                # The user-voice bg colour code we configured for browse-claude.
+                self.assertIn('48;5;235', colored,
+                              'expected user-row bg escape in colored capture')
+                t.send('q')
+
     def test_drills_into_subagent(self):
         """Expanding a subagent reveals its own transcript lines.
 

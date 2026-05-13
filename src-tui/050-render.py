@@ -860,7 +860,7 @@ def _truncate_by_cells(s, max_cols):
     return (''.join(out), cells)
 
 
-def _write_segments(segments, max_width, *, pad_to=0):
+def _write_segments(segments, max_width, *, pad_to=0, row_bg=None):
     """Emit ``segments`` to the terminal, truncating at ``max_width`` cells.
 
     Each segment is a ``(text, fg, bold)`` triple. ``fg=None`` and
@@ -868,6 +868,12 @@ def _write_segments(segments, max_width, *, pad_to=0):
     sequences emitted, no reset). When fg or bold is set, we wrap the
     chunk in ``set_style`` / ``reset_style`` so adjacent segments don't
     bleed colours.
+
+    ``row_bg`` (256-color int, optional) applies a background colour to
+    every chunk *and* extends it across the trailing pad — turning the
+    whole row into a coloured stripe. Recipes set ``item.row_bg`` on
+    Items they want to call out (e.g. user/assistant turns in
+    browse-claude); the list renderer threads it through here.
 
     Width is measured in *visible cells* (wide-char aware) so rows
     containing CJK / emoji / other East Asian wide chars truncate and
@@ -884,16 +890,27 @@ def _write_segments(segments, max_width, *, pad_to=0):
         chunk, chunk_cells = _truncate_by_cells(text, remaining)
         if not chunk:
             continue
-        if fg is not None or bold:
-            set_style(fg=fg, bold=bold)
+        if fg is not None or bold or row_bg is not None:
+            set_style(fg=fg, bg=row_bg, bold=bold)
             write(chunk)
             reset_style()
         else:
             write(chunk)
         pos += chunk_cells
-    if pad_to > pos:
-        write(' ' * (pad_to - pos))
-        pos = pad_to
+    # ``row_bg`` extends the highlight across the trailing pad so the
+    # row reads as a stripe rather than a tag-shaped patch. We bump
+    # ``pad_to`` up to ``max_width`` in that case, but only locally —
+    # callers that didn't ask for a stripe keep the existing behaviour
+    # (no extra padding, let ``end_row`` handle pane-edge fill).
+    effective_pad = pad_to if row_bg is None else max(pad_to, max_width)
+    if effective_pad > pos:
+        if row_bg is not None:
+            set_style(bg=row_bg)
+            write(' ' * (effective_pad - pos))
+            reset_style()
+        else:
+            write(' ' * (effective_pad - pos))
+        pos = effective_pad
     return pos
 
 
@@ -1299,7 +1316,10 @@ def render_list(browser, rect, *, rightmost: bool = False):
                     search_query=browser._search_query,
                 )
             else:
-                _write_segments(segments, width)
+                _write_segments(
+                    segments, width,
+                    row_bg=getattr(item, 'row_bg', None),
+                )
         end_row()
 
 

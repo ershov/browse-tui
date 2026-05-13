@@ -688,6 +688,13 @@ def _list_messages(jsonl_path, limit=None):
         item.line_no = n
         item.session_path = jsonl_path
         item.message_kind = kind
+        # Stripe user/assistant turns so the conversational pulse is
+        # readable at a glance. tag_style + the colored kind already
+        # mark every row; the row-bg adds a softer ambient signal that
+        # survives even when the kind/tag is cropped.
+        bg = _ROW_BG_FOR_KIND.get(kind)
+        if bg is not None:
+            item.row_bg = bg
         out.append(item)
 
     if truncated:
@@ -746,6 +753,18 @@ _TAG_STYLE_FOR_KIND = {
     'marble-origami-commit':      'dim',
     'marble-origami-snapshot':    'dim',
     'progress':                   'dim',
+}
+
+
+# Row-background highlights for the conversational pulse — applied via
+# ``item.row_bg`` so the framework's _write_segments paints the whole
+# row (incl. trailing pad) in the colour. Subtle 256-colour cells
+# chosen to read on dark terminals without overpowering the foreground:
+#   235 = #262626 (near-black neutral) for user prompts
+#    17 = #00005f (deep blue)           for assistant responses
+_ROW_BG_FOR_KIND = {
+    'user':      235,
+    'assistant':  17,
 }
 
 

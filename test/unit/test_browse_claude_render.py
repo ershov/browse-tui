@@ -1080,6 +1080,62 @@ class TestMessageOrderReverse(unittest.TestCase):
             os.unlink(path)
 
 
+class TestRowBgForKind(unittest.TestCase):
+    """User/assistant message rows get a row-bg highlight."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _write(self, records):
+        import json as _json
+        import tempfile
+        f = tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False)
+        for r in records:
+            f.write(_json.dumps(r) + '\n')
+        f.close()
+        return f.name
+
+    def test_user_row_has_bg(self):
+        path = self._write([
+            {'type': 'user', 'message': {'role': 'user', 'content': 'hi'}},
+        ])
+        try:
+            items = self.r._list_messages(path)
+            self.assertEqual(getattr(items[0], 'row_bg', None), 235)
+        finally:
+            os.unlink(path)
+
+    def test_assistant_row_has_bg(self):
+        path = self._write([
+            {'type': 'assistant',
+             'message': {'role': 'assistant',
+                         'content': [{'type': 'text', 'text': 'hi'}]}},
+        ])
+        try:
+            items = self.r._list_messages(path)
+            self.assertEqual(getattr(items[0], 'row_bg', None), 17)
+        finally:
+            os.unlink(path)
+
+    def test_other_kinds_have_no_bg(self):
+        path = self._write([
+            {'type': 'attachment',
+             'attachment': {'type': 'file', 'displayPath': '/x',
+                            'filename': '/x', 'content': ''}},
+            {'type': 'system', 'subtype': 'turn_duration',
+             'durationMs': 1, 'messageCount': 1},
+            {'type': 'permission-mode', 'permissionMode': 'plan'},
+        ])
+        try:
+            items = self.r._list_messages(path)
+            for it in items:
+                self.assertIsNone(getattr(it, 'row_bg', None),
+                                  f'{it.title!r} should have no row_bg')
+        finally:
+            os.unlink(path)
+
+
 class TestProjectOrdering(unittest.TestCase):
     """Projects sort by latest .jsonl mtime, not directory mtime."""
 
