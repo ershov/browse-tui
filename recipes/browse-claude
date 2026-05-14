@@ -3301,18 +3301,59 @@ def _ancestor_ids_for(item_id):
     Walks the **tree** parent map built in ``_scan_tree``, not the on-
     disk ``parentUuid`` chain. The on-disk chain is a write-time linked
     list (see ``sessionStorage.ts:1066``) that has nothing to do with
-    the displayed tree shape. For records *inside* a subagent's
-    ``.jsonl``, the chain also includes the outer
-    ``<parent_session_path>#agent:<aid>`` group row — without that,
-    cursor_to can't make the row visible after a t-toggle wipes the
-    cached children. Empty list for span/agent ids (those are
-    top-level) and for ids the scan can't resolve.
+    the displayed tree shape.
+
+    Crosses file boundaries:
+
+      * For records inside a subagent's ``.jsonl``, the chain continues
+        into the OUTER session's tree — first up to the
+        ``<parent_session_path>#agent:<aid>`` subagent group row, then
+        further into that group's own ancestors (the assistant whose
+        ``Task`` tool_use dispatched the subagent, and that assistant's
+        turn root, and the parent session itself).
+      * Span umbrellas inside a subagent are top-level there, but still
+        sit under the outer subagent group — same prepend rule.
+      * Agent group ids are top-level inside the parent session but
+        nest under the dispatching assistant in tree mode — the ``Task``
+        tool_use's owning assistant row is their parent.
+
+    Without this full walk a t-toggle from inside a subagent (where
+    refresh wiped the cached children) can't reach the outer chain,
+    leaves it un-expanded, and cursor_to fails to find the target row
+    in the visible list.
     """
     if not isinstance(item_id, str) or '#' not in item_id:
         return []
-    if '#agent:' in item_id or '#span:' in item_id:
-        # Synthetic top-level rows — no ancestors.
-        return []
+
+    # Agent group row: parent is the assistant that dispatched it.
+    if '#agent:' in item_id:
+        parent_session_path, _, aid = item_id.partition('#agent:')
+        if not os.path.isfile(parent_session_path):
+            return []
+        ptd = _scan_tree(parent_session_path)
+        asst_uuid = None
+        for link in ptd.agent_link.values():
+            if link.get('agent_id') == aid:
+                asst_uuid = link.get('assistant_uuid')
+                break
+        if asst_uuid is None:
+            return []
+        line = ptd.line_of.get(asst_uuid)
+        if line is None:
+            return []
+        parent_id = f'{parent_session_path}#{line}'
+        return _ancestor_ids_for(parent_id) + [parent_id]
+
+    # Span umbrella: top-level inside its file, but if that file is a
+    # subagent jsonl, prepend the outer subagent group's chain.
+    if '#span:' in item_id:
+        path, _, _ = item_id.partition('#span:')
+        outer = _outer_subagent_group_id(path)
+        if outer is None:
+            return []
+        return _ancestor_ids_for(outer) + [outer]
+
+    # Regular message id: walk parent_id_of within its own file.
     path, _, lineno = item_id.rpartition('#')
     try:
         n = int(lineno)
@@ -3321,7 +3362,7 @@ def _ancestor_ids_for(item_id):
     if not os.path.isfile(path):
         return []
     td = _scan_tree(path)
-    chain = []
+    chain_child_first = []
     seen = set()
     cur = n
     while cur in td.parent_id_of:
@@ -3329,8 +3370,7 @@ def _ancestor_ids_for(item_id):
         if parent_id in seen:
             break
         seen.add(parent_id)
-        chain.append(parent_id)
-        # Span / agent ids are top-level — stop walking.
+        chain_child_first.append(parent_id)
         if '#span:' in parent_id or '#agent:' in parent_id:
             break
         _, _, parent_line = parent_id.rpartition('#')
@@ -3338,12 +3378,30 @@ def _ancestor_ids_for(item_id):
             cur = int(parent_line)
         except ValueError:
             break
-    # If this is a subagent path, prepend the outer subagent-group row
-    # so the chain reaches all the way to the OUTER session's tree.
-    outer = _outer_subagent_group_id(path)
-    if outer is not None and outer not in seen:
-        chain.append(outer)
-    return list(reversed(chain))
+    chain = list(reversed(chain_child_first))
+
+    if chain:
+        top = chain[0]
+        if '#span:' in top or '#agent:' in top:
+            # Top jumps to a synthetic row (span umbrella / agent
+            # group) — recurse to walk that row's own ancestors,
+            # which may cross a file boundary.
+            chain = _ancestor_ids_for(top) + chain
+        else:
+            # Top is a regular message in the same file. If this file
+            # is a subagent jsonl, the topmost in-file row still nests
+            # under the outer subagent group — prepend that chain.
+            outer = _outer_subagent_group_id(path)
+            if outer is not None:
+                chain = _ancestor_ids_for(outer) + [outer] + chain
+    else:
+        # Record is itself a top-level row within its file (turn root
+        # / standalone meta). If the file is a subagent, prepend the
+        # outer subagent group's chain.
+        outer = _outer_subagent_group_id(path)
+        if outer is not None:
+            chain = _ancestor_ids_for(outer) + [outer]
+    return chain
 
 
 def _chain_expand_then_cursor(b, ancestor_ids, target_id):

@@ -1225,6 +1225,74 @@ class TestAncestorIdsForSubagent(unittest.TestCase):
             # Direct parent is the turn root; no outer subagent group.
             self.assertEqual(ancestors, [f'{sess_path}#0'])
 
+    def test_full_chain_crosses_file_boundary(self):
+        # Parent session: u1 (turn root) → a1 (Task tool_use) → u2 (tool_result).
+        # Subagent: su1 (turn root) → sa1 (assistant text).
+        # Ancestors of sa1 (deepest, line 1 in subagent) should walk:
+        #   parent: ... → turn root (u1, line 0 of parent)
+        #          → assistant a1 (line 1 of parent, dispatcher)
+        #          → subagent group (#agent:AGENT01)
+        #          → su1 (line 0 of subagent, turn root inside)
+        #   → sa1 itself (target, not included)
+        import json as _json
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix='subagent-chain-')
+        try:
+            sess_path = os.path.join(tmp, 'parent.jsonl')
+            with open(sess_path, 'w') as f:
+                f.write(_json.dumps({
+                    'type': 'user', 'uuid': 'u1',
+                    'message': {'role': 'user', 'content': 'dispatch'},
+                }) + '\n')
+                f.write(_json.dumps({
+                    'type': 'assistant', 'uuid': 'a1',
+                    'message': {'role': 'assistant', 'content': [
+                        {'type': 'tool_use', 'id': 'toolu_x',
+                         'name': 'Task',
+                         'input': {'prompt': 'go', 'subagent_type': 'Explore'}},
+                    ]},
+                }) + '\n')
+                f.write(_json.dumps({
+                    'type': 'user', 'uuid': 'u2',
+                    'message': {'role': 'user', 'content': [
+                        {'type': 'tool_result', 'tool_use_id': 'toolu_x',
+                         'content': 'done'},
+                    ]},
+                    'toolUseResult': {'agentId': 'AGENT01',
+                                      'agentType': 'Explore',
+                                      'status': 'completed'},
+                }) + '\n')
+            sub_dir = os.path.join(tmp, 'parent', 'subagents')
+            os.makedirs(sub_dir)
+            agent_path = os.path.join(sub_dir, 'agent-AGENT01.jsonl')
+            with open(agent_path, 'w') as f:
+                f.write(_json.dumps({
+                    'type': 'user', 'uuid': 'su1',
+                    'message': {'role': 'user', 'content': 'inside go'},
+                }) + '\n')
+                f.write(_json.dumps({
+                    'type': 'assistant', 'uuid': 'sa1',
+                    'message': {'role': 'assistant', 'content': [
+                        {'type': 'text', 'text': 'inside reply'},
+                    ]},
+                }) + '\n')
+
+            chain = self.r._ancestor_ids_for(f'{agent_path}#1')
+            # Expect (root → leaf):
+            #   parent's turn root (u1 at line 0)
+            #   parent's assistant a1 at line 1 (Task dispatcher)
+            #   subagent group #agent:AGENT01
+            #   subagent's turn root (su1 at line 0)
+            self.assertEqual(chain, [
+                f'{sess_path}#0',
+                f'{sess_path}#1',
+                f'{sess_path}#agent:AGENT01',
+                f'{agent_path}#0',
+            ])
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_outer_subagent_group_id_helper(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
