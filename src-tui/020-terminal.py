@@ -507,6 +507,29 @@ def term_resume():
 
 # ---- keystroke reader -----------------------------------------------------
 
+def input_ready():
+    """Return True iff more keyboard input is buffered on stdin right now.
+
+    Non-blocking poll (``select`` with a zero timeout). Used by the main
+    loop to coalesce a burst of keystrokes (e.g. a held-down arrow or a
+    pasted command) into a single render — dispatch the queued keys
+    back-to-back, paint once at the end.
+
+    Watches stdin only — the notification pipe is intentionally NOT
+    polled here so async worker deliveries break the coalescing loop
+    and the next outer iteration sees their state changes.
+    """
+    fd = sys.stdin.fileno()
+    while True:
+        try:
+            r, _, _ = select.select([fd], [], [], 0)
+            return bool(r)
+        except OSError as e:
+            if e.errno == errno.EINTR:
+                continue
+            raise
+
+
 def read_key():
     """Read one keystroke and return a string name for it.
 

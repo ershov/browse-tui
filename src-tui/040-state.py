@@ -1093,6 +1093,18 @@ _LIST_RATIO_MIN = 0.005
 _LIST_RATIO_MAX = 0.995
 
 
+# Input-burst coalescing budget. The main loop dispatches the first key
+# that wakes ``read_key``, then drains any keystrokes already buffered
+# on stdin (peeked via ``input_ready``) and dispatches each without re-
+# rendering. The render fires once when the burst ends. Without a
+# bound, a pasted command or a stuck-down key could starve the paint
+# indefinitely; these caps guarantee an intermediate frame after at
+# most ``_INPUT_BURST_MAX_KEYS`` keys or ``_INPUT_BURST_MAX_SECONDS``
+# of wall time, whichever comes first.
+_INPUT_BURST_MAX_KEYS = 64
+_INPUT_BURST_MAX_SECONDS = 0.016
+
+
 def _clamp_list_ratio(r: float) -> float:
     """Pin ``r`` into the valid ratio range. NaN / non-numeric → default."""
     try:
@@ -2927,31 +2939,33 @@ class Browser:
                     # Worker delivered something; loop and drain.
                     continue
 
-                # Dispatch the key to the action layer. Insert-mode is
-                # the most-special branch (placement marker movement),
-                # then search-mode + normal-mode dispatch live in
-                # dispatch_key.
-                #
-                # Snapshot the active list row before dispatch so we
-                # can snap the viewport back to follow the cursor when
-                # a key actually moved it. Wheel-scroll handlers leave
-                # the cursor alone, so the comparison is False and
-                # ``_list_scroll`` keeps the user's scrolled position.
-                prev_row = self._active_list_row()
-                prev_insert = self._insert_mode
-                if self._insert_mode:
-                    _handle_insert_key(self, ctx, key)
-                else:
-                    dispatch_key(self, ctx, key)
-                new_row = self._active_list_row()
-                if prev_insert != self._insert_mode or new_row != prev_row:
-                    self._snap_list_scroll_to_row(new_row)
-
-                # Trigger preview + children fetches for the (possibly
-                # moved) cursor before the next render pass. The
-                # children fetch populates the children-grid pane.
-                self._update_preview_for_cursor()
-                self._update_children_for_cursor()
+                # Dispatch the key. Then coalesce any keystrokes already
+                # buffered on stdin into the same render cycle — a held-
+                # down arrow or a paste burst dispatches all queued keys
+                # back-to-back and the outer loop renders once at the
+                # end. Bounded by ``_INPUT_BURST_MAX_KEYS`` and
+                # ``_INPUT_BURST_MAX_SECONDS`` so an endless input
+                # stream still yields intermediate frames.
+                self._handle_one_key(ctx, key)
+                burst_count = 1
+                burst_deadline = time.monotonic() + _INPUT_BURST_MAX_SECONDS
+                while (not self._quit_requested
+                        and burst_count < _INPUT_BURST_MAX_KEYS
+                        and time.monotonic() < burst_deadline
+                        and input_ready()):
+                    try:
+                        key = read_key()
+                    except KeyboardInterrupt:
+                        key = 'ctrl-c'
+                    # Worker delivery during the burst: let the outer
+                    # loop drain + render so the delivered state lands
+                    # on the next paint. (Signals like SIGWINCH set
+                    # globals checked at the top of the outer loop, so
+                    # they too get picked up there.)
+                    if key == '_notify':
+                        break
+                    self._handle_one_key(ctx, key)
+                    burst_count += 1
         finally:
             if not self._headless:
                 term_restore()
@@ -3082,6 +3096,39 @@ class Browser:
         if self._insert_mode:
             return self._insert_pos
         return self._state.cursor
+
+    def _handle_one_key(self, ctx, key) -> None:
+        """Dispatch one keystroke and run the per-key bookkeeping.
+
+        Snapshots the on-screen cursor row before dispatch so the
+        viewport snaps back to follow the cursor when the key actually
+        moved it (wheel-scroll handlers leave the cursor alone, so the
+        comparison is False and ``_list_scroll`` keeps the user's
+        scrolled position). After dispatch, kicks the idempotent
+        preview / children fetches for the new cursor.
+
+        Used by the main loop's burst-coalescing loop: dispatch the
+        first key, then keep calling this for each additional key
+        already buffered on stdin before the outer loop renders. The
+        per-key worker fetches stay live during the burst because
+        they're keyed by cursor id (not invocation count) and gated
+        cheaply.
+        """
+        prev_row = self._active_list_row()
+        prev_insert = self._insert_mode
+        if self._insert_mode:
+            _handle_insert_key(self, ctx, key)
+        else:
+            dispatch_key(self, ctx, key)
+        new_row = self._active_list_row()
+        if prev_insert != self._insert_mode or new_row != prev_row:
+            self._snap_list_scroll_to_row(new_row)
+
+        # Trigger preview + children fetches for the (possibly moved)
+        # cursor before the next render pass. Idempotent; safe to call
+        # once per key during a burst.
+        self._update_preview_for_cursor()
+        self._update_children_for_cursor()
 
     def _update_children_for_cursor(self) -> None:
         """Kick a children fetch for the cursor item if it's an unfetched branch.

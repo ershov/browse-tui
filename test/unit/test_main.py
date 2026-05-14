@@ -53,6 +53,7 @@ _cli.term_resume = lambda: None
 _state.term_init = lambda: None
 _state.term_restore = lambda: None
 _state.read_key = lambda: 'q'  # tests override per-case
+_state.input_ready = lambda: False  # tests override for burst tests
 _state.g_resize_flag = False
 _state.g_screen_lost_flag = False
 _state.Context = _context.Context
@@ -320,6 +321,178 @@ class TestBrowserRunHeadlessSmoke(unittest.TestCase):
             _state.read_key = original
         self.assertEqual(rc, 0)
         self.assertEqual(out.getvalue(), 'alpha\n')
+
+
+# ---------------------------------------------------------------------------
+# Input-burst coalescing (option-1 design — drain the stdin buffer between
+# renders so a held-down key or paste burst is dispatched in one batch
+# before the screen repaints).
+# ---------------------------------------------------------------------------
+
+
+class TestInputBurstCoalescing(unittest.TestCase):
+    """Multiple keystrokes already buffered on stdin are dispatched back-
+    to-back in a single render cycle; rendering happens once per burst
+    instead of once per key.
+
+    The tests run in non-headless mode so the render gate fires, with
+    ``render_full`` / ``render_partial`` stubbed to count invocations
+    and clear ``_needs_redraw`` (so the next iteration only renders if
+    a fresh key dirties state — which is exactly what the loop assumes).
+    """
+
+    def setUp(self):
+        self._orig_rf = _state.render_full
+        self._orig_rp = _state.render_partial
+        self._orig_rk = _state.read_key
+        self._orig_ir = _state.input_ready
+        self._orig_dk = _state.dispatch_key
+
+        self.render_count = 0
+        self.dispatch_log = []
+        self.input_ready_calls = 0
+
+        def count_full(browser, *a, **kw):
+            self.render_count += 1
+            browser._needs_redraw = set()
+        def count_partial(browser, *a, **kw):
+            self.render_count += 1
+            browser._needs_redraw = set()
+        _state.render_full = count_full
+        _state.render_partial = count_partial
+
+        # Wrap dispatch_key so each dispatched key lands in the log.
+        original_dispatch = self._orig_dk
+        def spy_dispatch_key(browser, ctx, key):
+            self.dispatch_log.append(key)
+            return original_dispatch(browser, ctx, key)
+        _state.dispatch_key = spy_dispatch_key
+
+    def tearDown(self):
+        _state.render_full = self._orig_rf
+        _state.render_partial = self._orig_rp
+        _state.read_key = self._orig_rk
+        _state.input_ready = self._orig_ir
+        _state.dispatch_key = self._orig_dk
+
+    def _drive(self, keys, input_ready_pattern):
+        """Run the main loop, feeding ``keys`` through ``read_key`` and
+        returning the configured ``input_ready_pattern`` (in order) on
+        each ``input_ready`` poll. Trailing reads default to ``'q'``;
+        trailing ``input_ready`` polls default to ``False``.
+        """
+        keys_iter = iter(keys)
+        def fake_read_key():
+            try:
+                return next(keys_iter)
+            except StopIteration:
+                return 'q'
+
+        ir_iter = iter(input_ready_pattern)
+        def fake_input_ready():
+            self.input_ready_calls += 1
+            try:
+                return next(ir_iter)
+            except StopIteration:
+                return False
+
+        _state.read_key = fake_read_key
+        _state.input_ready = fake_input_ready
+
+        # Non-headless so the render gate fires. ``term_init`` /
+        # ``term_restore`` are stubbed at module load.
+        b = Browser.from_flat_tree(['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'])
+        # Skip the startup render-wait so the test is deterministic.
+        # ``_headless`` controls term_init / render gating; flip it back
+        # to False for the actual run.
+        b._headless = False
+        rc = b.run()
+        return b, rc
+
+    def test_three_buffered_keys_dispatch_in_one_burst(self):
+        # 'j', 'j', 'j', then 'q'. input_ready=[T, T, F] means the first
+        # 'j' kicks off a burst, the next two 'j's drain inside that
+        # burst, then F ends it. 'q' arrives in a second outer iteration.
+        b, rc = self._drive(['j', 'j', 'j', 'q'], [True, True, False])
+        self.assertEqual(rc, 1)
+        # All four keys reached the dispatcher.
+        self.assertEqual(self.dispatch_log, ['j', 'j', 'j', 'q'])
+        # Cursor advanced once per 'j'.
+        self.assertEqual(b._state.cursor, 3)
+        # The three j's coalesce into one burst → only one in-loop
+        # render between them. Without coalescing each j would render
+        # individually, raising render_count to ~5.
+        self.assertLessEqual(
+            self.render_count, 3,
+            f'expected ≤3 renders for a 3-key burst + q + startup, '
+            f'got {self.render_count}',
+        )
+
+    def test_burst_reduces_render_count_vs_unbatched(self):
+        # 5 'j's coalesce into one burst + 1 'q' → at most one render
+        # after the j-burst and one after 'q' (plus the startup paint).
+        # Total renders ≤ 3, much less than the 6 we'd see without
+        # coalescing.
+        b, rc = self._drive(
+            ['j', 'j', 'j', 'j', 'j', 'q'],
+            [True, True, True, True, False])
+        self.assertEqual(rc, 1)
+        # Cursor advanced 5 times.
+        self.assertEqual(b._state.cursor, 5)
+        # Render is bounded by the number of (outer) iterations. Two
+        # bursts means at most two in-loop renders; plus the startup
+        # render, the ceiling is 3.
+        self.assertLessEqual(
+            self.render_count, 3,
+            f'expected ≤3 renders for 5 coalesced keys + q, '
+            f'got {self.render_count} (dispatched {self.dispatch_log})',
+        )
+
+    def test_burst_caps_at_max_keys(self):
+        # Force the burst cap by always returning input_ready=True. The
+        # loop must still bound the batch and yield to the renderer.
+        original_cap = _state._INPUT_BURST_MAX_KEYS
+        try:
+            _state._INPUT_BURST_MAX_KEYS = 3
+            # 6 'j's + 'q'. With cap=3, each burst handles 3 keys.
+            # 6 = 2 bursts × 3 keys, then 'q' is its own burst.
+            b, rc = self._drive(
+                ['j', 'j', 'j', 'j', 'j', 'j', 'q'],
+                [True] * 10)
+            self.assertEqual(rc, 1)
+            self.assertEqual(b._state.cursor, 6)
+            # We should have rendered at least once per cap-bounded burst
+            # (so the user gets feedback even mid-paste). 2 bursts of 3 +
+            # 1 burst of q = at least 3 in-loop renders.
+            self.assertGreaterEqual(
+                self.render_count, 3,
+                f'expected ≥3 renders when bursts hit cap, '
+                f'got {self.render_count}',
+            )
+        finally:
+            _state._INPUT_BURST_MAX_KEYS = original_cap
+
+    def test_notify_breaks_the_burst(self):
+        # A worker delivery (read_key returning '_notify') must break the
+        # burst so the outer loop can apply queue results and render the
+        # new state. Sequence: 'j', '_notify', 'j', 'q'. The first 'j'
+        # starts a burst. Then read_key returns '_notify' → burst ends.
+        # The outer loop iterates; the next 'j' starts a fresh burst.
+        b, rc = self._drive(['j', '_notify', 'j', 'q'],
+                            [True, False, False])
+        self.assertEqual(rc, 1)
+        # '_notify' is NOT dispatched; only real keys make it to the spy.
+        self.assertEqual(self.dispatch_log, ['j', 'j', 'q'])
+        self.assertEqual(b._state.cursor, 2)
+
+    def test_single_key_with_empty_buffer_dispatches_normally(self):
+        # Regression guard: when input_ready is False from the start, the
+        # burst loop never enters, exactly as the pre-coalescing main
+        # loop behaved.
+        b, rc = self._drive(['j', 'q'], [False, False])
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.dispatch_log, ['j', 'q'])
+        self.assertEqual(b._state.cursor, 1)
 
 
 if __name__ == '__main__':
