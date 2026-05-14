@@ -1158,6 +1158,93 @@ class TestTreeChildrenPreview(unittest.TestCase):
             os.unlink(path)
 
 
+class TestAncestorIdsForSubagent(unittest.TestCase):
+    """``_ancestor_ids_for`` prepends the outer subagent-group row."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_subagent_record_includes_outer_group_id(self):
+        # Lay out a parent session + a real subagent jsonl.
+        import json as _json
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix='subagent-anc-')
+        try:
+            sess_path = os.path.join(tmp, 'parent.jsonl')
+            with open(sess_path, 'w') as f:
+                # Outer session needs to exist on disk so the
+                # outer-subagent detection accepts it.
+                f.write('{}\n')
+            sub_dir = os.path.join(tmp, 'parent', 'subagents')
+            os.makedirs(sub_dir)
+            agent_path = os.path.join(sub_dir, 'agent-AGENT01.jsonl')
+            with open(agent_path, 'w') as f:
+                f.write(_json.dumps({
+                    'type': 'user', 'uuid': 'u1',
+                    'message': {'role': 'user',
+                                'content': 'hello inside subagent'},
+                }) + '\n')
+                f.write(_json.dumps({
+                    'type': 'assistant', 'uuid': 'a1',
+                    'message': {'role': 'assistant', 'content': [
+                        {'type': 'text', 'text': 'reply'},
+                    ]},
+                }) + '\n')
+            # u1 at line 0 is a turn root; a1 at line 1 is a child.
+            ancestors = self.r._ancestor_ids_for(f'{agent_path}#1')
+            # First ancestor (root) should be the outer subagent group
+            # in the parent session.
+            self.assertTrue(ancestors,
+                            'expected at least one ancestor')
+            self.assertEqual(ancestors[0],
+                             f'{sess_path}#agent:AGENT01')
+            # Direct parent should be the turn root inside the subagent.
+            self.assertEqual(ancestors[-1], f'{agent_path}#0')
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_main_session_record_has_no_outer_subagent_group(self):
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess_path = os.path.join(tmp, 'main.jsonl')
+            with open(sess_path, 'w') as f:
+                f.write(_json.dumps({
+                    'type': 'user', 'uuid': 'u1',
+                    'message': {'role': 'user', 'content': 'go'},
+                }) + '\n')
+                f.write(_json.dumps({
+                    'type': 'assistant', 'uuid': 'a1',
+                    'message': {'role': 'assistant', 'content': [
+                        {'type': 'text', 'text': 'r'},
+                    ]},
+                }) + '\n')
+            ancestors = self.r._ancestor_ids_for(f'{sess_path}#1')
+            # Direct parent is the turn root; no outer subagent group.
+            self.assertEqual(ancestors, [f'{sess_path}#0'])
+
+    def test_outer_subagent_group_id_helper(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess_path = os.path.join(tmp, 'parent.jsonl')
+            with open(sess_path, 'w') as f:
+                f.write('{}\n')
+            sub_dir = os.path.join(tmp, 'parent', 'subagents')
+            os.makedirs(sub_dir)
+            agent_path = os.path.join(sub_dir, 'agent-ABC.jsonl')
+            with open(agent_path, 'w') as f:
+                f.write('{}\n')
+            self.assertEqual(
+                self.r._outer_subagent_group_id(agent_path),
+                f'{sess_path}#agent:ABC',
+            )
+            # Non-subagent paths return None.
+            self.assertIsNone(self.r._outer_subagent_group_id(sess_path))
+            self.assertIsNone(self.r._outer_subagent_group_id('/nope'))
+
+
 class TestMdPagerResolution(unittest.TestCase):
     """``_resolve_md_pager`` walks $MD2ANSI / md / md2ansi in order."""
 

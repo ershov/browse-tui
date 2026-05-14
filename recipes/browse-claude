@@ -3264,13 +3264,48 @@ def _latest_voice_among_children(item_id):
     return f'{path}#{latest}' if latest is not None else None
 
 
+def _outer_subagent_group_id(path):
+    """If ``path`` is a subagent's ``.jsonl``, return its outer-row id.
+
+    Subagent transcripts live at::
+
+        <project_dir>/<parent_session_id>/subagents/agent-<aid>.jsonl
+
+    and the parent session shows them as collapsible rows with id
+    ``<parent_session_path>#agent:<aid>``. That outer row is the
+    framework-visible parent of every record inside the subagent —
+    if it isn't expanded, none of the subagent's records are
+    reachable. Used by ``_ancestor_ids_for`` to prepend it to the
+    chain so cursor preservation works across t-toggle from anywhere
+    inside a subagent.
+    """
+    if not isinstance(path, str):
+        return None
+    parent_dir = os.path.dirname(path)
+    if os.path.basename(parent_dir) != 'subagents':
+        return None
+    sess_dir = os.path.dirname(parent_dir)
+    sess_path = sess_dir + '.jsonl'
+    if not os.path.isfile(sess_path):
+        return None
+    name = os.path.basename(path)
+    if not name.startswith('agent-') or not name.endswith('.jsonl'):
+        return None
+    aid = name[len('agent-'):-len('.jsonl')]
+    return f'{sess_path}#agent:{aid}'
+
+
 def _ancestor_ids_for(item_id):
     """Return ids of every ancestor of ``item_id`` (root → direct parent).
 
     Walks the **tree** parent map built in ``_scan_tree``, not the on-
     disk ``parentUuid`` chain. The on-disk chain is a write-time linked
     list (see ``sessionStorage.ts:1066``) that has nothing to do with
-    the displayed tree shape. Empty list for span/agent ids (those are
+    the displayed tree shape. For records *inside* a subagent's
+    ``.jsonl``, the chain also includes the outer
+    ``<parent_session_path>#agent:<aid>`` group row — without that,
+    cursor_to can't make the row visible after a t-toggle wipes the
+    cached children. Empty list for span/agent ids (those are
     top-level) and for ids the scan can't resolve.
     """
     if not isinstance(item_id, str) or '#' not in item_id:
@@ -3303,6 +3338,11 @@ def _ancestor_ids_for(item_id):
             cur = int(parent_line)
         except ValueError:
             break
+    # If this is a subagent path, prepend the outer subagent-group row
+    # so the chain reaches all the way to the OUTER session's tree.
+    outer = _outer_subagent_group_id(path)
+    if outer is not None and outer not in seen:
+        chain.append(outer)
     return list(reversed(chain))
 
 
