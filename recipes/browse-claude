@@ -3001,12 +3001,16 @@ def _resolve_path(item):
     return iid
 
 
-def _action_edit(ctx):
-    """Open the cursor row's underlying file in $EDITOR.
+def _action_edit_source(ctx):
+    """``E`` — open the cursor row's underlying file in $EDITOR.
 
     For a project (a directory) we open the directory itself — most
     editors handle that gracefully (vim opens netrw, code opens the
     folder). For sessions and messages it's the .jsonl file.
+
+    Separate from the framework's built-in ``e`` (which opens the
+    *preview text* in $EDITOR with edits discarded). This one mutates
+    the on-disk source if the editor saves.
     """
     if ctx.cursor is None:
         return
@@ -3014,8 +3018,32 @@ def _action_edit(ctx):
     if not path or not os.path.exists(path):
         ctx.error(f'no such path: {path!r}')
         return
-    editor = os.environ.get('EDITOR') or 'less'
-    ctx.run_external([editor, path])
+    editor = os.environ.get('EDITOR') or 'vim'
+    ctx.run_external(_split_cmd(editor) + [path])
+
+
+def _action_view_source(ctx):
+    """``V`` — open the cursor row's underlying file in $PAGER.
+
+    Read-only view of the source ``.jsonl`` (or the project dir).
+    Pairs with ``E`` for the edit variant and with the framework's
+    built-in ``v`` (which pages the rendered *preview* — useful when
+    the preview is multi-screen, vs this which is the raw transcript).
+    """
+    if ctx.cursor is None:
+        return
+    path = _resolve_path(ctx.cursor)
+    if not path or not os.path.exists(path):
+        ctx.error(f'no such path: {path!r}')
+        return
+    pager = os.environ.get('PAGER') or 'less -R'
+    ctx.run_external(_split_cmd(pager) + [path])
+
+
+def _split_cmd(s):
+    """Shell-split a command env var like ``less -R`` or ``bat --paging=always``."""
+    import shlex
+    return shlex.split(s)
 
 
 def _action_show_id(ctx):
@@ -3345,8 +3373,11 @@ Usage: browse-claude [OPTIONS] [PROJECT]
 Walks ~/.claude/projects/ to surface a four-level tree: projects ->
 sessions -> messages (or subagents) -> subagent messages. Drill into
 a transcript with Right/Alt-Down; preview shows the rendered turn.
-Edit (or 'o') opens the source .jsonl in $EDITOR at the right line.
-Press ``t`` at any time to flip between flat and tree views.\
+
+  v / V   page the preview (v) / the source .jsonl (V) via $PAGER.
+  e / E   open the preview (e) / the source .jsonl (E) in $EDITOR.
+  J / K   jump cursor to next / previous user-or-assistant voice.
+  t       toggle flat / tree view.\
 """
 
 
@@ -3452,8 +3483,10 @@ def main():
         root_id=None,
         initial_scope=initial_scope,
         actions=[
-            Action('e',     'Edit/view source in $EDITOR',     _action_edit,        'cursor'),
-            Action('o',     'Edit/view source in $EDITOR',     _action_edit,        'cursor'),
+            # v / e are the framework defaults (page / edit the preview text).
+            # V / E open the underlying source file instead.
+            Action('V',     'View source file in $PAGER',      _action_view_source, 'cursor'),
+            Action('E',     'Edit source file in $EDITOR',     _action_edit_source, 'cursor'),
             Action('y',     'Show full id (paste-friendly)',   _action_show_id,     'cursor'),
             # 'none' gate so J/K fire even when the cursor sits on a
             # scope_root row (where ctx.cursor returns None). The
