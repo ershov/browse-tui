@@ -499,6 +499,132 @@ class TestBrowseClaude(unittest.TestCase):
                 t.wait_for('▶ user', timeout=3.0)
                 t.send('q')
 
+    def _make_tree_fixture(self, tmp):
+        """Two turns + one Agent dispatch with a real subagent jsonl."""
+        import json as _json
+        root = os.path.join(tmp, '.claude', 'projects')
+        proj = os.path.join(root, '-home-test-tree')
+        os.makedirs(proj)
+        sess = os.path.join(proj, 'tree-sess.jsonl')
+        with open(sess, 'w') as f:
+            for rec in [
+                {'type': 'permission-mode', 'permissionMode': 'plan'},
+                # Turn 1.
+                {'type': 'user', 'uuid': 'u1', 'parentUuid': None,
+                 'promptId': 'P1',
+                 'message': {'role': 'user',
+                             'content': 'PROBE_TURN1_USER'}},
+                {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+                 'message': {'role': 'assistant', 'content': [
+                     {'type': 'tool_use', 'id': 'toolu_x', 'name': 'Task',
+                      'input': {'prompt': 'PROBE_AGENT_PROMPT',
+                                'subagent_type': 'Explore'}},
+                 ]}},
+                {'type': 'user', 'uuid': 'u2', 'parentUuid': 'a1',
+                 'promptId': 'P1',
+                 'message': {'role': 'user', 'content': [
+                     {'type': 'tool_result', 'tool_use_id': 'toolu_x',
+                      'content': 'PROBE_AGENT_RESULT'},
+                 ]},
+                 'toolUseResult': {'agentId': 'AGENT01',
+                                   'agentType': 'Explore',
+                                   'status': 'completed'}},
+                {'type': 'assistant', 'uuid': 'a2', 'parentUuid': 'u2',
+                 'message': {'role': 'assistant', 'content': [
+                     {'type': 'text', 'text': 'PROBE_TURN1_REPLY'},
+                 ]}},
+                # Turn 2 (new promptId → new turn root).
+                {'type': 'user', 'uuid': 'u3', 'parentUuid': 'a2',
+                 'promptId': 'P2',
+                 'message': {'role': 'user',
+                             'content': 'PROBE_TURN2_USER'}},
+                {'type': 'assistant', 'uuid': 'a3', 'parentUuid': 'u3',
+                 'message': {'role': 'assistant', 'content': [
+                     {'type': 'text', 'text': 'PROBE_TURN2_REPLY'},
+                 ]}},
+            ]:
+                f.write(_json.dumps(rec) + '\n')
+        sub_dir = os.path.join(proj, 'tree-sess', 'subagents')
+        os.makedirs(sub_dir)
+        agent_path = os.path.join(sub_dir, 'agent-AGENT01.jsonl')
+        with open(agent_path, 'w') as f:
+            f.write(json.dumps({
+                'type': 'user', 'uuid': 'agU1', 'parentUuid': None,
+                'message': {'role': 'user',
+                            'content': 'PROBE_SUBAGENT_PROMPT'},
+            }) + '\n')
+        with open(os.path.join(sub_dir,
+                               'agent-AGENT01.meta.json'), 'w') as f:
+            json.dump({'agentType': 'Explore',
+                       'description': 'PROBE_SUBAGENT_DESC'}, f)
+        return sess
+
+    def test_tree_flag_lands_on_latest_voice(self):
+        """``--tree`` opens the session, expands ancestors, lands on latest voice."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._make_tree_fixture(tmp)
+            with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE,
+                         '--tree', '--file', sess)
+                # Latest voice = PROBE_TURN2_REPLY (the final assistant
+                # text). Preview pane should show its body.
+                t.wait_for('PROBE_TURN2_REPLY', timeout=3.0)
+                # Tree structure must be visible: both turn-roots
+                # expanded as ancestors of the cursor row.
+                cap = t.capture()
+                self.assertIn('PROBE_TURN1_USER', cap)
+                self.assertIn('PROBE_TURN2_USER', cap)
+                # ▼ markers indicate the expanded subtrees of the
+                # turn-roots between the scope root and the cursor.
+                self.assertIn('▼', cap)
+                t.send('q')
+
+    def test_t_toggle_preserves_cursor(self):
+        """``t`` flips tree↔flat without losing the cursor's message."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._make_tree_fixture(tmp)
+            with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE,
+                         '--tree', '--file', sess)
+                t.wait_for('PROBE_TURN2_REPLY', timeout=3.0)
+                # Capture cursor row's preview-pane body BEFORE toggle.
+                cap_tree = t.capture()
+                self.assertIn('PROBE_TURN2_REPLY', cap_tree)
+                # Flip to flat — preview should still target the same
+                # message (PROBE_TURN2_REPLY). The structure changes
+                # (no ▼ tree markers under the scope row in flat).
+                t.send('t')
+                # Wait long enough for refresh + cursor_to to land.
+                import time
+                time.sleep(0.15)
+                cap_flat = t.capture()
+                self.assertIn('PROBE_TURN2_REPLY', cap_flat,
+                              f'cursor lost on tree→flat: {cap_flat[:400]!r}')
+                # Flip back to tree.
+                t.send('t')
+                time.sleep(0.15)
+                cap_back = t.capture()
+                self.assertIn('PROBE_TURN2_REPLY', cap_back,
+                              f'cursor lost on flat→tree: {cap_back[:400]!r}')
+                t.send('q')
+
+    def test_tree_expand_assistant_shows_subagent(self):
+        """Expanding the Agent-calling assistant row reveals the subagent."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._make_tree_fixture(tmp)
+            with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE,
+                         '--tree', '--file', sess)
+                # The cursor-on-open chain already expanded all
+                # ancestors of the latest voice — including the
+                # assistant row that issued the Task call. So the
+                # subagent description should already be visible.
+                t.wait_for('PROBE_SUBAGENT_DESC', timeout=3.0)
+                t.send('q')
+
     def test_user_assistant_rows_have_row_bg(self):
         """Conversational rows should render with ``\\e[48;5;...m`` bg stripes.
 

@@ -187,7 +187,7 @@ class TestRenderers(unittest.TestCase):
                 },
             },
         })
-        self.assertIn('◀ assistant', out)
+        self.assertIn('⏺ assistant', out)
         self.assertIn('claude-sonnet-4-6', out)
         self.assertIn('[end_turn]', out)
         self.assertIn('Hi there.', out)
@@ -1077,6 +1077,449 @@ class TestMessageOrderReverse(unittest.TestCase):
             items = self.r._list_messages(path, limit=10)
             self.assertEqual(len(items), 1)
             self.assertNotIn('older entries hidden', items[0].title)
+        finally:
+            os.unlink(path)
+
+
+class TestScanTree(unittest.TestCase):
+    """``_scan_tree`` builds the parentUuid/promptId tree + caching."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _write_jsonl(self, records):
+        import json as _json
+        import tempfile
+        f = tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False,
+                                        prefix='abcd1234-')
+        for r in records:
+            f.write(_json.dumps(r) + '\n')
+        f.close()
+        return f.name
+
+    def test_simple_chain(self):
+        # u1(pid=P1) -> a1 -> u2(tool_result, no pid) -> a2
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1', 'parentUuid': None,
+             'promptId': 'P1',
+             'message': {'role': 'user', 'content': 'go'}},
+            {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 't1', 'name': 'Bash',
+                  'input': {'command': 'ls'}},
+             ]}},
+            {'type': 'user', 'uuid': 'u2', 'parentUuid': 'a1',
+             'promptId': 'P1',
+             'message': {'role': 'user', 'content': [
+                 {'type': 'tool_result', 'tool_use_id': 't1',
+                  'content': 'ok'},
+             ]}},
+            {'type': 'assistant', 'uuid': 'a2', 'parentUuid': 'u2',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'text', 'text': 'done'},
+             ]}},
+        ])
+        try:
+            td = self.r._scan_tree(path)
+            # 4 records, 1 root, rest chained.
+            self.assertEqual(len([r for r in td.records if r]), 4)
+            self.assertEqual([r['uuid'] for r in td.roots], ['u1'])
+            self.assertEqual([r['uuid'] for r in td.by_parent['u1']], ['a1'])
+            self.assertEqual([r['uuid'] for r in td.by_parent['a1']], ['u2'])
+            self.assertEqual([r['uuid'] for r in td.by_parent['u2']], ['a2'])
+            # inheritedPromptId propagates.
+            for u in ('u1', 'a1', 'u2', 'a2'):
+                self.assertEqual(td.inherited_pid[u], 'P1',
+                                 f'{u} should inherit P1')
+        finally:
+            os.unlink(path)
+
+    def test_turn_boundary_breaks_chain(self):
+        # u1(pid=P1) -> a1 -> u2(pid=P2, parent=a1)
+        # u2 should be a root (new turn), NOT a child of a1.
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1', 'parentUuid': None,
+             'promptId': 'P1',
+             'message': {'role': 'user', 'content': 'first'}},
+            {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'text', 'text': 'reply'},
+             ]}},
+            {'type': 'user', 'uuid': 'u2', 'parentUuid': 'a1',
+             'promptId': 'P2',
+             'message': {'role': 'user', 'content': 'second'}},
+        ])
+        try:
+            td = self.r._scan_tree(path)
+            self.assertEqual([r['uuid'] for r in td.roots], ['u1', 'u2'])
+            # a1 should NOT have u2 as a child (turn break).
+            self.assertNotIn('a1', td.by_parent)
+            # u2 is flagged as a turn-root.
+            u2 = td.by_uuid['u2']
+            self.assertTrue(u2.get('_tree_is_turn'))
+        finally:
+            os.unlink(path)
+
+    def test_orphan_parent_becomes_root(self):
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'parentUuid': 'does-not-exist',
+             'promptId': 'P1',
+             'message': {'role': 'user', 'content': 'broken'}},
+        ])
+        try:
+            td = self.r._scan_tree(path)
+            self.assertEqual([r['uuid'] for r in td.roots], ['u1'])
+            self.assertTrue(td.by_uuid['u1'].get('_tree_orphan'))
+        finally:
+            os.unlink(path)
+
+    def test_metadata_records_are_roots(self):
+        path = self._write_jsonl([
+            {'type': 'permission-mode', 'permissionMode': 'plan',
+             'sessionId': 'abcd1234'},
+            {'type': 'user', 'uuid': 'u1', 'parentUuid': None,
+             'promptId': 'P1',
+             'message': {'role': 'user', 'content': 'go'}},
+            {'type': 'last-prompt', 'lastPrompt': 'go',
+             'sessionId': 'abcd1234'},
+        ])
+        try:
+            td = self.r._scan_tree(path)
+            # 3 records all at root: permission-mode (meta), u1, last-prompt (meta).
+            self.assertEqual(len(td.roots), 3)
+            self.assertTrue(td.roots[0].get('_tree_is_meta'))
+            self.assertEqual(td.roots[1]['uuid'], 'u1')
+            self.assertTrue(td.roots[2].get('_tree_is_meta'))
+        finally:
+            os.unlink(path)
+
+    def test_forked_from_flagged(self):
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1', 'parentUuid': None,
+             'promptId': 'P1', 'forkedFrom': 'old-uuid-aaaa',
+             'message': {'role': 'user', 'content': 'resumed'}},
+        ])
+        try:
+            td = self.r._scan_tree(path)
+            self.assertEqual(td.by_uuid['u1'].get('_tree_forked_from'),
+                             'old-uuid-aaaa')
+        finally:
+            os.unlink(path)
+
+    def test_cache_invalidates_on_mtime_change(self):
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1', 'parentUuid': None,
+             'promptId': 'P1',
+             'message': {'role': 'user', 'content': 'one'}},
+        ])
+        try:
+            import json as _json
+            td1 = self.r._scan_tree(path)
+            self.assertEqual(len([r for r in td1.records if r]), 1)
+            # Append a new record + bump mtime.
+            with open(path, 'a') as f:
+                f.write(_json.dumps({
+                    'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+                    'message': {'role': 'assistant', 'content': [
+                        {'type': 'text', 'text': 'x'},
+                    ]},
+                }) + '\n')
+            import time
+            # File mtime is at second granularity on many fs's — force
+            # a different mtime via os.utime.
+            now = os.stat(path).st_mtime
+            os.utime(path, (now + 1, now + 1))
+            td2 = self.r._scan_tree(path)
+            self.assertEqual(len([r for r in td2.records if r]), 2)
+            self.assertIsNot(td1, td2)   # different cached instance
+        finally:
+            os.unlink(path)
+
+    def test_agent_link_resolves_subagent(self):
+        # Parent assistant with Task tool_use; child user tool_result
+        # whose toolUseResult.agentId resolves to a subagent jsonl.
+        import json as _json
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix='sa-')
+        try:
+            sess_path = os.path.join(tmp, 'parent.jsonl')
+            with open(sess_path, 'w') as f:
+                f.write(_json.dumps({
+                    'type': 'user', 'uuid': 'u1', 'parentUuid': None,
+                    'promptId': 'P1',
+                    'message': {'role': 'user', 'content': 'go'},
+                }) + '\n')
+                f.write(_json.dumps({
+                    'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+                    'message': {'role': 'assistant', 'content': [
+                        {'type': 'tool_use', 'id': 'toolu_x',
+                         'name': 'Task',
+                         'input': {'prompt': 'do thing',
+                                   'subagent_type': 'Explore'}},
+                    ]},
+                }) + '\n')
+                f.write(_json.dumps({
+                    'type': 'user', 'uuid': 'u2', 'parentUuid': 'a1',
+                    'promptId': 'P1',
+                    'message': {'role': 'user', 'content': [
+                        {'type': 'tool_result', 'tool_use_id': 'toolu_x',
+                         'content': 'output'},
+                    ]},
+                    'toolUseResult': {
+                        'agentId': 'AGENT01', 'agentType': 'Explore',
+                        'status': 'completed',
+                    },
+                }) + '\n')
+            # Lay out the matching subagent file.
+            sub_dir = os.path.join(tmp, 'parent', 'subagents')
+            os.makedirs(sub_dir)
+            agent_path = os.path.join(sub_dir, 'agent-AGENT01.jsonl')
+            with open(agent_path, 'w') as f:
+                f.write('{}\n')
+
+            td = self.r._scan_tree(sess_path)
+            self.assertIn('toolu_x', td.agent_link)
+            self.assertEqual(td.agent_link['toolu_x']['agent_id'], 'AGENT01')
+            self.assertEqual(td.agent_link['toolu_x']['agent_path'],
+                             agent_path)
+            self.assertEqual(td.agent_link['toolu_x']['assistant_uuid'],
+                             'a1')
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_last_voice_id_picks_latest(self):
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1', 'parentUuid': None,
+             'promptId': 'P1',
+             'message': {'role': 'user', 'content': 'first voice'}},
+            {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 't', 'name': 'Bash',
+                  'input': {'command': 'ls'}},
+             ]}},
+            {'type': 'user', 'uuid': 'u2', 'parentUuid': 'a1',
+             'promptId': 'P1',
+             'message': {'role': 'user', 'content': [
+                 {'type': 'tool_result', 'tool_use_id': 't',
+                  'content': 'ok'},
+             ]}},
+            {'type': 'assistant', 'uuid': 'a2', 'parentUuid': 'u2',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'text', 'text': 'latest voice'},
+             ]}},
+        ])
+        try:
+            self.assertEqual(self.r._last_voice_id(path), f'{path}#3')
+        finally:
+            os.unlink(path)
+
+
+class TestTreeListings(unittest.TestCase):
+    """Tree-mode get_children / _list_tree_roots / _list_tree_children."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _write_jsonl(self, records, prefix='sess-'):
+        import json as _json
+        import tempfile
+        f = tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False,
+                                        prefix=prefix)
+        for r in records:
+            f.write(_json.dumps(r) + '\n')
+        f.close()
+        return f.name
+
+    def test_session_roots_in_file_order(self):
+        # Two turns + one metadata record interleaved.
+        path = self._write_jsonl([
+            {'type': 'permission-mode', 'permissionMode': 'plan'},
+            {'type': 'user', 'uuid': 'u1', 'parentUuid': None,
+             'promptId': 'P1',
+             'message': {'role': 'user', 'content': 'first'}},
+            {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'text', 'text': 'reply'},
+             ]}},
+            {'type': 'user', 'uuid': 'u2', 'parentUuid': 'a1',
+             'promptId': 'P2',
+             'message': {'role': 'user', 'content': 'second'}},
+        ])
+        try:
+            roots = self.r._list_tree_roots(path)
+            # Expect permission-mode, u1, u2 — in file order.
+            self.assertEqual(len(roots), 3)
+            self.assertEqual(roots[0].kind, 'message')
+            self.assertEqual(roots[0].line_no, 0)   # metadata first
+            self.assertEqual(roots[1].line_no, 1)   # u1
+            self.assertEqual(roots[2].line_no, 3)   # u2 (turn-root)
+        finally:
+            os.unlink(path)
+
+    def test_drill_into_turn_root_lists_chain(self):
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1', 'parentUuid': None,
+             'promptId': 'P1',
+             'message': {'role': 'user', 'content': 'go'}},
+            {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 't1', 'name': 'Bash',
+                  'input': {'command': 'ls'}},
+             ]}},
+            {'type': 'user', 'uuid': 'u2', 'parentUuid': 'a1',
+             'promptId': 'P1',
+             'message': {'role': 'user', 'content': [
+                 {'type': 'tool_result', 'tool_use_id': 't1',
+                  'content': 'ok'},
+             ]}},
+            {'type': 'assistant', 'uuid': 'a2', 'parentUuid': 'u2',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'text', 'text': 'done'},
+             ]}},
+        ])
+        try:
+            # Children of u1 → [a1]
+            self.assertEqual(
+                [it.line_no for it in self.r._list_tree_children(path, 0)],
+                [1],
+            )
+            # Children of a1 → [u2]
+            self.assertEqual(
+                [it.line_no for it in self.r._list_tree_children(path, 1)],
+                [2],
+            )
+            # Children of u2 → [a2]
+            self.assertEqual(
+                [it.line_no for it in self.r._list_tree_children(path, 2)],
+                [3],
+            )
+            # a2 is a leaf.
+            self.assertEqual(self.r._list_tree_children(path, 3), [])
+        finally:
+            os.unlink(path)
+
+    def test_new_turn_user_is_not_a_child_of_prev_assistant(self):
+        # u1(P1) → a1 → u2(P2). u2 is a turn-root, not under a1.
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1', 'parentUuid': None,
+             'promptId': 'P1',
+             'message': {'role': 'user', 'content': 'first'}},
+            {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'text', 'text': 'r'},
+             ]}},
+            {'type': 'user', 'uuid': 'u2', 'parentUuid': 'a1',
+             'promptId': 'P2',
+             'message': {'role': 'user', 'content': 'second'}},
+        ])
+        try:
+            kids_of_a1 = self.r._list_tree_children(path, 1)
+            self.assertEqual(kids_of_a1, [])
+            roots = self.r._list_tree_roots(path)
+            self.assertEqual([it.line_no for it in roots], [0, 2])
+        finally:
+            os.unlink(path)
+
+    def test_subagent_attaches_to_assistant_row(self):
+        # Assistant with Task tool_use; tool_result resolves to a real
+        # subagent file. Children of the assistant row include both
+        # the tool_result AND the subagent pseudo-row.
+        import json as _json
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix='sa-tree-')
+        try:
+            sess_path = os.path.join(tmp, 'parent.jsonl')
+            with open(sess_path, 'w') as f:
+                f.write(_json.dumps({
+                    'type': 'user', 'uuid': 'u1', 'parentUuid': None,
+                    'promptId': 'P1',
+                    'message': {'role': 'user', 'content': 'go'},
+                }) + '\n')
+                f.write(_json.dumps({
+                    'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+                    'message': {'role': 'assistant', 'content': [
+                        {'type': 'tool_use', 'id': 'toolu_x',
+                         'name': 'Task',
+                         'input': {'prompt': 'do thing',
+                                   'subagent_type': 'Explore'}},
+                    ]},
+                }) + '\n')
+                f.write(_json.dumps({
+                    'type': 'user', 'uuid': 'u2', 'parentUuid': 'a1',
+                    'promptId': 'P1',
+                    'message': {'role': 'user', 'content': [
+                        {'type': 'tool_result', 'tool_use_id': 'toolu_x',
+                         'content': 'output'},
+                    ]},
+                    'toolUseResult': {'agentId': 'AGENT01',
+                                      'agentType': 'Explore',
+                                      'status': 'completed'},
+                }) + '\n')
+            sub_dir = os.path.join(tmp, 'parent', 'subagents')
+            os.makedirs(sub_dir)
+            agent_path = os.path.join(sub_dir, 'agent-AGENT01.jsonl')
+            with open(agent_path, 'w') as f:
+                f.write('{}\n')
+            with open(os.path.join(sub_dir,
+                                   'agent-AGENT01.meta.json'), 'w') as f:
+                _json.dump({'agentType': 'Explore',
+                            'description': 'probe stuff'}, f)
+
+            kids = self.r._list_tree_children(sess_path, 1)  # assistant @ line 1
+            self.assertEqual(len(kids), 2)
+            self.assertEqual(kids[0].kind, 'message')
+            self.assertEqual(kids[0].line_no, 2)   # the tool_result
+            self.assertEqual(kids[1].kind, 'subagent')
+            self.assertEqual(kids[1].agent_id, 'AGENT01')
+            self.assertEqual(kids[1].id,
+                             f'{sess_path}#agent:AGENT01')
+            # And the assistant row itself reports has_children=True.
+            td = self.r._scan_tree(sess_path)
+            asst_item = self.r._tree_item(sess_path,
+                                          td.records[1], td)
+            self.assertTrue(asst_item.has_children)
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_get_children_dispatch_tree_mode(self):
+        # The get_children dispatcher should route by id shape AND mode.
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1', 'parentUuid': None,
+             'promptId': 'P1',
+             'message': {'role': 'user', 'content': 'go'}},
+            {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'text', 'text': 'done'},
+             ]}},
+        ])
+        try:
+            saved = self.r._TREE_MODE
+            try:
+                # Tree mode: session jsonl → root-level rows.
+                self.r._TREE_MODE = True
+                roots = self.r.get_children(path)
+                self.assertEqual([it.line_no for it in roots], [0])
+                # Message id with children → returns them.
+                kids = self.r.get_children(f'{path}#0')
+                self.assertEqual([it.line_no for it in kids], [1])
+                # Leaf message → no children.
+                self.assertEqual(self.r.get_children(f'{path}#1'), [])
+
+                # Flat mode: session jsonl → messages newest-first list.
+                self.r._TREE_MODE = False
+                flat = self.r.get_children(path)
+                # Same two messages, newest-first.
+                titles = [it.title for it in flat if it.kind == 'message']
+                self.assertEqual(len(titles), 2)
+                # Message id has no children in flat mode.
+                self.assertEqual(self.r.get_children(f'{path}#0'), [])
+            finally:
+                self.r._TREE_MODE = saved
         finally:
             os.unlink(path)
 

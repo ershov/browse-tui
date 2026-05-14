@@ -376,12 +376,37 @@ def get_children(item_id):
     if item_id is None:
         return _list_projects()
     if isinstance(item_id, str) and '#agent:' in item_id:
+        # Tree mode views the subagent .jsonl as its own tree, recursing
+        # into _list_tree_roots. Flat mode lists its lines newest-first.
+        if _TREE_MODE:
+            session_path, _, suffix = item_id.partition('#agent:')
+            if not suffix:
+                return []
+            sub_dir = _subagents_dir(session_path)
+            agent_path = os.path.join(sub_dir, f'agent-{suffix}.jsonl')
+            if not os.path.isfile(agent_path):
+                return []
+            return _list_tree_roots(agent_path)
         return _list_subagent_messages(item_id)
+    if isinstance(item_id, str) and '#' in item_id:
+        # Message id ``<path>#<n>`` — only has children in tree mode.
+        if _TREE_MODE:
+            path, _, lineno = item_id.rpartition('#')
+            try:
+                n = int(lineno)
+            except ValueError:
+                return []
+            return _list_tree_children(path, n)
+        return []
     if isinstance(item_id, str) and item_id.endswith('.jsonl') and os.path.isfile(item_id):
+        if _TREE_MODE:
+            # Tree mode: subagents live inline under their assistant rows,
+            # not as a separate prelude at the session level.
+            return _list_tree_roots(item_id)
         return _list_session_children(item_id)
     if isinstance(item_id, str) and os.path.isdir(item_id):
         return _list_sessions(item_id)
-    # Messages have no children; anything else is unknown — return empty.
+    # Anything else (unknown) — return empty.
     return []
 
 
@@ -1187,7 +1212,10 @@ def _render_assistant(obj):
     stop  = msg.get('stop_reason') or ''
     usage = msg.get('usage') or {}
 
-    head = f'{WHITE}{BOLD}◀ assistant{RESET}  {MAGENTA}{model}{RESET}'
+    # ⏺ matches Claude Code's own BLACK_CIRCLE convention for assistant
+    # turns (src/constants/figures.ts). User turns keep ▶ for visual
+    # contrast at a glance.
+    head = f'{WHITE}{BOLD}⏺ assistant{RESET}  {MAGENTA}{model}{RESET}'
     if stop:
         head += f'  {_STOP_COLOR.get(stop, MUTE)}[{stop}]{RESET}'
     out = [head, '']
@@ -2079,6 +2107,404 @@ def _scan_session(path):
     return meta, timeline[-_TIMELINE_TAIL:]
 
 
+# ---- tree builder (#299) -------------------------------------------------
+#
+# Tree mode rebuilds the in-session children listing as an actual tree
+# instead of a reverse-time flat list. The structure follows ``parentUuid``
+# (the only field that gives reliable chain integrity across every
+# record type — see /promptId investigation notes), with one wrinkle:
+# user prompts get their own ``promptId``; when a child's
+# ``inheritedPromptId`` (= own pid OR parent's pid) differs from its
+# parent's, the parent link is broken and the child becomes a turn-root
+# at the top level. That nests each turn cleanly under its prompt while
+# keeping all the non-voice metadata records as siblings at root.
+#
+# The scan is cached per (path, mtime); subsequent calls within one
+# session are O(1). ``_TREE_CACHE`` clears entries whose mtime no longer
+# matches so files mutated between calls re-scan transparently.
+
+
+_TREE_CACHE = {}   # path → (mtime, TreeData)
+_TREE_MODE = False  # global view-mode toggle; flipped by --tree / 't' action
+
+
+_TREE_METADATA_TYPES = frozenset([
+    # records that show up as their own roots — they carry no
+    # parentUuid and don't participate in the conversation chain.
+    'summary', 'ai-title', 'custom-title', 'last-prompt', 'task-summary',
+    'tag', 'agent-name', 'agent-color', 'agent-setting', 'pr-link',
+    'mode', 'permission-mode', 'worktree-state', 'content-replacement',
+    'file-history-snapshot', 'attribution-snapshot', 'speculation-accept',
+    'queue-operation', 'marble-origami-commit', 'marble-origami-snapshot',
+    'progress',
+])
+
+
+class _TreeData:
+    """Cached tree-structure view of one ``.jsonl`` file.
+
+    Built once per file (per mtime). Fields:
+
+    * ``records``       — every parsed record in file order. Indices
+                          align with line numbers (for records that
+                          parsed cleanly); unparseable lines yield
+                          ``None`` so positions stay aligned.
+    * ``by_uuid``       — ``{uuid: record}`` for fast parent lookup.
+    * ``by_parent``     — ``{parentUuid: [child, …]}`` in file order.
+                          ``None`` key holds the records whose
+                          ``parentUuid`` is missing/null/orphan.
+    * ``inherited_pid`` — ``{uuid: promptId-from-self-or-ancestor}``.
+                          Used to detect turn boundaries: a child whose
+                          ``inheritedPromptId`` ≠ its parent's gets
+                          treated as a new root instead of a child.
+    * ``line_of``       — ``{uuid: file_line_number}`` so callers can
+                          synthesise ``<path>#<n>`` ids.
+    * ``roots``         — records at top level: metadata (no parent),
+                          true roots (parentUuid=null), orphans, and
+                          turn-roots. In file order, intermixed.
+    * ``agent_link``    — ``{tool_use_id: {agent_id, agent_path}}`` for
+                          every Agent/Task tool_use whose tool_result
+                          carried a resolvable subagent .jsonl.
+
+    Per-record attrs (attached lazily for renderers / list builders):
+      * ``rec['_tree_orphan']``     — parentUuid set but didn't resolve.
+      * ``rec['_tree_is_meta']``    — metadata-type record.
+      * ``rec['_tree_is_turn']``    — root because inheritedPromptId changed.
+      * ``rec['_tree_forked_from']``— record forks from an earlier uuid.
+    """
+
+    __slots__ = ('records', 'by_uuid', 'by_parent', 'inherited_pid',
+                 'line_of', 'roots', 'agent_link')
+
+    def __init__(self):
+        self.records = []
+        self.by_uuid = {}
+        self.by_parent = {}
+        self.inherited_pid = {}
+        self.line_of = {}
+        self.roots = []
+        self.agent_link = {}
+
+
+def _scan_tree(path):
+    """Return cached ``_TreeData`` for ``path``; (re)scan on mtime change."""
+    try:
+        mtime = os.stat(path).st_mtime
+    except OSError:
+        return _TreeData()
+    cached = _TREE_CACHE.get(path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+
+    td = _TreeData()
+    try:
+        f = open(path, 'r', encoding='utf-8', errors='replace')
+    except OSError:
+        _TREE_CACHE[path] = (mtime, td)
+        return td
+    with f:
+        for n, line in enumerate(f):
+            line = line.rstrip('\n')
+            if not line.strip():
+                td.records.append(None)
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                td.records.append(None)
+                continue
+            if not isinstance(rec, dict):
+                td.records.append(None)
+                continue
+            td.records.append(rec)
+            uuid = rec.get('uuid')
+            if uuid:
+                td.by_uuid[uuid] = rec
+                td.line_of[uuid] = n
+
+    # Second pass: classify each record. Order matters — inheritedPromptId
+    # propagates parent→child, so process records in file order (parents
+    # always precede their children in Claude Code's append-only log).
+    for rec in td.records:
+        if rec is None:
+            continue
+        t = rec.get('type', '')
+        uuid = rec.get('uuid')
+        parent_uuid = rec.get('parentUuid')
+
+        # inheritedPromptId: own promptId if set, else parent's, else None.
+        own_pid = rec.get('promptId')
+        if own_pid:
+            ipid = own_pid
+        elif parent_uuid and parent_uuid in td.inherited_pid:
+            ipid = td.inherited_pid[parent_uuid]
+        else:
+            ipid = None
+        if uuid:
+            td.inherited_pid[uuid] = ipid
+
+        # forkedFrom — surface as a node attr.
+        if rec.get('forkedFrom'):
+            rec['_tree_forked_from'] = rec['forkedFrom']
+
+        # Root classification (in priority order so flags are mutually
+        # exclusive where it matters).
+        is_root = False
+        if t in _TREE_METADATA_TYPES:
+            rec['_tree_is_meta'] = True
+            is_root = True
+        elif parent_uuid is None:
+            # Genuine top of conversation (first user prompt of session).
+            is_root = True
+        elif parent_uuid not in td.by_uuid:
+            # Parent doesn't resolve — corruption / partial restore /
+            # cross-file reference we can't follow. Treat as a root so
+            # the record still shows.
+            rec['_tree_orphan'] = True
+            is_root = True
+        else:
+            parent_pid = td.inherited_pid.get(parent_uuid)
+            if ipid is not None and parent_pid is not None and ipid != parent_pid:
+                # New turn: child's inheritedPromptId broke from parent's.
+                rec['_tree_is_turn'] = True
+                is_root = True
+
+        if is_root:
+            td.roots.append(rec)
+        else:
+            td.by_parent.setdefault(parent_uuid, []).append(rec)
+
+    # Subagent link table: for every assistant record carrying an
+    # Agent/Task tool_use, find the matching tool_result among its
+    # children, read its ``toolUseResult.agentId``, and resolve it to a
+    # subagent .jsonl path. Stored keyed by the tool_use id so #300's
+    # get_children can attach the subagent under the assistant row.
+    sub_dir = _subagents_dir(path)
+    for rec in td.records:
+        if rec is None:
+            continue
+        if rec.get('type') != 'assistant':
+            continue
+        msg = rec.get('message') or {}
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get('content') or []
+        if not isinstance(content, list):
+            continue
+        agent_calls = [
+            p for p in content
+            if isinstance(p, dict)
+            and p.get('type') == 'tool_use'
+            and p.get('name') in ('Agent', 'Task')
+        ]
+        if not agent_calls:
+            continue
+        # Walk children-by-parent to find the matching tool_result(s).
+        children = td.by_parent.get(rec.get('uuid'), [])
+        for tu in agent_calls:
+            tu_id = tu.get('id')
+            for child in children:
+                cmsg = child.get('message') or {}
+                if not isinstance(cmsg, dict):
+                    continue
+                ccontent = cmsg.get('content') or []
+                if not isinstance(ccontent, list):
+                    continue
+                for cp in ccontent:
+                    if (isinstance(cp, dict)
+                            and cp.get('type') == 'tool_result'
+                            and cp.get('tool_use_id') == tu_id):
+                        tur = child.get('toolUseResult')
+                        agent_id = (tur.get('agentId')
+                                    if isinstance(tur, dict) else None)
+                        if agent_id:
+                            agent_path = os.path.join(
+                                sub_dir, f'agent-{agent_id}.jsonl',
+                            )
+                            if os.path.isfile(agent_path):
+                                td.agent_link[tu_id] = {
+                                    'agent_id': agent_id,
+                                    'agent_path': agent_path,
+                                    'assistant_uuid': rec.get('uuid'),
+                                }
+
+    _TREE_CACHE[path] = (mtime, td)
+    return td
+
+
+def _last_voice_id(jsonl_path):
+    """Return ``<jsonl>#<n>`` id of the most-recent voice record, or None.
+
+    "Voice" matches ``_is_voice`` (user prompt or assistant text). Walks
+    records in REVERSE file order so the latest wins. Used for the
+    cursor-on-open and the t-toggle landing point.
+    """
+    td = _scan_tree(jsonl_path)
+    for n in range(len(td.records) - 1, -1, -1):
+        rec = td.records[n]
+        if rec is not None and _is_voice(rec):
+            return f'{jsonl_path}#{n}'
+    return None
+
+
+def _list_tree_roots(jsonl_path):
+    """Tree-mode listing for a session: root-level rows in file order."""
+    td = _scan_tree(jsonl_path)
+    out = []
+    for rec in td.roots:
+        if rec is None:
+            continue
+        item = _tree_item(jsonl_path, rec, td)
+        if item is not None:
+            out.append(item)
+    return out
+
+
+def _list_tree_children(jsonl_path, line_no):
+    """Children of one record in tree mode.
+
+    Combines two sources:
+      1. Records whose ``parentUuid`` points at this record (the
+         conversation chain — tool_result of a tool_use call, the next
+         assistant reply, etc.).
+      2. Subagent pseudo-rows. If this record is an assistant message
+         carrying an Agent/Task tool_use call whose ``tool_use_id`` has
+         a resolvable subagent .jsonl on disk (via ``td.agent_link``),
+         emit a single collapsible row for each such call.
+
+    Both sources are concatenated in that order — conversation chain
+    first, subagent pseudo-rows after — so the natural reading order
+    inside a turn stays "agent said X, the tool returned Y, … and by
+    the way it dispatched a subagent (collapsed)".
+    """
+    td = _scan_tree(jsonl_path)
+    if not (0 <= line_no < len(td.records)):
+        return []
+    rec = td.records[line_no]
+    if rec is None:
+        return []
+    out = []
+    uuid = rec.get('uuid')
+    if uuid:
+        for child in td.by_parent.get(uuid, []):
+            it = _tree_item(jsonl_path, child, td)
+            if it is not None:
+                out.append(it)
+    # Subagent pseudo-rows under an assistant's Agent/Task call.
+    if rec.get('type') == 'assistant':
+        msg = rec.get('message') or {}
+        if isinstance(msg, dict):
+            content = msg.get('content') or []
+            if isinstance(content, list):
+                for p in content:
+                    if (isinstance(p, dict)
+                            and p.get('type') == 'tool_use'
+                            and p.get('name') in ('Agent', 'Task')):
+                        link = td.agent_link.get(p.get('id'))
+                        if link:
+                            out.append(_subagent_pseudo_item(
+                                jsonl_path,
+                                link['agent_id'], link['agent_path'],
+                            ))
+    return out
+
+
+def _tree_item(jsonl_path, rec, td):
+    """Build a list-row ``Item`` for ``rec`` in tree mode.
+
+    Same shape as the flat-mode message item (same id, title, tag) plus
+    ``has_children=True`` when ``rec`` has chain-children or carries a
+    resolvable Agent/Task tool_use. The recipe's row-bg gate is applied
+    here too so voice rows pick up the conversational stripe in either
+    mode.
+    """
+    n = td.line_of.get(rec.get('uuid'))
+    if n is None:
+        for i, r in enumerate(td.records):
+            if r is rec:
+                n = i
+                break
+    if n is None:
+        return None
+    kind = _kind_of(rec)
+
+    has_children = False
+    uuid = rec.get('uuid')
+    if uuid and td.by_parent.get(uuid):
+        has_children = True
+    elif rec.get('type') == 'assistant':
+        msg = rec.get('message') or {}
+        if isinstance(msg, dict):
+            content = msg.get('content') or []
+            if isinstance(content, list):
+                for p in content:
+                    if (isinstance(p, dict)
+                            and p.get('type') == 'tool_use'
+                            and p.get('name') in ('Agent', 'Task')
+                            and p.get('id') in td.agent_link):
+                        has_children = True
+                        break
+
+    item = Item(
+        id=f'{jsonl_path}#{n}',
+        title=_oneline(_summarise_message(rec)),
+        tag=kind,
+        tag_style=_TAG_STYLE_FOR_KIND.get(kind, ''),
+        has_children=has_children,
+    )
+    item.kind = 'message'
+    item.line_no = n
+    item.session_path = jsonl_path
+    item.message_kind = kind
+    if _is_voice(rec):
+        bg = _ROW_BG_FOR_KIND.get(kind)
+        if bg is not None:
+            item.row_bg = bg
+    return item
+
+
+def _subagent_pseudo_item(parent_jsonl, agent_id, agent_path):
+    """Single-row Item representing a subagent under an assistant row.
+
+    Same fields as the rows produced by ``_list_subagents_for_session``
+    so the existing preview/edit handlers Just Work — only the parent
+    in the tree changes.
+    """
+    sub_dir = _subagents_dir(parent_jsonl)
+    meta = _read_subagent_meta(
+        os.path.join(sub_dir, f'agent-{agent_id}.meta.json'),
+    )
+    agent_type = meta.get('agentType') or 'agent'
+    description = meta.get('description') or ''
+    title = description or f'agent {agent_id}'
+    try:
+        st = os.stat(agent_path)
+        mtime = st.st_mtime
+    except OSError:
+        mtime = 0
+    try:
+        with open(agent_path, 'rb') as f:
+            count = sum(1 for _ in f)
+    except OSError:
+        count = 0
+    item = Item(
+        id=f'{parent_jsonl}#agent:{agent_id}',
+        title=title,
+        tag=f'{agent_type} · {count} msg · {_human_time(mtime)}',
+        tag_style='magenta',
+        has_children=count > 0,
+    )
+    item.kind = 'subagent'
+    item.agent_id = agent_id
+    item.agent_type = agent_type
+    item.agent_description = description
+    item.session_path = parent_jsonl
+    item.subagent_path = agent_path
+    item.line_count = count
+    item.mtime = mtime
+    return item
+
+
 def _fmt_session_card(m):
     """Compact metadata card for the session preview header.
 
@@ -2101,6 +2527,11 @@ def _fmt_session_card(m):
         rows.append(('title', f'{WHITE}{BOLD}{title}{RESET}'))
 
     chips = []
+    # View-mode chip — make it obvious which listing the user is looking
+    # at, especially since t-toggle silently changes the tree shape.
+    view_chip = (f'{GREEN}[tree]{RESET}' if _TREE_MODE
+                 else f'{MUTE}[flat]{RESET}')
+    chips.append(view_chip)
     mode = m.get('mode')
     if mode:
         col = RED if mode == 'coordinator' else MUTE
@@ -2348,6 +2779,102 @@ def _action_prev_voice(ctx):
     _jump_to_voice(ctx, -1)
 
 
+def _ancestor_ids_for(item_id):
+    """Return ``<jsonl>#<n>`` ids for every ancestor of ``item_id`` (root first).
+
+    Reads the parent chain from ``_scan_tree(jsonl_path)``. Empty list
+    when the id isn't a message id or has no resolvable parent. Useful
+    for the t-toggle: pre-expand the ancestor chain so a deeply-nested
+    message in the new view becomes visible before cursor_to fires.
+    """
+    if not isinstance(item_id, str) or '#' not in item_id or '#agent:' in item_id:
+        return []
+    path, _, lineno = item_id.rpartition('#')
+    try:
+        n = int(lineno)
+    except ValueError:
+        return []
+    if not os.path.isfile(path):
+        return []
+    td = _scan_tree(path)
+    if not (0 <= n < len(td.records)):
+        return []
+    rec = td.records[n]
+    chain = []
+    seen = set()
+    while rec is not None:
+        pu = rec.get('parentUuid')
+        if not pu or pu in seen:
+            break
+        seen.add(pu)
+        line = td.line_of.get(pu)
+        if line is None:
+            break
+        chain.append(f'{path}#{line}')
+        rec = td.records[line]
+    return list(reversed(chain))   # root → direct parent
+
+
+def _chain_expand_then_cursor(b, ancestor_ids, target_id):
+    """Sequentially expand ``ancestor_ids`` (root → leaf), then ``cursor_to``.
+
+    Each ``expand`` resolves only after its children are cached, which
+    is exactly when the next ``expand`` can read them. Without this
+    chaining the expands fire in parallel, the cursor_to runs before
+    any of them populate the visible list, and cursor_to no-ops
+    (leaving the cursor on the scope_root). Used for cursor-on-open
+    and the t-toggle's walk-up-and-expand path.
+    """
+    if not ancestor_ids:
+        b.cursor_to(target_id)
+        return
+    def _step(i):
+        if i >= len(ancestor_ids):
+            b.cursor_to(target_id)
+            return
+        b.expand(ancestor_ids[i]).then(lambda: _step(i + 1))
+    _step(0)
+
+
+def _action_toggle_tree(ctx):
+    """Flip flat ↔ tree view; preserve cursor on the same message id.
+
+    Flat→tree: the cursor's message may end up several levels deep
+    inside a turn-root that's collapsed by default. Walk the ``parentUuid``
+    chain from the target up to root, add each ancestor to the
+    framework's ``expanded`` set, then ``refresh()`` (which refetches the
+    root + every expanded parent) and ``cursor_to`` the original id.
+
+    Tree→flat: messages are direct children of the session in flat mode,
+    so no ancestors to expand — refresh + cursor_to is enough.
+    """
+    global _TREE_MODE
+    target_id = None
+    cur = ctx.cursor
+    if cur is not None:
+        target_id = cur.id
+
+    _TREE_MODE = not _TREE_MODE
+    ctx.message(f"view: {'tree' if _TREE_MODE else 'flat'}")
+
+    # Compute ancestor chain BEFORE refresh (we need a stable read of
+    # the file; refresh doesn't touch the on-disk content).
+    ancestors = _ancestor_ids_for(target_id) if target_id else []
+
+    pending = ctx.refresh()
+    if target_id:
+        # After refresh wipes the cache, chain ancestor expands → cursor.
+        # Same reasoning as cursor-on-open: cursor_to needs the row to
+        # be visible, which requires each ancestor's children to be
+        # cached, which is only guaranteed when each expand's Pending
+        # resolves before the next runs.
+        pending.then(
+            lambda: _chain_expand_then_cursor(
+                ctx._browser, ancestors, target_id,
+            )
+        )
+
+
 # ---- entry point ---------------------------------------------------------
 
 
@@ -2362,6 +2889,9 @@ Usage: browse-claude [OPTIONS] [PROJECT]
   --running       Filter projects/sessions to those with a live PID.
   --item N        After --session/--pid/--file, position the cursor on
                   line N (1-based) of the resolved transcript.
+  --tree          Show sessions as a tree (parentUuid + promptId structure,
+                  subagents inline under their assistant rows).
+  --no-tree       Show sessions as a flat reverse-time list (default).
   PROJECT         Project directory name under ~/.claude/projects/ to
                   drill into on launch. Ignored when --session / --pid /
                   --file is given.
@@ -2369,7 +2899,8 @@ Usage: browse-claude [OPTIONS] [PROJECT]
 Walks ~/.claude/projects/ to surface a four-level tree: projects ->
 sessions -> messages (or subagents) -> subagent messages. Drill into
 a transcript with Right/Alt-Down; preview shows the rendered turn.
-Edit (or 'o') opens the source .jsonl in $EDITOR at the right line.\
+Edit (or 'o') opens the source .jsonl in $EDITOR at the right line.
+Press ``t`` at any time to flip between flat and tree views.\
 """
 
 
@@ -2377,7 +2908,7 @@ _message_limit = _MESSAGE_LIMIT
 
 
 def main():
-    global _message_limit, _RUNNING_ONLY
+    global _message_limit, _RUNNING_ONLY, _TREE_MODE
     _init_color()
     _message_limit = _pop_limit_arg(_MESSAGE_LIMIT)
 
@@ -2388,6 +2919,14 @@ def main():
     file_arg   = _pop_value('--file')
     item_arg   = _pop_value('--item', int)
     _RUNNING_ONLY = _pop_flag('--running')
+
+    # View-mode flags (--tree wins over --no-tree if both are passed).
+    tree_flag    = _pop_flag('--tree')
+    no_tree_flag = _pop_flag('--no-tree')
+    if tree_flag:
+        _TREE_MODE = True
+    elif no_tree_flag:
+        _TREE_MODE = False
 
     # --running needs the running index regardless of which target we open;
     # tagging sessions with PIDs also depends on it.
@@ -2434,23 +2973,21 @@ def main():
 
     # Initial scope strategy when a target jsonl was resolved:
     #
-    #   --item N (any target):  scope INTO the jsonl, cursor on message N.
-    #                           The user explicitly wants to see message N,
-    #                           and the message row is a normal entry so
-    #                           preview works.
+    #   --item N:               scope INTO the jsonl, cursor on message N.
     #
-    #   no --item:              scope into the *parent* directory and put
-    #                           the cursor on the session row. Scoping
-    #                           directly into the jsonl would make the
-    #                           session a ``scope_root`` entry, which the
-    #                           framework intentionally skips for preview
-    #                           updates — you'd land on the file with no
-    #                           preview pane. With the parent as scope and
-    #                           the session row as a ``normal`` entry, the
-    #                           session preview (card + timeline) renders
-    #                           immediately and the user can drill in.
+    #   --tree, no --item:      scope INTO the jsonl, cursor on last voice
+    #                           (the user wants to see the conversation; the
+    #                           card+timeline is just bookkeeping, the
+    #                           interesting content is whatever was said
+    #                           most recently). Expanding ancestors makes
+    #                           the row visible despite default-collapsed
+    #                           subtrees.
+    #
+    #   flat, no --item:        scope into the *parent* directory and put
+    #                           the cursor on the session row. The session
+    #                           card preview shows everything at a glance.
     if target_jsonl:
-        if item_arg is not None:
+        if item_arg is not None or _TREE_MODE:
             initial_scope = target_jsonl
         else:
             initial_scope = os.path.dirname(target_jsonl) or '/'
@@ -2469,29 +3006,46 @@ def main():
         root_id=None,
         initial_scope=initial_scope,
         actions=[
-            Action('e', 'Edit/view source in $EDITOR',    _action_edit,       'cursor'),
-            Action('o', 'Edit/view source in $EDITOR',    _action_edit,       'cursor'),
-            Action('y', 'Show full id (paste-friendly)',  _action_show_id,    'cursor'),
-            Action('J', 'Jump to next voice (user/asst)', _action_next_voice, 'cursor'),
-            Action('K', 'Jump to prev voice (user/asst)', _action_prev_voice, 'cursor'),
+            Action('e', 'Edit/view source in $EDITOR',    _action_edit,        'cursor'),
+            Action('o', 'Edit/view source in $EDITOR',    _action_edit,        'cursor'),
+            Action('y', 'Show full id (paste-friendly)',  _action_show_id,     'cursor'),
+            Action('J', 'Jump to next voice (user/asst)', _action_next_voice,  'cursor'),
+            Action('K', 'Jump to prev voice (user/asst)', _action_prev_voice,  'cursor'),
+            Action('t', 'Toggle flat / tree view',        _action_toggle_tree, 'none'),
         ],
         help_intro=_HELP_INTRO_TMPL.format(default=_MESSAGE_LIMIT),
     )
 
     # Post-construction cursor positioning:
     #
-    #   With --item N: cursor lands on ``<jsonl>#<N-1>``. The scope is
-    #     already the jsonl, so messages render on first paint.
+    #   --item N:           cursor → ``<jsonl>#<N-1>``. Scope already
+    #                       the jsonl, so messages render on first paint.
     #
-    #   Without --item: scope is the parent dir; we need to (a) fetch its
-    #     children to populate the session-row list, then (b) move the
-    #     cursor onto the target session row. ``expand(parent).then(...)``
-    #     gives us that ordering for free — the .then fires once the
-    #     worker has cached the children list.
+    #   --tree, no --item:  cursor → last voice in the session. Walk
+    #                       parentUuid chain to pre-expand each ancestor
+    #                       so the row is visible despite default-collapsed
+    #                       subtrees. Falls back to the session row if no
+    #                       voice exists.
+    #
+    #   flat, no --item:    parent-dir scope; cursor → session row via
+    #                       expand-then-cursor_to.
     if target_jsonl:
         if item_arg is not None:
             n0 = max(1, item_arg) - 1
             b.cursor_to(f'{target_jsonl}#{n0}')
+        elif _TREE_MODE:
+            last_id = _last_voice_id(target_jsonl)
+            if last_id:
+                # Chain expands so each ancestor's children land in the
+                # cache before the next expand reads them, then
+                # cursor_to once the deepest expand resolves. Without
+                # the chain, cursor_to races the fetch worker — it
+                # scans visible_items, finds only the scope_root row
+                # (children of ancestors not yet fetched), and silently
+                # leaves the cursor put.
+                _chain_expand_then_cursor(
+                    b, _ancestor_ids_for(last_id), last_id,
+                )
         else:
             parent = os.path.dirname(target_jsonl) or '/'
             b.expand(parent).then(lambda: b.cursor_to(target_jsonl))
