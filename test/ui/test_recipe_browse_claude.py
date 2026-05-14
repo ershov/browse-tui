@@ -610,18 +610,58 @@ class TestBrowseClaude(unittest.TestCase):
                               f'cursor lost on flat→tree: {cap_back[:400]!r}')
                 t.send('q')
 
+    def test_tree_right_on_session_jumps_to_latest_voice(self):
+        """Drilling into a session row in tree mode lands on latest voice."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._make_tree_fixture(tmp)
+            # Don't auto-target the session — let the user drill in.
+            with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE, '--tree')
+                t.wait_for('/home/test/tree', timeout=3.0)
+                t.send('Right')                  # expand project (no voice yet)
+                t.wait_for('tree-sess', timeout=3.0)
+                t.send('Down')                   # cursor → session row
+                t.send('Right')                  # expand session
+                # Cursor should auto-land on PROBE_TURN2_REPLY — the
+                # latest voice in the whole session.
+                t.wait_for('PROBE_TURN2_REPLY', timeout=3.0)
+                cap = t.capture()
+                # Preview pane is the message preview for the cursor row.
+                self.assertIn('⏺ assistant', cap)
+                self.assertIn('PROBE_TURN2_REPLY', cap)
+                t.send('q')
+
     def test_tree_expand_assistant_shows_subagent(self):
-        """Expanding the Agent-calling assistant row reveals the subagent."""
+        """Expanding the Agent-calling assistant row reveals the subagent.
+
+        The fixture has two turns: turn 1 dispatched the subagent;
+        turn 2 is just text. Auto-cursor-on-open lands inside turn 2,
+        so we use ``K`` to walk back to turn 1's user voice, expand
+        turn 1, then drill into the Task-calling assistant row.
+        """
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess = self._make_tree_fixture(tmp)
             with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
                 t.launch(_BIN, '--run-py', _RECIPE,
                          '--tree', '--file', sess)
-                # The cursor-on-open chain already expanded all
-                # ancestors of the latest voice — including the
-                # assistant row that issued the Task call. So the
-                # subagent description should already be visible.
+                t.wait_for('PROBE_TURN2_REPLY', timeout=3.0)
+                # K walks UP through visible voices. From PROBE_TURN2_REPLY:
+                # K → PROBE_TURN2_USER, K → PROBE_TURN1_USER (turn 1 root,
+                # collapsed but visible at root level).
+                t.send('K')
+                t.send('K')
+                t.wait_for('PROBE_TURN1_USER', timeout=3.0)
+                # Right in tree mode expands the row AND auto-jumps the
+                # cursor to the latest voice inside the subtree. So
+                # after expanding turn 1, cursor lands on
+                # PROBE_TURN1_REPLY (the final assistant text). Up one
+                # row to land on the Task-calling assistant.
+                t.send('Right')
+                t.wait_for('PROBE_TURN1_REPLY', timeout=3.0)
+                t.send('Up')
+                t.send('Right')                  # expand Task assistant
                 t.wait_for('PROBE_SUBAGENT_DESC', timeout=3.0)
                 t.send('q')
 

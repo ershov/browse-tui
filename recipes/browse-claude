@@ -388,6 +388,17 @@ def get_children(item_id):
                 return []
             return _list_tree_roots(agent_path)
         return _list_subagent_messages(item_id)
+    if isinstance(item_id, str) and '#span:' in item_id:
+        # ``<jsonl>#span:<start>`` — synthetic <system> umbrella in tree
+        # mode. Children are the records of that span.
+        if _TREE_MODE:
+            path, _, suffix = item_id.partition('#span:')
+            try:
+                start = int(suffix)
+            except ValueError:
+                return []
+            return _list_span_records(path, start)
+        return []
     if isinstance(item_id, str) and '#' in item_id:
         # Message id ``<path>#<n>`` — only has children in tree mode.
         if _TREE_MODE:
@@ -790,8 +801,14 @@ _TAG_STYLE_FOR_KIND = {
 #   235 = #262626 (near-black neutral) for user prompts
 #    17 = #00005f (deep blue)           for assistant responses
 _ROW_BG_FOR_KIND = {
-    'user':      235,
-    'assistant':  17,
+    'user':            235,
+    'assistant':        17,
+    # ``queue-operation`` is the user typing more prompts while Claude
+    # is mid-turn — they're voice, just delivered out-of-band. Same
+    # stripe as a normal user voice so they read as "human still
+    # talking" even though they slot into the open turn rather than
+    # opening a new one.
+    'queue-operation': 235,
 }
 
 
@@ -802,9 +819,12 @@ def _is_voice(obj):
     assistant literally *said*. A user record whose content is just a
     tool_result wrapper, or an assistant record whose only content is
     a tool_use call, is machinery — kind/tag already calls it out, we
-    don't want to dye those rows.
+    don't want to dye those rows. ``queue-operation`` records also
+    count as voice (the user typed something while Claude was working).
     """
     t = obj.get('type')
+    if t == 'queue-operation':
+        return bool((obj.get('content') or '').strip())
     if t not in ('user', 'assistant'):
         return False
     msg = obj.get('message') if isinstance(obj.get('message'), dict) else {}
@@ -2143,47 +2163,105 @@ _TREE_METADATA_TYPES = frozenset([
 class _TreeData:
     """Cached tree-structure view of one ``.jsonl`` file.
 
-    Built once per file (per mtime). Fields:
+    The shape is span-based and ignores ``parentUuid`` for structure.
+    ``parentUuid`` is just a write-time linked-list back-pointer (see
+    ``sessionStorage.ts:1066`` in claude-code: ``parentUuid =
+    message.uuid`` after every chain-participant append). Using it
+    literally as a tree parent produces 15-deep cascades of attachments
+    under tool_results under attachments. The actual conversation
+    structure is way flatter:
 
-    * ``records``       — every parsed record in file order. Indices
-                          align with line numbers (for records that
-                          parsed cleanly); unparseable lines yield
-                          ``None`` so positions stay aligned.
-    * ``by_uuid``       — ``{uuid: record}`` for fast parent lookup.
-    * ``by_parent``     — ``{parentUuid: [child, …]}`` in file order.
-                          ``None`` key holds the records whose
-                          ``parentUuid`` is missing/null/orphan.
-    * ``inherited_pid`` — ``{uuid: promptId-from-self-or-ancestor}``.
-                          Used to detect turn boundaries: a child whose
-                          ``inheritedPromptId`` ≠ its parent's gets
-                          treated as a new root instead of a child.
-    * ``line_of``       — ``{uuid: file_line_number}`` so callers can
-                          synthesise ``<path>#<n>`` ids.
-    * ``roots``         — records at top level: metadata (no parent),
-                          true roots (parentUuid=null), orphans, and
-                          turn-roots. In file order, intermixed.
-    * ``agent_link``    — ``{tool_use_id: {agent_id, agent_path}}`` for
-                          every Agent/Task tool_use whose tool_result
-                          carried a resolvable subagent .jsonl.
+      * The session is a flat sequence of "turns" interleaved with
+        runs of out-of-turn metadata.
+      * A turn opens at a "user voice" record (user record carrying
+        text content, not a tool_result; not ``isMeta``) and closes at
+        the next ``system/turn_duration`` record (or at the next user
+        voice, whichever comes first).
+      * Everything between open/close is a turn member.
+      * Anything outside a turn — preamble, gaps between turns, file
+        tail — gets folded into a synthetic ``<system>`` umbrella span
+        so the top level doesn't blow up with one row per metadata
+        record.
 
-    Per-record attrs (attached lazily for renderers / list builders):
-      * ``rec['_tree_orphan']``     — parentUuid set but didn't resolve.
-      * ``rec['_tree_is_meta']``    — metadata-type record.
-      * ``rec['_tree_is_turn']``    — root because inheritedPromptId changed.
-      * ``rec['_tree_forked_from']``— record forks from an earlier uuid.
+    Inside a turn, only two semantic relationships are nested:
+
+      * tool execution group: an assistant record with a ``tool_use``
+        content part becomes the parent of (a) the matching user
+        tool_result (paired via ``tool_use_id``), (b) any attachment
+        records carrying a matching ``toolUseID`` (PreToolUse/
+        PostToolUse hook outputs), and (c) for Agent/Task tool_uses,
+        the subagent pseudo-row.
+      * subagent inline: the subagent's own ``.jsonl`` becomes a
+        recursive subtree under the assistant's tool_use row.
+
+    Fields:
+
+    * ``records``         — parsed records in file order, indices
+                            align with line numbers.
+    * ``by_uuid``         — ``{uuid: record}``.
+    * ``line_of``         — ``{uuid: line_number}``.
+    * ``roots_in_order``  — list of root-entry dicts in file order:
+                            ``{'kind':'turn','rec':<r>,'line':n}`` or
+                            ``{'kind':'span','start':n,'records':[…]}``.
+    * ``turn_direct``     — ``{turn_root_uuid: [recs]}`` — turn members
+                            that render directly under the turn (i.e.,
+                            NOT records that got re-parented under a
+                            tool_use as part of the tool execution group).
+    * ``tool_children``   — ``{assistant_uuid: [recs]}`` — the
+                            tool_result + hook attachments + isMeta
+                            back-pointers that pair with this assistant
+                            record's tool_use part. Drives the second
+                            layer of nesting inside a turn.
+    * ``span_records``    — ``{span_start_line: [recs]}`` — members of
+                            each ``<system>`` umbrella.
+    * ``agent_link``      — ``{tool_use_id: {agent_id, agent_path,
+                            assistant_uuid}}`` for every Agent/Task
+                            tool_use whose tool_result resolved a
+                            subagent .jsonl on disk.
+
+    Per-record attrs:
+      * ``rec['_tree_forked_from']`` — record explicitly forked from
+        an earlier uuid (``forkedFrom`` field).
     """
 
-    __slots__ = ('records', 'by_uuid', 'by_parent', 'inherited_pid',
-                 'line_of', 'roots', 'agent_link')
+    __slots__ = ('records', 'by_uuid', 'line_of', 'roots_in_order',
+                 'turn_direct', 'tool_children', 'span_records',
+                 'agent_link', 'records_line', 'parent_id_of')
 
     def __init__(self):
         self.records = []
         self.by_uuid = {}
-        self.by_parent = {}
-        self.inherited_pid = {}
         self.line_of = {}
-        self.roots = []
+        self.roots_in_order = []
+        self.turn_direct = {}
+        self.tool_children = {}
+        self.span_records = {}
         self.agent_link = {}
+        # id(rec) → line_no — looking up the line of a record without
+        # needing a uuid (metadata records often have none).
+        self.records_line = {}
+        # line_no → parent_id (``<jsonl>#<n>`` or ``<jsonl>#span:<n>``)
+        # for tree-ancestor walks. Top-level rows (turn-roots, span
+        # umbrellas) are absent.
+        self.parent_id_of = {}
+
+
+def _is_turn_root(rec):
+    """A turn root is a fresh user prompt — text content, not synthetic."""
+    if not isinstance(rec, dict):
+        return False
+    if rec.get('type') != 'user':
+        return False
+    if rec.get('isMeta'):
+        return False
+    return _is_voice(rec)
+
+
+def _is_turn_close(rec):
+    """``system/turn_duration`` is the post-turn marker."""
+    return (isinstance(rec, dict)
+            and rec.get('type') == 'system'
+            and rec.get('subtype') == 'turn_duration')
 
 
 def _scan_tree(path):
@@ -2217,97 +2295,141 @@ def _scan_tree(path):
                 td.records.append(None)
                 continue
             td.records.append(rec)
+            td.records_line[id(rec)] = n
             uuid = rec.get('uuid')
             if uuid:
                 td.by_uuid[uuid] = rec
                 td.line_of[uuid] = n
+            if rec.get('forkedFrom'):
+                rec['_tree_forked_from'] = rec['forkedFrom']
 
-    # Second pass: classify each record. Order matters — inheritedPromptId
-    # propagates parent→child, so process records in file order (parents
-    # always precede their children in Claude Code's append-only log).
-    for rec in td.records:
+    # Walk file order; partition records into spans (no open turn) vs
+    # turn members.
+    turn_open_uuid = None
+    turn_members_buf = {}    # turn_uuid → [recs] (collected here, later
+                             #   split into turn_direct + tool_children)
+    span_start = None
+    span_buf = []
+
+    def _close_span():
+        nonlocal span_start, span_buf
+        if span_buf:
+            td.span_records[span_start] = list(span_buf)
+            td.roots_in_order.append({
+                'kind': 'span',
+                'start': span_start,
+                'records': list(span_buf),
+            })
+        span_start = None
+        span_buf = []
+
+    for n, rec in enumerate(td.records):
         if rec is None:
             continue
-        t = rec.get('type', '')
-        uuid = rec.get('uuid')
-        parent_uuid = rec.get('parentUuid')
-
-        # inheritedPromptId: own promptId if set, else parent's, else None.
-        own_pid = rec.get('promptId')
-        if own_pid:
-            ipid = own_pid
-        elif parent_uuid and parent_uuid in td.inherited_pid:
-            ipid = td.inherited_pid[parent_uuid]
+        if _is_turn_root(rec):
+            _close_span()
+            turn_open_uuid = rec.get('uuid')
+            if turn_open_uuid:
+                turn_members_buf[turn_open_uuid] = []
+            td.roots_in_order.append({
+                'kind': 'turn', 'rec': rec, 'line': n,
+            })
+        elif turn_open_uuid is not None:
+            turn_members_buf[turn_open_uuid].append(rec)
+            if _is_turn_close(rec):
+                turn_open_uuid = None
         else:
-            ipid = None
-        if uuid:
-            td.inherited_pid[uuid] = ipid
+            if span_start is None:
+                span_start = n
+            span_buf.append(rec)
+    _close_span()
 
-        # forkedFrom — surface as a node attr.
-        if rec.get('forkedFrom'):
-            rec['_tree_forked_from'] = rec['forkedFrom']
+    # Tool execution grouping inside each turn. For every turn, build
+    # ``tool_owner: tool_use_id → assistant_uuid`` from the assistant
+    # records with tool_use content parts. Then partition members:
+    # records that back-point at a known tool_use get re-parented;
+    # everything else stays as a direct child of the turn root.
+    for turn_uuid, members in turn_members_buf.items():
+        tool_owner = {}
+        for m in members:
+            if m.get('type') != 'assistant':
+                continue
+            msg = m.get('message')
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get('content')
+            if not isinstance(content, list):
+                continue
+            for p in content:
+                if (isinstance(p, dict)
+                        and p.get('type') == 'tool_use'
+                        and p.get('id')):
+                    tool_owner[p['id']] = m.get('uuid')
 
-        # Root classification (in priority order so flags are mutually
-        # exclusive where it matters).
-        is_root = False
-        if t in _TREE_METADATA_TYPES:
-            rec['_tree_is_meta'] = True
-            is_root = True
-        elif parent_uuid is None:
-            # Genuine top of conversation (first user prompt of session).
-            is_root = True
-        elif parent_uuid not in td.by_uuid:
-            # Parent doesn't resolve — corruption / partial restore /
-            # cross-file reference we can't follow. Treat as a root so
-            # the record still shows.
-            rec['_tree_orphan'] = True
-            is_root = True
-        else:
-            parent_pid = td.inherited_pid.get(parent_uuid)
-            if ipid is not None and parent_pid is not None and ipid != parent_pid:
-                # New turn: child's inheritedPromptId broke from parent's.
-                rec['_tree_is_turn'] = True
-                is_root = True
+        direct = []
+        for m in members:
+            owner = None
 
-        if is_root:
-            td.roots.append(rec)
-        else:
-            td.by_parent.setdefault(parent_uuid, []).append(rec)
+            # (1) user tool_result content: tool_use_id back-pointer.
+            mmsg = m.get('message')
+            if isinstance(mmsg, dict):
+                mcontent = mmsg.get('content')
+                if isinstance(mcontent, list):
+                    for p in mcontent:
+                        if (isinstance(p, dict)
+                                and p.get('type') == 'tool_result'):
+                            tu = p.get('tool_use_id')
+                            if tu in tool_owner:
+                                owner = tool_owner[tu]
+                                break
 
-    # Subagent link table: for every assistant record carrying an
-    # Agent/Task tool_use, find the matching tool_result among its
-    # children, read its ``toolUseResult.agentId``, and resolve it to a
-    # subagent .jsonl path. Stored keyed by the tool_use id so #300's
-    # get_children can attach the subagent under the assistant row.
+            # (2) attachment with toolUseID — hook outputs.
+            if owner is None and m.get('type') == 'attachment':
+                att = m.get('attachment')
+                if isinstance(att, dict):
+                    tu = att.get('toolUseID')
+                    if tu in tool_owner:
+                        owner = tool_owner[tu]
+
+            # (3) records with explicit back-pointer fields (synthetic
+            # tool-followup user rows etc).
+            if owner is None:
+                tu = m.get('sourceToolUseID')
+                if tu in tool_owner:
+                    owner = tool_owner[tu]
+
+            if owner is not None:
+                td.tool_children.setdefault(owner, []).append(m)
+            else:
+                direct.append(m)
+        td.turn_direct[turn_uuid] = direct
+
+    # Subagent link: for every assistant record with an Agent/Task
+    # tool_use whose tool_children contain a matching tool_result whose
+    # toolUseResult.agentId resolves to a sibling subagent .jsonl,
+    # record the join. Used by ``_list_tree_children`` to attach the
+    # subagent pseudo-row under the assistant.
     sub_dir = _subagents_dir(path)
     for rec in td.records:
-        if rec is None:
+        if rec is None or rec.get('type') != 'assistant':
             continue
-        if rec.get('type') != 'assistant':
-            continue
-        msg = rec.get('message') or {}
+        msg = rec.get('message')
         if not isinstance(msg, dict):
             continue
-        content = msg.get('content') or []
+        content = msg.get('content')
         if not isinstance(content, list):
             continue
-        agent_calls = [
-            p for p in content
-            if isinstance(p, dict)
-            and p.get('type') == 'tool_use'
-            and p.get('name') in ('Agent', 'Task')
-        ]
-        if not agent_calls:
-            continue
-        # Walk children-by-parent to find the matching tool_result(s).
-        children = td.by_parent.get(rec.get('uuid'), [])
-        for tu in agent_calls:
-            tu_id = tu.get('id')
-            for child in children:
-                cmsg = child.get('message') or {}
+        for p in content:
+            if not (isinstance(p, dict)
+                    and p.get('type') == 'tool_use'
+                    and p.get('name') in ('Agent', 'Task')):
+                continue
+            tu_id = p.get('id')
+            for child in td.tool_children.get(rec.get('uuid'), []):
+                cmsg = child.get('message')
                 if not isinstance(cmsg, dict):
                     continue
-                ccontent = cmsg.get('content') or []
+                ccontent = cmsg.get('content')
                 if not isinstance(ccontent, list):
                     continue
                 for cp in ccontent:
@@ -2327,6 +2449,35 @@ def _scan_tree(path):
                                     'agent_path': agent_path,
                                     'assistant_uuid': rec.get('uuid'),
                                 }
+
+    # parent_id_of: maps each record's line → its tree-parent id.
+    # Used by ``_ancestor_ids_for`` for cursor-on-open and t-toggle's
+    # walk-up-and-expand. Top-level entries (turn-roots, span umbrellas)
+    # are absent from this map by design (they have no parent).
+    for turn_uuid, members in td.turn_direct.items():
+        turn_line = td.line_of.get(turn_uuid)
+        if turn_line is None:
+            continue
+        parent_id = f'{path}#{turn_line}'
+        for m in members:
+            line = td.records_line.get(id(m))
+            if line is not None:
+                td.parent_id_of[line] = parent_id
+    for owner_uuid, kids in td.tool_children.items():
+        owner_line = td.line_of.get(owner_uuid)
+        if owner_line is None:
+            continue
+        parent_id = f'{path}#{owner_line}'
+        for k in kids:
+            line = td.records_line.get(id(k))
+            if line is not None:
+                td.parent_id_of[line] = parent_id
+    for span_start, recs in td.span_records.items():
+        parent_id = f'{path}#span:{span_start}'
+        for r in recs:
+            line = td.records_line.get(id(r))
+            if line is not None:
+                td.parent_id_of[line] = parent_id
 
     _TREE_CACHE[path] = (mtime, td)
     return td
@@ -2348,34 +2499,38 @@ def _last_voice_id(jsonl_path):
 
 
 def _list_tree_roots(jsonl_path):
-    """Tree-mode listing for a session: root-level rows in file order."""
+    """Tree-mode listing for a session: root-level rows in file order.
+
+    Each entry is either a turn-root (user voice) or a ``<system>``
+    umbrella collapsing a contiguous run of metadata records.
+    """
     td = _scan_tree(jsonl_path)
     out = []
-    for rec in td.roots:
-        if rec is None:
-            continue
-        item = _tree_item(jsonl_path, rec, td)
-        if item is not None:
-            out.append(item)
+    for entry in td.roots_in_order:
+        if entry['kind'] == 'turn':
+            it = _tree_item(jsonl_path, entry['rec'], td)
+            if it is not None:
+                out.append(it)
+        else:   # 'span'
+            out.append(_span_umbrella_item(
+                jsonl_path, entry['start'], entry['records'],
+            ))
     return out
 
 
 def _list_tree_children(jsonl_path, line_no):
     """Children of one record in tree mode.
 
-    Combines two sources:
-      1. Records whose ``parentUuid`` points at this record (the
-         conversation chain — tool_result of a tool_use call, the next
-         assistant reply, etc.).
-      2. Subagent pseudo-rows. If this record is an assistant message
-         carrying an Agent/Task tool_use call whose ``tool_use_id`` has
-         a resolvable subagent .jsonl on disk (via ``td.agent_link``),
-         emit a single collapsible row for each such call.
+    Three cases, dispatched on ``rec``'s role in the structure:
 
-    Both sources are concatenated in that order — conversation chain
-    first, subagent pseudo-rows after — so the natural reading order
-    inside a turn stays "agent said X, the tool returned Y, … and by
-    the way it dispatched a subagent (collapsed)".
+    * **Turn root** (user voice) — children are ``turn_direct[uuid]``,
+      i.e. the turn's flat members minus anything re-parented under a
+      tool_use call.
+    * **Assistant carrying a tool_use** — children are
+      ``tool_children[uuid]`` (matched tool_result + hook attachments)
+      plus a subagent pseudo-row if any Agent/Task tool_use in this
+      assistant has a resolvable subagent.
+    * **Everything else** — leaf, no children.
     """
     td = _scan_tree(jsonl_path)
     if not (0 <= line_no < len(td.records)):
@@ -2385,13 +2540,22 @@ def _list_tree_children(jsonl_path, line_no):
         return []
     out = []
     uuid = rec.get('uuid')
-    if uuid:
-        for child in td.by_parent.get(uuid, []):
+
+    # Case 1: turn root.
+    if uuid and uuid in td.turn_direct:
+        for child in td.turn_direct[uuid]:
             it = _tree_item(jsonl_path, child, td)
             if it is not None:
                 out.append(it)
-    # Subagent pseudo-rows under an assistant's Agent/Task call.
+        return out
+
+    # Case 2: assistant row whose tool_use(s) own paired children
+    # and/or subagent dispatches.
     if rec.get('type') == 'assistant':
+        for child in td.tool_children.get(uuid, []):
+            it = _tree_item(jsonl_path, child, td)
+            if it is not None:
+                out.append(it)
         msg = rec.get('message') or {}
         if isinstance(msg, dict):
             content = msg.get('content') or []
@@ -2406,17 +2570,27 @@ def _list_tree_children(jsonl_path, line_no):
                                 jsonl_path,
                                 link['agent_id'], link['agent_path'],
                             ))
+        return out
+
+    return []
+
+
+def _list_span_records(jsonl_path, start_line):
+    """Children of a ``<system>`` umbrella: the records of one span."""
+    td = _scan_tree(jsonl_path)
+    out = []
+    for rec in td.span_records.get(start_line, []):
+        it = _tree_item(jsonl_path, rec, td)
+        if it is not None:
+            out.append(it)
     return out
 
 
 def _tree_item(jsonl_path, rec, td):
     """Build a list-row ``Item`` for ``rec`` in tree mode.
 
-    Same shape as the flat-mode message item (same id, title, tag) plus
-    ``has_children=True`` when ``rec`` has chain-children or carries a
-    resolvable Agent/Task tool_use. The recipe's row-bg gate is applied
-    here too so voice rows pick up the conversational stripe in either
-    mode.
+    ``has_children`` is True iff the record is a turn root with members,
+    or an assistant row that owns tool_children / a subagent dispatch.
     """
     n = td.line_of.get(rec.get('uuid'))
     if n is None:
@@ -2427,23 +2601,26 @@ def _tree_item(jsonl_path, rec, td):
     if n is None:
         return None
     kind = _kind_of(rec)
+    uuid = rec.get('uuid')
 
     has_children = False
-    uuid = rec.get('uuid')
-    if uuid and td.by_parent.get(uuid):
+    if uuid and td.turn_direct.get(uuid):
         has_children = True
     elif rec.get('type') == 'assistant':
-        msg = rec.get('message') or {}
-        if isinstance(msg, dict):
-            content = msg.get('content') or []
-            if isinstance(content, list):
-                for p in content:
-                    if (isinstance(p, dict)
-                            and p.get('type') == 'tool_use'
-                            and p.get('name') in ('Agent', 'Task')
-                            and p.get('id') in td.agent_link):
-                        has_children = True
-                        break
+        if td.tool_children.get(uuid):
+            has_children = True
+        else:
+            msg = rec.get('message') or {}
+            if isinstance(msg, dict):
+                content = msg.get('content') or []
+                if isinstance(content, list):
+                    for p in content:
+                        if (isinstance(p, dict)
+                                and p.get('type') == 'tool_use'
+                                and p.get('name') in ('Agent', 'Task')
+                                and p.get('id') in td.agent_link):
+                            has_children = True
+                            break
 
     item = Item(
         id=f'{jsonl_path}#{n}',
@@ -2460,6 +2637,50 @@ def _tree_item(jsonl_path, rec, td):
         bg = _ROW_BG_FOR_KIND.get(kind)
         if bg is not None:
             item.row_bg = bg
+    return item
+
+
+def _span_umbrella_item(jsonl_path, start_line, records):
+    """Synthetic ``<system>`` row collapsing a metadata span.
+
+    Id shape: ``<jsonl>#span:<start_line>``. ``get_children`` routes
+    that id to ``_list_span_records`` which returns the span's records
+    as flat children. Title shows the count + dominant types so the
+    row's still informative when collapsed.
+    """
+    from collections import Counter
+    type_counts = Counter()
+    for r in records:
+        if not isinstance(r, dict):
+            continue
+        t = r.get('type', '?')
+        if t == 'attachment':
+            att = r.get('attachment') or {}
+            sub = att.get('type', '') if isinstance(att, dict) else ''
+            type_counts[f'att:{sub}'] += 1
+        elif t == 'system':
+            sub = r.get('subtype', '')
+            type_counts[f'sys:{sub}' if sub else 'system'] += 1
+        else:
+            type_counts[t] += 1
+    types_summary = ', '.join(
+        f'{n}× {t}' if n > 1 else t
+        for t, n in type_counts.most_common(4)
+    )
+    if len(type_counts) > 4:
+        types_summary += ', …'
+
+    item = Item(
+        id=f'{jsonl_path}#span:{start_line}',
+        title=f'<system>  {types_summary}',
+        tag=f'{len(records)} records',
+        tag_style='dim',
+        has_children=len(records) > 0,
+    )
+    item.kind = 'span'
+    item.span_start = start_line
+    item.span_count = len(records)
+    item.session_path = jsonl_path
     return item
 
 
@@ -2779,15 +3000,108 @@ def _action_prev_voice(ctx):
     _jump_to_voice(ctx, -1)
 
 
-def _ancestor_ids_for(item_id):
-    """Return ``<jsonl>#<n>`` ids for every ancestor of ``item_id`` (root first).
+def _latest_voice_under(item_id):
+    """Latest-by-file-position voice record id within ``item_id``'s subtree.
 
-    Reads the parent chain from ``_scan_tree(jsonl_path)``. Empty list
-    when the id isn't a message id or has no resolvable parent. Useful
-    for the t-toggle: pre-expand the ancestor chain so a deeply-nested
-    message in the new view becomes visible before cursor_to fires.
+    Looks at the records that *would become visible* if ``item_id`` were
+    expanded — descendants in the tree-mode tree, not the raw
+    ``parentUuid`` chain. Returns ``None`` if the subtree has no voice
+    records or if the id doesn't resolve.
+
+    Cases handled, in id-shape order:
+
+      * bare ``.jsonl`` path (session or subagent file at the root of
+        a scope): latest voice in that file — defers to ``_last_voice_id``.
+      * ``<jsonl>#span:<n>``: latest voice among the span's records.
+      * ``<jsonl>#agent:<id>``: latest voice in the subagent's file.
+      * ``<jsonl>#<n>``: latest voice among the record's tree descendants.
     """
-    if not isinstance(item_id, str) or '#' not in item_id or '#agent:' in item_id:
+    if not isinstance(item_id, str):
+        return None
+
+    # Bare jsonl path — a session row.
+    if (item_id.endswith('.jsonl')
+            and os.path.isfile(item_id)
+            and '#' not in item_id):
+        return _last_voice_id(item_id)
+
+    # Span umbrella: scan its records for the latest voice.
+    if '#span:' in item_id:
+        path, _, suffix = item_id.partition('#span:')
+        try:
+            start = int(suffix)
+        except ValueError:
+            return None
+        if not os.path.isfile(path):
+            return None
+        td = _scan_tree(path)
+        latest_line = None
+        for r in td.span_records.get(start, []):
+            if _is_voice(r):
+                line = td.records_line.get(id(r))
+                if line is not None:
+                    latest_line = line
+        return f'{path}#{latest_line}' if latest_line is not None else None
+
+    # Subagent group: recurse into its own jsonl.
+    if '#agent:' in item_id:
+        path, _, suffix = item_id.partition('#agent:')
+        sub_dir = _subagents_dir(path)
+        agent_path = os.path.join(sub_dir, f'agent-{suffix}.jsonl')
+        if not os.path.isfile(agent_path):
+            return None
+        return _last_voice_id(agent_path)
+
+    # Regular message id: walk the tree-mode descendants.
+    if '#' not in item_id:
+        return None
+    path, _, lineno = item_id.rpartition('#')
+    try:
+        n = int(lineno)
+    except ValueError:
+        return None
+    if not os.path.isfile(path):
+        return None
+    td = _scan_tree(path)
+    if not (0 <= n < len(td.records)):
+        return None
+    rec = td.records[n]
+    if rec is None:
+        return None
+    uuid = rec.get('uuid')
+
+    descendants = [rec]
+    if uuid in td.turn_direct:
+        for m in td.turn_direct[uuid]:
+            descendants.append(m)
+            m_uuid = m.get('uuid')
+            if m_uuid in td.tool_children:
+                descendants.extend(td.tool_children[m_uuid])
+    elif uuid in td.tool_children:
+        descendants.extend(td.tool_children[uuid])
+
+    latest = None
+    for d in descendants:
+        if _is_voice(d):
+            line = td.records_line.get(id(d))
+            if line is not None:
+                latest = line
+    return f'{path}#{latest}' if latest is not None else None
+
+
+def _ancestor_ids_for(item_id):
+    """Return ids of every ancestor of ``item_id`` (root → direct parent).
+
+    Walks the **tree** parent map built in ``_scan_tree``, not the on-
+    disk ``parentUuid`` chain. The on-disk chain is a write-time linked
+    list (see ``sessionStorage.ts:1066``) that has nothing to do with
+    the displayed tree shape. Empty list for span/agent ids (those are
+    top-level) and for ids the scan can't resolve.
+    """
+    if not isinstance(item_id, str) or '#' not in item_id:
+        return []
+    if '#agent:' in item_id or '#span:' in item_id:
+        # Synthetic top-level rows — no ancestors.
         return []
     path, _, lineno = item_id.rpartition('#')
     try:
@@ -2797,22 +3111,24 @@ def _ancestor_ids_for(item_id):
     if not os.path.isfile(path):
         return []
     td = _scan_tree(path)
-    if not (0 <= n < len(td.records)):
-        return []
-    rec = td.records[n]
     chain = []
     seen = set()
-    while rec is not None:
-        pu = rec.get('parentUuid')
-        if not pu or pu in seen:
+    cur = n
+    while cur in td.parent_id_of:
+        parent_id = td.parent_id_of[cur]
+        if parent_id in seen:
             break
-        seen.add(pu)
-        line = td.line_of.get(pu)
-        if line is None:
+        seen.add(parent_id)
+        chain.append(parent_id)
+        # Span / agent ids are top-level — stop walking.
+        if '#span:' in parent_id or '#agent:' in parent_id:
             break
-        chain.append(f'{path}#{line}')
-        rec = td.records[line]
-    return list(reversed(chain))   # root → direct parent
+        _, _, parent_line = parent_id.rpartition('#')
+        try:
+            cur = int(parent_line)
+        except ValueError:
+            break
+    return list(reversed(chain))
 
 
 def _chain_expand_then_cursor(b, ancestor_ids, target_id):
@@ -2834,6 +3150,67 @@ def _chain_expand_then_cursor(b, ancestor_ids, target_id):
             return
         b.expand(ancestor_ids[i]).then(lambda: _step(i + 1))
     _step(0)
+
+
+def _action_tree_right(ctx):
+    """Right-arrow override: expand + jump to latest voice in tree mode.
+
+    Flat mode: replicate the framework default (collapsed row → expand;
+    already-expanded row → step into first child). Tree mode: same,
+    but after expanding a node, walk down to the latest voice inside
+    that subtree and land the cursor there. Reads better than leaving
+    the cursor on the now-expanded parent row.
+    """
+    cur = ctx.cursor
+    if cur is None:
+        return
+    state = ctx._browser._state
+    expandable = getattr(cur, 'has_children', False)
+
+    # Flat mode (or any non-tree-mode situation): emulate the default
+    # ``_nav_right`` — expand collapsed, step-into for already-expanded.
+    if not _TREE_MODE or not expandable:
+        if expandable and cur.id not in state.expanded:
+            ctx.expand(cur.id)
+            return
+        # Step into first child if cursor's next visible row is deeper.
+        try:
+            vis = ctx.visible_items
+        except AttributeError:
+            return
+        idx = ctx.cursor_index
+        if (expandable
+                and 0 <= idx < len(vis) - 1):
+            # ctx.visible_items returns (item, kind) tuples; the
+            # depth-comparison live in the framework's state. We don't
+            # have direct depth access here, so just nudge cursor one
+            # row down — the framework's expand-then-render guarantees
+            # the next row is the first child.
+            ctx._browser.cursor_to(vis[idx + 1][0].id)
+        return
+
+    target_id = cur.id
+    if target_id in state.expanded:
+        # Already expanded — jump straight to the latest voice in the
+        # subtree (same effect as repeated Right walking the tree).
+        latest = _latest_voice_under(target_id)
+        if latest and latest != target_id:
+            _chain_expand_then_cursor(
+                ctx._browser,
+                _ancestor_ids_for(latest),
+                latest,
+            )
+        return
+
+    # Collapsed expandable row: expand, then chain ancestors → cursor.
+    def _land():
+        latest = _latest_voice_under(target_id)
+        if latest is None or latest == target_id:
+            return
+        ancestors = [a for a in _ancestor_ids_for(latest)
+                     if a != target_id]
+        _chain_expand_then_cursor(ctx._browser, ancestors, latest)
+    ctx.expand(target_id).then(_land)
 
 
 def _action_toggle_tree(ctx):
@@ -3006,12 +3383,15 @@ def main():
         root_id=None,
         initial_scope=initial_scope,
         actions=[
-            Action('e', 'Edit/view source in $EDITOR',    _action_edit,        'cursor'),
-            Action('o', 'Edit/view source in $EDITOR',    _action_edit,        'cursor'),
-            Action('y', 'Show full id (paste-friendly)',  _action_show_id,     'cursor'),
-            Action('J', 'Jump to next voice (user/asst)', _action_next_voice,  'cursor'),
-            Action('K', 'Jump to prev voice (user/asst)', _action_prev_voice,  'cursor'),
-            Action('t', 'Toggle flat / tree view',        _action_toggle_tree, 'none'),
+            Action('e',     'Edit/view source in $EDITOR',     _action_edit,        'cursor'),
+            Action('o',     'Edit/view source in $EDITOR',     _action_edit,        'cursor'),
+            Action('y',     'Show full id (paste-friendly)',   _action_show_id,     'cursor'),
+            Action('J',     'Jump to next voice (user/asst)',  _action_next_voice,  'cursor'),
+            Action('K',     'Jump to prev voice (user/asst)',  _action_prev_voice,  'cursor'),
+            Action('t',     'Toggle flat / tree view',         _action_toggle_tree, 'none'),
+            # Tree-mode-aware Right: expand + jump to latest voice
+            # inside the now-visible subtree.
+            Action('right', 'Expand + cursor to latest voice', _action_tree_right,  'cursor'),
         ],
         help_intro=_HELP_INTRO_TMPL.format(default=_MESSAGE_LIMIT),
     )

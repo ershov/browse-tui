@@ -1099,99 +1099,188 @@ class TestScanTree(unittest.TestCase):
         return f.name
 
     def test_simple_chain(self):
-        # u1(pid=P1) -> a1 -> u2(tool_result, no pid) -> a2
+        # One turn: u1 (voice) → a1 (tool_use) → u2 (tool_result) → a2 (text).
+        # In the new structure: u1 is the turn root; a1 and a2 are direct
+        # members; u2 is re-parented under a1 via tool_use_id pairing.
         path = self._write_jsonl([
-            {'type': 'user', 'uuid': 'u1', 'parentUuid': None,
-             'promptId': 'P1',
+            {'type': 'user', 'uuid': 'u1',
              'message': {'role': 'user', 'content': 'go'}},
-            {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+            {'type': 'assistant', 'uuid': 'a1',
              'message': {'role': 'assistant', 'content': [
                  {'type': 'tool_use', 'id': 't1', 'name': 'Bash',
                   'input': {'command': 'ls'}},
              ]}},
-            {'type': 'user', 'uuid': 'u2', 'parentUuid': 'a1',
-             'promptId': 'P1',
+            {'type': 'user', 'uuid': 'u2',
              'message': {'role': 'user', 'content': [
                  {'type': 'tool_result', 'tool_use_id': 't1',
                   'content': 'ok'},
              ]}},
-            {'type': 'assistant', 'uuid': 'a2', 'parentUuid': 'u2',
+            {'type': 'assistant', 'uuid': 'a2',
              'message': {'role': 'assistant', 'content': [
                  {'type': 'text', 'text': 'done'},
              ]}},
         ])
         try:
             td = self.r._scan_tree(path)
-            # 4 records, 1 root, rest chained.
-            self.assertEqual(len([r for r in td.records if r]), 4)
-            self.assertEqual([r['uuid'] for r in td.roots], ['u1'])
-            self.assertEqual([r['uuid'] for r in td.by_parent['u1']], ['a1'])
-            self.assertEqual([r['uuid'] for r in td.by_parent['a1']], ['u2'])
-            self.assertEqual([r['uuid'] for r in td.by_parent['u2']], ['a2'])
-            # inheritedPromptId propagates.
-            for u in ('u1', 'a1', 'u2', 'a2'):
-                self.assertEqual(td.inherited_pid[u], 'P1',
-                                 f'{u} should inherit P1')
+            # One turn root (u1) at top level.
+            self.assertEqual(len(td.roots_in_order), 1)
+            self.assertEqual(td.roots_in_order[0]['kind'], 'turn')
+            self.assertEqual(td.roots_in_order[0]['rec']['uuid'], 'u1')
+            # u1's direct members: a1 (tool_use), a2 (text). u2 is NOT
+            # here — it's paired under a1.
+            direct = [r['uuid'] for r in td.turn_direct['u1']]
+            self.assertEqual(direct, ['a1', 'a2'])
+            # a1 owns u2 as a tool_child.
+            self.assertEqual(
+                [r['uuid'] for r in td.tool_children['a1']], ['u2'],
+            )
         finally:
             os.unlink(path)
 
-    def test_turn_boundary_breaks_chain(self):
-        # u1(pid=P1) -> a1 -> u2(pid=P2, parent=a1)
-        # u2 should be a root (new turn), NOT a child of a1.
+    def test_turn_boundary_makes_new_root(self):
+        # Two consecutive user voices → two turn roots; the first
+        # auto-closes when the second opens (no turn_duration between).
         path = self._write_jsonl([
-            {'type': 'user', 'uuid': 'u1', 'parentUuid': None,
-             'promptId': 'P1',
+            {'type': 'user', 'uuid': 'u1',
              'message': {'role': 'user', 'content': 'first'}},
-            {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+            {'type': 'assistant', 'uuid': 'a1',
              'message': {'role': 'assistant', 'content': [
                  {'type': 'text', 'text': 'reply'},
              ]}},
-            {'type': 'user', 'uuid': 'u2', 'parentUuid': 'a1',
-             'promptId': 'P2',
+            {'type': 'user', 'uuid': 'u2',
              'message': {'role': 'user', 'content': 'second'}},
         ])
         try:
             td = self.r._scan_tree(path)
-            self.assertEqual([r['uuid'] for r in td.roots], ['u1', 'u2'])
-            # a1 should NOT have u2 as a child (turn break).
-            self.assertNotIn('a1', td.by_parent)
-            # u2 is flagged as a turn-root.
-            u2 = td.by_uuid['u2']
-            self.assertTrue(u2.get('_tree_is_turn'))
+            self.assertEqual(len(td.roots_in_order), 2)
+            self.assertEqual(td.roots_in_order[0]['rec']['uuid'], 'u1')
+            self.assertEqual(td.roots_in_order[1]['rec']['uuid'], 'u2')
+            # u1 has a1 as a direct member. u2 has no members yet.
+            self.assertEqual(
+                [r['uuid'] for r in td.turn_direct['u1']], ['a1'],
+            )
+            self.assertEqual(td.turn_direct['u2'], [])
         finally:
             os.unlink(path)
 
-    def test_orphan_parent_becomes_root(self):
+    def test_lonely_user_record_is_still_a_turn_root(self):
+        # Defensive: a user voice with no parent and no sibling records.
+        # New algorithm doesn't care about parentUuid — text content
+        # alone makes it a turn root.
         path = self._write_jsonl([
             {'type': 'user', 'uuid': 'u1',
              'parentUuid': 'does-not-exist',
-             'promptId': 'P1',
              'message': {'role': 'user', 'content': 'broken'}},
         ])
         try:
             td = self.r._scan_tree(path)
-            self.assertEqual([r['uuid'] for r in td.roots], ['u1'])
-            self.assertTrue(td.by_uuid['u1'].get('_tree_orphan'))
+            self.assertEqual(len(td.roots_in_order), 1)
+            self.assertEqual(td.roots_in_order[0]['kind'], 'turn')
+            self.assertEqual(td.roots_in_order[0]['rec']['uuid'], 'u1')
         finally:
             os.unlink(path)
 
-    def test_metadata_records_are_roots(self):
+    def test_metadata_outside_turn_wraps_in_span(self):
+        # permission-mode (before any turn) → preamble span.
+        # u1 turn root.
+        # last-prompt (after u1, no turn_duration yet) → turn member.
+        # turn_duration closes the turn.
+        # ai-title after that → tail span.
         path = self._write_jsonl([
-            {'type': 'permission-mode', 'permissionMode': 'plan',
-             'sessionId': 'abcd1234'},
-            {'type': 'user', 'uuid': 'u1', 'parentUuid': None,
-             'promptId': 'P1',
+            {'type': 'permission-mode', 'permissionMode': 'plan'},
+            {'type': 'user', 'uuid': 'u1',
              'message': {'role': 'user', 'content': 'go'}},
-            {'type': 'last-prompt', 'lastPrompt': 'go',
-             'sessionId': 'abcd1234'},
+            {'type': 'last-prompt', 'lastPrompt': 'go'},
+            {'type': 'system', 'subtype': 'turn_duration',
+             'durationMs': 1, 'messageCount': 1},
+            {'type': 'ai-title', 'aiTitle': 'something'},
         ])
         try:
             td = self.r._scan_tree(path)
-            # 3 records all at root: permission-mode (meta), u1, last-prompt (meta).
-            self.assertEqual(len(td.roots), 3)
-            self.assertTrue(td.roots[0].get('_tree_is_meta'))
-            self.assertEqual(td.roots[1]['uuid'], 'u1')
-            self.assertTrue(td.roots[2].get('_tree_is_meta'))
+            # 3 top-level entries: preamble span, u1 turn, tail span.
+            self.assertEqual(len(td.roots_in_order), 3)
+            self.assertEqual(td.roots_in_order[0]['kind'], 'span')
+            self.assertEqual(td.roots_in_order[0]['start'], 0)
+            self.assertEqual(
+                [r['type'] for r in td.roots_in_order[0]['records']],
+                ['permission-mode'],
+            )
+            self.assertEqual(td.roots_in_order[1]['kind'], 'turn')
+            self.assertEqual(td.roots_in_order[1]['rec']['uuid'], 'u1')
+            self.assertEqual(td.roots_in_order[2]['kind'], 'span')
+            self.assertEqual(td.roots_in_order[2]['start'], 4)
+            # u1's direct members: last-prompt + turn_duration.
+            self.assertEqual(
+                [r['type'] for r in td.turn_direct['u1']],
+                ['last-prompt', 'system'],
+            )
+        finally:
+            os.unlink(path)
+
+    def test_queue_operation_inside_turn_is_voice_member(self):
+        # Queued prompts sent while a turn is open should land inside
+        # the turn (not a span) AND get the user-voice row_bg.
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'go'}},
+            {'type': 'assistant', 'uuid': 'a1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 't1', 'name': 'Bash',
+                  'input': {'command': 'sleep 10'}},
+             ]}},
+            {'type': 'queue-operation', 'operation': 'enqueue',
+             'content': 'also do this next', 'timestamp': '2026-05-14'},
+            {'type': 'system', 'subtype': 'turn_duration',
+             'durationMs': 1, 'messageCount': 1},
+        ])
+        try:
+            td = self.r._scan_tree(path)
+            # One turn root (u1); queue-op + turn_duration are turn
+            # members. No span at the top level.
+            self.assertEqual(len(td.roots_in_order), 1)
+            self.assertEqual(td.roots_in_order[0]['kind'], 'turn')
+            self.assertEqual(td.roots_in_order[0]['rec']['uuid'], 'u1')
+            direct_types = [r['type'] for r in td.turn_direct['u1']]
+            self.assertIn('queue-operation', direct_types)
+            # The Item built for it picks up row_bg.
+            queue_rec = next(r for r in td.records or []
+                             if isinstance(r, dict)
+                             and r.get('type') == 'queue-operation')
+            item = self.r._tree_item(path, queue_rec, td)
+            self.assertEqual(getattr(item, 'row_bg', None), 235)
+        finally:
+            os.unlink(path)
+
+    def test_hook_attachment_pairs_with_tool_use(self):
+        # Attachment with toolUseID matching a tool_use part nests
+        # under that tool_use's assistant row.
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'go'}},
+            {'type': 'assistant', 'uuid': 'a1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 't1', 'name': 'Bash',
+                  'input': {'command': 'ls'}},
+             ]}},
+            {'type': 'attachment',
+             'attachment': {'type': 'hook_success', 'hookName': 'lint',
+                            'hookEvent': 'PreToolUse', 'exitCode': 0,
+                            'durationMs': 5, 'toolUseID': 't1',
+                            'stdout': '', 'stderr': ''}},
+            {'type': 'user', 'uuid': 'u2',
+             'message': {'role': 'user', 'content': [
+                 {'type': 'tool_result', 'tool_use_id': 't1',
+                  'content': 'ok'},
+             ]}},
+        ])
+        try:
+            td = self.r._scan_tree(path)
+            # u1 turn root, a1 direct member. u2 + hook attachment under a1.
+            self.assertEqual(td.turn_direct['u1'][0]['uuid'], 'a1')
+            tool_kids = td.tool_children['a1']
+            kinds = [r['type'] for r in tool_kids]
+            self.assertIn('user', kinds)        # tool_result
+            self.assertIn('attachment', kinds)  # hook
         finally:
             os.unlink(path)
 
@@ -1334,93 +1423,103 @@ class TestTreeListings(unittest.TestCase):
         f.close()
         return f.name
 
-    def test_session_roots_in_file_order(self):
-        # Two turns + one metadata record interleaved.
+    def test_session_roots_wraps_metadata_in_span(self):
+        # permission-mode (preamble) + u1 (turn) + u2 (next turn) →
+        # three roots: span, turn, turn.
         path = self._write_jsonl([
             {'type': 'permission-mode', 'permissionMode': 'plan'},
-            {'type': 'user', 'uuid': 'u1', 'parentUuid': None,
-             'promptId': 'P1',
+            {'type': 'user', 'uuid': 'u1',
              'message': {'role': 'user', 'content': 'first'}},
-            {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+            {'type': 'assistant', 'uuid': 'a1',
              'message': {'role': 'assistant', 'content': [
                  {'type': 'text', 'text': 'reply'},
              ]}},
-            {'type': 'user', 'uuid': 'u2', 'parentUuid': 'a1',
-             'promptId': 'P2',
+            {'type': 'user', 'uuid': 'u2',
              'message': {'role': 'user', 'content': 'second'}},
         ])
         try:
             roots = self.r._list_tree_roots(path)
-            # Expect permission-mode, u1, u2 — in file order.
             self.assertEqual(len(roots), 3)
-            self.assertEqual(roots[0].kind, 'message')
-            self.assertEqual(roots[0].line_no, 0)   # metadata first
-            self.assertEqual(roots[1].line_no, 1)   # u1
-            self.assertEqual(roots[2].line_no, 3)   # u2 (turn-root)
+            # Preamble span umbrella.
+            self.assertEqual(roots[0].kind, 'span')
+            self.assertEqual(roots[0].id, f'{path}#span:0')
+            # u1 turn root.
+            self.assertEqual(roots[1].kind, 'message')
+            self.assertEqual(roots[1].line_no, 1)
+            # u2 turn root.
+            self.assertEqual(roots[2].kind, 'message')
+            self.assertEqual(roots[2].line_no, 3)
         finally:
             os.unlink(path)
 
-    def test_drill_into_turn_root_lists_chain(self):
+    def test_drill_into_turn_root_pairs_tool_result(self):
+        # u1 → a1 (tool_use) → u2 (tool_result) → a2 (text).
+        # u1's direct children: a1, a2. u2 is paired under a1.
         path = self._write_jsonl([
-            {'type': 'user', 'uuid': 'u1', 'parentUuid': None,
-             'promptId': 'P1',
+            {'type': 'user', 'uuid': 'u1',
              'message': {'role': 'user', 'content': 'go'}},
-            {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+            {'type': 'assistant', 'uuid': 'a1',
              'message': {'role': 'assistant', 'content': [
                  {'type': 'tool_use', 'id': 't1', 'name': 'Bash',
                   'input': {'command': 'ls'}},
              ]}},
-            {'type': 'user', 'uuid': 'u2', 'parentUuid': 'a1',
-             'promptId': 'P1',
+            {'type': 'user', 'uuid': 'u2',
              'message': {'role': 'user', 'content': [
                  {'type': 'tool_result', 'tool_use_id': 't1',
                   'content': 'ok'},
              ]}},
-            {'type': 'assistant', 'uuid': 'a2', 'parentUuid': 'u2',
+            {'type': 'assistant', 'uuid': 'a2',
              'message': {'role': 'assistant', 'content': [
                  {'type': 'text', 'text': 'done'},
              ]}},
         ])
         try:
-            # Children of u1 → [a1]
-            self.assertEqual(
-                [it.line_no for it in self.r._list_tree_children(path, 0)],
-                [1],
-            )
-            # Children of a1 → [u2]
-            self.assertEqual(
-                [it.line_no for it in self.r._list_tree_children(path, 1)],
-                [2],
-            )
-            # Children of u2 → [a2]
-            self.assertEqual(
-                [it.line_no for it in self.r._list_tree_children(path, 2)],
-                [3],
-            )
-            # a2 is a leaf.
+            # u1's children: [a1, a2] (a1 is line 1, a2 is line 3).
+            kids = self.r._list_tree_children(path, 0)
+            self.assertEqual([it.line_no for it in kids], [1, 3])
+            # a1's tool-execution children: [u2].
+            tool_kids = self.r._list_tree_children(path, 1)
+            self.assertEqual([it.line_no for it in tool_kids], [2])
+            # u2 and a2 are leaves.
+            self.assertEqual(self.r._list_tree_children(path, 2), [])
             self.assertEqual(self.r._list_tree_children(path, 3), [])
         finally:
             os.unlink(path)
 
-    def test_new_turn_user_is_not_a_child_of_prev_assistant(self):
-        # u1(P1) → a1 → u2(P2). u2 is a turn-root, not under a1.
+    def test_span_umbrella_children_are_records(self):
         path = self._write_jsonl([
-            {'type': 'user', 'uuid': 'u1', 'parentUuid': None,
-             'promptId': 'P1',
+            {'type': 'permission-mode', 'permissionMode': 'plan'},
+            {'type': 'ai-title', 'aiTitle': 'something'},
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'go'}},
+        ])
+        try:
+            roots = self.r._list_tree_roots(path)
+            self.assertEqual(roots[0].kind, 'span')
+            self.assertEqual(roots[0].span_count, 2)
+            # Drill into the span: two metadata records.
+            span_kids = self.r._list_span_records(path, 0)
+            self.assertEqual([it.line_no for it in span_kids], [0, 1])
+        finally:
+            os.unlink(path)
+
+    def test_two_consecutive_user_voices_yield_two_turn_roots(self):
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
              'message': {'role': 'user', 'content': 'first'}},
-            {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+            {'type': 'assistant', 'uuid': 'a1',
              'message': {'role': 'assistant', 'content': [
                  {'type': 'text', 'text': 'r'},
              ]}},
-            {'type': 'user', 'uuid': 'u2', 'parentUuid': 'a1',
-             'promptId': 'P2',
+            {'type': 'user', 'uuid': 'u2',
              'message': {'role': 'user', 'content': 'second'}},
         ])
         try:
-            kids_of_a1 = self.r._list_tree_children(path, 1)
-            self.assertEqual(kids_of_a1, [])
             roots = self.r._list_tree_roots(path)
             self.assertEqual([it.line_no for it in roots], [0, 2])
+            # u1's direct child is a1 (no other voices in this turn).
+            kids = self.r._list_tree_children(path, 0)
+            self.assertEqual([it.line_no for it in kids], [1])
         finally:
             os.unlink(path)
 
@@ -1470,13 +1569,15 @@ class TestTreeListings(unittest.TestCase):
                             'description': 'probe stuff'}, f)
 
             kids = self.r._list_tree_children(sess_path, 1)  # assistant @ line 1
+            # Two children: the tool_result (paired via tool_use_id) and
+            # the subagent pseudo-row (via agent_link).
             self.assertEqual(len(kids), 2)
-            self.assertEqual(kids[0].kind, 'message')
-            self.assertEqual(kids[0].line_no, 2)   # the tool_result
-            self.assertEqual(kids[1].kind, 'subagent')
-            self.assertEqual(kids[1].agent_id, 'AGENT01')
-            self.assertEqual(kids[1].id,
-                             f'{sess_path}#agent:AGENT01')
+            kinds = [k.kind for k in kids]
+            self.assertIn('message', kinds)    # tool_result
+            self.assertIn('subagent', kinds)
+            sub = next(k for k in kids if k.kind == 'subagent')
+            self.assertEqual(sub.agent_id, 'AGENT01')
+            self.assertEqual(sub.id, f'{sess_path}#agent:AGENT01')
             # And the assistant row itself reports has_children=True.
             td = self.r._scan_tree(sess_path)
             asst_item = self.r._tree_item(sess_path,
@@ -1500,20 +1601,21 @@ class TestTreeListings(unittest.TestCase):
         try:
             saved = self.r._TREE_MODE
             try:
-                # Tree mode: session jsonl → root-level rows.
+                # Tree mode: session jsonl → root-level rows (one turn root).
                 self.r._TREE_MODE = True
                 roots = self.r.get_children(path)
-                self.assertEqual([it.line_no for it in roots], [0])
-                # Message id with children → returns them.
+                self.assertEqual(len(roots), 1)
+                self.assertEqual(roots[0].kind, 'message')
+                self.assertEqual(roots[0].line_no, 0)   # u1
+                # Turn root's children → [a1].
                 kids = self.r.get_children(f'{path}#0')
                 self.assertEqual([it.line_no for it in kids], [1])
-                # Leaf message → no children.
+                # a1 is a leaf (no tool_use parts in this fixture).
                 self.assertEqual(self.r.get_children(f'{path}#1'), [])
 
                 # Flat mode: session jsonl → messages newest-first list.
                 self.r._TREE_MODE = False
                 flat = self.r.get_children(path)
-                # Same two messages, newest-first.
                 titles = [it.title for it in flat if it.kind == 'message']
                 self.assertEqual(len(titles), 2)
                 # Message id has no children in flat mode.
