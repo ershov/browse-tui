@@ -3046,21 +3046,6 @@ def _split_cmd(s):
     return shlex.split(s)
 
 
-# Matches an ANSI CSI/SGR escape sequence. Used to strip colour codes
-# from the preview before feeding it to a markdown renderer, since md
-# tools don't understand ANSI and would dump them as literal noise.
-_ANSI_STRIP_RE = None   # lazy-compiled below
-
-
-def _strip_ansi(s):
-    """Remove ANSI escape sequences from ``s``."""
-    global _ANSI_STRIP_RE
-    if _ANSI_STRIP_RE is None:
-        import re
-        _ANSI_STRIP_RE = re.compile(r'\x1b\[[0-9;]*m')
-    return _ANSI_STRIP_RE.sub('', s)
-
-
 def _resolve_md_pager():
     """Return the resolved markdown-pager command, or None.
 
@@ -3090,8 +3075,10 @@ def _action_md_preview(ctx):
 
     Resolves the renderer via ``_resolve_md_pager``. Reads the cursor
     row's preview (synchronously via ``get_preview`` if not cached),
-    strips ANSI from it (so the renderer sees plain markdown text),
-    writes to a temp .md file, runs the renderer on it, then cleans up.
+    writes it verbatim to a temp .md file, and runs the renderer on
+    it. Same plumbing as ``v``'s ``less -R``: the preview text is
+    handed off as-is; whatever ANSI it carries is the renderer's
+    problem to handle (or pass through).
     """
     import tempfile
     cmd = _resolve_md_pager()
@@ -3117,13 +3104,12 @@ def _action_md_preview(ctx):
         ctx.message('No preview available')
         return
 
-    plain = _strip_ansi(text)
     tmp = tempfile.NamedTemporaryFile(
         'w', suffix='.md', delete=False,
         encoding='utf-8', errors='surrogateescape',
     )
     try:
-        tmp.write(plain)
+        tmp.write(text)
         tmp.close()
         ctx.run_external(cmd + [tmp.name])
     finally:

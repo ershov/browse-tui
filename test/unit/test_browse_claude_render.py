@@ -1229,22 +1229,6 @@ class TestMdPagerResolution(unittest.TestCase):
             restore()
 
 
-class TestStripAnsi(unittest.TestCase):
-
-    @classmethod
-    def setUpClass(cls):
-        cls.r = _load_recipe()
-
-    def test_strips_csi_sgr(self):
-        self.assertEqual(
-            self.r._strip_ansi('\x1b[38;5;167mhello\x1b[0m world'),
-            'hello world',
-        )
-
-    def test_passthrough_plain(self):
-        self.assertEqual(self.r._strip_ansi('plain text'), 'plain text')
-
-
 class TestScanTree(unittest.TestCase):
     """``_scan_tree`` builds the parentUuid/promptId tree + caching."""
 
