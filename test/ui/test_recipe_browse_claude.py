@@ -610,26 +610,33 @@ class TestBrowseClaude(unittest.TestCase):
                               f'cursor lost on flat→tree: {cap_back[:400]!r}')
                 t.send('q')
 
-    def test_tree_right_on_session_jumps_to_latest_voice(self):
-        """Drilling into a session row in tree mode lands on latest voice."""
+    def test_tree_right_on_session_jumps_to_latest_turn_root(self):
+        """Drilling into a session row in tree mode lands on the latest turn root.
+
+        Single-level: cursor lands on the latest user voice (turn root)
+        among the session's direct children. The user can press Right
+        again to drill into that turn and land on the assistant reply.
+        """
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess = self._make_tree_fixture(tmp)
-            # Don't auto-target the session — let the user drill in.
             with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
                 t.launch(_BIN, '--run-py', _RECIPE, '--tree')
                 t.wait_for('/home/test/tree', timeout=3.0)
-                t.send('Right')                  # expand project (no voice yet)
+                t.send('Right')                  # expand project
                 t.wait_for('tree-sess', timeout=3.0)
                 t.send('Down')                   # cursor → session row
-                t.send('Right')                  # expand session
-                # Cursor should auto-land on PROBE_TURN2_REPLY — the
-                # latest voice in the whole session.
-                t.wait_for('PROBE_TURN2_REPLY', timeout=3.0)
+                t.send('Right')                  # expand session — one level
+                # Latest turn root (PROBE_TURN2_USER) is where the
+                # cursor should land.
+                t.wait_for('PROBE_TURN2_USER', timeout=3.0)
                 cap = t.capture()
-                # Preview pane is the message preview for the cursor row.
-                self.assertIn('⏺ assistant', cap)
-                self.assertIn('PROBE_TURN2_REPLY', cap)
+                self.assertIn('▶ user', cap)
+                self.assertIn('PROBE_TURN2_USER', cap)
+                # Pressing Right again should drill into turn 2 and
+                # land on its latest voice (PROBE_TURN2_REPLY).
+                t.send('Right')
+                t.wait_for('PROBE_TURN2_REPLY', timeout=3.0)
                 t.send('q')
 
     def test_tree_expand_assistant_shows_subagent(self):

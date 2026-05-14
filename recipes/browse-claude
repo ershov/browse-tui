@@ -3000,32 +3000,42 @@ def _action_prev_voice(ctx):
     _jump_to_voice(ctx, -1)
 
 
-def _latest_voice_under(item_id):
-    """Latest-by-file-position voice record id within ``item_id``'s subtree.
+def _latest_voice_among_children(item_id):
+    """Latest voice record id among the **direct** children of ``item_id``.
 
-    Looks at the records that *would become visible* if ``item_id`` were
-    expanded — descendants in the tree-mode tree, not the raw
-    ``parentUuid`` chain. Returns ``None`` if the subtree has no voice
-    records or if the id doesn't resolve.
+    Single-level: returns the id of the latest-by-file-position voice
+    record that would become visible if ``item_id`` were expanded.
+    Does NOT recurse into grandchildren — that's the user's job (press
+    Right again to drill deeper). Returns ``None`` if there is no voice
+    at this level, or the id doesn't resolve.
 
     Cases handled, in id-shape order:
 
-      * bare ``.jsonl`` path (session or subagent file at the root of
-        a scope): latest voice in that file — defers to ``_last_voice_id``.
+      * bare ``.jsonl`` path (session row): the latest **turn root**
+        (turn roots are themselves user-voice rows).
       * ``<jsonl>#span:<n>``: latest voice among the span's records.
-      * ``<jsonl>#agent:<id>``: latest voice in the subagent's file.
-      * ``<jsonl>#<n>``: latest voice among the record's tree descendants.
+      * ``<jsonl>#agent:<id>``: latest turn root in the subagent's file.
+      * ``<jsonl>#<n>`` resolving to a turn root: latest voice in
+        ``turn_direct[uuid]``.
+      * ``<jsonl>#<n>`` resolving to an assistant with tool_use children:
+        latest voice in ``tool_children[uuid]``.
     """
     if not isinstance(item_id, str):
         return None
 
-    # Bare jsonl path — a session row.
+    # Bare jsonl path — direct children are the file's roots. Pick the
+    # latest turn root (span umbrellas aren't voice).
     if (item_id.endswith('.jsonl')
             and os.path.isfile(item_id)
             and '#' not in item_id):
-        return _last_voice_id(item_id)
+        td = _scan_tree(item_id)
+        latest_line = None
+        for entry in td.roots_in_order:
+            if entry['kind'] == 'turn' and _is_voice(entry['rec']):
+                latest_line = entry['line']
+        return f'{item_id}#{latest_line}' if latest_line is not None else None
 
-    # Span umbrella: scan its records for the latest voice.
+    # Span umbrella: latest voice among its records.
     if '#span:' in item_id:
         path, _, suffix = item_id.partition('#span:')
         try:
@@ -3043,16 +3053,16 @@ def _latest_voice_under(item_id):
                     latest_line = line
         return f'{path}#{latest_line}' if latest_line is not None else None
 
-    # Subagent group: recurse into its own jsonl.
+    # Subagent group: latest turn root in its own jsonl.
     if '#agent:' in item_id:
         path, _, suffix = item_id.partition('#agent:')
         sub_dir = _subagents_dir(path)
         agent_path = os.path.join(sub_dir, f'agent-{suffix}.jsonl')
         if not os.path.isfile(agent_path):
             return None
-        return _last_voice_id(agent_path)
+        return _latest_voice_among_children(agent_path)
 
-    # Regular message id: walk the tree-mode descendants.
+    # Regular message id — turn root or tool-owning assistant.
     if '#' not in item_id:
         return None
     path, _, lineno = item_id.rpartition('#')
@@ -3070,20 +3080,17 @@ def _latest_voice_under(item_id):
         return None
     uuid = rec.get('uuid')
 
-    descendants = [rec]
     if uuid in td.turn_direct:
-        for m in td.turn_direct[uuid]:
-            descendants.append(m)
-            m_uuid = m.get('uuid')
-            if m_uuid in td.tool_children:
-                descendants.extend(td.tool_children[m_uuid])
+        children = td.turn_direct[uuid]
     elif uuid in td.tool_children:
-        descendants.extend(td.tool_children[uuid])
+        children = td.tool_children[uuid]
+    else:
+        return None
 
     latest = None
-    for d in descendants:
-        if _is_voice(d):
-            line = td.records_line.get(id(d))
+    for c in children:
+        if _is_voice(c):
+            line = td.records_line.get(id(c))
             if line is not None:
                 latest = line
     return f'{path}#{latest}' if latest is not None else None
@@ -3191,25 +3198,20 @@ def _action_tree_right(ctx):
 
     target_id = cur.id
     if target_id in state.expanded:
-        # Already expanded — jump straight to the latest voice in the
-        # subtree (same effect as repeated Right walking the tree).
-        latest = _latest_voice_under(target_id)
+        # Already expanded — jump to the latest voice one level down.
+        # User can press Right again to drill further; no auto-deep-dive.
+        latest = _latest_voice_among_children(target_id)
         if latest and latest != target_id:
-            _chain_expand_then_cursor(
-                ctx._browser,
-                _ancestor_ids_for(latest),
-                latest,
-            )
+            ctx.cursor_to(latest)
         return
 
-    # Collapsed expandable row: expand, then chain ancestors → cursor.
+    # Collapsed expandable row: expand, then cursor to the latest voice
+    # among the newly-visible direct children. Single level — drilling
+    # further is user-driven.
     def _land():
-        latest = _latest_voice_under(target_id)
-        if latest is None or latest == target_id:
-            return
-        ancestors = [a for a in _ancestor_ids_for(latest)
-                     if a != target_id]
-        _chain_expand_then_cursor(ctx._browser, ancestors, latest)
+        latest = _latest_voice_among_children(target_id)
+        if latest is not None and latest != target_id:
+            ctx.cursor_to(latest)
     ctx.expand(target_id).then(_land)
 
 
