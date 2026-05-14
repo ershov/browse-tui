@@ -1158,6 +1158,93 @@ class TestTreeChildrenPreview(unittest.TestCase):
             os.unlink(path)
 
 
+class TestMdPagerResolution(unittest.TestCase):
+    """``_resolve_md_pager`` walks $MD2ANSI / md / md2ansi in order."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _with_env(self, **kw):
+        """Snapshot, override, return restore-fn."""
+        saved = {k: os.environ.get(k) for k in kw}
+        for k, v in kw.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        def restore():
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        return restore
+
+    def test_env_var_wins(self):
+        restore = self._with_env(MD2ANSI='my-md-cmd --flag')
+        try:
+            self.assertEqual(self.r._resolve_md_pager(),
+                             ['my-md-cmd', '--flag'])
+        finally:
+            restore()
+
+    def test_env_pipeline_uses_shell(self):
+        restore = self._with_env(MD2ANSI='md2ansi | less -R')
+        try:
+            cmd = self.r._resolve_md_pager()
+            self.assertEqual(cmd[0], 'bash')
+            self.assertEqual(cmd[1], '-c')
+            self.assertIn('md2ansi | less -R', cmd[2])
+        finally:
+            restore()
+
+    def test_falls_through_to_path(self):
+        import shutil
+        # Build a temp dir with a sentinel ``md`` script, prepend to PATH.
+        import tempfile, stat
+        with tempfile.TemporaryDirectory() as tmp:
+            sentinel = os.path.join(tmp, 'md')
+            with open(sentinel, 'w') as f:
+                f.write('#!/bin/sh\ncat "$1"\n')
+            os.chmod(sentinel, os.stat(sentinel).st_mode | stat.S_IXUSR)
+            saved_path = os.environ['PATH']
+            restore = self._with_env(MD2ANSI=None)
+            try:
+                os.environ['PATH'] = tmp
+                # Force which() to re-resolve by passing the modified PATH.
+                self.assertEqual(self.r._resolve_md_pager(), ['md'])
+            finally:
+                os.environ['PATH'] = saved_path
+                restore()
+
+    def test_none_when_nothing_resolves(self):
+        restore = self._with_env(MD2ANSI=None)
+        saved_path = os.environ.get('PATH', '')
+        try:
+            os.environ['PATH'] = '/nonexistent-' + str(os.getpid())
+            self.assertIsNone(self.r._resolve_md_pager())
+        finally:
+            os.environ['PATH'] = saved_path
+            restore()
+
+
+class TestStripAnsi(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_strips_csi_sgr(self):
+        self.assertEqual(
+            self.r._strip_ansi('\x1b[38;5;167mhello\x1b[0m world'),
+            'hello world',
+        )
+
+    def test_passthrough_plain(self):
+        self.assertEqual(self.r._strip_ansi('plain text'), 'plain text')
+
+
 class TestScanTree(unittest.TestCase):
     """``_scan_tree`` builds the parentUuid/promptId tree + caching."""
 

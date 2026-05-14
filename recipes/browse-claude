@@ -3046,6 +3046,93 @@ def _split_cmd(s):
     return shlex.split(s)
 
 
+# Matches an ANSI CSI/SGR escape sequence. Used to strip colour codes
+# from the preview before feeding it to a markdown renderer, since md
+# tools don't understand ANSI and would dump them as literal noise.
+_ANSI_STRIP_RE = None   # lazy-compiled below
+
+
+def _strip_ansi(s):
+    """Remove ANSI escape sequences from ``s``."""
+    global _ANSI_STRIP_RE
+    if _ANSI_STRIP_RE is None:
+        import re
+        _ANSI_STRIP_RE = re.compile(r'\x1b\[[0-9;]*m')
+    return _ANSI_STRIP_RE.sub('', s)
+
+
+def _resolve_md_pager():
+    """Return the resolved markdown-pager command, or None.
+
+    Order: ``$MD2ANSI`` (shell-split), then ``md`` on PATH, then
+    ``md2ansi`` on PATH. Recipes that want a different fallback can
+    set ``$MD2ANSI`` to anything — including a piped chain like
+    ``md2ansi | less -R``, which we shell out via ``bash -c`` so the
+    pipe works.
+    """
+    import shlex
+    import shutil
+    env_cmd = os.environ.get('MD2ANSI')
+    if env_cmd:
+        if '|' in env_cmd or '<' in env_cmd or '>' in env_cmd:
+            # User-supplied pipeline — hand to a shell so the pipe runs.
+            return ['bash', '-c', f'{env_cmd} "$0"']
+        return shlex.split(env_cmd)
+    if shutil.which('md'):
+        return ['md']
+    if shutil.which('md2ansi'):
+        return ['md2ansi']
+    return None
+
+
+def _action_md_preview(ctx):
+    """``m`` — view the preview through a markdown-to-ANSI renderer.
+
+    Resolves the renderer via ``_resolve_md_pager``. Reads the cursor
+    row's preview (synchronously via ``get_preview`` if not cached),
+    strips ANSI from it (so the renderer sees plain markdown text),
+    writes to a temp .md file, runs the renderer on it, then cleans up.
+    """
+    import tempfile
+    cmd = _resolve_md_pager()
+    if cmd is None:
+        ctx.message('no markdown renderer found ($MD2ANSI / md / md2ansi)')
+        return
+
+    item = ctx.cursor
+    if item is None:
+        return
+    state = ctx._browser._state
+    get_preview = getattr(ctx._browser, 'get_preview', None)
+    text = None
+    if hasattr(state, '_preview'):
+        text = state._preview.get(item.id)
+    if text is None and get_preview is not None:
+        try:
+            text = get_preview(item.id)
+        except Exception as e:
+            ctx.error(f'preview: {type(e).__name__}: {e}')
+            return
+    if text is None:
+        ctx.message('No preview available')
+        return
+
+    plain = _strip_ansi(text)
+    tmp = tempfile.NamedTemporaryFile(
+        'w', suffix='.md', delete=False,
+        encoding='utf-8', errors='surrogateescape',
+    )
+    try:
+        tmp.write(plain)
+        tmp.close()
+        ctx.run_external(cmd + [tmp.name])
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
 def _action_show_id(ctx):
     """Surface the cursor row's id on the info bar (handy for debugging)."""
     if ctx.cursor is None:
@@ -3376,6 +3463,7 @@ a transcript with Right/Alt-Down; preview shows the rendered turn.
 
   v / V   page the preview (v) / the source .jsonl (V) via $PAGER.
   e / E   open the preview (e) / the source .jsonl (E) in $EDITOR.
+  m       render the preview as markdown via $MD2ANSI / md / md2ansi.
   J / K   jump cursor to next / previous user-or-assistant voice.
   t       toggle flat / tree view.\
 """
@@ -3487,6 +3575,7 @@ def main():
             # V / E open the underlying source file instead.
             Action('V',     'View source file in $PAGER',      _action_view_source, 'cursor'),
             Action('E',     'Edit source file in $EDITOR',     _action_edit_source, 'cursor'),
+            Action('m',     'View preview via $MD2ANSI / md',  _action_md_preview,  'cursor'),
             Action('y',     'Show full id (paste-friendly)',   _action_show_id,     'cursor'),
             # 'none' gate so J/K fire even when the cursor sits on a
             # scope_root row (where ctx.cursor returns None). The
