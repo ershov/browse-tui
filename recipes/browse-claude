@@ -53,7 +53,7 @@ CLAUDE_ROOT = os.path.join(
 # Cap on messages enumerated per session (rest reachable via $EDITOR on
 # the .jsonl). Keeps the UI from stalling on multi-MB transcripts.
 # Overridable via the ``-n NUMBER`` argv flag.
-_MESSAGE_LIMIT = 1000
+_MESSAGE_LIMIT = 10000
 
 
 # ---- ANSI palette --------------------------------------------------------
@@ -2145,7 +2145,7 @@ def _scan_session(path):
 
 
 _TREE_CACHE = {}   # path → (mtime, TreeData)
-_TREE_MODE = False  # global view-mode toggle; flipped by --tree / 't' action
+_TREE_MODE = True  # default; --no-tree CLI flag or 't' action flips it.
 
 
 _TREE_METADATA_TYPES = frozenset([
@@ -2894,6 +2894,14 @@ def _preview_message(path, n):
 
     Each renderer returns a body str with ANSI inlined. The chrome
     footer (uuid, cwd, timestamp, …) is uniform and appended here.
+
+    In tree mode the preview also appends the rendered bodies of the
+    cursor row's **direct** children (single level, no recursion) —
+    so a turn root's preview shows the user prompt + the assistant's
+    immediate reply + each tool_use line, without having to expand
+    and move the cursor. Cache invalidates on mode flip because the
+    t-toggle calls ``ctx.refresh()`` which clears the preview cursor
+    gate.
     """
     obj = _read_jsonl_line(path, n)
     if obj is None:
@@ -2903,7 +2911,56 @@ def _preview_message(path, n):
     kind = _classify(obj)
     body = _RENDERERS.get(kind, _render_unknown)(obj)
     chrome = _fmt_chrome(obj)
-    return body + ('\n' + chrome if chrome else '')
+    out = body + ('\n' + chrome if chrome else '')
+    if _TREE_MODE:
+        kids = _tree_children_preview(path, n)
+        if kids:
+            out = out + '\n' + kids
+    return out
+
+
+def _tree_children_preview(path, n):
+    """Concatenated body previews of one record's direct tree children.
+
+    Single level — no recursion into grandchildren. Each child's body
+    is preceded by a thin ``── kind ──`` separator so the wall of text
+    stays scannable. Subagent pseudo-rows render as a compact header
+    (type + description + msg count) rather than the full subagent
+    transcript.
+    """
+    if not isinstance(path, str) or not os.path.isfile(path):
+        return ''
+    children = _list_tree_children(path, n)
+    if not children:
+        return ''
+    parts = []
+    for child in children:
+        cid = child.id
+        if '#agent:' in cid:
+            # Subagent group — compact header only.
+            parts.append(
+                _rule(f'subagent: {child.agent_type or "agent"}')
+                + '\n'
+                + (child.agent_description
+                   or f'agent {getattr(child, "agent_id", "")}')
+            )
+            continue
+        if '#' not in cid:
+            continue
+        cpath, _, lineno = cid.rpartition('#')
+        try:
+            cn = int(lineno)
+        except ValueError:
+            continue
+        cobj = _read_jsonl_line(cpath, cn)
+        if cobj is None or not isinstance(cobj, dict) or '__raw__' in cobj:
+            continue
+        ckind = _classify(cobj)
+        cbody = _RENDERERS.get(ckind, _render_unknown)(cobj)
+        # No chrome footer for children — keeps focus on the cursor
+        # row's chrome and the children's content speaks for itself.
+        parts.append(_rule(ckind) + '\n' + cbody)
+    return '\n'.join(parts)
 
 
 # ---- actions -------------------------------------------------------------
@@ -3268,9 +3325,9 @@ Usage: browse-claude [OPTIONS] [PROJECT]
   --running       Filter projects/sessions to those with a live PID.
   --item N        After --session/--pid/--file, position the cursor on
                   line N (1-based) of the resolved transcript.
-  --tree          Show sessions as a tree (parentUuid + promptId structure,
-                  subagents inline under their assistant rows).
-  --no-tree       Show sessions as a flat reverse-time list (default).
+  --tree          Show sessions as a tree, grouped by turn (default).
+                  Subagents nest inline under their assistant rows.
+  --no-tree       Show sessions as a flat reverse-time list.
   PROJECT         Project directory name under ~/.claude/projects/ to
                   drill into on launch. Ignored when --session / --pid /
                   --file is given.
@@ -3388,8 +3445,12 @@ def main():
             Action('e',     'Edit/view source in $EDITOR',     _action_edit,        'cursor'),
             Action('o',     'Edit/view source in $EDITOR',     _action_edit,        'cursor'),
             Action('y',     'Show full id (paste-friendly)',   _action_show_id,     'cursor'),
-            Action('J',     'Jump to next voice (user/asst)',  _action_next_voice,  'cursor'),
-            Action('K',     'Jump to prev voice (user/asst)',  _action_prev_voice,  'cursor'),
+            # 'none' gate so J/K fire even when the cursor sits on a
+            # scope_root row (where ctx.cursor returns None). The
+            # handlers themselves consult ctx.cursor_index/visible_items
+            # and work regardless of cursor's normal/scope_root kind.
+            Action('J',     'Jump to next voice (user/asst)',  _action_next_voice,  'none'),
+            Action('K',     'Jump to prev voice (user/asst)',  _action_prev_voice,  'none'),
             Action('t',     'Toggle flat / tree view',         _action_toggle_tree, 'none'),
             # Tree-mode-aware Right: expand + jump to latest voice
             # inside the now-visible subtree.

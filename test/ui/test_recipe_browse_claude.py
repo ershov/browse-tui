@@ -166,7 +166,7 @@ class TestBrowseClaude(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             _make_fake_claude(tmp, with_subagents=True)
             with TmuxFixture(cols=140, rows=30, env=self._launch_env(tmp)) as t:
-                t.launch(_BIN, '--run-py', _RECIPE)
+                t.launch(_BIN, '--run-py', _RECIPE, '--no-tree')
                 t.wait_for('/home/test/project')
                 t.send('Right')
                 t.wait_for('abcd1234-deadbeef')
@@ -196,7 +196,8 @@ class TestBrowseClaude(unittest.TestCase):
                 json.dump({'sessionId': 'abcd1234-deadbeef', 'pid': pid,
                            'cwd': '/home/test/project', 'status': 'idle'}, f)
             with TmuxFixture(cols=140, rows=30, env=self._launch_env(tmp)) as t:
-                t.launch(_BIN, '--run-py', _RECIPE, '--pid', str(pid))
+                t.launch(_BIN, '--run-py', _RECIPE,
+                         '--no-tree', '--pid', str(pid))
                 # The session row's preview should include the
                 # session-card "session:" line.
                 t.wait_for('session:', timeout=3.0)
@@ -245,7 +246,7 @@ class TestBrowseClaude(unittest.TestCase):
                 for r in records:
                     f.write(_json.dumps(r) + '\n')
             with TmuxFixture(cols=140, rows=30, env=self._launch_env(tmp)) as t:
-                t.launch(_BIN, '--run-py', _RECIPE)
+                t.launch(_BIN, '--run-py', _RECIPE, '--no-tree')
                 t.wait_for('/home/test/jk')
                 t.send('Right')
                 t.wait_for('jk1234')
@@ -334,7 +335,7 @@ class TestBrowseClaude(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             proj, sess_a, sess_b = self._make_two_sessions(tmp)
             with TmuxFixture(cols=160, rows=40, env=self._launch_env(tmp)) as t:
-                t.launch(_BIN, '--run-py', _RECIPE)
+                t.launch(_BIN, '--run-py', _RECIPE, '--no-tree')
                 t.wait_for('/home/test/jk/multi')
                 t.send('Right')                  # expand project
                 t.wait_for('B-sess')
@@ -684,7 +685,7 @@ class TestBrowseClaude(unittest.TestCase):
             # Fixture has a user message; drill in to see it as a row.
             _make_fake_claude(tmp)
             with TmuxFixture(cols=140, rows=30, env=self._launch_env(tmp)) as t:
-                t.launch(_BIN, '--run-py', _RECIPE)
+                t.launch(_BIN, '--run-py', _RECIPE, '--no-tree')
                 t.wait_for('/home/test/project')
                 t.send('Right')
                 t.wait_for('abcd1234-deadbeef')
@@ -708,7 +709,7 @@ class TestBrowseClaude(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             _make_fake_claude(tmp, with_subagents=True)
             with TmuxFixture(cols=140, rows=30, env=self._launch_env(tmp)) as t:
-                t.launch(_BIN, '--run-py', _RECIPE)
+                t.launch(_BIN, '--run-py', _RECIPE, '--no-tree')
                 t.wait_for('/home/test/project')
                 t.send('Right')
                 t.wait_for('abcd1234-deadbeef')

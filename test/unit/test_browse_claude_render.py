@@ -1081,6 +1081,83 @@ class TestMessageOrderReverse(unittest.TestCase):
             os.unlink(path)
 
 
+class TestTreeChildrenPreview(unittest.TestCase):
+    """``_preview_message`` in tree mode appends direct-children bodies."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _write_jsonl(self, records):
+        import json as _json
+        import tempfile
+        f = tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False)
+        for r in records:
+            f.write(_json.dumps(r) + '\n')
+        f.close()
+        return f.name
+
+    def test_turn_root_preview_includes_children(self):
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user',
+                         'content': 'PROBE_USER_PROMPT'}},
+            {'type': 'assistant', 'uuid': 'a1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'text', 'text': 'PROBE_ASST_REPLY'},
+             ]}},
+        ])
+        try:
+            saved = self.r._TREE_MODE
+            try:
+                self.r._TREE_MODE = True
+                out = self.r._preview_message(path, 0)   # turn root
+                # Own body: the user prompt.
+                self.assertIn('PROBE_USER_PROMPT', out)
+                # Direct child's body: the assistant reply.
+                self.assertIn('PROBE_ASST_REPLY', out)
+                # Without tree mode: only the user prompt.
+                self.r._TREE_MODE = False
+                flat = self.r._preview_message(path, 0)
+                self.assertIn('PROBE_USER_PROMPT', flat)
+                self.assertNotIn('PROBE_ASST_REPLY', flat)
+            finally:
+                self.r._TREE_MODE = saved
+        finally:
+            os.unlink(path)
+
+    def test_children_preview_is_single_level_no_recursion(self):
+        # Turn root → assistant tool_use → user tool_result.
+        # In tree mode, the turn root preview should show the assistant
+        # but NOT the deeper tool_result (that's the grandchild).
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'PROBE_PROMPT'}},
+            {'type': 'assistant', 'uuid': 'a1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 't1', 'name': 'Bash',
+                  'input': {'command': 'PROBE_BASH_CMD'}},
+             ]}},
+            {'type': 'user', 'uuid': 'u2',
+             'message': {'role': 'user', 'content': [
+                 {'type': 'tool_result', 'tool_use_id': 't1',
+                  'content': 'PROBE_BASH_OUTPUT'},
+             ]}},
+        ])
+        try:
+            saved = self.r._TREE_MODE
+            try:
+                self.r._TREE_MODE = True
+                out = self.r._preview_message(path, 0)
+                self.assertIn('PROBE_PROMPT', out)
+                self.assertIn('PROBE_BASH_CMD', out)  # direct child
+                self.assertNotIn('PROBE_BASH_OUTPUT', out)  # grandchild
+            finally:
+                self.r._TREE_MODE = saved
+        finally:
+            os.unlink(path)
+
+
 class TestScanTree(unittest.TestCase):
     """``_scan_tree`` builds the parentUuid/promptId tree + caching."""
 
