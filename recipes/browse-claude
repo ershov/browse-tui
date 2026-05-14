@@ -1264,11 +1264,17 @@ def _render_assistant(obj):
     return '\n'.join(out).rstrip() + '\n'
 
 
-def _rule(title=''):
-    """A muted '── title ──' separator line."""
+def _rule(title='', color=None):
+    """A '── title ──' separator line. Default colour is MUTE.
+
+    Pass ``color=YELLOW`` (or any palette constant) to make a rule
+    pop — used by the tree-mode preview cascade to clearly mark the
+    boundary between the cursor row's content and each of its
+    appended children.
+    """
     bar = '─' * max(0, 60 - len(title) - 4)
     body = f'── {title} {bar}' if title else '─' * 60
-    return f'{MUTE}{body}{RESET}'
+    return f'{color or MUTE}{body}{RESET}'
 
 
 def _fmt_usage(u):
@@ -2915,7 +2921,10 @@ def _preview_message(path, n):
     if _TREE_MODE:
         kids = _tree_children_preview(path, n)
         if kids:
-            out = out + '\n' + kids
+            # Blank line between the cursor row's own content and the
+            # first child's separator — the child rules are bright, the
+            # gap keeps them from running into the chrome footer.
+            out = out + '\n\n' + kids
     return out
 
 
@@ -2923,10 +2932,12 @@ def _tree_children_preview(path, n):
     """Concatenated body previews of one record's direct tree children.
 
     Single level — no recursion into grandchildren. Each child's body
-    is preceded by a thin ``── kind ──`` separator so the wall of text
-    stays scannable. Subagent pseudo-rows render as a compact header
-    (type + description + msg count) rather than the full subagent
-    transcript.
+    is preceded by a **bright yellow** ``── kind ──`` rule so the
+    boundaries between the cursor row's own content and each appended
+    child stand out (other rules in the preview — chrome footer,
+    thinking separator, usage block — stay muted). Subagent pseudo-rows
+    render as a compact header (type + description) rather than the
+    full subagent transcript.
     """
     if not isinstance(path, str) or not os.path.isfile(path):
         return ''
@@ -2937,9 +2948,8 @@ def _tree_children_preview(path, n):
     for child in children:
         cid = child.id
         if '#agent:' in cid:
-            # Subagent group — compact header only.
             parts.append(
-                _rule(f'subagent: {child.agent_type or "agent"}')
+                _rule(f'subagent: {child.agent_type or "agent"}', YELLOW)
                 + '\n'
                 + (child.agent_description
                    or f'agent {getattr(child, "agent_id", "")}')
@@ -2957,10 +2967,10 @@ def _tree_children_preview(path, n):
             continue
         ckind = _classify(cobj)
         cbody = _RENDERERS.get(ckind, _render_unknown)(cobj)
-        # No chrome footer for children — keeps focus on the cursor
-        # row's chrome and the children's content speaks for itself.
-        parts.append(_rule(ckind) + '\n' + cbody)
-    return '\n'.join(parts)
+        parts.append(_rule(ckind, YELLOW) + '\n' + cbody)
+    # Blank line between adjacent children too — the bright rules
+    # then look like real section breaks rather than wall-of-text dividers.
+    return '\n\n'.join(parts)
 
 
 # ---- actions -------------------------------------------------------------
