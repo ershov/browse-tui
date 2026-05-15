@@ -687,59 +687,40 @@ def _list_subagent_messages(item_id):
 def _list_messages(jsonl_path, limit=None):
     """List messages newest-first, capped at ``limit`` lines.
 
-    JSONL files are written in chronological order (append-only), but
-    users almost always want to see what happened *recently* — so we
-    walk the file with a sliding window that keeps just the last
-    ``limit + 1`` lines, then emit them in reverse. The ``+1`` is a
-    truncation sentinel: if the deque ever overflowed we know there
-    are older entries we didn't yield, and we append a marker row at
-    the bottom to make that visible.
-    """
-    from collections import deque
+    Reads from the cached ``_TREE_CACHE[jsonl_path].records`` so we
+    don't re-walk the whole file on every navigation. ``_scan_tree``
+    populates the cache the first time we visit the path (and
+    bootstraps ``_TAIL_STATE`` so the live-tail worker can resume
+    from where the scan stopped). Empty/invalid lines (``None`` in
+    ``records``) are skipped without surfacing a fake row — the
+    ``V`` action can still extract their raw bytes via
+    ``line_offsets`` if the user wants to inspect them.
 
+    The truncation cap applies only at initial load; live updates
+    are insert-only (see ``_push_flat_inserts``).
+    """
     if limit is None:
         limit = _message_limit
-    try:
-        f = open(jsonl_path, 'r', encoding='utf-8', errors='replace')
-    except OSError as e:
+    if not os.path.isfile(jsonl_path):
         return [Item(
             id=f'__err__:{jsonl_path}',
-            title=f'[error] {e}',
+            title=f'[error] no such file: {jsonl_path}',
             tag='err',
             tag_style='red',
         )]
-    window = deque(maxlen=limit + 1)
-    total = 0
-    with f:
-        for n, line in enumerate(f):
-            window.append((n, line))
-            total = n + 1
-    truncated = len(window) > limit
-    if truncated:
-        window.popleft()
+    td = _scan_tree(jsonl_path)
+    total = len(td.records)
+    truncated = total > limit
+    start = total - limit if truncated else 0
 
     out = []
-    for n, line in reversed(window):
-        line = line.rstrip('\n')
-        if not line.strip():
-            continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            # Malformed line — surface it but stay scrolling.
-            out.append(Item(
-                id=f'{jsonl_path}#{n}',
-                title=f'[invalid json] {line[:1000]}',
-                tag='err',
-                tag_style='red',
-            ))
+    for n in range(total - 1, start - 1, -1):
+        obj = td.records[n]
+        if obj is None:
             continue
         kind = _kind_of(obj)
         item = Item(
             id=f'{jsonl_path}#{n}',
-            # Row titles must be single-line — _summarise_message
-            # now preserves newlines for the session-preview timeline,
-            # so collapse here for the list view.
             title=_oneline(_summarise_message(obj)),
             tag=kind,
             tag_style=_TAG_STYLE_FOR_KIND.get(kind, ''),
@@ -1160,7 +1141,25 @@ _PERM_COLOR = {
 
 
 def _read_jsonl_line(path, n):
-    """Return the parsed object for line ``n`` of ``path`` or ``None``."""
+    """Return the parsed object for line ``n`` of ``path`` or ``None``.
+
+    Serves from ``_TREE_CACHE[path].records[n]`` when the file has
+    been scanned (every read path now triggers ``_scan_tree``), so
+    previews are O(1) dict lookups rather than O(file_size) line
+    iterations. Falls back to a one-off file read for paths the
+    scanner hasn't visited yet (rare — covers transient setups).
+    ``None`` for missing files, out-of-range lines, blank lines, and
+    lines whose JSON failed to parse — re-parsing wouldn't change
+    the answer, and the caller surfaces an empty preview either way.
+    """
+    cached = _TREE_CACHE.get(path)
+    if cached is not None:
+        if 0 <= n < len(cached.records):
+            return cached.records[n]
+        return None
+    # Fallback: file not yet scanned. Cheaper than a full scan when
+    # all we need is one line, but should be hit only at startup
+    # races / unusual paths.
     try:
         with open(path, 'r', encoding='utf-8', errors='replace') as f:
             for i, line in enumerate(f):
@@ -1171,7 +1170,7 @@ def _read_jsonl_line(path, n):
                     try:
                         return json.loads(line)
                     except json.JSONDecodeError:
-                        return {'__raw__': line}
+                        return None
     except OSError:
         return None
     return None
@@ -1190,8 +1189,6 @@ _METADATA_TYPES = frozenset([
 def _classify(obj):
     """Map a parsed JSONL record to a renderer key."""
     if not isinstance(obj, dict):
-        return 'unknown'
-    if '__raw__' in obj:
         return 'unknown'
     t = obj.get('type')
     if t == 'user':       return 'user'
@@ -2345,6 +2342,14 @@ class _TreeData:
     * ``tool_use_name_of`` — ``{assistant_uuid: tool_name}`` — first
                             tool_use part's name (for the umbrella
                             title prefix).
+    * ``line_offsets``    — ``[int]`` with one **sentinel** entry past
+                            the last record. ``line_offsets[n]`` is the
+                            byte position where line ``n`` starts in
+                            the source file; the length of line ``n``
+                            is ``line_offsets[n+1] - line_offsets[n]``.
+                            Used by the ``V`` / ``E`` actions to
+                            extract per-line bytes without re-reading
+                            the whole file.
 
     Per-record attrs:
       * ``rec['_tree_forked_from']`` — record explicitly forked from
@@ -2355,7 +2360,8 @@ class _TreeData:
                  'turn_direct', 'tool_children', 'span_records',
                  'agent_link', 'records_line', 'parent_id_of',
                  'assistant_has_tool_use', 'tool_to_turn_root_line',
-                 'agent_to_assistant_line', 'tool_use_name_of')
+                 'agent_to_assistant_line', 'tool_use_name_of',
+                 'line_offsets')
 
     def __init__(self):
         self.records = []
@@ -2387,6 +2393,11 @@ class _TreeData:
         # assistant_uuid → name of first tool_use content part, for the
         # ``<tool:Name>`` umbrella's title prefix.
         self.tool_use_name_of = {}
+        # Byte offsets of each line, with a sentinel past the end so
+        # ``line_offsets[n+1] - line_offsets[n]`` always gives line n's
+        # length. Starts as ``[0]`` (sentinel-only, no lines yet) and
+        # grows by one entry per appended line.
+        self.line_offsets = [0]
 
 
 def _is_turn_root(rec):
@@ -2677,6 +2688,11 @@ def _scan_tree(path):
                     td.records.append(rec)
                     _fold_record(td, cur, rec, n, path, sub_dir)
             last_full_offset = f.tell()
+            # Sentinel pattern: each appended ``f.tell()`` becomes the
+            # start of the next line. After N complete lines,
+            # ``line_offsets`` has N+1 entries, and the length of line
+            # k is ``line_offsets[k+1] - line_offsets[k]``.
+            td.line_offsets.append(last_full_offset)
             n += 1
 
     # Stash the byte offset + scan cursor + last-seen size for the
@@ -2783,6 +2799,14 @@ def _read_new_records(path):
                                               rec=rec, n=n,
                                               path=path, sub_dir=sub_dir)
                 tail.byte_offset = f.tell()
+                # Sentinel pattern: append the end-of-line position
+                # so ``line_offsets[n+1] - line_offsets[n]`` always
+                # gives line n's length. Done both for the cached
+                # ``td`` (tree mode) and on flat-only paths via the
+                # ``records`` list above; the invariant is
+                # ``len(td.line_offsets) == len(td.records) + 1``.
+                if td is not None:
+                    td.line_offsets.append(tail.byte_offset)
                 n += 1
         # Keep ``tail.start_line`` in sync for flat-only paths; tree
         # mode reads it back from ``td.records`` on the next call.
@@ -3539,8 +3563,6 @@ def _preview_message(path, n):
     obj = _read_jsonl_line(path, n)
     if obj is None:
         return ''
-    if '__raw__' in obj:
-        return f'{RED}[invalid json]{RESET} {obj["__raw__"]}'
     kind = _classify(obj)
     body = _RENDERERS.get(kind, _render_unknown)(obj)
     chrome = _fmt_chrome(obj)
@@ -3628,7 +3650,7 @@ def _render_child_preview_body(child):
 def _render_record_with_rule(path, n):
     """Read one record, render its body, prefix with a bright-yellow rule."""
     obj = _read_jsonl_line(path, n)
-    if obj is None or not isinstance(obj, dict) or '__raw__' in obj:
+    if obj is None or not isinstance(obj, dict):
         return None
     kind = _classify(obj)
     body = _RENDERERS.get(kind, _render_unknown)(obj)
@@ -3671,43 +3693,197 @@ def _resolve_path(item):
     return iid
 
 
-def _action_edit_source(ctx):
-    """``E`` — open the cursor row's underlying file in $EDITOR.
+def _current_view_targets(ctx):
+    """Pick the items the ``V`` / ``E`` actions should operate on.
 
-    For a project (a directory) we open the directory itself — most
-    editors handle that gracefully (vim opens netrw, code opens the
-    folder). For sessions and messages it's the .jsonl file.
+    Falls back through:
+      1. The explicit selection (``ctx.targets`` when something is
+         selected with space-bar).
+      2. The cursor's item.
+      3. The scope_root row — so ``V`` / ``E`` work even when the
+         cursor sits on the synthetic top row of an opened file.
+
+    Returns ``[]`` when nothing resolves.
+    """
+    targets = list(ctx.targets) if ctx.cursor is not None else []
+    if targets:
+        return targets
+    rows = ctx.visible_items
+    if rows and 0 <= ctx.cursor_index < len(rows):
+        return [rows[ctx.cursor_index][0]]
+    return []
+
+
+def _gather_line_source(items):
+    """Group items into ``{path: [line_no, ...]}`` for byte extraction.
+
+    Each input item is classified by id shape:
+
+      * ``<path>#<n>`` (message leaf) → ``(path, n)`` recorded.
+      * Umbrella ids (``#prompt:`` / ``#tool:`` / ``#span:``) →
+        treated as "whole path" — caller falls back to opening the
+        full file.
+      * ``<sess>#agent:<aid>`` → likewise; the subagent jsonl is the
+        target for "whole file".
+      * Bare ``.jsonl`` / project path → "whole path".
+
+    Returns ``(per_line, whole_paths)`` where ``per_line`` is the
+    grouping dict and ``whole_paths`` is a list of ``(path, item)``
+    tuples for non-message targets. ``per_line`` lines are kept in
+    insertion order; the caller chooses how to assemble the temp
+    file.
+    """
+    per_line = {}
+    whole_paths = []
+    for item in items:
+        iid = getattr(item, 'id', None)
+        if not isinstance(iid, str):
+            continue
+        if '#agent:' in iid:
+            sess, _, aid = iid.partition('#agent:')
+            agent_path = os.path.join(
+                _subagents_dir(sess), f'agent-{aid}.jsonl',
+            )
+            whole_paths.append((agent_path, item))
+            continue
+        if '#prompt:' in iid or '#tool:' in iid or '#span:' in iid:
+            whole_paths.append((iid.partition('#')[0], item))
+            continue
+        if '#' in iid:
+            path, _, suffix = iid.rpartition('#')
+            try:
+                n = int(suffix)
+            except ValueError:
+                # Synthetic ids like ``#__truncated__`` — open the
+                # underlying file as a whole.
+                whole_paths.append((path, item))
+                continue
+            per_line.setdefault(path, []).append(n)
+            continue
+        whole_paths.append((iid, item))
+    return per_line, whole_paths
+
+
+def _write_line_excerpts(per_line):
+    """Extract specific lines from one-or-more files into a temp .jsonl.
+
+    Uses ``_TREE_CACHE[path].line_offsets`` for O(1) seek + read —
+    no whole-file scan. Returns the temp path (caller is responsible
+    for unlinking it after the external tool exits) or ``None`` if
+    nothing could be extracted.
+    """
+    import tempfile
+    written_any = False
+    tmp = tempfile.NamedTemporaryFile(
+        'wb', suffix='.jsonl', delete=False,
+    )
+    try:
+        for path, line_nos in per_line.items():
+            cached = _TREE_CACHE.get(path)
+            if cached is None:
+                continue
+            offsets = cached.line_offsets
+            try:
+                f = open(path, 'rb')
+            except OSError:
+                continue
+            with f:
+                for n in sorted(set(line_nos)):
+                    if not (0 <= n < len(offsets) - 1):
+                        continue
+                    start = offsets[n]
+                    end = offsets[n + 1]
+                    if end <= start:
+                        continue
+                    f.seek(start)
+                    chunk = f.read(end - start)
+                    if not chunk:
+                        continue
+                    tmp.write(chunk)
+                    if not chunk.endswith(b'\n'):
+                        tmp.write(b'\n')
+                    written_any = True
+    finally:
+        tmp.close()
+    if not written_any:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+        return None
+    return tmp.name
+
+
+def _run_source_command(ctx, cmd_env_var, default_cmd):
+    """Shared body of ``V`` / ``E``: resolve targets, dispatch external tool.
+
+    Strategy:
+      * All targets are message ids on the SAME file → extract just
+        those lines to a temp .jsonl and open that.
+      * All targets are message ids spanning multiple files → same,
+        concatenated into one temp file.
+      * Anything else (umbrella, subagent group, session, project) →
+        open the resolved path directly. With multiple non-message
+        targets we open just the first; mixing per-line + per-path
+        in one external invocation isn't a sensible UX.
+    """
+    targets = _current_view_targets(ctx)
+    if not targets:
+        return
+    per_line, whole_paths = _gather_line_source(targets)
+    cmd = _split_cmd(os.environ.get(cmd_env_var) or default_cmd)
+
+    # All-message-targets path: extract bytes from line_offsets.
+    if per_line and not whole_paths:
+        tmp_path = _write_line_excerpts(per_line)
+        if tmp_path is None:
+            ctx.error('could not extract line bytes (cache missing?)')
+            return
+        try:
+            ctx.run_external(cmd + [tmp_path])
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        return
+
+    # Single non-message target (or mixed): open the first resolved
+    # path. Covers cursor-on-session, cursor-on-scope_root, cursor-on-
+    # umbrella, and cursor-on-project use cases.
+    if whole_paths:
+        path, _item = whole_paths[0]
+        if not path or not os.path.exists(path):
+            ctx.error(f'no such path: {path!r}')
+            return
+        ctx.run_external(cmd + [path])
+        return
+
+
+def _action_edit_source(ctx):
+    """``E`` — open the source for the cursor row (or selection) in $EDITOR.
+
+    Message rows (single or multi-selected) extract just their lines
+    via ``_TreeData.line_offsets`` into a temp .jsonl. Session /
+    subagent / umbrella / project rows open their underlying file
+    or directory in $EDITOR directly.
 
     Separate from the framework's built-in ``e`` (which opens the
-    *preview text* in $EDITOR with edits discarded). This one mutates
-    the on-disk source if the editor saves.
+    *preview text* in $EDITOR with edits discarded). This one
+    operates on the on-disk source.
     """
-    if ctx.cursor is None:
-        return
-    path = _resolve_path(ctx.cursor)
-    if not path or not os.path.exists(path):
-        ctx.error(f'no such path: {path!r}')
-        return
-    editor = os.environ.get('EDITOR') or 'vim'
-    ctx.run_external(_split_cmd(editor) + [path])
+    _run_source_command(ctx, 'EDITOR', 'vim')
 
 
 def _action_view_source(ctx):
-    """``V`` — open the cursor row's underlying file in $PAGER.
+    """``V`` — page the source for the cursor row (or selection) in $PAGER.
 
-    Read-only view of the source ``.jsonl`` (or the project dir).
-    Pairs with ``E`` for the edit variant and with the framework's
+    Same target-resolution rules as ``E``. Pairs with the framework's
     built-in ``v`` (which pages the rendered *preview* — useful when
-    the preview is multi-screen, vs this which is the raw transcript).
+    the preview is multi-screen) versus this which is the raw
+    transcript bytes.
     """
-    if ctx.cursor is None:
-        return
-    path = _resolve_path(ctx.cursor)
-    if not path or not os.path.exists(path):
-        ctx.error(f'no such path: {path!r}')
-        return
-    pager = os.environ.get('PAGER') or 'less -R'
-    ctx.run_external(_split_cmd(pager) + [path])
+    _run_source_command(ctx, 'PAGER', 'less -R')
 
 
 def _split_cmd(s):
@@ -4241,8 +4417,11 @@ def main():
         actions=[
             # v / e are the framework defaults (page / edit the preview text).
             # V / E open the underlying source file instead.
-            Action('V',     'View source file in $PAGER',      _action_view_source, 'cursor'),
-            Action('E',     'Edit source file in $EDITOR',     _action_edit_source, 'cursor'),
+            # Gate 'none' (rather than 'cursor') so V/E fire on the
+            # scope_root row too — the user expects to view/edit the
+            # currently-open file from its synthetic top row.
+            Action('V',     'View source for cursor/selection in $PAGER',  _action_view_source, 'none'),
+            Action('E',     'Edit source for cursor/selection in $EDITOR', _action_edit_source, 'none'),
             Action('m',     'View preview via $MD2ANSI / md2ansi', _action_md_preview, 'cursor'),
             Action('y',     'Show full id (paste-friendly)',   _action_show_id,     'cursor'),
             # 'none' gate so J/K fire even when the cursor sits on a

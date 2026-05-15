@@ -647,7 +647,12 @@ class TestPreviewMessageDispatcher(unittest.TestCase):
         finally:
             os.unlink(path)
 
-    def test_invalid_json_line(self):
+    def test_invalid_json_line_returns_empty_preview(self):
+        # Invalid lines yield ``None`` from ``_read_jsonl_line`` and
+        # an empty preview. The previous ``[invalid json] <raw>``
+        # stub was dropped because re-parsing a line that failed once
+        # never succeeds — surfacing the raw bytes belongs to the
+        # ``V`` action (which uses ``line_offsets`` for that purpose).
         import tempfile
         with tempfile.NamedTemporaryFile('w', suffix='.jsonl',
                                          delete=False) as f:
@@ -655,8 +660,7 @@ class TestPreviewMessageDispatcher(unittest.TestCase):
             path = f.name
         try:
             out = self.r._preview_message(path, 0)
-            self.assertIn('[invalid json]', out)
-            self.assertIn('not json', out)
+            self.assertEqual(out, '')
         finally:
             os.unlink(path)
 
@@ -2304,6 +2308,101 @@ class TestLiveTail(unittest.TestCase):
         self.r._TREE_CACHE.clear()
         self.r._TAIL_STATE.clear()
 
+    def test_line_offsets_sentinel_pattern(self):
+        # ``td.line_offsets`` has N+1 entries (sentinel past the end)
+        # so length(line k) = line_offsets[k+1] - line_offsets[k] for
+        # all k in [0, N).
+        import json as _json
+        recs = [
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'one'}},
+            {'type': 'assistant', 'uuid': 'a1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'text', 'text': 'ok'},
+             ]}},
+            {'type': 'user', 'uuid': 'u2',
+             'message': {'role': 'user', 'content': 'two'}},
+        ]
+        path = self._write_jsonl(recs)
+        try:
+            td = self.r._scan_tree(path)
+            self.assertEqual(len(td.records), 3)
+            self.assertEqual(len(td.line_offsets), 4)
+            self.assertEqual(td.line_offsets[0], 0)
+            # Each entry strictly increases (every line has content).
+            for i in range(len(td.line_offsets) - 1):
+                self.assertLess(td.line_offsets[i], td.line_offsets[i + 1])
+            # The recorded line bytes round-trip back to the source.
+            with open(path, 'rb') as f:
+                for k, want in enumerate(recs):
+                    f.seek(td.line_offsets[k])
+                    chunk = f.read(td.line_offsets[k + 1] - td.line_offsets[k])
+                    self.assertEqual(_json.loads(chunk), want)
+        finally:
+            os.unlink(path)
+
+    def test_line_offsets_grow_with_tail_appends(self):
+        # Live tail extends ``records`` AND ``line_offsets`` in
+        # lockstep. After appending K new lines the sentinel still
+        # sits one past the last record.
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'hi'}},
+        ])
+        try:
+            td = self.r._scan_tree(path)
+            self.assertEqual(len(td.records), 1)
+            self.assertEqual(len(td.line_offsets), 2)
+            self._append(path, [
+                {'type': 'assistant', 'uuid': 'a1',
+                 'message': {'role': 'assistant', 'content': [
+                     {'type': 'text', 'text': 'x'},
+                 ]}},
+                {'type': 'user', 'uuid': 'u2',
+                 'message': {'role': 'user', 'content': 'two'}},
+            ])
+            self.r._read_new_records(path)
+            self.assertEqual(len(td.records), 3)
+            self.assertEqual(len(td.line_offsets), 4)
+            # Sentinel matches the file size.
+            self.assertEqual(td.line_offsets[-1], os.path.getsize(path))
+        finally:
+            os.unlink(path)
+
+    def test_read_jsonl_line_serves_from_cache(self):
+        # After ``_scan_tree`` runs, ``_read_jsonl_line`` reads the
+        # cached parsed dict — no file I/O.
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'hi'}},
+        ])
+        try:
+            self.r._scan_tree(path)
+            # Tamper with the cached record; if the function used
+            # the cache, it must return the tampered value.
+            self.r._TREE_CACHE[path].records[0] = {'__probe__': 'YES'}
+            self.assertEqual(self.r._read_jsonl_line(path, 0),
+                             {'__probe__': 'YES'})
+            # Out-of-range / invalid index → None.
+            self.assertIsNone(self.r._read_jsonl_line(path, 5))
+        finally:
+            os.unlink(path)
+
+    def test_read_jsonl_line_returns_none_for_invalid_lines(self):
+        # Invalid JSON line → ``td.records[n]`` is None, and the
+        # reader returns None (no ``__raw__`` re-parse).
+        import tempfile
+        path = tempfile.NamedTemporaryFile(
+            'w', suffix='.jsonl', delete=False,
+        ).name
+        with open(path, 'w') as f:
+            f.write('not json\n')
+        try:
+            self.r._scan_tree(path)
+            self.assertIsNone(self.r._read_jsonl_line(path, 0))
+        finally:
+            os.unlink(path)
+
     def test_bulk_scan_populates_tail_state(self):
         path = self._write_jsonl([
             {'type': 'user', 'uuid': 'u1',
@@ -2663,6 +2762,109 @@ class TestLiveTail(unittest.TestCase):
         finally:
             import shutil
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestViewEditSource(unittest.TestCase):
+    """``V`` / ``E`` extract per-line bytes from ``line_offsets``."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _write_jsonl(self, records):
+        import json as _json
+        import tempfile
+        f = tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False)
+        for r in records:
+            f.write(_json.dumps(r) + '\n')
+        f.close()
+        return f.name
+
+    def setUp(self):
+        self.r._TREE_CACHE.clear()
+        self.r._TAIL_STATE.clear()
+
+    def test_gather_line_source_classifies_ids(self):
+        path = '/tmp/fake.jsonl'
+        items = [
+            self.r.Item(id=f'{path}#3'),                  # message leaf
+            self.r.Item(id=f'{path}#5'),                  # message leaf
+            self.r.Item(id=f'{path}#prompt:10'),          # umbrella
+            self.r.Item(id=f'{path}#tool:11'),            # umbrella
+            self.r.Item(id=f'{path}#span:0'),             # umbrella
+            self.r.Item(id=f'{path}#agent:AAA'),          # subagent group
+            self.r.Item(id=path),                         # bare file
+            self.r.Item(id='/some/proj'),                 # directory
+        ]
+        per_line, whole_paths = self.r._gather_line_source(items)
+        # Two message leaves on the same path → grouped.
+        self.assertEqual(per_line, {path: [3, 5]})
+        # Whole-path entries: umbrellas + subagent + bare file + dir.
+        whole_paths_only = [p for p, _ in whole_paths]
+        self.assertEqual(len(whole_paths_only), 6)
+        # Subagent group resolves to the agent's jsonl, not the parent
+        # session.
+        self.assertIn(
+            os.path.join(self.r._subagents_dir(path), 'agent-AAA.jsonl'),
+            whole_paths_only,
+        )
+        # Plain umbrella ids resolve to the file path.
+        for u in (f'{path}', f'{path}', f'{path}', '/some/proj', path):
+            pass
+        self.assertEqual(whole_paths_only.count(path), 4)
+        # __truncated__ falls back to whole-file.
+        per_line2, whole2 = self.r._gather_line_source([
+            self.r.Item(id=f'{path}#__truncated__'),
+        ])
+        self.assertEqual(per_line2, {})
+        self.assertEqual([p for p, _ in whole2], [path])
+
+    def test_write_line_excerpts_uses_offsets(self):
+        import json as _json
+        recs = [
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'one'}},
+            {'type': 'assistant', 'uuid': 'a1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'text', 'text': 'two'},
+             ]}},
+            {'type': 'user', 'uuid': 'u2',
+             'message': {'role': 'user', 'content': 'three'}},
+        ]
+        path = self._write_jsonl(recs)
+        try:
+            self.r._scan_tree(path)
+            tmp = self.r._write_line_excerpts({path: [0, 2]})
+            self.assertIsNotNone(tmp)
+            try:
+                with open(tmp, 'r') as f:
+                    lines = [_json.loads(line) for line in f
+                             if line.strip()]
+                self.assertEqual(lines, [recs[0], recs[2]])
+            finally:
+                os.unlink(tmp)
+        finally:
+            os.unlink(path)
+
+    def test_write_line_excerpts_no_cache_returns_none(self):
+        # Without ``_TREE_CACHE`` we can't resolve offsets — bail
+        # cleanly.
+        path = '/tmp/nonexistent.jsonl'
+        tmp = self.r._write_line_excerpts({path: [0]})
+        self.assertIsNone(tmp)
+
+    def test_write_line_excerpts_skips_out_of_range_lines(self):
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'hi'}},
+        ])
+        try:
+            self.r._scan_tree(path)
+            # Line 99 doesn't exist; no entry should be written.
+            tmp = self.r._write_line_excerpts({path: [99]})
+            self.assertIsNone(tmp)
+        finally:
+            os.unlink(path)
 
 
 class TestSubagentRowTag(unittest.TestCase):
