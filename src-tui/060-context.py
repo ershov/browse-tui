@@ -148,13 +148,21 @@ class Context:
         return self._browser.cursor_to(id, on_complete)
 
     def expand(self, id: Any,
-               on_complete: Optional[Callable[[], None]] = None) -> 'Pending':
+               on_complete: Optional[Callable[[], None]] = None,
+               autoscroll: bool = False) -> 'Pending':
         """Expand and fetch the children of ``id``.
 
         Returns a :class:`Pending` that resolves once children are
         cached (or immediately if already cached).
+
+        ``autoscroll`` (default ``False``): pass ``True`` to park a
+        scroll-to-fit goal that adjusts the list viewport to show the
+        parent row plus its newly-revealed subtree (re-applied as
+        async children stream in). User-driven navigation passes
+        ``True``; recipes default to ``False`` so bulk-expand setup
+        doesn't surprise the user.
         """
-        return self._browser.expand(id, on_complete)
+        return self._browser.expand(id, on_complete, autoscroll=autoscroll)
 
     def select(self, ids, replace: bool = False) -> None:
         """Add ``ids`` to the selection set (or replace it)."""

@@ -893,5 +893,405 @@ class TestCursorAnchor(unittest.TestCase):
             b.stop_workers()
 
 
+# ---- 9. Scroll-to-fit on expansion (`_expand_goal`) ------------------------
+
+
+class TestExpandGoal(unittest.TestCase):
+    """Expanding a row sets a sticky scroll-to-fit goal that adjusts the
+    list viewport so the parent row plus its subtree are visible. The
+    goal survives async deliveries and clears on:
+      - subtree fully loaded
+      - subtree too big for the viewport (scroll-cap)
+      - user cursor move
+      - manual wheel scroll
+    """
+
+    def _pin_height(self, browser, height):
+        """Replace ``_list_pane_height_safe`` with a fixed-value stub so
+        we don't have to wire ``term_size`` / ``layout_panes`` for the
+        geometry math.
+        """
+        browser._list_pane_height_safe = lambda: height
+
+    def _tree(self, parent_children):
+        """Build a get_children callable from a dict mapping parent id →
+        list of (id, parent, _, _, has_children) tuples. None / '' → root.
+        """
+        def gc(parent_id):
+            return parent_children.get(parent_id, parent_children.get(None, []))
+        return gc
+
+    def test_user_expand_with_cached_children_scrolls_subtree_into_view(self):
+        # Root has [P, X1, ..., X20]. P has 4 cached children.
+        # Pane height = 5. Cursor on P (idx 0). Without the goal,
+        # expanding P would leave P.1..P.4 below the bottom of the
+        # 5-row pane (idx 5..8 visible).
+        gc = self._tree({
+            None: [('P', None, None, '', True)] + [(f'X{i}',) for i in range(20)],
+            'P':  [(f'P.{i}',) for i in range(1, 5)],
+        })
+        b = make_browser(get_children=gc)
+        self._pin_height(b, 5)
+        try:
+            b.refresh()
+            b.run_until_idle()
+            # Pre-cache P's children so the cached-expand branch fires.
+            b.expand('P')
+            b.run_until_idle()
+            # Collapse so the user-style fresh expand sets the goal.
+            b._state.expanded.discard('P')
+            _state.mark_visible_dirty(b._state)
+            b._list_scroll = 0
+
+            # User-driven expand (autoscroll=True).
+            b.expand('P', autoscroll=True)
+            b.run_until_idle()
+
+            # Subtree (P plus P.1..P.4) is 5 rows — exactly the pane
+            # height. Scroll should be 0 (P at top), last child at the
+            # bottom row.
+            self.assertEqual(b._list_scroll, 0)
+            # Fully loaded → goal cleared.
+            self.assertIsNone(b._expand_goal)
+        finally:
+            b.stop_workers()
+
+    def test_user_expand_scrolls_down_when_subtree_extends_past_bottom(self):
+        # Cursor on P at idx 5 (which is mid-pane initially). Pane
+        # height = 5. P has 3 children. After expand, subtree occupies
+        # idx 5..8. Pane currently shows idx 0..4. Goal must scroll
+        # down to put idx 8 at the bottom → scroll = 4.
+        rows = [('R0',), ('R1',), ('R2',), ('R3',), ('R4',),
+                ('P', None, None, '', True), ('Z',)]
+        gc = self._tree({
+            None: rows,
+            'P':  [(f'P.{i}',) for i in range(3)],
+        })
+        b = make_browser(get_children=gc)
+        self._pin_height(b, 5)
+        try:
+            b.refresh()
+            b.run_until_idle()
+            # Position viewport at top, cursor on P.
+            b._list_scroll = 0
+            b.cursor_to('P')
+            b.run_until_idle()
+            # Pre-cache so we hit the cached path.
+            b.expand('P')
+            b.run_until_idle()
+            b._state.expanded.discard('P')
+            _state.mark_visible_dirty(b._state)
+            b._list_scroll = 0
+
+            b.expand('P', autoscroll=True)
+            b.run_until_idle()
+            # P at idx 5, last child at idx 8, height 5 → desired
+            # scroll = max(8 - 5 + 1, 0) = 4. Capped at p_idx=5.
+            self.assertEqual(b._list_scroll, 4)
+            self.assertIsNone(b._expand_goal)
+        finally:
+            b.stop_workers()
+
+    def test_user_expand_scrolls_up_when_parent_above_viewport(self):
+        # 30-item list. P at idx 5. User scrolled past it (scroll=15)
+        # so P is above the viewport. Programmatically expanding P
+        # with autoscroll=True should scroll UP to bring P into view.
+        rows = [('R0',), ('R1',), ('R2',), ('R3',), ('R4',),
+                ('P', None, None, '', True)] + [(f'Z{i}',) for i in range(24)]
+        gc = self._tree({
+            None: rows,
+            'P':  [(f'P.{i}',) for i in range(3)],
+        })
+        b = make_browser(get_children=gc)
+        self._pin_height(b, 5)
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.expand('P')                     # pre-cache
+            b.run_until_idle()
+            b._state.expanded.discard('P')
+            _state.mark_visible_dirty(b._state)
+            b._list_scroll = 15               # P at idx 5 is above viewport
+
+            b.expand('P', autoscroll=True)
+            b.run_until_idle()
+            # Acceptable range: [last_idx - h + 1, p_idx] =
+            # [8 - 5 + 1, 5] = [4, 5]. Current scroll 15 is above; clamp
+            # picks 5 (closest to 15, capped at p_idx).
+            self.assertEqual(b._list_scroll, 5)
+            self.assertIsNone(b._expand_goal)
+        finally:
+            b.stop_workers()
+
+    def test_user_expand_no_scroll_when_subtree_already_fits(self):
+        # P at idx 0, subtree of 3 children. Pane is 10 tall — the
+        # whole thing already fits without scrolling.
+        gc = self._tree({
+            None: [('P', None, None, '', True), ('Z',)],
+            'P':  [('P1',), ('P2',), ('P3',)],
+        })
+        b = make_browser(get_children=gc)
+        self._pin_height(b, 10)
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.expand('P')                     # pre-cache
+            b.run_until_idle()
+            b._state.expanded.discard('P')
+            _state.mark_visible_dirty(b._state)
+            b._list_scroll = 0
+
+            b.expand('P', autoscroll=True)
+            b.run_until_idle()
+            self.assertEqual(b._list_scroll, 0)
+            self.assertIsNone(b._expand_goal)
+        finally:
+            b.stop_workers()
+
+    def test_user_expand_oversized_subtree_parks_parent_and_clears_goal(self):
+        # P has 20 children, pane height = 5. Subtree doesn't fit
+        # below the parent → scroll-cap: parent at top, goal cleared.
+        gc = self._tree({
+            None: [('P', None, None, '', True)],
+            'P':  [(f'P.{i}',) for i in range(20)],
+        })
+        b = make_browser(get_children=gc)
+        self._pin_height(b, 5)
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.expand('P')                     # pre-cache
+            b.run_until_idle()
+            b._state.expanded.discard('P')
+            _state.mark_visible_dirty(b._state)
+            b._list_scroll = 0
+
+            b.expand('P', autoscroll=True)
+            b.run_until_idle()
+            # P sits at idx 0 → desired = p_idx = 0 → no scroll change,
+            # but the goal clears (cap hit).
+            self.assertEqual(b._list_scroll, 0)
+            self.assertIsNone(b._expand_goal)
+        finally:
+            b.stop_workers()
+
+    def test_async_subtree_streams_into_view_as_deliveries_arrive(self):
+        # P uncached. Slow get_children returns 3 children after a
+        # small delay. On first expand the visible list shows
+        # [P, pending]; goal scrolls to put pending at bottom. As
+        # delivery lands, goal re-applies and scrolls further to fit
+        # the actual children.
+        children = [(f'P.{i}',) for i in range(3)]
+        rows = [('R0',), ('R1',), ('R2',), ('R3',), ('R4',),
+                ('P', None, None, '', True)]
+        delivered = {'first': True}
+        def gc(parent_id):
+            if parent_id in ('', None):
+                return rows
+            if parent_id == 'P':
+                if delivered['first']:
+                    delivered['first'] = False
+                    time.sleep(0.02)
+                return children
+            return []
+        b = make_browser(get_children=gc)
+        self._pin_height(b, 5)
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b._list_scroll = 0
+            b.cursor_to('P')                  # cursor on P (idx 5)
+            b.run_until_idle()
+
+            # Expand P (uncached → slow delivery).
+            b.expand('P', autoscroll=True)
+            b.run_until_idle()
+            # After full delivery, subtree is 4 rows (P + 3 children),
+            # last at idx 8. desired = clamp(0, 8-5+1, 5) = 4.
+            self.assertEqual(b._list_scroll, 4)
+            self.assertIsNone(b._expand_goal)
+        finally:
+            b.stop_workers()
+
+    def test_programmatic_expand_default_autoscroll_false_no_scroll(self):
+        # Browser.expand(id) without autoscroll=True must NOT scroll —
+        # recipes doing bulk setup should not surprise the user.
+        rows = [('R0',), ('R1',), ('R2',), ('R3',), ('R4',),
+                ('P', None, None, '', True)]
+        gc = self._tree({
+            None: rows,
+            'P':  [(f'P.{i}',) for i in range(3)],
+        })
+        b = make_browser(get_children=gc)
+        self._pin_height(b, 5)
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b._list_scroll = 0
+
+            b.expand('P')                     # no autoscroll kwarg
+            b.run_until_idle()
+            # No goal, no scroll change.
+            self.assertIsNone(b._expand_goal)
+            self.assertEqual(b._list_scroll, 0)
+        finally:
+            b.stop_workers()
+
+    def test_slow_delivery_scrolls_in_two_stages(self):
+        # Worker blocks on a gate so we can inspect the half-loaded
+        # state between the placeholder appearing and the real
+        # children arriving. The goal should:
+        #   Stage 1 (expand posted, worker blocked):
+        #     - visible list has [..., P, pending<P>]
+        #     - _expand_goal is parked
+        #     - _list_scroll moved just enough to show the placeholder
+        #   Stage 2 (worker released, children delivered):
+        #     - visible list has [..., P, P.0, P.1, P.2]
+        #     - _expand_goal cleared (subtree fully loaded)
+        #     - _list_scroll moved further to fit the last child
+        delivery_gate = threading.Event()
+        children = [(f'P.{i}',) for i in range(3)]
+        rows = [('R0',), ('R1',), ('R2',), ('R3',), ('R4',),
+                ('P', None, None, '', True)]
+        def gc(parent_id):
+            if parent_id in ('', None):
+                return rows
+            if parent_id == 'P':
+                delivery_gate.wait(timeout=1.0)
+                return children
+            return []
+        b = make_browser(get_children=gc)
+        self._pin_height(b, 5)
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b._list_scroll = 0
+            b.cursor_to('P')                  # cursor on P (idx 5)
+            b.run_until_idle()
+            self.assertEqual(b._list_scroll, 1)  # cursor-anchor snap
+
+            # ---- Stage 1: expand, worker blocked --------------------
+            b._list_scroll = 0
+            b.expand('P', autoscroll=True)
+            b.drain_main_queue()              # runs _do_expand, queues fetch
+            # The visible list now has a pending placeholder under P
+            # (visible_items emits it lazily for expanded-but-uncached
+            # parents).
+            vis = _state.visible_items(b._state)
+            self.assertEqual(vis[5].item.id, 'P')
+            self.assertEqual(vis[6].kind, 'pending')
+            # Goal is parked (subtree not yet loaded).
+            self.assertIsNotNone(b._expand_goal)
+            self.assertEqual(b._expand_goal['parent_id'], 'P')
+            # Scroll adjusted to keep the placeholder in view.
+            # p_idx=5, last_idx=6, height=5 → lo=2, hi=5 →
+            # clamp(0, 2, 5) = 2.
+            self.assertEqual(b._list_scroll, 2)
+
+            # ---- Stage 2: worker delivers ---------------------------
+            delivery_gate.set()
+            b.run_until_idle()
+            vis = _state.visible_items(b._state)
+            self.assertEqual(vis[5].item.id, 'P')
+            self.assertEqual(vis[6].item.id, 'P.0')
+            self.assertEqual(vis[8].item.id, 'P.2')
+            # Subtree fully loaded → goal cleared.
+            self.assertIsNone(b._expand_goal)
+            # last_idx=8, height=5 → lo=4, hi=5 → clamp(2, 4, 5) = 4.
+            self.assertEqual(b._list_scroll, 4)
+        finally:
+            delivery_gate.set()
+            b.stop_workers()
+
+    def test_user_cursor_move_clears_parked_goal(self):
+        # Goal parked on a slow-loading subtree → user presses 'j'
+        # mid-load → goal cleared, subsequent delivery doesn't snap.
+        children = [(f'P.{i}',) for i in range(3)]
+        delivery_gate = threading.Event()
+        rows = [('R0',), ('R1',), ('R2',), ('R3',), ('R4',),
+                ('P', None, None, '', True)]
+        def gc(parent_id):
+            if parent_id in ('', None):
+                return rows
+            if parent_id == 'P':
+                delivery_gate.wait(timeout=1.0)
+                return children
+            return []
+        b = make_browser(get_children=gc)
+        self._pin_height(b, 5)
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.cursor_to('P')
+            b.run_until_idle()
+            b._list_scroll = 0
+
+            # Kick a slow expansion. The worker blocks on
+            # delivery_gate, so the goal is parked.
+            b.expand('P', autoscroll=True)
+            # Pump the main thread without finishing the worker.
+            b.drain_main_queue()
+            self.assertIsNotNone(b._expand_goal)
+
+            # Simulate a user keypress that moves the cursor.
+            from test.async_._helpers import _state as _state_mod
+            ctx_mod = _state_mod.__dict__.get('Context')
+            # Use _handle_one_key directly with a fake context.
+            class _Ctx:
+                def __init__(self, b): self._browser = b
+                cursor = None
+                selected = []
+                targets = []
+            # Inject minimal Context surface.
+            # Actually use the real Context loader:
+            from test.unit._loader import load
+            _ctx_mod = load('_browse_tui_ctx', '060-context.py')
+            _ctx_mod.visible_items = _state_mod.visible_items
+            _state_mod.Context = _ctx_mod.Context
+            ctx = _ctx_mod.Context(b)
+            # Also need dispatch_key wired:
+            _actions_mod = load('_browse_tui_act', '070-actions.py')
+            _actions_mod.visible_items = _state_mod.visible_items
+            _actions_mod.mark_visible_dirty = _state_mod.mark_visible_dirty
+            _actions_mod.mark_cursor_changed = _state_mod.mark_cursor_changed
+            _state_mod.dispatch_key = _actions_mod.dispatch_key
+            _state_mod._handle_insert_key = _actions_mod._handle_insert_key
+            b._handle_one_key(ctx, 'j')
+            # Cursor moved → goal cleared.
+            self.assertIsNone(b._expand_goal)
+
+            # Release the worker; subsequent delivery must NOT snap
+            # the viewport.
+            scroll_before_delivery = b._list_scroll
+            delivery_gate.set()
+            b.run_until_idle()
+            self.assertEqual(b._list_scroll, scroll_before_delivery)
+        finally:
+            delivery_gate.set()
+            b.stop_workers()
+
+    def test_re_expand_of_already_expanded_does_not_reset_goal(self):
+        # An already-expanded id, re-expanded with autoscroll=True, is
+        # a no-op for the goal: nothing new is being revealed.
+        gc = self._tree({
+            None: [('P', None, None, '', True)],
+            'P':  [(f'P.{i}',) for i in range(3)],
+        })
+        b = make_browser(get_children=gc)
+        self._pin_height(b, 5)
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.expand('P', autoscroll=True)
+            b.run_until_idle()
+            self.assertIsNone(b._expand_goal)  # fully loaded after first
+            # Re-expand: no goal should be set again.
+            b.expand('P', autoscroll=True)
+            b.run_until_idle()
+            self.assertIsNone(b._expand_goal)
+        finally:
+            b.stop_workers()
+
+
 if __name__ == '__main__':
     unittest.main()

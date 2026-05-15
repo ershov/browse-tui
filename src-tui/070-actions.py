@@ -167,7 +167,10 @@ def _nav_right(ctx):
         return
     item = entry.item
     if getattr(item, 'has_children', False) and item.id not in state.expanded:
-        ctx.expand(item.id)
+        # User-driven expand → opt in to the scroll-to-fit goal so the
+        # newly-revealed subtree slides into view (re-applied as
+        # async children stream in). Recipes leave autoscroll=False.
+        ctx.expand(item.id, autoscroll=True)
         return
     if (getattr(item, 'has_children', False)
             and state.cursor + 1 < len(vis)
@@ -1486,6 +1489,9 @@ def _dispatch_mouse(browser, ctx, key):
     if kind in ('scroll-up', 'scroll-down'):
         delta = -_WHEEL_LINES if kind == 'scroll-up' else _WHEEL_LINES
         if pane == 'list':
+            # Manual viewport change overrides any parked
+            # scroll-to-fit goal — the user has taken over.
+            browser._expand_goal = None
             _scroll_list(browser, delta)
         elif pane == 'preview':
             _scroll_preview(browser, delta)

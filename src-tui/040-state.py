@@ -1515,6 +1515,31 @@ class Browser:
         # just ``[id]`` — fallbacks fill in once placement lands).
         self._cursor_anchor = []
 
+        # --- sticky scroll-to-fit goal on expansion --------------------
+        # When a node is newly expanded, the main loop tries to adjust
+        # ``_list_scroll`` so the parent row AND its newly-revealed
+        # subtree both fit in the list pane. The goal is parked here
+        # and re-applied after every visible-list mutation
+        # (``apply_children_results``, ``update_data._apply``) so a
+        # subtree that streams in over time keeps moving into view.
+        #
+        # Cleared when:
+        #   - the subtree is fully loaded (no pending placeholders), OR
+        #   - the subtree is larger than the pane minus the parent row
+        #     (scroll cap reached — can't fit any more without dropping
+        #     the parent), OR
+        #   - the user moves the cursor (``_handle_one_key`` clears
+        #     it), OR
+        #   - the user wheel-scrolls the list pane (mouse handler
+        #     clears it).
+        #
+        # Set by ``_do_expand`` when ``autoscroll=True`` and the node
+        # was not already expanded. User-driven ``→`` / ``l`` passes
+        # ``autoscroll=True``; ``Browser.expand`` defaults to
+        # ``autoscroll=False`` so recipes doing bulk setup don't
+        # surprise the user with a scroll jump.
+        self._expand_goal = None
+
         # --- insert-mode bookkeeping (ticket #21) ----------------------
         # Insert mode is entered by ``ctx.insert(label, on_confirm)``.
         # The user moves a placement marker through the visible tree and
@@ -1691,16 +1716,25 @@ class Browser:
         return pending
 
     def expand(self, id: Any,
-               on_complete: Optional[Callable[[], None]] = None) -> 'Pending':
+               on_complete: Optional[Callable[[], None]] = None,
+               autoscroll: bool = False) -> 'Pending':
         """(thread-safe) Add ``id`` to expanded; trigger fetch if not cached.
 
         Pending resolves when children are cached (or immediately on the
         next drain if already cached).
+
+        ``autoscroll`` (default ``False``): when ``True`` and ``id``
+        wasn't already expanded, park a sticky scroll goal so the
+        viewport adjusts to fit the parent row plus its newly-revealed
+        subtree (including async deliveries that arrive in pieces).
+        User-driven expansion (``→`` / ``l``) passes ``autoscroll=True``;
+        recipes doing bulk-expand setup leave the default and avoid
+        surprise scrolls.
         """
         pending = Pending()
         if on_complete is not None:
             pending.then(on_complete)
-        self.post(lambda: self._do_expand(id, pending))
+        self.post(lambda: self._do_expand(id, pending, autoscroll))
         return pending
 
     def set_children(self, id_, items) -> None:
@@ -1752,6 +1786,10 @@ class Browser:
             # item; ``_apply_cursor_anchor`` keeps the cursor's
             # identity stable by walking the snapshot tiers.
             self._apply_cursor_anchor()
+            # Re-apply the expand goal too — a structured push that
+            # materialises a previously-loading subtree should slide
+            # into view automatically.
+            self._apply_expand_goal()
             # Clamp the cursor back into the visible range when the
             # anchor walk didn't find a home (e.g., every id in the
             # snapshot was removed). Mirrors the clamp in
@@ -2014,6 +2052,10 @@ class Browser:
             # new visible list. See ``_apply_cursor_anchor`` for the
             # walk order (primary → next → prev → ancestors).
             self._apply_cursor_anchor()
+            # Re-apply the scroll-to-fit expand goal so a streaming
+            # subtree keeps moving into view as deliveries arrive.
+            # No-op if no goal is parked.
+            self._apply_expand_goal()
             # If the apply shrank the visible list past the cursor,
             # clamp it so the cursor still indexes a real row. Without
             # this, a watcher-driven refresh that removes items can
@@ -2199,7 +2241,7 @@ class Browser:
         self._apply_cursor_anchor()
         pending._resolve()
 
-    def _do_expand(self, id_, pending):
+    def _do_expand(self, id_, pending, autoscroll=False):
         """Main-thread: add ``id_`` to expanded; fetch if not cached.
 
         If children are already cached, mark visible-tree dirty and
@@ -2212,8 +2254,22 @@ class Browser:
         while the fetch is in flight) -- otherwise the loop renders
         nothing until the worker completes and the placeholder is
         invisibly skipped.
+
+        ``autoscroll`` parks a sticky scroll-to-fit goal on a fresh
+        expansion. The goal is applied here (synchronously, for the
+        cached path or to land on the loading placeholder) and re-
+        applied by ``apply_children_results`` / ``update_data._apply``
+        as the subtree streams in.
         """
+        was_expanded = id_ in self._state.expanded
         self._state.expanded.add(id_)
+        # Set the scroll-to-fit goal on a fresh expansion (the first
+        # transition from collapsed to expanded). Subsequent calls on
+        # an already-expanded id are no-ops here and shouldn't reset
+        # the goal — particularly if a recipe rapidly re-issues the
+        # same expand.
+        if autoscroll and not was_expanded:
+            self._expand_goal = {'parent_id': id_}
         if id_ in self._state._children:
             mark_visible_dirty(self._state)
             # Children already cached — expanding inserts those rows
@@ -2223,6 +2279,7 @@ class Browser:
             # goes through ``apply_children_results`` which also
             # re-snaps.)
             self._apply_cursor_anchor()
+            self._apply_expand_goal()
             self._needs_redraw.add('list')
             pending._resolve()
             return
@@ -2233,6 +2290,10 @@ class Browser:
         self._children_queue.append(id_)
         self._children_event.set()
         mark_visible_dirty(self._state)
+        # Uncached: the subtree only has a ⧗ placeholder right now.
+        # The goal scrolls just enough to show it; re-applies as real
+        # children stream in via apply_children_results.
+        self._apply_expand_goal()
         self._needs_redraw.add('list')
 
     def _do_select(self, ids, replace):
@@ -3248,6 +3309,95 @@ class Browser:
                 return True
         return False
 
+    def _apply_expand_goal(self) -> None:
+        """Adjust ``_list_scroll`` to fit the parked expansion goal.
+
+        Geometry (with ``height = list pane rows``):
+
+          * ``p_idx`` is the parent row's index in the visible list.
+          * ``last_idx`` is the last row of the parent's subtree (the
+            deepest descendant visible right now, possibly a ``pending``
+            placeholder).
+          * Acceptable scroll values satisfy "parent visible" AND
+            "last row visible": ``[last_idx - height + 1, p_idx]``.
+          * When the range is non-empty (subtree fits in the pane
+            below the parent), pick the value closest to the current
+            scroll — moves bidirectionally with the minimum amount.
+          * When the range is empty (subtree larger than the pane
+            minus the parent), park the parent at the top and clear
+            the goal (scroll-cap reached).
+
+        The goal also clears when every row in the subtree is
+        materialised (no ``pending`` placeholders). User cursor moves
+        and wheel scrolls clear it from their own dispatch sites.
+        Insert mode short-circuits — the active-row concept is the
+        insert marker, not the visible cursor, and the geometry above
+        doesn't apply.
+        """
+        goal = self._expand_goal
+        if goal is None or self._insert_mode:
+            return
+        parent_id = goal['parent_id']
+
+        # User collapsed the parent or it disappeared from the tree —
+        # the goal is meaningless either way.
+        if parent_id not in self._state.expanded:
+            self._expand_goal = None
+            return
+
+        vis = visible_items(self._state)
+        p_idx = None
+        p_depth = 0
+        for i, entry in enumerate(vis):
+            if entry.item.id == parent_id:
+                p_idx = i
+                p_depth = entry.depth
+                break
+        if p_idx is None:
+            self._expand_goal = None
+            return
+
+        # Subtree extent: contiguous run of deeper rows after the parent.
+        # ``has_pending`` tells us whether the subtree is still loading.
+        last_idx = p_idx
+        has_pending = False
+        for i in range(p_idx + 1, len(vis)):
+            if vis[i].depth <= p_depth:
+                break
+            last_idx = i
+            if vis[i].kind == 'pending':
+                has_pending = True
+
+        height = self._list_pane_height_safe()
+        if height <= 0:
+            return
+
+        lo = last_idx - height + 1
+        hi = p_idx
+        fits = hi >= lo
+        if fits:
+            # Minimal bidirectional move: nudge into the acceptable
+            # range only as far as needed.
+            desired = max(lo, min(hi, self._list_scroll))
+        else:
+            # Subtree too big for the available area; show parent at
+            # top and stop the goal afterwards.
+            desired = hi
+        if desired < 0:
+            desired = 0
+
+        if desired != self._list_scroll:
+            self._list_scroll = desired
+            self._needs_redraw.add('list')
+
+        # Stop conditions: fully loaded, or scroll-cap hit.
+        if not has_pending:
+            self._expand_goal = None
+            return
+        if not fits:
+            self._expand_goal = None
+            return
+
     def _handle_one_key(self, ctx, key) -> None:
         """Dispatch one keystroke and run the per-key bookkeeping.
 
@@ -3288,6 +3438,12 @@ class Browser:
                 # so the cursor stays on its item rather than drifting
                 # with shifted indices.
                 self._apply_cursor_anchor()
+            else:
+                # User moved the cursor — abandon any parked
+                # expand-to-fit goal so the next async delivery
+                # doesn't snap the viewport back onto the
+                # now-no-longer-interesting subtree.
+                self._expand_goal = None
         new_row = self._active_list_row()
         if prev_insert != self._insert_mode or new_row != prev_row:
             self._snap_list_scroll_to_row(new_row)
