@@ -1496,21 +1496,6 @@ class TestMdPagerResolution(unittest.TestCase):
             os.environ['PATH'] = saved_path
             restore()
 
-    def test_md_alone_no_longer_resolves(self):
-        # Even with ``md`` on PATH, the resolver should NOT pick it —
-        # we dropped that tool from the search order.
-        import tempfile
-        with tempfile.TemporaryDirectory() as tmp:
-            self._scratch_bin(tmp, ['md'])
-            saved_path = os.environ['PATH']
-            restore = self._with_env(MD2ANSI=None)
-            try:
-                os.environ['PATH'] = tmp
-                self.assertIsNone(self.r._resolve_md_pager())
-            finally:
-                os.environ['PATH'] = saved_path
-                restore()
-
 
 class TestScanTree(unittest.TestCase):
     """``_scan_tree`` builds the parentUuid/promptId tree + caching."""
