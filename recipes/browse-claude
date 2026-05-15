@@ -42,8 +42,9 @@ import datetime
 import json
 import os
 import sys
+import threading
 
-from browse_tui import Action, Browser, Item
+from browse_tui import Action, Browser, Item, upsert
 
 
 CLAUDE_ROOT = os.path.join(
@@ -374,6 +375,15 @@ def _indent_continuations(text, indent):
 
 def get_children(item_id):
     if item_id is None:
+        # Indirect ``re-read all`` signal: the framework calls this on
+        # initial load AND every time ``ctx.refresh()`` / Ctrl-R fires
+        # (``_do_refresh(None)`` invalidates the framework children
+        # cache and re-enqueues the root). Clear the recipe-internal
+        # caches so the next per-file get_children rebuilds _TreeData
+        # and _TAIL_STATE from scratch — equivalent to ``re-creates
+        # all structure`` without intercepting the global command.
+        _TREE_CACHE.clear()
+        _TAIL_STATE.clear()
         return _list_projects()
     if isinstance(item_id, str) and '#agent:' in item_id:
         # Tree mode views the subagent .jsonl as its own tree, recursing
@@ -2199,6 +2209,44 @@ _TREE_CACHE = {}   # path → (mtime, TreeData)
 _TREE_MODE = True  # default; --no-tree CLI flag or 't' action flips it.
 
 
+# Live-tail worker state, keyed by .jsonl path. One entry per file
+# the bulk scan has visited; the worker resumes from each entry's
+# byte_offset on its 5s tick and folds new records via _fold_record
+# (same code path as the bulk scan).
+class _TailState:
+    """Per-file state for the live-tail worker.
+
+    Persistence semantics:
+      * Survives normal navigation (cache hits in ``_scan_tree``).
+      * Recreated on mtime change (``_scan_tree`` rebuilds + rewrites).
+      * Cleared by the indirect ``get_children(None)`` reset signal —
+        which fires on Ctrl-R / ``ctx.refresh()`` / initial load.
+
+    ``error`` latches True on the first malformed complete line. The
+    worker skips this file thereafter until the size shrinks (which
+    also forces ``error=True``, but a follow-up mtime change drops the
+    state entirely via the rebuild path) or until the user-triggered
+    reset clears ``_TAIL_STATE[path]``.
+    """
+
+    __slots__ = ('byte_offset', 'last_size', 'cursor', 'error', 'lock')
+
+    def __init__(self, *, byte_offset, last_size, cursor, error):
+        self.byte_offset = byte_offset
+        self.last_size = last_size
+        self.cursor = cursor
+        self.error = error
+        # Held by ``_scan_tree`` (blocking) and ``_fold_new_lines``
+        # (trylock — bail on contention, matching the best-effort
+        # design).
+        self.lock = threading.Lock()
+
+
+_TAIL_STATE = {}    # path → _TailState
+_TAIL_STOP = None   # threading.Event; created in main()
+_TAIL_THREAD = None # threading.Thread; created in main()
+
+
 _TREE_METADATA_TYPES = frozenset([
     # records that show up as their own roots — they carry no
     # parentUuid and don't participate in the conversation chain.
@@ -2345,8 +2393,231 @@ def _is_turn_close(rec):
             and rec.get('subtype') == 'turn_duration')
 
 
+class _ScanCursor:
+    """Mutable per-file state-machine cursor for the bulk + tail fold.
+
+    Holds the open-turn / open-span context plus the per-turn
+    ``tool_use_id → assistant_uuid`` registry so each newly-arrived
+    record can be classified online (no second pass over a buffered
+    turn). Persists in ``_TAIL_STATE`` between worker ticks so a
+    record arriving in tick 2 sees the same registry the bulk scan
+    or tick 1 was building.
+    """
+
+    __slots__ = ('turn_open_uuid', 'tool_owner', 'span_start')
+
+    def __init__(self):
+        self.turn_open_uuid = None
+        # tool_use_id → owning assistant_uuid (within the open turn).
+        # Cleared on turn close.
+        self.tool_owner = {}
+        # Line number of the first record of the currently-open span,
+        # or None when not inside a span.
+        self.span_start = None
+
+
+def _fold_record(td, cur, rec, n, path, sub_dir):
+    """Fold one record at line ``n`` into ``td`` using ``cur``.
+
+    Returns a set of parent umbrella ids whose visible child list grew
+    (caller turns these into ``update_data`` patches). Bulk scan
+    ignores the return value; the tailer consumes it.
+    """
+    dirty = set()
+    if rec is None:
+        return dirty
+    if not isinstance(rec, dict):
+        return dirty
+
+    # Basic record bookkeeping (parallels the bulk scan's first pass).
+    td.records_line[id(rec)] = n
+    uuid = rec.get('uuid')
+    if uuid:
+        td.by_uuid[uuid] = rec
+        td.line_of[uuid] = n
+    if rec.get('forkedFrom'):
+        rec['_tree_forked_from'] = rec['forkedFrom']
+
+    # --- turn root: opens a new <prompt> umbrella, closes any open span.
+    if _is_turn_root(rec):
+        if cur.span_start is not None:
+            # Span closed by this turn root; the records list stored
+            # in td.span_records is live-shared with td.roots_in_order
+            # so no copy needed here.
+            cur.span_start = None
+        cur.turn_open_uuid = uuid
+        cur.tool_owner = {}
+        if uuid is not None:
+            td.turn_direct[uuid] = []
+        td.roots_in_order.append({'kind': 'turn', 'rec': rec, 'line': n})
+        td.parent_id_of[n] = f'{path}#prompt:{n}'
+        dirty.add(path)   # new root-level umbrella
+        return dirty
+
+    # --- record inside an open turn.
+    if cur.turn_open_uuid is not None:
+        turn_root_line = td.line_of.get(cur.turn_open_uuid)
+        turn_uuid = cur.turn_open_uuid
+
+        # (a) Assistant with one or more tool_use parts. Register each
+        # tool_use id → assistant uuid, mark the assistant as
+        # ``<tool>``-wrapped, and place it as a direct child of the
+        # turn (the umbrella around it lives at the listing layer).
+        if rec.get('type') == 'assistant':
+            msg = rec.get('message') or {}
+            content = msg.get('content') if isinstance(msg, dict) else None
+            has_tool_use = False
+            if isinstance(content, list):
+                for p in content:
+                    if (isinstance(p, dict)
+                            and p.get('type') == 'tool_use'
+                            and p.get('id')):
+                        cur.tool_owner[p['id']] = uuid
+                        if uuid:
+                            td.assistant_has_tool_use.add(uuid)
+                            td.tool_use_name_of.setdefault(
+                                uuid, p.get('name') or 'tool')
+                        has_tool_use = True
+            if has_tool_use:
+                td.turn_direct[turn_uuid].append(rec)
+                td.parent_id_of[n] = f'{path}#tool:{n}'
+                if turn_root_line is not None:
+                    td.tool_to_turn_root_line[n] = turn_root_line
+                    dirty.add(f'{path}#prompt:{turn_root_line}')
+                if _is_turn_close(rec):
+                    cur.turn_open_uuid = None
+                    cur.tool_owner = {}
+                return dirty
+
+        # (b) Tool-child resolution: tool_result / hook attachment /
+        # sourceToolUseID back-pointers.
+        owner = _resolve_tool_owner(rec, cur.tool_owner)
+
+        if owner is not None:
+            owner_line = td.line_of.get(owner)
+            td.tool_children.setdefault(owner, []).append(rec)
+            if owner_line is not None:
+                td.parent_id_of[n] = f'{path}#tool:{owner_line}'
+                dirty.add(f'{path}#tool:{owner_line}')
+            # Subagent-link check: a tool_result whose
+            # toolUseResult.agentId resolves an agent jsonl on disk.
+            _maybe_link_subagent(td, rec, owner, sub_dir, path)
+        else:
+            td.turn_direct[turn_uuid].append(rec)
+            if turn_root_line is not None:
+                td.parent_id_of[n] = f'{path}#prompt:{turn_root_line}'
+                dirty.add(f'{path}#prompt:{turn_root_line}')
+
+        if _is_turn_close(rec):
+            cur.turn_open_uuid = None
+            cur.tool_owner = {}
+        return dirty
+
+    # --- outside any turn: span member.
+    if cur.span_start is None:
+        cur.span_start = n
+        # Initialise a live-shared span records list so further
+        # appends from this same call AND from future tail ticks are
+        # both visible to the umbrella's preview without a copy step.
+        td.span_records[n] = []
+        td.roots_in_order.append({
+            'kind': 'span', 'start': n,
+            'records': td.span_records[n],
+        })
+        dirty.add(path)   # new root-level span umbrella
+    span_start = cur.span_start
+    td.span_records[span_start].append(rec)
+    td.parent_id_of[n] = f'{path}#span:{span_start}'
+    dirty.add(f'{path}#span:{span_start}')
+    return dirty
+
+
+def _resolve_tool_owner(rec, tool_owner):
+    """Look up the assistant_uuid that this record back-points at, or None."""
+    # (1) user tool_result content: tool_use_id back-pointer.
+    msg = rec.get('message')
+    if isinstance(msg, dict):
+        content = msg.get('content')
+        if isinstance(content, list):
+            for p in content:
+                if (isinstance(p, dict)
+                        and p.get('type') == 'tool_result'):
+                    tu = p.get('tool_use_id')
+                    if tu in tool_owner:
+                        return tool_owner[tu]
+    # (2) attachment with toolUseID — hook outputs.
+    if rec.get('type') == 'attachment':
+        att = rec.get('attachment')
+        if isinstance(att, dict):
+            tu = att.get('toolUseID')
+            if tu in tool_owner:
+                return tool_owner[tu]
+    # (3) records with explicit back-pointer fields.
+    tu = rec.get('sourceToolUseID')
+    if tu in tool_owner:
+        return tool_owner[tu]
+    return None
+
+
+def _maybe_link_subagent(td, rec, owner_uuid, sub_dir, path):
+    """If ``rec`` is a tool_result that resolves a subagent jsonl, link it.
+
+    Inspects the owner assistant's tool_use parts to find the matching
+    Agent/Task call and records the join via ``td.agent_link`` plus the
+    ``agent_to_assistant_line`` shortcut. No-op if anything mismatches.
+    """
+    msg = rec.get('message')
+    if not isinstance(msg, dict):
+        return
+    content = msg.get('content')
+    if not isinstance(content, list):
+        return
+    asst = td.by_uuid.get(owner_uuid)
+    if asst is None:
+        return
+    amsg = asst.get('message') or {}
+    if not isinstance(amsg, dict):
+        return
+    acontent = amsg.get('content') or []
+    if not isinstance(acontent, list):
+        return
+    for cp in content:
+        if not (isinstance(cp, dict) and cp.get('type') == 'tool_result'):
+            continue
+        tu_id = cp.get('tool_use_id')
+        if not tu_id:
+            continue
+        for ap in acontent:
+            if not (isinstance(ap, dict)
+                    and ap.get('type') == 'tool_use'
+                    and ap.get('id') == tu_id
+                    and ap.get('name') in ('Agent', 'Task')):
+                continue
+            tur = rec.get('toolUseResult')
+            agent_id = (tur.get('agentId')
+                        if isinstance(tur, dict) else None)
+            if not agent_id:
+                continue
+            agent_path = os.path.join(sub_dir, f'agent-{agent_id}.jsonl')
+            if not os.path.isfile(agent_path):
+                continue
+            td.agent_link[tu_id] = {
+                'agent_id': agent_id,
+                'agent_path': agent_path,
+                'assistant_uuid': owner_uuid,
+            }
+            asst_line = td.line_of.get(owner_uuid)
+            if asst_line is not None:
+                td.agent_to_assistant_line[agent_id] = asst_line
+
+
 def _scan_tree(path):
-    """Return cached ``_TreeData`` for ``path``; (re)scan on mtime change."""
+    """Return cached ``_TreeData`` for ``path``; (re)scan on mtime change.
+
+    Bulk-fills ``td`` via the per-record fold helper that the live-tail
+    worker shares — so a record landing in tick 2 is processed the
+    same way as if it had been there at scan time.
+    """
     try:
         mtime = os.stat(path).st_mtime
     except OSError:
@@ -2356,238 +2627,295 @@ def _scan_tree(path):
         return cached[1]
 
     td = _TreeData()
+    cur = _ScanCursor()
+    sub_dir = _subagents_dir(path)
     try:
         f = open(path, 'r', encoding='utf-8', errors='replace')
     except OSError:
         _TREE_CACHE[path] = (mtime, td)
         return td
+    # Use readline() (not ``for line in f``) so ``f.tell()`` is legal —
+    # the iterator protocol disables tell() to protect its read-ahead
+    # buffer. We need tell() to record byte offsets per line for the
+    # live-tail worker's resume point.
+    last_full_offset = 0
+    n = 0
     with f:
-        for n, line in enumerate(f):
-            line = line.rstrip('\n')
-            if not line.strip():
+        while True:
+            line = f.readline()
+            if not line:
+                break
+            had_nl = line.endswith('\n')
+            if not had_nl:
+                # Incomplete trailing line — leave offset at its start
+                # so the tail picks it up when more bytes arrive.
+                break
+            stripped = line.rstrip('\n')
+            if not stripped.strip():
                 td.records.append(None)
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                td.records.append(None)
-                continue
-            if not isinstance(rec, dict):
-                td.records.append(None)
-                continue
-            td.records.append(rec)
-            td.records_line[id(rec)] = n
-            uuid = rec.get('uuid')
-            if uuid:
-                td.by_uuid[uuid] = rec
-                td.line_of[uuid] = n
-            if rec.get('forkedFrom'):
-                rec['_tree_forked_from'] = rec['forkedFrom']
-
-    # Walk file order; partition records into spans (no open turn) vs
-    # turn members.
-    turn_open_uuid = None
-    turn_members_buf = {}    # turn_uuid → [recs] (collected here, later
-                             #   split into turn_direct + tool_children)
-    span_start = None
-    span_buf = []
-
-    def _close_span():
-        nonlocal span_start, span_buf
-        if span_buf:
-            td.span_records[span_start] = list(span_buf)
-            td.roots_in_order.append({
-                'kind': 'span',
-                'start': span_start,
-                'records': list(span_buf),
-            })
-        span_start = None
-        span_buf = []
-
-    for n, rec in enumerate(td.records):
-        if rec is None:
-            continue
-        if _is_turn_root(rec):
-            _close_span()
-            turn_open_uuid = rec.get('uuid')
-            if turn_open_uuid:
-                turn_members_buf[turn_open_uuid] = []
-            td.roots_in_order.append({
-                'kind': 'turn', 'rec': rec, 'line': n,
-            })
-        elif turn_open_uuid is not None:
-            turn_members_buf[turn_open_uuid].append(rec)
-            if _is_turn_close(rec):
-                turn_open_uuid = None
-        else:
-            if span_start is None:
-                span_start = n
-            span_buf.append(rec)
-    _close_span()
-
-    # Tool execution grouping inside each turn. For every turn, build
-    # ``tool_owner: tool_use_id → assistant_uuid`` from the assistant
-    # records with tool_use content parts. Then partition members:
-    # records that back-point at a known tool_use get re-parented;
-    # everything else stays as a direct child of the turn root.
-    for turn_uuid, members in turn_members_buf.items():
-        tool_owner = {}
-        for m in members:
-            if m.get('type') != 'assistant':
-                continue
-            msg = m.get('message')
-            if not isinstance(msg, dict):
-                continue
-            content = msg.get('content')
-            if not isinstance(content, list):
-                continue
-            for p in content:
-                if (isinstance(p, dict)
-                        and p.get('type') == 'tool_use'
-                        and p.get('id')):
-                    tool_owner[p['id']] = m.get('uuid')
-                    auuid = m.get('uuid')
-                    if auuid:
-                        td.assistant_has_tool_use.add(auuid)
-                        # First tool_use part's name drives the
-                        # ``<tool:Name>`` umbrella title prefix.
-                        td.tool_use_name_of.setdefault(
-                            auuid, p.get('name') or 'tool')
-
-        direct = []
-        for m in members:
-            owner = None
-
-            # (1) user tool_result content: tool_use_id back-pointer.
-            mmsg = m.get('message')
-            if isinstance(mmsg, dict):
-                mcontent = mmsg.get('content')
-                if isinstance(mcontent, list):
-                    for p in mcontent:
-                        if (isinstance(p, dict)
-                                and p.get('type') == 'tool_result'):
-                            tu = p.get('tool_use_id')
-                            if tu in tool_owner:
-                                owner = tool_owner[tu]
-                                break
-
-            # (2) attachment with toolUseID — hook outputs.
-            if owner is None and m.get('type') == 'attachment':
-                att = m.get('attachment')
-                if isinstance(att, dict):
-                    tu = att.get('toolUseID')
-                    if tu in tool_owner:
-                        owner = tool_owner[tu]
-
-            # (3) records with explicit back-pointer fields (synthetic
-            # tool-followup user rows etc).
-            if owner is None:
-                tu = m.get('sourceToolUseID')
-                if tu in tool_owner:
-                    owner = tool_owner[tu]
-
-            if owner is not None:
-                td.tool_children.setdefault(owner, []).append(m)
             else:
-                direct.append(m)
-        td.turn_direct[turn_uuid] = direct
+                try:
+                    rec = json.loads(stripped)
+                except json.JSONDecodeError:
+                    rec = None
+                if not isinstance(rec, dict):
+                    td.records.append(None)
+                else:
+                    td.records.append(rec)
+                    _fold_record(td, cur, rec, n, path, sub_dir)
+            last_full_offset = f.tell()
+            n += 1
 
-    # Subagent link: for every assistant record with an Agent/Task
-    # tool_use whose tool_children contain a matching tool_result whose
-    # toolUseResult.agentId resolves to a sibling subagent .jsonl,
-    # record the join. Used by ``_list_tree_children`` to attach the
-    # subagent pseudo-row under the assistant.
-    sub_dir = _subagents_dir(path)
-    for rec in td.records:
-        if rec is None or rec.get('type') != 'assistant':
-            continue
-        msg = rec.get('message')
-        if not isinstance(msg, dict):
-            continue
-        content = msg.get('content')
-        if not isinstance(content, list):
-            continue
-        for p in content:
-            if not (isinstance(p, dict)
-                    and p.get('type') == 'tool_use'
-                    and p.get('name') in ('Agent', 'Task')):
-                continue
-            tu_id = p.get('id')
-            for child in td.tool_children.get(rec.get('uuid'), []):
-                cmsg = child.get('message')
-                if not isinstance(cmsg, dict):
-                    continue
-                ccontent = cmsg.get('content')
-                if not isinstance(ccontent, list):
-                    continue
-                for cp in ccontent:
-                    if (isinstance(cp, dict)
-                            and cp.get('type') == 'tool_result'
-                            and cp.get('tool_use_id') == tu_id):
-                        tur = child.get('toolUseResult')
-                        agent_id = (tur.get('agentId')
-                                    if isinstance(tur, dict) else None)
-                        if agent_id:
-                            agent_path = os.path.join(
-                                sub_dir, f'agent-{agent_id}.jsonl',
-                            )
-                            if os.path.isfile(agent_path):
-                                td.agent_link[tu_id] = {
-                                    'agent_id': agent_id,
-                                    'agent_path': agent_path,
-                                    'assistant_uuid': rec.get('uuid'),
-                                }
-                                asst_line = td.line_of.get(rec.get('uuid'))
-                                if asst_line is not None:
-                                    td.agent_to_assistant_line[agent_id] = (
-                                        asst_line
-                                    )
-
-    # parent_id_of: maps each record's line → its parent **umbrella**
-    # id. Used by ``_ancestor_ids_for`` for cursor-on-open and the
-    # t-toggle's walk-up-and-expand. Every leaf row sits inside a
-    # ``<prompt>`` / ``<tool>`` / ``<system>`` umbrella, so this map
-    # always lands on an umbrella id — never on a raw message id.
-    #
-    # The umbrella-to-umbrella links (``<tool>`` → ``<prompt>``,
-    # ``<subagent>`` → ``<tool>``) live in dedicated maps:
-    # ``tool_to_turn_root_line`` and ``agent_to_assistant_line``.
-    for turn_uuid, members in td.turn_direct.items():
-        turn_line = td.line_of.get(turn_uuid)
-        if turn_line is None:
-            continue
-        prompt_id = f'{path}#prompt:{turn_line}'
-        # Turn root itself nests inside its own prompt umbrella.
-        td.parent_id_of[turn_line] = prompt_id
-        for m in members:
-            line = td.records_line.get(id(m))
-            if line is None:
-                continue
-            if m.get('uuid') in td.assistant_has_tool_use:
-                # Assistant-with-tool_use is wrapped in its own tool
-                # umbrella; the tool umbrella is the prompt's child.
-                td.parent_id_of[line] = f'{path}#tool:{line}'
-                td.tool_to_turn_root_line[line] = turn_line
-            else:
-                td.parent_id_of[line] = prompt_id
-    for owner_uuid, kids in td.tool_children.items():
-        owner_line = td.line_of.get(owner_uuid)
-        if owner_line is None:
-            continue
-        tool_id = f'{path}#tool:{owner_line}'
-        for k in kids:
-            line = td.records_line.get(id(k))
-            if line is not None:
-                td.parent_id_of[line] = tool_id
-    for span_start, recs in td.span_records.items():
-        parent_id = f'{path}#span:{span_start}'
-        for r in recs:
-            line = td.records_line.get(id(r))
-            if line is not None:
-                td.parent_id_of[line] = parent_id
-
+    # Stash the byte offset + scan cursor + last-seen size for the
+    # live-tail worker. The worker resumes from exactly the byte the
+    # bulk scan stopped at, with the same open-turn / open-span state.
+    _TAIL_STATE[path] = _TailState(
+        byte_offset=last_full_offset,
+        last_size=last_full_offset,
+        cursor=cur,
+        error=False,
+    )
     _TREE_CACHE[path] = (mtime, td)
     return td
+
+
+def _fold_new_lines(path):
+    """Incremental tail step: read new bytes, fold them into the cache.
+
+    Best-effort, per the design:
+
+      * Returns an empty set if the file's tail state is missing
+        (bulk scan hasn't bootstrapped yet), the error flag is set,
+        the size hasn't advanced, or the per-file lock is held.
+      * On a complete-line JSON parse failure (the file is corrupted
+        or written by a non-jsonl producer), sets the error flag and
+        returns whatever dirty parents were already collected.
+      * If the file's size shrank (truncation / rotation), sets the
+        error flag and returns no patches — the user must Ctrl-R to
+        recover.
+
+    Returns the set of parent umbrella ids whose visible child list
+    grew, suitable for ``update_data`` patches.
+    """
+    tail = _TAIL_STATE.get(path)
+    if tail is None or tail.error:
+        return set()
+    cached = _TREE_CACHE.get(path)
+    if cached is None:
+        return set()
+    td = cached[1]
+
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return set()
+    if size < tail.last_size:
+        # Truncation / rotation — our offset is stale; refuse to tail
+        # until the user re-reads (or until ``get_children(None)``
+        # clears the state on a refresh).
+        tail.error = True
+        return set()
+    if size == tail.last_size:
+        return set()
+
+    if not tail.lock.acquire(blocking=False):
+        # Contention with _scan_tree's blocking acquire. Best-effort:
+        # bail and retry on the next tick.
+        return set()
+    dirty = set()
+    try:
+        # Re-stat under the lock so we don't read past a size we just
+        # advanced via another worker.
+        size = os.path.getsize(path)
+        try:
+            f = open(path, 'r', encoding='utf-8', errors='replace')
+        except OSError:
+            return set()
+        with f:
+            f.seek(tail.byte_offset)
+            n = len(td.records)
+            sub_dir = _subagents_dir(path)
+            while True:
+                line = f.readline()
+                if not line:
+                    break
+                if not line.endswith('\n'):
+                    # Incomplete trailing line — leave the offset at
+                    # its start. The tail picks it up next tick once
+                    # more bytes have been appended.
+                    break
+                stripped = line.rstrip('\n')
+                if not stripped.strip():
+                    td.records.append(None)
+                else:
+                    try:
+                        rec = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        # First malformed complete line latches the
+                        # error flag. The previously-folded records
+                        # this tick still landed in td, so callers
+                        # may still flush patches for them.
+                        tail.error = True
+                        break
+                    if not isinstance(rec, dict):
+                        td.records.append(None)
+                    else:
+                        td.records.append(rec)
+                        dirty |= _fold_record(td, cur=tail.cursor, rec=rec,
+                                              n=n, path=path,
+                                              sub_dir=sub_dir)
+                tail.byte_offset = f.tell()
+                n += 1
+        tail.last_size = size
+    finally:
+        tail.lock.release()
+    return dirty
+
+
+def _item_to_upsert_kwargs(item):
+    """Extract Item fields + custom attrs into kwargs for ``upsert``.
+
+    ``upsert`` accepts arbitrary keyword args: declared dataclass
+    fields map to ``Item.__init__`` kwargs, anything else lands as
+    ``setattr`` on the freshly-built Item (mirrors ``to_item``).
+    Iterating ``vars(item)`` picks up both the declared fields and
+    the recipe-specific attrs (kind, line_no, row_bg, …) without
+    enumerating each one by name.
+    """
+    out = {}
+    for k, v in vars(item).items():
+        if k == 'id':
+            continue
+        out[k] = v
+    return out
+
+
+def _push_tail_diffs(b, dirty_parents):
+    """Apply ``update_data`` patches for every dirty umbrella's new kids.
+
+    For each parent id whose child list grew during the fold step, we
+    compare the live ``get_children(parent)`` output against what the
+    framework already has cached and ``upsert`` only the new entries.
+    Parents not yet expanded by the user are skipped — their children
+    will be fetched the normal way once expansion happens. Called on
+    the main thread via ``Browser.update_data`` (thread-safe).
+    """
+    if not dirty_parents:
+        return
+    state = b._state
+    ops = []
+    for parent_id in dirty_parents:
+        if parent_id not in state._children:
+            continue
+        existing_ids = {it.id for it in state._children[parent_id]}
+        try:
+            fresh = get_children(parent_id)
+        except Exception:
+            continue
+        for child in fresh:
+            if child.id in existing_ids:
+                continue
+            ops.append(upsert(child.id, parent_id,
+                              **_item_to_upsert_kwargs(child)))
+    if ops:
+        b.update_data(ops)
+
+
+def _tail_worker(b):
+    """Background loop: every 5s, tail the cursor's file once.
+
+    Best-effort and single-threaded — one file per tick, the file
+    being the one the cursor currently sits in (per the flat/tree
+    rule encoded in ``_cursor_tail_path``). Bails fast on lock
+    contention, missing tail state, error-latched files, or files
+    whose size hasn't advanced. The expensive work — diffing
+    ``get_children`` against ``state._children`` — happens off the
+    main thread; only ``update_data`` is dispatched cross-thread.
+
+    Stopped via the module-level ``_TAIL_STOP`` event when ``main``
+    exits. Marked daemon as a backstop so the thread doesn't keep
+    the process alive on its own.
+    """
+    while not _TAIL_STOP.is_set():
+        try:
+            path = _resolve_tail_path_from_browser(b)
+            if path is not None:
+                dirty = _fold_new_lines(path)
+                if dirty:
+                    _push_tail_diffs(b, dirty)
+        except Exception:
+            # Best-effort: a malformed cursor row / get_children
+            # blowup must not kill the worker. Silently swallow; the
+            # next tick gets a clean shot.
+            pass
+        _TAIL_STOP.wait(timeout=5.0)
+
+
+def _resolve_tail_path_from_browser(b):
+    """Return the file the cursor's current row maps to, or None.
+
+    Reads ``state.cursor`` + ``visible_items(state)`` to find the
+    cursor row's id, then routes through ``_cursor_tail_path``. Falls
+    back to the scope_root id when the cursor sits on it (the framework
+    flags those entries as kind='scope_root'), so a freshly-launched
+    recipe that hasn't moved the cursor off the scope root still gets
+    tailed.
+    """
+    try:
+        state = b._state
+        # Lazy import — visible_items lives in the framework module
+        # and isn't reachable as an attribute of Browser. The
+        # browse_tui module surface doesn't export it either; pull
+        # it from the same scope the Action handlers use.
+        vis = getattr(b, '_visible_items_cache', None)
+        if vis is None:
+            # The renderer also caches a visible-tree snapshot; if it
+            # isn't ready, derive freshly via the same call the
+            # framework's main loop uses.
+            from browse_tui import visible_items as _vi
+            vis = _vi(state)
+        if not vis:
+            return None
+        idx = state.cursor
+        if not (0 <= idx < len(vis)):
+            return None
+        entry = vis[idx]
+        item_id = entry.item.id if entry.item is not None else None
+        return _cursor_tail_path(item_id)
+    except Exception:
+        return None
+
+
+def _cursor_tail_path(item_id):
+    """Resolve the .jsonl path the tailer should watch for ``item_id``.
+
+    Mode-dependent for the subagent group row:
+
+      * Tree mode: ``<sess>#agent:<aid>`` reflects activity in the
+        parent session's tree, so tail the parent.
+      * Flat mode: ``<sess>#agent:<aid>`` IS the subagent's listing
+        (drill-into row), so tail the subagent jsonl.
+
+    Other id shapes: take the path prefix. Returns ``None`` if the
+    resolved path isn't a readable ``.jsonl``.
+    """
+    if not isinstance(item_id, str):
+        return None
+    if '#agent:' in item_id:
+        sess, _, aid = item_id.partition('#agent:')
+        if _TREE_MODE:
+            if isinstance(sess, str) and sess.endswith('.jsonl') and os.path.isfile(sess):
+                return sess
+            return None
+        agent_path = os.path.join(_subagents_dir(sess),
+                                  f'agent-{aid}.jsonl')
+        return agent_path if os.path.isfile(agent_path) else None
+    path = item_id.partition('#')[0] if '#' in item_id else item_id
+    if (isinstance(path, str)
+            and path.endswith('.jsonl')
+            and os.path.isfile(path)):
+        return path
+    return None
 
 
 def _last_voice_id(jsonl_path):
@@ -3848,7 +4176,27 @@ def main():
             parent = os.path.dirname(target_jsonl) or '/'
             b.expand(parent).then(lambda: b.cursor_to(target_jsonl))
 
-    sys.exit(b.run())
+    # Live-tail worker: polls the cursor's file every 5s and folds
+    # newly-appended records into the cached _TreeData, then pushes
+    # update_data patches for any umbrella whose visible child list
+    # grew. Daemon thread so it doesn't keep the process alive on
+    # its own; _TAIL_STOP signals clean shutdown before sys.exit.
+    global _TAIL_STOP, _TAIL_THREAD
+    _TAIL_STOP = threading.Event()
+    _TAIL_THREAD = threading.Thread(
+        target=_tail_worker, args=(b,),
+        name='browse-claude-tail', daemon=True,
+    )
+    _TAIL_THREAD.start()
+
+    try:
+        rc = b.run()
+    finally:
+        _TAIL_STOP.set()
+        # Give the worker a brief moment to wake from its wait()
+        # before the process exits — keeps shutdown clean in tests.
+        _TAIL_THREAD.join(timeout=1.0)
+    sys.exit(rc)
 
 
 if __name__ == '__main__':

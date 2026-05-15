@@ -726,6 +726,42 @@ class TestBrowseClaude(unittest.TestCase):
                 t.wait_for('hello world', timeout=3.0)
                 t.send('q')
 
+    def test_live_tail_picks_up_appended_record(self):
+        """Append to the cursor's file mid-run; the new row appears.
+
+        Verifies the background tailer's path: bulk-scan on launch
+        populates _TAIL_STATE, then a write from outside is detected
+        on the next 5s tick and folded into the cached _TreeData
+        with update_data patches. We append a fresh turn root so the
+        new ``<prompt>`` umbrella shows up at the file's root level.
+        """
+        import tempfile, json as _json, time
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, '.claude', 'projects', '-home-test-tail')
+            os.makedirs(proj)
+            sess = os.path.join(proj, 'tail-sess.jsonl')
+            with open(sess, 'w') as f:
+                f.write(_json.dumps({
+                    'type': 'user', 'uuid': 'u1',
+                    'message': {'role': 'user',
+                                'content': 'PROBE_INITIAL'},
+                }) + '\n')
+            with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE,
+                         '--tree', '--file', sess)
+                t.wait_for('PROBE_INITIAL', timeout=3.0)
+                # Append a new turn while the recipe is running. The
+                # tailer polls every 5s, so we wait up to ~7s for it
+                # to fold the new record + the framework to redraw.
+                with open(sess, 'a') as f:
+                    f.write(_json.dumps({
+                        'type': 'user', 'uuid': 'u2',
+                        'message': {'role': 'user',
+                                    'content': 'PROBE_APPENDED'},
+                    }) + '\n')
+                t.wait_for('PROBE_APPENDED', timeout=7.5)
+                t.send('q')
+
     def test_drills_into_subagent(self):
         """Expanding a subagent reveals its own transcript lines.
 

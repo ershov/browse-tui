@@ -42,6 +42,13 @@ def _stub_browse_tui():
     mod.Action = _Stub
     mod.Browser = _Stub
     mod.Item = _Stub
+    # ``upsert`` is the push-API op constructor (#266); the recipe
+    # uses it from the live-tail worker. Tests don't exercise the
+    # framework's actual upsert behavior, so a stub returning a
+    # plain tuple is enough to keep imports happy.
+    mod.upsert = lambda id_, parent_id, **fields: (
+        'upsert', id_, parent_id, fields,
+    )
     sys.modules['browse_tui'] = mod
 
 
@@ -2252,6 +2259,276 @@ class TestUmbrellaShapes(unittest.TestCase):
             ])
         finally:
             os.unlink(path)
+
+
+class TestLiveTail(unittest.TestCase):
+    """``_fold_new_lines`` is the live-tail counterpart of ``_scan_tree``."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _write_jsonl(self, records):
+        import json as _json
+        import tempfile
+        f = tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False)
+        for r in records:
+            f.write(_json.dumps(r) + '\n')
+        f.close()
+        return f.name
+
+    def _append(self, path, records):
+        import json as _json
+        with open(path, 'a') as f:
+            for r in records:
+                f.write(_json.dumps(r) + '\n')
+
+    def setUp(self):
+        # Each test starts with empty caches so prior tests don't leak
+        # state across the module-level dicts.
+        self.r._TREE_CACHE.clear()
+        self.r._TAIL_STATE.clear()
+
+    def test_bulk_scan_populates_tail_state(self):
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'hi'}},
+        ])
+        try:
+            self.r._scan_tree(path)
+            tail = self.r._TAIL_STATE.get(path)
+            self.assertIsNotNone(tail)
+            self.assertGreater(tail.byte_offset, 0)
+            self.assertEqual(tail.last_size, tail.byte_offset)
+            self.assertFalse(tail.error)
+            self.assertIsNotNone(tail.cursor)
+        finally:
+            os.unlink(path)
+
+    def test_fold_new_lines_extends_existing_turn(self):
+        # Bulk-scan a file with one open turn, append an assistant reply,
+        # fold; the turn's direct children should grow.
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'go'}},
+        ])
+        try:
+            td = self.r._scan_tree(path)
+            self.assertEqual(len(td.turn_direct.get('u1', [])), 0)
+            self._append(path, [
+                {'type': 'assistant', 'uuid': 'a1',
+                 'message': {'role': 'assistant', 'content': [
+                     {'type': 'text', 'text': 'PROBE_REPLY'},
+                 ]}},
+            ])
+            dirty = self.r._fold_new_lines(path)
+            # New leaf belongs to the existing <prompt:0> umbrella.
+            self.assertIn(f'{path}#prompt:0', dirty)
+            self.assertEqual(len(td.turn_direct['u1']), 1)
+            self.assertEqual(td.turn_direct['u1'][0].get('uuid'), 'a1')
+            tail = self.r._TAIL_STATE[path]
+            self.assertGreater(tail.byte_offset, 0)
+            self.assertFalse(tail.error)
+        finally:
+            os.unlink(path)
+
+    def test_fold_new_lines_opens_new_turn(self):
+        # Append a fresh user voice → new <prompt> umbrella appears
+        # at the file's root level (dirty set contains the path).
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'first'}},
+            {'type': 'assistant', 'uuid': 'a1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'text', 'text': 'r'},
+             ]}},
+        ])
+        try:
+            td = self.r._scan_tree(path)
+            self.assertEqual(
+                sum(1 for e in td.roots_in_order if e['kind'] == 'turn'),
+                1,
+            )
+            self._append(path, [
+                {'type': 'user', 'uuid': 'u2',
+                 'message': {'role': 'user', 'content': 'second'}},
+            ])
+            dirty = self.r._fold_new_lines(path)
+            self.assertIn(path, dirty)
+            self.assertEqual(
+                sum(1 for e in td.roots_in_order if e['kind'] == 'turn'),
+                2,
+            )
+        finally:
+            os.unlink(path)
+
+    def test_fold_new_lines_incomplete_trailing_line_holds_offset(self):
+        # Append a partial line (no trailing newline). The tail must NOT
+        # parse it; offset stays at the line's start so the next call
+        # picks it up once the rest arrives.
+        import json as _json
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'hi'}},
+        ])
+        try:
+            self.r._scan_tree(path)
+            offset_before = self.r._TAIL_STATE[path].byte_offset
+            # Construct a valid jsonl line and split it at an arbitrary
+            # boundary mid-payload.
+            full_line = _json.dumps({
+                'type': 'assistant', 'uuid': 'a1',
+                'message': {'role': 'assistant', 'content': [
+                    {'type': 'text', 'text': 'ok'},
+                ]},
+            })
+            split = len(full_line) // 2
+            with open(path, 'a') as f:
+                f.write(full_line[:split])   # no trailing \n yet
+            dirty = self.r._fold_new_lines(path)
+            self.assertFalse(dirty)
+            tail = self.r._TAIL_STATE[path]
+            self.assertEqual(tail.byte_offset, offset_before)
+            self.assertFalse(tail.error)
+            # Now complete the line with the remainder + trailing \n.
+            with open(path, 'a') as f:
+                f.write(full_line[split:] + '\n')
+            dirty = self.r._fold_new_lines(path)
+            self.assertIn(f'{path}#prompt:0', dirty)
+            tail = self.r._TAIL_STATE[path]
+            self.assertGreater(tail.byte_offset, offset_before)
+            self.assertFalse(tail.error)
+        finally:
+            os.unlink(path)
+
+    def test_fold_new_lines_malformed_json_latches_error(self):
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'hi'}},
+        ])
+        try:
+            self.r._scan_tree(path)
+            with open(path, 'a') as f:
+                f.write('not valid json\n')
+            self.r._fold_new_lines(path)
+            tail = self.r._TAIL_STATE[path]
+            self.assertTrue(tail.error)
+            # Further calls bail without resuming.
+            with open(path, 'a') as f:
+                f.write('{"type": "user", "uuid": "u2", '
+                        '"message": {"role": "user", '
+                        '"content": "second"}}\n')
+            dirty = self.r._fold_new_lines(path)
+            self.assertFalse(dirty)
+            self.assertTrue(tail.error)
+        finally:
+            os.unlink(path)
+
+    def test_fold_new_lines_truncation_latches_error(self):
+        # File shrinks (e.g. external truncation / rotation) → offset
+        # is stale → error flag latches; no patches issued.
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'one'}},
+            {'type': 'user', 'uuid': 'u2',
+             'message': {'role': 'user', 'content': 'two'}},
+        ])
+        try:
+            self.r._scan_tree(path)
+            with open(path, 'w') as f:   # truncate
+                f.write('')
+            dirty = self.r._fold_new_lines(path)
+            self.assertFalse(dirty)
+            self.assertTrue(self.r._TAIL_STATE[path].error)
+        finally:
+            os.unlink(path)
+
+    def test_fold_new_lines_no_change_returns_empty(self):
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'hi'}},
+        ])
+        try:
+            self.r._scan_tree(path)
+            self.assertEqual(self.r._fold_new_lines(path), set())
+        finally:
+            os.unlink(path)
+
+    def test_fold_new_lines_no_state_returns_empty(self):
+        # Tail without a prior bulk scan: nothing to do.
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'hi'}},
+        ])
+        try:
+            self.assertNotIn(path, self.r._TAIL_STATE)
+            self.assertEqual(self.r._fold_new_lines(path), set())
+        finally:
+            os.unlink(path)
+
+    def test_get_children_none_clears_caches(self):
+        # Indirect Ctrl-R signal: dropping the recipe-internal caches
+        # forces _scan_tree to rebuild on the next per-file get_children.
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'hi'}},
+        ])
+        try:
+            self.r._scan_tree(path)
+            self.assertIn(path, self.r._TREE_CACHE)
+            self.assertIn(path, self.r._TAIL_STATE)
+            self.r.get_children(None)
+            self.assertNotIn(path, self.r._TREE_CACHE)
+            self.assertNotIn(path, self.r._TAIL_STATE)
+        finally:
+            os.unlink(path)
+
+    def test_cursor_tail_path_extraction(self):
+        # Plain file path: returned as-is when it exists.
+        path = self._write_jsonl([{'type': 'user'}])
+        try:
+            self.assertEqual(self.r._cursor_tail_path(path), path)
+            # Message id (`<path>#N`).
+            self.assertEqual(self.r._cursor_tail_path(f'{path}#0'), path)
+            # Umbrella ids strip to the path.
+            self.assertEqual(self.r._cursor_tail_path(f'{path}#prompt:0'),
+                             path)
+            self.assertEqual(self.r._cursor_tail_path(f'{path}#tool:1'),
+                             path)
+            self.assertEqual(self.r._cursor_tail_path(f'{path}#span:2'),
+                             path)
+            # Non-jsonl path: None.
+            self.assertIsNone(self.r._cursor_tail_path('/etc/passwd'))
+            self.assertIsNone(self.r._cursor_tail_path(None))
+        finally:
+            os.unlink(path)
+
+    def test_cursor_tail_path_subagent_row_tree_vs_flat(self):
+        # Subagent group row: tree mode → parent jsonl; flat mode →
+        # subagent jsonl.
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix='tail-sa-')
+        try:
+            sess = os.path.join(tmp, 'parent.jsonl')
+            with open(sess, 'w') as f:
+                f.write('{}\n')
+            sub_dir = os.path.join(tmp, 'parent', 'subagents')
+            os.makedirs(sub_dir)
+            agent = os.path.join(sub_dir, 'agent-AGENT01.jsonl')
+            with open(agent, 'w') as f:
+                f.write('{}\n')
+            row_id = f'{sess}#agent:AGENT01'
+            saved = self.r._TREE_MODE
+            try:
+                self.r._TREE_MODE = True
+                self.assertEqual(self.r._cursor_tail_path(row_id), sess)
+                self.r._TREE_MODE = False
+                self.assertEqual(self.r._cursor_tail_path(row_id), agent)
+            finally:
+                self.r._TREE_MODE = saved
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 class TestSubagentRowTag(unittest.TestCase):
