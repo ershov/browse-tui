@@ -2840,40 +2840,85 @@ def _tail_worker(b):
         try:
             path = _resolve_tail_path_from_browser(b)
             if path is not None:
-                dirty = _fold_new_lines(path)
-                if dirty:
-                    _push_tail_diffs(b, dirty)
+                _maybe_bootstrap_tail_state(path)
+                if _TREE_MODE:
+                    # Tree mode: incremental fold + targeted
+                    # update_data patches for grown umbrellas.
+                    dirty = _fold_new_lines(path)
+                    if dirty:
+                        _push_tail_diffs(b, dirty)
+                else:
+                    # Flat mode: the listing is newest-first and
+                    # ``update_data`` upsert appends to the end of
+                    # the children list, which would put new rows in
+                    # the wrong place. Use ``Browser.refresh(path)``
+                    # to force a re-fetch via the recipe's
+                    # ``get_children`` — the file-read cost is the
+                    # tradeoff for keeping the simple flat reader.
+                    _maybe_refresh_flat_on_change(b, path)
         except Exception:
             # Best-effort: a malformed cursor row / get_children
-            # blowup must not kill the worker. Silently swallow; the
-            # next tick gets a clean shot.
+            # blowup must not kill the worker. Swallow silently;
+            # the next tick gets a clean shot.
             pass
         _TAIL_STOP.wait(timeout=5.0)
+
+
+def _maybe_bootstrap_tail_state(path):
+    """Populate ``_TAIL_STATE[path]`` if missing.
+
+    Tree mode bootstraps via ``_scan_tree`` (already wired). Flat
+    mode never calls ``_scan_tree`` so the entry would otherwise
+    never appear — we lazy-init here. ``last_size=0`` is deliberate:
+    the framework may have a cached children list from before the
+    worker started observing this file (e.g. the file grew after
+    the initial get_children call but before the worker's first
+    tick on it). Forcing the first post-bootstrap tick to see
+    ``size > 0`` triggers a refresh that syncs the cache.
+    """
+    if path in _TAIL_STATE:
+        return
+    _TAIL_STATE[path] = _TailState(
+        byte_offset=0, last_size=0,
+        cursor=_ScanCursor(), error=False,
+    )
+
+
+def _maybe_refresh_flat_on_change(b, path):
+    """Flat-mode tail step: if file size grew, trigger a parent refresh.
+
+    Updates ``_TAIL_STATE[path].last_size`` so we only refresh once
+    per growth event. Errors latch the flag, same shape as tree mode.
+    """
+    tail = _TAIL_STATE.get(path)
+    if tail is None or tail.error:
+        return
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return
+    if size < tail.last_size:
+        tail.error = True
+        return
+    if size == tail.last_size:
+        return
+    tail.last_size = size
+    tail.byte_offset = size
+    b.refresh(path)
 
 
 def _resolve_tail_path_from_browser(b):
     """Return the file the cursor's current row maps to, or None.
 
     Reads ``state.cursor`` + ``visible_items(state)`` to find the
-    cursor row's id, then routes through ``_cursor_tail_path``. Falls
-    back to the scope_root id when the cursor sits on it (the framework
-    flags those entries as kind='scope_root'), so a freshly-launched
-    recipe that hasn't moved the cursor off the scope root still gets
-    tailed.
+    cursor row's id, then routes through ``_cursor_tail_path``. The
+    scope_root row's id participates too, so a freshly-launched
+    recipe that hasn't moved the cursor still resolves a tail path.
     """
     try:
         state = b._state
-        # Lazy import — visible_items lives in the framework module
-        # and isn't reachable as an attribute of Browser. The
-        # browse_tui module surface doesn't export it either; pull
-        # it from the same scope the Action handlers use.
-        vis = getattr(b, '_visible_items_cache', None)
-        if vis is None:
-            # The renderer also caches a visible-tree snapshot; if it
-            # isn't ready, derive freshly via the same call the
-            # framework's main loop uses.
-            from browse_tui import visible_items as _vi
-            vis = _vi(state)
+        from browse_tui import visible_items as _vi
+        vis = _vi(state)
         if not vis:
             return None
         idx = state.cursor

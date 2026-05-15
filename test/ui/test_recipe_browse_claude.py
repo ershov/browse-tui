@@ -762,6 +762,39 @@ class TestBrowseClaude(unittest.TestCase):
                 t.wait_for('PROBE_APPENDED', timeout=7.5)
                 t.send('q')
 
+    def test_live_tail_flat_mode_picks_up_appended_record(self):
+        """Same as the tree-mode test, but in flat mode (newest-first list).
+
+        Flat mode never calls ``_scan_tree`` so tail state bootstraps
+        lazily inside the worker; the listing rebuilds via
+        ``b.refresh(path)`` rather than incremental ``update_data``
+        upserts (which would put new rows in the wrong place since
+        the list is newest-first).
+        """
+        import tempfile, json as _json
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, '.claude', 'projects', '-home-test-tailf')
+            os.makedirs(proj)
+            sess = os.path.join(proj, 'tail-sess.jsonl')
+            with open(sess, 'w') as f:
+                f.write(_json.dumps({
+                    'type': 'user', 'uuid': 'u1',
+                    'message': {'role': 'user',
+                                'content': 'PROBE_INITIAL_FLAT'},
+                }) + '\n')
+            with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE,
+                         '--no-tree', '--file', sess)
+                t.wait_for('PROBE_INITIAL_FLAT', timeout=3.0)
+                with open(sess, 'a') as f:
+                    f.write(_json.dumps({
+                        'type': 'user', 'uuid': 'u2',
+                        'message': {'role': 'user',
+                                    'content': 'PROBE_APPENDED_FLAT'},
+                    }) + '\n')
+                t.wait_for('PROBE_APPENDED_FLAT', timeout=7.5)
+                t.send('q')
+
     def test_drills_into_subagent(self):
         """Expanding a subagent reveals its own transcript lines.
 
