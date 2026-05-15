@@ -3556,7 +3556,7 @@ def _chain_expand_then_cursor(b, ancestor_ids, target_id):
         if i >= len(ancestor_ids):
             b.cursor_to(target_id)
             return
-        b.expand(ancestor_ids[i]).then(lambda: _step(i + 1))
+        b.expand(ancestor_ids[i], autoscroll=True).then(lambda: _step(i + 1))
     _step(0)
 
 
@@ -3579,7 +3579,7 @@ def _action_tree_right(ctx):
     # ``_nav_right`` — expand collapsed, step-into for already-expanded.
     if not _TREE_MODE or not expandable:
         if expandable and cur.id not in state.expanded:
-            ctx.expand(cur.id)
+            ctx.expand(cur.id, autoscroll=True)
             return
         # Step into first child if cursor's next visible row is deeper.
         try:
@@ -3608,12 +3608,16 @@ def _action_tree_right(ctx):
 
     # Collapsed expandable row: expand, then cursor to the latest voice
     # among the newly-visible direct children. Single level — drilling
-    # further is user-driven.
+    # further is user-driven. ``autoscroll=True`` parks the framework's
+    # scroll-to-fit goal so the parent row stays visible while the
+    # subtree slides into view; the subsequent ``cursor_to`` then moves
+    # the cursor to the latest voice without scrolling the parent off
+    # the top.
     def _land():
         latest = _latest_voice_among_children(target_id)
         if latest is not None and latest != target_id:
             ctx.cursor_to(latest)
-    ctx.expand(target_id).then(_land)
+    ctx.expand(target_id, autoscroll=True).then(_land)
 
 
 def _action_toggle_tree(ctx):
