@@ -3274,9 +3274,9 @@ def _split_cmd(s):
 def _resolve_md_pager():
     """Return the resolved markdown-pager command, or None.
 
-    Order: ``$MD2ANSI`` (shell-split), then ``md`` on PATH, then
-    ``md2ansi`` on PATH. Recipes that want a different fallback can
-    set ``$MD2ANSI`` to anything — including a piped chain like
+    Order: ``$MD2ANSI`` (shell-split), then ``md2ansi | less -RS`` if
+    both binaries are on PATH. Recipes that want a different fallback
+    can set ``$MD2ANSI`` to anything — including a piped chain like
     ``md2ansi | less -R``, which we shell out via ``bash -c`` so the
     pipe works.
     """
@@ -3288,8 +3288,8 @@ def _resolve_md_pager():
             # User-supplied pipeline — hand to a shell so the pipe runs.
             return ['bash', '-c', f'{env_cmd} "$0"']
         return shlex.split(env_cmd)
-    if shutil.which('md'):
-        return ['md']
+    if shutil.which('md2ansi') and shutil.which('less'):
+        return ['bash', '-c', 'md2ansi "$0" | less -RS']
     if shutil.which('md2ansi'):
         return ['md2ansi']
     return None
@@ -3308,7 +3308,7 @@ def _action_md_preview(ctx):
     import tempfile
     cmd = _resolve_md_pager()
     if cmd is None:
-        ctx.message('no markdown renderer found ($MD2ANSI / md / md2ansi)')
+        ctx.message('no markdown renderer found ($MD2ANSI / md2ansi)')
         return
 
     item = ctx.cursor
@@ -3682,7 +3682,7 @@ a transcript with Right/Alt-Down; preview shows the rendered turn.
 
   v / V   page the preview (v) / the source .jsonl (V) via $PAGER.
   e / E   open the preview (e) / the source .jsonl (E) in $EDITOR.
-  m       render the preview as markdown via $MD2ANSI / md / md2ansi.
+  m       render the preview as markdown via $MD2ANSI / md2ansi.
   J / K   jump cursor to next / previous user-or-assistant voice.
   t       toggle flat / tree view.\
 """
@@ -3794,7 +3794,7 @@ def main():
             # V / E open the underlying source file instead.
             Action('V',     'View source file in $PAGER',      _action_view_source, 'cursor'),
             Action('E',     'Edit source file in $EDITOR',     _action_edit_source, 'cursor'),
-            Action('m',     'View preview via $MD2ANSI / md',  _action_md_preview,  'cursor'),
+            Action('m',     'View preview via $MD2ANSI / md2ansi', _action_md_preview, 'cursor'),
             Action('y',     'Show full id (paste-friendly)',   _action_show_id,     'cursor'),
             # 'none' gate so J/K fire even when the cursor sits on a
             # scope_root row (where ctx.cursor returns None). The

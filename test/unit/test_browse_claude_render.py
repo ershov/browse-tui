@@ -1404,7 +1404,7 @@ class TestAncestorIdsForSubagent(unittest.TestCase):
 
 
 class TestMdPagerResolution(unittest.TestCase):
-    """``_resolve_md_pager`` walks $MD2ANSI / md / md2ansi in order."""
+    """``_resolve_md_pager`` walks $MD2ANSI / md2ansi+less in order."""
 
     @classmethod
     def setUpClass(cls):
@@ -1426,6 +1426,15 @@ class TestMdPagerResolution(unittest.TestCase):
                     os.environ[k] = v
         return restore
 
+    def _scratch_bin(self, tmp, names):
+        """Create executable stubs in ``tmp`` for each name in ``names``."""
+        import stat
+        for name in names:
+            path = os.path.join(tmp, name)
+            with open(path, 'w') as f:
+                f.write('#!/bin/sh\ncat "$1"\n')
+            os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
+
     def test_env_var_wins(self):
         restore = self._with_env(MD2ANSI='my-md-cmd --flag')
         try:
@@ -1444,21 +1453,35 @@ class TestMdPagerResolution(unittest.TestCase):
         finally:
             restore()
 
-    def test_falls_through_to_path(self):
-        import shutil
-        # Build a temp dir with a sentinel ``md`` script, prepend to PATH.
-        import tempfile, stat
+    def test_md2ansi_plus_less_pipes_to_less_rs(self):
+        # Default fallback when both md2ansi and less exist: pipe
+        # md2ansi output through ``less -RS`` via bash.
+        import tempfile
         with tempfile.TemporaryDirectory() as tmp:
-            sentinel = os.path.join(tmp, 'md')
-            with open(sentinel, 'w') as f:
-                f.write('#!/bin/sh\ncat "$1"\n')
-            os.chmod(sentinel, os.stat(sentinel).st_mode | stat.S_IXUSR)
+            self._scratch_bin(tmp, ['md2ansi', 'less'])
             saved_path = os.environ['PATH']
             restore = self._with_env(MD2ANSI=None)
             try:
                 os.environ['PATH'] = tmp
-                # Force which() to re-resolve by passing the modified PATH.
-                self.assertEqual(self.r._resolve_md_pager(), ['md'])
+                cmd = self.r._resolve_md_pager()
+                self.assertEqual(cmd[0], 'bash')
+                self.assertEqual(cmd[1], '-c')
+                self.assertIn('md2ansi', cmd[2])
+                self.assertIn('less -RS', cmd[2])
+            finally:
+                os.environ['PATH'] = saved_path
+                restore()
+
+    def test_md2ansi_alone_no_pipe(self):
+        # Without ``less`` on PATH, fall back to bare ``md2ansi``.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self._scratch_bin(tmp, ['md2ansi'])
+            saved_path = os.environ['PATH']
+            restore = self._with_env(MD2ANSI=None)
+            try:
+                os.environ['PATH'] = tmp
+                self.assertEqual(self.r._resolve_md_pager(), ['md2ansi'])
             finally:
                 os.environ['PATH'] = saved_path
                 restore()
@@ -1472,6 +1495,21 @@ class TestMdPagerResolution(unittest.TestCase):
         finally:
             os.environ['PATH'] = saved_path
             restore()
+
+    def test_md_alone_no_longer_resolves(self):
+        # Even with ``md`` on PATH, the resolver should NOT pick it —
+        # we dropped that tool from the search order.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self._scratch_bin(tmp, ['md'])
+            saved_path = os.environ['PATH']
+            restore = self._with_env(MD2ANSI=None)
+            try:
+                os.environ['PATH'] = tmp
+                self.assertIsNone(self.r._resolve_md_pager())
+            finally:
+                os.environ['PATH'] = saved_path
+                restore()
 
 
 class TestScanTree(unittest.TestCase):
