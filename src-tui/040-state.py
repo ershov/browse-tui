@@ -2984,9 +2984,13 @@ class Browser:
         """Request a preview fetch for the current cursor item.
 
         No-op when previews are disabled or when the cursor is on a
-        non-normal entry (placeholder / scope-root). Called by the main
-        loop at the top of every iteration (post-#124) so cursor moves
-        and worker deliveries both trigger latest-wins preview fetches.
+        ``pending`` placeholder (no real id to ask about). The scope
+        root row IS previewable — recipes commonly attach rich content
+        to the scope id (browse-claude session card, browse-plan ticket
+        body, …) and the user's first-glance row when launching with
+        an initial scope is the scope_root. Called by the main loop at
+        the top of every iteration (post-#124) so cursor moves and
+        worker deliveries both trigger latest-wins preview fetches.
 
         When the cursor lands on a different item (or off any normal
         item) since the last call, the preview pane is reset: scroll
@@ -3007,7 +3011,7 @@ class Browser:
         new_id = None
         if 0 <= state.cursor < len(vis):
             entry = vis[state.cursor]
-            if entry.kind == 'normal':
+            if entry.kind in ('normal', 'scope_root'):
                 new_id = entry.item.id
 
         if new_id == self._preview_cursor_id:

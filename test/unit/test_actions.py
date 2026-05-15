@@ -692,6 +692,23 @@ class TestPreviewResetOnCursorMove(unittest.TestCase):
         finally:
             b.stop_workers()
 
+    def test_scope_root_cursor_triggers_preview_fetch(self):
+        """Cursor on the scope_root row requests a preview for its id.
+
+        Recipes that scope into a rich item (browse-claude scoping into
+        a .jsonl or a #prompt: umbrella, browse-plan scoping into a
+        ticket) want the scope_root's preview visible from the moment
+        the user launches — the top row is the first thing the eye
+        lands on.
+        """
+        b = _make_browser(initial_scope='SCOPE_ID')
+        try:
+            b._update_preview_for_cursor()
+            self.assertEqual(b._preview_cursor_id, 'SCOPE_ID')
+            self.assertEqual(b._preview_req, 'SCOPE_ID')
+        finally:
+            b.stop_workers()
+
 
 # --- ticket #75: page sizes track terminal height -------------------------
 

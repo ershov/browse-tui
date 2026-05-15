@@ -698,6 +698,27 @@ class TestBrowseClaude(unittest.TestCase):
                               'expected user-row bg escape in colored capture')
                 t.send('q')
 
+    def test_positional_jsonl_shows_preview_for_top_row(self):
+        """Passing a .jsonl positional puts its session preview on top.
+
+        The top row is the scope_root row; previously the framework
+        skipped preview fetches for scope_root, leaving the pane blank
+        when the user launched into a single file. Regression for that.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_fake_claude(tmp)
+            sess = os.path.join(
+                tmp, '.claude', 'projects', '-home-test-project',
+                'abcd1234-deadbeef.jsonl',
+            )
+            with TmuxFixture(cols=140, rows=30, env=self._launch_env(tmp)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE, sess)
+                # Session card preview should land on first paint.
+                t.wait_for('session:', timeout=3.0)
+                # And the user prompt from the fake fixture too.
+                t.wait_for('hello world', timeout=3.0)
+                t.send('q')
+
     def test_drills_into_subagent(self):
         """Expanding a subagent reveals its own transcript lines.
 
