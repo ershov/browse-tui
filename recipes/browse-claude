@@ -3570,81 +3570,67 @@ def _preview_message(path, n):
 
 
 def _preview_umbrella(item_id):
-    """Concatenated bodies of an umbrella row's direct children.
+    """Recursive same-file body dump of an umbrella row's leaves.
 
-    Single level — no recursion into grandchildren. Each child body is
-    preceded by a **bright yellow** ``── kind ──`` rule so the
-    boundaries are visible (other rules elsewhere in the preview —
-    chrome footer, thinking separator, usage block — stay muted).
-    Subagent pseudo-rows render as a compact header (type + description)
-    rather than the full subagent transcript.
+    Walks the umbrella's descendants in document order, rendering
+    each leaf's body with a bright-yellow ``── kind ──`` rule. Nested
+    umbrellas in the same file are followed transparently (so a
+    ``<prompt>`` preview includes every line of every ``<tool>``
+    block it contains, plus any ``<system>`` span members folded
+    into the turn).
 
-    Handles ``<prompt>``, ``<tool>``, and ``<system>`` (span) ids
-    uniformly by dispatching through ``get_children`` and rendering
-    each returned ``Item``'s underlying record.
+    Subagent-group rows render as a compact stub (type + description)
+    — we never drill into the subagent's own jsonl from a parent's
+    preview. The user can scope into the subagent group separately
+    if they want its content.
+
+    Per-leaf renderer errors are caught and surfaced as a red error
+    stub so one bad row doesn't blank the entire preview.
     """
-    children = get_children(item_id)
-    if not children:
-        return ''
     parts = []
-    for child in children:
-        try:
-            rendered = _render_child_preview_body(child)
-        except Exception as e:
-            # One bad child shouldn't blank out the whole umbrella —
-            # surface a per-child error stub and keep going. Catching
-            # broadly is intentional: the preview pane is read-only
-            # observation, the cost of a hidden bug here is a missing
-            # row, not silent data corruption.
-            rendered = (_rule(f'error rendering child {child.id}', RED)
-                        + f'\n{type(e).__name__}: {e}')
-        if rendered is not None:
-            parts.append(rendered)
+    _collect_umbrella_preview(item_id, parts)
     return '\n\n'.join(parts)
 
 
-def _render_child_preview_body(child):
-    """Render one umbrella-child Item's preview body with a leading rule.
-
-    Returns None if the child can't be rendered (orphan id, missing
-    file, etc.). The leading rule is bright yellow so it stands out
-    from any rules inside individual record bodies.
-    """
-    cid = child.id
-    if not isinstance(cid, str):
-        return None
-    # Subagent group: compact header, not the full transcript.
-    if '#agent:' in cid:
-        agent_type = getattr(child, 'agent_type', None) or 'agent'
-        agent_desc = (getattr(child, 'agent_description', None)
-                      or f'agent {getattr(child, "agent_id", "")}')
-        return (_rule(f'subagent: {agent_type}', YELLOW)
-                + '\n' + agent_desc)
-    # Nested umbrellas inside an umbrella (e.g. a <tool> child of a
-    # <prompt>): render the underlying record body so the preview
-    # reads as a flat dump of every tool-use line + reply.
-    if '#prompt:' in cid:
-        path, _, suffix = cid.partition('#prompt:')
-        n = _parse_int(suffix)
-        if n is None:
-            return None
-        return _render_record_with_rule(path, n)
-    if '#tool:' in cid:
-        path, _, suffix = cid.partition('#tool:')
-        n = _parse_int(suffix)
-        if n is None:
-            return None
-        return _render_record_with_rule(path, n)
-    if '#span:' in cid:
-        # Span-inside-umbrella is rare; fall through to a tiny stub.
-        return _rule('system', YELLOW) + '\n' + child.title
-    if '#' not in cid:
-        return None
-    cpath, _, lineno = cid.rpartition('#')
-    n = _parse_int(lineno)
-    if n is None:
-        return None
-    return _render_record_with_rule(cpath, n)
+def _collect_umbrella_preview(item_id, parts):
+    """Append rendered bodies for ``item_id``'s descendants to ``parts``."""
+    try:
+        children = get_children(item_id)
+    except Exception as e:
+        parts.append(_rule(f'error listing {item_id}', RED)
+                     + f'\n{type(e).__name__}: {e}')
+        return
+    for child in children:
+        cid = getattr(child, 'id', None)
+        if not isinstance(cid, str):
+            continue
+        try:
+            if '#agent:' in cid:
+                # Subagent boundary — compact stub, don't drill in.
+                agent_type = getattr(child, 'agent_type', None) or 'agent'
+                agent_desc = (getattr(child, 'agent_description', None)
+                              or f'agent {getattr(child, "agent_id", "")}')
+                parts.append(_rule(f'subagent: {agent_type}', YELLOW)
+                             + '\n' + agent_desc)
+                continue
+            if '#prompt:' in cid or '#tool:' in cid or '#span:' in cid:
+                # Same-file umbrella — recurse so the user sees every
+                # underlying line, not just the umbrella's first
+                # leaf.
+                _collect_umbrella_preview(cid, parts)
+                continue
+            if '#' not in cid:
+                continue
+            cpath, _, lineno = cid.rpartition('#')
+            n = _parse_int(lineno)
+            if n is None:
+                continue
+            rendered = _render_record_with_rule(cpath, n)
+            if rendered is not None:
+                parts.append(rendered)
+        except Exception as e:
+            parts.append(_rule(f'error rendering child {cid}', RED)
+                         + f'\n{type(e).__name__}: {e}')
 
 
 def _render_record_with_rule(path, n):
@@ -3720,18 +3706,17 @@ def _gather_line_source(items):
     Each input item is classified by id shape:
 
       * ``<path>#<n>`` (message leaf) → ``(path, n)`` recorded.
-      * Umbrella ids (``#prompt:`` / ``#tool:`` / ``#span:``) →
-        treated as "whole path" — caller falls back to opening the
-        full file.
-      * ``<sess>#agent:<aid>`` → likewise; the subagent jsonl is the
-        target for "whole file".
+      * Umbrella ids (``#prompt:`` / ``#tool:`` / ``#span:``) → recurse
+        through the umbrella's same-file descendants and record each
+        leaf's line. ``#agent:`` boundaries are NOT crossed —
+        subagents live in their own ``.jsonl`` files.
+      * ``<sess>#agent:<aid>`` (subagent group row) → the subagent's
+        own ``.jsonl`` is the "whole file" to open.
       * Bare ``.jsonl`` / project path → "whole path".
 
     Returns ``(per_line, whole_paths)`` where ``per_line`` is the
-    grouping dict and ``whole_paths`` is a list of ``(path, item)``
-    tuples for non-message targets. ``per_line`` lines are kept in
-    insertion order; the caller chooses how to assemble the temp
-    file.
+    grouping dict (lines kept in document order) and ``whole_paths``
+    is a list of ``(path, item)`` tuples for non-line targets.
     """
     per_line = {}
     whole_paths = []
@@ -3747,7 +3732,16 @@ def _gather_line_source(items):
             whole_paths.append((agent_path, item))
             continue
         if '#prompt:' in iid or '#tool:' in iid or '#span:' in iid:
-            whole_paths.append((iid.partition('#')[0], item))
+            # Recurse through the umbrella's same-file leaves.
+            path = iid.partition('#')[0]
+            same_file_lines = _gather_umbrella_lines(iid)
+            if same_file_lines:
+                per_line.setdefault(path, []).extend(same_file_lines)
+            else:
+                # Defensive: empty umbrella → fall back to opening
+                # the file as a whole rather than silently doing
+                # nothing.
+                whole_paths.append((path, item))
             continue
         if '#' in iid:
             path, _, suffix = iid.rpartition('#')
@@ -3761,7 +3755,54 @@ def _gather_line_source(items):
             per_line.setdefault(path, []).append(n)
             continue
         whole_paths.append((iid, item))
+    # Pre-select pass: dedupe + sort each file's lines into
+    # canonical (file) order. Multi-target invocations (umbrella +
+    # one of its children, or two umbrellas with overlapping
+    # contents) collapse to one entry per leaf in document order —
+    # no surprises when ``_write_line_excerpts`` walks the list.
+    for path in per_line:
+        per_line[path] = sorted(set(per_line[path]))
     return per_line, whole_paths
+
+
+def _gather_umbrella_lines(item_id):
+    """Return [line_no, ...] for every leaf message under ``item_id``.
+
+    Walks the umbrella's children recursively in document order via
+    ``get_children`` (the same listing helper that builds the
+    displayed tree). Nested umbrellas in the SAME file are followed
+    transparently; ``#agent:`` boundaries are NOT crossed — the
+    subagent's records live in a different ``.jsonl`` and the user
+    can drill into that group row separately if they want them.
+    """
+    out = []
+    _walk_umbrella_lines(item_id, out)
+    return out
+
+
+def _walk_umbrella_lines(item_id, out):
+    """Append leaf line numbers under ``item_id`` to ``out`` in order."""
+    try:
+        children = get_children(item_id)
+    except Exception:
+        return
+    for child in children:
+        cid = getattr(child, 'id', None)
+        if not isinstance(cid, str):
+            continue
+        if '#agent:' in cid:
+            # Subagent boundary — content is in a different file.
+            continue
+        if '#prompt:' in cid or '#tool:' in cid or '#span:' in cid:
+            _walk_umbrella_lines(cid, out)
+            continue
+        if '#' in cid:
+            _, _, suffix = cid.rpartition('#')
+            try:
+                n = int(suffix)
+            except ValueError:
+                continue
+            out.append(n)
 
 
 def _write_line_excerpts(per_line):
@@ -3778,6 +3819,8 @@ def _write_line_excerpts(per_line):
         'wb', suffix='.jsonl', delete=False,
     )
     try:
+        # ``per_line`` is already pre-selected (deduped + sorted) by
+        # ``_gather_line_source`` — iterate as-is.
         for path, line_nos in per_line.items():
             cached = _TREE_CACHE.get(path)
             if cached is None:
@@ -3788,7 +3831,7 @@ def _write_line_excerpts(per_line):
             except OSError:
                 continue
             with f:
-                for n in sorted(set(line_nos)):
+                for n in line_nos:
                     if not (0 <= n < len(offsets) - 1):
                         continue
                     start = offsets[n]

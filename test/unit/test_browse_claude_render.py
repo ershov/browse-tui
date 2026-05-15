@@ -1163,12 +1163,12 @@ class TestTreeChildrenPreview(unittest.TestCase):
         finally:
             os.unlink(path)
 
-    def test_prompt_umbrella_preview_is_single_level_no_recursion(self):
+    def test_prompt_umbrella_preview_recurses_same_file(self):
         # Turn root → assistant tool_use → user tool_result.
-        # The ``<prompt>`` umbrella's preview should show the user
-        # prompt + the ``<tool>``-umbrella child's own body (i.e. the
-        # assistant tool_use line), but NOT the deeper tool_result
-        # (which lives inside the ``<tool>`` umbrella).
+        # The ``<prompt>`` umbrella's preview now recursively dumps
+        # every leaf body within the same file, so the deeper
+        # tool_result body is included alongside the user prompt and
+        # the assistant tool_use line.
         path = self._write_jsonl([
             {'type': 'user', 'uuid': 'u1',
              'message': {'role': 'user', 'content': 'PROBE_PROMPT'}},
@@ -1190,7 +1190,9 @@ class TestTreeChildrenPreview(unittest.TestCase):
                 out = self.r._preview_umbrella(f'{path}#prompt:0')
                 self.assertIn('PROBE_PROMPT', out)
                 self.assertIn('PROBE_BASH_CMD', out)
-                self.assertNotIn('PROBE_BASH_OUTPUT', out)  # grandchild
+                # Grandchild (inside the nested <tool> umbrella) is
+                # now included — same file, recurse through.
+                self.assertIn('PROBE_BASH_OUTPUT', out)
             finally:
                 self.r._TREE_MODE = saved
         finally:
@@ -2852,6 +2854,166 @@ class TestViewEditSource(unittest.TestCase):
         path = '/tmp/nonexistent.jsonl'
         tmp = self.r._write_line_excerpts({path: [0]})
         self.assertIsNone(tmp)
+
+    def test_gather_umbrella_lines_recurses_same_file(self):
+        # ``<prompt:0>`` contains ``<tool:1>`` which contains a
+        # tool_result on line 2. Gathering lines for the prompt
+        # umbrella should pull all three same-file leaves.
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'go'}},
+            {'type': 'assistant', 'uuid': 'a1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 't1', 'name': 'Bash',
+                  'input': {'command': 'ls'}},
+             ]}},
+            {'type': 'user', 'uuid': 'u2',
+             'message': {'role': 'user', 'content': [
+                 {'type': 'tool_result', 'tool_use_id': 't1',
+                  'content': 'ok'},
+             ]}},
+        ])
+        try:
+            saved = self.r._TREE_MODE
+            self.r._TREE_MODE = True
+            try:
+                self.r._scan_tree(path)
+                # Prompt umbrella → user msg (0), assistant tool_use
+                # (1), tool_result (2) in document order.
+                self.assertEqual(
+                    self.r._gather_umbrella_lines(f'{path}#prompt:0'),
+                    [0, 1, 2],
+                )
+                # Tool umbrella alone → assistant + tool_result.
+                self.assertEqual(
+                    self.r._gather_umbrella_lines(f'{path}#tool:1'),
+                    [1, 2],
+                )
+            finally:
+                self.r._TREE_MODE = saved
+        finally:
+            os.unlink(path)
+
+    def test_gather_umbrella_lines_stops_at_subagent_boundary(self):
+        # Parent session: u1 (turn root) → a1 (Task tool_use) → u2
+        # (tool_result with agentId). Gathering lines for the
+        # prompt umbrella includes the same-file leaves but NOT
+        # anything from the subagent's jsonl.
+        import json as _json
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix='gum-sa-')
+        try:
+            sess_path = os.path.join(tmp, 'parent.jsonl')
+            with open(sess_path, 'w') as f:
+                f.write(_json.dumps({
+                    'type': 'user', 'uuid': 'u1',
+                    'message': {'role': 'user', 'content': 'go'},
+                }) + '\n')
+                f.write(_json.dumps({
+                    'type': 'assistant', 'uuid': 'a1',
+                    'message': {'role': 'assistant', 'content': [
+                        {'type': 'tool_use', 'id': 'tu1', 'name': 'Task',
+                         'input': {'prompt': 'do', 'subagent_type': 'Explore'}},
+                    ]},
+                }) + '\n')
+                f.write(_json.dumps({
+                    'type': 'user', 'uuid': 'u2',
+                    'message': {'role': 'user', 'content': [
+                        {'type': 'tool_result', 'tool_use_id': 'tu1',
+                         'content': 'ok'},
+                    ]},
+                    'toolUseResult': {'agentId': 'AGENT01',
+                                      'agentType': 'Explore',
+                                      'status': 'completed'},
+                }) + '\n')
+            sub_dir = os.path.join(tmp, 'parent', 'subagents')
+            os.makedirs(sub_dir)
+            agent_path = os.path.join(sub_dir, 'agent-AGENT01.jsonl')
+            with open(agent_path, 'w') as f:
+                f.write(_json.dumps({
+                    'type': 'user', 'uuid': 'sub1',
+                    'message': {'role': 'user', 'content': 'inside'},
+                }) + '\n')
+            saved = self.r._TREE_MODE
+            self.r._TREE_MODE = True
+            try:
+                # All three parent-file leaves; nothing from subagent.
+                lines = self.r._gather_umbrella_lines(f'{sess_path}#prompt:0')
+                self.assertEqual(lines, [0, 1, 2])
+            finally:
+                self.r._TREE_MODE = saved
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_gather_line_source_recurses_umbrella(self):
+        # Pass an umbrella id to ``_gather_line_source``; per_line
+        # picks up all leaves under that umbrella in document order.
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'go'}},
+            {'type': 'assistant', 'uuid': 'a1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 't1', 'name': 'Bash',
+                  'input': {'command': 'ls'}},
+             ]}},
+            {'type': 'user', 'uuid': 'u2',
+             'message': {'role': 'user', 'content': [
+                 {'type': 'tool_result', 'tool_use_id': 't1',
+                  'content': 'ok'},
+             ]}},
+        ])
+        try:
+            saved = self.r._TREE_MODE
+            self.r._TREE_MODE = True
+            try:
+                self.r._scan_tree(path)
+                items = [self.r.Item(id=f'{path}#prompt:0')]
+                per_line, whole = self.r._gather_line_source(items)
+                self.assertEqual(per_line, {path: [0, 1, 2]})
+                self.assertFalse(whole)
+            finally:
+                self.r._TREE_MODE = saved
+        finally:
+            os.unlink(path)
+
+    def test_gather_dedupes_and_sorts_overlapping_targets(self):
+        # User selects an umbrella AND one of its child leaves (or
+        # two overlapping umbrellas). Pre-select pass collapses to
+        # one entry per leaf in file order — no duplicates, no
+        # out-of-order entries.
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'go'}},
+            {'type': 'assistant', 'uuid': 'a1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 't1', 'name': 'Bash',
+                  'input': {'command': 'ls'}},
+             ]}},
+            {'type': 'user', 'uuid': 'u2',
+             'message': {'role': 'user', 'content': [
+                 {'type': 'tool_result', 'tool_use_id': 't1',
+                  'content': 'ok'},
+             ]}},
+        ])
+        try:
+            saved = self.r._TREE_MODE
+            self.r._TREE_MODE = True
+            try:
+                self.r._scan_tree(path)
+                # Targets: leaf line 2 first, THEN the umbrella that
+                # contains lines 0..2. Pre-select must collapse the
+                # overlap and emit lines in file order.
+                items = [
+                    self.r.Item(id=f'{path}#2'),
+                    self.r.Item(id=f'{path}#prompt:0'),
+                ]
+                per_line, _ = self.r._gather_line_source(items)
+                self.assertEqual(per_line, {path: [0, 1, 2]})
+            finally:
+                self.r._TREE_MODE = saved
+        finally:
+            os.unlink(path)
 
     def test_write_line_excerpts_skips_out_of_range_lines(self):
         path = self._write_jsonl([
