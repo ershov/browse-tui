@@ -42,13 +42,14 @@ def _stub_browse_tui():
     mod.Action = _Stub
     mod.Browser = _Stub
     mod.Item = _Stub
-    # ``upsert`` is the push-API op constructor (#266); the recipe
-    # uses it from the live-tail worker. Tests don't exercise the
-    # framework's actual upsert behavior, so a stub returning a
-    # plain tuple is enough to keep imports happy.
+    # ``upsert`` / ``clear_children`` are push-API op constructors
+    # (#266); the recipe uses them from the live-tail worker. Tests
+    # don't exercise the framework's actual op-apply behavior, so
+    # stub them to plain tuples.
     mod.upsert = lambda id_, parent_id, **fields: (
         'upsert', id_, parent_id, fields,
     )
+    mod.clear_children = lambda parent_id: ('clear_children', parent_id)
     sys.modules['browse_tui'] = mod
 
 

@@ -44,7 +44,7 @@ import os
 import sys
 import threading
 
-from browse_tui import Action, Browser, Item, upsert
+from browse_tui import Action, Browser, Item, clear_children, upsert
 
 
 CLAUDE_ROOT = os.path.join(
@@ -2885,10 +2885,26 @@ def _maybe_bootstrap_tail_state(path):
 
 
 def _maybe_refresh_flat_on_change(b, path):
-    """Flat-mode tail step: if file size grew, trigger a parent refresh.
+    """Flat-mode tail step: atomically rebuild ``path``'s child list.
 
-    Updates ``_TAIL_STATE[path].last_size`` so we only refresh once
-    per growth event. Errors latch the flag, same shape as tree mode.
+    Cheap-and-correct path was originally ``b.refresh(path)``, but
+    that goes through cache_invalidate → re-enqueue → worker fetch
+    → deliver, leaving ``state._children[path]`` empty for one main-
+    loop turn. Holding ↑/↓ during that gap clamps the cursor to a
+    placeholder neighbour; when the fresh list lands the anchor
+    re-snaps it — net effect is a visible cursor jump.
+
+    Instead, compute the new list off-thread (cheap, ~10ms for a
+    multi-MB file in ``_list_messages``), then dispatch one
+    ``update_data`` batch with ``clear_children`` followed by an
+    ``upsert`` per item. ``update_data`` applies the whole batch in
+    a single main-loop tick, runs ``_apply_cursor_anchor`` exactly
+    once at the end, and snaps the cursor onto the same id without
+    going through a placeholder state. Separately, bust the
+    preview cache for the file's id so the session-card preview
+    picks up the new content even when the user is parked on the
+    session row at a scope above (cache-hit gate would otherwise
+    skip the re-fetch).
     """
     tail = _TAIL_STATE.get(path)
     if tail is None or tail.error:
@@ -2904,7 +2920,45 @@ def _maybe_refresh_flat_on_change(b, path):
         return
     tail.last_size = size
     tail.byte_offset = size
-    b.refresh(path)
+
+    state = b._state
+    if path in state._children:
+        # Rebuild the children list atomically (cursor anchor
+        # preserves the cursor's identity across the rebuild).
+        try:
+            fresh = get_children(path)
+        except Exception:
+            fresh = None
+        if fresh is not None:
+            ops = [clear_children(path)]
+            for it in fresh:
+                ops.append(upsert(it.id, path, **_item_to_upsert_kwargs(it)))
+            b.update_data(ops)
+
+    # Force the preview pane to re-fetch when its cached text is for
+    # this file (or one of its line ids — defensive, the leaf preview
+    # for an unchanged line is stable but a cheap re-fetch is fine).
+    # Posted onto the main thread so the mutation respects the
+    # framework's single-writer invariants.
+    b.post(lambda: _bust_preview_for_path(b, path))
+
+
+def _bust_preview_for_path(b, path):
+    """Drop cached preview text for ``path`` and force a re-fetch.
+
+    Runs on the main thread (via ``Browser.post``). Sets
+    ``_preview_cursor_id = None`` so the next
+    ``_update_preview_for_cursor`` call sees a difference and re-
+    requests, even when the cursor stayed on the same row. Same
+    plumbing ``_do_refresh`` uses for the user-driven Ctrl-R path.
+    """
+    state = b._state
+    state._preview.pop(path, None)
+    cur_id = state._preview_cursor_id
+    if cur_id == path or (isinstance(cur_id, str)
+                          and cur_id.startswith(path + '#')):
+        state._preview_cursor_id = None
+        b._needs_redraw.add('preview')
 
 
 def _resolve_tail_path_from_browser(b):
