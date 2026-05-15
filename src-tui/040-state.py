@@ -1488,17 +1488,32 @@ class Browser:
         self._quit_code = 0
         self._quit_output = ''
 
-        # --- cursor_to deferred resolution -----------------------------
-        # cursor_to(id) for an id not currently visible parks the request
-        # here; whenever a future cache delivery rebuilds the visible
-        # list, ``apply_children_results`` retries the placement and
-        # resolves the parked Pending if the id appeared. Phase 1
-        # acceptable simplification: we only retry once per delivery,
-        # we don't walk the parent chain to expand ancestors (that would
-        # need parent metadata on items). Production recipes that use
-        # from_flat_tree() get the cache populated up front so cursor_to
-        # always finds the id immediately.
-        self._pending_cursor = None  # tuple (id, Pending) or None
+        # --- sticky cursor anchor (id-based positioning) ---------------
+        # The cursor's identity is its *item id*, not its row index. The
+        # ``_cursor_anchor`` snapshot is a flat priority list of ids the
+        # loop should keep the cursor on, in preference order:
+        #
+        #   _cursor_anchor = [primary, next, prev, parent, gp, ..., root]
+        #
+        # ``primary`` is the cursor's intended item. ``next`` / ``prev``
+        # are the ids of the neighbouring visible "normal" rows captured
+        # at re-anchor time. ``parent`` and beyond walk the ancestor
+        # chain to the tree root via ``state._parent_of_id``.
+        #
+        # The snapshot is taken by ``_reanchor_cursor`` after every
+        # user-driven cursor move (and lazily on startup). It is applied
+        # by ``_apply_cursor_anchor`` after every background mutation
+        # that could shift visible-list indices: ``apply_children_results``,
+        # ``update_data._apply``, ``_do_expand`` (cached path). The walker
+        # tries each tier in order and snaps ``state.cursor`` onto the
+        # first match. On a ``primary`` hit it refreshes the snapshot
+        # (the neighbourhood may have shifted while the primary was
+        # missing); on a fallback hit it leaves the snapshot parked, so
+        # if the primary returns later the cursor jumps back.
+        #
+        # Set explicitly by ``cursor_to(id)`` (the snapshot starts as
+        # just ``[id]`` — fallbacks fill in once placement lands).
+        self._cursor_anchor = []
 
         # --- insert-mode bookkeeping (ticket #21) ----------------------
         # Insert mode is entered by ``ctx.insert(label, on_confirm)``.
@@ -1731,6 +1746,24 @@ class Browser:
 
         def _apply():
             apply_ops(self._state, ops_list)
+            # Re-snap the cursor onto its anchored id before flagging
+            # redraws. A streaming push that inserts items above the
+            # cursor would otherwise shift its index off the original
+            # item; ``_apply_cursor_anchor`` keeps the cursor's
+            # identity stable by walking the snapshot tiers.
+            self._apply_cursor_anchor()
+            # Clamp the cursor back into the visible range when the
+            # anchor walk didn't find a home (e.g., every id in the
+            # snapshot was removed). Mirrors the clamp in
+            # ``apply_children_results``; without it, an ``update_data``
+            # that shrinks the list past the cursor would leave the
+            # cursor pointing past the end and the renderer would
+            # silently skip the row.
+            vis = visible_items(self._state)
+            if vis and self._state.cursor >= len(vis):
+                self._state.cursor = len(vis) - 1
+            elif not vis:
+                self._state.cursor = 0
             # Flag list/children for redraw so background pushes (e.g.
             # from a watcher or a websocket bridge) become visible
             # without waiting for the user to press a key. ``apply_ops``
@@ -1975,6 +2008,12 @@ class Browser:
                 p._resolve()
             n += 1
         if n:
+            # Re-snap the cursor onto its anchored id (or closest
+            # fallback) before the index clamp runs, so the clamp only
+            # fires when the entire anchor chain is missing from the
+            # new visible list. See ``_apply_cursor_anchor`` for the
+            # walk order (primary → next → prev → ancestors).
+            self._apply_cursor_anchor()
             # If the apply shrank the visible list past the cursor,
             # clamp it so the cursor still indexes a real row. Without
             # this, a watcher-driven refresh that removes items can
@@ -2050,7 +2089,8 @@ class Browser:
                     and not self._children_results
                     and not preview_busy
                     and self._preview_result is None
-                    and not self._children_in_flight):
+                    and not self._children_in_flight
+                    and not self._state._children_pending):
                 return
             time.sleep(0.005)
         raise TimeoutError(
@@ -2061,7 +2101,8 @@ class Browser:
             f'preview_req={self._preview_req!r}, '
             f'preview_result={self._preview_result!r}, '
             f'preview_paused={self._preview_paused!r}, '
-            f'in_flight={list(self._children_in_flight)})'
+            f'in_flight={list(self._children_in_flight)}, '
+            f'children_pending={list(self._state._children_pending)})'
         )
 
     # ---- internal: refresh dispatch (main thread) -----------------------
@@ -2138,41 +2179,24 @@ class Browser:
     def _do_cursor_to(self, id_, pending):
         """Main-thread: position the cursor at ``id_`` and resolve ``pending``.
 
-        Phase 1 simplification: we walk the current visible-tree list
-        and, if ``id_`` is found, set ``self._state.cursor`` to its
-        index. If not found, we resolve the Pending anyway (best-effort)
-        so chained ``.then()`` callbacks don't strand. A future phase
-        could expand the parent chain via parent metadata on Items;
-        recipes that need it today should use ``from_flat_tree`` to
-        pre-populate the cache, in which case every id is visible.
+        Sets the sticky cursor anchor to ``[id_]`` so the loop keeps
+        trying to land the cursor on ``id_`` as background deliveries
+        rebuild the visible list. ``_apply_cursor_anchor`` snaps the
+        cursor immediately if ``id_`` is already visible; otherwise the
+        anchor stays parked and the next ``apply_children_results`` /
+        ``update_data`` mutation will retry. ``pending`` resolves
+        best-effort right away so chained ``.then()`` callbacks don't
+        strand — the Pending says "the request was processed", not
+        "the cursor is on the target yet".
 
-        Flags ``list`` / ``children`` / ``preview`` for redraw on a
-        successful move so the next render pass surfaces the new
-        cursor position -- without this, an external thread's
-        ``cursor_to`` would silently move the cursor but the screen
-        wouldn't update until the next user keystroke (regression
-        guarded by ticket #77's stress tests).
-
-        Also snaps the list viewport so the new cursor row is on-screen.
-        The main loop's automatic snap (in ``run()``) only fires when a
-        synchronous key handler moves ``state.cursor``; ``cursor_to``
-        defers the move via ``post`` so it lands *after* that snap
-        check. Without an explicit snap here, programmatic moves would
-        slide the cursor off-screen and force the user to scroll
-        manually — surprising for what reads as a navigation API.
+        The snapshot starts as just ``[id_]`` (no fallback tiers): we
+        haven't seen ``id_`` in the visible list yet, so we don't know
+        its neighbours. The first successful ``_apply_cursor_anchor``
+        hit on the primary will fill in the next/prev/parent tiers
+        from the freshly-resolved row.
         """
-        # Build/refresh the visible list; visible_items honours the
-        # dirty bit so this is a no-op if nothing changed.
-        vis = visible_items(self._state)
-        for i, entry in enumerate(vis):
-            if entry.item.id == id_:
-                self._state.cursor = i
-                mark_cursor_changed(self)
-                self._snap_list_scroll_to_row(i)
-                pending._resolve()
-                return
-        # Not visible. Best-effort: leave cursor alone and resolve.
-        # (Documented in cursor_to's docstring.)
+        self._cursor_anchor = [id_]
+        self._apply_cursor_anchor()
         pending._resolve()
 
     def _do_expand(self, id_, pending):
@@ -2192,6 +2216,13 @@ class Browser:
         self._state.expanded.add(id_)
         if id_ in self._state._children:
             mark_visible_dirty(self._state)
+            # Children already cached — expanding inserts those rows
+            # into the visible list immediately. Re-snap the cursor on
+            # its anchored id so its index doesn't drift if the
+            # expansion happened above the cursor row. (Uncached path
+            # goes through ``apply_children_results`` which also
+            # re-snaps.)
+            self._apply_cursor_anchor()
             self._needs_redraw.add('list')
             pending._resolve()
             return
@@ -2875,6 +2906,11 @@ class Browser:
                 self.run_until_idle(timeout=0.2)
             except TimeoutError:
                 pass
+            # Seed the cursor anchor from the initial cursor position
+            # so background deliveries that land between now and the
+            # first user keypress preserve the cursor's identity (not
+            # just its index).
+            self._reanchor_cursor()
             render_full(self)
 
         try:
@@ -3101,6 +3137,117 @@ class Browser:
             return self._insert_pos
         return self._state.cursor
 
+    def _compute_anchor_snapshot(self) -> list:
+        """Return a fresh anchor snapshot for the current cursor position.
+
+        Layout: ``[primary, next, prev, parent, grandparent, ..., root]``
+        where ``primary`` is the cursor item's id. Each successive entry
+        is a fallback the cursor falls onto if its predecessor is missing
+        from the visible list.
+
+        Snapshots all VisibleEntry kinds, not just ``normal``: ``scope_root``
+        entries carry the real scoped-item id (anchoring there is fine —
+        if the user scopes out, the same id reappears as a normal row),
+        and ``pending`` placeholders carry a deterministic
+        ``__pending_<parent>`` id that's stable while the parent is
+        loading. Treating synthetic rows the same as normal rows keeps
+        cursor navigation continuous when the user is parked on the
+        scope-root row or stepping through a loading subtree.
+
+        Returns ``[]`` only when there's no row to anchor at all (insert
+        mode, cursor out of range). Callers treat an empty list as
+        "leave the existing anchor alone".
+        """
+        if self._insert_mode:
+            return []
+        vis = visible_items(self._state)
+        cur = self._state.cursor
+        if not (0 <= cur < len(vis)):
+            return []
+        primary = vis[cur].item.id
+        out = [primary]
+        # Nearest visible neighbour after the cursor.
+        if cur + 1 < len(vis):
+            out.append(vis[cur + 1].item.id)
+        # Nearest visible neighbour before the cursor.
+        if cur - 1 >= 0:
+            out.append(vis[cur - 1].item.id)
+        # Ancestors closest-first to the tree root. ``walked`` is the
+        # cycle-detection set (a malformed parent index would otherwise
+        # spin forever); ``seen`` is the dedup set (don't repeat an id
+        # already in ``next`` / ``prev``, but still keep climbing past
+        # it so far ancestors are recorded).
+        cursor_id = primary
+        walked = {primary}
+        seen = set(out)
+        while True:
+            parent_id = self._state._parent_of_id.get(cursor_id)
+            if parent_id is None or parent_id in walked:
+                break
+            walked.add(parent_id)
+            if parent_id not in seen:
+                out.append(parent_id)
+                seen.add(parent_id)
+            cursor_id = parent_id
+        return out
+
+    def _reanchor_cursor(self) -> None:
+        """Capture a fresh anchor snapshot from the current cursor.
+
+        Called after every user-driven cursor move (in
+        ``_handle_one_key``) and after every successful ``primary``
+        match in ``_apply_cursor_anchor`` (the neighbourhood may have
+        shifted while we were chasing a missing primary). No-op when
+        the snapshot would be empty so a transient out-of-range or
+        synthetic-row state doesn't discard a still-valid anchor.
+        """
+        snap = self._compute_anchor_snapshot()
+        if snap:
+            self._cursor_anchor = snap
+
+    def _apply_cursor_anchor(self) -> bool:
+        """Snap ``state.cursor`` onto the anchored id (or its closest
+        fallback) inside the current visible list.
+
+        Walks ``_cursor_anchor`` tier-by-tier; the first id present in
+        the visible list wins. On a ``primary`` hit (tier 0) the
+        snapshot is refreshed — the cursor is back where the user last
+        positioned it, so the neighbourhood is now current. On a
+        fallback hit (tier ≥ 1) the snapshot is left parked so the
+        cursor can return to ``primary`` when it reappears in a later
+        delivery.
+
+        Returns True iff a tier matched (cursor may or may not have
+        moved — same row idx counts as a match). Used by every
+        background mutation hook (``apply_children_results``,
+        ``update_data._apply``, ``_do_expand``) plus
+        ``_handle_one_key`` for handlers that change list structure
+        without writing ``state.cursor``.
+        """
+        if not self._cursor_anchor:
+            return False
+        vis = visible_items(self._state)
+        id_to_idx = {}
+        for i, entry in enumerate(vis):
+            # Index every kind (normal / scope_root / pending). Each
+            # row has a stable item id; the renderer skips preview-
+            # fetches for non-normal kinds itself, so landing the
+            # cursor on a scope_root or pending row is harmless.
+            id_to_idx.setdefault(entry.item.id, i)
+        for tier_idx, target_id in enumerate(self._cursor_anchor):
+            if target_id in id_to_idx:
+                new_i = id_to_idx[target_id]
+                if self._state.cursor != new_i:
+                    self._state.cursor = new_i
+                    mark_cursor_changed(self)
+                    self._snap_list_scroll_to_row(new_i)
+                if tier_idx == 0:
+                    snap = self._compute_anchor_snapshot()
+                    if snap:
+                        self._cursor_anchor = snap
+                return True
+        return False
+
     def _handle_one_key(self, ctx, key) -> None:
         """Dispatch one keystroke and run the per-key bookkeeping.
 
@@ -3110,6 +3257,16 @@ class Browser:
         comparison is False and ``_list_scroll`` keeps the user's
         scrolled position). After dispatch, kicks the idempotent
         preview / children fetches for the new cursor.
+
+        Cursor-anchor flow: the pre-/post-dispatch ``state.cursor``
+        comparison tells us whether the handler intentionally moved
+        the cursor. If not, the handler may still have mutated the
+        visible-list shape (e.g., ``_expand_recursive`` flips
+        ``state.expanded`` without touching ``state.cursor``), which
+        would leave the cursor pointing at the wrong item by index —
+        ``_apply_cursor_anchor`` re-snaps it onto the anchored id.
+        Either way, we then re-snapshot for the next background
+        mutation.
 
         Used by the main loop's burst-coalescing loop: dispatch the
         first key, then keep calling this for each additional key
@@ -3123,10 +3280,21 @@ class Browser:
         if self._insert_mode:
             _handle_insert_key(self, ctx, key)
         else:
+            pre_cursor = self._state.cursor
             dispatch_key(self, ctx, key)
+            if self._state.cursor == pre_cursor:
+                # Handler didn't touch state.cursor; it may have
+                # mutated visible-list shape. Re-snap onto the anchor
+                # so the cursor stays on its item rather than drifting
+                # with shifted indices.
+                self._apply_cursor_anchor()
         new_row = self._active_list_row()
         if prev_insert != self._insert_mode or new_row != prev_row:
             self._snap_list_scroll_to_row(new_row)
+
+        # Re-anchor for the next background mutation. Skipped in
+        # insert mode and on synthetic rows by the helper itself.
+        self._reanchor_cursor()
 
         # Trigger preview + children fetches for the (possibly moved)
         # cursor before the next render pass. Idempotent; safe to call

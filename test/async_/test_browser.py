@@ -469,5 +469,429 @@ class TestThreadSafeOps(unittest.TestCase):
             b.stop_workers()
 
 
+# ---- 8. Sticky cursor anchor (id-based positioning) ------------------------
+
+
+from test.async_._helpers import _state  # access apply_ops helpers
+
+
+class TestCursorAnchor(unittest.TestCase):
+    """``Browser._cursor_anchor`` makes the cursor sticky by item id.
+
+    The cursor's identity is the id of the item under it (its row in the
+    visible list). Background mutations re-snap the cursor's index so
+    the same id stays selected; user keystrokes re-anchor.
+    """
+
+    def _children_pair(self, root_children, sub):
+        """Build a get_children that returns ``root_children`` for the
+        root id and ``sub`` for the named parent.
+        """
+        def gc(parent_id):
+            if parent_id in ('', None):
+                return root_children
+            return sub.get(parent_id, [])
+        return gc
+
+    def test_anchor_seeded_from_initial_cursor(self):
+        # After the first apply_children_results, the anchor should be
+        # primed with the cursor's row id (lazy init).
+        b = make_browser(get_children=lambda _id: [('A',), ('B',), ('C',)])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            # _reanchor_cursor runs in run() at startup; tests skip
+            # run(), so trigger the equivalent explicitly.
+            b._reanchor_cursor()
+            self.assertEqual(b._cursor_anchor[0], 'A')
+        finally:
+            b.stop_workers()
+
+    def test_cursor_follows_id_when_items_insert_above(self):
+        # Cursor on 'B' (idx 1). update_data inserts a new row above it.
+        # Without the anchor, cursor would stay at idx 1 (now 'NEW').
+        # With the anchor, cursor follows 'B' to its new idx.
+        b = make_browser(get_children=lambda _id: [('A',), ('B',), ('C',)])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.cursor_to('B')
+            b.run_until_idle()
+            self.assertEqual(b._state.cursor, 1)
+            self.assertEqual(b._cursor_anchor[0], 'B')
+
+            # Push a new sibling 'NEW' above 'B' by rewriting the
+            # children list in the desired order.
+            b.update_data([
+                _state.clear_children(None),
+                _state.upsert('NEW', None),
+                _state.upsert('A', None),
+                _state.upsert('B', None),
+                _state.upsert('C', None),
+            ])
+            b.run_until_idle()
+            # Cursor stayed on 'B', which is now at idx 2.
+            vis = _state.visible_items(b._state)
+            self.assertEqual(b._state.cursor, 2)
+            self.assertEqual(vis[b._state.cursor].item.id, 'B')
+        finally:
+            b.stop_workers()
+
+    def test_anchor_falls_back_to_next_sibling_when_primary_removed(self):
+        b = make_browser(get_children=lambda _id: [('A',), ('B',), ('C',)])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.cursor_to('B')
+            b.run_until_idle()
+            # Anchor snapshot should be [B, C, A] (primary, next, prev).
+            self.assertEqual(b._cursor_anchor[0], 'B')
+            self.assertIn('C', b._cursor_anchor)
+            self.assertIn('A', b._cursor_anchor)
+
+            # Remove B. Cursor must land on C (next sibling).
+            b.update_data([_state.remove('B')])
+            b.run_until_idle()
+            vis = _state.visible_items(b._state)
+            self.assertEqual(vis[b._state.cursor].item.id, 'C')
+            # Primary in the anchor is still 'B' — fallback hit doesn't
+            # re-snapshot.
+            self.assertEqual(b._cursor_anchor[0], 'B')
+        finally:
+            b.stop_workers()
+
+    def test_anchor_falls_back_to_prev_sibling_when_last_item(self):
+        b = make_browser(get_children=lambda _id: [('A',), ('B',), ('C',)])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.cursor_to('C')   # last item
+            b.run_until_idle()
+            # Remove C → no next, fall back to prev (B).
+            b.update_data([_state.remove('C')])
+            b.run_until_idle()
+            vis = _state.visible_items(b._state)
+            self.assertEqual(vis[b._state.cursor].item.id, 'B')
+        finally:
+            b.stop_workers()
+
+    def test_anchor_walks_to_parent_when_whole_sibling_group_gone(self):
+        # Root has A; A has A1, A2, A3. Cursor on A2. Remove all of A's
+        # children. Cursor should fall back to A (parent).
+        gc = self._children_pair(
+            [('A', None, None, '', True)],
+            {'A': [('A1',), ('A2',), ('A3',)]},
+        )
+        b = make_browser(get_children=gc)
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.expand('A')
+            b.run_until_idle()
+            b.cursor_to('A2')
+            b.run_until_idle()
+            self.assertEqual(b._cursor_anchor[0], 'A2')
+            # Anchor chain includes A1, A3, and A (parent).
+            self.assertIn('A', b._cursor_anchor)
+            self.assertIn('A1', b._cursor_anchor)
+            self.assertIn('A3', b._cursor_anchor)
+
+            # Wipe all A's children.
+            b.update_data([
+                _state.remove('A1'),
+                _state.remove('A2'),
+                _state.remove('A3'),
+            ])
+            b.run_until_idle()
+            vis = _state.visible_items(b._state)
+            self.assertEqual(vis[b._state.cursor].item.id, 'A')
+        finally:
+            b.stop_workers()
+
+    def test_anchor_walks_to_root_through_streaming_layers(self):
+        # Deep tree built layer by layer (root → A → A.A → A.A.A) so
+        # the cursor falls all the way up when intermediates are
+        # missing, then promotes back down as layers arrive.
+        gc = self._children_pair(
+            [('A', None, None, '', True)],
+            {'A':     [('A.A', None, None, '', True)],
+             'A.A':   [('A.A.A',)]},
+        )
+        b = make_browser(get_children=gc)
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.expand('A')
+            b.run_until_idle()
+            b.expand('A.A')
+            b.run_until_idle()
+            b.cursor_to('A.A.A')
+            b.run_until_idle()
+            self.assertEqual(b._cursor_anchor[0], 'A.A.A')
+
+            # Remove the leaf — cursor falls to grandparent's level
+            # (next/prev are siblings of A.A.A, but there are none → walk
+            # ancestors: A.A first).
+            b.update_data([_state.remove('A.A.A')])
+            b.run_until_idle()
+            vis = _state.visible_items(b._state)
+            self.assertEqual(vis[b._state.cursor].item.id, 'A.A')
+
+            # Also remove A.A — cursor falls one more level up to A.
+            b.update_data([_state.remove('A.A')])
+            b.run_until_idle()
+            vis = _state.visible_items(b._state)
+            self.assertEqual(vis[b._state.cursor].item.id, 'A')
+
+            # Bring A.A.A back — cursor jumps right back to it (primary
+            # still parked in the anchor). A.A stays in state.expanded
+            # from the original expansion.
+            b.update_data([_state.upsert('A.A', 'A', has_children=True),
+                           _state.upsert('A.A.A', 'A.A')])
+            b.run_until_idle()
+            vis = _state.visible_items(b._state)
+            self.assertEqual(vis[b._state.cursor].item.id, 'A.A.A')
+        finally:
+            b.stop_workers()
+
+    def test_anchor_resnapshots_on_primary_hit(self):
+        # When the primary lands, the snapshot is refreshed — capturing
+        # the *current* neighbours. Later if primary is removed again,
+        # the fallback uses fresh neighbours, not stale ones.
+        b = make_browser(get_children=lambda _id: [('A',), ('B',), ('C',)])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.cursor_to('B')
+            b.run_until_idle()
+            old_anchor = list(b._cursor_anchor)
+            self.assertEqual(old_anchor[0], 'B')
+
+            # Rewrite [A, B, C] as [X, B, Y] (cursor stays on B but its
+            # neighbours change).
+            b.update_data([
+                _state.clear_children(None),
+                _state.upsert('X', None),
+                _state.upsert('B', None),
+                _state.upsert('Y', None),
+            ])
+            b.run_until_idle()
+            # Primary still hit → resnapshot. Old neighbours (A, C)
+            # have been replaced by the fresh ones (X, Y).
+            self.assertEqual(b._cursor_anchor[0], 'B')
+            self.assertNotIn('A', b._cursor_anchor)
+            self.assertNotIn('C', b._cursor_anchor)
+            self.assertIn('X', b._cursor_anchor)
+            self.assertIn('Y', b._cursor_anchor)
+        finally:
+            b.stop_workers()
+
+    def test_anchor_returns_to_primary_when_it_reappears(self):
+        b = make_browser(get_children=lambda _id: [('A',), ('B',), ('C',)])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.cursor_to('B')
+            b.run_until_idle()
+
+            # Remove B → cursor falls to C.
+            b.update_data([_state.remove('B')])
+            b.run_until_idle()
+            vis = _state.visible_items(b._state)
+            self.assertEqual(vis[b._state.cursor].item.id, 'C')
+            # Primary stays parked.
+            self.assertEqual(b._cursor_anchor[0], 'B')
+
+            # Re-add B → cursor returns to it.
+            b.update_data([
+                _state.upsert('A', None),
+                _state.upsert('B', None),
+                _state.upsert('C', None),
+            ])
+            b.run_until_idle()
+            vis = _state.visible_items(b._state)
+            self.assertEqual(vis[b._state.cursor].item.id, 'B')
+        finally:
+            b.stop_workers()
+
+    def test_slow_refresh_preserves_cursor_id(self):
+        # The classic "Ctrl-R while parked on item C": the cursor must
+        # be back on C once the refresh completes, regardless of how
+        # long the worker took.
+        items = [('A',), ('B',), ('C',), ('D',), ('E',)]
+        def gc(_id):
+            # Tiny sleep simulates a slow recipe — long enough that the
+            # cache invalidation between refresh start and worker
+            # delivery is observable.
+            time.sleep(0.03)
+            return items
+        b = make_browser(get_children=gc)
+        try:
+            b.refresh()
+            b.run_until_idle(timeout=2.0)
+            b.cursor_to('C')
+            b.run_until_idle(timeout=2.0)
+            self.assertEqual(b._state.cursor, 2)
+
+            # Slow full refresh: worker re-fetches over ~30ms.
+            b.refresh()
+            b.run_until_idle(timeout=2.0)
+
+            # Cursor identity preserved across the reload.
+            vis = _state.visible_items(b._state)
+            self.assertEqual(vis[b._state.cursor].item.id, 'C')
+        finally:
+            b.stop_workers()
+
+    def test_slow_refresh_three_levels_restores_deep_cursor(self):
+        # The full case: 3-deep tree (root → A → A.A → A.A.A), cursor
+        # parked on the deepest leaf. A slow full refresh invalidates
+        # every cache and re-fetches each level over the worker
+        # (10ms/level), so the visible list passes through several
+        # intermediate states:
+        #
+        #   [pending root]                         (right after refresh)
+        #   [A, pending for A]                     (after root delivery)
+        #   [A, A.A, pending for A.A]              (after A delivery)
+        #   [A, A.A, A.A.A]                        (after A.A delivery)
+        #
+        # The cursor anchor walks UP its ancestor chain as the deeper
+        # ids vanish, then back DOWN as each delivery surfaces them.
+        # By the time the refresh fully completes, the cursor must be
+        # back on A.A.A (primary hit re-snapshots the chain).
+        sub = {
+            'A':   [('A.A', None, None, '', True)],
+            'A.A': [('A.A.A',)],
+        }
+        root = [('A', None, None, '', True)]
+
+        def gc(parent_id):
+            time.sleep(0.01)   # widen the loading window per level
+            if parent_id in ('', None):
+                return root
+            return sub.get(parent_id, [])
+
+        b = make_browser(get_children=gc)
+        try:
+            b.refresh()
+            b.run_until_idle(timeout=3.0)
+            b.expand('A')
+            b.run_until_idle(timeout=3.0)
+            b.expand('A.A')
+            b.run_until_idle(timeout=3.0)
+            b.cursor_to('A.A.A')
+            b.run_until_idle(timeout=3.0)
+            # Pre-refresh sanity: cursor on the deepest leaf.
+            vis = _state.visible_items(b._state)
+            self.assertEqual(vis[b._state.cursor].item.id, 'A.A.A')
+
+            # The slow full refresh.
+            b.refresh()
+            b.run_until_idle(timeout=3.0)
+
+            # Post-refresh: cursor identity preserved end-to-end,
+            # despite the visible list collapsing and rebuilding
+            # layer-by-layer.
+            vis = _state.visible_items(b._state)
+            self.assertEqual(vis[b._state.cursor].item.id, 'A.A.A')
+            # Resnapshot fired on the primary hit, so the chain reflects
+            # the rebuilt tree (ancestors A.A and A in the snapshot).
+            self.assertEqual(b._cursor_anchor[0], 'A.A.A')
+            self.assertIn('A.A', b._cursor_anchor)
+            self.assertIn('A', b._cursor_anchor)
+        finally:
+            b.stop_workers()
+
+    def test_slow_refresh_falls_back_when_cursor_item_gone(self):
+        # If the slow reload returns a list that no longer contains the
+        # cursor item, the cursor lands on a tier-2 fallback (next
+        # sibling).
+        delivery = {'first': True}
+        def gc(_id):
+            time.sleep(0.02)
+            if delivery['first']:
+                delivery['first'] = False
+                return [('A',), ('B',), ('C',), ('D',), ('E',)]
+            # Second call (the refresh): C is gone.
+            return [('A',), ('B',), ('D',), ('E',)]
+        b = make_browser(get_children=gc)
+        try:
+            b.refresh()
+            b.run_until_idle(timeout=2.0)
+            b.cursor_to('C')
+            b.run_until_idle(timeout=2.0)
+            self.assertEqual(b._cursor_anchor[0], 'C')
+
+            b.refresh()
+            b.run_until_idle(timeout=2.0)
+            # C is gone — fallback to next sibling D.
+            vis = _state.visible_items(b._state)
+            self.assertEqual(vis[b._state.cursor].item.id, 'D')
+            # Primary parked — if C reappeared later, the cursor would
+            # jump back.
+            self.assertEqual(b._cursor_anchor[0], 'C')
+        finally:
+            b.stop_workers()
+
+    def test_anchor_works_on_scope_root_row(self):
+        # When the user is scoped, the first visible row is a
+        # ``scope_root`` entry — the cursor must anchor to it just like
+        # a normal row so background mutations don't drift it.
+        gc = self._children_pair(
+            [('P', None, None, '', True)],
+            {'P': [('X',), ('Y',)]},
+        )
+        b = make_browser(get_children=gc, initial_scope='P')
+        try:
+            b.refresh()
+            b.run_until_idle(timeout=2.0)
+            # Cursor starts at idx 0 (the scope_root row for 'P').
+            vis = _state.visible_items(b._state)
+            self.assertEqual(vis[0].kind, 'scope_root')
+            self.assertEqual(vis[0].item.id, 'P')
+            # Seed the anchor as run() would after startup.
+            b._reanchor_cursor()
+            self.assertEqual(b._cursor_anchor[0], 'P')
+
+            # Background mutation rewrites P's children; cursor must
+            # stay on the scope_root row (id 'P'), not drift.
+            b.update_data([
+                _state.clear_children('P'),
+                _state.upsert('NEW', 'P'),
+                _state.upsert('X', 'P'),
+                _state.upsert('Y', 'P'),
+            ])
+            b.run_until_idle(timeout=2.0)
+            vis = _state.visible_items(b._state)
+            self.assertEqual(vis[b._state.cursor].item.id, 'P')
+        finally:
+            b.stop_workers()
+
+    def test_anchor_clamps_to_index_when_entire_chain_missing(self):
+        # When primary AND every fallback id is gone, the cursor falls
+        # back to the index clamp (existing behavior).
+        b = make_browser(get_children=lambda _id: [('A',), ('B',), ('C',)])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.cursor_to('B')
+            b.run_until_idle()
+            # Replace every item with completely fresh ids.
+            b.update_data([
+                _state.remove('A'),
+                _state.remove('B'),
+                _state.remove('C'),
+                _state.upsert('X', None),
+                _state.upsert('Y', None),
+            ])
+            b.run_until_idle()
+            # Anchor has no match → cursor clamped to within [0, len).
+            vis = _state.visible_items(b._state)
+            self.assertGreaterEqual(b._state.cursor, 0)
+            self.assertLess(b._state.cursor, len(vis))
+        finally:
+            b.stop_workers()
+
+
 if __name__ == '__main__':
     unittest.main()
