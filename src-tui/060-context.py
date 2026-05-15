@@ -198,23 +198,31 @@ class Context:
         """
         return self._browser.update_data(ops)
 
-    def upsert(self, id, parent_id, **fields) -> None:
+    def upsert(self, id, parent_id, *, where=None, **fields) -> None:
         """Single-op convenience: ``update_data([upsert(id, parent_id, **fields)])``.
 
         Routes through ``Browser.update_data`` so the mutation lands on
         the main thread atomically with respect to render. Returns
         ``None``. For multiple ops, prefer ``update_data`` directly to
         keep them in one batch.
-        """
-        return self._browser.update_data([upsert(id, parent_id, **fields)])
 
-    def set_item(self, id, parent_id, **fields) -> None:
+        ``where`` (optional, keyword-only) is a positioning descriptor;
+        see ``upsert`` helper / ``apply_ops`` semantics for details.
+        """
+        return self._browser.update_data(
+            [upsert(id, parent_id, where=where, **fields)]
+        )
+
+    def set_item(self, id, parent_id, *, where=None, **fields) -> None:
         """Single-op convenience: ``update_data([set_item(id, parent_id, **fields)])``.
 
         Insert-or-replace shape — see ``apply_ops`` semantics for ``set``.
-        Returns ``None``.
+        Returns ``None``. ``where`` (optional, keyword-only) carries an
+        optional positioning descriptor.
         """
-        return self._browser.update_data([set_item(id, parent_id, **fields)])
+        return self._browser.update_data(
+            [set_item(id, parent_id, where=where, **fields)]
+        )
 
     def remove(self, id) -> None:
         """Single-op convenience: ``update_data([remove(id)])``.

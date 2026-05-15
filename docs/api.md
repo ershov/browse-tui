@@ -578,17 +578,92 @@ Apply a batched list of tree-mutation ops on the main thread. Snapshots
 runs `apply_ops`. The whole batch is atomic with respect to render; two
 separate `update_data` calls are not — each is its own post-queue task.
 
-| Op                                          | Effect                                                                                                                                                                                          |
-| ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `("upsert", id, parent_id, fields)`         | Insert under `parent_id` if new; **patch-merge** in place if known (matching keys override `Item` fields, others land as custom attrs). Reparents if `parent_id` differs from the existing parent. `parent_id=None` patches fields only (silent no-op if `id` is unknown and `state.root_id` is not None). |
-| `("set", id, parent_id, fields)`            | Insert-or-replace. `fields` is the entire record; unspecified `Item` fields revert to dataclass defaults; custom attrs are dropped. A new `Item` instance is constructed. Children stored under `_children[id]` are preserved.                                |
-| `("remove", id)`                            | Remove the item. Cascades: `_children[id]` is also dropped along with all descendant index entries.                                                                                              |
-| `("clear_children", parent_id)`             | Drop all known children of `parent_id`; cache entry reverts to "no fetch yet"; `_loading[parent_id]` flips to False.                                                                             |
-| `("complete", parent_id)`                   | Clear the loading flag (`_loading[parent_id] = False`).                                                                                                                                          |
-| `("incomplete", parent_id)`                 | Set the loading flag (`_loading[parent_id] = True`).                                                                                                                                             |
+| Op                                                  | Effect                                                                                                                                                                                          |
+| --------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `("upsert", id, parent_id, fields[, where])`        | Insert under `parent_id` if new; **patch-merge** in place if known (matching keys override `Item` fields, others land as custom attrs). Reparents if `parent_id` differs from the existing parent. `parent_id=None` patches fields only (silent no-op if `id` is unknown and `state.root_id` is not None). Optional `where` carries a positioning descriptor — see *Positioning* below. |
+| `("set", id, parent_id, fields[, where])`           | Insert-or-replace. `fields` is the entire record; unspecified `Item` fields revert to dataclass defaults; custom attrs are dropped. A new `Item` instance is constructed. Children stored under `_children[id]` are preserved. Optional `where` carries a positioning descriptor — see *Positioning* below.                                |
+| `("remove", id)`                                    | Remove the item. Cascades: `_children[id]` is also dropped along with all descendant index entries.                                                                                              |
+| `("clear_children", parent_id)`                     | Drop all known children of `parent_id`; cache entry reverts to "no fetch yet"; `_loading[parent_id]` flips to False.                                                                             |
+| `("complete", parent_id)`                           | Clear the loading flag (`_loading[parent_id] = False`).                                                                                                                                          |
+| `("incomplete", parent_id)`                         | Set the loading flag (`_loading[parent_id] = True`).                                                                                                                                             |
 
 Ops apply in list order; reparenting in one op is visible to subsequent
 ops in the same batch. Unknown ops raise `ValueError` (no silent drop).
+
+##### Positioning (`where` on `upsert`/`set`)
+
+`upsert` and `set` accept an optional 5th tuple element — a positioning
+descriptor — that controls where a new (or repositioned) row lands in
+the parent's children list. The legacy 4-tuple form remains valid; when
+`where` is absent, new ids append at the end and existing ids keep their
+current position.
+
+The descriptor is a 2- or 3-tuple `(TYPE, OPTIONS [, REFERENCE])`:
+
+| TYPE       | OPTIONS                       | REFERENCE                                          | Effect                                                                  |
+| ---------- | ----------------------------- | -------------------------------------------------- | ----------------------------------------------------------------------- |
+| `"first"`  | `None` or `frozenset(...)`    | omitted (or silently ignored)                      | Insert at index 0.                                                      |
+| `"last"`   | `None` or `frozenset(...)`    | omitted (or silently ignored)                      | Insert at end.                                                          |
+| `"before"` | `None` or `frozenset(...)`    | `int` (child index) or `str` (child id) — required | Insert immediately before the referenced sibling.                       |
+| `"after"`  | `None` or `frozenset(...)`    | `int` (child index) or `str` (child id) — required | Insert immediately after the referenced sibling.                        |
+
+`OPTIONS` is a `frozenset` of string flags (or `None` for no flags). One
+flag is defined:
+
+- `"reposition"` — apply the position to an existing id. Without this
+  flag, an `upsert`/`set` whose id is already present keeps its current
+  position; with the flag, it moves to the computed position.
+
+**Reference resolution.** Out-of-range and missing references collapse
+to the nearest edge, regardless of direction:
+
+- `int < 0` or missing `str` id → `"before"` becomes `"first"`,
+  `"after"` becomes `"last"`.
+- `int >= len(children)` → both `"before"` and `"after"` become `"last"`.
+
+So `("before", None, -1)` and `("after", None, -1)` both insert first;
+`("before", None, 999)` and `("after", None, 999)` both insert last.
+
+**Same-id pivot.** If the reference resolves to the id being
+upserted (e.g. `where=("before", None, "X")` while upserting `"X"`):
+
+- New id (not yet a child) → pivot is missing → falls back to first/last
+  by direction.
+- Existing id without `"reposition"` → `where` is ignored; existing
+  position kept.
+- Existing id with `"reposition"` → same-id pivot is a no-op on
+  position; fields are still patched (`upsert`) or the item replaced
+  (`set`).
+
+**Validation.** A malformed descriptor (wrong tuple length, unknown
+keyword, unknown flag, non-int/str reference, missing reference for
+`"before"`/`"after"`, etc.) raises `ValueError` and aborts the batch.
+
+**Examples:**
+
+```python
+from browse_tui import upsert, set_item
+
+# Prepend a row (newest-first chat history).
+op = upsert('msg-42', 'session-9',
+            where=('first', None),
+            text=msg.text)
+
+# Insert immediately before a known sibling.
+op = upsert('log-99', 'log',
+            where=('before', None, 'log-100'),
+            text=line)
+
+# Insert at a known index.
+op = upsert('row-3', 'parent',
+            where=('after', None, 2),
+            text='…')
+
+# Reposition an existing row to the top.
+op = upsert('pinned', 'parent',
+            where=('first', frozenset({'reposition'})),
+            pinned=True)
+```
 
 Use the helper constructors (see *Helper functions* below) rather than
 hand-rolling tuples:
@@ -724,14 +799,18 @@ Six tagged-tuple constructors so recipes don't hand-roll op shapes:
 from browse_tui import upsert, set_item, remove, clear_children, complete, incomplete
 ```
 
-| Helper                                 | Returns                                       |
-| -------------------------------------- | --------------------------------------------- |
-| `upsert(id, parent_id, **fields)`      | `("upsert", id, parent_id, fields)`           |
-| `set_item(id, parent_id, **fields)`    | `("set", id, parent_id, fields)`              |
-| `remove(id)`                           | `("remove", id)`                              |
-| `clear_children(parent_id)`            | `("clear_children", parent_id)`               |
-| `complete(parent_id)`                  | `("complete", parent_id)`                     |
-| `incomplete(parent_id)`                | `("incomplete", parent_id)`                   |
+| Helper                                                    | Returns                                                             |
+| --------------------------------------------------------- | ------------------------------------------------------------------- |
+| `upsert(id, parent_id, *, where=None, **fields)`          | `("upsert", id, parent_id, fields)` or `(..., where)` if `where`    |
+| `set_item(id, parent_id, *, where=None, **fields)`        | `("set",    id, parent_id, fields)` or `(..., where)` if `where`    |
+| `remove(id)`                                              | `("remove", id)`                                                    |
+| `clear_children(parent_id)`                               | `("clear_children", parent_id)`                                     |
+| `complete(parent_id)`                                     | `("complete", parent_id)`                                           |
+| `incomplete(parent_id)`                                   | `("incomplete", parent_id)`                                         |
+
+`where` is keyword-only — it cannot collide positionally with a field
+name. See *Positioning* under `browser.update_data` for the descriptor
+shape and semantics.
 
 The `set` helper is named `set_item` because shadowing the built-in via
 `from browse_tui import set` would be hostile to recipes.

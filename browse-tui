@@ -1382,14 +1382,27 @@ def cache_invalidate_all(state: State) -> None:
 # is named that way (not ``set``) because shadowing the builtin via
 # ``from browse_tui import set`` would be hostile to recipes.
 
-def upsert(id, parent_id, **fields):
-    """Construct an ``("upsert", id, parent_id, fields)`` op tuple."""
-    return ('upsert', id, parent_id, fields)
+def upsert(id, parent_id, *, where=None, **fields):
+    """Construct an ``("upsert", id, parent_id, fields[, where])`` op tuple.
+
+    ``where`` is an optional positioning descriptor — see
+    ``_resolve_where_index`` for the tuple shape and semantics. When
+    omitted, the legacy 4-tuple form is emitted; with ``where`` set,
+    a 5-tuple is emitted that ``apply_ops`` recognises.
+    """
+    if where is None:
+        return ('upsert', id, parent_id, fields)
+    return ('upsert', id, parent_id, fields, where)
 
 
-def set_item(id, parent_id, **fields):
-    """Construct a ``("set", id, parent_id, fields)`` op tuple."""
-    return ('set', id, parent_id, fields)
+def set_item(id, parent_id, *, where=None, **fields):
+    """Construct a ``("set", id, parent_id, fields[, where])`` op tuple.
+
+    See ``upsert`` for the ``where`` argument.
+    """
+    if where is None:
+        return ('set', id, parent_id, fields)
+    return ('set', id, parent_id, fields, where)
 
 
 def remove(id):
@@ -1448,8 +1461,123 @@ def _drop_subtree_indexes(state: State, item_id) -> None:
         _drop_subtree_indexes(state, cid)
 
 
-def _apply_upsert(state: State, id_, parent_id, fields) -> bool:
-    """Apply one ``upsert`` op. Returns True if structure changed."""
+# Positioning descriptor for ``upsert`` / ``set`` ops.
+#
+# Shape: ``(TYPE, OPTIONS [, REFERENCE])``
+#   TYPE:      "first" | "last" | "before" | "after"
+#   OPTIONS:   None  | frozenset of strings  (currently only "reposition")
+#   REFERENCE: required for "before"/"after"; int (child index, clamped)
+#              or str (child id, falls back to first/last when missing)
+#
+# See ``docs/superpowers/specs/2026-05-15-update-data-positioning-design.md``.
+
+_VALID_WHERE_KEYWORDS = frozenset({'first', 'last', 'before', 'after'})
+_VALID_WHERE_OPTIONS = frozenset({'reposition'})
+
+
+def _validate_where(where) -> None:
+    """Validate a ``where`` descriptor. Raises ``ValueError`` if malformed."""
+    if not isinstance(where, tuple):
+        raise ValueError(
+            f'where must be a tuple, got {type(where).__name__}'
+        )
+    if len(where) not in (2, 3):
+        raise ValueError(
+            f'where tuple must have 2 or 3 elements, got {len(where)}'
+        )
+    type_ = where[0]
+    if type_ not in _VALID_WHERE_KEYWORDS:
+        raise ValueError(
+            f'unknown where keyword: {type_!r} '
+            f'(expected one of {sorted(_VALID_WHERE_KEYWORDS)})'
+        )
+    opts = where[1]
+    if opts is not None and not isinstance(opts, (set, frozenset)):
+        raise ValueError(
+            f'where options must be None or a (frozen)set, '
+            f'got {type(opts).__name__}'
+        )
+    if opts:
+        unknown = set(opts) - _VALID_WHERE_OPTIONS
+        if unknown:
+            raise ValueError(
+                f'unknown where option(s): {sorted(unknown)} '
+                f'(known: {sorted(_VALID_WHERE_OPTIONS)})'
+            )
+    if type_ in ('before', 'after'):
+        if len(where) != 3:
+            raise ValueError(
+                f'{type_!r} requires a reference (3-tuple)'
+            )
+        ref = where[2]
+        if not isinstance(ref, (int, str)):
+            raise ValueError(
+                f'where reference must be int or str, '
+                f'got {type(ref).__name__}'
+            )
+    # For "first"/"last" a 3-tuple is tolerated; the reference slot is
+    # silently ignored (forgiving — the parser dispatches on TYPE).
+
+
+def _resolve_where_index(children_list, where, self_id=None):
+    """Compute the insertion index for ``where`` given current ``children_list``.
+
+    Returns the target index (an int in ``[0, len(children_list)]``), or
+    ``None`` if ``self_id`` resolves to the pivot — the caller should
+    treat that as a no-op on position (per spec same-id rule).
+
+    Resolution rules:
+      * "first" -> 0
+      * "last"  -> len(children_list)
+      * "before"/"after" with int reference:
+          - ref < 0          -> collapse to first (0)
+          - ref >= len       -> collapse to last (len)
+          - 0 <= ref < len   -> use children_list[ref] as pivot
+      * "before"/"after" with str reference:
+          - id present       -> use that child as pivot
+          - id missing       -> "before"->first, "after"->last
+      * Same-id pivot (pivot resolves to ``self_id``) -> None
+
+    The collapse rule is intentionally direction-independent: out-of-range
+    int and missing str both go to the nearest edge, not direction-shifted
+    by one position.
+    """
+    type_ = where[0]
+    if type_ == 'first':
+        return 0
+    if type_ == 'last':
+        return len(children_list)
+    # before / after
+    ref = where[2]
+    if isinstance(ref, int):
+        if ref < 0:
+            return 0
+        if ref >= len(children_list):
+            return len(children_list)
+        idx = ref
+    else:
+        idx = None
+        for i, child in enumerate(children_list):
+            if child.id == ref:
+                idx = i
+                break
+        if idx is None:
+            return 0 if type_ == 'before' else len(children_list)
+    if self_id is not None and children_list[idx].id == self_id:
+        return None
+    return idx if type_ == 'before' else idx + 1
+
+
+def _apply_upsert(state: State, id_, parent_id, fields, where=None) -> bool:
+    """Apply one ``upsert`` op. Returns True if structure changed.
+
+    ``where`` (optional) is a positioning descriptor — see
+    ``_resolve_where_index`` for shape and semantics. When omitted, new
+    ids append at the end and existing ids keep their current position
+    (legacy behaviour).
+    """
+    if where is not None:
+        _validate_where(where)
     known = _item_field_names()
     existing = state._items_by_id.get(id_)
 
@@ -1479,7 +1607,18 @@ def _apply_upsert(state: State, id_, parent_id, fields) -> bool:
             setattr(item, k, v)
         # Insert under parent. Orphan upserts (unknown parent) are
         # allowed — the cache entry is created on demand.
-        state._children.setdefault(parent_id, []).append(item)
+        children_list = state._children.setdefault(parent_id, [])
+        if where is None:
+            children_list.append(item)
+        else:
+            # ``self_id`` lets same-id pivot resolve to None; for new
+            # ids it can only happen via str-pivot that doesn't match
+            # anything (handled by the missing-id fallback) so we never
+            # actually see ``None`` here in practice.
+            idx = _resolve_where_index(children_list, where, self_id=id_)
+            if idx is None:
+                idx = len(children_list)
+            children_list.insert(idx, item)
         state._items_by_id[id_] = item
         state._parent_of_id[id_] = parent_id
         return True
@@ -1496,23 +1635,75 @@ def _apply_upsert(state: State, id_, parent_id, fields) -> bool:
         # builder emits, so this is structural too.
         return True
 
+    reposition = (
+        where is not None and 'reposition' in (where[1] or frozenset())
+    )
     old_parent = state._parent_of_id.get(id_)
     if old_parent != parent_id:
         # Reparent: remove from old parent's child list (if cached),
-        # append to the new parent's, update the reverse index.
+        # insert into the new parent's list at ``where`` (or append if
+        # ``where`` is None). The reposition flag is irrelevant for
+        # reparent — moving to a new parent always places the row.
         old_list = state._children.get(old_parent)
         if old_list:
             for i, child in enumerate(old_list):
                 if child.id == id_:
                     del old_list[i]
                     break
-        state._children.setdefault(parent_id, []).append(existing)
+        new_list = state._children.setdefault(parent_id, [])
+        if where is None:
+            new_list.append(existing)
+        else:
+            idx = _resolve_where_index(new_list, where, self_id=id_)
+            if idx is None:
+                idx = len(new_list)
+            new_list.insert(idx, existing)
         state._parent_of_id[id_] = parent_id
+    elif reposition:
+        # Reposition within the same parent. Compute the target index
+        # against the original list (including the existing item), then
+        # move atomically.
+        children_list = state._children.get(parent_id)
+        if children_list is None:
+            # Defensive — existing item but no children list? Recreate.
+            state._children[parent_id] = [existing]
+            return True
+        target_idx = _resolve_where_index(
+            children_list, where, self_id=id_
+        )
+        if target_idx is None:
+            # Same-id pivot — leave position unchanged.
+            return True
+        cur_idx = None
+        for i, child in enumerate(children_list):
+            if child.id == id_:
+                cur_idx = i
+                break
+        if cur_idx is None:
+            # Out-of-sync state — existing recorded but not in parent's
+            # children list. Insert defensively at the target index.
+            if target_idx > len(children_list):
+                target_idx = len(children_list)
+            children_list.insert(target_idx, existing)
+            return True
+        del children_list[cur_idx]
+        if target_idx > cur_idx:
+            target_idx -= 1
+        children_list.insert(target_idx, existing)
+    # else: existing same-parent, no reposition -> keep current position
     return True
 
 
-def _apply_set(state: State, id_, parent_id, fields) -> bool:
-    """Apply one ``set`` op. Returns True if structure changed."""
+def _apply_set(state: State, id_, parent_id, fields, where=None) -> bool:
+    """Apply one ``set`` op. Returns True if structure changed.
+
+    ``where`` (optional) is a positioning descriptor — see
+    ``_resolve_where_index``. Like ``upsert``, new ids honour ``where``;
+    existing ids in the same parent keep their position unless the
+    ``"reposition"`` flag is set.
+    """
+    if where is not None:
+        _validate_where(where)
     known = _item_field_names()
     # Full replace: ``fields`` is the entire record. Unspecified Item
     # fields revert to dataclass defaults; custom attrs are dropped. A
@@ -1524,36 +1715,81 @@ def _apply_set(state: State, id_, parent_id, fields) -> bool:
     for k, v in extras.items():
         setattr(item, k, v)
 
+    reposition = (
+        where is not None and 'reposition' in (where[1] or frozenset())
+    )
     old_parent = state._parent_of_id.get(id_)
     if old_parent is None and id_ not in state._items_by_id:
-        # Insert under the supplied parent_id.
-        state._children.setdefault(parent_id, []).append(item)
+        # New id under the supplied parent_id.
+        children_list = state._children.setdefault(parent_id, [])
+        if where is None:
+            children_list.append(item)
+        else:
+            idx = _resolve_where_index(children_list, where, self_id=id_)
+            if idx is None:
+                idx = len(children_list)
+            children_list.insert(idx, item)
         state._items_by_id[id_] = item
         state._parent_of_id[id_] = parent_id
         return True
 
     # Replace existing. The id keeps its place in the parent's child
-    # list when the parent is unchanged; on reparent it moves to the
-    # new parent's tail.
+    # list when the parent is unchanged (or moves to the computed
+    # position when reposition is requested); on reparent it inserts
+    # at ``where`` (or appends if ``where`` is None).
     if old_parent == parent_id:
         old_list = state._children.get(old_parent)
-        if old_list is not None:
+        if old_list is None:
+            state._children[parent_id] = [item]
+        elif reposition:
+            target_idx = _resolve_where_index(
+                old_list, where, self_id=id_
+            )
+            cur_idx = None
+            for i, child in enumerate(old_list):
+                if child.id == id_:
+                    cur_idx = i
+                    break
+            if target_idx is None:
+                # Same-id pivot — replace in place.
+                if cur_idx is not None:
+                    old_list[cur_idx] = item
+                else:
+                    old_list.append(item)
+            else:
+                if cur_idx is None:
+                    if target_idx > len(old_list):
+                        target_idx = len(old_list)
+                    old_list.insert(target_idx, item)
+                else:
+                    del old_list[cur_idx]
+                    if target_idx > cur_idx:
+                        target_idx -= 1
+                    old_list.insert(target_idx, item)
+        else:
+            # No reposition: replace in place at current index.
             for i, child in enumerate(old_list):
                 if child.id == id_:
                     old_list[i] = item
                     break
             else:
                 old_list.append(item)
-        else:
-            state._children[parent_id] = [item]
     else:
+        # Reparent.
         old_list = state._children.get(old_parent)
         if old_list:
             for i, child in enumerate(old_list):
                 if child.id == id_:
                     del old_list[i]
                     break
-        state._children.setdefault(parent_id, []).append(item)
+        new_list = state._children.setdefault(parent_id, [])
+        if where is None:
+            new_list.append(item)
+        else:
+            idx = _resolve_where_index(new_list, where, self_id=id_)
+            if idx is None:
+                idx = len(new_list)
+            new_list.insert(idx, item)
         state._parent_of_id[id_] = parent_id
 
     state._items_by_id[id_] = item
@@ -1625,12 +1861,15 @@ def apply_ops(state: State, ops) -> None:
     for op in ops:
         kind = op[0]
         if kind == 'upsert':
-            _, id_, parent_id, fields = op
-            if _apply_upsert(state, id_, parent_id, fields):
+            # 4-tuple (legacy) or 5-tuple (with positioning descriptor).
+            _, id_, parent_id, fields, *rest = op
+            where = rest[0] if rest else None
+            if _apply_upsert(state, id_, parent_id, fields, where):
                 structural = True
         elif kind == 'set':
-            _, id_, parent_id, fields = op
-            if _apply_set(state, id_, parent_id, fields):
+            _, id_, parent_id, fields, *rest = op
+            where = rest[0] if rest else None
+            if _apply_set(state, id_, parent_id, fields, where):
                 structural = True
         elif kind == 'remove':
             _, id_ = op
@@ -7388,23 +7627,31 @@ class Context:
         """
         return self._browser.update_data(ops)
 
-    def upsert(self, id, parent_id, **fields) -> None:
+    def upsert(self, id, parent_id, *, where=None, **fields) -> None:
         """Single-op convenience: ``update_data([upsert(id, parent_id, **fields)])``.
 
         Routes through ``Browser.update_data`` so the mutation lands on
         the main thread atomically with respect to render. Returns
         ``None``. For multiple ops, prefer ``update_data`` directly to
         keep them in one batch.
-        """
-        return self._browser.update_data([upsert(id, parent_id, **fields)])
 
-    def set_item(self, id, parent_id, **fields) -> None:
+        ``where`` (optional, keyword-only) is a positioning descriptor;
+        see ``upsert`` helper / ``apply_ops`` semantics for details.
+        """
+        return self._browser.update_data(
+            [upsert(id, parent_id, where=where, **fields)]
+        )
+
+    def set_item(self, id, parent_id, *, where=None, **fields) -> None:
         """Single-op convenience: ``update_data([set_item(id, parent_id, **fields)])``.
 
         Insert-or-replace shape — see ``apply_ops`` semantics for ``set``.
-        Returns ``None``.
+        Returns ``None``. ``where`` (optional, keyword-only) carries an
+        optional positioning descriptor.
         """
-        return self._browser.update_data([set_item(id, parent_id, **fields)])
+        return self._browser.update_data(
+            [set_item(id, parent_id, where=where, **fields)]
+        )
 
     def remove(self, id) -> None:
         """Single-op convenience: ``update_data([remove(id)])``.

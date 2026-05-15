@@ -560,5 +560,480 @@ class TestUnknownOp(unittest.TestCase):
             apply_ops(s, [('not-an-op', 'a')])
 
 
+# ---- Positioning (`where` descriptor) ---------------------------------------
+
+
+def _ids(s, parent):
+    """Return the list of child ids under ``parent`` for assertions."""
+    return [c.id for c in s._children.get(parent, [])]
+
+
+def _seed_parent(*ids):
+    """Build a state with the given ids appended under '/'."""
+    s = State(root_id='/')
+    apply_ops(s, [upsert(i, '/', title=i.upper()) for i in ids])
+    return s
+
+
+class TestHelperWhere(unittest.TestCase):
+    """Helper constructors honour ``where=`` kwarg."""
+
+    def test_upsert_without_where_legacy_4tuple(self):
+        op = upsert('a', 'p', title='A')
+        self.assertEqual(len(op), 4)
+        self.assertEqual(op[0], 'upsert')
+
+    def test_upsert_with_where_5tuple(self):
+        op = upsert('a', 'p', where=('first', None), title='A')
+        self.assertEqual(len(op), 5)
+        self.assertEqual(op[4], ('first', None))
+
+    def test_set_item_without_where_legacy(self):
+        op = set_item('a', 'p', title='A')
+        self.assertEqual(len(op), 4)
+
+    def test_set_item_with_where_5tuple(self):
+        op = set_item('a', 'p', where=('last', None), title='A')
+        self.assertEqual(len(op), 5)
+        self.assertEqual(op[4], ('last', None))
+
+    def test_where_only_keyword_only(self):
+        # Cannot pass ``where`` positionally; must be keyword.
+        with self.assertRaises(TypeError):
+            upsert('a', 'p', ('first', None))  # type: ignore
+
+
+class TestPositioningFirst(unittest.TestCase):
+    """``where=("first", ...)`` inserts at index 0."""
+
+    def test_first_on_nonempty(self):
+        s = _seed_parent('a', 'b', 'c')
+        apply_ops(s, [upsert('x', '/', where=('first', None), title='X')])
+        self.assertEqual(_ids(s, '/'), ['x', 'a', 'b', 'c'])
+
+    def test_first_on_empty(self):
+        s = State(root_id='/')
+        apply_ops(s, [upsert('x', '/', where=('first', None), title='X')])
+        self.assertEqual(_ids(s, '/'), ['x'])
+
+    def test_first_via_set_item(self):
+        s = _seed_parent('a', 'b')
+        apply_ops(s, [set_item('x', '/', where=('first', None), title='X')])
+        self.assertEqual(_ids(s, '/'), ['x', 'a', 'b'])
+
+    def test_first_with_3tuple_silently_drops_reference(self):
+        # "first" with a length-3 tuple — reference slot is ignored.
+        s = _seed_parent('a', 'b')
+        apply_ops(s, [
+            upsert('x', '/', where=('first', None, 'ignored'), title='X'),
+        ])
+        self.assertEqual(_ids(s, '/'), ['x', 'a', 'b'])
+
+
+class TestPositioningLast(unittest.TestCase):
+    """``where=("last", ...)`` inserts at end (same as default)."""
+
+    def test_last_on_nonempty(self):
+        s = _seed_parent('a', 'b', 'c')
+        apply_ops(s, [upsert('x', '/', where=('last', None), title='X')])
+        self.assertEqual(_ids(s, '/'), ['a', 'b', 'c', 'x'])
+
+    def test_last_on_empty(self):
+        s = State(root_id='/')
+        apply_ops(s, [upsert('x', '/', where=('last', None), title='X')])
+        self.assertEqual(_ids(s, '/'), ['x'])
+
+
+class TestPositioningBeforeAfterById(unittest.TestCase):
+    """``where=("before"/"after", None, str_id)`` resolves to pivot's index."""
+
+    def test_before_existing_id(self):
+        s = _seed_parent('a', 'b', 'c')
+        apply_ops(s, [upsert('x', '/', where=('before', None, 'b'), title='X')])
+        self.assertEqual(_ids(s, '/'), ['a', 'x', 'b', 'c'])
+
+    def test_after_existing_id(self):
+        s = _seed_parent('a', 'b', 'c')
+        apply_ops(s, [upsert('x', '/', where=('after', None, 'b'), title='X')])
+        self.assertEqual(_ids(s, '/'), ['a', 'b', 'x', 'c'])
+
+    def test_before_first(self):
+        s = _seed_parent('a', 'b', 'c')
+        apply_ops(s, [upsert('x', '/', where=('before', None, 'a'), title='X')])
+        self.assertEqual(_ids(s, '/'), ['x', 'a', 'b', 'c'])
+
+    def test_after_last(self):
+        s = _seed_parent('a', 'b', 'c')
+        apply_ops(s, [upsert('x', '/', where=('after', None, 'c'), title='X')])
+        self.assertEqual(_ids(s, '/'), ['a', 'b', 'c', 'x'])
+
+
+class TestPositioningBeforeAfterByIndex(unittest.TestCase):
+    """``where=("before"/"after", None, int_idx)`` uses index lookup."""
+
+    def test_before_index_0(self):
+        s = _seed_parent('a', 'b', 'c')
+        apply_ops(s, [upsert('x', '/', where=('before', None, 0), title='X')])
+        self.assertEqual(_ids(s, '/'), ['x', 'a', 'b', 'c'])
+
+    def test_after_index_0(self):
+        s = _seed_parent('a', 'b', 'c')
+        apply_ops(s, [upsert('x', '/', where=('after', None, 0), title='X')])
+        self.assertEqual(_ids(s, '/'), ['a', 'x', 'b', 'c'])
+
+    def test_before_middle_index(self):
+        s = _seed_parent('a', 'b', 'c', 'd')
+        apply_ops(s, [upsert('x', '/', where=('before', None, 2), title='X')])
+        self.assertEqual(_ids(s, '/'), ['a', 'b', 'x', 'c', 'd'])
+
+    def test_after_middle_index(self):
+        s = _seed_parent('a', 'b', 'c', 'd')
+        apply_ops(s, [upsert('x', '/', where=('after', None, 2), title='X')])
+        self.assertEqual(_ids(s, '/'), ['a', 'b', 'c', 'x', 'd'])
+
+
+class TestPositioningClampAndFallback(unittest.TestCase):
+    """Out-of-range index and missing pivot collapse to nearest edge."""
+
+    def test_before_negative_index_first(self):
+        s = _seed_parent('a', 'b', 'c')
+        apply_ops(s, [upsert('x', '/', where=('before', None, -1), title='X')])
+        self.assertEqual(_ids(s, '/'), ['x', 'a', 'b', 'c'])
+
+    def test_after_negative_index_also_first(self):
+        # Asymmetric clamp: out-of-range goes to nearest edge regardless
+        # of direction. -1 collapses to "first" even with "after".
+        s = _seed_parent('a', 'b', 'c')
+        apply_ops(s, [upsert('x', '/', where=('after', None, -1), title='X')])
+        self.assertEqual(_ids(s, '/'), ['x', 'a', 'b', 'c'])
+
+    def test_before_too_big_index_last(self):
+        s = _seed_parent('a', 'b', 'c')
+        apply_ops(s, [upsert('x', '/', where=('before', None, 999), title='X')])
+        self.assertEqual(_ids(s, '/'), ['a', 'b', 'c', 'x'])
+
+    def test_after_too_big_index_last(self):
+        s = _seed_parent('a', 'b', 'c')
+        apply_ops(s, [upsert('x', '/', where=('after', None, 999), title='X')])
+        self.assertEqual(_ids(s, '/'), ['a', 'b', 'c', 'x'])
+
+    def test_before_missing_id_first(self):
+        s = _seed_parent('a', 'b', 'c')
+        apply_ops(s, [
+            upsert('x', '/', where=('before', None, 'nope'), title='X'),
+        ])
+        self.assertEqual(_ids(s, '/'), ['x', 'a', 'b', 'c'])
+
+    def test_after_missing_id_last(self):
+        s = _seed_parent('a', 'b', 'c')
+        apply_ops(s, [
+            upsert('x', '/', where=('after', None, 'nope'), title='X'),
+        ])
+        self.assertEqual(_ids(s, '/'), ['a', 'b', 'c', 'x'])
+
+    def test_before_on_empty_with_missing_id(self):
+        s = State(root_id='/')
+        apply_ops(s, [
+            upsert('x', '/', where=('before', None, 'nope'), title='X'),
+        ])
+        self.assertEqual(_ids(s, '/'), ['x'])
+
+    def test_after_on_empty_with_int(self):
+        s = State(root_id='/')
+        apply_ops(s, [upsert('x', '/', where=('after', None, 5), title='X')])
+        self.assertEqual(_ids(s, '/'), ['x'])
+
+
+class TestRepositionFlag(unittest.TestCase):
+    """Existing ids only move when the ``"reposition"`` flag is set."""
+
+    def test_existing_without_flag_keeps_position(self):
+        s = _seed_parent('a', 'b', 'c')
+        apply_ops(s, [
+            # ``b`` already at index 1; this should NOT move it.
+            upsert('b', '/', where=('first', None), title='B-updated'),
+        ])
+        self.assertEqual(_ids(s, '/'), ['a', 'b', 'c'])
+        self.assertEqual(s._items_by_id['b'].title, 'B-updated')
+
+    def test_reposition_to_first(self):
+        s = _seed_parent('a', 'b', 'c')
+        apply_ops(s, [
+            upsert('c', '/',
+                   where=('first', frozenset({'reposition'})),
+                   title='C-moved'),
+        ])
+        self.assertEqual(_ids(s, '/'), ['c', 'a', 'b'])
+        self.assertEqual(s._items_by_id['c'].title, 'C-moved')
+
+    def test_reposition_to_last(self):
+        s = _seed_parent('a', 'b', 'c')
+        apply_ops(s, [
+            upsert('a', '/',
+                   where=('last', frozenset({'reposition'})),
+                   title='A-moved'),
+        ])
+        self.assertEqual(_ids(s, '/'), ['b', 'c', 'a'])
+
+    def test_reposition_before_id(self):
+        s = _seed_parent('a', 'b', 'c', 'd')
+        apply_ops(s, [
+            upsert('a', '/',
+                   where=('before', frozenset({'reposition'}), 'd'),
+                   title='A'),
+        ])
+        self.assertEqual(_ids(s, '/'), ['b', 'c', 'a', 'd'])
+
+    def test_reposition_after_id(self):
+        s = _seed_parent('a', 'b', 'c', 'd')
+        apply_ops(s, [
+            upsert('a', '/',
+                   where=('after', frozenset({'reposition'}), 'd'),
+                   title='A'),
+        ])
+        self.assertEqual(_ids(s, '/'), ['b', 'c', 'd', 'a'])
+
+    def test_reposition_via_set_item(self):
+        s = _seed_parent('a', 'b', 'c')
+        apply_ops(s, [
+            set_item('c', '/',
+                     where=('first', frozenset({'reposition'})),
+                     title='C'),
+        ])
+        self.assertEqual(_ids(s, '/'), ['c', 'a', 'b'])
+
+    def test_reposition_same_id_pivot_is_noop_by_str(self):
+        s = _seed_parent('a', 'b', 'c')
+        apply_ops(s, [
+            upsert('b', '/',
+                   where=('before', frozenset({'reposition'}), 'b'),
+                   title='B'),
+        ])
+        # Same-id pivot — position unchanged, but fields still patched.
+        self.assertEqual(_ids(s, '/'), ['a', 'b', 'c'])
+
+    def test_reposition_same_id_pivot_is_noop_by_int(self):
+        s = _seed_parent('a', 'b', 'c')
+        # ``b`` is at index 1; pointing at index 1 is the same-id case.
+        apply_ops(s, [
+            upsert('b', '/',
+                   where=('after', frozenset({'reposition'}), 1),
+                   title='B'),
+        ])
+        self.assertEqual(_ids(s, '/'), ['a', 'b', 'c'])
+
+    def test_reposition_to_already_correct_position_is_noop(self):
+        # "before c" where b is already before c → no movement.
+        s = _seed_parent('a', 'b', 'c')
+        apply_ops(s, [
+            upsert('b', '/',
+                   where=('before', frozenset({'reposition'}), 'c'),
+                   title='B'),
+        ])
+        self.assertEqual(_ids(s, '/'), ['a', 'b', 'c'])
+
+    def test_reposition_adjusts_for_self_removal(self):
+        # Move ``b`` from index 1 to "after d" (index 3 originally) →
+        # post-removal target is index 2 → final: [a, c, d, b].
+        s = _seed_parent('a', 'b', 'c', 'd')
+        apply_ops(s, [
+            upsert('b', '/',
+                   where=('after', frozenset({'reposition'}), 'd'),
+                   title='B'),
+        ])
+        self.assertEqual(_ids(s, '/'), ['a', 'c', 'd', 'b'])
+
+
+class TestPositioningSameIdNewItem(unittest.TestCase):
+    """Same-id pivot for a NEW id falls back to first/last (id not present)."""
+
+    def test_new_id_before_self_first(self):
+        s = _seed_parent('a', 'b', 'c')
+        apply_ops(s, [
+            upsert('x', '/', where=('before', None, 'x'), title='X'),
+        ])
+        self.assertEqual(_ids(s, '/'), ['x', 'a', 'b', 'c'])
+
+    def test_new_id_after_self_last(self):
+        s = _seed_parent('a', 'b', 'c')
+        apply_ops(s, [
+            upsert('x', '/', where=('after', None, 'x'), title='X'),
+        ])
+        self.assertEqual(_ids(s, '/'), ['a', 'b', 'c', 'x'])
+
+
+class TestPositioningBatchOrder(unittest.TestCase):
+    """Pivot resolution sees only ids already present when the op runs."""
+
+    def test_pivot_in_later_op_treated_as_missing(self):
+        # A references B; B is added later in the same batch. A's pivot
+        # is missing at the time it's processed → collapses to "first".
+        s = State(root_id='/')
+        apply_ops(s, [
+            upsert('a', '/', where=('before', None, 'b'), title='A'),
+            upsert('b', '/', title='B'),
+        ])
+        # A inserts as the first child of empty list, then B appends.
+        self.assertEqual(_ids(s, '/'), ['a', 'b'])
+
+    def test_pivot_in_earlier_op_resolves(self):
+        # B references A; A is already present when B is processed.
+        s = State(root_id='/')
+        apply_ops(s, [
+            upsert('a', '/', title='A'),
+            upsert('b', '/', where=('before', None, 'a'), title='B'),
+        ])
+        self.assertEqual(_ids(s, '/'), ['b', 'a'])
+
+    def test_reposition_within_same_batch(self):
+        s = _seed_parent('a', 'b', 'c')
+        apply_ops(s, [
+            upsert('x', '/', where=('after', None, 'a'), title='X'),
+            upsert('x', '/',
+                   where=('last', frozenset({'reposition'})),
+                   title='X'),
+        ])
+        # First op inserts x after a: [a, x, b, c].
+        # Second op repositions x to the end: [a, b, c, x].
+        self.assertEqual(_ids(s, '/'), ['a', 'b', 'c', 'x'])
+
+
+class TestPositioningReparent(unittest.TestCase):
+    """``where`` applies in the new parent when reparenting."""
+
+    def test_reparent_with_where_first(self):
+        s = State(root_id='/')
+        apply_ops(s, [
+            upsert('a', '/', title='A'),
+            upsert('b', 'a', title='B-child-1'),
+            upsert('c', 'a', title='C-child-2'),
+            upsert('d', '/', title='D'),
+        ])
+        # Reparent ``d`` under ``a`` at the start of a's children.
+        apply_ops(s, [upsert('d', 'a', where=('first', None), title='D')])
+        self.assertEqual(_ids(s, 'a'), ['d', 'b', 'c'])
+        self.assertEqual(_ids(s, '/'), ['a'])
+
+    def test_reparent_with_where_before_id(self):
+        s = State(root_id='/')
+        apply_ops(s, [
+            upsert('a', '/', title='A'),
+            upsert('b', 'a', title='B'),
+            upsert('c', 'a', title='C'),
+            upsert('d', '/', title='D'),
+        ])
+        apply_ops(s, [
+            upsert('d', 'a', where=('before', None, 'c'), title='D'),
+        ])
+        self.assertEqual(_ids(s, 'a'), ['b', 'd', 'c'])
+
+    def test_reparent_set_item_with_where(self):
+        s = State(root_id='/')
+        apply_ops(s, [
+            upsert('a', '/', title='A'),
+            upsert('b', 'a', title='B'),
+            upsert('d', '/', title='D'),
+        ])
+        apply_ops(s, [set_item('d', 'a', where=('first', None), title='D')])
+        self.assertEqual(_ids(s, 'a'), ['d', 'b'])
+
+
+class TestPositioningValidation(unittest.TestCase):
+    """Malformed ``where`` descriptors raise ``ValueError``."""
+
+    def test_not_a_tuple(self):
+        s = State(root_id='/')
+        with self.assertRaises(ValueError):
+            apply_ops(s, [
+                ('upsert', 'x', '/', {'title': 'X'}, 'first'),
+            ])
+
+    def test_wrong_length(self):
+        s = State(root_id='/')
+        with self.assertRaises(ValueError):
+            apply_ops(s, [
+                ('upsert', 'x', '/', {'title': 'X'}, ('first',)),
+            ])
+        with self.assertRaises(ValueError):
+            apply_ops(s, [
+                ('upsert', 'x', '/', {'title': 'X'},
+                 ('before', None, 'a', 'extra')),
+            ])
+
+    def test_unknown_keyword(self):
+        s = State(root_id='/')
+        with self.assertRaises(ValueError):
+            apply_ops(s, [
+                ('upsert', 'x', '/', {'title': 'X'}, ('around', None, 'a')),
+            ])
+
+    def test_options_wrong_type(self):
+        s = State(root_id='/')
+        with self.assertRaises(ValueError):
+            apply_ops(s, [
+                ('upsert', 'x', '/', {'title': 'X'},
+                 ('first', 'reposition')),
+            ])
+
+    def test_unknown_option(self):
+        s = State(root_id='/')
+        with self.assertRaises(ValueError):
+            apply_ops(s, [
+                ('upsert', 'x', '/', {'title': 'X'},
+                 ('first', frozenset({'force'}))),
+            ])
+
+    def test_before_without_reference(self):
+        s = State(root_id='/')
+        with self.assertRaises(ValueError):
+            apply_ops(s, [
+                ('upsert', 'x', '/', {'title': 'X'}, ('before', None)),
+            ])
+
+    def test_after_without_reference(self):
+        s = State(root_id='/')
+        with self.assertRaises(ValueError):
+            apply_ops(s, [
+                ('upsert', 'x', '/', {'title': 'X'}, ('after', None)),
+            ])
+
+    def test_reference_wrong_type(self):
+        s = State(root_id='/')
+        with self.assertRaises(ValueError):
+            apply_ops(s, [
+                ('upsert', 'x', '/', {'title': 'X'},
+                 ('before', None, 3.14)),
+            ])
+
+    def test_reference_none_for_before_after(self):
+        # None is not a valid reference (we use "first"/"last" instead).
+        s = State(root_id='/')
+        with self.assertRaises(ValueError):
+            apply_ops(s, [
+                ('upsert', 'x', '/', {'title': 'X'},
+                 ('before', None, None)),
+            ])
+
+
+class TestPositioningStructuralDirty(unittest.TestCase):
+    """Positioning changes flip ``_visible_dirty`` like other mutations."""
+
+    def test_new_insert_with_where_marks_dirty(self):
+        s = _seed_parent('a', 'b')
+        s._visible_dirty = False
+        apply_ops(s, [upsert('x', '/', where=('first', None), title='X')])
+        self.assertTrue(s._visible_dirty)
+
+    def test_reposition_marks_dirty(self):
+        s = _seed_parent('a', 'b', 'c')
+        s._visible_dirty = False
+        apply_ops(s, [
+            upsert('a', '/',
+                   where=('last', frozenset({'reposition'})),
+                   title='A'),
+        ])
+        self.assertTrue(s._visible_dirty)
+
+
 if __name__ == '__main__':
     unittest.main()

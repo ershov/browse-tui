@@ -158,6 +158,20 @@ class TestUpsertConvenience(unittest.TestCase):
         finally:
             b.stop_workers()
 
+    def test_forwards_where_kwarg(self):
+        # ``where`` passes through to the helper, producing a 5-tuple.
+        b = _make_browser()
+        try:
+            captured = []
+            b.update_data = lambda ops: captured.append(list(ops))
+            ctx = Context(b)
+            ctx.upsert('a', '/', where=('first', None), title='A')
+            self.assertEqual(captured, [[
+                ('upsert', 'a', '/', {'title': 'A'}, ('first', None)),
+            ]])
+        finally:
+            b.stop_workers()
+
 
 class TestSetItemConvenience(unittest.TestCase):
     """``ctx.set_item(id, parent, **fields)`` → one ``set`` op."""
@@ -178,6 +192,19 @@ class TestSetItemConvenience(unittest.TestCase):
             ctx = Context(b)
             ctx.set_item('a', '/', title='A')
             self.assertEqual(captured, [[('set', 'a', '/', {'title': 'A'})]])
+        finally:
+            b.stop_workers()
+
+    def test_forwards_where_kwarg(self):
+        b = _make_browser()
+        try:
+            captured = []
+            b.update_data = lambda ops: captured.append(list(ops))
+            ctx = Context(b)
+            ctx.set_item('a', '/', where=('last', None), title='A')
+            self.assertEqual(captured, [[
+                ('set', 'a', '/', {'title': 'A'}, ('last', None)),
+            ]])
         finally:
             b.stop_workers()
 
