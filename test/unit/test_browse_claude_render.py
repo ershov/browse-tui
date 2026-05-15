@@ -42,14 +42,17 @@ def _stub_browse_tui():
     mod.Action = _Stub
     mod.Browser = _Stub
     mod.Item = _Stub
-    # ``upsert`` / ``clear_children`` are push-API op constructors
-    # (#266); the recipe uses them from the live-tail worker. Tests
-    # don't exercise the framework's actual op-apply behavior, so
-    # stub them to plain tuples.
-    mod.upsert = lambda id_, parent_id, **fields: (
-        'upsert', id_, parent_id, fields,
+    # ``upsert`` / ``remove`` are push-API op constructors used by
+    # the live-tail worker. Tests don't exercise the framework's
+    # actual op-apply behavior, so stub them to plain tuples.
+    # ``upsert`` accepts an optional ``where=`` keyword for
+    # positional inserts (added in the positioning-descriptor work).
+    mod.upsert = lambda id_, parent_id, *, where=None, **fields: (
+        ('upsert', id_, parent_id, fields)
+        if where is None
+        else ('upsert', id_, parent_id, fields, where)
     )
-    mod.clear_children = lambda parent_id: ('clear_children', parent_id)
+    mod.remove = lambda id_: ('remove', id_)
     sys.modules['browse_tui'] = mod
 
 
@@ -2481,6 +2484,78 @@ class TestLiveTail(unittest.TestCase):
             self.r.get_children(None)
             self.assertNotIn(path, self.r._TREE_CACHE)
             self.assertNotIn(path, self.r._TAIL_STATE)
+        finally:
+            os.unlink(path)
+
+    def test_flat_tail_emits_first_position_upserts(self):
+        # Flat mode incremental insert: when the file grows, the
+        # tail emits ``upsert(..., where=('first', None))`` per new
+        # row (in reverse order) so they end up at the head of the
+        # newest-first list — and ``remove(id)`` for anything that
+        # aged out via the truncation cap.
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'one'}},
+        ])
+        try:
+            # Bootstrap _TAIL_STATE; simulate the framework having
+            # populated state._children[path] with one row.
+            self.r._scan_tree(path)
+            saved_tree = self.r._TREE_MODE
+            self.r._TREE_MODE = False
+            try:
+                fake_existing = self.r._list_messages(path)
+                seen_ops = []
+
+                class FakeState:
+                    def __init__(s):
+                        s._children = {path: list(fake_existing)}
+                class FakeBrowser:
+                    def __init__(s):
+                        s._state = FakeState()
+                    def update_data(s, ops):
+                        seen_ops.append(list(ops))
+                    def post(s, fn):
+                        pass    # no-op for this unit test
+                fake_b = FakeBrowser()
+
+                # Append two new records to disk; tail should pick
+                # up both as new rows.
+                self._append(path, [
+                    {'type': 'user', 'uuid': 'u2',
+                     'message': {'role': 'user', 'content': 'two'}},
+                    {'type': 'assistant', 'uuid': 'a1',
+                     'message': {'role': 'assistant', 'content': [
+                         {'type': 'text', 'text': 'three'},
+                     ]}},
+                ])
+                # Force last_size into a smaller value so the change
+                # check fires (bulk scan set it to current size).
+                tail = self.r._TAIL_STATE[path]
+                tail.last_size = 1
+
+                self.r._maybe_refresh_flat_on_change(fake_b, path)
+
+                self.assertEqual(len(seen_ops), 1,
+                                 f'expected one update_data batch, got '
+                                 f'{seen_ops!r}')
+                ops = seen_ops[0]
+                # Two upserts, each carrying the where=('first', None)
+                # positioning descriptor.
+                upserts = [op for op in ops if op[0] == 'upsert']
+                self.assertEqual(len(upserts), 2)
+                for op in upserts:
+                    self.assertEqual(len(op), 5,
+                                     f'expected 5-tuple upsert (with '
+                                     f'where), got {op!r}')
+                    self.assertEqual(op[4], ('first', None))
+                # No removes (file just grew, no truncation cap hit).
+                self.assertFalse(
+                    [op for op in ops if op[0] == 'remove'],
+                    f'unexpected remove ops: {ops!r}',
+                )
+            finally:
+                self.r._TREE_MODE = saved_tree
         finally:
             os.unlink(path)
 
