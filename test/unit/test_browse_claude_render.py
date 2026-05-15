@@ -42,17 +42,15 @@ def _stub_browse_tui():
     mod.Action = _Stub
     mod.Browser = _Stub
     mod.Item = _Stub
-    # ``upsert`` / ``remove`` are push-API op constructors used by
-    # the live-tail worker. Tests don't exercise the framework's
-    # actual op-apply behavior, so stub them to plain tuples.
-    # ``upsert`` accepts an optional ``where=`` keyword for
-    # positional inserts (added in the positioning-descriptor work).
+    # ``upsert`` is a push-API op constructor used by the live-tail
+    # worker. Tests don't exercise the framework's actual op-apply
+    # behavior, so stub it to a plain tuple. The ``where=`` keyword
+    # (added in the positioning-descriptor work) becomes a 5-tuple.
     mod.upsert = lambda id_, parent_id, *, where=None, **fields: (
         ('upsert', id_, parent_id, fields)
         if where is None
         else ('upsert', id_, parent_id, fields, where)
     )
-    mod.remove = lambda id_: ('remove', id_)
     sys.modules['browse_tui'] = mod
 
 
