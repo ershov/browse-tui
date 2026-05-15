@@ -388,6 +388,26 @@ def get_children(item_id):
                 return []
             return _list_tree_roots(agent_path)
         return _list_subagent_messages(item_id)
+    if isinstance(item_id, str) and '#prompt:' in item_id:
+        # ``<jsonl>#prompt:<turn_root_line>`` — turn umbrella.
+        if _TREE_MODE:
+            path, _, suffix = item_id.partition('#prompt:')
+            try:
+                n = int(suffix)
+            except ValueError:
+                return []
+            return _list_prompt_children(path, n)
+        return []
+    if isinstance(item_id, str) and '#tool:' in item_id:
+        # ``<jsonl>#tool:<assistant_line>`` — tool-execution umbrella.
+        if _TREE_MODE:
+            path, _, suffix = item_id.partition('#tool:')
+            try:
+                n = int(suffix)
+            except ValueError:
+                return []
+            return _list_tool_children(path, n)
+        return []
     if isinstance(item_id, str) and '#span:' in item_id:
         # ``<jsonl>#span:<start>`` — synthetic <system> umbrella in tree
         # mode. Children are the records of that span.
@@ -400,14 +420,9 @@ def get_children(item_id):
             return _list_span_records(path, start)
         return []
     if isinstance(item_id, str) and '#' in item_id:
-        # Message id ``<path>#<n>`` — only has children in tree mode.
-        if _TREE_MODE:
-            path, _, lineno = item_id.rpartition('#')
-            try:
-                n = int(lineno)
-            except ValueError:
-                return []
-            return _list_tree_children(path, n)
+        # Regular message id ``<path>#<n>`` — always a leaf in tree
+        # mode now (umbrellas own all the expansion). Flat mode never
+        # had children for these.
         return []
     if isinstance(item_id, str) and item_id.endswith('.jsonl') and os.path.isfile(item_id):
         if _TREE_MODE:
@@ -1955,12 +1970,16 @@ def get_preview(item_id):
     * project (dir):       human-readable summary + session list
     * session (file):      first 20 lines of the .jsonl (truncated)
     * subagent (#agent:X): meta.json + first-prompt preview
+    * ``<prompt>`` / ``<tool>`` / ``<system>`` umbrella: concatenated
+                            bodies of the umbrella's direct children.
     * message (#N):        pretty-printed JSON of the line
     """
     if not isinstance(item_id, str) or item_id.startswith('__err__:'):
         return ''
     if '#agent:' in item_id:
         return _preview_subagent(item_id)
+    if '#prompt:' in item_id or '#tool:' in item_id or '#span:' in item_id:
+        return _preview_umbrella(item_id)
     if '#' in item_id:
         path, _, lineno = item_id.rpartition('#')
         if lineno == '__truncated__':
@@ -2224,6 +2243,20 @@ class _TreeData:
                             assistant_uuid}}`` for every Agent/Task
                             tool_use whose tool_result resolved a
                             subagent .jsonl on disk.
+    * ``assistant_has_tool_use`` — ``{assistant_uuid}`` set; True iff the
+                            assistant record at this line carries a
+                            ``tool_use`` content part (i.e. it should be
+                            wrapped in a ``<tool:Name>`` umbrella).
+    * ``tool_to_turn_root_line`` — ``{assistant_line: turn_root_line}``
+                            — maps a ``<tool:>`` umbrella to its
+                            containing ``<prompt>`` umbrella.
+    * ``agent_to_assistant_line`` — ``{agent_id: assistant_line}`` —
+                            maps a ``<subagent>`` group to its
+                            dispatching assistant's line (i.e. the
+                            ``<tool:Task>`` umbrella wrapping it).
+    * ``tool_use_name_of`` — ``{assistant_uuid: tool_name}`` — first
+                            tool_use part's name (for the umbrella
+                            title prefix).
 
     Per-record attrs:
       * ``rec['_tree_forked_from']`` — record explicitly forked from
@@ -2232,7 +2265,9 @@ class _TreeData:
 
     __slots__ = ('records', 'by_uuid', 'line_of', 'roots_in_order',
                  'turn_direct', 'tool_children', 'span_records',
-                 'agent_link', 'records_line', 'parent_id_of')
+                 'agent_link', 'records_line', 'parent_id_of',
+                 'assistant_has_tool_use', 'tool_to_turn_root_line',
+                 'agent_to_assistant_line', 'tool_use_name_of')
 
     def __init__(self):
         self.records = []
@@ -2246,10 +2281,24 @@ class _TreeData:
         # id(rec) → line_no — looking up the line of a record without
         # needing a uuid (metadata records often have none).
         self.records_line = {}
-        # line_no → parent_id (``<jsonl>#<n>`` or ``<jsonl>#span:<n>``)
-        # for tree-ancestor walks. Top-level rows (turn-roots, span
-        # umbrellas) are absent.
+        # line_no → parent_id — the parent **umbrella** id for that
+        # line's leaf row. One of: ``<jsonl>#prompt:<n>``,
+        # ``<jsonl>#tool:<n>``, or ``<jsonl>#span:<n>``. Top-level
+        # rows (the umbrellas themselves) are absent — their parent
+        # link lives in tool_to_turn_root_line / agent_to_assistant_line
+        # or is None.
         self.parent_id_of = {}
+        # Assistant records that carry at least one tool_use content
+        # part. Drives the ``<tool:Name>`` umbrella wrapping.
+        self.assistant_has_tool_use = set()
+        # ``<tool:>`` → its containing ``<prompt>`` umbrella.
+        self.tool_to_turn_root_line = {}
+        # ``<subagent>`` → its dispatching assistant (which becomes
+        # the ``<tool:Task>`` umbrella).
+        self.agent_to_assistant_line = {}
+        # assistant_uuid → name of first tool_use content part, for the
+        # ``<tool:Name>`` umbrella's title prefix.
+        self.tool_use_name_of = {}
 
 
 def _is_turn_root(rec):
@@ -2371,6 +2420,13 @@ def _scan_tree(path):
                         and p.get('type') == 'tool_use'
                         and p.get('id')):
                     tool_owner[p['id']] = m.get('uuid')
+                    auuid = m.get('uuid')
+                    if auuid:
+                        td.assistant_has_tool_use.add(auuid)
+                        # First tool_use part's name drives the
+                        # ``<tool:Name>`` umbrella title prefix.
+                        td.tool_use_name_of.setdefault(
+                            auuid, p.get('name') or 'tool')
 
         direct = []
         for m in members:
@@ -2455,29 +2511,48 @@ def _scan_tree(path):
                                     'agent_path': agent_path,
                                     'assistant_uuid': rec.get('uuid'),
                                 }
+                                asst_line = td.line_of.get(rec.get('uuid'))
+                                if asst_line is not None:
+                                    td.agent_to_assistant_line[agent_id] = (
+                                        asst_line
+                                    )
 
-    # parent_id_of: maps each record's line → its tree-parent id.
-    # Used by ``_ancestor_ids_for`` for cursor-on-open and t-toggle's
-    # walk-up-and-expand. Top-level entries (turn-roots, span umbrellas)
-    # are absent from this map by design (they have no parent).
+    # parent_id_of: maps each record's line → its parent **umbrella**
+    # id. Used by ``_ancestor_ids_for`` for cursor-on-open and the
+    # t-toggle's walk-up-and-expand. Every leaf row sits inside a
+    # ``<prompt>`` / ``<tool>`` / ``<system>`` umbrella, so this map
+    # always lands on an umbrella id — never on a raw message id.
+    #
+    # The umbrella-to-umbrella links (``<tool>`` → ``<prompt>``,
+    # ``<subagent>`` → ``<tool>``) live in dedicated maps:
+    # ``tool_to_turn_root_line`` and ``agent_to_assistant_line``.
     for turn_uuid, members in td.turn_direct.items():
         turn_line = td.line_of.get(turn_uuid)
         if turn_line is None:
             continue
-        parent_id = f'{path}#{turn_line}'
+        prompt_id = f'{path}#prompt:{turn_line}'
+        # Turn root itself nests inside its own prompt umbrella.
+        td.parent_id_of[turn_line] = prompt_id
         for m in members:
             line = td.records_line.get(id(m))
-            if line is not None:
-                td.parent_id_of[line] = parent_id
+            if line is None:
+                continue
+            if m.get('uuid') in td.assistant_has_tool_use:
+                # Assistant-with-tool_use is wrapped in its own tool
+                # umbrella; the tool umbrella is the prompt's child.
+                td.parent_id_of[line] = f'{path}#tool:{line}'
+                td.tool_to_turn_root_line[line] = turn_line
+            else:
+                td.parent_id_of[line] = prompt_id
     for owner_uuid, kids in td.tool_children.items():
         owner_line = td.line_of.get(owner_uuid)
         if owner_line is None:
             continue
-        parent_id = f'{path}#{owner_line}'
+        tool_id = f'{path}#tool:{owner_line}'
         for k in kids:
             line = td.records_line.get(id(k))
             if line is not None:
-                td.parent_id_of[line] = parent_id
+                td.parent_id_of[line] = tool_id
     for span_start, recs in td.span_records.items():
         parent_id = f'{path}#span:{span_start}'
         for r in recs:
@@ -2507,16 +2582,18 @@ def _last_voice_id(jsonl_path):
 def _list_tree_roots(jsonl_path):
     """Tree-mode listing for a session: root-level rows in file order.
 
-    Each entry is either a turn-root (user voice) or a ``<system>``
-    umbrella collapsing a contiguous run of metadata records.
+    Each entry is either a ``<prompt>`` umbrella (one per turn) or a
+    ``<system>`` umbrella collapsing a contiguous run of metadata
+    records. The first message is no longer also the expandable node —
+    that's the umbrella's job.
     """
     td = _scan_tree(jsonl_path)
     out = []
     for entry in td.roots_in_order:
         if entry['kind'] == 'turn':
-            it = _tree_item(jsonl_path, entry['rec'], td)
-            if it is not None:
-                out.append(it)
+            line = entry['line']
+            rec = entry['rec']
+            out.append(_prompt_umbrella_item(jsonl_path, line, rec, td))
         else:   # 'span'
             out.append(_span_umbrella_item(
                 jsonl_path, entry['start'], entry['records'],
@@ -2524,61 +2601,97 @@ def _list_tree_roots(jsonl_path):
     return out
 
 
-def _list_tree_children(jsonl_path, line_no):
-    """Children of one record in tree mode.
+def _list_prompt_children(jsonl_path, turn_root_line):
+    """Children of a ``<prompt>`` umbrella.
 
-    Three cases, dispatched on ``rec``'s role in the structure:
-
-    * **Turn root** (user voice) — children are ``turn_direct[uuid]``,
-      i.e. the turn's flat members minus anything re-parented under a
-      tool_use call.
-    * **Assistant carrying a tool_use** — children are
-      ``tool_children[uuid]`` (matched tool_result + hook attachments)
-      plus a subagent pseudo-row if any Agent/Task tool_use in this
-      assistant has a resolvable subagent.
-    * **Everything else** — leaf, no children.
+    Returns the turn root user voice as a leaf, followed by each turn
+    member in file order. Assistant members carrying a ``tool_use`` are
+    wrapped in their own ``<tool:Name>`` umbrella (always, even if no
+    tool_result has arrived yet — the umbrella shape stays stable as
+    the transcript grows).
     """
     td = _scan_tree(jsonl_path)
-    if not (0 <= line_no < len(td.records)):
+    if not (0 <= turn_root_line < len(td.records)):
         return []
-    rec = td.records[line_no]
+    rec = td.records[turn_root_line]
     if rec is None:
         return []
-    out = []
     uuid = rec.get('uuid')
-
-    # Case 1: turn root.
-    if uuid and uuid in td.turn_direct:
-        for child in td.turn_direct[uuid]:
+    out = []
+    # 1) The turn root itself, as a leaf — visible at the top of the
+    # expansion so the user prompt content is readable at the same
+    # indent as the assistant replies that follow. Clear ``row_bg``
+    # on the leaf so the umbrella row above is the only voice stripe
+    # for this prompt — without that K/J navigation would count both
+    # rows as voice and the pulse would feel doubled.
+    leaf = _tree_item(jsonl_path, rec, td)
+    if leaf is not None:
+        leaf.row_bg = None
+        out.append(leaf)
+    # 2) Each turn member.
+    if uuid is None:
+        return out
+    for child in td.turn_direct.get(uuid, []):
+        cuuid = child.get('uuid')
+        if cuuid in td.assistant_has_tool_use:
+            cline = td.line_of.get(cuuid)
+            if cline is None:
+                continue
+            out.append(_tool_umbrella_item(jsonl_path, cline, child, td))
+        else:
             it = _tree_item(jsonl_path, child, td)
             if it is not None:
                 out.append(it)
-        return out
+    return out
 
-    # Case 2: assistant row whose tool_use(s) own paired children
-    # and/or subagent dispatches.
-    if rec.get('type') == 'assistant':
-        for child in td.tool_children.get(uuid, []):
-            it = _tree_item(jsonl_path, child, td)
-            if it is not None:
-                out.append(it)
-        msg = rec.get('message') or {}
-        if isinstance(msg, dict):
-            content = msg.get('content') or []
-            if isinstance(content, list):
-                for p in content:
-                    if (isinstance(p, dict)
-                            and p.get('type') == 'tool_use'
-                            and p.get('name') in ('Agent', 'Task')):
-                        link = td.agent_link.get(p.get('id'))
-                        if link:
-                            out.append(_subagent_pseudo_item(
-                                jsonl_path,
-                                link['agent_id'], link['agent_path'],
-                            ))
-        return out
 
-    return []
+def _list_tool_children(jsonl_path, assistant_line):
+    """Children of a ``<tool>`` umbrella.
+
+    Returns the assistant tool_use record as a leaf, then every paired
+    tool_result / hook attachment in file order, and finally a
+    ``<subagent>`` umbrella for each resolvable Agent/Task dispatch. The
+    umbrella exists even when no tool_result has arrived yet so the
+    shape is stable across in-flight transcripts.
+    """
+    td = _scan_tree(jsonl_path)
+    if not (0 <= assistant_line < len(td.records)):
+        return []
+    rec = td.records[assistant_line]
+    if rec is None:
+        return []
+    uuid = rec.get('uuid')
+    out = []
+    # 1) Assistant tool_use record as a leaf. Clear ``row_bg`` (if any)
+    # for the same reason as the prompt umbrella's first leaf: the
+    # ``<tool>`` umbrella row above is the voice stripe; doubling it
+    # on the wrapped leaf would split K/J's voice pulse.
+    leaf = _tree_item(jsonl_path, rec, td)
+    if leaf is not None:
+        leaf.row_bg = None
+        out.append(leaf)
+    # 2) Paired tool_children (tool_result, hook attachments, …).
+    for child in td.tool_children.get(uuid, []):
+        it = _tree_item(jsonl_path, child, td)
+        if it is not None:
+            out.append(it)
+    # 3) Subagent pseudo-rows for Agent/Task tool_uses with a
+    # resolvable transcript.
+    msg = rec.get('message') or {}
+    if isinstance(msg, dict):
+        content = msg.get('content') or []
+        if isinstance(content, list):
+            for p in content:
+                if (isinstance(p, dict)
+                        and p.get('type') == 'tool_use'
+                        and p.get('name') in ('Agent', 'Task')):
+                    link = td.agent_link.get(p.get('id'))
+                    if link:
+                        out.append(_subagent_pseudo_item(
+                            jsonl_path,
+                            link['agent_id'], link['agent_path'],
+                        ))
+    return out
 
 
 def _list_span_records(jsonl_path, start_line):
@@ -2593,10 +2706,12 @@ def _list_span_records(jsonl_path, start_line):
 
 
 def _tree_item(jsonl_path, rec, td):
-    """Build a list-row ``Item`` for ``rec`` in tree mode.
+    """Build a leaf list-row ``Item`` for ``rec`` in tree mode.
 
-    ``has_children`` is True iff the record is a turn root with members,
-    or an assistant row that owns tool_children / a subagent dispatch.
+    Always ``has_children=False`` — wrapping into ``<prompt>`` / ``<tool>``
+    umbrellas is the listing layer's job (``_list_prompt_children`` /
+    ``_list_tool_children``). This builder produces the leaf
+    content-row that appears **inside** an umbrella's expansion.
     """
     n = td.line_of.get(rec.get('uuid'))
     if n is None:
@@ -2607,33 +2722,13 @@ def _tree_item(jsonl_path, rec, td):
     if n is None:
         return None
     kind = _kind_of(rec)
-    uuid = rec.get('uuid')
-
-    has_children = False
-    if uuid and td.turn_direct.get(uuid):
-        has_children = True
-    elif rec.get('type') == 'assistant':
-        if td.tool_children.get(uuid):
-            has_children = True
-        else:
-            msg = rec.get('message') or {}
-            if isinstance(msg, dict):
-                content = msg.get('content') or []
-                if isinstance(content, list):
-                    for p in content:
-                        if (isinstance(p, dict)
-                                and p.get('type') == 'tool_use'
-                                and p.get('name') in ('Agent', 'Task')
-                                and p.get('id') in td.agent_link):
-                            has_children = True
-                            break
 
     item = Item(
         id=f'{jsonl_path}#{n}',
         title=_oneline(_summarise_message(rec)),
         tag=kind,
         tag_style=_TAG_STYLE_FOR_KIND.get(kind, ''),
-        has_children=has_children,
+        has_children=False,
     )
     item.kind = 'message'
     item.line_no = n
@@ -2641,6 +2736,74 @@ def _tree_item(jsonl_path, rec, td):
     item.message_kind = kind
     if _is_voice(rec):
         bg = _ROW_BG_FOR_KIND.get(kind)
+        if bg is not None:
+            item.row_bg = bg
+    return item
+
+
+def _prompt_umbrella_item(jsonl_path, turn_root_line, rec, td):
+    """``<prompt>`` umbrella wrapping one turn.
+
+    Id shape: ``<jsonl>#prompt:<turn_root_line>``. Children are the turn
+    root user voice (as a leaf) followed by every turn member, with each
+    assistant-with-tool_use member further wrapped in a ``<tool>``
+    umbrella. The umbrella's title prefix mirrors the existing
+    ``<system>`` precedent so the kind tag reads consistently across all
+    umbrella rows.
+    """
+    summary = _oneline(_summarise_message(rec))
+    uuid = rec.get('uuid')
+    members = td.turn_direct.get(uuid, []) if uuid else []
+    # Count of direct children visible when expanded: the user voice
+    # itself + each member (tool-using members collapse into one row).
+    n_replies = len(members)
+    item = Item(
+        id=f'{jsonl_path}#prompt:{turn_root_line}',
+        title=f'<prompt>  {summary}',
+        tag=f'{n_replies} replies' if n_replies else 'no reply yet',
+        tag_style='dim',
+        has_children=True,
+    )
+    item.kind = 'prompt'
+    item.line_no = turn_root_line
+    item.session_path = jsonl_path
+    item.message_kind = _kind_of(rec)
+    # Voice stripe — the umbrella visually IS the user prompt at the
+    # turn level. Matches the leaf user-msg row's stripe so the two
+    # adjacent rows read as one voice block.
+    if _is_voice(rec):
+        bg = _ROW_BG_FOR_KIND.get(item.message_kind)
+        if bg is not None:
+            item.row_bg = bg
+    return item
+
+
+def _tool_umbrella_item(jsonl_path, assistant_line, rec, td):
+    """``<tool:Name>`` umbrella wrapping one tool-execution group.
+
+    Id shape: ``<jsonl>#tool:<assistant_line>``. Children are the
+    dispatching assistant itself (leaf), the paired ``tool_result`` +
+    hook attachments, and a ``<subagent>`` umbrella for Agent/Task
+    dispatches with a resolvable subagent transcript on disk. The tool
+    name in the prefix is the **first** ``tool_use`` part's name.
+    """
+    summary = _oneline(_summarise_message(rec))
+    uuid = rec.get('uuid')
+    tool_name = td.tool_use_name_of.get(uuid, 'tool')
+    item = Item(
+        id=f'{jsonl_path}#tool:{assistant_line}',
+        title=f'<tool:{tool_name}>  {summary}',
+        tag='tool_use',
+        tag_style=_TAG_STYLE_FOR_KIND.get('tool_use', ''),
+        has_children=True,
+    )
+    item.kind = 'tool'
+    item.line_no = assistant_line
+    item.session_path = jsonl_path
+    item.message_kind = _kind_of(rec)
+    item.tool_name = tool_name
+    if _is_voice(rec):
+        bg = _ROW_BG_FOR_KIND.get(item.message_kind)
         if bg is not None:
             item.row_bg = bg
     return item
@@ -2703,7 +2866,8 @@ def _subagent_pseudo_item(parent_jsonl, agent_id, agent_path):
     )
     agent_type = meta.get('agentType') or 'agent'
     description = meta.get('description') or ''
-    title = description or f'agent {agent_id}'
+    body = description or f'agent {agent_id}'
+    title = f'<subagent>  {body}'
     try:
         st = os.stat(agent_path)
         mtime = st.st_mtime
@@ -2896,18 +3060,13 @@ def _preview_subagent(item_id):
 
 
 def _preview_message(path, n):
-    """Per-line preview: classify the record, dispatch to a renderer.
+    """Per-line preview for a leaf message: classify + dispatch + chrome.
 
     Each renderer returns a body str with ANSI inlined. The chrome
-    footer (uuid, cwd, timestamp, …) is uniform and appended here.
-
-    In tree mode the preview also appends the rendered bodies of the
-    cursor row's **direct** children (single level, no recursion) —
-    so a turn root's preview shows the user prompt + the assistant's
-    immediate reply + each tool_use line, without having to expand
-    and move the cursor. Cache invalidates on mode flip because the
-    t-toggle calls ``ctx.refresh()`` which clears the preview cursor
-    gate.
+    footer (uuid, cwd, timestamp, …) is uniform and appended here. In
+    the new umbrella tree model leaves don't have children, so the
+    preview no longer concatenates anything extra — the umbrella's own
+    preview is where multi-child concatenation lives.
     """
     obj = _read_jsonl_line(path, n)
     if obj is None:
@@ -2917,60 +3076,94 @@ def _preview_message(path, n):
     kind = _classify(obj)
     body = _RENDERERS.get(kind, _render_unknown)(obj)
     chrome = _fmt_chrome(obj)
-    out = body + ('\n' + chrome if chrome else '')
-    if _TREE_MODE:
-        kids = _tree_children_preview(path, n)
-        if kids:
-            # Blank line between the cursor row's own content and the
-            # first child's separator — the child rules are bright, the
-            # gap keeps them from running into the chrome footer.
-            out = out + '\n\n' + kids
-    return out
+    return body + ('\n' + chrome if chrome else '')
 
 
-def _tree_children_preview(path, n):
-    """Concatenated body previews of one record's direct tree children.
+def _preview_umbrella(item_id):
+    """Concatenated bodies of an umbrella row's direct children.
 
-    Single level — no recursion into grandchildren. Each child's body
-    is preceded by a **bright yellow** ``── kind ──`` rule so the
-    boundaries between the cursor row's own content and each appended
-    child stand out (other rules in the preview — chrome footer,
-    thinking separator, usage block — stay muted). Subagent pseudo-rows
-    render as a compact header (type + description) rather than the
-    full subagent transcript.
+    Single level — no recursion into grandchildren. Each child body is
+    preceded by a **bright yellow** ``── kind ──`` rule so the
+    boundaries are visible (other rules elsewhere in the preview —
+    chrome footer, thinking separator, usage block — stay muted).
+    Subagent pseudo-rows render as a compact header (type + description)
+    rather than the full subagent transcript.
+
+    Handles ``<prompt>``, ``<tool>``, and ``<system>`` (span) ids
+    uniformly by dispatching through ``get_children`` and rendering
+    each returned ``Item``'s underlying record.
     """
-    if not isinstance(path, str) or not os.path.isfile(path):
-        return ''
-    children = _list_tree_children(path, n)
+    children = get_children(item_id)
     if not children:
         return ''
     parts = []
     for child in children:
-        cid = child.id
-        if '#agent:' in cid:
-            parts.append(
-                _rule(f'subagent: {child.agent_type or "agent"}', YELLOW)
-                + '\n'
-                + (child.agent_description
-                   or f'agent {getattr(child, "agent_id", "")}')
-            )
-            continue
-        if '#' not in cid:
-            continue
-        cpath, _, lineno = cid.rpartition('#')
-        try:
-            cn = int(lineno)
-        except ValueError:
-            continue
-        cobj = _read_jsonl_line(cpath, cn)
-        if cobj is None or not isinstance(cobj, dict) or '__raw__' in cobj:
-            continue
-        ckind = _classify(cobj)
-        cbody = _RENDERERS.get(ckind, _render_unknown)(cobj)
-        parts.append(_rule(ckind, YELLOW) + '\n' + cbody)
-    # Blank line between adjacent children too — the bright rules
-    # then look like real section breaks rather than wall-of-text dividers.
+        rendered = _render_child_preview_body(child)
+        if rendered is not None:
+            parts.append(rendered)
     return '\n\n'.join(parts)
+
+
+def _render_child_preview_body(child):
+    """Render one umbrella-child Item's preview body with a leading rule.
+
+    Returns None if the child can't be rendered (orphan id, missing
+    file, etc.). The leading rule is bright yellow so it stands out
+    from any rules inside individual record bodies.
+    """
+    cid = child.id
+    if not isinstance(cid, str):
+        return None
+    # Subagent group: compact header, not the full transcript.
+    if '#agent:' in cid:
+        agent_type = getattr(child, 'agent_type', None) or 'agent'
+        agent_desc = (getattr(child, 'agent_description', None)
+                      or f'agent {getattr(child, "agent_id", "")}')
+        return (_rule(f'subagent: {agent_type}', YELLOW)
+                + '\n' + agent_desc)
+    # Nested umbrellas inside an umbrella (e.g. a <tool> child of a
+    # <prompt>): render the underlying record body so the preview
+    # reads as a flat dump of every tool-use line + reply.
+    if '#prompt:' in cid:
+        path, _, suffix = cid.partition('#prompt:')
+        n = _parse_int(suffix)
+        if n is None:
+            return None
+        return _render_record_with_rule(path, n)
+    if '#tool:' in cid:
+        path, _, suffix = cid.partition('#tool:')
+        n = _parse_int(suffix)
+        if n is None:
+            return None
+        return _render_record_with_rule(path, n)
+    if '#span:' in cid:
+        # Span-inside-umbrella is rare; fall through to a tiny stub.
+        return _rule('system', YELLOW) + '\n' + child.title
+    if '#' not in cid:
+        return None
+    cpath, _, lineno = cid.rpartition('#')
+    n = _parse_int(lineno)
+    if n is None:
+        return None
+    return _render_record_with_rule(cpath, n)
+
+
+def _render_record_with_rule(path, n):
+    """Read one record, render its body, prefix with a bright-yellow rule."""
+    obj = _read_jsonl_line(path, n)
+    if obj is None or not isinstance(obj, dict) or '__raw__' in obj:
+        return None
+    kind = _classify(obj)
+    body = _RENDERERS.get(kind, _render_unknown)(obj)
+    return _rule(kind, YELLOW) + '\n' + body
+
+
+def _parse_int(s):
+    """Tolerant int parser; returns None on failure."""
+    try:
+        return int(s)
+    except (TypeError, ValueError):
+        return None
 
 
 # ---- actions -------------------------------------------------------------
@@ -3169,99 +3362,26 @@ def _action_prev_voice(ctx):
 
 
 def _latest_voice_among_children(item_id):
-    """Latest voice record id among the **direct** children of ``item_id``.
+    """Latest voice id among the **direct** children of ``item_id``.
 
-    Single-level: returns the id of the latest-by-file-position voice
-    record that would become visible if ``item_id`` were expanded.
-    Does NOT recurse into grandchildren — that's the user's job (press
-    Right again to drill deeper). Returns ``None`` if there is no voice
-    at this level, or the id doesn't resolve.
+    Single-level: returns the id of the latest (last-in-listing-order)
+    voice row that would become visible if ``item_id`` were expanded.
+    Does NOT recurse into grandchildren. Returns ``None`` if there is
+    no voice at this level, or the id doesn't resolve.
 
-    Cases handled, in id-shape order:
-
-      * bare ``.jsonl`` path (session row): the latest **turn root**
-        (turn roots are themselves user-voice rows).
-      * ``<jsonl>#span:<n>``: latest voice among the span's records.
-      * ``<jsonl>#agent:<id>``: latest turn root in the subagent's file.
-      * ``<jsonl>#<n>`` resolving to a turn root: latest voice in
-        ``turn_direct[uuid]``.
-      * ``<jsonl>#<n>`` resolving to an assistant with tool_use children:
-        latest voice in ``tool_children[uuid]``.
+    Implemented in terms of ``get_children`` so the umbrella structure
+    is honoured uniformly — ``<prompt>`` umbrellas advertise themselves
+    as voice via ``row_bg``, ``<tool>`` umbrellas only do so if the
+    assistant has text content, regular leaf voice rows match too.
     """
     if not isinstance(item_id, str):
         return None
-
-    # Bare jsonl path — direct children are the file's roots. Pick the
-    # latest turn root (span umbrellas aren't voice).
-    if (item_id.endswith('.jsonl')
-            and os.path.isfile(item_id)
-            and '#' not in item_id):
-        td = _scan_tree(item_id)
-        latest_line = None
-        for entry in td.roots_in_order:
-            if entry['kind'] == 'turn' and _is_voice(entry['rec']):
-                latest_line = entry['line']
-        return f'{item_id}#{latest_line}' if latest_line is not None else None
-
-    # Span umbrella: latest voice among its records.
-    if '#span:' in item_id:
-        path, _, suffix = item_id.partition('#span:')
-        try:
-            start = int(suffix)
-        except ValueError:
-            return None
-        if not os.path.isfile(path):
-            return None
-        td = _scan_tree(path)
-        latest_line = None
-        for r in td.span_records.get(start, []):
-            if _is_voice(r):
-                line = td.records_line.get(id(r))
-                if line is not None:
-                    latest_line = line
-        return f'{path}#{latest_line}' if latest_line is not None else None
-
-    # Subagent group: latest turn root in its own jsonl.
-    if '#agent:' in item_id:
-        path, _, suffix = item_id.partition('#agent:')
-        sub_dir = _subagents_dir(path)
-        agent_path = os.path.join(sub_dir, f'agent-{suffix}.jsonl')
-        if not os.path.isfile(agent_path):
-            return None
-        return _latest_voice_among_children(agent_path)
-
-    # Regular message id — turn root or tool-owning assistant.
-    if '#' not in item_id:
-        return None
-    path, _, lineno = item_id.rpartition('#')
-    try:
-        n = int(lineno)
-    except ValueError:
-        return None
-    if not os.path.isfile(path):
-        return None
-    td = _scan_tree(path)
-    if not (0 <= n < len(td.records)):
-        return None
-    rec = td.records[n]
-    if rec is None:
-        return None
-    uuid = rec.get('uuid')
-
-    if uuid in td.turn_direct:
-        children = td.turn_direct[uuid]
-    elif uuid in td.tool_children:
-        children = td.tool_children[uuid]
-    else:
-        return None
-
+    children = get_children(item_id)
     latest = None
-    for c in children:
-        if _is_voice(c):
-            line = td.records_line.get(id(c))
-            if line is not None:
-                latest = line
-    return f'{path}#{latest}' if latest is not None else None
+    for it in children:
+        if getattr(it, 'row_bg', None) is not None:
+            latest = it.id
+    return latest
 
 
 def _outer_subagent_group_id(path):
@@ -3298,24 +3418,21 @@ def _outer_subagent_group_id(path):
 def _ancestor_ids_for(item_id):
     """Return ids of every ancestor of ``item_id`` (root → direct parent).
 
-    Walks the **tree** parent map built in ``_scan_tree``, not the on-
-    disk ``parentUuid`` chain. The on-disk chain is a write-time linked
-    list (see ``sessionStorage.ts:1066``) that has nothing to do with
-    the displayed tree shape.
+    Walks the tree built in ``_scan_tree``. Every leaf in the displayed
+    tree is wrapped in at least one umbrella (``<prompt>`` / ``<tool>``
+    / ``<system>``), so the chain consists exclusively of umbrella ids
+    and subagent-group ids — never of raw message ids.
 
     Crosses file boundaries:
 
-      * For records inside a subagent's ``.jsonl``, the chain continues
-        into the OUTER session's tree — first up to the
+      * Records inside a subagent's ``.jsonl`` walk up through their
+        in-file umbrellas, then across to the
         ``<parent_session_path>#agent:<aid>`` subagent group row, then
-        further into that group's own ancestors (the assistant whose
-        ``Task`` tool_use dispatched the subagent, and that assistant's
-        turn root, and the parent session itself).
-      * Span umbrellas inside a subagent are top-level there, but still
-        sit under the outer subagent group — same prepend rule.
-      * Agent group ids are top-level inside the parent session but
-        nest under the dispatching assistant in tree mode — the ``Task``
-        tool_use's owning assistant row is their parent.
+        further into that group's own ancestors (its dispatching
+        ``<tool:Task>`` umbrella and that umbrella's containing
+        ``<prompt>``).
+      * Top-level umbrellas inside a subagent jsonl still nest under
+        the outer subagent group — same prepend rule.
 
     Without this full walk a t-toggle from inside a subagent (where
     refresh wiped the cached children) can't reach the outer chain,
@@ -3325,27 +3442,47 @@ def _ancestor_ids_for(item_id):
     if not isinstance(item_id, str) or '#' not in item_id:
         return []
 
-    # Agent group row: parent is the assistant that dispatched it.
+    # Subagent group: parent is the ``<tool:Task>`` umbrella in the
+    # outer session (the assistant that dispatched is wrapped in its
+    # own tool umbrella in the new model).
     if '#agent:' in item_id:
         parent_session_path, _, aid = item_id.partition('#agent:')
         if not os.path.isfile(parent_session_path):
             return []
         ptd = _scan_tree(parent_session_path)
-        asst_uuid = None
-        for link in ptd.agent_link.values():
-            if link.get('agent_id') == aid:
-                asst_uuid = link.get('assistant_uuid')
-                break
-        if asst_uuid is None:
+        asst_line = ptd.agent_to_assistant_line.get(aid)
+        if asst_line is None:
             return []
-        line = ptd.line_of.get(asst_uuid)
-        if line is None:
-            return []
-        parent_id = f'{parent_session_path}#{line}'
+        parent_id = f'{parent_session_path}#tool:{asst_line}'
         return _ancestor_ids_for(parent_id) + [parent_id]
 
-    # Span umbrella: top-level inside its file, but if that file is a
-    # subagent jsonl, prepend the outer subagent group's chain.
+    # ``<tool>`` umbrella: parent is the containing ``<prompt>``.
+    if '#tool:' in item_id:
+        path, _, suffix = item_id.partition('#tool:')
+        n = _parse_int(suffix)
+        if n is None or not os.path.isfile(path):
+            return []
+        td = _scan_tree(path)
+        turn_line = td.tool_to_turn_root_line.get(n)
+        if turn_line is None:
+            # Orphan tool umbrella (shouldn't happen in practice).
+            outer = _outer_subagent_group_id(path)
+            return (_ancestor_ids_for(outer) + [outer]
+                    if outer is not None else [])
+        parent_id = f'{path}#prompt:{turn_line}'
+        return _ancestor_ids_for(parent_id) + [parent_id]
+
+    # ``<prompt>`` umbrella: top-level in its file, but cross to outer
+    # subagent chain if the file is a subagent jsonl.
+    if '#prompt:' in item_id:
+        path, _, _ = item_id.partition('#prompt:')
+        outer = _outer_subagent_group_id(path)
+        if outer is None:
+            return []
+        return _ancestor_ids_for(outer) + [outer]
+
+    # ``<system>`` span umbrella: same shape as ``<prompt>`` — top-level
+    # in its file, unless the file is a subagent jsonl.
     if '#span:' in item_id:
         path, _, _ = item_id.partition('#span:')
         outer = _outer_subagent_group_id(path)
@@ -3353,55 +3490,21 @@ def _ancestor_ids_for(item_id):
             return []
         return _ancestor_ids_for(outer) + [outer]
 
-    # Regular message id: walk parent_id_of within its own file.
+    # Regular message id (leaf): look up its parent umbrella, then walk
+    # up from there.
     path, _, lineno = item_id.rpartition('#')
-    try:
-        n = int(lineno)
-    except ValueError:
-        return []
-    if not os.path.isfile(path):
+    n = _parse_int(lineno)
+    if n is None or not os.path.isfile(path):
         return []
     td = _scan_tree(path)
-    chain_child_first = []
-    seen = set()
-    cur = n
-    while cur in td.parent_id_of:
-        parent_id = td.parent_id_of[cur]
-        if parent_id in seen:
-            break
-        seen.add(parent_id)
-        chain_child_first.append(parent_id)
-        if '#span:' in parent_id or '#agent:' in parent_id:
-            break
-        _, _, parent_line = parent_id.rpartition('#')
-        try:
-            cur = int(parent_line)
-        except ValueError:
-            break
-    chain = list(reversed(chain_child_first))
-
-    if chain:
-        top = chain[0]
-        if '#span:' in top or '#agent:' in top:
-            # Top jumps to a synthetic row (span umbrella / agent
-            # group) — recurse to walk that row's own ancestors,
-            # which may cross a file boundary.
-            chain = _ancestor_ids_for(top) + chain
-        else:
-            # Top is a regular message in the same file. If this file
-            # is a subagent jsonl, the topmost in-file row still nests
-            # under the outer subagent group — prepend that chain.
-            outer = _outer_subagent_group_id(path)
-            if outer is not None:
-                chain = _ancestor_ids_for(outer) + [outer] + chain
-    else:
-        # Record is itself a top-level row within its file (turn root
-        # / standalone meta). If the file is a subagent, prepend the
-        # outer subagent group's chain.
+    parent_id = td.parent_id_of.get(n)
+    if parent_id is None:
+        # Orphan leaf — likely a top-level metadata record that the
+        # scan didn't wrap in a span. Still cross to outer subagent.
         outer = _outer_subagent_group_id(path)
-        if outer is not None:
-            chain = _ancestor_ids_for(outer) + [outer]
-    return chain
+        return (_ancestor_ids_for(outer) + [outer]
+                if outer is not None else [])
+    return _ancestor_ids_for(parent_id) + [parent_id]
 
 
 def _chain_expand_then_cursor(b, ancestor_ids, target_id):

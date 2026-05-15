@@ -1082,7 +1082,7 @@ class TestMessageOrderReverse(unittest.TestCase):
 
 
 class TestTreeChildrenPreview(unittest.TestCase):
-    """``_preview_message`` in tree mode appends direct-children bodies."""
+    """``_preview_umbrella`` concatenates direct-children bodies."""
 
     @classmethod
     def setUpClass(cls):
@@ -1097,7 +1097,9 @@ class TestTreeChildrenPreview(unittest.TestCase):
         f.close()
         return f.name
 
-    def test_turn_root_preview_includes_children(self):
+    def test_prompt_umbrella_preview_includes_user_and_reply(self):
+        # ``<prompt>`` umbrella preview = concat of [user voice leaf,
+        # assistant reply leaf].
         path = self._write_jsonl([
             {'type': 'user', 'uuid': 'u1',
              'message': {'role': 'user',
@@ -1111,25 +1113,24 @@ class TestTreeChildrenPreview(unittest.TestCase):
             saved = self.r._TREE_MODE
             try:
                 self.r._TREE_MODE = True
-                out = self.r._preview_message(path, 0)   # turn root
-                # Own body: the user prompt.
+                out = self.r._preview_umbrella(f'{path}#prompt:0')
                 self.assertIn('PROBE_USER_PROMPT', out)
-                # Direct child's body: the assistant reply.
                 self.assertIn('PROBE_ASST_REPLY', out)
-                # Without tree mode: only the user prompt.
-                self.r._TREE_MODE = False
-                flat = self.r._preview_message(path, 0)
-                self.assertIn('PROBE_USER_PROMPT', flat)
-                self.assertNotIn('PROBE_ASST_REPLY', flat)
+                # Leaf preview: just the user prompt body (no children).
+                leaf = self.r._preview_message(path, 0)
+                self.assertIn('PROBE_USER_PROMPT', leaf)
+                self.assertNotIn('PROBE_ASST_REPLY', leaf)
             finally:
                 self.r._TREE_MODE = saved
         finally:
             os.unlink(path)
 
-    def test_children_preview_is_single_level_no_recursion(self):
+    def test_prompt_umbrella_preview_is_single_level_no_recursion(self):
         # Turn root → assistant tool_use → user tool_result.
-        # In tree mode, the turn root preview should show the assistant
-        # but NOT the deeper tool_result (that's the grandchild).
+        # The ``<prompt>`` umbrella's preview should show the user
+        # prompt + the ``<tool>``-umbrella child's own body (i.e. the
+        # assistant tool_use line), but NOT the deeper tool_result
+        # (which lives inside the ``<tool>`` umbrella).
         path = self._write_jsonl([
             {'type': 'user', 'uuid': 'u1',
              'message': {'role': 'user', 'content': 'PROBE_PROMPT'}},
@@ -1148,10 +1149,39 @@ class TestTreeChildrenPreview(unittest.TestCase):
             saved = self.r._TREE_MODE
             try:
                 self.r._TREE_MODE = True
-                out = self.r._preview_message(path, 0)
+                out = self.r._preview_umbrella(f'{path}#prompt:0')
                 self.assertIn('PROBE_PROMPT', out)
-                self.assertIn('PROBE_BASH_CMD', out)  # direct child
+                self.assertIn('PROBE_BASH_CMD', out)
                 self.assertNotIn('PROBE_BASH_OUTPUT', out)  # grandchild
+            finally:
+                self.r._TREE_MODE = saved
+        finally:
+            os.unlink(path)
+
+    def test_tool_umbrella_preview_includes_assistant_and_result(self):
+        # ``<tool>`` umbrella preview = concat of [assistant tool_use
+        # leaf, tool_result leaf].
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'go'}},
+            {'type': 'assistant', 'uuid': 'a1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 't1', 'name': 'Bash',
+                  'input': {'command': 'PROBE_BASH_CMD'}},
+             ]}},
+            {'type': 'user', 'uuid': 'u2',
+             'message': {'role': 'user', 'content': [
+                 {'type': 'tool_result', 'tool_use_id': 't1',
+                  'content': 'PROBE_BASH_OUTPUT'},
+             ]}},
+        ])
+        try:
+            saved = self.r._TREE_MODE
+            try:
+                self.r._TREE_MODE = True
+                out = self.r._preview_umbrella(f'{path}#tool:1')
+                self.assertIn('PROBE_BASH_CMD', out)
+                self.assertIn('PROBE_BASH_OUTPUT', out)
             finally:
                 self.r._TREE_MODE = saved
         finally:
@@ -1199,8 +1229,9 @@ class TestAncestorIdsForSubagent(unittest.TestCase):
                             'expected at least one ancestor')
             self.assertEqual(ancestors[0],
                              f'{sess_path}#agent:AGENT01')
-            # Direct parent should be the turn root inside the subagent.
-            self.assertEqual(ancestors[-1], f'{agent_path}#0')
+            # Direct parent is now the ``<prompt>`` umbrella wrapping
+            # the subagent's turn root, NOT the turn root leaf itself.
+            self.assertEqual(ancestors[-1], f'{agent_path}#prompt:0')
         finally:
             import shutil
             shutil.rmtree(tmp, ignore_errors=True)
@@ -1222,17 +1253,18 @@ class TestAncestorIdsForSubagent(unittest.TestCase):
                     ]},
                 }) + '\n')
             ancestors = self.r._ancestor_ids_for(f'{sess_path}#1')
-            # Direct parent is the turn root; no outer subagent group.
-            self.assertEqual(ancestors, [f'{sess_path}#0'])
+            # Direct parent is the ``<prompt>`` umbrella; no outer
+            # subagent group.
+            self.assertEqual(ancestors, [f'{sess_path}#prompt:0'])
 
     def test_full_chain_crosses_file_boundary(self):
         # Parent session: u1 (turn root) → a1 (Task tool_use) → u2 (tool_result).
         # Subagent: su1 (turn root) → sa1 (assistant text).
         # Ancestors of sa1 (deepest, line 1 in subagent) should walk:
-        #   parent: ... → turn root (u1, line 0 of parent)
-        #          → assistant a1 (line 1 of parent, dispatcher)
-        #          → subagent group (#agent:AGENT01)
-        #          → su1 (line 0 of subagent, turn root inside)
+        #   parent: <prompt> umbrella @ line 0 (wraps u1)
+        #          → <tool:Task> umbrella @ line 1 (wraps a1)
+        #          → <subagent> group (#agent:AGENT01)
+        #          → <prompt> umbrella @ line 0 of subagent (wraps su1)
         #   → sa1 itself (target, not included)
         import json as _json
         import tempfile
@@ -1278,16 +1310,16 @@ class TestAncestorIdsForSubagent(unittest.TestCase):
                 }) + '\n')
 
             chain = self.r._ancestor_ids_for(f'{agent_path}#1')
-            # Expect (root → leaf):
-            #   parent's turn root (u1 at line 0)
-            #   parent's assistant a1 at line 1 (Task dispatcher)
+            # Expect (root → leaf), all umbrella ids:
+            #   parent's <prompt> umbrella (line 0, wraps u1)
+            #   parent's <tool:Task> umbrella (line 1, wraps a1)
             #   subagent group #agent:AGENT01
-            #   subagent's turn root (su1 at line 0)
+            #   subagent's <prompt> umbrella (line 0, wraps su1)
             self.assertEqual(chain, [
-                f'{sess_path}#0',
-                f'{sess_path}#1',
+                f'{sess_path}#prompt:0',
+                f'{sess_path}#tool:1',
                 f'{sess_path}#agent:AGENT01',
-                f'{agent_path}#0',
+                f'{agent_path}#prompt:0',
             ])
         finally:
             import shutil
@@ -1710,7 +1742,8 @@ class TestScanTree(unittest.TestCase):
 
 
 class TestTreeListings(unittest.TestCase):
-    """Tree-mode get_children / _list_tree_roots / _list_tree_children."""
+    """Tree-mode listings: _list_tree_roots / _list_prompt_children /
+    _list_tool_children / _list_span_records / get_children dispatch."""
 
     @classmethod
     def setUpClass(cls):
@@ -1728,7 +1761,7 @@ class TestTreeListings(unittest.TestCase):
 
     def test_session_roots_wraps_metadata_in_span(self):
         # permission-mode (preamble) + u1 (turn) + u2 (next turn) →
-        # three roots: span, turn, turn.
+        # three roots: span umbrella, prompt umbrella, prompt umbrella.
         path = self._write_jsonl([
             {'type': 'permission-mode', 'permissionMode': 'plan'},
             {'type': 'user', 'uuid': 'u1',
@@ -1746,18 +1779,22 @@ class TestTreeListings(unittest.TestCase):
             # Preamble span umbrella.
             self.assertEqual(roots[0].kind, 'span')
             self.assertEqual(roots[0].id, f'{path}#span:0')
-            # u1 turn root.
-            self.assertEqual(roots[1].kind, 'message')
+            # u1 prompt umbrella (line 1).
+            self.assertEqual(roots[1].kind, 'prompt')
             self.assertEqual(roots[1].line_no, 1)
-            # u2 turn root.
-            self.assertEqual(roots[2].kind, 'message')
+            self.assertEqual(roots[1].id, f'{path}#prompt:1')
+            self.assertTrue(roots[1].title.startswith('<prompt>'))
+            # u2 prompt umbrella (line 3).
+            self.assertEqual(roots[2].kind, 'prompt')
             self.assertEqual(roots[2].line_no, 3)
+            self.assertEqual(roots[2].id, f'{path}#prompt:3')
         finally:
             os.unlink(path)
 
     def test_drill_into_turn_root_pairs_tool_result(self):
         # u1 → a1 (tool_use) → u2 (tool_result) → a2 (text).
-        # u1's direct children: a1, a2. u2 is paired under a1.
+        # <prompt:0> children = [u1 leaf, <tool:1> umbrella, a2 leaf].
+        # <tool:1> children = [a1 leaf, u2 leaf].
         path = self._write_jsonl([
             {'type': 'user', 'uuid': 'u1',
              'message': {'role': 'user', 'content': 'go'}},
@@ -1777,15 +1814,28 @@ class TestTreeListings(unittest.TestCase):
              ]}},
         ])
         try:
-            # u1's children: [a1, a2] (a1 is line 1, a2 is line 3).
-            kids = self.r._list_tree_children(path, 0)
-            self.assertEqual([it.line_no for it in kids], [1, 3])
-            # a1's tool-execution children: [u2].
-            tool_kids = self.r._list_tree_children(path, 1)
-            self.assertEqual([it.line_no for it in tool_kids], [2])
-            # u2 and a2 are leaves.
-            self.assertEqual(self.r._list_tree_children(path, 2), [])
-            self.assertEqual(self.r._list_tree_children(path, 3), [])
+            prompt_kids = self.r._list_prompt_children(path, 0)
+            # [u1 leaf @ line 0, <tool:1> umbrella, a2 leaf @ line 3].
+            self.assertEqual(len(prompt_kids), 3)
+            self.assertEqual(prompt_kids[0].id, f'{path}#0')
+            self.assertEqual(prompt_kids[0].kind, 'message')
+            self.assertEqual(prompt_kids[1].id, f'{path}#tool:1')
+            self.assertEqual(prompt_kids[1].kind, 'tool')
+            self.assertEqual(prompt_kids[2].id, f'{path}#3')
+            self.assertEqual(prompt_kids[2].kind, 'message')
+            # <tool:1>'s children = [a1 leaf, u2 leaf].
+            tool_kids = self.r._list_tool_children(path, 1)
+            self.assertEqual([it.id for it in tool_kids],
+                             [f'{path}#1', f'{path}#2'])
+            # Leaves have no children in tree-mode get_children.
+            saved = self.r._TREE_MODE
+            try:
+                self.r._TREE_MODE = True
+                self.assertEqual(self.r.get_children(f'{path}#0'), [])
+                self.assertEqual(self.r.get_children(f'{path}#2'), [])
+                self.assertEqual(self.r.get_children(f'{path}#3'), [])
+            finally:
+                self.r._TREE_MODE = saved
         finally:
             os.unlink(path)
 
@@ -1819,10 +1869,13 @@ class TestTreeListings(unittest.TestCase):
         ])
         try:
             roots = self.r._list_tree_roots(path)
-            self.assertEqual([it.line_no for it in roots], [0, 2])
-            # u1's direct child is a1 (no other voices in this turn).
-            kids = self.r._list_tree_children(path, 0)
-            self.assertEqual([it.line_no for it in kids], [1])
+            # Two ``<prompt>`` umbrellas; both have kind='prompt'.
+            self.assertEqual([(it.kind, it.line_no) for it in roots],
+                             [('prompt', 0), ('prompt', 2)])
+            # u1's prompt umbrella exposes [u1 leaf, a1 leaf].
+            kids = self.r._list_prompt_children(path, 0)
+            self.assertEqual([it.id for it in kids],
+                             [f'{path}#0', f'{path}#1'])
         finally:
             os.unlink(path)
 
@@ -1871,21 +1924,29 @@ class TestTreeListings(unittest.TestCase):
                 _json.dump({'agentType': 'Explore',
                             'description': 'probe stuff'}, f)
 
-            kids = self.r._list_tree_children(sess_path, 1)  # assistant @ line 1
-            # Two children: the tool_result (paired via tool_use_id) and
-            # the subagent pseudo-row (via agent_link).
-            self.assertEqual(len(kids), 2)
-            kinds = [k.kind for k in kids]
-            self.assertIn('message', kinds)    # tool_result
-            self.assertIn('subagent', kinds)
-            sub = next(k for k in kids if k.kind == 'subagent')
-            self.assertEqual(sub.agent_id, 'AGENT01')
-            self.assertEqual(sub.id, f'{sess_path}#agent:AGENT01')
-            # And the assistant row itself reports has_children=True.
+            # ``<tool:1>`` umbrella children = [a1 leaf, u2 tool_result
+            # leaf, <subagent> umbrella].
+            kids = self.r._list_tool_children(sess_path, 1)
+            self.assertEqual(len(kids), 3)
+            self.assertEqual(kids[0].id, f'{sess_path}#1')
+            self.assertEqual(kids[0].kind, 'message')
+            self.assertEqual(kids[1].id, f'{sess_path}#2')
+            self.assertEqual(kids[1].kind, 'message')   # tool_result
+            self.assertEqual(kids[2].kind, 'subagent')
+            self.assertEqual(kids[2].agent_id, 'AGENT01')
+            self.assertEqual(kids[2].id,
+                             f'{sess_path}#agent:AGENT01')
+            # The assistant record itself is a leaf in tree mode now.
             td = self.r._scan_tree(sess_path)
             asst_item = self.r._tree_item(sess_path,
                                           td.records[1], td)
-            self.assertTrue(asst_item.has_children)
+            self.assertFalse(asst_item.has_children)
+            # But the <tool> umbrella wrapping it does have children.
+            tool_item = self.r._tool_umbrella_item(
+                sess_path, 1, td.records[1], td,
+            )
+            self.assertTrue(tool_item.has_children)
+            self.assertEqual(tool_item.id, f'{sess_path}#tool:1')
         finally:
             import shutil
             shutil.rmtree(tmp, ignore_errors=True)
@@ -1904,17 +1965,21 @@ class TestTreeListings(unittest.TestCase):
         try:
             saved = self.r._TREE_MODE
             try:
-                # Tree mode: session jsonl → root-level rows (one turn root).
+                # Tree mode: session jsonl → root-level rows (one
+                # ``<prompt>`` umbrella).
                 self.r._TREE_MODE = True
                 roots = self.r.get_children(path)
                 self.assertEqual(len(roots), 1)
-                self.assertEqual(roots[0].kind, 'message')
+                self.assertEqual(roots[0].kind, 'prompt')
                 self.assertEqual(roots[0].line_no, 0)   # u1
-                # Turn root's children → [a1].
-                kids = self.r.get_children(f'{path}#0')
-                self.assertEqual([it.line_no for it in kids], [1])
-                # a1 is a leaf (no tool_use parts in this fixture).
+                self.assertEqual(roots[0].id, f'{path}#prompt:0')
+                # Prompt umbrella's children → [u1 leaf, a1 leaf].
+                kids = self.r.get_children(f'{path}#prompt:0')
+                self.assertEqual([it.id for it in kids],
+                                 [f'{path}#0', f'{path}#1'])
+                # Regular message ids are leaves in tree mode.
                 self.assertEqual(self.r.get_children(f'{path}#1'), [])
+                self.assertEqual(self.r.get_children(f'{path}#0'), [])
 
                 # Flat mode: session jsonl → messages newest-first list.
                 self.r._TREE_MODE = False
@@ -1925,6 +1990,182 @@ class TestTreeListings(unittest.TestCase):
                 self.assertEqual(self.r.get_children(f'{path}#0'), [])
             finally:
                 self.r._TREE_MODE = saved
+        finally:
+            os.unlink(path)
+
+
+class TestUmbrellaShapes(unittest.TestCase):
+    """``<prompt>``, ``<tool>``, ``<subagent>``, ``<system>`` umbrellas."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _write_jsonl(self, records):
+        import json as _json
+        import tempfile
+        f = tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False)
+        for r in records:
+            f.write(_json.dumps(r) + '\n')
+        f.close()
+        return f.name
+
+    def test_prompt_umbrella_title_prefix_and_id(self):
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'hello world'}},
+        ])
+        try:
+            roots = self.r._list_tree_roots(path)
+            self.assertEqual(len(roots), 1)
+            it = roots[0]
+            self.assertEqual(it.kind, 'prompt')
+            self.assertEqual(it.id, f'{path}#prompt:0')
+            self.assertTrue(it.title.startswith('<prompt>'))
+            self.assertIn('hello world', it.title)
+        finally:
+            os.unlink(path)
+
+    def test_tool_umbrella_title_includes_tool_name(self):
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'go'}},
+            {'type': 'assistant', 'uuid': 'a1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 't1', 'name': 'Bash',
+                  'input': {'command': 'ls'}},
+             ]}},
+        ])
+        try:
+            kids = self.r._list_prompt_children(path, 0)
+            # Children: [u1 leaf, <tool:Bash> umbrella].
+            self.assertEqual(len(kids), 2)
+            tool = kids[1]
+            self.assertEqual(tool.kind, 'tool')
+            self.assertEqual(tool.id, f'{path}#tool:1')
+            self.assertEqual(tool.tool_name, 'Bash')
+            self.assertTrue(tool.title.startswith('<tool:Bash>'))
+        finally:
+            os.unlink(path)
+
+    def test_subagent_umbrella_title_prefix(self):
+        # Subagent pseudo-item carries the ``<subagent>`` prefix.
+        import json as _json
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix='sa-umb-')
+        try:
+            sess = os.path.join(tmp, 'parent.jsonl')
+            with open(sess, 'w') as f:
+                f.write('{}\n')
+            sub_dir = os.path.join(tmp, 'parent', 'subagents')
+            os.makedirs(sub_dir)
+            agent = os.path.join(sub_dir, 'agent-A1.jsonl')
+            with open(agent, 'w') as f:
+                f.write('{}\n')
+            with open(os.path.join(sub_dir,
+                                   'agent-A1.meta.json'), 'w') as f:
+                _json.dump({'agentType': 'Explore',
+                            'description': 'do stuff'}, f)
+            item = self.r._subagent_pseudo_item(sess, 'A1', agent)
+            self.assertTrue(item.title.startswith('<subagent>'))
+            self.assertIn('do stuff', item.title)
+            self.assertEqual(item.id, f'{sess}#agent:A1')
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_singleton_turn_still_gets_prompt_umbrella(self):
+        # A user-only turn with no assistant reply still wraps in
+        # ``<prompt>``.
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'lonely'}},
+        ])
+        try:
+            roots = self.r._list_tree_roots(path)
+            self.assertEqual(len(roots), 1)
+            self.assertEqual(roots[0].kind, 'prompt')
+            kids = self.r._list_prompt_children(path, 0)
+            self.assertEqual(len(kids), 1)
+            self.assertEqual(kids[0].id, f'{path}#0')
+        finally:
+            os.unlink(path)
+
+    def test_singleton_tool_without_result_still_wraps(self):
+        # Assistant with tool_use but no paired tool_result yet still
+        # gets a ``<tool>`` umbrella; its only child is the assistant
+        # itself.
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'go'}},
+            {'type': 'assistant', 'uuid': 'a1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 't1', 'name': 'Read',
+                  'input': {'file_path': '/x'}},
+             ]}},
+        ])
+        try:
+            kids = self.r._list_prompt_children(path, 0)
+            tool = kids[1]
+            self.assertEqual(tool.kind, 'tool')
+            tool_kids = self.r._list_tool_children(path, 1)
+            self.assertEqual(len(tool_kids), 1)
+            self.assertEqual(tool_kids[0].id, f'{path}#1')
+        finally:
+            os.unlink(path)
+
+    def test_wrapped_leaf_drops_row_bg_to_avoid_doubled_pulse(self):
+        # The first leaf inside ``<prompt>`` and ``<tool>`` umbrellas
+        # should have row_bg cleared so K/J doesn't count two adjacent
+        # voice rows.
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'hello'}},
+            {'type': 'assistant', 'uuid': 'a1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'text', 'text': 'mixed'},
+                 {'type': 'tool_use', 'id': 't1', 'name': 'Bash',
+                  'input': {'command': 'ls'}},
+             ]}},
+        ])
+        try:
+            roots = self.r._list_tree_roots(path)
+            prompt = roots[0]
+            self.assertEqual(prompt.row_bg, 235)   # user-voice bg
+            kids = self.r._list_prompt_children(path, 0)
+            user_leaf = kids[0]
+            self.assertIsNone(getattr(user_leaf, 'row_bg', None))
+            tool = kids[1]
+            # Assistant has both text and tool_use → it's voice.
+            self.assertEqual(tool.row_bg, 17)
+            tool_kids = self.r._list_tool_children(path, 1)
+            asst_leaf = tool_kids[0]
+            self.assertIsNone(getattr(asst_leaf, 'row_bg', None))
+        finally:
+            os.unlink(path)
+
+    def test_ancestor_chain_walks_through_umbrellas(self):
+        # Tool_result u2 @ line 2 → <tool:1> → <prompt:0>.
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'go'}},
+            {'type': 'assistant', 'uuid': 'a1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 't1', 'name': 'Bash',
+                  'input': {'command': 'ls'}},
+             ]}},
+            {'type': 'user', 'uuid': 'u2',
+             'message': {'role': 'user', 'content': [
+                 {'type': 'tool_result', 'tool_use_id': 't1',
+                  'content': 'ok'},
+             ]}},
+        ])
+        try:
+            chain = self.r._ancestor_ids_for(f'{path}#2')
+            self.assertEqual(chain, [
+                f'{path}#prompt:0',
+                f'{path}#tool:1',
+            ])
         finally:
             os.unlink(path)
 
