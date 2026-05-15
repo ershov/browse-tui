@@ -3,5 +3,6 @@ __pycache__/
 .PLAN.md.bak
 .worktrees
 .tmp
+.scratch
 tmp
 .claude/scheduled_tasks.lock
