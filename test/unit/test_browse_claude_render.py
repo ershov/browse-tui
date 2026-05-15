@@ -372,6 +372,31 @@ class TestAttachmentRenderers(unittest.TestCase):
         self.assertIn('./foo.py', out)
         self.assertIn('print("hi")', out)
 
+    def test_file_dict_content_unwraps_nested_file(self):
+        # Newer transcripts wrap the file body in
+        # ``{"type": "text", "file": {"filePath": ..., "content": ...}}``.
+        # The renderer must reach into ``file.content`` instead of
+        # calling ``.rstrip()`` on the dict.
+        out = self.r._render_attachment(self._attach(
+            'file', displayPath='./foo.py', filename='/tmp/foo.py',
+            content={'type': 'text', 'file': {
+                'filePath': '/tmp/foo.py', 'content': 'print("inner")\n',
+            }},
+        ))
+        self.assertIn('./foo.py', out)
+        self.assertIn('print("inner")', out)
+
+    def test_file_unknown_dict_falls_back_to_json(self):
+        # If we can't make sense of the dict, dump it as JSON rather
+        # than crashing — better to surface the raw payload than
+        # blanking the preview.
+        out = self.r._render_attachment(self._attach(
+            'file', displayPath='./foo.py',
+            content={'unknown': 'shape', 'k': 1},
+        ))
+        self.assertIn('"unknown"', out)
+        self.assertIn('"shape"', out)
+
     def test_diagnostics(self):
         out = self.r._render_attachment(self._attach(
             'diagnostics', isNew=True,
@@ -1154,6 +1179,39 @@ class TestTreeChildrenPreview(unittest.TestCase):
                 self.assertIn('PROBE_BASH_CMD', out)
                 self.assertNotIn('PROBE_BASH_OUTPUT', out)  # grandchild
             finally:
+                self.r._TREE_MODE = saved
+        finally:
+            os.unlink(path)
+
+    def test_umbrella_preview_survives_per_child_renderer_error(self):
+        # A renderer raising should NOT blank the umbrella's preview —
+        # subsequent children must still render, and the failure
+        # surfaces as a per-child error stub.
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'PROBE_GOOD_USER'}},
+            {'type': 'assistant', 'uuid': 'a1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'text', 'text': 'PROBE_GOOD_ASST'},
+             ]}},
+        ])
+        try:
+            saved = self.r._TREE_MODE
+            saved_renderers = dict(self.r._RENDERERS)
+            try:
+                self.r._TREE_MODE = True
+                def _boom(_obj):
+                    raise RuntimeError('PROBE_BOOM_MSG')
+                self.r._RENDERERS['user'] = _boom
+                out = self.r._preview_umbrella(f'{path}#prompt:0')
+                # The failing child's error appears…
+                self.assertIn('RuntimeError', out)
+                self.assertIn('PROBE_BOOM_MSG', out)
+                # …and the next child still renders.
+                self.assertIn('PROBE_GOOD_ASST', out)
+            finally:
+                self.r._RENDERERS.clear()
+                self.r._RENDERERS.update(saved_renderers)
                 self.r._TREE_MODE = saved
         finally:
             os.unlink(path)

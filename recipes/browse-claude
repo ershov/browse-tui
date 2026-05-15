@@ -1672,11 +1672,37 @@ def _fmt_attach_file(a):
     out = [f'{CYAN}{a.get("displayPath", a.get("filename", ""))}{RESET}']
     if a.get('filename') and a.get('filename') != a.get('displayPath'):
         out.append(f'{MUTE}{a["filename"]}{RESET}')
-    content = a.get('content', '')
-    if content:
+    text = _extract_attach_file_text(a.get('content', ''))
+    if text:
         out.append('')
-        out.append(content.rstrip())
+        out.append(text.rstrip())
     return '\n'.join(out)
+
+
+def _extract_attach_file_text(content):
+    """Pull the text payload out of an attachment's ``content`` field.
+
+    Older transcripts store the file body as a bare string. Newer ones
+    wrap it as ``{"type": "text", "file": {"filePath": "...",
+    "content": "..."}}`` (the format the SDK emits for editable file
+    attachments) — recurse into the nested ``file.content``. Anything
+    we can't make sense of falls back to the JSON-dump of the value so
+    the user still sees something rather than crashing the renderer.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        inner = content.get('file')
+        if isinstance(inner, dict):
+            file_content = inner.get('content', '')
+            if isinstance(file_content, str):
+                return file_content
+            return json.dumps(file_content, indent=2)
+        # ``content`` is some other dict shape we don't recognise.
+        return json.dumps(content, indent=2)
+    if content in (None, ''):
+        return ''
+    return json.dumps(content, indent=2)
 
 
 def _fmt_attach_diagnostics(a):
@@ -3098,7 +3124,16 @@ def _preview_umbrella(item_id):
         return ''
     parts = []
     for child in children:
-        rendered = _render_child_preview_body(child)
+        try:
+            rendered = _render_child_preview_body(child)
+        except Exception as e:
+            # One bad child shouldn't blank out the whole umbrella —
+            # surface a per-child error stub and keep going. Catching
+            # broadly is intentional: the preview pane is read-only
+            # observation, the cost of a hidden bug here is a missing
+            # row, not silent data corruption.
+            rendered = (_rule(f'error rendering child {child.id}', RED)
+                        + f'\n{type(e).__name__}: {e}')
         if rendered is not None:
             parts.append(rendered)
     return '\n\n'.join(parts)
