@@ -2172,10 +2172,11 @@ class TestUmbrellaShapes(unittest.TestCase):
         finally:
             os.unlink(path)
 
-    def test_wrapped_leaf_drops_row_bg_to_avoid_doubled_pulse(self):
-        # The first leaf inside ``<prompt>`` and ``<tool>`` umbrellas
-        # should have row_bg cleared so K/J doesn't count two adjacent
-        # voice rows.
+    def test_wrapped_leaf_keeps_row_bg_voice_marker(self):
+        # User voice and assistant voice leaves keep their row_bg stripe
+        # even when folded under a ``<prompt>`` / ``<tool>`` umbrella —
+        # the visual marker belongs to the voice itself, not to the
+        # outermost row.
         path = self._write_jsonl([
             {'type': 'user', 'uuid': 'u1',
              'message': {'role': 'user', 'content': 'hello'}},
@@ -2189,16 +2190,18 @@ class TestUmbrellaShapes(unittest.TestCase):
         try:
             roots = self.r._list_tree_roots(path)
             prompt = roots[0]
-            self.assertEqual(prompt.row_bg, 235)   # user-voice bg
+            self.assertEqual(prompt.row_bg, 235)
             kids = self.r._list_prompt_children(path, 0)
             user_leaf = kids[0]
-            self.assertIsNone(getattr(user_leaf, 'row_bg', None))
+            # The wrapped user leaf keeps the user-voice stripe.
+            self.assertEqual(user_leaf.row_bg, 235)
             tool = kids[1]
-            # Assistant has both text and tool_use → it's voice.
+            # Assistant has both text and tool_use → tool umbrella is
+            # voice.
             self.assertEqual(tool.row_bg, 17)
             tool_kids = self.r._list_tool_children(path, 1)
             asst_leaf = tool_kids[0]
-            self.assertIsNone(getattr(asst_leaf, 'row_bg', None))
+            self.assertEqual(asst_leaf.row_bg, 17)
         finally:
             os.unlink(path)
 

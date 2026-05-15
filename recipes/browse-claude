@@ -2646,13 +2646,11 @@ def _list_prompt_children(jsonl_path, turn_root_line):
     out = []
     # 1) The turn root itself, as a leaf — visible at the top of the
     # expansion so the user prompt content is readable at the same
-    # indent as the assistant replies that follow. Clear ``row_bg``
-    # on the leaf so the umbrella row above is the only voice stripe
-    # for this prompt — without that K/J navigation would count both
-    # rows as voice and the pulse would feel doubled.
+    # indent as the assistant replies that follow. Keeps its
+    # ``row_bg`` voice stripe; the user's voice deserves the marker
+    # whether or not it happens to be folded under an umbrella.
     leaf = _tree_item(jsonl_path, rec, td)
     if leaf is not None:
-        leaf.row_bg = None
         out.append(leaf)
     # 2) Each turn member.
     if uuid is None:
@@ -2688,13 +2686,12 @@ def _list_tool_children(jsonl_path, assistant_line):
         return []
     uuid = rec.get('uuid')
     out = []
-    # 1) Assistant tool_use record as a leaf. Clear ``row_bg`` (if any)
-    # for the same reason as the prompt umbrella's first leaf: the
-    # ``<tool>`` umbrella row above is the voice stripe; doubling it
-    # on the wrapped leaf would split K/J's voice pulse.
+    # 1) Assistant tool_use record as a leaf. Keeps its ``row_bg``
+    # voice stripe if the assistant has text content (mixed text +
+    # tool_use case) — same reasoning as the prompt umbrella's first
+    # leaf: voice markers belong on voice rows, regardless of nesting.
     leaf = _tree_item(jsonl_path, rec, td)
     if leaf is not None:
-        leaf.row_bg = None
         out.append(leaf)
     # 2) Paired tool_children (tool_result, hook attachments, …).
     for child in td.tool_children.get(uuid, []):

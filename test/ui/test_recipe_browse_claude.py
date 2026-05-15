@@ -655,21 +655,28 @@ class TestBrowseClaude(unittest.TestCase):
                 t.launch(_BIN, '--run-py', _RECIPE,
                          '--tree', '--file', sess)
                 t.wait_for('PROBE_TURN2_REPLY', timeout=3.0)
-                # K walks UP through visible voices. From PROBE_TURN2_REPLY:
-                # K → PROBE_TURN2_USER, K → PROBE_TURN1_USER (turn 1 root,
-                # collapsed but visible at root level).
+                # K walks UP through visible voices. From PROBE_TURN2_REPLY,
+                # the voice rows above (in order) are:
+                #   • u3 leaf      (PROBE_TURN2_USER)
+                #   • <prompt:5>   (umbrella for turn 2; same content)
+                #   • <prompt:1>   (turn 1 root, collapsed at top level)
+                # Three K's land cursor on the <prompt:1> umbrella row,
+                # ready to be expanded with Right.
+                t.send('K')
                 t.send('K')
                 t.send('K')
                 t.wait_for('PROBE_TURN1_USER', timeout=3.0)
                 # Right in tree mode expands the row AND auto-jumps the
-                # cursor to the latest voice inside the subtree. So
-                # after expanding turn 1, cursor lands on
-                # PROBE_TURN1_REPLY (the final assistant text). Up one
-                # row to land on the Task-calling assistant.
+                # cursor to the latest voice inside the subtree. After
+                # expanding turn 1, cursor lands on PROBE_TURN1_REPLY
+                # (the final assistant text leaf). Up two rows lands
+                # on the Task-calling <tool:Task> umbrella (one row up
+                # for the tool umbrella, since the assistant leaf
+                # sits a level inside).
                 t.send('Right')
                 t.wait_for('PROBE_TURN1_REPLY', timeout=3.0)
                 t.send('Up')
-                t.send('Right')                  # expand Task assistant
+                t.send('Right')                  # expand Task umbrella
                 t.wait_for('PROBE_SUBAGENT_DESC', timeout=3.0)
                 t.send('q')
 
