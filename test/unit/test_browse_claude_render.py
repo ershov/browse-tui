@@ -2977,6 +2977,67 @@ class TestViewEditSource(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_gather_umbrella_lines_multi_tool_full_coverage(self):
+        # Stress: turn with two tool calls + a text reply between
+        # them + a closing text reply. The umbrella gather must
+        # pull every line in document order with no duplicates.
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'go'}},                # 0
+            {'type': 'assistant', 'uuid': 'a1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 't1', 'name': 'Bash',
+                  'input': {'command': 'ls'}},
+             ]}},                                                          # 1
+            {'type': 'user', 'uuid': 'u2',
+             'message': {'role': 'user', 'content': [
+                 {'type': 'tool_result', 'tool_use_id': 't1',
+                  'content': 'r1'},
+             ]}},                                                          # 2
+            {'type': 'assistant', 'uuid': 'a2',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'text', 'text': 'between'},
+             ]}},                                                          # 3
+            {'type': 'assistant', 'uuid': 'a3',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 't2', 'name': 'Read',
+                  'input': {'file_path': '/x'}},
+             ]}},                                                          # 4
+            {'type': 'user', 'uuid': 'u3',
+             'message': {'role': 'user', 'content': [
+                 {'type': 'tool_result', 'tool_use_id': 't2',
+                  'content': 'r2'},
+             ]}},                                                          # 5
+            {'type': 'assistant', 'uuid': 'a4',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'text', 'text': 'after'},
+             ]}},                                                          # 6
+        ])
+        try:
+            saved = self.r._TREE_MODE
+            self.r._TREE_MODE = True
+            try:
+                self.r._scan_tree(path)
+                # Listing-order recursion may interleave; the test
+                # checks the canonicalised output from the V/E
+                # gather (dedupe + sort) is the full file range.
+                items = [self.r.Item(id=f'{path}#prompt:0')]
+                per_line, _ = self.r._gather_line_source(items)
+                self.assertEqual(per_line, {path: [0, 1, 2, 3, 4, 5, 6]})
+                # Each tool umbrella covers only its own pair.
+                self.assertEqual(
+                    sorted(self.r._gather_umbrella_lines(f'{path}#tool:1')),
+                    [1, 2],
+                )
+                self.assertEqual(
+                    sorted(self.r._gather_umbrella_lines(f'{path}#tool:4')),
+                    [4, 5],
+                )
+            finally:
+                self.r._TREE_MODE = saved
+        finally:
+            os.unlink(path)
+
     def test_gather_dedupes_and_sorts_overlapping_targets(self):
         # User selects an umbrella AND one of its child leaves (or
         # two overlapping umbrellas). Pre-select pass collapses to
