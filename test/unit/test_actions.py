@@ -553,6 +553,74 @@ class TestPreviewScrollActions(unittest.TestCase):
         finally:
             b.stop_workers()
 
+    def test_shift_pgdn_is_alias_for_alt_pgdn(self):
+        # Shift-PgDn mirrors Alt-PgDn — many terminals intercept the
+        # Shift variant for scrollback, but the binding is registered
+        # for emulators that pass it through.
+        b = _make_browser()
+        try:
+            ctx = _ctx_for(b)
+            dispatch_key(b, ctx, 'shift-pgdn')
+            self.assertEqual(b._preview_scroll, 20)
+        finally:
+            b.stop_workers()
+
+    def test_shift_pgup_is_alias_for_alt_pgup(self):
+        b = _make_browser()
+        try:
+            ctx = _ctx_for(b)
+            b._preview_scroll = 7
+            dispatch_key(b, ctx, 'shift-pgup')
+            self.assertEqual(b._preview_scroll, 0)
+        finally:
+            b.stop_workers()
+
+    def test_shift_home_jumps_preview_to_top(self):
+        b = _make_browser()
+        try:
+            ctx = _ctx_for(b)
+            b._preview_scroll = 42
+            dispatch_key(b, ctx, 'shift-home')
+            self.assertEqual(b._preview_scroll, 0)
+            self.assertIn('preview', b._needs_redraw)
+        finally:
+            b.stop_workers()
+
+    def test_alt_home_jumps_preview_to_top(self):
+        # Alt-Home is the universal-fallback binding (terminals that
+        # swallow Shift-Home still send Alt-Home).
+        b = _make_browser()
+        try:
+            ctx = _ctx_for(b)
+            b._preview_scroll = 42
+            dispatch_key(b, ctx, 'alt-home')
+            self.assertEqual(b._preview_scroll, 0)
+        finally:
+            b.stop_workers()
+
+    def test_shift_end_sets_sentinel_for_render_to_clamp(self):
+        # ``_preview_end`` doesn't know how many wrapped lines exist
+        # without running the wrap walker; it parks ``_preview_scroll``
+        # at a sentinel and lets ``render_preview``'s clamp settle it
+        # to ``max_scroll`` on the next paint.
+        b = _make_browser()
+        try:
+            ctx = _ctx_for(b)
+            dispatch_key(b, ctx, 'shift-end')
+            self.assertGreater(b._preview_scroll, 1_000_000)
+            self.assertIn('preview', b._needs_redraw)
+        finally:
+            b.stop_workers()
+
+    def test_alt_end_sets_sentinel_for_render_to_clamp(self):
+        b = _make_browser()
+        try:
+            ctx = _ctx_for(b)
+            dispatch_key(b, ctx, 'alt-end')
+            self.assertGreater(b._preview_scroll, 1_000_000)
+        finally:
+            b.stop_workers()
+
 
 class TestPreviewResetOnCursorMove(unittest.TestCase):
     """Cursor moves reset ``_preview_scroll`` and dismiss ``_help_mode``.

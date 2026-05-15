@@ -8278,6 +8278,24 @@ def _preview_page_up(ctx):
     ctx._browser._needs_redraw.add('preview')
 
 
+def _preview_home(ctx):
+    """{Shift,Alt}-Home — jump preview scroll to the top."""
+    ctx._browser._preview_scroll = 0
+    ctx._browser._needs_redraw.add('preview')
+
+
+def _preview_end(ctx):
+    """{Shift,Alt}-End — jump preview scroll to the bottom.
+
+    Sets a sentinel value the renderer clamps to ``max_scroll`` (so the
+    last content row lands at the bottom of the pane). The clamp lives
+    in ``render_preview`` where the wrapped-line count is in hand; we
+    just hand it a value bigger than any plausible buffer.
+    """
+    ctx._browser._preview_scroll = 10 ** 9
+    ctx._browser._needs_redraw.add('preview')
+
+
 # ---- list/preview split resize -------------------------------------------
 
 
@@ -8504,6 +8522,18 @@ def default_actions() -> list:
         Action('shift-up',   'Scroll preview line up',   _preview_scroll_up,   'none', 'PREVIEW'),
         Action('alt-pgdn',   'Scroll preview page down', _preview_page_down,   'none', 'PREVIEW'),
         Action('alt-pgup',   'Scroll preview page up',   _preview_page_up,     'none', 'PREVIEW'),
+        # Shift-PgUp/Dn are aliases for Alt-PgUp/Dn. Many terminal
+        # emulators intercept Shift-PgUp/Dn for their own scrollback,
+        # but we register the binding anyway so it works in emulators
+        # that pass it through.
+        Action('shift-pgdn', '', _preview_page_down, 'none', 'PREVIEW'),
+        Action('shift-pgup', '', _preview_page_up,   'none', 'PREVIEW'),
+        # Jump preview to top/bottom. Bind both Shift- and Alt- variants
+        # so users have at least one combination their terminal sends.
+        Action('shift-home', 'Scroll preview to top',    _preview_home, 'none', 'PREVIEW'),
+        Action('shift-end',  'Scroll preview to bottom', _preview_end,  'none', 'PREVIEW'),
+        Action('alt-home',   '', _preview_home, 'none', 'PREVIEW'),
+        Action('alt-end',    '', _preview_end,  'none', 'PREVIEW'),
         # Resize the list/preview split. Both pairs (``-``/``_`` and
         # ``=``/``+``) are bound for keyboard ergonomics — `-` and `=`
         # are unshifted, `_` and `+` are their shifted counterparts on
