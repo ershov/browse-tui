@@ -1722,7 +1722,11 @@ class TestScanTree(unittest.TestCase):
         finally:
             os.unlink(path)
 
-    def test_cache_invalidates_on_mtime_change(self):
+    def test_cache_survives_file_growth_until_explicit_reset(self):
+        # New semantics (post-mtime): _scan_tree's cache doesn't
+        # auto-invalidate when the file changes. The live-tail worker
+        # keeps the cached td in sync; explicit Ctrl-R / refresh
+        # (via ``get_children(None)``) is what drops the cache.
         path = self._write_jsonl([
             {'type': 'user', 'uuid': 'u1', 'parentUuid': None,
              'promptId': 'P1',
@@ -1732,7 +1736,6 @@ class TestScanTree(unittest.TestCase):
             import json as _json
             td1 = self.r._scan_tree(path)
             self.assertEqual(len([r for r in td1.records if r]), 1)
-            # Append a new record + bump mtime.
             with open(path, 'a') as f:
                 f.write(_json.dumps({
                     'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
@@ -1740,14 +1743,19 @@ class TestScanTree(unittest.TestCase):
                         {'type': 'text', 'text': 'x'},
                     ]},
                 }) + '\n')
-            import time
-            # File mtime is at second granularity on many fs's — force
-            # a different mtime via os.utime.
-            now = os.stat(path).st_mtime
-            os.utime(path, (now + 1, now + 1))
+            # Calling _scan_tree again WITHOUT a reset returns the
+            # same cached td (stale by design — tail would have
+            # folded the new record under normal operation).
             td2 = self.r._scan_tree(path)
-            self.assertEqual(len([r for r in td2.records if r]), 2)
-            self.assertIsNot(td1, td2)   # different cached instance
+            self.assertIs(td1, td2)
+            self.assertEqual(len([r for r in td2.records if r]), 1)
+
+            # Explicit reset via get_children(None) drops the cache;
+            # next call rebuilds from disk with all records.
+            self.r.get_children(None)
+            td3 = self.r._scan_tree(path)
+            self.assertIsNot(td1, td3)
+            self.assertEqual(len([r for r in td3.records if r]), 2)
         finally:
             os.unlink(path)
 
@@ -2264,7 +2272,12 @@ class TestUmbrellaShapes(unittest.TestCase):
 
 
 class TestLiveTail(unittest.TestCase):
-    """``_fold_new_lines`` is the live-tail counterpart of ``_scan_tree``."""
+    """``_read_new_records`` is the live-tail counterpart of ``_scan_tree``.
+
+    Shared between tree- and flat-mode: reads new bytes, parses
+    records, optionally folds them into the tree-mode ``_TreeData``.
+    Returns ``(records, dirty_parents)``.
+    """
 
     @classmethod
     def setUpClass(cls):
@@ -2307,9 +2320,10 @@ class TestLiveTail(unittest.TestCase):
         finally:
             os.unlink(path)
 
-    def test_fold_new_lines_extends_existing_turn(self):
+    def test_read_extends_existing_turn(self):
         # Bulk-scan a file with one open turn, append an assistant reply,
-        # fold; the turn's direct children should grow.
+        # read; the turn's direct children should grow and dirty parents
+        # should mark the prompt umbrella.
         path = self._write_jsonl([
             {'type': 'user', 'uuid': 'u1',
              'message': {'role': 'user', 'content': 'go'}},
@@ -2323,18 +2337,20 @@ class TestLiveTail(unittest.TestCase):
                      {'type': 'text', 'text': 'PROBE_REPLY'},
                  ]}},
             ])
-            dirty = self.r._fold_new_lines(path)
-            # New leaf belongs to the existing <prompt:0> umbrella.
+            records, dirty = self.r._read_new_records(path)
+            # One new record returned in file order.
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0][1].get('uuid'), 'a1')
+            # Tree fold: the new leaf belongs to <prompt:0>.
             self.assertIn(f'{path}#prompt:0', dirty)
             self.assertEqual(len(td.turn_direct['u1']), 1)
-            self.assertEqual(td.turn_direct['u1'][0].get('uuid'), 'a1')
             tail = self.r._TAIL_STATE[path]
             self.assertGreater(tail.byte_offset, 0)
             self.assertFalse(tail.error)
         finally:
             os.unlink(path)
 
-    def test_fold_new_lines_opens_new_turn(self):
+    def test_read_opens_new_turn(self):
         # Append a fresh user voice → new <prompt> umbrella appears
         # at the file's root level (dirty set contains the path).
         path = self._write_jsonl([
@@ -2355,7 +2371,8 @@ class TestLiveTail(unittest.TestCase):
                 {'type': 'user', 'uuid': 'u2',
                  'message': {'role': 'user', 'content': 'second'}},
             ])
-            dirty = self.r._fold_new_lines(path)
+            records, dirty = self.r._read_new_records(path)
+            self.assertEqual(len(records), 1)
             self.assertIn(path, dirty)
             self.assertEqual(
                 sum(1 for e in td.roots_in_order if e['kind'] == 'turn'),
@@ -2364,7 +2381,7 @@ class TestLiveTail(unittest.TestCase):
         finally:
             os.unlink(path)
 
-    def test_fold_new_lines_incomplete_trailing_line_holds_offset(self):
+    def test_read_incomplete_trailing_line_holds_offset(self):
         # Append a partial line (no trailing newline). The tail must NOT
         # parse it; offset stays at the line's start so the next call
         # picks it up once the rest arrives.
@@ -2376,8 +2393,6 @@ class TestLiveTail(unittest.TestCase):
         try:
             self.r._scan_tree(path)
             offset_before = self.r._TAIL_STATE[path].byte_offset
-            # Construct a valid jsonl line and split it at an arbitrary
-            # boundary mid-payload.
             full_line = _json.dumps({
                 'type': 'assistant', 'uuid': 'a1',
                 'message': {'role': 'assistant', 'content': [
@@ -2386,16 +2401,17 @@ class TestLiveTail(unittest.TestCase):
             })
             split = len(full_line) // 2
             with open(path, 'a') as f:
-                f.write(full_line[:split])   # no trailing \n yet
-            dirty = self.r._fold_new_lines(path)
+                f.write(full_line[:split])
+            records, dirty = self.r._read_new_records(path)
+            self.assertFalse(records)
             self.assertFalse(dirty)
             tail = self.r._TAIL_STATE[path]
             self.assertEqual(tail.byte_offset, offset_before)
             self.assertFalse(tail.error)
-            # Now complete the line with the remainder + trailing \n.
             with open(path, 'a') as f:
                 f.write(full_line[split:] + '\n')
-            dirty = self.r._fold_new_lines(path)
+            records, dirty = self.r._read_new_records(path)
+            self.assertEqual(len(records), 1)
             self.assertIn(f'{path}#prompt:0', dirty)
             tail = self.r._TAIL_STATE[path]
             self.assertGreater(tail.byte_offset, offset_before)
@@ -2403,7 +2419,7 @@ class TestLiveTail(unittest.TestCase):
         finally:
             os.unlink(path)
 
-    def test_fold_new_lines_malformed_json_latches_error(self):
+    def test_read_malformed_json_latches_error(self):
         path = self._write_jsonl([
             {'type': 'user', 'uuid': 'u1',
              'message': {'role': 'user', 'content': 'hi'}},
@@ -2412,7 +2428,7 @@ class TestLiveTail(unittest.TestCase):
             self.r._scan_tree(path)
             with open(path, 'a') as f:
                 f.write('not valid json\n')
-            self.r._fold_new_lines(path)
+            self.r._read_new_records(path)
             tail = self.r._TAIL_STATE[path]
             self.assertTrue(tail.error)
             # Further calls bail without resuming.
@@ -2420,13 +2436,14 @@ class TestLiveTail(unittest.TestCase):
                 f.write('{"type": "user", "uuid": "u2", '
                         '"message": {"role": "user", '
                         '"content": "second"}}\n')
-            dirty = self.r._fold_new_lines(path)
+            records, dirty = self.r._read_new_records(path)
+            self.assertFalse(records)
             self.assertFalse(dirty)
             self.assertTrue(tail.error)
         finally:
             os.unlink(path)
 
-    def test_fold_new_lines_truncation_latches_error(self):
+    def test_read_truncation_latches_error(self):
         # File shrinks (e.g. external truncation / rotation) → offset
         # is stale → error flag latches; no patches issued.
         path = self._write_jsonl([
@@ -2437,26 +2454,27 @@ class TestLiveTail(unittest.TestCase):
         ])
         try:
             self.r._scan_tree(path)
-            with open(path, 'w') as f:   # truncate
+            with open(path, 'w') as f:
                 f.write('')
-            dirty = self.r._fold_new_lines(path)
+            records, dirty = self.r._read_new_records(path)
+            self.assertFalse(records)
             self.assertFalse(dirty)
             self.assertTrue(self.r._TAIL_STATE[path].error)
         finally:
             os.unlink(path)
 
-    def test_fold_new_lines_no_change_returns_empty(self):
+    def test_read_no_change_returns_empty(self):
         path = self._write_jsonl([
             {'type': 'user', 'uuid': 'u1',
              'message': {'role': 'user', 'content': 'hi'}},
         ])
         try:
             self.r._scan_tree(path)
-            self.assertEqual(self.r._fold_new_lines(path), set())
+            self.assertEqual(self.r._read_new_records(path), ([], set()))
         finally:
             os.unlink(path)
 
-    def test_fold_new_lines_no_state_returns_empty(self):
+    def test_read_no_state_returns_empty(self):
         # Tail without a prior bulk scan: nothing to do.
         path = self._write_jsonl([
             {'type': 'user', 'uuid': 'u1',
@@ -2464,7 +2482,30 @@ class TestLiveTail(unittest.TestCase):
         ])
         try:
             self.assertNotIn(path, self.r._TAIL_STATE)
-            self.assertEqual(self.r._fold_new_lines(path), set())
+            self.assertEqual(self.r._read_new_records(path), ([], set()))
+        finally:
+            os.unlink(path)
+
+    def test_read_works_without_tree_cache_flat_mode_fallback(self):
+        # No ``_TREE_CACHE`` entry (flat-mode lazy bootstrap): the read
+        # still returns records but produces no dirty parents.
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'hi'}},
+        ])
+        try:
+            self.r._TAIL_STATE[path] = self.r._TailState(
+                byte_offset=0, last_size=0, start_line=0,
+                cursor=self.r._ScanCursor(), error=False,
+            )
+            self.assertNotIn(path, self.r._TREE_CACHE)
+            records, dirty = self.r._read_new_records(path)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0][0], 0)
+            self.assertEqual(records[0][1].get('uuid'), 'u1')
+            self.assertEqual(dirty, set())
+            # ``start_line`` advances even without td.records.
+            self.assertEqual(self.r._TAIL_STATE[path].start_line, 1)
         finally:
             os.unlink(path)
 
@@ -2500,61 +2541,48 @@ class TestLiveTail(unittest.TestCase):
                 pass
         return FakeBrowser(), seen_ops
 
-    def test_flat_tail_inserts_after_last_subagent(self):
-        # New flat-mode rows must land AFTER the trailing subagent
-        # row so the subagent group keeps its sticky-top position.
-        # No subagents → ref=-1 collapses to position 0 (top).
-        # Has subagents → ref=last_sub_idx → ``after`` lands at the
-        # first non-subagent slot.
+    def test_push_flat_inserts_after_last_subagent(self):
+        # New flat-mode rows must land AFTER the trailing subagent row
+        # so the subagent group keeps its sticky-top position. The
+        # push step builds Items from records returned by
+        # ``_read_new_records`` and emits ``upsert(...,
+        # where=('after', None, last_sub_idx))``.
         path = self._write_jsonl([
             {'type': 'user', 'uuid': 'u1',
              'message': {'role': 'user', 'content': 'one'}},
         ])
         try:
-            self.r._scan_tree(path)
-            saved_tree = self.r._TREE_MODE
-            self.r._TREE_MODE = False
-            try:
-                # Pretend two subagent rows are pinned at the top
-                # of the cached children list. Their ids match the
-                # ``<sess>#agent:<aid>`` shape so the recipe's filter
-                # finds them.
-                fake_msgs = self.r._list_messages(path)
-                fake_subs = [
-                    self.r.Item(id=f'{path}#agent:SUB_A',
-                                title='<subagent>  A'),
-                    self.r.Item(id=f'{path}#agent:SUB_B',
-                                title='<subagent>  B'),
-                ]
-                fake_subs[0].kind = 'subagent'
-                fake_subs[1].kind = 'subagent'
-                fake_b, seen_ops = self._fake_browser_with_children(
-                    path, fake_subs + fake_msgs,
-                )
+            fake_subs = [
+                self.r.Item(id=f'{path}#agent:SUB_A',
+                            title='<subagent>  A'),
+                self.r.Item(id=f'{path}#agent:SUB_B',
+                            title='<subagent>  B'),
+            ]
+            fake_subs[0].kind = 'subagent'
+            fake_subs[1].kind = 'subagent'
+            # Just two existing items in the framework's cache; the
+            # message row from line 0 isn't important here.
+            fake_b, seen_ops = self._fake_browser_with_children(
+                path, list(fake_subs),
+            )
 
-                # Append a new message; tail should insert after
-                # SUB_B (index 1 in existing).
-                self._append(path, [
-                    {'type': 'user', 'uuid': 'u2',
-                     'message': {'role': 'user', 'content': 'two'}},
-                ])
-                self.r._TAIL_STATE[path].last_size = 1
+            records = [(
+                1,
+                {'type': 'user', 'uuid': 'u2',
+                 'message': {'role': 'user', 'content': 'two'}},
+            )]
+            self.r._push_flat_inserts(fake_b, path, records)
 
-                self.r._maybe_refresh_flat_on_change(fake_b, path)
-
-                self.assertEqual(len(seen_ops), 1)
-                ops = seen_ops[0]
-                upserts = [op for op in ops if op[0] == 'upsert']
-                self.assertEqual(len(upserts), 1)
-                # Where descriptor should target ``after`` index 1
-                # (the last subagent's position).
-                self.assertEqual(upserts[0][4], ('after', None, 1))
-            finally:
-                self.r._TREE_MODE = saved_tree
+            self.assertEqual(len(seen_ops), 1)
+            ops = seen_ops[0]
+            upserts = [op for op in ops if op[0] == 'upsert']
+            self.assertEqual(len(upserts), 1)
+            # ``after`` index 1 = last subagent's position.
+            self.assertEqual(upserts[0][4], ('after', None, 1))
         finally:
             os.unlink(path)
 
-    def test_flat_tail_no_subagents_uses_minus_one(self):
+    def test_push_flat_inserts_no_subagents_uses_minus_one(self):
         # No subagents in the existing list → ref=-1, which the
         # framework collapses to position 0 (top of list).
         path = self._write_jsonl([
@@ -2563,36 +2591,29 @@ class TestLiveTail(unittest.TestCase):
         ])
         try:
             self.r._scan_tree(path)
-            saved_tree = self.r._TREE_MODE
-            self.r._TREE_MODE = False
-            try:
-                fake_msgs = self.r._list_messages(path)
-                fake_b, seen_ops = self._fake_browser_with_children(
-                    path, fake_msgs,
-                )
+            fake_msgs = self.r._list_messages(path)
+            fake_b, seen_ops = self._fake_browser_with_children(
+                path, fake_msgs,
+            )
 
-                self._append(path, [
-                    {'type': 'user', 'uuid': 'u2',
-                     'message': {'role': 'user', 'content': 'two'}},
-                    {'type': 'assistant', 'uuid': 'a1',
+            records = [
+                (1, {'type': 'user', 'uuid': 'u2',
+                     'message': {'role': 'user', 'content': 'two'}}),
+                (2, {'type': 'assistant', 'uuid': 'a1',
                      'message': {'role': 'assistant', 'content': [
                          {'type': 'text', 'text': 'three'},
-                     ]}},
-                ])
-                self.r._TAIL_STATE[path].last_size = 1
+                     ]}}),
+            ]
+            self.r._push_flat_inserts(fake_b, path, records)
 
-                self.r._maybe_refresh_flat_on_change(fake_b, path)
-
-                ops = seen_ops[0]
-                upserts = [op for op in ops if op[0] == 'upsert']
-                self.assertEqual(len(upserts), 2)
-                for op in upserts:
-                    self.assertEqual(op[4], ('after', None, -1))
-                self.assertFalse(
-                    [op for op in ops if op[0] == 'remove'],
-                )
-            finally:
-                self.r._TREE_MODE = saved_tree
+            ops = seen_ops[0]
+            upserts = [op for op in ops if op[0] == 'upsert']
+            self.assertEqual(len(upserts), 2)
+            for op in upserts:
+                self.assertEqual(op[4], ('after', None, -1))
+            self.assertFalse(
+                [op for op in ops if op[0] == 'remove'],
+            )
         finally:
             os.unlink(path)
 

@@ -2200,45 +2200,59 @@ def _scan_session(path):
 # at the top level. That nests each turn cleanly under its prompt while
 # keeping all the non-voice metadata records as siblings at root.
 #
-# The scan is cached per (path, mtime); subsequent calls within one
-# session are O(1). ``_TREE_CACHE`` clears entries whose mtime no longer
-# matches so files mutated between calls re-scan transparently.
+# The scan is cached; subsequent calls within one session are O(1).
+# Cache eviction is explicit — ``get_children(None)`` (Ctrl-R /
+# ``ctx.refresh()``) clears ``_TREE_CACHE`` + ``_TAIL_STATE``; the
+# live-tail worker keeps the cached ``_TreeData`` in sync with the
+# file as it grows, so no time-based invalidation is needed.
 
 
-_TREE_CACHE = {}   # path → (mtime, TreeData)
+_TREE_CACHE = {}   # path → TreeData
 _TREE_MODE = True  # default; --no-tree CLI flag or 't' action flips it.
 
 
-# Live-tail worker state, keyed by .jsonl path. One entry per file
-# the bulk scan has visited; the worker resumes from each entry's
-# byte_offset on its 5s tick and folds new records via _fold_record
-# (same code path as the bulk scan).
+# Live-tail worker state, keyed by .jsonl path. The worker resumes
+# from each entry's byte_offset on its 5s tick and parses new lines
+# via _read_new_records (shared between tree + flat modes).
 class _TailState:
     """Per-file state for the live-tail worker.
 
     Persistence semantics:
-      * Survives normal navigation (cache hits in ``_scan_tree``).
-      * Recreated on mtime change (``_scan_tree`` rebuilds + rewrites).
+      * Survives normal navigation (``_scan_tree`` cache hits return
+        the existing entry).
       * Cleared by the indirect ``get_children(None)`` reset signal —
-        which fires on Ctrl-R / ``ctx.refresh()`` / initial load.
+        which fires on Ctrl-R / ``ctx.refresh()`` / initial load. The
+        next per-file fetch rebuilds from scratch.
 
-    ``error`` latches True on the first malformed complete line. The
-    worker skips this file thereafter until the size shrinks (which
-    also forces ``error=True``, but a follow-up mtime change drops the
-    state entirely via the rebuild path) or until the user-triggered
-    reset clears ``_TAIL_STATE[path]``.
+    ``error`` latches True on the first malformed complete line OR a
+    size shrink (truncation / rotation). The worker skips this file
+    thereafter until the user-triggered reset clears
+    ``_TAIL_STATE[path]``.
+
+    Fields:
+      * ``byte_offset`` — resume point in the file for the next read.
+      * ``last_size`` — file size at the previous tick; the worker
+        bails when ``current_size == last_size``.
+      * ``start_line`` — line index of the byte at ``byte_offset``,
+        used when no ``_TREE_CACHE`` entry exists to count from
+        (flat-mode lazy bootstrap).
+      * ``cursor`` — the open-turn / open-span state machine, shared
+        between bulk scan and the tail's incremental fold.
+      * ``error`` — latched failure flag.
+      * ``lock`` — held by ``_scan_tree`` (blocking) and the worker
+        (trylock — bail on contention, matching best-effort).
     """
 
-    __slots__ = ('byte_offset', 'last_size', 'cursor', 'error', 'lock')
+    __slots__ = ('byte_offset', 'last_size', 'start_line',
+                 'cursor', 'error', 'lock')
 
-    def __init__(self, *, byte_offset, last_size, cursor, error):
+    def __init__(self, *, byte_offset, last_size, start_line,
+                 cursor, error):
         self.byte_offset = byte_offset
         self.last_size = last_size
+        self.start_line = start_line
         self.cursor = cursor
         self.error = error
-        # Held by ``_scan_tree`` (blocking) and ``_fold_new_lines``
-        # (trylock — bail on contention, matching the best-effort
-        # design).
         self.lock = threading.Lock()
 
 
@@ -2612,19 +2626,18 @@ def _maybe_link_subagent(td, rec, owner_uuid, sub_dir, path):
 
 
 def _scan_tree(path):
-    """Return cached ``_TreeData`` for ``path``; (re)scan on mtime change.
+    """Return cached ``_TreeData`` for ``path``; bulk-scan on cache miss.
 
-    Bulk-fills ``td`` via the per-record fold helper that the live-tail
-    worker shares — so a record landing in tick 2 is processed the
-    same way as if it had been there at scan time.
+    Cache invalidation is explicit (``get_children(None)`` clears
+    ``_TREE_CACHE`` + ``_TAIL_STATE`` on Ctrl-R / ``ctx.refresh()`` /
+    initial load). The live-tail worker keeps the cached ``td`` in
+    sync with file growth — no time-based check needed. A bulk scan
+    on cache miss bootstraps ``_TAIL_STATE`` from the file's current
+    end so the tail resumes from the exact byte where this scan stopped.
     """
-    try:
-        mtime = os.stat(path).st_mtime
-    except OSError:
-        return _TreeData()
     cached = _TREE_CACHE.get(path)
-    if cached and cached[0] == mtime:
-        return cached[1]
+    if cached is not None:
+        return cached
 
     td = _TreeData()
     cur = _ScanCursor()
@@ -2632,7 +2645,7 @@ def _scan_tree(path):
     try:
         f = open(path, 'r', encoding='utf-8', errors='replace')
     except OSError:
-        _TREE_CACHE[path] = (mtime, td)
+        _TREE_CACHE[path] = td
         return td
     # Use readline() (not ``for line in f``) so ``f.tell()`` is legal —
     # the iterator protocol disables tell() to protect its read-ahead
@@ -2672,69 +2685,74 @@ def _scan_tree(path):
     _TAIL_STATE[path] = _TailState(
         byte_offset=last_full_offset,
         last_size=last_full_offset,
+        start_line=n,
         cursor=cur,
         error=False,
     )
-    _TREE_CACHE[path] = (mtime, td)
+    _TREE_CACHE[path] = td
     return td
 
 
-def _fold_new_lines(path):
-    """Incremental tail step: read new bytes, fold them into the cache.
+def _read_new_records(path):
+    """Read newly-appended records since the last call.
+
+    The single source of truth for both tree-mode and flat-mode live
+    tail. When ``_TREE_CACHE`` has an entry, the parsed records are
+    also folded into ``td`` via ``_fold_record`` (so tree-mode
+    umbrellas, parent_id_of, agent_link, etc. stay current) and the
+    set of umbrella parents whose visible child list grew is
+    returned. Flat mode ignores the dirty set and consumes
+    ``records`` directly.
+
+    Returns ``(records, dirty_parents)``:
+      * ``records`` — ``[(line_no, rec_or_None), ...]`` in file order.
+        ``rec`` is ``None`` for blank lines and non-dict JSON.
+      * ``dirty_parents`` — set of umbrella ids whose visible child
+        list grew. Empty when no ``_TREE_CACHE`` entry exists.
 
     Best-effort, per the design:
 
-      * Returns an empty set if the file's tail state is missing
-        (bulk scan hasn't bootstrapped yet), the error flag is set,
+      * ``([], set())`` when state is missing, the error flag is set,
         the size hasn't advanced, or the per-file lock is held.
-      * On a complete-line JSON parse failure (the file is corrupted
-        or written by a non-jsonl producer), sets the error flag and
-        returns whatever dirty parents were already collected.
-      * If the file's size shrank (truncation / rotation), sets the
-        error flag and returns no patches — the user must Ctrl-R to
-        recover.
-
-    Returns the set of parent umbrella ids whose visible child list
-    grew, suitable for ``update_data`` patches.
+      * Sets the error flag on first malformed complete-line JSON or
+        on size shrink (truncation / rotation). Records collected
+        before the failure are still returned.
     """
     tail = _TAIL_STATE.get(path)
     if tail is None or tail.error:
-        return set()
-    cached = _TREE_CACHE.get(path)
-    if cached is None:
-        return set()
-    td = cached[1]
-
+        return ([], set())
     try:
         size = os.path.getsize(path)
     except OSError:
-        return set()
+        return ([], set())
     if size < tail.last_size:
         # Truncation / rotation — our offset is stale; refuse to tail
-        # until the user re-reads (or until ``get_children(None)``
-        # clears the state on a refresh).
+        # until the user re-reads (``get_children(None)`` clears the
+        # state on Ctrl-R / refresh).
         tail.error = True
-        return set()
+        return ([], set())
     if size == tail.last_size:
-        return set()
+        return ([], set())
 
     if not tail.lock.acquire(blocking=False):
-        # Contention with _scan_tree's blocking acquire. Best-effort:
-        # bail and retry on the next tick.
-        return set()
+        # Contention with ``_scan_tree``'s blocking acquire. Best-
+        # effort: bail and retry on the next tick.
+        return ([], set())
+    new_records = []
     dirty = set()
     try:
-        # Re-stat under the lock so we don't read past a size we just
-        # advanced via another worker.
-        size = os.path.getsize(path)
+        td = _TREE_CACHE.get(path)   # ``td`` or None for flat-only paths
+        sub_dir = _subagents_dir(path)
         try:
             f = open(path, 'r', encoding='utf-8', errors='replace')
         except OSError:
-            return set()
+            return ([], set())
         with f:
             f.seek(tail.byte_offset)
-            n = len(td.records)
-            sub_dir = _subagents_dir(path)
+            # Starting line number: prefer ``td.records``-based count
+            # (tree-mode invariant); fall back to ``tail.start_line``
+            # which we track for flat-only files.
+            n = len(td.records) if td is not None else tail.start_line
             while True:
                 line = f.readline()
                 if not line:
@@ -2745,31 +2763,35 @@ def _fold_new_lines(path):
                     # more bytes have been appended.
                     break
                 stripped = line.rstrip('\n')
-                if not stripped.strip():
-                    td.records.append(None)
-                else:
+                rec = None
+                if stripped.strip():
                     try:
                         rec = json.loads(stripped)
                     except json.JSONDecodeError:
                         # First malformed complete line latches the
-                        # error flag. The previously-folded records
-                        # this tick still landed in td, so callers
-                        # may still flush patches for them.
+                        # error flag. Anything we already read this
+                        # tick still flows back to the caller.
                         tail.error = True
                         break
                     if not isinstance(rec, dict):
-                        td.records.append(None)
-                    else:
-                        td.records.append(rec)
-                        dirty |= _fold_record(td, cur=tail.cursor, rec=rec,
-                                              n=n, path=path,
-                                              sub_dir=sub_dir)
+                        rec = None
+                new_records.append((n, rec))
+                if td is not None:
+                    td.records.append(rec)
+                    if rec is not None:
+                        dirty |= _fold_record(td, cur=tail.cursor,
+                                              rec=rec, n=n,
+                                              path=path, sub_dir=sub_dir)
                 tail.byte_offset = f.tell()
                 n += 1
+        # Keep ``tail.start_line`` in sync for flat-only paths; tree
+        # mode reads it back from ``td.records`` on the next call.
+        if td is None:
+            tail.start_line = n
         tail.last_size = size
     finally:
         tail.lock.release()
-    return dirty
+    return (new_records, dirty)
 
 
 def _item_to_upsert_kwargs(item):
@@ -2826,36 +2848,35 @@ def _tail_worker(b):
 
     Best-effort and single-threaded — one file per tick, the file
     being the one the cursor currently sits in (per the flat/tree
-    rule encoded in ``_cursor_tail_path``). Bails fast on lock
-    contention, missing tail state, error-latched files, or files
-    whose size hasn't advanced. The expensive work — diffing
-    ``get_children`` against ``state._children`` — happens off the
-    main thread; only ``update_data`` is dispatched cross-thread.
+    rule encoded in ``_cursor_tail_path``). Reads new bytes via the
+    shared ``_read_new_records`` step, then dispatches mode-specific
+    push:
+
+      * Tree mode consumes the ``dirty_parents`` set returned by the
+        fold step (each parent umbrella's child list grew).
+      * Flat mode consumes the raw ``records`` list and emits one
+        ``upsert`` per new line, positioned after the last subagent
+        row.
 
     Stopped via the module-level ``_TAIL_STOP`` event when ``main``
-    exits. Marked daemon as a backstop so the thread doesn't keep
-    the process alive on its own.
+    exits. Marked daemon as a backstop.
     """
     while not _TAIL_STOP.is_set():
         try:
             path = _resolve_tail_path_from_browser(b)
             if path is not None:
                 _maybe_bootstrap_tail_state(path)
-                if _TREE_MODE:
-                    # Tree mode: incremental fold + targeted
-                    # update_data patches for grown umbrellas.
-                    dirty = _fold_new_lines(path)
-                    if dirty:
+                records, dirty = _read_new_records(path)
+                if records or dirty:
+                    if _TREE_MODE:
                         _push_tail_diffs(b, dirty)
-                else:
-                    # Flat mode: the listing is newest-first and
-                    # ``update_data`` upsert appends to the end of
-                    # the children list, which would put new rows in
-                    # the wrong place. Use ``Browser.refresh(path)``
-                    # to force a re-fetch via the recipe's
-                    # ``get_children`` — the file-read cost is the
-                    # tradeoff for keeping the simple flat reader.
-                    _maybe_refresh_flat_on_change(b, path)
+                    else:
+                        _push_flat_inserts(b, path, records)
+                    # Bust the preview cache for the file so the
+                    # session-card preview re-renders even when the
+                    # cursor stayed parked on a row above the
+                    # changed listing.
+                    b.post(lambda p=path: _bust_preview_for_path(b, p))
         except Exception:
             # Best-effort: a malformed cursor row / get_children
             # blowup must not kill the worker. Swallow silently;
@@ -2874,93 +2895,71 @@ def _maybe_bootstrap_tail_state(path):
     worker started observing this file (e.g. the file grew after
     the initial get_children call but before the worker's first
     tick on it). Forcing the first post-bootstrap tick to see
-    ``size > 0`` triggers a refresh that syncs the cache.
+    ``size > 0`` triggers the read that syncs the cache.
     """
     if path in _TAIL_STATE:
         return
     _TAIL_STATE[path] = _TailState(
-        byte_offset=0, last_size=0,
+        byte_offset=0, last_size=0, start_line=0,
         cursor=_ScanCursor(), error=False,
     )
 
 
-def _maybe_refresh_flat_on_change(b, path):
-    """Flat-mode tail step: insert new rows at the head of the list.
+def _push_flat_inserts(b, path, records):
+    """Flat-mode push: build Items for new records and insert them.
 
-    Flat mode renders messages newest-first, so newly-appended file
-    records belong at the **start** of ``state._children[path]``.
-    ``upsert(..., where=('first', None))`` lands each new id at index
-    0; iterating new rows in reverse (oldest of the new batch first)
-    leaves the actual newest record at position 0 after the batch.
-    Truncation-marker drops or aged-out rows are removed in the same
-    batch so the list stays consistent with ``_list_messages``.
+    The flat-mode listing renders messages newest-first, so each new
+    file record belongs **before** the rest of the message rows but
+    **after** the trailing subagent group (which
+    ``_list_session_children`` pins to the top). ``where=('after',
+    None, last_sub_idx)`` with ``last_sub_idx = -1`` (no subagents)
+    collapses to position 0 via the int-ref edge rule.
 
-    Everything goes through one ``update_data`` call — the framework
-    applies the batch in a single main-loop tick and runs
-    ``_apply_cursor_anchor`` exactly once afterward, so a user
-    holding ↑/↓ doesn't see the cursor jump mid-tick.
-
-    Separately, bust the preview cache for the file's id so the
-    session-card preview picks up the new content even when the user
-    is parked on the session row at a scope above (cache-hit gate
-    would otherwise skip the re-fetch).
+    Iterating new rows in reverse (oldest of the new batch first)
+    leaves the freshest record at the head of the new group. The
+    whole batch goes through one ``update_data`` call so the
+    framework's cursor anchor runs exactly once at the end and
+    holding ↑/↓ doesn't see the cursor jump.
     """
-    tail = _TAIL_STATE.get(path)
-    if tail is None or tail.error:
+    if not records:
         return
-    try:
-        size = os.path.getsize(path)
-    except OSError:
-        return
-    if size < tail.last_size:
-        tail.error = True
-        return
-    if size == tail.last_size:
-        return
-    tail.last_size = size
-    tail.byte_offset = size
-
     state = b._state
-    if path in state._children:
-        try:
-            fresh = get_children(path)
-        except Exception:
-            fresh = None
-        if fresh is not None:
-            existing = state._children[path]
-            existing_ids = {it.id for it in existing}
-            # ``new_rows`` is in newest-first order (the head of
-            # ``fresh``); reversing it before upserting at the same
-            # position means the freshest record lands closest to
-            # the head of the new group. Live updates only ADD —
-            # the message-cap truncation only applies at initial
-            # load, so we never remove rows here even if ``fresh``
-            # would have dropped them.
-            new_rows = [it for it in fresh if it.id not in existing_ids]
+    if path not in state._children:
+        return
+    existing = state._children[path]
+    existing_ids = {it.id for it in existing}
 
-            # ``_list_session_children`` puts subagent rows first,
-            # then messages. New messages must land **after** the
-            # last existing subagent so they don't punch above the
-            # subagent group. -1 (no subagents) collapses to position
-            # 0 via the framework's int-ref edge rule.
-            last_sub_idx = -1
-            for i, it in enumerate(existing):
-                if isinstance(it.id, str) and '#agent:' in it.id:
-                    last_sub_idx = i
-            where = ('after', None, last_sub_idx)
+    last_sub_idx = -1
+    for i, it in enumerate(existing):
+        if isinstance(it.id, str) and '#agent:' in it.id:
+            last_sub_idx = i
+    where = ('after', None, last_sub_idx)
 
-            ops = []
-            for it in reversed(new_rows):
-                ops.append(upsert(it.id, path,
-                                  where=where,
-                                  **_item_to_upsert_kwargs(it)))
-            if ops:
-                b.update_data(ops)
-
-    # Force the preview pane to re-fetch when its cached text is for
-    # this file (or one of its line ids). Posted onto the main thread
-    # so the mutation respects the framework's single-writer rules.
-    b.post(lambda: _bust_preview_for_path(b, path))
+    ops = []
+    for n, rec in reversed(records):
+        if rec is None:
+            continue
+        item_id = f'{path}#{n}'
+        if item_id in existing_ids:
+            continue
+        kind = _kind_of(rec)
+        fields = {
+            'title': _oneline(_summarise_message(rec)),
+            'tag': kind,
+            'tag_style': _TAG_STYLE_FOR_KIND.get(kind, ''),
+            'has_children': False,
+            'kind': 'message',
+            'line_no': n,
+            'session_path': path,
+            'message_kind': kind,
+        }
+        if _is_voice(rec):
+            bg = _ROW_BG_FOR_KIND.get(kind)
+            if bg is not None:
+                fields['row_bg'] = bg
+        ops.append(upsert(item_id, path, where=where, **fields))
+    if ops:
+        b.update_data(ops)
 
 
 def _bust_preview_for_path(b, path):
