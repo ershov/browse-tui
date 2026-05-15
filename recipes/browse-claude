@@ -2931,17 +2931,29 @@ def _maybe_refresh_flat_on_change(b, path):
             existing_ids = {it.id for it in existing}
             fresh_ids = {it.id for it in fresh}
             # ``new_rows`` is in newest-first order (the head of
-            # ``fresh``); reversing it before upserting at "first"
-            # means the freshest record ends up at index 0.
+            # ``fresh``); reversing it before upserting at the same
+            # position means the freshest record lands closest to
+            # the head of the new group.
             new_rows = [it for it in fresh if it.id not in existing_ids]
             removed_ids = [it.id for it in existing if it.id not in fresh_ids]
+
+            # ``_list_session_children`` puts subagent rows first,
+            # then messages. New messages must land **after** the
+            # last existing subagent so they don't punch above the
+            # subagent group. -1 (no subagents) collapses to position
+            # 0 via the framework's int-ref edge rule.
+            last_sub_idx = -1
+            for i, it in enumerate(existing):
+                if isinstance(it.id, str) and '#agent:' in it.id:
+                    last_sub_idx = i
+            where = ('after', None, last_sub_idx)
 
             ops = []
             for rid in removed_ids:
                 ops.append(remove(rid))
             for it in reversed(new_rows):
                 ops.append(upsert(it.id, path,
-                                  where=('first', None),
+                                  where=where,
                                   **_item_to_upsert_kwargs(it)))
             if ops:
                 b.update_data(ops)

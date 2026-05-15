@@ -2487,40 +2487,92 @@ class TestLiveTail(unittest.TestCase):
         finally:
             os.unlink(path)
 
-    def test_flat_tail_emits_first_position_upserts(self):
-        # Flat mode incremental insert: when the file grows, the
-        # tail emits ``upsert(..., where=('first', None))`` per new
-        # row (in reverse order) so they end up at the head of the
-        # newest-first list — and ``remove(id)`` for anything that
-        # aged out via the truncation cap.
+    def _fake_browser_with_children(self, path, children):
+        seen_ops = []
+
+        class FakeState:
+            def __init__(s):
+                s._children = {path: list(children)}
+        class FakeBrowser:
+            def __init__(s):
+                s._state = FakeState()
+            def update_data(s, ops):
+                seen_ops.append(list(ops))
+            def post(s, fn):
+                pass
+        return FakeBrowser(), seen_ops
+
+    def test_flat_tail_inserts_after_last_subagent(self):
+        # New flat-mode rows must land AFTER the trailing subagent
+        # row so the subagent group keeps its sticky-top position.
+        # No subagents → ref=-1 collapses to position 0 (top).
+        # Has subagents → ref=last_sub_idx → ``after`` lands at the
+        # first non-subagent slot.
         path = self._write_jsonl([
             {'type': 'user', 'uuid': 'u1',
              'message': {'role': 'user', 'content': 'one'}},
         ])
         try:
-            # Bootstrap _TAIL_STATE; simulate the framework having
-            # populated state._children[path] with one row.
             self.r._scan_tree(path)
             saved_tree = self.r._TREE_MODE
             self.r._TREE_MODE = False
             try:
-                fake_existing = self.r._list_messages(path)
-                seen_ops = []
+                # Pretend two subagent rows are pinned at the top
+                # of the cached children list. Their ids match the
+                # ``<sess>#agent:<aid>`` shape so the recipe's filter
+                # finds them.
+                fake_msgs = self.r._list_messages(path)
+                fake_subs = [
+                    self.r.Item(id=f'{path}#agent:SUB_A',
+                                title='<subagent>  A'),
+                    self.r.Item(id=f'{path}#agent:SUB_B',
+                                title='<subagent>  B'),
+                ]
+                fake_subs[0].kind = 'subagent'
+                fake_subs[1].kind = 'subagent'
+                fake_b, seen_ops = self._fake_browser_with_children(
+                    path, fake_subs + fake_msgs,
+                )
 
-                class FakeState:
-                    def __init__(s):
-                        s._children = {path: list(fake_existing)}
-                class FakeBrowser:
-                    def __init__(s):
-                        s._state = FakeState()
-                    def update_data(s, ops):
-                        seen_ops.append(list(ops))
-                    def post(s, fn):
-                        pass    # no-op for this unit test
-                fake_b = FakeBrowser()
+                # Append a new message; tail should insert after
+                # SUB_B (index 1 in existing).
+                self._append(path, [
+                    {'type': 'user', 'uuid': 'u2',
+                     'message': {'role': 'user', 'content': 'two'}},
+                ])
+                self.r._TAIL_STATE[path].last_size = 1
 
-                # Append two new records to disk; tail should pick
-                # up both as new rows.
+                self.r._maybe_refresh_flat_on_change(fake_b, path)
+
+                self.assertEqual(len(seen_ops), 1)
+                ops = seen_ops[0]
+                upserts = [op for op in ops if op[0] == 'upsert']
+                self.assertEqual(len(upserts), 1)
+                # Where descriptor should target ``after`` index 1
+                # (the last subagent's position).
+                self.assertEqual(upserts[0][4], ('after', None, 1))
+            finally:
+                self.r._TREE_MODE = saved_tree
+        finally:
+            os.unlink(path)
+
+    def test_flat_tail_no_subagents_uses_minus_one(self):
+        # No subagents in the existing list → ref=-1, which the
+        # framework collapses to position 0 (top of list).
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'one'}},
+        ])
+        try:
+            self.r._scan_tree(path)
+            saved_tree = self.r._TREE_MODE
+            self.r._TREE_MODE = False
+            try:
+                fake_msgs = self.r._list_messages(path)
+                fake_b, seen_ops = self._fake_browser_with_children(
+                    path, fake_msgs,
+                )
+
                 self._append(path, [
                     {'type': 'user', 'uuid': 'u2',
                      'message': {'role': 'user', 'content': 'two'}},
@@ -2529,30 +2581,17 @@ class TestLiveTail(unittest.TestCase):
                          {'type': 'text', 'text': 'three'},
                      ]}},
                 ])
-                # Force last_size into a smaller value so the change
-                # check fires (bulk scan set it to current size).
-                tail = self.r._TAIL_STATE[path]
-                tail.last_size = 1
+                self.r._TAIL_STATE[path].last_size = 1
 
                 self.r._maybe_refresh_flat_on_change(fake_b, path)
 
-                self.assertEqual(len(seen_ops), 1,
-                                 f'expected one update_data batch, got '
-                                 f'{seen_ops!r}')
                 ops = seen_ops[0]
-                # Two upserts, each carrying the where=('first', None)
-                # positioning descriptor.
                 upserts = [op for op in ops if op[0] == 'upsert']
                 self.assertEqual(len(upserts), 2)
                 for op in upserts:
-                    self.assertEqual(len(op), 5,
-                                     f'expected 5-tuple upsert (with '
-                                     f'where), got {op!r}')
-                    self.assertEqual(op[4], ('first', None))
-                # No removes (file just grew, no truncation cap hit).
+                    self.assertEqual(op[4], ('after', None, -1))
                 self.assertFalse(
                     [op for op in ops if op[0] == 'remove'],
-                    f'unexpected remove ops: {ops!r}',
                 )
             finally:
                 self.r._TREE_MODE = saved_tree
