@@ -455,6 +455,41 @@ def set_item(id, parent_id, *, where=None, **fields):
     return ('set', id, parent_id, fields, where)
 
 
+# Sentinel for ``mod``'s ``parent_id`` argument meaning "don't touch
+# the parent". Distinct from ``None`` (which means root for
+# ``state.root_id is None`` setups, or an explicit None-parent
+# otherwise) and from any string id.
+class _KeepParent:
+    __slots__ = ()
+
+    def __repr__(self):
+        return 'KEEP_PARENT'
+
+
+KEEP_PARENT = _KeepParent()
+
+
+def mod(id, parent_id=KEEP_PARENT, *, where=None, **fields):
+    """Construct a ``("mod", id, parent_id, fields[, where])`` op tuple.
+
+    ``mod`` is the patch-only counterpart to ``upsert`` / ``set``:
+    if the id is unknown the op is a silent no-op (no insert). Use
+    it for safe field updates when the id might not yet exist (e.g.
+    streaming sources).
+
+    ``parent_id`` defaults to ``KEEP_PARENT`` — don't change the
+    parent. An explicit value (str id or ``None``) triggers a reparent
+    of the existing row.
+
+    ``where`` is honoured when the id exists; since ``mod`` never
+    inserts, positioning always implies repositioning (the
+    ``"reposition"`` flag in the options slot is unnecessary).
+    """
+    if where is None:
+        return ('mod', id, parent_id, fields)
+    return ('mod', id, parent_id, fields, where)
+
+
 def remove(id):
     """Construct a ``("remove", id)`` op tuple."""
     return ('remove', id)
@@ -681,8 +716,8 @@ def _apply_upsert(state: State, id_, parent_id, fields, where=None) -> bool:
 
     if parent_id is None:
         # Patch-only: leave parent unchanged. Mutating fields like
-        # ``has_children`` / ``title`` affects what the visible-tree
-        # builder emits, so this is structural too.
+        # ``has_children`` / ``title`` / ``hidden`` affects what the
+        # visible-tree builder emits, so this is structural.
         return True
 
     reposition = (
@@ -848,6 +883,115 @@ def _apply_set(state: State, id_, parent_id, fields, where=None) -> bool:
     return True
 
 
+def _apply_mod(state: State, id_, parent_id, fields, where=None) -> bool:
+    """Apply one ``mod`` op. Returns True if structure changed.
+
+    Patch-only: never inserts. Unknown id is a silent no-op. When
+    ``parent_id is KEEP_PARENT`` the parent is left untouched;
+    otherwise the row is reparented (``None`` means root for
+    ``state.root_id is None`` setups). ``where`` (optional) repositions
+    the row in its target parent's children list; reposition is
+    implicit (no need for the ``"reposition"`` options flag).
+    """
+    if where is not None:
+        _validate_where(where)
+    # Validate parent_id shape — KEEP_PARENT sentinel, str, or None.
+    if (
+        parent_id is not KEEP_PARENT
+        and parent_id is not None
+        and not isinstance(parent_id, str)
+    ):
+        raise ValueError(
+            f'mod parent_id must be a str, None, or KEEP_PARENT '
+            f'(got {type(parent_id).__name__})'
+        )
+    existing = state._items_by_id.get(id_)
+    if existing is None:
+        # Unknown id — silent no-op. Streaming tolerance.
+        return False
+    # Patch-merge fields. Drop ``id`` from the patch — the op's id is
+    # authoritative (matches the upsert convention). Field patches on
+    # an existing row are treated as structural (same posture as
+    # ``_apply_upsert`` existing-id branch — title/tag/hidden all
+    # affect the visible cache and the rendered output).
+    fields_no_id = {k: v for k, v in fields.items() if k != 'id'}
+    for k, v in fields_no_id.items():
+        setattr(existing, k, v)
+    structural = True
+
+    if parent_id is KEEP_PARENT:
+        # No reparent; no repositioning unless ``where`` was given.
+        if where is None:
+            return structural
+        # Reposition within current parent.
+        cur_parent = state._parent_of_id.get(id_)
+        children_list = state._children.get(cur_parent)
+        if children_list is None:
+            return structural
+        target_idx = _resolve_where_index(
+            children_list, where, self_id=id_
+        )
+        if target_idx is None:
+            # Same-id pivot — leave position unchanged.
+            return structural
+        cur_idx = None
+        for i, child in enumerate(children_list):
+            if child.id == id_:
+                cur_idx = i
+                break
+        if cur_idx is None:
+            return structural
+        del children_list[cur_idx]
+        if target_idx > cur_idx:
+            target_idx -= 1
+        children_list.insert(target_idx, existing)
+        return True
+
+    # Reparent path. ``parent_id`` is a real id or ``None``.
+    old_parent = state._parent_of_id.get(id_)
+    if old_parent != parent_id:
+        old_list = state._children.get(old_parent)
+        if old_list:
+            for i, child in enumerate(old_list):
+                if child.id == id_:
+                    del old_list[i]
+                    break
+        new_list = state._children.setdefault(parent_id, [])
+        if where is None:
+            new_list.append(existing)
+        else:
+            idx = _resolve_where_index(new_list, where, self_id=id_)
+            if idx is None:
+                idx = len(new_list)
+            new_list.insert(idx, existing)
+        state._parent_of_id[id_] = parent_id
+        return True
+    # Same parent — reposition only if ``where`` given.
+    if where is not None:
+        children_list = state._children.get(parent_id)
+        if children_list is None:
+            state._children[parent_id] = [existing]
+            return True
+        target_idx = _resolve_where_index(
+            children_list, where, self_id=id_
+        )
+        if target_idx is None:
+            return structural
+        cur_idx = None
+        for i, child in enumerate(children_list):
+            if child.id == id_:
+                cur_idx = i
+                break
+        if cur_idx is None:
+            return structural
+        del children_list[cur_idx]
+        if target_idx > cur_idx:
+            target_idx -= 1
+        children_list.insert(target_idx, existing)
+        return True
+    return structural
+
+
 def _apply_remove(state: State, id_) -> bool:
     """Apply one ``remove`` op. Returns True if structure changed."""
     if id_ not in state._items_by_id:
@@ -920,6 +1064,11 @@ def apply_ops(state: State, ops) -> None:
             _, id_, parent_id, fields, *rest = op
             where = rest[0] if rest else None
             if _apply_set(state, id_, parent_id, fields, where):
+                structural = True
+        elif kind == 'mod':
+            _, id_, parent_id, fields, *rest = op
+            where = rest[0] if rest else None
+            if _apply_mod(state, id_, parent_id, fields, where):
                 structural = True
         elif kind == 'remove':
             _, id_ = op
@@ -1077,6 +1226,11 @@ def _emit_children(state, children, depth, out):
 
     Iterative DFS — uses an explicit worklist. Each frame is
     ``(siblings_iter, depth)``; we push deeper frames as we descend.
+
+    Items with ``hidden=True`` are skipped entirely: no row is
+    emitted, and no recursion into their subtree happens. This is
+    the render-only cascade for the per-row visibility flag — see
+    ``docs/superpowers/specs/2026-05-16-row-visibility-design.md``.
     """
     # Worklist holds iterators of (item, depth) pairs to consume. We use
     # iter() so resuming a parent frame after recursing into a child is
@@ -1089,6 +1243,11 @@ def _emit_children(state, children, depth, out):
             child, d = next(siblings)
         except StopIteration:
             stack.pop()
+            continue
+        if getattr(child, 'hidden', False):
+            # Hidden row: emit nothing and skip its subtree. The flag
+            # is per-row; descendants' own ``hidden`` values are
+            # preserved and take effect once the ancestor is shown.
             continue
         out.append(VisibleEntry(item=child, depth=d, kind='normal'))
         if not child.has_children or child.id not in state.expanded:
@@ -2018,7 +2177,21 @@ class Browser:
         ops_list = list(ops)
 
         def _apply():
+            # Snapshot the pre-mutation visible list and cursor index
+            # so hide-driven displacement can walk back through what
+            # the user was looking at. See
+            # ``_apply_hide_displacement`` for the rule.
+            pre_vis = visible_items(self._state)
+            pre_vis_ids = [entry.item.id for entry in pre_vis]
+            pre_cursor = self._state.cursor
+
             apply_ops(self._state, ops_list)
+
+            # Hide-displacement takes precedence over the anchor for
+            # rows that were hidden (not deleted). When it runs it
+            # re-anchors from the new cursor, so the subsequent
+            # ``_apply_cursor_anchor`` primary-matches and is a no-op.
+            self._apply_hide_displacement(pre_vis_ids, pre_cursor)
             # Re-snap the cursor onto its anchored id before flagging
             # redraws. A streaming push that inserts items above the
             # cursor would otherwise shift its index off the original
@@ -3504,6 +3677,65 @@ class Browser:
         snap = self._compute_anchor_snapshot()
         if snap:
             self._cursor_anchor = snap
+
+    def _apply_hide_displacement(self, pre_vis_ids, pre_cursor) -> bool:
+        """Displace the cursor when its row was hidden (not deleted).
+
+        Called from ``Browser.update_data._apply`` after ``apply_ops``
+        has run, using a snapshot of the visible list captured before
+        the mutation. Returns True iff displacement happened.
+
+        The rule (per
+        ``docs/superpowers/specs/2026-05-16-row-visibility-design.md``):
+
+          * If the cursor's previous row id is still in visible_items
+            after the mutation, do nothing.
+          * Else, if the id was *deleted* (not in ``_items_by_id``),
+            do nothing — the cursor anchor's fallback chain handles
+            structural displacement.
+          * Else (id still exists but became hidden): walk back
+            through the pre-mutation visible list from ``pre_cursor``,
+            find the first id still visible after the mutation, and
+            move the cursor there. If no such id exists, land on
+            row 0 of the new visible list (or stay at 0 if it's
+            empty). Re-anchor from the new cursor.
+
+        This is intentionally separate from the anchor's chain
+        because filtering implies the user (or recipe) deliberately
+        changed what's visible — cursor movement is *expected*.
+        """
+        if not pre_vis_ids:
+            return False
+        if pre_cursor < 0 or pre_cursor >= len(pre_vis_ids):
+            return False
+        pre_cursor_id = pre_vis_ids[pre_cursor]
+        post_vis = visible_items(self._state)
+        post_id_to_idx = {
+            entry.item.id: i for i, entry in enumerate(post_vis)
+        }
+        if pre_cursor_id in post_id_to_idx:
+            return False
+        if pre_cursor_id not in self._state._items_by_id:
+            # Row was deleted (not hidden) — leave it to the anchor.
+            return False
+        # Walk back through the pre-mutation visible list looking for
+        # a still-visible row.
+        new_idx = None
+        for i in range(pre_cursor - 1, -1, -1):
+            if pre_vis_ids[i] in post_id_to_idx:
+                new_idx = post_id_to_idx[pre_vis_ids[i]]
+                break
+        if new_idx is None:
+            # No earlier row survived — land on the new first row.
+            new_idx = 0
+        if not post_vis:
+            self._state.cursor = 0
+        elif self._state.cursor != new_idx:
+            self._state.cursor = new_idx
+            mark_cursor_changed(self)
+            self._snap_list_scroll_to_row(new_idx)
+        self._reanchor_cursor()
+        return True
 
     def _apply_cursor_anchor(self) -> bool:
         """Snap ``state.cursor`` onto the anchored id (or its closest

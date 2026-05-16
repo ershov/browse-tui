@@ -31,6 +31,9 @@ class Item:
     tag_style: str = ''      # 'green'|'red'|'yellow'|'gray'|'cyan'
                              # |'blue'|'magenta'|'dim'
     has_children: bool = False  # controls ▼/▶ marker, drives expansion
+    hidden: bool = False     # per-row visibility — skipped at render time
+                             # (cascades over the subtree); see Visibility
+                             # under `browser.update_data` below
 ```
 
 `Item` is intentionally non-slotted: recipes can attach arbitrary
@@ -66,11 +69,11 @@ When a `get_children` callback returns a list, each element is run through
 | -------------- | ------------------------------------------------------------------- |
 | `Item(...)`    | identity                                                            |
 | `'hello'`      | `Item(id='hello')` (title defaults to `'hello'`)                    |
-| `('a', 'B')`   | `Item('a', 'B')` — positional, 1-5 elements                         |
+| `('a', 'B')`   | `Item('a', 'B')` — positional, 1-6 elements                         |
 | `{'id': 'a'}`  | `Item(**{'id': 'a'})` — extras land as attributes on the result     |
 
-Tuples shorter than 1 or longer than 5 raise `TypeError`. Dicts must contain
-an `id` key.
+Tuples shorter than 1 or longer than 6 raise `TypeError`. Dicts must contain
+an `id` key. The 6-tuple form maps to `(id, title, tag, tag_style, has_children, hidden)`.
 
 ```python
 from browse_tui import to_item
@@ -582,6 +585,7 @@ separate `update_data` calls are not — each is its own post-queue task.
 | --------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `("upsert", id, parent_id, fields[, where])`        | Insert under `parent_id` if new; **patch-merge** in place if known (matching keys override `Item` fields, others land as custom attrs). Reparents if `parent_id` differs from the existing parent. `parent_id=None` patches fields only (silent no-op if `id` is unknown and `state.root_id` is not None). Optional `where` carries a positioning descriptor — see *Positioning* below. |
 | `("set", id, parent_id, fields[, where])`           | Insert-or-replace. `fields` is the entire record; unspecified `Item` fields revert to dataclass defaults; custom attrs are dropped. A new `Item` instance is constructed. Children stored under `_children[id]` are preserved. Optional `where` carries a positioning descriptor — see *Positioning* below.                                |
+| `("mod", id, parent_id, fields[, where])`           | **Patch only — never inserts.** Silent no-op if `id` is unknown. `parent_id=KEEP_PARENT` (default) leaves parent untouched; any other value reparents. `where` always implies reposition (no `"reposition"` flag needed). See *Visibility* below for the main use case. |
 | `("remove", id)`                                    | Remove the item. Cascades: `_children[id]` is also dropped along with all descendant index entries.                                                                                              |
 | `("clear_children", parent_id)`                     | Drop all known children of `parent_id`; cache entry reverts to "no fetch yet"; `_loading[parent_id]` flips to False.                                                                             |
 | `("complete", parent_id)`                           | Clear the loading flag (`_loading[parent_id] = False`).                                                                                                                                          |
@@ -686,6 +690,53 @@ def cpu_pulse(browser):
                               tag_style='red' if cpu > 50 else 'dim'))
         browser.update_data(ops)        # one batch, one render
 ```
+
+##### Visibility (`hidden` flag on `Item` + `mod` op)
+
+`Item.hidden` is a per-row visibility flag (default `False` = visible).
+Hidden rows are skipped at render time, and a hidden expandable parent
+cascades over its entire subtree — descendants of a hidden ancestor
+render nothing, but their own `hidden` values are preserved (revealing
+the parent reinstates descendants with their individual states).
+
+Set at row creation via the `hidden=` kwarg on `upsert` / `set_item`:
+
+```python
+ctx.upsert('debug-row', 'parent', title='Debug', hidden=True)
+```
+
+Toggle dynamically via the **`mod` op** — patch-only, never inserts:
+
+```python
+from browse_tui import mod, KEEP_PARENT
+ctx.update_data([
+    mod('id-1', hidden=True),
+    mod('id-2', hidden=True),
+    mod('id-3', hidden=False),
+])
+```
+
+`mod` is patch-only by design: out-of-order or speculative toggles
+against ids that haven't arrived yet are silent no-ops, not inserts.
+`parent_id` defaults to the `KEEP_PARENT` sentinel ("leave the parent
+alone"); pass an explicit id (or `None`) to also reparent the row.
+
+`Context` does **not** expose a `ctx.mod(...)` convenience method —
+visibility toggles tend to come in batches, and the batched
+`update_data` route encourages efficient composition.
+
+**Cursor on a hidden row.** When `update_data` hides the row the
+cursor was on, the framework walks back through the pre-mutation
+visible list to find the first row still visible and parks the cursor
+there. If no earlier row survives, the cursor lands on the new first
+visible row. The walk-back is intentionally separate from the
+cursor anchor's fallback chain (which handles deletions): hide
+*expects* cursor movement; deletion *preserves* cursor identity.
+
+**Search and hidden compose with AND.** Hidden is absolute — search
+mode never elevates a hidden row, including hidden ancestors of
+matching descendants. Recipes that want matches to override hide
+should flip `hidden` themselves in response to search events.
 
 ##### Behavioural change vs. pre-streaming API
 
@@ -799,18 +850,23 @@ Six tagged-tuple constructors so recipes don't hand-roll op shapes:
 from browse_tui import upsert, set_item, remove, clear_children, complete, incomplete
 ```
 
-| Helper                                                    | Returns                                                             |
-| --------------------------------------------------------- | ------------------------------------------------------------------- |
-| `upsert(id, parent_id, *, where=None, **fields)`          | `("upsert", id, parent_id, fields)` or `(..., where)` if `where`    |
-| `set_item(id, parent_id, *, where=None, **fields)`        | `("set",    id, parent_id, fields)` or `(..., where)` if `where`    |
-| `remove(id)`                                              | `("remove", id)`                                                    |
-| `clear_children(parent_id)`                               | `("clear_children", parent_id)`                                     |
-| `complete(parent_id)`                                     | `("complete", parent_id)`                                           |
-| `incomplete(parent_id)`                                   | `("incomplete", parent_id)`                                         |
+| Helper                                                              | Returns                                                                 |
+| ------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| `upsert(id, parent_id, *, where=None, **fields)`                    | `("upsert", id, parent_id, fields)` or `(..., where)` if `where`        |
+| `set_item(id, parent_id, *, where=None, **fields)`                  | `("set",    id, parent_id, fields)` or `(..., where)` if `where`        |
+| `mod(id, parent_id=KEEP_PARENT, *, where=None, **fields)`           | `("mod",    id, parent_id, fields)` or `(..., where)` if `where`        |
+| `remove(id)`                                                        | `("remove", id)`                                                        |
+| `clear_children(parent_id)`                                         | `("clear_children", parent_id)`                                         |
+| `complete(parent_id)`                                               | `("complete", parent_id)`                                               |
+| `incomplete(parent_id)`                                             | `("incomplete", parent_id)`                                             |
 
 `where` is keyword-only — it cannot collide positionally with a field
 name. See *Positioning* under `browser.update_data` for the descriptor
 shape and semantics.
+
+`mod`'s `parent_id` defaults to the `KEEP_PARENT` module-level sentinel —
+patch fields without reparenting. See *Visibility* under
+`browser.update_data` for the main use case.
 
 The `set` helper is named `set_item` because shadowing the built-in via
 `from browse_tui import set` would be hostile to recipes.
@@ -880,6 +936,8 @@ What actually lives at `browse_tui.<name>`:
 | `coerce_has_children`     | function    |
 | `upsert`                  | function    |
 | `set_item`                | function    |
+| `mod`                     | function    |
+| `KEEP_PARENT`             | sentinel    |
 | `remove`                  | function    |
 | `clear_children`          | function    |
 | `complete`                | function    |

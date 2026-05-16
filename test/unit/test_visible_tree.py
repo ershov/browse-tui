@@ -278,5 +278,108 @@ class TestInsertionOrder(unittest.TestCase):
         )
 
 
+class TestHiddenFlag(unittest.TestCase):
+    """``hidden=True`` excludes a row and its subtree at render time."""
+
+    def test_hidden_leaf_omitted(self):
+        a = _kid('a')
+        b = Item(id='b', hidden=True)
+        c = _kid('c')
+        s = _state_factory(root_id=None, _children={None: [a, b, c]})
+        self.assertEqual(
+            _ids(visible_items(s)),
+            [('a', 0, 'normal'), ('c', 0, 'normal')],
+        )
+
+    def test_hidden_parent_hides_subtree(self):
+        parent = Item(id='p', has_children=True, hidden=True)
+        child = _kid('c')
+        s = _state_factory(
+            root_id=None,
+            _children={None: [parent], 'p': [child]},
+            expanded={'p'},
+        )
+        self.assertEqual(visible_items(s), [])
+
+    def test_hidden_parent_with_visible_sibling(self):
+        a = _kid('a')
+        hidden_parent = Item(id='b', has_children=True, hidden=True)
+        c = _kid('c')
+        sub1 = _kid('b1')
+        sub2 = _kid('b2')
+        s = _state_factory(
+            root_id=None,
+            _children={None: [a, hidden_parent, c], 'b': [sub1, sub2]},
+            expanded={'b'},
+        )
+        self.assertEqual(
+            _ids(visible_items(s)),
+            [('a', 0, 'normal'), ('c', 0, 'normal')],
+        )
+
+    def test_hidden_grandchild(self):
+        # Hidden grandchild is omitted; siblings of grandchild emitted.
+        parent = _kid('p', has_children=True)
+        sub_visible = _kid('s1')
+        sub_hidden = Item(id='s2', hidden=True)
+        sub_visible2 = _kid('s3')
+        s = _state_factory(
+            root_id=None,
+            _children={
+                None: [parent],
+                'p': [sub_visible, sub_hidden, sub_visible2],
+            },
+            expanded={'p'},
+        )
+        self.assertEqual(
+            _ids(visible_items(s)),
+            [
+                ('p', 0, 'normal'),
+                ('s1', 1, 'normal'),
+                ('s3', 1, 'normal'),
+            ],
+        )
+
+    def test_unhiding_parent_restores_child_state(self):
+        # Per spec: render-only cascade. Child's own ``hidden`` is
+        # preserved while the parent is hidden; flipping the parent
+        # back doesn't disturb child state.
+        parent = Item(id='p', has_children=True, hidden=True)
+        child_visible = _kid('c1')
+        child_hidden = Item(id='c2', hidden=True)
+        s = _state_factory(
+            root_id=None,
+            _children={
+                None: [parent],
+                'p': [child_visible, child_hidden],
+            },
+            expanded={'p'},
+        )
+        # Initially hidden — nothing visible.
+        self.assertEqual(visible_items(s), [])
+        # Flip parent visible.
+        parent.hidden = False
+        mark_visible_dirty(s)
+        # Child2 stays hidden; child1 reappears.
+        self.assertEqual(
+            _ids(visible_items(s)),
+            [('p', 0, 'normal'), ('c1', 1, 'normal')],
+        )
+
+    def test_hidden_root_child_with_pending(self):
+        # Hidden expandable + expanded → pending placeholder is not
+        # emitted (the whole subtree is skipped).
+        hidden_parent = Item(id='p', has_children=True, hidden=True)
+        s = _state_factory(
+            root_id=None,
+            _children={None: [hidden_parent]},
+            expanded={'p'},
+        )
+        # 'p' is expanded but the cache for 'p' is empty (no entry) —
+        # would normally emit a pending placeholder under it. Hidden
+        # ancestor skips the whole subtree.
+        self.assertEqual(visible_items(s), [])
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -108,10 +108,16 @@ class TestToItemFromTuple(unittest.TestCase):
         self.assertEqual(item.tag_style, 'green')
         self.assertTrue(item.has_children)
 
-    def test_six_or_more_elements_raises(self):
-        # 6+ elements have no field to land in; reject explicitly.
+    def test_six_elements_with_hidden(self):
+        item = to_item(('x', 'X', 'tag', 'green', True, True))
+        self.assertEqual(item.id, 'x')
+        self.assertTrue(item.has_children)
+        self.assertTrue(item.hidden)
+
+    def test_seven_or_more_elements_raises(self):
+        # 7+ elements have no field to land in; reject explicitly.
         with self.assertRaises(TypeError):
-            to_item(('x', 'X', 'tag', 'green', True, 'extra'))
+            to_item(('x', 'X', 'tag', 'green', True, False, 'extra'))
 
 
 class TestToItemFromDict(unittest.TestCase):

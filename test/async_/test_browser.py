@@ -1293,5 +1293,193 @@ class TestExpandGoal(unittest.TestCase):
             b.stop_workers()
 
 
+# ---- 10. Cursor hide-displacement (per-batch, walk-back) -----------------
+
+
+class TestHideDisplacement(unittest.TestCase):
+    """When the cursor's row gets hidden by an ``update_data`` batch,
+    the cursor walks back through the pre-mutation visible list to find
+    the previous visible row. See
+    ``docs/superpowers/specs/2026-05-16-row-visibility-design.md``.
+
+    Distinct from anchor displacement: anchor handles *deletion*; this
+    handles *hide*.
+    """
+
+    def test_cursor_on_hidden_row_walks_back(self):
+        b = make_browser(get_children=lambda _id: [
+            ('A',), ('B',), ('C',), ('D',),
+        ])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.cursor_to('C')
+            b.run_until_idle()
+            self.assertEqual(b._state.cursor, 2)
+
+            b.update_data([_state.mod('C', hidden=True)])
+            b.run_until_idle()
+            vis = _state.visible_items(b._state)
+            # 'C' gone; cursor on 'B' (the row above it in pre-mutation).
+            self.assertEqual([e.item.id for e in vis], ['A', 'B', 'D'])
+            self.assertEqual(b._state.cursor, 1)
+            self.assertEqual(vis[b._state.cursor].item.id, 'B')
+        finally:
+            b.stop_workers()
+
+    def test_cursor_lands_on_first_when_all_above_hidden(self):
+        b = make_browser(get_children=lambda _id: [
+            ('A',), ('B',), ('C',),
+        ])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.cursor_to('B')
+            b.run_until_idle()
+            # Hide A and B in one batch — no earlier visible row.
+            b.update_data([
+                _state.mod('A', hidden=True),
+                _state.mod('B', hidden=True),
+            ])
+            b.run_until_idle()
+            vis = _state.visible_items(b._state)
+            self.assertEqual([e.item.id for e in vis], ['C'])
+            # Walk-back found nothing → first visible row.
+            self.assertEqual(b._state.cursor, 0)
+            self.assertEqual(vis[b._state.cursor].item.id, 'C')
+        finally:
+            b.stop_workers()
+
+    def test_cursor_on_first_row_hidden_lands_on_new_first(self):
+        b = make_browser(get_children=lambda _id: [
+            ('A',), ('B',), ('C',),
+        ])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            self.assertEqual(b._state.cursor, 0)
+            b.update_data([_state.mod('A', hidden=True)])
+            b.run_until_idle()
+            vis = _state.visible_items(b._state)
+            self.assertEqual([e.item.id for e in vis], ['B', 'C'])
+            # Walk-back from row 0 finds nothing → first row of new.
+            self.assertEqual(b._state.cursor, 0)
+            self.assertEqual(vis[b._state.cursor].item.id, 'B')
+        finally:
+            b.stop_workers()
+
+    def test_unrelated_hide_does_not_move_cursor(self):
+        b = make_browser(get_children=lambda _id: [
+            ('A',), ('B',), ('C',),
+        ])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.cursor_to('B')
+            b.run_until_idle()
+            self.assertEqual(b._state.cursor, 1)
+            # Hide 'C', cursor on 'B' — no displacement needed.
+            b.update_data([_state.mod('C', hidden=True)])
+            b.run_until_idle()
+            vis = _state.visible_items(b._state)
+            self.assertEqual([e.item.id for e in vis], ['A', 'B'])
+            self.assertEqual(b._state.cursor, 1)
+            self.assertEqual(vis[b._state.cursor].item.id, 'B')
+        finally:
+            b.stop_workers()
+
+    def test_hidden_ancestor_displaces_cursor_on_descendant(self):
+        gc_root = [('P', None, None, '', True), ('X',)]
+
+        def gc(parent_id):
+            if parent_id in (None, ''):
+                return gc_root
+            if parent_id == 'P':
+                return [('P1',), ('P2',)]
+            return []
+
+        b = make_browser(get_children=gc)
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.expand('P')
+            b.run_until_idle()
+            b.cursor_to('P2')
+            b.run_until_idle()
+            # Hide P → subtree (P, P1, P2) all invisible. Cursor was
+            # on P2 (row 2 pre-mutation: P, P1, P2, X). Walk back:
+            # row 1 (P1) hidden, row 0 (P) hidden → fall to first
+            # visible (X).
+            b.update_data([_state.mod('P', hidden=True)])
+            b.run_until_idle()
+            vis = _state.visible_items(b._state)
+            self.assertEqual([e.item.id for e in vis], ['X'])
+            self.assertEqual(b._state.cursor, 0)
+        finally:
+            b.stop_workers()
+
+    def test_delete_uses_anchor_not_hide_displacement(self):
+        # If the cursor's id is *removed* (not hidden), the anchor's
+        # fallback chain (next-sibling-first) handles it.
+        b = make_browser(get_children=lambda _id: [
+            ('A',), ('B',), ('C',), ('D',),
+        ])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.cursor_to('B')
+            b.run_until_idle()
+            b.update_data([_state.remove('B')])
+            b.run_until_idle()
+            vis = _state.visible_items(b._state)
+            self.assertEqual([e.item.id for e in vis], ['A', 'C', 'D'])
+            # Anchor's chain: B missing → next sibling C (row 1).
+            self.assertEqual(b._state.cursor, 1)
+            self.assertEqual(vis[b._state.cursor].item.id, 'C')
+        finally:
+            b.stop_workers()
+
+    def test_reanchor_after_displacement(self):
+        # After hide-displacement the new cursor row id becomes the
+        # primary anchor.
+        b = make_browser(get_children=lambda _id: [
+            ('A',), ('B',), ('C',),
+        ])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.cursor_to('B')
+            b.run_until_idle()
+            self.assertEqual(b._cursor_anchor[0], 'B')
+            b.update_data([_state.mod('B', hidden=True)])
+            b.run_until_idle()
+            # New cursor on 'A'; anchor primary refreshed.
+            self.assertEqual(b._cursor_anchor[0], 'A')
+        finally:
+            b.stop_workers()
+
+    def test_hide_then_show_in_same_batch_no_net_movement(self):
+        b = make_browser(get_children=lambda _id: [
+            ('A',), ('B',), ('C',),
+        ])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.cursor_to('B')
+            b.run_until_idle()
+            b.update_data([
+                _state.mod('B', hidden=True),
+                _state.mod('B', hidden=False),
+            ])
+            b.run_until_idle()
+            vis = _state.visible_items(b._state)
+            self.assertEqual([e.item.id for e in vis], ['A', 'B', 'C'])
+            # Net effect: nothing hidden post-batch — cursor stays.
+            self.assertEqual(b._state.cursor, 1)
+            self.assertEqual(vis[b._state.cursor].item.id, 'B')
+        finally:
+            b.stop_workers()
+
+
 if __name__ == '__main__':
     unittest.main()

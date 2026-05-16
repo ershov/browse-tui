@@ -32,6 +32,8 @@ Item = _data.Item
 apply_ops = _state.apply_ops
 upsert = _state.upsert
 set_item = _state.set_item
+mod = _state.mod
+KEEP_PARENT = _state.KEEP_PARENT
 remove = _state.remove
 clear_children = _state.clear_children
 complete = _state.complete
@@ -1033,6 +1035,290 @@ class TestPositioningStructuralDirty(unittest.TestCase):
                    title='A'),
         ])
         self.assertTrue(s._visible_dirty)
+
+
+# ---- `mod` op + KEEP_PARENT sentinel ---------------------------------------
+
+
+class TestKeepParentSentinel(unittest.TestCase):
+    """The ``KEEP_PARENT`` module-level sentinel."""
+
+    def test_repr(self):
+        self.assertEqual(repr(KEEP_PARENT), 'KEEP_PARENT')
+
+    def test_distinct_from_none(self):
+        self.assertIsNot(KEEP_PARENT, None)
+
+    def test_distinct_from_string(self):
+        self.assertNotEqual(KEEP_PARENT, 'KEEP_PARENT')
+
+    def test_singleton_identity(self):
+        # ``KEEP_PARENT`` is a module-level singleton; recipes use
+        # identity (``is``) to detect it.
+        from test.unit._loader import load as _load
+        other = _load('_browse_tui_state_again', '040-state.py').KEEP_PARENT
+        # Loaded again into a different module — not the same instance,
+        # but the doc API only guarantees one importable name. So we
+        # just assert the in-process sentinel is consistent with itself.
+        self.assertIs(KEEP_PARENT, _state.KEEP_PARENT)
+        # Different module load creates a different sentinel; that's
+        # expected for the loader trick but irrelevant for production.
+        del other
+
+
+class TestModHelper(unittest.TestCase):
+    """``mod()`` constructor shapes."""
+
+    def test_default_parent_is_keep_parent(self):
+        op = mod('a', hidden=True)
+        self.assertEqual(op[0], 'mod')
+        self.assertEqual(op[1], 'a')
+        self.assertIs(op[2], KEEP_PARENT)
+        self.assertEqual(op[3], {'hidden': True})
+
+    def test_explicit_parent_id(self):
+        op = mod('a', 'new_parent', hidden=False)
+        self.assertEqual(op[2], 'new_parent')
+
+    def test_explicit_none_parent(self):
+        # ``None`` means root (or explicit None-parent) — not the
+        # "don't touch" sentinel.
+        op = mod('a', None, hidden=False)
+        self.assertIsNone(op[2])
+
+    def test_keep_parent_explicit(self):
+        op = mod('a', KEEP_PARENT, hidden=True)
+        self.assertIs(op[2], KEEP_PARENT)
+
+    def test_with_where_5tuple(self):
+        op = mod('a', where=('first', None))
+        self.assertEqual(len(op), 5)
+        self.assertEqual(op[4], ('first', None))
+
+    def test_where_keyword_only(self):
+        with self.assertRaises(TypeError):
+            mod('a', KEEP_PARENT, ('first', None))  # type: ignore
+
+
+class TestModUnknownId(unittest.TestCase):
+    """``mod`` against an unknown id is a silent no-op."""
+
+    def test_unknown_id_is_noop(self):
+        s = State(root_id='/')
+        apply_ops(s, [mod('ghost', hidden=True)])
+        self.assertNotIn('ghost', s._items_by_id)
+        self.assertFalse(s._children.get('/', []))
+
+    def test_unknown_id_does_not_mark_dirty(self):
+        s = State(root_id='/')
+        apply_ops(s, [upsert('a', '/', title='A')])
+        s._visible_dirty = False
+        apply_ops(s, [mod('ghost', hidden=True)])
+        self.assertFalse(s._visible_dirty)
+
+
+class TestModPatchKeepParent(unittest.TestCase):
+    """``mod`` with ``KEEP_PARENT`` patches fields and leaves parent alone."""
+
+    def _seed(self):
+        s = State(root_id='/')
+        apply_ops(s, [
+            upsert('a', '/', title='A'),
+            upsert('b', '/', title='B'),
+            upsert('c', '/', title='C'),
+        ])
+        return s
+
+    def test_patches_fields(self):
+        s = self._seed()
+        apply_ops(s, [mod('b', hidden=True, tag='X')])
+        self.assertTrue(s._items_by_id['b'].hidden)
+        self.assertEqual(s._items_by_id['b'].tag, 'X')
+
+    def test_parent_unchanged(self):
+        s = self._seed()
+        apply_ops(s, [mod('b', hidden=True)])
+        self.assertEqual(s._parent_of_id['b'], '/')
+
+    def test_position_unchanged(self):
+        s = self._seed()
+        apply_ops(s, [mod('b', hidden=True)])
+        self.assertEqual([c.id for c in s._children['/']], ['a', 'b', 'c'])
+
+    def test_custom_attrs_added(self):
+        s = self._seed()
+        apply_ops(s, [mod('b', custom_attr='value')])
+        self.assertEqual(s._items_by_id['b'].custom_attr, 'value')
+
+    def test_id_field_silently_dropped(self):
+        # Hand-rolled op tuple — passing ``id=`` to ``mod()`` would
+        # collide with the positional id arg, so build the tuple
+        # directly. The ``id`` key inside fields is dropped by
+        # ``_apply_mod`` (the op tuple's id is authoritative).
+        s = self._seed()
+        apply_ops(s, [
+            ('mod', 'b', KEEP_PARENT, {'id': 'should-be-ignored', 'title': 'B2'}),
+        ])
+        self.assertEqual(s._items_by_id['b'].id, 'b')
+        self.assertEqual(s._items_by_id['b'].title, 'B2')
+
+    def test_hidden_flip_marks_dirty(self):
+        s = self._seed()
+        s._visible_dirty = False
+        apply_ops(s, [mod('b', hidden=True)])
+        self.assertTrue(s._visible_dirty)
+
+    def test_field_patch_marks_dirty(self):
+        # All structural-or-rendering field patches mark dirty (same
+        # posture as upsert's existing-id branch).
+        s = self._seed()
+        s._visible_dirty = False
+        apply_ops(s, [mod('b', title='B-new')])
+        self.assertTrue(s._visible_dirty)
+
+
+class TestModReparent(unittest.TestCase):
+    """``mod`` with an explicit parent_id reparents the existing row."""
+
+    def _seed(self):
+        s = State(root_id='/')
+        apply_ops(s, [
+            upsert('A', '/', title='A', has_children=True),
+            upsert('B', '/', title='B', has_children=True),
+            upsert('x', 'A', title='X'),
+        ])
+        return s
+
+    def test_reparent_moves_to_new_parent(self):
+        s = self._seed()
+        apply_ops(s, [mod('x', 'B', tag='moved')])
+        self.assertNotIn(
+            'x', [c.id for c in s._children.get('A', [])]
+        )
+        self.assertIn('x', [c.id for c in s._children['B']])
+        self.assertEqual(s._parent_of_id['x'], 'B')
+        self.assertEqual(s._items_by_id['x'].tag, 'moved')
+
+    def test_reparent_same_parent_is_noop_for_position(self):
+        s = self._seed()
+        apply_ops(s, [mod('x', 'A', tag='same')])
+        self.assertEqual([c.id for c in s._children['A']], ['x'])
+
+    def test_reparent_with_where(self):
+        s = self._seed()
+        apply_ops(s, [
+            upsert('y', 'B', title='Y'),
+            upsert('z', 'B', title='Z'),
+        ])
+        # Reparent x into B at position 'first'.
+        apply_ops(s, [mod('x', 'B', where=('first', None))])
+        self.assertEqual([c.id for c in s._children['B']], ['x', 'y', 'z'])
+
+    def test_reparent_to_none(self):
+        # ``parent_id=None`` is an explicit reparent (not KEEP_PARENT).
+        s = self._seed()
+        apply_ops(s, [mod('x', None, tag='rooted')])
+        self.assertEqual(s._parent_of_id['x'], None)
+
+
+class TestModReposition(unittest.TestCase):
+    """``mod`` with ``where`` repositions the existing row in its parent."""
+
+    def _seed(self):
+        s = State(root_id='/')
+        apply_ops(s, [
+            upsert('a', '/', title='A'),
+            upsert('b', '/', title='B'),
+            upsert('c', '/', title='C'),
+            upsert('d', '/', title='D'),
+        ])
+        return s
+
+    def test_where_first(self):
+        s = self._seed()
+        apply_ops(s, [mod('c', where=('first', None))])
+        self.assertEqual([c.id for c in s._children['/']], ['c', 'a', 'b', 'd'])
+
+    def test_where_last(self):
+        s = self._seed()
+        apply_ops(s, [mod('a', where=('last', None))])
+        self.assertEqual([c.id for c in s._children['/']], ['b', 'c', 'd', 'a'])
+
+    def test_where_before_id(self):
+        s = self._seed()
+        apply_ops(s, [mod('a', where=('before', None, 'd'))])
+        self.assertEqual([c.id for c in s._children['/']], ['b', 'c', 'a', 'd'])
+
+    def test_where_after_id(self):
+        s = self._seed()
+        apply_ops(s, [mod('a', where=('after', None, 'd'))])
+        self.assertEqual([c.id for c in s._children['/']], ['b', 'c', 'd', 'a'])
+
+    def test_where_same_id_pivot_is_noop(self):
+        s = self._seed()
+        apply_ops(s, [mod('b', where=('before', None, 'b'))])
+        self.assertEqual([c.id for c in s._children['/']], ['a', 'b', 'c', 'd'])
+
+    def test_where_on_unknown_id_is_noop(self):
+        s = self._seed()
+        apply_ops(s, [mod('ghost', where=('first', None))])
+        self.assertEqual([c.id for c in s._children['/']], ['a', 'b', 'c', 'd'])
+
+
+class TestModValidation(unittest.TestCase):
+    """``mod`` rejects malformed shape."""
+
+    def test_bad_parent_id_type(self):
+        s = State(root_id='/')
+        apply_ops(s, [upsert('a', '/', title='A')])
+        with self.assertRaises(ValueError):
+            apply_ops(s, [('mod', 'a', 42, {'hidden': True})])
+
+    def test_bad_where(self):
+        s = State(root_id='/')
+        apply_ops(s, [upsert('a', '/', title='A')])
+        with self.assertRaises(ValueError):
+            apply_ops(s, [
+                ('mod', 'a', KEEP_PARENT, {}, ('not-a-keyword', None)),
+            ])
+
+
+# ---- `hidden` field + dirty propagation -----------------------------------
+
+
+class TestHiddenFieldOnItem(unittest.TestCase):
+    """``Item.hidden`` is a declared dataclass field, default False."""
+
+    def test_default_false(self):
+        it = Item(id='x')
+        self.assertFalse(it.hidden)
+
+    def test_explicit_true(self):
+        it = Item(id='x', hidden=True)
+        self.assertTrue(it.hidden)
+
+    def test_upsert_with_hidden_kwarg(self):
+        s = State(root_id='/')
+        apply_ops(s, [upsert('a', '/', title='A', hidden=True)])
+        self.assertTrue(s._items_by_id['a'].hidden)
+
+    def test_upsert_default_hidden_false(self):
+        s = State(root_id='/')
+        apply_ops(s, [upsert('a', '/', title='A')])
+        self.assertFalse(s._items_by_id['a'].hidden)
+
+    def test_set_item_with_hidden_kwarg(self):
+        s = State(root_id='/')
+        apply_ops(s, [set_item('a', '/', title='A', hidden=True)])
+        self.assertTrue(s._items_by_id['a'].hidden)
+
+    def test_set_item_without_hidden_reverts_to_default(self):
+        # ``set`` builds a fresh Item; fields not specified revert to
+        # dataclass defaults — including ``hidden=False``.
+        s = State(root_id='/')
+        apply_ops(s, [upsert('a', '/', title='A', hidden=True)])
+        apply_ops(s, [set_item('a', '/', title='A')])
+        self.assertFalse(s._items_by_id['a'].hidden)
 
 
 if __name__ == '__main__':

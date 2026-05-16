@@ -22,6 +22,12 @@ class Item:
 
     ``has_children`` controls the ``▼/▶`` marker and whether expansion
     is offered on the row.
+
+    ``hidden`` (default ``False``) is a per-row visibility flag.
+    Hidden rows are skipped at render time; a hidden expandable parent
+    hides its entire subtree (render-only cascade — descendants' own
+    ``hidden`` values are preserved). See ``docs/superpowers/specs/
+    2026-05-16-row-visibility-design.md`` for the full semantics.
     """
 
     id: Any
@@ -29,6 +35,7 @@ class Item:
     tag: str = ''
     tag_style: str = ''
     has_children: bool = False
+    hidden: bool = False
 
     def __post_init__(self) -> None:
         if not self.title:
@@ -56,9 +63,9 @@ def to_item(x: Any) -> Item:
     if isinstance(x, str):
         return Item(id=x)
     if isinstance(x, tuple):
-        if not 1 <= len(x) <= 5:
+        if not 1 <= len(x) <= 6:
             raise TypeError(
-                f'to_item: tuple must have 1-5 elements, got {len(x)}'
+                f'to_item: tuple must have 1-6 elements, got {len(x)}'
             )
         return Item(*x)
     if isinstance(x, dict):
@@ -66,7 +73,7 @@ def to_item(x: Any) -> Item:
             raise TypeError("to_item: dict must contain 'id' key")
         # Split known dataclass fields from extras so we can attach the
         # rest as arbitrary attributes (Item is intentionally non-slotted).
-        known = {'id', 'title', 'tag', 'tag_style', 'has_children'}
+        known = {'id', 'title', 'tag', 'tag_style', 'has_children', 'hidden'}
         fields = {k: v for k, v in x.items() if k in known}
         extras = {k: v for k, v in x.items() if k not in known}
         item = Item(**fields)
