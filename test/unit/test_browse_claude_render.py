@@ -51,6 +51,22 @@ def _stub_browse_tui():
         if where is None
         else ('upsert', id_, parent_id, fields, where)
     )
+
+    # ``mod`` op: patches an existing row's fields, never inserts. The
+    # ``parent_id`` defaults to ``KEEP_PARENT`` (don't reparent).
+    class _KeepParent:
+        __slots__ = ()
+        def __repr__(self):
+            return 'KEEP_PARENT'
+    KEEP_PARENT = _KeepParent()
+    mod.KEEP_PARENT = KEEP_PARENT
+
+    def _mod(id_, parent_id=KEEP_PARENT, *, where=None, **fields):
+        if where is None:
+            return ('mod', id_, parent_id, fields)
+        return ('mod', id_, parent_id, fields, where)
+    mod.mod = _mod
+
     sys.modules['browse_tui'] = mod
 
 
@@ -3506,6 +3522,515 @@ class TestSummariseTitles(unittest.TestCase):
                   'content-replacement', 'progress'):
             self.assertIn(k, self.r._TAG_STYLE_FOR_KIND,
                           f'missing tag style for {k!r}')
+
+
+class TestVoiceOnlyFilter(unittest.TestCase):
+    """``h`` hotkey + ``--no-show-all`` filter: hide everything that
+    isn't voice or a subagent umbrella.
+
+    Predicate lives in ``_passes_filter`` and is consulted by every
+    Item builder. Toggle emits a single ``mod`` batch — the framework's
+    hide-displacement hook handles cursor migration, so the recipe
+    doesn't touch the cursor itself.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def setUp(self):
+        self.r._TREE_CACHE.clear()
+        self.r._TAIL_STATE.clear()
+        # Default state for every test; individual tests flip it
+        # explicitly. Restored in tearDown so other suites don't see
+        # the filter on.
+        self._saved_filter = self.r._FILTER_VOICE_ONLY
+        self.r._FILTER_VOICE_ONLY = False
+
+    def tearDown(self):
+        self.r._FILTER_VOICE_ONLY = self._saved_filter
+
+    def _write_jsonl(self, records):
+        import json as _json
+        import tempfile
+        f = tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False)
+        for r in records:
+            f.write(_json.dumps(r) + '\n')
+        f.close()
+        return f.name
+
+    # ---- _passes_filter ---------------------------------------------------
+
+    def test_passes_filter_off_returns_true_always(self):
+        # With the filter off, the predicate is always True — callers
+        # rely on this so the same code path serves both states.
+        self.r._FILTER_VOICE_ONLY = False
+        self.assertTrue(self.r._passes_filter('whatever#0'))
+        self.assertTrue(self.r._passes_filter('whatever#prompt:0'))
+        self.assertTrue(self.r._passes_filter('whatever#tool:0'))
+        self.assertTrue(self.r._passes_filter('whatever#span:0'))
+        self.assertTrue(self.r._passes_filter('whatever#agent:ABC'))
+        self.assertTrue(self.r._passes_filter('__truncated__'))
+
+    def test_passes_filter_voice_leaf(self):
+        # voice leaf passes; non-voice leaf doesn't.
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'hi'}},
+            {'type': 'assistant', 'uuid': 'a1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 't1', 'name': 'X', 'input': {}},
+             ]}},
+        ])
+        try:
+            self.r._scan_tree(path)
+            self.r._FILTER_VOICE_ONLY = True
+            self.assertTrue(self.r._passes_filter(f'{path}#0'))
+            self.assertFalse(self.r._passes_filter(f'{path}#1'))
+        finally:
+            os.unlink(path)
+
+    def test_passes_filter_prompt_umbrella_always_true(self):
+        # ``#prompt:`` is always voice-bearing by construction.
+        self.r._FILTER_VOICE_ONLY = True
+        # No td needed; predicate short-circuits on the prompt prefix.
+        self.assertTrue(self.r._passes_filter('any/path#prompt:42'))
+
+    def test_passes_filter_tool_umbrella_pure_tool_use(self):
+        # Pure tool_use (no assistant text) doesn't pass.
+        path = self._write_jsonl([
+            {'type': 'assistant', 'uuid': 'a1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 't1', 'name': 'X', 'input': {}},
+             ]}},
+        ])
+        try:
+            self.r._scan_tree(path)
+            self.r._FILTER_VOICE_ONLY = True
+            self.assertFalse(self.r._passes_filter(f'{path}#tool:0'))
+        finally:
+            os.unlink(path)
+
+    def test_passes_filter_tool_umbrella_mixed_text(self):
+        # Assistant turn with text + tool_use: voice-bearing.
+        path = self._write_jsonl([
+            {'type': 'assistant', 'uuid': 'a1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'text', 'text': 'Doing X now'},
+                 {'type': 'tool_use', 'id': 't1', 'name': 'X', 'input': {}},
+             ]}},
+        ])
+        try:
+            self.r._scan_tree(path)
+            self.r._FILTER_VOICE_ONLY = True
+            self.assertTrue(self.r._passes_filter(f'{path}#tool:0'))
+        finally:
+            os.unlink(path)
+
+    def test_passes_filter_span_umbrella_membership(self):
+        # ``#span:`` passes iff any record in the span is voice.
+        # Fabricate a td directly to avoid relying on _scan_tree
+        # producing a specific span layout.
+        path = '/tmp/fake-span.jsonl'
+        td = self.r._TreeData()
+        td.span_records[0] = [
+            {'type': 'system', 'subtype': 'hook'},
+            {'type': 'attachment', 'attachment': {'type': 'file'}},
+        ]
+        td.span_records[5] = [
+            {'type': 'system', 'subtype': 'hook'},
+            {'type': 'user', 'uuid': 'u',
+             'message': {'role': 'user', 'content': 'hi'}},
+        ]
+        self.r._TREE_CACHE[path] = td
+        try:
+            self.r._FILTER_VOICE_ONLY = True
+            self.assertFalse(self.r._passes_filter(f'{path}#span:0'))
+            self.assertTrue(self.r._passes_filter(f'{path}#span:5'))
+        finally:
+            self.r._TREE_CACHE.pop(path, None)
+
+    def test_passes_filter_subagent_always_true(self):
+        # Subagent umbrellas are unconditionally visible — the recipe
+        # doesn't peek into another file to check.
+        self.r._FILTER_VOICE_ONLY = True
+        self.assertTrue(self.r._passes_filter('whatever#agent:ABC-DEF'))
+
+    def test_passes_filter_unparseable_id_is_permissive(self):
+        # Synthetic ids (err rows, ``__truncated__``) must stay visible.
+        self.r._FILTER_VOICE_ONLY = True
+        self.assertTrue(self.r._passes_filter('__truncated__'))
+        self.assertTrue(self.r._passes_filter('whatever#__truncated__'))
+        self.assertTrue(self.r._passes_filter('whatever#not_a_kind:5'))
+
+    # ---- Item builders set ``hidden`` ------------------------------------
+
+    def test_flat_message_builder_sets_hidden_under_filter(self):
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'hi'}},
+            {'type': 'assistant', 'uuid': 'a1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 't1', 'name': 'X', 'input': {}},
+             ]}},
+        ])
+        try:
+            self.r._FILTER_VOICE_ONLY = True
+            items = self.r._list_messages(path)
+            # Filter out the synthetic truncation row if any.
+            by_id = {it.id: it for it in items
+                     if not it.id.endswith('__truncated__')}
+            self.assertFalse(by_id[f'{path}#0'].hidden,
+                             'voice leaf must be visible')
+            self.assertTrue(by_id[f'{path}#1'].hidden,
+                            'pure tool_use leaf must be hidden')
+        finally:
+            os.unlink(path)
+
+    def test_flat_message_builder_default_hidden_false(self):
+        # Filter off: every row built with hidden=False.
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'hi'}},
+            {'type': 'assistant', 'uuid': 'a1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 't1', 'name': 'X', 'input': {}},
+             ]}},
+        ])
+        try:
+            self.r._FILTER_VOICE_ONLY = False
+            items = self.r._list_messages(path)
+            for it in items:
+                self.assertFalse(it.hidden,
+                                 f'{it.id} should be visible')
+        finally:
+            os.unlink(path)
+
+    def test_tree_item_sets_hidden_under_filter(self):
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'hi'}},
+            {'type': 'assistant', 'uuid': 'a1',
+             'parentUuid': 'u1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 't1', 'name': 'X', 'input': {}},
+             ]}},
+        ])
+        try:
+            td = self.r._scan_tree(path)
+            self.r._FILTER_VOICE_ONLY = True
+            voice_item = self.r._tree_item(path, td.records[0], td)
+            tool_item = self.r._tree_item(path, td.records[1], td)
+            self.assertFalse(voice_item.hidden)
+            self.assertTrue(tool_item.hidden)
+        finally:
+            os.unlink(path)
+
+    def test_subagent_pseudo_item_always_visible(self):
+        # Even with the filter on, subagent umbrellas keep hidden=False.
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'hi'}},
+        ])
+        try:
+            self.r._FILTER_VOICE_ONLY = True
+            # Use a fake agent path the helper will stat (file doesn't
+            # need to exist — _subagent_pseudo_item catches OSError).
+            item = self.r._subagent_pseudo_item(
+                path, 'AID-1', '/nonexistent/agent.jsonl',
+            )
+            self.assertFalse(item.hidden)
+        finally:
+            os.unlink(path)
+
+    # ---- toggle action ---------------------------------------------------
+
+    def _fake_browser_with_items(self, items_by_id):
+        seen_ops = []
+
+        class FakeState:
+            def __init__(s):
+                s._items_by_id = dict(items_by_id)
+                s._children = {}
+                s._preview = {}
+
+        class FakeBrowser:
+            def __init__(s):
+                s._state = FakeState()
+                s._preview_cursor_id = 'sentinel'
+                s._needs_redraw = set()
+            def update_data(s, ops):
+                seen_ops.append(list(ops))
+
+        class FakeCtx:
+            def __init__(s):
+                s._browser = FakeBrowser()
+                s.messages = []
+            def message(s, m):
+                s.messages.append(m)
+
+        return FakeCtx(), seen_ops
+
+    def test_toggle_action_emits_mod_batch_for_loaded_items(self):
+        # Toggling ON should mod every non-voice loaded item to
+        # hidden=True; voice items and subagents stay hidden=False.
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'hi'}},
+            {'type': 'assistant', 'uuid': 'a1',
+             'parentUuid': 'u1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 't1', 'name': 'X', 'input': {}},
+             ]}},
+        ])
+        try:
+            self.r._scan_tree(path)
+            voice = self.r.Item(id=f'{path}#0')
+            voice.hidden = False
+            tool = self.r.Item(id=f'{path}#1')
+            tool.hidden = False
+            sub = self.r.Item(id=f'{path}#agent:ABC')
+            sub.hidden = False
+            ctx, seen = self._fake_browser_with_items({
+                voice.id: voice, tool.id: tool, sub.id: sub,
+            })
+            self.r._action_toggle_filter(ctx)
+            self.assertTrue(self.r._FILTER_VOICE_ONLY)
+            self.assertEqual(len(seen), 1)
+            ops = seen[0]
+            # Every op is a mod op (no removes / upserts).
+            self.assertTrue(all(op[0] == 'mod' for op in ops),
+                            f'non-mod ops in batch: {ops}')
+            by_id = {op[1]: op for op in ops}
+            # Only the tool row changes (voice and subagent stay visible).
+            self.assertIn(tool.id, by_id)
+            self.assertNotIn(voice.id, by_id)
+            self.assertNotIn(sub.id, by_id)
+            self.assertEqual(by_id[tool.id][3].get('hidden'), True)
+        finally:
+            os.unlink(path)
+
+    def test_toggle_action_round_trip_restores_visibility(self):
+        # Toggle ON then OFF: every item ends up with hidden=False.
+        path = self._write_jsonl([
+            {'type': 'assistant', 'uuid': 'a1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 't1', 'name': 'X', 'input': {}},
+             ]}},
+        ])
+        try:
+            self.r._scan_tree(path)
+            tool = self.r.Item(id=f'{path}#0')
+            tool.hidden = False
+            ctx, seen = self._fake_browser_with_items({tool.id: tool})
+            self.r._action_toggle_filter(ctx)
+            self.assertTrue(self.r._FILTER_VOICE_ONLY)
+            # Simulate the framework applying the first batch.
+            for op in seen[0]:
+                if op[0] == 'mod' and op[1] == tool.id:
+                    tool.hidden = op[3].get('hidden', False)
+            self.r._action_toggle_filter(ctx)
+            self.assertFalse(self.r._FILTER_VOICE_ONLY)
+            self.assertEqual(len(seen), 2)
+            # Second batch flips the tool back to hidden=False.
+            mods = {op[1]: op[3] for op in seen[1] if op[0] == 'mod'}
+            self.assertIn(tool.id, mods)
+            self.assertEqual(mods[tool.id].get('hidden'), False)
+        finally:
+            os.unlink(path)
+
+    def test_toggle_action_invalidates_preview_cache(self):
+        # Umbrella previews compose from non-hidden children. After a
+        # filter flip, every cached preview is potentially stale —
+        # drop the cache and bump the cursor-id sentinel so the next
+        # preview fetch fires.
+        ctx, _ = self._fake_browser_with_items({})
+        ctx._browser._state._preview['foo'] = 'stale'
+        ctx._browser._preview_cursor_id = 'foo'
+        self.r._action_toggle_filter(ctx)
+        self.assertEqual(ctx._browser._state._preview, {},
+                         'preview cache should be cleared on toggle')
+        self.assertIsNone(ctx._browser._preview_cursor_id,
+                          'cursor-id sentinel should be reset so the next '
+                          'fetch re-runs')
+        self.assertIn('preview', ctx._browser._needs_redraw)
+
+    def test_toggle_action_no_remove_ops(self):
+        # Toggle never emits remove ops — visibility is non-destructive.
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'hi'}},
+            {'type': 'assistant', 'uuid': 'a1',
+             'parentUuid': 'u1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 't1', 'name': 'X', 'input': {}},
+             ]}},
+        ])
+        try:
+            self.r._scan_tree(path)
+            it0 = self.r.Item(id=f'{path}#0'); it0.hidden = False
+            it1 = self.r.Item(id=f'{path}#1'); it1.hidden = False
+            ctx, seen = self._fake_browser_with_items({
+                it0.id: it0, it1.id: it1,
+            })
+            self.r._action_toggle_filter(ctx)
+            ops = seen[0]
+            self.assertFalse(
+                any(op[0] in ('remove', 'clear_children') for op in ops),
+                f'destructive op leaked into toggle batch: {ops}',
+            )
+        finally:
+            os.unlink(path)
+
+    # ---- live tail under filter -----------------------------------------
+
+    def test_push_flat_inserts_under_filter_marks_hidden(self):
+        # New flat-mode rows under the filter pick up the right
+        # ``hidden`` flag at construction.
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'one'}},
+        ])
+        try:
+            td = self.r._scan_tree(path)
+            # In real usage the tail step appends to td.records before
+            # _push_flat_inserts runs; emulate that so _passes_filter
+            # has data for the new lines.
+            new_records = [
+                (1, {'type': 'user', 'uuid': 'u2',
+                     'message': {'role': 'user', 'content': 'two'}}),
+                (2, {'type': 'assistant', 'uuid': 'a1',
+                     'message': {'role': 'assistant', 'content': [
+                         {'type': 'tool_use', 'id': 't1',
+                          'name': 'X', 'input': {}},
+                     ]}}),
+            ]
+            for _n, rec in new_records:
+                td.records.append(rec)
+            seen_ops = []
+
+            class FakeState:
+                def __init__(s):
+                    s._children = {path: []}
+            class FakeBrowser:
+                def __init__(s):
+                    s._state = FakeState()
+                def update_data(s, ops):
+                    seen_ops.append(list(ops))
+                def post(s, fn):
+                    pass
+
+            self.r._FILTER_VOICE_ONLY = True
+            self.r._push_flat_inserts(FakeBrowser(), path, new_records)
+            self.assertEqual(len(seen_ops), 1)
+            ops = seen_ops[0]
+            by_id = {op[1]: op[3] for op in ops if op[0] == 'upsert'}
+            self.assertEqual(by_id[f'{path}#1'].get('hidden'), False,
+                             'voice row should arrive visible')
+            self.assertEqual(by_id[f'{path}#2'].get('hidden'), True,
+                             'tool_use row should arrive hidden')
+        finally:
+            os.unlink(path)
+
+    def test_push_tail_diffs_reveals_voice_bearing_parent(self):
+        # Live tail under filter: a previously-hidden umbrella whose
+        # predicate now passes gets a ``mod(parent_id, hidden=False)``
+        # before its new child upserts. We fabricate the transition by
+        # setting up a hidden span umbrella in the framework's index,
+        # then call _push_tail_diffs with that span id marked dirty
+        # after pre-loading the td with a voice record in the span.
+        path = '/tmp/fake-tail.jsonl'
+        td = self.r._TreeData()
+        # Span at line 0 now contains a voice record (transition).
+        td.span_records[0] = [
+            {'type': 'user', 'uuid': 'u',
+             'message': {'role': 'user', 'content': 'hi'}},
+        ]
+        # Stub for get_children: returns the span's records as items.
+        td.records = [td.span_records[0][0]]
+        self.r._TREE_CACHE[path] = td
+        try:
+            span_id = f'{path}#span:0'
+            span_item = self.r.Item(id=span_id)
+            span_item.hidden = True   # was hidden before the voice arrival
+
+            seen_ops = []
+
+            class FakeState:
+                def __init__(s):
+                    s._items_by_id = {span_id: span_item}
+                    s._children = {}     # span not expanded → no children
+            class FakeBrowser:
+                def __init__(s):
+                    s._state = FakeState()
+                def update_data(s, ops):
+                    seen_ops.append(list(ops))
+
+            self.r._FILTER_VOICE_ONLY = True
+            self.r._push_tail_diffs(FakeBrowser(), [span_id])
+            self.assertEqual(len(seen_ops), 1)
+            mods = [op for op in seen_ops[0] if op[0] == 'mod']
+            self.assertEqual(len(mods), 1)
+            self.assertEqual(mods[0][1], span_id)
+            self.assertEqual(mods[0][3].get('hidden'), False)
+        finally:
+            self.r._TREE_CACHE.pop(path, None)
+
+    # ---- preview respects hidden ----------------------------------------
+
+    def test_umbrella_preview_skips_hidden_children(self):
+        # A ``#prompt:`` preview composes from its non-hidden children
+        # only. Under voice-only, a tool umbrella with no voice content
+        # is hidden and should not contribute to the prompt's preview.
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'ask something'}},
+            {'type': 'assistant', 'uuid': 'a1',
+             'parentUuid': 'u1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 't1',
+                  'name': 'Bash', 'input': {'command': 'ls /secret'}},
+             ]}},
+            {'type': 'user', 'uuid': 'u2',
+             'parentUuid': 'a1',
+             'message': {'role': 'user', 'content': [
+                 {'type': 'tool_result', 'tool_use_id': 't1',
+                  'content': 'machinery noise'},
+             ]}},
+        ])
+        try:
+            self.r._scan_tree(path)
+            self.r._FILTER_VOICE_ONLY = True
+            preview_filtered = self.r._preview_umbrella(f'{path}#prompt:0')
+            # Without the filter the tool's machinery would appear.
+            self.r._FILTER_VOICE_ONLY = False
+            preview_full = self.r._preview_umbrella(f'{path}#prompt:0')
+            # Sanity: full preview contains the tool's input.
+            self.assertIn('ls /secret', preview_full)
+            # Filtered preview drops the hidden tool umbrella entirely.
+            self.assertNotIn('ls /secret', preview_filtered)
+            self.assertNotIn('machinery noise', preview_filtered)
+            # And it still contains the user prompt body.
+            self.assertIn('ask something', preview_filtered)
+        finally:
+            os.unlink(path)
+
+    # ---- CLI + help -----------------------------------------------------
+
+    def test_help_text_mentions_h_hotkey(self):
+        self.assertIn(' h ', self.r._HELP_INTRO_TMPL,
+                      'help intro should list the h hotkey')
+        self.assertIn('--show-all', self.r._HELP_INTRO_TMPL)
+        self.assertIn('--no-show-all', self.r._HELP_INTRO_TMPL)
+
+    def test_h_action_registered(self):
+        # Sanity: the recipe registers an 'h' action with the expected
+        # handler. We can't run the full main() under unit test (it
+        # touches argv / stdin) — inspect the source for the binding.
+        with open(_RECIPE) as f:
+            source = f.read()
+        self.assertIn("Action('h',", source)
+        self.assertIn('_action_toggle_filter', source)
 
 
 if __name__ == '__main__':

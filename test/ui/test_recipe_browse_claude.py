@@ -820,5 +820,127 @@ class TestBrowseClaude(unittest.TestCase):
                 t.send('q')
 
 
+    def test_h_toggle_hides_non_voice_rows(self):
+        """Pressing 'h' hides non-voice umbrellas and leaves in tree mode.
+
+        Fixture has a user voice (``PROBE_VOICE``) and one assistant
+        tool_use (``PROBE_TOOL_CALL``). Under ``--tree``, the tool wraps
+        in a ``<tool:Bash>`` umbrella that is **not** voice-bearing
+        (pure tool_use, no text), so after ``h`` the umbrella row and
+        its leaf both disappear and the preview composes only from the
+        voice content.
+        """
+        import json as _json
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, '.claude', 'projects', '-home-test-htog')
+            os.makedirs(proj)
+            sess = os.path.join(proj, 'htog.jsonl')
+            with open(sess, 'w') as f:
+                f.write(_json.dumps({
+                    'type': 'user', 'uuid': 'u1',
+                    'message': {'role': 'user', 'content': 'PROBE_VOICE'},
+                }) + '\n')
+                f.write(_json.dumps({
+                    'type': 'assistant', 'uuid': 'a1',
+                    'parentUuid': 'u1',
+                    'message': {'role': 'assistant', 'content': [
+                        {'type': 'tool_use', 'id': 't1',
+                         'name': 'Bash',
+                         'input': {'command': 'PROBE_TOOL_CALL'}},
+                    ]}},
+                ) + '\n')
+            import time
+            with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE,
+                         '--tree', '--file', sess)
+                t.wait_for('PROBE_VOICE', timeout=3.0)
+                t.wait_for('PROBE_TOOL_CALL', timeout=3.0)
+                t.send('h')
+                # Allow the mod batch + preview re-fetch to settle.
+                time.sleep(0.4)
+                # PROBE_VOICE survives in the (still-visible) prompt
+                # umbrella and the user-voice leaf.
+                cap = t.capture()
+                self.assertIn('PROBE_VOICE', cap)
+                # PROBE_TOOL_CALL should be gone from list AND preview
+                # (preview respects ``hidden`` on children).
+                self.assertNotIn('PROBE_TOOL_CALL', cap,
+                                 'tool_use should not appear on screen '
+                                 'after filter is on; got: '
+                                 + cap[-1000:])
+                t.send('q')
+
+    def test_h_toggle_round_trip_restores_view(self):
+        """``h h`` round-trip restores the original visible list."""
+        import json as _json
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, '.claude', 'projects', '-home-test-hrt')
+            os.makedirs(proj)
+            sess = os.path.join(proj, 'hrt.jsonl')
+            with open(sess, 'w') as f:
+                f.write(_json.dumps({
+                    'type': 'user', 'uuid': 'u1',
+                    'message': {'role': 'user', 'content': 'PROBE_RT_VOICE'},
+                }) + '\n')
+                f.write(_json.dumps({
+                    'type': 'assistant', 'uuid': 'a1',
+                    'parentUuid': 'u1',
+                    'message': {'role': 'assistant', 'content': [
+                        {'type': 'tool_use', 'id': 't1',
+                         'name': 'Bash',
+                         'input': {'command': 'PROBE_RT_TOOL'}},
+                    ]}},
+                ) + '\n')
+            import time
+            with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE,
+                         '--tree', '--file', sess)
+                t.wait_for('PROBE_RT_VOICE', timeout=3.0)
+                t.wait_for('PROBE_RT_TOOL', timeout=3.0)
+                t.send('h')
+                time.sleep(0.4)
+                cap_on = t.capture()
+                self.assertNotIn('PROBE_RT_TOOL', cap_on,
+                                 'filter on: tool should be hidden')
+                t.send('h')
+                time.sleep(0.4)
+                cap_off = t.capture()
+                self.assertIn('PROBE_RT_VOICE', cap_off)
+                self.assertIn('PROBE_RT_TOOL', cap_off,
+                              'filter off: tool should be visible again')
+                t.send('q')
+
+    def test_no_show_all_starts_in_filtered_mode(self):
+        """``--no-show-all`` boots straight into the voice-only view."""
+        import json as _json
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, '.claude', 'projects', '-home-test-cli')
+            os.makedirs(proj)
+            sess = os.path.join(proj, 'cli.jsonl')
+            with open(sess, 'w') as f:
+                f.write(_json.dumps({
+                    'type': 'user', 'uuid': 'u1',
+                    'message': {'role': 'user', 'content': 'PROBE_BOOT_VOICE'},
+                }) + '\n')
+                f.write(_json.dumps({
+                    'type': 'assistant', 'uuid': 'a1',
+                    'parentUuid': 'u1',
+                    'message': {'role': 'assistant', 'content': [
+                        {'type': 'tool_use', 'id': 't1',
+                         'name': 'Bash',
+                         'input': {'command': 'PROBE_BOOT_TOOL'}},
+                    ]}},
+                ) + '\n')
+            with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE,
+                         '--tree', '--no-show-all', '--file', sess)
+                t.wait_for('PROBE_BOOT_VOICE', timeout=3.0)
+                cap = t.capture()
+                self.assertNotIn('PROBE_BOOT_TOOL', cap,
+                                 'tool row should be hidden on boot under '
+                                 '--no-show-all; got: ' + cap[-800:])
+                t.send('q')
+
+
 if __name__ == '__main__':
     unittest.main()
