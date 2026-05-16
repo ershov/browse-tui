@@ -476,13 +476,22 @@ def _select_toggle_up(ctx):
 
 
 def _select_all_visible(ctx):
-    """Add every ``kind='normal'`` row in the visible list to the selection.
+    """Set the selection to exactly the currently-visible normal rows.
 
-    Placeholder rows (``kind='pending'``) and the synthetic scope-root row
-    are skipped — selecting a placeholder would smuggle the sentinel id
-    into the selection set and confuse downstream consumers.
+    Implementation: clear the existing selection set, then add every
+    ``kind='normal'`` row in the visible list. Anything previously
+    selected that isn't in the visible list — hidden rows, children
+    of collapsed parents, items in other scopes — gets dropped. This
+    is the WYSIWYG semantic: after Ctrl-A, "what's selected" matches
+    "what the user sees".
+
+    Placeholder rows (``kind='pending'``) and the synthetic scope-root
+    row are skipped — selecting a placeholder would smuggle the
+    sentinel id into the selection set and confuse downstream
+    consumers.
     """
     state = ctx._browser._state
+    state.selected.clear()
     vis = visible_items(state)
     for entry in vis:
         if entry.kind == 'normal':

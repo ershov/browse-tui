@@ -738,6 +738,16 @@ mode never elevates a hidden row, including hidden ancestors of
 matching descendants. Recipes that want matches to override hide
 should flip `hidden` themselves in response to search events.
 
+**Selection and hidden.** Hiding a row does not change
+`state.selected` — selection is identity-keyed and stable across
+visibility toggles. Hidden rows can be selected via API
+(`Browser.select`, `update_data` patches, etc.) regardless of
+visibility. The "Select all" keybinding (`Ctrl-A`) is WYSIWYG: it
+clears the existing selection and then adds every currently-visible
+normal row, so selections of hidden, collapsed-child, or
+out-of-scope rows are dropped. "Deselect all" (`Ctrl-N`) clears the
+entire selection set.
+
 ##### Behavioural change vs. pre-streaming API
 
 If a recipe has a `get_children(p)` callback **and** a watcher pushing into

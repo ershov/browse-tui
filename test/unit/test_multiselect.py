@@ -155,6 +155,42 @@ class TestCtrlASelectAll(unittest.TestCase):
         finally:
             b.stop_workers()
 
+    def test_ctrl_a_drops_selection_of_hidden_rows(self):
+        # Pre-selected hidden id is dropped: Ctrl-A first clears the set,
+        # then re-adds visible rows. Hidden rows aren't in visible_items,
+        # so they don't come back.
+        b = _make_browser()
+        a = Item(id='a')
+        b_hidden = Item(id='b', hidden=True)
+        c = Item(id='c')
+        b._state._children[None] = [a, b_hidden, c]
+        b._state.selected = {'a', 'b', 'c'}  # 'b' is hidden
+        try:
+            ctx = _ctx_for(b)
+            self.assertTrue(dispatch_key(b, ctx, 'ctrl-a'))
+            # 'b' is hidden → not in visible_items → not re-added.
+            self.assertEqual(b._state.selected, {'a', 'c'})
+        finally:
+            b.stop_workers()
+
+    def test_ctrl_a_drops_selection_of_collapsed_children(self):
+        # Pre-selected child of a collapsed parent is dropped too —
+        # it's not currently visible. Matches the WYSIWYG semantic.
+        b = _make_browser()
+        parent = Item(id='p', has_children=True)
+        child = Item(id='p1')
+        b._state._children[None] = [parent]
+        b._state._children['p'] = [child]
+        # Note: 'p' is NOT in state.expanded — child not visible.
+        b._state.selected = {'p', 'p1'}
+        try:
+            ctx = _ctx_for(b)
+            self.assertTrue(dispatch_key(b, ctx, 'ctrl-a'))
+            # 'p' is visible (added); 'p1' is hidden inside collapse (dropped).
+            self.assertEqual(b._state.selected, {'p'})
+        finally:
+            b.stop_workers()
+
 
 # ---- ctrl-n (clear selection) --------------------------------------------
 
