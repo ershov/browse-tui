@@ -1791,6 +1791,54 @@ class TestFilterUpdateDataIntegration(unittest.TestCase):
             b.stop_workers()
 
 
+class TestFilterAppliesToStreamedChildren(unittest.TestCase):
+    """Items delivered via ``get_children`` (apply_children_results) get
+    filter-evaluated when an active filter is in place."""
+
+    def test_get_children_children_get_flagged(self):
+        b = make_browser(get_children=lambda _id: [
+            ('apple',), ('banana',), ('cherry',),
+        ])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.set_filters(['app'])
+            b.run_until_idle()
+            vis_ids = [
+                e.item.id for e in _state.visible_items(b._state)
+                if e.kind == 'normal'
+            ]
+            self.assertEqual(vis_ids, ['apple'])
+            self.assertTrue(b._state._items_by_id['banana']._filter_hidden)
+        finally:
+            b.stop_workers()
+
+    def test_filter_first_then_load_children(self):
+        # Worker delivery order: filter is set *before* children arrive.
+        # Items come in via the get_children path (apply_children_results).
+        events = []
+
+        def get_children(parent_id):
+            events.append(parent_id)
+            return [('apple',), ('banana',), ('cherry',)]
+
+        b = make_browser(get_children=get_children)
+        try:
+            # Set filter first (no items yet).
+            b.set_filters(['app'])
+            b.run_until_idle()
+            # Now refresh — children deliver via the worker path.
+            b.refresh()
+            b.run_until_idle()
+            vis_ids = [
+                e.item.id for e in _state.visible_items(b._state)
+                if e.kind == 'normal'
+            ]
+            self.assertEqual(vis_ids, ['apple'])
+        finally:
+            b.stop_workers()
+
+
 class TestFilterCursorDisplacement(unittest.TestCase):
     """Cursor walks back when its row vanishes due to filter narrowing."""
 

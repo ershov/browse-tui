@@ -2771,6 +2771,12 @@ class Browser:
                 p._resolve()
             n += 1
         if n:
+            # Re-evaluate filter visibility — freshly-delivered items
+            # are reachable now and need their ``_filter_hidden`` flags
+            # set, otherwise an active filter wouldn't apply to them.
+            # No-op when ``_filters`` is empty.
+            if self._filters:
+                _recompute_filter_hidden(self._state, self._filters)
             # Re-snap the cursor onto its anchored id (or closest
             # fallback) before the index clamp runs, so the clamp only
             # fires when the entire anchor chain is missing from the
