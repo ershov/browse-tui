@@ -1314,12 +1314,16 @@ def _user_body_text(content):
 
 
 def _render_assistant(obj):
-    """Assistant turn: text / thinking / tool_use parts in source order."""
+    """Assistant turn: text / thinking / tool_use parts in source order.
+
+    The ``message.usage`` block (input / output / cache tokens) is
+    emitted by ``_fmt_chrome`` so all per-message metadata stays in
+    one place.
+    """
     msg = obj.get('message') if isinstance(obj.get('message'), dict) else {}
     parts = msg.get('content') if isinstance(msg.get('content'), list) else []
     model = msg.get('model', '?')
     stop  = msg.get('stop_reason') or ''
-    usage = msg.get('usage') or {}
 
     # ⏺ matches Claude Code's own BLACK_CIRCLE convention for assistant
     # turns (src/constants/figures.ts). User turns keep ▶ for visual
@@ -1347,8 +1351,6 @@ def _render_assistant(obj):
             out.append(_fmt_tool_use_part(part))
             out.append('')
 
-    if usage:
-        out.append(_fmt_usage(usage))
     return '\n'.join(out).rstrip() + '\n'
 
 
@@ -2044,13 +2046,20 @@ def _fmt_chrome(obj):
     if flags:
         rows.append(('flags', ', '.join(flags)))
 
-    if not rows:
+    msg = obj.get('message') if isinstance(obj.get('message'), dict) else {}
+    usage = msg.get('usage') or {}
+
+    if not rows and not usage:
         return ''
-    w = max(len(k) for k, _ in rows)
-    body = '\n'.join(
-        f'{MUTE}{k.ljust(w)}:{RESET} {v}' for k, v in rows
-    )
-    return _rule() + '\n' + body
+    parts = [_rule()]
+    if rows:
+        w = max(len(k) for k, _ in rows)
+        parts.append('\n'.join(
+            f'{MUTE}{k.ljust(w)}:{RESET} {v}' for k, v in rows
+        ))
+    if usage:
+        parts.append(_fmt_usage(usage))
+    return '\n'.join(parts)
 
 
 _RENDERERS = {

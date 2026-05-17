@@ -197,8 +197,12 @@ class TestRenderers(unittest.TestCase):
         self.assertIn('[error]', out)
 
     def test_assistant_text_with_usage(self):
-        out = self.r._render_assistant({
+        # Usage now rides in ``_fmt_chrome``, not the body. The body
+        # carries head / content; chrome appends the rule + metadata
+        # rows + the one-line ``── usage:`` footer.
+        obj = {
             'type': 'assistant',
+            'uuid': 'abc-123',
             'message': {
                 'role': 'assistant',
                 'model': 'claude-sonnet-4-6',
@@ -211,23 +215,51 @@ class TestRenderers(unittest.TestCase):
                     'cache_creation_input_tokens': 100,
                 },
             },
-        })
-        self.assertIn('⏺ assistant', out)
-        self.assertIn('claude-sonnet-4-6', out)
-        self.assertIn('[end_turn]', out)
-        self.assertIn('Hi there.', out)
-        self.assertIn('1,234', out)            # comma-formatted
-        self.assertIn('cache read', out)
-        # Usage footer is one line, prefixed with ``── usage:`` so it
-        # reads as a rule-style divider rather than body text.
+        }
+        body = self.r._render_assistant(obj)
+        chrome = self.r._fmt_chrome(obj)
+        self.assertIn('⏺ assistant', body)
+        self.assertIn('claude-sonnet-4-6', body)
+        self.assertIn('[end_turn]', body)
+        self.assertIn('Hi there.', body)
+        # Body no longer carries usage — it's chrome's concern.
+        self.assertNotIn('cache read', body)
+        self.assertNotIn('── usage', body)
+        # Chrome carries the one-line usage footer.
         usage_lines = [
-            ln for ln in out.split('\n') if '── usage:' in ln
+            ln for ln in chrome.split('\n') if '── usage:' in ln
         ]
         self.assertEqual(len(usage_lines), 1)
         self.assertIn('input: 1,234', usage_lines[0])
         self.assertIn('output: 56', usage_lines[0])
         self.assertIn('cache read: 9,000', usage_lines[0])
         self.assertIn('cache new: 100', usage_lines[0])
+
+    def test_chrome_usage_only(self):
+        # No uuid/timestamp/cwd, only usage: chrome still emits the
+        # leading rule and the one-line ``── usage:`` footer.
+        obj = {
+            'type': 'assistant',
+            'message': {
+                'role': 'assistant',
+                'content': [{'type': 'text', 'text': 'hi'}],
+                'usage': {
+                    'input_tokens': 5, 'output_tokens': 1,
+                    'cache_read_input_tokens': 0,
+                    'cache_creation_input_tokens': 0,
+                },
+            },
+        }
+        chrome = self.r._fmt_chrome(obj)
+        self.assertTrue(chrome, 'chrome must surface usage even with no other rows')
+        lines = chrome.split('\n')
+        self.assertIn('── usage:', lines[-1])
+        self.assertIn('input: 5', lines[-1])
+
+    def test_chrome_no_usage_no_rows_returns_empty(self):
+        # No chrome-relevant fields and no usage → empty chrome (no
+        # bare rule emitted).
+        self.assertEqual(self.r._fmt_chrome({'type': 'assistant'}), '')
 
     def test_assistant_thinking_separator(self):
         out = self.r._render_assistant({
