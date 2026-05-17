@@ -3445,8 +3445,14 @@ class Browser:
             # Seed the cursor anchor from the initial cursor position
             # so background deliveries that land between now and the
             # first user keypress preserve the cursor's identity (not
-            # just its index).
-            self._reanchor_cursor()
+            # just its index). Skip when the recipe has already set an
+            # explicit anchor via ``cursor_to`` before ``run()`` — the
+            # recipe is chasing a still-loading row and a snapshot of
+            # the default cursor position (usually row 0 = scope_root)
+            # would clobber it, leaving the cursor stranded once the
+            # row actually arrives.
+            if not self._cursor_anchor:
+                self._reanchor_cursor()
             render_full(self)
 
         try:

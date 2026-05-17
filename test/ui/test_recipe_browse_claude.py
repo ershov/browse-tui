@@ -910,6 +910,66 @@ class TestBrowseClaude(unittest.TestCase):
                               'filter off: tool should be visible again')
                 t.send('q')
 
+    def test_cursor_lands_on_last_voice_in_large_file(self):
+        """On a big file whose root-level fetch takes longer than the
+        startup ``run_until_idle`` window, the recipe's ``cursor_to``
+        on the last voice must still win.
+
+        Regression for: the framework's startup ``_reanchor_cursor``
+        was clobbering an already-set recipe anchor when the target
+        row hadn't loaded yet, leaving the cursor stranded on the
+        scope_root row forever.
+        """
+        import json as _json
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, '.claude', 'projects', '-home-test-big')
+            os.makedirs(proj)
+            sess = os.path.join(proj, 'big.jsonl')
+            # ~12000 records: large enough that the root fetch + its
+            # apply pass exceeds the 0.5s ``run_until_idle`` budget.
+            with open(sess, 'w') as f:
+                prev = None
+                for turn in range(1500):
+                    u = f'u{turn:05d}'
+                    f.write(_json.dumps({
+                        'type': 'user', 'uuid': u, 'parentUuid': prev,
+                        'message': {'role': 'user',
+                                    'content': f'turn {turn}'},
+                    }) + '\n'); prev = u
+                    for k in range(3):
+                        a = f'a{turn:05d}_{k}'
+                        f.write(_json.dumps({
+                            'type': 'assistant', 'uuid': a,
+                            'parentUuid': prev,
+                            'message': {'role': 'assistant', 'content': [
+                                {'type': 'tool_use', 'id': f't{turn}_{k}',
+                                 'name': 'Bash', 'input': {'cmd': 'echo'}}]},
+                        }) + '\n'); prev = a
+                        r = f'r{turn:05d}_{k}'
+                        f.write(_json.dumps({
+                            'type': 'user', 'uuid': r, 'parentUuid': prev,
+                            'message': {'role': 'user', 'content': [
+                                {'type': 'tool_result',
+                                 'tool_use_id': f't{turn}_{k}',
+                                 'content': 'out'}]},
+                        }) + '\n'); prev = r
+                    a = f'a{turn:05d}_done'
+                    f.write(_json.dumps({
+                        'type': 'assistant', 'uuid': a, 'parentUuid': prev,
+                        'message': {'role': 'assistant', 'content': [
+                            {'type': 'text',
+                             'text': f'PROBE_LAST_VOICE_{turn}'}]},
+                    }) + '\n'); prev = a
+            with TmuxFixture(cols=160, rows=40, env=self._launch_env(tmp)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE,
+                         '--tree', '--file', sess)
+                # The last voice is in turn 1499 — give it long enough
+                # for the scan + initial fetches + cursor snap. Without
+                # the framework fix, this times out: the cursor stays
+                # parked on the scope_root row indefinitely.
+                t.wait_for('PROBE_LAST_VOICE_1499', timeout=10.0)
+                t.send('q')
+
     def test_no_show_all_starts_in_filtered_mode(self):
         """``--no-show-all`` boots straight into the voice-only view."""
         import json as _json
