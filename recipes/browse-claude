@@ -1367,23 +1367,6 @@ def _rule(title='', color=None):
     return f'{color or MUTE}{body}{RESET}'
 
 
-def _fmt_usage(u):
-    """One-line ``── usage:`` footer for ``message.usage``.
-
-    Visually distinct from body content via the muted rule-style
-    prefix, and compact enough to fit the typical preview-pane
-    width without wrapping.
-    """
-    rows = [
-        ('input',      u.get('input_tokens', 0)),
-        ('output',     u.get('output_tokens', 0)),
-        ('cache read', u.get('cache_read_input_tokens', 0)),
-        ('cache new',  u.get('cache_creation_input_tokens', 0)),
-    ]
-    body = '   '.join(f'{k}: {v:,}' for k, v in rows)
-    return f'{MUTE}── usage:   {body}{RESET}'
-
-
 # ---- tool_use rendering --------------------------------------------------
 
 
@@ -2058,7 +2041,13 @@ def _fmt_chrome(obj):
             f'{MUTE}{k.ljust(w)}:{RESET} {v}' for k, v in rows
         ))
     if usage:
-        parts.append(_fmt_usage(usage))
+        parts.append('   '.join([
+            f'{MUTE}usage:{RESET}',
+            f'input: {usage.get("input_tokens", 0):,}',
+            f'output: {usage.get("output_tokens", 0):,}',
+            f'cache read: {usage.get("cache_read_input_tokens", 0):,}',
+            f'cache new: {usage.get("cache_creation_input_tokens", 0):,}',
+        ]))
     return '\n'.join(parts)
 
 

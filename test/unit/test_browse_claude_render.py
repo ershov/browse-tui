@@ -224,10 +224,11 @@ class TestRenderers(unittest.TestCase):
         self.assertIn('Hi there.', body)
         # Body no longer carries usage — it's chrome's concern.
         self.assertNotIn('cache read', body)
-        self.assertNotIn('── usage', body)
-        # Chrome carries the one-line usage footer.
+        self.assertNotIn('usage:', body)
+        # Chrome carries a single ``usage:`` line — a plain
+        # three-space separated string, no special formatting.
         usage_lines = [
-            ln for ln in chrome.split('\n') if '── usage:' in ln
+            ln for ln in chrome.split('\n') if 'usage:' in ln
         ]
         self.assertEqual(len(usage_lines), 1)
         self.assertIn('input: 1,234', usage_lines[0])
@@ -237,7 +238,7 @@ class TestRenderers(unittest.TestCase):
 
     def test_chrome_usage_only(self):
         # No uuid/timestamp/cwd, only usage: chrome still emits the
-        # leading rule and the one-line ``── usage:`` footer.
+        # leading rule and the ``usage:`` line.
         obj = {
             'type': 'assistant',
             'message': {
@@ -253,7 +254,7 @@ class TestRenderers(unittest.TestCase):
         chrome = self.r._fmt_chrome(obj)
         self.assertTrue(chrome, 'chrome must surface usage even with no other rows')
         lines = chrome.split('\n')
-        self.assertIn('── usage:', lines[-1])
+        self.assertIn('usage:', lines[-1])
         self.assertIn('input: 5', lines[-1])
 
     def test_chrome_no_usage_no_rows_returns_empty(self):
