@@ -450,9 +450,11 @@ charge of how the Browser is configured.
 | `v`            | View cursor item's preview in `$PAGER` (default `less -R`)  |
 | `e`            | Edit cursor item's preview in `$EDITOR` (default `vi`)      |
 | `/`            | Enter search mode                                           |
-| Enter          | In search mode → next match; otherwise → `--on-enter`       |
+| `&`            | Enter filter mode (stacking; less-style)                    |
+| Enter          | In search mode → next match; in filter mode → commit (or clear-all on empty); otherwise → `--on-enter` |
 | Shift-Enter    | In search mode → previous match                             |
-| Esc            | Exit search mode (in search), else quit                     |
+| Ctrl-X         | In filter mode → clear all filters and exit                 |
+| Esc            | Exit search/filter mode (cancel current edit), else quit    |
 | `?` / F1       | Toggle help screen                                          |
 | `q`            | Quit (exit code 1)                                          |
 | Ctrl-C         | Quit (exit code 1)                                          |
@@ -480,6 +482,17 @@ process is launched.
 
 In **search mode** (after `/`), every printable key extends the query and the
 cursor jumps to the nearest match in real time. Backspace trims; Esc cancels.
+
+In **filter mode** (after `&`), every printable key extends the live filter
+and the visible list narrows in real time using match-promotes-ancestors
+semantics (a non-matching parent stays visible if any descendant matches).
+Enter commits the live filter onto the stack; the next `&` adds another
+predicate (AND-stacked). Enter on an empty filter clears all filters.
+Ctrl-X clears all filters from inside the prompt. Backspace trims the
+in-progress entry; Ctrl-U clears just the in-progress entry; Ctrl-W kills
+the last word. Non-overridden keys (arrows, page keys, scope, …) fall
+through to normal navigation while the prompt stays open. See
+`docs/superpowers/specs/2026-05-17-filter-design.md`.
 
 **Mouse:** when running in a terminal that supports SGR mouse reporting,
 left-click on a list row positions the cursor there. The wheel scrolls

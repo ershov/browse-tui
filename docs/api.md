@@ -40,6 +40,11 @@ class Item:
 domain-specific attributes (`item.size`, `item.mtime`, `item.path` …) and
 they survive across the full pipeline (rendering, search, action env vars).
 
+A framework-internal `_filter_hidden` field also lives on `Item` (written
+by the interactive filter evaluator). It's `init=False, repr=False,
+compare=False` — invisible to recipe code and never part of equality.
+See the *Interactive filter* subsection under `browser.update_data`.
+
 ### Title fallback
 
 If `title` is empty, `__post_init__` sets it to `str(id)`. This is what makes
@@ -224,6 +229,12 @@ ctx.append_preview(id, chunk)         -> None
 ctx.clear_preview(id)                 -> None
 ctx.invalidate_preview(id)            -> None    # drop cache + re-fetch
 ctx.preview_to_tail()                 -> None    # pin preview to bottom
+ctx.nav_home()                        -> None    # cursor -> row 0 + PIN_FIRST
+ctx.nav_end()                         -> None    # cursor -> last row + PIN_LAST
+ctx.filters                           -> tuple[str, ...]   # active filter list
+ctx.set_filters(filters)              -> None    # replace; drops empty strings
+ctx.add_filter(text)                  -> None    # append (no-op if empty)
+ctx.clear_filters()                   -> None    # alias for set_filters([])
 ctx.run_in_worker(fn)                 -> threading.Thread
 ```
 
@@ -753,6 +764,51 @@ clears the existing selection and then adds every currently-visible
 normal row, so selections of hidden, collapsed-child, or
 out-of-scope rows are dropped. "Deselect all" (`Ctrl-N`) clears the
 entire selection set.
+
+##### Interactive filter (`&`) — user-driven, stacking
+
+A user-facing filter complements `Item.hidden`. While `hidden` is
+**recipe-owned** and cascades over subtrees, the filter is **user-owned**
+(via the `&` keybinding), stacks predicates with AND semantics, and uses
+*match-promotes-ancestors* — a non-matching parent with a matching
+descendant stays visible as scaffolding.
+
+- **`&`** opens the filter prompt and appends a placeholder entry.
+- Typing extends the live entry; matches re-evaluate every keystroke.
+- **Enter** commits the live entry; the next `&` stacks on top.
+- **Enter** on an empty live entry **clears all** filters.
+- **Ctrl-X** (within filter-edit) also clears all filters and exits.
+- **Ctrl-C** / **Esc** cancel the in-progress edit, keeping committed
+  filters.
+- Non-overridden keys (arrows, page keys, scope-in/out, …) fall through
+  to NORMAL dispatch so the user can navigate while the prompt is open.
+  `Enter` is the one carve-out — recipe `on_enter` handlers do not fire
+  during filter-edit.
+
+Per-row evaluation is bottom-up: every reachable item gets a framework-
+internal `_filter_hidden` flag (recipes never see it). The renderer skips
+rows whose flag is `True` *and* `state._filter_active` is `True`. When
+the filter is cleared, the flag becomes inert; no O(N) clear pass.
+
+Composition with `Item.hidden`: a row appears iff **neither** layer hides
+it. `Item.hidden` cascades over subtrees and is checked first, so a
+recipe-hidden row stays hidden even if filter scaffolding wants it.
+
+Recipes can read or replace the filter list:
+
+```python
+ctx.filters                    # tuple[str, ...] — committed + live, no empties
+ctx.set_filters(['open', 'today'])
+ctx.add_filter('high')         # no-op on empty
+ctx.clear_filters()            # alias for set_filters([])
+```
+
+`set_filters` forces filter-edit exit if active; the in-progress
+placeholder is discarded. Recipe writes are authoritative.
+
+See `docs/superpowers/specs/2026-05-17-filter-design.md` for the design
+details (mode enum, evaluator, lifecycle table, cursor / selection /
+search interaction).
 
 ##### Behavioural change vs. pre-streaming API
 

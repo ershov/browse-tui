@@ -1254,6 +1254,7 @@ class TestExpandGoal(unittest.TestCase):
             _actions_mod.visible_items = _state_mod.visible_items
             _actions_mod.mark_visible_dirty = _state_mod.mark_visible_dirty
             _actions_mod.mark_cursor_changed = _state_mod.mark_cursor_changed
+            _actions_mod.Mode = _state_mod.Mode
             _state_mod.dispatch_key = _actions_mod.dispatch_key
             _state_mod._handle_insert_key = _actions_mod._handle_insert_key
             b._handle_one_key(ctx, 'j')
@@ -1613,6 +1614,7 @@ class TestCursorPin(unittest.TestCase):
             _actions_mod.mark_cursor_changed = _state.mark_cursor_changed
             _actions_mod.PIN_FIRST = _state.PIN_FIRST
             _actions_mod.PIN_LAST = _state.PIN_LAST
+            _actions_mod.Mode = _state.Mode
             _state.dispatch_key = _actions_mod.dispatch_key
             _state._handle_insert_key = _actions_mod._handle_insert_key
             b._handle_one_key(ctx, 'j')
@@ -1707,6 +1709,7 @@ class TestCursorPin(unittest.TestCase):
             _actions_mod.mark_cursor_changed = _state.mark_cursor_changed
             _actions_mod.PIN_FIRST = _state.PIN_FIRST
             _actions_mod.PIN_LAST = _state.PIN_LAST
+            _actions_mod.Mode = _state.Mode
             _state.dispatch_key = _actions_mod.dispatch_key
             _state._handle_insert_key = _actions_mod._handle_insert_key
 
@@ -1717,6 +1720,248 @@ class TestCursorPin(unittest.TestCase):
             b._handle_one_key(ctx, 'end')
             self.assertEqual(b._state.cursor, 2)
             self.assertEqual(b._cursor_anchor, [_state.PIN_LAST])
+        finally:
+            b.stop_workers()
+
+
+# ---- 12. Interactive filter (`&`) integration ----------------------------
+#
+# Covers the cross-cutting behaviours called out in the design spec:
+# update_data re-triggers filter recompute, cursor hide-displacement
+# follows a filter-hidden row, PIN_FIRST/LAST survive filter narrowing,
+# select-all drops filter-hidden rows (WYSIWYG), and search runs only
+# over filter-passing rows.
+
+
+def _wire_actions(b):
+    """Helper: load+wire the actions module for filter dispatch."""
+    from test.unit._loader import load
+    _actions_mod = load('_browse_tui_act', '070-actions.py')
+    _actions_mod.visible_items = _state.visible_items
+    _actions_mod.mark_visible_dirty = _state.mark_visible_dirty
+    _actions_mod.mark_cursor_changed = _state.mark_cursor_changed
+    _actions_mod._recompute_filter_hidden = _state._recompute_filter_hidden
+    _actions_mod._AnchorSentinel = _state._AnchorSentinel
+    _actions_mod.PIN_FIRST = _state.PIN_FIRST
+    _actions_mod.PIN_LAST = _state.PIN_LAST
+    _actions_mod.Mode = _state.Mode
+    _state.dispatch_key = _actions_mod.dispatch_key
+    _state._handle_insert_key = _actions_mod._handle_insert_key
+    _ctx_mod = load('_browse_tui_ctx', '060-context.py')
+    _ctx_mod.visible_items = _state.visible_items
+    return _ctx_mod.Context(b)
+
+
+class TestFilterUpdateDataIntegration(unittest.TestCase):
+    """``update_data`` re-fires ``_recompute_filter_hidden`` after each batch."""
+
+    def test_streaming_match_unhides_scaffold_parent(self):
+        # Start: only non-matching items. Apply a filter — parent hidden.
+        # Then stream in a matching child — parent should resurrect.
+        b = make_browser(get_children=lambda _id: [])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.update_data([
+                ('upsert', 'parent', None,
+                 {'title': 'parent', 'has_children': True}),
+            ])
+            b.run_until_idle()
+            b.set_filters(['child'])
+            b.run_until_idle()
+            # Optimistic-pending: parent has has_children=True with no
+            # cached children, so it stays visible.
+            self.assertFalse(b._state._items_by_id['parent']._filter_hidden)
+            # Stream a non-matching child first — parent flips to hidden.
+            b.update_data([
+                ('upsert', 'one', 'parent', {'title': 'one'}),
+                ('complete', 'parent'),
+            ])
+            b.run_until_idle()
+            self.assertTrue(b._state._items_by_id['parent']._filter_hidden)
+            self.assertTrue(b._state._items_by_id['one']._filter_hidden)
+            # Now stream a matching child — parent resurrects as scaffold.
+            b.update_data([
+                ('upsert', 'child-foo', 'parent', {'title': 'child-foo'}),
+            ])
+            b.run_until_idle()
+            self.assertFalse(b._state._items_by_id['parent']._filter_hidden)
+            self.assertFalse(b._state._items_by_id['child-foo']._filter_hidden)
+        finally:
+            b.stop_workers()
+
+
+class TestFilterCursorDisplacement(unittest.TestCase):
+    """Cursor walks back when its row vanishes due to filter narrowing."""
+
+    def test_cursor_displaces_when_row_hidden_by_filter(self):
+        b = make_browser(get_children=lambda _id: [
+            ('apple',), ('banana',), ('cherry',),
+        ])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.cursor_to('banana')
+            b.run_until_idle()
+            self.assertEqual(b._state.cursor, 1)
+            # Filter 'app' — only apple matches; banana row vanishes.
+            b.set_filters(['app'])
+            b.run_until_idle()
+            # Cursor walks back to apple (idx 0 in the new visible list).
+            self.assertEqual(b._state.cursor, 0)
+        finally:
+            b.stop_workers()
+
+
+class TestPinSurvivesFilter(unittest.TestCase):
+    """PIN_FIRST / PIN_LAST re-bind to the filtered visible list."""
+
+    def test_pin_first_clamps_to_filter_top(self):
+        b = make_browser(get_children=lambda _id: [
+            ('apple',), ('banana',), ('cherry',),
+        ])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.nav_home()
+            b.run_until_idle()
+            self.assertEqual(b._cursor_anchor, [_state.PIN_FIRST])
+            # Filter to 'che' — only cherry remains. Pin stays first.
+            b.set_filters(['che'])
+            b.run_until_idle()
+            vis = _state.visible_items(b._state)
+            self.assertEqual([e.item.id for e in vis], ['cherry'])
+            self.assertEqual(b._state.cursor, 0)
+            self.assertEqual(b._cursor_anchor, [_state.PIN_FIRST])
+        finally:
+            b.stop_workers()
+
+    def test_pin_last_clamps_to_filter_bottom(self):
+        b = make_browser(get_children=lambda _id: [
+            ('apple',), ('banana',), ('apricot',),
+        ])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.nav_end()
+            b.run_until_idle()
+            self.assertEqual(b._cursor_anchor, [_state.PIN_LAST])
+            # Filter 'ap' — apple + apricot match; cursor at apricot.
+            b.set_filters(['ap'])
+            b.run_until_idle()
+            vis = _state.visible_items(b._state)
+            ids = [e.item.id for e in vis]
+            self.assertEqual(ids, ['apple', 'apricot'])
+            self.assertEqual(b._state.cursor, 1)
+            self.assertEqual(b._cursor_anchor, [_state.PIN_LAST])
+        finally:
+            b.stop_workers()
+
+
+class TestSelectAllRespectsFilter(unittest.TestCase):
+    """Ctrl-A select-all-visible drops filter-hidden ids (WYSIWYG)."""
+
+    def test_select_all_keeps_only_visible(self):
+        b = make_browser(get_children=lambda _id: [
+            ('apple',), ('banana',), ('cherry',),
+        ])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.select(['apple', 'banana', 'cherry'], replace=True)
+            b.run_until_idle()
+            # Filter 'app' — banana / cherry hidden.
+            b.set_filters(['app'])
+            b.run_until_idle()
+            # select-all-visible via dispatch.
+            ctx = _wire_actions(b)
+            b._handle_one_key(ctx, 'ctrl-a')
+            self.assertEqual(b._state.selected, {'apple'})
+        finally:
+            b.stop_workers()
+
+
+class TestSearchWithinFilter(unittest.TestCase):
+    """`/` search corpus narrows to filter-passing rows."""
+
+    def test_search_only_finds_filter_passing_rows(self):
+        b = make_browser(get_children=lambda _id: [
+            ('apple-a',), ('apple-b',), ('banana-a',),
+        ])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            # Filter 'apple' — banana-a hidden.
+            b.set_filters(['apple'])
+            b.run_until_idle()
+            # _search_find walks visible_items, which now excludes banana.
+            idx = _state._search_find(b._state, 'banana', 0, 1)
+            self.assertIsNone(idx)
+            # Search for 'apple' — finds apple-a (first match).
+            idx = _state._search_find(b._state, 'apple', -1, 1)
+            self.assertIsNotNone(idx)
+            vis = _state.visible_items(b._state)
+            self.assertEqual(vis[idx].item.id, 'apple-a')
+        finally:
+            b.stop_workers()
+
+
+class TestFilterApi(unittest.TestCase):
+    """``Browser.filters`` / ``set_filters`` / ``add_filter`` / ``clear_filters``."""
+
+    def test_filters_property_excludes_empty_placeholder(self):
+        b = make_browser(get_children=lambda _id: [('a',), ('b',)])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            # In FILTER_EDIT with empty placeholder, filters() returns ().
+            b._filters = ['']
+            b._mode = _state.Mode.FILTER_EDIT
+            self.assertEqual(b.filters, ())
+            # Once user has typed, the live entry surfaces.
+            b._filters = ['f']
+            self.assertEqual(b.filters, ('f',))
+            b._mode = _state.Mode.NORMAL
+        finally:
+            b.stop_workers()
+
+    def test_set_filters_forces_normal_mode(self):
+        b = make_browser(get_children=lambda _id: [('a',), ('b',)])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b._mode = _state.Mode.FILTER_EDIT
+            b._filters = ['half-typed']
+            b.set_filters(['final'])
+            b.run_until_idle()
+            self.assertIs(b._mode, _state.Mode.NORMAL)
+            self.assertEqual(b._filters, ['final'])
+        finally:
+            b.stop_workers()
+
+    def test_add_filter_appends(self):
+        b = make_browser(get_children=lambda _id: [('a',), ('b',)])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.set_filters(['first'])
+            b.run_until_idle()
+            b.add_filter('second')
+            b.run_until_idle()
+            self.assertEqual(b._filters, ['first', 'second'])
+        finally:
+            b.stop_workers()
+
+    def test_clear_filters_drops_all(self):
+        b = make_browser(get_children=lambda _id: [('a',), ('b',)])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.set_filters(['x', 'y'])
+            b.run_until_idle()
+            b.clear_filters()
+            b.run_until_idle()
+            self.assertEqual(b._filters, [])
         finally:
             b.stop_workers()
 

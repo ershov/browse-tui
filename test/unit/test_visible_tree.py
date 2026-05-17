@@ -381,5 +381,64 @@ class TestHiddenFlag(unittest.TestCase):
         self.assertEqual(visible_items(s), [])
 
 
+class TestFilterHiddenFlag(unittest.TestCase):
+    """``_filter_hidden`` per-row flag drops the row from the visible list.
+
+    Unlike ``hidden``, ``_filter_hidden`` is per-row (not a subtree
+    cascade) — but the bottom-up evaluator only flags a row when its
+    entire subtree fails, so the effect is equivalent. These tests
+    exercise the renderer's skip logic with hand-set flags.
+    """
+
+    def test_inert_when_filter_active_false(self):
+        # Flag set but ``_filter_active`` not set -> row still visible.
+        a = _kid('a')
+        a._filter_hidden = True
+        s = _state_factory(root_id=None, _children={None: [a]})
+        self.assertFalse(s._filter_active)
+        self.assertEqual(
+            _ids(visible_items(s)),
+            [('a', 0, 'normal')],
+        )
+
+    def test_filter_active_drops_flagged_row(self):
+        a = _kid('a')
+        b = _kid('b')
+        b._filter_hidden = True
+        c = _kid('c')
+        s = _state_factory(root_id=None, _children={None: [a, b, c]})
+        s._filter_active = True
+        self.assertEqual(
+            _ids(visible_items(s)),
+            [('a', 0, 'normal'), ('c', 0, 'normal')],
+        )
+
+    def test_filter_keeps_matching_descendant_when_parent_unflagged(self):
+        # Parent ``_filter_hidden=False`` (scaffold), child
+        # ``_filter_hidden=False`` too: both render.
+        parent = _kid('p', has_children=True)
+        child = _kid('c')
+        s = _state_factory(
+            root_id=None,
+            _children={None: [parent], 'p': [child]},
+            expanded={'p'},
+        )
+        s._filter_active = True
+        self.assertEqual(
+            _ids(visible_items(s)),
+            [('p', 0, 'normal'), ('c', 1, 'normal')],
+        )
+
+    def test_hidden_takes_precedence_over_filter(self):
+        # ``hidden=True`` short-circuits before the filter check, so a
+        # filter-passing recipe-hidden row is still hidden.
+        a = Item(id='a', hidden=True)
+        # No filter flag — the row passes the filter but is hidden by
+        # the recipe-owned ``hidden`` field.
+        s = _state_factory(root_id=None, _children={None: [a]})
+        s._filter_active = True
+        self.assertEqual(visible_items(s), [])
+
+
 if __name__ == '__main__':
     unittest.main()

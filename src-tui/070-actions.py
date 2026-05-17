@@ -528,7 +528,7 @@ def _select_clear(ctx):
 
 def _search_start(ctx):
     """Enter search-text-entry mode."""
-    ctx._browser._search_mode = True
+    ctx._browser._mode = Mode.SEARCH_EDIT
     ctx._browser._search_query = ''
     ctx._browser._needs_redraw.add('info')
 
@@ -536,7 +536,7 @@ def _search_start(ctx):
 def _search_next(ctx):
     """Jump cursor to the next match (forward, wrap-around).
 
-    Bound to ``enter`` while ``_search_mode`` is True. ``_search_find``
+    Bound to ``enter`` while ``_mode is Mode.SEARCH_EDIT``. ``_search_find``
     starts the walk *after* the current cursor, so repeated presses
     advance through every match in turn before wrapping back to the
     first.
@@ -549,11 +549,36 @@ def _search_next(ctx):
         mark_cursor_changed(browser)
 
 
+def _filter_start(ctx):
+    """Enter filter-edit mode (``&`` keybinding).
+
+    Appends an empty placeholder to ``_filters`` (the slot the user
+    types into) and sets ``_mode = Mode.FILTER_EDIT``. The placeholder
+    is never evaluated — see ``_recompute_filter_hidden`` and the
+    spec at ``docs/superpowers/specs/2026-05-17-filter-design.md``.
+    """
+    b = ctx._browser
+    b._mode = Mode.FILTER_EDIT
+    b._filters.append('')
+    b._needs_redraw.add('info')
+
+
+def _filter_recompute_and_redraw(browser):
+    """Re-evaluate filter visibility and flag UI redraws.
+
+    Called from every FILTER_EDIT keystroke that mutates the last
+    entry. Delegates to ``Browser._do_filter_change`` so the dispatch
+    layer and the public API write paths share one reconciliation
+    routine (recompute -> hide-displacement -> anchor -> redraw).
+    """
+    browser._do_filter_change()
+
+
 def _search_prev(ctx):
     """Jump cursor to the previous match (backward, wrap-around).
 
     Symmetric counterpart to ``_search_next`` — bound to ``shift-enter``
-    while ``_search_mode`` is True.
+    while ``_mode is Mode.SEARCH_EDIT``.
     """
     browser = ctx._browser
     state = browser._state
@@ -1008,6 +1033,10 @@ def default_actions() -> list:
         Action('alt-4',      '', _set_layout_pc, 'none', 'PREVIEW'),
         # Search.
         Action('/',         'Enter search mode', _search_start, 'none', 'SEARCH'),
+        # Filter (less-style `&`). Stacks predicates; empty Enter or
+        # Ctrl-X clears all. See
+        # docs/superpowers/specs/2026-05-17-filter-design.md.
+        Action('&',         'Enter filter mode', _filter_start, 'none', 'SEARCH'),
         # Multi-select bindings. ``read_key`` returns ``'space'`` for the
         # bare spacebar (special-cased in 020-terminal) but Alt+Space
         # arrives as ESC + ' ' which the alt-prefix branch turns into the
@@ -1056,13 +1085,13 @@ def build_keymap(browser) -> dict:
 def dispatch_key(browser, ctx: 'Context', key: str) -> bool:
     """Dispatch ``key`` to the matching action; return True if handled.
 
-    Search-mode (``browser._search_mode is True``) intercepts most keys:
-    ``esc`` exits search, ``enter`` and ``shift-enter`` jump between
-    matches (stubs in phase 1), ``backspace`` trims the query, and
-    printable characters extend it. Other keys fall through to normal
-    dispatch only when not in search mode.
+    SEARCH_EDIT mode (``browser._mode is Mode.SEARCH_EDIT``) intercepts
+    most keys: ``esc`` exits search, ``enter`` and ``shift-enter`` jump
+    between matches (stubs in phase 1), ``backspace`` trims the query,
+    and printable characters extend it. Other keys fall through to
+    normal dispatch only when not in an edit mode.
 
-    Outside search mode: ``enter`` runs the on_enter handler (print-exit,
+    Outside edit modes: ``enter`` runs the on_enter handler (print-exit,
     action-redirect, noop, or callable) and other keys run their bound
     Action's handler if its ``requires`` precondition is met.
 
@@ -1070,13 +1099,13 @@ def dispatch_key(browser, ctx: 'Context', key: str) -> bool:
     caller (main loop in #13) uses the return to decide whether to log
     the key or pass it through to a fallback.
     """
-    # Mouse events (clicks + wheel) are dispatched first when not in
-    # search mode. ``_dispatch_mouse`` parses the row/col, looks up the
-    # pane via ``layout_panes``, and applies the per-pane behaviour.
-    # Search mode silently swallows mouse events along with other
-    # unhandled keys (the multi-char ``mouse-click:R:C`` form bypasses
-    # the printable-char branch of the search-mode handler).
-    if not browser._search_mode and (
+    # Mouse events (clicks + wheel) are dispatched first when in normal
+    # mode. ``_dispatch_mouse`` parses the row/col, looks up the pane
+    # via ``layout_panes``, and applies the per-pane behaviour. Edit
+    # modes silently swallow mouse events along with other unhandled
+    # keys (the multi-char ``mouse-click:R:C`` form bypasses the
+    # printable-char branch of the edit-mode handler).
+    if browser._mode is Mode.NORMAL and (
             key.startswith('mouse-click:')
             or key.startswith('scroll-up:')
             or key.startswith('scroll-down:')):
@@ -1093,9 +1122,9 @@ def dispatch_key(browser, ctx: 'Context', key: str) -> bool:
     # user sees results filter under the cursor as they type), and adds
     # ``'list'`` to the redraw set so highlight spans repaint
     # immediately.
-    if browser._search_mode:
+    if browser._mode is Mode.SEARCH_EDIT:
         if key in ('esc', 'ctrl-c'):
-            browser._search_mode = False
+            browser._mode = Mode.NORMAL
             browser._search_query = ''
             browser._needs_redraw.add('info')
             browser._needs_redraw.add('list')
@@ -1157,10 +1186,86 @@ def dispatch_key(browser, ctx: 'Context', key: str) -> bool:
         # alt-*, etc.) fall through to the normal-mode dispatch below so
         # the list-pane navigation keys keep working while the user is
         # composing a query. Mouse events fall through harmlessly — the
-        # mouse-dispatch branch above is gated on ``not _search_mode``
-        # and the keymap has no binding for ``mouse-click:R:C``, so the
+        # mouse-dispatch branch above is gated on ``Mode.NORMAL`` and
+        # the keymap has no binding for ``mouse-click:R:C``, so the
         # event ends up silently dropped (preserves the prior
         # search-mode-swallows-mouse contract).
+
+    # Filter-edit (``&``) special handling.
+    #
+    # Mirrors SEARCH_EDIT in spirit but acts on ``browser._filters``
+    # (a list) and re-evaluates the per-Item ``_filter_hidden`` flags
+    # after every keystroke that changes the last entry. The last
+    # entry is the "live" one while in FILTER_EDIT.
+    #
+    # Enter commits (or clears all, if empty); Ctrl-X clears all
+    # unconditionally; Ctrl-C / Esc cancel the in-progress edit only.
+    # Other keys (arrows, etc.) fall through to NORMAL dispatch.
+    if browser._mode is Mode.FILTER_EDIT:
+        if key == 'enter':
+            last = browser._filters[-1] if browser._filters else ''
+            browser._mode = Mode.NORMAL
+            if not last:
+                # Commit-empty == clear all (less-compatible).
+                browser._filters = []
+            # else: the last entry is already in the list as the new
+            # committed top-of-stack — nothing more to do.
+            _filter_recompute_and_redraw(browser)
+            return True
+        if key == 'ctrl-x':
+            browser._mode = Mode.NORMAL
+            browser._filters = []
+            _filter_recompute_and_redraw(browser)
+            return True
+        if key in ('esc', 'ctrl-c'):
+            # Cancel the in-progress edit: pop the last entry (which
+            # IS the in-progress one in FILTER_EDIT). Committed
+            # filters stay.
+            browser._mode = Mode.NORMAL
+            if browser._filters:
+                browser._filters.pop()
+            _filter_recompute_and_redraw(browser)
+            return True
+        if key == 'backspace':
+            if browser._filters and browser._filters[-1]:
+                browser._filters[-1] = browser._filters[-1][:-1]
+                _filter_recompute_and_redraw(browser)
+            return True
+        # Ctrl-W kills the last whitespace-delimited word in the
+        # in-progress entry (readline convention; mirrors search).
+        if key == 'ctrl-w':
+            if browser._filters:
+                q = browser._filters[-1]
+                i = len(q)
+                while i > 0 and q[i - 1] == ' ':
+                    i -= 1
+                while i > 0 and q[i - 1] != ' ':
+                    i -= 1
+                browser._filters[-1] = q[:i]
+                _filter_recompute_and_redraw(browser)
+            return True
+        # Ctrl-U clears the in-progress entry (line-kill). To clear
+        # all filters use Ctrl-X.
+        if key == 'ctrl-u':
+            if browser._filters:
+                browser._filters[-1] = ''
+                _filter_recompute_and_redraw(browser)
+            return True
+        # ``space`` is the special name read_key uses for the bare
+        # spacebar; treat it literally inside the filter prompt.
+        if key == 'space':
+            if browser._filters:
+                browser._filters[-1] += ' '
+                _filter_recompute_and_redraw(browser)
+            return True
+        if len(key) == 1 and key.isprintable():
+            if browser._filters:
+                browser._filters[-1] += key
+                _filter_recompute_and_redraw(browser)
+            return True
+        # Multi-char keys (arrows, etc.) fall through to NORMAL
+        # dispatch. The prompt stays open; the last entry is
+        # unchanged.
 
     # Enter handling — outside search mode this falls to on_enter.
     if key == 'enter':

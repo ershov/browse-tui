@@ -35,12 +35,14 @@ _actions._search_jump_nearest = _state._search_jump_nearest
 _actions.mark_cursor_changed = _state.mark_cursor_changed
 _actions.PIN_FIRST = _state.PIN_FIRST
 _actions.PIN_LAST = _state.PIN_LAST
+_actions.Mode = _state.Mode
 
 
 Item = _data.Item
 State = _state.State
 VisibleEntry = _state.VisibleEntry
 Browser = _state.Browser
+Mode = _state.Mode
 visible_items = _state.visible_items
 _search_text = _state._search_text
 _search_matches = _state._search_matches
@@ -194,7 +196,7 @@ class TestSearchModeDispatch(unittest.TestCase):
 
     def test_typing_in_search_mode_jumps_cursor_to_nearest_match(self):
         b = self._browser_with_items(['foo', 'bar', 'baz', 'qux'])
-        b._search_mode = True
+        b._mode = Mode.SEARCH_EDIT
         try:
             ctx = _ctx_for(b)
             # Cursor starts at 0; typing 'baz' should land cursor on idx 2.
@@ -208,7 +210,7 @@ class TestSearchModeDispatch(unittest.TestCase):
 
     def test_enter_jumps_to_next_match(self):
         b = self._browser_with_items(['foo-a', 'bar', 'foo-b', 'foo-c'])
-        b._search_mode = True
+        b._mode = Mode.SEARCH_EDIT
         b._search_query = 'foo'
         b._state.cursor = 0  # already on first match
         try:
@@ -227,7 +229,7 @@ class TestSearchModeDispatch(unittest.TestCase):
 
     def test_shift_enter_jumps_to_previous(self):
         b = self._browser_with_items(['foo-a', 'bar', 'foo-b', 'foo-c'])
-        b._search_mode = True
+        b._mode = Mode.SEARCH_EDIT
         b._search_query = 'foo'
         b._state.cursor = 2
         try:
@@ -245,7 +247,7 @@ class TestSearchModeDispatch(unittest.TestCase):
         # Mirrors plan-tui: Esc clears the query so highlights vanish,
         # but the cursor stays on whatever match the user landed on.
         b = self._browser_with_items(['foo', 'bar', 'baz'])
-        b._search_mode = True
+        b._mode = Mode.SEARCH_EDIT
         try:
             ctx = _ctx_for(b)
             dispatch_key(b, ctx, 'b')
@@ -254,7 +256,7 @@ class TestSearchModeDispatch(unittest.TestCase):
             cursor_before = b._state.cursor
             self.assertEqual(cursor_before, 2)
             dispatch_key(b, ctx, 'esc')
-            self.assertFalse(b._search_mode)
+            self.assertIs(b._mode, Mode.NORMAL)
             self.assertEqual(b._search_query, '')
             # Cursor stays put — the user's landing position is preserved.
             self.assertEqual(b._state.cursor, cursor_before)
@@ -265,13 +267,13 @@ class TestSearchModeDispatch(unittest.TestCase):
         # ctrl-c is treated as a synonym for esc inside search mode —
         # universal abort. Clears the query and exits search mode.
         b = self._browser_with_items(['foo', 'bar'])
-        b._search_mode = True
+        b._mode = Mode.SEARCH_EDIT
         b._search_query = 'fo'
         try:
             ctx = _ctx_for(b)
             handled = dispatch_key(b, ctx, 'ctrl-c')
             self.assertTrue(handled)
-            self.assertFalse(b._search_mode)
+            self.assertIs(b._mode, Mode.NORMAL)
             self.assertEqual(b._search_query, '')
         finally:
             b.stop_workers()
@@ -280,7 +282,7 @@ class TestSearchModeDispatch(unittest.TestCase):
         # Alt-Enter is bound alongside Shift-Enter (terminals that swallow
         # the latter still have a way to walk matches backwards).
         b = self._browser_with_items(['foo-a', 'bar', 'foo-b', 'foo-c'])
-        b._search_mode = True
+        b._mode = Mode.SEARCH_EDIT
         b._search_query = 'foo'
         b._state.cursor = 2
         try:
@@ -296,7 +298,7 @@ class TestSearchModeDispatch(unittest.TestCase):
 
     def test_ctrl_w_kills_trailing_word(self):
         b = self._browser_with_items(['foo'])
-        b._search_mode = True
+        b._mode = Mode.SEARCH_EDIT
         b._search_query = 'foo bar'
         try:
             ctx = _ctx_for(b)
@@ -314,7 +316,7 @@ class TestSearchModeDispatch(unittest.TestCase):
         # Readline convention: ctrl-w on "foo bar   " (trailing spaces)
         # consumes the spaces AND the next word in one stroke.
         b = self._browser_with_items(['foo'])
-        b._search_mode = True
+        b._mode = Mode.SEARCH_EDIT
         b._search_query = 'foo bar   '
         try:
             ctx = _ctx_for(b)
@@ -325,7 +327,7 @@ class TestSearchModeDispatch(unittest.TestCase):
 
     def test_ctrl_w_on_empty_query_is_noop(self):
         b = self._browser_with_items(['foo'])
-        b._search_mode = True
+        b._mode = Mode.SEARCH_EDIT
         b._search_query = ''
         try:
             ctx = _ctx_for(b)
@@ -336,14 +338,14 @@ class TestSearchModeDispatch(unittest.TestCase):
 
     def test_ctrl_u_clears_query(self):
         b = self._browser_with_items(['foo'])
-        b._search_mode = True
+        b._mode = Mode.SEARCH_EDIT
         b._search_query = 'foo bar baz'
         try:
             ctx = _ctx_for(b)
             self.assertTrue(dispatch_key(b, ctx, 'ctrl-u'))
             self.assertEqual(b._search_query, '')
             # Stays in search mode (just the line was killed).
-            self.assertTrue(b._search_mode)
+            self.assertIs(b._mode, Mode.SEARCH_EDIT)
         finally:
             b.stop_workers()
 
@@ -351,7 +353,7 @@ class TestSearchModeDispatch(unittest.TestCase):
         # Non-letter navigation keys fall through to the normal dispatch
         # so the user can still walk the list while a query is composed.
         b = self._browser_with_items(['a', 'b', 'c', 'd'])
-        b._search_mode = True
+        b._mode = Mode.SEARCH_EDIT
         b._search_query = ''
         b._state.cursor = 0
         try:
@@ -363,26 +365,26 @@ class TestSearchModeDispatch(unittest.TestCase):
             # Query stays empty — arrow keys do not extend it.
             self.assertEqual(b._search_query, '')
             # Still in search mode.
-            self.assertTrue(b._search_mode)
+            self.assertIs(b._mode, Mode.SEARCH_EDIT)
         finally:
             b.stop_workers()
 
     def test_pgdn_navigates_during_search(self):
         b = self._browser_with_items([f'item-{i}' for i in range(50)])
-        b._search_mode = True
+        b._mode = Mode.SEARCH_EDIT
         b._state.cursor = 0
         try:
             ctx = _ctx_for(b)
             self.assertTrue(dispatch_key(b, ctx, 'pgdn'))
             # PgDn moves by a page. Cursor must have advanced past 0.
             self.assertGreater(b._state.cursor, 0)
-            self.assertTrue(b._search_mode)
+            self.assertIs(b._mode, Mode.SEARCH_EDIT)
         finally:
             b.stop_workers()
 
     def test_home_navigates_during_search(self):
         b = self._browser_with_items(['a', 'b', 'c', 'd'])
-        b._search_mode = True
+        b._mode = Mode.SEARCH_EDIT
         b._state.cursor = 3
         try:
             ctx = _ctx_for(b)
@@ -400,7 +402,7 @@ class TestSearchModeDispatch(unittest.TestCase):
         # 2), query shrinks 'baz' → 'ba'; 'baz' still matches 'ba' so
         # the cursor stays at 2.
         b = self._browser_with_items(['foo', 'bar', 'baz', 'qux'])
-        b._search_mode = True
+        b._mode = Mode.SEARCH_EDIT
         try:
             ctx = _ctx_for(b)
             dispatch_key(b, ctx, 'b')

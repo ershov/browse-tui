@@ -29,6 +29,7 @@ _state.Item = _data.Item
 _state.to_item = _data.to_item
 _state.notify_wake = _term.notify_wake
 _render.Item = _data.Item
+_render.Mode = _state.Mode
 _render.VisibleEntry = _state.VisibleEntry
 
 _context.visible_items = _state.visible_items
@@ -50,6 +51,7 @@ _actions.mark_visible_dirty = _state.mark_visible_dirty
 _actions.mark_cursor_changed = _state.mark_cursor_changed
 _actions.PIN_FIRST = _state.PIN_FIRST
 _actions.PIN_LAST = _state.PIN_LAST
+_actions.Mode = _state.Mode
 _actions.current_scope = _state.current_scope
 _actions.auto_insert_depth = _state.auto_insert_depth
 _actions.resolve_insert = _state.resolve_insert

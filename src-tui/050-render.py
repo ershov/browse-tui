@@ -2095,7 +2095,7 @@ def render_info_bar(row, cols, label, *, info=False, browser=None,
       * ``[N]`` selection count (if non-zero) in bold cyan;
       * a scope crumb path (when ``scope_stack`` is non-empty) — one
         ``▸ <id>`` segment per stack entry in bright cyan;
-      * the search prompt + query (when ``browser._search_mode``);
+      * the search prompt + query (when ``browser._mode is Mode.SEARCH_EDIT``);
       * a dim hint string about navigation keys (when not searching).
 
     The right edge ends with the pane label (``Preview``, ``Help``, …).
@@ -2126,12 +2126,32 @@ def render_info_bar(row, cols, label, *, info=False, browser=None,
 
     if info and browser is not None:
         sel_count = len(browser._state.selected)
-        search = browser._search_query if browser._search_mode else None
+        search = browser._search_query if browser._mode is Mode.SEARCH_EDIT else None
         crumb = _scope_crumb_text(browser)
+        # Filter prompt — built whenever filters are active or the user
+        # is editing one. Joined with ' & ' to match the display in the
+        # design spec (e.g. "foo & bar & ba_" mid-edit). The trailing
+        # underscore is appended when in FILTER_EDIT so the user sees
+        # the cursor position. See
+        # docs/superpowers/specs/2026-05-17-filter-design.md.
+        filt = None
+        if browser._mode is Mode.FILTER_EDIT or browser._filters:
+            entries = list(browser._filters)
+            if browser._mode is Mode.FILTER_EDIT and entries:
+                # Last entry is the live one — render with a trailing
+                # underscore so the user sees the active prompt.
+                live = entries[-1]
+                committed = entries[:-1]
+                live_part = (live or '') + '_'
+                shown = list(committed) + [live_part]
+            else:
+                shown = entries
+            filt = ' & '.join(shown)
     else:
         sel_count = 0
         search = None
         crumb = ''
+        filt = None
 
     label_str = ' {} '.format(label)
     pos = 0
@@ -2165,7 +2185,10 @@ def render_info_bar(row, cols, label, *, info=False, browser=None,
         write(S * min(7 - pos, cols - pos))
         pos = min(7, cols)
 
-    # Search prompt (when searching) or context-sensitive hints.
+    # Search prompt (when searching), filter prompt (when filtering),
+    # or context-sensitive hints. Search and filter cannot be active
+    # simultaneously (modes are mutually exclusive), so the order of
+    # checks is just a stylistic preference.
     if search is not None and pos < cols:
         prompt = '/'
         set_style(fg=11, bg=4, bold=True)
@@ -2175,6 +2198,17 @@ def render_info_bar(row, cols, label, *, info=False, browser=None,
             reset_style()
             write(search[:cols - pos])
             pos += len(search)
+        set_style(fg=8)
+    elif filt is not None and pos < cols:
+        prompt = '&'
+        set_style(fg=11, bg=4, bold=True)
+        write(prompt[:cols - pos])
+        pos += len(prompt)
+        if pos < cols:
+            reset_style()
+            text = ' ' + filt
+            write(text[:cols - pos])
+            pos += min(len(text), cols - pos)
         set_style(fg=8)
     elif info and pos < cols:
         # Hint text — kept generic; phase-3 ticket #32 will let recipes

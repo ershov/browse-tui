@@ -41,6 +41,7 @@ _state.notify_wake = _term.notify_wake
 # -h/--help auto-detect short-circuit (#91); inject it for tests.
 _state.compose_help_text = _render.compose_help_text
 _render.Item = _data.Item
+_render.Mode = _state.Mode
 _render.VisibleEntry = _state.VisibleEntry
 _render.default_actions = _actions.default_actions
 _actions.visible_items = _state.visible_items
@@ -51,6 +52,7 @@ _actions._search_jump_nearest = _state._search_jump_nearest
 _actions.mark_cursor_changed = _state.mark_cursor_changed
 _actions.PIN_FIRST = _state.PIN_FIRST
 _actions.PIN_LAST = _state.PIN_LAST
+_actions.Mode = _state.Mode
 _cli.Browser = _state.Browser
 _cli.Action = _actions.Action
 

@@ -37,6 +37,7 @@ _state.to_item = _data.to_item
 _state.notify_wake = _term.notify_wake
 
 _render.Item = _data.Item
+_render.Mode = _state.Mode
 _render.VisibleEntry = _state.VisibleEntry
 _render.PaneCache = _state.PaneCache
 _render.visible_items = _state.visible_items
@@ -58,6 +59,7 @@ _actions.mark_visible_dirty = _state.mark_visible_dirty
 _actions.mark_cursor_changed = _state.mark_cursor_changed
 _actions.PIN_FIRST = _state.PIN_FIRST
 _actions.PIN_LAST = _state.PIN_LAST
+_actions.Mode = _state.Mode
 
 
 Item = _data.Item

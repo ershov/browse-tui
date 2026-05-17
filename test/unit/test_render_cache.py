@@ -47,6 +47,7 @@ _state.notify_wake = _term.notify_wake
 # term_size). The concatenated production build gets these by virtue of
 # the modules being a single namespace.
 _render.Item = _data.Item
+_render.Mode = _state.Mode
 _render.VisibleEntry = _state.VisibleEntry
 _render.PaneCache = _state.PaneCache
 _render.visible_items = _state.visible_items
@@ -78,6 +79,7 @@ _actions._search_jump_nearest = _state._search_jump_nearest
 _actions.mark_cursor_changed = _state.mark_cursor_changed
 _actions.PIN_FIRST = _state.PIN_FIRST
 _actions.PIN_LAST = _state.PIN_LAST
+_actions.Mode = _state.Mode
 _actions.point_in_rect = _render.point_in_rect
 _actions._sub_needed_rows = _render._sub_needed_rows
 _actions._fmt_child = _render._fmt_child

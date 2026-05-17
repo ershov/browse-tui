@@ -34,6 +34,7 @@ _render = load('_browse_tui_render', '050-render.py')
 # (mirrors the state module's pattern). Inject the real class so the
 # default formatter can introspect.
 _render.Item = _data.Item
+_render.Mode = _state.Mode
 # PaneCache is referenced by the four content renderers (#187) — they
 # call ``browser._pane_cache.setdefault(name, PaneCache())``. Inject the
 # state-layer type the same way Item is injected.
@@ -45,6 +46,7 @@ _render._char_width = _term._char_width
 _render._visible_len = _term._visible_len
 
 Item = _data.Item
+Mode = _state.Mode
 format_item_segments = _render.format_item_segments
 layout_panes = _render.layout_panes
 render_separator = _render.render_separator
@@ -1255,7 +1257,7 @@ class _MockBrowser:
         self._insert_depth = 0
         self._insert_label = ''
         self._search_query = ''
-        self._search_mode = False
+        self._mode = Mode.NORMAL
         self._error_text = ''
         self._help_mode = False
         self._preview_scroll = 0

@@ -1,6 +1,6 @@
 """browse-tui: data layer (Item type, coercion, caches)."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -28,6 +28,13 @@ class Item:
     hides its entire subtree (render-only cascade — descendants' own
     ``hidden`` values are preserved). See ``docs/superpowers/specs/
     2026-05-16-row-visibility-design.md`` for the full semantics.
+
+    ``_filter_hidden`` is a framework-internal flag written by the
+    filter evaluator (see ``docs/superpowers/specs/2026-05-17-filter-
+    design.md``). Recipes do not see or set it: ``init=False`` keeps
+    it out of constructor signatures, ``repr=False`` hides it from
+    debug dumps, ``compare=False`` keeps it out of ``__eq__`` /
+    ``__hash__``.
     """
 
     id: Any
@@ -36,6 +43,9 @@ class Item:
     tag_style: str = ''
     has_children: bool = False
     hidden: bool = False
+    _filter_hidden: bool = field(
+        default=False, init=False, repr=False, compare=False,
+    )
 
     def __post_init__(self) -> None:
         if not self.title:

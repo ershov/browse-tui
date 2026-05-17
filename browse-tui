@@ -868,7 +868,7 @@ def _read_csi(fd, _read1, _peek):
 # SOURCE START: 030-data.py {{{
 """browse-tui: data layer (Item type, coercion, caches)."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -896,6 +896,13 @@ class Item:
     hides its entire subtree (render-only cascade — descendants' own
     ``hidden`` values are preserved). See ``docs/superpowers/specs/
     2026-05-16-row-visibility-design.md`` for the full semantics.
+
+    ``_filter_hidden`` is a framework-internal flag written by the
+    filter evaluator (see ``docs/superpowers/specs/2026-05-17-filter-
+    design.md``). Recipes do not see or set it: ``init=False`` keeps
+    it out of constructor signatures, ``repr=False`` hides it from
+    debug dumps, ``compare=False`` keeps it out of ``__eq__`` /
+    ``__hash__``.
     """
 
     id: Any
@@ -904,6 +911,9 @@ class Item:
     tag_style: str = ''
     has_children: bool = False
     hidden: bool = False
+    _filter_hidden: bool = field(
+        default=False, init=False, repr=False, compare=False,
+    )
 
     def __post_init__(self) -> None:
         if not self.title:
@@ -957,6 +967,7 @@ def to_item(x: Any) -> Item:
 # SOURCE START: 040-state.py {{{
 """browse-tui: state layer (visible tree, cursor/scope, async workers, post queue, Pending)."""
 
+import enum
 import inspect
 import queue
 import sys
@@ -965,6 +976,20 @@ import time
 from collections import deque
 from dataclasses import dataclass, field, fields as _dc_fields
 from typing import Any, Callable, Optional
+
+
+class Mode(enum.Enum):
+    """User-input dispatch mode for the Browser key handler.
+
+    ``NORMAL`` — keystrokes dispatch through the action keymap.
+    ``SEARCH_EDIT`` — ``/`` prompt open; typed chars extend the
+    search query, navigation keys still fall through.
+    ``FILTER_EDIT`` — ``&`` prompt open; typed chars extend the
+    last entry of ``Browser._filters``, with similar fall-through.
+    """
+    NORMAL = 'normal'
+    SEARCH_EDIT = 'search-edit'
+    FILTER_EDIT = 'filter-edit'
 
 
 class Pending:
@@ -1259,6 +1284,12 @@ class State:
     # later when it wires marker columns.
     cursor: int = 0
     selected: set = field(default_factory=set)
+    # Filter-active flag — derived state set by ``_recompute_filter_hidden``
+    # in lockstep with the per-Item ``_filter_hidden`` flags. The
+    # renderer checks this before consulting ``_filter_hidden`` so the
+    # check short-circuits when no filter is active. See
+    # ``docs/superpowers/specs/2026-05-17-filter-design.md``.
+    _filter_active: bool = False
 
 
 # ---- scope management ----------------------------------------------------
@@ -2229,6 +2260,15 @@ def _emit_children(state, children, depth, out):
             # is per-row; descendants' own ``hidden`` values are
             # preserved and take effect once the ancestor is shown.
             continue
+        if state._filter_active and getattr(child, '_filter_hidden', False):
+            # Filter-hidden: a row whose subtree contributes no
+            # filter match. Per-row skip, not a subtree cascade — the
+            # bottom-up evaluator only flags this on rows whose entire
+            # subtree fails, so any matching descendant has its own
+            # ``_filter_hidden=False`` and stays reachable via its
+            # (now visible) ancestor. See
+            # ``docs/superpowers/specs/2026-05-17-filter-design.md``.
+            continue
         out.append(VisibleEntry(item=child, depth=d, kind='normal'))
         if not child.has_children or child.id not in state.expanded:
             continue
@@ -2359,6 +2399,64 @@ def _search_jump_nearest(browser):
     if idx is not None:
         state.cursor = idx
         mark_cursor_changed(browser)
+
+
+# ---- interactive filter (`&`) evaluator ---------------------------------
+#
+# See docs/superpowers/specs/2026-05-17-filter-design.md.
+#
+# Bottom-up pass over ``state._children`` writes ``Item._filter_hidden``
+# on every reachable item: True when the item does not match the active
+# filter stack AND none of its descendants do either. The renderer
+# (``_emit_children``) skips rows whose ``_filter_hidden`` is True,
+# guarded by ``state._filter_active`` so the check short-circuits when
+# no filter is active.
+#
+# Reuses ``_search_text`` / ``_search_matches`` so the haystack rules
+# and fragment-AND matcher are identical to ``/`` search.
+
+
+def _recompute_filter_hidden(state, filters) -> None:
+    """Re-evaluate filter visibility across the tree.
+
+    ``filters`` is an iterable of filter strings (typically
+    ``Browser._filters``). Empty strings are ignored — they're the
+    placeholder slot used by the filter-edit prompt before the user has
+    typed anything.
+
+    No-op when no non-empty filter is present: existing
+    ``_filter_hidden`` flags become stale-but-inert because the
+    renderer guards on ``state._filter_active``. The next call with a
+    non-empty filter overwrites every reachable item's flag.
+    """
+    active = [q for q in filters if q]
+    state._filter_active = bool(active)
+    if not active:
+        return
+
+    def visit(item):
+        children = state._children.get(item.id, [])
+        any_desc_passes = False
+        for child in children:
+            if visit(child):
+                any_desc_passes = True
+        # Optimistic: a parent with promised-but-uncached children is
+        # treated as "scaffold-worthy" so it stays visible until the
+        # children stream in and the next recompute corrects the flag.
+        if item.has_children and item.id not in state._children:
+            any_desc_passes = True
+        text = _search_text(item)
+        self_passes = all(_search_matches(text, q) for q in active)
+        item._filter_hidden = not (self_passes or any_desc_passes)
+        return self_passes or any_desc_passes
+
+    # Walk from the tree root. ``Browser.from_flat_tree`` parks
+    # top-level items under ``state.root_id`` (default ``None`` for
+    # programmatic constructors, ``''`` via the CLI default), and the
+    # recursion in ``visit`` descends through ``state._children`` per
+    # item id — so every reachable Item gets flagged.
+    for child in state._children.get(state.root_id, []):
+        visit(child)
 
 
 # ---- insert-mode placement helpers (ticket #21) -------------------------
@@ -2823,12 +2921,20 @@ class Browser:
         # it and clears as it goes. The render layer treats an empty set
         # as "nothing to do".
         self._needs_redraw = set()
-        # Search state — phase 1 stores the strings; key handlers in #11
-        # set them. The renderer reads ``_search_query`` for highlight
-        # spans and ``_search_mode`` for the search prompt in the info
-        # bar. Phase-2 ticket #22 wires the actual highlight pass.
+        # User-input dispatch mode (NORMAL / SEARCH_EDIT / FILTER_EDIT).
+        # The renderer reads this to decide whether to show the search /
+        # filter prompts in the info bar; the action layer uses it to
+        # route keystrokes (typed chars extend the active query while a
+        # prompt is open, navigation keys fall through).
+        self._mode = Mode.NORMAL
+        # Search prompt buffer — renderer reads it for the prompt text
+        # and for highlight spans.
         self._search_query = ''
-        self._search_mode = False
+        # Filter stack — see docs/superpowers/specs/2026-05-17-filter-design.md.
+        # While ``_mode is Mode.FILTER_EDIT`` the last entry is the live
+        # one being typed; otherwise every entry is committed. Filtering
+        # is active iff this list contains any non-empty entries.
+        self._filters: list = []
         # Preview pane scroll offset (lines from top of preview content).
         # Reset whenever the preview content changes; nudged by the
         # shift-up/shift-down handlers in the action layer (#12).
@@ -3133,6 +3239,93 @@ class Browser:
             self._needs_redraw.add('list')
         self.post(_do)
 
+    # ---- interactive filter API ------------------------------------------
+    #
+    # See docs/superpowers/specs/2026-05-17-filter-design.md. Recipes
+    # mutate the filter stack via ``set_filters`` / ``add_filter`` /
+    # ``clear_filters`` (all thread-safe via post); reads use the
+    # ``filters`` property.
+    #
+    # Reads return all non-empty entries, including the in-progress
+    # entry while the user is typing in FILTER_EDIT — the in-progress
+    # filter already affects what the user sees on screen, so a recipe
+    # rendering "current filter state" should reflect it. The transient
+    # empty placeholder (open prompt, no typing yet) is filtered out;
+    # it's a UI mechanism, not a filter recipes should observe.
+
+    @property
+    def filters(self) -> tuple:
+        """Currently-active filter strings (committed + live), in order.
+
+        Returns a tuple of non-empty strings. The empty placeholder
+        slot used by the filter-edit prompt before the user types is
+        excluded.
+        """
+        return tuple(q for q in self._filters if q)
+
+    def _do_filter_change(self) -> None:
+        """Refresh ``_filter_hidden`` flags and reconcile cursor + redraw.
+
+        Shared by ``set_filters`` / ``add_filter`` / ``clear_filters`` —
+        runs the same pre-snapshot + recompute + hide-displacement +
+        anchor flow used by the FILTER_EDIT key handler. Reuses
+        ``_apply_hide_displacement`` so cursor follows a row that
+        vanished due to the filter change. The positional cursor pin
+        short-circuits hide-displacement, just like in ``update_data``.
+        """
+        pre_vis = visible_items(self._state)
+        pre_vis_ids = [entry.item.id for entry in pre_vis]
+        pre_cursor = self._state.cursor
+        _recompute_filter_hidden(self._state, self._filters)
+        mark_visible_dirty(self._state)
+        cur_anchor = self._cursor_anchor
+        pinned = cur_anchor and isinstance(
+            cur_anchor[0], _AnchorSentinel
+        )
+        if not pinned:
+            self._apply_hide_displacement(pre_vis_ids, pre_cursor)
+        self._apply_cursor_anchor()
+        self._needs_redraw.add('list')
+        self._needs_redraw.add('info')
+        mark_cursor_changed(self)
+
+    def set_filters(self, filters) -> None:
+        """(thread-safe) Replace the filter list with the given iterable.
+
+        Empty strings in ``filters`` are dropped silently. If the user
+        is currently in FILTER_EDIT, the mode is forced to NORMAL
+        (the in-progress placeholder is discarded) — recipe writes are
+        authoritative.
+        """
+        new_list = [q for q in filters if q]
+
+        def _do():
+            self._filters = list(new_list)
+            self._mode = Mode.NORMAL
+            self._do_filter_change()
+        self.post(_do)
+
+    def add_filter(self, text: str) -> None:
+        """(thread-safe) Append ``text`` to the filter stack (no-op if empty).
+
+        Forces FILTER_EDIT exit if active, then appends.
+        """
+        if not text:
+            return
+
+        def _do():
+            self._mode = Mode.NORMAL
+            # Drop any empty placeholder that FILTER_EDIT left behind,
+            # then append the new entry.
+            self._filters = [q for q in self._filters if q]
+            self._filters.append(text)
+            self._do_filter_change()
+        self.post(_do)
+
+    def clear_filters(self) -> None:
+        """(thread-safe) Drop all filters; alias for ``set_filters([])``."""
+        self.set_filters([])
+
     def expand(self, id: Any,
                on_complete: Optional[Callable[[], None]] = None,
                autoscroll: bool = False) -> 'Pending':
@@ -3206,6 +3399,15 @@ class Browser:
             pre_cursor = self._state.cursor
 
             apply_ops(self._state, ops_list)
+
+            # Re-evaluate filter visibility before computing the new
+            # visible list. New items may match or un-match active
+            # filters; existing items may have moved subtrees. The
+            # filter pass writes ``_filter_hidden`` flags so the
+            # post-batch ``visible_items`` reflects filter narrowing
+            # in time for hide-displacement to walk it.
+            if self._filters:
+                _recompute_filter_hidden(self._state, self._filters)
 
             # Positional pin owns the cursor position — skip
             # hide-displacement entirely (the pin re-clamps to the new
@@ -7286,7 +7488,7 @@ def render_info_bar(row, cols, label, *, info=False, browser=None,
       * ``[N]`` selection count (if non-zero) in bold cyan;
       * a scope crumb path (when ``scope_stack`` is non-empty) — one
         ``▸ <id>`` segment per stack entry in bright cyan;
-      * the search prompt + query (when ``browser._search_mode``);
+      * the search prompt + query (when ``browser._mode is Mode.SEARCH_EDIT``);
       * a dim hint string about navigation keys (when not searching).
 
     The right edge ends with the pane label (``Preview``, ``Help``, …).
@@ -7317,12 +7519,32 @@ def render_info_bar(row, cols, label, *, info=False, browser=None,
 
     if info and browser is not None:
         sel_count = len(browser._state.selected)
-        search = browser._search_query if browser._search_mode else None
+        search = browser._search_query if browser._mode is Mode.SEARCH_EDIT else None
         crumb = _scope_crumb_text(browser)
+        # Filter prompt — built whenever filters are active or the user
+        # is editing one. Joined with ' & ' to match the display in the
+        # design spec (e.g. "foo & bar & ba_" mid-edit). The trailing
+        # underscore is appended when in FILTER_EDIT so the user sees
+        # the cursor position. See
+        # docs/superpowers/specs/2026-05-17-filter-design.md.
+        filt = None
+        if browser._mode is Mode.FILTER_EDIT or browser._filters:
+            entries = list(browser._filters)
+            if browser._mode is Mode.FILTER_EDIT and entries:
+                # Last entry is the live one — render with a trailing
+                # underscore so the user sees the active prompt.
+                live = entries[-1]
+                committed = entries[:-1]
+                live_part = (live or '') + '_'
+                shown = list(committed) + [live_part]
+            else:
+                shown = entries
+            filt = ' & '.join(shown)
     else:
         sel_count = 0
         search = None
         crumb = ''
+        filt = None
 
     label_str = ' {} '.format(label)
     pos = 0
@@ -7356,7 +7578,10 @@ def render_info_bar(row, cols, label, *, info=False, browser=None,
         write(S * min(7 - pos, cols - pos))
         pos = min(7, cols)
 
-    # Search prompt (when searching) or context-sensitive hints.
+    # Search prompt (when searching), filter prompt (when filtering),
+    # or context-sensitive hints. Search and filter cannot be active
+    # simultaneously (modes are mutually exclusive), so the order of
+    # checks is just a stylistic preference.
     if search is not None and pos < cols:
         prompt = '/'
         set_style(fg=11, bg=4, bold=True)
@@ -7366,6 +7591,17 @@ def render_info_bar(row, cols, label, *, info=False, browser=None,
             reset_style()
             write(search[:cols - pos])
             pos += len(search)
+        set_style(fg=8)
+    elif filt is not None and pos < cols:
+        prompt = '&'
+        set_style(fg=11, bg=4, bold=True)
+        write(prompt[:cols - pos])
+        pos += len(prompt)
+        if pos < cols:
+            reset_style()
+            text = ' ' + filt
+            write(text[:cols - pos])
+            pos += min(len(text), cols - pos)
         set_style(fg=8)
     elif info and pos < cols:
         # Hint text — kept generic; phase-3 ticket #32 will let recipes
@@ -8032,6 +8268,39 @@ class Context:
         Symmetric to :meth:`nav_home`.
         """
         self._browser.nav_end()
+
+    @property
+    def filters(self) -> tuple:
+        """Currently-active filter strings (committed + live), in order.
+
+        Returns a tuple of non-empty strings — the empty placeholder
+        slot used by the filter-edit prompt before the user has typed
+        anything is excluded. The live (in-progress) entry IS included
+        as soon as the user has typed even one character, because it
+        already affects what the user sees on screen. See
+        ``docs/superpowers/specs/2026-05-17-filter-design.md``.
+        """
+        return self._browser.filters
+
+    def set_filters(self, filters) -> None:
+        """Replace the filter list with the given iterable of strings.
+
+        Empty strings are dropped. If the user is in FILTER_EDIT, the
+        mode is forced to NORMAL (the in-progress placeholder is
+        discarded). Recipe writes are authoritative.
+        """
+        self._browser.set_filters(filters)
+
+    def add_filter(self, text: str) -> None:
+        """Append ``text`` to the filter stack (no-op if empty).
+
+        Forces FILTER_EDIT exit if active before appending.
+        """
+        self._browser.add_filter(text)
+
+    def clear_filters(self) -> None:
+        """Drop all filters; alias for ``set_filters([])``."""
+        self._browser.clear_filters()
 
     def message(self, text: str) -> None:
         """Surface ``text`` as a transient status message."""
@@ -9168,7 +9437,7 @@ def _select_clear(ctx):
 
 def _search_start(ctx):
     """Enter search-text-entry mode."""
-    ctx._browser._search_mode = True
+    ctx._browser._mode = Mode.SEARCH_EDIT
     ctx._browser._search_query = ''
     ctx._browser._needs_redraw.add('info')
 
@@ -9176,7 +9445,7 @@ def _search_start(ctx):
 def _search_next(ctx):
     """Jump cursor to the next match (forward, wrap-around).
 
-    Bound to ``enter`` while ``_search_mode`` is True. ``_search_find``
+    Bound to ``enter`` while ``_mode is Mode.SEARCH_EDIT``. ``_search_find``
     starts the walk *after* the current cursor, so repeated presses
     advance through every match in turn before wrapping back to the
     first.
@@ -9189,11 +9458,36 @@ def _search_next(ctx):
         mark_cursor_changed(browser)
 
 
+def _filter_start(ctx):
+    """Enter filter-edit mode (``&`` keybinding).
+
+    Appends an empty placeholder to ``_filters`` (the slot the user
+    types into) and sets ``_mode = Mode.FILTER_EDIT``. The placeholder
+    is never evaluated — see ``_recompute_filter_hidden`` and the
+    spec at ``docs/superpowers/specs/2026-05-17-filter-design.md``.
+    """
+    b = ctx._browser
+    b._mode = Mode.FILTER_EDIT
+    b._filters.append('')
+    b._needs_redraw.add('info')
+
+
+def _filter_recompute_and_redraw(browser):
+    """Re-evaluate filter visibility and flag UI redraws.
+
+    Called from every FILTER_EDIT keystroke that mutates the last
+    entry. Delegates to ``Browser._do_filter_change`` so the dispatch
+    layer and the public API write paths share one reconciliation
+    routine (recompute -> hide-displacement -> anchor -> redraw).
+    """
+    browser._do_filter_change()
+
+
 def _search_prev(ctx):
     """Jump cursor to the previous match (backward, wrap-around).
 
     Symmetric counterpart to ``_search_next`` — bound to ``shift-enter``
-    while ``_search_mode`` is True.
+    while ``_mode is Mode.SEARCH_EDIT``.
     """
     browser = ctx._browser
     state = browser._state
@@ -9648,6 +9942,10 @@ def default_actions() -> list:
         Action('alt-4',      '', _set_layout_pc, 'none', 'PREVIEW'),
         # Search.
         Action('/',         'Enter search mode', _search_start, 'none', 'SEARCH'),
+        # Filter (less-style `&`). Stacks predicates; empty Enter or
+        # Ctrl-X clears all. See
+        # docs/superpowers/specs/2026-05-17-filter-design.md.
+        Action('&',         'Enter filter mode', _filter_start, 'none', 'SEARCH'),
         # Multi-select bindings. ``read_key`` returns ``'space'`` for the
         # bare spacebar (special-cased in 020-terminal) but Alt+Space
         # arrives as ESC + ' ' which the alt-prefix branch turns into the
@@ -9696,13 +9994,13 @@ def build_keymap(browser) -> dict:
 def dispatch_key(browser, ctx: 'Context', key: str) -> bool:
     """Dispatch ``key`` to the matching action; return True if handled.
 
-    Search-mode (``browser._search_mode is True``) intercepts most keys:
-    ``esc`` exits search, ``enter`` and ``shift-enter`` jump between
-    matches (stubs in phase 1), ``backspace`` trims the query, and
-    printable characters extend it. Other keys fall through to normal
-    dispatch only when not in search mode.
+    SEARCH_EDIT mode (``browser._mode is Mode.SEARCH_EDIT``) intercepts
+    most keys: ``esc`` exits search, ``enter`` and ``shift-enter`` jump
+    between matches (stubs in phase 1), ``backspace`` trims the query,
+    and printable characters extend it. Other keys fall through to
+    normal dispatch only when not in an edit mode.
 
-    Outside search mode: ``enter`` runs the on_enter handler (print-exit,
+    Outside edit modes: ``enter`` runs the on_enter handler (print-exit,
     action-redirect, noop, or callable) and other keys run their bound
     Action's handler if its ``requires`` precondition is met.
 
@@ -9710,13 +10008,13 @@ def dispatch_key(browser, ctx: 'Context', key: str) -> bool:
     caller (main loop in #13) uses the return to decide whether to log
     the key or pass it through to a fallback.
     """
-    # Mouse events (clicks + wheel) are dispatched first when not in
-    # search mode. ``_dispatch_mouse`` parses the row/col, looks up the
-    # pane via ``layout_panes``, and applies the per-pane behaviour.
-    # Search mode silently swallows mouse events along with other
-    # unhandled keys (the multi-char ``mouse-click:R:C`` form bypasses
-    # the printable-char branch of the search-mode handler).
-    if not browser._search_mode and (
+    # Mouse events (clicks + wheel) are dispatched first when in normal
+    # mode. ``_dispatch_mouse`` parses the row/col, looks up the pane
+    # via ``layout_panes``, and applies the per-pane behaviour. Edit
+    # modes silently swallow mouse events along with other unhandled
+    # keys (the multi-char ``mouse-click:R:C`` form bypasses the
+    # printable-char branch of the edit-mode handler).
+    if browser._mode is Mode.NORMAL and (
             key.startswith('mouse-click:')
             or key.startswith('scroll-up:')
             or key.startswith('scroll-down:')):
@@ -9733,9 +10031,9 @@ def dispatch_key(browser, ctx: 'Context', key: str) -> bool:
     # user sees results filter under the cursor as they type), and adds
     # ``'list'`` to the redraw set so highlight spans repaint
     # immediately.
-    if browser._search_mode:
+    if browser._mode is Mode.SEARCH_EDIT:
         if key in ('esc', 'ctrl-c'):
-            browser._search_mode = False
+            browser._mode = Mode.NORMAL
             browser._search_query = ''
             browser._needs_redraw.add('info')
             browser._needs_redraw.add('list')
@@ -9797,10 +10095,86 @@ def dispatch_key(browser, ctx: 'Context', key: str) -> bool:
         # alt-*, etc.) fall through to the normal-mode dispatch below so
         # the list-pane navigation keys keep working while the user is
         # composing a query. Mouse events fall through harmlessly — the
-        # mouse-dispatch branch above is gated on ``not _search_mode``
-        # and the keymap has no binding for ``mouse-click:R:C``, so the
+        # mouse-dispatch branch above is gated on ``Mode.NORMAL`` and
+        # the keymap has no binding for ``mouse-click:R:C``, so the
         # event ends up silently dropped (preserves the prior
         # search-mode-swallows-mouse contract).
+
+    # Filter-edit (``&``) special handling.
+    #
+    # Mirrors SEARCH_EDIT in spirit but acts on ``browser._filters``
+    # (a list) and re-evaluates the per-Item ``_filter_hidden`` flags
+    # after every keystroke that changes the last entry. The last
+    # entry is the "live" one while in FILTER_EDIT.
+    #
+    # Enter commits (or clears all, if empty); Ctrl-X clears all
+    # unconditionally; Ctrl-C / Esc cancel the in-progress edit only.
+    # Other keys (arrows, etc.) fall through to NORMAL dispatch.
+    if browser._mode is Mode.FILTER_EDIT:
+        if key == 'enter':
+            last = browser._filters[-1] if browser._filters else ''
+            browser._mode = Mode.NORMAL
+            if not last:
+                # Commit-empty == clear all (less-compatible).
+                browser._filters = []
+            # else: the last entry is already in the list as the new
+            # committed top-of-stack — nothing more to do.
+            _filter_recompute_and_redraw(browser)
+            return True
+        if key == 'ctrl-x':
+            browser._mode = Mode.NORMAL
+            browser._filters = []
+            _filter_recompute_and_redraw(browser)
+            return True
+        if key in ('esc', 'ctrl-c'):
+            # Cancel the in-progress edit: pop the last entry (which
+            # IS the in-progress one in FILTER_EDIT). Committed
+            # filters stay.
+            browser._mode = Mode.NORMAL
+            if browser._filters:
+                browser._filters.pop()
+            _filter_recompute_and_redraw(browser)
+            return True
+        if key == 'backspace':
+            if browser._filters and browser._filters[-1]:
+                browser._filters[-1] = browser._filters[-1][:-1]
+                _filter_recompute_and_redraw(browser)
+            return True
+        # Ctrl-W kills the last whitespace-delimited word in the
+        # in-progress entry (readline convention; mirrors search).
+        if key == 'ctrl-w':
+            if browser._filters:
+                q = browser._filters[-1]
+                i = len(q)
+                while i > 0 and q[i - 1] == ' ':
+                    i -= 1
+                while i > 0 and q[i - 1] != ' ':
+                    i -= 1
+                browser._filters[-1] = q[:i]
+                _filter_recompute_and_redraw(browser)
+            return True
+        # Ctrl-U clears the in-progress entry (line-kill). To clear
+        # all filters use Ctrl-X.
+        if key == 'ctrl-u':
+            if browser._filters:
+                browser._filters[-1] = ''
+                _filter_recompute_and_redraw(browser)
+            return True
+        # ``space`` is the special name read_key uses for the bare
+        # spacebar; treat it literally inside the filter prompt.
+        if key == 'space':
+            if browser._filters:
+                browser._filters[-1] += ' '
+                _filter_recompute_and_redraw(browser)
+            return True
+        if len(key) == 1 and key.isprintable():
+            if browser._filters:
+                browser._filters[-1] += key
+                _filter_recompute_and_redraw(browser)
+            return True
+        # Multi-char keys (arrows, etc.) fall through to NORMAL
+        # dispatch. The prompt stays open; the last entry is
+        # unchanged.
 
     # Enter handling — outside search mode this falls to on_enter.
     if key == 'enter':

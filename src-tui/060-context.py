@@ -185,6 +185,39 @@ class Context:
         """
         self._browser.nav_end()
 
+    @property
+    def filters(self) -> tuple:
+        """Currently-active filter strings (committed + live), in order.
+
+        Returns a tuple of non-empty strings — the empty placeholder
+        slot used by the filter-edit prompt before the user has typed
+        anything is excluded. The live (in-progress) entry IS included
+        as soon as the user has typed even one character, because it
+        already affects what the user sees on screen. See
+        ``docs/superpowers/specs/2026-05-17-filter-design.md``.
+        """
+        return self._browser.filters
+
+    def set_filters(self, filters) -> None:
+        """Replace the filter list with the given iterable of strings.
+
+        Empty strings are dropped. If the user is in FILTER_EDIT, the
+        mode is forced to NORMAL (the in-progress placeholder is
+        discarded). Recipe writes are authoritative.
+        """
+        self._browser.set_filters(filters)
+
+    def add_filter(self, text: str) -> None:
+        """Append ``text`` to the filter stack (no-op if empty).
+
+        Forces FILTER_EDIT exit if active before appending.
+        """
+        self._browser.add_filter(text)
+
+    def clear_filters(self) -> None:
+        """Drop all filters; alias for ``set_filters([])``."""
+        self._browser.clear_filters()
+
     def message(self, text: str) -> None:
         """Surface ``text`` as a transient status message."""
         self._browser.message(text)

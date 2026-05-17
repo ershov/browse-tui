@@ -28,6 +28,7 @@ _actions.mark_visible_dirty = _state.mark_visible_dirty
 _actions.mark_cursor_changed = _state.mark_cursor_changed
 _actions.PIN_FIRST = _state.PIN_FIRST
 _actions.PIN_LAST = _state.PIN_LAST
+_actions.Mode = _state.Mode
 _actions.scope_into = _state.scope_into
 _actions.scope_out = _state.scope_out
 
@@ -315,6 +316,7 @@ class TestScopeCrumbText(unittest.TestCase):
         # Lazy-load render module + Item injection (mirrors test_render).
         self._render = load('_browse_tui_render2', '050-render.py')
         self._render.Item = Item
+        self._render.Mode = _state.Mode
 
     def test_unscoped_returns_empty_string(self):
         b = _make_browser()

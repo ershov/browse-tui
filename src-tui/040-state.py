@@ -1,5 +1,6 @@
 """browse-tui: state layer (visible tree, cursor/scope, async workers, post queue, Pending)."""
 
+import enum
 import inspect
 import queue
 import sys
@@ -8,6 +9,20 @@ import time
 from collections import deque
 from dataclasses import dataclass, field, fields as _dc_fields
 from typing import Any, Callable, Optional
+
+
+class Mode(enum.Enum):
+    """User-input dispatch mode for the Browser key handler.
+
+    ``NORMAL`` — keystrokes dispatch through the action keymap.
+    ``SEARCH_EDIT`` — ``/`` prompt open; typed chars extend the
+    search query, navigation keys still fall through.
+    ``FILTER_EDIT`` — ``&`` prompt open; typed chars extend the
+    last entry of ``Browser._filters``, with similar fall-through.
+    """
+    NORMAL = 'normal'
+    SEARCH_EDIT = 'search-edit'
+    FILTER_EDIT = 'filter-edit'
 
 
 class Pending:
@@ -302,6 +317,12 @@ class State:
     # later when it wires marker columns.
     cursor: int = 0
     selected: set = field(default_factory=set)
+    # Filter-active flag — derived state set by ``_recompute_filter_hidden``
+    # in lockstep with the per-Item ``_filter_hidden`` flags. The
+    # renderer checks this before consulting ``_filter_hidden`` so the
+    # check short-circuits when no filter is active. See
+    # ``docs/superpowers/specs/2026-05-17-filter-design.md``.
+    _filter_active: bool = False
 
 
 # ---- scope management ----------------------------------------------------
@@ -1272,6 +1293,15 @@ def _emit_children(state, children, depth, out):
             # is per-row; descendants' own ``hidden`` values are
             # preserved and take effect once the ancestor is shown.
             continue
+        if state._filter_active and getattr(child, '_filter_hidden', False):
+            # Filter-hidden: a row whose subtree contributes no
+            # filter match. Per-row skip, not a subtree cascade — the
+            # bottom-up evaluator only flags this on rows whose entire
+            # subtree fails, so any matching descendant has its own
+            # ``_filter_hidden=False`` and stays reachable via its
+            # (now visible) ancestor. See
+            # ``docs/superpowers/specs/2026-05-17-filter-design.md``.
+            continue
         out.append(VisibleEntry(item=child, depth=d, kind='normal'))
         if not child.has_children or child.id not in state.expanded:
             continue
@@ -1402,6 +1432,64 @@ def _search_jump_nearest(browser):
     if idx is not None:
         state.cursor = idx
         mark_cursor_changed(browser)
+
+
+# ---- interactive filter (`&`) evaluator ---------------------------------
+#
+# See docs/superpowers/specs/2026-05-17-filter-design.md.
+#
+# Bottom-up pass over ``state._children`` writes ``Item._filter_hidden``
+# on every reachable item: True when the item does not match the active
+# filter stack AND none of its descendants do either. The renderer
+# (``_emit_children``) skips rows whose ``_filter_hidden`` is True,
+# guarded by ``state._filter_active`` so the check short-circuits when
+# no filter is active.
+#
+# Reuses ``_search_text`` / ``_search_matches`` so the haystack rules
+# and fragment-AND matcher are identical to ``/`` search.
+
+
+def _recompute_filter_hidden(state, filters) -> None:
+    """Re-evaluate filter visibility across the tree.
+
+    ``filters`` is an iterable of filter strings (typically
+    ``Browser._filters``). Empty strings are ignored — they're the
+    placeholder slot used by the filter-edit prompt before the user has
+    typed anything.
+
+    No-op when no non-empty filter is present: existing
+    ``_filter_hidden`` flags become stale-but-inert because the
+    renderer guards on ``state._filter_active``. The next call with a
+    non-empty filter overwrites every reachable item's flag.
+    """
+    active = [q for q in filters if q]
+    state._filter_active = bool(active)
+    if not active:
+        return
+
+    def visit(item):
+        children = state._children.get(item.id, [])
+        any_desc_passes = False
+        for child in children:
+            if visit(child):
+                any_desc_passes = True
+        # Optimistic: a parent with promised-but-uncached children is
+        # treated as "scaffold-worthy" so it stays visible until the
+        # children stream in and the next recompute corrects the flag.
+        if item.has_children and item.id not in state._children:
+            any_desc_passes = True
+        text = _search_text(item)
+        self_passes = all(_search_matches(text, q) for q in active)
+        item._filter_hidden = not (self_passes or any_desc_passes)
+        return self_passes or any_desc_passes
+
+    # Walk from the tree root. ``Browser.from_flat_tree`` parks
+    # top-level items under ``state.root_id`` (default ``None`` for
+    # programmatic constructors, ``''`` via the CLI default), and the
+    # recursion in ``visit`` descends through ``state._children`` per
+    # item id — so every reachable Item gets flagged.
+    for child in state._children.get(state.root_id, []):
+        visit(child)
 
 
 # ---- insert-mode placement helpers (ticket #21) -------------------------
@@ -1866,12 +1954,20 @@ class Browser:
         # it and clears as it goes. The render layer treats an empty set
         # as "nothing to do".
         self._needs_redraw = set()
-        # Search state — phase 1 stores the strings; key handlers in #11
-        # set them. The renderer reads ``_search_query`` for highlight
-        # spans and ``_search_mode`` for the search prompt in the info
-        # bar. Phase-2 ticket #22 wires the actual highlight pass.
+        # User-input dispatch mode (NORMAL / SEARCH_EDIT / FILTER_EDIT).
+        # The renderer reads this to decide whether to show the search /
+        # filter prompts in the info bar; the action layer uses it to
+        # route keystrokes (typed chars extend the active query while a
+        # prompt is open, navigation keys fall through).
+        self._mode = Mode.NORMAL
+        # Search prompt buffer — renderer reads it for the prompt text
+        # and for highlight spans.
         self._search_query = ''
-        self._search_mode = False
+        # Filter stack — see docs/superpowers/specs/2026-05-17-filter-design.md.
+        # While ``_mode is Mode.FILTER_EDIT`` the last entry is the live
+        # one being typed; otherwise every entry is committed. Filtering
+        # is active iff this list contains any non-empty entries.
+        self._filters: list = []
         # Preview pane scroll offset (lines from top of preview content).
         # Reset whenever the preview content changes; nudged by the
         # shift-up/shift-down handlers in the action layer (#12).
@@ -2176,6 +2272,93 @@ class Browser:
             self._needs_redraw.add('list')
         self.post(_do)
 
+    # ---- interactive filter API ------------------------------------------
+    #
+    # See docs/superpowers/specs/2026-05-17-filter-design.md. Recipes
+    # mutate the filter stack via ``set_filters`` / ``add_filter`` /
+    # ``clear_filters`` (all thread-safe via post); reads use the
+    # ``filters`` property.
+    #
+    # Reads return all non-empty entries, including the in-progress
+    # entry while the user is typing in FILTER_EDIT — the in-progress
+    # filter already affects what the user sees on screen, so a recipe
+    # rendering "current filter state" should reflect it. The transient
+    # empty placeholder (open prompt, no typing yet) is filtered out;
+    # it's a UI mechanism, not a filter recipes should observe.
+
+    @property
+    def filters(self) -> tuple:
+        """Currently-active filter strings (committed + live), in order.
+
+        Returns a tuple of non-empty strings. The empty placeholder
+        slot used by the filter-edit prompt before the user types is
+        excluded.
+        """
+        return tuple(q for q in self._filters if q)
+
+    def _do_filter_change(self) -> None:
+        """Refresh ``_filter_hidden`` flags and reconcile cursor + redraw.
+
+        Shared by ``set_filters`` / ``add_filter`` / ``clear_filters`` —
+        runs the same pre-snapshot + recompute + hide-displacement +
+        anchor flow used by the FILTER_EDIT key handler. Reuses
+        ``_apply_hide_displacement`` so cursor follows a row that
+        vanished due to the filter change. The positional cursor pin
+        short-circuits hide-displacement, just like in ``update_data``.
+        """
+        pre_vis = visible_items(self._state)
+        pre_vis_ids = [entry.item.id for entry in pre_vis]
+        pre_cursor = self._state.cursor
+        _recompute_filter_hidden(self._state, self._filters)
+        mark_visible_dirty(self._state)
+        cur_anchor = self._cursor_anchor
+        pinned = cur_anchor and isinstance(
+            cur_anchor[0], _AnchorSentinel
+        )
+        if not pinned:
+            self._apply_hide_displacement(pre_vis_ids, pre_cursor)
+        self._apply_cursor_anchor()
+        self._needs_redraw.add('list')
+        self._needs_redraw.add('info')
+        mark_cursor_changed(self)
+
+    def set_filters(self, filters) -> None:
+        """(thread-safe) Replace the filter list with the given iterable.
+
+        Empty strings in ``filters`` are dropped silently. If the user
+        is currently in FILTER_EDIT, the mode is forced to NORMAL
+        (the in-progress placeholder is discarded) — recipe writes are
+        authoritative.
+        """
+        new_list = [q for q in filters if q]
+
+        def _do():
+            self._filters = list(new_list)
+            self._mode = Mode.NORMAL
+            self._do_filter_change()
+        self.post(_do)
+
+    def add_filter(self, text: str) -> None:
+        """(thread-safe) Append ``text`` to the filter stack (no-op if empty).
+
+        Forces FILTER_EDIT exit if active, then appends.
+        """
+        if not text:
+            return
+
+        def _do():
+            self._mode = Mode.NORMAL
+            # Drop any empty placeholder that FILTER_EDIT left behind,
+            # then append the new entry.
+            self._filters = [q for q in self._filters if q]
+            self._filters.append(text)
+            self._do_filter_change()
+        self.post(_do)
+
+    def clear_filters(self) -> None:
+        """(thread-safe) Drop all filters; alias for ``set_filters([])``."""
+        self.set_filters([])
+
     def expand(self, id: Any,
                on_complete: Optional[Callable[[], None]] = None,
                autoscroll: bool = False) -> 'Pending':
@@ -2249,6 +2432,15 @@ class Browser:
             pre_cursor = self._state.cursor
 
             apply_ops(self._state, ops_list)
+
+            # Re-evaluate filter visibility before computing the new
+            # visible list. New items may match or un-match active
+            # filters; existing items may have moved subtrees. The
+            # filter pass writes ``_filter_hidden`` flags so the
+            # post-batch ``visible_items`` reflects filter narrowing
+            # in time for hide-displacement to walk it.
+            if self._filters:
+                _recompute_filter_hidden(self._state, self._filters)
 
             # Positional pin owns the cursor position — skip
             # hide-displacement entirely (the pin re-clamps to the new

@@ -39,6 +39,32 @@ class TestItemConstruction(unittest.TestCase):
         item = Item(id='x', has_children=True)
         self.assertTrue(item.has_children)
 
+    def test_filter_hidden_defaults_false(self):
+        item = Item(id='x')
+        self.assertFalse(item._filter_hidden)
+
+    def test_filter_hidden_excluded_from_init(self):
+        # init=False keeps the attribute out of the constructor signature.
+        with self.assertRaises(TypeError):
+            Item(id='x', _filter_hidden=True)
+
+    def test_filter_hidden_settable_after_construction(self):
+        item = Item(id='x')
+        item._filter_hidden = True
+        self.assertTrue(item._filter_hidden)
+
+    def test_filter_hidden_excluded_from_repr(self):
+        item = Item(id='x')
+        item._filter_hidden = True
+        self.assertNotIn('_filter_hidden', repr(item))
+
+    def test_filter_hidden_excluded_from_equality(self):
+        a = Item(id='x')
+        b = Item(id='x')
+        a._filter_hidden = True
+        # compare=False keeps __eq__ insensitive to the flag.
+        self.assertEqual(a, b)
+
     def test_tag_and_tag_style(self):
         item = Item(id='x', tag='in-progress', tag_style='green')
         self.assertEqual(item.tag, 'in-progress')

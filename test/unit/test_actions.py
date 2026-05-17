@@ -42,6 +42,7 @@ _actions._search_jump_nearest = _state._search_jump_nearest
 _actions.mark_cursor_changed = _state.mark_cursor_changed
 _actions.PIN_FIRST = _state.PIN_FIRST
 _actions.PIN_LAST = _state.PIN_LAST
+_actions.Mode = _state.Mode
 _actions.point_in_rect = _render.point_in_rect
 _actions._sub_needed_rows = _render._sub_needed_rows
 _actions._fmt_child = _render._fmt_child
@@ -54,6 +55,7 @@ _actions._fmt_child = _render._fmt_child
 
 Item = _data.Item
 Browser = _state.Browser
+Mode = _state.Mode
 Action = _actions.Action
 default_actions = _actions.default_actions
 build_keymap = _actions.build_keymap
@@ -278,9 +280,9 @@ class TestDispatchSearchStart(unittest.TestCase):
         b = _make_browser()
         try:
             ctx = _ctx_for(b)
-            self.assertFalse(b._search_mode)
+            self.assertIs(b._mode, Mode.NORMAL)
             self.assertTrue(dispatch_key(b, ctx, '/'))
-            self.assertTrue(b._search_mode)
+            self.assertIs(b._mode, Mode.SEARCH_EDIT)
             self.assertEqual(b._search_query, '')
         finally:
             b.stop_workers()
@@ -290,7 +292,7 @@ class TestDispatchInSearchMode(unittest.TestCase):
 
     def test_typing_extends_query(self):
         b = _make_browser()
-        b._search_mode = True
+        b._mode = Mode.SEARCH_EDIT
         try:
             ctx = _ctx_for(b)
             self.assertTrue(dispatch_key(b, ctx, 'a'))
@@ -301,19 +303,19 @@ class TestDispatchInSearchMode(unittest.TestCase):
 
     def test_esc_exits_search_mode(self):
         b = _make_browser()
-        b._search_mode = True
+        b._mode = Mode.SEARCH_EDIT
         b._search_query = 'foo'
         try:
             ctx = _ctx_for(b)
             self.assertTrue(dispatch_key(b, ctx, 'esc'))
-            self.assertFalse(b._search_mode)
+            self.assertIs(b._mode, Mode.NORMAL)
             self.assertEqual(b._search_query, '')
         finally:
             b.stop_workers()
 
     def test_backspace_removes_last_char(self):
         b = _make_browser()
-        b._search_mode = True
+        b._mode = Mode.SEARCH_EDIT
         b._search_query = 'foo'
         try:
             ctx = _ctx_for(b)
@@ -1151,7 +1153,7 @@ class TestMouseDispatch(unittest.TestCase):
         b = self._browser_with_n_items(10)
         restore = self._patch_term(80, 40)
         try:
-            b._search_mode = True
+            b._mode = Mode.SEARCH_EDIT
             b._search_query = 'foo'
             ctx = _ctx_for(b)
             layout = _render.layout_panes(80, 40, show_preview=True,
