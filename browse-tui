@@ -7596,26 +7596,24 @@ def render_info_bar(row, cols, label, *, info=False, browser=None,
     # or context-sensitive hints. Search and filter cannot be active
     # simultaneously (modes are mutually exclusive), so the order of
     # checks is just a stylistic preference.
+    #
+    # Both prompts render the indicator AND the input under reverse
+    # video so the active mode is unmistakable against the dim info-bar
+    # background. ``reset_style`` runs between the indicator and the
+    # input so the reverse attribute carries cleanly to both segments.
     if search is not None and pos < cols:
-        prompt = '/'
-        set_style(fg=11, bg=4, bold=True)
-        write(prompt[:cols - pos])
-        pos += len(prompt)
-        if pos < cols:
-            reset_style()
-            write(search[:cols - pos])
-            pos += len(search)
+        line = '/' + search
+        set_style(reverse=True, bold=True)
+        write(line[:cols - pos])
+        pos += len(line)
+        reset_style()
         set_style(fg=8)
     elif filt is not None and pos < cols:
-        prompt = '&'
-        set_style(fg=11, bg=4, bold=True)
-        write(prompt[:cols - pos])
-        pos += len(prompt)
-        if pos < cols:
-            reset_style()
-            text = ' ' + filt
-            write(text[:cols - pos])
-            pos += min(len(text), cols - pos)
+        line = '& ' + filt
+        set_style(reverse=True, bold=True)
+        write(line[:cols - pos])
+        pos += len(line)
+        reset_style()
         set_style(fg=8)
     elif info and pos < cols:
         # Hint text — kept generic; phase-3 ticket #32 will let recipes
