@@ -151,6 +151,25 @@ Notes:
   user cannot edit prior committed filters from within filter-edit;
   that's deliberately out of scope (Future work).
 
+### Fall-through for non-overridden keys
+
+Keys that are **not** in the table above fall through to NORMAL-mode
+dispatch. The user can navigate (`Up`, `Down`, `PageUp`, `PageDown`,
+arrow keys for the cursor, scope-in / scope-out, expand / collapse,
+etc.) while a filter edit is in progress; the prompt stays open and
+the last entry continues accumulating typed characters.
+
+This mirrors the existing SEARCH_EDIT behaviour. The general rule for
+both edit modes: the mode owns a small set of explicit overrides
+(printable input, the prompt-control keys listed above); everything
+else dispatches as if the user were in NORMAL mode.
+
+Note that `Enter` **is** explicitly overridden in FILTER_EDIT (commit
+or clear-all). It does *not* fall through, so any NORMAL-mode binding
+on `Enter` (e.g., recipe `on_enter` handlers) does not fire while the
+filter prompt is open. The user must Enter-out of FILTER_EDIT first
+before `Enter` activates its normal action.
+
 ### Status row
 
 While `self._filters` non-empty *or* `self._mode is Mode.FILTER_EDIT`,
@@ -476,6 +495,11 @@ Action / dispatch (FILTER_EDIT mode):
 - Enter on non-empty commits; on empty clears all and exits.
 - Ctrl-X clears all regardless of last entry.
 - Ctrl-C / Esc cancels current edit, keeps committed filters.
+- Non-overridden keys (arrows, PageUp/Down, scope-in/out, expand)
+  fall through to NORMAL-mode dispatch while the prompt stays open
+  and the last entry remains unchanged. Mirrors SEARCH_EDIT.
+- Enter does **not** fall through: recipe `on_enter` handlers do not
+  fire while in FILTER_EDIT.
 
 Async (Browser-level):
 
