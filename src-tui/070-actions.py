@@ -116,18 +116,29 @@ def _nav_up(ctx):
 
 
 def _nav_home(ctx):
-    """Jump cursor to the first row."""
-    state = ctx._browser._state
-    state.cursor = 0
-    mark_cursor_changed(ctx._browser)
+    """Jump cursor to the first row and pin it there.
+
+    The pin (``PIN_FIRST`` sentinel in ``_cursor_anchor``) makes the
+    cursor follow new arrivals at the top until any non-home/non-end
+    navigation clears it. See
+    ``docs/superpowers/specs/2026-05-17-cursor-pin-design.md``.
+    """
+    b = ctx._browser
+    b._state.cursor = 0
+    b._cursor_anchor = [PIN_FIRST]
+    mark_cursor_changed(b)
 
 
 def _nav_end(ctx):
-    """Jump cursor to the last visible row."""
-    state = ctx._browser._state
-    vis = visible_items(state)
-    state.cursor = max(0, len(vis) - 1)
-    mark_cursor_changed(ctx._browser)
+    """Jump cursor to the last visible row and pin it there.
+
+    Symmetric to ``_nav_home`` — uses the ``PIN_LAST`` sentinel.
+    """
+    b = ctx._browser
+    vis = visible_items(b._state)
+    b._state.cursor = max(0, len(vis) - 1)
+    b._cursor_anchor = [PIN_LAST]
+    mark_cursor_changed(b)
 
 
 def _nav_pgdn(ctx):

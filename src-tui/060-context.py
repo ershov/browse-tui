@@ -168,6 +168,23 @@ class Context:
         """Add ``ids`` to the selection set (or replace it)."""
         return self._browser.select(ids, replace)
 
+    def nav_home(self) -> None:
+        """Move cursor to row 0 and engage the ``PIN_FIRST`` cursor pin.
+
+        The cursor follows new arrivals at the top until any
+        non-home/non-end navigation clears the pin. See
+        :meth:`Browser.nav_home` and
+        ``docs/superpowers/specs/2026-05-17-cursor-pin-design.md``.
+        """
+        self._browser.nav_home()
+
+    def nav_end(self) -> None:
+        """Move cursor to the last visible row and engage ``PIN_LAST``.
+
+        Symmetric to :meth:`nav_home`.
+        """
+        self._browser.nav_end()
+
     def message(self, text: str) -> None:
         """Surface ``text`` as a transient status message."""
         self._browser.message(text)

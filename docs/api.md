@@ -554,6 +554,8 @@ via the post queue so the renderer never sees a torn state.
 browser.refresh(id=None, on_complete=None) -> Pending
 browser.cursor_to(id, on_complete=None)    -> Pending
 browser.expand(id, on_complete=None)       -> Pending
+browser.nav_home()                         # cursor → row 0; engage PIN_FIRST
+browser.nav_end()                          # cursor → last row; engage PIN_LAST
 browser.select(ids, replace=False)
 browser.message(text)
 browser.error(text)
@@ -755,6 +757,40 @@ the same parent, today the `get_children` return *appends* (rather than
 clobbers) the watcher's pushes. Items may interleave; none are lost. Recipes
 needing atomic replace can use `update_data([clear_children(p), …upserts…])`.
 
+#### `browser.nav_home() / browser.nav_end() -> None`
+
+Move the cursor to row 0 (`nav_home`) or the last visible row
+(`nav_end`) and **engage a positional pin** so the cursor follows
+new arrivals at that edge.
+
+The pin lives in `browser._cursor_anchor` as the `PIN_FIRST` or
+`PIN_LAST` module-level sentinel. While pinned:
+
+- Each `update_data` batch re-clamps the cursor to the pinned edge
+  via `_apply_cursor_anchor` — new items at the top (or bottom)
+  pull the cursor along.
+- Hide-displacement is short-circuited; the pin's re-clamp covers
+  the case naturally (last row hidden → cursor on new last row).
+- The pin survives across mutations as long as the cursor stays at
+  the pinned position.
+
+The pin is cleared by any other cursor motion — `j`/`k`, `PgUp`/
+`PgDn`, mouse click, `cursor_to(id)`. Re-pressing the opposite edge
+(`End` after `Home`, or vice versa) swaps `PIN_FIRST` ↔ `PIN_LAST`.
+
+Typical use case: tail-follow on a streaming log / chat. A recipe
+can engage the pin programmatically without simulating a key press:
+
+```python
+ctx.nav_end()  # follow new arrivals at the bottom
+```
+
+Both methods return `None`; no fetches are required, so there's
+nothing to await. They are thread-safe (post onto the main thread).
+
+The matching keybinds (`g`, `Home` → `nav_home`; `End` → `nav_end`)
+engage the pin too.
+
 #### `browser.watch(callback, interval=None) -> threading.Thread`
 
 Spawn a daemon thread invoking `callback(browser)` either once (`interval=None`)
@@ -948,6 +984,8 @@ What actually lives at `browse_tui.<name>`:
 | `set_item`                | function    |
 | `mod`                     | function    |
 | `KEEP_PARENT`             | sentinel    |
+| `PIN_FIRST`               | sentinel    |
+| `PIN_LAST`                | sentinel    |
 | `remove`                  | function    |
 | `clear_children`          | function    |
 | `complete`                | function    |

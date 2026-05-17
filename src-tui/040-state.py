@@ -469,6 +469,29 @@ class _KeepParent:
 KEEP_PARENT = _KeepParent()
 
 
+# Cursor-anchor sentinels — positional pins for tail-follow UX.
+#
+# When the user presses "go to first" or "go to last", the anchor
+# becomes ``[PIN_FIRST]`` or ``[PIN_LAST]`` instead of a tier-list of
+# ids. ``_apply_cursor_anchor`` resolves the sentinel to row 0 or
+# ``len(visible) - 1`` on every background mutation, so the cursor
+# follows the edge as new items arrive. Any non-home/non-end cursor
+# movement drops the pin. See
+# ``docs/superpowers/specs/2026-05-17-cursor-pin-design.md``.
+class _AnchorSentinel:
+    __slots__ = ('_kind',)
+
+    def __init__(self, kind):
+        self._kind = kind
+
+    def __repr__(self):
+        return f'<PIN_{self._kind.upper()}>'
+
+
+PIN_FIRST = _AnchorSentinel('first')
+PIN_LAST = _AnchorSentinel('last')
+
+
 def mod(id, parent_id=KEEP_PARENT, *, where=None, **fields):
     """Construct a ``("mod", id, parent_id, fields[, where])`` op tuple.
 
@@ -2113,6 +2136,38 @@ class Browser:
         self.post(lambda: self._do_cursor_to(id, pending))
         return pending
 
+    def nav_home(self) -> None:
+        """(thread-safe) Move cursor to row 0 and pin it there.
+
+        Posts a callable that sets ``state.cursor = 0`` and
+        ``_cursor_anchor = [PIN_FIRST]``. The cursor follows new
+        arrivals at the top until any non-home/non-end navigation
+        clears the pin. Returns ``None`` — there is nothing to await
+        (no fetches required).
+        """
+        def _do():
+            vis = visible_items(self._state)
+            self._state.cursor = 0 if vis else 0
+            self._cursor_anchor = [PIN_FIRST]
+            mark_cursor_changed(self)
+            self._needs_redraw.add('list')
+        self.post(_do)
+
+    def nav_end(self) -> None:
+        """(thread-safe) Move cursor to the last visible row and pin it there.
+
+        Symmetric to ``nav_home``. The cursor follows new arrivals at
+        the bottom until any non-home/non-end navigation clears the
+        pin. Returns ``None``.
+        """
+        def _do():
+            vis = visible_items(self._state)
+            self._state.cursor = max(0, len(vis) - 1)
+            self._cursor_anchor = [PIN_LAST]
+            mark_cursor_changed(self)
+            self._needs_redraw.add('list')
+        self.post(_do)
+
     def expand(self, id: Any,
                on_complete: Optional[Callable[[], None]] = None,
                autoscroll: bool = False) -> 'Pending':
@@ -2187,16 +2242,24 @@ class Browser:
 
             apply_ops(self._state, ops_list)
 
-            # Hide-displacement takes precedence over the anchor for
-            # rows that were hidden (not deleted). When it runs it
-            # re-anchors from the new cursor, so the subsequent
-            # ``_apply_cursor_anchor`` primary-matches and is a no-op.
-            self._apply_hide_displacement(pre_vis_ids, pre_cursor)
-            # Re-snap the cursor onto its anchored id before flagging
-            # redraws. A streaming push that inserts items above the
-            # cursor would otherwise shift its index off the original
-            # item; ``_apply_cursor_anchor`` keeps the cursor's
-            # identity stable by walking the snapshot tiers.
+            # Positional pin owns the cursor position — skip
+            # hide-displacement entirely (the pin re-clamps to the new
+            # edge, which is what the user asked for by pinning).
+            # Otherwise: hide-displacement runs first for the
+            # row-got-hidden case, then the anchor handles the
+            # row-still-visible-but-index-shifted case.
+            cur_anchor = self._cursor_anchor
+            pinned = cur_anchor and isinstance(
+                cur_anchor[0], _AnchorSentinel
+            )
+            if not pinned:
+                self._apply_hide_displacement(pre_vis_ids, pre_cursor)
+            # Re-snap the cursor onto its anchored id (or pinned
+            # edge) before flagging redraws. A streaming push that
+            # inserts items above the cursor would otherwise shift
+            # its index off the original item;
+            # ``_apply_cursor_anchor`` keeps the cursor's identity
+            # stable by walking the snapshot tiers.
             self._apply_cursor_anchor()
             # Re-apply the expand goal too — a structured push that
             # materialises a previously-loading subtree should slide
@@ -3673,7 +3736,26 @@ class Browser:
         shifted while we were chasing a missing primary). No-op when
         the snapshot would be empty so a transient out-of-range or
         synthetic-row state doesn't discard a still-valid anchor.
+
+        Positional pin survives this call iff the cursor is still at
+        the pinned row (row 0 for ``PIN_FIRST``, last row for
+        ``PIN_LAST``). Any other cursor position drops the pin and
+        captures a fresh id-based snapshot. See
+        ``docs/superpowers/specs/2026-05-17-cursor-pin-design.md``.
         """
+        cur = self._cursor_anchor
+        if cur and isinstance(cur[0], _AnchorSentinel):
+            pin = cur[0]
+            vis = visible_items(self._state)
+            if vis:
+                target = 0 if pin is PIN_FIRST else len(vis) - 1
+                if self._state.cursor == target:
+                    return
+            else:
+                # Empty list — keep the pin parked.
+                return
+            # Cursor moved off the pinned row → fall through to
+            # id-based snapshot capture.
         snap = self._compute_anchor_snapshot()
         if snap:
             self._cursor_anchor = snap
@@ -3759,6 +3841,19 @@ class Browser:
         if not self._cursor_anchor:
             return False
         vis = visible_items(self._state)
+        # Positional pin (``PIN_FIRST`` / ``PIN_LAST``) — short-circuit
+        # before the id-based walk. Empty list is a no-op; the pin
+        # stays parked until rows arrive.
+        first = self._cursor_anchor[0]
+        if isinstance(first, _AnchorSentinel):
+            if not vis:
+                return False
+            new_i = 0 if first is PIN_FIRST else len(vis) - 1
+            if self._state.cursor != new_i:
+                self._state.cursor = new_i
+                mark_cursor_changed(self)
+                self._snap_list_scroll_to_row(new_i)
+            return True
         id_to_idx = {}
         for i, entry in enumerate(vis):
             # Index every kind (normal / scope_root / pending). Each

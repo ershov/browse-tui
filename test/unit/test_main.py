@@ -41,6 +41,8 @@ _state.notify_wake = _term.notify_wake
 _actions.visible_items = _state.visible_items
 _actions.mark_visible_dirty = _state.mark_visible_dirty
 _actions.mark_cursor_changed = _state.mark_cursor_changed
+_actions.PIN_FIRST = _state.PIN_FIRST
+_actions.PIN_LAST = _state.PIN_LAST
 _cli.Action = _actions.Action
 _cli.Browser = _state.Browser
 # Action templates run as ``bash -c`` in production with a real terminal

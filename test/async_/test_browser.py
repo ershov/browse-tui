@@ -1481,5 +1481,245 @@ class TestHideDisplacement(unittest.TestCase):
             b.stop_workers()
 
 
+# ---- 11. Cursor pin (PIN_FIRST / PIN_LAST) ----------------------------
+
+
+class TestCursorPin(unittest.TestCase):
+    """Positional pin tier on the cursor anchor.
+
+    ``PIN_FIRST`` / ``PIN_LAST`` make the cursor stick to row 0 or the
+    last visible row across background mutations. The pin is engaged
+    by ``Browser.nav_home`` / ``Browser.nav_end`` (or the keybinds via
+    ``_nav_home`` / ``_nav_end``), and is cleared by any other cursor
+    motion. See
+    ``docs/superpowers/specs/2026-05-17-cursor-pin-design.md``.
+    """
+
+    def test_sentinels_are_distinct(self):
+        self.assertIsNot(_state.PIN_FIRST, _state.PIN_LAST)
+
+    def test_sentinel_reprs(self):
+        self.assertEqual(repr(_state.PIN_FIRST), '<PIN_FIRST>')
+        self.assertEqual(repr(_state.PIN_LAST), '<PIN_LAST>')
+
+    def test_nav_home_sets_pin_first(self):
+        b = make_browser(get_children=lambda _id: [('A',), ('B',), ('C',)])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            # Move cursor away so nav_home has to displace it.
+            b.cursor_to('C')
+            b.run_until_idle()
+            self.assertEqual(b._state.cursor, 2)
+            b.nav_home()
+            b.run_until_idle()
+            self.assertEqual(b._state.cursor, 0)
+            self.assertEqual(b._cursor_anchor, [_state.PIN_FIRST])
+        finally:
+            b.stop_workers()
+
+    def test_nav_end_sets_pin_last(self):
+        b = make_browser(get_children=lambda _id: [('A',), ('B',), ('C',)])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.nav_end()
+            b.run_until_idle()
+            self.assertEqual(b._state.cursor, 2)
+            self.assertEqual(b._cursor_anchor, [_state.PIN_LAST])
+        finally:
+            b.stop_workers()
+
+    def test_pin_first_follows_new_first_row(self):
+        b = make_browser(get_children=lambda _id: [('B',), ('C',)])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.nav_home()
+            b.run_until_idle()
+            # Insert a new row at the top via clear+upserts in the new order.
+            b.update_data([
+                _state.clear_children(None),
+                _state.upsert('A', None),
+                _state.upsert('B', None),
+                _state.upsert('C', None),
+            ])
+            b.run_until_idle()
+            vis = _state.visible_items(b._state)
+            self.assertEqual([e.item.id for e in vis], ['A', 'B', 'C'])
+            self.assertEqual(b._state.cursor, 0)
+            self.assertEqual(vis[b._state.cursor].item.id, 'A')
+            # Pin still engaged.
+            self.assertEqual(b._cursor_anchor, [_state.PIN_FIRST])
+        finally:
+            b.stop_workers()
+
+    def test_pin_last_follows_new_last_row(self):
+        b = make_browser(get_children=lambda _id: [('A',), ('B',)])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.nav_end()
+            b.run_until_idle()
+            self.assertEqual(b._state.cursor, 1)
+            # Append a new row.
+            b.update_data([_state.upsert('C', None)])
+            b.run_until_idle()
+            vis = _state.visible_items(b._state)
+            self.assertEqual([e.item.id for e in vis], ['A', 'B', 'C'])
+            self.assertEqual(b._state.cursor, 2)
+            self.assertEqual(vis[b._state.cursor].item.id, 'C')
+            self.assertEqual(b._cursor_anchor, [_state.PIN_LAST])
+        finally:
+            b.stop_workers()
+
+    def test_pin_last_follows_when_last_row_hidden(self):
+        b = make_browser(get_children=lambda _id: [('A',), ('B',), ('C',)])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.nav_end()
+            b.run_until_idle()
+            # Hide the current last row — pin should jump to new last.
+            b.update_data([_state.mod('C', hidden=True)])
+            b.run_until_idle()
+            vis = _state.visible_items(b._state)
+            self.assertEqual([e.item.id for e in vis], ['A', 'B'])
+            self.assertEqual(b._state.cursor, 1)
+            self.assertEqual(vis[b._state.cursor].item.id, 'B')
+            self.assertEqual(b._cursor_anchor, [_state.PIN_LAST])
+        finally:
+            b.stop_workers()
+
+    def test_pin_first_clears_on_j(self):
+        # Pressing 'j' (cursor down) should clear PIN_FIRST and
+        # capture an id-based anchor.
+        b = make_browser(get_children=lambda _id: [('A',), ('B',), ('C',)])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.nav_home()
+            b.run_until_idle()
+            self.assertEqual(b._cursor_anchor, [_state.PIN_FIRST])
+            # Build a Context + dispatch_key so we go through the
+            # real key-handling path.
+            from test.unit._loader import load
+            _ctx_mod = load('_browse_tui_ctx', '060-context.py')
+            _ctx_mod.visible_items = _state.visible_items
+            ctx = _ctx_mod.Context(b)
+            _actions_mod = load('_browse_tui_act', '070-actions.py')
+            _actions_mod.visible_items = _state.visible_items
+            _actions_mod.mark_visible_dirty = _state.mark_visible_dirty
+            _actions_mod.mark_cursor_changed = _state.mark_cursor_changed
+            _actions_mod.PIN_FIRST = _state.PIN_FIRST
+            _actions_mod.PIN_LAST = _state.PIN_LAST
+            _state.dispatch_key = _actions_mod.dispatch_key
+            _state._handle_insert_key = _actions_mod._handle_insert_key
+            b._handle_one_key(ctx, 'j')
+            # Cursor moved to row 1 → pin cleared.
+            self.assertEqual(b._state.cursor, 1)
+            self.assertNotIsInstance(
+                b._cursor_anchor[0], _state._AnchorSentinel
+            )
+            self.assertEqual(b._cursor_anchor[0], 'B')
+        finally:
+            b.stop_workers()
+
+    def test_pin_first_swapped_by_pin_last(self):
+        b = make_browser(get_children=lambda _id: [('A',), ('B',), ('C',)])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.nav_home()
+            b.run_until_idle()
+            self.assertEqual(b._cursor_anchor, [_state.PIN_FIRST])
+            b.nav_end()
+            b.run_until_idle()
+            self.assertEqual(b._cursor_anchor, [_state.PIN_LAST])
+            self.assertEqual(b._state.cursor, 2)
+        finally:
+            b.stop_workers()
+
+    def test_pin_clears_on_cursor_to(self):
+        b = make_browser(get_children=lambda _id: [('A',), ('B',), ('C',)])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.nav_end()
+            b.run_until_idle()
+            self.assertEqual(b._cursor_anchor, [_state.PIN_LAST])
+            b.cursor_to('B')
+            b.run_until_idle()
+            # cursor_to seeded an id-based anchor.
+            self.assertEqual(b._cursor_anchor[0], 'B')
+        finally:
+            b.stop_workers()
+
+    def test_pin_empty_list_keeps_pin(self):
+        # Pin engaged with no rows → cursor parked; pin survives.
+        b = make_browser(get_children=lambda _id: [])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.nav_home()
+            b.run_until_idle()
+            self.assertEqual(b._cursor_anchor, [_state.PIN_FIRST])
+            # Now arrival — pin lands cursor on row 0.
+            b.update_data([_state.upsert('A', None)])
+            b.run_until_idle()
+            self.assertEqual(b._state.cursor, 0)
+        finally:
+            b.stop_workers()
+
+    def test_pin_first_with_hidden_first_row(self):
+        # PIN_FIRST with the original first row hidden → cursor on new first.
+        b = make_browser(get_children=lambda _id: [('A',), ('B',), ('C',)])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.nav_home()
+            b.run_until_idle()
+            b.update_data([_state.mod('A', hidden=True)])
+            b.run_until_idle()
+            vis = _state.visible_items(b._state)
+            self.assertEqual([e.item.id for e in vis], ['B', 'C'])
+            self.assertEqual(b._state.cursor, 0)
+            self.assertEqual(b._cursor_anchor, [_state.PIN_FIRST])
+        finally:
+            b.stop_workers()
+
+    def test_action_layer_g_sets_pin(self):
+        # `g` and `home` keybinds engage PIN_FIRST via _nav_home.
+        b = make_browser(get_children=lambda _id: [('A',), ('B',), ('C',)])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.cursor_to('C')
+            b.run_until_idle()
+
+            from test.unit._loader import load
+            _ctx_mod = load('_browse_tui_ctx', '060-context.py')
+            _ctx_mod.visible_items = _state.visible_items
+            ctx = _ctx_mod.Context(b)
+            _actions_mod = load('_browse_tui_act', '070-actions.py')
+            _actions_mod.visible_items = _state.visible_items
+            _actions_mod.mark_visible_dirty = _state.mark_visible_dirty
+            _actions_mod.mark_cursor_changed = _state.mark_cursor_changed
+            _actions_mod.PIN_FIRST = _state.PIN_FIRST
+            _actions_mod.PIN_LAST = _state.PIN_LAST
+            _state.dispatch_key = _actions_mod.dispatch_key
+            _state._handle_insert_key = _actions_mod._handle_insert_key
+
+            b._handle_one_key(ctx, 'g')
+            self.assertEqual(b._state.cursor, 0)
+            self.assertEqual(b._cursor_anchor, [_state.PIN_FIRST])
+            # Then `end` flips to PIN_LAST.
+            b._handle_one_key(ctx, 'end')
+            self.assertEqual(b._state.cursor, 2)
+            self.assertEqual(b._cursor_anchor, [_state.PIN_LAST])
+        finally:
+            b.stop_workers()
+
+
 if __name__ == '__main__':
     unittest.main()

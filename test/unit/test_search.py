@@ -33,6 +33,8 @@ _actions.mark_visible_dirty = _state.mark_visible_dirty
 _actions._search_find = _state._search_find
 _actions._search_jump_nearest = _state._search_jump_nearest
 _actions.mark_cursor_changed = _state.mark_cursor_changed
+_actions.PIN_FIRST = _state.PIN_FIRST
+_actions.PIN_LAST = _state.PIN_LAST
 
 
 Item = _data.Item

@@ -49,6 +49,8 @@ _actions.current_scope = _state.current_scope
 _actions._search_find = _state._search_find
 _actions._search_jump_nearest = _state._search_jump_nearest
 _actions.mark_cursor_changed = _state.mark_cursor_changed
+_actions.PIN_FIRST = _state.PIN_FIRST
+_actions.PIN_LAST = _state.PIN_LAST
 _cli.Browser = _state.Browser
 _cli.Action = _actions.Action
 
