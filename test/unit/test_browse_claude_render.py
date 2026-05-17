@@ -218,6 +218,16 @@ class TestRenderers(unittest.TestCase):
         self.assertIn('Hi there.', out)
         self.assertIn('1,234', out)            # comma-formatted
         self.assertIn('cache read', out)
+        # Usage footer is one line, prefixed with ``── usage:`` so it
+        # reads as a rule-style divider rather than body text.
+        usage_lines = [
+            ln for ln in out.split('\n') if '── usage:' in ln
+        ]
+        self.assertEqual(len(usage_lines), 1)
+        self.assertIn('input: 1,234', usage_lines[0])
+        self.assertIn('output: 56', usage_lines[0])
+        self.assertIn('cache read: 9,000', usage_lines[0])
+        self.assertIn('cache new: 100', usage_lines[0])
 
     def test_assistant_thinking_separator(self):
         out = self.r._render_assistant({

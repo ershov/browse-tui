@@ -1348,7 +1348,6 @@ def _render_assistant(obj):
             out.append('')
 
     if usage:
-        out.append(_rule('usage'))
         out.append(_fmt_usage(usage))
     return '\n'.join(out).rstrip() + '\n'
 
@@ -1367,17 +1366,20 @@ def _rule(title='', color=None):
 
 
 def _fmt_usage(u):
-    """Aligned key/value block for ``message.usage``."""
+    """One-line ``── usage:`` footer for ``message.usage``.
+
+    Visually distinct from body content via the muted rule-style
+    prefix, and compact enough to fit the typical preview-pane
+    width without wrapping.
+    """
     rows = [
         ('input',      u.get('input_tokens', 0)),
         ('output',     u.get('output_tokens', 0)),
         ('cache read', u.get('cache_read_input_tokens', 0)),
         ('cache new',  u.get('cache_creation_input_tokens', 0)),
     ]
-    w = max(len(k) for k, _ in rows)
-    return '\n'.join(
-        f'{MUTE}{k.ljust(w)}:{RESET} {v:,}' for k, v in rows
-    )
+    body = '   '.join(f'{k}: {v:,}' for k, v in rows)
+    return f'{MUTE}── usage:   {body}{RESET}'
 
 
 # ---- tool_use rendering --------------------------------------------------
