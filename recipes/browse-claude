@@ -2034,20 +2034,21 @@ def _fmt_chrome(obj):
 
     if not rows and not usage:
         return ''
+    keys = [k for k, _ in rows] + (['usage'] if usage else [])
+    w = max(len(k) for k in keys)
     parts = [_rule()]
     if rows:
-        w = max(len(k) for k, _ in rows)
         parts.append('\n'.join(
             f'{MUTE}{k.ljust(w)}:{RESET} {v}' for k, v in rows
         ))
     if usage:
-        parts.append('   '.join([
-            f'{MUTE}usage:{RESET}',
+        usage_str = '   '.join([
             f'input: {usage.get("input_tokens", 0):,}',
             f'output: {usage.get("output_tokens", 0):,}',
             f'cache read: {usage.get("cache_read_input_tokens", 0):,}',
             f'cache new: {usage.get("cache_creation_input_tokens", 0):,}',
-        ]))
+        ])
+        parts.append(f'{MUTE}{"usage".ljust(w)}:{RESET} {usage_str}')
     return '\n'.join(parts)
 
 

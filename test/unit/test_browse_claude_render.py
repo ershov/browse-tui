@@ -225,16 +225,24 @@ class TestRenderers(unittest.TestCase):
         # Body no longer carries usage — it's chrome's concern.
         self.assertNotIn('cache read', body)
         self.assertNotIn('usage:', body)
-        # Chrome carries a single ``usage:`` line — a plain
-        # three-space separated string, no special formatting.
+        # Chrome carries a single ``usage`` line — a plain
+        # three-space separated string, aligned with the other rows.
         usage_lines = [
-            ln for ln in chrome.split('\n') if 'usage:' in ln
+            ln for ln in chrome.split('\n') if 'usage' in ln and ':' in ln
         ]
         self.assertEqual(len(usage_lines), 1)
         self.assertIn('input: 1,234', usage_lines[0])
         self.assertIn('output: 56', usage_lines[0])
         self.assertIn('cache read: 9,000', usage_lines[0])
         self.assertIn('cache new: 100', usage_lines[0])
+        # Alignment: each label row's colon sits at the same column.
+        label_lines = [
+            ln for ln in chrome.split('\n')
+            if ':' in ln and not ln.startswith('─')
+        ]
+        colon_cols = {ln.index(':') for ln in label_lines}
+        self.assertEqual(len(colon_cols), 1,
+                         f'rows not aligned: {label_lines}')
 
     def test_chrome_usage_only(self):
         # No uuid/timestamp/cwd, only usage: chrome still emits the
