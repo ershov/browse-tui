@@ -60,6 +60,7 @@ class TestScope(unittest.TestCase):
             '--fields', 'id,title,has_children',
             '--no-children-pane',
             '--show-ids', 'always',
+            '--scope-crumb',
         )
 
     def test_alt_down_drills_into_cursor(self):
@@ -121,6 +122,7 @@ class TestScope(unittest.TestCase):
                 '--fields', 'id,title,has_children',
                 '--no-children-pane',
                 '--show-ids', 'always',
+                '--scope-crumb',
             )
             t.wait_for('A A')
             t.wait_stable()

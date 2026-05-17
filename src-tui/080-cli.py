@@ -496,6 +496,12 @@ def build_argparser() -> argparse.ArgumentParser:
                    help='Whether to render the per-row id before the '
                         'title: always | auto (default; suppress id '
                         'when it equals the title) | never.')
+    p.add_argument('--scope-crumb', dest='show_scope_crumb',
+                   action='store_true', default=False,
+                   help='Show the scope drill-down crumb (▸ a ▸ b …) '
+                        'in the info bar. Off by default — ids can be '
+                        'long. Recipes that scope into short, '
+                        'meaningful ids can pin this on at construction.')
     p.add_argument('--title', metavar='TITLE', default='browse-tui')
     p.add_argument('--initial-scope', metavar='ID', default=None,
                    help='Start scoped to this id.')
@@ -854,6 +860,7 @@ def _build_browser_for_help(args) -> 'Browser':
         help_intro=intro,
         help_outro=outro,
         show_ids=args.show_ids,
+        show_scope_crumb=args.show_scope_crumb,
         _headless=True,
     )
 
@@ -1389,6 +1396,7 @@ def _build_lazy_browser(args, fields, record_sep, *, split='h'):
         help_intro=_resolve_help_text(args.help_intro) if args.help_intro else None,
         help_outro=_resolve_help_text(args.help_outro) if args.help_outro else None,
         show_ids=args.show_ids,
+        show_scope_crumb=args.show_scope_crumb,
         split=split,
     )
 
@@ -1450,6 +1458,7 @@ def _build_eager_browser(args, fields, record_sep, *, split='h'):
         help_intro=_resolve_help_text(args.help_intro) if args.help_intro else None,
         help_outro=_resolve_help_text(args.help_outro) if args.help_outro else None,
         show_ids=args.show_ids,
+        show_scope_crumb=args.show_scope_crumb,
         get_preview=_make_preview_fetcher(args.preview_cmd, args.action_timeout),
         split=split,
     )

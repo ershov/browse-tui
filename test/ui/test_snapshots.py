@@ -183,7 +183,7 @@ class TestSnapshots(unittest.TestCase):
             (_BIN, '--children-cmd', children_cmd,
              '--fields', 'id,title,has_children',
              '--no-children-pane', '--no-preview',
-             '--show-ids', 'always'),
+             '--show-ids', 'always', '--scope-crumb'),
             cols=80, rows=24,
             wait_for='A A',
             after=after,

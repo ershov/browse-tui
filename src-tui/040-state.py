@@ -1740,6 +1740,7 @@ class Browser:
                  help_intro: Optional[str] = None,
                  help_outro: Optional[str] = None,
                  show_ids: str = 'auto',
+                 show_scope_crumb: bool = False,
                  preview_buffer_cap_chars: int = 100_000,
                  preview_buffer_cap_lines: int = 1000,
                  _headless: bool = False) -> None:
@@ -1801,6 +1802,12 @@ class Browser:
                 duplication); ``'always'`` forces it; ``'never'`` hides
                 it. Recipes can pin this value at construction; the CLI
                 exposes ``--show-ids``.
+            show_scope_crumb: When ``True``, the bottom info bar
+                renders the scope-stack crumb (``▸ a ▸ b`` …) while
+                scoped. Off by default — the crumb can eat significant
+                horizontal space when ids are long (file paths, jsonl
+                paths). Recipes that scope into short, meaningful ids
+                can flip this on at construction.
             preview_buffer_cap_chars: Soft cap on buffered preview chars
                 produced by a ``get_preview`` generator before the worker
                 pauses pulling. Default 100_000 (~100 KB). The pause holds
@@ -1833,6 +1840,7 @@ class Browser:
         self.format_item = format_item
         self.show_preview = show_preview
         self.show_children_pane = show_children_pane
+        self.show_scope_crumb = show_scope_crumb
         # Honour ANSI SGR escapes in the preview pane (default True).
         # Toggled at runtime via capital-R; see ``_toggle_preview_ansi``
         # in 070-actions.py. The cache invalidation is naturally handled

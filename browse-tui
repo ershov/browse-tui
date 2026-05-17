@@ -2707,6 +2707,7 @@ class Browser:
                  help_intro: Optional[str] = None,
                  help_outro: Optional[str] = None,
                  show_ids: str = 'auto',
+                 show_scope_crumb: bool = False,
                  preview_buffer_cap_chars: int = 100_000,
                  preview_buffer_cap_lines: int = 1000,
                  _headless: bool = False) -> None:
@@ -2768,6 +2769,12 @@ class Browser:
                 duplication); ``'always'`` forces it; ``'never'`` hides
                 it. Recipes can pin this value at construction; the CLI
                 exposes ``--show-ids``.
+            show_scope_crumb: When ``True``, the bottom info bar
+                renders the scope-stack crumb (``▸ a ▸ b`` …) while
+                scoped. Off by default — the crumb can eat significant
+                horizontal space when ids are long (file paths, jsonl
+                paths). Recipes that scope into short, meaningful ids
+                can flip this on at construction.
             preview_buffer_cap_chars: Soft cap on buffered preview chars
                 produced by a ``get_preview`` generator before the worker
                 pauses pulling. Default 100_000 (~100 KB). The pause holds
@@ -2800,6 +2807,7 @@ class Browser:
         self.format_item = format_item
         self.show_preview = show_preview
         self.show_children_pane = show_children_pane
+        self.show_scope_crumb = show_scope_crumb
         # Honour ANSI SGR escapes in the preview pane (default True).
         # Toggled at runtime via capital-R; see ``_toggle_preview_ansi``
         # in 070-actions.py. The cache invalidation is naturally handled
@@ -7534,7 +7542,11 @@ def render_info_bar(row, cols, label, *, info=False, browser=None,
     if info and browser is not None:
         sel_count = len(browser._state.selected)
         search = browser._search_query if browser._mode is Mode.SEARCH_EDIT else None
-        crumb = _scope_crumb_text(browser)
+        crumb = (
+            _scope_crumb_text(browser)
+            if getattr(browser, 'show_scope_crumb', False)
+            else ''
+        )
         # Filter prompt — built whenever filters are active or the user
         # is editing one. Joined with ' & ' to match the display in the
         # design spec (e.g. "foo & bar & ba_" mid-edit). The trailing
@@ -11228,6 +11240,12 @@ def build_argparser() -> argparse.ArgumentParser:
                    help='Whether to render the per-row id before the '
                         'title: always | auto (default; suppress id '
                         'when it equals the title) | never.')
+    p.add_argument('--scope-crumb', dest='show_scope_crumb',
+                   action='store_true', default=False,
+                   help='Show the scope drill-down crumb (▸ a ▸ b …) '
+                        'in the info bar. Off by default — ids can be '
+                        'long. Recipes that scope into short, '
+                        'meaningful ids can pin this on at construction.')
     p.add_argument('--title', metavar='TITLE', default='browse-tui')
     p.add_argument('--initial-scope', metavar='ID', default=None,
                    help='Start scoped to this id.')
@@ -11586,6 +11604,7 @@ def _build_browser_for_help(args) -> 'Browser':
         help_intro=intro,
         help_outro=outro,
         show_ids=args.show_ids,
+        show_scope_crumb=args.show_scope_crumb,
         _headless=True,
     )
 
@@ -12121,6 +12140,7 @@ def _build_lazy_browser(args, fields, record_sep, *, split='h'):
         help_intro=_resolve_help_text(args.help_intro) if args.help_intro else None,
         help_outro=_resolve_help_text(args.help_outro) if args.help_outro else None,
         show_ids=args.show_ids,
+        show_scope_crumb=args.show_scope_crumb,
         split=split,
     )
 
@@ -12182,6 +12202,7 @@ def _build_eager_browser(args, fields, record_sep, *, split='h'):
         help_intro=_resolve_help_text(args.help_intro) if args.help_intro else None,
         help_outro=_resolve_help_text(args.help_outro) if args.help_outro else None,
         show_ids=args.show_ids,
+        show_scope_crumb=args.show_scope_crumb,
         get_preview=_make_preview_fetcher(args.preview_cmd, args.action_timeout),
         split=split,
     )

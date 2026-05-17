@@ -2127,7 +2127,11 @@ def render_info_bar(row, cols, label, *, info=False, browser=None,
     if info and browser is not None:
         sel_count = len(browser._state.selected)
         search = browser._search_query if browser._mode is Mode.SEARCH_EDIT else None
-        crumb = _scope_crumb_text(browser)
+        crumb = (
+            _scope_crumb_text(browser)
+            if getattr(browser, 'show_scope_crumb', False)
+            else ''
+        )
         # Filter prompt — built whenever filters are active or the user
         # is editing one. Joined with ' & ' to match the display in the
         # design spec (e.g. "foo & bar & ba_" mid-edit). The trailing
