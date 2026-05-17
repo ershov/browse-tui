@@ -230,14 +230,13 @@ def _toggle_children_pane(ctx):
 def _toggle_help(ctx):
     """Flip ``_help_mode`` and reset preview scroll.
 
-    Also clears ``_preview_at_tail`` — help content is a separate
-    document; the user's tail-follow intent for the per-item preview
-    shouldn't carry over.
+    ``_preview_at_tail`` is preserved — the pin is a sticky user
+    intent. When help is toggled off, the renderer's pin override
+    re-snaps to the new preview's ``max_scroll`` automatically.
     """
     b = ctx._browser
     b._help_mode = not b._help_mode
     b._preview_scroll = 0
-    b._preview_at_tail = False
     b._needs_redraw.add('preview')
 
 

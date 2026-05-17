@@ -3658,7 +3658,14 @@ class Browser:
 
         self._preview_cursor_id = new_id
         self._preview_scroll = 0
-        self._preview_at_tail = False
+        # ``_preview_at_tail`` is intentionally NOT cleared here: the
+        # tail pin is a sticky user intent that carries across cursor-
+        # item changes (and over recipe-driven cache invalidation, and
+        # over help-toggle). The renderer's pin override re-derives
+        # ``_preview_scroll = max_scroll`` on every pass, so the
+        # scroll=0 reset above is meaningful only when the pin is
+        # disengaged. Cleared only by explicit upward motion in the
+        # action layer.
         if self._help_mode:
             self._help_mode = False
         self._needs_redraw.add('preview')

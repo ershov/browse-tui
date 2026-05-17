@@ -287,21 +287,28 @@ class TestDownwardMotionsKeepFlag(unittest.TestCase):
 # --- Cursor / help reset paths ---------------------------------------------
 
 
-class TestResetPaths(unittest.TestCase):
+class TestStickiness(unittest.TestCase):
+    """Tail pin is a sticky intent that survives cursor moves and help.
 
-    def test_help_toggle_clears_flag(self):
+    Once engaged, the pin is only cleared by explicit upward scroll
+    motion. Cursor changes, help-mode toggle, and recipe-driven cache
+    invalidation all preserve the pin so the new content also opens
+    at the tail.
+    """
+
+    def test_help_toggle_preserves_flag(self):
         b = _make_browser('a\nb\n')
         try:
             ctx = _ctx_for(b)
             _actions._preview_end(ctx)
             _actions._toggle_help(ctx)
-            self.assertFalse(b._preview_at_tail)
+            self.assertTrue(b._preview_at_tail)
         finally:
             b.stop_workers()
 
-    def test_cursor_item_change_clears_flag(self):
-        """``_update_preview_for_cursor`` resets ``_preview_at_tail`` when
-        the cursored id changes."""
+    def test_cursor_item_change_preserves_flag(self):
+        """Sticky pin: a cursor move to another item keeps tail-follow
+        engaged so the new item also opens at the bottom."""
         b = _make_browser('a\nb\n')
         try:
             # Two items, cursor on first; engage tail.
@@ -318,8 +325,36 @@ class TestResetPaths(unittest.TestCase):
             # Move cursor → next _update_preview_for_cursor sees a new id.
             b._state.cursor = 1
             b._update_preview_for_cursor()
-            self.assertFalse(b._preview_at_tail)
-            self.assertEqual(b._preview_scroll, 0)
+            self.assertTrue(b._preview_at_tail,
+                            'tail pin should survive cursor-item change')
+            self.assertEqual(b._preview_scroll, 0,
+                             'scroll resets to 0 on cursor change; the '
+                             'renderer\'s pin override snaps it back to '
+                             'max_scroll on next paint')
+        finally:
+            b.stop_workers()
+
+    def test_render_after_cursor_change_snaps_to_new_tail(self):
+        """The scroll=0 reset on cursor change is overridden by the
+        pin on the next render — new item opens at its tail."""
+        b = _make_browser('a\nb\n')
+        try:
+            b._state._children[None] = [
+                _data.to_item(Item(id='x')),
+                _data.to_item(Item(id='y')),
+            ]
+            _state.mark_visible_dirty(b._state)
+            b._state._preview['x'] = 'xx\n' * 10
+            b._state._preview['y'] = '\n'.join(f'l{i}' for i in range(200))
+            ctx = _ctx_for(b)
+            _actions._preview_end(ctx)
+            b._state.cursor = 1
+            b._update_preview_for_cursor()
+            _render_preview(b)
+            self.assertTrue(b._preview_at_tail)
+            self.assertGreater(b._preview_scroll, 0,
+                               'pin should advance scroll to the new '
+                               'item\'s max_scroll on render')
         finally:
             b.stop_workers()
 

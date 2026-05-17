@@ -127,6 +127,10 @@ to `max_scroll` on every pass.
 
 ### Clearing the flag
 
+Tail-follow is a *sticky* user intent. Once engaged it survives
+across every kind of content/cursor change until the user explicitly
+scrolls up.
+
 The flag is cleared by:
 
 | Site                       | Trigger                                       |
@@ -135,8 +139,6 @@ The flag is cleared by:
 | `_preview_page_up`         | Alt-PgUp — explicit upward motion             |
 | `_preview_home`            | Shift/Alt-Home — explicit top jump            |
 | Wheel-up handler           | Wheel-up over the preview pane                |
-| Cursor-item-change reset   | New item; `_preview_scroll` already resets    |
-| `_toggle_help`             | Help mode toggle; `_preview_scroll` resets    |
 
 The flag is *not* cleared by:
 
@@ -146,6 +148,14 @@ The flag is *not* cleared by:
 - `_preview_end` (re-engagement is idempotent).
 - `append_preview`, `set_preview`, `clear_preview` — these update
   content; the flag survives so the view follows.
+- **Cursor-item change**: the new item also opens at its tail (the
+  cursor-change reset zeroes `_preview_scroll`, but the renderer's
+  pin override snaps it to the new `max_scroll` on next paint).
+- **Help-mode toggle**: returning from help shows the preview at
+  its tail.
+- **`Browser.invalidate_preview(id)`** (recipe-driven cache
+  invalidation): the cache is dropped and re-fetched while the pin
+  is preserved.
 
 ### Clearing logic shape
 

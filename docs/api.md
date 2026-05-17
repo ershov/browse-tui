@@ -834,17 +834,21 @@ Pin the preview view to the bottom of its content. Sets the
 view follows `append_preview` chunks and generator pulls without
 further user input.
 
-The flag is cleared automatically by:
+The flag is a **sticky user intent** — it only clears on explicit
+upward scroll motion: Shift-Up / Alt-Up, Alt-PgUp, Shift-Home /
+Alt-Home, or wheel-up over the preview pane.
 
-- Any upward scroll motion: Shift-Up / Alt-Up, Alt-PgUp,
-  Shift-Home / Alt-Home, wheel-up over the preview pane.
-- Cursor-item change (the per-item preview is replaced; tail intent
-  doesn't carry over).
-- Help-mode toggle (help content is a separate document).
+It survives across:
 
-Downward motions (Shift-Down, Alt-PgDn, wheel-down, repeat
-Shift/Alt-End) leave the flag engaged — the renderer clamps so they
-become no-ops at the tail.
+- Cursor-item changes (the new item also opens at its tail; the
+  cursor-change reset zeroes `_preview_scroll` and the renderer's
+  pin override snaps to the new `max_scroll` on next paint).
+- Help-mode toggle (returning from help leaves the view at the
+  preview's tail).
+- `invalidate_preview` and other recipe-driven content refreshes.
+- Downward motions (Shift-Down, Alt-PgDn, wheel-down, repeat
+  Shift/Alt-End) — the renderer clamps so they're no-ops at the
+  tail.
 
 ```python
 ctx.preview_to_tail()  # streaming log tail; new chunks stay visible
