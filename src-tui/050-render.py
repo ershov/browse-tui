@@ -2190,10 +2190,15 @@ def render_info_bar(row, cols, label, *, info=False, browser=None,
     # simultaneously (modes are mutually exclusive), so the order of
     # checks is just a stylistic preference.
     #
-    # Both prompts render the indicator AND the input under reverse
-    # video so the active mode is unmistakable against the dim info-bar
-    # background. ``reset_style`` runs between the indicator and the
-    # input so the reverse attribute carries cleanly to both segments.
+    # Reverse-video the prompt only while the user is *editing*
+    # (SEARCH_EDIT / FILTER_EDIT). A committed filter that's no longer
+    # being typed renders in plain styled text — visible enough that
+    # the user knows filtering is on, quiet enough that it doesn't
+    # compete with the rest of the info row.
+    filter_editing = (
+        info and browser is not None
+        and browser._mode is Mode.FILTER_EDIT
+    )
     if search is not None and pos < cols:
         line = '/' + search
         set_style(reverse=True, bold=True)
@@ -2203,7 +2208,10 @@ def render_info_bar(row, cols, label, *, info=False, browser=None,
         set_style(fg=8)
     elif filt is not None and pos < cols:
         line = '& ' + filt
-        set_style(reverse=True, bold=True)
+        if filter_editing:
+            set_style(reverse=True, bold=True)
+        else:
+            set_style(fg=11, bold=True)
         write(line[:cols - pos])
         pos += len(line)
         reset_style()
