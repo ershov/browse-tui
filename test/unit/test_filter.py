@@ -212,6 +212,33 @@ class TestOptimisticPendingChildren(unittest.TestCase):
         self.assertTrue(leaf._filter_hidden)
 
 
+class TestScopedItems(unittest.TestCase):
+    """Items under a scope (not directly under ``state.root_id``) are
+    still flagged by the recompute pass.
+
+    Mirrors ``browse-claude <session.jsonl>``: the recipe loads session
+    children into ``_children[session_path]`` without ever populating
+    ``_children[None]``. The evaluator must walk every cached parent's
+    children, not just ``state.root_id``.
+    """
+
+    def test_items_under_scope_get_flagged(self):
+        s = State(root_id=None)
+        s.scope_stack = ['/path/session.jsonl']
+        s._children['/path/session.jsonl'] = [
+            Item(id='/path/session.jsonl#1', title='hello world'),
+            Item(id='/path/session.jsonl#2', title='goodbye'),
+        ]
+        # _children[None] is empty — items live only under the scope.
+        _recompute_filter_hidden(s, ['hello'])
+        flags = {
+            it.id: it._filter_hidden
+            for it in s._children['/path/session.jsonl']
+        }
+        self.assertFalse(flags['/path/session.jsonl#1'])  # matches
+        self.assertTrue(flags['/path/session.jsonl#2'])   # doesn't
+
+
 class TestActiveFlag(unittest.TestCase):
 
     def test_active_flag_set_when_filter_non_empty(self):

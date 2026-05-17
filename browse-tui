@@ -2434,7 +2434,12 @@ def _recompute_filter_hidden(state, filters) -> None:
     if not active:
         return
 
+    visited: set = set()
+
     def visit(item):
+        if item.id in visited:
+            return not item._filter_hidden
+        visited.add(item.id)
         children = state._children.get(item.id, [])
         any_desc_passes = False
         for child in children:
@@ -2450,13 +2455,16 @@ def _recompute_filter_hidden(state, filters) -> None:
         item._filter_hidden = not (self_passes or any_desc_passes)
         return self_passes or any_desc_passes
 
-    # Walk from the tree root. ``Browser.from_flat_tree`` parks
-    # top-level items under ``state.root_id`` (default ``None`` for
-    # programmatic constructors, ``''`` via the CLI default), and the
-    # recursion in ``visit`` descends through ``state._children`` per
-    # item id — so every reachable Item gets flagged.
-    for child in state._children.get(state.root_id, []):
-        visit(child)
+    # Walk every cached subtree. Recipes that scope directly into a
+    # sub-id (e.g. ``browse-claude <session.jsonl>``) load children
+    # under that scope without ever populating ``_children[root_id]``,
+    # so a root-only walk would miss them. The ``visited`` set guards
+    # against double-recursion when an item is reached via multiple
+    # entry points (in a well-formed tree each id has one parent, so
+    # this is mostly defensive).
+    for parent_id in list(state._children.keys()):
+        for child in state._children[parent_id]:
+            visit(child)
 
 
 # ---- insert-mode placement helpers (ticket #21) -------------------------
