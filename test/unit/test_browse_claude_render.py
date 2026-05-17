@@ -3754,6 +3754,8 @@ class TestVoiceOnlyFilter(unittest.TestCase):
                 s._children = {}
                 s._preview = {}
 
+        invalidate_calls = []
+
         class FakeBrowser:
             def __init__(s):
                 s._state = FakeState()
@@ -3761,6 +3763,8 @@ class TestVoiceOnlyFilter(unittest.TestCase):
                 s._needs_redraw = set()
             def update_data(s, ops):
                 seen_ops.append(list(ops))
+            def invalidate_preview(s, id_):
+                invalidate_calls.append(id_)
 
         class FakeCtx:
             def __init__(s):
@@ -3842,17 +3846,20 @@ class TestVoiceOnlyFilter(unittest.TestCase):
     def test_toggle_action_invalidates_preview_cache(self):
         # Umbrella previews compose from non-hidden children. After a
         # filter flip, every cached preview is potentially stale —
-        # drop the cache and bump the cursor-id sentinel so the next
-        # preview fetch fires.
+        # drop the cache and force the cursor's preview to re-fetch via
+        # ``invalidate_preview`` (preserves view state like tail-pin).
         ctx, _ = self._fake_browser_with_items({})
+        # Re-bind the fake so invalidate calls are observable here.
+        invalidates = []
+        ctx._browser.invalidate_preview = lambda id_: invalidates.append(id_)
         ctx._browser._state._preview['foo'] = 'stale'
         ctx._browser._preview_cursor_id = 'foo'
         self.r._action_toggle_filter(ctx)
         self.assertEqual(ctx._browser._state._preview, {},
                          'preview cache should be cleared on toggle')
-        self.assertIsNone(ctx._browser._preview_cursor_id,
-                          'cursor-id sentinel should be reset so the next '
-                          'fetch re-runs')
+        self.assertEqual(invalidates, ['foo'],
+                         'cursor preview should be re-fetched via '
+                         'invalidate_preview (preserves view state)')
         self.assertIn('preview', ctx._browser._needs_redraw)
 
     def test_toggle_action_no_remove_ops(self):

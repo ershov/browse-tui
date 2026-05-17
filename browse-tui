@@ -2833,6 +2833,14 @@ class Browser:
         # Reset whenever the preview content changes; nudged by the
         # shift-up/shift-down handlers in the action layer (#12).
         self._preview_scroll = 0
+        # Tail-follow flag: when True, the renderer forces the scroll
+        # to ``max_scroll`` every pass so the view sticks to the bottom
+        # as preview content grows (streaming generators,
+        # ``append_preview``). Engaged by ``_preview_end`` /
+        # ``Browser.preview_to_tail``; cleared by any upward scroll
+        # action, cursor-item change, and help-mode toggle. See
+        # ``docs/superpowers/specs/2026-05-17-preview-tail-design.md``.
+        self._preview_at_tail = False
         # Help-mode toggle — when True, the preview pane shows the
         # composed help text (``compose_help_text(self)`` from the
         # render layer) instead of the per-item preview. The handler
@@ -3308,6 +3316,56 @@ class Browser:
         """
         def _apply():
             self._state._preview.pop(id_, None)
+            self._needs_redraw.add('preview')
+        self.post(_apply)
+
+    def invalidate_preview(self, id_) -> None:
+        """(thread-safe) Drop cached preview for ``id_`` and re-fetch.
+
+        Use this when the preview *text* is stale but the cursor has
+        not moved — e.g., an umbrella whose composed body depends on
+        children that just streamed in, or a file whose content
+        changed on disk. The view state (``_preview_scroll``,
+        ``_preview_at_tail``, ``_help_mode``) is preserved so a user
+        who pinned the view to the bottom keeps following the tail.
+
+        Implemented as a main-thread post that drops the cache entry
+        and calls ``request_preview(id_)`` to ask the worker for a
+        fresh fetch. The result lands in ``_state._preview[id_]`` via
+        the existing single-slot lane; the next render picks it up.
+
+        Contrast with the cursor-move path: cursor changes are a
+        "fresh view" signal — scroll resets to 0 and the tail pin is
+        cleared. Cache invalidation without a cursor move is a "same
+        view, refreshed content" signal — view state must survive.
+
+        Idempotent for the same id; ``id_`` need not be the cursor's
+        item — recipes can pre-emptively invalidate a soon-to-be-
+        visited row.
+        """
+        def _apply():
+            self._state._preview.pop(id_, None)
+            self.request_preview(id_)
+            self._needs_redraw.add('preview')
+        self.post(_apply)
+
+    def preview_to_tail(self) -> None:
+        """(thread-safe) Pin the preview view to the bottom of its content.
+
+        Sets ``_preview_at_tail = True`` on the main thread; the
+        renderer then overrides ``_preview_scroll`` to ``max_scroll``
+        on every pass while the flag is set, so the view follows
+        ``append_preview`` chunks and generator pulls without further
+        user input.
+
+        The flag clears automatically on any upward scroll motion
+        (Shift/Alt-Up, Alt-PgUp, Shift/Alt-Home, wheel-up), on
+        cursor-item change, and on help-mode toggle. Symmetric to
+        ``nav_end`` (which pins the list cursor to the bottom). See
+        ``docs/superpowers/specs/2026-05-17-preview-tail-design.md``.
+        """
+        def _apply():
+            self._preview_at_tail = True
             self._needs_redraw.add('preview')
         self.post(_apply)
 
@@ -4557,6 +4615,7 @@ class Browser:
 
         self._preview_cursor_id = new_id
         self._preview_scroll = 0
+        self._preview_at_tail = False
         if self._help_mode:
             self._help_mode = False
         self._needs_redraw.add('preview')
@@ -6702,10 +6761,23 @@ def render_preview(browser, rect, *, info=False, has_header=True,
     # ``wrapped`` and ``content_lines`` are both in hand and write the
     # clamped value back so subsequent shift-up presses don't have to
     # pump down through a phantom count.
+    #
+    # ``_preview_at_tail`` pin: when engaged (Shift/Alt-End or
+    # ``Browser.preview_to_tail``), force ``scroll = max_scroll`` and
+    # write it back. As ``wrapped`` grows from streaming appends or
+    # generator pulls, the next render lands the view at the new
+    # bottom — tail-follow without per-tick user input. The flag is
+    # cleared by upward motions in the action layer; downward motions
+    # are clamped here so the pin survives them naturally.
     max_scroll = max(0, len(wrapped) - content_lines)
-    scroll = max(0, min(browser._preview_scroll, max_scroll))
-    if scroll != browser._preview_scroll:
-        browser._preview_scroll = scroll
+    if browser._preview_at_tail:
+        scroll = max_scroll
+        if browser._preview_scroll != max_scroll:
+            browser._preview_scroll = max_scroll
+    else:
+        scroll = max(0, min(browser._preview_scroll, max_scroll))
+        if scroll != browser._preview_scroll:
+            browser._preview_scroll = scroll
 
     # #274: demand-pull signal. If the cursored id's preview generator
     # is paused at the cap and the user has scrolled near the buffered
@@ -8041,6 +8113,25 @@ class Context:
         """
         return self._browser.clear_preview(id)
 
+    def preview_to_tail(self) -> None:
+        """Pass-through to :meth:`Browser.preview_to_tail`.
+
+        Pins the preview view to the bottom of its content; subsequent
+        ``append_preview`` chunks keep the view on the new tail until
+        the user scrolls up.
+        """
+        return self._browser.preview_to_tail()
+
+    def invalidate_preview(self, id) -> None:
+        """Pass-through to :meth:`Browser.invalidate_preview`.
+
+        Drops cached preview text for ``id`` and re-fetches without
+        resetting view state (scroll, tail pin, help mode). Used when
+        the underlying data feeding a preview has changed but the
+        cursor hasn't moved.
+        """
+        return self._browser.invalidate_preview(id)
+
     def run_in_worker(self, fn: Callable[[], Any]) -> threading.Thread:
         """Run ``fn()`` on a fresh daemon thread, surfacing exceptions.
 
@@ -8770,10 +8861,17 @@ def _toggle_children_pane(ctx):
 
 
 def _toggle_help(ctx):
-    """Flip ``_help_mode`` and reset preview scroll."""
-    ctx._browser._help_mode = not ctx._browser._help_mode
-    ctx._browser._preview_scroll = 0
-    ctx._browser._needs_redraw.add('preview')
+    """Flip ``_help_mode`` and reset preview scroll.
+
+    Also clears ``_preview_at_tail`` — help content is a separate
+    document; the user's tail-follow intent for the per-item preview
+    shouldn't carry over.
+    """
+    b = ctx._browser
+    b._help_mode = not b._help_mode
+    b._preview_scroll = 0
+    b._preview_at_tail = False
+    b._needs_redraw.add('preview')
 
 
 def _toggle_preview_ansi(ctx):
@@ -9210,10 +9308,18 @@ def _preview_scroll_down(ctx):
 
 
 def _preview_scroll_up(ctx):
-    """shift-up — scroll preview up by one line (clamped at 0)."""
-    if ctx._browser._preview_scroll > 0:
-        ctx._browser._preview_scroll -= 1
-        ctx._browser._needs_redraw.add('preview')
+    """shift-up — scroll preview up by one line (clamped at 0).
+
+    Clears ``_preview_at_tail`` first so an upward step from the
+    tail-follow state lands one row above ``max_scroll`` (the renderer
+    keeps ``_preview_scroll`` synchronised with ``max_scroll`` while
+    the flag is engaged, so the decrement here is meaningful).
+    """
+    b = ctx._browser
+    b._preview_at_tail = False
+    if b._preview_scroll > 0:
+        b._preview_scroll -= 1
+        b._needs_redraw.add('preview')
 
 
 def _preview_page_down(ctx):
@@ -9233,30 +9339,43 @@ def _preview_page_down(ctx):
 
 
 def _preview_page_up(ctx):
-    """alt-pgup — scroll preview up by one preview-pane page (clamped at 0)."""
-    page = _preview_pane_height(ctx._browser)
-    ctx._browser._preview_scroll = max(
-        0, ctx._browser._preview_scroll - page
-    )
-    ctx._browser._needs_redraw.add('preview')
+    """alt-pgup — scroll preview up by one preview-pane page (clamped at 0).
+
+    Clears ``_preview_at_tail`` — upward motion is the tail-follow
+    exit signal. See ``_preview_scroll_up``.
+    """
+    b = ctx._browser
+    b._preview_at_tail = False
+    page = _preview_pane_height(b)
+    b._preview_scroll = max(0, b._preview_scroll - page)
+    b._needs_redraw.add('preview')
 
 
 def _preview_home(ctx):
-    """{Shift,Alt}-Home — jump preview scroll to the top."""
-    ctx._browser._preview_scroll = 0
-    ctx._browser._needs_redraw.add('preview')
+    """{Shift,Alt}-Home — jump preview scroll to the top.
+
+    Clears ``_preview_at_tail`` — Home is an explicit top jump, the
+    inverse of the tail-follow intent.
+    """
+    b = ctx._browser
+    b._preview_at_tail = False
+    b._preview_scroll = 0
+    b._needs_redraw.add('preview')
 
 
 def _preview_end(ctx):
-    """{Shift,Alt}-End — jump preview scroll to the bottom.
+    """{Shift,Alt}-End — pin the preview view to the bottom (tail-follow).
 
-    Sets a sentinel value the renderer clamps to ``max_scroll`` (so the
-    last content row lands at the bottom of the pane). The clamp lives
-    in ``render_preview`` where the wrapped-line count is in hand; we
-    just hand it a value bigger than any plausible buffer.
+    Sets ``_preview_at_tail = True``; the renderer then forces
+    ``_preview_scroll = max_scroll`` on every pass while the flag is
+    engaged, so streaming appends (``append_preview``, generator
+    pulls) keep the view at the new bottom without further user
+    input. The flag is cleared by any upward scroll motion, cursor
+    change, or help-mode toggle.
     """
-    ctx._browser._preview_scroll = 10 ** 9
-    ctx._browser._needs_redraw.add('preview')
+    b = ctx._browser
+    b._preview_at_tail = True
+    b._needs_redraw.add('preview')
 
 
 # ---- list/preview split resize -------------------------------------------
@@ -10133,7 +10252,14 @@ def _scroll_list(browser, delta):
 
 
 def _scroll_preview(browser, delta):
-    """Adjust ``_preview_scroll`` by ``delta`` rows (mirrors shift-up/-down)."""
+    """Adjust ``_preview_scroll`` by ``delta`` rows (mirrors shift-up/-down).
+
+    Wheel-up (``delta < 0``) clears ``_preview_at_tail`` — the tail
+    pin survives downward wheel motion (renderer clamps; pin still
+    engaged) but is broken by any upward gesture.
+    """
+    if delta < 0:
+        browser._preview_at_tail = False
     new_scroll = max(0, browser._preview_scroll + delta)
     if new_scroll != browser._preview_scroll:
         browser._preview_scroll = new_scroll

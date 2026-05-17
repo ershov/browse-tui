@@ -3071,18 +3071,19 @@ def _push_flat_inserts(b, path, records):
 def _bust_preview_for_path(b, path):
     """Drop cached preview text for ``path`` and force a re-fetch.
 
-    Runs on the main thread (via ``Browser.post``). Sets
-    ``_preview_cursor_id = None`` on the Browser so the next
-    ``_update_preview_for_cursor`` call sees a difference and re-
-    requests, even when the cursor stayed on the same row. Same
-    plumbing ``_do_refresh`` uses for the user-driven Ctrl-R path.
+    Runs on the main thread (via ``Browser.post``). For the cursor's
+    row or any descendant of ``path``, calls ``invalidate_preview``
+    which re-fetches *without* resetting view state — a user who
+    pinned the view to the bottom (Shift-End) keeps following the
+    tail as the umbrella's preview grows. For non-cursor paths the
+    cache is dropped so the next visit re-fetches.
     """
-    b._state._preview.pop(path, None)
     cur_id = b._preview_cursor_id
     if cur_id == path or (isinstance(cur_id, str)
                           and cur_id.startswith(path + '#')):
-        b._preview_cursor_id = None
-        b._needs_redraw.add('preview')
+        b.invalidate_preview(cur_id)
+    else:
+        b._state._preview.pop(path, None)
 
 
 def _resolve_tail_path_from_browser(b):
@@ -4451,9 +4452,13 @@ def _action_toggle_filter(ctx):
         b.update_data(ops)
     # Umbrella previews compose from non-hidden children, so every
     # cached preview is potentially stale after a filter flip. Drop
-    # the cache and force a re-fetch for the current cursor's id.
+    # every cached entry and re-fetch the cursor's preview without
+    # touching view state — a user who pinned the view to the bottom
+    # keeps following the tail of the newly-filtered content.
     state._preview.clear()
-    b._preview_cursor_id = None
+    cur_id = b._preview_cursor_id
+    if cur_id is not None:
+        b.invalidate_preview(cur_id)
     b._needs_redraw.add('preview')
     ctx.message(
         f"voice-only filter: {'on' if _FILTER_VOICE_ONLY else 'off'}"

@@ -600,26 +600,26 @@ class TestPreviewScrollActions(unittest.TestCase):
         finally:
             b.stop_workers()
 
-    def test_shift_end_sets_sentinel_for_render_to_clamp(self):
-        # ``_preview_end`` doesn't know how many wrapped lines exist
-        # without running the wrap walker; it parks ``_preview_scroll``
-        # at a sentinel and lets ``render_preview``'s clamp settle it
-        # to ``max_scroll`` on the next paint.
+    def test_shift_end_engages_tail_pin(self):
+        # ``_preview_end`` sets ``_preview_at_tail`` so the renderer
+        # forces ``_preview_scroll = max_scroll`` on every paint. The
+        # ``_preview_scroll`` value itself is untouched until render runs.
+        # See ``docs/superpowers/specs/2026-05-17-preview-tail-design.md``.
         b = _make_browser()
         try:
             ctx = _ctx_for(b)
             dispatch_key(b, ctx, 'shift-end')
-            self.assertGreater(b._preview_scroll, 1_000_000)
+            self.assertTrue(b._preview_at_tail)
             self.assertIn('preview', b._needs_redraw)
         finally:
             b.stop_workers()
 
-    def test_alt_end_sets_sentinel_for_render_to_clamp(self):
+    def test_alt_end_engages_tail_pin(self):
         b = _make_browser()
         try:
             ctx = _ctx_for(b)
             dispatch_key(b, ctx, 'alt-end')
-            self.assertGreater(b._preview_scroll, 1_000_000)
+            self.assertTrue(b._preview_at_tail)
         finally:
             b.stop_workers()
 

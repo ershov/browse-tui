@@ -272,6 +272,25 @@ class Context:
         """
         return self._browser.clear_preview(id)
 
+    def preview_to_tail(self) -> None:
+        """Pass-through to :meth:`Browser.preview_to_tail`.
+
+        Pins the preview view to the bottom of its content; subsequent
+        ``append_preview`` chunks keep the view on the new tail until
+        the user scrolls up.
+        """
+        return self._browser.preview_to_tail()
+
+    def invalidate_preview(self, id) -> None:
+        """Pass-through to :meth:`Browser.invalidate_preview`.
+
+        Drops cached preview text for ``id`` and re-fetches without
+        resetting view state (scroll, tail pin, help mode). Used when
+        the underlying data feeding a preview has changed but the
+        cursor hasn't moved.
+        """
+        return self._browser.invalidate_preview(id)
+
     def run_in_worker(self, fn: Callable[[], Any]) -> threading.Thread:
         """Run ``fn()`` on a fresh daemon thread, surfacing exceptions.
 

@@ -222,6 +222,8 @@ ctx.remove(id)                        -> None    # one-op convenience
 ctx.set_preview(id, text)             -> None
 ctx.append_preview(id, chunk)         -> None
 ctx.clear_preview(id)                 -> None
+ctx.invalidate_preview(id)            -> None    # drop cache + re-fetch
+ctx.preview_to_tail()                 -> None    # pin preview to bottom
 ctx.run_in_worker(fn)                 -> threading.Thread
 ```
 
@@ -566,6 +568,8 @@ browser.update_data(ops)                   # batched tree mutations
 browser.set_preview(id, text)
 browser.append_preview(id, chunk)
 browser.clear_preview(id)
+browser.invalidate_preview(id)             # drop cache + re-fetch
+browser.preview_to_tail()                  # pin preview scroll to bottom
 ```
 
 `update_data`, `append_preview`, and `clear_preview` schedule a callable on
@@ -790,6 +794,65 @@ nothing to await. They are thread-safe (post onto the main thread).
 
 The matching keybinds (`g`, `Home` → `nav_home`; `End` → `nav_end`)
 engage the pin too.
+
+#### `browser.invalidate_preview(id) -> None`
+
+Drop the cached preview text for `id` and re-request a fresh fetch.
+Unlike a cursor move, this preserves view state — `_preview_scroll`,
+`_preview_at_tail`, and `_help_mode` are all left intact, so a user
+who pinned the view to the bottom keeps following the tail as the
+re-fetched content arrives.
+
+Use this when the *underlying data* feeding a preview changed but
+the cursor stayed on the same row — for example, an umbrella whose
+composed body depends on children that just streamed in via
+`update_data`, or a file whose content changed on disk. The cursor-
+move path (`_update_preview_for_cursor`) treats `_preview_cursor_id
+= None` as a fresh-view signal and resets scroll + tail pin;
+`invalidate_preview` is the right primitive when that reset is
+unwanted.
+
+```python
+# Background watcher discovered new bytes in the cursor's file —
+# refresh the preview without disrupting tail-follow.
+def watcher(b):
+    while True:
+        time.sleep(1.0)
+        if file_changed(path):
+            cur = b._preview_cursor_id
+            if cur and cur.startswith(path):
+                b.invalidate_preview(cur)
+```
+
+Thread-safe — posts onto the main thread. Idempotent for the same id.
+
+#### `browser.preview_to_tail() -> None`
+
+Pin the preview view to the bottom of its content. Sets the
+`_preview_at_tail` flag on the main thread; the renderer then forces
+`_preview_scroll = max_scroll` on every pass while engaged, so the
+view follows `append_preview` chunks and generator pulls without
+further user input.
+
+The flag is cleared automatically by:
+
+- Any upward scroll motion: Shift-Up / Alt-Up, Alt-PgUp,
+  Shift-Home / Alt-Home, wheel-up over the preview pane.
+- Cursor-item change (the per-item preview is replaced; tail intent
+  doesn't carry over).
+- Help-mode toggle (help content is a separate document).
+
+Downward motions (Shift-Down, Alt-PgDn, wheel-down, repeat
+Shift/Alt-End) leave the flag engaged — the renderer clamps so they
+become no-ops at the tail.
+
+```python
+ctx.preview_to_tail()  # streaming log tail; new chunks stay visible
+```
+
+Symmetric to `nav_end` (which pins the list cursor to the bottom);
+the matching keybinds Shift-End / Alt-End engage it too.
+Thread-safe — posts onto the main thread.
 
 #### `browser.watch(callback, interval=None) -> threading.Thread`
 

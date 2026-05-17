@@ -1876,6 +1876,14 @@ class Browser:
         # Reset whenever the preview content changes; nudged by the
         # shift-up/shift-down handlers in the action layer (#12).
         self._preview_scroll = 0
+        # Tail-follow flag: when True, the renderer forces the scroll
+        # to ``max_scroll`` every pass so the view sticks to the bottom
+        # as preview content grows (streaming generators,
+        # ``append_preview``). Engaged by ``_preview_end`` /
+        # ``Browser.preview_to_tail``; cleared by any upward scroll
+        # action, cursor-item change, and help-mode toggle. See
+        # ``docs/superpowers/specs/2026-05-17-preview-tail-design.md``.
+        self._preview_at_tail = False
         # Help-mode toggle — when True, the preview pane shows the
         # composed help text (``compose_help_text(self)`` from the
         # render layer) instead of the per-item preview. The handler
@@ -2351,6 +2359,56 @@ class Browser:
         """
         def _apply():
             self._state._preview.pop(id_, None)
+            self._needs_redraw.add('preview')
+        self.post(_apply)
+
+    def invalidate_preview(self, id_) -> None:
+        """(thread-safe) Drop cached preview for ``id_`` and re-fetch.
+
+        Use this when the preview *text* is stale but the cursor has
+        not moved — e.g., an umbrella whose composed body depends on
+        children that just streamed in, or a file whose content
+        changed on disk. The view state (``_preview_scroll``,
+        ``_preview_at_tail``, ``_help_mode``) is preserved so a user
+        who pinned the view to the bottom keeps following the tail.
+
+        Implemented as a main-thread post that drops the cache entry
+        and calls ``request_preview(id_)`` to ask the worker for a
+        fresh fetch. The result lands in ``_state._preview[id_]`` via
+        the existing single-slot lane; the next render picks it up.
+
+        Contrast with the cursor-move path: cursor changes are a
+        "fresh view" signal — scroll resets to 0 and the tail pin is
+        cleared. Cache invalidation without a cursor move is a "same
+        view, refreshed content" signal — view state must survive.
+
+        Idempotent for the same id; ``id_`` need not be the cursor's
+        item — recipes can pre-emptively invalidate a soon-to-be-
+        visited row.
+        """
+        def _apply():
+            self._state._preview.pop(id_, None)
+            self.request_preview(id_)
+            self._needs_redraw.add('preview')
+        self.post(_apply)
+
+    def preview_to_tail(self) -> None:
+        """(thread-safe) Pin the preview view to the bottom of its content.
+
+        Sets ``_preview_at_tail = True`` on the main thread; the
+        renderer then overrides ``_preview_scroll`` to ``max_scroll``
+        on every pass while the flag is set, so the view follows
+        ``append_preview`` chunks and generator pulls without further
+        user input.
+
+        The flag clears automatically on any upward scroll motion
+        (Shift/Alt-Up, Alt-PgUp, Shift/Alt-Home, wheel-up), on
+        cursor-item change, and on help-mode toggle. Symmetric to
+        ``nav_end`` (which pins the list cursor to the bottom). See
+        ``docs/superpowers/specs/2026-05-17-preview-tail-design.md``.
+        """
+        def _apply():
+            self._preview_at_tail = True
             self._needs_redraw.add('preview')
         self.post(_apply)
 
@@ -3600,6 +3658,7 @@ class Browser:
 
         self._preview_cursor_id = new_id
         self._preview_scroll = 0
+        self._preview_at_tail = False
         if self._help_mode:
             self._help_mode = False
         self._needs_redraw.add('preview')

@@ -1577,10 +1577,23 @@ def render_preview(browser, rect, *, info=False, has_header=True,
     # ``wrapped`` and ``content_lines`` are both in hand and write the
     # clamped value back so subsequent shift-up presses don't have to
     # pump down through a phantom count.
+    #
+    # ``_preview_at_tail`` pin: when engaged (Shift/Alt-End or
+    # ``Browser.preview_to_tail``), force ``scroll = max_scroll`` and
+    # write it back. As ``wrapped`` grows from streaming appends or
+    # generator pulls, the next render lands the view at the new
+    # bottom — tail-follow without per-tick user input. The flag is
+    # cleared by upward motions in the action layer; downward motions
+    # are clamped here so the pin survives them naturally.
     max_scroll = max(0, len(wrapped) - content_lines)
-    scroll = max(0, min(browser._preview_scroll, max_scroll))
-    if scroll != browser._preview_scroll:
-        browser._preview_scroll = scroll
+    if browser._preview_at_tail:
+        scroll = max_scroll
+        if browser._preview_scroll != max_scroll:
+            browser._preview_scroll = max_scroll
+    else:
+        scroll = max(0, min(browser._preview_scroll, max_scroll))
+        if scroll != browser._preview_scroll:
+            browser._preview_scroll = scroll
 
     # #274: demand-pull signal. If the cursored id's preview generator
     # is paused at the cap and the user has scrolled near the buffered
