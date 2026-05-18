@@ -276,6 +276,8 @@ ctx.preview_item_id                   -> id | None    # id whose preview is show
 ctx.preview_to_tail()                 -> None    # pin preview to bottom
 ctx.nav_home()                        -> None    # cursor -> row 0 + PIN_FIRST
 ctx.nav_end()                         -> None    # cursor -> last row + PIN_LAST
+ctx.collapse_all()                    -> None    # clear all expanded
+ctx.expand_subtree(id, lazy=True)     -> None    # expand id + cached descendants
 ctx.filters                           -> tuple[str, ...]   # active filter list
 ctx.set_filters(filters)              -> None    # replace; drops empty strings
 ctx.add_filter(text)                  -> None    # append (no-op if empty)

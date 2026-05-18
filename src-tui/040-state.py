@@ -2816,6 +2816,61 @@ class Browser:
         ids_list = list(ids)
         self.post(lambda: self._do_select(ids_list, replace))
 
+    # ---- expansion helpers -----------------------------------------------
+
+    def collapse_all(self) -> None:
+        """(thread-safe) Clear the expanded set for the current scope.
+
+        Drops every entry from ``state.expanded`` — every previously
+        open subtree collapses to its parent row. The current scope
+        stack is unaffected; scoping is a separate concept.
+
+        Cursor is preserved on its current id when possible. If the
+        cursor was on a row whose parent was expanded, the
+        framework's cursor-anchor mechanism walks back to the
+        nearest still-visible ancestor.
+        """
+        def _do():
+            self._state.expanded.clear()
+            mark_visible_dirty(self._state)
+            # Re-anchor cursor so it lands on a still-visible row
+            # (the row it pointed at may be inside a collapsed subtree).
+            self._reanchor_cursor()
+            self._apply_cursor_anchor()
+            self._needs_redraw.add('all')
+            mark_cursor_changed(self)
+        self.post(_do)
+
+    def expand_subtree(self, id_, lazy: bool = True) -> None:
+        """(thread-safe) Expand every cached descendant of ``id_``.
+
+        Walks the cached children tree under ``id_`` and adds every
+        branch (item with ``has_children=True``) to ``state.expanded``.
+        ``id_`` itself is added too, so calling this on a collapsed
+        row opens it and everything below it that the framework
+        already knows about.
+
+        ``lazy=True`` (default): only walks what is currently cached;
+        un-fetched branches stay collapsed and will fetch the normal
+        way (cursor-into / user expand) later. ``lazy=False`` is
+        reserved for a future "force-fetch everything" mode and
+        currently behaves the same as ``True``.
+        """
+        def _do():
+            state = self._state
+            def _walk(pid):
+                state.expanded.add(pid)
+                children = state._children.get(pid)
+                if children is None:
+                    return
+                for c in children:
+                    if getattr(c, 'has_children', False):
+                        _walk(c.id)
+            _walk(id_)
+            mark_visible_dirty(state)
+            self._needs_redraw.add('all')
+        self.post(_do)
+
     def cancel(self, *pendings: 'Pending') -> None:
         """(thread-safe) Mark one or more Pendings cancelled (sugar for ``p.cancel()``).
 

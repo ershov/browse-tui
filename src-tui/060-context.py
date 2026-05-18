@@ -199,6 +199,25 @@ class Context:
         """Add ``ids`` to the selection set (or replace it)."""
         return self._browser.select(ids, replace)
 
+    def collapse_all(self) -> None:
+        """Clear every entry from ``state.expanded`` for the current scope.
+
+        Pass-through to :meth:`Browser.collapse_all`. Cursor identity
+        is preserved when possible; if the cursor sat inside a now-
+        collapsed subtree the framework walks back to the nearest
+        still-visible ancestor.
+        """
+        return self._browser.collapse_all()
+
+    def expand_subtree(self, id, lazy: bool = True) -> None:
+        """Expand every cached descendant of ``id`` (including ``id``).
+
+        Pass-through to :meth:`Browser.expand_subtree`. ``lazy=True``
+        (default) only walks the cached part of the tree —
+        un-fetched branches stay collapsed.
+        """
+        return self._browser.expand_subtree(id, lazy=lazy)
+
     def nav_home(self) -> None:
         """Move cursor to row 0 and engage the ``PIN_FIRST`` cursor pin.
 

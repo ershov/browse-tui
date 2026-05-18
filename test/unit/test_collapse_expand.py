@@ -1,0 +1,150 @@
+"""Tests for the public collapse_all / expand_subtree API."""
+
+import unittest
+
+from test.unit._loader import load
+
+_term = load('_browse_tui_term', '020-terminal.py')
+_data = load('_browse_tui_data', '030-data.py')
+_state = load('_browse_tui_state', '040-state.py')
+_context = load('_browse_tui_context', '060-context.py')
+
+_state.Item = _data.Item
+_state.to_item = _data.to_item
+_state.notify_wake = _term.notify_wake
+_context.visible_items = _state.visible_items
+
+Browser = _state.Browser
+Context = _context.Context
+
+
+def _seed_tree(b):
+    """Build:  a (branch) -> a1 (branch) -> a1x (leaf)
+                          -> a2 (leaf)
+               b (branch) -> b1 (leaf)
+    """
+    b.update_data([
+        ('upsert', 'a', None, {'has_children': True}),
+        ('upsert', 'b', None, {'has_children': True}),
+        ('upsert', 'a1', 'a', {'has_children': True}),
+        ('upsert', 'a2', 'a', {}),
+        ('upsert', 'a1x', 'a1', {}),
+        ('upsert', 'b1', 'b', {}),
+    ])
+    b.drain_main_queue()
+
+
+class TestCollapseAll(unittest.TestCase):
+
+    def test_clears_expanded_set(self):
+        b = Browser(_headless=True)
+        _seed_tree(b)
+        b._state.expanded.update({'a', 'a1', 'b'})
+        b.collapse_all()
+        b.drain_main_queue()
+        self.assertEqual(b._state.expanded, set())
+
+    def test_already_collapsed_is_noop(self):
+        b = Browser(_headless=True)
+        _seed_tree(b)
+        # Nothing expanded — call must not raise.
+        b.collapse_all()
+        b.drain_main_queue()
+        self.assertEqual(b._state.expanded, set())
+
+    def test_visible_list_reflects_collapse(self):
+        # 'a' expanded → a1 and a2 are visible. After collapse_all,
+        # only top-level rows remain visible.
+        b = Browser(_headless=True)
+        _seed_tree(b)
+        b._state.expanded.add('a')
+        _state.mark_visible_dirty(b._state)
+        before = [e.item.id for e in _state.visible_items(b._state)
+                  if e.kind == 'normal']
+        self.assertIn('a1', before)
+        b.collapse_all()
+        b.drain_main_queue()
+        after = [e.item.id for e in _state.visible_items(b._state)
+                 if e.kind == 'normal']
+        self.assertNotIn('a1', after)
+        self.assertIn('a', after)
+
+    def test_scope_stack_unchanged(self):
+        b = Browser(_headless=True)
+        _seed_tree(b)
+        b._state.scope_stack = ['a']
+        b.collapse_all()
+        b.drain_main_queue()
+        self.assertEqual(b._state.scope_stack, ['a'])
+
+
+class TestExpandSubtree(unittest.TestCase):
+
+    def test_adds_id_and_descendants(self):
+        b = Browser(_headless=True)
+        _seed_tree(b)
+        b.expand_subtree('a')
+        b.drain_main_queue()
+        # 'a' is added; 'a1' is added (branch); 'a2' is leaf, not added
+        # (the helper only adds parents); 'a1x' is leaf too.
+        self.assertIn('a', b._state.expanded)
+        self.assertIn('a1', b._state.expanded)
+        self.assertNotIn('a2', b._state.expanded)
+        self.assertNotIn('a1x', b._state.expanded)
+
+    def test_does_not_touch_other_branches(self):
+        b = Browser(_headless=True)
+        _seed_tree(b)
+        b.expand_subtree('a')
+        b.drain_main_queue()
+        self.assertNotIn('b', b._state.expanded)
+        self.assertNotIn('b1', b._state.expanded)
+
+    def test_uncached_branch_not_recursed(self):
+        b = Browser(_headless=True)
+        _seed_tree(b)
+        # Remove 'a1' from the children cache to simulate an
+        # un-fetched branch.
+        b._state._children.pop('a1', None)
+        b.expand_subtree('a')
+        b.drain_main_queue()
+        # 'a' is added; 'a1' is added too (it's in 'a's children
+        # list — a branch). But the helper doesn't recurse into 'a1'
+        # because its children aren't cached.
+        self.assertIn('a', b._state.expanded)
+        self.assertIn('a1', b._state.expanded)
+
+    def test_idempotent(self):
+        b = Browser(_headless=True)
+        _seed_tree(b)
+        b.expand_subtree('a')
+        b.drain_main_queue()
+        before = set(b._state.expanded)
+        b.expand_subtree('a')
+        b.drain_main_queue()
+        self.assertEqual(b._state.expanded, before)
+
+
+class TestContextPassthroughs(unittest.TestCase):
+
+    def test_collapse_all(self):
+        b = Browser(_headless=True)
+        _seed_tree(b)
+        b._state.expanded.add('a')
+        ctx = Context(b)
+        ctx.collapse_all()
+        b.drain_main_queue()
+        self.assertEqual(b._state.expanded, set())
+
+    def test_expand_subtree(self):
+        b = Browser(_headless=True)
+        _seed_tree(b)
+        ctx = Context(b)
+        ctx.expand_subtree('a')
+        b.drain_main_queue()
+        self.assertIn('a', b._state.expanded)
+        self.assertIn('a1', b._state.expanded)
+
+
+if __name__ == '__main__':
+    unittest.main()
