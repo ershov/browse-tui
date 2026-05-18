@@ -199,6 +199,31 @@ class Context:
         """Add ``ids`` to the selection set (or replace it)."""
         return self._browser.select(ids, replace)
 
+    def select_all_visible(self) -> None:
+        """Set the selection to every visible normal row (WYSIWYG).
+
+        Pass-through to :meth:`Browser.select_all_visible`. Items
+        previously selected that are not currently visible are
+        dropped from the selection.
+        """
+        return self._browser.select_all_visible()
+
+    def clear_selection(self) -> None:
+        """Drop every entry from the selection set.
+
+        Pass-through to :meth:`Browser.clear_selection`. No-op when
+        nothing is selected.
+        """
+        return self._browser.clear_selection()
+
+    def invert_selection(self) -> None:
+        """Flip selection across visible normal rows.
+
+        Pass-through to :meth:`Browser.invert_selection`. Selection
+        state of non-visible rows is preserved as-is.
+        """
+        return self._browser.invert_selection()
+
     @property
     def mode(self) -> 'Mode':
         """Current input-dispatch mode (``Mode`` enum).

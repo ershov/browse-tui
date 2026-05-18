@@ -495,37 +495,37 @@ def _select_toggle_up(ctx):
 
 
 def _select_all_visible(ctx):
-    """Set the selection to exactly the currently-visible normal rows.
+    """Ctrl-A — set selection to exactly the currently-visible normal rows.
 
-    Implementation: clear the existing selection set, then add every
-    ``kind='normal'`` row in the visible list. Anything previously
-    selected that isn't in the visible list — hidden rows, children
-    of collapsed parents, items in other scopes — gets dropped. This
-    is the WYSIWYG semantic: after Ctrl-A, "what's selected" matches
-    "what the user sees".
-
-    Placeholder rows (``kind='pending'``) and the synthetic scope-root
-    row are skipped — selecting a placeholder would smuggle the
-    sentinel id into the selection set and confuse downstream
-    consumers.
+    WYSIWYG: clear the existing set, then add every ``kind='normal'``
+    visible row. Placeholder rows and the synthetic scope-root row
+    are skipped. The action handler is already on the main thread,
+    so it mutates state.selected directly rather than going through
+    the (thread-safe-but-async) :meth:`Browser.select_all_visible`.
+    Both reach the same end state.
     """
     state = ctx._browser._state
     state.selected.clear()
-    vis = visible_items(state)
-    for entry in vis:
+    for entry in visible_items(state):
         if entry.kind == 'normal':
             state.selected.add(entry.item.id)
     ctx._browser._needs_redraw.add('list')
     ctx._browser._needs_redraw.add('info')
+    ctx._browser._fire_selection_change()
 
 
 def _select_clear(ctx):
-    """Empty the selection set. No-op on an already-empty selection."""
+    """Empty the selection set. No-op on an already-empty selection.
+
+    Direct mutation rationale: same as :func:`_select_all_visible`.
+    """
     state = ctx._browser._state
-    if state.selected:
-        state.selected.clear()
-        ctx._browser._needs_redraw.add('list')
-        ctx._browser._needs_redraw.add('info')
+    if not state.selected:
+        return
+    state.selected.clear()
+    ctx._browser._needs_redraw.add('list')
+    ctx._browser._needs_redraw.add('info')
+    ctx._browser._fire_selection_change()
 
 
 def _search_start(ctx):

@@ -2991,6 +2991,65 @@ class Browser:
             self._needs_redraw.add('all')
         self.post(_do)
 
+    # ---- selection helpers ----------------------------------------------
+
+    def select_all_visible(self) -> None:
+        """(thread-safe) Set selection to every visible normal row.
+
+        WYSIWYG: anything previously selected that isn't visible
+        (hidden rows, children of collapsed parents, items in other
+        scopes) is dropped. Placeholder rows are skipped.
+        """
+        def _do():
+            state = self._state
+            state.selected.clear()
+            for entry in visible_items(state):
+                if entry.kind == 'normal':
+                    state.selected.add(entry.item.id)
+            self._needs_redraw.add('list')
+            self._needs_redraw.add('info')
+            self._fire_selection_change()
+        self.post(_do)
+
+    def clear_selection(self) -> None:
+        """(thread-safe) Drop every entry from ``state.selected``.
+
+        No-op when the selection is already empty.
+        """
+        def _do():
+            state = self._state
+            if not state.selected:
+                return
+            state.selected.clear()
+            self._needs_redraw.add('list')
+            self._needs_redraw.add('info')
+            self._fire_selection_change()
+        self.post(_do)
+
+    def invert_selection(self) -> None:
+        """(thread-safe) Flip selection across every visible normal row.
+
+        Visible rows that were selected become deselected and
+        vice-versa. Selection state for non-visible rows is preserved
+        as-is. Placeholder rows are ignored.
+        """
+        def _do():
+            state = self._state
+            changed = False
+            for entry in visible_items(state):
+                if entry.kind != 'normal':
+                    continue
+                if entry.item.id in state.selected:
+                    state.selected.discard(entry.item.id)
+                else:
+                    state.selected.add(entry.item.id)
+                changed = True
+            if changed:
+                self._needs_redraw.add('list')
+                self._needs_redraw.add('info')
+                self._fire_selection_change()
+        self.post(_do)
+
     def cancel(self, *pendings: 'Pending') -> None:
         """(thread-safe) Mark one or more Pendings cancelled (sugar for ``p.cancel()``).
 
@@ -3122,6 +3181,12 @@ class Browser:
             self._on_scope_change(self._make_ctx_for_hook())
         except Exception as e:
             self.error(f'on_scope_change: {type(e).__name__}: {e}')
+
+    def _fire_selection_change(self) -> None:
+        """Fire ``on_selection_change`` (stub; filled in by ticket #388)."""
+        # Stubbed here so selection-mutating ops can call it now; ticket
+        # #388 wires the actual ``on_selection_change`` callback.
+        pass
 
     def _fire_on_quit(self) -> None:
         """Fire ``on_quit`` once during shutdown.

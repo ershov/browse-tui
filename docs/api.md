@@ -288,6 +288,9 @@ ctx.nav_home()                        -> None    # cursor -> row 0 + PIN_FIRST
 ctx.nav_end()                         -> None    # cursor -> last row + PIN_LAST
 ctx.collapse_all()                    -> None    # clear all expanded
 ctx.expand_subtree(id, lazy=True)     -> None    # expand id + cached descendants
+ctx.select_all_visible()              -> None    # selection = every visible row
+ctx.clear_selection()                 -> None    # drop every entry
+ctx.invert_selection()                -> None    # flip visible rows' selection
 ctx.scope                             -> id | None    # current scope (None at root)
 ctx.scope_stack                       -> tuple[id, ...]
 ctx.scope_into(id)                    -> None    # drill in; fires on_scope_change
