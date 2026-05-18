@@ -286,6 +286,10 @@ ctx.filters                           -> tuple[str, ...]   # active filter list
 ctx.set_filters(filters)              -> None    # replace; drops empty strings
 ctx.add_filter(text)                  -> None    # append (no-op if empty)
 ctx.clear_filters()                   -> None    # alias for set_filters([])
+ctx.mode                              -> Mode    # NORMAL / SEARCH_EDIT / FILTER_EDIT
+ctx.search_query                      -> str     # active /-search query
+ctx.set_search_query(text)            -> None    # replace; '' clears; forces NORMAL
+ctx.clear_search()                    -> None    # alias for set_search_query('')
 ctx.run_in_worker(fn)                 -> threading.Thread
 ```
 

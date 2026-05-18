@@ -2816,6 +2816,55 @@ class Browser:
         ids_list = list(ids)
         self.post(lambda: self._do_select(ids_list, replace))
 
+    # ---- mode + search inspection / control -----------------------------
+
+    @property
+    def mode(self) -> 'Mode':
+        """Current user-input dispatch mode (``Mode`` enum).
+
+        ``Mode.NORMAL`` — keystrokes dispatch through the action keymap.
+        ``Mode.SEARCH_EDIT`` — ``/`` prompt open, user is typing a search.
+        ``Mode.FILTER_EDIT`` — ``&`` prompt open, user is typing a filter.
+
+        Recipes can branch on this to decide whether a ``ctx.message``
+        write would clobber an in-progress prompt.
+        """
+        return self._mode
+
+    @property
+    def search_query(self) -> str:
+        """The currently-active search query string (``''`` if none).
+
+        Mirrors what the user typed at the ``/`` prompt and what the
+        renderer highlights in matching rows. Includes the live
+        entry while ``Mode.SEARCH_EDIT`` is active. Empty string
+        means no search is in effect.
+        """
+        return self._search_query
+
+    def set_search_query(self, text: str) -> None:
+        """(thread-safe) Replace the current search query with ``text``.
+
+        Parallels :meth:`set_filters` for the search lane. Empty
+        string clears the search. The framework re-highlights and
+        re-anchors the cursor to the nearest match on the next
+        drain. Forces ``Mode.NORMAL`` (exits any in-progress prompt).
+        """
+        new_query = '' if text is None else str(text)
+        def _do():
+            self._mode = Mode.NORMAL
+            self._search_query = new_query
+            if new_query:
+                # Re-jump to the nearest match like a user-typed query.
+                _search_jump_nearest(self)
+            self._needs_redraw.add('list')
+            self._needs_redraw.add('info')
+        self.post(_do)
+
+    def clear_search(self) -> None:
+        """(thread-safe) Drop the search query; alias for ``set_search_query('')``."""
+        self.set_search_query('')
+
     # ---- scope ----------------------------------------------------------
 
     @property

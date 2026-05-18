@@ -200,6 +200,37 @@ class Context:
         return self._browser.select(ids, replace)
 
     @property
+    def mode(self) -> 'Mode':
+        """Current input-dispatch mode (``Mode`` enum).
+
+        Pass-through to :attr:`Browser.mode`. Useful for action
+        handlers that want to short-circuit when a prompt is open.
+        """
+        return self._browser.mode
+
+    @property
+    def search_query(self) -> str:
+        """Active search query string (``''`` when none).
+
+        Pass-through to :attr:`Browser.search_query`. Reflects the
+        live entry during ``Mode.SEARCH_EDIT``.
+        """
+        return self._browser.search_query
+
+    def set_search_query(self, text: str) -> None:
+        """Replace the search query.
+
+        Pass-through to :meth:`Browser.set_search_query`. Empty
+        ``text`` clears the search. Forces ``Mode.NORMAL`` (exits
+        any in-progress prompt).
+        """
+        return self._browser.set_search_query(text)
+
+    def clear_search(self) -> None:
+        """Drop the search query; alias for ``set_search_query('')``."""
+        return self._browser.clear_search()
+
+    @property
     def scope(self):
         """Current scope id, or ``None`` at the root.
 
