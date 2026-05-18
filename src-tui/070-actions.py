@@ -420,6 +420,7 @@ def _scope_down(ctx):
         # it shows ``loading…`` until results land.
         ctx.expand(item.id)
     ctx._browser._needs_redraw.add('all')
+    ctx._browser._fire_scope_change()
 
 
 def _scope_up(ctx):
@@ -446,6 +447,7 @@ def _scope_up(ctx):
         # Fallback: clamp to a sensible position.
         state.cursor = 0
     ctx._browser._needs_redraw.add('all')
+    ctx._browser._fire_scope_change()
 
 
 def _select_toggle_down(ctx):

@@ -1411,12 +1411,16 @@ def mark_cursor_changed(browser) -> None:
     0c8769d, fix tracked under #223).
 
     Centralising the set here means new cursor-move sites just call
-    one function instead of recopying a hand-written triplet.
+    one function instead of recopying a hand-written triplet. Also
+    latches ``_cursor_change_pending`` so the main-loop drain can
+    fire the ``on_cursor_change`` hook at most once per tick even
+    when the cursor moves several times between drains.
     """
     rd = browser._needs_redraw
     rd.add('list')
     rd.add('children')
     rd.add('preview')
+    browser._cursor_change_pending = True
 
 
 def _search_jump_nearest(browser):
@@ -1743,6 +1747,9 @@ class Browser:
                  show_scope_crumb: bool = False,
                  preview_buffer_cap_chars: int = 100_000,
                  preview_buffer_cap_lines: int = 1000,
+                 on_cursor_change: Optional[Callable] = None,
+                 on_scope_change: Optional[Callable] = None,
+                 on_quit: Optional[Callable] = None,
                  _headless: bool = False) -> None:
         """Construct a Browser.
 
@@ -1818,6 +1825,23 @@ class Browser:
             preview_buffer_cap_lines: Soft cap on buffered preview lines
                 (``\\n`` count) before the worker pauses pulling. Default
                 1000. Counterpart to ``preview_buffer_cap_chars``.
+            on_cursor_change: Optional ``(ctx) -> None`` callback fired
+                once per main-loop tick on which the cursor row id
+                changed. Debounced: rapid intermediate moves coalesce
+                into a single fire. Recipes use this for "react when
+                the user lands on a different row" (e.g. auto-fetch
+                related data, update a sidebar). Exceptions are caught
+                and routed to :meth:`error`.
+            on_scope_change: Optional ``(ctx) -> None`` callback fired
+                after a scope-in / scope-out transition. Read
+                ``ctx.state.scope_stack`` to see the new scope.
+                Exceptions are caught and routed to :meth:`error`.
+            on_quit: Optional ``(ctx) -> None`` callback fired once
+                during main-loop shutdown, after the screen is
+                restored but before ``Browser.run`` returns. Recipes
+                use this to clean up worker threads, temp files, file
+                handles. Exceptions are swallowed silently (a failing
+                cleanup hook should not block exit).
             _headless: Skip terminal init/teardown — used by tests.
         """
         if show_ids not in ('always', 'auto', 'never'):
@@ -1871,6 +1895,20 @@ class Browser:
         self.help_intro = help_intro
         self.help_outro = help_outro
         self.show_ids = show_ids
+        # User-supplied lifecycle hooks. ``on_cursor_change`` is fired
+        # at most once per main-loop tick; ``_cursor_change_pending``
+        # latches between mark_cursor_changed and the drain, and
+        # ``_last_cursor_id`` tracks the id we last fired for so that
+        # cursor-anchor re-positioning that lands back on the same id
+        # is a no-op. ``on_scope_change`` fires after every
+        # scope_into / scope_out transition (main-thread paths only).
+        # ``on_quit`` fires once during shutdown after the screen is
+        # restored.
+        self._on_cursor_change = on_cursor_change
+        self._on_scope_change = on_scope_change
+        self._on_quit = on_quit
+        self._cursor_change_pending = False
+        self._last_cursor_id = None
         self._headless = _headless
 
         # --- domain state ------------------------------------------------
@@ -2853,6 +2891,76 @@ class Browser:
         self._workers_running = False
 
     # ---- main-loop drain (production main loop + tests) ----------------
+
+    # ---- lifecycle-hook dispatch ------------------------------------
+    #
+    # Each helper guards against missing hooks and catches exceptions
+    # raised by the user-supplied callback so a buggy recipe hook can
+    # never crash the main loop. ``on_quit`` swallows silently — it
+    # fires during shutdown and there's nowhere left to surface the
+    # error. The others route through :meth:`error` so the user sees
+    # what went wrong.
+
+    def _make_ctx_for_hook(self):
+        """Construct a Context for hook invocation.
+
+        Imported lazily because the Context class lives in 060-context.py
+        which loads after this module; at run-time the concatenated build
+        merges everything into one module so the bare ``Context`` name
+        is resolvable here.
+        """
+        return Context(self)
+
+    def _fire_cursor_change_if_pending(self) -> None:
+        """Fire ``on_cursor_change`` once if the cursor id changed.
+
+        Debounced: even if ``mark_cursor_changed`` was called several
+        times between drains, the hook fires at most once per drain —
+        and only if the *id* under the cursor differs from the last
+        fire. Cursor moves that land back on the same row id (anchor
+        re-positioning, hide-displacement settling) are a no-op.
+        """
+        if not self._cursor_change_pending:
+            return
+        self._cursor_change_pending = False
+        if self._on_cursor_change is None:
+            return
+        vis = visible_items(self._state)
+        cur_id = None
+        if 0 <= self._state.cursor < len(vis):
+            entry = vis[self._state.cursor]
+            if entry.kind == 'normal':
+                cur_id = entry.item.id
+        if cur_id == self._last_cursor_id:
+            return
+        self._last_cursor_id = cur_id
+        try:
+            self._on_cursor_change(self._make_ctx_for_hook())
+        except Exception as e:
+            self.error(f'on_cursor_change: {type(e).__name__}: {e}')
+
+    def _fire_scope_change(self) -> None:
+        """Fire ``on_scope_change`` after a scope transition."""
+        if self._on_scope_change is None:
+            return
+        try:
+            self._on_scope_change(self._make_ctx_for_hook())
+        except Exception as e:
+            self.error(f'on_scope_change: {type(e).__name__}: {e}')
+
+    def _fire_on_quit(self) -> None:
+        """Fire ``on_quit`` once during shutdown.
+
+        Exceptions are swallowed silently — a failing cleanup hook
+        should not block exit.
+        """
+        if self._on_quit is None:
+            return
+        cb, self._on_quit = self._on_quit, None  # arm once
+        try:
+            cb(self._make_ctx_for_hook())
+        except Exception:
+            pass
 
     def drain_main_queue(self) -> int:
         """Run all currently posted callables; return how many ran.
@@ -3868,6 +3976,11 @@ class Browser:
                 self._update_preview_for_cursor()
                 self._update_children_for_cursor()
 
+                # Lifecycle hook: at most one fire per drain, only
+                # when the cursor id actually changed (see
+                # ``_fire_cursor_change_if_pending``).
+                self._fire_cursor_change_if_pending()
+
                 # Resize flag — set by SIGWINCH handler in 020-terminal.
                 # Bare-name access works in the concatenated build; in
                 # tests this attribute is injected onto the module.
@@ -3940,6 +4053,10 @@ class Browser:
             if not self._headless:
                 term_restore()
             self.stop_workers()
+            # Lifecycle hook: fired after screen restore, before
+            # ``run`` returns. Exceptions swallowed (see
+            # ``_fire_on_quit``).
+            self._fire_on_quit()
 
         # After teardown — print captured output (e.g. from on_enter
         # print-exit). Done outside the alternate screen so the user's

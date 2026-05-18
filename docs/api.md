@@ -466,6 +466,44 @@ Controls whether the per-row id segment is rendered in front of the title.
 A `format_item` hook overrides this entirely — the hook's segments are
 emitted verbatim.
 
+### Lifecycle hooks
+
+Three optional callback kwargs let recipes react to framework events
+without polling. Each takes `(ctx) -> None`; recipes read what they
+need off `ctx`. All three exist on `Browser.__init__`:
+
+```python
+Browser(...,
+        on_cursor_change=cb,   # cursor row id changed (debounced)
+        on_scope_change=cb,    # scope_into / scope_out completed
+        on_quit=cb)            # shutdown, after screen restore
+```
+
+| Hook | When it fires | Notes |
+| ---- | ------------- | ----- |
+| `on_cursor_change` | At most once per main-loop tick; only when the row id under the cursor differs from the last fire. | Rapid moves coalesce. Re-anchor moves that land on the same id are silent. Exceptions surface via `Browser.error`. |
+| `on_scope_change` | After a successful `scope_into` / `scope_out` transition. | Read `ctx.state.scope_stack` for the new scope. Exceptions surface via `Browser.error`. |
+| `on_quit` | Once during shutdown, after the screen is restored, before `Browser.run` returns. | Use for worker / file-handle / temp-file cleanup. Exceptions are swallowed silently — a failing cleanup must not block exit. |
+
+Typical patterns:
+
+```python
+def on_cursor_change(ctx):
+    item = ctx.cursor
+    if item is None:
+        return
+    log.info(f'cursor: {item.id}')
+
+def on_scope_change(ctx):
+    if ctx.state.scope_stack:
+        ctx.message(f'in scope: {ctx.state.scope_stack[-1]}')
+
+def on_quit(ctx):
+    _STOP_EVENT.set()        # tell worker threads to wind down
+    for f in _OPEN_HANDLES:
+        f.close()
+```
+
 ### Callbacks
 
 #### `get_children(parent_id) -> Iterable[Item|str|tuple|dict] | Generator | None`
