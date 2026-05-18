@@ -292,6 +292,36 @@ uncaught exception via `browser.error`. The thread handle is mostly
 informational — synchronisation should be done via `Pending` or
 `threading.Event` inside `fn`.
 
+### Escape hatches (advanced; unstable surface)
+
+When the documented Context surface doesn't cover what a recipe needs,
+two read-only properties expose the underlying objects:
+
+```python
+ctx.browser   -> Browser   # the underlying Browser instance
+ctx.state     -> State     # the underlying State dataclass
+```
+
+Anything reachable through them is **at-your-own-risk** — names and
+shapes inside `Browser` and `State` may change between minor versions
+where the typed Context methods do not. Prefer the typed methods
+whenever they exist; if you find yourself reaching for an escape hatch
+to do something common, please open an issue so the capability can be
+promoted.
+
+Common legitimate reads off `ctx.state`:
+
+```python
+ctx.state.expanded         # set of expanded ids in the current scope
+ctx.state.scope_stack      # ancestor chain (root-first) of current scope
+ctx.state.cursor           # cursor row index into the visible list
+ctx.state.selected         # set of selected ids
+ctx.state.root_id          # initial scope root id (None if unset)
+```
+
+Writing to fields directly is unsupported — route mutations through
+Context / Browser methods so the framework sees them.
+
 ### Main-thread sub-flows
 
 These read keystrokes synchronously and must only be called from a handler

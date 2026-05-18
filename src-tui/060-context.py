@@ -35,6 +35,37 @@ class Context:
     def __init__(self, browser) -> None:
         self._browser = browser
 
+    # ---- escape hatches (advanced; unstable surface) ------------------
+    #
+    # These expose the underlying Browser and State for recipes that
+    # need something not covered by Context's documented API.
+    # Everything reachable through them is "advanced / at your own
+    # risk" — names and shapes here may change between minor versions
+    # where the Context surface itself does not. Prefer the typed
+    # Context methods whenever they cover the use case.
+
+    @property
+    def browser(self):
+        """The underlying :class:`Browser` instance (advanced; unstable).
+
+        Use Context methods first. Reach for this only when there is
+        a Browser-level capability that has not yet been promoted to
+        Context (please file an issue when that happens).
+        """
+        return self._browser
+
+    @property
+    def state(self):
+        """The underlying :class:`State` dataclass (advanced; read-only).
+
+        Useful for inspecting state fields that have no dedicated
+        accessor — ``state.expanded``, ``state.scope_stack``,
+        ``state.cursor``, ``state.selected`` etc. Mutating fields
+        directly is unsupported; route writes through Context /
+        Browser methods.
+        """
+        return self._browser._state
+
     # ---- selection helpers --------------------------------------------
 
     @property

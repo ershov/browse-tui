@@ -3832,9 +3832,16 @@ class TestVoiceOnlyFilter(unittest.TestCase):
         class FakeCtx:
             def __init__(s):
                 s._browser = FakeBrowser()
+                s.browser = s._browser
                 s.messages = []
             def message(s, m):
                 s.messages.append(m)
+            def all_items(s):
+                return s._browser.all_items()
+            def update_data(s, ops):
+                return s._browser.update_data(ops)
+            def drop_preview_cache(s, id_=None):
+                return s._browser.drop_preview_cache(id_)
 
         return FakeCtx(), seen_ops
 

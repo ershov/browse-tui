@@ -4339,13 +4339,13 @@ def _action_tree_right(ctx):
     cur = ctx.cursor
     if cur is None:
         return
-    state = ctx._browser._state
+    expanded = ctx.state.expanded
     expandable = getattr(cur, 'has_children', False)
 
     # Flat mode (or any non-tree-mode situation): emulate the default
     # ``_nav_right`` — expand collapsed, step-into for already-expanded.
     if not _TREE_MODE or not expandable:
-        if expandable and cur.id not in state.expanded:
+        if expandable and cur.id not in expanded:
             ctx.expand(cur.id, autoscroll=True)
             return
         # Step into first child if cursor's next visible row is deeper.
@@ -4361,11 +4361,11 @@ def _action_tree_right(ctx):
             # have direct depth access here, so just nudge cursor one
             # row down — the framework's expand-then-render guarantees
             # the next row is the first child.
-            ctx._browser.cursor_to(vis[idx + 1][0].id)
+            ctx.cursor_to(vis[idx + 1][0].id)
         return
 
     target_id = cur.id
-    if target_id in state.expanded:
+    if target_id in expanded:
         # Already expanded — jump to the latest voice one level down.
         # User can press Right again to drill further; no auto-deep-dive.
         latest = _latest_voice_among_children(target_id)
@@ -4421,7 +4421,7 @@ def _action_toggle_tree(ctx):
         # resolves before the next runs.
         pending.then(
             lambda: _chain_expand_then_cursor(
-                ctx._browser, ancestors, target_id,
+                ctx.browser, ancestors, target_id,
             )
         )
 
@@ -4444,20 +4444,19 @@ def _action_toggle_filter(ctx):
     """
     global _FILTER_VOICE_ONLY
     _FILTER_VOICE_ONLY = not _FILTER_VOICE_ONLY
-    b = ctx._browser
     ops = []
-    for item in b.all_items():
+    for item in ctx.all_items():
         want_hidden = not _passes_filter(item.id)
         if bool(getattr(item, 'hidden', False)) != want_hidden:
             ops.append(mod(item.id, hidden=want_hidden))
     if ops:
-        b.update_data(ops)
+        ctx.update_data(ops)
     # Umbrella previews compose from non-hidden children, so every
     # cached preview is potentially stale after a filter flip. Drop
     # every cached entry; ``drop_preview_cache`` will kick the worker
     # for the current preview cursor and flag a redraw, preserving
     # view state (a user pinned to the tail keeps following).
-    b.drop_preview_cache()
+    ctx.drop_preview_cache()
     ctx.message(
         f"voice-only filter: {'on' if _FILTER_VOICE_ONLY else 'off'}"
     )
