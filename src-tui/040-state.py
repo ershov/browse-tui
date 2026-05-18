@@ -2816,6 +2816,77 @@ class Browser:
         ids_list = list(ids)
         self.post(lambda: self._do_select(ids_list, replace))
 
+    # ---- scope ----------------------------------------------------------
+
+    @property
+    def scope(self):
+        """Current scope id, or ``None`` at the root.
+
+        Equivalent to ``state.scope_stack[-1] if state.scope_stack else None``.
+        """
+        s = self._state.scope_stack
+        return s[-1] if s else None
+
+    @property
+    def scope_stack(self) -> tuple:
+        """Ancestor chain (root-first) of the current scope, as a tuple.
+
+        Empty at the root. Read-only — to change scope use
+        :meth:`scope_into` / :meth:`scope_out`.
+        """
+        return tuple(self._state.scope_stack)
+
+    def scope_into(self, id_) -> None:
+        """(thread-safe) Drill into the item with ``id_``.
+
+        Pushes ``id_`` onto ``scope_stack``, restores the
+        ``_expanded_by_scope`` set for the new scope, lands the
+        cursor on row 0 of the new view, and kicks a fetch for
+        ``id_``'s children if they aren't cached yet. Fires
+        ``on_scope_change`` (if installed) after the transition.
+
+        No-op when ``id_`` is already the current scope.
+        """
+        def _do():
+            state = self._state
+            if state.scope_stack and state.scope_stack[-1] == id_:
+                return
+            scope_into(state, id_)
+            state.cursor = 0
+            if id_ not in state._children:
+                self._do_expand(id_, Pending(), False)
+            self._needs_redraw.add('all')
+            mark_cursor_changed(self)
+            self._fire_scope_change()
+        self.post(_do)
+
+    def scope_out(self) -> None:
+        """(thread-safe) Pop the top of ``scope_stack``.
+
+        No-op when already at the root. After popping, lands the
+        cursor on the row of the id we just drilled into (so the
+        user feels "I came back from there"). Falls back to row 0
+        if the popped id isn't found in the new visible list. Fires
+        ``on_scope_change`` (if installed) after the transition.
+        """
+        def _do():
+            state = self._state
+            popped = scope_out(state)
+            if popped is None:
+                return
+            placed = False
+            for i, entry in enumerate(visible_items(state)):
+                if entry.kind == 'normal' and entry.item.id == popped:
+                    state.cursor = i
+                    placed = True
+                    break
+            if not placed:
+                state.cursor = 0
+            self._needs_redraw.add('all')
+            mark_cursor_changed(self)
+            self._fire_scope_change()
+        self.post(_do)
+
     # ---- expansion helpers -----------------------------------------------
 
     def collapse_all(self) -> None:

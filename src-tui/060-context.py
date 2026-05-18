@@ -199,6 +199,44 @@ class Context:
         """Add ``ids`` to the selection set (or replace it)."""
         return self._browser.select(ids, replace)
 
+    @property
+    def scope(self):
+        """Current scope id, or ``None`` at the root.
+
+        Pass-through to :attr:`Browser.scope`. Recipes can use this
+        from any action handler that needs to branch on "am I in a
+        scope?" without poking ``ctx.state.scope_stack`` directly.
+        """
+        return self._browser.scope
+
+    @property
+    def scope_stack(self) -> tuple:
+        """Ancestor chain (root-first) of the current scope, as a tuple.
+
+        Pass-through to :attr:`Browser.scope_stack`. Read-only — use
+        :meth:`scope_into` / :meth:`scope_out` to change scope.
+        """
+        return self._browser.scope_stack
+
+    def scope_into(self, id) -> None:
+        """Drill into the item with ``id``.
+
+        Pass-through to :meth:`Browser.scope_into`. Pushes ``id``
+        onto the scope stack, lands the cursor on the new view's
+        row 0, and fires ``on_scope_change``. No-op if already
+        scoped into ``id``.
+        """
+        return self._browser.scope_into(id)
+
+    def scope_out(self) -> None:
+        """Pop the top of the scope stack.
+
+        Pass-through to :meth:`Browser.scope_out`. Lands the cursor
+        on the row we drilled into (or 0 if not found). Fires
+        ``on_scope_change``. No-op at the root.
+        """
+        return self._browser.scope_out()
+
     def collapse_all(self) -> None:
         """Clear every entry from ``state.expanded`` for the current scope.
 

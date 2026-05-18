@@ -278,6 +278,10 @@ ctx.nav_home()                        -> None    # cursor -> row 0 + PIN_FIRST
 ctx.nav_end()                         -> None    # cursor -> last row + PIN_LAST
 ctx.collapse_all()                    -> None    # clear all expanded
 ctx.expand_subtree(id, lazy=True)     -> None    # expand id + cached descendants
+ctx.scope                             -> id | None    # current scope (None at root)
+ctx.scope_stack                       -> tuple[id, ...]
+ctx.scope_into(id)                    -> None    # drill in; fires on_scope_change
+ctx.scope_out()                       -> None    # drill out; fires on_scope_change
 ctx.filters                           -> tuple[str, ...]   # active filter list
 ctx.set_filters(filters)              -> None    # replace; drops empty strings
 ctx.add_filter(text)                  -> None    # append (no-op if empty)
