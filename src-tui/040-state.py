@@ -2220,6 +2220,69 @@ class Browser:
         """Most recent transient status message surfaced via :meth:`message`."""
         return self._message_text
 
+    # ---- cache introspection ---------------------------------------------
+    #
+    # Read-only views into the framework's item / children cache.
+    # Recipes use these to answer "what's currently loaded" without
+    # forcing a refetch and without reaching into ``state._items_by_id``
+    # / ``state._children`` (which remain framework-private).
+
+    @property
+    def items_by_id(self) -> dict:
+        """All currently-loaded items keyed by id (live read-only view).
+
+        The returned dict is the framework's live cache — its identity
+        is stable but contents mutate as children stream in / out.
+        Recipes that need a stable iteration order should snapshot via
+        ``tuple(browser.items_by_id.items())``. Mutating the dict is
+        unsupported; route additions / removals through
+        :meth:`update_data`.
+        """
+        return self._state._items_by_id
+
+    def get_item(self, id_) -> Optional['Item']:
+        """Return the loaded Item with ``id`` or ``None`` if not loaded.
+
+        O(1). Items not yet fetched (children of a collapsed parent
+        that was never expanded) return ``None``. To distinguish "not
+        loaded" from "loaded but has no children", pair with
+        :meth:`cached_children`.
+        """
+        return self._state._items_by_id.get(id_)
+
+    def cached_children(self, parent_id) -> Optional[list]:
+        """Return loaded children of ``parent_id`` as a list (copy), or ``None``.
+
+        ``None`` means the parent's children have not been fetched
+        yet; ``[]`` means the parent is loaded and has no children.
+        The returned list is a shallow copy — modifying it does not
+        affect framework state. Use :meth:`update_data` to add /
+        remove children.
+        """
+        entry = self._state._children.get(parent_id)
+        if entry is None:
+            return None
+        return list(entry)
+
+    def cached_parents(self) -> list:
+        """Return ids of every parent whose children list is currently cached.
+
+        Useful for "iterate every loaded subtree" recipes (a file
+        browser polling mtime per cached directory, a tail-feed
+        recipe diffing every loaded session). Order is the cache's
+        insertion order; sort if recipe needs stability.
+        """
+        return list(self._state._children.keys())
+
+    def all_items(self):
+        """Iterator over every currently-loaded Item.
+
+        Equivalent to ``items_by_id.values()`` but returns a snapshot
+        iterator that is safe under concurrent cache mutation.
+        Order matches the cache's insertion order.
+        """
+        return iter(list(self._state._items_by_id.values()))
+
     def refresh(self, id: Any = None,
                 on_complete: Optional[Callable[[], None]] = None) -> 'Pending':
         """(thread-safe) Schedule a refetch of one parent's children (or the full root).

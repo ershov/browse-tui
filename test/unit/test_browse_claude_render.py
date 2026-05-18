@@ -2700,6 +2700,7 @@ class TestLiveTail(unittest.TestCase):
         class FakeState:
             def __init__(s):
                 s._children = {path: list(children)}
+                s._items_by_id = {it.id: it for it in children}
         class FakeBrowser:
             def __init__(s):
                 s._state = FakeState()
@@ -2707,6 +2708,13 @@ class TestLiveTail(unittest.TestCase):
                 seen_ops.append(list(ops))
             def post(s, fn):
                 pass
+            def get_item(s, id_):
+                return s._state._items_by_id.get(id_)
+            def cached_children(s, parent_id):
+                kids = s._state._children.get(parent_id)
+                return None if kids is None else list(kids)
+            def all_items(s):
+                return iter(list(s._state._items_by_id.values()))
         return FakeBrowser(), seen_ops
 
     def test_push_flat_inserts_after_last_subagent(self):
@@ -3816,6 +3824,8 @@ class TestVoiceOnlyFilter(unittest.TestCase):
                 seen_ops.append(list(ops))
             def invalidate_preview(s, id_):
                 invalidate_calls.append(id_)
+            def all_items(s):
+                return iter(list(s._state._items_by_id.values()))
 
         class FakeCtx:
             def __init__(s):
@@ -3970,6 +3980,7 @@ class TestVoiceOnlyFilter(unittest.TestCase):
             class FakeState:
                 def __init__(s):
                     s._children = {path: []}
+                    s._items_by_id = {}
             class FakeBrowser:
                 def __init__(s):
                     s._state = FakeState()
@@ -3977,6 +3988,11 @@ class TestVoiceOnlyFilter(unittest.TestCase):
                     seen_ops.append(list(ops))
                 def post(s, fn):
                     pass
+                def get_item(s, id_):
+                    return s._state._items_by_id.get(id_)
+                def cached_children(s, parent_id):
+                    kids = s._state._children.get(parent_id)
+                    return None if kids is None else list(kids)
 
             self.r._FILTER_VOICE_ONLY = True
             self.r._push_flat_inserts(FakeBrowser(), path, new_records)
@@ -4023,6 +4039,11 @@ class TestVoiceOnlyFilter(unittest.TestCase):
                     s._state = FakeState()
                 def update_data(s, ops):
                     seen_ops.append(list(ops))
+                def get_item(s, id_):
+                    return s._state._items_by_id.get(id_)
+                def cached_children(s, parent_id):
+                    kids = s._state._children.get(parent_id)
+                    return None if kids is None else list(kids)
 
             self.r._FILTER_VOICE_ONLY = True
             self.r._push_tail_diffs(FakeBrowser(), [span_id])

@@ -95,7 +95,7 @@ def mtime_watcher(browser):
     last = {}
     while True:
         time.sleep(1.0)
-        for d in list(browser._state._children.keys()):
+        for d in browser.cached_parents():
             if not isinstance(d, str):
                 continue
             try:

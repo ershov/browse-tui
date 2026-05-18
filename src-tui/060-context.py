@@ -230,6 +230,56 @@ class Context:
         """Request the main loop to exit with ``code`` and stdout ``output``."""
         self._browser.quit(code, output)
 
+    # ---- cache introspection ------------------------------------------
+    #
+    # Read-only views into the framework's live item / children cache.
+    # See :meth:`Browser.items_by_id` for invariants and lifecycle
+    # notes.
+
+    @property
+    def items_by_id(self) -> dict:
+        """All currently-loaded items keyed by id (live read-only view).
+
+        Pass-through to :meth:`Browser.items_by_id`. The returned
+        dict is the framework's live cache; do not mutate. Use
+        :meth:`update_data` to add / remove items.
+        """
+        return self._browser.items_by_id
+
+    def get_item(self, id_) -> Optional['Item']:
+        """Return the loaded Item with ``id`` or ``None``.
+
+        Pass-through to :meth:`Browser.get_item`. O(1) lookup over
+        the item cache.
+        """
+        return self._browser.get_item(id_)
+
+    def cached_children(self, parent_id) -> Optional[list]:
+        """Loaded children of ``parent_id`` as a list, or ``None`` if not cached.
+
+        Pass-through to :meth:`Browser.cached_children`. Returns a
+        shallow copy; ``None`` vs ``[]`` distinguishes "not fetched"
+        from "fetched, no children".
+        """
+        return self._browser.cached_children(parent_id)
+
+    def cached_parents(self) -> list:
+        """Ids of every parent whose children list is currently cached.
+
+        Pass-through to :meth:`Browser.cached_parents`. Useful for
+        recipes iterating every loaded subtree (mtime watchers,
+        tail-feed diffs, bulk visibility flips).
+        """
+        return self._browser.cached_parents()
+
+    def all_items(self):
+        """Iterator over every currently-loaded Item.
+
+        Pass-through to :meth:`Browser.all_items`. Snapshot iterator
+        — safe under concurrent cache mutation.
+        """
+        return self._browser.all_items()
+
     # ---- push API pass-throughs / convenience -------------------------
     #
     # These mirror the streaming-push surface (Section 3 of the design

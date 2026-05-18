@@ -214,6 +214,48 @@ ctx.quit(code=0, output='')           -> None
 | `error`      | Surface an error message (red, sticks until next message).           |
 | `quit`       | Exit the main loop with `code`; print `output` to stdout afterwards. |
 
+### Cache introspection
+
+Read-only views into the framework's live item / children cache. Use
+these to answer "what's currently loaded" without forcing a refetch.
+They are stable public API; the underlying `_items_by_id` / `_children`
+fields on `State` remain framework-private.
+
+```python
+ctx.items_by_id                       -> dict[id, Item]   # live read-only
+ctx.get_item(id)                      -> Item | None      # O(1) lookup
+ctx.cached_children(parent_id)        -> list[Item] | None
+ctx.cached_parents()                  -> list[id]
+ctx.all_items()                       -> Iterator[Item]   # snapshot
+```
+
+| Method            | What it does                                                                 |
+| ----------------- | ---------------------------------------------------------------------------- |
+| `items_by_id`     | Live dict; do not mutate. Identity stable across calls; contents stream.     |
+| `get_item`        | O(1) lookup. Returns `None` if id is not loaded.                             |
+| `cached_children` | `None` means "not yet fetched"; `[]` means "fetched, no children". Copy.     |
+| `cached_parents`  | Ids of every parent whose children list is cached (insertion order).         |
+| `all_items`       | Snapshot iterator — safe under concurrent cache mutation.                    |
+
+Typical recipe patterns:
+
+```python
+# "Bulk visibility flip" — toggle hidden on every loaded item
+for it in ctx.all_items():
+    if condition(it.id):
+        ctx.upsert(it.id, KEEP_PARENT, hidden=not it.hidden)
+
+# "Diff and append" — tail-feed dedup before update_data
+existing = {it.id for it in (ctx.cached_children(parent) or [])}
+for fresh in incoming:
+    if fresh.id not in existing:
+        ctx.upsert(fresh.id, parent, **kwargs)
+
+# "Iterate every loaded subtree" — directory mtime watcher etc.
+for p in ctx.cached_parents():
+    poll(p)
+```
+
 ### Push-API pass-throughs
 
 Mirror the `Browser` push surface so action handlers can mutate the tree

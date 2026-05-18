@@ -2922,7 +2922,6 @@ def _push_tail_diffs(b, dirty_parents):
     """
     if not dirty_parents:
         return
-    state = b._state
     ops = []
     for parent_id in dirty_parents:
         # Under voice-only filter, a tail append (e.g., a voice record
@@ -2931,16 +2930,17 @@ def _push_tail_diffs(b, dirty_parents):
         # in the same batch as its new children. Skip when the parent
         # isn't in our index (yet to be upserted) — it'll be built with
         # the right ``hidden`` from the builder.
-        parent_item = state._items_by_id.get(parent_id)
+        parent_item = b.get_item(parent_id)
         if (
             parent_item is not None
             and getattr(parent_item, 'hidden', False)
             and _passes_filter(parent_id)
         ):
             ops.append(mod(parent_id, hidden=False))
-        if parent_id not in state._children:
+        cached = b.cached_children(parent_id)
+        if cached is None:
             continue
-        existing_ids = {it.id for it in state._children[parent_id]}
+        existing_ids = {it.id for it in cached}
         try:
             fresh = get_children(parent_id)
         except Exception:
@@ -3034,10 +3034,9 @@ def _push_flat_inserts(b, path, records):
     """
     if not records:
         return
-    state = b._state
-    if path not in state._children:
+    existing = b.cached_children(path)
+    if existing is None:
         return
-    existing = state._children[path]
     existing_ids = {it.id for it in existing}
 
     last_sub_idx = -1
@@ -4450,12 +4449,11 @@ def _action_toggle_filter(ctx):
     global _FILTER_VOICE_ONLY
     _FILTER_VOICE_ONLY = not _FILTER_VOICE_ONLY
     b = ctx._browser
-    state = b._state
     ops = []
-    for id_, item in list(state._items_by_id.items()):
-        want_hidden = not _passes_filter(id_)
+    for item in b.all_items():
+        want_hidden = not _passes_filter(item.id)
         if bool(getattr(item, 'hidden', False)) != want_hidden:
-            ops.append(mod(id_, hidden=want_hidden))
+            ops.append(mod(item.id, hidden=want_hidden))
     if ops:
         b.update_data(ops)
     # Umbrella previews compose from non-hidden children, so every
@@ -4463,7 +4461,7 @@ def _action_toggle_filter(ctx):
     # every cached entry and re-fetch the cursor's preview without
     # touching view state — a user who pinned the view to the bottom
     # keeps following the tail of the newly-filtered content.
-    state._preview.clear()
+    b._state._preview.clear()
     cur_id = b._preview_cursor_id
     if cur_id is not None:
         b.invalidate_preview(cur_id)
