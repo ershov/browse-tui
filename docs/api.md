@@ -40,6 +40,16 @@ class Item:
 domain-specific attributes (`item.size`, `item.mtime`, `item.path` …) and
 they survive across the full pipeline (rendering, search, action env vars).
 
+Two such attributes are honoured by the list renderer when set:
+
+| Attribute  | Type     | Effect |
+| ---------- | -------- | ------ |
+| `row_bg`   | int (256-color) | Background colour for the whole row (turns the row into a coloured stripe; extends across the trailing pad). |
+| `row_fg`   | int (256-color) | Foreground colour for segments that don't specify their own `fg`. Segments with explicit colours keep theirs. Useful for "dim the whole row" / "red row for failed status" effects. |
+
+Both default to `None` (no override). Set per-item with `item.row_bg = 1`
+/ `item.row_fg = 8` after construction.
+
 A framework-internal `_filter_hidden` field also lives on `Item` (written
 by the interactive filter evaluator). It's `init=False, repr=False,
 compare=False` — invisible to recipe code and never part of equality.

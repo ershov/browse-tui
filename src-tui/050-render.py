@@ -860,7 +860,8 @@ def _truncate_by_cells(s, max_cols):
     return (''.join(out), cells)
 
 
-def _write_segments(segments, max_width, *, pad_to=0, row_bg=None):
+def _write_segments(segments, max_width, *, pad_to=0, row_bg=None,
+                    row_fg=None):
     """Emit ``segments`` to the terminal, truncating at ``max_width`` cells.
 
     Each segment is a ``(text, fg, bold)`` triple. ``fg=None`` and
@@ -874,6 +875,12 @@ def _write_segments(segments, max_width, *, pad_to=0, row_bg=None):
     whole row into a coloured stripe. Recipes set ``item.row_bg`` on
     Items they want to call out (e.g. user/assistant turns in
     browse-claude); the list renderer threads it through here.
+
+    ``row_fg`` (256-color int, optional) is the foreground analogue:
+    segments without their own ``fg`` pick up ``row_fg``; segments
+    that already specify a colour keep theirs. Useful for "dim the
+    whole row" / "red row for failed status" effects without
+    rewriting per-segment styles.
 
     Width is measured in *visible cells* (wide-char aware) so rows
     containing CJK / emoji / other East Asian wide chars truncate and
@@ -890,8 +897,11 @@ def _write_segments(segments, max_width, *, pad_to=0, row_bg=None):
         chunk, chunk_cells = _truncate_by_cells(text, remaining)
         if not chunk:
             continue
-        if fg is not None or bold or row_bg is not None:
-            set_style(fg=fg, bg=row_bg, bold=bold)
+        # Effective fg: segment's own ``fg`` wins; otherwise inherit
+        # ``row_fg`` (when set).
+        eff_fg = fg if fg is not None else row_fg
+        if eff_fg is not None or bold or row_bg is not None:
+            set_style(fg=eff_fg, bg=row_bg, bold=bold)
             write(chunk)
             reset_style()
         else:
@@ -1319,6 +1329,7 @@ def render_list(browser, rect, *, rightmost: bool = False):
                 _write_segments(
                     segments, width,
                     row_bg=getattr(item, 'row_bg', None),
+                    row_fg=getattr(item, 'row_fg', None),
                 )
         end_row()
 
