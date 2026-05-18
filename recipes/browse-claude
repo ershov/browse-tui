@@ -2124,6 +2124,9 @@ def _preview_session(path):
     One pass over the .jsonl folds metadata records (titles, modes,
     permission state, PR link, worktree, counts) into a compact card,
     then renders the most recent ``_TIMELINE_TAIL`` events as one-liners.
+
+    Voice-only filter: timeline rows that fail ``_is_voice`` are
+    dropped so the preview matches what the user sees in the list.
     """
     try:
         meta, timeline_rows = _scan_session(path)
@@ -2131,6 +2134,8 @@ def _preview_session(path):
         return f'[error] {e}'
     if not meta and not timeline_rows:
         return '(empty session)'
+    if _FILTER_VOICE_ONLY:
+        timeline_rows = [(n, obj) for n, obj in timeline_rows if _is_voice(obj)]
     return _fmt_session_card(meta) + '\n\n' + _fmt_timeline(timeline_rows)
 
 
@@ -3643,6 +3648,8 @@ def _preview_subagent(item_id):
         meta['agent_type'] = sidecar['agentType']
     if sidecar.get('description'):
         meta['agent_description'] = sidecar['description']
+    if _FILTER_VOICE_ONLY:
+        timeline_rows = [(n, obj) for n, obj in timeline_rows if _is_voice(obj)]
     return _fmt_session_card(meta) + '\n\n' + _fmt_timeline(timeline_rows)
 
 

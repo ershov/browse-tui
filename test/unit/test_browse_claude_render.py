@@ -4034,6 +4034,35 @@ class TestVoiceOnlyFilter(unittest.TestCase):
         finally:
             self.r._TREE_CACHE.pop(path, None)
 
+    # ---- session / subagent preview respects filter --------------------
+
+    def test_session_preview_filters_timeline(self):
+        # The session row is a synthetic preview built from
+        # ``_scan_session``; under the voice-only filter, the timeline
+        # must drop non-voice events to match the list view.
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'PROBE_VOICE_TEXT'}},
+            {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 't1', 'name': 'PROBE_TOOL_NAME',
+                  'input': {'cmd': 'ls'}},
+             ]}},
+        ])
+        try:
+            self.r._FILTER_VOICE_ONLY = False
+            full = self.r._preview_session(path)
+            self.assertIn('PROBE_VOICE_TEXT', full)
+            self.assertIn('PROBE_TOOL_NAME', full,
+                          'without filter the tool row should appear')
+            self.r._FILTER_VOICE_ONLY = True
+            filtered = self.r._preview_session(path)
+            self.assertIn('PROBE_VOICE_TEXT', filtered)
+            self.assertNotIn('PROBE_TOOL_NAME', filtered,
+                             'with filter the tool row must be dropped')
+        finally:
+            os.unlink(path)
+
     # ---- preview respects hidden ----------------------------------------
 
     def test_umbrella_preview_skips_hidden_children(self):
