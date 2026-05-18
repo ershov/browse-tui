@@ -2663,6 +2663,63 @@ class Browser:
             self._needs_redraw.add('preview')
         self.post(_apply)
 
+    # ---- preview-cache introspection -------------------------------------
+
+    def get_cached_preview(self, id_) -> Optional[str]:
+        """Return cached preview text for ``id_`` or ``None``.
+
+        Synchronous read — does **not** call ``get_preview`` and does
+        not schedule a worker fetch. Useful when a recipe wants to
+        hand the currently-displayed preview text to an external
+        consumer (e.g. an external pager / editor) without paying the
+        latency of a re-fetch.
+
+        Returns ``None`` if there is no cached entry (the worker has
+        not yet delivered for this id, or the entry was dropped via
+        :meth:`drop_preview_cache`).
+        """
+        return self._state._preview.get(id_)
+
+    def drop_preview_cache(self, id_=None) -> None:
+        """(thread-safe) Drop cached preview text.
+
+        ``id_=None`` (default) drops every entry — useful after a
+        bulk mutation that invalidates every composed preview (e.g.
+        a global filter flip that changes which children contribute
+        to umbrella previews).
+
+        When the dropped id matches the currently-displayed preview
+        cursor (or ``id_=None``), the worker is kicked for the
+        current cursor and the preview pane is flagged for redraw —
+        recipes do not need to combine this call with
+        :meth:`invalidate_preview` or hand-managed redraw signals.
+
+        View state (``_preview_scroll``, ``_preview_at_tail``) is
+        preserved so a user pinned to the tail keeps following.
+        """
+        def _apply():
+            if id_ is None:
+                self._state._preview.clear()
+            else:
+                self._state._preview.pop(id_, None)
+            cur = self._preview_cursor_id
+            if cur is not None and (id_ is None or id_ == cur):
+                self.request_preview(cur)
+            self._needs_redraw.add('preview')
+        self.post(_apply)
+
+    @property
+    def preview_item_id(self):
+        """Id whose preview is currently displayed (or ``None``).
+
+        Tracks the preview pane's worker target, not the row cursor.
+        Usually equals the row cursor's id, but lags behind during
+        rapid navigation while a worker fetch is in flight. Recipes
+        that want "is the user looking at this id right now?" should
+        check against ``preview_item_id`` rather than the row cursor.
+        """
+        return self._preview_cursor_id
+
     def preview_to_tail(self) -> None:
         """(thread-safe) Pin the preview view to the bottom of its content.
 

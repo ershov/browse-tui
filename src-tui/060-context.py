@@ -374,6 +374,33 @@ class Context:
         """
         return self._browser.invalidate_preview(id)
 
+    def get_cached_preview(self, id) -> Optional[str]:
+        """Cached preview text for ``id`` or ``None``.
+
+        Pass-through to :meth:`Browser.get_cached_preview`. Read-only,
+        no callback fire. Returns ``None`` for ids with no cached entry.
+        """
+        return self._browser.get_cached_preview(id)
+
+    def drop_preview_cache(self, id=None) -> None:
+        """Drop cached preview text.
+
+        Pass-through to :meth:`Browser.drop_preview_cache`. ``id=None``
+        drops every entry; when the dropped id matches the current
+        preview cursor, the worker is auto-kicked and the preview pane
+        is redrawn.
+        """
+        return self._browser.drop_preview_cache(id)
+
+    @property
+    def preview_item_id(self):
+        """Id whose preview is currently displayed (or ``None``).
+
+        Pass-through to :meth:`Browser.preview_item_id`. May lag behind
+        the row cursor during rapid navigation.
+        """
+        return self._browser.preview_item_id
+
     def run_in_worker(self, fn: Callable[[], Any]) -> threading.Thread:
         """Run ``fn()`` on a fresh daemon thread, surfacing exceptions.
 

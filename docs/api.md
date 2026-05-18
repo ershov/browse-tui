@@ -270,6 +270,9 @@ ctx.set_preview(id, text)             -> None
 ctx.append_preview(id, chunk)         -> None
 ctx.clear_preview(id)                 -> None
 ctx.invalidate_preview(id)            -> None    # drop cache + re-fetch
+ctx.get_cached_preview(id)            -> str | None   # read without re-fetch
+ctx.drop_preview_cache(id=None)       -> None    # drop one/all; auto-kicks cursor
+ctx.preview_item_id                   -> id | None    # id whose preview is shown
 ctx.preview_to_tail()                 -> None    # pin preview to bottom
 ctx.nav_home()                        -> None    # cursor -> row 0 + PIN_FIRST
 ctx.nav_end()                         -> None    # cursor -> last row + PIN_LAST

@@ -3083,12 +3083,12 @@ def _bust_preview_for_path(b, path):
     tail as the umbrella's preview grows. For non-cursor paths the
     cache is dropped so the next visit re-fetches.
     """
-    cur_id = b._preview_cursor_id
+    cur_id = b.preview_item_id
     if cur_id == path or (isinstance(cur_id, str)
                           and cur_id.startswith(path + '#')):
         b.invalidate_preview(cur_id)
     else:
-        b._state._preview.pop(path, None)
+        b.drop_preview_cache(path)
 
 
 def _resolve_tail_path_from_browser(b):
@@ -4085,12 +4085,8 @@ def _action_md_preview(ctx):
     item = ctx.cursor
     if item is None:
         return
-    state = ctx._browser._state
-    get_preview = getattr(ctx._browser, 'get_preview', None)
-    text = None
-    if hasattr(state, '_preview'):
-        text = state._preview.get(item.id)
-    if text is None and get_preview is not None:
+    text = ctx.get_cached_preview(item.id)
+    if text is None:
         try:
             text = get_preview(item.id)
         except Exception as e:
@@ -4458,14 +4454,10 @@ def _action_toggle_filter(ctx):
         b.update_data(ops)
     # Umbrella previews compose from non-hidden children, so every
     # cached preview is potentially stale after a filter flip. Drop
-    # every cached entry and re-fetch the cursor's preview without
-    # touching view state — a user who pinned the view to the bottom
-    # keeps following the tail of the newly-filtered content.
-    b._state._preview.clear()
-    cur_id = b._preview_cursor_id
-    if cur_id is not None:
-        b.invalidate_preview(cur_id)
-    b._needs_redraw.add('preview')
+    # every cached entry; ``drop_preview_cache`` will kick the worker
+    # for the current preview cursor and flag a redraw, preserving
+    # view state (a user pinned to the tail keeps following).
+    b.drop_preview_cache()
     ctx.message(
         f"voice-only filter: {'on' if _FILTER_VOICE_ONLY else 'off'}"
     )

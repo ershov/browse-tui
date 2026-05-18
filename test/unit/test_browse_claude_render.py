@@ -3826,6 +3826,8 @@ class TestVoiceOnlyFilter(unittest.TestCase):
                 invalidate_calls.append(id_)
             def all_items(s):
                 return iter(list(s._state._items_by_id.values()))
+            def drop_preview_cache(s, id_=None):
+                pass
 
         class FakeCtx:
             def __init__(s):
@@ -3904,24 +3906,21 @@ class TestVoiceOnlyFilter(unittest.TestCase):
         finally:
             os.unlink(path)
 
-    def test_toggle_action_invalidates_preview_cache(self):
+    def test_toggle_action_drops_preview_cache(self):
         # Umbrella previews compose from non-hidden children. After a
         # filter flip, every cached preview is potentially stale —
-        # drop the cache and force the cursor's preview to re-fetch via
-        # ``invalidate_preview`` (preserves view state like tail-pin).
+        # the recipe drops the whole preview cache via the public
+        # ``drop_preview_cache()`` API, which the framework guarantees
+        # will also re-kick the cursor preview and signal a redraw.
         ctx, _ = self._fake_browser_with_items({})
-        # Re-bind the fake so invalidate calls are observable here.
-        invalidates = []
-        ctx._browser.invalidate_preview = lambda id_: invalidates.append(id_)
-        ctx._browser._state._preview['foo'] = 'stale'
-        ctx._browser._preview_cursor_id = 'foo'
+        # Replace the fake's drop_preview_cache with a spy so we can
+        # confirm the recipe called it.
+        drops = []
+        ctx._browser.drop_preview_cache = lambda id_=None: drops.append(id_)
         self.r._action_toggle_filter(ctx)
-        self.assertEqual(ctx._browser._state._preview, {},
-                         'preview cache should be cleared on toggle')
-        self.assertEqual(invalidates, ['foo'],
-                         'cursor preview should be re-fetched via '
-                         'invalidate_preview (preserves view state)')
-        self.assertIn('preview', ctx._browser._needs_redraw)
+        self.assertEqual(drops, [None],
+                         'recipe should drop the whole preview cache '
+                         'so the framework re-fetches the cursor view')
 
     def test_toggle_action_no_remove_ops(self):
         # Toggle never emits remove ops — visibility is non-destructive.
