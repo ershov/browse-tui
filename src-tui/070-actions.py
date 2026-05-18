@@ -471,6 +471,7 @@ def _select_toggle_down(ctx):
         state.cursor += 1
     ctx._browser._needs_redraw.add('list')
     ctx._browser._needs_redraw.add('info')
+    ctx._browser._fire_selection_change()
 
 
 def _select_toggle_up(ctx):
@@ -492,6 +493,7 @@ def _select_toggle_up(ctx):
         state.cursor -= 1
     ctx._browser._needs_redraw.add('list')
     ctx._browser._needs_redraw.add('info')
+    ctx._browser._fire_selection_change()
 
 
 def _select_all_visible(ctx):

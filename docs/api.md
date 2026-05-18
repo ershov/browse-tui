@@ -497,15 +497,17 @@ need off `ctx`. All three exist on `Browser.__init__`:
 
 ```python
 Browser(...,
-        on_cursor_change=cb,   # cursor row id changed (debounced)
-        on_scope_change=cb,    # scope_into / scope_out completed
-        on_quit=cb)            # shutdown, after screen restore
+        on_cursor_change=cb,    # cursor row id changed (debounced)
+        on_scope_change=cb,     # scope_into / scope_out completed
+        on_selection_change=cb, # state.selected changed
+        on_quit=cb)             # shutdown, after screen restore
 ```
 
 | Hook | When it fires | Notes |
 | ---- | ------------- | ----- |
 | `on_cursor_change` | At most once per main-loop tick; only when the row id under the cursor differs from the last fire. | Rapid moves coalesce. Re-anchor moves that land on the same id are silent. Exceptions surface via `Browser.error`. |
 | `on_scope_change` | After a successful `scope_into` / `scope_out` transition. | Read `ctx.state.scope_stack` for the new scope. Exceptions surface via `Browser.error`. |
+| `on_selection_change` | After every change to `state.selected` (Space, alt-Space, Ctrl-A, Ctrl-N, `select_all_visible` / `clear_selection` / `invert_selection` / `select`). No-op calls (e.g. `clear` on an already-empty set) are silent. | Read `ctx.state.selected` or `ctx.selected` for the new set. Exceptions surface via `Browser.error`. |
 | `on_quit` | Once during shutdown, after the screen is restored, before `Browser.run` returns. | Use for worker / file-handle / temp-file cleanup. Exceptions are swallowed silently — a failing cleanup must not block exit. |
 
 Typical patterns:

@@ -114,6 +114,59 @@ class TestOnScopeChange(unittest.TestCase):
         self.assertIn('nope', b.error_text)
 
 
+class TestOnSelectionChange(unittest.TestCase):
+
+    def test_fires_on_select_all_visible(self):
+        fired = []
+        b = Browser(_headless=True,
+                    on_selection_change=lambda ctx: fired.append(
+                        set(ctx.state.selected)))
+        b.update_data([
+            ('upsert', 'a', None, {}),
+            ('upsert', 'b', None, {}),
+        ])
+        b.drain_main_queue()
+        b.select_all_visible()
+        b.drain_main_queue()
+        self.assertEqual(fired, [{'a', 'b'}])
+
+    def test_fires_on_clear(self):
+        fired = []
+        b = Browser(_headless=True,
+                    on_selection_change=lambda ctx: fired.append(1))
+        b._state.selected = {'a'}
+        b.clear_selection()
+        b.drain_main_queue()
+        self.assertEqual(fired, [1])
+
+    def test_no_fire_on_clear_when_already_empty(self):
+        fired = []
+        b = Browser(_headless=True,
+                    on_selection_change=lambda ctx: fired.append(1))
+        b.clear_selection()
+        b.drain_main_queue()
+        self.assertEqual(fired, [])
+
+    def test_fires_on_select_no_op_is_silent(self):
+        # ctx.select() with a set already containing those ids → no change.
+        fired = []
+        b = Browser(_headless=True,
+                    on_selection_change=lambda ctx: fired.append(1))
+        b._state.selected = {'a'}
+        b.select(['a'], replace=False)
+        b.drain_main_queue()
+        self.assertEqual(fired, [])
+
+    def test_exception_routed_to_error(self):
+        def bad(ctx):
+            raise RuntimeError('selection boom')
+        b = Browser(_headless=True, on_selection_change=bad)
+        b._state.selected = {'a'}
+        b.clear_selection()
+        b.drain_main_queue()
+        self.assertIn('selection boom', b.error_text)
+
+
 class TestOnQuit(unittest.TestCase):
 
     def test_fires_once(self):
