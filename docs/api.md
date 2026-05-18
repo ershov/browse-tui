@@ -315,6 +315,40 @@ uncaught exception via `browser.error`. The thread handle is mostly
 informational — synchronisation should be done via `Pending` or
 `threading.Event` inside `fn`.
 
+### Worker supersede: `ctx.run_in_slot(name, fn)`
+
+For workers whose latest call should replace any in-flight earlier
+call (live-as-you-type recompute, cancellable tail refresh), use
+`run_in_slot` instead. Each call returns a `CancellationToken`;
+re-submitting the same `name` cancels the prior token.
+
+```python
+ctx.run_in_slot(name: str, fn) -> CancellationToken
+
+class CancellationToken:
+    def is_cancelled() -> bool
+    def cancel() -> None
+```
+
+The function signature is `fn(token)` — `fn` receives the token
+and must poll `token.is_cancelled()` cooperatively at safe points.
+The framework does **not** kill threads.
+
+```python
+def slow_search(token):
+    for row in scan():
+        if token.is_cancelled():
+            return                       # bail out promptly
+        ctx.append_preview(cursor_id, render(row))
+
+# Each keystroke replaces the running worker.
+def on_query_change(text):
+    ctx.run_in_slot('preview-search', slow_search)
+```
+
+Exceptions inside `fn` are routed to `browser.error` exactly like
+`run_in_worker`.
+
 ### Escape hatches (advanced; unstable surface)
 
 When the documented Context surface doesn't cover what a recipe needs,

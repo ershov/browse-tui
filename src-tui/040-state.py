@@ -25,6 +25,34 @@ class Mode(enum.Enum):
     FILTER_EDIT = 'filter-edit'
 
 
+class CancellationToken:
+    """Cooperative-cancellation handle returned by ``Browser.run_in_slot``.
+
+    Each call to ``run_in_slot(name, fn)`` returns a fresh
+    ``CancellationToken``. Workers receive the token and must poll
+    ``is_cancelled()`` themselves at safe points — the framework
+    does **not** kill threads. Calling ``cancel()`` from any
+    thread sets the flag.
+
+    When the same slot is reused (next call to
+    ``run_in_slot(same_name, ...)``), the prior token is cancelled
+    automatically before the new worker starts.
+    """
+
+    __slots__ = ('_cancelled',)
+
+    def __init__(self) -> None:
+        self._cancelled = threading.Event()
+
+    def is_cancelled(self) -> bool:
+        """Return ``True`` after :meth:`cancel` (or supersede) ran."""
+        return self._cancelled.is_set()
+
+    def cancel(self) -> None:
+        """Set the cancelled flag. Idempotent."""
+        self._cancelled.set()
+
+
 class Pending:
     """A handle for an async operation that may chain follow-up callbacks.
 
@@ -1914,6 +1942,11 @@ class Browser:
         self._on_scope_change = on_scope_change
         self._on_selection_change = on_selection_change
         self._on_quit = on_quit
+        # Worker-slot registry for ``run_in_slot``. Each entry is the
+        # currently-active CancellationToken for a named slot;
+        # superseded tokens are removed lazily by the worker on exit.
+        self._slots: dict = {}
+        self._slots_lock = threading.Lock()
         self._cursor_change_pending = False
         self._last_cursor_id = None
         self._headless = _headless
@@ -2997,6 +3030,57 @@ class Browser:
             mark_visible_dirty(state)
             self._needs_redraw.add('all')
         self.post(_do)
+
+    # ---- worker supersede ----------------------------------------------
+
+    def run_in_slot(self, name: str, fn) -> 'CancellationToken':
+        """(thread-safe) Run ``fn(token)`` in a daemon thread; supersede prior run.
+
+        ``name`` identifies a "slot" — if another worker is currently
+        running in the same slot, its token is cancelled before the
+        new worker starts. Use cases: live-as-you-type computation
+        (collapse 30 keystrokes-worth of recompute into one running
+        job), tail-feed refresh (cancel the slow refresh when the
+        user navigates away).
+
+        ``fn`` is called as ``fn(token)``; the recipe must call
+        ``token.is_cancelled()`` at safe checkpoints (typically
+        every loop iteration, every chunk read, etc.). The framework
+        does NOT kill the thread — cancellation is purely
+        cooperative.
+
+        Returns the new :class:`CancellationToken`. Recipes can hold
+        it to cancel manually (``token.cancel()``), or let
+        re-submission to the same slot do it for them.
+
+        Exceptions raised inside ``fn`` are caught and routed to
+        :meth:`error` so a failing worker can't crash the process.
+        """
+        with self._slots_lock:
+            prev = self._slots.get(name)
+            token = CancellationToken()
+            self._slots[name] = token
+        if prev is not None:
+            prev.cancel()
+
+        def _runner():
+            try:
+                fn(token)
+            except Exception as e:
+                self.error(
+                    f'run_in_slot({name!r}): {type(e).__name__}: {e}'
+                )
+            finally:
+                with self._slots_lock:
+                    if self._slots.get(name) is token:
+                        del self._slots[name]
+
+        t = threading.Thread(
+            target=_runner, daemon=True,
+            name=f'browse-tui-slot-{name}',
+        )
+        t.start()
+        return token
 
     # ---- selection helpers ----------------------------------------------
 

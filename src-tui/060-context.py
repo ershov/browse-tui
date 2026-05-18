@@ -545,6 +545,18 @@ class Context:
         """
         return self._browser.preview_item_id
 
+    def run_in_slot(self, name: str, fn) -> 'CancellationToken':
+        """Run ``fn(token)`` in a daemon thread; supersede prior in slot.
+
+        Pass-through to :meth:`Browser.run_in_slot`. ``name``
+        identifies the slot; the previous worker (if any) for the
+        same name has its token cancelled before the new one starts.
+        ``fn`` receives a :class:`CancellationToken` and must
+        cooperatively check ``token.is_cancelled()`` at safe points.
+        Exceptions inside ``fn`` route to :attr:`Browser.error`.
+        """
+        return self._browser.run_in_slot(name, fn)
+
     def run_in_worker(self, fn: Callable[[], Any]) -> threading.Thread:
         """Run ``fn()`` on a fresh daemon thread, surfacing exceptions.
 
