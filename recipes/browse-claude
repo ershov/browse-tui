@@ -3094,22 +3094,21 @@ def _bust_preview_for_path(b, path):
 def _resolve_tail_path_from_browser(b):
     """Return the file the cursor's current row maps to, or None.
 
-    Reads ``state.cursor`` + ``visible_items(state)`` to find the
-    cursor row's id, then routes through ``_cursor_tail_path``. The
-    scope_root row's id participates too, so a freshly-launched
+    Reads the cursor + visible-list through a one-off Context so
+    the scope_root row's id participates too — a freshly-launched
     recipe that hasn't moved the cursor still resolves a tail path.
     """
     try:
-        state = b._state
-        from browse_tui import visible_items as _vi
-        vis = _vi(state)
+        from browse_tui import Context
+        ctx = Context(b)
+        vis = ctx.visible_items
         if not vis:
             return None
-        idx = state.cursor
+        idx = ctx.cursor_index
         if not (0 <= idx < len(vis)):
             return None
-        entry = vis[idx]
-        item_id = entry.item.id if entry.item is not None else None
+        item, _kind = vis[idx]
+        item_id = item.id if item is not None else None
         return _cursor_tail_path(item_id)
     except Exception:
         return None
