@@ -46,6 +46,28 @@ import threading
 
 from browse_tui import Action, Browser, BrowserConfig, Item, mod, upsert
 
+# Optional md2ansi plugin — colors user/assistant voice content inline.
+try:
+    from md2ansi import md2ansi as _md2ansi_fn
+    if not callable(_md2ansi_fn):
+        _md2ansi_fn = None
+except Exception:
+    _md2ansi_fn = None
+
+_MD_COLOR = _md2ansi_fn is not None  # default on when available
+_BROWSER = None  # set in main() — used for preview-width lookup
+
+
+def _md_voice(text):
+    """Run voice text through md2ansi when colored mode is on."""
+    if not _MD_COLOR or _md2ansi_fn is None or not text:
+        return text
+    try:
+        width = (_BROWSER.preview_width if _BROWSER else 0) or 80
+        return _md2ansi_fn(text, line_width=width)
+    except Exception:
+        return text
+
 
 CLAUDE_ROOT = os.path.join(
     os.environ.get('HOME', os.path.expanduser('~')), '.claude', 'projects',
@@ -1298,7 +1320,7 @@ def _render_user(obj):
 def _user_body_text(content):
     """Render the textual portion of a user content payload."""
     if isinstance(content, str):
-        return content
+        return _md_voice(content)
     if isinstance(content, list):
         chunks = []
         for part in content:
@@ -1309,7 +1331,7 @@ def _user_body_text(content):
                 chunks.append(part.get('text', '') or '')
             # tool_result handled in _render_tool_result; tool_use not
             # expected on a user record.
-        return '\n\n'.join(c for c in chunks if c)
+        return _md_voice('\n\n'.join(c for c in chunks if c))
     return str(content) if content is not None else ''
 
 
@@ -1338,7 +1360,7 @@ def _render_assistant(obj):
             continue
         t = part.get('type')
         if t == 'text':
-            out.append(part.get('text', '') or '')
+            out.append(_md_voice(part.get('text', '') or ''))
             out.append('')
         elif t == 'thinking':
             text = part.get('thinking', '') or ''
@@ -4110,6 +4132,14 @@ def _action_md_preview(ctx):
             pass
 
 
+def _action_toggle_md(ctx):
+    """Toggle md2ansi rendering of user/assistant voice content."""
+    global _MD_COLOR
+    _MD_COLOR = not _MD_COLOR
+    ctx.drop_preview_cache()
+    ctx.message(f'voice rendering: {"colored" if _MD_COLOR else "raw"}')
+
+
 def _action_show_id(ctx):
     """Surface the cursor row's id on the info bar (handy for debugging)."""
     if ctx.cursor is None:
@@ -4491,7 +4521,9 @@ a transcript with Right/Alt-Down; preview shows the rendered turn.
 
   v / V   page the preview (v) / the source .jsonl (V) via $PAGER.
   e / E   open the preview (e) / the source .jsonl (E) in $EDITOR.
-  m       render the preview as markdown via $MD2ANSI / md2ansi.
+  m       toggle inline markdown coloring of voice content (only bound
+          when the md2ansi Python module is importable).
+  M       render the preview via $MD2ANSI / md2ansi (external).
   J / K   jump cursor to next / previous user-or-assistant voice.
   t       toggle flat / tree view.
   h       toggle voice-only filter (hide tool calls / machinery).\
@@ -4502,7 +4534,7 @@ _message_limit = _MESSAGE_LIMIT
 
 
 def main():
-    global _message_limit, _RUNNING_ONLY, _TREE_MODE, _FILTER_VOICE_ONLY
+    global _message_limit, _RUNNING_ONLY, _TREE_MODE, _FILTER_VOICE_ONLY, _BROWSER
     _init_color()
     _message_limit = _pop_limit_arg(_MESSAGE_LIMIT)
 
@@ -4594,6 +4626,15 @@ def main():
         else:
             initial_scope = os.path.dirname(target_jsonl) or '/'
 
+    # 'M' always pages the preview through the external $MD2ANSI / md2ansi.
+    # 'm' toggles inline markdown coloring iff the md2ansi Python module
+    # was importable; otherwise it's left unbound.
+    actions_m = [Action('M', 'View preview via $MD2ANSI / md2ansi',
+                        _action_md_preview, 'cursor')]
+    if _md2ansi_fn is not None:
+        actions_m.insert(0, Action('m', 'Toggle voice markdown coloring',
+                                   _action_toggle_md, 'none'))
+
     b = Browser(BrowserConfig(
         title='browse-claude',
         show_children_pane=False,
@@ -4615,7 +4656,7 @@ def main():
             # currently-open file from its synthetic top row.
             Action('V',     'View source for cursor/selection in $PAGER',  _action_view_source, 'none'),
             Action('E',     'Edit source for cursor/selection in $EDITOR', _action_edit_source, 'none'),
-            Action('m',     'View preview via $MD2ANSI / md2ansi', _action_md_preview, 'cursor'),
+            *actions_m,
             Action('y',     'Show full id (paste-friendly)',   _action_show_id,     'cursor'),
             # 'none' gate so J/K fire even when the cursor sits on a
             # scope_root row (where ctx.cursor returns None). The
@@ -4631,6 +4672,7 @@ def main():
         ],
         help_intro=_HELP_INTRO_TMPL.format(default=_MESSAGE_LIMIT),
     ))
+    _BROWSER = b
 
     # Post-construction cursor positioning:
     #

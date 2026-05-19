@@ -283,6 +283,7 @@ ctx.invalidate_preview(id)            -> None    # drop cache + re-fetch
 ctx.get_cached_preview(id)            -> str | None   # read without re-fetch
 ctx.drop_preview_cache(id=None)       -> None    # drop one/all; auto-kicks cursor
 ctx.preview_item_id                   -> id | None    # id whose preview is shown
+ctx.preview_width                     -> int    # preview pane cols (0 if hidden / no tty)
 ctx.preview_to_tail()                 -> None    # pin preview to bottom
 ctx.nav_home()                        -> None    # cursor -> row 0 + PIN_FIRST
 ctx.nav_end()                         -> None    # cursor -> last row + PIN_LAST
@@ -1094,6 +1095,27 @@ ctx.preview_to_tail()  # streaming log tail; new chunks stay visible
 Symmetric to `nav_end` (which pins the list cursor to the bottom);
 the matching keybinds Shift-End / Alt-End engage it too.
 Thread-safe — posts onto the main thread.
+
+#### `browser.preview_width -> int`
+
+Width of the preview pane in terminal columns, refreshed on every
+render pass. Reads a cached value the renderer updates from the live
+layout — so reads are O(1) and don't recompute geometry, but resizes,
+split / ratio changes, and `show_preview` toggles take effect on the
+next paint (and are visible to the next `get_preview` fetch).
+
+Returns `0` until the first paint, while the preview pane is hidden,
+or when terminal geometry can't be read (headless tests, no tty). Pick
+an explicit fallback when a non-zero value is required:
+
+```python
+def get_preview(item_id):
+    text = read_markdown(item_id)
+    width = ctx.preview_width or 80
+    return md2ansi(text, line_width=width)
+```
+
+Also accessible as `ctx.preview_width`. Safe to read from any thread.
 
 #### `browser.watch(callback, interval=None) -> threading.Thread`
 

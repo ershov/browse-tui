@@ -555,6 +555,18 @@ class Context:
         """
         return self._browser.preview_item_id
 
+    @property
+    def preview_width(self) -> int:
+        """Current width of the preview pane in terminal columns.
+
+        Pass-through to :meth:`Browser.preview_width`. Recomputed from
+        live geometry each call; returns ``0`` when the preview pane
+        isn't shown or terminal geometry can't be read. Callers wanting
+        a non-zero fallback should pick one explicitly, e.g.
+        ``ctx.preview_width or 80``.
+        """
+        return self._browser.preview_width
+
     def run_in_slot(self, name: str, fn) -> 'CancellationToken':
         """Run ``fn(token)`` in a daemon thread; supersede prior in slot.
 

@@ -2120,6 +2120,13 @@ class Browser:
         # dismiss the help overlay so the user sees the new item's
         # preview, not stale state from the previous one.
         self._preview_cursor_id = None
+        # Last computed width of the preview pane in terminal columns.
+        # Refreshed by ``_layout_for`` (050-render) on every render pass.
+        # Zero until the first paint, or while the preview pane isn't
+        # visible / terminal geometry can't be read. Exposed via the
+        # ``preview_width`` property so recipes can size word-wrap and
+        # markdown rendering to the live pane.
+        self._preview_width = 0
         # List-pane scroll offset (rows from top of the visible list).
         # Maintained by render_list to keep the cursor on-screen; lives
         # on Browser so partial redraws remember it across calls.
@@ -2838,6 +2845,24 @@ class Browser:
         check against ``preview_item_id`` rather than the row cursor.
         """
         return self._preview_cursor_id
+
+    @property
+    def preview_width(self) -> int:
+        """Current width of the preview pane in terminal columns.
+
+        Refreshed on every render by ``_layout_for`` (050-render.py) —
+        recipes calling this from ``get_preview`` see the value that
+        sized the *current* paint, so resizes (SIGWINCH),
+        ``set_list_ratio`` / ``set_split`` changes, and ``show_preview``
+        toggles all show up on the next preview fetch.
+
+        Returns ``0`` until the first paint, while the preview pane is
+        hidden, or when terminal geometry can't be read (headless tests,
+        ``term_size`` raising, no tty). Callers that want a non-zero
+        fallback should pick one explicitly, e.g.
+        ``browser.preview_width or 80``.
+        """
+        return self._preview_width
 
     def preview_to_tail(self) -> None:
         """(thread-safe) Pin the preview view to the bottom of its content.

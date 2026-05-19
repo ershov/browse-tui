@@ -17,6 +17,17 @@ import sys
 
 from browse_tui import Action, Browser, BrowserConfig, Item, upsert
 
+# Optional md2ansi plugin — colors ticket previews when available.
+try:
+    from md2ansi import md2ansi as _md2ansi_fn
+    if not callable(_md2ansi_fn):
+        _md2ansi_fn = None
+except Exception:
+    _md2ansi_fn = None
+
+_MD_COLOR = _md2ansi_fn is not None  # default on when available
+_BROWSER = None  # set in main() — used for preview-width lookup
+
 
 # ``plan`` is on PATH in normal use; fall back to the sandvault
 # binary so the recipe still runs in the test fixture / CI environment
@@ -201,7 +212,21 @@ def get_preview(item_id):
         result = _run_plan(str(item_id), 'get')
     if result.returncode != 0:
         return result.stderr.strip() or '(no preview)'
-    return result.stdout
+    text = result.stdout
+    if _MD_COLOR and _md2ansi_fn is not None:
+        try:
+            width = (_BROWSER.preview_width if _BROWSER else 0) or 80
+            return _md2ansi_fn(text, line_width=width)
+        except Exception:
+            pass
+    return text
+
+
+def _action_toggle_md(ctx):
+    global _MD_COLOR
+    _MD_COLOR = not _MD_COLOR
+    ctx.drop_preview_cache()
+    ctx.message(f'preview: {"colored" if _MD_COLOR else "raw"}')
 
 
 # ---- actions -------------------------------------------------------------
@@ -378,6 +403,7 @@ or selection seeds the actions below; the recipe shells out to the
 
 
 def main():
+    global _BROWSER
     initial_scope = None
     # Skip argv[1] when it's a flag (e.g. -h / --help) — Browser.run()'s
     # auto-detect short-circuits to print recipe-aware help, and parsing
@@ -389,6 +415,15 @@ def main():
         except ValueError:
             sys.stderr.write(f'browse-plan: invalid ticket id {sys.argv[1]!r}\n')
             sys.exit(2)
+
+    # 'm' is the move action by default; when md2ansi is available we
+    # rebind it to a coloured / raw toggle, and move shifts to 'M'.
+    if _md2ansi_fn is not None:
+        move_key, move_label = 'M', 'Move (re-parent or reorder)'
+        toggle_action = [Action('m', 'Toggle markdown coloring', _action_toggle_md, 'none')]
+    else:
+        move_key, move_label = 'm', 'Move (re-parent or reorder)'
+        toggle_action = []
 
     b = Browser(BrowserConfig(
         title='browse-plan',
@@ -404,13 +439,14 @@ def main():
             Action('V', 'View ticket recursively',              lambda ctx: _action_view(ctx, True),   'cursor'),
             Action('c', 'Create child ticket',                  lambda ctx: _action_create(ctx),       'cursor'),
             Action('C', 'Create children in bulk',              lambda ctx: _action_create(ctx, True), 'cursor'),
-            Action('m', 'Move (re-parent or reorder)',          _action_move,                          'targets'),
+            Action(move_key, move_label,                        _action_move,                          'targets'),
             Action('x', 'Close ticket',                         _action_close,                         'targets'),
             Action('o', 'Reopen closed ticket',                 _action_reopen,                        'targets'),
             Action('~', 'Show recent plan-CLI command log',     _action_command_log,                   'none'),
-        ],
+        ] + toggle_action,
         help_intro=_HELP_INTRO,
     ))
+    _BROWSER = b
     sys.exit(b.run())
 
 

@@ -2325,6 +2325,14 @@ def _layout_for(browser):
     layout['list_rightmost'] = _is_rightmost(layout.get('list'))
     layout['children_rightmost'] = _is_rightmost(layout.get('children'))
     layout['preview_rightmost'] = _is_rightmost(layout.get('preview'))
+    # Cache the live preview-pane width on the Browser so ``get_preview``
+    # callbacks (and other recipe code) can size markdown wrap / frames
+    # to the actual pane without re-deriving the layout. Zero when the
+    # preview pane isn't visible.
+    prect = layout.get('preview')
+    browser._preview_width = (
+        prect.width if prect is not None and prect.width > 0 else 0
+    )
     # The info bar always spans the full width in current layouts (the
     # pane separator that owns it is full-width by construction), so
     # it's rightmost whenever it exists.
