@@ -74,6 +74,17 @@ _LIST_FORMAT = (
 # ---- subprocess helpers --------------------------------------------------
 
 
+# Plan file selector. Set by ``main`` from ``-f FILE`` / ``--file FILE`` on
+# the recipe argv; ``None`` means the plan CLI picks the file itself
+# (PLAN_MD env var, .PLAN.md auto-discovery — see ``plan --help``).
+_PLAN_FILE = None
+
+
+def _plan_argv():
+    """Base ``plan`` argv with ``-f FILE`` prepended when set."""
+    return [PLAN_BIN] + (['-f', _PLAN_FILE] if _PLAN_FILE else [])
+
+
 def _run_plan(*args, capture=True):
     """Run ``plan`` with argv ``args`` and return ``CompletedProcess``.
 
@@ -81,7 +92,7 @@ def _run_plan(*args, capture=True):
     a synthetic non-zero result so callers can surface the error
     uniformly via the ``ctx.error`` channel.
     """
-    full = [PLAN_BIN] + list(args)
+    full = _plan_argv() + list(args)
     try:
         return subprocess.run(
             full,
@@ -273,7 +284,7 @@ def _action_edit(ctx, recursive=False):
     """Open ``$EDITOR`` on the cursor ticket via ``plan edit``."""
     if ctx.cursor is None:
         return
-    cmd = [PLAN_BIN, 'edit']
+    cmd = _plan_argv() + ['edit']
     if recursive:
         cmd.append('-r')
     cmd.append('project' if ctx.cursor.id == 0 else str(ctx.cursor.id))
@@ -308,7 +319,7 @@ def _action_create(ctx, recursive=False):
     label = 'create -r' if recursive else 'create'
 
     def on_confirm(relation, dest_id):
-        cmd = [PLAN_BIN, 'create', '-e']
+        cmd = _plan_argv() + ['create', '-e']
         if recursive:
             cmd.append('-r')
         cmd.append(f'title="New ticket", move="{relation} {dest_id}"')
@@ -391,7 +402,9 @@ def _action_command_log(ctx):
 _HELP_INTRO = """\
 browse-plan — drop-in replacement for plan-tui on the browse-tui core.
 
-Usage: browse-plan [TICKET_ID]
+Usage: browse-plan [-f FILE] [TICKET_ID]
+  -f FILE      Plan file to operate on (passed through to ``plan -f FILE``).
+  --file FILE  Long alias for -f.
   TICKET_ID    Numeric ticket id to drill into on launch (sets the initial
                scope). Without an id, the tree opens at the project root.
 
@@ -402,8 +415,33 @@ or selection seeds the actions below; the recipe shells out to the
 """
 
 
+def _pop_file_arg():
+    """Pop ``-f FILE`` / ``--file FILE`` (and ``=FILE``) from sys.argv.
+
+    Returns the file path or ``None``. Mutates ``sys.argv`` in place so
+    the positional TICKET_ID parser below sees a clean argv.
+    """
+    i = 1
+    while i < len(sys.argv):
+        a = sys.argv[i]
+        if a in ('-f', '--file'):
+            if i + 1 >= len(sys.argv):
+                sys.stderr.write(f'browse-plan: {a} requires a FILE argument\n')
+                sys.exit(2)
+            value = sys.argv[i + 1]
+            del sys.argv[i:i + 2]
+            return value
+        if a.startswith('-f=') or a.startswith('--file='):
+            value = a.split('=', 1)[1]
+            del sys.argv[i]
+            return value
+        i += 1
+    return None
+
+
 def main():
-    global _BROWSER
+    global _BROWSER, _PLAN_FILE
+    _PLAN_FILE = _pop_file_arg()
     initial_scope = None
     # Skip argv[1] when it's a flag (e.g. -h / --help) — Browser.run()'s
     # auto-detect short-circuits to print recipe-aware help, and parsing
