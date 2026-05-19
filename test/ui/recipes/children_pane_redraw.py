@@ -21,7 +21,7 @@ Usage:
 
 import sys
 
-from browse_tui import Browser, Item
+from browse_tui import Browser, BrowserConfig, Item
 
 
 def main():
@@ -59,11 +59,11 @@ def main():
             return 'preview-of-C\n' * 5
         return f'preview:{item_id}'
 
-    b = Browser(
+    b = Browser(BrowserConfig(
         get_children=get_children,
         get_preview=get_preview,
         show_ids='always',
-    )
+    ))
     sys.exit(b.run())
 
 

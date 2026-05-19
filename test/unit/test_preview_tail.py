@@ -64,6 +64,7 @@ _actions.Mode = _state.Mode
 
 Item = _data.Item
 Browser = _state.Browser
+BrowserConfig = _state.BrowserConfig
 Context = _context.Context
 dispatch_key = _actions.dispatch_key
 
@@ -75,7 +76,7 @@ def _make_browser(preview_text='', **kw):
 
     kw.setdefault('_headless', True)
     kw.setdefault('get_preview', gp)
-    b = Browser(**kw)
+    b = Browser(BrowserConfig(**kw))
     b._state._children[None] = [_data.to_item(Item(id='a'))]
     _state.mark_visible_dirty(b._state)
     b._state._preview['a'] = preview_text

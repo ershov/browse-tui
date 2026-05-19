@@ -37,7 +37,7 @@ import subprocess
 import sys
 import threading
 
-from browse_tui import Action, Browser, Item
+from browse_tui import Action, Browser, BrowserConfig, Item
 
 
 _ERROR_ID = '__error__'
@@ -361,7 +361,7 @@ def main():
     _search_limit = _pop_limit_arg(_SEARCH_LIMIT)
     jql = _resolve_jql()
     title = 'browse-jira-mcp' if jql == _JQL_DEFAULT else f'browse-jira-mcp: {jql}'
-    sys.exit(Browser(
+    sys.exit(Browser(BrowserConfig(
         title=title,
         get_children=get_children,
         get_preview=get_preview,
@@ -372,7 +372,7 @@ def main():
         help_intro=_HELP_INTRO_TMPL.format(
             jql=jql, default=_SEARCH_LIMIT, limit=_search_limit,
         ),
-    ).run())
+    )).run())
 
 
 if __name__ == '__main__':

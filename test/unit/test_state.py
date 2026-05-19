@@ -25,6 +25,7 @@ _state.to_item = _data.to_item
 _state.notify_wake = _term.notify_wake
 
 Browser = _state.Browser
+BrowserConfig = _state.BrowserConfig
 _clamp_split = _state._clamp_split
 _VALID_SPLITS = _state._VALID_SPLITS
 
@@ -62,25 +63,25 @@ class TestBrowserSplitConstructor(unittest.TestCase):
     def test_default_split_resolves_auto(self):
         # Default is 'auto' which resolves via term_size; in headless
         # 80-col tests that yields 'h'.
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         self.assertEqual(b.split, 'h')
 
     def test_all_valid_splits_stick(self):
         for code in _VALID_SPLITS:
-            b = Browser(split=code, _headless=True)
+            b = Browser(BrowserConfig(split=code, _headless=True))
             self.assertEqual(b.split, code)
 
     def test_invalid_split_defaults_to_h(self):
         for bad in ('zz', '', 'horizontal'):
-            b = Browser(split=bad, _headless=True)
+            b = Browser(BrowserConfig(split=bad, _headless=True))
             self.assertEqual(b.split, 'h')
 
     def test_none_split_defaults_to_h(self):
-        b = Browser(split=None, _headless=True)
+        b = Browser(BrowserConfig(split=None, _headless=True))
         self.assertEqual(b.split, 'h')
 
     def test_non_string_split_defaults_to_h(self):
-        b = Browser(split=42, _headless=True)
+        b = Browser(BrowserConfig(split=42, _headless=True))
         self.assertEqual(b.split, 'h')
 
 
@@ -93,33 +94,33 @@ class TestBrowserSetSplit(unittest.TestCase):
     """
 
     def test_set_split_stores_valid_value(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         b._needs_redraw.clear()
         b.set_split('v')
         b.drain_main_queue()
         self.assertEqual(b.split, 'v')
 
     def test_set_split_marks_full_redraw(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         b._needs_redraw.clear()
         b.set_split('m')
         b.drain_main_queue()
         self.assertIn('all', b._needs_redraw)
 
     def test_set_split_clamps_invalid(self):
-        b = Browser(split='v', _headless=True)
+        b = Browser(BrowserConfig(split='v', _headless=True))
         b.set_split('garbage')
         b.drain_main_queue()
         self.assertEqual(b.split, 'h')
 
     def test_set_split_clamps_none(self):
-        b = Browser(split='v', _headless=True)
+        b = Browser(BrowserConfig(split='v', _headless=True))
         b.set_split(None)
         b.drain_main_queue()
         self.assertEqual(b.split, 'h')
 
     def test_set_split_each_valid_round_trip(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         for code in _VALID_SPLITS:
             b.set_split(code)
             b.drain_main_queue()
@@ -130,7 +131,7 @@ class TestBrowserSetSplitDeferred(unittest.TestCase):
     """``set_split`` defers mutation to the main-thread drain (#265)."""
 
     def test_set_split_does_not_mutate_until_drained(self):
-        b = Browser(split='h', _headless=True)
+        b = Browser(BrowserConfig(split='h', _headless=True))
         b.set_split('v')
         # Before drain: state is unchanged.
         self.assertEqual(b.split, 'h')
@@ -141,7 +142,7 @@ class TestBrowserSetSplitDeferred(unittest.TestCase):
     def test_do_set_split_clamps_synchronously(self):
         # The private worker is the synchronous path; existing
         # clamp behaviour is preserved through it.
-        b = Browser(split='v', _headless=True)
+        b = Browser(BrowserConfig(split='v', _headless=True))
         b._do_set_split('garbage')
         self.assertEqual(b.split, 'h')
         b._do_set_split('m')
@@ -152,7 +153,7 @@ class TestBrowserSetListRatioDeferred(unittest.TestCase):
     """``set_list_ratio`` defers mutation to the main-thread drain (#265)."""
 
     def test_set_list_ratio_does_not_mutate_until_drained(self):
-        b = Browser(list_ratio=0.5, _headless=True)
+        b = Browser(BrowserConfig(list_ratio=0.5, _headless=True))
         b.set_list_ratio(0.25)
         # Before drain: state is unchanged.
         self.assertEqual(b.list_ratio, 0.5)
@@ -161,14 +162,14 @@ class TestBrowserSetListRatioDeferred(unittest.TestCase):
 
     def test_do_set_list_ratio_clamps_synchronously(self):
         # Clamp gate still works via the private worker.
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         b._do_set_list_ratio(2.0)
         self.assertEqual(b.list_ratio, _state._LIST_RATIO_MAX)
         b._do_set_list_ratio(-1.0)
         self.assertEqual(b.list_ratio, _state._LIST_RATIO_MIN)
 
     def test_set_list_ratio_marks_full_redraw_after_drain(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         b._needs_redraw.clear()
         b.set_list_ratio(0.4)
         b.drain_main_queue()
@@ -179,7 +180,7 @@ class TestBrowserSetChildren(unittest.TestCase):
     """``set_children`` (#265) lets recipe-owned threads inject results."""
 
     def test_set_children_appears_after_apply(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         # Pre-condition: no cached children for 'p'.
         self.assertNotIn('p', b._state._children)
         b.set_children('p', [{'id': 'a'}, {'id': 'b'}])
@@ -189,7 +190,7 @@ class TestBrowserSetChildren(unittest.TestCase):
         self.assertEqual([k.id for k in kids], ['a', 'b'])
 
     def test_set_children_coerces_plain_dicts(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         b.set_children('p', [{'id': 'a', 'title': 'A'}])
         b.apply_children_results()
         kids = b._state._children['p']
@@ -199,7 +200,7 @@ class TestBrowserSetChildren(unittest.TestCase):
         self.assertEqual(kids[0].title, 'A')
 
     def test_set_children_from_worker_thread_appears(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         # Pre-fill an unrelated cache entry to ensure isolation.
         done = threading.Event()
 
@@ -217,7 +218,7 @@ class TestBrowserSetChildren(unittest.TestCase):
         self.assertEqual([k.id for k in kids], ['x'])
 
     def test_set_children_multiple_threads_queue_fifo(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         # Two threads append, with a barrier so the order in the
         # deque is deterministic per call (each call appends one
         # entry under the GIL; the test guards order at the call
@@ -258,14 +259,14 @@ class TestBrowserSetPreview(unittest.TestCase):
     """``set_preview`` (#265) lets recipe-owned threads inject previews."""
 
     def test_set_preview_appears_after_apply(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         b.set_preview('a', 'hello')
         applied = b.apply_preview_result()
         self.assertTrue(applied)
         self.assertEqual(b._state._preview['a'], 'hello')
 
     def test_set_preview_latest_wins_before_apply(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         b.set_preview('a', 'first')
         b.set_preview('a', 'second')
         applied = b.apply_preview_result()
@@ -273,14 +274,14 @@ class TestBrowserSetPreview(unittest.TestCase):
         self.assertEqual(b._state._preview['a'], 'second')
 
     def test_set_preview_none_coerces_to_empty(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         b.set_preview('a', None)
         applied = b.apply_preview_result()
         self.assertTrue(applied)
         self.assertEqual(b._state._preview['a'], '')
 
     def test_set_preview_from_worker_thread_appears(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         done = threading.Event()
 
         def worker():
@@ -473,7 +474,7 @@ class TestBrowserPaneCacheInit(unittest.TestCase):
     """Browser.__init__ initialises ``_pane_cache`` to an empty dict."""
 
     def test_pane_cache_starts_empty(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         self.assertEqual(b._pane_cache, {})
         self.assertIsInstance(b._pane_cache, dict)
 
@@ -482,15 +483,15 @@ class TestBrowserPreviewAnsi(unittest.TestCase):
     """Browser.__init__ accepts ``preview_ansi`` (default True) — #244."""
 
     def test_default_is_true(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         self.assertTrue(b.preview_ansi)
 
     def test_explicit_false_stored(self):
-        b = Browser(preview_ansi=False, _headless=True)
+        b = Browser(BrowserConfig(preview_ansi=False, _headless=True))
         self.assertFalse(b.preview_ansi)
 
     def test_explicit_true_stored(self):
-        b = Browser(preview_ansi=True, _headless=True)
+        b = Browser(BrowserConfig(preview_ansi=True, _headless=True))
         self.assertTrue(b.preview_ansi)
 
 

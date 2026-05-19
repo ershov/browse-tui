@@ -55,6 +55,7 @@ _actions._fmt_child = _render._fmt_child
 
 Item = _data.Item
 Browser = _state.Browser
+BrowserConfig = _state.BrowserConfig
 Mode = _state.Mode
 Action = _actions.Action
 default_actions = _actions.default_actions
@@ -85,7 +86,7 @@ class _FakeContext:
 def _make_browser(**kw):
     """Build a headless Browser; tests call stop_workers in tearDown."""
     kw.setdefault('_headless', True)
-    return Browser(**kw)
+    return Browser(BrowserConfig(**kw))
 
 
 def _ctx_for(browser):

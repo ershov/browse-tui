@@ -16,7 +16,7 @@ Usage:
 import os
 import sys
 
-from browse_tui import Action, Browser, Item
+from browse_tui import Action, Browser, BrowserConfig, Item
 
 
 def _logfile():
@@ -59,7 +59,7 @@ def _confirm_or_cancel(_ctx):
 
 
 def main():
-    b = Browser(
+    b = Browser(BrowserConfig(
         get_children=_get_children,
         actions=[
             Action('c', 'Create', _do_insert, 'cursor'),
@@ -68,7 +68,7 @@ def main():
         # Force the id segment on every row so UI tests can assert on a
         # stable shape regardless of whether id == title.
         show_ids='always',
-    )
+    ))
     sys.exit(b.run())
 
 

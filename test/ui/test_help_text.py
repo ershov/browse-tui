@@ -288,12 +288,12 @@ class TestRecipeHelpFlag(unittest.TestCase):
             with open(script, 'w') as f:
                 f.write(
                     "import argparse, sys\n"
-                    "from browse_tui import Browser, Item\n"
+                    "from browse_tui import Browser, BrowserConfig, Item\n"
                     "p = argparse.ArgumentParser(prog='custom_recipe',\n"
                     "    description='RECIPE-OWN-HELP-MARKER')\n"
                     "p.add_argument('--mode', default='default')\n"
                     "args = p.parse_args()\n"
-                    "b = Browser(get_children=lambda _id: [Item('x')])\n"
+                    "b = Browser(BrowserConfig(get_children=lambda _id: [Item('x')]))\n"
                     "sys.exit(b.run())\n"
                 )
             out = subprocess.run(

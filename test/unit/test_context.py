@@ -49,13 +49,14 @@ _context.layout_panes = _render.layout_panes
 
 Item = _data.Item
 Browser = _state.Browser
+BrowserConfig = _state.BrowserConfig
 Pending = _state.Pending
 Context = _context.Context
 
 
 def _make_browser(**kw):
     kw.setdefault('_headless', True)
-    return Browser(**kw)
+    return Browser(BrowserConfig(**kw))
 
 
 # --- Construction ---------------------------------------------------------

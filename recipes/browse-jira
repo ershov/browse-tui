@@ -25,7 +25,7 @@ import shutil
 import subprocess
 import sys
 
-from browse_tui import Action, Browser, Item
+from browse_tui import Action, Browser, BrowserConfig, Item
 
 
 _ERROR_ID = '__error__'
@@ -125,7 +125,7 @@ single error row.\
 
 
 def main():
-    sys.exit(Browser(
+    sys.exit(Browser(BrowserConfig(
         title='browse-jira',
         get_children=get_children,
         get_preview=get_preview,
@@ -134,7 +134,7 @@ def main():
                    open_in_browser, 'cursor'),
         ],
         help_intro=_HELP_INTRO,
-    ).run())
+    )).run())
 
 
 if __name__ == '__main__':

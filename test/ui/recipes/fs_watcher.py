@@ -11,7 +11,7 @@ contents change. Used by the background-update UI test.
 import sys
 import time
 
-from browse_tui import Browser, Item
+from browse_tui import Browser, BrowserConfig, Item
 
 
 def main():
@@ -27,7 +27,7 @@ def main():
 
     # show_ids='always' keeps the rendered shape stable for UI tests
     # even though the recipe sets id == title.
-    b = Browser(get_children=get_children, show_ids='always')
+    b = Browser(BrowserConfig(get_children=get_children, show_ids='always'))
 
     def watcher(browser):
         last = None

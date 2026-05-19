@@ -21,6 +21,7 @@ _state.notify_wake = _term.notify_wake
 
 # Re-export the names tests want.
 Browser = _state.Browser
+BrowserConfig = _state.BrowserConfig
 Pending = _state.Pending
 State = _state.State
 Item = _data.Item
@@ -33,6 +34,6 @@ def make_browser(**kw):
     out of subsequent tests.
     """
     kw.setdefault('_headless', True)
-    b = Browser(**kw)
+    b = Browser(BrowserConfig(**kw))
     b.start_workers()
     return b

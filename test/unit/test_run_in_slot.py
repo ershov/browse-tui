@@ -23,6 +23,7 @@ _state.notify_wake = _term.notify_wake
 _context.visible_items = _state.visible_items
 
 Browser = _state.Browser
+BrowserConfig = _state.BrowserConfig
 Context = _context.Context
 CancellationToken = _state.CancellationToken
 
@@ -48,7 +49,7 @@ class TestCancellationToken(unittest.TestCase):
 class TestRunInSlot(unittest.TestCase):
 
     def test_returns_token(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         done = threading.Event()
         token = b.run_in_slot('s', lambda t: done.set())
         done.wait(timeout=2.0)
@@ -56,7 +57,7 @@ class TestRunInSlot(unittest.TestCase):
 
     def test_resubmission_cancels_prior(self):
         # First worker spins on its token; second submission cancels it.
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         first_started = threading.Event()
         first_exited = threading.Event()
 
@@ -76,7 +77,7 @@ class TestRunInSlot(unittest.TestCase):
         self.assertTrue(first_exited.is_set())
 
     def test_different_slots_are_independent(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         t1 = b.run_in_slot('a', lambda token: time.sleep(0.05))
         t2 = b.run_in_slot('b', lambda token: time.sleep(0.05))
         # Neither is cancelled — different slots.
@@ -84,7 +85,7 @@ class TestRunInSlot(unittest.TestCase):
         self.assertFalse(t2.is_cancelled())
 
     def test_exception_routed_to_error(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         done = threading.Event()
         def bad(token):
             done.set()
@@ -101,7 +102,7 @@ class TestRunInSlot(unittest.TestCase):
         self.assertIn('run_in_slot', b.error_text)
 
     def test_slot_entry_removed_on_exit(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         done = threading.Event()
         b.run_in_slot('s', lambda token: done.set())
         done.wait(timeout=2.0)
@@ -116,7 +117,7 @@ class TestRunInSlot(unittest.TestCase):
 class TestContextPassthrough(unittest.TestCase):
 
     def test_ctx_run_in_slot(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         ctx = Context(b)
         done = threading.Event()
         token = ctx.run_in_slot('s', lambda t: done.set())

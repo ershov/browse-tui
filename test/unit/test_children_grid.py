@@ -37,6 +37,7 @@ _render.Item = _data.Item
 Item = _data.Item
 State = _state.State
 Browser = _state.Browser
+BrowserConfig = _state.BrowserConfig
 visible_items = _state.visible_items
 
 layout_panes = _render.layout_panes

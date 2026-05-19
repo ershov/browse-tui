@@ -41,6 +41,7 @@ def _stub_browse_tui():
 
     mod.Action = _Stub
     mod.Browser = _Stub
+    mod.BrowserConfig = _Stub
     mod.Item = _Stub
     # ``upsert`` is a push-API op constructor used by the live-tail
     # worker. Tests don't exercise the framework's actual op-apply

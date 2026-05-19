@@ -33,7 +33,7 @@ import subprocess
 import sys
 import threading
 
-from browse_tui import Action, Browser, Item
+from browse_tui import Action, Browser, BrowserConfig, Item
 
 
 _ERROR_ID = '__error__'
@@ -295,7 +295,7 @@ def main():
     cmd = sys.argv[1:]
     _client = _MCPClient(cmd)
     title = f'browse-mcp: {" ".join(cmd)}'
-    sys.exit(Browser(
+    sys.exit(Browser(BrowserConfig(
         title=title,
         get_children=get_children,
         get_preview=get_preview,
@@ -303,7 +303,7 @@ def main():
             Action('a', 'About server (serverInfo)', show_about, 'none'),
         ],
         help_intro=_HELP_INTRO,
-    ).run())
+    )).run())
 
 
 if __name__ == '__main__':

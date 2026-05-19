@@ -87,6 +87,7 @@ _actions._fmt_child = _render._fmt_child
 
 Item = _data.Item
 Browser = _state.Browser
+BrowserConfig = _state.BrowserConfig
 Rect = _render.Rect
 
 
@@ -134,7 +135,7 @@ def _make_browser(items=None, **kw):
 
     kw.setdefault('_headless', True)
     kw.setdefault('get_children', gc)
-    b = Browser(**kw)
+    b = Browser(BrowserConfig(**kw))
     # Force the root children to be cached up front so visible_items has
     # something to traverse.
     b._state._children[None] = [_data.to_item(it) for it in items]

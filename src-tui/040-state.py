@@ -11,6 +11,14 @@ from dataclasses import dataclass, field, fields as _dc_fields
 from typing import Any, Callable, Optional
 
 
+# Cross-module symbol: ``registered_plugins`` is defined by
+# ``035-plugins.py`` in the concatenated build. When this file is
+# loaded standalone (tests), ``setdefault`` installs an empty list
+# so Browser construction with no plugins behaves correctly. Tests
+# that need plugin behaviour rewire the attribute explicitly.
+globals().setdefault('registered_plugins', [])
+
+
 class Mode(enum.Enum):
     """User-input dispatch mode for the Browser key handler.
 
@@ -1707,6 +1715,43 @@ def _clamp_split(s) -> str:
     return 'h'
 
 
+@dataclass
+class BrowserConfig:
+    """Construction parameters for :class:`Browser`.
+
+    Every previous ``Browser(**kwargs)`` keyword argument is a field
+    here. Plugins may mutate this dataclass in ``on_before_init``
+    hooks to influence what the Browser becomes; ``Browser.__init__``
+    reads the fields once, after firing those hooks.
+    """
+    title: str = 'browse-tui'
+    get_children: Optional[Callable[[Any], Any]] = None
+    get_preview: Optional[Callable[[Any], Optional[str]]] = None
+    actions: Optional[list] = None
+    on_enter: Any = None
+    format_item: Optional[Callable] = None
+    root_id: Any = None
+    initial_scope: Any = None
+    show_preview: bool = True
+    show_children_pane: bool = True
+    preview_ansi: bool = True
+    list_ratio: float = 0.30
+    split: str = 'auto'
+    multi_select: bool = True
+    print_format: str = '{id}'
+    help_intro: Optional[str] = None
+    help_outro: Optional[str] = None
+    show_ids: str = 'auto'
+    show_scope_crumb: bool = False
+    preview_buffer_cap_chars: int = 100_000
+    preview_buffer_cap_lines: int = 1000
+    on_cursor_change: Optional[Callable] = None
+    on_scope_change: Optional[Callable] = None
+    on_selection_change: Optional[Callable] = None
+    on_quit: Optional[Callable] = None
+    _headless: bool = False
+
+
 class Browser:
     """The TUI engine and async coordinator.
 
@@ -1753,33 +1798,7 @@ class Browser:
                           branches on it once #9 lands.
     """
 
-    def __init__(self, *,
-                 title: str = 'browse-tui',
-                 get_children: Optional[Callable[[Any], Any]] = None,
-                 get_preview: Optional[Callable[[Any], Optional[str]]] = None,
-                 actions: Optional[list] = None,
-                 on_enter: Any = None,
-                 format_item: Optional[Callable] = None,
-                 root_id: Any = None,
-                 initial_scope: Any = None,
-                 show_preview: bool = True,
-                 show_children_pane: bool = True,
-                 preview_ansi: bool = True,
-                 list_ratio: float = 0.30,
-                 split: str = 'auto',
-                 multi_select: bool = True,
-                 print_format: str = '{id}',
-                 help_intro: Optional[str] = None,
-                 help_outro: Optional[str] = None,
-                 show_ids: str = 'auto',
-                 show_scope_crumb: bool = False,
-                 preview_buffer_cap_chars: int = 100_000,
-                 preview_buffer_cap_lines: int = 1000,
-                 on_cursor_change: Optional[Callable] = None,
-                 on_scope_change: Optional[Callable] = None,
-                 on_selection_change: Optional[Callable] = None,
-                 on_quit: Optional[Callable] = None,
-                 _headless: bool = False) -> None:
+    def __init__(self, config: Optional['BrowserConfig'] = None) -> None:
         """Construct a Browser.
 
         All keyword arguments are optional; sensible defaults yield a
@@ -1878,27 +1897,41 @@ class Browser:
                 cleanup hook should not block exit).
             _headless: Skip terminal init/teardown — used by tests.
         """
-        if show_ids not in ('always', 'auto', 'never'):
+        if config is None:
+            config = BrowserConfig()
+        # Plugin hook: ``on_before_init`` fires with ``self`` (empty
+        # at this point — barely any attributes set) and ``config``,
+        # which plugins may mutate to influence what the Browser
+        # becomes. Hooks run in registration order; exceptions
+        # propagate. All field reads below go through ``config`` so
+        # plugin mutations are picked up.
+        for _plugin_cfg in registered_plugins:
+            if _plugin_cfg.on_before_init is not None:
+                _plugin_cfg.on_before_init(self, config)
+
+        if config.show_ids not in ('always', 'auto', 'never'):
             raise ValueError(
                 "show_ids must be one of 'always', 'auto', 'never'; "
-                f"got {show_ids!r}"
+                f"got {config.show_ids!r}"
             )
         # --- user-supplied data callbacks -------------------------------
         # Default get_children to "no children" so a Browser constructed
         # with no kwargs still works (tests, smoke checks). get_preview
         # stays None -- the preview worker treats None as "always returns
         # ''" rather than calling a no-op lambda needlessly.
-        self.title = title
-        self.get_children = get_children or (lambda _id: [])
-        self.get_preview = get_preview
+        self.title = config.title
+        self.get_children = config.get_children or (lambda _id: [])
+        self.get_preview = config.get_preview
         # actions/on_enter/format_item are stored opaquely in phase 1;
         # tickets #11 (Context) and #12 (action keymap) read them.
-        self.actions = list(actions) if actions is not None else []
-        self.on_enter = on_enter
-        self.format_item = format_item
-        self.show_preview = show_preview
-        self.show_children_pane = show_children_pane
-        self.show_scope_crumb = show_scope_crumb
+        self.actions = (
+            list(config.actions) if config.actions is not None else []
+        )
+        self.on_enter = config.on_enter
+        self.format_item = config.format_item
+        self.show_preview = config.show_preview
+        self.show_children_pane = config.show_children_pane
+        self.show_scope_crumb = config.show_scope_crumb
         # Honour ANSI SGR escapes in the preview pane (default True).
         # Toggled at runtime via capital-R; see ``_toggle_preview_ansi``
         # in 070-actions.py. The cache invalidation is naturally handled
@@ -1906,29 +1939,29 @@ class Browser:
         # renderer — colour-bearing rows produce different bytes when
         # SGR re-emit is suppressed, so they redraw; plain rows produce
         # identical bytes and stay cache-hit (#240 design note).
-        self.preview_ansi = preview_ansi
+        self.preview_ansi = config.preview_ansi
         # Fraction of total terminal rows allocated to the list pane.
         # Stored as a float so it survives terminal resizes without
         # rounding drift; clamped to a usable range by ``set_list_ratio``.
         # The ratio covers list / (list + children-grid + preview) per
         # the model: children pane stays content-driven, preview gets
         # the remainder.
-        self.list_ratio = _clamp_list_ratio(list_ratio)
+        self.list_ratio = _clamp_list_ratio(config.list_ratio)
         # Split-layout selector — controls which family of pane geometries
         # ``layout_panes`` produces. Default ``'auto'`` resolves at
         # construction time via ``_clamp_split`` (vertical at >=230 cols,
         # else horizontal) so Python recipes that construct Browser
         # directly get the same auto behaviour as ``--split-type=auto``.
-        self.split = _clamp_split(split)
-        self.multi_select = multi_select
-        self.print_format = print_format
+        self.split = _clamp_split(config.split)
+        self.multi_select = config.multi_select
+        self.print_format = config.print_format
         # help_intro/help_outro are prose blurbs shown above/below the
         # auto-generated key list in --help and the in-app help screen
         # (?). Recipes set them to explain what their tool does;
         # ``None`` (the default) elides the corresponding section.
-        self.help_intro = help_intro
-        self.help_outro = help_outro
-        self.show_ids = show_ids
+        self.help_intro = config.help_intro
+        self.help_outro = config.help_outro
+        self.show_ids = config.show_ids
         # User-supplied lifecycle hooks. ``on_cursor_change`` is fired
         # at most once per main-loop tick; ``_cursor_change_pending``
         # latches between mark_cursor_changed and the drain, and
@@ -1938,10 +1971,10 @@ class Browser:
         # scope_into / scope_out transition (main-thread paths only).
         # ``on_quit`` fires once during shutdown after the screen is
         # restored.
-        self._on_cursor_change = on_cursor_change
-        self._on_scope_change = on_scope_change
-        self._on_selection_change = on_selection_change
-        self._on_quit = on_quit
+        self._on_cursor_change = config.on_cursor_change
+        self._on_scope_change = config.on_scope_change
+        self._on_selection_change = config.on_selection_change
+        self._on_quit = config.on_quit
         # Worker-slot registry for ``run_in_slot``. Each entry is the
         # currently-active CancellationToken for a named slot;
         # superseded tokens are removed lazily by the worker on exit.
@@ -1949,20 +1982,20 @@ class Browser:
         self._slots_lock = threading.Lock()
         self._cursor_change_pending = False
         self._last_cursor_id = None
-        self._headless = _headless
+        self._headless = config._headless
 
         # --- domain state ------------------------------------------------
         # State stays a separate dataclass so unit tests can poke it
         # without spinning up a Browser. The preview cache lives on State
         # alongside _children for cohesion (one place to invalidate
         # everything per item id).
-        self._state = State(root_id=root_id)
+        self._state = State(root_id=config.root_id)
         self._state._preview = {}  # item_id -> preview text
         # Apply ``initial_scope`` after State is built so scope_into can
         # do its bookkeeping (saving the empty pre-scope expanded set
         # under the prior scope key).
-        if initial_scope is not None:
-            scope_into(self._state, initial_scope)
+        if config.initial_scope is not None:
+            scope_into(self._state, config.initial_scope)
 
         # --- cross-thread plumbing --------------------------------------
         # main_queue: any thread -> main thread. Drained by drain_main_queue
@@ -2010,8 +2043,8 @@ class Browser:
         # ``_preview_lock`` serialises mutations across the worker
         # thread and the main thread (request_preview uses it to
         # observe / clear the paused state when superseding).
-        self._preview_buffer_cap_chars = int(preview_buffer_cap_chars)
-        self._preview_buffer_cap_lines = int(preview_buffer_cap_lines)
+        self._preview_buffer_cap_chars = int(config.preview_buffer_cap_chars)
+        self._preview_buffer_cap_lines = int(config.preview_buffer_cap_lines)
         self._preview_lock = threading.Lock()
         self._preview_paused = None  # dict(id, gen, chars, lines) or None
         # #274: demand-resume flag. Set by ``signal_preview_demand``
@@ -2177,6 +2210,14 @@ class Browser:
         self._insert_depth = 0
         self._insert_callback = None
         self._insert_label = ''
+
+        # Plugin hook: ``on_after_init`` fires with the fully-built
+        # Browser. Plugins use this for monkey-patching instance
+        # methods or attaching per-Browser state. Hooks run in
+        # registration order; exceptions propagate.
+        for _plugin_cfg in registered_plugins:
+            if _plugin_cfg.on_after_init is not None:
+                _plugin_cfg.on_after_init(self)
 
     # ---- action registration -------------------------------------------
 
@@ -4292,6 +4333,15 @@ class Browser:
                 self._reanchor_cursor()
             render_full(self)
 
+        # Plugin hook: ``on_before_run`` fires after construction is
+        # complete and the workers/render are wired, just before the
+        # event loop starts. Plugins use this for last-minute key
+        # binding overrides or kicking off background tasks. Hooks
+        # run in registration order; exceptions propagate.
+        for _plugin_cfg in registered_plugins:
+            if _plugin_cfg.on_before_run is not None:
+                _plugin_cfg.on_before_run(self)
+
         try:
             while not self._quit_requested:
                 # Drain pending updates from any thread, then render if
@@ -4394,6 +4444,14 @@ class Browser:
             # ``run`` returns. Exceptions swallowed (see
             # ``_fire_on_quit``).
             self._fire_on_quit()
+            # Plugin hook: ``on_after_run`` fires inside the finally
+            # so cleanup runs even when the event loop exits via
+            # exception. Hooks run in registration order; exceptions
+            # propagate (and may replace an in-flight exception, per
+            # Python's finally semantics).
+            for _plugin_cfg in registered_plugins:
+                if _plugin_cfg.on_after_run is not None:
+                    _plugin_cfg.on_after_run(self)
 
         # After teardown — print captured output (e.g. from on_enter
         # print-exit). Done outside the alternate screen so the user's
@@ -4992,7 +5050,7 @@ class Browser:
 
         browser_kwargs.setdefault('get_children', _get_children_eager)
         browser_kwargs.setdefault('root_id', root_id)
-        b = cls(**browser_kwargs)
+        b = cls(BrowserConfig(**browser_kwargs))
         # Pre-populate the cache via a single ``update_data`` batch so
         # visible_items() and apply_*_results see it immediately; no
         # fetch happens at runtime unless the caller invokes ``refresh``

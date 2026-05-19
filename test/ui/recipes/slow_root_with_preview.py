@@ -13,7 +13,7 @@ Usage:  browse-tui --run-py slow_root_with_preview.py [DELAY]
 import sys
 import time
 
-from browse_tui import Browser, Item
+from browse_tui import Browser, BrowserConfig, Item
 
 
 def main():
@@ -30,11 +30,11 @@ def main():
     def get_preview(item_id):
         return f'PREVIEW:{item_id}\nline2\nline3'
 
-    b = Browser(
+    b = Browser(BrowserConfig(
         get_children=get_children,
         get_preview=get_preview,
         show_ids='always',
-    )
+    ))
     sys.exit(b.run())
 
 

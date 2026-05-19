@@ -21,6 +21,7 @@ _state.notify_wake = _term.notify_wake
 _context.visible_items = _state.visible_items
 
 Browser = _state.Browser
+BrowserConfig = _state.BrowserConfig
 Context = _context.Context
 
 
@@ -38,7 +39,7 @@ def _seed(b):
 class TestSelectAllVisible(unittest.TestCase):
 
     def test_selects_visible(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         _seed(b)
         b.select_all_visible()
         b.drain_main_queue()
@@ -46,7 +47,7 @@ class TestSelectAllVisible(unittest.TestCase):
         self.assertEqual(b._state.selected, {'a', 'b', 'c'})
 
     def test_drops_invisible_previously_selected(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         _seed(b)
         # Pre-select an item under a collapsed parent.
         b._state.selected = {'a1'}
@@ -60,7 +61,7 @@ class TestSelectAllVisible(unittest.TestCase):
 class TestClearSelection(unittest.TestCase):
 
     def test_clears_all(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         _seed(b)
         b._state.selected = {'a', 'b', 'c'}
         b.clear_selection()
@@ -68,7 +69,7 @@ class TestClearSelection(unittest.TestCase):
         self.assertEqual(b._state.selected, set())
 
     def test_idempotent(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         _seed(b)
         b.clear_selection()
         b.drain_main_queue()
@@ -78,7 +79,7 @@ class TestClearSelection(unittest.TestCase):
 class TestInvertSelection(unittest.TestCase):
 
     def test_flips_visible(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         _seed(b)
         b._state.selected = {'a'}
         b.invert_selection()
@@ -87,7 +88,7 @@ class TestInvertSelection(unittest.TestCase):
         self.assertEqual(b._state.selected, {'b', 'c'})
 
     def test_preserves_invisible(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         _seed(b)
         # 'a1' is invisible (under collapsed 'a'); pre-select it.
         b._state.selected = {'a1'}
@@ -102,7 +103,7 @@ class TestInvertSelection(unittest.TestCase):
 class TestContextPassthroughs(unittest.TestCase):
 
     def test_all_three(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         _seed(b)
         ctx = Context(b)
         ctx.select_all_visible()

@@ -121,7 +121,7 @@ class TestCtrlCParity(unittest.TestCase):
             log = os.path.join(tmp, 'log')
             with open(recipe, 'w') as f:
                 f.write(
-                    "from browse_tui import Browser, Item, Action\n"
+                    "from browse_tui import Browser, BrowserConfig, Item, Action\n"
                     "import sys\n"
                     "def get_children(_):\n"
                     "    return [Item(id='a')]\n"
@@ -129,9 +129,9 @@ class TestCtrlCParity(unittest.TestCase):
                     f"    val = ctx.input('Name: ')\n"
                     f"    open({log!r}, 'w').write('NONE' if val is None else 'VAL:' + repr(val))\n"
                     "    ctx.quit()\n"
-                    "b = Browser(get_children=get_children, "
+                    "b = Browser(BrowserConfig(get_children=get_children, "
                     "actions=[Action('i', 'Input', go, 'cursor')], "
-                    "show_ids='always')\n"
+                    "show_ids='always'))\n"
                     "sys.exit(b.run())\n")
             with TmuxFixture(cols=80, rows=24) as t:
                 t.launch(_BIN, '--run-py', recipe)
@@ -149,7 +149,7 @@ class TestCtrlCParity(unittest.TestCase):
             log = os.path.join(tmp, 'log')
             with open(recipe, 'w') as f:
                 f.write(
-                    "from browse_tui import Browser, Item, Action\n"
+                    "from browse_tui import Browser, BrowserConfig, Item, Action\n"
                     "import sys\n"
                     "def get_children(_):\n"
                     "    return [Item(id='a')]\n"
@@ -157,9 +157,9 @@ class TestCtrlCParity(unittest.TestCase):
                     f"    val = ctx.confirm('Sure?')\n"
                     f"    open({log!r}, 'w').write('YES' if val else 'NO')\n"
                     "    ctx.quit()\n"
-                    "b = Browser(get_children=get_children, "
+                    "b = Browser(BrowserConfig(get_children=get_children, "
                     "actions=[Action('d', 'Delete', go, 'cursor')], "
-                    "show_ids='always')\n"
+                    "show_ids='always'))\n"
                     "sys.exit(b.run())\n")
             with TmuxFixture(cols=80, rows=24) as t:
                 t.launch(_BIN, '--run-py', recipe)

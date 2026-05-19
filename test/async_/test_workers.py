@@ -17,14 +17,14 @@ import threading
 import time
 import unittest
 
-from test.async_._helpers import Browser, Pending, make_browser
+from test.async_._helpers import Browser, BrowserConfig, Pending, make_browser
 
 
 class TestWorkerLifecycle(unittest.TestCase):
     """start_workers / stop_workers spawn and join the threads cleanly."""
 
     def test_start_workers_creates_live_threads(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         self.assertIsNone(b._children_thread)
         self.assertIsNone(b._preview_thread)
         b.start_workers()
@@ -227,7 +227,7 @@ class TestHeadlessAndIdle(unittest.TestCase):
         old_stdout = sys.stdout
         sys.stdout = captured
         try:
-            b = Browser(_headless=True)
+            b = Browser(BrowserConfig(_headless=True))
             self.assertTrue(b._headless)
             b.start_workers()
             b.stop_workers()

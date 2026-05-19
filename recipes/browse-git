@@ -24,7 +24,7 @@ import shutil
 import subprocess
 import sys
 
-from browse_tui import Browser, Item
+from browse_tui import Browser, BrowserConfig, Item
 
 
 _LOG_LIMIT = 1000
@@ -152,12 +152,12 @@ _log_limit = _LOG_LIMIT
 def main():
     global _log_limit
     _log_limit = _pop_limit_arg(_LOG_LIMIT)
-    sys.exit(Browser(
+    sys.exit(Browser(BrowserConfig(
         title='browse-git',
         get_children=get_children,
         get_preview=get_preview,
         help_intro=_HELP_INTRO_TMPL.format(default=_LOG_LIMIT, limit=_log_limit),
-    ).run())
+    )).run())
 
 
 if __name__ == '__main__':

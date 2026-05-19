@@ -21,6 +21,7 @@ _state.Context = _context.Context
 _context.visible_items = _state.visible_items
 
 Browser = _state.Browser
+BrowserConfig = _state.BrowserConfig
 Context = _context.Context
 
 
@@ -38,12 +39,12 @@ def _seed(b):
 class TestScopeReaders(unittest.TestCase):
 
     def test_root_scope_is_none(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         self.assertIsNone(b.scope)
         self.assertEqual(b.scope_stack, ())
 
     def test_after_scope_into(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         _seed(b)
         b.scope_into('a')
         b.drain_main_queue()
@@ -51,7 +52,7 @@ class TestScopeReaders(unittest.TestCase):
         self.assertEqual(b.scope_stack, ('a',))
 
     def test_nested_scope_stack(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         _seed(b)
         b.scope_into('a')
         b.drain_main_queue()
@@ -64,14 +65,14 @@ class TestScopeReaders(unittest.TestCase):
 class TestScopeInto(unittest.TestCase):
 
     def test_changes_state(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         _seed(b)
         b.scope_into('a')
         b.drain_main_queue()
         self.assertEqual(b._state.scope_stack, ['a'])
 
     def test_repeat_is_noop(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         _seed(b)
         b.scope_into('a')
         b.drain_main_queue()
@@ -81,16 +82,16 @@ class TestScopeInto(unittest.TestCase):
 
     def test_fires_hook(self):
         fired = []
-        b = Browser(_headless=True,
+        b = Browser(BrowserConfig(_headless=True,
                     on_scope_change=lambda ctx: fired.append(
-                        tuple(ctx.scope_stack)))
+                        tuple(ctx.scope_stack))))
         _seed(b)
         b.scope_into('a')
         b.drain_main_queue()
         self.assertEqual(fired, [('a',)])
 
     def test_signals_redraw(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         _seed(b)
         b._needs_redraw.clear()
         b.scope_into('a')
@@ -101,7 +102,7 @@ class TestScopeInto(unittest.TestCase):
 class TestScopeOut(unittest.TestCase):
 
     def test_pops_top(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         _seed(b)
         b._state.scope_stack = ['a', 'a1']
         b.scope_out()
@@ -109,7 +110,7 @@ class TestScopeOut(unittest.TestCase):
         self.assertEqual(b._state.scope_stack, ['a'])
 
     def test_noop_at_root(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         _seed(b)
         b.scope_out()
         b.drain_main_queue()
@@ -117,9 +118,9 @@ class TestScopeOut(unittest.TestCase):
 
     def test_fires_hook(self):
         fired = []
-        b = Browser(_headless=True,
+        b = Browser(BrowserConfig(_headless=True,
                     on_scope_change=lambda ctx: fired.append(
-                        tuple(ctx.scope_stack)))
+                        tuple(ctx.scope_stack))))
         _seed(b)
         b._state.scope_stack = ['a']
         b.scope_out()
@@ -128,8 +129,8 @@ class TestScopeOut(unittest.TestCase):
 
     def test_noop_does_not_fire(self):
         fired = []
-        b = Browser(_headless=True,
-                    on_scope_change=lambda ctx: fired.append(1))
+        b = Browser(BrowserConfig(_headless=True,
+                    on_scope_change=lambda ctx: fired.append(1)))
         b.scope_out()
         b.drain_main_queue()
         self.assertEqual(fired, [])
@@ -138,7 +139,7 @@ class TestScopeOut(unittest.TestCase):
 class TestContextPassthroughs(unittest.TestCase):
 
     def test_readers(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         _seed(b)
         ctx = Context(b)
         self.assertIsNone(ctx.scope)
@@ -148,7 +149,7 @@ class TestContextPassthroughs(unittest.TestCase):
         self.assertEqual(ctx.scope_stack, ('a',))
 
     def test_writers(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         _seed(b)
         ctx = Context(b)
         ctx.scope_into('a')

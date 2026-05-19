@@ -16,7 +16,9 @@ import threading
 import time
 import unittest
 
-from test.async_._helpers import Browser, Item, Pending, State, make_browser
+from test.async_._helpers import (
+    Browser, BrowserConfig, Item, Pending, State, make_browser
+)
 
 
 # ---- 1. Construction defaults / kwargs -------------------------------------
@@ -26,7 +28,7 @@ class TestConstructionDefaults(unittest.TestCase):
     """Exhaustively poke the new __init__ signature."""
 
     def test_no_kwargs_defaults(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         try:
             self.assertEqual(b.title, 'browse-tui')
             self.assertIsNone(b._state.root_id)
@@ -47,13 +49,13 @@ class TestConstructionDefaults(unittest.TestCase):
             b.stop_workers()
 
     def test_initial_scope_pushed(self):
-        b = Browser(
+        b = Browser(BrowserConfig(
             _headless=True,
             title='foo',
             get_children=lambda _id: [],
             root_id='/',
             initial_scope='/x',
-        )
+        ))
         try:
             self.assertEqual(b.title, 'foo')
             self.assertEqual(b._state.root_id, '/')
@@ -65,7 +67,7 @@ class TestConstructionDefaults(unittest.TestCase):
         # Action class doesn't exist yet; we just want the kwarg to be
         # accepted and stored.
         sentinel = object()
-        b = Browser(_headless=True, actions=[sentinel])
+        b = Browser(BrowserConfig(_headless=True, actions=[sentinel]))
         try:
             self.assertEqual(b.actions, [sentinel])
         finally:
@@ -74,7 +76,7 @@ class TestConstructionDefaults(unittest.TestCase):
     def test_callable_kwargs_stored(self):
         fmt = lambda item, ctx: [(str(item.id), '', False)]
         on_enter = lambda ctx: None
-        b = Browser(_headless=True, format_item=fmt, on_enter=on_enter)
+        b = Browser(BrowserConfig(_headless=True, format_item=fmt, on_enter=on_enter))
         try:
             self.assertIs(b.format_item, fmt)
             self.assertIs(b.on_enter, on_enter)
@@ -82,13 +84,13 @@ class TestConstructionDefaults(unittest.TestCase):
             b.stop_workers()
 
     def test_show_flags_can_be_disabled(self):
-        b = Browser(
+        b = Browser(BrowserConfig(
             _headless=True,
             show_preview=False,
             show_children_pane=False,
             multi_select=False,
             print_format='{title}',
-        )
+        ))
         try:
             self.assertFalse(b.show_preview)
             self.assertFalse(b.show_children_pane)

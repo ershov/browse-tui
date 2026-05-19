@@ -21,13 +21,14 @@ _state.notify_wake = _term.notify_wake
 _context.visible_items = _state.visible_items
 
 Browser = _state.Browser
+BrowserConfig = _state.BrowserConfig
 Context = _context.Context
 Item = _data.Item
 
 
 def _make_browser():
     """Build a small browser with three loaded items under 'root'."""
-    b = Browser(_headless=True)
+    b = Browser(BrowserConfig(_headless=True))
     b.update_data([
         ('upsert', 'a', None, {'title': 'A', 'has_children': True}),
         ('upsert', 'b', None, {'title': 'B'}),
@@ -94,7 +95,7 @@ class TestCachedChildren(unittest.TestCase):
         self.assertIsNone(b.cached_children('b'))
 
     def test_empty_vs_none_distinguishable(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         # Direct entry: a parent with an empty list shows up as []
         # (loaded, no children), not None (not yet loaded).
         b._state._children['x'] = []

@@ -518,6 +518,16 @@ class Context:
         """
         return self._browser.invalidate_preview(id)
 
+    def register_plugin(self, cfg) -> None:
+        """Pass-through to the module-level ``register_plugin``.
+
+        Appends ``cfg`` (a :class:`PluginConfig`) to the global
+        ``registered_plugins`` list. Note that calling this from a
+        live Context registers for *future* Browser constructions —
+        the current Browser's ``__init__`` hooks have already fired.
+        """
+        return register_plugin(cfg)
+
     def get_cached_preview(self, id) -> Optional[str]:
         """Cached preview text for ``id`` or ``None``.
 

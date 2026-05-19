@@ -61,6 +61,7 @@ _actions.layout_panes = _render.layout_panes
 
 Item = _data.Item
 Browser = _state.Browser
+BrowserConfig = _state.BrowserConfig
 Context = _context.Context
 _handle_insert_key = _actions._handle_insert_key
 
@@ -134,7 +135,7 @@ class TestContextInsertEntry(unittest.TestCase):
             b.stop_workers()
 
     def test_insert_with_empty_visible_list_is_noop(self):
-        b = Browser(_headless=False)
+        b = Browser(BrowserConfig(_headless=False))
         try:
             ctx = Context(b)
             ctx.insert('create', lambda r, d: None)

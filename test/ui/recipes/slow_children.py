@@ -12,7 +12,7 @@ Usage:
 import sys
 import time
 
-from browse_tui import Browser, Item
+from browse_tui import Browser, BrowserConfig, Item
 
 
 def main():
@@ -30,13 +30,13 @@ def main():
         return [Item(id='alpha', title='alpha'),
                 Item(id='beta', title='beta')]
 
-    b = Browser(
+    b = Browser(BrowserConfig(
         get_children=get_children,
         show_children_pane=show_children_pane,
         # Force the id segment on every row so UI tests can assert on a
         # stable shape regardless of whether id == title.
         show_ids='always',
-    )
+    ))
     sys.exit(b.run())
 
 

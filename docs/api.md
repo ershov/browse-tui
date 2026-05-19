@@ -490,9 +490,13 @@ applied on the main thread.
 
 ### Constructor
 
+A `Browser` takes a single `BrowserConfig` dataclass holding every
+construction parameter:
+
 ```python
-Browser(
-    *,
+from browse_tui import Browser, BrowserConfig
+
+b = Browser(BrowserConfig(
     title='browse-tui',
     get_children=lambda _: [],            # (parent_id) -> Iterable[Item|str|tuple|dict]
     get_preview=None,                     # (item_id) -> str  (optional)
@@ -507,8 +511,13 @@ Browser(
     print_format='{id}',
     show_ids='auto',                      # 'always' | 'auto' | 'never'
     preview_ansi=True,                    # honour SGR colour codes in preview
-)
+))
 ```
+
+`BrowserConfig` is a dataclass — adding a new construction parameter
+means adding a field there. Plugins that need to influence
+construction read or mutate the same dataclass in their
+`on_before_init` hook (see *Plugin system* below).
 
 #### `show_ids`
 
@@ -1116,6 +1125,216 @@ sys.exit(b.run())
 
 Uncaught exceptions in the callback are surfaced via `browser.error(...)` and
 the watcher thread dies (no auto-restart).
+
+---
+
+## Plugin system
+
+Plugins are ordinary Python modules that extend the framework or a
+specific recipe. Two loading channels:
+
+* **Recipe-driven:** a recipe `import`s a plugin module like any
+  other helper. Standard Python — no framework cooperation needed
+  beyond `BROWSE_TUI_PLUGIN_PATH`-style `sys.path` setup (covered
+  automatically — see *Module discovery* below).
+* **User-driven:** `browse-tui --plugin SPEC [--plugin SPEC ...]`
+  loads plugins at launch time regardless of what the main recipe
+  expects. SPEC is either a module name or a filesystem path.
+
+A plugin module can optionally call `register_plugin(PluginConfig(...))`
+to receive lifecycle callbacks. A plugin that only writes into a
+shared registry at module-body time (`preview_formatters['markdown']
+= my_format`, etc.) needs no `register_plugin` call at all.
+
+### `BrowserConfig`
+
+```python
+@dataclass
+class BrowserConfig:
+    title: str = 'browse-tui'
+    get_children: Callable | None = None
+    get_preview:  Callable | None = None
+    actions: list | None = None
+    on_enter: Any = None
+    format_item: Callable | None = None
+    root_id: Any = None
+    initial_scope: Any = None
+    show_preview: bool = True
+    show_children_pane: bool = True
+    preview_ansi: bool = True
+    list_ratio: float = 0.30
+    split: str = 'auto'
+    multi_select: bool = True
+    print_format: str = '{id}'
+    help_intro: str | None = None
+    help_outro: str | None = None
+    show_ids: str = 'auto'
+    show_scope_crumb: bool = False
+    preview_buffer_cap_chars: int = 100_000
+    preview_buffer_cap_lines: int = 1000
+    on_cursor_change: Callable | None = None
+    on_scope_change: Callable | None = None
+    on_selection_change: Callable | None = None
+    on_quit: Callable | None = None
+    _headless: bool = False
+```
+
+Every field corresponds to a Browser construction parameter — see
+the *Constructor* section for the per-field semantics.
+
+### `PluginConfig`
+
+```python
+@dataclass
+class PluginConfig:
+    name: str | None = None
+    on_before_init: Callable[[Browser, BrowserConfig], None] | None = None
+    on_after_init:  Callable[[Browser], None] | None = None
+    on_before_run:  Callable[[Browser], None] | None = None
+    on_after_run:   Callable[[Browser], None] | None = None
+```
+
+All fields optional. If `name` is `None` at `register_plugin` time,
+it's filled from the calling module's `__name__`.
+
+### `register_plugin(cfg)` and `registered_plugins`
+
+```python
+from browse_tui import PluginConfig, register_plugin, registered_plugins
+
+def _setup(browser):
+    browser.bind('M', show_markdown_help)
+
+register_plugin(PluginConfig(name='markdown-preview', on_before_run=_setup))
+```
+
+`registered_plugins` is the live list of registrations, in
+registration order. Public and fully mutable — plugins may inspect,
+reorder, remove, or replace entries to compose with each other.
+Multiple calls from the same module are allowed; each appends a
+separate entry.
+
+`Context.register_plugin(cfg)` is the pass-through. Calling it
+during a Browser's lifetime registers for *future* Browser
+constructions — the current Browser's `__init__` hooks have already
+fired.
+
+### Lifecycle hooks
+
+| Hook | When | What you get |
+| ---- | ---- | ------------ |
+| `on_before_init` | Top of `Browser.__init__`, after defaults are loaded into `BrowserConfig` and before any construction. | `(browser, config)`. `browser` is essentially empty — treat it as identity only. Mutate `config` to override defaults the recipe set. |
+| `on_after_init`  | Bottom of `Browser.__init__`, after the Browser is fully built. | `(browser)`. Read or monkey-patch the live Browser. |
+| `on_before_run`  | Top of `Browser.run`, right before the event loop starts. | `(browser)`. Workers are already running; final-mile setup. |
+| `on_after_run`   | Inside a `finally` at the end of `Browser.run`, even when the loop exits via exception. | `(browser)`. Cleanup. May replace an in-flight exception per Python's `finally` semantics. |
+
+Hooks fire in registration order on each pass. Missing hooks (`None`)
+are skipped silently. Exceptions propagate unchanged — the framework
+does not catch / log / continue.
+
+### Hooking patterns
+
+Several patterns cover most extension needs:
+
+1. **Populate a shared registry at module-body time.** Cheapest for
+   simple "add a thing" plugins:
+
+   ```python
+   from browse_tui import preview_formatters
+   preview_formatters['markdown'] = render_markdown
+   ```
+
+   No hooks, no `register_plugin` call.
+
+2. **Override `BrowserConfig` defaults in `on_before_init`.** When
+   the plugin wants to set defaults the recipe will then read:
+
+   ```python
+   def _set_defaults(browser, config):
+       if config.preview_formatter is None:
+           config.preview_formatter = render_markdown
+   register_plugin(PluginConfig(on_before_init=_set_defaults))
+   ```
+
+3. **Wrap callable fields on `BrowserConfig`.** Compose instead of
+   replace:
+
+   ```python
+   def _wrap(browser, config):
+       prev = config.preview_formatter
+       def chained(item):
+           text = prev(item) if prev else item.body
+           return decorate_with_markdown(text)
+       config.preview_formatter = chained
+   ```
+
+4. **Monkey-patch the Browser instance in `on_after_init`.** Works
+   for replacing methods, adding new methods, or attaching plain
+   attribute data:
+
+   ```python
+   def _patch(browser):
+       orig = browser.set_preview
+       def wrapped(id_, text):
+           return orig(id_, render_markdown(text))
+       browser.set_preview = wrapped
+       browser.markdown = MarkdownState()
+   ```
+
+5. **Monkey-patch the `Browser` class at module-body time.** Apply
+   to every Browser; useful for tests and global rewrites. Class-
+   level attributes are a convenient namespace for cross-Browser
+   registries:
+
+   ```python
+   Browser.preview_formatters = {}
+   ```
+
+6. **Compose with another plugin via `registered_plugins`.** Find
+   the target by name and wrap its hooks:
+
+   ```python
+   for cfg in registered_plugins:
+       if cfg.name == 'syntax-highlight':
+           orig = cfg.on_after_init
+           def wrapped(browser):
+               if orig: orig(browser)
+               attach_extra_lexer(browser)
+           cfg.on_after_init = wrapped
+   ```
+
+### `--plugin` CLI flag
+
+```
+browse-tui --plugin foo --plugin bar --run-py recipe.py
+browse-tui --plugin /opt/tools/markdown_helper.py --run recipe.py
+browse-tui -c cmd -p cmd --plugin foo            # CLI mode (no recipe file)
+```
+
+* Repeatable. Order is preserved.
+* `SPEC` is either a module name (no `/`, no `.py`) or a filesystem
+  path. Paths are loaded via `importlib.util.spec_from_file_location`
+  and named after their basename without the `.py` suffix; module
+  names go through `importlib.import_module`.
+* Plugins load before the main recipe / TUI mode starts.
+* Combining `--plugin` with `--run-cli` (or `--run` auto-detected as
+  `cli`) exits with a hard error before any import or `execvpe`.
+  External CLI recipes replace the Python process; plugins would be
+  discarded. Pass `--plugin` to the inner `browse-tui` invocation
+  inside the recipe script instead.
+
+### Module discovery (`sys.path`)
+
+At process start, the launcher prepends three locations to
+`sys.path`, in order:
+
+1. The directory containing the running `browse-tui` binary.
+2. The directory of the main Python recipe (when there is one).
+3. For each path-form `--plugin SPEC`: that file's parent directory.
+
+This makes the natural "drop file in directory" distribution work
+three ways: alongside the binary, alongside the recipe, or wherever
+a path-form plugin lives.
 
 ---
 

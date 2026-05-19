@@ -38,6 +38,7 @@ _state.to_item = _data.to_item
 _state.notify_wake = _term.notify_wake
 
 Browser = _state.Browser
+BrowserConfig = _state.BrowserConfig
 State = _state.State
 Item = _data.Item
 cache_invalidate_subtree = _state.cache_invalidate_subtree
@@ -54,7 +55,7 @@ class TestStateIndexDefaults(unittest.TestCase):
         self.assertEqual(s._loading, {})
 
     def test_browser_state_defaults(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         self.assertEqual(b._state._items_by_id, {})
         self.assertEqual(b._state._parent_of_id, {})
         self.assertEqual(b._state._loading, {})
@@ -142,7 +143,7 @@ class TestApplyChildrenResultsIndexes(unittest.TestCase):
     """``apply_children_results`` populates indexes and clears ``_loading``."""
 
     def test_first_delivery_populates(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         b.set_children('p', [{'id': 'x'}, {'id': 'y'}])
         b.apply_children_results()
         s = b._state
@@ -155,7 +156,7 @@ class TestApplyChildrenResultsIndexes(unittest.TestCase):
         self.assertFalse(s._loading['p'])
 
     def test_replacement_drops_previous_entries(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         b.set_children('p', [{'id': 'x'}, {'id': 'y'}])
         b.apply_children_results()
         # Now replace with a different set.
@@ -171,7 +172,7 @@ class TestApplyChildrenResultsIndexes(unittest.TestCase):
         self.assertEqual(s._parent_of_id['z'], 'p')
 
     def test_clears_loading_flag(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         # Simulate a dispatch having set the flag.
         b._state._loading['p'] = True
         b.set_children('p', [{'id': 'x'}])
@@ -183,7 +184,7 @@ class TestDispatchSetsLoading(unittest.TestCase):
     """Dispatch paths flip ``_loading[parent] = True`` synchronously."""
 
     def test_do_refresh_sets_loading(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         # Use the synchronous internal entry — no worker needed.
         Pending = _state.Pending
         p = Pending()
@@ -195,7 +196,7 @@ class TestDispatchSetsLoading(unittest.TestCase):
     def test_do_refresh_coalesces_does_not_double_flag(self):
         # Second call while the first is still in flight is a piggyback;
         # the flag stays True (not toggled off and on).
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         Pending = _state.Pending
         p1 = Pending()
         p2 = Pending()
@@ -204,7 +205,7 @@ class TestDispatchSetsLoading(unittest.TestCase):
         self.assertTrue(b._state._loading['/'])
 
     def test_do_expand_sets_loading_when_uncached(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         Pending = _state.Pending
         p = Pending()
         b._do_expand('child', p)
@@ -214,7 +215,7 @@ class TestDispatchSetsLoading(unittest.TestCase):
     def test_do_expand_does_not_touch_loading_when_cached(self):
         # If children are already cached, no fetch is dispatched and
         # _loading is untouched (it'll be False from the prior delivery).
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         b._state._children['x'] = [Item(id='c')]
         b._state._loading['x'] = False
         Pending = _state.Pending
@@ -223,7 +224,7 @@ class TestDispatchSetsLoading(unittest.TestCase):
         self.assertFalse(b._state._loading['x'])
 
     def test_update_children_for_cursor_sets_loading(self):
-        b = Browser(show_children_pane=True, _headless=True)
+        b = Browser(BrowserConfig(show_children_pane=True, _headless=True))
         # Seed: cursor on a row with children, but children not yet cached.
         item = Item(id='parent', has_children=True)
         b._state._children[None] = [item]
@@ -347,7 +348,7 @@ class TestEndToEndDispatchAndDelivery(unittest.TestCase):
         def get_children(parent_id):
             return [Item(id=f'{parent_id}/a'), Item(id=f'{parent_id}/b')]
 
-        b = Browser(get_children=get_children, _headless=True)
+        b = Browser(BrowserConfig(get_children=get_children, _headless=True))
         b.start_workers()
         try:
             pending = b.refresh('P')
@@ -382,7 +383,7 @@ class TestEndToEndDispatchAndDelivery(unittest.TestCase):
                 return [Item(id='old-a'), Item(id='old-b')]
             return [Item(id='new-c')]
 
-        b = Browser(get_children=get_children, _headless=True)
+        b = Browser(BrowserConfig(get_children=get_children, _headless=True))
         b.start_workers()
         try:
             b.refresh('P')

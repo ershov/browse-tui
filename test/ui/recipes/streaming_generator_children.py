@@ -19,7 +19,7 @@ Usage:  browse-tui --run-py streaming_generator_children.py [DELAY]
 import sys
 import time
 
-from browse_tui import Browser, Item
+from browse_tui import Browser, BrowserConfig, Item
 
 
 def main():
@@ -41,7 +41,7 @@ def main():
         time.sleep(delay)
         yield Item(id='c-1', title='c-1')
 
-    b = Browser(get_children=get_children, show_ids='always')
+    b = Browser(BrowserConfig(get_children=get_children, show_ids='always'))
     sys.exit(b.run())
 
 

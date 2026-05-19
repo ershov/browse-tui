@@ -20,18 +20,19 @@ _state.notify_wake = _term.notify_wake
 _context.visible_items = _state.visible_items
 
 Browser = _state.Browser
+BrowserConfig = _state.BrowserConfig
 Context = _context.Context
 
 
 class TestEscapeHatches(unittest.TestCase):
 
     def test_ctx_browser_returns_browser(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         ctx = Context(b)
         self.assertIs(ctx.browser, b)
 
     def test_ctx_state_returns_state(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         ctx = Context(b)
         self.assertIs(ctx.state, b._state)
 
@@ -39,7 +40,7 @@ class TestEscapeHatches(unittest.TestCase):
         # The documented use case is reading state fields like
         # ``expanded``, ``scope_stack``, ``cursor``, ``selected``,
         # ``root_id`` directly.
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         ctx = Context(b)
         self.assertIsInstance(ctx.state.expanded, set)
         self.assertIsInstance(ctx.state.scope_stack, list)
@@ -47,7 +48,7 @@ class TestEscapeHatches(unittest.TestCase):
         self.assertEqual(ctx.state.cursor, 0)
 
     def test_state_reflects_mutations(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         ctx = Context(b)
         b._state.expanded.add('foo')
         self.assertIn('foo', ctx.state.expanded)

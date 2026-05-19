@@ -35,6 +35,7 @@ _actions.scope_out = _state.scope_out
 Item = _data.Item
 State = _state.State
 Browser = _state.Browser
+BrowserConfig = _state.BrowserConfig
 visible_items = _state.visible_items
 scope_into = _state.scope_into
 scope_out = _state.scope_out
@@ -52,7 +53,7 @@ def _ctx_for(browser):
 def _make_browser(**kw):
     """Build a headless Browser; tests call stop_workers in tearDown."""
     kw.setdefault('_headless', True)
-    return Browser(**kw)
+    return Browser(BrowserConfig(**kw))
 
 
 def _kid(id_, has_children=False):

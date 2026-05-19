@@ -32,6 +32,7 @@ _actions.Mode = _state.Mode
 
 Item = _data.Item
 Browser = _state.Browser
+BrowserConfig = _state.BrowserConfig
 Action = _actions.Action
 default_actions = _actions.default_actions
 dispatch_key = _actions.dispatch_key
@@ -40,7 +41,7 @@ dispatch_key = _actions.dispatch_key
 def _make_browser(**kw):
     """Build a headless Browser; tests call stop_workers in tearDown."""
     kw.setdefault('_headless', True)
-    return Browser(**kw)
+    return Browser(BrowserConfig(**kw))
 
 
 def _ctx_for(browser):

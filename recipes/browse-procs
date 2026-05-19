@@ -19,7 +19,7 @@ import signal
 import subprocess
 import sys
 
-from browse_tui import Action, Browser, Item
+from browse_tui import Action, Browser, BrowserConfig, Item
 
 
 def _list_procs():
@@ -134,7 +134,7 @@ the tree with Ctrl-R; preview reads /proc/<pid>/status.\
 
 
 def main():
-    sys.exit(Browser(
+    sys.exit(Browser(BrowserConfig(
         title='browse-procs',
         get_children=get_children,
         get_preview=get_preview,
@@ -143,7 +143,7 @@ def main():
                    kill_proc, 'cursor'),
         ],
         help_intro=_HELP_INTRO,
-    ).run())
+    )).run())
 
 
 if __name__ == '__main__':

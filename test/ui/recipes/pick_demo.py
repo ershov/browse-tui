@@ -19,7 +19,7 @@ Usage:
 import os
 import sys
 
-from browse_tui import Action, Browser, Item
+from browse_tui import Action, Browser, BrowserConfig, Item
 
 
 def _logfile():
@@ -41,10 +41,10 @@ def _pick_status(ctx):
 
 
 def main():
-    b = Browser(
+    b = Browser(BrowserConfig(
         get_children=_get_children,
         actions=[Action('s', 'Status', _pick_status, 'cursor')],
-    )
+    ))
     sys.exit(b.run())
 
 

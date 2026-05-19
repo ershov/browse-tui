@@ -528,6 +528,16 @@ def build_argparser() -> argparse.ArgumentParser:
     # everything after it. The pre-scan in parse_args handles dispatch
     # before argparse runs; argparse never sees these flags. They are
     # listed in --help via the epilog text below.
+    # Plugin loading. Extracted from argv before parse_args runs so
+    # this entry exists only to make ``--help`` list the flag; the
+    # action is a no-op (argparse never sees ``--plugin`` because
+    # ``_extract_plugins`` already removed it).
+    p.add_argument('--plugin', metavar='SPEC', action='append', default=[],
+                   help='Load a Python plugin. SPEC is a module name '
+                        '(import-time) or a filesystem path (loaded via '
+                        'spec_from_file_location). Repeatable. Rejected '
+                        'with --run-cli or --run resolving to a non-Python '
+                        'recipe.')
     # Debug / ops
     p.add_argument('--command-log', action='store_true',
                    help='Show command log on quit.')
@@ -537,6 +547,115 @@ def build_argparser() -> argparse.ArgumentParser:
 
 
 _RECIPE_FLAGS = ('--run', '--run-py', '--run-cli')
+
+
+def _setup_plugin_sys_path(script_path: Optional[str] = None) -> None:
+    """Prepend the standard module-discovery directories to ``sys.path``.
+
+    Idempotent — each candidate is added at most once. Called from
+    ``main`` before plugin loading and from ``cmd_run_py`` before
+    running a Python recipe so:
+
+    1. The directory containing the running ``browse-tui`` binary is
+       searchable. Plugins shipped alongside the binary become
+       importable by short name.
+    2. The directory of the main Python recipe (when there is one) is
+       searchable. A recipe and its companion plugins can sit in the
+       same directory; the recipe's own ``import`` and
+       ``--plugin SHORTNAME`` both resolve.
+
+    Path-form ``--plugin`` SPECs add their own parent directory in
+    ``_load_plugins`` (#3 in the spec).
+    """
+    candidates = []
+    own = sys.argv[0] if sys.argv else None
+    if own:
+        own_dir = os.path.dirname(os.path.realpath(own))
+        if own_dir:
+            candidates.append(own_dir)
+    if script_path:
+        candidates.append(os.path.dirname(os.path.abspath(script_path)) or '.')
+    for d in candidates:
+        if d and d not in sys.path:
+            sys.path.insert(0, d)
+
+
+def _load_plugins(specs: list) -> None:
+    """Import each ``--plugin`` SPEC, in CLI order.
+
+    SPEC classification:
+
+    * Contains ``/`` or ends in ``.py`` → filesystem path. Loaded
+      via ``importlib.util.spec_from_file_location`` and named after
+      the basename (``.py`` stripped). The file's parent directory is
+      prepended to ``sys.path`` so the plugin can import its own
+      sibling modules.
+    * Otherwise → module name. Loaded via
+      ``importlib.import_module``. Must be on ``sys.path``.
+
+    Failures propagate as plain ``ImportError`` (or any other
+    exception the plugin's module body raises). The framework
+    deliberately does not catch — silent skips would be much harder
+    to debug than a clear traceback.
+    """
+    import importlib
+    import importlib.util
+    for spec in specs:
+        if '/' in spec or spec.endswith('.py'):
+            path = os.path.abspath(spec)
+            parent = os.path.dirname(path) or '.'
+            if parent not in sys.path:
+                sys.path.insert(0, parent)
+            name = os.path.basename(path)
+            if name.endswith('.py'):
+                name = name[:-3]
+            module_spec = importlib.util.spec_from_file_location(name, path)
+            if module_spec is None or module_spec.loader is None:
+                raise ImportError(f'cannot load plugin from {path}')
+            module = importlib.util.module_from_spec(module_spec)
+            sys.modules[name] = module
+            module_spec.loader.exec_module(module)
+        else:
+            importlib.import_module(spec)
+
+
+def _extract_plugins(argv: list) -> tuple:
+    """Strip ``--plugin SPEC`` pairs out of ``argv``.
+
+    Returns ``(plugins, remaining)`` where ``plugins`` is the ordered
+    list of SPEC strings and ``remaining`` is ``argv`` with the
+    ``--plugin`` flag and its value removed wherever they appeared.
+
+    Also supports ``--plugin=SPEC`` (no whitespace).
+
+    Done up-front so plugin loading is orthogonal to argparse vs.
+    recipe-mode dispatch. Plugins apply to TUI mode, ``--run`` (when
+    it resolves to Python), and ``--run-py``; ``--run-cli`` is
+    rejected later in ``main`` per the spec.
+    """
+    plugins: list = []
+    remaining: list = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == '--plugin':
+            if i + 1 >= len(argv):
+                sys.stderr.write('browse-tui: --plugin requires a SPEC argument\n')
+                sys.exit(2)
+            plugins.append(argv[i + 1])
+            i += 2
+            continue
+        if tok.startswith('--plugin='):
+            spec = tok[len('--plugin='):]
+            if not spec:
+                sys.stderr.write('browse-tui: --plugin requires a SPEC argument\n')
+                sys.exit(2)
+            plugins.append(spec)
+            i += 1
+            continue
+        remaining.append(tok)
+        i += 1
+    return plugins, remaining
 
 
 def parse_args(argv: list) -> tuple:
@@ -563,7 +682,13 @@ def parse_args(argv: list) -> tuple:
 
     Otherwise (``argv[0]`` is a flag), argparse handles the whole argv
     in TUI mode and ``extras`` stays empty.
+
+    ``--plugin SPEC`` (repeatable) is extracted from anywhere in
+    ``argv`` before either dispatch path runs, so it may appear before
+    the recipe path or anywhere among the TUI-mode flags.
     """
+    plugins, argv = _extract_plugins(argv)
+
     if argv:
         first = argv[0]
 
@@ -575,17 +700,22 @@ def parse_args(argv: list) -> tuple:
                     f'as the next argument\n'
                 )
                 sys.exit(2)
-            return _recipe_namespace(mode, argv[1]), list(argv[2:])
+            ns = _recipe_namespace(mode, argv[1])
+            ns.plugins = plugins
+            return ns, list(argv[2:])
 
         # Bare positional → auto-detect mode.
         if not first.startswith('-'):
-            return _recipe_namespace('auto', first), list(argv[1:])
+            ns = _recipe_namespace('auto', first)
+            ns.plugins = plugins
+            return ns, list(argv[1:])
 
     # TUI mode — full argparse.
     p = build_argparser()
     args = p.parse_args(argv)
     args.run = None
     args.run_mode = None
+    args.plugins = plugins
     return args, []
 
 
@@ -854,7 +984,7 @@ def _build_browser_for_help(args) -> 'Browser':
             # error; for --help we keep going so the rest of the help
             # still renders even if a spec is busted.
             continue
-    return Browser(
+    return Browser(BrowserConfig(
         title=args.title,
         actions=actions,
         help_intro=intro,
@@ -862,7 +992,7 @@ def _build_browser_for_help(args) -> 'Browser':
         show_ids=args.show_ids,
         show_scope_crumb=args.show_scope_crumb,
         _headless=True,
-    )
+    ))
 
 
 # ---- --install / --uninstall ----------------------------------------------
@@ -1380,7 +1510,7 @@ def _build_lazy_browser(args, fields, record_sep, *, split='h'):
 
     get_preview = _make_preview_fetcher(args.preview_cmd, timeout)
 
-    return Browser(
+    return Browser(BrowserConfig(
         title=args.title,
         get_children=get_children,
         get_preview=get_preview,
@@ -1398,7 +1528,7 @@ def _build_lazy_browser(args, fields, record_sep, *, split='h'):
         show_ids=args.show_ids,
         show_scope_crumb=args.show_scope_crumb,
         split=split,
-    )
+    ))
 
 
 def _build_eager_browser(args, fields, record_sep, *, split='h'):
@@ -1532,6 +1662,52 @@ def main(argv=None) -> int:
         argv = ['--help']
 
     args, extras = parse_args(argv)
+
+    # Module-discovery setup: prepend the binary directory (and the
+    # main-recipe directory if applicable) to ``sys.path`` so plugins
+    # shipped alongside the binary and recipe-local helpers can be
+    # imported by short name. Runs unconditionally — applies even
+    # when no plugins are specified, since recipes commonly import
+    # sibling files from their own directory.
+    recipe_path_for_syspath = None
+    if getattr(args, 'run', None):
+        rm = getattr(args, 'run_mode', None)
+        effective_mode_for_syspath = rm
+        if rm == 'auto':
+            effective_mode_for_syspath = _detect_recipe_mode(args.run)
+        if effective_mode_for_syspath == 'py':
+            recipe_path_for_syspath = args.run
+    _setup_plugin_sys_path(recipe_path_for_syspath)
+
+    # Load plugins ahead of any dispatch. ``--run-cli`` (and ``--run``
+    # auto-detected as ``cli``) cannot host plugins — the Python
+    # process is replaced by the external recipe — so combining the
+    # two is rejected here before any import. See the plugin spec
+    # for rationale.
+    if getattr(args, 'plugins', None):
+        run_mode = getattr(args, 'run_mode', None)
+        effective_mode = run_mode
+        if run_mode == 'auto':
+            effective_mode = _detect_recipe_mode(args.run)
+        if effective_mode == 'cli':
+            sys.stderr.write(
+                'browse-tui: --plugin requires an in-process recipe host '
+                '(CLI mode or a Python recipe).\n'
+                '            --run-cli (or --run resolved as \'cli\') '
+                'replaces the Python process with the recipe, so plugins\n'
+                '            imported by the launcher would be discarded.\n'
+                '            To use plugins with an external CLI recipe, '
+                'pass --plugin to the inner \'browse-tui\' invocation\n'
+                '            inside the recipe script.\n'
+            )
+            return 2
+        # Make ``import browse_tui`` resolve to the running module so
+        # plugins can pull ``Browser``, ``PluginConfig`` etc. without
+        # needing the binary to be on ``sys.path`` as a regular
+        # importable package. Mirrors what ``cmd_run_py`` does for
+        # Python recipes.
+        sys.modules.setdefault('browse_tui', sys.modules[__name__])
+        _load_plugins(args.plugins)
 
     # Recipe mode (--run / --run-py / --run-cli / bare positional) is
     # checked first. parse_args has already enforced "recipe must be

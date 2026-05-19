@@ -42,6 +42,7 @@ Item = _data.Item
 State = _state.State
 VisibleEntry = _state.VisibleEntry
 Browser = _state.Browser
+BrowserConfig = _state.BrowserConfig
 Mode = _state.Mode
 visible_items = _state.visible_items
 _search_text = _state._search_text
@@ -54,7 +55,7 @@ dispatch_key = _actions.dispatch_key
 def _make_browser(**kw):
     """Build a headless Browser; tests call stop_workers in tearDown."""
     kw.setdefault('_headless', True)
-    return Browser(**kw)
+    return Browser(BrowserConfig(**kw))
 
 
 def _ctx_for(browser):

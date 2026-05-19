@@ -17,7 +17,7 @@ Usage:  browse-tui --run-py streaming_preview_chunks.py [DELAY]
 import sys
 import time
 
-from browse_tui import Browser, Item
+from browse_tui import Browser, BrowserConfig, Item
 
 
 def main():
@@ -35,11 +35,11 @@ def main():
         time.sleep(delay)
         yield 'third line\n'
 
-    b = Browser(
+    b = Browser(BrowserConfig(
         get_children=get_children,
         get_preview=get_preview,
         show_ids='always',
-    )
+    ))
     sys.exit(b.run())
 
 

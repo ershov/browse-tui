@@ -44,7 +44,7 @@ import os
 import sys
 import threading
 
-from browse_tui import Action, Browser, Item, mod, upsert
+from browse_tui import Action, Browser, BrowserConfig, Item, mod, upsert
 
 
 CLAUDE_ROOT = os.path.join(
@@ -4594,7 +4594,7 @@ def main():
         else:
             initial_scope = os.path.dirname(target_jsonl) or '/'
 
-    b = Browser(
+    b = Browser(BrowserConfig(
         title='browse-claude',
         show_children_pane=False,
         # Item ids are file paths (project) / .jsonl paths (session) /
@@ -4630,7 +4630,7 @@ def main():
             Action('right', 'Expand + cursor to latest voice', _action_tree_right,  'cursor'),
         ],
         help_intro=_HELP_INTRO_TMPL.format(default=_MESSAGE_LIMIT),
-    )
+    ))
 
     # Post-construction cursor positioning:
     #

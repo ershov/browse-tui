@@ -28,6 +28,7 @@ _state.to_item = _data.to_item
 _state.notify_wake = _term.notify_wake
 _cli.Action = _actions.Action
 _cli.Browser = _state.Browser
+_cli.BrowserConfig = _state.BrowserConfig
 _cli.Item = _data.Item
 # Headless tests don't have a real terminal; stub the suspend/resume hooks.
 _cli.term_suspend = lambda: None

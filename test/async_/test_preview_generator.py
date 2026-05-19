@@ -8,7 +8,7 @@ generator) and waits for either a cursor-move (abandon, fires recipe
 ``finally``) or a future #274 demand signal (resume).
 
 Cap defaults: 100 KB chars or 1000 lines (whichever first). Configured
-via ``Browser(preview_buffer_cap_chars=…, preview_buffer_cap_lines=…)``.
+via ``Browser(BrowserConfig(preview_buffer_cap_chars=…, preview_buffer_cap_lines=…))``.
 
 Pause state lives on ``Browser._preview_paused`` (None when not paused;
 otherwise a dict with keys ``id``, ``gen``, ``chars``, ``lines``). It is

@@ -20,6 +20,7 @@ _state.notify_wake = _term.notify_wake
 _context.visible_items = _state.visible_items
 
 Browser = _state.Browser
+BrowserConfig = _state.BrowserConfig
 Context = _context.Context
 Mode = _state.Mode
 
@@ -36,16 +37,16 @@ def _seed(b):
 class TestMode(unittest.TestCase):
 
     def test_default_normal(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         self.assertIs(b.mode, Mode.NORMAL)
 
     def test_reflects_search_edit(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         b._mode = Mode.SEARCH_EDIT
         self.assertIs(b.mode, Mode.SEARCH_EDIT)
 
     def test_reflects_filter_edit(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         b._mode = Mode.FILTER_EDIT
         self.assertIs(b.mode, Mode.FILTER_EDIT)
 
@@ -53,11 +54,11 @@ class TestMode(unittest.TestCase):
 class TestSearchQueryReader(unittest.TestCase):
 
     def test_default_empty(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         self.assertEqual(b.search_query, '')
 
     def test_reflects_state(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         b._search_query = 'foo'
         self.assertEqual(b.search_query, 'foo')
 
@@ -65,14 +66,14 @@ class TestSearchQueryReader(unittest.TestCase):
 class TestSetSearchQuery(unittest.TestCase):
 
     def test_replaces_query(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         _seed(b)
         b.set_search_query('ban')
         b.drain_main_queue()
         self.assertEqual(b.search_query, 'ban')
 
     def test_empty_clears(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         _seed(b)
         b._search_query = 'old'
         b.set_search_query('')
@@ -80,7 +81,7 @@ class TestSetSearchQuery(unittest.TestCase):
         self.assertEqual(b.search_query, '')
 
     def test_forces_normal_mode(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         _seed(b)
         b._mode = Mode.SEARCH_EDIT
         b.set_search_query('foo')
@@ -88,7 +89,7 @@ class TestSetSearchQuery(unittest.TestCase):
         self.assertIs(b.mode, Mode.NORMAL)
 
     def test_none_coerced_to_empty(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         _seed(b)
         b._search_query = 'stale'
         b.set_search_query(None)
@@ -98,7 +99,7 @@ class TestSetSearchQuery(unittest.TestCase):
     def test_jumps_to_match(self):
         # After setting a query, the cursor lands on the first
         # match (forward from row 0).
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         _seed(b)
         b.set_search_query('ban')
         b.drain_main_queue()
@@ -106,7 +107,7 @@ class TestSetSearchQuery(unittest.TestCase):
         self.assertEqual(vis[b._state.cursor].item.id, 'banana')
 
     def test_signals_redraw(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         _seed(b)
         b._needs_redraw.clear()
         b.set_search_query('x')
@@ -118,7 +119,7 @@ class TestSetSearchQuery(unittest.TestCase):
 class TestClearSearch(unittest.TestCase):
 
     def test_clear_empties_query(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         _seed(b)
         b._search_query = 'something'
         b.clear_search()
@@ -129,13 +130,13 @@ class TestClearSearch(unittest.TestCase):
 class TestContextPassthroughs(unittest.TestCase):
 
     def test_readers(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         ctx = Context(b)
         self.assertIs(ctx.mode, Mode.NORMAL)
         self.assertEqual(ctx.search_query, '')
 
     def test_writers(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         _seed(b)
         ctx = Context(b)
         ctx.set_search_query('apple')

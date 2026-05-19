@@ -22,6 +22,7 @@ _state.Context = _context.Context        # hooks need Context in scope
 _context.visible_items = _state.visible_items
 
 Browser = _state.Browser
+BrowserConfig = _state.BrowserConfig
 Item = _data.Item
 mark_cursor_changed = _state.mark_cursor_changed
 
@@ -39,9 +40,9 @@ class TestOnCursorChange(unittest.TestCase):
 
     def test_fires_once_per_drain(self):
         fired = []
-        b = Browser(_headless=True,
+        b = Browser(BrowserConfig(_headless=True,
                     on_cursor_change=lambda ctx: fired.append(
-                        ctx.cursor.id if ctx.cursor else None))
+                        ctx.cursor.id if ctx.cursor else None)))
         _seed(b, [Item(id='a'), Item(id='b'), Item(id='c')])
         b._last_cursor_id = None  # ensure first move is observed
         b._state.cursor = 1
@@ -51,9 +52,9 @@ class TestOnCursorChange(unittest.TestCase):
 
     def test_coalesces_rapid_moves(self):
         fired = []
-        b = Browser(_headless=True,
+        b = Browser(BrowserConfig(_headless=True,
                     on_cursor_change=lambda ctx: fired.append(
-                        ctx.cursor.id if ctx.cursor else None))
+                        ctx.cursor.id if ctx.cursor else None)))
         _seed(b, [Item(id='a'), Item(id='b'), Item(id='c')])
         # Several moves in quick succession (no fire between).
         b._state.cursor = 1
@@ -70,8 +71,8 @@ class TestOnCursorChange(unittest.TestCase):
         # Cursor anchor re-positioning often calls mark_cursor_changed
         # without changing the id. The hook must not fire in that case.
         fired = []
-        b = Browser(_headless=True,
-                    on_cursor_change=lambda ctx: fired.append(1))
+        b = Browser(BrowserConfig(_headless=True,
+                    on_cursor_change=lambda ctx: fired.append(1)))
         _seed(b, [Item(id='a'), Item(id='b')])
         b._state.cursor = 0
         mark_cursor_changed(b)
@@ -85,7 +86,7 @@ class TestOnCursorChange(unittest.TestCase):
     def test_exception_routed_to_error(self):
         def bad(ctx):
             raise RuntimeError('boom')
-        b = Browser(_headless=True, on_cursor_change=bad)
+        b = Browser(BrowserConfig(_headless=True, on_cursor_change=bad))
         _seed(b, [Item(id='a'), Item(id='b')])
         b._state.cursor = 1
         mark_cursor_changed(b)
@@ -99,16 +100,16 @@ class TestOnScopeChange(unittest.TestCase):
 
     def test_fires_on_scope_change(self):
         fired = []
-        b = Browser(_headless=True,
+        b = Browser(BrowserConfig(_headless=True,
                     on_scope_change=lambda ctx: fired.append(
-                        tuple(ctx.state.scope_stack)))
+                        tuple(ctx.state.scope_stack))))
         b._fire_scope_change()
         self.assertEqual(fired, [()])  # current state of the stack
 
     def test_exception_routed_to_error(self):
         def bad(ctx):
             raise ValueError('nope')
-        b = Browser(_headless=True, on_scope_change=bad)
+        b = Browser(BrowserConfig(_headless=True, on_scope_change=bad))
         b._fire_scope_change()
         b.drain_main_queue()
         self.assertIn('nope', b.error_text)
@@ -118,9 +119,9 @@ class TestOnSelectionChange(unittest.TestCase):
 
     def test_fires_on_select_all_visible(self):
         fired = []
-        b = Browser(_headless=True,
+        b = Browser(BrowserConfig(_headless=True,
                     on_selection_change=lambda ctx: fired.append(
-                        set(ctx.state.selected)))
+                        set(ctx.state.selected))))
         b.update_data([
             ('upsert', 'a', None, {}),
             ('upsert', 'b', None, {}),
@@ -132,8 +133,8 @@ class TestOnSelectionChange(unittest.TestCase):
 
     def test_fires_on_clear(self):
         fired = []
-        b = Browser(_headless=True,
-                    on_selection_change=lambda ctx: fired.append(1))
+        b = Browser(BrowserConfig(_headless=True,
+                    on_selection_change=lambda ctx: fired.append(1)))
         b._state.selected = {'a'}
         b.clear_selection()
         b.drain_main_queue()
@@ -141,8 +142,8 @@ class TestOnSelectionChange(unittest.TestCase):
 
     def test_no_fire_on_clear_when_already_empty(self):
         fired = []
-        b = Browser(_headless=True,
-                    on_selection_change=lambda ctx: fired.append(1))
+        b = Browser(BrowserConfig(_headless=True,
+                    on_selection_change=lambda ctx: fired.append(1)))
         b.clear_selection()
         b.drain_main_queue()
         self.assertEqual(fired, [])
@@ -150,8 +151,8 @@ class TestOnSelectionChange(unittest.TestCase):
     def test_fires_on_select_no_op_is_silent(self):
         # ctx.select() with a set already containing those ids → no change.
         fired = []
-        b = Browser(_headless=True,
-                    on_selection_change=lambda ctx: fired.append(1))
+        b = Browser(BrowserConfig(_headless=True,
+                    on_selection_change=lambda ctx: fired.append(1)))
         b._state.selected = {'a'}
         b.select(['a'], replace=False)
         b.drain_main_queue()
@@ -160,7 +161,7 @@ class TestOnSelectionChange(unittest.TestCase):
     def test_exception_routed_to_error(self):
         def bad(ctx):
             raise RuntimeError('selection boom')
-        b = Browser(_headless=True, on_selection_change=bad)
+        b = Browser(BrowserConfig(_headless=True, on_selection_change=bad))
         b._state.selected = {'a'}
         b.clear_selection()
         b.drain_main_queue()
@@ -171,8 +172,8 @@ class TestOnQuit(unittest.TestCase):
 
     def test_fires_once(self):
         fired = []
-        b = Browser(_headless=True,
-                    on_quit=lambda ctx: fired.append(ctx))
+        b = Browser(BrowserConfig(_headless=True,
+                    on_quit=lambda ctx: fired.append(ctx)))
         b._fire_on_quit()
         b._fire_on_quit()  # second call is a no-op
         self.assertEqual(len(fired), 1)
@@ -180,7 +181,7 @@ class TestOnQuit(unittest.TestCase):
     def test_exception_swallowed(self):
         def bad(ctx):
             raise RuntimeError('cleanup blew up')
-        b = Browser(_headless=True, on_quit=bad)
+        b = Browser(BrowserConfig(_headless=True, on_quit=bad))
         # Must not raise.
         b._fire_on_quit()
 
@@ -188,7 +189,7 @@ class TestOnQuit(unittest.TestCase):
 class TestDefaultsAreNoOp(unittest.TestCase):
 
     def test_no_hooks_no_explosion(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         # All three fire methods should be safe no-ops.
         b._cursor_change_pending = True
         b._fire_cursor_change_if_pending()

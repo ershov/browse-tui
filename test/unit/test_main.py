@@ -46,6 +46,7 @@ _actions.PIN_LAST = _state.PIN_LAST
 _actions.Mode = _state.Mode
 _cli.Action = _actions.Action
 _cli.Browser = _state.Browser
+_cli.BrowserConfig = _state.BrowserConfig
 # Action templates run as ``bash -c`` in production with a real terminal
 # suspend/resume around them; the tests don't go through that path, but
 # we provide stubs so a caller that does won't blow up.
@@ -79,6 +80,7 @@ _context.term_resume = _term.term_resume
 _context.visible_items = _state.visible_items
 
 Browser = _state.Browser
+BrowserConfig = _state.BrowserConfig
 Item = _data.Item
 
 
@@ -221,10 +223,10 @@ class TestBrowserShowIdsValidation(unittest.TestCase):
 
     def test_invalid_value_raises_value_error(self):
         with self.assertRaises(ValueError):
-            Browser(show_ids='sometimes', _headless=True)
+            Browser(BrowserConfig(show_ids='sometimes', _headless=True))
 
     def test_default_is_auto(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         self.assertEqual(b.show_ids, 'auto')
 
 

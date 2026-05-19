@@ -12,7 +12,7 @@ Usage:  browse-tui --run-py streaming_watcher_update.py [DELAY]
 import sys
 import time
 
-from browse_tui import Browser, Item, upsert
+from browse_tui import Browser, BrowserConfig, Item, upsert
 
 
 def main():
@@ -24,7 +24,7 @@ def main():
                     Item(id='row-b', title='B', tag='-')]
         return []
 
-    b = Browser(get_children=get_children, show_ids='always')
+    b = Browser(BrowserConfig(get_children=get_children, show_ids='always'))
 
     def watcher(browser):
         time.sleep(delay)

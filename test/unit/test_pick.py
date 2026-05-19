@@ -47,13 +47,14 @@ _context.layout_panes = _render.layout_panes
 
 Item = _data.Item
 Browser = _state.Browser
+BrowserConfig = _state.BrowserConfig
 Context = _context.Context
 _pick_on_info_bar = _context._pick_on_info_bar
 
 
 def _make_browser(**kw):
     kw.setdefault('_headless', True)
-    return Browser(**kw)
+    return Browser(BrowserConfig(**kw))
 
 
 # --- Headless contract ----------------------------------------------------
@@ -145,7 +146,7 @@ def _make_picker_browser():
     the StubTerminal context manager prevents any actual tty output.
     The Browser still needs ``stop_workers`` called by the test.
     """
-    return Browser(_headless=False)
+    return Browser(BrowserConfig(_headless=False))
 
 
 class TestPickLoop(unittest.TestCase):

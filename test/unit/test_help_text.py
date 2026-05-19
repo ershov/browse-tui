@@ -59,6 +59,7 @@ _cli.Action = _actions.Action
 
 Action = _actions.Action
 Browser = _state.Browser
+BrowserConfig = _state.BrowserConfig
 default_actions = _actions.default_actions
 compose_help_text = _render.compose_help_text
 _resolve_help_text = _cli._resolve_help_text
@@ -67,7 +68,7 @@ _resolve_help_text = _cli._resolve_help_text
 def _make_browser(**kw):
     """Build a headless Browser; tests don't run workers."""
     kw.setdefault('_headless', True)
-    return Browser(**kw)
+    return Browser(BrowserConfig(**kw))
 
 
 class _StopRun(Exception):

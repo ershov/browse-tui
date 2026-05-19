@@ -11,7 +11,7 @@ import stat
 import sys
 import time
 
-from browse_tui import Action, Browser, Item
+from browse_tui import Action, Browser, BrowserConfig, Item
 
 
 def human_size(n):
@@ -122,7 +122,7 @@ automatically. Press Enter (or 'e') to open the cursor row in $EDITOR.\
 
 def main():
     root = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.getcwd()
-    b = Browser(
+    b = Browser(BrowserConfig(
         title='browse-fs',
         show_ids="never",
         show_children_pane=False,
@@ -136,7 +136,7 @@ def main():
         ],
         on_enter='action:e',
         help_intro=_HELP_INTRO,
-    )
+    ))
     b.watch(mtime_watcher)
     sys.exit(b.run())
 

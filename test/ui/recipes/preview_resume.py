@@ -10,7 +10,7 @@ Usage:  browse-tui --run-py preview_resume.py
 
 import sys
 
-from browse_tui import Browser, Item
+from browse_tui import Browser, BrowserConfig, Item
 
 
 def main():
@@ -27,7 +27,7 @@ def main():
         for i in range(1, 201):
             yield f'LINE_{i:03d}\n'
 
-    b = Browser(
+    b = Browser(BrowserConfig(
         get_children=get_children,
         get_preview=get_preview,
         show_ids='always',
@@ -36,7 +36,7 @@ def main():
         # threshold to clearly trigger.
         preview_buffer_cap_chars=1_000_000,
         preview_buffer_cap_lines=30,
-    )
+    ))
     sys.exit(b.run())
 
 

@@ -15,6 +15,7 @@ _state.notify_wake = _term.notify_wake
 _context.visible_items = _state.visible_items
 
 Browser = _state.Browser
+BrowserConfig = _state.BrowserConfig
 Context = _context.Context
 
 
@@ -37,7 +38,7 @@ def _seed_tree(b):
 class TestCollapseAll(unittest.TestCase):
 
     def test_clears_expanded_set(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         _seed_tree(b)
         b._state.expanded.update({'a', 'a1', 'b'})
         b.collapse_all()
@@ -45,7 +46,7 @@ class TestCollapseAll(unittest.TestCase):
         self.assertEqual(b._state.expanded, set())
 
     def test_already_collapsed_is_noop(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         _seed_tree(b)
         # Nothing expanded — call must not raise.
         b.collapse_all()
@@ -55,7 +56,7 @@ class TestCollapseAll(unittest.TestCase):
     def test_visible_list_reflects_collapse(self):
         # 'a' expanded → a1 and a2 are visible. After collapse_all,
         # only top-level rows remain visible.
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         _seed_tree(b)
         b._state.expanded.add('a')
         _state.mark_visible_dirty(b._state)
@@ -70,7 +71,7 @@ class TestCollapseAll(unittest.TestCase):
         self.assertIn('a', after)
 
     def test_scope_stack_unchanged(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         _seed_tree(b)
         b._state.scope_stack = ['a']
         b.collapse_all()
@@ -81,7 +82,7 @@ class TestCollapseAll(unittest.TestCase):
 class TestExpandSubtree(unittest.TestCase):
 
     def test_adds_id_and_descendants(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         _seed_tree(b)
         b.expand_subtree('a')
         b.drain_main_queue()
@@ -93,7 +94,7 @@ class TestExpandSubtree(unittest.TestCase):
         self.assertNotIn('a1x', b._state.expanded)
 
     def test_does_not_touch_other_branches(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         _seed_tree(b)
         b.expand_subtree('a')
         b.drain_main_queue()
@@ -101,7 +102,7 @@ class TestExpandSubtree(unittest.TestCase):
         self.assertNotIn('b1', b._state.expanded)
 
     def test_uncached_branch_not_recursed(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         _seed_tree(b)
         # Remove 'a1' from the children cache to simulate an
         # un-fetched branch.
@@ -115,7 +116,7 @@ class TestExpandSubtree(unittest.TestCase):
         self.assertIn('a1', b._state.expanded)
 
     def test_idempotent(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         _seed_tree(b)
         b.expand_subtree('a')
         b.drain_main_queue()
@@ -128,7 +129,7 @@ class TestExpandSubtree(unittest.TestCase):
 class TestContextPassthroughs(unittest.TestCase):
 
     def test_collapse_all(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         _seed_tree(b)
         b._state.expanded.add('a')
         ctx = Context(b)
@@ -137,7 +138,7 @@ class TestContextPassthroughs(unittest.TestCase):
         self.assertEqual(b._state.expanded, set())
 
     def test_expand_subtree(self):
-        b = Browser(_headless=True)
+        b = Browser(BrowserConfig(_headless=True))
         _seed_tree(b)
         ctx = Context(b)
         ctx.expand_subtree('a')

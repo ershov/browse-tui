@@ -17,7 +17,7 @@ Usage:  browse-tui --run-py streaming_slow_root.py [DELAY]
 import sys
 import time
 
-from browse_tui import Browser, Item
+from browse_tui import Browser, BrowserConfig, Item
 
 
 def main():
@@ -30,7 +30,7 @@ def main():
         return [Item(id='alpha', title='alpha'),
                 Item(id='beta', title='beta')]
 
-    b = Browser(get_children=get_children, show_ids='always')
+    b = Browser(BrowserConfig(get_children=get_children, show_ids='always'))
     sys.exit(b.run())
 
 
