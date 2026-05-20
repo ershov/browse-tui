@@ -3606,6 +3606,38 @@ class Browser:
                 self._children_queue.append((x, False))
         self._children_event.set()
 
+    def _do_initial_fetch(self):
+        """Main-thread: enqueue the initial root + scope/expanded fetches.
+
+        Unlike ``_do_refresh(None)`` this does *not* invalidate caches
+        or mark anything as a reload — startup is not a refresh. Recipes
+        that build expensive per-file structures during scope resolution
+        (e.g. browse-claude's ``_TREE_CACHE``) keep those caches.
+        Mirrors ``_do_refresh``'s scope + expanded re-dispatch so a
+        recipe that pre-set ``scope_stack`` / ``expanded`` before run()
+        gets the same set of fetches kicked off at startup.
+
+        Each enqueue is gated on the standard ``_children_pending`` /
+        cache checks so re-runs are idempotent.
+        """
+        targets = [self._state.root_id]
+        if self._state.scope_stack:
+            targets.append(current_scope(self._state))
+        targets.extend(self._state.expanded)
+        seen = set()
+        for id_ in targets:
+            if id_ in seen:
+                continue
+            seen.add(id_)
+            if id_ in self._state._children:
+                continue
+            if id_ in self._state._children_pending:
+                continue
+            self._state._children_pending.add(id_)
+            self._state._loading[id_] = True
+            self._children_queue.append((id_, False))
+        self._children_event.set()
+
     def _do_cursor_to(self, id_, pending):
         """Main-thread: position the cursor at ``id_`` and resolve ``pending``.
 
@@ -4341,12 +4373,17 @@ class Browser:
         ctx = Context(self)
         self._ctx = ctx
 
-        # Initial fetch + render. We post a refresh of the root so the
-        # children worker populates the cache (or leverages an already-
-        # populated cache from from_flat_tree). Wait briefly for the
-        # first results before painting so the user doesn't flash a
-        # ``loading…`` placeholder for callbacks that resolve in <500ms.
-        self.refresh()
+        # Initial fetch + render. Enqueue the root (plus any
+        # pre-existing scope / expanded ids) with ``reload=False`` —
+        # startup is not a refresh, so the recipe's per-file caches
+        # (e.g. browse-claude's ``_TREE_CACHE`` populated while
+        # resolving the initial scope) should survive. The explicit
+        # ``self.refresh()`` / Ctrl-R path goes through
+        # ``_do_refresh`` which enqueues with ``reload=True``.
+        # Wait briefly for the first results before painting so the
+        # user doesn't flash a ``loading…`` placeholder for callbacks
+        # that resolve in <500ms.
+        self.post(self._do_initial_fetch)
         if not self._headless:
             try:
                 self.run_until_idle(timeout=0.5)
