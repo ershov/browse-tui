@@ -29,7 +29,7 @@ def _logfile():
     return os.environ.get('PICK_LOG', '/tmp/pick.log')
 
 
-def _get_children(_):
+def _get_children(_, *, reload=False):
     return [Item(id='item', title='one')]
 
 

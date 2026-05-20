@@ -293,7 +293,7 @@ class TestRecipeHelpFlag(unittest.TestCase):
                     "    description='RECIPE-OWN-HELP-MARKER')\n"
                     "p.add_argument('--mode', default='default')\n"
                     "args = p.parse_args()\n"
-                    "b = Browser(BrowserConfig(get_children=lambda _id: [Item('x')]))\n"
+                    "b = Browser(BrowserConfig(get_children=lambda _id, *, reload=False: [Item('x')]))\n"
                     "sys.exit(b.run())\n"
                 )
             out = subprocess.run(

@@ -76,7 +76,7 @@ def _err_item(msg):
     return [Item(id='__error__', title=msg, tag='err', tag_style='red')]
 
 
-def get_children(item_id):
+def get_children(item_id, *, reload=False):
     if not shutil.which('git'):
         return _err_item('git CLI not found on PATH')
 

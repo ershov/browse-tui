@@ -23,7 +23,7 @@ class TestPendingCancelEndToEnd(unittest.TestCase):
         gate = threading.Event()
         ran = []
 
-        def slow_kids(_pid):
+        def slow_kids(_pid, *, reload=False):
             gate.wait(timeout=2.0)
             return [Item(id='child')]
 
@@ -58,7 +58,7 @@ class TestPendingCancelEndToEnd(unittest.TestCase):
         gate = threading.Event()
         ran = []
 
-        def slow_kids(_pid):
+        def slow_kids(_pid, *, reload=False):
             gate.wait(timeout=2.0)
             return []
 
@@ -89,7 +89,7 @@ class TestPendingCancelEndToEnd(unittest.TestCase):
         # has even enqueued the worker request). The worker still runs
         # because cancellation is non-strict.
         ran = []
-        b = make_browser(get_children=lambda _: [Item(id='c')], root_id='/')
+        b = make_browser(get_children=lambda _, *, reload=False: [Item(id='c')], root_id='/')
         try:
             p = b.refresh('/')
             p.then(lambda: ran.append('cb'))
@@ -108,7 +108,7 @@ class TestPendingCancelEndToEnd(unittest.TestCase):
         gate = threading.Event()
         ran = []
 
-        def slow_kids(_pid):
+        def slow_kids(_pid, *, reload=False):
             gate.wait(timeout=2.0)
             return []
 

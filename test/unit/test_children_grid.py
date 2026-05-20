@@ -270,7 +270,7 @@ class TestUpdateChildrenForCursor(unittest.TestCase):
         b._state.cursor = 0
         b._update_children_for_cursor()
         self.assertIn('a', b._state._children_pending)
-        self.assertEqual(list(b._children_queue), ['a'])
+        self.assertEqual(list(b._children_queue), [('a', False)])
 
     def test_no_op_for_leaf(self):
         rows = [Item(id='x', title='leaf')]  # has_children=False

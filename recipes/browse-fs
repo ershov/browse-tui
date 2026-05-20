@@ -40,7 +40,7 @@ def _is_dir(dirent):
         return False
 
 
-def get_children(path):
+def get_children(path, *, reload=False):
     if not path:
         path = os.getcwd()
     try:

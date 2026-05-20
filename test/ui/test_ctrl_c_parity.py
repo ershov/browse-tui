@@ -123,7 +123,7 @@ class TestCtrlCParity(unittest.TestCase):
                 f.write(
                     "from browse_tui import Browser, BrowserConfig, Item, Action\n"
                     "import sys\n"
-                    "def get_children(_):\n"
+                    "def get_children(_, *, reload=False):\n"
                     "    return [Item(id='a')]\n"
                     "def go(ctx):\n"
                     f"    val = ctx.input('Name: ')\n"
@@ -151,7 +151,7 @@ class TestCtrlCParity(unittest.TestCase):
                 f.write(
                     "from browse_tui import Browser, BrowserConfig, Item, Action\n"
                     "import sys\n"
-                    "def get_children(_):\n"
+                    "def get_children(_, *, reload=False):\n"
                     "    return [Item(id='a')]\n"
                     "def go(ctx):\n"
                     f"    val = ctx.confirm('Sure?')\n"

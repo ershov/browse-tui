@@ -56,7 +56,7 @@ def _by_ppid(procs):
     return out
 
 
-def get_children(parent_id):
+def get_children(parent_id, *, reload=False):
     """Children of ``parent_id``.
 
     ``None`` (root): return the init process — PID 1 on Linux. If

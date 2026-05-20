@@ -17,7 +17,7 @@ from browse_tui import Browser, BrowserConfig, Item
 def main():
     path = sys.argv[1]
 
-    def get_children(_parent_id):
+    def get_children(_parent_id, *, reload=False):
         try:
             with open(path) as f:
                 return [Item(id=line.strip(), title=line.strip())

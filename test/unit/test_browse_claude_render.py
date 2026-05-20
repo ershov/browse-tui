@@ -1824,9 +1824,9 @@ class TestScanTree(unittest.TestCase):
             self.assertIs(td1, td2)
             self.assertEqual(len([r for r in td2.records if r]), 1)
 
-            # Explicit reset via get_children(None) drops the cache;
-            # next call rebuilds from disk with all records.
-            self.r.get_children(None)
+            # Explicit reset via get_children(None, reload=True) drops
+            # the cache; next call rebuilds from disk with all records.
+            self.r.get_children(None, reload=True)
             td3 = self.r._scan_tree(path)
             self.assertIsNot(td1, td3)
             self.assertEqual(len([r for r in td3.records if r]), 2)
@@ -2678,9 +2678,11 @@ class TestLiveTail(unittest.TestCase):
         finally:
             os.unlink(path)
 
-    def test_get_children_none_clears_caches(self):
-        # Indirect Ctrl-R signal: dropping the recipe-internal caches
-        # forces _scan_tree to rebuild on the next per-file get_children.
+    def test_get_children_none_reload_clears_caches(self):
+        # Ctrl-R signal: ``get_children(None, reload=True)`` wipes the
+        # recipe-internal caches so _scan_tree rebuilds on the next
+        # per-file get_children. ``reload=False`` (the default and the
+        # initial-load path) preserves them — see ticket #407.
         path = self._write_jsonl([
             {'type': 'user', 'uuid': 'u1',
              'message': {'role': 'user', 'content': 'hi'}},
@@ -2689,11 +2691,44 @@ class TestLiveTail(unittest.TestCase):
             self.r._scan_tree(path)
             self.assertIn(path, self.r._TREE_CACHE)
             self.assertIn(path, self.r._TAIL_STATE)
+            # Initial-load semantics: don't wipe.
             self.r.get_children(None)
+            self.assertIn(path, self.r._TREE_CACHE)
+            self.assertIn(path, self.r._TAIL_STATE)
+            # Explicit refresh: wipe.
+            self.r.get_children(None, reload=True)
             self.assertNotIn(path, self.r._TREE_CACHE)
             self.assertNotIn(path, self.r._TAIL_STATE)
         finally:
             os.unlink(path)
+
+    def test_get_children_subtree_reload_busts_just_that_file(self):
+        # ``get_children(<jsonl>, reload=True)`` drops only that file's
+        # _TreeData and rebuilds it; siblings' caches stay intact (same
+        # _TreeData identity).
+        path_a = self._write_jsonl([
+            {'type': 'user', 'uuid': 'a1',
+             'message': {'role': 'user', 'content': 'a'}},
+        ])
+        path_b = self._write_jsonl([
+            {'type': 'user', 'uuid': 'b1',
+             'message': {'role': 'user', 'content': 'b'}},
+        ])
+        try:
+            td_a_before = self.r._scan_tree(path_a)
+            td_b_before = self.r._scan_tree(path_b)
+            # Reload path_a — its _TreeData should be rebuilt.
+            self.r.get_children(path_a, reload=True)
+            self.assertIsNot(self.r._TREE_CACHE[path_a], td_a_before)
+            # path_b's cache untouched.
+            self.assertIs(self.r._TREE_CACHE[path_b], td_b_before)
+            # Non-reload call leaves both alone.
+            td_a_after = self.r._TREE_CACHE[path_a]
+            self.r.get_children(path_a)
+            self.assertIs(self.r._TREE_CACHE[path_a], td_a_after)
+        finally:
+            os.unlink(path_a)
+            os.unlink(path_b)
 
     def _fake_browser_with_children(self, path, children):
         seen_ops = []

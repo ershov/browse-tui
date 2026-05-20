@@ -41,7 +41,7 @@ def main():
         ],
     }
 
-    def get_children(parent_id):
+    def get_children(parent_id, *, reload=False):
         return list(children.get(parent_id or '', []))
 
     def get_preview(item_id):

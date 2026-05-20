@@ -25,7 +25,7 @@ def _logfile():
     return os.environ.get('INSERT_LOG', '/tmp/insert.log')
 
 
-def _get_children(parent):
+def _get_children(parent, *, reload=False):
     if parent is None:
         return [
             Item(id='a', has_children=True),

@@ -69,7 +69,7 @@ def _parse_list(text):
     return items
 
 
-def get_children(_):
+def get_children(_, *, reload=False):
     if not shutil.which('jira'):
         return _err('jira CLI not found — see https://github.com/go-jira/jira')
     try:

@@ -191,7 +191,7 @@ def _tool_tag(tool):
     return ('tool', 'cyan')
 
 
-def get_children(parent_id):
+def get_children(parent_id, *, reload=False):
     if parent_id is not None:
         return []
     if _client.init_error:

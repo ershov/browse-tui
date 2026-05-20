@@ -358,7 +358,7 @@ import sys
 from browse_tui import Action, Browser, Item
 
 
-def get_children(parent_id):
+def get_children(parent_id, *, reload=False):
     """Return children of parent_id. parent_id is None for the root."""
     if parent_id is None:
         return [Item(id='a', title='Apple', has_children=True),
@@ -398,7 +398,7 @@ Make it executable (`chmod +x my-recipe`), drop the shebang, run it.
 ```python
 import subprocess
 
-def get_children(parent_id):
+def get_children(parent_id, *, reload=False):
     result = subprocess.run(['plan', str(parent_id), 'list'],
                             capture_output=True, text=True, timeout=30)
     if result.returncode != 0:
@@ -409,7 +409,7 @@ def get_children(parent_id):
 #### Custom attributes that survive to actions
 
 ```python
-def get_children(_):
+def get_children(_, *, reload=False):
     items = [Item(id='a', title='Apple')]
     items[0].size = 1024
     items[0].mtime = time.time()

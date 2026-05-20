@@ -27,7 +27,7 @@ class TestCoalesceChildrenQueue(unittest.TestCase):
         gate = threading.Event()
         fetch_count = [0]
 
-        def slow_kids(pid):
+        def slow_kids(pid, *, reload=False):
             fetch_count[0] += 1
             gate.wait(timeout=2.0)
             return [Item(id=f'{pid}/c')]
@@ -69,7 +69,7 @@ class TestCoalesceChildrenQueue(unittest.TestCase):
         gate = threading.Event()
         fetch_count = [0]
 
-        def slow_kids(_pid):
+        def slow_kids(_pid, *, reload=False):
             fetch_count[0] += 1
             gate.wait(timeout=2.0)
             return []
@@ -101,7 +101,7 @@ class TestCoalesceChildrenQueue(unittest.TestCase):
         gate = threading.Event()
         fetch_count = [0]
 
-        def slow_kids(_pid):
+        def slow_kids(_pid, *, reload=False):
             fetch_count[0] += 1
             gate.wait(timeout=2.0)
             return []
@@ -143,7 +143,7 @@ class TestCoalesceChildrenQueue(unittest.TestCase):
         gate = threading.Event()
         seen = []
 
-        def slow_kids(pid):
+        def slow_kids(pid, *, reload=False):
             seen.append(pid)
             gate.wait(timeout=2.0)
             return []
@@ -173,7 +173,7 @@ class TestCoalesceChildrenQueue(unittest.TestCase):
         # cache-forever check.
         fetch_count = [0]
 
-        def kids(_pid):
+        def kids(_pid, *, reload=False):
             fetch_count[0] += 1
             return []
 

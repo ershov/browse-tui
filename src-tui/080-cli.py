@@ -1490,7 +1490,7 @@ def _build_lazy_browser(args, fields, record_sep, *, split='h'):
     timeout = args.action_timeout
     fmt = args.input
 
-    def get_children(parent_id):
+    def get_children(parent_id, *, reload=False):
         env = {**os.environ, 'TUI_ID': str(parent_id) if parent_id is not None else ''}
         try:
             proc = subprocess.run(

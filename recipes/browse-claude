@@ -395,17 +395,34 @@ def _indent_continuations(text, indent):
 # that shape before the plain-jsonl branch.
 
 
-def get_children(item_id):
+def get_children(item_id, *, reload=False):
+    # ``reload=True`` is the framework's explicit "this is a refresh,
+    # not an initial fetch" signal — see ``_do_refresh`` in 040-state.py
+    # and ticket #407. Honour it at every id shape so the framework can
+    # refresh a single subtree (one session file's tree, one subagent's
+    # tree, or the entire root) without disturbing the rest.
+    #
+    # Granularity:
+    #   * ``None``                — full wipe (root refresh / Ctrl-R).
+    #   * ``<jsonl>``             — bust just that file's _TreeData.
+    #   * ``<jsonl>#prompt/tool/span/…`` — bust the containing file's
+    #     _TreeData; one umbrella's children are derived from indexes
+    #     in the same file's TreeData so anything narrower is moot.
+    #   * ``<jsonl>#agent:<aid>`` — bust the subagent's file too.
+    #   * project dir            — nothing to bust (no _TreeData).
+    if reload and item_id is not None:
+        _bust_caches_for(item_id)
     if item_id is None:
-        # Indirect ``re-read all`` signal: the framework calls this on
-        # initial load AND every time ``ctx.refresh()`` / Ctrl-R fires
-        # (``_do_refresh(None)`` invalidates the framework children
-        # cache and re-enqueues the root). Clear the recipe-internal
-        # caches so the next per-file get_children rebuilds _TreeData
-        # and _TAIL_STATE from scratch — equivalent to ``re-creates
-        # all structure`` without intercepting the global command.
-        _TREE_CACHE.clear()
-        _TAIL_STATE.clear()
+        # ``get_children(None)`` fires on initial load AND on
+        # ``ctx.refresh()`` / Ctrl-R. The framework distinguishes the
+        # two via ``reload=True`` — only an explicit refresh wipes
+        # ``_TREE_CACHE`` / ``_TAIL_STATE``. Initial-load callers leave
+        # ``reload`` at the default — typical startup sequence already
+        # ran ``_scan_tree`` for the user's scope before the root
+        # listing fires, and we don't want to throw that work away.
+        if reload:
+            _TREE_CACHE.clear()
+            _TAIL_STATE.clear()
         return _list_projects()
     if isinstance(item_id, str) and '#agent:' in item_id:
         # Tree mode views the subagent .jsonl as its own tree, recursing
@@ -2732,12 +2749,51 @@ def _maybe_link_subagent(td, rec, owner_uuid, sub_dir, path):
                 td.agent_to_assistant_line[agent_id] = asst_line
 
 
+def _resolve_path_for_bust(item_id):
+    """Map an id shape to the .jsonl path whose ``_TreeData`` it depends on.
+
+    Returns ``None`` when ``item_id`` doesn't reference per-file scanned
+    state (project dirs, unparseable ids).
+    """
+    if not isinstance(item_id, str):
+        return None
+    # Subagent boundary: ``<sess>#agent:<aid>`` → subagent's own jsonl.
+    if '#agent:' in item_id:
+        sess, _, aid = item_id.partition('#agent:')
+        if not aid:
+            return None
+        agent_path = os.path.join(_subagents_dir(sess), f'agent-{aid}.jsonl')
+        return agent_path if os.path.isfile(agent_path) else None
+    # Any other ``<path>#...`` id resolves to ``<path>``.
+    if '#' in item_id:
+        path = item_id.partition('#')[0]
+        return path if path.endswith('.jsonl') and os.path.isfile(path) else None
+    # Bare .jsonl path.
+    if item_id.endswith('.jsonl') and os.path.isfile(item_id):
+        return item_id
+    return None
+
+
+def _bust_caches_for(item_id):
+    """Drop cached ``_TreeData`` + ``_TailState`` for one file's tree.
+
+    Used by ``get_children(..., reload=True)`` to refresh a single
+    subtree without disturbing siblings. No-op for ids that don't
+    resolve to a per-file ``_TreeData`` (project dirs, unparseable ids).
+    """
+    path = _resolve_path_for_bust(item_id)
+    if path is None:
+        return
+    _TREE_CACHE.pop(path, None)
+    _TAIL_STATE.pop(path, None)
+
+
 def _scan_tree(path):
     """Return cached ``_TreeData`` for ``path``; bulk-scan on cache miss.
 
-    Cache invalidation is explicit (``get_children(None)`` clears
-    ``_TREE_CACHE`` + ``_TAIL_STATE`` on Ctrl-R / ``ctx.refresh()`` /
-    initial load). The live-tail worker keeps the cached ``td`` in
+    Cache invalidation is explicit (``get_children(id, reload=True)``
+    drops the entry; ``get_children(None, reload=True)`` clears
+    everything). The live-tail worker keeps the cached ``td`` in
     sync with file growth — no time-based check needed. A bulk scan
     on cache miss bootstraps ``_TAIL_STATE`` from the file's current
     end so the tail resumes from the exact byte where this scan stopped.

@@ -27,7 +27,7 @@ class TestEmptyListReturn(unittest.TestCase):
     """Empty list return → batch of just ``[complete(parent_id)]``."""
 
     def test_empty_list_clears_loading_flag(self):
-        b = make_browser(get_children=lambda _: [], root_id='/')
+        b = make_browser(get_children=lambda _, *, reload=False: [], root_id='/')
         try:
             p = b.refresh('/')
             b.run_until_idle()
@@ -41,7 +41,7 @@ class TestEmptyListReturn(unittest.TestCase):
         # Visible-tree builder distinguishes "absent" (placeholder) from
         # "empty list" (render nothing) — empty return must yield the
         # latter so the placeholder row goes away.
-        b = make_browser(get_children=lambda _: [], root_id='/')
+        b = make_browser(get_children=lambda _, *, reload=False: [], root_id='/')
         try:
             b.refresh('/')
             b.run_until_idle()
@@ -54,7 +54,7 @@ class TestNoneReturn(unittest.TestCase):
     """``None`` return: no batch posted; ``_loading`` stays True."""
 
     def test_none_return_leaves_loading_true(self):
-        b = make_browser(get_children=lambda _: None, root_id='/')
+        b = make_browser(get_children=lambda _, *, reload=False: None, root_id='/')
         try:
             b.refresh('/')
             b.run_until_idle()
@@ -65,7 +65,7 @@ class TestNoneReturn(unittest.TestCase):
             b.stop_workers()
 
     def test_none_return_does_not_populate_cache_with_items(self):
-        b = make_browser(get_children=lambda _: None, root_id='/')
+        b = make_browser(get_children=lambda _, *, reload=False: None, root_id='/')
         try:
             b.refresh('/')
             b.run_until_idle()
@@ -81,7 +81,7 @@ class TestNoneReturn(unittest.TestCase):
         # strand on a None-returning recipe — the worker has finished
         # its job even if the data will arrive via a separate push.
         events = []
-        b = make_browser(get_children=lambda _: None, root_id='/')
+        b = make_browser(get_children=lambda _, *, reload=False: None, root_id='/')
         try:
             b.refresh('/').then(lambda: events.append('done'))
             b.run_until_idle()
@@ -94,7 +94,7 @@ class TestMixedShapeReturn(unittest.TestCase):
     """Mixed Item / str / tuple / dict in one return list — all coerced."""
 
     def test_mixed_shapes_all_land_in_cache(self):
-        def kids(_pid):
+        def kids(_pid, *, reload=False):
             return [
                 Item(id='a', title='A'),                # Item
                 'b',                                    # str → leaf
@@ -121,7 +121,7 @@ class TestMixedShapeReturn(unittest.TestCase):
     def test_custom_attrs_survive_to_cache(self):
         # Items with recipe-attached custom attrs must round-trip
         # through the upsert ops (``fields_of`` includes ``__dict__``).
-        def kids(_pid):
+        def kids(_pid, *, reload=False):
             it = Item(id='x', title='X')
             it.size = 42
             it.path = '/x'
@@ -144,7 +144,7 @@ class TestPendingFiresAfterApply(unittest.TestCase):
     def test_then_sees_cache_populated(self):
         observed = []
 
-        def kids(_pid):
+        def kids(_pid, *, reload=False):
             return [Item(id='a'), Item(id='b')]
 
         b = make_browser(get_children=kids, root_id='/')
@@ -162,7 +162,7 @@ class TestPendingFiresAfterApply(unittest.TestCase):
     def test_then_sees_loading_cleared(self):
         observed = []
 
-        b = make_browser(get_children=lambda _: [], root_id='/')
+        b = make_browser(get_children=lambda _, *, reload=False: [], root_id='/')
         try:
             (b.refresh('/')
                 .then(lambda: observed.append(
@@ -181,7 +181,7 @@ class TestPendingFiresAfterApply(unittest.TestCase):
         # ``_children``.
         observed = []
 
-        def kids(_pid):
+        def kids(_pid, *, reload=False):
             return [Item(id='a'), Item(id='b')]
 
         b = make_browser(get_children=kids, root_id='/')
@@ -212,7 +212,7 @@ class TestWatcherDuringFetch(unittest.TestCase):
         gate = threading.Event()
         released = threading.Event()
 
-        def slow_kids(_pid):
+        def slow_kids(_pid, *, reload=False):
             # Block the worker so we can land a watcher push first.
             gate.wait(timeout=2.0)
             released.set()
@@ -262,7 +262,7 @@ class TestWatcherDuringFetch(unittest.TestCase):
         # The reverse ordering: worker delivers first, watcher pushes
         # after. Both items must end up in the cache.
         b = make_browser(
-            get_children=lambda _: [Item(id='a')],
+            get_children=lambda _, *, reload=False: [Item(id='a')],
             root_id='p',
         )
         try:
@@ -286,7 +286,7 @@ class TestWorkerDoesNotUseLegacyDeque(unittest.TestCase):
 
     def test_worker_delivery_does_not_enqueue_to_children_results(self):
         b = make_browser(
-            get_children=lambda _: [Item(id='a')],
+            get_children=lambda _, *, reload=False: [Item(id='a')],
             root_id='/',
         )
         try:

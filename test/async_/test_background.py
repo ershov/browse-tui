@@ -16,7 +16,7 @@ from test.async_._helpers import make_browser
 class TestBackgroundUpdates(unittest.TestCase):
 
     def test_watcher_thread_can_refresh(self):
-        b = make_browser(get_children=lambda _id: [(f'{_id}/c',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: [(f'{_id}/c',)])
         try:
             def watcher():
                 b.refresh('A')
@@ -47,7 +47,7 @@ class TestBackgroundUpdates(unittest.TestCase):
         # Each watcher tick adds an item to the recipe's view of the
         # world; after each refresh, the cache reflects the latest view.
         store = {'children': []}
-        def get_children(_id):
+        def get_children(_id, *, reload=False):
             return list(store['children'])
         b = make_browser(get_children=get_children)
         try:

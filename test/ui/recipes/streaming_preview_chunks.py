@@ -23,7 +23,7 @@ from browse_tui import Browser, BrowserConfig, Item
 def main():
     delay = float(sys.argv[1]) if len(sys.argv) > 1 else 0.2
 
-    def get_children(parent_id):
+    def get_children(parent_id, *, reload=False):
         if parent_id in (None, ''):
             return [Item(id='item', title='item')]
         return []

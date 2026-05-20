@@ -30,7 +30,7 @@ def main():
     # visible" assertions to be deterministic on a busy host.
     delay = float(sys.argv[1]) if len(sys.argv) > 1 else 1.0
 
-    def get_children(parent_id):
+    def get_children(parent_id, *, reload=False):
         if parent_id not in (None, ''):
             return []
         yield [Item(id='a-1', title='a-1'),

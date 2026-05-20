@@ -69,7 +69,7 @@ class TestChildrenWorkerFifo(unittest.TestCase):
 
     def test_refresh_fetches_and_resolves(self):
         calls = []
-        def get_children(id_):
+        def get_children(id_, *, reload=False):
             calls.append(id_)
             return [(f'{id_}/a',), (f'{id_}/b',)]
         b = make_browser(get_children=get_children)
@@ -90,7 +90,7 @@ class TestChildrenWorkerFifo(unittest.TestCase):
         # Block per-id so we can confirm ordering even on a fast machine:
         # each fetch records the id then sleeps a touch -- a LIFO worker
         # would interleave or reverse the writes.
-        def get_children(id_):
+        def get_children(id_, *, reload=False):
             order.append(id_)
             time.sleep(0.005)
             return []
@@ -111,7 +111,7 @@ class TestChildrenWorkerFifo(unittest.TestCase):
         # in test_coalesce.py; this one keeps the cross-thread "submit
         # from another thread" coverage.
         calls = []
-        def get_children(id_):
+        def get_children(id_, *, reload=False):
             calls.append(id_)
             return []
         b = make_browser(get_children=get_children)
@@ -138,7 +138,7 @@ class TestChildrenWorkerFifo(unittest.TestCase):
             b.stop_workers()
 
     def test_get_children_error_resolves_pending_with_empty_cache(self):
-        def boom(id_):
+        def boom(id_, *, reload=False):
             raise RuntimeError('kaboom')
         b = make_browser(get_children=boom)
         try:

@@ -27,7 +27,7 @@ class TestListYieldingGenerator(unittest.TestCase):
     """Generator that yields lists of items — each list is one batch."""
 
     def test_list_yields_land_in_order(self):
-        def kids(_pid):
+        def kids(_pid, *, reload=False):
             yield [Item(id='a'), Item(id='b')]
             yield [Item(id='c')]
 
@@ -41,7 +41,7 @@ class TestListYieldingGenerator(unittest.TestCase):
             b.stop_workers()
 
     def test_clean_exhaustion_clears_loading(self):
-        def kids(_pid):
+        def kids(_pid, *, reload=False):
             yield [Item(id='a')]
 
         b = make_browser(get_children=kids, root_id='/')
@@ -58,7 +58,7 @@ class TestSingleItemYieldingGenerator(unittest.TestCase):
     """Each yield is a single Item / tuple / dict / str — coerced via to_item."""
 
     def test_single_yields_all_coerced(self):
-        def kids(_pid):
+        def kids(_pid, *, reload=False):
             yield Item(id='a', title='A')
             yield ('b', 'B')
             yield {'id': 'c', 'title': 'C'}
@@ -83,7 +83,7 @@ class TestMixedYields(unittest.TestCase):
     """Generator that mixes list yields and single-item yields."""
 
     def test_mixed_list_and_single_yields(self):
-        def kids(_pid):
+        def kids(_pid, *, reload=False):
             yield Item(id='a')                       # single Item
             yield [Item(id='b'), Item(id='c')]       # batch
             yield ('d', 'D')                         # single tuple
@@ -103,7 +103,7 @@ class TestEmptyGenerator(unittest.TestCase):
     """Immediate StopIteration with no yields — like an empty list return."""
 
     def test_empty_generator_clears_loading(self):
-        def kids(_pid):
+        def kids(_pid, *, reload=False):
             return
             yield  # noqa — unreachable, makes this a generator function
 
@@ -117,7 +117,7 @@ class TestEmptyGenerator(unittest.TestCase):
             b.stop_workers()
 
     def test_empty_generator_leaves_cache_as_empty_list(self):
-        def kids(_pid):
+        def kids(_pid, *, reload=False):
             return
             yield  # noqa
 
@@ -135,7 +135,7 @@ class TestEmptyGenerator(unittest.TestCase):
     def test_empty_generator_resolves_pending(self):
         events = []
 
-        def kids(_pid):
+        def kids(_pid, *, reload=False):
             return
             yield  # noqa
 
@@ -152,7 +152,7 @@ class TestGeneratorRaisesMidStream(unittest.TestCase):
     """Mid-stream exception: prior items survive, loading stays, error surfaces."""
 
     def test_partial_items_present_after_raise(self):
-        def kids(_pid):
+        def kids(_pid, *, reload=False):
             yield [Item(id='a'), Item(id='b')]
             raise RuntimeError('boom')
 
@@ -167,7 +167,7 @@ class TestGeneratorRaisesMidStream(unittest.TestCase):
             b.stop_workers()
 
     def test_loading_stays_true_after_raise(self):
-        def kids(_pid):
+        def kids(_pid, *, reload=False):
             yield [Item(id='a')]
             raise RuntimeError('boom')
 
@@ -182,7 +182,7 @@ class TestGeneratorRaisesMidStream(unittest.TestCase):
             b.stop_workers()
 
     def test_error_surfaces_via_browser_error(self):
-        def kids(_pid):
+        def kids(_pid, *, reload=False):
             yield [Item(id='a')]
             raise RuntimeError('boom')
 
@@ -198,7 +198,7 @@ class TestGeneratorRaisesMidStream(unittest.TestCase):
     def test_pending_still_resolves_after_raise(self):
         events = []
 
-        def kids(_pid):
+        def kids(_pid, *, reload=False):
             yield [Item(id='a')]
             raise RuntimeError('boom')
 
@@ -226,7 +226,7 @@ class TestIncrementalVisibility(unittest.TestCase):
         gate1 = threading.Event()
         gate2 = threading.Event()
 
-        def kids(_pid):
+        def kids(_pid, *, reload=False):
             yield [Item(id='a')]
             gate1.wait(timeout=2.0)
             yield [Item(id='b')]
@@ -286,7 +286,7 @@ class TestPendingFiresAfterExhaustion(unittest.TestCase):
     def test_pending_fires_once_after_all_yields(self):
         observed = []
 
-        def kids(_pid):
+        def kids(_pid, *, reload=False):
             yield [Item(id='a')]
             yield [Item(id='b')]
             yield [Item(id='c')]
@@ -307,7 +307,7 @@ class TestPendingFiresAfterExhaustion(unittest.TestCase):
     def test_pending_fires_once_for_empty_generator(self):
         observed = []
 
-        def kids(_pid):
+        def kids(_pid, *, reload=False):
             return
             yield  # noqa — empty generator
 
@@ -324,7 +324,7 @@ class TestListReturnRegression(unittest.TestCase):
     """Sanity: a non-generator list return still uses #271's path."""
 
     def test_plain_list_return_still_works(self):
-        def kids(_pid):
+        def kids(_pid, *, reload=False):
             return [Item(id='a'), Item(id='b'), Item(id='c')]
 
         b = make_browser(get_children=kids, root_id='/')
@@ -339,7 +339,7 @@ class TestListReturnRegression(unittest.TestCase):
             b.stop_workers()
 
     def test_plain_empty_list_return_still_works(self):
-        b = make_browser(get_children=lambda _: [], root_id='/')
+        b = make_browser(get_children=lambda _, *, reload=False: [], root_id='/')
         try:
             b.refresh('/')
             b.run_until_idle()
@@ -349,7 +349,7 @@ class TestListReturnRegression(unittest.TestCase):
             b.stop_workers()
 
     def test_none_return_still_leaves_loading_true(self):
-        b = make_browser(get_children=lambda _: None, root_id='/')
+        b = make_browser(get_children=lambda _, *, reload=False: None, root_id='/')
         try:
             b.refresh('/')
             b.run_until_idle()
@@ -363,7 +363,7 @@ class TestGeneratorCustomAttrsSurvive(unittest.TestCase):
     """Recipe-attached custom attrs survive through generator delivery."""
 
     def test_custom_attrs_preserved_via_fields_of_item(self):
-        def kids(_pid):
+        def kids(_pid, *, reload=False):
             it1 = Item(id='x', title='X')
             it1.size = 42
             it1.path = '/x'

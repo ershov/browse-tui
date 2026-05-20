@@ -102,7 +102,7 @@ to_item({'id': 'a', 'size': 42}).size       # 42 — extras attach
 Mixed lists are valid:
 
 ```python
-def get_children(_):
+def get_children(_, *, reload=False):
     return ['plain', ('id2', 'titled'), {'id': 'rich', 'tag': 'NEW'}]
 ```
 
@@ -499,7 +499,7 @@ from browse_tui import Browser, BrowserConfig
 
 b = Browser(BrowserConfig(
     title='browse-tui',
-    get_children=lambda _: [],            # (parent_id) -> Iterable[Item|str|tuple|dict]
+    get_children=lambda _, *, reload=False: [],            # (parent_id) -> Iterable[Item|str|tuple|dict]
     get_preview=None,                     # (item_id) -> str  (optional)
     actions=None,                         # list[Action]
     on_enter=None,                        # default Enter handler; see below
@@ -575,7 +575,7 @@ def on_quit(ctx):
 
 ### Callbacks
 
-#### `get_children(parent_id) -> Iterable[Item|str|tuple|dict] | Generator | None`
+#### `get_children(parent_id, *, reload=False) -> Iterable[Item|str|tuple|dict] | Generator | None`
 
 Required (in practice). Called per parent-being-expanded, on a worker thread.
 Return any iterable of items in any of the four shapes accepted by `to_item`.
@@ -584,13 +584,20 @@ Mixed lists are fine. The result is cached until `ctx.refresh(parent_id)` or
 
 For the very first call, `parent_id` is `root_id`.
 
+`reload` is `True` only on the root refresh enqueue (Ctrl-R / `ctx.refresh()`
+with no id) — a single signal that means "drop any recipe-internal caches
+and rebuild from scratch." Every other call (expand, auto-prefetch,
+re-dispatched expanded ids during the same refresh) passes `reload=False`;
+the framework's own `cache_invalidate_all` already wiped `state._children`
+so per-id re-signalling would be redundant.
+
 Errors raised inside `get_children` are caught at the worker boundary: the
 parent's children become `[]` (preventing retry storms), the error is
 surfaced via the info bar, and any `Pending` waiting on the fetch still
 resolves (callback chains keep firing).
 
 ```python
-def get_children(parent_id):
+def get_children(parent_id, *, reload=False):
     if parent_id is None:
         parent_id = '/'
     return [Item(id=os.path.join(parent_id, n), title=n,
@@ -611,7 +618,7 @@ else (`Item`, `tuple`, `dict`, `str`) is a single item coerced via `to_item` —
 same flexibility as today's mixed return lists, applied per-yield.
 
 ```python
-def get_children(parent_id):
+def get_children(parent_id, *, reload=False):
     page = 0
     while True:
         rows = jira_search(parent_id, offset=page * 100, limit=100)
@@ -1547,7 +1554,7 @@ Minimal but full-featured recipe:
 import os, sys
 from browse_tui import Action, Browser, Item
 
-def get_children(path):
+def get_children(path, *, reload=False):
     if not path:
         path = os.getcwd()
     out = []

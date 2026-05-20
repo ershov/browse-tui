@@ -14,7 +14,7 @@ from browse_tui import Browser, BrowserConfig, Item
 
 
 def main():
-    def get_children(parent_id):
+    def get_children(parent_id, *, reload=False):
         if parent_id in (None, ''):
             return [Item(id='item', title='item')]
         return []

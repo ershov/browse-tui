@@ -22,7 +22,7 @@ def main():
     delay = float(sys.argv[1]) if len(sys.argv) > 1 else 1.0
     show_children_pane = '--no-children-pane' not in sys.argv[2:]
 
-    def get_children(parent_id):
+    def get_children(parent_id, *, reload=False):
         if parent_id in (None, ''):
             return [Item(id='parent', title='parent', has_children=True)]
         # Slow path: simulate a long-running fetch.

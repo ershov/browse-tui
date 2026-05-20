@@ -136,7 +136,7 @@ def _parse_ticket_line(line):
 #   - any positive int               -> direct children of ticket ``parent_id``.
 
 
-def get_children(parent_id):
+def get_children(parent_id, *, reload=False):
     """Lazy children fetch via the ``plan`` CLI.
 
     Plan-tui's behaviour for the root scope: synthesize a "Project" entry

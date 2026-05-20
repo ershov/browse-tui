@@ -19,7 +19,7 @@ import unittest
 from test.async_._helpers import Item, make_browser
 
 
-def _tree_get_children(parent_id):
+def _tree_get_children(parent_id, *, reload=False):
     """Minimal tree: / → a → a/b → a/b/c, a/b/c has one child a/b/c/leaf."""
     if parent_id is None or parent_id == '/':
         return [Item(id='a', title='A', has_children=True)]
@@ -51,7 +51,7 @@ class TestFullRefreshExpanded(unittest.TestCase):
         calls = []
         lock = threading.Lock()
 
-        def tracked(parent_id):
+        def tracked(parent_id, *, reload=False):
             with lock:
                 calls.append(parent_id)
             return _tree_get_children(parent_id)
@@ -104,7 +104,7 @@ class TestFullRefreshExpanded(unittest.TestCase):
         calls = []
         lock = threading.Lock()
 
-        def tracked(parent_id):
+        def tracked(parent_id, *, reload=False):
             with lock:
                 calls.append(parent_id)
             return _tree_get_children(parent_id)

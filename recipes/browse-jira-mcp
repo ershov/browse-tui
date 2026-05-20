@@ -225,7 +225,7 @@ def _status_style(category):
     }.get(category, 'white')
 
 
-def get_children(parent_id):
+def get_children(parent_id, *, reload=False):
     if parent_id is not None:
         return []
     bad = _check_env()

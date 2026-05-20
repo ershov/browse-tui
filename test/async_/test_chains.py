@@ -15,7 +15,7 @@ class TestThen(unittest.TestCase):
 
     def test_refresh_then_callback_fires_after_fetch(self):
         events = []
-        b = make_browser(get_children=lambda _: [])
+        b = make_browser(get_children=lambda _, *, reload=False: [])
         try:
             p = b.refresh('A').then(lambda: events.append('done'))
             self.assertIsInstance(p, Pending)
@@ -28,7 +28,7 @@ class TestThen(unittest.TestCase):
 
     def test_on_complete_kwarg_equivalent_to_then(self):
         events = []
-        b = make_browser(get_children=lambda _: [])
+        b = make_browser(get_children=lambda _, *, reload=False: [])
         try:
             b.refresh('A', on_complete=lambda: events.append('done'))
             b.run_until_idle()
@@ -38,7 +38,7 @@ class TestThen(unittest.TestCase):
 
     def test_two_thens_fire_in_order(self):
         events = []
-        b = make_browser(get_children=lambda _: [])
+        b = make_browser(get_children=lambda _, *, reload=False: [])
         try:
             (b.refresh('A')
                 .then(lambda: events.append(1))
@@ -50,7 +50,7 @@ class TestThen(unittest.TestCase):
 
     def test_refresh_then_kicks_second_refresh(self):
         seen = []
-        def get_children(id_):
+        def get_children(id_, *, reload=False):
             seen.append(id_)
             return []
         b = make_browser(get_children=get_children)
@@ -66,7 +66,7 @@ class TestThen(unittest.TestCase):
 
     def test_two_level_chain_across_refreshes(self):
         events = []
-        def get_children(id_):
+        def get_children(id_, *, reload=False):
             return []
         b = make_browser(get_children=get_children)
         try:
@@ -83,7 +83,7 @@ class TestThen(unittest.TestCase):
         # apply_children_results runs. After run_until_idle, attaching a
         # .then must fire synchronously.
         events = []
-        b = make_browser(get_children=lambda _: [])
+        b = make_browser(get_children=lambda _, *, reload=False: [])
         try:
             p = b.refresh('A')
             b.run_until_idle()

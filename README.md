@@ -53,7 +53,7 @@ inherited unchanged.
 import os
 from browse_tui import Browser, Item, Action
 
-def get_children(path):
+def get_children(path, *, reload=False):
     if not path:
         path = os.getcwd()
     return [

@@ -52,7 +52,7 @@ class TestConstructionDefaults(unittest.TestCase):
         b = Browser(BrowserConfig(
             _headless=True,
             title='foo',
-            get_children=lambda _id: [],
+            get_children=lambda _id, *, reload=False: [],
             root_id='/',
             initial_scope='/x',
         ))
@@ -107,7 +107,7 @@ class TestCursorTo(unittest.TestCase):
 
     def _browser_with_root_children(self, ids):
         # One-level cache: root_id -> [Item, Item, ...]; no nested children.
-        b = make_browser(get_children=lambda _id: [(i,) for i in ids])
+        b = make_browser(get_children=lambda _id, *, reload=False: [(i,) for i in ids])
         b.refresh()  # populate root
         b.run_until_idle()
         return b
@@ -154,7 +154,7 @@ class TestExpand(unittest.TestCase):
 
     def test_expand_uncached_triggers_fetch_and_resolves(self):
         seen = []
-        def gc(id_):
+        def gc(id_, *, reload=False):
             seen.append(id_)
             return [(f'{id_}/x',)]
         b = make_browser(get_children=gc)
@@ -172,7 +172,7 @@ class TestExpand(unittest.TestCase):
 
     def test_expand_already_cached_resolves_without_extra_fetch(self):
         seen = []
-        def gc(id_):
+        def gc(id_, *, reload=False):
             seen.append(id_)
             return []
         b = make_browser(get_children=gc)
@@ -190,7 +190,7 @@ class TestExpand(unittest.TestCase):
 
     def test_expand_chain(self):
         events = []
-        b = make_browser(get_children=lambda _id: [])
+        b = make_browser(get_children=lambda _id, *, reload=False: [])
         try:
             b.expand('A').then(
                 lambda: b.expand('B').then(
@@ -427,7 +427,7 @@ class TestThreadSafeOps(unittest.TestCase):
 
     def test_refresh_from_background_thread(self):
         seen = []
-        def gc(id_):
+        def gc(id_, *, reload=False):
             seen.append(id_)
             return [(f'{id_}/c',)]
         b = make_browser(get_children=gc)
@@ -443,7 +443,7 @@ class TestThreadSafeOps(unittest.TestCase):
             b.stop_workers()
 
     def test_cursor_to_from_background_thread(self):
-        b = make_browser(get_children=lambda _id: [('A',), ('B',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: [('A',), ('B',)])
         try:
             b.refresh()
             b.run_until_idle()
@@ -489,7 +489,7 @@ class TestCursorAnchor(unittest.TestCase):
         """Build a get_children that returns ``root_children`` for the
         root id and ``sub`` for the named parent.
         """
-        def gc(parent_id):
+        def gc(parent_id, *, reload=False):
             if parent_id in ('', None):
                 return root_children
             return sub.get(parent_id, [])
@@ -498,7 +498,7 @@ class TestCursorAnchor(unittest.TestCase):
     def test_anchor_seeded_from_initial_cursor(self):
         # After the first apply_children_results, the anchor should be
         # primed with the cursor's row id (lazy init).
-        b = make_browser(get_children=lambda _id: [('A',), ('B',), ('C',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: [('A',), ('B',), ('C',)])
         try:
             b.refresh()
             b.run_until_idle()
@@ -513,7 +513,7 @@ class TestCursorAnchor(unittest.TestCase):
         # Cursor on 'B' (idx 1). update_data inserts a new row above it.
         # Without the anchor, cursor would stay at idx 1 (now 'NEW').
         # With the anchor, cursor follows 'B' to its new idx.
-        b = make_browser(get_children=lambda _id: [('A',), ('B',), ('C',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: [('A',), ('B',), ('C',)])
         try:
             b.refresh()
             b.run_until_idle()
@@ -540,7 +540,7 @@ class TestCursorAnchor(unittest.TestCase):
             b.stop_workers()
 
     def test_anchor_falls_back_to_next_sibling_when_primary_removed(self):
-        b = make_browser(get_children=lambda _id: [('A',), ('B',), ('C',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: [('A',), ('B',), ('C',)])
         try:
             b.refresh()
             b.run_until_idle()
@@ -563,7 +563,7 @@ class TestCursorAnchor(unittest.TestCase):
             b.stop_workers()
 
     def test_anchor_falls_back_to_prev_sibling_when_last_item(self):
-        b = make_browser(get_children=lambda _id: [('A',), ('B',), ('C',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: [('A',), ('B',), ('C',)])
         try:
             b.refresh()
             b.run_until_idle()
@@ -660,7 +660,7 @@ class TestCursorAnchor(unittest.TestCase):
         # When the primary lands, the snapshot is refreshed — capturing
         # the *current* neighbours. Later if primary is removed again,
         # the fallback uses fresh neighbours, not stale ones.
-        b = make_browser(get_children=lambda _id: [('A',), ('B',), ('C',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: [('A',), ('B',), ('C',)])
         try:
             b.refresh()
             b.run_until_idle()
@@ -689,7 +689,7 @@ class TestCursorAnchor(unittest.TestCase):
             b.stop_workers()
 
     def test_anchor_returns_to_primary_when_it_reappears(self):
-        b = make_browser(get_children=lambda _id: [('A',), ('B',), ('C',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: [('A',), ('B',), ('C',)])
         try:
             b.refresh()
             b.run_until_idle()
@@ -721,7 +721,7 @@ class TestCursorAnchor(unittest.TestCase):
         # be back on C once the refresh completes, regardless of how
         # long the worker took.
         items = [('A',), ('B',), ('C',), ('D',), ('E',)]
-        def gc(_id):
+        def gc(_id, *, reload=False):
             # Tiny sleep simulates a slow recipe — long enough that the
             # cache invalidation between refresh start and worker
             # delivery is observable.
@@ -767,7 +767,7 @@ class TestCursorAnchor(unittest.TestCase):
         }
         root = [('A', None, None, '', True)]
 
-        def gc(parent_id):
+        def gc(parent_id, *, reload=False):
             time.sleep(0.01)   # widen the loading window per level
             if parent_id in ('', None):
                 return root
@@ -809,7 +809,7 @@ class TestCursorAnchor(unittest.TestCase):
         # cursor item, the cursor lands on a tier-2 fallback (next
         # sibling).
         delivery = {'first': True}
-        def gc(_id):
+        def gc(_id, *, reload=False):
             time.sleep(0.02)
             if delivery['first']:
                 delivery['first'] = False
@@ -872,7 +872,7 @@ class TestCursorAnchor(unittest.TestCase):
     def test_anchor_clamps_to_index_when_entire_chain_missing(self):
         # When primary AND every fallback id is gone, the cursor falls
         # back to the index clamp (existing behavior).
-        b = make_browser(get_children=lambda _id: [('A',), ('B',), ('C',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: [('A',), ('B',), ('C',)])
         try:
             b.refresh()
             b.run_until_idle()
@@ -919,7 +919,7 @@ class TestExpandGoal(unittest.TestCase):
         """Build a get_children callable from a dict mapping parent id →
         list of (id, parent, _, _, has_children) tuples. None / '' → root.
         """
-        def gc(parent_id):
+        def gc(parent_id, *, reload=False):
             return parent_children.get(parent_id, parent_children.get(None, []))
         return gc
 
@@ -1087,7 +1087,7 @@ class TestExpandGoal(unittest.TestCase):
         rows = [('R0',), ('R1',), ('R2',), ('R3',), ('R4',),
                 ('P', None, None, '', True)]
         delivered = {'first': True}
-        def gc(parent_id):
+        def gc(parent_id, *, reload=False):
             if parent_id in ('', None):
                 return rows
             if parent_id == 'P':
@@ -1155,7 +1155,7 @@ class TestExpandGoal(unittest.TestCase):
         children = [(f'P.{i}',) for i in range(3)]
         rows = [('R0',), ('R1',), ('R2',), ('R3',), ('R4',),
                 ('P', None, None, '', True)]
-        def gc(parent_id):
+        def gc(parent_id, *, reload=False):
             if parent_id in ('', None):
                 return rows
             if parent_id == 'P':
@@ -1212,7 +1212,7 @@ class TestExpandGoal(unittest.TestCase):
         delivery_gate = threading.Event()
         rows = [('R0',), ('R1',), ('R2',), ('R3',), ('R4',),
                 ('P', None, None, '', True)]
-        def gc(parent_id):
+        def gc(parent_id, *, reload=False):
             if parent_id in ('', None):
                 return rows
             if parent_id == 'P':
@@ -1310,7 +1310,7 @@ class TestHideDisplacement(unittest.TestCase):
     """
 
     def test_cursor_on_hidden_row_walks_back(self):
-        b = make_browser(get_children=lambda _id: [
+        b = make_browser(get_children=lambda _id, *, reload=False: [
             ('A',), ('B',), ('C',), ('D',),
         ])
         try:
@@ -1331,7 +1331,7 @@ class TestHideDisplacement(unittest.TestCase):
             b.stop_workers()
 
     def test_cursor_lands_on_first_when_all_above_hidden(self):
-        b = make_browser(get_children=lambda _id: [
+        b = make_browser(get_children=lambda _id, *, reload=False: [
             ('A',), ('B',), ('C',),
         ])
         try:
@@ -1354,7 +1354,7 @@ class TestHideDisplacement(unittest.TestCase):
             b.stop_workers()
 
     def test_cursor_on_first_row_hidden_lands_on_new_first(self):
-        b = make_browser(get_children=lambda _id: [
+        b = make_browser(get_children=lambda _id, *, reload=False: [
             ('A',), ('B',), ('C',),
         ])
         try:
@@ -1372,7 +1372,7 @@ class TestHideDisplacement(unittest.TestCase):
             b.stop_workers()
 
     def test_unrelated_hide_does_not_move_cursor(self):
-        b = make_browser(get_children=lambda _id: [
+        b = make_browser(get_children=lambda _id, *, reload=False: [
             ('A',), ('B',), ('C',),
         ])
         try:
@@ -1394,7 +1394,7 @@ class TestHideDisplacement(unittest.TestCase):
     def test_hidden_ancestor_displaces_cursor_on_descendant(self):
         gc_root = [('P', None, None, '', True), ('X',)]
 
-        def gc(parent_id):
+        def gc(parent_id, *, reload=False):
             if parent_id in (None, ''):
                 return gc_root
             if parent_id == 'P':
@@ -1424,7 +1424,7 @@ class TestHideDisplacement(unittest.TestCase):
     def test_delete_uses_anchor_not_hide_displacement(self):
         # If the cursor's id is *removed* (not hidden), the anchor's
         # fallback chain (next-sibling-first) handles it.
-        b = make_browser(get_children=lambda _id: [
+        b = make_browser(get_children=lambda _id, *, reload=False: [
             ('A',), ('B',), ('C',), ('D',),
         ])
         try:
@@ -1445,7 +1445,7 @@ class TestHideDisplacement(unittest.TestCase):
     def test_reanchor_after_displacement(self):
         # After hide-displacement the new cursor row id becomes the
         # primary anchor.
-        b = make_browser(get_children=lambda _id: [
+        b = make_browser(get_children=lambda _id, *, reload=False: [
             ('A',), ('B',), ('C',),
         ])
         try:
@@ -1462,7 +1462,7 @@ class TestHideDisplacement(unittest.TestCase):
             b.stop_workers()
 
     def test_hide_then_show_in_same_batch_no_net_movement(self):
-        b = make_browser(get_children=lambda _id: [
+        b = make_browser(get_children=lambda _id, *, reload=False: [
             ('A',), ('B',), ('C',),
         ])
         try:
@@ -1506,7 +1506,7 @@ class TestCursorPin(unittest.TestCase):
         self.assertEqual(repr(_state.PIN_LAST), '<PIN_LAST>')
 
     def test_nav_home_sets_pin_first(self):
-        b = make_browser(get_children=lambda _id: [('A',), ('B',), ('C',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: [('A',), ('B',), ('C',)])
         try:
             b.refresh()
             b.run_until_idle()
@@ -1522,7 +1522,7 @@ class TestCursorPin(unittest.TestCase):
             b.stop_workers()
 
     def test_nav_end_sets_pin_last(self):
-        b = make_browser(get_children=lambda _id: [('A',), ('B',), ('C',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: [('A',), ('B',), ('C',)])
         try:
             b.refresh()
             b.run_until_idle()
@@ -1534,7 +1534,7 @@ class TestCursorPin(unittest.TestCase):
             b.stop_workers()
 
     def test_pin_first_follows_new_first_row(self):
-        b = make_browser(get_children=lambda _id: [('B',), ('C',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: [('B',), ('C',)])
         try:
             b.refresh()
             b.run_until_idle()
@@ -1558,7 +1558,7 @@ class TestCursorPin(unittest.TestCase):
             b.stop_workers()
 
     def test_pin_last_follows_new_last_row(self):
-        b = make_browser(get_children=lambda _id: [('A',), ('B',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: [('A',), ('B',)])
         try:
             b.refresh()
             b.run_until_idle()
@@ -1577,7 +1577,7 @@ class TestCursorPin(unittest.TestCase):
             b.stop_workers()
 
     def test_pin_last_follows_when_last_row_hidden(self):
-        b = make_browser(get_children=lambda _id: [('A',), ('B',), ('C',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: [('A',), ('B',), ('C',)])
         try:
             b.refresh()
             b.run_until_idle()
@@ -1597,7 +1597,7 @@ class TestCursorPin(unittest.TestCase):
     def test_pin_first_clears_on_j(self):
         # Pressing 'j' (cursor down) should clear PIN_FIRST and
         # capture an id-based anchor.
-        b = make_browser(get_children=lambda _id: [('A',), ('B',), ('C',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: [('A',), ('B',), ('C',)])
         try:
             b.refresh()
             b.run_until_idle()
@@ -1630,7 +1630,7 @@ class TestCursorPin(unittest.TestCase):
             b.stop_workers()
 
     def test_pin_first_swapped_by_pin_last(self):
-        b = make_browser(get_children=lambda _id: [('A',), ('B',), ('C',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: [('A',), ('B',), ('C',)])
         try:
             b.refresh()
             b.run_until_idle()
@@ -1645,7 +1645,7 @@ class TestCursorPin(unittest.TestCase):
             b.stop_workers()
 
     def test_pin_clears_on_cursor_to(self):
-        b = make_browser(get_children=lambda _id: [('A',), ('B',), ('C',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: [('A',), ('B',), ('C',)])
         try:
             b.refresh()
             b.run_until_idle()
@@ -1661,7 +1661,7 @@ class TestCursorPin(unittest.TestCase):
 
     def test_pin_empty_list_keeps_pin(self):
         # Pin engaged with no rows → cursor parked; pin survives.
-        b = make_browser(get_children=lambda _id: [])
+        b = make_browser(get_children=lambda _id, *, reload=False: [])
         try:
             b.refresh()
             b.run_until_idle()
@@ -1677,7 +1677,7 @@ class TestCursorPin(unittest.TestCase):
 
     def test_pin_first_with_hidden_first_row(self):
         # PIN_FIRST with the original first row hidden → cursor on new first.
-        b = make_browser(get_children=lambda _id: [('A',), ('B',), ('C',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: [('A',), ('B',), ('C',)])
         try:
             b.refresh()
             b.run_until_idle()
@@ -1694,7 +1694,7 @@ class TestCursorPin(unittest.TestCase):
 
     def test_action_layer_g_sets_pin(self):
         # `g` and `home` keybinds engage PIN_FIRST via _nav_home.
-        b = make_browser(get_children=lambda _id: [('A',), ('B',), ('C',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: [('A',), ('B',), ('C',)])
         try:
             b.refresh()
             b.run_until_idle()
@@ -1760,7 +1760,7 @@ class TestFilterUpdateDataIntegration(unittest.TestCase):
     def test_streaming_match_unhides_scaffold_parent(self):
         # Start: only non-matching items. Apply a filter — parent hidden.
         # Then stream in a matching child — parent should resurrect.
-        b = make_browser(get_children=lambda _id: [])
+        b = make_browser(get_children=lambda _id, *, reload=False: [])
         try:
             b.refresh()
             b.run_until_idle()
@@ -1798,7 +1798,7 @@ class TestFilterAppliesToStreamedChildren(unittest.TestCase):
     filter-evaluated when an active filter is in place."""
 
     def test_get_children_children_get_flagged(self):
-        b = make_browser(get_children=lambda _id: [
+        b = make_browser(get_children=lambda _id, *, reload=False: [
             ('apple',), ('banana',), ('cherry',),
         ])
         try:
@@ -1820,7 +1820,7 @@ class TestFilterAppliesToStreamedChildren(unittest.TestCase):
         # Items come in via the get_children path (apply_children_results).
         events = []
 
-        def get_children(parent_id):
+        def get_children(parent_id, *, reload=False):
             events.append(parent_id)
             return [('apple',), ('banana',), ('cherry',)]
 
@@ -1845,7 +1845,7 @@ class TestFilterCursorDisplacement(unittest.TestCase):
     """Cursor walks back when its row vanishes due to filter narrowing."""
 
     def test_cursor_displaces_when_row_hidden_by_filter(self):
-        b = make_browser(get_children=lambda _id: [
+        b = make_browser(get_children=lambda _id, *, reload=False: [
             ('apple',), ('banana',), ('cherry',),
         ])
         try:
@@ -1867,7 +1867,7 @@ class TestPinSurvivesFilter(unittest.TestCase):
     """PIN_FIRST / PIN_LAST re-bind to the filtered visible list."""
 
     def test_pin_first_clamps_to_filter_top(self):
-        b = make_browser(get_children=lambda _id: [
+        b = make_browser(get_children=lambda _id, *, reload=False: [
             ('apple',), ('banana',), ('cherry',),
         ])
         try:
@@ -1887,7 +1887,7 @@ class TestPinSurvivesFilter(unittest.TestCase):
             b.stop_workers()
 
     def test_pin_last_clamps_to_filter_bottom(self):
-        b = make_browser(get_children=lambda _id: [
+        b = make_browser(get_children=lambda _id, *, reload=False: [
             ('apple',), ('banana',), ('apricot',),
         ])
         try:
@@ -1912,7 +1912,7 @@ class TestSelectAllRespectsFilter(unittest.TestCase):
     """Ctrl-A select-all-visible drops filter-hidden ids (WYSIWYG)."""
 
     def test_select_all_keeps_only_visible(self):
-        b = make_browser(get_children=lambda _id: [
+        b = make_browser(get_children=lambda _id, *, reload=False: [
             ('apple',), ('banana',), ('cherry',),
         ])
         try:
@@ -1935,7 +1935,7 @@ class TestSearchWithinFilter(unittest.TestCase):
     """`/` search corpus narrows to filter-passing rows."""
 
     def test_search_only_finds_filter_passing_rows(self):
-        b = make_browser(get_children=lambda _id: [
+        b = make_browser(get_children=lambda _id, *, reload=False: [
             ('apple-a',), ('apple-b',), ('banana-a',),
         ])
         try:
@@ -1960,7 +1960,7 @@ class TestFilterApi(unittest.TestCase):
     """``Browser.filters`` / ``set_filters`` / ``add_filter`` / ``clear_filters``."""
 
     def test_filters_property_excludes_empty_placeholder(self):
-        b = make_browser(get_children=lambda _id: [('a',), ('b',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: [('a',), ('b',)])
         try:
             b.refresh()
             b.run_until_idle()
@@ -1976,7 +1976,7 @@ class TestFilterApi(unittest.TestCase):
             b.stop_workers()
 
     def test_set_filters_forces_normal_mode(self):
-        b = make_browser(get_children=lambda _id: [('a',), ('b',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: [('a',), ('b',)])
         try:
             b.refresh()
             b.run_until_idle()
@@ -1990,7 +1990,7 @@ class TestFilterApi(unittest.TestCase):
             b.stop_workers()
 
     def test_add_filter_appends(self):
-        b = make_browser(get_children=lambda _id: [('a',), ('b',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: [('a',), ('b',)])
         try:
             b.refresh()
             b.run_until_idle()
@@ -2003,7 +2003,7 @@ class TestFilterApi(unittest.TestCase):
             b.stop_workers()
 
     def test_clear_filters_drops_all(self):
-        b = make_browser(get_children=lambda _id: [('a',), ('b',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: [('a',), ('b',)])
         try:
             b.refresh()
             b.run_until_idle()

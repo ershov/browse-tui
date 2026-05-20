@@ -61,7 +61,7 @@ class TestStreamingYields(unittest.TestCase):
             yield 'line 3\n'
 
         b = make_browser(
-            get_children=lambda _: [Item(id='a')],
+            get_children=lambda _, *, reload=False: [Item(id='a')],
             get_preview=get_preview,
             root_id='/',
         )
@@ -86,7 +86,7 @@ class TestStreamingYields(unittest.TestCase):
             yield 'C'
 
         b = make_browser(
-            get_children=lambda _: [Item(id='x')],
+            get_children=lambda _, *, reload=False: [Item(id='x')],
             get_preview=get_preview,
             root_id='/',
         )
@@ -126,7 +126,7 @@ class TestStreamingYields(unittest.TestCase):
             yield ' world'
 
         b = make_browser(
-            get_children=lambda _: [Item(id='a')],
+            get_children=lambda _, *, reload=False: [Item(id='a')],
             get_preview=get_preview,
             root_id='/',
         )
@@ -153,7 +153,7 @@ class TestCapThenPause(unittest.TestCase):
 
         # Cap at 100 chars → after 2 yields, pause.
         b = make_browser(
-            get_children=lambda _: [Item(id='a')],
+            get_children=lambda _, *, reload=False: [Item(id='a')],
             get_preview=get_preview,
             root_id='/',
             preview_buffer_cap_chars=100,
@@ -196,7 +196,7 @@ class TestCapThenPause(unittest.TestCase):
 
         # Cap at 3 lines → after 3 yields, pause.
         b = make_browser(
-            get_children=lambda _: [Item(id='a')],
+            get_children=lambda _, *, reload=False: [Item(id='a')],
             get_preview=get_preview,
             root_id='/',
             preview_buffer_cap_chars=1_000_000,
@@ -234,7 +234,7 @@ class TestAbandonMidStream(unittest.TestCase):
                 finally_fired.set()
 
         b = make_browser(
-            get_children=lambda _: [Item(id='a'), Item(id='b')],
+            get_children=lambda _, *, reload=False: [Item(id='a'), Item(id='b')],
             get_preview=get_preview,
             root_id='/',
             preview_buffer_cap_chars=100,
@@ -279,7 +279,7 @@ class TestAbandonMidStream(unittest.TestCase):
                 finally_fired.set()
 
         b = make_browser(
-            get_children=lambda _: [Item(id='a')],
+            get_children=lambda _, *, reload=False: [Item(id='a')],
             get_preview=get_preview,
             root_id='/',
             preview_buffer_cap_chars=100,
@@ -316,7 +316,7 @@ class TestAbandonMidStream(unittest.TestCase):
                 finally_fired.set()
 
         b = make_browser(
-            get_children=lambda _: [Item(id='a'), Item(id='b')],
+            get_children=lambda _, *, reload=False: [Item(id='a'), Item(id='b')],
             get_preview=get_preview,
             root_id='/',
         )
@@ -353,7 +353,7 @@ class TestStringReturnRegression(unittest.TestCase):
             return f'preview for {_id}'
 
         b = make_browser(
-            get_children=lambda _: [Item(id='a')],
+            get_children=lambda _, *, reload=False: [Item(id='a')],
             get_preview=get_preview,
             root_id='/',
         )
@@ -370,7 +370,7 @@ class TestStringReturnRegression(unittest.TestCase):
 
     def test_none_return_becomes_empty_string(self):
         b = make_browser(
-            get_children=lambda _: [Item(id='a')],
+            get_children=lambda _, *, reload=False: [Item(id='a')],
             get_preview=lambda _id: None,
             root_id='/',
         )
@@ -397,7 +397,7 @@ class TestStringReturnRegression(unittest.TestCase):
             return _gen()
 
         b = make_browser(
-            get_children=lambda _: [Item(id='str'), Item(id='gen')],
+            get_children=lambda _, *, reload=False: [Item(id='str'), Item(id='gen')],
             get_preview=get_preview,
             root_id='/',
         )
@@ -425,7 +425,7 @@ class TestGeneratorRaisesMidStream(unittest.TestCase):
             raise RuntimeError('boom')
 
         b = make_browser(
-            get_children=lambda _: [Item(id='a')],
+            get_children=lambda _, *, reload=False: [Item(id='a')],
             get_preview=get_preview,
             root_id='/',
         )
@@ -449,7 +449,7 @@ class TestGeneratorRaisesMidStream(unittest.TestCase):
             raise ValueError('initial boom')
 
         b = make_browser(
-            get_children=lambda _: [Item(id='a')],
+            get_children=lambda _, *, reload=False: [Item(id='a')],
             get_preview=get_preview,
             root_id='/',
         )
@@ -484,7 +484,7 @@ class TestNewPreviewSupersedesPaused(unittest.TestCase):
                 yield 'b-content'
 
         b = make_browser(
-            get_children=lambda _: [Item(id='a'), Item(id='b')],
+            get_children=lambda _, *, reload=False: [Item(id='a'), Item(id='b')],
             get_preview=get_preview,
             root_id='/',
             preview_buffer_cap_chars=100,
@@ -525,7 +525,7 @@ class TestEmptyAndCleanExhaustion(unittest.TestCase):
             yield  # noqa — makes the function a generator
 
         b = make_browser(
-            get_children=lambda _: [Item(id='a')],
+            get_children=lambda _, *, reload=False: [Item(id='a')],
             get_preview=get_preview,
             root_id='/',
         )
@@ -545,7 +545,7 @@ class TestEmptyAndCleanExhaustion(unittest.TestCase):
             yield 'done'
 
         b = make_browser(
-            get_children=lambda _: [Item(id='a')],
+            get_children=lambda _, *, reload=False: [Item(id='a')],
             get_preview=get_preview,
             root_id='/',
         )

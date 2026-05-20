@@ -63,7 +63,7 @@ class TestResumeOnDemand(unittest.TestCase):
 
         # Cap at 100 chars → 2 yields per cap window.
         b = make_browser(
-            get_children=lambda _: [Item(id='a')],
+            get_children=lambda _, *, reload=False: [Item(id='a')],
             get_preview=get_preview,
             root_id='/',
             preview_buffer_cap_chars=100,
@@ -120,7 +120,7 @@ class TestResumeOnDemand(unittest.TestCase):
                 yield 'x' * 50
 
         b = make_browser(
-            get_children=lambda _: [Item(id='a')],
+            get_children=lambda _, *, reload=False: [Item(id='a')],
             get_preview=get_preview,
             root_id='/',
             preview_buffer_cap_chars=100,
@@ -144,7 +144,7 @@ class TestResumeOnDemand(unittest.TestCase):
     def test_demand_signal_for_unpaused_id_is_noop(self):
         # No preview paused at all → signal is harmless.
         b = make_browser(
-            get_children=lambda _: [Item(id='a')],
+            get_children=lambda _, *, reload=False: [Item(id='a')],
             get_preview=lambda _id: 'plain',
             root_id='/',
         )
@@ -165,7 +165,7 @@ class TestResumeOnDemand(unittest.TestCase):
                 yield 'x' * 50
 
         b = make_browser(
-            get_children=lambda _: [Item(id='a'), Item(id='b')],
+            get_children=lambda _, *, reload=False: [Item(id='a'), Item(id='b')],
             get_preview=get_preview,
             root_id='/',
             preview_buffer_cap_chars=100,
@@ -195,7 +195,7 @@ class TestMultipleResumeCycles(unittest.TestCase):
                 yield 'x' * 50
 
         b = make_browser(
-            get_children=lambda _: [Item(id='a')],
+            get_children=lambda _, *, reload=False: [Item(id='a')],
             get_preview=get_preview,
             root_id='/',
             preview_buffer_cap_chars=100,
@@ -264,7 +264,7 @@ class TestCursorMoveDuringResume(unittest.TestCase):
                 yield 'b-content'
 
         b = make_browser(
-            get_children=lambda _: [Item(id='a'), Item(id='b')],
+            get_children=lambda _, *, reload=False: [Item(id='a'), Item(id='b')],
             get_preview=get_preview,
             root_id='/',
             preview_buffer_cap_chars=100,
@@ -323,7 +323,7 @@ class TestExhaustionAfterResume(unittest.TestCase):
                 yield 'x' * 50
 
         b = make_browser(
-            get_children=lambda _: [Item(id='a')],
+            get_children=lambda _, *, reload=False: [Item(id='a')],
             get_preview=get_preview,
             root_id='/',
             preview_buffer_cap_chars=100,
@@ -374,7 +374,7 @@ class TestRunUntilIdleStillRecognisesResume(unittest.TestCase):
                 yield 'x' * 50
 
         b = make_browser(
-            get_children=lambda _: [Item(id='a')],
+            get_children=lambda _, *, reload=False: [Item(id='a')],
             get_preview=get_preview,
             root_id='/',
             preview_buffer_cap_chars=100,

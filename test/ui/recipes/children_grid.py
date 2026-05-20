@@ -32,7 +32,7 @@ def main():
         ],
     }
 
-    def get_children(parent_id):
+    def get_children(parent_id, *, reload=False):
         return list(children.get(parent_id or '', []))
 
     show_children_pane = '--no-children-pane' not in sys.argv[1:]

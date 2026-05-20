@@ -1920,7 +1920,7 @@ class Browser:
         # stays None -- the preview worker treats None as "always returns
         # ''" rather than calling a no-op lambda needlessly.
         self.title = config.title
-        self.get_children = config.get_children or (lambda _id: [])
+        self.get_children = config.get_children or (lambda _id, *, reload=False: [])
         self.get_preview = config.get_preview
         # actions/on_enter/format_item are stored opaquely in phase 1;
         # tickets #11 (Context) and #12 (action keymap) read them.
@@ -2013,6 +2013,14 @@ class Browser:
         # by ``set_children`` / ``apply_children_results`` (the public
         # thread-safe injection path for recipes that bypass the
         # worker). The worker itself no longer touches it.
+        # Queue entries are ``(id, reload)`` tuples. ``reload=True``
+        # fires only for the root refresh (``_do_refresh`` with id=None
+        # or id=root_id) — a single signal that means "drop all your
+        # caches and rebuild from scratch." All other enqueue paths
+        # (expand, auto-prefetch, re-dispatched expanded ids) use
+        # ``reload=False`` because the framework's own
+        # ``cache_invalidate_all`` already wiped ``state._children``
+        # and recipes' per-file caches will naturally re-populate.
         self._children_queue = deque()
         self._children_in_flight = {}     # id -> list[Pending] awaiting this fetch
         self._children_results = deque()  # FIFO of (id, items) — set_children only
@@ -3578,9 +3586,14 @@ class Browser:
         # Only enqueue + flag pending the first time -- a fetch already in
         # flight for this id will deliver one result that resolves every
         # registered waiter together.
+        #
+        # ``reload=True`` fires only on the root refresh enqueue here.
+        # The re-dispatched expanded ids below get ``reload=False`` —
+        # the root call already triggered the recipe's full cache wipe,
+        # so per-id signals would be redundant.
         if id_ not in self._state._children_pending:
             self._state._children_pending.add(id_)
-            self._children_queue.append(id_)
+            self._children_queue.append((id_, True))
         # Re-dispatch every previously-expanded parent (and the scope
         # root) so their sub-trees don't strand on the loading
         # placeholder. These are fire-and-forget — nobody specific is
@@ -3590,7 +3603,7 @@ class Browser:
             self._state._loading[x] = True
             if x not in self._state._children_pending:
                 self._state._children_pending.add(x)
-                self._children_queue.append(x)
+                self._children_queue.append((x, False))
         self._children_event.set()
 
     def _do_cursor_to(self, id_, pending):
@@ -3662,7 +3675,7 @@ class Browser:
         # Keep ``_loading`` in lockstep with dispatch (see ``_do_refresh``).
         self._state._loading[id_] = True
         self._children_in_flight.setdefault(id_, []).append(pending)
-        self._children_queue.append(id_)
+        self._children_queue.append((id_, False))
         self._children_event.set()
         mark_visible_dirty(self._state)
         # Uncached: the subtree only has a ⧗ placeholder right now.
@@ -3757,12 +3770,12 @@ class Browser:
             self._children_event.wait()
             self._children_event.clear()
             while self._children_queue and not self._stop:
-                id_ = self._children_queue.popleft()
+                id_, reload_ = self._children_queue.popleft()
                 items = None
                 gen = None
                 error = False
                 try:
-                    raw = self.get_children(id_)
+                    raw = self.get_children(id_, reload=reload_)
                 except Exception as e:
                     error = True
                     # Cross-thread write to a Python str attribute is
@@ -5002,7 +5015,7 @@ class Browser:
         state._children_pending.add(item.id)
         # Keep ``_loading`` in lockstep with dispatch (see ``_do_refresh``).
         state._loading[item.id] = True
-        self._children_queue.append(item.id)
+        self._children_queue.append((item.id, False))
         self._children_event.set()
 
     # ---- eager adapter -------------------------------------------------
@@ -5070,7 +5083,7 @@ class Browser:
         # Captures children_by_parent rather than self._state._children
         # so a later cache_invalidate_all() doesn't strand the recipe
         # (we still want eager reads to win).
-        def _get_children_eager(pid):
+        def _get_children_eager(pid, *, reload=False):
             return children_by_parent.get(pid, [])
 
         browser_kwargs.setdefault('get_children', _get_children_eager)

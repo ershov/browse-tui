@@ -345,7 +345,7 @@ class TestEndToEndDispatchAndDelivery(unittest.TestCase):
     def test_dispatch_then_delivery(self):
         results_seen = threading.Event()
 
-        def get_children(parent_id):
+        def get_children(parent_id, *, reload=False):
             return [Item(id=f'{parent_id}/a'), Item(id=f'{parent_id}/b')]
 
         b = Browser(BrowserConfig(get_children=get_children, _headless=True))
@@ -377,7 +377,7 @@ class TestEndToEndDispatchAndDelivery(unittest.TestCase):
         """A refresh that yields a different child set evicts old index rows."""
         call = {'n': 0}
 
-        def get_children(parent_id):
+        def get_children(parent_id, *, reload=False):
             call['n'] += 1
             if call['n'] == 1:
                 return [Item(id='old-a'), Item(id='old-b')]
