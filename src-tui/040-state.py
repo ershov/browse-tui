@@ -1280,10 +1280,17 @@ def visible_items(state: State) -> list:
     scope_root_id = current_scope(state)
     if state.scope_stack:
         # Try to recover the actual Item for the scope row by scanning the
-        # cache; fall back to a synthetic Item if not findable.
+        # cache; fall back to a synthetic Item if not findable. Register
+        # the synthetic in ``_items_by_id`` so the per-Item preview cache
+        # (#422) has a place to land: ``apply_preview_result`` and the
+        # renderer both key on ``_items_by_id``, so an unregistered
+        # synthetic would silently swallow preview text.
         scope_item = _find_item(state, scope_root_id)
         if scope_item is None:
+            scope_item = state._items_by_id.get(scope_root_id)
+        if scope_item is None:
             scope_item = Item(id=scope_root_id, title=str(scope_root_id))
+            state._items_by_id[scope_root_id] = scope_item
         out.append(VisibleEntry(item=scope_item, depth=0, kind='scope_root'))
         base_depth = 1
     else:
