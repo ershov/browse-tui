@@ -733,176 +733,6 @@ class TestPreviewMessageDispatcher(unittest.TestCase):
             os.unlink(path)
 
 
-class TestSessionPreview(unittest.TestCase):
-    """``_preview_session`` folds metadata + renders a recent timeline."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.r = _load_recipe()
-
-    def _write_session(self, records):
-        import json as _json
-        import tempfile
-        f = tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False,
-                                        prefix='abc1234-')
-        for r in records:
-            f.write(_json.dumps(r) + '\n')
-        f.close()
-        return f.name
-
-    def test_card_folds_metadata(self):
-        path = self._write_session([
-            {'type': 'custom-title', 'customTitle': 'My Title',
-             'sessionId': 'abc1234'},
-            {'type': 'permission-mode', 'permissionMode': 'acceptEdits',
-             'sessionId': 'abc1234'},
-            {'type': 'pr-link', 'prRepository': 'foo/bar', 'prNumber': 5,
-             'prUrl': 'https://github.com/foo/bar/pull/5',
-             'timestamp': '2026-05-07T00:00:00Z', 'sessionId': 'abc1234'},
-            {'type': 'tag', 'tag': 'perf', 'sessionId': 'abc1234'},
-            {'type': 'last-prompt', 'lastPrompt': 'do the X',
-             'sessionId': 'abc1234'},
-            {'type': 'user',
-             'message': {'role': 'user', 'content': 'hello'},
-             'timestamp': '2026-05-07T00:00:01Z'},
-            {'type': 'assistant',
-             'message': {'role': 'assistant',
-                         'content': [{'type': 'text', 'text': 'world'}]},
-             'timestamp': '2026-05-07T00:00:02Z'},
-        ])
-        try:
-            out = self.r._preview_session(path)
-            self.assertIn('My Title', out)
-            self.assertIn('[acceptEdits]', out)
-            self.assertIn('foo/bar#5', out)
-            self.assertIn('perf', out)
-            self.assertIn('do the X', out)
-            self.assertIn('1 user', out)
-            self.assertIn('1 asst', out)
-            self.assertIn('timeline', out)
-        finally:
-            os.unlink(path)
-
-    def test_empty_session_renders_zero_counts(self):
-        path = self._write_session([])
-        try:
-            out = self.r._preview_session(path)
-            # No events to surface, but the card still names the session
-            # and shows zeroed counts. Easier on the eye than a bare
-            # "empty session" string when the file briefly has no rows.
-            self.assertIn('0 msg', out)
-            self.assertIn('(no events)', out)
-        finally:
-            os.unlink(path)
-
-    def test_timeline_lists_recent_events(self):
-        # >30 events, only the trailing 30 should render.
-        records = [
-            {'type': 'user',
-             'message': {'role': 'user', 'content': f'prompt {i}'},
-             'timestamp': f'2026-05-07T00:00:{i:02d}Z'}
-            for i in range(40)
-        ]
-        path = self._write_session(records)
-        try:
-            out = self.r._preview_session(path)
-            # Last prompt MUST appear.
-            self.assertIn('prompt 39', out)
-            # First prompt should NOT appear (it was trimmed).
-            self.assertNotIn('prompt 0 ', out)
-        finally:
-            os.unlink(path)
-
-    def test_worktree_active(self):
-        path = self._write_session([
-            {'type': 'worktree-state',
-             'worktreeSession': {'worktreePath': '/tmp/wt',
-                                 'worktreeBranch': 'feat'},
-             'sessionId': 'abc1234'},
-        ])
-        try:
-            out = self.r._preview_session(path)
-            self.assertIn('/tmp/wt', out)
-            self.assertIn('feat', out)
-        finally:
-            os.unlink(path)
-
-
-class TestSubagentPreview(unittest.TestCase):
-    """Subagent preview reuses the session pipeline + sidecar fields."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.r = _load_recipe()
-
-    def _make_subagent(self, agent_id, records, sidecar=None):
-        """Lay out a parent session + subagent .jsonl + .meta.json."""
-        import json as _json
-        import tempfile
-        tmp = tempfile.mkdtemp(prefix='claude-')
-        sess_path = os.path.join(tmp, 'parent-session.jsonl')
-        with open(sess_path, 'w') as f:
-            f.write(_json.dumps({'type': 'user',
-                                 'message': {'role': 'user',
-                                             'content': 'parent prompt'}}) + '\n')
-        sub_dir = os.path.join(tmp, 'parent-session', 'subagents')
-        os.makedirs(sub_dir)
-        agent_path = os.path.join(sub_dir, f'agent-{agent_id}.jsonl')
-        with open(agent_path, 'w') as f:
-            for r in records:
-                f.write(_json.dumps(r) + '\n')
-        if sidecar is not None:
-            with open(os.path.join(sub_dir,
-                                   f'agent-{agent_id}.meta.json'), 'w') as f:
-                _json.dump(sidecar, f)
-        return tmp, sess_path, agent_id
-
-    def test_renders_as_session(self):
-        tmp, sess_path, agent_id = self._make_subagent(
-            'AG01',
-            records=[
-                {'type': 'user',
-                 'message': {'role': 'user', 'content': 'go do the thing'},
-                 'timestamp': '2026-05-07T00:00:01Z'},
-                {'type': 'assistant',
-                 'message': {'role': 'assistant', 'model': 'm',
-                             'stop_reason': 'end_turn',
-                             'content': [{'type': 'text', 'text': 'done'}]},
-                 'timestamp': '2026-05-07T00:00:02Z'},
-            ],
-            sidecar={'agentType': 'general-purpose',
-                     'description': 'Test the thing'},
-        )
-        out = self.r._preview_subagent(f'{sess_path}#agent:{agent_id}')
-        # Card content
-        self.assertIn(f'agent {agent_id}', out)
-        self.assertIn('general-purpose', out)
-        self.assertIn('Test the thing', out)
-        # Counts (1 user + 1 assistant)
-        self.assertIn('2 msg', out)
-        self.assertIn('1 user', out)
-        self.assertIn('1 asst', out)
-        # Timeline
-        self.assertIn('timeline', out)
-        self.assertIn('go do the thing', out)
-        self.assertIn('done', out)
-
-    def test_no_sidecar(self):
-        tmp, sess_path, agent_id = self._make_subagent(
-            'NO_META',
-            records=[{'type': 'user',
-                      'message': {'role': 'user', 'content': 'hi'}}],
-        )
-        out = self.r._preview_subagent(f'{sess_path}#agent:{agent_id}')
-        self.assertIn(f'agent {agent_id}', out)
-        # Without sidecar, agent_type/desc rows shouldn't surface.
-        self.assertNotIn('type   :', out)
-        self.assertNotIn('desc   :', out)
-        # But timeline + counts still render.
-        self.assertIn('timeline', out)
-        self.assertIn('hi', out)
-
-
 class TestRunningSessions(unittest.TestCase):
     """``_pid_alive`` + the running-session helpers, and --running filtering."""
 
@@ -3422,64 +3252,6 @@ class TestMultilinePreservation(unittest.TestCase):
         s = 'foo\nbar\n  baz '
         self.assertEqual(self.r._oneline(s), 'foo bar baz')
 
-    def test_indent_continuations_aligns(self):
-        out = self.r._indent_continuations('a\nb\nc', '   ')
-        self.assertEqual(out, 'a\n   b\n   c')
-
-    def test_indent_continuations_one_line_unchanged(self):
-        self.assertEqual(self.r._indent_continuations('hi', '   '), 'hi')
-
-    def test_card_renders_multiline_value(self):
-        # task-summary with embedded newlines should appear multi-line
-        # in the card, indented under the value column.
-        path = self._write_session([
-            {'type': 'task-summary',
-             'summary': 'planning:\n  - step 1\n  - step 2',
-             'sessionId': 'abc'},
-        ])
-        try:
-            out = self.r._preview_session(path)
-            self.assertIn('planning:', out)
-            self.assertIn('step 1', out)
-            self.assertIn('step 2', out)
-            # Continuation indent: the `now:` row's label is followed by
-            # ': ' and the indent matches that width — verify by checking
-            # the full alignment exists.
-            lines = out.split('\n')
-            now_idx = next((i for i, l in enumerate(lines)
-                            if 'now' in l and ':' in l), None)
-            self.assertIsNotNone(now_idx)
-            # Subsequent lines from the multi-line value should start
-            # with whitespace (the indent).
-            self.assertTrue(lines[now_idx + 1].startswith(' '))
-        finally:
-            os.unlink(path)
-
-    def test_timeline_multiline_title_indents(self):
-        path = self._write_session([
-            {'type': 'user',
-             'message': {'role': 'user',
-                         'content': 'first line\nsecond line\nthird line'},
-             'timestamp': '2026-05-08T00:00:01Z'},
-        ])
-        try:
-            out = self.r._preview_session(path)
-            self.assertIn('first line', out)
-            self.assertIn('second line', out)
-            self.assertIn('third line', out)
-            # Continuation lines indented to align under the title column.
-            lines = out.split('\n')
-            first_idx = next((i for i, l in enumerate(lines)
-                              if 'first line' in l), None)
-            self.assertIsNotNone(first_idx)
-            cont = lines[first_idx + 1]
-            # Continuations indented by _TIMELINE_PREFIX_WIDTH (21) spaces.
-            self.assertTrue(cont.startswith(' ' * 21),
-                            f'continuation should be indented: {cont!r}')
-            self.assertIn('second line', cont)
-        finally:
-            os.unlink(path)
-
     def test_row_list_title_is_single_line(self):
         # The list-row title must be single-line, even when the
         # underlying content is multi-line.
@@ -3491,16 +3263,6 @@ class TestMultilinePreservation(unittest.TestCase):
         self.assertNotIn('\n', title)
         self.assertIn('hi', title)
         self.assertIn('bye', title)
-
-    def _write_session(self, records):
-        import json as _json
-        import tempfile
-        f = tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False,
-                                        prefix='abc1234-')
-        for r in records:
-            f.write(_json.dumps(r) + '\n')
-        f.close()
-        return f.name
 
 
 class TestSummariseTitles(unittest.TestCase):
@@ -4097,12 +3859,13 @@ class TestVoiceOnlyFilter(unittest.TestCase):
         finally:
             self.r._TREE_CACHE.pop(path, None)
 
-    # ---- session / subagent preview respects filter --------------------
+    # ---- session row preview goes through umbrella cascade -------------
 
-    def test_session_preview_filters_timeline(self):
-        # The session row is a synthetic preview built from
-        # ``_scan_session``; under the voice-only filter, the timeline
-        # must drop non-voice events to match the list view.
+    def test_session_preview_uses_umbrella_cascade(self):
+        # The session row's preview is built the same way as any other
+        # umbrella: get_children + concatenated child bodies. Under the
+        # voice-only filter, non-voice children are skipped because
+        # they're hidden=True at construction.
         path = self._write_jsonl([
             {'type': 'user', 'uuid': 'u1',
              'message': {'role': 'user', 'content': 'PROBE_VOICE_TEXT'}},
@@ -4114,15 +3877,17 @@ class TestVoiceOnlyFilter(unittest.TestCase):
         ])
         try:
             self.r._FILTER_VOICE_ONLY = False
-            full = self.r._preview_session(path)
+            full = self.r.get_preview(path)
             self.assertIn('PROBE_VOICE_TEXT', full)
             self.assertIn('PROBE_TOOL_NAME', full,
-                          'without filter the tool row should appear')
+                          'without filter the tool body should appear')
+            # Clear the tree cache so item builders re-read the filter.
+            self.r._TREE_CACHE.clear()
             self.r._FILTER_VOICE_ONLY = True
-            filtered = self.r._preview_session(path)
+            filtered = self.r.get_preview(path)
             self.assertIn('PROBE_VOICE_TEXT', filtered)
             self.assertNotIn('PROBE_TOOL_NAME', filtered,
-                             'with filter the tool row must be dropped')
+                             'with filter the tool body must be hidden')
         finally:
             os.unlink(path)
 

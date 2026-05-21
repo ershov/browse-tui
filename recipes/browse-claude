@@ -364,26 +364,6 @@ def _find_session_by_pid(pid):
     return _find_session_by_id(data.get('sessionId'))
 
 
-def _indent_continuations(text, indent):
-    """Prefix every line *after* the first with ``indent``.
-
-    Lets a key/value or label/title pair render as::
-
-        last:    line one
-                 line two
-                 line three
-
-    by computing the indent (typically the visible width of the label
-    chrome) and re-emitting subsequent lines flush-aligned under the
-    value column. The first line is left untouched so the caller stays
-    in control of *its* prefix.
-    """
-    if '\n' not in text:
-        return text
-    head, _, rest = text.partition('\n')
-    return head + '\n' + '\n'.join(indent + line for line in rest.split('\n'))
-
-
 # ---- get_children: dispatches by id shape --------------------------------
 #
 # The Browser passes the raw item id back into ``get_children``. We use the
@@ -2108,8 +2088,12 @@ def get_preview(item_id):
     """Preview-pane content for the cursor item.
 
     * project (dir):       human-readable summary + session list
-    * session (file):      first 20 lines of the .jsonl (truncated)
-    * subagent (#agent:X): meta.json + first-prompt preview
+    * session (.jsonl):    concatenated child previews (same machinery
+                            as the umbrella previews — uniform body
+                            cascade, honours the voice-only filter
+                            transparently via ``hidden`` on children).
+    * subagent (#agent:X): same uniform cascade against the subagent's
+                            own .jsonl.
     * ``<prompt>`` / ``<tool>`` / ``<system>`` umbrella: concatenated
                             bodies of the umbrella's direct children.
     * message (#N):        pretty-printed JSON of the line
@@ -2117,7 +2101,7 @@ def get_preview(item_id):
     if not isinstance(item_id, str) or item_id.startswith('__err__:'):
         return ''
     if '#agent:' in item_id:
-        return _preview_subagent(item_id)
+        return _preview_umbrella(item_id)
     if '#prompt:' in item_id or '#tool:' in item_id or '#span:' in item_id:
         return _preview_umbrella(item_id)
     if '#' in item_id:
@@ -2135,7 +2119,7 @@ def get_preview(item_id):
     if os.path.isdir(item_id):
         return _preview_project(item_id)
     if os.path.isfile(item_id) and item_id.endswith('.jsonl'):
-        return _preview_session(item_id)
+        return _preview_umbrella(item_id)
     return ''
 
 
@@ -2155,146 +2139,6 @@ def _preview_project(path):
     if len(names) > 50:
         body += f'\n  … and {len(names) - 50} more'
     return f'{header}\n{body}' if body else header
-
-
-def _preview_session(path):
-    """Structured session preview: metadata card + recent timeline.
-
-    One pass over the .jsonl folds metadata records (titles, modes,
-    permission state, PR link, worktree, counts) into a compact card,
-    then renders the most recent ``_TIMELINE_TAIL`` events as one-liners.
-
-    Voice-only filter: timeline rows that fail ``_is_voice`` are
-    dropped so the preview matches what the user sees in the list.
-    """
-    try:
-        meta, timeline_rows = _scan_session(path)
-    except OSError as e:
-        return f'[error] {e}'
-    if not meta and not timeline_rows:
-        return '(empty session)'
-    if _FILTER_VOICE_ONLY:
-        timeline_rows = [(n, obj) for n, obj in timeline_rows if _is_voice(obj)]
-    return _fmt_session_card(meta) + '\n\n' + _fmt_timeline(timeline_rows)
-
-
-# How many events to show in the timeline tail (first/last halves on
-# longer sessions). Cheap to bump — the scan already walks the whole
-# file; the cost is how much fits in the preview pane.
-_TIMELINE_TAIL = 1000
-
-
-def _scan_session(path):
-    """Walk the .jsonl once. Return ``(meta_dict, timeline_rows)``.
-
-    ``meta_dict`` collapses last-wins metadata (title, mode, permission)
-    plus aggregates (counts, first/last timestamp, tags, etc.).
-    ``timeline_rows`` is a list of ``(line_no, obj)`` for events worth
-    showing in the timeline; metadata-only records are excluded so the
-    timeline reads as "what happened" rather than "what got bookkept".
-    """
-    meta = {
-        'path': path,
-        'session_id': os.path.basename(path)[:-len('.jsonl')]
-                      if path.endswith('.jsonl') else os.path.basename(path),
-        'tags': [],
-        'counts': {
-            'total': 0, 'user': 0, 'assistant': 0,
-            'tool_use': 0, 'tool_result': 0, 'attachment': 0,
-            'system': 0, 'errors': 0, 'subagent_msgs': 0,
-        },
-    }
-    timeline = []
-    first_ts = None
-    last_ts = None
-    with open(path, 'r', encoding='utf-8', errors='replace') as f:
-        for n, line in enumerate(f):
-            line = line.rstrip('\n')
-            if not line.strip():
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(obj, dict):
-                continue
-            t = obj.get('type')
-            ts = obj.get('timestamp')
-            if ts:
-                first_ts = first_ts or ts
-                last_ts = ts
-            meta['counts']['total'] += 1
-            if obj.get('isSidechain'):
-                meta['counts']['subagent_msgs'] += 1
-
-            # Last-wins metadata
-            if t == 'custom-title':
-                meta['custom_title'] = obj.get('customTitle', '')
-            elif t == 'ai-title':
-                meta['ai_title'] = obj.get('aiTitle', '')
-            elif t == 'last-prompt':
-                meta['last_prompt'] = obj.get('lastPrompt', '')
-            elif t == 'tag':
-                tag = obj.get('tag')
-                if tag and tag not in meta['tags']:
-                    meta['tags'].append(tag)
-            elif t == 'agent-name':
-                meta['agent_name'] = obj.get('agentName', '')
-            elif t == 'agent-color':
-                meta['agent_color'] = obj.get('agentColor', '')
-            elif t == 'agent-setting':
-                meta['agent_setting'] = obj.get('agentSetting', '')
-            elif t == 'permission-mode':
-                meta['permission_mode'] = obj.get('permissionMode', '')
-            elif t == 'mode':
-                meta['mode'] = obj.get('mode', '')
-            elif t == 'pr-link':
-                meta['pr'] = {
-                    'repo':   obj.get('prRepository', ''),
-                    'number': obj.get('prNumber', ''),
-                    'url':    obj.get('prUrl', ''),
-                }
-            elif t == 'worktree-state':
-                meta['worktree'] = obj.get('worktreeSession')
-            elif t == 'task-summary':
-                meta['task_summary'] = obj.get('summary', '')
-            elif t == 'summary':
-                meta['summary'] = obj.get('summary', '')
-
-            # Aggregate counts on conversation records
-            if t == 'user':
-                meta['counts']['user'] += 1
-                content = (obj.get('message') or {}).get('content')
-                if isinstance(content, list):
-                    if any(isinstance(p, dict) and p.get('type') == 'tool_result'
-                           for p in content):
-                        meta['counts']['tool_result'] += 1
-                timeline.append((n, obj))
-            elif t == 'assistant':
-                meta['counts']['assistant'] += 1
-                content = (obj.get('message') or {}).get('content')
-                if isinstance(content, list):
-                    if any(isinstance(p, dict) and p.get('type') == 'tool_use'
-                           for p in content):
-                        meta['counts']['tool_use'] += 1
-                timeline.append((n, obj))
-            elif t == 'attachment':
-                meta['counts']['attachment'] += 1
-                timeline.append((n, obj))
-            elif t == 'system':
-                meta['counts']['system'] += 1
-                if obj.get('subtype') == 'api_error':
-                    meta['counts']['errors'] += 1
-                timeline.append((n, obj))
-            # metadata records are NOT added to the timeline — they're
-            # already folded into the card above.
-
-    meta['first_ts'] = first_ts
-    meta['last_ts'] = last_ts
-
-    # Pick the timeline to display: last N events, since the cursor's
-    # most common need is "what happened recently".
-    return meta, timeline[-_TIMELINE_TAIL:]
 
 
 # ---- tree builder (#299) -------------------------------------------------
@@ -3562,171 +3406,6 @@ def _subagent_pseudo_item(parent_jsonl, agent_id, agent_path):
     item.line_count = count
     item.mtime = mtime
     return item
-
-
-def _fmt_session_card(m):
-    """Compact metadata card for the session preview header.
-
-    Used both for top-level sessions and for subagent transcripts —
-    the latter populate ``session_id`` with ``"agent <id>"`` and may
-    set ``agent_type`` / ``agent_description`` from the sidecar
-    ``meta.json`` so those surface near the top of the card.
-    """
-    rows = []
-    sid = m.get('session_id', '')
-    rows.append(('session', f'{WHITE}{sid}{RESET}'))
-
-    if m.get('agent_type'):
-        rows.append(('type', f'{MAGENTA}{m["agent_type"]}{RESET}'))
-    if m.get('agent_description'):
-        rows.append(('desc', f'{WHITE}{m["agent_description"]}{RESET}'))
-
-    title = m.get('custom_title') or m.get('ai_title')
-    if title:
-        rows.append(('title', f'{WHITE}{BOLD}{title}{RESET}'))
-
-    chips = []
-    # View-mode chip — make it obvious which listing the user is looking
-    # at, especially since t-toggle silently changes the tree shape.
-    view_chip = (f'{GREEN}[tree]{RESET}' if _TREE_MODE
-                 else f'{MUTE}[flat]{RESET}')
-    chips.append(view_chip)
-    mode = m.get('mode')
-    if mode:
-        col = RED if mode == 'coordinator' else MUTE
-        chips.append(f'{col}[{mode}]{RESET}')
-    pmode = m.get('permission_mode')
-    if pmode:
-        col = _PERM_COLOR.get(pmode, MUTE)
-        chips.append(f'{col}[{pmode}]{RESET}')
-    if chips:
-        rows.append(('mode', '  '.join(chips)))
-
-    pr = m.get('pr')
-    if pr:
-        rows.append(('PR',
-                     f'{WHITE}{pr["repo"]}#{pr["number"]}{RESET}  '
-                     f'{BLUE}{pr["url"]}{RESET}'))
-
-    wt = m.get('worktree')
-    if wt is not None:
-        if wt is None or wt == {}:
-            rows.append(('worktree', f'{MUTE}(exited){RESET}'))
-        elif isinstance(wt, dict):
-            wpath = wt.get('worktreePath', '')
-            wbranch = wt.get('worktreeBranch', '')
-            rows.append(('worktree',
-                         f'{CYAN}{wpath}{RESET}  '
-                         f'{MUTE}@{RESET} {GREEN}{wbranch}{RESET}'))
-
-    last_prompt = m.get('last_prompt')
-    if last_prompt:
-        snippet = _trim(last_prompt, 200)
-        rows.append(('last', snippet))
-
-    if m.get('tags'):
-        rows.append(('tags', f'{YELLOW}{", ".join(m["tags"])}{RESET}'))
-
-    if m.get('agent_name'):
-        rows.append(('agent', f'{MAGENTA}{m["agent_name"]}{RESET}'))
-
-    if m.get('task_summary'):
-        snippet = _trim(m['task_summary'], 200)
-        rows.append(('now', f'{ITAL}{snippet}{RESET}'))
-
-    if m.get('summary'):
-        snippet = _trim(m['summary'], 200)
-        rows.append(('summary', snippet))
-
-    if m.get('first_ts'):
-        rows.append(('started', f'{MUTE}{m["first_ts"]}{RESET}'))
-    if m.get('last_ts') and m.get('last_ts') != m.get('first_ts'):
-        rows.append(('ended',   f'{MUTE}{m["last_ts"]}{RESET}'))
-
-    c = m['counts']
-    counts_line = (
-        f'{c["total"]} msg · {c["user"]} user · {c["assistant"]} asst · '
-        f'{c["tool_use"]} tool_use · {c["tool_result"]} tool_result · '
-        f'{c["attachment"]} attach'
-    )
-    if c['errors']:
-        counts_line += f'  {RED}· {c["errors"]} errors{RESET}'
-    rows.append(('counts', counts_line))
-
-    if c['subagent_msgs']:
-        rows.append(('sidechain', f'{MUTE}{c["subagent_msgs"]} msgs{RESET}'))
-
-    w = max(len(k) for k, _ in rows)
-    indent = ' ' * (w + 2)   # label width + ':' + ' '
-    return '\n'.join(
-        f'{MUTE}{k.ljust(w)}:{RESET} {_indent_continuations(v, indent)}'
-        for k, v in rows
-    )
-
-
-# Visible width of the ``L#### kind             `` prefix that
-# ``_fmt_timeline`` emits. Used to indent multi-line titles so
-# subsequent lines align under the title column.
-#
-#  ``L`` + 4-wide line number + ' ' + kind padded to 14 + ' ' = 21.
-_TIMELINE_PREFIX_WIDTH = 21
-
-
-def _fmt_timeline(rows):
-    """Render the trailing events.
-
-    Each event is one logical row, but if its summary spans multiple
-    lines (multi-paragraph user prompts, tool stdout, structured diffs,
-    …) those extra lines render flush-aligned under the title column
-    rather than collapsed to a single space-separated blob.
-    """
-    if not rows:
-        return f'{MUTE}(no events){RESET}'
-    out = [_rule('timeline')]
-    indent = ' ' * _TIMELINE_PREFIX_WIDTH
-    for n, obj in rows:
-        kind = _kind_of(obj)
-        color = _KIND_HEADER_COLOR.get(kind, MUTE)
-        title = _indent_continuations(_summarise_message(obj), indent)
-        out.append(f'{MUTE}L{n+1:>4}{RESET} '
-                   f'{color}{kind:<14}{RESET} {title}')
-    return '\n'.join(out)
-
-
-def _preview_subagent(item_id):
-    """Preview a subagent group as a full session.
-
-    The agent's ``.jsonl`` file is structurally identical to a top-level
-    session transcript, so we reuse the same ``_scan_session`` +
-    ``_fmt_session_card`` + ``_fmt_timeline`` pipeline. The only extras
-    are the fields stored in ``agent-<id>.meta.json`` (agentType,
-    description) which we layer onto the scanned metadata before
-    rendering.
-    """
-    session_path, _, suffix = item_id.partition('#agent:')
-    if not suffix:
-        return ''
-    agent_id = suffix
-    sub_dir = _subagents_dir(session_path)
-    agent_path = os.path.join(sub_dir, f'agent-{agent_id}.jsonl')
-    sidecar = _read_subagent_meta(
-        os.path.join(sub_dir, f'agent-{agent_id}.meta.json'),
-    )
-    try:
-        meta, timeline_rows = _scan_session(agent_path)
-    except OSError as e:
-        return f'[error] {e}'
-    # Surface the subagent-specific identity in the card. ``session_id``
-    # for a top-level session is the .jsonl basename; for a subagent the
-    # agent_id is what the user actually thinks of as "this thing".
-    meta['session_id'] = f'agent {agent_id}'
-    if sidecar.get('agentType'):
-        meta['agent_type'] = sidecar['agentType']
-    if sidecar.get('description'):
-        meta['agent_description'] = sidecar['description']
-    if _FILTER_VOICE_ONLY:
-        timeline_rows = [(n, obj) for n, obj in timeline_rows if _is_voice(obj)]
-    return _fmt_session_card(meta) + '\n\n' + _fmt_timeline(timeline_rows)
 
 
 def _preview_message(path, n):

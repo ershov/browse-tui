@@ -182,7 +182,8 @@ class TestBrowseClaude(unittest.TestCase):
         .jsonl made the session a ``scope_root`` entry, which the
         framework skips for preview updates. The fix scopes into the
         parent dir and moves the cursor onto the session row, so its
-        preview (card + timeline) renders.
+        preview (concatenated child bodies, same as any umbrella)
+        renders.
         """
         with tempfile.TemporaryDirectory() as tmp:
             _make_fake_claude(tmp)
@@ -198,12 +199,9 @@ class TestBrowseClaude(unittest.TestCase):
             with TmuxFixture(cols=140, rows=30, env=self._launch_env(tmp)) as t:
                 t.launch(_BIN, '--run-py', _RECIPE,
                          '--no-tree', '--pid', str(pid))
-                # The session row's preview should include the
-                # session-card "session:" line.
-                t.wait_for('session:', timeout=3.0)
-                # And the user message we put in the fake jsonl should
-                # land in the timeline (proving we did a full session
-                # scan, not just rendered the breadcrumb).
+                # The user message we put in the fake jsonl should land
+                # in the concatenated preview (proving we walked the
+                # session's children, not just rendered the breadcrumb).
                 t.wait_for('hello world', timeout=3.0)
                 t.send('q')
 
@@ -720,9 +718,9 @@ class TestBrowseClaude(unittest.TestCase):
             )
             with TmuxFixture(cols=140, rows=30, env=self._launch_env(tmp)) as t:
                 t.launch(_BIN, '--run-py', _RECIPE, sess)
-                # Session card preview should land on first paint.
-                t.wait_for('session:', timeout=3.0)
-                # And the user prompt from the fake fixture too.
+                # The user prompt from the fake fixture should land on
+                # first paint (preview cascades over the session's
+                # children, same as any umbrella).
                 t.wait_for('hello world', timeout=3.0)
                 t.send('q')
 
