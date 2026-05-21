@@ -1591,7 +1591,16 @@ def render_preview(browser, rect, *, info=False, has_header=True,
         # invariant for plain content.
         raw = text.split('\n') if text else []
         wrapped = []
-        for line in raw:
+        # ``wrapped_tail_offset`` is the index in ``wrapped`` where the
+        # wrap of the last raw line starts — needed by the #423 in-place
+        # append-extension path to splice new wrapped rows over the
+        # previously-open tail line's wrap. Recorded just before
+        # extending ``wrapped`` with the last raw line's rows. Defaults
+        # to ``len(wrapped)`` (post-wrap) so an empty preview / no-raw-
+        # lines branch records 0.
+        wrapped_tail_offset = 0
+        last_idx = len(raw) - 1
+        for i, line in enumerate(raw):
             line = line.replace('\t', '    ')
             # Search-highlight gate: a line that matches the active
             # search query renders with highlight (yellow/bold)
@@ -1603,19 +1612,30 @@ def render_preview(browser, rect, *, info=False, has_header=True,
                 stripped = (_ANSI_CSI_RE.sub('', line)
                             if '\x1b' in line else line)
                 drop_sgr = _search_matches(stripped, query)
+            if i == last_idx:
+                wrapped_tail_offset = len(wrapped)
             wrapped.extend(_wrap_preview_line(
                 line, width, ansi_on=ansi_on, drop_sgr=drop_sgr))
 
         # Cache the wrap on the Item when it's a per-item, non-search
         # render. Other branches (error/help/search) recompute on every
         # paint and don't share the cache slot.
+        #
+        # ``raw_tail_offset`` is the position in ``item.preview`` just
+        # after the last ``\n`` (or 0 if no newline yet, or
+        # ``len(preview)`` when the preview ends with a newline — both
+        # falling out of ``rfind('\n') + 1`` naturally). This is the
+        # start of the currently-open partial last raw line, which is
+        # the splice point for #423 in-place ``append_preview``.
         if item is not None and not query and not browser._error_text \
                 and not browser._help_mode:
+            raw_text = item.preview if item.preview is not None else ''
+            last_nl = raw_text.rfind('\n')
+            raw_tail_offset = 0 if last_nl < 0 else last_nl + 1
             item.preview_render = PreviewRender(
                 wrapped=wrapped,
-                raw_tail_offset=len(item.preview)
-                if item.preview is not None else 0,
-                wrapped_tail_offset=len(wrapped),
+                raw_tail_offset=raw_tail_offset,
+                wrapped_tail_offset=wrapped_tail_offset,
                 width=width,
                 ansi_on=ansi_on,
             )

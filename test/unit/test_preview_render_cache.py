@@ -36,6 +36,14 @@ _actions = load('_browse_tui_actions_prc', '070-actions.py')
 _state.Item = _data.Item
 _state.to_item = _data.to_item
 _state.notify_wake = _term.notify_wake
+# Cross-wires for the #423 in-place ``append_preview`` extension path:
+# ``_extend_or_drop_preview_render`` (in 040-state.py) calls the wrap
+# and sanitisation helpers defined in 050-render.py. In the artifact
+# they share a module namespace; under the test loader they don't, so
+# inject explicitly.
+_state.PreviewRender = _data.PreviewRender
+_state._wrap_preview_line = _render._wrap_preview_line
+_state._sanitize_preview = _render._sanitize_preview
 
 _render.Item = _data.Item
 _render.PreviewRender = _data.PreviewRender
@@ -108,12 +116,78 @@ class TestSetPreviewClearsRender(unittest.TestCase):
         self.assertIsNone(item.preview_render)
 
 
-class TestAppendPreviewClearsRender(unittest.TestCase):
+class TestAppendPreviewExtendsRender(unittest.TestCase):
+    """``append_preview`` extends the wrap in place when possible (#423).
 
-    def test_append_preview_drops_render_cache(self):
+    Sentinel-cache cases (no real wrap behind the cache) keep the
+    extension contract observable by checking the splice happens: a
+    non-empty append re-wraps the affected tail and updates offsets;
+    an empty chunk is a cheap no-op; a missing cache leaves
+    ``preview_render`` None for the next paint to lazy-fill.
+    """
+
+    def test_append_preview_extends_render_cache(self):
         b = Browser(BrowserConfig(_headless=True))
         item = _seed(b, 'a', 'foo')
-        _attach_render_cache(item)
+        # Cached state for raw "foo": wrap is one row, offset 0, tail
+        # offset 0 (the whole preview is still the open partial line).
+        item.preview_render = PreviewRender(
+            wrapped=['foo'],
+            raw_tail_offset=0,
+            wrapped_tail_offset=0,
+            width=80,
+            ansi_on=True,
+        )
+        b.append_preview('a', 'bar')
+        b.drain_main_queue()
+        self.assertEqual(item.preview, 'foobar')
+        # Cache extended in place — not dropped.
+        self.assertIsNotNone(item.preview_render)
+        self.assertEqual(item.preview_render.wrapped, ['foobar'])
+        self.assertEqual(item.preview_render.raw_tail_offset, 0)
+        self.assertEqual(item.preview_render.wrapped_tail_offset, 0)
+
+    def test_append_preview_empty_chunk_keeps_cache(self):
+        b = Browser(BrowserConfig(_headless=True))
+        item = _seed(b, 'a', 'foo')
+        cached = PreviewRender(
+            wrapped=['foo'],
+            raw_tail_offset=0,
+            wrapped_tail_offset=0,
+            width=80,
+            ansi_on=True,
+        )
+        item.preview_render = cached
+        b.append_preview('a', '')
+        b.drain_main_queue()
+        # No change to preview text or the cache.
+        self.assertEqual(item.preview, 'foo')
+        self.assertIs(item.preview_render, cached)
+
+    def test_append_preview_with_no_cache_stays_none(self):
+        b = Browser(BrowserConfig(_headless=True))
+        item = _seed(b, 'a', 'foo')
+        # No preview_render attached → still None; next paint will
+        # lazy-fill the wrap.
+        self.assertIsNone(item.preview_render)
+        b.append_preview('a', 'bar')
+        b.drain_main_queue()
+        self.assertEqual(item.preview, 'foobar')
+        self.assertIsNone(item.preview_render)
+
+    def test_append_preview_ansi_mismatch_drops_cache(self):
+        # Defensive fallback: if the cached ansi_on doesn't match the
+        # Browser's current policy (eager invalidation should normally
+        # prevent this), drop the cache so the next render rebuilds.
+        b = Browser(BrowserConfig(_headless=True))
+        item = _seed(b, 'a', 'foo')
+        item.preview_render = PreviewRender(
+            wrapped=['foo'],
+            raw_tail_offset=0,
+            wrapped_tail_offset=0,
+            width=80,
+            ansi_on=not b.preview_ansi,  # mismatch
+        )
         b.append_preview('a', 'bar')
         b.drain_main_queue()
         self.assertEqual(item.preview, 'foobar')
@@ -339,6 +413,249 @@ class TestPreviewRoundTrip(unittest.TestCase):
         b.drain_main_queue()
         self.assertIsNone(item.preview)
         self.assertIsNone(b.get_cached_preview('a'))
+
+
+# --- #423 in-place extension via render round-trip -----------------------
+#
+# These tests build a baseline by setting the full text + rendering, then
+# build the same content incrementally (initial set + append) and re-render.
+# The two ``wrapped`` lists must be byte-identical: extending in place must
+# never diverge from a fresh full re-wrap.
+
+
+def _render_and_get_wrapped(b):
+    """Render once and return the cached ``wrapped`` list."""
+    _render_preview(b)
+    cached = b._state._items_by_id['a'].preview_render
+    assert cached is not None, 'expected preview_render to be populated'
+    return list(cached.wrapped)
+
+
+def _build_baseline(text):
+    """Browser with the full preview pre-set and rendered once."""
+    b = _make_browser_with_preview(text)
+    return b
+
+
+def _build_incremental(prefix, chunk):
+    """Browser with ``prefix`` set + rendered, then ``chunk`` appended."""
+    b = _make_browser_with_preview(prefix)
+    _render_preview(b)  # populate the wrap cache
+    b.append_preview('a', chunk)
+    b.drain_main_queue()
+    return b
+
+
+class TestAppendExtendMatchesFreshWrap(unittest.TestCase):
+    """The #423 invariant: incremental wrap == fresh full wrap, byte-for-byte."""
+
+    def _assert_match(self, prefix, chunk):
+        full = prefix + chunk
+        baseline = _build_baseline(full)
+        incremental = _build_incremental(prefix, chunk)
+        try:
+            base_wrapped = _render_and_get_wrapped(baseline)
+            inc_wrapped = _render_and_get_wrapped(incremental)
+            self.assertEqual(
+                inc_wrapped, base_wrapped,
+                'in-place extension diverged from fresh wrap for '
+                'prefix={!r}, chunk={!r}'.format(prefix, chunk),
+            )
+            # The cached preview text must match too.
+            self.assertEqual(
+                incremental._state._items_by_id['a'].preview, full,
+            )
+        finally:
+            baseline.stop_workers()
+            incremental.stop_workers()
+
+    def test_no_newline_chunk(self):
+        # Append text without any '\n' — the open last line extends.
+        self._assert_match('hello', ' world')
+
+    def test_one_newline_chunk(self):
+        # Append text with one '\n' — closes the partial, opens a new one.
+        self._assert_match('hello', '\nworld')
+
+    def test_multi_newline_chunk(self):
+        # Append text with several newlines — multiple new wrapped lines.
+        self._assert_match('foo', '\nbar\nbaz\nqux')
+
+    def test_chunk_starts_with_newline(self):
+        # Edge: chunk begins with '\n' — previous open line closes
+        # immediately, new lines follow.
+        self._assert_match('alpha', '\nbeta\ngamma')
+
+    def test_chunk_ends_with_newline(self):
+        # Edge: chunk ends with '\n' — new tail line is empty.
+        self._assert_match('one', '\ntwo\n')
+
+    def test_chunk_into_empty_preview(self):
+        # Append to a preview that was originally empty but rendered.
+        self._assert_match('', 'fresh content')
+
+    def test_long_chunk_wraps_multiple_times(self):
+        # A chunk long enough to wrap many times under default width.
+        # The narrow-width path is exercised in a dedicated test below.
+        self._assert_match('start ', 'x' * 500)
+
+    def test_append_after_existing_newlines(self):
+        # Prefix has multiple newlines already.
+        self._assert_match('a\nb\nc', '\nd\ne')
+
+    def test_append_preserves_partial_line_wrap(self):
+        # Prefix ends mid-line (no trailing '\n'); chunk extends it
+        # then breaks. Tail offsets must point past the new break.
+        self._assert_match('partial line text', ' more\nnext')
+
+    def test_multiple_appends_chained(self):
+        # Two sequential appends — the second extension reads offsets
+        # written by the first. Catches any off-by-one in update logic.
+        full = 'a\nbb\nccc\ndddd'
+        baseline = _build_baseline(full)
+        b = _make_browser_with_preview('a')
+        try:
+            _render_preview(b)
+            b.append_preview('a', '\nbb')
+            b.drain_main_queue()
+            b.append_preview('a', '\nccc\ndddd')
+            b.drain_main_queue()
+            base_wrapped = _render_and_get_wrapped(baseline)
+            inc_wrapped = _render_and_get_wrapped(b)
+            self.assertEqual(inc_wrapped, base_wrapped)
+        finally:
+            baseline.stop_workers()
+            b.stop_workers()
+
+    def test_property_various_split_points(self):
+        # For a fixed full text, split at several positions and verify
+        # set(prefix) + append(suffix) == set(full) for each split.
+        full = 'lorem\nipsum dolor sit amet\nconsectetur\nadipiscing'
+        for k in (0, 1, 5, 6, 7, 15, 23, 27, len(full) - 1, len(full)):
+            with self.subTest(split=k):
+                self._assert_match(full[:k], full[k:])
+
+
+class TestAppendExtendOffsetsBookkeeping(unittest.TestCase):
+    """Verify the recorded offsets after an extension are usable."""
+
+    def test_offsets_match_fresh_wrap(self):
+        # After an in-place extension the offsets should be equal to
+        # the offsets a fresh full render would have produced.
+        prefix = 'first line\nsecond'
+        chunk = ' line tail\nthird line'
+        full = prefix + chunk
+        baseline = _make_browser_with_preview(full)
+        incremental = _make_browser_with_preview(prefix)
+        try:
+            _render_preview(baseline)
+            _render_preview(incremental)
+            incremental.append_preview('a', chunk)
+            incremental.drain_main_queue()
+            # Render the baseline already happened; just inspect.
+            base_cached = baseline._state._items_by_id['a'].preview_render
+            inc_cached = incremental._state._items_by_id['a'].preview_render
+            self.assertIsNotNone(inc_cached)
+            self.assertEqual(inc_cached.raw_tail_offset,
+                             base_cached.raw_tail_offset)
+            self.assertEqual(inc_cached.wrapped_tail_offset,
+                             base_cached.wrapped_tail_offset)
+            self.assertEqual(inc_cached.width, base_cached.width)
+            self.assertEqual(inc_cached.ansi_on, base_cached.ansi_on)
+        finally:
+            baseline.stop_workers()
+            incremental.stop_workers()
+
+
+class TestAppendAfterWidthChange(unittest.TestCase):
+    """Width change drops the cache; subsequent append extends from fresh."""
+
+    def test_width_change_then_append_extends_correctly(self):
+        # Simulate: render at one width, simulate a width invalidation
+        # (drop_preview_cache helper), append → next paint regens
+        # fresh, then a second append extends correctly.
+        prefix = 'aaa\nbbb'
+        chunk1 = '\nccc'
+        chunk2 = '\nddd'
+        full = prefix + chunk1 + chunk2
+
+        # Build incremental: prefix → render → invalidate (simulating
+        # an eager-invalidation hook firing) → append chunk1 → render
+        # (fresh) → append chunk2 → render.
+        incremental = _make_browser_with_preview(prefix)
+        try:
+            _render_preview(incremental)
+            # Width change ⇒ wrap cache dropped on every item. Mimic
+            # what ``_invalidate_all_preview_renders`` does.
+            incremental._invalidate_all_preview_renders()
+            self.assertIsNone(
+                incremental._state._items_by_id['a'].preview_render,
+            )
+            # First append after invalidation: extension helper sees
+            # ``preview_render is None`` and leaves it None.
+            incremental.append_preview('a', chunk1)
+            incremental.drain_main_queue()
+            self.assertIsNone(
+                incremental._state._items_by_id['a'].preview_render,
+            )
+            # Next render lazy-fills.
+            _render_preview(incremental)
+            cached_after_render = (
+                incremental._state._items_by_id['a'].preview_render
+            )
+            self.assertIsNotNone(cached_after_render)
+            # Second append: extension helper now has a cache to grow.
+            incremental.append_preview('a', chunk2)
+            incremental.drain_main_queue()
+            cached_after_chunk2 = (
+                incremental._state._items_by_id['a'].preview_render
+            )
+            self.assertIsNotNone(cached_after_chunk2)
+            # Match against a fresh baseline.
+            baseline = _make_browser_with_preview(full)
+            try:
+                base_wrapped = _render_and_get_wrapped(baseline)
+                self.assertEqual(cached_after_chunk2.wrapped, base_wrapped)
+            finally:
+                baseline.stop_workers()
+        finally:
+            incremental.stop_workers()
+
+
+class TestAppendNarrowWidthWrap(unittest.TestCase):
+    """Verify long-chunk multi-wrap correctness using a tiny pane."""
+
+    def test_long_chunk_wraps_to_correct_row_count(self):
+        # Build a Browser with a tiny preview pane so wrapping is
+        # certain to kick in. We can't easily set the pane width
+        # directly from a unit test (it comes from term geometry), so
+        # we forge the cache state with a small width and call the
+        # extension helper directly to exercise the wrap math.
+        b = Browser(BrowserConfig(_headless=True))
+        item = _seed(b, 'a', 'ab')
+        width = 4
+        item.preview_render = PreviewRender(
+            wrapped=['ab'],
+            raw_tail_offset=0,
+            wrapped_tail_offset=0,
+            width=width,
+            ansi_on=True,
+        )
+        # Append a chunk that — combined with the open 'ab' — needs to
+        # wrap. With width=4, "ab" + "cdefghij" = "abcdefghij" → 10
+        # cols → ceil(10/4) = 3 wrapped rows.
+        b.append_preview('a', 'cdefghij')
+        b.drain_main_queue()
+        self.assertEqual(item.preview, 'abcdefghij')
+        cached = item.preview_render
+        self.assertIsNotNone(cached)
+        self.assertEqual(len(cached.wrapped), 3)
+        # Sanity: every row is at most ``width`` columns wide (no SGR
+        # in this content, so byte-length = visible cols).
+        for row in cached.wrapped:
+            self.assertLessEqual(len(row), width)
+        # The concatenation of the wrapped rows reproduces the raw text.
+        self.assertEqual(''.join(cached.wrapped), 'abcdefghij')
 
 
 if __name__ == '__main__':
