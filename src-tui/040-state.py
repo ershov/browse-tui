@@ -2528,6 +2528,17 @@ class Browser:
         The returned list is a shallow copy — modifying it does not
         affect framework state. Use :meth:`update_data` to add /
         remove children.
+
+        **Children-list authority.** Once ``_state._children[parent]``
+        is non-None — populated by ``get_children`` delivery or any
+        ``update_data`` upsert — the framework treats whatever's there
+        as the parent's children list. There's no "loading more"
+        indicator after the initial population; tree expansion paints
+        exactly what's in the list at paint time. The framework can't
+        tell "still streaming" from "forgot to push the rest", so
+        recipes that push children incrementally are responsible for
+        eventually pushing all siblings. See :meth:`update_data` for
+        the same constraint phrased from the push side.
         """
         entry = self._state._children.get(parent_id)
         if entry is None:
@@ -2768,6 +2779,22 @@ class Browser:
 
         Snapshots ``ops`` to a ``list`` on the calling thread so the
         scheduled callable doesn't capture a mutating live source.
+
+        **Children-list authority.** Once ``_state._children[parent]``
+        is non-None — populated by ``get_children`` delivery or any
+        ``update_data`` upsert — the framework treats whatever's there
+        as the parent's children list. There's no "loading more"
+        indicator after the initial population: tree expansion paints
+        exactly what's in the list at paint time.
+
+        *Implication:* if you push children for a parent via
+        ``update_data(upsert(...))`` you must *eventually* push all
+        siblings. Partial lists are valid as transient states (the
+        tail-worker pattern streams new children over time and the
+        user sees them arrive), but a permanently-incomplete list
+        means tree expansion permanently hides the missing siblings.
+        The framework can't tell "still streaming" from "forgot to
+        push the rest" — that's a recipe-author responsibility.
         """
         ops_list = list(ops)
 
@@ -2846,6 +2873,25 @@ class Browser:
         earlier one. Recipes using this should construct the Browser
         with ``get_preview=None`` so the built-in worker doesn't race.
         ``text`` is coerced to ``''`` if None.
+
+        **Registration prerequisite.** This is a no-op when ``id_`` is
+        not present in ``_items_by_id``. Preview storage lives on the
+        Item (``Item.preview`` / ``Item.preview_render``) so without a
+        registered Item there is nowhere to write. To cache preview
+        text for an id, ensure the Item exists first — the cheapest
+        idiom is an idempotent upsert with no field changes::
+
+            b.update_data([upsert(id_, parent_id)])
+            b.set_preview(id_, text)
+
+        For an existing id this is patch-merge-with-no-fields (no-op);
+        for a missing id it creates a minimal Item under ``parent_id``
+        with default field values (``title=''`` backfilled from
+        ``str(id)``, ``tag=''``, ``has_children=False``, etc.) unless
+        you pass them explicitly. Pair with the children-list
+        authority rule on :meth:`update_data` — registering one item
+        via upsert puts it in the parent's children list, so you must
+        eventually push the full sibling set under that parent.
         """
         if text is None:
             text = ''
@@ -2881,6 +2927,10 @@ class Browser:
         wins. Recipes that need strict ordering should pick one path
         per id (typically ``append_preview`` + ``clear_preview`` for
         streaming, ``set_preview`` for one-shot replacements).
+
+        **Registration prerequisite.** This is a no-op when ``id_`` is
+        not present in ``_items_by_id`` (no Item, nowhere to append).
+        See :meth:`set_preview` for the idempotent-ensure pattern.
         """
         if chunk is None:
             chunk = ''
@@ -2909,6 +2959,10 @@ class Browser:
         pane dirty so the next render shows the cleared state (which,
         for the cursor item, is rendered as an empty pane until a
         worker fetch or push repopulates the entry).
+
+        **Registration prerequisite.** This is a no-op when ``id_`` is
+        not present in ``_items_by_id``. See :meth:`set_preview` for
+        the idempotent-ensure pattern.
         """
         def _apply():
             item = self._state._items_by_id.get(id_)
@@ -2941,6 +2995,14 @@ class Browser:
         Idempotent for the same id; ``id_`` need not be the cursor's
         item — recipes can pre-emptively invalidate a soon-to-be-
         visited row.
+
+        **Registration prerequisite.** The cache-drop step is a no-op
+        when ``id_`` is not present in ``_items_by_id`` (no Item,
+        nothing to drop). The ``request_preview`` kick still fires so
+        the worker can populate a freshly-registered id; if the id
+        remains unregistered the worker's result will also no-op on
+        delivery. See :meth:`set_preview` for the idempotent-ensure
+        pattern.
         """
         def _apply():
             item = self._state._items_by_id.get(id_)

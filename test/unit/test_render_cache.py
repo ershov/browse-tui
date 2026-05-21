@@ -697,30 +697,6 @@ class TestRenderPreviewAnsiIntegration(_RenderCacheBase):
             f'got {body!r}',
         )
 
-    def test_search_match_in_coloured_line_drops_sgr(self):
-        """Search match → highlight wins, source SGR stripped."""
-        # Red 'alpha' as the preview text. With search query 'alpha'
-        # the matched line must drop SGR — the walker is told
-        # drop_sgr=True for that line.
-        self.browser = self._make('\x1b[31malpha\x1b[m')
-        self.browser._search_query = 'alpha'
-        _render.render_full(self.browser)
-        body = _strip_bsu_esu(self.cap.drain())
-        # The preview content 'alpha' appears.
-        self.assertIn('alpha', body)
-        # And the source colour (\e[31m) is NOT present in the preview
-        # row because drop_sgr=True dropped it. (The list pane / info
-        # bar may emit other SGR for highlighting, so search for the
-        # specific \e[31m which only the source colour would emit.)
-        # NOTE: if any other code path emits \e[31m as a coincidence
-        # this assertion would over-trigger. The list-pane's
-        # ``_write_highlighted`` uses yellow/bold (\e[33;1m), not red.
-        self.assertNotIn(
-            '\x1b[31m', body,
-            'search-matched line must drop source SGR; '
-            f'got {body!r}',
-        )
-
     def test_cache_hit_on_second_paint(self):
         """Second paint with same preview state → BSU+ESU only."""
         self.browser = self._make('\x1b[31mhello\x1b[m world')

@@ -1532,14 +1532,11 @@ def render_preview(browser, rect, *, info=False, has_header=True,
     # ``preview_ansi`` is stored on Browser since #244; the attribute is
     # always present, no defensive default required.
     ansi_on = browser.preview_ansi
-    query = getattr(browser, '_search_query', '')
 
     # Resolve the cached Item (when in the per-item branch). When we
     # land on a real item, ``item.preview_render`` is the wrap cache
     # candidate; honour it when the geometry and ANSI policy still
-    # match, otherwise regenerate. Search-active renders always
-    # regenerate because ``drop_sgr`` is per-line and depends on the
-    # live query.
+    # match, otherwise regenerate.
     item = None
     if browser._error_text:
         text = browser._error_text
@@ -1554,11 +1551,10 @@ def render_preview(browser, rect, *, info=False, has_header=True,
                 text = item.preview
 
     # Wrap-cache fast path (#422) — only for per-item previews
-    # (error/help text is composed each paint anyway), only when no
-    # search query is active, and only when geometry + ANSI policy
-    # match the cache.
+    # (error/help text is composed each paint anyway), and only when
+    # geometry + ANSI policy match the cache.
     wrapped = None
-    if item is not None and not query and not browser._error_text \
+    if item is not None and not browser._error_text \
             and not browser._help_mode:
         cached = item.preview_render
         if (cached is not None
@@ -1602,24 +1598,14 @@ def render_preview(browser, rect, *, info=False, has_header=True,
         last_idx = len(raw) - 1
         for i, line in enumerate(raw):
             line = line.replace('\t', '    ')
-            # Search-highlight gate: a line that matches the active
-            # search query renders with highlight (yellow/bold)
-            # downstream, which wins over any inline SGR — strip SGR
-            # for that line. Match against the SGR-stripped text so
-            # the codes don't interfere.
-            drop_sgr = False
-            if query:
-                stripped = (_ANSI_CSI_RE.sub('', line)
-                            if '\x1b' in line else line)
-                drop_sgr = _search_matches(stripped, query)
             if i == last_idx:
                 wrapped_tail_offset = len(wrapped)
             wrapped.extend(_wrap_preview_line(
-                line, width, ansi_on=ansi_on, drop_sgr=drop_sgr))
+                line, width, ansi_on=ansi_on, drop_sgr=False))
 
-        # Cache the wrap on the Item when it's a per-item, non-search
-        # render. Other branches (error/help/search) recompute on every
-        # paint and don't share the cache slot.
+        # Cache the wrap on the Item when it's a per-item render.
+        # Other branches (error/help) recompute on every paint and
+        # don't share the cache slot.
         #
         # ``raw_tail_offset`` is the position in ``item.preview`` just
         # after the last ``\n`` (or 0 if no newline yet, or
@@ -1627,7 +1613,7 @@ def render_preview(browser, rect, *, info=False, has_header=True,
         # falling out of ``rfind('\n') + 1`` naturally). This is the
         # start of the currently-open partial last raw line, which is
         # the splice point for #423 in-place ``append_preview``.
-        if item is not None and not query and not browser._error_text \
+        if item is not None and not browser._error_text \
                 and not browser._help_mode:
             raw_text = item.preview if item.preview is not None else ''
             last_nl = raw_text.rfind('\n')

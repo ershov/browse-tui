@@ -658,5 +658,126 @@ class TestAppendNarrowWidthWrap(unittest.TestCase):
         self.assertEqual(''.join(cached.wrapped), 'abcdefghij')
 
 
+# --- Preview-API registration prerequisite (ticket #430) ------------------
+#
+# The preview cache lives on ``Item.preview`` (per #422). The four mutating
+# preview APIs (``set_preview`` / ``append_preview`` / ``clear_preview`` /
+# ``invalidate_preview``) all look up ``_items_by_id[id]`` on the main
+# thread and silently no-op when the id is not present — there's no Item
+# to write to. These tests pin that contract so a future refactor can't
+# accidentally start auto-synthesising Items from preview writes.
+#
+# Plus the documented escape hatch: ``update_data([upsert(id, parent)])``
+# is the cheap idempotent-ensure pattern. For a missing id it creates a
+# minimal Item; for an existing id with no extra fields it's a no-op
+# (patch-merge with no fields).
+
+
+class TestPreviewAPIRegistrationPrerequisite(unittest.TestCase):
+    """Mutating preview APIs no-op silently for unregistered ids."""
+
+    def test_set_preview_on_unregistered_id_is_noop(self):
+        b = Browser(BrowserConfig(_headless=True))
+        # No Item registered for 'ghost'.
+        self.assertNotIn('ghost', b._state._items_by_id)
+        b.set_preview('ghost', 'should-be-dropped')
+        # apply_preview_result returns True (the slot was non-empty),
+        # but no Item is synthesised and no text is cached.
+        b.apply_preview_result()
+        self.assertNotIn('ghost', b._state._items_by_id)
+        self.assertIsNone(b.get_cached_preview('ghost'))
+
+    def test_set_preview_on_registered_id_writes(self):
+        b = Browser(BrowserConfig(_headless=True))
+        item = _seed(b, 'a')  # registered, preview=None initially
+        b.set_preview('a', 'hello')
+        b.apply_preview_result()
+        self.assertEqual(item.preview, 'hello')
+        self.assertEqual(b.get_cached_preview('a'), 'hello')
+
+    def test_append_preview_on_unregistered_id_is_noop(self):
+        b = Browser(BrowserConfig(_headless=True))
+        self.assertNotIn('ghost', b._state._items_by_id)
+        b.append_preview('ghost', 'chunk')
+        b.drain_main_queue()
+        # No Item created; no preview cached.
+        self.assertNotIn('ghost', b._state._items_by_id)
+        self.assertIsNone(b.get_cached_preview('ghost'))
+
+    def test_clear_preview_on_unregistered_id_is_noop(self):
+        b = Browser(BrowserConfig(_headless=True))
+        # Should not raise; should not create an Item.
+        b.clear_preview('ghost')
+        b.drain_main_queue()
+        self.assertNotIn('ghost', b._state._items_by_id)
+
+    def test_invalidate_preview_on_unregistered_id_is_noop(self):
+        b = Browser(BrowserConfig(_headless=True))
+        # Capture any worker kicks — invalidate_preview calls
+        # request_preview, which should still run (it's the recipe's
+        # responsibility to either tolerate that no-op or pre-register
+        # the Item via upsert).
+        b.request_preview = lambda id_: None
+        # Should not raise; should not create an Item.
+        b.invalidate_preview('ghost')
+        b.drain_main_queue()
+        self.assertNotIn('ghost', b._state._items_by_id)
+
+
+class TestIdempotentEnsureUpsertPattern(unittest.TestCase):
+    """``update_data([upsert(id, parent)])`` is the documented ensure path.
+
+    For a missing id, this creates a minimal Item with default fields
+    so subsequent ``set_preview`` lands. For an existing id with no
+    extra fields, it is a patch-merge-with-no-fields no-op.
+    """
+
+    def test_upsert_then_set_preview_caches_text(self):
+        b = Browser(BrowserConfig(_headless=True))
+        # Seed an empty children list for the parent so the upsert can
+        # land — without it ``_children[parent]`` remains None and
+        # tree-side bookkeeping skips the insertion.
+        b._state._children[None] = []
+        # 'unknown' has no Item yet.
+        self.assertNotIn('unknown', b._state._items_by_id)
+        b.update_data([_state.upsert('unknown', None)])
+        b.drain_main_queue()
+        # Item now exists with default field values. Note: Item.__post_init__
+        # backfills an empty ``title`` from ``str(id)``, so a bare upsert
+        # leaves the row visible as the id rather than as a blank line.
+        item = b._state._items_by_id.get('unknown')
+        self.assertIsNotNone(item)
+        self.assertEqual(item.id, 'unknown')
+        self.assertEqual(item.title, 'unknown')
+        self.assertEqual(item.tag, '')
+        self.assertFalse(item.has_children)
+        # And it is recorded as a child of the root parent.
+        self.assertIn(item, b._state._children[None])
+
+        # set_preview now lands.
+        b.set_preview('unknown', 'text-for-unknown')
+        b.apply_preview_result()
+        self.assertEqual(item.preview, 'text-for-unknown')
+        self.assertEqual(b.get_cached_preview('unknown'),
+                         'text-for-unknown')
+
+    def test_upsert_existing_id_no_fields_does_not_overwrite(self):
+        b = Browser(BrowserConfig(_headless=True))
+        b._state._children[None] = []
+        # Seed via upsert with real fields.
+        b.update_data([_state.upsert('a', None, title='Original',
+                                     tag='v1')])
+        b.drain_main_queue()
+        item = b._state._items_by_id['a']
+        self.assertEqual(item.title, 'Original')
+        self.assertEqual(item.tag, 'v1')
+        # Idempotent-ensure: upsert with no fields must not zero out
+        # existing fields.
+        b.update_data([_state.upsert('a', None)])
+        b.drain_main_queue()
+        self.assertEqual(item.title, 'Original')
+        self.assertEqual(item.tag, 'v1')
+
+
 if __name__ == '__main__':
     unittest.main()

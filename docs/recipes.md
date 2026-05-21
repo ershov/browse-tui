@@ -498,6 +498,60 @@ def confirm_pick(ctx):
 `ctx.quit(code, output)` exits the loop; `output` is printed to stdout
 after terminal teardown so it integrates with shell pipelines.
 
+### Framework constraints when pushing data
+
+The eager-push surface (`update_data`, `set_preview`, `append_preview`,
+`clear_preview`, `invalidate_preview`) is fast, thread-safe, and
+silently forgiving in places that can bite you. Two rules to keep in
+mind:
+
+#### Children-list authority
+
+Once `_state._children[parent]` is non-None — populated by a
+`get_children` delivery or any `update_data` upsert — the framework
+treats whatever's there as the parent's children list. There is no
+"loading more" indicator after the initial population: tree expansion
+paints exactly what's in the list at paint time.
+
+**Implication:** if you push children for a parent via
+`update_data(upsert(...))`, you must *eventually* push all siblings.
+Partial lists are valid as transient states (the tail-worker pattern
+streams children over time, and the user sees them appear as they
+arrive), but a permanently-incomplete list means tree expansion
+permanently hides the missing siblings. The framework can't tell
+"still streaming" from "forgot to push the rest" — that's a
+recipe-author responsibility.
+
+#### Preview-API registration prerequisite
+
+`set_preview`, `append_preview`, `clear_preview`, and
+`invalidate_preview` all no-op when the id isn't present in
+`_items_by_id`. Preview storage lives on the Item (`Item.preview` /
+`Item.preview_render`), so without a registered Item there's nowhere
+to write. To cache preview text for an id, register the Item first.
+
+The cheapest idiom is an idempotent upsert with no field changes:
+
+```python
+b.update_data([upsert(id_, parent_id)])
+b.set_preview(id_, text)
+```
+
+For an existing id this is patch-merge-with-no-fields (no-op); for a
+missing id it creates a minimal Item under `parent_id` with default
+fields (`title` backfilled from `str(id)`, `tag=''`,
+`has_children=False`, etc.) unless you pass them explicitly. Pair
+with the children-list authority rule above — registering one item
+via upsert puts it in the parent's children list, so you must
+eventually push the full sibling set under that parent.
+
+**The framework registers cursor-reachable Items.** `visible_items`
+synthesises and registers a `scope_root` Item when one doesn't
+already exist (see the `state.scope_stack` branch in 040-state.py),
+so the per-Item preview cache always has somewhere to land for the
+cursor's current row. Recipes only need to enforce the registration
+constraint above for their *own* pushes — not for cursor navigation.
+
 ### Tips
 
 - **Errors in callbacks won't crash the UI** — `get_children` raising lands
