@@ -1754,10 +1754,12 @@ class TestViewEditDefaults(unittest.TestCase):
         if get_preview is self._DEFAULT_GET_PREVIEW:
             get_preview = lambda item_id: f'GENERATED:{item_id}'
         b = _make_browser(show_preview=show_preview, get_preview=get_preview)
-        b._state._children[None] = [Item(id='x', title='X')]
+        item = Item(id='x', title='X')
+        b._state._children[None] = [item]
+        b._state._items_by_id['x'] = item
         b._state.cursor = 0
         if preview_text is not None:
-            b._state._preview = {'x': preview_text}
+            item.preview = preview_text
         ctx = _ctx_for(b)
 
         captured = {'cmd': None, 'bytes': None, 'existed': None,
@@ -1889,7 +1891,7 @@ class TestViewEditDefaults(unittest.TestCase):
             self.assertEqual(called, ['x'])
             self.assertEqual(cap['bytes'], b'GENERATED:x')
             # Cached for next time.
-            self.assertEqual(b._state._preview.get('x'), 'GENERATED:x')
+            self.assertEqual(b._state._items_by_id['x'].preview, 'GENERATED:x')
         finally:
             b.stop_workers()
 
@@ -1905,7 +1907,7 @@ class TestViewEditDefaults(unittest.TestCase):
             finally:
                 del os.environ['EDITOR']
             self.assertEqual(cap['bytes'], b'EDIT:x')
-            self.assertEqual(b._state._preview.get('x'), 'EDIT:x')
+            self.assertEqual(b._state._items_by_id['x'].preview, 'EDIT:x')
         finally:
             b.stop_workers()
 

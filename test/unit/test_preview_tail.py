@@ -77,9 +77,11 @@ def _make_browser(preview_text='', **kw):
     kw.setdefault('_headless', True)
     kw.setdefault('get_preview', gp)
     b = Browser(BrowserConfig(**kw))
-    b._state._children[None] = [_data.to_item(Item(id='a'))]
+    item = _data.to_item(Item(id='a'))
+    b._state._children[None] = [item]
+    b._state._items_by_id['a'] = item
     _state.mark_visible_dirty(b._state)
-    b._state._preview['a'] = preview_text
+    item.preview = preview_text
     return b
 
 
@@ -175,7 +177,9 @@ class TestTailFollow(unittest.TestCase):
             _render_preview(b)
             initial_max = b._preview_scroll
             # Now append more content; renderer sees longer wrapped list.
-            b._state._preview['a'] += '\n'.join(f'x{i}' for i in range(50)) + '\n'
+            b._state._items_by_id['a'].preview += (
+                '\n'.join(f'x{i}' for i in range(50)) + '\n'
+            )
             b._needs_redraw.add('preview')
             _render_preview(b)
             self.assertGreater(
@@ -315,13 +319,14 @@ class TestStickiness(unittest.TestCase):
         b = _make_browser('a\nb\n')
         try:
             # Two items, cursor on first; engage tail.
-            b._state._children[None] = [
-                _data.to_item(Item(id='x')),
-                _data.to_item(Item(id='y')),
-            ]
+            ix = _data.to_item(Item(id='x'))
+            iy = _data.to_item(Item(id='y'))
+            b._state._children[None] = [ix, iy]
+            b._state._items_by_id['x'] = ix
+            b._state._items_by_id['y'] = iy
             _state.mark_visible_dirty(b._state)
-            b._state._preview['x'] = 'xx\n' * 10
-            b._state._preview['y'] = 'yy\n' * 10
+            ix.preview = 'xx\n' * 10
+            iy.preview = 'yy\n' * 10
             ctx = _ctx_for(b)
             _actions._preview_end(ctx)
             self.assertTrue(b._preview_at_tail)
@@ -342,13 +347,14 @@ class TestStickiness(unittest.TestCase):
         pin on the next render — new item opens at its tail."""
         b = _make_browser('a\nb\n')
         try:
-            b._state._children[None] = [
-                _data.to_item(Item(id='x')),
-                _data.to_item(Item(id='y')),
-            ]
+            ix = _data.to_item(Item(id='x'))
+            iy = _data.to_item(Item(id='y'))
+            b._state._children[None] = [ix, iy]
+            b._state._items_by_id['x'] = ix
+            b._state._items_by_id['y'] = iy
             _state.mark_visible_dirty(b._state)
-            b._state._preview['x'] = 'xx\n' * 10
-            b._state._preview['y'] = '\n'.join(f'l{i}' for i in range(200))
+            ix.preview = 'xx\n' * 10
+            iy.preview = '\n'.join(f'l{i}' for i in range(200))
             ctx = _ctx_for(b)
             _actions._preview_end(ctx)
             b._state.cursor = 1
@@ -452,11 +458,11 @@ class TestInvalidatePreviewPreservesViewState(unittest.TestCase):
     def test_invalidate_drops_cache_entry(self):
         b = _make_browser('cached body\n')
         try:
-            b._state._preview['a'] = 'stale text'
+            b._state._items_by_id['a'].preview = 'stale text'
             b.invalidate_preview('a')
             b.drain_main_queue()
             # Cache cleared; renderer will see empty until worker fetches.
-            self.assertNotIn('a', b._state._preview)
+            self.assertIsNone(b._state._items_by_id['a'].preview)
         finally:
             b.stop_workers()
 
@@ -464,10 +470,10 @@ class TestInvalidatePreviewPreservesViewState(unittest.TestCase):
         b = _make_browser('a\n')
         try:
             ctx = _ctx_for(b)
-            b._state._preview['a'] = 'stale'
+            b._state._items_by_id['a'].preview = 'stale'
             ctx.invalidate_preview('a')
             b.drain_main_queue()
-            self.assertNotIn('a', b._state._preview)
+            self.assertIsNone(b._state._items_by_id['a'].preview)
             self.assertEqual(b._preview_req, 'a')
         finally:
             b.stop_workers()

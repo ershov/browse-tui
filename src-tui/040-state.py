@@ -1990,7 +1990,6 @@ class Browser:
         # alongside _children for cohesion (one place to invalidate
         # everything per item id).
         self._state = State(root_id=config.root_id)
-        self._state._preview = {}  # item_id -> preview text
         # Apply ``initial_scope`` after State is built so scope_into can
         # do its bookkeeping (saving the empty pre-scope expanded set
         # under the prior scope key).
@@ -2720,16 +2719,18 @@ class Browser:
         """(thread-safe) Append ``chunk`` to the cached preview for ``id_``.
 
         The append is scheduled on the main thread via ``post()`` so the
-        read-modify-write of ``_state._preview[id_]`` is race-free. If
-        ``id_`` has no cached entry yet, the chunk becomes the entire
-        preview. ``chunk`` is coerced to ``''`` if None.
+        read-modify-write of ``item.preview`` is race-free. If ``id_``
+        has no Item in the index, the append is silently dropped (the
+        item is not loaded). If the Item's ``preview`` is ``None`` it
+        is initialised to ``''`` before appending. ``chunk`` is coerced
+        to ``''`` if None.
 
         Marks the preview pane dirty so the next render pass picks up
         the new content.
 
-        Cache shape note: ``_state._preview`` is a per-id ``dict``, so
-        appending to one id does not affect any other. The renderer reads
-        ``_state._preview.get(cursor_id, '')`` so an append for a
+        Cache shape note: preview text now lives on ``Item.preview`` so
+        appending to one id does not affect any other. The renderer
+        reads ``item.preview`` for the cursor id; an append for a
         non-cursor id is buffered silently until the user navigates to
         that item.
 
@@ -2747,9 +2748,10 @@ class Browser:
         if chunk is None:
             chunk = ''
         def _apply():
-            self._state._preview[id_] = (
-                self._state._preview.get(id_, '') + chunk
-            )
+            item = self._state._items_by_id.get(id_)
+            if item is not None:
+                cur = item.preview if item.preview is not None else ''
+                item.preview = cur + chunk
             self._needs_redraw.add('preview')
         self.post(_apply)
 
@@ -2763,7 +2765,9 @@ class Browser:
         worker fetch or push repopulates the entry).
         """
         def _apply():
-            self._state._preview.pop(id_, None)
+            item = self._state._items_by_id.get(id_)
+            if item is not None:
+                item.preview = None
             self._needs_redraw.add('preview')
         self.post(_apply)
 
@@ -2779,8 +2783,8 @@ class Browser:
 
         Implemented as a main-thread post that drops the cache entry
         and calls ``request_preview(id_)`` to ask the worker for a
-        fresh fetch. The result lands in ``_state._preview[id_]`` via
-        the existing single-slot lane; the next render picks it up.
+        fresh fetch. The result lands in ``item.preview`` via the
+        existing single-slot lane; the next render picks it up.
 
         Contrast with the cursor-move path: cursor changes are a
         "fresh view" signal — scroll resets to 0 and the tail pin is
@@ -2792,7 +2796,9 @@ class Browser:
         visited row.
         """
         def _apply():
-            self._state._preview.pop(id_, None)
+            item = self._state._items_by_id.get(id_)
+            if item is not None:
+                item.preview = None
             self.request_preview(id_)
             self._needs_redraw.add('preview')
         self.post(_apply)
@@ -2809,10 +2815,11 @@ class Browser:
         latency of a re-fetch.
 
         Returns ``None`` if there is no cached entry (the worker has
-        not yet delivered for this id, or the entry was dropped via
-        :meth:`drop_preview_cache`).
+        not yet delivered for this id, the id is unknown, or the entry
+        was dropped via :meth:`drop_preview_cache`).
         """
-        return self._state._preview.get(id_)
+        item = self._state._items_by_id.get(id_)
+        return item.preview if item is not None else None
 
     def drop_preview_cache(self, id_=None) -> None:
         """(thread-safe) Drop cached preview text.
@@ -2833,9 +2840,12 @@ class Browser:
         """
         def _apply():
             if id_ is None:
-                self._state._preview.clear()
+                for it in self._state._items_by_id.values():
+                    it.preview = None
             else:
-                self._state._preview.pop(id_, None)
+                item = self._state._items_by_id.get(id_)
+                if item is not None:
+                    item.preview = None
             cur = self._preview_cursor_id
             if cur is not None and (id_ is None or id_ == cur):
                 self.request_preview(cur)
@@ -3475,7 +3485,9 @@ class Browser:
             return False
         id_, text = self._preview_result
         self._preview_result = None
-        self._state._preview[id_] = text
+        item = self._state._items_by_id.get(id_)
+        if item is not None:
+            item.preview = text
         self._needs_redraw.add('preview')
         return True
 
@@ -4095,7 +4107,7 @@ class Browser:
         * Each yielded chunk is coerced to ``str`` and appended via
           ``append_preview`` (post-queue, race-free read-modify-write).
         * Tracks running buffer size locally (chars + lines). Reading
-          back from ``_state._preview`` would race with the main-thread
+          back from ``Item.preview`` would race with the main-thread
           drain — the local counter is authoritative for the cap check.
         * When cap is reached → pauses (does NOT close the generator)
           and waits on ``_preview_resume_event``. Wake conditions:
@@ -4114,9 +4126,9 @@ class Browser:
           partial buffered preview is retained.
 
         ``_preview_result`` is NOT used in this branch — the streaming
-        path writes directly through the per-id ``_state._preview``
-        cache via ``append_preview``. The single-slot result lane is
-        only for non-generator returns.
+        path writes directly through the per-id ``Item.preview`` cache
+        via ``append_preview``. The single-slot result lane is only
+        for non-generator returns.
         """
         chars = 0
         lines = 0

@@ -903,6 +903,15 @@ class Item:
     it out of constructor signatures, ``repr=False`` hides it from
     debug dumps, ``compare=False`` keeps it out of ``__eq__`` /
     ``__hash__``.
+
+    ``preview`` is the per-item preview text cache (string or
+    ``None``). Lives on the Item rather than a side-table dict so it
+    survives the Item's lifetime naturally and is dropped with it.
+    Excluded from ``__eq__`` / ``__hash__`` / ``repr`` and ``init`` —
+    it's a derived cache slot, not part of the Item's identity. Recipes
+    populate it via ``Browser.set_preview`` / ``append_preview`` /
+    ``clear_preview`` / ``invalidate_preview``; the worker delivery
+    path writes it directly.
     """
 
     id: Any
@@ -913,6 +922,9 @@ class Item:
     hidden: bool = False
     _filter_hidden: bool = field(
         default=False, init=False, repr=False, compare=False,
+    )
+    preview: Any = field(
+        default=None, init=False, repr=False, compare=False,
     )
 
     def __post_init__(self) -> None:
@@ -3038,7 +3050,6 @@ class Browser:
         # alongside _children for cohesion (one place to invalidate
         # everything per item id).
         self._state = State(root_id=config.root_id)
-        self._state._preview = {}  # item_id -> preview text
         # Apply ``initial_scope`` after State is built so scope_into can
         # do its bookkeeping (saving the empty pre-scope expanded set
         # under the prior scope key).
@@ -3768,16 +3779,18 @@ class Browser:
         """(thread-safe) Append ``chunk`` to the cached preview for ``id_``.
 
         The append is scheduled on the main thread via ``post()`` so the
-        read-modify-write of ``_state._preview[id_]`` is race-free. If
-        ``id_`` has no cached entry yet, the chunk becomes the entire
-        preview. ``chunk`` is coerced to ``''`` if None.
+        read-modify-write of ``item.preview`` is race-free. If ``id_``
+        has no Item in the index, the append is silently dropped (the
+        item is not loaded). If the Item's ``preview`` is ``None`` it
+        is initialised to ``''`` before appending. ``chunk`` is coerced
+        to ``''`` if None.
 
         Marks the preview pane dirty so the next render pass picks up
         the new content.
 
-        Cache shape note: ``_state._preview`` is a per-id ``dict``, so
-        appending to one id does not affect any other. The renderer reads
-        ``_state._preview.get(cursor_id, '')`` so an append for a
+        Cache shape note: preview text now lives on ``Item.preview`` so
+        appending to one id does not affect any other. The renderer
+        reads ``item.preview`` for the cursor id; an append for a
         non-cursor id is buffered silently until the user navigates to
         that item.
 
@@ -3795,9 +3808,10 @@ class Browser:
         if chunk is None:
             chunk = ''
         def _apply():
-            self._state._preview[id_] = (
-                self._state._preview.get(id_, '') + chunk
-            )
+            item = self._state._items_by_id.get(id_)
+            if item is not None:
+                cur = item.preview if item.preview is not None else ''
+                item.preview = cur + chunk
             self._needs_redraw.add('preview')
         self.post(_apply)
 
@@ -3811,7 +3825,9 @@ class Browser:
         worker fetch or push repopulates the entry).
         """
         def _apply():
-            self._state._preview.pop(id_, None)
+            item = self._state._items_by_id.get(id_)
+            if item is not None:
+                item.preview = None
             self._needs_redraw.add('preview')
         self.post(_apply)
 
@@ -3827,8 +3843,8 @@ class Browser:
 
         Implemented as a main-thread post that drops the cache entry
         and calls ``request_preview(id_)`` to ask the worker for a
-        fresh fetch. The result lands in ``_state._preview[id_]`` via
-        the existing single-slot lane; the next render picks it up.
+        fresh fetch. The result lands in ``item.preview`` via the
+        existing single-slot lane; the next render picks it up.
 
         Contrast with the cursor-move path: cursor changes are a
         "fresh view" signal — scroll resets to 0 and the tail pin is
@@ -3840,7 +3856,9 @@ class Browser:
         visited row.
         """
         def _apply():
-            self._state._preview.pop(id_, None)
+            item = self._state._items_by_id.get(id_)
+            if item is not None:
+                item.preview = None
             self.request_preview(id_)
             self._needs_redraw.add('preview')
         self.post(_apply)
@@ -3857,10 +3875,11 @@ class Browser:
         latency of a re-fetch.
 
         Returns ``None`` if there is no cached entry (the worker has
-        not yet delivered for this id, or the entry was dropped via
-        :meth:`drop_preview_cache`).
+        not yet delivered for this id, the id is unknown, or the entry
+        was dropped via :meth:`drop_preview_cache`).
         """
-        return self._state._preview.get(id_)
+        item = self._state._items_by_id.get(id_)
+        return item.preview if item is not None else None
 
     def drop_preview_cache(self, id_=None) -> None:
         """(thread-safe) Drop cached preview text.
@@ -3881,9 +3900,12 @@ class Browser:
         """
         def _apply():
             if id_ is None:
-                self._state._preview.clear()
+                for it in self._state._items_by_id.values():
+                    it.preview = None
             else:
-                self._state._preview.pop(id_, None)
+                item = self._state._items_by_id.get(id_)
+                if item is not None:
+                    item.preview = None
             cur = self._preview_cursor_id
             if cur is not None and (id_ is None or id_ == cur):
                 self.request_preview(cur)
@@ -4523,7 +4545,9 @@ class Browser:
             return False
         id_, text = self._preview_result
         self._preview_result = None
-        self._state._preview[id_] = text
+        item = self._state._items_by_id.get(id_)
+        if item is not None:
+            item.preview = text
         self._needs_redraw.add('preview')
         return True
 
@@ -5143,7 +5167,7 @@ class Browser:
         * Each yielded chunk is coerced to ``str`` and appended via
           ``append_preview`` (post-queue, race-free read-modify-write).
         * Tracks running buffer size locally (chars + lines). Reading
-          back from ``_state._preview`` would race with the main-thread
+          back from ``Item.preview`` would race with the main-thread
           drain — the local counter is authoritative for the cap check.
         * When cap is reached → pauses (does NOT close the generator)
           and waits on ``_preview_resume_event``. Wake conditions:
@@ -5162,9 +5186,9 @@ class Browser:
           partial buffered preview is retained.
 
         ``_preview_result`` is NOT used in this branch — the streaming
-        path writes directly through the per-id ``_state._preview``
-        cache via ``append_preview``. The single-slot result lane is
-        only for non-generator returns.
+        path writes directly through the per-id ``Item.preview`` cache
+        via ``append_preview``. The single-slot result lane is only
+        for non-generator returns.
         """
         chars = 0
         lines = 0
@@ -7692,7 +7716,7 @@ def render_preview(browser, rect, *, info=False, has_header=True,
     Source priority for the content:
       1. ``browser._error_text`` if set      → display the error text
       2. ``browser._help_mode`` if True      → display ``compose_help_text``
-      3. ``browser._state._preview[id]``     → per-item preview
+      3. ``item.preview`` (cursor item)      → per-item preview
       4. fallthrough — empty preview         → blank rows
 
     Content is wrapped at ``rect.width`` columns. Rows shorter than
@@ -7738,10 +7762,11 @@ def render_preview(browser, rect, *, info=False, has_header=True,
         text = compose_help_text(browser, include_usage=False)
     else:
         cursor_id = _cursor_id(browser)
-        text = (
-            browser._state._preview.get(cursor_id, '')
-            if cursor_id is not None else ''
-        )
+        text = ''
+        if cursor_id is not None:
+            item = browser._state._items_by_id.get(cursor_id)
+            if item is not None and item.preview is not None:
+                text = item.preview
 
     # ``preview_ansi`` is stored on Browser since #244; the attribute is
     # always present, no defensive default required.
@@ -10343,8 +10368,8 @@ def _run_external_on_preview(ctx, *, env_var, default):
 
     Resolution order for the preview text:
 
-      1. ``state._preview[item.id]`` — used as-is when present, including
-         the empty string (legitimate empty content).
+      1. ``item.preview`` — used as-is when present, including the
+         empty string (legitimate empty content).
       2. Synchronous fetch via ``browser.get_preview(item.id)`` — works
          even when the preview pane is hidden or the async worker has
          not delivered yet. The result is cached so a subsequent toggle
@@ -10353,7 +10378,6 @@ def _run_external_on_preview(ctx, *, env_var, default):
          or the fetcher returned ``None``/raised — surface a message
          and skip the external command.
     """
-    state = ctx._browser._state
     item = ctx.cursor
     if item is None:
         return
@@ -10365,9 +10389,7 @@ def _run_external_on_preview(ctx, *, env_var, default):
     if get_preview is None:
         ctx.message('No preview available')
         return
-    text = None
-    if hasattr(state, '_preview'):
-        text = state._preview.get(item.id)
+    text = getattr(item, 'preview', None)
     if text is None:
         # Cache miss — fetch synchronously. The preview pane may be
         # hidden, or the async worker may not have run yet; either way
@@ -10382,8 +10404,7 @@ def _run_external_on_preview(ctx, *, env_var, default):
             ctx.message('No preview available')
             return
         # Cache so the preview pane (if shown later) skips the refetch.
-        if hasattr(state, '_preview'):
-            state._preview[item.id] = text
+        item.preview = text
     cmd = os.environ.get(env_var) or default
     with tempfile.NamedTemporaryFile(
             mode='wb', prefix='browse-tui-', suffix='.txt', delete=False) as f:

@@ -17,7 +17,9 @@ import threading
 import time
 import unittest
 
-from test.async_._helpers import Browser, BrowserConfig, Pending, make_browser
+from test.async_._helpers import (
+    Browser, BrowserConfig, Item, Pending, make_browser, get_preview_text,
+)
 
 
 class TestWorkerLifecycle(unittest.TestCase):
@@ -162,9 +164,10 @@ class TestPreviewWorker(unittest.TestCase):
             return f'preview of {id_}'
         b = make_browser(get_preview=get_preview)
         try:
+            b._state._items_by_id['A'] = Item(id='A')
             b.request_preview('A')
             b.run_until_idle()
-            self.assertEqual(b._state._preview.get('A'), 'preview of A')
+            self.assertEqual(get_preview_text(b, 'A'), 'preview of A')
         finally:
             b.stop_workers()
 
@@ -179,6 +182,8 @@ class TestPreviewWorker(unittest.TestCase):
             return f'preview of {id_}'
         b = make_browser(get_preview=get_preview)
         try:
+            b._state._items_by_id['A'] = Item(id='A')
+            b._state._items_by_id['B'] = Item(id='B')
             b.request_preview('A')
             time.sleep(0.01)  # let the worker pick up 'A'
             b.request_preview('B')
@@ -189,7 +194,7 @@ class TestPreviewWorker(unittest.TestCase):
             # worker delivered its result before B clobbered the slot,
             # which it does in our implementation, but tests assert
             # weakly to stay robust to plausible reorderings).
-            self.assertEqual(b._state._preview.get('B'), 'preview of B')
+            self.assertEqual(get_preview_text(b, 'B'), 'preview of B')
         finally:
             b.stop_workers()
 
@@ -198,9 +203,10 @@ class TestPreviewWorker(unittest.TestCase):
             raise ValueError('nope')
         b = make_browser(get_preview=bad)
         try:
+            b._state._items_by_id['X'] = Item(id='X')
             b.request_preview('X')
             b.run_until_idle()
-            text = b._state._preview.get('X', '')
+            text = (get_preview_text(b, 'X') or '')
             self.assertTrue(text.startswith('[error]'))
             self.assertIn('ValueError', text)
             self.assertIn('nope', text)
@@ -210,9 +216,10 @@ class TestPreviewWorker(unittest.TestCase):
     def test_no_get_preview_returns_empty_string(self):
         b = make_browser()  # get_preview is None
         try:
+            b._state._items_by_id['X'] = Item(id='X')
             b.request_preview('X')
             b.run_until_idle()
-            self.assertEqual(b._state._preview.get('X'), '')
+            self.assertEqual(get_preview_text(b, 'X'), '')
         finally:
             b.stop_workers()
 

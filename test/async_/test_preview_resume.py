@@ -23,7 +23,7 @@ import threading
 import time
 import unittest
 
-from test.async_._helpers import Item, make_browser
+from test.async_._helpers import Item, make_browser, get_preview_text
 
 
 def _wait_until(predicate, timeout=2.0, interval=0.005):
@@ -230,7 +230,7 @@ class TestMultipleResumeCycles(unittest.TestCase):
                 self.assertGreaterEqual(cur - prev, 100)
 
             # Buffer reflects the milestones (>= last milestone chars).
-            buf_len = len(b._state._preview.get('a', ''))
+            buf_len = len((get_preview_text(b, 'a') or ''))
             self.assertGreaterEqual(buf_len, milestones[-1])
         finally:
             b.stop_workers()
@@ -304,7 +304,7 @@ class TestCursorMoveDuringResume(unittest.TestCase):
             # Worker should now be serving b.
             self.assertTrue(
                 _drain_until(
-                    b, lambda: b._state._preview.get('b') == 'b-content'
+                    b, lambda: get_preview_text(b, 'b') == 'b-content'
                 ),
             )
         finally:
@@ -360,7 +360,7 @@ class TestExhaustionAfterResume(unittest.TestCase):
                               f'still paused: {b._preview_paused!r}')
             self.assertIsNone(b._preview_req)
             # Final buffer = 5 * 50 = 250 chars.
-            self.assertEqual(len(b._state._preview.get('a', '')), 250)
+            self.assertEqual(len((get_preview_text(b, 'a') or '')), 250)
         finally:
             b.stop_workers()
 

@@ -340,8 +340,8 @@ def _run_external_on_preview(ctx, *, env_var, default):
 
     Resolution order for the preview text:
 
-      1. ``state._preview[item.id]`` — used as-is when present, including
-         the empty string (legitimate empty content).
+      1. ``item.preview`` — used as-is when present, including the
+         empty string (legitimate empty content).
       2. Synchronous fetch via ``browser.get_preview(item.id)`` — works
          even when the preview pane is hidden or the async worker has
          not delivered yet. The result is cached so a subsequent toggle
@@ -350,7 +350,6 @@ def _run_external_on_preview(ctx, *, env_var, default):
          or the fetcher returned ``None``/raised — surface a message
          and skip the external command.
     """
-    state = ctx._browser._state
     item = ctx.cursor
     if item is None:
         return
@@ -362,9 +361,7 @@ def _run_external_on_preview(ctx, *, env_var, default):
     if get_preview is None:
         ctx.message('No preview available')
         return
-    text = None
-    if hasattr(state, '_preview'):
-        text = state._preview.get(item.id)
+    text = getattr(item, 'preview', None)
     if text is None:
         # Cache miss — fetch synchronously. The preview pane may be
         # hidden, or the async worker may not have run yet; either way
@@ -379,8 +376,7 @@ def _run_external_on_preview(ctx, *, env_var, default):
             ctx.message('No preview available')
             return
         # Cache so the preview pane (if shown later) skips the refetch.
-        if hasattr(state, '_preview'):
-            state._preview[item.id] = text
+        item.preview = text
     cmd = os.environ.get(env_var) or default
     with tempfile.NamedTemporaryFile(
             mode='wb', prefix='browse-tui-', suffix='.txt', delete=False) as f:

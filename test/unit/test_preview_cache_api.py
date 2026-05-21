@@ -18,6 +18,7 @@ _state.to_item = _data.to_item
 _state.notify_wake = _term.notify_wake
 _context.visible_items = _state.visible_items
 
+Item = _data.Item
 Browser = _state.Browser
 BrowserConfig = _state.BrowserConfig
 Context = _context.Context
@@ -27,11 +28,19 @@ def _drain(b):
     b.drain_main_queue()
 
 
+def _seed(b, id_, text):
+    """Register an Item with id and stash ``text`` on its ``preview`` slot."""
+    item = Item(id=id_)
+    b._state._items_by_id[id_] = item
+    item.preview = text
+    return item
+
+
 class TestGetCachedPreview(unittest.TestCase):
 
     def test_returns_cached_text(self):
         b = Browser(BrowserConfig(_headless=True))
-        b._state._preview['x'] = 'hello'
+        _seed(b, 'x', 'hello')
         self.assertEqual(b.get_cached_preview('x'), 'hello')
 
     def test_returns_none_when_absent(self):
@@ -50,24 +59,27 @@ class TestDropPreviewCache(unittest.TestCase):
 
     def test_drop_single_id(self):
         b = Browser(BrowserConfig(_headless=True))
-        b._state._preview.update({'a': 'A', 'b': 'B'})
+        a = _seed(b, 'a', 'A')
+        bb = _seed(b, 'b', 'B')
         b.drop_preview_cache('a')
         _drain(b)
-        self.assertNotIn('a', b._state._preview)
-        self.assertIn('b', b._state._preview)
+        self.assertIsNone(a.preview)
+        self.assertEqual(bb.preview, 'B')
 
     def test_drop_all(self):
         b = Browser(BrowserConfig(_headless=True))
-        b._state._preview.update({'a': 'A', 'b': 'B', 'c': 'C'})
+        items = [_seed(b, i, i.upper()) for i in ('a', 'b', 'c')]
         b.drop_preview_cache()
         _drain(b)
-        self.assertEqual(b._state._preview, {})
+        for it in items:
+            self.assertIsNone(it.preview)
 
     def test_idempotent_on_missing(self):
         b = Browser(BrowserConfig(_headless=True))
         b.drop_preview_cache('never_existed')
         _drain(b)
-        self.assertEqual(b._state._preview, {})
+        # Nothing should crash; index stays empty.
+        self.assertEqual(b._state._items_by_id, {})
 
     def test_signals_redraw(self):
         b = Browser(BrowserConfig(_headless=True))
@@ -81,7 +93,7 @@ class TestDropPreviewCache(unittest.TestCase):
         # framework auto-kicks request_preview so the pane refills.
         b = Browser(BrowserConfig(_headless=True))
         b._preview_cursor_id = 'cur'
-        b._state._preview['cur'] = 'stale'
+        _seed(b, 'cur', 'stale')
 
         kicked = []
         b.request_preview = lambda id_: kicked.append(id_)
@@ -93,7 +105,7 @@ class TestDropPreviewCache(unittest.TestCase):
     def test_does_not_kick_for_non_cursor_id(self):
         b = Browser(BrowserConfig(_headless=True))
         b._preview_cursor_id = 'cur'
-        b._state._preview['other'] = 'stale'
+        _seed(b, 'other', 'stale')
 
         kicked = []
         b.request_preview = lambda id_: kicked.append(id_)
@@ -105,7 +117,8 @@ class TestDropPreviewCache(unittest.TestCase):
     def test_drop_all_kicks_cursor(self):
         b = Browser(BrowserConfig(_headless=True))
         b._preview_cursor_id = 'cur'
-        b._state._preview.update({'cur': 'A', 'other': 'B'})
+        _seed(b, 'cur', 'A')
+        _seed(b, 'other', 'B')
 
         kicked = []
         b.request_preview = lambda id_: kicked.append(id_)
@@ -131,18 +144,19 @@ class TestContextPassthroughs(unittest.TestCase):
 
     def test_get_cached_preview(self):
         b = Browser(BrowserConfig(_headless=True))
-        b._state._preview['x'] = 'X'
+        _seed(b, 'x', 'X')
         ctx = Context(b)
         self.assertEqual(ctx.get_cached_preview('x'), 'X')
         self.assertIsNone(ctx.get_cached_preview('nope'))
 
     def test_drop_preview_cache(self):
         b = Browser(BrowserConfig(_headless=True))
-        b._state._preview.update({'a': 'A', 'b': 'B'})
+        a = _seed(b, 'a', 'A')
+        _seed(b, 'b', 'B')
         ctx = Context(b)
         ctx.drop_preview_cache('a')
         _drain(b)
-        self.assertNotIn('a', b._state._preview)
+        self.assertIsNone(a.preview)
 
     def test_preview_item_id(self):
         b = Browser(BrowserConfig(_headless=True))

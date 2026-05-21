@@ -258,30 +258,36 @@ class TestBrowserSetChildren(unittest.TestCase):
 class TestBrowserSetPreview(unittest.TestCase):
     """``set_preview`` (#265) lets recipe-owned threads inject previews."""
 
-    def test_set_preview_appears_after_apply(self):
+    def _browser_with_item(self, id_='a'):
         b = Browser(BrowserConfig(_headless=True))
+        item = _data.Item(id=id_)
+        b._state._items_by_id[id_] = item
+        return b, item
+
+    def test_set_preview_appears_after_apply(self):
+        b, item = self._browser_with_item()
         b.set_preview('a', 'hello')
         applied = b.apply_preview_result()
         self.assertTrue(applied)
-        self.assertEqual(b._state._preview['a'], 'hello')
+        self.assertEqual(item.preview, 'hello')
 
     def test_set_preview_latest_wins_before_apply(self):
-        b = Browser(BrowserConfig(_headless=True))
+        b, item = self._browser_with_item()
         b.set_preview('a', 'first')
         b.set_preview('a', 'second')
         applied = b.apply_preview_result()
         self.assertTrue(applied)
-        self.assertEqual(b._state._preview['a'], 'second')
+        self.assertEqual(item.preview, 'second')
 
     def test_set_preview_none_coerces_to_empty(self):
-        b = Browser(BrowserConfig(_headless=True))
+        b, item = self._browser_with_item()
         b.set_preview('a', None)
         applied = b.apply_preview_result()
         self.assertTrue(applied)
-        self.assertEqual(b._state._preview['a'], '')
+        self.assertEqual(item.preview, '')
 
     def test_set_preview_from_worker_thread_appears(self):
-        b = Browser(BrowserConfig(_headless=True))
+        b, item = self._browser_with_item()
         done = threading.Event()
 
         def worker():
@@ -294,7 +300,7 @@ class TestBrowserSetPreview(unittest.TestCase):
         self.assertTrue(done.is_set())
         applied = b.apply_preview_result()
         self.assertTrue(applied)
-        self.assertEqual(b._state._preview['a'], 'from-thread')
+        self.assertEqual(item.preview, 'from-thread')
 
 
 # --- PaneCache (#186) ------------------------------------------------------

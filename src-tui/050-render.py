@@ -1489,7 +1489,7 @@ def render_preview(browser, rect, *, info=False, has_header=True,
     Source priority for the content:
       1. ``browser._error_text`` if set      → display the error text
       2. ``browser._help_mode`` if True      → display ``compose_help_text``
-      3. ``browser._state._preview[id]``     → per-item preview
+      3. ``item.preview`` (cursor item)      → per-item preview
       4. fallthrough — empty preview         → blank rows
 
     Content is wrapped at ``rect.width`` columns. Rows shorter than
@@ -1535,10 +1535,11 @@ def render_preview(browser, rect, *, info=False, has_header=True,
         text = compose_help_text(browser, include_usage=False)
     else:
         cursor_id = _cursor_id(browser)
-        text = (
-            browser._state._preview.get(cursor_id, '')
-            if cursor_id is not None else ''
-        )
+        text = ''
+        if cursor_id is not None:
+            item = browser._state._items_by_id.get(cursor_id)
+            if item is not None and item.preview is not None:
+                text = item.preview
 
     # ``preview_ansi`` is stored on Browser since #244; the attribute is
     # always present, no defensive default required.

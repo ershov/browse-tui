@@ -24,7 +24,7 @@ import threading
 import time
 import unittest
 
-from test.async_._helpers import Item, make_browser
+from test.async_._helpers import Item, make_browser, get_preview_text
 
 
 def _wait_until(predicate, timeout=2.0, interval=0.005):
@@ -70,7 +70,7 @@ class TestStreamingYields(unittest.TestCase):
             b.run_until_idle()
             b.request_preview('a')
             b.run_until_idle()
-            self.assertEqual(b._state._preview.get('a'), 'line 1\nline 2\nline 3\n')
+            self.assertEqual(get_preview_text(b, 'a'), 'line 1\nline 2\nline 3\n')
         finally:
             b.stop_workers()
 
@@ -97,21 +97,21 @@ class TestStreamingYields(unittest.TestCase):
 
             # Worker is now blocked on gate1 — wait until 'A' is in cache.
             self.assertTrue(
-                _drain_until(b, lambda: b._state._preview.get('x') == 'A'),
-                f"expected 'A', got {b._state._preview.get('x')!r}",
+                _drain_until(b, lambda: get_preview_text(b, 'x') == 'A'),
+                f"expected 'A', got {get_preview_text(b, 'x')!r}",
             )
 
             # Release gate1 — worker yields 'B'.
             gate1.set()
             self.assertTrue(
-                _drain_until(b, lambda: b._state._preview.get('x') == 'AB'),
-                f"expected 'AB', got {b._state._preview.get('x')!r}",
+                _drain_until(b, lambda: get_preview_text(b, 'x') == 'AB'),
+                f"expected 'AB', got {get_preview_text(b, 'x')!r}",
             )
 
             # Release gate2 — worker yields 'C' and exhausts.
             gate2.set()
             b.run_until_idle()
-            self.assertEqual(b._state._preview.get('x'), 'ABC')
+            self.assertEqual(get_preview_text(b, 'x'), 'ABC')
         finally:
             gate1.set()
             gate2.set()
@@ -135,7 +135,7 @@ class TestStreamingYields(unittest.TestCase):
             b.run_until_idle()
             b.request_preview('a')
             b.run_until_idle()
-            self.assertEqual(b._state._preview.get('a'), 'hello 42 world')
+            self.assertEqual(get_preview_text(b, 'a'), 'hello 42 world')
         finally:
             b.stop_workers()
 
@@ -180,7 +180,7 @@ class TestCapThenPause(unittest.TestCase):
             )
             # Buffer reflects exactly what was pulled (>= cap, but no more
             # than initial * 50).
-            buf = b._state._preview.get('a', '')
+            buf = (get_preview_text(b, 'a') or '')
             self.assertGreaterEqual(len(buf), 100)
             self.assertEqual(len(buf), initial * 50)
         finally:
@@ -327,7 +327,7 @@ class TestAbandonMidStream(unittest.TestCase):
             # Wait until first chunk is delivered.
             self.assertTrue(
                 _drain_until(
-                    b, lambda: b._state._preview.get('a') == 'first chunk'
+                    b, lambda: get_preview_text(b, 'a') == 'first chunk'
                 ),
             )
             # Move cursor BEFORE releasing the gate. Worker is blocked
@@ -362,7 +362,7 @@ class TestStringReturnRegression(unittest.TestCase):
             b.run_until_idle()
             b.request_preview('a')
             b.run_until_idle()
-            self.assertEqual(b._state._preview.get('a'), 'preview for a')
+            self.assertEqual(get_preview_text(b, 'a'), 'preview for a')
             # Generator-only state stays untouched.
             self.assertIsNone(b._preview_paused)
         finally:
@@ -379,7 +379,7 @@ class TestStringReturnRegression(unittest.TestCase):
             b.run_until_idle()
             b.request_preview('a')
             b.run_until_idle()
-            self.assertEqual(b._state._preview.get('a'), '')
+            self.assertEqual(get_preview_text(b, 'a'), '')
             self.assertIsNone(b._preview_paused)
         finally:
             b.stop_workers()
@@ -406,11 +406,11 @@ class TestStringReturnRegression(unittest.TestCase):
             b.run_until_idle()
             b.request_preview('str')
             b.run_until_idle()
-            self.assertEqual(b._state._preview.get('str'), 'plain')
+            self.assertEqual(get_preview_text(b, 'str'), 'plain')
 
             b.request_preview('gen')
             b.run_until_idle()
-            self.assertEqual(b._state._preview.get('gen'), 'streamed-gen')
+            self.assertEqual(get_preview_text(b, 'gen'), 'streamed-gen')
         finally:
             b.stop_workers()
 
@@ -434,7 +434,7 @@ class TestGeneratorRaisesMidStream(unittest.TestCase):
             b.run_until_idle()
             b.request_preview('a')
             b.run_until_idle()
-            buf = b._state._preview.get('a', '')
+            buf = (get_preview_text(b, 'a') or '')
             self.assertIn('first chunk', buf)
             self.assertIn('second chunk', buf)
             self.assertIn('RuntimeError', buf)
@@ -458,7 +458,7 @@ class TestGeneratorRaisesMidStream(unittest.TestCase):
             b.run_until_idle()
             b.request_preview('a')
             b.run_until_idle()
-            buf = b._state._preview.get('a', '')
+            buf = (get_preview_text(b, 'a') or '')
             self.assertIn('ValueError', buf)
             self.assertIn('initial boom', buf)
         finally:
@@ -509,7 +509,7 @@ class TestNewPreviewSupersedesPaused(unittest.TestCase):
                 "b's preview did not start",
             )
             b.run_until_idle()
-            self.assertEqual(b._state._preview.get('b'), 'b-content')
+            self.assertEqual(get_preview_text(b, 'b'), 'b-content')
             # Paused state empty (b's gen exhausted; a's was abandoned).
             self.assertIsNone(b._preview_paused)
         finally:
@@ -535,7 +535,7 @@ class TestEmptyAndCleanExhaustion(unittest.TestCase):
             b.request_preview('a')
             b.run_until_idle()
             # No yields — cache stays absent (or empty).
-            self.assertIn(b._state._preview.get('a', ''), ('', None))
+            self.assertIn((get_preview_text(b, 'a') or ''), ('', None))
             self.assertIsNone(b._preview_paused)
         finally:
             b.stop_workers()
@@ -555,7 +555,7 @@ class TestEmptyAndCleanExhaustion(unittest.TestCase):
             b.request_preview('a')
             b.run_until_idle()
             self.assertIsNone(b._preview_req)
-            self.assertEqual(b._state._preview.get('a'), 'done')
+            self.assertEqual(get_preview_text(b, 'a'), 'done')
         finally:
             b.stop_workers()
 

@@ -70,6 +70,16 @@ def _make_browser(**kw):
     return Browser(BrowserConfig(**kw))
 
 
+def _seed_items(b, *ids):
+    """Register Items for ``ids`` so preview writes have a target."""
+    items = {}
+    for id_ in ids:
+        item = Item(id=id_)
+        b._state._items_by_id[id_] = item
+        items[id_] = item
+    return items
+
+
 # --- update_data pass-through --------------------------------------------
 
 
@@ -284,10 +294,11 @@ class TestSetPreviewPassThrough(unittest.TestCase):
         # (_preview_result), drained by apply_preview_result.
         b = _make_browser()
         try:
+            items = _seed_items(b, 'a')
             ctx = Context(b)
             ctx.set_preview('a', 'hello')
             self.assertTrue(b.apply_preview_result())
-            self.assertEqual(b._state._preview['a'], 'hello')
+            self.assertEqual(items['a'].preview, 'hello')
         finally:
             b.stop_workers()
 
@@ -296,7 +307,7 @@ class TestAppendPreviewPassThrough(unittest.TestCase):
     """``ctx.append_preview(id, chunk)`` forwards to Browser.
 
     Browser.append_preview routes via post() so the read-modify-write
-    of ``_state._preview[id]`` happens on the main thread.
+    of ``item.preview`` happens on the main thread.
     """
 
     def test_returns_none(self):
@@ -310,56 +321,61 @@ class TestAppendPreviewPassThrough(unittest.TestCase):
     def test_appends_to_empty_cache(self):
         b = _make_browser()
         try:
+            items = _seed_items(b, 'a')
             ctx = Context(b)
             ctx.append_preview('a', 'hello')
             b.drain_main_queue()
-            self.assertEqual(b._state._preview.get('a'), 'hello')
+            self.assertEqual(items['a'].preview, 'hello')
         finally:
             b.stop_workers()
 
     def test_appends_to_existing_cache(self):
         b = _make_browser()
         try:
+            items = _seed_items(b, 'a')
             ctx = Context(b)
-            b._state._preview['a'] = 'foo'
+            items['a'].preview = 'foo'
             ctx.append_preview('a', 'bar')
             b.drain_main_queue()
-            self.assertEqual(b._state._preview['a'], 'foobar')
+            self.assertEqual(items['a'].preview, 'foobar')
         finally:
             b.stop_workers()
 
     def test_multiple_appends_concatenate(self):
         b = _make_browser()
         try:
+            items = _seed_items(b, 'a')
             ctx = Context(b)
             ctx.append_preview('a', 'a')
             ctx.append_preview('a', 'b')
             ctx.append_preview('a', 'c')
             b.drain_main_queue()
-            self.assertEqual(b._state._preview['a'], 'abc')
+            self.assertEqual(items['a'].preview, 'abc')
         finally:
             b.stop_workers()
 
     def test_per_id_isolation(self):
         b = _make_browser()
         try:
+            items = _seed_items(b, 'a', 'b')
             ctx = Context(b)
             ctx.append_preview('a', 'A')
             ctx.append_preview('b', 'B')
             b.drain_main_queue()
-            self.assertEqual(b._state._preview['a'], 'A')
-            self.assertEqual(b._state._preview['b'], 'B')
+            self.assertEqual(items['a'].preview, 'A')
+            self.assertEqual(items['b'].preview, 'B')
         finally:
             b.stop_workers()
 
     def test_none_chunk_coerces_to_empty(self):
         b = _make_browser()
         try:
+            items = _seed_items(b, 'a')
             ctx = Context(b)
-            b._state._preview['a'] = 'foo'
+            items['a'].preview = 'foo'
             ctx.append_preview('a', None)
             b.drain_main_queue()
-            self.assertEqual(b._state._preview['a'], 'foo')
+            self.assertEqual(items['a'].preview, 'foo')
         finally:
             b.stop_workers()
 
@@ -389,11 +405,12 @@ class TestClearPreviewPassThrough(unittest.TestCase):
     def test_drops_cached_entry(self):
         b = _make_browser()
         try:
+            items = _seed_items(b, 'a')
             ctx = Context(b)
-            b._state._preview['a'] = 'old'
+            items['a'].preview = 'old'
             ctx.clear_preview('a')
             b.drain_main_queue()
-            self.assertNotIn('a', b._state._preview)
+            self.assertIsNone(items['a'].preview)
         finally:
             b.stop_workers()
 
@@ -403,15 +420,16 @@ class TestClearPreviewPassThrough(unittest.TestCase):
             ctx = Context(b)
             ctx.clear_preview('nonexistent')
             b.drain_main_queue()  # should not raise
-            self.assertNotIn('nonexistent', b._state._preview)
+            self.assertNotIn('nonexistent', b._state._items_by_id)
         finally:
             b.stop_workers()
 
     def test_marks_preview_dirty(self):
         b = _make_browser()
         try:
+            items = _seed_items(b, 'a')
             ctx = Context(b)
-            b._state._preview['a'] = 'old'
+            items['a'].preview = 'old'
             b._needs_redraw.clear()
             ctx.clear_preview('a')
             b.drain_main_queue()

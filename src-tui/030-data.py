@@ -35,6 +35,15 @@ class Item:
     it out of constructor signatures, ``repr=False`` hides it from
     debug dumps, ``compare=False`` keeps it out of ``__eq__`` /
     ``__hash__``.
+
+    ``preview`` is the per-item preview text cache (string or
+    ``None``). Lives on the Item rather than a side-table dict so it
+    survives the Item's lifetime naturally and is dropped with it.
+    Excluded from ``__eq__`` / ``__hash__`` / ``repr`` and ``init`` —
+    it's a derived cache slot, not part of the Item's identity. Recipes
+    populate it via ``Browser.set_preview`` / ``append_preview`` /
+    ``clear_preview`` / ``invalidate_preview``; the worker delivery
+    path writes it directly.
     """
 
     id: Any
@@ -45,6 +54,9 @@ class Item:
     hidden: bool = False
     _filter_hidden: bool = field(
         default=False, init=False, repr=False, compare=False,
+    )
+    preview: Any = field(
+        default=None, init=False, repr=False, compare=False,
     )
 
     def __post_init__(self) -> None:

@@ -138,7 +138,10 @@ def _make_browser(items=None, **kw):
     b = Browser(BrowserConfig(**kw))
     # Force the root children to be cached up front so visible_items has
     # something to traverse.
-    b._state._children[None] = [_data.to_item(it) for it in items]
+    coerced = [_data.to_item(it) for it in items]
+    b._state._children[None] = coerced
+    for it in coerced:
+        b._state._items_by_id[it.id] = it
     _state.mark_visible_dirty(b._state)
     return b
 
@@ -470,13 +473,13 @@ class TestRightmostUsesEraseLine(_RenderCacheBase):
         # storing it in the preview cache dict. ``render_preview`` reads
         # ``browser._preview`` (or similar) — populate via the worker
         # contract instead, which is to set the entry directly.
-        self.browser._state._preview['a'] = long_text
+        self.browser._state._items_by_id['a'].preview = long_text
 
         _render.render_full(self.browser)
         self.cap.drain()
 
         # Now shrink the preview content.
-        self.browser._state._preview['a'] = short_text
+        self.browser._state._items_by_id['a'].preview = short_text
         captured['preview'] = short_text
         self.browser._needs_redraw.add('preview')
         _render.render_partial(self.browser)
@@ -613,7 +616,7 @@ class TestRenderPreviewAnsiIntegration(_RenderCacheBase):
         browser_kw.setdefault('show_preview', True)
         browser_kw.setdefault('show_children_pane', False)
         b = _make_browser(items, **browser_kw)
-        b._state._preview['a'] = preview_text
+        b._state._items_by_id['a'].preview = preview_text
         return b
 
     def test_plain_text_byte_identical_to_pre_ansi(self):
@@ -739,7 +742,7 @@ class TestPreviewScrollClamp(_RenderCacheBase):
         items = [Item(id='a', title='alpha')]
         b = _make_browser(items, split='v', show_preview=True,
                           show_children_pane=False)
-        b._state._preview['a'] = preview_text
+        b._state._items_by_id['a'].preview = preview_text
         return b
 
     def test_scroll_when_content_fits_clamps_to_zero(self):

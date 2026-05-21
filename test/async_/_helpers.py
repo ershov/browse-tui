@@ -37,3 +37,13 @@ def make_browser(**kw):
     b = Browser(BrowserConfig(**kw))
     b.start_workers()
     return b
+
+
+def get_preview_text(b, id_):
+    """Return the cached preview text for ``id_`` or ``None``.
+
+    Replaces the legacy ``b._state._preview.get(id_)`` lookup now that
+    preview text lives on ``Item.preview`` (ticket #422).
+    """
+    item = b._state._items_by_id.get(id_)
+    return item.preview if item is not None else None
