@@ -3443,20 +3443,114 @@ def _preview_umbrella(item_id):
 
     Per-leaf renderer errors are caught and surfaced as a red error
     stub so one bad row doesn't blank the entire preview.
+
+    Side effects (added in #424):
+      * Children discovered during the descent that aren't yet in the
+        framework's cache are eager-pushed via one batched
+        ``_BROWSER.update_data(ops)`` call. Subsequent recompositions
+        (and a user's first expand) reuse those entries without
+        re-running ``get_children``.
+      * Each leaf record's rendered body is cached on its Item via a
+        single main-thread ``post`` that writes ``item.preview = text``
+        for every leaf the descent rendered. The umbrella's own
+        composed preview is cached by the framework via the standard
+        worker return path (no recipe-side ``set_preview`` needed
+        for the top-level id).
+
+    We deliberately avoid ``set_preview`` for the per-leaf cache:
+    that API is single-slot (latest-wins) and would lose all but the
+    last write in a multi-leaf composition. The direct ``post`` writes
+    are race-free because they land on the main thread, and they don't
+    interfere with the worker's own single-slot result delivery for
+    the umbrella id.
     """
     parts = []
-    _collect_umbrella_preview(item_id, parts)
+    ops = []
+    leaf_previews = {}
+    _collect_umbrella_preview(item_id, parts, ops, leaf_previews)
+    if _BROWSER is not None:
+        # One batched push per top-level invocation. Thread-safe:
+        # ``update_data`` schedules the apply onto the main thread.
+        # The post queue is FIFO so this lands before the leaf-preview
+        # writes below — leaves we just discovered will be in
+        # ``_items_by_id`` by the time their preview write runs.
+        if ops:
+            _BROWSER.update_data(ops)
+        if leaf_previews:
+            _BROWSER.post(lambda b=_BROWSER, lp=leaf_previews:
+                          _apply_leaf_previews(b, lp))
     return '\n\n'.join(parts)
 
 
-def _collect_umbrella_preview(item_id, parts):
-    """Append rendered bodies for ``item_id``'s descendants to ``parts``."""
-    try:
-        children = get_children(item_id)
-    except Exception as e:
-        parts.append(_rule(f'error listing {item_id}', RED)
-                     + f'\n{type(e).__name__}: {e}')
-        return
+def _apply_leaf_previews(b, leaf_previews):
+    """Main-thread: write rendered text onto each leaf Item's preview.
+
+    Mirrors what ``apply_preview_result`` does, but for many ids at
+    once. Skips ids that aren't in the index (e.g. a leaf whose
+    upsert op was dropped between scheduling and now). Drops the
+    wrap-render cache so the next paint regenerates against fresh
+    text.
+    """
+    items = b.items_by_id
+    for cid, text in leaf_previews.items():
+        item = items.get(cid)
+        if item is None:
+            continue
+        item.preview = text
+        item.preview_render = None
+
+
+def _collect_umbrella_preview(item_id, parts, ops, leaf_previews):
+    """Append rendered bodies for ``item_id``'s descendants to ``parts``.
+
+    ``ops`` is an accumulator of ``upsert`` tuples for the framework
+    push API. The top-level caller flushes the batch once after the
+    whole descent completes. When ``_BROWSER`` exposes children for
+    ``item_id`` via ``cached_children``, no upserts are staged for that
+    subtree (the framework already has them).
+
+    ``leaf_previews`` is an ``{id: rendered_text}`` accumulator for
+    per-leaf preview-cache writes. The top-level caller posts one
+    main-thread callback that writes every entry to its Item.
+    """
+    # Read-path: prefer the framework's cached children if available.
+    # ``cached_children`` returns None when the parent hasn't been
+    # fetched yet (or when we're running outside a real Browser, e.g.
+    # in unit tests). A non-None list — even empty — is authoritative.
+    children = None
+    cached = None
+    if _BROWSER is not None:
+        try:
+            cached = _BROWSER.cached_children(item_id)
+        except Exception:
+            cached = None
+    if cached is not None:
+        children = cached
+    else:
+        try:
+            children = get_children(item_id)
+        except Exception as e:
+            parts.append(_rule(f'error listing {item_id}', RED)
+                         + f'\n{type(e).__name__}: {e}')
+            return
+        # Stage upserts so subsequent recursion / expansion sees the
+        # children without re-running ``get_children``. The framework's
+        # ``upsert`` op is a no-op if the child id is already present
+        # with matching parent + fields, but checking via
+        # ``items_by_id`` first lets us skip the work entirely.
+        if _BROWSER is not None:
+            try:
+                index = _BROWSER.items_by_id
+            except Exception:
+                index = None
+            for child in children:
+                cid = getattr(child, 'id', None)
+                if not isinstance(cid, str):
+                    continue
+                if index is not None and cid in index:
+                    continue
+                ops.append(upsert(cid, item_id,
+                                  **_item_to_upsert_kwargs(child)))
     for child in children:
         cid = getattr(child, 'id', None)
         if not isinstance(cid, str):
@@ -3480,7 +3574,7 @@ def _collect_umbrella_preview(item_id, parts):
                 # Same-file umbrella — recurse so the user sees every
                 # underlying line, not just the umbrella's first
                 # leaf.
-                _collect_umbrella_preview(cid, parts)
+                _collect_umbrella_preview(cid, parts, ops, leaf_previews)
                 continue
             if '#' not in cid:
                 continue
@@ -3488,9 +3582,33 @@ def _collect_umbrella_preview(item_id, parts):
             n = _parse_int(lineno)
             if n is None:
                 continue
+            # Per-record preview cache on Item: skip the JSONL read +
+            # body render when the framework already has a non-empty
+            # cached preview for this leaf. The umbrella's own preview
+            # gets cached by the framework's worker return path, but
+            # each leaf only lands in the cache once *we* compose
+            # something with it.
+            cached_leaf = None
+            if _BROWSER is not None:
+                try:
+                    cached_leaf = _BROWSER.get_cached_preview(cid)
+                except Exception:
+                    cached_leaf = None
+            if cached_leaf:
+                parts.append(cached_leaf)
+                continue
             rendered = _render_record_with_rule(cpath, n)
             if rendered is not None:
                 parts.append(rendered)
+                # Cache the leaf render so the next recomposition
+                # (tail tick, sibling umbrella's recursion, collapse
+                # + re-expand, …) is a cheap dict lookup. The actual
+                # write happens on the main thread via the top-level
+                # ``post`` callback in ``_preview_umbrella`` — using a
+                # batched ``post`` instead of ``set_preview`` because
+                # ``set_preview`` is single-slot (latest-wins).
+                if _BROWSER is not None:
+                    leaf_previews[cid] = rendered
         except Exception as e:
             parts.append(_rule(f'error rendering child {cid}', RED)
                          + f'\n{type(e).__name__}: {e}')

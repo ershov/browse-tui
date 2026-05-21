@@ -3948,5 +3948,375 @@ class TestVoiceOnlyFilter(unittest.TestCase):
         self.assertIn('_action_toggle_filter', source)
 
 
+# ---- #424: composer ↔ framework cache integration ----------------------
+#
+# These tests exercise the three new behaviors added to
+# ``_collect_umbrella_preview``:
+#   * children flow through ``_BROWSER.cached_children`` (no duplicate
+#     ``get_children`` calls after the first composition),
+#   * absent children are eager-pushed via one batched
+#     ``_BROWSER.update_data(ops)`` call per top-level invocation,
+#   * each leaf's rendered body is cached on ``Item.preview`` via a
+#     single main-thread ``post`` callback.
+#
+# The recipe is unit-testable against a fake Browser that captures
+# ``cached_children`` reads, ``update_data`` op batches, and
+# main-thread posts. The fake mirrors the framework's threading
+# contract: every method is callable from any thread; ``post``-ed
+# callables run inline (we drain them at the test's discretion via
+# ``flush()``), and ``update_data`` mirrors the real apply behaviour
+# enough that subsequent reads see the upserts.
+
+
+class _FakeBrowser:
+    """In-process stand-in for ``Browser`` used by #424 tests.
+
+    Tracks every interesting call:
+      * ``cached_children_calls`` — ids the composer asked about.
+      * ``update_data_calls`` — list of op-list batches submitted.
+      * ``posted`` — pending main-thread callables (drained by
+        ``flush()``).
+      * ``items_by_id`` / ``_children_cache`` — minimal storage so
+        the second pass can observe the eager-push effect.
+
+    Threading model: synchronous. ``update_data`` and ``post`` both
+    queue work onto ``posted``; the test drives it explicitly via
+    ``flush()``.
+    """
+
+    def __init__(self):
+        self.cached_children_calls = []
+        self.update_data_calls = []
+        self.posted = []
+        self.items_by_id = {}
+        self._children_cache = {}
+
+    def cached_children(self, parent_id):
+        self.cached_children_calls.append(parent_id)
+        entry = self._children_cache.get(parent_id)
+        if entry is None:
+            return None
+        return list(entry)
+
+    def get_cached_preview(self, id_):
+        item = self.items_by_id.get(id_)
+        return getattr(item, 'preview', None) if item is not None else None
+
+    def update_data(self, ops):
+        ops_list = list(ops)
+        self.update_data_calls.append(ops_list)
+
+        def _apply(ops_list=ops_list):
+            for op in ops_list:
+                kind = op[0]
+                if kind != 'upsert':
+                    continue
+                id_ = op[1]
+                parent_id = op[2]
+                fields = op[3]
+                if id_ in self.items_by_id:
+                    item = self.items_by_id[id_]
+                    for k, v in fields.items():
+                        setattr(item, k, v)
+                else:
+                    item = _RecordingItem(id_, **fields)
+                    self.items_by_id[id_] = item
+                kids = self._children_cache.setdefault(parent_id, [])
+                if item not in kids:
+                    kids.append(item)
+        self.posted.append(_apply)
+
+    def post(self, fn):
+        self.posted.append(fn)
+
+    def flush(self):
+        """Drain queued main-thread work, FIFO."""
+        while self.posted:
+            fn = self.posted.pop(0)
+            fn()
+
+
+class _RecordingItem:
+    """Mimic ``Item``'s relevant fields without pulling in the framework.
+
+    ``hidden`` defaults to False (matches Item default). ``preview`` is
+    the per-Item preview cache the framework reads via
+    ``get_cached_preview``. Extra kwargs land as attributes (mirrors
+    ``Item.__init__`` + ``setattr`` extras).
+    """
+
+    def __init__(self, id_, **fields):
+        self.id = id_
+        self.preview = None
+        self.preview_render = None
+        self.hidden = False
+        for k, v in fields.items():
+            setattr(self, k, v)
+
+
+class TestUmbrellaPreviewCacheIntegration(unittest.TestCase):
+    """#424: cached_children-driven reads + eager push + leaf preview cache."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def setUp(self):
+        self._saved_BROWSER = self.r._BROWSER
+        self._saved_TREE_MODE = self.r._TREE_MODE
+        self.r._TREE_MODE = True
+
+    def tearDown(self):
+        self.r._BROWSER = self._saved_BROWSER
+        self.r._TREE_MODE = self._saved_TREE_MODE
+        # Drop the recipe-level tree cache so each test gets a fresh
+        # scan of its synthetic .jsonl.
+        self.r._TREE_CACHE.clear()
+
+    def _write_jsonl(self, records):
+        import json as _json
+        import tempfile
+        f = tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False)
+        for r in records:
+            f.write(_json.dumps(r) + '\n')
+        f.close()
+        return f.name
+
+    def _instrument_get_children(self):
+        """Wrap ``get_children`` to record every call. Returns the counter
+        and a teardown callable to restore the original."""
+        counter = {'calls': []}
+        original = self.r.get_children
+
+        def _wrapped(item_id, *, reload=False):
+            counter['calls'].append(item_id)
+            return original(item_id, reload=reload)
+
+        self.r.get_children = _wrapped
+        return counter, (lambda: setattr(self.r, 'get_children', original))
+
+    def _make_three_record_session(self):
+        # Turn root → assistant tool_use → user tool_result. Yields a
+        # ``<prompt>`` umbrella with a nested ``<tool>`` umbrella.
+        return self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'PROBE_USER'}},
+            {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 't1', 'name': 'Bash',
+                  'input': {'command': 'PROBE_BASH'}},
+             ]}},
+            {'type': 'user', 'uuid': 'u2', 'parentUuid': 'a1',
+             'message': {'role': 'user', 'content': [
+                 {'type': 'tool_result', 'tool_use_id': 't1',
+                  'content': 'PROBE_OUTPUT'},
+             ]}},
+        ])
+
+    def test_no_browser_falls_back_to_get_children(self):
+        # Smoke: with ``_BROWSER=None`` (e.g. unit-test harness without
+        # a real Browser) the composer still works — it just doesn't
+        # eager-push or leaf-cache. Verifies graceful degradation.
+        self.r._BROWSER = None
+        path = self._make_three_record_session()
+        try:
+            out = self.r._preview_umbrella(f'{path}#prompt:0')
+            self.assertIn('PROBE_USER', out)
+            self.assertIn('PROBE_BASH', out)
+            self.assertIn('PROBE_OUTPUT', out)
+        finally:
+            os.unlink(path)
+
+    def test_composer_does_not_double_call_get_children(self):
+        # First composition: ``get_children`` is called for the prompt
+        # umbrella and the nested tool umbrella (one each).
+        # Second composition: cache hits for both — no new calls.
+        self.r._BROWSER = _FakeBrowser()
+        path = self._make_three_record_session()
+        counter, restore = self._instrument_get_children()
+        try:
+            self.r._preview_umbrella(f'{path}#prompt:0')
+            self.r._BROWSER.flush()
+            first_pass_calls = list(counter['calls'])
+            # First pass must have fetched both umbrellas.
+            self.assertIn(f'{path}#prompt:0', first_pass_calls)
+            self.assertIn(f'{path}#tool:1', first_pass_calls)
+
+            self.r._preview_umbrella(f'{path}#prompt:0')
+            self.r._BROWSER.flush()
+            # No additional ``get_children`` calls — cache served
+            # every read.
+            self.assertEqual(
+                len(counter['calls']), len(first_pass_calls),
+                f'second pass should hit cache; saw new calls: '
+                f'{counter["calls"][len(first_pass_calls):]}',
+            )
+        finally:
+            restore()
+            os.unlink(path)
+
+    def test_leaf_previews_are_populated(self):
+        # After ``_preview_umbrella`` runs, every leaf child of the
+        # umbrella should have ``Item.preview`` populated. We check by
+        # consulting the FakeBrowser's items_by_id index after the
+        # post queue drains.
+        self.r._BROWSER = _FakeBrowser()
+        path = self._make_three_record_session()
+        try:
+            self.r._preview_umbrella(f'{path}#prompt:0')
+            self.r._BROWSER.flush()
+            # The leaf record ids are ``<path>#0``, ``<path>#1``,
+            # ``<path>#2``. All three should have a non-empty
+            # ``preview`` slot. Umbrellas (#prompt:, #tool:) are not
+            # leaves and won't be populated by this code path — the
+            # framework's worker handles those.
+            for n in (0, 1, 2):
+                cid = f'{path}#{n}'
+                item = self.r._BROWSER.items_by_id.get(cid)
+                self.assertIsNotNone(item, f'leaf {cid} not in index')
+                self.assertTrue(
+                    item.preview,
+                    f'leaf {cid}.preview should be populated; '
+                    f'got {item.preview!r}',
+                )
+        finally:
+            os.unlink(path)
+
+    def test_eager_push_one_update_data_call_per_invocation(self):
+        # The composer should accumulate upserts across the recursive
+        # descent and flush them in exactly one ``update_data`` call.
+        self.r._BROWSER = _FakeBrowser()
+        path = self._make_three_record_session()
+        try:
+            self.r._preview_umbrella(f'{path}#prompt:0')
+            self.assertEqual(
+                len(self.r._BROWSER.update_data_calls), 1,
+                'composer should flush exactly one update_data batch '
+                'per top-level invocation; got '
+                f'{len(self.r._BROWSER.update_data_calls)}',
+            )
+            # The batch should contain at least one upsert (the leaves
+            # under the prompt umbrella).
+            ops = self.r._BROWSER.update_data_calls[0]
+            upserts = [op for op in ops if op[0] == 'upsert']
+            self.assertGreater(
+                len(upserts), 0,
+                'expected at least one upsert op for the leaves',
+            )
+        finally:
+            os.unlink(path)
+
+    def test_tail_tick_only_re_renders_new_records(self):
+        # Compose once. Append a new leaf via a synthetic upsert. Wrap
+        # ``_render_record_with_rule`` to count calls. The second
+        # composition should re-render only the new leaf (existing
+        # ones are cache hits).
+        self.r._BROWSER = _FakeBrowser()
+        path = self._make_three_record_session()
+
+        render_calls = []
+        original_render = self.r._render_record_with_rule
+
+        def _counting_render(p, n):
+            render_calls.append((p, n))
+            return original_render(p, n)
+
+        self.r._render_record_with_rule = _counting_render
+        try:
+            self.r._preview_umbrella(f'{path}#prompt:0')
+            self.r._BROWSER.flush()
+            calls_after_first = list(render_calls)
+            # First pass: the three leaves all rendered.
+            self.assertEqual(
+                len(calls_after_first), 3,
+                f'first pass should render 3 leaves; got '
+                f'{calls_after_first}',
+            )
+
+            # Simulate a tail tick: append a new leaf to the cached
+            # children list. (Real tail worker would do this via
+            # ``update_data`` upsert; we shortcut by mutating the
+            # fake's storage. The point of the test is to verify the
+            # composer's cache behavior, not the tail worker's.)
+            new_leaf = _RecordingItem(
+                f'{path}#3',
+                title='NEW',
+                tag='user',
+                hidden=False,
+            )
+            self.r._BROWSER.items_by_id[new_leaf.id] = new_leaf
+            self.r._BROWSER._children_cache.setdefault(
+                f'{path}#prompt:0', []
+            ).append(new_leaf)
+
+            # Now write the new record to disk and re-scan so
+            # ``_render_record_with_rule`` can read it.
+            import json as _json
+            with open(path, 'a') as f:
+                f.write(_json.dumps({
+                    'type': 'user', 'uuid': 'u3', 'parentUuid': 'a1',
+                    'message': {'role': 'user',
+                                'content': 'PROBE_NEW_RECORD'},
+                }) + '\n')
+            self.r._TREE_CACHE.pop(path, None)
+
+            render_calls.clear()
+            self.r._preview_umbrella(f'{path}#prompt:0')
+            self.r._BROWSER.flush()
+            # Second pass: only the new leaf re-renders. The three
+            # existing leaves were cache hits.
+            self.assertEqual(
+                len(render_calls), 1,
+                f'second pass should render only the new leaf; got '
+                f'{render_calls}',
+            )
+            self.assertEqual(render_calls[0], (path, 3))
+        finally:
+            self.r._render_record_with_rule = original_render
+            os.unlink(path)
+
+    def test_collapse_and_re_expand_uses_cached_children(self):
+        # The "collapse + re-expand" UX is mediated by the framework's
+        # expand goal — but the relevant invariant for the composer is
+        # that a second ``cached_children`` read on the same id hits
+        # the framework's cache (so the user's first expand sees the
+        # preview-populated children instantly). After ``_preview_umbrella``
+        # runs once, ``cached_children`` for the umbrella should be
+        # non-None.
+        self.r._BROWSER = _FakeBrowser()
+        path = self._make_three_record_session()
+        try:
+            self.r._preview_umbrella(f'{path}#prompt:0')
+            self.r._BROWSER.flush()
+            # First expand: the framework consults its cache via
+            # cached_children. The recipe-side composer has populated
+            # it; the framework would now skip the children-queue
+            # fetch entirely.
+            cached = self.r._BROWSER.cached_children(f'{path}#prompt:0')
+            self.assertIsNotNone(
+                cached, 'cached_children should be populated after '
+                'preview composition',
+            )
+            self.assertGreater(
+                len(cached), 0,
+                'cached children list should be non-empty',
+            )
+            # Second preview pass: the composer reads from the cache,
+            # never re-asks ``get_children`` for this id.
+            counter, restore = self._instrument_get_children()
+            try:
+                self.r._preview_umbrella(f'{path}#prompt:0')
+                self.r._BROWSER.flush()
+                self.assertNotIn(
+                    f'{path}#prompt:0', counter['calls'],
+                    'second composition must not re-fetch '
+                    'cached umbrella children',
+                )
+            finally:
+                restore()
+        finally:
+            os.unlink(path)
+
+
 if __name__ == '__main__':
     unittest.main()
