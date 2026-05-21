@@ -1,7 +1,35 @@
 """browse-tui: data layer (Item type, coercion, caches)."""
 
+from collections import namedtuple
 from dataclasses import dataclass, field
 from typing import Any
+
+
+# ``PreviewRender`` is the per-Item wrap cache used by ``render_preview``
+# (050-render.py). It is filled lazily on first paint and dropped eagerly
+# whenever its inputs change:
+#
+#   * ``Item.preview`` is set / appended / cleared
+#   * terminal resize
+#   * ``preview_ansi`` toggle (Capital-R)
+#   * ``update_data`` mod / upsert touching the Item
+#
+# ``wrapped``             — list[str] of wrapped/SGR-tokenised rows
+# ``raw_tail_offset``     — character offset in ``Item.preview`` where the
+#                           wrap consumed input up to (for the future
+#                           in-place ``append_preview`` fast path).
+# ``wrapped_tail_offset`` — number of wrapped rows produced so far (same
+#                           reason).
+# ``width``, ``ansi_on``  — geometry / SGR-policy the cache was built
+#                           against. Defensive fields: eager invalidation
+#                           hooks (resize, ansi toggle) should have
+#                           dropped the cache already, but a mismatch
+#                           triggers regeneration as a safety net.
+PreviewRender = namedtuple(
+    'PreviewRender',
+    ['wrapped', 'raw_tail_offset', 'wrapped_tail_offset',
+     'width', 'ansi_on'],
+)
 
 
 @dataclass
@@ -44,6 +72,13 @@ class Item:
     populate it via ``Browser.set_preview`` / ``append_preview`` /
     ``clear_preview`` / ``invalidate_preview``; the worker delivery
     path writes it directly.
+
+    ``preview_render`` is the per-Item wrap cache (a ``PreviewRender``
+    namedtuple or ``None``) consumed by ``render_preview``. Filled
+    lazily on first paint; dropped to ``None`` eagerly on any input
+    change (preview text mutation, terminal resize, ``preview_ansi``
+    toggle, ``update_data`` mod/upsert). Same identity exclusion as
+    ``preview``.
     """
 
     id: Any
@@ -56,6 +91,14 @@ class Item:
         default=False, init=False, repr=False, compare=False,
     )
     preview: Any = field(
+        default=None, init=False, repr=False, compare=False,
+    )
+    # Wrap cache for ``preview`` — see ``PreviewRender`` above. Lazily
+    # filled by ``render_preview`` on first paint; eagerly invalidated
+    # (set back to ``None``) on any input change (text mutation, resize,
+    # ansi toggle, mod/upsert). Excluded from identity for the same
+    # reason as ``preview``.
+    preview_render: Any = field(
         default=None, init=False, repr=False, compare=False,
     )
 

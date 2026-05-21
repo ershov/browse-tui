@@ -37,6 +37,7 @@ _state.to_item = _data.to_item
 _state.notify_wake = _term.notify_wake
 
 _render.Item = _data.Item
+_render.PreviewRender = _data.PreviewRender
 _render.Mode = _state.Mode
 _render.VisibleEntry = _state.VisibleEntry
 _render.PaneCache = _state.PaneCache
@@ -177,9 +178,13 @@ class TestTailFollow(unittest.TestCase):
             _render_preview(b)
             initial_max = b._preview_scroll
             # Now append more content; renderer sees longer wrapped list.
-            b._state._items_by_id['a'].preview += (
+            # Direct mutation bypasses ``append_preview``'s auto-invalidate
+            # of the wrap cache (#422), so drop it by hand.
+            item_a = b._state._items_by_id['a']
+            item_a.preview += (
                 '\n'.join(f'x{i}' for i in range(50)) + '\n'
             )
+            item_a.preview_render = None
             b._needs_redraw.add('preview')
             _render_preview(b)
             self.assertGreater(

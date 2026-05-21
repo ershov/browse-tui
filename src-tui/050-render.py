@@ -1529,6 +1529,18 @@ def render_preview(browser, rect, *, info=False, has_header=True,
     if content_lines <= 0:
         return
 
+    # ``preview_ansi`` is stored on Browser since #244; the attribute is
+    # always present, no defensive default required.
+    ansi_on = browser.preview_ansi
+    query = getattr(browser, '_search_query', '')
+
+    # Resolve the cached Item (when in the per-item branch). When we
+    # land on a real item, ``item.preview_render`` is the wrap cache
+    # candidate; honour it when the geometry and ANSI policy still
+    # match, otherwise regenerate. Search-active renders always
+    # regenerate because ``drop_sgr`` is per-line and depends on the
+    # live query.
+    item = None
     if browser._error_text:
         text = browser._error_text
     elif browser._help_mode:
@@ -1541,45 +1553,72 @@ def render_preview(browser, rect, *, info=False, has_header=True,
             if item is not None and item.preview is not None:
                 text = item.preview
 
-    # ``preview_ansi`` is stored on Browser since #244; the attribute is
-    # always present, no defensive default required.
-    ansi_on = browser.preview_ansi
+    # Wrap-cache fast path (#422) — only for per-item previews
+    # (error/help text is composed each paint anyway), only when no
+    # search query is active, and only when geometry + ANSI policy
+    # match the cache.
+    wrapped = None
+    if item is not None and not query and not browser._error_text \
+            and not browser._help_mode:
+        cached = item.preview_render
+        if (cached is not None
+                and cached.width == width
+                and cached.ansi_on == ansi_on):
+            wrapped = cached.wrapped
 
-    # Strip control chars before they hit the terminal. Covers all three
-    # sources (per-item preview, error text, help) so anything that
-    # reaches this pane is safe — preview data and action errors can
-    # carry attacker-controlled bytes (binary files, raw terminal
-    # captures, command stderr); help is composed in-process but cheap
-    # to filter and recipes may supply ``help_intro`` / ``help_outro``.
-    #
-    # In raw mode (``ansi_on=False``) the sanitiser also maps ESC to
-    # '?' so untrusted content can never inject SGR or other escape
-    # sequences. The walker below sees no ESC bytes in that case and
-    # falls through to plain wrap.
-    text = _sanitize_preview(text, ansi_on=ansi_on)
+    if wrapped is None:
+        # Strip control chars before they hit the terminal. Covers all
+        # three sources (per-item preview, error text, help) so anything
+        # that reaches this pane is safe — preview data and action
+        # errors can carry attacker-controlled bytes (binary files, raw
+        # terminal captures, command stderr); help is composed in-process
+        # but cheap to filter and recipes may supply ``help_intro`` /
+        # ``help_outro``.
+        #
+        # In raw mode (``ansi_on=False``) the sanitiser also maps ESC to
+        # '?' so untrusted content can never inject SGR or other escape
+        # sequences. The walker below sees no ESC bytes in that case and
+        # falls through to plain wrap.
+        text = _sanitize_preview(text, ansi_on=ansi_on)
 
-    # Wrap content to the rect's width.
-    #
-    # The wrap goes through ``_wrap_preview_line`` (#242) which tokenises
-    # SGR sequences and emits self-contained visual rows (active SGR
-    # re-opened at row start, trailing ``\e[m`` iff the row carries any
-    # SGR). Plain rows are byte-identical whether ``ansi_on`` is True or
-    # False — preserves the cache-hit invariant for plain content.
-    query = getattr(browser, '_search_query', '')
-    raw = text.split('\n') if text else []
-    wrapped = []
-    for line in raw:
-        line = line.replace('\t', '    ')
-        # Search-highlight gate: a line that matches the active search
-        # query renders with highlight (yellow/bold) downstream, which
-        # wins over any inline SGR — strip SGR for that line. Match
-        # against the SGR-stripped text so the codes don't interfere.
-        drop_sgr = False
-        if query:
-            stripped = _ANSI_CSI_RE.sub('', line) if '\x1b' in line else line
-            drop_sgr = _search_matches(stripped, query)
-        wrapped.extend(_wrap_preview_line(
-            line, width, ansi_on=ansi_on, drop_sgr=drop_sgr))
+        # Wrap content to the rect's width.
+        #
+        # The wrap goes through ``_wrap_preview_line`` (#242) which
+        # tokenises SGR sequences and emits self-contained visual rows
+        # (active SGR re-opened at row start, trailing ``\e[m`` iff the
+        # row carries any SGR). Plain rows are byte-identical whether
+        # ``ansi_on`` is True or False — preserves the cache-hit
+        # invariant for plain content.
+        raw = text.split('\n') if text else []
+        wrapped = []
+        for line in raw:
+            line = line.replace('\t', '    ')
+            # Search-highlight gate: a line that matches the active
+            # search query renders with highlight (yellow/bold)
+            # downstream, which wins over any inline SGR — strip SGR
+            # for that line. Match against the SGR-stripped text so
+            # the codes don't interfere.
+            drop_sgr = False
+            if query:
+                stripped = (_ANSI_CSI_RE.sub('', line)
+                            if '\x1b' in line else line)
+                drop_sgr = _search_matches(stripped, query)
+            wrapped.extend(_wrap_preview_line(
+                line, width, ansi_on=ansi_on, drop_sgr=drop_sgr))
+
+        # Cache the wrap on the Item when it's a per-item, non-search
+        # render. Other branches (error/help/search) recompute on every
+        # paint and don't share the cache slot.
+        if item is not None and not query and not browser._error_text \
+                and not browser._help_mode:
+            item.preview_render = PreviewRender(
+                wrapped=wrapped,
+                raw_tail_offset=len(item.preview)
+                if item.preview is not None else 0,
+                wrapped_tail_offset=len(wrapped),
+                width=width,
+                ansi_on=ansi_on,
+            )
 
     # Clamp ``_preview_scroll`` so the last content row lands at the
     # bottom of the pane when fully scrolled — conventional viewport

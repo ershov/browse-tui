@@ -17,6 +17,7 @@ _data = load('_browse_tui_data', '030-data.py')
 _state = load('_browse_tui_state', '040-state.py')
 _render = load('_browse_tui_render', '050-render.py')
 _render.Item = _data.Item
+_render.PreviewRender = _data.PreviewRender
 _render.Mode = _state.Mode
 
 _sanitize_preview = _render._sanitize_preview

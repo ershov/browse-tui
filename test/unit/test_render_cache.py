@@ -47,6 +47,7 @@ _state.notify_wake = _term.notify_wake
 # term_size). The concatenated production build gets these by virtue of
 # the modules being a single namespace.
 _render.Item = _data.Item
+_render.PreviewRender = _data.PreviewRender
 _render.Mode = _state.Mode
 _render.VisibleEntry = _state.VisibleEntry
 _render.PaneCache = _state.PaneCache
@@ -478,8 +479,12 @@ class TestRightmostUsesEraseLine(_RenderCacheBase):
         _render.render_full(self.browser)
         self.cap.drain()
 
-        # Now shrink the preview content.
-        self.browser._state._items_by_id['a'].preview = short_text
+        # Now shrink the preview content. Direct preview assignment
+        # bypasses the per-Item invalidation of ``preview_render``
+        # (#422), so drop it explicitly.
+        item_a = self.browser._state._items_by_id['a']
+        item_a.preview = short_text
+        item_a.preview_render = None
         captured['preview'] = short_text
         self.browser._needs_redraw.add('preview')
         _render.render_partial(self.browser)

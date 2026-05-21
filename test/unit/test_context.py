@@ -43,6 +43,7 @@ _context.read_key = _term.read_key
 # layout_panes lives in 050-render.py; load and inject if needed.
 _render = load('_browse_tui_render', '050-render.py')
 _render.Item = _data.Item
+_render.PreviewRender = _data.PreviewRender
 _render.Mode = _state.Mode
 _context.layout_panes = _render.layout_panes
 

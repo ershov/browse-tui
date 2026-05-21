@@ -19,6 +19,7 @@ _state.to_item = _data.to_item
 _state.notify_wake = _term.notify_wake
 # render module needs Item and state helpers
 _render.Item = _data.Item
+_render.PreviewRender = _data.PreviewRender
 _render._char_width = _term._char_width
 _render._visible_len = _term._visible_len
 

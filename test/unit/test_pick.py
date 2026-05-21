@@ -28,6 +28,7 @@ _state.Item = _data.Item
 _state.to_item = _data.to_item
 _state.notify_wake = _term.notify_wake
 _render.Item = _data.Item
+_render.PreviewRender = _data.PreviewRender
 _render.Mode = _state.Mode
 
 _context.visible_items = _state.visible_items

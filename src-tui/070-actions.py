@@ -249,8 +249,14 @@ def _toggle_preview_ansi(ctx):
     comparison in ``end_row`` drives a redraw on those rows; plain
     rows produce identical bytes and stay cache-hit. No explicit
     ``_pane_cache`` surgery is required (#240 design note).
+
+    Wrap cache (#422): toggling ``preview_ansi`` changes the wrapped
+    output bytes (SGR re-emit vs strip). Walk loaded Items and drop
+    every ``preview_render`` so the next paint regenerates with the
+    new policy.
     """
     ctx._browser.preview_ansi = not ctx._browser.preview_ansi
+    ctx._browser._invalidate_all_preview_renders()
     ctx._browser._needs_redraw.add('preview')
 
 

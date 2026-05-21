@@ -41,6 +41,7 @@ _state.notify_wake = _term.notify_wake
 # -h/--help auto-detect short-circuit (#91); inject it for tests.
 _state.compose_help_text = _render.compose_help_text
 _render.Item = _data.Item
+_render.PreviewRender = _data.PreviewRender
 _render.Mode = _state.Mode
 _render.VisibleEntry = _state.VisibleEntry
 _render.default_actions = _actions.default_actions

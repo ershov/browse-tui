@@ -793,6 +793,13 @@ def _apply_upsert(state: State, id_, parent_id, fields, where=None) -> bool:
     # references (visible cache, selection set) keep working.
     for k, v in fields.items():
         setattr(existing, k, v)
+    # Wrap cache (#422): the Item is being mutated. Drop both the raw
+    # preview cache and the wrapped render — the displayed body may
+    # depend on any patched field (title in composed umbrellas, tag in
+    # status-driven summaries, etc.). Recipes that compose previews
+    # from sibling Items lean on this invalidation.
+    existing.preview = None
+    existing.preview_render = None
 
     if parent_id is None:
         # Patch-only: leave parent unchanged. Mutating fields like
@@ -997,6 +1004,11 @@ def _apply_mod(state: State, id_, parent_id, fields, where=None) -> bool:
     fields_no_id = {k: v for k, v in fields.items() if k != 'id'}
     for k, v in fields_no_id.items():
         setattr(existing, k, v)
+    # Wrap cache (#422): the Item is being mutated. Drop both the raw
+    # preview cache and the wrapped render. See ``_apply_upsert`` for
+    # the rationale.
+    existing.preview = None
+    existing.preview_render = None
     structural = True
 
     if parent_id is KEEP_PARENT:
@@ -2752,6 +2764,11 @@ class Browser:
             if item is not None:
                 cur = item.preview if item.preview is not None else ''
                 item.preview = cur + chunk
+                # Wrap cache (#422) — drop the stale render so the next
+                # paint regenerates. In-place extension is a separate
+                # ticket; for now we treat any append as full
+                # invalidation.
+                item.preview_render = None
             self._needs_redraw.add('preview')
         self.post(_apply)
 
@@ -2768,6 +2785,7 @@ class Browser:
             item = self._state._items_by_id.get(id_)
             if item is not None:
                 item.preview = None
+                item.preview_render = None
             self._needs_redraw.add('preview')
         self.post(_apply)
 
@@ -2799,6 +2817,7 @@ class Browser:
             item = self._state._items_by_id.get(id_)
             if item is not None:
                 item.preview = None
+                item.preview_render = None
             self.request_preview(id_)
             self._needs_redraw.add('preview')
         self.post(_apply)
@@ -2842,10 +2861,12 @@ class Browser:
             if id_ is None:
                 for it in self._state._items_by_id.values():
                     it.preview = None
+                    it.preview_render = None
             else:
                 item = self._state._items_by_id.get(id_)
                 if item is not None:
                     item.preview = None
+                    item.preview_render = None
             cur = self._preview_cursor_id
             if cur is not None and (id_ is None or id_ == cur):
                 self.request_preview(cur)
@@ -2901,6 +2922,20 @@ class Browser:
             self._preview_at_tail = True
             self._needs_redraw.add('preview')
         self.post(_apply)
+
+    def _invalidate_all_preview_renders(self) -> None:
+        """Drop ``preview_render`` on every loaded Item.
+
+        Called when the wrap inputs change globally — terminal resize
+        (width changes ⇒ wrap geometry changes) and ``preview_ansi``
+        toggle (SGR re-emit policy changes ⇒ wrapped bytes change).
+        The raw ``preview`` text is untouched; only the wrap cache
+        goes. Cheap walk: empty when no items are loaded, and only
+        live items survive (orphaned previews are impossible since
+        ticket #422 moved the storage onto the Item).
+        """
+        for item in self._state._items_by_id.values():
+            item.preview_render = None
 
     def set_list_ratio(self, ratio: float) -> None:
         """(thread-safe) Set the list pane's share of total terminal rows (clamped).
@@ -3488,6 +3523,9 @@ class Browser:
         item = self._state._items_by_id.get(id_)
         if item is not None:
             item.preview = text
+            # Wrap cache (#422) — drop the stale render so the next
+            # paint regenerates against the new text.
+            item.preview_render = None
         self._needs_redraw.add('preview')
         return True
 
@@ -4461,6 +4499,10 @@ class Browser:
                 if globals().get('g_resize_flag', False):
                     globals()['g_resize_flag'] = False
                     self._needs_redraw.add('all')
+                    # Wrap cache (#422): preview wrap width changed.
+                    # Walk loaded items and drop every ``preview_render``
+                    # so the next paint regenerates at the new width.
+                    self._invalidate_all_preview_renders()
                 # Screen-lost flag — set by SIGCONT / term_resume after the
                 # alt-screen content was destroyed externally. Drop the
                 # per-pane row caches so ``end_row`` doesn't cache-hit
@@ -4487,6 +4529,7 @@ class Browser:
                 if globals().get('g_resize_flag', False):
                     globals()['g_resize_flag'] = False
                     self._needs_redraw.add('all')
+                    self._invalidate_all_preview_renders()
                 if globals().get('g_screen_lost_flag', False):
                     globals()['g_screen_lost_flag'] = False
                     self._pane_cache.clear()

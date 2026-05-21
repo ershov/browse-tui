@@ -34,6 +34,7 @@ _render = load('_browse_tui_render', '050-render.py')
 # (mirrors the state module's pattern). Inject the real class so the
 # default formatter can introspect.
 _render.Item = _data.Item
+_render.PreviewRender = _data.PreviewRender
 _render.Mode = _state.Mode
 # PaneCache is referenced by the four content renderers (#187) — they
 # call ``browser._pane_cache.setdefault(name, PaneCache())``. Inject the
