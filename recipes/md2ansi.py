@@ -7,6 +7,7 @@ See md2ansi_lib.design.md for architecture, naming conventions, and rule tables.
 
 import re
 from dataclasses import dataclass, field
+from typing import Any
 
 
 # ### Section: SGR color constants ##########################################
@@ -43,9 +44,14 @@ class M2A_Context:
 
 @dataclass(slots=True)
 class M2A_DocumentState:
-    line_width: int = 80
+    line_width: int = 150
     footnotes: dict = field(default_factory=dict)
     footnote_order: list = field(default_factory=list)
+    cell_min_width: int = 20
+    row_dividers: Any = None
+    # Table layout keys off this rather than `line_width` so the 150-char
+    # fallback used for HR sizing doesn't accidentally trigger shrinking.
+    table_fit_width: int = 0
 
 
 # ### Section: Shared regex fragments #######################################
@@ -125,10 +131,59 @@ def _m2a_build_context(rules):
 
 _M2A_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
 
+# Markdown-table cell-content matcher. Each char is in exactly one branch — a
+# non-pipe non-backslash non-newline char, OR a backslash followed by any
+# single char (the markdown escape, including `\|`). The same tempered-greedy
+# shape we use for string-literal patterns; linear in input size.
+_M2A_TABLE_CELL_RE = re.compile(
+    r" ( (?: [^|\\\n] | \\. )* ) (?: \| | $ ) ",
+    re.VERBOSE,
+)
+
+
+def _m2a_split_table_row(s):
+    """Split a markdown table row on un-escaped `|`. Honours `\\|`.
+    Strips one optional leading `|` and one optional trailing un-escaped `|`,
+    then walks the rest through the linear cell-content regex.
+    """
+    s = s.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|") and not s.endswith("\\|"):
+        s = s[:-1]
+    cells = []
+    pos = 0
+    end = len(s)
+    while pos <= end:
+        mt = _M2A_TABLE_CELL_RE.match(s, pos)
+        if mt is None or mt.end() == pos:
+            break
+        cells.append(mt.group(1).strip())
+        pos = mt.end()
+    return cells
+
 
 def _m2a_visible_len(s):
     """Length of s with ANSI escapes stripped — used for width calculations."""
     return len(_M2A_ANSI_ESCAPE_RE.sub("", s))
+
+
+def _m2a_align_cell(content, width, align):
+    """Pad `content` to `width` columns according to `align`.
+
+    Width math uses _m2a_visible_len so embedded ANSI escapes don't skew it.
+    Caller is responsible for any surrounding decoration (e.g. the single
+    space of inner padding inside table `│ … │` cells).
+    """
+    pad_n = width - _m2a_visible_len(content)
+    if pad_n <= 0:
+        return content
+    if align == "right":
+        return " " * pad_n + content
+    if align == "center":
+        left = pad_n // 2
+        return " " * left + content + " " * (pad_n - left)
+    return content + " " * pad_n
 
 
 def _m2a_prefix_lines(text, prefix):
@@ -196,19 +251,30 @@ def _m2a_fmt_table(m, name, current_style, context, state):
         s = ln.strip()
         if not s.startswith("|"):
             continue
-        # `| a | b |` → ['', ' a ', ' b ', ''] → strip outer empties.
-        parts = [c.strip() for c in s.strip("|").split("|")]
-        raw_rows.append(parts)
+        raw_rows.append(_m2a_split_table_row(s))
     if len(raw_rows) < 1:
         return m.group(0)
     header = raw_rows[0]
     # Detect separator row (e.g. `| --- | :--: |`); skip if present.
-    # TODO: support table cell alignment: :-- , --: , :--:
     body_start = 1
     if len(raw_rows) >= 2 and all(re.fullmatch(r":?-{2,}:?", c) for c in raw_rows[1]):
         body_start = 2
     body = raw_rows[body_start:]
     n_cols = len(header)
+
+    # Per-column alignment from the separator row (`:--` left, `--:` right,
+    # `:--:` center). Default left when no separator row or no marker.
+    aligns = ["left"] * n_cols
+    if body_start == 2:
+        for i, c in enumerate(raw_rows[1][:n_cols]):
+            left_mark = c.startswith(":")
+            right_mark = c.endswith(":")
+            if left_mark and right_mark:
+                aligns[i] = "center"
+            elif right_mark:
+                aligns[i] = "right"
+            else:
+                aligns[i] = "left"
 
     def pad(row):
         return list(row[:n_cols]) + [""] * max(0, n_cols - len(row))
@@ -226,18 +292,122 @@ def _m2a_fmt_table(m, name, current_style, context, state):
         for i in range(n_cols)
     ]
 
+    # ── Shrink-to-fit layout ─────────────────────────────────────────────
+    # When the caller set a target line width, reduce wide columns so the
+    # total table width fits. Columns whose natural width is already at or
+    # below cell_min_width are pinned and never wrapped. The loop reassigns
+    # widths proportionally; any column that would drop below cell_min_width
+    # is pinned at cell_min_width and the remaining wide columns are
+    # re-scaled. Per spec, if everything is pinned and the table still
+    # overflows, we accept the overflow.
+    target_lw = state.table_fit_width
+    cell_min = state.cell_min_width
+    if target_lw > 0:
+        overhead = 3 * n_cols + 1
+        fixed = {i for i in range(n_cols) if widths[i] <= cell_min}
+        wide = [i for i in range(n_cols) if i not in fixed]
+        for _ in range(n_cols + 1):
+            fit_w = target_lw - overhead - sum(widths[i] for i in fixed)
+            wide_sum = sum(widths[i] for i in wide)
+            if not wide or wide_sum <= fit_w:
+                break
+            factor = fit_w / wide_sum if wide_sum > 0 else 0
+            progressed = False
+            still_wide = []
+            for i in wide:
+                new = int(widths[i] * factor)
+                if new <= cell_min:
+                    widths[i] = cell_min
+                    fixed.add(i)
+                    progressed = True
+                else:
+                    widths[i] = new
+                    still_wide.append(i)
+            wide = still_wide
+            if not progressed:
+                break
+
+    # ── Per-cell wrapping ────────────────────────────────────────────────
+    # Cells are already rendered (`rendered_header`, `rendered_body`). Wrap
+    # the styled text with `_m2a_wrap_ansi_line` so inline rules (`**bold**`,
+    # `` `code` ``, links, images) are matched against the FULL cell text
+    # before any wrapping splits it. Width math runs on visible chars; SGR
+    # escapes are preserved verbatim and re-emitted after each break.
+    # Reset at the end of every wrapped sub-line so a styled span left open
+    # at the break point (e.g. `**bold` ending one sub-line, `bold**` on the
+    # next) can't leak into the cell padding, the `│` separator, or the next
+    # cell on the same visual row. Tables don't inherit a style — they're
+    # always top-level — so plain `\x1b[m` (= `\x1b[0m`) is the right reset.
+    def cell_sublines(rendered, w):
+        return _m2a_wrap_ansi_line(rendered, w, "", "\x1b[m") if rendered else [""]
+
+    header_cells = [cell_sublines(rendered_header[i], widths[i]) for i in range(n_cols)]
+    body_cells = [[cell_sublines(r[i], widths[i]) for i in range(n_cols)] for r in rendered_body]
+
+    # Per-column actual-vs-assigned reconciliation:
+    #   - if a cell wrap left a sub-line wider than the column (long unbreakable
+    #     token), grow the column to that width and re-wrap every cell in the
+    #     column so any other cells get to use the extra room;
+    #   - if every sub-line fits comfortably below the assigned width, shrink
+    #     the column down to what's actually used.
+    for i in range(n_cols):
+        actual = max(
+            (_m2a_visible_len(s) for s in header_cells[i]),
+            default=0,
+        )
+        for row in body_cells:
+            for s in row[i]:
+                actual = max(actual, _m2a_visible_len(s))
+        if actual > widths[i]:
+            widths[i] = actual
+            header_cells[i] = cell_sublines(rendered_header[i], widths[i])
+            for r_idx, r in enumerate(rendered_body):
+                body_cells[r_idx][i] = cell_sublines(r[i], widths[i])
+        elif actual < widths[i]:
+            widths[i] = max(actual, 1)
+
     def render_row(cells):
-        parts = []
-        for i, c in enumerate(cells):
-            pad_n = widths[i] - _m2a_visible_len(c)
-            parts.append(f" {c}{' ' * pad_n} ")
-        return "│" + "│".join(parts) + "│"
+        # cells: list of per-column lists of rendered sub-lines.
+        height = max((len(c) for c in cells), default=1)
+        out = []
+        for k in range(height):
+            parts = []
+            for i, col in enumerate(cells):
+                if k < len(col):
+                    parts.append(f" {_m2a_align_cell(col[k], widths[i], aligns[i])} ")
+                else:
+                    # Top-align: pad shorter cells with blank lines at the bottom.
+                    parts.append(" " + " " * widths[i] + " ")
+            out.append("│" + "│".join(parts) + "│")
+        return out, height
 
     def border(left, mid, right):
         return left + mid.join("─" * (widths[i] + 2) for i in range(n_cols)) + right
 
-    out_lines = [border("┌", "┬", "┐"), render_row(rendered_header), border("├", "┼", "┤")]
-    out_lines.extend(render_row(r) for r in rendered_body)
+    out_lines = [border("┌", "┬", "┐")]
+    header_lines, _ = render_row(header_cells)
+    out_lines.extend(header_lines)
+    out_lines.append(border("├", "┼", "┤"))
+
+    body_blocks = []
+    any_wrapped = False
+    for row in body_cells:
+        row_lines, height = render_row(row)
+        body_blocks.append(row_lines)
+        if height > 1:
+            any_wrapped = True
+
+    if state.row_dividers is True:
+        emit_dividers = True
+    elif state.row_dividers is False:
+        emit_dividers = False
+    else:
+        emit_dividers = any_wrapped
+
+    for idx, rl in enumerate(body_blocks):
+        if idx > 0 and emit_dividers:
+            out_lines.append(border("├", "┼", "┤"))
+        out_lines.extend(rl)
     out_lines.append(border("└", "┴", "┘"))
     return "\n".join(out_lines)
 
@@ -692,6 +862,64 @@ def _m2a_wrap_line(line, line_width, continuation):
     return lines_out
 
 
+def _m2a_wrap_ansi_line(line, line_width, continuation="", reset_sgr=""):
+    """ANSI-aware variant of `_m2a_wrap_line`: wraps at visible-character
+    positions, leaves SGR escape sequences intact, and re-emits the last seen
+    SGR at the start of each new line so any styling active at the break
+    point survives onto the next line.
+
+    `reset_sgr` (e.g. `"\\x1b[0m"`) is appended to every output line so a
+    styled span that's still open at the break point cannot leak into
+    whatever follows on the same visual row — table-cell separators, padding,
+    or the next cell on the same line.
+    """
+    if _m2a_visible_len(line) <= line_width:
+        return [line + reset_sgr]
+    threshold = max(0, line_width - 30)
+    # Tokenize: ANSI escapes first (so they're not eaten by the word class),
+    # then whitespace runs, then word runs. The word class explicitly excludes
+    # \x1b so an ESC sequence following a word starts a new token rather than
+    # being swallowed into it.
+    tokens = re.findall(r"\x1b\[[0-9;]*m|\s+|[^\s\x1b]+", line)
+
+    lines_out = []
+    current = []
+    current_vlen = 0
+    pending = []      # whitespace + escapes accumulated since the last word
+    pending_vlen = 0  # visible width contributed by `pending`
+    last_sgr = ""     # most recent SGR seen — re-emitted after a break
+
+    for tok in tokens:
+        if tok.startswith("\x1b["):
+            last_sgr = tok
+            pending.append(tok)
+            continue
+        if tok[0].isspace():
+            pending.append(tok)
+            pending_vlen += len(tok)
+            continue
+        # `tok` is a word.
+        attempt_vlen = current_vlen + pending_vlen + len(tok)
+        if attempt_vlen <= line_width or current_vlen < threshold or current_vlen == 0:
+            current.extend(pending)
+            current.append(tok)
+            current_vlen = attempt_vlen
+        else:
+            lines_out.append("".join(current) + reset_sgr)
+            current = [continuation]
+            if last_sgr:
+                current.append(last_sgr)
+            current.append(tok)
+            current_vlen = len(continuation) + len(tok)
+        pending = []
+        pending_vlen = 0
+
+    # Flush any trailing escapes (e.g. closing reset).
+    current.extend(pending)
+    lines_out.append("".join(current) + reset_sgr)
+    return lines_out
+
+
 def _m2a_wrap_source(text, line_width):
     """Pre-pass over raw source: wrap long paragraph / list / blockquote
     lines. Skip tables (TODO: cell-aware wrap), code blocks, headings,
@@ -724,19 +952,30 @@ def _m2a_wrap_source(text, line_width):
     return "\n".join(out)
 
 
-def md2ansi(text, current_style="0", line_width=0):
+def md2ansi(text, current_style="0", line_width=0, cell_min_width=20, row_dividers=None):
     """Convert Markdown text to ANSI-colored output.
 
     `line_width` > 0 enables source-level word wrapping for paragraphs, lists,
     and blockquotes. It's also the width used by `_m2a_fmt_hr`. When 0 (the
     default) no wrapping happens and HR falls back to a 150-char bar.
+
+    `cell_min_width` is the minimum width a table column can be shrunk to when
+    fitting the table into `line_width`; columns whose natural width is at or
+    below this are never shrunk or wrapped. `row_dividers` is a tristate:
+    `None` (default) emits inter-row dividers only when any body cell wraps;
+    `True` always emits them; `False` never emits them.
     """
     if line_width > 0:
         text = _m2a_wrap_source(text, line_width)
         state_lw = line_width
     else:
         state_lw = 150
-    state = M2A_DocumentState(line_width=state_lw)
+    state = M2A_DocumentState(
+        line_width=state_lw,
+        cell_min_width=cell_min_width,
+        row_dividers=row_dividers,
+        table_fit_width=line_width,
+    )
     out = _md2ansi(text, current_style, M2A_CONTEXT_MD, state)
     if state.footnote_order:
         out += _m2a_render_footnotes(state, current_style)
