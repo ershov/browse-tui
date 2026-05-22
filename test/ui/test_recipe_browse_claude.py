@@ -182,8 +182,9 @@ class TestBrowseClaude(unittest.TestCase):
         .jsonl made the session a ``scope_root`` entry, which the
         framework skips for preview updates. The fix scopes into the
         parent dir and moves the cursor onto the session row, so its
-        preview (concatenated child bodies, same as any umbrella)
-        renders.
+        preview (now lightweight metadata — sessionId, mtime, etc.)
+        renders. Scoping into the session upgrades it to the full
+        cascade.
         """
         with tempfile.TemporaryDirectory() as tmp:
             _make_fake_claude(tmp)
@@ -199,9 +200,13 @@ class TestBrowseClaude(unittest.TestCase):
             with TmuxFixture(cols=140, rows=30, env=self._launch_env(tmp)) as t:
                 t.launch(_BIN, '--run-py', _RECIPE,
                          '--no-tree', '--pid', str(pid))
-                # The user message we put in the fake jsonl should land
-                # in the concatenated preview (proving we walked the
-                # session's children, not just rendered the breadcrumb).
+                # Session row's lightweight preview surfaces the
+                # sessionId and mtime — proves the preview pane is
+                # populated even though we haven't scoped in.
+                t.wait_for('abcd1234', timeout=3.0)
+                # Scoping in upgrades the preview to the full cascade,
+                # which now includes the message body.
+                t.send('Right')
                 t.wait_for('hello world', timeout=3.0)
                 t.send('q')
 
@@ -781,8 +786,11 @@ class TestBrowseClaude(unittest.TestCase):
                                 'content': 'PROBE_INITIAL_FLAT'},
                 }) + '\n')
             with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
+                # ``--item 0`` makes the recipe scope INTO the session
+                # (rather than landing on a project-list row) — so the
+                # message rows render in the list directly.
                 t.launch(_BIN, '--run-py', _RECIPE,
-                         '--no-tree', '--file', sess)
+                         '--no-tree', '--file', sess, '--item', '0')
                 t.wait_for('PROBE_INITIAL_FLAT', timeout=3.0)
                 with open(sess, 'a') as f:
                     f.write(_json.dumps({

@@ -3231,6 +3231,147 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             self.assertNotIn('inside-subagent', preview)
 
 
+class TestSessionRowVsScopeRootPreview(unittest.TestCase):
+    """When a session row is just a list element (not scope_root, not
+    expanded), the preview is metadata-only. When scope_root or
+    expanded, it's the full umbrella cascade."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _write(self, records):
+        import json as _json
+        import tempfile
+        f = tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False)
+        for r in records:
+            f.write(_json.dumps(r) + '\n')
+        f.close()
+        return f.name
+
+    def test_metadata_preview_reads_one_line(self):
+        path = self._write([
+            {'type': 'user', 'sessionId': 's-uuid', 'cwd': '/w',
+             'gitBranch': 'main', 'slug': 'happy',
+             'message': {'role': 'user', 'content': 'first prompt body'}},
+            {'type': 'assistant', 'sessionId': 's-uuid',
+             'message': {'role': 'assistant',
+                         'content': [{'type': 'text', 'text': 'reply body'}]}},
+        ])
+        try:
+            out = self.r._preview_session_metadata(path)
+            self.assertIn('browse-claude', out)
+            self.assertIn(path, out)
+            self.assertIn('s-uuid', out)
+            self.assertIn('main', out)
+            self.assertIn('happy', out)
+            self.assertIn('mtime', out)
+            # The body of the file must NOT appear — that's the cascade
+            # preview's job, not the cheap metadata path.
+            self.assertNotIn('reply body', out)
+            self.assertNotIn('first prompt body', out)
+        finally:
+            os.unlink(path)
+
+    def test_metadata_preview_no_scan_tree(self):
+        # _preview_session_metadata must NOT populate _TREE_CACHE.
+        path = self._write([
+            {'type': 'user', 'sessionId': 's',
+             'message': {'role': 'user', 'content': 'hi'}},
+        ])
+        try:
+            self.r._TREE_CACHE.clear()
+            self.r._preview_session_metadata(path)
+            self.assertNotIn(path, self.r._TREE_CACHE,
+                             '_scan_tree should not have been called')
+        finally:
+            os.unlink(path)
+
+    def test_get_preview_session_row_goes_through_metadata(self):
+        # No _BROWSER → _session_is_active returns True; force the
+        # context by stashing a fake browser with empty scope/expand.
+        path = self._write([
+            {'type': 'user', 'sessionId': 'sid',
+             'message': {'role': 'user', 'content': 'body'}},
+        ])
+        try:
+            class _S:
+                def __init__(self):
+                    self.scope_stack = []
+                    self.expanded = set()
+            class _B:
+                _state = _S()
+            saved = self.r._BROWSER
+            self.r._BROWSER = _B()
+            self.r._TREE_CACHE.clear()
+            try:
+                out = self.r.get_preview(path)
+            finally:
+                self.r._BROWSER = saved
+            self.assertIn(path, out)
+            self.assertNotIn('body', out)
+        finally:
+            os.unlink(path)
+
+    def test_get_preview_scope_root_goes_through_full_cascade(self):
+        path = self._write([
+            {'type': 'user', 'sessionId': 'sid',
+             'message': {'role': 'user', 'content': 'body-line'}},
+        ])
+        try:
+            class _S:
+                def __init__(self, scope):
+                    self.scope_stack = [scope]
+                    self.expanded = set()
+            class _B:
+                def __init__(self, scope):
+                    self._state = _S(scope)
+                def cached_children(self, _id): return None
+                def update_data(self, _ops): pass
+                def set_preview(self, _id, _text): pass
+                items_by_id = {}
+            saved = self.r._BROWSER
+            self.r._BROWSER = _B(path)
+            self.r._TREE_CACHE.clear()
+            try:
+                out = self.r.get_preview(path)
+            finally:
+                self.r._BROWSER = saved
+            # Scope card + cascaded body content.
+            self.assertIn('browse-claude', out)
+            self.assertIn('body-line', out)
+        finally:
+            os.unlink(path)
+
+    def test_get_preview_expanded_goes_through_full_cascade(self):
+        path = self._write([
+            {'type': 'user', 'sessionId': 'sid',
+             'message': {'role': 'user', 'content': 'body-line'}},
+        ])
+        try:
+            class _S:
+                def __init__(self, expanded):
+                    self.scope_stack = []
+                    self.expanded = expanded
+            class _B:
+                def __init__(self, expanded):
+                    self._state = _S(expanded)
+                def cached_children(self, _id): return None
+                def update_data(self, _ops): pass
+                def set_preview(self, _id, _text): pass
+                items_by_id = {}
+            saved = self.r._BROWSER
+            self.r._BROWSER = _B({path})
+            self.r._TREE_CACHE.clear()
+            try:
+                out = self.r.get_preview(path)
+            finally:
+                self.r._BROWSER = saved
+            self.assertIn('body-line', out)
+        finally:
+            os.unlink(path)
+
+
 class TestScopeCard(unittest.TestCase):
     """Synthetic top row preview is prefixed by a scope card."""
 

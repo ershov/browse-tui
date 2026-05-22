@@ -2148,8 +2148,72 @@ def get_preview(item_id):
     if os.path.isdir(item_id):
         return _preview_project(item_id)
     if os.path.isfile(item_id) and item_id.endswith('.jsonl'):
-        return _preview_umbrella(item_id)
+        # Two contexts share the bare-.jsonl id:
+        #   * row in a project's session list (scrolling — keep it
+        #     cheap; avoid scanning the file).
+        #   * scope_root (synthesised top row when the user scopes
+        #     in) — the user has committed to this session, render
+        #     the full cascade.
+        # Expanded-inline rows count as "committed" too: the user
+        # has actively opened the subtree.
+        if _session_is_active(item_id):
+            return _preview_umbrella(item_id)
+        return _preview_session_metadata(item_id)
     return ''
+
+
+def _session_is_active(path):
+    """True iff the session row should render its heavy preview.
+
+    Heavy = full umbrella cascade + scope card. Cheap = metadata-only
+    card. ``_BROWSER is None`` (tests, headless mode) defaults to
+    heavy so existing behaviour is preserved.
+    """
+    if _BROWSER is None:
+        return True
+    state = _BROWSER._state
+    if state.scope_stack and state.scope_stack[-1] == path:
+        return True
+    return path in state.expanded
+
+
+def _preview_session_metadata(path):
+    """Cheap metadata-only preview for a session row in a parent list.
+
+    Reads only the first line of the file (for the Claude stamps) and
+    one ``os.stat``. Avoids ``_scan_tree`` entirely — scrolling
+    through a project of large transcripts must not block on parsing
+    megabytes of records.
+    """
+    rec = {}
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            line = f.readline()
+        if line.strip():
+            try:
+                parsed = json.loads(line)
+                if isinstance(parsed, dict):
+                    rec = parsed
+            except (TypeError, ValueError):
+                pass
+    except OSError:
+        pass
+    rows = [('path', path)]
+    for key in ('sessionId', 'entrypoint', 'cwd', 'gitBranch', 'slug'):
+        v = rec.get(key)
+        if v:
+            rows.append((key, v))
+    try:
+        st = os.stat(path)
+        rows.append(('mtime', _human_time(st.st_mtime)))
+    except OSError:
+        pass
+    w = max(len(k) for k, _ in rows)
+    body = '\n'.join(
+        f'   {MUTE}{k.ljust(w)}:{RESET} {v}' for k, v in rows
+    )
+    hint = (f'\n\n{MUTE}(expand or scope in to see the transcript){RESET}')
+    return f'{_rule("browse-claude", BLUE)}\n{body}\n{_rule()}{hint}'
 
 
 def _preview_project(path):
@@ -4614,7 +4678,10 @@ def main():
     #
     #   flat, no --item:        scope into the *parent* directory and put
     #                           the cursor on the session row. The session
-    #                           card preview shows everything at a glance.
+    #                           row's preview is lightweight metadata (so
+    #                           scrolling between sessions stays cheap);
+    #                           expanding or scoping into the session
+    #                           upgrades it to the full cascade.
     if target_jsonl:
         if item_arg is not None or _TREE_MODE:
             initial_scope = target_jsonl
