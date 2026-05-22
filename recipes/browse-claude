@@ -3093,9 +3093,18 @@ def _list_tree_roots(jsonl_path):
     ``<system>`` umbrella collapsing a contiguous run of metadata
     records. The first message is no longer also the expandable node —
     that's the umbrella's job.
+
+    Subagent files whose dispatch site lives in this session's main
+    thread render inline under their dispatching assistant turn (via
+    ``td.agent_link`` / ``agent_to_assistant_line``). Orphan subagent
+    files — those with no matching ``Agent`` / ``Task`` ``tool_use.id``
+    in the main thread — would otherwise vanish, so we surface them
+    here at the top, mirroring flat-view placement.
     """
     td = _scan_tree(jsonl_path)
     out = []
+    for orphan in _orphan_subagents_for_session(jsonl_path, td):
+        out.append(orphan)
     for entry in td.roots_in_order:
         if entry['kind'] == 'turn':
             line = entry['line']
@@ -3105,6 +3114,30 @@ def _list_tree_roots(jsonl_path):
             out.append(_span_umbrella_item(
                 jsonl_path, entry['start'], entry['records'],
             ))
+    return out
+
+
+def _orphan_subagents_for_session(jsonl_path, td):
+    """Return subagent items whose dispatch isn't wired to the main thread.
+
+    Diffs the on-disk subagent set against ``td.agent_link`` (built by
+    ``_maybe_link_subagent`` during scan). Unmatched files come back
+    tagged ``orphan · …`` and dimmed so the user can see they aren't
+    wired into the session's turn graph.
+    """
+    subs = _list_subagents_for_session(jsonl_path)
+    if not subs:
+        return []
+    linked = {info.get('agent_id') for info in td.agent_link.values()}
+    out = []
+    for item in subs:
+        if item.agent_id in linked:
+            continue
+        item.tag = (f'{item.agent_type} · {item.line_count} msg · orphan · '
+                    f'{_human_time(item.mtime)}')
+        item.tag_style = 'dim'
+        item.is_orphan = True
+        out.append(item)
     return out
 
 

@@ -3085,6 +3085,125 @@ class TestSubagentRowTag(unittest.TestCase):
             self.assertIn('3h ago', row.tag)
 
 
+class TestOrphanSubagents(unittest.TestCase):
+    """Tree-mode surfaces subagent files whose dispatch isn't wired."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _build_fixture(self, tmp, agents):
+        """Create a session.jsonl + ``subagents/agent-<id>.jsonl`` files.
+
+        ``agents`` is a list of ``(agent_id, agent_type, description,
+        with_dispatch)`` — when ``with_dispatch`` is True, a paired
+        assistant tool_use + user tool_result are emitted in the main
+        thread so ``_maybe_link_subagent`` wires the file.
+        """
+        import json as _json
+        proj = os.path.join(tmp, '-x')
+        os.makedirs(proj)
+        sess_path = os.path.join(proj, 'parent-sid.jsonl')
+        sub_dir = os.path.join(proj, 'parent-sid', 'subagents')
+        os.makedirs(sub_dir)
+        records = []
+        for agent_id, agent_type, desc, with_dispatch in agents:
+            ap = os.path.join(sub_dir, f'agent-{agent_id}.jsonl')
+            with open(ap, 'w') as f:
+                f.write('{}\n')
+            with open(os.path.join(sub_dir, f'agent-{agent_id}.meta.json'),
+                      'w') as fm:
+                _json.dump({'agentType': agent_type,
+                            'description': desc}, fm)
+            if not with_dispatch:
+                continue
+            tu_id = f'toolu_{agent_id}'
+            asst_uuid = f'uuid-asst-{agent_id}'
+            records.append({
+                'type': 'user', 'uuid': f'uuid-user-{agent_id}',
+                'parentUuid': None,
+                'message': {'role': 'user', 'content': 'go'},
+            })
+            records.append({
+                'type': 'assistant', 'uuid': asst_uuid,
+                'parentUuid': f'uuid-user-{agent_id}',
+                'message': {'role': 'assistant', 'content': [{
+                    'type': 'tool_use', 'id': tu_id, 'name': 'Agent',
+                    'input': {'subagent_type': agent_type,
+                              'description': desc, 'prompt': 'p'},
+                }]},
+            })
+            records.append({
+                'type': 'user', 'uuid': f'uuid-tr-{agent_id}',
+                'parentUuid': asst_uuid,
+                'message': {'role': 'user', 'content': [{
+                    'type': 'tool_result', 'tool_use_id': tu_id,
+                    'content': 'ok',
+                }]},
+                'toolUseResult': {
+                    'status': 'completed', 'agentId': agent_id,
+                    'agentType': agent_type, 'content': [],
+                },
+            })
+        with open(sess_path, 'w') as f:
+            for r in records:
+                f.write(_json.dumps(r) + '\n')
+        return sess_path
+
+    def test_orphans_returned_separately(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._build_fixture(tmp, [
+                ('A1', 'general-purpose', 'wired one',   True),
+                ('A2', 'general-purpose', 'wired two',   True),
+                ('A3', 'general-purpose', 'orphan one',  False),
+            ])
+            self.r._TREE_CACHE.clear()
+            td = self.r._scan_tree(sess)
+            orphans = self.r._orphan_subagents_for_session(sess, td)
+            self.assertEqual(len(orphans), 1)
+            self.assertEqual(orphans[0].agent_id, 'A3')
+            self.assertIn('orphan', orphans[0].tag)
+            self.assertEqual(orphans[0].tag_style, 'dim')
+            self.assertTrue(getattr(orphans[0], 'is_orphan', False))
+
+    def test_flat_mode_still_lists_all_subs(self):
+        # _list_session_children (flat-mode path) returns the full
+        # subagent set unchanged — orphan surfacing is tree-mode only.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._build_fixture(tmp, [
+                ('A1', 'general-purpose', 'wired one',   True),
+                ('A2', 'general-purpose', 'wired two',   True),
+                ('A3', 'general-purpose', 'orphan one',  False),
+            ])
+            self.r._TREE_CACHE.clear()
+            children = self.r._list_session_children(sess)
+            sub_rows = [c for c in children
+                        if getattr(c, 'kind', None) == 'subagent']
+            self.assertEqual(len(sub_rows), 3)
+            self.assertEqual(
+                {r.agent_id for r in sub_rows},
+                {'A1', 'A2', 'A3'},
+            )
+
+    def test_tree_roots_includes_orphans_at_top(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._build_fixture(tmp, [
+                ('A1', 'general-purpose', 'wired one',   True),
+                ('A2', 'general-purpose', 'orphan one',  False),
+            ])
+            self.r._TREE_CACHE.clear()
+            roots = self.r._list_tree_roots(sess)
+            # First row is the orphan subagent; A1 (wired) is not at
+            # the top — it renders inline under its dispatching turn.
+            self.assertEqual(getattr(roots[0], 'kind', None), 'subagent')
+            self.assertEqual(roots[0].agent_id, 'A2')
+            kinds = [getattr(r, 'kind', None) for r in roots]
+            self.assertNotIn('subagent', kinds[1:])
+
+
 class TestRowBgForKind(unittest.TestCase):
     """User/assistant message rows get a row-bg highlight."""
 
