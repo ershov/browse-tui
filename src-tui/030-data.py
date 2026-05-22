@@ -32,6 +32,31 @@ PreviewRender = namedtuple(
 )
 
 
+# ``ChildrenGridLayout`` is the per-Browser memoised result of
+# ``_sub_layout`` (050-render.py). The grid layout depends only on
+# ``(children list, width, show_ids)`` — three inputs whose change the
+# Browser can detect — so we cache the computed tuple under those keys
+# and reuse it across ``layout_panes`` (sizing the grid pane) and
+# ``render_children_grid`` (drawing it). Without the cache each paint
+# recomputes ``_fmt_child`` + ``_wrap_entry`` for every child twice
+# (once for sizing, once for rendering).
+#
+# Fields mirror ``_sub_layout``'s return tuple:
+#   * ``num_cols``    — column count for the layout.
+#   * ``col_width``   — width of each column (incl. inter-column gap).
+#   * ``slot_rows``   — list[int]; rows occupied by each entry.
+#   * ``entry_lines`` — list[list[str]]; wrapped lines per entry.
+#
+# Lives on Browser (not on Item) because the cache key includes the
+# Browser-side ``show_ids`` mode. Invalidated eagerly by
+# ``Browser._invalidate_children_grid_cache()`` whenever a children
+# list is mutated in place (see ``_apply_*`` paths in 040-state.py).
+ChildrenGridLayout = namedtuple(
+    'ChildrenGridLayout',
+    ['num_cols', 'col_width', 'slot_rows', 'entry_lines'],
+)
+
+
 @dataclass
 class Item:
     """A single node in the hierarchy.

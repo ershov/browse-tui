@@ -1810,8 +1810,11 @@ def render_children_grid(browser, rect, *, info=False, has_header=True,
             end_row()
         return
 
-    # Cached non-empty children — multi-column flowed layout.
-    num_cols, col_width, slot_rows, entry_lines = _sub_layout(
+    # Cached non-empty children — multi-column flowed layout. Routed
+    # through ``browser.children_grid_layout`` (#414) so the same
+    # ``ChildrenGridLayout`` instance computed by ``_layout_for`` for
+    # sizing is reused here for rendering.
+    num_cols, col_width, slot_rows, entry_lines = browser.children_grid_layout(
         children, width, show_ids=browser.show_ids,
     )
     ranges = _distribute_to_columns(num_cols, slot_rows)
@@ -2336,8 +2339,14 @@ def _layout_for(browser):
         if cursor is not None and cursor.has_children:
             cached = browser._state._children.get(cursor.id)
             if cached:
-                children_rows = _sub_needed_rows(
+                # Route through the memoised layout (#414) so
+                # ``render_children_grid`` reuses the same instance
+                # below instead of recomputing on every paint.
+                layout_ = browser.children_grid_layout(
                     cached, cols, show_ids=browser.show_ids,
+                )
+                children_rows = _sub_total_rows(
+                    layout_.num_cols, layout_.slot_rows,
                 )
                 # Per #180 the vertical (Alt-1) children column width is
                 # CONTENT-INDEPENDENT (fixed at 25% of the right area),
