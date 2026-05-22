@@ -3085,6 +3085,53 @@ class TestSubagentRowTag(unittest.TestCase):
             self.assertIn('3h ago', row.tag)
 
 
+class TestAttributionAgentTag(unittest.TestCase):
+    """Subagent assistant rows surface attributionAgent in the tag."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_row_tag_assistant_with_attribution(self):
+        rec = {'type': 'assistant', 'attributionAgent': 'general-purpose',
+               'message': {'role': 'assistant',
+                           'content': [{'type': 'text', 'text': 'hi'}]}}
+        tag = self.r._row_tag('assistant', rec)
+        self.assertEqual(tag, 'assistant · general-purpose')
+
+    def test_row_tag_user_record_unaffected(self):
+        # attributionAgent on a user row is unusual but shouldn't
+        # cause the tag to mutate.
+        rec = {'type': 'user', 'attributionAgent': 'general-purpose',
+               'message': {'role': 'user', 'content': 'hi'}}
+        tag = self.r._row_tag('user', rec)
+        self.assertEqual(tag, 'user')
+
+    def test_row_tag_missing_attribution(self):
+        rec = {'type': 'assistant',
+               'message': {'role': 'assistant',
+                           'content': [{'type': 'text', 'text': 'hi'}]}}
+        tag = self.r._row_tag('assistant', rec)
+        self.assertEqual(tag, 'assistant')
+
+    def test_list_messages_row_carries_attribution_tag(self):
+        import json as _json
+        import tempfile
+        f = tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False)
+        f.write(_json.dumps({
+            'type': 'assistant', 'attributionAgent': 'general-purpose',
+            'message': {'role': 'assistant',
+                        'content': [{'type': 'text', 'text': 'hi'}]},
+        }) + '\n')
+        f.close()
+        try:
+            self.r._TREE_CACHE.clear()
+            items = self.r._list_messages(f.name)
+            self.assertIn('general-purpose', items[0].tag)
+        finally:
+            os.unlink(f.name)
+
+
 class TestSubagentUmbrellaVoice(unittest.TestCase):
     """Subagent umbrellas are marked as voice rows (assistant stripe)
     and their content is NOT inlined into the parent's preview."""

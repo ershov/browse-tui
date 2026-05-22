@@ -748,7 +748,7 @@ def _list_messages(jsonl_path, limit=None):
         item = Item(
             id=item_id,
             title=_oneline(_summarise_message(obj)),
-            tag=kind,
+            tag=_row_tag(kind, obj),
             tag_style=_TAG_STYLE_FOR_KIND.get(kind, ''),
             has_children=False,
             hidden=not _passes_filter(item_id, td),
@@ -953,6 +953,20 @@ def _kind_of(obj):
     if isinstance(msg, dict) and msg.get('role'):
         return msg['role']
     return 'message'
+
+
+def _row_tag(kind, rec):
+    """Row tag for ``rec``.
+
+    Adds ``· <attributionAgent>`` to assistant rows inside subagent
+    transcripts so the user can see which sub-type produced the turn
+    (e.g. ``assistant · general-purpose``). Other record kinds get the
+    bare kind label.
+    """
+    attr = rec.get('attributionAgent') if isinstance(rec, dict) else None
+    if attr and kind == 'assistant':
+        return f'{kind} · {attr}'
+    return kind
 
 
 def _summarise_message(obj):
@@ -3286,7 +3300,7 @@ def _tree_item(jsonl_path, rec, td):
     item = Item(
         id=item_id,
         title=_oneline(_summarise_message(rec)),
-        tag=kind,
+        tag=_row_tag(kind, rec),
         tag_style=_TAG_STYLE_FOR_KIND.get(kind, ''),
         has_children=False,
         hidden=not _passes_filter(item_id, td),
