@@ -3190,6 +3190,17 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0].row_bg, 17)  # assistant stripe
 
+    def test_inline_subagent_pseudo_item_has_voice_bg(self):
+        # Tree-mode placement uses _subagent_pseudo_item, not the
+        # session-level lister. It must carry the same stripe.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._build(tmp)
+            sub_dir = self.r._subagents_dir(sess)
+            agent_path = os.path.join(sub_dir, 'agent-A1.jsonl')
+            item = self.r._subagent_pseudo_item(sess, 'A1', agent_path)
+            self.assertEqual(item.row_bg, 17)
+
     def test_orphan_subagent_row_keeps_voice_bg(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:

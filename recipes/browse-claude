@@ -3477,6 +3477,11 @@ def _subagent_pseudo_item(parent_jsonl, agent_id, agent_path):
     item.subagent_path = agent_path
     item.line_count = count
     item.mtime = mtime
+    # Voice stripe: same colour as top-of-list and orphan subagent rows
+    # so the inline tree-mode placement reads as voice too.
+    bg = _ROW_BG_FOR_KIND.get('subagent')
+    if bg is not None:
+        item.row_bg = bg
     return item
 
 
