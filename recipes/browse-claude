@@ -1749,40 +1749,40 @@ def _render_attachment(obj):
 
 
 def _fmt_attach_file(a):
+    """Filename only — the body lives on disk and can be large.
+    Reachable via $EDITOR, not the preview pane."""
     out = [f'{CYAN}{a.get("displayPath", a.get("filename", ""))}{RESET}']
     if a.get('filename') and a.get('filename') != a.get('displayPath'):
         out.append(f'{MUTE}{a["filename"]}{RESET}')
-    text = _extract_attach_file_text(a.get('content', ''))
-    if text:
-        out.append('')
-        out.append(text.rstrip())
     return '\n'.join(out)
 
 
-def _extract_attach_file_text(content):
-    """Pull the text payload out of an attachment's ``content`` field.
+def _fmt_attach_compact_file_reference(a):
+    """Path-only — compaction's file ref points at a file on disk."""
+    out = [f'{CYAN}{a.get("displayPath", a.get("filename", ""))}{RESET}']
+    if a.get('filename') and a.get('filename') != a.get('displayPath'):
+        out.append(f'{MUTE}{a["filename"]}{RESET}')
+    return '\n'.join(out)
 
-    Older transcripts store the file body as a bare string. Newer ones
-    wrap it as ``{"type": "text", "file": {"filePath": "...",
-    "content": "..."}}`` (the format the SDK emits for editable file
-    attachments) — recurse into the nested ``file.content``. Anything
-    we can't make sense of falls back to the JSON-dump of the value so
-    the user still sees something rather than crashing the renderer.
-    """
-    if isinstance(content, str):
-        return content
-    if isinstance(content, dict):
-        inner = content.get('file')
-        if isinstance(inner, dict):
-            file_content = inner.get('content', '')
-            if isinstance(file_content, str):
-                return file_content
-            return json.dumps(file_content, indent=2)
-        # ``content`` is some other dict shape we don't recognise.
-        return json.dumps(content, indent=2)
-    if content in (None, ''):
-        return ''
-    return json.dumps(content, indent=2)
+
+def _fmt_attach_edited_text_file(a):
+    fname = a.get('filename', '?')
+    head = f'{CYAN}✎ edited{RESET}  {fname}'
+    snip = a.get('snippet')
+    if snip:
+        return head + '\n\n' + snip.rstrip()
+    return head
+
+
+def _fmt_attach_plan_mode_exit(a):
+    exists = a.get('planExists')
+    arrow = f'{RED}→{RESET}'
+    out = [f'{YELLOW}⇆ mode{RESET}  {arrow} exit plan mode']
+    path = a.get('planFilePath')
+    if path:
+        kept = 'kept' if exists else 'discarded'
+        out.append(f'{MUTE}plan {kept}:{RESET} {path}')
+    return '\n'.join(out)
 
 
 def _fmt_attach_diagnostics(a):
@@ -1882,6 +1882,9 @@ def _fmt_attach_default(a):
 
 _ATTACH_FORMATTERS = {
     'file':                   _fmt_attach_file,
+    'compact_file_reference': _fmt_attach_compact_file_reference,
+    'edited_text_file':       _fmt_attach_edited_text_file,
+    'plan_mode_exit':         _fmt_attach_plan_mode_exit,
     'diagnostics':            _fmt_attach_diagnostics,
     'command_permissions':    _fmt_attach_command_permissions,
     'queued_command':         _fmt_attach_queued_command,

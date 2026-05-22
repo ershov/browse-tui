@@ -440,39 +440,57 @@ class TestAttachmentRenderers(unittest.TestCase):
         return {'type': 'attachment',
                 'attachment': dict(type=sub, **fields)}
 
-    def test_file(self):
+    def test_file_path_only(self):
+        # File attachments render path-only — the body lives on disk
+        # and can be megabytes; we surface the path and let the user
+        # open it in $EDITOR if they want the content.
         out = self.r._render_attachment(self._attach(
             'file', displayPath='./foo.py', filename='/tmp/foo.py',
             content='print("hi")\n',
         ))
         self.assertIn('📎 attachment', out)
         self.assertIn('./foo.py', out)
-        self.assertIn('print("hi")', out)
+        self.assertIn('/tmp/foo.py', out)
+        self.assertNotIn('print("hi")', out)
 
-    def test_file_dict_content_unwraps_nested_file(self):
-        # Newer transcripts wrap the file body in
-        # ``{"type": "text", "file": {"filePath": ..., "content": ...}}``.
-        # The renderer must reach into ``file.content`` instead of
-        # calling ``.rstrip()`` on the dict.
+    def test_compact_file_reference(self):
         out = self.r._render_attachment(self._attach(
-            'file', displayPath='./foo.py', filename='/tmp/foo.py',
-            content={'type': 'text', 'file': {
-                'filePath': '/tmp/foo.py', 'content': 'print("inner")\n',
-            }},
+            'compact_file_reference',
+            displayPath='src-tui/040-state.py',
+            filename='/abs/src-tui/040-state.py',
         ))
-        self.assertIn('./foo.py', out)
-        self.assertIn('print("inner")', out)
+        self.assertIn('compact', out.lower())  # head says "attachment compact_file_reference"
+        self.assertIn('src-tui/040-state.py', out)
+        self.assertIn('/abs/src-tui/040-state.py', out)
 
-    def test_file_unknown_dict_falls_back_to_json(self):
-        # If we can't make sense of the dict, dump it as JSON rather
-        # than crashing — better to surface the raw payload than
-        # blanking the preview.
+    def test_edited_text_file(self):
         out = self.r._render_attachment(self._attach(
-            'file', displayPath='./foo.py',
-            content={'unknown': 'shape', 'k': 1},
+            'edited_text_file',
+            filename='/tmp/foo.log',
+            snippet='1\tline-one\n2\tline-two\n',
         ))
-        self.assertIn('"unknown"', out)
-        self.assertIn('"shape"', out)
+        self.assertIn('edited', out)
+        self.assertIn('/tmp/foo.log', out)
+        self.assertIn('line-one', out)
+
+    def test_plan_mode_exit_kept(self):
+        out = self.r._render_attachment(self._attach(
+            'plan_mode_exit',
+            planExists=True,
+            planFilePath='/p/plan.md',
+        ))
+        self.assertIn('mode', out)
+        self.assertIn('exit plan', out)
+        self.assertIn('kept', out)
+        self.assertIn('/p/plan.md', out)
+
+    def test_plan_mode_exit_discarded(self):
+        out = self.r._render_attachment(self._attach(
+            'plan_mode_exit',
+            planExists=False,
+            planFilePath='/p/plan.md',
+        ))
+        self.assertIn('discarded', out)
 
     def test_diagnostics(self):
         out = self.r._render_attachment(self._attach(
