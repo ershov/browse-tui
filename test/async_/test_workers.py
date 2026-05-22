@@ -224,6 +224,127 @@ class TestPreviewWorker(unittest.TestCase):
             b.stop_workers()
 
 
+# --- #431: single-flight worker invariant -------------------------------
+#
+# The preview worker must process at most one ``get_preview`` fetch at a
+# time. ``request_preview`` overwrites the single-slot ``_preview_req``;
+# the worker reads the slot, fetches, and discards the result if the
+# slot has been clobbered. After #431 (recipe-facing ``set_preview``
+# moved to the post queue) this invariant must still hold — recipes do
+# not contend with the worker on its own lane.
+
+
+class TestPreviewWorkerSingleFlight(unittest.TestCase):
+    """At-most-one in-flight ``get_preview`` regardless of request burst."""
+
+    def test_rapid_requests_keep_max_concurrency_at_one(self):
+        # 20 rapid ``request_preview`` calls with different ids. The
+        # worker runs each fetch end-to-end before pulling the next id
+        # off the single-slot request, so concurrency never exceeds 1.
+        # Most fetches are superseded before the worker reaches them
+        # (the slot is overwritten on every call), so the total number
+        # of ``get_preview`` invocations is much less than 20.
+        lock = threading.Lock()
+        state = {'in_flight': 0, 'max_in_flight': 0, 'total_calls': 0}
+
+        def get_preview(id_):
+            with lock:
+                state['in_flight'] += 1
+                state['total_calls'] += 1
+                if state['in_flight'] > state['max_in_flight']:
+                    state['max_in_flight'] = state['in_flight']
+            # Brief sleep so concurrent calls (if any) would overlap.
+            time.sleep(0.01)
+            with lock:
+                state['in_flight'] -= 1
+            return f'preview of {id_}'
+
+        b = make_browser(get_preview=get_preview)
+        try:
+            ids = [f'id-{n}' for n in range(20)]
+            for id_ in ids:
+                b._state._items_by_id[id_] = Item(id=id_)
+            for id_ in ids:
+                b.request_preview(id_)
+            b.run_until_idle()
+            # Hard invariant: never more than one fetch in flight.
+            self.assertEqual(
+                state['max_in_flight'], 1,
+                'single-flight invariant violated: observed '
+                f'{state["max_in_flight"]} concurrent get_preview calls',
+            )
+            # Soft invariant: most requests should be superseded before
+            # the worker reaches them. We assert << 20 (not == 1)
+            # because the first call may run to completion before the
+            # rest are queued, and timing is jittery. In practice this
+            # is ~1-3 calls on a fast machine.
+            self.assertLess(
+                state['total_calls'], 20,
+                'expected most requests to be superseded; got '
+                f'{state["total_calls"]} actual fetches',
+            )
+            # The last id is the authoritative request — its preview
+            # must be in the cache.
+            self.assertEqual(get_preview_text(b, ids[-1]),
+                             f'preview of {ids[-1]}')
+        finally:
+            b.stop_workers()
+
+
+class TestSetPreviewWorkerRaceSemantics(unittest.TestCase):
+    """#431 worker-vs-recipe race: documented, deliberate, unchanged.
+
+    Within a single ``run_until_idle`` iteration:
+      1. ``drain_main_queue`` runs first → recipe ``set_preview`` lands.
+      2. ``apply_preview_result`` runs second → worker delivery overwrites.
+
+    So if both write for the same id around the same time, the worker
+    wins. Recipes that want a guaranteed write should construct the
+    Browser with ``get_preview=None`` (no worker to race).
+    """
+
+    def test_worker_overwrites_recipe_set_preview_for_same_id(self):
+        gate = threading.Event()
+
+        def get_preview(id_):
+            # Block until the test releases the gate so we can race
+            # the worker's delivery against a recipe ``set_preview``.
+            gate.wait(timeout=2.0)
+            return 'from-worker'
+
+        b = make_browser(get_preview=get_preview)
+        try:
+            b._state._items_by_id['a'] = Item(id='a')
+            # Kick the worker; it blocks inside get_preview.
+            b.request_preview('a')
+            # Wait briefly to let the worker thread pick up the request.
+            time.sleep(0.02)
+            # Recipe writes via set_preview — queued on the post queue.
+            b.set_preview('a', 'from-recipe')
+            # Release the worker; now both writes are in flight.
+            gate.set()
+            b.run_until_idle()
+            # apply_preview_result runs after drain_main_queue per the
+            # documented ordering — the worker wins.
+            self.assertEqual(get_preview_text(b, 'a'), 'from-worker')
+        finally:
+            gate.set()  # in case of test failure, unblock the worker
+            b.stop_workers()
+
+    def test_recipe_set_preview_with_no_worker_lands(self):
+        # The documented escape hatch: construct with get_preview=None
+        # so there is no worker to race. Recipes that need a guaranteed
+        # write should use this pattern.
+        b = make_browser(get_preview=None)
+        try:
+            b._state._items_by_id['a'] = Item(id='a')
+            b.set_preview('a', 'from-recipe')
+            b.run_until_idle()
+            self.assertEqual(get_preview_text(b, 'a'), 'from-recipe')
+        finally:
+            b.stop_workers()
+
+
 class TestHeadlessAndIdle(unittest.TestCase):
     """Headless flag is observable; idle Browser is idle immediately."""
 

@@ -4029,6 +4029,23 @@ class _FakeBrowser:
     def post(self, fn):
         self.posted.append(fn)
 
+    def set_preview(self, id_, text):
+        """Mirror the framework's #431 behavior: queue a main-thread
+        write that lands ``item.preview = text`` on the next flush.
+        Like the real ``Browser.set_preview``, this no-ops silently
+        when ``id_`` is not in ``items_by_id`` at apply time.
+        """
+        if text is None:
+            text = ''
+
+        def _apply(id_=id_, text=text):
+            item = self.items_by_id.get(id_)
+            if item is None:
+                return
+            item.preview = text
+            item.preview_render = None
+        self.posted.append(_apply)
+
     def flush(self):
         """Drain queued main-thread work, FIFO."""
         while self.posted:

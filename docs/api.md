@@ -772,13 +772,15 @@ browser.invalidate_preview(id)             # drop cache + re-fetch
 browser.preview_to_tail()                  # pin preview scroll to bottom
 ```
 
-`update_data`, `append_preview`, and `clear_preview` schedule a callable on
-the post queue that mutates state on the main thread; their writes become
-visible (and trigger a paint) on the next drain — no keystroke required.
-`set_preview` routes through the single-slot preview-result lane instead of
-the post queue. Both land on the main thread, but recipes mixing
-`set_preview` with `append_preview`/`clear_preview` for the same id should
-pick one path — see `browser.append_preview` for the ordering caveat.
+`update_data`, `set_preview`, `append_preview`, and `clear_preview` all
+schedule a callable on the post queue that mutates state on the main
+thread; their writes become visible (and trigger a paint) on the next
+drain — no keystroke required. Since #431 `set_preview` shares this FIFO
+lane: multiple writes accumulate (every call lands), and ordering with
+`append_preview` / `clear_preview` is the simple FIFO of the post queue.
+The framework's preview worker still delivers its own `get_preview`
+results via a separate single-slot lane (`_preview_result`); see
+`browser.set_preview` for worker-vs-recipe race semantics.
 
 #### `browser.update_data(ops) -> None`
 

@@ -3451,18 +3451,12 @@ def _preview_umbrella(item_id):
         (and a user's first expand) reuse those entries without
         re-running ``get_children``.
       * Each leaf record's rendered body is cached on its Item via a
-        single main-thread ``post`` that writes ``item.preview = text``
-        for every leaf the descent rendered. The umbrella's own
-        composed preview is cached by the framework via the standard
-        worker return path (no recipe-side ``set_preview`` needed
-        for the top-level id).
-
-    We deliberately avoid ``set_preview`` for the per-leaf cache:
-    that API is single-slot (latest-wins) and would lose all but the
-    last write in a multi-leaf composition. The direct ``post`` writes
-    are race-free because they land on the main thread, and they don't
-    interfere with the worker's own single-slot result delivery for
-    the umbrella id.
+        per-leaf ``_BROWSER.set_preview(cid, text)`` call. Since #431
+        ``set_preview`` routes through the post queue (FIFO), so
+        every write lands — the umbrella's own composed preview is
+        still cached by the framework via the standard worker return
+        path (no recipe-side ``set_preview`` needed for the top-level
+        id).
     """
     parts = []
     ops = []
@@ -3476,28 +3470,9 @@ def _preview_umbrella(item_id):
         # ``_items_by_id`` by the time their preview write runs.
         if ops:
             _BROWSER.update_data(ops)
-        if leaf_previews:
-            _BROWSER.post(lambda b=_BROWSER, lp=leaf_previews:
-                          _apply_leaf_previews(b, lp))
+        for cid, text in leaf_previews.items():
+            _BROWSER.set_preview(cid, text)
     return '\n\n'.join(parts)
-
-
-def _apply_leaf_previews(b, leaf_previews):
-    """Main-thread: write rendered text onto each leaf Item's preview.
-
-    Mirrors what ``apply_preview_result`` does, but for many ids at
-    once. Skips ids that aren't in the index (e.g. a leaf whose
-    upsert op was dropped between scheduling and now). Drops the
-    wrap-render cache so the next paint regenerates against fresh
-    text.
-    """
-    items = b.items_by_id
-    for cid, text in leaf_previews.items():
-        item = items.get(cid)
-        if item is None:
-            continue
-        item.preview = text
-        item.preview_render = None
 
 
 def _collect_umbrella_preview(item_id, parts, ops, leaf_previews):
@@ -3510,8 +3485,9 @@ def _collect_umbrella_preview(item_id, parts, ops, leaf_previews):
     subtree (the framework already has them).
 
     ``leaf_previews`` is an ``{id: rendered_text}`` accumulator for
-    per-leaf preview-cache writes. The top-level caller posts one
-    main-thread callback that writes every entry to its Item.
+    per-leaf preview-cache writes. The top-level caller iterates the
+    dict and calls ``set_preview`` per leaf — each call queues its
+    own main-thread closure via the post queue (FIFO).
     """
     # Read-path: prefer the framework's cached children if available.
     # ``cached_children`` returns None when the parent hasn't been
@@ -3602,11 +3578,10 @@ def _collect_umbrella_preview(item_id, parts, ops, leaf_previews):
                 parts.append(rendered)
                 # Cache the leaf render so the next recomposition
                 # (tail tick, sibling umbrella's recursion, collapse
-                # + re-expand, …) is a cheap dict lookup. The actual
-                # write happens on the main thread via the top-level
-                # ``post`` callback in ``_preview_umbrella`` — using a
-                # batched ``post`` instead of ``set_preview`` because
-                # ``set_preview`` is single-slot (latest-wins).
+                # + re-expand, …) is a cheap dict lookup. Accumulated
+                # here and flushed by the top-level caller via per-leaf
+                # ``set_preview`` calls (queued onto the main thread via
+                # the framework's FIFO post queue, since #431).
                 if _BROWSER is not None:
                     leaf_previews[cid] = rendered
         except Exception as e:

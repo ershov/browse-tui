@@ -291,14 +291,14 @@ class TestSetPreviewPassThrough(unittest.TestCase):
             b.stop_workers()
 
     def test_text_lands_in_cache_after_apply(self):
-        # set_preview routes through the worker single-slot
-        # (_preview_result), drained by apply_preview_result.
+        # #431: set_preview routes through the FIFO post queue, drained
+        # by drain_main_queue. No more single-slot _preview_result write.
         b = _make_browser()
         try:
             items = _seed_items(b, 'a')
             ctx = Context(b)
             ctx.set_preview('a', 'hello')
-            self.assertTrue(b.apply_preview_result())
+            b.drain_main_queue()
             self.assertEqual(items['a'].preview, 'hello')
         finally:
             b.stop_workers()

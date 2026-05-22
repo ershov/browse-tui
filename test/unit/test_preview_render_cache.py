@@ -110,8 +110,8 @@ class TestSetPreviewClearsRender(unittest.TestCase):
         item = _seed(b, 'a', 'old')
         _attach_render_cache(item)
         b.set_preview('a', 'new')
-        # set_preview routes through _preview_result + apply_preview_result.
-        self.assertTrue(b.apply_preview_result())
+        # #431: set_preview now routes through the FIFO post queue.
+        b.drain_main_queue()
         self.assertEqual(item.preview, 'new')
         self.assertIsNone(item.preview_render)
 
@@ -405,7 +405,7 @@ class TestPreviewRoundTrip(unittest.TestCase):
         b = Browser(BrowserConfig(_headless=True))
         item = _seed(b, 'a')
         b.set_preview('a', 'hello')
-        b.apply_preview_result()
+        b.drain_main_queue()
         self.assertEqual(item.preview, 'hello')
         self.assertEqual(b.get_cached_preview('a'), 'hello')
 
@@ -681,9 +681,10 @@ class TestPreviewAPIRegistrationPrerequisite(unittest.TestCase):
         # No Item registered for 'ghost'.
         self.assertNotIn('ghost', b._state._items_by_id)
         b.set_preview('ghost', 'should-be-dropped')
-        # apply_preview_result returns True (the slot was non-empty),
-        # but no Item is synthesised and no text is cached.
-        b.apply_preview_result()
+        # #431: set_preview's closure looks up _items_by_id and returns
+        # early if the id is unknown — no Item is synthesised and no
+        # text is cached.
+        b.drain_main_queue()
         self.assertNotIn('ghost', b._state._items_by_id)
         self.assertIsNone(b.get_cached_preview('ghost'))
 
@@ -691,7 +692,7 @@ class TestPreviewAPIRegistrationPrerequisite(unittest.TestCase):
         b = Browser(BrowserConfig(_headless=True))
         item = _seed(b, 'a')  # registered, preview=None initially
         b.set_preview('a', 'hello')
-        b.apply_preview_result()
+        b.drain_main_queue()
         self.assertEqual(item.preview, 'hello')
         self.assertEqual(b.get_cached_preview('a'), 'hello')
 
@@ -756,7 +757,7 @@ class TestIdempotentEnsureUpsertPattern(unittest.TestCase):
 
         # set_preview now lands.
         b.set_preview('unknown', 'text-for-unknown')
-        b.apply_preview_result()
+        b.drain_main_queue()
         self.assertEqual(item.preview, 'text-for-unknown')
         self.assertEqual(b.get_cached_preview('unknown'),
                          'text-for-unknown')
@@ -777,6 +778,99 @@ class TestIdempotentEnsureUpsertPattern(unittest.TestCase):
         b.drain_main_queue()
         self.assertEqual(item.title, 'Original')
         self.assertEqual(item.tag, 'v1')
+
+
+# --- #431: set_preview routes through the FIFO post queue ----------------
+#
+# Pre-#431: ``set_preview`` wrote to the single-slot ``_preview_result``,
+# so two recipe writes in quick succession lost the first (latest-wins).
+# Post-#431: ``set_preview`` posts a main-thread closure per call, so
+# every write lands. The framework worker continues to deliver its own
+# ``get_preview`` results through ``_preview_result`` untouched.
+
+
+class TestSetPreviewPostQueueSemantics(unittest.TestCase):
+    """``set_preview`` lands every write via the FIFO post queue (#431)."""
+
+    def test_multiple_set_preview_calls_all_land(self):
+        # The motivating case for #431: three writes to three different
+        # ids, all of which must land. Pre-#431 only the last would survive.
+        b = Browser(BrowserConfig(_headless=True))
+        items = {id_: _seed(b, id_) for id_ in ('A', 'B', 'C')}
+        b.set_preview('A', 'a-text')
+        b.set_preview('B', 'b-text')
+        b.set_preview('C', 'c-text')
+        b.run_until_idle()
+        self.assertEqual(items['A'].preview, 'a-text')
+        self.assertEqual(items['B'].preview, 'b-text')
+        self.assertEqual(items['C'].preview, 'c-text')
+
+    def test_set_preview_does_not_touch_worker_slot(self):
+        # The framework's single-slot ``_preview_result`` is reserved
+        # for the worker's deliveries. ``set_preview`` writes must not
+        # appear there (otherwise we'd race the worker on its own lane).
+        b = Browser(BrowserConfig(_headless=True))
+        _seed(b, 'A')
+        b.set_preview('A', 'a-text')
+        # The closure is in the post queue but not yet drained: the
+        # worker slot must still be empty.
+        self.assertIsNone(b._preview_result)
+        b.drain_main_queue()
+        # Even after draining the post queue, the worker slot is still
+        # empty (the closure writes directly to ``item.preview``, not
+        # to ``_preview_result``).
+        self.assertIsNone(b._preview_result)
+
+    def test_update_data_then_set_preview_fifo_orders_writes(self):
+        # ``update_data`` posts the apply step on the main thread; a
+        # subsequent ``set_preview`` lands in the queue after it. FIFO
+        # drain guarantees the upsert lands before the preview write,
+        # so the new Item is in ``_items_by_id`` when ``set_preview``'s
+        # closure runs.
+        b = Browser(BrowserConfig(_headless=True))
+        b._state._children[None] = []
+        self.assertNotIn('new', b._state._items_by_id)
+        b.update_data([_state.upsert('new', None)])
+        b.set_preview('new', 'preview-for-new')
+        b.run_until_idle()
+        item = b._state._items_by_id.get('new')
+        self.assertIsNotNone(item)
+        self.assertEqual(item.preview, 'preview-for-new')
+
+    def test_set_preview_then_clear_preview_fifo_orders_writes(self):
+        # FIFO across the mutating preview APIs: a clear posted after a
+        # set must observe the set on the way through.
+        b = Browser(BrowserConfig(_headless=True))
+        item = _seed(b, 'a')
+        b.set_preview('a', 'hello')
+        b.clear_preview('a')
+        b.drain_main_queue()
+        # The clear wins because it was posted last.
+        self.assertIsNone(item.preview)
+
+    def test_clear_preview_then_set_preview_fifo_orders_writes(self):
+        # Reverse order: clear first, then set — the set wins.
+        b = Browser(BrowserConfig(_headless=True))
+        item = _seed(b, 'a', 'old')
+        b.clear_preview('a')
+        b.set_preview('a', 'new')
+        b.drain_main_queue()
+        self.assertEqual(item.preview, 'new')
+
+    def test_set_preview_id_late_binding_in_loop_is_safe(self):
+        # Construct ``set_preview`` calls in a comprehension/loop with
+        # different ids. The closure inside ``set_preview`` captures
+        # ``id_`` as a parameter (function arg), not a free variable,
+        # so this is safe — but pin the contract here so a future
+        # refactor can't accidentally regress.
+        b = Browser(BrowserConfig(_headless=True))
+        items = {id_: _seed(b, id_) for id_ in ('x', 'y', 'z')}
+        ids_and_text = [('x', 'X-text'), ('y', 'Y-text'), ('z', 'Z-text')]
+        for id_, text in ids_and_text:
+            b.set_preview(id_, text)
+        b.drain_main_queue()
+        for id_, text in ids_and_text:
+            self.assertEqual(items[id_].preview, text)
 
 
 if __name__ == '__main__':

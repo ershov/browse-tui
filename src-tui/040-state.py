@@ -2867,12 +2867,22 @@ class Browser:
         self.post(_apply)
 
     def set_preview(self, id_, text) -> None:
-        """(thread-safe) Inject pre-fetched preview text for ``id_`` from any thread.
+        """(thread-safe) Cache preview text for ``id_``.
 
-        Latest-wins: a later ``set_preview`` overwrites an unconsumed
-        earlier one. Recipes using this should construct the Browser
-        with ``get_preview=None`` so the built-in worker doesn't race.
-        ``text`` is coerced to ``''`` if None.
+        Posts a main-thread closure that writes ``item.preview = text``
+        and drops the wrap cache. Multiple calls accumulate via the
+        post queue — every write lands (FIFO), so a recipe that calls
+        ``set_preview`` once per leaf in a composition no longer loses
+        all but the last write. ``text`` is coerced to ``''`` if None.
+
+        Worker-race note: the framework's preview worker continues to
+        deliver its own ``get_preview`` results via the single-slot
+        ``_preview_result`` lane (consumed by ``apply_preview_result``).
+        Within one main-loop iteration the post queue drains *before*
+        ``apply_preview_result`` runs, so a worker fetch that lands at
+        the same time will overwrite a recipe ``set_preview`` for the
+        same id. Recipes that want a guaranteed write should construct
+        the Browser with ``get_preview=None`` (no worker to race).
 
         **Registration prerequisite.** This is a no-op when ``id_`` is
         not present in ``_items_by_id``. Preview storage lives on the
@@ -2895,8 +2905,15 @@ class Browser:
         """
         if text is None:
             text = ''
-        self._preview_result = (id_, text)
-        notify_wake()
+        def _apply():
+            item = self._state._items_by_id.get(id_)
+            if item is not None:
+                item.preview = text
+                # Wrap cache (#422) — drop the stale render so the next
+                # paint regenerates against the new text.
+                item.preview_render = None
+            self._needs_redraw.add('preview')
+        self.post(_apply)
 
     def append_preview(self, id_, chunk) -> None:
         """(thread-safe) Append ``chunk`` to the cached preview for ``id_``.
@@ -2917,16 +2934,12 @@ class Browser:
         non-cursor id is buffered silently until the user navigates to
         that item.
 
-        Ordering caveat: ``set_preview`` (above) routes through the
-        single-slot worker pipeline (``_preview_result`` + ``apply_preview_result``)
-        while ``append_preview`` / ``clear_preview`` route through the
-        post queue. Both land on the main thread, but the post queue
-        drains before ``apply_preview_result`` each iteration, so a
-        ``set_preview`` posted *after* an ``append_preview`` may still
-        land *after* the append on the same iteration — i.e. the set
-        wins. Recipes that need strict ordering should pick one path
-        per id (typically ``append_preview`` + ``clear_preview`` for
-        streaming, ``set_preview`` for one-shot replacements).
+        Ordering: ``set_preview`` / ``append_preview`` / ``clear_preview``
+        all route through the post queue, so calls land in FIFO order
+        on the main thread. (The framework's preview worker still uses
+        the single-slot ``_preview_result`` lane for its own
+        ``get_preview`` deliveries; see :meth:`set_preview` for the
+        worker-vs-recipe race semantics.)
 
         **Registration prerequisite.** This is a no-op when ``id_`` is
         not present in ``_items_by_id`` (no Item, nowhere to append).
