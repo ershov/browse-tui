@@ -2519,6 +2519,12 @@ def _fold_record(td, cur, rec, n, path, sub_dir):
 
 def _resolve_tool_owner(rec, tool_owner):
     """Look up the assistant_uuid that this record back-points at, or None."""
+    # (0) Explicit assistant-uuid back-pointer (subagent jsonls stamp
+    # every tool-result user record with the owning assistant turn's
+    # uuid). Strongest signal — bypasses the tool_owner indirection.
+    asst = rec.get('sourceToolAssistantUUID')
+    if asst:
+        return asst
     # (1) user tool_result content: tool_use_id back-pointer.
     msg = rec.get('message')
     if isinstance(msg, dict):

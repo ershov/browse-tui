@@ -3085,6 +3085,74 @@ class TestSubagentRowTag(unittest.TestCase):
             self.assertIn('3h ago', row.tag)
 
 
+class TestToolResultFallback(unittest.TestCase):
+    """Subagent records carry no top-level toolUseResult — the body
+    renderer must fall back to the inline tool_result.content block,
+    and the pairing resolver must honour sourceToolAssistantUUID."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_resolve_picks_up_source_tool_assistant_uuid(self):
+        rec = {
+            'type': 'user',
+            'sourceToolAssistantUUID': 'uuid-asst-42',
+            'message': {'role': 'user', 'content': [{
+                'type': 'tool_result', 'tool_use_id': 'toolu_xyz',
+                'content': 'ok',
+            }]},
+        }
+        # Empty tool_owner map — must still resolve via the explicit
+        # back-pointer.
+        owner = self.r._resolve_tool_owner(rec, {})
+        self.assertEqual(owner, 'uuid-asst-42')
+
+    def test_resolve_prefers_source_tool_assistant_uuid_over_tool_owner(self):
+        # When both signals point at different assistants, the explicit
+        # uuid back-pointer wins (it's stamped by the runtime).
+        rec = {
+            'type': 'user',
+            'sourceToolAssistantUUID': 'uuid-asst-explicit',
+            'message': {'role': 'user', 'content': [{
+                'type': 'tool_result', 'tool_use_id': 'toolu_xyz',
+                'content': 'ok',
+            }]},
+        }
+        owner = self.r._resolve_tool_owner(
+            rec, {'toolu_xyz': 'uuid-asst-via-map'},
+        )
+        self.assertEqual(owner, 'uuid-asst-explicit')
+
+    def test_body_falls_back_to_raw_content_when_tur_missing(self):
+        body = self.r._fmt_tool_use_result(None, 'plain-string-content')
+        self.assertEqual(body, 'plain-string-content')
+
+    def test_body_falls_back_to_text_blocks_when_tur_missing(self):
+        body = self.r._fmt_tool_use_result(None, [
+            {'type': 'text', 'text': 'first'},
+            {'type': 'text', 'text': 'second'},
+        ])
+        self.assertIn('first', body)
+        self.assertIn('second', body)
+
+    def test_render_tool_result_subagent_shape(self):
+        # Subagent-shape record: no top-level toolUseResult; the body
+        # has to come from message.content[].content.
+        rec = {
+            'type': 'user',
+            'message': {'role': 'user', 'content': [{
+                'type': 'tool_result', 'tool_use_id': 'toolu_abc',
+                'is_error': False,
+                'content': 'bash output line',
+            }]},
+        }
+        part = rec['message']['content'][0]
+        out = self.r._render_tool_result(rec, part)
+        self.assertIn('tool_result', out)
+        self.assertIn('bash output line', out)
+
+
 class TestOrphanSubagents(unittest.TestCase):
     """Tree-mode surfaces subagent files whose dispatch isn't wired."""
 
