@@ -228,8 +228,12 @@ class TestRenderers(unittest.TestCase):
         self.assertNotIn('usage:', body)
         # Chrome carries a single ``usage`` line — a plain
         # three-space separated string, aligned with the other rows.
+        import re as _re
+        sgr = _re.compile(r'\x1b\[[0-9;]*m')
+        plain_chrome = sgr.sub('', chrome)
         usage_lines = [
-            ln for ln in chrome.split('\n') if 'usage' in ln and ':' in ln
+            ln for ln in plain_chrome.split('\n')
+            if 'usage' in ln and ':' in ln
         ]
         self.assertEqual(len(usage_lines), 1)
         self.assertIn('input: 1,234', usage_lines[0])
@@ -237,8 +241,10 @@ class TestRenderers(unittest.TestCase):
         self.assertIn('cache read: 9,000', usage_lines[0])
         self.assertIn('cache new: 100', usage_lines[0])
         # Alignment: each label row's colon sits at the same column.
+        # Only check the *first* colon — the inline usage sub-labels
+        # also carry colons, but those land later in the line.
         label_lines = [
-            ln for ln in chrome.split('\n')
+            ln for ln in plain_chrome.split('\n')
             if ':' in ln and not ln.startswith('─')
         ]
         colon_cols = {ln.index(':') for ln in label_lines}
@@ -262,7 +268,9 @@ class TestRenderers(unittest.TestCase):
         }
         chrome = self.r._fmt_chrome(obj)
         self.assertTrue(chrome, 'chrome must surface usage even with no other rows')
-        lines = chrome.split('\n')
+        import re as _re
+        sgr = _re.compile(r'\x1b\[[0-9;]*m')
+        lines = sgr.sub('', chrome).split('\n')
         self.assertIn('usage:', lines[-1])
         self.assertIn('input: 5', lines[-1])
 
