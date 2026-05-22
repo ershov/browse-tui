@@ -900,25 +900,18 @@ PreviewRender = namedtuple(
 )
 
 
-# ``ChildrenGridLayout`` is the per-Browser memoised result of
+# ``ChildrenGridLayout`` is the per-Browser last-computed result of
 # ``_sub_layout`` (050-render.py). The grid layout depends only on
-# ``(children list, width, show_ids)`` — three inputs whose change the
-# Browser can detect — so we cache the computed tuple under those keys
-# and reuse it across ``layout_panes`` (sizing the grid pane) and
-# ``render_children_grid`` (drawing it). Without the cache each paint
-# recomputes ``_fmt_child`` + ``_wrap_entry`` for every child twice
-# (once for sizing, once for rendering).
+# ``(children list, width, show_ids)``. ``Browser.children_grid_layout``
+# recomputes on every call (no cache — see #434) and stores the
+# resulting namedtuple on the Browser so callers can read it without
+# re-deriving inputs.
 #
 # Fields mirror ``_sub_layout``'s return tuple:
 #   * ``num_cols``    — column count for the layout.
 #   * ``col_width``   — width of each column (incl. inter-column gap).
 #   * ``slot_rows``   — list[int]; rows occupied by each entry.
 #   * ``entry_lines`` — list[list[str]]; wrapped lines per entry.
-#
-# Lives on Browser (not on Item) because the cache key includes the
-# Browser-side ``show_ids`` mode. Invalidated eagerly by
-# ``Browser._invalidate_children_grid_cache()`` whenever a children
-# list is mutated in place (see ``_apply_*`` paths in 040-state.py).
 ChildrenGridLayout = namedtuple(
     'ChildrenGridLayout',
     ['num_cols', 'col_width', 'slot_rows', 'entry_lines'],
@@ -3412,25 +3405,31 @@ class Browser:
         # shim in 020-terminal; this ticket just wires the dict.
         self._pane_cache: dict = {}
 
-        # --- children-grid layout cache (#414) --------------------------
+        # --- children-grid layout (#434) --------------------------------
         # ``_sub_layout`` (050-render.py) is a pure function of
         # ``(children, width, show_ids)`` and is called twice per paint
         # by default — once in ``layout_panes`` to size the grid pane,
         # once in ``render_children_grid`` to draw it. The result is
-        # cached here and exposed through ``children_grid_layout`` so
-        # both call sites land on the same memoised
-        # ``ChildrenGridLayout`` instance.
+        # stored here (last-computed) so callers that don't need to
+        # re-derive inputs can read it directly.
         #
-        # Slot shape: ``(children_id, width, show_ids, layout)`` or
-        # ``None`` (cold). ``children_id`` is ``id(children)`` — O(1)
-        # check. The list identity stays stable across in-place
-        # mutations (``append`` / ``insert`` / ``pop`` from
-        # ``_apply_upsert`` / ``_apply_remove`` / etc.) so those paths
-        # call ``_invalidate_children_grid_cache`` explicitly. List
-        # replacement (``_state._children[id] = items`` in
-        # ``apply_children_results``) yields a fresh ``id()`` and the
-        # cache misses naturally.
-        self._children_grid_cache = None
+        # No cache, no invalidation: ``children_grid_layout`` recomputes
+        # on every call. ``_sub_layout`` is cheap; the 2x-per-paint cost
+        # is acceptable and removes a class of subtle invalidation
+        # bugs. Initialised to a valid empty layout so reads never see
+        # ``None`` — mirrors ``_sub_layout([], 0, 'auto')``'s canonical
+        # empty shape ``(1, 0, [], [])``. Hard-coded rather than
+        # calling ``_sub_layout`` so ``__init__`` doesn't pull in
+        # render-module names (helps the test loader, which wires
+        # modules together lazily). Falls back to a plain tuple when
+        # ``ChildrenGridLayout`` isn't available in the namespace —
+        # production builds concatenate all modules so the namedtuple
+        # is always present; tests that don't inject it still get a
+        # valid 4-tuple they can unpack the same way.
+        _cgl = globals().get('ChildrenGridLayout')
+        self._children_grid_layout = (
+            _cgl(1, 0, [], []) if _cgl is not None else (1, 0, [], [])
+        )
 
         # --- quit bookkeeping (read by the main loop in #13) ------------
         # quit() flips _quit_requested; the main loop watches the flag
@@ -3957,13 +3956,6 @@ class Browser:
 
             apply_ops(self._state, ops_list)
 
-            # Children-grid layout cache (#414) — any mutation that
-            # touches a children list in place (append/insert/del/
-            # reposition) leaves ``id(children)`` stable, so the
-            # cache wouldn't notice. Invalidate unconditionally; the
-            # next paint regenerates. Cheap (one slot to null).
-            self._invalidate_children_grid_cache()
-
             # Re-evaluate filter visibility before computing the new
             # visible list. New items may match or un-match active
             # filters; existing items may have moved subtrees. The
@@ -4296,27 +4288,8 @@ class Browser:
         for item in self._state._items_by_id.values():
             item.preview_render = None
 
-    def _invalidate_children_grid_cache(self) -> None:
-        """Drop the cached ``ChildrenGridLayout`` (#414).
-
-        Called from any ``_apply_*`` path that mutates a children list
-        in place (``_apply_upsert`` append/insert, ``_apply_remove``
-        del, ``_apply_mod`` reposition, ``_apply_set`` replace) so the
-        next ``children_grid_layout`` call recomputes against the
-        new list contents. Cheap — just nulls a single slot.
-
-        The cache key uses ``id(children)`` which would otherwise miss
-        the change (the list identity is stable across in-place
-        mutations). List *replacement*
-        (``apply_children_results`` swapping in a fresh list) yields a
-        new ``id()`` and would miss naturally — calling this helper
-        from those paths too is harmless and keeps the invalidation
-        rule simple ("any mutation, invalidate").
-        """
-        self._children_grid_cache = None
-
     def children_grid_layout(self, children, width, show_ids='auto'):
-        """Return the memoised children-grid layout (#414).
+        """Recompute and return the children-grid layout for the inputs.
 
         Public API consumed by ``layout_panes`` (sizing the grid pane)
         and ``render_children_grid`` (drawing it). Returns a
@@ -4325,23 +4298,19 @@ class Browser:
         ``num_cols, col_width, slot_rows, entry_lines = ...`` work
         unchanged.
 
-        Cache key: ``(id(children), width, show_ids)``. On hit returns
-        the stored layout (same instance); on miss computes via
-        ``_sub_layout`` and stores. List-mutation paths in 040-state.py
-        call ``_invalidate_children_grid_cache`` explicitly because
-        in-place mutations don't change ``id(children)``.
+        Always recomputes — the layout is cheap enough that caching
+        adds more complexity than it saves (#434 reverses #414's
+        cache). The result is stored on ``self._children_grid_layout``
+        so callers can read the last-computed layout without
+        re-passing inputs.
         """
         # _sub_layout lives in 050-render.py; in the concatenated build
         # it's a bare name in the same namespace, and the test loader
         # injects it onto this module so Browser can reach it.
-        key = (id(children), width, show_ids)
-        cached = self._children_grid_cache
-        if cached is not None and cached[0:3] == key:
-            return cached[3]
         layout = _sub_layout(children, width, show_ids=show_ids)
         if not isinstance(layout, ChildrenGridLayout):
             layout = ChildrenGridLayout(*layout)
-        self._children_grid_cache = key + (layout,)
+        self._children_grid_layout = layout
         return layout
 
     def set_list_ratio(self, ratio: float) -> None:
@@ -4865,12 +4834,6 @@ class Browser:
             _index_drop_children(self._state, id_)
             self._state._children[id_] = items
             _index_add_children(self._state, id_, items)
-            # Children-grid layout cache (#414): the children list for
-            # ``id_`` was just replaced with a fresh list — the new
-            # ``id()`` would miss the cache naturally, but the old
-            # cached entry (keyed on the previous list's id) is now
-            # dead weight. Drop it.
-            self._invalidate_children_grid_cache()
             self._state._children_pending.discard(id_)
             # Worker delivered → no longer loading. Stays addressable
             # via ``_loading`` rather than implied membership in
@@ -8434,9 +8397,8 @@ def render_children_grid(browser, rect, *, info=False, has_header=True,
         return
 
     # Cached non-empty children — multi-column flowed layout. Routed
-    # through ``browser.children_grid_layout`` (#414) so the same
-    # ``ChildrenGridLayout`` instance computed by ``_layout_for`` for
-    # sizing is reused here for rendering.
+    # through ``browser.children_grid_layout`` which recomputes via
+    # ``_sub_layout`` and stores on the Browser (#434).
     num_cols, col_width, slot_rows, entry_lines = browser.children_grid_layout(
         children, width, show_ids=browser.show_ids,
     )
@@ -8962,9 +8924,10 @@ def _layout_for(browser):
         if cursor is not None and cursor.has_children:
             cached = browser._state._children.get(cursor.id)
             if cached:
-                # Route through the memoised layout (#414) so
-                # ``render_children_grid`` reuses the same instance
-                # below instead of recomputing on every paint.
+                # Route through ``children_grid_layout`` which
+                # recomputes via ``_sub_layout`` and stores the result
+                # on the Browser (#434). ``render_children_grid`` will
+                # recompute again on its own call — cheap, acceptable.
                 layout_ = browser.children_grid_layout(
                     cached, cols, show_ids=browser.show_ids,
                 )

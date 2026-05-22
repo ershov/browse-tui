@@ -1811,9 +1811,8 @@ def render_children_grid(browser, rect, *, info=False, has_header=True,
         return
 
     # Cached non-empty children — multi-column flowed layout. Routed
-    # through ``browser.children_grid_layout`` (#414) so the same
-    # ``ChildrenGridLayout`` instance computed by ``_layout_for`` for
-    # sizing is reused here for rendering.
+    # through ``browser.children_grid_layout`` which recomputes via
+    # ``_sub_layout`` and stores on the Browser (#434).
     num_cols, col_width, slot_rows, entry_lines = browser.children_grid_layout(
         children, width, show_ids=browser.show_ids,
     )
@@ -2339,9 +2338,10 @@ def _layout_for(browser):
         if cursor is not None and cursor.has_children:
             cached = browser._state._children.get(cursor.id)
             if cached:
-                # Route through the memoised layout (#414) so
-                # ``render_children_grid`` reuses the same instance
-                # below instead of recomputing on every paint.
+                # Route through ``children_grid_layout`` which
+                # recomputes via ``_sub_layout`` and stores the result
+                # on the Browser (#434). ``render_children_grid`` will
+                # recompute again on its own call — cheap, acceptable.
                 layout_ = browser.children_grid_layout(
                     cached, cols, show_ids=browser.show_ids,
                 )

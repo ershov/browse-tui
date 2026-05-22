@@ -323,118 +323,91 @@ class TestUpdateChildrenForCursor(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Browser.children_grid_layout — memoised layout cache (#414)
+# Browser.children_grid_layout — eager recompute (#434, reversing #414)
 # ---------------------------------------------------------------------------
 
 
-class TestChildrenGridLayoutCache(unittest.TestCase):
-    """The Browser-level children-grid layout cache.
+class TestChildrenGridLayout(unittest.TestCase):
+    """The Browser-level children-grid layout helper.
 
     ``Browser.children_grid_layout(children, width, show_ids)`` returns
-    a ``ChildrenGridLayout`` namedtuple. Repeat calls with the same
-    ``(id(children), width, show_ids)`` key hit the cache and return
-    the same instance. Mutating the children list in place via
-    ``update_data`` invalidates the cache eagerly so subsequent calls
-    see the new content.
+    a ``ChildrenGridLayout`` namedtuple computed via ``_sub_layout``.
+    Recomputes on every call (no cache — see #434) and stores the
+    result on ``Browser._children_grid_layout`` so callers can read
+    the last-computed layout without re-passing inputs.
     """
 
     def _make_browser(self, **kwargs):
         kwargs.setdefault('_headless', True)
         return Browser.from_flat_tree(kwargs.pop('rows', []), **kwargs)
 
-    def test_cache_hit_returns_same_instance(self):
-        rows = [
-            Item(id='p', title='parent', has_children=True),
-        ]
-        b = self._make_browser(rows=rows)
-        # Pre-populate cached children for 'p'.
-        b._state._children['p'] = [
-            Item(id=str(i), title='child{}'.format(i)) for i in range(4)
-        ]
-        children = b._state._children['p']
-        a = b.children_grid_layout(children, 80, show_ids='auto')
-        c = b.children_grid_layout(children, 80, show_ids='auto')
-        # Same key → same memoised instance.
-        self.assertIs(a, c)
-        # Returned object is a ChildrenGridLayout namedtuple.
-        self.assertIsInstance(a, _data.ChildrenGridLayout)
-        # And carries the same fields _sub_layout returns.
-        expected = _sub_layout(children, 80, show_ids='auto')
-        self.assertEqual(a.num_cols, expected[0])
-        self.assertEqual(a.col_width, expected[1])
-        self.assertEqual(a.slot_rows, expected[2])
-        self.assertEqual(a.entry_lines, expected[3])
+    def test_default_layout_after_init(self):
+        # Browser construction installs a valid empty
+        # ChildrenGridLayout so reads never see None.
+        b = self._make_browser()
+        layout = b._children_grid_layout
+        self.assertIsNotNone(layout)
+        self.assertIsInstance(layout, _data.ChildrenGridLayout)
+        # Empty shape: 1 column, no entries.
+        self.assertEqual(layout.num_cols, 1)
+        self.assertEqual(layout.slot_rows, [])
+        self.assertEqual(layout.entry_lines, [])
 
-    def test_cache_miss_on_width_change(self):
+    def test_returns_children_grid_layout_namedtuple(self):
         rows = [Item(id='p', title='parent', has_children=True)]
         b = self._make_browser(rows=rows)
         b._state._children['p'] = [
             Item(id=str(i), title='c{}'.format(i)) for i in range(4)
         ]
         children = b._state._children['p']
-        a = b.children_grid_layout(children, 80, show_ids='auto')
-        bigger = b.children_grid_layout(children, 120, show_ids='auto')
-        self.assertIsNot(a, bigger)
+        layout = b.children_grid_layout(children, 80, show_ids='auto')
+        self.assertIsInstance(layout, _data.ChildrenGridLayout)
+        # Carries the same fields _sub_layout returns.
+        expected = _sub_layout(children, 80, show_ids='auto')
+        self.assertEqual(layout.num_cols, expected[0])
+        self.assertEqual(layout.col_width, expected[1])
+        self.assertEqual(layout.slot_rows, expected[2])
+        self.assertEqual(layout.entry_lines, expected[3])
+        # And was stored on the Browser for later reads.
+        self.assertIs(b._children_grid_layout, layout)
 
-    def test_cache_miss_on_show_ids_change(self):
+    def test_different_width_yields_different_layout(self):
+        # Smoke test: different widths can produce different layouts.
+        # Use many children so column count isn't capped by len(children),
+        # and a narrow vs wide pair so num_cols genuinely shifts.
         rows = [Item(id='p', title='parent', has_children=True)]
         b = self._make_browser(rows=rows)
         b._state._children['p'] = [
-            Item(id='42', title='hello'),
-            Item(id='99', title='world'),
+            Item(id=str(i), title='c{}'.format(i)) for i in range(40)
+        ]
+        children = b._state._children['p']
+        narrow = b.children_grid_layout(children, 20, show_ids='auto')
+        wide = b.children_grid_layout(children, 200, show_ids='auto')
+        self.assertNotEqual(narrow.num_cols, wide.num_cols)
+
+    def test_different_show_ids_yields_different_layout(self):
+        # Smoke test: show_ids='always' adds extra text to entries that
+        # would otherwise have their id suppressed.
+        rows = [Item(id='p', title='parent', has_children=True)]
+        b = self._make_browser(rows=rows)
+        b._state._children['p'] = [
+            Item(id='README.md'),
+            Item(id='LICENSE'),
         ]
         children = b._state._children['p']
         a = b.children_grid_layout(children, 80, show_ids='auto')
         c = b.children_grid_layout(children, 80, show_ids='always')
-        self.assertIsNot(a, c)
+        # 'always' duplicates id+title; entry_lines differ.
+        self.assertNotEqual(a.entry_lines, c.entry_lines)
 
-    def test_cache_invalidated_by_update_data(self):
-        # In-place mutation of the children list (upsert appending a new
-        # id) leaves ``id(children)`` stable. The cache must be
-        # invalidated explicitly by the mutation path so the next
-        # ``children_grid_layout`` call reflects the new entry.
-        upsert = _state.upsert
-
-        rows = [Item(id='p', title='parent', has_children=True)]
-        b = self._make_browser(rows=rows)
-        # Pre-populate 'p' with two children.
-        b._state._children['p'] = [
-            Item(id='a', title='alpha'),
-            Item(id='b', title='beta'),
-        ]
-        # Re-register so _items_by_id / _parent_of_id are consistent.
-        b._state._items_by_id['a'] = b._state._children['p'][0]
-        b._state._items_by_id['b'] = b._state._children['p'][1]
-        b._state._parent_of_id['a'] = 'p'
-        b._state._parent_of_id['b'] = 'p'
-
-        children = b._state._children['p']
-        first = b.children_grid_layout(children, 80, show_ids='auto')
-        first_len = len(first.entry_lines)
-
-        # In-place append via update_data → upsert with a new id.
-        b.update_data([upsert('c', 'p', title='gamma')])
-        b.run_until_idle()
-
-        # Same list object (in-place append) ...
-        self.assertIs(b._state._children['p'], children)
-        # ... but the cache must have been invalidated.
-        after = b.children_grid_layout(children, 80, show_ids='auto')
-        self.assertIsNot(first, after)
-        self.assertEqual(len(after.entry_lines), first_len + 1)
-
-    def test_layout_panes_and_render_share_cache(self):
-        # ``_layout_for`` (sizing the grid pane) and
-        # ``render_children_grid`` (drawing it) should both land on the
-        # same memoised ChildrenGridLayout instance. We instrument
-        # ``_sub_layout`` and assert it's invoked exactly once across
-        # back-to-back paints with identical inputs.
+    def test_children_grid_layout_recomputes_every_call(self):
+        # Eager recompute — no cache. Calling twice with identical
+        # inputs should invoke ``_sub_layout`` twice.
         rows = [
             Item(id='p', title='parent', has_children=True),
             Item(id='q', title='other'),
         ]
         b = self._make_browser(rows=rows)
-        # Cursor on the branch and cache its children.
         b._state.cursor = 0
         b._state._children['p'] = [
             Item(id=str(i), title='c{}'.format(i)) for i in range(6)
@@ -442,14 +415,10 @@ class TestChildrenGridLayoutCache(unittest.TestCase):
         for child in b._state._children['p']:
             b._state._items_by_id[child.id] = child
             b._state._parent_of_id[child.id] = 'p'
-
-        # Warm the cache with one call. From here on, identical inputs
-        # must hit the cache.
         children = b._state._children['p']
-        first = b.children_grid_layout(children, 80, show_ids='auto')
 
-        # Patch ``_sub_layout`` (on _state, since Browser invokes it
-        # from there in the test build) to count invocations.
+        # Patch ``_sub_layout`` on _state (Browser invokes it from there
+        # in the test build) to count invocations.
         calls = [0]
         original = _state._sub_layout
 
@@ -459,12 +428,9 @@ class TestChildrenGridLayoutCache(unittest.TestCase):
 
         _state._sub_layout = _counting_sub_layout
         try:
-            # Same inputs → cache hits → no further _sub_layout calls.
-            second = b.children_grid_layout(children, 80, show_ids='auto')
-            third = b.children_grid_layout(children, 80, show_ids='auto')
-            self.assertIs(first, second)
-            self.assertIs(first, third)
-            self.assertEqual(calls[0], 0)
+            b.children_grid_layout(children, 80, show_ids='auto')
+            b.children_grid_layout(children, 80, show_ids='auto')
+            self.assertEqual(calls[0], 2)
         finally:
             _state._sub_layout = original
 
