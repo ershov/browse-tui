@@ -672,6 +672,12 @@ def _list_subagents_for_session(session_jsonl_path):
         item.subagent_path = agent_path
         item.line_count = count
         item.mtime = st.st_mtime
+        # Voice stripe: the dispatching assistant call is voice, so
+        # the subagent umbrella that represents it carries the
+        # assistant-row background colour.
+        bg = _ROW_BG_FOR_KIND.get('subagent')
+        if bg is not None:
+            item.row_bg = bg
         out.append(item)
     # Newest-first ordering matches the rest of the recipe.
     out.sort(key=lambda it: -it.mtime)
@@ -836,6 +842,12 @@ _ROW_BG_FOR_KIND = {
     # talking" even though they slot into the open turn rather than
     # opening a new one.
     'queue-operation': 235,
+    # Subagent umbrella rows: the dispatching assistant ``Agent`` /
+    # ``Task`` call IS voice (it's how the assistant tells the
+    # subagent what to do), so the umbrella inherits the assistant
+    # stripe. Applies both to inline-wired umbrellas and to orphans
+    # surfaced at the top of tree view.
+    'subagent':         17,
 }
 
 
@@ -3674,12 +3686,13 @@ def _collect_umbrella_preview(item_id, parts, ops, leaf_previews):
             continue
         try:
             if '#agent:' in cid:
-                # Subagent boundary — compact stub, don't drill in.
-                agent_type = getattr(child, 'agent_type', None) or 'agent'
-                agent_desc = (getattr(child, 'agent_description', None)
-                              or f'agent {getattr(child, "agent_id", "")}')
-                parts.append(_rule(f'subagent: {agent_type}', YELLOW)
-                             + '\n' + agent_desc)
+                # Subagent boundary — never drill into another file's
+                # records from a parent's preview. The dispatching
+                # Agent / Task tool_use + matching tool_result already
+                # live in the parent file and render through the
+                # normal leaf path under the dispatching turn, so we
+                # don't even emit a stub — would just duplicate that
+                # pair.
                 continue
             if '#prompt:' in cid or '#tool:' in cid or '#span:' in cid:
                 # Same-file umbrella — recurse so the user sees every

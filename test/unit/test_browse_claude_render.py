@@ -3085,6 +3085,86 @@ class TestSubagentRowTag(unittest.TestCase):
             self.assertIn('3h ago', row.tag)
 
 
+class TestSubagentUmbrellaVoice(unittest.TestCase):
+    """Subagent umbrellas are marked as voice rows (assistant stripe)
+    and their content is NOT inlined into the parent's preview."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _build(self, tmp, with_dispatch=True):
+        import json as _json
+        proj = os.path.join(tmp, '-x')
+        os.makedirs(proj)
+        sess = os.path.join(proj, 'parent-sid.jsonl')
+        sub_dir = os.path.join(proj, 'parent-sid', 'subagents')
+        os.makedirs(sub_dir)
+        with open(os.path.join(sub_dir, 'agent-A1.jsonl'), 'w') as f:
+            f.write(_json.dumps({
+                'type': 'assistant',
+                'message': {'role': 'assistant',
+                            'content': [{'type': 'text',
+                                         'text': 'inside-subagent'}]},
+            }) + '\n')
+        with open(os.path.join(sub_dir, 'agent-A1.meta.json'), 'w') as fm:
+            _json.dump({'agentType': 'general-purpose',
+                        'description': 'do work'}, fm)
+        recs = []
+        if with_dispatch:
+            recs += [
+                {'type': 'user', 'uuid': 'u1', 'parentUuid': None,
+                 'message': {'role': 'user', 'content': 'kick off'}},
+                {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+                 'message': {'role': 'assistant', 'content': [{
+                     'type': 'tool_use', 'id': 'toolu_X', 'name': 'Agent',
+                     'input': {'subagent_type': 'general-purpose',
+                               'description': 'do work', 'prompt': 'p'},
+                 }]}},
+                {'type': 'user', 'uuid': 't1', 'parentUuid': 'a1',
+                 'message': {'role': 'user', 'content': [{
+                     'type': 'tool_result', 'tool_use_id': 'toolu_X',
+                     'content': 'done',
+                 }]},
+                 'toolUseResult': {'status': 'completed', 'agentId': 'A1',
+                                   'agentType': 'general-purpose',
+                                   'content': []}},
+            ]
+        with open(sess, 'w') as f:
+            for r in recs:
+                f.write(_json.dumps(r) + '\n')
+        return sess
+
+    def test_subagent_row_has_voice_bg(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._build(tmp)
+            rows = self.r._list_subagents_for_session(sess)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].row_bg, 17)  # assistant stripe
+
+    def test_orphan_subagent_row_keeps_voice_bg(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._build(tmp, with_dispatch=False)
+            self.r._TREE_CACHE.clear()
+            td = self.r._scan_tree(sess)
+            orphans = self.r._orphan_subagents_for_session(sess, td)
+            self.assertEqual(len(orphans), 1)
+            self.assertEqual(orphans[0].row_bg, 17)
+            self.assertIn('orphan', orphans[0].tag)
+
+    def test_parent_preview_does_not_inline_subagent_content(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._build(tmp)
+            self.r._TREE_CACHE.clear()
+            # Compose the parent's <tool:Agent> umbrella preview — the
+            # subagent's body must NOT bleed in via the umbrella cascade.
+            preview = self.r._preview_umbrella(f'{sess}#tool:1')
+            self.assertNotIn('inside-subagent', preview)
+
+
 class TestScopeCard(unittest.TestCase):
     """Synthetic top row preview is prefixed by a scope card."""
 
