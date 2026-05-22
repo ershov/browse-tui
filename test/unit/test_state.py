@@ -256,13 +256,13 @@ class TestBrowserSetChildren(unittest.TestCase):
 
 
 class TestBrowserSetPreview(unittest.TestCase):
-    """``set_preview`` (#265, #431) lets recipe-owned threads inject previews.
+    """``set_preview`` (#265, #431, #442) lets recipe-owned threads inject previews.
 
     Post-#431 contract: ``set_preview`` routes through the FIFO post
     queue (same lane as ``append_preview`` / ``clear_preview``), so
-    every call lands — no more single-slot latest-wins. The framework
-    worker still uses its own ``_preview_result`` slot, untouched by
-    ``set_preview``.
+    every call lands. Post-#442: the framework worker also delivers
+    via the post queue (no more single-slot ``_preview_result`` lane),
+    so worker and recipe writes share the same FIFO ordering.
     """
 
     def _browser_with_item(self, id_='a'):
@@ -277,12 +277,12 @@ class TestBrowserSetPreview(unittest.TestCase):
         b.drain_main_queue()
         self.assertEqual(item.preview, 'hello')
 
-    def test_set_preview_does_not_touch_worker_slot(self):
-        # #431: ``set_preview`` no longer writes ``_preview_result``;
-        # that slot is reserved for the worker's own deliveries.
+    def test_set_preview_does_not_have_worker_slot(self):
+        # #442: ``_preview_result`` was removed; no single-slot lane.
+        # The worker now also delivers via the post queue.
         b, _item = self._browser_with_item()
         b.set_preview('a', 'hello')
-        self.assertIsNone(b._preview_result)
+        self.assertFalse(hasattr(b, '_preview_result'))
 
     def test_set_preview_multiple_calls_all_land(self):
         # #431: every queued ``set_preview`` write lands on a different

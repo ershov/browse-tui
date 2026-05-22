@@ -780,13 +780,14 @@ class TestIdempotentEnsureUpsertPattern(unittest.TestCase):
         self.assertEqual(item.tag, 'v1')
 
 
-# --- #431: set_preview routes through the FIFO post queue ----------------
+# --- #431/#442: set_preview routes through the FIFO post queue -----------
 #
 # Pre-#431: ``set_preview`` wrote to the single-slot ``_preview_result``,
 # so two recipe writes in quick succession lost the first (latest-wins).
 # Post-#431: ``set_preview`` posts a main-thread closure per call, so
-# every write lands. The framework worker continues to deliver its own
-# ``get_preview`` results through ``_preview_result`` untouched.
+# every write lands. Post-#442: the framework worker also delivers via
+# the post queue (the ``_preview_result`` lane was removed), so all
+# writes — recipe and worker — share a single FIFO ordering.
 
 
 class TestSetPreviewPostQueueSemantics(unittest.TestCase):
@@ -805,21 +806,14 @@ class TestSetPreviewPostQueueSemantics(unittest.TestCase):
         self.assertEqual(items['B'].preview, 'b-text')
         self.assertEqual(items['C'].preview, 'c-text')
 
-    def test_set_preview_does_not_touch_worker_slot(self):
-        # The framework's single-slot ``_preview_result`` is reserved
-        # for the worker's deliveries. ``set_preview`` writes must not
-        # appear there (otherwise we'd race the worker on its own lane).
+    def test_no_single_slot_preview_result_lane(self):
+        # #442: the legacy ``_preview_result`` slot is gone. The worker
+        # delivers via the post queue too, so there is no shared "worker
+        # lane" to race against.
         b = Browser(BrowserConfig(_headless=True))
         _seed(b, 'A')
         b.set_preview('A', 'a-text')
-        # The closure is in the post queue but not yet drained: the
-        # worker slot must still be empty.
-        self.assertIsNone(b._preview_result)
-        b.drain_main_queue()
-        # Even after draining the post queue, the worker slot is still
-        # empty (the closure writes directly to ``item.preview``, not
-        # to ``_preview_result``).
-        self.assertIsNone(b._preview_result)
+        self.assertFalse(hasattr(b, '_preview_result'))
 
     def test_update_data_then_set_preview_fifo_orders_writes(self):
         # ``update_data`` posts the apply step on the main thread; a

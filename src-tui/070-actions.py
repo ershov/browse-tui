@@ -1458,7 +1458,6 @@ def _handle_insert_key(browser, ctx: 'Context', key: str) -> bool:
     if key == '_notify':
         browser.drain_main_queue()
         browser.apply_children_results()
-        browser.apply_preview_result()
         return True
     # Unhandled — swallow silently. plan-tui forwards to the normal-mode
     # handler here; phase-2 simplification is to ignore. Recipes that

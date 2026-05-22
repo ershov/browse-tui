@@ -1041,7 +1041,6 @@ def _pick_on_info_bar(browser, label, options, *, _read_key=None):
             # implicitly by re-deriving the layout above.
             browser.drain_main_queue()
             browser.apply_children_results()
-            browser.apply_preview_result()
             continue
 
         if key in ('down', 'ctrl-n'):

@@ -2403,7 +2403,7 @@ def visible_items(state: State) -> list:
         # Try to recover the actual Item for the scope row by scanning the
         # cache; fall back to a synthetic Item if not findable. Register
         # the synthetic in ``_items_by_id`` so the per-Item preview cache
-        # (#422) has a place to land: ``apply_preview_result`` and the
+        # (#422) has a place to land: ``_deliver_preview`` (#442) and the
         # renderer both key on ``_items_by_id``, so an unregistered
         # synthetic would silently swallow preview text.
         scope_item = _find_item(state, scope_root_id)
@@ -3283,13 +3283,24 @@ class Browser:
         self._children_results = deque()  # FIFO of (id, items) — set_children only
         self._children_event = threading.Event()
 
-        # preview worker: single-slot latest-wins. The worker reads
-        # _preview_req atomically, fetches, writes _preview_result, then
-        # checks if _preview_req is still the same id. If not, loops to
-        # serve the newer request. See _preview_worker for the snippet
-        # we ported verbatim from plan-tui.
+        # Preview worker: post-queue delivery + local-id dedup (#442).
+        # The worker keeps a ``local_id`` of the most recently fetched
+        # request. On each iteration it reads ``_preview_req``: if it
+        # equals ``local_id`` (already fetched) or ``None`` (nothing
+        # asked), it clears the wake event and re-reads (clear-then-read
+        # closes the gap with ``request_preview`` setting the event
+        # while we were deciding to sleep). Otherwise it adopts the new
+        # id, clears the event (to arm "next request landed during
+        # fetch"), invokes ``get_preview``, and posts a
+        # ``_deliver_preview`` closure that caches the result on the
+        # main thread. No single-slot ``_preview_result`` lane: every
+        # delivery lands via the FIFO post queue, so back-to-back
+        # fetches all reach the cache even if the cursor has moved on.
+        #
+        # Only the main thread writes ``_preview_req`` (worker reads
+        # only). Single-attribute reads/writes are GIL-safe; no lock
+        # needed for this slot. ``_preview_event`` is the wake signal.
         self._preview_req = None
-        self._preview_result = None  # (id, text)
         self._preview_event = threading.Event()
 
         # Preview generator support (#273). When ``get_preview`` returns
@@ -4022,14 +4033,14 @@ class Browser:
         ``set_preview`` once per leaf in a composition no longer loses
         all but the last write. ``text`` is coerced to ``''`` if None.
 
-        Worker-race note: the framework's preview worker continues to
-        deliver its own ``get_preview`` results via the single-slot
-        ``_preview_result`` lane (consumed by ``apply_preview_result``).
-        Within one main-loop iteration the post queue drains *before*
-        ``apply_preview_result`` runs, so a worker fetch that lands at
-        the same time will overwrite a recipe ``set_preview`` for the
-        same id. Recipes that want a guaranteed write should construct
-        the Browser with ``get_preview=None`` (no worker to race).
+        Worker-race note: the framework's preview worker also delivers
+        through the FIFO post queue (#442 redesign), so worker results
+        and recipe ``set_preview`` calls land in submission order — no
+        more "worker always wins" overwrite. If a recipe ``set_preview``
+        is queued after the worker's ``_deliver_preview`` closure for
+        the same id, the recipe write is the final state. Recipes that
+        want a guaranteed write with no worker activity at all should
+        still construct the Browser with ``get_preview=None``.
 
         **Registration prerequisite.** This is a no-op when ``id_`` is
         not present in ``_items_by_id``. Preview storage lives on the
@@ -4083,10 +4094,10 @@ class Browser:
 
         Ordering: ``set_preview`` / ``append_preview`` / ``clear_preview``
         all route through the post queue, so calls land in FIFO order
-        on the main thread. (The framework's preview worker still uses
-        the single-slot ``_preview_result`` lane for its own
-        ``get_preview`` deliveries; see :meth:`set_preview` for the
-        worker-vs-recipe race semantics.)
+        on the main thread. The framework's preview worker also delivers
+        via the post queue (#442), so worker and recipe writes share a
+        single FIFO ordering — see :meth:`set_preview` for the
+        worker-vs-recipe race semantics.
 
         **Registration prerequisite.** This is a no-op when ``id_`` is
         not present in ``_items_by_id`` (no Item, nowhere to append).
@@ -4144,8 +4155,9 @@ class Browser:
 
         Implemented as a main-thread post that drops the cache entry
         and calls ``request_preview(id_)`` to ask the worker for a
-        fresh fetch. The result lands in ``item.preview`` via the
-        existing single-slot lane; the next render picks it up.
+        fresh fetch. The result lands in ``item.preview`` via a
+        ``_deliver_preview`` closure on the post queue (#442); the next
+        render picks it up.
 
         Contrast with the cursor-move path: cursor changes are a
         "fresh view" signal — scroll resets to 0 and the tail pin is
@@ -4884,34 +4896,52 @@ class Browser:
             self._needs_redraw.add('all')
         return n
 
-    def apply_preview_result(self) -> bool:
-        """Move the worker-produced preview text into the cache.
+    def _deliver_preview(self, id_, text) -> None:
+        """Main-thread closure that caches a worker-produced preview (#442).
 
-        Returns True if a result was applied, False if the slot was empty.
-        Also flags the preview pane dirty so the loop renders it on the
-        next pass (without this the worker delivery only becomes visible
-        after the next keystroke that triggers a ``_needs_redraw`` add).
+        Posted by ``_preview_worker`` after each non-generator fetch.
+        Caches ``text`` on ``Item.preview`` unconditionally — even if
+        the cursor has moved on, the work is preserved so a back-cursor
+        visit doesn't re-fetch. Flags the preview pane dirty only when
+        the cursor is still pointing at ``id_``; an out-of-band delivery
+        for a now-unseen id doesn't trigger a redundant repaint.
+
+        Clears ``_preview_req`` when it still equals ``id_`` so the
+        request slot drains naturally — both ``run_until_idle`` and
+        the streaming-pause checks rely on ``_preview_req is None`` as
+        the "no pending preview fetch" signal. When the slot holds a
+        different id (the user moved the cursor mid-fetch), leave it
+        alone — the worker will see the newer id on its next loop.
+
+        ``text`` is coerced to ``''`` if None (defensive — the worker
+        already coerces, but ``_deliver_preview`` is also a stable
+        injection point recipes could call directly).
         """
-        if self._preview_result is None:
-            return False
-        id_, text = self._preview_result
-        self._preview_result = None
+        if text is None:
+            text = ''
         item = self._state._items_by_id.get(id_)
         if item is not None:
             item.preview = text
             # Wrap cache (#422) — drop the stale render so the next
             # paint regenerates against the new text.
             item.preview_render = None
-        self._needs_redraw.add('preview')
-        return True
+        # Drain the request slot for this id (latest-wins: don't clobber
+        # a newer pending request landed during the fetch).
+        if self._preview_req == id_:
+            self._preview_req = None
+        # Conditional redraw: cursor may have moved during the fetch.
+        # A delivery for the still-current id is what the user is
+        # waiting to see; everything else just fills the cache.
+        if id_ == self._preview_cursor_id:
+            self._needs_redraw.add('preview')
 
     def run_until_idle(self, timeout: float = 2.0) -> None:
         """Test affordance: drain queues + wait for workers, until idle.
 
         Idle means: main_queue empty AND children_queue empty AND
-        children_results empty AND _preview_req is None AND
-        _preview_result is None AND no in-flight pendings. Polls every
-        5ms and raises ``TimeoutError`` if not idle within ``timeout``.
+        children_results empty AND _preview_req is None AND no
+        in-flight pendings. Polls every 5ms and raises ``TimeoutError``
+        if not idle within ``timeout``.
 
         Per #273: a preview-generator-paused state (worker holding a
         live generator, waiting for cursor-move or demand signal)
@@ -4928,7 +4958,6 @@ class Browser:
         while time.monotonic() < deadline:
             self.drain_main_queue()
             self.apply_children_results()
-            self.apply_preview_result()
             paused = self._preview_paused
             preview_busy = (
                 self._preview_req is not None
@@ -4939,7 +4968,6 @@ class Browser:
                     and not self._children_queue
                     and not self._children_results
                     and not preview_busy
-                    and self._preview_result is None
                     and not self._children_in_flight
                     and not self._state._children_pending):
                 return
@@ -4950,7 +4978,6 @@ class Browser:
             f'children_queue={len(self._children_queue)}, '
             f'children_results={len(self._children_results)}, '
             f'preview_req={self._preview_req!r}, '
-            f'preview_result={self._preview_result!r}, '
             f'preview_paused={self._preview_paused!r}, '
             f'in_flight={list(self._children_in_flight)}, '
             f'children_pending={list(self._state._children_pending)})'
@@ -5413,71 +5440,104 @@ class Browser:
             p._resolve()
 
     def _preview_worker(self):
-        """Latest-wins single-slot worker (ported from plan-tui).
+        """Post-queue preview worker with local-id dedup (#442).
 
-        Reads ``_preview_req`` atomically, fetches, writes the result.
-        Only the main thread writes ``_preview_req`` -- the worker
-        clears it only after confirming no newer request landed during
-        the fetch. If a newer request did land, we loop immediately to
-        serve it without blocking on the event.
+        Keeps a ``local_id`` of the most recently fetched request.
+        Each iteration:
 
-        Per #273: when ``get_preview`` returns a generator, the worker
-        switches to a streaming branch — see
-        ``_stream_preview_from_generator``. Each yield is delivered via
-        ``append_preview``; when the running buffer hits the configured
-        cap, the worker pauses (without closing the generator). A
-        cursor-move closes the generator and pivots; a future #274
-        demand signal will resume it.
+          1. Read ``_preview_req``. If it equals ``local_id`` (already
+             fetched) or ``None`` (nothing asked), clear the wake event
+             and re-read (clear-then-read closes the gap with
+             ``request_preview`` setting the event during our decision).
+             Then ``wait()`` if there's still nothing new. Resets
+             ``local_id`` to ``None`` on sleep so a re-request of the
+             same id after we've gone idle fires again.
+          2. Otherwise adopt the new id, clear the event (arming "next
+             request landed during fetch"), and call ``get_preview``.
+          3. Generator results route through
+             ``_stream_preview_from_generator`` (unchanged) which
+             delivers via ``append_preview`` — also on the post queue.
+          4. Non-generator results post a ``_deliver_preview`` closure
+             that caches the text on ``Item.preview`` and conditionally
+             flags redraw. Lambdas capture ``id_`` and ``text`` by
+             default-arg to avoid the late-binding pitfall.
+
+        No single-slot ``_preview_result`` lane: every delivery lands
+        through the FIFO post queue, so back-to-back fetches all reach
+        the cache (the in-flight A delivery is no longer overwritten
+        when the user moves to B). Memory effect: cached previews
+        accumulate but are bounded by visited items.
+
+        Re-request of the same id while a fetch for it is in flight is
+        dropped — the worker finishes the in-flight fetch, sees
+        ``_preview_req == local_id`` on the next loop, and sleeps. The
+        user sees stale-not-blank for that one cycle; navigating away
+        and back forces a refresh. Accepted per #442 design discussion.
+
+        Single-flight invariant preserved: at most one ``get_preview``
+        executes at a time (the loop is strictly sequential).
         """
+        local_id = None
         while not self._stop:
-            self._preview_event.wait()
+            req = self._preview_req
+            if req is None or req == local_id:
+                # Nothing new (or already fetched this id). Sleep.
+                # Keep ``local_id`` so we don't immediately re-fetch
+                # the same delivery sitting in the post queue.
+                self._preview_event.clear()
+                # Re-read after clear() to catch a request_preview that
+                # fired in the gap between the read above and clear().
+                req = self._preview_req
+                if req is None or req == local_id:
+                    self._preview_event.wait()
+                    # On wake, drop ``local_id`` so a re-request of
+                    # the same id (e.g. invalidate_preview → request)
+                    # is treated as fresh work after the sleep.
+                    local_id = None
+                # else: a new request raced in; fall through to fetch.
+                continue
+            # New work — different id (or first iteration after wake).
+            local_id = req
+            # Arm "next request during fetch": if request_preview fires
+            # while get_preview is running, the event will be set and
+            # the next iteration's read will see the new id.
             self._preview_event.clear()
-            while not self._stop:
-                req_id = self._preview_req
-                if req_id is None:
-                    break
-                # If a paused generator from an earlier request is
-                # still alive (cursor moved between yields), close it
-                # so its recipe's ``finally`` runs before we serve the
-                # new request.
-                self._abandon_paused_preview_if_any(except_id=req_id)
-                try:
-                    if self.get_preview is not None:
-                        result = self.get_preview(req_id)
-                    else:
-                        result = ''
-                except Exception as e:
-                    self._preview_result = (
-                        req_id, f'[error] {type(e).__name__}: {e}'
-                    )
-                    notify_wake()
-                    if self._preview_req == req_id:
-                        self._preview_req = None
-                    continue
-
-                if inspect.isgenerator(result):
-                    # Streaming branch: drain into ``append_preview``
-                    # until cap or exhaustion. Returns when the
-                    # generator is exhausted, errored, abandoned, or
-                    # left paused. ``_preview_req`` is cleared inside
-                    # the streamer at appropriate points (matching the
-                    # latest-wins semantics).
-                    self._stream_preview_from_generator(req_id, result)
+            # If a paused generator from an earlier request is still
+            # alive (cursor moved between yields), close it so its
+            # recipe's ``finally`` runs before we serve the new request.
+            self._abandon_paused_preview_if_any(except_id=req)
+            try:
+                if self.get_preview is not None:
+                    result = self.get_preview(req)
                 else:
-                    if result is None:
-                        result = ''
-                    self._preview_result = (req_id, result)
-                    notify_wake()
-                    # Latest-wins: only clear the slot if no newer
-                    # request landed during the fetch. Otherwise loop
-                    # immediately to serve the newer one (we'll
-                    # overwrite _preview_result on the next iteration
-                    # -- the main thread may have already consumed the
-                    # previous one, or it may not; either way the
-                    # latest result is what wins).
-                    if self._preview_req == req_id:
-                        self._preview_req = None
-                    # else: keep looping with the new req_id
+                    result = ''
+            except Exception as e:
+                err_text = f'[error] {type(e).__name__}: {e}'
+                # Capture by value via default-arg to dodge late-binding.
+                self.post(
+                    lambda id_=req, t=err_text:
+                        self._deliver_preview(id_, t)
+                )
+                notify_wake()
+                continue
+
+            if inspect.isgenerator(result):
+                # Streaming branch: drain into ``append_preview`` until
+                # cap or exhaustion. Returns when the generator is
+                # exhausted, errored, abandoned, or left paused.
+                # ``append_preview`` already routes through the post
+                # queue, so no extra delivery wiring is needed here.
+                self._stream_preview_from_generator(req, result)
+            else:
+                if result is None:
+                    result = ''
+                # Capture by value (id_, t) — do NOT close over req/result
+                # directly, since the next loop iteration will rebind them.
+                self.post(
+                    lambda id_=req, t=result:
+                        self._deliver_preview(id_, t)
+                )
+                notify_wake()
 
     def _abandon_paused_preview_if_any(self, except_id=None):
         """Close any paused preview generator whose id != ``except_id``.
@@ -5539,10 +5599,11 @@ class Browser:
           ``[error] ExceptionName: message`` appended to the buffer;
           partial buffered preview is retained.
 
-        ``_preview_result`` is NOT used in this branch — the streaming
-        path writes directly through the per-id ``Item.preview`` cache
-        via ``append_preview``. The single-slot result lane is only
-        for non-generator returns.
+        The streaming path writes directly through the per-id
+        ``Item.preview`` cache via ``append_preview`` (post queue);
+        the non-generator branch in ``_preview_worker`` posts a
+        ``_deliver_preview`` closure (also post queue) — both routes
+        share the same FIFO ordering (#442).
         """
         chars = 0
         lines = 0
@@ -5851,7 +5912,6 @@ class Browser:
                 # next read_key wake.
                 self.drain_main_queue()
                 self.apply_children_results()
-                self.apply_preview_result()
 
                 # Re-derive preview / children fetches for the current
                 # cursor *after* applying worker deliveries — when a
@@ -5978,18 +6038,31 @@ class Browser:
         body, …) and the user's first-glance row when launching with
         an initial scope is the scope_root. Called by the main loop at
         the top of every iteration (post-#124) so cursor moves and
-        worker deliveries both trigger latest-wins preview fetches.
+        worker deliveries both trigger preview fetches.
 
-        When the cursor lands on a different item (or off any normal
-        item) since the last call, the preview pane is reset: scroll
-        offset returns to 0 and help mode (if active) is dismissed so
-        the user sees the new item's preview, not stale state.
+        Three behaviors (#442):
+
+          * Same cursor + cached: no-op. The renderer paints from cache.
+          * Same cursor + cache cleared (``item.preview is None``):
+            re-fire ``request_preview`` so any mutation that dropped
+            the cache (e.g. ``invalidate_preview``, a recipe call to
+            ``clear_preview``, a children-mutation handler clearing an
+            umbrella body) recovers on the next main-loop iteration.
+            This fixes the "stuck blank" failure mode: previously, if
+            the cursor stayed put while something nulled the cache, the
+            renderer would read ``None`` and never trigger a re-fetch.
+          * Cursor moved + new id already cached: skip the fetch; just
+            reset scroll/help and flag redraw. The renderer paints from
+            cache. Saves a redundant ``get_preview`` round-trip for
+            navigation across already-visited rows.
+          * Cursor moved + new id not cached (or ``None``): request a
+            fetch and reset scroll/help.
 
         Idempotency note: the gate is ``_preview_cursor_id`` (only
         updated when the cursor moves to a different item), NOT
-        ``_preview_req`` (cleared by the worker after each fetch). A
-        ``_preview_req`` gate would cause a hot fetch loop now that
-        this runs every iteration — see ticket #126.
+        ``_preview_req`` (cleared inside the worker as it processes
+        deliveries). A ``_preview_req`` gate would cause a hot fetch
+        loop now that this runs every iteration — see ticket #126.
         """
         if not self.show_preview:
             return
@@ -6003,9 +6076,15 @@ class Browser:
                 new_id = entry.item.id
 
         if new_id == self._preview_cursor_id:
-            # Cursor still on the same item — already requested in a
-            # prior call, the worker either resolved or is in flight.
-            # Re-firing now would kick a redundant fetch every iteration.
+            # Cursor still on the same item. Normally a no-op; but if
+            # the cached preview has been cleared (None) we need to
+            # re-fire request_preview — otherwise the renderer would
+            # paint blank until the user navigates away and back.
+            # See #442 "stuck blank" repro.
+            if new_id is not None:
+                item = state._items_by_id.get(new_id)
+                if item is not None and item.preview is None:
+                    self.request_preview(new_id)
             return
 
         self._preview_cursor_id = new_id
@@ -6030,6 +6109,13 @@ class Browser:
             # stay alive (and its recipe ``finally`` wouldn't fire)
             # until the cursor lands on a new normal item.
             self._preview_resume_event.set()
+            return
+
+        # Cursor landed on a new id with a cached preview — paint from
+        # cache, skip the round-trip. The renderer's clamp keeps
+        # ``_preview_scroll`` valid even though we reset it to 0 above.
+        item = state._items_by_id.get(new_id)
+        if item is not None and item.preview is not None:
             return
         self.request_preview(new_id)
 
@@ -10402,7 +10488,6 @@ def _pick_on_info_bar(browser, label, options, *, _read_key=None):
             # implicitly by re-deriving the layout above.
             browser.drain_main_queue()
             browser.apply_children_results()
-            browser.apply_preview_result()
             continue
 
         if key in ('down', 'ctrl-n'):
@@ -11899,7 +11984,6 @@ def _handle_insert_key(browser, ctx: 'Context', key: str) -> bool:
     if key == '_notify':
         browser.drain_main_queue()
         browser.apply_children_results()
-        browser.apply_preview_result()
         return True
     # Unhandled — swallow silently. plan-tui forwards to the normal-mode
     # handler here; phase-2 simplification is to ignore. Recipes that
