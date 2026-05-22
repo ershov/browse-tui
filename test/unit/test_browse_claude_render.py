@@ -3085,6 +3085,115 @@ class TestSubagentRowTag(unittest.TestCase):
             self.assertIn('3h ago', row.tag)
 
 
+class TestScopeCard(unittest.TestCase):
+    """Synthetic top row preview is prefixed by a scope card."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _write(self, records, suffix='.jsonl'):
+        import json as _json
+        import tempfile
+        f = tempfile.NamedTemporaryFile('w', suffix=suffix, delete=False)
+        for r in records:
+            f.write(_json.dumps(r) + '\n')
+        f.close()
+        return f.name
+
+    def test_card_session_file_fields(self):
+        path = self._write([
+            {'type': 'user', 'sessionId': 's-uuid', 'entrypoint': 'cli',
+             'cwd': '/work', 'gitBranch': 'main', 'slug': 'happy-slug',
+             'message': {'role': 'user', 'content': 'hi'}},
+        ])
+        try:
+            self.r._TREE_CACHE.clear()
+            td = self.r._scan_tree(path)
+            card = self.r._fmt_scope_card(path, td)
+            self.assertIn('browse-claude', card)
+            self.assertIn(path, card)
+            self.assertIn('s-uuid', card)
+            self.assertIn('cli', card)
+            self.assertIn('/work', card)
+            self.assertIn('main', card)
+            self.assertIn('happy-slug', card)
+            self.assertIn('lines', card)
+            self.assertIn('voice', card)
+        finally:
+            os.unlink(path)
+
+    def test_card_omits_slug_when_absent(self):
+        path = self._write([
+            {'type': 'user', 'sessionId': 's-uuid',
+             'message': {'role': 'user', 'content': 'hi'}},
+        ])
+        try:
+            self.r._TREE_CACHE.clear()
+            td = self.r._scan_tree(path)
+            card = self.r._fmt_scope_card(path, td)
+            self.assertNotIn('slug', card)
+        finally:
+            os.unlink(path)
+
+    def test_card_subagent_variant(self):
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, '-x')
+            os.makedirs(proj)
+            sub_dir = os.path.join(proj, 'parent-sid', 'subagents')
+            os.makedirs(sub_dir)
+            agent_path = os.path.join(sub_dir, 'agent-AID42.jsonl')
+            with open(agent_path, 'w') as f:
+                f.write(_json.dumps({
+                    'type': 'user', 'sessionId': 'parent-sid',
+                    'message': {'role': 'user', 'content': 'do it'},
+                }) + '\n')
+            with open(os.path.join(sub_dir, 'agent-AID42.meta.json'),
+                      'w') as fm:
+                _json.dump({'agentType': 'general-purpose',
+                            'description': 'compose previews'}, fm)
+            self.r._TREE_CACHE.clear()
+            td = self.r._scan_tree(agent_path)
+            card = self.r._fmt_scope_card(agent_path, td)
+            self.assertIn('subagent', card)
+            self.assertIn('AID42', card)
+            self.assertIn('general-purpose', card)
+            self.assertIn('compose previews', card)
+            self.assertIn('parent-sid', card)
+
+    def test_voice_count_cached_on_td(self):
+        path = self._write([
+            {'type': 'user',
+             'message': {'role': 'user', 'content': 'hi'}},
+            {'type': 'attachment',
+             'attachment': {'type': 'date_change', 'newDate': '2026-05-22'}},
+        ])
+        try:
+            self.r._TREE_CACHE.clear()
+            td = self.r._scan_tree(path)
+            self.assertIsNone(td.voice_count)
+            self.r._fmt_scope_card(path, td)
+            self.assertEqual(td.voice_count, 1)
+        finally:
+            os.unlink(path)
+
+    def test_preview_umbrella_prepends_card_for_top_row(self):
+        path = self._write([
+            {'type': 'user', 'sessionId': 's-uuid',
+             'message': {'role': 'user', 'content': 'hi'}},
+        ])
+        try:
+            self.r._TREE_CACHE.clear()
+            out = self.r.get_preview(path)
+            # Card sits at the head of the preview.
+            self.assertIn('browse-claude', out)
+            self.assertIn('s-uuid', out)
+        finally:
+            os.unlink(path)
+
+
 class TestToolResultFallback(unittest.TestCase):
     """Subagent records carry no top-level toolUseResult — the body
     renderer must fall back to the inline tool_result.content block,

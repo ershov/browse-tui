@@ -2321,7 +2321,7 @@ class _TreeData:
                  'agent_link', 'records_line', 'parent_id_of',
                  'assistant_has_tool_use', 'tool_to_turn_root_line',
                  'agent_to_assistant_line', 'tool_use_name_of',
-                 'line_offsets')
+                 'line_offsets', 'voice_count')
 
     def __init__(self):
         self.records = []
@@ -2358,6 +2358,10 @@ class _TreeData:
         # length. Starts as ``[0]`` (sentinel-only, no lines yet) and
         # grows by one entry per appended line.
         self.line_offsets = [0]
+        # Cached count of voice-bearing records — populated lazily by
+        # ``_fmt_scope_card`` and invalidated by tail appends that
+        # bring in new voice records.
+        self.voice_count = None
 
 
 def _is_turn_root(rec):
@@ -3468,6 +3472,88 @@ def _preview_message(path, n):
     return body + ('\n' + chrome if chrome else '')
 
 
+def _scope_card_path(item_id):
+    """Return the on-disk .jsonl whose scope card should prepend the
+    preview, or None if ``item_id`` doesn't anchor a synthetic top row.
+
+    Two id shapes earn the card: the bare ``.jsonl`` path (top row in
+    the project's session list, or when ``--file`` opens a transcript
+    directly) and a ``<sess>#agent:<aid>`` row whose preview is
+    composed from the subagent's own jsonl.
+    """
+    if isinstance(item_id, str) and '#agent:' in item_id:
+        sess, _, aid = item_id.partition('#agent:')
+        if not aid:
+            return None
+        agent_path = os.path.join(_subagents_dir(sess), f'agent-{aid}.jsonl')
+        return agent_path if os.path.isfile(agent_path) else None
+    if (isinstance(item_id, str) and item_id.endswith('.jsonl')
+            and os.path.isfile(item_id)):
+        return item_id
+    return None
+
+
+def _fmt_scope_card(path, td):
+    """One-block header identifying the file backing the synthetic top row.
+
+    Pulls sessionId / entrypoint / cwd / gitBranch / slug from the
+    first record that has them (every Claude record carries the
+    stamps). Subagent variant additionally lists agentId, agentType
+    and description from the sibling meta.json. Returns a string
+    ready to prepend to the cascade body.
+    """
+    rec = next((r for r in td.records if isinstance(r, dict)), None) or {}
+    is_sub = False
+    parent = os.path.dirname(path)
+    if os.path.basename(parent) == 'subagents':
+        fname = os.path.basename(path)
+        if fname.startswith('agent-') and fname.endswith('.jsonl'):
+            meta_path = os.path.join(parent, fname[:-len('.jsonl')]
+                                     + '.meta.json')
+            if os.path.isfile(meta_path):
+                is_sub = True
+    rows = []
+    rows.append(('path', path))
+    if is_sub:
+        agent_id = os.path.basename(path)[len('agent-'):-len('.jsonl')]
+        meta = _read_subagent_meta(os.path.join(
+            os.path.dirname(path), f'agent-{agent_id}.meta.json',
+        ))
+        rows.append(('agentId', agent_id))
+        if meta.get('agentType'):
+            rows.append(('agentType', meta['agentType']))
+        if meta.get('description'):
+            rows.append(('description', meta['description']))
+    if rec.get('sessionId'):
+        rows.append(('sessionId', rec['sessionId']))
+    if rec.get('entrypoint'):
+        rows.append(('entrypoint', rec['entrypoint']))
+    if rec.get('cwd'):
+        rows.append(('cwd', rec['cwd']))
+    if rec.get('gitBranch'):
+        rows.append(('gitBranch', rec['gitBranch']))
+    if rec.get('slug'):
+        rows.append(('slug', rec['slug']))
+    n_lines = sum(1 for r in td.records if r is not None)
+    rows.append(('lines', str(n_lines)))
+    if td.voice_count is None:
+        td.voice_count = sum(
+            1 for r in td.records if isinstance(r, dict) and _is_voice(r)
+        )
+    rows.append(('voice', str(td.voice_count)))
+    try:
+        st = os.stat(path)
+        rows.append(('mtime', _human_time(st.st_mtime)))
+    except OSError:
+        pass
+    label = 'browse-claude (subagent)' if is_sub else 'browse-claude'
+    w = max(len(k) for k, _ in rows)
+    body = '\n'.join(
+        f'   {MUTE}{k.ljust(w)}:{RESET} {v}' for k, v in rows
+    )
+    return f'{_rule(label, BLUE)}\n{body}\n{_rule()}'
+
+
 def _preview_umbrella(item_id):
     """Recursive same-file body dump of an umbrella row's leaves.
 
@@ -3503,6 +3589,13 @@ def _preview_umbrella(item_id):
     parts = []
     ops = []
     leaf_previews = {}
+    card_path = _scope_card_path(item_id)
+    if card_path is not None:
+        try:
+            td = _scan_tree(card_path)
+            parts.append(_fmt_scope_card(card_path, td))
+        except Exception as e:
+            parts.append(_rule(f'error in scope card: {e}', RED))
     _collect_umbrella_preview(item_id, parts, ops, leaf_previews)
     if _BROWSER is not None:
         # One batched push per top-level invocation. Thread-safe:
