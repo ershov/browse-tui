@@ -560,5 +560,259 @@ class TestEmptyAndCleanExhaustion(unittest.TestCase):
             b.stop_workers()
 
 
+class TestAbandonClearsCache(unittest.TestCase):
+    """#456: cursor-move / _stop on a streaming preview clears Item.preview.
+
+    The partial buffer in ``Item.preview`` is no longer a useful cache
+    once the generator is abandoned — a re-visit should refetch fresh
+    rather than paint the truncated text as if it were the final
+    preview. Cache is preserved on clean ``StopIteration`` and on
+    mid-stream exception (partial + ``[error]`` tag is informative).
+    """
+
+    def test_cursor_move_clears_paused_partial(self):
+        # Generator pauses at the cap with two chunks buffered.
+        def get_preview(_id):
+            while True:
+                yield 'x' * 50
+
+        b = make_browser(
+            get_children=lambda _, *, reload=False: [
+                Item(id='a'), Item(id='b'),
+            ],
+            get_preview=get_preview,
+            root_id='/',
+            preview_buffer_cap_chars=100,
+        )
+        try:
+            b.refresh('/')
+            b.run_until_idle()
+            b.request_preview('a')
+            # Wait until paused mid-stream — partial 'a' is cached.
+            self.assertTrue(
+                _drain_until(b, lambda: b._preview_paused is not None),
+                'worker did not pause on a',
+            )
+            self.assertGreaterEqual(len(get_preview_text(b, 'a') or ''), 100)
+            # Cursor-move: abandon a, switch to b.
+            b.request_preview('b')
+            # Wait for the post-queue cache clear + b to take over.
+            self.assertTrue(
+                _drain_until(b, lambda: get_preview_text(b, 'a') is None),
+                f"abandoned id 'a' cache not cleared: "
+                f"{get_preview_text(b, 'a')!r}",
+            )
+        finally:
+            b.stop_workers()
+
+    def test_cursor_move_clears_mid_stream_partial(self):
+        # Generator hasn't paused yet — blocked on a gate after one chunk.
+        gate = threading.Event()
+
+        def get_preview(_id):
+            yield 'first chunk'
+            gate.wait(timeout=2.0)
+            yield 'second chunk'  # should never execute
+
+        b = make_browser(
+            get_children=lambda _, *, reload=False: [
+                Item(id='a'), Item(id='b'),
+            ],
+            get_preview=get_preview,
+            root_id='/',
+        )
+        try:
+            b.refresh('/')
+            b.run_until_idle()
+            b.request_preview('a')
+            self.assertTrue(
+                _drain_until(
+                    b, lambda: get_preview_text(b, 'a') == 'first chunk'
+                ),
+            )
+            # Cursor-move before the generator's second yield. Release
+            # the gate so next(gen) returns and the worker observes
+            # the cursor-move on the next loop iteration.
+            b.request_preview('b')
+            gate.set()
+            self.assertTrue(
+                _drain_until(b, lambda: get_preview_text(b, 'a') is None),
+                f"mid-stream abandoned id 'a' cache not cleared: "
+                f"{get_preview_text(b, 'a')!r}",
+            )
+        finally:
+            gate.set()
+            b.stop_workers()
+
+    def test_revisit_after_abandon_refetches_fresh(self):
+        # After cursor-move clears the cache, a re-request for the same
+        # id should fire the worker again — not silently keep the stale
+        # partial. We track call_count to confirm the second call.
+        call_count = {'n': 0}
+
+        def get_preview(item_id):
+            if item_id == 'a':
+                call_count['n'] += 1
+                yield f"call-{call_count['n']}-chunk1 "
+                yield 'x' * 50
+                yield 'x' * 50  # pushes past cap
+                yield 'x' * 50
+            else:
+                yield 'b-content'
+
+        b = make_browser(
+            get_children=lambda _, *, reload=False: [
+                Item(id='a'), Item(id='b'),
+            ],
+            get_preview=get_preview,
+            root_id='/',
+            preview_buffer_cap_chars=100,
+        )
+        try:
+            b.refresh('/')
+            b.run_until_idle()
+            b.request_preview('a')
+            self.assertTrue(
+                _drain_until(b, lambda: b._preview_paused is not None),
+                'worker did not pause on first visit to a',
+            )
+            self.assertIn('call-1', get_preview_text(b, 'a') or '')
+            # Move off — should abandon + clear.
+            b.request_preview('b')
+            self.assertTrue(
+                _drain_until(b, lambda: get_preview_text(b, 'a') is None),
+            )
+            b.run_until_idle()
+            # Revisit a: worker should re-run get_preview('a') from
+            # scratch, producing 'call-2-' prefixed output.
+            b.request_preview('a')
+            self.assertTrue(
+                _drain_until(
+                    b,
+                    lambda: 'call-2' in (get_preview_text(b, 'a') or ''),
+                ),
+                f"re-request did not refetch: "
+                f"call_count={call_count['n']}, "
+                f"text={get_preview_text(b, 'a')!r}",
+            )
+            self.assertEqual(call_count['n'], 2)
+        finally:
+            b.stop_workers()
+
+    def test_clean_stopiteration_preserves_cache(self):
+        # Regression guard: the abandon clear must NOT trip when the
+        # generator finishes cleanly.
+        def get_preview(_id):
+            yield 'complete '
+            yield 'preview'
+
+        b = make_browser(
+            get_children=lambda _, *, reload=False: [Item(id='a')],
+            get_preview=get_preview,
+            root_id='/',
+        )
+        try:
+            b.refresh('/')
+            b.run_until_idle()
+            b.request_preview('a')
+            b.run_until_idle()
+            self.assertEqual(get_preview_text(b, 'a'), 'complete preview')
+            # Wait a beat + drain once more — clear must not arrive.
+            time.sleep(0.05)
+            b.drain_main_queue()
+            self.assertEqual(get_preview_text(b, 'a'), 'complete preview')
+        finally:
+            b.stop_workers()
+
+    def test_mid_stream_exception_preserves_partial(self):
+        # Regression guard: mid-stream raise leaves the partial +
+        # ``[error]`` tag in the cache, intentionally informative.
+        def get_preview(_id):
+            yield 'partial '
+            raise RuntimeError('boom')
+
+        b = make_browser(
+            get_children=lambda _, *, reload=False: [Item(id='a')],
+            get_preview=get_preview,
+            root_id='/',
+        )
+        try:
+            b.refresh('/')
+            b.run_until_idle()
+            b.request_preview('a')
+            b.run_until_idle()
+            time.sleep(0.05)
+            b.drain_main_queue()
+            buf = get_preview_text(b, 'a') or ''
+            self.assertIn('partial ', buf)
+            self.assertIn('RuntimeError', buf)
+            self.assertIn('boom', buf)
+            # Cache is NOT None (partial+error tag is preserved).
+            self.assertIsNotNone(get_preview_text(b, 'a'))
+        finally:
+            b.stop_workers()
+
+    def test_side_effect_ops_on_other_ids_untouched(self):
+        # The umbrella case: a generator for 'a' writes set_preview ops
+        # for sibling ids 'leaf1'/'leaf2' as side effects. On abandon,
+        # the framework only clears 'a' — the sibling caches survive.
+        # (The framework's clear is scoped to the abandoned id; this
+        # test confirms it.)
+        from test.async_._helpers import _state as _state_mod
+        set_preview_op = _state_mod.set_preview_op
+
+        def get_preview(item_id):
+            if item_id == 'a':
+                # Side-effect: cache previews for leaves before
+                # yielding our own content. update_data is thread-safe.
+                b_ref[0].update_data([
+                    set_preview_op('leaf1', 'leaf1-body'),
+                    set_preview_op('leaf2', 'leaf2-body'),
+                ])
+                while True:
+                    yield 'x' * 50
+            else:
+                yield f'{item_id}-content'
+
+        b_ref = [None]
+        b = make_browser(
+            get_children=lambda _, *, reload=False: [
+                Item(id='a'), Item(id='b'),
+                Item(id='leaf1'), Item(id='leaf2'),
+            ],
+            get_preview=get_preview,
+            root_id='/',
+            preview_buffer_cap_chars=100,
+        )
+        b_ref[0] = b
+        try:
+            b.refresh('/')
+            b.run_until_idle()
+            b.request_preview('a')
+            # Wait until paused — leaves should now have their cache too.
+            self.assertTrue(
+                _drain_until(
+                    b,
+                    lambda: (
+                        b._preview_paused is not None
+                        and get_preview_text(b, 'leaf1') == 'leaf1-body'
+                        and get_preview_text(b, 'leaf2') == 'leaf2-body'
+                    ),
+                ),
+                f"leaves not populated: "
+                f"leaf1={get_preview_text(b, 'leaf1')!r}, "
+                f"leaf2={get_preview_text(b, 'leaf2')!r}",
+            )
+            # Abandon a — leaves must survive; only 'a' is cleared.
+            b.request_preview('b')
+            self.assertTrue(
+                _drain_until(b, lambda: get_preview_text(b, 'a') is None),
+            )
+            self.assertEqual(get_preview_text(b, 'leaf1'), 'leaf1-body')
+            self.assertEqual(get_preview_text(b, 'leaf2'), 'leaf2-body')
+        finally:
+            b.stop_workers()
+
+
 if __name__ == '__main__':
     unittest.main()

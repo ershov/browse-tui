@@ -4601,6 +4601,46 @@ class Browser:
                 )
                 notify_wake()
 
+    def _post_clear_abandoned_preview(self, item_id):
+        """Post a main-thread cache-clear for an abandoned streaming preview (#456).
+
+        Used by ``_stream_preview_from_generator`` and
+        ``_abandon_paused_preview_if_any`` when a streaming generator is
+        dropped before clean ``StopIteration`` — either because the
+        cursor moved off ``item_id`` or because ``_stop`` woke the
+        worker. The partial buffer in ``Item.preview`` is no longer a
+        useful cache entry: a subsequent visit should refetch fresh,
+        not paint the truncated text as if it were the final preview.
+
+        Sets ``Item.preview = None`` and ``Item.preview_render = None``
+        on the main thread via the post queue (the worker is a daemon
+        thread, so direct state mutation would race the renderer).
+        Idempotent and safe for unknown ids (silent no-op).
+
+        Cache is *preserved* on:
+          * Clean ``StopIteration`` — the buffer is the final preview.
+          * Mid-stream exception — partial buffer + ``[error]`` tag is
+            an intentionally informative result.
+          * Side-effect ops written via ``set_preview_op`` for *other*
+            ids (e.g. the umbrella generator populating leaf bodies);
+            those ids are not the abandoned generator's id, so they
+            stay untouched.
+        """
+        state = self._state
+
+        def _clear():
+            item = state._items_by_id.get(item_id)
+            if item is None:
+                return
+            item.preview = None
+            item.preview_render = None
+            # Repaint so the cleared pane reflects on screen if the
+            # cursor happens to land back on this id before a fresh
+            # fetch delivers.
+            self._needs_redraw.add('preview')
+
+        self.post(_clear)
+
     def _abandon_paused_preview_if_any(self, except_id=None):
         """Close any paused preview generator whose id != ``except_id``.
 
@@ -4608,6 +4648,10 @@ class Browser:
         Closing a generator triggers its ``finally`` blocks via
         ``GeneratorExit`` — recipes use this for resource cleanup
         (file handles, network sockets, etc.).
+
+        Posts a cache-clear for the abandoned id (#456) so a later
+        visit refetches fresh instead of painting the truncated buffer
+        as if it were the final preview.
 
         Defensive: ``gen.close()`` itself catches generator-internal
         exceptions, but we still wrap to keep the worker thread alive
@@ -4622,6 +4666,7 @@ class Browser:
                 # paused generator (resume path will pick it up). Only
                 # used by the resume signal codepath in #274.
                 return
+            abandoned_id = paused['id']
             self._preview_paused = None
             # Clear any stale demand-resume request — that paused
             # generator is going away.
@@ -4634,6 +4679,9 @@ class Browser:
             # the generator (per Python semantics) but we belt-and-
             # braces in case a recipe re-raises in ``finally``.
             pass
+        # #456: discard the partial buffer for the abandoned id so a
+        # re-visit refetches instead of painting the truncated cache.
+        self._post_clear_abandoned_preview(abandoned_id)
 
     def _stream_preview_from_generator(self, item_id, gen):
         """Drain a ``get_preview`` generator into ``append_preview``.
@@ -4679,7 +4727,13 @@ class Browser:
         next_cap_chars = cap_chars
         next_cap_lines = cap_lines
         try:
-            while not self._stop:
+            while True:
+                if self._stop:
+                    # #456: shutdown — clear the partial buffer so a
+                    # stale truncated cache can't survive into a
+                    # later run if the main queue drains again.
+                    self._post_clear_abandoned_preview(item_id)
+                    return
                 # Cursor-move abandon check before pulling: if the
                 # request slot has moved off our id, drop the
                 # generator (its ``finally`` fires via ``gen.close()``)
@@ -4689,6 +4743,9 @@ class Browser:
                         gen.close()
                     except Exception:
                         pass
+                    # #456: clear the partial buffer so a re-visit
+                    # refetches fresh instead of painting truncated.
+                    self._post_clear_abandoned_preview(item_id)
                     return
                 try:
                     chunk = next(gen)
@@ -4766,6 +4823,10 @@ class Browser:
                                     gen.close()
                                 except Exception:
                                     pass
+                            # #456: clear the partial buffer so a
+                            # re-visit refetches fresh instead of
+                            # painting truncated.
+                            self._post_clear_abandoned_preview(item_id)
                             return
                         # #274 demand signal — renderer asked us to
                         # keep pulling. Clear paused state + the
@@ -4817,6 +4878,10 @@ class Browser:
                         continue
                     # ``_stop`` woke us — exit without closing (the
                     # daemon thread is going away anyway).
+                    # #456: still post the cache-clear so if the main
+                    # loop drains once more before tear-down, a stale
+                    # partial doesn't survive into a re-run scenario.
+                    self._post_clear_abandoned_preview(item_id)
                     return
         finally:
             # Belt-and-braces: if anything escaped (shouldn't), make
