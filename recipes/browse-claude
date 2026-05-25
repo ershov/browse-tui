@@ -3048,6 +3048,27 @@ def _read_new_records(path):
     return (new_records, dirty)
 
 
+def _refresh_hidden_in_op(op):
+    """Return ``op`` with its ``hidden`` field re-evaluated against the
+    live ``_FILTER_VOICE_ONLY`` global.
+
+    Used by the umbrella generator's flush helper so a filter toggle
+    that lands between descent (when an item's ``hidden`` was sampled)
+    and flush (when the upsert is posted to the framework) takes
+    effect on the items being pushed. Non-upsert ops pass through
+    unchanged; upsert ops without ``hidden`` in their fields also
+    pass through.
+    """
+    if not (isinstance(op, tuple) and op and op[0] == 'upsert'):
+        return op
+    _, cid, parent_id, fields, *rest = op
+    if not isinstance(fields, dict) or 'hidden' not in fields:
+        return op
+    new_fields = dict(fields)
+    new_fields['hidden'] = not _passes_filter(cid)
+    return (op[0], cid, parent_id, new_fields) + tuple(rest)
+
+
 def _item_to_upsert_kwargs(item):
     """Extract Item fields + custom attrs into kwargs for ``upsert``.
 
@@ -3898,6 +3919,17 @@ def _collect_umbrella_preview(item_id, _state=None):
             return
         ops = state['ops']
         if ops:
+            # Re-evaluate ``hidden`` against the live filter for every
+            # upsert at flush time, not at descent time. Otherwise a
+            # filter toggle that lands mid-stream (e.g., user presses
+            # ``h`` while the umbrella is paused at the cap) would have
+            # its mod-ops clobbered by the abandoned generator's
+            # ``finally:`` flush, which carries upserts whose hidden
+            # flags reflect the filter state at descent. The bug
+            # manifested as the first ``h`` press not re-filtering the
+            # umbrella preview — the OLD items' stale hidden flags
+            # were restored by the finally-flush.
+            ops = [_refresh_hidden_in_op(op) for op in ops]
             _BROWSER.update_data(ops)
         state['ops'] = []
         state['count'] = 0

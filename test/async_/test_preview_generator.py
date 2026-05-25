@@ -1315,6 +1315,67 @@ class TestDropPreviewCacheRefetchesGenerator(unittest.TestCase):
             b.stop_workers()
 
 
+class TestDropPreviewCacheAfterModBatch(unittest.TestCase):
+    """#471 follow-up: user-reported regression on first `h`-toggle.
+
+    Sequence: open file → cursor on synthetic top row → press `h`
+    (which fires update_data(mod_ops) for hidden flags, then
+    drop_preview_cache()). The umbrella preview should re-stream
+    against the new filter — i.e. the kick that follows the
+    drop_preview_cache should land and the worker should refetch.
+    """
+
+    def test_mod_batch_followed_by_drop_cache_refills_preview(self):
+        # Two posts in quick succession: one structural (mod), one
+        # preview-only (drop_preview_cache). The preview-only branch
+        # of update_data._apply fires the kick — the worker must
+        # refetch even though the previous batch was structural.
+        call_count = {'n': 0}
+
+        def get_preview(_id):
+            call_count['n'] += 1
+            yield f'pass-{call_count["n"]}\n'
+
+        b = make_browser(
+            get_children=lambda _, *, reload=False: [Item(id='cur')],
+            get_preview=get_preview,
+            root_id='/',
+        )
+        try:
+            b.refresh('/')
+            b.run_until_idle()
+            b._preview_cursor_id = 'cur'
+            b.request_preview('cur')
+            b.run_until_idle()
+            self.assertEqual(get_preview_text(b, 'cur'), 'pass-1\n')
+
+            # Simulate `h`-toggle's two-post sequence:
+            # 1) update_data with a mod op (structural) on some other
+            #    id — exercises the non-preview-only batch path.
+            # 2) drop_preview_cache(None) — exercises the
+            #    preview-only batch fast path, which must still fire
+            #    the cursor kick.
+            #
+            # We mod a fake registered item to keep the op valid.
+            from test.async_._helpers import _state as state_mod
+            b._state._items_by_id['cur'].title = 'old'
+            b.update_data([state_mod.mod('cur', title='new')])
+            b.drop_preview_cache()
+            self.assertTrue(
+                _drain_until(
+                    b,
+                    lambda: (call_count['n'] >= 2
+                             and get_preview_text(b, 'cur') == 'pass-2\n'),
+                    timeout=2.0,
+                ),
+                f'preview did not refill after mod+drop sequence; '
+                f'call_count={call_count["n"]}, '
+                f'text={get_preview_text(b, "cur")!r}',
+            )
+        finally:
+            b.stop_workers()
+
+
 class TestStreamingDoesNotHang(unittest.TestCase):
     """#471: a huge streaming generator under tail-pin must complete
     promptly. The bug was O(N²) cost in update_data._apply running

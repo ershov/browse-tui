@@ -3354,6 +3354,94 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             self.assertNotIn('SID-XYZ', umbrella,
                              'umbrella preview should not include leaf chrome')
 
+    def test_toggle_filter_drops_preview_cache_for_synthetic_row(self):
+        # Regression #4 (user-reported): on a freshly-opened jsonl,
+        # cursor on the synthetic top row, pressing `h` (toggle
+        # voice-only filter) must drop the cached preview so the
+        # umbrella is re-streamed against the new filter.
+        #
+        # Previously the umbrella generated content survived the
+        # toggle on the first press — only the second-pair toggle
+        # (off then on again) finally re-streamed. Root cause: stale
+        # cache from before the filter flip stayed in Item.preview;
+        # nothing invalidated it on the synthetic-row id specifically.
+        import tempfile
+        import json as _json
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, '-h')
+            os.makedirs(proj)
+            sess = os.path.join(proj, 's.jsonl')
+            # Mix of voice (user/assistant text) and non-voice
+            # (tool_use without text) records — so the filter has
+            # something to hide.
+            recs = [
+                {'type': 'user', 'uuid': 'u1', 'parentUuid': None,
+                 'message': {'role': 'user',
+                             'content': 'PROBE_VOICE_USER'}},
+                {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+                 'message': {'role': 'assistant', 'content': [{
+                     'type': 'tool_use', 'id': 't1', 'name': 'Bash',
+                     'input': {'command': 'PROBE_BASH_HIDDEN'},
+                 }]}},
+            ]
+            with open(sess, 'w') as f:
+                for r in recs:
+                    f.write(_json.dumps(r) + '\n')
+            self.r._TREE_CACHE.clear()
+
+            # With filter OFF, the umbrella body contains both records.
+            self.r._FILTER_VOICE_ONLY = False
+            try:
+                with_all = ''.join(self.r._preview_umbrella(sess))
+                self.assertIn('PROBE_VOICE_USER', with_all)
+                self.assertIn('PROBE_BASH_HIDDEN', with_all)
+
+                # With filter ON, the umbrella body should drop the
+                # non-voice <tool:Bash> umbrella.
+                self.r._FILTER_VOICE_ONLY = True
+                # Clear the recipe-level tree cache so the next
+                # _preview_umbrella reflects the new filter state when
+                # it builds children via get_children (mod ops aren't
+                # simulated here — we use the same predicate).
+                self.r._TREE_CACHE.clear()
+                with_voice = ''.join(self.r._preview_umbrella(sess))
+                self.assertIn('PROBE_VOICE_USER', with_voice)
+                self.assertNotIn(
+                    'PROBE_BASH_HIDDEN', with_voice,
+                    'voice-only filter should hide the non-voice '
+                    'tool_use record from the umbrella preview',
+                )
+            finally:
+                self.r._FILTER_VOICE_ONLY = False
+
+    def test_flush_refreshes_hidden_against_live_filter(self):
+        # #4 follow-up: the umbrella generator captures each child's
+        # ``hidden`` flag at descent time. If the user toggles the
+        # voice-only filter between descent and flush (the kick path
+        # for `h`), the abandoned generator's finally flush must
+        # re-evaluate hidden against the live filter — otherwise the
+        # stale flag clobbers the toggle's mod ops.
+        op = ('upsert', '/x/file.jsonl#tool:5',
+              '/x/file.jsonl#prompt:0',
+              {'hidden': False, 'title': 't'},
+              None)
+        # Mock _passes_filter so we can drive the live filter state.
+        original_passes = self.r._passes_filter
+        self.r._passes_filter = lambda *_a, **_k: False  # hidden=True
+        try:
+            refreshed = self.r._refresh_hidden_in_op(op)
+            self.assertEqual(refreshed[3]['hidden'], True,
+                             '_refresh_hidden_in_op should reflect '
+                             'the live filter state')
+            # Non-upsert ops pass through unchanged.
+            mod_op = ('mod', '/x#0', None, {'title': 'new'}, None)
+            self.assertIs(self.r._refresh_hidden_in_op(mod_op), mod_op)
+            # Upsert without hidden in fields also passes through.
+            no_hidden = ('upsert', '/x#0', None, {'title': 't'}, None)
+            self.assertIs(self.r._refresh_hidden_in_op(no_hidden), no_hidden)
+        finally:
+            self.r._passes_filter = original_passes
+
     def test_umbrella_does_not_clobber_leaf_preview_cache(self):
         # Regression: previously, the umbrella's set_preview_op
         # side-effect wrote body-only into leaf Item.preview, so a
