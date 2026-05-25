@@ -3074,18 +3074,18 @@ class Browser:
             for kick in self._state._preview_kicks:
                 kind = kick[0]
                 if kind == 'id':
-                    self.request_preview(kick[1])
+                    self._kick_after_invalidate(kick[1])
                 elif kind == 'cursor':
                     # drop_preview_cache(None) — kick the cursor id (if any).
                     cur = self._preview_cursor_id
                     if cur is not None:
-                        self.request_preview(cur)
+                        self._kick_after_invalidate(cur)
                 elif kind == 'cursor_if':
                     # drop_preview_cache(id) — kick only when the
                     # dropped id is the current preview cursor.
                     cur = self._preview_cursor_id
                     if cur is not None and kick[1] == cur:
-                        self.request_preview(cur)
+                        self._kick_after_invalidate(cur)
 
             # Re-evaluate filter visibility before computing the new
             # visible list. New items may match or un-match active
@@ -4610,6 +4610,14 @@ class Browser:
                 # ``append_preview`` already routes through the post
                 # queue, so no extra delivery wiring is needed here.
                 self._stream_preview_from_generator(req, result)
+                # #471: reset the worker's "already fetched" memo after
+                # any streaming termination so a follow-up
+                # ``request_preview(same_id)`` (typically fired by an
+                # ``invalidate_preview`` / ``drop_preview_cache`` kick
+                # after the streaming generator was externally
+                # abandoned) is treated as a fresh fetch rather than
+                # absorbed by the same-id dedup gate.
+                local_id = None
             else:
                 if result is None:
                     result = ''
@@ -4620,6 +4628,44 @@ class Browser:
                         self._deliver_preview(id_, t)
                 )
                 notify_wake()
+
+    def _kick_after_invalidate(self, id_):
+        """Cache for ``id_`` was just nulled — make sure the worker
+        actually re-fetches from scratch (#471).
+
+        Without this, a same-id ``request_preview`` is silently absorbed
+        by a paused streaming generator that's still holding state for
+        the *previous* fetch: the cursor-move check inside the streaming
+        worker compares ids and sees no change, so the paused generator
+        stays alive, the cache stays null, and the renderer paints
+        blank until the user navigates away.
+
+        Fix: when a kick lands for an id whose paused generator is
+        live, abandon the generator first so the next
+        ``request_preview`` triggers a fresh ``get_preview`` call.
+
+        Cache-clear from the abandon is intentionally suppressed here
+        — the caller just nulled the cache; double-clearing risks
+        clobbering a fresh delivery that races the abandon teardown.
+        """
+        with self._preview_lock:
+            paused = self._preview_paused
+            if paused is not None and paused.get('id') == id_:
+                abandoned_gen = paused['gen']
+                self._preview_paused = None
+                self._preview_resume_pull = False
+                self._preview_demand_signal_state = None
+            else:
+                abandoned_gen = None
+        if abandoned_gen is not None:
+            try:
+                abandoned_gen.close()
+            except Exception:
+                # ``gen.close()`` swallows generator-internal raises per
+                # Python semantics; belt-and-braces against a recipe
+                # ``finally:`` that re-raises.
+                pass
+        self.request_preview(id_)
 
     def _post_clear_abandoned_preview(self, item_id):
         """Post a main-thread cache-clear for an abandoned streaming preview (#456).

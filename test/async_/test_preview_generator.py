@@ -1109,5 +1109,211 @@ class TestScreenDerivedCap(unittest.TestCase):
             b.stop_workers()
 
 
+class TestDropPreviewCacheRefetchesGenerator(unittest.TestCase):
+    """#471: dropping the preview cache for the cursor row must trigger
+    a fresh fetch — including the streaming/generator path.
+
+    Reproduces the user-reported regression: with the cursor on an
+    umbrella row whose ``get_preview`` returns a generator, pressing
+    ``m`` (toggle markdown) or reloading nulls every item's preview and
+    kicks ``request_preview(cursor)`` — but the preview pane stayed
+    blank forever because the re-request never produced visible content.
+    """
+
+    def test_drop_cache_then_request_refills_generator_preview(self):
+        # Simulates `m`-toggle: drop_preview_cache(None) + request the
+        # cursored id. The generator should run again and the cache
+        # should end up with the full content.
+        call_count = {'n': 0}
+
+        def get_preview(_id):
+            call_count['n'] += 1
+            yield 'A\n'
+            yield 'B\n'
+            yield 'C\n'
+
+        b = make_browser(
+            get_children=lambda _, *, reload=False: [Item(id='cur')],
+            get_preview=get_preview,
+            root_id='/',
+        )
+        try:
+            b.refresh('/')
+            b.run_until_idle()
+            # Pin the preview-cursor id so the ('cursor', None) kick
+            # from drop_preview_cache fires request_preview('cur').
+            b._preview_cursor_id = 'cur'
+            b.request_preview('cur')
+            b.run_until_idle()
+            self.assertEqual(get_preview_text(b, 'cur'), 'A\nB\nC\n')
+            self.assertEqual(call_count['n'], 1)
+
+            # Simulate the `m`-toggle flow: drop all caches and kick
+            # the cursor. The framework's drop_preview_cache(None) op
+            # produces a ``('cursor', None)`` preview-kick handled by
+            # update_data._apply, which fires request_preview(cur).
+            b.drop_preview_cache()
+            self.assertTrue(
+                _drain_until(
+                    b,
+                    lambda: get_preview_text(b, 'cur') == 'A\nB\nC\n',
+                    timeout=2.0,
+                ),
+                f"preview did not refill after drop_preview_cache; "
+                f"got {get_preview_text(b, 'cur')!r}, "
+                f"call_count={call_count['n']}, "
+                f"_preview_req={b._preview_req!r}",
+            )
+            self.assertGreaterEqual(call_count['n'], 2)
+        finally:
+            b.stop_workers()
+
+    def test_drop_cache_for_id_then_request_refills_generator_preview(self):
+        # Same scenario but targeting a single id via
+        # drop_preview_cache(id) — the `cursor_if` kick path.
+        call_count = {'n': 0}
+
+        def get_preview(_id):
+            call_count['n'] += 1
+            yield 'one\n'
+            yield 'two\n'
+
+        b = make_browser(
+            get_children=lambda _, *, reload=False: [Item(id='cur')],
+            get_preview=get_preview,
+            root_id='/',
+        )
+        try:
+            b.refresh('/')
+            b.run_until_idle()
+            b._preview_cursor_id = 'cur'
+            b.request_preview('cur')
+            b.run_until_idle()
+            self.assertEqual(get_preview_text(b, 'cur'), 'one\ntwo\n')
+
+            b.drop_preview_cache('cur')
+            self.assertTrue(
+                _drain_until(
+                    b,
+                    lambda: get_preview_text(b, 'cur') == 'one\ntwo\n',
+                    timeout=2.0,
+                ),
+                f"single-id drop did not refill; got "
+                f"{get_preview_text(b, 'cur')!r}, "
+                f"call_count={call_count['n']}, "
+                f"_preview_req={b._preview_req!r}",
+            )
+            self.assertGreaterEqual(call_count['n'], 2)
+        finally:
+            b.stop_workers()
+
+    def test_drop_cache_during_paused_stream_refetches_from_start(self):
+        # Reproduces the user-reported regression: generator is paused
+        # mid-stream (large umbrella, cap reached), user presses `m`
+        # (drop_preview_cache(None) + kick cursor) — the worker is
+        # holding a paused generator pointing at the cursor's id, so
+        # the cursor-kick request_preview(same_id) is silently absorbed
+        # by the in-flight generator. The cache stays null because the
+        # paused generator would resume from where it was (not restart),
+        # not refill from scratch.
+        #
+        # Correct behavior: a kick that lands when the cache for that
+        # id is null AND the worker is paused on that id should
+        # abandon the paused generator and start a fresh fetch from
+        # the beginning.
+        call_count = {'n': 0}
+
+        def get_preview(_id):
+            call_count['n'] += 1
+            yield 'header\n'
+            yield 'x' * 200    # forces a pause if cap is small
+            yield 'tail\n'
+
+        b = make_browser(
+            get_children=lambda _, *, reload=False: [Item(id='cur')],
+            get_preview=get_preview,
+            root_id='/',
+            preview_buffer_cap_chars=100,   # small cap → pause after 2 yields
+        )
+        try:
+            b.refresh('/')
+            b.run_until_idle()
+            b._preview_cursor_id = 'cur'
+            b.request_preview('cur')
+            # Wait until paused — generator has yielded 'header\n' and
+            # ~200 x's, hit the cap, is parked at _preview_paused.
+            self.assertTrue(
+                _drain_until(b, lambda: b._preview_paused is not None),
+                'worker did not pause on first stream',
+            )
+            self.assertEqual(call_count['n'], 1)
+            buffered = get_preview_text(b, 'cur') or ''
+            self.assertTrue(buffered.startswith('header\n'))
+
+            # User presses `m`: drop all caches + cursor-kick. Expect a
+            # fresh generator to run from the start and the cache to
+            # repopulate with the full content (header + x's + tail).
+            b.drop_preview_cache()
+            # The fresh generator will also pause at the cap with
+            # 'header\n' + 200 x's = ~207 chars; the renderer's
+            # demand-signal isn't wired in this test harness, so
+            # force-drain by clearing the at-tail pin or via the
+            # framework. For coverage of "fresh start", asserting the
+            # cache starts with 'header' and call_count is 2 is enough
+            # — the resume-to-tail path is exercised by
+            # TestDrainWhenPinned.
+            self.assertTrue(
+                _drain_until(
+                    b,
+                    lambda: (call_count['n'] >= 2
+                             and (get_preview_text(b, 'cur') or '').startswith(
+                                 'header\n')),
+                    timeout=3.0,
+                ),
+                f"fresh generator did not run from start after "
+                f"drop_preview_cache; "
+                f"got {get_preview_text(b, 'cur')!r}, "
+                f"call_count={call_count['n']}, "
+                f"_preview_paused={b._preview_paused!r}",
+            )
+        finally:
+            b.stop_workers()
+
+    def test_invalidate_preview_refills_generator_preview(self):
+        # Direct invalidate_preview(id) — the `('id', id)` kick path.
+        call_count = {'n': 0}
+
+        def get_preview(_id):
+            call_count['n'] += 1
+            yield 'live\n'
+
+        b = make_browser(
+            get_children=lambda _, *, reload=False: [Item(id='cur')],
+            get_preview=get_preview,
+            root_id='/',
+        )
+        try:
+            b.refresh('/')
+            b.run_until_idle()
+            b.request_preview('cur')
+            b.run_until_idle()
+            self.assertEqual(get_preview_text(b, 'cur'), 'live\n')
+
+            b.invalidate_preview('cur')
+            self.assertTrue(
+                _drain_until(
+                    b,
+                    lambda: (get_preview_text(b, 'cur') == 'live\n'
+                             and call_count['n'] >= 2),
+                    timeout=2.0,
+                ),
+                f"invalidate_preview did not refill; got "
+                f"{get_preview_text(b, 'cur')!r}, "
+                f"call_count={call_count['n']}",
+            )
+        finally:
+            b.stop_workers()
+
+
 if __name__ == '__main__':
     unittest.main()
