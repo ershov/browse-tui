@@ -38,6 +38,11 @@ remove = _state.remove
 clear_children = _state.clear_children
 complete = _state.complete
 incomplete = _state.incomplete
+set_preview_op = _state.set_preview_op
+append_preview_op = _state.append_preview_op
+clear_preview_op = _state.clear_preview_op
+invalidate_preview_op = _state.invalidate_preview_op
+drop_preview_cache_op = _state.drop_preview_cache_op
 
 
 class TestHelperConstructors(unittest.TestCase):
@@ -1397,6 +1402,403 @@ class TestHiddenFieldOnItem(unittest.TestCase):
         apply_ops(s, [upsert('a', '/', title='A', hidden=True)])
         apply_ops(s, [set_item('a', '/', title='A')])
         self.assertFalse(s._items_by_id['a'].hidden)
+
+
+# ---- preview-cache ops (#446) ----------------------------------------------
+
+
+class TestPreviewOpHelpers(unittest.TestCase):
+    """Preview-cache op constructors produce well-formed tagged tuples."""
+
+    def test_set_preview_op_shape(self):
+        self.assertEqual(
+            set_preview_op('a', 'hi'), ('set_preview', 'a', 'hi'),
+        )
+
+    def test_set_preview_op_passes_none_through(self):
+        # Constructor leaves None as-is; ``apply_ops`` coerces to ''.
+        self.assertEqual(
+            set_preview_op('a', None), ('set_preview', 'a', None),
+        )
+
+    def test_append_preview_op_shape(self):
+        self.assertEqual(
+            append_preview_op('a', 'chunk'),
+            ('append_preview', 'a', 'chunk'),
+        )
+
+    def test_clear_preview_op_shape(self):
+        self.assertEqual(clear_preview_op('a'), ('clear_preview', 'a'))
+
+    def test_invalidate_preview_op_shape(self):
+        self.assertEqual(
+            invalidate_preview_op('a'), ('invalidate_preview', 'a'),
+        )
+
+    def test_drop_preview_cache_op_single_id(self):
+        self.assertEqual(
+            drop_preview_cache_op('a'), ('drop_preview_cache', 'a'),
+        )
+
+    def test_drop_preview_cache_op_default_none(self):
+        # Default arg means "drop all".
+        self.assertEqual(
+            drop_preview_cache_op(), ('drop_preview_cache', None),
+        )
+
+
+class TestApplySetPreviewOp(unittest.TestCase):
+    """``set_preview_op`` writes ``Item.preview`` and drops the wrap cache."""
+
+    def _seed(self):
+        s = State(root_id='/')
+        apply_ops(s, [upsert('a', '/', title='A')])
+        item = s._items_by_id['a']
+        item.preview_render = 'cached render sentinel'
+        return s, item
+
+    def test_writes_text(self):
+        s, item = self._seed()
+        apply_ops(s, [set_preview_op('a', 'hello')])
+        self.assertEqual(item.preview, 'hello')
+
+    def test_drops_preview_render(self):
+        s, item = self._seed()
+        apply_ops(s, [set_preview_op('a', 'hello')])
+        self.assertIsNone(item.preview_render)
+
+    def test_none_coerces_to_empty_string(self):
+        # Matches Browser.set_preview's contract.
+        s, item = self._seed()
+        apply_ops(s, [set_preview_op('a', None)])
+        self.assertEqual(item.preview, '')
+
+    def test_unknown_id_is_silent_noop(self):
+        s = State(root_id='/')
+        apply_ops(s, [set_preview_op('ghost', 'x')])
+        self.assertNotIn('ghost', s._items_by_id)
+
+    def test_sets_preview_dirty_flag(self):
+        s, _ = self._seed()
+        s._preview_dirty = False
+        apply_ops(s, [set_preview_op('a', 'hello')])
+        self.assertTrue(s._preview_dirty)
+
+    def test_does_not_kick(self):
+        # set_preview never schedules a worker kick.
+        s, _ = self._seed()
+        apply_ops(s, [set_preview_op('a', 'hello')])
+        self.assertEqual(s._preview_kicks, [])
+
+    def test_does_not_mark_visible_dirty(self):
+        s, _ = self._seed()
+        s._visible_dirty = False
+        apply_ops(s, [set_preview_op('a', 'hello')])
+        self.assertFalse(s._visible_dirty)
+
+
+class TestApplyAppendPreviewOp(unittest.TestCase):
+    """``append_preview_op`` does an rmw on ``Item.preview``."""
+
+    def _seed(self, initial=None):
+        s = State(root_id='/')
+        apply_ops(s, [upsert('a', '/', title='A')])
+        item = s._items_by_id['a']
+        item.preview = initial
+        return s, item
+
+    def test_appends_to_none(self):
+        s, item = self._seed(initial=None)
+        apply_ops(s, [append_preview_op('a', 'hello')])
+        self.assertEqual(item.preview, 'hello')
+
+    def test_appends_to_empty(self):
+        s, item = self._seed(initial='')
+        apply_ops(s, [append_preview_op('a', 'hello')])
+        self.assertEqual(item.preview, 'hello')
+
+    def test_appends_to_existing(self):
+        s, item = self._seed(initial='foo')
+        apply_ops(s, [append_preview_op('a', 'bar')])
+        self.assertEqual(item.preview, 'foobar')
+
+    def test_multiple_appends_in_batch(self):
+        # FIFO within a batch — appends concatenate in order.
+        s, item = self._seed(initial='')
+        apply_ops(s, [
+            append_preview_op('a', 'a'),
+            append_preview_op('a', 'b'),
+            append_preview_op('a', 'c'),
+        ])
+        self.assertEqual(item.preview, 'abc')
+
+    def test_none_chunk_coerces_to_empty(self):
+        s, item = self._seed(initial='foo')
+        apply_ops(s, [append_preview_op('a', None)])
+        self.assertEqual(item.preview, 'foo')
+
+    def test_unknown_id_is_silent_noop(self):
+        s = State(root_id='/')
+        apply_ops(s, [append_preview_op('ghost', 'x')])
+        self.assertNotIn('ghost', s._items_by_id)
+
+    def test_sets_preview_dirty_flag(self):
+        s, _ = self._seed()
+        s._preview_dirty = False
+        apply_ops(s, [append_preview_op('a', 'x')])
+        self.assertTrue(s._preview_dirty)
+
+    def test_passes_through_with_no_cached_render(self):
+        # ``_extend_or_drop_preview_render`` is a no-op when
+        # ``preview_render`` is already None (the next paint regenerates
+        # fresh). Verify the append doesn't accidentally set it to
+        # something non-None.
+        s, item = self._seed(initial='foo')
+        self.assertIsNone(item.preview_render)
+        apply_ops(s, [append_preview_op('a', 'bar')])
+        self.assertIsNone(item.preview_render)
+
+
+class TestApplyClearPreviewOp(unittest.TestCase):
+    """``clear_preview_op`` drops the raw text and wrap cache."""
+
+    def _seed(self):
+        s = State(root_id='/')
+        apply_ops(s, [upsert('a', '/', title='A')])
+        item = s._items_by_id['a']
+        item.preview = 'cached'
+        item.preview_render = 'cached render'
+        return s, item
+
+    def test_clears_preview(self):
+        s, item = self._seed()
+        apply_ops(s, [clear_preview_op('a')])
+        self.assertIsNone(item.preview)
+
+    def test_clears_preview_render(self):
+        s, item = self._seed()
+        apply_ops(s, [clear_preview_op('a')])
+        self.assertIsNone(item.preview_render)
+
+    def test_unknown_id_is_silent_noop(self):
+        s = State(root_id='/')
+        apply_ops(s, [clear_preview_op('ghost')])
+        self.assertNotIn('ghost', s._items_by_id)
+
+    def test_sets_preview_dirty_flag(self):
+        s, _ = self._seed()
+        s._preview_dirty = False
+        apply_ops(s, [clear_preview_op('a')])
+        self.assertTrue(s._preview_dirty)
+
+    def test_does_not_kick(self):
+        s, _ = self._seed()
+        apply_ops(s, [clear_preview_op('a')])
+        self.assertEqual(s._preview_kicks, [])
+
+
+class TestApplyInvalidatePreviewOp(unittest.TestCase):
+    """``invalidate_preview_op`` drops the cache and schedules a worker kick."""
+
+    def _seed(self):
+        s = State(root_id='/')
+        apply_ops(s, [upsert('a', '/', title='A')])
+        item = s._items_by_id['a']
+        item.preview = 'cached'
+        item.preview_render = 'cached render'
+        return s, item
+
+    def test_clears_cache(self):
+        s, item = self._seed()
+        apply_ops(s, [invalidate_preview_op('a')])
+        self.assertIsNone(item.preview)
+        self.assertIsNone(item.preview_render)
+
+    def test_schedules_kick_for_id(self):
+        s, _ = self._seed()
+        apply_ops(s, [invalidate_preview_op('a')])
+        self.assertEqual(s._preview_kicks, [('id', 'a')])
+
+    def test_kick_fires_even_when_id_unknown(self):
+        # invalidate_preview always kicks the worker — the cache-drop
+        # is a no-op for unknown ids but the request fires anyway
+        # (mirrors Browser.invalidate_preview's docstring).
+        s = State(root_id='/')
+        apply_ops(s, [invalidate_preview_op('ghost')])
+        self.assertEqual(s._preview_kicks, [('id', 'ghost')])
+
+    def test_sets_preview_dirty_flag(self):
+        s, _ = self._seed()
+        s._preview_dirty = False
+        apply_ops(s, [invalidate_preview_op('a')])
+        self.assertTrue(s._preview_dirty)
+
+
+class TestApplyDropPreviewCacheOp(unittest.TestCase):
+    """``drop_preview_cache_op`` drops one or all entries with a cursor kick."""
+
+    def _seed_two(self):
+        s = State(root_id='/')
+        apply_ops(s, [
+            upsert('a', '/', title='A'),
+            upsert('b', '/', title='B'),
+        ])
+        a = s._items_by_id['a']
+        b = s._items_by_id['b']
+        a.preview = 'A-text'
+        a.preview_render = 'A-render'
+        b.preview = 'B-text'
+        b.preview_render = 'B-render'
+        return s, a, b
+
+    def test_drop_single_id_clears_only_that_one(self):
+        s, a, b = self._seed_two()
+        apply_ops(s, [drop_preview_cache_op('a')])
+        self.assertIsNone(a.preview)
+        self.assertEqual(b.preview, 'B-text')
+
+    def test_drop_none_clears_all(self):
+        s, a, b = self._seed_two()
+        apply_ops(s, [drop_preview_cache_op()])
+        self.assertIsNone(a.preview)
+        self.assertIsNone(b.preview)
+        self.assertIsNone(a.preview_render)
+        self.assertIsNone(b.preview_render)
+
+    def test_drop_unknown_id_is_silent_noop(self):
+        s, a, _ = self._seed_two()
+        apply_ops(s, [drop_preview_cache_op('ghost')])
+        # a/b untouched.
+        self.assertEqual(a.preview, 'A-text')
+
+    def test_kick_intent_for_single_id(self):
+        # Recorded as ``cursor_if`` — Browser kicks only when the
+        # dropped id matches the current preview cursor.
+        s, _, _ = self._seed_two()
+        apply_ops(s, [drop_preview_cache_op('a')])
+        self.assertEqual(s._preview_kicks, [('cursor_if', 'a')])
+
+    def test_kick_intent_for_drop_all(self):
+        # Recorded as ``cursor`` — Browser kicks the cursor id (if any).
+        s, _, _ = self._seed_two()
+        apply_ops(s, [drop_preview_cache_op()])
+        self.assertEqual(s._preview_kicks, [('cursor', None)])
+
+    def test_kick_intent_for_unknown_single_id(self):
+        # Unknown id still records the intent — the
+        # cursor-match guard in Browser will filter it out.
+        s, _, _ = self._seed_two()
+        apply_ops(s, [drop_preview_cache_op('ghost')])
+        self.assertEqual(s._preview_kicks, [('cursor_if', 'ghost')])
+
+    def test_sets_preview_dirty_flag(self):
+        s, _, _ = self._seed_two()
+        s._preview_dirty = False
+        apply_ops(s, [drop_preview_cache_op('a')])
+        self.assertTrue(s._preview_dirty)
+
+
+class TestPreviewOpsSideEffectReset(unittest.TestCase):
+    """Each ``apply_ops`` call resets ``_preview_dirty`` / ``_preview_kicks``."""
+
+    def test_resets_dirty_when_no_preview_ops(self):
+        s = State(root_id='/')
+        apply_ops(s, [upsert('a', '/', title='A')])
+        # No preview op in this batch — dirty stays False.
+        self.assertFalse(s._preview_dirty)
+
+    def test_resets_kicks_when_no_preview_ops(self):
+        s = State(root_id='/')
+        apply_ops(s, [upsert('a', '/', title='A')])
+        self.assertEqual(s._preview_kicks, [])
+
+    def test_subsequent_batch_resets_dirty(self):
+        # Batch 1 sets dirty; Batch 2 (no preview ops) clears it.
+        s = State(root_id='/')
+        apply_ops(s, [
+            upsert('a', '/', title='A'),
+            set_preview_op('a', 'x'),
+        ])
+        self.assertTrue(s._preview_dirty)
+        apply_ops(s, [upsert('a', '/', title='A2')])
+        self.assertFalse(s._preview_dirty)
+
+    def test_subsequent_batch_resets_kicks(self):
+        s = State(root_id='/')
+        apply_ops(s, [
+            upsert('a', '/', title='A'),
+            invalidate_preview_op('a'),
+        ])
+        self.assertEqual(s._preview_kicks, [('id', 'a')])
+        apply_ops(s, [upsert('a', '/', title='A2')])
+        self.assertEqual(s._preview_kicks, [])
+
+    def test_multiple_kicks_accumulate_in_order(self):
+        s = State(root_id='/')
+        apply_ops(s, [
+            upsert('a', '/', title='A'),
+            upsert('b', '/', title='B'),
+            invalidate_preview_op('a'),
+            invalidate_preview_op('b'),
+            drop_preview_cache_op(),
+        ])
+        self.assertEqual(s._preview_kicks, [
+            ('id', 'a'),
+            ('id', 'b'),
+            ('cursor', None),
+        ])
+
+
+class TestMixedBatchUpsertAndSetPreview(unittest.TestCase):
+    """A single batch can carry tree ops and preview ops; both visible after drain."""
+
+    def test_upsert_then_set_preview_in_one_batch(self):
+        # The registering upsert lands before the set_preview op within
+        # the same batch — the umbrella composer relies on this
+        # ordering to register leaves before writing their previews.
+        s = State(root_id='/')
+        apply_ops(s, [
+            upsert('a', '/', title='A'),
+            set_preview_op('a', 'hello'),
+        ])
+        self.assertEqual(s._items_by_id['a'].preview, 'hello')
+
+    def test_set_preview_before_upsert_is_silent_noop(self):
+        # Set_preview targeting a not-yet-registered id is dropped.
+        s = State(root_id='/')
+        apply_ops(s, [
+            set_preview_op('a', 'hello'),
+            upsert('a', '/', title='A'),
+        ])
+        # The set_preview op silently no-op'd; the upsert created
+        # the Item with default preview=None.
+        self.assertIsNone(s._items_by_id['a'].preview)
+
+    def test_many_leaves_with_previews_in_one_batch(self):
+        # The umbrella composer's hot path: a batch of upserts
+        # followed by per-leaf set_preview_op entries.
+        s = State(root_id='/')
+        batch = []
+        for i in range(50):
+            batch.append(upsert(f'leaf{i}', '/', title=f'L{i}'))
+        for i in range(50):
+            batch.append(set_preview_op(f'leaf{i}', f'preview{i}'))
+        apply_ops(s, batch)
+        for i in range(50):
+            self.assertEqual(
+                s._items_by_id[f'leaf{i}'].preview, f'preview{i}',
+            )
+
+    def test_dirty_flags_set_for_mixed_batch(self):
+        s = State(root_id='/')
+        s._visible_dirty = False
+        apply_ops(s, [
+            upsert('a', '/', title='A'),
+            set_preview_op('a', 'x'),
+        ])
+        # Tree op flips _visible_dirty; preview op flips _preview_dirty.
+        self.assertTrue(s._visible_dirty)
+        self.assertTrue(s._preview_dirty)
 
 
 if __name__ == '__main__':

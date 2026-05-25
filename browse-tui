@@ -1480,6 +1480,16 @@ class State:
     # check short-circuits when no filter is active. See
     # ``docs/superpowers/specs/2026-05-17-filter-design.md``.
     _filter_active: bool = False
+    # Side-effect signals populated by ``apply_ops`` when preview-cache
+    # ops run in a batch (#446). ``apply_ops`` is pure state mutation,
+    # but preview ops have Browser-level fallout: a preview-pane redraw
+    # signal and (for invalidate / cursor-affecting drops) a preview
+    # worker kick. We collect those signals on State so ``apply_ops``
+    # stays argument-pure; ``update_data._apply`` reads and translates
+    # them after the batch lands. Each call of ``apply_ops`` resets
+    # these slots before processing the batch.
+    _preview_dirty: bool = False
+    _preview_kicks: list = field(default_factory=list)
 
 
 # ---- scope management ----------------------------------------------------
@@ -1709,6 +1719,66 @@ def complete(parent_id):
 def incomplete(parent_id):
     """Construct an ``("incomplete", parent_id)`` op tuple."""
     return ('incomplete', parent_id)
+
+
+# Preview-cache op constructors (#446). These mirror the corresponding
+# ``Browser`` single-call methods but produce op tuples that can be
+# batched alongside tree-mutation ops in a single ``update_data`` call.
+# Helper names take an ``_op`` suffix to keep them from colliding with
+# the Browser method names when both are re-exported from ``browse_tui``.
+
+def set_preview_op(id, text):
+    """Construct a ``("set_preview", id, text)`` op tuple.
+
+    Effect on apply: ``item.preview = text or ''`` and the wrap-cache
+    ``item.preview_render`` is dropped. No-op if ``id`` is not in
+    ``state._items_by_id`` (registration prerequisite — same as
+    :meth:`Browser.set_preview`).
+    """
+    return ('set_preview', id, text)
+
+
+def append_preview_op(id, chunk):
+    """Construct a ``("append_preview", id, chunk)`` op tuple.
+
+    Effect on apply: read-modify-write on ``item.preview`` (None ->
+    ``''`` -> append). The wrap-cache is extended in place via the
+    recorded tail offsets when the cached geometry matches, otherwise
+    dropped. No-op if ``id`` is unknown.
+    """
+    return ('append_preview', id, chunk)
+
+
+def clear_preview_op(id):
+    """Construct a ``("clear_preview", id)`` op tuple.
+
+    Effect on apply: ``item.preview = None`` and the wrap-cache is
+    dropped. No-op if ``id`` is unknown.
+    """
+    return ('clear_preview', id)
+
+
+def invalidate_preview_op(id):
+    """Construct an ``("invalidate_preview", id)`` op tuple.
+
+    Effect on apply: ``item.preview = None`` and the wrap-cache is
+    dropped (when ``id`` is known), then a worker re-fetch is kicked
+    via ``request_preview(id)`` regardless of whether the id was
+    known — mirrors :meth:`Browser.invalidate_preview`.
+    """
+    return ('invalidate_preview', id)
+
+
+def drop_preview_cache_op(id=None):
+    """Construct a ``("drop_preview_cache", id_or_none)`` op tuple.
+
+    Effect on apply: drop ``item.preview`` and the wrap-cache for the
+    named ``id`` (one item) or for every loaded Item (``id=None``).
+    When the dropped id matches the preview-cursor (or all are dropped),
+    a worker kick is staged for the cursor id — mirrors
+    :meth:`Browser.drop_preview_cache`.
+    """
+    return ('drop_preview_cache', id)
 
 
 def _item_field_names():
@@ -2262,7 +2332,71 @@ def _apply_clear_children(state: State, parent_id) -> bool:
     return had_entry or bool(children)
 
 
-def apply_ops(state: State, ops) -> None:
+def _apply_set_preview(state: State, id_, text) -> None:
+    """Apply one ``set_preview`` op — body of :meth:`Browser.set_preview`.
+
+    Coerces ``text=None`` to ``''``; writes ``item.preview`` and drops
+    the wrap cache. No-op when the id is not registered.
+    """
+    item = state._items_by_id.get(id_)
+    if item is None:
+        return
+    item.preview = text if text is not None else ''
+    item.preview_render = None
+
+
+def _apply_append_preview(state: State, id_, chunk, preview_ansi) -> None:
+    """Apply one ``append_preview`` op — body of :meth:`Browser.append_preview`.
+
+    Read-modify-write on ``item.preview``; tries to extend the wrap
+    cache in place via ``_extend_or_drop_preview_render``. No-op when
+    the id is not registered. ``chunk=None`` coerces to ``''``.
+    """
+    item = state._items_by_id.get(id_)
+    if item is None:
+        return
+    if chunk is None:
+        chunk = ''
+    cur = item.preview if item.preview is not None else ''
+    item.preview = cur + chunk
+    _extend_or_drop_preview_render(item, chunk, preview_ansi)
+
+
+def _apply_clear_preview(state: State, id_) -> None:
+    """Apply one ``clear_preview`` op — body of :meth:`Browser.clear_preview`.
+
+    Drops the raw preview text and the wrap cache. No-op when the id
+    is not registered.
+    """
+    item = state._items_by_id.get(id_)
+    if item is None:
+        return
+    item.preview = None
+    item.preview_render = None
+
+
+def _apply_drop_preview_cache(state: State, id_) -> None:
+    """Apply one ``drop_preview_cache`` op — body of :meth:`Browser.drop_preview_cache`.
+
+    When ``id_`` is None, drops cache on every loaded Item; otherwise
+    drops the named one (silent no-op when unknown). The post-batch
+    "kick the cursor if its preview was dropped" decision lives on
+    Browser — ``apply_ops`` records the intent on
+    ``state._preview_kicks`` and ``update_data._apply`` resolves it.
+    """
+    if id_ is None:
+        for item in state._items_by_id.values():
+            item.preview = None
+            item.preview_render = None
+        return
+    item = state._items_by_id.get(id_)
+    if item is None:
+        return
+    item.preview = None
+    item.preview_render = None
+
+
+def apply_ops(state: State, ops, *, preview_ansi: bool = True) -> None:
     """Apply a list of ``update_data`` ops to ``state`` in order.
 
     Pure state mutation — no threading, no rendering. Each op is a
@@ -2272,10 +2406,29 @@ def apply_ops(state: State, ops) -> None:
     ``_visible_dirty`` if any op affected the visible structure
     (anything that touched ``_children``).
 
+    Side-effect signals for preview ops (#446) are written to
+    ``state._preview_dirty`` (bool) and ``state._preview_kicks``
+    (list). Both slots are reset at the start of every call so the
+    caller can read the per-batch outcome without manual bookkeeping.
+    ``state._preview_kicks`` carries entries that ``update_data._apply``
+    translates into ``request_preview`` calls:
+      * ``('id', cid)``           — invalidate_preview kick (unconditional).
+      * ``('cursor', None)``      — drop_preview_cache with id=None.
+      * ``('cursor_if', cid)``    — drop_preview_cache for a specific id;
+                                    Browser kicks only when ``cid`` matches
+                                    the current preview cursor.
+
+    ``preview_ansi`` is forwarded to ``_extend_or_drop_preview_render``
+    for ``append_preview`` ops. The default matches
+    :attr:`BrowserConfig.preview_ansi` so standalone unit tests don't
+    need to thread the value through.
+
     Unknown ops raise ``ValueError`` — silent drops would mask recipe
     typos.
     """
     structural = False
+    preview_dirty = False
+    preview_kicks = []
     for op in ops:
         kind = op[0]
         if kind == 'upsert':
@@ -2308,10 +2461,42 @@ def apply_ops(state: State, ops) -> None:
         elif kind == 'incomplete':
             _, parent_id = op
             state._loading[parent_id] = True
+        elif kind == 'set_preview':
+            _, id_, text = op
+            _apply_set_preview(state, id_, text)
+            preview_dirty = True
+        elif kind == 'append_preview':
+            _, id_, chunk = op
+            _apply_append_preview(state, id_, chunk, preview_ansi)
+            preview_dirty = True
+        elif kind == 'clear_preview':
+            _, id_ = op
+            _apply_clear_preview(state, id_)
+            preview_dirty = True
+        elif kind == 'invalidate_preview':
+            _, id_ = op
+            _apply_clear_preview(state, id_)
+            # Worker kick fires regardless of whether the id was
+            # registered — mirrors :meth:`Browser.invalidate_preview`.
+            preview_kicks.append(('id', id_))
+            preview_dirty = True
+        elif kind == 'drop_preview_cache':
+            _, id_ = op
+            _apply_drop_preview_cache(state, id_)
+            # Cursor-kick decision belongs to Browser (it owns
+            # ``_preview_cursor_id``). Record the intent for the caller
+            # to resolve.
+            if id_ is None:
+                preview_kicks.append(('cursor', None))
+            else:
+                preview_kicks.append(('cursor_if', id_))
+            preview_dirty = True
         else:
             raise ValueError(f'apply_ops: unknown op kind {kind!r}')
     if structural:
         state._visible_dirty = True
+    state._preview_dirty = preview_dirty
+    state._preview_kicks = preview_kicks
 
 
 # ---- helpers for the children-worker → update_data delivery (#271) -------
@@ -3977,7 +4162,31 @@ class Browser:
             pre_vis_ids = [entry.item.id for entry in pre_vis]
             pre_cursor = self._state.cursor
 
-            apply_ops(self._state, ops_list)
+            apply_ops(
+                self._state, ops_list, preview_ansi=self.preview_ansi,
+            )
+
+            # Preview-op side effects (#446). ``apply_ops`` left the
+            # outcome on ``state._preview_dirty`` / ``state._preview_kicks``;
+            # translate to a redraw flag + ``request_preview`` calls
+            # while ``self`` is still in scope.
+            if self._state._preview_dirty:
+                self._needs_redraw.add('preview')
+            for kick in self._state._preview_kicks:
+                kind = kick[0]
+                if kind == 'id':
+                    self.request_preview(kick[1])
+                elif kind == 'cursor':
+                    # drop_preview_cache(None) — kick the cursor id (if any).
+                    cur = self._preview_cursor_id
+                    if cur is not None:
+                        self.request_preview(cur)
+                elif kind == 'cursor_if':
+                    # drop_preview_cache(id) — kick only when the
+                    # dropped id is the current preview cursor.
+                    cur = self._preview_cursor_id
+                    if cur is not None and kick[1] == cur:
+                        self.request_preview(cur)
 
             # Re-evaluate filter visibility before computing the new
             # visible list. New items may match or un-match active
@@ -4073,17 +4282,11 @@ class Browser:
         via upsert puts it in the parent's children list, so you must
         eventually push the full sibling set under that parent.
         """
-        if text is None:
-            text = ''
-        def _apply():
-            item = self._state._items_by_id.get(id_)
-            if item is not None:
-                item.preview = text
-                # Wrap cache (#422) — drop the stale render so the next
-                # paint regenerates against the new text.
-                item.preview_render = None
-            self._needs_redraw.add('preview')
-        self.post(_apply)
+        # Thin wrapper around ``update_data`` so single-call writes
+        # share the batch-lane semantics (#446). Recipes composing a
+        # large preview (e.g. ``_preview_umbrella``) can fold many
+        # ``set_preview_op`` entries into one batch.
+        self.update_data([set_preview_op(id_, text)])
 
     def append_preview(self, id_, chunk) -> None:
         """(thread-safe) Append ``chunk`` to the cached preview for ``id_``.
@@ -4115,24 +4318,10 @@ class Browser:
         not present in ``_items_by_id`` (no Item, nowhere to append).
         See :meth:`set_preview` for the idempotent-ensure pattern.
         """
-        if chunk is None:
-            chunk = ''
-        def _apply():
-            item = self._state._items_by_id.get(id_)
-            if item is not None:
-                cur = item.preview if item.preview is not None else ''
-                item.preview = cur + chunk
-                # Wrap cache (#423) — try to extend the existing wrap in
-                # place using the recorded tail offsets so streaming
-                # appends don't pay an O(N) re-wrap on every chunk. Falls
-                # back to dropping the cache (next paint regens) when the
-                # cache is absent, when chunk is empty, or when the
-                # cached geometry / ANSI policy does not match the
-                # current Browser state (defensive — eager invalidation
-                # should normally prevent the mismatch).
-                _extend_or_drop_preview_render(item, chunk, self.preview_ansi)
-            self._needs_redraw.add('preview')
-        self.post(_apply)
+        # Delegates to ``update_data`` (#446) so streaming appends and
+        # tree mutations can share a single batch when the caller folds
+        # them together.
+        self.update_data([append_preview_op(id_, chunk)])
 
     def clear_preview(self, id_) -> None:
         """(thread-safe) Drop cached preview text for ``id_``.
@@ -4147,13 +4336,9 @@ class Browser:
         not present in ``_items_by_id``. See :meth:`set_preview` for
         the idempotent-ensure pattern.
         """
-        def _apply():
-            item = self._state._items_by_id.get(id_)
-            if item is not None:
-                item.preview = None
-                item.preview_render = None
-            self._needs_redraw.add('preview')
-        self.post(_apply)
+        # Delegates to ``update_data`` (#446); a clear merged with tree
+        # ops into one batch is a single post-queue wake.
+        self.update_data([clear_preview_op(id_)])
 
     def invalidate_preview(self, id_) -> None:
         """(thread-safe) Drop cached preview for ``id_`` and re-fetch.
@@ -4188,14 +4373,10 @@ class Browser:
         delivery. See :meth:`set_preview` for the idempotent-ensure
         pattern.
         """
-        def _apply():
-            item = self._state._items_by_id.get(id_)
-            if item is not None:
-                item.preview = None
-                item.preview_render = None
-            self.request_preview(id_)
-            self._needs_redraw.add('preview')
-        self.post(_apply)
+        # Delegates to ``update_data`` (#446). The worker kick is
+        # plumbed through ``state._preview_kicks`` and resolved in
+        # ``update_data._apply``.
+        self.update_data([invalidate_preview_op(id_)])
 
     # ---- preview-cache introspection -------------------------------------
 
@@ -4232,21 +4413,11 @@ class Browser:
         View state (``_preview_scroll``, ``_preview_at_tail``) is
         preserved so a user pinned to the tail keeps following.
         """
-        def _apply():
-            if id_ is None:
-                for it in self._state._items_by_id.values():
-                    it.preview = None
-                    it.preview_render = None
-            else:
-                item = self._state._items_by_id.get(id_)
-                if item is not None:
-                    item.preview = None
-                    item.preview_render = None
-            cur = self._preview_cursor_id
-            if cur is not None and (id_ is None or id_ == cur):
-                self.request_preview(cur)
-            self._needs_redraw.add('preview')
-        self.post(_apply)
+        # Delegates to ``update_data`` (#446). The cursor-kick decision
+        # is plumbed through ``state._preview_kicks`` and resolved in
+        # ``update_data._apply``, which still has access to
+        # ``self._preview_cursor_id``.
+        self.update_data([drop_preview_cache_op(id_)])
 
     @property
     def preview_item_id(self):

@@ -22,6 +22,12 @@ Item = _data.Item
 Browser = _state.Browser
 BrowserConfig = _state.BrowserConfig
 Context = _context.Context
+upsert = _state.upsert
+set_preview_op = _state.set_preview_op
+append_preview_op = _state.append_preview_op
+clear_preview_op = _state.clear_preview_op
+invalidate_preview_op = _state.invalidate_preview_op
+drop_preview_cache_op = _state.drop_preview_cache_op
 
 
 def _drain(b):
@@ -163,6 +169,137 @@ class TestContextPassthroughs(unittest.TestCase):
         b._preview_cursor_id = 'foo'
         ctx = Context(b)
         self.assertEqual(ctx.preview_item_id, 'foo')
+
+
+class TestBatchedPreviewOpsKickWorker(unittest.TestCase):
+    """``update_data`` batches with preview ops translate to ``request_preview`` calls (#446)."""
+
+    def test_invalidate_preview_op_kicks_via_update_data(self):
+        b = Browser(BrowserConfig(_headless=True))
+        _seed(b, 'x', 'old')
+        kicked = []
+        b.request_preview = lambda id_: kicked.append(id_)
+
+        b.update_data([invalidate_preview_op('x')])
+        _drain(b)
+        self.assertEqual(kicked, ['x'])
+
+    def test_invalidate_preview_op_kicks_unknown_id(self):
+        # Matches Browser.invalidate_preview contract — kick fires even
+        # when the id is unregistered.
+        b = Browser(BrowserConfig(_headless=True))
+        kicked = []
+        b.request_preview = lambda id_: kicked.append(id_)
+
+        b.update_data([invalidate_preview_op('ghost')])
+        _drain(b)
+        self.assertEqual(kicked, ['ghost'])
+
+    def test_drop_preview_cache_op_kicks_when_cursor_matches(self):
+        b = Browser(BrowserConfig(_headless=True))
+        b._preview_cursor_id = 'cur'
+        _seed(b, 'cur', 'stale')
+        kicked = []
+        b.request_preview = lambda id_: kicked.append(id_)
+
+        b.update_data([drop_preview_cache_op('cur')])
+        _drain(b)
+        self.assertEqual(kicked, ['cur'])
+
+    def test_drop_preview_cache_op_no_kick_when_cursor_differs(self):
+        b = Browser(BrowserConfig(_headless=True))
+        b._preview_cursor_id = 'cur'
+        _seed(b, 'other', 'stale')
+        kicked = []
+        b.request_preview = lambda id_: kicked.append(id_)
+
+        b.update_data([drop_preview_cache_op('other')])
+        _drain(b)
+        self.assertEqual(kicked, [])
+
+    def test_drop_preview_cache_op_all_kicks_cursor(self):
+        b = Browser(BrowserConfig(_headless=True))
+        b._preview_cursor_id = 'cur'
+        _seed(b, 'cur', 'A')
+        _seed(b, 'other', 'B')
+        kicked = []
+        b.request_preview = lambda id_: kicked.append(id_)
+
+        b.update_data([drop_preview_cache_op()])
+        _drain(b)
+        self.assertEqual(kicked, ['cur'])
+
+    def test_multiple_kicks_in_one_batch(self):
+        # Two invalidate ops in one batch produce two request_preview
+        # calls. request_preview is latest-wins so the observable
+        # ``_preview_req`` ends up as the last id, but each call still
+        # runs.
+        b = Browser(BrowserConfig(_headless=True))
+        _seed(b, 'a', 'A')
+        _seed(b, 'b', 'B')
+        kicked = []
+        b.request_preview = lambda id_: kicked.append(id_)
+
+        b.update_data([
+            invalidate_preview_op('a'),
+            invalidate_preview_op('b'),
+        ])
+        _drain(b)
+        self.assertEqual(kicked, ['a', 'b'])
+
+
+class TestBatchedPreviewOpsWriteThrough(unittest.TestCase):
+    """Mixed batches: tree + preview ops land in one ``update_data`` call (#446)."""
+
+    def test_upsert_and_set_preview_in_one_batch(self):
+        # The umbrella composer's hot-path: register an Item and write
+        # its preview in the same batch. The within-batch FIFO ordering
+        # makes the registration visible to the set_preview op.
+        b = Browser(BrowserConfig(_headless=True))
+        b.update_data([
+            upsert('a', None, title='A'),
+            set_preview_op('a', 'hello'),
+        ])
+        _drain(b)
+        item = b._state._items_by_id['a']
+        self.assertEqual(item.preview, 'hello')
+
+    def test_one_post_for_mixed_batch(self):
+        # Whole batch is delivered through one post-queue closure —
+        # not one per op. Asserted via queue size.
+        b = Browser(BrowserConfig(_headless=True))
+        before = b._main_queue.qsize()
+        b.update_data([
+            upsert('a', None, title='A'),
+            set_preview_op('a', 'x'),
+            set_preview_op('a', 'y'),
+            set_preview_op('a', 'z'),
+        ])
+        # Single closure scheduled on the post queue.
+        self.assertEqual(b._main_queue.qsize(), before + 1)
+        _drain(b)
+        # Last write wins (FIFO).
+        self.assertEqual(b._state._items_by_id['a'].preview, 'z')
+
+    def test_preview_dirty_signal_marks_redraw(self):
+        b = Browser(BrowserConfig(_headless=True))
+        _seed(b, 'a', 'cached')
+        b._needs_redraw.clear()
+        b.update_data([set_preview_op('a', 'fresh')])
+        _drain(b)
+        self.assertIn('preview', b._needs_redraw)
+
+    def test_batch_without_preview_ops_does_not_flag_preview(self):
+        # Pure tree-op batch — preview-dirty flag stays False so
+        # _needs_redraw doesn't get 'preview' on its own from this path.
+        b = Browser(BrowserConfig(_headless=True))
+        b.update_data([upsert('a', None, title='A')])
+        # Reset and apply another tree-only batch to check no leak.
+        _drain(b)
+        b._needs_redraw.clear()
+        b.update_data([upsert('a', None, title='A2')])
+        _drain(b)
+        self.assertNotIn('preview', b._needs_redraw)
 
 
 if __name__ == '__main__':

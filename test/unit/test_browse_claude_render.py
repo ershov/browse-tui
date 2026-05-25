@@ -73,6 +73,13 @@ def _stub_browse_tui():
     # is fine — but the symbol must exist for the import to succeed.
     mod.scope_into = lambda state, item_id: None
 
+    # ``set_preview_op`` is the preview-batch op constructor (#446) —
+    # the umbrella composer folds leaf-preview writes into the same
+    # ``update_data`` batch as the eager-push upserts. Stub it as a
+    # tagged tuple so the recipe's ops list carries a recognisable
+    # shape for the _FakeBrowser to interpret.
+    mod.set_preview_op = lambda id_, text: ('set_preview', id_, text)
+
     sys.modules['browse_tui'] = mod
 
 
@@ -4739,21 +4746,30 @@ class _FakeBrowser:
         def _apply(ops_list=ops_list):
             for op in ops_list:
                 kind = op[0]
-                if kind != 'upsert':
-                    continue
-                id_ = op[1]
-                parent_id = op[2]
-                fields = op[3]
-                if id_ in self.items_by_id:
-                    item = self.items_by_id[id_]
-                    for k, v in fields.items():
-                        setattr(item, k, v)
-                else:
-                    item = _RecordingItem(id_, **fields)
-                    self.items_by_id[id_] = item
-                kids = self._children_cache.setdefault(parent_id, [])
-                if item not in kids:
-                    kids.append(item)
+                if kind == 'upsert':
+                    id_ = op[1]
+                    parent_id = op[2]
+                    fields = op[3]
+                    if id_ in self.items_by_id:
+                        item = self.items_by_id[id_]
+                        for k, v in fields.items():
+                            setattr(item, k, v)
+                    else:
+                        item = _RecordingItem(id_, **fields)
+                        self.items_by_id[id_] = item
+                    kids = self._children_cache.setdefault(parent_id, [])
+                    if item not in kids:
+                        kids.append(item)
+                elif kind == 'set_preview':
+                    # Mirror Browser.set_preview semantics: writes into
+                    # ``Item.preview`` if the id is registered, otherwise
+                    # silently no-op. Coerces None to ''.
+                    _, id_, text = op
+                    item = self.items_by_id.get(id_)
+                    if item is None:
+                        continue
+                    item.preview = text if text is not None else ''
+                    item.preview_render = None
         self.posted.append(_apply)
 
     def post(self, fn):

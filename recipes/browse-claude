@@ -45,7 +45,8 @@ import sys
 import threading
 
 from browse_tui import (
-    Action, Browser, BrowserConfig, Item, mod, scope_into, upsert,
+    Action, Browser, BrowserConfig, Item, mod, scope_into, set_preview_op,
+    upsert,
 )
 
 # Optional md2ansi plugin — colors user/assistant voice content inline.
@@ -3698,13 +3699,14 @@ def _preview_umbrella(item_id):
         ``_BROWSER.update_data(ops)`` call. Subsequent recompositions
         (and a user's first expand) reuse those entries without
         re-running ``get_children``.
-      * Each leaf record's rendered body is cached on its Item via a
-        per-leaf ``_BROWSER.set_preview(cid, text)`` call. Since #431
-        ``set_preview`` routes through the post queue (FIFO), so
-        every write lands — the umbrella's own composed preview is
-        still cached by the framework via the standard worker return
-        path (no recipe-side ``set_preview`` needed for the top-level
-        id).
+      * Each leaf record's rendered body is cached on its Item by
+        appending ``set_preview_op(cid, text)`` to the same batch that
+        carries the eager-push upserts (#446). Both tree mutations and
+        preview writes ride one ``update_data`` post — for a
+        thousand-message session that collapses ~1000 closures and pipe
+        wakes into one. Within-batch FIFO ordering guarantees the
+        registering upsert lands before its matching ``set_preview_op``
+        so the registration-prerequisite stays satisfied.
     """
     parts = []
     ops = []
@@ -3718,15 +3720,16 @@ def _preview_umbrella(item_id):
             parts.append(_rule(f'error in scope card: {e}', RED))
     _collect_umbrella_preview(item_id, parts, ops, leaf_previews)
     if _BROWSER is not None:
-        # One batched push per top-level invocation. Thread-safe:
-        # ``update_data`` schedules the apply onto the main thread.
-        # The post queue is FIFO so this lands before the leaf-preview
-        # writes below — leaves we just discovered will be in
-        # ``_items_by_id`` by the time their preview write runs.
+        # Fold leaf-preview writes into the same batch as the eager
+        # upserts (#446) — one ``update_data`` post covers both. The
+        # batch is ordered: upserts first (registering leaves), then
+        # ``set_preview_op`` entries (writing into ``Item.preview``).
+        # Within-batch FIFO ordering on ``apply_ops`` makes the
+        # registration visible to the preview op that follows it.
+        for cid, text in leaf_previews.items():
+            ops.append(set_preview_op(cid, text))
         if ops:
             _BROWSER.update_data(ops)
-        for cid, text in leaf_previews.items():
-            _BROWSER.set_preview(cid, text)
     return '\n\n'.join(parts)
 
 
