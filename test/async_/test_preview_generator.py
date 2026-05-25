@@ -814,5 +814,128 @@ class TestAbandonClearsCache(unittest.TestCase):
             b.stop_workers()
 
 
+class TestDrainWhenPinned(unittest.TestCase):
+    """#457: tail-pin (Shift-End) drains without pausing at the cap.
+
+    When ``browser._preview_at_tail`` is True, the user has explicitly
+    asked for the full preview via Shift-End. The generator-pause logic
+    would otherwise park the worker at the cap and only resume one
+    window per render tick — adding render-paced latency to the
+    explicit "give me everything" command. Spec §2: while pinned, the
+    worker advances the cap thresholds inline and keeps pulling.
+    """
+
+    def test_pinned_drains_without_pausing(self):
+        # Generator yields ~3 cap windows worth of content. With the
+        # tail-pin engaged, the worker must reach StopIteration without
+        # ever recording a paused state.
+        yield_count = {'n': 0}
+        total_yields = 30  # 30 * 50 = 1500 chars, cap=500 → ~3 windows
+
+        def get_preview(_id):
+            for _ in range(total_yields):
+                yield_count['n'] += 1
+                yield 'x' * 50
+
+        # Observer thread samples ``_preview_paused`` aggressively while
+        # the generator drains so a transient pause would be caught.
+        paused_observations = []
+        stop_observer = threading.Event()
+
+        def observe(b):
+            while not stop_observer.is_set():
+                p = b._preview_paused
+                if p is not None:
+                    paused_observations.append(dict(p))
+                time.sleep(0.0005)
+
+        b = make_browser(
+            get_children=lambda _, *, reload=False: [Item(id='a')],
+            get_preview=get_preview,
+            root_id='/',
+            preview_buffer_cap_chars=500,
+            preview_buffer_cap_lines=1_000_000,
+        )
+        try:
+            b.refresh('/')
+            b.run_until_idle()
+            # Engage the tail-pin BEFORE requesting the preview so the
+            # worker sees it on the very first cap check.
+            b._preview_at_tail = True
+
+            t = threading.Thread(target=observe, args=(b,), daemon=True)
+            t.start()
+            try:
+                b.request_preview('a')
+                # Generator should run to exhaustion without pausing.
+                self.assertTrue(
+                    _drain_until(
+                        b, lambda: yield_count['n'] == total_yields
+                    ),
+                    f"generator did not exhaust: "
+                    f"yield_count={yield_count['n']}",
+                )
+                b.run_until_idle()
+            finally:
+                stop_observer.set()
+                t.join(timeout=1.0)
+
+            # Buffer holds all 30 yields concatenated.
+            self.assertEqual(
+                get_preview_text(b, 'a'), 'x' * (total_yields * 50)
+            )
+            # Request slot cleared on clean StopIteration.
+            self.assertIsNone(b._preview_req)
+            # Crucially: no paused state observed mid-flight, even
+            # though the buffered size sailed past the cap multiple
+            # times.
+            self.assertEqual(
+                paused_observations, [],
+                f"unexpected paused state(s) while tail-pinned: "
+                f"{paused_observations!r}",
+            )
+            self.assertIsNone(b._preview_paused)
+        finally:
+            b.stop_workers()
+
+    def test_unpinned_still_pauses_at_cap(self):
+        # Regression: when ``_preview_at_tail`` is False, the existing
+        # cap-pause behaviour must be unchanged.
+        yield_count = {'n': 0}
+
+        def get_preview(_id):
+            while True:
+                yield_count['n'] += 1
+                yield 'x' * 50
+
+        b = make_browser(
+            get_children=lambda _, *, reload=False: [Item(id='a')],
+            get_preview=get_preview,
+            root_id='/',
+            preview_buffer_cap_chars=100,
+            preview_buffer_cap_lines=1_000_000,
+        )
+        try:
+            b.refresh('/')
+            b.run_until_idle()
+            # Tail-pin is False by default — be explicit for clarity.
+            self.assertFalse(b._preview_at_tail)
+
+            b.request_preview('a')
+            self.assertTrue(
+                _drain_until(b, lambda: b._preview_paused is not None),
+                'worker did not enter paused state with tail-pin off',
+            )
+            paused = b._preview_paused
+            self.assertEqual(paused['id'], 'a')
+            # Worker stopped pulling at the cap.
+            initial = yield_count['n']
+            time.sleep(0.05)
+            b.drain_main_queue()
+            self.assertEqual(yield_count['n'], initial)
+        finally:
+            b.stop_workers()
+
+
 if __name__ == '__main__':
     unittest.main()

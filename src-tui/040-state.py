@@ -4776,6 +4776,19 @@ class Browser:
                     notify_wake()
 
                 if chars >= next_cap_chars or lines >= next_cap_lines:
+                    # #457: drain-without-pause while the user has
+                    # pinned the preview to its tail via Shift-End.
+                    # The user explicitly asked for the full content;
+                    # parking between cap windows adds render-tick
+                    # latency that defeats the explicit "give me
+                    # everything" command. Advance the cap thresholds
+                    # inline and keep pulling. Memory growth while
+                    # pinned is intentional — Shift-End is a deliberate
+                    # opt-in (see streaming-umbrella spec §2).
+                    if self._preview_at_tail:
+                        next_cap_chars = chars + cap_chars
+                        next_cap_lines = lines + cap_lines
+                        continue
                     # Pause. Record the live generator so a cursor-move
                     # can abandon it (closing fires recipe ``finally``)
                     # and so #274 can resume. ``_preview_req`` keeps
