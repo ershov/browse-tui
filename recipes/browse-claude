@@ -3886,7 +3886,6 @@ def _collect_umbrella_preview(item_id, _state=None):
     if top_level:
         _state = {
             'ops': [],
-            'leaf_previews': {},
             'count': 0,
         }
 
@@ -3895,22 +3894,12 @@ def _collect_umbrella_preview(item_id, _state=None):
             return
         if _BROWSER is None:
             state['ops'].clear()
-            state['leaf_previews'].clear()
             state['count'] = 0
             return
         ops = state['ops']
-        # Fold leaf-preview writes into the same batch as the eager
-        # upserts (#446) — one ``update_data`` post covers both. The
-        # batch is ordered: upserts first (registering leaves), then
-        # ``set_preview_op`` entries (writing into ``Item.preview``).
-        # Within-batch FIFO ordering on ``apply_ops`` makes the
-        # registration visible to the preview op that follows it.
-        for cid, text in state['leaf_previews'].items():
-            ops.append(set_preview_op(cid, text))
         if ops:
             _BROWSER.update_data(ops)
         state['ops'] = []
-        state['leaf_previews'] = {}
         state['count'] = 0
 
     try:
@@ -3999,33 +3988,20 @@ def _walk_umbrella(item_id, _state, _flush):
             n = _parse_int(lineno)
             if n is None:
                 continue
-            # Per-record preview cache on Item: skip the JSONL read +
-            # body render when the framework already has a non-empty
-            # cached preview for this leaf. The umbrella's own preview
-            # gets cached by the framework's worker return path, but
-            # each leaf only lands in the cache once *we* compose
-            # something with it.
-            cached_leaf = None
-            if _BROWSER is not None:
-                try:
-                    cached_leaf = _BROWSER.get_cached_preview(cid)
-                except Exception:
-                    cached_leaf = None
-            if cached_leaf:
-                yield cached_leaf + '\n\n'
-                _state['count'] += 1
-                _flush(_state)
-                continue
+            # Always render the leaf body fresh for the umbrella cascade.
+            # We deliberately do NOT consult ``get_cached_preview(cid)``
+            # nor write the rendered body back into the leaf's
+            # ``Item.preview`` via set_preview_op. The two consumers
+            # render differently: the umbrella wants body-only (chrome
+            # between leaves is noise) while a direct cursor-visit on
+            # the leaf wants body + chrome. Sharing one cache slot for
+            # both caused chrome to bleed into the umbrella when a
+            # leaf had been visited directly first, and stripped
+            # chrome from the leaf preview when the umbrella had been
+            # viewed first. JSONL line read + body render is cheap
+            # enough that re-rendering on each compose is fine.
             rendered = _render_record_with_rule(cpath, n)
             if rendered is not None:
-                # Cache the leaf render so the next recomposition
-                # (tail tick, sibling umbrella's recursion, collapse
-                # + re-expand, …) is a cheap dict lookup. Accumulated
-                # in ``_state`` and flushed every STREAM_BATCH records
-                # by the inner ``_flush`` helper — the top-level
-                # ``finally:`` drains the remainder on exit.
-                if _BROWSER is not None:
-                    _state['leaf_previews'][cid] = rendered
                 yield rendered + '\n\n'
                 _state['count'] += 1
                 _flush(_state)

@@ -2104,6 +2104,20 @@ class BrowserConfig:
 STREAM_CAP_FACTOR = 3
 MIN_CAP_LINES = 50
 
+# Ops that don't change the tree structure — used by ``update_data._apply``
+# to skip the O(N) maintenance pipeline for pure-preview batches. Without
+# this gate, a streaming generator yielding N chunks would do N×
+# ``visible_items`` / ``hide-displacement`` / ``cursor-anchor`` /
+# ``expand-goal`` passes for an O(N²) cost — the 100% CPU hang reported
+# when draining huge umbrellas under Shift-End tail-pin.
+_PREVIEW_ONLY_OP_KINDS = frozenset([
+    'set_preview',
+    'append_preview',
+    'clear_preview',
+    'invalidate_preview',
+    'drop_preview_cache',
+])
+
 
 class Browser:
     """The TUI engine and async coordinator.
@@ -3051,8 +3065,41 @@ class Browser:
         push the rest" — that's a recipe-author responsibility.
         """
         ops_list = list(ops)
+        # Streaming-preview hot path (#471 follow-up): when every op in
+        # the batch is a pure preview op (no structural change), skip
+        # the O(N) maintenance pipeline (visible_items snapshot,
+        # hide-displacement, cursor-anchor, expand-goal, list/children
+        # redraw flags). For a streaming generator yielding thousands
+        # of chunks, this turns a per-chunk O(N) cost into O(1) and
+        # avoids the O(N²) hang reported when draining huge umbrellas
+        # under Shift-End tail-pin.
+        preview_only_batch = bool(ops_list) and all(
+            isinstance(op, tuple) and op[0] in _PREVIEW_ONLY_OP_KINDS
+            for op in ops_list
+        )
 
         def _apply():
+            if preview_only_batch:
+                apply_ops(
+                    self._state, ops_list,
+                    preview_ansi=self.preview_ansi,
+                )
+                if self._state._preview_dirty:
+                    self._needs_redraw.add('preview')
+                for kick in self._state._preview_kicks:
+                    kind = kick[0]
+                    if kind == 'id':
+                        self._kick_after_invalidate(kick[1])
+                    elif kind == 'cursor':
+                        cur = self._preview_cursor_id
+                        if cur is not None:
+                            self._kick_after_invalidate(cur)
+                    elif kind == 'cursor_if':
+                        cur = self._preview_cursor_id
+                        if cur is not None and kick[1] == cur:
+                            self._kick_after_invalidate(cur)
+                return
+
             # Snapshot the pre-mutation visible list and cursor index
             # so hide-driven displacement can walk back through what
             # the user was looking at. See

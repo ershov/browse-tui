@@ -1315,5 +1315,55 @@ class TestDropPreviewCacheRefetchesGenerator(unittest.TestCase):
             b.stop_workers()
 
 
+class TestStreamingDoesNotHang(unittest.TestCase):
+    """#471: a huge streaming generator under tail-pin must complete
+    promptly. The bug was O(N²) cost in update_data._apply running
+    the full maintenance pipeline (visible_items, hide-displacement,
+    cursor-anchor, expand-goal) for every per-chunk append_preview op.
+    """
+
+    def test_drain_under_tail_pin_terminates_in_reasonable_time(self):
+        # Yield 2000 chunks under tail-pin. Without the preview-only
+        # batch fast path in _apply, this took O(N²) and hung. With
+        # the fast path it should complete in < 5 s on any reasonable
+        # machine — we use 30 s as a generous CI floor.
+        N = 2000
+
+        def get_preview(_id):
+            for i in range(N):
+                yield f'line {i}\n'
+
+        b = make_browser(
+            get_children=lambda _, *, reload=False: [Item(id='big')],
+            get_preview=get_preview,
+            root_id='/',
+        )
+        try:
+            b.refresh('/')
+            b.run_until_idle()
+            b._preview_at_tail = True
+            b._preview_cursor_id = 'big'
+            b.request_preview('big')
+            start = time.monotonic()
+            b.run_until_idle(timeout=30.0)
+            elapsed = time.monotonic() - start
+            text = get_preview_text(b, 'big') or ''
+            self.assertEqual(
+                text.count('\n'), N,
+                f"expected {N} lines, got {text.count(chr(10))}; "
+                f"elapsed={elapsed:.1f}s",
+            )
+            # The fast path should make this well under a second on a
+            # modest machine; allow 5 s for slow CI. A regression to
+            # the O(N²) path would blow past this for N=2000.
+            self.assertLess(
+                elapsed, 5.0,
+                f"streaming drain took {elapsed:.1f}s — "
+                f"O(N²) maintenance regression?",
+            )
+        finally:
+            b.stop_workers()
+
+
 if __name__ == '__main__':
     unittest.main()

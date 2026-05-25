@@ -3308,6 +3308,84 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             finally:
                 self.r._FILTER_VOICE_ONLY = False
 
+    def test_umbrella_preview_omits_chrome_even_after_direct_leaf_visit(self):
+        # Regression: previously, when a leaf had been visited directly
+        # first (populating its cache with body + chrome) and then the
+        # umbrella was viewed, the umbrella's cached-leaf shortcut would
+        # pick up the chrome-bearing cache and bleed chrome into the
+        # umbrella cascade. The fix: umbrella always renders fresh and
+        # never reads/writes the leaf cache.
+        import tempfile
+        import json as _json
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, '-c')
+            os.makedirs(proj)
+            sess = os.path.join(proj, 's.jsonl')
+            recs = [
+                {'type': 'user', 'uuid': 'u1', 'parentUuid': None,
+                 'sessionId': 'SID-XYZ',  # chrome carries this
+                 'message': {'role': 'user', 'content': 'hello'}},
+                {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+                 'sessionId': 'SID-XYZ',
+                 'message': {'role': 'assistant', 'content': [{
+                     'type': 'text', 'text': 'hi back',
+                 }]}},
+            ]
+            with open(sess, 'w') as f:
+                for r in recs:
+                    f.write(_json.dumps(r) + '\n')
+            self.r._TREE_CACHE.clear()
+
+            # Step 1: simulate a direct leaf visit by writing the
+            # chrome-bearing preview into the framework cache. (In real
+            # usage, the framework's get_preview path produces this.)
+            leaf_id = f'{sess}#0'
+            chrome_text = self.r._preview_message(sess, 0)
+            self.assertIn('SID-XYZ', chrome_text,
+                          'sanity: leaf preview should include sessionId chrome')
+
+            # Step 2: build the umbrella for the prompt and consume it.
+            # The umbrella cascade should NOT include the chrome line
+            # even though the leaf has been visited directly.
+            umbrella = ''.join(self.r._preview_umbrella(f'{sess}#prompt:0'))
+            # The user's voice content is in the umbrella.
+            self.assertIn('hello', umbrella)
+            # Chrome (sessionId line) must NOT appear in the umbrella.
+            self.assertNotIn('SID-XYZ', umbrella,
+                             'umbrella preview should not include leaf chrome')
+
+    def test_umbrella_does_not_clobber_leaf_preview_cache(self):
+        # Regression: previously, the umbrella's set_preview_op
+        # side-effect wrote body-only into leaf Item.preview, so a
+        # subsequent direct leaf visit painted body-only (missing
+        # chrome). Now the umbrella never writes leaf cache; direct
+        # visits manage their own cache via get_preview.
+        import tempfile
+        import json as _json
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, '-d')
+            os.makedirs(proj)
+            sess = os.path.join(proj, 's.jsonl')
+            recs = [
+                {'type': 'user', 'uuid': 'u1', 'parentUuid': None,
+                 'sessionId': 'SID-ABC',
+                 'message': {'role': 'user', 'content': 'q'}},
+            ]
+            with open(sess, 'w') as f:
+                for r in recs:
+                    f.write(_json.dumps(r) + '\n')
+            self.r._TREE_CACHE.clear()
+
+            # Run the umbrella generator to completion — this used to
+            # write leaf previews into the framework cache.
+            list(self.r._preview_umbrella(f'{sess}#prompt:0'))
+
+            # A subsequent leaf preview must still produce chrome.
+            leaf_text = self.r._preview_message(sess, 0)
+            self.assertIn('SID-ABC', leaf_text,
+                          'leaf preview should still include chrome '
+                          'after the umbrella ran')
+
     def test_tool_umbrella_for_non_agent_tool_has_no_bg(self):
         # Sanity: <tool:Bash> (or any non-Agent tool) without an
         # agent_link gets no row stripe — the propagation is specific
@@ -5038,29 +5116,34 @@ class TestUmbrellaPreviewCacheIntegration(unittest.TestCase):
             restore()
             os.unlink(path)
 
-    def test_leaf_previews_are_populated(self):
-        # After ``_preview_umbrella`` drains, every leaf child of the
-        # umbrella should have ``Item.preview`` populated. We check by
-        # consulting the FakeBrowser's items_by_id index after the
-        # post queue drains.
+    def test_umbrella_does_not_populate_leaf_preview_cache(self):
+        # Regression: previously, ``_preview_umbrella`` populated each
+        # visited leaf's ``Item.preview`` as a side effect (via
+        # set_preview_op). That cache was body-only, but a direct
+        # leaf visit's preview is body + chrome — sharing the cache
+        # slot between the two consumers caused chrome to bleed into
+        # the umbrella OR strip from the leaf depending on visit
+        # order. The umbrella no longer writes to the leaf cache; each
+        # consumer manages its own.
         self.r._BROWSER = _FakeBrowser()
         path = self._make_three_record_session()
         try:
             ''.join(self.r._preview_umbrella(f'{path}#prompt:0'))
             self.r._BROWSER.flush()
-            # The leaf record ids are ``<path>#0``, ``<path>#1``,
-            # ``<path>#2``. All three should have a non-empty
-            # ``preview`` slot. Umbrellas (#prompt:, #tool:) are not
-            # leaves and won't be populated by this code path — the
-            # framework's worker handles those.
+            # Leaves get *registered* in the index via eager-push
+            # upserts (so the framework's tree expansion is cheap),
+            # but their ``preview`` slot stays None — populated only
+            # by the framework's own worker when a direct cursor
+            # visit calls ``get_preview(leaf_id)``.
             for n in (0, 1, 2):
                 cid = f'{path}#{n}'
                 item = self.r._BROWSER.items_by_id.get(cid)
                 self.assertIsNotNone(item, f'leaf {cid} not in index')
-                self.assertTrue(
+                self.assertFalse(
                     item.preview,
-                    f'leaf {cid}.preview should be populated; '
-                    f'got {item.preview!r}',
+                    f'leaf {cid}.preview should be None — umbrella '
+                    f'must not pollute the leaf cache. Got '
+                    f'{item.preview!r}',
                 )
         finally:
             os.unlink(path)
@@ -5091,11 +5174,11 @@ class TestUmbrellaPreviewCacheIntegration(unittest.TestCase):
         finally:
             os.unlink(path)
 
-    def test_tail_tick_only_re_renders_new_records(self):
-        # Compose once. Append a new leaf via a synthetic upsert. Wrap
-        # ``_render_record_with_rule`` to count calls. The second
-        # composition should re-render only the new leaf (existing
-        # ones are cache hits).
+    def test_tail_tick_re_renders_all_leaves_each_pass(self):
+        # The umbrella deliberately renders each leaf fresh on every
+        # compose — no leaf preview cache. The minor cost (one JSONL
+        # read + body render per leaf per compose) is the price of
+        # keeping the leaf cache uncluttered for direct visits.
         self.r._BROWSER = _FakeBrowser()
         path = self._make_three_record_session()
 
@@ -5111,51 +5194,22 @@ class TestUmbrellaPreviewCacheIntegration(unittest.TestCase):
             ''.join(self.r._preview_umbrella(f'{path}#prompt:0'))
             self.r._BROWSER.flush()
             calls_after_first = list(render_calls)
-            # First pass: the three leaves all rendered.
             self.assertEqual(
                 len(calls_after_first), 3,
                 f'first pass should render 3 leaves; got '
                 f'{calls_after_first}',
             )
 
-            # Simulate a tail tick: append a new leaf to the cached
-            # children list. (Real tail worker would do this via
-            # ``update_data`` upsert; we shortcut by mutating the
-            # fake's storage. The point of the test is to verify the
-            # composer's cache behavior, not the tail worker's.)
-            new_leaf = _RecordingItem(
-                f'{path}#3',
-                title='NEW',
-                tag='user',
-                hidden=False,
-            )
-            self.r._BROWSER.items_by_id[new_leaf.id] = new_leaf
-            self.r._BROWSER._children_cache.setdefault(
-                f'{path}#prompt:0', []
-            ).append(new_leaf)
-
-            # Now write the new record to disk and re-scan so
-            # ``_render_record_with_rule`` can read it.
-            import json as _json
-            with open(path, 'a') as f:
-                f.write(_json.dumps({
-                    'type': 'user', 'uuid': 'u3', 'parentUuid': 'a1',
-                    'message': {'role': 'user',
-                                'content': 'PROBE_NEW_RECORD'},
-                }) + '\n')
-            self.r._TREE_CACHE.pop(path, None)
-
             render_calls.clear()
             ''.join(self.r._preview_umbrella(f'{path}#prompt:0'))
             self.r._BROWSER.flush()
-            # Second pass: only the new leaf re-renders. The three
-            # existing leaves were cache hits.
+            # Second pass: every leaf re-renders. There's no leaf
+            # cache to hit.
             self.assertEqual(
-                len(render_calls), 1,
-                f'second pass should render only the new leaf; got '
+                len(render_calls), 3,
+                f'second pass should re-render all 3 leaves; got '
                 f'{render_calls}',
             )
-            self.assertEqual(render_calls[0], (path, 3))
         finally:
             self.r._render_record_with_rule = original_render
             os.unlink(path)
@@ -5310,17 +5364,18 @@ class TestUmbrellaGenerator(unittest.TestCase):
         finally:
             os.unlink(path)
 
-    def test_partial_drain_then_close_flushes_side_effects(self):
+    def test_partial_drain_then_close_flushes_eager_push_ops(self):
         # STREAM_BATCH=25 — build a session large enough that pulling
         # ~30 chunks crosses the batch boundary at least once. After
-        # ``gen.close()`` the ``finally:`` flush should have ensured
-        # the visited leaves have their ``Item.preview`` populated.
+        # ``gen.close()`` the ``finally:`` flush should have posted the
+        # eager-push upserts. (Leaf preview cache writes are NOT a
+        # side-effect any more; only the upserts that register leaves
+        # in the framework's tree remain.)
         self.r._BROWSER = _FakeBrowser()
         path = self._make_session(60)
         try:
             gen = self.r._preview_umbrella(path)
-            # Skip the scope card (first chunk).
-            next(gen)
+            next(gen)   # scope card
             pulled = 0
             for _ in range(30):
                 try:
@@ -5330,57 +5385,49 @@ class TestUmbrellaGenerator(unittest.TestCase):
                     break
             gen.close()
             self.r._BROWSER.flush()
-            # The first STREAM_BATCH (25) leaves should have been
-            # flushed mid-stream; the remainder lands in the
-            # ``finally:`` flush. Count leaves with a populated
-            # preview slot.
-            populated = 0
-            for n in range(60):
-                cid = f'{path}#{n}'
-                item = self.r._BROWSER.items_by_id.get(cid)
-                if item is not None and item.preview:
-                    populated += 1
-            self.assertGreaterEqual(
-                populated, pulled,
-                f'expected at least {pulled} populated leaf previews '
-                f'(one per pulled chunk); got {populated}',
-            )
-            # Sanity: more than one ``update_data`` batch fired — the
-            # mid-stream flush at STREAM_BATCH and the ``finally:``
-            # flush are distinct posts.
+            # More than one ``update_data`` batch fired — the
+            # mid-stream STREAM_BATCH flush and the ``finally:`` flush
+            # are distinct posts.
             self.assertGreaterEqual(
                 len(self.r._BROWSER.update_data_calls), 2,
                 'expected at least two update_data batches '
                 '(mid-stream + finally flush)',
             )
+            # The batches contain upserts only — no set_preview ops.
+            for ops in self.r._BROWSER.update_data_calls:
+                for op in ops:
+                    self.assertNotEqual(
+                        op[0], 'set_preview',
+                        'umbrella must not emit set_preview ops for '
+                        'leaves — they would clobber direct-visit '
+                        'previews. Got: %r' % (op,),
+                    )
+
         finally:
             os.unlink(path)
 
     def test_finally_flushes_remainder(self):
         # A short partial drain (well under STREAM_BATCH=25) should
-        # still see its visited leaves cached via the ``finally:``
-        # path on ``gen.close()``.
+        # still see its eager-push upserts flushed via the
+        # ``finally:`` path on ``gen.close()``.
         self.r._BROWSER = _FakeBrowser()
         path = self._make_session(10)
         try:
             gen = self.r._preview_umbrella(path)
             next(gen)   # scope card
-            pulled_ids = []
-            for n in range(5):
+            for _ in range(5):
                 next(gen)
-                pulled_ids.append(f'{path}#{n}')
             gen.close()
             self.r._BROWSER.flush()
-            for cid in pulled_ids:
-                item = self.r._BROWSER.items_by_id.get(cid)
-                self.assertIsNotNone(
-                    item, f'leaf {cid} not registered',
-                )
-                self.assertTrue(
-                    item.preview,
-                    f'leaf {cid} preview should be flushed via '
-                    f'finally: on early close; got {item.preview!r}',
-                )
+            # At least one update_data batch fired (the finally flush).
+            self.assertGreaterEqual(
+                len(self.r._BROWSER.update_data_calls), 1,
+                'expected at least one update_data batch (finally flush)',
+            )
+            # No set_preview ops should appear.
+            for ops in self.r._BROWSER.update_data_calls:
+                for op in ops:
+                    self.assertNotEqual(op[0], 'set_preview')
         finally:
             os.unlink(path)
 
