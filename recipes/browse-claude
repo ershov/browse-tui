@@ -3550,6 +3550,13 @@ def _tool_umbrella_item(jsonl_path, assistant_line, rec, td):
     hook attachments, and a ``<subagent>`` umbrella for Agent/Task
     dispatches with a resolvable subagent transcript on disk. The tool
     name in the prefix is the **first** ``tool_use`` part's name.
+
+    Voice stripe: inherited from the underlying assistant record when
+    it qualifies as voice (mixed text + tool_use), OR from the subagent
+    kind when this umbrella wraps a resolvable Agent/Task dispatch.
+    The latter mirrors how the subagent pseudo-row is striped so the
+    voice marker propagates the whole way up from the subagent leaf
+    through its ``<tool:Agent>`` umbrella.
     """
     summary = _oneline(_summarise_message(rec))
     uuid = rec.get('uuid')
@@ -3572,7 +3579,34 @@ def _tool_umbrella_item(jsonl_path, assistant_line, rec, td):
         bg = _ROW_BG_FOR_KIND.get(item.message_kind)
         if bg is not None:
             item.row_bg = bg
+    elif _tool_umbrella_wraps_subagent(rec, td):
+        bg = _ROW_BG_FOR_KIND.get('subagent')
+        if bg is not None:
+            item.row_bg = bg
     return item
+
+
+def _tool_umbrella_wraps_subagent(rec, td):
+    """True iff this assistant tool_use record dispatches a resolvable
+    Agent/Task subagent — i.e. there is at least one tool_use part with
+    name in ('Agent', 'Task') whose id has an ``agent_link`` entry.
+    """
+    msg = rec.get('message') if isinstance(rec, dict) else None
+    if not isinstance(msg, dict):
+        return False
+    content = msg.get('content')
+    if not isinstance(content, list):
+        return False
+    for p in content:
+        if not isinstance(p, dict):
+            continue
+        if p.get('type') != 'tool_use':
+            continue
+        if p.get('name') not in ('Agent', 'Task'):
+            continue
+        if td.agent_link.get(p.get('id')):
+            return True
+    return False
 
 
 def _span_umbrella_item(jsonl_path, start_line, records):

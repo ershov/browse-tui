@@ -3242,6 +3242,51 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             preview = ''.join(self.r._preview_umbrella(f'{sess}#tool:1'))
             self.assertNotIn('inside-subagent', preview)
 
+    def test_tool_umbrella_for_agent_dispatch_has_subagent_bg(self):
+        # When a <tool:Agent> umbrella wraps a resolvable subagent
+        # dispatch, the umbrella row itself must carry the subagent
+        # voice stripe — the voice marker propagates the whole way up
+        # from the subagent leaf through its <tool:Agent> umbrella.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._build(tmp)
+            self.r._TREE_CACHE.clear()
+            td = self.r._scan_tree(sess)
+            # Line 1 is the assistant tool_use record dispatching Agent.
+            assistant_rec = td.records[1]
+            item = self.r._tool_umbrella_item(sess, 1, assistant_rec, td)
+            self.assertEqual(item.row_bg, 17,
+                             '<tool:Agent> umbrella should inherit '
+                             'subagent stripe when dispatching a resolvable '
+                             'subagent transcript')
+
+    def test_tool_umbrella_for_non_agent_tool_has_no_bg(self):
+        # Sanity: <tool:Bash> (or any non-Agent tool) without an
+        # agent_link gets no row stripe — the propagation is specific
+        # to Agent/Task dispatches.
+        import tempfile
+        import json as _json
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, '-y')
+            os.makedirs(proj)
+            sess = os.path.join(proj, 's.jsonl')
+            recs = [
+                {'type': 'user', 'uuid': 'u1', 'parentUuid': None,
+                 'message': {'role': 'user', 'content': 'ls'}},
+                {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+                 'message': {'role': 'assistant', 'content': [{
+                     'type': 'tool_use', 'id': 'toolu_B', 'name': 'Bash',
+                     'input': {'command': 'ls'},
+                 }]}},
+            ]
+            with open(sess, 'w') as f:
+                for r in recs:
+                    f.write(_json.dumps(r) + '\n')
+            self.r._TREE_CACHE.clear()
+            td = self.r._scan_tree(sess)
+            item = self.r._tool_umbrella_item(sess, 1, td.records[1], td)
+            self.assertIsNone(getattr(item, 'row_bg', None))
+
 
 class TestSessionRowVsScopeRootPreview(unittest.TestCase):
     """When a session row is just a list element (not scope_root, not

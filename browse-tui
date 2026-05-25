@@ -3206,6 +3206,26 @@ class BrowserConfig:
     _headless: bool = False
 
 
+# Streaming preview cap derivation (#458 / streaming-umbrella spec §3).
+#
+# ``_stream_preview_from_generator`` re-reads its line cap each pause
+# cycle via ``Browser._preview_cap_lines()`` so a terminal resize takes
+# effect on the next cap window. The cap is sized in screens of the
+# preview pane:
+#
+#   * ``STREAM_CAP_FACTOR = 3`` → ~3 screens of buffered scrollback,
+#     well past the ``_PREVIEW_DEMAND_THRESHOLD = 12`` (050-render.py)
+#     so the demand-resume kicks in long before the user scrolls into
+#     unbuffered territory.
+#   * ``MIN_CAP_LINES = 50`` → floor for the cold-start case where the
+#     pane height hasn't been measured yet (no tty, headless tests).
+#
+# The char cap (``preview_buffer_cap_chars``) stays as the static
+# memory safety net — it doesn't scale with pane size.
+STREAM_CAP_FACTOR = 3
+MIN_CAP_LINES = 50
+
+
 class Browser:
     """The TUI engine and async coordinator.
 
@@ -5722,6 +5742,46 @@ class Browser:
                 )
                 notify_wake()
 
+    def _post_clear_abandoned_preview(self, item_id):
+        """Post a main-thread cache-clear for an abandoned streaming preview (#456).
+
+        Used by ``_stream_preview_from_generator`` and
+        ``_abandon_paused_preview_if_any`` when a streaming generator is
+        dropped before clean ``StopIteration`` — either because the
+        cursor moved off ``item_id`` or because ``_stop`` woke the
+        worker. The partial buffer in ``Item.preview`` is no longer a
+        useful cache entry: a subsequent visit should refetch fresh,
+        not paint the truncated text as if it were the final preview.
+
+        Sets ``Item.preview = None`` and ``Item.preview_render = None``
+        on the main thread via the post queue (the worker is a daemon
+        thread, so direct state mutation would race the renderer).
+        Idempotent and safe for unknown ids (silent no-op).
+
+        Cache is *preserved* on:
+          * Clean ``StopIteration`` — the buffer is the final preview.
+          * Mid-stream exception — partial buffer + ``[error]`` tag is
+            an intentionally informative result.
+          * Side-effect ops written via ``set_preview_op`` for *other*
+            ids (e.g. the umbrella generator populating leaf bodies);
+            those ids are not the abandoned generator's id, so they
+            stay untouched.
+        """
+        state = self._state
+
+        def _clear():
+            item = state._items_by_id.get(item_id)
+            if item is None:
+                return
+            item.preview = None
+            item.preview_render = None
+            # Repaint so the cleared pane reflects on screen if the
+            # cursor happens to land back on this id before a fresh
+            # fetch delivers.
+            self._needs_redraw.add('preview')
+
+        self.post(_clear)
+
     def _abandon_paused_preview_if_any(self, except_id=None):
         """Close any paused preview generator whose id != ``except_id``.
 
@@ -5729,6 +5789,10 @@ class Browser:
         Closing a generator triggers its ``finally`` blocks via
         ``GeneratorExit`` — recipes use this for resource cleanup
         (file handles, network sockets, etc.).
+
+        Posts a cache-clear for the abandoned id (#456) so a later
+        visit refetches fresh instead of painting the truncated buffer
+        as if it were the final preview.
 
         Defensive: ``gen.close()`` itself catches generator-internal
         exceptions, but we still wrap to keep the worker thread alive
@@ -5743,6 +5807,7 @@ class Browser:
                 # paused generator (resume path will pick it up). Only
                 # used by the resume signal codepath in #274.
                 return
+            abandoned_id = paused['id']
             self._preview_paused = None
             # Clear any stale demand-resume request — that paused
             # generator is going away.
@@ -5755,6 +5820,9 @@ class Browser:
             # the generator (per Python semantics) but we belt-and-
             # braces in case a recipe re-raises in ``finally``.
             pass
+        # #456: discard the partial buffer for the abandoned id so a
+        # re-visit refetches instead of painting the truncated cache.
+        self._post_clear_abandoned_preview(abandoned_id)
 
     def _stream_preview_from_generator(self, item_id, gen):
         """Drain a ``get_preview`` generator into ``append_preview``.
@@ -5790,17 +5858,28 @@ class Browser:
         """
         chars = 0
         lines = 0
+        # ``cap_chars`` is the static memory safety net (config-bound,
+        # doesn't move with terminal size). ``cap_lines`` is re-derived
+        # from the preview pane height via ``_preview_cap_lines()`` at
+        # every cap event (#458 / streaming-umbrella spec §3) so a
+        # terminal resize takes effect on the next cap window without
+        # restarting the generator.
         cap_chars = self._preview_buffer_cap_chars
-        cap_lines = self._preview_buffer_cap_lines
         # Cumulative caps grow by one window per #274 demand-resume so
         # the local counters can stay running totals (matching the
         # reported ``_preview_paused['chars']`` / ``['lines']``
         # semantics from #273 — the dict records the buffer size at
         # pause time).
         next_cap_chars = cap_chars
-        next_cap_lines = cap_lines
+        next_cap_lines = self._preview_cap_lines()
         try:
-            while not self._stop:
+            while True:
+                if self._stop:
+                    # #456: shutdown — clear the partial buffer so a
+                    # stale truncated cache can't survive into a
+                    # later run if the main queue drains again.
+                    self._post_clear_abandoned_preview(item_id)
+                    return
                 # Cursor-move abandon check before pulling: if the
                 # request slot has moved off our id, drop the
                 # generator (its ``finally`` fires via ``gen.close()``)
@@ -5810,6 +5889,9 @@ class Browser:
                         gen.close()
                     except Exception:
                         pass
+                    # #456: clear the partial buffer so a re-visit
+                    # refetches fresh instead of painting truncated.
+                    self._post_clear_abandoned_preview(item_id)
                     return
                 try:
                     chunk = next(gen)
@@ -5840,6 +5922,22 @@ class Browser:
                     notify_wake()
 
                 if chars >= next_cap_chars or lines >= next_cap_lines:
+                    # #457: drain-without-pause while the user has
+                    # pinned the preview to its tail via Shift-End.
+                    # The user explicitly asked for the full content;
+                    # parking between cap windows adds render-tick
+                    # latency that defeats the explicit "give me
+                    # everything" command. Advance the cap thresholds
+                    # inline and keep pulling. Memory growth while
+                    # pinned is intentional — Shift-End is a deliberate
+                    # opt-in (see streaming-umbrella spec §2).
+                    if self._preview_at_tail:
+                        # Re-derive ``cap_lines`` per cap event (#458)
+                        # so a resize between windows takes effect even
+                        # while we're sailing through under tail-pin.
+                        next_cap_chars = chars + cap_chars
+                        next_cap_lines = lines + self._preview_cap_lines()
+                        continue
                     # Pause. Record the live generator so a cursor-move
                     # can abandon it (closing fires recipe ``finally``)
                     # and so #274 can resume. ``_preview_req`` keeps
@@ -5887,6 +5985,10 @@ class Browser:
                                     gen.close()
                                 except Exception:
                                     pass
+                            # #456: clear the partial buffer so a
+                            # re-visit refetches fresh instead of
+                            # painting truncated.
+                            self._post_clear_abandoned_preview(item_id)
                             return
                         # #274 demand signal — renderer asked us to
                         # keep pulling. Clear paused state + the
@@ -5907,8 +6009,11 @@ class Browser:
                             # Advance cap thresholds by one window so
                             # the running ``chars``/``lines`` totals
                             # stay cumulative across resume cycles.
+                            # Re-derive ``cap_lines`` per resume (#458)
+                            # so the next window reflects the current
+                            # pane height.
                             next_cap_chars = chars + cap_chars
-                            next_cap_lines = lines + cap_lines
+                            next_cap_lines = lines + self._preview_cap_lines()
                             break
                         # Was the paused state cleared from outside?
                         # (e.g. ``_abandon_paused_preview_if_any``
@@ -5938,6 +6043,10 @@ class Browser:
                         continue
                     # ``_stop`` woke us — exit without closing (the
                     # daemon thread is going away anyway).
+                    # #456: still post the cache-clear so if the main
+                    # loop drains once more before tear-down, a stale
+                    # partial doesn't survive into a re-run scenario.
+                    self._post_clear_abandoned_preview(item_id)
                     return
         finally:
             # Belt-and-braces: if anything escaped (shouldn't), make
@@ -6331,6 +6440,54 @@ class Browser:
             return h if h > 0 else 0
         except Exception:
             return 0
+
+    def _preview_pane_height_safe(self) -> int:
+        """Return the preview pane's content height, or 0 if unknown.
+
+        Mirrors ``_preview_pane_height`` in 070-actions.py but lives
+        here so the streaming worker (state layer) can read it without
+        crossing into the action layer. ``layout_panes`` reports the
+        preview rect including the separator row; subtract 1 to get the
+        scrollable content height. Returns 0 in headless / no-tty
+        contexts so callers can fall back to a floor.
+        """
+        try:
+            ts = globals().get('term_size')
+            lp = globals().get('layout_panes')
+            if ts is None or lp is None:
+                return 0
+            cols, rows = ts()
+            layout = lp(
+                cols, rows,
+                split=self.split,
+                show_preview=self.show_preview,
+                show_children_pane=self.show_children_pane,
+                list_ratio=self.list_ratio,
+            )
+            prev_rect = layout.get('preview')
+            if prev_rect is None:
+                return 0
+            h = prev_rect.height - 1  # exclude separator row
+            return h if h > 0 else 0
+        except Exception:
+            return 0
+
+    def _preview_cap_lines(self) -> int:
+        """Streaming preview line cap derived from the preview pane.
+
+        Re-read once per pause cycle by
+        ``_stream_preview_from_generator`` so a terminal resize takes
+        effect on the next cap window without restarting the
+        generator. Returns
+        ``max(preview_pane_height * STREAM_CAP_FACTOR, MIN_CAP_LINES)``
+        (streaming-umbrella spec §3 / ticket #458).
+
+        The companion char cap (``_preview_buffer_cap_chars``) stays
+        static — it's the memory safety net, not the screen-fit
+        sizing.
+        """
+        height = self._preview_pane_height_safe()
+        return max(height * STREAM_CAP_FACTOR, MIN_CAP_LINES)
 
     def _snap_list_scroll_to_row(self, row: int) -> None:
         """Adjust ``_list_scroll`` so visible-list ``row`` is on-screen.
