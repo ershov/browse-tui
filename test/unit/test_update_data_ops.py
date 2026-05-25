@@ -227,6 +227,50 @@ class TestUpsertPatchOnly(unittest.TestCase):
         )
 
 
+class TestUpsertPreviewCacheGate(unittest.TestCase):
+    """``upsert`` invalidates the preview cache only when fields change (#445)."""
+
+    def _seed(self):
+        s = State(root_id='/')
+        apply_ops(s, [upsert('a', '/', title='A')])
+        item = s._items_by_id['a']
+        item.preview = 'cached preview text'
+        item.preview_render = 'cached render sentinel'
+        return s, item
+
+    def test_no_fields_preserves_preview_cache(self):
+        # The documented idempotent-ensure idiom used before set_preview:
+        #   update_data([upsert(id, parent)]) + set_preview(id, text)
+        # must not nuke a cached preview.
+        s, item = self._seed()
+        apply_ops(s, [upsert('a', '/')])
+        self.assertEqual(item.preview, 'cached preview text')
+        self.assertEqual(item.preview_render, 'cached render sentinel')
+
+    def test_no_fields_patch_only_preserves_preview_cache(self):
+        # parent_id=None (patch-only) with no fields — same gate.
+        s, item = self._seed()
+        apply_ops(s, [upsert('a', None)])
+        self.assertEqual(item.preview, 'cached preview text')
+        self.assertEqual(item.preview_render, 'cached render sentinel')
+
+    def test_field_mutation_drops_preview_cache(self):
+        # Existing behaviour preserved: a real patch invalidates the
+        # cache (the displayed body may depend on the patched field).
+        s, item = self._seed()
+        apply_ops(s, [upsert('a', None, title='A2')])
+        self.assertIsNone(item.preview)
+        self.assertIsNone(item.preview_render)
+
+    def test_custom_attr_patch_drops_preview_cache(self):
+        # Custom attrs count as field changes too (recipes that compose
+        # previews from custom attrs need the invalidation).
+        s, item = self._seed()
+        apply_ops(s, [upsert('a', None, size=42)])
+        self.assertIsNone(item.preview)
+        self.assertIsNone(item.preview_render)
+
+
 class TestSet(unittest.TestCase):
     """``set`` is a full replace — new instance, defaults reverted."""
 
@@ -1281,6 +1325,40 @@ class TestModValidation(unittest.TestCase):
             apply_ops(s, [
                 ('mod', 'a', KEEP_PARENT, {}, ('not-a-keyword', None)),
             ])
+
+
+class TestModPreviewCacheGate(unittest.TestCase):
+    """``mod`` invalidates the preview cache only when fields change (#445)."""
+
+    def _seed(self):
+        s = State(root_id='/')
+        apply_ops(s, [upsert('a', '/', title='A')])
+        item = s._items_by_id['a']
+        item.preview = 'cached preview text'
+        item.preview_render = 'cached render sentinel'
+        return s, item
+
+    def test_no_fields_preserves_preview_cache(self):
+        s, item = self._seed()
+        apply_ops(s, [mod('a')])
+        self.assertEqual(item.preview, 'cached preview text')
+        self.assertEqual(item.preview_render, 'cached render sentinel')
+
+    def test_only_id_field_preserves_preview_cache(self):
+        # ``_apply_mod`` drops the ``id`` key from the patch; an
+        # id-only patch is effectively a no-op and must not invalidate.
+        s, item = self._seed()
+        apply_ops(s, [
+            ('mod', 'a', KEEP_PARENT, {'id': 'ignored'}),
+        ])
+        self.assertEqual(item.preview, 'cached preview text')
+        self.assertEqual(item.preview_render, 'cached render sentinel')
+
+    def test_field_mutation_drops_preview_cache(self):
+        s, item = self._seed()
+        apply_ops(s, [mod('a', title='A2')])
+        self.assertIsNone(item.preview)
+        self.assertIsNone(item.preview_render)
 
 
 # ---- `hidden` field + dirty propagation -----------------------------------

@@ -798,8 +798,14 @@ def _apply_upsert(state: State, id_, parent_id, fields, where=None) -> bool:
     # depend on any patched field (title in composed umbrellas, tag in
     # status-driven summaries, etc.). Recipes that compose previews
     # from sibling Items lean on this invalidation.
-    existing.preview = None
-    existing.preview_render = None
+    #
+    # Gate (#445): skip the drop for a no-op patch. The documented
+    # idempotent-ensure idiom (``upsert(id, parent)`` with no fields,
+    # used to register an Item before ``set_preview``) and reposition-
+    # only calls (``where=`` only) should not nuke a cached preview.
+    if fields:
+        existing.preview = None
+        existing.preview_render = None
 
     if parent_id is None:
         # Patch-only: leave parent unchanged. Mutating fields like
@@ -1007,8 +1013,13 @@ def _apply_mod(state: State, id_, parent_id, fields, where=None) -> bool:
     # Wrap cache (#422): the Item is being mutated. Drop both the raw
     # preview cache and the wrapped render. See ``_apply_upsert`` for
     # the rationale.
-    existing.preview = None
-    existing.preview_render = None
+    #
+    # Gate (#445): skip the drop for a no-op patch (no real fields,
+    # ignoring the discarded ``id`` key). Mirrors ``_apply_upsert``:
+    # mutate -> invalidate; no-op -> preserve cache.
+    if fields_no_id:
+        existing.preview = None
+        existing.preview_render = None
     structural = True
 
     if parent_id is KEEP_PARENT:
@@ -1893,11 +1904,12 @@ class Browser:
     """The TUI engine and async coordinator.
 
     Holds the data caches (``_state``), the cross-thread post queue
-    (``_main_queue``), the children FIFO worker, and the latest-wins
-    preview worker. All public mutation goes through ``post(fn)`` so
-    background threads (workers, watchers, signal handlers) are safe to
-    schedule work without taking locks -- the main thread drains the
-    queue on every wake.
+    (``_main_queue``), the children FIFO worker, and the preview worker
+    (latest-wins request slot, FIFO delivery via the post queue). All
+    public mutation goes through ``post(fn)`` so background threads
+    (workers, watchers, signal handlers) are safe to schedule work
+    without taking locks -- the main thread drains the queue on every
+    wake.
 
     Construction kwargs (full spec'd surface):
       title:              window title (renderer in #10).
@@ -3683,12 +3695,12 @@ class Browser:
             pass
 
     def drain_main_queue(self) -> int:
-        """Run all currently posted callables; return how many ran.
+        """Run posted callables until the queue is empty; return how many ran.
 
-        Runs only fns that were already in the queue when we started --
-        callables that post further work end up running on the next
-        drain (so there's no risk of a tight loop monopolising the main
-        thread). queue.Queue's get_nowait gives us the right semantics.
+        Callables that post further work end up running in the same
+        drain -- the loop keeps pulling via ``get_nowait`` until
+        ``queue.Empty`` is raised. The tight-loop risk this implies is
+        addressed elsewhere (callers throttle re-posting work).
         """
         n = 0
         while True:
