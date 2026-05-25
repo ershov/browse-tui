@@ -1087,7 +1087,7 @@ class TestTreeChildrenPreview(unittest.TestCase):
             saved = self.r._TREE_MODE
             try:
                 self.r._TREE_MODE = True
-                out = self.r._preview_umbrella(f'{path}#prompt:0')
+                out = ''.join(self.r._preview_umbrella(f'{path}#prompt:0'))
                 self.assertIn('PROBE_USER_PROMPT', out)
                 self.assertIn('PROBE_ASST_REPLY', out)
                 # Leaf preview: just the user prompt body (no children).
@@ -1123,7 +1123,7 @@ class TestTreeChildrenPreview(unittest.TestCase):
             saved = self.r._TREE_MODE
             try:
                 self.r._TREE_MODE = True
-                out = self.r._preview_umbrella(f'{path}#prompt:0')
+                out = ''.join(self.r._preview_umbrella(f'{path}#prompt:0'))
                 self.assertIn('PROBE_PROMPT', out)
                 self.assertIn('PROBE_BASH_CMD', out)
                 # Grandchild (inside the nested <tool> umbrella) is
@@ -1154,7 +1154,7 @@ class TestTreeChildrenPreview(unittest.TestCase):
                 def _boom(_obj):
                     raise RuntimeError('PROBE_BOOM_MSG')
                 self.r._RENDERERS['user'] = _boom
-                out = self.r._preview_umbrella(f'{path}#prompt:0')
+                out = ''.join(self.r._preview_umbrella(f'{path}#prompt:0'))
                 # The failing child's error appears…
                 self.assertIn('RuntimeError', out)
                 self.assertIn('PROBE_BOOM_MSG', out)
@@ -1188,7 +1188,7 @@ class TestTreeChildrenPreview(unittest.TestCase):
             saved = self.r._TREE_MODE
             try:
                 self.r._TREE_MODE = True
-                out = self.r._preview_umbrella(f'{path}#tool:1')
+                out = ''.join(self.r._preview_umbrella(f'{path}#tool:1'))
                 self.assertIn('PROBE_BASH_CMD', out)
                 self.assertIn('PROBE_BASH_OUTPUT', out)
             finally:
@@ -3239,7 +3239,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             self.r._TREE_CACHE.clear()
             # Compose the parent's <tool:Agent> umbrella preview — the
             # subagent's body must NOT bleed in via the umbrella cascade.
-            preview = self.r._preview_umbrella(f'{sess}#tool:1')
+            preview = ''.join(self.r._preview_umbrella(f'{sess}#tool:1'))
             self.assertNotIn('inside-subagent', preview)
 
 
@@ -3346,7 +3346,12 @@ class TestSessionRowVsScopeRootPreview(unittest.TestCase):
             self.r._BROWSER = _B(path)
             self.r._TREE_CACHE.clear()
             try:
-                out = self.r.get_preview(path)
+                # Umbrella branches return a generator (#460) — drain
+                # it for the substring assertions below.
+                result = self.r.get_preview(path)
+                out = (
+                    ''.join(result) if not isinstance(result, str) else result
+                )
             finally:
                 self.r._BROWSER = saved
             # Scope card + cascaded body content.
@@ -3376,7 +3381,11 @@ class TestSessionRowVsScopeRootPreview(unittest.TestCase):
             self.r._BROWSER = _B({path})
             self.r._TREE_CACHE.clear()
             try:
-                out = self.r.get_preview(path)
+                # Umbrella branches return a generator (#460).
+                result = self.r.get_preview(path)
+                out = (
+                    ''.join(result) if not isinstance(result, str) else result
+                )
             finally:
                 self.r._BROWSER = saved
             self.assertIn('body-line', out)
@@ -3477,7 +3486,11 @@ class TestSubagentRowLightweightPreview(unittest.TestCase):
             self.r._BROWSER = _B(item_id)
             self.r._TREE_CACHE.clear()
             try:
-                out = self.r.get_preview(item_id)
+                # Umbrella branches return a generator (#460).
+                result = self.r.get_preview(item_id)
+                out = (
+                    ''.join(result) if not isinstance(result, str) else result
+                )
             finally:
                 self.r._BROWSER = saved
             self.assertIn('SUBAGENT-INTERNAL-BODY', out)
@@ -3502,7 +3515,11 @@ class TestSubagentRowLightweightPreview(unittest.TestCase):
             self.r._BROWSER = _B({item_id})
             self.r._TREE_CACHE.clear()
             try:
-                out = self.r.get_preview(item_id)
+                # Umbrella branches return a generator (#460).
+                result = self.r.get_preview(item_id)
+                out = (
+                    ''.join(result) if not isinstance(result, str) else result
+                )
             finally:
                 self.r._BROWSER = saved
             self.assertIn('SUBAGENT-INTERNAL-BODY', out)
@@ -3609,7 +3626,11 @@ class TestScopeCard(unittest.TestCase):
         ])
         try:
             self.r._TREE_CACHE.clear()
-            out = self.r.get_preview(path)
+            # ``get_preview`` for a session id returns the umbrella
+            # generator (cross-file scope_root path) — drain it for
+            # the assertions below.
+            result = self.r.get_preview(path)
+            out = ''.join(result) if not isinstance(result, str) else result
             # Card sits at the head of the preview.
             self.assertIn('browse-claude', out)
             self.assertIn('s-uuid', out)
@@ -4614,14 +4635,16 @@ class TestVoiceOnlyFilter(unittest.TestCase):
         ])
         try:
             self.r._FILTER_VOICE_ONLY = False
-            full = self.r.get_preview(path)
+            # Session-path preview routes through the umbrella
+            # generator (#460); drain it for the assertions.
+            full = ''.join(self.r.get_preview(path))
             self.assertIn('PROBE_VOICE_TEXT', full)
             self.assertIn('PROBE_TOOL_NAME', full,
                           'without filter the tool body should appear')
             # Clear the tree cache so item builders re-read the filter.
             self.r._TREE_CACHE.clear()
             self.r._FILTER_VOICE_ONLY = True
-            filtered = self.r.get_preview(path)
+            filtered = ''.join(self.r.get_preview(path))
             self.assertIn('PROBE_VOICE_TEXT', filtered)
             self.assertNotIn('PROBE_TOOL_NAME', filtered,
                              'with filter the tool body must be hidden')
@@ -4653,10 +4676,14 @@ class TestVoiceOnlyFilter(unittest.TestCase):
         try:
             self.r._scan_tree(path)
             self.r._FILTER_VOICE_ONLY = True
-            preview_filtered = self.r._preview_umbrella(f'{path}#prompt:0')
+            preview_filtered = ''.join(
+                self.r._preview_umbrella(f'{path}#prompt:0'),
+            )
             # Without the filter the tool's machinery would appear.
             self.r._FILTER_VOICE_ONLY = False
-            preview_full = self.r._preview_umbrella(f'{path}#prompt:0')
+            preview_full = ''.join(
+                self.r._preview_umbrella(f'{path}#prompt:0'),
+            )
             # Sanity: full preview contains the tool's input.
             self.assertIn('ls /secret', preview_full)
             # Filtered preview drops the hidden tool umbrella entirely.
@@ -4883,7 +4910,7 @@ class TestUmbrellaPreviewCacheIntegration(unittest.TestCase):
         self.r._BROWSER = None
         path = self._make_three_record_session()
         try:
-            out = self.r._preview_umbrella(f'{path}#prompt:0')
+            out = ''.join(self.r._preview_umbrella(f'{path}#prompt:0'))
             self.assertIn('PROBE_USER', out)
             self.assertIn('PROBE_BASH', out)
             self.assertIn('PROBE_OUTPUT', out)
@@ -4898,14 +4925,14 @@ class TestUmbrellaPreviewCacheIntegration(unittest.TestCase):
         path = self._make_three_record_session()
         counter, restore = self._instrument_get_children()
         try:
-            self.r._preview_umbrella(f'{path}#prompt:0')
+            ''.join(self.r._preview_umbrella(f'{path}#prompt:0'))
             self.r._BROWSER.flush()
             first_pass_calls = list(counter['calls'])
             # First pass must have fetched both umbrellas.
             self.assertIn(f'{path}#prompt:0', first_pass_calls)
             self.assertIn(f'{path}#tool:1', first_pass_calls)
 
-            self.r._preview_umbrella(f'{path}#prompt:0')
+            ''.join(self.r._preview_umbrella(f'{path}#prompt:0'))
             self.r._BROWSER.flush()
             # No additional ``get_children`` calls — cache served
             # every read.
@@ -4919,14 +4946,14 @@ class TestUmbrellaPreviewCacheIntegration(unittest.TestCase):
             os.unlink(path)
 
     def test_leaf_previews_are_populated(self):
-        # After ``_preview_umbrella`` runs, every leaf child of the
+        # After ``_preview_umbrella`` drains, every leaf child of the
         # umbrella should have ``Item.preview`` populated. We check by
         # consulting the FakeBrowser's items_by_id index after the
         # post queue drains.
         self.r._BROWSER = _FakeBrowser()
         path = self._make_three_record_session()
         try:
-            self.r._preview_umbrella(f'{path}#prompt:0')
+            ''.join(self.r._preview_umbrella(f'{path}#prompt:0'))
             self.r._BROWSER.flush()
             # The leaf record ids are ``<path>#0``, ``<path>#1``,
             # ``<path>#2``. All three should have a non-empty
@@ -4946,17 +4973,19 @@ class TestUmbrellaPreviewCacheIntegration(unittest.TestCase):
             os.unlink(path)
 
     def test_eager_push_one_update_data_call_per_invocation(self):
-        # The composer should accumulate upserts across the recursive
-        # descent and flush them in exactly one ``update_data`` call.
+        # For a small descent (well under STREAM_BATCH=25 records),
+        # the composer should accumulate upserts and flush them in a
+        # single ``update_data`` call on the generator's ``finally:``
+        # path.
         self.r._BROWSER = _FakeBrowser()
         path = self._make_three_record_session()
         try:
-            self.r._preview_umbrella(f'{path}#prompt:0')
+            ''.join(self.r._preview_umbrella(f'{path}#prompt:0'))
             self.assertEqual(
                 len(self.r._BROWSER.update_data_calls), 1,
                 'composer should flush exactly one update_data batch '
-                'per top-level invocation; got '
-                f'{len(self.r._BROWSER.update_data_calls)}',
+                'per top-level invocation when records < STREAM_BATCH; '
+                f'got {len(self.r._BROWSER.update_data_calls)}',
             )
             # The batch should contain at least one upsert (the leaves
             # under the prompt umbrella).
@@ -4986,7 +5015,7 @@ class TestUmbrellaPreviewCacheIntegration(unittest.TestCase):
 
         self.r._render_record_with_rule = _counting_render
         try:
-            self.r._preview_umbrella(f'{path}#prompt:0')
+            ''.join(self.r._preview_umbrella(f'{path}#prompt:0'))
             self.r._BROWSER.flush()
             calls_after_first = list(render_calls)
             # First pass: the three leaves all rendered.
@@ -5024,7 +5053,7 @@ class TestUmbrellaPreviewCacheIntegration(unittest.TestCase):
             self.r._TREE_CACHE.pop(path, None)
 
             render_calls.clear()
-            self.r._preview_umbrella(f'{path}#prompt:0')
+            ''.join(self.r._preview_umbrella(f'{path}#prompt:0'))
             self.r._BROWSER.flush()
             # Second pass: only the new leaf re-renders. The three
             # existing leaves were cache hits.
@@ -5049,7 +5078,7 @@ class TestUmbrellaPreviewCacheIntegration(unittest.TestCase):
         self.r._BROWSER = _FakeBrowser()
         path = self._make_three_record_session()
         try:
-            self.r._preview_umbrella(f'{path}#prompt:0')
+            ''.join(self.r._preview_umbrella(f'{path}#prompt:0'))
             self.r._BROWSER.flush()
             # First expand: the framework consults its cache via
             # cached_children. The recipe-side composer has populated
@@ -5068,7 +5097,7 @@ class TestUmbrellaPreviewCacheIntegration(unittest.TestCase):
             # never re-asks ``get_children`` for this id.
             counter, restore = self._instrument_get_children()
             try:
-                self.r._preview_umbrella(f'{path}#prompt:0')
+                ''.join(self.r._preview_umbrella(f'{path}#prompt:0'))
                 self.r._BROWSER.flush()
                 self.assertNotIn(
                     f'{path}#prompt:0', counter['calls'],
@@ -5077,6 +5106,188 @@ class TestUmbrellaPreviewCacheIntegration(unittest.TestCase):
                 )
             finally:
                 restore()
+        finally:
+            os.unlink(path)
+
+
+class TestUmbrellaGenerator(unittest.TestCase):
+    """#459: ``_preview_umbrella`` is a generator yielding chunks.
+
+    Verifies:
+      * First yield is the scope card (when ``_scope_card_path`` resolves).
+      * Yields land in document order, one chunk per leaf.
+      * Full drain reproduces the substrings the old non-generator
+        implementation produced (sanity for the join-equivalence claim).
+      * Partial drain past STREAM_BATCH followed by ``gen.close()``
+        flushes the buffered side-effect ops via ``finally:``.
+      * A short partial drain (< STREAM_BATCH) closed early still
+        flushes via ``finally:``.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def setUp(self):
+        self._saved_BROWSER = self.r._BROWSER
+        self._saved_TREE_MODE = self.r._TREE_MODE
+        self.r._TREE_MODE = True
+
+    def tearDown(self):
+        self.r._BROWSER = self._saved_BROWSER
+        self.r._TREE_MODE = self._saved_TREE_MODE
+        self.r._TREE_CACHE.clear()
+
+    def _write_jsonl(self, records):
+        import json as _json
+        import tempfile
+        f = tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False)
+        for r in records:
+            f.write(_json.dumps(r) + '\n')
+        f.close()
+        return f.name
+
+    def _make_session(self, n_turns):
+        """Build a session with ``n_turns`` independent user-prompt records.
+
+        Each record is a turn-root prompt — no nested tool calls — so
+        every turn produces exactly one yielded leaf chunk under the
+        session's umbrella cascade.
+        """
+        records = []
+        for i in range(n_turns):
+            records.append({
+                'type': 'user', 'uuid': f'u{i}',
+                'message': {'role': 'user',
+                            'content': f'PROBE_TURN_{i:04d}'},
+            })
+        return self._write_jsonl(records)
+
+    def test_yields_scope_card_first(self):
+        # The session path resolves a scope-card path; the first yield
+        # is the rendered scope card. Subsequent yields are leaves.
+        self.r._BROWSER = None
+        path = self._make_session(2)
+        try:
+            gen = self.r._preview_umbrella(path)
+            first = next(gen)
+            # The scope card prints the recipe banner string;
+            # leaf chunks never carry it.
+            self.assertIn('browse-claude', first)
+            # Trailing separator on every chunk.
+            self.assertTrue(first.endswith('\n\n'))
+            # Drain to release file handles / generator state.
+            for _ in gen:
+                pass
+        finally:
+            os.unlink(path)
+
+    def test_yields_in_document_order(self):
+        # Pull each chunk one at a time and confirm the leaf order
+        # tracks the on-disk record order.
+        self.r._BROWSER = None
+        path = self._make_session(4)
+        try:
+            chunks = list(self.r._preview_umbrella(path))
+            # First chunk is the scope card; the remaining ``n``
+            # chunks should each carry exactly one PROBE_TURN_NNNN
+            # marker in ascending order.
+            leaf_chunks = [c for c in chunks if 'PROBE_TURN_' in c]
+            self.assertEqual(
+                len(leaf_chunks), 4,
+                f'expected one leaf chunk per turn; got {len(leaf_chunks)}',
+            )
+            for i, chunk in enumerate(leaf_chunks):
+                self.assertIn(f'PROBE_TURN_{i:04d}', chunk)
+        finally:
+            os.unlink(path)
+
+    def test_full_drain_matches_substrings(self):
+        # ``''.join(generator)`` over a small fixture should still
+        # contain every body the old non-generator umbrella produced.
+        self.r._BROWSER = None
+        path = self._make_session(3)
+        try:
+            full = ''.join(self.r._preview_umbrella(path))
+            for i in range(3):
+                self.assertIn(f'PROBE_TURN_{i:04d}', full)
+            # Scope card sits at the head.
+            head, _, _ = full.partition('PROBE_TURN_0000')
+            self.assertIn('browse-claude', head)
+        finally:
+            os.unlink(path)
+
+    def test_partial_drain_then_close_flushes_side_effects(self):
+        # STREAM_BATCH=25 — build a session large enough that pulling
+        # ~30 chunks crosses the batch boundary at least once. After
+        # ``gen.close()`` the ``finally:`` flush should have ensured
+        # the visited leaves have their ``Item.preview`` populated.
+        self.r._BROWSER = _FakeBrowser()
+        path = self._make_session(60)
+        try:
+            gen = self.r._preview_umbrella(path)
+            # Skip the scope card (first chunk).
+            next(gen)
+            pulled = 0
+            for _ in range(30):
+                try:
+                    next(gen)
+                    pulled += 1
+                except StopIteration:
+                    break
+            gen.close()
+            self.r._BROWSER.flush()
+            # The first STREAM_BATCH (25) leaves should have been
+            # flushed mid-stream; the remainder lands in the
+            # ``finally:`` flush. Count leaves with a populated
+            # preview slot.
+            populated = 0
+            for n in range(60):
+                cid = f'{path}#{n}'
+                item = self.r._BROWSER.items_by_id.get(cid)
+                if item is not None and item.preview:
+                    populated += 1
+            self.assertGreaterEqual(
+                populated, pulled,
+                f'expected at least {pulled} populated leaf previews '
+                f'(one per pulled chunk); got {populated}',
+            )
+            # Sanity: more than one ``update_data`` batch fired — the
+            # mid-stream flush at STREAM_BATCH and the ``finally:``
+            # flush are distinct posts.
+            self.assertGreaterEqual(
+                len(self.r._BROWSER.update_data_calls), 2,
+                'expected at least two update_data batches '
+                '(mid-stream + finally flush)',
+            )
+        finally:
+            os.unlink(path)
+
+    def test_finally_flushes_remainder(self):
+        # A short partial drain (well under STREAM_BATCH=25) should
+        # still see its visited leaves cached via the ``finally:``
+        # path on ``gen.close()``.
+        self.r._BROWSER = _FakeBrowser()
+        path = self._make_session(10)
+        try:
+            gen = self.r._preview_umbrella(path)
+            next(gen)   # scope card
+            pulled_ids = []
+            for n in range(5):
+                next(gen)
+                pulled_ids.append(f'{path}#{n}')
+            gen.close()
+            self.r._BROWSER.flush()
+            for cid in pulled_ids:
+                item = self.r._BROWSER.items_by_id.get(cid)
+                self.assertIsNotNone(
+                    item, f'leaf {cid} not registered',
+                )
+                self.assertTrue(
+                    item.preview,
+                    f'leaf {cid} preview should be flushed via '
+                    f'finally: on early close; got {item.preview!r}',
+                )
         finally:
             os.unlink(path)
 
