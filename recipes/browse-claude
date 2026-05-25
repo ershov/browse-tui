@@ -44,7 +44,9 @@ import os
 import sys
 import threading
 
-from browse_tui import Action, Browser, BrowserConfig, Item, mod, upsert
+from browse_tui import (
+    Action, Browser, BrowserConfig, Item, mod, scope_into, upsert,
+)
 
 # Optional md2ansi plugin — colors user/assistant voice content inline.
 try:
@@ -2129,8 +2131,14 @@ def get_preview(item_id):
     """
     if not isinstance(item_id, str) or item_id.startswith('__err__:'):
         return ''
-    if '#agent:' in item_id:
-        return _preview_umbrella(item_id)
+    # Cross-file rows (subagent group, bare session): heavy umbrella
+    # cascade only when committed (scope_root or expanded inline);
+    # cheap metadata card otherwise so scrolling stays cheap.
+    if _is_cross_file_id(item_id):
+        if _item_is_active(item_id):
+            return _preview_umbrella(item_id)
+        file_path = _scope_card_path(item_id)
+        return _preview_file_metadata(file_path) if file_path else ''
     if '#prompt:' in item_id or '#tool:' in item_id or '#span:' in item_id:
         return _preview_umbrella(item_id)
     if '#' in item_id:
@@ -2147,43 +2155,40 @@ def get_preview(item_id):
         return _preview_message(path, n)
     if os.path.isdir(item_id):
         return _preview_project(item_id)
-    if os.path.isfile(item_id) and item_id.endswith('.jsonl'):
-        # Two contexts share the bare-.jsonl id:
-        #   * row in a project's session list (scrolling — keep it
-        #     cheap; avoid scanning the file).
-        #   * scope_root (synthesised top row when the user scopes
-        #     in) — the user has committed to this session, render
-        #     the full cascade.
-        # Expanded-inline rows count as "committed" too: the user
-        # has actively opened the subtree.
-        if _session_is_active(item_id):
-            return _preview_umbrella(item_id)
-        return _preview_session_metadata(item_id)
     return ''
 
 
-def _session_is_active(path):
-    """True iff the session row should render its heavy preview.
+def _item_is_active(item_id):
+    """True iff the cursor row should render its heavy cascade preview.
 
     Heavy = full umbrella cascade + scope card. Cheap = metadata-only
-    card. ``_BROWSER is None`` (tests, headless mode) defaults to
-    heavy so existing behaviour is preserved.
+    card (path / sessionId / agentType / etc.). The rule is uniform
+    across cross-file row types (bare ``.jsonl`` session rows and
+    ``#agent:`` subagent umbrellas): the user has committed iff the
+    row is the current scope_root or is currently expanded inline.
+
+    ``_BROWSER is None`` (tests, headless mode) defaults to heavy so
+    existing behaviour is preserved.
     """
     if _BROWSER is None:
         return True
     state = _BROWSER._state
-    if state.scope_stack and state.scope_stack[-1] == path:
+    if state.scope_stack and state.scope_stack[-1] == item_id:
         return True
-    return path in state.expanded
+    return item_id in state.expanded
 
 
-def _preview_session_metadata(path):
-    """Cheap metadata-only preview for a session row in a parent list.
+def _preview_file_metadata(path):
+    """Cheap metadata-only preview for a cross-file row.
 
-    Reads only the first line of the file (for the Claude stamps) and
-    one ``os.stat``. Avoids ``_scan_tree`` entirely — scrolling
-    through a project of large transcripts must not block on parsing
-    megabytes of records.
+    Reads only the first line of the file (for the Claude stamps)
+    and one ``os.stat``. Avoids ``_scan_tree`` entirely — scrolling
+    through a project of large transcripts (or a session with many
+    subagents) must not block on parsing megabytes of records.
+
+    Detects the subagent variant when ``path`` lives under a
+    ``subagents/`` directory with a sibling ``.meta.json``; surfaces
+    agentId / agentType / description from the meta file.
     """
     rec = {}
     try:
@@ -2198,7 +2203,26 @@ def _preview_session_metadata(path):
                 pass
     except OSError:
         pass
+    is_sub = False
+    parent = os.path.dirname(path)
+    if os.path.basename(parent) == 'subagents':
+        fname = os.path.basename(path)
+        if fname.startswith('agent-') and fname.endswith('.jsonl'):
+            meta_path = os.path.join(parent,
+                                     fname[:-len('.jsonl')] + '.meta.json')
+            if os.path.isfile(meta_path):
+                is_sub = True
     rows = [('path', path)]
+    if is_sub:
+        agent_id = os.path.basename(path)[len('agent-'):-len('.jsonl')]
+        meta = _read_subagent_meta(os.path.join(
+            os.path.dirname(path), f'agent-{agent_id}.meta.json',
+        ))
+        rows.append(('agentId', agent_id))
+        if meta.get('agentType'):
+            rows.append(('agentType', meta['agentType']))
+        if meta.get('description'):
+            rows.append(('description', meta['description']))
     for key in ('sessionId', 'entrypoint', 'cwd', 'gitBranch', 'slug'):
         v = rec.get(key)
         if v:
@@ -2213,7 +2237,8 @@ def _preview_session_metadata(path):
         f'   {MUTE}{k.ljust(w)}:{RESET} {v}' for k, v in rows
     )
     hint = (f'\n\n{MUTE}(expand or scope in to see the transcript){RESET}')
-    return f'{_rule("browse-claude", BLUE)}\n{body}\n{_rule()}{hint}'
+    label = 'browse-claude (subagent)' if is_sub else 'browse-claude'
+    return f'{_rule(label, BLUE)}\n{body}\n{_rule()}{hint}'
 
 
 def _preview_project(path):
@@ -4415,6 +4440,67 @@ def _chain_expand_then_cursor(b, ancestor_ids, target_id):
     _step(0)
 
 
+def _is_cross_file_id(item_id):
+    """True iff ``item_id`` anchors a *different* file's content.
+
+    Cross-file rows render a lightweight metadata preview while the
+    row is in the parent listing; the heavy cascade only fires when
+    the user commits (scope_root or expanded inline). Returning True
+    tells :func:`_invalidate_if_cross_file` to drop the cached
+    preview whenever the row transitions into the active state, so
+    the next preview pass picks up the heavy cascade instead of the
+    stale metadata.
+    """
+    if not isinstance(item_id, str):
+        return False
+    if '#agent:' in item_id:
+        return True
+    if '#' not in item_id and item_id.endswith('.jsonl'):
+        return True
+    return False
+
+
+def _invalidate_if_cross_file(item_id):
+    """Drop the cached preview for ``item_id`` if it's cross-file.
+
+    Called from the right-arrow and scope-down overrides so the next
+    preview pass re-runs ``get_preview`` against the updated state
+    (expanded set / scope_stack) and upgrades the lightweight
+    metadata card to the heavy umbrella cascade.
+    """
+    if _BROWSER is None:
+        return
+    if _is_cross_file_id(item_id):
+        _BROWSER.invalidate_preview(item_id)
+
+
+def _action_scope_down(ctx):
+    """Scope-down override that invalidates cross-file previews.
+
+    Replicates the framework default (``_scope_down``) and then drops
+    the cached preview for the new scope_root if it's a cross-file
+    id, so the framework re-runs ``get_preview`` against the updated
+    scope_stack — the row transitions from lightweight metadata to
+    the heavy umbrella cascade.
+    """
+    cur = ctx.cursor
+    if cur is None:
+        return
+    if not getattr(cur, 'has_children', False):
+        return
+    state = ctx._browser._state
+    target_id = cur.id
+    # Use the framework's scope_into directly; it pushes the id onto
+    # ``scope_stack`` and restores the per-scope expanded set.
+    scope_into(state, target_id)
+    state.cursor = 0
+    if target_id not in state._children:
+        ctx.expand(target_id)
+    ctx._browser._needs_redraw.add('all')
+    ctx._browser._fire_scope_change()
+    _invalidate_if_cross_file(target_id)
+
+
 def _action_tree_right(ctx):
     """Right-arrow override: expand + jump to latest voice in tree mode.
 
@@ -4435,6 +4521,7 @@ def _action_tree_right(ctx):
     if not _TREE_MODE or not expandable:
         if expandable and cur.id not in expanded:
             ctx.expand(cur.id, autoscroll=True)
+            _invalidate_if_cross_file(cur.id)
             return
         # Step into first child if cursor's next visible row is deeper.
         try:
@@ -4473,6 +4560,7 @@ def _action_tree_right(ctx):
         if latest is not None and latest != target_id:
             ctx.cursor_to(latest)
     ctx.expand(target_id, autoscroll=True).then(_land)
+    _invalidate_if_cross_file(target_id)
 
 
 def _action_toggle_tree(ctx):
@@ -4731,6 +4819,11 @@ def main():
             # Tree-mode-aware Right: expand + jump to latest voice
             # inside the now-visible subtree.
             Action('right', 'Expand + cursor to latest voice', _action_tree_right,  'cursor'),
+            # Scope-down override invalidates the cross-file preview
+            # cache so the new scope_root upgrades from the lightweight
+            # metadata card to the heavy umbrella cascade on the next
+            # preview pass.
+            Action('alt-down', 'Scope down into item',          _action_scope_down,  'cursor'),
         ],
         help_intro=_HELP_INTRO_TMPL.format(default=_MESSAGE_LIMIT),
     ))

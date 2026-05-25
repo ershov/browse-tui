@@ -68,6 +68,11 @@ def _stub_browse_tui():
         return ('mod', id_, parent_id, fields, where)
     mod.mod = _mod
 
+    # scope_into is used by the alt-down override; the recipe imports
+    # it from browse_tui. Tests don't exercise the action so a no-op
+    # is fine — but the symbol must exist for the import to succeed.
+    mod.scope_into = lambda state, item_id: None
+
     sys.modules['browse_tui'] = mod
 
 
@@ -3259,7 +3264,7 @@ class TestSessionRowVsScopeRootPreview(unittest.TestCase):
                          'content': [{'type': 'text', 'text': 'reply body'}]}},
         ])
         try:
-            out = self.r._preview_session_metadata(path)
+            out = self.r._preview_file_metadata(path)
             self.assertIn('browse-claude', out)
             self.assertIn(path, out)
             self.assertIn('s-uuid', out)
@@ -3274,21 +3279,21 @@ class TestSessionRowVsScopeRootPreview(unittest.TestCase):
             os.unlink(path)
 
     def test_metadata_preview_no_scan_tree(self):
-        # _preview_session_metadata must NOT populate _TREE_CACHE.
+        # _preview_file_metadata must NOT populate _TREE_CACHE.
         path = self._write([
             {'type': 'user', 'sessionId': 's',
              'message': {'role': 'user', 'content': 'hi'}},
         ])
         try:
             self.r._TREE_CACHE.clear()
-            self.r._preview_session_metadata(path)
+            self.r._preview_file_metadata(path)
             self.assertNotIn(path, self.r._TREE_CACHE,
                              '_scan_tree should not have been called')
         finally:
             os.unlink(path)
 
     def test_get_preview_session_row_goes_through_metadata(self):
-        # No _BROWSER → _session_is_active returns True; force the
+        # No _BROWSER → _item_is_active returns True; force the
         # context by stashing a fake browser with empty scope/expand.
         path = self._write([
             {'type': 'user', 'sessionId': 'sid',
@@ -3370,6 +3375,130 @@ class TestSessionRowVsScopeRootPreview(unittest.TestCase):
             self.assertIn('body-line', out)
         finally:
             os.unlink(path)
+
+
+class TestSubagentRowLightweightPreview(unittest.TestCase):
+    """``#agent:`` rows follow the same cross-file rule as session rows:
+    lightweight metadata until the row is scope_root or expanded.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _build(self, tmp):
+        import json as _json
+        proj = os.path.join(tmp, '-x')
+        os.makedirs(proj)
+        sess = os.path.join(proj, 'parent-sid.jsonl')
+        with open(sess, 'w') as f:
+            f.write(_json.dumps({
+                'type': 'user', 'sessionId': 'parent-sid',
+                'message': {'role': 'user', 'content': 'go'},
+            }) + '\n')
+        sub_dir = os.path.join(proj, 'parent-sid', 'subagents')
+        os.makedirs(sub_dir)
+        agent_path = os.path.join(sub_dir, 'agent-A1.jsonl')
+        with open(agent_path, 'w') as f:
+            f.write(_json.dumps({
+                'type': 'user', 'sessionId': 'parent-sid',
+                'message': {'role': 'user',
+                            'content': 'SUBAGENT-INTERNAL-BODY'},
+            }) + '\n')
+        with open(os.path.join(sub_dir, 'agent-A1.meta.json'), 'w') as fm:
+            _json.dump({'agentType': 'general-purpose',
+                        'description': 'compose previews'}, fm)
+        return sess, agent_path
+
+    def test_metadata_preview_for_subagent_path(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, agent_path = self._build(tmp)
+            out = self.r._preview_file_metadata(agent_path)
+            self.assertIn('subagent', out)
+            self.assertIn('A1', out)
+            self.assertIn('general-purpose', out)
+            self.assertIn('compose previews', out)
+            self.assertIn(agent_path, out)
+            # Body of the subagent jsonl must NOT appear.
+            self.assertNotIn('SUBAGENT-INTERNAL-BODY', out)
+
+    def test_get_preview_subagent_row_inactive_metadata(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, agent_path = self._build(tmp)
+            item_id = f'{sess}#agent:A1'
+            class _S:
+                scope_stack = []
+                expanded = set()
+            class _B:
+                _state = _S()
+                def cached_children(self, _id): return None
+                def update_data(self, _ops): pass
+                def set_preview(self, _id, _text): pass
+                items_by_id = {}
+            saved = self.r._BROWSER
+            self.r._BROWSER = _B()
+            self.r._TREE_CACHE.clear()
+            try:
+                out = self.r.get_preview(item_id)
+            finally:
+                self.r._BROWSER = saved
+            self.assertIn('subagent', out)
+            self.assertIn('A1', out)
+            self.assertNotIn('SUBAGENT-INTERNAL-BODY', out)
+            self.assertNotIn(agent_path, self.r._TREE_CACHE,
+                             'no _scan_tree on inactive subagent row')
+
+    def test_get_preview_subagent_row_scope_root_active(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, agent_path = self._build(tmp)
+            item_id = f'{sess}#agent:A1'
+            class _S:
+                def __init__(self, scope):
+                    self.scope_stack = [scope]
+                    self.expanded = set()
+            class _B:
+                def __init__(self, scope):
+                    self._state = _S(scope)
+                def cached_children(self, _id): return None
+                def update_data(self, _ops): pass
+                def set_preview(self, _id, _text): pass
+                items_by_id = {}
+            saved = self.r._BROWSER
+            self.r._BROWSER = _B(item_id)
+            self.r._TREE_CACHE.clear()
+            try:
+                out = self.r.get_preview(item_id)
+            finally:
+                self.r._BROWSER = saved
+            self.assertIn('SUBAGENT-INTERNAL-BODY', out)
+
+    def test_get_preview_subagent_row_expanded_active(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, agent_path = self._build(tmp)
+            item_id = f'{sess}#agent:A1'
+            class _S:
+                def __init__(self, expanded):
+                    self.scope_stack = []
+                    self.expanded = expanded
+            class _B:
+                def __init__(self, expanded):
+                    self._state = _S(expanded)
+                def cached_children(self, _id): return None
+                def update_data(self, _ops): pass
+                def set_preview(self, _id, _text): pass
+                items_by_id = {}
+            saved = self.r._BROWSER
+            self.r._BROWSER = _B({item_id})
+            self.r._TREE_CACHE.clear()
+            try:
+                out = self.r.get_preview(item_id)
+            finally:
+                self.r._BROWSER = saved
+            self.assertIn('SUBAGENT-INTERNAL-BODY', out)
 
 
 class TestScopeCard(unittest.TestCase):

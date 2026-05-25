@@ -819,10 +819,16 @@ class TestBrowseClaude(unittest.TestCase):
                 t.send('Down')
                 t.send('Right')
                 t.wait_for('PROBE-DESC', timeout=3.0)
-                # Subagent rows sort first per the recipe — cursor should
-                # be on it after the inward drill, so Right expands it.
-                t.send('Right')
-                t.wait_for('subagent task', timeout=3.0)
+                t.wait_stable()
+                # Cursor sits on the session row after the inward
+                # drill; first Right is the second toggle (steps
+                # cursor to first child = subagent row), the next
+                # Right expands the subagent. Subagent rows now use a
+                # lightweight metadata preview, so the body only
+                # appears once we actually expand inline.
+                t.send('Right')   # step cursor onto subagent row
+                t.send('Right')   # expand subagent
+                t.wait_for('subagent task', timeout=5.0)
                 t.send('q')
 
 
