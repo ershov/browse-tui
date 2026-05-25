@@ -2085,6 +2085,26 @@ class BrowserConfig:
     _headless: bool = False
 
 
+# Streaming preview cap derivation (#458 / streaming-umbrella spec §3).
+#
+# ``_stream_preview_from_generator`` re-reads its line cap each pause
+# cycle via ``Browser._preview_cap_lines()`` so a terminal resize takes
+# effect on the next cap window. The cap is sized in screens of the
+# preview pane:
+#
+#   * ``STREAM_CAP_FACTOR = 3`` → ~3 screens of buffered scrollback,
+#     well past the ``_PREVIEW_DEMAND_THRESHOLD = 12`` (050-render.py)
+#     so the demand-resume kicks in long before the user scrolls into
+#     unbuffered territory.
+#   * ``MIN_CAP_LINES = 50`` → floor for the cold-start case where the
+#     pane height hasn't been measured yet (no tty, headless tests).
+#
+# The char cap (``preview_buffer_cap_chars``) stays as the static
+# memory safety net — it doesn't scale with pane size.
+STREAM_CAP_FACTOR = 3
+MIN_CAP_LINES = 50
+
+
 class Browser:
     """The TUI engine and async coordinator.
 
@@ -4717,15 +4737,20 @@ class Browser:
         """
         chars = 0
         lines = 0
+        # ``cap_chars`` is the static memory safety net (config-bound,
+        # doesn't move with terminal size). ``cap_lines`` is re-derived
+        # from the preview pane height via ``_preview_cap_lines()`` at
+        # every cap event (#458 / streaming-umbrella spec §3) so a
+        # terminal resize takes effect on the next cap window without
+        # restarting the generator.
         cap_chars = self._preview_buffer_cap_chars
-        cap_lines = self._preview_buffer_cap_lines
         # Cumulative caps grow by one window per #274 demand-resume so
         # the local counters can stay running totals (matching the
         # reported ``_preview_paused['chars']`` / ``['lines']``
         # semantics from #273 — the dict records the buffer size at
         # pause time).
         next_cap_chars = cap_chars
-        next_cap_lines = cap_lines
+        next_cap_lines = self._preview_cap_lines()
         try:
             while True:
                 if self._stop:
@@ -4786,8 +4811,11 @@ class Browser:
                     # pinned is intentional — Shift-End is a deliberate
                     # opt-in (see streaming-umbrella spec §2).
                     if self._preview_at_tail:
+                        # Re-derive ``cap_lines`` per cap event (#458)
+                        # so a resize between windows takes effect even
+                        # while we're sailing through under tail-pin.
                         next_cap_chars = chars + cap_chars
-                        next_cap_lines = lines + cap_lines
+                        next_cap_lines = lines + self._preview_cap_lines()
                         continue
                     # Pause. Record the live generator so a cursor-move
                     # can abandon it (closing fires recipe ``finally``)
@@ -4860,8 +4888,11 @@ class Browser:
                             # Advance cap thresholds by one window so
                             # the running ``chars``/``lines`` totals
                             # stay cumulative across resume cycles.
+                            # Re-derive ``cap_lines`` per resume (#458)
+                            # so the next window reflects the current
+                            # pane height.
                             next_cap_chars = chars + cap_chars
-                            next_cap_lines = lines + cap_lines
+                            next_cap_lines = lines + self._preview_cap_lines()
                             break
                         # Was the paused state cleared from outside?
                         # (e.g. ``_abandon_paused_preview_if_any``
@@ -5288,6 +5319,54 @@ class Browser:
             return h if h > 0 else 0
         except Exception:
             return 0
+
+    def _preview_pane_height_safe(self) -> int:
+        """Return the preview pane's content height, or 0 if unknown.
+
+        Mirrors ``_preview_pane_height`` in 070-actions.py but lives
+        here so the streaming worker (state layer) can read it without
+        crossing into the action layer. ``layout_panes`` reports the
+        preview rect including the separator row; subtract 1 to get the
+        scrollable content height. Returns 0 in headless / no-tty
+        contexts so callers can fall back to a floor.
+        """
+        try:
+            ts = globals().get('term_size')
+            lp = globals().get('layout_panes')
+            if ts is None or lp is None:
+                return 0
+            cols, rows = ts()
+            layout = lp(
+                cols, rows,
+                split=self.split,
+                show_preview=self.show_preview,
+                show_children_pane=self.show_children_pane,
+                list_ratio=self.list_ratio,
+            )
+            prev_rect = layout.get('preview')
+            if prev_rect is None:
+                return 0
+            h = prev_rect.height - 1  # exclude separator row
+            return h if h > 0 else 0
+        except Exception:
+            return 0
+
+    def _preview_cap_lines(self) -> int:
+        """Streaming preview line cap derived from the preview pane.
+
+        Re-read once per pause cycle by
+        ``_stream_preview_from_generator`` so a terminal resize takes
+        effect on the next cap window without restarting the
+        generator. Returns
+        ``max(preview_pane_height * STREAM_CAP_FACTOR, MIN_CAP_LINES)``
+        (streaming-umbrella spec §3 / ticket #458).
+
+        The companion char cap (``_preview_buffer_cap_chars``) stays
+        static — it's the memory safety net, not the screen-fit
+        sizing.
+        """
+        height = self._preview_pane_height_safe()
+        return max(height * STREAM_CAP_FACTOR, MIN_CAP_LINES)
 
     def _snap_list_scroll_to_row(self, row: int) -> None:
         """Adjust ``_list_scroll`` so visible-list ``row`` is on-screen.

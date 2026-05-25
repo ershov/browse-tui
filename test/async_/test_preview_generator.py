@@ -937,5 +937,177 @@ class TestDrainWhenPinned(unittest.TestCase):
             b.stop_workers()
 
 
+class TestScreenDerivedCap(unittest.TestCase):
+    """#458: streaming line cap is derived from the preview pane height.
+
+    Spec §3 / streaming-umbrella: ``_stream_preview_from_generator``
+    re-reads its line cap from ``Browser._preview_cap_lines()`` once
+    per pause cycle. The cap is
+    ``max(pane_height * STREAM_CAP_FACTOR, MIN_CAP_LINES)`` with
+    ``STREAM_CAP_FACTOR = 3`` and ``MIN_CAP_LINES = 50``. Terminal
+    resizes adjust the next cap window naturally; ``cap_chars`` stays
+    as the static memory safety net.
+    """
+
+    def _pin_preview_height(self, browser, height):
+        """Stub ``_preview_pane_height_safe`` so we don't need a tty /
+        ``layout_panes`` wiring to drive the derived cap.
+        """
+        browser._preview_pane_height_safe = lambda: height
+
+    def test_pause_fires_near_pane_height_times_factor(self):
+        # Pane height = 20. Expected cap = 20 * 3 = 60 lines (above
+        # the MIN_CAP_LINES=50 floor, well below the static 1000-line
+        # config default). If the cap weren't re-derived per pause,
+        # the generator would buffer ~1000 lines before pausing.
+        # Asserting the pause fires at exactly 60 yields proves the
+        # screen-derived cap is in effect.
+        yield_count = {'n': 0}
+
+        def get_preview(_id):
+            while True:
+                yield_count['n'] += 1
+                yield 'l\n'  # one line per yield
+
+        b = make_browser(
+            get_children=lambda _, *, reload=False: [Item(id='a')],
+            get_preview=get_preview,
+            root_id='/',
+            # Char cap stays generous so the line cap is what trips.
+            preview_buffer_cap_chars=1_000_000,
+            preview_buffer_cap_lines=1000,
+        )
+        try:
+            self._pin_preview_height(b, 20)
+            b.refresh('/')
+            b.run_until_idle()
+            b.request_preview('a')
+            # Wait until paused.
+            self.assertTrue(
+                _drain_until(b, lambda: b._preview_paused is not None),
+                'worker did not enter paused state',
+            )
+            paused = b._preview_paused
+            self.assertEqual(paused['id'], 'a')
+            # Pause fires at 60 lines (20 * STREAM_CAP_FACTOR), not at
+            # the 1000-line static config default.
+            self.assertEqual(paused['lines'], 60)
+            self.assertEqual(yield_count['n'], 60)
+            # And the worker actually stopped pulling.
+            initial = yield_count['n']
+            time.sleep(0.05)
+            b.drain_main_queue()
+            self.assertEqual(yield_count['n'], initial)
+        finally:
+            b.stop_workers()
+
+    def test_min_cap_floor_when_pane_height_zero(self):
+        # Pane height = 0 (cold start / no tty). Expected cap = floor
+        # of MIN_CAP_LINES = 50.
+        yield_count = {'n': 0}
+
+        def get_preview(_id):
+            while True:
+                yield_count['n'] += 1
+                yield 'l\n'
+
+        b = make_browser(
+            get_children=lambda _, *, reload=False: [Item(id='a')],
+            get_preview=get_preview,
+            root_id='/',
+            preview_buffer_cap_chars=1_000_000,
+            preview_buffer_cap_lines=1000,
+        )
+        try:
+            self._pin_preview_height(b, 0)
+            b.refresh('/')
+            b.run_until_idle()
+            b.request_preview('a')
+            self.assertTrue(
+                _drain_until(b, lambda: b._preview_paused is not None),
+                'worker did not enter paused state',
+            )
+            paused = b._preview_paused
+            self.assertEqual(paused['lines'], 50)
+            self.assertEqual(yield_count['n'], 50)
+        finally:
+            b.stop_workers()
+
+    def test_preview_cap_lines_method_returns_expected_values(self):
+        # Direct unit-test of the derivation method itself, independent
+        # of the worker thread.
+        b = make_browser(
+            get_children=lambda _, *, reload=False: [Item(id='a')],
+            get_preview=lambda _id: '',
+            root_id='/',
+        )
+        try:
+            self._pin_preview_height(b, 20)
+            self.assertEqual(b._preview_cap_lines(), 60)  # 20 * 3
+            self._pin_preview_height(b, 100)
+            self.assertEqual(b._preview_cap_lines(), 300)  # 100 * 3
+            # Floor: tiny / zero pane → MIN_CAP_LINES.
+            self._pin_preview_height(b, 0)
+            self.assertEqual(b._preview_cap_lines(), 50)
+            self._pin_preview_height(b, 5)
+            self.assertEqual(b._preview_cap_lines(), 50)  # 5*3=15 < 50
+        finally:
+            b.stop_workers()
+
+    def test_resize_between_windows_takes_effect_next_pause(self):
+        # Verify the cap re-reads per pause cycle, not once at start.
+        # First pause: pane height 20 → cap 60. "Resize" to height 40
+        # → next cap window should be lines + 40*3 = 60 + 120 = 180.
+        yield_count = {'n': 0}
+
+        def get_preview(_id):
+            while True:
+                yield_count['n'] += 1
+                yield 'l\n'
+
+        b = make_browser(
+            get_children=lambda _, *, reload=False: [Item(id='a')],
+            get_preview=get_preview,
+            root_id='/',
+            preview_buffer_cap_chars=1_000_000,
+            preview_buffer_cap_lines=1000,
+        )
+        try:
+            self._pin_preview_height(b, 20)
+            b.refresh('/')
+            b.run_until_idle()
+            b.request_preview('a')
+            self.assertTrue(
+                _drain_until(b, lambda: b._preview_paused is not None),
+                'worker did not enter paused state at first cap',
+            )
+            self.assertEqual(b._preview_paused['lines'], 60)
+
+            # "Resize" the terminal — bump pane height. Trigger the
+            # demand-resume so the worker re-enters its cap derivation.
+            self._pin_preview_height(b, 40)
+            with b._preview_lock:
+                b._preview_resume_pull = True
+            b._preview_resume_event.set()
+
+            # Wait until the worker pauses again at the next window.
+            self.assertTrue(
+                _drain_until(
+                    b,
+                    lambda: (
+                        b._preview_paused is not None
+                        and b._preview_paused['lines'] > 60
+                    ),
+                ),
+                f"worker did not pause at the widened cap; "
+                f"paused={b._preview_paused!r}",
+            )
+            # Window is the freshly-derived 40*3 = 120 lines beyond
+            # the previous 60-line pause → 180 lines buffered.
+            self.assertEqual(b._preview_paused['lines'], 180)
+        finally:
+            b.stop_workers()
+
+
 if __name__ == '__main__':
     unittest.main()
