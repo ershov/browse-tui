@@ -863,6 +863,11 @@ def _is_voice(obj):
     a tool_use call, is machinery — kind/tag already calls it out, we
     don't want to dye those rows. ``queue-operation`` records also
     count as voice (the user typed something while Claude was working).
+
+    ``AskUserQuestion`` is the one tool that *is* dialog: the assistant's
+    tool_use is the question itself, and the user's tool_result is the
+    answer. Both halves count as voice — detected structurally by tool
+    name and by the ``{questions, answers}`` shape on ``toolUseResult``.
     """
     t = obj.get('type')
     if t == 'queue-operation':
@@ -875,9 +880,17 @@ def _is_voice(obj):
         return bool(content.strip())
     if isinstance(content, list):
         for p in content:
-            if isinstance(p, dict) and p.get('type') == 'text':
-                if (p.get('text') or '').strip():
-                    return True
+            if not isinstance(p, dict):
+                continue
+            pt = p.get('type')
+            if pt == 'text' and (p.get('text') or '').strip():
+                return True
+            if pt == 'tool_use' and p.get('name') == 'AskUserQuestion':
+                return True
+        if t == 'user':
+            tur = obj.get('toolUseResult')
+            if isinstance(tur, dict) and 'questions' in tur and 'answers' in tur:
+                return True
         return False
     return False
 
@@ -1528,16 +1541,93 @@ def _fmt_tool_use_skill(inp):
     return f'{MAGENTA}{skill}{RESET}' + (f'  {MUTE}args:{RESET} {args}' if args else '')
 
 
+def _fmt_ask_user_question(questions, answers=None, annotations=None):
+    """Render an AskUserQuestion payload as markdown.
+
+    Shared by both directions: the tool_use side passes ``answers=None``;
+    the tool_result side passes ``answers``/``annotations`` from
+    ``toolUseResult``. Output is plain markdown — the caller pipes it
+    through ``_md_voice`` so md2ansi (when available) colors it like
+    other voice content.
+    """
+    if not isinstance(questions, list) or not questions:
+        return ''
+    answers = answers if isinstance(answers, dict) else {}
+    annotations = annotations if isinstance(annotations, dict) else {}
+    blocks = []
+    for q in questions:
+        if not isinstance(q, dict):
+            continue
+        qtext = q.get('question', '')
+        blocks.append(_fmt_aq_one(q, answers.get(qtext), annotations.get(qtext)))
+    return '\n\n'.join(b for b in blocks if b)
+
+
+def _fmt_aq_one(q, answer, annotation):  # noqa: ARG001 — annotation reserved
+    """Render one question + its options as a markdown block.
+
+    ``answer`` is the user's pick (string or list for multiSelect, or
+    None on the tool_use side). Options whose label matches the answer
+    flip to a filled glyph. Any answer that doesn't match a known label
+    is surfaced separately as ``**Other:** "..."``.
+    """
+    text = q.get('question', '?')
+    header = q.get('header', '')
+    multi = bool(q.get('multiSelect'))
+    options = q.get('options') or []
+
+    if answer is None:
+        selected = set()
+    elif isinstance(answer, list):
+        selected = {a for a in answer if isinstance(a, str)}
+    elif isinstance(answer, str):
+        selected = {answer}
+    else:
+        selected = set()
+    option_labels = {o.get('label') for o in options if isinstance(o, dict)}
+    other_answers = [a for a in selected if a not in option_labels]
+
+    glyph_off, glyph_on = ('☐', '☑') if multi else ('◯', '●')
+    head = f'**{header}:** {text}' if header else f'**{text}**'
+    lines = [head, '']
+    for i, opt in enumerate(options, 1):
+        if not isinstance(opt, dict):
+            continue
+        label = opt.get('label', '?')
+        desc = opt.get('description', '') or ''
+        glyph = glyph_on if label in selected else glyph_off
+        lines.append(f'{i}. {glyph} **{label}**')
+        if desc:
+            for ln in desc.splitlines():
+                lines.append(f'   {ln}')
+        preview = opt.get('preview', '') or ''
+        if preview:
+            lines.append('')
+            lines.append('   ```')
+            for ln in preview.splitlines():
+                lines.append(f'   {ln}')
+            lines.append('   ```')
+    for other in other_answers:
+        lines.append('')
+        lines.append(f'**Other:** "{other}"')
+    return '\n'.join(lines)
+
+
+def _fmt_tool_use_ask_user_question(inp):
+    return _md_voice(_fmt_ask_user_question(inp.get('questions')))
+
+
 _TOOL_USE_FORMATTERS = {
-    'Bash':  _fmt_tool_use_bash,
-    'Read':  _fmt_tool_use_read,
-    'Edit':  _fmt_tool_use_edit,
-    'Write': _fmt_tool_use_write,
-    'Grep':  _fmt_tool_use_grep,
-    'Glob':  _fmt_tool_use_glob,
-    'Agent': _fmt_tool_use_agent,
-    'Task':  _fmt_tool_use_agent,
-    'Skill': _fmt_tool_use_skill,
+    'Bash':             _fmt_tool_use_bash,
+    'Read':             _fmt_tool_use_read,
+    'Edit':             _fmt_tool_use_edit,
+    'Write':            _fmt_tool_use_write,
+    'Grep':             _fmt_tool_use_grep,
+    'Glob':             _fmt_tool_use_glob,
+    'Agent':            _fmt_tool_use_agent,
+    'Task':             _fmt_tool_use_agent,
+    'Skill':            _fmt_tool_use_skill,
+    'AskUserQuestion':  _fmt_tool_use_ask_user_question,
 }
 
 
@@ -1597,6 +1687,8 @@ def _fmt_tool_use_result(tur, raw_content):
         return _fmt_tur_subagent(tur)
     if 'commandName' in keys and 'success' in keys:
         return _fmt_tur_skill(tur)
+    if 'questions' in keys and 'answers' in keys:
+        return _fmt_tur_ask_user_question(tur)
     return _fmt_tur_default(tur)
 
 
@@ -1756,6 +1848,11 @@ def _fmt_tur_skill(tur):
     ok = bool(tur.get('success'))
     color = GREEN if ok else RED
     return f'{MAGENTA}{name}{RESET}  {color}[{"ok" if ok else "fail"}]{RESET}'
+
+
+def _fmt_tur_ask_user_question(tur):
+    return _md_voice(_fmt_ask_user_question(
+        tur.get('questions'), tur.get('answers'), tur.get('annotations')))
 
 
 def _fmt_tur_default(tur):

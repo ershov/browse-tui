@@ -5081,5 +5081,156 @@ class TestUmbrellaPreviewCacheIntegration(unittest.TestCase):
             os.unlink(path)
 
 
+class TestAskUserQuestion(unittest.TestCase):
+    """``AskUserQuestion`` renders the request *and* the reply through a
+    shared markdown formatter, and both halves count as voice."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _input(self, multi=False):
+        return {'questions': [{
+            'question': 'How should the batch API be shaped?',
+            'header': 'API shape',
+            'multiSelect': multi,
+            'options': [
+                {'label': 'Add preview ops to update_data',
+                 'description': 'Op tuples set_preview/append_preview.',
+                 'preview': 'ops = [...]\nb.update_data(ops)'},
+                {'label': 'Add plural convenience methods',
+                 'description': 'set_previews({id: text}) etc.'},
+                {'label': 'Both: ops + plural wrappers',
+                 'description': 'Recipes pick what reads best.'},
+            ],
+        }]}
+
+    def _tur(self, answer, multi=False, annotation=None):
+        inp = self._input(multi=multi)
+        q = inp['questions'][0]['question']
+        return {
+            'questions': inp['questions'],
+            'answers': {q: answer},
+            'annotations': ({q: {'preview': annotation}} if annotation else {}),
+        }
+
+    def test_tool_use_renders_question_and_options(self):
+        out = self.r._render_assistant({
+            'type': 'assistant',
+            'message': {'role': 'assistant', 'content': [{
+                'type': 'tool_use', 'id': 'tu', 'name': 'AskUserQuestion',
+                'input': self._input(),
+            }]},
+        })
+        self.assertIn('🔧 AskUserQuestion', out)
+        # Header chip prefix + the full question text are present.
+        self.assertIn('API shape:', out)
+        self.assertIn('How should the batch API be shaped?', out)
+        # Every option label is present, none is marked as chosen.
+        self.assertIn('Add preview ops to update_data', out)
+        self.assertIn('Add plural convenience methods', out)
+        self.assertIn('Both: ops + plural wrappers', out)
+        self.assertIn('◯', out)
+        self.assertNotIn('●', out)
+        # Numbered list + preview code fence both appear.
+        self.assertIn('1.', out)
+        self.assertIn('```', out)
+        self.assertIn('ops = [...]', out)
+
+    def test_tool_use_multiselect_uses_checkboxes(self):
+        out = self.r._render_assistant({
+            'type': 'assistant',
+            'message': {'role': 'assistant', 'content': [{
+                'type': 'tool_use', 'name': 'AskUserQuestion',
+                'input': self._input(multi=True),
+            }]},
+        })
+        self.assertIn('☐', out)
+        self.assertNotIn('☑', out)
+
+    def test_tool_result_marks_chosen_option(self):
+        out = self.r._render_user({
+            'type': 'user',
+            'message': {'role': 'user', 'content': [{
+                'type': 'tool_result', 'tool_use_id': 'tu', 'content': '',
+            }]},
+            'toolUseResult': self._tur('Add preview ops to update_data'),
+        })
+        # Chosen option carries the filled glyph; the others keep ◯.
+        self.assertIn('● **Add preview ops to update_data**', out)
+        self.assertIn('◯ **Add plural convenience methods**', out)
+        self.assertIn('◯ **Both: ops + plural wrappers**', out)
+
+    def test_tool_result_multiselect_marks_each_chosen(self):
+        out = self.r._render_user({
+            'type': 'user',
+            'message': {'role': 'user', 'content': [{
+                'type': 'tool_result', 'tool_use_id': 'tu', 'content': '',
+            }]},
+            'toolUseResult': self._tur(
+                ['Add preview ops to update_data', 'Both: ops + plural wrappers'],
+                multi=True),
+        })
+        self.assertIn('☑ **Add preview ops to update_data**', out)
+        self.assertIn('☐ **Add plural convenience methods**', out)
+        self.assertIn('☑ **Both: ops + plural wrappers**', out)
+
+    def test_tool_result_other_answer_surfaced(self):
+        out = self.r._render_user({
+            'type': 'user',
+            'message': {'role': 'user', 'content': [{
+                'type': 'tool_result', 'tool_use_id': 'tu', 'content': '',
+            }]},
+            'toolUseResult': self._tur('Update the recipe to batch previews.'),
+        })
+        # No option was selected — all stay ◯ — and the custom answer is
+        # surfaced separately.
+        self.assertNotIn('●', out)
+        self.assertIn('**Other:** "Update the recipe to batch previews."', out)
+
+    def test_is_voice_assistant_question(self):
+        rec = {
+            'type': 'assistant',
+            'message': {'role': 'assistant', 'content': [{
+                'type': 'tool_use', 'name': 'AskUserQuestion',
+                'input': self._input(),
+            }]},
+        }
+        self.assertTrue(self.r._is_voice(rec))
+
+    def test_is_voice_user_reply(self):
+        rec = {
+            'type': 'user',
+            'message': {'role': 'user', 'content': [{
+                'type': 'tool_result', 'tool_use_id': 'tu', 'content': '',
+            }]},
+            'toolUseResult': self._tur('Add preview ops to update_data'),
+        }
+        self.assertTrue(self.r._is_voice(rec))
+
+    def test_is_voice_unrelated_tool_use_still_machinery(self):
+        # Sanity check: a non-AskUserQuestion tool_use is NOT voice.
+        rec = {
+            'type': 'assistant',
+            'message': {'role': 'assistant', 'content': [{
+                'type': 'tool_use', 'name': 'Bash',
+                'input': {'command': 'ls'},
+            }]},
+        }
+        self.assertFalse(self.r._is_voice(rec))
+
+    def test_is_voice_unrelated_tool_result_still_machinery(self):
+        rec = {
+            'type': 'user',
+            'message': {'role': 'user', 'content': [{
+                'type': 'tool_result', 'tool_use_id': 'tu', 'content': 'ok',
+            }]},
+            'toolUseResult': {'stdout': 'ok', 'stderr': '',
+                              'interrupted': False, 'isImage': False,
+                              'noOutputExpected': False},
+        }
+        self.assertFalse(self.r._is_voice(rec))
+
+
 if __name__ == '__main__':
     unittest.main()
