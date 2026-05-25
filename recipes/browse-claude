@@ -938,7 +938,15 @@ def _passes_filter(item_id, td=None):
         if 0 <= n < len(td.records):
             rec = td.records[n]
             if isinstance(rec, dict):
-                return _is_voice(rec)
+                # Voice if the underlying assistant carries text, OR
+                # the tool_use dispatches a resolvable subagent (same
+                # rule that gives the umbrella its row stripe in
+                # ``_tool_umbrella_item``) — the voice marker
+                # propagates up from the subagent through the
+                # ``<tool:Agent>`` umbrella, and so should the filter.
+                if _is_voice(rec):
+                    return True
+                return _tool_umbrella_wraps_subagent(rec, td)
         return True
     if suffix.startswith('span:'):
         try:

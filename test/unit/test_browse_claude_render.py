@@ -3260,6 +3260,54 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
                              'subagent stripe when dispatching a resolvable '
                              'subagent transcript')
 
+    def test_tool_umbrella_for_agent_dispatch_passes_voice_filter(self):
+        # The voice-only filter (`h` key) must keep <tool:Agent> rows
+        # visible when they wrap a resolvable subagent — the umbrella
+        # carries the subagent voice stripe, so filtering them out
+        # would hide the visual cue.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._build(tmp)
+            self.r._TREE_CACHE.clear()
+            self.r._scan_tree(sess)
+            tool_id = f'{sess}#tool:1'
+            # With voice-only filter ON, the <tool:Agent> id passes.
+            self.r._FILTER_VOICE_ONLY = True
+            try:
+                self.assertTrue(self.r._passes_filter(tool_id))
+            finally:
+                self.r._FILTER_VOICE_ONLY = False
+
+    def test_tool_umbrella_for_bash_filtered_out_in_voice_only(self):
+        # Non-Agent tool (e.g. Bash) — no voice content, no subagent
+        # link: should be hidden by the voice-only filter.
+        import tempfile
+        import json as _json
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, '-z')
+            os.makedirs(proj)
+            sess = os.path.join(proj, 's.jsonl')
+            recs = [
+                {'type': 'user', 'uuid': 'u1', 'parentUuid': None,
+                 'message': {'role': 'user', 'content': 'ls'}},
+                {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+                 'message': {'role': 'assistant', 'content': [{
+                     'type': 'tool_use', 'id': 'tb', 'name': 'Bash',
+                     'input': {'command': 'ls'},
+                 }]}},
+            ]
+            with open(sess, 'w') as f:
+                for r in recs:
+                    f.write(_json.dumps(r) + '\n')
+            self.r._TREE_CACHE.clear()
+            self.r._scan_tree(sess)
+            tool_id = f'{sess}#tool:1'
+            self.r._FILTER_VOICE_ONLY = True
+            try:
+                self.assertFalse(self.r._passes_filter(tool_id))
+            finally:
+                self.r._FILTER_VOICE_ONLY = False
+
     def test_tool_umbrella_for_non_agent_tool_has_no_bg(self):
         # Sanity: <tool:Bash> (or any non-Agent tool) without an
         # agent_link gets no row stripe — the propagation is specific
