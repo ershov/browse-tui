@@ -5029,6 +5029,15 @@ def main():
             sys.exit(2)
     elif len(sys.argv) > 1:
         initial_scope = sys.argv[1]
+        # Promote a positional .jsonl path to ``target_jsonl`` so the
+        # cursor-on-open path treats it the same as ``--file <path>``.
+        # Without this, ``./browse-tui recipes/browse-claude
+        # /path/to/session.jsonl`` opens the file but leaves the cursor
+        # on the scope_root row.
+        if (isinstance(initial_scope, str)
+                and initial_scope.endswith('.jsonl')
+                and os.path.isfile(initial_scope)):
+            target_jsonl = os.path.abspath(initial_scope)
 
     if item_arg is not None and not target_jsonl:
         print('browse-claude: --item requires --session/--pid/--file',
