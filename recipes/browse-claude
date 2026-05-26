@@ -2385,6 +2385,15 @@ def _preview_project(path):
 
 
 _TREE_CACHE = {}   # path → TreeData
+
+# Per-path mutex so two threads (children worker + preview worker) can't
+# both fully-scan the same huge transcript concurrently. Without this,
+# the cursor-on-open path's chain has to wait for whichever scan finishes
+# *last* under GIL contention — empirically ~doubles the wait on a 77MB
+# file. With the mutex, the first thread runs the scan, the second
+# blocks briefly, then sees the populated _TREE_CACHE and returns.
+_SCAN_LOCKS = {}            # path → threading.Lock
+_SCAN_LOCKS_LOCK = threading.Lock()
 _TREE_MODE = True  # default; --no-tree CLI flag or 't' action flips it.
 _FILTER_VOICE_ONLY = False  # default; --no-show-all flag or 'h' flips it.
 
@@ -2882,11 +2891,33 @@ def _scan_tree(path):
     sync with file growth — no time-based check needed. A bulk scan
     on cache miss bootstraps ``_TAIL_STATE`` from the file's current
     end so the tail resumes from the exact byte where this scan stopped.
+
+    Concurrent callers (children worker + preview worker on file open)
+    serialize on a per-path mutex so a huge transcript isn't scanned
+    twice under GIL contention. The mutex is dropped on completion;
+    the cache lookup is double-checked under the lock so the second
+    caller returns the just-populated entry without re-scanning.
     """
     cached = _TREE_CACHE.get(path)
     if cached is not None:
         return cached
+    with _SCAN_LOCKS_LOCK:
+        path_lock = _SCAN_LOCKS.setdefault(path, threading.Lock())
+    with path_lock:
+        # Re-check after acquiring — the thread we were waiting on
+        # may have populated the cache.
+        cached = _TREE_CACHE.get(path)
+        if cached is not None:
+            return cached
+        return _scan_tree_locked(path)
 
+
+def _scan_tree_locked(path):
+    """Body of ``_scan_tree`` — runs under the per-path mutex.
+
+    Caller has already verified ``_TREE_CACHE`` is empty for ``path``
+    and holds the per-path lock.
+    """
     td = _TreeData()
     cur = _ScanCursor()
     sub_dir = _subagents_dir(path)

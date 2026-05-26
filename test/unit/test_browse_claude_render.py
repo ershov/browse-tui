@@ -3562,6 +3562,58 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             finally:
                 self.r.visible_items = saved_vi
 
+    def test_scan_tree_serializes_concurrent_callers(self):
+        # Two threads calling _scan_tree on the same path concurrently
+        # must NOT both fully parse the file — the second blocks on the
+        # per-path mutex and picks up the populated _TREE_CACHE.
+        import tempfile
+        import json as _json
+        import threading as _threading
+        import time as _time
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = os.path.join(tmp, 's.jsonl')
+            with open(sess, 'w') as f:
+                f.write(_json.dumps({
+                    'type': 'user', 'uuid': 'u1',
+                    'message': {'role': 'user', 'content': 'x'},
+                }) + '\n')
+            self.r._TREE_CACHE.clear()
+            self.r._SCAN_LOCKS.clear()
+
+            # Instrument the actual scan body to count invocations.
+            calls = []
+            original = self.r._scan_tree_locked
+
+            def _counting_locked(p):
+                calls.append(p)
+                # Tiny sleep to ensure the second caller hits the lock
+                # while we're inside.
+                _time.sleep(0.01)
+                return original(p)
+
+            self.r._scan_tree_locked = _counting_locked
+            try:
+                results = [None, None]
+
+                def _call(idx):
+                    results[idx] = self.r._scan_tree(sess)
+
+                t1 = _threading.Thread(target=_call, args=(0,))
+                t2 = _threading.Thread(target=_call, args=(1,))
+                t1.start()
+                t2.start()
+                t1.join(timeout=2.0)
+                t2.join(timeout=2.0)
+                # Exactly one scan ran; both callers got the same td.
+                self.assertEqual(
+                    len(calls), 1,
+                    f'expected exactly one scan; got {len(calls)}',
+                )
+                self.assertIsNotNone(results[0])
+                self.assertIs(results[0], results[1])
+            finally:
+                self.r._scan_tree_locked = original
+
     def test_scan_tree_tracks_latest_voice_line(self):
         # _scan_tree's forward pass eagerly populates
         # td.latest_voice_line so the cursor-on-open path doesn't have
