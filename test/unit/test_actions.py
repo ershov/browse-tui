@@ -2138,14 +2138,16 @@ class TestViewEditDefaults(unittest.TestCase):
 
     def test_v_and_e_in_default_actions(self):
         # Sanity: both keys are wired into default_actions() with the
-        # expected handlers, in the OTHER section, gated on cursor.
+        # expected handlers, in the OTHER section, gated on 'none' so
+        # they also fire on scope_root rows (handler resolves the
+        # visible entry itself and skips pending placeholders).
         keys = {a.key: a for a in default_actions()}
         self.assertIn('v', keys)
         self.assertIn('e', keys)
         self.assertIs(keys['v'].handler, _actions._view_in_pager)
         self.assertIs(keys['e'].handler, _actions._edit_in_editor)
-        self.assertEqual(keys['v'].requires, 'cursor')
-        self.assertEqual(keys['e'].requires, 'cursor')
+        self.assertEqual(keys['v'].requires, 'none')
+        self.assertEqual(keys['e'].requires, 'none')
         self.assertEqual(keys['v'].section, 'OTHER')
         self.assertEqual(keys['e'].section, 'OTHER')
 

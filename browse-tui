@@ -12080,10 +12080,14 @@ def default_actions() -> list:
         Action('f1',        'Toggle help',    _toggle_help, 'none', 'OTHER'),
         Action('ctrl-r',    'Reload',         _reload,      'none', 'OTHER'),
         Action('ctrl-l',    'Redraw',         _redraw,      'none', 'OTHER'),
-        # View / edit the cursor item's preview text. Recipes override
+        # View / edit the cursor row's preview text. Gate 'none' so
+        # the handler also fires on the scope_root row (whose preview
+        # is shown in the pane but ``ctx.cursor`` filters out — see
+        # ``Context.cursor``). The handler resolves the visible entry
+        # itself and skips ``pending`` placeholders. Recipes override
         # 'e' to make edits actually persist (the default discards).
-        Action('v',         'View preview in $PAGER',  _view_in_pager,   'cursor', 'OTHER'),
-        Action('e',         'Edit preview in $EDITOR (changes discarded)', _edit_in_editor, 'cursor', 'OTHER'),
+        Action('v',         'View preview in $PAGER',  _view_in_pager,   'none', 'OTHER'),
+        Action('e',         'Edit preview in $EDITOR (changes discarded)', _edit_in_editor, 'none', 'OTHER'),
         Action('q',         'Quit',           _quit,        'none', 'OTHER'),
         Action('esc',       'Quit',           _quit,        'none', 'OTHER'),
         Action('ctrl-c',    'Quit',           _quit,        'none', 'OTHER'),
