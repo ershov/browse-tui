@@ -241,6 +241,12 @@ def _m2a_fmt_inline_code(m, name, current_style, context, state):
     return _m2a_styled(text, current_style, M2A_COLOR_STRING)
 
 
+def _m2a_fmt_escape(m, name, current_style, context, state):
+    # `\<punct>` → the punctuation char alone; `\<newline>` → bare newline
+    # (CommonMark hard-line-break).
+    return m.group(f"{name}_char")
+
+
 def _m2a_fmt_image(m, name, current_style, context, state):
     alt = m.group(f"{name}_alt") or ""
     return _m2a_styled(f"[IMG: {alt}]", current_style, f"3;{M2A_COLOR_DIM}")
@@ -737,45 +743,61 @@ _MD_CODE_INLINE  = rf" ` (?P<*> (?: [^`\n] | \n (?! {_BSA} ) )+ ) ` "
 
 _MD_IMAGE = r" ! \[ (?P<*alt> [^\]\n]* ) \] \( (?P<*url> [^)\n]* ) \) "
 
+# Backslash-escape token: `\<any char>`. Used as the first alternative in
+# every inline-delimiter rule's inner alternation so that `\*`, `\~`, `\[`,
+# `\\` etc. survive the wrapper rule as a single 2-char unit and don't
+# accidentally close the span.
+_MD_ESCAPED = r"\\."
+
+# Standalone escape rule fires in the INLINE context so each `\<punct>`
+# token gets unwrapped to just the punctuation char. The `\n` in the
+# class implements CommonMark's hard-line-break syntax (`\` at end of
+# line emits a newline and drops the backslash).
+_MD_ESCAPE = r"""
+    \\ (?P<*char>
+        [ !"\#\$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~ \n ]
+    )
+"""
+
 _MD_LINK = rf"""
     (?<!!) \[ (?P<*>
-        (?: [^\]\n] | \n (?! {_BSA} ) )+
+        (?: {_MD_ESCAPED} | [^\]\n\\] | \n (?! {_BSA} ) )+
     ) \] \( (?P<*url> [^)\n]* ) \)
 """
 
 _MD_BOLDITALIC = rf"""
     \*\*\* (?P<*>
-        (?: [^*\n] | \*(?!\*\*) | \n (?! {_BSA} ) )+
+        (?: {_MD_ESCAPED} | [^*\n\\] | \*(?!\*\*) | \n (?! {_BSA} ) )+
     ) \*\*\*
 """
 
 _MD_BOLD_UNDER = rf"""
     \*\*_ (?P<*>
-        (?: [^_\n] | \n (?! {_BSA} ) )+
+        (?: {_MD_ESCAPED} | [^_\n\\] | \n (?! {_BSA} ) )+
     ) _\*\*
 """
 
 _MD_UNDER_BOLD = rf"""
     _\*\* (?P<*>
-        (?: [^*\n] | \*(?!\*) | \n (?! {_BSA} ) )+
+        (?: {_MD_ESCAPED} | [^*\n\\] | \*(?!\*) | \n (?! {_BSA} ) )+
     ) \*\*_
 """
 
 _MD_BOLD = rf"""
     \*\* (?P<*>
-        (?: [^*\n] | \*(?!\*) | \n (?! {_BSA} ) )+
+        (?: {_MD_ESCAPED} | [^*\n\\] | \*(?!\*) | \n (?! {_BSA} ) )+
     ) \*\*
 """
 
 _MD_STRIKE = rf"""
     ~~ (?P<*>
-        (?: [^~\n] | ~(?!~) | \n (?! {_BSA} ) )+
+        (?: {_MD_ESCAPED} | [^~\n\\] | ~(?!~) | \n (?! {_BSA} ) )+
     ) ~~
 """
 
 _MD_ITALIC = rf"""
     (?<!\*) \* (?P<*>
-        (?: [^*\n] | \n (?! {_BSA} ) )+
+        (?: {_MD_ESCAPED} | [^*\n\\] | \n (?! {_BSA} ) )+
     ) \* (?!\*)
 """
 
@@ -793,6 +815,10 @@ def _m2a_code_lambda(code_ctx, lang=None):
 _M2A_RULES_INLINE_RAW = (
     ("code_inline2",  _MD_CODE_INLINE2, _m2a_fmt_inline_code,  None),
     ("code_inline",   _MD_CODE_INLINE,  _m2a_fmt_inline_code,  None),
+    # Backslash escapes — placed AFTER inline code so backslashes inside
+    # ``…`` are preserved verbatim per CommonMark, but BEFORE every other
+    # delimiter so `\*`, `\~`, `\[` etc. don't trigger emphasis / links.
+    ("escape",        _MD_ESCAPE,       _m2a_fmt_escape,       None),
     ("image",         _MD_IMAGE,        _m2a_fmt_image,        None),
     ("link",          _MD_LINK,         M2A_COLOR_LINK,        _M2A_RECURSE_SELF),
     ("bolditalic",    _MD_BOLDITALIC,   "1;3",                 _M2A_RECURSE_SELF),
