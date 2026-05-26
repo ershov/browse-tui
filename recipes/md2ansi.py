@@ -131,6 +131,15 @@ def _m2a_build_context(rules):
 
 _M2A_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
 
+# Line-wrap "no-break zone" — within the first N visible chars of a line, an
+# overflowing word is attached rather than triggering a break (there's no
+# useful break point that close to the start). Capped at 20 so a long token
+# in a wide line breaks instead of accumulating leading content past that
+# point; for narrow widths (line_width ≤ 30) the zone shrinks linearly to 0
+# so cramped columns still get aggressive breaks.
+def _m2a_no_break_zone(line_width):
+    return min(20, max(0, line_width - 30))
+
 # Markdown-table cell-content matcher. Each char is in exactly one branch — a
 # non-pipe non-backslash non-newline char, OR a backslash followed by any
 # single char (the markdown escape, including `\|`). The same tempered-greedy
@@ -344,13 +353,7 @@ def _m2a_fmt_table(m, name, current_style, context, state):
     header_cells = [cell_sublines(rendered_header[i], widths[i]) for i in range(n_cols)]
     body_cells = [[cell_sublines(r[i], widths[i]) for i in range(n_cols)] for r in rendered_body]
 
-    # Per-column actual-vs-assigned reconciliation:
-    #   - if a cell wrap left a sub-line wider than the column (long unbreakable
-    #     token), grow the column to that width and re-wrap every cell in the
-    #     column so any other cells get to use the extra room;
-    #   - if every sub-line fits comfortably below the assigned width, shrink
-    #     the column down to what's actually used.
-    for i in range(n_cols):
+    def _col_actual(i):
         actual = max(
             (_m2a_visible_len(s) for s in header_cells[i]),
             default=0,
@@ -358,13 +361,79 @@ def _m2a_fmt_table(m, name, current_style, context, state):
         for row in body_cells:
             for s in row[i]:
                 actual = max(actual, _m2a_visible_len(s))
-        if actual > widths[i]:
+        return actual
+
+    def _rewrap_column(i):
+        header_cells[i] = cell_sublines(rendered_header[i], widths[i])
+        for r_idx, r in enumerate(rendered_body):
+            body_cells[r_idx][i] = cell_sublines(r[i], widths[i])
+
+    def _reconcile_column(i):
+        # Grow widths[i] until the column's widest sub-line fits, re-wrapping
+        # in between. The grow step ISN'T idempotent — at a wider width the
+        # no-break zone gives more room, which can let a long word land on a
+        # line that's already past threshold, producing an even wider
+        # sub-line — so iterate until stable.
+        for _ in range(n_cols + 8):
+            actual = _col_actual(i)
+            if actual <= widths[i]:
+                break
             widths[i] = actual
-            header_cells[i] = cell_sublines(rendered_header[i], widths[i])
-            for r_idx, r in enumerate(rendered_body):
-                body_cells[r_idx][i] = cell_sublines(r[i], widths[i])
-        elif actual < widths[i]:
+            _rewrap_column(i)
+        else:
+            widths[i] = max(widths[i], _col_actual(i))
+        # If every sub-line came in below the final width, shrink to fit.
+        if actual < widths[i]:
             widths[i] = max(actual, 1)
+
+    for i in range(n_cols):
+        _reconcile_column(i)
+
+    # ── Extra fitting round ──────────────────────────────────────────────
+    # If some column grew past its layout assignment (oversize) the table
+    # now overflows the budget. Try to recover space by shrinking the
+    # remaining (non-oversize, non-cell-min) columns proportionally into
+    # whatever budget is left. After each shrink+reconcile, if a column
+    # grew back above its new target it joins the oversize set and the
+    # round re-runs over the rest. The loop terminates when the table fits
+    # OR no further columns can be shrunk OR no column changed in the pass.
+    if target_lw > 0:
+        layout_widths = list(widths)
+        # Anything that grew during the initial reconcile is "oversize". Track
+        # the per-column target the extra-fit pass last tried — used to detect
+        # bounce-back inside the loop.
+        for _outer in range(n_cols + 1):
+            total = overhead + sum(widths)
+            if total <= target_lw:
+                break
+            oversize = {i for i in range(n_cols) if widths[i] > layout_widths[i]}
+            non_shrinkable = {i for i in range(n_cols) if widths[i] <= cell_min}
+            shrinkable = [
+                i for i in range(n_cols)
+                if i not in oversize and i not in non_shrinkable
+            ]
+            if not shrinkable:
+                break
+            excluded_sum = sum(widths[i] for i in oversize) + sum(widths[i] for i in non_shrinkable)
+            fit_w = max(0, target_lw - overhead - excluded_sum)
+            cur_sum = sum(widths[i] for i in shrinkable)
+            if cur_sum <= fit_w:
+                break
+            factor = fit_w / cur_sum if cur_sum > 0 else 0
+            progressed = False
+            for i in shrinkable:
+                new_w = max(cell_min, int(widths[i] * factor))
+                if new_w >= widths[i]:
+                    continue
+                widths[i] = new_w
+                # The new target becomes the layout baseline for this column;
+                # a re-reconcile that bounces above it marks the column oversize.
+                layout_widths[i] = new_w
+                _rewrap_column(i)
+                _reconcile_column(i)
+                progressed = True
+            if not progressed:
+                break
 
     def render_row(cells):
         # cells: list of per-column lists of rendered sub-lines.
@@ -812,12 +881,14 @@ def _m2a_continuation_indent(line):
 
 
 def _m2a_wrap_line(line, line_width, continuation):
-    """Greedy word-wrap with a no-break zone for the first `line_width - 30`
-    characters. Long single words may overflow.
+    """Greedy word-wrap with a small no-break zone at the start of each line.
+    A word that doesn't fit triggers a break unless the line is still under
+    20 visible chars (in which case we attach and accept the overflow — there's
+    no useful break point that close to the start).
     """
     if len(line) <= line_width:
         return [line]
-    threshold = max(0, line_width - 30)
+    threshold = _m2a_no_break_zone(line_width)
 
     # Fast-path: the first `threshold` chars are in the no-break zone — copy
     # them verbatim, extended to the next word boundary so a word straddling
@@ -875,7 +946,7 @@ def _m2a_wrap_ansi_line(line, line_width, continuation="", reset_sgr=""):
     """
     if _m2a_visible_len(line) <= line_width:
         return [line + reset_sgr]
-    threshold = max(0, line_width - 30)
+    threshold = _m2a_no_break_zone(line_width)
     # Tokenize: ANSI escapes first (so they're not eaten by the word class),
     # then whitespace runs, then word runs. The word class explicitly excludes
     # \x1b so an ESC sequence following a word starts a new token rather than
