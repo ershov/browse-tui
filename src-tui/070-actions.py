@@ -355,10 +355,20 @@ def _run_external_on_preview(ctx, *, env_var, default):
       3. If neither is available — ``browser.get_preview`` is ``None``
          or the fetcher returned ``None``/raised — surface a message
          and skip the external command.
+
+    Resolves the active row from ``ctx.visible_items[cursor_index]``
+    so scope_root rows (which the preview pane already shows content
+    for) are operable too. Only ``pending`` placeholder rows skip out
+    — they have no real id.
     """
-    item = ctx.cursor
-    if item is None:
+    state = ctx._browser._state
+    vis = visible_items(state)
+    if not (0 <= state.cursor < len(vis)):
         return
+    entry = vis[state.cursor]
+    if entry.kind == 'pending':
+        return
+    item = entry.item
     # When the recipe has no preview source, the preview worker fills
     # the cache with '' as a placeholder (see ``_preview_worker`` in
     # 040-state). That placeholder is not meaningful content, so bail

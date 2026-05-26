@@ -1854,6 +1854,44 @@ class TestViewEditDefaults(unittest.TestCase):
         finally:
             b.stop_workers()
 
+    def test_v_works_on_scope_root_row(self):
+        # Scope_root row has ``ctx.cursor is None`` (the property
+        # filters synthetic kinds), but its preview is shown in the
+        # pane and ``v``/``e`` should operate on it just like a
+        # normal row.
+        b = _make_browser(get_preview=lambda id_: f'SCOPED_PREVIEW:{id_}')
+        scope_id = 'project/scope'
+        # Set up a scope so the visible list emits a scope_root entry.
+        b._state._children[scope_id] = []
+        b._state.scope_stack[:] = [scope_id]
+        b._state.cursor = 0  # the scope_root row
+        ctx = _ctx_for(b)
+        captured = {'cmd': None, 'bytes': None}
+
+        def stub_run_external(cmd, env=None):
+            captured['cmd'] = cmd
+            import shlex
+            path = shlex.split(cmd)[-1]
+            if os.path.exists(path):
+                with open(path, 'rb') as f:
+                    captured['bytes'] = f.read()
+            return 0
+
+        ctx.run_external = stub_run_external
+        try:
+            _actions._view_in_pager(ctx)
+            self.assertIsNotNone(
+                captured['cmd'],
+                '_view_in_pager must operate on scope_root rows '
+                '(their preview is shown in the pane)',
+            )
+            self.assertEqual(
+                captured['bytes'], b'SCOPED_PREVIEW:project/scope',
+                'scope_root preview text should reach the pager',
+            )
+        finally:
+            b.stop_workers()
+
     def test_v_messages_when_no_get_preview_and_no_cache(self):
         # No cache + no get_preview fetcher → 'No preview available'.
         b, ctx, cap = self._setup(preview_text=None, get_preview=None)
