@@ -566,6 +566,12 @@ def _list_sessions(project_dir):
         item = Item(
             id=full,
             title=sid,
+            # When this session becomes the current scope, show the
+            # full filesystem path on the synthetic scope-header row
+            # (the listing-pane title stays short — the session id).
+            # Matches the display you get when opening the session
+            # directly from the command line.
+            scope_title=full,
             tag=tag,
             tag_style=('green' if running_meta else 'dim'),
             has_children=count > 0 or n_subs > 0,

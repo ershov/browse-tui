@@ -432,12 +432,31 @@ def _scope_up(ctx):
     popping, walks the new visible tree to find the id we just left
     and parks the cursor on it — so the user feels "I came back from
     there" rather than landing arbitrarily.
+
+    Lazy-fetches the new scope's children if they aren't cached.
+    Normal navigation guarantees a cache hit (``scope_into`` only
+    fires on items the user has expanded, whose children are already
+    cached), but a recipe that pre-pushes a multi-level
+    ``scope_stack`` at construction may have lower levels with no
+    cached children. The fetch is fire-and-forget — the visible list
+    repopulates when the worker delivers; the cursor anchor (set
+    below) keeps the user's intended landing row across the async
+    arrival.
     """
-    state = ctx._browser._state
+    b = ctx._browser
+    state = b._state
     popped = scope_out(state)
     if popped is None:
         return  # already at root
-    # Place cursor on the row we drilled into earlier.
+    new_top = current_scope(state)
+    if new_top is not None and new_top not in state._children:
+        b._ensure_children_fetched(new_top)
+        b._children_event.set()
+    # Place cursor on the row we drilled into earlier. If its children
+    # aren't cached yet (recipe pre-pushed scope stack — lazy fetch
+    # above queued the work), use cursor_to so the anchor is set on a
+    # *posted* callable that runs AFTER _handle_one_key's trailing
+    # ``_reanchor_cursor()`` — direct mutation here would be clobbered.
     vis = visible_items(state)
     placed = False
     for i, entry in enumerate(vis):
@@ -446,10 +465,10 @@ def _scope_up(ctx):
             placed = True
             break
     if not placed:
-        # Fallback: clamp to a sensible position.
         state.cursor = 0
-    ctx._browser._needs_redraw.add('all')
-    ctx._browser._fire_scope_change()
+        b.cursor_to(popped)
+    b._needs_redraw.add('all')
+    b._fire_scope_change()
 
 
 def _select_toggle_down(ctx):

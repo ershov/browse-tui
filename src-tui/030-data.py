@@ -119,6 +119,15 @@ class Item:
     preview_render: Any = field(
         default=None, init=False, repr=False, compare=False,
     )
+    # Optional alternative title used by the renderer for the
+    # ``scope_root`` row only — for items whose listing label is a
+    # short id (e.g. a session GUID) but whose scope-header should
+    # carry more context (full path, qualified name). ``None`` falls
+    # back to ``title`` so the field is a pure opt-in for recipes that
+    # want the distinction. Placed after the cache fields so it stays
+    # out of positional-construction signatures (tuple → Item
+    # coercion); recipes set it by keyword or via attribute write.
+    scope_title: Any = None
 
     def __post_init__(self) -> None:
         if not self.title:

@@ -33,17 +33,13 @@ def _tree_get_children(parent_id, *, reload=False):
 
 
 class TestInitialFetchScopeStack(unittest.TestCase):
-    """Initial fetch must walk every scope-stack level, not just the top.
-
-    Recipes can pre-push a multi-level scope stack at construction
-    (e.g. ``[parent_dir, target_file]``) so alt-up from the inner
-    level pops to a meaningful intermediate. The framework needs to
-    fetch every level's children at startup; otherwise the user
-    scope-ups into a level whose children were never fetched and
-    sees a blank list until they manually refresh.
+    """Initial fetch only walks the current scope (top of stack), not
+    every level. Deeper levels are lazy-fetched by ``_scope_up`` on
+    demand so a pre-pushed deep stack with expensive levels doesn't
+    pay for fetches the user may never reach.
     """
 
-    def test_initial_fetch_visits_every_scope_stack_level(self):
+    def test_initial_fetch_only_fetches_current_scope(self):
         import threading
         calls = []
         lock = threading.Lock()
@@ -54,24 +50,25 @@ class TestInitialFetchScopeStack(unittest.TestCase):
             return _tree_get_children(parent_id)
 
         b = make_browser(get_children=tracked, root_id='/')
-        # Pre-push a deep scope stack BEFORE startup. ``initial_scope``
-        # in BrowserConfig only sets the top; recipes wanting deeper
-        # stacks do list.insert(0, ...) on the raw stack.
+        # Pre-push a deep scope stack BEFORE startup.
         b._state.scope_stack[:] = ['a', 'a/b']
         try:
-            # Trigger the initial fetch via post + drain. ``run_until_idle``
-            # also calls _do_initial_fetch indirectly through main loop.
             b.post(b._do_initial_fetch)
             b.run_until_idle()
-            # Every scope-stack level got fetched, not just the top.
-            self.assertIn('a',   calls,
-                          f'lower scope level not fetched; calls={calls!r}')
+            # Only the current scope (top of stack) and root got fetched.
             self.assertIn('a/b', calls,
                           f'top scope level not fetched; calls={calls!r}')
-            self.assertIn('a',   b._state._children,
-                          'children cache missing for lower scope level')
-            self.assertIn('a/b', b._state._children,
-                          'children cache missing for top scope level')
+            self.assertNotIn(
+                'a', calls,
+                f'lower scope level should NOT be pre-fetched (lazy '
+                f'load on scope_up instead); calls={calls!r}',
+            )
+            self.assertIn('a/b', b._state._children)
+            self.assertNotIn(
+                'a', b._state._children,
+                'lower scope level should not have cached children '
+                'until the user scope-ups into it',
+            )
         finally:
             b.stop_workers()
 

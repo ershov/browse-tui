@@ -31,6 +31,7 @@ _actions.PIN_LAST = _state.PIN_LAST
 _actions.Mode = _state.Mode
 _actions.scope_into = _state.scope_into
 _actions.scope_out = _state.scope_out
+_actions.current_scope = _state.current_scope
 
 Item = _data.Item
 State = _state.State
@@ -261,6 +262,54 @@ class TestAltUpDispatch(unittest.TestCase):
             dispatch_key(b, ctx, 'alt-up')
             self.assertEqual(b._state.scope_stack, [])
             self.assertEqual(b._state.cursor, 1)
+        finally:
+            b.stop_workers()
+
+    def test_alt_up_lazy_fetches_uncached_new_scope(self):
+        # Recipe pre-pushed a multi-level scope stack without ever
+        # navigating through the lower levels — so the new top after
+        # scope_up has no cached children. _scope_up must queue a
+        # fetch so the visible list populates instead of stranding.
+        b = _make_browser()
+        try:
+            # 'parent' has no cached children. Only 'A' (the current
+            # scope) and root are cached.
+            b._state._children[None] = [Item(id='parent', has_children=True)]
+            b._state.scope_stack[:] = ['parent', 'A']
+            b._state._children['A'] = [Item(id='a1')]
+            ctx = _ctx_for(b)
+            dispatch_key(b, ctx, 'alt-up')
+            # Scope popped to 'parent'.
+            self.assertEqual(b._state.scope_stack, ['parent'])
+            # 'parent' got queued for a fetch.
+            self.assertIn('parent', b._state._children_pending)
+            # Cursor land on the popped id is deferred via cursor_to —
+            # a posted callable that runs *after* _handle_one_key's
+            # trailing _reanchor_cursor (which would otherwise clobber
+            # any anchor set inline here). The post queue carries one
+            # _do_cursor_to closure waiting to run.
+            self.assertFalse(
+                b._main_queue.empty(),
+                'expected a posted cursor_to(popped) on the main queue',
+            )
+        finally:
+            b.stop_workers()
+
+    def test_alt_up_does_not_re_fetch_cached_scope(self):
+        # When the new top scope has cached children (normal
+        # navigation case — user drilled in earlier so its children
+        # were already fetched), scope_up does NOT queue a redundant
+        # fetch.
+        b = _make_browser()
+        try:
+            b._state._children[None] = [Item(id='A', has_children=True)]
+            b._state._children['A'] = [Item(id='a1')]
+            scope_into(b._state, 'A')
+            ctx = _ctx_for(b)
+            dispatch_key(b, ctx, 'alt-up')
+            self.assertEqual(b._state.scope_stack, [])
+            # Root was already cached — no fetch queued.
+            self.assertNotIn(None, b._state._children_pending)
         finally:
             b.stop_workers()
 

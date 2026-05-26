@@ -199,7 +199,12 @@ def format_item_segments(item, *, depth=0, base_depth=0, expanded=False,
         segs = []
         if _id_visible(item, show_ids):
             segs.append(('{} '.format(item.id), _ID_COLOR, True))
-        segs.append((item.title, _SCOPE_ROOT_FG, True))
+        # ``scope_title`` overrides ``title`` for the scope-header row
+        # only — lets a recipe show e.g. a session's full filesystem
+        # path when that session is the current scope, while keeping
+        # the listing's per-row title short (the session id).
+        scope_text = getattr(item, 'scope_title', None) or item.title
+        segs.append((scope_text, _SCOPE_ROOT_FG, True))
         return segs
 
     # ----- normal kind ------------------------------------------------

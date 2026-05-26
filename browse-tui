@@ -987,6 +987,15 @@ class Item:
     preview_render: Any = field(
         default=None, init=False, repr=False, compare=False,
     )
+    # Optional alternative title used by the renderer for the
+    # ``scope_root`` row only — for items whose listing label is a
+    # short id (e.g. a session GUID) but whose scope-header should
+    # carry more context (full path, qualified name). ``None`` falls
+    # back to ``title`` so the field is a pure opt-in for recipes that
+    # want the distinction. Placed after the cache fields so it stays
+    # out of positional-construction signatures (tuple → Item
+    # coercion); recipes set it by keyword or via attribute write.
+    scope_title: Any = None
 
     def __post_init__(self) -> None:
         if not self.title:
@@ -5256,15 +5265,15 @@ class Browser:
         ``_children_pending`` gate is cleared in ``apply_children_results``).
         """
         if id_ is None:
-            # Snapshot expanded set + every scope_stack level BEFORE
-            # invalidation so we can re-dispatch fetches for them too.
-            # Without this, ``visible_items`` would emit a placeholder
-            # for each expanded parent missing from ``_children`` and
-            # the only auto-dispatch (``_update_children_for_cursor``)
-            # only fires for the cursor item — leaving siblings /
-            # ancestors / lower scope levels stuck.
+            # Snapshot expanded set + scope root BEFORE invalidation so
+            # we can re-dispatch fetches for them too. Without this,
+            # ``visible_items`` would emit a placeholder for each
+            # expanded parent missing from ``_children`` and the only
+            # auto-dispatch (``_update_children_for_cursor``) only fires
+            # for the cursor item — leaving siblings/ancestors stuck.
             extra = set(self._state.expanded)
-            extra.update(self._state.scope_stack)
+            if self._state.scope_stack:
+                extra.add(current_scope(self._state))
             cache_invalidate_all(self._state)
             id_ = self._state.root_id
             extra.discard(id_)
@@ -5324,27 +5333,43 @@ class Browser:
         cache checks so re-runs are idempotent.
         """
         targets = [self._state.root_id]
-        # Fetch every level of the scope stack, not just the top.
-        # Otherwise a pre-pushed deep scope (e.g. recipe constructed
-        # ``[parent_dir, target_file]`` for a two-level alt-up to
-        # work) leaves the deeper levels with no cached children, and
-        # ``_scope_up`` strands on a blank list until the user
-        # manually refreshes.
-        targets.extend(self._state.scope_stack)
+        if self._state.scope_stack:
+            targets.append(current_scope(self._state))
         targets.extend(self._state.expanded)
         seen = set()
         for id_ in targets:
             if id_ in seen:
                 continue
             seen.add(id_)
-            if id_ in self._state._children:
-                continue
-            if id_ in self._state._children_pending:
-                continue
-            self._state._children_pending.add(id_)
-            self._state._loading[id_] = True
-            self._children_queue.append((id_, False))
+            self._ensure_children_fetched(id_)
         self._children_event.set()
+
+    def _ensure_children_fetched(self, id_) -> None:
+        """Main-thread: queue a children fetch for ``id_`` if not cached.
+
+        No-op when ``id_`` already has cached children or a fetch is
+        already in flight for it. Used by ``_do_initial_fetch`` /
+        ``_do_refresh`` to seed startup fetches, and by ``_scope_up``
+        to lazy-load levels of a recipe-pre-pushed scope stack that
+        the user never navigated through.
+
+        Caller must be on the main thread. The worker reads
+        ``_children_queue`` / ``_children_pending`` without locking,
+        relying on GIL-protected single-mutator semantics: only the
+        main thread appends.
+        """
+        if id_ in self._state._children:
+            return
+        if id_ in self._state._children_pending:
+            return
+        self._state._children_pending.add(id_)
+        self._state._loading[id_] = True
+        self._children_queue.append((id_, False))
+        # Worker wake is the caller's responsibility — the initial-
+        # fetch path batches multiple ids and wakes once at the end,
+        # so leaving the kick here would double-wake. Callers that
+        # ensure a single id should ``self._children_event.set()``
+        # themselves.
 
     def _do_cursor_to(self, id_, pending):
         """Main-thread: position the cursor at ``id_`` and resolve ``pending``.
@@ -7309,7 +7334,12 @@ def format_item_segments(item, *, depth=0, base_depth=0, expanded=False,
         segs = []
         if _id_visible(item, show_ids):
             segs.append(('{} '.format(item.id), _ID_COLOR, True))
-        segs.append((item.title, _SCOPE_ROOT_FG, True))
+        # ``scope_title`` overrides ``title`` for the scope-header row
+        # only — lets a recipe show e.g. a session's full filesystem
+        # path when that session is the current scope, while keeping
+        # the listing's per-row title short (the session id).
+        scope_text = getattr(item, 'scope_title', None) or item.title
+        segs.append((scope_text, _SCOPE_ROOT_FG, True))
         return segs
 
     # ----- normal kind ------------------------------------------------
@@ -11396,12 +11426,31 @@ def _scope_up(ctx):
     popping, walks the new visible tree to find the id we just left
     and parks the cursor on it — so the user feels "I came back from
     there" rather than landing arbitrarily.
+
+    Lazy-fetches the new scope's children if they aren't cached.
+    Normal navigation guarantees a cache hit (``scope_into`` only
+    fires on items the user has expanded, whose children are already
+    cached), but a recipe that pre-pushes a multi-level
+    ``scope_stack`` at construction may have lower levels with no
+    cached children. The fetch is fire-and-forget — the visible list
+    repopulates when the worker delivers; the cursor anchor (set
+    below) keeps the user's intended landing row across the async
+    arrival.
     """
-    state = ctx._browser._state
+    b = ctx._browser
+    state = b._state
     popped = scope_out(state)
     if popped is None:
         return  # already at root
-    # Place cursor on the row we drilled into earlier.
+    new_top = current_scope(state)
+    if new_top is not None and new_top not in state._children:
+        b._ensure_children_fetched(new_top)
+        b._children_event.set()
+    # Place cursor on the row we drilled into earlier. If its children
+    # aren't cached yet (recipe pre-pushed scope stack — lazy fetch
+    # above queued the work), use cursor_to so the anchor is set on a
+    # *posted* callable that runs AFTER _handle_one_key's trailing
+    # ``_reanchor_cursor()`` — direct mutation here would be clobbered.
     vis = visible_items(state)
     placed = False
     for i, entry in enumerate(vis):
@@ -11410,10 +11459,10 @@ def _scope_up(ctx):
             placed = True
             break
     if not placed:
-        # Fallback: clamp to a sensible position.
         state.cursor = 0
-    ctx._browser._needs_redraw.add('all')
-    ctx._browser._fire_scope_change()
+        b.cursor_to(popped)
+    b._needs_redraw.add('all')
+    b._fire_scope_change()
 
 
 def _select_toggle_down(ctx):
