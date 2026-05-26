@@ -1000,8 +1000,14 @@ class TestDecodeProjectPath(unittest.TestCase):
         self.assertEqual(self.r._decode_project_path('weird'), 'weird')
 
 
-class TestMessageOrderReverse(unittest.TestCase):
-    """``_list_messages`` returns newest-first with a trailing truncation marker."""
+class TestMessageOrder(unittest.TestCase):
+    """``_list_messages`` returns rows in **chronological** order (#475) —
+    matches tree-mode ordering so the t-toggle doesn't flip the
+    conversation. ``limit=0`` (the new default) disables truncation
+    entirely; explicit ``limit=N`` keeps the latest N with a marker
+    pinned at the **top** of the list (representing the older entries
+    that came before the kept window).
+    """
 
     @classmethod
     def setUpClass(cls):
@@ -1016,7 +1022,7 @@ class TestMessageOrderReverse(unittest.TestCase):
         f.close()
         return f.name
 
-    def test_newest_first(self):
+    def test_chronological_order(self):
         path = self._write([
             {'type': 'user', 'message': {'role': 'user', 'content': 'one'}},
             {'type': 'user', 'message': {'role': 'user', 'content': 'two'}},
@@ -1025,26 +1031,26 @@ class TestMessageOrderReverse(unittest.TestCase):
         try:
             items = self.r._list_messages(path)
             titles = [it.title for it in items]
-            self.assertIn('three', titles[0])
+            self.assertIn('one',   titles[0])
             self.assertIn('two',   titles[1])
-            self.assertIn('one',   titles[2])
+            self.assertIn('three', titles[2])
         finally:
             os.unlink(path)
 
-    def test_truncation_marker_at_end(self):
+    def test_truncation_marker_at_start(self):
         path = self._write([
             {'type': 'user', 'message': {'role': 'user', 'content': f'msg{i}'}}
             for i in range(10)
         ])
         try:
             items = self.r._list_messages(path, limit=3)
-            # Three real items + one truncation marker at the END.
+            # One truncation marker at the START + three real items.
             self.assertEqual(len(items), 4)
-            self.assertIn('older entries hidden', items[-1].title)
-            # First three should be the *latest* three (msg9, msg8, msg7).
-            self.assertIn('msg9', items[0].title)
-            self.assertIn('msg8', items[1].title)
-            self.assertIn('msg7', items[2].title)
+            self.assertIn('older entries hidden', items[0].title)
+            # Real items are the *latest* three in chronological order.
+            self.assertIn('msg7', items[1].title)
+            self.assertIn('msg8', items[2].title)
+            self.assertIn('msg9', items[3].title)
         finally:
             os.unlink(path)
 
@@ -1056,6 +1062,21 @@ class TestMessageOrderReverse(unittest.TestCase):
             items = self.r._list_messages(path, limit=10)
             self.assertEqual(len(items), 1)
             self.assertNotIn('older entries hidden', items[0].title)
+        finally:
+            os.unlink(path)
+
+    def test_no_marker_when_limit_is_zero(self):
+        # limit=0 means "no cap" — even for files with many records,
+        # the marker should not appear.
+        path = self._write([
+            {'type': 'user', 'message': {'role': 'user', 'content': f'msg{i}'}}
+            for i in range(50)
+        ])
+        try:
+            items = self.r._list_messages(path, limit=0)
+            self.assertEqual(len(items), 50)
+            for it in items:
+                self.assertNotIn('older entries hidden', it.title)
         finally:
             os.unlink(path)
 
@@ -2626,12 +2647,12 @@ class TestLiveTail(unittest.TestCase):
                 return iter(list(s._state._items_by_id.values()))
         return FakeBrowser(), seen_ops
 
-    def test_push_flat_inserts_after_last_subagent(self):
-        # New flat-mode rows must land AFTER the trailing subagent row
-        # so the subagent group keeps its sticky-top position. The
-        # push step builds Items from records returned by
-        # ``_read_new_records`` and emits ``upsert(...,
-        # where=('after', None, last_sub_idx))``.
+    def test_push_flat_inserts_appends_at_end(self):
+        # Since #475 flat mode renders chronologically, new tail
+        # records must append at the **end** of the parent's child
+        # list — not be inserted after the last subagent. The push
+        # step emits plain ``upsert`` ops (no ``where=`` kwarg) so the
+        # framework's default "append at end" placement applies.
         path = self._write_jsonl([
             {'type': 'user', 'uuid': 'u1',
              'message': {'role': 'user', 'content': 'one'}},
@@ -2645,8 +2666,6 @@ class TestLiveTail(unittest.TestCase):
             ]
             fake_subs[0].kind = 'subagent'
             fake_subs[1].kind = 'subagent'
-            # Just two existing items in the framework's cache; the
-            # message row from line 0 isn't important here.
             fake_b, seen_ops = self._fake_browser_with_children(
                 path, list(fake_subs),
             )
@@ -2662,14 +2681,16 @@ class TestLiveTail(unittest.TestCase):
             ops = seen_ops[0]
             upserts = [op for op in ops if op[0] == 'upsert']
             self.assertEqual(len(upserts), 1)
-            # ``after`` index 1 = last subagent's position.
-            self.assertEqual(upserts[0][4], ('after', None, 1))
+            # No positioning descriptor — default-append at end.
+            # Upsert tuple shape: ('upsert', id, parent_id, fields).
+            self.assertEqual(len(upserts[0]), 4)
         finally:
             os.unlink(path)
 
-    def test_push_flat_inserts_no_subagents_uses_minus_one(self):
-        # No subagents in the existing list → ref=-1, which the
-        # framework collapses to position 0 (top of list).
+    def test_push_flat_inserts_preserves_record_order(self):
+        # New records arrive from _read_new_records in file order
+        # (oldest of the batch first). The push must preserve that
+        # order so the framework appends in chronological sequence.
         path = self._write_jsonl([
             {'type': 'user', 'uuid': 'u1',
              'message': {'role': 'user', 'content': 'one'}},
@@ -2694,8 +2715,9 @@ class TestLiveTail(unittest.TestCase):
             ops = seen_ops[0]
             upserts = [op for op in ops if op[0] == 'upsert']
             self.assertEqual(len(upserts), 2)
-            for op in upserts:
-                self.assertEqual(op[4], ('after', None, -1))
+            # Op order matches input order: line 1 first, then line 2.
+            self.assertEqual(upserts[0][1], f'{path}#1')
+            self.assertEqual(upserts[1][1], f'{path}#2')
             self.assertFalse(
                 [op for op in ops if op[0] == 'remove'],
             )

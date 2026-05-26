@@ -213,10 +213,11 @@ class TestBrowseClaude(unittest.TestCase):
     def test_J_K_jump_between_voice_rows(self):
         """``J``/``K`` skip over tool_use / tool_result / metadata rows.
 
-        Fixture mixes (newest-first as the list renders): asst-text,
-        asst-tool_use, user-tool_result, user-text. From the top
-        (asst-text, the newest voice row), one ``J`` should land on
-        user-text — skipping the two machinery rows between them.
+        Fixture (chronological list order since #475): user-text,
+        user-tool_result, asst-tool_use, asst-text. After Right-
+        expanding the session, the recipe lands the cursor on the
+        latest voice (asst-text). One ``K`` (prev voice) should skip
+        the two machinery rows and land on user-text.
         """
         import tempfile, json as _json
         with tempfile.TemporaryDirectory() as tmp:
@@ -224,7 +225,6 @@ class TestBrowseClaude(unittest.TestCase):
             proj = os.path.join(root, '-home-test-jk')
             os.makedirs(proj)
             sess = os.path.join(proj, 'jk1234.jsonl')
-            # Chronological order on disk; rendered list is reversed.
             records = [
                 {'type': 'user',
                  'message': {'role': 'user',
@@ -255,16 +255,13 @@ class TestBrowseClaude(unittest.TestCase):
                 t.wait_for('jk1234')
                 t.send('Down')
                 t.send('Right')
-                # All four rows visible.
+                # All four rows visible; cursor lands on the latest
+                # voice (PROBE_ASST_VOICE) automatically.
                 t.wait_for('PROBE_ASST_VOICE')
                 t.wait_for('PROBE_USER_VOICE')
-                # Move cursor onto the assistant voice row (newest, first).
-                t.send('Down')
-                # Now press J — should skip the two machinery rows below
-                # and land on the user voice row. We assert by reading the
-                # preview pane (which the recipe updates to match cursor)
-                # for the user prompt body.
-                t.send('J')
+                # Press K (prev voice) — should skip the two
+                # machinery rows above and land on PROBE_USER_VOICE.
+                t.send('K')
                 # The preview pane should now show the user's text body
                 # — "▶ user" header is in the renderer, the body is the
                 # PROBE marker.
@@ -690,6 +687,11 @@ class TestBrowseClaude(unittest.TestCase):
         ``_write_segments(row_bg=…)`` plumbing end-to-end. Captures
         the tmux pane with ``-e`` (colors) and asserts the 256-color
         background SGR for user (235) appears in the output.
+
+        After the session-row expansion the cursor lands on the
+        latest voice (the user row) and the reverse-video selection
+        hides its bg stripe. ``Up`` moves cursor off so the stripe is
+        observable in the capture.
         """
         with tempfile.TemporaryDirectory() as tmp:
             # Fixture has a user message; drill in to see it as a row.
@@ -702,6 +704,10 @@ class TestBrowseClaude(unittest.TestCase):
                 t.send('Down')
                 t.send('Right')
                 t.wait_for('hello world', timeout=3.0)
+                # Move cursor off the user row so its bg stripe is
+                # visible (reverse-video selection masks the stripe).
+                t.send('Up')
+                t.wait_stable()
                 colored = t.capture(colors=True)
                 # The user-voice bg colour code we configured for browse-claude.
                 self.assertIn('48;5;235', colored,
@@ -808,6 +814,11 @@ class TestBrowseClaude(unittest.TestCase):
         subagent's first user message ('subagent task: do the thing')
         renders. Distinct from the parent session's 'hello world' so
         we know we routed into the right .jsonl.
+
+        After #475 expanding a session jumps the cursor to the latest
+        voice (a record row, not a subagent). Navigate Home to the
+        top of the session's children (where subagents sit) before
+        expanding the subagent.
         """
         with tempfile.TemporaryDirectory() as tmp:
             _make_fake_claude(tmp, with_subagents=True)
@@ -820,13 +831,17 @@ class TestBrowseClaude(unittest.TestCase):
                 t.send('Right')
                 t.wait_for('PROBE-DESC', timeout=3.0)
                 t.wait_stable()
-                # Cursor sits on the session row after the inward
-                # drill; first Right is the second toggle (steps
-                # cursor to first child = subagent row), the next
-                # Right expands the subagent. Subagent rows now use a
-                # lightweight metadata preview, so the body only
-                # appears once we actually expand inline.
-                t.send('Right')   # step cursor onto subagent row
+                # Navigate to the subagent row. Cursor landed on the
+                # latest voice inside the session (user "hello world")
+                # after expanding; the subagent group sits at the top
+                # of the session's children (above the records). 3
+                # Up presses reach it past the 3 record rows.
+                # (Using Home would pin the cursor to row 0 and the
+                # framework's anchor-replay would fight subsequent
+                # Down presses on async children deliveries.)
+                t.send('Up')
+                t.send('Up')
+                t.send('Up')
                 t.send('Right')   # expand subagent
                 t.wait_for('subagent task', timeout=5.0)
                 t.send('q')

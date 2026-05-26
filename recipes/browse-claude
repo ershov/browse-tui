@@ -76,10 +76,13 @@ CLAUDE_ROOT = os.path.join(
     os.environ.get('HOME', os.path.expanduser('~')), '.claude', 'projects',
 )
 
-# Cap on messages enumerated per session (rest reachable via $EDITOR on
-# the .jsonl). Keeps the UI from stalling on multi-MB transcripts.
-# Overridable via the ``-n NUMBER`` argv flag.
-_MESSAGE_LIMIT = 10000
+# Cap on messages enumerated per session in flat mode (tree mode is
+# uncapped since it only lists umbrellas at the top level). 0 means
+# "no cap" — the default after we unified flat with tree mode in #475;
+# the framework's virtualised list pane handles 30k+ rows fine. The
+# ``-n NUMBER`` argv flag still works as an explicit override for
+# users who want a safety valve on truly pathological transcripts.
+_MESSAGE_LIMIT = 0
 
 
 # ---- ANSI palette --------------------------------------------------------
@@ -713,7 +716,10 @@ def _list_subagent_messages(item_id):
 
 
 def _list_messages(jsonl_path, limit=None):
-    """List messages newest-first, capped at ``limit`` lines.
+    """List messages in **chronological** order (oldest first).
+
+    Matches tree-mode ordering so the cursor-jump-to-latest-voice and
+    the t-toggle don't visually flip the conversation on the user.
 
     Reads from the cached ``_TREE_CACHE[jsonl_path].records`` so we
     don't re-walk the whole file on every navigation. ``_scan_tree``
@@ -724,8 +730,10 @@ def _list_messages(jsonl_path, limit=None):
     ``V`` action can still extract their raw bytes via
     ``line_offsets`` if the user wants to inspect them.
 
-    The truncation cap applies only at initial load; live updates
-    are insert-only (see ``_push_flat_inserts``).
+    ``limit`` truncates from the **start** of the file (so the user
+    keeps the most recent messages — they're scrolling toward the
+    tail anyway). ``limit=0`` (the default after #475) disables
+    truncation entirely.
     """
     if limit is None:
         limit = _message_limit
@@ -738,11 +746,19 @@ def _list_messages(jsonl_path, limit=None):
         )]
     td = _scan_tree(jsonl_path)
     total = len(td.records)
-    truncated = total > limit
+    truncated = bool(limit) and total > limit
     start = total - limit if truncated else 0
 
     out = []
-    for n in range(total - 1, start - 1, -1):
+    if truncated:
+        older = start
+        out.append(Item(
+            id=f'{jsonl_path}#__truncated__',
+            title=f'({older} older entries hidden; press e to view file)',
+            tag='…',
+            tag_style='dim',
+        ))
+    for n in range(start, total):
         obj = td.records[n]
         if obj is None:
             continue
@@ -771,14 +787,6 @@ def _list_messages(jsonl_path, limit=None):
                 item.row_bg = bg
         out.append(item)
 
-    if truncated:
-        older = total - limit
-        out.append(Item(
-            id=f'{jsonl_path}#__truncated__',
-            title=f'({older} older entries hidden; press e to view file)',
-            tag='…',
-            tag_style='dim',
-        ))
     return out
 
 
@@ -3236,20 +3244,17 @@ def _maybe_bootstrap_tail_state(path):
 
 
 def _push_flat_inserts(b, path, records):
-    """Flat-mode push: build Items for new records and insert them.
+    """Flat-mode push: build Items for new records and append them.
 
-    The flat-mode listing renders messages newest-first, so each new
-    file record belongs **before** the rest of the message rows but
-    **after** the trailing subagent group (which
-    ``_list_session_children`` pins to the top). ``where=('after',
-    None, last_sub_idx)`` with ``last_sub_idx = -1`` (no subagents)
-    collapses to position 0 via the int-ref edge rule.
+    Flat mode now renders messages in chronological order (oldest
+    first, latest at the bottom — same as tree mode). New tail
+    records belong at the **end** of the list. ``where=None`` uses
+    the framework's default "append at the end of the parent's
+    children" behaviour.
 
-    Iterating new rows in reverse (oldest of the new batch first)
-    leaves the freshest record at the head of the new group. The
-    whole batch goes through one ``update_data`` call so the
-    framework's cursor anchor runs exactly once at the end and
-    holding ↑/↓ doesn't see the cursor jump.
+    The whole batch goes through one ``update_data`` call so the
+    framework's cursor anchor runs exactly once at the end and the
+    user's cursor position is preserved across the insert.
     """
     if not records:
         return
@@ -3258,14 +3263,8 @@ def _push_flat_inserts(b, path, records):
         return
     existing_ids = {it.id for it in existing}
 
-    last_sub_idx = -1
-    for i, it in enumerate(existing):
-        if isinstance(it.id, str) and '#agent:' in it.id:
-            last_sub_idx = i
-    where = ('after', None, last_sub_idx)
-
     ops = []
-    for n, rec in reversed(records):
+    for n, rec in records:
         if rec is None:
             continue
         item_id = f'{path}#{n}'
@@ -3287,7 +3286,7 @@ def _push_flat_inserts(b, path, records):
             bg = _ROW_BG_FOR_KIND.get(kind)
             if bg is not None:
                 fields['row_bg'] = bg
-        ops.append(upsert(item_id, path, where=where, **fields))
+        ops.append(upsert(item_id, path, **fields))
     if ops:
         b.update_data(ops)
 
@@ -4475,8 +4474,9 @@ def _jump_to_voice(ctx, direction):
 
     "Voice" rows are user prompts and assistant text replies — the
     speech-only rows ``_is_voice`` marks via ``row_bg``. Direction
-    matches the list ordering — ``+1`` walks down (older messages,
-    since the list is newest-first), ``-1`` walks up (newer).
+    is positional in the visible list: ``+1`` walks down (which now
+    means *newer* messages — the list is chronological), ``-1`` walks
+    up (older).
 
     Walks the *visible* item list, not the on-disk tree. That means
     jumps cross expanded subtree boundaries naturally — if two
@@ -4717,9 +4717,13 @@ def _focus_latest_voice_when_ready(b, target_jsonl):
         cur = state.cursor
         if not (0 <= cur < len(vis) and vis[cur].kind == 'scope_root'):
             return
-        _chain_expand_then_cursor(
-            b, _ancestor_ids_for(last_id), last_id,
-        )
+        # Tree mode: walk the ancestor chain so each #prompt:N umbrella
+        # is expanded before the final cursor_to lands. Flat mode: the
+        # leaf is already directly visible under the scope_root, so the
+        # ancestor list is empty and the chain collapses to one
+        # cursor_to.
+        ancestors = _ancestor_ids_for(last_id) if _TREE_MODE else []
+        _chain_expand_then_cursor(b, ancestors, last_id)
     b.expand(target_jsonl).then(_fire)
 
 
@@ -4785,13 +4789,17 @@ def _action_scope_down(ctx):
 
 
 def _action_tree_right(ctx):
-    """Right-arrow override: expand + jump to latest voice in tree mode.
+    """Right-arrow override: expand + jump to latest voice.
 
-    Flat mode: replicate the framework default (collapsed row → expand;
-    already-expanded row → step into first child). Tree mode: same,
-    but after expanding a node, walk down to the latest voice inside
-    that subtree and land the cursor there. Reads better than leaving
-    the cursor on the now-expanded parent row.
+    Mode-agnostic since #475 — flat mode and tree mode both now place
+    the cursor on the latest voice inside the newly-revealed (or
+    already-expanded) subtree. ``_latest_voice_among_children`` uses
+    ``get_children`` so it returns the right thing in both modes
+    (umbrellas in tree, flat leaves in flat).
+
+    Step-into for already-expanded rows reuses the framework default
+    (one row down — the framework's expand-then-render guarantees the
+    next row is the first child).
     """
     cur = ctx.cursor
     if cur is None:
@@ -4799,27 +4807,8 @@ def _action_tree_right(ctx):
     expanded = ctx.state.expanded
     expandable = getattr(cur, 'has_children', False)
 
-    # Flat mode (or any non-tree-mode situation): emulate the default
-    # ``_nav_right`` — expand collapsed, step-into for already-expanded.
-    if not _TREE_MODE or not expandable:
-        if expandable and cur.id not in expanded:
-            ctx.expand(cur.id, autoscroll=True)
-            _invalidate_if_cross_file(cur.id)
-            return
-        # Step into first child if cursor's next visible row is deeper.
-        try:
-            vis = ctx.visible_items
-        except AttributeError:
-            return
-        idx = ctx.cursor_index
-        if (expandable
-                and 0 <= idx < len(vis) - 1):
-            # ctx.visible_items returns (item, kind) tuples; the
-            # depth-comparison live in the framework's state. We don't
-            # have direct depth access here, so just nudge cursor one
-            # row down — the framework's expand-then-render guarantees
-            # the next row is the first child.
-            ctx.cursor_to(vis[idx + 1][0].id)
+    if not expandable:
+        # Non-expandable row: nothing to do.
         return
 
     target_id = cur.id
@@ -5048,25 +5037,17 @@ def main():
     #
     #   --item N:               scope INTO the jsonl, cursor on message N.
     #
-    #   --tree, no --item:      scope INTO the jsonl, cursor on last voice
-    #                           (the user wants to see the conversation; the
-    #                           card+timeline is just bookkeeping, the
-    #                           interesting content is whatever was said
-    #                           most recently). Expanding ancestors makes
-    #                           the row visible despite default-collapsed
-    #                           subtrees.
-    #
-    #   flat, no --item:        scope into the *parent* directory and put
-    #                           the cursor on the session row. The session
-    #                           row's preview is lightweight metadata (so
-    #                           scrolling between sessions stays cheap);
-    #                           expanding or scoping into the session
-    #                           upgrades it to the full cascade.
+    #   no --item:              scope INTO the jsonl in BOTH modes, cursor
+    #                           on last voice (the conversation, not the
+    #                           card+timeline, is what the user came for).
+    #                           Two-level scope_stack ([parent_dir, jsonl])
+    #                           so alt-up pops one logical level (file →
+    #                           project dir) instead of jumping to the
+    #                           project root.
+    parent_scope = None
     if target_jsonl:
-        if item_arg is not None or _TREE_MODE:
-            initial_scope = target_jsonl
-        else:
-            initial_scope = os.path.dirname(target_jsonl) or '/'
+        initial_scope = target_jsonl
+        parent_scope = os.path.dirname(target_jsonl) or '/'
 
     # 'M' always pages the preview through the external $MD2ANSI / md2ansi.
     # 'm' toggles inline markdown coloring iff the md2ansi Python module
@@ -5121,27 +5102,33 @@ def main():
     ))
     _BROWSER = b
 
+    # Two-level scope_stack: [parent_dir, target_jsonl]. ``initial_scope``
+    # was set above to target_jsonl, so the framework's __init__ pushed
+    # that onto the stack as the current scope. Slot parent_dir UNDER it
+    # so alt-up from inside the file pops one logical level (file →
+    # project dir) instead of jumping straight to the project root.
+    # Direct list insert preserves the framework's _expanded_by_scope
+    # bookkeeping the __init__ scope_into already established.
+    if target_jsonl and parent_scope and parent_scope != target_jsonl:
+        b._state.scope_stack.insert(0, parent_scope)
+
     # Post-construction cursor positioning:
     #
-    #   --item N:           cursor → ``<jsonl>#<N-1>``. Scope already
-    #                       the jsonl, so messages render on first paint.
+    #   --item N:          cursor → ``<jsonl>#<N-1>``. Scope already the
+    #                      jsonl, so messages render on first paint.
     #
-    #   --tree, no --item:  cursor → last voice in the session. Deferred
-    #                       until scope_root's children have loaded so
-    #                       the ancestor walk doesn't race the initial
-    #                       fetch (see ``_focus_latest_voice_when_ready``).
-    #
-    #   flat, no --item:    parent-dir scope; cursor → session row via
-    #                       expand-then-cursor_to.
+    #   no --item:         cursor → last voice in the session. Deferred
+    #                      until scope_root's children have loaded
+    #                      (see ``_focus_latest_voice_when_ready``).
+    #                      Works in both flat and tree mode — the only
+    #                      difference is whether the chain needs to walk
+    #                      ancestor umbrellas (tree) or not (flat).
     if target_jsonl:
         if item_arg is not None:
             n0 = max(1, item_arg) - 1
             b.cursor_to(f'{target_jsonl}#{n0}')
-        elif _TREE_MODE:
-            _focus_latest_voice_when_ready(b, target_jsonl)
         else:
-            parent = os.path.dirname(target_jsonl) or '/'
-            b.expand(parent).then(lambda: b.cursor_to(target_jsonl))
+            _focus_latest_voice_when_ready(b, target_jsonl)
 
     # Live-tail worker: polls the cursor's file every 5s and folds
     # newly-appended records into the cached _TreeData, then pushes
