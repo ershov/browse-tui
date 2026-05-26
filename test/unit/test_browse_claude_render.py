@@ -80,6 +80,11 @@ def _stub_browse_tui():
     # shape for the _FakeBrowser to interpret.
     mod.set_preview_op = lambda id_, text: ('set_preview', id_, text)
 
+    # visible_items is used by the cursor-on-open ready-check
+    # (_focus_latest_voice_when_ready). Tests don't exercise the
+    # focus flow directly, so a no-op returning [] is fine.
+    mod.visible_items = lambda state: []
+
     sys.modules['browse_tui'] = mod
 
 
@@ -3413,6 +3418,229 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
                 )
             finally:
                 self.r._FILTER_VOICE_ONLY = False
+
+    def test_focus_latest_voice_when_ready_jumps_after_load(self):
+        # _focus_latest_voice_when_ready chains:
+        #   1. b.expand(target_jsonl).then(_fire)
+        #   2. _fire reads _last_voice_id, checks cursor still on
+        #      scope_root, then runs _chain_expand_then_cursor.
+        # We capture each step with a fake Browser.
+        import tempfile
+        import json as _json
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = os.path.join(tmp, 's.jsonl')
+            recs = [
+                {'type': 'user', 'uuid': 'u1',
+                 'message': {'role': 'user', 'content': 'a'}},
+                {'type': 'user', 'uuid': 'u2',
+                 'message': {'role': 'user', 'content': 'b'}},
+            ]
+            with open(sess, 'w') as f:
+                for r in recs:
+                    f.write(_json.dumps(r) + '\n')
+            self.r._TREE_CACHE.clear()
+
+            # Fake browser captures expand/cursor_to + simulates a
+            # scope_root cursor that hasn't moved.
+            calls = {'cursor_to': [], 'expand_chain': []}
+
+            class _ScopeRootEntry:
+                kind = 'scope_root'
+                item = None
+
+            class _State:
+                cursor = 0
+
+            class _Pending:
+                def __init__(self):
+                    self._cb = None
+                def then(self, cb):
+                    self._cb = cb
+                    return self
+                def fire(self):
+                    if self._cb:
+                        self._cb()
+
+            class _FakeBrowser:
+                def __init__(self):
+                    self._state = _State()
+                    self._pendings = []
+                def expand(self, _id, autoscroll=False):
+                    p = _Pending()
+                    self._pendings.append(p)
+                    calls['expand_chain'].append(_id)
+                    return p
+                def cursor_to(self, _id):
+                    calls['cursor_to'].append(_id)
+
+            # Override visible_items so the scope_root check passes.
+            saved_vi = self.r.visible_items
+            self.r.visible_items = lambda state: [_ScopeRootEntry()]
+            try:
+                b = _FakeBrowser()
+                self.r._focus_latest_voice_when_ready(b, sess)
+                # First expand call: target_jsonl (to wait for
+                # scope_root's children).
+                self.assertEqual(calls['expand_chain'], [sess])
+                # No cursor_to yet — Pending not resolved.
+                self.assertEqual(calls['cursor_to'], [])
+                # Resolve each pending in sequence — the chain calls
+                # ``b.expand(...).then(...)`` once per ancestor before
+                # finally firing cursor_to. Drain until cursor_to fires.
+                fired = 0
+                while fired < len(b._pendings) and not calls['cursor_to']:
+                    b._pendings[fired].fire()
+                    fired += 1
+                # Now the chain should have fired cursor_to on the
+                # latest voice.
+                self.assertEqual(calls['cursor_to'], [f'{sess}#1'])
+            finally:
+                self.r.visible_items = saved_vi
+
+    def test_focus_latest_voice_when_ready_cancels_if_cursor_moved(self):
+        # If the user has navigated off scope_root before the
+        # deferred fire, the jump cancels — no cursor_to.
+        import tempfile
+        import json as _json
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = os.path.join(tmp, 's.jsonl')
+            recs = [
+                {'type': 'user', 'uuid': 'u1',
+                 'message': {'role': 'user', 'content': 'voice'}},
+            ]
+            with open(sess, 'w') as f:
+                for r in recs:
+                    f.write(_json.dumps(r) + '\n')
+            self.r._TREE_CACHE.clear()
+
+            calls = {'cursor_to': [], 'expand_chain': []}
+
+            class _NormalEntry:
+                kind = 'normal'
+                class item:
+                    id = 'somewhere/else'
+
+            class _State:
+                cursor = 0
+
+            class _Pending:
+                def __init__(self):
+                    self._cb = None
+                def then(self, cb):
+                    self._cb = cb
+                    return self
+                def fire(self):
+                    if self._cb:
+                        self._cb()
+
+            class _FakeBrowser:
+                def __init__(self):
+                    self._state = _State()
+                    self._pendings = []
+                def expand(self, _id, autoscroll=False):
+                    p = _Pending()
+                    self._pendings.append(p)
+                    calls['expand_chain'].append(_id)
+                    return p
+                def cursor_to(self, _id):
+                    calls['cursor_to'].append(_id)
+
+            # visible_items reports cursor on a non-scope_root row.
+            saved_vi = self.r.visible_items
+            self.r.visible_items = lambda state: [_NormalEntry()]
+            try:
+                b = _FakeBrowser()
+                self.r._focus_latest_voice_when_ready(b, sess)
+                # Fire scope_root delivery — user has navigated.
+                b._pendings[0].fire()
+                # cursor_to should NOT have been called.
+                self.assertEqual(
+                    calls['cursor_to'], [],
+                    'cursor_to should be suppressed when the user '
+                    'has navigated off scope_root before fire',
+                )
+            finally:
+                self.r.visible_items = saved_vi
+
+    def test_scan_tree_tracks_latest_voice_line(self):
+        # _scan_tree's forward pass eagerly populates
+        # td.latest_voice_line so the cursor-on-open path doesn't have
+        # to walk records[] in reverse.
+        import tempfile
+        import json as _json
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = os.path.join(tmp, 's.jsonl')
+            recs = [
+                # 0: voice (user text)
+                {'type': 'user', 'uuid': 'u1',
+                 'message': {'role': 'user', 'content': 'first'}},
+                # 1: NOT voice (tool_use without text)
+                {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+                 'message': {'role': 'assistant', 'content': [{
+                     'type': 'tool_use', 'id': 't1', 'name': 'Bash',
+                     'input': {'command': 'ls'},
+                 }]}},
+                # 2: voice (assistant text — the latest)
+                {'type': 'assistant', 'uuid': 'a2', 'parentUuid': 'u1',
+                 'message': {'role': 'assistant', 'content': [{
+                     'type': 'text', 'text': 'reply',
+                 }]}},
+                # 3: NOT voice (tool_result)
+                {'type': 'user', 'uuid': 'u2', 'parentUuid': 'a1',
+                 'message': {'role': 'user', 'content': [{
+                     'type': 'tool_result', 'tool_use_id': 't1',
+                     'content': 'output',
+                 }]}},
+            ]
+            with open(sess, 'w') as f:
+                for r in recs:
+                    f.write(_json.dumps(r) + '\n')
+            self.r._TREE_CACHE.clear()
+            td = self.r._scan_tree(sess)
+            # Line 2 was the most-recent voice. Lines 1 and 3 are
+            # machinery (no text content) so they don't shift the
+            # tracker.
+            self.assertEqual(td.latest_voice_line, 2)
+
+    def test_last_voice_id_is_o1_via_tracked_field(self):
+        # _last_voice_id reads td.latest_voice_line; no reverse walk.
+        import tempfile
+        import json as _json
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = os.path.join(tmp, 's.jsonl')
+            recs = [
+                {'type': 'user', 'uuid': 'u1',
+                 'message': {'role': 'user', 'content': 'q'}},
+                {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+                 'message': {'role': 'assistant', 'content': [{
+                     'type': 'text', 'text': 'r',
+                 }]}},
+            ]
+            with open(sess, 'w') as f:
+                for r in recs:
+                    f.write(_json.dumps(r) + '\n')
+            self.r._TREE_CACHE.clear()
+            self.assertEqual(self.r._last_voice_id(sess), f'{sess}#1')
+
+    def test_last_voice_id_none_when_no_voice_records(self):
+        # Pure-machinery transcript: scan completes with
+        # latest_voice_line still None, _last_voice_id returns None.
+        import tempfile
+        import json as _json
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = os.path.join(tmp, 's.jsonl')
+            recs = [
+                # All non-voice (tool_use / tool_result / system)
+                {'type': 'system', 'uuid': 's1',
+                 'subtype': 'compaction', 'content': ''},
+            ]
+            with open(sess, 'w') as f:
+                for r in recs:
+                    f.write(_json.dumps(r) + '\n')
+            self.r._TREE_CACHE.clear()
+            td = self.r._scan_tree(sess)
+            self.assertIsNone(td.latest_voice_line)
+            self.assertIsNone(self.r._last_voice_id(sess))
 
     def test_flush_refreshes_hidden_against_live_filter(self):
         # #4 follow-up: the umbrella generator captures each child's

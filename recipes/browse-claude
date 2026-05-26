@@ -46,7 +46,7 @@ import threading
 
 from browse_tui import (
     Action, Browser, BrowserConfig, Item, mod, scope_into, set_preview_op,
-    upsert,
+    upsert, visible_items,
 )
 
 # Optional md2ansi plugin — colors user/assistant voice content inline.
@@ -2542,7 +2542,7 @@ class _TreeData:
                  'agent_link', 'records_line', 'parent_id_of',
                  'assistant_has_tool_use', 'tool_to_turn_root_line',
                  'agent_to_assistant_line', 'tool_use_name_of',
-                 'line_offsets', 'voice_count')
+                 'line_offsets', 'voice_count', 'latest_voice_line')
 
     def __init__(self):
         self.records = []
@@ -2583,6 +2583,13 @@ class _TreeData:
         # ``_fmt_scope_card`` and invalidated by tail appends that
         # bring in new voice records.
         self.voice_count = None
+        # Line number of the most-recent voice record seen during the
+        # scan (None if no voice record yet). Updated eagerly inside
+        # the scan loop so consumers don't have to re-walk records[].
+        # Used by the cursor-on-open path to land on the latest voice
+        # without an upfront synchronous full-file pass on the main
+        # thread.
+        self.latest_voice_line = None
 
 
 def _is_turn_root(rec):
@@ -2917,6 +2924,8 @@ def _scan_tree(path):
                 else:
                     td.records.append(rec)
                     _fold_record(td, cur, rec, n, path, sub_dir)
+                    if _is_voice(rec):
+                        td.latest_voice_line = n
             last_full_offset = f.tell()
             # Sentinel pattern: each appended ``f.tell()`` becomes the
             # start of the next line. After N complete lines,
@@ -3028,6 +3037,8 @@ def _read_new_records(path):
                         dirty |= _fold_record(td, cur=tail.cursor,
                                               rec=rec, n=n,
                                               path=path, sub_dir=sub_dir)
+                        if _is_voice(rec):
+                            td.latest_voice_line = n
                 tail.byte_offset = f.tell()
                 # Sentinel pattern: append the end-of-line position
                 # so ``line_offsets[n+1] - line_offsets[n]`` always
@@ -3326,16 +3337,16 @@ def _cursor_tail_path(item_id):
 def _last_voice_id(jsonl_path):
     """Return ``<jsonl>#<n>`` id of the most-recent voice record, or None.
 
-    "Voice" matches ``_is_voice`` (user prompt or assistant text). Walks
-    records in REVERSE file order so the latest wins. Used for the
-    cursor-on-open and the t-toggle landing point.
+    "Voice" matches ``_is_voice`` (user prompt or assistant text).
+    Reads the eagerly-tracked ``td.latest_voice_line`` populated by
+    ``_scan_tree`` during its forward pass, so this is O(1) on cache
+    hit (no reverse walk).
     """
     td = _scan_tree(jsonl_path)
-    for n in range(len(td.records) - 1, -1, -1):
-        rec = td.records[n]
-        if rec is not None and _is_voice(rec):
-            return f'{jsonl_path}#{n}'
-    return None
+    n = td.latest_voice_line
+    if n is None:
+        return None
+    return f'{jsonl_path}#{n}'
 
 
 def _list_tree_roots(jsonl_path):
@@ -4637,6 +4648,50 @@ def _chain_expand_then_cursor(b, ancestor_ids, target_id):
     _step(0)
 
 
+def _focus_latest_voice_when_ready(b, target_jsonl):
+    """Defer the cursor-on-open jump until scope_root's children land.
+
+    Replaces the pre-``run()`` synchronous ``_last_voice_id`` precompute
+    + chain, which forced a 1.6s full-file ``_scan_tree`` on the main
+    thread and raced the initial fetch's FIFO ordering for huge
+    transcripts.
+
+    Algorithm:
+      1. Wait for ``b.expand(target_jsonl).then(...)`` to fire —
+         scope_root's children landed via ``_do_initial_fetch``'s
+         standard delivery, which means ``_scan_tree`` has run on the
+         children-worker thread and ``td.latest_voice_line`` is
+         populated.
+      2. Check the cursor's *current* position. If the user has moved
+         off the scope_root row, leave them alone — they navigated
+         while the file was loading and a surprise jump would be
+         disorienting.
+      3. Otherwise, walk the ancestor chain via
+         ``_chain_expand_then_cursor`` to land on the latest voice.
+
+    The cancel-on-user-moved check uses the live cursor instead of an
+    ``on_cursor_change`` subscription: the framework places the cursor
+    on scope_root atomically before any user input could land, so
+    "cursor still on scope_root at fire time" is a reliable proxy for
+    "user hasn't touched it yet."
+    """
+    def _fire():
+        last_id = _last_voice_id(target_jsonl)
+        if not last_id:
+            return
+        # Cancel if the user has navigated since startup. The scope_root
+        # row has ``entry.kind == 'scope_root'`` in the visible list.
+        state = b._state
+        vis = visible_items(state)
+        cur = state.cursor
+        if not (0 <= cur < len(vis) and vis[cur].kind == 'scope_root'):
+            return
+        _chain_expand_then_cursor(
+            b, _ancestor_ids_for(last_id), last_id,
+        )
+    b.expand(target_jsonl).then(_fire)
+
+
 def _is_cross_file_id(item_id):
     """True iff ``item_id`` anchors a *different* file's content.
 
@@ -5031,11 +5086,10 @@ def main():
     #   --item N:           cursor → ``<jsonl>#<N-1>``. Scope already
     #                       the jsonl, so messages render on first paint.
     #
-    #   --tree, no --item:  cursor → last voice in the session. Walk
-    #                       parentUuid chain to pre-expand each ancestor
-    #                       so the row is visible despite default-collapsed
-    #                       subtrees. Falls back to the session row if no
-    #                       voice exists.
+    #   --tree, no --item:  cursor → last voice in the session. Deferred
+    #                       until scope_root's children have loaded so
+    #                       the ancestor walk doesn't race the initial
+    #                       fetch (see ``_focus_latest_voice_when_ready``).
     #
     #   flat, no --item:    parent-dir scope; cursor → session row via
     #                       expand-then-cursor_to.
@@ -5044,18 +5098,7 @@ def main():
             n0 = max(1, item_arg) - 1
             b.cursor_to(f'{target_jsonl}#{n0}')
         elif _TREE_MODE:
-            last_id = _last_voice_id(target_jsonl)
-            if last_id:
-                # Chain expands so each ancestor's children land in the
-                # cache before the next expand reads them, then
-                # cursor_to once the deepest expand resolves. Without
-                # the chain, cursor_to races the fetch worker — it
-                # scans visible_items, finds only the scope_root row
-                # (children of ancestors not yet fetched), and silently
-                # leaves the cursor put.
-                _chain_expand_then_cursor(
-                    b, _ancestor_ids_for(last_id), last_id,
-                )
+            _focus_latest_voice_when_ready(b, target_jsonl)
         else:
             parent = os.path.dirname(target_jsonl) or '/'
             b.expand(parent).then(lambda: b.cursor_to(target_jsonl))
