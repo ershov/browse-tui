@@ -2958,21 +2958,36 @@ def _search_jump_nearest(browser):
 
 # ---- interactive filter (`&`) evaluator ---------------------------------
 #
-# See docs/superpowers/specs/2026-05-17-filter-design.md.
+# See docs/superpowers/specs/2026-05-27-filter-visible-tree-only-design.md
+# (supersedes the optimistic-keep-visible evaluator from the original
+# 2026-05-17-filter-design.md).
 #
-# Bottom-up pass over ``state._children`` writes ``Item._filter_hidden``
-# on every reachable item: True when the item does not match the active
-# filter stack AND none of its descendants do either. The renderer
-# (``_emit_children``) skips rows whose ``_filter_hidden`` is True,
-# guarded by ``state._filter_active`` so the check short-circuits when
-# no filter is active.
+# DFS over the *visible* tree (the same shape ``_emit_children`` would
+# walk with the filter off) writes ``Item._filter_hidden`` on every
+# reachable item: True when the item does not match the active filter
+# stack AND none of its currently-visible descendants do either. The
+# renderer (``_emit_children``) skips rows whose ``_filter_hidden`` is
+# True, guarded by ``state._filter_active`` so the check short-circuits
+# when no filter is active.
 #
 # Reuses ``_search_text`` / ``_search_matches`` so the haystack rules
 # and fragment-AND matcher are identical to ``/`` search.
+#
+# Key semantic rules (per the design):
+#
+#   1. The walk descends only through items in ``state.expanded`` —
+#      collapsed parents are evaluated against their own searchable
+#      text alone; their children are not consulted.
+#   2. ``Item.hidden=True`` rows are skipped entirely (they aren't
+#      "visible" and can't match or scaffold an ancestor).
+#   3. No optimistic branch: a parent with ``has_children=True`` whose
+#      children aren't cached contributes nothing — visibility depends
+#      on the parent's own match alone.
+#   4. The current-scope row is exempt: always treated as a match.
 
 
 def _recompute_filter_hidden(state, filters, *, show_ids='auto') -> None:
-    """Re-evaluate filter visibility across the tree.
+    """Re-evaluate filter visibility across the visible tree.
 
     ``filters`` is an iterable of filter strings (typically
     ``Browser._filters``). Empty strings are ignored — they're the
@@ -2999,43 +3014,153 @@ def _recompute_filter_hidden(state, filters, *, show_ids='auto') -> None:
         return
 
     scope_id = state.scope_stack[-1] if state.scope_stack else None
-    visited: set = set()
 
     def visit(item):
-        if item.id in visited:
-            return not item._filter_hidden
-        visited.add(item.id)
-        children = state._children.get(item.id, [])
-        any_desc_passes = False
-        for child in children:
-            if visit(child):
-                any_desc_passes = True
-        # Optimistic: a parent with promised-but-uncached children is
-        # treated as "scaffold-worthy" so it stays visible until the
-        # children stream in and the next recompute corrects the flag.
-        if item.has_children and item.id not in state._children:
-            any_desc_passes = True
+        """Bottom-up DFS over the visible subtree.
+
+        Returns True iff ``item`` should be visible
+        (``_filter_hidden=False``).
+        """
+        # Rule 2: recipe-hidden rows aren't part of the visible tree.
+        # No flag write; the renderer would skip them regardless and
+        # they can't scaffold an ancestor.
+        if getattr(item, 'hidden', False):
+            return False
+
+        # Descend only into expanded subtrees (Rule 1). Collapsed
+        # children contribute nothing.
+        any_visible_desc_passes = False
+        if item.has_children and item.id in state.expanded:
+            for child in state._children.get(item.id, ()):
+                if visit(child):
+                    any_visible_desc_passes = True
+
         is_scope = (item.id == scope_id)
         text = _search_text(
             item, show_ids=show_ids, is_current_scope=is_scope,
         )
-        self_passes = all(_search_matches(text, q) for q in active)
-        # Scope row exemption: always visible.
-        if is_scope:
-            self_passes = True
-        item._filter_hidden = not (self_passes or any_desc_passes)
-        return self_passes or any_desc_passes
+        # Scope row exemption: always treated as a match.
+        self_passes = is_scope or all(
+            _search_matches(text, q) for q in active
+        )
+        item._filter_hidden = not (
+            self_passes or any_visible_desc_passes
+        )
+        return not item._filter_hidden
 
-    # Walk every cached subtree. Recipes that scope directly into a
-    # sub-id (e.g. ``browse-claude <session.jsonl>``) load children
-    # under that scope without ever populating ``_children[root_id]``,
-    # so a root-only walk would miss them. The ``visited`` set guards
-    # against double-recursion when an item is reached via multiple
-    # entry points (in a well-formed tree each id has one parent, so
-    # this is mostly defensive).
-    for parent_id in list(state._children.keys()):
-        for child in state._children[parent_id]:
+    # Walk the same shape ``_emit_children`` would walk with the filter
+    # off: the scope row (when scoped) or root's children (unscoped).
+    # The scope row is normally in ``state.expanded`` (``scope_into``
+    # auto-adds it) so the DFS descends into its children.
+    if state.scope_stack:
+        scope_root_id = state.scope_stack[-1]
+        scope_item = _find_item(state, scope_root_id)
+        if scope_item is None:
+            scope_item = state._items_by_id.get(scope_root_id)
+        if scope_item is not None:
+            visit(scope_item)
+    else:
+        for child in state._children.get(state.root_id, ()):
             visit(child)
+
+
+# ---- per-op incremental filter propagation (ticket #498) ----------------
+#
+# ``_propagate_filter_status_up`` is the per-item dual of
+# ``_recompute_filter_hidden`` above. Instead of a full walk over the
+# visible tree, it re-evaluates ONE item's ``_filter_hidden`` flag and
+# then walks upward through ancestors, terminating at the first ancestor
+# whose flag value doesn't change. This is the "per-op incremental
+# update" helper from
+# ``docs/superpowers/specs/2026-05-27-filter-visible-tree-only-design.md``
+# ("Per-op incremental update" section).
+#
+# Used by:
+#   * ``update_data._apply`` dispatch (#499): per affected item.
+#   * ``_do_expand`` subtree-revisit (#501): after the new subtree's
+#     visit() runs, propagate up from the expand-parent so any flag
+#     change reaches the scope row.
+#
+# Semantics mirror ``_recompute_filter_hidden``'s per-item evaluation:
+#   1. ``hidden=True`` items contribute nothing (can't scaffold).
+#   2. Only descendants reachable through ``state.expanded`` count.
+#   3. The current scope row is exempt (always treated as match).
+#   4. No optimistic branch for uncached children (matches the rewrite
+#      in ticket #497).
+#
+# The walk upward is keyed off ``state._parent_of_id`` (the reverse
+# index maintained by ``_index_add_children`` / ``_index_drop_children``).
+# A missing entry means "no parent known" -> we've reached the top.
+
+
+def _propagate_filter_status_up(state, item, filters, *, show_ids='auto'):
+    """Re-evaluate one item's ``_filter_hidden`` and walk up ancestors.
+
+    For each item visited the helper recomputes ``_filter_hidden`` from
+    the item's own searchable text plus the current ``_filter_hidden``
+    flags of its visible children (descendants reachable via
+    ``state.expanded`` and not ``Item.hidden=True``). If the new flag
+    value equals the existing one, the walk terminates: ancestors
+    above are unaffected because the only signal they receive from
+    this subtree is the cur item's flag.
+
+    ``filters`` is iterable of filter strings; empty / whitespace-only
+    handling matches ``_recompute_filter_hidden``: only truthy strings
+    are honoured, and an all-empty list is a no-op.
+
+    ``show_ids`` is plumbed through to ``_search_text`` so propagation
+    sees the same haystack as the full walk.
+
+    No-op when no non-empty filter is present. Recipe-``hidden=True``
+    items count as "not visible, doesn't scaffold" — propagation still
+    continues through them upward (the parent gets re-evaluated against
+    the rest of its children).
+    """
+    active = [q for q in filters if q]
+    if not active:
+        return
+
+    scope_id = state.scope_stack[-1] if state.scope_stack else None
+
+    cur = item
+    while cur is not None:
+        if not getattr(cur, 'hidden', False):
+            # Recompute cur's flag from self-match + visible children's
+            # current flags. Recipe-hidden cur is skipped: it can't
+            # scaffold an ancestor and the renderer drops it anyway;
+            # we still walk upward so the parent re-evaluates against
+            # its other (non-hidden) children.
+            any_visible_desc_passes = False
+            if cur.has_children and cur.id in state.expanded:
+                for child in state._children.get(cur.id, ()):
+                    if getattr(child, 'hidden', False):
+                        continue
+                    if not child._filter_hidden:
+                        any_visible_desc_passes = True
+                        break
+            is_scope = (cur.id == scope_id)
+            text = _search_text(
+                cur, show_ids=show_ids, is_current_scope=is_scope,
+            )
+            self_passes = is_scope or all(
+                _search_matches(text, q) for q in active
+            )
+            new_hidden = not (self_passes or any_visible_desc_passes)
+
+            if cur._filter_hidden == new_hidden:
+                # No change at this level: ancestors above us see the
+                # same signal from this subtree as before. Early-out.
+                return
+            cur._filter_hidden = new_hidden
+
+        # Walk up via the reverse-parent index. ``get()`` returns
+        # ``None`` for either "no entry" (item not indexed) or
+        # "parent_id is None" (item is at root level): both terminate
+        # the walk — nothing above the conceptual root.
+        parent_id = state._parent_of_id.get(cur.id)
+        if parent_id is None:
+            return
+        cur = state._items_by_id.get(parent_id)
 
 
 # ---- insert-mode placement helpers (ticket #21) -------------------------

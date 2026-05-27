@@ -1760,8 +1760,12 @@ class TestFilterUpdateDataIntegration(unittest.TestCase):
     """``update_data`` re-fires ``_recompute_filter_hidden`` after each batch."""
 
     def test_streaming_match_unhides_scaffold_parent(self):
-        # Start: only non-matching items. Apply a filter — parent hidden.
-        # Then stream in a matching child — parent should resurrect.
+        # Start: only non-matching items. Apply a filter — parent
+        # hidden (visible-tree-only semantic: collapsed/uncached parent
+        # with no self-match doesn't get optimistic kept-visible
+        # treatment; see 2026-05-27-filter-visible-tree-only-design).
+        # Expand the parent so its children participate in the walk;
+        # then stream in a matching child — parent should resurrect.
         b = make_browser(get_children=lambda _id, *, reload=False: [])
         try:
             b.refresh()
@@ -1771,12 +1775,15 @@ class TestFilterUpdateDataIntegration(unittest.TestCase):
                  {'title': 'parent', 'has_children': True}),
             ])
             b.run_until_idle()
+            # Expand parent so the DFS descends into its children.
+            b._state.expanded.add('parent')
             b.set_filters(['child'])
             b.run_until_idle()
-            # Optimistic-pending: parent has has_children=True with no
-            # cached children, so it stays visible.
-            self.assertFalse(b._state._items_by_id['parent']._filter_hidden)
-            # Stream a non-matching child first — parent flips to hidden.
+            # Parent expanded but no cached children + own text doesn't
+            # match — hidden (no optimistic branch).
+            self.assertTrue(b._state._items_by_id['parent']._filter_hidden)
+            # Stream a non-matching child first — parent stays hidden,
+            # child hidden.
             b.update_data([
                 ('upsert', 'one', 'parent', {'title': 'one'}),
                 ('complete', 'parent'),
