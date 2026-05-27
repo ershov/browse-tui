@@ -27,7 +27,7 @@ import sys
 from browse_tui import Browser, BrowserConfig, Item
 
 
-_LOG_LIMIT = 1000
+_LOG_LIMIT = 10000
 
 
 def _pop_limit_arg(default):
