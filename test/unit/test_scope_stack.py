@@ -106,11 +106,12 @@ class TestExpandedPreserved(unittest.TestCase):
         s = State(root_id='__ROOT__')
         s.expanded = {'x', 'y'}
         scope_into(s, 'A')
-        # Fresh scope — expanded is empty (no prior memo).
-        self.assertEqual(s.expanded, set())
+        # Fresh scope — expanded contains only the scope id itself
+        # (auto-added by scope_into so the scope row paints expanded).
+        self.assertEqual(s.expanded, {'A'})
         s.expanded.add('z')
         scope_out(s)
-        # Restored to root's set; 'z' did not bleed across.
+        # Restored to root's set; 'z' / 'A' did not bleed across.
         self.assertEqual(s.expanded, {'x', 'y'})
 
     def test_revisiting_scope_restores_its_expanded(self):
@@ -119,7 +120,9 @@ class TestExpandedPreserved(unittest.TestCase):
         s.expanded.add('z')
         scope_out(s)
         scope_into(s, 'A')
-        self.assertEqual(s.expanded, {'z'})
+        # Restored set includes the previously-added 'z' AND the scope
+        # id itself ('A', auto-added on every scope_into).
+        self.assertEqual(s.expanded, {'A', 'z'})
 
 
 class TestVisibleReflectsScope(unittest.TestCase):
@@ -139,13 +142,13 @@ class TestVisibleReflectsScope(unittest.TestCase):
             [(r.item.id, r.depth, r.kind) for r in rows],
             [('A', 0, 'normal')],
         )
-        # Scope into 'A': scope_root row + children.
+        # Scope into 'A': scope row at depth 0 (normal kind) + children.
         scope_into(s, 'A')
         rows = visible_items(s)
         self.assertEqual(
             [(r.item.id, r.depth, r.kind) for r in rows],
             [
-                ('A', 0, 'scope_root'),
+                ('A', 0, 'normal'),
                 ('A1', 1, 'normal'),
                 ('A2', 1, 'normal'),
             ],
@@ -162,6 +165,68 @@ class TestScopeOutAtRootIsNoOp(unittest.TestCase):
         self.assertEqual(s.scope_stack, [])
         self.assertEqual(current_scope(s), '__ROOT__')
         self.assertEqual(s.expanded, {'x'})
+
+
+class TestScopeIntoAutoExpands(unittest.TestCase):
+    """scope_into auto-adds the scope id to the expanded set so the
+    scope row renders with the ▼ glyph by default (the scope row is
+    now a normal row at depth 0 — see scope-root unification design)."""
+
+    def test_scope_into_adds_id_to_expanded(self):
+        s = State(root_id='__ROOT__')
+        scope_into(s, 'A')
+        self.assertIn('A', s.expanded)
+
+    def test_scope_into_does_not_leak_into_memoised_set(self):
+        # The auto-add lives only in the active expanded set, not in
+        # the memoised entry of the scope we just left. scope_out
+        # writes the active set back, so any explicit changes the
+        # user makes while in scope are still preserved across
+        # round-trips.
+        s = State(root_id='__ROOT__')
+        s.expanded = {'x'}
+        scope_into(s, 'A')
+        # 'A' is in the new active set...
+        self.assertEqual(s.expanded, {'A'})
+        # ...but not in the memoised root entry, so popping back
+        # restores {'x'} without 'A' bleeding in.
+        scope_out(s)
+        self.assertEqual(s.expanded, {'x'})
+
+
+class TestScopeOutAutoExpands(unittest.TestCase):
+    """scope_out mirrors scope_into's auto-expand: when we land in a
+    still-scoped state, the new current scope id is added to
+    ``state.expanded`` so the scope row paints expanded by default.
+    Without this, popping into a scope whose memoised expanded set
+    doesn't include itself (recipe-pushed deep stack, never previously
+    entered via scope_into) would hide the popped row's siblings."""
+
+    def test_scope_out_into_nested_scope_auto_expands(self):
+        s = State(root_id='__ROOT__')
+        # Simulate a recipe-pushed deep stack: never went through
+        # scope_into so neither scope's memoised set carries the
+        # scope id.
+        s.scope_stack = ['outer', 'inner']
+        s._expanded_by_scope = {}  # nothing memoised
+        s.expanded = set()
+        # Pop the inner scope. Now we're scoped to 'outer'.
+        popped = scope_out(s)
+        self.assertEqual(popped, 'inner')
+        self.assertEqual(s.scope_stack, ['outer'])
+        # 'outer' was auto-added to expanded so the scope row paints
+        # expanded and 'inner' appears as a child below.
+        self.assertIn('outer', s.expanded)
+
+    def test_scope_out_to_root_does_not_auto_expand(self):
+        # No scope after popping → nothing to auto-expand.
+        s = State(root_id='__ROOT__')
+        scope_into(s, 'A')
+        scope_out(s)
+        # At root: expanded is whatever root's memoised set was
+        # (empty in this case), no auto-add fires.
+        self.assertEqual(s.expanded, set())
+        self.assertEqual(s.scope_stack, [])
 
 
 class TestScopeMarksDirty(unittest.TestCase):
@@ -350,8 +415,10 @@ class TestPerScopeExpandedRoundTrip(unittest.TestCase):
             # Drill into A again.
             self.assertTrue(dispatch_key(b, ctx, 'alt-down'))
             b.drain_main_queue()
-            # A's expanded set is restored to what we set last time.
-            self.assertEqual(b._state.expanded, {'a1'})
+            # A's expanded set is restored to what we set last time
+            # ({'a1'}), plus the scope id 'A' itself (auto-added by
+            # scope_into so the scope row paints expanded).
+            self.assertEqual(b._state.expanded, {'A', 'a1'})
         finally:
             b.stop_workers()
 

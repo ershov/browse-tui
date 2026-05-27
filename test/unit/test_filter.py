@@ -254,5 +254,46 @@ class TestActiveFlag(unittest.TestCase):
         self.assertFalse(s._filter_active)
 
 
+class TestScopeRowExemption(unittest.TestCase):
+    """The current-scope row is exempt from filter hiding — it's the
+    "you are here" indicator and must remain visible regardless of
+    whether its content matches. See scope-root unification design."""
+
+    def test_scope_row_visible_even_when_it_does_not_match(self):
+        scope = Item(id='scope-x', title='SCOPE', has_children=True)
+        child = Item(id='c1', title='banana')
+        s = _state_with({None: [scope], 'scope-x': [child]})
+        s.scope_stack = ['scope-x']
+        # Filter for 'apple' — child doesn't match, scope's own text
+        # ('scope-x SCOPE') doesn't match either. Without the
+        # exemption the scope row would be hidden too.
+        _recompute_filter_hidden(s, ['apple'])
+        self.assertFalse(scope._filter_hidden)  # scope kept visible
+        self.assertTrue(child._filter_hidden)   # non-matching child hidden
+
+    def test_scope_row_visible_when_matching_too(self):
+        # Sanity: matching scope row stays visible (the exemption is
+        # additive, not destructive).
+        scope = Item(id='scope-apple', title='SCOPE', has_children=True)
+        child = Item(id='c1', title='banana')
+        s = _state_with({None: [scope], 'scope-apple': [child]})
+        s.scope_stack = ['scope-apple']
+        _recompute_filter_hidden(s, ['apple'])
+        self.assertFalse(scope._filter_hidden)
+
+    def test_non_scope_root_no_special_treatment(self):
+        # An unrelated item with the same content shape gets normally
+        # filtered when the scope is something else.
+        scope = Item(id='scope-x', title='SCOPE', has_children=True)
+        unrelated = Item(id='outer-y', title='YYY')
+        s = _state_with({None: [scope, unrelated]})
+        s.scope_stack = ['scope-x']
+        # Filter that no row matches; unrelated is hidden, scope is
+        # exempt.
+        _recompute_filter_hidden(s, ['zzz-no-match'])
+        self.assertFalse(scope._filter_hidden)
+        self.assertTrue(unrelated._filter_hidden)
+
+
 if __name__ == '__main__':
     unittest.main()

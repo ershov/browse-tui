@@ -251,11 +251,13 @@ class TestFormatItemSegmentsDefault(unittest.TestCase):
         self.assertEqual(len(_joined(d2)) - len(_joined(d0)), 4)
 
 
-# --- format_item_segments: pending / scope_root kinds -----------------------
+# --- format_item_segments: pending kind + is_current_scope --------------------
 
 
 class TestFormatItemSegmentsKinds(unittest.TestCase):
-    """Synthetic kinds short-circuit the default layout."""
+    """``pending`` short-circuits the default layout; the scope row is
+    rendered as a normal row with the ``is_current_scope`` label-override
+    flag (see scope-root unification design)."""
 
     def test_pending_kind_renders_loading_glyph(self):
         item = Item(id='__pending__', title='⧗ loading…')
@@ -267,28 +269,59 @@ class TestFormatItemSegmentsKinds(unittest.TestCase):
         self.assertNotIn('▶', joined)
         self.assertNotIn('▼', joined)
 
-    def test_scope_root_kind_is_bold_id_title(self):
-        item = Item(id='proj', title='My Project')
-        segs = format_item_segments(item, kind='scope_root')
+    def test_scope_row_renders_as_normal(self):
+        # The scope row is emitted as kind='normal' at depth 0. It gets
+        # the same chrome as any normal row (selection marker, expand
+        # glyph if has_children).
+        item = Item(id='proj', title='My Project', has_children=True)
+        segs = format_item_segments(
+            item, kind='normal', depth=0, base_depth=1,
+            expanded=True, is_current_scope=True,
+        )
         joined = _joined(segs)
-        # No star marker, no expand arrow for the scope row. The id
-        # is rendered (id != title) without the '#' sigil.
-        self.assertNotIn('* ', joined)
         self.assertIn('proj ', joined)
         self.assertIn('My Project', joined)
-        self.assertNotIn('#', joined)
-        # At least one segment must be bold (signalling scope-root style).
-        self.assertTrue(
-            any(seg[2] for seg in segs),
-            'scope_root row should have at least one bold segment',
-        )
+        # Selection marker (unselected → '  ') and expand glyph (▼) are
+        # rendered like any normal row.
+        self.assertIn('▼', joined)
 
-    def test_scope_root_auto_suppresses_id_when_equal_to_title(self):
-        item = Item(id='proj')  # title defaults to 'proj'
-        segs = format_item_segments(item, kind='scope_root')
-        joined = _joined(segs)
-        # Only the title is rendered; no leading id segment, no '#'.
-        self.assertEqual(joined, 'proj')
+    def test_scope_title_overrides_when_is_current_scope(self):
+        item = Item(id='sess-abc', title='abc')
+        item.scope_title = '/full/path/to/sess-abc.jsonl'
+        # Without is_current_scope, scope_title is ignored.
+        segs = format_item_segments(item, kind='normal')
+        self.assertIn('abc', _joined(segs))
+        self.assertNotIn('/full/path', _joined(segs))
+        # With is_current_scope, scope_title wins.
+        segs2 = format_item_segments(item, kind='normal', is_current_scope=True)
+        self.assertIn('/full/path/to/sess-abc.jsonl', _joined(segs2))
+
+    def test_scope_title_ignored_when_unset(self):
+        # No scope_title → title is used regardless of is_current_scope.
+        item = Item(id='proj', title='My Project')
+        segs = format_item_segments(item, kind='normal', is_current_scope=True)
+        self.assertIn('My Project', _joined(segs))
+
+    def test_scope_row_title_segment_is_bold(self):
+        # The scope row's title segment is rendered bold so it stands
+        # apart from the listing — the "you are here" indicator. The
+        # selection/expand-marker chrome stays non-bold.
+        item = Item(id='proj', title='My Project')
+        segs = format_item_segments(item, kind='normal', is_current_scope=True)
+        # Find the title segment (text equals item.title).
+        title_seg = next(s for s in segs if s[0] == 'My Project')
+        self.assertTrue(title_seg[2], 'title segment must be bold for scope row')
+        # And NOT bold for a non-current-scope row.
+        segs2 = format_item_segments(item, kind='normal', is_current_scope=False)
+        title_seg2 = next(s for s in segs2 if s[0] == 'My Project')
+        self.assertFalse(title_seg2[2])
+
+    def test_scope_row_id_segment_is_bold(self):
+        # The id segment also bolds for the scope row (when shown).
+        item = Item(id='proj', title='My Project')  # id != title -> id visible
+        segs = format_item_segments(item, kind='normal', is_current_scope=True)
+        id_seg = next(s for s in segs if 'proj' in s[0] and s[0] != 'My Project')
+        self.assertTrue(id_seg[2], 'id segment must be bold for scope row')
 
 
 # --- format_item override hook ---------------------------------------------

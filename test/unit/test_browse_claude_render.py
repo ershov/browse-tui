@@ -3462,13 +3462,19 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
                     f.write(_json.dumps(r) + '\n')
             self.r._TREE_CACHE.clear()
 
-            # Fake browser captures expand/cursor_to + simulates a
-            # scope_root cursor that hasn't moved.
+            # Fake browser captures expand/cursor_to + simulates the
+            # scope row at the cursor (still on it = user hasn't moved).
             calls = {'cursor_to': [], 'expand_chain': []}
 
-            class _ScopeRootEntry:
-                kind = 'scope_root'
-                item = None
+            class _ScopeRowItem:
+                def __init__(self, id_):
+                    self.id = id_
+
+            class _ScopeRowEntry:
+                kind = 'normal'
+
+                def __init__(self, id_):
+                    self.item = _ScopeRowItem(id_)
 
             class _State:
                 cursor = 0
@@ -3495,9 +3501,10 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
                 def cursor_to(self, _id):
                     calls['cursor_to'].append(_id)
 
-            # Override visible_items so the scope_root check passes.
+            # Override visible_items so the scope-row check passes
+            # (cursor still on the row whose id == target_jsonl).
             saved_vi = self.r.visible_items
-            self.r.visible_items = lambda state: [_ScopeRootEntry()]
+            self.r.visible_items = lambda state: [_ScopeRowEntry(sess)]
             try:
                 b = _FakeBrowser()
                 self.r._focus_latest_voice_when_ready(b, sess)
@@ -3567,19 +3574,20 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
                 def cursor_to(self, _id):
                     calls['cursor_to'].append(_id)
 
-            # visible_items reports cursor on a non-scope_root row.
+            # visible_items reports cursor on a row whose id is NOT
+            # the scope target — user has navigated away.
             saved_vi = self.r.visible_items
             self.r.visible_items = lambda state: [_NormalEntry()]
             try:
                 b = _FakeBrowser()
                 self.r._focus_latest_voice_when_ready(b, sess)
-                # Fire scope_root delivery — user has navigated.
+                # Fire delivery — user has navigated, jump cancels.
                 b._pendings[0].fire()
                 # cursor_to should NOT have been called.
                 self.assertEqual(
                     calls['cursor_to'], [],
                     'cursor_to should be suppressed when the user '
-                    'has navigated off scope_root before fire',
+                    'has navigated off the scope row before fire',
                 )
             finally:
                 self.r.visible_items = saved_vi

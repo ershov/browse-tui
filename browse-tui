@@ -996,6 +996,17 @@ class Item:
     # out of positional-construction signatures (tuple → Item
     # coercion); recipes set it by keyword or via attribute write.
     scope_title: Any = None
+    # Framework-owned provenance flag. ``True`` for Items fabricated by
+    # ``visible_items`` as a stub when a scope-root id has no real Item
+    # yet (recipe-pre-pushed ``initial_scope``, deep ``scope_stack``
+    # injected by a recipe, lazy-fetched alt-up into an uncached
+    # ancestor, post-refresh window before re-fetch). Cleared by
+    # ``_promote_synthetic`` when the parent's children fetch delivers
+    # a real Item with the matching id. Recipes do not set this; the
+    # default carries the right semantics for everything else.
+    synthetic: bool = field(
+        default=False, init=False, repr=False, compare=False,
+    )
 
     def __post_init__(self) -> None:
         if not self.title:
@@ -1425,10 +1436,10 @@ class VisibleEntry:
       - ``item``: the Item being shown (or a synthetic placeholder).
       - ``depth``: 0-based depth relative to the current scope root.
       - ``kind``: one of:
-          * ``'normal'`` — an ordinary tree row.
-          * ``'scope_root'`` — the scope item itself, shown at depth 0
-            when ``scope_stack`` is non-empty (mirrors plan-tui showing
-            the scope ticket as the first row).
+          * ``'normal'`` — an ordinary tree row. The scope row at
+            depth 0 (when scoped) is also ``'normal'``; recipes and
+            actions identify it via ``item.id == current_scope(state)``
+            rather than a row-role discriminator.
           * ``'pending'`` — synthetic ``loading…`` placeholder under an
             expanded parent whose children haven't loaded yet.
     """
@@ -1513,13 +1524,23 @@ def scope_into(state: State, item_id) -> None:
     """Push the current expanded set under its scope key, switch scope.
 
     The new scope's expanded set is restored from ``_expanded_by_scope``
-    (empty if first visit). Marks the visible-tree dirty.
+    (empty if first visit). The scope id itself is auto-added to the
+    new expanded set so the scope row paints expanded by default — the
+    scope row is now a normal row at depth 0, and without the auto-add
+    it would render collapsed (▶) until the user pressed Right. Marks
+    the visible-tree dirty.
     """
     # Memoise the expanded set under the scope we're leaving.
     state._expanded_by_scope[current_scope(state)] = state.expanded
     state.scope_stack.append(item_id)
     # Restore (or default to empty) the expanded set for the new scope.
-    state.expanded = state._expanded_by_scope.get(item_id, set())
+    # Copy on restore so the auto-add below doesn't leak into the
+    # memoised entry; scope_out writes state.expanded back to
+    # _expanded_by_scope when leaving, preserving any explicit
+    # collapses the user made while in scope.
+    state.expanded = set(state._expanded_by_scope.get(item_id, ()))
+    # Auto-expand the scope row itself (see docstring).
+    state.expanded.add(item_id)
     state._visible_dirty = True
 
 
@@ -1528,14 +1549,22 @@ def scope_out(state: State) -> Any:
 
     Returns the id we were scoped *to* before popping (so the caller can
     move the cursor onto it). Returns None if the stack is already empty.
+
+    Mirrors ``scope_into``'s auto-expand invariant: when we land in a
+    still-scoped state, the new current scope id is added to
+    ``state.expanded`` so the scope row paints expanded by default.
+    Without this, popping into a scope whose memoised expanded set
+    doesn't include itself (e.g. a recipe-pushed deep stack) would
+    paint the scope row collapsed and hide the very row the caller
+    intends to land the cursor on.
     """
     if not state.scope_stack:
         return None
-    # Memoise the scope we're leaving.
     leaving = state.scope_stack.pop()
     state._expanded_by_scope[leaving] = state.expanded
-    # Restore the previous scope's expanded set.
-    state.expanded = state._expanded_by_scope.get(current_scope(state), set())
+    state.expanded = set(state._expanded_by_scope.get(current_scope(state), ()))
+    if state.scope_stack:
+        state.expanded.add(state.scope_stack[-1])
     state._visible_dirty = True
     return leaving
 
@@ -1579,6 +1608,75 @@ def _index_add_children(state: State, parent_id, items) -> None:
     for child in items:
         state._items_by_id[child.id] = child
         state._parent_of_id[child.id] = parent_id
+
+
+_PROMOTION_DATA_FIELDS = (
+    'title', 'tag', 'tag_style', 'has_children', 'hidden', 'scope_title',
+)
+
+
+def _promote_synthetic(synthetic, real) -> None:
+    """Copy data from ``real`` onto ``synthetic`` in place; clear flag.
+
+    Used when a children-fetch delivery brings a real Item whose id
+    matches an existing synthetic stub in ``_items_by_id`` (typically
+    fabricated by ``visible_items`` for a scope-root id with no cached
+    Item). Identity-preserving: callers can keep their reference to
+    the synthetic and observe the promotion via attribute reads.
+
+    Merge policy:
+      - Item data fields (``title``, ``tag``, ``tag_style``,
+        ``has_children``, ``hidden``, ``scope_title``): take ``real``.
+      - Recipe-attached extras (``__dict__`` keys not in the dataclass
+        field set): copied from ``real``. Extras on ``synthetic`` that
+        aren't on ``real`` are not removed — synthetics rarely carry
+        extras, but conservative-merge preserves them if present.
+      - Framework cache slots (``preview``, ``preview_render``):
+        ``real``'s values win when non-None; otherwise the synthetic's
+        cached values are preserved. The common case is
+        ``real.preview is None`` (the preview cache is filled lazily
+        on first paint), so any preview already cached on the
+        synthetic survives the promotion.
+      - ``_filter_hidden``: ignored here; the framework recomputes it
+        in ``apply_children_results`` after promotion.
+      - ``synthetic`` flag: cleared.
+    """
+    for name in _PROMOTION_DATA_FIELDS:
+        setattr(synthetic, name, getattr(real, name))
+    # Recipe extras: anything on real.__dict__ not in the dataclass
+    # field set.
+    known = {f.name for f in _dc_fields(synthetic)}
+    for k, v in real.__dict__.items():
+        if k not in known:
+            setattr(synthetic, k, v)
+    # Cache slots: real wins when populated.
+    if real.preview is not None:
+        synthetic.preview = real.preview
+        synthetic.preview_render = real.preview_render
+    synthetic.synthetic = False
+
+
+def _promote_synthetics(state: State, items):
+    """Promote any synthetic stubs in ``_items_by_id`` matched by ``items``.
+
+    Returns a new list (same length as ``items``) where each entry is
+    either the original ``Item`` from ``items`` (no synthetic match)
+    or the promoted synthetic (after in-place mutation). Substituting
+    the promoted synthetic preserves identity in ``_items_by_id`` and
+    on the per-Item preview cache.
+
+    Called from ``apply_children_results`` between
+    ``_index_drop_children`` and ``_state._children[id_] = items``.
+    """
+    out = []
+    for incoming in items:
+        existing = state._items_by_id.get(incoming.id)
+        if existing is not None and getattr(existing, 'synthetic', False):
+            _promote_synthetic(existing, incoming)
+            out.append(existing)
+        else:
+            out.append(incoming)
+    return out
 
 
 def cache_invalidate_subtree(state: State, item_id) -> None:
@@ -2586,8 +2684,10 @@ def visible_items(state: State) -> list:
     Build:
       1. Determine scope via ``current_scope``.
       2. If ``scope_stack`` is non-empty, emit the scope item itself at
-         depth 0 (kind ``'scope_root'``); subsequent children start at
-         depth 1.
+         depth 0 as a normal row; subsequent children start at depth 1.
+         The scope row is always expanded (``scope_into`` auto-adds the
+         scope id to ``state.expanded``) so children render inline
+         beneath it.
       3. Iterative DFS over ``_children``, honouring ``expanded``:
          - Cached non-empty list: emit each child; recurse into expanded
            parents with ``has_children``.
@@ -2603,43 +2703,45 @@ def visible_items(state: State) -> list:
 
     out: list = []
 
-    scope_root_id = current_scope(state)
     if state.scope_stack:
-        # Try to recover the actual Item for the scope row by scanning the
-        # cache; fall back to a synthetic Item if not findable. Register
-        # the synthetic in ``_items_by_id`` so the per-Item preview cache
-        # (#422) has a place to land: ``_deliver_preview`` (#442) and the
-        # renderer both key on ``_items_by_id``, so an unregistered
-        # synthetic would silently swallow preview text.
+        # Treat the scope row as a normal expanded parent. _emit_children
+        # uniformly handles: emit the row at depth 0, check
+        # ``has_children`` + ``id in state.expanded``, recurse into the
+        # cached children list at depth 1 (or emit a pending placeholder
+        # at depth 1 when the children fetch is still in flight). No
+        # special-cased ``base_depth`` arithmetic and no separate
+        # expansion / pending logic for the scope row — the scope row
+        # IS just a parent that happens to sit at depth 0.
+        #
+        # Recover the actual Item via _find_item; fall back to a
+        # synthetic stub if not findable. The synthetic is registered
+        # in ``_items_by_id`` (so the per-Item preview cache has a
+        # place to land — see #422 / #442) and flagged ``synthetic=True``
+        # so ``_promote_synthetics`` can promote it in place when the
+        # parent's children fetch later arrives. ``has_children=True``
+        # on the stub keeps the expand glyph rendered — you can only
+        # scope INTO an item with children, and recipes that scope to a
+        # pre-known id (``initial_scope``) honour the same invariant.
+        scope_root_id = current_scope(state)
         scope_item = _find_item(state, scope_root_id)
         if scope_item is None:
             scope_item = state._items_by_id.get(scope_root_id)
         if scope_item is None:
-            scope_item = Item(id=scope_root_id, title=str(scope_root_id))
+            scope_item = Item(
+                id=scope_root_id,
+                title=str(scope_root_id),
+                has_children=True,
+            )
+            scope_item.synthetic = True
             state._items_by_id[scope_root_id] = scope_item
-        out.append(VisibleEntry(item=scope_item, depth=0, kind='scope_root'))
-        base_depth = 1
+        _emit_children(state, [scope_item], 0, out)
     else:
-        base_depth = 0
-
-    # DFS using an explicit stack of child rows still to expand into. We
-    # push children onto a worklist in reverse so popping yields them in
-    # original insertion order.
-    children = state._children.get(scope_root_id)
-    if children is None:
-        # Scope root not cached. If at root, this means we've never loaded
-        # anything — render nothing. (At a nested scope, a placeholder
-        # under the scope_root would be reasonable, but for now we mirror
-        # plan-tui's behaviour and render an empty content area; the
-        # worker will populate the cache.)
-        if state.scope_stack and scope_root_id in state.expanded:
-            out.append(VisibleEntry(
-                item=_make_pending_placeholder(),
-                depth=base_depth,
-                kind='pending',
-            ))
-    else:
-        _emit_children(state, children, base_depth, out)
+        # Unscoped: emit root's children at depth 0. ``_emit_children``
+        # handles None gracefully via its caller — at root we just
+        # render an empty content area when the cache is empty.
+        children = state._children.get(state.root_id)
+        if children is not None:
+            _emit_children(state, children, 0, out)
 
     state._visible_cache = out
     state._visible_dirty = False
@@ -2726,17 +2828,38 @@ def _find_item(state, item_id):
 # to ``visible_items`` keeps state-driven helpers in one module.
 
 
-def _search_text(item):
-    """Return the searchable haystack for an Item.
+def _search_text(item, *, show_ids='auto', is_current_scope=False):
+    """Return the searchable haystack for an Item, aligned with the display.
 
-    Includes the id and (when present) the bracketed tag so a query like
-    ``open`` matches ``#5 [open] foo`` even when ``open`` is the tag and
-    not a substring of the title. Mirrors plan-tui's ``_search_text``
-    (which embeds the status string the user sees on screen).
+    Includes the same segments the renderer would emit so search /
+    filter matches match what the user actually sees:
+
+      * id segment — only when it would be rendered (``show_ids`` resolves
+        to visible per ``_id_visible``: ``'always'`` always, ``'auto'``
+        when ``str(id) != title``, ``'never'`` never). Without this gate
+        a recipe like browse-claude (``show_ids='never'``, voice ids
+        carry the full file path) would match every row when the user
+        searches for a path fragment that's only visible on the scope
+        header — see scope-root unification design.
+      * title segment — replaced by ``item.scope_title`` for the
+        current-scope row, mirroring the renderer's label override.
+      * bracketed tag — included so ``open`` matches ``[open]`` even
+        when it isn't in the title.
     """
-    parts = [str(item.id)]
-    if item.title:
-        parts.append(item.title)
+    parts = []
+    id_visible = (
+        show_ids == 'always'
+        or (show_ids != 'never' and str(item.id) != item.title)
+    )
+    if id_visible:
+        parts.append(str(item.id))
+    label = item.title
+    if is_current_scope:
+        scope_title = getattr(item, 'scope_title', None)
+        if scope_title:
+            label = scope_title
+    if label:
+        parts.append(label)
     if item.tag:
         parts.append('[{}]'.format(item.tag))
     return ' '.join(parts)
@@ -2758,24 +2881,35 @@ def _search_matches(text, query):
     return all(f in low for f in fragments)
 
 
-def _search_find(state, query, start_idx, direction=1):
+def _search_find(state, query, start_idx, direction=1, *, show_ids='auto'):
     """Find the next/prev visible item matching ``query``.
 
     Walks the visible list starting from ``start_idx`` in ``direction``
     (1 forward, -1 backward), wrapping around. Skips non-``'normal'``
-    entries (placeholders / scope_root) so search never lands on a
-    synthetic row. Returns the visible-list index of the match, or
-    ``None`` if no match exists.
+    entries (``pending`` placeholders) so search never lands on a row
+    without a real id. The scope row at depth 0 (when scoped) is a
+    ``normal`` row and is searchable like any other. ``show_ids`` is
+    plumbed through to ``_search_text`` so matches align with the
+    rendered display (an id that isn't shown can't drive a match).
+    Returns the visible-list index of the match, or ``None`` if no
+    match exists.
     """
     vis = visible_items(state)
     if not vis or not query:
         return None
+    scope_id = state.scope_stack[-1] if state.scope_stack else None
     n = len(vis)
     for step in range(1, n + 1):
         idx = (start_idx + step * direction) % n
         entry = vis[idx]
-        if entry.kind == 'normal' and _search_matches(
-                _search_text(entry.item), query):
+        if entry.kind != 'normal':
+            continue
+        text = _search_text(
+            entry.item,
+            show_ids=show_ids,
+            is_current_scope=(entry.item.id == scope_id),
+        )
+        if _search_matches(text, query):
             return idx
     return None
 
@@ -2813,7 +2947,10 @@ def _search_jump_nearest(browser):
     match, mirroring plan-tui).
     """
     state = browser._state
-    idx = _search_find(state, browser._search_query, state.cursor - 1, 1)
+    idx = _search_find(
+        state, browser._search_query, state.cursor - 1, 1,
+        show_ids=browser.show_ids,
+    )
     if idx is not None:
         state.cursor = idx
         mark_cursor_changed(browser)
@@ -2834,7 +2971,7 @@ def _search_jump_nearest(browser):
 # and fragment-AND matcher are identical to ``/`` search.
 
 
-def _recompute_filter_hidden(state, filters) -> None:
+def _recompute_filter_hidden(state, filters, *, show_ids='auto') -> None:
     """Re-evaluate filter visibility across the tree.
 
     ``filters`` is an iterable of filter strings (typically
@@ -2842,16 +2979,26 @@ def _recompute_filter_hidden(state, filters) -> None:
     placeholder slot used by the filter-edit prompt before the user has
     typed anything.
 
+    ``show_ids`` is plumbed through to ``_search_text`` so the filter
+    matches against the same haystack the user would search by ``/`` —
+    a row whose id wouldn't render can't drive a filter match.
+
     No-op when no non-empty filter is present: existing
     ``_filter_hidden`` flags become stale-but-inert because the
     renderer guards on ``state._filter_active``. The next call with a
     non-empty filter overwrites every reachable item's flag.
+
+    The current-scope row is exempt — it's always shown, regardless of
+    whether it matches the filter, because hiding the row you're
+    scoped *into* makes no sense (you'd lose the context of where you
+    are). See scope-root unification design.
     """
     active = [q for q in filters if q]
     state._filter_active = bool(active)
     if not active:
         return
 
+    scope_id = state.scope_stack[-1] if state.scope_stack else None
     visited: set = set()
 
     def visit(item):
@@ -2868,8 +3015,14 @@ def _recompute_filter_hidden(state, filters) -> None:
         # children stream in and the next recompute corrects the flag.
         if item.has_children and item.id not in state._children:
             any_desc_passes = True
-        text = _search_text(item)
+        is_scope = (item.id == scope_id)
+        text = _search_text(
+            item, show_ids=show_ids, is_current_scope=is_scope,
+        )
         self_passes = all(_search_matches(text, q) for q in active)
+        # Scope row exemption: always visible.
+        if is_scope:
+            self_passes = True
         item._filter_hidden = not (self_passes or any_desc_passes)
         return self_passes or any_desc_passes
 
@@ -2932,6 +3085,13 @@ def resolve_insert(pos, depth, vis, *, scope_root_id=None):
     ``relation`` is one of ``'before'``, ``'after'``, ``'first'``;
     ``dest_id`` is the item id the relation references.
 
+    ``scope_root_id`` is the id of the current scope (``None`` when not
+    scoped). When non-None, depth-0 insertions are rejected — they
+    would land outside the scope (as a sibling of the scope row, which
+    has no visible parent). The scope row at depth 0 is still a valid
+    *parent* for depth>0 insertions; the ordinary "above is parent for
+    deeper depth" branch handles that case naturally.
+
     plan-tui has an explicit ``parent`` field on every ticket and uses
     an id_map of all_tickets to walk up ancestors. browse-tui's lazy
     model doesn't carry ``parent`` on ``VisibleEntry``, so we walk the
@@ -2942,16 +3102,12 @@ def resolve_insert(pos, depth, vis, *, scope_root_id=None):
     if not vis or pos <= 0:
         return (None, None)
 
-    above = vis[pos - 1]
-
-    # Skip the synthetic scope_root row — it isn't a valid insertion
-    # reference. Mirror plan-tui's "id == 0" branch: if the row directly
-    # above the gap is the scope root, fall through to a "before vis[pos]"
-    # placement (or give up if there's no row below either).
-    if above.kind == 'scope_root':
-        if pos < len(vis):
-            return ('before', vis[pos].item.id)
+    # When scoped, depth 0 means "outside the scope" — reject. (See
+    # scope-root unification design.)
+    if scope_root_id is not None and depth == 0:
         return (None, None)
+
+    above = vis[pos - 1]
 
     if depth > above.depth:
         # Inserting as child of above.
@@ -2962,11 +3118,13 @@ def resolve_insert(pos, depth, vis, *, scope_root_id=None):
 
     # depth < above.depth — outdented. Walk back through ``vis`` until
     # we hit a row at the target depth; that's the ancestor we want to
-    # become a sibling of (relation 'after').
+    # become a sibling of (relation 'after'). The depth==0 guard above
+    # already short-circuited the scoped case, so we never land on the
+    # scope row here.
     i = pos - 1
     while i >= 0 and vis[i].depth > depth:
         i -= 1
-    if i >= 0 and vis[i].depth == depth and vis[i].kind != 'scope_root':
+    if i >= 0 and vis[i].depth == depth:
         return ('after', vis[i].item.id)
     return (None, None)
 
@@ -3750,10 +3908,11 @@ class Browser:
         # through ``_handle_insert_key`` instead of the regular dispatch.
         #
         # ``_insert_pos`` is a *gap* position in the visible list: 1
-        # means "insert before the first row after the scope_root",
-        # ``len(vis)`` means "insert at the very end". ``_insert_depth``
-        # is the indentation level for the placement marker (controlled
-        # by the user via right/left).
+        # means "insert before the first row after the scope row" (or
+        # the first top-level row when unscoped), ``len(vis)`` means
+        # "insert at the very end". ``_insert_depth`` is the
+        # indentation level for the placement marker (controlled by
+        # the user via right/left).
         self._insert_mode = False
         self._insert_pos = 0
         self._insert_depth = 0
@@ -4067,7 +4226,9 @@ class Browser:
         pre_vis = visible_items(self._state)
         pre_vis_ids = [entry.item.id for entry in pre_vis]
         pre_cursor = self._state.cursor
-        _recompute_filter_hidden(self._state, self._filters)
+        _recompute_filter_hidden(
+            self._state, self._filters, show_ids=self.show_ids,
+        )
         mark_visible_dirty(self._state)
         cur_anchor = self._cursor_anchor
         pinned = cur_anchor and isinstance(
@@ -4271,7 +4432,9 @@ class Browser:
             # post-batch ``visible_items`` reflects filter narrowing
             # in time for hide-displacement to walk it.
             if self._filters:
-                _recompute_filter_hidden(self._state, self._filters)
+                _recompute_filter_hidden(
+            self._state, self._filters, show_ids=self.show_ids,
+        )
 
             # Positional pin owns the cursor position — skip
             # hide-displacement entirely (the pin re-clamps to the new
@@ -5103,6 +5266,12 @@ class Browser:
             # set under ``id_`` doesn't leave stale ``_items_by_id`` /
             # ``_parent_of_id`` rows pointing at the previous list.
             _index_drop_children(self._state, id_)
+            # Promote any synthetic stubs whose ids match the freshly-
+            # delivered children before installing the list. The stub's
+            # ``_items_by_id`` entry is preserved (identity-stable);
+            # ``_index_add_children`` below then writes the same
+            # identity back under the matched id.
+            items = _promote_synthetics(self._state, items)
             self._state._children[id_] = items
             _index_add_children(self._state, id_, items)
             self._state._children_pending.discard(id_)
@@ -5120,7 +5289,9 @@ class Browser:
             # set, otherwise an active filter wouldn't apply to them.
             # No-op when ``_filters`` is empty.
             if self._filters:
-                _recompute_filter_hidden(self._state, self._filters)
+                _recompute_filter_hidden(
+            self._state, self._filters, show_ids=self.show_ids,
+        )
             # Re-snap the cursor onto its anchored id (or closest
             # fallback) before the index clamp runs, so the clamp only
             # fires when the entire anchor chain is missing from the
@@ -6303,9 +6474,9 @@ class Browser:
             # just its index). Skip when the recipe has already set an
             # explicit anchor via ``cursor_to`` before ``run()`` — the
             # recipe is chasing a still-loading row and a snapshot of
-            # the default cursor position (usually row 0 = scope_root)
-            # would clobber it, leaving the cursor stranded once the
-            # row actually arrives.
+            # the default cursor position (usually row 0 = the scope
+            # row at depth 0) would clobber it, leaving the cursor
+            # stranded once the row actually arrives.
             if not self._cursor_anchor:
                 self._reanchor_cursor()
             render_full(self)
@@ -6448,12 +6619,12 @@ class Browser:
 
         No-op when previews are disabled or when the cursor is on a
         ``pending`` placeholder (no real id to ask about). The scope
-        root row IS previewable — recipes commonly attach rich content
-        to the scope id (browse-claude session card, browse-plan ticket
-        body, …) and the user's first-glance row when launching with
-        an initial scope is the scope_root. Called by the main loop at
-        the top of every iteration (post-#124) so cursor moves and
-        worker deliveries both trigger preview fetches.
+        row at depth 0 IS previewable — recipes commonly attach rich
+        content to the scope id (browse-claude session card,
+        browse-plan ticket body, …) and the user's first-glance row
+        when launching with an initial scope is the scope row. Called
+        by the main loop at the top of every iteration (post-#124) so
+        cursor moves and worker deliveries both trigger preview fetches.
 
         Three behaviors (#442):
 
@@ -6487,7 +6658,7 @@ class Browser:
         new_id = None
         if 0 <= state.cursor < len(vis):
             entry = vis[state.cursor]
-            if entry.kind in ('normal', 'scope_root'):
+            if entry.kind == 'normal':
                 new_id = entry.item.id
 
         if new_id == self._preview_cursor_id:
@@ -6654,14 +6825,15 @@ class Browser:
         is a fallback the cursor falls onto if its predecessor is missing
         from the visible list.
 
-        Snapshots all VisibleEntry kinds, not just ``normal``: ``scope_root``
-        entries carry the real scoped-item id (anchoring there is fine —
-        if the user scopes out, the same id reappears as a normal row),
-        and ``pending`` placeholders carry a deterministic
+        Snapshots all VisibleEntry kinds, not just non-``pending``: the
+        scope row at depth 0 (when scoped) is now itself a normal row
+        carrying the real scoped-item id (anchoring there is fine — if
+        the user scopes out, the same id reappears at depth 1 under
+        the new top), and ``pending`` placeholders carry a deterministic
         ``__pending_<parent>`` id that's stable while the parent is
         loading. Treating synthetic rows the same as normal rows keeps
         cursor navigation continuous when the user is parked on the
-        scope-root row or stepping through a loading subtree.
+        scope row or stepping through a loading subtree.
 
         Returns ``[]`` only when there's no row to anchor at all (insert
         mode, cursor out of range). Callers treat an empty list as
@@ -6829,10 +7001,10 @@ class Browser:
             return True
         id_to_idx = {}
         for i, entry in enumerate(vis):
-            # Index every kind (normal / scope_root / pending). Each
-            # row has a stable item id; the renderer skips preview-
-            # fetches for non-normal kinds itself, so landing the
-            # cursor on a scope_root or pending row is harmless.
+            # Index every kind (normal / pending). Each row has a
+            # stable item id; the renderer skips preview-fetches for
+            # ``pending`` kinds itself, so landing the cursor on a
+            # pending row is harmless.
             id_to_idx.setdefault(entry.item.id, i)
         for tier_idx, target_id in enumerate(self._cursor_anchor):
             if target_id in id_to_idx:
@@ -7196,7 +7368,6 @@ _TAG_STYLE = {
 _ID_COLOR = 3   # yellow for the '#id' segment
 _MARKER_COLOR = 4   # blue for the ▼/▶ expand glyph
 _PENDING_FG = 242   # dim for the ⧗ loading… placeholder
-_SCOPE_ROOT_FG = None   # default fg, bolded by the segment's bold=True
 
 # Insert-mode marker — sentinel id used by the synthetic ``VisibleEntry``
 # injected into the rendered list when ``browser._insert_mode`` is True.
@@ -7277,7 +7448,8 @@ def _id_visible(item, show_ids):
 
 def format_item_segments(item, *, depth=0, base_depth=0, expanded=False,
                          selected=False, kind='normal', search_query='',
-                         format_item=None, ctx=None, show_ids='auto'):
+                         format_item=None, ctx=None, show_ids='auto',
+                         is_current_scope=False):
     """Compute the (text, fg, bold) segment list for one row.
 
     Returns a list of ``(text, fg, bold)`` triples. When the user-supplied
@@ -7295,17 +7467,16 @@ def format_item_segments(item, *, depth=0, base_depth=0, expanded=False,
                           ``'auto'`` suppresses it when ``str(id) == title``)
       - tag segment:      ``'[{tag}] '`` styled per ``_TAG_STYLE`` (omitted
                           when ``item.tag`` is empty)
-      - title segment:    ``item.title``
+      - title segment:    ``item.title``, OR ``item.scope_title`` when
+                          ``is_current_scope`` is True and the item has
+                          ``scope_title`` set (the "no parent context
+                          above me" label override; see scope-root
+                          unification design)
 
     Default layout for ``kind='pending'``:
       - indentation only, then a single dim ``'⧗ loading…'`` segment.
         No selection marker, no expand marker — placeholder rows are
         synthetic and don't participate in selection/expansion.
-
-    Default layout for ``kind='scope_root'``:
-      - bolded ``'{id} {title}'`` (id segment gated on ``show_ids``,
-        same auto-suppression rule as the normal kind). No selection
-        marker, no expand marker.
 
     ``search_query`` is accepted for forward-compatibility with phase-2
     ticket #22; phase 1 ignores it (highlighting is applied later by
@@ -7330,18 +7501,6 @@ def format_item_segments(item, *, depth=0, base_depth=0, expanded=False,
             (item.title, _PENDING_FG, False),
         ]
 
-    if kind == 'scope_root':
-        segs = []
-        if _id_visible(item, show_ids):
-            segs.append(('{} '.format(item.id), _ID_COLOR, True))
-        # ``scope_title`` overrides ``title`` for the scope-header row
-        # only — lets a recipe show e.g. a session's full filesystem
-        # path when that session is the current scope, while keeping
-        # the listing's per-row title short (the session id).
-        scope_text = getattr(item, 'scope_title', None) or item.title
-        segs.append((scope_text, _SCOPE_ROOT_FG, True))
-        return segs
-
     # ----- normal kind ------------------------------------------------
     sel_marker = '* ' if selected else '  '
 
@@ -7350,19 +7509,26 @@ def format_item_segments(item, *, depth=0, base_depth=0, expanded=False,
     else:
         expand_marker = '  '
 
+    # The scope row gets its id + title segments bolded so it stands
+    # apart from the listing below — the "you are here" indicator. The
+    # selection / expand markers stay non-bold (they're chrome, not
+    # content). The tag segment keeps its tag_style-driven bold so
+    # explicit tag styles still control their own weight.
     segments = [
         (sel_marker, None, False),
         (indent, None, False),
         (expand_marker, _MARKER_COLOR, False),
     ]
     if _id_visible(item, show_ids):
-        segments.append(('{} '.format(item.id), _ID_COLOR, False))
+        segments.append(('{} '.format(item.id), _ID_COLOR, is_current_scope))
 
     if item.tag:
         sfg, sbold = _TAG_STYLE.get(item.tag_style, _TAG_STYLE[''])
         segments.append(('[{}] '.format(item.tag), sfg, sbold))
 
-    segments.append((item.title, None, False))
+    scope_title = getattr(item, 'scope_title', None)
+    title_text = scope_title if (is_current_scope and scope_title) else item.title
+    segments.append((title_text, None, is_current_scope))
     return segments
 
 
@@ -8385,13 +8551,11 @@ def render_list(browser, rect, *, rightmost: bool = False):
     scroll = max(0, min(browser._list_scroll, max_scroll))
     browser._list_scroll = scroll
 
-    # base_depth: the scope-root row sits at depth 0 by construction
-    # (visible_items sets ``kind='scope_root', depth=0`` when scoped),
-    # so children below it want their indent measured from depth 1.
-    if state.scope_stack:
-        base_depth = 1
-    else:
-        base_depth = 0
+    # ``current_scope_id`` is the one piece of scope state the segment
+    # builder needs — it picks ``scope_title`` over ``title`` for the
+    # row that IS the current scope (see scope-root unification design).
+    # Every other aspect of rendering is uniform across all rows.
+    current_scope_id = state.scope_stack[-1] if state.scope_stack else None
 
     for row_idx in range(height):
         vis_idx = scroll + row_idx
@@ -8413,10 +8577,7 @@ def render_list(browser, rect, *, rightmost: bool = False):
         # bold) and skip the regular segment / cursor / search logic
         # entirely. Mirrors plan-tui's _id == -1 branch.
         if entry.kind == 'insert_marker':
-            rel_depth = entry.depth - base_depth
-            if rel_depth < 0:
-                rel_depth = 0
-            line = '  ' + '  ' * rel_depth + '  # ' + item.title
+            line = '  ' + '  ' * entry.depth + '  # ' + item.title
             line, line_cells = _truncate_by_cells(line, width)
             set_style(fg=11, bg=4, bold=True)
             write(line)
@@ -8429,7 +8590,6 @@ def render_list(browser, rect, *, rightmost: bool = False):
         segments = format_item_segments(
             item,
             depth=entry.depth,
-            base_depth=base_depth,
             expanded=item.id in state.expanded,
             selected=is_selected,
             kind=entry.kind,
@@ -8437,6 +8597,7 @@ def render_list(browser, rect, *, rightmost: bool = False):
             format_item=browser.format_item,
             ctx=None,
             show_ids=browser.show_ids,
+            is_current_scope=(item.id == current_scope_id),
         )
 
         if is_cursor_line:
@@ -8458,7 +8619,12 @@ def render_list(browser, rect, *, rightmost: bool = False):
             if (browser._search_query
                     and entry.kind == 'normal'
                     and _search_matches(
-                        _search_text(item), browser._search_query)):
+                        _search_text(
+                            item,
+                            show_ids=browser.show_ids,
+                            is_current_scope=(item.id == current_scope_id),
+                        ),
+                        browser._search_query)):
                 line = ''.join(s[0] for s in segments)
                 line, _ = _truncate_by_cells(line, width)
                 _write_highlighted(
@@ -10029,7 +10195,10 @@ class Context:
     def visible_items(self) -> list:
         """Visible rows in display order, as ``(Item, kind)`` tuples.
 
-        ``kind`` is one of ``'normal'``, ``'scope_root'``, ``'pending'``.
+        ``kind`` is one of ``'normal'``, ``'pending'``. The scope row
+        at depth 0 (when scoped) is emitted as ``'normal'`` — recipes
+        identify it via ``item.id == ctx.scope`` rather than a row-role
+        discriminator.
         Reflects the current state of expanded / scoped subtrees, so a
         row expanded by an earlier ``Right`` press shows up with its
         children inline. ``ctx.cursor_index`` indexes this same list.
@@ -10663,18 +10832,19 @@ class Context:
         vis = visible_items(state)
         if not vis:
             return
-        # Default placement: gap right after the cursor item. visible_items
-        # builds the list with the scope_root row at index 0 when scoped,
-        # so cursor + 1 always lands at a real-row gap.
+        # Default placement: gap right after the cursor item. When
+        # scoped, ``visible_items`` emits the scope row at index 0 as a
+        # normal row at depth 0; ``cursor + 1`` lands at a real-row gap
+        # below it (or below the cursor when the cursor is on a child).
         pos = state.cursor + 1
-        # Clamp to [min_pos, len(vis)]; min_pos is 1 (skip the
-        # scope_root gap at index 0 when present).
+        # Clamp to [1, len(vis)]. The pos=0 gap (above the scope row
+        # when scoped, or above the first root row otherwise) is
+        # rejected by ``resolve_insert`` so we never park there.
         max_pos = len(vis)
-        min_pos = 1 if vis and vis[0].kind == 'scope_root' else 1
         if pos > max_pos:
             pos = max_pos
-        if pos < min_pos:
-            pos = min_pos
+        if pos < 1:
+            pos = 1
         self._browser._insert_mode = True
         self._browser._insert_pos = pos
         self._browser._insert_depth = auto_insert_depth(pos, vis)
@@ -11309,7 +11479,7 @@ def _view_in_pager(ctx):
     Works whether the preview pane is visible or not: cached entries are
     used as-is; on cache miss the recipe's ``get_preview`` is invoked
     synchronously and the result cached. Silent no-op when the cursor
-    is on a placeholder / scope_root row (no item to preview).
+    is on a ``pending`` placeholder row (no item to preview).
     """
     _run_external_on_preview(ctx, env_var='PAGER', default='less -R')
 
@@ -11351,9 +11521,8 @@ def _run_external_on_preview(ctx, *, env_var, default):
          and skip the external command.
 
     Resolves the active row from ``ctx.visible_items[cursor_index]``
-    so scope_root rows (which the preview pane already shows content
-    for) are operable too. Only ``pending`` placeholder rows skip out
-    — they have no real id.
+    so the scope row at depth 0 (when scoped) is operable too. Only
+    ``pending`` placeholder rows skip out — they have no real id.
     """
     state = ctx._browser._state
     vis = visible_items(state)
@@ -11417,13 +11586,13 @@ def _scope_down(ctx):
     if not getattr(item, 'has_children', False):
         return  # don't scope into leaves; phase-2 simplification
     scope_into(state, item.id)
-    # Land the cursor on the scope_root row at the top of the new view.
+    # Land the cursor on the scope row at the top of the new view.
     state.cursor = 0
     if item.id not in state._children:
         # Trigger a fetch — ``expand`` is the cheapest entry point;
         # adds id to expanded and enqueues the children fetch. The
-        # scope_root row is rendered regardless; the placeholder under
-        # it shows ``loading…`` until results land.
+        # scope row is rendered regardless; the placeholder under it
+        # shows ``loading…`` until results land.
         ctx.expand(item.id)
     ctx._browser._needs_redraw.add('all')
     ctx._browser._fire_scope_change()
@@ -11525,11 +11694,12 @@ def _select_all_visible(ctx):
     """Ctrl-A — set selection to exactly the currently-visible normal rows.
 
     WYSIWYG: clear the existing set, then add every ``kind='normal'``
-    visible row. Placeholder rows and the synthetic scope-root row
-    are skipped. The action handler is already on the main thread,
-    so it mutates state.selected directly rather than going through
-    the (thread-safe-but-async) :meth:`Browser.select_all_visible`.
-    Both reach the same end state.
+    visible row. Placeholder rows are skipped (pending ``loading…``
+    rows have no real id). The scope row at depth 0 (when scoped) is
+    a normal row and is included. The action handler is already on
+    the main thread, so it mutates state.selected directly rather than
+    going through the (thread-safe-but-async)
+    :meth:`Browser.select_all_visible`. Both reach the same end state.
     """
     state = ctx._browser._state
     state.selected.clear()
@@ -11572,7 +11742,10 @@ def _search_next(ctx):
     """
     browser = ctx._browser
     state = browser._state
-    idx = _search_find(state, browser._search_query, state.cursor, 1)
+    idx = _search_find(
+        state, browser._search_query, state.cursor, 1,
+        show_ids=browser.show_ids,
+    )
     if idx is not None:
         state.cursor = idx
         mark_cursor_changed(browser)
@@ -11611,7 +11784,10 @@ def _search_prev(ctx):
     """
     browser = ctx._browser
     state = browser._state
-    idx = _search_find(state, browser._search_query, state.cursor, -1)
+    idx = _search_find(
+        state, browser._search_query, state.cursor, -1,
+        show_ids=browser.show_ids,
+    )
     if idx is not None:
         state.cursor = idx
         mark_cursor_changed(browser)
@@ -11637,8 +11813,8 @@ def _expand_recursive(ctx):
     we kick a fetch via ``ctx.expand`` so they resolve on the next
     drain.
 
-    No-op when the cursor row isn't a normal item (placeholder /
-    scope_root / empty list).
+    No-op when the cursor row isn't a normal item (``pending``
+    placeholder / empty list).
     """
     state = ctx._browser._state
     if ctx.cursor is None:
@@ -12081,10 +12257,11 @@ def default_actions() -> list:
         Action('ctrl-r',    'Reload',         _reload,      'none', 'OTHER'),
         Action('ctrl-l',    'Redraw',         _redraw,      'none', 'OTHER'),
         # View / edit the cursor row's preview text. Gate 'none' so
-        # the handler also fires on the scope_root row (whose preview
-        # is shown in the pane but ``ctx.cursor`` filters out — see
-        # ``Context.cursor``). The handler resolves the visible entry
-        # itself and skips ``pending`` placeholders. Recipes override
+        # the handler also fires on the scope row at depth 0 (whose
+        # preview is shown in the pane but ``ctx.cursor`` may filter
+        # out — see ``Context.cursor``). The handler resolves the
+        # visible entry itself and skips ``pending`` placeholders.
+        # Recipes override
         # 'e' to make edits actually persist (the default discards).
         Action('v',         'View preview in $PAGER',  _view_in_pager,   'none', 'OTHER'),
         Action('e',         'Edit preview in $EDITOR (changes discarded)', _edit_in_editor, 'none', 'OTHER'),
@@ -12337,8 +12514,10 @@ def _handle_insert_key(browser, ctx: 'Context', key: str) -> bool:
     vis = visible_items(state)
     max_pos = len(vis)
     # min_pos = 1 always — gap 0 sits above the first row, which is the
-    # scope_root row when scoped (and a regular row otherwise). Either
-    # way the marker starts at gap 1 and never goes lower.
+    # scope row when scoped (and a regular row otherwise). Either way
+    # the marker starts at gap 1 and never goes lower. In scoped view
+    # ``resolve_insert`` further rejects depth-0 placements, since
+    # those would land outside the scope.
     min_pos = 1
 
     def _set_pos(new_pos):
@@ -12427,9 +12606,9 @@ def _handle_insert_key(browser, ctx: 'Context', key: str) -> bool:
                 browser._needs_redraw.add('all')
                 return True
         # Second case: outdent and reposition before the parent. We use
-        # base = base depth of the current scope. visible_items emits
-        # the scope_root at depth 0 when scoped, so children start at
-        # depth 1 → base = 1; otherwise base = 0.
+        # base = base depth of the current scope. ``visible_items``
+        # emits the scope row at depth 0 (normal kind) when scoped, so
+        # children start at depth 1 → base = 1; otherwise base = 0.
         base = 1 if state.scope_stack else 0
         if depth > base:
             new_depth = depth - 1
@@ -12468,7 +12647,7 @@ def _handle_insert_key(browser, ctx: 'Context', key: str) -> bool:
     if key == 'enter':
         relation, dest_id = resolve_insert(
             browser._insert_pos, browser._insert_depth, vis,
-            scope_root_id=current_scope(state),
+            scope_root_id=(state.scope_stack[-1] if state.scope_stack else None),
         )
         cb = browser._insert_callback
         browser._insert_mode = False

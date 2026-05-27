@@ -57,6 +57,23 @@ class TestSelectAllVisible(unittest.TestCase):
         self.assertNotIn('a1', b._state.selected)
         self.assertEqual(b._state.selected, {'a', 'b', 'c'})
 
+    def test_includes_scope_row_when_scoped(self):
+        # After scope-root unification the scope row at depth 0 is a
+        # normal row and participates in Ctrl-A. (Previously it was a
+        # separate 'scope_root' kind and was excluded.)
+        b = Browser(BrowserConfig(_headless=True))
+        b.update_data([
+            ('upsert', 'a', None, {'has_children': True}),
+            ('upsert', 'a1', 'a', {}),
+        ])
+        b.drain_main_queue()
+        b.scope_into('a')
+        b.drain_main_queue()
+        b.select_all_visible()
+        b.drain_main_queue()
+        # Both the scope row ('a') and its child ('a1') are selected.
+        self.assertEqual(b._state.selected, {'a', 'a1'})
+
 
 class TestClearSelection(unittest.TestCase):
 

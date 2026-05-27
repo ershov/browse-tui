@@ -4708,20 +4708,22 @@ def _focus_latest_voice_when_ready(b, target_jsonl):
 
     The cancel-on-user-moved check uses the live cursor instead of an
     ``on_cursor_change`` subscription: the framework places the cursor
-    on scope_root atomically before any user input could land, so
-    "cursor still on scope_root at fire time" is a reliable proxy for
-    "user hasn't touched it yet."
+    on the scope row atomically before any user input could land, so
+    "cursor still on the scope row at fire time" is a reliable proxy
+    for "user hasn't touched it yet."
     """
     def _fire():
         last_id = _last_voice_id(target_jsonl)
         if not last_id:
             return
-        # Cancel if the user has navigated since startup. The scope_root
-        # row has ``entry.kind == 'scope_root'`` in the visible list.
+        # Cancel if the user has navigated since startup. Post scope-
+        # root unification the scope row is a normal row at depth 0
+        # whose item id is ``target_jsonl``; identify it that way
+        # rather than by the (deprecated) ``kind='scope_root'``.
         state = b._state
         vis = visible_items(state)
         cur = state.cursor
-        if not (0 <= cur < len(vis) and vis[cur].kind == 'scope_root'):
+        if not (0 <= cur < len(vis) and vis[cur].item.id == target_jsonl):
             return
         # Tree mode: walk the ancestor chain so each #prompt:N umbrella
         # is expanded before the final cursor_to lands. Flat mode: the

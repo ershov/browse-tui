@@ -207,30 +207,64 @@ class TestResolveInsertOutdent(unittest.TestCase):
 
 
 class TestResolveInsertScopeRoot(unittest.TestCase):
+    """After scope-root unification, the scope row is a normal row at
+    depth 0. The reject-on-depth-0 rule moves to a ``scope_root_id``
+    keyword check: callers pass it when scoped, and depth==0 insertions
+    are short-circuited to ``(None, None)``. The scope row itself is
+    still a valid parent for depth>0 insertions."""
 
-    def test_above_scope_root_with_below_returns_before(self):
+    def test_first_child_of_scope_row(self):
         vis = [
-            _entry('S', 0, kind='scope_root'),
+            _entry('S', 0, has_children=True),  # scope row, normal kind
             _entry('a', 1),
         ]
-        # gap 1, depth 1 → above is scope_root; below is 'a' → ('before', 'a').
-        self.assertEqual(resolve_insert(1, 1, vis), ('before', 'a'))
+        # gap 1, depth 1 → above is scope row at depth 0; depth>above.depth
+        # → ('first', 'S'). This is "insert as first child of the scope row."
+        self.assertEqual(
+            resolve_insert(1, 1, vis, scope_root_id='S'),
+            ('first', 'S'),
+        )
 
-    def test_above_scope_root_with_no_below_returns_none(self):
-        vis = [_entry('S', 0, kind='scope_root')]
-        # gap 1 (end), no below row → (None, None).
-        self.assertEqual(resolve_insert(1, 0, vis), (None, None))
+    def test_depth_zero_rejected_when_scoped(self):
+        vis = [_entry('S', 0, has_children=True)]
+        # gap 1, depth 0 in scoped view → reject (would land outside scope).
+        self.assertEqual(
+            resolve_insert(1, 0, vis, scope_root_id='S'),
+            (None, None),
+        )
 
-    def test_outdent_walking_past_scope_root_returns_none(self):
-        # Don't allow outdent to land on the scope_root as an ancestor.
+    def test_outdent_to_depth_zero_rejected_when_scoped(self):
+        # In scoped view, depth-0 is short-circuited regardless of the
+        # walk-back path.
         vis = [
-            _entry('S', 0, kind='scope_root'),
+            _entry('S', 0, has_children=True),
             _entry('a', 1, has_children=True),
             _entry('b', 2),
         ]
-        # gap 3 (end), depth 0 → walk back: vis[2] d=2 skip; vis[1] d=1
-        # skip; vis[0] d=0 but kind='scope_root' → reject → (None, None).
-        self.assertEqual(resolve_insert(3, 0, vis), (None, None))
+        # gap 3 (end), depth 0 in scoped view → reject.
+        self.assertEqual(
+            resolve_insert(3, 0, vis, scope_root_id='S'),
+            (None, None),
+        )
+
+    def test_outdent_within_scope_works(self):
+        # Outdenting to depth 1 (still inside the scope) is fine.
+        vis = [
+            _entry('S', 0, has_children=True),
+            _entry('a', 1, has_children=True),
+            _entry('b', 2),
+        ]
+        # gap 3 (end), depth 1 → walk back: vis[2] d=2 skip; vis[1] d=1
+        # ✓ → ('after', 'a').
+        self.assertEqual(
+            resolve_insert(3, 1, vis, scope_root_id='S'),
+            ('after', 'a'),
+        )
+
+    def test_depth_zero_allowed_when_not_scoped(self):
+        # No scope_root_id → depth-0 insertions work normally.
+        vis = [_entry('p', 0)]
+        self.assertEqual(resolve_insert(1, 0, vis), ('after', 'p'))
 
 
 class TestResolveInsertDeepTree(unittest.TestCase):

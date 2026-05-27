@@ -61,7 +61,6 @@ _TAG_STYLE = {
 _ID_COLOR = 3   # yellow for the '#id' segment
 _MARKER_COLOR = 4   # blue for the ▼/▶ expand glyph
 _PENDING_FG = 242   # dim for the ⧗ loading… placeholder
-_SCOPE_ROOT_FG = None   # default fg, bolded by the segment's bold=True
 
 # Insert-mode marker — sentinel id used by the synthetic ``VisibleEntry``
 # injected into the rendered list when ``browser._insert_mode`` is True.
@@ -142,7 +141,8 @@ def _id_visible(item, show_ids):
 
 def format_item_segments(item, *, depth=0, base_depth=0, expanded=False,
                          selected=False, kind='normal', search_query='',
-                         format_item=None, ctx=None, show_ids='auto'):
+                         format_item=None, ctx=None, show_ids='auto',
+                         is_current_scope=False):
     """Compute the (text, fg, bold) segment list for one row.
 
     Returns a list of ``(text, fg, bold)`` triples. When the user-supplied
@@ -160,17 +160,16 @@ def format_item_segments(item, *, depth=0, base_depth=0, expanded=False,
                           ``'auto'`` suppresses it when ``str(id) == title``)
       - tag segment:      ``'[{tag}] '`` styled per ``_TAG_STYLE`` (omitted
                           when ``item.tag`` is empty)
-      - title segment:    ``item.title``
+      - title segment:    ``item.title``, OR ``item.scope_title`` when
+                          ``is_current_scope`` is True and the item has
+                          ``scope_title`` set (the "no parent context
+                          above me" label override; see scope-root
+                          unification design)
 
     Default layout for ``kind='pending'``:
       - indentation only, then a single dim ``'⧗ loading…'`` segment.
         No selection marker, no expand marker — placeholder rows are
         synthetic and don't participate in selection/expansion.
-
-    Default layout for ``kind='scope_root'``:
-      - bolded ``'{id} {title}'`` (id segment gated on ``show_ids``,
-        same auto-suppression rule as the normal kind). No selection
-        marker, no expand marker.
 
     ``search_query`` is accepted for forward-compatibility with phase-2
     ticket #22; phase 1 ignores it (highlighting is applied later by
@@ -195,18 +194,6 @@ def format_item_segments(item, *, depth=0, base_depth=0, expanded=False,
             (item.title, _PENDING_FG, False),
         ]
 
-    if kind == 'scope_root':
-        segs = []
-        if _id_visible(item, show_ids):
-            segs.append(('{} '.format(item.id), _ID_COLOR, True))
-        # ``scope_title`` overrides ``title`` for the scope-header row
-        # only — lets a recipe show e.g. a session's full filesystem
-        # path when that session is the current scope, while keeping
-        # the listing's per-row title short (the session id).
-        scope_text = getattr(item, 'scope_title', None) or item.title
-        segs.append((scope_text, _SCOPE_ROOT_FG, True))
-        return segs
-
     # ----- normal kind ------------------------------------------------
     sel_marker = '* ' if selected else '  '
 
@@ -215,19 +202,26 @@ def format_item_segments(item, *, depth=0, base_depth=0, expanded=False,
     else:
         expand_marker = '  '
 
+    # The scope row gets its id + title segments bolded so it stands
+    # apart from the listing below — the "you are here" indicator. The
+    # selection / expand markers stay non-bold (they're chrome, not
+    # content). The tag segment keeps its tag_style-driven bold so
+    # explicit tag styles still control their own weight.
     segments = [
         (sel_marker, None, False),
         (indent, None, False),
         (expand_marker, _MARKER_COLOR, False),
     ]
     if _id_visible(item, show_ids):
-        segments.append(('{} '.format(item.id), _ID_COLOR, False))
+        segments.append(('{} '.format(item.id), _ID_COLOR, is_current_scope))
 
     if item.tag:
         sfg, sbold = _TAG_STYLE.get(item.tag_style, _TAG_STYLE[''])
         segments.append(('[{}] '.format(item.tag), sfg, sbold))
 
-    segments.append((item.title, None, False))
+    scope_title = getattr(item, 'scope_title', None)
+    title_text = scope_title if (is_current_scope and scope_title) else item.title
+    segments.append((title_text, None, is_current_scope))
     return segments
 
 
@@ -1250,13 +1244,11 @@ def render_list(browser, rect, *, rightmost: bool = False):
     scroll = max(0, min(browser._list_scroll, max_scroll))
     browser._list_scroll = scroll
 
-    # base_depth: the scope-root row sits at depth 0 by construction
-    # (visible_items sets ``kind='scope_root', depth=0`` when scoped),
-    # so children below it want their indent measured from depth 1.
-    if state.scope_stack:
-        base_depth = 1
-    else:
-        base_depth = 0
+    # ``current_scope_id`` is the one piece of scope state the segment
+    # builder needs — it picks ``scope_title`` over ``title`` for the
+    # row that IS the current scope (see scope-root unification design).
+    # Every other aspect of rendering is uniform across all rows.
+    current_scope_id = state.scope_stack[-1] if state.scope_stack else None
 
     for row_idx in range(height):
         vis_idx = scroll + row_idx
@@ -1278,10 +1270,7 @@ def render_list(browser, rect, *, rightmost: bool = False):
         # bold) and skip the regular segment / cursor / search logic
         # entirely. Mirrors plan-tui's _id == -1 branch.
         if entry.kind == 'insert_marker':
-            rel_depth = entry.depth - base_depth
-            if rel_depth < 0:
-                rel_depth = 0
-            line = '  ' + '  ' * rel_depth + '  # ' + item.title
+            line = '  ' + '  ' * entry.depth + '  # ' + item.title
             line, line_cells = _truncate_by_cells(line, width)
             set_style(fg=11, bg=4, bold=True)
             write(line)
@@ -1294,7 +1283,6 @@ def render_list(browser, rect, *, rightmost: bool = False):
         segments = format_item_segments(
             item,
             depth=entry.depth,
-            base_depth=base_depth,
             expanded=item.id in state.expanded,
             selected=is_selected,
             kind=entry.kind,
@@ -1302,6 +1290,7 @@ def render_list(browser, rect, *, rightmost: bool = False):
             format_item=browser.format_item,
             ctx=None,
             show_ids=browser.show_ids,
+            is_current_scope=(item.id == current_scope_id),
         )
 
         if is_cursor_line:
@@ -1323,7 +1312,12 @@ def render_list(browser, rect, *, rightmost: bool = False):
             if (browser._search_query
                     and entry.kind == 'normal'
                     and _search_matches(
-                        _search_text(item), browser._search_query)):
+                        _search_text(
+                            item,
+                            show_ids=browser.show_ids,
+                            is_current_scope=(item.id == current_scope_id),
+                        ),
+                        browser._search_query)):
                 line = ''.join(s[0] for s in segments)
                 line, _ = _truncate_by_cells(line, width)
                 _write_highlighted(

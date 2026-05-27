@@ -89,6 +89,51 @@ class TestSearchText(unittest.TestCase):
         self.assertNotIn('[', text)
         self.assertNotIn(']', text)
 
+    def test_id_omitted_when_show_ids_never(self):
+        # When the recipe sets show_ids='never', the id segment is never
+        # rendered. Matching against it would surface "ghost matches" on
+        # rows where the user can't see the id. Align with the renderer.
+        item = Item(id='/path/with/foo/sess.jsonl', title='sess')
+        text = _search_text(item, show_ids='never')
+        self.assertNotIn('/path/with/foo/', text)
+        self.assertIn('sess', text)
+
+    def test_id_kept_when_show_ids_auto_and_differs_from_title(self):
+        # Default 'auto' keeps id when it'd be rendered (id != title).
+        item = Item(id='foo-id', title='Title')
+        text = _search_text(item, show_ids='auto')
+        self.assertIn('foo-id', text)
+        self.assertIn('Title', text)
+
+    def test_id_omitted_when_show_ids_auto_and_equals_title(self):
+        # Auto suppresses id when id == title (duplication).
+        item = Item(id='same', title='same')
+        text = _search_text(item, show_ids='auto')
+        # id segment isn't repeated; text is just 'same'.
+        self.assertEqual(text, 'same')
+
+    def test_id_kept_when_show_ids_always(self):
+        item = Item(id='same', title='same')
+        text = _search_text(item, show_ids='always')
+        # Both id and title appear.
+        self.assertEqual(text, 'same same')
+
+    def test_scope_title_used_when_is_current_scope(self):
+        # The scope row shows scope_title in place of title — search
+        # should match against that label, not the listing-pane title.
+        item = Item(id='sess-x', title='sess-x')
+        item.scope_title = '/full/path/to/x.jsonl'
+        text = _search_text(item, is_current_scope=True)
+        self.assertIn('/full/path/to/x.jsonl', text)
+        self.assertNotIn('sess-x sess-x', text)  # title replaced
+
+    def test_scope_title_ignored_when_not_current_scope(self):
+        item = Item(id='sess-x', title='sess-x')
+        item.scope_title = '/full/path'
+        text = _search_text(item, is_current_scope=False)
+        self.assertNotIn('/full/path', text)
+        self.assertIn('sess-x', text)
+
 
 # --- _search_matches ------------------------------------------------------
 
@@ -161,20 +206,43 @@ class TestSearchFind(unittest.TestCase):
         # next index is 0).
         self.assertEqual(_search_find(s, 'alp', 2, 1), 0)
 
-    def test_skips_non_normal_entries(self):
-        # Build a state with a scope_root row at the top — _search_find
-        # should skip it and only consider 'normal' rows.
+    def test_can_land_on_scope_row(self):
+        # After scope-root unification the scope row is a normal row
+        # at depth 0 and is searchable like any other.
         s = State(root_id='proj')
         s.scope_stack = ['proj']
-        s._children['proj'] = [Item(id='match', title='matchy')]
-        # Pre-build the visible list to confirm the scope row sits at 0.
+        s._children['proj'] = [Item(id='other', title='other')]
+        # Pre-build the visible list to confirm the scope row is normal.
         vis = visible_items(s)
-        self.assertEqual(vis[0].kind, 'scope_root')
-        self.assertEqual(vis[1].kind, 'normal')
-        # Searching 'match' from idx 0 should find idx 1, not 0 (the
-        # scope_root id 'proj' contains no 'match' anyway, but the rule
-        # is structural: scope_root is never a search hit).
-        self.assertEqual(_search_find(s, 'match', 0, 1), 1)
+        self.assertEqual(vis[0].kind, 'normal')
+        self.assertEqual(vis[0].item.id, 'proj')
+        # Searching for the scope-row id should find idx 0.
+        self.assertEqual(_search_find(s, 'proj', 1, 1), 0)
+
+    def test_show_ids_never_excludes_path_ids_from_matching(self):
+        # browse-claude style: voice rows carry path-prefixed ids and
+        # show_ids='never'. Searching for a path fragment must NOT
+        # match every voice row (the rendered text doesn't include the
+        # path). Only the scope row, whose rendered scope_title
+        # carries the path, should match.
+        path = '/home/u/proj/sess.jsonl'
+        scope_item = Item(id=path, title='sess', has_children=True)
+        scope_item.scope_title = path
+        v0 = Item(id=f'{path}#0', title='user: hi')
+        v1 = Item(id=f'{path}#1', title='assistant: hello')
+        s = State(root_id='__ROOT__')
+        s.scope_stack = [path]
+        s._children[path] = [v0, v1]
+        s._items_by_id[path] = scope_item
+        # With show_ids='never', searching 'home' should match only
+        # the scope row (its scope_title contains '/home/'); v0/v1
+        # rendered titles do not contain 'home'.
+        idx = _search_find(s, 'home', -1, 1, show_ids='never')
+        self.assertEqual(idx, 0)  # scope row
+        # Cursor advance from scope row → wrap, find scope row again.
+        # (Direction-1 walk starting just past idx 0 returns to it.)
+        idx2 = _search_find(s, 'home', 0, 1, show_ids='never')
+        self.assertEqual(idx2, 0)  # only one match
 
     def test_no_match_returns_none(self):
         s = self._state_with([Item(id='alpha'), Item(id='beta')])

@@ -60,8 +60,10 @@ class TestVisibleItemsFabricatedStub(unittest.TestCase):
         s = State(root_id='__ROOT__')
         scope_into(s, 'unseen-id')
         rows = visible_items(s)
-        # First row is the scope_root.
-        self.assertEqual(rows[0].kind, 'scope_root')
+        # First row is the scope row, emitted as a normal row at depth
+        # 0 (post-unification — see scope-root unification design).
+        self.assertEqual(rows[0].kind, 'normal')
+        self.assertEqual(rows[0].depth, 0)
         self.assertEqual(rows[0].item.id, 'unseen-id')
         self.assertTrue(rows[0].item.synthetic)
         # Registered in _items_by_id with the flag set.

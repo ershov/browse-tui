@@ -836,9 +836,10 @@ class TestCursorAnchor(unittest.TestCase):
             b.stop_workers()
 
     def test_anchor_works_on_scope_root_row(self):
-        # When the user is scoped, the first visible row is a
-        # ``scope_root`` entry — the cursor must anchor to it just like
-        # a normal row so background mutations don't drift it.
+        # When the user is scoped, the first visible row is the scope
+        # row at depth 0 (post-unification, emitted as kind='normal'
+        # rather than 'scope_root') — the cursor must anchor to it so
+        # background mutations don't drift it.
         gc = self._children_pair(
             [('P', None, None, '', True)],
             {'P': [('X',), ('Y',)]},
@@ -847,9 +848,10 @@ class TestCursorAnchor(unittest.TestCase):
         try:
             b.refresh()
             b.run_until_idle(timeout=2.0)
-            # Cursor starts at idx 0 (the scope_root row for 'P').
+            # Cursor starts at idx 0 (the scope row for 'P').
             vis = _state.visible_items(b._state)
-            self.assertEqual(vis[0].kind, 'scope_root')
+            self.assertEqual(vis[0].kind, 'normal')
+            self.assertEqual(vis[0].depth, 0)
             self.assertEqual(vis[0].item.id, 'P')
             # Seed the anchor as run() would after startup.
             b._reanchor_cursor()

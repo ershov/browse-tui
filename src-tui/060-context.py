@@ -114,7 +114,10 @@ class Context:
     def visible_items(self) -> list:
         """Visible rows in display order, as ``(Item, kind)`` tuples.
 
-        ``kind`` is one of ``'normal'``, ``'scope_root'``, ``'pending'``.
+        ``kind`` is one of ``'normal'``, ``'pending'``. The scope row
+        at depth 0 (when scoped) is emitted as ``'normal'`` — recipes
+        identify it via ``item.id == ctx.scope`` rather than a row-role
+        discriminator.
         Reflects the current state of expanded / scoped subtrees, so a
         row expanded by an earlier ``Right`` press shows up with its
         children inline. ``ctx.cursor_index`` indexes this same list.
@@ -748,18 +751,19 @@ class Context:
         vis = visible_items(state)
         if not vis:
             return
-        # Default placement: gap right after the cursor item. visible_items
-        # builds the list with the scope_root row at index 0 when scoped,
-        # so cursor + 1 always lands at a real-row gap.
+        # Default placement: gap right after the cursor item. When
+        # scoped, ``visible_items`` emits the scope row at index 0 as a
+        # normal row at depth 0; ``cursor + 1`` lands at a real-row gap
+        # below it (or below the cursor when the cursor is on a child).
         pos = state.cursor + 1
-        # Clamp to [min_pos, len(vis)]; min_pos is 1 (skip the
-        # scope_root gap at index 0 when present).
+        # Clamp to [1, len(vis)]. The pos=0 gap (above the scope row
+        # when scoped, or above the first root row otherwise) is
+        # rejected by ``resolve_insert`` so we never park there.
         max_pos = len(vis)
-        min_pos = 1 if vis and vis[0].kind == 'scope_root' else 1
         if pos > max_pos:
             pos = max_pos
-        if pos < min_pos:
-            pos = min_pos
+        if pos < 1:
+            pos = 1
         self._browser._insert_mode = True
         self._browser._insert_pos = pos
         self._browser._insert_depth = auto_insert_depth(pos, vis)

@@ -315,7 +315,7 @@ def _view_in_pager(ctx):
     Works whether the preview pane is visible or not: cached entries are
     used as-is; on cache miss the recipe's ``get_preview`` is invoked
     synchronously and the result cached. Silent no-op when the cursor
-    is on a placeholder / scope_root row (no item to preview).
+    is on a ``pending`` placeholder row (no item to preview).
     """
     _run_external_on_preview(ctx, env_var='PAGER', default='less -R')
 
@@ -357,9 +357,8 @@ def _run_external_on_preview(ctx, *, env_var, default):
          and skip the external command.
 
     Resolves the active row from ``ctx.visible_items[cursor_index]``
-    so scope_root rows (which the preview pane already shows content
-    for) are operable too. Only ``pending`` placeholder rows skip out
-    — they have no real id.
+    so the scope row at depth 0 (when scoped) is operable too. Only
+    ``pending`` placeholder rows skip out — they have no real id.
     """
     state = ctx._browser._state
     vis = visible_items(state)
@@ -423,13 +422,13 @@ def _scope_down(ctx):
     if not getattr(item, 'has_children', False):
         return  # don't scope into leaves; phase-2 simplification
     scope_into(state, item.id)
-    # Land the cursor on the scope_root row at the top of the new view.
+    # Land the cursor on the scope row at the top of the new view.
     state.cursor = 0
     if item.id not in state._children:
         # Trigger a fetch — ``expand`` is the cheapest entry point;
         # adds id to expanded and enqueues the children fetch. The
-        # scope_root row is rendered regardless; the placeholder under
-        # it shows ``loading…`` until results land.
+        # scope row is rendered regardless; the placeholder under it
+        # shows ``loading…`` until results land.
         ctx.expand(item.id)
     ctx._browser._needs_redraw.add('all')
     ctx._browser._fire_scope_change()
@@ -531,11 +530,12 @@ def _select_all_visible(ctx):
     """Ctrl-A — set selection to exactly the currently-visible normal rows.
 
     WYSIWYG: clear the existing set, then add every ``kind='normal'``
-    visible row. Placeholder rows and the synthetic scope-root row
-    are skipped. The action handler is already on the main thread,
-    so it mutates state.selected directly rather than going through
-    the (thread-safe-but-async) :meth:`Browser.select_all_visible`.
-    Both reach the same end state.
+    visible row. Placeholder rows are skipped (pending ``loading…``
+    rows have no real id). The scope row at depth 0 (when scoped) is
+    a normal row and is included. The action handler is already on
+    the main thread, so it mutates state.selected directly rather than
+    going through the (thread-safe-but-async)
+    :meth:`Browser.select_all_visible`. Both reach the same end state.
     """
     state = ctx._browser._state
     state.selected.clear()
@@ -578,7 +578,10 @@ def _search_next(ctx):
     """
     browser = ctx._browser
     state = browser._state
-    idx = _search_find(state, browser._search_query, state.cursor, 1)
+    idx = _search_find(
+        state, browser._search_query, state.cursor, 1,
+        show_ids=browser.show_ids,
+    )
     if idx is not None:
         state.cursor = idx
         mark_cursor_changed(browser)
@@ -617,7 +620,10 @@ def _search_prev(ctx):
     """
     browser = ctx._browser
     state = browser._state
-    idx = _search_find(state, browser._search_query, state.cursor, -1)
+    idx = _search_find(
+        state, browser._search_query, state.cursor, -1,
+        show_ids=browser.show_ids,
+    )
     if idx is not None:
         state.cursor = idx
         mark_cursor_changed(browser)
@@ -643,8 +649,8 @@ def _expand_recursive(ctx):
     we kick a fetch via ``ctx.expand`` so they resolve on the next
     drain.
 
-    No-op when the cursor row isn't a normal item (placeholder /
-    scope_root / empty list).
+    No-op when the cursor row isn't a normal item (``pending``
+    placeholder / empty list).
     """
     state = ctx._browser._state
     if ctx.cursor is None:
@@ -1087,10 +1093,11 @@ def default_actions() -> list:
         Action('ctrl-r',    'Reload',         _reload,      'none', 'OTHER'),
         Action('ctrl-l',    'Redraw',         _redraw,      'none', 'OTHER'),
         # View / edit the cursor row's preview text. Gate 'none' so
-        # the handler also fires on the scope_root row (whose preview
-        # is shown in the pane but ``ctx.cursor`` filters out — see
-        # ``Context.cursor``). The handler resolves the visible entry
-        # itself and skips ``pending`` placeholders. Recipes override
+        # the handler also fires on the scope row at depth 0 (whose
+        # preview is shown in the pane but ``ctx.cursor`` may filter
+        # out — see ``Context.cursor``). The handler resolves the
+        # visible entry itself and skips ``pending`` placeholders.
+        # Recipes override
         # 'e' to make edits actually persist (the default discards).
         Action('v',         'View preview in $PAGER',  _view_in_pager,   'none', 'OTHER'),
         Action('e',         'Edit preview in $EDITOR (changes discarded)', _edit_in_editor, 'none', 'OTHER'),
@@ -1343,8 +1350,10 @@ def _handle_insert_key(browser, ctx: 'Context', key: str) -> bool:
     vis = visible_items(state)
     max_pos = len(vis)
     # min_pos = 1 always — gap 0 sits above the first row, which is the
-    # scope_root row when scoped (and a regular row otherwise). Either
-    # way the marker starts at gap 1 and never goes lower.
+    # scope row when scoped (and a regular row otherwise). Either way
+    # the marker starts at gap 1 and never goes lower. In scoped view
+    # ``resolve_insert`` further rejects depth-0 placements, since
+    # those would land outside the scope.
     min_pos = 1
 
     def _set_pos(new_pos):
@@ -1433,9 +1442,9 @@ def _handle_insert_key(browser, ctx: 'Context', key: str) -> bool:
                 browser._needs_redraw.add('all')
                 return True
         # Second case: outdent and reposition before the parent. We use
-        # base = base depth of the current scope. visible_items emits
-        # the scope_root at depth 0 when scoped, so children start at
-        # depth 1 → base = 1; otherwise base = 0.
+        # base = base depth of the current scope. ``visible_items``
+        # emits the scope row at depth 0 (normal kind) when scoped, so
+        # children start at depth 1 → base = 1; otherwise base = 0.
         base = 1 if state.scope_stack else 0
         if depth > base:
             new_depth = depth - 1
@@ -1474,7 +1483,7 @@ def _handle_insert_key(browser, ctx: 'Context', key: str) -> bool:
     if key == 'enter':
         relation, dest_id = resolve_insert(
             browser._insert_pos, browser._insert_depth, vis,
-            scope_root_id=current_scope(state),
+            scope_root_id=(state.scope_stack[-1] if state.scope_stack else None),
         )
         cb = browser._insert_callback
         browser._insert_mode = False
