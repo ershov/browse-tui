@@ -451,6 +451,75 @@ def _index_add_children(state: State, parent_id, items) -> None:
         state._parent_of_id[child.id] = parent_id
 
 
+_PROMOTION_DATA_FIELDS = (
+    'title', 'tag', 'tag_style', 'has_children', 'hidden', 'scope_title',
+)
+
+
+def _promote_synthetic(synthetic, real) -> None:
+    """Copy data from ``real`` onto ``synthetic`` in place; clear flag.
+
+    Used when a children-fetch delivery brings a real Item whose id
+    matches an existing synthetic stub in ``_items_by_id`` (typically
+    fabricated by ``visible_items`` for a scope-root id with no cached
+    Item). Identity-preserving: callers can keep their reference to
+    the synthetic and observe the promotion via attribute reads.
+
+    Merge policy:
+      - Item data fields (``title``, ``tag``, ``tag_style``,
+        ``has_children``, ``hidden``, ``scope_title``): take ``real``.
+      - Recipe-attached extras (``__dict__`` keys not in the dataclass
+        field set): copied from ``real``. Extras on ``synthetic`` that
+        aren't on ``real`` are not removed — synthetics rarely carry
+        extras, but conservative-merge preserves them if present.
+      - Framework cache slots (``preview``, ``preview_render``):
+        ``real``'s values win when non-None; otherwise the synthetic's
+        cached values are preserved. The common case is
+        ``real.preview is None`` (the preview cache is filled lazily
+        on first paint), so any preview already cached on the
+        synthetic survives the promotion.
+      - ``_filter_hidden``: ignored here; the framework recomputes it
+        in ``apply_children_results`` after promotion.
+      - ``synthetic`` flag: cleared.
+    """
+    for name in _PROMOTION_DATA_FIELDS:
+        setattr(synthetic, name, getattr(real, name))
+    # Recipe extras: anything on real.__dict__ not in the dataclass
+    # field set.
+    known = {f.name for f in _dc_fields(synthetic)}
+    for k, v in real.__dict__.items():
+        if k not in known:
+            setattr(synthetic, k, v)
+    # Cache slots: real wins when populated.
+    if real.preview is not None:
+        synthetic.preview = real.preview
+        synthetic.preview_render = real.preview_render
+    synthetic.synthetic = False
+
+
+def _promote_synthetics(state: State, items):
+    """Promote any synthetic stubs in ``_items_by_id`` matched by ``items``.
+
+    Returns a new list (same length as ``items``) where each entry is
+    either the original ``Item`` from ``items`` (no synthetic match)
+    or the promoted synthetic (after in-place mutation). Substituting
+    the promoted synthetic preserves identity in ``_items_by_id`` and
+    on the per-Item preview cache.
+
+    Called from ``apply_children_results`` between
+    ``_index_drop_children`` and ``_state._children[id_] = items``.
+    """
+    out = []
+    for incoming in items:
+        existing = state._items_by_id.get(incoming.id)
+        if existing is not None and getattr(existing, 'synthetic', False):
+            _promote_synthetic(existing, incoming)
+            out.append(existing)
+        else:
+            out.append(incoming)
+    return out
+
+
 def cache_invalidate_subtree(state: State, item_id) -> None:
     """Drop one parent's children entry and mark the visible-tree dirty.
 
@@ -1481,11 +1550,17 @@ def visible_items(state: State) -> list:
         # (#422) has a place to land: ``_deliver_preview`` (#442) and the
         # renderer both key on ``_items_by_id``, so an unregistered
         # synthetic would silently swallow preview text.
+        #
+        # The synthetic is marked with ``synthetic=True`` so the next
+        # children-fetch delivery (``_promote_synthetics``) can promote
+        # it in place to a real Item without breaking identity in
+        # ``_items_by_id`` or losing the cached preview.
         scope_item = _find_item(state, scope_root_id)
         if scope_item is None:
             scope_item = state._items_by_id.get(scope_root_id)
         if scope_item is None:
             scope_item = Item(id=scope_root_id, title=str(scope_root_id))
+            scope_item.synthetic = True
             state._items_by_id[scope_root_id] = scope_item
         out.append(VisibleEntry(item=scope_item, depth=0, kind='scope_root'))
         base_depth = 1
@@ -3973,6 +4048,12 @@ class Browser:
             # set under ``id_`` doesn't leave stale ``_items_by_id`` /
             # ``_parent_of_id`` rows pointing at the previous list.
             _index_drop_children(self._state, id_)
+            # Promote any synthetic stubs whose ids match the freshly-
+            # delivered children before installing the list. The stub's
+            # ``_items_by_id`` entry is preserved (identity-stable);
+            # ``_index_add_children`` below then writes the same
+            # identity back under the matched id.
+            items = _promote_synthetics(self._state, items)
             self._state._children[id_] = items
             _index_add_children(self._state, id_, items)
             self._state._children_pending.discard(id_)

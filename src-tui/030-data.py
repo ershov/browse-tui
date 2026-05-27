@@ -128,6 +128,17 @@ class Item:
     # out of positional-construction signatures (tuple → Item
     # coercion); recipes set it by keyword or via attribute write.
     scope_title: Any = None
+    # Framework-owned provenance flag. ``True`` for Items fabricated by
+    # ``visible_items`` as a stub when a scope-root id has no real Item
+    # yet (recipe-pre-pushed ``initial_scope``, deep ``scope_stack``
+    # injected by a recipe, lazy-fetched alt-up into an uncached
+    # ancestor, post-refresh window before re-fetch). Cleared by
+    # ``_promote_synthetic`` when the parent's children fetch delivers
+    # a real Item with the matching id. Recipes do not set this; the
+    # default carries the right semantics for everything else.
+    synthetic: bool = field(
+        default=False, init=False, repr=False, compare=False,
+    )
 
     def __post_init__(self) -> None:
         if not self.title:
