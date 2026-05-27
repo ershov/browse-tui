@@ -2986,6 +2986,52 @@ def _search_jump_nearest(browser):
 #   4. The current-scope row is exempt: always treated as a match.
 
 
+def _filter_visit_subtree(state, item, active, scope_id, show_ids):
+    """Bottom-up DFS over a visible subtree, writing ``_filter_hidden``.
+
+    Mirrors the per-item evaluation used by ``_recompute_filter_hidden``:
+    descend through expanded cached children; the item passes iff its
+    own text matches every active filter OR at least one visible
+    descendant passes. Returns True iff the item itself should be
+    visible (``_filter_hidden=False``).
+
+    ``active`` is the pre-filtered list of truthy filter strings;
+    ``scope_id`` is the current scope row id (or ``None`` when
+    unscoped). Both are passed in to avoid recomputing per recursive
+    call. This is shared between the full ``_recompute_filter_hidden``
+    walk and the per-op dispatch's "force-evaluate a new item's
+    subtree" hook (#499).
+    """
+    # Rule 2: recipe-hidden rows aren't part of the visible tree. No
+    # flag write; the renderer would skip them regardless and they
+    # can't scaffold an ancestor.
+    if getattr(item, 'hidden', False):
+        return False
+
+    # Descend only into expanded subtrees (Rule 1). Collapsed children
+    # contribute nothing.
+    any_visible_desc_passes = False
+    if item.has_children and item.id in state.expanded:
+        for child in state._children.get(item.id, ()):
+            if _filter_visit_subtree(
+                state, child, active, scope_id, show_ids,
+            ):
+                any_visible_desc_passes = True
+
+    is_scope = (item.id == scope_id)
+    text = _search_text(
+        item, show_ids=show_ids, is_current_scope=is_scope,
+    )
+    # Scope row exemption: always treated as a match.
+    self_passes = is_scope or all(
+        _search_matches(text, q) for q in active
+    )
+    item._filter_hidden = not (
+        self_passes or any_visible_desc_passes
+    )
+    return not item._filter_hidden
+
+
 def _recompute_filter_hidden(state, filters, *, show_ids='auto') -> None:
     """Re-evaluate filter visibility across the visible tree.
 
@@ -3015,39 +3061,6 @@ def _recompute_filter_hidden(state, filters, *, show_ids='auto') -> None:
 
     scope_id = state.scope_stack[-1] if state.scope_stack else None
 
-    def visit(item):
-        """Bottom-up DFS over the visible subtree.
-
-        Returns True iff ``item`` should be visible
-        (``_filter_hidden=False``).
-        """
-        # Rule 2: recipe-hidden rows aren't part of the visible tree.
-        # No flag write; the renderer would skip them regardless and
-        # they can't scaffold an ancestor.
-        if getattr(item, 'hidden', False):
-            return False
-
-        # Descend only into expanded subtrees (Rule 1). Collapsed
-        # children contribute nothing.
-        any_visible_desc_passes = False
-        if item.has_children and item.id in state.expanded:
-            for child in state._children.get(item.id, ()):
-                if visit(child):
-                    any_visible_desc_passes = True
-
-        is_scope = (item.id == scope_id)
-        text = _search_text(
-            item, show_ids=show_ids, is_current_scope=is_scope,
-        )
-        # Scope row exemption: always treated as a match.
-        self_passes = is_scope or all(
-            _search_matches(text, q) for q in active
-        )
-        item._filter_hidden = not (
-            self_passes or any_visible_desc_passes
-        )
-        return not item._filter_hidden
-
     # Walk the same shape ``_emit_children`` would walk with the filter
     # off: the scope row (when scoped) or root's children (unscoped).
     # The scope row is normally in ``state.expanded`` (``scope_into``
@@ -3058,10 +3071,14 @@ def _recompute_filter_hidden(state, filters, *, show_ids='auto') -> None:
         if scope_item is None:
             scope_item = state._items_by_id.get(scope_root_id)
         if scope_item is not None:
-            visit(scope_item)
+            _filter_visit_subtree(
+                state, scope_item, active, scope_id, show_ids,
+            )
     else:
         for child in state._children.get(state.root_id, ()):
-            visit(child)
+            _filter_visit_subtree(
+                state, child, active, scope_id, show_ids,
+            )
 
 
 # ---- per-op incremental filter propagation (ticket #498) ----------------
@@ -3161,6 +3178,227 @@ def _propagate_filter_status_up(state, item, filters, *, show_ids='auto'):
         if parent_id is None:
             return
         cur = state._items_by_id.get(parent_id)
+
+
+# ---- per-op filter dispatch (ticket #499) -------------------------------
+#
+# ``update_data._apply`` calls these to drive per-op filter propagation
+# in place of the full ``_recompute_filter_hidden`` walk. The pre-scan
+# captures the pre-mutation state needed to resolve "what id is
+# affected, under what parent" before ``apply_ops`` runs (some ops —
+# ``upsert`` of an existing id with ``parent_id=None`` patch-only,
+# ``mod`` with ``KEEP_PARENT``, ``remove`` — only have answers in the
+# pre-state).
+#
+# Dispatch table (per affected op, ``visible-expanded`` parent gating
+# per Rule 2 of
+# ``docs/superpowers/specs/2026-05-27-filter-visible-tree-only-design.md``):
+#   * ``upsert`` / ``set`` / ``mod`` of an item under visible-expanded
+#     parent: ``_propagate_filter_status_up(item, ...)``. The item's
+#     own match may have changed (or it's a NEW item that needs its
+#     flag set); walking up re-evaluates its parent's scaffold status.
+#   * ``remove`` of an item under visible-expanded parent:
+#     ``_propagate_filter_status_up(parent, ...)``. The parent may
+#     have lost its only matching descendant.
+#   * ``clear_children`` of a visible-expanded parent: same as remove
+#     for the parent itself.
+#   * Reparent (existing item moves between parents): propagate from
+#     BOTH old and new parents — each may flip status.
+#   * Any op under a collapsed parent: skip (Rule 2 — invisible
+#     change).
+#
+# "Visible-expanded" parent = root (``parent_id is None`` or
+# ``state.root_id``) OR a non-root id in ``state.expanded``. A parent
+# that has been ``expand``-ed by the user but doesn't yet have cached
+# children IS still visible-expanded — its placeholder row renders
+# until the children stream in, and freshly-arrived children must be
+# filter-evaluated.
+
+
+def _filter_dispatch_pre_scan(state, op):
+    """Return a dispatch tuple describing the op's filter side effects,
+    or ``None`` for ops that don't affect filter visibility.
+
+    Captures the pre-mutation snapshot of the item's current parent
+    (needed for ``mod`` with ``KEEP_PARENT``, for ``remove`` after the
+    item is dropped from the indexes, and for detecting reparent on
+    ``upsert``/``set``) and whether the id is a fresh insert (needed
+    so the dispatcher visit()s the new subtree before propagating up
+    from the parent — see ``_dispatch_filter_propagation``).
+
+    Tuple shape:
+      (kind, item_id, new_parent_id, old_parent_id, is_new)
+    """
+    kind = op[0]
+    if kind == 'upsert':
+        _, id_, op_parent_id, _fields, *_rest = op
+        existed = id_ in state._items_by_id
+        old_parent_id = state._parent_of_id.get(id_)
+        # ``_apply_upsert`` quirk: existing id with ``parent_id=None``
+        # is patch-only and leaves the parent unchanged. Also: new id
+        # with ``parent_id=None`` AND ``state.root_id is not None`` is
+        # a silent drop. Mirror both — otherwise the dispatcher
+        # propagates against a parent that wasn't actually touched.
+        if op_parent_id is None and existed:
+            new_parent_id = old_parent_id
+        elif op_parent_id is None and state.root_id is not None:
+            # Silent drop in apply_ops — no dispatch.
+            return None
+        else:
+            new_parent_id = op_parent_id
+        return (
+            'upsert', id_, new_parent_id, old_parent_id, not existed,
+        )
+    if kind == 'set':
+        _, id_, op_parent_id, _fields, *_rest = op
+        # ``_apply_set`` rebuilds the Item instance. For a NEW id, treat
+        # it like an upsert (visit subtree, propagate from parent). For
+        # an EXISTING id, the children list is untouched and their
+        # ``_filter_hidden`` flags stay valid — propagate-up from the
+        # (new) item itself; the helper will re-evaluate the item's
+        # text and walk upward if its status changed.
+        existed = id_ in state._items_by_id
+        old_parent_id = state._parent_of_id.get(id_)
+        return ('set', id_, op_parent_id, old_parent_id, not existed)
+    if kind == 'mod':
+        _, id_, op_parent_id, _fields, *_rest = op
+        # Unknown id → ``_apply_mod`` is a silent no-op; nothing to
+        # propagate.
+        if id_ not in state._items_by_id:
+            return None
+        old_parent_id = state._parent_of_id.get(id_)
+        if op_parent_id is KEEP_PARENT:
+            new_parent_id = old_parent_id
+        else:
+            new_parent_id = op_parent_id
+        # mod is patch-only; never inserts. Existing item.
+        return ('mod', id_, new_parent_id, old_parent_id, False)
+    if kind == 'remove':
+        _, id_ = op
+        # Unknown id → ``_apply_remove`` is a silent no-op; nothing to
+        # propagate.
+        if id_ not in state._items_by_id:
+            return None
+        old_parent_id = state._parent_of_id.get(id_)
+        return ('remove', id_, None, old_parent_id, False)
+    if kind == 'clear_children':
+        _, parent_id = op
+        # If the parent has no cached children, ``_apply_clear_children``
+        # is effectively a no-op.
+        if parent_id not in state._children:
+            return None
+        return ('clear_children', None, parent_id, parent_id, False)
+    # complete / incomplete / set_preview / append_preview /
+    # clear_preview / invalidate_preview / drop_preview_cache: no
+    # filter-visibility side effects.
+    return None
+
+
+def _is_parent_visible_expanded(state, parent_id):
+    """Return True iff ``parent_id`` is a visible-expanded parent.
+
+    Visible-expanded per Rule 2:
+      * root (``parent_id == state.root_id``) — always conceptually
+        expanded; ``visible_items`` walks ``_children[root_id]``
+        regardless of ``state.expanded``.
+      * any other id (including the scope row) — must be in
+        ``state.expanded``. ``scope_into`` auto-adds the scope id, so
+        this naturally captures the scope-root case.
+
+    A parent that's expanded but with no cached children is still
+    visible — it renders with a "pending" placeholder row, and an
+    op arriving under it lifts the placeholder. Hence no
+    ``_children`` gate.
+    """
+    if parent_id == state.root_id:
+        return True
+    return parent_id in state.expanded
+
+
+def _dispatch_filter_propagation(state, dispatch_info, filters, show_ids):
+    """Apply per-op filter propagation for the captured dispatch info.
+
+    Each entry comes from ``_filter_dispatch_pre_scan``. The visible-
+    expanded gate (Rule 2) decides whether to propagate; when an op
+    reparents an existing item BOTH the old and new parent get walks.
+    ``_propagate_filter_status_up`` does its own early-terminate up
+    the ancestor chain.
+
+    For NEW items (``is_new=True``) the dispatcher visits the item's
+    subtree first (writing ``_filter_hidden`` bottom-up) and then
+    propagates from the PARENT — calling propagate-up FROM the new
+    item itself would early-terminate before reaching the parent
+    when the item's evaluated flag matches its dataclass default of
+    ``False``. For EXISTING items (``is_new=False``) propagate-up
+    starts from the item itself, since its evaluation may flip its
+    flag and bubble up naturally.
+    """
+    # Coalesce duplicate walks within this batch.
+    walked = set()
+    active = [q for q in filters if q]
+    scope_id = state.scope_stack[-1] if state.scope_stack else None
+
+    def _walk_from_id(target_id):
+        if target_id is None or target_id in walked:
+            return
+        item = state._items_by_id.get(target_id)
+        if item is None:
+            return
+        walked.add(target_id)
+        _propagate_filter_status_up(
+            state, item, filters, show_ids=show_ids,
+        )
+
+    for entry in dispatch_info:
+        kind, item_id, new_parent_id, old_parent_id, is_new = entry
+
+        if kind == 'remove':
+            # Item is gone post-apply — propagate from the old parent.
+            if _is_parent_visible_expanded(state, old_parent_id):
+                _walk_from_id(old_parent_id)
+            continue
+
+        if kind == 'clear_children':
+            # Propagate from the cleared parent itself.
+            if _is_parent_visible_expanded(state, new_parent_id):
+                _walk_from_id(new_parent_id)
+            continue
+
+        # upsert / set / mod
+        new_visible = _is_parent_visible_expanded(state, new_parent_id)
+        reparented = (
+            old_parent_id is not None
+            and old_parent_id != new_parent_id
+        )
+        if reparented:
+            old_visible = _is_parent_visible_expanded(
+                state, old_parent_id,
+            )
+        else:
+            old_visible = False
+
+        if new_visible:
+            if is_new:
+                # NEW item: visit its subtree to set ``_filter_hidden``
+                # bottom-up (covers the rare pre-seeded-children case
+                # too — a leaf new item gets one self-eval). Then
+                # propagate-up FROM PARENT so the parent re-evaluates
+                # against the newly-flagged child. Walking from the
+                # new item itself would early-terminate when its flag
+                # equals the dataclass default before the parent ever
+                # sees the change.
+                new_item = state._items_by_id.get(item_id)
+                if new_item is not None:
+                    _filter_visit_subtree(
+                        state, new_item, active, scope_id, show_ids,
+                    )
+                _walk_from_id(new_parent_id)
+            else:
+                # EXISTING item: propagate-up from the item itself.
+                # Its evaluation may flip the flag, bubbling up.
+                _walk_from_id(item_id)
+        if reparented and old_visible:
+            _walk_from_id(old_parent_id)
 
 
 # ---- insert-mode placement helpers (ticket #21) -------------------------
@@ -4538,6 +4776,25 @@ class Browser:
             pre_vis_ids = [entry.item.id for entry in pre_vis]
             pre_cursor = self._state.cursor
 
+            # Pre-scan ops for per-op filter propagation (#499). Captures
+            # (kind, item_id, new_parent_id, old_parent_id) per structural
+            # op BEFORE apply_ops mutates state — needed because some ops
+            # (``mod`` with ``KEEP_PARENT``, ``remove``, ``upsert`` of an
+            # existing id with ``parent_id=None`` patch-only) only have
+            # answers in the pre-state. The dispatch table below (post-
+            # apply) calls ``_propagate_filter_status_up`` per affected
+            # parent/item, walking O(depth) per op instead of the full
+            # visible-tree walk. Per Rule 2 of
+            # ``docs/superpowers/specs/2026-05-27-filter-visible-tree-only-design.md``
+            # (visible-tree-only filter): ops landing under a collapsed
+            # parent contribute no visible change and skip.
+            filter_dispatch = []
+            if self._filters:
+                for op in ops_list:
+                    info = _filter_dispatch_pre_scan(self._state, op)
+                    if info is not None:
+                        filter_dispatch.append(info)
+
             apply_ops(
                 self._state, ops_list, preview_ansi=self.preview_ansi,
             )
@@ -4565,15 +4822,25 @@ class Browser:
                         self._kick_after_invalidate(cur)
 
             # Re-evaluate filter visibility before computing the new
-            # visible list. New items may match or un-match active
-            # filters; existing items may have moved subtrees. The
-            # filter pass writes ``_filter_hidden`` flags so the
-            # post-batch ``visible_items`` reflects filter narrowing
-            # in time for hide-displacement to walk it.
-            if self._filters:
-                _recompute_filter_hidden(
-            self._state, self._filters, show_ids=self.show_ids,
-        )
+            # visible list. Per-op dispatch (#499): walk ``filter_dispatch``
+            # entries captured pre-apply and call
+            # ``_propagate_filter_status_up`` per affected parent/item.
+            # Each call walks O(depth) and early-terminates at the first
+            # ancestor whose flag value doesn't change. The dispatcher
+            # itself gates on the visible-expanded check (Rule 2 of
+            # ``2026-05-27-filter-visible-tree-only-design``): ops
+            # landing under a collapsed parent skip entirely.
+            #
+            # ``apply_children_results`` (worker delivery, rare path)
+            # keeps its full ``_recompute_filter_hidden`` walk —
+            # ``update_data`` is the primary streaming path and
+            # benefits from incremental updates; the legacy path's
+            # full walk is the safe fallback.
+            if self._filters and filter_dispatch:
+                _dispatch_filter_propagation(
+                    self._state, filter_dispatch,
+                    self._filters, self.show_ids,
+                )
 
             # Positional pin owns the cursor position — skip
             # hide-displacement entirely (the pin re-clamps to the new

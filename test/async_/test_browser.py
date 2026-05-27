@@ -1802,6 +1802,231 @@ class TestFilterUpdateDataIntegration(unittest.TestCase):
             b.stop_workers()
 
 
+class TestFilterUpdateDataPerOpDispatch(unittest.TestCase):
+    """``update_data._apply`` runs ``_propagate_filter_status_up`` per
+    affected op (not a full visible-tree walk). Skips entirely when the
+    op lands under a collapsed parent (Rule 2 of
+    2026-05-27-filter-visible-tree-only-design). Expanded-but-uncached
+    parents do fire propagation — newly-arriving children are filter-
+    evaluated as they land (the parent renders with a placeholder
+    until they do)."""
+
+    def test_streaming_batch_each_propagates_pre_existing_untouched(self):
+        # Setup: expanded parent with one pre-existing matching child
+        # (so parent is scaffold-visible). Then stream N upserts of new
+        # non-matching siblings. Pre-existing items' flags must not be
+        # rewritten (the dispatch policy walks O(depth) per op, never
+        # the full subtree). Verified by counting propagate-up calls
+        # and confirming the pre-existing matching child's flag was
+        # not rewritten by a full-tree walk.
+        b = make_browser(get_children=lambda _id, *, reload=False: [])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.update_data([
+                ('upsert', 'p', None,
+                 {'title': 'p', 'has_children': True}),
+                ('upsert', 'match', 'p', {'title': 'apple'}),
+                ('complete', 'p'),
+            ])
+            b.run_until_idle()
+            b._state.expanded.add('p')
+            b.set_filters(['app'])
+            b.run_until_idle()
+            # Scaffold-visible: parent kept because child 'apple' matches.
+            self.assertFalse(b._state._items_by_id['p']._filter_hidden)
+            self.assertFalse(b._state._items_by_id['match']._filter_hidden)
+
+            # Instrument propagation: wrap _propagate_filter_status_up
+            # and count invocations and arg ids.
+            original = _state._propagate_filter_status_up
+            calls = []
+
+            def _spy(state, item, filters, *, show_ids='auto'):
+                calls.append(getattr(item, 'id', None))
+                return original(state, item, filters, show_ids=show_ids)
+
+            _state._propagate_filter_status_up = _spy
+            try:
+                # Stream 5 non-matching new children. Each new item's
+                # dispatch:
+                #   visit(new_item)            -> 1 visit
+                #   propagate_up(parent='p')   -> 1 propagate call
+                # Total: 5 propagate calls (one per upsert).
+                ops = [
+                    ('upsert', f'n{i}', 'p', {'title': f'banana{i}'})
+                    for i in range(5)
+                ]
+                b.update_data(ops)
+                b.run_until_idle()
+            finally:
+                _state._propagate_filter_status_up = original
+
+            # 1 propagate call — coalesced. The 5 upserts all target
+            # the SAME parent 'p'; the dispatcher visits each new item
+            # individually but coalesces the propagate-up-from-parent
+            # walk so 'p' is only walked once per batch (the rest are
+            # dedup-skipped). A full-walk implementation would call
+            # ``_propagate_filter_status_up`` zero times entirely
+            # (going through ``_recompute_filter_hidden`` instead).
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls, ['p'])
+            # Pre-existing items still have correct flags.
+            self.assertFalse(b._state._items_by_id['p']._filter_hidden)
+            self.assertFalse(b._state._items_by_id['match']._filter_hidden)
+            # New non-matching items are hidden.
+            for i in range(5):
+                self.assertTrue(
+                    b._state._items_by_id[f'n{i}']._filter_hidden
+                )
+        finally:
+            b.stop_workers()
+
+    def test_op_under_collapsed_parent_no_walk(self):
+        # Filter active; parent has matching children but is COLLAPSED.
+        # New op under the collapsed parent must NOT trigger propagation
+        # (Rule 2: invisible change).
+        b = make_browser(get_children=lambda _id, *, reload=False: [])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.update_data([
+                ('upsert', 'p', None,
+                 {'title': 'plum', 'has_children': True}),
+                ('upsert', 'c', 'p', {'title': 'cherry'}),
+                ('complete', 'p'),
+            ])
+            b.run_until_idle()
+            # Parent collapsed (not in state.expanded).
+            self.assertNotIn('p', b._state.expanded)
+            b.set_filters(['cherry'])
+            b.run_until_idle()
+            # With Rule 2, collapsed parent isn't scaffolded by its
+            # hidden children — parent's own text 'plum' doesn't match,
+            # so parent is hidden.
+            self.assertTrue(b._state._items_by_id['p']._filter_hidden)
+
+            # Now stream a NEW matching child under the still-collapsed
+            # parent. Dispatch policy says: skip — the change is
+            # invisible. The parent stays as-is.
+            original = _state._propagate_filter_status_up
+            calls = []
+
+            def _spy(state, item, filters, *, show_ids='auto'):
+                calls.append(getattr(item, 'id', None))
+                return original(state, item, filters, show_ids=show_ids)
+
+            _state._propagate_filter_status_up = _spy
+            try:
+                b.update_data([
+                    ('upsert', 'c2', 'p', {'title': 'cherry-2'}),
+                ])
+                b.run_until_idle()
+            finally:
+                _state._propagate_filter_status_up = original
+
+            # No propagate calls — collapsed parent skipped.
+            self.assertEqual(calls, [])
+            # Parent's flag didn't change (still hidden).
+            self.assertTrue(b._state._items_by_id['p']._filter_hidden)
+        finally:
+            b.stop_workers()
+
+    def test_op_under_uncached_parent_no_walk(self):
+        # Filter active; an op targets a parent that has no ``_children``
+        # entry AND is not expanded. The dispatcher skips entirely
+        # because the parent fails the visible-expanded gate (Rule 2).
+        # An uncached parent is, in practice, ALSO collapsed — the
+        # user hasn't expanded into it yet, so its children-list has
+        # never been populated. This test exercises the typical
+        # combination.
+        b = make_browser(get_children=lambda _id, *, reload=False: [])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            # Create parent only; never expanded, no children push.
+            b.update_data([
+                ('upsert', 'p', None,
+                 {'title': 'plum', 'has_children': True}),
+            ])
+            b.run_until_idle()
+            # Confirm: state._children has no entry for 'p' (parent has
+            # never been fetched / no children pushed yet).
+            self.assertNotIn('p', b._state._children)
+            # 'p' is not in state.expanded — collapsed.
+            self.assertNotIn('p', b._state.expanded)
+            b.set_filters(['notmatching'])
+            b.run_until_idle()
+            self.assertTrue(b._state._items_by_id['p']._filter_hidden)
+
+            # Stream an upsert under 'p'. The dispatcher checks the
+            # visible-expanded gate (parent in state.expanded? parent
+            # == root?) — neither holds, so skip.
+            original = _state._propagate_filter_status_up
+            calls = []
+
+            def _spy(state, item, filters, *, show_ids='auto'):
+                calls.append(getattr(item, 'id', None))
+                return original(state, item, filters, show_ids=show_ids)
+
+            _state._propagate_filter_status_up = _spy
+            try:
+                b.update_data([
+                    ('upsert', 'x', 'p', {'title': 'notmatching-child'}),
+                ])
+                b.run_until_idle()
+            finally:
+                _state._propagate_filter_status_up = original
+
+            # No propagation: parent is uncached AND collapsed → skip.
+            self.assertEqual(calls, [])
+            # Parent stays hidden (no change).
+            self.assertTrue(b._state._items_by_id['p']._filter_hidden)
+        finally:
+            b.stop_workers()
+
+    def test_remove_op_clearing_last_matcher_flips_parent_hidden(self):
+        # Setup: expanded parent with one matching child + one non-
+        # matching child. Filter active — parent is scaffold-visible
+        # (kept by the matching child). Remove the matching child:
+        # parent must flip to hidden, propagation walking up from the
+        # parent.
+        b = make_browser(get_children=lambda _id, *, reload=False: [])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.update_data([
+                ('upsert', 'p', None,
+                 {'title': 'plum', 'has_children': True}),
+                ('upsert', 'match', 'p', {'title': 'apple'}),
+                ('upsert', 'other', 'p', {'title': 'banana'}),
+                ('complete', 'p'),
+            ])
+            b.run_until_idle()
+            b._state.expanded.add('p')
+            b.set_filters(['app'])
+            b.run_until_idle()
+            # Pre-remove: parent scaffold-visible, 'match' visible,
+            # 'other' hidden.
+            self.assertFalse(b._state._items_by_id['p']._filter_hidden)
+            self.assertFalse(b._state._items_by_id['match']._filter_hidden)
+            self.assertTrue(b._state._items_by_id['other']._filter_hidden)
+
+            # Remove the only matching child.
+            b.update_data([('remove', 'match')])
+            b.run_until_idle()
+
+            # 'match' is gone from the indexes.
+            self.assertNotIn('match', b._state._items_by_id)
+            # Parent flips to hidden (no more matching descendants;
+            # parent's own text 'plum' doesn't match either).
+            self.assertTrue(b._state._items_by_id['p']._filter_hidden)
+            # The remaining non-matching child stays hidden.
+            self.assertTrue(b._state._items_by_id['other']._filter_hidden)
+        finally:
+            b.stop_workers()
+
+
 class TestFilterAppliesToStreamedChildren(unittest.TestCase):
     """Items delivered via ``get_children`` (apply_children_results) get
     filter-evaluated when an active filter is in place."""
