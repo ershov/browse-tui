@@ -3681,6 +3681,20 @@ class Browser:
         self._children_results = deque()  # FIFO of (id, items) — set_children only
         self._children_event = threading.Event()
 
+        # Children prefetch slot: latest-wins single-flight for the
+        # cursor-driven prefetch path (#481). Mirrors ``_preview_req``:
+        # ``_update_children_for_cursor`` writes the current cursor's id
+        # here; the children worker reads in Pass 1 of its loop and
+        # decides whether to fetch (skips cache hits and FIFO-pending
+        # hits). ``_children_prefetch_local_id`` is the worker's
+        # "what I just fetched or decided to skip" memo — exposed as an
+        # attribute so ``run_until_idle`` can observe quiescence without
+        # touching worker internals. Single-attribute reads/writes are
+        # GIL-safe; no lock needed. See
+        # docs/superpowers/specs/2026-05-27-children-prefetch-slot-design.md.
+        self._children_prefetch_req = None
+        self._children_prefetch_local_id = None
+
         # Preview worker: post-queue delivery + local-id dedup (#442).
         # The worker keeps a ``local_id`` of the most recently fetched
         # request. On each iteration it reads ``_preview_req``: if it
@@ -5394,10 +5408,21 @@ class Browser:
                 and not (paused is not None
                          and paused.get('id') == self._preview_req)
             )
+            # Children prefetch slot is busy when its slot value differs
+            # from the worker's local-id memo — meaning either the worker
+            # hasn't picked up the latest request yet, or is mid-fetch
+            # for it. When they match (worker has acted on this id, even
+            # if to skip because cached), the slot is quiescent.
+            children_prefetch_busy = (
+                self._children_prefetch_req is not None
+                and self._children_prefetch_req
+                    != self._children_prefetch_local_id
+            )
             if (self._main_queue.empty()
                     and not self._children_queue
                     and not self._children_results
                     and not preview_busy
+                    and not children_prefetch_busy
                     and not self._children_in_flight
                     and not self._state._children_pending):
                 return
@@ -5410,7 +5435,10 @@ class Browser:
             f'preview_req={self._preview_req!r}, '
             f'preview_paused={self._preview_paused!r}, '
             f'in_flight={list(self._children_in_flight)}, '
-            f'children_pending={list(self._state._children_pending)})'
+            f'children_pending={list(self._state._children_pending)}, '
+            f'children_prefetch_req={self._children_prefetch_req!r}, '
+            f'children_prefetch_local_id='
+            f'{self._children_prefetch_local_id!r})'
         )
 
     # ---- internal: refresh dispatch (main thread) -----------------------
@@ -5655,113 +5683,224 @@ class Browser:
     # ---- workers --------------------------------------------------------
 
     def _children_worker(self):
-        """FIFO worker thread: drain ``_children_queue`` one id at a time.
+        """Children worker thread: two-pass slot-first loop (#481).
 
-        Per ticket #271, delivery now goes through ``update_data`` rather
-        than the legacy ``_children_results`` deque. Per ticket #272, a
-        generator return is iterated and each yield is delivered as its
-        own ``update_data`` batch. The worker calls the user's
-        ``get_children``, coerces the return via ``to_item``, and posts:
+        Each outer iteration runs two passes:
 
-        * ``None`` return → no batch is posted; ``_loading`` stays True
-          (the recipe will push from elsewhere). Pendings still resolve
-          via ``_post_children_delivery`` so ``refresh().then()`` chains
-          fire after the worker call returned.
-        * generator return → each yielded chunk becomes its own
-          ``update_data`` batch (no trailing ``complete`` per chunk).
-          A ``list`` yield is treated as a batch of items; anything
-          else (``Item``, ``tuple``, ``dict``, ``str``) is treated as a
-          single item, coerced via ``to_item``. On clean exhaustion
-          (``StopIteration``) the worker emits a final
-          ``[complete(parent_id)]`` batch to clear loading. On a
-          mid-stream exception the partial deliveries stay in place,
-          ``_loading`` is NOT cleared (per the streaming-push spec:
-          "loading stays unless caller cleared explicitly"), and the
-          error is surfaced via ``self.error(...)``.
-        * iterable (incl. ``[]``) return → batch is
-          ``[upsert(it.id, parent_id, **fields_of(it)) for it in items]``
-          followed by a trailing ``complete(parent_id)`` op (atomic with
-          the data: the trailing ``complete`` clears
-          ``_loading[parent_id]`` in the same drain). For ``[]``, the
-          batch is just ``[complete(parent_id)]``.
+        Pass 1: drain the cursor-prefetch slot ``_children_prefetch_req``
+        until quiescent. A new slot value (``!= _children_prefetch_local_id``)
+        is handled in one of three ways:
 
-        The Pending registry (``_children_in_flight``) is resolved on
-        the main thread by ``_post_children_delivery``, posted *after*
-        the ``update_data`` callable so ``apply_ops`` has run by the
-        time chains fire — a ``then`` callback observes the post-batch
-        cache state. For generators the housekeeping is scheduled when
-        the generator EXHAUSTS (or raises); mid-stream batches do NOT
-        fire the pending chain.
+          * ``slot_id not in state._children_pending`` — fresh work.
+            Add ``slot_id`` to ``_children_pending`` and call
+            ``_fetch_and_deliver_children(slot_id, reload=False)``.
+            The helper short-circuits on a cache hit.
+          * ``slot_id in state._children_pending`` AND a matching FIFO
+            entry exists — promote: ``remove`` the entry from the
+            queue, copy its ``reload`` flag, and fetch via the helper
+            so the cursor's work carries any explicit refresh intent
+            instead of silently downgrading to ``reload=False``.
+          * ``slot_id in state._children_pending`` AND no FIFO entry —
+            in flight from a previous slot iteration's helper call.
+            ``continue``; ``local_id == slot_id`` short-circuits the
+            inner loop on the next read.
 
-        Errors caught at the boundary -- a misbehaving ``get_children``
-        must not crash the worker thread. On error during the initial
-        call or while coercing a non-generator iterable: ``error_text``
-        is updated, no batch is posted (an empty synthesised delivery
-        is sent so the placeholder clears), and the post-delivery
-        housekeeping still runs. On a generator mid-stream error the
-        items already yielded survive, ``_loading`` stays True, and
-        ``_post_children_delivery`` still runs to resolve Pendings.
+        ``local_id`` is updated whenever a new slot value is observed,
+        so a stable slot (cursor parked on the same id) doesn't spin.
+        Continuous cursor movement during the burst stays in this
+        inner loop — Pass 2 only runs once the slot settles. See the
+        "Continuous scroll" edge case in the design doc; this is
+        deferred-not-lost behavior for FIFO entries during sustained
+        scrolling.
+
+        Pass 2: drain ONE entry from ``_children_queue`` (the FIFO used by
+        ``_dispatch_children``, ``_do_initial_fetch``, recipe-driven
+        ``refresh()``/``expand()``). One per outer iteration so a busy
+        slot keeps preempting; FIFO drains as soon as the cursor settles.
+
+        Sleep when both are quiet, with the standard clear-then-check-
+        then-wait pattern so a wake that arrives between checks isn't
+        lost. On wake from ``.wait()``, reset ``_children_prefetch_local_id``
+        to ``None`` so a re-request of the same id (cache invalidated in
+        place) refetches.
+
+        Delivery routes (per ticket #271/#272), error handling, and
+        Pending resolution all live in ``_fetch_and_deliver_children``
+        — both passes share the same delivery code.
         """
         while not self._stop:
-            self._children_event.wait()
-            self._children_event.clear()
-            while self._children_queue and not self._stop:
+            did_work = False
+
+            # Pass 1: drain the cursor-prefetch slot until quiescent.
+            # Cache short-circuit lives in ``_fetch_and_deliver_children``
+            # (#481 Stage 10) — Pass 1 doesn't gate cache itself.
+            while not self._stop:
+                slot_id = self._children_prefetch_req
+                if (slot_id is None
+                        or slot_id == self._children_prefetch_local_id):
+                    break
+                self._children_prefetch_local_id = slot_id
+                # When the id is already in pending, an explicit FIFO
+                # entry probably carries the work — take it (with its
+                # ``reload`` flag) so the cursor's fetch carries any
+                # refresh intent rather than silently downgrading to
+                # ``reload=False``. If pending but NOT in FIFO, the
+                # work is already in flight from a previous slot
+                # iteration's helper call; ``local_id == slot_id``
+                # will short-circuit on the next read.
+                reload_ = False
+                if slot_id in self._state._children_pending:
+                    # ``list(queue)`` snapshots atomically under the
+                    # GIL — main thread (sole appender) cannot mutate
+                    # mid-snapshot, so no ``deque mutated during
+                    # iteration`` risk. ``queue.remove(target)`` is
+                    # itself a single atomic call; main's only FIFO
+                    # mutation is ``.append()`` at the right end,
+                    # which never shifts ``target``'s position.
+                    target = None
+                    for q_entry in list(self._children_queue):
+                        if q_entry[0] == slot_id:
+                            target = q_entry
+                            break
+                    if target is not None:
+                        try:
+                            self._children_queue.remove(target)
+                            reload_ = target[1]
+                        except ValueError:
+                            target = None
+                    if target is None:
+                        # Pending but no FIFO entry — in-flight elsewhere.
+                        continue
+                else:
+                    # Fresh: commit to the fetch by marking pending so
+                    # a concurrent ``_dispatch_children`` for the same
+                    # id short-circuits.
+                    self._state._children_pending.add(slot_id)
+                self._fetch_and_deliver_children(slot_id, reload_)
+                did_work = True
+
+            # Pass 2: drain ONE FIFO entry (if any). Pass 1's
+            # promotion ``remove`` and this ``popleft`` are both on
+            # the worker thread (sequential within an iteration —
+            # never concurrent). Main thread is the only other
+            # writer and only ``.append()``s at the right end,
+            # which is atomic and doesn't shift the front.
+            if self._children_queue and not self._stop:
                 id_, reload_ = self._children_queue.popleft()
+                self._fetch_and_deliver_children(id_, reload_)
+                did_work = True
+
+            if did_work:
+                continue
+
+            # No work this iteration — sleep with the clear-then-check
+            # -then-wait pattern. Re-check slot + queue *after* clearing
+            # the event so a producer that fires between the prior read
+            # and the clear can't be lost.
+            self._children_event.clear()
+            slot_id = self._children_prefetch_req
+            slot_quiet = (slot_id is None
+                          or slot_id == self._children_prefetch_local_id)
+            if (slot_quiet
+                    and not self._children_queue
+                    and not self._stop):
+                self._children_event.wait()
+                # On wake, reset local_id so a re-request of the same id
+                # (e.g. cache cleared in place + main thread set event)
+                # is treated as fresh work on the next iteration.
+                self._children_prefetch_local_id = None
+
+    def _fetch_and_deliver_children(self, id_, reload_):
+        """Call ``get_children`` for ``id_`` and route the result.
+
+        Three outcomes per ticket #271/#272:
+        * generator → ``_stream_children_from_generator`` drains it (one
+          ``update_data`` batch per yield, plus a trailing ``complete``).
+        * iterable (incl. ``[]``) → coerce via ``to_item``, build a batch
+          via ``_build_children_batch``, post ``update_data`` plus
+          ``_post_children_delivery``.
+        * ``None`` → no batch posted; ``_loading`` stays True. Still post
+          ``_post_children_delivery`` so Pendings resolve and the
+          ``_children_pending`` dispatch tracker clears.
+
+        Cache-hit shortcut: when ``reload_=False`` and ``id_`` is already
+        in ``state._children``, skip the ``get_children`` call entirely
+        and post only the housekeeping. Defends against races where the
+        cache populated between FIFO enqueue and worker pop (e.g. another
+        path delivered, or the slot worker just won the race for the
+        same id). Pendings registered against ``id_`` still resolve via
+        ``_post_children_delivery``.
+
+        Errors at the boundary surface via ``self._error_text`` and a
+        synthesised empty delivery so the placeholder row clears.
+
+        Worker-thread only — main-thread mutations are routed through
+        the post queue (``update_data`` / ``self.post(...)``). Calls
+        ``notify_wake()`` after dispatch so the renderer flips to the
+        new state on the next loop iteration.
+        """
+        if not reload_ and id_ in self._state._children:
+            # Cache hit: no fetch needed, but the housekeeping still has
+            # to run so ``refresh().then()`` chains resolve and
+            # ``_children_pending`` clears.
+            self.post(lambda pid=id_: self._post_children_delivery(pid))
+            notify_wake()
+            return
+        items = None
+        gen = None
+        error = False
+        try:
+            raw = self.get_children(id_, reload=reload_)
+        except Exception as e:
+            error = True
+            # Cross-thread write to a Python str attribute is
+            # safe under the GIL; the renderer reads it later
+            # on the main thread.
+            self._error_text = (
+                f'get_children({id_!r}): {type(e).__name__}: {e}'
+            )
+        else:
+            if raw is None:
                 items = None
-                gen = None
-                error = False
+            elif inspect.isgenerator(raw):
+                # Generator branch: stream yields as separate
+                # ``update_data`` batches. Materialise here only
+                # to mark ``items`` so the post-loop dispatch
+                # below routes to the streaming path.
+                gen = raw
+            else:
                 try:
-                    raw = self.get_children(id_, reload=reload_)
+                    items = [to_item(x) for x in raw]
                 except Exception as e:
                     error = True
-                    # Cross-thread write to a Python str attribute is
-                    # safe under the GIL; the renderer reads it later
-                    # on the main thread.
                     self._error_text = (
-                        f'get_children({id_!r}): {type(e).__name__}: {e}'
+                        f'get_children({id_!r}): '
+                        f'{type(e).__name__}: {e}'
                     )
-                else:
-                    if raw is None:
-                        items = None
-                    elif inspect.isgenerator(raw):
-                        # Generator branch: stream yields as separate
-                        # ``update_data`` batches. Materialise here only
-                        # to mark ``items`` so the post-loop dispatch
-                        # below routes to the streaming path.
-                        gen = raw
-                    else:
-                        try:
-                            items = [to_item(x) for x in raw]
-                        except Exception as e:
-                            error = True
-                            self._error_text = (
-                                f'get_children({id_!r}): '
-                                f'{type(e).__name__}: {e}'
-                            )
 
-                if error:
-                    # Synthesise an empty delivery so the placeholder
-                    # row clears and ``_loading`` flips to False; the
-                    # error is surfaced via ``_error_text``.
-                    items = []
+        if error:
+            # Synthesise an empty delivery so the placeholder
+            # row clears and ``_loading`` flips to False; the
+            # error is surfaced via ``_error_text``.
+            items = []
 
-                if gen is not None:
-                    self._stream_children_from_generator(id_, gen)
-                elif items is None:
-                    # ``None`` return: no batch posted, ``_loading``
-                    # stays True. Still post the housekeeping so
-                    # Pendings resolve and the ``_children_pending``
-                    # dispatch tracker clears for this parent.
-                    self.post(lambda pid=id_: self._post_children_delivery(pid))
-                else:
-                    batch = _build_children_batch(id_, items)
-                    self.update_data(batch)
-                    # Schedule housekeeping AFTER ``update_data``'s post
-                    # so ``apply_ops`` has run by the time Pendings fire
-                    # — chained ``.then`` callbacks observe the post-
-                    # batch state (queue.Queue is FIFO).
-                    self.post(lambda pid=id_: self._post_children_delivery(pid))
-                notify_wake()
+        if gen is not None:
+            self._stream_children_from_generator(id_, gen)
+        elif items is None:
+            # ``None`` return: no batch posted, ``_loading``
+            # stays True. Still post the housekeeping so
+            # Pendings resolve and the ``_children_pending``
+            # dispatch tracker clears for this parent.
+            self.post(lambda pid=id_: self._post_children_delivery(pid))
+        else:
+            batch = _build_children_batch(id_, items)
+            self.update_data(batch)
+            # Schedule housekeeping AFTER ``update_data``'s post
+            # so ``apply_ops`` has run by the time Pendings fire
+            # — chained ``.then`` callbacks observe the post-
+            # batch state (queue.Queue is FIFO).
+            self.post(lambda pid=id_: self._post_children_delivery(pid))
+        notify_wake()
 
     def _stream_children_from_generator(self, parent_id, gen):
         """Drain a ``get_children`` generator, posting one batch per yield.
@@ -7170,20 +7309,35 @@ class Browser:
         self._update_children_for_cursor()
 
     def _update_children_for_cursor(self) -> None:
-        """Kick a children fetch for the cursor item if it's an unfetched branch.
+        """Request a children prefetch for the cursor item (#481).
 
-        The children-grid pane (ticket #19) wants the cursor item's
-        direct children even when the cursor row itself isn't expanded
-        in the list pane. Plan-tui drives this with a separate
-        ``plan_children(tid)`` round-trip; browse-tui has only one
-        children worker, so we re-use it: enqueue the cursor id without
-        touching ``state.expanded`` (so the visible-tree builder doesn't
-        descend into it). The cache fills, the grid renders, and the
-        list pane stays unchanged.
+        Writes the cursor's id into the latest-wins slot
+        ``_children_prefetch_req``; the children worker reads in Pass 1
+        of its loop and decides whether to fetch. Rapid cursor movement
+        coalesces — only the latest cursor stop's id remains in the
+        slot, intermediate positions are superseded.
 
-        No-op when the children-grid pane is disabled, when the cursor
-        is on a non-normal entry, when the cursor item has no children,
-        or when its children are already cached / in flight.
+        The slot always reflects the cursor's intent regardless of
+        whether the id is also queued in the FIFO: the worker owns
+        the FIFO-promotion path (Pass 1 scans + removes a matching
+        FIFO entry and copies its ``reload`` flag). Keeping promotion
+        in the worker avoids a main-thread/worker race on multi-step
+        deque mutations and concentrates the lookup-and-fetch decision
+        in one place.
+
+        Early-returns:
+          * pane disabled,
+          * cursor not on a normal item,
+          * cursor item not expandable (``has_children=False``),
+          * already cached (``state._children[id]`` present).
+
+        Idempotent re-fire: when the slot already holds the cursor's
+        id, wake the worker and reset ``_children_prefetch_local_id``
+        so a re-request after the worker parked refetches. Mirrors
+        the preview "stuck blank" re-fire pattern at
+        ``_update_preview_for_cursor`` — a cache-clear-in-place
+        (e.g. ``clear_children`` while the cursor stays put) doesn't
+        leave the children pane blank until the user navigates away.
         """
         if not self.show_children_pane:
             return
@@ -7197,14 +7351,18 @@ class Browser:
         item = entry.item
         if not item.has_children:
             return
-        if item.id in state._children:
+        new_id = item.id
+        if new_id in state._children:
             return  # already cached
-        if item.id in state._children_pending:
-            return  # already in flight
-        state._children_pending.add(item.id)
-        # Keep ``_loading`` in lockstep with dispatch (see ``_do_refresh``).
-        state._loading[item.id] = True
-        self._children_queue.append((item.id, False))
+        if self._children_prefetch_req == new_id:
+            # Slot already has this id — re-fire the wake so the worker
+            # re-evaluates (cache may have been cleared in place while
+            # the cursor stayed put). Reset local_id so the next loop
+            # iteration treats it as fresh work.
+            self._children_prefetch_local_id = None
+            self._children_event.set()
+            return
+        self._children_prefetch_req = new_id
         self._children_event.set()
 
     # ---- eager adapter -------------------------------------------------

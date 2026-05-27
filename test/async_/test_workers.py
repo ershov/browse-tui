@@ -1,10 +1,16 @@
 """Worker-thread tests: lifecycle, FIFO order, latest-wins, error handling.
 
-The children worker is a strict FIFO queue: any ids submitted via
-``refresh()`` get fetched in submission order. The preview worker
-serves the latest ``_preview_req`` with single-flight semantics --
-at most one ``get_preview`` runs at a time -- and delivers results
-through the FIFO post queue (#442). A re-request of the same id
+The children worker runs a two-pass loop (#481). Pass 1 drains the
+cursor-prefetch slot ``_children_prefetch_req`` with latest-wins
+single-flight semantics, promoting a matching FIFO entry (and copying
+its ``reload`` flag) when the cursor lands on an id that's already
+queued. Pass 2 drains one entry from the FIFO ``_children_queue`` used
+by ``refresh()`` / ``expand()`` / initial fetch — explicit ops still
+land in submission order, the cursor's pane just preempts them.
+
+The preview worker serves the latest ``_preview_req`` with single-flight
+semantics — at most one ``get_preview`` runs at a time — and delivers
+results through the FIFO post queue (#442). A re-request of the same id
 while a fetch is in flight is dropped (the worker dedups by
 ``local_id``).
 
@@ -649,6 +655,381 @@ class TestHeadlessAndIdle(unittest.TestCase):
             # on the first iteration.
             self.assertLess(elapsed, 0.1)
         finally:
+            b.stop_workers()
+
+
+# --- #481: children prefetch slot (latest-wins single-flight for cursor) ---
+
+
+class TestChildrenPrefetchSlot(unittest.TestCase):
+    """Cursor-driven children prefetch via single slot, mirroring #442.
+
+    The children worker reads ``_children_prefetch_req`` in Pass 1 of its
+    loop and fetches the latest value (skipping cache + pending hits).
+    Pass 2 drains one FIFO entry. Sleep when both quiet. See
+    docs/superpowers/specs/2026-05-27-children-prefetch-slot-design.md.
+    """
+
+    def test_slot_write_triggers_fetch(self):
+        # Direct slot write should drive a get_children call.
+        calls = []
+        def get_children(id_, *, reload=False):
+            calls.append(id_)
+            return [{'id': f'{id_}/x'}]
+        b = make_browser(get_children=get_children)
+        try:
+            b._state._items_by_id['A'] = Item(id='A', has_children=True)
+            b._children_prefetch_req = 'A'
+            b._children_event.set()
+            b.run_until_idle()
+            self.assertEqual(calls, ['A'])
+            self.assertIn('A', b._state._children)
+            # local_id memo follows the slot.
+            self.assertEqual(b._children_prefetch_local_id, 'A')
+        finally:
+            b.stop_workers()
+
+    def test_cache_invalidation_re_kicks_slot(self):
+        # Cursor parked on X, X gets fetched, then cache is cleared
+        # in place (e.g. clear_children op while cursor stays put).
+        # The next _update_children_for_cursor call should re-fire so
+        # the worker re-fetches — mirrors preview's "stuck blank" fix.
+        calls = []
+        def get_children(id_, *, reload=False):
+            if id_ is None:
+                return [{'id': 'A', 'has_children': True}]
+            calls.append(id_)
+            return [{'id': f'{id_}/c'}]
+        b = make_browser(get_children=get_children, show_children_pane=True)
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b._state.cursor = 0
+            b._update_children_for_cursor()
+            b.run_until_idle()
+            self.assertEqual(calls, ['A'])
+            # Clear A's cache in place; cursor stays on A.
+            b.update_data([('clear_children', 'A')])
+            b.run_until_idle()
+            # Re-fire by calling the cursor helper again — slot still
+            # has 'A'. The worker must refetch.
+            b._update_children_for_cursor()
+            b.run_until_idle()
+            self.assertEqual(calls, ['A', 'A'])
+        finally:
+            b.stop_workers()
+
+    def test_rapid_cursor_moves_coalesce_children_prefetch(self):
+        # 20 cursor moves with a slow get_children. The cursor-prefetch
+        # slot is latest-wins, so most positions are superseded before
+        # the worker reaches them. Concurrency never exceeds 1.
+        lock = threading.Lock()
+        state = {'in_flight': 0, 'max_in_flight': 0, 'total': 0}
+
+        def get_children(id_, *, reload=False):
+            if id_ is None:
+                # Root listing: 20 expandable items.
+                return [{'id': f'p{i:02d}', 'has_children': True}
+                        for i in range(20)]
+            with lock:
+                state['in_flight'] += 1
+                state['max_in_flight'] = max(
+                    state['max_in_flight'], state['in_flight'],
+                )
+                state['total'] += 1
+            time.sleep(0.01)
+            with lock:
+                state['in_flight'] -= 1
+            return [{'id': f'{id_}/x'}]
+
+        b = make_browser(get_children=get_children, show_children_pane=True)
+        try:
+            b.refresh()
+            b.run_until_idle()
+            # Drive 20 cursor moves through visible items 0..19.
+            for i in range(20):
+                b._state.cursor = i
+                b._update_children_for_cursor()
+            b.run_until_idle()
+            self.assertEqual(
+                state['max_in_flight'], 1,
+                'single-flight violated: '
+                f'{state["max_in_flight"]} concurrent get_children calls',
+            )
+            self.assertLess(
+                state['total'], 20,
+                f'expected coalesce; got {state["total"]} fetches',
+            )
+            # Last cursor's id MUST be in cache.
+            self.assertIn('p19', b._state._children)
+        finally:
+            b.stop_workers()
+
+    def test_single_flight_invariant_mixed_slot_and_fifo(self):
+        # Mixed: cursor moves AND explicit b.refresh() calls. Max
+        # in-flight across both paths must stay at 1.
+        lock = threading.Lock()
+        state = {'in_flight': 0, 'max_in_flight': 0}
+
+        def get_children(id_, *, reload=False):
+            if id_ is None:
+                return [{'id': f'q{i:02d}', 'has_children': True}
+                        for i in range(10)]
+            with lock:
+                state['in_flight'] += 1
+                state['max_in_flight'] = max(
+                    state['max_in_flight'], state['in_flight'],
+                )
+            time.sleep(0.005)
+            with lock:
+                state['in_flight'] -= 1
+            return [{'id': f'{id_}/c'}]
+
+        b = make_browser(get_children=get_children, show_children_pane=True)
+        try:
+            b.refresh()
+            b.run_until_idle()
+            # Interleave cursor moves and explicit refreshes.
+            for i in range(10):
+                b._state.cursor = i
+                b._update_children_for_cursor()
+                # Refresh some other id to fill FIFO concurrently.
+                b.refresh(f'q{(i + 5) % 10:02d}')
+            b.run_until_idle()
+            self.assertEqual(
+                state['max_in_flight'], 1,
+                'single-flight violated: '
+                f'{state["max_in_flight"]} concurrent get_children calls',
+            )
+        finally:
+            b.stop_workers()
+
+    def test_slot_first_priority_during_continuous_cursor_movement(self):
+        # FIFO is pre-loaded with several refreshes; meanwhile rapid
+        # cursor moves write the slot. Slot-first priority means at
+        # least one cursor-row delivery lands before every FIFO entry
+        # has finished.
+        delivery_order = []
+        lock = threading.Lock()
+
+        def get_children(id_, *, reload=False):
+            if id_ is None:
+                return [{'id': f'r{i:02d}', 'has_children': True}
+                        for i in range(20)]
+            # Slow enough that we can observe ordering.
+            time.sleep(0.02)
+            with lock:
+                delivery_order.append(id_)
+            return [{'id': f'{id_}/c'}]
+
+        b = make_browser(get_children=get_children, show_children_pane=True)
+        try:
+            b.refresh()
+            b.run_until_idle()
+            # Pre-fill FIFO with 5 explicit refreshes BEFORE any cursor
+            # move — these enter the FIFO queue, the worker is sleeping.
+            # We don't call run_until_idle here so the queue is hot.
+            for i in range(5):
+                b.refresh(f'r{i:02d}')
+            # Now drive a tight burst of cursor moves. The worker
+            # should preempt FIFO with the cursor's id.
+            for i in range(15, 20):
+                b._state.cursor = i
+                b._update_children_for_cursor()
+            b.run_until_idle()
+            # Find the index of the LAST cursor delivery (r19) and the
+            # last FIFO id (r04). Slot-first means r19 lands BEFORE
+            # every FIFO entry is done — i.e. there's at least one
+            # 'r1x' id in delivery_order before all the 'r0x' ids.
+            last_cursor_idx = delivery_order.index('r19')
+            last_fifo_idx = delivery_order.index('r04')
+            self.assertLess(
+                last_cursor_idx, last_fifo_idx,
+                'slot-first priority violated: cursor id r19 should land '
+                f'before the last FIFO id r04. Order: {delivery_order!r}',
+            )
+        finally:
+            b.stop_workers()
+
+    def test_fifo_drains_after_cursor_settles(self):
+        # Companion to slot-first-priority: once the cursor stops, the
+        # FIFO must drain — all pre-loaded ids end up cached.
+        def get_children(id_, *, reload=False):
+            if id_ is None:
+                return [{'id': f's{i:02d}', 'has_children': True}
+                        for i in range(10)]
+            return [{'id': f'{id_}/c'}]
+
+        b = make_browser(get_children=get_children, show_children_pane=True)
+        try:
+            b.refresh()
+            b.run_until_idle()
+            for i in range(5):
+                b.refresh(f's{i:02d}')
+            b._state.cursor = 7
+            b._update_children_for_cursor()
+            b.run_until_idle()
+            # Every FIFO id must be cached.
+            for i in range(5):
+                self.assertIn(
+                    f's{i:02d}', b._state._children,
+                    f's{i:02d} did not drain from FIFO',
+                )
+            # Cursor's id also cached.
+            self.assertIn('s07', b._state._children)
+        finally:
+            b.stop_workers()
+
+    def test_fifo_entry_skips_fetch_when_cached_and_no_reload(self):
+        # Symmetry with the slot path: a FIFO ``(id, False)`` entry
+        # whose cache has already populated (e.g. via set_children
+        # from another path, or a race after enqueue) should skip the
+        # get_children call. Pending and Pendings must still resolve.
+        calls = []
+        def get_children(id_, *, reload=False):
+            if id_ is None:
+                return [{'id': 'X', 'has_children': True}]
+            calls.append(id_)
+            return [{'id': f'{id_}/c'}]
+
+        b = make_browser(get_children=get_children, show_children_pane=True)
+        try:
+            b.refresh()
+            b.run_until_idle()
+            self.assertEqual(calls, [])  # root only — no per-id call yet
+            # Pre-populate cache for X directly.
+            b._state._children['X'] = [Item(id='X/c', has_children=False)]
+            # Now enqueue (X, False) the way _dispatch_children would.
+            b._state._children_pending.add('X')
+            b._children_queue.append(('X', False))
+            b._children_event.set()
+            b.run_until_idle()
+            self.assertEqual(
+                calls, [],
+                'get_children should NOT fire for cached id with '
+                f'reload=False; got {calls!r}',
+            )
+            # Pending must drain so refresh().then() chains / idle
+            # detection work.
+            self.assertNotIn('X', b._state._children_pending)
+        finally:
+            b.stop_workers()
+
+    def test_fifo_entry_with_reload_true_still_fetches_when_cached(self):
+        # Sibling: same cached state, but reload=True means "refresh,
+        # ignore cache". The worker must still call get_children.
+        calls = []
+        def get_children(id_, *, reload=False):
+            if id_ is None:
+                return [{'id': 'X', 'has_children': True}]
+            calls.append((id_, reload))
+            return [{'id': f'{id_}/c-fresh'}]
+
+        b = make_browser(get_children=get_children, show_children_pane=True)
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b._state._children['X'] = [Item(id='X/c-stale', has_children=False)]
+            b._state._children_pending.add('X')
+            b._children_queue.append(('X', True))
+            b._children_event.set()
+            b.run_until_idle()
+            self.assertEqual(
+                calls, [('X', True)],
+                'reload=True must force fetch even when cached; '
+                f'got {calls!r}',
+            )
+        finally:
+            b.stop_workers()
+
+    def test_cursor_promotes_same_id_fifo_entry_to_front(self):
+        # FIFO is pre-filled with three explicit refreshes [A, B, X].
+        # While A is mid-fetch (gated), the cursor lands on X. The
+        # cursor's id should be promoted to FIFO front so X delivers
+        # BEFORE B — without promotion X would deliver last.
+        gate = threading.Event()
+        delivery_order = []
+
+        def get_children(id_, *, reload=False):
+            if id_ is None:
+                return [{'id': 'A', 'has_children': True},
+                        {'id': 'B', 'has_children': True},
+                        {'id': 'X', 'has_children': True}]
+            if id_ == 'A':
+                gate.wait(timeout=2.0)
+            delivery_order.append(id_)
+            return [{'id': f'{id_}/c'}]
+
+        b = make_browser(get_children=get_children, show_children_pane=True)
+        try:
+            b.refresh()
+            b.run_until_idle()
+            # Refresh A and dispatch the post-queue closure so the
+            # worker enqueues A and enters the gate.
+            b.refresh('A')
+            b.drain_main_queue()
+            time.sleep(0.05)  # let worker pop A and reach gate.wait
+            # Queue up B and X after A is in flight. Both pending.
+            b.refresh('B')
+            b.refresh('X')
+            b.drain_main_queue()
+            # Cursor lands on X (visible-list index 2). Writes slot=X.
+            # When A's gate releases, the worker's Pass 1 sees X in
+            # pending, scans FIFO=[B, X], pulls X (with its reload),
+            # and fetches X via the slot path before Pass 2 pops B.
+            b._state.cursor = 2
+            b._update_children_for_cursor()
+            gate.set()
+            b.run_until_idle()
+            self.assertEqual(
+                delivery_order[0], 'A',
+                f'A should have delivered first (was mid-fetch); '
+                f'order: {delivery_order!r}',
+            )
+            self.assertLess(
+                delivery_order.index('X'), delivery_order.index('B'),
+                f'X should land before B after promotion; '
+                f'order: {delivery_order!r}',
+            )
+        finally:
+            gate.set()
+            b.stop_workers()
+
+    def test_concurrent_explicit_refresh_and_slot_no_duplicate_fetch(self):
+        # Slot has X, then explicit refresh('X') is called. Only one
+        # get_children(X) should run — either via slot or via FIFO, not
+        # both. ``_children_pending`` is the gate.
+        gate = threading.Event()
+        calls = []
+
+        def get_children(id_, *, reload=False):
+            if id_ is None:
+                return [{'id': 'X', 'has_children': True}]
+            calls.append(id_)
+            gate.wait(timeout=1.0)
+            return [{'id': f'{id_}/c'}]
+
+        b = make_browser(get_children=get_children, show_children_pane=True)
+        try:
+            b.refresh()
+            b.run_until_idle()
+            # Park cursor on X; worker starts fetching X via slot. The
+            # gate blocks so we can race the explicit refresh in.
+            b._state.cursor = 0
+            b._update_children_for_cursor()
+            time.sleep(0.02)  # let worker take the slot
+            # Explicit refresh — should be deduped via _children_pending.
+            p = b.refresh('X')
+            gate.set()
+            b.run_until_idle()
+            self.assertEqual(
+                calls, ['X'],
+                f'expected single fetch; got {calls!r}',
+            )
+            # Pending resolves after the (single) delivery.
+            self.assertTrue(p.done)
+        finally:
+            gate.set()
             b.stop_workers()
 
 

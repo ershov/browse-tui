@@ -223,20 +223,25 @@ class TestDispatchSetsLoading(unittest.TestCase):
         b._do_expand('x', p)
         self.assertFalse(b._state._loading['x'])
 
-    def test_update_children_for_cursor_sets_loading(self):
+    def test_update_children_for_cursor_writes_prefetch_slot(self):
+        # Post-#481: cursor-driven children fetch goes through the
+        # latest-wins prefetch slot rather than the FIFO. The slot
+        # write happens here; the worker later picks it up and (when
+        # it commits to fetching) adds the id to ``_children_pending``.
         b = Browser(BrowserConfig(show_children_pane=True, _headless=True))
-        # Seed: cursor on a row with children, but children not yet cached.
         item = Item(id='parent', has_children=True)
         b._state._children[None] = [item]
         b._state._items_by_id['parent'] = item
         b._state._parent_of_id['parent'] = None
         b._state._visible_dirty = True
-        # Visible cache rebuild moves cursor=0 onto our parent row.
         _ = _state.visible_items(b._state)
         b._state.cursor = 0
         b._update_children_for_cursor()
-        self.assertTrue(b._state._loading['parent'])
-        self.assertIn('parent', b._state._children_pending)
+        self.assertEqual(b._children_prefetch_req, 'parent')
+        # ``_loading`` and ``_children_pending`` are no longer set at
+        # slot-write time — the worker owns them when it commits.
+        self.assertNotIn('parent', b._state._loading)
+        self.assertNotIn('parent', b._state._children_pending)
 
 
 class TestFromFlatTreeIndexes(unittest.TestCase):

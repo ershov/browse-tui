@@ -269,16 +269,23 @@ class TestUpdateChildrenForCursor(unittest.TestCase):
         )
 
     def test_kicks_fetch_for_uncached_branch(self):
+        # Post-#481: writes the cursor id into the latest-wins prefetch
+        # slot instead of appending to the children FIFO.
         rows = [
             Item(id='a', title='alpha', has_children=True),
             Item(id='b', title='beta'),
         ]
         b = self._make_browser(rows=rows)
-        # Cursor at index 0 -> 'a' (a branch with uncached children).
         b._state.cursor = 0
         b._update_children_for_cursor()
-        self.assertIn('a', b._state._children_pending)
-        self.assertEqual(list(b._children_queue), [('a', False)])
+        self.assertEqual(b._children_prefetch_req, 'a')
+        # FIFO untouched — prefetch lives in the slot.
+        self.assertEqual(list(b._children_queue), [])
+        # ``_children_pending`` is owned by FIFO enqueuers (no longer
+        # set by ``_update_children_for_cursor``); the worker adds the
+        # slot id to ``_children_pending`` only when it commits to a
+        # fetch.
+        self.assertNotIn('a', b._state._children_pending)
 
     def test_no_op_for_leaf(self):
         rows = [Item(id='x', title='leaf')]  # has_children=False
@@ -287,6 +294,7 @@ class TestUpdateChildrenForCursor(unittest.TestCase):
         b._update_children_for_cursor()
         self.assertNotIn('x', b._state._children_pending)
         self.assertEqual(list(b._children_queue), [])
+        self.assertIsNone(b._children_prefetch_req)
 
     def test_no_op_for_already_cached_branch(self):
         rows = [Item(id='a', title='alpha', has_children=True)]
@@ -297,6 +305,7 @@ class TestUpdateChildrenForCursor(unittest.TestCase):
         b._update_children_for_cursor()
         self.assertNotIn('a', b._state._children_pending)
         self.assertEqual(list(b._children_queue), [])
+        self.assertIsNone(b._children_prefetch_req)
 
     def test_no_op_when_pane_disabled(self):
         rows = [Item(id='a', title='alpha', has_children=True)]
@@ -304,15 +313,23 @@ class TestUpdateChildrenForCursor(unittest.TestCase):
         b._state.cursor = 0
         b._update_children_for_cursor()
         self.assertNotIn('a', b._state._children_pending)
+        self.assertIsNone(b._children_prefetch_req)
 
-    def test_no_op_when_already_in_flight(self):
+    def test_writes_slot_when_already_in_flight(self):
+        # Post-#481 Stage 11: the slot is written even when the id is
+        # already pending — the worker handles the promotion/dedup
+        # decision in Pass 1 (scans FIFO, takes the entry with its
+        # reload flag; if pending but not in FIFO, no-ops). The helper
+        # function itself doesn't enqueue to FIFO. The user-visible
+        # invariant (no double fetch) still holds, and the slot
+        # mirrors the cursor's intent.
         rows = [Item(id='a', title='alpha', has_children=True)]
         b = self._make_browser(rows=rows)
-        # Mark already pending; helper must not double-enqueue.
         b._state._children_pending.add('a')
         b._state.cursor = 0
         b._update_children_for_cursor()
         self.assertEqual(list(b._children_queue), [])
+        self.assertEqual(b._children_prefetch_req, 'a')
 
     def test_no_op_for_non_normal_cursor(self):
         # Empty rows list -> no visible items -> helper returns silently.
@@ -320,6 +337,7 @@ class TestUpdateChildrenForCursor(unittest.TestCase):
         b._state.cursor = 0
         b._update_children_for_cursor()
         self.assertEqual(list(b._children_queue), [])
+        self.assertIsNone(b._children_prefetch_req)
 
 
 # ---------------------------------------------------------------------------

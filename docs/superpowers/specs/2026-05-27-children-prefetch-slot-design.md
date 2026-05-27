@@ -75,13 +75,11 @@ self._children_prefetch_local_id = None
 
 Wake signalling re-uses the existing `self._children_event` — no new event.
 
-### `_update_children_for_cursor` rewrite (`040-state.py:6031`)
+### `_update_children_for_cursor` rewrite (`040-state.py`)
 
-The cache and `_children_pending` gates move OUT of this function and INTO the
-worker. The slot always reflects the cursor's intent regardless of cache state;
-the worker decides whether a fetch is actually needed. This eliminates a class of
-races where the cache populating between gate-check and slot-write would orphan
-the wake.
+Main-thread side stays small. The slot always reflects the cursor's intent;
+the worker owns the decisions about cache hits and FIFO promotion (see Worker
+Pass 1 below).
 
 ```python
 def _update_children_for_cursor(self):
@@ -94,25 +92,29 @@ def _update_children_for_cursor(self):
         entry = vis[state.cursor]
         if entry.kind == 'normal' and entry.item.has_children:
             new_id = entry.item.id
-    if new_id == self._children_prefetch_req:
-        # Same cursor (idempotent). Re-fire if cache got cleared while
-        # the cursor sat here, so the worker re-fetches instead of
-        # staying parked on a stale ``local_id``. Mirrors the preview
-        # "stuck blank" re-fire at ``_update_preview_for_cursor``.
-        if (new_id is not None
-                and new_id not in state._children
-                and new_id not in state._children_pending):
-            self._children_prefetch_local_id = None
-            self._children_event.set()
+    if new_id is None:
+        return
+    if new_id in state._children:
+        return  # already cached
+    if self._children_prefetch_req == new_id:
+        # Same cursor — re-fire wake so a cache-clear-in-place
+        # (e.g. ``clear_children`` while the cursor stayed put)
+        # gets refetched. Mirrors the preview "stuck blank" pattern.
+        self._children_prefetch_local_id = None
+        self._children_event.set()
         return
     self._children_prefetch_req = new_id
     self._children_event.set()
 ```
 
-`new_id == None` is a valid slot value — it means "no cursor item wants
-children." The worker treats it as no-work.
+Notes:
+* `new_id == None` is a valid no-op state — the worker treats `None` as no-work.
+* The "already in pending" gate is intentionally absent: the worker's Pass 1
+  promotion path (below) inspects pending + FIFO and either pulls the FIFO
+  entry over (with its `reload` flag) or no-ops when the work is already in
+  flight from a previous slot iteration.
 
-### Worker loop restructure (`_children_worker` at `040-state.py:4516`)
+### Worker loop restructure (`_children_worker`)
 
 Today's structure drains the FIFO completely on each wake. The new structure runs
 two passes per outer iteration:
@@ -131,18 +133,45 @@ def _children_worker(self):
                     or slot_id == self._children_prefetch_local_id):
                 break
             self._children_prefetch_local_id = slot_id
-            if slot_id in self._state._children:
-                continue                          # already cached
+            # Promotion: when slot_id is pending, an explicit FIFO
+            # entry probably has the work — take it (with its reload
+            # flag) and fetch via the slot path. If pending but NOT
+            # in FIFO, the work is in flight from a previous slot
+            # iteration's helper call; no-op (local_id catches the
+            # loop on next read).
+            reload_ = False
             if slot_id in self._state._children_pending:
-                continue                          # FIFO owns this id
-            self._state._children_pending.add(slot_id)
-            self._fetch_and_deliver_children(slot_id, reload=False)
+                with self._children_queue_lock:
+                    target = None
+                    for q_entry in list(self._children_queue):
+                        if q_entry[0] == slot_id:
+                            target = q_entry
+                            break
+                    if target is not None:
+                        try:
+                            self._children_queue.remove(target)
+                            reload_ = target[1]
+                        except ValueError:
+                            target = None
+                if target is None:
+                    continue
+            else:
+                # Fresh: commit by marking pending so a concurrent
+                # ``_dispatch_children`` for the same id short-circuits.
+                self._state._children_pending.add(slot_id)
+            self._fetch_and_deliver_children(slot_id, reload_)
             did_work = True
 
-        # Pass 2: drain one FIFO entry.
-        if self._children_queue and not self._stop:
-            id_, reload_ = self._children_queue.popleft()
-            self._fetch_and_deliver_children(id_, reload=reload_)
+        # Pass 2: drain one FIFO entry under the lock so it doesn't
+        # race the Pass 1 promotion scan.
+        popped = None
+        if not self._stop:
+            with self._children_queue_lock:
+                if self._children_queue:
+                    popped = self._children_queue.popleft()
+        if popped is not None:
+            id_, reload_ = popped
+            self._fetch_and_deliver_children(id_, reload_)
             did_work = True
 
         if did_work:
@@ -162,31 +191,39 @@ def _children_worker(self):
             self._children_prefetch_local_id = None
 ```
 
-`_fetch_and_deliver_children(id_, reload=...)` is the extracted body of the
-existing FIFO loop: calls `get_children`, handles generator vs. iterable returns,
-catches exceptions, posts the `update_data` batch and `_post_children_delivery`.
-No behavior change there; the slot path passes `reload=False` (prefetch never
-reloads), the FIFO path passes the queued `reload_` value.
+`_fetch_and_deliver_children(id_, reload_)` is the extracted body of the existing
+FIFO loop: calls `get_children`, handles generator vs. iterable returns, catches
+exceptions, posts the `update_data` batch and `_post_children_delivery`. It also
+shorts on `not reload_ and id_ in state._children` (cache hit + no-reload),
+posting only the housekeeping. Both Pass 1 and Pass 2 route through this helper;
+the cache check lives there exclusively (Pass 1 does NOT pre-gate cache).
+
+A `threading.Lock` (`_children_queue_lock`) guards the multi-step FIFO ops:
+the Pass 1 promotion (scan + `remove`) and the Pass 2 `popleft`. Single-step
+`.append()` from other dispatch paths stays unlocked — CPython deque ops are
+GIL-atomic at the single-call level; only multi-call patterns need explicit
+serialisation against concurrent popleft.
 
 ### Dedup interplay
 
-Slot and FIFO share `_children_pending` as the "in-flight committed" gate. Three
-rules keep dedup correct:
+Slot and FIFO share `_children_pending` as the "in-flight committed" gate:
 
-1. **Slot processing adds to `_children_pending`** before fetching, exactly like
-   `_dispatch_children` does today for FIFO entries. Delivery via
-   `_post_children_delivery` discards.
-2. **Slot processing skips if `_children_pending` already has the id** — FIFO got
-   there first. The FIFO entry fetches; slot defers.
-3. **FIFO enqueuers (`_dispatch_children`, etc.) keep their existing
-   `_children_pending` check** — they skip if the slot worker has already marked
-   the id pending.
+1. **Fresh slot fetch** (id not in pending): worker adds to pending before
+   calling the helper. Any concurrent `_dispatch_children` for the same id
+   short-circuits via its existing pending check.
+2. **Promoted slot fetch** (id already in pending — FIFO has it): worker
+   removes the FIFO entry under `_children_queue_lock` and fetches with the
+   FIFO entry's `reload` flag. Pending stays set; the helper's delivery
+   discards.
+3. **In-flight elsewhere** (id in pending, no FIFO entry): worker's previous
+   slot iteration already kicked the helper and the delivery is mid-flight on
+   the post queue. No-op; `local_id == slot_id` short-circuits the loop on
+   the next read.
 
-The narrow race window — slot worker checks pending → sees empty → another thread
-adds → slot worker also adds — is benign: `set.add` is idempotent and the eventual
-delivery's `discard` is idempotent. The worst case is a duplicate `get_children`
-call, and the cache-hit check at the top of slot processing catches that on the
-second worker iteration.
+`_post_children_delivery` on the main thread is the single discard point;
+both Pass 1 and Pass 2 deliveries route through it. Pending objects registered
+in `_children_in_flight` resolve naturally regardless of which path drove the
+fetch.
 
 ### Lifecycle
 
