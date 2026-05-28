@@ -430,6 +430,19 @@ class TestToolUseResultDispatch(unittest.TestCase):
         self.assertIn('in-progress', out)
         self.assertIn('assignee', out)
 
+    def test_task_update_updated_fields_as_list(self):
+        # Newer CC builds emit ``updatedFields`` as a list of names
+        # rather than a {name: value} dict — render without crashing.
+        out = self.r._render_user(self._user_with_tur({
+            'taskId': '1', 'success': True,
+            'statusChange': {'from': 'pending', 'to': 'completed'},
+            'updatedFields': ['status'],
+        }))
+        self.assertIn('#1', out)
+        self.assertIn('pending', out)
+        self.assertIn('completed', out)
+        self.assertIn('status', out)
+
     def test_grep_content(self):
         out = self.r._render_user(self._user_with_tur({
             'filenames': ['a.py'], 'mode': 'content',

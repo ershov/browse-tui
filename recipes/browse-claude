@@ -1822,13 +1822,19 @@ def _fmt_tur_grep_or_search(tur):
 
 def _fmt_tur_task_update(tur):
     sc = tur.get('statusChange') or {}
-    fields = tur.get('updatedFields') or {}
+    fields = tur.get('updatedFields')
     head = f'{MUTE}task {RESET}{WHITE}#{tur.get("taskId", "?")}{RESET}'
     if sc:
         head += f'  {sc.get("from", "?")} → {GREEN if tur.get("success") else RED}{sc.get("to", "?")}{RESET}'
     out = [head]
-    for k, v in fields.items():
-        out.append(f'{MUTE}{k}:{RESET} {v}')
+    # ``updatedFields`` shape varies across CC versions: a dict
+    # ``{field: new_value}`` on older builds, a list ``[field_name, ...]``
+    # on newer ones. Render either without assuming one shape.
+    if isinstance(fields, dict):
+        for k, v in fields.items():
+            out.append(f'{MUTE}{k}:{RESET} {v}')
+    elif isinstance(fields, list) and fields:
+        out.append(f'{MUTE}updated:{RESET} {", ".join(str(f) for f in fields)}')
     if tur.get('verificationNudgeNeeded'):
         out.append(f'{YELLOW}verification needed{RESET}')
     return '\n'.join(out)
