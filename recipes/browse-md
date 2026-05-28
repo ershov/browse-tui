@@ -12,15 +12,36 @@ import os
 import re
 import sys
 
-from browse_tui import Browser, BrowserConfig, Item
+from browse_tui import Action, Browser, BrowserConfig, Item
+
+# Optional md2ansi plugin — gates the colored markdown preview mode.
+# Mirrors the gate pattern in browse-fs / browse-claude: import the
+# function, fall back to ``None`` if the module is missing or the
+# imported name isn't actually callable (defensive against monkey-
+# patched stubs in tests / odd vendored copies).
+try:
+    from md2ansi import md2ansi as _md2ansi_fn
+    if not callable(_md2ansi_fn):
+        _md2ansi_fn = None
+except Exception:
+    _md2ansi_fn = None
+
+# Default colored preview on when md2ansi is importable; the ``m``
+# action (bound only when ``_md2ansi_fn`` is not ``None``) flips it
+# at runtime. ``_BROWSER`` is set in ``main()`` after construction so
+# ``get_preview`` can look up the current ``preview_width`` for the
+# md2ansi word-wrap.
+_MD_COLOR = _md2ansi_fn is not None
+_BROWSER = None  # set in main() — used for preview-width lookup
 
 # Raw anchor string from the ``FILE.md#anchor`` positional — resolved
 # to an item id in a later ticket (see #521). Empty string when the
 # positional had no ``#``.
 _ANCHOR = ''
 
-# Whole-file slurp populated in main(). Preview returns this verbatim
-# until later tickets layer on per-node previews.
+# Whole-file slurp populated in main(). ``get_preview`` slices into
+# this for per-node previews (heading / list-item windows) and
+# returns the whole buffer for the root id.
 _FILE_TEXT = ''
 
 # Item index — ``id`` → ``Item``. Populated by ``_build_nodes`` from
@@ -557,13 +578,146 @@ def get_children(node_id, *, reload=False):
 
 
 def get_preview(node_id):
-    # Single-file recipe: every node previews the whole file body until
-    # per-node previews land in later tickets.
-    return _FILE_TEXT
+    """Return the preview slice for ``node_id``.
+
+    Three dispatch paths:
+
+    1. Root id (no ``#`` separator, or ``node_id`` matches the root
+       path exactly) → return the whole ``_FILE_TEXT`` body.
+    2. ``<path>#<n>`` id → parse the line number, resolve via
+       ``_BY_LINE`` (exact-line hit) or ``_node_at_line`` (fallback
+       for off-grid anchors). The resolved item's
+       ``[byte_offset : byte_offset + byte_size]`` window is the
+       slice.
+    3. Anything else (unresolvable id) → ``''``. Defensive: a stale
+       cursor id from a previous scope mustn't crash the preview.
+
+    When ``_MD_COLOR`` is on (and md2ansi is importable), the slice
+    runs through ``_md2ansi_fn(text, line_width=…)`` for ANSI-coloured
+    rendering. The call is wrapped in a broad ``except Exception`` so
+    pathological markdown can't crash the preview pane — we just fall
+    back to the raw slice.
+    """
+    # Root preview: id has no ``#`` (or the recipe explicitly handed
+    # us the root path). ``_FILE_TEXT`` is the whole-file slurp from
+    # ``main()``.
+    if '#' not in node_id:
+        text = _FILE_TEXT
+    else:
+        # ``<path>#<n>`` — parse the line number and resolve to a node.
+        # ``rpartition`` so paths that happen to contain ``#`` (rare)
+        # still split on the *last* one we appended in ``_build_nodes``.
+        _, _, line_str = node_id.rpartition('#')
+        try:
+            line_no = int(line_str)
+        except ValueError:
+            return ''
+        item = _BY_LINE.get(line_no)
+        if item is None:
+            item = _node_at_line(line_no)
+        if item is None:
+            return ''
+        bo = item.byte_offset
+        text = _FILE_TEXT[bo:bo + item.byte_size]
+
+    if _MD_COLOR and _md2ansi_fn is not None:
+        try:
+            width = (_BROWSER.preview_width if _BROWSER else 0) or 80
+            return _md2ansi_fn(text, line_width=width)
+        except Exception:
+            # Bad markdown / md2ansi blow-up → raw slice. Matches the
+            # browse-fs convention: the preview pane stays alive even
+            # if the renderer chokes.
+            pass
+    return text
+
+
+def _action_toggle_md(ctx):
+    """``m`` — flip ``_MD_COLOR`` between rendered and raw markdown.
+
+    Drops the preview cache so the next render runs through (or skips)
+    the md2ansi pipe immediately. Only bound when ``_md2ansi_fn`` is
+    importable; if md2ansi is missing the action isn't wired into
+    ``actions`` at all, so the keystroke falls through to the default
+    handler.
+    """
+    global _MD_COLOR
+    _MD_COLOR = not _MD_COLOR
+    ctx.drop_preview_cache()
+    ctx.message(f'md preview: {"colored" if _MD_COLOR else "raw"}')
+
+
+def _resolve_md_pager():
+    """Return the resolved markdown-pager command, or ``None``.
+
+    Order: ``$MD2ANSI`` (shell-split), then ``md2ansi | less -RS`` if
+    both binaries are on PATH, then bare ``md2ansi``. Recipes that
+    want a different fallback can set ``$MD2ANSI`` to anything —
+    including a piped chain like ``md2ansi | less -R``, which we
+    shell out via ``bash -c`` so the pipe works. Lifted verbatim from
+    browse-claude's same-named helper.
+    """
+    import shlex
+    import shutil
+    env_cmd = os.environ.get('MD2ANSI')
+    if env_cmd:
+        if '|' in env_cmd or '<' in env_cmd or '>' in env_cmd:
+            # User-supplied pipeline — hand to a shell so the pipe runs.
+            return ['bash', '-c', f'{env_cmd} "$0"']
+        return shlex.split(env_cmd)
+    if shutil.which('md2ansi') and shutil.which('less'):
+        return ['bash', '-c', 'md2ansi "$0" | less -RS']
+    if shutil.which('md2ansi'):
+        return ['md2ansi']
+    return None
+
+
+def _action_md_preview(ctx):
+    """``M`` — view the preview through a markdown-to-ANSI renderer.
+
+    Resolves the renderer via ``_resolve_md_pager``. Reads the cursor
+    row's preview (cached when available, else by calling
+    ``get_preview`` synchronously), writes it verbatim to a temp .md
+    file, and runs the renderer on it. The temp file is unlinked on
+    return regardless of how the external process exited.
+    """
+    import tempfile
+    cmd = _resolve_md_pager()
+    if cmd is None:
+        ctx.message('no markdown renderer found ($MD2ANSI / md2ansi)')
+        return
+
+    item = ctx.cursor
+    if item is None:
+        return
+    text = ctx.get_cached_preview(item.id)
+    if text is None:
+        try:
+            text = get_preview(item.id)
+        except Exception as e:
+            ctx.error(f'preview: {type(e).__name__}: {e}')
+            return
+    if text is None:
+        ctx.message('No preview available')
+        return
+
+    tmp = tempfile.NamedTemporaryFile(
+        'w', suffix='.md', delete=False,
+        encoding='utf-8', errors='surrogateescape',
+    )
+    try:
+        tmp.write(text)
+        tmp.close()
+        ctx.run_external(cmd + [tmp.name])
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
 
 
 def main():
-    global _ANCHOR, _FILE_TEXT, _BY_ID, _BY_LINE, _LINES_SORTED
+    global _ANCHOR, _FILE_TEXT, _BY_ID, _BY_LINE, _LINES_SORTED, _BROWSER
     if len(sys.argv) < 2:
         print(_USAGE, file=sys.stderr)
         sys.exit(2)
@@ -593,6 +747,16 @@ def main():
     # scope without threading the by-id dict through every call.
     _BY_LINE, _LINES_SORTED = _build_line_index(_BY_ID)
     initial_scope = _resolve_anchor(_ANCHOR, root.id)
+    # ``M`` is always available — it errors gracefully when no
+    # renderer is found, so users discover the env-var hook even on
+    # boxes without md2ansi installed. ``m`` only makes sense when
+    # md2ansi is importable; otherwise the toggle can't do anything
+    # useful (the preview is already raw).
+    actions = [Action('M', 'View preview via $MD2ANSI / md2ansi',
+                      _action_md_preview, 'cursor')]
+    if _md2ansi_fn is not None:
+        actions.insert(0, Action('m', 'Toggle markdown coloring',
+                                 _action_toggle_md, 'none'))
     b = Browser(BrowserConfig(
         title='browse-md',
         show_children_pane=False,
@@ -601,7 +765,12 @@ def main():
         get_children=get_children,
         get_preview=get_preview,
         initial_scope=initial_scope,
+        actions=actions,
     ))
+    # Stash the Browser on the module so ``get_preview`` can read
+    # ``preview_width`` for md2ansi word-wrap. Matches the pattern in
+    # browse-fs / browse-claude.
+    _BROWSER = b
     sys.exit(b.run())
 
 

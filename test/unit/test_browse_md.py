@@ -17,10 +17,13 @@ Coverage focuses on the helpers exported at module scope:
 * ``_node_at_line``                   (TestNodeAtLine)
 * ``_display_title``                  (TestDisplayTitle)
 * ``_resolve_anchor``                 (TestResolveAnchor)
+* ``get_preview``                     (TestGetPreview)
+* ``_action_toggle_md``               (TestToggleMd)
+* ``_resolve_md_pager``               (TestResolveMdPager)
 
 These are the work of tickets #519 (parser), #520 (list walker +
-tree linking + Item construction), and #521 (line lookup + anchor
-resolution).
+tree linking + Item construction), #521 (line lookup + anchor
+resolution), and #522 (preview pipeline + ``m`` / ``M`` toggles).
 """
 
 import importlib.util
@@ -852,6 +855,340 @@ class TestResolveAnchor(unittest.TestCase):
             result = self._resolve('bullet')
         self.assertEqual(result, self.root.id)
         self.assertIn('bullet', buf.getvalue())
+
+
+class TestGetPreview(unittest.TestCase):
+    """``get_preview`` — slice ``_FILE_TEXT`` per node, optionally md2ansi-render."""
+
+    # Fixture chosen so headings, list items, and root all resolve to
+    # different byte windows. Trailing newline so byte_size on the
+    # final node ends cleanly at len(text).
+    FIXTURE = (
+        '# H1\n'        # line 0, bytes 0..5
+        'preamble\n'    # line 1, bytes 5..14
+        '## H2\n'       # line 2, bytes 14..20
+        '- a\n'         # line 3, bytes 20..24
+        '- b\n'         # line 4, bytes 24..28
+        '# H1b\n'       # line 5, bytes 28..34
+    )
+
+    def setUp(self):
+        # Fresh module per test — globals (``_FILE_TEXT``, ``_BY_ID``,
+        # ``_BY_LINE``, ``_LINES_SORTED``, ``_MD_COLOR``,
+        # ``_md2ansi_fn``, ``_BROWSER``) mustn't bleed across tests.
+        self.r = _load_recipe()
+        self.path = '/tmp/preview.md'
+        line_starts = self.r._line_starts(self.FIXTURE)
+        events = self.r._parse(self.FIXTURE)
+        self.root, by_id = self.r._build_nodes(
+            events, self.FIXTURE, line_starts, self.path,
+        )
+        # Wire the module-level state ``get_preview`` reads from. This
+        # mirrors what ``main()`` does at startup; we skip the actual
+        # Browser construction.
+        self.r._FILE_TEXT = self.FIXTURE
+        self.r._BY_ID = by_id
+        self.r._BY_LINE, self.r._LINES_SORTED = (
+            self.r._build_line_index(by_id))
+        # Default the colored-render gate off so the raw-slice tests
+        # don't accidentally exercise the md2ansi path. Each rendering
+        # test re-enables it explicitly.
+        self.r._MD_COLOR = False
+        self.r._BROWSER = None
+
+    def test_root_id_returns_whole_file(self):
+        # Root id has no ``#`` — full file body comes back.
+        self.assertEqual(self.r.get_preview(self.root.id), self.FIXTURE)
+
+    def test_heading_returns_section_slice(self):
+        # ``# H1`` at line 0 owns everything up to ``# H1b`` at line 5.
+        h1 = self.root._children[0]
+        self.assertEqual(h1.tag, 'h1')
+        out = self.r.get_preview(h1.id)
+        # Slice = [byte_offset, byte_offset + byte_size).
+        self.assertEqual(out,
+                         self.FIXTURE[h1.byte_offset:
+                                      h1.byte_offset + h1.byte_size])
+        # Sanity: starts with ``# H1\n`` and stops before ``# H1b``.
+        self.assertTrue(out.startswith('# H1\n'))
+        self.assertNotIn('# H1b', out)
+
+    def test_nested_heading_slice(self):
+        # ``## H2`` is a child of ``# H1``; its section runs from its
+        # own offset to the next sibling-or-shallower boundary (here
+        # the next ``# H1b`` since no other ``## H*`` follows).
+        h1 = self.root._children[0]
+        h2 = h1._children[0]
+        self.assertEqual(h2.tag, 'h2')
+        out = self.r.get_preview(h2.id)
+        self.assertEqual(out,
+                         self.FIXTURE[h2.byte_offset:
+                                      h2.byte_offset + h2.byte_size])
+        self.assertTrue(out.startswith('## H2\n'))
+
+    def test_list_item_returns_leaf_slice(self):
+        # ``- a`` at line 3 — leaf list item; its byte_size spans only
+        # its own line (next sibling is ``- b`` at line 4).
+        h1 = self.root._children[0]
+        h2 = h1._children[0]
+        li_a = h2._children[0]
+        self.assertIn(li_a.tag, ('ul', 'ol'))
+        out = self.r.get_preview(li_a.id)
+        self.assertEqual(out, '- a\n')
+
+    def test_unknown_id_returns_empty(self):
+        # ``/path#999`` resolves to no node; ``_node_at_line`` will
+        # return the last node ≤ 999 (which is fine — but a
+        # non-integer suffix has nothing to fall back to).
+        self.assertEqual(self.r.get_preview('/some/path#notanumber'), '')
+
+    def test_line_with_no_node_below_returns_empty(self):
+        # Line ``-1`` is before every parsed node — _BY_LINE miss,
+        # _node_at_line returns None → empty.
+        out = self.r.get_preview(f'{self.path}#-1')
+        self.assertEqual(out, '')
+
+    def test_md_color_off_returns_raw(self):
+        # Already the default, but assert explicitly — colored mode
+        # off means the raw slice flows through untouched.
+        self.r._MD_COLOR = False
+        h1 = self.root._children[0]
+        out = self.r.get_preview(h1.id)
+        self.assertNotIn('RENDERED', out)
+
+    def test_md_color_on_runs_md2ansi(self):
+        # Install a stub renderer and flip the gate. ``get_preview``
+        # should hand the slice to the stub and return its output.
+        calls = []
+        def stub(text, line_width):
+            calls.append((text, line_width))
+            return 'RENDERED'
+        self.r._md2ansi_fn = stub
+        self.r._MD_COLOR = True
+        self.r._BROWSER = None  # exercises the ``or 80`` width fallback
+        h1 = self.root._children[0]
+        out = self.r.get_preview(h1.id)
+        self.assertEqual(out, 'RENDERED')
+        self.assertEqual(len(calls), 1)
+        # The stub received the raw heading slice + a 80-col default.
+        self.assertTrue(calls[0][0].startswith('# H1\n'))
+        self.assertEqual(calls[0][1], 80)
+
+    def test_md_color_uses_browser_preview_width(self):
+        # When ``_BROWSER`` is set, ``get_preview`` reads its
+        # ``preview_width`` for the line_width arg.
+        class _FakeBrowser:
+            preview_width = 42
+        widths = []
+        def stub(text, line_width):
+            widths.append(line_width)
+            return text
+        self.r._md2ansi_fn = stub
+        self.r._MD_COLOR = True
+        self.r._BROWSER = _FakeBrowser()
+        self.r.get_preview(self.root.id)
+        self.assertEqual(widths, [42])
+
+    def test_md_color_zero_width_falls_back_to_80(self):
+        # ``preview_width`` of 0 is the framework's "not yet sized"
+        # sentinel — our ``or 80`` guard kicks in.
+        class _FakeBrowser:
+            preview_width = 0
+        widths = []
+        def stub(text, line_width):
+            widths.append(line_width)
+            return text
+        self.r._md2ansi_fn = stub
+        self.r._MD_COLOR = True
+        self.r._BROWSER = _FakeBrowser()
+        self.r.get_preview(self.root.id)
+        self.assertEqual(widths, [80])
+
+    def test_md_color_renderer_raises_falls_back_to_raw(self):
+        # md2ansi blow-ups must not propagate. We expect the raw slice.
+        def boom(text, line_width):
+            raise RuntimeError('bad markdown')
+        self.r._md2ansi_fn = boom
+        self.r._MD_COLOR = True
+        h1 = self.root._children[0]
+        out = self.r.get_preview(h1.id)
+        # Raw slice, untouched.
+        self.assertEqual(out,
+                         self.FIXTURE[h1.byte_offset:
+                                      h1.byte_offset + h1.byte_size])
+
+    def test_md_color_on_but_fn_none_returns_raw(self):
+        # Defensive: if a test leaves ``_MD_COLOR`` on but the import
+        # never resolved, the gate inside ``get_preview`` skips the
+        # render path rather than crashing on ``None(...)``.
+        self.r._md2ansi_fn = None
+        self.r._MD_COLOR = True
+        h1 = self.root._children[0]
+        out = self.r.get_preview(h1.id)
+        self.assertEqual(out,
+                         self.FIXTURE[h1.byte_offset:
+                                      h1.byte_offset + h1.byte_size])
+
+
+class _FakeCtx:
+    """Recorder for ``ctx`` interactions used by action handlers."""
+
+    def __init__(self):
+        self.dropped = 0
+        self.messages = []
+        self.errors = []
+
+    def drop_preview_cache(self, id_=None):
+        self.dropped += 1
+
+    def message(self, text):
+        self.messages.append(text)
+
+    def error(self, text):
+        self.errors.append(text)
+
+
+class TestToggleMd(unittest.TestCase):
+    """``_action_toggle_md`` flips ``_MD_COLOR`` and notifies ctx."""
+
+    def setUp(self):
+        self.r = _load_recipe()
+        # Pretend md2ansi was importable so the toggle is meaningful;
+        # the action itself only depends on ``_MD_COLOR``, not on the
+        # function being callable, so an identity stub is fine.
+        self.r._md2ansi_fn = lambda text, line_width: text
+        self.r._MD_COLOR = True
+        self.ctx = _FakeCtx()
+
+    def test_flip_true_to_false(self):
+        self.r._action_toggle_md(self.ctx)
+        self.assertFalse(self.r._MD_COLOR)
+        self.assertEqual(self.ctx.dropped, 1)
+        self.assertEqual(self.ctx.messages, ['md preview: raw'])
+
+    def test_flip_back_round_trip(self):
+        self.r._action_toggle_md(self.ctx)  # True -> False
+        self.r._action_toggle_md(self.ctx)  # False -> True
+        self.assertTrue(self.r._MD_COLOR)
+        self.assertEqual(self.ctx.dropped, 2)
+        self.assertEqual(self.ctx.messages,
+                         ['md preview: raw', 'md preview: colored'])
+
+    def test_flip_from_false(self):
+        # Starting from False — message reports the new state ("colored").
+        self.r._MD_COLOR = False
+        self.r._action_toggle_md(self.ctx)
+        self.assertTrue(self.r._MD_COLOR)
+        self.assertEqual(self.ctx.messages, ['md preview: colored'])
+
+
+class TestResolveMdPager(unittest.TestCase):
+    """``_resolve_md_pager`` walks ``$MD2ANSI`` / ``md2ansi+less`` in order."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _with_env(self, **kw):
+        """Snapshot env, override per kw, return a restore-fn."""
+        import os
+        saved = {k: os.environ.get(k) for k in kw}
+        for k, v in kw.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        def restore():
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        return restore
+
+    def _scratch_bin(self, tmp, names):
+        """Create executable stubs in ``tmp`` for each name in ``names``."""
+        import os
+        import stat
+        for name in names:
+            path = os.path.join(tmp, name)
+            with open(path, 'w') as f:
+                f.write('#!/bin/sh\ncat "$1"\n')
+            os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
+
+    def test_env_var_wins(self):
+        restore = self._with_env(MD2ANSI='md2ansi')
+        try:
+            self.assertEqual(self.r._resolve_md_pager(), ['md2ansi'])
+        finally:
+            restore()
+
+    def test_env_var_shlex_splits(self):
+        # ``shlex.split`` keeps the flag separate from the binary name.
+        restore = self._with_env(MD2ANSI='my-md-cmd --flag')
+        try:
+            self.assertEqual(self.r._resolve_md_pager(),
+                             ['my-md-cmd', '--flag'])
+        finally:
+            restore()
+
+    def test_env_pipeline_uses_bash_dash_c(self):
+        # ``|`` in $MD2ANSI → bash wrapper so the pipe runs.
+        restore = self._with_env(MD2ANSI='md2ansi | less -R')
+        try:
+            cmd = self.r._resolve_md_pager()
+            self.assertEqual(cmd[0], 'bash')
+            self.assertEqual(cmd[1], '-c')
+            self.assertIn('md2ansi | less -R', cmd[2])
+        finally:
+            restore()
+
+    def test_md2ansi_plus_less_pipes_to_less_rs(self):
+        # Default fallback when both md2ansi and less exist: pipe
+        # md2ansi output through ``less -RS`` via bash.
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self._scratch_bin(tmp, ['md2ansi', 'less'])
+            saved_path = os.environ['PATH']
+            restore = self._with_env(MD2ANSI=None)
+            try:
+                os.environ['PATH'] = tmp
+                cmd = self.r._resolve_md_pager()
+                self.assertEqual(cmd[0], 'bash')
+                self.assertEqual(cmd[1], '-c')
+                self.assertIn('md2ansi', cmd[2])
+                self.assertIn('less -RS', cmd[2])
+            finally:
+                os.environ['PATH'] = saved_path
+                restore()
+
+    def test_md2ansi_alone_no_pipe(self):
+        # Without ``less`` on PATH, fall back to bare ``md2ansi``.
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self._scratch_bin(tmp, ['md2ansi'])
+            saved_path = os.environ['PATH']
+            restore = self._with_env(MD2ANSI=None)
+            try:
+                os.environ['PATH'] = tmp
+                self.assertEqual(self.r._resolve_md_pager(), ['md2ansi'])
+            finally:
+                os.environ['PATH'] = saved_path
+                restore()
+
+    def test_none_when_nothing_resolves(self):
+        # No env var, no binaries on PATH → ``None``.
+        import os
+        restore = self._with_env(MD2ANSI=None)
+        saved_path = os.environ.get('PATH', '')
+        try:
+            os.environ['PATH'] = '/nonexistent-' + str(os.getpid())
+            self.assertIsNone(self.r._resolve_md_pager())
+        finally:
+            os.environ['PATH'] = saved_path
+            restore()
 
 
 if __name__ == '__main__':
