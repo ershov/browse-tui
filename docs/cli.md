@@ -492,8 +492,17 @@ predicate (AND-stacked). Enter on an empty filter clears all filters.
 Ctrl-X clears all filters from inside the prompt. Backspace trims the
 in-progress entry; Ctrl-U clears just the in-progress entry; Ctrl-W kills
 the last word. Non-overridden keys (arrows, page keys, scope, …) fall
-through to normal navigation while the prompt stays open. See
-`docs/superpowers/specs/2026-05-17-filter-design.md`.
+through to normal navigation while the prompt stays open.
+
+The filter narrows the list to rows that match across what's currently
+visible. Collapsed parents are evaluated on their own text alone — the
+filter does not look inside collapsed subtrees, so it never triggers a
+deep fetch. Expand a parent and the newly-revealed rows are filtered as
+they appear. See
+`docs/superpowers/specs/2026-05-27-filter-visible-tree-only-design.md`
+for the evaluator rationale, and
+`docs/superpowers/specs/2026-05-17-filter-design.md` for the keybindings
+and recipe API.
 
 **Mouse:** when running in a terminal that supports SGR mouse reporting,
 left-click on a list row positions the cursor there. The wheel scrolls

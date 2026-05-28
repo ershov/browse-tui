@@ -976,10 +976,40 @@ descendant stays visible as scaffolding.
   `Enter` is the one carve-out — recipe `on_enter` handlers do not fire
   during filter-edit.
 
-Per-row evaluation is bottom-up: every reachable item gets a framework-
-internal `_filter_hidden` flag (recipes never see it). The renderer skips
-rows whose flag is `True` *and* `state._filter_active` is `True`. When
-the filter is cleared, the flag becomes inert; no O(N) clear pass.
+**What the filter sees.** Evaluation is scoped to the **currently
+visible tree** — the rows that would be on screen if the filter were
+off. A node passes iff it self-matches against every active entry, *or*
+it has at least one visible matching descendant (the scaffold rule).
+Two consequences worth knowing:
+
+- The filter never looks inside collapsed nodes. A collapsed parent is
+  judged on its own text alone; the framework does not eagerly fetch
+  uncached subtrees to find matches. Expand a parent to evaluate its
+  children.
+- Newly revealed rows (streamed in via `update_data` under a visible
+  expanded parent, or revealed by an `expand` the user just performed)
+  are evaluated as they appear, with the change propagated up through
+  visible ancestors only.
+
+**Recompute triggers.** The filter recomputes on:
+
+- filter change (typing, `set_filters`, `clear_filters`);
+- scope change (`scope_into` / `scope_out`);
+- `expand` of a previously-collapsed parent (newly-revealed subtree
+  only — the expanded parent's own flag is preserved);
+- each `update_data` op landing under a visible expanded parent
+  (per-op walk-up, early-terminating at the first stable ancestor).
+
+It does **not** recompute on collapse, cursor movement, or `update_data`
+ops landing under a collapsed / uncached parent. As a result, a
+scaffold-visible parent stays visible after the user collapses it
+(stale-scaffold contract); the flag catches up on the next filter
+change.
+
+Per-row evaluation writes a framework-internal `_filter_hidden` flag
+(recipes never see it). The renderer skips rows whose flag is `True`
+*and* `state._filter_active` is `True`. When the filter is cleared, the
+flag becomes inert; no O(N) clear pass.
 
 Composition with `Item.hidden`: a row appears iff **neither** layer hides
 it. `Item.hidden` cascades over subtrees and is checked first, so a
@@ -997,9 +1027,11 @@ ctx.clear_filters()            # alias for set_filters([])
 `set_filters` forces filter-edit exit if active; the in-progress
 placeholder is discarded. Recipe writes are authoritative.
 
-See `docs/superpowers/specs/2026-05-17-filter-design.md` for the design
-details (mode enum, evaluator, lifecycle table, cursor / selection /
-search interaction).
+See `docs/superpowers/specs/2026-05-27-filter-visible-tree-only-design.md`
+for the evaluator and recompute-trigger rationale, and
+`docs/superpowers/specs/2026-05-17-filter-design.md` for the keybindings,
+mode enum, and recipe API (its evaluator / triggers sections are
+superseded by the 05-27 design).
 
 ##### Behavioural change vs. pre-streaming API
 

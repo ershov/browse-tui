@@ -7,6 +7,17 @@ and the cursor-pin work (2026-05-17-cursor-pin-design.md). Adds an
 interactive, user-driven filter overlay with a `less`-like keybinding
 (`&`) and stacking semantics.
 
+> **Partially superseded** by
+> [`2026-05-27-filter-visible-tree-only-design.md`](2026-05-27-filter-visible-tree-only-design.md).
+> The evaluator semantics (optimistic-keep-visible for uncached
+> subtrees, walking every key in `state._children`) and the recompute-
+> trigger table have been replaced by the visible-tree-only rules. The
+> user-facing keybindings (`&`, Enter, Ctrl-X, Ctrl-C / Esc), the `Mode`
+> enum, the state shape (`_filters`, `_filter_active`, `_filter_hidden`),
+> and the recipe API (`filters`, `set_filters`, `add_filter`,
+> `clear_filters`) remain authoritative. Per-section supersession
+> banners appear inline below.
+
 ## Motivation
 
 The framework already gives recipes a *data-level* visibility primitive
@@ -187,6 +198,15 @@ Exact rendering is a UX detail; the data is available from
 
 ## Evaluation
 
+> **Superseded** by
+> [`2026-05-27-filter-visible-tree-only-design.md`](2026-05-27-filter-visible-tree-only-design.md).
+> The optimistic-keep-visible branch (`has_children and id not in
+> _children`) and the outer walk over every key in `state._children`
+> are gone; the evaluator now does a single DFS over the
+> currently-visible tree rooted at scope (or root children) and never
+> looks inside collapsed nodes. See the new design's *Semantic rules*
+> and *Evaluation algorithm* sections.
+
 ```python
 def _recompute_filter_hidden(state, filters):
     """Single bottom-up pass; writes Item._filter_hidden + state._filter_active."""
@@ -220,6 +240,15 @@ The streaming/pending-children optimism is baked into the same pass
 
 ### Streaming / pending children
 
+> **Superseded** by
+> [`2026-05-27-filter-visible-tree-only-design.md`](2026-05-27-filter-visible-tree-only-design.md).
+> Uncached-`has_children` parents are no longer kept optimistically
+> visible: a collapsed parent (cached or not) is judged on its own
+> text alone, and the per-op `_propagate_filter_status_up` helper
+> handles incremental updates when children stream in under a
+> *visible expanded* parent. Changes landing under collapsed /
+> uncached parents are ignored (Rule 2).
+
 If a parent has `has_children=True` but its children are not yet
 cached in `state._children`, the recursive `visit` sees no children
 and the parent's `_filter_hidden` is decided on self-match alone.
@@ -239,6 +268,11 @@ Once children stream in, the next `update_data` batch retriggers
 recompute and the parent's state is corrected.
 
 ### Active flag
+
+> **Note:** The `state._filter_active` flag itself is unchanged — the
+> renderer's short-circuit gate still works the same way. The
+> *derivation* (which now walks only the visible tree) is covered by
+> [`2026-05-27-filter-visible-tree-only-design.md`](2026-05-27-filter-visible-tree-only-design.md).
 
 `active = [q for q in filters if q]` is computed once per recompute.
 The empty placeholder during FILTER_EDIT contributes nothing to
@@ -282,6 +316,15 @@ either); we don't need a second cascade path in the renderer.
 
 ## Recompute triggers
 
+> **Superseded** by
+> [`2026-05-27-filter-visible-tree-only-design.md`](2026-05-27-filter-visible-tree-only-design.md).
+> The new trigger table replaces the per-`update_data`-batch full
+> walk with per-op `_propagate_filter_status_up` (early-terminating
+> at the first stable ancestor) and adds explicit triggers for
+> `expand` (newly-revealed subtree only), with `collapse` and cursor
+> movement being explicit no-ops. See the *Recompute triggers* table
+> in the new design.
+
 `_recompute_filter_hidden` fires:
 
 1. **Each keystroke in FILTER_EDIT** that mutates the last entry
@@ -299,6 +342,14 @@ either); we don't need a second cascade path in the renderer.
 ---
 
 ## Cursor and selection integration
+
+> **Partially superseded** by
+> [`2026-05-27-filter-visible-tree-only-design.md`](2026-05-27-filter-visible-tree-only-design.md).
+> Cursor movement no longer triggers any recompute (Non-goal in the
+> new design); the hide-displacement / pin / selection / search
+> interactions described below still apply mechanically because the
+> derived `_filter_hidden` flag and the renderer short-circuit on
+> `state._filter_active` are unchanged.
 
 ### Cursor displacement
 
