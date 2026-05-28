@@ -1191,5 +1191,298 @@ class TestResolveMdPager(unittest.TestCase):
             restore()
 
 
+class TestMergeRanges(unittest.TestCase):
+    """``_merge_ranges`` — sort + dedupe + adjacency-merge ``(bo, bs)``."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_empty_list(self):
+        self.assertEqual(self.r._merge_ranges([]), [])
+
+    def test_single_range(self):
+        self.assertEqual(self.r._merge_ranges([(10, 5)]), [(10, 5)])
+
+    def test_two_disjoint_in_order(self):
+        # Disjoint and already sorted — passthrough.
+        self.assertEqual(
+            self.r._merge_ranges([(0, 5), (10, 3)]),
+            [(0, 5), (10, 3)],
+        )
+
+    def test_two_disjoint_out_of_order(self):
+        # Same disjoint ranges but reversed input — sorted in output.
+        self.assertEqual(
+            self.r._merge_ranges([(10, 3), (0, 5)]),
+            [(0, 5), (10, 3)],
+        )
+
+    def test_two_overlapping(self):
+        # (0..5) overlaps (3..13) → (0..13).
+        self.assertEqual(
+            self.r._merge_ranges([(0, 5), (3, 10)]),
+            [(0, 13)],
+        )
+
+    def test_two_adjacent(self):
+        # (0..5) followed by (5..3) — adjacent, no gap. Merge to (0..8).
+        self.assertEqual(
+            self.r._merge_ranges([(0, 5), (5, 3)]),
+            [(0, 8)],
+        )
+
+    def test_range_fully_contained(self):
+        # (0..20) contains (5..3) — result is just the outer.
+        self.assertEqual(
+            self.r._merge_ranges([(0, 20), (5, 3)]),
+            [(0, 20)],
+        )
+
+    def test_three_two_merge_one_disjoint(self):
+        # (0..5)+(4..3) merge into (0..7); (20..5) stays separate.
+        self.assertEqual(
+            self.r._merge_ranges([(0, 5), (4, 3), (20, 5)]),
+            [(0, 7), (20, 5)],
+        )
+
+    def test_identical_ranges_deduped(self):
+        self.assertEqual(
+            self.r._merge_ranges([(10, 5), (10, 5)]),
+            [(10, 5)],
+        )
+
+
+class TestWriteRangeExcerpts(unittest.TestCase):
+    """``_write_range_excerpts`` — concatenate slices into a temp .md file."""
+
+    def setUp(self):
+        self.r = _load_recipe()
+        # The recipe slices ``_FILE_TEXT``; install our own buffer.
+        self.r._FILE_TEXT = (
+            'AAAA\n'      # bytes  0..4  (line ends in \n)
+            'BBBB\n'      # bytes  5..9
+            'CCCC\n'      # bytes 10..14
+            'DDDD'        # bytes 15..18 (no trailing newline)
+        )
+        self.tmp_paths = []
+
+    def tearDown(self):
+        import os
+        for p in self.tmp_paths:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+    def _read(self, path):
+        with open(path, 'r', encoding='utf-8', errors='surrogateescape') as f:
+            return f.read()
+
+    def test_single_range(self):
+        path = self.r._write_range_excerpts([(0, 5)])
+        self.tmp_paths.append(path)
+        self.assertEqual(self._read(path), 'AAAA\n')
+
+    def test_two_ranges_first_ends_with_newline(self):
+        # First slice ends in \n → no extra separator inserted.
+        path = self.r._write_range_excerpts([(0, 5), (10, 5)])
+        self.tmp_paths.append(path)
+        self.assertEqual(self._read(path), 'AAAA\nCCCC\n')
+
+    def test_two_ranges_first_lacks_newline(self):
+        # First slice is 'DDDD' (no \n); separator \n inserted before next.
+        path = self.r._write_range_excerpts([(15, 4), (0, 5)])
+        # Note: caller is responsible for merging/sorting; this helper
+        # writes whatever it's given in order. We pass ranges in the
+        # given order to exercise the "needs separator" branch.
+        self.tmp_paths.append(path)
+        self.assertEqual(self._read(path), 'DDDD\nAAAA\n')
+
+    def test_three_ranges_mixed_newline_endings(self):
+        # First two end in \n (no separator inserted between them);
+        # third slice ('DDDD') has no trailing newline → file ends raw.
+        path = self.r._write_range_excerpts([(0, 5), (5, 5), (15, 4)])
+        self.tmp_paths.append(path)
+        self.assertEqual(self._read(path), 'AAAA\nBBBB\nDDDD')
+
+    def test_empty_input(self):
+        path = self.r._write_range_excerpts([])
+        self.tmp_paths.append(path)
+        self.assertEqual(self._read(path), '')
+
+    def test_path_has_md_suffix(self):
+        path = self.r._write_range_excerpts([(0, 1)])
+        self.tmp_paths.append(path)
+        self.assertTrue(path.endswith('.md'))
+
+
+class _SrcCmdCtx:
+    """Recorder for ``ctx`` in ``_run_source_command`` tests."""
+
+    def __init__(self, targets):
+        self.targets = list(targets)
+        self.calls = []
+        self.errors = []
+        self.messages = []
+
+    def run_external(self, cmd):
+        # Snapshot the argv list. The tempfile path (if any) needs to
+        # still exist for the test to read it — we rely on the test
+        # inspecting the file *during* the call rather than after the
+        # finally clause unlinks it.
+        self.calls.append(list(cmd))
+        # Read the tempfile contents synchronously so the assertion
+        # can run after ``_run_source_command`` returns (which
+        # unlinks).
+        if len(cmd) > 0:
+            import os
+            last = cmd[-1]
+            if os.path.exists(last):
+                try:
+                    with open(last, 'r', encoding='utf-8',
+                              errors='surrogateescape') as f:
+                        self.last_tmp_contents = f.read()
+                except OSError:
+                    pass
+
+    def error(self, text):
+        self.errors.append(text)
+
+    def message(self, text):
+        self.messages.append(text)
+
+
+class _SrcItem:
+    """Bare Item stand-in for ``_run_source_command`` tests."""
+    def __init__(self, *, id, kind, byte_offset=0, byte_size=0):
+        self.id = id
+        self.kind = kind
+        self.byte_offset = byte_offset
+        self.byte_size = byte_size
+
+
+class TestRunSourceCommand(unittest.TestCase):
+    """``_run_source_command`` — root vs non-root dispatch + tempfile flow."""
+
+    def setUp(self):
+        import os
+        self.r = _load_recipe()
+        self.r._FILE_TEXT = (
+            'AAAA\n'      # bytes  0..4
+            'BBBB\n'      # bytes  5..9
+            'CCCC\n'      # bytes 10..14
+            'DDDD\n'      # bytes 15..19
+            'EEEE\n'      # bytes 20..24
+        )
+        self.path = '/tmp/src.md'
+        # Snapshot env so per-test PAGER/EDITOR overrides don't leak.
+        self._env_saved = {k: os.environ.get(k) for k in ('PAGER', 'EDITOR')}
+        # Force defaults so we don't pick up host PAGER/EDITOR.
+        os.environ.pop('PAGER', None)
+        os.environ.pop('EDITOR', None)
+
+    def tearDown(self):
+        import os
+        for k, v in self._env_saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_empty_targets_noop(self):
+        ctx = _SrcCmdCtx(targets=[])
+        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.assertEqual(ctx.calls, [])
+
+    def test_root_only_opens_original_path(self):
+        # ``root.id`` is the absolute path; the command should be the
+        # default split + that path. No tempfile.
+        root = _SrcItem(id=self.path, kind='root')
+        ctx = _SrcCmdCtx(targets=[root])
+        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.assertEqual(ctx.calls, [['less', '-R', self.path]])
+
+    def test_root_mixed_with_non_root_root_wins(self):
+        # Spec: "If any target is root → behave as if only root was
+        # selected". Mixed input still goes through the root branch.
+        root = _SrcItem(id=self.path, kind='root')
+        leaf = _SrcItem(id=self.path + '#3', kind='heading',
+                        byte_offset=0, byte_size=5)
+        ctx = _SrcCmdCtx(targets=[leaf, root])
+        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.assertEqual(ctx.calls, [['less', '-R', self.path]])
+
+    def test_single_non_root_writes_temp_and_runs(self):
+        leaf = _SrcItem(id=self.path + '#2', kind='heading',
+                        byte_offset=10, byte_size=5)
+        ctx = _SrcCmdCtx(targets=[leaf])
+        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        # Exactly one call; last argv is the tempfile path with .md.
+        self.assertEqual(len(ctx.calls), 1)
+        argv = ctx.calls[0]
+        self.assertEqual(argv[:2], ['less', '-R'])
+        self.assertTrue(argv[2].endswith('.md'))
+        # Tempfile contents = the leaf's byte slice.
+        self.assertEqual(ctx.last_tmp_contents, 'CCCC\n')
+
+    def test_three_non_root_out_of_order_merged_file_order(self):
+        # Three non-root targets handed in out of file order; the
+        # produced temp file should contain merged ranges in file
+        # order with no duplication. We use disjoint ranges so the
+        # output is just concatenation (no slice loss).
+        a = _SrcItem(id=self.path + '#0', kind='heading',
+                     byte_offset=0, byte_size=5)   # 'AAAA\n'
+        b = _SrcItem(id=self.path + '#2', kind='heading',
+                     byte_offset=10, byte_size=5)  # 'CCCC\n'
+        c = _SrcItem(id=self.path + '#4', kind='heading',
+                     byte_offset=20, byte_size=5)  # 'EEEE\n'
+        # Out of file order.
+        ctx = _SrcCmdCtx(targets=[c, a, b])
+        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.assertEqual(len(ctx.calls), 1)
+        # Expected: file order, no duplication.
+        self.assertEqual(ctx.last_tmp_contents, 'AAAA\nCCCC\nEEEE\n')
+
+    def test_overlapping_ranges_deduped(self):
+        # Two overlapping non-root targets → merged into one range,
+        # no slice duplication in the temp file.
+        a = _SrcItem(id=self.path + '#0', kind='heading',
+                     byte_offset=0, byte_size=10)   # 'AAAA\nBBBB\n'
+        b = _SrcItem(id=self.path + '#1', kind='heading',
+                     byte_offset=5, byte_size=10)   # 'BBBB\nCCCC\n'
+        ctx = _SrcCmdCtx(targets=[a, b])
+        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        # Merged range covers bytes 0..15 — one contiguous slice.
+        self.assertEqual(ctx.last_tmp_contents, 'AAAA\nBBBB\nCCCC\n')
+
+    def test_tempfile_is_unlinked_after_run(self):
+        # The tempfile path captured by the ctx call should not exist
+        # on disk after _run_source_command returns (unlinked in
+        # ``finally``).
+        import os
+        leaf = _SrcItem(id=self.path + '#0', kind='heading',
+                        byte_offset=0, byte_size=5)
+        ctx = _SrcCmdCtx(targets=[leaf])
+        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        argv = ctx.calls[0]
+        self.assertFalse(os.path.exists(argv[2]))
+
+    def test_env_var_override(self):
+        # When the env var is set, it wins over the default. Used by
+        # both ``$PAGER`` (V) and ``$EDITOR`` (E) — exercise here once.
+        import os
+        os.environ['PAGER'] = 'bat --paging=always'
+        try:
+            leaf = _SrcItem(id=self.path + '#0', kind='heading',
+                            byte_offset=0, byte_size=5)
+            ctx = _SrcCmdCtx(targets=[leaf])
+            self.r._run_source_command(ctx, 'PAGER', 'less -R')
+            argv = ctx.calls[0]
+            self.assertEqual(argv[:2], ['bat', '--paging=always'])
+        finally:
+            os.environ.pop('PAGER', None)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -716,6 +716,164 @@ def _action_md_preview(ctx):
             pass
 
 
+def _split_cmd(s):
+    """Shell-split a command env var like ``less -R`` or ``bat --paging=always``.
+
+    Lifted verbatim from browse-claude (lines 4395-4398). Used by
+    ``_run_source_command`` to turn ``$PAGER`` / ``$EDITOR`` into an
+    argv list ready for ``ctx.run_external``.
+    """
+    import shlex
+    return shlex.split(s)
+
+
+def _merge_ranges(ranges):
+    """Sort + merge overlapping/adjacent ``(byte_offset, byte_size)`` ranges.
+
+    Returns a new list, sorted by ``byte_offset`` ascending, with no
+    overlaps and no adjacent ranges (adjacent ranges are merged into
+    one). Adjacency means ``next.byte_offset == current_end`` — the
+    next range starts exactly where the current ends, so concatenation
+    is byte-perfect with no gap.
+
+    Algorithm: stable sort by ``byte_offset``, then a single linear
+    walk. For each next range, if its start is ``<= current_end``,
+    extend ``current_end`` to ``max(current_end, next_end)``;
+    otherwise emit the current range and start a new one. The
+    ``<= current_end`` test covers both overlap and adjacency in one
+    branch.
+
+    Edge cases:
+      * Empty input → empty output.
+      * Single range → list with that one range.
+      * Identical ranges → deduped to one.
+      * A range fully contained in another → the outer survives.
+    """
+    if not ranges:
+        return []
+    ordered = sorted(ranges, key=lambda r: r[0])
+    merged = []
+    cur_bo, cur_bs = ordered[0]
+    cur_end = cur_bo + cur_bs
+    for nxt_bo, nxt_bs in ordered[1:]:
+        nxt_end = nxt_bo + nxt_bs
+        if nxt_bo <= cur_end:
+            # Overlap or adjacency — extend the current range's end.
+            if nxt_end > cur_end:
+                cur_end = nxt_end
+        else:
+            merged.append((cur_bo, cur_end - cur_bo))
+            cur_bo = nxt_bo
+            cur_end = nxt_end
+    merged.append((cur_bo, cur_end - cur_bo))
+    return merged
+
+
+def _write_range_excerpts(ranges):
+    """Write merged byte-range slices of ``_FILE_TEXT`` to a temp .md file.
+
+    ``ranges`` is the output of ``_merge_ranges`` — sorted,
+    non-overlapping ``(byte_offset, byte_size)`` tuples. Each slice is
+    ``_FILE_TEXT[bo:bo+bs]``; when the previous slice doesn't end with
+    ``\\n`` and there's a next slice, an explicit ``\\n`` is inserted
+    so the boundary between two adjacent-but-not-adjacent ranges still
+    reads as a line break. (Truly adjacent ranges — the kind
+    ``_merge_ranges`` already coalesces — never reach this branch.)
+
+    Returns the path to the written file; the caller is responsible
+    for ``os.unlink`` in a ``finally``. ``errors='surrogateescape'``
+    matches the convention used by ``_action_md_preview`` so stray
+    non-UTF-8 bytes round-trip rather than raising.
+    """
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(
+        'w', suffix='.md', delete=False,
+        encoding='utf-8', errors='surrogateescape',
+    )
+    try:
+        prev_slice = ''
+        for bo, bs in ranges:
+            piece = _FILE_TEXT[bo:bo + bs]
+            if prev_slice and not prev_slice.endswith('\n'):
+                tmp.write('\n')
+            tmp.write(piece)
+            prev_slice = piece
+    finally:
+        tmp.close()
+    return tmp.name
+
+
+def _run_source_command(ctx, env_var, default):
+    """Shared body of ``V`` / ``E``: resolve targets, dispatch external tool.
+
+    Strategy (lifted from browse-claude:4323-4392, swapping the
+    per-line extractor for byte-range merging):
+
+      * ``ctx.targets`` handles "selection-or-cursor".
+      * Any target is the synthetic root (``kind == 'root'``) → open
+        the original file in place (root.id is the absolute path).
+        Edits via ``E`` persist naturally.
+      * All targets are non-root → collect ``(byte_offset,
+        byte_size)`` ranges, merge them (sort + dedupe + coalesce
+        adjacent), concatenate the slices into a temp .md file, run
+        the external tool on it, unlink in ``finally``.
+
+    Empty ``targets`` (no cursor, no selection) is a no-op.
+    """
+    targets = ctx.targets
+    if not targets:
+        return
+    cmd = _split_cmd(os.environ.get(env_var) or default)
+
+    # Classify: any root in the target set wins — we open the original
+    # file directly so an ``E`` edit lands on disk. Mirrors the spec's
+    # "behave as if only root was selected" wording.
+    root_target = None
+    for item in targets:
+        if getattr(item, 'kind', None) == 'root':
+            root_target = item
+            break
+
+    if root_target is not None:
+        # ``root.id`` is the absolute file path (set in ``_build_nodes``).
+        ctx.run_external(cmd + [root_target.id])
+        return
+
+    # All targets non-root → byte-range merge into a temp file.
+    ranges = [(t.byte_offset, t.byte_size) for t in targets]
+    merged = _merge_ranges(ranges)
+    tmp_path = _write_range_excerpts(merged)
+    try:
+        ctx.run_external(cmd + [tmp_path])
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def _action_view_source(ctx):
+    """``V`` — page the source for the cursor row (or selection) in $PAGER.
+
+    On a root row this pages the original file; on non-root rows it
+    pages a temp .md file containing the merged byte-range slices for
+    every targeted item. Pairs with the framework's built-in ``v``
+    (which pages the *preview* text, not the on-disk source).
+    """
+    _run_source_command(ctx, 'PAGER', 'less -R')
+
+
+def _action_edit_source(ctx):
+    """``E`` — open the source for the cursor row (or selection) in $EDITOR.
+
+    On a root row this edits the original file in place; on non-root
+    rows it opens a throwaway temp .md file with the merged slice
+    contents. Separate from the framework's built-in ``e`` (which
+    opens the *preview text* in $EDITOR with edits discarded).
+    """
+    _run_source_command(ctx, 'EDITOR', 'vim')
+
+
 def main():
     global _ANCHOR, _FILE_TEXT, _BY_ID, _BY_LINE, _LINES_SORTED, _BROWSER
     if len(sys.argv) < 2:
@@ -757,6 +915,14 @@ def main():
     if _md2ansi_fn is not None:
         actions.insert(0, Action('m', 'Toggle markdown coloring',
                                  _action_toggle_md, 'none'))
+    # ``V`` / ``E`` operate on ``ctx.targets`` (selection-or-cursor),
+    # including the synthetic root row where ``ctx.cursor`` is None
+    # but a scope_root target is still resolvable — hence the
+    # ``'none'`` gate.
+    actions.append(Action('V', 'View source for cursor/selection in $PAGER',
+                          _action_view_source, 'none'))
+    actions.append(Action('E', 'Edit source for cursor/selection in $EDITOR',
+                          _action_edit_source, 'none'))
     b = Browser(BrowserConfig(
         title='browse-md',
         show_children_pane=False,
