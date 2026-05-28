@@ -1003,6 +1003,22 @@ via md2ansi.
 """
 
 
+def _die(msg, *, with_usage=True):
+    """Emit ``browse-md: <msg>`` (and optionally the usage line) and exit 2.
+
+    Centralises the stderr-write + ``sys.exit(2)`` pattern shared by
+    every argv-validation error path in ``main()``. ``with_usage`` is
+    ``True`` by default — most argv errors benefit from a reminder of
+    the expected shape — but the file-not-found path passes
+    ``with_usage=False`` since the user already got the positional
+    shape syntactically right.
+    """
+    print(f'browse-md: {msg}', file=sys.stderr)
+    if with_usage:
+        print(_USAGE, file=sys.stderr)
+    sys.exit(2)
+
+
 def _pop_flag(name, alts=()):
     """Pop the bare flag ``name`` (or any ``alts``) from ``sys.argv``.
 
@@ -1034,18 +1050,32 @@ def main():
     # interchangeably (``--list`` / ``--lists``); the flag has no
     # arguments — its mere presence flips emission on.
     _INCLUDE_LISTS = _pop_flag('-l', alts=('--list', '--lists'))
-    if len(sys.argv) < 2:
-        print(_USAGE, file=sys.stderr)
-        sys.exit(2)
-    raw = sys.argv[1]
+    # After ``_pop_flag`` consumed every known flag, anything starting
+    # with ``-`` left in argv is an unrecognised option, and exactly one
+    # non-``-`` positional is expected. Flag-shaped leftovers are
+    # surfaced first (most useful diagnostic), then positional count.
+    # We intentionally don't support ``--`` as end-of-options here:
+    # ``-``-prefixed filenames can be passed as ``./-strange-name.md``.
+    leftover = sys.argv[1:]
+    for tok in leftover:
+        if tok.startswith('-') and tok != '-':
+            _die(f'unrecognised option: {tok}')
+    positionals = [t for t in leftover if not (t.startswith('-') and t != '-')]
+    if not positionals:
+        _die('missing FILE.md[#anchor]')
+    if len(positionals) > 1:
+        _die(f'unexpected argument: {positionals[1]!r}')
+    raw = positionals[0]
     # Split once on the first ``#`` — anything after is the anchor and
     # gets resolved against the parsed tree below.
     file_part, sep, anchor = raw.partition('#')
     _ANCHOR = anchor if sep else ''
     path = os.path.abspath(os.path.expanduser(file_part))
     if not os.path.isfile(path):
-        print(_USAGE, file=sys.stderr)
-        sys.exit(2)
+        # Echo the user's input (pre-expanduser, pre-abspath) so the
+        # error names exactly what they typed. ``with_usage=False`` —
+        # the user already got the positional shape syntactically right.
+        _die(f'no such file: {file_part}', with_usage=False)
     # Capture the abs path so ``_reparse`` (Ctrl-R) can re-read the
     # same file without re-parsing argv. The first parse runs through
     # the shared ``_reparse`` helper too — same path that Ctrl-R uses,

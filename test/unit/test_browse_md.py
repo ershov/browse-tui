@@ -1932,6 +1932,128 @@ class TestArgvFlag(unittest.TestCase):
             self.r.sys.argv, ['browse-md', '--frobnicate', 'FILE.md'])
 
 
+class TestArgvErrors(unittest.TestCase):
+    """End-to-end argv validation in ``main()`` — #550 + #551.
+
+    Exercises the leftover-arg / file-not-found error paths by patching
+    the recipe's ``sys.argv`` and invoking ``main()`` directly. Each
+    case captures stderr via ``contextlib.redirect_stderr`` and asserts
+    on the ``SystemExit`` code + the emitted message. ``main()`` doesn't
+    reach the Browser construction in the error paths (``sys.exit(2)``
+    fires before that), so the stub ``Browser`` from ``_stub_browse_tui``
+    is never invoked.
+    """
+
+    def setUp(self):
+        # Fresh recipe per test so each case starts with a clean module
+        # (``_pop_flag`` mutates ``sys.argv`` in place — restoring isn't
+        # enough since other globals also get touched on the success
+        # path; we never hit the success path here anyway).
+        self.r = _load_recipe(include_lists=False)
+        self._saved_argv = list(self.r.sys.argv)
+
+    def tearDown(self):
+        self.r.sys.argv[:] = self._saved_argv
+
+    def _set_argv(self, argv):
+        self.r.sys.argv[:] = argv
+
+    def _run_main_capture(self):
+        """Invoke ``main()``; return ``(exit_code, stderr_text)``."""
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            with self.assertRaises(SystemExit) as cm:
+                self.r.main()
+        code = cm.exception.code
+        return code, buf.getvalue()
+
+    def test_no_args_reports_missing_file_with_usage(self):
+        self._set_argv(['browse-md'])
+        code, err = self._run_main_capture()
+        self.assertEqual(code, 2)
+        self.assertIn('missing FILE.md', err)
+        self.assertIn(self.r._USAGE, err)
+
+    def test_missing_file_path_reports_path_without_usage(self):
+        self._set_argv(['browse-md', '/no/such/path.md'])
+        code, err = self._run_main_capture()
+        self.assertEqual(code, 2)
+        self.assertIn('no such file: /no/such/path.md', err)
+        # ``with_usage=False`` for the file-not-found path — the user
+        # already got the positional shape right syntactically.
+        self.assertNotIn(self.r._USAGE, err)
+
+    def test_unknown_long_option(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile(
+                'w', suffix='.md', delete=False) as tmp:
+            tmp.write('# H\n')
+            tmp_path = tmp.name
+        try:
+            self._set_argv(['browse-md', '--bogus', tmp_path])
+            code, err = self._run_main_capture()
+            self.assertEqual(code, 2)
+            self.assertIn('unrecognised option: --bogus', err)
+        finally:
+            import os as _os
+            _os.unlink(tmp_path)
+
+    def test_unknown_short_option(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile(
+                'w', suffix='.md', delete=False) as tmp:
+            tmp.write('# H\n')
+            tmp_path = tmp.name
+        try:
+            self._set_argv(['browse-md', '-x', tmp_path])
+            code, err = self._run_main_capture()
+            self.assertEqual(code, 2)
+            self.assertIn('unrecognised option: -x', err)
+        finally:
+            import os as _os
+            _os.unlink(tmp_path)
+
+    def test_extra_positional(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile(
+                'w', suffix='.md', delete=False) as tmp:
+            tmp.write('# H\n')
+            tmp_path = tmp.name
+        try:
+            self._set_argv(['browse-md', tmp_path, 'extra'])
+            code, err = self._run_main_capture()
+            self.assertEqual(code, 2)
+            self.assertIn('unexpected argument', err)
+            self.assertIn('extra', err)
+        finally:
+            import os as _os
+            _os.unlink(tmp_path)
+
+    def test_bogus_and_extra_reports_one(self):
+        # When both a bogus flag and an extra positional are present,
+        # the recipe surfaces ONE of them (whichever its validation
+        # walk hits first — currently the flag). We just assert exit 2
+        # and that at least one of the bad tokens is named.
+        import tempfile
+        with tempfile.NamedTemporaryFile(
+                'w', suffix='.md', delete=False) as tmp:
+            tmp.write('# H\n')
+            tmp_path = tmp.name
+        try:
+            self._set_argv(['browse-md', '--bogus', tmp_path, 'extra'])
+            code, err = self._run_main_capture()
+            self.assertEqual(code, 2)
+            self.assertTrue(
+                '--bogus' in err or 'extra' in err,
+                f'expected at least one bad token named in stderr, got: {err!r}',
+            )
+        finally:
+            import os as _os
+            _os.unlink(tmp_path)
+
+
 class TestBuildNodesNoLists(unittest.TestCase):
     """``_build_nodes`` with ``_INCLUDE_LISTS = False`` — headings only.
 
