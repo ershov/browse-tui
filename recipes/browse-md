@@ -901,9 +901,15 @@ def _run_source_command(ctx, env_var, default):
     per-line extractor for byte-range merging):
 
       * ``ctx.targets`` handles "selection-or-cursor".
-      * Any target is the synthetic root (``kind == 'root'``) → open
-        the original file in place (root.id is the absolute path).
-        Edits via ``E`` persist naturally.
+      * Any target is the root → open the original file in place
+        (``_ROOT_PATH`` is the absolute path). Edits via ``E`` persist
+        naturally. "Is the root" means either our real root Item
+        (``kind == 'root'``) or the framework's synthetic scope-root
+        pseudo-row (fabricated by ``visible_items`` when the scope id
+        isn't in any cached children list — see #552). The pseudo-row
+        carries the same id as our root (the absolute file path) but
+        none of our hidden attrs (``kind``, ``byte_offset``,
+        ``byte_size``), so we discriminate on id rather than ``kind``.
       * All targets are non-root → collect ``(byte_offset,
         byte_size)`` ranges, merge them (sort + dedupe + coalesce
         adjacent), concatenate the slices into a temp .md file, run
@@ -918,15 +924,20 @@ def _run_source_command(ctx, env_var, default):
 
     # Classify: any root in the target set wins — we open the original
     # file directly so an ``E`` edit lands on disk. Mirrors the spec's
-    # "behave as if only root was selected" wording.
-    root_target = None
-    for item in targets:
-        if getattr(item, 'kind', None) == 'root':
-            root_target = item
-            break
+    # "behave as if only root was selected" wording. The id-based check
+    # also catches the framework's synthetic scope-root pseudo-Item,
+    # which shares root's id but not our hidden ``kind`` attr (#552).
+    is_root = lambda it: (
+        getattr(it, 'kind', None) == 'root' or it.id == _ROOT_PATH
+    )
+    root_target = next((it for it in targets if is_root(it)), None)
 
     if root_target is not None:
-        # ``root.id`` is the absolute file path (set in ``_build_nodes``).
+        # ``root_target.id`` is the absolute file path: equals
+        # ``_ROOT_PATH`` by construction for the real root (set in
+        # ``_build_nodes``) and by the scope-root pseudo-row contract
+        # (the framework fabricates it with the scope id, which is our
+        # root id).
         ctx.run_external(cmd + [root_target.id])
         return
 

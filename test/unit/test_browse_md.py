@@ -1518,6 +1518,23 @@ class _SrcItem:
         self.byte_size = byte_size
 
 
+class _ScopeRootPseudoItem:
+    """Framework's scope-root pseudo-Item stand-in (#552).
+
+    Mirrors what ``visible_items`` fabricates for a scoped session
+    whose scope id isn't in any cached children list: an Item with
+    ``id`` / ``title`` / ``has_children`` / ``synthetic`` but none of
+    our recipe-added hidden attrs (``kind``, ``byte_offset``,
+    ``byte_size``). Accessing those attrs raises ``AttributeError`` —
+    exactly the surface that #552 crashed on.
+    """
+    def __init__(self, *, id):
+        self.id = id
+        self.title = str(id)
+        self.has_children = True
+        self.synthetic = True
+
+
 class TestRunSourceCommand(unittest.TestCase):
     """``_run_source_command`` — root vs non-root dispatch + tempfile flow."""
 
@@ -1532,6 +1549,16 @@ class TestRunSourceCommand(unittest.TestCase):
             'EEEE\n'      # bytes 20..24
         )
         self.path = '/tmp/src.md'
+        # Snapshot module state we might patch (so the scope-root
+        # pseudo-item branch can be exercised). ``_load_recipe`` gives a
+        # fresh module per test, but we restore explicitly for clarity
+        # and to honour the ticket's "restore _BY_ID / _ROOT_PATH"
+        # request (#552).
+        self._mod_saved = {
+            '_ROOT_PATH': self.r._ROOT_PATH,
+            '_BY_ID': dict(self.r._BY_ID),
+        }
+        self.r._ROOT_PATH = self.path
         # Snapshot env so per-test PAGER/EDITOR overrides don't leak.
         self._env_saved = {k: os.environ.get(k) for k in ('PAGER', 'EDITOR')}
         # Force defaults so we don't pick up host PAGER/EDITOR.
@@ -1545,6 +1572,9 @@ class TestRunSourceCommand(unittest.TestCase):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+        # Restore patched module state.
+        self.r._ROOT_PATH = self._mod_saved['_ROOT_PATH']
+        self.r._BY_ID = self._mod_saved['_BY_ID']
 
     def test_empty_targets_noop(self):
         ctx = _SrcCmdCtx(targets=[])
@@ -1638,6 +1668,27 @@ class TestRunSourceCommand(unittest.TestCase):
             self.assertEqual(argv[:2], ['bat', '--paging=always'])
         finally:
             os.environ.pop('PAGER', None)
+
+    def test_scope_root_pseudo_item_takes_root_path(self):
+        # #552: when the framework hands us its synthetic scope-root
+        # pseudo-Item (no ``kind`` / ``byte_offset`` attrs but
+        # ``id == _ROOT_PATH``), classify it as root and open the
+        # original file directly — no tempfile, no AttributeError.
+        pseudo = _ScopeRootPseudoItem(id=self.path)
+        ctx = _SrcCmdCtx(targets=[pseudo])
+        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.assertEqual(ctx.calls, [['less', '-R', self.path]])
+
+    def test_scope_root_pseudo_item_mixed_with_non_root_root_wins(self):
+        # Same root-wins rule as the real-root case: any root in the
+        # target set (including the scope-root pseudo) routes through
+        # the original-file branch and skips the byte-range merge.
+        pseudo = _ScopeRootPseudoItem(id=self.path)
+        leaf = _SrcItem(id=self.path + '#3', kind='heading',
+                        byte_offset=0, byte_size=5)
+        ctx = _SrcCmdCtx(targets=[leaf, pseudo])
+        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.assertEqual(ctx.calls, [['less', '-R', self.path]])
 
 
 class TestReload(unittest.TestCase):
