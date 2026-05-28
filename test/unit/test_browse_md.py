@@ -56,7 +56,7 @@ def _stub_browse_tui():
     sys.modules['browse_tui'] = mod
 
 
-def _load_recipe():
+def _load_recipe(include_lists=True):
     """Load (or reload) the browse-md recipe; returns the module.
 
     ``recipes/browse-md`` has no ``.py`` extension; importlib's
@@ -64,6 +64,13 @@ def _load_recipe():
     source loader explicitly. A fresh module instance is created on
     every call so tests that mutate module-level state (notably
     ``_BY_ID`` for ``get_children``) don't bleed into each other.
+
+    The recipe defaults ``_INCLUDE_LISTS`` to ``False`` (production
+    behaviour: headings only unless ``-l`` is passed). The majority of
+    parser-level tests assume list items show up as tree rows, so
+    this loader flips the flag back to ``True`` after module
+    execution. Tests that need to exercise the lists-off path pass
+    ``include_lists=False``.
     """
     _stub_browse_tui()
     name = '_browse_md_under_test'
@@ -71,6 +78,7 @@ def _load_recipe():
     spec = importlib.util.spec_from_loader(name, loader)
     mod = importlib.util.module_from_spec(spec)
     loader.exec_module(mod)
+    mod._INCLUDE_LISTS = include_lists
     return mod
 
 
@@ -1714,8 +1722,17 @@ class TestHelpIntro(unittest.TestCase):
         self.assertTrue(self.r._HELP_INTRO.strip())
 
     def test_contains_usage_form(self):
-        # The usage line documents the file + optional anchor syntax.
-        self.assertIn('browse-md FILE.md', self.r._HELP_INTRO)
+        # The usage line documents the optional ``-l`` flag, the
+        # required file, and (further down) the anchor syntax.
+        self.assertIn('browse-md [-l] FILE.md', self.r._HELP_INTRO)
+
+    def test_mentions_lists_flag(self):
+        # The ``-l`` / ``--list`` / ``--lists`` flag toggles list-item
+        # emission; all three aliases should be discoverable from the
+        # intro alongside a brief description.
+        self.assertIn('-l', self.r._HELP_INTRO)
+        self.assertIn('--list', self.r._HELP_INTRO)
+        self.assertIn('--lists', self.r._HELP_INTRO)
 
     def test_mentions_anchor(self):
         # Anchor syntax is a load-bearing feature; document it.
@@ -1739,6 +1756,199 @@ class TestHelpIntro(unittest.TestCase):
         # browse-fs-style compact help — should comfortably fit under
         # the ~25-line budget noted in the ticket.
         self.assertLessEqual(self.r._HELP_INTRO.count('\n'), 25)
+
+
+class TestArgvFlag(unittest.TestCase):
+    """``_pop_flag`` — extract ``-l`` / ``--list`` / ``--lists`` from argv.
+
+    The flag is parsed before the positional in ``main()`` so order
+    in argv is flexible; the helper is verified directly by patching
+    ``sys.argv`` on the recipe module. ``setUp`` reloads the recipe
+    with lists off (the production default) so the flag's effect on
+    the global is observable.
+    """
+
+    def setUp(self):
+        # Fresh module per test — ``sys.argv`` is patched on the
+        # recipe's own ``sys`` reference, so we restore the original
+        # argv in ``tearDown`` to keep test isolation tight.
+        self.r = _load_recipe(include_lists=False)
+        self._saved_argv = list(self.r.sys.argv)
+
+    def tearDown(self):
+        # Restore argv on the recipe module so any subsequent test
+        # that touches it via the shared interpreter ``sys`` sees the
+        # original list — defence-in-depth against cross-test bleed.
+        self.r.sys.argv[:] = self._saved_argv
+
+    def _set_argv(self, argv):
+        self.r.sys.argv[:] = argv
+
+    def test_flag_absent_returns_false(self):
+        self._set_argv(['browse-md', 'FILE.md'])
+        self.assertFalse(self.r._pop_flag('-l', alts=('--list', '--lists')))
+        # The positional survives the pop pass.
+        self.assertEqual(self.r.sys.argv, ['browse-md', 'FILE.md'])
+
+    def test_short_flag_before_positional(self):
+        self._set_argv(['browse-md', '-l', 'FILE.md'])
+        self.assertTrue(self.r._pop_flag('-l', alts=('--list', '--lists')))
+        self.assertEqual(self.r.sys.argv, ['browse-md', 'FILE.md'])
+
+    def test_short_flag_after_positional(self):
+        self._set_argv(['browse-md', 'FILE.md', '-l'])
+        self.assertTrue(self.r._pop_flag('-l', alts=('--list', '--lists')))
+        self.assertEqual(self.r.sys.argv, ['browse-md', 'FILE.md'])
+
+    def test_long_list_alias(self):
+        self._set_argv(['browse-md', '--list', 'FILE.md'])
+        self.assertTrue(self.r._pop_flag('-l', alts=('--list', '--lists')))
+        self.assertEqual(self.r.sys.argv, ['browse-md', 'FILE.md'])
+
+    def test_long_lists_alias(self):
+        self._set_argv(['browse-md', '--lists', 'FILE.md'])
+        self.assertTrue(self.r._pop_flag('-l', alts=('--list', '--lists')))
+        self.assertEqual(self.r.sys.argv, ['browse-md', 'FILE.md'])
+
+    def test_repeated_flags_all_removed(self):
+        # Multiple instances of the flag (mixing aliases) should ALL
+        # be removed so the positional remains at ``sys.argv[1]``.
+        self._set_argv(['browse-md', '-l', '--list', 'FILE.md'])
+        self.assertTrue(self.r._pop_flag('-l', alts=('--list', '--lists')))
+        self.assertEqual(self.r.sys.argv, ['browse-md', 'FILE.md'])
+
+    def test_pop_flag_does_not_consume_unrelated_args(self):
+        # Unknown args are left alone — they'll surface downstream if
+        # bogus, but ``_pop_flag`` itself only touches its own keys.
+        self._set_argv(['browse-md', '--frobnicate', 'FILE.md'])
+        self.assertFalse(self.r._pop_flag('-l', alts=('--list', '--lists')))
+        self.assertEqual(
+            self.r.sys.argv, ['browse-md', '--frobnicate', 'FILE.md'])
+
+
+class TestBuildNodesNoLists(unittest.TestCase):
+    """``_build_nodes`` with ``_INCLUDE_LISTS = False`` — headings only.
+
+    Same fixture as ``TestBuildNodes`` (so we can compare against its
+    "lists on" expectations), but the recipe is loaded with the flag
+    off. Heading shape MUST be unchanged — same ids, same byte/line
+    offsets — and list items MUST be absent from the tree and from
+    ``_BY_ID``. The section ``byte_size`` widens to include the list
+    bytes (since lists no longer act as sub-section boundaries).
+    """
+
+    FIXTURE = (
+        '# H1\n'        # line 0
+        '## H2a\n'      # line 1
+        '- a\n'         # line 2
+        '  - a1\n'      # line 3
+        '- b\n'         # line 4
+        '## H2b\n'      # line 5
+        '1. one\n'      # line 6
+        '# H1b\n'       # line 7
+        '- top\n'       # line 8
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe(include_lists=False)
+        cls.path = '/tmp/nolists.md'
+        cls.line_starts = cls.r._line_starts(cls.FIXTURE)
+        cls.events = cls.r._parse(cls.FIXTURE)
+        cls.root, cls.by_id = cls.r._build_nodes(
+            cls.events, cls.FIXTURE, cls.line_starts, cls.path,
+        )
+
+    def test_events_contain_only_headings(self):
+        # Parser-level gate: ``_parse`` skipped list emission entirely.
+        kinds = {kind for kind, _ in self.events}
+        self.assertEqual(kinds, {'h1', 'h2'})
+
+    def test_root_has_two_h1_children(self):
+        # Shape at root is unchanged — two H1s, no list items.
+        kids = self.root._children
+        self.assertEqual([k.tag for k in kids], ['h1', 'h1'])
+        self.assertEqual([k.title for k in kids], ['H1', 'H1b'])
+
+    def test_no_list_items_in_tree(self):
+        # Walk every node in the tree; no ``ul`` or ``ol`` shows up.
+        seen_tags = []
+
+        def walk(node):
+            for kid in node._children:
+                seen_tags.append(kid.tag)
+                walk(kid)
+
+        walk(self.root)
+        for tag in seen_tags:
+            self.assertNotIn(tag, ('ul', 'ol'))
+
+    def test_no_list_items_in_by_id(self):
+        # ``_BY_ID`` is the flat index — every entry must be a heading
+        # or the root.
+        for item in self.by_id.values():
+            self.assertIn(item.kind, ('root', 'heading'))
+
+    def test_heading_ids_unchanged(self):
+        # Heading ids are ``<path>#<line_offset>`` — they depend on
+        # the source line numbers, which the flag doesn't affect.
+        h1 = self.root._children[0]
+        h2a, h2b = h1._children
+        h1b = self.root._children[1]
+        self.assertEqual(h1.id, f'{self.path}#0')
+        self.assertEqual(h2a.id, f'{self.path}#1')
+        self.assertEqual(h2b.id, f'{self.path}#5')
+        self.assertEqual(h1b.id, f'{self.path}#7')
+
+    def test_heading_byte_offsets_unchanged(self):
+        # Heading byte offsets are the literal positions of the ``#``
+        # in the source — independent of list emission.
+        h1 = self.root._children[0]
+        h2a, h2b = h1._children
+        h1b = self.root._children[1]
+        self.assertEqual(h1.byte_offset, self.FIXTURE.index('# H1\n'))
+        self.assertEqual(h2a.byte_offset, self.FIXTURE.index('## H2a'))
+        self.assertEqual(h2b.byte_offset, self.FIXTURE.index('## H2b'))
+        self.assertEqual(h1b.byte_offset, self.FIXTURE.index('# H1b'))
+
+    def test_h2a_section_subsumes_list_bytes(self):
+        # With lists off, the H2a section's byte_size extends to the
+        # next heading (H2b) instead of stopping at the first list
+        # item. The actual byte boundary is the same as with lists
+        # on (boundary rule is heading-driven for headings), but with
+        # no list items in the tree, those bytes are now ONLY part of
+        # the section — they're not separately enumerated.
+        h1 = self.root._children[0]
+        h2a, h2b = h1._children
+        self.assertEqual(h2a.byte_offset + h2a.byte_size, h2b.byte_offset)
+        # And the section text actually contains the list lines.
+        sliced = self.FIXTURE[h2a.byte_offset:h2a.byte_offset + h2a.byte_size]
+        self.assertIn('- a', sliced)
+        self.assertIn('  - a1', sliced)
+        self.assertIn('- b', sliced)
+
+    def test_last_section_runs_to_eof(self):
+        # The last heading (H1b) extends through ``- top`` to EOF.
+        h1b = self.root._children[1]
+        self.assertEqual(
+            h1b.byte_offset + h1b.byte_size, len(self.FIXTURE))
+        # And ``- top`` text appears inside the section slice.
+        sliced = self.FIXTURE[h1b.byte_offset:h1b.byte_offset + h1b.byte_size]
+        self.assertIn('- top', sliced)
+
+    def test_heading_has_children_reflects_no_list_kids(self):
+        # H2a previously had two list-item children; with lists off
+        # it's a leaf. H1 (which has H2 children) still reports
+        # ``has_children``.
+        h1 = self.root._children[0]
+        self.assertTrue(h1.has_children)
+        h2a = h1._children[0]
+        self.assertFalse(h2a.has_children)
+        h2b = h1._children[1]
+        self.assertFalse(h2b.has_children)
+        # Second H1 had only a list item under it — also a leaf now.
+        h1b = self.root._children[1]
+        self.assertFalse(h1b.has_children)
 
 
 if __name__ == '__main__':

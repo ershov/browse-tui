@@ -1,13 +1,15 @@
 #!/usr/bin/env -S browse-tui --run-py
 """browse-md — single-file markdown browser.
 
-Parses a markdown file into a tree of headings (h1..h6) plus the
-nested list items underneath each section; the preview pane shows
-the file body (or a byte-slice for non-root cursor rows), optionally
-rendered through md2ansi for ANSI-coloured markdown. Anchor syntax
-(``FILE.md#name`` / ``FILE.md#<line>``) seeds the initial scope so
-deep links open directly on the targeted section. Ctrl-R re-slurps
-the file from disk and rebuilds the tree in place.
+Parses a markdown file into a tree of headings (h1..h6); list items
+under each section can optionally be surfaced as tree rows via the
+``-l`` / ``--list`` / ``--lists`` flag (default: headings only). The
+preview pane shows the file body (or a byte-slice for non-root
+cursor rows), optionally rendered through md2ansi for ANSI-coloured
+markdown. Anchor syntax (``FILE.md#name`` / ``FILE.md#<line>``)
+seeds the initial scope so deep links open directly on the targeted
+section. Ctrl-R re-slurps the file from disk and rebuilds the tree
+in place.
 
 Custom actions on top of the framework defaults:
 
@@ -17,7 +19,7 @@ Custom actions on top of the framework defaults:
   V   page the source for cursor/selection in ``$PAGER``.
   E   edit the source for cursor/selection in ``$EDITOR``.
 
-Usage:  browse-md FILE.md[#anchor]
+Usage:  browse-md [-l] FILE.md[#anchor]
 """
 
 import bisect
@@ -115,7 +117,16 @@ _HEADING_PREFIX_RE = re.compile(r'^#+\s*')
 _LIST_PREFIX_RE = re.compile(r'^([-*+]|\d+\.)\s+')
 
 
-_USAGE = 'usage: browse-md FILE.md[#anchor]'
+# Gate for emitting list-item events from ``_parse``. Default off:
+# the tree shows headings only, which is the common "table of
+# contents" view. ``main()`` flips this to ``True`` when ``-l`` /
+# ``--list`` / ``--lists`` appears in argv. The flag only controls
+# emission — the ``list`` rule in ``_PARSER_RE`` still masks its
+# span so code-fence-vs-list-line precedence is unchanged.
+_INCLUDE_LISTS = False
+
+
+_USAGE = 'usage: browse-md [-l] FILE.md[#anchor]'
 
 
 # ### Section: Markdown block-rule table ##############################
@@ -300,8 +311,13 @@ def _parse(text):
                 'source': m.group(),
             }))
         elif kind == 'list':
-            # Fan one multi-line list match into per-marker-line nodes.
-            events.extend(_walk_list(m, line_starts))
+            # Fan one multi-line list match into per-marker-line nodes —
+            # but only when ``_INCLUDE_LISTS`` is on. With the flag off
+            # the regex still consumed the list span (so code-fence vs
+            # list-line precedence is unchanged), we just drop the
+            # would-be events so list items don't show in the tree.
+            if _INCLUDE_LISTS:
+                events.extend(_walk_list(m, line_starts))
         # code / blockquote / table / hr / frontmatter: skip. Their
         # only job is to consume their span so later rules can't.
     return events
@@ -949,16 +965,20 @@ def _action_edit_source(ctx):
 _HELP_INTRO = """\
 browse-md — single-file markdown browser.
 
-Usage: browse-md FILE.md[#anchor]
+Usage: browse-md [-l] FILE.md[#anchor]
+  -l, --list, --lists
+            Also surface list items in the tree (default: headings
+            only).
   FILE.md   Markdown file to open.
   #anchor   Optional deep-link target — either a 0-based line number
             (``#42``) or a heading name. Heading lookup runs three
             tiers in source order: exact ``_display_title`` match,
             then prefix, then substring; first hit wins.
 
-Headings (h1..h6) and the nested list items below each section form
-the tree; the preview pane shows the file body (or the byte-slice
-for a non-root cursor), optionally rendered via md2ansi.
+Headings (h1..h6) form the tree by default; pass ``-l`` to also
+surface list items as tree rows. The preview pane shows the file
+body (or the byte-slice for a non-root cursor), optionally rendered
+via md2ansi.
 
   m       Toggle md2ansi coloring of the preview pane (only bound
           when the md2ansi Python module is importable).
@@ -969,8 +989,37 @@ for a non-root cursor), optionally rendered via md2ansi.
 """
 
 
+def _pop_flag(name, alts=()):
+    """Pop the bare flag ``name`` (or any ``alts``) from ``sys.argv``.
+
+    Walks ``sys.argv`` from index 1; the first literal match (against
+    ``name`` or any entry in ``alts``) is deleted in place. Continues
+    scanning so repeated occurrences (e.g. ``-l --list``) are all
+    removed. Returns ``True`` if at least one match was found.
+
+    Patterned after ``_pop_flag`` in browse-claude — small enough to
+    duplicate rather than share. Used by ``main()`` to extract
+    ``-l`` / ``--list`` / ``--lists`` before the positional is read.
+    """
+    found = False
+    i = 1
+    while i < len(sys.argv):
+        if sys.argv[i] == name or sys.argv[i] in alts:
+            del sys.argv[i]
+            found = True
+            continue
+        i += 1
+    return found
+
+
 def main():
-    global _ANCHOR, _ROOT_PATH, _BROWSER
+    global _ANCHOR, _ROOT_PATH, _BROWSER, _INCLUDE_LISTS
+    # Pop the lists-on flag BEFORE reading the positional so order in
+    # argv is flexible: ``browse-md -l FILE.md`` and
+    # ``browse-md FILE.md -l`` both work. The aliases are accepted
+    # interchangeably (``--list`` / ``--lists``); the flag has no
+    # arguments — its mere presence flips emission on.
+    _INCLUDE_LISTS = _pop_flag('-l', alts=('--list', '--lists'))
     if len(sys.argv) < 2:
         print(_USAGE, file=sys.stderr)
         sys.exit(2)
