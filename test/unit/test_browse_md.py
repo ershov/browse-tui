@@ -310,42 +310,46 @@ class TestBuildNodes(unittest.TestCase):
         kids = self.root._children
         self.assertEqual(len(kids), 2)
         self.assertEqual([k.tag for k in kids], ['h1', 'h1'])
-        self.assertEqual(kids[0].title, '# H1')
-        self.assertEqual(kids[1].title, '# H1b')
+        # Titles are pre-stripped of the leading ``#``s and whitespace;
+        # the kind is already conveyed by the ``[h1]`` tag.
+        self.assertEqual(kids[0].title, 'H1')
+        self.assertEqual(kids[1].title, 'H1b')
 
     def test_first_h1_has_two_h2_children(self):
         h1 = self.root._children[0]
         kids = h1._children
         self.assertEqual(len(kids), 2)
         self.assertEqual([k.tag for k in kids], ['h2', 'h2'])
-        self.assertEqual(kids[0].title, '## H2a')
-        self.assertEqual(kids[1].title, '## H2b')
+        self.assertEqual(kids[0].title, 'H2a')
+        self.assertEqual(kids[1].title, 'H2b')
 
     def test_h2a_has_two_list_items(self):
         h2a = self.root._children[0]._children[0]
         kids = h2a._children
         self.assertEqual(len(kids), 2)
         self.assertEqual([k.tag for k in kids], ['ul', 'ul'])
-        self.assertEqual(kids[0].title, '- a')
-        self.assertEqual(kids[1].title, '- b')
+        # List-item titles are pre-stripped of the marker + whitespace.
+        self.assertEqual(kids[0].title, 'a')
+        self.assertEqual(kids[1].title, 'b')
 
     def test_a_has_one_nested_child(self):
         h2a = self.root._children[0]._children[0]
         a = h2a._children[0]
         self.assertEqual(len(a._children), 1)
-        self.assertEqual(a._children[0].title, '- a1')
+        self.assertEqual(a._children[0].title, 'a1')
         self.assertTrue(a.has_children)
 
     def test_h2b_has_one_ol_child(self):
         h2b = self.root._children[0]._children[1]
         self.assertEqual(len(h2b._children), 1)
         self.assertEqual(h2b._children[0].tag, 'ol')
-        self.assertEqual(h2b._children[0].title, '1. one')
+        # ``1. one`` → ``one`` after marker stripping.
+        self.assertEqual(h2b._children[0].title, 'one')
 
     def test_second_h1_has_one_list_child(self):
         h1b = self.root._children[1]
         self.assertEqual(len(h1b._children), 1)
-        self.assertEqual(h1b._children[0].title, '- top')
+        self.assertEqual(h1b._children[0].title, 'top')
 
     def test_byte_size_spans_to_next_sibling_or_shallower(self):
         # First H1 covers lines 0..6 (up to '# H1b' on line 7).
@@ -437,10 +441,13 @@ class TestBuildNodes(unittest.TestCase):
         h2b = h1._children[1]
         self.assertEqual(h2b._children[0].tag, 'ol')
 
-    def test_title_no_hash_stripping(self):
-        # ``## H2a`` title is the source line verbatim (rstripped + lstripped).
+    def test_title_strips_marker_prefix(self):
+        # Headings drop leading ``#``s + whitespace; the source line
+        # ``## H2a`` becomes the title ``H2a``. The kind is already
+        # conveyed by the ``[h2]`` tag, so storing the sigil again
+        # would be redundant.
         h2a = self.root._children[0]._children[0]
-        self.assertEqual(h2a.title, '## H2a')
+        self.assertEqual(h2a.title, 'H2a')
 
     def test_has_children_matches_tree_shape(self):
         # Root, h1, h2a, ``- a`` all have children; leaves don't.
@@ -464,6 +471,96 @@ class TestBuildNodes(unittest.TestCase):
         # Each non-root id resolves to an Item.
         h1 = self.root._children[0]
         self.assertIs(self.by_id[h1.id], h1)
+
+
+class TestTitleStripping(unittest.TestCase):
+    """Title construction in ``_build_nodes`` — marker prefix removal.
+
+    The kind/tag of a tree row is already conveyed by the ``[h1]`` /
+    ``[ul]`` / ... tag (with colour), so the title text drops the
+    redundant ``#`` sigil or list marker. Only the leading prefix +
+    its immediate whitespace is stripped — inline formatting and any
+    trailing decoration stay intact.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _build(self, text, path='/tmp/strip.md'):
+        ls = self.r._line_starts(text)
+        events = self.r._parse(text)
+        return self.r._build_nodes(events, text, ls, path)
+
+    def _titles_in_source_order(self, text):
+        # Walk the tree depth-first in source order so we get every
+        # parsed node's title regardless of nesting.
+        root, _ = self._build(text)
+        out = []
+
+        def walk(node):
+            for kid in node._children:
+                out.append(kid.title)
+                walk(kid)
+
+        walk(root)
+        return out
+
+    def test_heading_inline_formatting_preserved(self):
+        # ``## My **bold** heading`` → ``My **bold** heading``. The
+        # ``**`` markers are part of the title text, not the sigil
+        # prefix, so they survive.
+        titles = self._titles_in_source_order('## My **bold** heading\n')
+        self.assertEqual(titles, ['My **bold** heading'])
+
+    def test_heading_trailing_hash_preserved(self):
+        # md2ansi's heading patterns don't special-case a trailing
+        # ``#``, so it stays in the source line — and therefore in
+        # the stored title — after we strip only the *leading*
+        # ``#``s + whitespace.
+        titles = self._titles_in_source_order(
+            '### Heading with trailing #\n')
+        self.assertEqual(titles, ['Heading with trailing #'])
+
+    def test_list_item_dash_stripped(self):
+        # ``- foo bar`` → ``foo bar``.
+        titles = self._titles_in_source_order('- foo bar\n')
+        self.assertEqual(titles, ['foo bar'])
+
+    def test_list_item_asterisk_stripped(self):
+        # ``* item`` → ``item``.
+        titles = self._titles_in_source_order('* item\n')
+        self.assertEqual(titles, ['item'])
+
+    def test_list_item_plus_stripped(self):
+        # ``+ item`` → ``item``.
+        titles = self._titles_in_source_order('+ item\n')
+        self.assertEqual(titles, ['item'])
+
+    def test_list_item_ordered_single_digit(self):
+        # ``1. item one`` → ``item one``.
+        titles = self._titles_in_source_order('1. item one\n')
+        self.assertEqual(titles, ['item one'])
+
+    def test_list_item_ordered_multi_digit(self):
+        # ``42. wat`` → ``wat``.
+        titles = self._titles_in_source_order('42. wat\n')
+        self.assertEqual(titles, ['wat'])
+
+    def test_heading_with_bold_italic_leading_asterisks(self):
+        # ``## *** bold-italic ***`` — the leading ``##`` matches the
+        # heading rule before the list rule gets a chance, so the
+        # title still gets the heading-prefix treatment and the
+        # ``***`` markers (which are inline formatting, not a list
+        # marker) survive. This is a parser-precedence sanity check.
+        titles = self._titles_in_source_order('## *** bold-italic ***\n')
+        self.assertEqual(titles, ['*** bold-italic ***'])
+
+    def test_heading_extra_internal_whitespace_preserved(self):
+        # Only the *immediate* whitespace after the ``#`` run is
+        # consumed by the strip — internal double-spaces survive.
+        titles = self._titles_in_source_order('## Foo  bar\n')
+        self.assertEqual(titles, ['Foo  bar'])
 
 
 class TestGetChildren(unittest.TestCase):
@@ -603,18 +700,20 @@ class TestNodeAtLine(unittest.TestCase):
         self.r._BY_LINE, self.r._LINES_SORTED = self.r._build_line_index(by_id)
 
     def test_exact_match_on_heading_line(self):
-        # Line 0 is the ``# H1`` heading.
+        # Line 0 is the ``# H1`` heading; the stored title drops the
+        # leading ``#`` + whitespace.
         node = self.r._node_at_line(0)
         self.assertIsNotNone(node)
-        self.assertEqual(node.title, '# H1')
+        self.assertEqual(node.title, 'H1')
 
     def test_exact_match_on_list_item_line(self):
-        # Line 2 is the ``- a`` list item.
+        # Line 2 is the ``- a`` list item; the stored title drops the
+        # leading marker + whitespace.
         node = self.r._node_at_line(2)
-        self.assertEqual(node.title, '- a')
+        self.assertEqual(node.title, 'a')
         # Line 3 is its nested ``- a1`` child.
         node = self.r._node_at_line(3)
-        self.assertEqual(node.title, '- a1')
+        self.assertEqual(node.title, 'a1')
 
     def test_inexact_falls_back_to_previous_node(self):
         # If we had blank/paragraph lines in this fixture the lookup
@@ -634,9 +733,10 @@ class TestNodeAtLine(unittest.TestCase):
         self.r._BY_LINE, self.r._LINES_SORTED = (
             self.r._build_line_index(by_id))
         # Lines 1 and 2 sit between ``# H1`` (line 0) and ``## H2``
-        # (line 3); they should fall back to ``# H1``.
-        self.assertEqual(self.r._node_at_line(1).title, '# H1')
-        self.assertEqual(self.r._node_at_line(2).title, '# H1')
+        # (line 3); they should fall back to ``# H1`` (stored as
+        # ``H1`` after marker stripping).
+        self.assertEqual(self.r._node_at_line(1).title, 'H1')
+        self.assertEqual(self.r._node_at_line(2).title, 'H1')
 
     def test_line_before_any_node_returns_none(self):
         # Build a fixture with a leading preamble so line 0 has no
@@ -654,15 +754,16 @@ class TestNodeAtLine(unittest.TestCase):
         self.assertIsNone(self.r._node_at_line(0))
 
     def test_exact_match_on_last_node(self):
-        # Line 8 is the last node (``- top`` under ``# H1b``).
+        # Line 8 is the last node (``- top`` under ``# H1b``); stored
+        # title drops the marker.
         node = self.r._node_at_line(8)
-        self.assertEqual(node.title, '- top')
+        self.assertEqual(node.title, 'top')
 
     def test_line_past_last_node_returns_last_containing(self):
         # Past EOF — should fall back to the last node (``- top``
         # subsumes any imaginary later lines under it).
         node = self.r._node_at_line(99999)
-        self.assertEqual(node.title, '- top')
+        self.assertEqual(node.title, 'top')
 
     def test_empty_file_returns_none(self):
         # No parsed nodes → every lookup is ``None``.
@@ -677,7 +778,14 @@ class TestNodeAtLine(unittest.TestCase):
 
 
 class TestDisplayTitle(unittest.TestCase):
-    """``_display_title`` — strip ``#`` markers + whitespace for matching."""
+    """``_display_title`` — strip surrounding whitespace for matching.
+
+    Stored titles are pre-stripped of ``#`` / list markers at
+    ``_build_nodes`` time, so this helper has collapsed to a thin
+    ``title.strip()`` wrapper. We keep a couple of sanity checks
+    here; the substantive marker-stripping coverage lives in
+    ``TestBuildNodes`` and ``TestTitleStripping``.
+    """
 
     @classmethod
     def setUpClass(cls):
@@ -689,39 +797,24 @@ class TestDisplayTitle(unittest.TestCase):
         it.kind = 'heading'
         return it
 
-    def test_h1(self):
-        self.assertEqual(self.r._display_title(self._heading('# Foo')), 'Foo')
+    def test_returns_title_unchanged_when_clean(self):
+        # The post-#542 contract: stored titles are already free of
+        # ``#`` sigils, so a clean ``Foo`` round-trips verbatim.
+        self.assertEqual(self.r._display_title(self._heading('Foo')), 'Foo')
 
-    def test_h2(self):
+    def test_strips_surrounding_whitespace(self):
+        # Defensive: any stray padding is trimmed so anchor matching
+        # uses a stable key.
         self.assertEqual(
-            self.r._display_title(self._heading('## Foo Bar')), 'Foo Bar')
-
-    def test_h6(self):
-        self.assertEqual(
-            self.r._display_title(self._heading('###### Deep heading')),
-            'Deep heading',
+            self.r._display_title(self._heading('  Foo Bar  ')),
+            'Foo Bar',
         )
 
     def test_inline_markers_preserved(self):
-        # ``**bold**`` markers are NOT stripped — only leading ``#``s
-        # plus surrounding whitespace.
+        # ``**bold**`` markers are NOT stripped — they're part of the
+        # title text. Only surrounding whitespace is trimmed.
         self.assertEqual(
-            self.r._display_title(self._heading('## **bold**')), '**bold**')
-
-    def test_no_hash_prefix_falls_back_to_strip(self):
-        # Defensive: a malformed title with no ``#`` prefix still
-        # returns the title with surrounding whitespace stripped.
-        self.assertEqual(
-            self.r._display_title(self._heading('  no markers  ')),
-            'no markers',
-        )
-
-    def test_trailing_hashes_preserved(self):
-        # md2ansi's ``_MD_H*`` patterns don't special-case trailing
-        # ``#``s, so the raw source line keeps them; ``_display_title``
-        # only touches leading ``#``s + surrounding whitespace.
-        self.assertEqual(
-            self.r._display_title(self._heading('## Foo ##')), 'Foo ##')
+            self.r._display_title(self._heading('**bold**')), '**bold**')
 
 
 class TestResolveAnchor(unittest.TestCase):

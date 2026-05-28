@@ -100,6 +100,20 @@ _HEADING_STYLES = {
 # one ``_MD_LIST`` match out into one event per marker line.
 _LIST_ITEM_RE = re.compile(r'^([ \t]*)([-*+]|\d+\.)[ \t]+(.*)$')
 
+# Title-stripping regexes used by ``_build_nodes`` to produce tree-row
+# labels free of redundant markers. The kind/tag is already conveyed
+# by ``[h1]`` / ``[ul]`` etc. with colour, so the title text drops:
+#   * Leading ``#``s + immediate whitespace for headings, e.g.
+#     ``## My **bold** heading`` → ``My **bold** heading`` (inline
+#     formatting markers are preserved — only the leading sigils go).
+#   * Leading list marker (``-`` / ``*`` / ``+`` / ``\d+.``) plus
+#     following whitespace for list items, e.g. ``- foo`` → ``foo``
+#     and ``1. item`` → ``item``.
+# Source-faithful byte slices used by ``get_preview`` are unchanged;
+# this only affects what shows in tree rows.
+_HEADING_PREFIX_RE = re.compile(r'^#+\s*')
+_LIST_PREFIX_RE = re.compile(r'^([-*+]|\d+\.)\s+')
+
 
 _USAGE = 'usage: browse-md FILE.md[#anchor]'
 
@@ -338,7 +352,13 @@ def _build_nodes(events, file_text, line_starts, path):
         source = payload['source']
         if kind in _HEADING_EVENT_KINDS:
             level = int(kind[1])  # 'h3' -> 3
-            title = source.rstrip('\n').lstrip()
+            # Drop leading ``#``s + immediate whitespace; the tag
+            # ``[h1]``/``[h2]``/... already conveys the level visually,
+            # so the title text shouldn't carry the same marker again.
+            # Inline formatting markers (``**bold**`` etc.) are
+            # preserved — the regex only touches the sigil prefix.
+            line = source.rstrip('\n').lstrip()
+            title = _HEADING_PREFIX_RE.sub('', line)
             item = Item(
                 id=f'{path}#{lo}',
                 title=title,
@@ -348,8 +368,12 @@ def _build_nodes(events, file_text, line_starts, path):
             item.kind = 'heading'
             item.level = level
         else:
-            # ``ul`` / ``ol`` — list-item node.
-            title = source.rstrip('\n').lstrip()
+            # ``ul`` / ``ol`` — list-item node. Drop the leading
+            # marker (``-`` / ``*`` / ``+`` / ``\d+.``) plus its
+            # trailing whitespace for the same reason as headings —
+            # the ``[ul]`` / ``[ol]`` tag already says it's a list.
+            line = source.rstrip('\n').lstrip()
+            title = _LIST_PREFIX_RE.sub('', line)
             item = Item(
                 id=f'{path}#{lo}',
                 title=title,
@@ -512,19 +536,17 @@ def _node_at_line(n):
 def _display_title(item):
     """Return ``item.title`` normalised for anchor matching.
 
-    Strips leading ``#`` markers (heading sigils) and any surrounding
-    whitespace. The stored ``title`` keeps its ``#``s so the tree row
-    still renders ``## Foo``; this helper only normalises the match
-    key. Falls back to ``title.strip()`` for non-heading items or
-    titles missing the expected leading ``#`` (defensive — list-item
-    titles have no leading ``#`` and we still want a sensible answer).
+    Stored titles are already pre-stripped at ``_build_nodes`` time —
+    headings have their leading ``#``s + whitespace removed, list
+    items have their marker + whitespace removed. This helper now
+    just trims surrounding whitespace so callers in the anchor-match
+    flow get a stable key regardless of any future title-construction
+    quirks.
 
-    Example: ``'## My **bold** heading'`` → ``'My **bold** heading'``
-    (inline markers preserved; only the leading ``#``s and surrounding
-    whitespace are stripped).
+    Example: a heading stored as ``'My **bold** heading'`` returns
+    itself unchanged; inline formatting markers are preserved.
     """
-    title = item.title
-    return title.lstrip('#').strip()
+    return item.title.strip()
 
 
 def _resolve_anchor(anchor, root_id):
