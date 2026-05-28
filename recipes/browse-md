@@ -4,15 +4,17 @@
 Parses each markdown file on argv into a tree of headings (h1..h6);
 list items under each section can optionally be surfaced as tree
 rows via the ``-l`` / ``--list`` / ``--lists`` flag (default:
-headings only). With a single file the per-file Item is the root.
-With multiple files a synthetic multi-root sits above the per-file
-Items so all files are visible as siblings.
+headings only). Per-file roots ARE the top-level entries: with a
+single file the browser opens scoped into that file's headings;
+with multiple files each file shows as a top-level row and the
+framework's ``get_children(None)`` returns the per-file roots in
+argv order.
 
 Anchor syntax (``FILE.md#name`` / ``FILE.md#<line>``) seeds the
 initial scope so deep links open directly on the targeted section.
 When multiple files carry anchors, the FIRST anchored file in argv
-order wins — other anchors are ignored, the multi-root still
-contains every file.
+order wins — other anchors are ignored, every file is still listed
+at the top level.
 
 The preview pane shows the file body (or a byte-slice for non-root
 cursor rows), optionally rendered through md2ansi for ANSI-coloured
@@ -24,13 +26,14 @@ Custom actions on top of the framework defaults:
   m   toggle md2ansi coloring of the preview (only bound when the
       ``md2ansi`` Python module is importable).
   M   page the preview through ``$MD2ANSI`` / external ``md2ansi``.
-  V   page the source for cursor/selection in ``$PAGER``. On the
-      multi-root opens the first argv file; on a per-file root
-      opens that file; on a non-root row pages the byte-slice
-      tempfile. Cross-file multi-select takes the FIRST file's
-      targets only.
+  V   page the source for cursor/selection in ``$PAGER``. On a
+      per-file root opens that file; on non-root rows pages a temp
+      file containing the merged byte-range slices. Cross-file
+      multi-select groups targets by file, merges byte ranges per
+      file, and concatenates the resulting slices with a
+      ``\\n===== <filename> =====\\n`` separator between groups.
   E   edit the source for cursor/selection in ``$EDITOR``. Same
-      multi-root / per-file-root / cross-file rules as V.
+      per-file-root / cross-file rules as V.
 
 Usage:  browse-md [-l] FILE.md[#anchor] [FILE.md[#anchor] ...]
 """
@@ -62,14 +65,6 @@ except Exception:
 _MD_COLOR = _md2ansi_fn is not None
 _BROWSER = None  # set in main() — used for preview-width lookup
 
-# Sentinel id for the synthetic multi-root that owns the per-file
-# subtrees. Distinct from any real abs-path (real paths don't start
-# with ``(``) and short enough that ``get_preview`` / classifier
-# string-compare against it cheaply. The same constant becomes the
-# Browser's ``root_id`` so the framework's reload hook recognises
-# "reload at root" via ``node_id == _ROOT_ID``.
-_ROOT_ID = '(multi)'
-
 # Per-file state slot — populated by ``_reparse`` from
 # ``_INPUT_FILES``. Lookups in ``get_preview`` / classifier resolve
 # the right file's text + indexes via this dict; the per-Item
@@ -81,10 +76,12 @@ _FILES = {}
 # by Ctrl-R to know which files to re-slurp.
 _INPUT_FILES = []
 
-# Aggregate id-to-Item index — multi-root + per-file roots + every
-# heading/list-item across every file. Read by ``get_children`` to
+# Aggregate id-to-Item index — per-file roots + every heading /
+# list-item across every file. Read by ``get_children`` to
 # materialise tree rows on demand and by ``get_preview`` to look up
-# an id's owning file via ``item.file_path``.
+# an id's owning file via ``item.file_path``. There is no synthetic
+# multi-root: ``get_children(None)`` returns the per-file roots in
+# argv order, so the files ARE the top-level entries.
 _BY_ID = {}
 
 # --- Legacy single-file shims --------------------------------------
@@ -264,9 +261,9 @@ class _FileState:
       * ``line_starts``  — byte offset of the start of each line.
                           Passed into ``_walk_list`` / ``_line_of``.
       * ``by_id``        — id-to-Item index for THIS file (no
-                          multi-root, no other files). Useful when
-                          a helper needs to walk only one file's
-                          nodes (e.g. anchor resolution).
+                          other files). Useful when a helper needs
+                          to walk only one file's nodes (e.g.
+                          anchor resolution).
       * ``by_line``      — ``line_offset -> Item`` for this file.
                           Excludes the per-file root so anchor
                           lookups for offsets in preamble territory
@@ -274,9 +271,10 @@ class _FileState:
       * ``lines_sorted`` — sorted keys of ``by_line`` for the
                           ``bisect_right`` lookup in
                           ``_node_at_line``.
-      * ``file_root``    — the per-file root Item (siblings under
-                          the synthetic multi-root in multi-file
-                          mode; THE root in single-file mode).
+      * ``file_root``    — the per-file root Item. In multi-file
+                          mode it's one of the top-level rows
+                          returned by ``get_children(None)``; in
+                          single-file mode it's the only one.
     """
 
     __slots__ = ('path', 'text', 'line_starts',
@@ -409,16 +407,16 @@ def _build_nodes(events, file_text, line_starts, path):
 
     Returns ``(root, by_id)``. The per-file root owns every top-level
     heading and every pre-first-heading list item; ``by_id`` is the
-    flat id-to-Item index for THIS file (no multi-root, no other
-    files). Children lists are pre-populated on each Item as
-    ``item._children`` so ``get_children`` can return them without
-    re-walking the event stream.
+    flat id-to-Item index for THIS file (no other files). Children
+    lists are pre-populated on each Item as ``item._children`` so
+    ``get_children`` can return them without re-walking the event
+    stream.
 
-    Every Item carries ``file_path = path`` so multi-file ``get_preview``
-    knows which file's ``_FILE_TEXT`` to slice from — even when only
-    the id is in hand. The per-file root gets the same back-reference;
-    the synthetic multi-root (built later in ``_build_multi_root``) is
-    the only Item without one.
+    Every Item carries ``file_path = path`` so multi-file
+    ``get_preview`` knows which file's text to slice from — even
+    when only the id is in hand. The per-file root gets the same
+    back-reference; files ARE the top-level entries, so there's no
+    synthetic root above them that would need its own metadata.
 
     Three passes:
 
@@ -606,52 +604,10 @@ def _build_line_index(by_id):
     return by_line, lines_sorted
 
 
-def _build_multi_root(file_states):
-    """Synthesise the multi-root Item sitting above the per-file roots.
-
-    ``file_states`` is the argv-ordered list of ``_FileState`` objects
-    coming out of ``_reparse``. The returned root carries:
-
-      * ``id == _ROOT_ID``  — the sentinel matching ``_FILES`` lookups
-        in ``get_preview`` / classifier.
-      * ``title``           — ``"N files"`` so the row reads as a
-        compact summary in the visible-tree header.
-      * ``kind == 'multi-root'`` — distinct from per-file roots'
-        ``'root'`` so the classifier can tell them apart.
-      * ``_children``       — the per-file roots in argv order.
-      * ``byte_offset/byte_size`` — zero (no underlying text). The
-        ``V`` / ``E`` classifier short-circuits BEFORE byte-range
-        slicing for multi-root targets, so these are never used.
-      * ``file_path = None`` — the multi-root has no owning file;
-        callers must classify before reading the attr.
-
-    Single-file callers (and tests that exercise the single-file
-    pipeline directly) never reach this helper — ``_reparse`` only
-    invokes it when ``_INPUT_FILES`` has more than one entry, so the
-    Browser's ``root_id`` is the per-file root's id in that case and
-    the multi-root sentinel sits unused.
-    """
-    root = Item(
-        id=_ROOT_ID,
-        title=f'{len(file_states)} files',
-        has_children=bool(file_states),
-    )
-    root.kind = 'multi-root'
-    root.level = 0
-    root.byte_offset = 0
-    root.byte_size = 0
-    root.line_offset = 0
-    root.line_size = 0
-    root.file_path = None
-    root._children = [fs.file_root for fs in file_states]
-    return root
-
-
 def _classify_id(node_id):
     """Single-source classifier for an Item id.
 
     Returns one of:
-      * ``('multi-root', None)``   — the synthetic multi-root sentinel.
       * ``('file-root', path)``    — a per-file root (id is the file's
                                      abs path; ``_FILES[path]`` exists).
       * ``('content', path)``      — a per-file heading or list-item.
@@ -665,8 +621,6 @@ def _classify_id(node_id):
     "slice into a per-file body". Centralising the rule means a future
     id-shape change touches one place.
     """
-    if node_id == _ROOT_ID:
-        return ('multi-root', None)
     if node_id in _FILES:
         return ('file-root', node_id)
     # Content id shape: ``<path>#<line>``. ``rpartition`` so paths
@@ -751,7 +705,7 @@ def _resolve_anchor(anchor, file_root_id):
     ``file_root_id`` is the per-file root id whose headings are
     searched. In multi-file mode the caller picks the file via
     "first anchored file wins" and passes its root id here; in
-    single-file (and legacy-test) mode it's just the lone root id.
+    single-file mode it's just the lone root id.
     """
     if not anchor:
         return file_root_id
@@ -822,14 +776,15 @@ def _reparse():
     with the same ``_parse`` + ``_build_nodes`` pipeline used in
     single-file mode.
 
-    With one input file the Browser root is that file's per-file root
-    (legacy behaviour: ``root_id`` = abs path). With two or more, the
-    Browser root is the synthetic multi-root sentinel ``_ROOT_ID`` and
-    each per-file root becomes a top-level sibling under it.
+    Files ARE the top-level entries: the Browser's ``root_id`` is
+    always ``None`` and ``get_children(None)`` returns the per-file
+    roots in argv order. There is no synthetic multi-root above
+    them — single-file and multi-file mode share the same tree
+    shape, the difference is just how many top-level rows there are.
 
-    Returns the root Item used by ``main()`` to seed ``BrowserConfig``
-    and by Ctrl-R callers (the latter discards it — but exposing it
-    keeps both code paths symmetric).
+    Returns ``None`` for symmetry with the previous signature — the
+    callers that used it (Ctrl-R) ignored the return value, and
+    ``main()`` no longer needs a "root" object because there is none.
     """
     global _FILES, _BY_ID
     global _FILE_TEXT, _BY_LINE, _LINES_SORTED, _ROOT_PATH
@@ -868,29 +823,11 @@ def _reparse():
         # Aggregate id-to-Item — every per-file by_id contributes.
         _BY_ID.update(by_id)
 
-    # Build the synthetic multi-root only when we have >1 files; the
-    # single-file path keeps the per-file root AS the Browser root so
-    # the visible-tree header reads as the file's basename rather than
-    # ``"1 files"``.
-    if len(file_states) > 1:
-        multi_root = _build_multi_root(file_states)
-        _BY_ID[_ROOT_ID] = multi_root
-        root = multi_root
-    elif file_states:
-        root = file_states[0].file_root
-    else:
-        # Defensive: ``main()`` rejects zero-positional argv, so this
-        # branch is unreachable in production. Tests that call
-        # ``_reparse`` with an empty ``_INPUT_FILES`` get an empty
-        # placeholder rather than a NameError.
-        root = None
-
     # Mirror the FIRST file's state into the legacy single-file
     # globals so tests / call sites that haven't been updated still
     # see a consistent view. In single-file mode this is the only
     # file's state; in multi-file mode the first file is the
-    # well-defined choice (matches "first file wins" for V/E on
-    # multi-root and ``_INPUT_FILES`` ordering).
+    # well-defined choice (matches ``_INPUT_FILES`` ordering).
     if file_states:
         first = file_states[0]
         _FILE_TEXT = first.text
@@ -903,82 +840,56 @@ def _reparse():
         _LINES_SORTED = []
         _ROOT_PATH = None
 
-    return root
+    return None
 
 
 def get_children(node_id, *, reload=False):
     """Return cached children for ``node_id``.
 
     The tree is built once in ``main()`` (``_build_nodes`` walks each
-    file's flat event stream and pre-populates ``item._children``,
-    then ``_reparse`` aggregates per-file roots under the synthetic
-    multi-root), so this is a dict lookup — no per-call parsing.
-    Unknown ids return ``[]`` so a stale anchor or scope id doesn't
-    surface as a traceback.
+    file's flat event stream and pre-populates ``item._children``;
+    ``_reparse`` collects the per-file roots into ``_FILES`` in argv
+    order), so this is a dict lookup — no per-call parsing. Unknown
+    ids return ``[]`` so a stale anchor or scope id doesn't surface
+    as a traceback.
 
-    ``reload=True`` is honoured only at the Browser root (``node_id``
-    is ``None`` or matches the current root id — ``_ROOT_ID`` in
-    multi-file mode, the single per-file root's path in single-file
-    mode): the framework's Ctrl-R hook calls
-    ``get_children(current_root, reload=True)``, and we use that as
-    the trigger to re-slurp every file and rebuild every index.
+    ``node_id is None`` is the framework's "top-level entries" probe
+    (Browser ``root_id=None``). We return the per-file roots in argv
+    order — files ARE the top-level rows, there is no synthetic
+    multi-root above them.
+
+    ``reload=True`` is honoured at the top-level probe (``node_id is
+    None``) — the framework's Ctrl-R hook calls
+    ``get_children(None, reload=True)``, and we use that as the
+    trigger to re-slurp every file and rebuild every index.
     Non-root reloads return cached children unchanged — full reparse
     is cheap but pointless when the request targets a sub-node.
     """
-    if reload:
-        # Treat ``None`` and either flavour of root (multi-root id or
-        # the single-file root path) as the "reload-at-root" trigger.
-        # ``_ROOT_PATH`` is the first file's abs path; in single-file
-        # mode it IS the Browser root id, in multi-file mode it's a
-        # per-file root and a reload there shouldn't reparse — but the
-        # ticket says "treat as root" so we keep the wider gate.
-        if node_id is None or node_id == _ROOT_ID or node_id == _ROOT_PATH:
-            _reparse()
+    if reload and node_id is None:
+        _reparse()
     if node_id is None:
-        # Pick the Browser root: multi-root sentinel if it's in the
-        # aggregate index, else the single-file root path.
-        node_id = _ROOT_ID if _ROOT_ID in _BY_ID else _ROOT_PATH
+        # Top-level: per-file roots in argv order. ``_INPUT_FILES``
+        # preserves argv order; ``_FILES`` is keyed by abs path so we
+        # consult ``_INPUT_FILES`` for the ordering and pull each
+        # file's root out of ``_FILES`` by path.
+        return [_FILES[p].file_root for p, _ in _INPUT_FILES if p in _FILES]
     item = _BY_ID.get(node_id)
     if item is None:
         return []
     return list(item._children)
 
 
-def _multi_root_preview():
-    """Return the summary text shown when the cursor is on the multi-root.
-
-    Lists each input file with the count of heading-kind items in its
-    subtree, one per line — a compact "what's loaded" view that
-    doesn't concatenate every file's body (which is the footgun the
-    ticket calls out). Falls back to a bare count if ``_FILES`` is
-    empty (defensive — ``main()`` rejects zero-positional argv).
-    """
-    if not _FILES:
-        return ''
-    lines = [f'{len(_FILES)} files:']
-    # Iterate in argv order so the summary lines match the visible
-    # tree order — ``_INPUT_FILES`` is the argv-derived list of
-    # ``(path, anchor)`` pairs.
-    for path, _anchor in _INPUT_FILES:
-        fs = _FILES.get(path)
-        if fs is None:
-            continue
-        n_headings = sum(
-            1 for it in fs.by_id.values() if it.kind == 'heading'
-        )
-        lines.append(f'  {os.path.basename(path)}  ({n_headings} headings)')
-    return '\n'.join(lines) + '\n'
-
-
 def get_preview(node_id):
     """Return the preview slice for ``node_id``.
 
-    Four dispatch paths (via ``_classify_id`` when ``_FILES`` is
+    Three dispatch paths (via ``_classify_id`` when ``_FILES`` is
     populated; legacy single-file callsites fall through to the
     module-level ``_FILE_TEXT`` / ``_BY_LINE`` shims):
 
-    1. Multi-root (``node_id == _ROOT_ID``) → ``_multi_root_preview``
-       short summary, NOT a concatenation of every file body.
+    1. ``node_id is None`` → empty string. The framework asks for a
+       preview at the "top-level entries" pseudo-row in some shells;
+       we have no aggregate content to show (files ARE the top-level
+       rows, each with its own preview).
     2. Per-file root → the corresponding ``_FILES[path].text`` (the
        whole file body).
     3. Per-file content (``<path>#<n>``) → byte-range slice from the
@@ -994,10 +905,10 @@ def get_preview(node_id):
     pathological markdown can't crash the preview pane — we just fall
     back to the raw slice.
     """
+    if node_id is None:
+        return ''
     kind, path = _classify_id(node_id)
-    if kind == 'multi-root':
-        text = _multi_root_preview()
-    elif kind == 'file-root':
+    if kind == 'file-root':
         text = _FILES[path].text
     elif kind == 'content':
         fs = _FILES[path]
@@ -1235,6 +1146,47 @@ def _write_range_excerpts(ranges, file_text=None):
     return tmp.name
 
 
+def _write_range_excerpts_grouped(groups):
+    """Write per-file merged byte-range slices to a single temp .md file.
+
+    ``groups`` is an ordered list of ``(path, file_text, merged_ranges)``
+    tuples — typically produced by ``_run_source_command`` grouping
+    non-root targets by ``file_path`` (in argv order) and running
+    ``_merge_ranges`` per file.
+
+    Each group is prefixed with a
+    ``\\n===== <basename(path)> =====\\n`` separator (omitted before
+    the first group) so the reader can see file boundaries. Within a
+    group, slices are written via the same ``\\n``-insertion logic
+    used by ``_write_range_excerpts`` — boundaries between
+    non-adjacent ranges get an explicit newline.
+
+    Returns the path to the written file; caller unlinks in
+    ``finally``.
+    """
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(
+        'w', suffix='.md', delete=False,
+        encoding='utf-8', errors='surrogateescape',
+    )
+    try:
+        first = True
+        for path, file_text, ranges in groups:
+            if not first:
+                tmp.write(f'\n===== {os.path.basename(path)} =====\n')
+            first = False
+            prev_slice = ''
+            for bo, bs in ranges:
+                piece = file_text[bo:bo + bs]
+                if prev_slice and not prev_slice.endswith('\n'):
+                    tmp.write('\n')
+                tmp.write(piece)
+                prev_slice = piece
+    finally:
+        tmp.close()
+    return tmp.name
+
+
 def _run_source_command(ctx, env_var, default):
     """Shared body of ``V`` / ``E``: resolve targets, dispatch external tool.
 
@@ -1242,104 +1194,98 @@ def _run_source_command(ctx, env_var, default):
     per-line extractor for byte-range merging):
 
       * ``ctx.targets`` handles "selection-or-cursor".
-      * Any target is the multi-root → open the FIRST argv file in
-        place. Multi-root has no underlying body so a byte-range
-        slice isn't meaningful; the first-file rule is documented
-        in ``_HELP_INTRO``.
       * Any target is a per-file root → open THAT file in place
         (``root_target.id`` is the abs path). Edits via ``E``
         persist naturally. Mirrors the pre-multi-file single-root
-        contract.
-      * Cross-file multi-select (non-root targets spanning more than
-        one file) → take the FIRST file's targets only and ignore
-        the rest. Spec-pinned to the simpler option; documented in
-        ``_HELP_INTRO``.
-      * Otherwise (all targets non-root + same file) → collect
-        ``(byte_offset, byte_size)`` ranges, merge them (sort +
-        dedupe + coalesce adjacent), concatenate the slices into a
-        temp .md file, run the external tool on it, unlink in
-        ``finally``.
+        contract; if multiple per-file roots are in the selection
+        the FIRST in argv order wins.
+      * All non-root targets in ONE file → collect
+        ``(byte_offset, byte_size)`` ranges, merge them, concatenate
+        the slices into a temp .md file, run the external tool on it,
+        unlink in ``finally``.
+      * Non-root targets across MULTIPLE files → group by file in
+        argv order, merge ranges per file, write each group to the
+        same temp .md file separated by a
+        ``\\n===== <filename> =====\\n`` header line so the reader
+        can see file boundaries.
 
     Empty ``targets`` (no cursor, no selection) is a no-op.
 
-    Root detection logic — there are now THREE "open the file
-    directly" shapes:
+    Root detection — there are two "open the file directly" shapes:
       * Real per-file root: ``kind == 'root'``.
-      * Real multi-root: ``kind == 'multi-root'``.
       * Framework's synthetic scope-root pseudo-Item (#552): no
-        ``kind`` attr at all; id matches the Browser's current root.
-    The id-based branch in ``_is_root`` covers the pseudo-row in
-    both single-file mode (id is the per-file root path) and
-    multi-file mode (id is ``_ROOT_ID``).
+        ``kind`` attr at all; id matches a key in ``_FILES`` (or
+        ``_ROOT_PATH`` in the legacy single-file test path).
     """
     targets = ctx.targets
     if not targets:
         return
 
     def _is_root(it):
-        # Real-root attrs first — they're the common case.
-        k = getattr(it, 'kind', None)
-        if k == 'root' or k == 'multi-root':
+        # Real per-file root attr first — common case.
+        if getattr(it, 'kind', None) == 'root':
             return True
         # Framework's scope-root pseudo-Item lacks ``kind`` but its
-        # id matches the Browser's root. We accept either the
-        # multi-root sentinel or any per-file root id (= a key in
-        # ``_FILES``). Legacy single-file callers fall through to
+        # id matches a file path (any key in ``_FILES`` is a per-file
+        # root id). Legacy single-file callers fall through to
         # ``_ROOT_PATH`` when ``_FILES`` is empty (tests don't go
         # through ``_reparse``).
-        return (
-            it.id == _ROOT_ID
-            or it.id in _FILES
-            or it.id == _ROOT_PATH
-        )
+        return it.id in _FILES or it.id == _ROOT_PATH
 
     cmd = _split_cmd(os.environ.get(env_var) or default)
 
-    # Find any root in the target set — root-wins on mixed input.
-    root_target = next((it for it in targets if _is_root(it)), None)
-    if root_target is not None:
-        path = _pick_path_for_root(root_target)
-        ctx.run_external(cmd + [path])
+    # Root-wins on mixed input. If multiple roots are present, pick
+    # the FIRST one in argv order so the behaviour is stable when the
+    # user multi-selects per-file roots.
+    root_targets = [it for it in targets if _is_root(it)]
+    if root_targets:
+        order = [p for p, _ in _INPUT_FILES]
+
+        def _root_path(it):
+            # Real per-file root or pseudo-Item with a known path.
+            return it.id if it.id in _FILES else (_ROOT_PATH or it.id)
+
+        # Pick the one that sorts earliest by argv order. Unknown
+        # paths sort last (defensive — should not happen in
+        # production).
+        chosen = min(
+            root_targets,
+            key=lambda it: order.index(_root_path(it))
+            if _root_path(it) in order else 1 << 31,
+        )
+        ctx.run_external(cmd + [_root_path(chosen)])
         return
 
-    # All targets non-root: figure out which file(s) they come from.
-    # Cross-file → first-file-only rule. Same-file → merge and write
-    # a single tempfile.
+    # All targets non-root: group by file in argv order.
     # ``getattr`` with a default keeps the legacy single-file tests
     # (which build Items without ``file_path``) on the ``_FILE_TEXT``
-    # branch via ``_write_range_excerpts``'s default arg.
-    paths_seen = []
+    # path.
+    by_path = {}
     for t in targets:
         fp = getattr(t, 'file_path', None)
-        if fp is not None and fp not in paths_seen:
-            paths_seen.append(fp)
+        by_path.setdefault(fp, []).append(t)
 
-    if len(paths_seen) <= 1:
-        # Single-file (or legacy fileless): all targets share one
-        # buffer.
-        file_text = None
-        if paths_seen:
-            fs = _FILES.get(paths_seen[0])
-            if fs is not None:
-                file_text = fs.text
-        same_file_targets = targets
-    else:
-        # Cross-file: keep only the first file's targets. The first
-        # file is determined by argv order (``_INPUT_FILES``) — pick
-        # whichever of ``paths_seen`` appears earliest there.
-        order = [p for p, _ in _INPUT_FILES]
-        first_path = min(
-            paths_seen, key=lambda p: order.index(p) if p in order else 1 << 31,
-        )
-        same_file_targets = [
-            t for t in targets if getattr(t, 'file_path', None) == first_path
-        ]
-        fs = _FILES.get(first_path)
-        file_text = fs.text if fs is not None else None
+    # Build the ordered per-file groups. Files in argv order first,
+    # then any fileless targets (legacy single-file tests) at the end.
+    groups = []
+    seen = set()
+    for p, _ in _INPUT_FILES:
+        if p in by_path and p not in seen:
+            seen.add(p)
+            fs = _FILES.get(p)
+            if fs is None:
+                continue
+            ranges = [(t.byte_offset, t.byte_size) for t in by_path[p]]
+            groups.append((p, fs.text, _merge_ranges(ranges)))
+    # Legacy fileless targets (``file_path is None``) — fall through
+    # to ``_FILE_TEXT``. Only relevant in single-file test fixtures.
+    if None in by_path:
+        ranges = [(t.byte_offset, t.byte_size) for t in by_path[None]]
+        groups.append((_ROOT_PATH or '', _FILE_TEXT, _merge_ranges(ranges)))
 
-    ranges = [(t.byte_offset, t.byte_size) for t in same_file_targets]
-    merged = _merge_ranges(ranges)
-    tmp_path = _write_range_excerpts(merged, file_text=file_text)
+    if not groups:
+        return
+    tmp_path = _write_range_excerpts_grouped(groups)
     try:
         ctx.run_external(cmd + [tmp_path])
     finally:
@@ -1349,36 +1295,16 @@ def _run_source_command(ctx, env_var, default):
             pass
 
 
-def _pick_path_for_root(root_target):
-    """Resolve a root-classified target to the file path to open.
-
-    Cases:
-      * Multi-root (real or pseudo, id == ``_ROOT_ID``): take the
-        FIRST input file. Documented in ``_HELP_INTRO``.
-      * Per-file root: ``root_target.id`` IS the file path.
-      * Legacy single-file pseudo-root (id == ``_ROOT_PATH``,
-        ``_FILES`` empty): fall through to ``_ROOT_PATH``.
-    """
-    if root_target.id == _ROOT_ID:
-        if _INPUT_FILES:
-            return _INPUT_FILES[0][0]
-        # Defensive: multi-root without an input list shouldn't
-        # happen — but if it does, open the legacy single-file shim.
-        return _ROOT_PATH
-    if root_target.id in _FILES:
-        return root_target.id
-    # Legacy / scope-root pseudo-item in single-file mode.
-    return _ROOT_PATH if _ROOT_PATH is not None else root_target.id
-
-
 def _action_view_source(ctx):
     """``V`` — page the source for the cursor row (or selection) in $PAGER.
 
-    On a root row this pages the original file; on non-root rows it
-    pages a temp .md file containing the merged byte-range slices for
-    every targeted item (or the first file's slices when the selection
-    spans multiple files). Pairs with the framework's built-in ``v``
-    (which pages the *preview* text, not the on-disk source).
+    On a per-file root row this pages the original file directly; on
+    non-root rows it pages a temp .md file containing the merged
+    byte-range slices for every targeted item. Cross-file selections
+    group ranges by file and concatenate the per-file slices with a
+    ``\\n===== <filename> =====\\n`` separator. Pairs with the
+    framework's built-in ``v`` (which pages the *preview* text, not
+    the on-disk source).
     """
     _run_source_command(ctx, 'PAGER', 'less -R')
 
@@ -1386,10 +1312,12 @@ def _action_view_source(ctx):
 def _action_edit_source(ctx):
     """``E`` — open the source for the cursor row (or selection) in $EDITOR.
 
-    On a root row this edits the original file in place; on non-root
-    rows it opens a throwaway temp .md file with the merged slice
-    contents. Separate from the framework's built-in ``e`` (which
-    opens the *preview text* in $EDITOR with edits discarded).
+    On a per-file root row this edits the original file in place; on
+    non-root rows it opens a throwaway temp .md file with the merged
+    slice contents (cross-file selections use the same per-file
+    grouping + separator as ``V``). Separate from the framework's
+    built-in ``e`` (which opens the *preview text* in $EDITOR with
+    edits discarded).
     """
     _run_source_command(ctx, 'EDITOR', 'vim')
 
@@ -1399,8 +1327,10 @@ browse-md — markdown browser for one or more files.
 
 Usage: browse-md [-l] FILE.md[#anchor] [FILE.md[#anchor] ...]
   -l, --list, --lists  Also surface list items (default: headings).
-  FILE.md   One or more markdown files. Multi-root row sits above
-            per-file subtrees when >1 file is given.
+  FILE.md   One or more markdown files. Each file shows as a
+            top-level row in the tree; there is no synthetic root
+            above them. With a single file the browser opens scoped
+            into that file's headings.
   #anchor   Deep-link target — 0-based line number or heading name
             (exact / prefix / substring tiers; first hit wins). When
             multiple files carry anchors, the FIRST anchored file in
@@ -1408,11 +1338,14 @@ Usage: browse-md [-l] FILE.md[#anchor] [FILE.md[#anchor] ...]
 
   m       Toggle md2ansi coloring (requires md2ansi).
   M       Render the preview through ``$MD2ANSI`` / md2ansi.
-  V       Page source for cursor/selection in ``$PAGER``. Multi-root
-          / per-file root opens the file directly; cross-file
-          multi-select takes the first file's targets only.
+  V       Page source for cursor/selection in ``$PAGER``. On a
+          per-file root opens that file directly; on non-root rows
+          pages a temp file with the merged byte-range slices.
+          Cross-file selections group by file in argv order and
+          concatenate the per-file slices separated by
+          ``\\n===== <filename> =====\\n``.
   E       Edit source for cursor/selection in ``$EDITOR`` (same
-          root / cross-file rules as V).
+          per-file / cross-file rules as V).
   Ctrl-R  Re-slurp every input file and rebuild the tree.\
 """
 
@@ -1507,18 +1440,27 @@ def main():
     # First parse runs through the shared ``_reparse`` helper — same
     # path that Ctrl-R uses, so any rebuild bug surfaces at startup
     # not at first reload.
-    root = _reparse()
+    _reparse()
 
-    # Resolve the initial scope:
-    #   * No anchors anywhere → multi-root (or the single per-file
-    #     root in single-file mode), i.e. ``root.id``.
-    #   * Some anchor → resolve against the first anchored file's
-    #     state. Result is either a content id (heading/line hit) or
-    #     the file's own root id (anchor missed → fallthrough).
+    # Resolve the initial scope. Files ARE the top-level entries
+    # (``BrowserConfig(root_id=None)``); ``initial_scope`` controls
+    # which row the browser opens "into" on startup:
+    #   * Multi-file, no anchor → ``None`` (show the top-level list
+    #     of files; user picks).
+    #   * Multi-file, first anchor on file X → resolve against X.
+    #   * Single-file, no anchor → scope INTO the file's per-file
+    #     root (visual matches the pre-#553 single-file UX).
+    #   * Single-file, anchor → resolve against the file.
     if first_anchor_path is not None:
         initial_scope = _resolve_anchor(_ANCHOR, first_anchor_path)
+    elif len(_FILES) == 1:
+        # Single-file no-anchor: open scoped INTO the file's root so
+        # the user immediately sees the file's headings rather than a
+        # one-row list. Same visual as before the multi-file rework.
+        only_path = next(iter(_FILES))
+        initial_scope = _FILES[only_path].file_root.id
     else:
-        initial_scope = root.id
+        initial_scope = None
 
     # ``M`` is always available — it errors gracefully when no
     # renderer is found, so users discover the env-var hook even on
@@ -1543,7 +1485,7 @@ def main():
         title='browse-md',
         show_children_pane=False,
         show_ids='never',
-        root_id=root.id,
+        root_id=None,
         get_children=get_children,
         get_preview=get_preview,
         initial_scope=initial_scope,

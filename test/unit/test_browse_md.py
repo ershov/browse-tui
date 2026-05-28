@@ -1784,11 +1784,18 @@ class TestReload(unittest.TestCase):
         # ``_LINES_SORTED`` is the bisect view — must stay in sync.
         self.assertEqual(self.r._LINES_SORTED, new_lines)
 
-    def test_reload_reparses_when_node_id_matches_root_path(self):
-        # The framework's Ctrl-R hook can pass either ``None`` or the
-        # current root's id; ``_ROOT_PATH`` is the id we registered.
+    def test_reload_only_at_top_level_probe(self):
+        # Post-#559: ``BrowserConfig(root_id=None)`` means Ctrl-R
+        # always calls ``get_children(None, reload=True)``. Reload
+        # requests at any other node-id (including ``_ROOT_PATH`` —
+        # which is now just a per-file root, not the Browser root)
+        # short-circuit to the cached branch.
         self._write('# Delta\n')
         self.r.get_children(self.r._ROOT_PATH, reload=True)
+        # Stale content survives — no reparse ran.
+        self.assertEqual(self._heading_titles(), ['Alpha', 'Sub-Alpha'])
+        # Reload at ``None`` does reparse.
+        self.r.get_children(None, reload=True)
         self.assertEqual(self._heading_titles(), ['Delta'])
 
     def test_reload_false_does_not_reparse(self):
@@ -2275,9 +2282,9 @@ class _MultiCaseBase(unittest.TestCase):
         """Populate ``_INPUT_FILES`` with the given paths and reparse.
 
         ``files`` is a sequence of ``(abs_path, anchor)`` tuples — or
-        bare paths, in which case the anchor defaults to ``''``. Returns
-        the root Item ``_reparse`` produced (multi-root when >1 file,
-        per-file root for a single file).
+        bare paths, in which case the anchor defaults to ``''``.
+        Returns ``None`` (post-#559 ``_reparse`` has no root to
+        return — files ARE the top-level entries).
         """
         normalised = []
         for f in files:
@@ -2406,20 +2413,25 @@ class TestArgvMulti(_MultiCaseBase):
 
 
 class TestBuildMulti(_MultiCaseBase):
-    """Multi-root + per-file roots constructed by ``_reparse``."""
+    """Per-file roots constructed by ``_reparse`` as top-level entries.
 
-    def test_multi_root_has_per_file_root_children(self):
-        root = self._load_multi(self.path_a, self.path_b)
-        # Root id is the sentinel — distinct from any real path.
-        self.assertEqual(root.id, self.r._ROOT_ID)
-        # Children are the two per-file roots in argv order.
-        self.assertEqual([c.id for c in root._children],
-                         [self.path_a, self.path_b])
+    Post-#559: there is no synthetic multi-root. ``get_children(None)``
+    returns the per-file roots in argv order; files ARE the top-level
+    rows.
+    """
+
+    def test_get_children_none_returns_per_file_roots_in_argv_order(self):
+        # The framework's ``get_children(None)`` probe is the only
+        # path to the top-level rows — files in argv order.
+        self._load_multi(self.path_a, self.path_b)
+        top = self.r.get_children(None)
+        self.assertEqual([c.id for c in top], [self.path_a, self.path_b])
 
     def test_per_file_root_titles_are_basenames(self):
         import os
-        root = self._load_multi(self.path_a, self.path_b)
-        titles = [c.title for c in root._children]
+        self._load_multi(self.path_a, self.path_b)
+        top = self.r.get_children(None)
+        titles = [c.title for c in top]
         self.assertEqual(titles, [
             os.path.basename(self.path_a),
             os.path.basename(self.path_b),
@@ -2428,8 +2440,8 @@ class TestBuildMulti(_MultiCaseBase):
     def test_per_file_root_has_expected_headings(self):
         # Each per-file root carries its own headings (h1/h2) — the
         # exact tree shape from single-file ``_build_nodes``.
-        root = self._load_multi(self.path_a, self.path_b)
-        a_root, b_root = root._children
+        self._load_multi(self.path_a, self.path_b)
+        a_root, b_root = self.r.get_children(None)
         a_tags = [c.tag for c in a_root._children]
         # A has two h1s (A1, A1b).
         self.assertEqual(a_tags, ['h1', 'h1'])
@@ -2437,45 +2449,44 @@ class TestBuildMulti(_MultiCaseBase):
         # B has two h1s (B1, B1b).
         self.assertEqual(b_tags, ['h1', 'h1'])
 
-    def test_multi_root_kind(self):
-        # The multi-root carries a distinct ``kind`` so the classifier
-        # can tell it apart from per-file roots.
-        root = self._load_multi(self.path_a, self.path_b)
-        self.assertEqual(root.kind, 'multi-root')
+    def test_no_synthetic_multi_root_in_by_id(self):
+        # No ``(multi)`` / ``multi-root`` Item lives in the aggregate
+        # index. Every Item is either a per-file root (id == path) or
+        # a per-file content node (id == ``<path>#<line>``).
+        self._load_multi(self.path_a, self.path_b)
+        for item_id, item in self.r._BY_ID.items():
+            self.assertNotEqual(
+                getattr(item, 'kind', None), 'multi-root',
+                f'unexpected multi-root item: {item_id}')
 
     def test_per_file_root_kind_is_root(self):
         # Per-file roots keep the ``'root'`` kind — same shape as the
-        # pre-multi-file single root, so existing root-detection logic
+        # pre-multi-file single root, so root-detection logic
         # (e.g. ``_run_source_command``) classifies them correctly.
-        root = self._load_multi(self.path_a, self.path_b)
-        for c in root._children:
+        self._load_multi(self.path_a, self.path_b)
+        for c in self.r.get_children(None):
             self.assertEqual(c.kind, 'root')
 
-    def test_aggregate_by_id_contains_multi_root_and_per_file_ids(self):
-        root = self._load_multi(self.path_a, self.path_b)
-        self.assertIn(self.r._ROOT_ID, self.r._BY_ID)
+    def test_aggregate_by_id_contains_per_file_ids(self):
+        self._load_multi(self.path_a, self.path_b)
         self.assertIn(self.path_a, self.r._BY_ID)
         self.assertIn(self.path_b, self.r._BY_ID)
         # And the per-file headings — at least one from each file.
         self.assertIn(f'{self.path_a}#0', self.r._BY_ID)
         self.assertIn(f'{self.path_b}#0', self.r._BY_ID)
 
-    def test_single_file_uses_per_file_root_no_multi_root(self):
-        # With a single file in ``_INPUT_FILES``, the Browser root
-        # stays as the per-file root — no multi-root sentinel is added
-        # to ``_BY_ID`` (the visible-tree header reads as the file's
-        # basename rather than ``"1 files"``).
-        root = self._load_multi(self.path_a)
-        self.assertEqual(root.id, self.path_a)
-        self.assertNotIn(self.r._ROOT_ID, self.r._BY_ID)
+    def test_single_file_top_level_has_one_row(self):
+        # With one file in ``_INPUT_FILES``, the top-level row count
+        # is 1 — that file's per-file root. No synthetic multi-root.
+        self._load_multi(self.path_a)
+        top = self.r.get_children(None)
+        self.assertEqual([c.id for c in top], [self.path_a])
 
     def test_items_carry_file_path_back_reference(self):
-        # Every Item built by ``_build_nodes`` carries ``file_path`` so
-        # ``get_preview`` can find its owning file's text. Multi-root
-        # itself has no owning file (``file_path is None``).
-        root = self._load_multi(self.path_a, self.path_b)
-        self.assertIsNone(root.file_path)
-        a_root, b_root = root._children
+        # Every Item built by ``_build_nodes`` carries ``file_path``
+        # so ``get_preview`` can find its owning file's text.
+        self._load_multi(self.path_a, self.path_b)
+        a_root, b_root = self.r.get_children(None)
         self.assertEqual(a_root.file_path, self.path_a)
         self.assertEqual(b_root.file_path, self.path_b)
         # Per-file content items inherit their file's path.
@@ -2484,7 +2495,16 @@ class TestBuildMulti(_MultiCaseBase):
 
 
 class TestAnchorMulti(_MultiCaseBase):
-    """Initial-scope resolution across multiple files."""
+    """Initial-scope resolution across one or more files.
+
+    Post-#559 the rules are:
+      * Multi-file, no anchor → ``initial_scope is None`` (browser
+        starts at the top-level list of files).
+      * Multi-file, first anchor on file X → resolve against X.
+      * Single-file, no anchor → ``initial_scope`` is the file's own
+        per-file root id (browser opens scoped INTO the file).
+      * Single-file, anchor → resolve against the file.
+    """
 
     def _initial_scope(self, *files):
         """Re-run the argv-to-initial-scope flow without invoking ``main()``.
@@ -2493,7 +2513,7 @@ class TestAnchorMulti(_MultiCaseBase):
         the first anchored file, resolve via ``_resolve_anchor``.
         """
         self.r._INPUT_FILES = list(files)
-        root = self.r._reparse()
+        self.r._reparse()
         first_anchor = ''
         first_anchor_path = None
         for path, anchor in files:
@@ -2502,14 +2522,24 @@ class TestAnchorMulti(_MultiCaseBase):
                 first_anchor_path = path
         if first_anchor_path is not None:
             return self.r._resolve_anchor(first_anchor, first_anchor_path)
-        return root.id
+        if len(self.r._FILES) == 1:
+            only_path = next(iter(self.r._FILES))
+            return self.r._FILES[only_path].file_root.id
+        return None
 
-    def test_no_anchors_returns_multi_root_id(self):
-        # Two files, neither anchored → initial scope is the
-        # multi-root sentinel.
+    def test_multi_file_no_anchor_returns_none(self):
+        # Two files, neither anchored → initial scope is ``None``
+        # (browser shows the top-level list of files).
         scope = self._initial_scope(
             (self.path_a, ''), (self.path_b, ''))
-        self.assertEqual(scope, self.r._ROOT_ID)
+        self.assertIsNone(scope)
+
+    def test_single_file_no_anchor_returns_file_root_id(self):
+        # One file, no anchor → scope into the file's root so the
+        # browser opens on its headings (matches the pre-multi-file
+        # single-file UX).
+        scope = self._initial_scope((self.path_a, ''))
+        self.assertEqual(scope, self.path_a)
 
     def test_anchor_on_second_file_resolves_in_that_file(self):
         # File A unanchored, file B carries ``#B2`` → scope drills
@@ -2541,22 +2571,23 @@ class TestAnchorMulti(_MultiCaseBase):
             (self.path_a, ''), (self.path_b, '0'))
         self.assertEqual(scope, f'{self.path_b}#0')
 
+    def test_single_file_anchor_resolves(self):
+        # Single file with anchor → resolves via ``_resolve_anchor``
+        # against that file's per-file root.
+        scope = self._initial_scope((self.path_a, 'A2'))
+        self.assertEqual(scope, f'{self.path_a}#1')
+
 
 class TestGetPreviewMulti(_MultiCaseBase):
-    """``get_preview`` dispatch across the multi-root id space."""
+    """``get_preview`` dispatch across the multi-file id space."""
 
-    def test_multi_root_preview_is_summary_not_concatenation(self):
+    def test_preview_at_none_is_empty(self):
+        # Files ARE the top-level entries; the framework asking for
+        # ``get_preview(None)`` (no row selected) returns the empty
+        # string — there is no aggregate preview to show.
         self._load_multi(self.path_a, self.path_b)
-        # Force md2ansi off so the raw summary string flows through.
         self.r._MD_COLOR = False
-        out = self.r.get_preview(self.r._ROOT_ID)
-        # Summary mentions both basenames and a heading count line.
-        import os
-        self.assertIn(os.path.basename(self.path_a), out)
-        self.assertIn(os.path.basename(self.path_b), out)
-        # And critically NOT the body of either file (no
-        # concatenation footgun).
-        self.assertNotIn('body of A2', out)
+        self.assertEqual(self.r.get_preview(None), '')
 
     def test_per_file_root_preview_is_full_file_text(self):
         self._load_multi(self.path_a, self.path_b)
@@ -2587,7 +2618,14 @@ class TestGetPreviewMulti(_MultiCaseBase):
 
 
 class TestRunSourceCommandMulti(_MultiCaseBase):
-    """``_run_source_command`` semantics on multi-root + cross-file."""
+    """``_run_source_command`` semantics on multi-file selections.
+
+    Post-#559: no synthetic multi-root, so no "open first file"
+    short-circuit. Per-file root rows open that file directly;
+    non-root selections — including ones spanning multiple files —
+    are honoured by grouping ranges per file and concatenating the
+    per-file slices into one temp file with a header separator.
+    """
 
     def setUp(self):
         super().setUp()
@@ -2606,33 +2644,24 @@ class TestRunSourceCommandMulti(_MultiCaseBase):
                 os.environ[k] = v
         super().tearDown()
 
-    def test_multi_root_opens_first_file(self):
-        # Real multi-root target → opens the first argv file.
-        self._load_multi(self.path_a, self.path_b)
-        multi_root = self.r._BY_ID[self.r._ROOT_ID]
-        ctx = _SrcCmdCtx(targets=[multi_root])
-        self.r._run_source_command(ctx, 'PAGER', 'less -R')
-        self.assertEqual(ctx.calls, [['less', '-R', self.path_a]])
-
-    def test_multi_root_pseudo_item_opens_first_file(self):
-        # Scope-root pseudo-Item (no ``kind`` attr) with id ==
-        # ``_ROOT_ID`` should still classify as multi-root and open
-        # the first file. #552 contract carried into multi-file mode.
-        self._load_multi(self.path_a, self.path_b)
-        pseudo = _ScopeRootPseudoItem(id=self.r._ROOT_ID)
-        ctx = _SrcCmdCtx(targets=[pseudo])
-        self.r._run_source_command(ctx, 'PAGER', 'less -R')
-        self.assertEqual(ctx.calls, [['less', '-R', self.path_a]])
-
     def test_per_file_root_opens_that_file(self):
-        # Per-file root target → opens that specific file (not the
-        # first argv file). Mirrors the pre-multi-file V/E behaviour
-        # one level deeper in the tree.
+        # Per-file root target → opens that specific file.
         self._load_multi(self.path_a, self.path_b)
         b_root = self.r._FILES[self.path_b].file_root
         ctx = _SrcCmdCtx(targets=[b_root])
         self.r._run_source_command(ctx, 'PAGER', 'less -R')
         self.assertEqual(ctx.calls, [['less', '-R', self.path_b]])
+
+    def test_first_per_file_root_wins_when_multiple_selected(self):
+        # Two per-file roots selected → open the FIRST in argv order
+        # (stable rule when the user multi-selects file rows).
+        self._load_multi(self.path_a, self.path_b)
+        a_root = self.r._FILES[self.path_a].file_root
+        b_root = self.r._FILES[self.path_b].file_root
+        # Selection order reversed — argv order is what matters.
+        ctx = _SrcCmdCtx(targets=[b_root, a_root])
+        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.assertEqual(ctx.calls, [['less', '-R', self.path_a]])
 
     def test_same_file_non_root_targets_merge_in_one_tempfile(self):
         # Two non-root targets from the SAME file → one tempfile, the
@@ -2647,33 +2676,47 @@ class TestRunSourceCommandMulti(_MultiCaseBase):
         # cover the whole A file (A1 spans to A1b, A1b spans to EOF).
         self.assertEqual(ctx.last_tmp_contents, self.A_TEXT)
 
-    def test_cross_file_takes_first_file_only(self):
-        # Targets span both files → only the first file's targets
-        # make it into the tempfile (documented "first-file-only"
-        # cross-file rule).
-        self._load_multi(self.path_a, self.path_b)
-        a_h1 = self.r._BY_ID[f'{self.path_a}#0']
-        b_h1 = self.r._BY_ID[f'{self.path_b}#0']
-        ctx = _SrcCmdCtx(targets=[a_h1, b_h1])
-        self.r._run_source_command(ctx, 'PAGER', 'less -R')
-        self.assertEqual(len(ctx.calls), 1)
-        # Tempfile contains A's slice, not B's.
-        self.assertIn('A1', ctx.last_tmp_contents)
-        self.assertNotIn('B1', ctx.last_tmp_contents)
-
-    def test_cross_file_first_file_is_argv_order_not_target_order(self):
-        # Even when B's target is listed FIRST in the selection,
-        # cross-file dedup picks the FIRST file by argv order — file
-        # A, not file B. The "first-file" rule is positional, not
-        # selection-order.
+    def test_cross_file_groups_by_file_in_argv_order(self):
+        # Targets span both files → temp file contains BOTH files'
+        # slices, grouped per file with a ``===== <basename> =====``
+        # separator. Files appear in argv order (A before B) regardless
+        # of selection order.
+        import os
         self._load_multi(self.path_a, self.path_b)
         a_h1 = self.r._BY_ID[f'{self.path_a}#0']
         b_h1 = self.r._BY_ID[f'{self.path_b}#0']
         ctx = _SrcCmdCtx(targets=[b_h1, a_h1])
         self.r._run_source_command(ctx, 'PAGER', 'less -R')
         self.assertEqual(len(ctx.calls), 1)
-        self.assertIn('A1', ctx.last_tmp_contents)
-        self.assertNotIn('B1', ctx.last_tmp_contents)
+        out = ctx.last_tmp_contents
+        # Both files' headings are present.
+        self.assertIn('# A1', out)
+        self.assertIn('# B1', out)
+        # Argv order: A's slice precedes B's, and the separator carries
+        # B's basename.
+        a_idx = out.find('# A1')
+        b_idx = out.find('# B1')
+        self.assertLess(a_idx, b_idx)
+        # Separator format: ``\n===== <basename> =====\n`` before B's
+        # group (no separator before the first group, which is A).
+        sep = f'===== {os.path.basename(self.path_b)} ====='
+        self.assertIn(sep, out)
+        # A's basename should NOT appear as a separator (A is the
+        # first group, no header before it).
+        a_sep = f'===== {os.path.basename(self.path_a)} ====='
+        self.assertNotIn(a_sep, out)
+
+    def test_cross_file_argv_order_independent_of_selection_order(self):
+        # Even when B's target is listed FIRST in the selection, the
+        # groups in the temp file appear in argv order (A then B).
+        self._load_multi(self.path_a, self.path_b)
+        a_h1 = self.r._BY_ID[f'{self.path_a}#0']
+        b_h1 = self.r._BY_ID[f'{self.path_b}#0']
+        ctx = _SrcCmdCtx(targets=[b_h1, a_h1])
+        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        out = ctx.last_tmp_contents
+        # A's content comes first.
+        self.assertLess(out.find('# A1'), out.find('# B1'))
 
 
 class TestReloadMulti(_MultiCaseBase):
@@ -2708,13 +2751,13 @@ class TestReloadMulti(_MultiCaseBase):
         self.assertEqual(a_titles, ['NewA'])
         self.assertEqual(b_titles, ['NewB', 'NewB2'])
 
-    def test_reload_at_multi_root_id_reparses(self):
-        # The framework's Ctrl-R hook can pass the current root id;
-        # for multi-file mode that's ``_ROOT_ID``. Reload should
-        # re-slurp every file.
+    def test_reload_at_none_reparses(self):
+        # Post-#559: ``BrowserConfig(root_id=None)`` means Ctrl-R
+        # always calls ``get_children(None, reload=True)``. Reload
+        # should re-slurp every file.
         self._load_multi(self.path_a, self.path_b)
         self._write(self.path_a, '# Mutated\n')
-        self.r.get_children(self.r._ROOT_ID, reload=True)
+        self.r.get_children(None, reload=True)
         a_titles = [
             it.title for it in self.r._FILES[self.path_a].by_id.values()
             if it.kind == 'heading'
@@ -2731,12 +2774,11 @@ class TestReloadMulti(_MultiCaseBase):
 
 
 class TestClassifyId(_MultiCaseBase):
-    """``_classify_id`` — single source of truth for id shape dispatch."""
+    """``_classify_id`` — single source of truth for id shape dispatch.
 
-    def test_multi_root_id(self):
-        self._load_multi(self.path_a, self.path_b)
-        self.assertEqual(
-            self.r._classify_id(self.r._ROOT_ID), ('multi-root', None))
+    Post-#559: three classifications — ``'file-root'``, ``'content'``,
+    ``'unknown'``. No synthetic multi-root case.
+    """
 
     def test_per_file_root_id(self):
         self._load_multi(self.path_a, self.path_b)
