@@ -957,6 +957,61 @@ class TestResolveAnchor(unittest.TestCase):
         self.assertEqual(result, self.root.id)
         self.assertIn('bullet', buf.getvalue())
 
+    def _build_goals_fixture(self):
+        # Single ``## Goals`` heading at line 0 so the three tiers can
+        # be exercised independently — stored title for ``## Goals`` is
+        # ``'Goals'`` after #542 stripped the marker.
+        text = '## Goals\n'
+        line_starts = self.r._line_starts(text)
+        events = self.r._parse(text)
+        root, by_id = self.r._build_nodes(events, text, line_starts, '/g.md')
+        self.r._BY_ID = by_id
+        self.r._BY_LINE, self.r._LINES_SORTED = (
+            self.r._build_line_index(by_id))
+        return root
+
+    def test_case_insensitive_exact_match(self):
+        # Lower-case anchor ``goals`` matches stored title ``Goals``
+        # via the exact tier (both sides lowered for comparison).
+        root = self._build_goals_fixture()
+        self.assertEqual(
+            self.r._resolve_anchor('goals', root.id), '/g.md#0')
+
+    def test_case_insensitive_all_caps_exact_match(self):
+        # All-caps anchor still hits the exact tier — lowering both
+        # sides means ``GOALS`` == ``goals`` == display ``Goals``.
+        root = self._build_goals_fixture()
+        self.assertEqual(
+            self.r._resolve_anchor('GOALS', root.id), '/g.md#0')
+
+    def test_case_insensitive_prefix_match(self):
+        # ``GOA`` is not an exact match for ``Goals`` but is a prefix
+        # (after both sides are lowered to ``goa`` / ``goals``).
+        root = self._build_goals_fixture()
+        self.assertEqual(
+            self.r._resolve_anchor('GOA', root.id), '/g.md#0')
+
+    def test_case_insensitive_substring_match(self):
+        # ``OAL`` is neither exact nor prefix; substring tier matches
+        # ``goals`` (lowered display title) contains ``oal``.
+        root = self._build_goals_fixture()
+        self.assertEqual(
+            self.r._resolve_anchor('OAL', root.id), '/g.md#0')
+
+    def test_no_match_warning_preserves_anchor_case(self):
+        # The stderr warning echoes the user's anchor string verbatim
+        # (including casing) — only the comparison key is lowered.
+        root = self._build_goals_fixture()
+        from io import StringIO
+        from contextlib import redirect_stderr
+        buf = StringIO()
+        with redirect_stderr(buf):
+            result = self.r._resolve_anchor('noMatch', root.id)
+        self.assertEqual(result, root.id)
+        # ``'noMatch'`` (preserved casing) appears in the warning —
+        # repr-quoted because the recipe uses ``{anchor!r}``.
+        self.assertIn("'noMatch'", buf.getvalue())
+
 
 class TestGetPreview(unittest.TestCase):
     """``get_preview`` — slice ``_FILE_TEXT`` per node, optionally md2ansi-render."""

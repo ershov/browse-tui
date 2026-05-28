@@ -599,17 +599,20 @@ def _resolve_anchor(anchor, root_id):
         (it for it in _BY_ID.values() if it.kind == 'heading'),
         key=lambda it: it.line_offset,
     )
+    # Lower the anchor once; comparison is case-insensitive but the
+    # stored title and the stderr warning still echo original casing.
+    key = anchor.lower()
     # Tier 1: exact match.
     for h in headings:
-        if _display_title(h) == anchor:
+        if _display_title(h).lower() == key:
             return h.id
     # Tier 2: prefix match.
     for h in headings:
-        if _display_title(h).startswith(anchor):
+        if _display_title(h).lower().startswith(key):
             return h.id
     # Tier 3: substring match.
     for h in headings:
-        if anchor in _display_title(h):
+        if key in _display_title(h).lower():
             return h.id
     print(
         f'browse-md: no heading matches {anchor!r}, opening at root',

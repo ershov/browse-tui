@@ -75,8 +75,10 @@ Argv parsing:
      every heading node, defined as the source line with `#` markers
      AND leading/trailing whitespace stripped. The stored `title`
      keeps `#`s; the comparison only normalises the search key.
-     Match is case-sensitive. Three-tier fallback — each tier
-     scans all headings in source order before falling through:
+     Match is case-insensitive (both anchor and display title are
+     lowered for comparison; the stored title is unchanged). Three-tier
+     fallback — each tier scans all headings in source order before
+     falling through:
      1. **Exact match**: `display_title == anchor`. First hit wins.
      2. **Prefix match**: `display_title.startswith(anchor)`. First
         hit wins.
