@@ -7,7 +7,9 @@ on the requested section.
 Usage:  browse-md FILE.md[#anchor]
 """
 
+import bisect
 import os
+import re
 import sys
 
 from browse_tui import Browser, BrowserConfig
@@ -23,6 +25,157 @@ _FILE_TEXT = ''
 
 
 _USAGE = 'usage: browse-md FILE.md[#anchor]'
+
+
+# ### Section: Markdown block-rule table ##############################
+#
+# Patterns lifted verbatim from md2ansi.py (lines 697-726). md2ansi
+# writes inner captures as ``(?P<*...>...)`` placeholders that its
+# ``_m2a_build_context`` rewrites at build time. We don't need those
+# inner names — ``_parse`` keys on the outer rule by iterating
+# ``_RULES`` and picking the first whose group matched (md2ansi-style;
+# see ``_m2a_replace`` in md2ansi.py). Every ``(?P<*...>...)`` is
+# converted to a non-capturing ``(?:...)`` group to keep the patterns
+# idiomatic ``re`` and avoid name collisions when stitched into the
+# combined regex below.
+#
+# Every alternation has disjoint branches (no-rollback discipline);
+# every cross-line span uses tempered-greedy ``(?: (?! STOP ) [\s\S] )*``
+# so the engine never backtracks. See the design doc's "Regex
+# discipline (no rollback, greedy)" section.
+
+# Headings — exact-count ``#`` followed by space ensures mutual exclusion.
+_MD_H1 = r"^ \# [ \t]+ (?: [^\n]+ ) $"
+_MD_H2 = r"^ \#{2} [ \t]+ (?: [^\n]+ ) $"
+_MD_H3 = r"^ \#{3} [ \t]+ (?: [^\n]+ ) $"
+_MD_H4 = r"^ \#{4} [ \t]+ (?: [^\n]+ ) $"
+_MD_H5 = r"^ \#{5} [ \t]+ (?: [^\n]+ ) $"
+_MD_H6 = r"^ \#{6} [ \t]+ (?: [^\n]+ ) $"
+
+_MD_HR = r"^ (?: -{3,} | ={3,} | _{3,} ) [ \t]* $"
+
+# Frontmatter — anchored to file start via ``\A`` so it never matches
+# mid-document. Tempered-greedy body so the closing ``---`` is the
+# first one we see. Trailing ``(?:\n|$)`` lets the rule own its closing
+# newline (or end-of-file) instead of leaving a stray line for later
+# rules.
+_MD_FRONTMATTER = r"""
+    \A --- \n
+    (?: (?! ^ --- [ \t]* $ ) [\s\S] )*
+    ^ --- [ \t]* (?: \n | \Z )
+"""
+
+# Fenced code blocks — tempered-greedy body so each char has exactly
+# one matching branch (the negative lookahead consumes one char per
+# iteration). ``(?:```|~~~)`` matches either fence style.
+_MD_CODE_GEN = r"""
+    ^ (?: [ \t]* ) (?:```|~~~) [ \t]* (?: \w* ) [ \t]* \n
+    (?: (?! ^ [ \t]* (?:```|~~~) [ \t]* $ ) [\s\S] )*
+    ^ [ \t]* (?:```|~~~) [ \t]* $
+"""
+
+_MD_BLOCKQUOTE = r"^ > [ \t]? [^\n]* (?: \n > [ \t]? [^\n]* )*"
+
+_MD_TABLE = r"^ [ \t]* \| [^\n]* (?: \n [ \t]* \| [^\n]* )*"
+
+_MD_LIST = r"""
+    ^ [ \t]* (?: [-*+] | \d+\. ) [ \t]+ [^\n]*
+    (?: \n [ \t]* (?: [-*+] | \d+\. ) [ \t]+ [^\n]* )*
+"""
+
+# Rule order is precedence. Headings/HR are line-bound and need to win
+# over the multi-line block rules on a single ``#`` line. ``code``
+# precedes ``blockquote/table/list`` so list-looking lines inside a
+# fence are masked. ``frontmatter`` MUST precede ``hr``: both can match
+# a leading ``---`` line at offset 0, and Python ``re`` alternation is
+# leftmost-first, so if ``hr`` came first it would consume only the
+# opening fence as an HR and ``\A``-anchored ``frontmatter`` would
+# never get a chance.
+_RULES = (
+    ('h1',          _MD_H1),
+    ('h2',          _MD_H2),
+    ('h3',          _MD_H3),
+    ('h4',          _MD_H4),
+    ('h5',          _MD_H5),
+    ('h6',          _MD_H6),
+    ('frontmatter', _MD_FRONTMATTER),
+    ('hr',          _MD_HR),
+    ('code',        _MD_CODE_GEN),
+    ('blockquote',  _MD_BLOCKQUOTE),
+    ('table',       _MD_TABLE),
+    ('list',        _MD_LIST),
+)
+
+# Combined regex — same shape md2ansi uses in ``_m2a_build_context``
+# (md2ansi.py:113). One ``finditer`` pass over the text yields all
+# block-level matches in document order; ``_parse`` walks ``_RULES``
+# per match to find which outer group matched (see ``_parse`` for why
+# we don't use ``m.lastgroup``).
+_PARSER_RE = re.compile(
+    '|'.join(f'(?P<{n}>{p})' for n, p in _RULES),
+    re.VERBOSE | re.MULTILINE | re.DOTALL,
+)
+
+
+def _line_starts(text):
+    """Byte offset of the start of each line in ``text``.
+
+    Index ``i`` holds the offset of line ``i`` (0-based). Used by
+    ``_parse`` to convert a heading's ``m.start()`` byte offset into a
+    line number via ``bisect``. Uses ``re.finditer`` so the scan runs
+    in the C-level regex engine rather than a Python ``for`` loop.
+    """
+    return [0] + [m.end() for m in re.finditer(r'\n', text)]
+
+
+def _line_of(byte_offset, line_starts):
+    """0-based line number for ``byte_offset`` given precomputed line starts."""
+    # ``bisect_right - 1`` lands on the line whose start is <= offset.
+    return bisect.bisect_right(line_starts, byte_offset) - 1
+
+
+# Rule names that emit a heading node from ``_parse`` — dispatch is
+# by exact name, so other rules (code/blockquote/table/hr/frontmatter)
+# never reach the heading branch.
+_HEADING_KINDS = frozenset(('h1', 'h2', 'h3', 'h4', 'h5', 'h6'))
+
+
+def _parse(text):
+    """Flat ordered list of parser events for ``text``.
+
+    Each event is a ``(kind, payload)`` tuple:
+      * heading: ``('h1'..'h6', {'byte_offset', 'line_offset', 'source'})``
+      * list:    ``('list', match)`` — sentinel; the per-item walker
+        (ticket #520) replaces these with one node per marker line.
+
+    Code/blockquote/table/hr/frontmatter matches emit nothing — they
+    exist solely to mask their contents from later rules in the
+    combined regex.
+    """
+    line_starts = _line_starts(text)
+    events = []
+    for m in _PARSER_RE.finditer(text):
+        # Identify the outer rule by walking ``_RULES`` and picking the
+        # first whose named group has a non-None match. ``m.lastgroup``
+        # would be simpler but returns the *highest-numbered* matching
+        # named group — so any future inner ``(?P<...>...)`` group
+        # inside a rule pattern would silently misroute dispatch. This
+        # mirrors md2ansi's ``_m2a_replace`` (md2ansi.py:863-882).
+        groups = m.groupdict()
+        kind = next(n for n, _ in _RULES if groups.get(n) is not None)
+        if kind in _HEADING_KINDS:
+            byte_offset = m.start()
+            events.append((kind, {
+                'byte_offset': byte_offset,
+                'line_offset': _line_of(byte_offset, line_starts),
+                'source': m.group(),
+            }))
+        elif kind == 'list':
+            # Sentinel — ticket #520 fans this out per marker line.
+            events.append(('list', m))
+        # code / blockquote / table / hr / frontmatter: skip. Their
+        # only job is to consume their span so later rules can't.
+    return events
 
 
 def get_children(node_id, *, reload=False):

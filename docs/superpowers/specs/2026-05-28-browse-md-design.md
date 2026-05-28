@@ -221,8 +221,8 @@ _RULES = (
     ('h4',          _MD_H4),
     ('h5',          _MD_H5),
     ('h6',          _MD_H6),
+    ('frontmatter', _MD_FRONTMATTER),   # MUST precede `hr`: both match `---` at offset 0
     ('hr',          _MD_HR),
-    ('frontmatter', _MD_FRONTMATTER),   # only at offset 0; see below
     ('code',        _MD_CODE_GEN),      # ``` and ~~~ both handled
     ('blockquote',  _MD_BLOCKQUOTE),
     ('table',       _MD_TABLE),
@@ -237,8 +237,12 @@ _PARSER_RE = re.compile(
 def _parse(text):
     nodes = []
     for m in _PARSER_RE.finditer(text):
-        kind = m.lastgroup
-        if kind.startswith('h') and kind != 'hr':
+        # md2ansi-style dispatch: walk _RULES and pick the first whose
+        # outer named group has a non-None match. Robust against future
+        # inner (?P<...>) groups — see md2ansi.py:863-882.
+        groups = m.groupdict()
+        kind = next(n for n, _ in _RULES if groups.get(n) is not None)
+        if kind in _HEADING_KINDS:
             nodes.append(_make_heading(kind, m, text))
         elif kind == 'list':
             nodes.extend(_walk_list(m, text))
@@ -246,6 +250,11 @@ def _parse(text):
         # exist only to mask their contents from later rules.
     return nodes
 ```
+
+Note: we walk `_RULES` instead of using `m.lastgroup` because
+`lastgroup` returns the *highest-numbered* matching named group, so
+any future inner `(?P<...>)` group inside a rule pattern would
+silently misroute dispatch.
 
 Per-rule notes:
 
