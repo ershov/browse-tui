@@ -6040,6 +6040,30 @@ class Browser:
             self._expand_goal = {'parent_id': id_}
         if id_ in self._state._children:
             mark_visible_dirty(self._state)
+            # Filter hook (#501): evaluate the newly-revealed subtree
+            # under the just-expanded parent. Walk each child via
+            # ``_filter_visit_subtree`` so its ``_filter_hidden`` flag
+            # (and the flags of its visible-expanded descendants) is
+            # set against the current filter. The expanded parent
+            # itself is NOT re-evaluated — preserves the parent's
+            # scaffold/match status from the original recompute (the
+            # stale-scaffold contract; see "Accepted UX trade-offs"
+            # #2 in
+            # ``docs/superpowers/specs/2026-05-27-filter-visible-tree-only-design.md``).
+            # Placed before ``_apply_cursor_anchor`` so the anchor walk
+            # sees the updated flags. No-op when no filter is active.
+            if self._filters:
+                active = [q for q in self._filters if q]
+                if active:
+                    scope_id = (
+                        self._state.scope_stack[-1]
+                        if self._state.scope_stack else None
+                    )
+                    for child in self._state._children.get(id_, ()):
+                        _filter_visit_subtree(
+                            self._state, child,
+                            active, scope_id, self.show_ids,
+                        )
             # Children already cached — expanding inserts those rows
             # into the visible list immediately. Re-snap the cursor on
             # its anchored id so its index doesn't drift if the

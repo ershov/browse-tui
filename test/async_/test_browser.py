@@ -2361,5 +2361,174 @@ class TestFilterRecomputeOnScopeChange(unittest.TestCase):
             b.stop_workers()
 
 
+class TestFilterRecomputeOnExpand(unittest.TestCase):
+    """``_do_expand``'s cached-children branch walks the newly-revealed
+    subtree under the expanded parent and writes ``_filter_hidden`` flags
+    for each child — but does NOT re-evaluate the expanded parent itself
+    (ticket #501). Preserves the parent's scaffold/match status set at
+    the original filter recompute. See "Recompute triggers" + "Accepted
+    UX trade-offs" #2 in
+    ``docs/superpowers/specs/2026-05-27-filter-visible-tree-only-design.md``.
+    """
+
+    def test_expand_reveals_matching_child_parent_flag_unchanged(self):
+        # Tree: root → 'p' (title 'plum', no match for 'app'); 'p' has
+        # two cached children: 'apple' (matches) and 'other' (doesn't).
+        # 'p' starts COLLAPSED. Apply filter — with p collapsed and
+        # its own text non-matching, parent is hidden (Rule 2).
+        # Expand p: hook must visit p's children, flagging 'apple'
+        # visible and 'other' hidden. Parent's flag stays UNCHANGED
+        # (the stale-scaffold contract: don't re-evaluate the parent).
+        b = make_browser(get_children=lambda _id, *, reload=False: [])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.update_data([
+                ('upsert', 'p', None,
+                 {'title': 'plum', 'has_children': True}),
+                ('upsert', 'apple', 'p', {'title': 'apple'}),
+                ('upsert', 'other', 'p', {'title': 'banana'}),
+                ('complete', 'p'),
+            ])
+            b.run_until_idle()
+            # 'p' is collapsed (never added to state.expanded).
+            self.assertNotIn('p', b._state.expanded)
+            b.set_filters(['app'])
+            b.run_until_idle()
+            # Collapsed parent + self non-match → hidden.
+            self.assertTrue(b._state._items_by_id['p']._filter_hidden)
+            # Children weren't walked (collapsed parent), so their flags
+            # are stale from any prior state; capture parent's flag now
+            # for the post-expand assertion.
+            parent_flag_before = b._state._items_by_id['p']._filter_hidden
+
+            # Expand p — hook walks the newly-revealed subtree.
+            b.expand('p')
+            b.run_until_idle()
+            self.assertIn('p', b._state.expanded)
+            # Parent's flag UNCHANGED (don't re-evaluate the parent).
+            self.assertEqual(
+                b._state._items_by_id['p']._filter_hidden,
+                parent_flag_before,
+            )
+            # Matching child visible; non-matching child hidden.
+            self.assertFalse(
+                b._state._items_by_id['apple']._filter_hidden
+            )
+            self.assertTrue(
+                b._state._items_by_id['other']._filter_hidden
+            )
+        finally:
+            b.stop_workers()
+
+    def test_expand_reveals_non_matching_child_parent_flag_unchanged(self):
+        # Tree: root → 'p' (title 'plum-match' — DOES match 'plum').
+        # 'p' has one cached non-matching child 'kiwi'. 'p' starts
+        # collapsed. Apply filter 'plum' — p is visible (self-match);
+        # kiwi is never walked (p collapsed), default flag False (not
+        # hidden), but that flag is moot since the renderer doesn't
+        # see it while p is collapsed. Expand p — hook walks kiwi
+        # and flips its flag to True (hidden). Parent's flag stays
+        # UNCHANGED at False (don't re-evaluate the parent).
+        b = make_browser(get_children=lambda _id, *, reload=False: [])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.update_data([
+                ('upsert', 'p', None,
+                 {'title': 'plum-match', 'has_children': True}),
+                ('upsert', 'kiwi', 'p', {'title': 'kiwi'}),
+                ('complete', 'p'),
+            ])
+            b.run_until_idle()
+            # 'p' is collapsed.
+            self.assertNotIn('p', b._state.expanded)
+            b.set_filters(['plum'])
+            b.run_until_idle()
+            # Parent visible (self-match).
+            self.assertFalse(b._state._items_by_id['p']._filter_hidden)
+            parent_flag_before = b._state._items_by_id['p']._filter_hidden
+
+            # Expand p — hook walks the child subtree.
+            b.expand('p')
+            b.run_until_idle()
+            self.assertIn('p', b._state.expanded)
+            # Parent's flag UNCHANGED (don't re-evaluate the parent).
+            self.assertEqual(
+                b._state._items_by_id['p']._filter_hidden,
+                parent_flag_before,
+            )
+            # Non-matching child flagged hidden.
+            self.assertTrue(b._state._items_by_id['kiwi']._filter_hidden)
+        finally:
+            b.stop_workers()
+
+    def test_expand_stale_scaffold_parent_stays_visible(self):
+        # Stale-scaffold contract (UX trade-off #2): build A→B→leaf where
+        # 'leaf' matches. Filter 'leaf' with the whole chain expanded —
+        # A and B both become scaffold-visible. Collapse B (no recompute
+        # on collapse — B's hidden 'leaf' descendant no longer
+        # contributes to A's scaffolding, but A's flag persists per
+        # Rule 4/5). Collapse A. Re-expand A — hook walks the newly-
+        # revealed subtree (just B, since B is still collapsed); B's
+        # own text doesn't match and its only visible child set is
+        # empty (B collapsed) so B gets hidden. A's flag is NOT
+        # re-evaluated — A stays visible despite having no visible
+        # matching descendants. Trade-off accepted: better than the
+        # row the user just clicked vanishing.
+        b = make_browser(get_children=lambda _id, *, reload=False: [])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.update_data([
+                ('upsert', 'A', None,
+                 {'title': 'A', 'has_children': True}),
+                ('upsert', 'B', 'A',
+                 {'title': 'B', 'has_children': True}),
+                ('upsert', 'leaf', 'B', {'title': 'leaf'}),
+                ('complete', 'B'),
+                ('complete', 'A'),
+            ])
+            b.run_until_idle()
+            # Expand the whole chain so the filter walk descends into it.
+            b._state.expanded.add('A')
+            b._state.expanded.add('B')
+            b.set_filters(['leaf'])
+            b.run_until_idle()
+            # Both ancestors are scaffold-visible because of the 'leaf'
+            # match.
+            self.assertFalse(b._state._items_by_id['A']._filter_hidden)
+            self.assertFalse(b._state._items_by_id['B']._filter_hidden)
+            self.assertFalse(b._state._items_by_id['leaf']._filter_hidden)
+
+            # User collapses B (no recompute on collapse — A's flag
+            # persists, stale-scaffold).
+            b._state.expanded.discard('B')
+            # User collapses A (no recompute on collapse).
+            b._state.expanded.discard('A')
+            # A's flag is still the stale "visible" value.
+            self.assertFalse(b._state._items_by_id['A']._filter_hidden)
+            parent_flag_before = b._state._items_by_id['A']._filter_hidden
+
+            # Re-expand A. Hook walks A's children: just 'B' (still
+            # collapsed). B's own text doesn't match, B has no visible
+            # matching descendants (B collapsed, leaf hidden under it),
+            # so B flips to _filter_hidden=True. A's own flag is NOT
+            # re-evaluated — stays visible (stale-scaffold survives,
+            # per UX trade-off #2).
+            b.expand('A')
+            b.run_until_idle()
+            self.assertEqual(
+                b._state._items_by_id['A']._filter_hidden,
+                parent_flag_before,
+            )
+            self.assertFalse(
+                b._state._items_by_id['A']._filter_hidden
+            )
+            self.assertTrue(b._state._items_by_id['B']._filter_hidden)
+        finally:
+            b.stop_workers()
+
+
 if __name__ == '__main__':
     unittest.main()
