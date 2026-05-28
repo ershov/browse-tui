@@ -1,0 +1,71 @@
+#!/usr/bin/env -S browse-tui --run-py
+"""browse-md — single-file markdown browser. Lists headings + fences as
+a tree, preview shows the file body. Anchor (``FILE.md#name`` or
+``FILE.md#<line>``) seeds the initial scope so deep links land directly
+on the requested section.
+
+Usage:  browse-md FILE.md[#anchor]
+"""
+
+import os
+import sys
+
+from browse_tui import Browser, BrowserConfig
+
+# Raw anchor string from the ``FILE.md#anchor`` positional — resolved
+# to an item id in a later ticket (see #521). Empty string when the
+# positional had no ``#``.
+_ANCHOR = ''
+
+# Whole-file slurp populated in main(). Preview returns this verbatim
+# until later tickets layer on per-node previews.
+_FILE_TEXT = ''
+
+
+_USAGE = 'usage: browse-md FILE.md[#anchor]'
+
+
+def get_children(node_id, *, reload=False):
+    # Real implementation lands in later tickets — for now every node
+    # is a leaf so the listing pane is empty.
+    return []
+
+
+def get_preview(node_id):
+    # Single-file recipe: every node previews the whole file body until
+    # per-node previews land in later tickets.
+    return _FILE_TEXT
+
+
+def main():
+    global _ANCHOR, _FILE_TEXT
+    if len(sys.argv) < 2:
+        print(_USAGE, file=sys.stderr)
+        sys.exit(2)
+    raw = sys.argv[1]
+    # Split once on the first ``#`` — anything after is the anchor and
+    # gets stashed for ticket #521 to resolve once the tree is built.
+    file_part, sep, anchor = raw.partition('#')
+    _ANCHOR = anchor if sep else ''
+    path = os.path.abspath(os.path.expanduser(file_part))
+    if not os.path.isfile(path):
+        print(_USAGE, file=sys.stderr)
+        sys.exit(2)
+    # ``errors='replace'`` keeps the recipe alive on stray non-UTF-8
+    # bytes — the preview pane will show the replacement char rather
+    # than the read raising.
+    with open(path, 'r', encoding='utf-8', errors='replace') as f:
+        _FILE_TEXT = f.read()
+    b = Browser(BrowserConfig(
+        title='browse-md',
+        show_children_pane=False,
+        show_ids='never',
+        root_id=path,
+        get_children=get_children,
+        get_preview=get_preview,
+    ))
+    sys.exit(b.run())
+
+
+if __name__ == '__main__':
+    main()
