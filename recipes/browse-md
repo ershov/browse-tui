@@ -28,6 +28,19 @@ _FILE_TEXT = ''
 # off of the matching entry. Cleared / rebuilt on full reparse.
 _BY_ID = {}
 
+# Line index — ``line_offset`` → ``Item``. Populated by
+# ``_build_nodes`` alongside ``_BY_ID``. Root is intentionally
+# excluded so ``_node_at_line`` returns ``None`` for offsets in
+# preamble territory (the anchor flow then falls back to root).
+_BY_LINE = {}
+
+# Sorted view of ``_BY_LINE`` keys for ``bisect_right`` lookup in
+# ``_node_at_line``. Source-ordered parse + distinct ``byte_offset``
+# per event keeps the underlying dict's insertion order monotonic,
+# but we materialise a sorted list anyway so the bisect contract
+# survives any future reordering.
+_LINES_SORTED = []
+
 # Tag-style palette per heading level. h1 stays red (md2ansi-ish loud
 # top); deeper levels cycle through the named palette ending in gray
 # for the deepest h6.
@@ -406,6 +419,125 @@ def _build_nodes(events, file_text, line_starts, path):
     return root, by_id
 
 
+def _build_line_index(by_id):
+    """Return ``(by_line, lines_sorted)`` for ``_node_at_line`` lookup.
+
+    Walks the ``by_id`` map returned by ``_build_nodes`` and skips the
+    synthetic root entry (its ``line_offset`` of 0 would otherwise
+    swallow every "line precedes any parsed node" anchor lookup).
+
+    Multiple Items at the same ``line_offset`` resolve to the last
+    one inserted; parser events sit at distinct ``byte_offset``\\ s,
+    so collisions only happen in pathological inputs (e.g. ``\\r\\n``
+    line endings folded onto the same logical line). Whichever wins
+    is deterministic given ``by_id`` iteration order.
+    """
+    by_line = {}
+    for item in by_id.values():
+        if item.kind == 'root':
+            continue
+        by_line[item.line_offset] = item
+    lines_sorted = sorted(by_line)
+    return by_line, lines_sorted
+
+
+def _node_at_line(n):
+    """Return the deepest parsed node whose source range contains line ``n``.
+
+    Contract (per the spec's "Lookup contract" section):
+      * Exact-match wins — if a node starts on line ``n``, that node
+        is returned regardless of any earlier node whose range also
+        covers ``n``.
+      * Otherwise return the node with the greatest ``line_offset``
+        ≤ ``n``. Since every parsed range encompasses its descendants,
+        the deepest-containing node is also the one with the greatest
+        ``line_offset`` that doesn't exceed ``n``.
+      * ``None`` if ``n`` precedes every parsed node (preamble
+        territory — the anchor flow substitutes root scope upstream).
+
+    Uses ``bisect_right`` against the cached ``_LINES_SORTED`` view so
+    the lookup is O(log N) over node count.
+    """
+    item = _BY_LINE.get(n)
+    if item is not None:
+        return item
+    i = bisect.bisect_right(_LINES_SORTED, n) - 1
+    if i < 0:
+        return None
+    return _BY_LINE[_LINES_SORTED[i]]
+
+
+def _display_title(item):
+    """Return ``item.title`` normalised for anchor matching.
+
+    Strips leading ``#`` markers (heading sigils) and any surrounding
+    whitespace. The stored ``title`` keeps its ``#``s so the tree row
+    still renders ``## Foo``; this helper only normalises the match
+    key. Falls back to ``title.strip()`` for non-heading items or
+    titles missing the expected leading ``#`` (defensive — list-item
+    titles have no leading ``#`` and we still want a sensible answer).
+
+    Example: ``'## My **bold** heading'`` → ``'My **bold** heading'``
+    (inline markers preserved; only the leading ``#``s and surrounding
+    whitespace are stripped).
+    """
+    title = item.title
+    return title.lstrip('#').strip()
+
+
+def _resolve_anchor(anchor, root_id):
+    """Resolve an anchor string to an Item id (for ``initial_scope``).
+
+    Three-way dispatch matching the spec's "Argument parsing" rules:
+
+      * Empty anchor → ``root_id``.
+      * All-digit anchor → treat as a 0-indexed line number, look up
+        via ``_node_at_line``. Fall through silently to ``root_id``
+        when the lookup returns ``None`` (the anchor precedes every
+        parsed node — normal for early-file targets).
+      * Non-digit anchor → three-tier scan over headings only, in
+        source order: exact ``_display_title`` match, then prefix,
+        then substring. First hit in any tier wins. No match in any
+        tier emits a stderr warning and falls through to root.
+
+    The tier loop runs each predicate as a separate pass over the
+    heading list so a substring hit on heading A can't pre-empt an
+    exact match on later heading B — matching the spec's "scan all
+    headings before falling through" wording.
+    """
+    if not anchor:
+        return root_id
+    if anchor.isdigit():
+        item = _node_at_line(int(anchor))
+        return item.id if item is not None else root_id
+    # Non-digit: scan headings in source order. ``_BY_ID`` is built
+    # in insertion order (root + parser-event order from
+    # ``_build_nodes``), so filtering to headings and sorting by
+    # ``line_offset`` yields source order without depending on dict
+    # iteration semantics.
+    headings = sorted(
+        (it for it in _BY_ID.values() if it.kind == 'heading'),
+        key=lambda it: it.line_offset,
+    )
+    # Tier 1: exact match.
+    for h in headings:
+        if _display_title(h) == anchor:
+            return h.id
+    # Tier 2: prefix match.
+    for h in headings:
+        if _display_title(h).startswith(anchor):
+            return h.id
+    # Tier 3: substring match.
+    for h in headings:
+        if anchor in _display_title(h):
+            return h.id
+    print(
+        f'browse-md: no heading matches {anchor!r}, opening at root',
+        file=sys.stderr,
+    )
+    return root_id
+
+
 def get_children(node_id, *, reload=False):
     """Return cached children for ``node_id``.
 
@@ -431,13 +563,13 @@ def get_preview(node_id):
 
 
 def main():
-    global _ANCHOR, _FILE_TEXT, _BY_ID
+    global _ANCHOR, _FILE_TEXT, _BY_ID, _BY_LINE, _LINES_SORTED
     if len(sys.argv) < 2:
         print(_USAGE, file=sys.stderr)
         sys.exit(2)
     raw = sys.argv[1]
     # Split once on the first ``#`` — anything after is the anchor and
-    # gets stashed for ticket #521 to resolve once the tree is built.
+    # gets resolved against the parsed tree below.
     file_part, sep, anchor = raw.partition('#')
     _ANCHOR = anchor if sep else ''
     path = os.path.abspath(os.path.expanduser(file_part))
@@ -456,6 +588,11 @@ def main():
     line_starts = _line_starts(_FILE_TEXT)
     events = _parse(_FILE_TEXT)
     root, _BY_ID = _build_nodes(events, _FILE_TEXT, line_starts, path)
+    # Line-keyed lookup tables for ``_node_at_line`` / anchor resolve.
+    # Built once here so ``_resolve_anchor`` can find them at module
+    # scope without threading the by-id dict through every call.
+    _BY_LINE, _LINES_SORTED = _build_line_index(_BY_ID)
+    initial_scope = _resolve_anchor(_ANCHOR, root.id)
     b = Browser(BrowserConfig(
         title='browse-md',
         show_children_pane=False,
@@ -463,6 +600,7 @@ def main():
         root_id=root.id,
         get_children=get_children,
         get_preview=get_preview,
+        initial_scope=initial_scope,
     ))
     sys.exit(b.run())
 

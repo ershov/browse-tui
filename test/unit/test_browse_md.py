@@ -14,9 +14,13 @@ Coverage focuses on the helpers exported at module scope:
 * ``_walk_list``                      (TestWalkList)
 * ``_build_nodes``                    (TestBuildNodes)
 * ``get_children``                    (TestGetChildren)
+* ``_node_at_line``                   (TestNodeAtLine)
+* ``_display_title``                  (TestDisplayTitle)
+* ``_resolve_anchor``                 (TestResolveAnchor)
 
-These are the work of tickets #519 (parser) and #520 (list walker +
-tree linking + Item construction).
+These are the work of tickets #519 (parser), #520 (list walker +
+tree linking + Item construction), and #521 (line lookup + anchor
+resolution).
 """
 
 import importlib.util
@@ -563,6 +567,291 @@ class TestEdgeCases(unittest.TestCase):
         # The list item's section also runs to EOF.
         li = h1._children[0]
         self.assertEqual(li.byte_offset + li.byte_size, len(text))
+
+
+class TestNodeAtLine(unittest.TestCase):
+    """``_node_at_line`` — line → deepest containing Item lookup."""
+
+    # Same fixture as ``TestBuildNodes`` so we can predict offsets.
+    FIXTURE = (
+        '# H1\n'        # line 0
+        '## H2a\n'      # line 1
+        '- a\n'         # line 2
+        '  - a1\n'      # line 3
+        '- b\n'         # line 4
+        '## H2b\n'      # line 5
+        '1. one\n'      # line 6
+        '# H1b\n'       # line 7
+        '- top\n'       # line 8
+    )
+
+    def setUp(self):
+        # Fresh module per test — ``_BY_LINE`` / ``_LINES_SORTED``
+        # are module-level state populated by ``main()``; we have
+        # to mirror that wiring here.
+        self.r = _load_recipe()
+        self.path = '/tmp/lookup.md'
+        line_starts = self.r._line_starts(self.FIXTURE)
+        events = self.r._parse(self.FIXTURE)
+        self.root, by_id = self.r._build_nodes(
+            events, self.FIXTURE, line_starts, self.path,
+        )
+        self.r._BY_ID = by_id
+        self.r._BY_LINE, self.r._LINES_SORTED = self.r._build_line_index(by_id)
+
+    def test_exact_match_on_heading_line(self):
+        # Line 0 is the ``# H1`` heading.
+        node = self.r._node_at_line(0)
+        self.assertIsNotNone(node)
+        self.assertEqual(node.title, '# H1')
+
+    def test_exact_match_on_list_item_line(self):
+        # Line 2 is the ``- a`` list item.
+        node = self.r._node_at_line(2)
+        self.assertEqual(node.title, '- a')
+        # Line 3 is its nested ``- a1`` child.
+        node = self.r._node_at_line(3)
+        self.assertEqual(node.title, '- a1')
+
+    def test_inexact_falls_back_to_previous_node(self):
+        # If we had blank/paragraph lines in this fixture the lookup
+        # would land on the most recent parsed node. The fixture is
+        # dense (every line is a node), so swap to a fixture with a
+        # gap to exercise this.
+        text = (
+            '# H1\n'        # line 0
+            'paragraph\n'   # line 1 — no node
+            'more text\n'   # line 2 — no node
+            '## H2\n'       # line 3
+        )
+        line_starts = self.r._line_starts(text)
+        events = self.r._parse(text)
+        _root, by_id = self.r._build_nodes(events, text, line_starts, '/x.md')
+        self.r._BY_ID = by_id
+        self.r._BY_LINE, self.r._LINES_SORTED = (
+            self.r._build_line_index(by_id))
+        # Lines 1 and 2 sit between ``# H1`` (line 0) and ``## H2``
+        # (line 3); they should fall back to ``# H1``.
+        self.assertEqual(self.r._node_at_line(1).title, '# H1')
+        self.assertEqual(self.r._node_at_line(2).title, '# H1')
+
+    def test_line_before_any_node_returns_none(self):
+        # Build a fixture with a leading preamble so line 0 has no
+        # parsed node.
+        text = (
+            'preamble line\n'   # line 0 — no node
+            '# H1\n'            # line 1
+        )
+        line_starts = self.r._line_starts(text)
+        events = self.r._parse(text)
+        _root, by_id = self.r._build_nodes(events, text, line_starts, '/y.md')
+        self.r._BY_ID = by_id
+        self.r._BY_LINE, self.r._LINES_SORTED = (
+            self.r._build_line_index(by_id))
+        self.assertIsNone(self.r._node_at_line(0))
+
+    def test_exact_match_on_last_node(self):
+        # Line 8 is the last node (``- top`` under ``# H1b``).
+        node = self.r._node_at_line(8)
+        self.assertEqual(node.title, '- top')
+
+    def test_line_past_last_node_returns_last_containing(self):
+        # Past EOF — should fall back to the last node (``- top``
+        # subsumes any imaginary later lines under it).
+        node = self.r._node_at_line(99999)
+        self.assertEqual(node.title, '- top')
+
+    def test_empty_file_returns_none(self):
+        # No parsed nodes → every lookup is ``None``.
+        line_starts = self.r._line_starts('')
+        events = self.r._parse('')
+        _root, by_id = self.r._build_nodes(events, '', line_starts, '/e.md')
+        self.r._BY_ID = by_id
+        self.r._BY_LINE, self.r._LINES_SORTED = (
+            self.r._build_line_index(by_id))
+        self.assertIsNone(self.r._node_at_line(0))
+        self.assertIsNone(self.r._node_at_line(42))
+
+
+class TestDisplayTitle(unittest.TestCase):
+    """``_display_title`` — strip ``#`` markers + whitespace for matching."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _heading(self, title):
+        """Build a minimal stand-in Item with the right shape."""
+        it = self.r.Item(title=title)
+        it.kind = 'heading'
+        return it
+
+    def test_h1(self):
+        self.assertEqual(self.r._display_title(self._heading('# Foo')), 'Foo')
+
+    def test_h2(self):
+        self.assertEqual(
+            self.r._display_title(self._heading('## Foo Bar')), 'Foo Bar')
+
+    def test_h6(self):
+        self.assertEqual(
+            self.r._display_title(self._heading('###### Deep heading')),
+            'Deep heading',
+        )
+
+    def test_inline_markers_preserved(self):
+        # ``**bold**`` markers are NOT stripped — only leading ``#``s
+        # plus surrounding whitespace.
+        self.assertEqual(
+            self.r._display_title(self._heading('## **bold**')), '**bold**')
+
+    def test_no_hash_prefix_falls_back_to_strip(self):
+        # Defensive: a malformed title with no ``#`` prefix still
+        # returns the title with surrounding whitespace stripped.
+        self.assertEqual(
+            self.r._display_title(self._heading('  no markers  ')),
+            'no markers',
+        )
+
+    def test_trailing_hashes_preserved(self):
+        # md2ansi's ``_MD_H*`` patterns don't special-case trailing
+        # ``#``s, so the raw source line keeps them; ``_display_title``
+        # only touches leading ``#``s + surrounding whitespace.
+        self.assertEqual(
+            self.r._display_title(self._heading('## Foo ##')), 'Foo ##')
+
+
+class TestResolveAnchor(unittest.TestCase):
+    """``_resolve_anchor`` — anchor string → ``initial_scope`` id."""
+
+    FIXTURE = (
+        '# Intro\n'             # line 0
+        '## Overview\n'         # line 1
+        '- bullet\n'            # line 2
+        '## Details\n'          # line 3
+        '# Conclusion\n'        # line 4
+    )
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self.path = '/tmp/anchor.md'
+        line_starts = self.r._line_starts(self.FIXTURE)
+        events = self.r._parse(self.FIXTURE)
+        self.root, by_id = self.r._build_nodes(
+            events, self.FIXTURE, line_starts, self.path,
+        )
+        self.r._BY_ID = by_id
+        self.r._BY_LINE, self.r._LINES_SORTED = (
+            self.r._build_line_index(by_id))
+
+    def _resolve(self, anchor):
+        return self.r._resolve_anchor(anchor, self.root.id)
+
+    def test_empty_anchor_returns_root(self):
+        self.assertEqual(self._resolve(''), self.root.id)
+
+    def test_digit_anchor_exact_line(self):
+        # ``#0`` resolves to ``# Intro`` (line 0).
+        self.assertEqual(self._resolve('0'), f'{self.path}#0')
+        # ``#3`` resolves to ``## Details`` (line 3).
+        self.assertEqual(self._resolve('3'), f'{self.path}#3')
+
+    def test_digit_anchor_inexact_falls_back_to_previous(self):
+        # No node sits exactly on line 999999 → ``_node_at_line``
+        # returns the last node; ``_resolve_anchor`` returns that id.
+        self.assertEqual(self._resolve('999999'), f'{self.path}#4')
+
+    def test_digit_anchor_past_eof_does_not_warn(self):
+        # All-digit anchors fall through silently (the spec says no
+        # warning in this path).
+        from io import StringIO
+        from contextlib import redirect_stderr
+        buf = StringIO()
+        with redirect_stderr(buf):
+            self._resolve('999999')
+        self.assertEqual(buf.getvalue(), '')
+
+    def test_digit_anchor_before_any_node(self):
+        # Build a fixture where line 0 has no node; the digit anchor
+        # ``0`` lands in preamble territory and falls back to root.
+        text = 'preamble line\n# After\n'
+        line_starts = self.r._line_starts(text)
+        events = self.r._parse(text)
+        root, by_id = self.r._build_nodes(events, text, line_starts, '/p.md')
+        self.r._BY_ID = by_id
+        self.r._BY_LINE, self.r._LINES_SORTED = (
+            self.r._build_line_index(by_id))
+        # ``_node_at_line(0)`` is None → fall back to root.
+        self.assertEqual(self.r._resolve_anchor('0', root.id), root.id)
+
+    def test_exact_match_heading(self):
+        # ``Overview`` matches ``## Overview`` exactly (display_title).
+        self.assertEqual(self._resolve('Overview'), f'{self.path}#1')
+
+    def test_prefix_match_heading(self):
+        # ``Det`` matches ``## Details`` as a prefix; no exact match.
+        self.assertEqual(self._resolve('Det'), f'{self.path}#3')
+
+    def test_substring_match_heading(self):
+        # ``clus`` matches ``# Conclusion`` as a substring; no exact /
+        # prefix match in the heading set.
+        self.assertEqual(self._resolve('clus'), f'{self.path}#4')
+
+    def test_no_match_warns_and_returns_root(self):
+        from io import StringIO
+        from contextlib import redirect_stderr
+        buf = StringIO()
+        with redirect_stderr(buf):
+            result = self._resolve('xyzzy-nonexistent')
+        self.assertEqual(result, self.root.id)
+        # Warning mentions the anchor (the exact wording is recipe-
+        # owned; we assert the substring contract).
+        self.assertIn('xyzzy-nonexistent', buf.getvalue())
+
+    def test_tier_precedence_exact_beats_prefix(self):
+        # ``Foo`` exact-matches one heading AND is a prefix of another.
+        # Tier 1 (exact) must win even though the prefix-only heading
+        # comes earlier in source order — the tiers are scanned in
+        # full before falling through to the next tier.
+        text = (
+            '# Foobar\n'    # line 0 — prefix-only match
+            '# Foo\n'       # line 1 — exact match
+        )
+        line_starts = self.r._line_starts(text)
+        events = self.r._parse(text)
+        root, by_id = self.r._build_nodes(events, text, line_starts, '/t.md')
+        self.r._BY_ID = by_id
+        self.r._BY_LINE, self.r._LINES_SORTED = (
+            self.r._build_line_index(by_id))
+        # Exact match on line 1 wins over prefix match on line 0.
+        self.assertEqual(self.r._resolve_anchor('Foo', root.id), '/t.md#1')
+
+    def test_source_order_tie_first_wins(self):
+        # Two headings with the same exact display_title → first in
+        # source order wins.
+        text = (
+            '# Dup\n'   # line 0
+            '# Dup\n'   # line 1
+        )
+        line_starts = self.r._line_starts(text)
+        events = self.r._parse(text)
+        root, by_id = self.r._build_nodes(events, text, line_starts, '/d.md')
+        self.r._BY_ID = by_id
+        self.r._BY_LINE, self.r._LINES_SORTED = (
+            self.r._build_line_index(by_id))
+        self.assertEqual(self.r._resolve_anchor('Dup', root.id), '/d.md#0')
+
+    def test_anchor_skips_list_items(self):
+        # ``bullet`` matches the list-item ``- bullet`` text but
+        # ``_resolve_anchor`` only scans headings; no match → warning
+        # + root fall-through.
+        from io import StringIO
+        from contextlib import redirect_stderr
+        buf = StringIO()
+        with redirect_stderr(buf):
+            result = self._resolve('bullet')
+        self.assertEqual(result, self.root.id)
+        self.assertIn('bullet', buf.getvalue())
 
 
 if __name__ == '__main__':
