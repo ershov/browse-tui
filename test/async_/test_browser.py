@@ -2250,5 +2250,116 @@ class TestFilterApi(unittest.TestCase):
             b.stop_workers()
 
 
+class TestFilterRecomputeOnScopeChange(unittest.TestCase):
+    """``scope_into`` / ``scope_out`` trigger a full
+    ``_recompute_filter_hidden`` walk on the new visible tree (ticket
+    #500). Without the hook, an item flagged ``_filter_hidden=True`` by
+    a prior recompute stays hidden after scoping into it — the scope
+    row renders as nothing because ``visible_items`` filters it out.
+    """
+
+    def test_scope_into_non_matching_item_renders_scope_row(self):
+        # Tree: root has parent 'X' (no self-match for filter 'zzz'),
+        # children 'x1' and 'x2' also don't match. Pre-cache X's
+        # children so the filter walk descends into them and flags X
+        # as ``_filter_hidden=True``.
+        def get_children(parent_id, *, reload=False):
+            if parent_id is None:
+                return [('X', None, {'title': 'X', 'has_children': True})]
+            if parent_id == 'X':
+                return [('x1',), ('x2',)]
+            return []
+        b = make_browser(get_children=get_children)
+        try:
+            b.refresh()
+            b.run_until_idle()
+            # Expand X so the filter walk descends into its children.
+            b._state.expanded.add('X')
+            _state.mark_visible_dirty(b._state)
+            # Trigger expand of X's children.
+            b.expand('X')
+            b.run_until_idle()
+            # Apply a filter that matches nothing in X's subtree —
+            # _recompute_filter_hidden flags X (and its children) as
+            # _filter_hidden=True.
+            b.set_filters(['zzz'])
+            b.run_until_idle()
+            self.assertTrue(b._state._items_by_id['X']._filter_hidden)
+            # Now scope into X. The scope-row exemption inside
+            # _recompute_filter_hidden should fire and unhide X.
+            b.scope_into('X')
+            b.run_until_idle()
+            # After scope_into, the scope row must render — its
+            # _filter_hidden=False (scope-row exemption fires inside
+            # the recompute).
+            self.assertFalse(b._state._items_by_id['X']._filter_hidden)
+            vis = _state.visible_items(b._state)
+            vis_ids = [e.item.id for e in vis if e.kind == 'normal']
+            self.assertIn('X', vis_ids)
+        finally:
+            b.stop_workers()
+
+    def test_scope_out_renders_new_scope_row(self):
+        # Tree: root has 'A' (parent), 'A' has 'B' (parent), 'B' has
+        # 'b1' (no match for filter 'zzz').
+        #
+        # Scenario:
+        # 1. Pre-cache A, B, b1.
+        # 2. Apply filter 'zzz' at root scope: nothing matches — A
+        #    flagged ``_filter_hidden=True`` by the recompute (and so
+        #    is B).
+        # 3. Scope into A — the #500 hook unhides A (current scope).
+        #    Inside A, B is still flagged hidden.
+        # 4. Scope into B — B becomes current scope, exempted; A is
+        #    above the scope so its flag is whatever it was last set
+        #    to (we don't walk it).
+        # 5. Scope out: scope row becomes A again. Without the #500
+        #    fix, A's stale ``_filter_hidden=True`` (from step 4's
+        #    walk under B) keeps the scope row hidden. With the fix,
+        #    the post-scope-change recompute exempts A.
+        def get_children(parent_id, *, reload=False):
+            if parent_id is None:
+                return [('A', None, {'title': 'A', 'has_children': True})]
+            if parent_id == 'A':
+                return [('B', None, {'title': 'B', 'has_children': True})]
+            if parent_id == 'B':
+                return [('b1',)]
+            return []
+        b = make_browser(get_children=get_children)
+        try:
+            b.refresh()
+            b.run_until_idle()
+            # Pre-cache A, B, b1.
+            b.expand('A')
+            b.run_until_idle()
+            b.expand('B')
+            b.run_until_idle()
+            # Apply filter at root scope — A, B, b1 all hidden.
+            b.set_filters(['zzz'])
+            b.run_until_idle()
+            self.assertTrue(b._state._items_by_id['A']._filter_hidden)
+            # Scope into A; #500 hook unhides A on recompute.
+            b.scope_into('A')
+            b.run_until_idle()
+            self.assertFalse(b._state._items_by_id['A']._filter_hidden)
+            # Scope into B; #500 hook unhides B on recompute.
+            b.scope_into('B')
+            b.run_until_idle()
+            # Walking from B, A is no longer reachable in the visible
+            # tree — its flag isn't rewritten. Confirm B is exempt.
+            self.assertFalse(b._state._items_by_id['B']._filter_hidden)
+            # Now scope out — scope row becomes A. The post-scope-change
+            # recompute must exempt A so it renders.
+            b.scope_out()
+            b.run_until_idle()
+            self.assertEqual(list(b._state.scope_stack), ['A'])
+            self.assertFalse(b._state._items_by_id['A']._filter_hidden)
+            vis = _state.visible_items(b._state)
+            vis_ids = [e.item.id for e in vis if e.kind == 'normal']
+            self.assertIn('A', vis_ids)
+        finally:
+            b.stop_workers()
+
+
 if __name__ == '__main__':
     unittest.main()

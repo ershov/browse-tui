@@ -5279,6 +5279,20 @@ class Browser:
             state.cursor = 0
             if id_ not in state._children:
                 self._do_expand(id_, Pending(), False)
+            # Scope change is a full-walk trigger (see
+            # ``docs/superpowers/specs/2026-05-27-filter-visible-tree-only-design.md``
+            # "Recompute triggers" table). The walk re-evaluates
+            # ``_filter_hidden`` on the new visible tree rooted at the
+            # new scope — critically, the scope-row exemption inside
+            # ``_filter_visit_subtree`` fires for ``id_`` so a row that
+            # was ``_filter_hidden=True`` from a prior recompute is
+            # unhidden the moment the user scopes into it. No-op when
+            # no filter is active. ``scope_into`` (state-layer) already
+            # set ``_visible_dirty``.
+            if self._filters:
+                _recompute_filter_hidden(
+                    self._state, self._filters, show_ids=self.show_ids,
+                )
             self._needs_redraw.add('all')
             mark_cursor_changed(self)
             self._fire_scope_change()
@@ -5298,6 +5312,16 @@ class Browser:
             popped = scope_out(state)
             if popped is None:
                 return
+            # Scope change is a full-walk trigger (see scope_into hook).
+            # Run BEFORE the visible_items() walk below so the cursor
+            # search sees the new ``_filter_hidden`` flags — without
+            # this, the post-scope-out walk would pre-filter the
+            # popped row when the new scope row's exemption hasn't
+            # fired yet.
+            if self._filters:
+                _recompute_filter_hidden(
+                    self._state, self._filters, show_ids=self.show_ids,
+                )
             placed = False
             for i, entry in enumerate(visible_items(state)):
                 if entry.kind == 'normal' and entry.item.id == popped:

@@ -47,6 +47,7 @@ import threading
 from browse_tui import (
     Action, Browser, BrowserConfig, Item, mod, scope_into, set_preview_op,
     upsert, visible_items,
+    _recompute_filter_hidden,
 )
 
 # Optional md2ansi plugin — colors user/assistant voice content inline.
@@ -4791,6 +4792,15 @@ def _action_scope_down(ctx):
     state.cursor = 0
     if target_id not in state._children:
         ctx.expand(target_id)
+    # Scope change is a full-walk trigger for filter recompute (ticket
+    # #500). Without this, an item that was ``_filter_hidden=True``
+    # from a prior recompute stays hidden after being scoped into.
+    # Mirrors the hook in ``Browser.scope_into._do``.
+    if ctx._browser._filters:
+        _recompute_filter_hidden(
+            state, ctx._browser._filters,
+            show_ids=ctx._browser.show_ids,
+        )
     ctx._browser._needs_redraw.add('all')
     ctx._browser._fire_scope_change()
     _invalidate_if_cross_file(target_id)

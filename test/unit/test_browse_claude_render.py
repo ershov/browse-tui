@@ -85,6 +85,11 @@ def _stub_browse_tui():
     # focus flow directly, so a no-op returning [] is fine.
     mod.visible_items = lambda state: []
 
+    # _recompute_filter_hidden is used by the alt-down override to
+    # re-evaluate filter visibility after scope change (ticket #500).
+    # Tests don't exercise the filter walk, so a no-op is fine.
+    mod._recompute_filter_hidden = lambda state, filters, *, show_ids='auto': None
+
     sys.modules['browse_tui'] = mod
 
 
