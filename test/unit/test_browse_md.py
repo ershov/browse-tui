@@ -1484,5 +1484,169 @@ class TestRunSourceCommand(unittest.TestCase):
             os.environ.pop('PAGER', None)
 
 
+class TestReload(unittest.TestCase):
+    """``_reparse`` + ``get_children(..., reload=True)`` — Ctrl-R path.
+
+    Builds an on-disk fixture, runs the recipe's parse/build pipeline
+    via ``_reparse``, mutates the file, then reloads via the public
+    ``get_children`` Ctrl-R contract and confirms every parser-derived
+    index reflects the new content.
+    """
+
+    def setUp(self):
+        import os
+        import tempfile
+        # Fresh module per test — ``_BY_ID`` / ``_BY_LINE`` etc are
+        # module-level state that other tests scribble on.
+        self.r = _load_recipe()
+        self.tmp = tempfile.NamedTemporaryFile(
+            'w', suffix='.md', delete=False, encoding='utf-8',
+        )
+        self.tmp.close()
+        self.path = self.tmp.name
+        self._write(
+            '# Alpha\n'
+            '## Sub-Alpha\n'
+            '- item\n'
+        )
+        # Point ``_reparse`` at the fixture and run the first parse —
+        # same code path ``main()`` uses at startup.
+        self.r._ROOT_PATH = self.path
+        self.r._reparse()
+
+    def tearDown(self):
+        import os
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+    def _write(self, text):
+        with open(self.path, 'w', encoding='utf-8') as f:
+            f.write(text)
+
+    def _heading_titles(self):
+        # ``_display_title`` strips the leading ``#`` so we can compare
+        # plain section names. Filters to heading-kind nodes only.
+        return sorted(
+            self.r._display_title(it)
+            for it in self.r._BY_ID.values()
+            if getattr(it, 'kind', None) == 'heading'
+        )
+
+    def test_initial_parse_state(self):
+        # Sanity: the setUp parse picked up both headings.
+        self.assertEqual(self._heading_titles(), ['Alpha', 'Sub-Alpha'])
+        self.assertEqual(self.r._FILE_TEXT.count('# Alpha'), 1)
+
+    def test_reparse_picks_up_new_heading(self):
+        # Modify the file on disk; the running tree still reflects the
+        # old content until reparse runs.
+        self._write(
+            '# Alpha\n'
+            '## Sub-Alpha\n'
+            '- item\n'
+            '\n'
+            '# Beta\n'
+            '## Sub-Beta\n'
+        )
+        # Before reparse: tree is still stale.
+        self.assertNotIn('Beta', self._heading_titles())
+        # Trigger reparse via the public Ctrl-R contract.
+        self.r.get_children(None, reload=True)
+        self.assertEqual(self._heading_titles(),
+                         ['Alpha', 'Beta', 'Sub-Alpha', 'Sub-Beta'])
+
+    def test_reparse_drops_removed_headings(self):
+        # Shrink the file — old headings must disappear from the index.
+        self._write('# Gamma only\n')
+        self.r.get_children(None, reload=True)
+        self.assertEqual(self._heading_titles(), ['Gamma only'])
+
+    def test_reparse_rebuilds_line_index(self):
+        # The line index is independent of ``_BY_ID``; confirm it tracks.
+        old_lines = sorted(self.r._BY_LINE)
+        self._write(
+            '\n'   # blank line shifts every subsequent line offset.
+            '# Alpha\n'
+            '# Beta\n'
+        )
+        self.r.get_children(None, reload=True)
+        new_lines = sorted(self.r._BY_LINE)
+        self.assertNotEqual(old_lines, new_lines)
+        # ``_LINES_SORTED`` is the bisect view — must stay in sync.
+        self.assertEqual(self.r._LINES_SORTED, new_lines)
+
+    def test_reload_reparses_when_node_id_matches_root_path(self):
+        # The framework's Ctrl-R hook can pass either ``None`` or the
+        # current root's id; ``_ROOT_PATH`` is the id we registered.
+        self._write('# Delta\n')
+        self.r.get_children(self.r._ROOT_PATH, reload=True)
+        self.assertEqual(self._heading_titles(), ['Delta'])
+
+    def test_reload_false_does_not_reparse(self):
+        # Default call (no reload kw) must NOT re-read the file even if
+        # it's been mutated underneath us.
+        self._write('# CompletelyDifferent\n')
+        self.r.get_children(None)  # default reload=False
+        # Old content still in the index.
+        self.assertEqual(self._heading_titles(), ['Alpha', 'Sub-Alpha'])
+
+    def test_reload_on_non_root_id_returns_cached_without_reparse(self):
+        # Non-root reload requests are short-circuited to the cached
+        # branch — full reparse would be wasted on a node-id that
+        # doesn't even own the file as a whole.
+        h1 = next(
+            it for it in self.r._BY_ID.values()
+            if getattr(it, 'kind', None) == 'heading'
+            and self.r._display_title(it) == 'Alpha'
+        )
+        self._write('# CompletelyDifferent\n')
+        result = self.r.get_children(h1.id, reload=True)
+        # Cached children survived (no reparse ran).
+        self.assertEqual(self._heading_titles(), ['Alpha', 'Sub-Alpha'])
+        # And the call still returned the heading's cached children.
+        self.assertEqual([c.tag for c in result], ['h2'])
+
+
+class TestHelpIntro(unittest.TestCase):
+    """``_HELP_INTRO`` — recipe-level prose shown above ``--help``."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_is_non_empty_string(self):
+        self.assertIsInstance(self.r._HELP_INTRO, str)
+        self.assertTrue(self.r._HELP_INTRO.strip())
+
+    def test_contains_usage_form(self):
+        # The usage line documents the file + optional anchor syntax.
+        self.assertIn('browse-md FILE.md', self.r._HELP_INTRO)
+
+    def test_mentions_anchor(self):
+        # Anchor syntax is a load-bearing feature; document it.
+        self.assertIn('#anchor', self.r._HELP_INTRO)
+
+    def test_mentions_each_custom_action(self):
+        # All four custom action keys should be discoverable from the
+        # intro (the keys are bound on the action rows below it, but
+        # the intro gives the one-liner).
+        for key in ('m', 'M', 'V', 'E'):
+            with self.subTest(key=key):
+                # Bound as a word in the format ``  m`` / ``  M`` etc.
+                # at start of an indented line — search for "  KEY ".
+                self.assertRegex(self.r._HELP_INTRO, rf'(?m)^\s+{key}\b')
+
+    def test_mentions_reload(self):
+        # Ctrl-R is the framework keybinding; document its effect.
+        self.assertIn('Ctrl-R', self.r._HELP_INTRO)
+
+    def test_compact_size(self):
+        # browse-fs-style compact help — should comfortably fit under
+        # the ~25-line budget noted in the ticket.
+        self.assertLessEqual(self.r._HELP_INTRO.count('\n'), 25)
+
+
 if __name__ == '__main__':
     unittest.main()

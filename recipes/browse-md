@@ -1,8 +1,21 @@
 #!/usr/bin/env -S browse-tui --run-py
-"""browse-md — single-file markdown browser. Lists headings + fences as
-a tree, preview shows the file body. Anchor (``FILE.md#name`` or
-``FILE.md#<line>``) seeds the initial scope so deep links land directly
-on the requested section.
+"""browse-md — single-file markdown browser.
+
+Parses a markdown file into a tree of headings (h1..h6) plus the
+nested list items underneath each section; the preview pane shows
+the file body (or a byte-slice for non-root cursor rows), optionally
+rendered through md2ansi for ANSI-coloured markdown. Anchor syntax
+(``FILE.md#name`` / ``FILE.md#<line>``) seeds the initial scope so
+deep links open directly on the targeted section. Ctrl-R re-slurps
+the file from disk and rebuilds the tree in place.
+
+Custom actions on top of the framework defaults:
+
+  m   toggle md2ansi coloring of the preview (only bound when the
+      ``md2ansi`` Python module is importable).
+  M   page the preview through ``$MD2ANSI`` / external ``md2ansi``.
+  V   page the source for cursor/selection in ``$PAGER``.
+  E   edit the source for cursor/selection in ``$EDITOR``.
 
 Usage:  browse-md FILE.md[#anchor]
 """
@@ -35,13 +48,21 @@ _MD_COLOR = _md2ansi_fn is not None
 _BROWSER = None  # set in main() — used for preview-width lookup
 
 # Raw anchor string from the ``FILE.md#anchor`` positional — resolved
-# to an item id in a later ticket (see #521). Empty string when the
+# to an item id via ``_resolve_anchor`` and handed to
+# ``BrowserConfig(initial_scope=...)``. Empty string when the
 # positional had no ``#``.
 _ANCHOR = ''
 
+# Absolute path of the file being browsed — captured in ``main()``
+# before the first parse so ``_reparse`` (Ctrl-R) knows where to read
+# from. ``get_children`` also compares ``node_id`` against this to
+# decide whether a reload request targets root.
+_ROOT_PATH = None
+
 # Whole-file slurp populated in main(). ``get_preview`` slices into
 # this for per-node previews (heading / list-item windows) and
-# returns the whole buffer for the root id.
+# returns the whole buffer for the root id. Wiped + repopulated by
+# ``_reparse`` on Ctrl-R.
 _FILE_TEXT = ''
 
 # Item index — ``id`` → ``Item``. Populated by ``_build_nodes`` from
@@ -559,6 +580,28 @@ def _resolve_anchor(anchor, root_id):
     return root_id
 
 
+def _reparse():
+    """Re-slurp ``_ROOT_PATH`` and rebuild every parser-derived index.
+
+    Wipes ``_FILE_TEXT``, ``_BY_ID``, ``_BY_LINE``, ``_LINES_SORTED``
+    and rebuilds them in place from the on-disk file. The recipe
+    parses a single file front-to-back so a full reparse is cheap —
+    no per-subtree invalidation is needed for Ctrl-R correctness.
+
+    Returns the new root Item (the caller doesn't need it for the
+    Ctrl-R path, but exposing it keeps ``main()`` and ``get_children``
+    on the same code path).
+    """
+    global _FILE_TEXT, _BY_ID, _BY_LINE, _LINES_SORTED
+    with open(_ROOT_PATH, 'r', encoding='utf-8', errors='replace') as f:
+        _FILE_TEXT = f.read()
+    line_starts = _line_starts(_FILE_TEXT)
+    events = _parse(_FILE_TEXT)
+    root, _BY_ID = _build_nodes(events, _FILE_TEXT, line_starts, _ROOT_PATH)
+    _BY_LINE, _LINES_SORTED = _build_line_index(_BY_ID)
+    return root
+
+
 def get_children(node_id, *, reload=False):
     """Return cached children for ``node_id``.
 
@@ -567,10 +610,17 @@ def get_children(node_id, *, reload=False):
     is a dict lookup — no per-call parsing. Unknown ids return ``[]``
     so a stale anchor or scope id doesn't surface as a traceback.
 
-    ``reload`` is accepted for API conformance but currently a no-op;
-    Ctrl-R reload lands in a later ticket (see the spec's "Reload"
-    section, owned by #523+).
+    ``reload=True`` is honoured only at root (``node_id`` is ``None``
+    or matches ``_ROOT_PATH``): the framework's Ctrl-R hook calls
+    ``get_children(current_root, reload=True)``, and we use that as
+    the trigger to re-slurp the file and rebuild every index. Non-root
+    reloads return cached children unchanged — single-file parse is
+    cheap enough that there's no value in per-subtree invalidation.
     """
+    if reload and (node_id is None or node_id == _ROOT_PATH):
+        _reparse()
+    if node_id is None:
+        node_id = _ROOT_PATH
     item = _BY_ID.get(node_id)
     if item is None:
         return []
@@ -874,8 +924,31 @@ def _action_edit_source(ctx):
     _run_source_command(ctx, 'EDITOR', 'vim')
 
 
+_HELP_INTRO = """\
+browse-md — single-file markdown browser.
+
+Usage: browse-md FILE.md[#anchor]
+  FILE.md   Markdown file to open.
+  #anchor   Optional deep-link target — either a 0-based line number
+            (``#42``) or a heading name. Heading lookup runs three
+            tiers in source order: exact ``_display_title`` match,
+            then prefix, then substring; first hit wins.
+
+Headings (h1..h6) and the nested list items below each section form
+the tree; the preview pane shows the file body (or the byte-slice
+for a non-root cursor), optionally rendered via md2ansi.
+
+  m       Toggle md2ansi coloring of the preview pane (only bound
+          when the md2ansi Python module is importable).
+  M       Render the preview through ``$MD2ANSI`` / external md2ansi.
+  V       Page the source for cursor/selection in ``$PAGER``.
+  E       Edit the source for cursor/selection in ``$EDITOR``.
+  Ctrl-R  Re-slurp the file and rebuild the tree in place.\
+"""
+
+
 def main():
-    global _ANCHOR, _FILE_TEXT, _BY_ID, _BY_LINE, _LINES_SORTED, _BROWSER
+    global _ANCHOR, _ROOT_PATH, _BROWSER
     if len(sys.argv) < 2:
         print(_USAGE, file=sys.stderr)
         sys.exit(2)
@@ -888,28 +961,19 @@ def main():
     if not os.path.isfile(path):
         print(_USAGE, file=sys.stderr)
         sys.exit(2)
-    # ``errors='replace'`` keeps the recipe alive on stray non-UTF-8
-    # bytes — the preview pane will show the replacement char rather
-    # than the read raising.
-    with open(path, 'r', encoding='utf-8', errors='replace') as f:
-        _FILE_TEXT = f.read()
-    # Parse + build the tree once at startup. ``_BY_ID`` becomes the
-    # backing index for ``get_children``; ``root.id`` is the path
-    # string we hand to ``BrowserConfig`` so root-scope lookups land
-    # on the synthetic root entry rather than the empty-dict fallback.
-    line_starts = _line_starts(_FILE_TEXT)
-    events = _parse(_FILE_TEXT)
-    root, _BY_ID = _build_nodes(events, _FILE_TEXT, line_starts, path)
-    # Line-keyed lookup tables for ``_node_at_line`` / anchor resolve.
-    # Built once here so ``_resolve_anchor`` can find them at module
-    # scope without threading the by-id dict through every call.
-    _BY_LINE, _LINES_SORTED = _build_line_index(_BY_ID)
+    # Capture the abs path so ``_reparse`` (Ctrl-R) can re-read the
+    # same file without re-parsing argv. The first parse runs through
+    # the shared ``_reparse`` helper too — same path that Ctrl-R uses,
+    # so any rebuild bug surfaces at startup not at first reload.
+    _ROOT_PATH = path
+    root = _reparse()
     initial_scope = _resolve_anchor(_ANCHOR, root.id)
     # ``M`` is always available — it errors gracefully when no
     # renderer is found, so users discover the env-var hook even on
     # boxes without md2ansi installed. ``m`` only makes sense when
     # md2ansi is importable; otherwise the toggle can't do anything
-    # useful (the preview is already raw).
+    # useful (the preview is already raw). Matches the conditional
+    # build-up pattern in browse-claude / browse-fs.
     actions = [Action('M', 'View preview via $MD2ANSI / md2ansi',
                       _action_md_preview, 'cursor')]
     if _md2ansi_fn is not None:
@@ -932,6 +996,7 @@ def main():
         get_preview=get_preview,
         initial_scope=initial_scope,
         actions=actions,
+        help_intro=_HELP_INTRO,
     ))
     # Stash the Browser on the module so ``get_preview`` can read
     # ``preview_width`` for md2ansi word-wrap. Matches the pattern in
