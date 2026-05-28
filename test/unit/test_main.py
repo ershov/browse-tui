@@ -64,6 +64,15 @@ _state.Context = _context.Context
 _state.dispatch_key = _actions.dispatch_key
 _state.render_full = lambda *a, **kw: None
 _state.render_partial = lambda *a, **kw: None
+# ``Browser.run`` calls ``_layout_for`` once before the initial preview
+# fetch to populate ``_preview_width`` (ticket #558). In the concatenated
+# build the name resolves naturally; in tests we inject it here so the
+# non-headless startup path doesn't NameError. ``term_size`` is wired
+# alongside because ``_layout_for`` reads it; the default fallback
+# ``(80, 24)`` is fine for tests that don't override it.
+_state._layout_for = _render._layout_for
+_render.term_size = _term.term_size
+_render.visible_items = _state.visible_items
 
 # Context references back into terminal/render — wire those too so that
 # the headless paths don't accidentally hit a missing symbol.
@@ -326,6 +335,92 @@ class TestBrowserRunHeadlessSmoke(unittest.TestCase):
             _state.read_key = original
         self.assertEqual(rc, 0)
         self.assertEqual(out.getvalue(), 'alpha\n')
+
+
+# ---------------------------------------------------------------------------
+# Initial-paint preview width (ticket #558): the first ``get_preview`` fetch
+# on startup must see the live preview-pane width, not the ``preview_width
+# == 0`` sentinel that triggers the recipe-level ``or 80`` fallback.
+# ---------------------------------------------------------------------------
+
+
+class TestBrowserRunFirstPreviewWidth(unittest.TestCase):
+    """The preview worker must read the real preview-pane width on the
+    very first fetch, before any ``get_preview`` call rendered text at
+    the 80-col fallback width.
+
+    Repro shape: a non-headless Browser is constructed at terminal size
+    160x40 and asked to ``run()``. ``read_key`` returns ``'q'`` so the
+    main loop drops out after a single iteration. The ``get_preview``
+    callback captures ``browser.preview_width`` each time it fires; the
+    very first capture is what users see on screen.
+
+    Before the fix the capture is ``0`` (no paint has populated
+    ``_preview_width`` yet). After the fix it is the real preview-pane
+    width returned by ``layout_panes`` for the current terminal.
+    """
+
+    def setUp(self):
+        # Force a deterministic, non-80 terminal so a ``0``-fallback
+        # bug can't masquerade as a correct value. Module-level wiring
+        # already points ``_render.term_size`` at the real terminal
+        # helper; we override here and restore in tearDown.
+        self._orig_term_size = _render.term_size
+        _render.term_size = lambda: (160, 40)
+
+    def tearDown(self):
+        _render.term_size = self._orig_term_size
+
+    def test_initial_get_preview_sees_real_preview_width(self):
+        captured_widths: list = []
+        captured: dict = {}
+
+        def get_preview(id_):
+            # Pull the width straight off the Browser — that's what
+            # recipes do (browse-md / browse-claude / browse-fs all
+            # read ``_BROWSER.preview_width``). Capture for assertion.
+            captured_widths.append(captured['browser'].preview_width)
+            return f'preview for {id_}'
+
+        b = Browser.from_flat_tree(
+            ['alpha', 'beta'],
+            get_preview=get_preview,
+            _headless=False,
+            show_children_pane=False,  # keep _layout_for simple
+        )
+        captured['browser'] = b
+
+        # Compute the expected preview-pane width from the same layout
+        # function the renderer uses, so the assertion stays in lock-
+        # step with any future layout tweak.
+        layout = _render.layout_panes(
+            160, 40,
+            split='h',
+            show_preview=True,
+            show_children_pane=False,
+            list_ratio=b.list_ratio,
+        )
+        prect = layout.get('preview')
+        self.assertIsNotNone(prect, 'preview pane must exist for repro')
+        expected = prect.width
+        self.assertGreater(expected, 0)
+        # Make extra sure we're not coincidentally validating the 80
+        # fallback — at 160 cols the preview pane is wider than 80.
+        self.assertNotEqual(expected, 80)
+
+        rc = b.run()
+        # Sanity: the loop did quit cleanly.
+        self.assertEqual(rc, 1)
+        # The worker fired at least once during the startup wait.
+        self.assertTrue(captured_widths,
+                        'get_preview must run during startup')
+        # The first capture is the user-visible one; later captures
+        # (after the loop iterates) are irrelevant to this bug.
+        self.assertEqual(
+            captured_widths[0], expected,
+            f'first get_preview saw width={captured_widths[0]} '
+            f'(expected {expected}); pre-fix this is 0',
+        )
 
 
 # ---------------------------------------------------------------------------

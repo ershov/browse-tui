@@ -7041,6 +7041,13 @@ class Browser:
                 self.run_until_idle(timeout=0.5)
             except TimeoutError:
                 pass  # slow callback; render the loading state
+            # Compute the layout once before the first preview fetch so
+            # ``_preview_width`` is populated when the worker reads it.
+            # Without this, ``get_preview`` runs with ``preview_width
+            # == 0`` and recipes fall back to the 80-col default — the
+            # first paint then displays a preview wrapped to 80 columns
+            # regardless of the real pane width.
+            _layout_for(self)
             self._update_preview_for_cursor()
             self._update_children_for_cursor()
             try:
