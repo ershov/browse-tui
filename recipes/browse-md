@@ -1,25 +1,38 @@
 #!/usr/bin/env -S browse-tui --run-py
-"""browse-md — single-file markdown browser.
+"""browse-md — markdown browser supporting one or more files.
 
-Parses a markdown file into a tree of headings (h1..h6); list items
-under each section can optionally be surfaced as tree rows via the
-``-l`` / ``--list`` / ``--lists`` flag (default: headings only). The
-preview pane shows the file body (or a byte-slice for non-root
+Parses each markdown file on argv into a tree of headings (h1..h6);
+list items under each section can optionally be surfaced as tree
+rows via the ``-l`` / ``--list`` / ``--lists`` flag (default:
+headings only). With a single file the per-file Item is the root.
+With multiple files a synthetic multi-root sits above the per-file
+Items so all files are visible as siblings.
+
+Anchor syntax (``FILE.md#name`` / ``FILE.md#<line>``) seeds the
+initial scope so deep links open directly on the targeted section.
+When multiple files carry anchors, the FIRST anchored file in argv
+order wins — other anchors are ignored, the multi-root still
+contains every file.
+
+The preview pane shows the file body (or a byte-slice for non-root
 cursor rows), optionally rendered through md2ansi for ANSI-coloured
-markdown. Anchor syntax (``FILE.md#name`` / ``FILE.md#<line>``)
-seeds the initial scope so deep links open directly on the targeted
-section. Ctrl-R re-slurps the file from disk and rebuilds the tree
-in place.
+markdown. Ctrl-R re-slurps every file from disk and rebuilds the
+tree in place.
 
 Custom actions on top of the framework defaults:
 
   m   toggle md2ansi coloring of the preview (only bound when the
       ``md2ansi`` Python module is importable).
   M   page the preview through ``$MD2ANSI`` / external ``md2ansi``.
-  V   page the source for cursor/selection in ``$PAGER``.
-  E   edit the source for cursor/selection in ``$EDITOR``.
+  V   page the source for cursor/selection in ``$PAGER``. On the
+      multi-root opens the first argv file; on a per-file root
+      opens that file; on a non-root row pages the byte-slice
+      tempfile. Cross-file multi-select takes the FIRST file's
+      targets only.
+  E   edit the source for cursor/selection in ``$EDITOR``. Same
+      multi-root / per-file-root / cross-file rules as V.
 
-Usage:  browse-md [-l] FILE.md[#anchor]
+Usage:  browse-md [-l] FILE.md[#anchor] [FILE.md[#anchor] ...]
 """
 
 import bisect
@@ -49,41 +62,54 @@ except Exception:
 _MD_COLOR = _md2ansi_fn is not None
 _BROWSER = None  # set in main() — used for preview-width lookup
 
-# Raw anchor string from the ``FILE.md#anchor`` positional — resolved
-# to an item id via ``_resolve_anchor`` and handed to
-# ``BrowserConfig(initial_scope=...)``. Empty string when the
-# positional had no ``#``.
-_ANCHOR = ''
+# Sentinel id for the synthetic multi-root that owns the per-file
+# subtrees. Distinct from any real abs-path (real paths don't start
+# with ``(``) and short enough that ``get_preview`` / classifier
+# string-compare against it cheaply. The same constant becomes the
+# Browser's ``root_id`` so the framework's reload hook recognises
+# "reload at root" via ``node_id == _ROOT_ID``.
+_ROOT_ID = '(multi)'
 
-# Absolute path of the file being browsed — captured in ``main()``
-# before the first parse so ``_reparse`` (Ctrl-R) knows where to read
-# from. ``get_children`` also compares ``node_id`` against this to
-# decide whether a reload request targets root.
-_ROOT_PATH = None
+# Per-file state slot — populated by ``_reparse`` from
+# ``_INPUT_FILES``. Lookups in ``get_preview`` / classifier resolve
+# the right file's text + indexes via this dict; the per-Item
+# ``file_path`` back-reference (set in ``_build_nodes``) is the key.
+_FILES = {}
 
-# Whole-file slurp populated in main(). ``get_preview`` slices into
-# this for per-node previews (heading / list-item windows) and
-# returns the whole buffer for the root id. Wiped + repopulated by
-# ``_reparse`` on Ctrl-R.
-_FILE_TEXT = ''
+# Argv-derived list of ``(abs_path, anchor_or_empty)`` pairs, in argv
+# order. Populated by ``main()`` before the first ``_reparse``; used
+# by Ctrl-R to know which files to re-slurp.
+_INPUT_FILES = []
 
-# Item index — ``id`` → ``Item``. Populated by ``_build_nodes`` from
-# the synthetic root downward; ``get_children`` reads ``_children``
-# off of the matching entry. Cleared / rebuilt on full reparse.
+# Aggregate id-to-Item index — multi-root + per-file roots + every
+# heading/list-item across every file. Read by ``get_children`` to
+# materialise tree rows on demand and by ``get_preview`` to look up
+# an id's owning file via ``item.file_path``.
 _BY_ID = {}
 
-# Line index — ``line_offset`` → ``Item``. Populated by
-# ``_build_nodes`` alongside ``_BY_ID``. Root is intentionally
-# excluded so ``_node_at_line`` returns ``None`` for offsets in
-# preamble territory (the anchor flow then falls back to root).
+# --- Legacy single-file shims --------------------------------------
+#
+# A handful of existing tests populate these module globals directly
+# (e.g. ``self.r._BY_LINE = ...``) and call ``_node_at_line`` /
+# ``_resolve_anchor`` / ``get_preview`` against them. To keep those
+# tests passing without rewriting every test setUp, ``_reparse``
+# mirrors the FIRST input file's state into these globals; helpers
+# fall back to them when no explicit file-state is passed in.
+#
+# ``_FILE_TEXT``: first file's body (or ``''`` if no files).
+# ``_BY_LINE``: ``line_offset -> Item`` for the first file.
+# ``_LINES_SORTED``: sorted view of ``_BY_LINE`` keys.
+# ``_ROOT_PATH``: abs path of the first file (or ``None``).
+_FILE_TEXT = ''
 _BY_LINE = {}
-
-# Sorted view of ``_BY_LINE`` keys for ``bisect_right`` lookup in
-# ``_node_at_line``. Source-ordered parse + distinct ``byte_offset``
-# per event keeps the underlying dict's insertion order monotonic,
-# but we materialise a sorted list anyway so the bisect contract
-# survives any future reordering.
 _LINES_SORTED = []
+_ROOT_PATH = None
+
+# Raw anchor string from the first anchored file in argv (after the
+# multi-file refactor: "first anchor wins"). Empty when no positional
+# carried a ``#``. Resolved to an item id via ``_resolve_anchor`` and
+# handed to ``BrowserConfig(initial_scope=...)``.
+_ANCHOR = ''
 
 # Tag-style palette per heading level. h1 stays red (md2ansi-ish loud
 # top); deeper levels cycle through the named palette ending in gray
@@ -126,7 +152,7 @@ _LIST_PREFIX_RE = re.compile(r'^([-*+]|\d+\.)\s+')
 _INCLUDE_LISTS = False
 
 
-_USAGE = 'usage: browse-md [-l] FILE.md[#anchor]'
+_USAGE = 'usage: browse-md [-l] FILE.md[#anchor] [FILE.md[#anchor] ...]'
 
 
 # ### Section: Markdown block-rule table ##############################
@@ -217,6 +243,54 @@ _PARSER_RE = re.compile(
     '|'.join(f'(?P<{n}>{p})' for n, p in _RULES),
     re.VERBOSE | re.MULTILINE | re.DOTALL,
 )
+
+
+class _FileState:
+    """Per-file parser state bundle held inside ``_FILES``.
+
+    A plain attribute carrier — every field is filled in by
+    ``_reparse`` from a single ``_build_nodes`` invocation plus the
+    derived line index. Keeping it on a class rather than a dict gives
+    each lookup site (``get_preview``, ``_run_source_command``,
+    ``_resolve_anchor``) attribute-level errors when a field is
+    missing rather than a silent ``None``.
+
+    Fields:
+      * ``path``         — abs path of the file (also the per-file
+                          root's Item id).
+      * ``text``         — full file body. ``get_preview`` slices
+                          this for non-root rows; the root preview
+                          is the whole buffer.
+      * ``line_starts``  — byte offset of the start of each line.
+                          Passed into ``_walk_list`` / ``_line_of``.
+      * ``by_id``        — id-to-Item index for THIS file (no
+                          multi-root, no other files). Useful when
+                          a helper needs to walk only one file's
+                          nodes (e.g. anchor resolution).
+      * ``by_line``      — ``line_offset -> Item`` for this file.
+                          Excludes the per-file root so anchor
+                          lookups for offsets in preamble territory
+                          fall through to root upstream.
+      * ``lines_sorted`` — sorted keys of ``by_line`` for the
+                          ``bisect_right`` lookup in
+                          ``_node_at_line``.
+      * ``file_root``    — the per-file root Item (siblings under
+                          the synthetic multi-root in multi-file
+                          mode; THE root in single-file mode).
+    """
+
+    __slots__ = ('path', 'text', 'line_starts',
+                 'by_id', 'by_line', 'lines_sorted', 'file_root')
+
+    def __init__(self, path, text, line_starts,
+                 by_id, by_line, lines_sorted, file_root):
+        self.path = path
+        self.text = text
+        self.line_starts = line_starts
+        self.by_id = by_id
+        self.by_line = by_line
+        self.lines_sorted = lines_sorted
+        self.file_root = file_root
 
 
 def _line_starts(text):
@@ -333,11 +407,18 @@ _LIST_EVENT_KINDS = frozenset(('ul', 'ol'))
 def _build_nodes(events, file_text, line_starts, path):
     """Materialise events into a tree of ``Item`` instances.
 
-    Returns ``(root, by_id)``. The synthetic root owns every top-level
+    Returns ``(root, by_id)``. The per-file root owns every top-level
     heading and every pre-first-heading list item; ``by_id`` is the
-    flat id-to-Item index. Children lists are pre-populated on each
-    Item as ``item._children`` so ``get_children`` can return them
-    without re-walking the event stream.
+    flat id-to-Item index for THIS file (no multi-root, no other
+    files). Children lists are pre-populated on each Item as
+    ``item._children`` so ``get_children`` can return them without
+    re-walking the event stream.
+
+    Every Item carries ``file_path = path`` so multi-file ``get_preview``
+    knows which file's ``_FILE_TEXT`` to slice from — even when only
+    the id is in hand. The per-file root gets the same back-reference;
+    the synthetic multi-root (built later in ``_build_multi_root``) is
+    the only Item without one.
 
     Three passes:
 
@@ -400,6 +481,7 @@ def _build_nodes(events, file_text, line_starts, path):
             item.level = payload['level']
         item.byte_offset = bo
         item.line_offset = lo
+        item.file_path = path
         item._children = []
         nodes.append(item)
 
@@ -448,6 +530,7 @@ def _build_nodes(events, file_text, line_starts, path):
     root.byte_size = file_bytes_eof
     root.line_offset = 0
     root.line_size = file_lines_eof
+    root.file_path = path
     root._children = []
 
     # Heading stack: each entry is ``(level, Item)``. Top is the
@@ -523,7 +606,79 @@ def _build_line_index(by_id):
     return by_line, lines_sorted
 
 
-def _node_at_line(n):
+def _build_multi_root(file_states):
+    """Synthesise the multi-root Item sitting above the per-file roots.
+
+    ``file_states`` is the argv-ordered list of ``_FileState`` objects
+    coming out of ``_reparse``. The returned root carries:
+
+      * ``id == _ROOT_ID``  — the sentinel matching ``_FILES`` lookups
+        in ``get_preview`` / classifier.
+      * ``title``           — ``"N files"`` so the row reads as a
+        compact summary in the visible-tree header.
+      * ``kind == 'multi-root'`` — distinct from per-file roots'
+        ``'root'`` so the classifier can tell them apart.
+      * ``_children``       — the per-file roots in argv order.
+      * ``byte_offset/byte_size`` — zero (no underlying text). The
+        ``V`` / ``E`` classifier short-circuits BEFORE byte-range
+        slicing for multi-root targets, so these are never used.
+      * ``file_path = None`` — the multi-root has no owning file;
+        callers must classify before reading the attr.
+
+    Single-file callers (and tests that exercise the single-file
+    pipeline directly) never reach this helper — ``_reparse`` only
+    invokes it when ``_INPUT_FILES`` has more than one entry, so the
+    Browser's ``root_id`` is the per-file root's id in that case and
+    the multi-root sentinel sits unused.
+    """
+    root = Item(
+        id=_ROOT_ID,
+        title=f'{len(file_states)} files',
+        has_children=bool(file_states),
+    )
+    root.kind = 'multi-root'
+    root.level = 0
+    root.byte_offset = 0
+    root.byte_size = 0
+    root.line_offset = 0
+    root.line_size = 0
+    root.file_path = None
+    root._children = [fs.file_root for fs in file_states]
+    return root
+
+
+def _classify_id(node_id):
+    """Single-source classifier for an Item id.
+
+    Returns one of:
+      * ``('multi-root', None)``   — the synthetic multi-root sentinel.
+      * ``('file-root', path)``    — a per-file root (id is the file's
+                                     abs path; ``_FILES[path]`` exists).
+      * ``('content', path)``      — a per-file heading or list-item.
+        ``path`` is the file abs path; the rest of the id is
+        ``#<line_offset>``.
+      * ``('unknown', None)``      — id doesn't fit any of the above.
+        Caller decides how to fail (usually empty preview or noop).
+
+    Used by ``get_preview``, ``_run_source_command``, and any other
+    surface that needs to distinguish "open the file directly" from
+    "slice into a per-file body". Centralising the rule means a future
+    id-shape change touches one place.
+    """
+    if node_id == _ROOT_ID:
+        return ('multi-root', None)
+    if node_id in _FILES:
+        return ('file-root', node_id)
+    # Content id shape: ``<path>#<line>``. ``rpartition`` so paths
+    # that happen to contain ``#`` (rare) still split on the last one.
+    if '#' in node_id:
+        path, _, _ = node_id.rpartition('#')
+        if path in _FILES:
+            return ('content', path)
+    return ('unknown', None)
+
+
+def _node_at_line(n, file_state=None):
     """Return the deepest parsed node whose source range contains line ``n``.
 
     Contract (per the spec's "Lookup contract" section):
@@ -535,18 +690,26 @@ def _node_at_line(n):
         the deepest-containing node is also the one with the greatest
         ``line_offset`` that doesn't exceed ``n``.
       * ``None`` if ``n`` precedes every parsed node (preamble
-        territory — the anchor flow substitutes root scope upstream).
+        territory — the anchor flow then falls back to root upstream).
 
-    Uses ``bisect_right`` against the cached ``_LINES_SORTED`` view so
-    the lookup is O(log N) over node count.
+    ``file_state`` selects which file's line index to consult. When
+    ``None`` (legacy single-file callers / tests that populate
+    ``_BY_LINE`` / ``_LINES_SORTED`` directly), the module-level
+    globals are used instead — preserving the pre-multi-file API.
     """
-    item = _BY_LINE.get(n)
+    if file_state is not None:
+        by_line = file_state.by_line
+        lines_sorted = file_state.lines_sorted
+    else:
+        by_line = _BY_LINE
+        lines_sorted = _LINES_SORTED
+    item = by_line.get(n)
     if item is not None:
         return item
-    i = bisect.bisect_right(_LINES_SORTED, n) - 1
+    i = bisect.bisect_right(lines_sorted, n) - 1
     if i < 0:
         return None
-    return _BY_LINE[_LINES_SORTED[i]]
+    return by_line[lines_sorted[i]]
 
 
 def _display_title(item):
@@ -565,14 +728,14 @@ def _display_title(item):
     return item.title.strip()
 
 
-def _resolve_anchor(anchor, root_id):
+def _resolve_anchor(anchor, file_root_id):
     """Resolve an anchor string to an Item id (for ``initial_scope``).
 
     Three-way dispatch matching the spec's "Argument parsing" rules:
 
-      * Empty anchor → ``root_id``.
+      * Empty anchor → ``file_root_id``.
       * All-digit anchor → treat as a 0-indexed line number, look up
-        via ``_node_at_line``. Fall through silently to ``root_id``
+        via ``_node_at_line``. Fall through silently to ``file_root_id``
         when the lookup returns ``None`` (the anchor precedes every
         parsed node — normal for early-file targets).
       * Non-digit anchor → three-tier scan over headings only, in
@@ -584,19 +747,47 @@ def _resolve_anchor(anchor, root_id):
     heading list so a substring hit on heading A can't pre-empt an
     exact match on later heading B — matching the spec's "scan all
     headings before falling through" wording.
+
+    ``file_root_id`` is the per-file root id whose headings are
+    searched. In multi-file mode the caller picks the file via
+    "first anchored file wins" and passes its root id here; in
+    single-file (and legacy-test) mode it's just the lone root id.
     """
     if not anchor:
-        return root_id
+        return file_root_id
+    # Pick the file state to scan. ``_FILES`` is populated by
+    # ``_reparse``; legacy single-file tests skip ``_reparse`` and
+    # populate the module-level ``_BY_ID`` / ``_BY_LINE`` directly,
+    # in which case ``_FILES`` is empty and we fall back to the
+    # module-level indexes by passing ``file_state=None`` to the
+    # downstream helpers.
+    file_state = _FILES.get(file_root_id)
     if anchor.isdigit():
-        item = _node_at_line(int(anchor))
-        return item.id if item is not None else root_id
-    # Non-digit: scan headings in source order. ``_BY_ID`` is built
-    # in insertion order (root + parser-event order from
-    # ``_build_nodes``), so filtering to headings and sorting by
-    # ``line_offset`` yields source order without depending on dict
-    # iteration semantics.
+        item = _node_at_line(int(anchor), file_state)
+        return item.id if item is not None else file_root_id
+    # Non-digit: scan headings in source order. ``_BY_ID`` (per-file
+    # in multi-file mode via ``file_state.by_id``, or the module-level
+    # aggregate in legacy mode) is built in insertion order (root +
+    # parser-event order from ``_build_nodes``), so filtering to
+    # headings and sorting by ``line_offset`` yields source order
+    # without depending on dict iteration semantics.
+    if file_state is not None:
+        candidates = file_state.by_id.values()
+    else:
+        # Legacy: scan ``_BY_ID`` but filter to headings whose
+        # ``file_path`` matches ``file_root_id`` when present (so a
+        # multi-file aggregate-only test doesn't accidentally match
+        # the wrong file's heading). Tests built without ``file_path``
+        # (older fixtures) hit the ``getattr(..., None)`` fallback
+        # which keeps the heading in scope — preserving pre-#553
+        # behaviour.
+        candidates = []
+        for it in _BY_ID.values():
+            fp = getattr(it, 'file_path', None)
+            if fp is None or fp == file_root_id:
+                candidates.append(it)
     headings = sorted(
-        (it for it in _BY_ID.values() if it.kind == 'heading'),
+        (it for it in candidates if it.kind == 'heading'),
         key=lambda it: it.line_offset,
     )
     # Lower the anchor once; comparison is case-insensitive but the
@@ -618,69 +809,183 @@ def _resolve_anchor(anchor, root_id):
         f'browse-md: no heading matches {anchor!r}, opening at root',
         file=sys.stderr,
     )
-    return root_id
+    return file_root_id
 
 
 def _reparse():
-    """Re-slurp ``_ROOT_PATH`` and rebuild every parser-derived index.
+    """Re-slurp every input file and rebuild every parser-derived index.
 
-    Wipes ``_FILE_TEXT``, ``_BY_ID``, ``_BY_LINE``, ``_LINES_SORTED``
-    and rebuilds them in place from the on-disk file. The recipe
-    parses a single file front-to-back so a full reparse is cheap —
-    no per-subtree invalidation is needed for Ctrl-R correctness.
+    Wipes ``_FILES``, ``_BY_ID`` (aggregate), and the legacy
+    single-file shims (``_FILE_TEXT`` / ``_BY_LINE`` / ``_LINES_SORTED``
+    / ``_ROOT_PATH``), then rebuilds them in place from the on-disk
+    files listed in ``_INPUT_FILES``. Each file is parsed independently
+    with the same ``_parse`` + ``_build_nodes`` pipeline used in
+    single-file mode.
 
-    Returns the new root Item (the caller doesn't need it for the
-    Ctrl-R path, but exposing it keeps ``main()`` and ``get_children``
-    on the same code path).
+    With one input file the Browser root is that file's per-file root
+    (legacy behaviour: ``root_id`` = abs path). With two or more, the
+    Browser root is the synthetic multi-root sentinel ``_ROOT_ID`` and
+    each per-file root becomes a top-level sibling under it.
+
+    Returns the root Item used by ``main()`` to seed ``BrowserConfig``
+    and by Ctrl-R callers (the latter discards it — but exposing it
+    keeps both code paths symmetric).
     """
-    global _FILE_TEXT, _BY_ID, _BY_LINE, _LINES_SORTED
-    with open(_ROOT_PATH, 'r', encoding='utf-8', errors='replace') as f:
-        _FILE_TEXT = f.read()
-    line_starts = _line_starts(_FILE_TEXT)
-    events = _parse(_FILE_TEXT)
-    root, _BY_ID = _build_nodes(events, _FILE_TEXT, line_starts, _ROOT_PATH)
-    _BY_LINE, _LINES_SORTED = _build_line_index(_BY_ID)
+    global _FILES, _BY_ID
+    global _FILE_TEXT, _BY_LINE, _LINES_SORTED, _ROOT_PATH
+
+    _FILES = {}
+    _BY_ID = {}
+
+    # Legacy / test fallback: if ``_INPUT_FILES`` is empty but
+    # ``_ROOT_PATH`` was set externally (older test fixtures that
+    # populate ``_ROOT_PATH`` directly before calling ``_reparse``),
+    # treat it as a one-file input list. Production ``main()`` always
+    # populates ``_INPUT_FILES`` before reaching here.
+    input_files = _INPUT_FILES
+    if not input_files and _ROOT_PATH is not None:
+        input_files = [(_ROOT_PATH, '')]
+
+    file_states = []
+    for path, _anchor in input_files:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            text = f.read()
+        ls = _line_starts(text)
+        events = _parse(text)
+        file_root, by_id = _build_nodes(events, text, ls, path)
+        by_line, lines_sorted = _build_line_index(by_id)
+        fs = _FileState(
+            path=path,
+            text=text,
+            line_starts=ls,
+            by_id=by_id,
+            by_line=by_line,
+            lines_sorted=lines_sorted,
+            file_root=file_root,
+        )
+        _FILES[path] = fs
+        file_states.append(fs)
+        # Aggregate id-to-Item — every per-file by_id contributes.
+        _BY_ID.update(by_id)
+
+    # Build the synthetic multi-root only when we have >1 files; the
+    # single-file path keeps the per-file root AS the Browser root so
+    # the visible-tree header reads as the file's basename rather than
+    # ``"1 files"``.
+    if len(file_states) > 1:
+        multi_root = _build_multi_root(file_states)
+        _BY_ID[_ROOT_ID] = multi_root
+        root = multi_root
+    elif file_states:
+        root = file_states[0].file_root
+    else:
+        # Defensive: ``main()`` rejects zero-positional argv, so this
+        # branch is unreachable in production. Tests that call
+        # ``_reparse`` with an empty ``_INPUT_FILES`` get an empty
+        # placeholder rather than a NameError.
+        root = None
+
+    # Mirror the FIRST file's state into the legacy single-file
+    # globals so tests / call sites that haven't been updated still
+    # see a consistent view. In single-file mode this is the only
+    # file's state; in multi-file mode the first file is the
+    # well-defined choice (matches "first file wins" for V/E on
+    # multi-root and ``_INPUT_FILES`` ordering).
+    if file_states:
+        first = file_states[0]
+        _FILE_TEXT = first.text
+        _BY_LINE = first.by_line
+        _LINES_SORTED = first.lines_sorted
+        _ROOT_PATH = first.path
+    else:
+        _FILE_TEXT = ''
+        _BY_LINE = {}
+        _LINES_SORTED = []
+        _ROOT_PATH = None
+
     return root
 
 
 def get_children(node_id, *, reload=False):
     """Return cached children for ``node_id``.
 
-    The tree is built once in ``main()`` (``_build_nodes`` walks the
-    flat event stream and pre-populates ``item._children``), so this
-    is a dict lookup — no per-call parsing. Unknown ids return ``[]``
-    so a stale anchor or scope id doesn't surface as a traceback.
+    The tree is built once in ``main()`` (``_build_nodes`` walks each
+    file's flat event stream and pre-populates ``item._children``,
+    then ``_reparse`` aggregates per-file roots under the synthetic
+    multi-root), so this is a dict lookup — no per-call parsing.
+    Unknown ids return ``[]`` so a stale anchor or scope id doesn't
+    surface as a traceback.
 
-    ``reload=True`` is honoured only at root (``node_id`` is ``None``
-    or matches ``_ROOT_PATH``): the framework's Ctrl-R hook calls
+    ``reload=True`` is honoured only at the Browser root (``node_id``
+    is ``None`` or matches the current root id — ``_ROOT_ID`` in
+    multi-file mode, the single per-file root's path in single-file
+    mode): the framework's Ctrl-R hook calls
     ``get_children(current_root, reload=True)``, and we use that as
-    the trigger to re-slurp the file and rebuild every index. Non-root
-    reloads return cached children unchanged — single-file parse is
-    cheap enough that there's no value in per-subtree invalidation.
+    the trigger to re-slurp every file and rebuild every index.
+    Non-root reloads return cached children unchanged — full reparse
+    is cheap but pointless when the request targets a sub-node.
     """
-    if reload and (node_id is None or node_id == _ROOT_PATH):
-        _reparse()
+    if reload:
+        # Treat ``None`` and either flavour of root (multi-root id or
+        # the single-file root path) as the "reload-at-root" trigger.
+        # ``_ROOT_PATH`` is the first file's abs path; in single-file
+        # mode it IS the Browser root id, in multi-file mode it's a
+        # per-file root and a reload there shouldn't reparse — but the
+        # ticket says "treat as root" so we keep the wider gate.
+        if node_id is None or node_id == _ROOT_ID or node_id == _ROOT_PATH:
+            _reparse()
     if node_id is None:
-        node_id = _ROOT_PATH
+        # Pick the Browser root: multi-root sentinel if it's in the
+        # aggregate index, else the single-file root path.
+        node_id = _ROOT_ID if _ROOT_ID in _BY_ID else _ROOT_PATH
     item = _BY_ID.get(node_id)
     if item is None:
         return []
     return list(item._children)
 
 
+def _multi_root_preview():
+    """Return the summary text shown when the cursor is on the multi-root.
+
+    Lists each input file with the count of heading-kind items in its
+    subtree, one per line — a compact "what's loaded" view that
+    doesn't concatenate every file's body (which is the footgun the
+    ticket calls out). Falls back to a bare count if ``_FILES`` is
+    empty (defensive — ``main()`` rejects zero-positional argv).
+    """
+    if not _FILES:
+        return ''
+    lines = [f'{len(_FILES)} files:']
+    # Iterate in argv order so the summary lines match the visible
+    # tree order — ``_INPUT_FILES`` is the argv-derived list of
+    # ``(path, anchor)`` pairs.
+    for path, _anchor in _INPUT_FILES:
+        fs = _FILES.get(path)
+        if fs is None:
+            continue
+        n_headings = sum(
+            1 for it in fs.by_id.values() if it.kind == 'heading'
+        )
+        lines.append(f'  {os.path.basename(path)}  ({n_headings} headings)')
+    return '\n'.join(lines) + '\n'
+
+
 def get_preview(node_id):
     """Return the preview slice for ``node_id``.
 
-    Three dispatch paths:
+    Four dispatch paths (via ``_classify_id`` when ``_FILES`` is
+    populated; legacy single-file callsites fall through to the
+    module-level ``_FILE_TEXT`` / ``_BY_LINE`` shims):
 
-    1. Root id (no ``#`` separator, or ``node_id`` matches the root
-       path exactly) → return the whole ``_FILE_TEXT`` body.
-    2. ``<path>#<n>`` id → parse the line number, resolve via
-       ``_BY_LINE`` (exact-line hit) or ``_node_at_line`` (fallback
-       for off-grid anchors). The resolved item's
-       ``[byte_offset : byte_offset + byte_size]`` window is the
-       slice.
-    3. Anything else (unresolvable id) → ``''``. Defensive: a stale
+    1. Multi-root (``node_id == _ROOT_ID``) → ``_multi_root_preview``
+       short summary, NOT a concatenation of every file body.
+    2. Per-file root → the corresponding ``_FILES[path].text`` (the
+       whole file body).
+    3. Per-file content (``<path>#<n>``) → byte-range slice from the
+       right file's text. Resolved via ``_BY_ID[node_id].file_path``
+       to find the owning file, then ``_node_at_line`` against that
+       file's line index for off-grid anchors.
+    4. Anything else (unresolvable id) → ``''``. Defensive: a stale
        cursor id from a previous scope mustn't crash the preview.
 
     When ``_MD_COLOR`` is on (and md2ansi is importable), the slice
@@ -689,27 +994,55 @@ def get_preview(node_id):
     pathological markdown can't crash the preview pane — we just fall
     back to the raw slice.
     """
-    # Root preview: id has no ``#`` (or the recipe explicitly handed
-    # us the root path). ``_FILE_TEXT`` is the whole-file slurp from
-    # ``main()``.
-    if '#' not in node_id:
-        text = _FILE_TEXT
-    else:
-        # ``<path>#<n>`` — parse the line number and resolve to a node.
-        # ``rpartition`` so paths that happen to contain ``#`` (rare)
-        # still split on the *last* one we appended in ``_build_nodes``.
+    kind, path = _classify_id(node_id)
+    if kind == 'multi-root':
+        text = _multi_root_preview()
+    elif kind == 'file-root':
+        text = _FILES[path].text
+    elif kind == 'content':
+        fs = _FILES[path]
+        # ``<path>#<n>`` — parse the line number and resolve to a node
+        # in the right file's line index.
         _, _, line_str = node_id.rpartition('#')
         try:
             line_no = int(line_str)
         except ValueError:
             return ''
-        item = _BY_LINE.get(line_no)
+        item = fs.by_line.get(line_no)
         if item is None:
-            item = _node_at_line(line_no)
+            item = _node_at_line(line_no, fs)
         if item is None:
             return ''
         bo = item.byte_offset
-        text = _FILE_TEXT[bo:bo + item.byte_size]
+        text = fs.text[bo:bo + item.byte_size]
+    else:
+        # Classifier returned ``unknown``. If ``_FILES`` is populated
+        # (multi-file mode is live), an unknown id is genuinely
+        # unresolvable — return empty rather than hand back the
+        # legacy ``_FILE_TEXT`` shim (which would be a footgun:
+        # cursor-on-stale-id wouldn't show its old file's body).
+        if _FILES:
+            return ''
+        # Legacy single-file path: classifier failed because
+        # ``_FILES`` is empty (tests that populate ``_BY_ID`` /
+        # ``_FILE_TEXT`` directly without going through ``_reparse``).
+        # Fall back to the module-level shim — same code shape the
+        # pre-#553 recipe used.
+        if '#' not in node_id:
+            text = _FILE_TEXT
+        else:
+            _, _, line_str = node_id.rpartition('#')
+            try:
+                line_no = int(line_str)
+            except ValueError:
+                return ''
+            item = _BY_LINE.get(line_no)
+            if item is None:
+                item = _node_at_line(line_no)
+            if item is None:
+                return ''
+            bo = item.byte_offset
+            text = _FILE_TEXT[bo:bo + item.byte_size]
 
     if _MD_COLOR and _md2ansi_fn is not None:
         try:
@@ -860,16 +1193,22 @@ def _merge_ranges(ranges):
     return merged
 
 
-def _write_range_excerpts(ranges):
-    """Write merged byte-range slices of ``_FILE_TEXT`` to a temp .md file.
+def _write_range_excerpts(ranges, file_text=None):
+    """Write merged byte-range slices to a temp .md file.
 
     ``ranges`` is the output of ``_merge_ranges`` — sorted,
     non-overlapping ``(byte_offset, byte_size)`` tuples. Each slice is
-    ``_FILE_TEXT[bo:bo+bs]``; when the previous slice doesn't end with
+    ``file_text[bo:bo+bs]``; when the previous slice doesn't end with
     ``\\n`` and there's a next slice, an explicit ``\\n`` is inserted
     so the boundary between two adjacent-but-not-adjacent ranges still
     reads as a line break. (Truly adjacent ranges — the kind
     ``_merge_ranges`` already coalesces — never reach this branch.)
+
+    ``file_text`` defaults to ``_FILE_TEXT`` so legacy callers (and
+    tests that populate the module-level shim directly) keep working
+    without explicit plumbing. Multi-file callers should pass the
+    right file's text in explicitly — the per-file
+    ``_FILES[path].text`` is the source of truth in that mode.
 
     Returns the path to the written file; the caller is responsible
     for ``os.unlink`` in a ``finally``. ``errors='surrogateescape'``
@@ -877,6 +1216,8 @@ def _write_range_excerpts(ranges):
     non-UTF-8 bytes round-trip rather than raising.
     """
     import tempfile
+    if file_text is None:
+        file_text = _FILE_TEXT
     tmp = tempfile.NamedTemporaryFile(
         'w', suffix='.md', delete=False,
         encoding='utf-8', errors='surrogateescape',
@@ -884,7 +1225,7 @@ def _write_range_excerpts(ranges):
     try:
         prev_slice = ''
         for bo, bs in ranges:
-            piece = _FILE_TEXT[bo:bo + bs]
+            piece = file_text[bo:bo + bs]
             if prev_slice and not prev_slice.endswith('\n'):
                 tmp.write('\n')
             tmp.write(piece)
@@ -901,50 +1242,104 @@ def _run_source_command(ctx, env_var, default):
     per-line extractor for byte-range merging):
 
       * ``ctx.targets`` handles "selection-or-cursor".
-      * Any target is the root → open the original file in place
-        (``_ROOT_PATH`` is the absolute path). Edits via ``E`` persist
-        naturally. "Is the root" means either our real root Item
-        (``kind == 'root'``) or the framework's synthetic scope-root
-        pseudo-row (fabricated by ``visible_items`` when the scope id
-        isn't in any cached children list — see #552). The pseudo-row
-        carries the same id as our root (the absolute file path) but
-        none of our hidden attrs (``kind``, ``byte_offset``,
-        ``byte_size``), so we discriminate on id rather than ``kind``.
-      * All targets are non-root → collect ``(byte_offset,
-        byte_size)`` ranges, merge them (sort + dedupe + coalesce
-        adjacent), concatenate the slices into a temp .md file, run
-        the external tool on it, unlink in ``finally``.
+      * Any target is the multi-root → open the FIRST argv file in
+        place. Multi-root has no underlying body so a byte-range
+        slice isn't meaningful; the first-file rule is documented
+        in ``_HELP_INTRO``.
+      * Any target is a per-file root → open THAT file in place
+        (``root_target.id`` is the abs path). Edits via ``E``
+        persist naturally. Mirrors the pre-multi-file single-root
+        contract.
+      * Cross-file multi-select (non-root targets spanning more than
+        one file) → take the FIRST file's targets only and ignore
+        the rest. Spec-pinned to the simpler option; documented in
+        ``_HELP_INTRO``.
+      * Otherwise (all targets non-root + same file) → collect
+        ``(byte_offset, byte_size)`` ranges, merge them (sort +
+        dedupe + coalesce adjacent), concatenate the slices into a
+        temp .md file, run the external tool on it, unlink in
+        ``finally``.
 
     Empty ``targets`` (no cursor, no selection) is a no-op.
+
+    Root detection logic — there are now THREE "open the file
+    directly" shapes:
+      * Real per-file root: ``kind == 'root'``.
+      * Real multi-root: ``kind == 'multi-root'``.
+      * Framework's synthetic scope-root pseudo-Item (#552): no
+        ``kind`` attr at all; id matches the Browser's current root.
+    The id-based branch in ``_is_root`` covers the pseudo-row in
+    both single-file mode (id is the per-file root path) and
+    multi-file mode (id is ``_ROOT_ID``).
     """
     targets = ctx.targets
     if not targets:
         return
+
+    def _is_root(it):
+        # Real-root attrs first — they're the common case.
+        k = getattr(it, 'kind', None)
+        if k == 'root' or k == 'multi-root':
+            return True
+        # Framework's scope-root pseudo-Item lacks ``kind`` but its
+        # id matches the Browser's root. We accept either the
+        # multi-root sentinel or any per-file root id (= a key in
+        # ``_FILES``). Legacy single-file callers fall through to
+        # ``_ROOT_PATH`` when ``_FILES`` is empty (tests don't go
+        # through ``_reparse``).
+        return (
+            it.id == _ROOT_ID
+            or it.id in _FILES
+            or it.id == _ROOT_PATH
+        )
+
     cmd = _split_cmd(os.environ.get(env_var) or default)
 
-    # Classify: any root in the target set wins — we open the original
-    # file directly so an ``E`` edit lands on disk. Mirrors the spec's
-    # "behave as if only root was selected" wording. The id-based check
-    # also catches the framework's synthetic scope-root pseudo-Item,
-    # which shares root's id but not our hidden ``kind`` attr (#552).
-    is_root = lambda it: (
-        getattr(it, 'kind', None) == 'root' or it.id == _ROOT_PATH
-    )
-    root_target = next((it for it in targets if is_root(it)), None)
-
+    # Find any root in the target set — root-wins on mixed input.
+    root_target = next((it for it in targets if _is_root(it)), None)
     if root_target is not None:
-        # ``root_target.id`` is the absolute file path: equals
-        # ``_ROOT_PATH`` by construction for the real root (set in
-        # ``_build_nodes``) and by the scope-root pseudo-row contract
-        # (the framework fabricates it with the scope id, which is our
-        # root id).
-        ctx.run_external(cmd + [root_target.id])
+        path = _pick_path_for_root(root_target)
+        ctx.run_external(cmd + [path])
         return
 
-    # All targets non-root → byte-range merge into a temp file.
-    ranges = [(t.byte_offset, t.byte_size) for t in targets]
+    # All targets non-root: figure out which file(s) they come from.
+    # Cross-file → first-file-only rule. Same-file → merge and write
+    # a single tempfile.
+    # ``getattr`` with a default keeps the legacy single-file tests
+    # (which build Items without ``file_path``) on the ``_FILE_TEXT``
+    # branch via ``_write_range_excerpts``'s default arg.
+    paths_seen = []
+    for t in targets:
+        fp = getattr(t, 'file_path', None)
+        if fp is not None and fp not in paths_seen:
+            paths_seen.append(fp)
+
+    if len(paths_seen) <= 1:
+        # Single-file (or legacy fileless): all targets share one
+        # buffer.
+        file_text = None
+        if paths_seen:
+            fs = _FILES.get(paths_seen[0])
+            if fs is not None:
+                file_text = fs.text
+        same_file_targets = targets
+    else:
+        # Cross-file: keep only the first file's targets. The first
+        # file is determined by argv order (``_INPUT_FILES``) — pick
+        # whichever of ``paths_seen`` appears earliest there.
+        order = [p for p, _ in _INPUT_FILES]
+        first_path = min(
+            paths_seen, key=lambda p: order.index(p) if p in order else 1 << 31,
+        )
+        same_file_targets = [
+            t for t in targets if getattr(t, 'file_path', None) == first_path
+        ]
+        fs = _FILES.get(first_path)
+        file_text = fs.text if fs is not None else None
+
+    ranges = [(t.byte_offset, t.byte_size) for t in same_file_targets]
     merged = _merge_ranges(ranges)
-    tmp_path = _write_range_excerpts(merged)
+    tmp_path = _write_range_excerpts(merged, file_text=file_text)
     try:
         ctx.run_external(cmd + [tmp_path])
     finally:
@@ -954,12 +1349,35 @@ def _run_source_command(ctx, env_var, default):
             pass
 
 
+def _pick_path_for_root(root_target):
+    """Resolve a root-classified target to the file path to open.
+
+    Cases:
+      * Multi-root (real or pseudo, id == ``_ROOT_ID``): take the
+        FIRST input file. Documented in ``_HELP_INTRO``.
+      * Per-file root: ``root_target.id`` IS the file path.
+      * Legacy single-file pseudo-root (id == ``_ROOT_PATH``,
+        ``_FILES`` empty): fall through to ``_ROOT_PATH``.
+    """
+    if root_target.id == _ROOT_ID:
+        if _INPUT_FILES:
+            return _INPUT_FILES[0][0]
+        # Defensive: multi-root without an input list shouldn't
+        # happen — but if it does, open the legacy single-file shim.
+        return _ROOT_PATH
+    if root_target.id in _FILES:
+        return root_target.id
+    # Legacy / scope-root pseudo-item in single-file mode.
+    return _ROOT_PATH if _ROOT_PATH is not None else root_target.id
+
+
 def _action_view_source(ctx):
     """``V`` — page the source for the cursor row (or selection) in $PAGER.
 
     On a root row this pages the original file; on non-root rows it
     pages a temp .md file containing the merged byte-range slices for
-    every targeted item. Pairs with the framework's built-in ``v``
+    every targeted item (or the first file's slices when the selection
+    spans multiple files). Pairs with the framework's built-in ``v``
     (which pages the *preview* text, not the on-disk source).
     """
     _run_source_command(ctx, 'PAGER', 'less -R')
@@ -977,29 +1395,25 @@ def _action_edit_source(ctx):
 
 
 _HELP_INTRO = """\
-browse-md — single-file markdown browser.
+browse-md — markdown browser for one or more files.
 
-Usage: browse-md [-l] FILE.md[#anchor]
-  -l, --list, --lists
-            Also surface list items in the tree (default: headings
-            only).
-  FILE.md   Markdown file to open.
-  #anchor   Optional deep-link target — either a 0-based line number
-            (``#42``) or a heading name. Heading lookup runs three
-            tiers in source order: exact ``_display_title`` match,
-            then prefix, then substring; first hit wins.
+Usage: browse-md [-l] FILE.md[#anchor] [FILE.md[#anchor] ...]
+  -l, --list, --lists  Also surface list items (default: headings).
+  FILE.md   One or more markdown files. Multi-root row sits above
+            per-file subtrees when >1 file is given.
+  #anchor   Deep-link target — 0-based line number or heading name
+            (exact / prefix / substring tiers; first hit wins). When
+            multiple files carry anchors, the FIRST anchored file in
+            argv order wins.
 
-Headings (h1..h6) form the tree by default; pass ``-l`` to also
-surface list items as tree rows. The preview pane shows the file
-body (or the byte-slice for a non-root cursor), optionally rendered
-via md2ansi.
-
-  m       Toggle md2ansi coloring of the preview pane (only bound
-          when the md2ansi Python module is importable).
-  M       Render the preview through ``$MD2ANSI`` / external md2ansi.
-  V       Page the source for cursor/selection in ``$PAGER``.
-  E       Edit the source for cursor/selection in ``$EDITOR``.
-  Ctrl-R  Re-slurp the file and rebuild the tree in place.\
+  m       Toggle md2ansi coloring (requires md2ansi).
+  M       Render the preview through ``$MD2ANSI`` / md2ansi.
+  V       Page source for cursor/selection in ``$PAGER``. Multi-root
+          / per-file root opens the file directly; cross-file
+          multi-select takes the first file's targets only.
+  E       Edit source for cursor/selection in ``$EDITOR`` (same
+          root / cross-file rules as V).
+  Ctrl-R  Re-slurp every input file and rebuild the tree.\
 """
 
 
@@ -1043,17 +1457,16 @@ def _pop_flag(name, alts=()):
 
 
 def main():
-    global _ANCHOR, _ROOT_PATH, _BROWSER, _INCLUDE_LISTS
-    # Pop the lists-on flag BEFORE reading the positional so order in
+    global _ANCHOR, _BROWSER, _INCLUDE_LISTS, _INPUT_FILES
+    # Pop the lists-on flag BEFORE reading the positionals so order in
     # argv is flexible: ``browse-md -l FILE.md`` and
     # ``browse-md FILE.md -l`` both work. The aliases are accepted
     # interchangeably (``--list`` / ``--lists``); the flag has no
     # arguments — its mere presence flips emission on.
     _INCLUDE_LISTS = _pop_flag('-l', alts=('--list', '--lists'))
     # After ``_pop_flag`` consumed every known flag, anything starting
-    # with ``-`` left in argv is an unrecognised option, and exactly one
-    # non-``-`` positional is expected. Flag-shaped leftovers are
-    # surfaced first (most useful diagnostic), then positional count.
+    # with ``-`` left in argv is an unrecognised option. Surface those
+    # first (most useful diagnostic) before positional-count checks.
     # We intentionally don't support ``--`` as end-of-options here:
     # ``-``-prefixed filenames can be passed as ``./-strange-name.md``.
     leftover = sys.argv[1:]
@@ -1063,26 +1476,50 @@ def main():
     positionals = [t for t in leftover if not (t.startswith('-') and t != '-')]
     if not positionals:
         _die('missing FILE.md[#anchor]')
-    if len(positionals) > 1:
-        _die(f'unexpected argument: {positionals[1]!r}')
-    raw = positionals[0]
-    # Split once on the first ``#`` — anything after is the anchor and
-    # gets resolved against the parsed tree below.
-    file_part, sep, anchor = raw.partition('#')
-    _ANCHOR = anchor if sep else ''
-    path = os.path.abspath(os.path.expanduser(file_part))
-    if not os.path.isfile(path):
-        # Echo the user's input (pre-expanduser, pre-abspath) so the
-        # error names exactly what they typed. ``with_usage=False`` —
-        # the user already got the positional shape syntactically right.
-        _die(f'no such file: {file_part}', with_usage=False)
-    # Capture the abs path so ``_reparse`` (Ctrl-R) can re-read the
-    # same file without re-parsing argv. The first parse runs through
-    # the shared ``_reparse`` helper too — same path that Ctrl-R uses,
-    # so any rebuild bug surfaces at startup not at first reload.
-    _ROOT_PATH = path
+
+    # Walk every positional, split into (file_part, anchor) at the
+    # first ``#``, validate the file exists, and collect into the
+    # argv-ordered ``_INPUT_FILES`` list of (abs_path, anchor) pairs.
+    # The first anchored entry (if any) seeds ``_ANCHOR`` for the
+    # initial-scope resolution downstream.
+    input_files = []
+    first_anchor = ''
+    first_anchor_path = None
+    for raw in positionals:
+        # Split once on the first ``#`` — anything after is the anchor.
+        file_part, sep, anchor = raw.partition('#')
+        anchor = anchor if sep else ''
+        path = os.path.abspath(os.path.expanduser(file_part))
+        if not os.path.isfile(path):
+            # Echo the user's INPUT (pre-expanduser, pre-abspath) so
+            # the error names exactly what they typed.
+            _die(f'no such file: {file_part}', with_usage=False)
+        input_files.append((path, anchor))
+        # "First anchor wins" — record the first non-empty anchor and
+        # its owning path; subsequent anchors are ignored.
+        if anchor and first_anchor_path is None:
+            first_anchor = anchor
+            first_anchor_path = path
+
+    _INPUT_FILES = input_files
+    _ANCHOR = first_anchor
+
+    # First parse runs through the shared ``_reparse`` helper — same
+    # path that Ctrl-R uses, so any rebuild bug surfaces at startup
+    # not at first reload.
     root = _reparse()
-    initial_scope = _resolve_anchor(_ANCHOR, root.id)
+
+    # Resolve the initial scope:
+    #   * No anchors anywhere → multi-root (or the single per-file
+    #     root in single-file mode), i.e. ``root.id``.
+    #   * Some anchor → resolve against the first anchored file's
+    #     state. Result is either a content id (heading/line hit) or
+    #     the file's own root id (anchor missed → fallthrough).
+    if first_anchor_path is not None:
+        initial_scope = _resolve_anchor(_ANCHOR, first_anchor_path)
+    else:
+        initial_scope = root.id
+
     # ``M`` is always available — it errors gracefully when no
     # renderer is found, so users discover the env-var hook even on
     # boxes without md2ansi installed. ``m`` only makes sense when

@@ -2015,7 +2015,11 @@ class TestArgvErrors(unittest.TestCase):
             import os as _os
             _os.unlink(tmp_path)
 
-    def test_extra_positional(self):
+    def test_extra_positional_nonexistent_file(self):
+        # After #553 the recipe accepts multiple file positionals, so
+        # an "extra" token is treated as another file. A non-existent
+        # extra positional therefore surfaces as "no such file: extra"
+        # rather than "unexpected argument".
         import tempfile
         with tempfile.NamedTemporaryFile(
                 'w', suffix='.md', delete=False) as tmp:
@@ -2025,8 +2029,7 @@ class TestArgvErrors(unittest.TestCase):
             self._set_argv(['browse-md', tmp_path, 'extra'])
             code, err = self._run_main_capture()
             self.assertEqual(code, 2)
-            self.assertIn('unexpected argument', err)
-            self.assertIn('extra', err)
+            self.assertIn('no such file: extra', err)
         finally:
             import os as _os
             _os.unlink(tmp_path)
@@ -2177,6 +2180,588 @@ class TestBuildNodesNoLists(unittest.TestCase):
         # Second H1 had only a list item under it — also a leaf now.
         h1b = self.root._children[1]
         self.assertFalse(h1b.has_children)
+
+
+# ====================================================================
+# Multi-file support (#553)
+# ====================================================================
+#
+# These suites exercise the post-#553 multi-file pipeline: argv with
+# more than one positional, the synthetic multi-root, per-file root
+# subtrees, anchor resolution across files, preview dispatch by
+# ``_classify_id``, ``V``/``E`` semantics on multi-root and cross-file
+# selections, and Ctrl-R reparse of every input file.
+#
+# Module globals touched by these tests (``_FILES``, ``_INPUT_FILES``,
+# ``_BY_ID``, ``_FILE_TEXT``, ``_BY_LINE``, ``_LINES_SORTED``,
+# ``_ROOT_PATH``) are restored to safe defaults in ``tearDown`` so
+# state doesn't leak across tests.
+
+
+class _MultiCaseBase(unittest.TestCase):
+    """Common setUp/tearDown for the multi-file suites.
+
+    Writes two on-disk markdown fixtures with distinguishable heading
+    sets, snapshots every module global the suites touch, and exposes
+    a ``_load_multi(...)`` helper that calls ``_reparse`` after
+    populating ``_INPUT_FILES`` — same code path ``main()`` uses at
+    startup, minus the argv parse.
+    """
+
+    A_TEXT = (
+        '# A1\n'        # line 0
+        '## A2\n'       # line 1
+        'body of A2\n'  # line 2
+        '# A1b\n'       # line 3
+    )
+
+    B_TEXT = (
+        '# B1\n'        # line 0
+        '## B2\n'       # line 1
+        '## B2b\n'      # line 2
+        '# B1b\n'       # line 3
+    )
+
+    def setUp(self):
+        import os
+        import tempfile
+        self.r = _load_recipe()
+        # Snapshot every module global the suites might scribble on.
+        # ``tearDown`` restores them so a failing assert doesn't bleed
+        # into a sibling suite.
+        self._saved = {
+            '_FILES': dict(self.r._FILES),
+            '_INPUT_FILES': list(self.r._INPUT_FILES),
+            '_BY_ID': dict(self.r._BY_ID),
+            '_FILE_TEXT': self.r._FILE_TEXT,
+            '_BY_LINE': dict(self.r._BY_LINE),
+            '_LINES_SORTED': list(self.r._LINES_SORTED),
+            '_ROOT_PATH': self.r._ROOT_PATH,
+            '_ANCHOR': self.r._ANCHOR,
+        }
+        # Two on-disk fixtures so ``_reparse`` reads actual files.
+        # ``delete=False`` + manual unlink in tearDown so the file
+        # exists for the duration of the test.
+        fa = tempfile.NamedTemporaryFile(
+            'w', suffix='.md', delete=False, encoding='utf-8')
+        fa.write(self.A_TEXT)
+        fa.close()
+        fb = tempfile.NamedTemporaryFile(
+            'w', suffix='.md', delete=False, encoding='utf-8')
+        fb.write(self.B_TEXT)
+        fb.close()
+        self.path_a = fa.name
+        self.path_b = fb.name
+
+    def tearDown(self):
+        import os
+        # Restore module globals.
+        self.r._FILES = self._saved['_FILES']
+        self.r._INPUT_FILES = self._saved['_INPUT_FILES']
+        self.r._BY_ID = self._saved['_BY_ID']
+        self.r._FILE_TEXT = self._saved['_FILE_TEXT']
+        self.r._BY_LINE = self._saved['_BY_LINE']
+        self.r._LINES_SORTED = self._saved['_LINES_SORTED']
+        self.r._ROOT_PATH = self._saved['_ROOT_PATH']
+        self.r._ANCHOR = self._saved['_ANCHOR']
+        # Clean up on-disk fixtures.
+        for p in (self.path_a, self.path_b):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+    def _load_multi(self, *files):
+        """Populate ``_INPUT_FILES`` with the given paths and reparse.
+
+        ``files`` is a sequence of ``(abs_path, anchor)`` tuples — or
+        bare paths, in which case the anchor defaults to ``''``. Returns
+        the root Item ``_reparse`` produced (multi-root when >1 file,
+        per-file root for a single file).
+        """
+        normalised = []
+        for f in files:
+            if isinstance(f, tuple):
+                normalised.append(f)
+            else:
+                normalised.append((f, ''))
+        self.r._INPUT_FILES = normalised
+        return self.r._reparse()
+
+
+class TestArgvMulti(_MultiCaseBase):
+    """``main()`` argv parsing with multiple positionals."""
+
+    def _run_main_capture(self, argv):
+        import contextlib
+        import io
+        self.r.sys.argv[:] = argv
+        buf = io.StringIO()
+        # ``main()`` reaches the Browser construction on the success
+        # path; the stubbed ``Browser`` from ``_stub_browse_tui`` has
+        # no ``run`` method, which raises ``AttributeError``. That's
+        # fine — by that point all the argv-parsing side effects we
+        # want to assert on (``_INPUT_FILES``, ``_ANCHOR``,
+        # ``_INCLUDE_LISTS``) have already landed. Catch both
+        # ``SystemExit`` (error paths) and ``AttributeError`` (success
+        # path past Browser construction).
+        with contextlib.redirect_stderr(buf):
+            try:
+                self.r.main()
+            except (SystemExit, AttributeError):
+                pass
+        return buf.getvalue()
+
+    def test_two_files_recorded_in_argv_order(self):
+        self._run_main_capture(['browse-md', self.path_a, self.path_b])
+        self.assertEqual(
+            self.r._INPUT_FILES,
+            [(self.path_a, ''), (self.path_b, '')],
+        )
+
+    def test_three_files_recorded_in_argv_order(self):
+        # A third on-disk fixture for this case only.
+        import os
+        import tempfile
+        fc = tempfile.NamedTemporaryFile(
+            'w', suffix='.md', delete=False, encoding='utf-8')
+        fc.write('# C\n')
+        fc.close()
+        try:
+            self._run_main_capture(
+                ['browse-md', self.path_a, self.path_b, fc.name])
+            self.assertEqual(
+                self.r._INPUT_FILES,
+                [(self.path_a, ''), (self.path_b, ''), (fc.name, '')],
+            )
+        finally:
+            os.unlink(fc.name)
+
+    def test_lists_flag_before_files(self):
+        self._run_main_capture(
+            ['browse-md', '-l', self.path_a, self.path_b])
+        self.assertTrue(self.r._INCLUDE_LISTS)
+        self.assertEqual(len(self.r._INPUT_FILES), 2)
+
+    def test_lists_flag_after_files(self):
+        self._run_main_capture(
+            ['browse-md', self.path_a, self.path_b, '-l'])
+        self.assertTrue(self.r._INCLUDE_LISTS)
+        self.assertEqual(len(self.r._INPUT_FILES), 2)
+
+    def test_lists_flag_between_files(self):
+        # ``_pop_flag`` removes ``-l`` from anywhere in argv; the
+        # remaining positionals are processed in left-to-right order.
+        self._run_main_capture(
+            ['browse-md', self.path_a, '-l', self.path_b])
+        self.assertTrue(self.r._INCLUDE_LISTS)
+        self.assertEqual(
+            [p for p, _ in self.r._INPUT_FILES],
+            [self.path_a, self.path_b],
+        )
+
+    def test_anchor_on_first_file_only(self):
+        # First positional has an anchor, second doesn't. Both files
+        # get loaded; ``_ANCHOR`` is the first positional's anchor.
+        self._run_main_capture(
+            ['browse-md', f'{self.path_a}#A2', self.path_b])
+        self.assertEqual(self.r._INPUT_FILES,
+                         [(self.path_a, 'A2'), (self.path_b, '')])
+        self.assertEqual(self.r._ANCHOR, 'A2')
+
+    def test_anchor_on_second_file_only(self):
+        # Anchor on the second positional → first-anchor-wins still
+        # makes B's anchor the winner because A has none.
+        self._run_main_capture(
+            ['browse-md', self.path_a, f'{self.path_b}#B2'])
+        self.assertEqual(self.r._INPUT_FILES,
+                         [(self.path_a, ''), (self.path_b, 'B2')])
+        self.assertEqual(self.r._ANCHOR, 'B2')
+
+    def test_anchor_on_both_files_first_wins(self):
+        # Both files anchored — ``_ANCHOR`` records the FIRST anchor
+        # in argv order. The second anchor is stored on the tuple but
+        # ignored by the initial-scope resolver.
+        self._run_main_capture(
+            ['browse-md', f'{self.path_a}#A2', f'{self.path_b}#B2'])
+        self.assertEqual(self.r._INPUT_FILES,
+                         [(self.path_a, 'A2'), (self.path_b, 'B2')])
+        self.assertEqual(self.r._ANCHOR, 'A2')
+
+    def test_missing_file_in_middle_dies(self):
+        # Non-existent positional between two real files surfaces the
+        # MISSING path verbatim in the error — pre-expanduser /
+        # pre-abspath user-input.
+        import contextlib
+        import io
+        self.r.sys.argv[:] = [
+            'browse-md', self.path_a, '/no/such/middle.md', self.path_b,
+        ]
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            with self.assertRaises(SystemExit) as cm:
+                self.r.main()
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn('no such file: /no/such/middle.md', buf.getvalue())
+
+
+class TestBuildMulti(_MultiCaseBase):
+    """Multi-root + per-file roots constructed by ``_reparse``."""
+
+    def test_multi_root_has_per_file_root_children(self):
+        root = self._load_multi(self.path_a, self.path_b)
+        # Root id is the sentinel — distinct from any real path.
+        self.assertEqual(root.id, self.r._ROOT_ID)
+        # Children are the two per-file roots in argv order.
+        self.assertEqual([c.id for c in root._children],
+                         [self.path_a, self.path_b])
+
+    def test_per_file_root_titles_are_basenames(self):
+        import os
+        root = self._load_multi(self.path_a, self.path_b)
+        titles = [c.title for c in root._children]
+        self.assertEqual(titles, [
+            os.path.basename(self.path_a),
+            os.path.basename(self.path_b),
+        ])
+
+    def test_per_file_root_has_expected_headings(self):
+        # Each per-file root carries its own headings (h1/h2) — the
+        # exact tree shape from single-file ``_build_nodes``.
+        root = self._load_multi(self.path_a, self.path_b)
+        a_root, b_root = root._children
+        a_tags = [c.tag for c in a_root._children]
+        # A has two h1s (A1, A1b).
+        self.assertEqual(a_tags, ['h1', 'h1'])
+        b_tags = [c.tag for c in b_root._children]
+        # B has two h1s (B1, B1b).
+        self.assertEqual(b_tags, ['h1', 'h1'])
+
+    def test_multi_root_kind(self):
+        # The multi-root carries a distinct ``kind`` so the classifier
+        # can tell it apart from per-file roots.
+        root = self._load_multi(self.path_a, self.path_b)
+        self.assertEqual(root.kind, 'multi-root')
+
+    def test_per_file_root_kind_is_root(self):
+        # Per-file roots keep the ``'root'`` kind — same shape as the
+        # pre-multi-file single root, so existing root-detection logic
+        # (e.g. ``_run_source_command``) classifies them correctly.
+        root = self._load_multi(self.path_a, self.path_b)
+        for c in root._children:
+            self.assertEqual(c.kind, 'root')
+
+    def test_aggregate_by_id_contains_multi_root_and_per_file_ids(self):
+        root = self._load_multi(self.path_a, self.path_b)
+        self.assertIn(self.r._ROOT_ID, self.r._BY_ID)
+        self.assertIn(self.path_a, self.r._BY_ID)
+        self.assertIn(self.path_b, self.r._BY_ID)
+        # And the per-file headings — at least one from each file.
+        self.assertIn(f'{self.path_a}#0', self.r._BY_ID)
+        self.assertIn(f'{self.path_b}#0', self.r._BY_ID)
+
+    def test_single_file_uses_per_file_root_no_multi_root(self):
+        # With a single file in ``_INPUT_FILES``, the Browser root
+        # stays as the per-file root — no multi-root sentinel is added
+        # to ``_BY_ID`` (the visible-tree header reads as the file's
+        # basename rather than ``"1 files"``).
+        root = self._load_multi(self.path_a)
+        self.assertEqual(root.id, self.path_a)
+        self.assertNotIn(self.r._ROOT_ID, self.r._BY_ID)
+
+    def test_items_carry_file_path_back_reference(self):
+        # Every Item built by ``_build_nodes`` carries ``file_path`` so
+        # ``get_preview`` can find its owning file's text. Multi-root
+        # itself has no owning file (``file_path is None``).
+        root = self._load_multi(self.path_a, self.path_b)
+        self.assertIsNone(root.file_path)
+        a_root, b_root = root._children
+        self.assertEqual(a_root.file_path, self.path_a)
+        self.assertEqual(b_root.file_path, self.path_b)
+        # Per-file content items inherit their file's path.
+        a_h1 = a_root._children[0]
+        self.assertEqual(a_h1.file_path, self.path_a)
+
+
+class TestAnchorMulti(_MultiCaseBase):
+    """Initial-scope resolution across multiple files."""
+
+    def _initial_scope(self, *files):
+        """Re-run the argv-to-initial-scope flow without invoking ``main()``.
+
+        Mirrors the logic in ``main()``: walk ``_INPUT_FILES``, pick
+        the first anchored file, resolve via ``_resolve_anchor``.
+        """
+        self.r._INPUT_FILES = list(files)
+        root = self.r._reparse()
+        first_anchor = ''
+        first_anchor_path = None
+        for path, anchor in files:
+            if anchor and first_anchor_path is None:
+                first_anchor = anchor
+                first_anchor_path = path
+        if first_anchor_path is not None:
+            return self.r._resolve_anchor(first_anchor, first_anchor_path)
+        return root.id
+
+    def test_no_anchors_returns_multi_root_id(self):
+        # Two files, neither anchored → initial scope is the
+        # multi-root sentinel.
+        scope = self._initial_scope(
+            (self.path_a, ''), (self.path_b, ''))
+        self.assertEqual(scope, self.r._ROOT_ID)
+
+    def test_anchor_on_second_file_resolves_in_that_file(self):
+        # File A unanchored, file B carries ``#B2`` → scope drills
+        # into B's H2 heading.
+        scope = self._initial_scope(
+            (self.path_a, ''), (self.path_b, 'B2'))
+        self.assertEqual(scope, f'{self.path_b}#1')
+
+    def test_anchor_on_first_file_resolves_in_that_file(self):
+        # File A carries ``#A2``, file B unanchored → scope drills
+        # into A's H2 heading. Confirms anchor-on-first-file works
+        # symmetrically with anchor-on-second.
+        scope = self._initial_scope(
+            (self.path_a, 'A2'), (self.path_b, ''))
+        self.assertEqual(scope, f'{self.path_a}#1')
+
+    def test_both_anchored_first_wins(self):
+        # Both files anchored → the FIRST one in argv order wins
+        # (matches the ticket's "first anchored file" rule). B's
+        # anchor is recorded in ``_INPUT_FILES`` but ignored here.
+        scope = self._initial_scope(
+            (self.path_a, 'A2'), (self.path_b, 'B2'))
+        self.assertEqual(scope, f'{self.path_a}#1')
+
+    def test_digit_anchor_resolves_against_named_file(self):
+        # Digit anchors are 0-based line numbers — resolution is
+        # per-file. ``#0`` on B should hit B's first heading, not A's.
+        scope = self._initial_scope(
+            (self.path_a, ''), (self.path_b, '0'))
+        self.assertEqual(scope, f'{self.path_b}#0')
+
+
+class TestGetPreviewMulti(_MultiCaseBase):
+    """``get_preview`` dispatch across the multi-root id space."""
+
+    def test_multi_root_preview_is_summary_not_concatenation(self):
+        self._load_multi(self.path_a, self.path_b)
+        # Force md2ansi off so the raw summary string flows through.
+        self.r._MD_COLOR = False
+        out = self.r.get_preview(self.r._ROOT_ID)
+        # Summary mentions both basenames and a heading count line.
+        import os
+        self.assertIn(os.path.basename(self.path_a), out)
+        self.assertIn(os.path.basename(self.path_b), out)
+        # And critically NOT the body of either file (no
+        # concatenation footgun).
+        self.assertNotIn('body of A2', out)
+
+    def test_per_file_root_preview_is_full_file_text(self):
+        self._load_multi(self.path_a, self.path_b)
+        self.r._MD_COLOR = False
+        self.assertEqual(self.r.get_preview(self.path_a), self.A_TEXT)
+        self.assertEqual(self.r.get_preview(self.path_b), self.B_TEXT)
+
+    def test_per_file_heading_preview_is_file_slice(self):
+        # Heading id is ``<path>#<line>``; preview is the byte-slice
+        # of that file's text. Confirms ``get_preview`` routes to the
+        # right file via the ``_classify_id('content', ...)`` branch.
+        self._load_multi(self.path_a, self.path_b)
+        self.r._MD_COLOR = False
+        # Slice for ``# A1`` (line 0) — runs to ``# A1b`` at line 3.
+        a_h1_id = f'{self.path_a}#0'
+        out = self.r.get_preview(a_h1_id)
+        self.assertTrue(out.startswith('# A1\n'))
+        self.assertIn('body of A2', out)
+        # And the slice doesn't bleed into file B.
+        self.assertNotIn('# B1', out)
+
+    def test_unknown_id_returns_empty(self):
+        self._load_multi(self.path_a, self.path_b)
+        self.r._MD_COLOR = False
+        self.assertEqual(self.r.get_preview('/no/such/path.md'), '')
+        self.assertEqual(
+            self.r.get_preview('/no/such/path.md#0'), '')
+
+
+class TestRunSourceCommandMulti(_MultiCaseBase):
+    """``_run_source_command`` semantics on multi-root + cross-file."""
+
+    def setUp(self):
+        super().setUp()
+        # Snapshot env so per-test PAGER/EDITOR overrides don't leak.
+        import os
+        self._env_saved = {k: os.environ.get(k) for k in ('PAGER', 'EDITOR')}
+        os.environ.pop('PAGER', None)
+        os.environ.pop('EDITOR', None)
+
+    def tearDown(self):
+        import os
+        for k, v in self._env_saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        super().tearDown()
+
+    def test_multi_root_opens_first_file(self):
+        # Real multi-root target → opens the first argv file.
+        self._load_multi(self.path_a, self.path_b)
+        multi_root = self.r._BY_ID[self.r._ROOT_ID]
+        ctx = _SrcCmdCtx(targets=[multi_root])
+        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.assertEqual(ctx.calls, [['less', '-R', self.path_a]])
+
+    def test_multi_root_pseudo_item_opens_first_file(self):
+        # Scope-root pseudo-Item (no ``kind`` attr) with id ==
+        # ``_ROOT_ID`` should still classify as multi-root and open
+        # the first file. #552 contract carried into multi-file mode.
+        self._load_multi(self.path_a, self.path_b)
+        pseudo = _ScopeRootPseudoItem(id=self.r._ROOT_ID)
+        ctx = _SrcCmdCtx(targets=[pseudo])
+        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.assertEqual(ctx.calls, [['less', '-R', self.path_a]])
+
+    def test_per_file_root_opens_that_file(self):
+        # Per-file root target → opens that specific file (not the
+        # first argv file). Mirrors the pre-multi-file V/E behaviour
+        # one level deeper in the tree.
+        self._load_multi(self.path_a, self.path_b)
+        b_root = self.r._FILES[self.path_b].file_root
+        ctx = _SrcCmdCtx(targets=[b_root])
+        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.assertEqual(ctx.calls, [['less', '-R', self.path_b]])
+
+    def test_same_file_non_root_targets_merge_in_one_tempfile(self):
+        # Two non-root targets from the SAME file → one tempfile, the
+        # merged byte ranges in file order.
+        self._load_multi(self.path_a, self.path_b)
+        a_h1 = self.r._BY_ID[f'{self.path_a}#0']
+        a_h1b = self.r._BY_ID[f'{self.path_a}#3']
+        ctx = _SrcCmdCtx(targets=[a_h1b, a_h1])
+        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.assertEqual(len(ctx.calls), 1)
+        # File-order: A1 slice first, then A1b slice. Together they
+        # cover the whole A file (A1 spans to A1b, A1b spans to EOF).
+        self.assertEqual(ctx.last_tmp_contents, self.A_TEXT)
+
+    def test_cross_file_takes_first_file_only(self):
+        # Targets span both files → only the first file's targets
+        # make it into the tempfile (documented "first-file-only"
+        # cross-file rule).
+        self._load_multi(self.path_a, self.path_b)
+        a_h1 = self.r._BY_ID[f'{self.path_a}#0']
+        b_h1 = self.r._BY_ID[f'{self.path_b}#0']
+        ctx = _SrcCmdCtx(targets=[a_h1, b_h1])
+        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.assertEqual(len(ctx.calls), 1)
+        # Tempfile contains A's slice, not B's.
+        self.assertIn('A1', ctx.last_tmp_contents)
+        self.assertNotIn('B1', ctx.last_tmp_contents)
+
+    def test_cross_file_first_file_is_argv_order_not_target_order(self):
+        # Even when B's target is listed FIRST in the selection,
+        # cross-file dedup picks the FIRST file by argv order — file
+        # A, not file B. The "first-file" rule is positional, not
+        # selection-order.
+        self._load_multi(self.path_a, self.path_b)
+        a_h1 = self.r._BY_ID[f'{self.path_a}#0']
+        b_h1 = self.r._BY_ID[f'{self.path_b}#0']
+        ctx = _SrcCmdCtx(targets=[b_h1, a_h1])
+        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.assertEqual(len(ctx.calls), 1)
+        self.assertIn('A1', ctx.last_tmp_contents)
+        self.assertNotIn('B1', ctx.last_tmp_contents)
+
+
+class TestReloadMulti(_MultiCaseBase):
+    """``_reparse`` re-slurps every file in ``_INPUT_FILES``."""
+
+    def _write(self, path, text):
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(text)
+
+    def test_both_files_reparsed_after_disk_mutation(self):
+        # Initial parse: both fixtures' headings are in the aggregate
+        # index. Mutate both, reload via the public ``get_children``
+        # Ctrl-R contract, confirm both files' new headings appear.
+        self._load_multi(self.path_a, self.path_b)
+        # Sanity: pre-mutation state.
+        self.assertIn(f'{self.path_a}#0', self.r._BY_ID)
+        self.assertIn(f'{self.path_b}#0', self.r._BY_ID)
+        # Overwrite both files with new content.
+        self._write(self.path_a, '# NewA\n')
+        self._write(self.path_b, '# NewB\n## NewB2\n')
+        # Trigger reparse via the public Ctrl-R contract.
+        self.r.get_children(None, reload=True)
+        # Both files' new headings landed in the aggregate index.
+        a_titles = [
+            it.title for it in self.r._FILES[self.path_a].by_id.values()
+            if it.kind == 'heading'
+        ]
+        b_titles = sorted(
+            it.title for it in self.r._FILES[self.path_b].by_id.values()
+            if it.kind == 'heading'
+        )
+        self.assertEqual(a_titles, ['NewA'])
+        self.assertEqual(b_titles, ['NewB', 'NewB2'])
+
+    def test_reload_at_multi_root_id_reparses(self):
+        # The framework's Ctrl-R hook can pass the current root id;
+        # for multi-file mode that's ``_ROOT_ID``. Reload should
+        # re-slurp every file.
+        self._load_multi(self.path_a, self.path_b)
+        self._write(self.path_a, '# Mutated\n')
+        self.r.get_children(self.r._ROOT_ID, reload=True)
+        a_titles = [
+            it.title for it in self.r._FILES[self.path_a].by_id.values()
+            if it.kind == 'heading'
+        ]
+        self.assertEqual(a_titles, ['Mutated'])
+
+    def test_per_file_root_input_files_preserved(self):
+        # ``_reparse`` doesn't mutate ``_INPUT_FILES`` — Ctrl-R needs
+        # to find the same file list on every call.
+        self._load_multi(self.path_a, self.path_b)
+        before = list(self.r._INPUT_FILES)
+        self.r.get_children(None, reload=True)
+        self.assertEqual(self.r._INPUT_FILES, before)
+
+
+class TestClassifyId(_MultiCaseBase):
+    """``_classify_id`` — single source of truth for id shape dispatch."""
+
+    def test_multi_root_id(self):
+        self._load_multi(self.path_a, self.path_b)
+        self.assertEqual(
+            self.r._classify_id(self.r._ROOT_ID), ('multi-root', None))
+
+    def test_per_file_root_id(self):
+        self._load_multi(self.path_a, self.path_b)
+        self.assertEqual(
+            self.r._classify_id(self.path_a), ('file-root', self.path_a))
+        self.assertEqual(
+            self.r._classify_id(self.path_b), ('file-root', self.path_b))
+
+    def test_content_id(self):
+        self._load_multi(self.path_a, self.path_b)
+        self.assertEqual(
+            self.r._classify_id(f'{self.path_a}#0'),
+            ('content', self.path_a))
+        self.assertEqual(
+            self.r._classify_id(f'{self.path_b}#1'),
+            ('content', self.path_b))
+
+    def test_unknown_id(self):
+        self._load_multi(self.path_a, self.path_b)
+        self.assertEqual(
+            self.r._classify_id('/no/such/path.md'), ('unknown', None))
+        self.assertEqual(
+            self.r._classify_id('/no/such/path.md#3'), ('unknown', None))
+        self.assertEqual(
+            self.r._classify_id('garbage'), ('unknown', None))
 
 
 if __name__ == '__main__':
