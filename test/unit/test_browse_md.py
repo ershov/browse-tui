@@ -1689,6 +1689,33 @@ class TestRunSourceCommand(unittest.TestCase):
         finally:
             os.environ.pop('PAGER', None)
 
+    def test_multi_select_two_non_root_same_file_both_ranges_in_tempfile(self):
+        # #568 regression: ``V`` / ``E`` with a multi-select of two
+        # non-root targets in the SAME file must hand PAGER / EDITOR a
+        # tempfile containing BOTH targets' byte slices — not just the
+        # cursor's. This guards the consumer-code path: given a ctx
+        # whose ``targets`` returns both items (per the framework's
+        # ``selected if non-empty, else [cursor]`` contract), the
+        # recipe MUST process every target and the tempfile MUST
+        # include every selected section. The ticket cites a
+        # symptom where only the cursor's section appears even
+        # though both items are marked.
+        a = _SrcItem(id=self.path + '#0', kind='heading',
+                     byte_offset=0, byte_size=5)    # 'AAAA\n'
+        b = _SrcItem(id=self.path + '#2', kind='heading',
+                     byte_offset=10, byte_size=5)   # 'CCCC\n'
+        ctx = _SrcCmdCtx(targets=[a, b])
+        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        # Exactly one PAGER invocation on a tempfile (last argv).
+        self.assertEqual(len(ctx.calls), 1)
+        argv = ctx.calls[0]
+        self.assertTrue(argv[-1].endswith('.md'))
+        # Both ranges present in the tempfile contents (captured by
+        # ``_SrcCmdCtx.run_external`` synchronously before the
+        # ``finally`` unlinks the path).
+        self.assertIn('AAAA\n', ctx.last_tmp_contents)
+        self.assertIn('CCCC\n', ctx.last_tmp_contents)
+
     def test_scope_root_pseudo_item_takes_root_path(self):
         # #552: when the framework hands us its synthetic scope-root
         # pseudo-Item (no ``kind`` / ``byte_offset`` attrs but
