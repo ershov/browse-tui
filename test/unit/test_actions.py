@@ -1150,8 +1150,8 @@ class TestMouseDispatch(unittest.TestCase):
 
     # ---- modal-state interactions --------------------------------------
 
-    def test_search_mode_swallows_mouse_events(self):
-        """Mouse click in search mode does not extend the query, does not move cursor."""
+    def test_search_mode_passes_mouse_clicks_through(self):
+        """Mouse click in search mode moves the cursor without disturbing the query."""
         b = self._browser_with_n_items(10)
         restore = self._patch_term(80, 40)
         try:
@@ -1160,10 +1160,53 @@ class TestMouseDispatch(unittest.TestCase):
             ctx = _ctx_for(b)
             layout = _render.layout_panes(80, 40, show_preview=True,
                                           show_children_pane=True)
-            cursor_before = b._state.cursor
-            dispatch_key(b, ctx, f'mouse-click:{layout["list"].top + 3}:5')
+            target_row = layout['list'].top + 3
+            dispatch_key(b, ctx, f'mouse-click:{target_row}:5')
+            # Query is untouched; search mode stays open; cursor follows
+            # the click just like in normal mode.
             self.assertEqual(b._search_query, 'foo')
-            self.assertEqual(b._state.cursor, cursor_before)
+            self.assertIs(b._mode, Mode.SEARCH_EDIT)
+            self.assertEqual(b._state.cursor,
+                             b._list_scroll + (target_row - layout['list'].top))
+        finally:
+            restore()
+            b.stop_workers()
+
+    def test_search_mode_passes_mouse_scroll_through(self):
+        """Wheel scroll in search mode adjusts list scroll without touching the query."""
+        b = self._browser_with_n_items(30)
+        restore = self._patch_term(80, 40)
+        try:
+            b._mode = Mode.SEARCH_EDIT
+            b._search_query = 'foo'
+            ctx = _ctx_for(b)
+            layout = _render.layout_panes(80, 40, show_preview=True,
+                                          show_children_pane=True)
+            scroll_before = b._list_scroll
+            dispatch_key(b, ctx, f'scroll-down:{layout["list"].top + 1}:5')
+            self.assertEqual(b._search_query, 'foo')
+            self.assertIs(b._mode, Mode.SEARCH_EDIT)
+            self.assertGreater(b._list_scroll, scroll_before)
+        finally:
+            restore()
+            b.stop_workers()
+
+    def test_filter_mode_passes_mouse_clicks_through(self):
+        """Mouse click in filter mode moves the cursor without disturbing the filter."""
+        b = self._browser_with_n_items(10)
+        restore = self._patch_term(80, 40)
+        try:
+            b._mode = Mode.FILTER_EDIT
+            b._filters = ['foo']
+            ctx = _ctx_for(b)
+            layout = _render.layout_panes(80, 40, show_preview=True,
+                                          show_children_pane=True)
+            target_row = layout['list'].top + 2
+            dispatch_key(b, ctx, f'mouse-click:{target_row}:5')
+            self.assertEqual(b._filters, ['foo'])
+            self.assertIs(b._mode, Mode.FILTER_EDIT)
+            self.assertEqual(b._state.cursor,
+                             b._list_scroll + (target_row - layout['list'].top))
         finally:
             restore()
             b.stop_workers()

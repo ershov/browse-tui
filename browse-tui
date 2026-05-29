@@ -12914,14 +12914,13 @@ def dispatch_key(browser, ctx: 'Context', key: str) -> bool:
     caller (main loop in #13) uses the return to decide whether to log
     the key or pass it through to a fallback.
     """
-    # Mouse events (clicks + wheel) are dispatched first when in normal
+    # Mouse events (clicks + wheel) are dispatched first regardless of
     # mode. ``_dispatch_mouse`` parses the row/col, looks up the pane
-    # via ``layout_panes``, and applies the per-pane behaviour. Edit
-    # modes silently swallow mouse events along with other unhandled
-    # keys (the multi-char ``mouse-click:R:C`` form bypasses the
-    # printable-char branch of the edit-mode handler).
-    if browser._mode is Mode.NORMAL and (
-            key.startswith('mouse-click:')
+    # via ``layout_panes``, and applies the per-pane behaviour. Search
+    # and filter edit modes keep their prompt open — the mouse just
+    # moves the cursor / scrolls the pane like in normal mode. Insert
+    # mode never reaches here (it runs in ``_handle_insert_key``).
+    if (key.startswith('mouse-click:')
             or key.startswith('scroll-up:')
             or key.startswith('scroll-down:')):
         return _dispatch_mouse(browser, ctx, key)
@@ -13000,11 +12999,8 @@ def dispatch_key(browser, ctx: 'Context', key: str) -> bool:
         # Multi-char key names (arrows, pgdn/pgup, home/end, ctrl-*,
         # alt-*, etc.) fall through to the normal-mode dispatch below so
         # the list-pane navigation keys keep working while the user is
-        # composing a query. Mouse events fall through harmlessly — the
-        # mouse-dispatch branch above is gated on ``Mode.NORMAL`` and
-        # the keymap has no binding for ``mouse-click:R:C``, so the
-        # event ends up silently dropped (preserves the prior
-        # search-mode-swallows-mouse contract).
+        # composing a query. Mouse events are dispatched at the top of
+        # this function regardless of mode, so they never reach here.
 
     # Filter-edit (``&``) special handling.
     #
@@ -13346,10 +13342,11 @@ def _preview_pane_height(browser):
 #   * Wheel on preview pane → ±_WHEEL_LINES on _preview_scroll.
 #   * Wheel elsewhere       → no-op.
 #
-# In modal modes we do nothing: search-mode swallows all unhandled keys,
-# insert-mode runs in _handle_insert_key (and silently ignores what it
-# doesn't recognize), pickers in _pick_on_info_bar swallow unknowns. So
-# this dispatcher only fires from the normal-mode branch of dispatch_key.
+# Search / filter edit modes route through here too — the prompt stays
+# open, the mouse just moves the cursor or scrolls the pane like in
+# normal mode. Insert-mode runs in _handle_insert_key (and silently
+# ignores what it doesn't recognize). Pickers in _pick_on_info_bar
+# swallow unknowns, so this dispatcher never fires while a picker is up.
 
 _WHEEL_LINES = 3
 
