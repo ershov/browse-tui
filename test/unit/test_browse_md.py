@@ -39,9 +39,16 @@ _RECIPE = _REPO / 'recipes' / 'browse-md'
 
 
 def _stub_browse_tui():
-    """Insert a no-op ``browse_tui`` module so the recipe can import."""
-    if 'browse_tui' in sys.modules:
-        return
+    """Insert a no-op ``browse_tui`` module so the recipe can import.
+
+    Always installs a fresh module so we don't inherit a stub from
+    another test file (e.g. ``test_browse_claude_render`` installs its
+    own ``_Stub`` for ``Browser`` which lacks the ``config`` /
+    ``expand_calls`` attributes the browse-md tests inspect). The
+    recipe is reloaded via ``SourceFileLoader`` in ``_load_recipe``,
+    so its ``from browse_tui import ...`` re-reads the freshly stubbed
+    module on every recipe load.
+    """
     mod = types.ModuleType('browse_tui')
 
     class _Stub:
@@ -1609,15 +1616,51 @@ class TestRunSourceCommand(unittest.TestCase):
         self.r._run_source_command(ctx, 'PAGER', 'less -R')
         self.assertEqual(ctx.calls, [['less', '-R', self.path]])
 
-    def test_root_mixed_with_non_root_root_wins(self):
-        # Spec: "If any target is root → behave as if only root was
-        # selected". Mixed input still goes through the root branch.
+    def test_single_root_cursor_only_opens_file(self):
+        # #572: cursor on a file-root with NO selection → single
+        # target → opens the file directly (no tempfile). This is
+        # the same shape as ``test_root_only_opens_original_path``
+        # but pinned with the post-#572 name to document the
+        # single-target shortcut contract.
+        import os
+        root = _SrcItem(id=self.path, kind='root')
+        ctx = _SrcCmdCtx(targets=[root])
+        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.assertEqual(ctx.calls, [['less', '-R', self.path]])
+        # No tempfile was produced — last argv is the original path.
+        argv = ctx.calls[0]
+        self.assertFalse(argv[-1].endswith('.md') and argv[-1] != self.path)
+
+    def test_single_root_marked_alone_opens_file(self):
+        # #572: one file-root space-marked, nothing else in the
+        # selection → ``ctx.targets`` returns just that root → single
+        # target → opens the file directly. Same outcome as
+        # cursor-only; this asserts the contract still holds when
+        # the single target came from a space-mark rather than the
+        # cursor.
+        root = _SrcItem(id=self.path, kind='root')
+        ctx = _SrcCmdCtx(targets=[root])
+        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.assertEqual(ctx.calls, [['less', '-R', self.path]])
+
+    def test_root_mixed_with_non_root_combines_into_tempfile(self):
+        # #572: Mixed targets no longer trigger root-wins. The
+        # file-root expands to the whole file range and merges with
+        # the heading's sub-range (the whole-file range absorbs it),
+        # producing a tempfile that contains the entire file body.
         root = _SrcItem(id=self.path, kind='root')
         leaf = _SrcItem(id=self.path + '#3', kind='heading',
                         byte_offset=0, byte_size=5)
         ctx = _SrcCmdCtx(targets=[leaf, root])
         self.r._run_source_command(ctx, 'PAGER', 'less -R')
-        self.assertEqual(ctx.calls, [['less', '-R', self.path]])
+        # Exactly one call; last argv is the tempfile path with .md.
+        self.assertEqual(len(ctx.calls), 1)
+        argv = ctx.calls[0]
+        self.assertEqual(argv[:2], ['less', '-R'])
+        self.assertTrue(argv[2].endswith('.md'))
+        # Single-file output → no header. Whole-file range absorbs
+        # the heading's sub-range.
+        self.assertEqual(ctx.last_tmp_contents, self.r._FILE_TEXT)
 
     def test_single_non_root_writes_temp_and_runs(self):
         leaf = _SrcItem(id=self.path + '#2', kind='heading',
@@ -1726,16 +1769,23 @@ class TestRunSourceCommand(unittest.TestCase):
         self.r._run_source_command(ctx, 'PAGER', 'less -R')
         self.assertEqual(ctx.calls, [['less', '-R', self.path]])
 
-    def test_scope_root_pseudo_item_mixed_with_non_root_root_wins(self):
-        # Same root-wins rule as the real-root case: any root in the
-        # target set (including the scope-root pseudo) routes through
-        # the original-file branch and skips the byte-range merge.
+    def test_scope_root_pseudo_item_mixed_with_non_root_combines(self):
+        # #572: mixed targets no longer trigger root-wins. The
+        # scope-root pseudo-Item, like a real root, expands to the
+        # whole-file range and merges with the heading's sub-range.
+        # Result: a tempfile containing the whole file body.
         pseudo = _ScopeRootPseudoItem(id=self.path)
         leaf = _SrcItem(id=self.path + '#3', kind='heading',
                         byte_offset=0, byte_size=5)
         ctx = _SrcCmdCtx(targets=[leaf, pseudo])
         self.r._run_source_command(ctx, 'PAGER', 'less -R')
-        self.assertEqual(ctx.calls, [['less', '-R', self.path]])
+        self.assertEqual(len(ctx.calls), 1)
+        argv = ctx.calls[0]
+        self.assertEqual(argv[:2], ['less', '-R'])
+        self.assertTrue(argv[2].endswith('.md'))
+        # Single-file output → no header; whole-file range absorbs
+        # the heading's sub-range.
+        self.assertEqual(ctx.last_tmp_contents, self.r._FILE_TEXT)
 
 
 class TestReload(unittest.TestCase):
@@ -2755,16 +2805,36 @@ class TestRunSourceCommandMulti(_MultiCaseBase):
         self.r._run_source_command(ctx, 'PAGER', 'less -R')
         self.assertEqual(ctx.calls, [['less', '-R', self.path_b]])
 
-    def test_first_per_file_root_wins_when_multiple_selected(self):
-        # Two per-file roots selected → open the FIRST in argv order
-        # (stable rule when the user multi-selects file rows).
+    def test_two_roots_combines_with_headers(self):
+        # #572: two per-file roots selected → no longer root-wins.
+        # Each root expands to its whole-file range; output is a
+        # tempfile containing both files concatenated with the
+        # ``===== <basename> =====`` header before EACH group
+        # (including the first).
+        import os
         self._load_multi(self.path_a, self.path_b)
         a_root = self.r._FILES[self.path_a].file_root
         b_root = self.r._FILES[self.path_b].file_root
         # Selection order reversed — argv order is what matters.
         ctx = _SrcCmdCtx(targets=[b_root, a_root])
         self.r._run_source_command(ctx, 'PAGER', 'less -R')
-        self.assertEqual(ctx.calls, [['less', '-R', self.path_a]])
+        self.assertEqual(len(ctx.calls), 1)
+        argv = ctx.calls[0]
+        self.assertEqual(argv[:2], ['less', '-R'])
+        self.assertTrue(argv[2].endswith('.md'))
+        out = ctx.last_tmp_contents
+        # Headers before EACH group, including the first.
+        a_sep = f'===== {os.path.basename(self.path_a)} ====='
+        b_sep = f'===== {os.path.basename(self.path_b)} ====='
+        self.assertIn(a_sep, out)
+        self.assertIn(b_sep, out)
+        # Argv order: A's group precedes B's.
+        self.assertLess(out.find(a_sep), out.find(b_sep))
+        # Each group contains the whole file body.
+        self.assertIn(self.A_TEXT, out)
+        self.assertIn(self.B_TEXT, out)
+        # Header before the first group → output starts with A's sep.
+        self.assertTrue(out.startswith(a_sep + '\n'))
 
     def test_same_file_non_root_targets_merge_in_one_tempfile(self):
         # Two non-root targets from the SAME file → one tempfile, the
@@ -2782,8 +2852,9 @@ class TestRunSourceCommandMulti(_MultiCaseBase):
     def test_cross_file_groups_by_file_in_argv_order(self):
         # Targets span both files → temp file contains BOTH files'
         # slices, grouped per file with a ``===== <basename> =====``
-        # separator. Files appear in argv order (A before B) regardless
-        # of selection order.
+        # header before EACH group (including the first, post-#572).
+        # Files appear in argv order (A before B) regardless of
+        # selection order.
         import os
         self._load_multi(self.path_a, self.path_b)
         a_h1 = self.r._BY_ID[f'{self.path_a}#0']
@@ -2795,19 +2866,20 @@ class TestRunSourceCommandMulti(_MultiCaseBase):
         # Both files' headings are present.
         self.assertIn('# A1', out)
         self.assertIn('# B1', out)
-        # Argv order: A's slice precedes B's, and the separator carries
-        # B's basename.
+        # Argv order: A's slice precedes B's.
         a_idx = out.find('# A1')
         b_idx = out.find('# B1')
         self.assertLess(a_idx, b_idx)
-        # Separator format: ``\n===== <basename> =====\n`` before B's
-        # group (no separator before the first group, which is A).
-        sep = f'===== {os.path.basename(self.path_b)} ====='
-        self.assertIn(sep, out)
-        # A's basename should NOT appear as a separator (A is the
-        # first group, no header before it).
+        # #572: Header appears before EACH group, including the first.
         a_sep = f'===== {os.path.basename(self.path_a)} ====='
-        self.assertNotIn(a_sep, out)
+        b_sep = f'===== {os.path.basename(self.path_b)} ====='
+        self.assertIn(a_sep, out)
+        self.assertIn(b_sep, out)
+        # A's header must come before A's body, and B's after A's.
+        self.assertLess(out.find(a_sep), a_idx)
+        self.assertLess(a_idx, out.find(b_sep))
+        # Output starts with A's header (first group gets one now).
+        self.assertTrue(out.startswith(a_sep + '\n'))
 
     def test_cross_file_argv_order_independent_of_selection_order(self):
         # Even when B's target is listed FIRST in the selection, the
@@ -2820,6 +2892,55 @@ class TestRunSourceCommandMulti(_MultiCaseBase):
         out = ctx.last_tmp_contents
         # A's content comes first.
         self.assertLess(out.find('# A1'), out.find('# B1'))
+
+    def test_root_plus_content_same_file_combines(self):
+        # #572: file-root A space-marked + heading from file A → temp
+        # file with the whole-file range absorbing the heading's
+        # sub-range. Single-file output → NO header.
+        import os
+        self._load_multi(self.path_a, self.path_b)
+        a_root = self.r._FILES[self.path_a].file_root
+        a_h1 = self.r._BY_ID[f'{self.path_a}#0']
+        ctx = _SrcCmdCtx(targets=[a_root, a_h1])
+        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.assertEqual(len(ctx.calls), 1)
+        argv = ctx.calls[0]
+        self.assertTrue(argv[-1].endswith('.md'))
+        # Single-file group → no ``=====`` header. Whole-file range
+        # absorbs the heading's sub-range → output is the whole A
+        # body.
+        out = ctx.last_tmp_contents
+        a_sep = f'===== {os.path.basename(self.path_a)} ====='
+        self.assertNotIn(a_sep, out)
+        self.assertEqual(out, self.A_TEXT)
+
+    def test_root_A_plus_content_B_combines_with_headers(self):
+        # #572: file-root A + heading from file B → temp file with
+        # two groups; BOTH groups get a ``===== <basename> =====``
+        # header (including the first). A's group is the whole-file
+        # range; B's group is the heading's slice.
+        import os
+        self._load_multi(self.path_a, self.path_b)
+        a_root = self.r._FILES[self.path_a].file_root
+        b_h1 = self.r._BY_ID[f'{self.path_b}#0']
+        ctx = _SrcCmdCtx(targets=[a_root, b_h1])
+        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.assertEqual(len(ctx.calls), 1)
+        argv = ctx.calls[0]
+        self.assertTrue(argv[-1].endswith('.md'))
+        out = ctx.last_tmp_contents
+        a_sep = f'===== {os.path.basename(self.path_a)} ====='
+        b_sep = f'===== {os.path.basename(self.path_b)} ====='
+        # Header before EACH group, including the first.
+        self.assertIn(a_sep, out)
+        self.assertIn(b_sep, out)
+        # Output starts with A's header.
+        self.assertTrue(out.startswith(a_sep + '\n'))
+        # A's group contains the whole A body; B's group contains B1.
+        self.assertIn(self.A_TEXT, out)
+        self.assertIn('# B1', out)
+        # Argv order: A's header precedes B's.
+        self.assertLess(out.find(a_sep), out.find(b_sep))
 
 
 class TestReloadMulti(_MultiCaseBase):

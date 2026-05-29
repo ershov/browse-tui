@@ -1151,30 +1151,34 @@ def _write_range_excerpts_grouped(groups):
 
     ``groups`` is an ordered list of ``(path, file_text, merged_ranges)``
     tuples — typically produced by ``_run_source_command`` grouping
-    non-root targets by ``file_path`` (in argv order) and running
+    targets by ``file_path`` (in argv order) and running
     ``_merge_ranges`` per file.
 
-    Each group is prefixed with a
-    ``\\n===== <basename(path)> =====\\n`` separator (omitted before
-    the first group) so the reader can see file boundaries. Within a
-    group, slices are written via the same ``\\n``-insertion logic
-    used by ``_write_range_excerpts`` — boundaries between
-    non-adjacent ranges get an explicit newline.
+    When ``groups`` contains MORE THAN ONE file, every group is
+    prefixed with a ``===== <basename(path)> =====\\n`` header —
+    including the FIRST group — so the reader can tell where each
+    file's content begins. When ``groups`` contains a single file,
+    no header is emitted (the user already knows which file they
+    selected from). Within a group, slices are written via the same
+    ``\\n``-insertion logic used by ``_write_range_excerpts`` —
+    boundaries between non-adjacent ranges get an explicit newline.
 
     Returns the path to the written file; caller unlinks in
     ``finally``.
     """
     import tempfile
+    multi = len(groups) > 1
     tmp = tempfile.NamedTemporaryFile(
         'w', suffix='.md', delete=False,
         encoding='utf-8', errors='surrogateescape',
     )
     try:
-        first = True
         for path, file_text, ranges in groups:
-            if not first:
-                tmp.write(f'\n===== {os.path.basename(path)} =====\n')
-            first = False
+            if multi:
+                # Header before every group, including the first, so
+                # the first file's boundary is just as visible as the
+                # subsequent ones.
+                tmp.write(f'===== {os.path.basename(path)} =====\n')
             prev_slice = ''
             for bo, bs in ranges:
                 piece = file_text[bo:bo + bs]
@@ -1190,24 +1194,28 @@ def _write_range_excerpts_grouped(groups):
 def _run_source_command(ctx, env_var, default):
     """Shared body of ``V`` / ``E``: resolve targets, dispatch external tool.
 
-    Strategy (lifted from browse-claude:4323-4392, swapping the
-    per-line extractor for byte-range merging):
+    Strategy:
 
       * ``ctx.targets`` handles "selection-or-cursor".
-      * Any target is a per-file root → open THAT file in place
-        (``root_target.id`` is the abs path). Edits via ``E``
-        persist naturally. Mirrors the pre-multi-file single-root
-        contract; if multiple per-file roots are in the selection
-        the FIRST in argv order wins.
-      * All non-root targets in ONE file → collect
-        ``(byte_offset, byte_size)`` ranges, merge them, concatenate
-        the slices into a temp .md file, run the external tool on it,
-        unlink in ``finally``.
-      * Non-root targets across MULTIPLE files → group by file in
-        argv order, merge ranges per file, write each group to the
-        same temp .md file separated by a
-        ``\\n===== <filename> =====\\n`` header line so the reader
-        can see file boundaries.
+      * **Exactly one target, and it is a file-root** → open the
+        original file directly (no tempfile). Edits via ``E``
+        persist naturally. Covers both "cursor on a file row, no
+        selection" and "one file row space-marked, nothing else".
+      * **Anything else** (any multi-target situation, including
+        roots mixed with content) → produce a temp file. Every
+        target contributes a byte range to be sliced out of its
+        file's text:
+          * a file-root expands to that file's whole text
+            ``(0, len(file_text))``;
+          * a content target uses its own
+            ``(byte_offset, byte_size)``.
+        Ranges are grouped by file in argv order, merged per file
+        (so a whole-file range naturally absorbs any sub-ranges
+        from the same file), then concatenated into one temp ``.md``
+        passed to ``$PAGER`` / ``$EDITOR``. When more than one file
+        contributes, every group is prefixed with a
+        ``===== <basename> =====`` header — including the first —
+        so the reader can spot file boundaries.
 
     Empty ``targets`` (no cursor, no selection) is a no-op.
 
@@ -1232,56 +1240,68 @@ def _run_source_command(ctx, env_var, default):
         # through ``_reparse``).
         return it.id in _FILES or it.id == _ROOT_PATH
 
+    def _root_path(it):
+        # Real per-file root or pseudo-Item with a known path.
+        return it.id if it.id in _FILES else (_ROOT_PATH or it.id)
+
     cmd = _split_cmd(os.environ.get(env_var) or default)
 
-    # Root-wins on mixed input. If multiple roots are present, pick
-    # the FIRST one in argv order so the behaviour is stable when the
-    # user multi-selects per-file roots.
-    root_targets = [it for it in targets if _is_root(it)]
-    if root_targets:
-        order = [p for p, _ in _INPUT_FILES]
-
-        def _root_path(it):
-            # Real per-file root or pseudo-Item with a known path.
-            return it.id if it.id in _FILES else (_ROOT_PATH or it.id)
-
-        # Pick the one that sorts earliest by argv order. Unknown
-        # paths sort last (defensive — should not happen in
-        # production).
-        chosen = min(
-            root_targets,
-            key=lambda it: order.index(_root_path(it))
-            if _root_path(it) in order else 1 << 31,
-        )
-        ctx.run_external(cmd + [_root_path(chosen)])
+    # Single-target shortcut: cursor or sole-selection on a file row
+    # → open the file directly. Edits via E persist. This is the ONLY
+    # path that bypasses the tempfile pipeline — any larger selection
+    # (even if it contains one file-root and one heading) flows
+    # through the unified expansion below.
+    if len(targets) == 1 and _is_root(targets[0]):
+        ctx.run_external(cmd + [_root_path(targets[0])])
         return
 
-    # All targets non-root: group by file in argv order.
-    # ``getattr`` with a default keeps the legacy single-file tests
-    # (which build Items without ``file_path``) on the ``_FILE_TEXT``
-    # path.
-    by_path = {}
+    # Otherwise: expand every target into a (file_path, byte_offset,
+    # byte_size) triple. File-root targets expand to the file's full
+    # byte range so when merged with sibling content targets the
+    # whole-file range naturally absorbs them.
+    expanded = []
     for t in targets:
-        fp = getattr(t, 'file_path', None)
-        by_path.setdefault(fp, []).append(t)
+        if _is_root(t):
+            path = _root_path(t)
+            fs = _FILES.get(path)
+            if fs is not None:
+                expanded.append((path, 0, len(fs.text)))
+            elif path == _ROOT_PATH:
+                # Legacy single-file fixture path (no ``_FILES``
+                # entry — tests populate ``_FILE_TEXT`` / ``_ROOT_PATH``
+                # directly). Fall through with ``file_path=None`` so
+                # the grouping branch picks up ``_FILE_TEXT``.
+                expanded.append((None, 0, len(_FILE_TEXT)))
+        else:
+            fp = getattr(t, 'file_path', None)
+            bo = getattr(t, 'byte_offset', None)
+            bs = getattr(t, 'byte_size', None)
+            if bo is None or bs is None:
+                # Defensive: skip targets we can't slice.
+                continue
+            expanded.append((fp, bo, bs))
 
-    # Build the ordered per-file groups. Files in argv order first,
-    # then any fileless targets (legacy single-file tests) at the end.
+    if not expanded:
+        return
+
+    # Group by file in argv order. Files not in ``_INPUT_FILES``
+    # (legacy single-file tests where ``file_path`` is None) go last
+    # and fall through to ``_FILE_TEXT``.
+    by_path = {}
+    for path, bo, bs in expanded:
+        by_path.setdefault(path, []).append((bo, bs))
     groups = []
     seen = set()
     for p, _ in _INPUT_FILES:
         if p in by_path and p not in seen:
             seen.add(p)
             fs = _FILES.get(p)
-            if fs is None:
-                continue
-            ranges = [(t.byte_offset, t.byte_size) for t in by_path[p]]
-            groups.append((p, fs.text, _merge_ranges(ranges)))
-    # Legacy fileless targets (``file_path is None``) — fall through
-    # to ``_FILE_TEXT``. Only relevant in single-file test fixtures.
+            if fs is not None:
+                groups.append((p, fs.text, _merge_ranges(by_path[p])))
     if None in by_path:
-        ranges = [(t.byte_offset, t.byte_size) for t in by_path[None]]
-        groups.append((_ROOT_PATH or '', _FILE_TEXT, _merge_ranges(ranges)))
+        groups.append(
+            (_ROOT_PATH or '', _FILE_TEXT, _merge_ranges(by_path[None]))
+        )
 
     if not groups:
         return
