@@ -1448,17 +1448,23 @@ def main():
     #   * Multi-file, no anchor → ``None`` (show the top-level list
     #     of files; user picks).
     #   * Multi-file, first anchor on file X → resolve against X.
-    #   * Single-file, no anchor → scope INTO the file's per-file
-    #     root (visual matches the pre-#553 single-file UX).
-    #   * Single-file, anchor → resolve against the file.
+    #   * Single-file, no anchor → ``None`` plus an auto-expand on
+    #     the file row so headings are visible immediately. We
+    #     deliberately avoid scoping INTO the file's root: the
+    #     framework's scope_stack would be left with one entry, and
+    #     alt-up from a heading would pop to an empty/undefined
+    #     state (see ticket #566).
+    #   * Single-file, anchor → resolve against the file (anchor
+    #     drill-in already reveals the heading, so no auto-expand).
+    auto_expand_id = None
     if first_anchor_path is not None:
         initial_scope = _resolve_anchor(_ANCHOR, first_anchor_path)
     elif len(_FILES) == 1:
-        # Single-file no-anchor: open scoped INTO the file's root so
-        # the user immediately sees the file's headings rather than a
-        # one-row list. Same visual as before the multi-file rework.
+        # Single-file no-anchor: leave initial_scope None and
+        # auto-expand the file's top row instead of scoping into it.
+        initial_scope = None
         only_path = next(iter(_FILES))
-        initial_scope = _FILES[only_path].file_root.id
+        auto_expand_id = _FILES[only_path].file_root.id
     else:
         initial_scope = None
 
@@ -1496,6 +1502,13 @@ def main():
     # ``preview_width`` for md2ansi word-wrap. Matches the pattern in
     # browse-fs / browse-claude.
     _BROWSER = b
+    # Single-file no-anchor: auto-expand the file row so its
+    # headings are visible immediately. Matches the visual the old
+    # ``initial_scope = file_root.id`` branch produced, but without
+    # the scope_stack hack that made alt-up land on an empty list
+    # (ticket #566).
+    if auto_expand_id is not None:
+        b.expand(auto_expand_id)
     sys.exit(b.run())
 
 

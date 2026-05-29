@@ -49,8 +49,28 @@ def _stub_browse_tui():
             for k, v in kw.items():
                 setattr(self, k, v)
 
+    class _BrowserStub(_Stub):
+        """Browser stub that records ``expand(...)`` calls.
+
+        ``main()`` calls ``Browser(BrowserConfig(...))`` and then
+        ``b.expand(id)`` for the single-file no-anchor auto-expand
+        path (ticket #566). The stub stashes the config arg on
+        ``self.config`` so tests can inspect ``initial_scope``, and
+        records ``expand`` calls on ``self.expand_calls``.
+        """
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            # ``Browser`` is constructed positionally with a single
+            # ``BrowserConfig`` instance; stash it so tests can read
+            # ``self.config.initial_scope``.
+            self.config = a[0] if a else None
+            self.expand_calls = []
+
+        def expand(self, id, *a, **kw):
+            self.expand_calls.append((id, a, kw))
+
     mod.Action = _Stub
-    mod.Browser = _Stub
+    mod.Browser = _BrowserStub
     mod.BrowserConfig = _Stub
     mod.Item = _Stub
     sys.modules['browse_tui'] = mod
@@ -2497,13 +2517,17 @@ class TestBuildMulti(_MultiCaseBase):
 class TestAnchorMulti(_MultiCaseBase):
     """Initial-scope resolution across one or more files.
 
-    Post-#559 the rules are:
+    Post-#566 the rules are:
       * Multi-file, no anchor → ``initial_scope is None`` (browser
-        starts at the top-level list of files).
-      * Multi-file, first anchor on file X → resolve against X.
-      * Single-file, no anchor → ``initial_scope`` is the file's own
-        per-file root id (browser opens scoped INTO the file).
-      * Single-file, anchor → resolve against the file.
+        starts at the top-level list of files); no auto-expand.
+      * Multi-file, first anchor on file X → resolve against X; no
+        auto-expand.
+      * Single-file, no anchor → ``initial_scope is None`` PLUS an
+        auto-expand on the file row (so the file's headings are
+        visible without scoping into the file — alt-up from a
+        heading then lands on the file row, not an empty list).
+      * Single-file, anchor → resolve against the file; no
+        auto-expand (the anchor drill-in already shows the heading).
     """
 
     def _initial_scope(self, *files):
@@ -2511,6 +2535,8 @@ class TestAnchorMulti(_MultiCaseBase):
 
         Mirrors the logic in ``main()``: walk ``_INPUT_FILES``, pick
         the first anchored file, resolve via ``_resolve_anchor``.
+        Returns just the ``initial_scope`` value — the auto-expand
+        side-effect is tested separately via ``_run_main``.
         """
         self.r._INPUT_FILES = list(files)
         self.r._reparse()
@@ -2522,10 +2548,31 @@ class TestAnchorMulti(_MultiCaseBase):
                 first_anchor_path = path
         if first_anchor_path is not None:
             return self.r._resolve_anchor(first_anchor, first_anchor_path)
-        if len(self.r._FILES) == 1:
-            only_path = next(iter(self.r._FILES))
-            return self.r._FILES[only_path].file_root.id
+        # Single-file no-anchor and multi-file no-anchor both leave
+        # ``initial_scope`` at ``None``; the single-file case is
+        # handled instead via the auto-expand call asserted in
+        # ``_run_main`` below.
         return None
+
+    def _run_main(self, argv):
+        """Drive ``main()`` through Browser construction and return ``_BROWSER``.
+
+        The stubbed ``Browser`` from ``_stub_browse_tui`` has no
+        ``run`` method, so ``main()`` raises ``AttributeError`` just
+        past the auto-expand call. By that point we've captured
+        ``initial_scope`` (on the Browser's BrowserConfig) and any
+        ``expand(...)`` invocations.
+        """
+        import contextlib
+        import io
+        self.r.sys.argv[:] = argv
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            try:
+                self.r.main()
+            except (SystemExit, AttributeError):
+                pass
+        return self.r._BROWSER
 
     def test_multi_file_no_anchor_returns_none(self):
         # Two files, neither anchored → initial scope is ``None``
@@ -2534,12 +2581,13 @@ class TestAnchorMulti(_MultiCaseBase):
             (self.path_a, ''), (self.path_b, ''))
         self.assertIsNone(scope)
 
-    def test_single_file_no_anchor_returns_file_root_id(self):
-        # One file, no anchor → scope into the file's root so the
-        # browser opens on its headings (matches the pre-multi-file
-        # single-file UX).
+    def test_single_file_no_anchor_returns_none(self):
+        # One file, no anchor → ``initial_scope`` is ``None`` (post
+        # #566). The "show the file's headings immediately" visual
+        # is delivered via ``b.expand(file_root.id)`` instead — see
+        # ``test_single_file_no_anchor_auto_expands_file_row``.
         scope = self._initial_scope((self.path_a, ''))
-        self.assertEqual(scope, self.path_a)
+        self.assertIsNone(scope)
 
     def test_anchor_on_second_file_resolves_in_that_file(self):
         # File A unanchored, file B carries ``#B2`` → scope drills
@@ -2576,6 +2624,34 @@ class TestAnchorMulti(_MultiCaseBase):
         # against that file's per-file root.
         scope = self._initial_scope((self.path_a, 'A2'))
         self.assertEqual(scope, f'{self.path_a}#1')
+
+    def test_single_file_no_anchor_auto_expands_file_row(self):
+        # Single-file no-anchor: ``initial_scope`` is ``None`` AND
+        # ``main()`` calls ``b.expand(file_root.id)`` so the file's
+        # headings are visible from startup without scoping into
+        # the file (ticket #566).
+        b = self._run_main(['browse-md', self.path_a])
+        self.assertIsNone(b.config.initial_scope)
+        self.assertEqual(len(b.expand_calls), 1)
+        expanded_id, _, _ = b.expand_calls[0]
+        # The file's per-file-root id equals its abs path.
+        self.assertEqual(expanded_id, self.path_a)
+
+    def test_single_file_with_anchor_does_not_auto_expand(self):
+        # Single-file WITH anchor: ``initial_scope`` resolves to the
+        # anchored heading and no auto-expand is issued (the anchor
+        # drill-in already reveals the heading).
+        b = self._run_main(['browse-md', f'{self.path_a}#A2'])
+        self.assertEqual(b.config.initial_scope, f'{self.path_a}#1')
+        self.assertEqual(b.expand_calls, [])
+
+    def test_multi_file_no_anchor_does_not_auto_expand(self):
+        # Multi-file no-anchor: ``initial_scope`` is ``None`` and no
+        # auto-expand — the user picks a file from the top-level
+        # list.
+        b = self._run_main(['browse-md', self.path_a, self.path_b])
+        self.assertIsNone(b.config.initial_scope)
+        self.assertEqual(b.expand_calls, [])
 
 
 class TestGetPreviewMulti(_MultiCaseBase):
