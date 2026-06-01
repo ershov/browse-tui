@@ -2595,6 +2595,8 @@ class BrowserConfig:
     on_cursor_change: Optional[Callable] = None
     on_scope_change: Optional[Callable] = None
     on_selection_change: Optional[Callable] = None
+    on_expand: Optional[Callable] = None
+    on_collapse: Optional[Callable] = None
     on_quit: Optional[Callable] = None
     _headless: bool = False
 
@@ -2863,11 +2865,18 @@ class Browser:
         # cursor-anchor re-positioning that lands back on the same id
         # is a no-op. ``on_scope_change`` fires after every
         # scope_into / scope_out transition (main-thread paths only).
+        # ``on_expand`` / ``on_collapse`` fire from a drain-time diff of
+        # ``state.expanded`` against ``_last_expanded`` (see
+        # ``_fire_expand_collapse_if_pending``) — no mutation site is
+        # instrumented, so every expand source (keyboard, ``ctx.expand``,
+        # recursive actions, ``collapse_all``, startup) is caught.
         # ``on_quit`` fires once during shutdown after the screen is
         # restored.
         self._on_cursor_change = config.on_cursor_change
         self._on_scope_change = config.on_scope_change
         self._on_selection_change = config.on_selection_change
+        self._on_expand = config.on_expand
+        self._on_collapse = config.on_collapse
         self._on_quit = config.on_quit
         # Worker-slot registry for ``run_in_slot``. Each entry is the
         # currently-active CancellationToken for a named slot;
@@ -2876,6 +2885,14 @@ class Browser:
         self._slots_lock = threading.Lock()
         self._cursor_change_pending = False
         self._last_cursor_id = None
+        # Snapshot of ``state.expanded`` as of the last expand/collapse
+        # fire. Seeded empty so any expansion issued before ``run()``
+        # (recipe startup ``b.expand(...)``, or an ``initial_scope`` that
+        # restores a saved set) fires ``on_expand`` on the first drain.
+        # ``scope_into`` / ``scope_out`` re-baseline this after a
+        # transition so per-scope set restores don't masquerade as
+        # expands/collapses.
+        self._last_expanded = set()
         self._headless = config._headless
 
         # --- domain state ------------------------------------------------
@@ -4174,6 +4191,13 @@ class Browser:
             self._needs_redraw.add('all')
             mark_cursor_changed(self)
             self._fire_scope_change(self.scope, prev_scope_id, 'in')
+            # Re-baseline the expand/collapse diff: ``scope_into`` just
+            # restored the new scope's per-scope expanded set, which the
+            # drain-time diff would otherwise read as a burst of expands /
+            # collapses. A scope transition is an ``on_scope_change``
+            # event, not an expand — so anchor ``_last_expanded`` to the
+            # restored set and the next diff sees no delta.
+            self._last_expanded = set(self._state.expanded)
         self.post(_do)
 
     def scope_out(self) -> None:
@@ -4214,6 +4238,11 @@ class Browser:
             self._needs_redraw.add('all')
             mark_cursor_changed(self)
             self._fire_scope_change(self.scope, prev_scope_id, 'out')
+            # Re-baseline the expand/collapse diff — symmetric with
+            # ``scope_into``. ``scope_out`` restored the parent scope's
+            # expanded set; anchor ``_last_expanded`` to it so the restore
+            # doesn't masquerade as expands/collapses.
+            self._last_expanded = set(self._state.expanded)
         self.post(_do)
 
     # ---- expansion helpers -----------------------------------------------
@@ -4537,6 +4566,46 @@ class Browser:
             self._on_selection_change(self._make_ctx_for_hook(), ids)
         except Exception as e:
             self.error(f'on_selection_change: {type(e).__name__}: {e}')
+
+    def _fire_expand_collapse_if_pending(self) -> None:
+        """Fire ``on_collapse`` / ``on_expand`` from a drain-time set diff.
+
+        Diffs ``state.expanded`` against ``_last_expanded``:
+        ``added = expanded - last`` fires one ``on_expand(list(added))``,
+        ``removed = last - expanded`` fires one ``on_collapse(list(removed))``.
+        A whole burst between drains (Alt-Right / Alt-Left, ``collapse_all``,
+        ``expand_subtree``) is therefore delivered as a single call; a drain
+        that nets to no change fires nothing. ``on_collapse`` fires before
+        ``on_expand`` per the documented drain order.
+
+        Unconditional (no pending flag): the diff runs every drain so the
+        many places that mutate ``state.expanded`` — including the direct
+        ``state.expanded.discard(...)`` in the actions layer — are caught
+        with no instrumentation at the mutation sites (the design intent;
+        the #500 failure mode prevented). The expanded set is small, so a
+        per-drain set diff is cheap.
+
+        ``_last_expanded`` is always re-snapshotted at the end, even when
+        no handler is installed, so a handler registered later never sees
+        a stale historical delta. (List order is unspecified — recipes
+        that need a stable order should sort.)
+        """
+        expanded = self._state.expanded
+        if expanded != self._last_expanded:
+            removed = self._last_expanded - expanded
+            added = expanded - self._last_expanded
+            if removed and self._on_collapse is not None:
+                try:
+                    self._on_collapse(self._make_ctx_for_hook(),
+                                      list(removed))
+                except Exception as e:
+                    self.error(f'on_collapse: {type(e).__name__}: {e}')
+            if added and self._on_expand is not None:
+                try:
+                    self._on_expand(self._make_ctx_for_hook(), list(added))
+                except Exception as e:
+                    self.error(f'on_expand: {type(e).__name__}: {e}')
+            self._last_expanded = set(expanded)
 
     def _fire_on_quit(self) -> None:
         """Fire ``on_quit`` once during shutdown.
@@ -5993,9 +6062,13 @@ class Browser:
                 self._update_preview_for_cursor()
                 self._update_children_for_cursor()
 
-                # Lifecycle hook: at most one fire per drain, only
-                # when the cursor id actually changed (see
-                # ``_fire_cursor_change_if_pending``).
+                # Lifecycle hooks fire once per drain in the documented
+                # order (spec "Ordering within a drain"): structure
+                # (on_collapse → on_expand) before cursor settling, so a
+                # cursor-change handler sees the post-expansion tree. (The
+                # later phases — children-loaded, scope, search/filter,
+                # resize — slot in here in the same order as they land.)
+                self._fire_expand_collapse_if_pending()
                 self._fire_cursor_change_if_pending()
 
                 # Resize flag — set by SIGWINCH handler in 020-terminal.
