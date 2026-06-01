@@ -50,9 +50,9 @@ from browse_tui import (
     _recompute_filter_hidden,
 )
 
-# Optional md2ansi plugin — colors user/assistant voice content inline.
+# Optional md2ansi_lib plugin — colors user/assistant voice content inline.
 try:
-    from md2ansi import md2ansi as _md2ansi_fn
+    from md2ansi_lib import md2ansi as _md2ansi_fn
     if not callable(_md2ansi_fn):
         _md2ansi_fn = None
 except Exception:
@@ -4965,7 +4965,7 @@ a transcript with Right/Alt-Down; preview shows the rendered turn.
   v / V   page the preview (v) / the source .jsonl (V) via $PAGER.
   e / E   open the preview (e) / the source .jsonl (E) in $EDITOR.
   m       toggle inline markdown coloring of voice content (only bound
-          when the md2ansi Python module is importable).
+          when the md2ansi_lib Python module is importable).
   M       render the preview via $MD2ANSI / md2ansi (external).
   J / K   jump cursor to next / previous user-or-assistant voice.
   t       toggle flat / tree view.
@@ -5074,7 +5074,7 @@ def main():
         parent_scope = os.path.dirname(target_jsonl) or '/'
 
     # 'M' always pages the preview through the external $MD2ANSI / md2ansi.
-    # 'm' toggles inline markdown coloring iff the md2ansi Python module
+    # 'm' toggles inline markdown coloring iff the md2ansi_lib Python module
     # was importable; otherwise it's left unbound.
     actions_m = [Action('M', 'View preview via $MD2ANSI / md2ansi',
                         _action_md_preview, 'cursor')]

@@ -17,9 +17,9 @@ import sys
 
 from browse_tui import Action, Browser, BrowserConfig, Item, upsert
 
-# Optional md2ansi plugin — colors ticket previews when available.
+# Optional md2ansi_lib plugin — colors ticket previews when available.
 try:
-    from md2ansi import md2ansi as _md2ansi_fn
+    from md2ansi_lib import md2ansi as _md2ansi_fn
     if not callable(_md2ansi_fn):
         _md2ansi_fn = None
 except Exception:
@@ -454,7 +454,7 @@ def main():
             sys.stderr.write(f'browse-plan: invalid ticket id {sys.argv[1]!r}\n')
             sys.exit(2)
 
-    # 'm' is the move action by default; when md2ansi is available we
+    # 'm' is the move action by default; when md2ansi_lib is available we
     # rebind it to a coloured / raw toggle, and move shifts to 'M'.
     if _md2ansi_fn is not None:
         move_key, move_label = 'M', 'Move (re-parent or reorder)'

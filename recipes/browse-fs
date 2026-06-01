@@ -13,9 +13,9 @@ import time
 
 from browse_tui import Action, Browser, BrowserConfig, Item
 
-# Optional md2ansi plugin — gates the colored *.md preview mode.
+# Optional md2ansi_lib plugin — gates the colored *.md preview mode.
 try:
-    from md2ansi import md2ansi as _md2ansi_fn
+    from md2ansi_lib import md2ansi as _md2ansi_fn
     if not callable(_md2ansi_fn):
         _md2ansi_fn = None
 except Exception:

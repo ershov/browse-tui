@@ -240,7 +240,7 @@ class TestParse(unittest.TestCase):
         self.assertEqual(self._kinds(events), ['ol', 'ol'])
 
     def test_list_with_continuation_strict(self):
-        # md2ansi's ``_MD_LIST`` is strict: every line of the block
+        # md2ansi_lib's ``_MD_LIST`` is strict: every line of the block
         # MUST be a marker line. A continuation line breaks the match,
         # which produces TWO separate list matches (one per side of
         # the continuation). We don't get a continuation event — only
@@ -259,7 +259,7 @@ class TestParse(unittest.TestCase):
         # ``_MD_LIST`` match accepts mixed ``-`` and ``\d+.`` lines
         # because the alternation is per-line. So this whole block is
         # one match and the walker fans it into two events: one ``ul``
-        # and one ``ol``. (If md2ansi's rule ever tightens, this is the
+        # and one ``ol``. (If md2ansi_lib's rule ever tightens, this is the
         # observed-behavior canary — feel free to update.)
         text = '- foo\n1. bar\n'
         events = self.r._parse(text)
@@ -549,7 +549,7 @@ class TestTitleStripping(unittest.TestCase):
         self.assertEqual(titles, ['My **bold** heading'])
 
     def test_heading_trailing_hash_preserved(self):
-        # md2ansi's heading patterns don't special-case a trailing
+        # md2ansi_lib's heading patterns don't special-case a trailing
         # ``#``, so it stays in the source line — and therefore in
         # the stored title — after we strip only the *leading*
         # ``#``s + whitespace.
@@ -1236,7 +1236,7 @@ class TestToggleMd(unittest.TestCase):
 
     def setUp(self):
         self.r = _load_recipe()
-        # Pretend md2ansi was importable so the toggle is meaningful;
+        # Pretend md2ansi_lib was importable so the toggle is meaningful;
         # the action itself only depends on ``_MD_COLOR``, not on the
         # function being callable, so an identity stub is fine.
         self.r._md2ansi_fn = lambda text, line_width: text

@@ -24,7 +24,7 @@ tree in place.
 Custom actions on top of the framework defaults:
 
   m   toggle md2ansi coloring of the preview (only bound when the
-      ``md2ansi`` Python module is importable).
+      ``md2ansi_lib`` Python module is importable).
   M   page the preview through ``$MD2ANSI`` / external ``md2ansi``.
   V   page the source for cursor/selection in ``$PAGER``. On a
       per-file root opens that file; on non-root rows pages a temp
@@ -45,19 +45,19 @@ import sys
 
 from browse_tui import Action, Browser, BrowserConfig, Item
 
-# Optional md2ansi plugin — gates the colored markdown preview mode.
+# Optional md2ansi_lib plugin — gates the colored markdown preview mode.
 # Mirrors the gate pattern in browse-fs / browse-claude: import the
 # function, fall back to ``None`` if the module is missing or the
 # imported name isn't actually callable (defensive against monkey-
 # patched stubs in tests / odd vendored copies).
 try:
-    from md2ansi import md2ansi as _md2ansi_fn
+    from md2ansi_lib import md2ansi as _md2ansi_fn
     if not callable(_md2ansi_fn):
         _md2ansi_fn = None
 except Exception:
     _md2ansi_fn = None
 
-# Default colored preview on when md2ansi is importable; the ``m``
+# Default colored preview on when md2ansi_lib is importable; the ``m``
 # action (bound only when ``_md2ansi_fn`` is not ``None``) flips it
 # at runtime. ``_BROWSER`` is set in ``main()`` after construction so
 # ``get_preview`` can look up the current ``preview_width`` for the
@@ -108,7 +108,7 @@ _ROOT_PATH = None
 # handed to ``BrowserConfig(initial_scope=...)``.
 _ANCHOR = ''
 
-# Tag-style palette per heading level. h1 stays red (md2ansi-ish loud
+# Tag-style palette per heading level. h1 stays red (md2ansi_lib-ish loud
 # top); deeper levels cycle through the named palette ending in gray
 # for the deepest h6.
 _HEADING_STYLES = {
@@ -120,8 +120,8 @@ _HEADING_STYLES = {
     6: 'gray',
 }
 
-# Per-line list-item regex — lifted verbatim from md2ansi
-# (``_m2a_fmt_list``, md2ansi.py:493). Used by ``_walk_list`` to fan
+# Per-line list-item regex — lifted verbatim from md2ansi_lib
+# (``_m2a_fmt_list``, md2ansi_lib.py:493). Used by ``_walk_list`` to fan
 # one ``_MD_LIST`` match out into one event per marker line.
 _LIST_ITEM_RE = re.compile(r'^([ \t]*)([-*+]|\d+\.)[ \t]+(.*)$')
 
@@ -154,12 +154,12 @@ _USAGE = 'usage: browse-md [-l] FILE.md[#anchor] [FILE.md[#anchor] ...]'
 
 # ### Section: Markdown block-rule table ##############################
 #
-# Patterns lifted verbatim from md2ansi.py (lines 697-726). md2ansi
+# Patterns lifted verbatim from md2ansi_lib.py (lines 697-726). md2ansi_lib
 # writes inner captures as ``(?P<*...>...)`` placeholders that its
 # ``_m2a_build_context`` rewrites at build time. We don't need those
 # inner names — ``_parse`` keys on the outer rule by iterating
-# ``_RULES`` and picking the first whose group matched (md2ansi-style;
-# see ``_m2a_replace`` in md2ansi.py). Every ``(?P<*...>...)`` is
+# ``_RULES`` and picking the first whose group matched (md2ansi_lib-style;
+# see ``_m2a_replace`` in md2ansi_lib.py). Every ``(?P<*...>...)`` is
 # converted to a non-capturing ``(?:...)`` group to keep the patterns
 # idiomatic ``re`` and avoid name collisions when stitched into the
 # combined regex below.
@@ -231,8 +231,8 @@ _RULES = (
     ('list',        _MD_LIST),
 )
 
-# Combined regex — same shape md2ansi uses in ``_m2a_build_context``
-# (md2ansi.py:113). One ``finditer`` pass over the text yields all
+# Combined regex — same shape md2ansi_lib uses in ``_m2a_build_context``
+# (md2ansi_lib.py:113). One ``finditer`` pass over the text yields all
 # block-level matches in document order; ``_parse`` walks ``_RULES``
 # per match to find which outer group matched (see ``_parse`` for why
 # we don't use ``m.lastgroup``).
@@ -372,7 +372,7 @@ def _parse(text):
         # would be simpler but returns the *highest-numbered* matching
         # named group — so any future inner ``(?P<...>...)`` group
         # inside a rule pattern would silently misroute dispatch. This
-        # mirrors md2ansi's ``_m2a_replace`` (md2ansi.py:863-882).
+        # mirrors md2ansi_lib's ``_m2a_replace`` (md2ansi_lib.py:863-882).
         groups = m.groupdict()
         kind = next(n for n, _ in _RULES if groups.get(n) is not None)
         if kind in _HEADING_KINDS:
@@ -899,7 +899,7 @@ def get_preview(node_id):
     4. Anything else (unresolvable id) → ``''``. Defensive: a stale
        cursor id from a previous scope mustn't crash the preview.
 
-    When ``_MD_COLOR`` is on (and md2ansi is importable), the slice
+    When ``_MD_COLOR`` is on (and md2ansi_lib is importable), the slice
     runs through ``_md2ansi_fn(text, line_width=…)`` for ANSI-coloured
     rendering. The call is wrapped in a broad ``except Exception`` so
     pathological markdown can't crash the preview pane — we just fall
@@ -972,7 +972,7 @@ def _action_toggle_md(ctx):
 
     Drops the preview cache so the next render runs through (or skips)
     the md2ansi pipe immediately. Only bound when ``_md2ansi_fn`` is
-    importable; if md2ansi is missing the action isn't wired into
+    importable; if md2ansi_lib is missing the action isn't wired into
     ``actions`` at all, so the keystroke falls through to the default
     handler.
     """
@@ -1356,7 +1356,7 @@ Usage: browse-md [-l] FILE.md[#anchor] [FILE.md[#anchor] ...]
             multiple files carry anchors, the FIRST anchored file in
             argv order wins.
 
-  m       Toggle md2ansi coloring (requires md2ansi).
+  m       Toggle md2ansi coloring (requires md2ansi_lib).
   M       Render the preview through ``$MD2ANSI`` / md2ansi.
   V       Page source for cursor/selection in ``$PAGER``. On a
           per-file root opens that file directly; on non-root rows
@@ -1490,8 +1490,8 @@ def main():
 
     # ``M`` is always available — it errors gracefully when no
     # renderer is found, so users discover the env-var hook even on
-    # boxes without md2ansi installed. ``m`` only makes sense when
-    # md2ansi is importable; otherwise the toggle can't do anything
+    # boxes without md2ansi_lib installed. ``m`` only makes sense when
+    # md2ansi_lib is importable; otherwise the toggle can't do anything
     # useful (the preview is already raw). Matches the conditional
     # build-up pattern in browse-claude / browse-fs.
     actions = [Action('M', 'View preview via $MD2ANSI / md2ansi',

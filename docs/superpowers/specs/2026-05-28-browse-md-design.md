@@ -23,13 +23,13 @@ recipe family offers for sessions / files / processes.
    item itself plus every descendant. Root previews the whole file.
    Slices are exact source bytes — no reformatting.
 4. `m` toggles md2ansi rendering of the preview, matching browse-claude
-   / browse-fs conventions (gated on the md2ansi import).
+   / browse-fs conventions (gated on the md2ansi_lib import).
 5. `v` / `e` page / edit the preview text (framework defaults). `V` /
    `E` open the *source* — original file on root, temp-file extract
    for non-root.
 6. `M` pages the preview through the external `$MD2ANSI` / `md2ansi`
    binary, again matching browse-claude.
-7. Parser is **lifted from md2ansi.py's technique**: same regex
+7. Parser is **lifted from md2ansi_lib.py's technique**: same regex
    fragments, same `_m2a_build_context` combined-regex approach, same
    precedence-by-rule-order masking of nested constructs. We re-use
    the actual constants (`_MD_H1`..`_MD_H6`, `_MD_HR`, `_MD_CODE_GEN`,
@@ -38,7 +38,7 @@ recipe family offers for sessions / files / processes.
 
 ## Non-goals
 
-- No setext headings (`===` / `---` under a line). md2ansi doesn't
+- No setext headings (`===` / `---` under a line). md2ansi_lib doesn't
   honour them; we mirror that.
 - No tree rows for paragraphs, code blocks, blockquotes, tables, HRs,
   or YAML frontmatter. These are visible only in previews.
@@ -105,7 +105,7 @@ Three node kinds: synthetic `root`, `heading`, `list-item`.
 
 ### Heading nodes
 
-- ATX only: `^\#{1..6}[ \t]+TEXT$` (re.VERBOSE shape from md2ansi:
+- ATX only: `^\#{1..6}[ \t]+TEXT$` (re.VERBOSE shape from md2ansi_lib:
   `_MD_H1` .. `_MD_H6`, re-used as-is via the combined-regex parser
   below).
 - `id = '<path>#<line_no>'` where `line_no` is 0-indexed (matches
@@ -115,7 +115,7 @@ Three node kinds: synthetic `root`, `heading`, `list-item`.
   indent). No `#`-stripping, no formatting-marker removal — the
   recipe never reformats. Example row: `## My **bold** heading`.
 - `tag = 'h1'` … `'h6'`.
-- `tag_style` per level (chosen to read close to md2ansi's palette
+- `tag_style` per level (chosen to read close to md2ansi_lib's palette
   using browse-tui's named colours):
   - h1: `red`
   - h2: `yellow`
@@ -129,12 +129,12 @@ Three node kinds: synthetic `root`, `heading`, `list-item`.
 ### List-item nodes
 
 - Detection: matched per-line *inside* the multi-line list block the
-  combined-regex parser emits (md2ansi's `_MD_LIST` matches a whole
+  combined-regex parser emits (md2ansi_lib's `_MD_LIST` matches a whole
   contiguous list, then `_m2a_fmt_list` walks its lines). We do the
   same: `re.match(r'^([ \t]*)([-*+]|\d+\.)[ \t]+(.*)$', ln)` over
-  each line of the match. Exact regex shape copied from md2ansi
-  `_m2a_fmt_list` (md2ansi.py:493).
-- `level = len(indent.expandtabs(4)) // 2` — identical to md2ansi.
+  each line of the match. Exact regex shape copied from md2ansi_lib
+  `_m2a_fmt_list` (md2ansi_lib.py:493).
+- `level = len(indent.expandtabs(4)) // 2` — identical to md2ansi_lib.
   Tab = 4 spaces; 2-space indent step = one level.
 - `id = '<path>#<line_no>'`.
 - `title` = the source marker line verbatim, only `.rstrip('\n')` and
@@ -148,9 +148,9 @@ Three node kinds: synthetic `root`, `heading`, `list-item`.
 - `has_children = True` iff there's at least one deeper-indent list
   item before this item's section ends.
 
-### Parser pipeline (lifted from md2ansi)
+### Parser pipeline (lifted from md2ansi_lib)
 
-md2ansi's technique (md2ansi.py:113, `_m2a_build_context`):
+md2ansi_lib's technique (md2ansi_lib.py:113, `_m2a_build_context`):
 
 > Build ONE combined regex by alternating each rule's pattern inside
 > a named group: `(?P<h1>...) | (?P<h2>...) | ... | (?P<list>...)`.
@@ -161,13 +161,13 @@ md2ansi's technique (md2ansi.py:113, `_m2a_build_context`):
 
 #### Regex discipline (no rollback, greedy)
 
-Every pattern in `_RULES` MUST follow md2ansi's linear-time regex
+Every pattern in `_RULES` MUST follow md2ansi_lib's linear-time regex
 conventions verbatim. The rule, stated explicitly:
 
 - **Every alternation has disjoint branches.** Each character in the
   input has exactly one matching branch — never two — so the regex
   engine never has to roll back a choice. Example from
-  md2ansi.py:65, table cell:
+  md2ansi_lib.py:65, table cell:
   ```
   [^|\\\n] | \\.
   ```
@@ -180,27 +180,27 @@ conventions verbatim. The rule, stated explicitly:
 
 - **Tempered-greedy bodies for cross-line spans.** Where a pattern
   needs to consume content up to a sentinel, use the
-  `(?: (?! <sentinel> ) <single_char> )*` shape — md2ansi.py:70
-  (`_M2A_STR_TDQ`), md2ansi.py:710 (fenced code body), and
-  md2ansi.py:148 (`_M2A_TABLE_CELL_RE`) all use this. The negative
+  `(?: (?! <sentinel> ) <single_char> )*` shape — md2ansi_lib.py:70
+  (`_M2A_STR_TDQ`), md2ansi_lib.py:710 (fenced code body), and
+  md2ansi_lib.py:148 (`_M2A_TABLE_CELL_RE`) all use this. The negative
   lookahead consumes exactly one character per iteration, so the
   match runs in linear time regardless of how the sentinel is
   written.
 
-- **No re-implementation of md2ansi patterns.** Patterns we lift
+- **No re-implementation of md2ansi_lib patterns.** Patterns we lift
   (`_MD_H1`..`_MD_H6`, `_MD_HR`, `_MD_CODE_GEN`, `_MD_BLOCKQUOTE`,
   `_MD_TABLE`, `_MD_LIST`) are copied byte-for-byte from
-  md2ansi.py — the only patterns we add are `_MD_FRONTMATTER`
+  md2ansi_lib.py — the only patterns we add are `_MD_FRONTMATTER`
   (offset-0 `\A---\n...\n---`) and the per-line list-item regex
-  (already documented at md2ansi.py:493). Any new pattern follows
+  (already documented at md2ansi_lib.py:493). Any new pattern follows
   the same discipline.
 
-The combined regex is also compiled with the same flags as md2ansi:
+The combined regex is also compiled with the same flags as md2ansi_lib:
 `re.VERBOSE | re.MULTILINE | re.DOTALL`.
 
 #### Linear, non-recursive
 
-md2ansi's `_md2ansi` dispatcher (md2ansi.py:863) recurses — inline
+md2ansi_lib's `_md2ansi` dispatcher (md2ansi_lib.py:863) recurses — inline
 rules carry an `actual_recurse` context so bold/italic *inside* a
 heading or table cell can re-feed through the INLINE rule table.
 **browse-md does not.** Our parser cares only about the block-level
@@ -211,11 +211,11 @@ the combined regex, no recursive descent, no nested contexts.
 
 #### Combined-regex enumerator
 
-We adopt md2ansi's combined-regex shape, but use it for
+We adopt md2ansi_lib's combined-regex shape, but use it for
 **enumeration** instead of substitution:
 
 ```python
-# Patterns copied verbatim from md2ansi.py.
+# Patterns copied verbatim from md2ansi_lib.py.
 _RULES = (
     ('h1',          _MD_H1),
     ('h2',          _MD_H2),
@@ -239,9 +239,9 @@ _PARSER_RE = re.compile(
 def _parse(text):
     nodes = []
     for m in _PARSER_RE.finditer(text):
-        # md2ansi-style dispatch: walk _RULES and pick the first whose
+        # md2ansi_lib-style dispatch: walk _RULES and pick the first whose
         # outer named group has a non-None match. Robust against future
-        # inner (?P<...>) groups — see md2ansi.py:863-882.
+        # inner (?P<...>) groups — see md2ansi_lib.py:863-882.
         groups = m.groupdict()
         kind = next(n for n, _ in _RULES if groups.get(n) is not None)
         if kind in _HEADING_KINDS:
@@ -264,11 +264,11 @@ Per-rule notes:
   heading. `m.start()` gives the byte offset; line number is computed
   via a precomputed byte-to-line index. The index's exact construction
   is a ticket-level detail.
-- **Fenced code blocks** are multi-line (md2ansi `_MD_CODE_GEN` with
+- **Fenced code blocks** are multi-line (md2ansi_lib `_MD_CODE_GEN` with
   DOTALL). Match consumes the whole fenced block, so list-like
   content inside is invisible to the list rule. We emit nothing.
 - **Blockquote / table / HR** — same masking purpose, no emission.
-- **List blocks** are handled by md2ansi's `_MD_LIST` pattern. See
+- **List blocks** are handled by md2ansi_lib's `_MD_LIST` pattern. See
   the dedicated subsection below — that's the only rule of ours
   that fans out into multiple emitted nodes per match.
 - **Frontmatter** is line-bound: pattern is
@@ -277,7 +277,7 @@ Per-rule notes:
 
 #### List parsing details
 
-md2ansi's `_MD_LIST` (md2ansi.py:723-726) is line-oriented and
+md2ansi_lib's `_MD_LIST` (md2ansi_lib.py:723-726) is line-oriented and
 strict — it matches a contiguous run of lines that each start with
 `[-*+]` or `\d+.`. Crucially:
 
@@ -322,8 +322,8 @@ ticket-level):
 - Input: one `_MD_LIST` match (a contiguous run of marker-starting
   lines).
 - For each line in the match: run the per-line regex
-  `^([ \t]*)([-*+]|\d+\.)[ \t]+(.*)$` (the same shape md2ansi uses
-  in `_m2a_fmt_list`, md2ansi.py:493). On match, emit one
+  `^([ \t]*)([-*+]|\d+\.)[ \t]+(.*)$` (the same shape md2ansi_lib uses
+  in `_m2a_fmt_list`, md2ansi_lib.py:493). On match, emit one
   list-item node with `level = len(indent.expandtabs(4)) // 2`,
   `kind` = `'ol'` if marker is `\d+.` else `'ul'`, and
   `byte_offset` / `line_offset` derived from the line's position
@@ -415,7 +415,7 @@ re-indentation, no marker rewriting.
 Render policy (display layer only — the underlying bytes don't
 change):
 
-- If `_MD_COLOR` is True (default when md2ansi importable) →
+- If `_MD_COLOR` is True (default when md2ansi_lib importable) →
   pipe through `md2ansi(text, line_width=_BROWSER.preview_width or 80)`.
 - Else → return `text` unchanged.
 
@@ -429,7 +429,7 @@ Matches the browse-fs `_MD_COLOR` / `_BROWSER` pattern verbatim.
 | `e` | framework default | Open preview text in `$EDITOR`. Edits discarded (preview-text semantics). |
 | `V` | recipe | View source. See multi-select rules below. |
 | `E` | recipe | Edit source. Same target rules as `V`; root edits persist, non-root edits go to a temp file and are discarded. |
-| `m` | recipe (only bound if `md2ansi` importable) | Toggle md2ansi preview rendering. Drops preview cache. |
+| `m` | recipe (only bound if `md2ansi_lib` importable) | Toggle md2ansi preview rendering. Drops preview cache. |
 | `M` | recipe | View preview via external `$MD2ANSI` / `md2ansi` binary. Same plumbing as browse-claude `_action_md_preview`. |
 
 ### Multi-select semantics on `V` / `E`
@@ -476,7 +476,7 @@ No new tests this round.
 
 ## Risks & open questions
 
-- **Lazy continuation in list items**: md2ansi treats a deeper-indent
+- **Lazy continuation in list items**: md2ansi_lib treats a deeper-indent
   line as a list-continuation (still part of the same item). We
   inherit that, so a `more text` line indented two spaces under
   `- foo` belongs to `foo`'s range, not the tree. ✔
@@ -485,7 +485,7 @@ No new tests this round.
 - **Very large files**: parser does one `finditer` pass over the
   whole text; preview is O(slice). 100 KLOC tested in md2ansi's own
   rendering path — same regex, same budget.
-- **Tab-indented lists at 2-space convention**: md2ansi's
+- **Tab-indented lists at 2-space convention**: md2ansi_lib's
   `expandtabs(4)` is non-configurable; we inherit. Documented.
 - **Anchor name collision**: with two headings sharing a title (or
   matching the same prefix / substring tier), `FILE.md#<name>`

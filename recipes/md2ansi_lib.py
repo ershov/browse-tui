@@ -1088,7 +1088,7 @@ def md2ansi(text, current_style="0", line_width=0, cell_min_width=20, row_divide
 
 try:
     from browse_tui import register_plugin, PluginConfig
-    register_plugin(PluginConfig(name='md2ansi'))
+    register_plugin(PluginConfig(name='md2ansi_lib'))
 except ImportError:
     pass
 
