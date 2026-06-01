@@ -11,12 +11,18 @@ from test.unit._loader import load
 _data = load('_browse_tui_data', '030-data.py')
 _term = load('_browse_tui_term', '020-terminal.py')
 _state = load('_browse_tui_state', '040-state.py')
+_context = load('_browse_tui_context', '060-context.py')
 
 # Production builds resolve these via name shadowing in the concatenated
 # source; under tests we have to wire them in by hand.
 _state.Item = _data.Item
 _state.to_item = _data.to_item
 _state.notify_wake = _term.notify_wake
+# Lifecycle hooks build a Context via ``Browser._make_ctx_for_hook``; the
+# concatenated build resolves the bare ``Context`` name, but the isolated
+# test load has to inject it (and Context's own ``visible_items`` dep).
+_state.Context = _context.Context
+_context.visible_items = _state.visible_items
 
 
 # Re-export the names tests want.
@@ -25,6 +31,7 @@ BrowserConfig = _state.BrowserConfig
 Pending = _state.Pending
 State = _state.State
 Item = _data.Item
+Context = _context.Context
 
 
 def make_browser(**kw):

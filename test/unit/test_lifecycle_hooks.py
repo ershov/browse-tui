@@ -56,6 +56,9 @@ Item = _data.Item
 Context = _context.Context
 mark_cursor_changed = _state.mark_cursor_changed
 dispatch_key = _actions.dispatch_key
+complete = _state.complete
+clear_children = _state.clear_children
+upsert = _state.upsert
 
 
 def _seed(b, items):
@@ -695,6 +698,152 @@ class TestScopeReBaseline(unittest.TestCase):
             b.stop_workers()
 
 
+class TestOnChildrenLoaded(unittest.TestCase):
+    """``on_children_loaded(ctx, parent_ids)`` fires once per drain with the
+    list of parent ids whose ``get_children`` fetch SETTLED this drain.
+
+    These synchronous tests drive the two genuine-settlement sites by hand
+    — the ``complete`` op (``update_data`` / worker batch tail) and the
+    ``apply_children_results`` legacy deque (``set_children``) — and pin the
+    critical exclusion: ``clear_children`` also clears ``_loading`` but
+    DROPS the cache, so it must NOT fire. Worker-delivery timing lives in
+    ``test/async_/test_children_loaded.py``.
+    """
+
+    def test_complete_op_fires_with_parent(self):
+        # A ``complete`` op (the worker's batch tail) settles loading →
+        # fires once with the parent id; children are available.
+        fired = []
+        b = Browser(BrowserConfig(
+            _headless=True,
+            on_children_loaded=lambda ctx, pids: fired.append(list(pids))))
+        b._state._loading['p'] = True
+        b.update_data([upsert('c', 'p', title='C'), complete('p')])
+        b.drain_main_queue()
+        b._fire_children_loaded_if_pending()
+        self.assertEqual(fired, [['p']])
+
+    def test_complete_op_children_available_at_fire(self):
+        # At fire time ``ctx.cached_children(parent)`` is populated.
+        seen = []
+        b = Browser(BrowserConfig(
+            _headless=True,
+            on_children_loaded=lambda ctx, pids: seen.append(
+                {pid: ctx.cached_children(pid) for pid in pids})))
+        b._state._loading['p'] = True
+        b.update_data([upsert('c', 'p', title='C'), complete('p')])
+        b.drain_main_queue()
+        b._fire_children_loaded_if_pending()
+        self.assertEqual(len(seen), 1)
+        self.assertEqual([it.id for it in seen[0]['p']], ['c'])
+
+    def test_empty_complete_fires_with_empty_children(self):
+        # ``get_children`` returning ``[]`` settles via a bare
+        # ``complete(p)`` and a ``_children[p] = []`` cache entry (the
+        # real worker creates the latter in ``_post_children_delivery``;
+        # seeded here to model the full delivery). Fires with
+        # ``cached_children == []`` (not None). The worker-flow timing of
+        # this is pinned in ``test/async_/test_children_loaded.py``.
+        seen = []
+        b = Browser(BrowserConfig(
+            _headless=True,
+            on_children_loaded=lambda ctx, pids: seen.append(
+                {pid: ctx.cached_children(pid) for pid in pids})))
+        b._state._children['p'] = []        # what _post_children_delivery does
+        b._state._loading['p'] = True
+        b.update_data([complete('p')])
+        b.drain_main_queue()
+        b._fire_children_loaded_if_pending()
+        self.assertEqual(seen, [{'p': []}])
+
+    def test_apply_children_results_fires(self):
+        # The legacy ``set_children`` deque path settles via
+        # ``apply_children_results`` — it too must fire.
+        fired = []
+        b = Browser(BrowserConfig(
+            _headless=True,
+            on_children_loaded=lambda ctx, pids: fired.append(list(pids))))
+        b._state._loading['p'] = True
+        b.set_children('p', [Item(id='c')])
+        b.apply_children_results()
+        b._fire_children_loaded_if_pending()
+        self.assertEqual(fired, [['p']])
+
+    def test_clear_children_does_not_fire(self):
+        # ``clear_children`` sets ``_loading=False`` but DROPS the cache
+        # (cached_children → None). It is NOT a settlement → must not fire.
+        fired = []
+        b = Browser(BrowserConfig(
+            _headless=True,
+            on_children_loaded=lambda ctx, pids: fired.append(list(pids))))
+        # Seed a settled parent first, fire & drain it so the pending set
+        # is empty, then clear it.
+        b._state._loading['p'] = True
+        b.update_data([upsert('c', 'p'), complete('p')])
+        b.drain_main_queue()
+        b._fire_children_loaded_if_pending()
+        fired.clear()
+        b.update_data([clear_children('p')])
+        b.drain_main_queue()
+        b._fire_children_loaded_if_pending()
+        self.assertEqual(fired, [])
+        # And the cache really did revert to "not fetched".
+        self.assertIsNone(Context(b).cached_children('p'))
+
+    def test_batches_multiple_parents_in_one_drain(self):
+        # Several settlements before a drain coalesce into ONE call.
+        fired = []
+        b = Browser(BrowserConfig(
+            _headless=True,
+            on_children_loaded=lambda ctx, pids: fired.append(set(pids))))
+        b._state._loading.update({'p': True, 'q': True})
+        b.update_data([upsert('c', 'p'), complete('p'),
+                       upsert('d', 'q'), complete('q')])
+        b.drain_main_queue()
+        b._fire_children_loaded_if_pending()
+        self.assertEqual(len(fired), 1)
+        self.assertEqual(fired[0], {'p', 'q'})
+
+    def test_second_drain_does_not_refire(self):
+        # The pending set is drained on fire — a subsequent drain with no
+        # new settlement fires nothing.
+        fired = []
+        b = Browser(BrowserConfig(
+            _headless=True,
+            on_children_loaded=lambda ctx, pids: fired.append(list(pids))))
+        b._state._loading['p'] = True
+        b.update_data([upsert('c', 'p'), complete('p')])
+        b.drain_main_queue()
+        b._fire_children_loaded_if_pending()
+        b._fire_children_loaded_if_pending()
+        self.assertEqual(fired, [['p']])
+
+    def test_missing_handler_still_clears_pending(self):
+        # No handler installed: the pending set is still drained so a
+        # handler registered later never sees a stale historical settle.
+        b = Browser(BrowserConfig(_headless=True))
+        b._state._loading['p'] = True
+        b.update_data([complete('p')])
+        b.drain_main_queue()
+        self.assertEqual(b._children_loaded_pending, {'p'})
+        b._fire_children_loaded_if_pending()
+        self.assertEqual(b._children_loaded_pending, set())
+
+    def test_exception_routed_to_error(self):
+        def bad(ctx, pids):
+            raise RuntimeError('loaded boom')
+        b = Browser(BrowserConfig(_headless=True, on_children_loaded=bad))
+        b._state._loading['p'] = True
+        b.update_data([complete('p')])
+        b.drain_main_queue()
+        b._fire_children_loaded_if_pending()
+        b.drain_main_queue()
+        self.assertIn('loaded boom', b.error_text)
+        self.assertIn('on_children_loaded', b.error_text)
+        # Pending still cleared despite the throw.
+        self.assertEqual(b._children_loaded_pending, set())
+
+
 class TestDefaultsAreNoOp(unittest.TestCase):
 
     def test_no_hooks_no_explosion(self):
@@ -706,6 +855,8 @@ class TestDefaultsAreNoOp(unittest.TestCase):
         b._fire_selection_change()
         b._state.expanded = {'x'}
         b._fire_expand_collapse_if_pending()
+        b._children_loaded_pending = {'p'}
+        b._fire_children_loaded_if_pending()
         b._fire_on_quit()
 
 

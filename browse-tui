@@ -1510,6 +1510,15 @@ class State:
     # these slots before processing the batch.
     _preview_dirty: bool = False
     _preview_kicks: list = field(default_factory=list)
+    # Parents whose children fetch SETTLED during the current
+    # ``apply_ops`` / ``apply_children_results`` pass — recorded by
+    # ``_set_loading(..., settled=True)`` (the ``complete`` op tail and
+    # the legacy delivery deque). Collected on State so ``apply_ops``
+    # stays argument-pure; the Browser-level callers move these into
+    # ``_children_loaded_pending`` after the pass and reset the list
+    # before populating it. NOT touched by ``clear_children`` (which
+    # drops the cache) — see ``_set_loading``.
+    _settled_parents: list = field(default_factory=list)
 
 
 # ---- scope management ----------------------------------------------------
@@ -1677,6 +1686,29 @@ def _promote_synthetics(state: State, items):
         else:
             out.append(incoming)
     return out
+
+
+def _set_loading(state: State, parent_id, value, *, settled=False) -> None:
+    """Write ``state._loading[parent_id] = value``; the loading choke point.
+
+    ``settled=True`` marks a genuine fetch SETTLEMENT — children for
+    ``parent_id`` became available (the worker's ``complete`` op tail,
+    ``apply_children_results``) — and records the id on
+    ``state._settled_parents`` so the caller can move it into the
+    Browser's ``_children_loaded_pending`` set (drained once per tick by
+    ``_fire_children_loaded_if_pending``).
+
+    ``settled`` is deliberately NOT passed by ``clear_children`` /
+    ``incomplete`` / cache-invalidation: those clear loading but DROP (or
+    never had) the children, so firing ``on_children_loaded`` there would
+    violate the contract that ``ctx.cached_children(parent_id)`` is
+    populated at fire time. Callers that collect settlements reset
+    ``state._settled_parents`` before populating it (see ``apply_ops`` /
+    ``apply_children_results``).
+    """
+    state._loading[parent_id] = value
+    if settled:
+        state._settled_parents.append(parent_id)
 
 
 def cache_invalidate_subtree(state: State, item_id) -> None:
@@ -2434,7 +2466,11 @@ def _apply_clear_children(state: State, parent_id) -> bool:
     state._children.pop(parent_id, None)
     # Spec: "loading flag is reset accordingly" — we set False (the
     # parent is in a known not-loading state; any future fetch will
-    # flip it back to True via dispatch).
+    # flip it back to True via dispatch). NOT a settlement: the cache
+    # entry was just dropped above, so ``cached_children`` would be
+    # ``None`` — firing ``on_children_loaded`` here would break its
+    # "children present at fire time" contract. Hence the bare
+    # assignment (no ``_set_loading(..., settled=True)``).
     state._loading[parent_id] = False
     return had_entry or bool(children)
 
@@ -2536,6 +2572,11 @@ def apply_ops(state: State, ops, *, preview_ansi: bool = True) -> None:
     structural = False
     preview_dirty = False
     preview_kicks = []
+    # Reset the per-batch settlement list before processing so the
+    # caller reads only this batch's settled parents (mirrors the
+    # ``_preview_kicks`` reset above). ``_set_loading(..., settled=True)``
+    # — fired by the ``complete`` op below — appends to it.
+    state._settled_parents = []
     for op in ops:
         kind = op[0]
         if kind == 'upsert':
@@ -2564,7 +2605,10 @@ def apply_ops(state: State, ops, *, preview_ansi: bool = True) -> None:
                 structural = True
         elif kind == 'complete':
             _, parent_id = op
-            state._loading[parent_id] = False
+            # Genuine settlement: children are now available (the upserts
+            # in this same batch, or an empty list). Record so
+            # ``on_children_loaded`` fires for ``parent_id``.
+            _set_loading(state, parent_id, False, settled=True)
         elif kind == 'incomplete':
             _, parent_id = op
             state._loading[parent_id] = True
@@ -3738,6 +3782,7 @@ class BrowserConfig:
     on_selection_change: Optional[Callable] = None
     on_expand: Optional[Callable] = None
     on_collapse: Optional[Callable] = None
+    on_children_loaded: Optional[Callable] = None
     on_quit: Optional[Callable] = None
     _headless: bool = False
 
@@ -4011,13 +4056,19 @@ class Browser:
         # ``_fire_expand_collapse_if_pending``) — no mutation site is
         # instrumented, so every expand source (keyboard, ``ctx.expand``,
         # recursive actions, ``collapse_all``, startup) is caught.
-        # ``on_quit`` fires once during shutdown after the screen is
-        # restored.
+        # ``on_children_loaded`` fires once per drain with the parents
+        # whose ``get_children`` fetch SETTLED this drain (the two
+        # genuine-settlement sites — the ``complete`` op and
+        # ``apply_children_results`` — record into
+        # ``_children_loaded_pending``; ``clear_children`` deliberately
+        # does NOT, since it drops the cache). ``on_quit`` fires once
+        # during shutdown after the screen is restored.
         self._on_cursor_change = config.on_cursor_change
         self._on_scope_change = config.on_scope_change
         self._on_selection_change = config.on_selection_change
         self._on_expand = config.on_expand
         self._on_collapse = config.on_collapse
+        self._on_children_loaded = config.on_children_loaded
         self._on_quit = config.on_quit
         # Worker-slot registry for ``run_in_slot``. Each entry is the
         # currently-active CancellationToken for a named slot;
@@ -4034,6 +4085,12 @@ class Browser:
         # transition so per-scope set restores don't masquerade as
         # expands/collapses.
         self._last_expanded = set()
+        # Parents whose ``get_children`` fetch settled since the last
+        # ``_fire_children_loaded_if_pending`` drain. A set (not a diff)
+        # collected by the genuine-settlement sites; drained into one
+        # ``on_children_loaded(list)`` per tick. ``clear_children`` is
+        # excluded — it clears loading but drops the children.
+        self._children_loaded_pending = set()
         self._headless = config._headless
 
         # --- domain state ------------------------------------------------
@@ -4831,6 +4888,15 @@ class Browser:
             apply_ops(
                 self._state, ops_list, preview_ansi=self.preview_ansi,
             )
+
+            # Children-loaded settlement (#600). ``apply_ops`` recorded
+            # every parent whose ``complete`` op settled this batch on
+            # ``state._settled_parents``; move them into the drain-time
+            # pending set. ``_fire_children_loaded_if_pending`` delivers
+            # the batch as one ``on_children_loaded(list)`` per tick.
+            if self._state._settled_parents:
+                self._children_loaded_pending.update(
+                    self._state._settled_parents)
 
             # Preview-op side effects (#446). ``apply_ops`` left the
             # outcome on ``state._preview_dirty`` / ``state._preview_kicks``;
@@ -5748,6 +5814,34 @@ class Browser:
                     self.error(f'on_expand: {type(e).__name__}: {e}')
             self._last_expanded = set(expanded)
 
+    def _fire_children_loaded_if_pending(self) -> None:
+        """Fire ``on_children_loaded`` once with the parents that settled.
+
+        Drains ``_children_loaded_pending`` — the set populated by the
+        genuine-settlement sites (the ``complete`` op tail via
+        ``apply_ops``, and ``apply_children_results``) — into a single
+        ``on_children_loaded(list)`` call per drain. A full refresh that
+        refetches several expanded parents therefore delivers them
+        batched as their fetches settle in the same tick.
+
+        The pending set is ALWAYS cleared, even when no handler is
+        installed or the handler raises, so a handler registered later
+        never observes a stale historical settlement and a throw can't
+        wedge the set. Exceptions route to :meth:`error` (never crash
+        the loop), matching the other hooks. ``clear_children`` does not
+        populate the set, so a cache-drop never fires here.
+        """
+        if not self._children_loaded_pending:
+            return
+        parent_ids = list(self._children_loaded_pending)
+        self._children_loaded_pending.clear()
+        if self._on_children_loaded is None:
+            return
+        try:
+            self._on_children_loaded(self._make_ctx_for_hook(), parent_ids)
+        except Exception as e:
+            self.error(f'on_children_loaded: {type(e).__name__}: {e}')
+
     def _fire_on_quit(self) -> None:
         """Fire ``on_quit`` once during shutdown.
 
@@ -5796,6 +5890,11 @@ class Browser:
         cache when ``_notify`` is the only thing waking the loop.
         """
         n = 0
+        # Collect genuine settlements (#600) for this delivery pass.
+        # Reset before populating so we read only this pass's parents
+        # (the same discipline ``apply_ops`` uses); harvested into
+        # ``_children_loaded_pending`` after the loop.
+        self._state._settled_parents = []
         while self._children_results:
             id_, items = self._children_results.popleft()
             # Replace the cached list — drop the old entries from the
@@ -5815,11 +5914,17 @@ class Browser:
             # Worker delivered → no longer loading. Stays addressable
             # via ``_loading`` rather than implied membership in
             # ``_children_pending`` (foundation for ``update_data``).
-            self._state._loading[id_] = False
+            # ``settled=True``: the children list was just installed
+            # above, so this is a genuine settlement → fires
+            # ``on_children_loaded``.
+            _set_loading(self._state, id_, False, settled=True)
             mark_visible_dirty(self._state)
             for p in self._children_in_flight.pop(id_, []):
                 p._resolve()
             n += 1
+        # Move this pass's settlements into the drain-time pending set.
+        if self._state._settled_parents:
+            self._children_loaded_pending.update(self._state._settled_parents)
         if n:
             # Re-evaluate filter visibility — freshly-delivered items
             # are reachable now and need their ``_filter_hidden`` flags
@@ -7205,11 +7310,14 @@ class Browser:
 
                 # Lifecycle hooks fire once per drain in the documented
                 # order (spec "Ordering within a drain"): structure
-                # (on_collapse → on_expand) before cursor settling, so a
-                # cursor-change handler sees the post-expansion tree. (The
-                # later phases — children-loaded, scope, search/filter,
-                # resize — slot in here in the same order as they land.)
+                # (on_collapse → on_expand) then children-arrival
+                # (on_children_loaded) before cursor settling, so a
+                # cursor-change handler sees the post-expansion tree with
+                # freshly-delivered children accounted for. (The remaining
+                # phases — scope, search/filter, resize — slot in here in
+                # the same order as they land.)
                 self._fire_expand_collapse_if_pending()
+                self._fire_children_loaded_if_pending()
                 self._fire_cursor_change_if_pending()
 
                 # Resize flag — set by SIGWINCH handler in 020-terminal.
