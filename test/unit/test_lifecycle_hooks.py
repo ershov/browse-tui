@@ -533,14 +533,32 @@ class TestOnExpandCollapse(unittest.TestCase):
         finally:
             b.stop_workers()
 
-    def test_missing_handlers_are_silent(self):
+    def test_missing_handlers_skip_prep_no_snapshot(self):
+        # With BOTH on_expand and on_collapse unset (#627), the fire path
+        # early-returns BEFORE the set diff / snapshot — so ``_last_expanded``
+        # is NOT advanced. Hooks are construction-time-fixed, so a snapshot
+        # going stale while unset is harmless (matches on_cursor_change).
         b = self._tree()                 # no on_expand / on_collapse
+        try:
+            self.assertEqual(b._last_expanded, set())   # initial baseline
+            b._state.expanded = {'A'}
+            b._fire_expand_collapse_if_pending()
+            # Prep skipped → snapshot left at its initial value, NOT {'A'}.
+            self.assertEqual(b._last_expanded, set())
+        finally:
+            b.stop_workers()
+
+    def test_one_handler_set_still_runs_prep(self):
+        # The early-return needs BOTH unset; with only on_expand set the
+        # diff/snapshot still run (and a collapse with no on_collapse is a
+        # silent-but-snapshotted no-op).
+        ex = []
+        b = self._tree(on_expand=lambda ctx, ids: ex.append(list(ids)))
         try:
             b._state.expanded = {'A'}
             b._fire_expand_collapse_if_pending()
-            # Baseline still advances so the no-handler case can't leak a
-            # stale delta into a later fire.
-            self.assertEqual(b._last_expanded, {'A'})
+            self.assertEqual(ex, [['A']])
+            self.assertEqual(b._last_expanded, {'A'})   # prep ran
         finally:
             b.stop_workers()
 
@@ -818,14 +836,18 @@ class TestOnChildrenLoaded(unittest.TestCase):
         b._fire_children_loaded_if_pending()
         self.assertEqual(fired, [['p']])
 
-    def test_missing_handler_still_clears_pending(self):
-        # No handler installed: the pending set is still drained so a
-        # handler registered later never sees a stale historical settle.
+    def test_missing_handler_skips_harvest(self):
+        # No handler installed (#627): the settlement harvest is gated on
+        # ``_on_children_loaded is not None``, so the pending set stays EMPTY
+        # — no per-settlement set.update() work when nobody is listening.
+        # (``_set_loading(..., settled=True)`` still records into the cheap
+        # per-pass ``_settled_parents`` list; only the harvest is skipped.)
         b = Browser(BrowserConfig(_headless=True))
         b._state._loading['p'] = True
         b.update_data([complete('p')])
         b.drain_main_queue()
-        self.assertEqual(b._children_loaded_pending, {'p'})
+        self.assertEqual(b._children_loaded_pending, set())
+        # The fire path short-circuits on the empty set — still a no-op.
         b._fire_children_loaded_if_pending()
         self.assertEqual(b._children_loaded_pending, set())
 
@@ -915,14 +937,15 @@ class TestOnSearchChange(unittest.TestCase):
         b._fire_search_change_if_pending()
         self.assertEqual(fired, ['foo'])
 
-    def test_missing_handler_still_advances_baseline(self):
-        # No handler: the baseline still advances so a handler registered
-        # later never sees a stale historical delta.
+    def test_missing_handler_skips_prep_no_snapshot(self):
+        # No handler (#627): the fire path early-returns BEFORE the diff, so
+        # ``_last_search_query`` is NOT advanced. Acceptable because hooks
+        # are construction-time-fixed (matches on_cursor_change).
         b = Browser(BrowserConfig(_headless=True))
         b.set_search_query('x')
         b.drain_main_queue()
         b._fire_search_change_if_pending()
-        self.assertEqual(b._last_search_query, 'x')
+        self.assertEqual(b._last_search_query, '')   # snapshot left at init
 
     def test_exception_routed_to_error(self):
         def bad(ctx, q):
@@ -1013,12 +1036,15 @@ class TestOnFilterChange(unittest.TestCase):
         b._fire_filter_change_if_pending()
         self.assertEqual(fired, [])
 
-    def test_missing_handler_still_advances_baseline(self):
+    def test_missing_handler_skips_prep_no_snapshot(self):
+        # No handler (#627): the fire path early-returns BEFORE building the
+        # filters tuple, so ``_last_filters`` is NOT advanced. Acceptable
+        # because hooks are construction-time-fixed (matches on_cursor_change).
         b = Browser(BrowserConfig(_headless=True))
         b.set_filters(['z'])
         b.drain_main_queue()
         b._fire_filter_change_if_pending()
-        self.assertEqual(b._last_filters, ('z',))
+        self.assertEqual(b._last_filters, ())        # snapshot left at init
 
     def test_exception_routed_to_error(self):
         def bad(ctx, f):
@@ -1096,6 +1122,27 @@ class TestOnResize(unittest.TestCase):
             b._fire_resize_if_pending()       # _resize_pending is False
             self.assertEqual(fired, [])
             self.assertEqual(reads, [])
+        finally:
+            restore()
+
+    def test_missing_handler_skips_term_size_read_but_clears_flag(self):
+        # No on_resize (#627): even with the SIGWINCH flag staged, the fire
+        # path early-returns BEFORE reading term_size() (the syscall is
+        # skipped). The pending flag is still cleared so a single SIGWINCH
+        # never lingers, and ``_last_size`` is left untouched.
+        reads = []
+
+        def counting():
+            reads.append(1)
+            return (100, 30)
+        b = Browser(BrowserConfig(_headless=True))   # no on_resize
+        restore = self._stub_term_size(counting)
+        try:
+            b._resize_pending = True
+            b._fire_resize_if_pending()
+            self.assertEqual(reads, [])               # term_size NOT read
+            self.assertFalse(b._resize_pending)       # flag still cleared
+            self.assertIsNone(b._last_size)           # snapshot untouched
         finally:
             restore()
 

@@ -440,6 +440,8 @@ def _scope_down(ctx):
     # directly via the free ``scope_into(state, ...)`` above, so anchor
     # ``_last_expanded`` to the restored set (mirrors the Browser method)
     # — the restore is an ``on_scope_change`` event, not an expand.
+    # Intentionally left unconditional (not gated on a handler like the
+    # #627 fire-path skips): a scope keystroke is rare, not per drain.
     ctx._browser._last_expanded = set(state.expanded)
 
 
@@ -492,6 +494,8 @@ def _scope_up(ctx):
     b._fire_scope_change(ctx.scope, prev_scope_id, 'out')
     # Re-baseline the expand/collapse diff — symmetric with ``_scope_down``;
     # this handler restored the parent scope's expanded set directly.
+    # Intentionally left unconditional (not gated on a handler like the
+    # #627 fire-path skips): runs only on a rare scope keystroke.
     b._last_expanded = set(state.expanded)
 
 

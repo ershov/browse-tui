@@ -3777,8 +3777,11 @@ class Browser:
             # every parent whose ``complete`` op settled this batch on
             # ``state._settled_parents``; move them into the drain-time
             # pending set. ``_fire_children_loaded_if_pending`` delivers
-            # the batch as one ``on_children_loaded(list)`` per tick.
-            if self._state._settled_parents:
+            # the batch as one ``on_children_loaded(list)`` per tick. Gated
+            # on the handler (#627): with no listener the pending set stays
+            # empty and the fire short-circuits — no per-settlement update.
+            if (self._on_children_loaded is not None
+                    and self._state._settled_parents):
                 self._children_loaded_pending.update(
                     self._state._settled_parents)
 
@@ -4287,7 +4290,10 @@ class Browser:
             # drain-time diff would otherwise read as a burst of expands /
             # collapses. A scope transition is an ``on_scope_change``
             # event, not an expand — so anchor ``_last_expanded`` to the
-            # restored set and the next diff sees no delta.
+            # restored set and the next diff sees no delta. Intentionally
+            # left unconditional (not gated on a handler like the #627
+            # fire-path skips): scope transitions are rare, not per-drain,
+            # and this keeps the baseline correct if a handler is ever set.
             self._last_expanded = set(self._state.expanded)
         self.post(_do)
 
@@ -4332,7 +4338,9 @@ class Browser:
             # Re-baseline the expand/collapse diff — symmetric with
             # ``scope_into``. ``scope_out`` restored the parent scope's
             # expanded set; anchor ``_last_expanded`` to it so the restore
-            # doesn't masquerade as expands/collapses.
+            # doesn't masquerade as expands/collapses. Intentionally left
+            # unconditional (not gated on a handler like the #627 fire-path
+            # skips): runs only on a rare scope transition, not per drain.
             self._last_expanded = set(self._state.expanded)
         self.post(_do)
 
@@ -4669,18 +4677,26 @@ class Browser:
         that nets to no change fires nothing. ``on_collapse`` fires before
         ``on_expand`` per the documented drain order.
 
-        Unconditional (no pending flag): the diff runs every drain so the
-        many places that mutate ``state.expanded`` — including the direct
-        ``state.expanded.discard(...)`` in the actions layer — are caught
-        with no instrumentation at the mutation sites (the design intent;
-        the #500 failure mode prevented). The expanded set is small, so a
-        per-drain set diff is cheap.
+        No pending flag: when a handler is installed the diff runs every
+        drain so the many places that mutate ``state.expanded`` — including
+        the direct ``state.expanded.discard(...)`` in the actions layer —
+        are caught with no instrumentation at the mutation sites (the design
+        intent; the #500 failure mode prevented). The expanded set is small,
+        so a per-drain set diff is cheap.
 
-        ``_last_expanded`` is always re-snapshotted at the end, even when
-        no handler is installed, so a handler registered later never sees
-        a stale historical delta. (List order is unspecified — recipes
+        When BOTH ``on_expand`` and ``on_collapse`` are unset (#627) the
+        whole prep — the diff AND the ``set(expanded)`` snapshot — is
+        skipped, so ``_last_expanded`` is NOT re-snapshotted and may go
+        stale while there is no handler. That is fine: hooks are
+        construction-time-fixed (set via ``BrowserConfig`` / before
+        ``run()``), so the snapshot is only consulted once a handler exists,
+        and it's re-baselined on every scope transition. This matches
+        ``on_cursor_change``, which likewise doesn't advance
+        ``_last_cursor_id`` when unset. (List order is unspecified — recipes
         that need a stable order should sort.)
         """
+        if self._on_expand is None and self._on_collapse is None:
+            return
         expanded = self._state.expanded
         if expanded != self._last_expanded:
             removed = self._last_expanded - expanded
@@ -4735,21 +4751,24 @@ class Browser:
         coalesce to the final value; clearing to ``''`` is a real change
         and fires once; an identical re-set is a no-op.
 
-        Unconditional (no pending flag): the diff runs every drain so every
-        mutation source — live ``SEARCH_EDIT`` typing, commit,
-        ``set_search_query`` / ``clear_search`` — is caught without
-        instrumenting the mutation sites. ``_last_search_query`` is always
-        re-snapshotted, even with no handler installed, so a handler
-        registered later never sees a stale historical delta.
+        No pending flag: when a handler is installed the diff runs every
+        drain so every mutation source — live ``SEARCH_EDIT`` typing,
+        commit, ``set_search_query`` / ``clear_search`` — is caught without
+        instrumenting the mutation sites. When ``on_search_change`` is unset
+        (#627) the prep (the diff and the snapshot) is skipped entirely, so
+        ``_last_search_query`` is NOT re-snapshotted and may go stale; that
+        is fine because hooks are construction-time-fixed (matches
+        ``on_cursor_change``, which doesn't advance its snapshot when unset).
         """
+        if self._on_search_change is None:
+            return
         query = self._search_query
         if query != self._last_search_query:
             self._last_search_query = query
-            if self._on_search_change is not None:
-                try:
-                    self._on_search_change(self._make_ctx_for_hook(), query)
-                except Exception as e:
-                    self.error(f'on_search_change: {type(e).__name__}: {e}')
+            try:
+                self._on_search_change(self._make_ctx_for_hook(), query)
+            except Exception as e:
+                self.error(f'on_search_change: {type(e).__name__}: {e}')
 
     def _fire_filter_change_if_pending(self) -> None:
         """Fire ``on_filter_change`` once if the active filter tuple changed.
@@ -4760,17 +4779,22 @@ class Browser:
         re-snapshots. ``set_filters`` / ``add_filter`` / ``clear_filters``
         and the ``&`` edit/commit path all flow through this; an identical
         re-set is a no-op, and ``add_filter('')`` is a no-op because the
-        ``filters`` property drops empty strings. Same unconditional /
-        always-re-snapshot contract as ``_fire_search_change_if_pending``.
+        ``filters`` property drops empty strings. Same skip-when-unset
+        contract as ``_fire_search_change_if_pending``: when
+        ``on_filter_change`` is unset (#627) the prep — including building
+        ``tuple(self.filters)`` — is skipped, so ``_last_filters`` is NOT
+        re-snapshotted and may go stale; fine because hooks are
+        construction-time-fixed (matches ``on_cursor_change``).
         """
+        if self._on_filter_change is None:
+            return
         filters = tuple(self.filters)
         if filters != self._last_filters:
             self._last_filters = filters
-            if self._on_filter_change is not None:
-                try:
-                    self._on_filter_change(self._make_ctx_for_hook(), filters)
-                except Exception as e:
-                    self.error(f'on_filter_change: {type(e).__name__}: {e}')
+            try:
+                self._on_filter_change(self._make_ctx_for_hook(), filters)
+            except Exception as e:
+                self.error(f'on_filter_change: {type(e).__name__}: {e}')
 
     def _fire_resize_if_pending(self) -> None:
         """Fire ``on_resize`` once when an observed resize changed the size.
@@ -4782,15 +4806,22 @@ class Browser:
         from ``_last_size``, fires ``on_resize(ctx, cols, rows)`` and
         re-snapshots.
 
+        When ``on_resize`` is unset (#627) the pending flag is still cleared
+        (so a single SIGWINCH never lingers) but the method early-returns
+        BEFORE reading ``term_size()`` — the syscall and the snapshot are
+        skipped, so ``_last_size`` may go stale; fine because hooks are
+        construction-time-fixed (matches ``on_cursor_change``).
+
         ``term_size`` can be missing, raise, or return ``(0, 0)`` in a
         headless / no-tty context (mirrors ``_clamp_split`` /
         ``_list_pane_height_safe``); in any of those cases we don't fire
-        garbage dimensions and leave ``_last_size`` untouched. The pending
-        flag is always cleared so a single SIGWINCH never re-fires.
+        garbage dimensions and leave ``_last_size`` untouched.
         """
         if not self._resize_pending:
             return
         self._resize_pending = False
+        if self._on_resize is None:
+            return
         ts = globals().get('term_size')
         if ts is None:
             return
@@ -4803,11 +4834,10 @@ class Browser:
         size = (cols, rows)
         if size != self._last_size:
             self._last_size = size
-            if self._on_resize is not None:
-                try:
-                    self._on_resize(self._make_ctx_for_hook(), cols, rows)
-                except Exception as e:
-                    self.error(f'on_resize: {type(e).__name__}: {e}')
+            try:
+                self._on_resize(self._make_ctx_for_hook(), cols, rows)
+            except Exception as e:
+                self.error(f'on_resize: {type(e).__name__}: {e}')
 
     def _fire_on_quit(self) -> None:
         """Fire ``on_quit`` once during shutdown.
@@ -4890,7 +4920,9 @@ class Browser:
                 p._resolve()
             n += 1
         # Move this pass's settlements into the drain-time pending set.
-        if self._state._settled_parents:
+        # Gated on the handler (#627): no listener → pending stays empty.
+        if (self._on_children_loaded is not None
+                and self._state._settled_parents):
             self._children_loaded_pending.update(self._state._settled_parents)
         if n:
             # Re-evaluate filter visibility — freshly-delivered items
