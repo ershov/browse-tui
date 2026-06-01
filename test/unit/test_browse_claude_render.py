@@ -5999,5 +5999,247 @@ class TestAskUserQuestion(unittest.TestCase):
         self.assertFalse(self.r._is_voice(rec))
 
 
+class TestOnExpandJumpComposition(unittest.TestCase):
+    """``_on_expand`` + ``_on_children_loaded`` jump-to-latest-voice.
+
+    The right-arrow expand half of the old ``_action_tree_right`` moved
+    onto the ``on_expand`` / ``on_children_loaded`` lifecycle hooks so
+    the post-expand jump fires for EVERY expansion source, not just the
+    keyboard. The composition splits on whether the expanded node's
+    children are cached at fire time:
+
+      * cached  → ``_on_expand`` jumps to the latest voice immediately;
+      * uncached→ ``_on_expand`` parks the id and ``_on_children_loaded``
+        performs the jump once the async fetch settles.
+
+    These tests drive the recipe's hook callbacks directly against a
+    fake ctx (recording ``cursor_to`` + serving a controllable
+    ``cached_children``) and a real on-disk session so the module-level
+    ``get_children`` / ``_latest_voice_among_children`` resolve. The
+    end-to-end keyboard path is covered by the tmux UI suite
+    (``test/ui/test_recipe_browse_claude.py``).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def setUp(self):
+        # Isolate the module-level pending set across tests.
+        self.r._AWAITING_VOICE_JUMP.clear()
+        self.addCleanup(self.r._AWAITING_VOICE_JUMP.clear)
+        self.r._TREE_CACHE.clear()
+        self.addCleanup(self.r._TREE_CACHE.clear)
+        # Tree mode is the default; pin it so the fixture's turn-root
+        # children resolve the same way regardless of test order.
+        self._saved_tree_mode = self.r._TREE_MODE
+        self.r._TREE_MODE = True
+        self.addCleanup(setattr, self.r, '_TREE_MODE', self._saved_tree_mode)
+        # ``_invalidate_if_cross_file`` reads the module ``_BROWSER``;
+        # install a recorder so we can assert the cross-file upgrade.
+        self._saved_browser = self.r._BROWSER
+        self.addCleanup(setattr, self.r, '_BROWSER', self._saved_browser)
+
+    class _AllExpanded:
+        """Stand-in for ``state.expanded`` where every id is expanded.
+
+        Default for tests that don't exercise the collapse-before-settle
+        guard, so ``_on_children_loaded``'s still-expanded check passes.
+        """
+
+        def __contains__(self, _id):
+            return True
+
+    def _make_ctx(self, *, cached, expanded=None):
+        """Fake ctx recording ``cursor_to`` + serving ``cached_children``.
+
+        ``cached`` maps an id to the value ``cached_children`` should
+        return (``None`` = fetch in flight, a list = available).
+        ``expanded`` is the set exposed as ``ctx.state.expanded`` (the
+        recipe's still-expanded guard reads it); ``None`` means "treat
+        everything as expanded". Also installs a recording ``_BROWSER``
+        so cross-file invalidation is observable via ``invalidated``.
+        """
+        cursor_to_calls = []
+        invalidated = []
+        expanded_set = self._AllExpanded() if expanded is None else expanded
+
+        class _FakeBrowser:
+            def invalidate_preview(self, id_):
+                invalidated.append(id_)
+
+        self.r._BROWSER = _FakeBrowser()
+
+        class _State:
+            expanded = expanded_set
+
+        class _Ctx:
+            state = _State()
+
+            def cached_children(self, id_):
+                val = cached.get(id_, None)
+                return None if val is None else list(val)
+
+            def cursor_to(self, id_):
+                cursor_to_calls.append(id_)
+
+        return _Ctx(), cursor_to_calls, invalidated
+
+    def _write_session(self, tmp):
+        """A 2-voice turn: user FIRST_VOICE, a tool_use, asst LAST_VOICE.
+
+        Tree-mode listing for ``<sess>#prompt:0`` is::
+
+            #0 user FIRST_VOICE | #1 tool_use | #2 asst LAST_VOICE
+
+        so ``_latest_voice_among_children('<sess>#prompt:0')`` is the
+        final assistant text leaf, ``<sess>#2`` — the deterministic
+        jump target used by these tests.
+        """
+        import json as _json
+        sess = os.path.join(tmp, 's.jsonl')
+        recs = [
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'FIRST_VOICE'}},
+            {'type': 'assistant', 'uuid': 'a1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'name': 'Bash',
+                  'input': {'command': 'x'}}]}},
+            {'type': 'assistant', 'uuid': 'a2',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'text', 'text': 'LAST_VOICE'}]}},
+        ]
+        with open(sess, 'w') as f:
+            for r in recs:
+                f.write(_json.dumps(r) + '\n')
+        return sess
+
+    def test_uncached_expand_defers_then_children_loaded_jumps(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._write_session(tmp)
+            turn = f'{sess}#prompt:0'
+            # Children NOT cached at expand time → defer, no jump yet.
+            ctx, cursor_to_calls, _ = self._make_ctx(cached={turn: None})
+            self.r._on_expand(ctx, [turn])
+            self.assertEqual(cursor_to_calls, [],
+                             'uncached expand must not jump immediately')
+            self.assertIn(turn, self.r._AWAITING_VOICE_JUMP,
+                          'uncached expand must park the id as pending')
+            # Fetch settles → the children-loaded hook performs the jump
+            # and clears the pending entry.
+            self.r._on_children_loaded(ctx, [turn])
+            self.assertEqual(cursor_to_calls, [f'{sess}#2'],
+                             'children-loaded must jump to the latest voice')
+            self.assertNotIn(turn, self.r._AWAITING_VOICE_JUMP,
+                             'pending id must be discarded after the jump')
+
+    def test_cached_expand_jumps_immediately(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._write_session(tmp)
+            turn = f'{sess}#prompt:0'
+            # Children already cached (non-None) → jump now, no defer.
+            ctx, cursor_to_calls, _ = self._make_ctx(
+                cached={turn: ['sentinel']})
+            self.r._on_expand(ctx, [turn])
+            self.assertEqual(cursor_to_calls, [f'{sess}#2'],
+                             'cached expand must jump to the latest voice now')
+            self.assertNotIn(turn, self.r._AWAITING_VOICE_JUMP,
+                             'cached expand must not park a pending id')
+
+    def test_children_loaded_for_non_pending_parent_does_not_jump(self):
+        # A settlement that the recipe never deferred (a background
+        # refresh / tail refetch of an already-expanded parent) must
+        # NOT yank the cursor.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._write_session(tmp)
+            turn = f'{sess}#prompt:0'
+            ctx, cursor_to_calls, _ = self._make_ctx(cached={turn: ['x']})
+            # _AWAITING_VOICE_JUMP is empty (cleared in setUp).
+            self.r._on_children_loaded(ctx, [turn])
+            self.assertEqual(cursor_to_calls, [],
+                             'children-loaded for a non-deferred parent '
+                             'must not move the cursor')
+
+    def test_collapse_before_settle_discards_without_jumping(self):
+        # Expand an UNCACHED umbrella (id parked), then collapse it
+        # before the async fetch settles. The framework still fires
+        # on_children_loaded when the fetch lands (settlement is
+        # unconditional). The hook must NOT jump onto a now-hidden
+        # child — it must drop the stale entry and skip the cursor_to.
+        # Without the still-expanded guard this jumps onto a hidden row
+        # (sticky anchor); without unconditional discard the stale id
+        # would also leak.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._write_session(tmp)
+            turn = f'{sess}#prompt:0'
+            # Expanded set starts with the turn (it was just expanded).
+            expanded = {turn}
+            ctx, cursor_to_calls, _ = self._make_ctx(
+                cached={turn: None}, expanded=expanded)
+            # Uncached expand → parked, no jump yet.
+            self.r._on_expand(ctx, [turn])
+            self.assertEqual(cursor_to_calls, [])
+            self.assertIn(turn, self.r._AWAITING_VOICE_JUMP)
+            # User collapses the turn before its fetch delivers.
+            expanded.discard(turn)
+            # Fetch settles → framework fires on_children_loaded anyway.
+            self.r._on_children_loaded(ctx, [turn])
+            # No jump (parent no longer expanded), and the entry is gone.
+            self.assertEqual(cursor_to_calls, [],
+                             'must not jump onto a child of a collapsed row')
+            self.assertNotIn(turn, self.r._AWAITING_VOICE_JUMP,
+                             'stale pending id must be discarded even when '
+                             'the jump is skipped')
+
+    def test_cross_file_id_invalidated_on_expand(self):
+        # Expanding a cross-file row (bare .jsonl / #agent:) drops its
+        # cached preview so it upgrades from the metadata card to the
+        # heavy umbrella cascade; non-cross-file ids are left alone.
+        ctx, _, invalidated = self._make_ctx(
+            cached={'/x/s.jsonl': ['k'],
+                    '/x/s.jsonl#agent:AB': ['k'],
+                    '/x/s.jsonl#prompt:0': ['k']})
+        self.r._on_expand(ctx, ['/x/s.jsonl',
+                                '/x/s.jsonl#agent:AB',
+                                '/x/s.jsonl#prompt:0'])
+        self.assertEqual(invalidated,
+                         ['/x/s.jsonl', '/x/s.jsonl#agent:AB'],
+                         'only cross-file ids should be invalidated')
+
+    def test_jump_no_voice_among_children_is_noop(self):
+        # _jump_to_latest_voice no-ops when there is no voice at this
+        # level: a bare leaf id has no children, so the latest-voice
+        # lookup returns None and no cursor_to is issued.
+        import tempfile, json as _json
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = os.path.join(tmp, 'm.jsonl')
+            recs = [
+                {'type': 'user', 'uuid': 'u1',
+                 'message': {'role': 'user', 'content': 'V'}},
+            ]
+            with open(sess, 'w') as f:
+                for r in recs:
+                    f.write(_json.dumps(r) + '\n')
+            ctx, cursor_to_calls, _ = self._make_ctx(cached={})
+            # A bare message-leaf id resolves to no children at all.
+            self.r._jump_to_latest_voice(ctx, f'{sess}#0')
+            self.assertEqual(cursor_to_calls, [])
+
+    def test_jump_skips_when_latest_voice_is_self(self):
+        # If the only voice among children is the row itself (latest ==
+        # item_id), the guard skips the redundant cursor_to.
+        ctx, cursor_to_calls, _ = self._make_ctx(cached={})
+        saved = self.r._latest_voice_among_children
+        self.r._latest_voice_among_children = lambda _id: 'SAME'
+        self.addCleanup(setattr, self.r,
+                        '_latest_voice_among_children', saved)
+        self.r._jump_to_latest_voice(ctx, 'SAME')
+        self.assertEqual(cursor_to_calls, [])
+
+
 if __name__ == '__main__':
     unittest.main()
