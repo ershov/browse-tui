@@ -1,4 +1,22 @@
 
+## Development
+
+### Branching
+
+Trivial tasks can be done right in the main branch.
+Big tasks are done in a git worktree.
+We never make changes in a regular branch.
+If unsure whether the task is big enought for a worktree development, as the user.
+
+### Code review
+
+Use planning-with-plan skill to create implementation plan. Use dispatch-with-plan skill to dispatch tasks to subagents.
+
+For non-trivial tasks, launch a review subagent to assess the change. The focus should be on:
+1. Does the change achieve the stated goal?
+2. Does it do so in a reasonably simple way i.e. not overengineered?
+3. Is there any stale code left?
+
 ## Task tracking
 
 Use the `plan` CLI for ALL task tracking.
