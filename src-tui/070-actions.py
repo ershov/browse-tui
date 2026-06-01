@@ -421,6 +421,9 @@ def _scope_down(ctx):
         return
     if not getattr(item, 'has_children', False):
         return  # don't scope into leaves; phase-2 simplification
+    # Capture the scope we're leaving (``None`` at root) before the
+    # transition mutates the stack, to thread into the hook.
+    prev_scope_id = ctx.scope
     scope_into(state, item.id)
     # Land the cursor on the scope row at the top of the new view.
     state.cursor = 0
@@ -431,7 +434,7 @@ def _scope_down(ctx):
         # shows ``loading…`` until results land.
         ctx.expand(item.id)
     ctx._browser._needs_redraw.add('all')
-    ctx._browser._fire_scope_change()
+    ctx._browser._fire_scope_change(ctx.scope, prev_scope_id, 'in')
 
 
 def _scope_up(ctx):
@@ -454,6 +457,9 @@ def _scope_up(ctx):
     """
     b = ctx._browser
     state = b._state
+    # Capture the scope we're leaving (``None`` at root, though that
+    # path early-returns below) before popping the stack.
+    prev_scope_id = ctx.scope
     popped = scope_out(state)
     if popped is None:
         return  # already at root
@@ -477,7 +483,7 @@ def _scope_up(ctx):
         state.cursor = 0
         b.cursor_to(popped)
     b._needs_redraw.add('all')
-    b._fire_scope_change()
+    b._fire_scope_change(ctx.scope, prev_scope_id, 'out')
 
 
 def _select_toggle_down(ctx):

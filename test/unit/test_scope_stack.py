@@ -33,6 +33,12 @@ _actions.scope_into = _state.scope_into
 _actions.scope_out = _state.scope_out
 _actions.current_scope = _state.current_scope
 
+# on_scope_change builds a Context when fired; wire it like the other
+# hook tests do (concatenated builds resolve ``Context`` via merge).
+_context = load('_browse_tui_context', '060-context.py')
+_state.Context = _context.Context
+_context.visible_items = _state.visible_items
+
 Item = _data.Item
 State = _state.State
 Browser = _state.Browser
@@ -46,8 +52,6 @@ dispatch_key = _actions.dispatch_key
 
 def _ctx_for(browser):
     """Build a real Context for the given browser (matches test_actions)."""
-    _context = load('_browse_tui_context', '060-context.py')
-    _context.visible_items = _state.visible_items
     return _context.Context(browser)
 
 
@@ -296,6 +300,26 @@ class TestAltDownDispatch(unittest.TestCase):
         finally:
             b.stop_workers()
 
+    def test_alt_down_fires_scope_change_with_direction_in(self):
+        # The keyboard scope-in path delivers the uniform payload
+        # (scope_id, prev_scope_id, direction) just like the
+        # programmatic Browser.scope_into.
+        fired = []
+        b = _make_browser(on_scope_change=lambda ctx, sid, prev, d:
+                          fired.append((sid, prev, d)))
+        try:
+            b._state._children[None] = [
+                Item(id='A', has_children=True),
+                Item(id='B'),
+            ]
+            b._state._children['A'] = [Item(id='a1')]
+            ctx = _ctx_for(b)
+            dispatch_key(b, ctx, 'alt-down')
+            b.drain_main_queue()
+            self.assertEqual(fired, [('A', None, 'in')])
+        finally:
+            b.stop_workers()
+
 
 class TestAltUpDispatch(unittest.TestCase):
     """Dispatching 'alt-up' pops scope and re-positions the cursor."""
@@ -327,6 +351,25 @@ class TestAltUpDispatch(unittest.TestCase):
             dispatch_key(b, ctx, 'alt-up')
             self.assertEqual(b._state.scope_stack, [])
             self.assertEqual(b._state.cursor, 1)
+        finally:
+            b.stop_workers()
+
+    def test_alt_up_fires_scope_change_with_direction_out(self):
+        # Keyboard scope-out to root delivers (None, popped, 'out').
+        fired = []
+        b = _make_browser(on_scope_change=lambda ctx, sid, prev, d:
+                          fired.append((sid, prev, d)))
+        try:
+            b._state._children[None] = [
+                Item(id='A', has_children=True),
+                Item(id='B'),
+            ]
+            b._state._children['A'] = [Item(id='a1')]
+            scope_into(b._state, 'A')
+            ctx = _ctx_for(b)
+            dispatch_key(b, ctx, 'alt-up')
+            b.drain_main_queue()
+            self.assertEqual(fired, [(None, 'A', 'out')])
         finally:
             b.stop_workers()
 

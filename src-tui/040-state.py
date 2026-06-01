@@ -4150,6 +4150,9 @@ class Browser:
             state = self._state
             if state.scope_stack and state.scope_stack[-1] == id_:
                 return
+            # Capture the scope we're leaving (``None`` at root) before
+            # the transition mutates the stack, to thread into the hook.
+            prev_scope_id = self.scope
             scope_into(state, id_)
             state.cursor = 0
             if id_ not in state._children:
@@ -4170,7 +4173,7 @@ class Browser:
                 )
             self._needs_redraw.add('all')
             mark_cursor_changed(self)
-            self._fire_scope_change()
+            self._fire_scope_change(self.scope, prev_scope_id, 'in')
         self.post(_do)
 
     def scope_out(self) -> None:
@@ -4184,6 +4187,9 @@ class Browser:
         """
         def _do():
             state = self._state
+            # Capture the scope we're leaving (``None`` at root, though
+            # that path early-returns below) before popping the stack.
+            prev_scope_id = self.scope
             popped = scope_out(state)
             if popped is None:
                 return
@@ -4207,7 +4213,7 @@ class Browser:
                 state.cursor = 0
             self._needs_redraw.add('all')
             mark_cursor_changed(self)
-            self._fire_scope_change()
+            self._fire_scope_change(self.scope, prev_scope_id, 'out')
         self.post(_do)
 
     # ---- expansion helpers -----------------------------------------------
@@ -4494,25 +4500,41 @@ class Browser:
             return
         self._last_cursor_id = cur_id
         try:
-            self._on_cursor_change(self._make_ctx_for_hook())
+            self._on_cursor_change(self._make_ctx_for_hook(), cur_id)
         except Exception as e:
             self.error(f'on_cursor_change: {type(e).__name__}: {e}')
 
-    def _fire_scope_change(self) -> None:
-        """Fire ``on_scope_change`` after a scope transition."""
+    def _fire_scope_change(self, scope_id=None, prev_scope_id=None,
+                           direction=None) -> None:
+        """Fire ``on_scope_change`` after a scope transition.
+
+        ``scope_id`` is the new current scope id (``None`` at root),
+        ``prev_scope_id`` the scope just left (``None`` at root), and
+        ``direction`` is ``'in'`` for a ``scope_into`` / ``'out'`` for a
+        ``scope_out``. The Browser-level ``scope_into`` / ``scope_out``
+        capture these and thread them through; a bare ``_fire_scope_change()``
+        (no transition context) passes ``None`` for all three.
+        """
         if self._on_scope_change is None:
             return
         try:
-            self._on_scope_change(self._make_ctx_for_hook())
+            self._on_scope_change(self._make_ctx_for_hook(),
+                                  scope_id, prev_scope_id, direction)
         except Exception as e:
             self.error(f'on_scope_change: {type(e).__name__}: {e}')
 
     def _fire_selection_change(self) -> None:
-        """Fire ``on_selection_change`` if installed."""
+        """Fire ``on_selection_change`` if installed.
+
+        Passes the resulting selected ids as a list. ``state.selected``
+        is a set; we sort so the payload is stable across fires (the
+        underlying set order is unspecified).
+        """
         if self._on_selection_change is None:
             return
         try:
-            self._on_selection_change(self._make_ctx_for_hook())
+            ids = sorted(self._state.selected)
+            self._on_selection_change(self._make_ctx_for_hook(), ids)
         except Exception as e:
             self.error(f'on_selection_change: {type(e).__name__}: {e}')
 
@@ -4526,7 +4548,7 @@ class Browser:
             return
         cb, self._on_quit = self._on_quit, None  # arm once
         try:
-            cb(self._make_ctx_for_hook())
+            cb(self._make_ctx_for_hook(), self._quit_code)
         except Exception:
             pass
 
