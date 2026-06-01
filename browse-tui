@@ -7936,12 +7936,13 @@ class Browser:
 
     @classmethod
     def from_flat_tree(cls, rows, *, root_id: Any = None,
+                       path_sep: Optional[str] = None,
                        **browser_kwargs) -> 'Browser':
         """Build a Browser whose ``_children`` cache is pre-populated from ``rows``.
 
         Each row may be ``Item``, ``str``, ``tuple``, or ``dict`` (per
         ``to_item`` rules). Hierarchy detection looks at the coerced
-        Items:
+        Items, most-explicit-wins:
 
         * **parent-pointer mode** -- if any row has a ``parent`` field
           (or attribute) other than ``None``, every row is grouped under
@@ -7952,13 +7953,18 @@ class Browser:
           ``(depth, item)``: a row at depth ``d+1`` is a child of the
           most recent row at depth ``d``; depth-0 rows go under
           ``root_id``.
-        * **flat mode** -- if neither hint is present, all rows become
-          direct children of ``root_id``.
+        * **path-split mode** -- otherwise, if ``path_sep`` is set, each
+          row's ``id`` is split on it (via ``expand_path_rows``) into a
+          tree of prefix nodes; the resulting rows are then grouped by
+          the synthesised ``parent`` exactly as in parent-pointer mode.
+        * **flat mode** -- if no hint is present, all rows become direct
+          children of ``root_id``.
 
         The synthesised ``get_children`` reads from the pre-populated
         cache, so no user callback runs at runtime. Recipes wanting
         true laziness should pass their own ``get_children`` instead.
         """
+        rows = list(rows)  # materialise: path mode re-iterates raw rows
         items = [to_item(r) for r in rows]
         has_parent = any(
             getattr(it, 'parent', None) is not None for it in items
@@ -7967,10 +7973,15 @@ class Browser:
             not has_parent
             and any(getattr(it, 'depth', None) is not None for it in items)
         )
+        # Path-split is a derivation rule, less explicit than a per-row
+        # parent/depth column; it only runs when neither is present.
+        use_path = not has_parent and not has_depth and path_sep is not None
+        if use_path:
+            items = [to_item(r) for r in expand_path_rows(rows, path_sep)]
 
         children_by_parent: dict = {}
 
-        if has_parent:
+        if has_parent or use_path:
             for it in items:
                 p = getattr(it, 'parent', None)
                 if p is None:
@@ -7992,6 +8003,16 @@ class Browser:
         else:
             if items:
                 children_by_parent[root_id] = list(items)
+
+        if use_path:
+            # In path-split mode ``has_children`` is derived from the
+            # synthesised tree, ignoring any incoming column: a node is
+            # expandable iff it appears as a parent of some other node.
+            # Assign unconditionally so a carried ``True`` on a leaf is
+            # overridden to ``False`` (the tree is fully known and eager,
+            # so a leaf has nothing to lazily expand into).
+            for it in items:
+                it.has_children = it.id in children_by_parent
 
         # Synthesise the get_children callback to read from the cache.
         # Captures children_by_parent rather than self._state._children
