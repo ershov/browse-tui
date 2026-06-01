@@ -34,6 +34,11 @@ Custom actions on top of the framework defaults:
       ``\\n===== <filename> =====\\n`` separator between groups.
   E   edit the source for cursor/selection in ``$EDITOR``. Same
       per-file-root / cross-file rules as V.
+  →   expand the cursor row (overrides the framework default); when
+      the row is a file whose only child is a heading, that heading
+      is auto-expanded too, so a single-heading document reveals its
+      sections in one keystroke. The same cascade runs on the
+      single-file startup auto-expand.
 
 Usage:  browse-md [-l] FILE.md[#anchor] [FILE.md[#anchor] ...]
 """
@@ -630,6 +635,31 @@ def _classify_id(node_id):
         if path in _FILES:
             return ('content', path)
     return ('unknown', None)
+
+
+def _lone_heading_child_id(file_root_id):
+    """Return a file-root's sole child id iff that child is a heading.
+
+    Markdown files usually wrap their whole body under a single
+    top-level heading (commonly a ``# Title`` h1), so expanding the
+    file row reveals just that one heading — a dead-end that needs a
+    second expand before the sections beneath it show. When
+    ``file_root_id`` names a file (a key in ``_FILES``) whose per-file
+    root has exactly one child and that child is a heading of any level
+    (h1..h6), return the child's id so the caller can auto-expand it
+    alongside the file row.
+
+    Returns ``None`` for every other shape: an id that isn't a file
+    root, a root with zero or multiple children, or a sole child that
+    isn't a heading (e.g. a list item surfaced under ``-l``).
+    """
+    fs = _FILES.get(file_root_id)
+    if fs is None:
+        return None
+    children = fs.file_root._children
+    if len(children) == 1 and children[0].kind == 'heading':
+        return children[0].id
+    return None
 
 
 def _node_at_line(n, file_state=None):
@@ -1342,6 +1372,44 @@ def _action_edit_source(ctx):
     _run_source_command(ctx, 'EDITOR', 'vim')
 
 
+def _action_expand(ctx):
+    """``→`` — expand the cursor row, auto-expanding a file's lone heading.
+
+    Overrides the framework default (registered on the same ``right``
+    key, which wins per ``build_keymap``). It reproduces both default
+    behaviours:
+
+      * a collapsed expandable row is expanded;
+      * an already-expanded row steps the cursor onto its first child.
+
+    The browse-md addition lives in the collapse→expand branch: when
+    the row just expanded is a file whose only child is a heading (see
+    ``_lone_heading_child_id``), that heading is expanded too, so a
+    single-heading document reveals its real sections in one keystroke
+    instead of two. The child id comes from the pre-built tree, so the
+    two expands can be issued back-to-back without waiting on the
+    file-root's children to be cached — the final expanded-set / render
+    is order-independent.
+    """
+    cur = ctx.cursor
+    if cur is None or not getattr(cur, 'has_children', False):
+        return
+    target_id = cur.id
+    if target_id not in ctx.state.expanded:
+        # Collapsed → expand. ``autoscroll=True`` matches the default's
+        # scroll-to-fit on user-driven expansion; the cascade expand
+        # leaves it off so it doesn't reset that goal.
+        ctx.expand(target_id, autoscroll=True)
+        cascade_id = _lone_heading_child_id(target_id)
+        if cascade_id is not None:
+            ctx.expand(cascade_id)
+        return
+    # Already expanded → step onto the first child (framework default).
+    item = _BY_ID.get(target_id)
+    if item is not None and item._children:
+        ctx.cursor_to(item._children[0].id)
+
+
 _HELP_INTRO = """\
 browse-md — markdown browser for one or more files.
 
@@ -1507,6 +1575,12 @@ def main():
                           _action_view_source, 'none'))
     actions.append(Action('E', 'Edit source for cursor/selection in $EDITOR',
                           _action_edit_source, 'none'))
+    # Override the built-in Right-arrow so expanding a file whose only
+    # child is a heading auto-expands that heading too (see
+    # ``_action_expand`` / ``_lone_heading_child_id``).
+    actions.append(Action('right',
+                          "Expand; auto-expand a file's lone heading",
+                          _action_expand, 'cursor'))
     b = Browser(BrowserConfig(
         title='browse-md',
         show_children_pane=False,
@@ -1529,6 +1603,13 @@ def main():
     # (ticket #566).
     if auto_expand_id is not None:
         b.expand(auto_expand_id)
+        # Same lone-heading cascade as the Right-arrow override
+        # (``_action_expand``): when the single file wraps everything
+        # under one heading, expand that heading at startup too so its
+        # sections are visible without a second keystroke.
+        cascade_id = _lone_heading_child_id(auto_expand_id)
+        if cascade_id is not None:
+            b.expand(cascade_id)
     sys.exit(b.run())
 
 

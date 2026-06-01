@@ -3030,5 +3030,202 @@ class TestClassifyId(_MultiCaseBase):
             self.r._classify_id('garbage'), ('unknown', None))
 
 
+class _SingleFileBase(unittest.TestCase):
+    """Write one on-disk markdown fixture and reparse it through the recipe.
+
+    Snapshots the module globals ``_reparse`` scribbles on and restores
+    them in ``tearDown`` so a failing assert doesn't bleed into a
+    sibling suite — same discipline as ``_MultiCaseBase``.
+    """
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self._saved = {
+            '_FILES': dict(self.r._FILES),
+            '_INPUT_FILES': list(self.r._INPUT_FILES),
+            '_BY_ID': dict(self.r._BY_ID),
+            '_FILE_TEXT': self.r._FILE_TEXT,
+            '_BY_LINE': dict(self.r._BY_LINE),
+            '_LINES_SORTED': list(self.r._LINES_SORTED),
+            '_ROOT_PATH': self.r._ROOT_PATH,
+            '_ANCHOR': self.r._ANCHOR,
+        }
+        self._paths = []
+
+    def tearDown(self):
+        import os
+        for k, v in self._saved.items():
+            setattr(self.r, k, v)
+        for p in self._paths:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+    def _load(self, text):
+        """Write ``text`` to a temp .md, reparse, return its abs path."""
+        import tempfile
+        f = tempfile.NamedTemporaryFile(
+            'w', suffix='.md', delete=False, encoding='utf-8')
+        f.write(text)
+        f.close()
+        self._paths.append(f.name)
+        self.r._INPUT_FILES = [(f.name, '')]
+        self.r._reparse()
+        return f.name
+
+
+class TestLoneHeadingChildId(_SingleFileBase):
+    """``_lone_heading_child_id`` — file-root sole-heading-child detection."""
+
+    def test_single_h1_child_returns_its_id(self):
+        # ``# Title`` wraps a single ``## Section`` — the file root has
+        # exactly one child (the h1), so the helper returns the h1 id.
+        path = self._load('# Title\n## Section\nbody\n')
+        self.assertEqual(
+            self.r._lone_heading_child_id(path), f'{path}#0')
+
+    def test_single_h2_child_returns_its_id(self):
+        # Any heading level qualifies, not just h1 — a file whose sole
+        # child is an ``## h2`` still gets the cascade.
+        path = self._load('## Only\nbody\n')
+        self.assertEqual(
+            self.r._lone_heading_child_id(path), f'{path}#0')
+
+    def test_two_top_level_headings_returns_none(self):
+        path = self._load('# A\n# B\n')
+        self.assertIsNone(self.r._lone_heading_child_id(path))
+
+    def test_single_list_item_child_returns_none(self):
+        # A lone non-heading child (list item) does not qualify.
+        path = self._load('- only item\n')
+        root = self.r._FILES[path].file_root
+        self.assertEqual(len(root._children), 1)
+        self.assertEqual(root._children[0].kind, 'list-item')
+        self.assertIsNone(self.r._lone_heading_child_id(path))
+
+    def test_no_children_returns_none(self):
+        path = self._load('plain body, no headings\n')
+        self.assertIsNone(self.r._lone_heading_child_id(path))
+
+    def test_unknown_id_returns_none(self):
+        self._load('# Title\n## Section\n')
+        self.assertIsNone(self.r._lone_heading_child_id('/no/such.md'))
+
+
+class _ExpandCtx:
+    """Recorder for ``ctx`` in ``_action_expand`` tests.
+
+    Mirrors the slice of the Context surface the handler touches:
+    ``cursor`` (Item or None), ``state.expanded`` (set), ``expand`` and
+    ``cursor_to``. Calls are recorded for assertion.
+    """
+
+    def __init__(self, cursor, expanded=()):
+        self._cursor = cursor
+        self.state = types.SimpleNamespace(expanded=set(expanded))
+        self.expand_calls = []
+        self.cursor_to_calls = []
+
+    @property
+    def cursor(self):
+        return self._cursor
+
+    def expand(self, id, on_complete=None, autoscroll=False):
+        self.expand_calls.append((id, autoscroll))
+
+    def cursor_to(self, id, on_complete=None):
+        self.cursor_to_calls.append(id)
+
+
+class TestActionExpand(_SingleFileBase):
+    """``_action_expand`` — Right-arrow override with lone-heading cascade."""
+
+    def test_collapsed_file_lone_heading_expands_both(self):
+        path = self._load('# Title\n## Section\nbody\n')
+        root = self.r._FILES[path].file_root
+        ctx = _ExpandCtx(root, expanded=())
+        self.r._action_expand(ctx)
+        # File row expanded (autoscroll on) + its lone heading child
+        # (no autoscroll, so it doesn't fight the file-row scroll goal).
+        self.assertEqual(
+            ctx.expand_calls, [(path, True), (f'{path}#0', False)])
+        self.assertEqual(ctx.cursor_to_calls, [])
+
+    def test_collapsed_file_two_headings_expands_only_file(self):
+        path = self._load('# A\n# B\n')
+        root = self.r._FILES[path].file_root
+        ctx = _ExpandCtx(root, expanded=())
+        self.r._action_expand(ctx)
+        self.assertEqual(ctx.expand_calls, [(path, True)])
+        self.assertEqual(ctx.cursor_to_calls, [])
+
+    def test_already_expanded_steps_to_first_child(self):
+        path = self._load('# Title\n## Section\nbody\n')
+        root = self.r._FILES[path].file_root
+        ctx = _ExpandCtx(root, expanded=(path,))
+        self.r._action_expand(ctx)
+        # Already expanded → no new expand; cursor steps onto first child.
+        self.assertEqual(ctx.expand_calls, [])
+        self.assertEqual(ctx.cursor_to_calls, [f'{path}#0'])
+
+    def test_non_expandable_cursor_noop(self):
+        path = self._load('# Title\n## Section\n')
+        leaf = self.r._BY_ID[f'{path}#1']  # ``## Section`` — no children
+        self.assertFalse(leaf.has_children)
+        ctx = _ExpandCtx(leaf, expanded=())
+        self.r._action_expand(ctx)
+        self.assertEqual(ctx.expand_calls, [])
+        self.assertEqual(ctx.cursor_to_calls, [])
+
+    def test_no_cursor_noop(self):
+        self._load('# Title\n## Section\n')
+        ctx = _ExpandCtx(None, expanded=())
+        self.r._action_expand(ctx)
+        self.assertEqual(ctx.expand_calls, [])
+        self.assertEqual(ctx.cursor_to_calls, [])
+
+
+class TestStartupLoneHeadingCascade(unittest.TestCase):
+    """``main()`` startup auto-expand cascades into a file's lone heading."""
+
+    def setUp(self):
+        self.r = _load_recipe()
+
+    def _write(self, text):
+        import os
+        import tempfile
+        f = tempfile.NamedTemporaryFile(
+            'w', suffix='.md', delete=False, encoding='utf-8')
+        f.write(text)
+        f.close()
+        self.addCleanup(os.unlink, f.name)
+        return f.name
+
+    def _run_main(self, path):
+        import contextlib
+        import io
+        self.r.sys.argv[:] = ['browse-md', path]
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            try:
+                self.r.main()
+            except (SystemExit, AttributeError):
+                pass
+        return self.r._BROWSER
+
+    def test_single_heading_file_expands_file_and_heading(self):
+        path = self._write('# Title\n## Section\nbody\n')
+        b = self._run_main(path)
+        ids = [c[0] for c in b.expand_calls]
+        self.assertEqual(ids, [path, f'{path}#0'])
+
+    def test_multi_heading_file_expands_only_file(self):
+        path = self._write('# A\n# B\n')
+        b = self._run_main(path)
+        ids = [c[0] for c in b.expand_calls]
+        self.assertEqual(ids, [path])
+
+
 if __name__ == '__main__':
     unittest.main()
