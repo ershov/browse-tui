@@ -7416,15 +7416,25 @@ class Browser:
                 self._update_preview_for_cursor()
                 self._update_children_for_cursor()
 
-                # Lifecycle hooks fire once per drain in the documented
-                # order (spec "Ordering within a drain"): geometry
-                # (on_resize) and input state (on_search_change →
-                # on_filter_change) first since they may reshape the visible
-                # tree, then structure (on_collapse → on_expand), then
-                # children-arrival (on_children_loaded) before cursor
-                # settling, so a cursor-change handler sees the
-                # post-expansion tree with freshly-delivered children
-                # accounted for. (on_resize consumes the ``_resize_pending``
+                # Post-drain lifecycle-hook settle pass. NOTE: this is
+                # only PART of the hook firing — ``on_scope_change`` and
+                # ``on_selection_change`` already fired synchronously at
+                # their mutation sites during the ``drain_main_queue``
+                # above (``scope_into`` / ``scope_out`` and the selection
+                # ops call ``_fire_*`` inline). The hooks below are the
+                # ones that diff / collect state across the whole drain and
+                # so must fire after it settles, each at most once per tick.
+                #
+                # The single ordering guarantee recipes may rely on is that
+                # ``on_cursor_change`` fires LAST, after expansion has
+                # settled, so a cursor-change handler sees the post-
+                # expansion tree with freshly-delivered children accounted
+                # for. The order of the rest is an implementation detail
+                # (not a contract): geometry (on_resize) and input state
+                # (on_search_change → on_filter_change) first since they may
+                # reshape the visible tree, then structure (on_collapse →
+                # on_expand), then children-arrival (on_children_loaded),
+                # then the cursor. (on_resize consumes the ``_resize_pending``
                 # flag latched at the SIGWINCH observation points below, so
                 # a resize observed this iteration fires on the next drain.)
                 self._fire_resize_if_pending()

@@ -389,16 +389,29 @@ settles — the correct "children reloaded" signal.
 
 ### Ordering within a drain
 
-When several hooks are pending in one drain they fire in a fixed
-order after `apply_ops` / cursor settling: `on_resize` →
-`on_search_change` → `on_filter_change` → `on_collapse` → `on_expand`
-→ `on_children_loaded` → `on_scope_change` → `on_cursor_change` →
-`on_selection_change`. Rationale: geometry and input-state first (they
-may reshape the visible tree), then structure, then children arrival,
-then cursor/selection settling last so a cursor-change handler sees
-the post-expansion tree. The exact order is documented and
-test-pinned; recipes should not depend on cross-hook ordering beyond
-what is specified.
+The hooks do **not** all fire from one ordered post-drain pass, and
+the original "fixed order" wording overstated the contract. As
+implemented (`src-tui/040-state.py`), the firing splits in two:
+
+- **`on_scope_change` and `on_selection_change` fire synchronously at
+  their mutation sites**, inside `drain_main_queue` — `scope_into` /
+  `scope_out` call `_fire_scope_change` directly after the transition
+  (and re-baseline `_last_expanded` there), and each selection mutation
+  calls `_fire_selection_change` as it lands.
+- **`on_resize`, `on_search_change`, `on_filter_change`, `on_collapse`,
+  `on_expand`, `on_children_loaded`, `on_cursor_change`** fire in a
+  post-drain settle pass (the `_fire_*_if_pending` block), in that
+  listed order: geometry and input-state first (they may reshape the
+  visible tree), then structure, then children arrival, then the cursor
+  last.
+
+**The contract recipes may rely on:** `on_cursor_change` fires **last,
+after expansion has settled** — a cursor-change handler always sees the
+post-expansion tree with freshly-delivered children accounted for.
+Each hook fires at most once per logical change per drain. All other
+cross-hook ordering is **unspecified** — recipes must not depend on it
+(in particular, the relative order of the inline scope / selection
+fires versus the post-drain pass is not guaranteed and may change).
 
 ### Error handling
 
