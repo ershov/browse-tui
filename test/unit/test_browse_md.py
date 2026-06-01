@@ -3113,81 +3113,101 @@ class TestLoneHeadingChildId(_SingleFileBase):
         self.assertIsNone(self.r._lone_heading_child_id('/no/such.md'))
 
 
-class _ExpandCtx:
-    """Recorder for ``ctx`` in ``_action_expand`` tests.
+class _CascadeCtx:
+    """Recorder for ``ctx`` in ``_on_expand`` unit tests.
 
-    Mirrors the slice of the Context surface the handler touches:
-    ``cursor`` (Item or None), ``state.expanded`` (set), ``expand`` and
-    ``cursor_to``. Calls are recorded for assertion.
+    The ``on_expand`` hook only ever calls ``ctx.expand(cascade_id)``;
+    this stub records those calls so the per-id cascade decision can be
+    asserted in isolation, without standing up a real Browser. The
+    full-stack verification (that the recursive fire actually lands the
+    heading in ``state.expanded``) lives in ``TestOnExpandCascadeLive``.
     """
 
-    def __init__(self, cursor, expanded=()):
-        self._cursor = cursor
-        self.state = types.SimpleNamespace(expanded=set(expanded))
+    def __init__(self):
         self.expand_calls = []
-        self.cursor_to_calls = []
-
-    @property
-    def cursor(self):
-        return self._cursor
 
     def expand(self, id, on_complete=None, autoscroll=False):
         self.expand_calls.append((id, autoscroll))
 
-    def cursor_to(self, id, on_complete=None):
-        self.cursor_to_calls.append(id)
 
+class TestOnExpand(_SingleFileBase):
+    """``_on_expand(ctx, ids)`` — the lone-heading cascade hook.
 
-class TestActionExpand(_SingleFileBase):
-    """``_action_expand`` — Right-arrow override with lone-heading cascade."""
+    Unit-level coverage of the per-id decision. The hook replaced the
+    old ``_action_expand`` right-arrow override: the expand itself (and
+    the already-expanded step-into-first-child gesture) is now the
+    framework default ``_nav_right``; only the lone-heading auto-expand
+    is the recipe's, and it rides ``on_expand`` so it fires for every
+    expansion source (keyboard, programmatic, startup).
+    """
 
-    def test_collapsed_file_lone_heading_expands_both(self):
+    def test_lone_heading_id_cascades_to_child(self):
+        # Expanding a file whose sole child is a heading expands that
+        # heading too. The cascade expand uses the default autoscroll
+        # (False) so it doesn't park a scroll goal.
         path = self._load('# Title\n## Section\nbody\n')
-        root = self.r._FILES[path].file_root
-        ctx = _ExpandCtx(root, expanded=())
-        self.r._action_expand(ctx)
-        # File row expanded (autoscroll on) + its lone heading child
-        # (no autoscroll, so it doesn't fight the file-row scroll goal).
-        self.assertEqual(
-            ctx.expand_calls, [(path, True), (f'{path}#0', False)])
-        self.assertEqual(ctx.cursor_to_calls, [])
+        ctx = _CascadeCtx()
+        self.r._on_expand(ctx, [path])
+        self.assertEqual(ctx.expand_calls, [(f'{path}#0', False)])
 
-    def test_collapsed_file_two_headings_expands_only_file(self):
+    def test_two_top_level_headings_no_cascade(self):
+        # A file with two top-level headings has no lone-heading child.
         path = self._load('# A\n# B\n')
-        root = self.r._FILES[path].file_root
-        ctx = _ExpandCtx(root, expanded=())
-        self.r._action_expand(ctx)
-        self.assertEqual(ctx.expand_calls, [(path, True)])
-        self.assertEqual(ctx.cursor_to_calls, [])
+        ctx = _CascadeCtx()
+        self.r._on_expand(ctx, [path])
+        self.assertEqual(ctx.expand_calls, [])
 
-    def test_already_expanded_steps_to_first_child(self):
+    def test_non_file_id_no_cascade(self):
+        # An id that just expanded but is a heading (not a file root)
+        # never qualifies, so nothing cascades.
         path = self._load('# Title\n## Section\nbody\n')
-        root = self.r._FILES[path].file_root
-        ctx = _ExpandCtx(root, expanded=(path,))
-        self.r._action_expand(ctx)
-        # Already expanded → no new expand; cursor steps onto first child.
+        ctx = _CascadeCtx()
+        self.r._on_expand(ctx, [f'{path}#0'])
         self.assertEqual(ctx.expand_calls, [])
-        self.assertEqual(ctx.cursor_to_calls, [f'{path}#0'])
 
-    def test_non_expandable_cursor_noop(self):
-        path = self._load('# Title\n## Section\n')
-        leaf = self.r._BY_ID[f'{path}#1']  # ``## Section`` — no children
-        self.assertFalse(leaf.has_children)
-        ctx = _ExpandCtx(leaf, expanded=())
-        self.r._action_expand(ctx)
+    def test_cascade_id_does_not_re_cascade(self):
+        # The follow-on expand of the lone heading re-fires on_expand
+        # with that heading's id; its own child is a section, not a
+        # lone-heading file, so the cascade terminates (no further
+        # expand). This is what bounds the recursion.
+        path = self._load('# Title\n## Section\nbody\n')
+        ctx = _CascadeCtx()
+        self.r._on_expand(ctx, [f'{path}#0'])  # the cascade target
         self.assertEqual(ctx.expand_calls, [])
-        self.assertEqual(ctx.cursor_to_calls, [])
 
-    def test_no_cursor_noop(self):
-        self._load('# Title\n## Section\n')
-        ctx = _ExpandCtx(None, expanded=())
-        self.r._action_expand(ctx)
-        self.assertEqual(ctx.expand_calls, [])
-        self.assertEqual(ctx.cursor_to_calls, [])
+    def test_batch_cascades_each_qualifying_id(self):
+        # ``ids`` is a list (a multi-node expand burst). Each qualifying
+        # file root in the batch cascades independently. Load both files
+        # in one reparse so ``_FILES`` holds both roots at once.
+        import tempfile
+        paths = []
+        for body in ('# One\n## S1\n', '# Two\n## S2\n'):
+            f = tempfile.NamedTemporaryFile(
+                'w', suffix='.md', delete=False, encoding='utf-8')
+            f.write(body)
+            f.close()
+            self._paths.append(f.name)
+            paths.append(f.name)
+        self.r._INPUT_FILES = [(p, '') for p in paths]
+        self.r._reparse()
+        p1, p2 = paths
+        ctx = _CascadeCtx()
+        self.r._on_expand(ctx, [p1, p2])
+        self.assertEqual(
+            set(ctx.expand_calls), {(f'{p1}#0', False), (f'{p2}#0', False)})
 
 
-class TestStartupLoneHeadingCascade(unittest.TestCase):
-    """``main()`` startup auto-expand cascades into a file's lone heading."""
+class TestStartupAutoExpand(unittest.TestCase):
+    """``main()`` posts the single-file startup auto-expand.
+
+    ``main()`` issues exactly one ``b.expand(file_root)`` for the
+    single-file no-anchor case. The lone-heading cascade is no longer
+    duplicated here — it rides the ``on_expand`` hook, which the real
+    Browser fires for this very expand. (The test stub does not run
+    hooks, so only the file-root expand is recorded here; the cascade's
+    end result is verified against a real Browser in
+    ``TestOnExpandCascadeLive``.)
+    """
 
     def setUp(self):
         self.r = _load_recipe()
@@ -3214,17 +3234,201 @@ class TestStartupLoneHeadingCascade(unittest.TestCase):
                 pass
         return self.r._BROWSER
 
-    def test_single_heading_file_expands_file_and_heading(self):
+    def test_single_file_posts_file_root_expand(self):
         path = self._write('# Title\n## Section\nbody\n')
         b = self._run_main(path)
         ids = [c[0] for c in b.expand_calls]
-        self.assertEqual(ids, [path, f'{path}#0'])
+        # Just the file-root expand; the cascade is the hook's job now.
+        self.assertEqual(ids, [path])
+        # And on_expand is wired into the config so the hook can run.
+        self.assertIs(b.config.on_expand, self.r._on_expand)
 
-    def test_multi_heading_file_expands_only_file(self):
+    def test_multi_heading_file_posts_file_root_expand(self):
         path = self._write('# A\n# B\n')
         b = self._run_main(path)
         ids = [c[0] for c in b.expand_calls]
         self.assertEqual(ids, [path])
+
+
+def _load_framework():
+    """Load + wire the real ``src-tui`` modules for a live Browser.
+
+    Mirrors the cross-module name injection in
+    ``test/unit/test_lifecycle_hooks.py`` — the production single-file
+    build resolves these names by concatenation, so a per-file load has
+    to staple them together by hand. Returns the loaded ``term`` /
+    ``data`` / ``state`` / ``render`` / ``context`` / ``actions``
+    modules. Loaded lazily (inside the live test) so the rest of this
+    file, which deliberately stubs ``browse_tui``, is untouched.
+    """
+    from test.unit._loader import load
+    term = load('_md_live_term', '020-terminal.py')
+    data = load('_md_live_data', '030-data.py')
+    state = load('_md_live_state', '040-state.py')
+    render = load('_md_live_render', '050-render.py')
+    context = load('_md_live_context', '060-context.py')
+    actions = load('_md_live_actions', '070-actions.py')
+
+    state.Item = data.Item
+    state.to_item = data.to_item
+    state.notify_wake = term.notify_wake
+    state.Context = context.Context          # hooks build a Context
+    render.Item = data.Item
+    render.PreviewRender = data.PreviewRender
+    render.VisibleEntry = state.VisibleEntry
+    context.visible_items = state.visible_items
+    # Names the keyboard handlers (dispatch_key / _nav_right / …) resolve
+    # at run-time by concatenation in the production build.
+    actions.write = term.write
+    actions.visible_items = state.visible_items
+    actions.mark_visible_dirty = state.mark_visible_dirty
+    actions.current_scope = state.current_scope
+    actions.mark_cursor_changed = state.mark_cursor_changed
+    actions.Mode = state.Mode
+    actions.scope_into = state.scope_into
+    actions.scope_out = state.scope_out
+    return term, data, state, render, context, actions
+
+
+class TestOnExpandCascadeLive(unittest.TestCase):
+    """End-to-end: the ``on_expand`` cascade against a real Browser.
+
+    Builds an actual framework ``Browser`` wired with the recipe's
+    ``get_children`` and ``on_expand=_on_expand``, then drives an expand
+    headlessly (post-queue drain + the ``_fire_expand_collapse_if_pending``
+    settle pass, the way ``test_lifecycle_hooks`` does). Verifies the
+    cascade's whole point: expanding a file-root whose sole child is a
+    heading lands BOTH the file-root and that heading in
+    ``state.expanded`` — the duplicated startup logic and the right-arrow
+    override are gone, yet the behaviour survives via the single hook.
+    """
+
+    def setUp(self):
+        self.r = _load_recipe()
+        (self._term, self._data, self._fwstate, self._render,
+         self._fwcontext, self._fwactions) = _load_framework()
+        self.Browser = self._fwstate.Browser
+        self.BrowserConfig = self._fwstate.BrowserConfig
+        self.Context = self._fwcontext.Context
+
+    def _load_md(self, text):
+        """Write ``text`` to a temp .md, reparse the recipe, return path."""
+        import os
+        import tempfile
+        f = tempfile.NamedTemporaryFile(
+            'w', suffix='.md', delete=False, encoding='utf-8')
+        f.write(text)
+        f.close()
+        self.addCleanup(os.unlink, f.name)
+        self.r._INPUT_FILES = [(f.name, '')]
+        self.r._reparse()
+        return f.name
+
+    def _browser_for(self, path):
+        """Real Browser over the recipe tree with the cascade hook wired.
+
+        Children are pre-seeded into the Browser's cache (from the
+        recipe's own ``get_children``) so every expand resolves
+        synchronously without a worker — the cascade then completes
+        purely through the drain / fire pumping below.
+        """
+        b = self.Browser(self.BrowserConfig(
+            _headless=True,
+            root_id=None,
+            get_children=self.r.get_children,
+            on_expand=self.r._on_expand,
+        ))
+        # Seed the framework cache from the recipe tree so expansion is
+        # synchronous (top-level probe + every node with children).
+        s = b._state
+        s._children[None] = list(self.r.get_children(None))
+        for node_id, item in self.r._BY_ID.items():
+            if getattr(item, 'has_children', False):
+                s._children[node_id] = list(self.r.get_children(node_id))
+        b.drain_main_queue()
+        return b
+
+    def _pump(self, b):
+        """Drain + fire until the expanded set stops growing.
+
+        The cascade needs two cycles: drain N fires ``on_expand`` for the
+        file-root, whose handler posts ``ctx.expand(heading)``; drain N+1
+        applies that and fires ``on_expand`` for the heading (which does
+        not cascade further). Loop until a cycle adds nothing.
+        """
+        for _ in range(8):
+            before = set(b._state.expanded)
+            b.drain_main_queue()
+            b._fire_expand_collapse_if_pending()
+            if set(b._state.expanded) == before:
+                break
+
+    def test_expanding_file_root_cascades_to_lone_heading(self):
+        path = self._load_md('# Title\n## Section\nbody\n')
+        b = self._browser_for(path)
+        try:
+            self.assertEqual(b._state.expanded, set())   # clean baseline
+            b.expand(path)                               # user/programmatic
+            self._pump(b)
+            # BOTH the file-root AND its lone heading end up expanded.
+            self.assertIn(path, b._state.expanded)
+            self.assertIn(f'{path}#0', b._state.expanded)
+            self.assertEqual(b._state.expanded, {path, f'{path}#0'})
+        finally:
+            b.stop_workers()
+
+    def test_startup_expand_before_run_cascades(self):
+        # The startup path: ``b.expand(file_root)`` issued before the
+        # loop runs is seen by the first drain (``_last_expanded`` starts
+        # empty) and the cascade fires from there — the single code path
+        # that replaced the duplicated startup block.
+        path = self._load_md('# Title\n## Section\nbody\n')
+        b = self._browser_for(path)
+        try:
+            self.assertEqual(b._last_expanded, set())
+            b.expand(path)
+            self._pump(b)
+            self.assertEqual(b._state.expanded, {path, f'{path}#0'})
+        finally:
+            b.stop_workers()
+
+    def test_two_headings_no_cascade(self):
+        # A file with two top-level headings: the file-root expands, but
+        # there is no lone heading to cascade into.
+        path = self._load_md('# A\n# B\n')
+        b = self._browser_for(path)
+        try:
+            b.expand(path)
+            self._pump(b)
+            self.assertEqual(b._state.expanded, {path})
+        finally:
+            b.stop_workers()
+
+    def test_already_expanded_step_into_first_child(self):
+        # The step-into-first-child gesture is the framework default
+        # ``_nav_right`` now (the recipe no longer overrides ``→``).
+        # Re-pressing ``→`` on an already-expanded row moves the cursor
+        # onto the first child row and fires NO further expand.
+        actions = self._fwactions
+        path = self._load_md('# Title\n## Section\nbody\n')
+        b = self._browser_for(path)
+        try:
+            # Start from the fully-cascaded state, cursor on the file row.
+            b.expand(path)
+            self._pump(b)
+            b._state.cursor = 0
+            self._fwstate.mark_cursor_changed(b)
+            b.drain_main_queue()
+            expanded_before = set(b._state.expanded)
+            ctx = self.Context(b)
+            self.assertTrue(actions.dispatch_key(b, ctx, 'right'))
+            b.drain_main_queue()
+            b._fire_expand_collapse_if_pending()
+            # Cursor advanced to the first child; expanded set unchanged.
+            self.assertEqual(b._state.cursor, 1)
+            self.assertEqual(b._state.expanded, expanded_before)
+        finally:
+            b.stop_workers()
 
 
 if __name__ == '__main__':
