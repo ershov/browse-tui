@@ -92,6 +92,32 @@ class TestArgParser(unittest.TestCase):
         self.assertIn('--preview-ansi', help_text)
         self.assertIn('--no-preview-ansi', help_text)
 
+    def test_children_pane_default_true(self):
+        args, _ = _cli.parse_args([])
+        self.assertTrue(args.children_pane)
+
+    def test_no_children_pane_flag_sets_false(self):
+        args, _ = _cli.parse_args(['--no-children-pane'])
+        self.assertFalse(args.children_pane)
+
+    def test_children_pane_flag_sets_true(self):
+        # Positive form mainly useful for overriding a recipe-side
+        # config that turned the pane off; CLI default is already True.
+        args, _ = _cli.parse_args(['--children-pane'])
+        self.assertTrue(args.children_pane)
+
+    def test_multi_select_default_true(self):
+        args, _ = _cli.parse_args([])
+        self.assertTrue(args.multi_select)
+
+    def test_no_multi_select_flag_sets_false(self):
+        args, _ = _cli.parse_args(['--no-multi-select'])
+        self.assertFalse(args.multi_select)
+
+    def test_multi_select_flag_sets_true(self):
+        args, _ = _cli.parse_args(['--multi-select'])
+        self.assertTrue(args.multi_select)
+
     def test_initial_scope(self):
         args, _ = _cli.parse_args(['--initial-scope', 'x'])
         self.assertEqual(args.initial_scope, 'x')

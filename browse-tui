@@ -14107,16 +14107,21 @@ def build_argparser() -> argparse.ArgumentParser:
                         'flag, the pane is shown when --preview-cmd '
                         '(or the recipe) supplies a preview source, '
                         'and hidden otherwise.')
-    p.add_argument('--no-children-pane', action='store_true',
-                   help='Start with children-grid pane hidden.')
+    p.add_argument('--children-pane', dest='children_pane', default=True,
+                   action=argparse.BooleanOptionalAction,
+                   help='Show (--children-pane, default) or hide '
+                        '(--no-children-pane) the children-grid pane '
+                        'at startup.')
     p.add_argument('--preview-ansi', default=True,
                    action=argparse.BooleanOptionalAction,
                    help='Honour ANSI SGR escape sequences in the '
                         'preview pane (default: enabled). Use '
                         '--no-preview-ansi to strip colours from '
                         'preview output. Toggled at runtime with R.')
-    p.add_argument('--no-multi-select', action='store_true',
-                   help='Disable selection.')
+    p.add_argument('--multi-select', dest='multi_select', default=True,
+                   action=argparse.BooleanOptionalAction,
+                   help='Enable (--multi-select, default) or disable '
+                        '(--no-multi-select) multi-row selection.')
     p.add_argument('--list-size', metavar='N|N%', default=None,
                    help='Initial list-pane size. Either an integer line '
                         'count (interpreted relative to startup terminal '
@@ -15157,10 +15162,10 @@ def _build_lazy_browser(args, fields, record_sep, *, split='h'):
         root_id=args.root_id,
         initial_scope=args.initial_scope,
         show_preview=args.preview,
-        show_children_pane=not args.no_children_pane,
+        show_children_pane=args.children_pane,
         preview_ansi=args.preview_ansi,
         list_ratio=_resolve_list_size(args.list_size),
-        multi_select=not args.no_multi_select,
+        multi_select=args.multi_select,
         on_enter=args.on_enter,
         print_format=args.print_format,
         help_intro=_resolve_help_text(args.help_intro) if args.help_intro else None,
@@ -15219,10 +15224,10 @@ def _build_eager_browser(args, fields, record_sep, *, split='h'):
         title=args.title,
         initial_scope=args.initial_scope,
         show_preview=args.preview,
-        show_children_pane=not args.no_children_pane,
+        show_children_pane=args.children_pane,
         preview_ansi=args.preview_ansi,
         list_ratio=_resolve_list_size(args.list_size),
-        multi_select=not args.no_multi_select,
+        multi_select=args.multi_select,
         on_enter=args.on_enter,
         print_format=args.print_format,
         help_intro=_resolve_help_text(args.help_intro) if args.help_intro else None,
