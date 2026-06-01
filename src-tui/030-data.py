@@ -1,5 +1,6 @@
 """browse-tui: data layer (Item type, coercion, caches)."""
 
+import dataclasses
 from collections import namedtuple
 from dataclasses import dataclass, field
 from typing import Any
@@ -187,3 +188,106 @@ def to_item(x: Any) -> Item:
         f'to_item: unsupported type {type(x).__name__}; '
         f'expected Item, str, tuple, or dict'
     )
+
+
+def _split_path_row(row: Any):
+    """Extract ``(id, extras, explicit_title, title)`` from a raw row.
+
+    Runs *before* ``to_item`` coercion so an explicit ``title`` can be
+    told apart from the ``str(id)`` default. ``extras`` are the carried
+    metadata fields (everything but ``id``/``title``) destined for the
+    leaf. ``title`` is meaningful only when ``explicit_title`` is True.
+    Mirrors ``to_item``'s accepted shapes.
+    """
+    if isinstance(row, Item):
+        extras = {'tag': row.tag, 'tag_style': row.tag_style}
+        extras.update(_item_extras(row))
+        return row.id, extras, row.title != str(row.id), row.title
+    if isinstance(row, str):
+        return row, {}, False, None
+    if isinstance(row, tuple):
+        if not 1 <= len(row) <= 6:
+            raise TypeError(
+                f'expand_path_rows: tuple must have 1-6 elements, '
+                f'got {len(row)}'
+            )
+        # Positional (id, title, tag, tag_style, has_children, hidden);
+        # has_children/hidden are dropped (structure is derived).
+        extras = dict(zip(('tag', 'tag_style'), row[2:4]))
+        title = row[1] if len(row) >= 2 else None
+        return row[0], extras, len(row) >= 2, title
+    if isinstance(row, dict):
+        if 'id' not in row:
+            raise TypeError("expand_path_rows: dict must contain 'id' key")
+        extras = {k: v for k, v in row.items() if k != 'id'}
+        explicit_title = 'title' in extras
+        title = extras.pop('title', None)
+        return row['id'], extras, explicit_title, title
+    raise TypeError(
+        f'expand_path_rows: unsupported row type {type(row).__name__}; '
+        f'expected Item, str, tuple, or dict'
+    )
+
+
+def _item_extras(it: Item) -> dict:
+    """Carry an ``Item``'s recipe-attached extra attributes onto a leaf.
+
+    Excludes *all* declared dataclass fields (derived from the dataclass
+    itself, so cache/provenance slots like ``preview``, ``preview_render``,
+    ``synthetic`` and ``scope_title`` never leak) plus underscore-prefixed
+    framework internals. ``tag``/``tag_style`` are declared fields and so
+    excluded here — ``_split_path_row`` adds them explicitly for Item rows.
+    """
+    declared = {f.name for f in dataclasses.fields(it)}
+    return {
+        k: v for k, v in vars(it).items()
+        if not k.startswith('_') and k not in declared
+    }
+
+
+def expand_path_rows(rows, sep: str) -> list:
+    """Expand path-like ids into a list of node-row dicts.
+
+    Each input row (``Item``/``str``/``tuple``/``dict``, per ``to_item``)
+    has its ``id`` split on the non-empty separator ``sep`` to synthesize
+    a tree. Returns ``list[dict]`` with ``id``, ``parent`` and ``title``
+    set — one dict per leaf and per intermediate prefix node — ordered so
+    grouping by ``parent`` yields first-seen sibling order. ``parent`` is
+    ``None`` for top-level nodes. ``has_children`` is *not* set here; the
+    consumer derives it from the parent links.
+
+    Empty-segment handling is path-aware: a leading separator is
+    preserved (``/etc/x`` ≠ ``etc/x``), while doubled and trailing
+    separators collapse. Entries with no non-empty segment are skipped.
+    A prefix that is also an explicit input row merges its carried fields
+    and explicit title onto the already-emitted node (explicit wins).
+    """
+    nodes: dict = {}  # id -> emitted dict (insertion order = first-seen)
+    for row in rows:
+        rid, extras, explicit_title, title = _split_path_row(row)
+        rid = str(rid)
+        lead = sep if rid.startswith(sep) else ''
+        segs = [s for s in rid.split(sep) if s]
+        if not segs:
+            continue  # empty / all-separator entry → no node
+        last = len(segs)
+        parent = None
+        for k in range(1, last + 1):
+            nid = lead + sep.join(segs[:k])
+            node = nodes.get(nid)
+            if node is None:
+                node = nodes[nid] = {
+                    'id': nid, 'parent': parent, 'title': segs[k - 1],
+                }
+            if k == last:
+                # Leaf level for this row: attach its carried metadata,
+                # and let an explicit title override the segment. The
+                # synthesized ``id``/``parent`` links are structural and
+                # never clobbered by a carried column of the same name.
+                for ek, ev in extras.items():
+                    if ek not in ('id', 'parent'):
+                        node[ek] = ev
+                if explicit_title:
+                    node['title'] = title
+            parent = nid
+    return list(nodes.values())
