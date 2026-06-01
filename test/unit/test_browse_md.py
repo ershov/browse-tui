@@ -98,7 +98,16 @@ def _load_recipe(include_lists=True):
     this loader flips the flag back to ``True`` after module
     execution. Tests that need to exercise the lists-off path pass
     ``include_lists=False``.
+
+    ``recipes/`` is put on ``sys.path`` (idempotently) so the recipe's
+    now-hard ``from md2ansi_lib import ...`` resolves to the real
+    library — the same thing ``--run-py`` does at runtime by prepending
+    the recipe's directory. Without this the import would silently fail
+    under test and ``_parse`` would have no scanner to call.
     """
+    recipes_dir = str(_REPO / 'recipes')
+    if recipes_dir not in sys.path:
+        sys.path.insert(0, recipes_dir)
     _stub_browse_tui()
     name = '_browse_md_under_test'
     loader = SourceFileLoader(name, str(_RECIPE))
@@ -268,6 +277,34 @@ class TestParse(unittest.TestCase):
         # kinds (``ul`` for ``-``, ``ol`` for ``1.``).
         self.assertEqual(kinds, ['ul', 'ol'])
 
+    def test_heading_events_identical_lists_off_vs_on(self):
+        # The kind set ``_parse`` requests from ``md2ansi_scan`` is
+        # picked by ``_INCLUDE_LISTS``, but the full grammar runs either
+        # way — so heading events must be byte-for-byte identical whether
+        # or not list spans are also yielded. Guards the flag-driven
+        # ``_SCAN_KINDS`` selection.
+        text = (
+            '# H1\n'
+            '- a\n'
+            '- b\n'
+            '## H2\n'
+            '1. one\n'
+            '### H3\n'
+        )
+        try:
+            self.r._INCLUDE_LISTS = True
+            with_lists = self.r._parse(text)
+            self.r._INCLUDE_LISTS = False
+            without_lists = self.r._parse(text)
+        finally:
+            # ``_load_recipe`` left the flag True for this class; restore.
+            self.r._INCLUDE_LISTS = True
+        headings_on = [e for e in with_lists if e[0] in self.r._HEADING_KINDS]
+        # With lists off, every event is a heading already.
+        self.assertEqual(without_lists, headings_on)
+        # And the flag really did change list emission (sanity).
+        self.assertNotEqual(with_lists, without_lists)
+
 
 class TestWalkList(unittest.TestCase):
     """``_walk_list`` fans one list match out into per-line events."""
@@ -277,10 +314,14 @@ class TestWalkList(unittest.TestCase):
         cls.r = _load_recipe()
 
     def _events_for(self, text):
+        # ``_walk_list`` now takes ``(base, text, line_starts)`` fed from
+        # an ``md2ansi_scan`` list span. The span text is the list block
+        # WITHOUT its trailing newline (matching what the scanner yields,
+        # and what the old ``_MD_LIST`` match also excluded), so strip it
+        # here; the per-line assertions stay valid.
         line_starts = self.r._line_starts(text)
-        m = self.r._PARSER_RE.search(text)
-        self.assertIsNotNone(m, f'no match in {text!r}')
-        return self.r._walk_list(m, line_starts)
+        span_text = text.rstrip('\n')
+        return self.r._walk_list(0, span_text, line_starts)
 
     def test_single_level_indent_zero(self):
         events = self._events_for('- a\n- b\n- c\n')
@@ -1200,17 +1241,22 @@ class TestGetPreview(unittest.TestCase):
                          self.FIXTURE[h1.byte_offset:
                                       h1.byte_offset + h1.byte_size])
 
-    def test_md_color_on_but_fn_none_returns_raw(self):
-        # Defensive: if a test leaves ``_MD_COLOR`` on but the import
-        # never resolved, the gate inside ``get_preview`` skips the
-        # render path rather than crashing on ``None(...)``.
-        self.r._md2ansi_fn = None
+    def test_md_color_default_on_renders_via_real_library(self):
+        # md2ansi_lib is a hard dependency, so a freshly loaded recipe
+        # defaults ``_MD_COLOR`` on and binds ``_md2ansi_fn`` to the
+        # real library function (``recipes/`` is on ``sys.path``).
+        fresh = _load_recipe()
+        self.assertTrue(fresh._MD_COLOR)  # module-load default
+        self.assertIsNotNone(fresh._md2ansi_fn)
+        # With ``_MD_COLOR`` on and no monkeypatch, ``get_preview`` runs
+        # the slice through the library: the output differs from the raw
+        # slice and carries the ANSI escape introducer the library emits.
         self.r._MD_COLOR = True
         h1 = self.root._children[0]
+        raw = self.FIXTURE[h1.byte_offset:h1.byte_offset + h1.byte_size]
         out = self.r.get_preview(h1.id)
-        self.assertEqual(out,
-                         self.FIXTURE[h1.byte_offset:
-                                      h1.byte_offset + h1.byte_size])
+        self.assertNotEqual(out, raw)
+        self.assertIn('\x1b[', out)
 
 
 class _FakeCtx:
@@ -1236,9 +1282,9 @@ class TestToggleMd(unittest.TestCase):
 
     def setUp(self):
         self.r = _load_recipe()
-        # Pretend md2ansi_lib was importable so the toggle is meaningful;
-        # the action itself only depends on ``_MD_COLOR``, not on the
-        # function being callable, so an identity stub is fine.
+        # The toggle only flips ``_MD_COLOR``; it never calls the render
+        # function, so an identity stub keeps the test independent of the
+        # real library's output. Start from a known-on state.
         self.r._md2ansi_fn = lambda text, line_width: text
         self.r._MD_COLOR = True
         self.ctx = _FakeCtx()
@@ -2159,6 +2205,54 @@ class TestArgvErrors(unittest.TestCase):
         finally:
             import os as _os
             _os.unlink(tmp_path)
+
+
+class TestMissingDependencyGate(unittest.TestCase):
+    """``main()`` fails fast when ``md2ansi_lib`` couldn't be imported.
+
+    ``_parse`` derives the whole tree from ``md2ansi_scan``, so the
+    library is a hard dependency. ``main()`` checks ``_md2ansi_scan``
+    before any parsing and exits 2 via ``_die`` when it is ``None`` —
+    simulating an environment where the import failed. The stub
+    ``browse_tui`` is already installed by the loader, and the gate
+    fires before the Browser is ever constructed.
+    """
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self._saved_argv = list(self.r.sys.argv)
+
+    def tearDown(self):
+        self.r.sys.argv[:] = self._saved_argv
+
+    def test_missing_scanner_exits_two_with_message(self):
+        import contextlib
+        import io
+        import os
+        import tempfile
+        # A real .md file so the gate is exercised, not the argv checks
+        # (the gate runs first regardless, but a valid file ensures the
+        # only reason main() can exit is the missing-dependency gate).
+        with tempfile.NamedTemporaryFile(
+                'w', suffix='.md', delete=False, encoding='utf-8') as tmp:
+            tmp.write('# H1\n')
+            tmp_path = tmp.name
+        try:
+            self.r._md2ansi_scan = None
+            self.r.sys.argv[:] = ['browse-md', tmp_path]
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                with self.assertRaises(SystemExit) as cm:
+                    self.r.main()
+            self.assertEqual(cm.exception.code, 2)
+            err = buf.getvalue()
+            self.assertIn('requires the md2ansi_lib module', err)
+            # ``_die`` prefixes the recipe name.
+            self.assertIn('browse-md:', err)
+            # ``with_usage=False`` — the usage line is NOT printed.
+            self.assertNotIn(self.r._USAGE, err)
+        finally:
+            os.unlink(tmp_path)
 
 
 class TestBuildNodesNoLists(unittest.TestCase):
