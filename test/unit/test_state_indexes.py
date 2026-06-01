@@ -35,6 +35,7 @@ _state = load('_browse_tui_state', '040-state.py')
 # notify_wake injected explicitly.
 _state.Item = _data.Item
 _state.to_item = _data.to_item
+_state.expand_path_rows = _data.expand_path_rows
 _state.notify_wake = _term.notify_wake
 
 Browser = _state.Browser
@@ -294,6 +295,161 @@ class TestFromFlatTreeIndexes(unittest.TestCase):
         # Parents that have populated children lists are not loading.
         for parent_id in s._children.keys():
             self.assertIs(s._loading[parent_id], False)
+
+
+class TestFromFlatTreePathSep(unittest.TestCase):
+    """``path_sep`` builds the synthesised tree (no parent/depth column)."""
+
+    @staticmethod
+    def _visible(b):
+        """Visible (id, has_children, depth) tuples, all nodes expanded."""
+        s = b._state
+        # Expand every cached parent so the whole tree renders inline.
+        s.expanded = set(s._items_by_id)
+        s._visible_dirty = True
+        return [
+            (e.item.id, e.item.has_children, e.depth)
+            for e in _state.visible_items(s)
+        ]
+
+    def test_builds_synthesised_tree_with_has_children_markers(self):
+        rows = [
+            'docs/api/auth.md',
+            'docs/api/users.md',
+            'docs/README.md',
+            '/etc/passwd',
+        ]
+        b = Browser.from_flat_tree(rows, path_sep='/', _headless=True)
+        s = b._state
+        # Intermediate prefixes are synthesised as real nodes.
+        self.assertEqual(
+            set(s._items_by_id),
+            {
+                'docs', 'docs/api', 'docs/api/auth.md', 'docs/api/users.md',
+                'docs/README.md', '/etc', '/etc/passwd',
+            },
+        )
+        # Parent links follow the prefix structure; top level -> root (None).
+        self.assertIsNone(s._parent_of_id['docs'])
+        self.assertEqual(s._parent_of_id['docs/api'], 'docs')
+        self.assertEqual(s._parent_of_id['docs/api/auth.md'], 'docs/api')
+        self.assertEqual(s._parent_of_id['docs/README.md'], 'docs')
+        self.assertIsNone(s._parent_of_id['/etc'])
+        self.assertEqual(s._parent_of_id['/etc/passwd'], '/etc')
+        # has_children is derived from structure: only the prefix nodes
+        # that actually parent something are expandable.
+        expandable = {i for i, hc in
+                      ((it.id, it.has_children)
+                       for it in s._items_by_id.values()) if hc}
+        self.assertEqual(expandable, {'docs', 'docs/api', '/etc'})
+
+    def test_visible_items_renders_tree_without_runtime_fetch(self):
+        # A get_children that raises proves nothing is fetched at runtime:
+        # the eager cache must satisfy every read visible_items performs.
+        def _boom(pid, *, reload=False):
+            raise AssertionError(f'runtime fetch for {pid!r}')
+
+        rows = ['docs/api/auth.md', 'docs/README.md']
+        b = Browser.from_flat_tree(
+            rows, path_sep='/', get_children=_boom, _headless=True,
+        )
+        # No parent is left in a loading state (nothing pending to fetch).
+        self.assertTrue(all(v is False for v in b._state._loading.values()))
+        visible = self._visible(b)
+        # Full expanded tree renders straight from the pre-populated cache.
+        self.assertEqual(
+            visible,
+            [
+                ('docs', True, 0),
+                ('docs/api', True, 1),
+                ('docs/api/auth.md', False, 2),
+                ('docs/README.md', False, 1),
+            ],
+        )
+
+    def test_title_is_last_segment(self):
+        b = Browser.from_flat_tree(
+            ['docs/api/auth.md'], path_sep='/', _headless=True,
+        )
+        s = b._state
+        self.assertEqual(s._items_by_id['docs'].title, 'docs')
+        self.assertEqual(s._items_by_id['docs/api'].title, 'api')
+        self.assertEqual(s._items_by_id['docs/api/auth.md'].title, 'auth.md')
+
+    def test_multi_char_separator(self):
+        rows = ['os::path::join', 'os::path::split']
+        b = Browser.from_flat_tree(rows, path_sep='::', _headless=True)
+        s = b._state
+        self.assertEqual(
+            set(s._items_by_id),
+            {'os', 'os::path', 'os::path::join', 'os::path::split'},
+        )
+        self.assertTrue(s._items_by_id['os'].has_children)
+        self.assertTrue(s._items_by_id['os::path'].has_children)
+        self.assertFalse(s._items_by_id['os::path::join'].has_children)
+
+    def test_carried_has_children_on_leaf_is_overridden(self):
+        # ``has_children`` is a known Item field, so a dict row carrying
+        # it flows through ``to_item``. In path mode the flag is DERIVED
+        # from the tree and the incoming value ignored: a childless leaf
+        # ends up False (no phantom ▶), while the synthesised prefix is
+        # True because it actually parents the leaf.
+        rows = [{'id': 'docs/a.md', 'has_children': True}]
+        b = Browser.from_flat_tree(rows, path_sep='/', _headless=True)
+        s = b._state
+        self.assertFalse(s._items_by_id['docs/a.md'].has_children)
+        self.assertTrue(s._items_by_id['docs'].has_children)
+
+
+class TestFromFlatTreePathSepPrecedence(unittest.TestCase):
+    """``parent`` > ``depth`` > ``path_sep`` > flat."""
+
+    def test_parent_column_beats_path_sep(self):
+        # Ids contain the separator but a parent column is present, so
+        # parent-pointer mode wins: ids are NOT split into prefix nodes.
+        rows = [
+            {'id': 'a/b'},
+            {'id': 'a/b/c', 'parent': 'a/b'},
+        ]
+        b = Browser.from_flat_tree(rows, path_sep='/', _headless=True)
+        s = b._state
+        # Only the two literal ids exist — no synthesised 'a' prefix.
+        self.assertEqual(set(s._items_by_id), {'a/b', 'a/b/c'})
+        self.assertIsNone(s._parent_of_id['a/b'])
+        self.assertEqual(s._parent_of_id['a/b/c'], 'a/b')
+
+    def test_depth_column_beats_path_sep(self):
+        rows = [
+            {'id': 'a/b', 'depth': 0},
+            {'id': 'a/b/c', 'depth': 1},
+        ]
+        b = Browser.from_flat_tree(rows, path_sep='/', _headless=True)
+        s = b._state
+        # Depth-coded grouping, ids untouched: no synthesised 'a' prefix.
+        self.assertEqual(set(s._items_by_id), {'a/b', 'a/b/c'})
+        self.assertIsNone(s._parent_of_id['a/b'])
+        self.assertEqual(s._parent_of_id['a/b/c'], 'a/b')
+
+    def test_path_sep_beats_flat(self):
+        # No parent/depth column: path_sep splits, vs. the flat fallback
+        # which would put both ids directly under root.
+        rows = ['a/b', 'a/b/c']
+        b = Browser.from_flat_tree(rows, path_sep='/', _headless=True)
+        s = b._state
+        # Synthesised prefix node 'a' appears; tree is nested.
+        self.assertEqual(set(s._items_by_id), {'a', 'a/b', 'a/b/c'})
+        self.assertIsNone(s._parent_of_id['a'])
+        self.assertEqual(s._parent_of_id['a/b'], 'a')
+        self.assertEqual(s._parent_of_id['a/b/c'], 'a/b')
+
+    def test_no_path_sep_stays_flat(self):
+        # Without path_sep, slash-bearing ids stay flat under root.
+        rows = ['a/b', 'a/b/c']
+        b = Browser.from_flat_tree(rows, _headless=True)
+        s = b._state
+        self.assertEqual(set(s._items_by_id), {'a/b', 'a/b/c'})
+        self.assertIsNone(s._parent_of_id['a/b'])
+        self.assertIsNone(s._parent_of_id['a/b/c'])
 
 
 class TestRefreshInvalidationDropsIndexes(unittest.TestCase):

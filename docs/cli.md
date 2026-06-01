@@ -73,7 +73,15 @@ records:
   with no `parent` go under `--root-id`).
 - Else if any record has a `depth` field, the tree is built by depth-coding
   (each row at depth `d+1` is a child of the most recent row at depth `d`).
+- Else if `--path-sep CHARS` is given, each row's `id` is split on `CHARS`
+  to synthesize a tree (see `--path-sep` below).
 - Else the rows are flat children of `--root-id`.
+
+Precedence is `parent > depth > path-split > flat` — a more explicit
+structural column always wins. If `--path-sep` is given but the rows also
+carry an explicit `parent`/`depth` column, the flag is ignored and
+`browse-tui: --path-sep ignored: rows carry explicit parent/depth` is
+printed to stderr.
 
 Special case: `--root-cmd cat` reads stdin verbatim (no subprocess). After
 consuming stdin, the binary reopens stdin from `/dev/tty` so keyboard input
@@ -138,6 +146,36 @@ find . -maxdepth 3 -print0 | browse-tui --root-cmd cat \
 ```
 
 `json-array` ignores `--record-sep` (the whole input is a single value).
+
+### Path separator
+
+`--path-sep CHARS` splits each parsed row's `id` on `CHARS` and synthesizes
+a tree, creating intermediate prefix nodes as needed. Eager `--root-cmd`
+only; combining it with `--children-cmd` is an error
+(`error: --path-sep requires --root-cmd (eager mode)`, exit 2). It is
+orthogonal to `--input`/`--fields` — the parser produces rows as usual,
+then the `id` column is split. `CHARS` may be multiple characters (e.g.
+`::`). Node ids are full prefix paths; a leaf's title is its last segment
+(an explicit `title` column wins), and metadata columns ride onto the leaf.
+
+Empty segments are handled path-aware: a leading separator is preserved
+(`/etc/passwd` → `/etc` › `/etc/passwd`, so absolute ≠ relative), doubled
+separators collapse (`a//b` → `a` › `a/b`), a trailing separator is ignored
+(`a/b/` → `a` › `a/b`), and empty / all-separator entries are skipped.
+
+```bash
+# plain path list → tree
+find . | browse-tui --root-cmd cat --path-sep /
+
+# metadata columns ride onto leaves
+find . -printf '%p\t%s\n' | browse-tui --root-cmd cat --fields id,size --path-sep /
+
+# non-/ separator (qualified names)
+printf 'os.path.join\nos.path.split\n' | browse-tui --root-cmd cat --path-sep .
+```
+
+See `--root-cmd` above for how `--path-sep` slots into hierarchy detection
+(`parent > depth > path-split > flat`).
 
 ### Worked examples per format
 
