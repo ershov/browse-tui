@@ -68,11 +68,6 @@ def _stub_browse_tui():
         return ('mod', id_, parent_id, fields, where)
     mod.mod = _mod
 
-    # scope_into is used by the alt-down override; the recipe imports
-    # it from browse_tui. Tests don't exercise the action so a no-op
-    # is fine — but the symbol must exist for the import to succeed.
-    mod.scope_into = lambda state, item_id: None
-
     # ``set_preview_op`` is the preview-batch op constructor (#446) —
     # the umbrella composer folds leaf-preview writes into the same
     # ``update_data`` batch as the eager-push upserts. Stub it as a
@@ -84,11 +79,6 @@ def _stub_browse_tui():
     # (_focus_latest_voice_when_ready). Tests don't exercise the
     # focus flow directly, so a no-op returning [] is fine.
     mod.visible_items = lambda state: []
-
-    # _recompute_filter_hidden is used by the alt-down override to
-    # re-evaluate filter visibility after scope change (ticket #500).
-    # Tests don't exercise the filter walk, so a no-op is fine.
-    mod._recompute_filter_hidden = lambda state, filters, *, show_ids='auto': None
 
     sys.modules['browse_tui'] = mod
 
@@ -6239,6 +6229,78 @@ class TestOnExpandJumpComposition(unittest.TestCase):
                         '_latest_voice_among_children', saved)
         self.r._jump_to_latest_voice(ctx, 'SAME')
         self.assertEqual(cursor_to_calls, [])
+
+
+class TestOnScopeChangeCrossFileUpgrade(unittest.TestCase):
+    """``_on_scope_change`` upgrades a cross-file scope_root's preview.
+
+    The cross-file preview invalidation that the deleted ``alt-down``
+    override (``_action_scope_down``) appended after its inline
+    ``scope_into`` now lives on the ``on_scope_change`` lifecycle hook,
+    gated on ``direction == 'in'``. So it fires for EVERY scope-in source
+    — alt-down, programmatic ``ctx.scope_into``, startup ``initial_scope``
+    — and only drops the cache for cross-file ids (bare ``.jsonl`` /
+    ``#agent:``), leaving in-file scope rows on their already-heavy
+    preview. Scope-OUT must NOT invalidate.
+
+    These drive the hook directly against a recorder ``_BROWSER``; the
+    end-to-end programmatic scope-in (``--pid``) preview upgrade is
+    covered by the tmux UI suite (``test/ui/test_recipe_browse_claude``).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def setUp(self):
+        self._saved_browser = self.r._BROWSER
+        self.addCleanup(setattr, self.r, '_BROWSER', self._saved_browser)
+
+    def _install_recorder(self):
+        invalidated = []
+
+        class _FakeBrowser:
+            def invalidate_preview(self, id_):
+                invalidated.append(id_)
+
+        self.r._BROWSER = _FakeBrowser()
+        return invalidated
+
+    def test_scope_in_cross_file_invalidates(self):
+        # Scope into a bare .jsonl (session row) → cache dropped so the
+        # next preview pass upgrades to the heavy umbrella cascade.
+        invalidated = self._install_recorder()
+        self.r._on_scope_change(None, '/x/s.jsonl', None, 'in')
+        self.assertEqual(invalidated, ['/x/s.jsonl'])
+
+    def test_scope_in_agent_id_invalidates(self):
+        # ``#agent:`` rows are cross-file too.
+        invalidated = self._install_recorder()
+        self.r._on_scope_change(None, '/x/s.jsonl#agent:AB', '/x', 'in')
+        self.assertEqual(invalidated, ['/x/s.jsonl#agent:AB'])
+
+    def test_scope_in_in_file_id_does_not_invalidate(self):
+        # An in-file scope row (``#prompt:`` / ``#N``) is not cross-file:
+        # it already renders the heavy cascade, so leave its cache alone.
+        invalidated = self._install_recorder()
+        self.r._on_scope_change(None, '/x/s.jsonl#prompt:0', '/x/s.jsonl',
+                                'in')
+        self.assertEqual(invalidated, [])
+
+    def test_scope_out_does_not_invalidate(self):
+        # Scope-OUT never invalidates — even when the id scoped out TO is
+        # itself a cross-file id, it was already upgraded when scoped in.
+        invalidated = self._install_recorder()
+        self.r._on_scope_change(None, '/x/s.jsonl', '/x/s.jsonl#prompt:0',
+                                'out')
+        self.assertEqual(invalidated, [],
+                         'scope-out must not invalidate the preview')
+
+    def test_scope_out_to_root_does_not_invalidate(self):
+        # Scoping out to root (``scope_id is None``) is also a no-op.
+        invalidated = self._install_recorder()
+        self.r._on_scope_change(None, None, '/x/s.jsonl', 'out')
+        self.assertEqual(invalidated, [])
 
 
 if __name__ == '__main__':

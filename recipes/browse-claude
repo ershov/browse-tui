@@ -45,9 +45,8 @@ import sys
 import threading
 
 from browse_tui import (
-    Action, Browser, BrowserConfig, Item, mod, scope_into, set_preview_op,
+    Action, Browser, BrowserConfig, Item, mod, set_preview_op,
     upsert, visible_items,
-    _recompute_filter_hidden,
 )
 
 # Optional md2ansi_lib plugin — colors user/assistant voice content inline.
@@ -4765,8 +4764,8 @@ def _is_cross_file_id(item_id):
 def _invalidate_if_cross_file(item_id):
     """Drop the cached preview for ``item_id`` if it's cross-file.
 
-    Called from the right-arrow and scope-down overrides so the next
-    preview pass re-runs ``get_preview`` against the updated state
+    Called from the ``on_expand`` and ``on_scope_change`` hooks so the
+    next preview pass re-runs ``get_preview`` against the updated state
     (expanded set / scope_stack) and upgrades the lightweight
     metadata card to the heavy umbrella cascade.
     """
@@ -4776,40 +4775,34 @@ def _invalidate_if_cross_file(item_id):
         _BROWSER.invalidate_preview(item_id)
 
 
-def _action_scope_down(ctx):
-    """Scope-down override that invalidates cross-file previews.
+def _on_scope_change(ctx, scope_id, prev_scope_id, direction):
+    """Scope-change hook: upgrade a cross-file scope_root's preview.
 
-    Replicates the framework default (``_scope_down``) and then drops
-    the cached preview for the new scope_root if it's a cross-file
-    id, so the framework re-runs ``get_preview`` against the updated
-    scope_stack — the row transitions from lightweight metadata to
-    the heavy umbrella cascade.
+    Registered as the ``on_scope_change`` lifecycle hook, so it fires on
+    every runtime scope transition — the ``alt-down`` / ``alt-up`` keys
+    and a programmatic ``ctx.scope_into`` / ``ctx.scope_out`` — not just
+    one overridden key. (The construction-time ``initial_scope`` is set
+    up before the loop starts and does not fire the hook, matching the
+    old override, which likewise never ran at startup.)
+
+    On scope-IN (``direction == 'in'``) into a cross-file id, drop the
+    cached preview for the new scope_root so the next preview pass
+    re-runs ``get_preview`` against the updated ``scope_stack`` and
+    upgrades the row from the lightweight metadata card to the heavy
+    umbrella cascade. Scope-OUT (``direction == 'out'``) needs no
+    invalidation — the row being scoped out of stays as-is, and the new
+    (shallower) scope_root was already rendered heavy when it was first
+    scoped into.
+
+    This replaces the old ``alt-down`` override (``_action_scope_down``),
+    which mirrored the framework's ``scope_into`` internals inline just
+    to append this trailing invalidation; the framework default
+    ``_scope_down`` now performs the scope push / cursor reset / children
+    fetch / filter recompute / redraw / fire, and this hook carries the
+    one piece that was recipe-specific.
     """
-    cur = ctx.cursor
-    if cur is None:
-        return
-    if not getattr(cur, 'has_children', False):
-        return
-    state = ctx._browser._state
-    target_id = cur.id
-    # Use the framework's scope_into directly; it pushes the id onto
-    # ``scope_stack`` and restores the per-scope expanded set.
-    scope_into(state, target_id)
-    state.cursor = 0
-    if target_id not in state._children:
-        ctx.expand(target_id)
-    # Scope change is a full-walk trigger for filter recompute (ticket
-    # #500). Without this, an item that was ``_filter_hidden=True``
-    # from a prior recompute stays hidden after being scoped into.
-    # Mirrors the hook in ``Browser.scope_into._do``.
-    if ctx._browser._filters:
-        _recompute_filter_hidden(
-            state, ctx._browser._filters,
-            show_ids=ctx._browser.show_ids,
-        )
-    ctx._browser._needs_redraw.add('all')
-    ctx._browser._fire_scope_change()
-    _invalidate_if_cross_file(target_id)
+    if direction == 'in':
+        _invalidate_if_cross_file(scope_id)
 
 
 # Ids whose expand fired while their children were still being
@@ -5200,11 +5193,9 @@ def main():
             # re-press case — drilling to the latest voice one level down
             # when the row is already expanded (no expand → no hook).
             Action('right', 'Expand + cursor to latest voice', _action_tree_right,  'cursor'),
-            # Scope-down override invalidates the cross-file preview
-            # cache so the new scope_root upgrades from the lightweight
-            # metadata card to the heavy umbrella cascade on the next
-            # preview pass.
-            Action('alt-down', 'Scope down into item',          _action_scope_down,  'cursor'),
+            # alt-down (scope-down) uses the framework default; the
+            # ``on_scope_change`` hook below upgrades a cross-file
+            # scope_root's preview on scope-in.
         ],
         # Post-expand jump-to-latest-voice + cross-file preview upgrade,
         # composed across the two hooks so they fire for EVERY expansion
@@ -5214,6 +5205,10 @@ def main():
         # ``on_children_loaded`` once the fetch settles.
         on_expand=_on_expand,
         on_children_loaded=_on_children_loaded,
+        # Scope-in to a cross-file id upgrades the new scope_root from
+        # the lightweight metadata card to the heavy umbrella cascade.
+        # Fires for alt-down, programmatic scope, and startup alike.
+        on_scope_change=_on_scope_change,
         help_intro=_HELP_INTRO_TMPL.format(default=_MESSAGE_LIMIT),
     ))
     _BROWSER = b
