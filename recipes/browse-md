@@ -23,8 +23,7 @@ tree in place.
 
 Custom actions on top of the framework defaults:
 
-  m   toggle md2ansi coloring of the preview (only bound when the
-      ``md2ansi_lib`` Python module is importable).
+  m   toggle md2ansi coloring of the preview.
   M   page the preview through ``$MD2ANSI`` / external ``md2ansi``.
   V   page the source for cursor/selection in ``$PAGER``. On a
       per-file root opens that file; on non-root rows pages a temp
@@ -67,12 +66,12 @@ try:
 except ImportError:
     _md2ansi_fn = _md2ansi_scan = None
 
-# Default colored preview on when md2ansi_lib is importable; the ``m``
-# action (bound only when ``_md2ansi_fn`` is not ``None``) flips it
-# at runtime. ``_BROWSER`` is set in ``main()`` after construction so
-# ``get_preview`` can look up the current ``preview_width`` for the
-# md2ansi word-wrap.
-_MD_COLOR = _md2ansi_fn is not None
+# Colored preview defaults on — md2ansi_lib is a hard dependency past
+# the ``main()`` gate, so ``_md2ansi_fn`` is always present in
+# production; the ``m`` action flips it at runtime. ``_BROWSER`` is set
+# in ``main()`` after construction so ``get_preview`` can look up the
+# current ``preview_width`` for the md2ansi word-wrap.
+_MD_COLOR = True
 _BROWSER = None  # set in main() — used for preview-width lookup
 
 # Per-file state slot — populated by ``_reparse`` from
@@ -850,11 +849,11 @@ def get_preview(node_id):
     4. Anything else (unresolvable id) → ``''``. Defensive: a stale
        cursor id from a previous scope mustn't crash the preview.
 
-    When ``_MD_COLOR`` is on (and md2ansi_lib is importable), the slice
-    runs through ``_md2ansi_fn(text, line_width=…)`` for ANSI-coloured
-    rendering. The call is wrapped in a broad ``except Exception`` so
-    pathological markdown can't crash the preview pane — we just fall
-    back to the raw slice.
+    When ``_MD_COLOR`` is on, the slice runs through
+    ``_md2ansi_fn(text, line_width=…)`` for ANSI-coloured rendering. The
+    call is wrapped in a broad ``except Exception`` so pathological
+    markdown can't crash the preview pane — we just fall back to the raw
+    slice.
     """
     if node_id is None:
         return ''
@@ -906,7 +905,7 @@ def get_preview(node_id):
             bo = item.byte_offset
             text = _FILE_TEXT[bo:bo + item.byte_size]
 
-    if _MD_COLOR and _md2ansi_fn is not None:
+    if _MD_COLOR:
         try:
             width = (_BROWSER.preview_width if _BROWSER else 0) or 80
             return _md2ansi_fn(text, line_width=width)
@@ -922,10 +921,7 @@ def _action_toggle_md(ctx):
     """``m`` — flip ``_MD_COLOR`` between rendered and raw markdown.
 
     Drops the preview cache so the next render runs through (or skips)
-    the md2ansi pipe immediately. Only bound when ``_md2ansi_fn`` is
-    importable; if md2ansi_lib is missing the action isn't wired into
-    ``actions`` at all, so the keystroke falls through to the default
-    handler.
+    the md2ansi pipe immediately.
     """
     global _MD_COLOR
     _MD_COLOR = not _MD_COLOR
@@ -1345,7 +1341,7 @@ Usage: browse-md [-l] FILE.md[#anchor] [FILE.md[#anchor] ...]
             multiple files carry anchors, the FIRST anchored file in
             argv order wins.
 
-  m       Toggle md2ansi coloring (requires md2ansi_lib).
+  m       Toggle md2ansi coloring.
   M       Render the preview through ``$MD2ANSI`` / md2ansi.
   V       Page source for cursor/selection in ``$PAGER``. On a
           per-file root opens that file directly; on non-root rows
@@ -1485,17 +1481,16 @@ def main():
     else:
         initial_scope = None
 
-    # ``M`` is always available — it errors gracefully when no
-    # renderer is found, so users discover the env-var hook even on
-    # boxes without md2ansi_lib installed. ``m`` only makes sense when
-    # md2ansi_lib is importable; otherwise the toggle can't do anything
-    # useful (the preview is already raw). Matches the conditional
-    # build-up pattern in browse-claude / browse-fs.
-    actions = [Action('M', 'View preview via $MD2ANSI / md2ansi',
+    # ``m`` (toggle library coloring) and ``M`` (page through the
+    # external ``$MD2ANSI`` / ``md2ansi`` program) are both always
+    # bound. ``m`` is safe to wire unconditionally because md2ansi_lib
+    # is a hard dependency past the gate above, so ``_md2ansi_fn`` is
+    # always present. ``M`` errors gracefully when no external renderer
+    # is found, so users still discover the env-var hook.
+    actions = [Action('m', 'Toggle markdown coloring',
+                      _action_toggle_md, 'none'),
+               Action('M', 'View preview via $MD2ANSI / md2ansi',
                       _action_md_preview, 'cursor')]
-    if _md2ansi_fn is not None:
-        actions.insert(0, Action('m', 'Toggle markdown coloring',
-                                 _action_toggle_md, 'none'))
     # ``V`` / ``E`` operate on ``ctx.targets`` (selection-or-cursor),
     # including the synthetic root row where ``ctx.cursor`` is None
     # but a scope_root target is still resolvable — hence the

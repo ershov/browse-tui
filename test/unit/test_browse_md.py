@@ -1241,17 +1241,22 @@ class TestGetPreview(unittest.TestCase):
                          self.FIXTURE[h1.byte_offset:
                                       h1.byte_offset + h1.byte_size])
 
-    def test_md_color_on_but_fn_none_returns_raw(self):
-        # Defensive: if a test leaves ``_MD_COLOR`` on but the import
-        # never resolved, the gate inside ``get_preview`` skips the
-        # render path rather than crashing on ``None(...)``.
-        self.r._md2ansi_fn = None
+    def test_md_color_default_on_renders_via_real_library(self):
+        # md2ansi_lib is a hard dependency, so a freshly loaded recipe
+        # defaults ``_MD_COLOR`` on and binds ``_md2ansi_fn`` to the
+        # real library function (``recipes/`` is on ``sys.path``).
+        fresh = _load_recipe()
+        self.assertTrue(fresh._MD_COLOR)  # module-load default
+        self.assertIsNotNone(fresh._md2ansi_fn)
+        # With ``_MD_COLOR`` on and no monkeypatch, ``get_preview`` runs
+        # the slice through the library: the output differs from the raw
+        # slice and carries the ANSI escape introducer the library emits.
         self.r._MD_COLOR = True
         h1 = self.root._children[0]
+        raw = self.FIXTURE[h1.byte_offset:h1.byte_offset + h1.byte_size]
         out = self.r.get_preview(h1.id)
-        self.assertEqual(out,
-                         self.FIXTURE[h1.byte_offset:
-                                      h1.byte_offset + h1.byte_size])
+        self.assertNotEqual(out, raw)
+        self.assertIn('\x1b[', out)
 
 
 class _FakeCtx:
@@ -1277,9 +1282,9 @@ class TestToggleMd(unittest.TestCase):
 
     def setUp(self):
         self.r = _load_recipe()
-        # Pretend md2ansi_lib was importable so the toggle is meaningful;
-        # the action itself only depends on ``_MD_COLOR``, not on the
-        # function being callable, so an identity stub is fine.
+        # The toggle only flips ``_MD_COLOR``; it never calls the render
+        # function, so an identity stub keeps the test independent of the
+        # real library's output. Start from a known-on state.
         self.r._md2ansi_fn = lambda text, line_width: text
         self.r._MD_COLOR = True
         self.ctx = _FakeCtx()
