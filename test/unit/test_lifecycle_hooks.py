@@ -844,6 +844,341 @@ class TestOnChildrenLoaded(unittest.TestCase):
         self.assertEqual(b._children_loaded_pending, set())
 
 
+class TestOnSearchChange(unittest.TestCase):
+    """``on_search_change(ctx, query)`` — drain-time diff of the effective
+    search query against ``_last_search_query``. Fires once per drain on
+    the final value; clearing to ``''`` is a change → fires once; an
+    identical re-set is a no-op.
+    """
+
+    def test_fires_on_change_with_new_query(self):
+        fired = []
+        b = Browser(BrowserConfig(_headless=True,
+                    on_search_change=lambda ctx, q: fired.append(q)))
+        b.set_search_query('foo')
+        b.drain_main_queue()
+        b._fire_search_change_if_pending()
+        self.assertEqual(fired, ['foo'])
+
+    def test_payload_matches_ctx_search_query(self):
+        # The query payload is what the recipe would read off ctx.
+        seen = []
+        b = Browser(BrowserConfig(_headless=True,
+                    on_search_change=lambda ctx, q: seen.append(
+                        (q, ctx.search_query))))
+        b.set_search_query('bar')
+        b.drain_main_queue()
+        b._fire_search_change_if_pending()
+        self.assertEqual(seen, [('bar', 'bar')])
+
+    def test_clear_fires_once_with_empty_string(self):
+        fired = []
+        b = Browser(BrowserConfig(_headless=True,
+                    on_search_change=lambda ctx, q: fired.append(q)))
+        # Establish a non-empty query and fire it first.
+        b.set_search_query('hello')
+        b.drain_main_queue()
+        b._fire_search_change_if_pending()
+        fired.clear()
+        # Clearing back to '' is a real change → fires once with ''.
+        b.clear_search()
+        b.drain_main_queue()
+        b._fire_search_change_if_pending()
+        self.assertEqual(fired, [''])
+        # A second drain with no further change does not re-fire.
+        b._fire_search_change_if_pending()
+        self.assertEqual(fired, [''])
+
+    def test_identical_reset_is_no_op(self):
+        fired = []
+        b = Browser(BrowserConfig(_headless=True,
+                    on_search_change=lambda ctx, q: fired.append(q)))
+        b.set_search_query('same')
+        b.drain_main_queue()
+        b._fire_search_change_if_pending()
+        self.assertEqual(fired, ['same'])
+        # Re-setting the same query does not change the effective value.
+        b.set_search_query('same')
+        b.drain_main_queue()
+        b._fire_search_change_if_pending()
+        self.assertEqual(fired, ['same'])
+
+    def test_coalesces_rapid_edits_to_final_value(self):
+        # Several edits before a single drain coalesce to the latest.
+        fired = []
+        b = Browser(BrowserConfig(_headless=True,
+                    on_search_change=lambda ctx, q: fired.append(q)))
+        b.set_search_query('f')
+        b.set_search_query('fo')
+        b.set_search_query('foo')
+        b.drain_main_queue()
+        b._fire_search_change_if_pending()
+        self.assertEqual(fired, ['foo'])
+
+    def test_missing_handler_still_advances_baseline(self):
+        # No handler: the baseline still advances so a handler registered
+        # later never sees a stale historical delta.
+        b = Browser(BrowserConfig(_headless=True))
+        b.set_search_query('x')
+        b.drain_main_queue()
+        b._fire_search_change_if_pending()
+        self.assertEqual(b._last_search_query, 'x')
+
+    def test_exception_routed_to_error(self):
+        def bad(ctx, q):
+            raise RuntimeError('search boom')
+        b = Browser(BrowserConfig(_headless=True, on_search_change=bad))
+        b.set_search_query('q')
+        b.drain_main_queue()
+        b._fire_search_change_if_pending()
+        b.drain_main_queue()
+        self.assertIn('search boom', b.error_text)
+        self.assertIn('on_search_change', b.error_text)
+
+
+class TestOnFilterChange(unittest.TestCase):
+    """``on_filter_change(ctx, filters)`` — drain-time diff of
+    ``tuple(self.filters)`` against ``_last_filters``. ``set`` / ``add`` /
+    ``clear`` fire; an identical re-set is a no-op; ``add_filter('')`` is a
+    no-op because ``filters`` drops empties.
+    """
+
+    def test_set_filters_fires_with_tuple(self):
+        fired = []
+        b = Browser(BrowserConfig(_headless=True,
+                    on_filter_change=lambda ctx, f: fired.append(f)))
+        b.set_filters(['a', 'b'])
+        b.drain_main_queue()
+        b._fire_filter_change_if_pending()
+        self.assertEqual(fired, [('a', 'b')])
+
+    def test_payload_matches_ctx_filters(self):
+        seen = []
+        b = Browser(BrowserConfig(_headless=True,
+                    on_filter_change=lambda ctx, f: seen.append(
+                        (f, ctx.filters))))
+        b.set_filters(['x'])
+        b.drain_main_queue()
+        b._fire_filter_change_if_pending()
+        self.assertEqual(seen, [(('x',), ('x',))])
+
+    def test_add_filter_fires(self):
+        fired = []
+        b = Browser(BrowserConfig(_headless=True,
+                    on_filter_change=lambda ctx, f: fired.append(f)))
+        b.set_filters(['a'])
+        b.drain_main_queue()
+        b._fire_filter_change_if_pending()
+        fired.clear()
+        b.add_filter('b')
+        b.drain_main_queue()
+        b._fire_filter_change_if_pending()
+        self.assertEqual(fired, [('a', 'b')])
+
+    def test_clear_filters_fires_with_empty_tuple(self):
+        fired = []
+        b = Browser(BrowserConfig(_headless=True,
+                    on_filter_change=lambda ctx, f: fired.append(f)))
+        b.set_filters(['a', 'b'])
+        b.drain_main_queue()
+        b._fire_filter_change_if_pending()
+        fired.clear()
+        b.clear_filters()
+        b.drain_main_queue()
+        b._fire_filter_change_if_pending()
+        self.assertEqual(fired, [()])
+
+    def test_identical_reset_is_no_op(self):
+        fired = []
+        b = Browser(BrowserConfig(_headless=True,
+                    on_filter_change=lambda ctx, f: fired.append(f)))
+        b.set_filters(['a', 'b'])
+        b.drain_main_queue()
+        b._fire_filter_change_if_pending()
+        self.assertEqual(fired, [('a', 'b')])
+        # Re-setting the identical list does not change the tuple.
+        b.set_filters(['a', 'b'])
+        b.drain_main_queue()
+        b._fire_filter_change_if_pending()
+        self.assertEqual(fired, [('a', 'b')])
+
+    def test_add_empty_filter_is_no_op(self):
+        # add_filter('') returns early (no post); filters drops empties so
+        # even if it ran the effective tuple would be unchanged.
+        fired = []
+        b = Browser(BrowserConfig(_headless=True,
+                    on_filter_change=lambda ctx, f: fired.append(f)))
+        b.add_filter('')
+        b.drain_main_queue()
+        b._fire_filter_change_if_pending()
+        self.assertEqual(fired, [])
+
+    def test_missing_handler_still_advances_baseline(self):
+        b = Browser(BrowserConfig(_headless=True))
+        b.set_filters(['z'])
+        b.drain_main_queue()
+        b._fire_filter_change_if_pending()
+        self.assertEqual(b._last_filters, ('z',))
+
+    def test_exception_routed_to_error(self):
+        def bad(ctx, f):
+            raise RuntimeError('filter boom')
+        b = Browser(BrowserConfig(_headless=True, on_filter_change=bad))
+        b.set_filters(['q'])
+        b.drain_main_queue()
+        b._fire_filter_change_if_pending()
+        b.drain_main_queue()
+        self.assertIn('filter boom', b.error_text)
+        self.assertIn('on_filter_change', b.error_text)
+
+
+class TestOnResize(unittest.TestCase):
+    """``on_resize(ctx, cols, rows)`` — fires once when an observed resize
+    changes ``term_size()`` vs ``_last_size``; unchanged size fires
+    nothing. A staged ``_resize_pending`` flag (set at the SIGWINCH
+    observation points) gates the diff. ``term_size`` is stubbed onto the
+    state module here (the production build resolves it by concatenation).
+    """
+
+    def _stub_term_size(self, ret):
+        """Patch ``term_size`` onto _state; return a restorer. ``ret`` is a
+        ``(cols, rows)`` tuple or a callable returning one (or raising).
+        """
+        prev = getattr(_state, 'term_size', None)
+        had = hasattr(_state, 'term_size')
+        _state.term_size = ret if callable(ret) else (lambda: ret)
+
+        def restore():
+            if had:
+                _state.term_size = prev
+            elif hasattr(_state, 'term_size'):
+                del _state.term_size
+        return restore
+
+    def test_fires_once_on_changed_size(self):
+        fired = []
+        b = Browser(BrowserConfig(_headless=True,
+                    on_resize=lambda ctx, c, r: fired.append((c, r))))
+        restore = self._stub_term_size((120, 40))
+        try:
+            b._resize_pending = True          # SIGWINCH observed
+            b._fire_resize_if_pending()
+            self.assertEqual(fired, [(120, 40)])
+            self.assertEqual(b._last_size, (120, 40))
+        finally:
+            restore()
+
+    def test_unchanged_size_fires_nothing(self):
+        fired = []
+        b = Browser(BrowserConfig(_headless=True,
+                    on_resize=lambda ctx, c, r: fired.append((c, r))))
+        restore = self._stub_term_size((80, 24))
+        try:
+            b._last_size = (80, 24)           # already at this size
+            b._resize_pending = True
+            b._fire_resize_if_pending()
+            self.assertEqual(fired, [])
+        finally:
+            restore()
+
+    def test_no_pending_no_term_size_read(self):
+        # Without the staged flag the diff doesn't run at all.
+        fired = []
+        reads = []
+        b = Browser(BrowserConfig(_headless=True,
+                    on_resize=lambda ctx, c, r: fired.append((c, r))))
+
+        def counting():
+            reads.append(1)
+            return (100, 30)
+        restore = self._stub_term_size(counting)
+        try:
+            b._fire_resize_if_pending()       # _resize_pending is False
+            self.assertEqual(fired, [])
+            self.assertEqual(reads, [])
+        finally:
+            restore()
+
+    def test_second_drain_does_not_refire(self):
+        fired = []
+        b = Browser(BrowserConfig(_headless=True,
+                    on_resize=lambda ctx, c, r: fired.append((c, r))))
+        restore = self._stub_term_size((90, 30))
+        try:
+            b._resize_pending = True
+            b._fire_resize_if_pending()
+            # Flag cleared on fire; a second call with no new SIGWINCH and
+            # the same size does nothing.
+            b._fire_resize_if_pending()
+            self.assertEqual(fired, [(90, 30)])
+        finally:
+            restore()
+
+    def test_zero_dims_do_not_fire(self):
+        # Headless / no-tty term_size often returns (0, 0); don't fire
+        # garbage dimensions.
+        fired = []
+        b = Browser(BrowserConfig(_headless=True,
+                    on_resize=lambda ctx, c, r: fired.append((c, r))))
+        restore = self._stub_term_size((0, 0))
+        try:
+            b._resize_pending = True
+            b._fire_resize_if_pending()
+            self.assertEqual(fired, [])
+            self.assertIsNone(b._last_size)
+        finally:
+            restore()
+
+    def test_term_size_raising_is_graceful(self):
+        fired = []
+        b = Browser(BrowserConfig(_headless=True,
+                    on_resize=lambda ctx, c, r: fired.append((c, r))))
+
+        def raising():
+            raise OSError('no tty')
+        restore = self._stub_term_size(raising)
+        try:
+            b._resize_pending = True
+            b._fire_resize_if_pending()       # must not raise
+            self.assertEqual(fired, [])
+        finally:
+            restore()
+
+    def test_missing_term_size_is_graceful(self):
+        # term_size not wired onto the module at all (the default in many
+        # headless test modules) → no fire, no crash.
+        fired = []
+        b = Browser(BrowserConfig(_headless=True,
+                    on_resize=lambda ctx, c, r: fired.append((c, r))))
+        prev = getattr(_state, 'term_size', None)
+        had = hasattr(_state, 'term_size')
+        if had:
+            del _state.term_size
+        try:
+            b._resize_pending = True
+            b._fire_resize_if_pending()
+            self.assertEqual(fired, [])
+        finally:
+            if had:
+                _state.term_size = prev
+
+    def test_exception_in_handler_routed_to_error(self):
+        def bad(ctx, c, r):
+            raise RuntimeError('resize boom')
+        b = Browser(BrowserConfig(_headless=True, on_resize=bad))
+        restore = self._stub_term_size((110, 35))
+        try:
+            b._resize_pending = True
+            b._fire_resize_if_pending()
+            b.drain_main_queue()
+            self.assertIn('resize boom', b.error_text)
+            self.assertIn('on_resize', b.error_text)
+            # Size baseline still advanced despite the throw.
+            self.assertEqual(b._last_size, (110, 35))
+        finally:
+            restore()
+
+
 class TestDefaultsAreNoOp(unittest.TestCase):
 
     def test_no_hooks_no_explosion(self):
@@ -857,6 +1192,14 @@ class TestDefaultsAreNoOp(unittest.TestCase):
         b._fire_expand_collapse_if_pending()
         b._children_loaded_pending = {'p'}
         b._fire_children_loaded_if_pending()
+        b.set_search_query('q')
+        b.drain_main_queue()
+        b._fire_search_change_if_pending()
+        b.set_filters(['f'])
+        b.drain_main_queue()
+        b._fire_filter_change_if_pending()
+        b._resize_pending = True
+        b._fire_resize_if_pending()
         b._fire_on_quit()
 
 

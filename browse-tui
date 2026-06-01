@@ -3783,6 +3783,9 @@ class BrowserConfig:
     on_expand: Optional[Callable] = None
     on_collapse: Optional[Callable] = None
     on_children_loaded: Optional[Callable] = None
+    on_search_change: Optional[Callable] = None
+    on_filter_change: Optional[Callable] = None
+    on_resize: Optional[Callable] = None
     on_quit: Optional[Callable] = None
     _headless: bool = False
 
@@ -4061,14 +4064,24 @@ class Browser:
         # genuine-settlement sites — the ``complete`` op and
         # ``apply_children_results`` — record into
         # ``_children_loaded_pending``; ``clear_children`` deliberately
-        # does NOT, since it drops the cache). ``on_quit`` fires once
-        # during shutdown after the screen is restored.
+        # does NOT, since it drops the cache). ``on_search_change`` /
+        # ``on_filter_change`` fire from a drain-time diff of the effective
+        # query / filter tuple against ``_last_search_query`` /
+        # ``_last_filters`` (so every mutation source — live edit, commit,
+        # ``set_search_query`` / ``set_filters`` / ``add_filter`` /
+        # ``clear_*`` — coalesces to one fire per drain). ``on_resize``
+        # fires once when an observed SIGWINCH changes ``term_size()`` vs
+        # ``_last_size``. ``on_quit`` fires once during shutdown after the
+        # screen is restored.
         self._on_cursor_change = config.on_cursor_change
         self._on_scope_change = config.on_scope_change
         self._on_selection_change = config.on_selection_change
         self._on_expand = config.on_expand
         self._on_collapse = config.on_collapse
         self._on_children_loaded = config.on_children_loaded
+        self._on_search_change = config.on_search_change
+        self._on_filter_change = config.on_filter_change
+        self._on_resize = config.on_resize
         self._on_quit = config.on_quit
         # Worker-slot registry for ``run_in_slot``. Each entry is the
         # currently-active CancellationToken for a named slot;
@@ -4091,6 +4104,18 @@ class Browser:
         # ``on_children_loaded(list)`` per tick. ``clear_children`` is
         # excluded — it clears loading but drops the children.
         self._children_loaded_pending = set()
+        # Snapshots for the input-state / geometry diffs. ``on_search_change``
+        # / ``on_filter_change`` fire when the effective query / filter tuple
+        # differs from these (clearing to ``''`` / ``()`` is a real change →
+        # fires once). ``_last_size`` is ``None`` until the first observed
+        # resize so the first SIGWINCH always fires. ``_resize_pending`` is
+        # latched at the SIGWINCH observation points (mirrors
+        # ``_cursor_change_pending``); the drain consumes it so ``term_size``
+        # is only read on an actual resize, not every tick.
+        self._last_search_query = ''
+        self._last_filters: tuple = ()
+        self._last_size = None
+        self._resize_pending = False
         self._headless = config._headless
 
         # --- domain state ------------------------------------------------
@@ -5842,6 +5867,89 @@ class Browser:
         except Exception as e:
             self.error(f'on_children_loaded: {type(e).__name__}: {e}')
 
+    def _fire_search_change_if_pending(self) -> None:
+        """Fire ``on_search_change`` once if the effective query changed.
+
+        Diffs ``self._search_query`` against ``_last_search_query``: any
+        delta fires one ``on_search_change(ctx, query)`` with the new
+        string, then re-snapshots. Several keystrokes between drains
+        coalesce to the final value; clearing to ``''`` is a real change
+        and fires once; an identical re-set is a no-op.
+
+        Unconditional (no pending flag): the diff runs every drain so every
+        mutation source — live ``SEARCH_EDIT`` typing, commit,
+        ``set_search_query`` / ``clear_search`` — is caught without
+        instrumenting the mutation sites. ``_last_search_query`` is always
+        re-snapshotted, even with no handler installed, so a handler
+        registered later never sees a stale historical delta.
+        """
+        query = self._search_query
+        if query != self._last_search_query:
+            self._last_search_query = query
+            if self._on_search_change is not None:
+                try:
+                    self._on_search_change(self._make_ctx_for_hook(), query)
+                except Exception as e:
+                    self.error(f'on_search_change: {type(e).__name__}: {e}')
+
+    def _fire_filter_change_if_pending(self) -> None:
+        """Fire ``on_filter_change`` once if the active filter tuple changed.
+
+        Diffs ``tuple(self.filters)`` (the committed-plus-live, empties
+        dropped) against ``_last_filters``: any delta fires one
+        ``on_filter_change(ctx, filters)`` with the new tuple, then
+        re-snapshots. ``set_filters`` / ``add_filter`` / ``clear_filters``
+        and the ``&`` edit/commit path all flow through this; an identical
+        re-set is a no-op, and ``add_filter('')`` is a no-op because the
+        ``filters`` property drops empty strings. Same unconditional /
+        always-re-snapshot contract as ``_fire_search_change_if_pending``.
+        """
+        filters = tuple(self.filters)
+        if filters != self._last_filters:
+            self._last_filters = filters
+            if self._on_filter_change is not None:
+                try:
+                    self._on_filter_change(self._make_ctx_for_hook(), filters)
+                except Exception as e:
+                    self.error(f'on_filter_change: {type(e).__name__}: {e}')
+
+    def _fire_resize_if_pending(self) -> None:
+        """Fire ``on_resize`` once when an observed resize changed the size.
+
+        Gated by ``_resize_pending`` — latched at the SIGWINCH observation
+        points in the run loop (mirrors ``_cursor_change_pending``) so
+        ``term_size()`` is only read on an actual resize, not every tick.
+        When pending, reads ``term_size()`` and, if ``(cols, rows)`` differs
+        from ``_last_size``, fires ``on_resize(ctx, cols, rows)`` and
+        re-snapshots.
+
+        ``term_size`` can be missing, raise, or return ``(0, 0)`` in a
+        headless / no-tty context (mirrors ``_clamp_split`` /
+        ``_list_pane_height_safe``); in any of those cases we don't fire
+        garbage dimensions and leave ``_last_size`` untouched. The pending
+        flag is always cleared so a single SIGWINCH never re-fires.
+        """
+        if not self._resize_pending:
+            return
+        self._resize_pending = False
+        ts = globals().get('term_size')
+        if ts is None:
+            return
+        try:
+            cols, rows = ts()
+        except Exception:
+            return
+        if not cols or not rows:
+            return
+        size = (cols, rows)
+        if size != self._last_size:
+            self._last_size = size
+            if self._on_resize is not None:
+                try:
+                    self._on_resize(self._make_ctx_for_hook(), cols, rows)
+                except Exception as e:
+                    self.error(f'on_resize: {type(e).__name__}: {e}')
+
     def _fire_on_quit(self) -> None:
         """Fire ``on_quit`` once during shutdown.
 
@@ -7309,13 +7417,19 @@ class Browser:
                 self._update_children_for_cursor()
 
                 # Lifecycle hooks fire once per drain in the documented
-                # order (spec "Ordering within a drain"): structure
-                # (on_collapse → on_expand) then children-arrival
-                # (on_children_loaded) before cursor settling, so a
-                # cursor-change handler sees the post-expansion tree with
-                # freshly-delivered children accounted for. (The remaining
-                # phases — scope, search/filter, resize — slot in here in
-                # the same order as they land.)
+                # order (spec "Ordering within a drain"): geometry
+                # (on_resize) and input state (on_search_change →
+                # on_filter_change) first since they may reshape the visible
+                # tree, then structure (on_collapse → on_expand), then
+                # children-arrival (on_children_loaded) before cursor
+                # settling, so a cursor-change handler sees the
+                # post-expansion tree with freshly-delivered children
+                # accounted for. (on_resize consumes the ``_resize_pending``
+                # flag latched at the SIGWINCH observation points below, so
+                # a resize observed this iteration fires on the next drain.)
+                self._fire_resize_if_pending()
+                self._fire_search_change_if_pending()
+                self._fire_filter_change_if_pending()
                 self._fire_expand_collapse_if_pending()
                 self._fire_children_loaded_if_pending()
                 self._fire_cursor_change_if_pending()
@@ -7330,6 +7444,10 @@ class Browser:
                     # Walk loaded items and drop every ``preview_render``
                     # so the next paint regenerates at the new width.
                     self._invalidate_all_preview_renders()
+                    # Latch for the ``on_resize`` hook — the next drain's
+                    # ``_fire_resize_if_pending`` reads ``term_size`` and
+                    # fires if the dimensions actually changed.
+                    self._resize_pending = True
                 # Screen-lost flag — set by SIGCONT / term_resume after the
                 # alt-screen content was destroyed externally. Drop the
                 # per-pane row caches so ``end_row`` doesn't cache-hit
@@ -7357,6 +7475,7 @@ class Browser:
                     globals()['g_resize_flag'] = False
                     self._needs_redraw.add('all')
                     self._invalidate_all_preview_renders()
+                    self._resize_pending = True
                 if globals().get('g_screen_lost_flag', False):
                     globals()['g_screen_lost_flag'] = False
                     self._pane_cache.clear()
