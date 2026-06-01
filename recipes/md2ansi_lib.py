@@ -531,7 +531,7 @@ def _m2a_render_footnotes(state, current_style):
     return "\n".join(out) + "\n"
 
 
-def _m2a_fmt_code(m, name, current_style, context, state, code_context, lang=None):
+def _m2a_fmt_code(m, name, current_style, context, state, code_context, lang=None, label=None):
     body = m.group(f"{name}_body")
     indent = m.group(f"{name}_indent") or ""
     if lang is None:
@@ -547,7 +547,8 @@ def _m2a_fmt_code(m, name, current_style, context, state, code_context, lang=Non
         (_m2a_visible_len(ln) for ln in rendered.split("\n")),
         default=0,
     )
-    label = f"Code: {lang}" if lang else "Code"
+    if label is None:
+        label = f"Code: {lang}" if lang else "Code"
     # Layout: the frame sticks out 1 char past the body on each side, and the
     # body is indented by 1 space so it sits inside the frame. `inner` is the
     # dash count between the corners; total visible frame width = inner + 2.
@@ -703,6 +704,24 @@ _MD_H6 = r"^ \#{6} [ \t]+ (?P<*> [^\n]+ ) $"
 
 _MD_HR = r"^ (?: -{3,} | ={3,} | _{3,} ) [ \t]* $"
 
+# Frontmatter — anchored to file start via `\A` so it never matches
+# mid-document. Empty `(?P<*indent>)` group so the shared `_m2a_fmt_code`
+# framing (which reads `{name}_indent`) works with no indent. The body is a run
+# of lines that are each non-empty, non-comment (`#…`), and not the closing
+# fence; the first blank line, `#` comment, or `---` ends it. Requiring a tight
+# block keeps real markdown (which has blank lines / `#` headings) from being
+# mistaken for frontmatter when a document opens with a `---` thematic break.
+# The closing `---` ends at `$` (not consuming its trailing newline, like code
+# fences) so the framed box doesn't merge with the following line. MUST precede
+# `hr` in the rule table (both match a leading `---`).
+_MD_FRONTMATTER = r"""
+    \A (?P<*indent>) --- [ \t]* \n
+    (?P<*body>
+        (?: ^ (?! --- [ \t]* $ ) (?! [ \t]* \# ) (?! [ \t]* $ ) [^\n]* \n )*
+    )
+    ^ --- [ \t]* $
+"""
+
 # Fenced code blocks — tempered-greedy body so each char has one matching branch.
 def _fenced(tag, fence=r"```"):
     return rf"""
@@ -804,8 +823,8 @@ _MD_ITALIC = rf"""
 # Lambdas binding the code context (and display language label) for each
 # language-specific code block. The generic block passes lang=None so the
 # handler reads it from the pattern's captured `_lang` group.
-def _m2a_code_lambda(code_ctx, lang=None):
-    return lambda m, name, cs, ctx, st: _m2a_fmt_code(m, name, cs, ctx, st, code_ctx, lang)
+def _m2a_code_lambda(code_ctx, lang=None, label=None):
+    return lambda m, name, cs, ctx, st: _m2a_fmt_code(m, name, cs, ctx, st, code_ctx, lang, label)
 
 # Inline rules — used to build M2A_CONTEXT_MD_INLINE (where _M2A_RECURSE_SELF
 # resolves to INLINE itself), and reused inside _M2A_RULES_MD after rebinding
@@ -838,6 +857,7 @@ _M2A_RULES_INLINE_IN_MD = tuple(
 )
 
 _M2A_RULES_MD = (
+    ("frontmatter",   _MD_FRONTMATTER,  _m2a_code_lambda(M2A_CONTEXT_CODE_GENERIC, label="Frontmatter"), None),
     ("h1",            _MD_H1,           M2A_COLOR_H1,                                 M2A_CONTEXT_MD_INLINE),
     ("h2",            _MD_H2,           M2A_COLOR_H2,                                 M2A_CONTEXT_MD_INLINE),
     ("h3",            _MD_H3,           M2A_COLOR_H3,                                 M2A_CONTEXT_MD_INLINE),
@@ -1024,9 +1044,26 @@ def _m2a_wrap_source(text, line_width):
     """
     if line_width <= 0:
         return text
+    lines = text.split("\n")
     out = []
+    start = 0
+    # Leading frontmatter (\A `---` … `---`): pass it through verbatim so its
+    # YAML lines aren't word-wrapped. Mirrors the _MD_FRONTMATTER rule exactly,
+    # including its strictness (no blank lines, no `#` comments in the body), so
+    # we only skip what the renderer will actually box. A mid-document `---` is
+    # an HR, not a fence, so `---` can't be a generic in/out toggle here.
+    if lines and re.match(r"^---[ \t]*$", lines[0]):
+        k = 1
+        while k < len(lines):
+            if re.match(r"^---[ \t]*$", lines[k]):
+                out.extend(lines[:k + 1])
+                start = k + 1
+                break
+            if lines[k].strip() == "" or re.match(r"^[ \t]*#", lines[k]):
+                break
+            k += 1
     in_code = False
-    for ln in text.split("\n"):
+    for ln in lines[start:]:
         # Code-fence toggle — anything inside is left verbatim.
         if re.match(r"^[ \t]*(```|~~~)", ln):
             in_code = not in_code
@@ -1079,6 +1116,133 @@ def md2ansi(text, current_style="0", line_width=0, cell_min_width=20, row_divide
     return out
 
 
+# ### Section: Structural scan API #########################################
+
+# A non-rendering view of the matches the engine already produces. `md2ansi_scan`
+# runs the same compiled MD grammar over the RAW (unwrapped) source and yields
+# one `M2A_Span` per top-level match, so consumers (e.g. a markdown TOC browser)
+# get heading/list/code offsets without re-implementing the grammar. The scan is
+# non-recursive: it sees every block span plus any inline match at top level, but
+# not inline markup nested inside a block (that stays masked in the block's span).
+
+
+@dataclass(frozen=True, slots=True)
+class M2A_Span:
+    """One top-level match from `md2ansi_scan`.
+
+    `kind` is the broad category ('heading', 'code', 'list', 'emphasis', …);
+    `subtype` is the narrow refinement, always populated — it falls back to
+    `kind` when there's no finer detail — so callers can match on it alone
+    ('h1'..'h6', 'code-python'/'code-<tag>', 'bold'/'italic'/…). `is_block`
+    separates block constructs from inline. `start`/`end` are character offsets
+    into the scanned text (`text[start:end] == text`).
+    """
+    kind: str
+    subtype: str
+    is_block: bool
+    start: int
+    end: int
+    text: str
+
+
+# Outer-rule-name -> (kind, subtype) for rules whose classification differs from
+# the fallback (kind == subtype == rule name). Headings collapse to 'heading'
+# with the level as subtype; the code_* rules collapse to 'code' with a `code-`
+# prefixed language subtype (namespaced so a fence tag can never collide with
+# another construct's subtype); the emphasis variants collapse to 'emphasis'.
+# `code_generic`'s subtype is replaced by its fence tag at scan time when present.
+_M2A_SPAN_KINDS = {
+    "h1": ("heading", "h1"), "h2": ("heading", "h2"), "h3": ("heading", "h3"),
+    "h4": ("heading", "h4"), "h5": ("heading", "h5"), "h6": ("heading", "h6"),
+    "code_python":  ("code", "code-python"),
+    "code_bash":    ("code", "code-bash"),
+    "code_js":      ("code", "code-javascript"),
+    "code_generic": ("code", "code"),
+    "code_inline2": ("code_inline", "code_inline"),
+    "code_inline":  ("code_inline", "code_inline"),
+    "bolditalic":   ("emphasis", "bolditalic"),
+    "bold_under":   ("emphasis", "bolditalic"),
+    "under_bold":   ("emphasis", "bolditalic"),
+    "bold":         ("emphasis", "bold"),
+    "italic":       ("emphasis", "italic"),
+    "strike":       ("emphasis", "strike"),
+}
+
+
+def _m2a_span_kind(rule_name):
+    """Map an outer rule name to `(kind, subtype)`; fallback is `(name, name)`."""
+    return _M2A_SPAN_KINDS.get(rule_name, (rule_name, rule_name))
+
+
+# Names of the inline rules — drives `is_block` and the inline kind set.
+_M2A_INLINE_RULE_NAMES = frozenset(name for name, *_ in _M2A_RULES_INLINE_RAW)
+
+# Broad-kind sets, derived from the rule tables (nothing hand-maintained).
+# `md2ansi_scan(kinds=…)` takes any set of these; compose with `|` / `-` / `&`.
+M2A_SPANS_INLINE = frozenset(
+    _m2a_span_kind(name)[0] for name in _M2A_INLINE_RULE_NAMES
+)
+M2A_SPANS_BLOCK = frozenset(
+    _m2a_span_kind(name)[0]
+    for name, *_ in _M2A_RULES_MD
+    if name not in _M2A_INLINE_RULE_NAMES
+)
+M2A_SPANS_ALL = M2A_SPANS_BLOCK | M2A_SPANS_INLINE
+
+
+def _m2a_scan(text, kinds):
+    """Generator workhorse for `md2ansi_scan` (no validation).
+
+    One `finditer` pass over the combined MD grammar — the same regex, engine,
+    and order the renderer uses — so the scan can't drift from what gets
+    rendered. The outer rule is identified the same way as `_m2a_replace`: the
+    first outer named group with a non-None match (NOT `m.lastgroup`, which
+    would pick an inner capture).
+    """
+    rule_names = [name for name, *_ in M2A_CONTEXT_MD.rules]
+    for m in M2A_CONTEXT_MD.compiled.finditer(text):
+        groups = m.groupdict()
+        rule = next(name for name in rule_names if groups.get(name) is not None)
+        kind, subtype = _m2a_span_kind(rule)
+        if rule == "code_generic":
+            tag = (groups.get("code_generic_lang") or "").strip()
+            if tag:
+                subtype = f"code-{tag}"
+        if kind not in kinds:
+            continue
+        yield M2A_Span(
+            kind=kind,
+            subtype=subtype,
+            is_block=rule not in _M2A_INLINE_RULE_NAMES,
+            start=m.start(),
+            end=m.end(),
+            text=m.group(0),
+        )
+
+
+def md2ansi_scan(text, kinds=M2A_SPANS_BLOCK):
+    """Yield `M2A_Span` for top-level matches whose `kind` is in `kinds`.
+
+    Spans come in document order. The scan runs over the RAW text (no
+    line-wrapping), so `text[span.start:span.end] == span.text`. It is
+    non-recursive: every block span is reported, plus any inline match at top
+    level, but inline markup nested inside a block stays masked in that block's
+    span (use `recursive=` — not yet implemented — for that).
+
+    `kinds` is any set of broad kinds; compose with set arithmetic, e.g.
+    `M2A_SPANS_BLOCK - {'frontmatter'}` or `{'heading', 'list'}`. Defaults to
+    `M2A_SPANS_BLOCK`. Validated eagerly: passing a name not in `M2A_SPANS_ALL`
+    raises `ValueError` at the call, before iteration.
+    """
+    unknown = set(kinds) - M2A_SPANS_ALL
+    if unknown:
+        raise ValueError(
+            f"md2ansi_scan: unknown span kind(s) {sorted(unknown)}; "
+            f"valid kinds are {sorted(M2A_SPANS_ALL)}"
+        )
+    return _m2a_scan(text, frozenset(kinds))
+
+
 # ### Section: Plugin registration ##########################################
 
 # Make this file double as a browse-tui plugin: when imported under a
@@ -1091,7 +1255,6 @@ try:
     register_plugin(PluginConfig(name='md2ansi_lib'))
 except ImportError:
     pass
-
 
 # ### Section: main #########################################################
 
