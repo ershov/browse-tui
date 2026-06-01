@@ -50,17 +50,22 @@ import sys
 
 from browse_tui import Action, Browser, BrowserConfig, Item
 
-# Optional md2ansi_lib plugin — gates the colored markdown preview mode.
-# Mirrors the gate pattern in browse-fs / browse-claude: import the
-# function, fall back to ``None`` if the module is missing or the
-# imported name isn't actually callable (defensive against monkey-
-# patched stubs in tests / odd vendored copies).
+# md2ansi_lib — now a HARD dependency. ``_parse`` derives heading /
+# list structure from ``md2ansi_scan`` (one source of truth with the
+# library grammar), so the recipe cannot build its tree without it.
+# ``_md2ansi_fn`` is retained as the colored-preview render seam that
+# ``get_preview`` calls and the render-path tests monkeypatch. The
+# import stays wrapped in try/except so the module is still importable
+# for unit tests that exercise individual helpers; the absence is
+# enforced at runtime by the ``main()`` gate below (which calls
+# ``_die`` when ``_md2ansi_scan`` is ``None``), not at import time.
+# Both names resolve because ``--run-py`` prepends the recipe's
+# directory (``recipes/``) to ``sys.path`` and ``md2ansi_lib.py``
+# lives there.
 try:
-    from md2ansi_lib import md2ansi as _md2ansi_fn
-    if not callable(_md2ansi_fn):
-        _md2ansi_fn = None
-except Exception:
-    _md2ansi_fn = None
+    from md2ansi_lib import md2ansi as _md2ansi_fn, md2ansi_scan as _md2ansi_scan
+except ImportError:
+    _md2ansi_fn = _md2ansi_scan = None
 
 # Default colored preview on when md2ansi_lib is importable; the ``m``
 # action (bound only when ``_md2ansi_fn`` is not ``None``) flips it
@@ -127,7 +132,7 @@ _HEADING_STYLES = {
 
 # Per-line list-item regex — lifted verbatim from md2ansi_lib
 # (``_m2a_fmt_list``, md2ansi_lib.py:493). Used by ``_walk_list`` to fan
-# one ``_MD_LIST`` match out into one event per marker line.
+# one ``md2ansi_scan`` list span out into one event per marker line.
 _LIST_ITEM_RE = re.compile(r'^([ \t]*)([-*+]|\d+\.)[ \t]+(.*)$')
 
 # Title-stripping regexes used by ``_build_nodes`` to produce tree-row
@@ -148,103 +153,15 @@ _LIST_PREFIX_RE = re.compile(r'^([-*+]|\d+\.)\s+')
 # Gate for emitting list-item events from ``_parse``. Default off:
 # the tree shows headings only, which is the common "table of
 # contents" view. ``main()`` flips this to ``True`` when ``-l`` /
-# ``--list`` / ``--lists`` appears in argv. The flag only controls
-# emission — the ``list`` rule in ``_PARSER_RE`` still masks its
-# span so code-fence-vs-list-line precedence is unchanged.
+# ``--list`` / ``--lists`` appears in argv. The flag picks which kind
+# set ``_parse`` requests from ``md2ansi_scan`` — list spans are only
+# yielded when it is on. The full grammar runs internally either way,
+# so code-fence-vs-list-line precedence (and heading detection) is
+# unchanged regardless of the flag.
 _INCLUDE_LISTS = False
 
 
 _USAGE = 'usage: browse-md [-l] FILE.md[#anchor] [FILE.md[#anchor] ...]'
-
-
-# ### Section: Markdown block-rule table ##############################
-#
-# Patterns lifted verbatim from md2ansi_lib.py (lines 697-726). md2ansi_lib
-# writes inner captures as ``(?P<*...>...)`` placeholders that its
-# ``_m2a_build_context`` rewrites at build time. We don't need those
-# inner names — ``_parse`` keys on the outer rule by iterating
-# ``_RULES`` and picking the first whose group matched (md2ansi_lib-style;
-# see ``_m2a_replace`` in md2ansi_lib.py). Every ``(?P<*...>...)`` is
-# converted to a non-capturing ``(?:...)`` group to keep the patterns
-# idiomatic ``re`` and avoid name collisions when stitched into the
-# combined regex below.
-#
-# Every alternation has disjoint branches (no-rollback discipline);
-# every cross-line span uses tempered-greedy ``(?: (?! STOP ) [\s\S] )*``
-# so the engine never backtracks. See the design doc's "Regex
-# discipline (no rollback, greedy)" section.
-
-# Headings — exact-count ``#`` followed by space ensures mutual exclusion.
-_MD_H1 = r"^ \# [ \t]+ (?: [^\n]+ ) $"
-_MD_H2 = r"^ \#{2} [ \t]+ (?: [^\n]+ ) $"
-_MD_H3 = r"^ \#{3} [ \t]+ (?: [^\n]+ ) $"
-_MD_H4 = r"^ \#{4} [ \t]+ (?: [^\n]+ ) $"
-_MD_H5 = r"^ \#{5} [ \t]+ (?: [^\n]+ ) $"
-_MD_H6 = r"^ \#{6} [ \t]+ (?: [^\n]+ ) $"
-
-_MD_HR = r"^ (?: -{3,} | ={3,} | _{3,} ) [ \t]* $"
-
-# Frontmatter — anchored to file start via ``\A`` so it never matches
-# mid-document. Tempered-greedy body so the closing ``---`` is the
-# first one we see. Trailing ``(?:\n|$)`` lets the rule own its closing
-# newline (or end-of-file) instead of leaving a stray line for later
-# rules.
-_MD_FRONTMATTER = r"""
-    \A --- \n
-    (?: (?! ^ --- [ \t]* $ ) [\s\S] )*
-    ^ --- [ \t]* (?: \n | \Z )
-"""
-
-# Fenced code blocks — tempered-greedy body so each char has exactly
-# one matching branch (the negative lookahead consumes one char per
-# iteration). ``(?:```|~~~)`` matches either fence style.
-_MD_CODE_GEN = r"""
-    ^ (?: [ \t]* ) (?:```|~~~) [ \t]* (?: \w* ) [ \t]* \n
-    (?: (?! ^ [ \t]* (?:```|~~~) [ \t]* $ ) [\s\S] )*
-    ^ [ \t]* (?:```|~~~) [ \t]* $
-"""
-
-_MD_BLOCKQUOTE = r"^ > [ \t]? [^\n]* (?: \n > [ \t]? [^\n]* )*"
-
-_MD_TABLE = r"^ [ \t]* \| [^\n]* (?: \n [ \t]* \| [^\n]* )*"
-
-_MD_LIST = r"""
-    ^ [ \t]* (?: [-*+] | \d+\. ) [ \t]+ [^\n]*
-    (?: \n [ \t]* (?: [-*+] | \d+\. ) [ \t]+ [^\n]* )*
-"""
-
-# Rule order is precedence. Headings/HR are line-bound and need to win
-# over the multi-line block rules on a single ``#`` line. ``code``
-# precedes ``blockquote/table/list`` so list-looking lines inside a
-# fence are masked. ``frontmatter`` MUST precede ``hr``: both can match
-# a leading ``---`` line at offset 0, and Python ``re`` alternation is
-# leftmost-first, so if ``hr`` came first it would consume only the
-# opening fence as an HR and ``\A``-anchored ``frontmatter`` would
-# never get a chance.
-_RULES = (
-    ('h1',          _MD_H1),
-    ('h2',          _MD_H2),
-    ('h3',          _MD_H3),
-    ('h4',          _MD_H4),
-    ('h5',          _MD_H5),
-    ('h6',          _MD_H6),
-    ('frontmatter', _MD_FRONTMATTER),
-    ('hr',          _MD_HR),
-    ('code',        _MD_CODE_GEN),
-    ('blockquote',  _MD_BLOCKQUOTE),
-    ('table',       _MD_TABLE),
-    ('list',        _MD_LIST),
-)
-
-# Combined regex — same shape md2ansi_lib uses in ``_m2a_build_context``
-# (md2ansi_lib.py:113). One ``finditer`` pass over the text yields all
-# block-level matches in document order; ``_parse`` walks ``_RULES``
-# per match to find which outer group matched (see ``_parse`` for why
-# we don't use ``m.lastgroup``).
-_PARSER_RE = re.compile(
-    '|'.join(f'(?P<{n}>{p})' for n, p in _RULES),
-    re.VERBOSE | re.MULTILINE | re.DOTALL,
-)
 
 
 class _FileState:
@@ -300,9 +217,9 @@ def _line_starts(text):
     """Byte offset of the start of each line in ``text``.
 
     Index ``i`` holds the offset of line ``i`` (0-based). Used by
-    ``_parse`` to convert a heading's ``m.start()`` byte offset into a
-    line number via ``bisect``. Uses ``re.finditer`` so the scan runs
-    in the C-level regex engine rather than a Python ``for`` loop.
+    ``_parse`` to convert a span's ``start`` byte offset into a line
+    number via ``bisect``. Uses ``re.finditer`` so the scan runs in the
+    C-level regex engine rather than a Python ``for`` loop.
     """
     return [0] + [m.end() for m in re.finditer(r'\n', text)]
 
@@ -313,29 +230,29 @@ def _line_of(byte_offset, line_starts):
     return bisect.bisect_right(line_starts, byte_offset) - 1
 
 
-# Rule names that emit a heading node from ``_parse`` — dispatch is
-# by exact name, so other rules (code/blockquote/table/hr/frontmatter)
-# never reach the heading branch.
+# Event kinds that map to heading-shaped tree rows (h1..h6) — used by
+# ``_build_nodes`` (via ``_HEADING_EVENT_KINDS``) to tell a heading
+# event apart from a list-item (``ul`` / ``ol``) event.
 _HEADING_KINDS = frozenset(('h1', 'h2', 'h3', 'h4', 'h5', 'h6'))
 
 
-def _walk_list(match, line_starts):
-    """Fan one ``_MD_LIST`` match out into one event per marker line.
+def _walk_list(base, text, line_starts):
+    """Fan one ``md2ansi_scan`` list span out into one event per marker line.
 
-    ``_MD_LIST`` already guarantees that every line of the match starts
-    with a list marker (continuation lines split the match, see the
-    spec's "List parsing details"). So we can split on ``\\n`` and run
-    the per-line regex without further line-validity checks.
+    The span text ``md2ansi_scan`` yields already guarantees that every
+    line starts with a list marker (continuation lines split the block
+    into separate spans, see the spec's "List parsing details"). So we
+    can split on ``\\n`` and run the per-line regex without further
+    line-validity checks.
 
-    ``byte_offset`` is the match's absolute start plus the per-line
-    offset within the match (the sum of preceding line lengths + 1 per
-    newline). ``line_offset`` is derived via ``_line_of`` against the
-    file-wide ``line_starts`` so future reparses don't need a separate
-    counter.
+    ``base`` is the span's absolute start byte (``span.start``) and
+    ``text`` is the span body (``span.text``). ``byte_offset`` is
+    ``base`` plus the per-line offset within ``text`` (the sum of
+    preceding line lengths + 1 per newline). ``line_offset`` is derived
+    via ``_line_of`` against the file-wide ``line_starts`` so future
+    reparses don't need a separate counter.
     """
     events = []
-    base = match.start()
-    text = match.group()
     # ``split`` over ``\n`` reconstructs each line; ``offset`` tracks
     # the line's byte position within ``text`` (relative). Each iter
     # adds ``len(line)+1`` (the ``+1`` for the newline ``split``
@@ -358,6 +275,16 @@ def _walk_list(match, line_starts):
     return events
 
 
+# Scan-kind sets requested from ``md2ansi_scan``, chosen by
+# ``_INCLUDE_LISTS`` so the library only yields spans we turn into rows.
+# The full grammar runs internally either way (code / blockquote /
+# table / frontmatter / hr stay masked), so heading detection is
+# identical regardless of which set we pass — the only difference is
+# whether ``'list'`` spans are yielded.
+_SCAN_KINDS_HEADINGS = frozenset(('heading',))
+_SCAN_KINDS_WITH_LISTS = frozenset(('heading', 'list'))
+
+
 def _parse(text):
     """Flat ordered list of parser events for ``text``.
 
@@ -365,38 +292,32 @@ def _parse(text):
       * heading:   ``('h1'..'h6', {'byte_offset', 'line_offset', 'source'})``
       * list item: ``('ul'|'ol', {'byte_offset', 'line_offset', 'level', 'source'})``
 
-    Code/blockquote/table/hr/frontmatter matches emit nothing — they
-    exist solely to mask their contents from later rules in the
-    combined regex.
+    A thin adapter over ``md2ansi_scan``: one structural-scan pass over
+    the same combined grammar the renderer uses (single source of truth
+    with the library), filtered to the kinds we turn into tree rows.
+    The requested kind set is chosen by ``_INCLUDE_LISTS`` so list spans
+    are never materialised when ``-l`` is off; heading spans are
+    byte-for-byte identical either way because the library filters at
+    yield time over the full grammar. Code / blockquote / table / hr /
+    frontmatter are matched internally (masking their contents) but not
+    yielded, so they emit nothing here.
     """
     line_starts = _line_starts(text)
+    kinds = _SCAN_KINDS_WITH_LISTS if _INCLUDE_LISTS else _SCAN_KINDS_HEADINGS
     events = []
-    for m in _PARSER_RE.finditer(text):
-        # Identify the outer rule by walking ``_RULES`` and picking the
-        # first whose named group has a non-None match. ``m.lastgroup``
-        # would be simpler but returns the *highest-numbered* matching
-        # named group — so any future inner ``(?P<...>...)`` group
-        # inside a rule pattern would silently misroute dispatch. This
-        # mirrors md2ansi_lib's ``_m2a_replace`` (md2ansi_lib.py:863-882).
-        groups = m.groupdict()
-        kind = next(n for n, _ in _RULES if groups.get(n) is not None)
-        if kind in _HEADING_KINDS:
-            byte_offset = m.start()
-            events.append((kind, {
+    for span in _md2ansi_scan(text, kinds=kinds):
+        if span.kind == 'heading':
+            byte_offset = span.start
+            events.append((span.subtype, {     # subtype is 'h1'..'h6'
                 'byte_offset': byte_offset,
                 'line_offset': _line_of(byte_offset, line_starts),
-                'source': m.group(),
+                'source': span.text,
             }))
-        elif kind == 'list':
-            # Fan one multi-line list match into per-marker-line nodes —
-            # but only when ``_INCLUDE_LISTS`` is on. With the flag off
-            # the regex still consumed the list span (so code-fence vs
-            # list-line precedence is unchanged), we just drop the
-            # would-be events so list items don't show in the tree.
-            if _INCLUDE_LISTS:
-                events.extend(_walk_list(m, line_starts))
-        # code / blockquote / table / hr / frontmatter: skip. Their
-        # only job is to consume their span so later rules can't.
+        else:
+            # ``'list'`` — only yielded when ``_INCLUDE_LISTS`` is on.
+            # ``md2ansi_scan`` reports the whole top-level list block as
+            # one span; fan it into per-marker-line nodes ourselves.
+            events.extend(_walk_list(span.start, span.text, line_starts))
     return events
 
 
@@ -1479,6 +1400,14 @@ def _pop_flag(name, alts=()):
 
 def main():
     global _ANCHOR, _BROWSER, _INCLUDE_LISTS, _INPUT_FILES
+    # Hard-dependency gate. ``_parse`` derives the whole tree from
+    # ``md2ansi_scan``; without the library there is nothing to build,
+    # so fail fast with a clear message rather than running degraded.
+    # Checked here (not at import time) so the module stays importable
+    # for unit tests that exercise individual helpers.
+    if _md2ansi_scan is None:
+        _die('requires the md2ansi_lib module (expected alongside the recipe)',
+             with_usage=False)
     # Pop the lists-on flag BEFORE reading the positionals so order in
     # argv is flexible: ``browse-md -l FILE.md`` and
     # ``browse-md FILE.md -l`` both work. The aliases are accepted
