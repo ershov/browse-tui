@@ -52,7 +52,8 @@ class TestWideCharsListPane(unittest.TestCase):
                 "printf '日本語日本語"
                 "日本語日本語日本語"
                 "日本語日本語END\\nshort\\n' | "
-                f"{_BIN} --show-ids never --split-type v --root-cmd cat",
+                f"{_BIN} --show-ids never --split-type v --root-cmd cat "
+                f"--preview",
             )
             # Wait on the status-bar separator (drawn only after the TUI
             # paints) — using 'short' would match the echoed shell command
@@ -94,7 +95,8 @@ class TestWideCharsListPane(unittest.TestCase):
             t.launch(
                 'bash', '-c',
                 f"printf '{payload}\\nshort\\n' | "
-                f"{_BIN} --show-ids never --split-type v --root-cmd cat",
+                f"{_BIN} --show-ids never --split-type v --root-cmd cat "
+                f"--preview",
             )
             t.wait_for('Preview', timeout=3.0)
             t.wait_stable()

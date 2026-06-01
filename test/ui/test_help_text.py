@@ -86,7 +86,7 @@ class TestHelpScreenInTui(unittest.TestCase):
         with TmuxFixture(cols=80, rows=80) as t:
             t.launch('bash', '-c',
                      f"printf 'a\\n' | {_BIN} --show-ids always --root-cmd cat "
-                     f"--no-children-pane")
+                     f"--no-children-pane --preview")
             t.wait_for('a a')
             t.send('?')
             t.wait_for('NAVIGATION')
@@ -99,7 +99,7 @@ class TestHelpScreenInTui(unittest.TestCase):
         with TmuxFixture(cols=80, rows=100) as t:
             t.launch('bash', '-c',
                      f"printf 'a\\n' | {_BIN} --show-ids always --root-cmd cat "
-                     f"--no-children-pane "
+                     f"--no-children-pane --preview "
                      f"-a 'e:Edit cursor in editor:true' "
                      f"-a 'd:Delete with confirm:true'")
             t.wait_for('a a')
@@ -115,7 +115,7 @@ class TestHelpScreenInTui(unittest.TestCase):
         with TmuxFixture(cols=80, rows=100) as t:
             t.launch('bash', '-c',
                      f"printf 'a\\n' | {_BIN} --show-ids always --root-cmd cat "
-                     f"--no-children-pane "
+                     f"--no-children-pane --preview "
                      f"--help-intro 'PROJECT-INTRO-MARKER' "
                      f"--help-outro 'project-outro-marker'")
             t.wait_for('a a')
@@ -133,7 +133,7 @@ class TestHelpScreenInTui(unittest.TestCase):
             with TmuxFixture(cols=80, rows=80) as t:
                 t.launch('bash', '-c',
                          f"printf 'a\\n' | {_BIN} --show-ids always --root-cmd cat "
-                         f"--no-children-pane "
+                         f"--no-children-pane --preview "
                          f"--help-intro '@{intro}'")
                 t.wait_for('a a')
                 t.send('?')

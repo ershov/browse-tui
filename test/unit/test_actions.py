@@ -85,8 +85,15 @@ class _FakeContext:
 
 
 def _make_browser(**kw):
-    """Build a headless Browser; tests call stop_workers in tearDown."""
+    """Build a headless Browser; tests call stop_workers in tearDown.
+
+    The preview pane defaults to visible here so the many layout /
+    mouse / resize / scroll tests in this module keep their assumed
+    geometry. Pass ``show_preview=False`` (or supply / omit
+    ``get_preview``) to test the auto-detect rule directly.
+    """
     kw.setdefault('_headless', True)
+    kw.setdefault('show_preview', True)
     return Browser(BrowserConfig(**kw))
 
 

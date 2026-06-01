@@ -34,7 +34,9 @@ class TestConstructionDefaults(unittest.TestCase):
             self.assertIsNone(b._state.root_id)
             self.assertEqual(b._state.selected, set())
             self.assertEqual(b._state.cursor, 0)
-            self.assertTrue(b.show_preview)
+            # show_preview default is "auto" (None); with no
+            # get_preview supplied, the resolved value is False.
+            self.assertFalse(b.show_preview)
             self.assertTrue(b.show_children_pane)
             self.assertTrue(b.multi_select)
             self.assertEqual(b.print_format, '{id}')
@@ -45,6 +47,43 @@ class TestConstructionDefaults(unittest.TestCase):
             self.assertFalse(b._quit_requested)
             self.assertEqual(b._quit_code, 0)
             self.assertEqual(b._quit_output, '')
+        finally:
+            b.stop_workers()
+
+    def test_show_preview_auto_with_get_preview(self):
+        b = Browser(BrowserConfig(
+            _headless=True,
+            get_preview=lambda _id: 'x',
+        ))
+        try:
+            self.assertTrue(b.show_preview)
+        finally:
+            b.stop_workers()
+
+    def test_show_preview_auto_without_get_preview(self):
+        b = Browser(BrowserConfig(_headless=True))
+        try:
+            self.assertFalse(b.show_preview)
+        finally:
+            b.stop_workers()
+
+    def test_show_preview_explicit_true_overrides_auto(self):
+        # No get_preview, but caller forces True.
+        b = Browser(BrowserConfig(_headless=True, show_preview=True))
+        try:
+            self.assertTrue(b.show_preview)
+        finally:
+            b.stop_workers()
+
+    def test_show_preview_explicit_false_overrides_auto(self):
+        # get_preview is set, but caller forces False.
+        b = Browser(BrowserConfig(
+            _headless=True,
+            get_preview=lambda _id: 'x',
+            show_preview=False,
+        ))
+        try:
+            self.assertFalse(b.show_preview)
         finally:
             b.stop_workers()
 

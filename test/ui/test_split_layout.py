@@ -63,10 +63,15 @@ def _launch_with_data(t: TmuxFixture, *extra_args):
     Using ``--root-cmd cat`` keeps the input deterministic (no tree
     expansion to wait on); ``--show-ids always`` pins the row layout
     so the rendered text is stable across runs.
+
+    ``--preview`` is supplied so the preview pane is forced visible
+    — the split layout assertions all depend on a preview pane
+    being part of the layout (the auto rule would hide it because
+    no ``--preview-cmd`` is set).
     """
     cmd = (
         "printf 'a\\nb\\nc\\n' | "
-        f"{_BIN} --show-ids always --root-cmd cat"
+        f"{_BIN} --show-ids always --root-cmd cat --preview"
     )
     for a in extra_args:
         cmd += ' ' + a
@@ -158,7 +163,8 @@ class TestAutoSplitResolution(unittest.TestCase):
         with TmuxFixture(cols=242, rows=40) as t:
             cmd = (
                 "printf 'a\\nb\\nc\\n' | "
-                f"{_BIN} --show-ids always --root-cmd cat | cat"
+                f"{_BIN} --show-ids always --root-cmd cat "
+                f"--preview | cat"
             )
             t.send_line(cmd)
             t.wait_for('a a')

@@ -158,7 +158,8 @@ class TestSnapshots(unittest.TestCase):
         self._run_snapshot(
             'help_mode.txt',
             ('bash', '-c',
-             f"printf 'a\\n' | {_BIN} --show-ids always --root-cmd cat --no-children-pane"),
+             f"printf 'a\\n' | {_BIN} --show-ids always --root-cmd cat "
+             f"--no-children-pane --preview"),
             cols=80, rows=24,
             wait_for='a a',
             after=after,

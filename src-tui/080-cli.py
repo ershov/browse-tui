@@ -465,8 +465,16 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument('--print-format', metavar='FMT', default='{id}',
                    help='Format for print-exit. str.format syntax over Item attrs.')
     # Layout
-    p.add_argument('--no-preview', action='store_true',
-                   help='Start with preview pane hidden.')
+    # Tri-state preview pane: --preview forces it on, --no-preview
+    # forces it off, neither is the default (None) and lets the
+    # Browser auto-decide based on whether a preview source exists.
+    p.add_argument('--preview', dest='preview', default=None,
+                   action=argparse.BooleanOptionalAction,
+                   help='Force the preview pane visible (--preview) '
+                        'or hidden (--no-preview). Without either '
+                        'flag, the pane is shown when --preview-cmd '
+                        '(or the recipe) supplies a preview source, '
+                        'and hidden otherwise.')
     p.add_argument('--no-children-pane', action='store_true',
                    help='Start with children-grid pane hidden.')
     p.add_argument('--preview-ansi', default=True,
@@ -1516,7 +1524,7 @@ def _build_lazy_browser(args, fields, record_sep, *, split='h'):
         get_preview=get_preview,
         root_id=args.root_id,
         initial_scope=args.initial_scope,
-        show_preview=not args.no_preview,
+        show_preview=args.preview,
         show_children_pane=not args.no_children_pane,
         preview_ansi=args.preview_ansi,
         list_ratio=_resolve_list_size(args.list_size),
@@ -1578,7 +1586,7 @@ def _build_eager_browser(args, fields, record_sep, *, split='h'):
         root_id=args.root_id,
         title=args.title,
         initial_scope=args.initial_scope,
-        show_preview=not args.no_preview,
+        show_preview=args.preview,
         show_children_pane=not args.no_children_pane,
         preview_ansi=args.preview_ansi,
         list_ratio=_resolve_list_size(args.list_size),

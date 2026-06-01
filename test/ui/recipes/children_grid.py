@@ -39,6 +39,10 @@ def main():
     b = Browser(BrowserConfig(
         get_children=get_children,
         show_children_pane=show_children_pane,
+        # The UI tests in test_children_grid.py assert on layout with
+        # the preview pane present; the recipe has no get_preview so
+        # force the pane on.
+        show_preview=True,
         # Force the id segment on every row so UI tests can assert on a
         # stable shape regardless of whether id == title.
         show_ids='always',

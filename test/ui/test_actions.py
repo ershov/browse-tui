@@ -60,7 +60,8 @@ class TestActions(unittest.TestCase):
         with TmuxFixture(cols=80, rows=24) as t:
             t.launch('bash', '-c',
                      f"printf 'a\\n' | {_BIN} --show-ids always "
-                     f"--root-cmd cat --action 'x:Bad:false'")
+                     f"--root-cmd cat --preview "
+                     f"--action 'x:Bad:false'")
             t.wait_for('a a')
             t.send('x')
             # The action layer posts the error back to the main thread

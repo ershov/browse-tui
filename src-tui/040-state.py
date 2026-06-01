@@ -2575,7 +2575,11 @@ class BrowserConfig:
     format_item: Optional[Callable] = None
     root_id: Any = None
     initial_scope: Any = None
-    show_preview: bool = True
+    # ``None`` means "auto" — resolved by ``Browser.__init__`` to
+    # ``get_preview is not None``. Recipes/CLIs that omit a preview
+    # function get a list-only layout for free; setting True or False
+    # explicitly overrides the auto rule.
+    show_preview: Optional[bool] = None
     show_children_pane: bool = True
     preview_ansi: bool = True
     list_ratio: float = 0.30
@@ -2652,7 +2656,10 @@ class Browser:
                           consumes in #10.
       root_id:            Any (default None).
       initial_scope:      if set, pushed onto scope_stack at construction.
-      show_preview:       enable the preview pane (renderer in #10).
+      show_preview:       enable the preview pane. ``None`` (default)
+                          means "auto" — preview pane is shown iff
+                          ``get_preview`` is supplied. True/False
+                          forces the choice.
       show_children_pane: enable the right-hand children-as-list pane.
       preview_ansi:       honour ANSI SGR sequences in preview text
                           (default True). Toggled at runtime via
@@ -2712,6 +2719,9 @@ class Browser:
             initial_scope: If set, pushed onto ``scope_stack`` at
                 construction so the UI starts inside that scope.
             show_preview: Whether the preview pane starts visible.
+                ``None`` (default) means "auto" — the pane is visible
+                iff ``get_preview`` is supplied. ``True`` / ``False``
+                forces the choice regardless of ``get_preview``.
             show_children_pane: Whether the children-grid pane starts
                 visible.
             preview_ansi: Whether the preview pane honours ANSI SGR
@@ -2807,7 +2817,13 @@ class Browser:
         )
         self.on_enter = config.on_enter
         self.format_item = config.format_item
-        self.show_preview = config.show_preview
+        # ``show_preview=None`` means "auto": show the preview pane
+        # iff a ``get_preview`` callback was supplied. Explicit
+        # True/False from the caller wins.
+        if config.show_preview is None:
+            self.show_preview = self.get_preview is not None
+        else:
+            self.show_preview = config.show_preview
         self.show_children_pane = config.show_children_pane
         self.show_scope_crumb = config.show_scope_crumb
         # Honour ANSI SGR escapes in the preview pane (default True).

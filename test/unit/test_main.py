@@ -198,11 +198,53 @@ class TestRunTuiArgsToBrowser(unittest.TestCase):
         self.assertEqual(labels['d'], 'Del')
 
     def test_no_preview_flag_propagates(self):
-        args = _make_args(root_cmd='printf "a\\n"', no_preview=True)
+        args = _make_args(root_cmd='printf "a\\n"', preview=False)
         rc = _cli.run_tui(args)
         self.assertEqual(rc, 42)
         b = self._captured[0]
         self.assertFalse(b.show_preview)
+
+    def test_preview_flag_propagates(self):
+        # --preview forces the pane visible even when no get_preview
+        # is supplied (would otherwise auto-resolve to False).
+        args = _make_args(root_cmd='printf "a\\n"', preview=True)
+        rc = _cli.run_tui(args)
+        self.assertEqual(rc, 42)
+        b = self._captured[0]
+        self.assertTrue(b.show_preview)
+
+    def test_preview_pane_auto_hidden_without_preview_cmd(self):
+        # No --preview-cmd and no --no-preview: auto-resolves to hidden
+        # because there is no preview source to drive the pane.
+        args = _make_args(root_cmd='printf "a\\n"')
+        rc = _cli.run_tui(args)
+        self.assertEqual(rc, 42)
+        b = self._captured[0]
+        self.assertFalse(b.show_preview)
+
+    def test_preview_pane_auto_shown_with_preview_cmd(self):
+        # --preview-cmd supplies a get_preview; auto-resolves to shown.
+        args = _make_args(root_cmd='printf "a\\n"', preview_cmd='echo hi')
+        rc = _cli.run_tui(args)
+        self.assertEqual(rc, 42)
+        b = self._captured[0]
+        self.assertTrue(b.show_preview)
+
+    def test_preview_pane_auto_hidden_lazy_path(self):
+        # --children-cmd path without --preview-cmd: auto → hidden.
+        args = _make_args(children_cmd='printf "a\\n"')
+        rc = _cli.run_tui(args)
+        self.assertEqual(rc, 42)
+        b = self._captured[0]
+        self.assertFalse(b.show_preview)
+
+    def test_preview_pane_auto_shown_lazy_path(self):
+        # --children-cmd path with --preview-cmd: auto → shown.
+        args = _make_args(children_cmd='printf "a\\n"', preview_cmd='echo hi')
+        rc = _cli.run_tui(args)
+        self.assertEqual(rc, 42)
+        b = self._captured[0]
+        self.assertTrue(b.show_preview)
 
     def test_show_ids_default_is_auto(self):
         args = _make_args(root_cmd='printf "a\\n"')

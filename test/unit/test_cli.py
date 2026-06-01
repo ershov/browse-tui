@@ -45,7 +45,9 @@ class TestArgParser(unittest.TestCase):
         self.assertEqual(args.record_sep, 'nl')
         self.assertEqual(args.on_enter, 'print-exit')
         self.assertEqual(args.print_format, '{id}')
-        self.assertFalse(args.no_preview)
+        # Tri-state default: None means "auto" — the Browser resolves
+        # the actual visibility based on get_preview presence.
+        self.assertIsNone(args.preview)
         self.assertEqual(args.action, [])
         self.assertEqual(extras, [])
 
@@ -62,7 +64,13 @@ class TestArgParser(unittest.TestCase):
 
     def test_no_preview_flag(self):
         args, _ = _cli.parse_args(['--no-preview'])
-        self.assertTrue(args.no_preview)
+        self.assertFalse(args.preview)
+
+    def test_preview_flag(self):
+        # Positive form: --preview overrides the auto rule and forces
+        # the pane visible regardless of get_preview presence.
+        args, _ = _cli.parse_args(['--preview'])
+        self.assertTrue(args.preview)
 
     def test_preview_ansi_default_true(self):
         # #245: default is ANSI-on so existing behaviour is preserved.

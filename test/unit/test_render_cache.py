@@ -136,6 +136,10 @@ def _make_browser(items=None, **kw):
 
     kw.setdefault('_headless', True)
     kw.setdefault('get_children', gc)
+    # Render-cache tests assume the preview pane is part of the layout;
+    # show_preview defaults to "auto" (= False here since there's no
+    # get_preview) so pin it on unless a test overrides.
+    kw.setdefault('show_preview', True)
     b = Browser(BrowserConfig(**kw))
     # Force the root children to be cached up front so visible_items has
     # something to traverse.
