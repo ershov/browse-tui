@@ -14211,6 +14211,10 @@ def build_argparser() -> argparse.ArgumentParser:
                    help='Comma-separated field names for tsv/csv/ifs/split.')
     p.add_argument('--record-sep', metavar='SEP', default='nl',
                    help='Record separator: nl (default) | null | LITERAL.')
+    p.add_argument('--path-sep', metavar='CHARS', default=None,
+                   help='Split each row id on CHARS to synthesize a tree '
+                        '(eager --root-cmd only). Ignored if rows carry '
+                        'explicit parent/depth.')
     # Actions
     p.add_argument('-a', '--action', metavar='KEY:LABEL:CMD',
                    action='append', default=[],
@@ -15343,9 +15347,24 @@ def _build_eager_browser(args, fields, record_sep, *, split='h'):
         data, fmt=args.input, fields=fields, record_sep=record_sep,
     ))
 
+    # The user typed --path-sep deliberately; if the rows also carry an
+    # explicit parent/depth column, from_flat_tree's precedence silently
+    # drops path_sep. Surface that here so the override isn't a mystery.
+    # Match the precedence's value-semantics: a null-valued column does
+    # NOT override path-split (path_sep still runs), so it must not warn.
+    if args.path_sep is not None and any(
+        (r.get('parent') is not None or r.get('depth') is not None)
+        for r in rows if isinstance(r, dict)
+    ):
+        sys.stderr.write(
+            'browse-tui: --path-sep ignored: rows carry explicit '
+            'parent/depth\n'
+        )
+
     return Browser.from_flat_tree(
         rows,
         root_id=args.root_id,
+        path_sep=args.path_sep,
         title=args.title,
         initial_scope=args.initial_scope,
         show_preview=args.preview,
@@ -15388,6 +15407,14 @@ def run_tui(args):
             f'[browse-tui auto] spec={getattr(args, "split_type", None)!r} '
             f'cols={cols} -> split={split!r}\n'
         )
+
+    # --path-sep synthesizes a tree from the fully-known eager row set;
+    # it has no meaning for lazy per-parent listing.
+    if args.path_sep is not None and args.children_cmd:
+        sys.stderr.write(
+            'error: --path-sep requires --root-cmd (eager mode)\n'
+        )
+        return 2
 
     if args.children_cmd:
         b = _build_lazy_browser(args, fields, record_sep, split=split)

@@ -194,7 +194,7 @@ tested parent-pointer machinery.
 - `run_tui` rejects `--path-sep` combined with `--children-cmd`:
   `error: --path-sep requires --root-cmd (eager mode)` → exit 2.
 - After parsing rows, if `args.path_sep` is set and any parsed row has a
-  `parent`/`depth` key, emit the stderr warning above (then let
+  non-None `parent`/`depth` value, emit the stderr warning above (then let
   `from_flat_tree`'s precedence drop `path_sep`).
 
 ## CLI surface

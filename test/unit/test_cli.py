@@ -25,6 +25,7 @@ _cli = load('_browse_tui_cli', '080-cli.py')
 # Cross-module name wiring (concatenated builds resolve these naturally).
 _state.Item = _data.Item
 _state.to_item = _data.to_item
+_state.expand_path_rows = _data.expand_path_rows
 _state.notify_wake = _term.notify_wake
 _cli.Action = _actions.Action
 _cli.Browser = _state.Browser
@@ -611,6 +612,208 @@ class TestPreviewFetcherWiring(unittest.TestCase):
             self.assertEqual(b.get_preview('z'), 'LAZY-z\n')
         finally:
             b.stop_workers()
+
+
+class TestPathSep(unittest.TestCase):
+    """``--path-sep`` argparse capture + eager-builder / run_tui wiring."""
+
+    def test_default_is_none(self):
+        args, _ = _cli.parse_args([])
+        self.assertIsNone(args.path_sep)
+
+    def test_argparse_captures_value(self):
+        args, _ = _cli.parse_args(['--path-sep', '/'])
+        self.assertEqual(args.path_sep, '/')
+
+    def test_in_help(self):
+        parser = _cli.build_argparser()
+        self.assertIn('--path-sep', parser.format_help())
+
+    def test_eager_builder_splits_into_tree(self):
+        # ``--path-sep /`` end to end: rows parsed then from_flat_tree
+        # synthesizes the prefix tree (intermediate nodes included).
+        args, _ = _cli.parse_args([
+            '--root-cmd', "printf 'docs/api/auth.md\\ndocs/README.md\\n'",
+            '--path-sep', '/',
+        ])
+        b = _cli._build_eager_browser(
+            args, fields=['id', 'title'], record_sep=b'\n',
+        )
+        try:
+            self.assertIsNotNone(b)
+            s = b._state
+            # Synthesised intermediate prefixes appear as real nodes.
+            self.assertEqual(
+                set(s._items_by_id),
+                {'docs', 'docs/api', 'docs/api/auth.md', 'docs/README.md'},
+            )
+            # Top-level nodes parent to the CLI's default root id ('').
+            self.assertEqual(s._parent_of_id['docs'], '')
+            self.assertEqual(s._parent_of_id['docs/api'], 'docs')
+            self.assertEqual(s._parent_of_id['docs/api/auth.md'], 'docs/api')
+            self.assertEqual(s._parent_of_id['docs/README.md'], 'docs')
+            # has_children derived from structure.
+            self.assertTrue(s._items_by_id['docs'].has_children)
+            self.assertTrue(s._items_by_id['docs/api'].has_children)
+            self.assertFalse(s._items_by_id['docs/api/auth.md'].has_children)
+        finally:
+            if b is not None:
+                b.stop_workers()
+
+    def test_eager_builder_metadata_rides_onto_leaf(self):
+        # A metadata column (size) rides along onto the leaf unchanged;
+        # only the id is split.
+        args, _ = _cli.parse_args([
+            '--root-cmd', "printf 'docs/api/auth.md\\t10\\n'",
+            '--fields', 'id,size',
+            '--path-sep', '/',
+        ])
+        b = _cli._build_eager_browser(
+            args, fields=['id', 'size'], record_sep=b'\n',
+        )
+        try:
+            self.assertIsNotNone(b)
+            s = b._state
+            self.assertEqual(
+                set(s._items_by_id),
+                {'docs', 'docs/api', 'docs/api/auth.md'},
+            )
+            leaf = s._items_by_id['docs/api/auth.md']
+            self.assertEqual(getattr(leaf, 'size', None), '10')
+            # The synthesised prefixes carry no metadata.
+            self.assertIsNone(
+                getattr(s._items_by_id['docs'], 'size', None)
+            )
+        finally:
+            if b is not None:
+                b.stop_workers()
+
+    def test_path_sep_with_children_cmd_errors(self):
+        # Lazy mode is rejected: run_tui returns 2 with the exact message.
+        args, _ = _cli.parse_args([
+            '--children-cmd', 'ls $TUI_ID',
+            '--path-sep', '/',
+        ])
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            rc = _cli.run_tui(args)
+        self.assertEqual(rc, 2)
+        self.assertEqual(
+            buf.getvalue(),
+            'error: --path-sep requires --root-cmd (eager mode)\n',
+        )
+
+    def test_parent_column_warns_and_explicit_mode_wins(self):
+        # A parent column beats path_sep: warning emitted, parent-pointer
+        # grouping used (ids NOT split into prefix nodes).
+        args, _ = _cli.parse_args([
+            '--root-cmd', "printf '{\"id\": \"a/b\"}\\n"
+                          "{\"id\": \"a/b/c\", \"parent\": \"a/b\"}\\n'",
+            '--input', 'json',
+            '--path-sep', '/',
+        ])
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            b = _cli._build_eager_browser(
+                args, fields=['id', 'title'], record_sep=b'\n',
+            )
+        try:
+            self.assertEqual(
+                buf.getvalue(),
+                'browse-tui: --path-sep ignored: rows carry explicit '
+                'parent/depth\n',
+            )
+            self.assertIsNotNone(b)
+            s = b._state
+            # No synthesised 'a' prefix — explicit parent mode won.
+            self.assertEqual(set(s._items_by_id), {'a/b', 'a/b/c'})
+            self.assertEqual(s._parent_of_id['a/b'], '')
+            self.assertEqual(s._parent_of_id['a/b/c'], 'a/b')
+        finally:
+            if b is not None:
+                b.stop_workers()
+
+    def test_depth_column_warns_and_explicit_mode_wins(self):
+        # A depth column likewise beats path_sep: warning + depth-coded
+        # grouping, ids untouched.
+        args, _ = _cli.parse_args([
+            '--root-cmd', "printf '{\"id\": \"a/b\", \"depth\": 0}\\n"
+                          "{\"id\": \"a/b/c\", \"depth\": 1}\\n'",
+            '--input', 'json',
+            '--path-sep', '/',
+        ])
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            b = _cli._build_eager_browser(
+                args, fields=['id', 'title'], record_sep=b'\n',
+            )
+        try:
+            self.assertEqual(
+                buf.getvalue(),
+                'browse-tui: --path-sep ignored: rows carry explicit '
+                'parent/depth\n',
+            )
+            self.assertIsNotNone(b)
+            s = b._state
+            self.assertEqual(set(s._items_by_id), {'a/b', 'a/b/c'})
+            self.assertEqual(s._parent_of_id['a/b'], '')
+            self.assertEqual(s._parent_of_id['a/b/c'], 'a/b')
+        finally:
+            if b is not None:
+                b.stop_workers()
+
+    def test_null_valued_parent_does_not_warn_and_path_split_runs(self):
+        # A null-valued parent column does NOT override path-split (the
+        # precedence keys off non-None values), so no warning is emitted
+        # and the ids are still split into the synthesized prefix tree.
+        args, _ = _cli.parse_args([
+            '--root-cmd',
+            "printf '{\"id\": \"docs/api/auth.md\", \"parent\": null}\\n'",
+            '--input', 'json',
+            '--path-sep', '/',
+        ])
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            b = _cli._build_eager_browser(
+                args, fields=['id', 'title'], record_sep=b'\n',
+            )
+        try:
+            self.assertEqual(buf.getvalue(), '')
+            self.assertIsNotNone(b)
+            s = b._state
+            # Path-split ran: synthesized prefix nodes are present.
+            self.assertEqual(
+                set(s._items_by_id),
+                {'docs', 'docs/api', 'docs/api/auth.md'},
+            )
+        finally:
+            if b is not None:
+                b.stop_workers()
+
+    def test_null_valued_depth_does_not_warn_and_path_split_runs(self):
+        # Same for a null-valued depth column.
+        args, _ = _cli.parse_args([
+            '--root-cmd',
+            "printf '{\"id\": \"docs/api/auth.md\", \"depth\": null}\\n'",
+            '--input', 'json',
+            '--path-sep', '/',
+        ])
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            b = _cli._build_eager_browser(
+                args, fields=['id', 'title'], record_sep=b'\n',
+            )
+        try:
+            self.assertEqual(buf.getvalue(), '')
+            self.assertIsNotNone(b)
+            s = b._state
+            self.assertEqual(
+                set(s._items_by_id),
+                {'docs', 'docs/api', 'docs/api/auth.md'},
+            )
+        finally:
+            if b is not None:
+                b.stop_workers()
 
 
 class TestResolveListSize(unittest.TestCase):
