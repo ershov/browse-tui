@@ -45,9 +45,8 @@ import sys
 import threading
 
 from browse_tui import (
-    Action, Browser, BrowserConfig, Item, mod, scope_into, set_preview_op,
+    Action, Browser, BrowserConfig, Item, mod, set_preview_op,
     upsert, visible_items,
-    _recompute_filter_hidden,
 )
 
 # Optional md2ansi_lib plugin — colors user/assistant voice content inline.
@@ -4765,8 +4764,8 @@ def _is_cross_file_id(item_id):
 def _invalidate_if_cross_file(item_id):
     """Drop the cached preview for ``item_id`` if it's cross-file.
 
-    Called from the right-arrow and scope-down overrides so the next
-    preview pass re-runs ``get_preview`` against the updated state
+    Called from the ``on_expand`` and ``on_scope_change`` hooks so the
+    next preview pass re-runs ``get_preview`` against the updated state
     (expanded set / scope_stack) and upgrades the lightweight
     metadata card to the heavy umbrella cascade.
     """
@@ -4776,87 +4775,161 @@ def _invalidate_if_cross_file(item_id):
         _BROWSER.invalidate_preview(item_id)
 
 
-def _action_scope_down(ctx):
-    """Scope-down override that invalidates cross-file previews.
+def _on_scope_change(ctx, scope_id, prev_scope_id, direction):
+    """Scope-change hook: upgrade a cross-file scope_root's preview.
 
-    Replicates the framework default (``_scope_down``) and then drops
-    the cached preview for the new scope_root if it's a cross-file
-    id, so the framework re-runs ``get_preview`` against the updated
-    scope_stack — the row transitions from lightweight metadata to
-    the heavy umbrella cascade.
+    Registered as the ``on_scope_change`` lifecycle hook, so it fires on
+    every runtime scope transition — the ``alt-down`` / ``alt-up`` keys
+    and a programmatic ``ctx.scope_into`` / ``ctx.scope_out`` — not just
+    one overridden key. (The construction-time ``initial_scope`` is set
+    up before the loop starts and does not fire the hook, matching the
+    old override, which likewise never ran at startup.)
+
+    On scope-IN (``direction == 'in'``) into a cross-file id, drop the
+    cached preview for the new scope_root so the next preview pass
+    re-runs ``get_preview`` against the updated ``scope_stack`` and
+    upgrades the row from the lightweight metadata card to the heavy
+    umbrella cascade. Scope-OUT (``direction == 'out'``) needs no
+    invalidation — the row being scoped out of stays as-is, and the new
+    (shallower) scope_root was already rendered heavy when it was first
+    scoped into.
+
+    This replaces the old ``alt-down`` override (``_action_scope_down``),
+    which mirrored the framework's ``scope_into`` internals inline just
+    to append this trailing invalidation; the framework default
+    ``_scope_down`` now performs the scope push / cursor reset / children
+    fetch / filter recompute / redraw / fire, and this hook carries the
+    one piece that was recipe-specific.
+    """
+    if direction == 'in':
+        _invalidate_if_cross_file(scope_id)
+
+
+# Ids whose expand fired while their children were still being
+# fetched. ``_on_expand`` parks them here; ``_on_children_loaded``
+# drains each one and performs the deferred jump-to-latest-voice once
+# the children land. See ``_on_expand`` for the cached-vs-uncached
+# composition.
+_AWAITING_VOICE_JUMP = set()
+
+
+def _jump_to_latest_voice(ctx, item_id):
+    """Move the cursor to the latest voice among ``item_id``'s children.
+
+    Single-level: ``_latest_voice_among_children`` reads the direct
+    children only, so this lands on the newest voice one level inside —
+    drilling further is user-driven. Mode-agnostic since #475 (flat and
+    tree both resolve through ``get_children``). No-op when there is no
+    voice at this level or the latest voice is the row itself.
+    """
+    latest = _latest_voice_among_children(item_id)
+    if latest is not None and latest != item_id:
+        ctx.cursor_to(latest)
+
+
+def _on_expand(ctx, ids):
+    """Expand hook: upgrade cross-file previews + jump to latest voice.
+
+    Registered as the ``on_expand`` lifecycle hook, so it fires on the
+    collapse→expand transition from EVERY source — the ``→`` key, the
+    minimal ``right`` handler's ``ctx.expand`` for a collapsed row, a
+    programmatic ``ctx.expand``, and the recipe's own deep-link /
+    startup expands — not just keyboard input. For each newly-expanded
+    id this:
+
+      * drops the cached preview if the id is cross-file
+        (``_invalidate_if_cross_file``), so the row upgrades from the
+        lightweight metadata card to the heavy umbrella cascade on the
+        next preview pass — the row has just transitioned into the
+        active (expanded) state; and
+      * lands the cursor on the latest voice among the now-visible
+        direct children. Children may not be cached yet at fire time:
+        when ``ctx.cached_children(id) is not None`` the children are
+        in hand and the jump happens now; otherwise the id is parked
+        in ``_AWAITING_VOICE_JUMP`` and ``_on_children_loaded`` does
+        the jump once the async fetch settles.
+
+    This replaces the old ``→`` override's ``ctx.expand(id).then(_land)``
+    chain, which only fired for an expand the recipe itself issued —
+    the hook composition fires for user-driven keyboard expansion too.
+    """
+    for id in ids:
+        _invalidate_if_cross_file(id)
+        if ctx.cached_children(id) is not None:
+            _jump_to_latest_voice(ctx, id)
+        else:
+            _AWAITING_VOICE_JUMP.add(id)
+
+
+def _on_children_loaded(ctx, parent_ids):
+    """Children-loaded hook: fulfil deferred jump-to-latest-voice.
+
+    The source-agnostic completion side of the composition started in
+    ``_on_expand``. For each parent whose fetch just settled, if that
+    parent was awaiting its post-expand jump, discard it from the
+    pending set and land the cursor on the latest voice now that the
+    children are cached. Parents that settled for any other reason
+    (a background ``refresh`` / tail refetch, or an expand that did not
+    request a jump) are simply not in the set, so the cursor is never
+    yanked by an arrival the user did not trigger.
+
+    The id is discarded **unconditionally** once seen — a stale entry
+    must never linger and trigger a spurious jump on a later settlement.
+    But the jump only fires when the parent is **still expanded**: the
+    framework settles ``on_children_loaded`` when the fetch lands
+    regardless of expanded state, so a node collapsed before its
+    in-flight fetch delivered would otherwise have the cursor yanked
+    onto a now-hidden child (installing a sticky anchor). This is the
+    "recipe checks 'still expanded'" guard the composition pattern
+    prescribes.
+    """
+    for pid in parent_ids:
+        if pid in _AWAITING_VOICE_JUMP:
+            _AWAITING_VOICE_JUMP.discard(pid)
+            if pid in ctx.state.expanded:
+                _jump_to_latest_voice(ctx, pid)
+
+
+def _action_tree_right(ctx):
+    """Right-arrow handler for the already-expanded re-press only.
+
+    The expand itself, its ``autoscroll`` scroll-to-fit goal, and the
+    post-expand jump-to-latest-voice are all handled by the framework
+    default plus the ``on_expand`` / ``on_children_loaded`` hooks: a
+    collapsed row just delegates to ``ctx.expand(id, autoscroll=True)``
+    and lets ``_on_expand`` do the cursor jump (for every source, not
+    only the keyboard) and the cross-file preview upgrade.
+
+    The one gesture the hooks cannot reproduce is the **re-press**: when
+    ``→`` is pressed on a row that is *already* expanded, no state change
+    occurs, so ``on_expand`` does not fire. The framework default would
+    step the cursor onto the row's FIRST child (oldest, since children
+    list chronologically); browse-claude's signature instead drills to
+    the LATEST voice one level down. This handler keeps only that case —
+    a single ``cursor_to`` — so a second ``→`` walks to the newest reply
+    rather than the top of the turn.
     """
     cur = ctx.cursor
     if cur is None:
         return
     if not getattr(cur, 'has_children', False):
-        return
-    state = ctx._browser._state
-    target_id = cur.id
-    # Use the framework's scope_into directly; it pushes the id onto
-    # ``scope_stack`` and restores the per-scope expanded set.
-    scope_into(state, target_id)
-    state.cursor = 0
-    if target_id not in state._children:
-        ctx.expand(target_id)
-    # Scope change is a full-walk trigger for filter recompute (ticket
-    # #500). Without this, an item that was ``_filter_hidden=True``
-    # from a prior recompute stays hidden after being scoped into.
-    # Mirrors the hook in ``Browser.scope_into._do``.
-    if ctx._browser._filters:
-        _recompute_filter_hidden(
-            state, ctx._browser._filters,
-            show_ids=ctx._browser.show_ids,
-        )
-    ctx._browser._needs_redraw.add('all')
-    ctx._browser._fire_scope_change()
-    _invalidate_if_cross_file(target_id)
-
-
-def _action_tree_right(ctx):
-    """Right-arrow override: expand + jump to latest voice.
-
-    Mode-agnostic since #475 — flat mode and tree mode both now place
-    the cursor on the latest voice inside the newly-revealed (or
-    already-expanded) subtree. ``_latest_voice_among_children`` uses
-    ``get_children`` so it returns the right thing in both modes
-    (umbrellas in tree, flat leaves in flat).
-
-    Step-into for already-expanded rows reuses the framework default
-    (one row down — the framework's expand-then-render guarantees the
-    next row is the first child).
-    """
-    cur = ctx.cursor
-    if cur is None:
-        return
-    expanded = ctx.state.expanded
-    expandable = getattr(cur, 'has_children', False)
-
-    if not expandable:
-        # Non-expandable row: nothing to do.
+        # Non-expandable row: nothing to do (framework default also
+        # no-ops here).
         return
 
     target_id = cur.id
-    if target_id in expanded:
+    if target_id in ctx.state.expanded:
         # Already expanded — jump to the latest voice one level down.
         # User can press Right again to drill further; no auto-deep-dive.
-        latest = _latest_voice_among_children(target_id)
-        if latest and latest != target_id:
-            ctx.cursor_to(latest)
+        _jump_to_latest_voice(ctx, target_id)
         return
 
-    # Collapsed expandable row: expand, then cursor to the latest voice
-    # among the newly-visible direct children. Single level — drilling
-    # further is user-driven. ``autoscroll=True`` parks the framework's
-    # scroll-to-fit goal so the parent row stays visible while the
-    # subtree slides into view; the subsequent ``cursor_to`` then moves
-    # the cursor to the latest voice without scrolling the parent off
-    # the top.
-    def _land():
-        latest = _latest_voice_among_children(target_id)
-        if latest is not None and latest != target_id:
-            ctx.cursor_to(latest)
-    ctx.expand(target_id, autoscroll=True).then(_land)
-    _invalidate_if_cross_file(target_id)
+    # Collapsed expandable row: expand with the user-navigation
+    # scroll-to-fit goal. ``_on_expand`` performs the post-expand jump
+    # (cached now, or after ``_on_children_loaded`` settles) and the
+    # cross-file preview invalidation — for this keypress and for every
+    # other expansion source alike.
+    ctx.expand(target_id, autoscroll=True)
 
 
 def _action_toggle_tree(ctx):
@@ -5113,15 +5186,29 @@ def main():
             Action('K',     'Jump to prev voice (user/asst)',  _action_prev_voice,  'none'),
             Action('t',     'Toggle flat / tree view',         _action_toggle_tree, 'none'),
             Action('h',     'Toggle voice-only filter',        _action_toggle_filter, 'none'),
-            # Tree-mode-aware Right: expand + jump to latest voice
-            # inside the now-visible subtree.
+            # Right: the framework default expands a collapsed row; the
+            # ``on_expand`` / ``on_children_loaded`` hooks then jump the
+            # cursor to the latest voice (for every expansion source, not
+            # just this keypress). This minimal handler keeps only the
+            # re-press case — drilling to the latest voice one level down
+            # when the row is already expanded (no expand → no hook).
             Action('right', 'Expand + cursor to latest voice', _action_tree_right,  'cursor'),
-            # Scope-down override invalidates the cross-file preview
-            # cache so the new scope_root upgrades from the lightweight
-            # metadata card to the heavy umbrella cascade on the next
-            # preview pass.
-            Action('alt-down', 'Scope down into item',          _action_scope_down,  'cursor'),
+            # alt-down (scope-down) uses the framework default; the
+            # ``on_scope_change`` hook below upgrades a cross-file
+            # scope_root's preview on scope-in.
         ],
+        # Post-expand jump-to-latest-voice + cross-file preview upgrade,
+        # composed across the two hooks so they fire for EVERY expansion
+        # source (keyboard, programmatic, deep-link, startup), not only
+        # the right-arrow override the recipe used to carry. The cached
+        # case jumps in ``on_expand``; the uncached case defers to
+        # ``on_children_loaded`` once the fetch settles.
+        on_expand=_on_expand,
+        on_children_loaded=_on_children_loaded,
+        # Scope-in to a cross-file id upgrades the new scope_root from
+        # the lightweight metadata card to the heavy umbrella cascade.
+        # Fires for alt-down, programmatic scope, and startup alike.
+        on_scope_change=_on_scope_change,
         help_intro=_HELP_INTRO_TMPL.format(default=_MESSAGE_LIMIT),
     ))
     _BROWSER = b

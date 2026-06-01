@@ -1289,42 +1289,29 @@ def _action_edit_source(ctx):
     _run_source_command(ctx, 'EDITOR', 'vim')
 
 
-def _action_expand(ctx):
-    """``→`` — expand the cursor row, auto-expanding a file's lone heading.
+def _on_expand(ctx, ids):
+    """Auto-expand a file whose only child is a heading.
 
-    Overrides the framework default (registered on the same ``right``
-    key, which wins per ``build_keymap``). It reproduces both default
-    behaviours:
+    Registered as the ``on_expand`` lifecycle hook, so it fires on the
+    collapse→expand transition from EVERY source — the ``→`` key, a
+    programmatic ``ctx.expand``, and the startup ``b.expand`` issued
+    before ``run()`` — not just keyboard input. For each id that just
+    entered the expanded set, if it names a file whose sole child is a
+    heading (see ``_lone_heading_child_id``), that heading is expanded
+    too, so a single-heading document reveals its real sections in one
+    gesture instead of two.
 
-      * a collapsed expandable row is expanded;
-      * an already-expanded row steps the cursor onto its first child.
-
-    The browse-md addition lives in the collapse→expand branch: when
-    the row just expanded is a file whose only child is a heading (see
-    ``_lone_heading_child_id``), that heading is expanded too, so a
-    single-heading document reveals its real sections in one keystroke
-    instead of two. The child id comes from the pre-built tree, so the
-    two expands can be issued back-to-back without waiting on the
-    file-root's children to be cached — the final expanded-set / render
-    is order-independent.
+    The cascade is self-terminating: the lone heading's own child is a
+    section (never itself a lone-heading file), so the follow-on expand
+    of ``cascade_id`` re-fires ``on_expand`` once more and then stops.
+    The child id comes from the pre-built tree, so the expand can be
+    issued without waiting on the file-root's children to be cached —
+    the final expanded-set / render is order-independent.
     """
-    cur = ctx.cursor
-    if cur is None or not getattr(cur, 'has_children', False):
-        return
-    target_id = cur.id
-    if target_id not in ctx.state.expanded:
-        # Collapsed → expand. ``autoscroll=True`` matches the default's
-        # scroll-to-fit on user-driven expansion; the cascade expand
-        # leaves it off so it doesn't reset that goal.
-        ctx.expand(target_id, autoscroll=True)
-        cascade_id = _lone_heading_child_id(target_id)
+    for id in ids:
+        cascade_id = _lone_heading_child_id(id)
         if cascade_id is not None:
             ctx.expand(cascade_id)
-        return
-    # Already expanded → step onto the first child (framework default).
-    item = _BY_ID.get(target_id)
-    if item is not None and item._children:
-        ctx.cursor_to(item._children[0].id)
 
 
 _HELP_INTRO = """\
@@ -1499,12 +1486,10 @@ def main():
                           _action_view_source, 'none'))
     actions.append(Action('E', 'Edit source for cursor/selection in $EDITOR',
                           _action_edit_source, 'none'))
-    # Override the built-in Right-arrow so expanding a file whose only
-    # child is a heading auto-expands that heading too (see
-    # ``_action_expand`` / ``_lone_heading_child_id``).
-    actions.append(Action('right',
-                          "Expand; auto-expand a file's lone heading",
-                          _action_expand, 'cursor'))
+    # The built-in Right-arrow (``_nav_right``) handles expand and
+    # step-into-first-child; the lone-heading auto-expand rides the
+    # ``on_expand`` hook below so it fires for every expansion source,
+    # not just the keyboard (see ``_on_expand`` / ``_lone_heading_child_id``).
     b = Browser(BrowserConfig(
         title='browse-md',
         show_children_pane=False,
@@ -1514,6 +1499,7 @@ def main():
         get_preview=get_preview,
         initial_scope=initial_scope,
         actions=actions,
+        on_expand=_on_expand,
         help_intro=_HELP_INTRO,
     ))
     # Stash the Browser on the module so ``get_preview`` can read
@@ -1526,14 +1512,10 @@ def main():
     # the scope_stack hack that made alt-up land on an empty list
     # (ticket #566).
     if auto_expand_id is not None:
+        # This expand fires ``on_expand`` like any other, so the
+        # lone-heading cascade in ``_on_expand`` runs at startup too —
+        # the cascade lives in exactly one place.
         b.expand(auto_expand_id)
-        # Same lone-heading cascade as the Right-arrow override
-        # (``_action_expand``): when the single file wraps everything
-        # under one heading, expand that heading at startup too so its
-        # sections are visible without a second keystroke.
-        cascade_id = _lone_heading_child_id(auto_expand_id)
-        if cascade_id is not None:
-            b.expand(cascade_id)
     sys.exit(b.run())
 
 

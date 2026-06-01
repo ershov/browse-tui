@@ -1614,6 +1614,15 @@ class State:
     # these slots before processing the batch.
     _preview_dirty: bool = False
     _preview_kicks: list = field(default_factory=list)
+    # Parents whose children fetch SETTLED during the current
+    # ``apply_ops`` / ``apply_children_results`` pass — recorded by
+    # ``_set_loading(..., settled=True)`` (the ``complete`` op tail and
+    # the legacy delivery deque). Collected on State so ``apply_ops``
+    # stays argument-pure; the Browser-level callers move these into
+    # ``_children_loaded_pending`` after the pass and reset the list
+    # before populating it. NOT touched by ``clear_children`` (which
+    # drops the cache) — see ``_set_loading``.
+    _settled_parents: list = field(default_factory=list)
 
 
 # ---- scope management ----------------------------------------------------
@@ -1781,6 +1790,29 @@ def _promote_synthetics(state: State, items):
         else:
             out.append(incoming)
     return out
+
+
+def _set_loading(state: State, parent_id, value, *, settled=False) -> None:
+    """Write ``state._loading[parent_id] = value``; the loading choke point.
+
+    ``settled=True`` marks a genuine fetch SETTLEMENT — children for
+    ``parent_id`` became available (the worker's ``complete`` op tail,
+    ``apply_children_results``) — and records the id on
+    ``state._settled_parents`` so the caller can move it into the
+    Browser's ``_children_loaded_pending`` set (drained once per tick by
+    ``_fire_children_loaded_if_pending``).
+
+    ``settled`` is deliberately NOT passed by ``clear_children`` /
+    ``incomplete`` / cache-invalidation: those clear loading but DROP (or
+    never had) the children, so firing ``on_children_loaded`` there would
+    violate the contract that ``ctx.cached_children(parent_id)`` is
+    populated at fire time. Callers that collect settlements reset
+    ``state._settled_parents`` before populating it (see ``apply_ops`` /
+    ``apply_children_results``).
+    """
+    state._loading[parent_id] = value
+    if settled:
+        state._settled_parents.append(parent_id)
 
 
 def cache_invalidate_subtree(state: State, item_id) -> None:
@@ -2538,7 +2570,11 @@ def _apply_clear_children(state: State, parent_id) -> bool:
     state._children.pop(parent_id, None)
     # Spec: "loading flag is reset accordingly" — we set False (the
     # parent is in a known not-loading state; any future fetch will
-    # flip it back to True via dispatch).
+    # flip it back to True via dispatch). NOT a settlement: the cache
+    # entry was just dropped above, so ``cached_children`` would be
+    # ``None`` — firing ``on_children_loaded`` here would break its
+    # "children present at fire time" contract. Hence the bare
+    # assignment (no ``_set_loading(..., settled=True)``).
     state._loading[parent_id] = False
     return had_entry or bool(children)
 
@@ -2640,6 +2676,11 @@ def apply_ops(state: State, ops, *, preview_ansi: bool = True) -> None:
     structural = False
     preview_dirty = False
     preview_kicks = []
+    # Reset the per-batch settlement list before processing so the
+    # caller reads only this batch's settled parents (mirrors the
+    # ``_preview_kicks`` reset above). ``_set_loading(..., settled=True)``
+    # — fired by the ``complete`` op below — appends to it.
+    state._settled_parents = []
     for op in ops:
         kind = op[0]
         if kind == 'upsert':
@@ -2668,7 +2709,10 @@ def apply_ops(state: State, ops, *, preview_ansi: bool = True) -> None:
                 structural = True
         elif kind == 'complete':
             _, parent_id = op
-            state._loading[parent_id] = False
+            # Genuine settlement: children are now available (the upserts
+            # in this same batch, or an empty list). Record so
+            # ``on_children_loaded`` fires for ``parent_id``.
+            _set_loading(state, parent_id, False, settled=True)
         elif kind == 'incomplete':
             _, parent_id = op
             state._loading[parent_id] = True
@@ -3840,6 +3884,12 @@ class BrowserConfig:
     on_cursor_change: Optional[Callable] = None
     on_scope_change: Optional[Callable] = None
     on_selection_change: Optional[Callable] = None
+    on_expand: Optional[Callable] = None
+    on_collapse: Optional[Callable] = None
+    on_children_loaded: Optional[Callable] = None
+    on_search_change: Optional[Callable] = None
+    on_filter_change: Optional[Callable] = None
+    on_resize: Optional[Callable] = None
     on_quit: Optional[Callable] = None
     _headless: bool = False
 
@@ -4108,11 +4158,34 @@ class Browser:
         # cursor-anchor re-positioning that lands back on the same id
         # is a no-op. ``on_scope_change`` fires after every
         # scope_into / scope_out transition (main-thread paths only).
-        # ``on_quit`` fires once during shutdown after the screen is
-        # restored.
+        # ``on_expand`` / ``on_collapse`` fire from a drain-time diff of
+        # ``state.expanded`` against ``_last_expanded`` (see
+        # ``_fire_expand_collapse_if_pending``) — no mutation site is
+        # instrumented, so every expand source (keyboard, ``ctx.expand``,
+        # recursive actions, ``collapse_all``, startup) is caught.
+        # ``on_children_loaded`` fires once per drain with the parents
+        # whose ``get_children`` fetch SETTLED this drain (the two
+        # genuine-settlement sites — the ``complete`` op and
+        # ``apply_children_results`` — record into
+        # ``_children_loaded_pending``; ``clear_children`` deliberately
+        # does NOT, since it drops the cache). ``on_search_change`` /
+        # ``on_filter_change`` fire from a drain-time diff of the effective
+        # query / filter tuple against ``_last_search_query`` /
+        # ``_last_filters`` (so every mutation source — live edit, commit,
+        # ``set_search_query`` / ``set_filters`` / ``add_filter`` /
+        # ``clear_*`` — coalesces to one fire per drain). ``on_resize``
+        # fires once when an observed SIGWINCH changes ``term_size()`` vs
+        # ``_last_size``. ``on_quit`` fires once during shutdown after the
+        # screen is restored.
         self._on_cursor_change = config.on_cursor_change
         self._on_scope_change = config.on_scope_change
         self._on_selection_change = config.on_selection_change
+        self._on_expand = config.on_expand
+        self._on_collapse = config.on_collapse
+        self._on_children_loaded = config.on_children_loaded
+        self._on_search_change = config.on_search_change
+        self._on_filter_change = config.on_filter_change
+        self._on_resize = config.on_resize
         self._on_quit = config.on_quit
         # Worker-slot registry for ``run_in_slot``. Each entry is the
         # currently-active CancellationToken for a named slot;
@@ -4121,6 +4194,32 @@ class Browser:
         self._slots_lock = threading.Lock()
         self._cursor_change_pending = False
         self._last_cursor_id = None
+        # Snapshot of ``state.expanded`` as of the last expand/collapse
+        # fire. Seeded empty so any expansion issued before ``run()``
+        # (recipe startup ``b.expand(...)``, or an ``initial_scope`` that
+        # restores a saved set) fires ``on_expand`` on the first drain.
+        # ``scope_into`` / ``scope_out`` re-baseline this after a
+        # transition so per-scope set restores don't masquerade as
+        # expands/collapses.
+        self._last_expanded = set()
+        # Parents whose ``get_children`` fetch settled since the last
+        # ``_fire_children_loaded_if_pending`` drain. A set (not a diff)
+        # collected by the genuine-settlement sites; drained into one
+        # ``on_children_loaded(list)`` per tick. ``clear_children`` is
+        # excluded — it clears loading but drops the children.
+        self._children_loaded_pending = set()
+        # Snapshots for the input-state / geometry diffs. ``on_search_change``
+        # / ``on_filter_change`` fire when the effective query / filter tuple
+        # differs from these (clearing to ``''`` / ``()`` is a real change →
+        # fires once). ``_last_size`` is ``None`` until the first observed
+        # resize so the first SIGWINCH always fires. ``_resize_pending`` is
+        # latched at the SIGWINCH observation points (mirrors
+        # ``_cursor_change_pending``); the drain consumes it so ``term_size``
+        # is only read on an actual resize, not every tick.
+        self._last_search_query = ''
+        self._last_filters: tuple = ()
+        self._last_size = None
+        self._resize_pending = False
         self._headless = config._headless
 
         # --- domain state ------------------------------------------------
@@ -4919,6 +5018,18 @@ class Browser:
                 self._state, ops_list, preview_ansi=self.preview_ansi,
             )
 
+            # Children-loaded settlement (#600). ``apply_ops`` recorded
+            # every parent whose ``complete`` op settled this batch on
+            # ``state._settled_parents``; move them into the drain-time
+            # pending set. ``_fire_children_loaded_if_pending`` delivers
+            # the batch as one ``on_children_loaded(list)`` per tick. Gated
+            # on the handler (#627): with no listener the pending set stays
+            # empty and the fire short-circuits — no per-settlement update.
+            if (self._on_children_loaded is not None
+                    and self._state._settled_parents):
+                self._children_loaded_pending.update(
+                    self._state._settled_parents)
+
             # Preview-op side effects (#446). ``apply_ops`` left the
             # outcome on ``state._preview_dirty`` / ``state._preview_kicks``;
             # translate to a redraw flag + ``request_preview`` calls
@@ -5395,6 +5506,9 @@ class Browser:
             state = self._state
             if state.scope_stack and state.scope_stack[-1] == id_:
                 return
+            # Capture the scope we're leaving (``None`` at root) before
+            # the transition mutates the stack, to thread into the hook.
+            prev_scope_id = self.scope
             scope_into(state, id_)
             state.cursor = 0
             if id_ not in state._children:
@@ -5415,7 +5529,17 @@ class Browser:
                 )
             self._needs_redraw.add('all')
             mark_cursor_changed(self)
-            self._fire_scope_change()
+            self._fire_scope_change(self.scope, prev_scope_id, 'in')
+            # Re-baseline the expand/collapse diff: ``scope_into`` just
+            # restored the new scope's per-scope expanded set, which the
+            # drain-time diff would otherwise read as a burst of expands /
+            # collapses. A scope transition is an ``on_scope_change``
+            # event, not an expand — so anchor ``_last_expanded`` to the
+            # restored set and the next diff sees no delta. Intentionally
+            # left unconditional (not gated on a handler like the #627
+            # fire-path skips): scope transitions are rare, not per-drain,
+            # and this keeps the baseline correct if a handler is ever set.
+            self._last_expanded = set(self._state.expanded)
         self.post(_do)
 
     def scope_out(self) -> None:
@@ -5429,6 +5553,9 @@ class Browser:
         """
         def _do():
             state = self._state
+            # Capture the scope we're leaving (``None`` at root, though
+            # that path early-returns below) before popping the stack.
+            prev_scope_id = self.scope
             popped = scope_out(state)
             if popped is None:
                 return
@@ -5452,7 +5579,14 @@ class Browser:
                 state.cursor = 0
             self._needs_redraw.add('all')
             mark_cursor_changed(self)
-            self._fire_scope_change()
+            self._fire_scope_change(self.scope, prev_scope_id, 'out')
+            # Re-baseline the expand/collapse diff — symmetric with
+            # ``scope_into``. ``scope_out`` restored the parent scope's
+            # expanded set; anchor ``_last_expanded`` to it so the restore
+            # doesn't masquerade as expands/collapses. Intentionally left
+            # unconditional (not gated on a handler like the #627 fire-path
+            # skips): runs only on a rare scope transition, not per drain.
+            self._last_expanded = set(self._state.expanded)
         self.post(_do)
 
     # ---- expansion helpers -----------------------------------------------
@@ -5739,27 +5873,216 @@ class Browser:
             return
         self._last_cursor_id = cur_id
         try:
-            self._on_cursor_change(self._make_ctx_for_hook())
+            self._on_cursor_change(self._make_ctx_for_hook(), cur_id)
         except Exception as e:
             self.error(f'on_cursor_change: {type(e).__name__}: {e}')
 
-    def _fire_scope_change(self) -> None:
-        """Fire ``on_scope_change`` after a scope transition."""
+    def _fire_scope_change(self, scope_id=None, prev_scope_id=None,
+                           direction=None) -> None:
+        """Fire ``on_scope_change`` after a scope transition.
+
+        ``scope_id`` is the new current scope id (``None`` at root),
+        ``prev_scope_id`` the scope just left (``None`` at root), and
+        ``direction`` is ``'in'`` for a ``scope_into`` / ``'out'`` for a
+        ``scope_out``. The Browser-level ``scope_into`` / ``scope_out``
+        capture these and thread them through; a bare ``_fire_scope_change()``
+        (no transition context) passes ``None`` for all three.
+        """
         if self._on_scope_change is None:
             return
         try:
-            self._on_scope_change(self._make_ctx_for_hook())
+            self._on_scope_change(self._make_ctx_for_hook(),
+                                  scope_id, prev_scope_id, direction)
         except Exception as e:
             self.error(f'on_scope_change: {type(e).__name__}: {e}')
 
     def _fire_selection_change(self) -> None:
-        """Fire ``on_selection_change`` if installed."""
+        """Fire ``on_selection_change`` if installed.
+
+        Passes the resulting selected ids as a list. ``state.selected``
+        is a set; we sort so the payload is stable across fires (the
+        underlying set order is unspecified).
+        """
         if self._on_selection_change is None:
             return
         try:
-            self._on_selection_change(self._make_ctx_for_hook())
+            ids = sorted(self._state.selected)
+            self._on_selection_change(self._make_ctx_for_hook(), ids)
         except Exception as e:
             self.error(f'on_selection_change: {type(e).__name__}: {e}')
+
+    def _fire_expand_collapse_if_pending(self) -> None:
+        """Fire ``on_collapse`` / ``on_expand`` from a drain-time set diff.
+
+        Diffs ``state.expanded`` against ``_last_expanded``:
+        ``added = expanded - last`` fires one ``on_expand(list(added))``,
+        ``removed = last - expanded`` fires one ``on_collapse(list(removed))``.
+        A whole burst between drains (Alt-Right / Alt-Left, ``collapse_all``,
+        ``expand_subtree``) is therefore delivered as a single call; a drain
+        that nets to no change fires nothing. ``on_collapse`` fires before
+        ``on_expand`` per the documented drain order.
+
+        No pending flag: when a handler is installed the diff runs every
+        drain so the many places that mutate ``state.expanded`` — including
+        the direct ``state.expanded.discard(...)`` in the actions layer —
+        are caught with no instrumentation at the mutation sites (the design
+        intent; the #500 failure mode prevented). The expanded set is small,
+        so a per-drain set diff is cheap.
+
+        When BOTH ``on_expand`` and ``on_collapse`` are unset (#627) the
+        whole prep — the diff AND the ``set(expanded)`` snapshot — is
+        skipped, so ``_last_expanded`` is NOT re-snapshotted and may go
+        stale while there is no handler. That is fine: hooks are
+        construction-time-fixed (set via ``BrowserConfig`` / before
+        ``run()``), so the snapshot is only consulted once a handler exists,
+        and it's re-baselined on every scope transition. This matches
+        ``on_cursor_change``, which likewise doesn't advance
+        ``_last_cursor_id`` when unset. (List order is unspecified — recipes
+        that need a stable order should sort.)
+        """
+        if self._on_expand is None and self._on_collapse is None:
+            return
+        expanded = self._state.expanded
+        if expanded != self._last_expanded:
+            removed = self._last_expanded - expanded
+            added = expanded - self._last_expanded
+            if removed and self._on_collapse is not None:
+                try:
+                    self._on_collapse(self._make_ctx_for_hook(),
+                                      list(removed))
+                except Exception as e:
+                    self.error(f'on_collapse: {type(e).__name__}: {e}')
+            if added and self._on_expand is not None:
+                try:
+                    self._on_expand(self._make_ctx_for_hook(), list(added))
+                except Exception as e:
+                    self.error(f'on_expand: {type(e).__name__}: {e}')
+            self._last_expanded = set(expanded)
+
+    def _fire_children_loaded_if_pending(self) -> None:
+        """Fire ``on_children_loaded`` once with the parents that settled.
+
+        Drains ``_children_loaded_pending`` — the set populated by the
+        genuine-settlement sites (the ``complete`` op tail via
+        ``apply_ops``, and ``apply_children_results``) — into a single
+        ``on_children_loaded(list)`` call per drain. A full refresh that
+        refetches several expanded parents therefore delivers them
+        batched as their fetches settle in the same tick.
+
+        The pending set is ALWAYS cleared, even when no handler is
+        installed or the handler raises, so a handler registered later
+        never observes a stale historical settlement and a throw can't
+        wedge the set. Exceptions route to :meth:`error` (never crash
+        the loop), matching the other hooks. ``clear_children`` does not
+        populate the set, so a cache-drop never fires here.
+        """
+        if not self._children_loaded_pending:
+            return
+        parent_ids = list(self._children_loaded_pending)
+        self._children_loaded_pending.clear()
+        if self._on_children_loaded is None:
+            return
+        try:
+            self._on_children_loaded(self._make_ctx_for_hook(), parent_ids)
+        except Exception as e:
+            self.error(f'on_children_loaded: {type(e).__name__}: {e}')
+
+    def _fire_search_change_if_pending(self) -> None:
+        """Fire ``on_search_change`` once if the effective query changed.
+
+        Diffs ``self._search_query`` against ``_last_search_query``: any
+        delta fires one ``on_search_change(ctx, query)`` with the new
+        string, then re-snapshots. Several keystrokes between drains
+        coalesce to the final value; clearing to ``''`` is a real change
+        and fires once; an identical re-set is a no-op.
+
+        No pending flag: when a handler is installed the diff runs every
+        drain so every mutation source — live ``SEARCH_EDIT`` typing,
+        commit, ``set_search_query`` / ``clear_search`` — is caught without
+        instrumenting the mutation sites. When ``on_search_change`` is unset
+        (#627) the prep (the diff and the snapshot) is skipped entirely, so
+        ``_last_search_query`` is NOT re-snapshotted and may go stale; that
+        is fine because hooks are construction-time-fixed (matches
+        ``on_cursor_change``, which doesn't advance its snapshot when unset).
+        """
+        if self._on_search_change is None:
+            return
+        query = self._search_query
+        if query != self._last_search_query:
+            self._last_search_query = query
+            try:
+                self._on_search_change(self._make_ctx_for_hook(), query)
+            except Exception as e:
+                self.error(f'on_search_change: {type(e).__name__}: {e}')
+
+    def _fire_filter_change_if_pending(self) -> None:
+        """Fire ``on_filter_change`` once if the active filter tuple changed.
+
+        Diffs ``tuple(self.filters)`` (the committed-plus-live, empties
+        dropped) against ``_last_filters``: any delta fires one
+        ``on_filter_change(ctx, filters)`` with the new tuple, then
+        re-snapshots. ``set_filters`` / ``add_filter`` / ``clear_filters``
+        and the ``&`` edit/commit path all flow through this; an identical
+        re-set is a no-op, and ``add_filter('')`` is a no-op because the
+        ``filters`` property drops empty strings. Same skip-when-unset
+        contract as ``_fire_search_change_if_pending``: when
+        ``on_filter_change`` is unset (#627) the prep — including building
+        ``tuple(self.filters)`` — is skipped, so ``_last_filters`` is NOT
+        re-snapshotted and may go stale; fine because hooks are
+        construction-time-fixed (matches ``on_cursor_change``).
+        """
+        if self._on_filter_change is None:
+            return
+        filters = tuple(self.filters)
+        if filters != self._last_filters:
+            self._last_filters = filters
+            try:
+                self._on_filter_change(self._make_ctx_for_hook(), filters)
+            except Exception as e:
+                self.error(f'on_filter_change: {type(e).__name__}: {e}')
+
+    def _fire_resize_if_pending(self) -> None:
+        """Fire ``on_resize`` once when an observed resize changed the size.
+
+        Gated by ``_resize_pending`` — latched at the SIGWINCH observation
+        points in the run loop (mirrors ``_cursor_change_pending``) so
+        ``term_size()`` is only read on an actual resize, not every tick.
+        When pending, reads ``term_size()`` and, if ``(cols, rows)`` differs
+        from ``_last_size``, fires ``on_resize(ctx, cols, rows)`` and
+        re-snapshots.
+
+        When ``on_resize`` is unset (#627) the pending flag is still cleared
+        (so a single SIGWINCH never lingers) but the method early-returns
+        BEFORE reading ``term_size()`` — the syscall and the snapshot are
+        skipped, so ``_last_size`` may go stale; fine because hooks are
+        construction-time-fixed (matches ``on_cursor_change``).
+
+        ``term_size`` can be missing, raise, or return ``(0, 0)`` in a
+        headless / no-tty context (mirrors ``_clamp_split`` /
+        ``_list_pane_height_safe``); in any of those cases we don't fire
+        garbage dimensions and leave ``_last_size`` untouched.
+        """
+        if not self._resize_pending:
+            return
+        self._resize_pending = False
+        if self._on_resize is None:
+            return
+        ts = globals().get('term_size')
+        if ts is None:
+            return
+        try:
+            cols, rows = ts()
+        except Exception:
+            return
+        if not cols or not rows:
+            return
+        size = (cols, rows)
+        if size != self._last_size:
+            self._last_size = size
+            try:
+                self._on_resize(self._make_ctx_for_hook(), cols, rows)
+            except Exception as e:
+                self.error(f'on_resize: {type(e).__name__}: {e}')
 
     def _fire_on_quit(self) -> None:
         """Fire ``on_quit`` once during shutdown.
@@ -5771,7 +6094,7 @@ class Browser:
             return
         cb, self._on_quit = self._on_quit, None  # arm once
         try:
-            cb(self._make_ctx_for_hook())
+            cb(self._make_ctx_for_hook(), self._quit_code)
         except Exception:
             pass
 
@@ -5809,6 +6132,11 @@ class Browser:
         cache when ``_notify`` is the only thing waking the loop.
         """
         n = 0
+        # Collect genuine settlements (#600) for this delivery pass.
+        # Reset before populating so we read only this pass's parents
+        # (the same discipline ``apply_ops`` uses); harvested into
+        # ``_children_loaded_pending`` after the loop.
+        self._state._settled_parents = []
         while self._children_results:
             id_, items = self._children_results.popleft()
             # Replace the cached list — drop the old entries from the
@@ -5828,11 +6156,19 @@ class Browser:
             # Worker delivered → no longer loading. Stays addressable
             # via ``_loading`` rather than implied membership in
             # ``_children_pending`` (foundation for ``update_data``).
-            self._state._loading[id_] = False
+            # ``settled=True``: the children list was just installed
+            # above, so this is a genuine settlement → fires
+            # ``on_children_loaded``.
+            _set_loading(self._state, id_, False, settled=True)
             mark_visible_dirty(self._state)
             for p in self._children_in_flight.pop(id_, []):
                 p._resolve()
             n += 1
+        # Move this pass's settlements into the drain-time pending set.
+        # Gated on the handler (#627): no listener → pending stays empty.
+        if (self._on_children_loaded is not None
+                and self._state._settled_parents):
+            self._children_loaded_pending.update(self._state._settled_parents)
         if n:
             # Re-evaluate filter visibility — freshly-delivered items
             # are reachable now and need their ``_filter_hidden`` flags
@@ -7216,9 +7552,32 @@ class Browser:
                 self._update_preview_for_cursor()
                 self._update_children_for_cursor()
 
-                # Lifecycle hook: at most one fire per drain, only
-                # when the cursor id actually changed (see
-                # ``_fire_cursor_change_if_pending``).
+                # Post-drain lifecycle-hook settle pass. NOTE: this is
+                # only PART of the hook firing — ``on_scope_change`` and
+                # ``on_selection_change`` already fired synchronously at
+                # their mutation sites during the ``drain_main_queue``
+                # above (``scope_into`` / ``scope_out`` and the selection
+                # ops call ``_fire_*`` inline). The hooks below are the
+                # ones that diff / collect state across the whole drain and
+                # so must fire after it settles, each at most once per tick.
+                #
+                # The single ordering guarantee recipes may rely on is that
+                # ``on_cursor_change`` fires LAST, after expansion has
+                # settled, so a cursor-change handler sees the post-
+                # expansion tree with freshly-delivered children accounted
+                # for. The order of the rest is an implementation detail
+                # (not a contract): geometry (on_resize) and input state
+                # (on_search_change → on_filter_change) first since they may
+                # reshape the visible tree, then structure (on_collapse →
+                # on_expand), then children-arrival (on_children_loaded),
+                # then the cursor. (on_resize consumes the ``_resize_pending``
+                # flag latched at the SIGWINCH observation points below, so
+                # a resize observed this iteration fires on the next drain.)
+                self._fire_resize_if_pending()
+                self._fire_search_change_if_pending()
+                self._fire_filter_change_if_pending()
+                self._fire_expand_collapse_if_pending()
+                self._fire_children_loaded_if_pending()
                 self._fire_cursor_change_if_pending()
 
                 # Resize flag — set by SIGWINCH handler in 020-terminal.
@@ -7231,6 +7590,10 @@ class Browser:
                     # Walk loaded items and drop every ``preview_render``
                     # so the next paint regenerates at the new width.
                     self._invalidate_all_preview_renders()
+                    # Latch for the ``on_resize`` hook — the next drain's
+                    # ``_fire_resize_if_pending`` reads ``term_size`` and
+                    # fires if the dimensions actually changed.
+                    self._resize_pending = True
                 # Screen-lost flag — set by SIGCONT / term_resume after the
                 # alt-screen content was destroyed externally. Drop the
                 # per-pane row caches so ``end_row`` doesn't cache-hit
@@ -7258,6 +7621,7 @@ class Browser:
                     globals()['g_resize_flag'] = False
                     self._needs_redraw.add('all')
                     self._invalidate_all_preview_renders()
+                    self._resize_pending = True
                 if globals().get('g_screen_lost_flag', False):
                     globals()['g_screen_lost_flag'] = False
                     self._pane_cache.clear()
@@ -12331,6 +12695,9 @@ def _scope_down(ctx):
         return
     if not getattr(item, 'has_children', False):
         return  # don't scope into leaves; phase-2 simplification
+    # Capture the scope we're leaving (``None`` at root) before the
+    # transition mutates the stack, to thread into the hook.
+    prev_scope_id = ctx.scope
     scope_into(state, item.id)
     # Land the cursor on the scope row at the top of the new view.
     state.cursor = 0
@@ -12341,7 +12708,15 @@ def _scope_down(ctx):
         # shows ``loading…`` until results land.
         ctx.expand(item.id)
     ctx._browser._needs_redraw.add('all')
-    ctx._browser._fire_scope_change()
+    ctx._browser._fire_scope_change(ctx.scope, prev_scope_id, 'in')
+    # Re-baseline the expand/collapse diff: this handler bypasses
+    # ``Browser.scope_into`` and restores the new scope's expanded set
+    # directly via the free ``scope_into(state, ...)`` above, so anchor
+    # ``_last_expanded`` to the restored set (mirrors the Browser method)
+    # — the restore is an ``on_scope_change`` event, not an expand.
+    # Intentionally left unconditional (not gated on a handler like the
+    # #627 fire-path skips): a scope keystroke is rare, not per drain.
+    ctx._browser._last_expanded = set(state.expanded)
 
 
 def _scope_up(ctx):
@@ -12364,6 +12739,9 @@ def _scope_up(ctx):
     """
     b = ctx._browser
     state = b._state
+    # Capture the scope we're leaving (``None`` at root, though that
+    # path early-returns below) before popping the stack.
+    prev_scope_id = ctx.scope
     popped = scope_out(state)
     if popped is None:
         return  # already at root
@@ -12387,7 +12765,12 @@ def _scope_up(ctx):
         state.cursor = 0
         b.cursor_to(popped)
     b._needs_redraw.add('all')
-    b._fire_scope_change()
+    b._fire_scope_change(ctx.scope, prev_scope_id, 'out')
+    # Re-baseline the expand/collapse diff — symmetric with ``_scope_down``;
+    # this handler restored the parent scope's expanded set directly.
+    # Intentionally left unconditional (not gated on a handler like the
+    # #627 fire-path skips): runs only on a rare scope keystroke.
+    b._last_expanded = set(state.expanded)
 
 
 def _select_toggle_down(ctx):

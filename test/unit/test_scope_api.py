@@ -83,7 +83,7 @@ class TestScopeInto(unittest.TestCase):
     def test_fires_hook(self):
         fired = []
         b = Browser(BrowserConfig(_headless=True,
-                    on_scope_change=lambda ctx: fired.append(
+                    on_scope_change=lambda ctx, *a: fired.append(
                         tuple(ctx.scope_stack))))
         _seed(b)
         b.scope_into('a')
@@ -119,7 +119,7 @@ class TestScopeOut(unittest.TestCase):
     def test_fires_hook(self):
         fired = []
         b = Browser(BrowserConfig(_headless=True,
-                    on_scope_change=lambda ctx: fired.append(
+                    on_scope_change=lambda ctx, *a: fired.append(
                         tuple(ctx.scope_stack))))
         _seed(b)
         b._state.scope_stack = ['a']
@@ -130,7 +130,7 @@ class TestScopeOut(unittest.TestCase):
     def test_noop_does_not_fire(self):
         fired = []
         b = Browser(BrowserConfig(_headless=True,
-                    on_scope_change=lambda ctx: fired.append(1)))
+                    on_scope_change=lambda ctx, *a: fired.append(1)))
         b.scope_out()
         b.drain_main_queue()
         self.assertEqual(fired, [])

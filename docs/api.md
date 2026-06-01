@@ -342,8 +342,8 @@ def slow_search(token):
             return                       # bail out promptly
         ctx.append_preview(cursor_id, render(row))
 
-# Each keystroke replaces the running worker.
-def on_query_change(text):
+# Each keystroke replaces the running worker (wire via on_search_change).
+def on_search_change(ctx, query):
     ctx.run_in_slot('preview-search', slow_search)
 ```
 
@@ -535,43 +535,162 @@ emitted verbatim.
 
 ### Lifecycle hooks
 
-Three optional callback kwargs let recipes react to framework events
-without polling. Each takes `(ctx) -> None`; recipes read what they
-need off `ctx`. All three exist on `Browser.__init__`:
+Ten optional callback kwargs let recipes react to framework events
+without polling. Every hook takes `ctx` followed by **the subject of
+the change** — there is no `(ctx)`-only hook. Recipes can still read
+the same data off `ctx` (`ctx.cursor`, `ctx.selected`, `ctx.filters`,
+…); the payload is the convenient, uniform path. All ten are
+optional `BrowserConfig` fields, mirrored as `Browser(...)` kwargs,
+`None` by default and a no-op when unset:
 
 ```python
 Browser(...,
-        on_cursor_change=cb,    # cursor row id changed (debounced)
-        on_scope_change=cb,     # scope_into / scope_out completed
-        on_selection_change=cb, # state.selected changed
-        on_quit=cb)             # shutdown, after screen restore
+        # observed state
+        on_cursor_change=cb,     # (ctx, id)     cursor row id changed (debounced)
+        on_selection_change=cb,  # (ctx, ids)    state.selected changed
+        on_scope_change=cb,      # (ctx, scope_id, prev_scope_id, direction)
+        on_quit=cb,              # (ctx, code)   shutdown, after screen restore
+        # tree structure
+        on_expand=cb,            # (ctx, ids)    ids newly expanded this drain
+        on_collapse=cb,          # (ctx, ids)    ids newly collapsed this drain
+        on_children_loaded=cb,   # (ctx, parent_ids)  fetches that settled this drain
+        # input state / geometry
+        on_search_change=cb,     # (ctx, query)  effective search query changed
+        on_filter_change=cb,     # (ctx, filters)  active filter tuple changed
+        on_resize=cb)            # (ctx, cols, rows)  terminal resized
 ```
 
-| Hook | When it fires | Notes |
-| ---- | ------------- | ----- |
-| `on_cursor_change` | At most once per main-loop tick; only when the row id under the cursor differs from the last fire. | Rapid moves coalesce. Re-anchor moves that land on the same id are silent. Exceptions surface via `Browser.error`. |
-| `on_scope_change` | After a successful `scope_into` / `scope_out` transition. | Read `ctx.state.scope_stack` for the new scope. Exceptions surface via `Browser.error`. |
-| `on_selection_change` | After every change to `state.selected` (Space, alt-Space, Ctrl-A, Ctrl-N, `select_all_visible` / `clear_selection` / `invert_selection` / `select`). No-op calls (e.g. `clear` on an already-empty set) are silent. | Read `ctx.state.selected` or `ctx.selected` for the new set. Exceptions surface via `Browser.error`. |
-| `on_quit` | Once during shutdown, after the screen is restored, before `Browser.run` returns. | Use for worker / file-handle / temp-file cleanup. Exceptions are swallowed silently — a failing cleanup must not block exit. |
+| Hook | Signature | When it fires | Notes |
+| ---- | --------- | ------------- | ----- |
+| `on_cursor_change` | `(ctx, id)` | At most once per main-loop tick; only when the row id under the cursor differs from the last fire. | `id` is the cursor row id, or `None` on a placeholder / empty list. Rapid moves coalesce. Re-anchor moves that land on the same id are silent. |
+| `on_selection_change` | `(ctx, ids)` | After every change to `state.selected` (Space, alt-Space, Ctrl-A, Ctrl-N, `select_all_visible` / `clear_selection` / `invert_selection` / `select`). No-op calls (e.g. `clear` on an already-empty set) are silent. | `ids` is the resulting selected id list (sorted for a stable payload). |
+| `on_scope_change` | `(ctx, scope_id, prev_scope_id, direction)` | After a successful `scope_into` / `scope_out` transition. | `scope_id` is the new scope, `prev_scope_id` the one just left — either is `None` at the root. `direction` is `'in'` (scope_into) or `'out'` (scope_out). See *scope direction* below. |
+| `on_quit` | `(ctx, code)` | Once during shutdown, after the screen is restored, before `Browser.run` returns. | `code` is the exit code stashed by `quit()`. Use for worker / file-handle / temp-file cleanup. Exceptions are swallowed silently — a failing cleanup must not block exit. |
+| `on_expand` | `(ctx, ids)` | When one or more ids newly enter `state.expanded` (the collapse→expand transition). | `ids` is the list expanded this drain (≥1): length 1 for a single `→`/`l`, longer for Alt-Right / `expand_subtree` / a recursive expand. Re-pressing `→` on an already-expanded node fires nothing. Children may or may not be cached at fire time — see *cached vs. uncached* below. |
+| `on_collapse` | `(ctx, ids)` | When one or more ids newly leave `state.expanded`. Symmetric with `on_expand`. | `ids` batches the burst: `←`/`h` (length 1), a recursive collapse, or `collapse_all` (the whole expanded set in one call). |
+| `on_children_loaded` | `(ctx, parent_ids)` | When one or more `get_children` fetches **settle** (a parent's loading flag flips True→False). | `parent_ids` batches every parent that settled this drain (≥1). Per id, `ctx.cached_children(pid)` returns the full list (possibly `[]`). The source-agnostic counterpart to `ctx.expand(id).then(cb)`. See firing rules below. |
+| `on_search_change` | `(ctx, query)` | When the effective search query changes — live per keystroke in search-edit mode, and on `set_search_query` / `clear_search`. | `query` is the new string (also `ctx.search_query`). Debounced to one fire per drain on the final value; clearing to `''` fires once. |
+| `on_filter_change` | `(ctx, filters)` | When the committed-plus-live filter list changes (`&` typing/commit/clear, `set_filters` / `add_filter` / `clear_filters`). | `filters` is the `tuple[str, ...]` also returned by `ctx.filters`. Debounced per drain; an identical re-set is a no-op; `add_filter('')` is a no-op. |
+| `on_resize` | `(ctx, cols, rows)` | When the terminal dimensions change (SIGWINCH path). | `cols` / `rows` are the new dimensions. Lets recipes drop width-dependent caches up front rather than lazily on the next `get_preview`. |
+
+All hooks are **source-agnostic** (they fire on the state transition,
+not the keystroke — keyboard, mouse, programmatic call, and startup
+auto-expands all count) and **drain-time / debounced** (coalesced to
+one fire per main-loop tick; set / burst events deliver the whole
+burst as one list). Every hook except `on_quit` routes exceptions to
+`Browser.error` (a red info-bar message) and never crashes the loop;
+`on_quit` swallows silently so a failing cleanup can't block exit.
+
+> **Note:** `on_expand` / `on_collapse` are source-agnostic about the
+> *gesture* too — insert-mode marker movement that re-roots the tree
+> can land or remove ids from `state.expanded` and therefore fire
+> them. Treat the payload as "what changed", not "what the user pressed".
 
 Typical patterns:
 
 ```python
-def on_cursor_change(ctx):
-    item = ctx.cursor
-    if item is None:
+def on_cursor_change(ctx, id):
+    if id is None:
         return
-    log.info(f'cursor: {item.id}')
+    log.info(f'cursor: {id}')
 
-def on_scope_change(ctx):
-    if ctx.state.scope_stack:
-        ctx.message(f'in scope: {ctx.state.scope_stack[-1]}')
+def on_scope_change(ctx, scope_id, prev_scope_id, direction):
+    if direction == 'in':
+        ctx.message(f'scoped into {scope_id} (from {prev_scope_id})')
 
-def on_quit(ctx):
+def on_expand(ctx, ids):
+    log.debug('expanded %s', ids)
+
+def on_quit(ctx, code):
     _STOP_EVENT.set()        # tell worker threads to wind down
     for f in _OPEN_HANDLES:
         f.close()
 ```
+
+#### `on_scope_change` direction and `prev_scope_id`
+
+A scope transition carries both endpoints and a direction, so a recipe
+can branch on scope-*in* vs scope-*out* without overriding keys or
+tracking the prior scope itself:
+
+- `scope_into(child)` → `direction == 'in'`; `scope_id` is the new
+  scope, `prev_scope_id` is the scope left. The initial scope-in from
+  the root passes `prev_scope_id is None`.
+- `scope_out()` → `direction == 'out'`; scoping out to the root passes
+  `scope_id is None`.
+
+```python
+def on_scope_change(ctx, scope_id, prev_scope_id, direction):
+    if direction == 'in':
+        ctx.invalidate_preview(scope_id)   # cross-file preview refresh
+```
+
+#### Cached vs. uncached expansion (composition pattern)
+
+`on_expand` and `on_children_loaded` are orthogonal events. At
+`on_expand` fire time a node's children **may or may not be cached** —
+an expand of an uncached node kicks an async fetch, and only that
+fetch later fires `on_children_loaded`. Expanding an **already-cached**
+node fires `on_expand` but **not** `on_children_loaded` (no fetch ran).
+
+A recipe that wants to "act once an expanded node's children are
+visible" composes the two — `on_expand` stashes the intent,
+`on_children_loaded` fulfils it. Unlike `ctx.expand(id).then(cb)`
+(which only fires for an expand *the recipe itself* issued), this works
+for user-driven expansion and correctly excludes refresh / prefetch
+arrivals:
+
+```python
+_awaiting = set()
+
+def on_expand(ctx, ids):
+    for id in ids:
+        if ctx.cached_children(id) is not None:
+            _react(ctx, id)            # children already cached: act now
+        else:
+            _awaiting.add(id)          # fetch in flight: defer
+
+def on_children_loaded(ctx, parent_ids):
+    for pid in parent_ids:
+        if pid in _awaiting:
+            _awaiting.discard(pid)
+            _react(ctx, pid)
+```
+
+`on_children_loaded` firing rules:
+
+- **Settles via fetch only.** A cached expand does not fire it.
+- **Empty result fires** with `cached_children(pid) == []`; a `None`
+  return does **not** fire until the recipe later clears loading.
+- **Errors fire** — a `get_children` exception becomes `[]` at the
+  worker boundary, loading clears, the hook fires with an empty list.
+- **Refresh refires.** `ctx.refresh(parent)` invalidates then
+  refetches → fires again on the new completion. A full `ctx.refresh()`
+  preserves `state.expanded` (so no expand/collapse fires) but
+  refetches every expanded parent, batching them as each settles.
+
+#### Scope transitions do not fire expand/collapse
+
+`scope_into` / `scope_out` save and restore per-scope expanded sets. A
+scope transition is an `on_scope_change` event, **not** a burst of
+expansions: immediately after the transition restores `state.expanded`
+the framework re-baselines its expand/collapse diff, so the restored
+ids are not reported as fresh expands or collapses. `on_scope_change`
+fires (with its direction); `on_expand` / `on_collapse` stay silent.
+The next genuine expand after a transition fires normally.
+
+#### Firing order within a drain
+
+The only cross-hook ordering guarantee is that **`on_cursor_change`
+fires last, after expansion has settled** — so a cursor-change handler
+sees the post-expansion tree with freshly-delivered children accounted
+for. Beyond that, do not depend on the relative order of hooks:
+`on_scope_change` and `on_selection_change` fire synchronously at their
+mutation sites (as the scope / selection change is applied), while
+`on_resize`, `on_search_change`, `on_filter_change`, `on_collapse`,
+`on_expand`, `on_children_loaded`, and `on_cursor_change` fire in a
+post-drain settle pass. Each hook still fires at most once per logical
+change per drain.
 
 ### Callbacks
 
@@ -1235,10 +1354,16 @@ class BrowserConfig:
     show_scope_crumb: bool = False
     preview_buffer_cap_chars: int = 100_000
     preview_buffer_cap_lines: int = 1000
-    on_cursor_change: Callable | None = None
-    on_scope_change: Callable | None = None
-    on_selection_change: Callable | None = None
-    on_quit: Callable | None = None
+    on_cursor_change: Callable | None = None      # (ctx, id)
+    on_scope_change: Callable | None = None        # (ctx, scope_id, prev_scope_id, direction)
+    on_selection_change: Callable | None = None    # (ctx, ids)
+    on_expand: Callable | None = None              # (ctx, ids)
+    on_collapse: Callable | None = None            # (ctx, ids)
+    on_children_loaded: Callable | None = None     # (ctx, parent_ids)
+    on_search_change: Callable | None = None       # (ctx, query)
+    on_filter_change: Callable | None = None       # (ctx, filters)
+    on_resize: Callable | None = None              # (ctx, cols, rows)
+    on_quit: Callable | None = None                # (ctx, code)
     _headless: bool = False
 ```
 

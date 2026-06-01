@@ -421,6 +421,9 @@ def _scope_down(ctx):
         return
     if not getattr(item, 'has_children', False):
         return  # don't scope into leaves; phase-2 simplification
+    # Capture the scope we're leaving (``None`` at root) before the
+    # transition mutates the stack, to thread into the hook.
+    prev_scope_id = ctx.scope
     scope_into(state, item.id)
     # Land the cursor on the scope row at the top of the new view.
     state.cursor = 0
@@ -431,7 +434,15 @@ def _scope_down(ctx):
         # shows ``loading…`` until results land.
         ctx.expand(item.id)
     ctx._browser._needs_redraw.add('all')
-    ctx._browser._fire_scope_change()
+    ctx._browser._fire_scope_change(ctx.scope, prev_scope_id, 'in')
+    # Re-baseline the expand/collapse diff: this handler bypasses
+    # ``Browser.scope_into`` and restores the new scope's expanded set
+    # directly via the free ``scope_into(state, ...)`` above, so anchor
+    # ``_last_expanded`` to the restored set (mirrors the Browser method)
+    # — the restore is an ``on_scope_change`` event, not an expand.
+    # Intentionally left unconditional (not gated on a handler like the
+    # #627 fire-path skips): a scope keystroke is rare, not per drain.
+    ctx._browser._last_expanded = set(state.expanded)
 
 
 def _scope_up(ctx):
@@ -454,6 +465,9 @@ def _scope_up(ctx):
     """
     b = ctx._browser
     state = b._state
+    # Capture the scope we're leaving (``None`` at root, though that
+    # path early-returns below) before popping the stack.
+    prev_scope_id = ctx.scope
     popped = scope_out(state)
     if popped is None:
         return  # already at root
@@ -477,7 +491,12 @@ def _scope_up(ctx):
         state.cursor = 0
         b.cursor_to(popped)
     b._needs_redraw.add('all')
-    b._fire_scope_change()
+    b._fire_scope_change(ctx.scope, prev_scope_id, 'out')
+    # Re-baseline the expand/collapse diff — symmetric with ``_scope_down``;
+    # this handler restored the parent scope's expanded set directly.
+    # Intentionally left unconditional (not gated on a handler like the
+    # #627 fire-path skips): runs only on a rare scope keystroke.
+    b._last_expanded = set(state.expanded)
 
 
 def _select_toggle_down(ctx):
