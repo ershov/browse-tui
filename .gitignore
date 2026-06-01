@@ -2,6 +2,7 @@
 __pycache__/
 .PLAN.md.bak
 .worktrees
+.claude/worktrees
 .tmp
 .scratch
 tmp
