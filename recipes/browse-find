@@ -1,5 +1,6 @@
 #!/bin/bash
-# browse-find — recursive file picker over `find -print0`. NUL-safe; works
+# browse-find — recursive directory-tree picker over `find -print0`. Splits
+# each full path on "/" so it nests into a real tree. NUL-safe; works
 # correctly with paths that contain spaces or newlines.
 # Usage: browse-find [ROOT [find-args...]]   (ROOT defaults to ".")
 # Extra args are passed through to find (e.g. -type f -name '*.py').
@@ -8,13 +9,14 @@ set -euo pipefail
 case "${1:-}" in
     -h|--help)
         cat <<'EOF'
-browse-find — recursive file picker over `find -print0`.
+browse-find — recursive directory-tree picker over `find -print0`.
 
 Usage: browse-find [ROOT [find-args...]]
   ROOT         Directory to walk. Defaults to the current directory.
   find-args    Extra arguments forwarded verbatim to `find` after ROOT,
                e.g. `-type f -name '*.py'`.
 
+Each full path is split on "/" so results nest into a directory tree.
 NUL-safe: works correctly with paths containing spaces or newlines.
 EOF
         exit 0
@@ -39,4 +41,5 @@ exec "$BIN" \
     --root-cmd "find $QROOT -mindepth 1 $QARGS -print0" \
     --input tsv --fields id \
     --record-sep null \
+    --path-sep / \
     --preview-cmd '[[ -d "$TUI_ID" ]] && ls -lA --color=always "$TUI_ID" || head -1000 "$TUI_ID" 2>/dev/null'

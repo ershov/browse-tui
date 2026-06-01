@@ -295,13 +295,14 @@ the stdout result.
 
 ### `recipes/browse-find`
 
-Recursive file picker over `find -print0`. NUL-safe — handles paths
-with spaces or newlines correctly. Extra arguments after the root path
-are forwarded straight to `find`.
+Recursive directory-tree picker over `find -print0`. Each full path is
+split on `/` so the flat `find` output nests into a real directory
+tree. NUL-safe — handles paths with spaces or newlines correctly.
+Extra arguments after the root path are forwarded straight to `find`.
 
-**Demonstrates:** `--record-sep null` for NUL-separated input + safe
-positional-argument quoting via `printf %q` + a preview that branches
-on file vs dir.
+**Demonstrates:** `--path-sep /` to build a tree from full paths +
+`--record-sep null` for NUL-separated input + safe positional-argument
+quoting via `printf %q` + a preview that branches on file vs dir.
 
 **Usage:**
 
@@ -311,7 +312,7 @@ on file vs dir.
 ./recipes/browse-find . -type f -name '*.py'     # extra args forwarded to find
 ```
 
-**Source:** [`recipes/browse-find`](../recipes/browse-find) (~26 lines)
+**Source:** [`recipes/browse-find`](../recipes/browse-find) (~28 lines)
 
 ### `recipes/browse-ls`
 
