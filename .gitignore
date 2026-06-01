@@ -6,3 +6,4 @@ __pycache__/
 .scratch
 tmp
 .claude/scheduled_tasks.lock
+.PLAN.md.reject

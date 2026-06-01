@@ -21,6 +21,9 @@ Use the `plan` CLI for ALL task tracking.
 ### Reporting progress
 - Show status: `plan list --format 'f"{indent}#{id} [{status}] {title}"'`
 
+### Merging branches
+Plan files merge automatically when the git merge driver is installed (`plan install git`): `git merge`/`rebase` reconciles them structurally. If a merge reports a **conflict** in a plan file, the driver left a `<file>.reject` sidecar (the plan file itself stays valid, defaulting to your side) — there are no `<<<<<<<` markers to hand-edit. Finish it: edit each block in the `.reject` to keep ONE side (`--- to ---` or `--- from ---`), then `plan merge --resolve && git add <file>` — or `plan merge --abort` to discard. Merge another branch's plan manually with `plan merge <branch>`; recover a file already broken by raw conflict markers with `plan resolve`.
+
 ### For subagents / team workers
 When dispatching subagents, you are the coordinator — do not implement tickets yourself.
 

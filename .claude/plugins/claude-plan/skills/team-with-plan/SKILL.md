@@ -65,6 +65,14 @@ Use the `plan` CLI to manage your assigned work:
 - For body restructuring: plan edit --start N, edit the file, plan edit --accept
 ```
 
+## Merging Plan Branches
+
+When workers commit plan changes on separate branches, reconcile them with the structure-aware merge driver (install once per repo: `plan install git`). With it configured, `git merge`/`rebase` merges plan files automatically — no manual step on the clean path.
+
+On a **conflict**, the driver writes a `<file>.reject` sidecar and marks the file unmerged; the plan file itself stays valid (defaulting to the current branch's side), so there are no `<<<<<<<` markers in it. To finish: edit each block in the `.reject` to keep ONE side (`--- to ---` or `--- from ---`), then `plan merge --resolve && git add <file>` (or `plan merge --abort`). Agents run non-interactively — the driver already produced the `.reject`; just resolve it.
+
+Merge a specific branch's plan on demand with `plan merge <branch>`. Recover a plan file already broken by raw git conflict markers with `plan resolve`.
+
 ## Integration
 
 - Use **claude-plan:planning-with-plan** to create the initial work breakdown
