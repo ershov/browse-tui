@@ -115,15 +115,25 @@ module stays importable for unit tests that exercise individual helpers.
 ### 3. `_parse()` rewrite
 
 `_parse` becomes a thin adapter that preserves its current event-tuple
-contract (so `_build_nodes` and everything downstream are untouched):
+contract (so `_build_nodes` and everything downstream are untouched).
+The requested kind set is chosen by `_INCLUDE_LISTS`, so the library
+only yields spans we actually turn into tree rows — no `'list'`
+callbacks when list rows are off:
 
 ```python
-_SCAN_KINDS = frozenset(('heading', 'list'))
+# Scan-kind sets requested from md2ansi_scan, chosen by _INCLUDE_LISTS so
+# the library only yields spans we turn into rows. The full grammar runs
+# internally either way (code/blockquote/table/frontmatter/hr stay
+# masked), so heading detection is identical regardless of which set we
+# pass — the only difference is whether 'list' spans are yielded.
+_SCAN_KINDS_HEADINGS = frozenset(('heading',))
+_SCAN_KINDS_WITH_LISTS = frozenset(('heading', 'list'))
 
 def _parse(text):
     line_starts = _line_starts(text)
+    kinds = _SCAN_KINDS_WITH_LISTS if _INCLUDE_LISTS else _SCAN_KINDS_HEADINGS
     events = []
-    for span in _md2ansi_scan(text, kinds=_SCAN_KINDS):
+    for span in _md2ansi_scan(text, kinds=kinds):
         if span.kind == 'heading':
             bo = span.start
             events.append((span.subtype, {        # subtype is 'h1'..'h6'
@@ -131,15 +141,18 @@ def _parse(text):
                 'line_offset': _line_of(bo, line_starts),
                 'source': span.text,
             }))
-        elif span.kind == 'list' and _INCLUDE_LISTS:
+        else:  # 'list' — only yielded when _INCLUDE_LISTS is on
             events.extend(_walk_list(span.start, span.text, line_starts))
     return events
 ```
 
 Emitted event kinds (`'h1'..'h6'`, `'ul'`/`'ol'`) and payload fields
 (`byte_offset`, `line_offset`, `source`, `level`) are unchanged.
-`_INCLUDE_LISTS` still gates list emission; the full grammar runs
-regardless, so heading detection is unaffected by the flag.
+Gating the requested kinds (rather than filtering after the fact) means
+list spans are never materialised when `-l` is off. Because
+`md2ansi_scan` filters at yield time over the full combined grammar,
+the heading spans are byte-for-byte identical whether or not `'list'`
+is requested.
 
 ### 4. `_walk_list()` signature change
 
@@ -206,7 +219,9 @@ stripping, `_LIST_ITEM_RE`, and the `V`/`E`/`M`/Ctrl-R/`→` actions.
    `md2ansi_scan` list span's `start`/`text`) and assert the same
    per-line events.
 3. **`TestParse`.** Assertions unchanged; they pass against the real
-   library grammar (verified above).
+   library grammar (verified above). Add a check that with
+   `_INCLUDE_LISTS` off the heading events are identical to lists-on
+   (guards the flag-driven `_SCAN_KINDS` selection).
 4. **New: missing-dependency gate.** Set `mod._md2ansi_scan = None`,
    call `mod.main()` with argv naming a real file, assert
    `SystemExit` code 2 and the stderr message.
