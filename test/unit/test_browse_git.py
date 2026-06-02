@@ -17,6 +17,10 @@ Coverage (ticket #617 — commits mode end-to-end):
 
 * ``_parse_decorations``   ``%D`` → ref chips (HEAD/branch/remote/tag)
 * ``_parse_name_status``   A/M/D letters + rename → status + new path
+
+Coverage (ticket #618 — reflog mode):
+
+* ``_reflog_row``          NUL record → reflog Item (id/chips), malformed→None
 """
 
 import importlib.util
@@ -340,6 +344,51 @@ class TestParseNameStatus(unittest.TestCase):
         self.assertEqual(self.r._STATUS_LETTER_STYLE['M'], 'yellow')
         self.assertEqual(self.r._STATUS_LETTER_STYLE['D'], 'red')
         self.assertEqual(self.r._STATUS_LETTER_STYLE['R'], 'cyan')
+
+
+class TestReflogRow(unittest.TestCase):
+    """``_reflog_row`` turns a NUL reflog record into a decorated Item."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _record(self, sha, selector, reldate, deco, subject):
+        return '\x00'.join([sha, selector, reldate, deco, subject])
+
+    def test_full_record(self):
+        line = self._record(
+            'deadbeef0000000000000000000000000000abcd',
+            'HEAD@{0}', '2 days ago', 'HEAD -> main', 'commit: two')
+        item = self.r._reflog_row(0, line)
+        # id encodes the enumeration index n=0 + the sha.
+        self.assertEqual(
+            item.id, 'reflog:0:deadbeef0000000000000000000000000000abcd')
+        self.assertEqual(item.tag, 'deadbee')
+        self.assertEqual(item.tag_style, 'yellow')
+        self.assertEqual(item.title, 'commit: two')
+        self.assertTrue(item.has_children)
+        # Selector + reldate are dim chips, then the %D decoration chips.
+        self.assertEqual(item.chips, [
+            ('HEAD@{0}', 'dim'),
+            ('2 days ago', 'dim'),
+            ('HEAD', 'green'),
+            ('main', 'cyan'),
+        ])
+
+    def test_index_is_carried(self):
+        # Same sha at two reflog positions -> distinct ids (no collapse).
+        sha = 'cafe00000000000000000000000000000000babe'
+        line = self._record(sha, 'HEAD@{3}', '1 hour ago', '', 'reset: moving')
+        item = self.r._reflog_row(3, line)
+        self.assertEqual(item.id, f'reflog:3:{sha}')
+        self.assertEqual(item.chips, [('HEAD@{3}', 'dim'), ('1 hour ago', 'dim')])
+
+    def test_malformed_returns_none(self):
+        self.assertIsNone(self.r._reflog_row(0, 'only\x00three\x00fields'))
+
+    def test_empty_returns_none(self):
+        self.assertIsNone(self.r._reflog_row(0, ''))
 
 
 if __name__ == '__main__':

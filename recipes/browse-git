@@ -319,7 +319,7 @@ def _git_remotes():
     return _REMOTES_CACHE
 
 
-# Name-status status letters → (tag text, tag_style).
+# Name-status status letter → tag_style.
 _STATUS_LETTER_STYLE = {
     'A': 'green',
     'M': 'yellow',
@@ -368,7 +368,11 @@ def get_children(item_id, *, reload=False):
         return _root_children()
     if kind == 'commit':
         return _commit_files(parsed[1])
-    # ref / status / stash / reflog drill-down arrives in later tickets;
+    if kind == 'reflog':
+        # A reflog entry drills into the same file list as a commit —
+        # a sha is a sha. parsed = ('reflog', n, sha).
+        return _commit_files(parsed[2])
+    # ref / status / stash drill-down arrives in later tickets;
     # file rows and error rows are leaves.
     return []
 
@@ -377,7 +381,9 @@ def _root_children():
     """Top-level rows for the active mode."""
     if _mode == 'commits':
         return _commits_root()
-    # status / reflog / branches / stash listing arrives in later tickets.
+    if _mode == 'reflog':
+        return _reflog_root()
+    # status / branches / stash listing arrives in later tickets.
     return []
 
 
@@ -415,6 +421,48 @@ def _commits_root():
     return items
 
 
+def _reflog_root():
+    """``git reflog`` rows as ``reflog:<n>:<sha>`` items, decorated.
+
+    Each record is NUL-separated ``%H %gd %cr %D %gs`` (selector, relative
+    date, decoration, action subject). The id carries the 0-based
+    enumeration index ``n`` for uniqueness — the reflog revisits the same
+    sha, so a bare ``reflog:<sha>`` would collapse duplicate rows.
+    """
+    result = _run_git(
+        'reflog', '--format=%H%x00%gd%x00%cr%x00%D%x00%gs', '-n',
+        str(_log_limit))
+    if result.returncode != 0:
+        return _err_item(f'git reflog failed: {result.stderr.strip()}')
+    items = []
+    for n, line in enumerate(result.stdout.splitlines()):
+        row = _reflog_row(n, line)
+        if row is not None:
+            items.append(row)
+    return items
+
+
+def _reflog_row(n, line):
+    """Build one reflog Item from its enumeration index + NUL record.
+
+    Returns ``None`` for a malformed (under-filled) line. The selector
+    (``%gd``, e.g. ``HEAD@{0}``) and relative date are dim chips; the
+    ``%D`` decoration reuses ``_parse_decorations``.
+    """
+    if not line:
+        return None
+    fields = line.split('\x00')
+    if len(fields) < 5:
+        return None
+    sha, selector, reldate, deco, subject = fields[:5]
+    chips = [(selector, 'dim'), (reldate, 'dim')]
+    chips.extend(_parse_decorations(deco))
+    item = Item(id=f'reflog:{n}:{sha}', title=subject,
+                tag=sha[:7], tag_style='yellow', has_children=True)
+    item.chips = chips
+    return item
+
+
 def _commit_files(sha):
     """Changed files in commit ``sha`` as ``file:<sha>:<path>`` rows.
 
@@ -443,6 +491,9 @@ def get_preview(item_id):
 
     if kind == 'commit':
         return _commit_preview(parsed[1])
+    if kind == 'reflog':
+        # Same as a commit node — parsed = ('reflog', n, sha).
+        return _commit_preview(parsed[2])
     if kind == 'file':
         return _file_preview(parsed[1], parsed[2])
     # root / err / not-yet-implemented kinds have no preview yet.

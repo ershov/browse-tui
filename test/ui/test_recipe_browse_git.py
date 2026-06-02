@@ -189,6 +189,22 @@ class TestBrowseGit(unittest.TestCase):
                 self.assertIn('▶', subject_row)
                 t.send('q')
 
+    def test_mode_reflog_lists_entries(self):
+        """``--mode reflog`` lists reflog entries with selector + action.
+
+        The temp repo's two commits each produce a reflog entry, so the
+        list shows ``HEAD@{n}`` selectors and ``commit`` action subjects.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_repo(tmp)
+            with TmuxFixture(cols=120, rows=30) as t:
+                t.send_line(f'cd {tmp}')
+                t.launch(_BIN, '--run-py', _RECIPE, '--mode', 'reflog')
+                # A reflog selector chip and a commit action subject.
+                t.wait_for(re.compile(r'HEAD@\{'), timeout=5.0)
+                t.wait_for('commit', timeout=5.0)
+                t.send('q')
+
     def test_rapid_scroll_children_pane_lands(self):
         """Rapid 25-key burst lands the children pane within ~2s.
 
