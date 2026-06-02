@@ -1,0 +1,259 @@
+"""Unit tests for the ``recipes/browse-git`` helpers.
+
+The recipe is a single-file ``--run-py`` script that imports
+``browse_tui`` (only available when the binary loads it). To exercise
+the id parser, the diff colorizer, and the positional classifier
+directly we stub ``browse_tui`` in ``sys.modules`` and load the
+extension-less recipe via ``SourceFileLoader`` — the same pattern as
+``test/unit/test_browse_md.py``.
+
+Coverage (ticket #616 — structural backbone):
+
+* ``_parse_id``            every kind, incl. colon paths / slash refnames
+* ``_colorize_diff``       ANSI on both the delta and git-fallback paths
+* ``_classify_positionals``  path / rev / ``--`` / unknown(→exit)
+"""
+
+import importlib.util
+import shutil
+import subprocess
+import sys
+import types
+import unittest
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+
+_REPO = Path(__file__).resolve().parents[2]
+_RECIPE = _REPO / 'recipes' / 'browse-git'
+
+
+def _stub_browse_tui():
+    """Insert a no-op ``browse_tui`` module so the recipe can import.
+
+    Always installs a fresh module so a stub left behind by another
+    recipe's unit test doesn't bleed in. ``Item`` keeps its kwargs as
+    attributes so the children-builder tests can read ``.id`` / ``.tag``
+    if needed; ``Browser`` / ``BrowserConfig`` / ``Action`` are inert.
+    """
+    mod = types.ModuleType('browse_tui')
+
+    class _Stub:
+        def __init__(self, *a, **kw):
+            self._args = a
+            for k, v in kw.items():
+                setattr(self, k, v)
+
+    mod.Action = _Stub
+    mod.Browser = _Stub
+    mod.BrowserConfig = _Stub
+    mod.Item = _Stub
+    sys.modules['browse_tui'] = mod
+
+
+def _load_recipe():
+    """Load (or reload) the browse-git recipe; returns a fresh module.
+
+    ``recipes/`` is put on ``sys.path`` so the recipe's optional
+    ``from md2ansi_lib import ...`` resolves to the real library, just
+    as ``--run-py`` does by prepending the recipe directory at runtime.
+    A fresh module is built on every call so tests that mutate
+    module-level globals (``_revs`` / ``_paths`` / ``_MD_COLOR``) stay
+    isolated.
+    """
+    recipes_dir = str(_REPO / 'recipes')
+    if recipes_dir not in sys.path:
+        sys.path.insert(0, recipes_dir)
+    _stub_browse_tui()
+    name = '_browse_git_under_test'
+    loader = SourceFileLoader(name, str(_RECIPE))
+    spec = importlib.util.spec_from_loader(name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+class TestParseId(unittest.TestCase):
+    """``_parse_id`` classifies every prefixed id shape."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_root(self):
+        self.assertEqual(self.r._parse_id(None), ('root',))
+
+    def test_non_string(self):
+        self.assertEqual(self.r._parse_id(42), ('other', 42))
+
+    def test_error_row(self):
+        self.assertEqual(self.r._parse_id('__error__'), ('err', ''))
+
+    def test_commit(self):
+        self.assertEqual(self.r._parse_id('commit:abc123'),
+                         ('commit', 'abc123'))
+
+    def test_file(self):
+        self.assertEqual(self.r._parse_id('file:abc123:src/main.py'),
+                         ('file', 'abc123', 'src/main.py'))
+
+    def test_file_path_with_colon(self):
+        # A path may itself contain a colon — only the first ':' after the
+        # sha splits.
+        self.assertEqual(self.r._parse_id('file:abc123:a/b:c.txt'),
+                         ('file', 'abc123', 'a/b:c.txt'))
+
+    def test_status(self):
+        self.assertEqual(self.r._parse_id('status:M :src/x.py'),
+                         ('status', 'M ', 'src/x.py'))
+
+    def test_status_path_with_colon(self):
+        self.assertEqual(self.r._parse_id('status:??:weird:name'),
+                         ('status', '??', 'weird:name'))
+
+    def test_ref_simple(self):
+        self.assertEqual(self.r._parse_id('ref:main'), ('ref', 'main'))
+
+    def test_ref_with_slashes(self):
+        # Refnames carry '/' (origin/feature/x) — kept verbatim.
+        self.assertEqual(self.r._parse_id('ref:origin/feature/x'),
+                         ('ref', 'origin/feature/x'))
+
+    def test_ref_with_colon(self):
+        # A refname may (rarely) contain ':'; ref keeps all of rest.
+        self.assertEqual(self.r._parse_id('ref:weird:ref'),
+                         ('ref', 'weird:ref'))
+
+    def test_reflog(self):
+        self.assertEqual(self.r._parse_id('reflog:3:deadbeef'),
+                         ('reflog', '3', 'deadbeef'))
+
+    def test_stash_node(self):
+        self.assertEqual(self.r._parse_id('stash:0'), ('stash', '0'))
+
+    def test_stash_file(self):
+        self.assertEqual(self.r._parse_id('stash:0:src/x.py'),
+                         ('stash', '0', 'src/x.py'))
+
+    def test_stash_file_path_with_colon(self):
+        self.assertEqual(self.r._parse_id('stash:1:a:b.py'),
+                         ('stash', '1', 'a:b.py'))
+
+    def test_unknown_prefix(self):
+        self.assertEqual(self.r._parse_id('weird:thing'),
+                         ('other', 'thing'))
+
+
+class TestColorizeDiff(unittest.TestCase):
+    """``_colorize_diff`` returns ANSI on both delta and fallback paths."""
+
+    def setUp(self):
+        self.r = _load_recipe()
+        # A minimal git-colored diff (caller's contract: already colored).
+        self.colored = (
+            '\x1b[1mdiff --git a/x b/x\x1b[m\n'
+            '\x1b[31m--- a/x\x1b[m\n'
+            '\x1b[32m+++ b/x\x1b[m\n'
+            '@@ -1 +1 @@\n'
+            '\x1b[31m-old\x1b[m\n'
+            '\x1b[32m+new\x1b[m\n'
+        )
+
+    def test_fallback_path_returns_colored_text(self):
+        # Force the no-delta branch by swapping the recipe module's
+        # ``shutil`` so which() reports delta absent (a fake namespace,
+        # not the shared module, so the patch can't leak).
+        self.r.shutil = types.SimpleNamespace(which=lambda name: None)
+        out = self.r._colorize_diff(self.colored)
+        self.assertIn('\x1b[', out)
+        # Fallback returns the caller's already-colored text unchanged.
+        self.assertEqual(out, self.colored)
+
+    def test_delta_path_returns_ansi(self):
+        if shutil.which('delta') is None:
+            self.skipTest('delta not on PATH')
+        # Real which() finds delta; the helper pipes through it. The fresh
+        # recipe module references the genuine ``subprocess`` module, so
+        # this exercises the real delta binary end to end.
+        out = self.r._colorize_diff(self.colored)
+        self.assertIn('\x1b[', out)
+
+    def test_delta_path_monkeypatched(self):
+        # Prove the delta branch produces ANSI-bearing text without
+        # depending on a delta install: swap which() + a fake subprocess
+        # namespace on the recipe module only (never the shared
+        # ``subprocess`` module, which would leak into other tests).
+        self.r.shutil = types.SimpleNamespace(which=lambda name: '/usr/bin/delta')
+
+        def fake_run(cmd, **kw):
+            self.assertEqual(cmd[0], 'delta')
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout='\x1b[34mrendered\x1b[0m\n', stderr='')
+
+        fake_subprocess = types.SimpleNamespace(
+            run=fake_run, CompletedProcess=subprocess.CompletedProcess)
+        self.r.subprocess = fake_subprocess
+        out = self.r._colorize_diff(self.colored)
+        self.assertIn('\x1b[', out)
+        self.assertIn('rendered', out)
+
+
+class TestClassifyPositionals(unittest.TestCase):
+    """``_classify_positionals`` sorts args into revs / paths / exit."""
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self._orig_argv = sys.argv
+
+    def tearDown(self):
+        sys.argv = self._orig_argv
+
+    def _run(self, *args):
+        sys.argv = ['browse-git', *args]
+        self.r._revs = []
+        self.r._paths = []
+        self.r._classify_positionals()
+        return self.r._revs, self.r._paths
+
+    def test_existing_path_is_pathspec(self):
+        # The recipe file itself certainly exists.
+        revs, paths = self._run(str(_RECIPE))
+        self.assertEqual(revs, [])
+        self.assertEqual(paths, [str(_RECIPE)])
+
+    def test_after_double_dash_is_pathspec(self):
+        revs, paths = self._run('--', 'does/not/exist.py', 'also/missing')
+        self.assertEqual(revs, [])
+        self.assertEqual(paths, ['does/not/exist.py', 'also/missing'])
+
+    def test_rev_is_classified_as_rev(self):
+        # Stub git rev-parse so 'HEAD' classifies as a rev without a repo.
+        def fake_run_git(*git_args):
+            if 'rev-parse' in git_args:
+                return subprocess.CompletedProcess(git_args, 0, '', '')
+            return subprocess.CompletedProcess(git_args, 1, '', '')
+
+        self.r._run_git = fake_run_git
+        revs, paths = self._run('HEAD')
+        self.assertEqual(revs, ['HEAD'])
+        self.assertEqual(paths, [])
+
+    def test_unknown_exits_2(self):
+        # Neither an existing path nor a valid rev -> SystemExit(2).
+        def fake_run_git(*git_args):
+            return subprocess.CompletedProcess(git_args, 1, '', '')
+
+        self.r._run_git = fake_run_git
+        with self.assertRaises(SystemExit) as cm:
+            self._run('definitely-not-a-real-ref-or-path-xyz')
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_flag_tokens_are_skipped(self):
+        # -h / --help before -- are left for the framework, not exited on.
+        revs, paths = self._run('-h')
+        self.assertEqual(revs, [])
+        self.assertEqual(paths, [])
+
+
+if __name__ == '__main__':
+    unittest.main()

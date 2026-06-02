@@ -1,42 +1,82 @@
 #!/usr/bin/env -S browse-tui --run-py
-"""browse-git — drill from recent commits into changed files into diffs.
+"""browse-git — a tig-like browser over a git repository.
 
-Three levels:
+Five view modes, switchable by ``--mode NAME`` at launch, by the
+backtick (`` ` ``) key at runtime, or auto-selected from positional
+arguments:
 
-  level 0: recent commits        (``git log --oneline -n 1000``)
-  level 1: files changed         (``git show --name-only <sha>``)
-  level 2: per-file unified diff (``git show <sha> -- <path>``)
+  commits   recent ``git log`` — drill commit -> changed files -> diff
+  status    ``git status`` working-tree entries
+  reflog    ``git reflog`` entries
+  branches  branches / remotes / tags via ``git for-each-ref``
+  stash     ``git stash list``
 
-The level-0 commit cap defaults to 1000; pass ``-n NUMBER`` to
-override.
+Every row id carries a mandatory ``KIND:`` prefix so dispatch never
+relies on hex-vs-word heuristics:
 
-Identifiers are dispatched by shape:
-  * commit ids look like ``<sha>`` (no colon)
-  * file ids look like ``<sha>:<path>`` (one colon, sha is the prefix)
-  * preview at level 2 = the unified diff for that file in that commit.
+  commit:<sha>          a commit          -> changed files
+  file:<sha>:<path>     a file in a commit (leaf) -> per-file diff
+  ref:<refname>         a branch/remote/tag -> commits on that ref
+  status:<XY>:<path>    a working-tree entry (leaf) -> staged/worktree diff
+  stash:<n>[:<path>]    a stash, or a file in one
+  reflog:<n>:<sha>      a reflog entry    -> changed files
 
-Demonstrates: subprocess-driven hierarchy, three levels via id-shape
-dispatch, large preview text, and graceful degradation when ``git`` is
-absent or the cwd isn't a repo.
+Previews honour ANSI: ``git`` emits color via ``-c color.ui=always``
+and per-file diffs are rendered through ``delta`` when it is on PATH
+(otherwise the git-colored diff is shown verbatim). Commit messages can
+be md2ansi-colored when ``md2ansi_lib`` is importable (toggle with
+``m``).
+
+Keys: Enter flips expand/collapse of the cursor row; `` ` `` opens the
+mode picker; ``m`` toggles md2ansi message coloring (when available);
+``E`` edits the real working-tree file for file/status rows in $EDITOR;
+the built-in ``v`` / ``e`` page / edit the preview text.
+
+Read-only with respect to history — the only mutation is ``E``'s
+working-tree edit.
+
+Usage:
+  browse-git [-n NUMBER] [--mode NAME] [<revs>…] [-- <paths>…]
 """
 
+import os
 import shutil
 import subprocess
 import sys
 
-from browse_tui import Browser, BrowserConfig, Item
+from browse_tui import Action, Browser, BrowserConfig, Item
+
+# Optional md2ansi_lib plugin — gates md2ansi coloring of commit messages.
+try:
+    from md2ansi_lib import md2ansi as _md2ansi_fn
+    if not callable(_md2ansi_fn):
+        _md2ansi_fn = None
+except Exception:
+    _md2ansi_fn = None
+
+_MD_COLOR = _md2ansi_fn is not None  # default on when available
+
+_LOG_LIMIT = 1000
+_MODES = ('commits', 'status', 'reflog', 'branches', 'stash')
+
+# Module-level state, all set in main() before the Browser launches.
+_log_limit = _LOG_LIMIT
+_mode = 'commits'
+_browser = None  # set in main() — used for preview-width lookup
+_revs = []       # positional revisions scoping commits mode
+_paths = []      # positional pathspecs scoping commits mode
 
 
-_LOG_LIMIT = 10000
+# ---- argv helper ---------------------------------------------------------
 
 
 def _pop_limit_arg(default):
     """Pop ``-n NUMBER`` (or ``-n=NUMBER``) out of ``sys.argv`` and return it.
 
     Removed before Browser.run() sees the argv so the recipe's own knob
-    doesn't leak into the help-flag auto-detect or the recipe's other
-    positional parsing. Falls back to ``default`` if the flag is absent
-    or its value isn't an int.
+    doesn't leak into the help-flag auto-detect or the positional
+    classification below. Falls back to ``default`` if the flag is
+    absent or its value isn't an int.
     """
     i = 1
     while i < len(sys.argv):
@@ -61,6 +101,91 @@ def _pop_limit_arg(default):
     return default
 
 
+def _pop_mode_arg():
+    """Pop ``--mode NAME`` (or ``--mode=NAME``) out of ``sys.argv``.
+
+    Returns the chosen mode name, or ``None`` if the flag is absent. An
+    unknown mode name is fatal (stderr + exit 2) — the user asked for a
+    view that doesn't exist.
+    """
+    i = 1
+    while i < len(sys.argv):
+        a = sys.argv[i]
+        value = None
+        if a == '--mode' and i + 1 < len(sys.argv):
+            value = sys.argv[i + 1]
+            del sys.argv[i:i + 2]
+        elif a.startswith('--mode='):
+            value = a.split('=', 1)[1]
+            del sys.argv[i]
+        else:
+            i += 1
+            continue
+        if value not in _MODES:
+            sys.stderr.write(
+                f'browse-git: unknown mode {value!r}; '
+                f'choose one of {", ".join(_MODES)}\n')
+            sys.exit(2)
+        return value
+    return None
+
+
+# ---- id parsing ----------------------------------------------------------
+
+
+def _parse_id(item_id):
+    """Split a ``KIND:REST`` id into a structured tuple keyed by kind.
+
+    Returns a tuple whose first element is the kind string; the
+    remaining elements depend on the kind (see the module docstring's
+    id table):
+
+      ('root',)                          item_id is None
+      ('commit', sha)
+      ('file', sha, path)                path may contain ':'
+      ('ref', refname)                   refname may contain ':' or '/'
+      ('status', xy, path)               path may contain ':'
+      ('stash', n)                       a stash node
+      ('stash', n, path)                 a file within a stash
+      ('reflog', n, sha)
+      ('err', rest)                      __error__ rows (no children)
+      ('other', rest)                    unrecognised prefix
+
+    ``rest`` is split with ``split(':', 1)`` for the kinds that carry a
+    trailing path so colons inside paths survive; ``ref`` keeps the
+    whole remainder verbatim.
+    """
+    if item_id is None:
+        return ('root',)
+    if not isinstance(item_id, str):
+        return ('other', item_id)
+    if item_id == '__error__':
+        return ('err', '')
+
+    kind, _, rest = item_id.partition(':')
+
+    if kind == 'commit':
+        return ('commit', rest)
+    if kind == 'ref':
+        # Refnames carry '/' (origin/main) and, rarely, ':' — keep all.
+        return ('ref', rest)
+    if kind in ('file', 'status'):
+        head, _, path = rest.partition(':')
+        return (kind, head, path)
+    if kind == 'reflog':
+        n, _, sha = rest.partition(':')
+        return ('reflog', n, sha)
+    if kind == 'stash':
+        n, sep, path = rest.partition(':')
+        if sep:
+            return ('stash', n, path)
+        return ('stash', n)
+    return ('other', rest)
+
+
+# ---- subprocess + colorization helpers -----------------------------------
+
+
 def _run_git(*args):
     """Run ``git args…``; return CompletedProcess (returncode + stdout/err).
 
@@ -71,93 +196,320 @@ def _run_git(*args):
                           capture_output=True, text=True)
 
 
+def _git_color(*args):
+    """Return stdout of ``git -c color.ui=always <args>``.
+
+    Forces SGR even though stdout is a pipe; used for ``show --stat`` and
+    ref summaries whose color should always be present regardless of the
+    ``delta`` fallback path.
+    """
+    result = _run_git('-c', 'color.ui=always', *args)
+    return result.stdout if result.returncode == 0 else result.stderr
+
+
+def _colorize_diff(raw):
+    """Render an already-git-colored diff for the preview pane.
+
+    Contract: ``raw`` is the diff text produced *once* by the caller,
+    already SGR-colored (e.g. via ``_git_color('show', …)`` which runs
+    with ``color.ui=always``). When ``delta`` is on PATH the text is
+    piped through it for terminal-native rendering; ``delta`` parses the
+    colored diff and re-emits its own SGR. When ``delta`` is absent the
+    git-colored ``raw`` is returned unchanged — so either path yields
+    ANSI-bearing text and the caller never has to generate the diff
+    twice.
+
+    ``--no-gitconfig`` ignores the user's theme and suppresses the OSC-8
+    hyperlink emission the preview pane can't render; ``--paging never``
+    stops delta spawning a pager off-tty; ``--width`` matches the pane
+    (read from the module-level ``_browser`` since ``get_preview`` gets
+    no ``ctx``).
+    """
+    if shutil.which('delta'):
+        width = (_browser.preview_width if _browser else 0) or 80
+        proc = subprocess.run(
+            ['delta', '--no-gitconfig', '--paging', 'never',
+             '--width', str(width)],
+            input=raw, capture_output=True, text=True, check=False)
+        if proc.returncode == 0:
+            return proc.stdout
+        # delta failed unexpectedly — fall back to the git-colored text.
+    return raw
+
+
+def _md_message(text):
+    """Return ``text`` md2ansi-colored when the toggle + library allow it."""
+    if _MD_COLOR and _md2ansi_fn is not None and text:
+        try:
+            width = (_browser.preview_width if _browser else 0) or 80
+            return _md2ansi_fn(text, line_width=width)
+        except Exception:
+            pass
+    return text
+
+
 def _err_item(msg):
     """Return a single non-expandable error Item to render in the list."""
     return [Item(id='__error__', title=msg, tag='err', tag_style='red')]
 
 
+# ---- children ------------------------------------------------------------
+
+
 def get_children(item_id, *, reload=False):
-    if not shutil.which('git'):
-        return _err_item('git CLI not found on PATH')
+    parsed = _parse_id(item_id)
+    kind = parsed[0]
 
-    if item_id is None:
-        # Verify we're inside a git working tree.
-        rc = _run_git('rev-parse', '--is-inside-work-tree')
-        if rc.returncode != 0:
-            return _err_item('not a git repository (or git not available)')
-        result = _run_git('log', '--oneline', '-n', str(_log_limit))
-        if result.returncode != 0:
-            return _err_item(f'git log failed: {result.stderr.strip()}')
-        items = []
-        for line in result.stdout.splitlines():
-            parts = line.split(None, 1)
-            if not parts:
-                continue
-            sha = parts[0]
-            msg = parts[1] if len(parts) > 1 else ''
-            item = Item(id=sha, title=msg, tag=sha[:7],
-                        tag_style='yellow', has_children=True)
-            items.append(item)
-        return items
-
-    if isinstance(item_id, str) and item_id != '__error__' and ':' not in item_id:
-        # Commit sha -> changed files.
-        result = _run_git('show', '--name-only', '--format=', item_id)
-        if result.returncode != 0:
-            return _err_item(f'git show failed: {result.stderr.strip()}')
-        items = []
-        for path in result.stdout.splitlines():
-            path = path.strip()
-            if not path:
-                continue
-            items.append(Item(id=f'{item_id}:{path}', title=path,
-                              has_children=False))
-        return items
-
-    # Files (level 2) and __error__ have no children.
+    if kind == 'root':
+        return _root_children()
+    if kind == 'commit':
+        return _commit_files(parsed[1])
+    # ref / status / stash / reflog drill-down arrives in later tickets;
+    # file rows and error rows are leaves.
     return []
 
 
+def _root_children():
+    """Top-level rows for the active mode."""
+    if _mode == 'commits':
+        return _commits_root()
+    # status / reflog / branches / stash listing arrives in later tickets.
+    return []
+
+
+def _commits_root():
+    """``git log`` rows as ``commit:<sha>`` items (thin for now).
+
+    Decorations / author-date chips / md2ansi messages are layered on in
+    a later ticket; here each row carries the short sha as a tag and the
+    subject as the title so the list is functional.
+    """
+    args = ['log', f'--format=%H%x00%s', '-n', str(_log_limit)]
+    args += _revs
+    if _paths:
+        args += ['--', *_paths]
+    result = _run_git(*args)
+    if result.returncode != 0:
+        return _err_item(f'git log failed: {result.stderr.strip()}')
+    items = []
+    for line in result.stdout.splitlines():
+        if not line:
+            continue
+        sha, _, subject = line.partition('\x00')
+        items.append(Item(id=f'commit:{sha}', title=subject,
+                          tag=sha[:7], tag_style='yellow',
+                          has_children=True))
+    return items
+
+
+def _commit_files(sha):
+    """Changed files in commit ``sha`` as ``file:<sha>:<path>`` rows.
+
+    Status-letter chips / rename handling arrive in a later ticket; the
+    plain path list is enough to drill into per-file diffs now.
+    """
+    result = _run_git('show', '--name-only', '--format=', sha)
+    if result.returncode != 0:
+        return _err_item(f'git show failed: {result.stderr.strip()}')
+    items = []
+    for path in result.stdout.splitlines():
+        path = path.strip()
+        if not path:
+            continue
+        items.append(Item(id=f'file:{sha}:{path}', title=path,
+                          has_children=False))
+    return items
+
+
+# ---- preview -------------------------------------------------------------
+
+
 def get_preview(item_id):
-    if item_id is None or item_id == '__error__':
-        return ''
-    if not isinstance(item_id, str):
-        return ''
-    if ':' in item_id:
-        # File-in-commit -> unified diff for just that path.
-        sha, _, path = item_id.partition(':')
-        result = _run_git('show', sha, '--', path)
-        return result.stdout if result.returncode == 0 else result.stderr
-    # Commit -> stat + message.
-    result = _run_git('show', '--stat', item_id)
-    return result.stdout if result.returncode == 0 else result.stderr
+    parsed = _parse_id(item_id)
+    kind = parsed[0]
+
+    if kind == 'commit':
+        return _commit_preview(parsed[1])
+    if kind == 'file':
+        return _file_preview(parsed[1], parsed[2])
+    # root / err / not-yet-implemented kinds have no preview yet.
+    return ''
+
+
+def _commit_preview(sha):
+    """Commit node preview = md2ansi(message) + colored ``show --stat``."""
+    msg = _run_git('show', '--no-patch', '--format=%B', sha)
+    body = _md_message(msg.stdout.rstrip('\n')) if msg.returncode == 0 else ''
+    stat = _git_color('show', '--stat', '--format=', sha)
+    if body and stat:
+        return f'{body}\n\n{stat}'
+    return body or stat
+
+
+def _file_preview(sha, path):
+    """File leaf preview = colored per-file diff for ``path`` in ``sha``."""
+    raw = _git_color('show', sha, '--', path)
+    return _colorize_diff(raw)
+
+
+# ---- key handlers --------------------------------------------------------
+
+
+def on_enter(ctx):
+    """Flip expand/collapse of the cursor row; never quits, never prints.
+
+    Leaves (rows without children) are a no-op. The decision reads
+    ``ctx.state.expanded`` — the set of expanded ids in the current
+    scope — so a second Enter on an open row folds it back up.
+    """
+    item = ctx.cursor
+    if item is None or not item.has_children:
+        return
+    if item.id in ctx.state.expanded:
+        ctx.collapse(item.id)
+    else:
+        # User-driven navigation — autoscroll the newly-revealed children
+        # into view, matching the built-in Right-arrow handler.
+        ctx.expand(item.id, autoscroll=True)
+
+
+def switch_mode(ctx):
+    """Backtick — pick one of the five modes, then re-list the root."""
+    global _mode
+    chosen = ctx.pick('mode', list(_MODES))
+    if chosen is None or chosen == _mode:
+        return
+    _mode = chosen
+    ctx.message(f'mode: {_mode}')
+    ctx.refresh()
+
+
+def edit_file(ctx):
+    """``E`` — open the real working-tree file in $EDITOR.
+
+    Only file/status rows map to a working-tree path; other row kinds
+    (commits, refs, stashes) are a no-op. ``file:`` paths are repo-root
+    relative, so resolve them against the work-tree root.
+    """
+    item = ctx.cursor
+    if item is None:
+        return
+    parsed = _parse_id(item.id)
+    kind = parsed[0]
+    if kind in ('file', 'status'):
+        path = parsed[2]
+    else:
+        return
+    root = _run_git('rev-parse', '--show-toplevel')
+    base = root.stdout.strip() if root.returncode == 0 else ''
+    target = os.path.join(base, path) if base else path
+    editor = os.environ.get('EDITOR', 'vi')
+    ctx.run_external([editor, target])
+
+
+def toggle_md(ctx):
+    """``m`` — flip md2ansi coloring of the commit message; refresh preview."""
+    global _MD_COLOR
+    _MD_COLOR = not _MD_COLOR
+    ctx.drop_preview_cache()
+    ctx.message(f'message coloring: {"colored" if _MD_COLOR else "raw"}')
+
+
+# ---- entry point ---------------------------------------------------------
 
 
 _HELP_INTRO_TMPL = """\
-browse-git — drill from recent commits into changed files into diffs.
+browse-git — a tig-like browser over a git repository.
 
-Usage: browse-git [-n NUMBER]
-  -n NUMBER  Cap the recent-commit list to this many entries
-             (default: {default}).
+Usage: browse-git [-n NUMBER] [--mode NAME] [<revs>…] [-- <paths>…]
+  -n NUMBER     Cap the commit / reflog list to this many entries
+                (default: {default}).
+  --mode NAME   Start in one of: {modes}.
+  <revs>        Revisions scoping the commits list (git log <revs>).
+  -- <paths>    Pathspecs scoping the commits list.
 
-Three levels: a recent ``git log -n {limit}``; the files changed in the
-selected commit; and the per-file unified diff for that commit.
-Read-only — preview shows the diff (or stat / message at level 0).\
+Five view modes — commits (default), status, reflog, branches, stash —
+switchable with --mode, the backtick (`) picker, or auto-selected from
+positional arguments. Enter flips expand/collapse of the cursor row; v
+pages the colored preview; e edits the preview text; E edits the real
+working-tree file (file/status rows); m toggles md2ansi message coloring
+when available. Previews are color: git emits SGR and per-file diffs go
+through delta when it is installed.\
 """
 
 
-_log_limit = _LOG_LIMIT
+def _classify_positionals():
+    """Sort the leftover positionals into ``_revs`` / ``_paths``.
+
+    Everything after a literal ``--`` is an unconditional pathspec.
+    Otherwise an arg that names an existing path is a pathspec; an arg
+    that ``git rev-parse`` confirms as a commit is a rev; anything else
+    is fatal (stderr + exit 2). Leftover flag-like tokens (``-h`` /
+    ``--help``) before the ``--`` are skipped so the framework's help
+    auto-detect still fires.
+    """
+    global _revs, _paths
+    args = sys.argv[1:]
+    if '--' in args:
+        cut = args.index('--')
+        head, tail = args[:cut], args[cut + 1:]
+        _paths.extend(tail)
+    else:
+        head = args
+    for arg in head:
+        if arg.startswith('-'):
+            continue
+        if os.path.exists(arg):
+            _paths.append(arg)
+            continue
+        rc = _run_git('rev-parse', '--verify', '--quiet', f'{arg}^{{commit}}')
+        if rc.returncode == 0:
+            _revs.append(arg)
+            continue
+        sys.stderr.write(f'browse-git: unknown path or revision: {arg}\n')
+        sys.exit(2)
 
 
 def main():
-    global _log_limit
+    global _browser, _log_limit, _mode
+    # git presence + a work tree are preconditions — fail fast before the
+    # TUI launches rather than surfacing an in-list error row. Skip the
+    # checks when a help token is present so ``--help`` still reaches
+    # Browser.run()'s help auto-detect even outside a repo.
+    if not any(a in ('-h', '--help') for a in sys.argv[1:]):
+        if not shutil.which('git'):
+            sys.stderr.write('browse-git: git not found on PATH\n')
+            sys.exit(2)
+        if _run_git('rev-parse', '--is-inside-work-tree').returncode != 0:
+            sys.stderr.write('browse-git: not inside a git work tree\n')
+            sys.exit(2)
+
     _log_limit = _pop_limit_arg(_LOG_LIMIT)
-    sys.exit(Browser(BrowserConfig(
+    requested_mode = _pop_mode_arg()
+    _classify_positionals()
+    if requested_mode is not None:
+        _mode = requested_mode
+
+    actions = [
+        Action('`', 'Switch view mode', switch_mode, 'none'),
+        Action('E', 'Edit working-tree file in $EDITOR', edit_file, 'cursor'),
+    ]
+    if _md2ansi_fn is not None:
+        actions.append(
+            Action('m', 'Toggle md2ansi message coloring', toggle_md, 'none'))
+
+    b = Browser(BrowserConfig(
         title='browse-git',
         get_children=get_children,
         get_preview=get_preview,
-        help_intro=_HELP_INTRO_TMPL.format(default=_LOG_LIMIT, limit=_log_limit),
-    )).run())
+        actions=actions,
+        on_enter=on_enter,
+        show_ids='never',
+        help_intro=_HELP_INTRO_TMPL.format(
+            default=_LOG_LIMIT, modes=', '.join(_MODES)),
+    ))
+    _browser = b
+    sys.exit(b.run())
 
 
 if __name__ == '__main__':
