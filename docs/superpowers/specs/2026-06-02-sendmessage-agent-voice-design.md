@@ -76,10 +76,10 @@ distinct per direction.
 - `_is_voice` → True for both new kinds: mirror the existing
   `AskUserQuestion` branch for the outbound tool_use; add a
   task-notification check for the inbound user record.
-- `_ROW_BG_FOR_KIND`: add two new distinct dark stripes in the same
-  green family (so they read as one "agent voice" channel, split by
-  direction): **`agent-send` → 22 (dark green)**, **`agent-reply` → 23
-  (dark green-blue / teal)**; tunable. Both distinct from human (235) and
+- `_ROW_BG_FOR_KIND`: add two new distinct dark stripes from the 256
+  cube (so they read as one "agent voice" channel, split by direction):
+  **`agent-send` → 22 (darkest green, #005f00)**, **`agent-reply` → 23
+  (darkest cyan, #005f5f)**. Both distinct from human (235) and
   assistant (17).
 - `_TAG_STYLE_FOR_KIND`: add tag-text styles for both kinds.
 
@@ -161,6 +161,6 @@ distinct per direction.
   specific enough today (no other `toolUseResult` is exactly those two
   keys), but if a future tool collides we may need to thread the owning
   tool name into `_fmt_tool_use_result`.
-- Stripe color choices (22 dark green / 23 dark green-blue) are a first
-  pass; adjust against the real palette during implementation if they
-  clash with existing rows.
+- Stripe colors are the darkest green (22) and darkest cyan (23) in the
+  256 cube — the same dark-stripe family as the existing human (235) and
+  assistant (17) rows.

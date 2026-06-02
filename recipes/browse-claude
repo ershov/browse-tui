@@ -991,14 +991,14 @@ _ROW_BG_FOR_KIND = {
     # stripe. Applies both to inline-wired umbrellas and to orphans
     # surfaced at the top of tree view.
     'subagent':         17,
-    # Outbound leader→worker SendMessage — its own dark-green stripe
-    # (22) so the inter-agent voice channel reads distinct from the
-    # human (235) and the leader's own assistant turns (17).
+    # Outbound leader→worker SendMessage — the darkest green in the 256
+    # cube (22, #005f00), so the inter-agent voice channel reads distinct
+    # from the human (235) and the leader's own assistant turns (17).
     'agent-send':       22,
-    # Inbound worker→leader task-notification reply — a sibling stripe
-    # in the same green family (23, dark green-blue / teal) so the two
-    # halves of the channel read together but split by direction. The
-    # whole point of the kind: redirect the reply off the human stripe.
+    # Inbound worker→leader task-notification reply — the darkest cyan
+    # (23, #005f5f): a sibling of the send stripe so the two halves of
+    # the channel read together but split by direction. The whole point
+    # of the kind: redirect the reply off the human stripe.
     'agent-reply':      23,
 }
 
