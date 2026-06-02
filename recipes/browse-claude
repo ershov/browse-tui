@@ -940,6 +940,8 @@ _TAG_STYLE_FOR_KIND = {
     'system':              'gray',
     'tool_use':            'yellow',
     'tool_result':         'yellow',
+    # Inter-agent voice (leader → worker SendMessage).
+    'agent-send':          'green',
     # Bookmarks / state changes
     'last-prompt':         'magenta',
     'permission-mode':     'yellow',
@@ -987,6 +989,10 @@ _ROW_BG_FOR_KIND = {
     # stripe. Applies both to inline-wired umbrellas and to orphans
     # surfaced at the top of tree view.
     'subagent':         17,
+    # Outbound leader→worker SendMessage — its own dark-green stripe
+    # (22) so the inter-agent voice channel reads distinct from the
+    # human (235) and the leader's own assistant turns (17).
+    'agent-send':       22,
 }
 
 
@@ -1004,6 +1010,10 @@ def _is_voice(obj):
     tool_use is the question itself, and the user's tool_result is the
     answer. Both halves count as voice — detected structurally by tool
     name and by the ``{questions, answers}`` shape on ``toolUseResult``.
+    ``SendMessage`` (leader → worker) is the same case for the outbound
+    half: the assistant's tool_use *is* the message, so it counts as
+    voice. Its ``{success, message}`` delivery ack is just a status
+    receipt, not voice.
     """
     t = obj.get('type')
     if t == 'queue-operation':
@@ -1021,7 +1031,8 @@ def _is_voice(obj):
             pt = p.get('type')
             if pt == 'text' and (p.get('text') or '').strip():
                 return True
-            if pt == 'tool_use' and p.get('name') == 'AskUserQuestion':
+            if pt == 'tool_use' and p.get('name') in (
+                    'AskUserQuestion', 'SendMessage'):
                 return True
         if t == 'user':
             tur = obj.get('toolUseResult')
@@ -1105,7 +1116,15 @@ def _passes_filter(item_id, td=None):
 
 
 def _kind_of(obj):
-    """Best-effort classifier for one JSONL record."""
+    """Best-effort classifier for one JSONL record.
+
+    Most records map to their raw ``type`` / message role. The one
+    refinement: an assistant record whose salient content is a
+    ``SendMessage`` tool_use is the leader voicing a worker, so it gets
+    its own ``agent-send`` kind (drives its stripe + tag style).
+    """
+    if _is_send_message(obj):
+        return 'agent-send'
     t = obj.get('type')
     if t:
         return t
@@ -1298,6 +1317,9 @@ def _tool_use_one_line(name, inp):
         return inp.get('subagent_type', '?')
     if name == 'Skill':
         return inp.get('skill', '?')
+    if name == 'SendMessage':
+        recipient, summary, _ = _send_message_fields(inp)
+        return f'→ {recipient}: {summary}'
     return ''
 
 
@@ -1761,6 +1783,52 @@ def _fmt_tool_use_ask_user_question(inp):
     return _md_voice(_fmt_ask_user_question(inp.get('questions')))
 
 
+def _send_message_fields(inp):
+    """``(recipient, summary, message)`` from a ``SendMessage`` input.
+
+    The tool duplicates its fields: prefer ``recipient``/``message``,
+    fall back to ``to``/``content``. ``summary`` is a short label.
+    """
+    inp = inp if isinstance(inp, dict) else {}
+    recipient = inp.get('recipient') or inp.get('to') or '?'
+    summary = inp.get('summary', '')
+    message = inp.get('message')
+    if not message:
+        message = inp.get('content', '')
+    return recipient, summary, message
+
+
+def _is_send_message(rec):
+    """True iff ``rec`` is an assistant record whose salient content is a
+    ``SendMessage`` tool_use (mirrors the AskUserQuestion voice branch)."""
+    if not isinstance(rec, dict):
+        return False
+    msg = rec.get('message') if isinstance(rec.get('message'), dict) else {}
+    if (rec.get('type') or msg.get('role')) != 'assistant':
+        return False
+    content = msg.get('content')
+    if not isinstance(content, list):
+        return False
+    for p in content:
+        if (isinstance(p, dict) and p.get('type') == 'tool_use'
+                and p.get('name') == 'SendMessage'):
+            return True
+    return False
+
+
+def _fmt_tool_use_send_message(inp):
+    """Outbound leader→worker message: header line + markdown body."""
+    recipient, summary, message = _send_message_fields(inp)
+    head = f'{BOLD}→ {recipient}{RESET}'
+    if summary:
+        head += f'  {MUTE}·{RESET} {summary}'
+    out = [head]
+    if message:
+        out.append('')
+        out.append(_md_voice(message))
+    return '\n'.join(out)
+
+
 _TOOL_USE_FORMATTERS = {
     'Bash':             _fmt_tool_use_bash,
     'Read':             _fmt_tool_use_read,
@@ -1772,6 +1840,7 @@ _TOOL_USE_FORMATTERS = {
     'Task':             _fmt_tool_use_agent,
     'Skill':            _fmt_tool_use_skill,
     'AskUserQuestion':  _fmt_tool_use_ask_user_question,
+    'SendMessage':      _fmt_tool_use_send_message,
 }
 
 
@@ -1831,6 +1900,11 @@ def _fmt_tool_use_result(tur, raw_content):
         return _fmt_tur_subagent(tur)
     if 'commandName' in keys and 'success' in keys:
         return _fmt_tur_skill(tur)
+    # SendMessage delivery ack — shape is exactly ``{success, message}``.
+    # Checked after skill (whose ack adds ``commandName``) so the exact
+    # key-set match here doesn't shadow it.
+    if keys == {'success', 'message'}:
+        return _fmt_tur_send_message(tur)
     if 'questions' in keys and 'answers' in keys:
         return _fmt_tur_ask_user_question(tur)
     return _fmt_tur_default(tur)
@@ -1998,6 +2072,24 @@ def _fmt_tur_skill(tur):
     ok = bool(tur.get('success'))
     color = GREEN if ok else RED
     return f'{MAGENTA}{name}{RESET}  {color}[{"ok" if ok else "fail"}]{RESET}'
+
+
+def _fmt_tur_send_message(tur):
+    """SendMessage delivery ack: compact ``✓ delivered · <message>`` /
+    ``✗ <message>`` with the trailing ``Output: /tmp/…`` path trimmed."""
+    ok = bool(tur.get('success'))
+    message = tur.get('message', '') or ''
+    # The ack message tails with an "Output: /tmp/…/tasks/<id>.output"
+    # path that's just plumbing — drop it from this compact view.
+    idx = message.find('Output: ')
+    if idx != -1:
+        message = message[:idx]
+    message = message.strip()
+    if ok:
+        head = f'{GREEN}✓ delivered{RESET}'
+        return f'{head}  {MUTE}·{RESET} {message}' if message else head
+    head = f'{RED}✗{RESET}'
+    return f'{head} {message}' if message else head
 
 
 def _fmt_tur_ask_user_question(tur):
