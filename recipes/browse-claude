@@ -41,6 +41,7 @@ Phase-3 simplifications (intentionally out of scope):
 import datetime
 import json
 import os
+import re
 import sys
 import threading
 
@@ -556,7 +557,7 @@ def _list_sessions(project_dir):
         # --running: hide sessions whose claude process isn't alive.
         if _RUNNING_ONLY and not running_meta:
             continue
-        n_subs = _count_subagents(project_dir, sid)
+        n_subs = _count_subagents(full)
         tag = f'{count} msg'
         if n_subs:
             tag += f' · {n_subs} sub'
@@ -607,16 +608,128 @@ def _subagents_dir(session_jsonl_path):
     return os.path.join(base, 'subagents')
 
 
-def _count_subagents(project_dir, sid):
-    """Cheap count of subagent .jsonl files for one session."""
-    sub_dir = os.path.join(project_dir, sid, 'subagents')
+# After a Claude Code update, a session that enters a git worktree stores
+# its subagent transcripts under the project dir derived from the *cwd at
+# dispatch time* — not the project dir holding the session .jsonl. So the
+# co-located ``<session>/subagents`` dir (the legacy layout) is no longer
+# the only place to look. The helpers below resolve subagents across both
+# the legacy co-located dir AND every cwd-derived dir the session touched.
+
+
+def _encode_project_path(cwd):
+    """Encode a cwd into its Claude project-dir name.
+
+    Forward of ``_decode_project_path``: Claude Code names a project dir
+    by replacing every ``/`` and ``.`` in the cwd with ``-`` (so e.g.
+    ``/home/u/proj/.worktrees/wt`` → ``-home-u-proj--worktrees-wt``).
+    ``_decode_project_path`` is lossy (it can't tell a ``-`` apart from a
+    ``/`` or ``.``), so we encode directly here rather than inverting it.
+    """
+    return cwd.replace('/', '-').replace('.', '-')
+
+
+# Cache distinct-cwd scans by (path, size, mtime) so repeated listings
+# (count + enumerate + drill-in) don't re-read the file.
+_SESSION_CWDS_CACHE = {}
+_CWD_RE = re.compile(rb'"cwd"\s*:\s*"([^"]*)"')
+
+
+def _session_cwds(session_jsonl_path):
+    """Return the set of distinct ``cwd`` strings recorded in a session.
+
+    Cheap single-pass regex over the raw bytes (no JSON parse). Cached by
+    ``(path, size, mtime)`` so we read each session file at most once per
+    on-disk revision.
+    """
     try:
-        return sum(
-            1 for n in os.listdir(sub_dir)
-            if n.startswith('agent-') and n.endswith('.jsonl')
-        )
+        st = os.stat(session_jsonl_path)
     except OSError:
-        return 0
+        return set()
+    key = (session_jsonl_path, st.st_size, st.st_mtime)
+    cached = _SESSION_CWDS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    cwds = set()
+    try:
+        with open(session_jsonl_path, 'rb') as f:
+            for m in _CWD_RE.finditer(f.read()):
+                try:
+                    cwds.add(m.group(1).decode('utf-8'))
+                except UnicodeDecodeError:
+                    continue
+    except OSError:
+        cwds = set()
+    _SESSION_CWDS_CACHE[key] = cwds
+    return cwds
+
+
+def _candidate_subagents_dirs(session_jsonl_path):
+    """Ordered, deduped, existing-only subagent dirs for a session.
+
+    Legacy co-located dir first (so the common non-worktree case keeps
+    today's behaviour and stays the first match), then one
+    ``<CLAUDE_ROOT>/<encode(cwd)>/<sid>/subagents`` per distinct session
+    cwd (where a worktree session's subagents actually land).
+    """
+    sid = os.path.basename(os.path.splitext(session_jsonl_path)[0])
+    seen = set()
+    out = []
+
+    def _add(d):
+        if d in seen:
+            return
+        seen.add(d)
+        if os.path.isdir(d):
+            out.append(d)
+
+    _add(_subagents_dir(session_jsonl_path))
+    for cwd in _session_cwds(session_jsonl_path):
+        _add(os.path.join(
+            CLAUDE_ROOT, _encode_project_path(cwd), sid, 'subagents'))
+    return out
+
+
+def _resolve_agent_jsonl(session_jsonl_path, agent_id):
+    """Path to ``agent-<id>.jsonl``, searching all candidate dirs.
+
+    Returns the first existing match across candidate dirs. When none
+    exist, falls back to the legacy co-located path STRING (not checked
+    for existence) so callers' ``os.path.isfile`` guards behave exactly
+    as before for a truly-absent agent.
+    """
+    name = f'agent-{agent_id}.jsonl'
+    for d in _candidate_subagents_dirs(session_jsonl_path):
+        p = os.path.join(d, name)
+        if os.path.isfile(p):
+            return p
+    return os.path.join(_subagents_dir(session_jsonl_path), name)
+
+
+def _count_subagents(session_jsonl_path):
+    """Cheap count of distinct subagent .jsonl files for one session.
+
+    Fast path: the legacy co-located dir is checked first and, when it
+    holds any agents, returned directly without scanning session cwds.
+    Only when it's absent/empty do we fall back to the cwd-derived dirs
+    (the worktree-relocated layout), deduping agent ids across them.
+    """
+    def _agent_ids(sub_dir):
+        try:
+            return {
+                n[len('agent-'):-len('.jsonl')]
+                for n in os.listdir(sub_dir)
+                if n.startswith('agent-') and n.endswith('.jsonl')
+            }
+        except OSError:
+            return set()
+
+    colocated = _agent_ids(_subagents_dir(session_jsonl_path))
+    if colocated:
+        return len(colocated)
+    ids = set()
+    for sub_dir in _candidate_subagents_dirs(session_jsonl_path):
+        ids |= _agent_ids(sub_dir)
+    return len(ids)
 
 
 def _read_subagent_meta(meta_path):
@@ -638,59 +751,64 @@ def _list_subagents_for_session(session_jsonl_path):
     and the agent id, so ``get_children`` can route it without needing
     to remember any per-row state.
     """
-    sub_dir = _subagents_dir(session_jsonl_path)
-    if not os.path.isdir(sub_dir):
-        return []
     out = []
-    try:
-        names = os.listdir(sub_dir)
-    except OSError:
-        return []
-    for name in names:
-        if not (name.startswith('agent-') and name.endswith('.jsonl')):
-            continue
-        agent_id = name[len('agent-'):-len('.jsonl')]
-        agent_path = os.path.join(sub_dir, name)
+    seen_ids = set()
+    for sub_dir in _candidate_subagents_dirs(session_jsonl_path):
         try:
-            st = os.stat(agent_path)
+            names = os.listdir(sub_dir)
         except OSError:
             continue
-        try:
-            with open(agent_path, 'rb') as f:
-                count = sum(1 for _ in f)
-        except OSError:
-            count = 0
-        meta = _read_subagent_meta(
-            os.path.join(sub_dir, f'agent-{agent_id}.meta.json'),
-        )
-        agent_type = meta.get('agentType') or 'agent'
-        description = meta.get('description') or ''
-        # Title surfaces the description (what the agent was asked to do)
-        # since the agent_id is opaque. Falls back to the id for agents
-        # without a meta file.
-        title = description or f'agent {agent_id}'
-        item = Item(
-            id=f'{session_jsonl_path}#agent:{agent_id}',
-            title=title,
-            tag=f'{agent_type} · {count} msg · {_human_time(st.st_mtime)}',
-            tag_style='magenta',
-            has_children=count > 0,
-        )
-        item.kind = 'subagent'
-        item.agent_id = agent_id
-        item.agent_type = agent_type
-        item.agent_description = description
-        item.session_path = session_jsonl_path
-        item.subagent_path = agent_path
-        item.line_count = count
-        item.mtime = st.st_mtime
-        # Voice stripe: the dispatching assistant call is voice, so
-        # the subagent umbrella that represents it carries the
-        # assistant-row background colour.
-        bg = _ROW_BG_FOR_KIND.get('subagent')
-        if bg is not None:
-            item.row_bg = bg
-        out.append(item)
+        for name in names:
+            if not (name.startswith('agent-') and name.endswith('.jsonl')):
+                continue
+            agent_id = name[len('agent-'):-len('.jsonl')]
+            # Dedup across dirs: the first candidate (legacy co-located)
+            # wins so the common case is untouched.
+            if agent_id in seen_ids:
+                continue
+            agent_path = os.path.join(sub_dir, name)
+            try:
+                st = os.stat(agent_path)
+            except OSError:
+                continue
+            seen_ids.add(agent_id)
+            try:
+                with open(agent_path, 'rb') as f:
+                    count = sum(1 for _ in f)
+            except OSError:
+                count = 0
+            # Read meta from the SAME dir the agent file was found in.
+            meta = _read_subagent_meta(
+                os.path.join(sub_dir, f'agent-{agent_id}.meta.json'),
+            )
+            agent_type = meta.get('agentType') or 'agent'
+            description = meta.get('description') or ''
+            # Title surfaces the description (what the agent was asked to
+            # do) since the agent_id is opaque. Falls back to the id for
+            # agents without a meta file.
+            title = description or f'agent {agent_id}'
+            item = Item(
+                id=f'{session_jsonl_path}#agent:{agent_id}',
+                title=title,
+                tag=f'{agent_type} · {count} msg · {_human_time(st.st_mtime)}',
+                tag_style='magenta',
+                has_children=count > 0,
+            )
+            item.kind = 'subagent'
+            item.agent_id = agent_id
+            item.agent_type = agent_type
+            item.agent_description = description
+            item.session_path = session_jsonl_path
+            item.subagent_path = agent_path
+            item.line_count = count
+            item.mtime = st.st_mtime
+            # Voice stripe: the dispatching assistant call is voice, so
+            # the subagent umbrella that represents it carries the
+            # assistant-row background colour.
+            bg = _ROW_BG_FOR_KIND.get('subagent')
+            if bg is not None:
+                item.row_bg = bg
+            out.append(item)
     # Newest-first ordering matches the rest of the recipe.
     out.sort(key=lambda it: -it.mtime)
     return out
@@ -714,8 +832,7 @@ def _list_subagent_messages(item_id):
     if not suffix:
         return []
     agent_id = suffix
-    sub_dir = _subagents_dir(session_path)
-    agent_path = os.path.join(sub_dir, f'agent-{agent_id}.jsonl')
+    agent_path = _resolve_agent_jsonl(session_path, agent_id)
     if not os.path.isfile(agent_path):
         return []
     return _list_messages(agent_path)

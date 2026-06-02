@@ -34,7 +34,7 @@ def setUpModule():
         subprocess.run([os.path.join(_REPO, 'build-tui.sh')], check=True)
 
 
-def _make_fake_claude(tmpdir, with_subagents=False):
+def _make_fake_claude(tmpdir, with_subagents=False, relocated=False):
     """Create a fake ``$HOME/.claude/projects`` layout for tests.
 
     Returns the path to the projects root. Layout::
@@ -53,30 +53,82 @@ def _make_fake_claude(tmpdir, with_subagents=False):
     ``.meta.json`` ({agentType, description}). This mirrors the real
     on-disk layout — the recipe enumerates these as drillable rows
     alongside the session's top-level messages.
+
+    When ``relocated`` is true (implies ``with_subagents``), the session
+    .jsonl stays under ``-home-test-project/`` but its subagents live
+    under a **cwd-derived** project dir, mirroring what Claude Code does
+    after a session enters a git worktree. The session records carry
+    ``cwd=/home/test/project/.worktrees/wt`` which encodes to
+    ``-home-test-project--worktrees-wt`` (``.`` and ``/`` both → ``-``),
+    so the subagents land at
+    ``-home-test-project--worktrees-wt/abcd1234-deadbeef/subagents/``.
+    The session also carries an ``Agent`` tool_use + a tool_result whose
+    ``toolUseResult.agentId`` links to the relocated subagent.
     """
+    if relocated:
+        with_subagents = True
     root = os.path.join(tmpdir, '.claude', 'projects')
     proj = os.path.join(root, '-home-test-project')
     os.makedirs(proj)
     sess = os.path.join(proj, 'abcd1234-deadbeef.jsonl')
-    with open(sess, 'w') as f:
-        f.write(json.dumps({
+    cwd = '/home/test/project'
+    agent_id = 'FAKEAGENT01'
+    records = [
+        {
             'type': 'last-prompt',
             'leafUuid': '12345678-aaaa-bbbb-cccc-dddddddddddd',
             'sessionId': 'abcd1234',
-        }) + '\n')
-        f.write(json.dumps({
+        },
+        {
             'type': 'permission-mode',
             'permissionMode': 'plan',
             'sessionId': 'abcd1234',
-        }) + '\n')
-        f.write(json.dumps({
+        },
+        {
             'type': 'user',
             'message': {'role': 'user', 'content': 'hello world'},
-        }) + '\n')
+        },
+    ]
+    if relocated:
+        # The session moved into a worktree; every record now records the
+        # worktree cwd, which is where Claude Code stores the subagents.
+        cwd = '/home/test/project/.worktrees/wt'
+        for rec in records:
+            rec['cwd'] = cwd
+        # The dispatching assistant call + its tool_result link the main
+        # session to the subagent via ``toolUseResult.agentId``.
+        records.append({
+            'type': 'assistant',
+            'uuid': 'a-dispatch',
+            'cwd': cwd,
+            'message': {'role': 'assistant', 'content': [
+                {'type': 'tool_use', 'id': 'toolu_DISPATCH01',
+                 'name': 'Agent',
+                 'input': {'description': 'PROBE-DESC test the thing'}},
+            ]},
+        })
+        records.append({
+            'type': 'user',
+            'uuid': 'u-result',
+            'parentUuid': 'a-dispatch',
+            'cwd': cwd,
+            'message': {'role': 'user', 'content': [
+                {'type': 'tool_result', 'tool_use_id': 'toolu_DISPATCH01',
+                 'content': 'done'},
+            ]},
+            'toolUseResult': {'agentId': agent_id},
+        })
+    with open(sess, 'w') as f:
+        for rec in records:
+            f.write(json.dumps(rec) + '\n')
     if with_subagents:
-        sub_dir = os.path.join(proj, 'abcd1234-deadbeef', 'subagents')
+        if relocated:
+            enc = cwd.replace('/', '-').replace('.', '-')
+            sub_dir = os.path.join(
+                root, enc, 'abcd1234-deadbeef', 'subagents')
+        else:
+            sub_dir = os.path.join(proj, 'abcd1234-deadbeef', 'subagents')
         os.makedirs(sub_dir)
-        agent_id = 'FAKEAGENT01'
         agent_jsonl = os.path.join(sub_dir, f'agent-{agent_id}.jsonl')
         with open(agent_jsonl, 'w') as f:
             f.write(json.dumps({
@@ -839,6 +891,77 @@ class TestBrowseClaude(unittest.TestCase):
                 # (Using Home would pin the cursor to row 0 and the
                 # framework's anchor-replay would fight subsequent
                 # Down presses on async children deliveries.)
+                t.send('Up')
+                t.send('Up')
+                t.send('Up')
+                t.send('Right')   # expand subagent
+                t.wait_for('subagent task', timeout=5.0)
+                t.send('q')
+
+    def test_relocated_subagent_count_tag(self):
+        """Session count tag picks up worktree-relocated subagents.
+
+        The session .jsonl lives under ``-home-test-project/`` but its
+        subagents were stored under the cwd-derived worktree project
+        dir. The ``· N sub`` tag on the session row must still reflect
+        them — proving ``_count_subagents`` resolves via session cwds,
+        not just the co-located dir.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_fake_claude(tmp, relocated=True)
+            with TmuxFixture(cols=140, rows=30, env=self._launch_env(tmp)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE, '--no-tree')
+                t.wait_for('/home/test/project')
+                t.send('Right')
+                # The session row's tag shows ``· 1 sub`` only if the
+                # relocated subagent dir was discovered.
+                t.wait_for('1 sub', timeout=3.0)
+                t.send('q')
+
+    def test_relocated_subagent_listed_under_session(self):
+        """A worktree-relocated subagent shows as a sibling of the messages.
+
+        Same as ``test_lists_subagents_under_session`` but the subagent
+        transcript lives under the cwd-derived project dir rather than
+        co-located with the session .jsonl.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_fake_claude(tmp, relocated=True)
+            with TmuxFixture(cols=140, rows=30, env=self._launch_env(tmp)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE, '--no-tree')
+                t.wait_for('/home/test/project')
+                t.send('Right')
+                t.wait_for('abcd1234-deadbeef')
+                t.send('Down')
+                t.send('Right')
+                t.wait_for('PROBE-DESC', timeout=3.0)
+                t.send('q')
+
+    def test_drills_into_relocated_subagent(self):
+        """Expanding a worktree-relocated subagent reveals its transcript.
+
+        Mirrors ``test_drills_into_subagent`` but the subagent .jsonl is
+        stored under the cwd-derived worktree project dir, so reaching
+        its lines exercises ``_resolve_agent_jsonl`` rather than the
+        co-located fast path.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_fake_claude(tmp, relocated=True)
+            with TmuxFixture(cols=140, rows=30, env=self._launch_env(tmp)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE, '--no-tree')
+                t.wait_for('/home/test/project')
+                t.send('Right')
+                t.wait_for('abcd1234-deadbeef')
+                t.send('Down')
+                t.send('Right')
+                t.wait_for('PROBE-DESC', timeout=3.0)
+                t.wait_stable()
+                # After expanding the session the cursor lands on the
+                # latest *voice* — the ``hello world`` user turn (the
+                # appended Agent tool_use / tool_result rows aren't
+                # voice). The subagent group sits at the top of the
+                # session's children, above the 2 metadata rows; 3 Up
+                # presses reach it (matches test_drills_into_subagent).
                 t.send('Up')
                 t.send('Up')
                 t.send('Up')
