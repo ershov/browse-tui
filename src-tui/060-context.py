@@ -198,6 +198,16 @@ class Context:
         """
         return self._browser.expand(id, on_complete, autoscroll=autoscroll)
 
+    def collapse(self, id: Any) -> None:
+        """Collapse ``id`` — remove it from the expanded set.
+
+        Pass-through to :meth:`Browser.collapse`. The single-node
+        counterpart to :meth:`expand`: folds away ``id``'s children
+        and repaints. Collapsing an id that isn't expanded is a no-op.
+        Returns ``None`` — no fetch, nothing to await.
+        """
+        return self._browser.collapse(id)
+
     def select(self, ids, replace: bool = False) -> None:
         """Add ``ids`` to the selection set (or replace it)."""
         return self._browser.select(ids, replace)

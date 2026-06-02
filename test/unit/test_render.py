@@ -234,6 +234,50 @@ class TestFormatItemSegmentsDefault(unittest.TestCase):
         self.assertEqual(fg, _TAG_STYLE['green'][0])
         self.assertEqual(bold, _TAG_STYLE['green'][1])
 
+    def test_chips_emit_trailing_colored_segments(self):
+        # Two chips → two extra ' [text]' segments after the title, each
+        # styled through _TAG_STYLE just like the tag segment.
+        item = Item(id='a', title='Alpha')
+        item.chips = [('HEAD', 'green'), ('v1.2', 'yellow')]
+        segs = format_item_segments(item)
+        chip_segs = [s for s in segs if '[HEAD]' in s[0] or '[v1.2]' in s[0]]
+        self.assertEqual(len(chip_segs), 2, f'expected two chip segs, got {chip_segs!r}')
+        # First chip: green fg/bold; second chip: yellow fg/bold. Color
+        # lives in the segment fg, never embedded in the text.
+        head, head_fg, head_bold = chip_segs[0]
+        self.assertEqual(head, ' [HEAD]')
+        self.assertEqual((head_fg, head_bold), _TAG_STYLE['green'])
+        tag, tag_fg, tag_bold = chip_segs[1]
+        self.assertEqual(tag, ' [v1.2]')
+        self.assertEqual((tag_fg, tag_bold), _TAG_STYLE['yellow'])
+        # Chips come *after* the title segment.
+        title_idx = next(i for i, s in enumerate(segs) if s[0] == 'Alpha')
+        chip_idxs = [i for i, s in enumerate(segs) if s in chip_segs]
+        self.assertTrue(all(i > title_idx for i in chip_idxs))
+
+    def test_chip_unknown_style_falls_back_to_default(self):
+        # An unrecognized style resolves through _TAG_STYLE[''] (plain),
+        # mirroring tag_style — it must not crash.
+        item = Item(id='a', title='Alpha')
+        item.chips = [('odd', 'not-a-style')]
+        segs = format_item_segments(item)
+        chip_segs = [s for s in segs if s[0] == ' [odd]']
+        self.assertEqual(len(chip_segs), 1)
+        _, fg, bold = chip_segs[0]
+        self.assertEqual((fg, bold), _TAG_STYLE[''])
+
+    def test_no_chips_unchanged(self):
+        # Regression guard: an Item without ``chips`` renders exactly as
+        # before — no extra '[' segments beyond an explicit tag (none here).
+        item = Item(id='a', title='Alpha')
+        segs = format_item_segments(item)
+        self.assertNotIn('[', _joined(segs))
+        # And an empty/None chips attribute is also a no-op.
+        item.chips = []
+        self.assertEqual(format_item_segments(item), segs)
+        item.chips = None
+        self.assertEqual(format_item_segments(item), segs)
+
     def test_selected_emits_star_marker(self):
         item = Item(id='a')
         segs = format_item_segments(item, selected=True)

@@ -165,6 +165,10 @@ def format_item_segments(item, *, depth=0, base_depth=0, expanded=False,
                           ``scope_title`` set (the "no parent context
                           above me" label override; see scope-root
                           unification design)
+      - chip segments:    one ``' [{text}]'`` per ``(text, style)`` in
+                          ``item.chips`` (when set), each styled per
+                          ``_TAG_STYLE`` like the tag segment. Lets a row
+                          carry several colored labels after the title.
 
     Default layout for ``kind='pending'``:
       - indentation only, then a single dim ``'⧗ loading…'`` segment.
@@ -222,6 +226,14 @@ def format_item_segments(item, *, depth=0, base_depth=0, expanded=False,
     scope_title = getattr(item, 'scope_title', None)
     title_text = scope_title if (is_current_scope and scope_title) else item.title
     segments.append((title_text, None, is_current_scope))
+
+    # Trailing colored chips: one ``[{text}] `` segment per (text, style)
+    # in ``item.chips``, styled through ``_TAG_STYLE`` like the tag chip.
+    # Color rides the segment ``fg`` (never embedded in text) so width
+    # math stays correct.
+    for text, style in getattr(item, 'chips', None) or ():
+        cfg, cbold = _TAG_STYLE.get(style, _TAG_STYLE[''])
+        segments.append((' [{}]'.format(text), cfg, cbold))
     return segments
 
 

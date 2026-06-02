@@ -40,12 +40,13 @@ class Item:
 domain-specific attributes (`item.size`, `item.mtime`, `item.path` …) and
 they survive across the full pipeline (rendering, search, action env vars).
 
-Two such attributes are honoured by the list renderer when set:
+Three such attributes are honoured by the list renderer when set:
 
 | Attribute  | Type     | Effect |
 | ---------- | -------- | ------ |
 | `row_bg`   | int (256-color) | Background colour for the whole row (turns the row into a coloured stripe; extends across the trailing pad). |
 | `row_fg`   | int (256-color) | Foreground colour for segments that don't specify their own `fg`. Segments with explicit colours keep theirs. Useful for "dim the whole row" / "red row for failed status" effects. |
+| `chips`    | `list[(text, style)]` | Trailing coloured chips rendered after the title as ` [text]` segments, each coloured by `style` through the same `_TAG_STYLE` palette as `tag_style` (`'green'`, `'red'`, … or `''` for plain). Unlike a single `tag`, several chips can follow one title; the colour rides the segment foreground (never embedded in the text) so width math stays correct. Honoured only by the default formatter — a `format_item` override is responsible for its own chip layout. |
 
 Both default to `None` (no override). Set per-item with `item.row_bg = 1`
 / `item.row_fg = 8` after construction.
@@ -208,6 +209,7 @@ Each returns a `Pending` (where applicable) — see `Pending` below.
 ctx.refresh(id=None, on_complete=None) -> Pending
 ctx.cursor_to(id, on_complete=None)   -> Pending
 ctx.expand(id, on_complete=None)      -> Pending
+ctx.collapse(id)                      -> None
 ctx.select(ids, replace=False)        -> None
 ctx.message(text)                     -> None
 ctx.error(text)                       -> None
@@ -219,6 +221,7 @@ ctx.quit(code=0, output='')           -> None
 | `refresh`    | Refetch one parent's children (or full root if id is None).          |
 | `cursor_to`  | Move cursor to id; resolves once positioned (best-effort).           |
 | `expand`     | Add id to expanded; trigger fetch if not cached.                     |
+| `collapse`   | Remove id from expanded; fold its subtree (no-op if not expanded).   |
 | `select`     | Add ids to selection (or replace).                                   |
 | `message`    | Surface a transient status message in the info bar.                  |
 | `error`      | Surface an error message (red, sticks until next message).           |
@@ -287,6 +290,7 @@ ctx.preview_width                     -> int    # preview pane cols (0 if hidden
 ctx.preview_to_tail()                 -> None    # pin preview to bottom
 ctx.nav_home()                        -> None    # cursor -> row 0 + PIN_FIRST
 ctx.nav_end()                         -> None    # cursor -> last row + PIN_LAST
+ctx.collapse(id)                      -> None    # remove one id from expanded
 ctx.collapse_all()                    -> None    # clear all expanded
 ctx.expand_subtree(id, lazy=True)     -> None    # expand id + cached descendants
 ctx.select_all_visible()              -> None    # selection = every visible row
@@ -875,6 +879,7 @@ via the post queue so the renderer never sees a torn state.
 browser.refresh(id=None, on_complete=None) -> Pending
 browser.cursor_to(id, on_complete=None)    -> Pending
 browser.expand(id, on_complete=None)       -> Pending
+browser.collapse(id)                       -> None   # remove id from expanded; fold subtree
 browser.nav_home()                         # cursor → row 0; engage PIN_FIRST
 browser.nav_end()                          # cursor → last row; engage PIN_LAST
 browser.select(ids, replace=False)

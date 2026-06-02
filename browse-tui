@@ -4896,6 +4896,28 @@ class Browser:
         self.post(lambda: self._do_expand(id, pending, autoscroll))
         return pending
 
+    def collapse(self, id: Any) -> None:
+        """(thread-safe) Remove ``id`` from expanded; collapse its subtree.
+
+        The single-node counterpart to :meth:`expand` — discards ``id``
+        from ``state.expanded`` so its children fold away, then triggers
+        the same repaint path the ``←`` / ``l`` navigation key uses
+        (``mark_visible_dirty`` plus a cursor-change mark). No fetch is
+        involved, so this returns ``None`` rather than a ``Pending``:
+        there is nothing to await.
+
+        Collapsing an id that is not expanded is a no-op (``discard``
+        never raises). The cursor is left where it is; if it sat inside
+        the now-collapsed subtree the framework's cursor-anchor walk
+        lands it on the nearest still-visible ancestor on the next
+        render.
+        """
+        def _do():
+            self._state.expanded.discard(id)
+            mark_visible_dirty(self._state)
+            mark_cursor_changed(self)
+        self.post(_do)
+
     def set_children(self, id_, items) -> None:
         """(thread-safe) Inject pre-fetched children for ``id_`` from any thread.
 
@@ -8582,6 +8604,10 @@ def format_item_segments(item, *, depth=0, base_depth=0, expanded=False,
                           ``scope_title`` set (the "no parent context
                           above me" label override; see scope-root
                           unification design)
+      - chip segments:    one ``' [{text}]'`` per ``(text, style)`` in
+                          ``item.chips`` (when set), each styled per
+                          ``_TAG_STYLE`` like the tag segment. Lets a row
+                          carry several colored labels after the title.
 
     Default layout for ``kind='pending'``:
       - indentation only, then a single dim ``'⧗ loading…'`` segment.
@@ -8639,6 +8665,14 @@ def format_item_segments(item, *, depth=0, base_depth=0, expanded=False,
     scope_title = getattr(item, 'scope_title', None)
     title_text = scope_title if (is_current_scope and scope_title) else item.title
     segments.append((title_text, None, is_current_scope))
+
+    # Trailing colored chips: one ``[{text}] `` segment per (text, style)
+    # in ``item.chips``, styled through ``_TAG_STYLE`` like the tag chip.
+    # Color rides the segment ``fg`` (never embedded in text) so width
+    # math stays correct.
+    for text, style in getattr(item, 'chips', None) or ():
+        cfg, cbold = _TAG_STYLE.get(style, _TAG_STYLE[''])
+        segments.append((' [{}]'.format(text), cfg, cbold))
     return segments
 
 
@@ -11388,6 +11422,16 @@ class Context:
         doesn't surprise the user.
         """
         return self._browser.expand(id, on_complete, autoscroll=autoscroll)
+
+    def collapse(self, id: Any) -> None:
+        """Collapse ``id`` — remove it from the expanded set.
+
+        Pass-through to :meth:`Browser.collapse`. The single-node
+        counterpart to :meth:`expand`: folds away ``id``'s children
+        and repaints. Collapsing an id that isn't expanded is a no-op.
+        Returns ``None`` — no fetch, nothing to await.
+        """
+        return self._browser.collapse(id)
 
     def select(self, ids, replace: bool = False) -> None:
         """Add ``ids`` to the selection set (or replace it)."""

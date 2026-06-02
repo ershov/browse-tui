@@ -79,6 +79,44 @@ class TestCollapseAll(unittest.TestCase):
         self.assertEqual(b._state.scope_stack, ['a'])
 
 
+class TestCollapse(unittest.TestCase):
+
+    def test_removes_id_from_expanded(self):
+        b = Browser(BrowserConfig(_headless=True))
+        _seed_tree(b)
+        b._state.expanded.update({'a', 'b'})
+        b.collapse('a')
+        b.drain_main_queue()
+        self.assertNotIn('a', b._state.expanded)
+        # Sibling expansion is untouched.
+        self.assertIn('b', b._state.expanded)
+
+    def test_already_collapsed_is_noop(self):
+        b = Browser(BrowserConfig(_headless=True))
+        _seed_tree(b)
+        # 'a' is not in the expanded set — collapsing must not raise.
+        b.collapse('a')
+        b.drain_main_queue()
+        self.assertNotIn('a', b._state.expanded)
+
+    def test_visible_list_folds_subtree(self):
+        # 'a' expanded → a1 and a2 are visible. After collapse('a'),
+        # those child rows fold away while 'a' itself stays visible.
+        b = Browser(BrowserConfig(_headless=True))
+        _seed_tree(b)
+        b._state.expanded.add('a')
+        _state.mark_visible_dirty(b._state)
+        before = [e.item.id for e in _state.visible_items(b._state)
+                  if e.kind == 'normal']
+        self.assertIn('a1', before)
+        b.collapse('a')
+        b.drain_main_queue()
+        after = [e.item.id for e in _state.visible_items(b._state)
+                 if e.kind == 'normal']
+        self.assertNotIn('a1', after)
+        self.assertIn('a', after)
+
+
 class TestExpandSubtree(unittest.TestCase):
 
     def test_adds_id_and_descendants(self):
@@ -145,6 +183,24 @@ class TestContextPassthroughs(unittest.TestCase):
         b.drain_main_queue()
         self.assertIn('a', b._state.expanded)
         self.assertIn('a1', b._state.expanded)
+
+    def test_collapse(self):
+        b = Browser(BrowserConfig(_headless=True))
+        _seed_tree(b)
+        b._state.expanded.add('a')
+        ctx = Context(b)
+        ctx.collapse('a')
+        b.drain_main_queue()
+        self.assertNotIn('a', b._state.expanded)
+
+    def test_collapse_already_collapsed_is_noop(self):
+        b = Browser(BrowserConfig(_headless=True))
+        _seed_tree(b)
+        ctx = Context(b)
+        # Nothing expanded — pass-through must not raise.
+        ctx.collapse('a')
+        b.drain_main_queue()
+        self.assertNotIn('a', b._state.expanded)
 
 
 if __name__ == '__main__':
