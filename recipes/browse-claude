@@ -418,8 +418,7 @@ def get_children(item_id, *, reload=False):
             session_path, _, suffix = item_id.partition('#agent:')
             if not suffix:
                 return []
-            sub_dir = _subagents_dir(session_path)
-            agent_path = os.path.join(sub_dir, f'agent-{suffix}.jsonl')
+            agent_path = _resolve_agent_jsonl(session_path, suffix)
             if not os.path.isfile(agent_path):
                 return []
             return _list_tree_roots(agent_path)
@@ -2779,7 +2778,7 @@ class _ScanCursor:
         self.span_start = None
 
 
-def _fold_record(td, cur, rec, n, path, sub_dir):
+def _fold_record(td, cur, rec, n, path):
     """Fold one record at line ``n`` into ``td`` using ``cur``.
 
     Returns a set of parent umbrella ids whose visible child list grew
@@ -2864,7 +2863,7 @@ def _fold_record(td, cur, rec, n, path, sub_dir):
                 dirty.add(f'{path}#tool:{owner_line}')
             # Subagent-link check: a tool_result whose
             # toolUseResult.agentId resolves an agent jsonl on disk.
-            _maybe_link_subagent(td, rec, owner, sub_dir, path)
+            _maybe_link_subagent(td, rec, owner, path)
         else:
             td.turn_direct[turn_uuid].append(rec)
             if turn_root_line is not None:
@@ -2928,7 +2927,7 @@ def _resolve_tool_owner(rec, tool_owner):
     return None
 
 
-def _maybe_link_subagent(td, rec, owner_uuid, sub_dir, path):
+def _maybe_link_subagent(td, rec, owner_uuid, path):
     """If ``rec`` is a tool_result that resolves a subagent jsonl, link it.
 
     Inspects the owner assistant's tool_use parts to find the matching
@@ -2967,7 +2966,7 @@ def _maybe_link_subagent(td, rec, owner_uuid, sub_dir, path):
                         if isinstance(tur, dict) else None)
             if not agent_id:
                 continue
-            agent_path = os.path.join(sub_dir, f'agent-{agent_id}.jsonl')
+            agent_path = _resolve_agent_jsonl(path, agent_id)
             if not os.path.isfile(agent_path):
                 continue
             td.agent_link[tu_id] = {
@@ -2993,7 +2992,7 @@ def _resolve_path_for_bust(item_id):
         sess, _, aid = item_id.partition('#agent:')
         if not aid:
             return None
-        agent_path = os.path.join(_subagents_dir(sess), f'agent-{aid}.jsonl')
+        agent_path = _resolve_agent_jsonl(sess, aid)
         return agent_path if os.path.isfile(agent_path) else None
     # Any other ``<path>#...`` id resolves to ``<path>``.
     if '#' in item_id:
@@ -3057,7 +3056,6 @@ def _scan_tree_locked(path):
     """
     td = _TreeData()
     cur = _ScanCursor()
-    sub_dir = _subagents_dir(path)
     try:
         f = open(path, 'r', encoding='utf-8', errors='replace')
     except OSError:
@@ -3091,7 +3089,7 @@ def _scan_tree_locked(path):
                     td.records.append(None)
                 else:
                     td.records.append(rec)
-                    _fold_record(td, cur, rec, n, path, sub_dir)
+                    _fold_record(td, cur, rec, n, path)
                     if _is_voice(rec):
                         td.latest_voice_line = n
             last_full_offset = f.tell()
@@ -3165,7 +3163,6 @@ def _read_new_records(path):
     dirty = set()
     try:
         td = _TREE_CACHE.get(path)   # ``td`` or None for flat-only paths
-        sub_dir = _subagents_dir(path)
         try:
             f = open(path, 'r', encoding='utf-8', errors='replace')
         except OSError:
@@ -3204,7 +3201,7 @@ def _read_new_records(path):
                     if rec is not None:
                         dirty |= _fold_record(td, cur=tail.cursor,
                                               rec=rec, n=n,
-                                              path=path, sub_dir=sub_dir)
+                                              path=path)
                         if _is_voice(rec):
                             td.latest_voice_line = n
                 tail.byte_offset = f.tell()
@@ -3482,8 +3479,7 @@ def _cursor_tail_path(item_id):
             if isinstance(sess, str) and sess.endswith('.jsonl') and os.path.isfile(sess):
                 return sess
             return None
-        agent_path = os.path.join(_subagents_dir(sess),
-                                  f'agent-{aid}.jsonl')
+        agent_path = _resolve_agent_jsonl(sess, aid)
         return agent_path if os.path.isfile(agent_path) else None
     path = item_id.partition('#')[0] if '#' in item_id else item_id
     if (isinstance(path, str)
@@ -3863,9 +3859,9 @@ def _subagent_pseudo_item(parent_jsonl, agent_id, agent_path):
     so the existing preview/edit handlers Just Work — only the parent
     in the tree changes.
     """
-    sub_dir = _subagents_dir(parent_jsonl)
     meta = _read_subagent_meta(
-        os.path.join(sub_dir, f'agent-{agent_id}.meta.json'),
+        os.path.join(os.path.dirname(agent_path),
+                     f'agent-{agent_id}.meta.json'),
     )
     agent_type = meta.get('agentType') or 'agent'
     description = meta.get('description') or ''
@@ -3936,7 +3932,7 @@ def _scope_card_path(item_id):
         sess, _, aid = item_id.partition('#agent:')
         if not aid:
             return None
-        agent_path = os.path.join(_subagents_dir(sess), f'agent-{aid}.jsonl')
+        agent_path = _resolve_agent_jsonl(sess, aid)
         return agent_path if os.path.isfile(agent_path) else None
     if (isinstance(item_id, str) and item_id.endswith('.jsonl')
             and os.path.isfile(item_id)):
@@ -4250,9 +4246,7 @@ def _resolve_path(item):
         session_path, _, suffix = iid.partition('#agent:')
         if not suffix:
             return session_path
-        return os.path.join(
-            _subagents_dir(session_path), f'agent-{suffix}.jsonl',
-        )
+        return _resolve_agent_jsonl(session_path, suffix)
     if '#' in iid:
         iid, _, _ = iid.rpartition('#')
     return iid
@@ -4305,9 +4299,7 @@ def _gather_line_source(items):
             continue
         if '#agent:' in iid:
             sess, _, aid = iid.partition('#agent:')
-            agent_path = os.path.join(
-                _subagents_dir(sess), f'agent-{aid}.jsonl',
-            )
+            agent_path = _resolve_agent_jsonl(sess, aid)
             whole_paths.append((agent_path, item))
             continue
         if '#prompt:' in iid or '#tool:' in iid or '#span:' in iid:

@@ -552,52 +552,73 @@ class TestBrowseClaude(unittest.TestCase):
                 t.wait_for('▶ user', timeout=3.0)
                 t.send('q')
 
-    def _make_tree_fixture(self, tmp):
-        """Two turns + one Agent dispatch with a real subagent jsonl."""
+    def _make_tree_fixture(self, tmp, relocated=False):
+        """Two turns + one Agent dispatch with a real subagent jsonl.
+
+        When ``relocated`` is true the session ``.jsonl`` stays under
+        ``-home-test-tree/`` but its subagent transcript lives under a
+        **cwd-derived** project dir, mirroring what Claude Code does
+        once a session enters a git worktree. Every record carries
+        ``cwd=/home/test/tree/.worktrees/wt`` which encodes to
+        ``-home-test-tree--worktrees-wt`` (``.`` and ``/`` both → ``-``),
+        so ``agent-AGENT01.jsonl`` lands at
+        ``-home-test-tree--worktrees-wt/tree-sess/subagents/`` rather
+        than co-located with the session.
+        """
         import json as _json
         root = os.path.join(tmp, '.claude', 'projects')
         proj = os.path.join(root, '-home-test-tree')
         os.makedirs(proj)
         sess = os.path.join(proj, 'tree-sess.jsonl')
+        records = [
+            {'type': 'permission-mode', 'permissionMode': 'plan'},
+            # Turn 1.
+            {'type': 'user', 'uuid': 'u1', 'parentUuid': None,
+             'promptId': 'P1',
+             'message': {'role': 'user',
+                         'content': 'PROBE_TURN1_USER'}},
+            {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 'toolu_x', 'name': 'Task',
+                  'input': {'prompt': 'PROBE_AGENT_PROMPT',
+                            'subagent_type': 'Explore'}},
+             ]}},
+            {'type': 'user', 'uuid': 'u2', 'parentUuid': 'a1',
+             'promptId': 'P1',
+             'message': {'role': 'user', 'content': [
+                 {'type': 'tool_result', 'tool_use_id': 'toolu_x',
+                  'content': 'PROBE_AGENT_RESULT'},
+             ]},
+             'toolUseResult': {'agentId': 'AGENT01',
+                               'agentType': 'Explore',
+                               'status': 'completed'}},
+            {'type': 'assistant', 'uuid': 'a2', 'parentUuid': 'u2',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'text', 'text': 'PROBE_TURN1_REPLY'},
+             ]}},
+            # Turn 2 (new promptId → new turn root).
+            {'type': 'user', 'uuid': 'u3', 'parentUuid': 'a2',
+             'promptId': 'P2',
+             'message': {'role': 'user',
+                         'content': 'PROBE_TURN2_USER'}},
+            {'type': 'assistant', 'uuid': 'a3', 'parentUuid': 'u3',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'text', 'text': 'PROBE_TURN2_REPLY'},
+             ]}},
+        ]
+        if relocated:
+            # The session moved into a worktree; every record records the
+            # worktree cwd, which is where Claude Code stores subagents.
+            cwd = '/home/test/tree/.worktrees/wt'
+            for rec in records:
+                rec['cwd'] = cwd
+            enc = cwd.replace('/', '-').replace('.', '-')
+            sub_dir = os.path.join(root, enc, 'tree-sess', 'subagents')
+        else:
+            sub_dir = os.path.join(proj, 'tree-sess', 'subagents')
         with open(sess, 'w') as f:
-            for rec in [
-                {'type': 'permission-mode', 'permissionMode': 'plan'},
-                # Turn 1.
-                {'type': 'user', 'uuid': 'u1', 'parentUuid': None,
-                 'promptId': 'P1',
-                 'message': {'role': 'user',
-                             'content': 'PROBE_TURN1_USER'}},
-                {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
-                 'message': {'role': 'assistant', 'content': [
-                     {'type': 'tool_use', 'id': 'toolu_x', 'name': 'Task',
-                      'input': {'prompt': 'PROBE_AGENT_PROMPT',
-                                'subagent_type': 'Explore'}},
-                 ]}},
-                {'type': 'user', 'uuid': 'u2', 'parentUuid': 'a1',
-                 'promptId': 'P1',
-                 'message': {'role': 'user', 'content': [
-                     {'type': 'tool_result', 'tool_use_id': 'toolu_x',
-                      'content': 'PROBE_AGENT_RESULT'},
-                 ]},
-                 'toolUseResult': {'agentId': 'AGENT01',
-                                   'agentType': 'Explore',
-                                   'status': 'completed'}},
-                {'type': 'assistant', 'uuid': 'a2', 'parentUuid': 'u2',
-                 'message': {'role': 'assistant', 'content': [
-                     {'type': 'text', 'text': 'PROBE_TURN1_REPLY'},
-                 ]}},
-                # Turn 2 (new promptId → new turn root).
-                {'type': 'user', 'uuid': 'u3', 'parentUuid': 'a2',
-                 'promptId': 'P2',
-                 'message': {'role': 'user',
-                             'content': 'PROBE_TURN2_USER'}},
-                {'type': 'assistant', 'uuid': 'a3', 'parentUuid': 'u3',
-                 'message': {'role': 'assistant', 'content': [
-                     {'type': 'text', 'text': 'PROBE_TURN2_REPLY'},
-                 ]}},
-            ]:
+            for rec in records:
                 f.write(_json.dumps(rec) + '\n')
-        sub_dir = os.path.join(proj, 'tree-sess', 'subagents')
         os.makedirs(sub_dir)
         agent_path = os.path.join(sub_dir, 'agent-AGENT01.jsonl')
         with open(agent_path, 'w') as f:
@@ -730,6 +751,46 @@ class TestBrowseClaude(unittest.TestCase):
                 t.send('Up')
                 t.send('Right')                  # expand Task umbrella
                 t.wait_for('PROBE_SUBAGENT_DESC', timeout=3.0)
+                t.send('q')
+
+    def test_tree_expand_assistant_shows_relocated_subagent(self):
+        """Tree mode reveals a worktree-relocated subagent inline.
+
+        Same flow as ``test_tree_expand_assistant_shows_subagent`` but
+        the subagent transcript lives under the cwd-derived worktree
+        project dir, not co-located with the session ``.jsonl``. The
+        Task-calling assistant row must still surface the subagent
+        (``PROBE_SUBAGENT_DESC``), and drilling into it must reveal its
+        transcript line — proving the tree-mode resolution sites route
+        through ``_resolve_agent_jsonl``.
+        """
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._make_tree_fixture(tmp, relocated=True)
+            with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE,
+                         '--tree', '--file', sess)
+                t.wait_for('PROBE_TURN2_REPLY', timeout=3.0)
+                # Walk back to turn 1's root umbrella (see the co-located
+                # variant for the row-by-row reasoning behind the 3 K's).
+                t.send('K')
+                t.send('K')
+                t.send('K')
+                t.wait_for('PROBE_TURN1_USER', timeout=3.0)
+                t.send('Right')                  # expand turn 1
+                t.wait_for('PROBE_TURN1_REPLY', timeout=3.0)
+                t.send('Up')
+                t.send('Right')                  # expand Task umbrella
+                # The relocated subagent must surface inline under the
+                # dispatching assistant — fails before routing through
+                # the resolver (the agent_link is never built because
+                # the co-located subagents dir is empty).
+                t.wait_for('PROBE_SUBAGENT_DESC', timeout=3.0)
+                # Drill into the subagent row: its transcript line must
+                # render, proving get_children resolves the relocated
+                # agent jsonl too.
+                t.send('Right')
+                t.wait_for('PROBE_SUBAGENT_PROMPT', timeout=3.0)
                 t.send('q')
 
     def test_user_assistant_rows_have_row_bg(self):
