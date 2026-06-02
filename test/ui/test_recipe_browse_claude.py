@@ -1212,6 +1212,269 @@ class TestBrowseClaude(unittest.TestCase):
                                  '--no-show-all; got: ' + cap[-800:])
                 t.send('q')
 
+    # -- SendMessage inter-agent round-trip (#643/#649) --------------------
+
+    def _make_sendmessage_fixture(self, tmp):
+        """A session holding one full leader↔worker SendMessage round-trip.
+
+        Five records, chronological on disk:
+
+          1. a turn-opening human ``user`` prompt (so the session has a
+             genuine human turn root above the exchange);
+          2. an ``assistant`` record carrying the outbound ``SendMessage``
+             tool_use (recipient / summary / message markdown);
+          3. the ``{success, message}`` delivery ack tool_result;
+          4. a ``user`` ``<task-notification>`` record — the worker's
+             inbound reply (task-id / tool-use-id / status / summary /
+             result markdown).
+
+        The PROBE_ markers are unique so the tmux assertions can pin each
+        rendered fragment. Returns the session ``.jsonl`` path.
+        """
+        import json as _json
+        root = os.path.join(tmp, '.claude', 'projects')
+        proj = os.path.join(root, '-home-test-sendmsg')
+        os.makedirs(proj)
+        sess = os.path.join(proj, 'sendmsg-sess.jsonl')
+        recipient = 'PROBE_WORKER_7'
+        tool_use_id = 'toolu_SENDMSG01'
+        records = [
+            # Human turn root.
+            {'type': 'user', 'uuid': 'u1', 'parentUuid': None,
+             'promptId': 'P1',
+             'message': {'role': 'user',
+                         'content': 'PROBE_HUMAN_PROMPT'}},
+            # Outbound: leader → worker SendMessage.
+            {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': tool_use_id,
+                  'name': 'SendMessage',
+                  'input': {'recipient': recipient,
+                            'summary': 'PROBE_SEND_SUMMARY',
+                            'message': '## PROBE_SEND_BODY heading'}},
+             ]}},
+            # Delivery ack — shape is exactly {success, message}.
+            {'type': 'user', 'uuid': 'u2', 'parentUuid': 'a1',
+             'message': {'role': 'user', 'content': [
+                 {'type': 'tool_result', 'tool_use_id': tool_use_id,
+                  'content': 'PROBE_ACK_RAW'},
+             ]},
+             'toolUseResult': {
+                 'success': True,
+                 'message': ('Message delivered to ' + recipient
+                             + '. Output: /tmp/x/tasks/'
+                             + recipient + '.output')}},
+            # Inbound: worker → leader task-notification reply.
+            {'type': 'user', 'uuid': 'u3', 'parentUuid': 'u2',
+             'promptId': 'P-notify',
+             'message': {'role': 'user', 'content': (
+                 '<task-notification>'
+                 '<task-id>' + recipient + '</task-id>'
+                 '<tool-use-id>' + tool_use_id + '</tool-use-id>'
+                 '<output-file>/tmp/x/tasks/' + recipient + '.output'
+                 '</output-file>'
+                 '<status>completed</status>'
+                 '<summary>PROBE_REPLY_SUMMARY</summary>'
+                 '<result>## PROBE_REPLY_BODY heading</result>'
+                 '</task-notification>')}},
+        ]
+        with open(sess, 'w') as f:
+            for rec in records:
+                f.write(_json.dumps(rec) + '\n')
+        return sess
+
+    def test_flat_sendmessage_round_trip_renders(self):
+        """Flat mode: outbound, ack and inbound each render with their kind.
+
+        Drives ``--no-tree`` and scopes straight into the session
+        (``--item 0``) so the message rows list directly. Asserts the
+        outbound ``→ <recipient>`` header + message markdown and the
+        ``agent-send`` tag; the inbound ``← …`` one-liner + result
+        markdown and the ``agent-reply`` tag (NOT ``user``); and the
+        compact ``✓ delivered`` ack form.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._make_sendmessage_fixture(tmp)
+            with TmuxFixture(cols=160, rows=40, env=self._launch_env(tmp)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE,
+                         '--no-tree', '--file', sess, '--item', '0')
+                # Scoped via ``--item 0`` the rows list chronologically;
+                # the inbound reply one-liner (``← <task_id> · <status> ·
+                # <summary>``) is the last (latest voice) row.
+                t.wait_for('PROBE_REPLY_SUMMARY', timeout=3.0)
+                cap = t.capture()
+                # Outbound one-liner + its distinct kind tag.
+                self.assertIn('PROBE_WORKER_7', cap)
+                self.assertIn('agent-send', cap,
+                              'outbound row should tag as agent-send; '
+                              'got: ' + cap[-1200:])
+                # Inbound tagged agent-reply, NOT the human ``user`` kind.
+                self.assertIn('agent-reply', cap,
+                              'inbound reply should tag as agent-reply; '
+                              'got: ' + cap[-1200:])
+                # The ``←`` direction glyph distinguishes the reply.
+                self.assertIn('←', cap)
+                # Drill into the outbound row's preview: header + markdown.
+                # Cursor lands on the latest voice (the reply, bottom row);
+                # K walks up to the outbound SendMessage voice row.
+                t.send('K')
+                cap2 = t.wait_for('→ PROBE_WORKER_7', timeout=3.0)
+                self.assertIn('PROBE_SEND_BODY', cap2,
+                              'outbound preview should render message '
+                              'markdown; got: ' + cap2[-1200:])
+                t.send('q')
+
+    def test_flat_sendmessage_inbound_preview_and_ack(self):
+        """Flat mode: inbound preview renders its result; ack is compact.
+
+        On open the cursor lands on the latest voice — the inbound reply
+        — so its preview (``← task-notification`` header + ``<result>``
+        markdown) renders immediately. The ack row, sitting between the
+        two voice rows, renders its compact ``✓ delivered`` status when
+        the cursor reaches it.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._make_sendmessage_fixture(tmp)
+            with TmuxFixture(cols=160, rows=40, env=self._launch_env(tmp)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE,
+                         '--no-tree', '--file', sess, '--item', '0')
+                # Inbound reply preview on first paint.
+                cap = t.wait_for('← task-notification', timeout=3.0)
+                self.assertIn('PROBE_REPLY_BODY', cap,
+                              'inbound preview should render result '
+                              'markdown; got: ' + cap[-1200:])
+                # The cursor lands on the latest voice (the reply, the
+                # bottom row). The ack tool_result sits directly above it
+                # in the chronological flat list; move the cursor onto it
+                # so its compact ``✓ delivered`` preview renders. The long
+                # ``Output: /tmp`` path must be trimmed from that view.
+                t.send('Up')
+                cap2 = t.wait_for('✓ delivered', timeout=3.0)
+                self.assertNotIn('.output', cap2,
+                                 'ack should trim the long Output: path; '
+                                 'got: ' + cap2[-1200:])
+                t.send('q')
+
+    def test_flat_sendmessage_voice_filter_keeps_voice_hides_ack(self):
+        """Flat voice-only: outbound + inbound survive, the ack is hidden.
+
+        Boots ``--no-show-all`` (voice-only). The outbound SendMessage and
+        the inbound task-notification both classify as voice, so their
+        rows stay; the ``{success, message}`` ack is a plain tool_result
+        (machinery) and must be filtered out.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._make_sendmessage_fixture(tmp)
+            with TmuxFixture(cols=160, rows=40, env=self._launch_env(tmp)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE,
+                         '--no-tree', '--no-show-all',
+                         '--file', sess, '--item', '0')
+                t.wait_for('PROBE_REPLY_SUMMARY', timeout=3.0)
+                cap = t.capture()
+                # Both voice halves of the channel remain listed.
+                self.assertIn('agent-send', cap,
+                              'outbound should survive voice-only filter; '
+                              'got: ' + cap[-1200:])
+                self.assertIn('agent-reply', cap,
+                              'inbound should survive voice-only filter; '
+                              'got: ' + cap[-1200:])
+                # The delivery ack (tool_result machinery) is filtered out
+                # — its one-liner prefix ``↳ tool_result`` must be gone.
+                self.assertNotIn('↳ tool_result', cap,
+                                 'ack should be hidden under voice-only; '
+                                 'got: ' + cap[-1200:])
+                t.send('q')
+
+    def test_tree_sendmessage_reply_umbrella_not_prompt(self):
+        """Tree mode: the task-notification turn umbrella reads ``<reply>``.
+
+        The inbound task-notification opens its own turn (so the leader's
+        follow-up nests under it), but its umbrella must NOT masquerade as
+        a human ``<prompt>`` — it carries the ``<reply>`` prefix and the
+        ``agent-reply`` kind. The genuine human turn keeps ``<prompt>``.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._make_sendmessage_fixture(tmp)
+            with TmuxFixture(cols=160, rows=40, env=self._launch_env(tmp)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE, '--tree')
+                t.wait_for('/home/test/sendmsg', timeout=3.0)
+                t.send('Right')                  # expand project
+                t.wait_for('sendmsg-sess', timeout=3.0)
+                t.send('Down')                   # cursor → session row
+                t.send('Right')                  # expand session — one level
+                # The session's direct children are the two turn roots:
+                # the human ``<prompt>`` and the task-notification turn.
+                cap = t.wait_for('<reply>', timeout=3.0)
+                # The agent-reply turn umbrella reads ``<reply>``, not
+                # ``<prompt>``, and surfaces its ``←`` one-liner.
+                self.assertIn('<reply>', cap,
+                              'task-notification turn should use the '
+                              '<reply> prefix; got: ' + cap[-1400:])
+                self.assertIn('PROBE_REPLY_SUMMARY', cap)
+                # The genuine human turn keeps the ``<prompt>`` prefix.
+                self.assertIn('<prompt>', cap,
+                              'human turn should keep <prompt>; '
+                              'got: ' + cap[-1400:])
+                t.send('q')
+
+    def test_tree_sendmessage_outbound_umbrella_and_stripes(self):
+        """Tree mode: the SendMessage tool umbrella carries the agent-send kind.
+
+        Drilling into the human turn reveals the ``<tool:SendMessage>``
+        umbrella; its kind is ``agent-send`` and the outbound header
+        renders in its preview. The inbound reply, an ``agent-reply`` row,
+        is NOT re-parented under that umbrella — it stays a sibling turn.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._make_sendmessage_fixture(tmp)
+            with TmuxFixture(cols=160, rows=40, env=self._launch_env(tmp)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE,
+                         '--tree', '--file', sess)
+                # Latest voice = the inbound reply turn; its preview shows
+                # the task-notification render.
+                t.wait_for('← task-notification', timeout=3.0)
+                cap0 = t.capture()
+                self.assertIn('PROBE_REPLY_BODY', cap0)
+                # Walk up to the human turn root and expand it to reveal
+                # the SendMessage tool umbrella.
+                t.send('K')
+                t.send('K')
+                t.send('K')
+                t.wait_for('PROBE_HUMAN_PROMPT', timeout=3.0)
+                t.send('Right')                  # expand the human turn
+                # The <tool:SendMessage> umbrella surfaces under the turn.
+                cap = t.wait_for('SendMessage', timeout=3.0)
+                self.assertIn('→ PROBE_WORKER_7', cap,
+                              'outbound one-liner should show under the '
+                              'turn; got: ' + cap[-1400:])
+                t.send('q')
+
+    def test_tree_sendmessage_voice_filter_keeps_voice_hides_ack(self):
+        """Tree voice-only: outbound + inbound survive, the ack is hidden."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._make_sendmessage_fixture(tmp)
+            with TmuxFixture(cols=160, rows=40, env=self._launch_env(tmp)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE,
+                         '--tree', '--no-show-all', '--file', sess)
+                # Inbound reply still lands as the latest voice.
+                t.wait_for('← task-notification', timeout=3.0)
+                # Walk up to the human turn and expand it; the
+                # SendMessage outbound voice row survives the filter
+                # while its ack tool_result is hidden.
+                t.send('K')
+                t.send('K')
+                t.send('K')
+                t.wait_for('PROBE_HUMAN_PROMPT', timeout=3.0)
+                t.send('Right')                  # expand human turn
+                cap = t.wait_for('SendMessage', timeout=3.0)
+                self.assertIn('→ PROBE_WORKER_7', cap,
+                              'outbound should survive voice-only filter '
+                              'in tree mode; got: ' + cap[-1400:])
+                self.assertNotIn('↳ tool_result', cap,
+                                 'ack should be hidden under voice-only '
+                                 'in tree mode; got: ' + cap[-1400:])
+                t.send('q')
+
 
 if __name__ == '__main__':
     unittest.main()

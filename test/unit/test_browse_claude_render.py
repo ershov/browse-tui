@@ -6356,5 +6356,317 @@ class TestOnScopeChangeCrossFileUpgrade(unittest.TestCase):
         self.assertEqual(invalidated, [])
 
 
+class TestSendMessage(unittest.TestCase):
+    """Outbound ``SendMessage`` (leader → worker): the assistant tool_use
+    is the message, its ``{success, message}`` tool_result is a delivery
+    ack. Both render as agent voice, distinct from human / assistant."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _input(self, recipient='worker-7', summary='Address review nits',
+               message='Please fix the **three** findings.\n\nDetails here.',
+               with_to=False, with_content=False):
+        inp = {'recipient': recipient, 'summary': summary, 'message': message}
+        if with_to:
+            inp.pop('recipient', None)
+            inp['to'] = recipient
+        if with_content:
+            inp.pop('message', None)
+            inp['content'] = message
+        return inp
+
+    def _send_rec(self, **kw):
+        return {
+            'type': 'assistant',
+            'message': {'role': 'assistant', 'content': [{
+                'type': 'tool_use', 'id': 'tu1', 'name': 'SendMessage',
+                'input': self._input(**kw),
+            }]},
+        }
+
+    def _ack_rec(self, success=True,
+                 message=('Agent "worker-7" had no active task; resumed from '
+                          'transcript in the background with your message. '
+                          "You'll be notified when it finishes. "
+                          'Output: /tmp/claude-1001/proj/sess/tasks/worker-7.output')):
+        return {
+            'type': 'user',
+            'message': {'role': 'user', 'content': [{
+                'type': 'tool_result', 'tool_use_id': 'tu1', 'content': '',
+            }]},
+            'toolUseResult': {'success': success, 'message': message},
+        }
+
+    # -- _fmt_tool_use_send_message (full preview) -------------------------
+
+    def test_fmt_send_header_and_markdown(self):
+        out = self.r._fmt_tool_use_send_message(self._input())
+        self.assertIn('→ worker-7', out)
+        self.assertIn('Address review nits', out)
+        # message body rendered (md2ansi unavailable in tests → raw md).
+        self.assertIn('Please fix the **three** findings.', out)
+        self.assertIn('Details here.', out)
+
+    def test_fmt_send_to_content_fallbacks(self):
+        out = self.r._fmt_tool_use_send_message(
+            self._input(with_to=True, with_content=True))
+        self.assertIn('→ worker-7', out)
+        self.assertIn('Address review nits', out)
+        self.assertIn('Please fix the **three** findings.', out)
+
+    # -- dispatch through the assistant renderer ---------------------------
+
+    def test_render_assistant_dispatches_send_message(self):
+        out = self.r._render_assistant(self._send_rec())
+        self.assertIn('🔧 SendMessage', out)
+        self.assertIn('→ worker-7', out)
+        self.assertIn('Address review nits', out)
+        self.assertIn('Please fix the **three** findings.', out)
+
+    def test_send_message_registered_in_formatters(self):
+        self.assertIn('SendMessage', self.r._TOOL_USE_FORMATTERS)
+
+    # -- one-liner ---------------------------------------------------------
+
+    def test_tool_use_one_line_send(self):
+        line = self.r._tool_use_one_line('SendMessage', self._input())
+        self.assertEqual(line, '→ worker-7: Address review nits')
+
+    def test_tool_use_one_line_send_to_fallback(self):
+        line = self.r._tool_use_one_line(
+            'SendMessage', self._input(with_to=True))
+        self.assertEqual(line, '→ worker-7: Address review nits')
+
+    def test_summarise_message_send(self):
+        # The assistant-with-only-tool_use path routes through the
+        # one-liner: 🔧 SendMessage(→ worker-7: Address review nits).
+        out = self.r._summarise_message(self._send_rec())
+        self.assertIn('🔧 SendMessage', out)
+        self.assertIn('→ worker-7: Address review nits', out)
+
+    # -- ack: _fmt_tur_send_message ---------------------------------------
+
+    def test_fmt_tur_send_success_delivered(self):
+        out = self.r._fmt_tur_send_message(
+            {'success': True, 'message': 'queued the message. '
+             'Output: /tmp/claude/x/tasks/w.output'})
+        self.assertIn('✓ delivered', out)
+        # The long Output: /tmp path is trimmed off.
+        self.assertNotIn('/tmp/claude/x/tasks/w.output', out)
+        self.assertIn('queued the message.', out)
+
+    def test_fmt_tur_send_failure(self):
+        out = self.r._fmt_tur_send_message(
+            {'success': False, 'message': 'no such agent'})
+        self.assertIn('✗', out)
+        self.assertIn('no such agent', out)
+        self.assertNotIn('delivered', out)
+
+    # -- routing through _fmt_tool_use_result ------------------------------
+
+    def test_tool_use_result_routes_ack_by_key_set(self):
+        out = self.r._fmt_tool_use_result(
+            {'success': True, 'message': 'delivered it. '
+             'Output: /tmp/a/b/tasks/x.output'}, '')
+        self.assertIn('✓ delivered', out)
+        self.assertNotIn('/tmp/a/b/tasks/x.output', out)
+
+    def test_skill_ack_not_shadowed_by_send(self):
+        # A skill ack carries commandName alongside success — it must
+        # still route to the skill formatter, not the SendMessage one.
+        out = self.r._fmt_tool_use_result(
+            {'commandName': 'verify', 'success': True}, '')
+        self.assertIn('verify', out)
+        self.assertNotIn('delivered', out)
+
+    def test_render_tool_result_send_ack(self):
+        out = self.r._render_user(self._ack_rec())
+        self.assertIn('✓ delivered', out)
+        self.assertNotIn('worker-7.output', out)
+
+    # -- _is_voice ---------------------------------------------------------
+
+    def test_is_voice_send_message(self):
+        self.assertTrue(self.r._is_voice(self._send_rec()))
+
+    def test_is_voice_send_ack_is_machinery(self):
+        # The delivery ack is a status receipt, not voice.
+        self.assertFalse(self.r._is_voice(self._ack_rec()))
+
+    # -- _kind_of ----------------------------------------------------------
+
+    def test_kind_of_agent_send(self):
+        self.assertEqual(self.r._kind_of(self._send_rec()), 'agent-send')
+
+    def test_kind_of_plain_assistant_unchanged(self):
+        rec = {'type': 'assistant',
+               'message': {'role': 'assistant',
+                           'content': [{'type': 'text', 'text': 'hi'}]}}
+        self.assertEqual(self.r._kind_of(rec), 'assistant')
+
+    def test_kind_of_bash_tool_use_unchanged(self):
+        rec = {'type': 'assistant',
+               'message': {'role': 'assistant', 'content': [{
+                   'type': 'tool_use', 'name': 'Bash',
+                   'input': {'command': 'ls'}}]}}
+        self.assertEqual(self.r._kind_of(rec), 'assistant')
+
+    # -- stripe / tag style registration -----------------------------------
+
+    def test_agent_send_stripe_and_tag_style_registered(self):
+        self.assertEqual(self.r._ROW_BG_FOR_KIND.get('agent-send'), 22)
+        self.assertIn('agent-send', self.r._TAG_STYLE_FOR_KIND)
+
+
+class TestTaskNotification(unittest.TestCase):
+    """Inbound task-notification reply (worker → leader): a ``user``
+    record whose text content is a ``<task-notification>`` wrapper. It
+    must render as agent voice (its own ``agent-reply`` stripe), not be
+    mis-attributed to the human."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    _NOTIFY = (
+        '<task-notification>\n'
+        '<task-id>a4276aa253ce276ab</task-id>\n'
+        '<tool-use-id>toolu_01Lha6wR4Xgnc21wKyJeM2E9</tool-use-id>\n'
+        '<output-file>/tmp/claude-1001/proj/sess/tasks/a4276aa253ce276ab.output'
+        '</output-file>\n'
+        '<status>completed</status>\n'
+        '<summary>Agent "Implement ticket #616" completed</summary>\n'
+        '<result>All **three** findings addressed.\n\n'
+        '## Report\n\nDetails here.</result>\n'
+        '</task-notification>'
+    )
+
+    def _notify_rec(self, text=None):
+        """A user record carrying the notification as a bare string."""
+        return {
+            'type': 'user',
+            'message': {'role': 'user',
+                        'content': self._NOTIFY if text is None else text},
+        }
+
+    def _notify_rec_list(self, text=None):
+        """Same, but content as a single text part (list shape)."""
+        return {
+            'type': 'user',
+            'message': {'role': 'user', 'content': [
+                {'type': 'text', 'text': self._NOTIFY if text is None else text},
+            ]},
+        }
+
+    def _human_rec(self):
+        return {
+            'type': 'user',
+            'message': {'role': 'user', 'content': 'Just a normal prompt.'},
+        }
+
+    # -- _parse_task_notification ------------------------------------------
+
+    def test_parse_all_fields(self):
+        d = self.r._parse_task_notification(self._NOTIFY)
+        self.assertEqual(d['task_id'], 'a4276aa253ce276ab')
+        self.assertEqual(d['tool_use_id'], 'toolu_01Lha6wR4Xgnc21wKyJeM2E9')
+        self.assertEqual(
+            d['output_file'],
+            '/tmp/claude-1001/proj/sess/tasks/a4276aa253ce276ab.output')
+        self.assertEqual(d['status'], 'completed')
+        self.assertEqual(d['summary'], 'Agent "Implement ticket #616" completed')
+        # result kept as raw markdown (not stripped/rendered).
+        self.assertIn('All **three** findings addressed.', d['result'])
+        self.assertIn('## Report', d['result'])
+
+    def test_parse_missing_tags_tolerant(self):
+        d = self.r._parse_task_notification(
+            '<task-notification><status>completed</status>'
+            '</task-notification>')
+        self.assertEqual(d['status'], 'completed')
+        # Absent tags resolve to '' (not a KeyError / None surprise).
+        self.assertEqual(d['task_id'], '')
+        self.assertEqual(d['summary'], '')
+        self.assertEqual(d['result'], '')
+
+    # -- _is_task_notification ---------------------------------------------
+
+    def test_is_task_notification_string(self):
+        self.assertTrue(self.r._is_task_notification(self._notify_rec()))
+
+    def test_is_task_notification_list(self):
+        self.assertTrue(self.r._is_task_notification(self._notify_rec_list()))
+
+    def test_is_task_notification_human_false(self):
+        self.assertFalse(self.r._is_task_notification(self._human_rec()))
+
+    def test_is_task_notification_leading_whitespace(self):
+        # lstrip() before the prefix check.
+        self.assertTrue(
+            self.r._is_task_notification(self._notify_rec('\n   ' + self._NOTIFY)))
+
+    # -- _kind_of ----------------------------------------------------------
+
+    def test_kind_of_agent_reply(self):
+        self.assertEqual(self.r._kind_of(self._notify_rec()), 'agent-reply')
+
+    def test_kind_of_human_user_unchanged(self):
+        self.assertEqual(self.r._kind_of(self._human_rec()), 'user')
+
+    # -- _is_voice (unchanged path) ----------------------------------------
+
+    def test_is_voice_task_notification(self):
+        self.assertTrue(self.r._is_voice(self._notify_rec()))
+
+    # -- stripe / tag style registration -----------------------------------
+
+    def test_agent_reply_stripe_is_teal(self):
+        # The reply's stripe resolves to 23 (teal), NOT human's 235.
+        kind = self.r._kind_of(self._notify_rec())
+        self.assertEqual(self.r._ROW_BG_FOR_KIND.get(kind), 23)
+        self.assertIn('agent-reply', self.r._TAG_STYLE_FOR_KIND)
+
+    def test_human_user_stripe_still_235(self):
+        kind = self.r._kind_of(self._human_rec())
+        self.assertEqual(self.r._ROW_BG_FOR_KIND.get(kind), 235)
+
+    # -- _summarise_message ------------------------------------------------
+
+    def test_summarise_one_liner(self):
+        out = self.r._summarise_message(self._notify_rec())
+        self.assertIn('←', out)
+        self.assertIn('a4276aa253ce276ab', out)
+        self.assertIn('completed', out)
+        self.assertIn('Agent "Implement ticket #616" completed', out)
+        # Must NOT dump the raw XML wrapper.
+        self.assertNotIn('<task-notification>', out)
+        self.assertNotIn('<result>', out)
+
+    def test_summarise_human_unchanged(self):
+        out = self.r._summarise_message(self._human_rec())
+        self.assertIn('Just a normal prompt.', out)
+
+    # -- full preview (_render_user) ---------------------------------------
+
+    def test_full_preview_header_and_markdown(self):
+        out = self.r._render_user(self._notify_rec())
+        self.assertIn('completed', out)
+        self.assertIn('Agent "Implement ticket #616" completed', out)
+        self.assertIn('a4276aa253ce276ab.output', out)
+        # result rendered (md2ansi unavailable in tests → raw md).
+        self.assertIn('All **three** findings addressed.', out)
+        self.assertIn('## Report', out)
+        # Not the raw XML wrapper.
+        self.assertNotIn('<task-notification>', out)
+        self.assertNotIn('<result>', out)
+
+    def test_full_preview_human_unchanged(self):
+        out = self.r._render_user(self._human_rec())
+        self.assertIn('▶ user', out)
+        self.assertIn('Just a normal prompt.', out)
+
+
 if __name__ == '__main__':
     unittest.main()
