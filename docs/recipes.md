@@ -163,33 +163,68 @@ Keys: `k` send SIGTERM (with confirmation), `ctrl-r` reload tree.
 
 ## `recipes/browse-git`
 
-Recent commits → changed files → per-file diff.
+A tig-like browser over a git repository, with five view modes.
 
-**One-line summary:** three-level hierarchy via id-shape dispatch — top
-level lists `git log --oneline -n 50`, expanding a commit lists its
-changed files via `git show --name-only`, and the preview pane shows
-the unified diff for that file.
+**One-line summary:** five switchable modes — commits (default), status,
+reflog, branches, stash — over a mandatory `KIND:`-prefixed id scheme;
+colorized diff / message previews; ref-decoration and author·date chips
+on commit rows.
+
+**Modes:**
+
+- **commits** — recent `git log`; drill commit → changed files →
+  per-file diff. Scoped by positional revs / paths.
+- **status** — `git status` working-tree entries; the leaf preview is
+  the staged and/or worktree diff chosen by the porcelain `XY` code
+  (`MM` shows both sections; `??` renders the file as an addition).
+- **reflog** — `git reflog` entries with their `HEAD@{n}` selector;
+  same commit → file → diff drill-down.
+- **branches** — branches / remotes / tags via `git for-each-ref`,
+  tagged by kind; drill a ref into its commits.
+- **stash** — `git stash list`; drill into a stash's files.
+
+Switch modes with `--mode NAME` at launch, the backtick (`` ` ``) picker
+at runtime, or auto-selection from positional args.
 
 **Demonstrates:**
 
-- Multiple subprocess invocations behind a single `get_children` —
-  commits at level 0, file lists at level 1, diff text in `get_preview`.
-- Id-shape dispatch (`<sha>` vs `<sha>:<path>`) without threading
-  extra state through the Browser.
-- Graceful degradation when `git` is missing or the cwd isn't a
-  repository — surfaces a single error Item instead of crashing.
+- A `KIND:`-prefixed id scheme (`commit:`, `file:`, `ref:`, `status:`,
+  `stash:`, `reflog:`) parsed by one `_parse_id` helper — no hex-vs-word
+  heuristics; `get_children` / `get_preview` dispatch on the kind.
+- Colorized previews: `git -c color.ui=always` for diffs / stat, piped
+  through [`delta`](https://github.com/dandavison/delta) when it is on
+  PATH (`--no-gitconfig --paging never --width <preview_width>`), with a
+  silent fallback to the git-colored diff when `delta` is absent.
+- Optional md2ansi commit-message coloring via the soft `md2ansi_lib`
+  import, toggled with `m` (the same pattern as `browse-fs` /
+  `browse-plan`).
+- `item.chips` — ref/tag decorations parsed from `%D` plus an
+  `author · relative-date` chip render as colored trailing chips on
+  commit rows; file rows carry an A/M/D/R status-letter tag.
+- `on_enter` as a callable that flips expand/collapse via `ctx.expand` /
+  `ctx.collapse` (Enter never quits in long-running browse mode).
+- `ctx.pick` for the runtime mode picker; `ctx.run_external` for the `E`
+  working-tree edit; positional rev-vs-path classification via
+  `git rev-parse`.
+- Fail-fast in `main()` — `git` missing or not inside a work tree exits
+  with a stderr message before the TUI launches.
 
 **Usage:**
 
 ```bash
 cd /path/to/your/repo
-./recipes/browse-git
+./recipes/browse-git                    # commits mode
+./recipes/browse-git --mode status      # working-tree changes
+./recipes/browse-git -n 200 HEAD~50     # cap + root the log at a rev
+./recipes/browse-git -- src/            # filter the log to a path
 ```
 
-No custom actions — drill in with `Right`, view diffs in the preview
-pane, leave with `q`.
+Keys: `` ` `` mode picker, `Enter` flip expand/collapse, `E` edit the
+working-tree file in `$EDITOR` (file/status rows), `m` toggle md2ansi
+message coloring (when available); the built-in `v` pages the colored
+diff in `$PAGER`, `e` edits the preview text.
 
-**Source:** [`recipes/browse-git`](../recipes/browse-git) (~110 lines)
+**Source:** [`recipes/browse-git`](../recipes/browse-git) (~1030 lines)
 
 ---
 

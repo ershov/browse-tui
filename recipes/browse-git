@@ -21,6 +21,11 @@ relies on hex-vs-word heuristics:
   stash:<n>[:<path>]    a stash, or a file in one
   reflog:<n>:<sha>      a reflog entry    -> changed files
 
+Commit (and reflog) rows are decorated: branch / remote / tag refs
+parsed from ``%D`` render as colored trailing chips (HEAD + local
+branch, remote, ``tag:``), followed by a dim ``author · relative-date``
+chip; file rows carry their A/M/D/R status letter as a colored tag.
+
 Previews honour ANSI: ``git`` emits color via ``-c color.ui=always``
 and per-file diffs are rendered through ``delta`` when it is on PATH
 (otherwise the git-colored diff is shown verbatim). Commit messages can
@@ -896,20 +901,37 @@ def toggle_md(ctx):
 _HELP_INTRO_TMPL = """\
 browse-git — a tig-like browser over a git repository.
 
-Usage: browse-git [-n NUMBER] [--mode NAME] [<revs>…] [-- <paths>…]
+Usage: browse-git [-n NUMBER] [--mode NAME] [<rev>…] [-- <path>…]
   -n NUMBER     Cap the commit / reflog list to this many entries
                 (default: {default}).
-  --mode NAME   Start in one of: {modes}.
-  <revs>        Revisions scoping the commits list (git log <revs>).
-  -- <paths>    Pathspecs scoping the commits list.
+  --mode NAME   Start in one of: {modes}. Default: commits.
+  <rev>…        A rev / sha roots the commits log at it (git log <rev>).
+  <path>…       A path filters the commits log to commits touching it.
+  -- <path>…    Everything after -- is forced to be a pathspec.
 
-Five view modes — commits (default), status, reflog, branches, stash —
-switchable with --mode, the backtick (`) picker, or auto-selected from
-positional arguments. Enter flips expand/collapse of the cursor row; v
-pages the colored preview; e edits the preview text; E edits the real
-working-tree file (file/status rows); m toggles md2ansi message coloring
-when available. Previews are color: git emits SGR and per-file diffs go
-through delta when it is installed.\
+Positional args are auto-classified: an arg that names an existing file
+or directory is a pathspec; otherwise an arg git resolves as a commit is
+a rev; anything else is an error. They scope commits mode (an explicit
+--mode other than commits ignores them).
+
+The five view modes:
+  commits   recent git log; drill commit -> changed files -> per-file diff
+  status    working-tree entries; leaf preview = staged / worktree diff
+  reflog    reflog entries; same drill-down as commits
+  branches  branches / remotes / tags; drill a ref into its commits
+  stash     stash entries; drill into the stash's files
+
+Keys:
+  `         open the mode picker (switch view mode at runtime)
+  Enter     flip expand/collapse of the cursor row (never quits)
+  E         edit the real working-tree file in $EDITOR (file/status rows)
+  m         toggle md2ansi commit-message coloring (when md2ansi_lib present)
+  v         (built-in) page the colored preview / diff in $PAGER
+  e         (built-in) edit the preview text in $EDITOR
+
+Previews are colorized: git emits SGR, per-file diffs go through delta
+when it is installed, and commit messages are md2ansi-colored when
+available. Commit rows show ref/tag decorations and an author · date chip.\
 """
 
 
