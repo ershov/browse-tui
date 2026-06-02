@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./build-tui.sh)",
+      "Bash(python3 -m unittest *)",
+      "Bash(./run-tests.sh)",
+      "Bash(python -m unittest *)"
+    ]
+  }
+}

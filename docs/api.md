@@ -40,12 +40,13 @@ class Item:
 domain-specific attributes (`item.size`, `item.mtime`, `item.path` …) and
 they survive across the full pipeline (rendering, search, action env vars).
 
-Two such attributes are honoured by the list renderer when set:
+Three such attributes are honoured by the list renderer when set:
 
 | Attribute  | Type     | Effect |
 | ---------- | -------- | ------ |
 | `row_bg`   | int (256-color) | Background colour for the whole row (turns the row into a coloured stripe; extends across the trailing pad). |
 | `row_fg`   | int (256-color) | Foreground colour for segments that don't specify their own `fg`. Segments with explicit colours keep theirs. Useful for "dim the whole row" / "red row for failed status" effects. |
+| `chips`    | `list[(text, style)]` | Trailing coloured chips rendered after the title as ` [text]` segments, each coloured by `style` through the same `_TAG_STYLE` palette as `tag_style` (`'green'`, `'red'`, … or `''` for plain). Unlike a single `tag`, several chips can follow one title; the colour rides the segment foreground (never embedded in the text) so width math stays correct. Honoured only by the default formatter — a `format_item` override is responsible for its own chip layout. |
 
 Both default to `None` (no override). Set per-item with `item.row_bg = 1`
 / `item.row_fg = 8` after construction.
