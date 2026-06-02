@@ -455,8 +455,13 @@ def get_children(item_id, *, reload=False):
         # A reflog entry drills into the same file list as a commit —
         # a sha is a sha. parsed = ('reflog', n, sha).
         return _commit_files(parsed[2])
-    # ref / status / stash drill-down arrives in later tickets;
-    # file rows and error rows are leaves.
+    if kind == 'stash' and len(parsed) == 2:
+        # A stash node (parsed = ('stash', n)) drills into its files; a
+        # stash file leaf (('stash', n, path)) has none. The synthetic
+        # "no stashes" row has a non-numeric n and yields [] too.
+        return _stash_files(parsed[1])
+    # ref drill-down arrives in a later ticket; file / leaf / error rows
+    # have no children.
     return []
 
 
@@ -468,7 +473,9 @@ def _root_children():
         return _reflog_root()
     if _mode == 'status':
         return _status_root()
-    # branches / stash listing arrives in later tickets.
+    if _mode == 'stash':
+        return _stash_root()
+    # branches listing arrives in a later ticket.
     return []
 
 
@@ -573,6 +580,77 @@ def _status_root():
     return items
 
 
+def _stash_root():
+    """``git stash list`` rows as ``stash:<n>`` items, decorated.
+
+    Each record is NUL-separated ``%gd %cr %gs`` (selector, relative date,
+    subject). An empty stash list yields a single dim, non-drillable "no
+    stashes" row (sentinel id ``stash:none`` — its non-numeric ``n`` keeps
+    it out of the stash drill-down and preview paths).
+    """
+    result = _run_git('stash', 'list', '--format=%gd%x00%cr%x00%gs')
+    if result.returncode != 0:
+        return _err_item(f'git stash list failed: {result.stderr.strip()}')
+    items = []
+    for line in result.stdout.splitlines():
+        row = _stash_row(line)
+        if row is not None:
+            items.append(row)
+    if not items:
+        return [Item(id='stash:none', title='no stashes',
+                     tag_style='dim', has_children=False)]
+    return items
+
+
+def _stash_row(line):
+    """Build one stash Item from a ``%gd %cr %gs`` NUL record.
+
+    Returns ``None`` for a malformed (under-filled) line. The index ``n``
+    is extracted from the ``%gd`` selector (``stash@{2}`` → ``2``); the
+    relative date is a dim chip and the selector becomes the yellow tag.
+    """
+    if not line:
+        return None
+    fields = line.split('\x00')
+    if len(fields) < 3:
+        return None
+    selector, reldate, subject = fields[:3]
+    n = _stash_index(selector)
+    if n is None:
+        return None
+    item = Item(id=f'stash:{n}', title=subject,
+                tag=selector, tag_style='yellow', has_children=True)
+    item.chips = [(reldate, 'dim')]
+    return item
+
+
+def _stash_index(selector):
+    """Extract the 0-based index from a ``stash@{n}`` selector, or None."""
+    inner = selector.partition('{')[2].partition('}')[0]
+    return inner if inner.isdigit() else None
+
+
+def _stash_files(n):
+    """Files in stash ``n`` as ``stash:<n>:<path>`` rows.
+
+    Reuses ``git stash show --name-status stash@{n}`` + ``_parse_name_status``
+    so each row carries its status-letter tag. A non-numeric ``n`` (the
+    "no stashes" sentinel) yields no children.
+    """
+    if not str(n).isdigit():
+        return []
+    result = _run_git('stash', 'show', '--name-status', f'stash@{{{n}}}')
+    if result.returncode != 0:
+        return _err_item(f'git stash show failed: {result.stderr.strip()}')
+    items = []
+    for status, path in _parse_name_status(result.stdout):
+        items.append(Item(id=f'stash:{n}:{path}', title=path,
+                          tag=status,
+                          tag_style=_STATUS_LETTER_STYLE.get(status, ''),
+                          has_children=False))
+    return items
+
+
 def _commit_files(sha):
     """Changed files in commit ``sha`` as ``file:<sha>:<path>`` rows.
 
@@ -612,6 +690,15 @@ def get_preview(item_id):
         if parsed[2]:
             return _status_preview(parsed[1], parsed[2])
         return ''
+    if kind == 'stash':
+        # parsed = ('stash', n) node or ('stash', n, path) leaf. The "no
+        # stashes" sentinel has a non-numeric n — guard it out.
+        n = parsed[1]
+        if not n.isdigit():
+            return ''
+        if len(parsed) == 3:
+            return _stash_file_preview(n, parsed[2])
+        return _stash_preview(n)
     # root / err / not-yet-implemented kinds have no preview yet.
     return ''
 
@@ -652,6 +739,18 @@ def _status_preview(xy, path):
         else:
             sections.append(body)
     return '\n\n'.join(s for s in sections if s)
+
+
+def _stash_preview(n):
+    """Stash node preview = colored full ``stash show -p stash@{n}`` diff."""
+    raw = _git_color('stash', 'show', '-p', f'stash@{{{n}}}')
+    return _colorize_diff(raw)
+
+
+def _stash_file_preview(n, path):
+    """Stash file leaf preview = colored per-file diff in ``stash@{n}``."""
+    raw = _git_color('show', f'stash@{{{n}}}', '--', path)
+    return _colorize_diff(raw)
 
 
 # ---- key handlers --------------------------------------------------------

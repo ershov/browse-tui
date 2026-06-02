@@ -27,6 +27,11 @@ Coverage (ticket #619 — status mode):
 * ``_parse_porcelain_z``   NUL porcelain → (XY, path), incl. rename
 * ``_status_tag``          XY → one-letter tag (X-or-Y, ``?`` for ``??``)
 * ``_status_diff_plan``    XY → staged/unstaged/untracked diff command(s)
+
+Coverage (ticket #620 — stash mode):
+
+* ``_stash_index``         ``stash@{n}`` → ``n`` (or None)
+* ``_stash_row``           NUL record → stash Item (id/tag/title/chips)
 """
 
 import importlib.util
@@ -506,6 +511,63 @@ class TestStatusDiffPlan(unittest.TestCase):
             self.r._status_diff_plan('??', 'f.txt'),
             [('untracked',
               ['diff', '--no-index', '--', '/dev/null', 'f.txt'])])
+
+
+class TestStashIndex(unittest.TestCase):
+    """``_stash_index`` extracts the 0-based index from a ``%gd`` selector."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_zero(self):
+        self.assertEqual(self.r._stash_index('stash@{0}'), '0')
+
+    def test_double_digit(self):
+        self.assertEqual(self.r._stash_index('stash@{12}'), '12')
+
+    def test_non_index_selector(self):
+        self.assertIsNone(self.r._stash_index('garbage'))
+        self.assertIsNone(self.r._stash_index(''))
+
+
+class TestStashRow(unittest.TestCase):
+    """``_stash_row`` turns a ``%gd %cr %gs`` NUL record into a stash Item."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _record(self, selector, reldate, subject):
+        return '\x00'.join([selector, reldate, subject])
+
+    def test_full_record(self):
+        item = self.r._stash_row(
+            self._record('stash@{0}', '2 hours ago', 'WIP on main: abc init'))
+        self.assertEqual(item.id, 'stash:0')
+        self.assertEqual(item.tag, 'stash@{0}')
+        self.assertEqual(item.tag_style, 'yellow')
+        self.assertEqual(item.title, 'WIP on main: abc init')
+        self.assertTrue(item.has_children)
+        self.assertEqual(item.chips, [('2 hours ago', 'dim')])
+
+    def test_index_from_selector(self):
+        item = self.r._stash_row(
+            self._record('stash@{3}', '1 day ago', 'On main: hotfix'))
+        # id keys on the index extracted from the selector, not enumeration.
+        self.assertEqual(item.id, 'stash:3')
+        self.assertEqual(item.tag, 'stash@{3}')
+
+    def test_malformed_returns_none(self):
+        self.assertIsNone(self.r._stash_row('stash@{0}\x00only-two'))
+
+    def test_bad_selector_returns_none(self):
+        # A record whose selector has no extractable index is skipped.
+        self.assertIsNone(
+            self.r._stash_row('garbage\x002 hours ago\x00WIP'))
+
+    def test_empty_returns_none(self):
+        self.assertIsNone(self.r._stash_row(''))
 
 
 if __name__ == '__main__':

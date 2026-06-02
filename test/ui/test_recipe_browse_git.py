@@ -226,6 +226,32 @@ class TestBrowseGit(unittest.TestCase):
                 self.assertIn('[M]', row)
                 t.send('q')
 
+    def test_mode_stash_lists_stash(self):
+        """``--mode stash`` lists a stash with its ``stash@{0}`` selector.
+
+        After ``_make_repo`` we modify a tracked file and ``git stash`` it,
+        so ``git stash list`` reports one entry → the recipe renders a row
+        with a ``stash@{0}`` tag and a ``WIP on`` subject.
+        """
+        env = {
+            **os.environ,
+            'GIT_AUTHOR_NAME': 'Test', 'GIT_AUTHOR_EMAIL': 'test@example.com',
+            'GIT_COMMITTER_NAME': 'Test', 'GIT_COMMITTER_EMAIL': 'test@example.com',
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_repo(tmp)
+            # Dirty a tracked file, then stash it.
+            with open(os.path.join(tmp, 'beta.txt'), 'w') as f:
+                f.write('beta changed\n')
+            subprocess.run(['git', '-C', tmp, 'stash'], check=True,
+                           capture_output=True, env=env)
+            with TmuxFixture(cols=120, rows=30) as t:
+                t.send_line(f'cd {tmp}')
+                t.launch(_BIN, '--run-py', _RECIPE, '--mode', 'stash')
+                cap = t.wait_for('stash@{', timeout=5.0)
+                self.assertIn('WIP on', cap)
+                t.send('q')
+
     def test_rapid_scroll_children_pane_lands(self):
         """Rapid 25-key burst lands the children pane within ~2s.
 
