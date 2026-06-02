@@ -3906,9 +3906,16 @@ def _prompt_umbrella_item(jsonl_path, turn_root_line, rec, td):
     # itself + each member (tool-using members collapse into one row).
     n_replies = len(members)
     item_id = f'{jsonl_path}#prompt:{turn_root_line}'
+    # A turn opened by a worker→leader task-notification is agent voice,
+    # not a human prompt — relabel its umbrella so the row doesn't
+    # masquerade as one (a SendMessage-only assistant turn can't be a
+    # turn root; only user voice opens turns, so the human-vs-reply
+    # split is the only distinction needed here).
+    kind = _kind_of(rec)
+    prefix = '<reply>' if kind == 'agent-reply' else '<prompt>'
     item = Item(
         id=item_id,
-        title=f'<prompt>  {summary}',
+        title=f'{prefix}  {summary}',
         tag=f'{n_replies} replies' if n_replies else 'no reply yet',
         tag_style='dim',
         has_children=True,
@@ -3917,7 +3924,7 @@ def _prompt_umbrella_item(jsonl_path, turn_root_line, rec, td):
     item.kind = 'prompt'
     item.line_no = turn_root_line
     item.session_path = jsonl_path
-    item.message_kind = _kind_of(rec)
+    item.message_kind = kind
     # Voice stripe — the umbrella visually IS the user prompt at the
     # turn level. Matches the leaf user-msg row's stripe so the two
     # adjacent rows read as one voice block.
