@@ -6520,5 +6520,153 @@ class TestSendMessage(unittest.TestCase):
         self.assertIn('agent-send', self.r._TAG_STYLE_FOR_KIND)
 
 
+class TestTaskNotification(unittest.TestCase):
+    """Inbound task-notification reply (worker → leader): a ``user``
+    record whose text content is a ``<task-notification>`` wrapper. It
+    must render as agent voice (its own ``agent-reply`` stripe), not be
+    mis-attributed to the human."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    _NOTIFY = (
+        '<task-notification>\n'
+        '<task-id>a4276aa253ce276ab</task-id>\n'
+        '<tool-use-id>toolu_01Lha6wR4Xgnc21wKyJeM2E9</tool-use-id>\n'
+        '<output-file>/tmp/claude-1001/proj/sess/tasks/a4276aa253ce276ab.output'
+        '</output-file>\n'
+        '<status>completed</status>\n'
+        '<summary>Agent "Implement ticket #616" completed</summary>\n'
+        '<result>All **three** findings addressed.\n\n'
+        '## Report\n\nDetails here.</result>\n'
+        '</task-notification>'
+    )
+
+    def _notify_rec(self, text=None):
+        """A user record carrying the notification as a bare string."""
+        return {
+            'type': 'user',
+            'message': {'role': 'user',
+                        'content': self._NOTIFY if text is None else text},
+        }
+
+    def _notify_rec_list(self, text=None):
+        """Same, but content as a single text part (list shape)."""
+        return {
+            'type': 'user',
+            'message': {'role': 'user', 'content': [
+                {'type': 'text', 'text': self._NOTIFY if text is None else text},
+            ]},
+        }
+
+    def _human_rec(self):
+        return {
+            'type': 'user',
+            'message': {'role': 'user', 'content': 'Just a normal prompt.'},
+        }
+
+    # -- _parse_task_notification ------------------------------------------
+
+    def test_parse_all_fields(self):
+        d = self.r._parse_task_notification(self._NOTIFY)
+        self.assertEqual(d['task_id'], 'a4276aa253ce276ab')
+        self.assertEqual(d['tool_use_id'], 'toolu_01Lha6wR4Xgnc21wKyJeM2E9')
+        self.assertEqual(
+            d['output_file'],
+            '/tmp/claude-1001/proj/sess/tasks/a4276aa253ce276ab.output')
+        self.assertEqual(d['status'], 'completed')
+        self.assertEqual(d['summary'], 'Agent "Implement ticket #616" completed')
+        # result kept as raw markdown (not stripped/rendered).
+        self.assertIn('All **three** findings addressed.', d['result'])
+        self.assertIn('## Report', d['result'])
+
+    def test_parse_missing_tags_tolerant(self):
+        d = self.r._parse_task_notification(
+            '<task-notification><status>completed</status>'
+            '</task-notification>')
+        self.assertEqual(d['status'], 'completed')
+        # Absent tags resolve to '' (not a KeyError / None surprise).
+        self.assertEqual(d['task_id'], '')
+        self.assertEqual(d['summary'], '')
+        self.assertEqual(d['result'], '')
+
+    # -- _is_task_notification ---------------------------------------------
+
+    def test_is_task_notification_string(self):
+        self.assertTrue(self.r._is_task_notification(self._notify_rec()))
+
+    def test_is_task_notification_list(self):
+        self.assertTrue(self.r._is_task_notification(self._notify_rec_list()))
+
+    def test_is_task_notification_human_false(self):
+        self.assertFalse(self.r._is_task_notification(self._human_rec()))
+
+    def test_is_task_notification_leading_whitespace(self):
+        # lstrip() before the prefix check.
+        self.assertTrue(
+            self.r._is_task_notification(self._notify_rec('\n   ' + self._NOTIFY)))
+
+    # -- _kind_of ----------------------------------------------------------
+
+    def test_kind_of_agent_reply(self):
+        self.assertEqual(self.r._kind_of(self._notify_rec()), 'agent-reply')
+
+    def test_kind_of_human_user_unchanged(self):
+        self.assertEqual(self.r._kind_of(self._human_rec()), 'user')
+
+    # -- _is_voice (unchanged path) ----------------------------------------
+
+    def test_is_voice_task_notification(self):
+        self.assertTrue(self.r._is_voice(self._notify_rec()))
+
+    # -- stripe / tag style registration -----------------------------------
+
+    def test_agent_reply_stripe_is_teal(self):
+        # The reply's stripe resolves to 23 (teal), NOT human's 235.
+        kind = self.r._kind_of(self._notify_rec())
+        self.assertEqual(self.r._ROW_BG_FOR_KIND.get(kind), 23)
+        self.assertIn('agent-reply', self.r._TAG_STYLE_FOR_KIND)
+
+    def test_human_user_stripe_still_235(self):
+        kind = self.r._kind_of(self._human_rec())
+        self.assertEqual(self.r._ROW_BG_FOR_KIND.get(kind), 235)
+
+    # -- _summarise_message ------------------------------------------------
+
+    def test_summarise_one_liner(self):
+        out = self.r._summarise_message(self._notify_rec())
+        self.assertIn('←', out)
+        self.assertIn('a4276aa253ce276ab', out)
+        self.assertIn('completed', out)
+        self.assertIn('Agent "Implement ticket #616" completed', out)
+        # Must NOT dump the raw XML wrapper.
+        self.assertNotIn('<task-notification>', out)
+        self.assertNotIn('<result>', out)
+
+    def test_summarise_human_unchanged(self):
+        out = self.r._summarise_message(self._human_rec())
+        self.assertIn('Just a normal prompt.', out)
+
+    # -- full preview (_render_user) ---------------------------------------
+
+    def test_full_preview_header_and_markdown(self):
+        out = self.r._render_user(self._notify_rec())
+        self.assertIn('completed', out)
+        self.assertIn('Agent "Implement ticket #616" completed', out)
+        self.assertIn('a4276aa253ce276ab.output', out)
+        # result rendered (md2ansi unavailable in tests → raw md).
+        self.assertIn('All **three** findings addressed.', out)
+        self.assertIn('## Report', out)
+        # Not the raw XML wrapper.
+        self.assertNotIn('<task-notification>', out)
+        self.assertNotIn('<result>', out)
+
+    def test_full_preview_human_unchanged(self):
+        out = self.r._render_user(self._human_rec())
+        self.assertIn('▶ user', out)
+        self.assertIn('Just a normal prompt.', out)
+
+
 if __name__ == '__main__':
     unittest.main()

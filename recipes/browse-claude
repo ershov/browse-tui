@@ -940,8 +940,10 @@ _TAG_STYLE_FOR_KIND = {
     'system':              'gray',
     'tool_use':            'yellow',
     'tool_result':         'yellow',
-    # Inter-agent voice (leader → worker SendMessage).
+    # Inter-agent voice: leader → worker SendMessage (send) and the
+    # worker → leader task-notification reply (reply).
     'agent-send':          'green',
+    'agent-reply':         'cyan',
     # Bookmarks / state changes
     'last-prompt':         'magenta',
     'permission-mode':     'yellow',
@@ -993,6 +995,11 @@ _ROW_BG_FOR_KIND = {
     # (22) so the inter-agent voice channel reads distinct from the
     # human (235) and the leader's own assistant turns (17).
     'agent-send':       22,
+    # Inbound worker→leader task-notification reply — a sibling stripe
+    # in the same green family (23, dark green-blue / teal) so the two
+    # halves of the channel read together but split by direction. The
+    # whole point of the kind: redirect the reply off the human stripe.
+    'agent-reply':      23,
 }
 
 
@@ -1118,13 +1125,18 @@ def _passes_filter(item_id, td=None):
 def _kind_of(obj):
     """Best-effort classifier for one JSONL record.
 
-    Most records map to their raw ``type`` / message role. The one
-    refinement: an assistant record whose salient content is a
-    ``SendMessage`` tool_use is the leader voicing a worker, so it gets
-    its own ``agent-send`` kind (drives its stripe + tag style).
+    Most records map to their raw ``type`` / message role. Two
+    refinements for the inter-agent voice channel: an assistant record
+    whose salient content is a ``SendMessage`` tool_use is the leader
+    voicing a worker (``agent-send``); a ``user`` record that is a
+    ``<task-notification>`` is the worker's reply back (``agent-reply``).
+    Both drive their own stripe + tag style — without this, the reply
+    would inherit the human stripe and be mis-attributed.
     """
     if _is_send_message(obj):
         return 'agent-send'
+    if _is_task_notification(obj):
+        return 'agent-reply'
     t = obj.get('type')
     if t:
         return t
@@ -1293,6 +1305,13 @@ def _summarise_message(obj):
         for p in content:
             if isinstance(p, dict) and p.get('type') == 'tool_result':
                 return f'↳ tool_result: {_tool_result_one_line(obj, p)}'
+
+    # Inbound worker→leader reply — a one-liner off the parsed fields
+    # rather than dumping the raw ``<task-notification>`` XML wrapper.
+    if role == 'user' and _is_task_notification(obj):
+        d = _parse_task_notification(_extract_text(content))
+        bits = [b for b in (d['task_id'], d['status'], d['summary']) if b]
+        return '← ' + ' · '.join(bits) if bits else '← task-notification'
 
     text = _extract_text(content)
     text = _trim(text, 5000)
@@ -1509,6 +1528,11 @@ def _render_user(obj):
             if isinstance(part, dict) and part.get('type') == 'tool_result':
                 return _render_tool_result(obj, part)
 
+    # Inbound worker→leader reply — a small header + the ``<result>``
+    # markdown, instead of dumping the raw XML wrapper as a prompt.
+    if _is_task_notification(obj):
+        return _render_task_notification(_extract_text(content))
+
     head = f'{WHITE}{BOLD}▶ user{RESET}'
     chips = []
     if is_meta:
@@ -1538,6 +1562,26 @@ def _user_body_text(content):
             # expected on a user record.
         return _md_voice('\n\n'.join(c for c in chunks if c))
     return str(content) if content is not None else ''
+
+
+def _render_task_notification(text):
+    """Inbound worker→leader reply: a status/summary/output-file header
+    then the ``<result>`` rendered as markdown via ``_md_voice``."""
+    d = _parse_task_notification(text)
+    head = f'{CYAN}{BOLD}← task-notification{RESET}'
+    if d['task_id']:
+        head += f'  {MUTE}{d["task_id"]}{RESET}'
+    out = [head]
+    if d['status']:
+        out.append(f'{MUTE}status:{RESET} {d["status"]}')
+    if d['summary']:
+        out.append(f'{MUTE}summary:{RESET} {d["summary"]}')
+    if d['output_file']:
+        out.append(f'{MUTE}output:{RESET} {d["output_file"]}')
+    if d['result']:
+        out.append('')
+        out.append(_md_voice(d['result']))
+    return '\n'.join(out)
 
 
 def _render_assistant(obj):
@@ -1814,6 +1858,55 @@ def _is_send_message(rec):
                 and p.get('name') == 'SendMessage'):
             return True
     return False
+
+
+_TASK_NOTIFY_PREFIX = '<task-notification>'
+
+# Map the wrapper's hyphenated tags onto the dict keys we surface.
+_TASK_NOTIFY_TAGS = {
+    'task-id': 'task_id',
+    'tool-use-id': 'tool_use_id',
+    'output-file': 'output_file',
+    'status': 'status',
+    'summary': 'summary',
+    'result': 'result',
+}
+
+
+def _parse_task_notification(text):
+    """Peel a ``<task-notification>`` wrapper into its tagged fields.
+
+    Returns ``{task_id, tool_use_id, output_file, status, summary,
+    result}`` — every key present, missing tags resolving to ``''``.
+    ``result`` is kept as raw markdown (rendered later via ``_md_voice``).
+    A single non-greedy regex per tag, not a full XML parse: the payload
+    is machine-emitted with a fixed shape and ``result`` is free-form
+    markdown that would choke a strict parser.
+    """
+    text = text or ''
+    out = {v: '' for v in _TASK_NOTIFY_TAGS.values()}
+    for tag, key in _TASK_NOTIFY_TAGS.items():
+        m = re.search(rf'<{tag}>(.*?)</{tag}>', text, re.DOTALL)
+        if m:
+            out[key] = m.group(1).strip()
+    return out
+
+
+def _is_task_notification(rec):
+    """True iff ``rec`` is a ``user`` record whose text content is a
+    ``<task-notification>`` wrapper (the worker→leader inbound reply).
+
+    Mirrors ``_is_send_message`` for the outbound half: detection is by
+    the wrapper prefix on the record's text content, tolerant of the
+    bare-string and single-text-part content shapes.
+    """
+    if not isinstance(rec, dict):
+        return False
+    msg = rec.get('message') if isinstance(rec.get('message'), dict) else {}
+    if (rec.get('type') or msg.get('role')) != 'user':
+        return False
+    text = _extract_text(msg.get('content', ''))
+    return text.lstrip().startswith(_TASK_NOTIFY_PREFIX)
 
 
 def _fmt_tool_use_send_message(inp):
