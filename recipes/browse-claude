@@ -10,12 +10,18 @@ exposing a four-level hierarchy:
        OR  subagents   (when the session has dispatched subagents)
   level 3: subagent messages (records within a subagent .jsonl)
 
-Subagents (sidechain transcripts) live on disk at
-``~/.claude/projects/<encoded-path>/<session-id>/subagents/agent-<id>.jsonl``,
+Subagents live on disk at
+``~/.claude/projects/<encoded-cwd>/<session-id>/subagents/agent-<id>.jsonl``,
 optionally accompanied by an ``agent-<id>.meta.json`` describing the
-``agentType`` and ``description``. They appear as sibling rows alongside
+``agentType`` and ``description``. ``<encoded-cwd>`` is derived from the
+cwd at dispatch time (every ``/`` and ``.`` becomes ``-``), so a session
+that runs inside a git worktree stores its subagents under the worktree's
+project dir — NOT necessarily the dir holding the main ``<session>.jsonl``.
+The legacy co-located layout is just the special case where the cwd never
+left the project root. Either way they appear as sibling rows alongside
 the session's top-level messages — pick one to drill into its own
-transcript.
+transcript. See ``_candidate_subagents_dirs`` / ``_resolve_agent_jsonl``
+for the cross-project-dir lookup.
 
 Identifiers are kept simple and dispatchable purely by shape:
   * project ids are absolute paths to the project directory.
