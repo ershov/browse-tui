@@ -8,3 +8,4 @@ __pycache__/
 tmp
 .claude/scheduled_tasks.lock
 .PLAN.md.reject
+.claude/settings.local.json
