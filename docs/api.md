@@ -209,6 +209,7 @@ Each returns a `Pending` (where applicable) — see `Pending` below.
 ctx.refresh(id=None, on_complete=None) -> Pending
 ctx.cursor_to(id, on_complete=None)   -> Pending
 ctx.expand(id, on_complete=None)      -> Pending
+ctx.collapse(id)                      -> None
 ctx.select(ids, replace=False)        -> None
 ctx.message(text)                     -> None
 ctx.error(text)                       -> None
@@ -220,6 +221,7 @@ ctx.quit(code=0, output='')           -> None
 | `refresh`    | Refetch one parent's children (or full root if id is None).          |
 | `cursor_to`  | Move cursor to id; resolves once positioned (best-effort).           |
 | `expand`     | Add id to expanded; trigger fetch if not cached.                     |
+| `collapse`   | Remove id from expanded; fold its subtree (no-op if not expanded).   |
 | `select`     | Add ids to selection (or replace).                                   |
 | `message`    | Surface a transient status message in the info bar.                  |
 | `error`      | Surface an error message (red, sticks until next message).           |
@@ -288,6 +290,7 @@ ctx.preview_width                     -> int    # preview pane cols (0 if hidden
 ctx.preview_to_tail()                 -> None    # pin preview to bottom
 ctx.nav_home()                        -> None    # cursor -> row 0 + PIN_FIRST
 ctx.nav_end()                         -> None    # cursor -> last row + PIN_LAST
+ctx.collapse(id)                      -> None    # remove one id from expanded
 ctx.collapse_all()                    -> None    # clear all expanded
 ctx.expand_subtree(id, lazy=True)     -> None    # expand id + cached descendants
 ctx.select_all_visible()              -> None    # selection = every visible row
@@ -757,6 +760,7 @@ via the post queue so the renderer never sees a torn state.
 browser.refresh(id=None, on_complete=None) -> Pending
 browser.cursor_to(id, on_complete=None)    -> Pending
 browser.expand(id, on_complete=None)       -> Pending
+browser.collapse(id)                       -> None   # remove id from expanded; fold subtree
 browser.nav_home()                         # cursor → row 0; engage PIN_FIRST
 browser.nav_end()                          # cursor → last row; engage PIN_LAST
 browser.select(ids, replace=False)

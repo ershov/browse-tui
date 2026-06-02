@@ -3552,6 +3552,28 @@ class Browser:
         self.post(lambda: self._do_expand(id, pending, autoscroll))
         return pending
 
+    def collapse(self, id: Any) -> None:
+        """(thread-safe) Remove ``id`` from expanded; collapse its subtree.
+
+        The single-node counterpart to :meth:`expand` — discards ``id``
+        from ``state.expanded`` so its children fold away, then triggers
+        the same repaint path the ``←`` / ``l`` navigation key uses
+        (``mark_visible_dirty`` plus a cursor-change mark). No fetch is
+        involved, so this returns ``None`` rather than a ``Pending``:
+        there is nothing to await.
+
+        Collapsing an id that is not expanded is a no-op (``discard``
+        never raises). The cursor is left where it is; if it sat inside
+        the now-collapsed subtree the framework's cursor-anchor walk
+        lands it on the nearest still-visible ancestor on the next
+        render.
+        """
+        def _do():
+            self._state.expanded.discard(id)
+            mark_visible_dirty(self._state)
+            mark_cursor_changed(self)
+        self.post(_do)
+
     def set_children(self, id_, items) -> None:
         """(thread-safe) Inject pre-fetched children for ``id_`` from any thread.
 
