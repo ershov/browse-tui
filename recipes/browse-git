@@ -248,6 +248,110 @@ def _md_message(text):
     return text
 
 
+def _parse_decorations(deco, remotes=None):
+    """Parse a ``%D`` decoration string into ``[(text, style)]`` chips.
+
+    ``%D`` is the bare decoration form (no surrounding parens), e.g.
+    ``HEAD -> main, tag: v1.0, origin/main, feature/x``. Tokens are split
+    on ``', '`` and classified:
+
+      * ``HEAD -> name`` → a ``HEAD`` chip plus the pointed-at branch
+        (``HEAD`` styled green, the branch by its own kind);
+      * ``tag: name``    → yellow ``name`` chip;
+      * a remote-tracking ref (leading segment is a known remote, e.g.
+        ``origin/main``) → blue;
+      * any other token  → a local branch, cyan (so a local branch named
+        ``feature/x`` is NOT mistaken for a remote).
+
+    ``remotes`` is the set of remote names (``{'origin'}``) used to tell a
+    remote-tracking ref from a slash-bearing local branch; when ``None``
+    it's looked up once via ``git remote``. ``HEAD`` alone (detached)
+    yields a single green ``HEAD`` chip. An empty decoration yields no
+    chips. The framework's chip styler only honours named palette styles,
+    so the HEAD chip uses ``'green'`` (the palette has no bold-green
+    entry).
+    """
+    chips = []
+    deco = (deco or '').strip()
+    if not deco:
+        return chips
+    if remotes is None:
+        remotes = _git_remotes()
+    for token in deco.split(', '):
+        token = token.strip()
+        if not token:
+            continue
+        if token.startswith('HEAD -> '):
+            chips.append(('HEAD', 'green'))
+            branch = token[len('HEAD -> '):].strip()
+            if branch:
+                chips.append((branch, _ref_style(branch, remotes)))
+        elif token == 'HEAD':
+            chips.append(('HEAD', 'green'))
+        elif token.startswith('tag: '):
+            chips.append((token[len('tag: '):].strip(), 'yellow'))
+        else:
+            chips.append((token, _ref_style(token, remotes)))
+    return chips
+
+
+def _ref_style(name, remotes):
+    """Style a plain ref: remote-tracking refs blue, local branches cyan.
+
+    A ref is remote-tracking when its leading path segment is one of the
+    repo's remote names (``origin/main`` with ``origin`` a remote). A
+    local branch carrying a ``/`` (``feature/x``) stays cyan.
+    """
+    head = name.split('/', 1)[0]
+    return 'blue' if '/' in name and head in remotes else 'cyan'
+
+
+_REMOTES_CACHE = None
+
+
+def _git_remotes():
+    """Return the set of configured remote names (cached for the session)."""
+    global _REMOTES_CACHE
+    if _REMOTES_CACHE is None:
+        result = _run_git('remote')
+        _REMOTES_CACHE = (
+            set(result.stdout.split()) if result.returncode == 0 else set())
+    return _REMOTES_CACHE
+
+
+# Name-status status letters → (tag text, tag_style).
+_STATUS_LETTER_STYLE = {
+    'A': 'green',
+    'M': 'yellow',
+    'D': 'red',
+    'R': 'cyan',
+    'C': 'cyan',
+    'T': 'yellow',
+}
+
+
+def _parse_name_status(text):
+    """Parse ``git show --name-status`` output into ``[(status, path)]``.
+
+    Each line is ``<STATUS>\\t<path>`` (add/modify/delete) or, for renames
+    and copies, ``<STATUS>\\t<old>\\t<new>`` where ``STATUS`` carries a
+    similarity score (``R100`` / ``C75``). Returns the single status
+    letter and the path to display — the *new* path for renames/copies,
+    which is also what the resulting ``file:`` id keys on.
+    """
+    rows = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split('\t')
+        if len(parts) < 2:
+            continue
+        status = parts[0][:1]  # drop the similarity score on R/C
+        path = parts[-1]       # new path for renames/copies; the path otherwise
+        rows.append((status, path))
+    return rows
+
+
 def _err_item(msg):
     """Return a single non-expandable error Item to render in the list."""
     return [Item(id='__error__', title=msg, tag='err', tag_style='red')]
@@ -278,13 +382,16 @@ def _root_children():
 
 
 def _commits_root():
-    """``git log`` rows as ``commit:<sha>`` items (thin for now).
+    """``git log`` rows as ``commit:<sha>`` items, decorated with chips.
 
-    Decorations / author-date chips / md2ansi messages are layered on in
-    a later ticket; here each row carries the short sha as a tag and the
-    subject as the title so the list is functional.
+    Each record is NUL-separated ``%H %D %an %ar %s`` (subject is a single
+    line, so ``splitlines()`` then ``split('\\x00')`` is unambiguous). The
+    row carries the short sha as a yellow tag and the subject as the title;
+    chips are the ref decorations parsed from ``%D`` followed by a dim
+    ``author · reldate`` chip.
     """
-    args = ['log', f'--format=%H%x00%s', '-n', str(_log_limit)]
+    args = ['log', '--format=%H%x00%D%x00%an%x00%ar%x00%s', '-n',
+            str(_log_limit)]
     args += _revs
     if _paths:
         args += ['--', *_paths]
@@ -295,28 +402,34 @@ def _commits_root():
     for line in result.stdout.splitlines():
         if not line:
             continue
-        sha, _, subject = line.partition('\x00')
-        items.append(Item(id=f'commit:{sha}', title=subject,
-                          tag=sha[:7], tag_style='yellow',
-                          has_children=True))
+        fields = line.split('\x00')
+        if len(fields) < 5:
+            continue
+        sha, deco, author, reldate, subject = fields[:5]
+        chips = _parse_decorations(deco)
+        chips.append((f'{author} · {reldate}', 'dim'))
+        item = Item(id=f'commit:{sha}', title=subject,
+                    tag=sha[:7], tag_style='yellow', has_children=True)
+        item.chips = chips
+        items.append(item)
     return items
 
 
 def _commit_files(sha):
     """Changed files in commit ``sha`` as ``file:<sha>:<path>`` rows.
 
-    Status-letter chips / rename handling arrive in a later ticket; the
-    plain path list is enough to drill into per-file diffs now.
+    Uses ``--name-status`` so each row carries its A/M/D/R status letter
+    in the ``tag`` chip (colored by kind). Renames/copies display the new
+    path, and the ``file:`` id keys on that same new path.
     """
-    result = _run_git('show', '--name-only', '--format=', sha)
+    result = _run_git('show', '--name-status', '--format=', sha)
     if result.returncode != 0:
         return _err_item(f'git show failed: {result.stderr.strip()}')
     items = []
-    for path in result.stdout.splitlines():
-        path = path.strip()
-        if not path:
-            continue
+    for status, path in _parse_name_status(result.stdout):
         items.append(Item(id=f'file:{sha}:{path}', title=path,
+                          tag=status,
+                          tag_style=_STATUS_LETTER_STYLE.get(status, ''),
                           has_children=False))
     return items
 
@@ -338,7 +451,7 @@ def get_preview(item_id):
 
 def _commit_preview(sha):
     """Commit node preview = md2ansi(message) + colored ``show --stat``."""
-    msg = _run_git('show', '--no-patch', '--format=%B', sha)
+    msg = _run_git('show', '-s', '--format=%B', sha)
     body = _md_message(msg.stdout.rstrip('\n')) if msg.returncode == 0 else ''
     stat = _git_color('show', '--stat', '--format=', sha)
     if body and stat:
@@ -470,6 +583,20 @@ def _classify_positionals():
         sys.exit(2)
 
 
+def _window_title():
+    """Title reflecting the active mode and any positional rev/path filter.
+
+    There is no runtime retitle API, so the filter is baked into the
+    construction-time title — e.g. ``browse-git [commits: src/ HEAD~5]``.
+    Modes other than ``commits`` don't take a filter, so only the mode is
+    shown for them.
+    """
+    if _mode == 'commits' and (_revs or _paths):
+        filt = ' '.join(_revs + _paths)
+        return f'browse-git [{_mode}: {filt}]'
+    return f'browse-git [{_mode}]'
+
+
 def main():
     global _browser, _log_limit, _mode
     # git presence + a work tree are preconditions — fail fast before the
@@ -499,7 +626,7 @@ def main():
             Action('m', 'Toggle md2ansi message coloring', toggle_md, 'none'))
 
     b = Browser(BrowserConfig(
-        title='browse-git',
+        title=_window_title(),
         get_children=get_children,
         get_preview=get_preview,
         actions=actions,

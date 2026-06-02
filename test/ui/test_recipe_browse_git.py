@@ -120,6 +120,75 @@ class TestBrowseGit(unittest.TestCase):
                 t.wait_for('beta.txt', timeout=5.0)
                 t.send('q')
 
+    def test_branch_head_shows_decoration_chip(self):
+        """The newest commit's row carries its ``HEAD -> main`` chip text.
+
+        ``_make_repo`` leaves HEAD on branch ``main``, so ``git log``'s
+        ``%D`` for the newest commit is ``HEAD -> main`` → the recipe
+        renders a green ``[main]`` decoration chip after the subject.
+        tmux strips SGR but keeps the chip text, so we assert the row
+        carrying the subject also shows ``main``.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_repo(tmp)
+            with TmuxFixture(cols=120, rows=30) as t:
+                t.send_line(f'cd {tmp}')
+                t.launch(_BIN, '--run-py', _RECIPE)
+                t.wait_for('second commit add beta', timeout=5.0)
+                # The decoration chip + the subject share the newest
+                # commit's row; assert the row containing the subject
+                # also contains the branch name.
+                cap = t.wait_for('second commit add beta', timeout=5.0)
+                row = next(ln for ln in cap.splitlines()
+                           if 'second commit add beta' in ln)
+                self.assertIn('main', row)
+                t.send('q')
+
+    def test_enter_toggles_file_list(self):
+        """Enter opens a commit's file list, and a second Enter closes it.
+
+        The standalone Children pane always shows the cursor's children,
+        so we assert on the *tree* instead: an expanded commit shows its
+        file as an indented ``[A] beta.txt`` row in the list pane, and the
+        collapse removes that indented row. The commit's expand marker
+        flips ``▼`` (open) ↔ ``▶`` (closed) in lockstep, which we also
+        check on the subject's row.
+        """
+        indented_file = re.compile(r'^\s+\[A\] beta\.txt', re.MULTILINE)
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_repo(tmp)
+            with TmuxFixture(cols=120, rows=30) as t:
+                t.send_line(f'cd {tmp}')
+                t.launch(_BIN, '--run-py', _RECIPE)
+                t.wait_for('second commit add beta', timeout=5.0)
+                # Cursor starts on the newest commit. Enter expands it:
+                # the indented file row appears and the marker is ▼.
+                t.send('Enter')
+                cap = t.wait_for(indented_file, timeout=5.0)
+                subject_row = next(ln for ln in cap.splitlines()
+                                   if 'second commit add beta' in ln)
+                self.assertIn('▼', subject_row)
+                # A second Enter collapses it — the indented file row goes
+                # away and the marker flips back to ▶.
+                t.send('Enter')
+                deadline = time.time() + 3.0
+                gone = False
+                while time.time() < deadline:
+                    if not indented_file.search(t.capture()):
+                        gone = True
+                        break
+                    time.sleep(0.05)
+                self.assertTrue(
+                    gone,
+                    'indented [A] beta.txt still in the tree after a '
+                    'second Enter — the expand/collapse toggle did not '
+                    'fold the file list.')
+                cap = t.capture()
+                subject_row = next(ln for ln in cap.splitlines()
+                                   if 'second commit add beta' in ln)
+                self.assertIn('▶', subject_row)
+                t.send('q')
+
     def test_rapid_scroll_children_pane_lands(self):
         """Rapid 25-key burst lands the children pane within ~2s.
 

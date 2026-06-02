@@ -12,6 +12,11 @@ Coverage (ticket #616 — structural backbone):
 * ``_parse_id``            every kind, incl. colon paths / slash refnames
 * ``_colorize_diff``       ANSI on both the delta and git-fallback paths
 * ``_classify_positionals``  path / rev / ``--`` / unknown(→exit)
+
+Coverage (ticket #617 — commits mode end-to-end):
+
+* ``_parse_decorations``   ``%D`` → ref chips (HEAD/branch/remote/tag)
+* ``_parse_name_status``   A/M/D letters + rename → status + new path
 """
 
 import importlib.util
@@ -253,6 +258,88 @@ class TestClassifyPositionals(unittest.TestCase):
         revs, paths = self._run('-h')
         self.assertEqual(revs, [])
         self.assertEqual(paths, [])
+
+
+class TestParseDecorations(unittest.TestCase):
+    """``_parse_decorations`` turns a ``%D`` string into colored chips."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_mixed_refs(self):
+        # HEAD -> branch, remote, tag, and a slash-bearing local branch.
+        # Remotes={'origin'} so origin/main is blue while feature/x stays
+        # a cyan local branch.
+        chips = self.r._parse_decorations(
+            'HEAD -> main, origin/main, tag: v1.0, feature/x',
+            remotes={'origin'})
+        self.assertEqual(chips, [
+            ('HEAD', 'green'),
+            ('main', 'cyan'),
+            ('origin/main', 'blue'),
+            ('v1.0', 'yellow'),
+            ('feature/x', 'cyan'),
+        ])
+
+    def test_empty_decoration(self):
+        self.assertEqual(self.r._parse_decorations('', remotes=set()), [])
+        self.assertEqual(self.r._parse_decorations(None, remotes=set()), [])
+
+    def test_detached_head(self):
+        self.assertEqual(
+            self.r._parse_decorations('HEAD', remotes=set()),
+            [('HEAD', 'green')])
+
+    def test_tag_only(self):
+        self.assertEqual(
+            self.r._parse_decorations('tag: v2.3', remotes=set()),
+            [('v2.3', 'yellow')])
+
+    def test_remote_needs_known_remote(self):
+        # Without 'origin' in remotes, a slash ref is treated as a local
+        # branch (cyan), not blue.
+        self.assertEqual(
+            self.r._parse_decorations('origin/main', remotes=set()),
+            [('origin/main', 'cyan')])
+        self.assertEqual(
+            self.r._parse_decorations('origin/main', remotes={'origin'}),
+            [('origin/main', 'blue')])
+
+
+class TestParseNameStatus(unittest.TestCase):
+    """``_parse_name_status`` maps status lines to (letter, display path)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_add_modify_delete(self):
+        out = self.r._parse_name_status('A\tnew.py\nM\ta.py\nD\tgone.py\n')
+        self.assertEqual(out, [
+            ('A', 'new.py'),
+            ('M', 'a.py'),
+            ('D', 'gone.py'),
+        ])
+
+    def test_rename_shows_new_path(self):
+        # 'R100\told\tnew' -> status 'R', new path is what we display + id.
+        out = self.r._parse_name_status('R100\told.txt\tnew.txt\n')
+        self.assertEqual(out, [('R', 'new.txt')])
+
+    def test_copy_shows_new_path(self):
+        out = self.r._parse_name_status('C75\tsrc.txt\tcopy.txt\n')
+        self.assertEqual(out, [('C', 'copy.txt')])
+
+    def test_blank_lines_ignored(self):
+        self.assertEqual(self.r._parse_name_status('\n\n'), [])
+
+    def test_status_letter_styles(self):
+        # The recipe maps each letter to the spec'd palette color.
+        self.assertEqual(self.r._STATUS_LETTER_STYLE['A'], 'green')
+        self.assertEqual(self.r._STATUS_LETTER_STYLE['M'], 'yellow')
+        self.assertEqual(self.r._STATUS_LETTER_STYLE['D'], 'red')
+        self.assertEqual(self.r._STATUS_LETTER_STYLE['R'], 'cyan')
 
 
 if __name__ == '__main__':
