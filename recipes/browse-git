@@ -197,14 +197,20 @@ def _run_git(*args):
 
 
 def _git_color(*args):
-    """Return stdout of ``git -c color.ui=always <args>``.
+    """Return colored output of ``git -c color.ui=always <args>``.
 
-    Forces SGR even though stdout is a pipe; used for ``show --stat`` and
-    ref summaries whose color should always be present regardless of the
-    ``delta`` fallback path.
+    Forces SGR even though stdout is a pipe; used for ``show --stat``,
+    per-file diffs, and ref summaries whose color should always be present
+    regardless of the ``delta`` fallback path.
+
+    Prefers stdout whenever it's non-empty, only falling back to stderr
+    when stdout is empty. This keeps ``git diff --no-index`` working: that
+    command exits non-zero whenever the files differ (always, for
+    ``/dev/null`` vs a real file) yet still writes the diff to stdout, so a
+    plain ``rc == 0`` gate would discard a perfectly good untracked diff.
     """
     result = _run_git('-c', 'color.ui=always', *args)
-    return result.stdout if result.returncode == 0 else result.stderr
+    return result.stdout or result.stderr
 
 
 def _colorize_diff(raw):
@@ -319,7 +325,8 @@ def _git_remotes():
     return _REMOTES_CACHE
 
 
-# Name-status status letter → tag_style.
+# Status letter → tag_style. Shared by the commit/reflog file lists
+# (name-status letters) and status mode (porcelain XY → one letter).
 _STATUS_LETTER_STYLE = {
     'A': 'green',
     'M': 'yellow',
@@ -327,6 +334,7 @@ _STATUS_LETTER_STYLE = {
     'R': 'cyan',
     'C': 'cyan',
     'T': 'yellow',
+    '?': 'dim',
 }
 
 
@@ -350,6 +358,81 @@ def _parse_name_status(text):
         path = parts[-1]       # new path for renames/copies; the path otherwise
         rows.append((status, path))
     return rows
+
+
+def _parse_porcelain_z(data):
+    """Parse ``git status --porcelain -z`` bytes-as-text into ``[(XY, path)]``.
+
+    The ``-z`` form is NUL-terminated and never quotes paths, so paths with
+    spaces / odd chars survive verbatim — chosen over the line-based
+    ``--porcelain`` (which C-quotes such paths and uses an inline
+    ``orig -> new`` arrow for renames).
+
+    Each entry is ``XY<space><path>`` where ``XY`` is exactly the first two
+    columns (either may be a space for one-sided changes — `` M``, ``M ``,
+    ``MM``, ``??``…). For a rename/copy (``X`` is ``R`` or ``C``) git emits
+    the entry's path then a SECOND NUL field carrying the old path; we keep
+    the new path and skip the old one. Returns ``[(XY, new_path)]``.
+    """
+    fields = [f for f in data.split('\x00') if f != '']
+    rows = []
+    i = 0
+    while i < len(fields):
+        entry = fields[i]
+        i += 1
+        if len(entry) < 3:
+            continue
+        xy = entry[:2]
+        path = entry[3:]  # column 3 is the separating space
+        # Rename / copy: the next NUL field is the old path — consume it.
+        if xy and xy[0] in ('R', 'C'):
+            i += 1
+        rows.append((xy, path))
+    return rows
+
+
+def _status_tag(xy):
+    """Pick the one-letter status tag for a porcelain ``XY`` code.
+
+    Untracked (``??``) shows ``?``; otherwise the staged column ``X`` when
+    set, else the worktree column ``Y``. Returns ``''`` for an all-space
+    code (shouldn't occur in porcelain output).
+    """
+    if xy == '??':
+        return '?'
+    x, y = xy[0], xy[1] if len(xy) > 1 else ' '
+    if x != ' ':
+        return x
+    if y != ' ':
+        return y
+    return ''
+
+
+def _status_diff_plan(xy, path):
+    """Map a porcelain ``XY`` + path to the diff command(s) to render.
+
+    Returns a list of ``(header, argv)`` pairs — the per-file diff(s) whose
+    colored output makes up the status-leaf preview:
+
+      * staged (``X`` set and not ``?``)   → ``diff --cached -- <path>``
+      * worktree (``Y`` set and not ``?``) → ``diff -- <path>``
+      * untracked (``??``)                 → ``diff --no-index -- /dev/null <path>``
+
+    A two-sided code (``MM``) yields BOTH the staged and worktree diffs,
+    each under its own header. The ``argv`` lists are the args passed to
+    ``git`` (color is applied by the caller via ``_git_color``). Note the
+    ``--no-index`` diff exits non-zero whenever the files differ — the
+    caller must NOT gate on the return code.
+    """
+    if xy == '??':
+        return [('untracked', ['diff', '--no-index', '--', '/dev/null', path])]
+    x, y = xy[0], xy[1] if len(xy) > 1 else ' '
+    plan = []
+    if x not in (' ', '?'):
+        plan.append(('staged', ['diff', '--cached', '--', path]))
+    if y not in (' ', '?'):
+        plan.append(('unstaged', ['diff', '--', path]))
+    return plan
 
 
 def _err_item(msg):
@@ -383,7 +466,9 @@ def _root_children():
         return _commits_root()
     if _mode == 'reflog':
         return _reflog_root()
-    # status / branches / stash listing arrives in later tickets.
+    if _mode == 'status':
+        return _status_root()
+    # branches / stash listing arrives in later tickets.
     return []
 
 
@@ -463,6 +548,31 @@ def _reflog_row(n, line):
     return item
 
 
+def _status_root():
+    """``git status --porcelain -z`` rows as ``status:<XY>:<path>`` items.
+
+    Each entry becomes a non-expandable leaf tagged by its one-letter
+    status (colored by kind); the leaf preview is the staged / worktree /
+    untracked diff chosen by the ``XY`` code. A clean tree yields a single
+    dim, non-drillable "working tree clean" row.
+    """
+    result = _run_git('status', '--porcelain', '-z')
+    if result.returncode != 0:
+        return _err_item(f'git status failed: {result.stderr.strip()}')
+    rows = _parse_porcelain_z(result.stdout)
+    if not rows:
+        return [Item(id='status:clean', title='working tree clean',
+                     tag_style='dim', has_children=False)]
+    items = []
+    for xy, path in rows:
+        tag = _status_tag(xy)
+        items.append(Item(id=f'status:{xy}:{path}', title=path,
+                          tag=tag,
+                          tag_style=_STATUS_LETTER_STYLE.get(tag, ''),
+                          has_children=False))
+    return items
+
+
 def _commit_files(sha):
     """Changed files in commit ``sha`` as ``file:<sha>:<path>`` rows.
 
@@ -496,6 +606,12 @@ def get_preview(item_id):
         return _commit_preview(parsed[2])
     if kind == 'file':
         return _file_preview(parsed[1], parsed[2])
+    if kind == 'status':
+        # parsed = ('status', XY, path). The synthetic clean row has no
+        # path, so guard before building a diff.
+        if parsed[2]:
+            return _status_preview(parsed[1], parsed[2])
+        return ''
     # root / err / not-yet-implemented kinds have no preview yet.
     return ''
 
@@ -514,6 +630,28 @@ def _file_preview(sha, path):
     """File leaf preview = colored per-file diff for ``path`` in ``sha``."""
     raw = _git_color('show', sha, '--', path)
     return _colorize_diff(raw)
+
+
+def _status_preview(xy, path):
+    """Status-leaf preview: the staged / worktree / untracked diff(s).
+
+    The ``XY`` code selects the diff command(s) via ``_status_diff_plan``;
+    each is run git-colored and piped through ``_colorize_diff``. A
+    two-sided code (``MM``) shows both sections under ``── staged ──`` /
+    ``── unstaged ──`` headers. The ``--no-index`` untracked diff exits
+    non-zero by design, so its output is captured regardless of code.
+    """
+    plan = _status_diff_plan(xy, path)
+    sections = []
+    multi = len(plan) > 1
+    for header, argv in plan:
+        raw = _git_color(*argv)
+        body = _colorize_diff(raw)
+        if multi:
+            sections.append(f'── {header} ──\n{body}')
+        else:
+            sections.append(body)
+    return '\n\n'.join(s for s in sections if s)
 
 
 # ---- key handlers --------------------------------------------------------

@@ -21,6 +21,12 @@ Coverage (ticket #617 — commits mode end-to-end):
 Coverage (ticket #618 — reflog mode):
 
 * ``_reflog_row``          NUL record → reflog Item (id/chips), malformed→None
+
+Coverage (ticket #619 — status mode):
+
+* ``_parse_porcelain_z``   NUL porcelain → (XY, path), incl. rename
+* ``_status_tag``          XY → one-letter tag (X-or-Y, ``?`` for ``??``)
+* ``_status_diff_plan``    XY → staged/unstaged/untracked diff command(s)
 """
 
 import importlib.util
@@ -389,6 +395,117 @@ class TestReflogRow(unittest.TestCase):
 
     def test_empty_returns_none(self):
         self.assertIsNone(self.r._reflog_row(0, ''))
+
+
+class TestPorcelainParse(unittest.TestCase):
+    """``_parse_porcelain_z`` turns NUL porcelain into ``[(XY, path)]``."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_one_sided_and_two_sided_codes(self):
+        # Each NUL-terminated entry is 'XY<space><path>'. XY may carry a
+        # space for one-sided changes; '??' is untracked.
+        data = ('MM both.txt\x00'
+                ' D tracked_del.txt\x00'
+                ' M tracked_mod.txt\x00'
+                'M  tracked_staged.txt\x00'
+                'A  added.txt\x00'
+                '?? untracked.txt\x00')
+        self.assertEqual(self.r._parse_porcelain_z(data), [
+            ('MM', 'both.txt'),
+            (' D', 'tracked_del.txt'),
+            (' M', 'tracked_mod.txt'),
+            ('M ', 'tracked_staged.txt'),
+            ('A ', 'added.txt'),
+            ('??', 'untracked.txt'),
+        ])
+
+    def test_rename_uses_new_path_and_skips_old(self):
+        # For a rename, '-z' emits the new path then a SECOND NUL field
+        # carrying the old path; we keep the new path and drop the old.
+        data = 'R  renamed_new.txt\x00renamed_old.txt\x00 M after.txt\x00'
+        self.assertEqual(self.r._parse_porcelain_z(data), [
+            ('R ', 'renamed_new.txt'),
+            (' M', 'after.txt'),
+        ])
+
+    def test_copy_skips_old_path_too(self):
+        data = 'C  copy_new.txt\x00copy_src.txt\x00'
+        self.assertEqual(self.r._parse_porcelain_z(data),
+                         [('C ', 'copy_new.txt')])
+
+    def test_path_with_spaces_survives(self):
+        # '-z' never quotes — a path with spaces is intact.
+        data = ' M a file with spaces.txt\x00'
+        self.assertEqual(self.r._parse_porcelain_z(data),
+                         [(' M', 'a file with spaces.txt')])
+
+    def test_empty_is_clean(self):
+        self.assertEqual(self.r._parse_porcelain_z(''), [])
+
+
+class TestStatusTag(unittest.TestCase):
+    """``_status_tag`` chooses the one-letter status tag from ``XY``."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_staged_letter_wins(self):
+        self.assertEqual(self.r._status_tag('M '), 'M')
+        self.assertEqual(self.r._status_tag('A '), 'A')
+
+    def test_worktree_letter_when_unstaged(self):
+        self.assertEqual(self.r._status_tag(' M'), 'M')
+        self.assertEqual(self.r._status_tag(' D'), 'D')
+
+    def test_two_sided_prefers_staged(self):
+        self.assertEqual(self.r._status_tag('MM'), 'M')
+        self.assertEqual(self.r._status_tag('MD'), 'M')
+
+    def test_untracked(self):
+        self.assertEqual(self.r._status_tag('??'), '?')
+
+    def test_question_mark_has_a_style(self):
+        self.assertEqual(self.r._STATUS_LETTER_STYLE['?'], 'dim')
+
+
+class TestStatusDiffPlan(unittest.TestCase):
+    """``_status_diff_plan`` maps ``XY`` to the diff command(s) to run."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_staged_only(self):
+        self.assertEqual(self.r._status_diff_plan('M ', 'f.txt'),
+                         [('staged', ['diff', '--cached', '--', 'f.txt'])])
+
+    def test_worktree_only(self):
+        self.assertEqual(self.r._status_diff_plan(' M', 'f.txt'),
+                         [('unstaged', ['diff', '--', 'f.txt'])])
+
+    def test_both_sides(self):
+        self.assertEqual(self.r._status_diff_plan('MM', 'f.txt'), [
+            ('staged', ['diff', '--cached', '--', 'f.txt']),
+            ('unstaged', ['diff', '--', 'f.txt']),
+        ])
+
+    def test_added_staged(self):
+        self.assertEqual(self.r._status_diff_plan('A ', 'f.txt'),
+                         [('staged', ['diff', '--cached', '--', 'f.txt'])])
+
+    def test_deleted_worktree(self):
+        self.assertEqual(self.r._status_diff_plan(' D', 'f.txt'),
+                         [('unstaged', ['diff', '--', 'f.txt'])])
+
+    def test_untracked_uses_no_index(self):
+        self.assertEqual(
+            self.r._status_diff_plan('??', 'f.txt'),
+            [('untracked',
+              ['diff', '--no-index', '--', '/dev/null', 'f.txt'])])
 
 
 if __name__ == '__main__':

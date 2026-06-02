@@ -205,6 +205,27 @@ class TestBrowseGit(unittest.TestCase):
                 t.wait_for('commit', timeout=5.0)
                 t.send('q')
 
+    def test_mode_status_shows_modified_file(self):
+        """``--mode status`` lists a modified tracked file with an ``M`` tag.
+
+        After ``_make_repo`` we dirty a tracked file (unstaged), so
+        ``git status --porcelain`` reports `` M beta.txt`` → the recipe
+        renders a row with an ``M`` status tag next to ``beta.txt``.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_repo(tmp)
+            # Modify a tracked file without staging → worktree-modified.
+            with open(os.path.join(tmp, 'beta.txt'), 'w') as f:
+                f.write('beta changed\n')
+            with TmuxFixture(cols=120, rows=30) as t:
+                t.send_line(f'cd {tmp}')
+                t.launch(_BIN, '--run-py', _RECIPE, '--mode', 'status')
+                cap = t.wait_for('beta.txt', timeout=5.0)
+                row = next(ln for ln in cap.splitlines() if 'beta.txt' in ln)
+                # The status tag is rendered as ``[M]`` before the path.
+                self.assertIn('[M]', row)
+                t.send('q')
+
     def test_rapid_scroll_children_pane_lands(self):
         """Rapid 25-key burst lands the children pane within ~2s.
 
