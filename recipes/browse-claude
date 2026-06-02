@@ -4656,6 +4656,38 @@ def _latest_voice_among_children(item_id):
     return latest
 
 
+# Cache ``<sid> → session .jsonl path`` for the cross-project-dir lookup
+# below. Session ids are UUID-unique, so a hit is stable for the life of
+# the process; misses aren't cached (a session whose file lands later
+# should still be found on a subsequent toggle).
+_SESSION_PATH_BY_SID = {}
+
+
+def _session_path_for_sid(sid):
+    """Find ``<CLAUDE_ROOT>/*/<sid>.jsonl`` — the real session for ``sid``.
+
+    A worktree-relocated subagent's ``<sid>`` dir sits under the
+    cwd-derived project dir, NOT next to the session ``.jsonl`` (which
+    stays under the project dir it was created in). Since session ids
+    are UUID-unique, the first ``<sid>.jsonl`` found anywhere under
+    ``CLAUDE_ROOT`` is the right one. Returns the path or ``None``.
+    """
+    cached = _SESSION_PATH_BY_SID.get(sid)
+    if cached is not None and os.path.isfile(cached):
+        return cached
+    name = f'{sid}.jsonl'
+    try:
+        projects = os.listdir(CLAUDE_ROOT)
+    except OSError:
+        return None
+    for project in projects:
+        candidate = os.path.join(CLAUDE_ROOT, project, name)
+        if os.path.isfile(candidate):
+            _SESSION_PATH_BY_SID[sid] = candidate
+            return candidate
+    return None
+
+
 def _outer_subagent_group_id(path):
     """If ``path`` is a subagent's ``.jsonl``, return its outer-row id.
 
@@ -4670,20 +4702,32 @@ def _outer_subagent_group_id(path):
     reachable. Used by ``_ancestor_ids_for`` to prepend it to the
     chain so cursor preservation works across t-toggle from anywhere
     inside a subagent.
+
+    For a worktree-relocated subagent the session ``.jsonl`` is NOT the
+    co-located sibling of the ``<sid>`` dir (it lives in a different,
+    cwd-derived project dir), so when the sibling is absent we fall
+    back to searching ``<CLAUDE_ROOT>/*/<sid>.jsonl`` for the real one.
     """
     if not isinstance(path, str):
         return None
     parent_dir = os.path.dirname(path)
     if os.path.basename(parent_dir) != 'subagents':
         return None
-    sess_dir = os.path.dirname(parent_dir)
-    sess_path = sess_dir + '.jsonl'
-    if not os.path.isfile(sess_path):
-        return None
     name = os.path.basename(path)
     if not name.startswith('agent-') or not name.endswith('.jsonl'):
         return None
     aid = name[len('agent-'):-len('.jsonl')]
+    sess_dir = os.path.dirname(parent_dir)
+    # Co-located fast path: the legacy layout keeps the session .jsonl
+    # next to its ``<sid>`` dir.
+    sess_path = sess_dir + '.jsonl'
+    if not os.path.isfile(sess_path):
+        # Relocated layout: the real session lives in a different
+        # project dir — locate it by its (UUID-unique) session id.
+        sid = os.path.basename(sess_dir)
+        sess_path = _session_path_for_sid(sid)
+        if sess_path is None:
+            return None
     return f'{sess_path}#agent:{aid}'
 
 

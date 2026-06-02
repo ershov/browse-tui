@@ -1387,6 +1387,59 @@ class TestAncestorIdsForSubagent(unittest.TestCase):
             self.assertIsNone(self.r._outer_subagent_group_id(sess_path))
             self.assertIsNone(self.r._outer_subagent_group_id('/nope'))
 
+    def test_outer_subagent_group_id_relocated_crosses_project_dirs(self):
+        """Worktree-relocated subagent → real session in another project dir.
+
+        Once a session enters a git worktree, Claude Code stores its
+        subagents under the cwd-derived project dir, NOT next to the
+        session ``.jsonl`` (which stays in the project dir it was born
+        in). So the co-located ``<sid>.jsonl`` sibling of the subagent's
+        ``<sid>`` dir is absent, and the helper must locate the real
+        session by searching ``<CLAUDE_ROOT>/*/<sid>.jsonl``. Before the
+        fix it only checked the sibling and returned ``None`` — which
+        broke the ``t``-toggle ancestry walk from inside the subagent.
+        """
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, '.claude', 'projects')
+            # Session lives under its original project dir.
+            sess_proj = os.path.join(root, '-home-test-tree')
+            os.makedirs(sess_proj)
+            sess_path = os.path.join(sess_proj, 'tree-sess.jsonl')
+            with open(sess_path, 'w') as f:
+                f.write('{}\n')
+            # Subagent lives under the DISTINCT cwd-derived project dir.
+            sub_dir = os.path.join(
+                root, '-home-test-tree--worktrees-wt',
+                'tree-sess', 'subagents')
+            os.makedirs(sub_dir)
+            agent_path = os.path.join(sub_dir, 'agent-AGENT01.jsonl')
+            with open(agent_path, 'w') as f:
+                f.write('{}\n')
+            orig_root = self.r.CLAUDE_ROOT
+            # Caches are keyed by sid; clear so this fixture's lookup
+            # isn't shadowed by a stale entry from another test.
+            self.r._SESSION_PATH_BY_SID.clear()
+            self.r.CLAUDE_ROOT = root
+            try:
+                self.assertEqual(
+                    self.r._outer_subagent_group_id(agent_path),
+                    f'{sess_path}#agent:AGENT01',
+                )
+                # A subagent whose <sid> matches no session anywhere → None.
+                orphan_sub = os.path.join(
+                    root, '-home-test-tree--worktrees-wt',
+                    'orphan-sess', 'subagents')
+                os.makedirs(orphan_sub)
+                orphan_agent = os.path.join(orphan_sub, 'agent-ZZZ.jsonl')
+                with open(orphan_agent, 'w') as f:
+                    f.write('{}\n')
+                self.assertIsNone(
+                    self.r._outer_subagent_group_id(orphan_agent))
+            finally:
+                self.r.CLAUDE_ROOT = orig_root
+                self.r._SESSION_PATH_BY_SID.clear()
+
 
 class TestMdPagerResolution(unittest.TestCase):
     """``_resolve_md_pager`` walks $MD2ANSI / md2ansi+less in order."""
