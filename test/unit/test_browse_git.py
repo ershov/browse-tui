@@ -32,6 +32,11 @@ Coverage (ticket #620 — stash mode):
 
 * ``_stash_index``         ``stash@{n}`` → ``n`` (or None)
 * ``_stash_row``           NUL record → stash Item (id/tag/title/chips)
+
+Coverage (ticket #621 — branches mode):
+
+* ``_parse_for_each_ref_line``  full+short refname → (kind, short),
+  kind classified from the refs/heads|remotes|tags prefix
 """
 
 import importlib.util
@@ -568,6 +573,59 @@ class TestStashRow(unittest.TestCase):
 
     def test_empty_returns_none(self):
         self.assertIsNone(self.r._stash_row(''))
+
+
+class TestForEachRefParse(unittest.TestCase):
+    """``_parse_for_each_ref_line`` classifies a ref by its full prefix."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _line(self, full, short):
+        return f'{full}\x00{short}'
+
+    def test_local_branch(self):
+        self.assertEqual(
+            self.r._parse_for_each_ref_line(
+                self._line('refs/heads/main', 'main')),
+            ('branch', 'main'))
+
+    def test_local_branch_with_slash(self):
+        # A slash-bearing local branch is a branch (kind from the prefix,
+        # not the short name shape).
+        self.assertEqual(
+            self.r._parse_for_each_ref_line(
+                self._line('refs/heads/feature/x', 'feature/x')),
+            ('branch', 'feature/x'))
+
+    def test_remote(self):
+        self.assertEqual(
+            self.r._parse_for_each_ref_line(
+                self._line('refs/remotes/origin/main', 'origin/main')),
+            ('remote', 'origin/main'))
+
+    def test_tag(self):
+        self.assertEqual(
+            self.r._parse_for_each_ref_line(
+                self._line('refs/tags/v1.0', 'v1.0')),
+            ('tag', 'v1.0'))
+
+    def test_kind_style_palette(self):
+        # The recipe colors each kind word via _REF_KIND_STYLE.
+        self.assertEqual(self.r._REF_KIND_STYLE['branch'], 'cyan')
+        self.assertEqual(self.r._REF_KIND_STYLE['remote'], 'blue')
+        self.assertEqual(self.r._REF_KIND_STYLE['tag'], 'yellow')
+
+    def test_unknown_namespace_is_skipped(self):
+        # e.g. refs/stash and the like aren't part of the three views.
+        self.assertIsNone(
+            self.r._parse_for_each_ref_line(self._line('refs/stash', 'stash')))
+
+    def test_blank_and_malformed(self):
+        self.assertIsNone(self.r._parse_for_each_ref_line(''))
+        self.assertIsNone(
+            self.r._parse_for_each_ref_line('refs/heads/main'))  # no NUL
 
 
 if __name__ == '__main__':

@@ -252,6 +252,28 @@ class TestBrowseGit(unittest.TestCase):
                 self.assertIn('WIP on', cap)
                 t.send('q')
 
+    def test_mode_branches_lists_and_drills(self):
+        """``--mode branches`` lists ``main`` (branch tag); drilling shows commits.
+
+        The temp repo is on branch ``main``, so branches mode renders a
+        ``main`` row tagged ``branch``. Right-arrow on it lists that ref's
+        commits — the newest commit subject appears beneath it.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_repo(tmp)
+            with TmuxFixture(cols=120, rows=30) as t:
+                t.send_line(f'cd {tmp}')
+                t.launch(_BIN, '--run-py', _RECIPE, '--mode', 'branches')
+                cap = t.wait_for('main', timeout=5.0)
+                row = next(ln for ln in cap.splitlines()
+                           if re.search(r'\bmain\b', ln))
+                # The kind word is rendered as a ``[branch]`` tag.
+                self.assertIn('[branch]', row)
+                # Drill into the ref's commits.
+                t.send('Right')
+                t.wait_for('second commit add beta', timeout=5.0)
+                t.send('q')
+
     def test_rapid_scroll_children_pane_lands(self):
         """Rapid 25-key burst lands the children pane within ~2s.
 

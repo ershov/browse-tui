@@ -460,8 +460,11 @@ def get_children(item_id, *, reload=False):
         # stash file leaf (('stash', n, path)) has none. The synthetic
         # "no stashes" row has a non-numeric n and yields [] too.
         return _stash_files(parsed[1])
-    # ref drill-down arrives in a later ticket; file / leaf / error rows
-    # have no children.
+    if kind == 'ref':
+        # A ref drills into its commits — the shared commit-log builder
+        # with the refname as the sole rev. parsed = ('ref', refname).
+        return _commit_log_items([parsed[1]], [])
+    # file / leaf / error rows have no children.
     return []
 
 
@@ -475,24 +478,32 @@ def _root_children():
         return _status_root()
     if _mode == 'stash':
         return _stash_root()
-    # branches listing arrives in a later ticket.
+    if _mode == 'branches':
+        return _branches_root()
     return []
 
 
 def _commits_root():
+    """Commits-mode root = the ``git log`` for the positional rev/path filter."""
+    return _commit_log_items(_revs, _paths)
+
+
+def _commit_log_items(revs, paths):
     """``git log`` rows as ``commit:<sha>`` items, decorated with chips.
 
-    Each record is NUL-separated ``%H %D %an %ar %s`` (subject is a single
-    line, so ``splitlines()`` then ``split('\\x00')`` is unambiguous). The
-    row carries the short sha as a yellow tag and the subject as the title;
-    chips are the ref decorations parsed from ``%D`` followed by a dim
-    ``author · reldate`` chip.
+    Shared by commits mode (called with the positional ``_revs`` /
+    ``_paths``) and branches-mode ref drill-down (called with
+    ``([refname], [])``). Each record is NUL-separated ``%H %D %an %ar %s``
+    (subject is a single line, so ``splitlines()`` then ``split('\\x00')``
+    is unambiguous). The row carries the short sha as a yellow tag and the
+    subject as the title; chips are the ref decorations parsed from ``%D``
+    followed by a dim ``author · reldate`` chip.
     """
     args = ['log', '--format=%H%x00%D%x00%an%x00%ar%x00%s', '-n',
             str(_log_limit)]
-    args += _revs
-    if _paths:
-        args += ['--', *_paths]
+    args += list(revs)
+    if paths:
+        args += ['--', *paths]
     result = _run_git(*args)
     if result.returncode != 0:
         return _err_item(f'git log failed: {result.stderr.strip()}')
@@ -651,6 +662,65 @@ def _stash_files(n):
     return items
 
 
+# Ref kind word → (tag style). Local branches cyan, remotes blue, tags
+# yellow — matching the decoration-chip palette in `_parse_decorations`.
+_REF_KIND_STYLE = {
+    'branch': 'cyan',
+    'remote': 'blue',
+    'tag': 'yellow',
+}
+
+
+def _branches_root():
+    """``git for-each-ref`` rows as ``ref:<short>`` items, tagged by kind.
+
+    One call over ``refs/heads`` / ``refs/remotes`` / ``refs/tags``,
+    newest-commit-first. The format emits the full ``%(refname)`` (for
+    kind classification) and ``%(refname:short)`` (for display + id),
+    NUL-separated. Each ref drills into that ref's commits.
+    """
+    result = _run_git(
+        'for-each-ref', '--sort=-committerdate',
+        '--format=%(refname)%00%(refname:short)',
+        'refs/heads', 'refs/remotes', 'refs/tags')
+    if result.returncode != 0:
+        return _err_item(f'git for-each-ref failed: {result.stderr.strip()}')
+    items = []
+    for line in result.stdout.splitlines():
+        parsed = _parse_for_each_ref_line(line)
+        if parsed is None:
+            continue
+        kind, short = parsed
+        items.append(Item(id=f'ref:{short}', title=short,
+                          tag=kind, tag_style=_REF_KIND_STYLE.get(kind, ''),
+                          has_children=True))
+    return items
+
+
+def _parse_for_each_ref_line(line):
+    """Parse a ``%(refname)%00%(refname:short)`` line → ``(kind, short)``.
+
+    ``kind`` is classified from the FULL refname prefix:
+    ``refs/heads/`` → ``branch``, ``refs/remotes/`` → ``remote``,
+    ``refs/tags/`` → ``tag``. Returns ``None`` for a blank / malformed
+    line or an unrecognised namespace.
+    """
+    if not line:
+        return None
+    full, sep, short = line.partition('\x00')
+    if not sep:
+        return None
+    if full.startswith('refs/heads/'):
+        kind = 'branch'
+    elif full.startswith('refs/remotes/'):
+        kind = 'remote'
+    elif full.startswith('refs/tags/'):
+        kind = 'tag'
+    else:
+        return None
+    return (kind, short)
+
+
 def _commit_files(sha):
     """Changed files in commit ``sha`` as ``file:<sha>:<path>`` rows.
 
@@ -682,6 +752,10 @@ def get_preview(item_id):
     if kind == 'reflog':
         # Same as a commit node — parsed = ('reflog', n, sha).
         return _commit_preview(parsed[2])
+    if kind == 'ref':
+        # A refname resolves as a commit-ish, so the commit-node preview
+        # (message + show --stat) works unchanged. parsed = ('ref', name).
+        return _commit_preview(parsed[1])
     if kind == 'file':
         return _file_preview(parsed[1], parsed[2])
     if kind == 'status':
