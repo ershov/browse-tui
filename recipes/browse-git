@@ -778,7 +778,7 @@ def get_preview(item_id):
         if len(parsed) == 3:
             return _stash_file_preview(n, parsed[2])
         return _stash_preview(n)
-    # root / err / not-yet-implemented kinds have no preview yet.
+    # root / err / sentinel kinds have no preview.
     return ''
 
 
@@ -861,6 +861,10 @@ def switch_mode(ctx):
         return
     _mode = chosen
     ctx.message(f'mode: {_mode}')
+    # All five modes share one root scope (and thus one ``state.expanded``
+    # set); drop the previous mode's expanded ids before re-listing so the
+    # refresh doesn't re-fetch / re-expand rows that don't exist here.
+    ctx.collapse_all()
     ctx.refresh()
 
 
@@ -945,7 +949,6 @@ def _classify_positionals():
     ``--help``) before the ``--`` are skipped so the framework's help
     auto-detect still fires.
     """
-    global _revs, _paths
     args = sys.argv[1:]
     if '--' in args:
         cut = args.index('--')
