@@ -994,12 +994,14 @@ _ROW_BG_FOR_KIND = {
     # Outbound leader→worker SendMessage — the darkest green in the 256
     # cube (22, #005f00), so the inter-agent voice channel reads distinct
     # from the human (235) and the leader's own assistant turns (17).
-    'agent-send':       22,
+    # >>> OVERRIDEN WITH DARK BLUE
+    'agent-send':       17, #22,
     # Inbound worker→leader task-notification reply — the darkest cyan
     # (23, #005f5f): a sibling of the send stripe so the two halves of
     # the channel read together but split by direction. The whole point
     # of the kind: redirect the reply off the human stripe.
-    'agent-reply':      23,
+    # >>> OVERRIDEN WITH DARK BLUE
+    'agent-reply':      17, #23,
 }
 
 
