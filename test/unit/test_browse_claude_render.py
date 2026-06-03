@@ -7356,6 +7356,66 @@ class TestMarkdownSubtrees(unittest.TestCase):
             self.assertNotIn('\x1b', off)
             self.assertIn('Summary', off)
 
+    # ---- boundary integration + get_preview reorder (#662) -------------
+
+    def test_is_cross_file_fallback_for_md_file_doc_id(self):
+        # An md file-doc id matches neither #agent: nor bare-.jsonl, so the
+        # not-loaded fallback in _is_cross_file_id returns False — the id is
+        # never mistaken for a cross-file (session/subagent) row by shape.
+        # (The reorder, tested next, is what protects the *loaded* case.)
+        file_id = self.r._md_doc.compose_md_id(
+            '/p/s.jsonl#0', ['/abs/report.md'])
+        self.assertIsNone(self.r._BROWSER)   # setUp default → fallback path
+        self.assertFalse(self.r._is_cross_file_id(file_id))
+
+    def test_get_preview_md_file_doc_routes_to_md_node_despite_boundary(self):
+        # #662 reorder regression guard. An md file-doc id carries
+        # boundary=True; with a _BROWSER that returns it from get_item, the
+        # (now boundary-based) _is_cross_file_id reports True for it. If the
+        # cross-file check ran first it would hijack the preview into the
+        # metadata/umbrella path. Because '#md:' is checked BEFORE
+        # _is_cross_file_id, the node still routes to _preview_md_node and
+        # yields the file's own text — never the cross-file card.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            report = os.path.join(tmp, 'report.md')
+            with open(report, 'w') as f:
+                f.write('# Findings\n\nMD-FILE-DOC-BODY\n')
+            file_id = self.r._md_doc.compose_md_id(
+                '/p/s.jsonl#0', [os.path.realpath(report)])
+
+            class _B:
+                def __init__(self, item):
+                    self._item = item
+                def get_item(self, id_):
+                    return self._item if id_ == file_id else None
+
+            item = type('I', (), {'id': file_id, 'boundary': True})()
+            self.r._BROWSER = _B(item)
+            self.r._MD_COLOR = False
+            # The predicate really does see this id as cross-file (boundary).
+            self.assertTrue(self.r._is_cross_file_id(file_id))
+            out = self.r.get_preview(file_id)
+            # Routed to the md document preview (the file's text), NOT the
+            # cross-file metadata card (which prints 'browse-claude' + a
+            # 'path' row and never the body).
+            self.assertIn('Findings', out)
+            self.assertIn('MD-FILE-DOC-BODY', out)
+            self.assertNotIn('browse-claude', out)
+
+    def test_get_preview_inline_md_node_routes_to_md_node(self):
+        # The inline (same-file, boundary=False) document node also routes to
+        # _preview_md_node — confirms the reorder didn't regress the common
+        # case and that '#md:' precedes the generic '#' message branch too.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            self.r._MD_COLOR = False
+            inline_id = self.r._md_doc.compose_md_id(f'{sess}#0', [])
+            out = self.r.get_preview(inline_id)
+            self.assertIn('Summary', out)
+            self.assertNotIn('browse-claude', out)
+
     # ---- labels (#661) -------------------------------------------------
 
     def test_label_relative_to_project_root(self):
@@ -7476,6 +7536,173 @@ class TestMarkdownSubtrees(unittest.TestCase):
             self.assertEqual(
                 [op for op in flat_ops if op[0] == 'mod'], [],
                 'no self-heal mod for non-empty or non-md parents')
+
+
+class TestBoundaryMigration(unittest.TestCase):
+    """#662: ``boundary`` flag integration + the id-shape ``if`` migration.
+
+    Asserts (a) the rows the OLD ``_is_cross_file_id`` matched now carry
+    ``boundary=True`` (subagent-group ``#agent:`` rows and bare ``.jsonl``
+    session rows; md *inline* and message/umbrella rows do not); (b)
+    ``_is_cross_file_id`` is behaviour-equivalent via the boundary lookup,
+    with the OLD id-shape predicate preserved as the not-loaded fallback;
+    (c) the ``get_preview`` reorder routes an md file-doc (``boundary=True``)
+    to ``_preview_md_node`` instead of the cross-file metadata/cascade path;
+    (d) ``_walk_umbrella`` skips a ``boundary=True`` child.
+
+    Isolation-robust: ``_BROWSER`` / ``_TREE_MODE`` are saved/restored so
+    these pass identically in isolation and under full discover (the recipe
+    module is shared across suites).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def setUp(self):
+        self._saved_browser = self.r._BROWSER
+        self._saved_tree_mode = self.r._TREE_MODE
+        self.addCleanup(setattr, self.r, '_BROWSER', self._saved_browser)
+        self.addCleanup(setattr, self.r, '_TREE_MODE', self._saved_tree_mode)
+        self.r._BROWSER = None
+        self.addCleanup(self.r._TREE_CACHE.clear)
+
+    # ---- fixtures ------------------------------------------------------
+
+    def _project_with_subagent(self, tmp):
+        """A project + session with one wired subagent (agent ``A1``).
+
+        Returns ``(sess_path, agent_path)``. The subagent's own .jsonl
+        carries a unique sentinel so a preview cascade that wrongly drilled
+        into it would be detectable.
+        """
+        import json as _json
+        proj = os.path.join(tmp, '-x')
+        os.makedirs(proj)
+        sess = os.path.join(proj, 'parent-sid.jsonl')
+        with open(sess, 'w') as f:
+            f.write(_json.dumps({
+                'type': 'user', 'sessionId': 'parent-sid',
+                'message': {'role': 'user', 'content': 'PARENT-LEAF-BODY'},
+            }) + '\n')
+        sub_dir = os.path.join(proj, 'parent-sid', 'subagents')
+        os.makedirs(sub_dir)
+        agent_path = os.path.join(sub_dir, 'agent-A1.jsonl')
+        with open(agent_path, 'w') as f:
+            f.write(_json.dumps({
+                'type': 'user', 'sessionId': 'parent-sid',
+                'message': {'role': 'user', 'content': 'AGENT-INTERNAL-BODY'},
+            }) + '\n')
+        with open(os.path.join(sub_dir, 'agent-A1.meta.json'), 'w') as fm:
+            _json.dump({'agentType': 'general-purpose',
+                        'description': 'do a thing'}, fm)
+        return sess, agent_path
+
+    # ---- (a) boundary set on the migrated rows -------------------------
+
+    def test_subagent_group_rows_are_boundary(self):
+        # Both #agent: builders (the per-session lister and the inline
+        # pseudo-item) and orphan rows (which delegate to the lister) must
+        # set boundary=True so the migrated predicate matches them.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, agent_path = self._project_with_subagent(tmp)
+            (sub,) = self.r._list_subagents_for_session(sess)
+            self.assertTrue(sub.boundary)
+            self.assertIn('#agent:', sub.id)
+            pseudo = self.r._subagent_pseudo_item(sess, 'A1', agent_path)
+            self.assertTrue(pseudo.boundary)
+            self.assertIn('#agent:', pseudo.id)
+
+    def test_session_rows_are_boundary(self):
+        # Bare .jsonl session rows in _list_sessions carry boundary=True.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, _ = self._project_with_subagent(tmp)
+            proj = os.path.dirname(sess)
+            rows = self.r._list_sessions(proj)
+            self.assertTrue(rows)
+            for it in rows:
+                self.assertTrue(it.id.endswith('.jsonl'))
+                self.assertTrue(it.boundary, it.id)
+
+    # ---- (b) _is_cross_file_id parity (boundary + fallback) ------------
+
+    def test_is_cross_file_via_boundary_when_loaded(self):
+        # When the Item IS loaded, the predicate reads its boundary flag.
+        item_id = '/p/parent-sid.jsonl#agent:A1'
+
+        class _B:
+            def __init__(self, items):
+                self._items = items
+            def get_item(self, id_):
+                return self._items.get(id_)
+
+        boundary_item = type('I', (), {'id': item_id, 'boundary': True})()
+        self.r._BROWSER = _B({item_id: boundary_item})
+        self.assertTrue(self.r._is_cross_file_id(item_id))
+        # A loaded, NON-boundary item is not cross-file even with a shape
+        # the old test would have matched — the attribute is authoritative.
+        bare = '/p/s.jsonl'
+        nonboundary = type('I', (), {'id': bare, 'boundary': False})()
+        self.r._BROWSER = _B({bare: nonboundary})
+        self.assertFalse(self.r._is_cross_file_id(bare))
+
+    def test_is_cross_file_fallback_when_not_loaded(self):
+        # _BROWSER is None (this suite's default) → fall back to the OLD
+        # id-shape predicate; parity for #agent: / bare-.jsonl rows.
+        self.assertTrue(self.r._is_cross_file_id('/p/s.jsonl#agent:A1'))
+        self.assertTrue(self.r._is_cross_file_id('/p/s.jsonl'))
+        # Non-cross-file shapes stay False.
+        self.assertFalse(self.r._is_cross_file_id('/p/s.jsonl#3'))
+        self.assertFalse(self.r._is_cross_file_id('/p/s.jsonl#prompt:0'))
+        self.assertFalse(self.r._is_cross_file_id('/some/dir'))
+        self.assertFalse(self.r._is_cross_file_id(None))
+
+    def test_is_cross_file_fallback_when_browser_lacks_get_item(self):
+        # A Browser stand-in without get_item (older fakes / headless) is
+        # treated like "not loaded" → id-shape fallback, never an
+        # AttributeError.
+        self.r._BROWSER = type('B', (), {})()
+        self.assertTrue(self.r._is_cross_file_id('/p/s.jsonl#agent:A1'))
+        self.assertFalse(self.r._is_cross_file_id('/p/s.jsonl#3'))
+
+    # ---- (c) get_preview reorder + md file-doc fallback are exercised in
+    #          TestMarkdownSubtrees (which loads the recipe with md_doc live,
+    #          so '#md:' ids can be composed). See its
+    #          ``test_get_preview_md_file_doc_routes_to_md_node_despite_boundary``
+    #          (THE reorder regression guard) and the file-doc fallback test.
+
+    # ---- (d) _walk_umbrella skips boundary children --------------------
+
+    def test_walk_umbrella_skips_boundary_child(self):
+        # A boundary child (here a subagent #agent: row pointing at another
+        # file) must NOT have its content folded into the parent's cascade;
+        # a same-file leaf sibling still renders.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, agent_path = self._project_with_subagent(tmp)
+            parent_id = f'{sess}#prompt:0'
+            agent_id = f'{sess}#agent:A1'
+            leaf_id = f'{sess}#0'   # the PARENT-LEAF-BODY user line
+
+            boundary_child = type(
+                'I', (), {'id': agent_id, 'boundary': True, 'hidden': False})()
+            leaf_child = type(
+                'I', (), {'id': leaf_id, 'boundary': False, 'hidden': False})()
+
+            class _B:
+                def __init__(self, kids):
+                    self._kids = kids
+                def cached_children(self, pid):
+                    return list(self._kids) if pid == parent_id else None
+
+            self.r._BROWSER = _B([boundary_child, leaf_child])
+            out = ''.join(self.r._collect_umbrella_preview(parent_id))
+            # Same-file leaf rendered; the boundary subagent's own body did
+            # NOT bleed in.
+            self.assertIn('PARENT-LEAF-BODY', out)
+            self.assertNotIn('AGENT-INTERNAL-BODY', out)
 
 
 if __name__ == '__main__':

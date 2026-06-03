@@ -611,6 +611,13 @@ def _list_sessions(project_dir):
             tag=tag,
             tag_style=('green' if running_meta else 'dim'),
             has_children=count > 0 or n_subs > 0,
+            # A bare session row anchors a whole other file — a
+            # self-contained foreign subtree. ``boundary`` is what the
+            # migrated ``_is_cross_file_id`` reads to render the cheap
+            # metadata card until the row is committed (scoped/expanded),
+            # and what stops a recursive expand from walking the whole
+            # transcript in one go.
+            boundary=True,
         )
         item.kind = 'session'
         item.line_count = count
@@ -932,6 +939,14 @@ def _list_subagents_for_session(session_jsonl_path):
                 tag=f'{agent_type} · {count} msg · {_human_time(st.st_mtime)}',
                 tag_style='magenta',
                 has_children=count > 0,
+                # Subagent transcripts live in their own .jsonl — a
+                # self-contained foreign subtree. ``boundary`` stops
+                # recursive/multi-expansion at the group row and keeps
+                # the agent's lines out of a parent's preview cascade
+                # (the attribute ``_is_cross_file_id`` / ``_walk_umbrella``
+                # consult instead of the old ``'#agent:' in id`` shape
+                # test). Orphan rows inherit it via this builder.
+                boundary=True,
             )
             item.kind = 'subagent'
             item.agent_id = agent_id
@@ -3071,6 +3086,20 @@ def get_preview(item_id):
     """
     if not isinstance(item_id, str) or item_id.startswith('__err__:'):
         return ''
+    if '#md:' in item_id:
+        # Markdown document/heading node. Checked FIRST — before both
+        # ``_is_cross_file_id`` and the generic '#' message path. The
+        # cross-file check is now boundary-based, and an md *file*-doc
+        # node carries ``boundary=True``, so it would otherwise be hijacked
+        # into the cross-file metadata/cascade path. md ids never contain
+        # ``#agent:`` and never end in ``.jsonl``, so claiming them here
+        # steals no cross-file id; it just routes every md node (inline
+        # OR file, regardless of its boundary flag) to its own document
+        # preview, and keeps a trailing ``#<lineoffset>`` from being
+        # mis-read as a record line number. A no-op when ``_md_doc is
+        # None`` (no ``#md:`` id can exist then, but the guard keeps the
+        # branch self-contained).
+        return _preview_md_node(item_id) if _md_doc is not None else ''
     # Cross-file rows (subagent group, bare session): heavy umbrella
     # cascade only when committed (scope_root or expanded inline);
     # cheap metadata card otherwise so scrolling stays cheap.
@@ -3081,12 +3110,6 @@ def get_preview(item_id):
         return _preview_file_metadata(file_path) if file_path else ''
     if '#prompt:' in item_id or '#tool:' in item_id or '#span:' in item_id:
         return _preview_umbrella(item_id)
-    if '#md:' in item_id:
-        # Markdown document/heading node. Checked BEFORE the generic '#'
-        # message path so a trailing ``#<lineoffset>`` is never mis-read as a
-        # record line number. A no-op when ``_md_doc is None`` (no ``#md:`` id
-        # can exist then, but the guard keeps the branch self-contained).
-        return _preview_md_node(item_id) if _md_doc is not None else ''
     if '#' in item_id:
         path, _, lineno = item_id.rpartition('#')
         if lineno == '__truncated__':
@@ -4601,6 +4624,9 @@ def _subagent_pseudo_item(parent_jsonl, agent_id, agent_path):
         tag_style='magenta',
         has_children=count > 0,
         hidden=False,   # subagent umbrellas are always visible
+        # Foreign subtree (the agent's own .jsonl): same boundary
+        # semantics as the rows from ``_list_subagents_for_session``.
+        boundary=True,
     )
     item.kind = 'subagent'
     item.agent_id = agent_id
@@ -4881,14 +4907,17 @@ def _walk_umbrella(item_id, _state, _flush):
         if getattr(child, 'hidden', False):
             continue
         try:
-            if '#agent:' in cid:
-                # Subagent boundary — never drill into another file's
-                # records from a parent's preview. The dispatching
-                # Agent / Task tool_use + matching tool_result already
-                # live in the parent file and render through the
-                # normal leaf path under the dispatching turn, so we
-                # don't even emit a stub — would just duplicate that
-                # pair.
+            if getattr(child, 'boundary', False):
+                # Boundary child — a self-contained foreign subtree
+                # (subagent group, referenced .md file): never drill
+                # into another file's content from a parent's preview
+                # cascade. For a subagent the dispatching Agent / Task
+                # tool_use + matching tool_result already live in the
+                # parent file and render through the normal leaf path
+                # under the dispatching turn, so we don't even emit a
+                # stub — would just duplicate that pair. (md docs are
+                # never in this cascade, so this only fires for the
+                # ``#agent:`` rows it used to match by id shape.)
                 continue
             if '#prompt:' in cid or '#tool:' in cid or '#span:' in cid:
                 # Same-file umbrella — recurse so the user sees every
@@ -5059,8 +5088,8 @@ def _gather_umbrella_lines(item_id):
     Walks the umbrella's children recursively in document order via
     ``get_children`` (the same listing helper that builds the
     displayed tree). Nested umbrellas in the SAME file are followed
-    transparently; ``#agent:`` boundaries are NOT crossed — the
-    subagent's records live in a different ``.jsonl`` and the user
+    transparently; ``boundary`` children (subagent groups) are NOT
+    crossed — their records live in a different ``.jsonl`` and the user
     can drill into that group row separately if they want them.
     """
     out = []
@@ -5078,8 +5107,12 @@ def _walk_umbrella_lines(item_id, out):
         cid = getattr(child, 'id', None)
         if not isinstance(cid, str):
             continue
-        if '#agent:' in cid:
-            # Subagent boundary — content is in a different file.
+        if getattr(child, 'boundary', False):
+            # Boundary child — a self-contained foreign subtree (subagent
+            # group): its content lives in a different file, so the
+            # export excerpt stops at the group row (the user drills into
+            # it separately). md docs never appear in this cascade, so
+            # this only matches the ``#agent:`` rows it did by id shape.
             continue
         if '#prompt:' in cid or '#tool:' in cid or '#span:' in cid:
             _walk_umbrella_lines(cid, out)
@@ -5621,9 +5654,27 @@ def _is_cross_file_id(item_id):
     preview whenever the row transitions into the active state, so
     the next preview pass picks up the heavy cascade instead of the
     stale metadata.
+
+    Attribute-based since the ``boundary`` migration: a row is
+    cross-file iff its loaded Item carries ``boundary=True`` — set on
+    subagent-group ``#agent:`` rows and bare ``.jsonl`` session rows
+    (exactly the shapes the old id test matched), plus md *file*-doc
+    nodes (which never reach this path — ``get_preview`` routes ``#md:``
+    ids out before the cross-file check). When the Item isn't loaded
+    (``get_item`` → ``None``: no live Browser, a Browser without the
+    lookup, or a row referenced before its fetch) we fall back to the
+    OLD id-shape predicate, so behaviour is identical for ``#agent:`` /
+    bare-``.jsonl`` rows regardless of load state.
     """
     if not isinstance(item_id, str):
         return False
+    get_item = getattr(_BROWSER, 'get_item', None)
+    item = get_item(item_id) if get_item is not None else None
+    if item is not None:
+        return bool(getattr(item, 'boundary', False))
+    # Fallback (Item not loaded): the original id-shape test, so the
+    # cheap-preview / cascade-upgrade contract holds even before the
+    # row's Item exists in the index.
     if '#agent:' in item_id:
         return True
     if '#' not in item_id and item_id.endswith('.jsonl'):
