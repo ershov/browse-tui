@@ -178,6 +178,13 @@ def _id_visible(item, show_ids):
     return str(item.id) != item.title
 
 
+# Sentinel for ``RowContext.max_col_width(field, parent_id=...)``: lets an
+# omitted ``parent_id`` (default to this row's parent) be told apart from an
+# explicit ``parent_id=None`` (a legitimate parent key for a ``root_id=None``
+# Browser).
+_PARENT_DEFAULT = object()
+
+
 class RowContext:
     """Per-row geometry + tree state handed to the row-format hooks.
 
@@ -212,8 +219,10 @@ class RowContext:
     (the ``list_width`` passed in is ``0``), matching the ``preview_width``
     contract; recipes wanting a fallback pick one explicitly.
 
-    ``max_col_width`` (cached per-parent column measurement) lands in
-    Stage 3 — it is intentionally absent here.
+    Method:
+      * ``max_col_width(field, parent_id=None)`` — the max display-cell width
+        of a pre-formatted column string across a sibling group (design
+        sec C). Cached per parent on ``State``; lazily filled.
     """
 
     __slots__ = (
@@ -247,6 +256,40 @@ class RowContext:
         """
         remaining = self.list_width - chrome_cells
         self.content_width = remaining if remaining > 0 else 0
+
+    def max_col_width(self, field, parent_id=_PARENT_DEFAULT):
+        """Max display-cell width of ``str(getattr(child, field, ''))`` over a
+        sibling group (design sec C).
+
+        ``parent_id`` defaults to *this row's* parent (``ctx.parent_id``), so a
+        row aligns a column to its siblings; pass an explicit id (including
+        ``None`` — a legitimate parent key for a ``root_id=None`` Browser) to
+        measure a different group. The recipe pre-stores the *display* string
+        it intends to render on each Item and passes that field name, so what
+        is measured is what is rendered.
+
+        Result is memoised per ``(parent_id, field)`` on
+        ``State._col_width_cache`` and rebuilt lazily after that parent's child
+        list is dropped, replaced, or mutated (see ``_index_drop_children`` /
+        ``_col_width_drop``). A cache hit re-scans nothing.
+
+        A child missing ``field`` contributes ``0`` (``getattr`` default
+        ``''``); an empty or absent sibling list yields ``0``.
+        """
+        if parent_id is _PARENT_DEFAULT:
+            parent_id = self.parent_id
+        state = self._browser._state
+        cache = state._col_width_cache.setdefault(parent_id, {})
+        cached = cache.get(field)
+        if cached is not None:
+            return cached
+        width = max(
+            (cell_width(str(getattr(child, field, '')))
+             for child in state._children.get(parent_id, ())),
+            default=0,
+        )
+        cache[field] = width
+        return width
 
     @property
     def browser(self):

@@ -344,6 +344,16 @@ class State:
     _items_by_id: dict = field(default_factory=dict)
     _parent_of_id: dict = field(default_factory=dict)
     _loading: dict = field(default_factory=dict)
+    # Per-parent column-width cache for ``RowContext.max_col_width`` (design
+    # sec C): ``parent_id -> {field_name: max display-cell width}``. Lives on
+    # State (not Browser) because every invalidation choke point is a
+    # state-level function — ``_index_drop_children`` (the drop/replace choke
+    # point, hit by ``refresh`` / worker delivery and ``cache_invalidate_subtree``),
+    # ``cache_invalidate_all``, the ``_drop_subtree_indexes`` cascade, and the
+    # ``update_data`` op mutators — so the drop sits next to the ``_children``
+    # mutation it shadows. Lazily filled by ``max_col_width`` on first read of
+    # a ``(parent_id, field)`` and rebuilt on the next render after a drop.
+    _col_width_cache: dict = field(default_factory=dict)
     _visible_dirty: bool = True
     _visible_cache: list = field(default_factory=list)
     # Cursor index into the visible-tree list, and the user-selected ids
@@ -445,6 +455,19 @@ def mark_visible_dirty(state: State) -> None:
     state._visible_dirty = True
 
 
+def _col_width_drop(state: State, parent_id) -> None:
+    """Drop the ``RowContext.max_col_width`` cache entry for one parent.
+
+    The companion to ``_index_drop_children`` for the per-parent column-width
+    cache (design sec C): whenever a parent's child list is dropped, replaced,
+    or mutated in place, its memoised column widths go stale. Idempotent —
+    a missing key is ignored. Called from ``_index_drop_children`` (the
+    drop/replace choke point), the ``_drop_subtree_indexes`` cascade, and the
+    ``update_data`` op mutators that touch child lists in place.
+    """
+    state._col_width_cache.pop(parent_id, None)
+
+
 def _index_drop_children(state: State, parent_id) -> None:
     """Drop ``_items_by_id`` / ``_parent_of_id`` entries for one parent's children.
 
@@ -452,7 +475,13 @@ def _index_drop_children(state: State, parent_id) -> None:
     (cache invalidation, fresh worker delivery). Idempotent: safe to call
     for a parent with no cache entry. Doesn't touch ``_loading`` — that
     flag is owned by dispatch / delivery, not by index maintenance.
+
+    Also evicts the parent's ``max_col_width`` entry: this is the single
+    drop/replace choke point, so dropping here covers ``refresh`` / worker
+    delivery (``apply_children_results``) and ``cache_invalidate_subtree``
+    in one place.
     """
+    _col_width_drop(state, parent_id)
     items = state._children.get(parent_id)
     if not items:
         return
@@ -588,13 +617,14 @@ def cache_invalidate_all(state: State) -> None:
     """Clear the entire children cache and mark the visible-tree dirty.
 
     Also clears the auxiliary indexes (``_items_by_id``,
-    ``_parent_of_id``, ``_loading``) so they stay in lockstep with
-    ``_children``.
+    ``_parent_of_id``, ``_loading``) and the per-parent column-width cache
+    (``_col_width_cache``) so they stay in lockstep with ``_children``.
     """
     state._children.clear()
     state._items_by_id.clear()
     state._parent_of_id.clear()
     state._loading.clear()
+    state._col_width_cache.clear()
     state._visible_dirty = True
 
 
@@ -802,6 +832,9 @@ def _drop_subtree_indexes(state: State, item_id) -> None:
     """
     children = state._children.pop(item_id, None)
     state._loading.pop(item_id, None)
+    # This level pops ``_children`` directly (not via ``_index_drop_children``),
+    # so its column-width entry must be dropped here too.
+    _col_width_drop(state, item_id)
     if not children:
         return
     for child in children:
@@ -1299,6 +1332,10 @@ def _apply_remove(state: State, id_) -> bool:
             if child.id == id_:
                 del parent_list[i]
                 break
+    # The row left ``parent_id``'s child list (in place) — its memoised
+    # column widths are stale. (The cascade below handles ``id_``'s own
+    # subtree entries.)
+    _col_width_drop(state, parent_id)
     # Cascade: drop the item's own subtree (children of ``id_`` as a
     # parent), recursively cleaning up indexes for descendants.
     _drop_subtree_indexes(state, id_)
@@ -1320,9 +1357,12 @@ def _apply_clear_children(state: State, parent_id) -> bool:
             _drop_subtree_indexes(state, cid)
     # Cache entry reverts to "no fetch yet" — drop the dict entry
     # entirely so the visible-tree builder shows a placeholder if the
-    # parent is expanded (matches the pre-fetch state).
+    # parent is expanded (matches the pre-fetch state). The column-width
+    # entry goes with it (this pops ``_children`` directly, bypassing
+    # ``_index_drop_children``).
     had_entry = parent_id in state._children
     state._children.pop(parent_id, None)
+    _col_width_drop(state, parent_id)
     # Spec: "loading flag is reset accordingly" — we set False (the
     # parent is in a known not-loading state; any future fetch will
     # flip it back to True via dispatch). NOT a settlement: the cache
@@ -1442,18 +1482,43 @@ def apply_ops(state: State, ops, *, preview_ansi: bool = True) -> None:
             # 4-tuple (legacy) or 5-tuple (with positioning descriptor).
             _, id_, parent_id, fields, *rest = op
             where = rest[0] if rest else None
+            # upsert/set/mod mutate a parent's child list IN PLACE
+            # (append/insert/del/replace) rather than dropping it via
+            # ``_index_drop_children``, so the column-width cache isn't
+            # touched by the index path. Snapshot the pre-op parent and drop
+            # both it and the post-op parent whenever the mutator reports a
+            # structural change (returns True): that's what catches a field-
+            # VALUE change to a measured column (the case we must invalidate).
+            # A rare known-id no-op patch (``mod(id, KEEP_PARENT, {})``, the
+            # ``upsert(id, parent=None)`` idempotent-ensure idiom) also returns
+            # True and so over-drops here — harmless (a refill re-measures the
+            # same widths; an over-drop never yields a stale hit). We
+            # deliberately do NOT gate this on ``if fields`` the way the
+            # adjacent preview-cache drops do: an empty-fields REPARENT (an
+            # upsert/set/mod that only moves the row to a new parent, no field
+            # patch) is structural and must still drop BOTH the old and new
+            # parent's entries — an ``if fields`` gate would miss it.
+            old_parent = state._parent_of_id.get(id_)
             if _apply_upsert(state, id_, parent_id, fields, where):
                 structural = True
+                _col_width_drop(state, old_parent)
+                _col_width_drop(state, state._parent_of_id.get(id_))
         elif kind == 'set':
             _, id_, parent_id, fields, *rest = op
             where = rest[0] if rest else None
+            old_parent = state._parent_of_id.get(id_)
             if _apply_set(state, id_, parent_id, fields, where):
                 structural = True
+                _col_width_drop(state, old_parent)
+                _col_width_drop(state, state._parent_of_id.get(id_))
         elif kind == 'mod':
             _, id_, parent_id, fields, *rest = op
             where = rest[0] if rest else None
+            old_parent = state._parent_of_id.get(id_)
             if _apply_mod(state, id_, parent_id, fields, where):
                 structural = True
+                _col_width_drop(state, old_parent)
+                _col_width_drop(state, state._parent_of_id.get(id_))
         elif kind == 'remove':
             _, id_ = op
             if _apply_remove(state, id_):

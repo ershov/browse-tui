@@ -37,6 +37,11 @@ _render = load('_browse_tui_render', '050-render.py')
 _render.Item = _data.Item
 _render.PreviewRender = _data.PreviewRender
 _render.Mode = _state.Mode
+# ``apply_ops`` (upsert/set ops) constructs ``Item`` instances inside the
+# state module; the isolated test load has to inject the real class (mirrors
+# the ``_render.Item`` injection above). The ``max_col_width`` invalidation
+# tests drive ``apply_ops`` directly.
+_state.Item = _data.Item
 # PaneCache is referenced by the four content renderers (#187) — they
 # call ``browser._pane_cache.setdefault(name, PaneCache())``. Inject the
 # state-layer type the same way Item is injected.
@@ -59,6 +64,12 @@ for _name in ('_TAG_STYLE', '_id_visible', '_ID_COLOR', '_MARKER_COLOR',
 
 Item = _data.Item
 Mode = _state.Mode
+State = _state.State
+apply_ops = _state.apply_ops
+cache_invalidate_subtree = _state.cache_invalidate_subtree
+cache_invalidate_all = _state.cache_invalidate_all
+_index_drop_children = _state._index_drop_children
+KEEP_PARENT = _state.KEEP_PARENT
 RowContext = _render.RowContext
 default_row = _state.default_row
 default_row_chrome = _state.default_row_chrome
@@ -709,6 +720,340 @@ class TestRowContextContentWidth(unittest.TestCase):
         ctx = _ctx(item, list_width=3)
         ctx._set_content_width(10)
         self.assertEqual(ctx.content_width, 0)
+
+
+# --- max_col_width (design sec C) -------------------------------------------
+
+
+class _StateBrowser:
+    """Minimal Browser stand-in wrapping a real ``State``.
+
+    ``RowContext.max_col_width`` reads/fills ``self._browser._state`` —
+    specifically ``_children`` (the sibling list), ``_parent_of_id`` (for
+    ``ctx.parent_id``) and ``_col_width_cache`` (the memo). A real ``State``
+    supplies all three, so the invalidation entry points (``apply_ops`` /
+    ``cache_invalidate_*``) can be exercised against the same object.
+    """
+
+    def __init__(self, state):
+        self._state = state
+        self.show_ids = 'auto'
+
+
+def _state_ctx(state, item, **kw):
+    """Build a :class:`RowContext` for ``item`` backed by a real ``State``."""
+    return RowContext(
+        _StateBrowser(state), item,
+        depth=kw.get('depth', 0),
+        selected=kw.get('selected', False),
+        expanded=kw.get('expanded', False),
+        is_current_scope=kw.get('is_current_scope', False),
+        kind=kw.get('kind', 'normal'),
+        list_width=kw.get('list_width', 80),
+    )
+
+
+class TestMaxColWidthMeasurement(unittest.TestCase):
+    """``max_col_width`` measures the per-parent max in DISPLAY CELLS."""
+
+    def _state_with_siblings(self):
+        # Three siblings under '/': col strings of cell width 3, 4, 0.
+        s = State(root_id='/')
+        a = Item(id='a'); a.col = 'abc'        # 3 cells
+        b = Item(id='b'); b.col = '漢字'        # 2 wide chars -> 4 cells
+        c = Item(id='c')                        # missing 'col' -> '' -> 0
+        s._children['/'] = [a, b, c]
+        s._parent_of_id = {'a': '/', 'b': '/', 'c': '/'}
+        return s, a, b, c
+
+    def test_returns_per_parent_max_in_cells(self):
+        s, a, *_ = self._state_with_siblings()
+        ctx = _state_ctx(s, a)
+        # The widest sibling is the CJK one: 2 chars * 2 cells = 4.
+        self.assertEqual(ctx.max_col_width('col'), 4)
+
+    def test_wide_char_counts_as_two_cells(self):
+        # Isolate the wide-char measurement: a lone CJK sibling.
+        s = State(root_id='/')
+        w = Item(id='w'); w.col = '日本語'      # 3 wide chars -> 6 cells
+        s._children['/'] = [w]
+        s._parent_of_id = {'w': '/'}
+        ctx = _state_ctx(s, w)
+        self.assertEqual(ctx.max_col_width('col'), 6)
+
+    def test_missing_field_contributes_zero(self):
+        # No sibling carries 'ghost' -> every getattr default '' -> max 0.
+        s, a, *_ = self._state_with_siblings()
+        ctx = _state_ctx(s, a)
+        self.assertEqual(ctx.max_col_width('ghost'), 0)
+
+    def test_one_missing_field_among_present_does_not_lower_max(self):
+        # 'c' lacks 'col' (contributes 0) but does not drag the max below
+        # the widest present sibling.
+        s, a, *_ = self._state_with_siblings()
+        ctx = _state_ctx(s, a)
+        self.assertEqual(ctx.max_col_width('col'), 4)
+
+    def test_empty_sibling_list_is_zero(self):
+        s = State(root_id='/')
+        s._children['/'] = []
+        a = Item(id='a'); a.col = 'wide-value'
+        # 'a' is not under '/', so '/' has no children to measure.
+        ctx = _state_ctx(s, a)
+        self.assertEqual(ctx.max_col_width('col', '/'), 0)
+
+    def test_absent_sibling_list_is_zero(self):
+        # Parent never cached: no '/' key in _children at all.
+        s = State(root_id='/')
+        a = Item(id='a'); a.col = 'x'
+        ctx = _state_ctx(s, a)
+        self.assertEqual(ctx.max_col_width('col', '/'), 0)
+
+    def test_non_string_value_is_stringified(self):
+        # The field may hold a non-string; max_col_width measures str(value).
+        s = State(root_id='/')
+        a = Item(id='a'); a.num = 12345        # str -> '12345' -> 5 cells
+        s._children['/'] = [a]
+        s._parent_of_id = {'a': '/'}
+        ctx = _state_ctx(s, a)
+        self.assertEqual(ctx.max_col_width('num'), 5)
+
+    def test_defaults_to_this_rows_parent(self):
+        # Two parents with different-width columns; a child of each measures
+        # only its own siblings.
+        s = State(root_id='/')
+        pa = Item(id='pa'); ca = Item(id='ca'); ca.col = 'short'      # 5
+        pb = Item(id='pb'); cb = Item(id='cb'); cb.col = 'much-longer'  # 11
+        s._children = {'pa': [ca], 'pb': [cb]}
+        s._parent_of_id = {'ca': 'pa', 'cb': 'pb'}
+        self.assertEqual(_state_ctx(s, ca).max_col_width('col'), 5)
+        self.assertEqual(_state_ctx(s, cb).max_col_width('col'), 11)
+
+    def test_explicit_parent_overrides_default(self):
+        s = State(root_id='/')
+        pa = Item(id='pa'); ca = Item(id='ca'); ca.col = 'short'
+        pb = Item(id='pb'); cb = Item(id='cb'); cb.col = 'much-longer'
+        s._children = {'pa': [ca], 'pb': [cb]}
+        s._parent_of_id = {'ca': 'pa', 'cb': 'pb'}
+        # 'ca' lives under 'pa' but explicitly asks for 'pb's column.
+        self.assertEqual(_state_ctx(s, ca).max_col_width('col', 'pb'), 11)
+
+    def test_explicit_none_parent_distinct_from_default(self):
+        # parent_id=None is a real key (root_id=None Browser), NOT "omitted".
+        s = State()                              # root_id is None
+        top = Item(id='top'); top.col = 'rooted-row'   # 10 cells, parent None
+        child = Item(id='c'); child.col = 'x'          # parent 'top'
+        s._children = {None: [top], 'top': [child]}
+        s._parent_of_id = {'top': None, 'c': 'top'}
+        ctx = _state_ctx(s, child)
+        self.assertEqual(ctx.parent_id, 'top')
+        # Omitted -> this row's parent ('top'): width of 'x' = 1.
+        self.assertEqual(ctx.max_col_width('col'), 1)
+        # Explicit None -> the root group: width of 'rooted-row' = 10.
+        self.assertEqual(ctx.max_col_width('col', None), 10)
+
+    def test_flat_single_parent_matches_global_max(self):
+        # A flat list (all rows under one parent, as a git log) -> per-parent
+        # alignment equals the global max across every row.
+        s = State(root_id='/')
+        vals = ['feat: a', 'fix: bug', 'refactor: the whole module']
+        items = []
+        for i, v in enumerate(vals):
+            it = Item(id=f'c{i}'); it.col = v
+            items.append(it)
+            s._parent_of_id[it.id] = '/'
+        s._children['/'] = items
+        per_parent = _state_ctx(s, items[0]).max_col_width('col')
+        global_max = max(_render.cell_width(v) for v in vals)
+        self.assertEqual(per_parent, global_max)
+
+
+class TestMaxColWidthCache(unittest.TestCase):
+    """The result is memoised per ``(parent_id, field)``; a hit re-scans
+    nothing."""
+
+    def _state_with_siblings(self):
+        s = State(root_id='/')
+        a = Item(id='a'); a.col = 'abc'
+        b = Item(id='b'); b.col = 'abcde'
+        s._children['/'] = [a, b]
+        s._parent_of_id = {'a': '/', 'b': '/'}
+        return s, a, b
+
+    def test_first_call_fills_cache(self):
+        s, a, _ = self._state_with_siblings()
+        self.assertEqual(s._col_width_cache, {})
+        _state_ctx(s, a).max_col_width('col')
+        self.assertEqual(s._col_width_cache, {'/': {'col': 5}})
+
+    def test_second_call_hits_cache_no_rescan(self):
+        # Spy on cell_width: it must NOT be invoked on the cached second call.
+        s, a, _ = self._state_with_siblings()
+        ctx = _state_ctx(s, a)
+        calls = {'n': 0}
+        real_cell_width = _render.cell_width
+
+        def counting(s_):
+            calls['n'] += 1
+            return real_cell_width(s_)
+
+        _render.cell_width = counting
+        try:
+            self.assertEqual(ctx.max_col_width('col'), 5)
+            after_first = calls['n']
+            self.assertGreater(after_first, 0)   # the fill scanned siblings
+            # Second call: cached -> no further cell_width invocations.
+            self.assertEqual(ctx.max_col_width('col'), 5)
+            self.assertEqual(calls['n'], after_first)
+        finally:
+            _render.cell_width = real_cell_width
+
+    def test_cached_zero_still_hits_cache(self):
+        # A memoised 0 (missing field) must hit the cache, not re-scan: the
+        # `is not None` check distinguishes "cached 0" from "not computed".
+        s, a, _ = self._state_with_siblings()
+        ctx = _state_ctx(s, a)
+        calls = {'n': 0}
+        real_cell_width = _render.cell_width
+
+        def counting(s_):
+            calls['n'] += 1
+            return real_cell_width(s_)
+
+        _render.cell_width = counting
+        try:
+            self.assertEqual(ctx.max_col_width('ghost'), 0)
+            after_first = calls['n']
+            self.assertEqual(ctx.max_col_width('ghost'), 0)
+            self.assertEqual(calls['n'], after_first)
+        finally:
+            _render.cell_width = real_cell_width
+
+    def test_distinct_fields_cached_independently(self):
+        s = State(root_id='/')
+        a = Item(id='a'); a.x = 'ab'; a.y = 'abcd'
+        s._children['/'] = [a]
+        s._parent_of_id = {'a': '/'}
+        ctx = _state_ctx(s, a)
+        self.assertEqual(ctx.max_col_width('x'), 2)
+        self.assertEqual(ctx.max_col_width('y'), 4)
+        self.assertEqual(s._col_width_cache['/'], {'x': 2, 'y': 4})
+
+
+class TestMaxColWidthInvalidation(unittest.TestCase):
+    """The cache entry is dropped on child-list drop / replace / mutation."""
+
+    def _populate(self, root='/'):
+        s = State(root_id=root)
+        a = Item(id='a'); a.col = 'abc'
+        b = Item(id='b'); b.col = 'abcde'        # widest: 5
+        s._children[root] = [a, b]
+        s._items_by_id = {'a': a, 'b': b}
+        s._parent_of_id = {'a': root, 'b': root}
+        return s, a, b
+
+    def _fill(self, s, item):
+        # Prime the cache for the item's parent under field 'col'.
+        w = _state_ctx(s, item).max_col_width('col')
+        self.assertIn(s._parent_of_id[item.id], s._col_width_cache)
+        return w
+
+    def test_cache_invalidate_subtree_drops_entry(self):
+        s, a, _ = self._populate()
+        self._fill(s, a)
+        cache_invalidate_subtree(s, '/')
+        self.assertNotIn('/', s._col_width_cache)
+
+    def test_cache_invalidate_all_clears_everything(self):
+        s, a, _ = self._populate()
+        self._fill(s, a)
+        cache_invalidate_all(s)
+        self.assertEqual(s._col_width_cache, {})
+
+    def test_index_drop_children_drops_entry(self):
+        # ``_index_drop_children`` is THE drop/replace choke point that
+        # worker delivery (refresh) and ``cache_invalidate_subtree`` route
+        # through. Dropping there is what covers refresh for free. (The
+        # end-to-end refresh / update_data invalidation through the real
+        # ``Browser`` is asserted in test_state_indexes.py.)
+        s, a, _ = self._populate()
+        self._fill(s, a)
+        self.assertIn('/', s._col_width_cache)
+        _index_drop_children(s, '/')
+        self.assertNotIn('/', s._col_width_cache)
+
+    def test_index_drop_children_drops_even_empty_list(self):
+        # A parent whose cached entry is [] (measured width 0) still has its
+        # column-width entry evicted — the drop precedes the empty-list guard.
+        s = State(root_id='/')
+        s._children['/'] = []
+        # Prime the (0-width) cache for '/'.
+        self.assertEqual(_state_ctx(s, Item(id='ph')).max_col_width('col', '/'),
+                         0)
+        self.assertIn('/', s._col_width_cache)
+        _index_drop_children(s, '/')
+        self.assertNotIn('/', s._col_width_cache)
+
+    def test_update_data_upsert_drops_entry(self):
+        s, a, _ = self._populate()
+        self._fill(s, a)
+        self.assertEqual(s._col_width_cache['/']['col'], 5)
+        # Upsert a NEW, wider sibling under '/'.
+        apply_ops(s, [('upsert', 'c', '/', {'col': 'abcdefghij'})])  # 10
+        self.assertNotIn('/', s._col_width_cache)
+        # Recompute reflects the new widest sibling.
+        ctx = _state_ctx(s, a)
+        self.assertEqual(ctx.max_col_width('col'), 10)
+
+    def test_update_data_mod_drops_entry(self):
+        s, a, b = self._populate()
+        self._fill(s, a)
+        # Mod an existing sibling's measured field (patch keeps parent).
+        apply_ops(s, [('mod', 'a', KEEP_PARENT, {'col': 'XXXXXXXXXXXX'})])
+        self.assertNotIn('/', s._col_width_cache)
+        ctx = _state_ctx(s, a)
+        self.assertEqual(ctx.max_col_width('col'), 12)
+
+    def test_update_data_remove_drops_entry(self):
+        s, a, b = self._populate()
+        self._fill(s, a)
+        apply_ops(s, [('remove', 'b')])           # drop the widest sibling
+        self.assertNotIn('/', s._col_width_cache)
+        ctx = _state_ctx(s, a)
+        self.assertEqual(ctx.max_col_width('col'), 3)   # only 'a' (abc) left
+
+    def test_update_data_clear_children_drops_entry(self):
+        s, a, _ = self._populate()
+        self._fill(s, a)
+        apply_ops(s, [('clear_children', '/')])
+        self.assertNotIn('/', s._col_width_cache)
+
+    def test_noop_mod_does_not_blow_cache_unnecessarily(self):
+        # A mod targeting an UNKNOWN id is a silent no-op (not structural),
+        # so the cache is untouched.
+        s, a, _ = self._populate()
+        self._fill(s, a)
+        apply_ops(s, [('mod', 'nonexistent', KEEP_PARENT, {'col': 'z'})])
+        self.assertIn('/', s._col_width_cache)
+
+    def test_reparent_drops_both_parents(self):
+        # Moving a child from one parent to another invalidates BOTH groups.
+        s = State(root_id='/')
+        pa = Item(id='pa'); pb = Item(id='pb')
+        x = Item(id='x'); x.col = 'wiiiiide'      # 8
+        y = Item(id='y'); y.col = 'yy'            # 2
+        s._children = {'pa': [x], 'pb': [y]}
+        s._items_by_id = {'pa': pa, 'pb': pb, 'x': x, 'y': y}
+        s._parent_of_id = {'x': 'pa', 'y': 'pb'}
+        # Prime both parents' caches.
+        self.assertEqual(_state_ctx(s, x).max_col_width('col'), 8)
+        self.assertEqual(_state_ctx(s, y).max_col_width('col'), 2)
+        self.assertIn('pa', s._col_width_cache)
+        self.assertIn('pb', s._col_width_cache)
+        # Reparent x from pa -> pb via mod.
+        apply_ops(s, [('mod', 'x', 'pb', {})])
+        self.assertNotIn('pa', s._col_width_cache)
+        self.assertNotIn('pb', s._col_width_cache)
 
 
 class TestDefaultHandlersExportedFromBrowseTui(unittest.TestCase):
