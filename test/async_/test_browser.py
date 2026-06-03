@@ -17,7 +17,8 @@ import time
 import unittest
 
 from test.async_._helpers import (
-    Browser, BrowserConfig, Item, Pending, State, make_browser
+    Browser, BrowserConfig, Item, Pending, State, make_browser,
+    default_row_chrome, default_row_content,
 )
 
 
@@ -41,7 +42,11 @@ class TestConstructionDefaults(unittest.TestCase):
             self.assertTrue(b.multi_select)
             self.assertEqual(b.print_format, '{id}')
             self.assertIsNone(b.on_enter)
-            self.assertIsNone(b.format_item)
+            # No format_row override → bound to the default composer; the
+            # chrome / content hooks resolve to the framework defaults.
+            self.assertEqual(b._row_segments, b._compose_row)
+            self.assertIs(b.format_row_chrome, default_row_chrome)
+            self.assertIs(b.format_row_content, default_row_content)
             self.assertEqual(b.actions, [])
             # quit fields default
             self.assertFalse(b._quit_requested)
@@ -115,9 +120,14 @@ class TestConstructionDefaults(unittest.TestCase):
     def test_callable_kwargs_stored(self):
         fmt = lambda item, ctx: [(str(item.id), '', False)]
         on_enter = lambda ctx: None
-        b = Browser(BrowserConfig(_headless=True, format_item=fmt, on_enter=on_enter))
+        b = Browser(BrowserConfig(_headless=True, format_row=fmt, on_enter=on_enter))
         try:
-            self.assertIs(b.format_item, fmt)
+            # A whole-row ``format_row`` override binds directly to
+            # ``_row_segments`` (no composer); the chrome / content hooks
+            # still resolve to the framework defaults.
+            self.assertIs(b._row_segments, fmt)
+            self.assertIs(b.format_row_chrome, default_row_chrome)
+            self.assertIs(b.format_row_content, default_row_content)
             self.assertIs(b.on_enter, on_enter)
         finally:
             b.stop_workers()

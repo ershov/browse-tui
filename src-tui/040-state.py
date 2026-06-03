@@ -2602,6 +2602,118 @@ def _extend_or_drop_preview_render(item, chunk, ansi_on) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Default row-format handlers (design sec A) — the framework's stock chrome /
+# content builders, split out of the old ``format_item_segments`` so a recipe
+# can override one part (just the content for columns) while keeping the rest,
+# or call a default, edit its segments, and return them. Public / module-level
+# so ``sys.modules['browse_tui']`` (080-cli) re-exports them automatically.
+#
+# They live here (not in 050-render) so ``Browser.__init__`` can bind them
+# with ``config.X or default_X`` as an intra-module name — the ~30 unit-test
+# files that load this module standalone and construct ``Browser`` then need
+# no change. Their *bodies* reference render-layer constants / helpers
+# (``_TAG_STYLE``, ``_id_visible``, ``_ID_COLOR``, ``_MARKER_COLOR``,
+# ``_PENDING_FG``, ``cell_width``) which the concatenated build resolves by
+# name; isolated test loads that actually render inject them the same way
+# ``Item`` is injected.
+
+
+def _segments_cells(segments):
+    """Total display-cell width of a ``(text, fg, bold)`` segment list.
+
+    Sums :func:`cell_width` (wide-char aware) over each segment's text —
+    colour rides ``fg``/``bold``, never the text, so the width is exact.
+    Used by the chrome→content hand-off to size ``ctx.content_width``.
+    """
+    return sum(cell_width(text) for text, _fg, _bold in segments)
+
+
+def default_row_chrome(item, ctx):
+    """The framework's default row *chrome* segments for a normal row.
+
+    The structural prefix, lifted verbatim from the old
+    ``format_item_segments``: the selection marker (``'* '`` if
+    ``ctx.selected`` else ``'  '``), the indentation (``'  '`` per tree
+    level), and the expander glyph (``'▼ '`` if ``ctx.expanded``, ``'▶ '``
+    if ``item.has_children`` else ``'  '``). Chrome stays framework-owned
+    unless a recipe overrides ``format_row_chrome``, so overriding only
+    ``format_row_content`` keeps the tree intact.
+    """
+    rel_depth = ctx.depth
+    if rel_depth < 0:
+        rel_depth = 0
+    indent = '  ' * rel_depth
+
+    sel_marker = '* ' if ctx.selected else '  '
+    if item.has_children:
+        expand_marker = '▼ ' if ctx.expanded else '▶ '   # ▼ / ▶
+    else:
+        expand_marker = '  '
+
+    return [
+        (sel_marker, None, False),
+        (indent, None, False),
+        (expand_marker, _MARKER_COLOR, False),
+    ]
+
+
+def default_row_content(item, ctx):
+    """The framework's default row *content* segments for a normal row.
+
+    The content region, lifted verbatim from the old
+    ``format_item_segments``: the id segment (gated by
+    ``ctx.browser.show_ids`` via :func:`_id_visible`), the ``tag`` chip,
+    the title (with the ``ctx.is_current_scope`` → ``scope_title``
+    override), and the trailing ``chips``. Output is byte-for-byte
+    identical to the pre-change ``kind='normal'`` content.
+
+    The scope row gets its id + title segments bolded so it stands apart
+    from the listing below — the "you are here" indicator. The selection /
+    expand markers stay non-bold (chrome, not content); the tag segment
+    keeps its ``tag_style``-driven bold so explicit tag styles still
+    control their own weight.
+    """
+    is_current_scope = ctx.is_current_scope
+    show_ids = ctx.browser.show_ids
+
+    segments = []
+    if _id_visible(item, show_ids):
+        segments.append(('{} '.format(item.id), _ID_COLOR, is_current_scope))
+
+    if item.tag:
+        sfg, sbold = _TAG_STYLE.get(item.tag_style, _TAG_STYLE[''])
+        segments.append(('[{}] '.format(item.tag), sfg, sbold))
+
+    scope_title = getattr(item, 'scope_title', None)
+    title_text = scope_title if (is_current_scope and scope_title) else item.title
+    segments.append((title_text, None, is_current_scope))
+
+    # Trailing colored chips: one ``[{text}] `` segment per (text, style)
+    # in ``item.chips``, styled through ``_TAG_STYLE`` like the tag chip.
+    # Color rides the segment ``fg`` (never embedded in text) so width
+    # math stays correct.
+    for text, style in getattr(item, 'chips', None) or ():
+        cfg, cbold = _TAG_STYLE.get(style, _TAG_STYLE[''])
+        segments.append((' [{}]'.format(text), cfg, cbold))
+    return segments
+
+
+def default_row(item, ctx):
+    """The framework's default *whole row* — chrome + content.
+
+    Returns ``default_row_chrome(item, ctx) + default_row_content(item,
+    ctx)`` and sets ``ctx.content_width`` (``list_width − chrome cells``)
+    along the way, mirroring :meth:`Browser._compose_row`. This is the
+    "give me a stock row to tweak" helper for a whole-row ``format_row``
+    override — it composes the *framework* defaults, not any other
+    resolved hook.
+    """
+    chrome = default_row_chrome(item, ctx)
+    ctx._set_content_width(_segments_cells(chrome))
+    return chrome + default_row_content(item, ctx)
+
+
 @dataclass
 class BrowserConfig:
     """Construction parameters for :class:`Browser`.
@@ -2616,7 +2728,19 @@ class BrowserConfig:
     get_preview: Optional[Callable[[Any], Optional[str]]] = None
     actions: Optional[list] = None
     on_enter: Any = None
-    format_item: Optional[Callable] = None
+    # Row-format hooks (design sec A). Each is ``(item, ctx) -> segments``
+    # where a segment is a ``(text, fg, bold)`` triple. Resolution is by
+    # config, not by return value, and bound once in ``Browser.__init__``:
+    #   * ``format_row``          — the whole row (total control).
+    #   * ``format_row_chrome``   — selection marker + indent + expander.
+    #   * ``format_row_content``  — the content region (id + tag + title +
+    #                               chips today; arbitrary columns when set).
+    # A hook left ``None`` uses the framework default for that part; a hook
+    # that *is* set owns its return completely. Override only
+    # ``format_row_content`` to get columns while keeping the tree chrome.
+    format_row: Optional[Callable] = None
+    format_row_chrome: Optional[Callable] = None
+    format_row_content: Optional[Callable] = None
     root_id: Any = None
     initial_scope: Any = None
     # ``None`` means "auto" — resolved by ``Browser.__init__`` to
@@ -2702,8 +2826,11 @@ class Browser:
                           phase 1 stores the list opaquely).
       on_enter:           default-action handler; #13 wires fall-back
                           print+exit when None.
-      format_item:        (item, ctx) -> [(text, fg, bold), …]; renderer
-                          consumes in #10.
+      format_row /        (item, ctx) -> [(text, fg, bold), …] row-format
+      format_row_chrome / hooks (design sec A); each unset hook falls back
+      format_row_content: to the framework default for that part. Resolved
+                          once in ``__init__``; the renderer calls
+                          ``_row_segments`` with no per-row ``None`` test.
       root_id:            Any (default None).
       initial_scope:      if set, pushed onto scope_stack at construction.
       show_preview:       enable the preview pane. ``None`` (default)
@@ -2762,8 +2889,16 @@ class Browser:
                 ``print_format`` and exits 0; ``'action:KEY'`` runs the
                 bound action; ``'noop'`` does nothing; a callable is
                 invoked with the Context.
-            format_item: Optional ``(item, ctx) -> [(text, fg, bold)…]``
-                hook overriding the default per-row layout.
+            format_row / format_row_chrome / format_row_content: Optional
+                ``(item, ctx) -> [(text, fg, bold)…]`` row-format hooks
+                (design sec A). ``format_row`` owns the whole row;
+                ``format_row_chrome`` the selection marker + indent +
+                expander; ``format_row_content`` the id + tag + title +
+                chips (or arbitrary columns). Each is resolved once here
+                (``config.X or default_X``); an unset hook uses the
+                framework default for that part, a set hook owns its
+                return. Override only ``format_row_content`` to render
+                columns while keeping the tree chrome.
             root_id: Initial id passed to the first ``get_children``
                 call. ``None`` is the default.
             initial_scope: If set, pushed onto ``scope_stack`` at
@@ -2860,13 +2995,22 @@ class Browser:
         self.title = config.title
         self.get_children = config.get_children or (lambda _id, *, reload=False: [])
         self.get_preview = config.get_preview
-        # actions/on_enter/format_item are stored opaquely in phase 1;
+        # actions/on_enter are stored opaquely in phase 1;
         # tickets #11 (Context) and #12 (action keymap) read them.
         self.actions = (
             list(config.actions) if config.actions is not None else []
         )
         self.on_enter = config.on_enter
-        self.format_item = config.format_item
+        # Row-format hooks (design sec A) — resolved ONCE here, after the
+        # ``on_before_init`` plugin hooks have had their chance to mutate
+        # ``config``. An unset hook binds to the framework default for its
+        # part, so ``render_list`` never tests a hook against ``None``.
+        self.format_row_chrome = config.format_row_chrome or default_row_chrome
+        self.format_row_content = config.format_row_content or default_row_content
+        # Whole-row renderer: an explicit ``format_row`` override wins;
+        # otherwise the (resolved) chrome + content composer, which owns
+        # the chrome→content ``content_width`` hand-off (``_compose_row``).
+        self._row_segments = config.format_row or self._compose_row
         # ``show_preview=None`` means "auto": show the preview pane
         # iff a ``get_preview`` callback was supplied. Explicit
         # True/False from the caller wins.
@@ -3277,6 +3421,27 @@ class Browser:
         for _plugin_cfg in registered_plugins:
             if _plugin_cfg.on_after_init is not None:
                 _plugin_cfg.on_after_init(self)
+
+    # ---- row formatting -------------------------------------------------
+
+    def _compose_row(self, item, ctx):
+        """The default whole-row builder: chrome + content (design sec A).
+
+        Bound to ``self._row_segments`` when no ``format_row`` override is
+        configured. Calls the *resolved* ``self.format_row_chrome`` /
+        ``self.format_row_content`` (the module defaults when a hook is
+        unset), in that order, so it owns the chrome→content
+        ``content_width`` hand-off: chrome is built and measured *before*
+        the content hook runs, so ``ctx.content_width`` (cells left after
+        the chrome on this row) is correct when the content hook reads it.
+
+        A whole-row ``format_row`` override bypasses this method, so under
+        such an override ``ctx.content_width`` stays equal to
+        ``ctx.list_width`` (the chrome split is unknown).
+        """
+        chrome = self.format_row_chrome(item, ctx)
+        ctx._set_content_width(_segments_cells(chrome))
+        return chrome + self.format_row_content(item, ctx)
 
     # ---- action registration -------------------------------------------
 

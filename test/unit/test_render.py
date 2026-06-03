@@ -2,9 +2,10 @@
 
 The render module owns two kinds of code:
 
-  * Pure helpers — ``format_item_segments`` (build the per-item segment
-    list) and ``layout_panes`` (geometry math). These are unit-testable
-    with no terminal in the loop.
+  * Pure helpers — the default row-format handlers (``default_row_chrome``
+    / ``default_row_content`` / ``default_row``, exercised here via the
+    ``default_segments`` shim) and ``layout_panes`` (geometry math). These
+    are unit-testable with no terminal in the loop.
   * Pane renderers — ``render_list``, ``render_preview``,
     ``render_separator``, plus the orchestration ``render_full`` /
     ``render_partial``. These write through ``020-terminal``'s
@@ -46,14 +47,84 @@ _render.PaneCache = _state.PaneCache
 _render._char_width = _term._char_width
 _render._visible_len = _term._visible_len
 
+# The default row-format handlers (``default_row_chrome`` /
+# ``default_row_content`` / ``default_row``) live in 040-state but
+# reference render-layer constants/helpers (``_TAG_STYLE`` / ``_id_visible``
+# / ``_ID_COLOR`` / ``_MARKER_COLOR`` / ``cell_width``) at call time. The
+# concatenated production build resolves them by name; the isolated test
+# load has to inject them into the state module.
+for _name in ('_TAG_STYLE', '_id_visible', '_ID_COLOR', '_MARKER_COLOR',
+              'cell_width'):
+    setattr(_state, _name, getattr(_render, _name))
+
 Item = _data.Item
 Mode = _state.Mode
-format_item_segments = _render.format_item_segments
+RowContext = _render.RowContext
+default_row = _state.default_row
+default_row_chrome = _state.default_row_chrome
+default_row_content = _state.default_row_content
+_segments_cells = _state._segments_cells
 layout_panes = _render.layout_panes
 render_separator = _render.render_separator
 Rect = _render.Rect
 point_in_rect = _render.point_in_rect
 _TAG_STYLE = _render._TAG_STYLE
+
+
+class _FakeState:
+    """Minimal ``State`` stand-in for building a :class:`RowContext`.
+
+    ``RowContext.__init__`` only touches ``browser._state._parent_of_id``;
+    everything else it stores from its constructor kwargs.
+    """
+
+    def __init__(self, parent_of_id=None):
+        self._parent_of_id = parent_of_id or {}
+
+
+class _FakeBrowser:
+    """Minimal ``Browser`` stand-in for the row-format unit tests.
+
+    Carries the two attributes the default handlers reach for: ``show_ids``
+    (read by ``default_row_content`` via ``ctx.browser.show_ids``) and a
+    ``_state`` with ``_parent_of_id`` (read by ``RowContext.__init__``).
+    """
+
+    def __init__(self, *, show_ids='auto', parent_of_id=None):
+        self.show_ids = show_ids
+        self._state = _FakeState(parent_of_id)
+
+
+def _ctx(item, *, depth=0, selected=False, expanded=False,
+         is_current_scope=False, kind='normal', list_width=0,
+         show_ids='auto', parent_of_id=None, browser=None):
+    """Build a :class:`RowContext` for ``item`` the way ``render_list`` does.
+
+    Lets the segment-level tests exercise the public default handlers
+    (which take ``(item, ctx)``) without standing up a full Browser.
+    """
+    if browser is None:
+        browser = _FakeBrowser(show_ids=show_ids, parent_of_id=parent_of_id)
+    return RowContext(
+        browser, item,
+        depth=depth, selected=selected, expanded=expanded,
+        is_current_scope=is_current_scope, kind=kind, list_width=list_width,
+    )
+
+
+def default_segments(item, *, base_depth=0, **kw):
+    """Default whole-row segments for ``item`` — the migrated stand-in for
+    the old ``format_item_segments(item, ...)`` on a *normal* row.
+
+    Builds a ctx (``base_depth`` is folded into ``depth`` to preserve the
+    old ``rel_depth = depth - base_depth`` semantics the renderer no longer
+    needs — the live render path always uses ``base_depth=0``) and returns
+    ``default_row(item, ctx)`` (chrome + content with the content_width
+    hand-off), matching what ``Browser._compose_row`` produces when no
+    hooks are overridden.
+    """
+    depth = kw.pop('depth', 0) - base_depth
+    return default_row(item, _ctx(item, depth=depth, **kw))
 
 
 class _TermCapture:
@@ -160,7 +231,7 @@ class TestTagStyleMap(unittest.TestCase):
         self.assertEqual(_TAG_STYLE.get('not-a-real-style', default), default)
 
 
-# --- format_item_segments: default formatter --------------------------------
+# --- default row formatter (via the ``default_segments`` shim) --------------
 
 
 def _texts(segs):
@@ -177,7 +248,7 @@ class TestFormatItemSegmentsDefault(unittest.TestCase):
 
     def test_leaf_no_tag_no_selection(self):
         item = Item(id='a')
-        segs = format_item_segments(item)
+        segs = default_segments(item)
         joined = _joined(segs)
         # Selection marker (2 chars), expand-marker (2 chars for a leaf),
         # then title 'a'. Auto-suppression hides the id segment when
@@ -192,7 +263,7 @@ class TestFormatItemSegmentsDefault(unittest.TestCase):
     def test_leaf_id_visible_when_title_differs(self):
         # When title differs from id, the id segment is emitted (no '#').
         item = Item(id='a', title='Alpha')
-        segs = format_item_segments(item)
+        segs = default_segments(item)
         joined = _joined(segs)
         self.assertIn('a ', joined)
         self.assertIn('Alpha', joined)
@@ -200,7 +271,7 @@ class TestFormatItemSegmentsDefault(unittest.TestCase):
 
     def test_show_ids_always_emits_id_even_when_equal_to_title(self):
         item = Item(id='a')  # title defaults to 'a'
-        segs = format_item_segments(item, show_ids='always')
+        segs = default_segments(item, show_ids='always')
         joined = _joined(segs)
         # The id segment is present (and matches the title text); look
         # for the trailing ' ' separator that distinguishes it from the
@@ -209,24 +280,24 @@ class TestFormatItemSegmentsDefault(unittest.TestCase):
 
     def test_show_ids_never_hides_id_even_when_different_from_title(self):
         item = Item(id='a', title='Alpha')
-        segs = format_item_segments(item, show_ids='never')
+        segs = default_segments(item, show_ids='never')
         joined = _joined(segs)
         self.assertNotIn('a ', joined)
         self.assertIn('Alpha', joined)
 
     def test_collapsed_parent_uses_right_arrow(self):
         item = Item(id='a', has_children=True)
-        segs = format_item_segments(item, expanded=False)
+        segs = default_segments(item, expanded=False)
         self.assertIn('▶', _joined(segs))  # ▶
 
     def test_expanded_parent_uses_down_arrow(self):
         item = Item(id='a', has_children=True)
-        segs = format_item_segments(item, expanded=True)
+        segs = default_segments(item, expanded=True)
         self.assertIn('▼', _joined(segs))  # ▼
 
     def test_tag_segment_is_styled(self):
         item = Item(id='a', tag='running', tag_style='green')
-        segs = format_item_segments(item)
+        segs = default_segments(item)
         # Find the tag segment and confirm its fg matches the green entry.
         tag_segs = [s for s in segs if '[running]' in s[0]]
         self.assertEqual(len(tag_segs), 1, f'expected one tag seg, got {tag_segs!r}')
@@ -239,7 +310,7 @@ class TestFormatItemSegmentsDefault(unittest.TestCase):
         # styled through _TAG_STYLE just like the tag segment.
         item = Item(id='a', title='Alpha')
         item.chips = [('HEAD', 'green'), ('v1.2', 'yellow')]
-        segs = format_item_segments(item)
+        segs = default_segments(item)
         chip_segs = [s for s in segs if '[HEAD]' in s[0] or '[v1.2]' in s[0]]
         self.assertEqual(len(chip_segs), 2, f'expected two chip segs, got {chip_segs!r}')
         # First chip: green fg/bold; second chip: yellow fg/bold. Color
@@ -260,7 +331,7 @@ class TestFormatItemSegmentsDefault(unittest.TestCase):
         # mirroring tag_style — it must not crash.
         item = Item(id='a', title='Alpha')
         item.chips = [('odd', 'not-a-style')]
-        segs = format_item_segments(item)
+        segs = default_segments(item)
         chip_segs = [s for s in segs if s[0] == ' [odd]']
         self.assertEqual(len(chip_segs), 1)
         _, fg, bold = chip_segs[0]
@@ -270,17 +341,17 @@ class TestFormatItemSegmentsDefault(unittest.TestCase):
         # Regression guard: an Item without ``chips`` renders exactly as
         # before — no extra '[' segments beyond an explicit tag (none here).
         item = Item(id='a', title='Alpha')
-        segs = format_item_segments(item)
+        segs = default_segments(item)
         self.assertNotIn('[', _joined(segs))
         # And an empty/None chips attribute is also a no-op.
         item.chips = []
-        self.assertEqual(format_item_segments(item), segs)
+        self.assertEqual(default_segments(item), segs)
         item.chips = None
-        self.assertEqual(format_item_segments(item), segs)
+        self.assertEqual(default_segments(item), segs)
 
     def test_selected_emits_star_marker(self):
         item = Item(id='a')
-        segs = format_item_segments(item, selected=True)
+        segs = default_segments(item, selected=True)
         # First segment text should start with '* '.
         self.assertTrue(
             segs[0][0].startswith('* '),
@@ -289,36 +360,28 @@ class TestFormatItemSegmentsDefault(unittest.TestCase):
 
     def test_indent_scales_with_depth(self):
         item = Item(id='a')
-        d0 = format_item_segments(item, depth=0, base_depth=0)
-        d2 = format_item_segments(item, depth=2, base_depth=0)
+        d0 = default_segments(item, depth=0, base_depth=0)
+        d2 = default_segments(item, depth=2, base_depth=0)
         # Depth 2 - depth 0 = 2 levels = 4 spaces of additional indent.
         self.assertEqual(len(_joined(d2)) - len(_joined(d0)), 4)
 
 
-# --- format_item_segments: pending kind + is_current_scope --------------------
+# --- default content: is_current_scope (the scope row) ----------------------
+# (The pending placeholder branch moved out of the segment builder into
+#  ``render_list``; it is covered by ``TestRenderListPendingRow`` below.)
 
 
 class TestFormatItemSegmentsKinds(unittest.TestCase):
-    """``pending`` short-circuits the default layout; the scope row is
-    rendered as a normal row with the ``is_current_scope`` label-override
-    flag (see scope-root unification design)."""
-
-    def test_pending_kind_renders_loading_glyph(self):
-        item = Item(id='__pending__', title='⧗ loading…')
-        segs = format_item_segments(item, kind='pending', depth=1)
-        joined = _joined(segs)
-        self.assertIn('⧗ loading', joined)
-        # No selection star, no expand arrow on a pending row.
-        self.assertNotIn('* ', joined)
-        self.assertNotIn('▶', joined)
-        self.assertNotIn('▼', joined)
+    """The scope row is rendered as a normal row with the
+    ``is_current_scope`` label-override flag (see scope-root unification
+    design)."""
 
     def test_scope_row_renders_as_normal(self):
         # The scope row is emitted as kind='normal' at depth 0. It gets
         # the same chrome as any normal row (selection marker, expand
         # glyph if has_children).
         item = Item(id='proj', title='My Project', has_children=True)
-        segs = format_item_segments(
+        segs = default_segments(
             item, kind='normal', depth=0, base_depth=1,
             expanded=True, is_current_scope=True,
         )
@@ -333,17 +396,17 @@ class TestFormatItemSegmentsKinds(unittest.TestCase):
         item = Item(id='sess-abc', title='abc')
         item.scope_title = '/full/path/to/sess-abc.jsonl'
         # Without is_current_scope, scope_title is ignored.
-        segs = format_item_segments(item, kind='normal')
+        segs = default_segments(item, kind='normal')
         self.assertIn('abc', _joined(segs))
         self.assertNotIn('/full/path', _joined(segs))
         # With is_current_scope, scope_title wins.
-        segs2 = format_item_segments(item, kind='normal', is_current_scope=True)
+        segs2 = default_segments(item, kind='normal', is_current_scope=True)
         self.assertIn('/full/path/to/sess-abc.jsonl', _joined(segs2))
 
     def test_scope_title_ignored_when_unset(self):
         # No scope_title → title is used regardless of is_current_scope.
         item = Item(id='proj', title='My Project')
-        segs = format_item_segments(item, kind='normal', is_current_scope=True)
+        segs = default_segments(item, kind='normal', is_current_scope=True)
         self.assertIn('My Project', _joined(segs))
 
     def test_scope_row_title_segment_is_bold(self):
@@ -351,43 +414,42 @@ class TestFormatItemSegmentsKinds(unittest.TestCase):
         # apart from the listing — the "you are here" indicator. The
         # selection/expand-marker chrome stays non-bold.
         item = Item(id='proj', title='My Project')
-        segs = format_item_segments(item, kind='normal', is_current_scope=True)
+        segs = default_segments(item, kind='normal', is_current_scope=True)
         # Find the title segment (text equals item.title).
         title_seg = next(s for s in segs if s[0] == 'My Project')
         self.assertTrue(title_seg[2], 'title segment must be bold for scope row')
         # And NOT bold for a non-current-scope row.
-        segs2 = format_item_segments(item, kind='normal', is_current_scope=False)
+        segs2 = default_segments(item, kind='normal', is_current_scope=False)
         title_seg2 = next(s for s in segs2 if s[0] == 'My Project')
         self.assertFalse(title_seg2[2])
 
     def test_scope_row_id_segment_is_bold(self):
         # The id segment also bolds for the scope row (when shown).
         item = Item(id='proj', title='My Project')  # id != title -> id visible
-        segs = format_item_segments(item, kind='normal', is_current_scope=True)
+        segs = default_segments(item, kind='normal', is_current_scope=True)
         id_seg = next(s for s in segs if 'proj' in s[0] and s[0] != 'My Project')
         self.assertTrue(id_seg[2], 'id segment must be bold for scope row')
 
 
-# --- format_item override hook ---------------------------------------------
+# --- format_row override hook -----------------------------------------------
 
 
-class TestFormatItemFormatHook(unittest.TestCase):
-    """The user-supplied format_item hook short-circuits default formatting."""
+class TestFormatRowHook(unittest.TestCase):
+    """A whole-row ``format_row`` override owns the row completely — it is
+    bound directly to ``_row_segments`` and called with ``(item, ctx)``."""
 
     def test_hook_return_value_is_used_verbatim(self):
-        called = []
-
         def hook(item, ctx):
-            called.append((item, ctx))
             return [('CUSTOM', None, False)]
 
         item = Item(id='a', title='Alpha')
-        segs = format_item_segments(item, format_item=hook)
+        ctx = _ctx(item, list_width=80)
+        segs = hook(item, ctx)
         self.assertEqual(segs, [('CUSTOM', None, False)])
-        # Default formatting did not run — no '#a' anywhere.
+        # Default formatting did not run — only the hook's segment.
         self.assertEqual(_joined(segs), 'CUSTOM')
 
-    def test_hook_receives_item_argument(self):
+    def test_hook_receives_item_and_real_ctx(self):
         captured = {}
 
         def hook(item, ctx):
@@ -396,12 +458,279 @@ class TestFormatItemFormatHook(unittest.TestCase):
             return [('x', None, False)]
 
         item = Item(id='a')
-        format_item_segments(item, format_item=hook)
+        ctx = _ctx(item, depth=2, selected=True, list_width=40)
+        hook(item, ctx)
         self.assertIs(captured['item'], item)
-        # ctx may be None in phase 1 — what matters is that the hook is
-        # called with two positional args without raising. Phase-2 ticket
-        # #11 wires the real Context object.
-        self.assertIn('ctx', captured)
+        # The hook now receives a real RowContext (no longer None) carrying
+        # per-row state — the phase-2 promise the old ``format_item`` lacked.
+        self.assertIsInstance(captured['ctx'], RowContext)
+        self.assertEqual(captured['ctx'].depth, 2)
+        self.assertTrue(captured['ctx'].selected)
+
+
+# --- Stage 2: default-output golden + the chrome/content split --------------
+
+
+class TestDefaultRowGolden(unittest.TestCase):
+    """The default whole-row output is byte-for-byte the pre-change layout.
+
+    Hand-written golden segment lists (the exact triples the old
+    ``format_item_segments`` produced) guard the headline Stage-2 promise:
+    default rendering is unchanged. ``MARKER_FG`` / ``ID_FG`` resolve to
+    the palette indices the chrome / id used before (4 / 3).
+    """
+
+    def test_leaf_unselected_auto_id_suppressed(self):
+        # id == title under 'auto' → no id segment. Leaf → '  ' expander.
+        item = Item(id='a')
+        self.assertEqual(default_segments(item), [
+            ('  ', None, False),          # selection marker (unselected)
+            ('', None, False),            # indent (depth 0)
+            ('  ', _render.MARKER_FG, False),   # expander (leaf)
+            ('a', None, False),           # title
+        ])
+
+    def test_selected_expanded_parent_with_id_tag_and_chip(self):
+        item = Item(id='x', title='Title', tag='run', tag_style='green')
+        item.chips = [('HEAD', 'yellow')]
+        segs = default_segments(
+            item, depth=2, selected=True, expanded=True, show_ids='always',
+        )
+        self.assertEqual(segs, [
+            ('* ', None, False),          # selected
+            ('    ', None, False),        # indent (depth 2 → 4 spaces)
+            ('  ', _render.MARKER_FG, False),   # leaf expander (no has_children)
+            ('x ', _render.ID_FG, False),       # id (show_ids='always')
+            ('[run] ', _TAG_STYLE['green'][0], _TAG_STYLE['green'][1]),
+            ('Title', None, False),       # title
+            (' [HEAD]', _TAG_STYLE['yellow'][0], _TAG_STYLE['yellow'][1]),
+        ])
+
+    def test_expanded_parent_uses_down_arrow_segment(self):
+        item = Item(id='d', title='Dir', has_children=True)
+        segs = default_segments(item, expanded=True)
+        # The expander segment carries '▼ ' coloured MARKER_FG.
+        self.assertEqual(segs[2], ('▼ ', _render.MARKER_FG, False))
+
+    def test_scope_row_bolds_id_and_title_segments(self):
+        item = Item(id='proj', title='My Project')
+        segs = default_segments(item, is_current_scope=True)
+        id_seg = next(s for s in segs if s[0] == 'proj ')
+        title_seg = next(s for s in segs if s[0] == 'My Project')
+        self.assertEqual(id_seg, ('proj ', _render.ID_FG, True))
+        self.assertEqual(title_seg, ('My Project', None, True))
+
+
+class TestRowFormatHookComposition(unittest.TestCase):
+    """The three-hook dispatcher: by-config resolution, bound once, with the
+    chrome/content split (design sec A) — exercised through ``_compose_row``
+    on a real Browser-shaped object."""
+
+    def _browser(self, **hooks):
+        # Build via _MockBrowser so we get the real ``_compose_row`` + the
+        # ``Browser.__init__`` resolution rules (unset → default).
+        b = _MockBrowser(_MockState([]))
+        for k, v in hooks.items():
+            setattr(b, k, v)
+        return b
+
+    def _row_ctx(self, item, browser, **kw):
+        kw.setdefault('list_width', 80)
+        return RowContext(
+            browser, item,
+            depth=kw.get('depth', 0), selected=kw.get('selected', False),
+            expanded=kw.get('expanded', False),
+            is_current_scope=kw.get('is_current_scope', False),
+            kind=kw.get('kind', 'normal'), list_width=kw['list_width'],
+        )
+
+    def test_unset_hooks_use_defaults_identity(self):
+        # A Browser with no hooks set binds chrome/content to the module
+        # defaults and ``_row_segments`` to its own composer.
+        b = self._browser()
+        self.assertIs(b.format_row_chrome, default_row_chrome)
+        self.assertIs(b.format_row_content, default_row_content)
+        self.assertEqual(b._row_segments, b._compose_row)
+
+    def test_default_compose_equals_default_row(self):
+        # With no overrides, the composer's output equals ``default_row``.
+        b = self._browser()
+        item = Item(id='x', title='Title', tag='t', tag_style='cyan')
+        ctx_a = self._row_ctx(item, b, depth=1, selected=True)
+        ctx_b = self._row_ctx(item, b, depth=1, selected=True)
+        self.assertEqual(b._row_segments(item, ctx_a), default_row(item, ctx_b))
+
+    def test_override_content_keeps_chrome(self):
+        # Overriding only format_row_content keeps the framework chrome
+        # (selection marker + indent + expander) prefix.
+        def content(item, ctx):
+            return [('COLS', None, False)]
+
+        b = self._browser(format_row_content=content)
+        item = Item(id='x', title='Title', has_children=True)
+        ctx = self._row_ctx(item, b, depth=1, selected=True, expanded=True)
+        segs = b._row_segments(item, ctx)
+        # Chrome is the default three-segment prefix...
+        self.assertEqual(segs[:3], [
+            ('* ', None, False),
+            ('  ', None, False),
+            ('▼ ', _render.MARKER_FG, False),
+        ])
+        # ...followed verbatim by the override's content.
+        self.assertEqual(segs[3:], [('COLS', None, False)])
+
+    def test_override_chrome_keeps_default_content(self):
+        def chrome(item, ctx):
+            return [('>>', None, False)]
+
+        b = self._browser(format_row_chrome=chrome)
+        item = Item(id='x', title='Title')   # id != title → id visible
+        ctx = self._row_ctx(item, b)
+        segs = b._row_segments(item, ctx)
+        self.assertEqual(segs[0], ('>>', None, False))
+        # Default content follows: id + title.
+        self.assertEqual(segs[1:], [
+            ('x ', _render.ID_FG, False),
+            ('Title', None, False),
+        ])
+
+    def test_format_row_override_replaces_everything(self):
+        # A whole-row override binds straight to _row_segments; neither the
+        # default chrome nor the default content runs.
+        def whole(item, ctx):
+            return [('WHOLE', None, False)]
+
+        b = self._browser()
+        b._row_segments = whole   # what __init__ does for config.format_row
+        item = Item(id='x', title='Title')
+        ctx = self._row_ctx(item, b)
+        self.assertEqual(b._row_segments(item, ctx), [('WHOLE', None, False)])
+
+    def test_set_hook_return_used_verbatim_no_none_sentinel(self):
+        # A set hook that returns an empty list is honoured as-is (there is
+        # no None-return sentinel falling back to the default).
+        def content(item, ctx):
+            return []
+
+        b = self._browser(format_row_content=content)
+        item = Item(id='x', title='Title')
+        ctx = self._row_ctx(item, b)
+        # Only the chrome remains; the content contributed nothing.
+        self.assertEqual(b._row_segments(item, ctx), b.format_row_chrome(item, ctx))
+
+    def test_hook_calls_default_then_edits_and_returns(self):
+        # The documented compose-by-call-edit-return pattern: a recipe calls
+        # default_row_content, appends a column, returns the edited list.
+        def content(item, ctx):
+            segs = default_row_content(item, ctx)
+            segs.append((' EXTRA', None, False))
+            return segs
+
+        b = self._browser(format_row_content=content)
+        item = Item(id='a')
+        ctx = self._row_ctx(item, b)
+        segs = b._row_segments(item, ctx)
+        self.assertEqual(segs[-1], (' EXTRA', None, False))
+        # And the default content ('a' title) is still present before it.
+        self.assertIn(('a', None, False), segs)
+
+
+class TestRowContextFields(unittest.TestCase):
+    """``RowContext`` carries the correct per-row state + dimensions."""
+
+    def test_carries_per_row_state(self):
+        item = Item(id='child', title='Child')
+        ctx = _ctx(
+            item, depth=3, selected=True, expanded=True,
+            is_current_scope=True, kind='normal', list_width=100,
+            parent_of_id={'child': 'parent'},
+        )
+        self.assertEqual(ctx.depth, 3)
+        self.assertTrue(ctx.selected)
+        self.assertTrue(ctx.expanded)
+        self.assertTrue(ctx.is_current_scope)
+        self.assertEqual(ctx.kind, 'normal')
+        self.assertEqual(ctx.parent_id, 'parent')
+
+    def test_parent_id_none_when_unmapped(self):
+        item = Item(id='orphan')
+        ctx = _ctx(item, parent_of_id={})
+        self.assertIsNone(ctx.parent_id)
+
+    def test_browser_escape_hatch(self):
+        item = Item(id='a')
+        b = _FakeBrowser(show_ids='always')
+        ctx = _ctx(item, browser=b)
+        self.assertIs(ctx.browser, b)
+
+    def test_list_width_zero_before_first_paint(self):
+        # Default list_width is 0 (headless / pre-paint), matching the
+        # preview_width contract.
+        item = Item(id='a')
+        ctx = _ctx(item)
+        self.assertEqual(ctx.list_width, 0)
+        self.assertEqual(ctx.content_width, 0)
+
+
+class TestRowContextContentWidth(unittest.TestCase):
+    """``content_width`` = list_width − chrome cells under the composer;
+    = list_width under a whole-row override."""
+
+    def test_content_width_after_default_compose_varies_with_depth(self):
+        b = _MockBrowser(_MockState([]))
+        for depth in (0, 1, 4):
+            item = Item(id='a', title='Alpha')
+            ctx = RowContext(
+                b, item, depth=depth, selected=False, expanded=False,
+                is_current_scope=False, kind='normal', list_width=80,
+            )
+            chrome = b.format_row_chrome(item, ctx)
+            b._row_segments(item, ctx)   # runs _compose_row → _set_content_width
+            self.assertEqual(ctx.content_width, 80 - _segments_cells(chrome))
+            # Sanity: deeper indent → narrower content.
+            self.assertLess(ctx.content_width, 80)
+
+    def test_content_width_equals_list_width_under_format_row_override(self):
+        # A whole-row override never calls _set_content_width, so the ctx
+        # keeps content_width == list_width.
+        item = Item(id='a')
+        ctx = _ctx(item, depth=3, list_width=80)
+        # Simulate the override path: render_list builds ctx, calls the
+        # bound _row_segments (the override) which does NOT touch the width.
+        def whole(it, c):
+            return [('WHOLE', None, False)]
+        whole(item, ctx)
+        self.assertEqual(ctx.content_width, 80)
+        self.assertEqual(ctx.content_width, ctx.list_width)
+
+    def test_content_width_clamps_at_zero_for_wide_chrome(self):
+        # A chrome wider than the pane yields content_width 0, never negative.
+        item = Item(id='a')
+        ctx = _ctx(item, list_width=3)
+        ctx._set_content_width(10)
+        self.assertEqual(ctx.content_width, 0)
+
+
+class TestDefaultHandlersExportedFromBrowseTui(unittest.TestCase):
+    """The public default handlers are importable from the ``browse_tui``
+    alias (here: the loaded state module) and compose as documented."""
+
+    def test_handlers_are_module_level(self):
+        # default_row composes chrome + content (the composer's defaults).
+        item = Item(id='a', title='Alpha')
+        ctx_whole = _ctx(item, list_width=40)
+        ctx_parts = _ctx(item, list_width=40)
+        whole = default_row(item, ctx_whole)
+        parts = (default_row_chrome(item, ctx_parts)
+                 + default_row_content(item, ctx_parts))
+        self.assertEqual(whole, parts)
+
+    def test_default_row_sets_content_width(self):
+        item = Item(id='a', title='Alpha')
+        ctx = _ctx(item, depth=1, list_width=40)
+        chrome = default_row_chrome(item, ctx)
+        default_row(item, ctx)
+        self.assertEqual(ctx.content_width, 40 - _segments_cells(chrome))
 
 
 # --- layout_panes -----------------------------------------------------------
@@ -1277,7 +1606,7 @@ class _MockState:
     """
 
     def __init__(self, visible, cursor=0, expanded=None, selected=None,
-                 scope_stack=()):
+                 scope_stack=(), parent_of_id=None):
         self._visible = visible
         self.cursor = cursor
         self.expanded = expanded or set()
@@ -1285,6 +1614,9 @@ class _MockState:
         self.scope_stack = scope_stack
         self._preview = {}
         self._children = {}
+        # Read by ``RowContext.__init__`` (``_parent_of_id.get(item.id)``)
+        # to populate ``ctx.parent_id``.
+        self._parent_of_id = parent_of_id or {}
 
 
 class _AutoPaneCache(dict):
@@ -1350,10 +1682,21 @@ class _MockBrowser:
         self.show_preview = True
         self.show_children_pane = False
         self.list_ratio = 0.30
-        self.format_item = None
         self.split = 'h'
+        # Row-format hooks, resolved as ``Browser.__init__`` does (design
+        # sec A): unset → framework default; ``format_row`` → whole-row
+        # override bound directly. Callers override via kwargs
+        # (``format_row=…`` / ``format_row_content=…``) after construction.
+        self.format_row_chrome = default_row_chrome
+        self.format_row_content = default_row_content
+        self._row_segments = self._compose_row
         for k, v in kwargs.items():
             setattr(self, k, v)
+
+    def _compose_row(self, item, ctx):
+        chrome = self.format_row_chrome(item, ctx)
+        ctx._set_content_width(_segments_cells(chrome))
+        return chrome + self.format_row_content(item, ctx)
 
 
 class TestRenderListRectClipping(unittest.TestCase):
@@ -1464,6 +1807,85 @@ class TestRenderListRectClipping(unittest.TestCase):
         browser = self._make_browser_with_items(items)
         _render.render_list(browser, None)
         self.assertEqual(self.cap.events, [])
+
+    # --- Stage 2: pending row + cursor/search over a columned row --------
+
+    def _entry(self, item, depth=0, kind='normal'):
+        class _Entry:
+            pass
+        e = _Entry()
+        e.item, e.depth, e.kind = item, depth, kind
+        return e
+
+    def test_pending_row_renders_loading_glyph_no_markers(self):
+        # The pending branch moved into render_list (out of the segment
+        # builder). It writes indent + a dim '⧗ loading…' glyph, with no
+        # selection / expand markers — byte-for-byte the pre-change shape.
+        item = Item(id='__pending__', title='⧗ loading…')
+        visible = [self._entry(item, depth=1, kind='pending')]
+        state = _MockState(visible)
+        _render.visible_items = lambda s: state._visible
+        browser = _MockBrowser(state)
+        rect = Rect(left=1, top=1, right=40, bottom=2)
+        _reconcile(browser, 'list', rect)
+        _render.render_list(browser, rect)
+        joined = ''.join(self.cap.flat)
+        self.assertIn('⧗ loading', joined)
+        self.assertNotIn('* ', joined)
+        self.assertNotIn('▶', joined)
+        self.assertNotIn('▼', joined)
+        # Indent: two leading spaces for depth 1, then the glyph.
+        self.assertTrue(joined.startswith('  ⧗'), repr(joined[:8]))
+
+    def test_cursor_row_over_columned_content_collapses_and_pads(self):
+        # A format_row_content override emits a padded column; the cursor
+        # path collapses segments to text and pads to width — the padding
+        # baked into the segment text must survive intact.
+        def content(item, ctx):
+            # 10-cell left-justified column + title.
+            return [('col1      ', None, False), (item.title, None, False)]
+
+        item = Item(id='a', title='Name')
+        visible = [self._entry(item)]
+        state = _MockState(visible, cursor=0)
+        _render.visible_items = lambda s: state._visible
+        browser = _MockBrowser(state, format_row_content=content)
+        rect = Rect(left=1, top=1, right=41, bottom=2)   # width 40
+        _reconcile(browser, 'list', rect)
+        _render.render_list(browser, rect)
+        joined = ''.join(self.cap.flat)
+        # Chrome ('  ' + '' + '  ') + 'col1      ' + 'Name' all present, in
+        # order, padded out to the 40-cell width.
+        self.assertIn('col1      Name', joined)
+        # Cursor row is reverse-video: a set_style with reverse=True fired.
+        self.assertTrue(
+            any(e[0] == 'set_style' and e[1].get('reverse')
+                for e in self.cap.events),
+            'cursor row must paint reverse-video',
+        )
+
+    def test_search_highlight_over_columned_content(self):
+        # With an active query that matches, a non-cursor columned row goes
+        # through the highlight path (collapse-to-text). The column padding
+        # survives the collapse — the matched text is still in the stream.
+        def content(item, ctx):
+            return [('PERMS  ', None, False), (item.title, None, False)]
+
+        item = Item(id='a', title='findme')
+        visible = [self._entry(item)]
+        state = _MockState(visible, cursor=5)   # cursor elsewhere (off-list)
+        _render.visible_items = lambda s: state._visible
+        browser = _MockBrowser(state, format_row_content=content,
+                               _search_query='findme')
+        # Make the search predicate match this row.
+        _render._search_matches = lambda text, q: q in text
+        _render._search_text = lambda item, **kw: item.title
+        rect = Rect(left=1, top=1, right=41, bottom=2)
+        _reconcile(browser, 'list', rect)
+        _render.render_list(browser, rect)
+        joined = ''.join(self.cap.flat)
+        self.assertIn('PERMS', joined)
+        self.assertIn('findme', joined)
 
 
 class TestRenderChildrenList(unittest.TestCase):

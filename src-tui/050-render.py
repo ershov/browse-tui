@@ -9,10 +9,15 @@ Renderer layout:
     the info bar at the bottom row. ``show_children_pane=False`` (or
     a cursor on a leaf, or no cached children) hides the children grid
     entirely; the preview pane then takes that space.
-  * Item rows are built as a list of ``(text, fg, bold)`` segments by
-    ``format_item_segments``. Recipes can override the whole row layout
-    by supplying a ``format_item=lambda item, ctx: …`` hook on Browser
-    (the renderer passes through the hook's return value verbatim).
+  * Item rows are built as a list of ``(text, fg, bold)`` segments via
+    ``browser._row_segments(item, ctx)`` (resolved once in
+    ``Browser.__init__``). Recipes override layout with the row-format
+    hooks (design sec A): ``format_row`` (whole row), ``format_row_chrome``
+    (selection marker + indent + expander), or ``format_row_content`` (the
+    content region) — the framework defaults (``default_row_chrome`` /
+    ``default_row_content`` / ``default_row``, in 040-state) fill any unset
+    hook. ``render_list`` builds a :class:`RowContext` per row and makes
+    one resolved call — no hook is ``None`` at runtime.
   * Tag styling: ``Item.tag_style`` is a string that maps via
     ``_TAG_STYLE`` to a (fg, bold) pair. The eight named styles in the
     spec (green/red/yellow/gray/cyan/blue/magenta/dim) plus ``''`` (no
@@ -173,102 +178,85 @@ def _id_visible(item, show_ids):
     return str(item.id) != item.title
 
 
-def format_item_segments(item, *, depth=0, base_depth=0, expanded=False,
-                         selected=False, kind='normal', search_query='',
-                         format_item=None, ctx=None, show_ids='auto',
-                         is_current_scope=False):
-    """Compute the (text, fg, bold) segment list for one row.
+class RowContext:
+    """Per-row geometry + tree state handed to the row-format hooks.
 
-    Returns a list of ``(text, fg, bold)`` triples. When the user-supplied
-    ``format_item`` hook is non-None, it's called with ``(item, ctx)`` and
-    its return value is used verbatim — the default segment layout below
-    is bypassed entirely. This is the override point recipes use to
-    surface domain-specific rows (file size, mtime, … see browse-fs).
+    Distinct from the action :class:`Context` (060-context.py): that one is
+    built once per dispatched action and carries cursor/targets/confirm;
+    this one is built per painted row (``height`` per frame) and carries
+    per-row state. Conflating them would mutate per-row state onto a
+    shared, longer-lived object.
 
-    Default layout for ``kind='normal'``:
-      - selection marker: ``'* '`` if ``selected``, else ``'  '``
-      - indentation:      ``2 * (depth - base_depth)`` spaces
-      - expand marker:    ``'▼ '`` if ``expanded``,
-                          ``'▶ '`` if ``item.has_children`` else ``'  '``
-      - id segment:       ``'{id} '`` in yellow (gated on ``show_ids``;
-                          ``'auto'`` suppresses it when ``str(id) == title``)
-      - tag segment:      ``'[{tag}] '`` styled per ``_TAG_STYLE`` (omitted
-                          when ``item.tag`` is empty)
-      - title segment:    ``item.title``, OR ``item.scope_title`` when
-                          ``is_current_scope`` is True and the item has
-                          ``scope_title`` set (the "no parent context
-                          above me" label override; see scope-root
-                          unification design)
-      - chip segments:    one ``' [{text}]'`` per ``(text, style)`` in
-                          ``item.chips`` (when set), each styled per
-                          ``_TAG_STYLE`` like the tag segment. Lets a row
-                          carry several colored labels after the title.
+    Per-row state (read-only):
+      * ``depth``            — tree depth of the row (absolute).
+      * ``selected``         — ``bool``: row is in ``state.selected``.
+      * ``expanded``         — ``bool``: row is in ``state.expanded``.
+      * ``is_current_scope`` — ``bool``: this item *is* the current scope.
+      * ``kind``             — ``VisibleEntry.kind`` (``'normal'`` for hook
+                               rows).
+      * ``parent_id``        — ``state._parent_of_id.get(item.id)``.
 
-    Default layout for ``kind='pending'``:
-      - indentation only, then a single dim ``'⧗ loading…'`` segment.
-        No selection marker, no expand marker — placeholder rows are
-        synthetic and don't participate in selection/expansion.
+    Dimensions (refreshed every paint, modelled on ``preview_width``):
+      * ``list_width``    — content width of the list pane in cells
+                            (``rect.width``).
+      * ``content_width`` — cells left for the content hook after the
+                            chrome on *this* row. Starts equal to
+                            ``list_width``; ``_compose_row`` /
+                            :func:`default_row` lower it via
+                            ``_set_content_width`` once the chrome is
+                            measured. Under a whole-row ``format_row``
+                            override it stays equal to ``list_width`` (the
+                            chrome split is unknown).
 
-    ``search_query`` is accepted for forward-compatibility with phase-2
-    ticket #22; phase 1 ignores it (highlighting is applied later by
-    the renderer, not by this segment builder).
+    Both dimensions are ``0`` before the first paint / in headless tests
+    (the ``list_width`` passed in is ``0``), matching the ``preview_width``
+    contract; recipes wanting a fallback pick one explicitly.
+
+    ``max_col_width`` (cached per-parent column measurement) lands in
+    Stage 3 — it is intentionally absent here.
     """
-    if format_item is not None:
-        # User override wins entirely. We don't validate the shape —
-        # if the hook returns something the writer can't handle, that
-        # surfaces as a clearer error in the writer.
-        return format_item(item, ctx)
 
-    rel_depth = depth - base_depth
-    if rel_depth < 0:
-        rel_depth = 0
-    indent = '  ' * rel_depth
+    __slots__ = (
+        'depth', 'selected', 'expanded', 'is_current_scope', 'kind',
+        'parent_id', 'list_width', 'content_width', '_browser',
+    )
 
-    if kind == 'pending':
-        # Placeholder rows: indent + dim glyph. Title carries the
-        # ⧗ loading… text from ``_make_pending_placeholder`` in 040-state.
-        return [
-            (indent, None, False),
-            (item.title, _PENDING_FG, False),
-        ]
+    def __init__(self, browser, item, *, depth, selected, expanded,
+                 is_current_scope, kind, list_width):
+        self._browser = browser
+        self.depth = depth
+        self.selected = selected
+        self.expanded = expanded
+        self.is_current_scope = is_current_scope
+        self.kind = kind
+        self.parent_id = browser._state._parent_of_id.get(item.id)
+        self.list_width = list_width
+        # content_width starts at the full pane width; the chrome→content
+        # composer lowers it once the chrome is measured. A whole-row
+        # override never calls _set_content_width, so it stays = list_width.
+        self.content_width = list_width
 
-    # ----- normal kind ------------------------------------------------
-    sel_marker = '* ' if selected else '  '
+    def _set_content_width(self, chrome_cells):
+        """Set ``content_width`` to ``list_width − chrome_cells``.
 
-    if item.has_children:
-        expand_marker = '▼ ' if expanded else '▶ '   # ▼ / ▶
-    else:
-        expand_marker = '  '
+        Called by the default composer (``Browser._compose_row`` /
+        :func:`default_row`) between building the chrome and running the
+        content hook, so the content hook sees the cells left after the
+        chrome on this row. Clamped at 0 so a chrome wider than the pane
+        never yields a negative width.
+        """
+        remaining = self.list_width - chrome_cells
+        self.content_width = remaining if remaining > 0 else 0
 
-    # The scope row gets its id + title segments bolded so it stands
-    # apart from the listing below — the "you are here" indicator. The
-    # selection / expand markers stay non-bold (they're chrome, not
-    # content). The tag segment keeps its tag_style-driven bold so
-    # explicit tag styles still control their own weight.
-    segments = [
-        (sel_marker, None, False),
-        (indent, None, False),
-        (expand_marker, _MARKER_COLOR, False),
-    ]
-    if _id_visible(item, show_ids):
-        segments.append(('{} '.format(item.id), _ID_COLOR, is_current_scope))
+    @property
+    def browser(self):
+        """The underlying :class:`Browser` (advanced; unstable surface).
 
-    if item.tag:
-        sfg, sbold = _TAG_STYLE.get(item.tag_style, _TAG_STYLE[''])
-        segments.append(('[{}] '.format(item.tag), sfg, sbold))
-
-    scope_title = getattr(item, 'scope_title', None)
-    title_text = scope_title if (is_current_scope and scope_title) else item.title
-    segments.append((title_text, None, is_current_scope))
-
-    # Trailing colored chips: one ``[{text}] `` segment per (text, style)
-    # in ``item.chips``, styled through ``_TAG_STYLE`` like the tag chip.
-    # Color rides the segment ``fg`` (never embedded in text) so width
-    # math stays correct.
-    for text, style in getattr(item, 'chips', None) or ():
-        cfg, cbold = _TAG_STYLE.get(style, _TAG_STYLE[''])
-        segments.append((' [{}]'.format(text), cfg, cbold))
-    return segments
+        Mirrors :attr:`Context.browser` — for capabilities not yet
+        promoted onto ``RowContext``. The default content hook reads
+        ``ctx.browser.show_ids`` through it.
+        """
+        return self._browser
 
 
 class Rect:
@@ -1505,18 +1493,32 @@ def render_list(browser, rect, *, rightmost: bool = False):
             end_row()
             continue
 
-        segments = format_item_segments(
-            item,
-            depth=entry.depth,
-            expanded=item.id in state.expanded,
-            selected=is_selected,
-            kind=entry.kind,
-            search_query=browser._search_query,
-            format_item=browser.format_item,
-            ctx=None,
-            show_ids=browser.show_ids,
-            is_current_scope=(item.id == current_scope_id),
-        )
+        # Pending placeholder — indent + a single dim ``⧗ loading…`` glyph.
+        # No selection / expand markers (the row is synthetic and doesn't
+        # participate in selection / expansion). The three-hook split
+        # applies to ``normal`` rows only, so this keeps its own early
+        # path (moved here verbatim from the old ``format_item_segments``).
+        if entry.kind == 'pending':
+            indent = '  ' * (entry.depth if entry.depth > 0 else 0)
+            segments = [
+                (indent, None, False),
+                (item.title, _PENDING_FG, False),
+            ]
+        else:
+            # Normal row: build a per-row RowContext and make one resolved
+            # call. ``browser._row_segments`` is the configured ``format_row``
+            # override or the default chrome+content composer — no hook is
+            # ``None`` here (they were bound once in ``Browser.__init__``).
+            ctx = RowContext(
+                browser, item,
+                depth=entry.depth,
+                selected=is_selected,
+                expanded=item.id in state.expanded,
+                is_current_scope=(item.id == current_scope_id),
+                kind=entry.kind,
+                list_width=width,
+            )
+            segments = browser._row_segments(item, ctx)
 
         if is_cursor_line:
             # Reverse video for the cursor line — collapse segments to a

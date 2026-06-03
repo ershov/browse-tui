@@ -32,6 +32,11 @@ Pending = _state.Pending
 State = _state.State
 Item = _data.Item
 Context = _context.Context
+# Default row-format handlers (design sec A) — tests assert the hooks bind
+# to these in ``Browser.__init__`` when left unset.
+default_row_chrome = _state.default_row_chrome
+default_row_content = _state.default_row_content
+default_row = _state.default_row
 
 
 def make_browser(**kw):
