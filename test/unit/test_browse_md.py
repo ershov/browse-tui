@@ -2208,14 +2208,15 @@ class TestArgvErrors(unittest.TestCase):
 
 
 class TestMissingDependencyGate(unittest.TestCase):
-    """``main()`` fails fast when ``md2ansi_lib`` couldn't be imported.
+    """``main()`` fails fast when a hard dependency couldn't be imported.
 
-    ``_parse`` derives the whole tree from ``md2ansi_scan``, so the
-    library is a hard dependency. ``main()`` checks ``_md2ansi_scan``
-    before any parsing and exits 2 via ``_die`` when it is ``None`` —
-    simulating an environment where the import failed. The stub
-    ``browse_tui`` is already installed by the loader, and the gate
-    fires before the Browser is ever constructed.
+    The tree is built by ``md_doc.build_doc_tree``, which in turn derives
+    structure from ``md2ansi_scan`` — so both ``md2ansi_lib`` and
+    ``md_doc`` are hard dependencies. ``main()`` checks ``_md2ansi_scan``
+    and then ``md_doc`` before any parsing and exits 2 via ``_die`` when
+    either is ``None`` — simulating an environment where the import
+    failed. The stub ``browse_tui`` is already installed by the loader,
+    and the gate fires before the Browser is ever constructed.
     """
 
     def setUp(self):
@@ -2225,28 +2226,54 @@ class TestMissingDependencyGate(unittest.TestCase):
     def tearDown(self):
         self.r.sys.argv[:] = self._saved_argv
 
-    def test_missing_scanner_exits_two_with_message(self):
-        import contextlib
-        import io
-        import os
+    def _real_md_file(self):
+        """Write a throwaway ``.md`` so the gate (not argv checks) fires."""
         import tempfile
-        # A real .md file so the gate is exercised, not the argv checks
-        # (the gate runs first regardless, but a valid file ensures the
-        # only reason main() can exit is the missing-dependency gate).
         with tempfile.NamedTemporaryFile(
                 'w', suffix='.md', delete=False, encoding='utf-8') as tmp:
             tmp.write('# H1\n')
-            tmp_path = tmp.name
+            return tmp.name
+
+    def _run_main_capture(self, tmp_path):
+        """Drive ``main()`` on ``tmp_path``; return ``(exit_code, stderr)``."""
+        import contextlib
+        import io
+        self.r.sys.argv[:] = ['browse-md', tmp_path]
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            with self.assertRaises(SystemExit) as cm:
+                self.r.main()
+        return cm.exception.code, buf.getvalue()
+
+    def test_missing_scanner_exits_two_with_message(self):
+        import os
+        # A real .md file so the gate is exercised, not the argv checks
+        # (the gate runs first regardless, but a valid file ensures the
+        # only reason main() can exit is the missing-dependency gate).
+        tmp_path = self._real_md_file()
         try:
             self.r._md2ansi_scan = None
-            self.r.sys.argv[:] = ['browse-md', tmp_path]
-            buf = io.StringIO()
-            with contextlib.redirect_stderr(buf):
-                with self.assertRaises(SystemExit) as cm:
-                    self.r.main()
-            self.assertEqual(cm.exception.code, 2)
-            err = buf.getvalue()
+            code, err = self._run_main_capture(tmp_path)
+            self.assertEqual(code, 2)
             self.assertIn('requires the md2ansi_lib module', err)
+            # ``_die`` prefixes the recipe name.
+            self.assertIn('browse-md:', err)
+            # ``with_usage=False`` — the usage line is NOT printed.
+            self.assertNotIn(self.r._USAGE, err)
+        finally:
+            os.unlink(tmp_path)
+
+    def test_missing_md_doc_exits_two_with_message(self):
+        import os
+        # Mirror the scanner gate for the ``md_doc`` hard dependency.
+        # Leave ``_md2ansi_scan`` intact so the FIRST gate passes and we
+        # exercise the ``md_doc is None`` branch specifically.
+        tmp_path = self._real_md_file()
+        try:
+            self.r.md_doc = None
+            code, err = self._run_main_capture(tmp_path)
+            self.assertEqual(code, 2)
+            self.assertIn('requires the md_doc module', err)
             # ``_die`` prefixes the recipe name.
             self.assertIn('browse-md:', err)
             # ``with_usage=False`` — the usage line is NOT printed.
