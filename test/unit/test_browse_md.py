@@ -3795,6 +3795,30 @@ class TestMdRefFollowing(unittest.TestCase):
         self.assertEqual([(c.tag, c.title) for c in self.r.get_children(k1.id)],
                          [('h2', 'K1a'), ('h2', 'K1b')])
 
+    # --- markdown-link references (ticket #698) ---------------------------
+
+    def test_markdown_link_ref_surfaces_as_md_child(self):
+        # Regression for #698: a file that references an EXISTING ``.md`` via a
+        # standard markdown LINK ``[label](other.md)`` (the COMMON case) must
+        # surface that file as an expandable ``[md]`` child of the file root.
+        # Before the fix the link delimiters polluted the captured token
+        # (``[B.md](B.md``), resolution returned None, and the ref was silently
+        # dropped — leaving the file with no ``[md]`` child at all.
+        import os
+        L = os.path.join(self.dir, 'L.md')
+        self._write(L, 'Prose that links to [the B doc](B.md) for details.\n')
+        self.r._INPUT_FILES = [(L, '')]
+        self.r._ROOT_PATH = L
+        self.r.md_doc.clear_cache()
+        self.r._reparse()
+        root = self.r._FILES[L].file_root
+        self.assertTrue(root.has_children)
+        md_kids = self._md_children(self.r.get_children(L))
+        # The link target B.md resolves and appears exactly once as a [md] child
+        # (the label + target both capture 'B.md', deduped by abspath).
+        self.assertEqual([k.title for k in md_kids], ['B.md'])
+        self.assertTrue(getattr(md_kids[0], 'boundary', False))
+
 
 if __name__ == '__main__':
     unittest.main()

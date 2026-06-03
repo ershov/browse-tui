@@ -339,22 +339,31 @@ def node_at_line(tree, line_offset):
 # ### Section: Reference detection & resolution ############################
 
 # Captures a ``.md`` reference token. The body excludes whitespace and the
-# four chars most likely to be noise around a path rather than part of it:
-# ``"`` and ``\`` (JSON string quotes / escapes), ``$`` (shell variables), and
-# ``*`` (globs). So a path embedded in a raw JSONL line, a shell command, or
-# prose all match cleanly while ``"foo.md"`` captures ``foo.md`` (not the
-# quote) and ``$X/y.md`` stops at the ``$``. Case: both ``.md`` and ``.MD``.
+# chars most likely to be noise around a path rather than part of it:
+# ``"`` and ``\`` (JSON string quotes / escapes), ``$`` (shell variables),
+# ``*`` (globs), the inline-code backtick, and the markdown link / autolink /
+# wiki-link delimiters ``( ) [ ] < >``. So a path embedded in a raw JSONL line,
+# a shell command, or prose all match cleanly while ``"foo.md"`` captures
+# ``foo.md`` (not the quote), ``$X/y.md`` stops at the ``$``, and the markdown
+# link ``[docs/cli.md](docs/cli.md)`` yields ``docs/cli.md`` twice (label +
+# target) instead of the unresolvable blob ``[docs/cli.md](docs/cli.md``.
+# Likewise ``<docs/api.md>`` -> ``docs/api.md``, `` `report.md` `` ->
+# ``report.md``, ``[x]: docs/ref.md`` -> ``docs/ref.md``, and
+# ``[[docs/wiki.md]]`` -> ``docs/wiki.md``. Case: both ``.md`` and ``.MD``.
+# Trade-off: a filename literally containing ``( ) [ ] < >`` or a backtick is
+# no longer captured — that is exceedingly rare, and surfacing the COMMON
+# markdown-link form is far more valuable.
 #
-# The leading ``(?<![^\s"\\$*])`` is a negative lookbehind asserting the
-# previous char is one of the excluded separators (whitespace / ``"`` / ``\`` /
-# ``$`` / ``*``) OR the start of the string — i.e. the token begins at the
-# first non-separator char, INCLUDING a leading ``/`` or ``~``. A plain ``\b``
-# would not: a word boundary anchors on the first *word* char, silently
-# dropping a leading ``/`` (``/abs/x.md`` -> ``abs/x.md``) or ``~``
-# (``~/n.md`` -> ``n.md``), which made ``resolve_md_ref``'s absolute/``~``
-# branch unreachable. The trailing ``\b`` is kept so ``.mdx`` and a trailing
-# ``.`` are still excluded.
-_MD_REF_RE = re.compile(r'(?<![^\s"\\$*])[^\s"\\$*]+\.(?:md|MD)\b')
+# The leading ``(?<![^\s"`\\$*()\[\]<>])`` is a negative lookbehind asserting
+# the previous char is one of the excluded separators (whitespace / ``"`` /
+# backtick / ``\`` / ``$`` / ``*`` / ``( ) [ ] < >``) OR the start of the
+# string — i.e. the token begins at the first non-separator char, INCLUDING a
+# leading ``/`` or ``~``. A plain ``\b`` would not: a word boundary anchors on
+# the first *word* char, silently dropping a leading ``/`` (``/abs/x.md`` ->
+# ``abs/x.md``) or ``~`` (``~/n.md`` -> ``n.md``), which made
+# ``resolve_md_ref``'s absolute/``~`` branch unreachable. The trailing ``\b``
+# is kept so ``.mdx`` and a trailing ``.`` are still excluded.
+_MD_REF_RE = re.compile(r'(?<![^\s"`\\$*()\[\]<>])[^\s"`\\$*()\[\]<>]+\.(?:md|MD)\b')
 
 # Cheap heading-detection gate: a ``#`` at the start of a line (after optional
 # indent). Pure regex — NO ``md2ansi_scan`` — so it is fast enough to run on

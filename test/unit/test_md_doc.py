@@ -296,6 +296,40 @@ class TestTriggersAndRefs(unittest.TestCase):
         # A '*' is excluded; a bare glob yields no capture.
         self.assertEqual(md_doc.find_md_refs('docs/*.md'), [])
 
+    def test_refs_markdown_inline_link(self):
+        # The COMMON case: a markdown inline link surfaces the path, not the
+        # unresolvable blob '[docs/cli.md](docs/cli.md'. The '[', ']', '(' and
+        # ')' delimiters are all stripped, so both the label and the target are
+        # captured as clean tokens. Downstream dedup-by-resolved-abspath
+        # collapses the pair to one file; at the find_md_refs level both appear.
+        self.assertEqual(
+            md_doc.find_md_refs('[docs/cli.md](docs/cli.md)'),
+            ['docs/cli.md', 'docs/cli.md'])
+
+    def test_refs_autolink(self):
+        # An autolink '<path>' captures the path without the angle brackets.
+        self.assertEqual(md_doc.find_md_refs('<docs/api.md>'), ['docs/api.md'])
+
+    def test_refs_inline_code(self):
+        # An inline-code span captures the path without the backticks.
+        self.assertEqual(md_doc.find_md_refs('`report.md`'), ['report.md'])
+
+    def test_refs_reference_definition(self):
+        # A link reference definition '[x]: path' captures only the target.
+        self.assertEqual(
+            md_doc.find_md_refs('[x]: docs/ref.md'), ['docs/ref.md'])
+
+    def test_refs_wiki_link(self):
+        # A wiki-style '[[path]]' captures the path without the doubled
+        # brackets.
+        self.assertEqual(
+            md_doc.find_md_refs('[[docs/wiki.md]]'), ['docs/wiki.md'])
+
+    def test_refs_bare_relative_unchanged_by_link_exclusions(self):
+        # A bare relative path with no link/code wrapper is captured exactly —
+        # the new ( ) [ ] < > backtick exclusions don't regress it.
+        self.assertEqual(md_doc.find_md_refs('docs/p.md'), ['docs/p.md'])
+
     def test_refs_capture_absolute_path(self):
         # An absolute path keeps its leading '/' — the lookbehind anchors the
         # token at the first non-separator char, not the first word char (a
