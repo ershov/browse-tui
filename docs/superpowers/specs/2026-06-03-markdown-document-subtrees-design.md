@@ -36,9 +36,10 @@ heading tree, recursively.
    whose children are its nested headings (h1 > h2 > …). This mirrors
    `browse-md`'s per-file model.
 3. References are followed **recursively**: a referenced file may itself
-   reference further `.md` files, with no depth cap (recursion is bounded
-   by cycle-stopping and by the fact that subtrees only materialise as
-   the user drills in).
+   reference further `.md` files, with no depth cap and no cycle
+   detection — under lazy materialisation a subtree only deepens as far
+   as the user manually drills in, so a self-referential chain never
+   expands on its own.
 4. A new framework `Item.boundary` flag marks self-contained foreign
    subtrees (referenced files, subagent transcripts, bare sessions) so
    recursive expansion stops at them and their descendants never fold
@@ -53,11 +54,13 @@ heading tree, recursively.
 
 ## Non-goals
 
-- **No alias / dedup of repeated files.** If the same file is reachable
-  via two branches, each copy expands independently. We only **stop
-  cycles** (a ref whose abspath is already an ancestor renders as a
-  non-expandable leaf). A process-wide `abspath → parsed-tree` cache
-  keeps duplicates from re-reading/re-parsing.
+- **No alias / dedup of repeated files, and no cycle detection.** If the
+  same file is reachable via two branches — or a file references one of
+  its own ancestors — each occurrence simply expands in place. Lazy
+  materialisation makes this safe: a subtree only deepens as the user
+  drills in, so nothing expands infinitely on its own. A process-wide
+  `abspath → parsed-tree` cache keeps repeated files from
+  re-reading/re-parsing.
 - **No directory tree.** Referenced files are a flat list with relative
   labels — we do not synthesise folder nodes (it breaks down across
   multiple roots).
@@ -85,7 +88,9 @@ Three pieces:
      `line_offset`, `byte_offset`, `byte_size`, and `children`. This is
      `browse-md`'s current `_build_nodes` generalised and lifted out.
    - `find_md_refs(text)` → ordered list of captured `.md` reference
-     strings (regex `\b\S+\.(?:md|MD)\b`).
+     strings (regex `\b[^\s"\\$*]+\.(?:md|MD)\b` — excludes whitespace
+     and `"`/`\`/`$`/`*` so JSON quotes/escapes, shell vars, and globs
+     don't pollute a match).
    - `resolve_md_ref(captured, *, doc_dir, cwd, project_root)` →
      absolute path or `None` (multi-base discovery, see below).
    - Id codec: `compose_md_id(base, abspaths, line_offset=None)` and
@@ -115,11 +120,12 @@ Two levels with a deliberate asymmetry:
 
 - **Message (level 0)** is the container. Its children are its inline
   `markdown` document node (headings only) **plus** one node per `.md`
-  file referenced *anywhere in the record* — the ref scan runs over the
-  whole record (`json.dumps(rec)`) so it catches `Write`/`Read`/`Edit`
-  tool paths, not just prose. So a ref that appears in the inline text
-  surfaces as a message-level sibling of the `markdown` node, not under
-  it; the `markdown` node stays a pure heading index of the inline text.
+  file referenced *anywhere in the record* — the ref scan covers the
+  whole record's string content (see Detection for the cheap traversal),
+  so it catches `Write`/`Read`/`Edit` tool paths, not just prose. A ref
+  that appears in the inline text therefore surfaces as a message-level
+  sibling of the `markdown` node, not under it; the `markdown` node stays
+  a pure heading index of the inline text.
 - **A referenced-file document** has children = its top-level headings
   **plus** one node per `.md` file referenced *in that file's own text*.
 
@@ -155,9 +161,9 @@ nested file heading<base>#md:<enc1>#md:<enc2>#<lineoffset>
 
 where
 - `<base>` = the untouched message id `<session_path>#<n>`,
-- `<enc>` = `urllib.parse.quote('file://' + abspath, safe='').replace('~', '%7E')`
-  (a referenced file; `~` is encoded explicitly because `quote` leaves
-  it unescaped),
+- `<enc>` = `urllib.parse.quote('file://' + abspath, safe='')` (a
+  referenced file; `safe=''` percent-encodes every delimiter that
+  matters — notably `#`→`%23` — so a segment never contains a raw `#`),
 - empty segment (`#md:` with nothing after) = the inline content of
   `<base>`,
 - `<lineoffset>` = decimal digits, a heading's 0-based line within the
@@ -171,12 +177,9 @@ yields the encoded segments; encoded segments contain no raw `#`
 only be the line offset — which is why a numeric `#<lineoffset>` suffix
 is safe and consistent with the existing numeric `#<n>` message suffix.
 `file://` is cosmetic-but-consistent flavour; resolution decodes the
-segment back to the abspath directly — **no lookup map is needed**, and
-cycle detection is a plain abspath comparison across the decoded chain.
-
-Files referenced anywhere in a document are children of that document
-node, so the abspath chain in the id is exactly the ancestor document
-chain — which the cycle check consults.
+last segment back to the abspath directly — **no lookup map is needed**.
+The encoded chain also makes dedup-within-a-document a plain abspath
+comparison.
 
 ## Detection (item-build) and lazy build (expand)
 
@@ -187,8 +190,16 @@ builder `_tree_item` (and the flat-mode builders), where the raw record
 - `md_doc.md_heading_trigger(text)` matches — regex `(?:^|\n)[ \t]*#`
   over the message's extracted markdown text (`_message_md_text(rec)`,
   the joined `text` parts plus any `tool_result` text), **or**
-- the `.md` reference regex matches `json.dumps(rec)` (the whole record,
-  so it catches `Write`/`Read`/`Edit` paths and prose alike).
+- the `.md` reference regex matches the record's own string content.
+  We do **not** serialise the record to JSON. At item delivery the
+  builder already holds the parsed `rec`, so the gate does a
+  short-circuiting depth-first walk over its string-valued leaves
+  (text, tool inputs, paths), stopping at the first `.md` hit — far
+  cheaper than `json.dumps(rec)`, and it still sees `Write`/`Read`/`Edit`
+  paths and prose alike. (When the raw JSONL source line is in hand —
+  e.g. during the expand build — regexing it directly is equivalent and
+  simpler; the improved regex excludes `"`/`\` so JSON escaping can't
+  leak into a match.)
 
 No `md2ansi_scan` and no `os.stat` at detection time — it is a pure
 regex gate. This can over-trigger (a `#` that lives only inside a fenced
@@ -199,13 +210,15 @@ code block; a `.md` token whose file does not exist), so it is
 builds the real subtree:
 
 - **message id `<base>`** → `[inline doc node if md2ansi_scan finds ≥1
-  heading]` + `[file doc node per existing ref in `json.dumps(rec)`,
-  deduped by abspath, sorted by label]`.
+  heading]` + `[file doc node per existing ref found in the record,
+  deduped by abspath, sorted by label]`. The record is read on demand
+  here, so the ref scan runs over its raw JSONL line / string leaves
+  (not `json.dumps`).
 - **inline document `<base>#md:`** → its top-level heading nodes only
   (its references already live at the message level above).
 - **file document `<base>#md:<segs>`** → `[top-level heading nodes]` +
-  `[file doc node per existing ref in *that file's text*]`, deduped and
-  sorted, applying cycle-stopping (below).
+  `[file doc node per existing ref in *that file's text*]`, deduped by
+  abspath and sorted by label.
 - **heading node `…#<lineoffset>`** → the sub-headings nested under that
   heading (no reference children).
 
@@ -223,16 +236,22 @@ foreign (`boundary=True`).
 ## Heading-tree building
 
 `md_doc.build_doc_tree` runs `md2ansi_scan(text, kinds={'heading'})`
-(adds `'list'` when `include_lists=True`), then applies `browse-md`'s
+(adds `'list'` only when `include_lists=True`), then applies `browse-md`'s
 existing logic — lifted verbatim and generalised — to compute
 `line_offset`, `byte_offset`, the boundary-rule `byte_size`, and the
-heading/list nesting. The result is a structural tree (no `Item`s). Each
-recipe maps nodes to `Item`s with its own id scheme, tag, and styling.
+nesting. The result is a structural tree (no `Item`s); each recipe maps
+nodes to `Item`s with its own id scheme, tag, and styling.
+
+**`browse-claude` never requests lists** — it always calls
+`build_doc_tree` headings-only. `include_lists=True` is used solely by
+`browse-md` (its `-l` flag); list support lives in the shared module only
+so `browse-md` can adopt it.
 
 ## Reference detection, resolution, labels
 
 - **Detection:** `find_md_refs(text)` returns captured strings matching
-  `\b\S+\.(?:md|MD)\b`, in document order.
+  `\b[^\s"\\$*]+\.(?:md|MD)\b` (excludes whitespace, `"`, `\`, `$`, `*`),
+  in document order.
 - **Resolution:** `resolve_md_ref(captured, *, doc_dir, cwd,
   project_root)` returns the first existing candidate, tried in order:
   1. absolute path, or `~`-prefixed → `expanduser`, used directly;
@@ -255,26 +274,27 @@ recipe maps nodes to `Item`s with its own id scheme, tag, and styling.
 `_decode_project_path` fix below), not from the lossy directory-name
 decode.
 
-## Recursion: expand-in-place + cycle-stopping + cache
+## Recursion: expand-in-place + cache
 
-References are followed to arbitrary depth, but:
+References are followed to arbitrary depth (no cap), with **no cycle or
+alias detection**:
 
-- **Cycle-stopping:** when building a document node's file children, a
-  ref whose resolved abspath already appears in that node's ancestor
-  chain (decode the `#md:` segments above it) is emitted as a
-  **non-expandable leaf** (`has_children=False`, a `(cycle)` chip) rather
-  than recursed into. This guarantees finiteness without a depth cap.
-- **Expand-in-place:** cross-branch duplicates (same file via two
-  non-ancestor branches) each expand independently — no canonical/alias
-  bookkeeping (explicit non-goal).
+- **Expand-in-place:** every reference — including one that points back
+  at an ancestor (a cycle) or duplicates a file reached via another
+  branch — simply expands in place as its own document node. There is no
+  canonical/alias bookkeeping (explicit non-goal).
+- **Why that's safe:** the tree is lazy — a node's children are built
+  only when the user expands it, never pre-cached. So a cyclic chain
+  (`a → b → a → …`) only deepens as far as the user manually drills; it
+  never expands on its own, and each level is a finite, distinct node id.
 - **Cache:** a process-wide `abspath → (text, doc_tree)` cache in
   `md_doc` means a file is read and scanned once regardless of how many
-  places reference it. Cleared on the recipes' reload (`Ctrl-R` /
-  `_bust_caches_for`).
+  places (or how many times along a cycle) reference it. Cleared on the
+  recipes' reload (`Ctrl-R` / `_bust_caches_for`).
 
-Because subtrees only materialise as the user drills in (children are
-built on expand, not pre-cached), recursive/multi-expansion does not
-explode either — and a `boundary` node halts it explicitly.
+A `boundary` node also halts recursive/multi-expansion explicitly, so
+even a deliberate "expand everything" stops at each referenced file
+rather than walking the reference graph.
 
 ## `boundary` — new framework Item flag
 
@@ -334,7 +354,6 @@ the node's own document — never a cross-item cascade.
   sharing the tag.
 - Heading nodes: `[h1]`…`[h6]` with the level→colour map (red, yellow,
   green, blue, magenta, gray), matching `browse-md`.
-- Cycle leaves carry a trailing `(cycle)` chip.
 
 ## Flat mode
 
@@ -400,11 +419,12 @@ needs.
 
 - **`md_doc` (isolated, no `browse_tui` stub):** `build_doc_tree`
   nesting + byte-range slicing on fixtures; heading/ref trigger regexes
-  (true/false: real heading, code-fence-only `#`, ref-only, none);
-  `resolve_md_ref` base-precedence + non-existent → `None`, dedup;
-  `compose_md_id`/`parse_md_id` round-trip incl. paths containing
-  `#`/`~`/`?`/spaces and the `#<lineoffset>` suffix; cycle detection on
-  a crafted chain; cache hit/`clear_cache`.
+  (true/false: real heading, code-fence-only `#`, ref-only, none; ref
+  regex excludes `"`/`\`/`$`/`*`); `resolve_md_ref` base-precedence +
+  non-existent → `None`, dedup; `compose_md_id`/`parse_md_id` round-trip
+  incl. paths containing `#`/`~`/`?`/spaces and the `#<lineoffset>`
+  suffix; a self-referential chain still expands (no cycle special-case);
+  cache hit/`clear_cache`.
 - **`browse-claude` (existing stub-import pattern in
   `test_browse_claude_render.py`):** detection sets `has_children`;
   `get_children` builds inline + file docs and headings; `get_preview`
@@ -425,8 +445,8 @@ needs.
 2. **`browse-claude` core:** detection + `#md:` ids + inline & file
    documents with headings (one or more levels), preview routing,
    resolution + labels, `boundary` migration, `_decode_project_path`
-   fix, self-heal. (Recursion falls out of the uniform model; cycle-stop
-   + cache included.)
+   fix, self-heal. (Recursion falls out of the uniform model; the
+   `md_doc` cache is included.)
 3. **`browse-md` adoption:** refactor onto `md_doc`; add
    reference-following.
 
