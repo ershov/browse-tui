@@ -1008,6 +1008,160 @@ class TestDecodeProjectPath(unittest.TestCase):
         self.assertEqual(self.r._decode_project_path('weird'), 'weird')
 
 
+class TestRealProjectPath(unittest.TestCase):
+    """``_real_project_path`` / ``_session_cwd_and_root`` (#659).
+
+    The accurate replacements for the lossy name-decode: derive the path
+    from a session's recorded ``cwd`` so a genuine hyphen survives, and
+    expose the ``(cwd, project_root)`` anchors the reference resolver
+    needs. State touched is HOME plus the byte-regex cwd cache; both are
+    saved/cleared in setUp/tearDown so the tests pass identically in
+    isolation and under full discover (no module-global pollution).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def setUp(self):
+        self._saved_home = os.environ.get('HOME')
+        os.environ['HOME'] = '/home/u'
+        # cwd scans are cached by (path, size, mtime); clearing keeps a
+        # stale tmp-path entry from a prior test out of our way.
+        self.r._SESSION_CWDS_CACHE.clear()
+
+    def tearDown(self):
+        self.r._SESSION_CWDS_CACHE.clear()
+        if self._saved_home is None:
+            os.environ.pop('HOME', None)
+        else:
+            os.environ['HOME'] = self._saved_home
+
+    def _write_session(self, project_dir, name, rec):
+        import json as _json
+        path = os.path.join(project_dir, name)
+        with open(path, 'w') as f:
+            f.write(_json.dumps(rec) + '\n')
+        return path
+
+    def test_real_hyphen_preserved_and_home_collapsed(self):
+        # A cwd with a *genuine* hyphen the lossy decode would mangle.
+        import tempfile
+        cwd = '/home/u/browse-tui'
+        with tempfile.TemporaryDirectory() as tmp:
+            enc = self.r._encode_project_path(cwd)   # -home-u-browse-tui
+            proj = os.path.join(tmp, enc)
+            os.makedirs(proj)
+            self._write_session(proj, 's1.jsonl', {'type': 'user', 'cwd': cwd})
+            # The lossy decoder mangles the hyphen; the real path keeps it.
+            self.assertEqual(self.r._decode_project_path(enc), '~/browse/tui')
+            self.assertEqual(self.r._real_project_path(proj), '~/browse-tui')
+
+    def test_prefers_encoding_match_over_extra_cwds(self):
+        # A worktree session records multiple cwds; we pin the one that
+        # round-trips back to this project dir, regardless of scan order.
+        import tempfile
+        cwd = '/home/u/proj-x'
+        other = '/home/u/proj-x/.worktrees/wt'
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, self.r._encode_project_path(cwd))
+            os.makedirs(proj)
+            # Two records, the non-canonical cwd first in the file.
+            import json as _json
+            path = os.path.join(proj, 's1.jsonl')
+            with open(path, 'w') as f:
+                f.write(_json.dumps({'cwd': other}) + '\n')
+                f.write(_json.dumps({'cwd': cwd}) + '\n')
+            self.assertEqual(self.r._real_project_cwd(proj), cwd)
+            self.assertEqual(self.r._real_project_path(proj), '~/proj-x')
+
+    def test_falls_back_to_lossy_decode_without_cwd(self):
+        # No readable cwd (empty dir / records without cwd) → lossy decode.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            enc = '-home-u-no-cwd-here'
+            proj = os.path.join(tmp, enc)
+            os.makedirs(proj)
+            # Empty project dir.
+            self.assertIsNone(self.r._real_project_cwd(proj))
+            self.assertEqual(
+                self.r._real_project_path(proj),
+                self.r._decode_project_path(enc),
+            )
+            # Same fallback when a session exists but carries no cwd field.
+            self._write_session(proj, 's1.jsonl', {'type': 'summary'})
+            self.assertIsNone(self.r._real_project_cwd(proj))
+            self.assertEqual(
+                self.r._real_project_path(proj),
+                self.r._decode_project_path(enc),
+            )
+
+    def test_find_git_root_returns_ancestor(self):
+        # A `.git` directory anywhere up the tree is the root.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = os.path.join(tmp, 'repo')
+            deep = os.path.join(repo, 'a', 'b', 'c')
+            os.makedirs(deep)
+            os.makedirs(os.path.join(repo, '.git'))
+            self.assertEqual(self.r._find_git_root(deep), repo)
+            # A `.git` *file* (worktree/submodule layout) counts too.
+            wt = os.path.join(tmp, 'wt')
+            os.makedirs(wt)
+            open(os.path.join(wt, '.git'), 'w').close()
+            self.assertEqual(self.r._find_git_root(wt), wt)
+
+    def test_find_git_root_none_when_absent(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            plain = os.path.join(tmp, 'plain', 'deep')
+            os.makedirs(plain)
+            self.assertIsNone(self.r._find_git_root(plain))
+            self.assertIsNone(self.r._find_git_root(''))
+
+    def test_session_cwd_and_root_uses_git_ancestor(self):
+        # cwd from the records; project_root = the `.git` ancestor.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = os.path.join(tmp, 'repo', 'sub-dir')
+            os.makedirs(cwd)
+            os.makedirs(os.path.join(tmp, 'repo', '.git'))
+            proj = os.path.join(tmp, self.r._encode_project_path(cwd))
+            os.makedirs(proj)
+            sess = self._write_session(proj, 's1.jsonl', {'cwd': cwd})
+            got_cwd, got_root = self.r._session_cwd_and_root(sess)
+            self.assertEqual(got_cwd, cwd)
+            self.assertEqual(got_root, os.path.join(tmp, 'repo'))
+
+    def test_session_cwd_and_root_falls_back_to_cwd(self):
+        # No `.git` above cwd → project_root is the cwd itself.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = os.path.join(tmp, 'plain-proj')
+            os.makedirs(cwd)
+            proj = os.path.join(tmp, self.r._encode_project_path(cwd))
+            os.makedirs(proj)
+            sess = self._write_session(proj, 's1.jsonl', {'cwd': cwd})
+            self.assertEqual(
+                self.r._session_cwd_and_root(sess), (cwd, cwd),
+            )
+
+    def test_session_cwd_and_root_no_cwd_returns_real_path(self):
+        # Unreadable cwd → (None, expanded lossy project dir), an absolute
+        # path the resolver can join against (no leftover ``~``).
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            enc = '-home-u-ghost'
+            proj = os.path.join(tmp, enc)
+            os.makedirs(proj)
+            sess = os.path.join(proj, 's1.jsonl')
+            open(sess, 'w').close()
+            got_cwd, got_root = self.r._session_cwd_and_root(sess)
+            self.assertIsNone(got_cwd)
+            self.assertEqual(got_root, '/home/u/ghost')
+            self.assertFalse(got_root.startswith('~'))
+
+
 class TestMessageOrder(unittest.TestCase):
     """``_list_messages`` returns rows in **chronological** order (#475) —
     matches tree-mode ordering so the t-toggle doesn't flip the

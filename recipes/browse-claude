@@ -518,7 +518,7 @@ def _list_projects():
             tag = f'{running}/{sessions} live · {_human_time(latest)}'
         item = Item(
             id=full,
-            title=_decode_project_path(name),
+            title=_real_project_path(full),
             tag=tag,
             tag_style=('green' if running else 'dim'),
             has_children=sessions > 0,
@@ -666,6 +666,110 @@ def _session_cwds(session_jsonl_path):
         cwds = set()
     _SESSION_CWDS_CACHE[key] = cwds
     return cwds
+
+
+def _collapse_home(path):
+    """Collapse a leading ``$HOME`` to ``~`` for display (else verbatim)."""
+    if not path:
+        return path
+    home = os.environ.get('HOME') or os.path.expanduser('~')
+    if home and path == home:
+        return '~'
+    if home and path.startswith(home + '/'):
+        return '~' + path[len(home):]
+    return path
+
+
+def _real_project_cwd(project_dir):
+    """The true cwd a Claude project directory was encoded from, or ``None``.
+
+    Reads the ``cwd`` recorded in the project's sessions (via the
+    ``_session_cwds`` byte-regex scan) rather than inverting the dir name —
+    ``_decode_project_path`` is lossy because it can't tell a real ``-``
+    from an encoded ``/``/``.``. We prefer a cwd that round-trips back to
+    this directory (``_encode_project_path(cwd) == basename``): that pins
+    the canonical cwd even for a worktree session whose records carry extra
+    dispatch cwds, and is order-independent. Lacking an exact match we
+    return any recorded cwd (sorted for determinism), and ``None`` only
+    when no session here carries a readable ``cwd`` (e.g. an empty dir).
+    """
+    try:
+        names = sorted(
+            n for n in os.listdir(project_dir) if n.endswith('.jsonl')
+        )
+    except OSError:
+        return None
+    base = os.path.basename(project_dir.rstrip('/'))
+    fallback = None
+    for name in names:
+        cwds = _session_cwds(os.path.join(project_dir, name))
+        for cwd in sorted(cwds):
+            if _encode_project_path(cwd) == base:
+                return cwd
+            if fallback is None:
+                fallback = cwd
+    return fallback
+
+
+def _real_project_path(project_dir):
+    """Display path for a project dir, hyphen-faithful, HOME→``~`` collapsed.
+
+    The accurate counterpart to ``_decode_project_path``: derives the path
+    from a session's recorded ``cwd`` (see ``_real_project_cwd``) so a real
+    hyphen in a directory name survives instead of being mangled into ``/``.
+    Falls back to the lossy name-decode only when no session here carries a
+    readable ``cwd`` (an empty project dir), so we always show *something*.
+    """
+    cwd = _real_project_cwd(project_dir)
+    if cwd:
+        return _collapse_home(cwd)
+    return _decode_project_path(os.path.basename(project_dir.rstrip('/')))
+
+
+def _find_git_root(start):
+    """Nearest ancestor of ``start`` (inclusive) holding a ``.git`` entry.
+
+    Walks parents until a ``.git`` directory **or file** is found (a file
+    is how git worktrees and submodules record their gitdir), stopping at
+    the filesystem root. Returns the containing directory, or ``None`` when
+    no ``.git`` is found along the way.
+    """
+    if not start:
+        return None
+    d = os.path.abspath(start)
+    while True:
+        if os.path.exists(os.path.join(d, '.git')):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def _session_cwd_and_root(session_jsonl_path):
+    """``(cwd, project_root)`` for a session — the resolver's path anchors.
+
+    ``cwd`` is the session's recorded working directory (its containing
+    project dir's ``_real_project_cwd``; ``None`` if unreadable).
+    ``project_root`` is the git root above ``cwd`` (nearest ``.git``
+    ancestor) when one exists, else the session's real project directory —
+    the actual filesystem path (not HOME-collapsed), so callers can
+    ``os.path.join`` against it. Both fall back gracefully: an unreadable
+    session yields ``(None, <lossy decoded project dir>)``.
+
+    Consumed by the markdown reference resolver to anchor relative ``.md``
+    references against the right roots.
+    """
+    project_dir = os.path.dirname(session_jsonl_path)
+    cwd = _real_project_cwd(project_dir)
+    if cwd:
+        root = _find_git_root(cwd) or cwd
+        return cwd, root
+    # No readable cwd (e.g. an empty project dir): best-effort root from the
+    # lossy dir-name decode, expanded to a real absolute path so callers can
+    # join against it.
+    decoded = _decode_project_path(os.path.basename(project_dir.rstrip('/')))
+    return None, os.path.expanduser(decoded)
 
 
 def _candidate_subagents_dirs(session_jsonl_path):
@@ -2684,7 +2788,7 @@ def _preview_project(path):
     except OSError as e:
         return f'[error] {e}'
     header = (
-        f'project: {_decode_project_path(os.path.basename(path))}\n'
+        f'project: {_real_project_path(path)}\n'
         f'path:    {path}\n'
         f'\n{len(names)} session(s):'
     )
