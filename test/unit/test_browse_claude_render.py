@@ -83,15 +83,33 @@ def _stub_browse_tui():
     sys.modules['browse_tui'] = mod
 
 
-def _load_recipe(force_color=True):
+def _load_recipe(force_color=True, *, with_md_doc=False):
     """Load (or reload) the recipe; returns the module.
 
     ``force_color`` controls whether ANSI constants are kept (True) or
     zeroed via ``NO_COLOR`` (False) — exercises both code paths.
+
+    ``with_md_doc`` controls markdown availability. The recipe derives
+    ``_MD_COLOR`` / ``_md_doc`` from whether ``md2ansi_lib`` / ``md_doc``
+    are importable at load time. Other test modules (e.g. ``test_md_doc``)
+    put ``recipes/`` on ``sys.path`` and import ``md2ansi_lib`` at
+    collection, leaving them in ``sys.modules`` — so a plain load would
+    pick up coloring non-deterministically by test order. The default
+    (``False``) loads with ``recipes/`` off ``sys.path`` and those modules
+    evicted, forcing the md-less baseline so the raw-markdown assertions
+    are order-independent; ``_load_recipe_with_md_doc`` passes ``True`` to
+    keep md2ansi / ``md_doc`` live for the colored-path tests.
     """
     _stub_browse_tui()
     saved_no_color = os.environ.get('NO_COLOR')
     saved_force_color = os.environ.get('FORCE_COLOR')
+    saved_md_path = saved_md_mods = None
+    if not with_md_doc:
+        _recipes_dir = str(_RECIPE.parent)
+        saved_md_path = list(sys.path)
+        sys.path[:] = [p for p in sys.path if p != _recipes_dir]
+        saved_md_mods = {m: sys.modules.pop(m, None)
+                         for m in ('md2ansi_lib', 'md_doc')}
     try:
         if force_color:
             os.environ['FORCE_COLOR'] = '1'
@@ -119,6 +137,11 @@ def _load_recipe(force_color=True):
             os.environ.pop('FORCE_COLOR', None)
         else:
             os.environ['FORCE_COLOR'] = saved_force_color
+        if not with_md_doc:
+            sys.path[:] = saved_md_path
+            for _m, _v in saved_md_mods.items():
+                if _v is not None:
+                    sys.modules[_m] = _v
 
 
 class TestClassify(unittest.TestCase):
@@ -6678,7 +6701,7 @@ class TestSendMessage(unittest.TestCase):
     # -- stripe / tag style registration -----------------------------------
 
     def test_agent_send_stripe_and_tag_style_registered(self):
-        self.assertEqual(self.r._ROW_BG_FOR_KIND.get('agent-send'), 22)
+        self.assertEqual(self.r._ROW_BG_FOR_KIND.get('agent-send'), 17)
         self.assertIn('agent-send', self.r._TAG_STYLE_FOR_KIND)
 
 
@@ -6784,10 +6807,10 @@ class TestTaskNotification(unittest.TestCase):
 
     # -- stripe / tag style registration -----------------------------------
 
-    def test_agent_reply_stripe_is_teal(self):
-        # The reply's stripe resolves to 23 (teal), NOT human's 235.
+    def test_agent_reply_stripe_matches_assistant(self):
+        # Inter-agent voice shares the assistant stripe (17), NOT human's 235.
         kind = self.r._kind_of(self._notify_rec())
-        self.assertEqual(self.r._ROW_BG_FOR_KIND.get(kind), 23)
+        self.assertEqual(self.r._ROW_BG_FOR_KIND.get(kind), 17)
         self.assertIn('agent-reply', self.r._TAG_STYLE_FOR_KIND)
 
     def test_human_user_stripe_still_235(self):
@@ -6848,7 +6871,7 @@ def _load_recipe_with_md_doc():
     saved_md_doc = sys.modules.get('md_doc')
     saved_md2ansi = sys.modules.get('md2ansi_lib')
     try:
-        return _load_recipe()
+        return _load_recipe(with_md_doc=True)
     finally:
         if added:
             try:
