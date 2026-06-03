@@ -46,7 +46,7 @@ Three such attributes are honoured by the list renderer when set:
 | ---------- | -------- | ------ |
 | `row_bg`   | int (256-color) | Background colour for the whole row (turns the row into a coloured stripe; extends across the trailing pad). |
 | `row_fg`   | int (256-color) | Foreground colour for segments that don't specify their own `fg`. Segments with explicit colours keep theirs. Useful for "dim the whole row" / "red row for failed status" effects. |
-| `chips`    | `list[(text, style)]` | Trailing coloured chips rendered after the title as ` [text]` segments, each coloured by `style` through the same `_TAG_STYLE` palette as `tag_style` (`'green'`, `'red'`, … or `''` for plain). Unlike a single `tag`, several chips can follow one title; the colour rides the segment foreground (never embedded in the text) so width math stays correct. Honoured only by the default formatter — a `format_item` override is responsible for its own chip layout. |
+| `chips`    | `list[(text, style)]` | Trailing coloured chips rendered after the title as ` [text]` segments, each coloured by `style` through the same palette as `tag_style` (`'green'`, `'red'`, … or `''` for plain — see `style(name)` below). Unlike a single `tag`, several chips can follow one title; the colour rides the segment foreground (never embedded in the text) so width math stays correct. Honoured only by the default content handler — a `format_row_content` / `format_row` override is responsible for its own chip layout. |
 
 Both default to `None` (no override). Set per-item with `item.row_bg = 1`
 / `item.row_fg = 8` after construction.
@@ -507,7 +507,9 @@ b = Browser(BrowserConfig(
     get_preview=None,                     # (item_id) -> str  (optional)
     actions=None,                         # list[Action]
     on_enter=None,                        # default Enter handler; see below
-    format_item=None,                     # advanced: per-item display override
+    format_row=None,                      # advanced: whole-row display override
+    format_row_chrome=None,               # advanced: selection marker + indent + expander
+    format_row_content=None,              # advanced: content region (id + tag + title + chips)
     root_id=None,
     initial_scope=None,
     show_preview=True,
@@ -534,8 +536,9 @@ Controls whether the per-row id segment is rendered in front of the title.
 | `'auto'`   | Default. Emit the id only when `str(item.id) != item.title`. The line-based CLI shape (`Item(id='README.md')`) renders as just `'README.md'`; tracker-style sources (`Item(id=42, title='Implement feature')`) render as `'42 Implement feature'`. |
 | `'never'`  | Never emit the id segment.                                             |
 
-A `format_item` hook overrides this entirely — the hook's segments are
-emitted verbatim.
+A `format_row` or `format_row_content` hook that doesn't emit the id segment
+overrides this entirely — a set hook's segments are emitted verbatim (the
+default content handler is the one that consults `show_ids`).
 
 ### Lifecycle hooks
 
@@ -814,10 +817,102 @@ Browser(get_children=…, on_enter='action:e')
 Browser(get_children=…, on_enter=lambda ctx: print(ctx.cursor.id))
 ```
 
-#### `format_item(item, ctx) -> [(text, fg, bold), …]`
+#### Row-format hooks
 
-Optional per-item display override. The renderer falls back to the default
-formatter (id + tag) when this is `None`. Most recipes leave it alone.
+Each item row is a list of `(text, fg, bold)` segments. Three optional,
+individually-overridable hooks let a recipe shape that list — each
+`(item, ctx) -> [(text, fg, bold), …]`, where `ctx` is a `RowContext`
+(below):
+
+| Hook                 | Region it owns                                            |
+| -------------------- | --------------------------------------------------------- |
+| `format_row`         | The **whole row** (total control).                        |
+| `format_row_chrome`  | The structural prefix: selection marker + indent + expander. |
+| `format_row_content` | The content region: id + tag + title + chips (or arbitrary columns). |
+
+The default composition is `format_row = format_row_chrome +
+format_row_content`. Chrome stays framework-owned unless explicitly
+overridden, so a recipe overrides **only `format_row_content`** to render
+its own columns *while keeping the tree* (indent + `▼`/`▶`). Most recipes
+leave all three alone.
+
+**Resolution is by config, not by return value, and bound once.** A hook
+left unset (`None`) uses the framework default for that part; a hook that
+*is* set owns its return completely. There is no magic `None`-return
+sentinel — a set hook always returns real segments. The hooks are resolved
+once in `Browser.__init__` (after `on_before_init` plugin hooks fire), so
+the per-row render path never tests a hook against `None`.
+
+To build "the default, plus a tweak" — or to column-format the common rows
+and fall back for the odd ones (an error row, a "working tree clean" row) —
+call the matching **public default handler**, edit the list it returns, and
+return that:
+
+```python
+from browse_tui import default_row_content, cell_ljust, style
+
+def fs_row_content(item, ctx):
+    if getattr(item, 'col_perms', None) is None:
+        return default_row_content(item, ctx)   # error / synthetic row
+    dfg, dbold = style('dim')
+    return [
+        (cell_ljust(item.col_perms, 10) + '  ', dfg, dbold),
+        (item.title, None, False),               # flexible column, last
+    ]
+
+Browser(BrowserConfig(get_children=…, format_row_content=fs_row_content))
+```
+
+Put the *flexible* column (the name / subject) **last** in the segment
+list: the renderer truncates left-to-right, so a narrow pane trims that
+column and leaves the fixed metadata columns intact.
+
+#### Public default handlers
+
+The framework's stock builders, exported so a hook can wrap them rather
+than reimplement them (importable from `browse_tui`):
+
+- **`default_row_chrome(item, ctx) -> [(text, fg, bold), …]`** — the
+  selection marker (`'* '`/`'  '`), indentation, and expander
+  (`'▼ '`/`'▶ '`/`'  '`) segments.
+- **`default_row_content(item, ctx) -> [(text, fg, bold), …]`** — the id
+  segment (gated by `show_ids`), the `tag` chip, the title (with the
+  `is_current_scope` → `scope_title` override), and the trailing `chips`.
+- **`default_row(item, ctx) -> [(text, fg, bold), …]`** — returns
+  `default_row_chrome(item, ctx) + default_row_content(item, ctx)` and sets
+  `ctx.content_width` along the way, so a whole-row `format_row` override
+  can call it, tweak the result, and return it. It composes the *framework*
+  defaults (not any other resolved hook).
+
+#### `RowContext`
+
+The per-row handle passed to all three hooks (distinct from the action
+`Context`). Built fresh per painted row; carries read-only per-row state and
+the live pane geometry:
+
+| Field              | Meaning                                                    |
+| ------------------ | ---------------------------------------------------------- |
+| `depth`            | tree depth of the row.                                     |
+| `selected`         | `bool` — row is in the selection.                          |
+| `expanded`         | `bool` — row is expanded.                                  |
+| `is_current_scope` | `bool` — this item *is* the current scope root.            |
+| `kind`             | the visible-entry kind (`'normal'` for hook rows).         |
+| `parent_id`        | the id of this row's parent (or `None`).                   |
+| `list_width`       | content width of the list pane in cells.                   |
+| `content_width`    | cells left for `format_row_content` after the chrome on this row. |
+
+`content_width` starts equal to `list_width` and is lowered to
+`list_width − cells(chrome)` once the default composer has measured the
+chrome (so a `format_row_content` hook reads the room left after the
+prefix). Under a whole-row `format_row` override it stays equal to
+`list_width` (the chrome split is unknown). Both dimensions are `0` before
+the first paint / in headless tests (matching the `preview_width` contract);
+pick a fallback explicitly (`ctx.list_width or 80`).
+
+Advanced escape hatch (mirrors `Context.browser`, unstable surface):
+
+- **`ctx.browser`** — the underlying `Browser`, for capabilities not yet on
+  `RowContext`.
 
 ### Lifecycle
 
@@ -1343,7 +1438,9 @@ class BrowserConfig:
     get_preview:  Callable | None = None
     actions: list | None = None
     on_enter: Any = None
-    format_item: Callable | None = None
+    format_row: Callable | None = None             # (item, ctx) -> segments
+    format_row_chrome: Callable | None = None      # (item, ctx) -> segments
+    format_row_content: Callable | None = None     # (item, ctx) -> segments
     root_id: Any = None
     initial_scope: Any = None
     show_preview: bool = True
@@ -1673,6 +1770,73 @@ coerce_has_children('false')  # False
 coerce_has_children(None)     # False
 ```
 
+### Cell-accurate string helpers
+
+For recipes assembling their own row segments (via the row-format hooks
+above), these format **plain text** measured in **display cells** — wide
+characters (CJK / emoji) count as 2. Carry colour via the segment
+`fg`/`bold`, never embedded SGR, so the width math stays exact.
+
+```python
+from browse_tui import cell_width, cell_fit, cell_ljust, cell_rjust, cell_center, cell_trim
+```
+
+| Helper                                                              | Returns                                                                       |
+| ------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| `cell_width(s) -> int`                                              | Display-cell width of `s`.                                                    |
+| `cell_ljust(s, width, fill=' ') -> str`                            | Pad right to `width` cells; `s` unchanged if already wider.                   |
+| `cell_rjust(s, width, fill=' ') -> str`                            | Pad left to `width` cells.                                                    |
+| `cell_center(s, width, fill=' ') -> str`                           | Pad both sides to `width` cells.                                              |
+| `cell_trim(s, width, *, where='end', ellipsis='…', word_boundary=False) -> str` | Trim to `width` cells (no-op if it fits); ellipsis placed at the `'end'` (`'abc…'`), `'start'` (`'…xyz'`), or `'middle'` (`'ab…yz'`). |
+| `cell_fit(s, width, *, justify='left', trim='end', ellipsis='…', fill=' ', word_boundary=False) -> str` | The one-call column formatter: `cell_trim` if too wide, else pad to **exactly** `width` cells per `justify`. |
+
+`cell_ljust`/`cell_rjust`/`cell_center` and `cell_trim` are the primitives;
+`cell_fit` is the combinator recipes reach for most — it always returns
+exactly `width` cells. The `ellipsis` defaults to `'…'` (1 cell); pass
+`'...'` for three dots. `word_boundary` (middle trim only) prefers a space
+near the cut. `fill` and `ellipsis` must each be a single cell.
+
+```python
+cell_fit('a long title', 8)                      # 'a long …'
+cell_fit('42', 6, justify='right')               # '    42'
+cell_fit('mid', 9, justify='center')             # '   mid   '
+cell_trim('/very/long/path', 10, where='start')  # '…long/path'
+```
+
+### Styles
+
+A segment's colour *is* a raw `(fg, bold)` pair — `fg` a 256-colour palette
+index (or `None` for the terminal default), `bold` a bool. The `tag_style` /
+chip vocabulary is the set of *named* styles mapping onto those pairs;
+recipes building their own segments resolve them through `style()`:
+
+```python
+from browse_tui import style, STYLE_NAMES, MARKER_FG, ID_FG, DIM_FG
+```
+
+- **`style(name) -> (fg, bold)`** — resolve a named style
+  (`'green'`/`'red'`/`'yellow'`/`'gray'`/`'cyan'`/`'blue'`/`'magenta'`/
+  `'dim'`/`''`) to the raw `(fg, bold)` pair `tag_style` / chips use. An
+  unknown name (or `''`) returns `(None, False)` (plain), matching tag
+  rendering's fallback.
+- **`STYLE_NAMES`** — a `frozenset` of the valid named-style keys (mirrors
+  the vocabulary documented on `Item.tag_style`); use it to validate or
+  enumerate.
+- **`MARKER_FG`** (`4`, blue `▼`/`▶`), **`ID_FG`** (`3`, yellow `#id`),
+  **`DIM_FG`** (`242`, the `'dim'` fg) — the semantic palette constants the
+  default chrome uses, exposed so columns can match it without magic
+  numbers.
+
+```python
+dfg, dbold = style('dim')                  # (242, False)
+seg = (cell_ljust('-rw-r--r--', 10), dfg, dbold)
+```
+
+A segment author writes either a named style (`fg, bold = style('dim')`) or
+a raw value directly (`(text, DIM_FG, False)`, or any 256-colour int). The
+named vocabulary is the recommended, stable colour API; raw ints are the
+escape hatch for colours outside the palette.
+
 ### Module exports
 
 What actually lives at `browse_tui.<name>`:
@@ -1683,10 +1847,25 @@ What actually lives at `browse_tui.<name>`:
 | `Item`                    | dataclass   |
 | `Action`                  | dataclass   |
 | `Context`                 | class       |
+| `RowContext`              | class       |
 | `Pending`                 | class       |
 | `to_item`                 | function    |
 | `parse_input`             | function    |
 | `coerce_has_children`     | function    |
+| `default_row`             | function    |
+| `default_row_chrome`      | function    |
+| `default_row_content`     | function    |
+| `cell_width`              | function    |
+| `cell_ljust`              | function    |
+| `cell_rjust`              | function    |
+| `cell_center`             | function    |
+| `cell_trim`               | function    |
+| `cell_fit`                | function    |
+| `style`                   | function    |
+| `STYLE_NAMES`             | frozenset   |
+| `MARKER_FG`               | int         |
+| `ID_FG`                   | int         |
+| `DIM_FG`                  | int         |
 | `upsert`                  | function    |
 | `set_item`                | function    |
 | `mod`                     | function    |

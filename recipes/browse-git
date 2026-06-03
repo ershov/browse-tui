@@ -21,10 +21,12 @@ relies on hex-vs-word heuristics:
   stash:<n>[:<path>]    a stash, or a file in one
   reflog:<n>:<sha>      a reflog entry    -> changed files
 
-Commit (and reflog) rows are decorated: branch / remote / tag refs
-parsed from ``%D`` render as colored trailing chips (HEAD + local
-branch, remote, ``tag:``), followed by a dim ``author · relative-date``
-chip; file rows carry their A/M/D/R status letter as a colored tag.
+Commit rows render in columns — a yellow short-sha, a dim author and a
+dim relative date — followed by the branch / remote / tag refs parsed
+from ``%D`` as colored chips (HEAD + local branch, remote, ``tag:``) and
+the subject last. Reflog rows keep the older chip layout (short-sha tag
++ selector / relative-date / decoration chips); file rows carry their
+A/M/D/R status letter as a colored tag.
 
 Previews honour ANSI: ``git`` emits color via ``-c color.ui=always``
 and per-file diffs are rendered through ``delta`` when it is on PATH
@@ -49,7 +51,10 @@ import shutil
 import subprocess
 import sys
 
-from browse_tui import Action, Browser, BrowserConfig, Item
+from browse_tui import (
+    Action, Browser, BrowserConfig, Item,
+    cell_ljust, default_row_content, style,
+)
 
 # Optional md2ansi_lib plugin — gates md2ansi coloring of commit messages.
 try:
@@ -494,15 +499,20 @@ def _commits_root():
 
 
 def _commit_log_items(revs, paths):
-    """``git log`` rows as ``commit:<sha>`` items, decorated with chips.
+    """``git log`` rows as ``commit:<sha>`` items, rendered in columns.
 
     Shared by commits mode (called with the positional ``_revs`` /
     ``_paths``) and branches-mode ref drill-down (called with
     ``([refname], [])``). Each record is NUL-separated ``%H %D %an %ar %s``
     (subject is a single line, so ``splitlines()`` then ``split('\\x00')``
-    is unambiguous). The row carries the short sha as a yellow tag and the
-    subject as the title; chips are the ref decorations parsed from ``%D``
-    followed by a dim ``author · reldate`` chip.
+    is unambiguous).
+
+    The short sha, author, and relative date are stored as ``col_sha`` /
+    ``col_author`` / ``col_date`` display strings — ``git_row_content``
+    renders them as aligned leading columns (commits are flat under one
+    parent, so the alignment is global). The subject is the title (the
+    flexible last column); ``item.chips`` carries only the ref decorations
+    parsed from ``%D`` (rendered between the date column and the subject).
     """
     args = ['log', '--format=%H%x00%D%x00%an%x00%ar%x00%s', '-n',
             str(_log_limit)]
@@ -520,13 +530,49 @@ def _commit_log_items(revs, paths):
         if len(fields) < 5:
             continue
         sha, deco, author, reldate, subject = fields[:5]
-        chips = _parse_decorations(deco)
-        chips.append((f'{author} · {reldate}', 'dim'))
-        item = Item(id=f'commit:{sha}', title=subject,
-                    tag=sha[:7], tag_style='yellow', has_children=True)
-        item.chips = chips
+        item = Item(id=f'commit:{sha}', title=subject, has_children=True)
+        # Column display strings (read by git_row_content via max_col_width).
+        item.col_sha = sha[:7]
+        item.col_author = author
+        item.col_date = reldate
+        item.chips = _parse_decorations(deco)
         items.append(item)
     return items
+
+
+def git_row_content(item, ctx):
+    """Columnar content for commit rows: sha | author | date | subject.
+
+    Each leading column (short sha yellow, author + relative date dim) is
+    left-justified to the widest sibling value (``ctx.max_col_width`` over
+    the row's parent group; commits are flat under one parent, so that is a
+    global alignment) and followed by a two-space gap. The ``%D`` decoration
+    chips come next, then the subject (the title) LAST so a narrow pane
+    truncates the subject rather than the metadata columns.
+
+    Only commit rows carry ``col_sha``; every other row kind
+    (status/stash/ref/file/reflog and the synthetic error / "clean" /
+    "no stashes" rows) lacks it and falls back to the framework default
+    content — keeping their tag chips and trailing decorations unchanged.
+    Only the content region is taken over; chrome (tree indent + ▼/▶) stays
+    framework-owned.
+    """
+    if getattr(item, 'col_sha', None) is None:
+        return default_row_content(item, ctx)    # non-commit / synthetic row
+    w = ctx.max_col_width
+    yfg, ybold = style('yellow')
+    dfg, dbold = style('dim')
+    segments = [
+        (cell_ljust(item.col_sha, w('col_sha')) + '  ', yfg, ybold),
+        (cell_ljust(item.col_author, w('col_author')) + '  ', dfg, dbold),
+        (cell_ljust(item.col_date, w('col_date')) + '  ', dfg, dbold),
+    ]
+    # Ref decorations between the date column and the subject.
+    for text, stylename in getattr(item, 'chips', None) or ():
+        cfg, cbold = style(stylename)
+        segments.append((f'[{text}] ', cfg, cbold))
+    segments.append((item.title, None, False))    # flexible column, last
+    return segments
 
 
 def _reflog_root():
@@ -935,7 +981,8 @@ Keys:
 
 Previews are colorized: git emits SGR, per-file diffs go through delta
 when it is installed, and commit messages are md2ansi-colored when
-available. Commit rows show ref/tag decorations and an author · date chip.\
+available. Commit rows render sha / author / date columns followed by
+their ref/tag decorations and the subject.\
 """
 
 
@@ -1016,6 +1063,7 @@ def main():
         title=_window_title(),
         get_children=get_children,
         get_preview=get_preview,
+        format_row_content=git_row_content,
         actions=actions,
         on_enter=on_enter,
         show_ids='never',

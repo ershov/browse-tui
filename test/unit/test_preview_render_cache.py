@@ -61,6 +61,12 @@ for _name in ('write', 'move', 'set_style', 'reset_style', 'clear_line',
               'clear_columns', 'begin_row', 'end_row', 'begin_sync',
               'end_sync', 'flush', 'term_size'):
     setattr(_render, _name, getattr(_term, _name))
+# Default row-format handlers live in 040-state but reference render-layer
+# constants/helpers at call time; inject them so a render through a
+# state-loaded Browser resolves them (the concatenated build does so by name).
+for _name in ('_TAG_STYLE', '_id_visible', '_ID_COLOR', '_MARKER_COLOR',
+              'cell_width'):
+    setattr(_state, _name, getattr(_render, _name))
 
 _context.visible_items = _state.visible_items
 

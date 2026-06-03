@@ -9,10 +9,15 @@ Renderer layout:
     the info bar at the bottom row. ``show_children_pane=False`` (or
     a cursor on a leaf, or no cached children) hides the children grid
     entirely; the preview pane then takes that space.
-  * Item rows are built as a list of ``(text, fg, bold)`` segments by
-    ``format_item_segments``. Recipes can override the whole row layout
-    by supplying a ``format_item=lambda item, ctx: …`` hook on Browser
-    (the renderer passes through the hook's return value verbatim).
+  * Item rows are built as a list of ``(text, fg, bold)`` segments via
+    ``browser._row_segments(item, ctx)`` (resolved once in
+    ``Browser.__init__``). Recipes override layout with the row-format
+    hooks (design sec A): ``format_row`` (whole row), ``format_row_chrome``
+    (selection marker + indent + expander), or ``format_row_content`` (the
+    content region) — the framework defaults (``default_row_chrome`` /
+    ``default_row_content`` / ``default_row``, in 040-state) fill any unset
+    hook. ``render_list`` builds a :class:`RowContext` per row and makes
+    one resolved call — no hook is ``None`` at runtime.
   * Tag styling: ``Item.tag_style`` is a string that maps via
     ``_TAG_STYLE`` to a (fg, bold) pair. The eight named styles in the
     spec (green/red/yellow/gray/cyan/blue/magenta/dim) plus ``''`` (no
@@ -61,6 +66,40 @@ _TAG_STYLE = {
 _ID_COLOR = 3   # yellow for the '#id' segment
 _MARKER_COLOR = 4   # blue for the ▼/▶ expand glyph
 _PENDING_FG = 242   # dim for the ⧗ loading… placeholder
+
+
+# --- Public styles API (see design sec D) ----------------------------------
+# A segment's colour *is* a raw (fg, bold) pair; ``_TAG_STYLE`` above is the
+# internal table mapping the named-style vocabulary onto those pairs. Recipes
+# assembling their own column segments can't reach ``_TAG_STYLE``, so expose
+# both layers — the named lookup ``style()`` / ``STYLE_NAMES``, and the raw
+# palette constants the default chrome uses (public faces of the ``_*_COLOR``
+# / ``_PENDING_FG`` internals) — so columns match ``tag_style`` / chips
+# without magic numbers.
+
+# The valid named-style keys (mirrors the vocabulary documented on
+# ``Item.tag_style``). Includes ``''`` — the plain, unstyled default.
+STYLE_NAMES = frozenset(_TAG_STYLE)
+
+# Raw palette constants — the semantic chrome colours a column is most
+# likely to want to match (see design sec D / "raw styles").
+MARKER_FG = _MARKER_COLOR   # 4 — blue ▼/▶ expander
+ID_FG = _ID_COLOR           # 3 — yellow #id segment
+DIM_FG = _PENDING_FG        # 242 — dim; the 'dim' named style's fg
+
+
+def style(name):
+    """Resolve a named style to its raw ``(fg, bold)`` pair.
+
+    ``name`` is one of the keys in :data:`STYLE_NAMES`
+    (``'green'``/``'red'``/``'yellow'``/``'gray'``/``'cyan'``/``'blue'``/
+    ``'magenta'``/``'dim'``/``''``). ``fg`` is a 256-colour palette index
+    (or ``None`` for the terminal default) and ``bold`` is a bool — the
+    same pair ``tag_style`` / chips resolve to. An unknown name (or ``''``)
+    returns ``(None, False)`` (plain), matching tag rendering's fallback.
+    """
+    return _TAG_STYLE.get(name, _TAG_STYLE[''])
+
 
 # Insert-mode marker — sentinel id used by the synthetic ``VisibleEntry``
 # injected into the rendered list when ``browser._insert_mode`` is True.
@@ -139,102 +178,128 @@ def _id_visible(item, show_ids):
     return str(item.id) != item.title
 
 
-def format_item_segments(item, *, depth=0, base_depth=0, expanded=False,
-                         selected=False, kind='normal', search_query='',
-                         format_item=None, ctx=None, show_ids='auto',
-                         is_current_scope=False):
-    """Compute the (text, fg, bold) segment list for one row.
+# Sentinel for ``RowContext.max_col_width(field, parent_id=...)``: lets an
+# omitted ``parent_id`` (default to this row's parent) be told apart from an
+# explicit ``parent_id=None`` (a legitimate parent key for a ``root_id=None``
+# Browser).
+_PARENT_DEFAULT = object()
 
-    Returns a list of ``(text, fg, bold)`` triples. When the user-supplied
-    ``format_item`` hook is non-None, it's called with ``(item, ctx)`` and
-    its return value is used verbatim — the default segment layout below
-    is bypassed entirely. This is the override point recipes use to
-    surface domain-specific rows (file size, mtime, … see browse-fs).
 
-    Default layout for ``kind='normal'``:
-      - selection marker: ``'* '`` if ``selected``, else ``'  '``
-      - indentation:      ``2 * (depth - base_depth)`` spaces
-      - expand marker:    ``'▼ '`` if ``expanded``,
-                          ``'▶ '`` if ``item.has_children`` else ``'  '``
-      - id segment:       ``'{id} '`` in yellow (gated on ``show_ids``;
-                          ``'auto'`` suppresses it when ``str(id) == title``)
-      - tag segment:      ``'[{tag}] '`` styled per ``_TAG_STYLE`` (omitted
-                          when ``item.tag`` is empty)
-      - title segment:    ``item.title``, OR ``item.scope_title`` when
-                          ``is_current_scope`` is True and the item has
-                          ``scope_title`` set (the "no parent context
-                          above me" label override; see scope-root
-                          unification design)
-      - chip segments:    one ``' [{text}]'`` per ``(text, style)`` in
-                          ``item.chips`` (when set), each styled per
-                          ``_TAG_STYLE`` like the tag segment. Lets a row
-                          carry several colored labels after the title.
+class RowContext:
+    """Per-row geometry + tree state handed to the row-format hooks.
 
-    Default layout for ``kind='pending'``:
-      - indentation only, then a single dim ``'⧗ loading…'`` segment.
-        No selection marker, no expand marker — placeholder rows are
-        synthetic and don't participate in selection/expansion.
+    Distinct from the action :class:`Context` (060-context.py): that one is
+    built once per dispatched action and carries cursor/targets/confirm;
+    this one is built per painted row (``height`` per frame) and carries
+    per-row state. Conflating them would mutate per-row state onto a
+    shared, longer-lived object.
 
-    ``search_query`` is accepted for forward-compatibility with phase-2
-    ticket #22; phase 1 ignores it (highlighting is applied later by
-    the renderer, not by this segment builder).
+    Per-row state (read-only):
+      * ``depth``            — tree depth of the row (absolute).
+      * ``selected``         — ``bool``: row is in ``state.selected``.
+      * ``expanded``         — ``bool``: row is in ``state.expanded``.
+      * ``is_current_scope`` — ``bool``: this item *is* the current scope.
+      * ``kind``             — ``VisibleEntry.kind`` (``'normal'`` for hook
+                               rows).
+      * ``parent_id``        — ``state._parent_of_id.get(item.id)``.
+
+    Dimensions (refreshed every paint, modelled on ``preview_width``):
+      * ``list_width``    — content width of the list pane in cells
+                            (``rect.width``).
+      * ``content_width`` — cells left for the content hook after the
+                            chrome on *this* row. Starts equal to
+                            ``list_width``; ``_compose_row`` /
+                            :func:`default_row` lower it via
+                            ``_set_content_width`` once the chrome is
+                            measured. Under a whole-row ``format_row``
+                            override it stays equal to ``list_width`` (the
+                            chrome split is unknown).
+
+    Both dimensions are ``0`` before the first paint / in headless tests
+    (the ``list_width`` passed in is ``0``), matching the ``preview_width``
+    contract; recipes wanting a fallback pick one explicitly.
+
+    Method:
+      * ``max_col_width(field, parent_id=None)`` — the max display-cell width
+        of a pre-formatted column string across a sibling group (design
+        sec C). Cached per parent on ``State``; lazily filled.
     """
-    if format_item is not None:
-        # User override wins entirely. We don't validate the shape —
-        # if the hook returns something the writer can't handle, that
-        # surfaces as a clearer error in the writer.
-        return format_item(item, ctx)
 
-    rel_depth = depth - base_depth
-    if rel_depth < 0:
-        rel_depth = 0
-    indent = '  ' * rel_depth
+    __slots__ = (
+        'depth', 'selected', 'expanded', 'is_current_scope', 'kind',
+        'parent_id', 'list_width', 'content_width', '_browser',
+    )
 
-    if kind == 'pending':
-        # Placeholder rows: indent + dim glyph. Title carries the
-        # ⧗ loading… text from ``_make_pending_placeholder`` in 040-state.
-        return [
-            (indent, None, False),
-            (item.title, _PENDING_FG, False),
-        ]
+    def __init__(self, browser, item, *, depth, selected, expanded,
+                 is_current_scope, kind, list_width):
+        self._browser = browser
+        self.depth = depth
+        self.selected = selected
+        self.expanded = expanded
+        self.is_current_scope = is_current_scope
+        self.kind = kind
+        self.parent_id = browser._state._parent_of_id.get(item.id)
+        self.list_width = list_width
+        # content_width starts at the full pane width; the chrome→content
+        # composer lowers it once the chrome is measured. A whole-row
+        # override never calls _set_content_width, so it stays = list_width.
+        self.content_width = list_width
 
-    # ----- normal kind ------------------------------------------------
-    sel_marker = '* ' if selected else '  '
+    def _set_content_width(self, chrome_cells):
+        """Set ``content_width`` to ``list_width − chrome_cells``.
 
-    if item.has_children:
-        expand_marker = '▼ ' if expanded else '▶ '   # ▼ / ▶
-    else:
-        expand_marker = '  '
+        Called by the default composer (``Browser._compose_row`` /
+        :func:`default_row`) between building the chrome and running the
+        content hook, so the content hook sees the cells left after the
+        chrome on this row. Clamped at 0 so a chrome wider than the pane
+        never yields a negative width.
+        """
+        remaining = self.list_width - chrome_cells
+        self.content_width = remaining if remaining > 0 else 0
 
-    # The scope row gets its id + title segments bolded so it stands
-    # apart from the listing below — the "you are here" indicator. The
-    # selection / expand markers stay non-bold (they're chrome, not
-    # content). The tag segment keeps its tag_style-driven bold so
-    # explicit tag styles still control their own weight.
-    segments = [
-        (sel_marker, None, False),
-        (indent, None, False),
-        (expand_marker, _MARKER_COLOR, False),
-    ]
-    if _id_visible(item, show_ids):
-        segments.append(('{} '.format(item.id), _ID_COLOR, is_current_scope))
+    def max_col_width(self, field, parent_id=_PARENT_DEFAULT):
+        """Max display-cell width of ``str(getattr(child, field, ''))`` over a
+        sibling group (design sec C).
 
-    if item.tag:
-        sfg, sbold = _TAG_STYLE.get(item.tag_style, _TAG_STYLE[''])
-        segments.append(('[{}] '.format(item.tag), sfg, sbold))
+        ``parent_id`` defaults to *this row's* parent (``ctx.parent_id``), so a
+        row aligns a column to its siblings; pass an explicit id (including
+        ``None`` — a legitimate parent key for a ``root_id=None`` Browser) to
+        measure a different group. The recipe pre-stores the *display* string
+        it intends to render on each Item and passes that field name, so what
+        is measured is what is rendered.
 
-    scope_title = getattr(item, 'scope_title', None)
-    title_text = scope_title if (is_current_scope and scope_title) else item.title
-    segments.append((title_text, None, is_current_scope))
+        Result is memoised per ``(parent_id, field)`` on
+        ``State._col_width_cache`` and rebuilt lazily after that parent's child
+        list is dropped, replaced, or mutated (see ``_index_drop_children`` /
+        ``_col_width_drop``). A cache hit re-scans nothing.
 
-    # Trailing colored chips: one ``[{text}] `` segment per (text, style)
-    # in ``item.chips``, styled through ``_TAG_STYLE`` like the tag chip.
-    # Color rides the segment ``fg`` (never embedded in text) so width
-    # math stays correct.
-    for text, style in getattr(item, 'chips', None) or ():
-        cfg, cbold = _TAG_STYLE.get(style, _TAG_STYLE[''])
-        segments.append((' [{}]'.format(text), cfg, cbold))
-    return segments
+        A child missing ``field`` contributes ``0`` (``getattr`` default
+        ``''``); an empty or absent sibling list yields ``0``.
+        """
+        if parent_id is _PARENT_DEFAULT:
+            parent_id = self.parent_id
+        state = self._browser._state
+        cache = state._col_width_cache.setdefault(parent_id, {})
+        cached = cache.get(field)
+        if cached is not None:
+            return cached
+        width = max(
+            (cell_width(str(getattr(child, field, '')))
+             for child in state._children.get(parent_id, ())),
+            default=0,
+        )
+        cache[field] = width
+        return width
+
+    @property
+    def browser(self):
+        """The underlying :class:`Browser` (advanced; unstable surface).
+
+        Mirrors :attr:`Context.browser` — for capabilities not yet
+        promoted onto ``RowContext``. The default content hook reads
+        ``ctx.browser.show_ids`` through it.
+        """
+        return self._browser
 
 
 class Rect:
@@ -871,6 +936,185 @@ def _truncate_by_cells(s, max_cols):
     return (''.join(out), cells)
 
 
+def _suffix_by_cells(s, max_cols):
+    """Longest *suffix* of plain text ``s`` fitting in ``max_cols`` cells.
+
+    The tail-side analogue of :func:`_truncate_by_cells` (which keeps a
+    prefix): walks ``s`` from the right, accumulating characters while the
+    running cell count stays within budget. Wide-char aware via
+    :func:`_char_width`; a wide char that would straddle the budget is
+    dropped rather than overshooting (so the result may be one cell short
+    of ``max_cols``, never over). ``max_cols <= 0`` returns ``''``.
+    """
+    if max_cols <= 0:
+        return ''
+    cells = 0
+    cut = len(s)
+    for i in range(len(s) - 1, -1, -1):
+        w = _char_width(s[i])
+        if cells + w > max_cols:
+            break
+        cells += w
+        cut = i
+    return s[cut:]
+
+
+def cell_width(s):
+    """Display-cell width of plain text ``s`` (the public face of
+    :func:`_visible_len`).
+
+    Wide-char aware: East Asian Wide/Fullwidth characters count as 2 cells,
+    others as 1. ANSI CSI escapes are not counted (recipes carry colour via
+    the segment ``fg``/``bold``, never embedded SGR — but the
+    escape-stripping keeps the contract identical to ``_visible_len``).
+    """
+    return _visible_len(s)
+
+
+def _char_width_total(s):
+    """Total display-cell width of ``s`` counting *every* char (no escape
+    stripping) — used to validate single-cell ``fill`` / ``ellipsis`` args.
+
+    Deliberately does **not** delegate to ``_visible_len`` / :func:`cell_width`,
+    which strip ANSI CSI sequences before counting. A ``fill`` / ``ellipsis``
+    is tiled into the result *verbatim*, so what matters is the cells the
+    raw string actually occupies on screen, not its ANSI-stripped visible
+    width. An escape-bearing value like ``'\\033[0m '`` has visible width 1
+    but occupies 5 raw cells; counting it as 1 would let the single-cell
+    guard wrongly accept it, and tiling those 5 chars per pad cell would
+    corrupt the column's width math. Counting raw chars rejects it.
+    """
+    return sum(_char_width(ch) for ch in s)
+
+
+def _check_fill(fill):
+    """Validate a pad ``fill`` is exactly one display cell; return it.
+
+    The cell-pad helpers tile ``fill`` one cell at a time, so a wide
+    (2-cell) or empty fill would break the exact-width contract. Reject it
+    loudly rather than silently mis-aligning a column.
+    """
+    if _char_width_total(fill) != 1:
+        raise ValueError(
+            'fill must be exactly one display cell, got {!r}'.format(fill))
+    return fill
+
+
+def cell_ljust(s, width, fill=' '):
+    """Left-justify ``s`` to ``width`` display cells, padding on the right.
+
+    Returns ``s`` unchanged if it is already ``width`` cells or wider (pad
+    never shrinks). ``fill`` must be exactly one display cell.
+    """
+    _check_fill(fill)
+    pad = width - cell_width(s)
+    return s + fill * pad if pad > 0 else s
+
+
+def cell_rjust(s, width, fill=' '):
+    """Right-justify ``s`` to ``width`` display cells, padding on the left.
+
+    Returns ``s`` unchanged if already ``width`` cells or wider. ``fill``
+    must be exactly one display cell.
+    """
+    _check_fill(fill)
+    pad = width - cell_width(s)
+    return fill * pad + s if pad > 0 else s
+
+
+def cell_center(s, width, fill=' '):
+    """Centre ``s`` within ``width`` display cells, padding both sides.
+
+    Extra padding (when the gap is odd) goes on the right, matching
+    :meth:`str.center`. Returns ``s`` unchanged if already ``width`` cells
+    or wider. ``fill`` must be exactly one display cell.
+    """
+    _check_fill(fill)
+    pad = width - cell_width(s)
+    if pad <= 0:
+        return s
+    left = pad // 2
+    return fill * left + s + fill * (pad - left)
+
+
+def cell_trim(s, width, *, where='end', ellipsis='…', word_boundary=False):
+    """Trim plain text ``s`` to ``width`` display cells with an ellipsis.
+
+    No-op when ``s`` already fits (``cell_width(s) <= width``). Otherwise
+    the ellipsis is placed per ``where``:
+
+      * ``'end'``   — ``'abc…'`` (keep a prefix of ``s``).
+      * ``'start'`` — ``'…xyz'`` (keep a suffix of ``s``).
+      * ``'middle'``— ``'ab…yz'`` (keep a prefix and a suffix; the prefix
+        gets the extra cell when the content budget is odd).
+
+    The ellipsis width is accounted within ``width`` (it is part of the
+    result, not appended past it); ``ellipsis`` defaults to ``'…'`` (1
+    cell) — pass ``'...'`` for three dots. Wide chars near the cut are
+    dropped rather than overshooting ``width``, so the result is always
+    ``<= width`` cells (it can be one cell short when a wide char straddles
+    the cut). ``word_boundary`` (``'middle'`` only) prefers to end the
+    prefix at a space so a word isn't split; it has no effect when no
+    suitable space sits within the prefix budget.
+
+    Returns the trimmed string. If even the ellipsis doesn't fit
+    (``width`` < its width) the ellipsis itself is cell-trimmed to
+    ``width`` and no content is kept.
+    """
+    if cell_width(s) <= width:
+        return s
+    ell_w = _char_width_total(ellipsis)
+    budget = width - ell_w
+    if budget <= 0:
+        # Not even room for the ellipsis — trim the ellipsis to fit, drop
+        # all content. Never overshoot the requested width.
+        return _truncate_by_cells(ellipsis, width)[0]
+
+    if where == 'start':
+        return ellipsis + _suffix_by_cells(s, budget)
+
+    if where == 'middle':
+        head_budget = budget - budget // 2   # ceil — prefix gets the extra
+        tail_budget = budget // 2
+        head = _truncate_by_cells(s, head_budget)[0]
+        if word_boundary:
+            cut = head.rfind(' ')
+            # Snap to the last space within the prefix, but keep it: an
+            # empty prefix (space at index 0) gains nothing, so only honour
+            # a space that leaves some non-space content before it.
+            if cut > 0:
+                head = head[:cut + 1]
+        tail = _suffix_by_cells(s, tail_budget)
+        return head + ellipsis + tail
+
+    # Default / 'end': keep a prefix, ellipsis trails.
+    return _truncate_by_cells(s, budget)[0] + ellipsis
+
+
+def cell_fit(s, width, *, justify='left', trim='end', ellipsis='…',
+             fill=' ', word_boundary=False):
+    """Trim-or-pad ``s`` to **exactly** ``width`` display cells.
+
+    The one-call column formatter: when ``s`` is too wide it is trimmed via
+    :func:`cell_trim` (honouring ``trim`` = ``'end'``/``'start'``/
+    ``'middle'``, ``ellipsis`` and ``word_boundary``); otherwise it is
+    padded per ``justify`` (``'left'``/``'right'``/``'center'``) with
+    ``fill``. The result is always exactly ``width`` cells — even when a
+    wide char straddles the trim budget (the trimmed string can come back a
+    cell short, so it is re-padded to ``width``). ``fill`` must be one cell.
+    """
+    _check_fill(fill)
+    pad = {'left': cell_ljust, 'right': cell_rjust,
+           'center': cell_center}.get(justify, cell_ljust)
+    if cell_width(s) > width:
+        trimmed = cell_trim(s, width, where=trim, ellipsis=ellipsis,
+                            word_boundary=word_boundary)
+        # A wide-char straddle can leave ``trimmed`` one cell short of
+        # ``width``; pad it back so the column lands on an exact boundary.
+        return pad(trimmed, width, fill)
+    return pad(s, width, fill)
+
+
 def _write_segments(segments, max_width, *, pad_to=0, row_bg=None,
                     row_fg=None):
     """Emit ``segments`` to the terminal, truncating at ``max_width`` cells.
@@ -1292,18 +1536,32 @@ def render_list(browser, rect, *, rightmost: bool = False):
             end_row()
             continue
 
-        segments = format_item_segments(
-            item,
-            depth=entry.depth,
-            expanded=item.id in state.expanded,
-            selected=is_selected,
-            kind=entry.kind,
-            search_query=browser._search_query,
-            format_item=browser.format_item,
-            ctx=None,
-            show_ids=browser.show_ids,
-            is_current_scope=(item.id == current_scope_id),
-        )
+        # Pending placeholder — indent + a single dim ``⧗ loading…`` glyph.
+        # No selection / expand markers (the row is synthetic and doesn't
+        # participate in selection / expansion). The three-hook split
+        # applies to ``normal`` rows only, so this keeps its own early
+        # path (moved here verbatim from the old ``format_item_segments``).
+        if entry.kind == 'pending':
+            indent = '  ' * (entry.depth if entry.depth > 0 else 0)
+            segments = [
+                (indent, None, False),
+                (item.title, _PENDING_FG, False),
+            ]
+        else:
+            # Normal row: build a per-row RowContext and make one resolved
+            # call. ``browser._row_segments`` is the configured ``format_row``
+            # override or the default chrome+content composer — no hook is
+            # ``None`` here (they were bound once in ``Browser.__init__``).
+            ctx = RowContext(
+                browser, item,
+                depth=entry.depth,
+                selected=is_selected,
+                expanded=item.id in state.expanded,
+                is_current_scope=(item.id == current_scope_id),
+                kind=entry.kind,
+                list_width=width,
+            )
+            segments = browser._row_segments(item, ctx)
 
         if is_cursor_line:
             # Reverse video for the cursor line — collapse segments to a

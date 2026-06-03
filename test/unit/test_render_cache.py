@@ -63,6 +63,13 @@ for _name in ('write', 'move', 'set_style', 'reset_style', 'clear_line',
               'clear_columns', 'begin_row', 'end_row', 'begin_sync',
               'end_sync', 'flush', 'term_size'):
     setattr(_render, _name, getattr(_term, _name))
+# The default row-format handlers (``default_row_chrome`` / ``_content``)
+# live in 040-state but reference render-layer constants/helpers at call
+# time (resolved by name in the concatenated build). Inject them so a
+# render through a state-loaded Browser doesn't NameError.
+for _name in ('_TAG_STYLE', '_id_visible', '_ID_COLOR', '_MARKER_COLOR',
+              'cell_width'):
+    setattr(_state, _name, getattr(_render, _name))
 
 # State references the rendering helpers via visible_items only (already
 # in 040-state.py), and the search helpers are loaded with the state

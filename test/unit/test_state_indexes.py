@@ -44,6 +44,8 @@ State = _state.State
 Item = _data.Item
 cache_invalidate_subtree = _state.cache_invalidate_subtree
 cache_invalidate_all = _state.cache_invalidate_all
+apply_ops = _state.apply_ops
+KEEP_PARENT = _state.KEEP_PARENT
 
 
 class TestStateIndexDefaults(unittest.TestCase):
@@ -179,6 +181,66 @@ class TestApplyChildrenResultsIndexes(unittest.TestCase):
         b.set_children('p', [{'id': 'x'}])
         b.apply_children_results()
         self.assertFalse(b._state._loading['p'])
+
+
+class TestColWidthCacheInvalidation(unittest.TestCase):
+    """The per-parent ``max_col_width`` cache (``_col_width_cache``) is
+    dropped in lockstep with the ``_children`` mutation sites — end-to-end
+    through the real ``Browser`` for the refresh and update_data paths.
+
+    These tests prime ``_col_width_cache`` directly (simulating a prior
+    render's memo) rather than through ``RowContext.max_col_width`` — the
+    measurement lives in 050-render, not loaded here; what's under test is
+    that the state-level mutation paths evict the entry.
+    """
+
+    def test_fresh_state_and_browser_have_empty_cache(self):
+        self.assertEqual(State()._col_width_cache, {})
+        self.assertEqual(
+            Browser(BrowserConfig(_headless=True))._state._col_width_cache, {})
+
+    def test_refresh_delivery_drops_entry(self):
+        # Worker delivery (``apply_children_results``) replaces a parent's
+        # child list via ``_index_drop_children`` -> the column-width entry
+        # for that parent is evicted.
+        b = Browser(BrowserConfig(_headless=True))
+        b.set_children('p', [{'id': 'x'}, {'id': 'y'}])
+        b.apply_children_results()
+        b._state._col_width_cache['p'] = {'col': 7}   # prime (as a render would)
+        # Re-deliver under the same parent (a refresh / re-fetch).
+        b.set_children('p', [{'id': 'z'}])
+        b.apply_children_results()
+        self.assertNotIn('p', b._state._col_width_cache)
+
+    def test_update_data_upsert_drops_entry(self):
+        b = Browser(BrowserConfig(_headless=True))
+        b.set_children('p', [{'id': 'x'}])
+        b.apply_children_results()
+        b._state._col_width_cache['p'] = {'col': 3}
+        apply_ops(b._state, [('upsert', 'w', 'p', {'col': 'wider-value'})])
+        self.assertNotIn('p', b._state._col_width_cache)
+
+    def test_update_data_mod_drops_entry(self):
+        b = Browser(BrowserConfig(_headless=True))
+        b.set_children('p', [{'id': 'x', 'col': 'a'}])
+        b.apply_children_results()
+        b._state._col_width_cache['p'] = {'col': 1}
+        apply_ops(b._state, [('mod', 'x', KEEP_PARENT, {'col': 'longer'})])
+        self.assertNotIn('p', b._state._col_width_cache)
+
+    def test_cache_invalidate_subtree_drops_entry(self):
+        s = State(root_id='/')
+        s._children['/'] = [Item(id='a')]
+        s._parent_of_id = {'a': '/'}
+        s._col_width_cache['/'] = {'col': 9}
+        cache_invalidate_subtree(s, '/')
+        self.assertNotIn('/', s._col_width_cache)
+
+    def test_cache_invalidate_all_clears_cache(self):
+        s = State(root_id='/')
+        s._col_width_cache = {'/': {'col': 9}, 'a': {'col': 2}}
+        cache_invalidate_all(s)
+        self.assertEqual(s._col_width_cache, {})
 
 
 class TestDispatchSetsLoading(unittest.TestCase):

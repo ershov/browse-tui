@@ -11,7 +11,10 @@ import stat
 import sys
 import time
 
-from browse_tui import Action, Browser, BrowserConfig, Item
+from browse_tui import (
+    Action, Browser, BrowserConfig, Item,
+    cell_ljust, cell_rjust, default_row_content, style,
+)
 
 # Optional md2ansi_lib plugin — gates the colored *.md preview mode.
 try:
@@ -57,12 +60,37 @@ def get_children(path, *, reload=False):
             continue
         is_dir = stat.S_ISDIR(st.st_mode)
         title = d.name + ('/' if is_dir else '')
-        tag, tag_style = ('', 'cyan') if is_dir else (human_size(st.st_size), 'dim')
-        item = Item(id=d.path, title=title, tag=tag, tag_style=tag_style,
-                    has_children=is_dir)
-        item.size, item.mode, item.mtime = st.st_size, stat.S_IMODE(st.st_mode), st.st_mtime
+        # Size moved out of the `tag` chip into the col_size column; rows
+        # carry no tag now (fs_row_content renders the metadata columns).
+        item = Item(id=d.path, title=title, has_children=is_dir)
+        # Column display strings (read by fs_row_content via max_col_width).
+        item.col_perms = stat.filemode(st.st_mode)
+        item.col_size = '' if is_dir else human_size(st.st_size)
+        item.col_mtime = time.strftime('%b %d %H:%M', time.localtime(st.st_mtime))
         items.append(item)
     return items
+
+
+def fs_row_content(item, ctx):
+    """Columnar content: perms | size | mtime | name (flexible, last).
+
+    Each metadata column is left/right-justified to the widest sibling
+    value (``ctx.max_col_width`` over the row's parent group) and rendered
+    dim; the title comes LAST so a narrow pane truncates the name rather
+    than the metadata. Error / synthetic rows (no ``col_perms``) fall back
+    to the framework default content. Only the content region is taken
+    over — chrome (tree indent + ▼/▶) stays framework-owned.
+    """
+    if getattr(item, 'col_perms', None) is None:
+        return default_row_content(item, ctx)    # error/synthetic row
+    w = ctx.max_col_width
+    dfg, dbold = style('dim')
+    return [
+        (cell_ljust(item.col_perms, w('col_perms')) + '  ', dfg, dbold),
+        (cell_rjust(item.col_size,  w('col_size'))  + '  ', dfg, dbold),
+        (cell_ljust(item.col_mtime, w('col_mtime')) + '  ', dfg, dbold),
+        (item.title, None, False),        # flexible column, last
+    ]
 
 
 def get_preview(path):
@@ -161,6 +189,7 @@ def main():
         show_children_pane=False,
         get_children=get_children,
         get_preview=get_preview,
+        format_row_content=fs_row_content,
         root_id=root,
         actions=actions,
         on_enter='action:e',

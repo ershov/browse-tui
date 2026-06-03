@@ -37,6 +37,16 @@ Coverage (ticket #621 — branches mode):
 
 * ``_parse_for_each_ref_line``  full+short refname → (kind, short),
   kind classified from the refs/heads|remotes|tags prefix
+
+Coverage (ticket #662 — commits columnar list):
+
+* ``_commit_log_items``    stores ``col_sha`` / ``col_author`` /
+  ``col_date`` and NO sha ``tag``; ``chips`` is the ``%D`` decorations
+  only (no author·date chip)
+* ``git_row_content``      commit rows → padded sha/author/date columns,
+  decoration chips, then the subject LAST; rows of differing lengths
+  align per-column; a non-commit row (no ``col_sha``) falls back to
+  exactly ``default_row_content`` and never measures a column
 """
 
 import importlib.util
@@ -53,6 +63,12 @@ _REPO = Path(__file__).resolve().parents[2]
 _RECIPE = _REPO / 'recipes' / 'browse-git'
 
 
+# Sentinel the stub ``style('dim')`` / ``style('yellow')`` return; the
+# columns in ``git_row_content`` must carry these exact (fg, bold) pairs.
+_DIM = (242, False)
+_YELLOW = (3, False)
+
+
 def _stub_browse_tui():
     """Insert a no-op ``browse_tui`` module so the recipe can import.
 
@@ -60,6 +76,12 @@ def _stub_browse_tui():
     recipe's unit test doesn't bleed in. ``Item`` keeps its kwargs as
     attributes so the children-builder tests can read ``.id`` / ``.tag``
     if needed; ``Browser`` / ``BrowserConfig`` / ``Action`` are inert.
+
+    The column helpers (``cell_ljust`` / ``style`` / ``default_row_content``)
+    are functional-but-minimal — the test data is plain ASCII so
+    ``str.ljust`` measures the same as the real cell-aware helper, which is
+    enough to prove ``git_row_content`` wires them correctly. They mirror
+    the stub in ``test_browse_fs.py``.
     """
     mod = types.ModuleType('browse_tui')
 
@@ -73,6 +95,23 @@ def _stub_browse_tui():
     mod.Browser = _Stub
     mod.BrowserConfig = _Stub
     mod.Item = _Stub
+
+    mod.cell_ljust = lambda s, width, fill=' ': s.ljust(width, fill)
+
+    def _style(name):
+        if name == 'dim':
+            return _DIM
+        if name == 'yellow':
+            return _YELLOW
+        return (None, False)
+
+    mod.style = _style
+
+    def _default_row_content(item, ctx):
+        # A recognisable sentinel so the fallback path is unambiguous.
+        return [('DEFAULT', getattr(item, 'id', None), getattr(item, 'title', None))]
+
+    mod.default_row_content = _default_row_content
     sys.modules['browse_tui'] = mod
 
 
@@ -96,6 +135,22 @@ def _load_recipe():
     mod = importlib.util.module_from_spec(spec)
     loader.exec_module(mod)
     return mod
+
+
+class _FakeCtx:
+    """A ``RowContext`` stand-in: ``max_col_width(field)`` → fixed width.
+
+    Records every field measured in ``calls`` so a test can assert the
+    fallback path never touches a column.
+    """
+
+    def __init__(self, widths):
+        self._widths = widths
+        self.calls = []
+
+    def max_col_width(self, field, parent_id=None):
+        self.calls.append(field)
+        return self._widths[field]
 
 
 class TestParseId(unittest.TestCase):
@@ -626,6 +681,188 @@ class TestForEachRefParse(unittest.TestCase):
         self.assertIsNone(self.r._parse_for_each_ref_line(''))
         self.assertIsNone(
             self.r._parse_for_each_ref_line('refs/heads/main'))  # no NUL
+
+
+class TestCommitLogItems(unittest.TestCase):
+    """``_commit_log_items`` stores sha/author/date columns, no sha tag."""
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self.r._log_limit = 1000
+
+    def _stub_git_log(self, records):
+        """Stub ``_run_git`` so ``log`` returns ``records`` (NUL fields).
+
+        ``remote`` returns empty (no remotes) so ``_parse_decorations``
+        classifies slash refs as local branches without shelling out.
+        """
+        out = '\n'.join('\x00'.join(rec) for rec in records)
+
+        def fake_run_git(*args):
+            if args and args[0] == 'log':
+                return subprocess.CompletedProcess(args, 0, out, '')
+            if args and args[0] == 'remote':
+                return subprocess.CompletedProcess(args, 0, '', '')
+            return subprocess.CompletedProcess(args, 1, '', '')
+
+        self.r._run_git = fake_run_git
+
+    def test_columns_stored_and_no_sha_tag(self):
+        # A commit with a HEAD -> main decoration: the row stores the
+        # column display strings, sets no tag, and chips are the %D
+        # decorations only (no trailing author·date chip).
+        self._stub_git_log([
+            ('deadbeefcafe1234567890abcdef000000000000',
+             'HEAD -> main', 'Alice', '2 days ago', 'first subject'),
+        ])
+        items = self.r._commit_log_items([], [])
+        self.assertEqual(len(items), 1)
+        it = items[0]
+        self.assertEqual(it.id,
+                         'commit:deadbeefcafe1234567890abcdef000000000000')
+        self.assertEqual(it.title, 'first subject')
+        self.assertTrue(it.has_children)
+
+        # Sha / author / date are columns now.
+        self.assertEqual(it.col_sha, 'deadbee')  # short sha (7)
+        self.assertEqual(it.col_author, 'Alice')
+        self.assertEqual(it.col_date, '2 days ago')
+
+        # The sha no longer lives in the tag chip; no tag is set at all.
+        self.assertEqual(getattr(it, 'tag', ''), '')
+        self.assertEqual(getattr(it, 'tag_style', ''), '')
+
+        # chips are ONLY the %D decorations — the dim author·date chip is
+        # gone (author/date are columns now).
+        self.assertEqual(it.chips, [('HEAD', 'green'), ('main', 'cyan')])
+
+    def test_no_decoration_yields_empty_chips(self):
+        # A bare commit (empty %D) carries no chips at all.
+        self._stub_git_log([
+            ('0123456789abcdef0123456789abcdef01234567',
+             '', 'Bob', '5 minutes ago', 'plain subject'),
+        ])
+        it = self.r._commit_log_items([], [])[0]
+        self.assertEqual(it.col_sha, '0123456')
+        self.assertEqual(it.col_author, 'Bob')
+        self.assertEqual(it.col_date, '5 minutes ago')
+        self.assertEqual(it.chips, [])
+        self.assertEqual(getattr(it, 'tag', ''), '')
+
+    def test_log_failure_returns_error_row(self):
+        # A non-zero git log still yields a single error Item (unchanged).
+        def fake_run_git(*args):
+            return subprocess.CompletedProcess(args, 1, '', 'boom')
+
+        self.r._run_git = fake_run_git
+        items = self.r._commit_log_items([], [])
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].id, '__error__')
+        # The error row has no col_sha → git_row_content falls back for it.
+        self.assertIsNone(getattr(items[0], 'col_sha', None))
+
+
+class TestGitRowContent(unittest.TestCase):
+    """``git_row_content`` builds padded columns with the subject last."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _widths(self, sha=7, author=5, date=12):
+        return {'col_sha': sha, 'col_author': author, 'col_date': date}
+
+    def _commit_item(self, **kw):
+        defaults = dict(id='commit:deadbee', title='subj',
+                        col_sha='deadbee', col_author='Alice',
+                        col_date='2 days ago', chips=[])
+        defaults.update(kw)
+        return self.r.Item(**defaults)
+
+    def test_columns_padded_then_subject_last(self):
+        ctx = _FakeCtx(self._widths(sha=7, author=5, date=12))
+        item = self._commit_item(
+            col_sha='deadbee', col_author='Al', col_date='2 days ago',
+            title='the subject', chips=[])
+        segs = self.r.git_row_content(item, ctx)
+
+        # Three column segments + the subject (no chips here).
+        self.assertEqual(len(segs), 4)
+        sha_seg, author_seg, date_seg, subject_seg = segs
+
+        # sha column: yellow, left-justified to width 7 + 2-space gap.
+        self.assertEqual(sha_seg, ('deadbee' + '  ', _YELLOW[0], _YELLOW[1]))
+        # author column: dim, left-justified to width 5 ('Al' -> 'Al   ').
+        self.assertEqual(author_seg, ('Al   ' + '  ', _DIM[0], _DIM[1]))
+        # date column: dim, left-justified to width 12.
+        self.assertEqual(date_seg,
+                         ('2 days ago  ' + '  ', _DIM[0], _DIM[1]))
+
+        # Subject comes LAST, plain (no fg, not bold) so a narrow pane
+        # truncates the subject rather than the metadata columns.
+        self.assertEqual(subject_seg, ('the subject', None, False))
+
+        # Widths sourced from max_col_width per column field, in order.
+        self.assertEqual(ctx.calls, ['col_sha', 'col_author', 'col_date'])
+
+    def test_decoration_chips_between_date_and_subject(self):
+        # The %D decorations render as ``[text] `` segments after the date
+        # column and before the subject, styled by name.
+        ctx = _FakeCtx(self._widths())
+        item = self._commit_item(
+            title='decorated',
+            chips=[('HEAD', 'green'), ('main', 'cyan')])
+        segs = self.r.git_row_content(item, ctx)
+        # 3 columns + 2 chips + subject.
+        self.assertEqual(len(segs), 6)
+        head_seg, branch_seg = segs[3], segs[4]
+        self.assertEqual(head_seg, ('[HEAD] ', *self.r.style('green')))
+        self.assertEqual(branch_seg, ('[main] ', *self.r.style('cyan')))
+        # Subject is still last.
+        self.assertEqual(segs[-1], ('decorated', None, False))
+
+    def test_rows_align_across_differing_lengths(self):
+        # Two commits whose raw sha/author/date differ in length must, once
+        # padded to the per-column max, yield equal segment widths.
+        widths = self._widths(sha=7, author=7, date=12)
+        a = self._commit_item(
+            col_sha='abc1234', col_author='Al', col_date='2 days ago',
+            title='a', chips=[])
+        b = self._commit_item(
+            col_sha='def5678', col_author='Bernard', col_date='3 weeks ago',
+            title='bbbb', chips=[])
+        segs_a = self.r.git_row_content(a, _FakeCtx(widths))
+        segs_b = self.r.git_row_content(b, _FakeCtx(widths))
+        # Per metadata column (sha/author/date → indices 0/1/2) the text
+        # length is identical across the two rows.
+        for col in range(3):
+            self.assertEqual(len(segs_a[col][0]), len(segs_b[col][0]),
+                             f'column {col} widths differ between rows')
+        # Concrete widths: column field width + 2-space gap.
+        self.assertEqual(len(segs_a[0][0]), 7 + 2)
+        self.assertEqual(len(segs_a[1][0]), 7 + 2)
+        self.assertEqual(len(segs_a[2][0]), 12 + 2)
+
+    def test_non_commit_row_falls_back(self):
+        # A status/stash/ref/file row (no col_sha) must return EXACTLY
+        # default_row_content(item, ctx) and never measure a column.
+        ctx = _FakeCtx(self._widths())
+        item = self.r.Item(id='status:M :beta.txt', title='beta.txt',
+                           tag='M', tag_style='yellow', has_children=False)
+        segs = self.r.git_row_content(item, ctx)
+        self.assertEqual(segs, self.r.default_row_content(item, ctx))
+        self.assertEqual(segs,
+                         [('DEFAULT', 'status:M :beta.txt', 'beta.txt')])
+        # The fallback path must not measure columns.
+        self.assertEqual(ctx.calls, [])
+
+    def test_explicit_none_col_sha_also_falls_back(self):
+        # Defensive: col_sha present but None still takes the fallback.
+        ctx = _FakeCtx(self._widths())
+        item = self.r.Item(id='__error__', title='boom', col_sha=None)
+        segs = self.r.git_row_content(item, ctx)
+        self.assertEqual(segs, self.r.default_row_content(item, ctx))
+        self.assertEqual(ctx.calls, [])
 
 
 if __name__ == '__main__':
