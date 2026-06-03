@@ -7779,6 +7779,57 @@ class TestMarkdownSubtrees(unittest.TestCase):
             self.assertEqual(calls, [],
                              'self-heal settle must not move the cursor')
 
+    # ---- subagent report body renders as markdown (#689) ---------------
+
+    _SUBAGENT_TUR = {
+        'agentId': 'abcd1234efgh', 'agentType': 'general-purpose',
+        'status': 'completed', 'totalDurationMs': 12340,
+        'totalTokens': 1234, 'totalToolUseCount': 5,
+        'content': [{'type': 'text',
+                     'text': '# Report Heading\n\nbody paragraph.'}],
+    }
+
+    def test_subagent_report_body_md2ansi_when_color_on(self):
+        # #689: the Agent tool_result body IS a markdown report, so with
+        # _MD_COLOR on it must render through md2ansi like the voice
+        # renderers — NOT be appended raw. md2ansi consumes the ``# ``
+        # heading marker and wraps the heading text in its palette escape.
+        self.r._MD_COLOR = True   # setUp save/restores; explicit for clarity
+        out = self.r._fmt_tur_subagent(self._SUBAGENT_TUR)
+        # The heading was rendered: md2ansi's heading-color CSI is present
+        # and the literal ``# `` markdown marker is gone from the body.
+        self.assertIn('\x1b[0;38;5;226m', out)
+        self.assertIn('Report Heading', out)
+        self.assertNotIn('# Report Heading', out)
+
+    def test_subagent_report_body_raw_when_color_off(self):
+        # #689: with _MD_COLOR off (or md2ansi unavailable) _md_voice is a
+        # pass-through, so the body stays the literal markdown source —
+        # the ``# `` heading marker survives, unrendered.
+        self.r._MD_COLOR = False
+        out = self.r._fmt_tur_subagent(self._SUBAGENT_TUR)
+        self.assertIn('# Report Heading', out)
+        self.assertIn('body paragraph.', out)
+
+    def test_subagent_header_stats_unchanged_by_md_toggle(self):
+        # #689: only the report BODY goes through _md_voice — the
+        # ``🤖 agentType [status]`` head and the ``Ns · N tools · N tokens``
+        # stats line are NOT markdown and must be byte-identical on/off.
+        self.r._MD_COLOR = True
+        on = self.r._fmt_tur_subagent(self._SUBAGENT_TUR)
+        self.r._MD_COLOR = False
+        off = self.r._fmt_tur_subagent(self._SUBAGENT_TUR)
+        # Salient head/stats fields present regardless of the toggle.
+        for token in ('🤖', 'general-purpose', '[completed]', '12.3s',
+                      '5 tools', '1,234 tokens'):
+            self.assertIn(token, on)
+            self.assertIn(token, off)
+        # The head + stats prefix (the two lines before the blank-line gap
+        # that precedes the body) is identical across the toggle.
+        head_stats_on = on.split('\n\n', 1)[0]
+        head_stats_off = off.split('\n\n', 1)[0]
+        self.assertEqual(head_stats_on, head_stats_off)
+
 
 class TestBoundaryMigration(unittest.TestCase):
     """#662: ``boundary`` flag integration + the id-shape ``if`` migration.

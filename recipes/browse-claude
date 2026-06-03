@@ -2636,13 +2636,18 @@ def _fmt_tur_subagent(tur):
     stats = (f'{MUTE}{dur_ms/1000:.1f}s · {n_tools} tools · '
              f'{tokens:,} tokens{RESET}')
     out = [head, stats, '']
+    # The report BODY is a markdown document (it even gets a synthetic
+    # ``markdown`` child) — render it through _md_voice like the voice
+    # renderers, NOT raw. The head/stats above stay as-is (not markdown).
     content = tur.get('content')
+    chunks = []
     if isinstance(content, list):
         for p in content:
             if isinstance(p, dict) and p.get('type') == 'text':
-                out.append(p.get('text', ''))
+                chunks.append(p.get('text', '') or '')
     elif isinstance(content, str):
-        out.append(content)
+        chunks.append(content)
+    out.append(_md_voice('\n\n'.join(c for c in chunks if c)))
     return '\n'.join(out).rstrip()
 
 
