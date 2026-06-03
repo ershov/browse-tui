@@ -22,6 +22,9 @@ Coverage mirrors the design spec's ``md_doc`` testing strategy:
                         (TestResolveMdRef).
 * ``compose_md_id`` / ``parse_md_id`` — exact round-trip incl. awkward paths
                         and the line-offset suffix (TestIdCodec).
+* ``refs_umbrella_id`` / ``split_refs_umbrella`` — ``#refs`` marker round-trip
+                        and collision-free rejection of other id shapes
+                        (TestRefsUmbrellaId).
 * ``get_doc`` / ``clear_cache`` — cache hit + clear (TestCache).
 """
 
@@ -527,6 +530,42 @@ class TestIdCodec(unittest.TestCase):
     def test_parse_non_md_id_raises(self):
         with self.assertRaises(ValueError):
             md_doc.parse_md_id('/p/session.jsonl#42')
+
+
+class TestRefsUmbrellaId(unittest.TestCase):
+    """``refs_umbrella_id`` / ``split_refs_umbrella`` — ``#refs`` marker."""
+
+    def test_roundtrip_message_base(self):
+        # docid is a plain message base ``<jsonl>#<n>``.
+        docid = '/p/s.jsonl#3'
+        uid = md_doc.refs_umbrella_id(docid)
+        self.assertEqual(uid, '/p/s.jsonl#3#refs')
+        self.assertEqual(md_doc.split_refs_umbrella(uid), docid)
+
+    def test_roundtrip_md_file_doc(self):
+        # docid is a ``#md:`` file-doc id (a message base + an encoded segment).
+        docid = md_doc.compose_md_id('/p/s.jsonl#3', ['/a/x.md'])
+        uid = md_doc.refs_umbrella_id(docid)
+        self.assertEqual(md_doc.split_refs_umbrella(uid), docid)
+
+    def test_split_none_for_plain_message_id(self):
+        # A bare message id ends in ``#<digits>``, not ``#refs``.
+        self.assertIsNone(md_doc.split_refs_umbrella('/p/s.jsonl#3'))
+
+    def test_split_none_for_md_doc_id(self):
+        # A ``#md:`` document id ends in an encoded segment (no raw '#').
+        docid = md_doc.compose_md_id('/p/s.jsonl#3', ['/a/x.md'])
+        self.assertIsNone(md_doc.split_refs_umbrella(docid))
+
+    def test_split_none_for_md_heading_id(self):
+        # A ``#md:…#<lineoffset>`` heading id ends in ``#<digits>``.
+        heading = md_doc.compose_md_id('/p/s.jsonl#3', ['/a/x.md'], 7)
+        self.assertIsNone(md_doc.split_refs_umbrella(heading))
+
+    def test_split_none_for_non_md_id(self):
+        # A bare path and a ``#prompt:`` umbrella id are not refs umbrellas.
+        self.assertIsNone(md_doc.split_refs_umbrella('/some/file.md'))
+        self.assertIsNone(md_doc.split_refs_umbrella('/p/s.jsonl#prompt:3'))
 
 
 class TestCache(unittest.TestCase):

@@ -554,6 +554,47 @@ def parse_md_id(item_id):
     return base, abspaths, line_offset
 
 
+# ### Section: References-umbrella id ######################################
+
+# A synthetic "References" umbrella node groups a document's discovered ``.md``
+# references under one tree parent. Its id appends a ``#refs`` marker onto the
+# document's id (``docid``), where ``docid`` is either a message base
+# (``<jsonl>#<n>``) or a ``#md:`` file-doc id (``<base>#md:<enc>``). The ref
+# file-docs UNDER the umbrella keep their own ``<docid>#md:<enc>`` ids — the
+# umbrella is a tree-grouping parent, NOT a new hop in the id chain.
+#
+# The ``#refs`` marker is unambiguous and cannot collide with any other id
+# shape: a percent-encoded ``#md:`` chain segment never contains a raw ``#``
+# (``safe=''`` turned every ``#`` into ``%23``), a heading id ends in
+# ``#<digits>``, and a message base ends in ``#<digits>`` — none of those end
+# in the literal ``#refs``. So ``endswith('#refs')`` is a sufficient test and
+# no regex is needed.
+
+_REFS_MARKER = '#refs'
+
+
+def refs_umbrella_id(docid):
+    """Compose the References-umbrella id for a document id.
+
+    Appends the ``#refs`` marker onto ``docid`` (a message base or a ``#md:``
+    file-doc id). Inverse of ``split_refs_umbrella``.
+    """
+    return docid + _REFS_MARKER
+
+
+def split_refs_umbrella(item_id):
+    """Return the ``docid`` of a References-umbrella id, or ``None``.
+
+    If ``item_id`` ends with the ``#refs`` marker it names a References
+    umbrella; strip the marker to recover the document id. Otherwise return
+    ``None`` (it is some other id — a message id, a ``#md:`` doc/heading id, or
+    a different umbrella). Inverse of ``refs_umbrella_id``.
+    """
+    if item_id.endswith(_REFS_MARKER):
+        return item_id[:-len(_REFS_MARKER)]
+    return None
+
+
 # ### Section: Process-wide parse cache ####################################
 
 # A referenced file is read and scanned once regardless of how many places (or
