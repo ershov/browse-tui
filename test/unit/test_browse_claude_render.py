@@ -7058,6 +7058,64 @@ class TestMarkdownSubtrees(unittest.TestCase):
             # No heading in the text → no inline node; just the one file doc.
             self.assertEqual([k.title for k in kids], ['real.md'])
 
+    def test_message_children_absolute_tool_path_yields_file_doc(self):
+        # Regression (#671): a Write tool_use carrying an ABSOLUTE .md
+        # file_path now produces a file-doc child. Before the find_md_refs
+        # lookbehind fix the leading '/' was dropped, leaving a token that
+        # resolved relative to cwd/project_root — to nothing — so the child
+        # was silently lost. The target lives OUTSIDE the project dir, so it
+        # can ONLY resolve via resolve_md_ref's absolute branch (rule #1).
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, 'proj')
+            os.makedirs(proj)
+            # A report file outside the project source tree, named by abspath.
+            outside = os.path.join(tmp, 'out')
+            os.makedirs(outside)
+            report = os.path.join(outside, 'report.md')
+            with open(report, 'w') as f:
+                f.write('# Findings\n\nbody\n')
+            report_abs = os.path.realpath(report)
+
+            enc = self.r._encode_project_path(proj)
+            sess_dir = os.path.join(tmp, 'projects', enc)
+            os.makedirs(sess_dir)
+            sess = os.path.join(sess_dir, 'sid.jsonl')
+            with open(sess, 'w') as f:
+                f.write(_json.dumps({'type': 'assistant', 'cwd': proj,
+                    'message': {'content': [
+                        {'type': 'tool_use', 'name': 'Write',
+                         'input': {'file_path': report, 'contents': 'x'}}]}})
+                        + '\n')
+
+            # Pre-fix sanity: the de-slashed token (leading '/' stripped, as a
+            # bare \b would have produced) does NOT resolve against any base,
+            # i.e. the child genuinely depended on the absolute capture.
+            deslashed = report.lstrip('/')
+            self.assertIsNone(self.r._md_doc.resolve_md_ref(
+                deslashed, doc_dir=proj, cwd=proj, project_root=proj))
+
+            kids = self.r._md_message_children(f'{sess}#0')
+            # No heading in the record → no inline node; exactly one file doc.
+            self.assertEqual(len(kids), 1, kids)
+            (filedoc,) = kids
+            self.assertEqual(filedoc.tag, 'md')
+            self.assertEqual(filedoc.kind, 'md-doc')
+            self.assertTrue(filedoc.boundary)
+            self.assertEqual(filedoc.md_abspath, report_abs)
+            # Id is abspath-canonical: it round-trips to the absolute realpath,
+            # proving the leading '/' survived find_md_refs and resolved via
+            # the absolute branch.
+            self.assertEqual(
+                self.r._md_doc.parse_md_id(filedoc.id),
+                (f'{sess}#0', [report_abs], None))
+            # Label is the recipe's own anchor-relative rule (outside the
+            # project → home-collapsed absolute), not a hardcoded literal.
+            self.assertEqual(
+                filedoc.title,
+                self.r._md_ref_label(report_abs, proj, proj))
+
     def test_message_children_sorted_by_label(self):
         import json as _json
         import tempfile

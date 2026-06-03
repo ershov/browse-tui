@@ -198,6 +198,39 @@ class TestTriggersAndRefs(unittest.TestCase):
         # A '*' is excluded; a bare glob yields no capture.
         self.assertEqual(md_doc.find_md_refs('docs/*.md'), [])
 
+    def test_refs_capture_absolute_path(self):
+        # An absolute path keeps its leading '/' — the lookbehind anchors the
+        # token at the first non-separator char, not the first word char (a
+        # bare \b would drop the '/' and make resolve_md_ref's absolute branch
+        # dead code).
+        self.assertEqual(
+            md_doc.find_md_refs('see /home/u/report.md here'),
+            ['/home/u/report.md'])
+
+    def test_refs_capture_tilde_path(self):
+        # A '~'-prefixed path keeps its leading '~' (a bare \b would drop it).
+        self.assertEqual(
+            md_doc.find_md_refs('open ~/notes.md please'), ['~/notes.md'])
+
+    def test_refs_capture_absolute_in_json(self):
+        # The primary use case: an absolute file_path inside a raw JSONL line.
+        # The leading '/' survives and the surrounding '"' is still excluded.
+        self.assertEqual(
+            md_doc.find_md_refs('{"file_path": "/abs/x.md"}'), ['/abs/x.md'])
+
+    def test_refs_relative_unchanged_by_lookbehind(self):
+        # Relative refs (no leading separator) capture exactly as before.
+        self.assertEqual(
+            md_doc.find_md_refs('wrote report.md and docs/notes.md'),
+            ['report.md', 'docs/notes.md'])
+
+    def test_refs_exclude_mdx_and_trailing_dot(self):
+        # The trailing \b is kept: '.mdx' is not a '.md' ref, and a sentence
+        # period after '.md' is not captured into the token.
+        self.assertEqual(md_doc.find_md_refs('a.mdx'), [])
+        self.assertEqual(
+            md_doc.find_md_refs('see report.md. done'), ['report.md'])
+
 
 class TestResolveMdRef(unittest.TestCase):
     """``resolve_md_ref`` — base precedence + first-existing + None."""
@@ -270,6 +303,36 @@ class TestResolveMdRef(unittest.TestCase):
             got = md_doc.resolve_md_ref(ref, doc_dir=d, cwd=d, project_root=d)
             self.assertEqual(got, os.path.realpath(os.path.join(d, 'sub', 'x.md')))
             self.assertNotIn('..', got)
+
+    def test_find_then_resolve_absolute_branch(self):
+        # End-to-end: an absolute .md path that flows through find_md_refs now
+        # keeps its leading '/' and so resolves via resolve_md_ref's absolute
+        # branch (rule #1). Before the lookbehind fix the leading '/' was
+        # dropped, leaving a cwd-relative token that did not exist — making the
+        # absolute branch unreachable dead code.
+        with tempfile.TemporaryDirectory() as d:
+            ap = os.path.join(d, 'sub', 'report.md')
+            self._write(ap, 'ABS')
+            (ref,) = md_doc.find_md_refs(f'wrote {ap} done')
+            self.assertEqual(ref, ap)  # leading '/' preserved
+            self.assertTrue(os.path.isabs(ref))
+            # Bases all point elsewhere; only the absolute branch can resolve it.
+            got = md_doc.resolve_md_ref(
+                ref, doc_dir='/nowhere', cwd='/nowhere', project_root='/nowhere')
+            self.assertEqual(got, os.path.realpath(ap))
+
+    def test_find_then_resolve_tilde_branch(self):
+        # End-to-end: a '~' .md path flows through find_md_refs keeping its '~'
+        # and resolves via expanduser (the absolute branch after expansion).
+        with tempfile.TemporaryDirectory() as home:
+            self._write(os.path.join(home, 'note.md'), 'TILDE')
+            (ref,) = md_doc.find_md_refs('open ~/note.md please')
+            self.assertEqual(ref, '~/note.md')  # leading '~' preserved
+            with mock.patch.dict(os.environ, {'HOME': home}):
+                got = md_doc.resolve_md_ref(
+                    ref, doc_dir='/x', cwd='/y', project_root='/z')
+            self.assertEqual(
+                got, os.path.realpath(os.path.join(home, 'note.md')))
 
 
 class TestIdCodec(unittest.TestCase):
