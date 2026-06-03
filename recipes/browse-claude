@@ -1669,8 +1669,8 @@ def _md_ref_label(abspath, cwd, project_root):
     return _collapse_home(abspath)
 
 
-# Heading level (1..6) → row tag / colour style, matching browse-md's map.
-# Styling is finalised in #661; here we set just enough for rows to render.
+# Heading level (1..6) → row tag / colour style, matching browse-md's map
+# (h1 loud red at the top, cycling down to a muted gray h6).
 _MD_HEADING_STYLE = {
     1: 'red', 2: 'yellow', 3: 'green', 4: 'blue', 5: 'magenta', 6: 'gray',
 }
@@ -1710,7 +1710,7 @@ def _md_file_item(base, abspaths, label):
         id=_md_doc.compose_md_id(base, abspaths),
         title=label,
         tag='md',
-        tag_style='blue',          # cross-file / attachment hue (see #661)
+        tag_style='blue',          # cross-file / attachment hue (vs dim inline)
         has_children=True,         # optimistic; self-heals on expand
         boundary=True,
     )
@@ -1772,7 +1772,7 @@ def _md_message_children(base):
             id=_md_doc.compose_md_id(base, []),
             title='markdown',
             tag='md',
-            tag_style='dim',       # same-file index hue (see #661)
+            tag_style='dim',       # muted same-file index (vs blue file docs)
             has_children=True,     # confirmed ≥1 heading
             boundary=False,        # inline content is same-file, not foreign
         )
@@ -1809,6 +1809,34 @@ def _md_node_at_line(doc_tree, line_offset):
     return None
 
 
+def _md_chain_doc(base, abspaths):
+    """Resolve a ``#md:`` chain's *last* document to ``(text, doc_tree)``.
+
+    The chain's terminal document is what both the subtree build and the
+    preview route operate on: a non-empty ``abspaths`` ends in a referenced
+    file (read + parsed once via ``md_doc.get_doc``'s process-wide cache); an
+    empty chain is the message's own inline content (``_message_md_text`` of the
+    ``<base>`` record, parsed with ``build_doc_tree``). Returns ``(None, None)``
+    when the document is unreadable / the base id has no valid line number — the
+    callers treat that as "no children / empty preview".
+    """
+    if abspaths:
+        try:
+            return _md_doc.get_doc(abspaths[-1])
+        except OSError:
+            return None, None
+    suffix = base.rpartition('#')[2]
+    try:
+        n = int(suffix)
+    except ValueError:
+        return None, None
+    rec = _read_jsonl_line(base.partition('#')[0], n)
+    if rec is None:
+        return None, None
+    text = _message_md_text(rec)
+    return text, _md_doc.build_doc_tree(text)
+
+
 def _md_subtree_children(item_id):
     """Children for a ``#md:`` node — the lazy, authoritative build.
 
@@ -1834,24 +1862,9 @@ def _md_subtree_children(item_id):
     base, abspaths, line_offset = _md_doc.parse_md_id(item_id)
     path = base.partition('#')[0]
 
-    # Build (or fetch) the tree of the chain's last document.
-    if abspaths:
-        abspath = abspaths[-1]
-        try:
-            text, doc_tree = _md_doc.get_doc(abspath)
-        except OSError:
-            return []
-    else:
-        suffix = base.rpartition('#')[2]
-        try:
-            n = int(suffix)
-        except ValueError:
-            return []
-        rec = _read_jsonl_line(path, n)
-        if rec is None:
-            return []
-        text = _message_md_text(rec)
-        doc_tree = _md_doc.build_doc_tree(text)
+    text, doc_tree = _md_chain_doc(base, abspaths)
+    if doc_tree is None:
+        return []
 
     # Heading node → its nested sub-headings (no ref children).
     if line_offset is not None:
@@ -1869,6 +1882,36 @@ def _md_subtree_children(item_id):
                 text, doc_dir, cwd or '', project_root or ''):
             out.append(_md_file_item(base, abspaths + [ref_abspath], label))
     return out
+
+
+def _preview_md_node(item_id):
+    """Preview body for a ``#md:`` document or heading node.
+
+    Reads ONLY the node's own document — never a cross-item cascade:
+
+      * **document node** (no ``line_offset``) → that document's full text:
+        the message's inline content (empty chain) or the referenced file's
+        text (``md_doc.get_doc`` cache).
+      * **heading node** (``…#<lineoffset>``) → just that heading's section,
+        sliced ``text[byte_offset : byte_offset + byte_size]`` from the cached
+        ``doc_tree`` (the boundary rule includes the heading's own sub-sections
+        and stops at the next sibling-or-shallower heading).
+
+    Both are rendered through ``_md_voice`` — md2ansi when the ``_MD_COLOR``
+    toggle is on, raw text otherwise — which already falls back to the raw
+    string if md2ansi raises. Returns ``''`` for an unreadable document or a
+    line offset that matches no heading.
+    """
+    base, abspaths, line_offset = _md_doc.parse_md_id(item_id)
+    text, doc_tree = _md_chain_doc(base, abspaths)
+    if text is None:
+        return ''
+    if line_offset is None:
+        return _md_voice(text)
+    node = _md_node_at_line(doc_tree, line_offset)
+    if node is None:
+        return ''
+    return _md_voice(text[node.byte_offset:node.byte_offset + node.byte_size])
 
 
 # ---- preview rendering ---------------------------------------------------
@@ -3039,11 +3082,11 @@ def get_preview(item_id):
     if '#prompt:' in item_id or '#tool:' in item_id or '#span:' in item_id:
         return _preview_umbrella(item_id)
     if '#md:' in item_id:
-        # Markdown document/heading node. A rich document/section preview
-        # lands in #661; for now return empty so the generic message-id
-        # branch below doesn't mis-parse the trailing ``#<lineoffset>`` as a
-        # record line number.
-        return ''
+        # Markdown document/heading node. Checked BEFORE the generic '#'
+        # message path so a trailing ``#<lineoffset>`` is never mis-read as a
+        # record line number. A no-op when ``_md_doc is None`` (no ``#md:`` id
+        # can exist then, but the guard keeps the branch self-contained).
+        return _preview_md_node(item_id) if _md_doc is not None else ''
     if '#' in item_id:
         path, _, lineno = item_id.rpartition('#')
         if lineno == '__truncated__':

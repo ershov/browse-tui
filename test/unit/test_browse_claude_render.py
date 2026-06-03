@@ -6860,18 +6860,21 @@ def _load_recipe_with_md_doc():
 
 
 class TestMarkdownSubtrees(unittest.TestCase):
-    """#660: markdown document-subtree detection + ``#md:`` get_children build.
+    """#660/#661: markdown document-subtree detection, build, preview, styling.
 
     Exercises the recipe's ``md_doc`` integration directly: the optimistic
     detection gate (``_md_has_children``), the lazy authoritative subtree build
     (``_md_message_children`` / ``_md_subtree_children``), recursion across
-    referenced files, and the ``_on_children_loaded`` self-heal. The recipe is
-    reloaded with ``md_doc`` live (see ``_load_recipe_with_md_doc``); a separate
-    test forces ``_md_doc = None`` to assert graceful degradation.
+    referenced files, the ``_on_children_loaded`` self-heal, and (#661) the
+    ``#md:`` preview routing — full document text for a document node, the
+    byte-range section slice for a heading node, the ``_MD_COLOR`` toggle, and
+    the relative-label rule. The recipe is reloaded with ``md_doc`` live (see
+    ``_load_recipe_with_md_doc``); a separate test forces ``_md_doc = None`` to
+    assert graceful degradation.
 
     Robust to shared-module-state pollution: ``md_doc``'s process-wide doc
-    cache is cleared and ``_BROWSER`` / ``_TREE_MODE`` are saved/restored in
-    setUp/tearDown.
+    cache is cleared and ``_BROWSER`` / ``_TREE_MODE`` / ``_MD_COLOR`` are
+    saved/restored in setUp/tearDown.
     """
 
     @classmethod
@@ -6884,8 +6887,10 @@ class TestMarkdownSubtrees(unittest.TestCase):
         # Save/restore mutable module state so order can't leak between tests.
         self._saved_browser = self.r._BROWSER
         self._saved_tree_mode = self.r._TREE_MODE
+        self._saved_md_color = self.r._MD_COLOR
         self.addCleanup(setattr, self.r, '_BROWSER', self._saved_browser)
         self.addCleanup(setattr, self.r, '_TREE_MODE', self._saved_tree_mode)
+        self.addCleanup(setattr, self.r, '_MD_COLOR', self._saved_md_color)
         self.r._BROWSER = None
         self.r._TREE_MODE = True
         # The recipe's per-file scan cache and md_doc's shared doc cache both
@@ -7188,14 +7193,163 @@ class TestMarkdownSubtrees(unittest.TestCase):
             finally:
                 self.r._md_doc = saved
 
-    def test_get_preview_md_id_returns_empty(self):
-        # #661 owns the rich preview; for now a #md: id must not crash the
-        # generic message-id preview path (which would mis-int the suffix).
+    def test_get_preview_md_id_unreadable_returns_empty(self):
+        # A #md: id whose base record / file is unreadable yields ''  — and
+        # crucially does NOT fall through to the generic message-id path (which
+        # would mis-int the ``#<lineoffset>`` suffix as a record line number).
         base = '/p/s.jsonl#3'
         heading_id = self.r._md_doc.compose_md_id(base, [], line_offset=12)
         self.assertEqual(self.r.get_preview(heading_id), '')
         self.assertEqual(
             self.r.get_preview(self.r._md_doc.compose_md_id(base, [])), '')
+
+    # ---- preview routing: document & heading (#661) --------------------
+
+    def _sections_file(self, tmp):
+        """A two-sibling-h1 doc for boundary-slice assertions.
+
+        ``# First`` (with a ``## Sub`` nested under it) then a sibling
+        ``# Second``. The h1 section-slice must include the nested sub-section
+        but stop before the later sibling — the boundary rule. Returns
+        ``(abspath, text)``.
+        """
+        text = '# First\n\nalpha\n\n## Sub\n\nbeta\n\n# Second\n\ngamma\n'
+        path = os.path.join(tmp, 'sections.md')
+        with open(path, 'w') as f:
+            f.write(text)
+        return os.path.realpath(path), text
+
+    def test_preview_inline_document_is_full_text(self):
+        # Document node (empty chain) → the message's FULL inline markdown,
+        # rendered. With color on the body is ANSI-wrapped, so assert on the
+        # plain words that survive md2ansi (every prose token is present).
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            self.r._MD_COLOR = False    # raw text → exact substring assertions
+            inline_id = self.r._md_doc.compose_md_id(f'{sess}#0', [])
+            out = self.r.get_preview(inline_id)
+            # The whole inline document, not just a summary fragment.
+            for token in ('Plan', 'Summary', 'Risks', 'report.md'):
+                self.assertIn(token, out)
+
+    def test_preview_file_document_is_full_file_text(self):
+        # Document node for a referenced file → that file's full text (via the
+        # md_doc cache), rendered. report.md has every section + the onward ref.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            self.r._MD_COLOR = False
+            file_id = self.r._md_doc.compose_md_id(
+                f'{sess}#0', [os.path.realpath(report)])
+            out = self.r.get_preview(file_id)
+            for token in ('Findings', 'body', 'appendix.md', 'Detail'):
+                self.assertIn(token, out)
+
+    def test_preview_heading_is_section_slice_with_boundaries(self):
+        # Heading node → ONLY that heading's byte-range section. The h1 slice
+        # includes its own nested sub-section but excludes the next sibling h1.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path, text = self._sections_file(tmp)
+            self.r._MD_COLOR = False
+            base = '/p/s.jsonl#0'   # base record is irrelevant for a file chain
+            # ``# First`` is at line 0; render its section.
+            first_id = self.r._md_doc.compose_md_id(base, [path], line_offset=0)
+            out = self.r.get_preview(first_id)
+            self.assertIn('First', out)
+            self.assertIn('Sub', out)       # nested sub-section IS included
+            self.assertIn('beta', out)
+            self.assertNotIn('Second', out)  # later sibling is NOT included
+            self.assertNotIn('gamma', out)
+            # The slice is exactly the section's byte range (raw == slice).
+            _, tree = self.r._md_doc.get_doc(path)
+            node = self.r._md_node_at_line(tree, 0)
+            self.assertEqual(
+                out, text[node.byte_offset:node.byte_offset + node.byte_size])
+            # The sibling ``# Second`` (line 8) renders its own section.
+            second_id = self.r._md_doc.compose_md_id(
+                base, [path], line_offset=8)
+            sec = self.r.get_preview(second_id)
+            self.assertIn('Second', sec)
+            self.assertIn('gamma', sec)
+            self.assertNotIn('First', sec)
+
+    def test_preview_heading_missing_line_offset_returns_empty(self):
+        # A line offset that matches no heading (stale id) → '' (no crash).
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path, _ = self._sections_file(tmp)
+            bad = self.r._md_doc.compose_md_id(
+                '/p/s.jsonl#0', [path], line_offset=999)
+            self.assertEqual(self.r.get_preview(bad), '')
+
+    def test_preview_md_color_toggle(self):
+        # _MD_COLOR honoured: ON → ANSI in the body; OFF → raw text, no ESC.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            inline_id = self.r._md_doc.compose_md_id(f'{sess}#0', [])
+            self.r._MD_COLOR = True
+            self.assertIn('\x1b', self.r.get_preview(inline_id))
+            self.r._md_doc.clear_cache()   # not strictly needed (inline), tidy
+            self.r._MD_COLOR = False
+            off = self.r.get_preview(inline_id)
+            self.assertNotIn('\x1b', off)
+            self.assertIn('Summary', off)
+
+    # ---- labels (#661) -------------------------------------------------
+
+    def test_label_relative_to_project_root(self):
+        # A file inside the project root is labelled relative to it (the id
+        # stays abspath-canonical; only the displayed title is relative).
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            kids = self.r._md_message_children(f'{sess}#0')
+            filedoc = next(k for k in kids if k.tag == 'md' and k.boundary)
+            self.assertEqual(filedoc.title, 'report.md')
+            # Id carries the absolute path, not the relative label.
+            _, abspaths, _ = self.r._md_doc.parse_md_id(filedoc.id)
+            self.assertEqual(abspaths, [os.path.realpath(report)])
+
+    def test_label_rule_anchor_precedence(self):
+        # The label rule (``_md_ref_label``) is a pure function over the two
+        # anchors; exercise all three branches directly so we don't depend on
+        # the resolver's prose-token handling:
+        #   1. inside project_root  -> relative to project_root (preferred),
+        #   2. inside cwd only      -> relative to cwd,
+        #   3. inside neither       -> ``~``-collapsed absolute path.
+        home = os.environ.get('HOME') or os.path.expanduser('~')
+        root = '/work/repo'
+        cwd = '/work/repo/sub'         # cwd nested under the root
+        # (1) file under the root (but not under cwd) -> root-relative.
+        self.assertEqual(
+            self.r._md_ref_label('/work/repo/docs/a.md', cwd, root),
+            'docs/a.md')
+        # (2) file under cwd but with a different (non-ancestor) root ->
+        #     cwd-relative (root checked first, misses, cwd matches).
+        self.assertEqual(
+            self.r._md_ref_label('/work/repo/sub/b.md', cwd, '/other/root'),
+            'b.md')
+        # (3) file under neither anchor -> ``~``-collapsed absolute path,
+        #     never a ``../`` relpath.
+        ext = os.path.join(home, 'elsewhere', 'c.md')
+        label = self.r._md_ref_label(ext, cwd, root)
+        self.assertEqual(label, self.r._collapse_home(ext))
+        self.assertTrue(label.startswith('~/'))
+        self.assertNotIn('../', label)
+
+    def test_inline_node_title_is_markdown(self):
+        # The inline (same-file) document node's title is the literal
+        # "markdown" — never a path label.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            kids = self.r._md_message_children(f'{sess}#0')
+            inline = next(k for k in kids if not k.boundary)
+            self.assertEqual(inline.title, 'markdown')
+            self.assertEqual(inline.tag_style, 'dim')
 
     # ---- self-heal -----------------------------------------------------
 
