@@ -515,6 +515,33 @@ def _status_diff_plan(xy, path):
     return plan
 
 
+def _status_leaf(xy, path):
+    """Build one ``status:<XY>:<path>`` working-tree leaf Item.
+
+    Shared by ``_status_root`` (status mode) and ``_worktree_files`` (the
+    commits-mode worktree groups) so both render a working-tree entry the
+    same way: a non-expandable leaf titled by its path, tagged with the
+    one-letter status (``_status_tag``) colored by kind. The leaf preview
+    is the staged / worktree / untracked diff chosen from the ``XY`` code.
+    """
+    tag = _status_tag(xy)
+    return Item(id=f'status:{xy}:{path}', title=path,
+                tag=tag,
+                tag_style=_STATUS_LETTER_STYLE.get(tag, ''),
+                has_children=False)
+
+
+# Worktree groups for commits mode — the ordered (bucket, label) pairs
+# defining BOTH the display order of the synthetic status rows and their
+# titles. Mirrors the four ``_classify_worktree`` buckets.
+_WC_GROUPS = [
+    ('untracked', 'Untracked changes'),
+    ('tracked', 'Tracked changes'),
+    ('staged', 'Staged changes'),
+    ('conflicts', 'Conflicts'),
+]
+
+
 def _err_item(msg):
     """Return a single non-expandable error Item to render in the list."""
     return [Item(id='__error__', title=msg, tag='err', tag_style='red')]
@@ -544,6 +571,10 @@ def get_children(item_id, *, reload=False):
         # A ref drills into its commits — the shared commit-log builder
         # with the refname as the sole rev. parsed = ('ref', refname).
         return _commit_log_items([parsed[1]], [])
+    if kind == 'wc':
+        # A worktree-status group drills into its files. parsed = ('wc',
+        # bucket); scope by the same positional paths as the root.
+        return _worktree_files(parsed[1], _paths)
     # file / leaf / error rows have no children.
     return []
 
@@ -564,8 +595,64 @@ def _root_children():
 
 
 def _commits_root():
-    """Commits-mode root = the ``git log`` for the positional rev/path filter."""
-    return _commit_log_items(_revs, _paths)
+    """Commits-mode root = worktree status groups + the ``git log``.
+
+    The synthetic worktree-status rows (``_worktree_groups``) are prepended
+    ONLY when no positional rev is in play: a rev roots the log at a
+    historical point, where live working-tree rows would be misleading. A
+    path filter is still honored (passed through to both the groups and the
+    log), so e.g. ``browse-git src/`` shows the working-tree changes under
+    ``src/`` above its commit history.
+    """
+    items = []
+    if not _revs:
+        items.extend(_worktree_groups(_paths))
+    items.extend(_commit_log_items(_revs, _paths))
+    return items
+
+
+def _worktree_status(paths):
+    """``git status --porcelain -z`` rows as ``[(XY, path)]``, scoped by paths.
+
+    Returns the parsed ``_parse_porcelain_z`` rows on success. On any git
+    failure it returns ``[]`` — degrading quietly to "no worktree rows"
+    rather than injecting an error row at the top of the commit log.
+    """
+    args = ['status', '--porcelain', '-z']
+    if paths:
+        args += ['--', *paths]
+    result = _run_git(*args)
+    if result.returncode != 0:
+        return []
+    return _parse_porcelain_z(result.stdout)
+
+
+def _worktree_groups(paths):
+    """Synthetic worktree-group rows for the commits-mode root.
+
+    Classifies ``_worktree_status(paths)`` into the four ``_WC_GROUPS``
+    buckets and emits one expandable ``wc:<bucket>`` row per NON-empty
+    bucket, in ``_WC_GROUPS`` order, titled by the group label. A clean
+    tree (no changes) yields ``[]`` — no rows at all.
+    """
+    buckets = _classify_worktree(_worktree_status(paths))
+    items = []
+    for bucket, label in _WC_GROUPS:
+        if buckets[bucket]:
+            items.append(Item(id=f'wc:{bucket}', title=label,
+                              has_children=True))
+    return items
+
+
+def _worktree_files(bucket, paths):
+    """Files in one worktree ``bucket`` as ``status:<XY>:<path>`` leaves.
+
+    Re-runs status + classify (cheap; keeps the groups self-contained) and
+    returns that bucket's ``(XY, path)`` entries as the shared
+    ``_status_leaf`` items. An unknown bucket name yields ``[]``.
+    """
+    buckets = _classify_worktree(_worktree_status(paths))
+    return [_status_leaf(xy, path) for xy, path in buckets.get(bucket, [])]
 
 
 def _commit_log_items(revs, paths):
@@ -702,14 +789,7 @@ def _status_root():
     if not rows:
         return [Item(id='status:clean', title='working tree clean',
                      tag_style='dim', has_children=False)]
-    items = []
-    for xy, path in rows:
-        tag = _status_tag(xy)
-        items.append(Item(id=f'status:{xy}:{path}', title=path,
-                          tag=tag,
-                          tag_style=_STATUS_LETTER_STYLE.get(tag, ''),
-                          has_children=False))
-    return items
+    return [_status_leaf(xy, path) for xy, path in rows]
 
 
 def _stash_root():
@@ -885,6 +965,10 @@ def get_preview(item_id):
         if parsed[2]:
             return _status_preview(parsed[1], parsed[2])
         return ''
+    if kind == 'wc':
+        # A worktree-status group — combined colored diff for the bucket,
+        # scoped to the same positional paths. parsed = ('wc', bucket).
+        return _worktree_preview(parsed[1], _paths)
     if kind == 'stash':
         # parsed = ('stash', n) node or ('stash', n, path) leaf. The "no
         # stashes" sentinel has a non-numeric n — guard it out.
@@ -934,6 +1018,40 @@ def _status_preview(xy, path):
         else:
             sections.append(body)
     return '\n\n'.join(s for s in sections if s)
+
+
+def _worktree_preview(bucket, paths):
+    """Combined colored diff for a worktree ``bucket``, scoped to its files.
+
+    Computes the bucket's own paths via ``_classify_worktree`` so e.g. the
+    tracked preview never pulls in staged-only files. The diff command is
+    chosen by bucket:
+
+      * ``staged``    → ``diff --cached -- <bucket paths>``
+      * ``tracked``   → ``diff -- <bucket paths>``
+      * ``conflicts`` → ``diff -- <bucket paths>`` (git renders unmerged
+        paths in combined ``--cc`` form)
+      * ``untracked`` → per file, ``diff --no-index -- /dev/null <path>``,
+        concatenated (untracked files have no index entry to diff against)
+
+    Each diff is run git-colored and piped through ``_colorize_diff``.
+    Returns ``''`` for an empty bucket or an unknown name.
+    """
+    buckets = _classify_worktree(_worktree_status(paths))
+    bucket_paths = [path for _xy, path in buckets.get(bucket, [])]
+    if not bucket_paths:
+        return ''
+    if bucket == 'staged':
+        raw = _git_color('diff', '--cached', '--', *bucket_paths)
+    elif bucket in ('tracked', 'conflicts'):
+        raw = _git_color('diff', '--', *bucket_paths)
+    elif bucket == 'untracked':
+        raw = ''.join(
+            _git_color('diff', '--no-index', '--', '/dev/null', path)
+            for path in bucket_paths)
+    else:
+        return ''
+    return _colorize_diff(raw)
 
 
 def _stash_preview(n):

@@ -990,5 +990,151 @@ class TestUnmergedTagStyle(unittest.TestCase):
             self.assertTrue(self.r._STATUS_LETTER_STYLE[letter], letter)
 
 
+class TestWorktreeGroups(unittest.TestCase):
+    """``_worktree_groups`` emits one expandable row per non-empty bucket."""
+
+    def setUp(self):
+        self.r = _load_recipe()
+
+    def test_ordering_and_labels(self):
+        # All four buckets non-empty: rows follow _WC_GROUPS order, ids are
+        # wc:<bucket>, titles are the group labels, all expandable.
+        self.r._worktree_status = lambda paths: [
+            ('??', 'new.txt'),
+            (' M', 'w.txt'),
+            ('M ', 's.txt'),
+            ('UU', 'c.txt'),
+        ]
+        items = self.r._worktree_groups([])
+        self.assertEqual(
+            [(it.id, it.title) for it in items],
+            [('wc:untracked', 'Untracked changes'),
+             ('wc:tracked', 'Tracked changes'),
+             ('wc:staged', 'Staged changes'),
+             ('wc:conflicts', 'Conflicts')])
+        self.assertTrue(all(it.has_children for it in items))
+
+    def test_only_non_empty_buckets_appear(self):
+        # Only untracked + staged have files → only those two rows, in order.
+        self.r._worktree_status = lambda paths: [
+            ('??', 'new.txt'),
+            ('M ', 's.txt'),
+        ]
+        items = self.r._worktree_groups([])
+        self.assertEqual([it.id for it in items],
+                         ['wc:untracked', 'wc:staged'])
+
+    def test_clean_tree_yields_no_rows(self):
+        # A clean tree (status → []) produces no synthetic rows at all.
+        self.r._worktree_status = lambda paths: []
+        self.assertEqual(self.r._worktree_groups([]), [])
+
+    def test_groups_constant_shape(self):
+        # _WC_GROUPS defines BOTH order and labels for the four buckets.
+        self.assertEqual(self.r._WC_GROUPS, [
+            ('untracked', 'Untracked changes'),
+            ('tracked', 'Tracked changes'),
+            ('staged', 'Staged changes'),
+            ('conflicts', 'Conflicts'),
+        ])
+
+
+class TestCommitsRootWorktreeScope(unittest.TestCase):
+    """``_commits_root`` prepends worktree rows ONLY for a clean (no-rev) log."""
+
+    def setUp(self):
+        self.r = _load_recipe()
+
+    def test_revs_suppress_worktree_rows(self):
+        # A positional rev makes the log historical — no live wc: rows.
+        self.r._revs = ['HEAD~1']
+        self.r._paths = []
+        sentinel = self.r.Item(id='commit:sentinel', title='s',
+                               has_children=True)
+        self.r._commit_log_items = lambda revs, paths: [sentinel]
+        self.r._worktree_status = lambda paths: [('M ', 's.txt')]
+        items = self.r._commits_root()
+        ids = [getattr(it, 'id', None) for it in items]
+        self.assertIn('commit:sentinel', ids)
+        self.assertFalse(any(str(i).startswith('wc:') for i in ids))
+
+    def test_no_revs_prepends_worktree_rows(self):
+        # With no rev, the wc: rows appear BEFORE the commit rows.
+        self.r._revs = []
+        self.r._paths = []
+        sentinel = self.r.Item(id='commit:sentinel', title='s',
+                               has_children=True)
+        self.r._commit_log_items = lambda revs, paths: [sentinel]
+        self.r._worktree_status = lambda paths: [('M ', 's.txt')]
+        items = self.r._commits_root()
+        ids = [getattr(it, 'id', None) for it in items]
+        self.assertEqual(ids, ['wc:staged', 'commit:sentinel'])
+
+
+class TestWorktreeFiles(unittest.TestCase):
+    """``_worktree_files`` returns one bucket's files as ``status:`` leaves."""
+
+    def setUp(self):
+        self.r = _load_recipe()
+
+    def test_returns_only_that_buckets_files(self):
+        self.r._worktree_status = lambda paths: [
+            ('M ', 's.txt'),
+            (' M', 'w.txt'),
+            ('??', 'new.txt'),
+        ]
+        items = self.r._worktree_files('staged', [])
+        self.assertEqual([it.id for it in items], ['status:M :s.txt'])
+        it = items[0]
+        self.assertEqual(it.title, 's.txt')
+        self.assertEqual(it.tag, 'M')
+        self.assertEqual(it.tag_style, 'yellow')
+        self.assertFalse(it.has_children)
+
+    def test_unknown_bucket_is_empty(self):
+        self.r._worktree_status = lambda paths: [('M ', 's.txt')]
+        self.assertEqual(self.r._worktree_files('nope', []), [])
+
+    def test_empty_bucket_is_empty(self):
+        self.r._worktree_status = lambda paths: [('M ', 's.txt')]
+        self.assertEqual(self.r._worktree_files('conflicts', []), [])
+
+
+class TestStatusLeafDedup(unittest.TestCase):
+    """``_status_root`` and ``_worktree_files`` share ``_status_leaf``."""
+
+    def setUp(self):
+        self.r = _load_recipe()
+
+    def test_status_root_builds_status_leaf_items(self):
+        # Stub _run_git so status --porcelain -z returns canned -z text;
+        # the rows _status_root builds must equal _status_leaf for the same
+        # (xy, path) — proving both paths share the one constructor.
+        data = 'M  s.txt\x00 M w.txt\x00?? new.txt\x00'
+
+        def fake_run_git(*args):
+            if args and args[0] == 'status':
+                return subprocess.CompletedProcess(args, 0, data, '')
+            return subprocess.CompletedProcess(args, 1, '', '')
+
+        self.r._run_git = fake_run_git
+        items = self.r._status_root()
+        expected = [self.r._status_leaf(xy, path) for xy, path in (
+            ('M ', 's.txt'), (' M', 'w.txt'), ('??', 'new.txt'))]
+        self.assertEqual(
+            [(it.id, it.tag, it.tag_style, it.title, it.has_children)
+             for it in items],
+            [(e.id, e.tag, e.tag_style, e.title, e.has_children)
+             for e in expected])
+
+    def test_status_leaf_shape(self):
+        leaf = self.r._status_leaf('??', 'new.txt')
+        self.assertEqual(leaf.id, 'status:??:new.txt')
+        self.assertEqual(leaf.title, 'new.txt')
+        self.assertEqual(leaf.tag, '?')
+        self.assertEqual(leaf.tag_style, 'dim')
+        self.assertFalse(leaf.has_children)
+
+
 if __name__ == '__main__':
     unittest.main()
