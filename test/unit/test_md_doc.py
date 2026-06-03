@@ -370,6 +370,19 @@ class TestCache(unittest.TestCase):
             self.assertIsNot(tree1, tree2)
             self.assertEqual(tree2[0].title, 'H2')
 
+    def test_invalid_utf8_byte_still_parses_headings(self):
+        # A referenced .md with a stray non-UTF-8 byte must not raise
+        # UnicodeDecodeError — get_doc decodes with errors='replace' so the
+        # headings still parse (the substituted U+FFFD never reads as a #).
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, 'bad.md')
+            with open(p, 'wb') as f:
+                f.write(b'# Heading\n\nbody with a bad byte \xff here\n## Sub\n')
+            text, tree = md_doc.get_doc(p)
+            self.assertEqual([n.title for n in tree], ['Heading'])
+            self.assertEqual([c.title for c in tree[0].children], ['Sub'])
+            self.assertIn('�', text)  # the bad byte was replaced
+
 
 if __name__ == '__main__':
     unittest.main()

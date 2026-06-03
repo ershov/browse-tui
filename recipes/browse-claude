@@ -64,6 +64,18 @@ try:
 except Exception:
     _md2ansi_fn = None
 
+# Optional md_doc plugin — turns a message's markdown (its inline content and
+# the ``.md`` files it references) into a navigable document subtree. The
+# import is guarded exactly like ``md2ansi`` above: when it fails (the sibling
+# recipe / its ``md2ansi_lib`` dep isn't importable) ``_md_doc`` is ``None`` and
+# the WHOLE feature degrades to a no-op — no message row gains markdown
+# children, detection never fires, and ``#md:`` routing is dead code. Every
+# other behaviour is unchanged.
+try:
+    import md_doc as _md_doc
+except Exception:
+    _md_doc = None
+
 _MD_COLOR = _md2ansi_fn is not None  # default on when available
 _BROWSER = None  # set in main() — used for preview-width lookup
 
@@ -416,6 +428,13 @@ def get_children(item_id, *, reload=False):
         if reload:
             _TREE_CACHE.clear()
             _TAIL_STATE.clear()
+            # Drop the shared markdown parse cache too, so a root Ctrl-R
+            # re-reads any referenced ``.md`` files edited on disk. (A
+            # per-file ``_bust_caches_for`` can't reach these — they live
+            # outside the session tree — so the full wipe is the right
+            # granularity.) No-op when md_doc isn't importable.
+            if _md_doc is not None:
+                _md_doc.clear_cache()
         return _list_projects()
     if isinstance(item_id, str) and '#agent:' in item_id:
         # Tree mode views the subagent .jsonl as its own tree, recursing
@@ -460,10 +479,21 @@ def get_children(item_id, *, reload=False):
                 return []
             return _list_span_records(path, start)
         return []
+    if isinstance(item_id, str) and _md_doc is not None and '#md:' in item_id:
+        # ``<base>#md:…`` — a node inside a message's markdown document
+        # subtree (inline doc, file doc, or heading). Built lazily and
+        # authoritatively here; mode-agnostic (works in tree AND flat). Dead
+        # code when ``_md_doc is None`` (the gate above never let a ``#md:``
+        # id be created, so this never fires either way).
+        return _md_subtree_children(item_id)
     if isinstance(item_id, str) and '#' in item_id:
-        # Regular message id ``<path>#<n>`` — always a leaf in tree
-        # mode now (umbrellas own all the expansion). Flat mode never
-        # had children for these.
+        # Regular message id ``<path>#<n>``. When ``md_doc`` is present, a
+        # message gains markdown children (its inline document + referenced
+        # ``.md`` files) — built lazily here, mode-agnostic. Otherwise it is a
+        # leaf in tree mode (umbrellas own all the expansion) and flat mode
+        # never had children for these.
+        if _md_doc is not None:
+            return _md_message_children(item_id)
         return []
     if isinstance(item_id, str) and item_id.endswith('.jsonl') and os.path.isfile(item_id):
         if _TREE_MODE:
@@ -1001,7 +1031,10 @@ def _list_messages(jsonl_path, limit=None):
             title=_oneline(_summarise_message(obj)),
             tag=_row_tag(kind, obj),
             tag_style=_TAG_STYLE_FOR_KIND.get(kind, ''),
-            has_children=False,
+            # Optimistic markdown-subtree detection — see ``_tree_item``. The
+            # feature is mode-agnostic, so flat-mode rows gain the same arrow;
+            # ``get_children`` returns the document nodes regardless of mode.
+            has_children=_md_has_children(obj),
             hidden=not _passes_filter(item_id, td),
         )
         item.kind = 'message'
@@ -1511,6 +1544,331 @@ def _extract_text(content):
     if content is None:
         return ''
     return str(content)
+
+
+# ---- markdown document subtrees (md_doc integration) ---------------------
+#
+# When ``md_doc`` is importable, a message that contains markdown headings OR
+# references existing ``.md`` files on disk becomes expandable into a document
+# subtree: an inline ``markdown`` document node plus one node per referenced
+# file, each drillable into its own heading tree, recursively. Detection is a
+# cheap regex gate run at item-build time (optimistic — it may over-trigger);
+# the authoritative tree is built lazily on expand in ``get_children`` and
+# self-heals a stale arrow via ``_on_children_loaded``. Ids use the ``#md:``
+# codec in ``md_doc`` so routing stays a ``'#md:' in item_id`` substring test.
+# The whole section is a no-op when ``_md_doc is None``.
+
+
+def _message_md_text(rec):
+    """The message's markdown text: every ``text`` part + any ``tool_result``
+    text, joined with blank lines.
+
+    This is the inline document's source — what ``md_doc.build_doc_tree`` /
+    ``md_heading_trigger`` scan for headings. Unlike ``_extract_text`` (which
+    returns the *first* useful fragment for a one-line summary), this collects
+    ALL prose: every ``type=='text'`` content part, plus the textual body of
+    any ``type=='tool_result'`` part (its ``content`` string, or the ``text``
+    of its content sub-parts). ``thinking`` and ``tool_use`` parts are skipped
+    — they aren't the message's authored markdown. A bare-string ``content`` is
+    returned verbatim. Returns ``''`` for a record with no text.
+    """
+    msg = rec.get('message') if isinstance(rec, dict) else None
+    content = msg.get('content') if isinstance(msg, dict) else None
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ''
+    chunks = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        ptype = part.get('type')
+        if ptype == 'text':
+            t = part.get('text', '') or ''
+            if t:
+                chunks.append(t)
+        elif ptype == 'tool_result':
+            inner = part.get('content')
+            if isinstance(inner, str):
+                if inner:
+                    chunks.append(inner)
+            elif isinstance(inner, list):
+                for sub in inner:
+                    if isinstance(sub, dict) and sub.get('type') == 'text':
+                        t = sub.get('text', '') or ''
+                        if t:
+                            chunks.append(t)
+    return '\n\n'.join(chunks)
+
+
+def _iter_str_leaves(obj):
+    """Yield every ``str`` leaf reachable in a nested dict/list ``obj``.
+
+    A short-circuit-friendly depth-first walk over the record's structure —
+    the detection gate's cheap alternative to ``json.dumps(rec)``. Dict values
+    and list elements are descended; keys are skipped (a JSON key is never a
+    document path). The caller can stop pulling at the first match, so a record
+    whose first text part already names a ``.md`` file never walks the rest.
+    """
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            yield from _iter_str_leaves(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _iter_str_leaves(v)
+
+
+def _record_has_md_ref(rec):
+    """True iff any string leaf of ``rec`` contains a ``.md`` reference token.
+
+    Short-circuiting: walks ``rec``'s string leaves (``_iter_str_leaves``) and
+    stops at the FIRST ``.md`` hit via ``md_doc.find_md_refs`` — far cheaper
+    than serialising the whole record. No ``os.stat`` here (detection is
+    optimistic; existence is checked lazily on expand, and a dead token
+    self-heals). Sees ``Write``/``Read``/``Edit`` tool paths and prose alike.
+    """
+    if _md_doc is None:
+        return False
+    for s in _iter_str_leaves(rec):
+        if _md_doc.find_md_refs(s):
+            return True
+    return False
+
+
+def _md_has_children(rec):
+    """Detection gate: should this message row carry an expansion arrow?
+
+    ``True`` when ``md_doc`` is present AND the message either has a markdown
+    heading (``md_heading_trigger`` over its extracted text) or references a
+    ``.md`` file anywhere in the record (``_record_has_md_ref``). Pure regex,
+    no disk I/O — intentionally *optimistic* (a ``#`` inside a code fence, or a
+    ``.md`` token that doesn't resolve, both trigger here and self-heal on the
+    first expand). A no-op (``False``) when ``_md_doc is None``.
+    """
+    if _md_doc is None:
+        return False
+    if _md_doc.md_heading_trigger(_message_md_text(rec)):
+        return True
+    return _record_has_md_ref(rec)
+
+
+def _md_ref_label(abspath, cwd, project_root):
+    """Display label for a referenced ``.md`` file, against a single anchor.
+
+    Rendered relative to ONE common anchor so a flat sibling list reads cleanly
+    without ``../`` noise: relative to ``project_root`` if the file is inside
+    it, else relative to ``cwd`` if inside it, else a ``~``-collapsed absolute
+    path. The label lives on the ``Item`` (never in the id — the id is
+    abspath-canonical).
+    """
+    for anchor in (project_root, cwd):
+        if anchor and (abspath == anchor or abspath.startswith(anchor.rstrip('/') + '/')):
+            return os.path.relpath(abspath, anchor)
+    return _collapse_home(abspath)
+
+
+# Heading level (1..6) → row tag / colour style, matching browse-md's map.
+# Styling is finalised in #661; here we set just enough for rows to render.
+_MD_HEADING_STYLE = {
+    1: 'red', 2: 'yellow', 3: 'green', 4: 'blue', 5: 'magenta', 6: 'gray',
+}
+
+
+def _md_heading_item(base, abspaths, node):
+    """Map an ``md_doc`` heading ``MdNode`` to a tree-row ``Item``.
+
+    Id = ``compose_md_id(base, abspaths, node.line_offset)`` — selecting the
+    heading by its line within the chain's last document. ``has_children`` is
+    authoritative (we already have the parsed node), so heading rows never need
+    self-heal. ``boundary`` is left ``False`` — a heading is same-document
+    structure, not a foreign subtree.
+    """
+    item = Item(
+        id=_md_doc.compose_md_id(base, abspaths, line_offset=node.line_offset),
+        title=node.title,
+        tag=f'h{node.level}',
+        tag_style=_MD_HEADING_STYLE.get(node.level, ''),
+        has_children=bool(node.children),
+    )
+    item.kind = 'md-heading'
+    item.md_level = node.level
+    return item
+
+
+def _md_file_item(base, abspaths, label):
+    """Map a referenced ``.md`` file to a document tree-row ``Item``.
+
+    ``abspaths`` is the full chain ending in this file (so the id nests under
+    its referrer). ``has_children`` is optimistically ``True`` — we have not
+    read the file yet; it self-heals on expand if the file has no headings and
+    no further refs. ``boundary=True`` marks it a self-contained foreign
+    subtree so recursive/multi-expansion stops at it.
+    """
+    item = Item(
+        id=_md_doc.compose_md_id(base, abspaths),
+        title=label,
+        tag='md',
+        tag_style='blue',          # cross-file / attachment hue (see #661)
+        has_children=True,         # optimistic; self-heals on expand
+        boundary=True,
+    )
+    item.kind = 'md-doc'
+    item.md_abspath = abspaths[-1]
+    return item
+
+
+def _md_resolved_refs(text, doc_dir, cwd, project_root):
+    """Resolve the ``.md`` refs in ``text`` to existing abspaths.
+
+    Returns a list of ``(abspath, label)`` pairs: each captured token resolved
+    via ``md_doc.resolve_md_ref`` (existing-only — unresolved tokens dropped),
+    deduped by abspath (first occurrence wins), and sorted by label so the flat
+    sibling list reads stably. ``doc_dir`` is the referencing document's own
+    directory (``cwd`` for the inline document, ``dirname(file)`` for a file).
+    """
+    seen = set()
+    out = []
+    for captured in _md_doc.find_md_refs(text):
+        abspath = _md_doc.resolve_md_ref(
+            captured, doc_dir=doc_dir, cwd=cwd, project_root=project_root)
+        if abspath is None or abspath in seen:
+            continue
+        seen.add(abspath)
+        out.append((abspath, _md_ref_label(abspath, cwd, project_root)))
+    out.sort(key=lambda pair: pair[1])
+    return out
+
+
+def _md_message_children(base):
+    """Children of a markdown message row ``<base>`` (``<session>#<n>``).
+
+    The authoritative build (lazy, on expand): an inline ``markdown`` document
+    node (only when the message's own text actually parses to ≥1 heading) plus
+    one ``[md]`` node per *existing* ``.md`` file referenced ANYWHERE in the
+    record — prose or tool path — deduped by abspath and sorted by label. A
+    ref that appears in the inline text surfaces here as a message-level
+    sibling, not under the ``markdown`` node (which stays a pure heading index);
+    this yields one unified list of every file the message references directly
+    under it. Returns ``[]`` when neither holds (the optimistic detection arrow
+    then self-heals).
+    """
+    path = base.partition('#')[0]
+    suffix = base.rpartition('#')[2]
+    try:
+        n = int(suffix)
+    except ValueError:
+        return []
+    rec = _read_jsonl_line(path, n)
+    if rec is None:
+        return []
+
+    out = []
+    # Inline document node — only when the message's own text has a heading.
+    text = _message_md_text(rec)
+    if _md_doc.build_doc_tree(text):
+        inline = Item(
+            id=_md_doc.compose_md_id(base, []),
+            title='markdown',
+            tag='md',
+            tag_style='dim',       # same-file index hue (see #661)
+            has_children=True,     # confirmed ≥1 heading
+            boundary=False,        # inline content is same-file, not foreign
+        )
+        inline.kind = 'md-doc'
+        out.append(inline)
+
+    # File document nodes — every existing ``.md`` ref in the whole record.
+    cwd, project_root = _session_cwd_and_root(path)
+    doc_dir = cwd or project_root
+    # Gather refs across the record's string leaves (prose + tool paths), in
+    # document order, then resolve/dedup/sort uniformly via the file's text
+    # path. We feed the concatenated leaves so one ``find_md_refs`` pass and
+    # one dedup cover the whole record.
+    record_text = '\n'.join(_iter_str_leaves(rec))
+    for abspath, label in _md_resolved_refs(
+            record_text, doc_dir, cwd or '', project_root or ''):
+        out.append(_md_file_item(base, [abspath], label))
+    return out
+
+
+def _md_node_at_line(doc_tree, line_offset):
+    """Find the heading ``MdNode`` at ``line_offset`` in a doc tree, or None.
+
+    Walks the (already-built) tree depth-first — the tree is small (one
+    document's headings) so a linear search is fine and avoids stashing a
+    by-line index on the structural nodes.
+    """
+    for node in doc_tree:
+        if node.line_offset == line_offset:
+            return node
+        found = _md_node_at_line(node.children, line_offset)
+        if found is not None:
+            return found
+    return None
+
+
+def _md_subtree_children(item_id):
+    """Children for a ``#md:`` node — the lazy, authoritative build.
+
+    Routes on the parsed id shape (``md_doc.parse_md_id`` → ``(base, abspaths,
+    line_offset)``):
+
+      * **heading** (``line_offset`` set) → the sub-headings nested under it
+        (walk the chain's last document tree to the node at ``line_offset``,
+        return its children as heading rows). No reference children — refs live
+        at the document level, not under a heading.
+      * **inline document** (``abspaths == []``, no ``line_offset``) → the
+        top-level heading rows of the message's inline text. Its refs already
+        surface at the message level above, so none are added here.
+      * **file document** (``abspaths`` non-empty, no ``line_offset``) → the
+        top-level heading rows of that file PLUS a ``[md]`` node per existing
+        ``.md`` ref in THAT file's own text (resolved against the file's own
+        directory), nested onto the chain. Recursion (file → file) falls out of
+        this uniform rule; expand-in-place, no cycle/alias detection.
+
+    File text + tree come from ``md_doc.get_doc`` (process-wide cache). Returns
+    ``[]`` for an unreadable/heading-less document (self-heals the arrow).
+    """
+    base, abspaths, line_offset = _md_doc.parse_md_id(item_id)
+    path = base.partition('#')[0]
+
+    # Build (or fetch) the tree of the chain's last document.
+    if abspaths:
+        abspath = abspaths[-1]
+        try:
+            text, doc_tree = _md_doc.get_doc(abspath)
+        except OSError:
+            return []
+    else:
+        suffix = base.rpartition('#')[2]
+        try:
+            n = int(suffix)
+        except ValueError:
+            return []
+        rec = _read_jsonl_line(path, n)
+        if rec is None:
+            return []
+        text = _message_md_text(rec)
+        doc_tree = _md_doc.build_doc_tree(text)
+
+    # Heading node → its nested sub-headings (no ref children).
+    if line_offset is not None:
+        node = _md_node_at_line(doc_tree, line_offset)
+        if node is None:
+            return []
+        return [_md_heading_item(base, abspaths, ch) for ch in node.children]
+
+    # Document node → top-level headings, then (file docs only) ref children.
+    out = [_md_heading_item(base, abspaths, node) for node in doc_tree]
+    if abspaths:
+        cwd, project_root = _session_cwd_and_root(path)
+        doc_dir = os.path.dirname(abspaths[-1])
+        for ref_abspath, label in _md_resolved_refs(
+                text, doc_dir, cwd or '', project_root or ''):
+            out.append(_md_file_item(base, abspaths + [ref_abspath], label))
+    return out
 
 
 # ---- preview rendering ---------------------------------------------------
@@ -2680,6 +3038,12 @@ def get_preview(item_id):
         return _preview_file_metadata(file_path) if file_path else ''
     if '#prompt:' in item_id or '#tool:' in item_id or '#span:' in item_id:
         return _preview_umbrella(item_id)
+    if '#md:' in item_id:
+        # Markdown document/heading node. A rich document/section preview
+        # lands in #661; for now return empty so the generic message-id
+        # branch below doesn't mis-parse the trailing ``#<lineoffset>`` as a
+        # record line number.
+        return ''
     if '#' in item_id:
         path, _, lineno = item_id.rpartition('#')
         if lineno == '__truncated__':
@@ -3960,10 +4324,13 @@ def _list_span_records(jsonl_path, start_line):
 def _tree_item(jsonl_path, rec, td):
     """Build a leaf list-row ``Item`` for ``rec`` in tree mode.
 
-    Always ``has_children=False`` — wrapping into ``<prompt>`` / ``<tool>``
-    umbrellas is the listing layer's job (``_list_prompt_children`` /
-    ``_list_tool_children``). This builder produces the leaf
-    content-row that appears **inside** an umbrella's expansion.
+    Conversationally a leaf — wrapping into ``<prompt>`` / ``<tool>`` umbrellas
+    is the listing layer's job (``_list_prompt_children`` /
+    ``_list_tool_children``); this builder produces the content-row that
+    appears **inside** an umbrella's expansion. Its one expandable case is the
+    markdown subtree: ``has_children`` reflects ``_md_has_children(rec)`` (a
+    no-op ``False`` when ``md_doc`` is absent), so a row with markdown headings
+    or a ``.md`` reference still gains the document-subtree arrow.
     """
     n = td.line_of.get(rec.get('uuid'))
     if n is None:
@@ -3981,7 +4348,10 @@ def _tree_item(jsonl_path, rec, td):
         title=_oneline(_summarise_message(rec)),
         tag=_row_tag(kind, rec),
         tag_style=_TAG_STYLE_FOR_KIND.get(kind, ''),
-        has_children=False,
+        # Optimistic markdown-subtree detection (no-op when md_doc absent):
+        # a heading or a ``.md`` ref earns an expansion arrow, built lazily by
+        # ``get_children`` and self-healed by ``_on_children_loaded`` if false.
+        has_children=_md_has_children(rec),
         hidden=not _passes_filter(item_id, td),
     )
     item.kind = 'message'
@@ -5345,6 +5715,49 @@ def _on_children_loaded(ctx, parent_ids):
             _AWAITING_VOICE_JUMP.discard(pid)
             if pid in ctx.state.expanded:
                 _jump_to_latest_voice(ctx, pid)
+        _md_self_heal(ctx, pid)
+
+
+def _md_self_heal(ctx, parent_id):
+    """Retract a false-positive markdown expansion arrow once its build is in.
+
+    Detection (the ``_md_has_children`` gate) and freshly-built file-doc nodes
+    are *optimistic* — they arrow without reading the file, so a ``#`` that
+    lives only inside a code fence, or a ``.md`` token that doesn't resolve,
+    earns an arrow that the authoritative ``get_children`` build then reveals
+    as empty. When such a markdown-managed parent settles to NO children, push
+    a ``mod(id, has_children=False)`` so the arrow disappears on next render.
+
+    Markdown-managed = (md_doc present) and the id is either a ``#md:`` node or
+    a plain message id ``<jsonl>#<n>``. Other parents (umbrellas, sessions) are
+    never md-optimistic, so we leave them untouched — a real umbrella with no
+    visible children keeps its arrow as before. No-op when the children aren't
+    cached yet or are non-empty, or when there's no browser to push to.
+    """
+    if _md_doc is None or _BROWSER is None:
+        return
+    if not isinstance(parent_id, str):
+        return
+    if '#md:' not in parent_id and not _is_md_message_id(parent_id):
+        return
+    kids = ctx.cached_children(parent_id)
+    if kids == []:
+        ctx.update_data([mod(parent_id, has_children=False)])
+
+
+def _is_md_message_id(item_id):
+    """True iff ``item_id`` is a plain message id ``<jsonl>#<n>``.
+
+    A message id whose markdown arrow the detection gate may have set
+    optimistically — the parent shape the self-heal also covers. Excludes the
+    keyword-selector ids (``#prompt:`` / ``#tool:`` / ``#span:`` / ``#agent:``
+    / ``#md:``) and the ``#__truncated__`` sentinel: those are not message
+    leaves and never carry a markdown arrow.
+    """
+    path, sep, suffix = item_id.rpartition('#')
+    if not sep or not suffix.isdigit():
+        return False
+    return path.endswith('.jsonl')
 
 
 def _action_tree_right(ctx):

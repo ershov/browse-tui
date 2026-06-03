@@ -6822,5 +6822,449 @@ class TestTaskNotification(unittest.TestCase):
         self.assertIn('Just a normal prompt.', out)
 
 
+def _load_recipe_with_md_doc():
+    """Reload the recipe with ``recipes/`` on ``sys.path`` so ``md_doc`` resolves.
+
+    The shared ``_load_recipe`` loads with the default path, where neither
+    ``md2ansi_lib`` nor ``md_doc`` is importable — so its module's ``_md_doc``
+    is ``None`` (the markdown feature is dormant). The markdown-subtree tests
+    need the live module, so they reload with the recipes dir prepended (as the
+    recipe gets at runtime — the framework prepends its dir), then restore
+    ``sys.path`` and drop the transient ``md_doc`` import so other test classes
+    keep seeing the no-md baseline.
+    """
+    recipes_dir = str(_REPO / 'recipes')
+    added = recipes_dir not in sys.path
+    if added:
+        sys.path.insert(0, recipes_dir)
+    saved_md_doc = sys.modules.get('md_doc')
+    saved_md2ansi = sys.modules.get('md2ansi_lib')
+    try:
+        return _load_recipe()
+    finally:
+        if added:
+            try:
+                sys.path.remove(recipes_dir)
+            except ValueError:
+                pass
+        # Restore the module table so the default (md-less) recipe load other
+        # classes rely on isn't perturbed by our transient imports.
+        if saved_md_doc is None:
+            sys.modules.pop('md_doc', None)
+        else:
+            sys.modules['md_doc'] = saved_md_doc
+        if saved_md2ansi is None:
+            sys.modules.pop('md2ansi_lib', None)
+        else:
+            sys.modules['md2ansi_lib'] = saved_md2ansi
+
+
+class TestMarkdownSubtrees(unittest.TestCase):
+    """#660: markdown document-subtree detection + ``#md:`` get_children build.
+
+    Exercises the recipe's ``md_doc`` integration directly: the optimistic
+    detection gate (``_md_has_children``), the lazy authoritative subtree build
+    (``_md_message_children`` / ``_md_subtree_children``), recursion across
+    referenced files, and the ``_on_children_loaded`` self-heal. The recipe is
+    reloaded with ``md_doc`` live (see ``_load_recipe_with_md_doc``); a separate
+    test forces ``_md_doc = None`` to assert graceful degradation.
+
+    Robust to shared-module-state pollution: ``md_doc``'s process-wide doc
+    cache is cleared and ``_BROWSER`` / ``_TREE_MODE`` are saved/restored in
+    setUp/tearDown.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe_with_md_doc()
+
+    def setUp(self):
+        self.assertIsNotNone(
+            self.r._md_doc, 'md_doc must be importable for these tests')
+        # Save/restore mutable module state so order can't leak between tests.
+        self._saved_browser = self.r._BROWSER
+        self._saved_tree_mode = self.r._TREE_MODE
+        self.addCleanup(setattr, self.r, '_BROWSER', self._saved_browser)
+        self.addCleanup(setattr, self.r, '_TREE_MODE', self._saved_tree_mode)
+        self.r._BROWSER = None
+        self.r._TREE_MODE = True
+        # The recipe's per-file scan cache and md_doc's shared doc cache both
+        # persist across tests — clear both each way.
+        self.r._TREE_CACHE.clear()
+        self.r._SESSION_CWDS_CACHE.clear()
+        self.r._md_doc.clear_cache()
+        self.addCleanup(self.r._TREE_CACHE.clear)
+        self.addCleanup(self.r._SESSION_CWDS_CACHE.clear)
+        self.addCleanup(self.r._md_doc.clear_cache)
+
+    # ---- fixture -------------------------------------------------------
+
+    def _build_project(self, tmp):
+        """A temp project + session whose messages exercise every path.
+
+        Layout (``cwd`` = the project source dir ``proj/``)::
+
+            proj/report.md      → references appendix.md  (recursion)
+            proj/appendix.md     → a leaf doc (no further refs)
+            projects/<enc>/sid.jsonl
+
+        Session records:
+
+          * #0 — headings (``# Summary`` / ``## Risks``) AND a ``report.md``
+                  ref in prose: detection True, builds inline + file docs.
+          * #1 — plain prose, no heading, no ref: detection False.
+          * #2 — a ``Write`` tool path naming ``missing.md`` (does NOT exist)
+                  and no heading: detection True (optimistic), but the build
+                  yields ``[]`` → self-heal target.
+
+        Returns ``(sess_path, proj_dir, report_md, appendix_md)``.
+        """
+        import json as _json
+        proj = os.path.join(tmp, 'proj')
+        os.makedirs(proj)
+        appendix = os.path.join(proj, 'appendix.md')
+        report = os.path.join(proj, 'report.md')
+        with open(appendix, 'w') as f:
+            f.write('# Appendix\n\ndetails\n')
+        with open(report, 'w') as f:
+            f.write('# Findings\n\nbody\n\nSee appendix.md for more.\n'
+                    '## Detail\n\nx\n')
+        # Encode proj into the Claude project-dir name the recipe resolves
+        # cwd/root from (matches _encode_project_path).
+        enc = self.r._encode_project_path(proj)
+        sess_dir = os.path.join(tmp, 'projects', enc)
+        os.makedirs(sess_dir)
+        sess = os.path.join(sess_dir, 'sid.jsonl')
+        recs = [
+            {'type': 'user', 'cwd': proj, 'message': {'content': [
+                {'type': 'text',
+                 'text': 'Plan\n# Summary\n## Risks\nsee report.md'}]}},
+            {'type': 'assistant', 'cwd': proj, 'message': {'content': [
+                {'type': 'text', 'text': 'just chatting, nothing here'}]}},
+            {'type': 'assistant', 'cwd': proj, 'message': {'content': [
+                {'type': 'tool_use', 'name': 'Write',
+                 'input': {'file_path': 'missing.md', 'contents': 'x'}}]}},
+        ]
+        with open(sess, 'w') as f:
+            for rc in recs:
+                f.write(_json.dumps(rc) + '\n')
+        return sess, proj, report, appendix
+
+    # ---- detection -----------------------------------------------------
+
+    def test_detection_heading_message(self):
+        rec = {'message': {'content': [
+            {'type': 'text', 'text': '# Heading\n\nbody'}]}}
+        self.assertTrue(self.r._md_has_children(rec))
+
+    def test_detection_ref_message_prose(self):
+        rec = {'message': {'content': [
+            {'type': 'text', 'text': 'I wrote it to docs/report.md today'}]}}
+        self.assertTrue(self.r._md_has_children(rec))
+
+    def test_detection_ref_message_tool_path(self):
+        # The ref lives in a tool_use input, not prose — the string-leaf walk
+        # must still find it (covers Write/Read/Edit paths).
+        rec = {'message': {'content': [
+            {'type': 'tool_use', 'name': 'Read',
+             'input': {'file_path': 'notes.md'}}]}}
+        self.assertTrue(self.r._md_has_children(rec))
+
+    def test_detection_plain_message_false(self):
+        rec = {'message': {'content': [
+            {'type': 'text', 'text': 'no heading, no reference at all'}]}}
+        self.assertFalse(self.r._md_has_children(rec))
+
+    def test_detection_code_fence_hash_triggers_optimistically(self):
+        # A ``#`` only inside a fenced code block fires the cheap regex gate
+        # (md_heading_trigger is line-anchored, not fence-aware). This is the
+        # intended optimism; the build later self-heals.
+        rec = {'message': {'content': [
+            {'type': 'text', 'text': '```\n# not a heading\n```'}]}}
+        self.assertTrue(self.r._md_has_children(rec))
+
+    def test_detection_quote_not_a_ref(self):
+        # ``.md`` inside a JSON-ish quoted token does not pollute the match:
+        # the ref regex excludes ``"``. A bare ``"x"`` with no .md is plainly
+        # negative; assert a quote-only string with no real path is False.
+        rec = {'message': {'content': [
+            {'type': 'text', 'text': 'discuss markdown in general'}]}}
+        self.assertFalse(self.r._md_has_children(rec))
+
+    def test_detection_graceful_noop_when_md_doc_none(self):
+        # Force the feature off; detection must be a hard no-op even for a
+        # record that would otherwise trigger.
+        saved = self.r._md_doc
+        try:
+            self.r._md_doc = None
+            rec = {'message': {'content': [
+                {'type': 'text', 'text': '# Heading and a docs/x.md ref'}]}}
+            self.assertFalse(self.r._md_has_children(rec))
+        finally:
+            self.r._md_doc = saved
+
+    # ---- message-level build: inline + file docs -----------------------
+
+    def test_message_children_inline_plus_file_doc(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            base = f'{sess}#0'
+            kids = self.r._md_message_children(base)
+            self.assertEqual(len(kids), 2, kids)
+            inline, filedoc = kids
+            # Inline document node: empty #md: chain, same-file (boundary off).
+            self.assertEqual(inline.id, f'{base}#md:')
+            self.assertEqual(inline.title, 'markdown')
+            self.assertFalse(inline.boundary)
+            self.assertTrue(inline.has_children)
+            self.assertEqual(inline.tag, 'md')
+            # File document node: report.md, foreign subtree (boundary on),
+            # optimistic has_children, label relative to the project root.
+            self.assertEqual(filedoc.title, 'report.md')
+            self.assertTrue(filedoc.boundary)
+            self.assertTrue(filedoc.has_children)
+            self.assertEqual(filedoc.tag, 'md')
+            self.assertEqual(
+                self.r._md_doc.parse_md_id(filedoc.id),
+                (base, [os.path.realpath(report)], None))
+
+    def test_message_children_dedup_and_existing_only(self):
+        # A message referencing the same existing file twice + a non-existent
+        # one yields exactly one file-doc node (deduped, existing-only).
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, 'proj')
+            os.makedirs(proj)
+            real = os.path.join(proj, 'real.md')
+            with open(real, 'w') as f:
+                f.write('# R\n')
+            enc = self.r._encode_project_path(proj)
+            sess_dir = os.path.join(tmp, 'projects', enc)
+            os.makedirs(sess_dir)
+            sess = os.path.join(sess_dir, 'sid.jsonl')
+            with open(sess, 'w') as f:
+                f.write(_json.dumps({'type': 'user', 'cwd': proj, 'message': {
+                    'content': [{'type': 'text', 'text':
+                                 'real.md and again real.md plus ghost.md'}]}})
+                        + '\n')
+            kids = self.r._md_message_children(f'{sess}#0')
+            # No heading in the text → no inline node; just the one file doc.
+            self.assertEqual([k.title for k in kids], ['real.md'])
+
+    def test_message_children_sorted_by_label(self):
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, 'proj')
+            os.makedirs(proj)
+            for n in ('zeta.md', 'alpha.md'):
+                with open(os.path.join(proj, n), 'w') as f:
+                    f.write('# H\n')
+            enc = self.r._encode_project_path(proj)
+            sess_dir = os.path.join(tmp, 'projects', enc)
+            os.makedirs(sess_dir)
+            sess = os.path.join(sess_dir, 'sid.jsonl')
+            with open(sess, 'w') as f:
+                f.write(_json.dumps({'type': 'user', 'cwd': proj, 'message': {
+                    'content': [{'type': 'text',
+                                 'text': 'first zeta.md then alpha.md'}]}})
+                        + '\n')
+            kids = self.r._md_message_children(f'{sess}#0')
+            self.assertEqual([k.title for k in kids], ['alpha.md', 'zeta.md'])
+
+    def test_message_children_no_inline_when_no_heading(self):
+        # A message with a ref but NO heading must not emit an inline doc node.
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, 'proj')
+            os.makedirs(proj)
+            with open(os.path.join(proj, 'x.md'), 'w') as f:
+                f.write('# X\n')
+            enc = self.r._encode_project_path(proj)
+            sess_dir = os.path.join(tmp, 'projects', enc)
+            os.makedirs(sess_dir)
+            sess = os.path.join(sess_dir, 'sid.jsonl')
+            with open(sess, 'w') as f:
+                f.write(_json.dumps({'type': 'user', 'cwd': proj, 'message': {
+                    'content': [{'type': 'text',
+                                 'text': 'see x.md (no heading here)'}]}})
+                        + '\n')
+            kids = self.r._md_message_children(f'{sess}#0')
+            self.assertNotIn('markdown', [k.title for k in kids])
+            self.assertEqual(len(kids), 1)
+
+    # ---- inline document → headings ------------------------------------
+
+    def test_inline_doc_children_are_headings(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            base = f'{sess}#0'
+            inline_id = self.r._md_doc.compose_md_id(base, [])
+            kids = self.r._md_subtree_children(inline_id)
+            # Inline text: "Plan" / "# Summary" / "## Risks" / "see report.md"
+            # → one top-level heading (Summary), Risks nests under it.
+            self.assertEqual([k.title for k in kids], ['Summary'])
+            self.assertEqual(kids[0].tag, 'h1')
+            self.assertTrue(kids[0].has_children)
+            self.assertFalse(getattr(kids[0], 'boundary', False))
+
+    def test_heading_children_are_subheadings(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            base = f'{sess}#0'
+            # Summary heading sits at inline line_offset 1.
+            summary_id = self.r._md_doc.compose_md_id(base, [], line_offset=1)
+            kids = self.r._md_subtree_children(summary_id)
+            self.assertEqual([k.title for k in kids], ['Risks'])
+            self.assertEqual(kids[0].tag, 'h2')
+            self.assertFalse(kids[0].has_children)
+
+    # ---- file document → headings + nested file refs (recursion) -------
+
+    def test_file_doc_children_headings_plus_nested_ref(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            base = f'{sess}#0'
+            report_real = os.path.realpath(report)
+            file_id = self.r._md_doc.compose_md_id(base, [report_real])
+            kids = self.r._md_subtree_children(file_id)
+            titles = [k.title for k in kids]
+            # report.md: "# Findings" (with "## Detail" nested) + a ref to
+            # appendix.md → one heading row + one file-doc row.
+            self.assertEqual(titles, ['Findings', 'appendix.md'])
+            heading, nested = kids
+            self.assertEqual(heading.tag, 'h1')
+            self.assertFalse(getattr(heading, 'boundary', False))
+            self.assertEqual(nested.tag, 'md')
+            self.assertTrue(nested.boundary)
+            # Nested ref id chains report.md → appendix.md.
+            self.assertEqual(
+                self.r._md_doc.parse_md_id(nested.id),
+                (base, [report_real, os.path.realpath(appendix)], None))
+
+    def test_recursion_file_to_file_expands(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            base = f'{sess}#0'
+            chain = [os.path.realpath(report), os.path.realpath(appendix)]
+            appendix_id = self.r._md_doc.compose_md_id(base, chain)
+            kids = self.r._md_subtree_children(appendix_id)
+            # appendix.md is a leaf doc: just its "# Appendix" heading, no refs.
+            self.assertEqual([k.title for k in kids], ['Appendix'])
+            self.assertEqual(kids[0].tag, 'h1')
+
+    # ---- routing through get_children ----------------------------------
+
+    def test_get_children_routes_message_and_md_ids(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            base = f'{sess}#0'
+            # Message id → inline + file docs (same as _md_message_children).
+            via_router = self.r.get_children(base)
+            self.assertEqual([k.title for k in via_router],
+                             ['markdown', 'report.md'])
+            # #md: id → routed to the subtree builder.
+            inline_id = self.r._md_doc.compose_md_id(base, [])
+            self.assertEqual(
+                [k.title for k in self.r.get_children(inline_id)], ['Summary'])
+
+    def test_get_children_message_is_leaf_without_md_doc(self):
+        # With the feature off, a message id is a leaf again (no md children).
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            saved = self.r._md_doc
+            try:
+                self.r._md_doc = None
+                self.assertEqual(self.r.get_children(f'{sess}#0'), [])
+            finally:
+                self.r._md_doc = saved
+
+    def test_get_preview_md_id_returns_empty(self):
+        # #661 owns the rich preview; for now a #md: id must not crash the
+        # generic message-id preview path (which would mis-int the suffix).
+        base = '/p/s.jsonl#3'
+        heading_id = self.r._md_doc.compose_md_id(base, [], line_offset=12)
+        self.assertEqual(self.r.get_preview(heading_id), '')
+        self.assertEqual(
+            self.r.get_preview(self.r._md_doc.compose_md_id(base, [])), '')
+
+    # ---- self-heal -----------------------------------------------------
+
+    def test_self_heal_flips_has_children_off_on_empty(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            # Message #2 is the optimistic false positive: its only .md token
+            # (missing.md) doesn't exist and it has no heading.
+            base = f'{sess}#2'
+            self.assertTrue(self.r._md_has_children(
+                self.r._read_jsonl_line(sess, 2)))     # arrow was set
+            self.assertEqual(self.r.get_children(base), [])  # build is empty
+
+            fake = _FakeBrowser()
+            self.r._BROWSER = fake
+            fake._children_cache[base] = []            # settled to no children
+
+            class _Ctx:
+                state = type('S', (), {'expanded': set()})()
+
+                def cached_children(self, id_):
+                    return fake.cached_children(id_)
+
+                def update_data(self, ops):
+                    return fake.update_data(ops)
+
+            self.r._on_children_loaded(_Ctx(), [base])
+            # The self-heal pushed exactly a mod(base, has_children=False) op
+            # (the _FakeBrowser records ops; applying a 'mod' isn't part of its
+            # minimal apply, so we assert on the emitted op — the recipe's
+            # contract — rather than on a fixture-applied field).
+            flat_ops = [op for batch in fake.update_data_calls for op in batch]
+            self.assertTrue(
+                any(op[0] == 'mod' and op[1] == base
+                    and op[3].get('has_children') is False
+                    for op in flat_ops),
+                flat_ops)
+
+    def test_self_heal_skips_nonempty_and_non_md_parents(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            fake = _FakeBrowser()
+            self.r._BROWSER = fake
+
+            class _Ctx:
+                state = type('S', (), {'expanded': set()})()
+
+                def cached_children(self, id_):
+                    return fake.cached_children(id_)
+
+                def update_data(self, ops):
+                    return fake.update_data(ops)
+
+            ctx = _Ctx()
+            # A real message id with NON-empty children: no retraction.
+            base0 = f'{sess}#0'
+            fake._children_cache[base0] = [_RecordingItem('child')]
+            # A non-md umbrella id settling empty: must be left alone.
+            umbrella = f'{sess}#prompt:0'
+            fake._children_cache[umbrella] = []
+            self.r._on_children_loaded(ctx, [base0, umbrella])
+            fake.flush()
+            flat_ops = [op for batch in fake.update_data_calls for op in batch]
+            self.assertEqual(
+                [op for op in flat_ops if op[0] == 'mod'], [],
+                'no self-heal mod for non-empty or non-md parents')
+
+
 if __name__ == '__main__':
     unittest.main()

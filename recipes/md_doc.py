@@ -509,12 +509,17 @@ def get_doc(abspath):
     ``resolve_md_ref`` so two routes to one file share an entry.
 
     I/O errors are not swallowed here: a caller resolves the ref to an existing
-    path before calling, and a read failure is worth surfacing.
+    path before calling, and a genuine read failure (permission, race) is worth
+    surfacing. Decoding, though, is best-effort — ``errors='replace'`` so a
+    referenced ``.md`` with a stray non-UTF-8 byte still parses its headings
+    (a substituted U+FFFD never reads as a structural ``#``) rather than
+    raising ``UnicodeDecodeError`` (a ``ValueError`` that would slip past a
+    caller's ``except OSError`` guard and surface an error banner).
     """
     cached = _DOC_CACHE.get(abspath)
     if cached is not None:
         return cached
-    with open(abspath, encoding='utf-8') as f:
+    with open(abspath, encoding='utf-8', errors='replace') as f:
         text = f.read()
     doc_tree = build_doc_tree(text)
     pair = (text, doc_tree)
