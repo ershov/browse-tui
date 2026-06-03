@@ -18,6 +18,7 @@ relies on hex-vs-word heuristics:
   file:<sha>:<path>     a file in a commit (leaf) -> per-file diff
   ref:<refname>         a branch/remote/tag -> commits on that ref
   status:<XY>:<path>    a working-tree entry (leaf) -> staged/worktree diff
+  wc:<bucket>           a status group (untracked/tracked/staged/conflicts)
   stash:<n>[:<path>]    a stash, or a file in one
   reflog:<n>:<sha>      a reflog entry    -> changed files
 
@@ -155,6 +156,7 @@ def _parse_id(item_id):
       ('file', sha, path)                path may contain ':'
       ('ref', refname)                   refname may contain ':' or '/'
       ('status', xy, path)               path may contain ':'
+      ('wc', bucket)                     a status group node
       ('stash', n)                       a stash node
       ('stash', n, path)                 a file within a stash
       ('reflog', n, sha)
@@ -176,6 +178,9 @@ def _parse_id(item_id):
 
     if kind == 'commit':
         return ('commit', rest)
+    if kind == 'wc':
+        # A status-group node — the remainder is the bucket name.
+        return ('wc', rest)
     if kind == 'ref':
         # Refnames carry '/' (origin/main) and, rarely, ':' — keep all.
         return ('ref', rest)
@@ -344,6 +349,7 @@ _STATUS_LETTER_STYLE = {
     'R': 'cyan',
     'C': 'cyan',
     'T': 'yellow',
+    'U': 'red',
     '?': 'dim',
 }
 
@@ -401,6 +407,62 @@ def _parse_porcelain_z(data):
     return rows
 
 
+# Porcelain XY codes that flag an unmerged (conflicted) path. Either
+# column being ``U``, or the matched-pair both-added / both-deleted forms
+# (``AA`` / ``DD``), means git is mid-merge on this path — the entry is a
+# conflict regardless of which side touched it.
+_UNMERGED_CODES = frozenset({'DD', 'AU', 'UD', 'UA', 'DU', 'AA', 'UU'})
+
+
+def _is_conflict(xy):
+    """True when a porcelain ``XY`` code names an unmerged (conflicted) path.
+
+    Conflict entries are the seven codes in ``_UNMERGED_CODES``; every
+    other code is an ordinary staged / worktree / untracked change.
+    """
+    return xy in _UNMERGED_CODES
+
+
+def _classify_worktree(rows):
+    """Bucket ``_parse_porcelain_z`` rows into the four worktree groups.
+
+    ``rows`` is the ``[(XY, path)]`` list from ``_parse_porcelain_z``.
+    Returns a dict with four lists, each holding the ``(XY, path)`` tuples
+    that belong to that group:
+
+      * ``'conflicts'`` — unmerged codes (``_is_conflict``); a conflict
+        lands here and ONLY here, never in staged / tracked, so a
+        mid-merge path shows up once.
+      * ``'untracked'`` — the ``??`` code.
+      * ``'staged'``    — a non-conflict code whose ``X`` column is set
+        (not a space, not ``?``).
+      * ``'tracked'``   — a non-conflict code whose ``Y`` column is set
+        (not a space, not ``?``).
+
+    Staged and tracked are NOT exclusive: a two-sided code such as ``MM``
+    (staged + unstaged modification) appears in BOTH lists.
+    """
+    buckets = {
+        'untracked': [],
+        'tracked': [],
+        'staged': [],
+        'conflicts': [],
+    }
+    for xy, path in rows:
+        if _is_conflict(xy):
+            buckets['conflicts'].append((xy, path))
+            continue
+        if xy == '??':
+            buckets['untracked'].append((xy, path))
+            continue
+        x, y = xy[0], xy[1] if len(xy) > 1 else ' '
+        if x not in (' ', '?'):
+            buckets['staged'].append((xy, path))
+        if y not in (' ', '?'):
+            buckets['tracked'].append((xy, path))
+    return buckets
+
+
 def _status_tag(xy):
     """Pick the one-letter status tag for a porcelain ``XY`` code.
 
@@ -424,9 +486,15 @@ def _status_diff_plan(xy, path):
     Returns a list of ``(header, argv)`` pairs — the per-file diff(s) whose
     colored output makes up the status-leaf preview:
 
+      * conflict (an unmerged code)        → ``diff -- <path>``
       * staged (``X`` set and not ``?``)   → ``diff --cached -- <path>``
       * worktree (``Y`` set and not ``?``) → ``diff -- <path>``
       * untracked (``??``)                 → ``diff --no-index -- /dev/null <path>``
+
+    Unmerged codes (``_is_conflict``) are handled FIRST, ahead of the
+    X/Y split, so a conflicted leaf shows a single ``diff -- <path>`` —
+    which git renders in combined (``--cc``) form for an unmerged path —
+    rather than two empty staged/worktree sections.
 
     A two-sided code (``MM``) yields BOTH the staged and worktree diffs,
     each under its own header. The ``argv`` lists are the args passed to
@@ -434,6 +502,8 @@ def _status_diff_plan(xy, path):
     ``--no-index`` diff exits non-zero whenever the files differ — the
     caller must NOT gate on the return code.
     """
+    if _is_conflict(xy):
+        return [('conflict', ['diff', '--', path])]
     if xy == '??':
         return [('untracked', ['diff', '--no-index', '--', '/dev/null', path])]
     x, y = xy[0], xy[1] if len(xy) > 1 else ' '

@@ -865,5 +865,130 @@ class TestGitRowContent(unittest.TestCase):
         self.assertEqual(ctx.calls, [])
 
 
+class TestParseIdWorktree(unittest.TestCase):
+    """``_parse_id`` understands the ``wc:<bucket>`` worktree-group kind."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_untracked_bucket(self):
+        self.assertEqual(self.r._parse_id('wc:untracked'),
+                         ('wc', 'untracked'))
+
+    def test_tracked_bucket(self):
+        self.assertEqual(self.r._parse_id('wc:tracked'), ('wc', 'tracked'))
+
+    def test_staged_bucket(self):
+        self.assertEqual(self.r._parse_id('wc:staged'), ('wc', 'staged'))
+
+    def test_conflicts_bucket(self):
+        self.assertEqual(self.r._parse_id('wc:conflicts'),
+                         ('wc', 'conflicts'))
+
+
+class TestIsConflict(unittest.TestCase):
+    """``_is_conflict`` flags the seven porcelain unmerged ``XY`` codes."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_all_unmerged_codes_are_conflicts(self):
+        for xy in ('DD', 'AU', 'UD', 'UA', 'DU', 'AA', 'UU'):
+            self.assertTrue(self.r._is_conflict(xy), xy)
+
+    def test_non_conflict_codes(self):
+        for xy in ('MM', 'M ', ' M', '??', 'A ', ' D', 'R '):
+            self.assertFalse(self.r._is_conflict(xy), xy)
+
+
+class TestClassifyWorktree(unittest.TestCase):
+    """``_classify_worktree`` buckets ``(XY, path)`` rows by group."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_conflict_codes_are_exclusive(self):
+        # A conflict row lands ONLY in conflicts — never staged/tracked,
+        # even though e.g. 'AA'/'DD' have both columns set.
+        for xy in ('UU', 'AA', 'DD'):
+            buckets = self.r._classify_worktree([(xy, 'c.txt')])
+            self.assertEqual(buckets['conflicts'], [(xy, 'c.txt')], xy)
+            self.assertEqual(buckets['staged'], [], xy)
+            self.assertEqual(buckets['tracked'], [], xy)
+            self.assertEqual(buckets['untracked'], [], xy)
+
+    def test_two_sided_code_is_both_staged_and_tracked(self):
+        buckets = self.r._classify_worktree([('MM', 'both.txt')])
+        self.assertEqual(buckets['staged'], [('MM', 'both.txt')])
+        self.assertEqual(buckets['tracked'], [('MM', 'both.txt')])
+        self.assertEqual(buckets['untracked'], [])
+        self.assertEqual(buckets['conflicts'], [])
+
+    def test_untracked_only(self):
+        buckets = self.r._classify_worktree([('??', 'new.txt')])
+        self.assertEqual(buckets['untracked'], [('??', 'new.txt')])
+        self.assertEqual(buckets['staged'], [])
+        self.assertEqual(buckets['tracked'], [])
+        self.assertEqual(buckets['conflicts'], [])
+
+    def test_staged_only(self):
+        buckets = self.r._classify_worktree([('M ', 's.txt')])
+        self.assertEqual(buckets['staged'], [('M ', 's.txt')])
+        self.assertEqual(buckets['tracked'], [])
+        self.assertEqual(buckets['untracked'], [])
+        self.assertEqual(buckets['conflicts'], [])
+
+    def test_tracked_only(self):
+        buckets = self.r._classify_worktree([(' M', 'w.txt')])
+        self.assertEqual(buckets['tracked'], [(' M', 'w.txt')])
+        self.assertEqual(buckets['staged'], [])
+        self.assertEqual(buckets['untracked'], [])
+        self.assertEqual(buckets['conflicts'], [])
+
+    def test_empty_input_all_buckets_empty(self):
+        buckets = self.r._classify_worktree([])
+        self.assertEqual(buckets, {
+            'untracked': [],
+            'tracked': [],
+            'staged': [],
+            'conflicts': [],
+        })
+
+
+class TestStatusDiffPlanConflict(unittest.TestCase):
+    """``_status_diff_plan`` shows one combined diff for unmerged codes."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_each_unmerged_code_yields_single_conflict_diff(self):
+        for xy in ('DD', 'AU', 'UD', 'UA', 'DU', 'AA', 'UU'):
+            self.assertEqual(
+                self.r._status_diff_plan(xy, 'f.txt'),
+                [('conflict', ['diff', '--', 'f.txt'])], xy)
+
+
+class TestUnmergedTagStyle(unittest.TestCase):
+    """Unmerged status letters resolve to a styled tag."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_u_letter_has_a_style(self):
+        self.assertIn('U', self.r._STATUS_LETTER_STYLE)
+        self.assertTrue(self.r._STATUS_LETTER_STYLE['U'])
+
+    def test_existing_conflict_letters_still_styled(self):
+        # 'AA'->'A', 'DD'->'D', 'UU'->'U' all resolve to a non-empty style.
+        for xy, letter in (('AA', 'A'), ('DD', 'D'), ('UU', 'U')):
+            self.assertEqual(self.r._status_tag(xy), letter, xy)
+            self.assertTrue(self.r._STATUS_LETTER_STYLE[letter], letter)
+
+
 if __name__ == '__main__':
     unittest.main()
