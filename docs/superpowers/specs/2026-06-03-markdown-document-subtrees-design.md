@@ -125,7 +125,15 @@ Two levels with a deliberate asymmetry:
   so it catches `Write`/`Read`/`Edit` tool paths, not just prose. A ref
   that appears in the inline text therefore surfaces as a message-level
   sibling of the `markdown` node, not under it; the `markdown` node stays
-  a pure heading index of the inline text.
+  a pure heading index of the inline text. This is deliberate — it avoids
+  listing a prose reference twice, and it yields one unified list of
+  every file the message references (prose or tool call) directly under
+  the message, rather than scattering refs between the `markdown` node
+  and the message level. (Separating them — scan only non-markdown fields
+  at the message level, defer prose refs to the expanded `markdown` node
+  — is possible but couples the message-level walker to the exact leaves
+  the markdown-text extractor consumes, and scatters the refs; not worth
+  it.)
 - **A referenced-file document** has children = its top-level headings
   **plus** one node per `.md` file referenced *in that file's own text*.
 
@@ -309,10 +317,14 @@ boundary: bool = False
 current document. The framework must (a) **not auto-expand or
 recursively walk into it** — recursive/multi-expand (`expand_subtree`
 and the Alt-Right path in `src-tui/040-state.py`) treats it as a leaf,
-expanding *to* it but never *through* it; the node stays manually
-expandable. Behaviour (b) — **not folding its descendants into an
-ancestor's preview cascade** — is honoured by recipes that build such
-cascades (the framework has no cross-item preview concept).
+expanding *to* it but never *through* it, **even when its children are
+already cached** from a prior manual expand. (Lazy expansion already
+skips *uncached* subtrees, so this is a no-op in the common case;
+`boundary` covers the cached case and makes the contract explicit.) The
+node stays manually expandable. Behaviour (b) — **not folding its
+descendants into an ancestor's preview cascade** — is honoured by
+recipes that build such cascades (the framework has no cross-item
+preview concept).
 
 **`browse-claude` consumers + migration (per the agreed cleanup):**
 
@@ -325,10 +337,10 @@ cascades (the framework has no cross-item preview concept).
   (looked up via `_BROWSER.get_item(item_id)`), preserving today's
   behaviour for `#agent:` / bare-`.jsonl` rows. Note the two `if`s serve
   different purposes (cascade-skip vs. metadata→cascade preview upgrade);
-  tests assert behaviour parity for the existing rows. Making subagent
-  groups `boundary` also means recursive/multi-expand now stops at a
-  subagent rather than auto-opening its whole transcript — an intended
-  improvement, called out here as a behaviour change.
+  tests assert behaviour parity for the existing rows. This is **not** a
+  behaviour change for subagents — recursive/multi-expansion is lazy and
+  already does not open an unopened subagent transcript; `boundary` only
+  makes that explicit and extends it to the previously-cached case.
 
 ## Preview
 
@@ -458,8 +470,7 @@ needs.
 - **`boundary` migration parity:** `_is_cross_file_id` and the
   `_walk_umbrella` skip serve subtly different purposes; the migration
   must preserve existing `#agent:` / `.jsonl` behaviour (asserted by
-  tests). Subagent recursive-expand now stopping at the boundary is an
-  intended behaviour change.
+  tests).
 - **Resolution I/O:** multi-base discovery does a few `os.stat`s per
   referenced token, but only on expand of a markdown message and only
   for tokens that matched the regex — bounded and lazy.
