@@ -944,6 +944,22 @@ class Item:
     ``hidden`` values are preserved). See ``docs/superpowers/specs/
     2026-05-16-row-visibility-design.md`` for the full semantics.
 
+    ``boundary`` (default ``False``) marks a node that heads a
+    *self-contained foreign subtree* — content sourced from outside the
+    current document (a referenced file, a subagent transcript, a bare
+    session). Recursive / multi-expansion (``expand_subtree`` and the
+    Alt-Right path in ``040-state.py``) treats it as a leaf: it expands
+    *to* the boundary node — the node itself may join ``state.expanded``
+    — but never *through* it, so its children/descendants are not
+    recursively expanded, **even when they are already cached** from a
+    prior manual expand. (Lazy expansion already skips *uncached*
+    subtrees, so this is a no-op in the common case; ``boundary`` covers
+    the cached case and makes the contract explicit.) The node stays
+    manually expandable. The other half of the contract — *not folding a
+    boundary's descendants into an ancestor's preview cascade* — is
+    honoured by recipes that build such cascades; the framework has no
+    cross-item preview concept.
+
     ``_filter_hidden`` is a framework-internal flag written by the
     filter evaluator (see ``docs/superpowers/specs/2026-05-17-filter-
     design.md``). Recipes do not see or set it: ``init=False`` keeps
@@ -974,6 +990,7 @@ class Item:
     tag_style: str = ''
     has_children: bool = False
     hidden: bool = False
+    boundary: bool = False
     _filter_hidden: bool = field(
         default=False, init=False, repr=False, compare=False,
     )
@@ -1045,7 +1062,8 @@ def to_item(x: Any) -> Item:
             raise TypeError("to_item: dict must contain 'id' key")
         # Split known dataclass fields from extras so we can attach the
         # rest as arbitrary attributes (Item is intentionally non-slotted).
-        known = {'id', 'title', 'tag', 'tag_style', 'has_children', 'hidden'}
+        known = {'id', 'title', 'tag', 'tag_style', 'has_children',
+                 'hidden', 'boundary'}
         fields = {k: v for k, v in x.items() if k in known}
         extras = {k: v for k, v in x.items() if k not in known}
         item = Item(**fields)
@@ -1724,7 +1742,8 @@ def _index_add_children(state: State, parent_id, items) -> None:
 
 
 _PROMOTION_DATA_FIELDS = (
-    'title', 'tag', 'tag_style', 'has_children', 'hidden', 'scope_title',
+    'title', 'tag', 'tag_style', 'has_children', 'hidden', 'boundary',
+    'scope_title',
 )
 
 
@@ -1739,7 +1758,8 @@ def _promote_synthetic(synthetic, real) -> None:
 
     Merge policy:
       - Item data fields (``title``, ``tag``, ``tag_style``,
-        ``has_children``, ``hidden``, ``scope_title``): take ``real``.
+        ``has_children``, ``hidden``, ``boundary``, ``scope_title``):
+        take ``real``.
       - Recipe-attached extras (``__dict__`` keys not in the dataclass
         field set): copied from ``real``. Extras on ``synthetic`` that
         aren't on ``real`` are not removed — synthetics rarely carry
@@ -5650,11 +5670,24 @@ class Browser:
         way (cursor-into / user expand) later. ``lazy=False`` is
         reserved for a future "force-fetch everything" mode and
         currently behaves the same as ``True``.
+
+        A node whose Item has ``Item.boundary=True`` is treated as a
+        leaf: the walk expands *to* it but never *through* it, so its
+        descendants are not recursively expanded even when cached. The
+        boundary node itself is still added to ``state.expanded``.
         """
         def _do():
             state = self._state
             def _walk(pid):
                 state.expanded.add(pid)
+                # Boundary nodes are self-contained foreign subtrees:
+                # expand *to* this node (added above), never *through*
+                # it — skip recursing into its children even when they
+                # are already cached. (Lazy expansion below already skips
+                # uncached branches; this covers the cached case.)
+                item = state._items_by_id.get(pid)
+                if item is not None and getattr(item, 'boundary', False):
+                    return
                 children = state._children.get(pid)
                 if children is None:
                     return
@@ -13020,7 +13053,11 @@ def _expand_recursive(ctx):
         for c in children:
             if getattr(c, 'has_children', False):
                 state.expanded.add(c.id)
-                _expand_subtree(c.id)
+                # A boundary child is a self-contained foreign subtree:
+                # expand *to* it (added above), never *through* it —
+                # don't recurse into its descendants even when cached.
+                if not getattr(c, 'boundary', False):
+                    _expand_subtree(c.id)
 
     _expand_subtree(parent_id)
     mark_visible_dirty(state)
