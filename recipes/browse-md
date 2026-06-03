@@ -615,6 +615,338 @@ def _resolve_anchor(anchor, file_root_id):
     return file_root_id
 
 
+# --- Markdown reference-following (#md: subtrees) ------------------
+#
+# A markdown FILE references other ``.md`` files (a relative/absolute/``~``
+# path token captured by ``md_doc.find_md_refs``). Each EXISTING referenced
+# file is surfaced as an expandable ``[md]`` child of the per-file root, drilling
+# into ITS headings and ITS refs, recursively. This MIRRORS browse-claude's
+# identical feature — the only difference is the base id: browse-md's base is the
+# file's bare-path id ``<file>`` (browse-claude's is a message id ``<sess>#<n>``).
+# Crucially, browse-md has NO "inline document" segment: the base IS a file, so
+# every ``#md:`` chain segment names a real file (browse-claude's empty-chain
+# inline-message case never arises here).
+#
+# Ids use the shared ``md_doc`` codec so routing stays a ``'#md:' in id``
+# substring test (``compose_md_id`` / ``parse_md_id``):
+#
+#   ref child of <F>      <F>#md:<enc(B)>            (file doc, boundary=True)
+#   its heading           <F>#md:<enc(B)>#<lineoffset>
+#   nested ref            <F>#md:<enc(B)>#md:<enc(A)>
+#
+# where ``<enc>`` = ``quote('file://' + abspath, safe='')``. browse-md's existing
+# heading id ``<F>#<lineoffset>`` already matches the trailing ``#<lineoffset>``
+# convention, so heading rows are uniform across the in-file tree and the
+# ``#md:`` subtrees.
+#
+# Build is LAZY: the in-file heading tree is pre-built eagerly in ``_reparse``,
+# but ref children (and everything under a referenced file) are materialised on
+# expand in ``get_children`` — reading/parsing a referenced file only when its
+# row is opened (via ``md_doc.get_doc``'s process-wide cache, cleared on Ctrl-R).
+# Refs attach at the DOCUMENT level (alongside headings, after them — never under
+# an individual heading), so recursion (file → file) falls out of one uniform
+# rule with NO cycle/alias detection: lazy materialisation makes a reference
+# cycle expand in place rather than loop. The whole section is a no-op when
+# ``md_doc`` is unavailable (the ``main()`` gate already fails fast in that case).
+
+# Heading level (1..6) → row tag / colour style — the same palette as the in-file
+# heading tree (``_HEADING_STYLES``); a ``#md:`` heading row should look identical
+# to an in-file one. Kept as a separate name purely so the mapping reads next to
+# the ``#md:`` helpers that use it.
+_MD_HEADING_STYLE = _HEADING_STYLES
+
+
+def _collapse_home(path):
+    """Collapse a leading ``$HOME`` to ``~`` for display (else verbatim).
+
+    Lifted from browse-claude's same-named helper — the fallback label for a
+    referenced file that lives outside both the project root and the cwd.
+    """
+    if not path:
+        return path
+    home = os.environ.get('HOME') or os.path.expanduser('~')
+    if home and path == home:
+        return '~'
+    if home and path.startswith(home + '/'):
+        return '~' + path[len(home):]
+    return path
+
+
+def _find_git_root(start):
+    """Nearest ancestor of ``start`` (inclusive) holding a ``.git`` entry.
+
+    Walks parents until a ``.git`` directory **or file** is found (a file is how
+    git worktrees / submodules record their gitdir), stopping at the filesystem
+    root. Returns the containing directory, or ``None`` when no ``.git`` is found.
+    Lifted from browse-claude — browse-md has no sessions, so the file's own
+    directory is the walk-up start.
+    """
+    if not start:
+        return None
+    d = os.path.abspath(start)
+    while True:
+        if os.path.exists(os.path.join(d, '.git')):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def _md_resolution_context(file_path):
+    """``(doc_dir, cwd, project_root)`` for resolving refs in ``file_path``.
+
+    The path anchors ``md_doc.resolve_md_ref`` / ``_md_ref_label`` need:
+
+      * ``doc_dir``      — the directory of the file whose text is being
+                           scanned (the CommonMark norm for relative refs).
+      * ``cwd``          — the process working directory (``os.getcwd()``).
+      * ``project_root`` — the git root walked up from ``doc_dir`` (nearest
+                           ``.git`` ancestor), else ``doc_dir`` itself when the
+                           file isn't inside a git tree.
+
+    browse-md has no sessions (unlike browse-claude, which derives cwd/root from
+    a session's recorded ``cwd``): the file's own directory is the only anchor,
+    so the walk-up starts there.
+    """
+    doc_dir = os.path.dirname(file_path)
+    cwd = os.getcwd()
+    project_root = _find_git_root(doc_dir) or doc_dir
+    return doc_dir, cwd, project_root
+
+
+def _md_ref_label(abspath, cwd, project_root):
+    """Display label for a referenced ``.md`` file, against a single anchor.
+
+    Rendered relative to ONE common anchor so a flat sibling list reads cleanly
+    without ``../`` noise: relative to ``project_root`` if the file is inside it,
+    else relative to ``cwd`` if inside it, else a ``~``-collapsed absolute path.
+    The label lives on the ``Item`` (never in the id — the id is abspath-
+    canonical). Lifted verbatim from browse-claude's same-named helper.
+    """
+    for anchor in (project_root, cwd):
+        if anchor and (abspath == anchor or abspath.startswith(anchor.rstrip('/') + '/')):
+            return os.path.relpath(abspath, anchor)
+    return _collapse_home(abspath)
+
+
+def _md_resolved_refs(text, doc_dir, cwd, project_root):
+    """Resolve the ``.md`` refs in ``text`` to existing ``(abspath, label)`` pairs.
+
+    Each captured token (``md_doc.find_md_refs``) is resolved via
+    ``md_doc.resolve_md_ref`` (existing-only — unresolved tokens dropped), deduped
+    by abspath (first occurrence wins), and sorted by label so the flat sibling
+    list reads stably. ``doc_dir`` is the referencing file's own directory.
+    Lifted verbatim from browse-claude's same-named helper.
+    """
+    seen = set()
+    out = []
+    for captured in md_doc.find_md_refs(text):
+        abspath = md_doc.resolve_md_ref(
+            captured, doc_dir=doc_dir, cwd=cwd, project_root=project_root)
+        if abspath is None or abspath in seen:
+            continue
+        seen.add(abspath)
+        out.append((abspath, _md_ref_label(abspath, cwd, project_root)))
+    out.sort(key=lambda pair: pair[1])
+    return out
+
+
+def _file_has_existing_ref(text, file_path):
+    """True iff ``text`` references at least one EXISTING ``.md`` file.
+
+    The cheap ``has_children`` half for a per-file root: short-circuits at the
+    FIRST captured ``.md`` token that ``md_doc.resolve_md_ref`` resolves to a
+    real path. Used by ``_reparse`` so a heading-less file that nonetheless
+    references an existing ``.md`` still carries an expansion arrow. Returns
+    ``False`` immediately when ``md_doc`` is unavailable.
+
+    This does read the referencing file's own directory off disk via
+    ``resolve_md_ref``'s ``os.path.exists`` probes, but never the referenced
+    files themselves — those are read lazily on expand. ``text`` is already in
+    ``_FileState`` (no extra read of the primary file).
+    """
+    if md_doc is None:
+        return False
+    doc_dir, cwd, project_root = _md_resolution_context(file_path)
+    for captured in md_doc.find_md_refs(text):
+        if md_doc.resolve_md_ref(
+                captured, doc_dir=doc_dir, cwd=cwd,
+                project_root=project_root) is not None:
+            return True
+    return False
+
+
+def _md_heading_item(base, abspaths, node):
+    """Map an ``md_doc`` heading ``MdNode`` to a tree-row ``Item``.
+
+    Id = ``compose_md_id(base, abspaths, node.line_offset)`` — selecting the
+    heading by its line within the chain's last document. ``has_children`` is
+    authoritative (the node is already parsed), so heading rows never need a
+    self-heal. ``boundary`` stays ``False`` — a heading is same-document
+    structure, not a foreign subtree. The ``[h1]``..``[h6]`` tag + style match
+    the in-file heading rows. Mirrors browse-claude's ``_md_heading_item``.
+    """
+    item = Item(
+        id=md_doc.compose_md_id(base, abspaths, line_offset=node.line_offset),
+        title=node.title,
+        tag=f'h{node.level}',
+        tag_style=_MD_HEADING_STYLE.get(node.level, ''),
+        has_children=bool(node.children),
+    )
+    item.kind = 'md-heading'
+    item.md_level = node.level
+    return item
+
+
+def _md_file_item(base, abspaths, label):
+    """Map a referenced ``.md`` file to a document tree-row ``Item``.
+
+    ``abspaths`` is the full chain ending in this file (so the id nests under its
+    referrer). ``has_children`` is optimistically ``True`` — the file is not read
+    until expand; it self-heals to a leaf if the file has neither headings nor
+    further refs. ``boundary=True`` marks it a self-contained foreign subtree so
+    recursive/multi-expansion stops at it. Mirrors browse-claude's
+    ``_md_file_item``.
+    """
+    item = Item(
+        id=md_doc.compose_md_id(base, abspaths),
+        title=label,
+        tag='md',
+        tag_style='blue',          # cross-file / attachment hue
+        has_children=True,         # optimistic; self-heals on expand
+        boundary=True,
+    )
+    item.kind = 'md-doc'
+    item.md_abspath = abspaths[-1]
+    return item
+
+
+def _md_node_at_line(doc_tree, line_offset):
+    """Find the heading ``MdNode`` at ``line_offset`` in a doc tree, or None.
+
+    Depth-first walk of the (already-built) ``md_doc`` structural tree — the tree
+    is one document's headings, so a linear search is fine and avoids stashing a
+    by-line index on the structural nodes. Mirrors browse-claude's
+    ``_md_node_at_line``.
+    """
+    for node in doc_tree:
+        if node.line_offset == line_offset:
+            return node
+        found = _md_node_at_line(node.children, line_offset)
+        if found is not None:
+            return found
+    return None
+
+
+def _md_chain_doc(abspaths):
+    """Resolve a ``#md:`` chain's *last* document to ``(text, doc_tree)``.
+
+    The chain's terminal file is what both the subtree build and the preview
+    route operate on. Unlike browse-claude (whose empty chain is the base
+    message's inline content), EVERY browse-md chain segment names a file, so
+    ``abspaths`` is non-empty for any valid browse-md ``#md:`` id: read + parse
+    its last entry once via ``md_doc.get_doc``'s process-wide cache. Returns
+    ``(None, None)`` on an unreadable file or a (malformed) empty chain — the
+    callers treat that as "no children / empty preview".
+    """
+    if not abspaths:
+        return None, None
+    try:
+        return md_doc.get_doc(abspaths[-1])
+    except OSError:
+        return None, None
+
+
+def _md_subtree_children(item_id):
+    """Children for a ``#md:`` node — the lazy, authoritative build.
+
+    Routes on the parsed id shape (``md_doc.parse_md_id`` → ``(base, abspaths,
+    line_offset)``; ``base`` is browse-md's per-file root id, ``abspaths`` the
+    referenced-file chain):
+
+      * **heading** (``line_offset`` set) → the sub-headings nested under it
+        (walk the chain's last-document tree to the node at ``line_offset``,
+        return its children as heading rows). No ref children — refs live at the
+        document level, not under a heading.
+      * **file document** (``abspaths`` non-empty, no ``line_offset``) → the
+        top-level heading rows of that file PLUS one ``[md]`` node per existing
+        ``.md`` ref in THAT file's own text (resolved against the file's own
+        directory), nested onto the chain. Recursion (file → file) falls out of
+        this uniform rule; expand-in-place, no cycle/alias detection.
+
+    File text + tree come from ``md_doc.get_doc`` (process-wide cache). Returns
+    ``[]`` for an unreadable/heading-less-and-ref-less document (which self-heals
+    the optimistic arrow). Mirrors browse-claude's ``_md_subtree_children`` minus
+    its inline-document branch (browse-md has no inline segment).
+    """
+    base, abspaths, line_offset = md_doc.parse_md_id(item_id)
+    text, doc_tree = _md_chain_doc(abspaths)
+    if doc_tree is None:
+        return []
+
+    # Heading node → its nested sub-headings (no ref children).
+    if line_offset is not None:
+        node = _md_node_at_line(doc_tree, line_offset)
+        if node is None:
+            return []
+        return [_md_heading_item(base, abspaths, ch) for ch in node.children]
+
+    # File-document node → top-level headings, then this file's ref children.
+    out = [_md_heading_item(base, abspaths, node) for node in doc_tree]
+    doc_dir, cwd, project_root = _md_resolution_context(abspaths[-1])
+    for ref_abspath, label in _md_resolved_refs(text, doc_dir, cwd, project_root):
+        out.append(_md_file_item(base, abspaths + [ref_abspath], label))
+    return out
+
+
+def _md_render(text):
+    """Render preview ``text`` through md2ansi when ``_MD_COLOR`` is on.
+
+    The colored-preview render seam shared with the existing ``get_preview``
+    path: when the ``m`` toggle is on (and a renderer is present) the text goes
+    through ``_md2ansi_fn`` at the current preview width, otherwise the raw text
+    is returned. Any md2ansi blow-up falls back to the raw text so the preview
+    pane stays alive. Mirrors browse-claude's ``_md_voice``.
+    """
+    if not _MD_COLOR or _md2ansi_fn is None or not text:
+        return text
+    try:
+        width = (_BROWSER.preview_width if _BROWSER else 0) or 80
+        return _md2ansi_fn(text, line_width=width)
+    except Exception:
+        return text
+
+
+def _preview_md_node(item_id):
+    """Preview body for a ``#md:`` document or heading node.
+
+    Reads ONLY the node's own document — never a cross-item cascade:
+
+      * **file-document node** (no ``line_offset``) → that referenced file's full
+        text (``md_doc.get_doc`` cache).
+      * **heading node** (``…#<lineoffset>``) → just that heading's section,
+        sliced ``text[byte_offset : byte_offset + byte_size]`` from the cached
+        ``doc_tree`` (the boundary rule includes the heading's own sub-sections
+        and stops at the next sibling-or-shallower heading).
+
+    Both render through ``_md_render`` (md2ansi when ``_MD_COLOR`` is on, raw
+    otherwise). Returns ``''`` for an unreadable document or a line offset that
+    matches no heading. Mirrors browse-claude's ``_preview_md_node`` minus its
+    inline-document case (browse-md has no inline segment).
+    """
+    _base, abspaths, line_offset = md_doc.parse_md_id(item_id)
+    text, doc_tree = _md_chain_doc(abspaths)
+    if text is None:
+        return ''
+    if line_offset is None:
+        return _md_render(text)
+    node = _md_node_at_line(doc_tree, line_offset)
+    if node is None:
+        return ''
+    return _md_render(text[node.byte_offset:node.byte_offset + node.byte_size])
+
+
 def _reparse():
     """Re-slurp every input file and rebuild every parser-derived index.
 
@@ -657,6 +989,14 @@ def _reparse():
         ls = _line_starts(text)
         events = _parse(text)
         file_root, by_id = _build_nodes(events, text, ls, path)
+        # The per-file root carries an expansion arrow when it has headings
+        # (set by ``_build_nodes``) OR references at least one existing ``.md``
+        # file — so a heading-less file that links to a real ``.md`` is still
+        # expandable into its ``[md]`` ref children. The ref half is computed
+        # cheaply here (no referenced file is read — only existence-probed); the
+        # ref CHILDREN themselves are built lazily on expand in ``get_children``.
+        if not file_root.has_children and _file_has_existing_ref(text, path):
+            file_root.has_children = True
         by_line, lines_sorted = _build_line_index(by_id)
         fs = _FileState(
             path=path,
@@ -693,28 +1033,44 @@ def _reparse():
 
 
 def get_children(node_id, *, reload=False):
-    """Return cached children for ``node_id``.
+    """Return children for ``node_id``.
 
-    The tree is built once in ``main()`` (``_build_nodes`` walks each
-    file's flat event stream and pre-populates ``item._children``;
-    ``_reparse`` collects the per-file roots into ``_FILES`` in argv
-    order), so this is a dict lookup — no per-call parsing. Unknown
-    ids return ``[]`` so a stale anchor or scope id doesn't surface
-    as a traceback.
+    The in-file heading tree is built once in ``main()`` (``_build_nodes`` walks
+    each file's flat event stream and pre-populates ``item._children``;
+    ``_reparse`` collects the per-file roots into ``_FILES`` in argv order), so
+    the in-file paths are a dict lookup — no per-call parsing. Markdown reference
+    children are built LAZILY here (referenced files are read/parsed only on
+    expand). Unknown ids return ``[]`` so a stale anchor or scope id doesn't
+    surface as a traceback.
 
-    ``node_id is None`` is the framework's "top-level entries" probe
-    (Browser ``root_id=None``). We return the per-file roots in argv
-    order — files ARE the top-level rows, there is no synthetic
-    multi-root above them.
+    Dispatch:
 
-    ``reload=True`` is honoured at the top-level probe (``node_id is
-    None``) — the framework's Ctrl-R hook calls
-    ``get_children(None, reload=True)``, and we use that as the
-    trigger to re-slurp every file and rebuild every index.
-    Non-root reloads return cached children unchanged — full reparse
-    is cheap but pointless when the request targets a sub-node.
+      * ``node_id is None`` — the framework's "top-level entries" probe (Browser
+        ``root_id=None``): the per-file roots in argv order. Files ARE the
+        top-level rows; there is no synthetic multi-root above them.
+      * ``…#md:…`` — a node inside a referenced-file subtree (a referenced ``.md``
+        document or one of its headings). Built lazily + authoritatively by
+        ``_md_subtree_children``. No-op when ``md_doc`` is unavailable.
+      * a per-file root (``node_id in _FILES``) — its eager top-level headings
+        PLUS one lazily-built ``[md]`` node per existing ``.md`` ref in the file
+        (appended AFTER the headings).
+      * any other in-file id (``<path>#<line>``) — the cached ``_children`` off
+        ``_BY_ID`` (headings have only sub-heading / list children — refs attach
+        at the document level, never under a heading).
+
+    ``reload=True`` is honoured at the top-level probe (``node_id is None``) — the
+    framework's Ctrl-R hook calls ``get_children(None, reload=True)``, and we use
+    that as the trigger to re-slurp every file, rebuild every index, AND drop the
+    shared ``md_doc`` parse cache (so edited referenced files are re-read).
+    Non-root reloads return cached children unchanged — full reparse is cheap but
+    pointless when the request targets a sub-node.
     """
     if reload and node_id is None:
+        if md_doc is not None:
+            # Drop the shared markdown parse cache so a Ctrl-R re-reads any
+            # referenced ``.md`` files edited on disk (they live outside the
+            # per-file ``_FILES`` index, so ``_reparse`` alone can't reach them).
+            md_doc.clear_cache()
         _reparse()
     if node_id is None:
         # Top-level: per-file roots in argv order. ``_INPUT_FILES``
@@ -722,6 +1078,21 @@ def get_children(node_id, *, reload=False):
         # consult ``_INPUT_FILES`` for the ordering and pull each
         # file's root out of ``_FILES`` by path.
         return [_FILES[p].file_root for p, _ in _INPUT_FILES if p in _FILES]
+    if md_doc is not None and isinstance(node_id, str) and '#md:' in node_id:
+        # A node inside a referenced-file subtree — built lazily here. Routing
+        # stays a substring test; ``_md_subtree_children`` parses the chain.
+        return _md_subtree_children(node_id)
+    if node_id in _FILES:
+        # Per-file root: its eager in-file headings, then the lazily-resolved
+        # ``[md]`` ref children (one per existing ``.md`` the file references).
+        fs = _FILES[node_id]
+        out = list(fs.file_root._children)
+        if md_doc is not None:
+            doc_dir, cwd, project_root = _md_resolution_context(node_id)
+            for ref_abspath, label in _md_resolved_refs(
+                    fs.text, doc_dir, cwd, project_root):
+                out.append(_md_file_item(node_id, [ref_abspath], label))
+        return out
     item = _BY_ID.get(node_id)
     if item is None:
         return []
@@ -748,6 +1119,12 @@ def get_preview(node_id):
     4. Anything else (unresolvable id) → ``''``. Defensive: a stale
        cursor id from a previous scope mustn't crash the preview.
 
+    A ``#md:`` id (a referenced-file document or heading node) is routed FIRST,
+    before ``_classify_id`` / the generic ``<path>#<line>`` path: an md
+    file-document node ends in an encoded segment (and a heading node in
+    ``…#<line>``), so the generic ``rpartition('#')`` would otherwise mis-read it.
+    ``_preview_md_node`` renders the referenced file's body / heading section.
+
     When ``_MD_COLOR`` is on, the slice runs through
     ``_md2ansi_fn(text, line_width=…)`` for ANSI-coloured rendering. The
     call is wrapped in a broad ``except Exception`` so pathological
@@ -756,6 +1133,12 @@ def get_preview(node_id):
     """
     if node_id is None:
         return ''
+    if md_doc is not None and isinstance(node_id, str) and '#md:' in node_id:
+        # Referenced-file document / heading node — its own document's text or
+        # heading section, never a cross-item cascade. Checked before the
+        # in-file ``_classify_id`` path so the trailing ``#<line>`` / encoded
+        # segment isn't mis-parsed as an in-file line number.
+        return _preview_md_node(node_id)
     kind, path = _classify_id(node_id)
     if kind == 'file-root':
         text = _FILES[path].text
