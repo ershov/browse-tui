@@ -92,6 +92,93 @@ def _make_repo_with_n_commits(tmpdir, n):
     return tmpdir
 
 
+def _make_repo_with_changes(tmpdir):
+    """Init a repo with one commit, then leave the tree dirty in three ways.
+
+    Mirrors ``_make_repo``'s git-env + local user setup. After the initial
+    commit (adding ``alpha.txt`` / ``beta.txt`` / ``gamma.txt``) the tree is
+    left with:
+      * an UNTRACKED file (``untracked.txt``, written but never added),
+      * an unstaged TRACKED modification (``beta.txt`` changed, not staged),
+      * a STAGED change (``gamma.txt`` changed then ``git add``ed).
+    These map to the recipe's untracked / tracked / staged worktree groups.
+    Returns the repo directory.
+    """
+    env = {
+        **os.environ,
+        'GIT_AUTHOR_NAME': 'Test', 'GIT_AUTHOR_EMAIL': 'test@example.com',
+        'GIT_COMMITTER_NAME': 'Test', 'GIT_COMMITTER_EMAIL': 'test@example.com',
+    }
+    def git(*args):
+        subprocess.run(['git', '-C', tmpdir, *args], check=True,
+                       capture_output=True, env=env)
+    git('init', '-q', '-b', 'main')
+    git('config', 'user.name', 'Test')
+    git('config', 'user.email', 'test@example.com')
+    for name in ('alpha.txt', 'beta.txt', 'gamma.txt'):
+        with open(os.path.join(tmpdir, name), 'w') as f:
+            f.write(f'{name} v1\n')
+    git('add', 'alpha.txt', 'beta.txt', 'gamma.txt')
+    git('commit', '-q', '-m', 'first commit add files')
+    # Untracked file — written, never added.
+    with open(os.path.join(tmpdir, 'untracked.txt'), 'w') as f:
+        f.write('brand new\n')
+    # Unstaged tracked modification.
+    with open(os.path.join(tmpdir, 'beta.txt'), 'w') as f:
+        f.write('beta.txt changed unstaged\n')
+    # Staged change.
+    with open(os.path.join(tmpdir, 'gamma.txt'), 'w') as f:
+        f.write('gamma.txt changed staged\n')
+    git('add', 'gamma.txt')
+    return tmpdir
+
+
+def _make_repo_with_conflict(tmpdir):
+    """Init a repo and produce a real, unresolved merge conflict.
+
+    Commits ``conflict.txt`` on ``main``, branches off, edits the same line
+    on each of two branches, then ``git merge``s the side branch back into
+    ``main`` (with ``check=False`` since a conflicting merge exits non-zero).
+    Leaves ``conflict.txt`` unmerged so the recipe's ``Conflicts`` group is
+    non-empty. Returns ``(tmpdir, conflicted)`` whether or not the merge
+    actually conflicted, plus a bool ``conflicted``.
+    """
+    env = {
+        **os.environ,
+        'GIT_AUTHOR_NAME': 'Test', 'GIT_AUTHOR_EMAIL': 'test@example.com',
+        'GIT_COMMITTER_NAME': 'Test', 'GIT_COMMITTER_EMAIL': 'test@example.com',
+    }
+    def git(*args, check=True):
+        return subprocess.run(['git', '-C', tmpdir, *args], check=check,
+                              capture_output=True, env=env)
+    git('init', '-q', '-b', 'main')
+    git('config', 'user.name', 'Test')
+    git('config', 'user.email', 'test@example.com')
+    path = os.path.join(tmpdir, 'conflict.txt')
+    with open(path, 'w') as f:
+        f.write('shared line\n')
+    git('add', 'conflict.txt')
+    git('commit', '-q', '-m', 'base commit')
+    # Side branch edits the shared line.
+    git('checkout', '-q', '-b', 'side')
+    with open(path, 'w') as f:
+        f.write('side edit\n')
+    git('add', 'conflict.txt')
+    git('commit', '-q', '-m', 'side edit')
+    # Back on main, edit the same line differently.
+    git('checkout', '-q', 'main')
+    with open(path, 'w') as f:
+        f.write('main edit\n')
+    git('add', 'conflict.txt')
+    git('commit', '-q', '-m', 'main edit')
+    # Merge the side branch — expected to conflict (exit != 0).
+    merge = git('merge', 'side', check=False)
+    # The status check below confirms whether the conflict actually landed.
+    status = git('status', '--porcelain', check=False)
+    conflicted = b'UU conflict.txt' in status.stdout or merge.returncode != 0
+    return tmpdir, conflicted
+
+
 class TestBrowseGit(unittest.TestCase):
 
     def test_lists_commits(self):
@@ -317,6 +404,92 @@ class TestBrowseGit(unittest.TestCase):
                     'within 2s of cursor settling — prefetch slot may '
                     'not be coalescing.',
                 )
+                t.send('q')
+
+    def test_worktree_groups_render_in_order(self):
+        """The synthetic worktree rows render, top-down, in group order.
+
+        ``_make_repo_with_changes`` leaves an untracked file, an unstaged
+        tracked modification and a staged change, so the commits-mode root
+        prepends three group rows — ``Untracked changes`` / ``Tracked
+        changes`` / ``Staged changes`` — above the commit log, in that
+        order. tmux strips SGR but keeps the label text, so we capture the
+        pane and assert the rows appear and are vertically ordered.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_repo_with_changes(tmp)
+            with TmuxFixture(cols=120, rows=30) as t:
+                t.send_line(f'cd {tmp}')
+                t.launch(_BIN, '--run-py', _RECIPE)
+                t.wait_for('Untracked changes', timeout=5.0)
+                t.wait_for('Tracked changes', timeout=5.0)
+                cap = t.wait_for('Staged changes', timeout=5.0)
+                lines = cap.splitlines()
+                def row_of(label):
+                    return next(i for i, ln in enumerate(lines) if label in ln)
+                untracked = row_of('Untracked changes')
+                tracked = row_of('Tracked changes')
+                staged = row_of('Staged changes')
+                self.assertLess(untracked, tracked)
+                self.assertLess(tracked, staged)
+                t.send('q')
+
+    def test_clean_repo_has_no_worktree_groups(self):
+        """A clean tree shows none of the synthetic worktree rows.
+
+        ``_make_repo`` commits everything, leaving the work tree clean, so
+        ``_worktree_groups`` yields nothing and the commits-mode root is the
+        bare log. We wait for a commit subject, then assert the pane carries
+        no worktree-group label.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_repo(tmp)
+            with TmuxFixture(cols=120, rows=30) as t:
+                t.send_line(f'cd {tmp}')
+                t.launch(_BIN, '--run-py', _RECIPE)
+                cap = t.wait_for('second commit add beta', timeout=5.0)
+                self.assertNotIn('Untracked changes', cap)
+                self.assertNotIn('Staged changes', cap)
+                self.assertNotIn('Tracked changes', cap)
+                t.send('q')
+
+    def test_worktree_group_drills_into_file(self):
+        """Right-arrow on the first worktree row reveals its file leaf.
+
+        The cursor starts on the topmost row — the ``Untracked changes``
+        group — so a single Right expands it into its ``untracked.txt``
+        file leaf.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_repo_with_changes(tmp)
+            with TmuxFixture(cols=120, rows=30) as t:
+                t.send_line(f'cd {tmp}')
+                t.launch(_BIN, '--run-py', _RECIPE)
+                t.wait_for('Untracked changes', timeout=5.0)
+                t.send('Right')
+                t.wait_for('untracked.txt', timeout=5.0)
+                t.send('q')
+
+    def test_conflict_group_drills_into_file(self):
+        """The ``Conflicts`` row appears mid-merge and drills to its file.
+
+        ``_make_repo_with_conflict`` leaves ``conflict.txt`` unmerged, so the
+        commits-mode root carries a ``Conflicts`` group. The cursor starts on
+        the topmost row (``Conflicts`` is the only worktree group here), so a
+        Right expands it into the ``conflict.txt`` leaf. If the harness can't
+        produce a real conflict the test skips rather than asserting falsely.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            _, conflicted = _make_repo_with_conflict(tmp)
+            if not conflicted:
+                self.skipTest('git merge did not leave a conflict in this '
+                              'environment')
+            with TmuxFixture(cols=120, rows=30) as t:
+                t.send_line(f'cd {tmp}')
+                t.launch(_BIN, '--run-py', _RECIPE)
+                t.wait_for('Conflicts', timeout=5.0)
+                t.send('Right')
+                t.wait_for('conflict.txt', timeout=5.0)
                 t.send('q')
 
 

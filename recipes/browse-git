@@ -7,6 +7,12 @@ arguments:
 
   commits   recent ``git log`` — drill commit -> changed files -> diff
   status    ``git status`` working-tree entries
+
+In commits mode the log is preceded by up to four synthetic working-change
+rows — ``Untracked changes`` / ``Tracked changes`` / ``Staged changes`` /
+``Conflicts`` — each shown only when non-empty and drillable into its
+files. They honor the same path filter and appear only on an unscoped log
+(no positional rev).
   reflog    ``git reflog`` entries
   branches  branches / remotes / tags via ``git for-each-ref``
   stash     ``git stash list``
@@ -1154,6 +1160,9 @@ a rev; anything else is an error. They scope commits mode (an explicit
 
 The five view modes:
   commits   recent git log; drill commit -> changed files -> per-file diff
+            (an unscoped log is preceded by working-change rows — Untracked
+            / Tracked / Staged / Conflicts — each shown only when non-empty,
+            drillable into their files, scoped by the same path filter)
   status    working-tree entries; leaf preview = staged / worktree diff
   reflog    reflog entries; same drill-down as commits
   branches  branches / remotes / tags; drill a ref into its commits

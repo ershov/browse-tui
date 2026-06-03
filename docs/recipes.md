@@ -173,7 +173,10 @@ on commit rows.
 **Modes:**
 
 - **commits** — recent `git log`; drill commit → changed files →
-  per-file diff. Scoped by positional revs / paths.
+  per-file diff. Scoped by positional revs / paths. An unscoped log is
+  preceded by up to four synthetic working-change rows — `Untracked
+  changes` / `Tracked changes` / `Staged changes` / `Conflicts` — each
+  shown only when non-empty and drillable into its files.
 - **status** — `git status` working-tree entries; the leaf preview is
   the staged and/or worktree diff chosen by the porcelain `XY` code
   (`MM` shows both sections; `??` renders the file as an addition).
@@ -224,7 +227,7 @@ working-tree file in `$EDITOR` (file/status rows), `m` toggle md2ansi
 message coloring (when available); the built-in `v` pages the colored
 diff in `$PAGER`, `e` edits the preview text.
 
-**Source:** [`recipes/browse-git`](../recipes/browse-git) (~1030 lines)
+**Source:** [`recipes/browse-git`](../recipes/browse-git) (~1275 lines)
 
 ---
 
