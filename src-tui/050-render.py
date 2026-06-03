@@ -62,6 +62,40 @@ _ID_COLOR = 3   # yellow for the '#id' segment
 _MARKER_COLOR = 4   # blue for the ▼/▶ expand glyph
 _PENDING_FG = 242   # dim for the ⧗ loading… placeholder
 
+
+# --- Public styles API (see design sec D) ----------------------------------
+# A segment's colour *is* a raw (fg, bold) pair; ``_TAG_STYLE`` above is the
+# internal table mapping the named-style vocabulary onto those pairs. Recipes
+# assembling their own column segments can't reach ``_TAG_STYLE``, so expose
+# both layers — the named lookup ``style()`` / ``STYLE_NAMES``, and the raw
+# palette constants the default chrome uses (public faces of the ``_*_COLOR``
+# / ``_PENDING_FG`` internals) — so columns match ``tag_style`` / chips
+# without magic numbers.
+
+# The valid named-style keys (mirrors the vocabulary documented on
+# ``Item.tag_style``). Includes ``''`` — the plain, unstyled default.
+STYLE_NAMES = frozenset(_TAG_STYLE)
+
+# Raw palette constants — the semantic chrome colours a column is most
+# likely to want to match (see design sec D / "raw styles").
+MARKER_FG = _MARKER_COLOR   # 4 — blue ▼/▶ expander
+ID_FG = _ID_COLOR           # 3 — yellow #id segment
+DIM_FG = _PENDING_FG        # 242 — dim; the 'dim' named style's fg
+
+
+def style(name):
+    """Resolve a named style to its raw ``(fg, bold)`` pair.
+
+    ``name`` is one of the keys in :data:`STYLE_NAMES`
+    (``'green'``/``'red'``/``'yellow'``/``'gray'``/``'cyan'``/``'blue'``/
+    ``'magenta'``/``'dim'``/``''``). ``fg`` is a 256-colour palette index
+    (or ``None`` for the terminal default) and ``bold`` is a bool — the
+    same pair ``tag_style`` / chips resolve to. An unknown name (or ``''``)
+    returns ``(None, False)`` (plain), matching tag rendering's fallback.
+    """
+    return _TAG_STYLE.get(name, _TAG_STYLE[''])
+
+
 # Insert-mode marker — sentinel id used by the synthetic ``VisibleEntry``
 # injected into the rendered list when ``browser._insert_mode`` is True.
 # We use ``object()`` so the sentinel never equals any user-supplied id
@@ -869,6 +903,185 @@ def _truncate_by_cells(s, max_cols):
         out.append(ch)
         cells += w
     return (''.join(out), cells)
+
+
+def _suffix_by_cells(s, max_cols):
+    """Longest *suffix* of plain text ``s`` fitting in ``max_cols`` cells.
+
+    The tail-side analogue of :func:`_truncate_by_cells` (which keeps a
+    prefix): walks ``s`` from the right, accumulating characters while the
+    running cell count stays within budget. Wide-char aware via
+    :func:`_char_width`; a wide char that would straddle the budget is
+    dropped rather than overshooting (so the result may be one cell short
+    of ``max_cols``, never over). ``max_cols <= 0`` returns ``''``.
+    """
+    if max_cols <= 0:
+        return ''
+    cells = 0
+    cut = len(s)
+    for i in range(len(s) - 1, -1, -1):
+        w = _char_width(s[i])
+        if cells + w > max_cols:
+            break
+        cells += w
+        cut = i
+    return s[cut:]
+
+
+def cell_width(s):
+    """Display-cell width of plain text ``s`` (the public face of
+    :func:`_visible_len`).
+
+    Wide-char aware: East Asian Wide/Fullwidth characters count as 2 cells,
+    others as 1. ANSI CSI escapes are not counted (recipes carry colour via
+    the segment ``fg``/``bold``, never embedded SGR — but the
+    escape-stripping keeps the contract identical to ``_visible_len``).
+    """
+    return _visible_len(s)
+
+
+def _char_width_total(s):
+    """Total display-cell width of ``s`` counting *every* char (no escape
+    stripping) — used to validate single-cell ``fill`` / ``ellipsis`` args.
+
+    Deliberately does **not** delegate to ``_visible_len`` / :func:`cell_width`,
+    which strip ANSI CSI sequences before counting. A ``fill`` / ``ellipsis``
+    is tiled into the result *verbatim*, so what matters is the cells the
+    raw string actually occupies on screen, not its ANSI-stripped visible
+    width. An escape-bearing value like ``'\\033[0m '`` has visible width 1
+    but occupies 5 raw cells; counting it as 1 would let the single-cell
+    guard wrongly accept it, and tiling those 5 chars per pad cell would
+    corrupt the column's width math. Counting raw chars rejects it.
+    """
+    return sum(_char_width(ch) for ch in s)
+
+
+def _check_fill(fill):
+    """Validate a pad ``fill`` is exactly one display cell; return it.
+
+    The cell-pad helpers tile ``fill`` one cell at a time, so a wide
+    (2-cell) or empty fill would break the exact-width contract. Reject it
+    loudly rather than silently mis-aligning a column.
+    """
+    if _char_width_total(fill) != 1:
+        raise ValueError(
+            'fill must be exactly one display cell, got {!r}'.format(fill))
+    return fill
+
+
+def cell_ljust(s, width, fill=' '):
+    """Left-justify ``s`` to ``width`` display cells, padding on the right.
+
+    Returns ``s`` unchanged if it is already ``width`` cells or wider (pad
+    never shrinks). ``fill`` must be exactly one display cell.
+    """
+    _check_fill(fill)
+    pad = width - cell_width(s)
+    return s + fill * pad if pad > 0 else s
+
+
+def cell_rjust(s, width, fill=' '):
+    """Right-justify ``s`` to ``width`` display cells, padding on the left.
+
+    Returns ``s`` unchanged if already ``width`` cells or wider. ``fill``
+    must be exactly one display cell.
+    """
+    _check_fill(fill)
+    pad = width - cell_width(s)
+    return fill * pad + s if pad > 0 else s
+
+
+def cell_center(s, width, fill=' '):
+    """Centre ``s`` within ``width`` display cells, padding both sides.
+
+    Extra padding (when the gap is odd) goes on the right, matching
+    :meth:`str.center`. Returns ``s`` unchanged if already ``width`` cells
+    or wider. ``fill`` must be exactly one display cell.
+    """
+    _check_fill(fill)
+    pad = width - cell_width(s)
+    if pad <= 0:
+        return s
+    left = pad // 2
+    return fill * left + s + fill * (pad - left)
+
+
+def cell_trim(s, width, *, where='end', ellipsis='…', word_boundary=False):
+    """Trim plain text ``s`` to ``width`` display cells with an ellipsis.
+
+    No-op when ``s`` already fits (``cell_width(s) <= width``). Otherwise
+    the ellipsis is placed per ``where``:
+
+      * ``'end'``   — ``'abc…'`` (keep a prefix of ``s``).
+      * ``'start'`` — ``'…xyz'`` (keep a suffix of ``s``).
+      * ``'middle'``— ``'ab…yz'`` (keep a prefix and a suffix; the prefix
+        gets the extra cell when the content budget is odd).
+
+    The ellipsis width is accounted within ``width`` (it is part of the
+    result, not appended past it); ``ellipsis`` defaults to ``'…'`` (1
+    cell) — pass ``'...'`` for three dots. Wide chars near the cut are
+    dropped rather than overshooting ``width``, so the result is always
+    ``<= width`` cells (it can be one cell short when a wide char straddles
+    the cut). ``word_boundary`` (``'middle'`` only) prefers to end the
+    prefix at a space so a word isn't split; it has no effect when no
+    suitable space sits within the prefix budget.
+
+    Returns the trimmed string. If even the ellipsis doesn't fit
+    (``width`` < its width) the ellipsis itself is cell-trimmed to
+    ``width`` and no content is kept.
+    """
+    if cell_width(s) <= width:
+        return s
+    ell_w = _char_width_total(ellipsis)
+    budget = width - ell_w
+    if budget <= 0:
+        # Not even room for the ellipsis — trim the ellipsis to fit, drop
+        # all content. Never overshoot the requested width.
+        return _truncate_by_cells(ellipsis, width)[0]
+
+    if where == 'start':
+        return ellipsis + _suffix_by_cells(s, budget)
+
+    if where == 'middle':
+        head_budget = budget - budget // 2   # ceil — prefix gets the extra
+        tail_budget = budget // 2
+        head = _truncate_by_cells(s, head_budget)[0]
+        if word_boundary:
+            cut = head.rfind(' ')
+            # Snap to the last space within the prefix, but keep it: an
+            # empty prefix (space at index 0) gains nothing, so only honour
+            # a space that leaves some non-space content before it.
+            if cut > 0:
+                head = head[:cut + 1]
+        tail = _suffix_by_cells(s, tail_budget)
+        return head + ellipsis + tail
+
+    # Default / 'end': keep a prefix, ellipsis trails.
+    return _truncate_by_cells(s, budget)[0] + ellipsis
+
+
+def cell_fit(s, width, *, justify='left', trim='end', ellipsis='…',
+             fill=' ', word_boundary=False):
+    """Trim-or-pad ``s`` to **exactly** ``width`` display cells.
+
+    The one-call column formatter: when ``s`` is too wide it is trimmed via
+    :func:`cell_trim` (honouring ``trim`` = ``'end'``/``'start'``/
+    ``'middle'``, ``ellipsis`` and ``word_boundary``); otherwise it is
+    padded per ``justify`` (``'left'``/``'right'``/``'center'``) with
+    ``fill``. The result is always exactly ``width`` cells — even when a
+    wide char straddles the trim budget (the trimmed string can come back a
+    cell short, so it is re-padded to ``width``). ``fill`` must be one cell.
+    """
+    _check_fill(fill)
+    pad = {'left': cell_ljust, 'right': cell_rjust,
+           'center': cell_center}.get(justify, cell_ljust)
+    if cell_width(s) > width:
+        trimmed = cell_trim(s, width, where=trim, ellipsis=ellipsis,
+                            word_boundary=word_boundary)
+        # A wide-char straddle can leave ``trimmed`` one cell short of
+        # ``width``; pad it back so the column lands on an exact boundary.
+        return pad(trimmed, width, fill)
+    return pad(s, width, fill)
 
 
 def _write_segments(segments, max_width, *, pad_to=0, row_bg=None,
