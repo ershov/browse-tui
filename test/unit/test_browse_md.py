@@ -3554,13 +3554,16 @@ class TestOnExpandCascadeLive(unittest.TestCase):
 
 
 class TestMdRefFollowing(unittest.TestCase):
-    """Markdown reference-following — ``#md:`` ref children (ticket #664).
+    """Markdown reference-following — ``#md:`` ref children under a ``[links]``
+    References umbrella (tickets #664, #698, #703).
 
-    A markdown FILE references other ``.md`` files; each EXISTING referenced file
-    surfaces as an expandable ``[md]`` child of the per-file root, drilling into
-    ITS headings + ITS refs recursively (mirrors browse-claude). Built on an
-    on-disk fixture driven through ``_reparse`` (the real ``main()`` startup
-    path) since reference resolution and ``md_doc.get_doc`` read from disk.
+    A markdown FILE references other ``.md`` files; the EXISTING referenced files
+    are grouped under ONE ``[links]`` References umbrella child of the document
+    (per-file root or referenced-file doc), each an expandable ``[md]`` node
+    drilling into ITS headings + ITS refs recursively (mirrors browse-claude's
+    #702). Built on an on-disk fixture driven through ``_reparse`` (the real
+    ``main()`` startup path) since reference resolution and ``md_doc.get_doc``
+    read from disk.
 
     Fixtures (in a private temp dir, so the git-root walk-up finds no ``.git``
     and ``project_root`` falls back to that dir — labels are bare basenames):
@@ -3613,38 +3616,59 @@ class TestMdRefFollowing(unittest.TestCase):
         with open(path, 'w', encoding='utf-8') as f:
             f.write(text)
 
-    def _md_children(self, kids):
-        return [k for k in kids if k.tag == 'md']
+    def _umbrella(self, kids):
+        # The single ``[links]`` References umbrella among a row's children.
+        umbrellas = [k for k in kids if k.tag == 'links']
+        self.assertEqual(len(umbrellas), 1,
+                         'expected exactly one References umbrella')
+        return umbrellas[0]
 
-    # --- per-file root: ref children -------------------------------------
+    def _refs(self, parent_id):
+        # The ``[md]`` ref file-docs grouped under ``parent_id``'s umbrella —
+        # expanding the parent, finding its umbrella, then expanding THAT.
+        umbrella = self._umbrella(self.r.get_children(parent_id))
+        return self.r.get_children(umbrella.id)
 
-    def test_root_lists_existing_ref_as_md_child(self):
-        # A's root children = its h1 heading + one ``[md]`` node for B.md.
-        # C.md is non-existent, so it is absent (existing-only).
+    # --- per-file root: References umbrella -------------------------------
+
+    def test_root_groups_existing_ref_under_umbrella(self):
+        # A's root children = its h1 heading + one ``[links]`` References
+        # umbrella (refs are NO LONGER direct children). Expanding the umbrella
+        # yields one ``[md]`` node for B.md; C.md is non-existent (existing-only).
         kids = self.r.get_children(self.A)
-        md_kids = self._md_children(kids)
-        self.assertEqual(len(md_kids), 1)
-        self.assertEqual(md_kids[0].title, 'B.md')
-        # And a heading row is also present (refs attach AFTER headings).
+        # A heading row is present, refs grouped after it under the umbrella.
         self.assertEqual(kids[0].tag, 'h1')
         self.assertEqual(kids[0].title, 'A title')
-        # The md ref node sits after the heading rows.
-        self.assertEqual(kids[-1].tag, 'md')
+        # No bare ``[md]`` ref nodes hang directly off the root anymore.
+        self.assertFalse(any(k.tag == 'md' for k in kids))
+        umbrella = self._umbrella(kids)
+        # The umbrella sits after the heading rows.
+        self.assertIs(kids[-1], umbrella)
+        self.assertEqual(umbrella.title, 'References')
+        self.assertEqual(umbrella.kind, 'md-refs')
+        self.assertFalse(umbrella.boundary)
+        self.assertTrue(umbrella.has_children)
+        # Its id = the file-root id + ``#refs``.
+        self.assertEqual(umbrella.id, self.r.md_doc.refs_umbrella_id(self.A))
+        # Expanding it yields the ref file-docs.
+        refs = self.r.get_children(umbrella.id)
+        self.assertEqual([k.title for k in refs], ['B.md'])
 
     def test_nonexistent_ref_absent(self):
-        # C.md never resolves, so no ``[md]`` child names it.
-        titles = [k.title for k in self.r.get_children(self.A)]
-        self.assertNotIn('C.md', titles)
+        # C.md never resolves, so no ``[md]`` child names it anywhere — neither
+        # at the root nor under the umbrella.
+        refs = self._refs(self.A)
+        self.assertNotIn('C.md', [k.title for k in refs])
 
     def test_ref_node_is_boundary(self):
-        # The referenced-file node carries the framework boundary flag.
-        bnode = self._md_children(self.r.get_children(self.A))[0]
+        # The referenced-file node under the umbrella carries the boundary flag.
+        bnode = self._refs(self.A)[0]
         self.assertTrue(getattr(bnode, 'boundary', False))
 
     def test_ref_label_is_relative(self):
         # Label is project_root-relative (here: bare basename, no leading
         # slash and no temp-dir prefix).
-        bnode = self._md_children(self.r.get_children(self.A))[0]
+        bnode = self._refs(self.A)[0]
         self.assertEqual(bnode.title, 'B.md')
         self.assertFalse(bnode.title.startswith('/'))
         self.assertNotIn(self.dir, bnode.title)
@@ -3661,44 +3685,58 @@ class TestMdRefFollowing(unittest.TestCase):
                     'first B.md, then ./B.md again, and D.md\n')
         self.r.md_doc.clear_cache()
         self.r._reparse()
-        md_kids = self._md_children(self.r.get_children(self.A))
-        titles = [k.title for k in md_kids]
+        refs = self._refs(self.A)
+        titles = [k.title for k in refs]
         # B.md deduped to one; D.md present; sorted by label.
         self.assertEqual(titles, ['B.md', 'D.md'])
 
     def test_ref_node_id_uses_md_chain_codec(self):
-        # The ref child id composes the #md: chain onto A's base id.
-        bnode = self._md_children(self.r.get_children(self.A))[0]
+        # The ref child id composes the #md: chain onto A's base id (UNCHANGED
+        # by the umbrella — the umbrella is a grouping parent, not a chain hop).
+        bnode = self._refs(self.A)[0]
         base, abspaths, line_offset = self.r.md_doc.parse_md_id(bnode.id)
         self.assertEqual(base, self.A)
         self.assertEqual(abspaths, [os.path.realpath(self.B)])
         self.assertIsNone(line_offset)
 
+    def test_umbrella_always_wraps_single_ref(self):
+        # Even a single ref is grouped under the umbrella — never hung directly
+        # under the document. A references only B.md (C.md is absent), so the
+        # umbrella has exactly one ``[md]`` child.
+        refs = self._refs(self.A)
+        self.assertEqual([k.title for k in refs], ['B.md'])
+
     # --- expanding a referenced file -------------------------------------
 
-    def test_expand_ref_yields_headings_and_back_ref(self):
-        # Expanding B's node yields B's top-level headings PLUS its ref back to
-        # A (the cycle expands in place — finite per manual drill, no loop).
-        bnode = self._md_children(self.r.get_children(self.A))[0]
+    def test_expand_ref_yields_headings_and_back_ref_umbrella(self):
+        # Expanding B's node yields B's top-level headings PLUS its own
+        # References umbrella (the cycle back to A is grouped, not direct).
+        bnode = self._refs(self.A)[0]
         bkids = self.r.get_children(bnode.id)
         heading_titles = [k.title for k in bkids if k.tag.startswith('h')]
         self.assertEqual(heading_titles, ['B one', 'B two'])
-        back = self._md_children(bkids)
+        # No bare ``[md]`` rows under the file doc — the ref is under B's
+        # own umbrella, whose id chains onto bnode.id.
+        self.assertFalse(any(k.tag == 'md' for k in bkids))
+        b_umbrella = self._umbrella(bkids)
+        self.assertEqual(b_umbrella.id, self.r.md_doc.refs_umbrella_id(bnode.id))
+        back = self.r.get_children(b_umbrella.id)
         self.assertEqual(len(back), 1)
         self.assertEqual(back[0].title, 'A.md')
         self.assertTrue(getattr(back[0], 'boundary', False))
 
     def test_cycle_expands_in_place_one_more_level(self):
         # Drilling the cycle A→B→A is finite per manual drill: expanding the
-        # A-under-B node yields A's headings + B again (no crash, no loop).
-        bnode = self._md_children(self.r.get_children(self.A))[0]
-        a_under_b = self._md_children(self.r.get_children(bnode.id))[0]
+        # A-under-B node yields A's headings + A's References umbrella again
+        # (no crash, no loop).
+        bnode = self._refs(self.A)[0]
+        a_under_b = self._refs(bnode.id)[0]
         a_kids = self.r.get_children(a_under_b.id)
         heading_titles = [k.title for k in a_kids if k.tag.startswith('h')]
         self.assertEqual(heading_titles, ['A title'])
-        # And B shows up again under this A — the cycle just keeps materialising
-        # lazily, one drill at a time.
-        self.assertEqual([k.title for k in self._md_children(a_kids)], ['B.md'])
+        # And B shows up again under this A's umbrella — the cycle just keeps
+        # materialising lazily, one drill at a time.
+        self.assertEqual([k.title for k in self._refs(a_under_b.id)], ['B.md'])
         # The chain id has grown by one segment each level.
         _, abspaths, _ = self.r.md_doc.parse_md_id(a_under_b.id)
         self.assertEqual(abspaths,
@@ -3706,19 +3744,41 @@ class TestMdRefFollowing(unittest.TestCase):
 
     def test_ref_file_heading_node_has_subheading_children(self):
         # A heading inside a referenced file expands to its sub-headings only
-        # (no ref children under a heading — refs live at the document level).
-        bnode = self._md_children(self.r.get_children(self.A))[0]
+        # (no ref children / no umbrella under a heading — refs live at the
+        # document level).
+        bnode = self._refs(self.A)[0]
         b_one = next(k for k in self.r.get_children(bnode.id)
                      if k.tag.startswith('h') and k.title == 'B one')
         sub = self.r.get_children(b_one.id)
         self.assertEqual([(k.tag, k.title) for k in sub], [('h2', 'B sub')])
-        self.assertFalse(any(k.tag == 'md' for k in sub))
+        self.assertFalse(any(k.tag in ('md', 'links') for k in sub))
 
     # --- preview routing --------------------------------------------------
 
+    def test_umbrella_preview_is_plain_label_list(self):
+        # The References umbrella preview is a PLAIN list of the ref labels
+        # (one per line, a count header) — NOT routed through md2ansi (no ANSI
+        # even with the color toggle ON), and never the file documents' bodies.
+        umbrella = self._umbrella(self.r.get_children(self.A))
+        self.r._MD_COLOR = True   # would colorise a markdown preview
+        out = self.r.get_preview(umbrella.id)
+        self.assertNotIn('\x1b', out, 'umbrella preview must be plain text')
+        self.assertIn('B.md', out)               # the ref label is listed
+        self.assertIn('1 referenced file', out)  # the count header
+        # NOT the referenced file's own body (that is the file-doc preview).
+        self.assertNotIn('B one', out)
+        self.assertNotIn('beta body', out)
+
+    def test_umbrella_preview_empty_when_unreadable(self):
+        # A #refs id whose document is gone yields '' (no crash, no header).
+        refs_id = self.r.md_doc.refs_umbrella_id(
+            self.r.md_doc.compose_md_id(
+                self.A, [os.path.join(self.dir, 'gone.md')]))
+        self.assertEqual(self.r.get_preview(refs_id), '')
+
     def test_preview_ref_document_node_is_full_text(self):
         # A referenced-file document id previews that file's FULL text.
-        bnode = self._md_children(self.r.get_children(self.A))[0]
+        bnode = self._refs(self.A)[0]
         with open(self.B, encoding='utf-8') as f:
             b_text = f.read()
         self.assertEqual(self.r.get_preview(bnode.id), b_text)
@@ -3726,7 +3786,7 @@ class TestMdRefFollowing(unittest.TestCase):
     def test_preview_ref_heading_node_is_section_slice(self):
         # A referenced-file heading id previews just that heading's section
         # slice (boundary rule: ``# B one`` stops before ``# B two``).
-        bnode = self._md_children(self.r.get_children(self.A))[0]
+        bnode = self._refs(self.A)[0]
         b_one = next(k for k in self.r.get_children(bnode.id)
                      if k.tag.startswith('h') and k.title == 'B one')
         out = self.r.get_preview(b_one.id)
@@ -3748,7 +3808,8 @@ class TestMdRefFollowing(unittest.TestCase):
 
     def test_heading_less_file_with_ref_is_expandable(self):
         # A file with NO headings that references an existing ``.md`` must still
-        # carry an expansion arrow (has_children True) and list the ref.
+        # carry an expansion arrow (has_children True). Its only child is the
+        # lazy References umbrella, which groups the ref.
         import os
         H = os.path.join(self.dir, 'H.md')
         self._write(H, 'Just prose, no headings, but see B.md for details.\n')
@@ -3758,10 +3819,12 @@ class TestMdRefFollowing(unittest.TestCase):
         self.r._reparse()
         root = self.r._FILES[H].file_root
         self.assertTrue(root.has_children)
-        # Eager heading tree is empty; the only child is the lazy ref node.
+        # Eager heading tree is empty; the only child is the lazy umbrella.
         self.assertEqual(root._children, [])
         kids = self.r.get_children(H)
-        self.assertEqual([(k.tag, k.title) for k in kids], [('md', 'B.md')])
+        self.assertEqual([(k.tag, k.title) for k in kids], [('links', 'References')])
+        refs = self.r.get_children(kids[0].id)
+        self.assertEqual([(k.tag, k.title) for k in refs], [('md', 'B.md')])
 
     def test_heading_less_file_without_ref_not_expandable(self):
         # Control: prose with no headings and no resolvable ref is a leaf —
@@ -3797,13 +3860,13 @@ class TestMdRefFollowing(unittest.TestCase):
 
     # --- markdown-link references (ticket #698) ---------------------------
 
-    def test_markdown_link_ref_surfaces_as_md_child(self):
+    def test_markdown_link_ref_surfaces_under_umbrella(self):
         # Regression for #698: a file that references an EXISTING ``.md`` via a
         # standard markdown LINK ``[label](other.md)`` (the COMMON case) must
-        # surface that file as an expandable ``[md]`` child of the file root.
-        # Before the fix the link delimiters polluted the captured token
+        # still surface that file — now grouped under the References umbrella.
+        # Before the #698 fix the link delimiters polluted the captured token
         # (``[B.md](B.md``), resolution returned None, and the ref was silently
-        # dropped — leaving the file with no ``[md]`` child at all.
+        # dropped — leaving the file with no ref at all.
         import os
         L = os.path.join(self.dir, 'L.md')
         self._write(L, 'Prose that links to [the B doc](B.md) for details.\n')
@@ -3813,11 +3876,11 @@ class TestMdRefFollowing(unittest.TestCase):
         self.r._reparse()
         root = self.r._FILES[L].file_root
         self.assertTrue(root.has_children)
-        md_kids = self._md_children(self.r.get_children(L))
-        # The link target B.md resolves and appears exactly once as a [md] child
-        # (the label + target both capture 'B.md', deduped by abspath).
-        self.assertEqual([k.title for k in md_kids], ['B.md'])
-        self.assertTrue(getattr(md_kids[0], 'boundary', False))
+        # The link target B.md resolves and appears exactly once as a [md] ref
+        # under the umbrella (the label + target both capture 'B.md', deduped).
+        refs = self._refs(L)
+        self.assertEqual([k.title for k in refs], ['B.md'])
+        self.assertTrue(getattr(refs[0], 'boundary', False))
 
 
 if __name__ == '__main__':

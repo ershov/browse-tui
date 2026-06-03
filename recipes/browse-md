@@ -618,11 +618,13 @@ def _resolve_anchor(anchor, file_root_id):
 # --- Markdown reference-following (#md: subtrees) ------------------
 #
 # A markdown FILE references other ``.md`` files (a relative/absolute/``~``
-# path token captured by ``md_doc.find_md_refs``). Each EXISTING referenced
-# file is surfaced as an expandable ``[md]`` child of the per-file root, drilling
-# into ITS headings and ITS refs, recursively. This MIRRORS browse-claude's
-# identical feature — the only difference is the base id: browse-md's base is the
-# file's bare-path id ``<file>`` (browse-claude's is a message id ``<sess>#<n>``).
+# path token captured by ``md_doc.find_md_refs``). A document's EXISTING
+# referenced files are grouped under one synthetic ``[links]`` References
+# umbrella (id ``<docid>#refs``, appended after the document's headings); each
+# ref is an expandable ``[md]`` file-doc UNDER that umbrella, drilling into ITS
+# headings and ITS refs, recursively. This MIRRORS browse-claude's identical
+# feature — the only difference is the base id: browse-md's base is the file's
+# bare-path id ``<file>`` (browse-claude's is a message id ``<sess>#<n>``).
 # Crucially, browse-md has NO "inline document" segment: the base IS a file, so
 # every ``#md:`` chain segment names a real file (browse-claude's empty-chain
 # inline-message case never arises here).
@@ -640,14 +642,16 @@ def _resolve_anchor(anchor, file_root_id):
 # ``#md:`` subtrees.
 #
 # Build is LAZY: the in-file heading tree is pre-built eagerly in ``_reparse``,
-# but ref children (and everything under a referenced file) are materialised on
-# expand in ``get_children`` — reading/parsing a referenced file only when its
-# row is opened (via ``md_doc.get_doc``'s process-wide cache, cleared on Ctrl-R).
-# Refs attach at the DOCUMENT level (alongside headings, after them — never under
-# an individual heading), so recursion (file → file) falls out of one uniform
-# rule with NO cycle/alias detection: lazy materialisation makes a reference
-# cycle expand in place rather than loop. The whole section is a no-op when
-# ``md_doc`` is unavailable (the ``main()`` gate already fails fast in that case).
+# but the References umbrella's full ref list (and everything under a referenced
+# file) is materialised on expand in ``get_children`` — the document-expand only
+# short-circuit-detects whether ANY ref exists (to hang the umbrella); the umbrella's
+# own expand reads/parses each referenced file (via ``md_doc.get_doc``'s
+# process-wide cache, cleared on Ctrl-R). Refs attach at the DOCUMENT level (the
+# umbrella sits alongside headings, after them — never under an individual
+# heading), so recursion (file → file) falls out of one uniform rule with NO
+# cycle/alias detection: lazy materialisation makes a reference cycle expand in
+# place rather than loop. The whole section is a no-op when ``md_doc`` is
+# unavailable (the ``main()`` gate already fails fast in that case).
 
 # Heading level (1..6) → row tag / colour style — the same palette as the in-file
 # heading tree (``_HEADING_STYLES``); a ``#md:`` heading row should look identical
@@ -801,6 +805,108 @@ def _md_file_item(base, abspaths, label):
     return item
 
 
+def _md_refs_umbrella_item(docid):
+    """The synthetic ``[links]`` References umbrella for a document ``docid``.
+
+    Groups every ``.md`` file a document references under ONE tree parent —
+    instead of interleaving the ref rows directly after the document's headings.
+    ``docid`` is the document's own id: a per-file root (a bare file path) at the
+    file-root level, or a ``#md:`` file-doc id at the referenced-file level. The
+    umbrella id appends the ``#refs`` marker (``md_doc.refs_umbrella_id``); the
+    ref file-docs UNDER it keep their own ``<docid>#md:<enc>`` ids — the umbrella
+    is a grouping parent, not a new hop in the ref chain.
+
+    ``boundary=False`` (same-document grouping — Alt-Right reveals the ref entries
+    but each ref file-doc under it stays a boundary). ``has_children=True`` is
+    authoritative: the caller only builds this when a ref actually exists (the
+    ``_file_has_existing_ref`` short-circuit), so the umbrella is never empty and
+    never needs self-heal. Mirrors browse-claude's ``_md_refs_umbrella_item``.
+    """
+    item = Item(
+        id=md_doc.refs_umbrella_id(docid),
+        title='References',
+        tag='links',
+        tag_style='cyan',          # muted cross-file grouping hue
+        has_children=True,         # caller built it only when a ref exists
+        boundary=False,            # same-document grouping, not a foreign doc
+    )
+    item.kind = 'md-refs'
+    return item
+
+
+def _md_refs_umbrella_children(item_id):
+    """Children of a ``[links]`` References umbrella — the full ref build.
+
+    THIS is the lazy point: ``get_children`` (per-file root) and
+    ``_md_subtree_children`` (file-doc) only short-circuit-detect a ref to decide
+    whether to hang the umbrella; the full resolve (resolve all, dedup by abspath,
+    sort by label) runs here, once, on the umbrella's own expand. Splits the
+    ``#refs`` marker back to the grouped document's id
+    (``md_doc.split_refs_umbrella``) and recovers that document's text +
+    resolution anchors, then builds one ``[md]`` file-doc per existing ref — same
+    ids (``<docid>#md:<enc>``) and ``boundary=True`` the direct children carried
+    before the umbrella was introduced, so expansion below the umbrella is
+    unchanged. Mirrors browse-claude's ``_md_refs_umbrella_children``.
+
+    Two document shapes, mirroring the two callers:
+
+      * **per-file root** (``docid`` is a bare file path in ``_FILES``) → the
+        file's cached ``_FileState.text``, anchored on ``_md_resolution_context``
+        of that path; refs chain directly off the file-root id.
+      * **file-doc id** (``docid`` contains ``#md:``) → the referenced file's own
+        text (``_md_chain_doc``), anchored on its own directory; refs nest onto
+        the existing ``abspaths`` chain.
+
+    Returns ``[]`` for an unreadable document (the umbrella is only built when a
+    ref exists, so an empty result here means the doc became unreadable since).
+    """
+    if md_doc is None:
+        return []
+    docid = md_doc.split_refs_umbrella(item_id)
+    if docid is None:
+        return []
+    if '#md:' in docid:
+        # File-doc umbrella: resolve the referenced file's own refs, nested onto
+        # its chain.
+        base, abspaths, _ = md_doc.parse_md_id(docid)
+        text, doc_tree = _md_chain_doc(abspaths)
+        if doc_tree is None:
+            return []
+        doc_dir, cwd, project_root = _md_resolution_context(abspaths[-1])
+        return [
+            _md_file_item(base, abspaths + [ref_abspath], label)
+            for ref_abspath, label in _md_resolved_refs(
+                text, doc_dir, cwd, project_root)
+        ]
+    # Per-file-root umbrella: resolve the file's refs off its cached text.
+    fs = _FILES.get(docid)
+    if fs is None:
+        return []
+    doc_dir, cwd, project_root = _md_resolution_context(docid)
+    return [
+        _md_file_item(docid, [ref_abspath], label)
+        for ref_abspath, label in _md_resolved_refs(
+            fs.text, doc_dir, cwd, project_root)
+    ]
+
+
+def _preview_md_refs_umbrella(item_id):
+    """Preview body for a ``[links]`` References umbrella.
+
+    A PLAIN, non-markdown listing of the grouped refs' labels — one per line
+    under a short count header — NEVER routed through ``_md_render`` / md2ansi
+    (the labels are file paths, not markdown to colorise). Reuses the umbrella's
+    own ``get_children`` build so the labels match the rows exactly. Returns
+    ``''`` when the document is unreadable / has no resolvable ref left. Mirrors
+    browse-claude's ``_preview_md_refs_umbrella``.
+    """
+    kids = _md_refs_umbrella_children(item_id)
+    if not kids:
+        return ''
+    header = f'{len(kids)} referenced file' + ('s' if len(kids) != 1 else '')
+    return '\n'.join([header, ''] + [k.title for k in kids])
+
+
 def _md_chain_doc(abspaths):
     """Resolve a ``#md:`` chain's *last* document to ``(text, doc_tree)``.
 
@@ -832,10 +938,13 @@ def _md_subtree_children(item_id):
         return its children as heading rows). No ref children — refs live at the
         document level, not under a heading.
       * **file document** (``abspaths`` non-empty, no ``line_offset``) → the
-        top-level heading rows of that file PLUS one ``[md]`` node per existing
-        ``.md`` ref in THAT file's own text (resolved against the file's own
-        directory), nested onto the chain. Recursion (file → file) falls out of
-        this uniform rule; expand-in-place, no cycle/alias detection.
+        top-level heading rows of that file PLUS a single ``[links]`` References
+        umbrella when THAT file references ≥1 existing ``.md`` (resolved against
+        the file's own directory). The umbrella groups the nested refs; building
+        the full ref list is deferred to its own expand, so here we only run the
+        ``_file_has_existing_ref`` short-circuit. Recursion (file → file) falls
+        out of this uniform rule once the umbrella expands; expand-in-place, no
+        cycle/alias detection.
 
     File text + tree come from ``md_doc.get_doc`` (process-wide cache). Returns
     ``[]`` for an unreadable/heading-less-and-ref-less document (which self-heals
@@ -854,11 +963,13 @@ def _md_subtree_children(item_id):
             return []
         return [_md_heading_item(base, abspaths, ch) for ch in node.children]
 
-    # File-document node → top-level headings, then this file's ref children.
+    # File-document node → top-level headings, then (when the file references at
+    # least one existing ``.md``) a single References umbrella grouping the file's
+    # own refs. The full resolve is deferred to the umbrella's expand; here we
+    # just short-circuit on the first one.
     out = [_md_heading_item(base, abspaths, node) for node in doc_tree]
-    doc_dir, cwd, project_root = _md_resolution_context(abspaths[-1])
-    for ref_abspath, label in _md_resolved_refs(text, doc_dir, cwd, project_root):
-        out.append(_md_file_item(base, abspaths + [ref_abspath], label))
+    if _file_has_existing_ref(text, abspaths[-1]):
+        out.append(_md_refs_umbrella_item(item_id))
     return out
 
 
@@ -954,9 +1065,10 @@ def _reparse():
         # The per-file root carries an expansion arrow when it has headings
         # (set by ``_build_nodes``) OR references at least one existing ``.md``
         # file — so a heading-less file that links to a real ``.md`` is still
-        # expandable into its ``[md]`` ref children. The ref half is computed
+        # expandable into its References umbrella. The ref half is computed
         # cheaply here (no referenced file is read — only existence-probed); the
-        # ref CHILDREN themselves are built lazily on expand in ``get_children``.
+        # umbrella (and the ref file-docs under it) is built lazily on expand in
+        # ``get_children``.
         if not file_root.has_children and _file_has_existing_ref(text, path):
             file_root.has_children = True
         by_line, lines_sorted = _build_line_index(by_id)
@@ -1013,9 +1125,14 @@ def get_children(node_id, *, reload=False):
       * ``…#md:…`` — a node inside a referenced-file subtree (a referenced ``.md``
         document or one of its headings). Built lazily + authoritatively by
         ``_md_subtree_children``. No-op when ``md_doc`` is unavailable.
+      * ``…#refs`` — a ``[links]`` References umbrella. Checked BEFORE the
+        ``#md:`` branch: a file-doc umbrella id ``<base>#md:<enc>#refs`` contains
+        ``#md:`` too, so the ``#refs`` test MUST come first or the ``#md:`` branch
+        would steal it. THIS is the lazy point — the full ref resolve happens
+        here, on umbrella expand (``_md_refs_umbrella_children``).
       * a per-file root (``node_id in _FILES``) — its eager top-level headings
-        PLUS one lazily-built ``[md]`` node per existing ``.md`` ref in the file
-        (appended AFTER the headings).
+        PLUS a single ``[links]`` References umbrella (appended AFTER the
+        headings) when the file references ≥1 existing ``.md``.
       * any other in-file id (``<path>#<line>``) — the cached ``_children`` off
         ``_BY_ID`` (headings have only sub-heading / list children — refs attach
         at the document level, never under a heading).
@@ -1040,20 +1157,27 @@ def get_children(node_id, *, reload=False):
         # consult ``_INPUT_FILES`` for the ordering and pull each
         # file's root out of ``_FILES`` by path.
         return [_FILES[p].file_root for p, _ in _INPUT_FILES if p in _FILES]
+    if (md_doc is not None and isinstance(node_id, str)
+            and md_doc.split_refs_umbrella(node_id) is not None):
+        # ``<docid>#refs`` — a ``[links]`` References umbrella. Checked BEFORE the
+        # ``#md:`` branch: a file-doc umbrella id ``<base>#md:<enc>#refs`` contains
+        # ``#md:`` too, so the ``#refs`` test MUST come first or the ``#md:``
+        # branch would steal it. THIS is the lazy point — the full ref resolve
+        # happens here, on umbrella expand.
+        return _md_refs_umbrella_children(node_id)
     if md_doc is not None and isinstance(node_id, str) and '#md:' in node_id:
         # A node inside a referenced-file subtree — built lazily here. Routing
         # stays a substring test; ``_md_subtree_children`` parses the chain.
         return _md_subtree_children(node_id)
     if node_id in _FILES:
-        # Per-file root: its eager in-file headings, then the lazily-resolved
-        # ``[md]`` ref children (one per existing ``.md`` the file references).
+        # Per-file root: its eager in-file headings, then a single ``[links]``
+        # References umbrella when the file references ≥1 existing ``.md``. The
+        # full ref list is built lazily on the umbrella's own expand; here we just
+        # short-circuit on the first existing ref.
         fs = _FILES[node_id]
         out = list(fs.file_root._children)
-        if md_doc is not None:
-            doc_dir, cwd, project_root = _md_resolution_context(node_id)
-            for ref_abspath, label in _md_resolved_refs(
-                    fs.text, doc_dir, cwd, project_root):
-                out.append(_md_file_item(node_id, [ref_abspath], label))
+        if md_doc is not None and _file_has_existing_ref(fs.text, node_id):
+            out.append(_md_refs_umbrella_item(node_id))
         return out
     item = _BY_ID.get(node_id)
     if item is None:
@@ -1095,6 +1219,13 @@ def get_preview(node_id):
     """
     if node_id is None:
         return ''
+    if (md_doc is not None and isinstance(node_id, str)
+            and md_doc.split_refs_umbrella(node_id) is not None):
+        # ``[links]`` References umbrella. Checked BEFORE the ``#md:`` path (a
+        # file-doc umbrella id ``<base>#md:<enc>#refs`` contains ``#md:``) and the
+        # in-file ``_classify_id`` path: render a PLAIN label list, not a document
+        # body (never routed through md2ansi).
+        return _preview_md_refs_umbrella(node_id)
     if md_doc is not None and isinstance(node_id, str) and '#md:' in node_id:
         # Referenced-file document / heading node — its own document's text or
         # heading section, never a cross-item cascade. Checked before the
