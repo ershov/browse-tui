@@ -391,8 +391,10 @@ the `tag` chip.
 Commits are flat under the root, so `max_col_width('col_author')` is
 global. `get_children` stores `item.col_sha`, `item.col_author`,
 `item.col_date`; `format_row_content` emits `[sha][author][date][subject]`
-with the subject last. Chips/decorations either stay trailing after the
-subject or become their own column. ~30 lines.
+with the subject last. The `%D` decoration chips render between the date
+column and the subject, so the subject stays the flexible last segment (a
+narrow pane truncates the subject, not the metadata). Reflog rows keep the
+default chip layout (out of scope here). ~30 lines.
 
 ## Rollout
 
