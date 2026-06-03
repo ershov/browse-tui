@@ -1017,11 +1017,17 @@ class TestRealProjectPath(unittest.TestCase):
     needs. State touched is HOME plus the byte-regex cwd cache; both are
     saved/cleared in setUp/tearDown so the tests pass identically in
     isolation and under full discover (no module-global pollution).
+
+    Loaded with ``md_doc`` live (``_load_recipe_with_md_doc``): the git-root
+    walk-up moved into ``md_doc`` (``find_git_root``), and
+    ``_session_cwd_and_root`` — a markdown-reference-resolution anchor whose
+    only callers are md-gated — now reaches it via ``_md_doc``, so these tests
+    need the module present.
     """
 
     @classmethod
     def setUpClass(cls):
-        cls.r = _load_recipe()
+        cls.r = _load_recipe_with_md_doc()
 
     def setUp(self):
         self._saved_home = os.environ.get('HOME')
@@ -1097,27 +1103,29 @@ class TestRealProjectPath(unittest.TestCase):
             )
 
     def test_find_git_root_returns_ancestor(self):
-        # A `.git` directory anywhere up the tree is the root.
+        # A `.git` directory anywhere up the tree is the root. The walk-up
+        # itself moved into md_doc (``find_git_root``); the recipe consumes it
+        # via ``_md_doc`` (the resolver-anchor path).
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             repo = os.path.join(tmp, 'repo')
             deep = os.path.join(repo, 'a', 'b', 'c')
             os.makedirs(deep)
             os.makedirs(os.path.join(repo, '.git'))
-            self.assertEqual(self.r._find_git_root(deep), repo)
+            self.assertEqual(self.r._md_doc.find_git_root(deep), repo)
             # A `.git` *file* (worktree/submodule layout) counts too.
             wt = os.path.join(tmp, 'wt')
             os.makedirs(wt)
             open(os.path.join(wt, '.git'), 'w').close()
-            self.assertEqual(self.r._find_git_root(wt), wt)
+            self.assertEqual(self.r._md_doc.find_git_root(wt), wt)
 
     def test_find_git_root_none_when_absent(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             plain = os.path.join(tmp, 'plain', 'deep')
             os.makedirs(plain)
-            self.assertIsNone(self.r._find_git_root(plain))
-            self.assertIsNone(self.r._find_git_root(''))
+            self.assertIsNone(self.r._md_doc.find_git_root(plain))
+            self.assertIsNone(self.r._md_doc.find_git_root(''))
 
     def test_session_cwd_and_root_uses_git_ancestor(self):
         # cwd from the records; project_root = the `.git` ancestor.
@@ -7322,7 +7330,7 @@ class TestMarkdownSubtrees(unittest.TestCase):
             self.assertNotIn('gamma', out)
             # The slice is exactly the section's byte range (raw == slice).
             _, tree = self.r._md_doc.get_doc(path)
-            node = self.r._md_node_at_line(tree, 0)
+            node = self.r._md_doc.node_at_line(tree, 0)
             self.assertEqual(
                 out, text[node.byte_offset:node.byte_offset + node.byte_size])
             # The sibling ``# Second`` (line 8) renders its own section.

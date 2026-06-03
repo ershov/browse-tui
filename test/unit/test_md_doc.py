@@ -11,6 +11,11 @@ Coverage mirrors the design spec's ``md_doc`` testing strategy:
 * ``build_doc_tree``  — heading nesting + boundary byte-range slicing on
                         fixtures, incl. a fenced ``#`` that is NOT a heading,
                         and the ``include_lists`` flag (TestBuildDocTree).
+* ``node_at_line``    — exact line-offset lookup over a built tree: top-level
+                        + deeply-nested match, no-match → ``None``
+                        (TestNodeAtLine).
+* ``find_git_root``   — nearest ``.git`` (dir or file) walk-up, none → ``None``,
+                        terminates at the filesystem root (TestFindGitRoot).
 * ``md_heading_trigger`` / ``find_md_refs`` — true/false gates and the ref
                         regex exclusions (TestTriggersAndRefs).
 * ``resolve_md_ref``  — base precedence, first-existing, ``None``
@@ -152,6 +157,99 @@ class TestBuildDocTree(unittest.TestCase):
         roots = md_doc.build_doc_tree('- alpha\n- beta\n', include_lists=True)
         self.assertEqual([r.title for r in roots], ['alpha', 'beta'])
         self.assertTrue(all(r.kind == 'list-item' for r in roots))
+
+
+class TestNodeAtLine(unittest.TestCase):
+    """``node_at_line`` — exact line-offset lookup over a built tree."""
+
+    # A tree with a deeply nested heading so the DFS recursion is exercised.
+    _TEXT = (
+        '# Top\n'        # line 0
+        'intro\n'        # line 1
+        '## A\n'         # line 2
+        'aaa\n'          # line 3
+        '### A1\n'       # line 4
+        'deep\n'         # line 5
+        '## B\n'         # line 6
+        'bbb\n'          # line 7
+    )
+
+    def test_top_level_match(self):
+        tree = md_doc.build_doc_tree(self._TEXT)
+        node = md_doc.node_at_line(tree, 0)
+        self.assertIsNotNone(node)
+        self.assertEqual(node.title, 'Top')
+
+    def test_deeply_nested_match(self):
+        # The DFS reaches a node nested two levels down by its exact offset.
+        tree = md_doc.build_doc_tree(self._TEXT)
+        node = md_doc.node_at_line(tree, 4)
+        self.assertIsNotNone(node)
+        self.assertEqual((node.title, node.level), ('A1', 3))
+
+    def test_mid_level_match(self):
+        tree = md_doc.build_doc_tree(self._TEXT)
+        self.assertEqual(md_doc.node_at_line(tree, 6).title, 'B')
+
+    def test_no_match_between_nodes_returns_none(self):
+        # A line offset that is NOT a node's own line (it falls on body text
+        # between headings) matches nothing — the lookup is exact, not a
+        # containing-range search.
+        tree = md_doc.build_doc_tree(self._TEXT)
+        self.assertIsNone(md_doc.node_at_line(tree, 3))
+
+    def test_before_first_node_returns_none(self):
+        # An offset before the first node's line yields None (no synthetic
+        # root, no containing fallback).
+        tree = md_doc.build_doc_tree('## Only\nbody\n')  # first node at line 0
+        self.assertIsNone(md_doc.node_at_line(tree, -1))
+
+    def test_offset_past_end_returns_none(self):
+        tree = md_doc.build_doc_tree(self._TEXT)
+        self.assertIsNone(md_doc.node_at_line(tree, 999))
+
+    def test_empty_tree_returns_none(self):
+        self.assertIsNone(md_doc.node_at_line([], 0))
+
+
+class TestFindGitRoot(unittest.TestCase):
+    """``find_git_root`` — nearest ``.git`` (dir or file) ancestor walk-up."""
+
+    def test_git_dir_found_at_self(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.mkdir(os.path.join(d, '.git'))
+            self.assertEqual(md_doc.find_git_root(d), os.path.abspath(d))
+
+    def test_git_dir_found_in_ancestor(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.mkdir(os.path.join(d, '.git'))
+            sub = os.path.join(d, 'a', 'b')
+            os.makedirs(sub)
+            self.assertEqual(md_doc.find_git_root(sub), os.path.abspath(d))
+
+    def test_git_file_found(self):
+        # A ``.git`` *file* (worktree / submodule gitdir pointer) counts too.
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, '.git'), 'w') as f:
+                f.write('gitdir: /elsewhere\n')
+            sub = os.path.join(d, 'nested')
+            os.makedirs(sub)
+            self.assertEqual(md_doc.find_git_root(sub), os.path.abspath(d))
+
+    def test_none_when_no_git(self):
+        # No ``.git`` anywhere up to the fs root → None (the walk terminates at
+        # root rather than looping). A tempdir under /tmp has no .git ancestor.
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(md_doc.find_git_root(d))
+
+    def test_falsy_start_returns_none(self):
+        self.assertIsNone(md_doc.find_git_root(''))
+        self.assertIsNone(md_doc.find_git_root(None))
+
+    def test_terminates_at_fs_root(self):
+        # The filesystem root is its own parent; the loop must stop there and
+        # return None rather than spin (the root has no .git in the test env).
+        self.assertIsNone(md_doc.find_git_root('/'))
 
 
 class TestTriggersAndRefs(unittest.TestCase):

@@ -672,27 +672,6 @@ def _collapse_home(path):
     return path
 
 
-def _find_git_root(start):
-    """Nearest ancestor of ``start`` (inclusive) holding a ``.git`` entry.
-
-    Walks parents until a ``.git`` directory **or file** is found (a file is how
-    git worktrees / submodules record their gitdir), stopping at the filesystem
-    root. Returns the containing directory, or ``None`` when no ``.git`` is found.
-    Lifted from browse-claude — browse-md has no sessions, so the file's own
-    directory is the walk-up start.
-    """
-    if not start:
-        return None
-    d = os.path.abspath(start)
-    while True:
-        if os.path.exists(os.path.join(d, '.git')):
-            return d
-        parent = os.path.dirname(d)
-        if parent == d:
-            return None
-        d = parent
-
-
 def _md_resolution_context(file_path):
     """``(doc_dir, cwd, project_root)`` for resolving refs in ``file_path``.
 
@@ -711,7 +690,7 @@ def _md_resolution_context(file_path):
     """
     doc_dir = os.path.dirname(file_path)
     cwd = os.getcwd()
-    project_root = _find_git_root(doc_dir) or doc_dir
+    project_root = md_doc.find_git_root(doc_dir) or doc_dir
     return doc_dir, cwd, project_root
 
 
@@ -822,23 +801,6 @@ def _md_file_item(base, abspaths, label):
     return item
 
 
-def _md_node_at_line(doc_tree, line_offset):
-    """Find the heading ``MdNode`` at ``line_offset`` in a doc tree, or None.
-
-    Depth-first walk of the (already-built) ``md_doc`` structural tree — the tree
-    is one document's headings, so a linear search is fine and avoids stashing a
-    by-line index on the structural nodes. Mirrors browse-claude's
-    ``_md_node_at_line``.
-    """
-    for node in doc_tree:
-        if node.line_offset == line_offset:
-            return node
-        found = _md_node_at_line(node.children, line_offset)
-        if found is not None:
-            return found
-    return None
-
-
 def _md_chain_doc(abspaths):
     """Resolve a ``#md:`` chain's *last* document to ``(text, doc_tree)``.
 
@@ -887,7 +849,7 @@ def _md_subtree_children(item_id):
 
     # Heading node → its nested sub-headings (no ref children).
     if line_offset is not None:
-        node = _md_node_at_line(doc_tree, line_offset)
+        node = md_doc.node_at_line(doc_tree, line_offset)
         if node is None:
             return []
         return [_md_heading_item(base, abspaths, ch) for ch in node.children]
@@ -941,7 +903,7 @@ def _preview_md_node(item_id):
         return ''
     if line_offset is None:
         return _md_render(text)
-    node = _md_node_at_line(doc_tree, line_offset)
+    node = md_doc.node_at_line(doc_tree, line_offset)
     if node is None:
         return ''
     return _md_render(text[node.byte_offset:node.byte_offset + node.byte_size])

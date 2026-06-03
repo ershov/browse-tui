@@ -763,26 +763,6 @@ def _real_project_path(project_dir):
     return _decode_project_path(os.path.basename(project_dir.rstrip('/')))
 
 
-def _find_git_root(start):
-    """Nearest ancestor of ``start`` (inclusive) holding a ``.git`` entry.
-
-    Walks parents until a ``.git`` directory **or file** is found (a file
-    is how git worktrees and submodules record their gitdir), stopping at
-    the filesystem root. Returns the containing directory, or ``None`` when
-    no ``.git`` is found along the way.
-    """
-    if not start:
-        return None
-    d = os.path.abspath(start)
-    while True:
-        if os.path.exists(os.path.join(d, '.git')):
-            return d
-        parent = os.path.dirname(d)
-        if parent == d:
-            return None
-        d = parent
-
-
 def _session_cwd_and_root(session_jsonl_path):
     """``(cwd, project_root)`` for a session — the resolver's path anchors.
 
@@ -800,7 +780,7 @@ def _session_cwd_and_root(session_jsonl_path):
     project_dir = os.path.dirname(session_jsonl_path)
     cwd = _real_project_cwd(project_dir)
     if cwd:
-        root = _find_git_root(cwd) or cwd
+        root = _md_doc.find_git_root(cwd) or cwd
         return cwd, root
     # No readable cwd (e.g. an empty project dir): best-effort root from the
     # lossy dir-name decode, expanded to a real absolute path so callers can
@@ -1808,22 +1788,6 @@ def _md_message_children(base):
     return out
 
 
-def _md_node_at_line(doc_tree, line_offset):
-    """Find the heading ``MdNode`` at ``line_offset`` in a doc tree, or None.
-
-    Walks the (already-built) tree depth-first — the tree is small (one
-    document's headings) so a linear search is fine and avoids stashing a
-    by-line index on the structural nodes.
-    """
-    for node in doc_tree:
-        if node.line_offset == line_offset:
-            return node
-        found = _md_node_at_line(node.children, line_offset)
-        if found is not None:
-            return found
-    return None
-
-
 def _md_chain_doc(base, abspaths):
     """Resolve a ``#md:`` chain's *last* document to ``(text, doc_tree)``.
 
@@ -1883,7 +1847,7 @@ def _md_subtree_children(item_id):
 
     # Heading node → its nested sub-headings (no ref children).
     if line_offset is not None:
-        node = _md_node_at_line(doc_tree, line_offset)
+        node = _md_doc.node_at_line(doc_tree, line_offset)
         if node is None:
             return []
         return [_md_heading_item(base, abspaths, ch) for ch in node.children]
@@ -1923,7 +1887,7 @@ def _preview_md_node(item_id):
         return ''
     if line_offset is None:
         return _md_voice(text)
-    node = _md_node_at_line(doc_tree, line_offset)
+    node = _md_doc.node_at_line(doc_tree, line_offset)
     if node is None:
         return ''
     return _md_voice(text[node.byte_offset:node.byte_offset + node.byte_size])

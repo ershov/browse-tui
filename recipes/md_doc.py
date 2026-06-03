@@ -312,6 +312,30 @@ def build_doc_tree(text, *, include_lists=False):
     return roots
 
 
+def node_at_line(tree, line_offset):
+    """Find the ``MdNode`` at ``line_offset`` in a doc tree, or ``None``.
+
+    Depth-first walk of an (already-built) ``MdNode`` tree — the list of
+    top-level nodes from ``build_doc_tree`` and, recursively, each node's
+    ``children``. Returns the first node whose ``line_offset`` *exactly*
+    equals the target (so the codec's heading selector is an O(nodes) lookup
+    that needs no by-line index stashed on the structural nodes); a
+    ``line_offset`` that matches no node — including one before the first
+    node — yields ``None``. The tree is one document's structure, so a linear
+    search is plenty.
+
+    Lifted verbatim from the recipes' ``_md_node_at_line`` (both
+    ``browse-claude`` and ``browse-md`` carried an identical copy).
+    """
+    for node in tree:
+        if node.line_offset == line_offset:
+            return node
+        found = node_at_line(node.children, line_offset)
+        if found is not None:
+            return found
+    return None
+
+
 # ### Section: Reference detection & resolution ############################
 
 # Captures a ``.md`` reference token. The body excludes whitespace and the
@@ -395,6 +419,32 @@ def resolve_md_ref(captured, *, doc_dir, cwd, project_root):
         if os.path.exists(cand):
             return os.path.realpath(cand)
     return None
+
+
+def find_git_root(start):
+    """Nearest ancestor of ``start`` (inclusive) holding a ``.git`` entry.
+
+    Walks parents until a ``.git`` directory **or file** is found (a file is
+    how git worktrees and submodules record their gitdir), stopping at the
+    filesystem root. Returns the containing directory, or ``None`` when no
+    ``.git`` is found along the way (or ``start`` is falsy).
+
+    The recipes feed the result (falling back to ``start`` itself) as the
+    ``project_root`` anchor for ``resolve_md_ref``: ``browse-md`` walks up from
+    a file's own directory, ``browse-claude`` from a session's recorded cwd.
+    Lifted verbatim from the recipes' ``_find_git_root`` (both carried an
+    identical copy).
+    """
+    if not start:
+        return None
+    d = os.path.abspath(start)
+    while True:
+        if os.path.exists(os.path.join(d, '.git')):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
 
 
 # ### Section: #md: id codec ###############################################
