@@ -7545,6 +7545,240 @@ class TestMarkdownSubtrees(unittest.TestCase):
                 [op for op in flat_ops if op[0] == 'mod'], [],
                 'no self-heal mod for non-empty or non-md parents')
 
+    # ---- right-arrow: move INTO the first child (#688) ------------------
+    #
+    # An umbrella/session moves the cursor INTO its children on a single
+    # right-arrow (``_on_expand`` → ``_jump_to_latest_voice`` lands on the
+    # latest VOICE child, whose ``row_bg`` is set). A markdown-managed row's
+    # children are document/heading nodes with NO ``row_bg``, so the
+    # latest-voice lookup returns ``None`` and the cursor used to stay put —
+    # right-arrow felt like a no-op. The fix lands the cursor on the FIRST
+    # visible child for these rows (the structural analog), reusing the same
+    # ``_AWAITING_VOICE_JUMP`` park / ``_on_children_loaded`` settle as the
+    # voice-jump. These tests drive the recipe's hook callbacks directly —
+    # the same fake-ctx style as ``TestOnExpandJumpComposition`` — but with
+    # ``md_doc`` live so the markdown subtree actually builds.
+
+    def _make_jump_ctx(self, *, cached, expanded=None):
+        """Fake ctx recording ``cursor_to`` + serving ``cached_children``.
+
+        ``cached`` maps an id → the value ``cached_children`` returns
+        (``None`` = fetch in flight, a list = available). ``expanded`` is the
+        set ``ctx.state.expanded`` exposes (the still-expanded guard reads
+        it); ``None`` means "everything is expanded". Installs a recording
+        ``_BROWSER`` (with ``invalidate_preview`` / ``preview_width`` so the
+        cross-file-upgrade and md-voice paths don't blow up). Returns
+        ``(ctx, cursor_to_calls)``.
+        """
+        cursor_to_calls = []
+
+        class _AllExpanded:
+            def __contains__(self, _id):
+                return True
+
+        expanded_set = _AllExpanded() if expanded is None else expanded
+
+        class _FakeBrowser:
+            preview_width = 80
+
+            def invalidate_preview(self, _id):
+                pass
+
+            def get_item(self, _id):
+                return None
+
+        self.r._BROWSER = _FakeBrowser()
+
+        class _State:
+            expanded = expanded_set
+
+        class _Ctx:
+            state = _State()
+
+            def cached_children(self, id_):
+                val = cached.get(id_, None)
+                return None if val is None else list(val)
+
+            def cursor_to(self, id_):
+                cursor_to_calls.append(id_)
+
+            def update_data(self, _ops):
+                # The settle path may self-heal a childless md row; record
+                # nothing — these tests only assert on cursor movement.
+                pass
+
+        return _Ctx(), cursor_to_calls
+
+    def test_first_visible_child_helper(self):
+        # The structural analog of _latest_voice_among_children: first child
+        # by listing order, skipping hidden rows; None when no visible child.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            base = f'{sess}#0'                       # message-with-md
+            kids = self.r.get_children(base)
+            self.assertTrue(kids, 'fixture should build md children')
+            self.assertEqual(
+                self.r._first_visible_child(base), kids[0].id)
+        # Non-str / no-children both yield None.
+        self.assertIsNone(self.r._first_visible_child(None))
+
+    def test_first_visible_child_skips_hidden(self):
+        # A hidden leading child is skipped; the first VISIBLE id is returned.
+        saved = self.r.get_children
+        hidden = _RecordingItem('h'); hidden.hidden = True
+        shown = _RecordingItem('v'); shown.hidden = False
+        self.r.get_children = lambda _id: [hidden, shown]
+        self.addCleanup(setattr, self.r, 'get_children', saved)
+        self.assertEqual(self.r._first_visible_child('x'), 'v')
+
+    def test_is_md_managed_id_predicate(self):
+        # md-managed = md_doc live AND (#md: node OR plain <jsonl>#<n>).
+        self.assertTrue(self.r._is_md_managed_id('/p/s.jsonl#3'))
+        self.assertTrue(self.r._is_md_managed_id('/p/s.jsonl#0#md:'))
+        # Umbrellas / sessions / subagent groups are NOT md-managed.
+        for not_md in ('/p/s.jsonl#prompt:0', '/p/s.jsonl#tool:1',
+                       '/p/s.jsonl#span:2', '/p/s.jsonl#agent:A1',
+                       '/p/s.jsonl', None):
+            self.assertFalse(self.r._is_md_managed_id(not_md), not_md)
+        # Hard no-op when the feature is off.
+        saved = self.r._md_doc
+        try:
+            self.r._md_doc = None
+            self.assertFalse(self.r._is_md_managed_id('/p/s.jsonl#3'))
+            self.assertFalse(self.r._is_md_managed_id('/p/s.jsonl#0#md:'))
+        finally:
+            self.r._md_doc = saved
+
+    def test_expand_md_message_lands_on_first_child(self):
+        # Cached expand of a message-with-md: cursor jumps to the inline
+        # ``markdown`` node (its first child) in one press — the bug case.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            base = f'{sess}#0'
+            kids = self.r.get_children(base)
+            first = kids[0].id
+            self.assertEqual(first, f'{base}#md:')   # the inline doc node
+            ctx, calls = self._make_jump_ctx(cached={base: kids})
+            self.r._on_expand(ctx, [base])
+            self.assertEqual(calls, [first],
+                             'expanding a message-with-md must land on its '
+                             'first child')
+
+    def test_expand_inline_md_node_lands_on_first_child(self):
+        # Cached expand of the inline ``markdown`` (#md:) node lands on its
+        # first heading row.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            inline = f'{sess}#0#md:'
+            kids = self.r.get_children(inline)
+            self.assertTrue(kids, 'inline doc should have heading children')
+            first = kids[0].id
+            ctx, calls = self._make_jump_ctx(cached={inline: kids})
+            self.r._on_expand(ctx, [inline])
+            self.assertEqual(calls, [first])
+
+    def test_expand_file_doc_lands_on_first_child(self):
+        # Cached expand of a file-doc (boundary) node lands on its first
+        # heading row.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            base = f'{sess}#0'
+            msg_kids = self.r.get_children(base)
+            filedoc = next(k for k in msg_kids
+                           if getattr(k, 'boundary', False))
+            kids = self.r.get_children(filedoc.id)
+            self.assertTrue(kids, 'file doc should have heading children')
+            first = kids[0].id
+            ctx, calls = self._make_jump_ctx(cached={filedoc.id: kids})
+            self.r._on_expand(ctx, [filedoc.id])
+            self.assertEqual(calls, [first])
+
+    def test_uncached_md_message_defers_then_lands_on_first_child(self):
+        # The async path: uncached expand parks the id (no jump yet), then
+        # _on_children_loaded lands on the first child once the fetch settles
+        # — exactly mirroring the voice-jump defer.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            base = f'{sess}#0'
+            first = self.r.get_children(base)[0].id
+            saved_pending = set(self.r._AWAITING_VOICE_JUMP)
+            self.addCleanup(self.r._AWAITING_VOICE_JUMP.clear)
+            self.addCleanup(self.r._AWAITING_VOICE_JUMP.update, saved_pending)
+            self.r._AWAITING_VOICE_JUMP.clear()
+            # Children NOT cached at expand time → defer.
+            ctx, calls = self._make_jump_ctx(cached={base: None})
+            self.r._on_expand(ctx, [base])
+            self.assertEqual(calls, [], 'uncached expand must not jump yet')
+            self.assertIn(base, self.r._AWAITING_VOICE_JUMP)
+            # Fetch settles → the children-loaded hook lands the cursor.
+            self.r._on_children_loaded(ctx, [base])
+            self.assertEqual(calls, [first])
+            self.assertNotIn(base, self.r._AWAITING_VOICE_JUMP)
+
+    def test_umbrella_still_lands_on_latest_voice_no_regression(self):
+        # An umbrella's post-expand jump is UNCHANGED: it lands on the LATEST
+        # voice child, not the first. A turn with user / tool_use / asst
+        # gives three direct children (#0 user, #1 tool_use, #2 asst), so
+        # first (#0) != latest (#2) and the assertion would catch any leak of
+        # the first-child fallback into the (non-md) umbrella path.
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = os.path.join(tmp, 's.jsonl')
+            recs = [
+                {'type': 'user', 'uuid': 'u1', 'message': {
+                    'role': 'user', 'content': 'FIRST_VOICE'}},
+                {'type': 'assistant', 'uuid': 'a1', 'message': {
+                    'role': 'assistant', 'content': [
+                        {'type': 'tool_use', 'name': 'Bash',
+                         'input': {'command': 'x'}}]}},
+                {'type': 'assistant', 'uuid': 'a2', 'message': {
+                    'role': 'assistant', 'content': [
+                        {'type': 'text', 'text': 'LAST_VOICE'}]}},
+            ]
+            with open(sess, 'w') as f:
+                for rc in recs:
+                    f.write(_json.dumps(rc) + '\n')
+            umb = f'{sess}#prompt:0'
+            self.assertFalse(self.r._is_md_managed_id(umb))
+            kids = self.r.get_children(umb)
+            latest = self.r._latest_voice_among_children(umb)
+            self.assertEqual(latest, f'{sess}#2')        # the LAST voice
+            self.assertNotEqual(latest, kids[0].id)      # first != latest
+            ctx, calls = self._make_jump_ctx(cached={umb: kids})
+            self.r._on_expand(ctx, [umb])
+            self.assertEqual(calls, [latest],
+                             'umbrella must still land on the latest voice')
+
+    def test_false_positive_md_message_does_not_move_cursor(self):
+        # A false-positive md row (a ``#`` only inside a code fence) whose
+        # authoritative build is empty must NOT move the cursor — neither at
+        # expand nor when the (empty) fetch settles (which only self-heals).
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            base = f'{sess}#2'                       # the optimistic positive
+            self.assertTrue(self.r._md_has_children(
+                self.r._read_jsonl_line(sess, 2)))   # arrow was set
+            self.assertEqual(self.r.get_children(base), [])  # build is empty
+            saved_pending = set(self.r._AWAITING_VOICE_JUMP)
+            self.addCleanup(self.r._AWAITING_VOICE_JUMP.clear)
+            self.addCleanup(self.r._AWAITING_VOICE_JUMP.update, saved_pending)
+            self.r._AWAITING_VOICE_JUMP.clear()
+            # Settled-to-empty children at fire time.
+            ctx, calls = self._make_jump_ctx(cached={base: []})
+            self.r._on_expand(ctx, [base])
+            self.assertEqual(calls, [],
+                             'a childless md row must not move the cursor')
+            self.r._on_children_loaded(ctx, [base])
+            self.assertEqual(calls, [],
+                             'self-heal settle must not move the cursor')
+
 
 class TestBoundaryMigration(unittest.TestCase):
     """#662: ``boundary`` flag integration + the id-shape ``if`` migration.

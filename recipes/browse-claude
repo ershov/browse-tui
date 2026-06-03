@@ -5370,6 +5370,27 @@ def _latest_voice_among_children(item_id):
     return latest
 
 
+def _first_visible_child(item_id):
+    """First **visible** direct child id of ``item_id`` (or ``None``).
+
+    The structural analog of :func:`_latest_voice_among_children` for
+    rows whose children carry no ``row_bg`` voice marker — markdown
+    document/heading/file nodes. Single-level (``get_children``, so it is
+    mode-agnostic and honours the umbrella structure), first-in-listing
+    order, and it skips children the voice-only filter has marked
+    ``hidden`` — mirroring the visibility the voice-jump respects (a
+    voice row always passes the filter, so the latest-voice lookup never
+    lands on a hidden row). Returns ``None`` when there are no children
+    or none are visible.
+    """
+    if not isinstance(item_id, str):
+        return None
+    for it in get_children(item_id):
+        if not getattr(it, 'hidden', False):
+            return it.id
+    return None
+
+
 # Cache ``<sid> → session .jsonl path`` for the cross-project-dir lookup
 # below. Session ids are UUID-unique, so a hit is stable for the life of
 # the process; misses aren't cached (a session whose file lands later
@@ -5706,8 +5727,22 @@ def _jump_to_latest_voice(ctx, item_id):
     drilling further is user-driven. Mode-agnostic since #475 (flat and
     tree both resolve through ``get_children``). No-op when there is no
     voice at this level or the latest voice is the row itself.
+
+    Markdown fallback: a markdown-managed row (a message-with-md, the
+    inline ``markdown`` node, a file-doc, or a heading) has no voice
+    child — its children are document/heading nodes with no ``row_bg`` —
+    so the latest-voice lookup returns ``None`` and the row would feel
+    like ``→`` "does nothing". For those rows, land on the FIRST visible
+    child instead (the structural analog of "latest voice"), so a single
+    ``→`` moves the cursor INTO the subtree just as it does for an
+    umbrella. Other rows (umbrellas, sessions) keep their latest-voice
+    landing untouched. ``_first_visible_child`` returns ``None`` when the
+    row has no children (e.g. a false-positive arrow ``_md_self_heal``
+    is about to retract), so nothing moves there.
     """
     latest = _latest_voice_among_children(item_id)
+    if latest is None and _is_md_managed_id(item_id):
+        latest = _first_visible_child(item_id)
     if latest is not None and latest != item_id:
         ctx.cursor_to(latest)
 
@@ -5783,24 +5818,37 @@ def _md_self_heal(ctx, parent_id):
     are *optimistic* — they arrow without reading the file, so a ``#`` that
     lives only inside a code fence, or a ``.md`` token that doesn't resolve,
     earns an arrow that the authoritative ``get_children`` build then reveals
-    as empty. When such a markdown-managed parent settles to NO children, push
-    a ``mod(id, has_children=False)`` so the arrow disappears on next render.
-
-    Markdown-managed = (md_doc present) and the id is either a ``#md:`` node or
-    a plain message id ``<jsonl>#<n>``. Other parents (umbrellas, sessions) are
-    never md-optimistic, so we leave them untouched — a real umbrella with no
-    visible children keeps its arrow as before. No-op when the children aren't
-    cached yet or are non-empty, or when there's no browser to push to.
+    as empty. When such a markdown-managed parent (``_is_md_managed_id``)
+    settles to NO children, push a ``mod(id, has_children=False)`` so the arrow
+    disappears on next render. Other parents (umbrellas, sessions) are never
+    md-optimistic, so we leave them untouched — a real umbrella with no visible
+    children keeps its arrow as before. No-op when the children aren't cached
+    yet or are non-empty, or when there's no browser to push to.
     """
-    if _md_doc is None or _BROWSER is None:
-        return
-    if not isinstance(parent_id, str):
-        return
-    if '#md:' not in parent_id and not _is_md_message_id(parent_id):
+    if _BROWSER is None or not _is_md_managed_id(parent_id):
         return
     kids = ctx.cached_children(parent_id)
     if kids == []:
         ctx.update_data([mod(parent_id, has_children=False)])
+
+
+def _is_md_managed_id(item_id):
+    """True iff ``item_id``'s children are owned by the markdown subtree.
+
+    Markdown-managed = ``md_doc`` is importable AND the id is either a
+    ``#md:`` node (inline document, file doc, or heading) or a plain
+    message id ``<jsonl>#<n>`` (which gains markdown children when the
+    message has a heading or references a ``.md`` file). These are the
+    rows whose expansion arrow the detection gate sets *optimistically*
+    (so ``_md_self_heal`` may retract it) and whose post-expand cursor
+    lands on the first child rather than a voice child
+    (``_jump_to_latest_voice``). Umbrellas / sessions are never
+    md-managed. A no-op (``False``) when ``_md_doc is None`` — the whole
+    markdown feature is dead code then.
+    """
+    if _md_doc is None or not isinstance(item_id, str):
+        return False
+    return '#md:' in item_id or _is_md_message_id(item_id)
 
 
 def _is_md_message_id(item_id):
