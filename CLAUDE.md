@@ -17,7 +17,7 @@ For non-trivial tasks, launch a review subagent to assess the change. The focus 
 2. Does it do so in a reasonably simple way i.e. not overengineered?
 3. Is there any stale code left?
 
-Make sure subagents are all Opus model with effort level at leash "high".
+Make sure subagents are all Opus model with effort level at least "high".
 
 ## Task tracking
 
