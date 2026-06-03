@@ -479,7 +479,8 @@ def _index_add_children(state: State, parent_id, items) -> None:
 
 
 _PROMOTION_DATA_FIELDS = (
-    'title', 'tag', 'tag_style', 'has_children', 'hidden', 'scope_title',
+    'title', 'tag', 'tag_style', 'has_children', 'hidden', 'boundary',
+    'scope_title',
 )
 
 
@@ -494,7 +495,8 @@ def _promote_synthetic(synthetic, real) -> None:
 
     Merge policy:
       - Item data fields (``title``, ``tag``, ``tag_style``,
-        ``has_children``, ``hidden``, ``scope_title``): take ``real``.
+        ``has_children``, ``hidden``, ``boundary``, ``scope_title``):
+        take ``real``.
       - Recipe-attached extras (``__dict__`` keys not in the dataclass
         field set): copied from ``real``. Extras on ``synthetic`` that
         aren't on ``real`` are not removed — synthetics rarely carry
@@ -4405,11 +4407,24 @@ class Browser:
         way (cursor-into / user expand) later. ``lazy=False`` is
         reserved for a future "force-fetch everything" mode and
         currently behaves the same as ``True``.
+
+        A node whose Item has ``Item.boundary=True`` is treated as a
+        leaf: the walk expands *to* it but never *through* it, so its
+        descendants are not recursively expanded even when cached. The
+        boundary node itself is still added to ``state.expanded``.
         """
         def _do():
             state = self._state
             def _walk(pid):
                 state.expanded.add(pid)
+                # Boundary nodes are self-contained foreign subtrees:
+                # expand *to* this node (added above), never *through*
+                # it — skip recursing into its children even when they
+                # are already cached. (Lazy expansion below already skips
+                # uncached branches; this covers the cached case.)
+                item = state._items_by_id.get(pid)
+                if item is not None and getattr(item, 'boundary', False):
+                    return
                 children = state._children.get(pid)
                 if children is None:
                     return

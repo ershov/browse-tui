@@ -64,6 +64,18 @@ try:
 except Exception:
     _md2ansi_fn = None
 
+# Optional md_doc plugin — turns a message's markdown (its inline content and
+# the ``.md`` files it references) into a navigable document subtree. The
+# import is guarded exactly like ``md2ansi`` above: when it fails (the sibling
+# recipe / its ``md2ansi_lib`` dep isn't importable) ``_md_doc`` is ``None`` and
+# the WHOLE feature degrades to a no-op — no message row gains markdown
+# children, detection never fires, and ``#md:`` routing is dead code. Every
+# other behaviour is unchanged.
+try:
+    import md_doc as _md_doc
+except Exception:
+    _md_doc = None
+
 _MD_COLOR = _md2ansi_fn is not None  # default on when available
 _BROWSER = None  # set in main() — used for preview-width lookup
 
@@ -416,6 +428,13 @@ def get_children(item_id, *, reload=False):
         if reload:
             _TREE_CACHE.clear()
             _TAIL_STATE.clear()
+            # Drop the shared markdown parse cache too, so a root Ctrl-R
+            # re-reads any referenced ``.md`` files edited on disk. (A
+            # per-file ``_bust_caches_for`` can't reach these — they live
+            # outside the session tree — so the full wipe is the right
+            # granularity.) No-op when md_doc isn't importable.
+            if _md_doc is not None:
+                _md_doc.clear_cache()
         return _list_projects()
     if isinstance(item_id, str) and '#agent:' in item_id:
         # Tree mode views the subagent .jsonl as its own tree, recursing
@@ -460,10 +479,21 @@ def get_children(item_id, *, reload=False):
                 return []
             return _list_span_records(path, start)
         return []
+    if isinstance(item_id, str) and _md_doc is not None and '#md:' in item_id:
+        # ``<base>#md:…`` — a node inside a message's markdown document
+        # subtree (inline doc, file doc, or heading). Built lazily and
+        # authoritatively here; mode-agnostic (works in tree AND flat). Dead
+        # code when ``_md_doc is None`` (the gate above never let a ``#md:``
+        # id be created, so this never fires either way).
+        return _md_subtree_children(item_id)
     if isinstance(item_id, str) and '#' in item_id:
-        # Regular message id ``<path>#<n>`` — always a leaf in tree
-        # mode now (umbrellas own all the expansion). Flat mode never
-        # had children for these.
+        # Regular message id ``<path>#<n>``. When ``md_doc`` is present, a
+        # message gains markdown children (its inline document + referenced
+        # ``.md`` files) — built lazily here, mode-agnostic. Otherwise it is a
+        # leaf in tree mode (umbrellas own all the expansion) and flat mode
+        # never had children for these.
+        if _md_doc is not None:
+            return _md_message_children(item_id)
         return []
     if isinstance(item_id, str) and item_id.endswith('.jsonl') and os.path.isfile(item_id):
         if _TREE_MODE:
@@ -518,7 +548,7 @@ def _list_projects():
             tag = f'{running}/{sessions} live · {_human_time(latest)}'
         item = Item(
             id=full,
-            title=_decode_project_path(name),
+            title=_real_project_path(full),
             tag=tag,
             tag_style=('green' if running else 'dim'),
             has_children=sessions > 0,
@@ -581,6 +611,13 @@ def _list_sessions(project_dir):
             tag=tag,
             tag_style=('green' if running_meta else 'dim'),
             has_children=count > 0 or n_subs > 0,
+            # A bare session row anchors a whole other file — a
+            # self-contained foreign subtree. ``boundary`` is what the
+            # migrated ``_is_cross_file_id`` reads to render the cheap
+            # metadata card until the row is committed (scoped/expanded),
+            # and what stops a recursive expand from walking the whole
+            # transcript in one go.
+            boundary=True,
         )
         item.kind = 'session'
         item.line_count = count
@@ -666,6 +703,90 @@ def _session_cwds(session_jsonl_path):
         cwds = set()
     _SESSION_CWDS_CACHE[key] = cwds
     return cwds
+
+
+def _collapse_home(path):
+    """Collapse a leading ``$HOME`` to ``~`` for display (else verbatim)."""
+    if not path:
+        return path
+    home = os.environ.get('HOME') or os.path.expanduser('~')
+    if home and path == home:
+        return '~'
+    if home and path.startswith(home + '/'):
+        return '~' + path[len(home):]
+    return path
+
+
+def _real_project_cwd(project_dir):
+    """The true cwd a Claude project directory was encoded from, or ``None``.
+
+    Reads the ``cwd`` recorded in the project's sessions (via the
+    ``_session_cwds`` byte-regex scan) rather than inverting the dir name —
+    ``_decode_project_path`` is lossy because it can't tell a real ``-``
+    from an encoded ``/``/``.``. We prefer a cwd that round-trips back to
+    this directory (``_encode_project_path(cwd) == basename``): that pins
+    the canonical cwd even for a worktree session whose records carry extra
+    dispatch cwds, and is order-independent. Lacking an exact match we
+    return any recorded cwd (sorted for determinism), and ``None`` only
+    when no session here carries a readable ``cwd`` (e.g. an empty dir).
+    """
+    try:
+        names = sorted(
+            n for n in os.listdir(project_dir) if n.endswith('.jsonl')
+        )
+    except OSError:
+        return None
+    base = os.path.basename(project_dir.rstrip('/'))
+    fallback = None
+    for name in names:
+        cwds = _session_cwds(os.path.join(project_dir, name))
+        for cwd in sorted(cwds):
+            if _encode_project_path(cwd) == base:
+                return cwd
+            if fallback is None:
+                fallback = cwd
+    return fallback
+
+
+def _real_project_path(project_dir):
+    """Display path for a project dir, hyphen-faithful, HOME→``~`` collapsed.
+
+    The accurate counterpart to ``_decode_project_path``: derives the path
+    from a session's recorded ``cwd`` (see ``_real_project_cwd``) so a real
+    hyphen in a directory name survives instead of being mangled into ``/``.
+    Falls back to the lossy name-decode only when no session here carries a
+    readable ``cwd`` (an empty project dir), so we always show *something*.
+    """
+    cwd = _real_project_cwd(project_dir)
+    if cwd:
+        return _collapse_home(cwd)
+    return _decode_project_path(os.path.basename(project_dir.rstrip('/')))
+
+
+def _session_cwd_and_root(session_jsonl_path):
+    """``(cwd, project_root)`` for a session — the resolver's path anchors.
+
+    ``cwd`` is the session's recorded working directory (its containing
+    project dir's ``_real_project_cwd``; ``None`` if unreadable).
+    ``project_root`` is the git root above ``cwd`` (nearest ``.git``
+    ancestor) when one exists, else the session's real project directory —
+    the actual filesystem path (not HOME-collapsed), so callers can
+    ``os.path.join`` against it. Both fall back gracefully: an unreadable
+    session yields ``(None, <lossy decoded project dir>)``.
+
+    Consumed by the markdown reference resolver to anchor relative ``.md``
+    references against the right roots.
+    """
+    project_dir = os.path.dirname(session_jsonl_path)
+    cwd = _real_project_cwd(project_dir)
+    if cwd:
+        root = _md_doc.find_git_root(cwd) or cwd
+        return cwd, root
+    # No readable cwd (e.g. an empty project dir): best-effort root from the
+    # lossy dir-name decode, expanded to a real absolute path so callers can
+    # join against it.
+    decoded = _decode_project_path(os.path.basename(project_dir.rstrip('/')))
+    return None, os.path.expanduser(decoded)
 
 
 def _candidate_subagents_dirs(session_jsonl_path):
@@ -798,6 +919,14 @@ def _list_subagents_for_session(session_jsonl_path):
                 tag=f'{agent_type} · {count} msg · {_human_time(st.st_mtime)}',
                 tag_style='magenta',
                 has_children=count > 0,
+                # Subagent transcripts live in their own .jsonl — a
+                # self-contained foreign subtree. ``boundary`` stops
+                # recursive/multi-expansion at the group row and keeps
+                # the agent's lines out of a parent's preview cascade
+                # (the attribute ``_is_cross_file_id`` / ``_walk_umbrella``
+                # consult instead of the old ``'#agent:' in id`` shape
+                # test). Orphan rows inherit it via this builder.
+                boundary=True,
             )
             item.kind = 'subagent'
             item.agent_id = agent_id
@@ -897,7 +1026,10 @@ def _list_messages(jsonl_path, limit=None):
             title=_oneline(_summarise_message(obj)),
             tag=_row_tag(kind, obj),
             tag_style=_TAG_STYLE_FOR_KIND.get(kind, ''),
-            has_children=False,
+            # Optimistic markdown-subtree detection — see ``_tree_item``. The
+            # feature is mode-agnostic, so flat-mode rows gain the same arrow;
+            # ``get_children`` returns the document nodes regardless of mode.
+            has_children=_md_has_children(obj),
             hidden=not _passes_filter(item_id, td),
         )
         item.kind = 'message'
@@ -1407,6 +1539,358 @@ def _extract_text(content):
     if content is None:
         return ''
     return str(content)
+
+
+# ---- markdown document subtrees (md_doc integration) ---------------------
+#
+# When ``md_doc`` is importable, a message that contains markdown headings OR
+# references existing ``.md`` files on disk becomes expandable into a document
+# subtree: an inline ``markdown`` document node plus one node per referenced
+# file, each drillable into its own heading tree, recursively. Detection is a
+# cheap regex gate run at item-build time (optimistic — it may over-trigger);
+# the authoritative tree is built lazily on expand in ``get_children`` and
+# self-heals a stale arrow via ``_on_children_loaded``. Ids use the ``#md:``
+# codec in ``md_doc`` so routing stays a ``'#md:' in item_id`` substring test.
+# The whole section is a no-op when ``_md_doc is None``.
+
+
+def _message_md_text(rec):
+    """The message's markdown text: every ``text`` part + any ``tool_result``
+    text, joined with blank lines.
+
+    This is the inline document's source — what ``md_doc.build_doc_tree`` /
+    ``md_heading_trigger`` scan for headings. Unlike ``_extract_text`` (which
+    returns the *first* useful fragment for a one-line summary), this collects
+    ALL prose: every ``type=='text'`` content part, plus the textual body of
+    any ``type=='tool_result'`` part (its ``content`` string, or the ``text``
+    of its content sub-parts). ``thinking`` and ``tool_use`` parts are skipped
+    — they aren't the message's authored markdown. A bare-string ``content`` is
+    returned verbatim. Returns ``''`` for a record with no text.
+    """
+    msg = rec.get('message') if isinstance(rec, dict) else None
+    content = msg.get('content') if isinstance(msg, dict) else None
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ''
+    chunks = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        ptype = part.get('type')
+        if ptype == 'text':
+            t = part.get('text', '') or ''
+            if t:
+                chunks.append(t)
+        elif ptype == 'tool_result':
+            inner = part.get('content')
+            if isinstance(inner, str):
+                if inner:
+                    chunks.append(inner)
+            elif isinstance(inner, list):
+                for sub in inner:
+                    if isinstance(sub, dict) and sub.get('type') == 'text':
+                        t = sub.get('text', '') or ''
+                        if t:
+                            chunks.append(t)
+    return '\n\n'.join(chunks)
+
+
+def _iter_str_leaves(obj):
+    """Yield every ``str`` leaf reachable in a nested dict/list ``obj``.
+
+    A short-circuit-friendly depth-first walk over the record's structure —
+    the detection gate's cheap alternative to ``json.dumps(rec)``. Dict values
+    and list elements are descended; keys are skipped (a JSON key is never a
+    document path). The caller can stop pulling at the first match, so a record
+    whose first text part already names a ``.md`` file never walks the rest.
+    """
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            yield from _iter_str_leaves(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _iter_str_leaves(v)
+
+
+def _record_has_md_ref(rec):
+    """True iff any string leaf of ``rec`` contains a ``.md`` reference token.
+
+    Short-circuiting: walks ``rec``'s string leaves (``_iter_str_leaves``) and
+    stops at the FIRST ``.md`` hit via ``md_doc.find_md_refs`` — far cheaper
+    than serialising the whole record. No ``os.stat`` here (detection is
+    optimistic; existence is checked lazily on expand, and a dead token
+    self-heals). Sees ``Write``/``Read``/``Edit`` tool paths and prose alike.
+    """
+    if _md_doc is None:
+        return False
+    for s in _iter_str_leaves(rec):
+        if _md_doc.find_md_refs(s):
+            return True
+    return False
+
+
+def _md_has_children(rec):
+    """Detection gate: should this message row carry an expansion arrow?
+
+    ``True`` when ``md_doc`` is present AND the message either has a markdown
+    heading (``md_heading_trigger`` over its extracted text) or references a
+    ``.md`` file anywhere in the record (``_record_has_md_ref``). Pure regex,
+    no disk I/O — intentionally *optimistic* (a ``#`` inside a code fence, or a
+    ``.md`` token that doesn't resolve, both trigger here and self-heal on the
+    first expand). A no-op (``False``) when ``_md_doc is None``.
+    """
+    if _md_doc is None:
+        return False
+    if _md_doc.md_heading_trigger(_message_md_text(rec)):
+        return True
+    return _record_has_md_ref(rec)
+
+
+def _md_ref_label(abspath, cwd, project_root):
+    """Display label for a referenced ``.md`` file, against a single anchor.
+
+    Rendered relative to ONE common anchor so a flat sibling list reads cleanly
+    without ``../`` noise: relative to ``project_root`` if the file is inside
+    it, else relative to ``cwd`` if inside it, else a ``~``-collapsed absolute
+    path. The label lives on the ``Item`` (never in the id — the id is
+    abspath-canonical).
+    """
+    for anchor in (project_root, cwd):
+        if anchor and (abspath == anchor or abspath.startswith(anchor.rstrip('/') + '/')):
+            return os.path.relpath(abspath, anchor)
+    return _collapse_home(abspath)
+
+
+# Heading level (1..6) → row tag / colour style, matching browse-md's map
+# (h1 loud red at the top, cycling down to a muted gray h6).
+_MD_HEADING_STYLE = {
+    1: 'red', 2: 'yellow', 3: 'green', 4: 'blue', 5: 'magenta', 6: 'gray',
+}
+
+
+def _md_heading_item(base, abspaths, node):
+    """Map an ``md_doc`` heading ``MdNode`` to a tree-row ``Item``.
+
+    Id = ``compose_md_id(base, abspaths, node.line_offset)`` — selecting the
+    heading by its line within the chain's last document. ``has_children`` is
+    authoritative (we already have the parsed node), so heading rows never need
+    self-heal. ``boundary`` is left ``False`` — a heading is same-document
+    structure, not a foreign subtree.
+    """
+    item = Item(
+        id=_md_doc.compose_md_id(base, abspaths, line_offset=node.line_offset),
+        title=node.title,
+        tag=f'h{node.level}',
+        tag_style=_MD_HEADING_STYLE.get(node.level, ''),
+        has_children=bool(node.children),
+    )
+    item.kind = 'md-heading'
+    item.md_level = node.level
+    return item
+
+
+def _md_file_item(base, abspaths, label):
+    """Map a referenced ``.md`` file to a document tree-row ``Item``.
+
+    ``abspaths`` is the full chain ending in this file (so the id nests under
+    its referrer). ``has_children`` is optimistically ``True`` — we have not
+    read the file yet; it self-heals on expand if the file has no headings and
+    no further refs. ``boundary=True`` marks it a self-contained foreign
+    subtree so recursive/multi-expansion stops at it.
+    """
+    item = Item(
+        id=_md_doc.compose_md_id(base, abspaths),
+        title=label,
+        tag='md',
+        tag_style='blue',          # cross-file / attachment hue (vs dim inline)
+        has_children=True,         # optimistic; self-heals on expand
+        boundary=True,
+    )
+    item.kind = 'md-doc'
+    item.md_abspath = abspaths[-1]
+    return item
+
+
+def _md_resolved_refs(text, doc_dir, cwd, project_root):
+    """Resolve the ``.md`` refs in ``text`` to existing abspaths.
+
+    Returns a list of ``(abspath, label)`` pairs: each captured token resolved
+    via ``md_doc.resolve_md_ref`` (existing-only — unresolved tokens dropped),
+    deduped by abspath (first occurrence wins), and sorted by label so the flat
+    sibling list reads stably. ``doc_dir`` is the referencing document's own
+    directory (``cwd`` for the inline document, ``dirname(file)`` for a file).
+    """
+    seen = set()
+    out = []
+    for captured in _md_doc.find_md_refs(text):
+        abspath = _md_doc.resolve_md_ref(
+            captured, doc_dir=doc_dir, cwd=cwd, project_root=project_root)
+        if abspath is None or abspath in seen:
+            continue
+        seen.add(abspath)
+        out.append((abspath, _md_ref_label(abspath, cwd, project_root)))
+    out.sort(key=lambda pair: pair[1])
+    return out
+
+
+def _md_message_children(base):
+    """Children of a markdown message row ``<base>`` (``<session>#<n>``).
+
+    The authoritative build (lazy, on expand): an inline ``markdown`` document
+    node (only when the message's own text actually parses to ≥1 heading) plus
+    one ``[md]`` node per *existing* ``.md`` file referenced ANYWHERE in the
+    record — prose or tool path — deduped by abspath and sorted by label. A
+    ref that appears in the inline text surfaces here as a message-level
+    sibling, not under the ``markdown`` node (which stays a pure heading index);
+    this yields one unified list of every file the message references directly
+    under it. Returns ``[]`` when neither holds (the optimistic detection arrow
+    then self-heals).
+    """
+    path = base.partition('#')[0]
+    suffix = base.rpartition('#')[2]
+    try:
+        n = int(suffix)
+    except ValueError:
+        return []
+    rec = _read_jsonl_line(path, n)
+    if rec is None:
+        return []
+
+    out = []
+    # Inline document node — only when the message's own text has a heading.
+    text = _message_md_text(rec)
+    if _md_doc.build_doc_tree(text):
+        inline = Item(
+            id=_md_doc.compose_md_id(base, []),
+            title='markdown',
+            tag='md',
+            tag_style='dim',       # muted same-file index (vs blue file docs)
+            has_children=True,     # confirmed ≥1 heading
+            boundary=False,        # inline content is same-file, not foreign
+        )
+        inline.kind = 'md-doc'
+        out.append(inline)
+
+    # File document nodes — every existing ``.md`` ref in the whole record.
+    cwd, project_root = _session_cwd_and_root(path)
+    doc_dir = cwd or project_root
+    # Gather refs across the record's string leaves (prose + tool paths), in
+    # document order, then resolve/dedup/sort uniformly via the file's text
+    # path. We feed the concatenated leaves so one ``find_md_refs`` pass and
+    # one dedup cover the whole record.
+    record_text = '\n'.join(_iter_str_leaves(rec))
+    for abspath, label in _md_resolved_refs(
+            record_text, doc_dir, cwd or '', project_root or ''):
+        out.append(_md_file_item(base, [abspath], label))
+    return out
+
+
+def _md_chain_doc(base, abspaths):
+    """Resolve a ``#md:`` chain's *last* document to ``(text, doc_tree)``.
+
+    The chain's terminal document is what both the subtree build and the
+    preview route operate on: a non-empty ``abspaths`` ends in a referenced
+    file (read + parsed once via ``md_doc.get_doc``'s process-wide cache); an
+    empty chain is the message's own inline content (``_message_md_text`` of the
+    ``<base>`` record, parsed with ``build_doc_tree``). Returns ``(None, None)``
+    when the document is unreadable / the base id has no valid line number — the
+    callers treat that as "no children / empty preview".
+    """
+    if abspaths:
+        try:
+            return _md_doc.get_doc(abspaths[-1])
+        except OSError:
+            return None, None
+    suffix = base.rpartition('#')[2]
+    try:
+        n = int(suffix)
+    except ValueError:
+        return None, None
+    rec = _read_jsonl_line(base.partition('#')[0], n)
+    if rec is None:
+        return None, None
+    text = _message_md_text(rec)
+    return text, _md_doc.build_doc_tree(text)
+
+
+def _md_subtree_children(item_id):
+    """Children for a ``#md:`` node — the lazy, authoritative build.
+
+    Routes on the parsed id shape (``md_doc.parse_md_id`` → ``(base, abspaths,
+    line_offset)``):
+
+      * **heading** (``line_offset`` set) → the sub-headings nested under it
+        (walk the chain's last document tree to the node at ``line_offset``,
+        return its children as heading rows). No reference children — refs live
+        at the document level, not under a heading.
+      * **inline document** (``abspaths == []``, no ``line_offset``) → the
+        top-level heading rows of the message's inline text. Its refs already
+        surface at the message level above, so none are added here.
+      * **file document** (``abspaths`` non-empty, no ``line_offset``) → the
+        top-level heading rows of that file PLUS a ``[md]`` node per existing
+        ``.md`` ref in THAT file's own text (resolved against the file's own
+        directory), nested onto the chain. Recursion (file → file) falls out of
+        this uniform rule; expand-in-place, no cycle/alias detection.
+
+    File text + tree come from ``md_doc.get_doc`` (process-wide cache). Returns
+    ``[]`` for an unreadable/heading-less document (self-heals the arrow).
+    """
+    base, abspaths, line_offset = _md_doc.parse_md_id(item_id)
+    path = base.partition('#')[0]
+
+    text, doc_tree = _md_chain_doc(base, abspaths)
+    if doc_tree is None:
+        return []
+
+    # Heading node → its nested sub-headings (no ref children).
+    if line_offset is not None:
+        node = _md_doc.node_at_line(doc_tree, line_offset)
+        if node is None:
+            return []
+        return [_md_heading_item(base, abspaths, ch) for ch in node.children]
+
+    # Document node → top-level headings, then (file docs only) ref children.
+    out = [_md_heading_item(base, abspaths, node) for node in doc_tree]
+    if abspaths:
+        cwd, project_root = _session_cwd_and_root(path)
+        doc_dir = os.path.dirname(abspaths[-1])
+        for ref_abspath, label in _md_resolved_refs(
+                text, doc_dir, cwd or '', project_root or ''):
+            out.append(_md_file_item(base, abspaths + [ref_abspath], label))
+    return out
+
+
+def _preview_md_node(item_id):
+    """Preview body for a ``#md:`` document or heading node.
+
+    Reads ONLY the node's own document — never a cross-item cascade:
+
+      * **document node** (no ``line_offset``) → that document's full text:
+        the message's inline content (empty chain) or the referenced file's
+        text (``md_doc.get_doc`` cache).
+      * **heading node** (``…#<lineoffset>``) → just that heading's section,
+        sliced ``text[byte_offset : byte_offset + byte_size]`` from the cached
+        ``doc_tree`` (the boundary rule includes the heading's own sub-sections
+        and stops at the next sibling-or-shallower heading).
+
+    Both are rendered through ``_md_voice`` — md2ansi when the ``_MD_COLOR``
+    toggle is on, raw text otherwise — which already falls back to the raw
+    string if md2ansi raises. Returns ``''`` for an unreadable document or a
+    line offset that matches no heading.
+    """
+    base, abspaths, line_offset = _md_doc.parse_md_id(item_id)
+    text, doc_tree = _md_chain_doc(base, abspaths)
+    if text is None:
+        return ''
+    if line_offset is None:
+        return _md_voice(text)
+    node = _md_doc.node_at_line(doc_tree, line_offset)
+    if node is None:
+        return ''
+    return _md_voice(text[node.byte_offset:node.byte_offset + node.byte_size])
 
 
 # ---- preview rendering ---------------------------------------------------
@@ -2152,13 +2636,18 @@ def _fmt_tur_subagent(tur):
     stats = (f'{MUTE}{dur_ms/1000:.1f}s · {n_tools} tools · '
              f'{tokens:,} tokens{RESET}')
     out = [head, stats, '']
+    # The report BODY is a markdown document (it even gets a synthetic
+    # ``markdown`` child) — render it through _md_voice like the voice
+    # renderers, NOT raw. The head/stats above stay as-is (not markdown).
     content = tur.get('content')
+    chunks = []
     if isinstance(content, list):
         for p in content:
             if isinstance(p, dict) and p.get('type') == 'text':
-                out.append(p.get('text', ''))
+                chunks.append(p.get('text', '') or '')
     elif isinstance(content, str):
-        out.append(content)
+        chunks.append(content)
+    out.append(_md_voice('\n\n'.join(c for c in chunks if c)))
     return '\n'.join(out).rstrip()
 
 
@@ -2566,6 +3055,20 @@ def get_preview(item_id):
     """
     if not isinstance(item_id, str) or item_id.startswith('__err__:'):
         return ''
+    if '#md:' in item_id:
+        # Markdown document/heading node. Checked FIRST — before both
+        # ``_is_cross_file_id`` and the generic '#' message path. The
+        # cross-file check is now boundary-based, and an md *file*-doc
+        # node carries ``boundary=True``, so it would otherwise be hijacked
+        # into the cross-file metadata/cascade path. md ids never contain
+        # ``#agent:`` and never end in ``.jsonl``, so claiming them here
+        # steals no cross-file id; it just routes every md node (inline
+        # OR file, regardless of its boundary flag) to its own document
+        # preview, and keeps a trailing ``#<lineoffset>`` from being
+        # mis-read as a record line number. A no-op when ``_md_doc is
+        # None`` (no ``#md:`` id can exist then, but the guard keeps the
+        # branch self-contained).
+        return _preview_md_node(item_id) if _md_doc is not None else ''
     # Cross-file rows (subagent group, bare session): heavy umbrella
     # cascade only when committed (scope_root or expanded inline);
     # cheap metadata card otherwise so scrolling stays cheap.
@@ -2684,7 +3187,7 @@ def _preview_project(path):
     except OSError as e:
         return f'[error] {e}'
     header = (
-        f'project: {_decode_project_path(os.path.basename(path))}\n'
+        f'project: {_real_project_path(path)}\n'
         f'path:    {path}\n'
         f'\n{len(names)} session(s):'
     )
@@ -3856,10 +4359,13 @@ def _list_span_records(jsonl_path, start_line):
 def _tree_item(jsonl_path, rec, td):
     """Build a leaf list-row ``Item`` for ``rec`` in tree mode.
 
-    Always ``has_children=False`` — wrapping into ``<prompt>`` / ``<tool>``
-    umbrellas is the listing layer's job (``_list_prompt_children`` /
-    ``_list_tool_children``). This builder produces the leaf
-    content-row that appears **inside** an umbrella's expansion.
+    Conversationally a leaf — wrapping into ``<prompt>`` / ``<tool>`` umbrellas
+    is the listing layer's job (``_list_prompt_children`` /
+    ``_list_tool_children``); this builder produces the content-row that
+    appears **inside** an umbrella's expansion. Its one expandable case is the
+    markdown subtree: ``has_children`` reflects ``_md_has_children(rec)`` (a
+    no-op ``False`` when ``md_doc`` is absent), so a row with markdown headings
+    or a ``.md`` reference still gains the document-subtree arrow.
     """
     n = td.line_of.get(rec.get('uuid'))
     if n is None:
@@ -3877,7 +4383,10 @@ def _tree_item(jsonl_path, rec, td):
         title=_oneline(_summarise_message(rec)),
         tag=_row_tag(kind, rec),
         tag_style=_TAG_STYLE_FOR_KIND.get(kind, ''),
-        has_children=False,
+        # Optimistic markdown-subtree detection (no-op when md_doc absent):
+        # a heading or a ``.md`` ref earns an expansion arrow, built lazily by
+        # ``get_children`` and self-healed by ``_on_children_loaded`` if false.
+        has_children=_md_has_children(rec),
         hidden=not _passes_filter(item_id, td),
     )
     item.kind = 'message'
@@ -4084,6 +4593,9 @@ def _subagent_pseudo_item(parent_jsonl, agent_id, agent_path):
         tag_style='magenta',
         has_children=count > 0,
         hidden=False,   # subagent umbrellas are always visible
+        # Foreign subtree (the agent's own .jsonl): same boundary
+        # semantics as the rows from ``_list_subagents_for_session``.
+        boundary=True,
     )
     item.kind = 'subagent'
     item.agent_id = agent_id
@@ -4364,14 +4876,17 @@ def _walk_umbrella(item_id, _state, _flush):
         if getattr(child, 'hidden', False):
             continue
         try:
-            if '#agent:' in cid:
-                # Subagent boundary — never drill into another file's
-                # records from a parent's preview. The dispatching
-                # Agent / Task tool_use + matching tool_result already
-                # live in the parent file and render through the
-                # normal leaf path under the dispatching turn, so we
-                # don't even emit a stub — would just duplicate that
-                # pair.
+            if getattr(child, 'boundary', False):
+                # Boundary child — a self-contained foreign subtree
+                # (subagent group, referenced .md file): never drill
+                # into another file's content from a parent's preview
+                # cascade. For a subagent the dispatching Agent / Task
+                # tool_use + matching tool_result already live in the
+                # parent file and render through the normal leaf path
+                # under the dispatching turn, so we don't even emit a
+                # stub — would just duplicate that pair. (md docs are
+                # never in this cascade, so this only fires for the
+                # ``#agent:`` rows it used to match by id shape.)
                 continue
             if '#prompt:' in cid or '#tool:' in cid or '#span:' in cid:
                 # Same-file umbrella — recurse so the user sees every
@@ -4542,8 +5057,8 @@ def _gather_umbrella_lines(item_id):
     Walks the umbrella's children recursively in document order via
     ``get_children`` (the same listing helper that builds the
     displayed tree). Nested umbrellas in the SAME file are followed
-    transparently; ``#agent:`` boundaries are NOT crossed — the
-    subagent's records live in a different ``.jsonl`` and the user
+    transparently; ``boundary`` children (subagent groups) are NOT
+    crossed — their records live in a different ``.jsonl`` and the user
     can drill into that group row separately if they want them.
     """
     out = []
@@ -4561,8 +5076,12 @@ def _walk_umbrella_lines(item_id, out):
         cid = getattr(child, 'id', None)
         if not isinstance(cid, str):
             continue
-        if '#agent:' in cid:
-            # Subagent boundary — content is in a different file.
+        if getattr(child, 'boundary', False):
+            # Boundary child — a self-contained foreign subtree (subagent
+            # group): its content lives in a different file, so the
+            # export excerpt stops at the group row (the user drills into
+            # it separately). md docs never appear in this cascade, so
+            # this only matches the ``#agent:`` rows it did by id shape.
             continue
         if '#prompt:' in cid or '#tool:' in cid or '#span:' in cid:
             _walk_umbrella_lines(cid, out)
@@ -4856,6 +5375,27 @@ def _latest_voice_among_children(item_id):
     return latest
 
 
+def _first_visible_child(item_id):
+    """First **visible** direct child id of ``item_id`` (or ``None``).
+
+    The structural analog of :func:`_latest_voice_among_children` for
+    rows whose children carry no ``row_bg`` voice marker — markdown
+    document/heading/file nodes. Single-level (``get_children``, so it is
+    mode-agnostic and honours the umbrella structure), first-in-listing
+    order, and it skips children the voice-only filter has marked
+    ``hidden`` — mirroring the visibility the voice-jump respects (a
+    voice row always passes the filter, so the latest-voice lookup never
+    lands on a hidden row). Returns ``None`` when there are no children
+    or none are visible.
+    """
+    if not isinstance(item_id, str):
+        return None
+    for it in get_children(item_id):
+        if not getattr(it, 'hidden', False):
+            return it.id
+    return None
+
+
 # Cache ``<sid> → session .jsonl path`` for the cross-project-dir lookup
 # below. Session ids are UUID-unique, so a hit is stable for the life of
 # the process; misses aren't cached (a session whose file lands later
@@ -5104,9 +5644,27 @@ def _is_cross_file_id(item_id):
     preview whenever the row transitions into the active state, so
     the next preview pass picks up the heavy cascade instead of the
     stale metadata.
+
+    Attribute-based since the ``boundary`` migration: a row is
+    cross-file iff its loaded Item carries ``boundary=True`` — set on
+    subagent-group ``#agent:`` rows and bare ``.jsonl`` session rows
+    (exactly the shapes the old id test matched), plus md *file*-doc
+    nodes (which never reach this path — ``get_preview`` routes ``#md:``
+    ids out before the cross-file check). When the Item isn't loaded
+    (``get_item`` → ``None``: no live Browser, a Browser without the
+    lookup, or a row referenced before its fetch) we fall back to the
+    OLD id-shape predicate, so behaviour is identical for ``#agent:`` /
+    bare-``.jsonl`` rows regardless of load state.
     """
     if not isinstance(item_id, str):
         return False
+    get_item = getattr(_BROWSER, 'get_item', None)
+    item = get_item(item_id) if get_item is not None else None
+    if item is not None:
+        return bool(getattr(item, 'boundary', False))
+    # Fallback (Item not loaded): the original id-shape test, so the
+    # cheap-preview / cascade-upgrade contract holds even before the
+    # row's Item exists in the index.
     if '#agent:' in item_id:
         return True
     if '#' not in item_id and item_id.endswith('.jsonl'):
@@ -5174,8 +5732,22 @@ def _jump_to_latest_voice(ctx, item_id):
     drilling further is user-driven. Mode-agnostic since #475 (flat and
     tree both resolve through ``get_children``). No-op when there is no
     voice at this level or the latest voice is the row itself.
+
+    Markdown fallback: a markdown-managed row (a message-with-md, the
+    inline ``markdown`` node, a file-doc, or a heading) has no voice
+    child — its children are document/heading nodes with no ``row_bg`` —
+    so the latest-voice lookup returns ``None`` and the row would feel
+    like ``→`` "does nothing". For those rows, land on the FIRST visible
+    child instead (the structural analog of "latest voice"), so a single
+    ``→`` moves the cursor INTO the subtree just as it does for an
+    umbrella. Other rows (umbrellas, sessions) keep their latest-voice
+    landing untouched. ``_first_visible_child`` returns ``None`` when the
+    row has no children (e.g. a false-positive arrow ``_md_self_heal``
+    is about to retract), so nothing moves there.
     """
     latest = _latest_voice_among_children(item_id)
+    if latest is None and _is_md_managed_id(item_id):
+        latest = _first_visible_child(item_id)
     if latest is not None and latest != item_id:
         ctx.cursor_to(latest)
 
@@ -5241,6 +5813,62 @@ def _on_children_loaded(ctx, parent_ids):
             _AWAITING_VOICE_JUMP.discard(pid)
             if pid in ctx.state.expanded:
                 _jump_to_latest_voice(ctx, pid)
+        _md_self_heal(ctx, pid)
+
+
+def _md_self_heal(ctx, parent_id):
+    """Retract a false-positive markdown expansion arrow once its build is in.
+
+    Detection (the ``_md_has_children`` gate) and freshly-built file-doc nodes
+    are *optimistic* — they arrow without reading the file, so a ``#`` that
+    lives only inside a code fence, or a ``.md`` token that doesn't resolve,
+    earns an arrow that the authoritative ``get_children`` build then reveals
+    as empty. When such a markdown-managed parent (``_is_md_managed_id``)
+    settles to NO children, push a ``mod(id, has_children=False)`` so the arrow
+    disappears on next render. Other parents (umbrellas, sessions) are never
+    md-optimistic, so we leave them untouched — a real umbrella with no visible
+    children keeps its arrow as before. No-op when the children aren't cached
+    yet or are non-empty, or when there's no browser to push to.
+    """
+    if _BROWSER is None or not _is_md_managed_id(parent_id):
+        return
+    kids = ctx.cached_children(parent_id)
+    if kids == []:
+        ctx.update_data([mod(parent_id, has_children=False)])
+
+
+def _is_md_managed_id(item_id):
+    """True iff ``item_id``'s children are owned by the markdown subtree.
+
+    Markdown-managed = ``md_doc`` is importable AND the id is either a
+    ``#md:`` node (inline document, file doc, or heading) or a plain
+    message id ``<jsonl>#<n>`` (which gains markdown children when the
+    message has a heading or references a ``.md`` file). These are the
+    rows whose expansion arrow the detection gate sets *optimistically*
+    (so ``_md_self_heal`` may retract it) and whose post-expand cursor
+    lands on the first child rather than a voice child
+    (``_jump_to_latest_voice``). Umbrellas / sessions are never
+    md-managed. A no-op (``False``) when ``_md_doc is None`` — the whole
+    markdown feature is dead code then.
+    """
+    if _md_doc is None or not isinstance(item_id, str):
+        return False
+    return '#md:' in item_id or _is_md_message_id(item_id)
+
+
+def _is_md_message_id(item_id):
+    """True iff ``item_id`` is a plain message id ``<jsonl>#<n>``.
+
+    A message id whose markdown arrow the detection gate may have set
+    optimistically — the parent shape the self-heal also covers. Excludes the
+    keyword-selector ids (``#prompt:`` / ``#tool:`` / ``#span:`` / ``#agent:``
+    / ``#md:``) and the ``#__truncated__`` sentinel: those are not message
+    leaves and never carry a markdown arrow.
+    """
+    path, sep, suffix = item_id.rpartition('#')
+    if not sep or not suffix.isdigit():
+        return False
+    return path.endswith('.jsonl')
 
 
 def _action_tree_right(ctx):

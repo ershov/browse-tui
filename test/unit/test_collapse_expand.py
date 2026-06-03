@@ -164,6 +164,71 @@ class TestExpandSubtree(unittest.TestCase):
         self.assertEqual(b._state.expanded, before)
 
 
+def _seed_boundary_tree(b, *, boundary):
+    """Build:  a (branch) -> bnd (branch) -> bnd_kid (branch) -> bnd_leaf
+                                          -> bnd_kid2 (leaf)
+
+    ``bnd``'s subtree is fully cached (every level's children list is in
+    ``_children``). When ``boundary=True`` is set on ``bnd``, a recursive
+    expand of the ancestor ``a`` must reach ``bnd`` but stop there — even
+    though ``bnd_kid`` is a cached branch. ``boundary=False`` is the
+    control: ``bnd_kid`` then expands like any other cached branch.
+    """
+    b.update_data([
+        ('upsert', 'a', None, {'has_children': True}),
+        ('upsert', 'bnd', 'a', {'has_children': True, 'boundary': boundary}),
+        ('upsert', 'bnd_kid', 'bnd', {'has_children': True}),
+        ('upsert', 'bnd_kid2', 'bnd', {}),
+        ('upsert', 'bnd_leaf', 'bnd_kid', {}),
+    ])
+    b.drain_main_queue()
+
+
+class TestExpandSubtreeBoundary(unittest.TestCase):
+    """``expand_subtree`` treats a ``boundary`` node as a leaf.
+
+    Expand *to* a boundary node (it joins ``state.expanded``) but never
+    *through* it — its children are not recursively expanded even when
+    they are already cached.
+    """
+
+    def test_boundary_node_expanded_but_children_not(self):
+        b = Browser(BrowserConfig(_headless=True))
+        _seed_boundary_tree(b, boundary=True)
+        # Sanity: bnd's subtree is genuinely cached (the "even when
+        # cached" case the flag exists to cover).
+        self.assertIn('bnd_kid', b._state._children)
+        b.expand_subtree('a')
+        b.drain_main_queue()
+        # Expanded TO the boundary node: 'a' and 'bnd' are added.
+        self.assertIn('a', b._state.expanded)
+        self.assertIn('bnd', b._state.expanded)
+        # NOT through it: the cached branch below 'bnd' stays collapsed.
+        self.assertNotIn('bnd_kid', b._state.expanded)
+
+    def test_non_boundary_cached_node_is_expanded(self):
+        # Control: identical shape, but 'bnd' is not a boundary, so the
+        # cached branch below it IS expanded recursively.
+        b = Browser(BrowserConfig(_headless=True))
+        _seed_boundary_tree(b, boundary=False)
+        b.expand_subtree('a')
+        b.drain_main_queue()
+        self.assertIn('a', b._state.expanded)
+        self.assertIn('bnd', b._state.expanded)
+        self.assertIn('bnd_kid', b._state.expanded)
+
+    def test_expand_subtree_on_boundary_node_itself(self):
+        # Invoking expand_subtree directly on a boundary node still
+        # expands the node itself (you asked to open it) but does not
+        # walk through into its cached descendants.
+        b = Browser(BrowserConfig(_headless=True))
+        _seed_boundary_tree(b, boundary=True)
+        b.expand_subtree('bnd')
+        b.drain_main_queue()
+        self.assertIn('bnd', b._state.expanded)
+        self.assertNotIn('bnd_kid', b._state.expanded)
+
+
 class TestContextPassthroughs(unittest.TestCase):
 
     def test_collapse_all(self):

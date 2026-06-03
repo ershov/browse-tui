@@ -1008,6 +1008,168 @@ class TestDecodeProjectPath(unittest.TestCase):
         self.assertEqual(self.r._decode_project_path('weird'), 'weird')
 
 
+class TestRealProjectPath(unittest.TestCase):
+    """``_real_project_path`` / ``_session_cwd_and_root`` (#659).
+
+    The accurate replacements for the lossy name-decode: derive the path
+    from a session's recorded ``cwd`` so a genuine hyphen survives, and
+    expose the ``(cwd, project_root)`` anchors the reference resolver
+    needs. State touched is HOME plus the byte-regex cwd cache; both are
+    saved/cleared in setUp/tearDown so the tests pass identically in
+    isolation and under full discover (no module-global pollution).
+
+    Loaded with ``md_doc`` live (``_load_recipe_with_md_doc``): the git-root
+    walk-up moved into ``md_doc`` (``find_git_root``), and
+    ``_session_cwd_and_root`` — a markdown-reference-resolution anchor whose
+    only callers are md-gated — now reaches it via ``_md_doc``, so these tests
+    need the module present.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe_with_md_doc()
+
+    def setUp(self):
+        self._saved_home = os.environ.get('HOME')
+        os.environ['HOME'] = '/home/u'
+        # cwd scans are cached by (path, size, mtime); clearing keeps a
+        # stale tmp-path entry from a prior test out of our way.
+        self.r._SESSION_CWDS_CACHE.clear()
+
+    def tearDown(self):
+        self.r._SESSION_CWDS_CACHE.clear()
+        if self._saved_home is None:
+            os.environ.pop('HOME', None)
+        else:
+            os.environ['HOME'] = self._saved_home
+
+    def _write_session(self, project_dir, name, rec):
+        import json as _json
+        path = os.path.join(project_dir, name)
+        with open(path, 'w') as f:
+            f.write(_json.dumps(rec) + '\n')
+        return path
+
+    def test_real_hyphen_preserved_and_home_collapsed(self):
+        # A cwd with a *genuine* hyphen the lossy decode would mangle.
+        import tempfile
+        cwd = '/home/u/browse-tui'
+        with tempfile.TemporaryDirectory() as tmp:
+            enc = self.r._encode_project_path(cwd)   # -home-u-browse-tui
+            proj = os.path.join(tmp, enc)
+            os.makedirs(proj)
+            self._write_session(proj, 's1.jsonl', {'type': 'user', 'cwd': cwd})
+            # The lossy decoder mangles the hyphen; the real path keeps it.
+            self.assertEqual(self.r._decode_project_path(enc), '~/browse/tui')
+            self.assertEqual(self.r._real_project_path(proj), '~/browse-tui')
+
+    def test_prefers_encoding_match_over_extra_cwds(self):
+        # A worktree session records multiple cwds; we pin the one that
+        # round-trips back to this project dir, regardless of scan order.
+        import tempfile
+        cwd = '/home/u/proj-x'
+        other = '/home/u/proj-x/.worktrees/wt'
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, self.r._encode_project_path(cwd))
+            os.makedirs(proj)
+            # Two records, the non-canonical cwd first in the file.
+            import json as _json
+            path = os.path.join(proj, 's1.jsonl')
+            with open(path, 'w') as f:
+                f.write(_json.dumps({'cwd': other}) + '\n')
+                f.write(_json.dumps({'cwd': cwd}) + '\n')
+            self.assertEqual(self.r._real_project_cwd(proj), cwd)
+            self.assertEqual(self.r._real_project_path(proj), '~/proj-x')
+
+    def test_falls_back_to_lossy_decode_without_cwd(self):
+        # No readable cwd (empty dir / records without cwd) → lossy decode.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            enc = '-home-u-no-cwd-here'
+            proj = os.path.join(tmp, enc)
+            os.makedirs(proj)
+            # Empty project dir.
+            self.assertIsNone(self.r._real_project_cwd(proj))
+            self.assertEqual(
+                self.r._real_project_path(proj),
+                self.r._decode_project_path(enc),
+            )
+            # Same fallback when a session exists but carries no cwd field.
+            self._write_session(proj, 's1.jsonl', {'type': 'summary'})
+            self.assertIsNone(self.r._real_project_cwd(proj))
+            self.assertEqual(
+                self.r._real_project_path(proj),
+                self.r._decode_project_path(enc),
+            )
+
+    def test_find_git_root_returns_ancestor(self):
+        # A `.git` directory anywhere up the tree is the root. The walk-up
+        # itself moved into md_doc (``find_git_root``); the recipe consumes it
+        # via ``_md_doc`` (the resolver-anchor path).
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = os.path.join(tmp, 'repo')
+            deep = os.path.join(repo, 'a', 'b', 'c')
+            os.makedirs(deep)
+            os.makedirs(os.path.join(repo, '.git'))
+            self.assertEqual(self.r._md_doc.find_git_root(deep), repo)
+            # A `.git` *file* (worktree/submodule layout) counts too.
+            wt = os.path.join(tmp, 'wt')
+            os.makedirs(wt)
+            open(os.path.join(wt, '.git'), 'w').close()
+            self.assertEqual(self.r._md_doc.find_git_root(wt), wt)
+
+    def test_find_git_root_none_when_absent(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            plain = os.path.join(tmp, 'plain', 'deep')
+            os.makedirs(plain)
+            self.assertIsNone(self.r._md_doc.find_git_root(plain))
+            self.assertIsNone(self.r._md_doc.find_git_root(''))
+
+    def test_session_cwd_and_root_uses_git_ancestor(self):
+        # cwd from the records; project_root = the `.git` ancestor.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = os.path.join(tmp, 'repo', 'sub-dir')
+            os.makedirs(cwd)
+            os.makedirs(os.path.join(tmp, 'repo', '.git'))
+            proj = os.path.join(tmp, self.r._encode_project_path(cwd))
+            os.makedirs(proj)
+            sess = self._write_session(proj, 's1.jsonl', {'cwd': cwd})
+            got_cwd, got_root = self.r._session_cwd_and_root(sess)
+            self.assertEqual(got_cwd, cwd)
+            self.assertEqual(got_root, os.path.join(tmp, 'repo'))
+
+    def test_session_cwd_and_root_falls_back_to_cwd(self):
+        # No `.git` above cwd → project_root is the cwd itself.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = os.path.join(tmp, 'plain-proj')
+            os.makedirs(cwd)
+            proj = os.path.join(tmp, self.r._encode_project_path(cwd))
+            os.makedirs(proj)
+            sess = self._write_session(proj, 's1.jsonl', {'cwd': cwd})
+            self.assertEqual(
+                self.r._session_cwd_and_root(sess), (cwd, cwd),
+            )
+
+    def test_session_cwd_and_root_no_cwd_returns_real_path(self):
+        # Unreadable cwd → (None, expanded lossy project dir), an absolute
+        # path the resolver can join against (no leftover ``~``).
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            enc = '-home-u-ghost'
+            proj = os.path.join(tmp, enc)
+            os.makedirs(proj)
+            sess = os.path.join(proj, 's1.jsonl')
+            open(sess, 'w').close()
+            got_cwd, got_root = self.r._session_cwd_and_root(sess)
+            self.assertIsNone(got_cwd)
+            self.assertEqual(got_root, '/home/u/ghost')
+            self.assertFalse(got_root.startswith('~'))
+
+
 class TestMessageOrder(unittest.TestCase):
     """``_list_messages`` returns rows in **chronological** order (#475) —
     matches tree-mode ordering so the t-toggle doesn't flip the
@@ -6666,6 +6828,1174 @@ class TestTaskNotification(unittest.TestCase):
         out = self.r._render_user(self._human_rec())
         self.assertIn('▶ user', out)
         self.assertIn('Just a normal prompt.', out)
+
+
+def _load_recipe_with_md_doc():
+    """Reload the recipe with ``recipes/`` on ``sys.path`` so ``md_doc`` resolves.
+
+    The shared ``_load_recipe`` loads with the default path, where neither
+    ``md2ansi_lib`` nor ``md_doc`` is importable — so its module's ``_md_doc``
+    is ``None`` (the markdown feature is dormant). The markdown-subtree tests
+    need the live module, so they reload with the recipes dir prepended (as the
+    recipe gets at runtime — the framework prepends its dir), then restore
+    ``sys.path`` and drop the transient ``md_doc`` import so other test classes
+    keep seeing the no-md baseline.
+    """
+    recipes_dir = str(_REPO / 'recipes')
+    added = recipes_dir not in sys.path
+    if added:
+        sys.path.insert(0, recipes_dir)
+    saved_md_doc = sys.modules.get('md_doc')
+    saved_md2ansi = sys.modules.get('md2ansi_lib')
+    try:
+        return _load_recipe()
+    finally:
+        if added:
+            try:
+                sys.path.remove(recipes_dir)
+            except ValueError:
+                pass
+        # Restore the module table so the default (md-less) recipe load other
+        # classes rely on isn't perturbed by our transient imports.
+        if saved_md_doc is None:
+            sys.modules.pop('md_doc', None)
+        else:
+            sys.modules['md_doc'] = saved_md_doc
+        if saved_md2ansi is None:
+            sys.modules.pop('md2ansi_lib', None)
+        else:
+            sys.modules['md2ansi_lib'] = saved_md2ansi
+
+
+class TestMarkdownSubtrees(unittest.TestCase):
+    """#660/#661: markdown document-subtree detection, build, preview, styling.
+
+    Exercises the recipe's ``md_doc`` integration directly: the optimistic
+    detection gate (``_md_has_children``), the lazy authoritative subtree build
+    (``_md_message_children`` / ``_md_subtree_children``), recursion across
+    referenced files, the ``_on_children_loaded`` self-heal, and (#661) the
+    ``#md:`` preview routing — full document text for a document node, the
+    byte-range section slice for a heading node, the ``_MD_COLOR`` toggle, and
+    the relative-label rule. The recipe is reloaded with ``md_doc`` live (see
+    ``_load_recipe_with_md_doc``); a separate test forces ``_md_doc = None`` to
+    assert graceful degradation.
+
+    Robust to shared-module-state pollution: ``md_doc``'s process-wide doc
+    cache is cleared and ``_BROWSER`` / ``_TREE_MODE`` / ``_MD_COLOR`` are
+    saved/restored in setUp/tearDown.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe_with_md_doc()
+
+    def setUp(self):
+        self.assertIsNotNone(
+            self.r._md_doc, 'md_doc must be importable for these tests')
+        # Save/restore mutable module state so order can't leak between tests.
+        self._saved_browser = self.r._BROWSER
+        self._saved_tree_mode = self.r._TREE_MODE
+        self._saved_md_color = self.r._MD_COLOR
+        self.addCleanup(setattr, self.r, '_BROWSER', self._saved_browser)
+        self.addCleanup(setattr, self.r, '_TREE_MODE', self._saved_tree_mode)
+        self.addCleanup(setattr, self.r, '_MD_COLOR', self._saved_md_color)
+        self.r._BROWSER = None
+        self.r._TREE_MODE = True
+        # The recipe's per-file scan cache and md_doc's shared doc cache both
+        # persist across tests — clear both each way.
+        self.r._TREE_CACHE.clear()
+        self.r._SESSION_CWDS_CACHE.clear()
+        self.r._md_doc.clear_cache()
+        self.addCleanup(self.r._TREE_CACHE.clear)
+        self.addCleanup(self.r._SESSION_CWDS_CACHE.clear)
+        self.addCleanup(self.r._md_doc.clear_cache)
+
+    # ---- fixture -------------------------------------------------------
+
+    def _build_project(self, tmp):
+        """A temp project + session whose messages exercise every path.
+
+        Layout (``cwd`` = the project source dir ``proj/``)::
+
+            proj/report.md      → references appendix.md  (recursion)
+            proj/appendix.md     → a leaf doc (no further refs)
+            projects/<enc>/sid.jsonl
+
+        Session records:
+
+          * #0 — headings (``# Summary`` / ``## Risks``) AND a ``report.md``
+                  ref in prose: detection True, builds inline + file docs.
+          * #1 — plain prose, no heading, no ref: detection False.
+          * #2 — a ``Write`` tool path naming ``missing.md`` (does NOT exist)
+                  and no heading: detection True (optimistic), but the build
+                  yields ``[]`` → self-heal target.
+
+        Returns ``(sess_path, proj_dir, report_md, appendix_md)``.
+        """
+        import json as _json
+        proj = os.path.join(tmp, 'proj')
+        os.makedirs(proj)
+        appendix = os.path.join(proj, 'appendix.md')
+        report = os.path.join(proj, 'report.md')
+        with open(appendix, 'w') as f:
+            f.write('# Appendix\n\ndetails\n')
+        with open(report, 'w') as f:
+            f.write('# Findings\n\nbody\n\nSee appendix.md for more.\n'
+                    '## Detail\n\nx\n')
+        # Encode proj into the Claude project-dir name the recipe resolves
+        # cwd/root from (matches _encode_project_path).
+        enc = self.r._encode_project_path(proj)
+        sess_dir = os.path.join(tmp, 'projects', enc)
+        os.makedirs(sess_dir)
+        sess = os.path.join(sess_dir, 'sid.jsonl')
+        recs = [
+            {'type': 'user', 'cwd': proj, 'message': {'content': [
+                {'type': 'text',
+                 'text': 'Plan\n# Summary\n## Risks\nsee report.md'}]}},
+            {'type': 'assistant', 'cwd': proj, 'message': {'content': [
+                {'type': 'text', 'text': 'just chatting, nothing here'}]}},
+            {'type': 'assistant', 'cwd': proj, 'message': {'content': [
+                {'type': 'tool_use', 'name': 'Write',
+                 'input': {'file_path': 'missing.md', 'contents': 'x'}}]}},
+        ]
+        with open(sess, 'w') as f:
+            for rc in recs:
+                f.write(_json.dumps(rc) + '\n')
+        return sess, proj, report, appendix
+
+    # ---- detection -----------------------------------------------------
+
+    def test_detection_heading_message(self):
+        rec = {'message': {'content': [
+            {'type': 'text', 'text': '# Heading\n\nbody'}]}}
+        self.assertTrue(self.r._md_has_children(rec))
+
+    def test_detection_ref_message_prose(self):
+        rec = {'message': {'content': [
+            {'type': 'text', 'text': 'I wrote it to docs/report.md today'}]}}
+        self.assertTrue(self.r._md_has_children(rec))
+
+    def test_detection_ref_message_tool_path(self):
+        # The ref lives in a tool_use input, not prose — the string-leaf walk
+        # must still find it (covers Write/Read/Edit paths).
+        rec = {'message': {'content': [
+            {'type': 'tool_use', 'name': 'Read',
+             'input': {'file_path': 'notes.md'}}]}}
+        self.assertTrue(self.r._md_has_children(rec))
+
+    def test_detection_plain_message_false(self):
+        rec = {'message': {'content': [
+            {'type': 'text', 'text': 'no heading, no reference at all'}]}}
+        self.assertFalse(self.r._md_has_children(rec))
+
+    def test_detection_code_fence_hash_triggers_optimistically(self):
+        # A ``#`` only inside a fenced code block fires the cheap regex gate
+        # (md_heading_trigger is line-anchored, not fence-aware). This is the
+        # intended optimism; the build later self-heals.
+        rec = {'message': {'content': [
+            {'type': 'text', 'text': '```\n# not a heading\n```'}]}}
+        self.assertTrue(self.r._md_has_children(rec))
+
+    def test_detection_quote_not_a_ref(self):
+        # ``.md`` inside a JSON-ish quoted token does not pollute the match:
+        # the ref regex excludes ``"``. A bare ``"x"`` with no .md is plainly
+        # negative; assert a quote-only string with no real path is False.
+        rec = {'message': {'content': [
+            {'type': 'text', 'text': 'discuss markdown in general'}]}}
+        self.assertFalse(self.r._md_has_children(rec))
+
+    def test_detection_graceful_noop_when_md_doc_none(self):
+        # Force the feature off; detection must be a hard no-op even for a
+        # record that would otherwise trigger.
+        saved = self.r._md_doc
+        try:
+            self.r._md_doc = None
+            rec = {'message': {'content': [
+                {'type': 'text', 'text': '# Heading and a docs/x.md ref'}]}}
+            self.assertFalse(self.r._md_has_children(rec))
+        finally:
+            self.r._md_doc = saved
+
+    # ---- message-level build: inline + file docs -----------------------
+
+    def test_message_children_inline_plus_file_doc(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            base = f'{sess}#0'
+            kids = self.r._md_message_children(base)
+            self.assertEqual(len(kids), 2, kids)
+            inline, filedoc = kids
+            # Inline document node: empty #md: chain, same-file (boundary off).
+            self.assertEqual(inline.id, f'{base}#md:')
+            self.assertEqual(inline.title, 'markdown')
+            self.assertFalse(inline.boundary)
+            self.assertTrue(inline.has_children)
+            self.assertEqual(inline.tag, 'md')
+            # File document node: report.md, foreign subtree (boundary on),
+            # optimistic has_children, label relative to the project root.
+            self.assertEqual(filedoc.title, 'report.md')
+            self.assertTrue(filedoc.boundary)
+            self.assertTrue(filedoc.has_children)
+            self.assertEqual(filedoc.tag, 'md')
+            self.assertEqual(
+                self.r._md_doc.parse_md_id(filedoc.id),
+                (base, [os.path.realpath(report)], None))
+
+    def test_message_children_dedup_and_existing_only(self):
+        # A message referencing the same existing file twice + a non-existent
+        # one yields exactly one file-doc node (deduped, existing-only).
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, 'proj')
+            os.makedirs(proj)
+            real = os.path.join(proj, 'real.md')
+            with open(real, 'w') as f:
+                f.write('# R\n')
+            enc = self.r._encode_project_path(proj)
+            sess_dir = os.path.join(tmp, 'projects', enc)
+            os.makedirs(sess_dir)
+            sess = os.path.join(sess_dir, 'sid.jsonl')
+            with open(sess, 'w') as f:
+                f.write(_json.dumps({'type': 'user', 'cwd': proj, 'message': {
+                    'content': [{'type': 'text', 'text':
+                                 'real.md and again real.md plus ghost.md'}]}})
+                        + '\n')
+            kids = self.r._md_message_children(f'{sess}#0')
+            # No heading in the text → no inline node; just the one file doc.
+            self.assertEqual([k.title for k in kids], ['real.md'])
+
+    def test_message_children_absolute_tool_path_yields_file_doc(self):
+        # Regression (#671): a Write tool_use carrying an ABSOLUTE .md
+        # file_path now produces a file-doc child. Before the find_md_refs
+        # lookbehind fix the leading '/' was dropped, leaving a token that
+        # resolved relative to cwd/project_root — to nothing — so the child
+        # was silently lost. The target lives OUTSIDE the project dir, so it
+        # can ONLY resolve via resolve_md_ref's absolute branch (rule #1).
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, 'proj')
+            os.makedirs(proj)
+            # A report file outside the project source tree, named by abspath.
+            outside = os.path.join(tmp, 'out')
+            os.makedirs(outside)
+            report = os.path.join(outside, 'report.md')
+            with open(report, 'w') as f:
+                f.write('# Findings\n\nbody\n')
+            report_abs = os.path.realpath(report)
+
+            enc = self.r._encode_project_path(proj)
+            sess_dir = os.path.join(tmp, 'projects', enc)
+            os.makedirs(sess_dir)
+            sess = os.path.join(sess_dir, 'sid.jsonl')
+            with open(sess, 'w') as f:
+                f.write(_json.dumps({'type': 'assistant', 'cwd': proj,
+                    'message': {'content': [
+                        {'type': 'tool_use', 'name': 'Write',
+                         'input': {'file_path': report, 'contents': 'x'}}]}})
+                        + '\n')
+
+            # Pre-fix sanity: the de-slashed token (leading '/' stripped, as a
+            # bare \b would have produced) does NOT resolve against any base,
+            # i.e. the child genuinely depended on the absolute capture.
+            deslashed = report.lstrip('/')
+            self.assertIsNone(self.r._md_doc.resolve_md_ref(
+                deslashed, doc_dir=proj, cwd=proj, project_root=proj))
+
+            kids = self.r._md_message_children(f'{sess}#0')
+            # No heading in the record → no inline node; exactly one file doc.
+            self.assertEqual(len(kids), 1, kids)
+            (filedoc,) = kids
+            self.assertEqual(filedoc.tag, 'md')
+            self.assertEqual(filedoc.kind, 'md-doc')
+            self.assertTrue(filedoc.boundary)
+            self.assertEqual(filedoc.md_abspath, report_abs)
+            # Id is abspath-canonical: it round-trips to the absolute realpath,
+            # proving the leading '/' survived find_md_refs and resolved via
+            # the absolute branch.
+            self.assertEqual(
+                self.r._md_doc.parse_md_id(filedoc.id),
+                (f'{sess}#0', [report_abs], None))
+            # Label is the recipe's own anchor-relative rule (outside the
+            # project → home-collapsed absolute), not a hardcoded literal.
+            self.assertEqual(
+                filedoc.title,
+                self.r._md_ref_label(report_abs, proj, proj))
+
+    def test_message_children_sorted_by_label(self):
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, 'proj')
+            os.makedirs(proj)
+            for n in ('zeta.md', 'alpha.md'):
+                with open(os.path.join(proj, n), 'w') as f:
+                    f.write('# H\n')
+            enc = self.r._encode_project_path(proj)
+            sess_dir = os.path.join(tmp, 'projects', enc)
+            os.makedirs(sess_dir)
+            sess = os.path.join(sess_dir, 'sid.jsonl')
+            with open(sess, 'w') as f:
+                f.write(_json.dumps({'type': 'user', 'cwd': proj, 'message': {
+                    'content': [{'type': 'text',
+                                 'text': 'first zeta.md then alpha.md'}]}})
+                        + '\n')
+            kids = self.r._md_message_children(f'{sess}#0')
+            self.assertEqual([k.title for k in kids], ['alpha.md', 'zeta.md'])
+
+    def test_message_children_no_inline_when_no_heading(self):
+        # A message with a ref but NO heading must not emit an inline doc node.
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, 'proj')
+            os.makedirs(proj)
+            with open(os.path.join(proj, 'x.md'), 'w') as f:
+                f.write('# X\n')
+            enc = self.r._encode_project_path(proj)
+            sess_dir = os.path.join(tmp, 'projects', enc)
+            os.makedirs(sess_dir)
+            sess = os.path.join(sess_dir, 'sid.jsonl')
+            with open(sess, 'w') as f:
+                f.write(_json.dumps({'type': 'user', 'cwd': proj, 'message': {
+                    'content': [{'type': 'text',
+                                 'text': 'see x.md (no heading here)'}]}})
+                        + '\n')
+            kids = self.r._md_message_children(f'{sess}#0')
+            self.assertNotIn('markdown', [k.title for k in kids])
+            self.assertEqual(len(kids), 1)
+
+    # ---- inline document → headings ------------------------------------
+
+    def test_inline_doc_children_are_headings(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            base = f'{sess}#0'
+            inline_id = self.r._md_doc.compose_md_id(base, [])
+            kids = self.r._md_subtree_children(inline_id)
+            # Inline text: "Plan" / "# Summary" / "## Risks" / "see report.md"
+            # → one top-level heading (Summary), Risks nests under it.
+            self.assertEqual([k.title for k in kids], ['Summary'])
+            self.assertEqual(kids[0].tag, 'h1')
+            self.assertTrue(kids[0].has_children)
+            self.assertFalse(getattr(kids[0], 'boundary', False))
+
+    def test_heading_children_are_subheadings(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            base = f'{sess}#0'
+            # Summary heading sits at inline line_offset 1.
+            summary_id = self.r._md_doc.compose_md_id(base, [], line_offset=1)
+            kids = self.r._md_subtree_children(summary_id)
+            self.assertEqual([k.title for k in kids], ['Risks'])
+            self.assertEqual(kids[0].tag, 'h2')
+            self.assertFalse(kids[0].has_children)
+
+    # ---- file document → headings + nested file refs (recursion) -------
+
+    def test_file_doc_children_headings_plus_nested_ref(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            base = f'{sess}#0'
+            report_real = os.path.realpath(report)
+            file_id = self.r._md_doc.compose_md_id(base, [report_real])
+            kids = self.r._md_subtree_children(file_id)
+            titles = [k.title for k in kids]
+            # report.md: "# Findings" (with "## Detail" nested) + a ref to
+            # appendix.md → one heading row + one file-doc row.
+            self.assertEqual(titles, ['Findings', 'appendix.md'])
+            heading, nested = kids
+            self.assertEqual(heading.tag, 'h1')
+            self.assertFalse(getattr(heading, 'boundary', False))
+            self.assertEqual(nested.tag, 'md')
+            self.assertTrue(nested.boundary)
+            # Nested ref id chains report.md → appendix.md.
+            self.assertEqual(
+                self.r._md_doc.parse_md_id(nested.id),
+                (base, [report_real, os.path.realpath(appendix)], None))
+
+    def test_recursion_file_to_file_expands(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            base = f'{sess}#0'
+            chain = [os.path.realpath(report), os.path.realpath(appendix)]
+            appendix_id = self.r._md_doc.compose_md_id(base, chain)
+            kids = self.r._md_subtree_children(appendix_id)
+            # appendix.md is a leaf doc: just its "# Appendix" heading, no refs.
+            self.assertEqual([k.title for k in kids], ['Appendix'])
+            self.assertEqual(kids[0].tag, 'h1')
+
+    # ---- routing through get_children ----------------------------------
+
+    def test_get_children_routes_message_and_md_ids(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            base = f'{sess}#0'
+            # Message id → inline + file docs (same as _md_message_children).
+            via_router = self.r.get_children(base)
+            self.assertEqual([k.title for k in via_router],
+                             ['markdown', 'report.md'])
+            # #md: id → routed to the subtree builder.
+            inline_id = self.r._md_doc.compose_md_id(base, [])
+            self.assertEqual(
+                [k.title for k in self.r.get_children(inline_id)], ['Summary'])
+
+    def test_get_children_message_is_leaf_without_md_doc(self):
+        # With the feature off, a message id is a leaf again (no md children).
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            saved = self.r._md_doc
+            try:
+                self.r._md_doc = None
+                self.assertEqual(self.r.get_children(f'{sess}#0'), [])
+            finally:
+                self.r._md_doc = saved
+
+    def test_get_preview_md_id_unreadable_returns_empty(self):
+        # A #md: id whose base record / file is unreadable yields ''  — and
+        # crucially does NOT fall through to the generic message-id path (which
+        # would mis-int the ``#<lineoffset>`` suffix as a record line number).
+        base = '/p/s.jsonl#3'
+        heading_id = self.r._md_doc.compose_md_id(base, [], line_offset=12)
+        self.assertEqual(self.r.get_preview(heading_id), '')
+        self.assertEqual(
+            self.r.get_preview(self.r._md_doc.compose_md_id(base, [])), '')
+
+    # ---- preview routing: document & heading (#661) --------------------
+
+    def _sections_file(self, tmp):
+        """A two-sibling-h1 doc for boundary-slice assertions.
+
+        ``# First`` (with a ``## Sub`` nested under it) then a sibling
+        ``# Second``. The h1 section-slice must include the nested sub-section
+        but stop before the later sibling — the boundary rule. Returns
+        ``(abspath, text)``.
+        """
+        text = '# First\n\nalpha\n\n## Sub\n\nbeta\n\n# Second\n\ngamma\n'
+        path = os.path.join(tmp, 'sections.md')
+        with open(path, 'w') as f:
+            f.write(text)
+        return os.path.realpath(path), text
+
+    def test_preview_inline_document_is_full_text(self):
+        # Document node (empty chain) → the message's FULL inline markdown,
+        # rendered. With color on the body is ANSI-wrapped, so assert on the
+        # plain words that survive md2ansi (every prose token is present).
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            self.r._MD_COLOR = False    # raw text → exact substring assertions
+            inline_id = self.r._md_doc.compose_md_id(f'{sess}#0', [])
+            out = self.r.get_preview(inline_id)
+            # The whole inline document, not just a summary fragment.
+            for token in ('Plan', 'Summary', 'Risks', 'report.md'):
+                self.assertIn(token, out)
+
+    def test_preview_file_document_is_full_file_text(self):
+        # Document node for a referenced file → that file's full text (via the
+        # md_doc cache), rendered. report.md has every section + the onward ref.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            self.r._MD_COLOR = False
+            file_id = self.r._md_doc.compose_md_id(
+                f'{sess}#0', [os.path.realpath(report)])
+            out = self.r.get_preview(file_id)
+            for token in ('Findings', 'body', 'appendix.md', 'Detail'):
+                self.assertIn(token, out)
+
+    def test_preview_heading_is_section_slice_with_boundaries(self):
+        # Heading node → ONLY that heading's byte-range section. The h1 slice
+        # includes its own nested sub-section but excludes the next sibling h1.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path, text = self._sections_file(tmp)
+            self.r._MD_COLOR = False
+            base = '/p/s.jsonl#0'   # base record is irrelevant for a file chain
+            # ``# First`` is at line 0; render its section.
+            first_id = self.r._md_doc.compose_md_id(base, [path], line_offset=0)
+            out = self.r.get_preview(first_id)
+            self.assertIn('First', out)
+            self.assertIn('Sub', out)       # nested sub-section IS included
+            self.assertIn('beta', out)
+            self.assertNotIn('Second', out)  # later sibling is NOT included
+            self.assertNotIn('gamma', out)
+            # The slice is exactly the section's byte range (raw == slice).
+            _, tree = self.r._md_doc.get_doc(path)
+            node = self.r._md_doc.node_at_line(tree, 0)
+            self.assertEqual(
+                out, text[node.byte_offset:node.byte_offset + node.byte_size])
+            # The sibling ``# Second`` (line 8) renders its own section.
+            second_id = self.r._md_doc.compose_md_id(
+                base, [path], line_offset=8)
+            sec = self.r.get_preview(second_id)
+            self.assertIn('Second', sec)
+            self.assertIn('gamma', sec)
+            self.assertNotIn('First', sec)
+
+    def test_preview_heading_missing_line_offset_returns_empty(self):
+        # A line offset that matches no heading (stale id) → '' (no crash).
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path, _ = self._sections_file(tmp)
+            bad = self.r._md_doc.compose_md_id(
+                '/p/s.jsonl#0', [path], line_offset=999)
+            self.assertEqual(self.r.get_preview(bad), '')
+
+    def test_preview_md_color_toggle(self):
+        # _MD_COLOR honoured: ON → ANSI in the body; OFF → raw text, no ESC.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            inline_id = self.r._md_doc.compose_md_id(f'{sess}#0', [])
+            self.r._MD_COLOR = True
+            self.assertIn('\x1b', self.r.get_preview(inline_id))
+            self.r._md_doc.clear_cache()   # not strictly needed (inline), tidy
+            self.r._MD_COLOR = False
+            off = self.r.get_preview(inline_id)
+            self.assertNotIn('\x1b', off)
+            self.assertIn('Summary', off)
+
+    # ---- boundary integration + get_preview reorder (#662) -------------
+
+    def test_is_cross_file_fallback_for_md_file_doc_id(self):
+        # An md file-doc id matches neither #agent: nor bare-.jsonl, so the
+        # not-loaded fallback in _is_cross_file_id returns False — the id is
+        # never mistaken for a cross-file (session/subagent) row by shape.
+        # (The reorder, tested next, is what protects the *loaded* case.)
+        file_id = self.r._md_doc.compose_md_id(
+            '/p/s.jsonl#0', ['/abs/report.md'])
+        self.assertIsNone(self.r._BROWSER)   # setUp default → fallback path
+        self.assertFalse(self.r._is_cross_file_id(file_id))
+
+    def test_get_preview_md_file_doc_routes_to_md_node_despite_boundary(self):
+        # #662 reorder regression guard. An md file-doc id carries
+        # boundary=True; with a _BROWSER that returns it from get_item, the
+        # (now boundary-based) _is_cross_file_id reports True for it. If the
+        # cross-file check ran first it would hijack the preview into the
+        # metadata/umbrella path. Because '#md:' is checked BEFORE
+        # _is_cross_file_id, the node still routes to _preview_md_node and
+        # yields the file's own text — never the cross-file card.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            report = os.path.join(tmp, 'report.md')
+            with open(report, 'w') as f:
+                f.write('# Findings\n\nMD-FILE-DOC-BODY\n')
+            file_id = self.r._md_doc.compose_md_id(
+                '/p/s.jsonl#0', [os.path.realpath(report)])
+
+            class _B:
+                def __init__(self, item):
+                    self._item = item
+                def get_item(self, id_):
+                    return self._item if id_ == file_id else None
+
+            item = type('I', (), {'id': file_id, 'boundary': True})()
+            self.r._BROWSER = _B(item)
+            self.r._MD_COLOR = False
+            # The predicate really does see this id as cross-file (boundary).
+            self.assertTrue(self.r._is_cross_file_id(file_id))
+            out = self.r.get_preview(file_id)
+            # Routed to the md document preview (the file's text), NOT the
+            # cross-file metadata card (which prints 'browse-claude' + a
+            # 'path' row and never the body).
+            self.assertIn('Findings', out)
+            self.assertIn('MD-FILE-DOC-BODY', out)
+            self.assertNotIn('browse-claude', out)
+
+    def test_get_preview_inline_md_node_routes_to_md_node(self):
+        # The inline (same-file, boundary=False) document node also routes to
+        # _preview_md_node — confirms the reorder didn't regress the common
+        # case and that '#md:' precedes the generic '#' message branch too.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            self.r._MD_COLOR = False
+            inline_id = self.r._md_doc.compose_md_id(f'{sess}#0', [])
+            out = self.r.get_preview(inline_id)
+            self.assertIn('Summary', out)
+            self.assertNotIn('browse-claude', out)
+
+    # ---- labels (#661) -------------------------------------------------
+
+    def test_label_relative_to_project_root(self):
+        # A file inside the project root is labelled relative to it (the id
+        # stays abspath-canonical; only the displayed title is relative).
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            kids = self.r._md_message_children(f'{sess}#0')
+            filedoc = next(k for k in kids if k.tag == 'md' and k.boundary)
+            self.assertEqual(filedoc.title, 'report.md')
+            # Id carries the absolute path, not the relative label.
+            _, abspaths, _ = self.r._md_doc.parse_md_id(filedoc.id)
+            self.assertEqual(abspaths, [os.path.realpath(report)])
+
+    def test_label_rule_anchor_precedence(self):
+        # The label rule (``_md_ref_label``) is a pure function over the two
+        # anchors; exercise all three branches directly so we don't depend on
+        # the resolver's prose-token handling:
+        #   1. inside project_root  -> relative to project_root (preferred),
+        #   2. inside cwd only      -> relative to cwd,
+        #   3. inside neither       -> ``~``-collapsed absolute path.
+        home = os.environ.get('HOME') or os.path.expanduser('~')
+        root = '/work/repo'
+        cwd = '/work/repo/sub'         # cwd nested under the root
+        # (1) file under the root (but not under cwd) -> root-relative.
+        self.assertEqual(
+            self.r._md_ref_label('/work/repo/docs/a.md', cwd, root),
+            'docs/a.md')
+        # (2) file under cwd but with a different (non-ancestor) root ->
+        #     cwd-relative (root checked first, misses, cwd matches).
+        self.assertEqual(
+            self.r._md_ref_label('/work/repo/sub/b.md', cwd, '/other/root'),
+            'b.md')
+        # (3) file under neither anchor -> ``~``-collapsed absolute path,
+        #     never a ``../`` relpath.
+        ext = os.path.join(home, 'elsewhere', 'c.md')
+        label = self.r._md_ref_label(ext, cwd, root)
+        self.assertEqual(label, self.r._collapse_home(ext))
+        self.assertTrue(label.startswith('~/'))
+        self.assertNotIn('../', label)
+
+    def test_inline_node_title_is_markdown(self):
+        # The inline (same-file) document node's title is the literal
+        # "markdown" — never a path label.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            kids = self.r._md_message_children(f'{sess}#0')
+            inline = next(k for k in kids if not k.boundary)
+            self.assertEqual(inline.title, 'markdown')
+            self.assertEqual(inline.tag_style, 'dim')
+
+    # ---- self-heal -----------------------------------------------------
+
+    def test_self_heal_flips_has_children_off_on_empty(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            # Message #2 is the optimistic false positive: its only .md token
+            # (missing.md) doesn't exist and it has no heading.
+            base = f'{sess}#2'
+            self.assertTrue(self.r._md_has_children(
+                self.r._read_jsonl_line(sess, 2)))     # arrow was set
+            self.assertEqual(self.r.get_children(base), [])  # build is empty
+
+            fake = _FakeBrowser()
+            self.r._BROWSER = fake
+            fake._children_cache[base] = []            # settled to no children
+
+            class _Ctx:
+                state = type('S', (), {'expanded': set()})()
+
+                def cached_children(self, id_):
+                    return fake.cached_children(id_)
+
+                def update_data(self, ops):
+                    return fake.update_data(ops)
+
+            self.r._on_children_loaded(_Ctx(), [base])
+            # The self-heal pushed exactly a mod(base, has_children=False) op
+            # (the _FakeBrowser records ops; applying a 'mod' isn't part of its
+            # minimal apply, so we assert on the emitted op — the recipe's
+            # contract — rather than on a fixture-applied field).
+            flat_ops = [op for batch in fake.update_data_calls for op in batch]
+            self.assertTrue(
+                any(op[0] == 'mod' and op[1] == base
+                    and op[3].get('has_children') is False
+                    for op in flat_ops),
+                flat_ops)
+
+    def test_self_heal_skips_nonempty_and_non_md_parents(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            fake = _FakeBrowser()
+            self.r._BROWSER = fake
+
+            class _Ctx:
+                state = type('S', (), {'expanded': set()})()
+
+                def cached_children(self, id_):
+                    return fake.cached_children(id_)
+
+                def update_data(self, ops):
+                    return fake.update_data(ops)
+
+            ctx = _Ctx()
+            # A real message id with NON-empty children: no retraction.
+            base0 = f'{sess}#0'
+            fake._children_cache[base0] = [_RecordingItem('child')]
+            # A non-md umbrella id settling empty: must be left alone.
+            umbrella = f'{sess}#prompt:0'
+            fake._children_cache[umbrella] = []
+            self.r._on_children_loaded(ctx, [base0, umbrella])
+            fake.flush()
+            flat_ops = [op for batch in fake.update_data_calls for op in batch]
+            self.assertEqual(
+                [op for op in flat_ops if op[0] == 'mod'], [],
+                'no self-heal mod for non-empty or non-md parents')
+
+    # ---- right-arrow: move INTO the first child (#688) ------------------
+    #
+    # An umbrella/session moves the cursor INTO its children on a single
+    # right-arrow (``_on_expand`` → ``_jump_to_latest_voice`` lands on the
+    # latest VOICE child, whose ``row_bg`` is set). A markdown-managed row's
+    # children are document/heading nodes with NO ``row_bg``, so the
+    # latest-voice lookup returns ``None`` and the cursor used to stay put —
+    # right-arrow felt like a no-op. The fix lands the cursor on the FIRST
+    # visible child for these rows (the structural analog), reusing the same
+    # ``_AWAITING_VOICE_JUMP`` park / ``_on_children_loaded`` settle as the
+    # voice-jump. These tests drive the recipe's hook callbacks directly —
+    # the same fake-ctx style as ``TestOnExpandJumpComposition`` — but with
+    # ``md_doc`` live so the markdown subtree actually builds.
+
+    def _make_jump_ctx(self, *, cached, expanded=None):
+        """Fake ctx recording ``cursor_to`` + serving ``cached_children``.
+
+        ``cached`` maps an id → the value ``cached_children`` returns
+        (``None`` = fetch in flight, a list = available). ``expanded`` is the
+        set ``ctx.state.expanded`` exposes (the still-expanded guard reads
+        it); ``None`` means "everything is expanded". Installs a recording
+        ``_BROWSER`` (with ``invalidate_preview`` / ``preview_width`` so the
+        cross-file-upgrade and md-voice paths don't blow up). Returns
+        ``(ctx, cursor_to_calls)``.
+        """
+        cursor_to_calls = []
+
+        class _AllExpanded:
+            def __contains__(self, _id):
+                return True
+
+        expanded_set = _AllExpanded() if expanded is None else expanded
+
+        class _FakeBrowser:
+            preview_width = 80
+
+            def invalidate_preview(self, _id):
+                pass
+
+            def get_item(self, _id):
+                return None
+
+        self.r._BROWSER = _FakeBrowser()
+
+        class _State:
+            expanded = expanded_set
+
+        class _Ctx:
+            state = _State()
+
+            def cached_children(self, id_):
+                val = cached.get(id_, None)
+                return None if val is None else list(val)
+
+            def cursor_to(self, id_):
+                cursor_to_calls.append(id_)
+
+            def update_data(self, _ops):
+                # The settle path may self-heal a childless md row; record
+                # nothing — these tests only assert on cursor movement.
+                pass
+
+        return _Ctx(), cursor_to_calls
+
+    def test_first_visible_child_helper(self):
+        # The structural analog of _latest_voice_among_children: first child
+        # by listing order, skipping hidden rows; None when no visible child.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            base = f'{sess}#0'                       # message-with-md
+            kids = self.r.get_children(base)
+            self.assertTrue(kids, 'fixture should build md children')
+            self.assertEqual(
+                self.r._first_visible_child(base), kids[0].id)
+        # Non-str / no-children both yield None.
+        self.assertIsNone(self.r._first_visible_child(None))
+
+    def test_first_visible_child_skips_hidden(self):
+        # A hidden leading child is skipped; the first VISIBLE id is returned.
+        saved = self.r.get_children
+        hidden = _RecordingItem('h'); hidden.hidden = True
+        shown = _RecordingItem('v'); shown.hidden = False
+        self.r.get_children = lambda _id: [hidden, shown]
+        self.addCleanup(setattr, self.r, 'get_children', saved)
+        self.assertEqual(self.r._first_visible_child('x'), 'v')
+
+    def test_is_md_managed_id_predicate(self):
+        # md-managed = md_doc live AND (#md: node OR plain <jsonl>#<n>).
+        self.assertTrue(self.r._is_md_managed_id('/p/s.jsonl#3'))
+        self.assertTrue(self.r._is_md_managed_id('/p/s.jsonl#0#md:'))
+        # Umbrellas / sessions / subagent groups are NOT md-managed.
+        for not_md in ('/p/s.jsonl#prompt:0', '/p/s.jsonl#tool:1',
+                       '/p/s.jsonl#span:2', '/p/s.jsonl#agent:A1',
+                       '/p/s.jsonl', None):
+            self.assertFalse(self.r._is_md_managed_id(not_md), not_md)
+        # Hard no-op when the feature is off.
+        saved = self.r._md_doc
+        try:
+            self.r._md_doc = None
+            self.assertFalse(self.r._is_md_managed_id('/p/s.jsonl#3'))
+            self.assertFalse(self.r._is_md_managed_id('/p/s.jsonl#0#md:'))
+        finally:
+            self.r._md_doc = saved
+
+    def test_expand_md_message_lands_on_first_child(self):
+        # Cached expand of a message-with-md: cursor jumps to the inline
+        # ``markdown`` node (its first child) in one press — the bug case.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            base = f'{sess}#0'
+            kids = self.r.get_children(base)
+            first = kids[0].id
+            self.assertEqual(first, f'{base}#md:')   # the inline doc node
+            ctx, calls = self._make_jump_ctx(cached={base: kids})
+            self.r._on_expand(ctx, [base])
+            self.assertEqual(calls, [first],
+                             'expanding a message-with-md must land on its '
+                             'first child')
+
+    def test_expand_inline_md_node_lands_on_first_child(self):
+        # Cached expand of the inline ``markdown`` (#md:) node lands on its
+        # first heading row.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            inline = f'{sess}#0#md:'
+            kids = self.r.get_children(inline)
+            self.assertTrue(kids, 'inline doc should have heading children')
+            first = kids[0].id
+            ctx, calls = self._make_jump_ctx(cached={inline: kids})
+            self.r._on_expand(ctx, [inline])
+            self.assertEqual(calls, [first])
+
+    def test_expand_file_doc_lands_on_first_child(self):
+        # Cached expand of a file-doc (boundary) node lands on its first
+        # heading row.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            base = f'{sess}#0'
+            msg_kids = self.r.get_children(base)
+            filedoc = next(k for k in msg_kids
+                           if getattr(k, 'boundary', False))
+            kids = self.r.get_children(filedoc.id)
+            self.assertTrue(kids, 'file doc should have heading children')
+            first = kids[0].id
+            ctx, calls = self._make_jump_ctx(cached={filedoc.id: kids})
+            self.r._on_expand(ctx, [filedoc.id])
+            self.assertEqual(calls, [first])
+
+    def test_uncached_md_message_defers_then_lands_on_first_child(self):
+        # The async path: uncached expand parks the id (no jump yet), then
+        # _on_children_loaded lands on the first child once the fetch settles
+        # — exactly mirroring the voice-jump defer.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            base = f'{sess}#0'
+            first = self.r.get_children(base)[0].id
+            saved_pending = set(self.r._AWAITING_VOICE_JUMP)
+            self.addCleanup(self.r._AWAITING_VOICE_JUMP.clear)
+            self.addCleanup(self.r._AWAITING_VOICE_JUMP.update, saved_pending)
+            self.r._AWAITING_VOICE_JUMP.clear()
+            # Children NOT cached at expand time → defer.
+            ctx, calls = self._make_jump_ctx(cached={base: None})
+            self.r._on_expand(ctx, [base])
+            self.assertEqual(calls, [], 'uncached expand must not jump yet')
+            self.assertIn(base, self.r._AWAITING_VOICE_JUMP)
+            # Fetch settles → the children-loaded hook lands the cursor.
+            self.r._on_children_loaded(ctx, [base])
+            self.assertEqual(calls, [first])
+            self.assertNotIn(base, self.r._AWAITING_VOICE_JUMP)
+
+    def test_umbrella_still_lands_on_latest_voice_no_regression(self):
+        # An umbrella's post-expand jump is UNCHANGED: it lands on the LATEST
+        # voice child, not the first. A turn with user / tool_use / asst
+        # gives three direct children (#0 user, #1 tool_use, #2 asst), so
+        # first (#0) != latest (#2) and the assertion would catch any leak of
+        # the first-child fallback into the (non-md) umbrella path.
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = os.path.join(tmp, 's.jsonl')
+            recs = [
+                {'type': 'user', 'uuid': 'u1', 'message': {
+                    'role': 'user', 'content': 'FIRST_VOICE'}},
+                {'type': 'assistant', 'uuid': 'a1', 'message': {
+                    'role': 'assistant', 'content': [
+                        {'type': 'tool_use', 'name': 'Bash',
+                         'input': {'command': 'x'}}]}},
+                {'type': 'assistant', 'uuid': 'a2', 'message': {
+                    'role': 'assistant', 'content': [
+                        {'type': 'text', 'text': 'LAST_VOICE'}]}},
+            ]
+            with open(sess, 'w') as f:
+                for rc in recs:
+                    f.write(_json.dumps(rc) + '\n')
+            umb = f'{sess}#prompt:0'
+            self.assertFalse(self.r._is_md_managed_id(umb))
+            kids = self.r.get_children(umb)
+            latest = self.r._latest_voice_among_children(umb)
+            self.assertEqual(latest, f'{sess}#2')        # the LAST voice
+            self.assertNotEqual(latest, kids[0].id)      # first != latest
+            ctx, calls = self._make_jump_ctx(cached={umb: kids})
+            self.r._on_expand(ctx, [umb])
+            self.assertEqual(calls, [latest],
+                             'umbrella must still land on the latest voice')
+
+    def test_false_positive_md_message_does_not_move_cursor(self):
+        # A false-positive md row (a ``#`` only inside a code fence) whose
+        # authoritative build is empty must NOT move the cursor — neither at
+        # expand nor when the (empty) fetch settles (which only self-heals).
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            base = f'{sess}#2'                       # the optimistic positive
+            self.assertTrue(self.r._md_has_children(
+                self.r._read_jsonl_line(sess, 2)))   # arrow was set
+            self.assertEqual(self.r.get_children(base), [])  # build is empty
+            saved_pending = set(self.r._AWAITING_VOICE_JUMP)
+            self.addCleanup(self.r._AWAITING_VOICE_JUMP.clear)
+            self.addCleanup(self.r._AWAITING_VOICE_JUMP.update, saved_pending)
+            self.r._AWAITING_VOICE_JUMP.clear()
+            # Settled-to-empty children at fire time.
+            ctx, calls = self._make_jump_ctx(cached={base: []})
+            self.r._on_expand(ctx, [base])
+            self.assertEqual(calls, [],
+                             'a childless md row must not move the cursor')
+            self.r._on_children_loaded(ctx, [base])
+            self.assertEqual(calls, [],
+                             'self-heal settle must not move the cursor')
+
+    # ---- subagent report body renders as markdown (#689) ---------------
+
+    _SUBAGENT_TUR = {
+        'agentId': 'abcd1234efgh', 'agentType': 'general-purpose',
+        'status': 'completed', 'totalDurationMs': 12340,
+        'totalTokens': 1234, 'totalToolUseCount': 5,
+        'content': [{'type': 'text',
+                     'text': '# Report Heading\n\nbody paragraph.'}],
+    }
+
+    def test_subagent_report_body_md2ansi_when_color_on(self):
+        # #689: the Agent tool_result body IS a markdown report, so with
+        # _MD_COLOR on it must render through md2ansi like the voice
+        # renderers — NOT be appended raw. md2ansi consumes the ``# ``
+        # heading marker and wraps the heading text in its palette escape.
+        self.r._MD_COLOR = True   # setUp save/restores; explicit for clarity
+        out = self.r._fmt_tur_subagent(self._SUBAGENT_TUR)
+        # The heading was rendered: md2ansi's heading-color CSI is present
+        # and the literal ``# `` markdown marker is gone from the body.
+        self.assertIn('\x1b[0;38;5;226m', out)
+        self.assertIn('Report Heading', out)
+        self.assertNotIn('# Report Heading', out)
+
+    def test_subagent_report_body_raw_when_color_off(self):
+        # #689: with _MD_COLOR off (or md2ansi unavailable) _md_voice is a
+        # pass-through, so the body stays the literal markdown source —
+        # the ``# `` heading marker survives, unrendered.
+        self.r._MD_COLOR = False
+        out = self.r._fmt_tur_subagent(self._SUBAGENT_TUR)
+        self.assertIn('# Report Heading', out)
+        self.assertIn('body paragraph.', out)
+
+    def test_subagent_header_stats_unchanged_by_md_toggle(self):
+        # #689: only the report BODY goes through _md_voice — the
+        # ``🤖 agentType [status]`` head and the ``Ns · N tools · N tokens``
+        # stats line are NOT markdown and must be byte-identical on/off.
+        self.r._MD_COLOR = True
+        on = self.r._fmt_tur_subagent(self._SUBAGENT_TUR)
+        self.r._MD_COLOR = False
+        off = self.r._fmt_tur_subagent(self._SUBAGENT_TUR)
+        # Salient head/stats fields present regardless of the toggle.
+        for token in ('🤖', 'general-purpose', '[completed]', '12.3s',
+                      '5 tools', '1,234 tokens'):
+            self.assertIn(token, on)
+            self.assertIn(token, off)
+        # The head + stats prefix (the two lines before the blank-line gap
+        # that precedes the body) is identical across the toggle.
+        head_stats_on = on.split('\n\n', 1)[0]
+        head_stats_off = off.split('\n\n', 1)[0]
+        self.assertEqual(head_stats_on, head_stats_off)
+
+
+class TestBoundaryMigration(unittest.TestCase):
+    """#662: ``boundary`` flag integration + the id-shape ``if`` migration.
+
+    Asserts (a) the rows the OLD ``_is_cross_file_id`` matched now carry
+    ``boundary=True`` (subagent-group ``#agent:`` rows and bare ``.jsonl``
+    session rows; md *inline* and message/umbrella rows do not); (b)
+    ``_is_cross_file_id`` is behaviour-equivalent via the boundary lookup,
+    with the OLD id-shape predicate preserved as the not-loaded fallback;
+    (c) the ``get_preview`` reorder routes an md file-doc (``boundary=True``)
+    to ``_preview_md_node`` instead of the cross-file metadata/cascade path;
+    (d) ``_walk_umbrella`` skips a ``boundary=True`` child.
+
+    Isolation-robust: ``_BROWSER`` / ``_TREE_MODE`` are saved/restored so
+    these pass identically in isolation and under full discover (the recipe
+    module is shared across suites).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def setUp(self):
+        self._saved_browser = self.r._BROWSER
+        self._saved_tree_mode = self.r._TREE_MODE
+        self.addCleanup(setattr, self.r, '_BROWSER', self._saved_browser)
+        self.addCleanup(setattr, self.r, '_TREE_MODE', self._saved_tree_mode)
+        self.r._BROWSER = None
+        self.addCleanup(self.r._TREE_CACHE.clear)
+
+    # ---- fixtures ------------------------------------------------------
+
+    def _project_with_subagent(self, tmp):
+        """A project + session with one wired subagent (agent ``A1``).
+
+        Returns ``(sess_path, agent_path)``. The subagent's own .jsonl
+        carries a unique sentinel so a preview cascade that wrongly drilled
+        into it would be detectable.
+        """
+        import json as _json
+        proj = os.path.join(tmp, '-x')
+        os.makedirs(proj)
+        sess = os.path.join(proj, 'parent-sid.jsonl')
+        with open(sess, 'w') as f:
+            f.write(_json.dumps({
+                'type': 'user', 'sessionId': 'parent-sid',
+                'message': {'role': 'user', 'content': 'PARENT-LEAF-BODY'},
+            }) + '\n')
+        sub_dir = os.path.join(proj, 'parent-sid', 'subagents')
+        os.makedirs(sub_dir)
+        agent_path = os.path.join(sub_dir, 'agent-A1.jsonl')
+        with open(agent_path, 'w') as f:
+            f.write(_json.dumps({
+                'type': 'user', 'sessionId': 'parent-sid',
+                'message': {'role': 'user', 'content': 'AGENT-INTERNAL-BODY'},
+            }) + '\n')
+        with open(os.path.join(sub_dir, 'agent-A1.meta.json'), 'w') as fm:
+            _json.dump({'agentType': 'general-purpose',
+                        'description': 'do a thing'}, fm)
+        return sess, agent_path
+
+    # ---- (a) boundary set on the migrated rows -------------------------
+
+    def test_subagent_group_rows_are_boundary(self):
+        # Both #agent: builders (the per-session lister and the inline
+        # pseudo-item) and orphan rows (which delegate to the lister) must
+        # set boundary=True so the migrated predicate matches them.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, agent_path = self._project_with_subagent(tmp)
+            (sub,) = self.r._list_subagents_for_session(sess)
+            self.assertTrue(sub.boundary)
+            self.assertIn('#agent:', sub.id)
+            pseudo = self.r._subagent_pseudo_item(sess, 'A1', agent_path)
+            self.assertTrue(pseudo.boundary)
+            self.assertIn('#agent:', pseudo.id)
+
+    def test_session_rows_are_boundary(self):
+        # Bare .jsonl session rows in _list_sessions carry boundary=True.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, _ = self._project_with_subagent(tmp)
+            proj = os.path.dirname(sess)
+            rows = self.r._list_sessions(proj)
+            self.assertTrue(rows)
+            for it in rows:
+                self.assertTrue(it.id.endswith('.jsonl'))
+                self.assertTrue(it.boundary, it.id)
+
+    # ---- (b) _is_cross_file_id parity (boundary + fallback) ------------
+
+    def test_is_cross_file_via_boundary_when_loaded(self):
+        # When the Item IS loaded, the predicate reads its boundary flag.
+        item_id = '/p/parent-sid.jsonl#agent:A1'
+
+        class _B:
+            def __init__(self, items):
+                self._items = items
+            def get_item(self, id_):
+                return self._items.get(id_)
+
+        boundary_item = type('I', (), {'id': item_id, 'boundary': True})()
+        self.r._BROWSER = _B({item_id: boundary_item})
+        self.assertTrue(self.r._is_cross_file_id(item_id))
+        # A loaded, NON-boundary item is not cross-file even with a shape
+        # the old test would have matched — the attribute is authoritative.
+        bare = '/p/s.jsonl'
+        nonboundary = type('I', (), {'id': bare, 'boundary': False})()
+        self.r._BROWSER = _B({bare: nonboundary})
+        self.assertFalse(self.r._is_cross_file_id(bare))
+
+    def test_is_cross_file_fallback_when_not_loaded(self):
+        # _BROWSER is None (this suite's default) → fall back to the OLD
+        # id-shape predicate; parity for #agent: / bare-.jsonl rows.
+        self.assertTrue(self.r._is_cross_file_id('/p/s.jsonl#agent:A1'))
+        self.assertTrue(self.r._is_cross_file_id('/p/s.jsonl'))
+        # Non-cross-file shapes stay False.
+        self.assertFalse(self.r._is_cross_file_id('/p/s.jsonl#3'))
+        self.assertFalse(self.r._is_cross_file_id('/p/s.jsonl#prompt:0'))
+        self.assertFalse(self.r._is_cross_file_id('/some/dir'))
+        self.assertFalse(self.r._is_cross_file_id(None))
+
+    def test_is_cross_file_fallback_when_browser_lacks_get_item(self):
+        # A Browser stand-in without get_item (older fakes / headless) is
+        # treated like "not loaded" → id-shape fallback, never an
+        # AttributeError.
+        self.r._BROWSER = type('B', (), {})()
+        self.assertTrue(self.r._is_cross_file_id('/p/s.jsonl#agent:A1'))
+        self.assertFalse(self.r._is_cross_file_id('/p/s.jsonl#3'))
+
+    # ---- (c) get_preview reorder + md file-doc fallback are exercised in
+    #          TestMarkdownSubtrees (which loads the recipe with md_doc live,
+    #          so '#md:' ids can be composed). See its
+    #          ``test_get_preview_md_file_doc_routes_to_md_node_despite_boundary``
+    #          (THE reorder regression guard) and the file-doc fallback test.
+
+    # ---- (d) _walk_umbrella skips boundary children --------------------
+
+    def test_walk_umbrella_skips_boundary_child(self):
+        # A boundary child (here a subagent #agent: row pointing at another
+        # file) must NOT have its content folded into the parent's cascade;
+        # a same-file leaf sibling still renders.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, agent_path = self._project_with_subagent(tmp)
+            parent_id = f'{sess}#prompt:0'
+            agent_id = f'{sess}#agent:A1'
+            leaf_id = f'{sess}#0'   # the PARENT-LEAF-BODY user line
+
+            boundary_child = type(
+                'I', (), {'id': agent_id, 'boundary': True, 'hidden': False})()
+            leaf_child = type(
+                'I', (), {'id': leaf_id, 'boundary': False, 'hidden': False})()
+
+            class _B:
+                def __init__(self, kids):
+                    self._kids = kids
+                def cached_children(self, pid):
+                    return list(self._kids) if pid == parent_id else None
+
+            self.r._BROWSER = _B([boundary_child, leaf_child])
+            out = ''.join(self.r._collect_umbrella_preview(parent_id))
+            # Same-file leaf rendered; the boundary subagent's own body did
+            # NOT bleed in.
+            self.assertIn('PARENT-LEAF-BODY', out)
+            self.assertNotIn('AGENT-INTERNAL-BODY', out)
 
 
 if __name__ == '__main__':

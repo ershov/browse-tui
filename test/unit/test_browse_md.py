@@ -27,6 +27,7 @@ resolution), and #522 (preview pipeline + ``m`` / ``M`` toggles).
 """
 
 import importlib.util
+import os
 import sys
 import types
 import unittest
@@ -2208,14 +2209,15 @@ class TestArgvErrors(unittest.TestCase):
 
 
 class TestMissingDependencyGate(unittest.TestCase):
-    """``main()`` fails fast when ``md2ansi_lib`` couldn't be imported.
+    """``main()`` fails fast when a hard dependency couldn't be imported.
 
-    ``_parse`` derives the whole tree from ``md2ansi_scan``, so the
-    library is a hard dependency. ``main()`` checks ``_md2ansi_scan``
-    before any parsing and exits 2 via ``_die`` when it is ``None`` —
-    simulating an environment where the import failed. The stub
-    ``browse_tui`` is already installed by the loader, and the gate
-    fires before the Browser is ever constructed.
+    The tree is built by ``md_doc.build_doc_tree``, which in turn derives
+    structure from ``md2ansi_scan`` — so both ``md2ansi_lib`` and
+    ``md_doc`` are hard dependencies. ``main()`` checks ``_md2ansi_scan``
+    and then ``md_doc`` before any parsing and exits 2 via ``_die`` when
+    either is ``None`` — simulating an environment where the import
+    failed. The stub ``browse_tui`` is already installed by the loader,
+    and the gate fires before the Browser is ever constructed.
     """
 
     def setUp(self):
@@ -2225,28 +2227,54 @@ class TestMissingDependencyGate(unittest.TestCase):
     def tearDown(self):
         self.r.sys.argv[:] = self._saved_argv
 
-    def test_missing_scanner_exits_two_with_message(self):
-        import contextlib
-        import io
-        import os
+    def _real_md_file(self):
+        """Write a throwaway ``.md`` so the gate (not argv checks) fires."""
         import tempfile
-        # A real .md file so the gate is exercised, not the argv checks
-        # (the gate runs first regardless, but a valid file ensures the
-        # only reason main() can exit is the missing-dependency gate).
         with tempfile.NamedTemporaryFile(
                 'w', suffix='.md', delete=False, encoding='utf-8') as tmp:
             tmp.write('# H1\n')
-            tmp_path = tmp.name
+            return tmp.name
+
+    def _run_main_capture(self, tmp_path):
+        """Drive ``main()`` on ``tmp_path``; return ``(exit_code, stderr)``."""
+        import contextlib
+        import io
+        self.r.sys.argv[:] = ['browse-md', tmp_path]
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            with self.assertRaises(SystemExit) as cm:
+                self.r.main()
+        return cm.exception.code, buf.getvalue()
+
+    def test_missing_scanner_exits_two_with_message(self):
+        import os
+        # A real .md file so the gate is exercised, not the argv checks
+        # (the gate runs first regardless, but a valid file ensures the
+        # only reason main() can exit is the missing-dependency gate).
+        tmp_path = self._real_md_file()
         try:
             self.r._md2ansi_scan = None
-            self.r.sys.argv[:] = ['browse-md', tmp_path]
-            buf = io.StringIO()
-            with contextlib.redirect_stderr(buf):
-                with self.assertRaises(SystemExit) as cm:
-                    self.r.main()
-            self.assertEqual(cm.exception.code, 2)
-            err = buf.getvalue()
+            code, err = self._run_main_capture(tmp_path)
+            self.assertEqual(code, 2)
             self.assertIn('requires the md2ansi_lib module', err)
+            # ``_die`` prefixes the recipe name.
+            self.assertIn('browse-md:', err)
+            # ``with_usage=False`` — the usage line is NOT printed.
+            self.assertNotIn(self.r._USAGE, err)
+        finally:
+            os.unlink(tmp_path)
+
+    def test_missing_md_doc_exits_two_with_message(self):
+        import os
+        # Mirror the scanner gate for the ``md_doc`` hard dependency.
+        # Leave ``_md2ansi_scan`` intact so the FIRST gate passes and we
+        # exercise the ``md_doc is None`` branch specifically.
+        tmp_path = self._real_md_file()
+        try:
+            self.r.md_doc = None
+            code, err = self._run_main_capture(tmp_path)
+            self.assertEqual(code, 2)
+            self.assertIn('requires the md_doc module', err)
             # ``_die`` prefixes the recipe name.
             self.assertIn('browse-md:', err)
             # ``with_usage=False`` — the usage line is NOT printed.
@@ -3523,6 +3551,249 @@ class TestOnExpandCascadeLive(unittest.TestCase):
             self.assertEqual(b._state.expanded, expanded_before)
         finally:
             b.stop_workers()
+
+
+class TestMdRefFollowing(unittest.TestCase):
+    """Markdown reference-following — ``#md:`` ref children (ticket #664).
+
+    A markdown FILE references other ``.md`` files; each EXISTING referenced file
+    surfaces as an expandable ``[md]`` child of the per-file root, drilling into
+    ITS headings + ITS refs recursively (mirrors browse-claude). Built on an
+    on-disk fixture driven through ``_reparse`` (the real ``main()`` startup
+    path) since reference resolution and ``md_doc.get_doc`` read from disk.
+
+    Fixtures (in a private temp dir, so the git-root walk-up finds no ``.git``
+    and ``project_root`` falls back to that dir — labels are bare basenames):
+      * ``A.md`` references ``B.md`` (existing) and ``C.md`` (non-existent),
+        and carries its own headings.
+      * ``B.md`` references ``A.md`` (a CYCLE — must expand in place, never loop)
+        and carries its own headings.
+    """
+
+    def setUp(self):
+        import os
+        import tempfile
+        # Fresh module per test — module-level state (``_FILES`` / ``_BY_ID`` /
+        # ``_INPUT_FILES`` / the md_doc parse cache) mustn't bleed across tests.
+        self.r = _load_recipe(include_lists=False)
+        # Drop any cached referenced docs left over from a sibling test (the
+        # md_doc cache is process-wide, not per recipe-module instance).
+        self.r.md_doc.clear_cache()
+        self.r._MD_COLOR = False
+        self.r._BROWSER = None
+        self.dir = tempfile.mkdtemp()
+        self.A = os.path.join(self.dir, 'A.md')
+        self.B = os.path.join(self.dir, 'B.md')
+        # ``# A title`` owns the whole file (no sibling h1), so a heading-slice
+        # preview against it would equal the whole body; ``B.md`` has two h1s so
+        # its first heading's section is a strict sub-slice (preview test below).
+        self._write(self.A,
+                    '# A title\n'
+                    'See B.md and also a missing C.md here.\n'
+                    '## A sub\n'
+                    'alpha body\n')
+        self._write(self.B,
+                    '# B one\n'
+                    'back to A.md again\n'
+                    '## B sub\n'
+                    'beta body\n'
+                    '# B two\n'
+                    'gamma body\n')
+        self.r._INPUT_FILES = [(self.A, '')]
+        self.r._ROOT_PATH = self.A
+        self.r._reparse()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.dir, ignore_errors=True)
+        # Leave no cached docs behind for the next test class.
+        self.r.md_doc.clear_cache()
+
+    def _write(self, path, text):
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(text)
+
+    def _md_children(self, kids):
+        return [k for k in kids if k.tag == 'md']
+
+    # --- per-file root: ref children -------------------------------------
+
+    def test_root_lists_existing_ref_as_md_child(self):
+        # A's root children = its h1 heading + one ``[md]`` node for B.md.
+        # C.md is non-existent, so it is absent (existing-only).
+        kids = self.r.get_children(self.A)
+        md_kids = self._md_children(kids)
+        self.assertEqual(len(md_kids), 1)
+        self.assertEqual(md_kids[0].title, 'B.md')
+        # And a heading row is also present (refs attach AFTER headings).
+        self.assertEqual(kids[0].tag, 'h1')
+        self.assertEqual(kids[0].title, 'A title')
+        # The md ref node sits after the heading rows.
+        self.assertEqual(kids[-1].tag, 'md')
+
+    def test_nonexistent_ref_absent(self):
+        # C.md never resolves, so no ``[md]`` child names it.
+        titles = [k.title for k in self.r.get_children(self.A)]
+        self.assertNotIn('C.md', titles)
+
+    def test_ref_node_is_boundary(self):
+        # The referenced-file node carries the framework boundary flag.
+        bnode = self._md_children(self.r.get_children(self.A))[0]
+        self.assertTrue(getattr(bnode, 'boundary', False))
+
+    def test_ref_label_is_relative(self):
+        # Label is project_root-relative (here: bare basename, no leading
+        # slash and no temp-dir prefix).
+        bnode = self._md_children(self.r.get_children(self.A))[0]
+        self.assertEqual(bnode.title, 'B.md')
+        self.assertFalse(bnode.title.startswith('/'))
+        self.assertNotIn(self.dir, bnode.title)
+
+    def test_ref_children_deduped_and_sorted(self):
+        # A file that references the SAME target twice (different tokens that
+        # resolve to one path) yields ONE child; multiple distinct refs sort
+        # by label. Rewrite A to reference B.md twice plus a second file.
+        import os
+        D = os.path.join(self.dir, 'D.md')
+        self._write(D, '# D\n')
+        self._write(self.A,
+                    '# A\n'
+                    'first B.md, then ./B.md again, and D.md\n')
+        self.r.md_doc.clear_cache()
+        self.r._reparse()
+        md_kids = self._md_children(self.r.get_children(self.A))
+        titles = [k.title for k in md_kids]
+        # B.md deduped to one; D.md present; sorted by label.
+        self.assertEqual(titles, ['B.md', 'D.md'])
+
+    def test_ref_node_id_uses_md_chain_codec(self):
+        # The ref child id composes the #md: chain onto A's base id.
+        bnode = self._md_children(self.r.get_children(self.A))[0]
+        base, abspaths, line_offset = self.r.md_doc.parse_md_id(bnode.id)
+        self.assertEqual(base, self.A)
+        self.assertEqual(abspaths, [os.path.realpath(self.B)])
+        self.assertIsNone(line_offset)
+
+    # --- expanding a referenced file -------------------------------------
+
+    def test_expand_ref_yields_headings_and_back_ref(self):
+        # Expanding B's node yields B's top-level headings PLUS its ref back to
+        # A (the cycle expands in place — finite per manual drill, no loop).
+        bnode = self._md_children(self.r.get_children(self.A))[0]
+        bkids = self.r.get_children(bnode.id)
+        heading_titles = [k.title for k in bkids if k.tag.startswith('h')]
+        self.assertEqual(heading_titles, ['B one', 'B two'])
+        back = self._md_children(bkids)
+        self.assertEqual(len(back), 1)
+        self.assertEqual(back[0].title, 'A.md')
+        self.assertTrue(getattr(back[0], 'boundary', False))
+
+    def test_cycle_expands_in_place_one_more_level(self):
+        # Drilling the cycle A→B→A is finite per manual drill: expanding the
+        # A-under-B node yields A's headings + B again (no crash, no loop).
+        bnode = self._md_children(self.r.get_children(self.A))[0]
+        a_under_b = self._md_children(self.r.get_children(bnode.id))[0]
+        a_kids = self.r.get_children(a_under_b.id)
+        heading_titles = [k.title for k in a_kids if k.tag.startswith('h')]
+        self.assertEqual(heading_titles, ['A title'])
+        # And B shows up again under this A — the cycle just keeps materialising
+        # lazily, one drill at a time.
+        self.assertEqual([k.title for k in self._md_children(a_kids)], ['B.md'])
+        # The chain id has grown by one segment each level.
+        _, abspaths, _ = self.r.md_doc.parse_md_id(a_under_b.id)
+        self.assertEqual(abspaths,
+                         [os.path.realpath(self.B), os.path.realpath(self.A)])
+
+    def test_ref_file_heading_node_has_subheading_children(self):
+        # A heading inside a referenced file expands to its sub-headings only
+        # (no ref children under a heading — refs live at the document level).
+        bnode = self._md_children(self.r.get_children(self.A))[0]
+        b_one = next(k for k in self.r.get_children(bnode.id)
+                     if k.tag.startswith('h') and k.title == 'B one')
+        sub = self.r.get_children(b_one.id)
+        self.assertEqual([(k.tag, k.title) for k in sub], [('h2', 'B sub')])
+        self.assertFalse(any(k.tag == 'md' for k in sub))
+
+    # --- preview routing --------------------------------------------------
+
+    def test_preview_ref_document_node_is_full_text(self):
+        # A referenced-file document id previews that file's FULL text.
+        bnode = self._md_children(self.r.get_children(self.A))[0]
+        with open(self.B, encoding='utf-8') as f:
+            b_text = f.read()
+        self.assertEqual(self.r.get_preview(bnode.id), b_text)
+
+    def test_preview_ref_heading_node_is_section_slice(self):
+        # A referenced-file heading id previews just that heading's section
+        # slice (boundary rule: ``# B one`` stops before ``# B two``).
+        bnode = self._md_children(self.r.get_children(self.A))[0]
+        b_one = next(k for k in self.r.get_children(bnode.id)
+                     if k.tag.startswith('h') and k.title == 'B one')
+        out = self.r.get_preview(b_one.id)
+        self.assertTrue(out.startswith('# B one\n'))
+        self.assertIn('## B sub', out)
+        self.assertNotIn('# B two', out)
+
+    def test_preview_unreadable_ref_doc_is_empty(self):
+        # An id naming a non-existent file previews '' (no crash).
+        bad = self.r.md_doc.compose_md_id(
+            self.A, [os.path.join(self.dir, 'gone.md')])
+        self.assertEqual(self.r.get_preview(bad), '')
+
+    # --- has_children / heading-less file --------------------------------
+
+    def test_root_has_children_with_heading_and_ref(self):
+        # A has both a heading and an existing ref — root is expandable.
+        self.assertTrue(self.r._FILES[self.A].file_root.has_children)
+
+    def test_heading_less_file_with_ref_is_expandable(self):
+        # A file with NO headings that references an existing ``.md`` must still
+        # carry an expansion arrow (has_children True) and list the ref.
+        import os
+        H = os.path.join(self.dir, 'H.md')
+        self._write(H, 'Just prose, no headings, but see B.md for details.\n')
+        self.r._INPUT_FILES = [(H, '')]
+        self.r._ROOT_PATH = H
+        self.r.md_doc.clear_cache()
+        self.r._reparse()
+        root = self.r._FILES[H].file_root
+        self.assertTrue(root.has_children)
+        # Eager heading tree is empty; the only child is the lazy ref node.
+        self.assertEqual(root._children, [])
+        kids = self.r.get_children(H)
+        self.assertEqual([(k.tag, k.title) for k in kids], [('md', 'B.md')])
+
+    def test_heading_less_file_without_ref_not_expandable(self):
+        # Control: prose with no headings and no resolvable ref is a leaf —
+        # the in-file behaviour for ref-less files is unchanged.
+        import os
+        P = os.path.join(self.dir, 'P.md')
+        self._write(P, 'Just prose. A missing nope.md reference only.\n')
+        self.r._INPUT_FILES = [(P, '')]
+        self.r._ROOT_PATH = P
+        self.r.md_doc.clear_cache()
+        self.r._reparse()
+        self.assertFalse(self.r._FILES[P].file_root.has_children)
+        self.assertEqual(self.r.get_children(P), [])
+
+    # --- unchanged in-file behaviour -------------------------------------
+
+    def test_in_file_heading_unaffected_for_refless_file(self):
+        # A ref-less file's heading children are exactly its sub-headings —
+        # no stray ``[md]`` rows leak into the in-file tree.
+        import os
+        K = os.path.join(self.dir, 'K.md')
+        self._write(K, '# K1\n## K1a\n## K1b\n# K2\n')
+        self.r._INPUT_FILES = [(K, '')]
+        self.r._ROOT_PATH = K
+        self.r.md_doc.clear_cache()
+        self.r._reparse()
+        kids = self.r.get_children(K)
+        self.assertEqual([(k.tag, k.title) for k in kids],
+                         [('h1', 'K1'), ('h1', 'K2')])
+        k1 = kids[0]
+        self.assertEqual([(c.tag, c.title) for c in self.r.get_children(k1.id)],
+                         [('h2', 'K1a'), ('h2', 'K1b')])
 
 
 if __name__ == '__main__':

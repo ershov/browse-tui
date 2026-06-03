@@ -513,6 +513,51 @@ class TestExpandCollapseRecursive(unittest.TestCase):
             b.stop_workers()
 
 
+class TestExpandRecursiveBoundary(unittest.TestCase):
+    """alt-right stops at a ``boundary`` node (expand to, not through)."""
+
+    def _tree(self, *, boundary):
+        # root: [A (boundary?, kids), C (leaf)]
+        # A: [A1 (kids), A2];  A1: [A1a]   — A's subtree fully cached.
+        b = _make_browser()
+        s = b._state
+        s._children[None] = [
+            Item(id='A', has_children=True, boundary=boundary),
+            Item(id='C'),
+        ]
+        s._children['A'] = [
+            Item(id='A1', has_children=True),
+            Item(id='A2'),
+        ]
+        s._children['A1'] = [Item(id='A1a')]
+        return b
+
+    def test_alt_right_expands_to_boundary_not_through(self):
+        b = self._tree(boundary=True)
+        try:
+            ctx = _ctx_for(b)
+            # Cursor on A (top level) → its parent is the root, so the
+            # recursive expand walks root's children.
+            self.assertTrue(dispatch_key(b, ctx, 'alt-right'))
+            # A is reached and added (expand TO the boundary)...
+            self.assertIn('A', b._state.expanded)
+            # ...but the cached branch A1 below it is NOT (never THROUGH).
+            self.assertNotIn('A1', b._state.expanded)
+        finally:
+            b.stop_workers()
+
+    def test_alt_right_non_boundary_control_recurses(self):
+        # Identical shape, A is not a boundary → A1 expands recursively.
+        b = self._tree(boundary=False)
+        try:
+            ctx = _ctx_for(b)
+            self.assertTrue(dispatch_key(b, ctx, 'alt-right'))
+            self.assertIn('A', b._state.expanded)
+            self.assertIn('A1', b._state.expanded)
+        finally:
+            b.stop_workers()
+
+
 class TestPreviewScrollActions(unittest.TestCase):
     """shift-up/down + alt-pgup/pgdn drive ``_preview_scroll``."""
 
