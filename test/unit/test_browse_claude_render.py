@@ -7041,22 +7041,34 @@ class TestMarkdownSubtrees(unittest.TestCase):
 
     # ---- message-level build: inline + file docs -----------------------
 
-    def test_message_children_inline_plus_file_doc(self):
+    def test_message_children_inline_plus_refs_umbrella(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess, proj, report, appendix = self._build_project(tmp)
             base = f'{sess}#0'
             kids = self.r._md_message_children(base)
             self.assertEqual(len(kids), 2, kids)
-            inline, filedoc = kids
+            inline, refs = kids
             # Inline document node: empty #md: chain, same-file (boundary off).
             self.assertEqual(inline.id, f'{base}#md:')
             self.assertEqual(inline.title, 'markdown')
             self.assertFalse(inline.boundary)
             self.assertTrue(inline.has_children)
             self.assertEqual(inline.tag, 'md')
-            # File document node: report.md, foreign subtree (boundary on),
-            # optimistic has_children, label relative to the project root.
+            # References umbrella: same-document grouping (boundary off), [links]
+            # tag, id = the message base + the #refs marker.
+            self.assertEqual(refs.id, self.r._md_doc.refs_umbrella_id(base))
+            self.assertEqual(refs.title, 'References')
+            self.assertEqual(refs.tag, 'links')
+            self.assertEqual(refs.kind, 'md-refs')
+            self.assertFalse(refs.boundary)
+            self.assertTrue(refs.has_children)
+            # The umbrella's OWN children are the file docs: report.md, foreign
+            # subtree (boundary on), optimistic has_children, label relative to
+            # the project root.
+            ref_kids = self.r._md_refs_umbrella_children(refs.id)
+            self.assertEqual(len(ref_kids), 1, ref_kids)
+            (filedoc,) = ref_kids
             self.assertEqual(filedoc.title, 'report.md')
             self.assertTrue(filedoc.boundary)
             self.assertTrue(filedoc.has_children)
@@ -7086,8 +7098,11 @@ class TestMarkdownSubtrees(unittest.TestCase):
                                  'real.md and again real.md plus ghost.md'}]}})
                         + '\n')
             kids = self.r._md_message_children(f'{sess}#0')
-            # No heading in the text → no inline node; just the one file doc.
-            self.assertEqual([k.title for k in kids], ['real.md'])
+            # No heading in the text → no inline node; just the References
+            # umbrella. The dedup/existing-only happens in its OWN children.
+            self.assertEqual([k.title for k in kids], ['References'])
+            ref_kids = self.r._md_refs_umbrella_children(kids[0].id)
+            self.assertEqual([k.title for k in ref_kids], ['real.md'])
 
     def test_message_children_absolute_tool_path_yields_file_doc(self):
         # Regression (#671): a Write tool_use carrying an ABSOLUTE .md
@@ -7128,9 +7143,12 @@ class TestMarkdownSubtrees(unittest.TestCase):
                 deslashed, doc_dir=proj, cwd=proj, project_root=proj))
 
             kids = self.r._md_message_children(f'{sess}#0')
-            # No heading in the record → no inline node; exactly one file doc.
-            self.assertEqual(len(kids), 1, kids)
-            (filedoc,) = kids
+            # No heading in the record → no inline node; just the References
+            # umbrella, whose one child is the file doc.
+            self.assertEqual([k.title for k in kids], ['References'])
+            ref_kids = self.r._md_refs_umbrella_children(kids[0].id)
+            self.assertEqual(len(ref_kids), 1, ref_kids)
+            (filedoc,) = ref_kids
             self.assertEqual(filedoc.tag, 'md')
             self.assertEqual(filedoc.kind, 'md-doc')
             self.assertTrue(filedoc.boundary)
@@ -7166,7 +7184,11 @@ class TestMarkdownSubtrees(unittest.TestCase):
                                  'text': 'first zeta.md then alpha.md'}]}})
                         + '\n')
             kids = self.r._md_message_children(f'{sess}#0')
-            self.assertEqual([k.title for k in kids], ['alpha.md', 'zeta.md'])
+            # No heading → just the References umbrella; its children are the
+            # refs, sorted by label.
+            self.assertEqual([k.title for k in kids], ['References'])
+            ref_kids = self.r._md_refs_umbrella_children(kids[0].id)
+            self.assertEqual([k.title for k in ref_kids], ['alpha.md', 'zeta.md'])
 
     def test_message_children_no_inline_when_no_heading(self):
         # A message with a ref but NO heading must not emit an inline doc node.
@@ -7220,7 +7242,7 @@ class TestMarkdownSubtrees(unittest.TestCase):
 
     # ---- file document → headings + nested file refs (recursion) -------
 
-    def test_file_doc_children_headings_plus_nested_ref(self):
+    def test_file_doc_children_headings_plus_refs_umbrella(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess, proj, report, appendix = self._build_project(tmp)
@@ -7230,14 +7252,23 @@ class TestMarkdownSubtrees(unittest.TestCase):
             kids = self.r._md_subtree_children(file_id)
             titles = [k.title for k in kids]
             # report.md: "# Findings" (with "## Detail" nested) + a ref to
-            # appendix.md → one heading row + one file-doc row.
-            self.assertEqual(titles, ['Findings', 'appendix.md'])
-            heading, nested = kids
+            # appendix.md → one heading row + one References umbrella.
+            self.assertEqual(titles, ['Findings', 'References'])
+            heading, refs = kids
             self.assertEqual(heading.tag, 'h1')
             self.assertFalse(getattr(heading, 'boundary', False))
+            # Umbrella id = the file-doc id + #refs; same-document grouping.
+            self.assertEqual(refs.id, self.r._md_doc.refs_umbrella_id(file_id))
+            self.assertEqual(refs.tag, 'links')
+            self.assertFalse(refs.boundary)
+            self.assertTrue(refs.has_children)
+            # The umbrella's OWN child is the nested file-doc, chained onto
+            # report.md → appendix.md.
+            nested_kids = self.r._md_refs_umbrella_children(refs.id)
+            self.assertEqual([k.title for k in nested_kids], ['appendix.md'])
+            (nested,) = nested_kids
             self.assertEqual(nested.tag, 'md')
             self.assertTrue(nested.boundary)
-            # Nested ref id chains report.md → appendix.md.
             self.assertEqual(
                 self.r._md_doc.parse_md_id(nested.id),
                 (base, [report_real, os.path.realpath(appendix)], None))
@@ -7251,8 +7282,137 @@ class TestMarkdownSubtrees(unittest.TestCase):
             appendix_id = self.r._md_doc.compose_md_id(base, chain)
             kids = self.r._md_subtree_children(appendix_id)
             # appendix.md is a leaf doc: just its "# Appendix" heading, no refs.
+            # No further ref → no References umbrella on a leaf doc.
             self.assertEqual([k.title for k in kids], ['Appendix'])
             self.assertEqual(kids[0].tag, 'h1')
+
+    # ---- References umbrella (#702) ------------------------------------
+
+    def test_refs_umbrella_always_wraps_single_ref(self):
+        # Even a single ref is grouped under the umbrella — never hung
+        # directly under the document.
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, 'proj')
+            os.makedirs(proj)
+            with open(os.path.join(proj, 'only.md'), 'w') as f:
+                f.write('# Only\n')
+            enc = self.r._encode_project_path(proj)
+            sess_dir = os.path.join(tmp, 'projects', enc)
+            os.makedirs(sess_dir)
+            sess = os.path.join(sess_dir, 'sid.jsonl')
+            with open(sess, 'w') as f:
+                f.write(_json.dumps({'type': 'user', 'cwd': proj, 'message': {
+                    'content': [{'type': 'text',
+                                 'text': 'just one ref: only.md'}]}}) + '\n')
+            kids = self.r._md_message_children(f'{sess}#0')
+            self.assertEqual([k.title for k in kids], ['References'])
+            self.assertEqual(kids[0].kind, 'md-refs')
+            ref_kids = self.r._md_refs_umbrella_children(kids[0].id)
+            self.assertEqual([k.title for k in ref_kids], ['only.md'])
+
+    def test_refs_umbrella_preview_is_plain_label_list(self):
+        # The umbrella preview is a PLAIN list of the ref labels (one per line,
+        # a count header) — NOT routed through md2ansi (no ANSI even with the
+        # color toggle ON), and never the file documents' own bodies.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            base = f'{sess}#0'
+            refs_id = self.r._md_doc.refs_umbrella_id(base)
+            self.r._MD_COLOR = True   # would colorise a markdown preview
+            out = self.r.get_preview(refs_id)
+            self.assertNotIn('\x1b', out, 'umbrella preview must be plain text')
+            self.assertIn('report.md', out)        # the ref label is listed
+            self.assertIn('1 referenced file', out)  # the count header
+            # NOT the referenced file's own body (that is the file-doc preview).
+            self.assertNotIn('Findings', out)
+            self.assertNotIn('body', out)
+
+    def test_refs_umbrella_preview_empty_when_unreadable(self):
+        # A #refs id whose document is gone yields '' (no crash, no header).
+        refs_id = self.r._md_doc.refs_umbrella_id('/nope/s.jsonl#3')
+        self.assertEqual(self.r.get_preview(refs_id), '')
+
+    def test_is_md_managed_id_covers_refs_umbrella(self):
+        # Both umbrella shapes (message-level and file-doc-level) are md-managed
+        # so the first-child landing drills INTO them.
+        self.assertTrue(self.r._is_md_managed_id('/p/s.jsonl#3#refs'))
+        self.assertTrue(self.r._is_md_managed_id('/p/s.jsonl#0#md:file%3A...#refs'))
+        saved = self.r._md_doc
+        try:
+            self.r._md_doc = None
+            self.assertFalse(self.r._is_md_managed_id('/p/s.jsonl#3#refs'))
+        finally:
+            self.r._md_doc = saved
+
+    def test_expand_refs_umbrella_lands_on_first_ref(self):
+        # Right-arrow into a References umbrella lands the cursor on its first
+        # ref file-doc (the umbrella is md-managed → first-child landing).
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            base = f'{sess}#0'
+            refs = next(k for k in self.r.get_children(base)
+                        if k.kind == 'md-refs')
+            ref_kids = self.r.get_children(refs.id)
+            self.assertTrue(ref_kids, 'umbrella should have ref children')
+            first = ref_kids[0].id
+            ctx, calls = self._make_jump_ctx(cached={refs.id: ref_kids})
+            self.r._on_expand(ctx, [refs.id])
+            self.assertEqual(calls, [first],
+                             'expanding a References umbrella must land on its '
+                             'first ref')
+
+    def test_file_doc_umbrella_routes_before_md_branch(self):
+        # A file-doc umbrella id ``<base>#md:<enc>#refs`` contains ``#md:``; the
+        # ``#refs`` routing MUST win in BOTH get_children and get_preview, or
+        # the ``#md:`` branch would steal it. Drive both through the routers.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            base = f'{sess}#0'
+            file_id = self.r._md_doc.compose_md_id(base, [os.path.realpath(report)])
+            refs_id = self.r._md_doc.refs_umbrella_id(file_id)
+            self.assertIn('#md:', refs_id)   # the ordering hazard is real
+            # get_children: routed to the umbrella builder → the nested ref,
+            # NOT the file-doc subtree (which would be ['Findings', 'References']).
+            self.assertEqual(
+                [k.title for k in self.r.get_children(refs_id)], ['appendix.md'])
+            # get_preview: routed to the plain label list, NOT the file body.
+            self.r._MD_COLOR = False
+            out = self.r.get_preview(refs_id)
+            self.assertIn('appendix.md', out)
+            self.assertNotIn('Findings', out)   # not the report.md body
+
+    def test_doc_expand_adds_umbrella_without_building_ref_list(self):
+        # The lazy short-circuit: a document-expand only adds the umbrella NODE
+        # — it does NOT build the full ref list (that is the umbrella's own
+        # get_children). Spy on the full-resolve helper to prove it is not
+        # called during the document-expand, only on the umbrella-expand.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess, proj, report, appendix = self._build_project(tmp)
+            base = f'{sess}#0'
+            calls = []
+            real = self.r._md_resolved_refs
+
+            def _spy(*a, **kw):
+                calls.append(1)
+                return real(*a, **kw)
+
+            self.r._md_resolved_refs = _spy
+            self.addCleanup(setattr, self.r, '_md_resolved_refs', real)
+            # Document-expand: the umbrella appears, the full resolve does NOT
+            # run (only the cheap _has_any_existing_ref short-circuit).
+            kids = self.r._md_message_children(base)
+            refs = next(k for k in kids if k.kind == 'md-refs')
+            self.assertEqual(calls, [], 'doc-expand must not build the ref list')
+            # Umbrella-expand: NOW the full resolve runs and yields the refs.
+            ref_kids = self.r._md_refs_umbrella_children(refs.id)
+            self.assertEqual(len(calls), 1, 'umbrella-expand runs the resolve')
+            self.assertEqual([k.title for k in ref_kids], ['report.md'])
 
     # ---- routing through get_children ----------------------------------
 
@@ -7261,14 +7421,20 @@ class TestMarkdownSubtrees(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             sess, proj, report, appendix = self._build_project(tmp)
             base = f'{sess}#0'
-            # Message id → inline + file docs (same as _md_message_children).
+            # Message id → inline doc + References umbrella (same as
+            # _md_message_children).
             via_router = self.r.get_children(base)
             self.assertEqual([k.title for k in via_router],
-                             ['markdown', 'report.md'])
+                             ['markdown', 'References'])
             # #md: id → routed to the subtree builder.
             inline_id = self.r._md_doc.compose_md_id(base, [])
             self.assertEqual(
                 [k.title for k in self.r.get_children(inline_id)], ['Summary'])
+            # #refs umbrella id → routed (BEFORE the #md: branch) to the
+            # umbrella builder; its child is the file doc.
+            refs_id = self.r._md_doc.refs_umbrella_id(base)
+            self.assertEqual(
+                [k.title for k in self.r.get_children(refs_id)], ['report.md'])
 
     def test_get_children_message_is_leaf_without_md_doc(self):
         # With the feature off, a message id is a leaf again (no md children).
@@ -7456,7 +7622,11 @@ class TestMarkdownSubtrees(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             sess, proj, report, appendix = self._build_project(tmp)
             kids = self.r._md_message_children(f'{sess}#0')
-            filedoc = next(k for k in kids if k.tag == 'md' and k.boundary)
+            # The file doc lives under the References umbrella, not directly
+            # under the message.
+            refs = next(k for k in kids if k.kind == 'md-refs')
+            ref_kids = self.r._md_refs_umbrella_children(refs.id)
+            filedoc = next(k for k in ref_kids if k.tag == 'md' and k.boundary)
             self.assertEqual(filedoc.title, 'report.md')
             # Id carries the absolute path, not the relative label.
             _, abspaths, _ = self.r._md_doc.parse_md_id(filedoc.id)
@@ -7705,13 +7875,15 @@ class TestMarkdownSubtrees(unittest.TestCase):
 
     def test_expand_file_doc_lands_on_first_child(self):
         # Cached expand of a file-doc (boundary) node lands on its first
-        # heading row.
+        # heading row. The file doc now sits under the message's References
+        # umbrella, so reach it through that.
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess, proj, report, appendix = self._build_project(tmp)
             base = f'{sess}#0'
-            msg_kids = self.r.get_children(base)
-            filedoc = next(k for k in msg_kids
+            refs = next(k for k in self.r.get_children(base)
+                        if k.kind == 'md-refs')
+            filedoc = next(k for k in self.r.get_children(refs.id)
                            if getattr(k, 'boundary', False))
             kids = self.r.get_children(filedoc.id)
             self.assertTrue(kids, 'file doc should have heading children')
