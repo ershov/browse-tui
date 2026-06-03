@@ -702,7 +702,11 @@ def _expand_recursive(ctx):
         for c in children:
             if getattr(c, 'has_children', False):
                 state.expanded.add(c.id)
-                _expand_subtree(c.id)
+                # A boundary child is a self-contained foreign subtree:
+                # expand *to* it (added above), never *through* it —
+                # don't recurse into its descendants even when cached.
+                if not getattr(c, 'boundary', False):
+                    _expand_subtree(c.id)
 
     _expand_subtree(parent_id)
     mark_visible_dirty(state)

@@ -76,6 +76,22 @@ class Item:
     ``hidden`` values are preserved). See ``docs/superpowers/specs/
     2026-05-16-row-visibility-design.md`` for the full semantics.
 
+    ``boundary`` (default ``False``) marks a node that heads a
+    *self-contained foreign subtree* — content sourced from outside the
+    current document (a referenced file, a subagent transcript, a bare
+    session). Recursive / multi-expansion (``expand_subtree`` and the
+    Alt-Right path in ``040-state.py``) treats it as a leaf: it expands
+    *to* the boundary node — the node itself may join ``state.expanded``
+    — but never *through* it, so its children/descendants are not
+    recursively expanded, **even when they are already cached** from a
+    prior manual expand. (Lazy expansion already skips *uncached*
+    subtrees, so this is a no-op in the common case; ``boundary`` covers
+    the cached case and makes the contract explicit.) The node stays
+    manually expandable. The other half of the contract — *not folding a
+    boundary's descendants into an ancestor's preview cascade* — is
+    honoured by recipes that build such cascades; the framework has no
+    cross-item preview concept.
+
     ``_filter_hidden`` is a framework-internal flag written by the
     filter evaluator (see ``docs/superpowers/specs/2026-05-17-filter-
     design.md``). Recipes do not see or set it: ``init=False`` keeps
@@ -106,6 +122,7 @@ class Item:
     tag_style: str = ''
     has_children: bool = False
     hidden: bool = False
+    boundary: bool = False
     _filter_hidden: bool = field(
         default=False, init=False, repr=False, compare=False,
     )
@@ -177,7 +194,8 @@ def to_item(x: Any) -> Item:
             raise TypeError("to_item: dict must contain 'id' key")
         # Split known dataclass fields from extras so we can attach the
         # rest as arbitrary attributes (Item is intentionally non-slotted).
-        known = {'id', 'title', 'tag', 'tag_style', 'has_children', 'hidden'}
+        known = {'id', 'title', 'tag', 'tag_style', 'has_children',
+                 'hidden', 'boundary'}
         fields = {k: v for k, v in x.items() if k in known}
         extras = {k: v for k, v in x.items() if k not in known}
         item = Item(**fields)

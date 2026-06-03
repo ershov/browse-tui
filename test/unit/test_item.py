@@ -39,6 +39,14 @@ class TestItemConstruction(unittest.TestCase):
         item = Item(id='x', has_children=True)
         self.assertTrue(item.has_children)
 
+    def test_boundary_defaults_false(self):
+        item = Item(id='x')
+        self.assertFalse(item.boundary)
+
+    def test_boundary_flag_settable(self):
+        item = Item(id='x', boundary=True)
+        self.assertTrue(item.boundary)
+
     def test_filter_hidden_defaults_false(self):
         item = Item(id='x')
         self.assertFalse(item._filter_hidden)
