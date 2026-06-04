@@ -963,13 +963,56 @@ def _pick_on_info_bar(browser, label, options, *, _read_key=None):
         ``prev_top`` (note: ``prev_top`` is the preview's *separator*
         row in the regular renderer; the picker repurposes it as the
         first option row, which is fine because exiting the picker
-        always sets ``_needs_redraw = {'all'}`` so the next render
-        repaints the separator over the leftover row).
+        drops the per-pane row cache and requests a full redraw, so the
+        next render re-emits the separator over the leftover row).
 
-    On exit (enter or esc) we mark the layout dirty so the main loop
-    repaints the regular UI on its next pass.
+    On exit (enter or esc) ``_restore`` invalidates the row cache and
+    marks the layout dirty so the main loop fully repaints the regular
+    UI on its next pass (the picker drew directly to the screen, so a
+    plain ``'all'`` request alone would cache-hit and skip the cells the
+    picker overdrew).
     """
     rk = _read_key if _read_key is not None else read_key
+
+    def _restore():
+        # Repaint the regular UI over the picker overlay. Two facts make
+        # this more than a plain ``_needs_redraw`` flag:
+        #
+        #   1. The picker drew its prompt + options with direct
+        #      ``move``/``write``/``clear_columns`` calls that bypass the
+        #      per-pane row cache. That cache still holds the pre-picker
+        #      UI content for those cells, so the next ``render_full``
+        #      cache-hits (identical buffered bytes, unchanged rect) and
+        #      emits nothing — the overlay survives. Dropping the row
+        #      cache forces an unconditional re-emit (same recovery the
+        #      screen-lost / resume paths use after an external overdraw).
+        #
+        #   2. With a freshly-cleared cache the renderer takes the
+        #      "first paint" branch, which emits NO trailing clear — it
+        #      assumes the cells below the content are already blank.
+        #      That holds at startup / after a real screen reset, but NOT
+        #      here: the picker left option text on the preview's blank
+        #      rows, so a content-only repaint would leave the last few
+        #      options (e.g. a trailing ``wontfix``) on screen. Blank the
+        #      whole preview pane + info bar first so the assumption is
+        #      true again.
+        cols, rows_total = term_size()
+        layout = layout_panes(
+            cols, rows_total,
+            split=getattr(browser, 'split', 'h'),
+            show_preview=browser.show_preview,
+            list_ratio=browser.list_ratio,
+        )
+        preview_rect = layout.get('preview')
+        info_bar = layout.get('info_bar')
+        if preview_rect is not None:
+            for row in range(preview_rect.top, preview_rect.bottom):
+                clear_columns(row, preview_rect.left, preview_rect.right)
+        if info_bar is not None:
+            clear_columns(info_bar.top, info_bar.left,
+                          info_bar.left + info_bar.width)
+        browser._pane_cache.clear()
+        browser._needs_redraw.add('all')
 
     filter_query = ''
     cursor = 0
@@ -1086,11 +1129,11 @@ def _pick_on_info_bar(browser, label, options, *, _read_key=None):
                 cursor = len(visible) - 1
         elif key == 'enter':
             if visible:
-                browser._needs_redraw.add('all')
+                _restore()
                 return visible[cursor]
             # No matches; ignore enter.
         elif key in ('esc', 'ctrl-c'):
-            browser._needs_redraw.add('all')
+            _restore()
             return None
         elif key == 'backspace':
             if filter_query:

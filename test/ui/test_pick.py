@@ -21,6 +21,8 @@ from test.ui.fixtures.tmux import TmuxFixture
 _BIN = os.path.abspath('./browse-tui')
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _RECIPE = os.path.join(_REPO, 'test', 'ui', 'recipes', 'pick_demo.py')
+_NOQUIT_RECIPE = os.path.join(
+    _REPO, 'test', 'ui', 'recipes', 'pick_noquit_demo.py')
 
 
 def setUpModule():
@@ -113,6 +115,54 @@ class TestPick(unittest.TestCase):
                 t.send('Enter')
                 content = _read_log_when_ready(log)
             self.assertEqual(content, 'done')
+
+
+class TestPickRedrawOnExit(unittest.TestCase):
+    """Regression: after pick() returns to the UI, the overlay repaints away.
+
+    Ticket #719. The picker draws its prompt + options directly to the
+    screen, bypassing the per-pane row cache. When the picking action
+    returns to the UI (instead of quitting), the next render must fully
+    repaint the regular UI over the overlay. Before the fix the renderer
+    cache-hit every unchanged row and emitted nothing, so the ``Status>``
+    prompt and the option list (notably the last option, on an otherwise
+    blank preview row) stayed on screen.
+
+    The no-quit recipe stays running so we can capture the post-pick
+    screen — the quit-after-pick path can't show the bug because teardown
+    leaves the alternate screen entirely.
+    """
+
+    def _assert_ui_restored(self, t):
+        cap = t.wait_for('PREVIEW-LINE-ONE', timeout=3.0)
+        # Picker chrome must be gone.
+        self.assertNotIn('Status>', cap,
+                         f'picker prompt left on screen:\n{cap}')
+        for opt in ('open', 'in-progress', 'done', 'wontfix'):
+            self.assertNotIn(opt, cap,
+                             f'picker option {opt!r} left on screen:\n{cap}')
+        # Regular UI must be back: rows, preview content, info-bar hints.
+        self.assertIn('ALPHA-ROW', cap)
+        self.assertIn('PREVIEW-LINE-THREE', cap)
+        self.assertIn('q:quit', cap)
+
+    def test_overlay_gone_after_cancel(self):
+        with TmuxFixture(cols=80, rows=24) as t:
+            t.launch(_BIN, '--run-py', _NOQUIT_RECIPE)
+            t.wait_for('ALPHA-ROW')
+            t.send('s')
+            t.wait_for('Status>')
+            t.send('Escape')
+            self._assert_ui_restored(t)
+
+    def test_overlay_gone_after_select(self):
+        with TmuxFixture(cols=80, rows=24) as t:
+            t.launch(_BIN, '--run-py', _NOQUIT_RECIPE)
+            t.wait_for('ALPHA-ROW')
+            t.send('s')
+            t.wait_for('Status>')
+            t.send('Enter')
+            self._assert_ui_restored(t)
 
 
 if __name__ == '__main__':
