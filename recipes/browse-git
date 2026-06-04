@@ -20,6 +20,7 @@ relies on hex-vs-word heuristics:
   status:<XY>:<path>    a working-tree entry (leaf) -> staged/worktree diff
   stash:<n>[:<path>]    a stash, or a file in one
   reflog:<n>:<sha>      a reflog entry    -> changed files
+  filler:<n>            an inert tree-mode connector row (no children)
 
 Commit rows render in columns — a yellow short-sha, a dim author and a
 dim relative date — followed by the branch / remote / tag refs parsed
@@ -35,15 +36,22 @@ be md2ansi-colored when ``md2ansi_lib`` is importable (toggle with
 ``m``).
 
 Keys: Enter flips expand/collapse of the cursor row; `` ` `` opens the
-mode picker; ``m`` toggles md2ansi message coloring (when available);
-``E`` edits the real working-tree file for file/status rows in $EDITOR;
-the built-in ``v`` / ``e`` page / edit the preview text.
+mode picker; ``t`` toggles the commit-graph column (``--tree``); ``m``
+toggles md2ansi message coloring (when available); ``E`` edits the real
+working-tree file for file/status rows in $EDITOR; the built-in ``v`` /
+``e`` page / edit the preview text.
+
+With ``--tree`` (or the ``t`` toggle, default off) the commit log gains a
+tig-style graph column: ``git log --graph`` does all the lane assignment
+and its art is glyph-substituted and rendered after the date column, with
+its connector-only FILLER lines kept as inert blank rows so the lanes line
+up. The flag scopes the commit log (commits mode + the ref drill-down).
 
 Read-only with respect to history — the only mutation is ``E``'s
 working-tree edit.
 
 Usage:
-  browse-git [-n NUMBER] [--mode NAME] [<revs>…] [-- <paths>…]
+  browse-git [-n NUMBER] [--mode NAME] [--tree] [<revs>…] [-- <paths>…]
 """
 
 import os
@@ -69,9 +77,23 @@ _MD_COLOR = _md2ansi_fn is not None  # default on when available
 _LOG_LIMIT = 1000
 _MODES = ('commits', 'status', 'reflog', 'branches', 'stash')
 
+# Glyph substitution for ``git log --graph`` art (tree mode). Maps git's
+# ASCII art to box-drawing / dot glyphs: every node ('*') becomes the same
+# dot so git's connectors — not the node shape — convey merges. Built once
+# as a str.translate table (see ``_graph_translate``).
+_GRAPH_GLYPHS = {
+    '*': '·',     # commit node           -> middle dot (U+00B7)
+    '|': '│',     # vertical lane         -> box vertical (U+2502)
+    '/': '╱',     # ascending diagonal    -> light up-right diag (U+2571)
+    '\\': '╲',    # descending diagonal   -> light down-right diag (U+2572)
+    '_': '─',     # horizontal connector  -> box horizontal (U+2500)
+}
+_GRAPH_TABLE = str.maketrans(_GRAPH_GLYPHS)
+
 # Module-level state, all set in main() before the Browser launches.
 _log_limit = _LOG_LIMIT
 _mode = 'commits'
+_tree_mode = False  # --tree / 't' — render git's commit graph as a column
 _browser = None  # set in main() — used for preview-width lookup
 _revs = []       # positional revisions scoping commits mode
 _paths = []      # positional pathspecs scoping commits mode
@@ -138,6 +160,30 @@ def _pop_mode_arg():
             sys.exit(2)
         return value
     return None
+
+
+def _pop_tree_arg(default):
+    """Pop the ``--tree`` / ``--no-tree`` toggle out of ``sys.argv``.
+
+    Returns ``True`` for ``--tree``, ``False`` for ``--no-tree``, or
+    ``default`` when neither appears. Every occurrence is removed (so the
+    flag never leaks into the positional classifier) and the LAST one wins,
+    so ``--tree --no-tree`` resolves to off. Mirrors ``_pop_mode_arg``'s
+    in-place argv editing.
+    """
+    chosen = default
+    i = 1
+    while i < len(sys.argv):
+        a = sys.argv[i]
+        if a == '--tree':
+            chosen = True
+            del sys.argv[i]
+        elif a == '--no-tree':
+            chosen = False
+            del sys.argv[i]
+        else:
+            i += 1
+    return chosen
 
 
 # ---- id parsing ----------------------------------------------------------
@@ -473,7 +519,7 @@ def get_children(item_id, *, reload=False):
     if kind == 'ref':
         # A ref drills into its commits — the shared commit-log builder
         # with the refname as the sole rev. parsed = ('ref', refname).
-        return _commit_log_items([parsed[1]], [])
+        return _log_items([parsed[1]], [])
     # file / leaf / error rows have no children.
     return []
 
@@ -495,7 +541,21 @@ def _root_children():
 
 def _commits_root():
     """Commits-mode root = the ``git log`` for the positional rev/path filter."""
-    return _commit_log_items(_revs, _paths)
+    return _log_items(_revs, _paths)
+
+
+def _log_items(revs, paths):
+    """Build the commit-log rows for ``revs`` / ``paths``, honouring tree mode.
+
+    The single seam shared by commits-mode root and the branches-mode ref
+    drill-down: when ``_tree_mode`` is on it routes to the ``git log
+    --graph`` builder (commit rows + inert filler rows carrying the graph
+    art); otherwise it calls the plain ``_commit_log_items`` so the
+    tree-off output is byte-identical to before this feature.
+    """
+    if _tree_mode:
+        return _commit_graph_items(revs, paths)
+    return _commit_log_items(revs, paths)
 
 
 def _commit_log_items(revs, paths):
@@ -540,26 +600,105 @@ def _commit_log_items(revs, paths):
     return items
 
 
+def _graph_translate(art):
+    """Glyph-substitute one line of ``git log --graph`` art.
+
+    Maps git's ASCII connectors to box-drawing / dot glyphs via the module
+    ``_GRAPH_TABLE`` (``*``→``·``, ``|``→``│``, ``/``→``╱``, ``\\``→``╲``,
+    ``_``→``─``). Internal spacing is git's lane alignment and is preserved;
+    only trailing spaces are stripped (git right-pads every art cell, and a
+    trailing run carries no lane information).
+    """
+    return art.translate(_GRAPH_TABLE).rstrip()
+
+
+def _commit_graph_items(revs, paths):
+    """``git log --graph`` rows: commit ``commit:<sha>`` items + filler rows.
+
+    The tree-mode counterpart to ``_commit_log_items``. ``git log --graph``
+    does ALL the lane assignment and prepends its art to every output line;
+    we render those lines verbatim (after glyph substitution) rather than
+    re-deriving the graph. The ``\\x1f`` (unit separator) format keeps the
+    art — which freely contains spaces and ``|`` / ``/`` — unambiguously
+    apart from the commit fields:
+
+      * ``<art>\\x1f%H\\x1f%an\\x1f%ar\\x1f%s\\x1f%D`` for a commit line —
+        splitting on ``\\x1f`` yields the art then the five fields;
+      * a pure-art FILLER line (``|\\``, ``|/`` …) has NO separator, so the
+        split yields a single element.
+
+    Commit lines build the same columnar Item as ``_commit_log_items`` and
+    additionally carry ``col_graph`` (the translated art). Filler lines
+    become inert Items (``id='filler:<n>'`` with a unique running ``n``,
+    ``has_children=False``, no ``col_sha``) carrying only ``col_graph`` —
+    ``_parse_id`` classifies them ``other`` so every drill-down / action /
+    preview path already no-ops on them. git's line order (commits and
+    fillers interleaved) is preserved.
+    """
+    args = ['log', '--graph', '--no-color',
+            '--format=\x1f%H\x1f%an\x1f%ar\x1f%s\x1f%D', '-n', str(_log_limit)]
+    args += list(revs)
+    if paths:
+        args += ['--', *paths]
+    result = _run_git(*args)
+    if result.returncode != 0:
+        return _err_item(f'git log failed: {result.stderr.strip()}')
+    items = []
+    filler_n = 0
+    for line in result.stdout.splitlines():
+        parts = line.split('\x1f')
+        if len(parts) > 1:
+            # Commit line: parts[0] is the art, the rest are H/an/ar/s/D.
+            art, sha, author, reldate, subject, deco = parts[:6]
+            item = Item(id=f'commit:{sha}', title=subject, has_children=True)
+            item.col_sha = sha[:7]
+            item.col_author = author
+            item.col_date = reldate
+            item.chips = _parse_decorations(deco)
+            item.col_graph = _graph_translate(art)
+            items.append(item)
+        else:
+            # Filler line: the whole line is graph art (no commit fields).
+            item = Item(id=f'filler:{filler_n}', title='', has_children=False)
+            item.col_graph = _graph_translate(line)
+            items.append(item)
+            filler_n += 1
+    return items
+
+
 def git_row_content(item, ctx):
-    """Columnar content for commit rows: sha | author | date | subject.
+    """Columnar content for commit rows: sha | author | date | [graph] | subject.
 
     Each leading column (short sha yellow, author + relative date dim) is
     left-justified to the widest sibling value (``ctx.max_col_width`` over
     the row's parent group; commits are flat under one parent, so that is a
-    global alignment) and followed by a two-space gap. The ``%D`` decoration
-    chips come next, then the subject (the title) LAST so a narrow pane
+    global alignment) and followed by a two-space gap. In tree mode the
+    commit's ``col_graph`` art follows the date column; then the ``%D``
+    decoration chips, then the subject (the title) LAST so a narrow pane
     truncates the subject rather than the metadata columns.
 
-    Only commit rows carry ``col_sha``; every other row kind
-    (status/stash/ref/file/reflog and the synthetic error / "clean" /
-    "no stashes" rows) lacks it and falls back to the framework default
-    content — keeping their tag chips and trailing decorations unchanged.
-    Only the content region is taken over; chrome (tree indent + ▼/▶) stays
-    framework-owned.
+    A tree-mode FILLER row carries ``col_graph`` but no ``col_sha``: it
+    renders a single blank pad spanning the sha+author+date columns (so its
+    art lines up under the commit rows' graph column) followed by its art.
+
+    Every other row kind (status/stash/ref/file/reflog and the synthetic
+    error / "clean" / "no stashes" rows) carries neither and falls back to
+    the framework default content — keeping their tag chips and trailing
+    decorations unchanged. Only the content region is taken over; chrome
+    (tree indent + ▼/▶) stays framework-owned.
+
+    ``gfg`` (the graph foreground) is the terminal default — ``style('')`` —
+    so the art is monochrome and git's connectors read as plain box lines.
     """
-    if getattr(item, 'col_sha', None) is None:
-        return default_row_content(item, ctx)    # non-commit / synthetic row
     w = ctx.max_col_width
+    gfg, gbold = style('')                          # graph: terminal default
+    if getattr(item, 'col_sha', None) is None:
+        graph = getattr(item, 'col_graph', None)
+        if graph is None:
+            return default_row_content(item, ctx)   # non-commit / synthetic row
+        # Filler row: blank-pad the sha+author+date span, then the art.
+        pad = (w('col_sha') + 2 + w('col_author') + 2 + w('col_date') + 2)
+        return [(' ' * pad, gfg, gbold), (graph, gfg, gbold)]
     yfg, ybold = style('yellow')
     dfg, dbold = style('dim')
     segments = [
@@ -567,6 +706,10 @@ def git_row_content(item, ctx):
         (cell_ljust(item.col_author, w('col_author')) + '  ', dfg, dbold),
         (cell_ljust(item.col_date, w('col_date')) + '  ', dfg, dbold),
     ]
+    # Commit graph art (tree mode) between the date column and the chips.
+    graph = getattr(item, 'col_graph', None)
+    if graph is not None:
+        segments.append((graph + ' ', gfg, gbold))
     # Ref decorations between the date column and the subject.
     for text, stylename in getattr(item, 'chips', None) or ():
         cfg, cbold = style(stylename)
@@ -945,16 +1088,32 @@ def toggle_md(ctx):
     ctx.message(f'message coloring: {"colored" if _MD_COLOR else "raw"}')
 
 
+def toggle_tree(ctx):
+    """``t`` — flip the commit-graph column (``--tree``); re-list the root.
+
+    Toggles ``_tree_mode`` and refreshes the root so the commit log is
+    rebuilt through the now-current builder — adding (or dropping) git's
+    graph column and the interleaved filler rows. Affects commits mode and
+    the branches-mode ref drill-down; other modes ignore the flag.
+    """
+    global _tree_mode
+    _tree_mode = not _tree_mode
+    ctx.message(f'commit graph: {"on" if _tree_mode else "off"}')
+    ctx.refresh()
+
+
 # ---- entry point ---------------------------------------------------------
 
 
 _HELP_INTRO_TMPL = """\
 browse-git — a tig-like browser over a git repository.
 
-Usage: browse-git [-n NUMBER] [--mode NAME] [<rev>…] [-- <path>…]
+Usage: browse-git [-n NUMBER] [--mode NAME] [--tree] [<rev>…] [-- <path>…]
   -n NUMBER     Cap the commit / reflog list to this many entries
                 (default: {default}).
   --mode NAME   Start in one of: {modes}. Default: commits.
+  --tree        Show git's commit-graph column in the commit log
+  --no-tree     (default off; toggle at runtime with 't').
   <rev>…        A rev / sha roots the commits log at it (git log <rev>).
   <path>…       A path filters the commits log to commits touching it.
   -- <path>…    Everything after -- is forced to be a pathspec.
@@ -974,6 +1133,7 @@ The five view modes:
 Keys:
   `         open the mode picker (switch view mode at runtime)
   Enter     flip expand/collapse of the cursor row (never quits)
+  t         toggle the commit-graph column (--tree) in the commit log
   E         edit the real working-tree file in $EDITOR (file/status rows)
   m         toggle md2ansi commit-message coloring (when md2ansi_lib present)
   v         (built-in) page the colored preview / diff in $PAGER
@@ -1032,7 +1192,7 @@ def _window_title():
 
 
 def main():
-    global _browser, _log_limit, _mode
+    global _browser, _log_limit, _mode, _tree_mode
     # git presence + a work tree are preconditions — fail fast before the
     # TUI launches rather than surfacing an in-list error row. Skip the
     # checks when a help token is present so ``--help`` still reaches
@@ -1047,12 +1207,14 @@ def main():
 
     _log_limit = _pop_limit_arg(_LOG_LIMIT)
     requested_mode = _pop_mode_arg()
+    _tree_mode = _pop_tree_arg(_tree_mode)
     _classify_positionals()
     if requested_mode is not None:
         _mode = requested_mode
 
     actions = [
         Action('`', 'Switch view mode', switch_mode, 'none'),
+        Action('t', 'Toggle commit graph (--tree)', toggle_tree, 'none'),
         Action('E', 'Edit working-tree file in $EDITOR', edit_file, 'cursor'),
     ]
     if _md2ansi_fn is not None:
