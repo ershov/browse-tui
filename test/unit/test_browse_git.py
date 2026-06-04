@@ -62,6 +62,18 @@ Coverage (ticket #701 — tree-mode commit graph):
   a tree-off commit row (no ``col_graph``) is byte-identical to before
 * ``_pop_tree_arg``        pops ``--tree`` / ``--no-tree`` (last wins)
 * ``toggle_tree``          flips ``_tree_mode`` and refreshes
+
+Coverage (ticket #702 — skip filler rows on up/down):
+
+* ``_skip_fillers``        on_cursor_change hook: bounces up/down off a
+  filler to the next commit in the travel direction (inferred from the
+  ``cursor_index`` delta sign), reversing at a top/bottom run; no-op when
+  tree-off / non-filler / None; loop-safe across the cursor_to re-fire
+* ``_commit_graph_items``  records its ordered ``(id, is_filler)`` list
+  under the build's namespace in ``_graph_rows_by_ns``; filler ids are
+  namespaced ``filler:<ns>:<n>`` so two drilled-in refs never collide and
+  a bounce resolves into the right ref's commit (concurrent ns entries
+  coexist)
 """
 
 import importlib.util
@@ -953,7 +965,7 @@ class TestCommitGraphItems(unittest.TestCase):
             self._commit_line('* ', sha, 'Alice', '2 days ago',
                               'first subject', 'HEAD -> main'),
         ])
-        items = self.r._commit_graph_items([], [])
+        items = self.r._commit_graph_items([], [], 'root')
         self.assertEqual(len(items), 1)
         it = items[0]
         # Same columnar commit Item as the plain builder…
@@ -974,22 +986,25 @@ class TestCommitGraphItems(unittest.TestCase):
             self._commit_line('* ', sha, 'Bob', '1 hour ago', 'subj', ''),
             '|\\  ',
         ])
-        items = self.r._commit_graph_items([], [])
+        items = self.r._commit_graph_items([], [], 'root')
         self.assertEqual(len(items), 2)
         filler = items[1]
-        self.assertEqual(filler.id, 'filler:0')
+        # Filler ids are namespaced by the build (ns='root' here) then a
+        # per-build running counter.
+        self.assertEqual(filler.id, 'filler:root:0')
         self.assertEqual(filler.title, '')
         self.assertFalse(filler.has_children)
         # No col_sha on a filler (so git_row_content takes the filler path).
         self.assertIsNone(getattr(filler, 'col_sha', None))
         # The whole line is the (translated) art: '|\' -> '│╲'.
         self.assertEqual(filler.col_graph, '│╲')
-        # _parse_id classifies a filler as 'other' (so it no-ops everywhere).
-        self.assertEqual(self.r._parse_id(filler.id), ('other', '0'))
+        # _parse_id partitions on the first ':' so a namespaced filler id is
+        # still kind 'other' (inert everywhere); rest keeps the ns:n tail.
+        self.assertEqual(self.r._parse_id(filler.id), ('other', 'root:0'))
 
     def test_order_preserved_and_filler_indices_run(self):
         # Commits + fillers interleave in git's emitted order; filler ids
-        # carry a unique running index.
+        # carry the build's ns then a unique running index.
         s1 = 'a' * 40
         s2 = 'b' * 40
         self._stub_graph_log([
@@ -998,9 +1013,9 @@ class TestCommitGraphItems(unittest.TestCase):
             self._commit_line('| * ', s2, 'B', 'now', 's2', ''),
             '|/  ',
         ])
-        items = self.r._commit_graph_items([], [])
+        items = self.r._commit_graph_items([], [], 'root')
         self.assertEqual([it.id for it in items], [
-            f'commit:{s1}', 'filler:0', f'commit:{s2}', 'filler:1',
+            f'commit:{s1}', 'filler:root:0', f'commit:{s2}', 'filler:root:1',
         ])
         # The second commit's art keeps its leading lane: '| * ' -> '│ ·'.
         self.assertEqual(items[2].col_graph, '│ ·')
@@ -1010,7 +1025,7 @@ class TestCommitGraphItems(unittest.TestCase):
             return subprocess.CompletedProcess(args, 1, '', 'boom')
 
         self.r._run_git = fake_run_git
-        items = self.r._commit_graph_items([], [])
+        items = self.r._commit_graph_items([], [], 'root')
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0].id, '__error__')
 
@@ -1028,7 +1043,7 @@ class TestCommitGraphItems(unittest.TestCase):
 
         self.r._run_git = fake_run_git
         self.r._log_limit = 42
-        self.r._commit_graph_items(['HEAD~5'], ['src/'])
+        self.r._commit_graph_items(['HEAD~5'], ['src/'], 'root')
         args = captured['args']
         self.assertIn('--graph', args)
         self.assertIn('--no-color', args)
@@ -1047,18 +1062,22 @@ class TestLogItemsRouting(unittest.TestCase):
         self.r = _load_recipe()
 
     def test_routes_to_plain_when_tree_off(self):
+        # Tree off: the plain builder (no namespace) is used; ns is ignored.
         self.r._tree_mode = False
         self.r._commit_log_items = lambda revs, paths: ['PLAIN', revs, paths]
-        self.r._commit_graph_items = lambda revs, paths: ['GRAPH', revs, paths]
-        self.assertEqual(self.r._log_items(['r'], ['p']),
+        self.r._commit_graph_items = (
+            lambda revs, paths, ns: ['GRAPH', revs, paths, ns])
+        self.assertEqual(self.r._log_items(['r'], ['p'], ns='root'),
                          ['PLAIN', ['r'], ['p']])
 
-    def test_routes_to_graph_when_tree_on(self):
+    def test_routes_to_graph_when_tree_on_threading_ns(self):
+        # Tree on: the graph builder is used and the ns is threaded through.
         self.r._tree_mode = True
         self.r._commit_log_items = lambda revs, paths: ['PLAIN', revs, paths]
-        self.r._commit_graph_items = lambda revs, paths: ['GRAPH', revs, paths]
-        self.assertEqual(self.r._log_items(['r'], ['p']),
-                         ['GRAPH', ['r'], ['p']])
+        self.r._commit_graph_items = (
+            lambda revs, paths, ns: ['GRAPH', revs, paths, ns])
+        self.assertEqual(self.r._log_items(['r'], ['p'], ns='ref:feat'),
+                         ['GRAPH', ['r'], ['p'], 'ref:feat'])
 
 
 class TestGitRowContentGraph(unittest.TestCase):
@@ -1107,7 +1126,7 @@ class TestGitRowContentGraph(unittest.TestCase):
         # A filler (col_graph set, no col_sha) blank-pads the sha+author+date
         # span then renders its art; both segments use the graph fg.
         ctx = _FakeCtx(self._widths(sha=7, author=5, date=12))
-        item = self.r.Item(id='filler:0', title='', has_children=False,
+        item = self.r.Item(id='filler:root:0', title='', has_children=False,
                            col_graph='│╲')
         segs = self.r.git_row_content(item, ctx)
         self.assertEqual(len(segs), 2)
@@ -1127,7 +1146,7 @@ class TestGitRowContentGraph(unittest.TestCase):
             id='commit:abc1234', title='c', col_sha='abc1234',
             col_author='Bernard', col_date='3 weeks ago', chips=[],
             col_graph='·')
-        filler = self.r.Item(id='filler:0', title='', has_children=False,
+        filler = self.r.Item(id='filler:root:0', title='', has_children=False,
                              col_graph='│')
         c_segs = self.r.git_row_content(commit, _FakeCtx(widths))
         f_segs = self.r.git_row_content(filler, _FakeCtx(widths))
@@ -1209,6 +1228,275 @@ class TestToggleTree(unittest.TestCase):
         self.assertFalse(self.r._tree_mode)
         self.assertEqual(calls['refresh'], 2)
         self.assertEqual(calls['messages'][-1], 'commit graph: off')
+
+
+class _FakeCursorItem:
+    """An Item stand-in for the cursor: only ``.id`` is read by the hook."""
+
+    def __init__(self, item_id):
+        self.id = item_id
+
+
+class _FakeCursorCtx:
+    """A ``RowContext`` stand-in for the ``on_cursor_change`` hook.
+
+    Exposes the three surfaces ``_skip_fillers`` reads — ``cursor`` (an
+    item with ``.id``), ``cursor_index`` (its position), and ``cursor_to``
+    (records every requested target id in ``moves``). The cursor itself is
+    set from an ``(id, index)`` pair so a test can model the row the cursor
+    rests on independently of where it would move next.
+    """
+
+    def __init__(self, cur_id, cursor_index):
+        self.cursor = _FakeCursorItem(cur_id)
+        self.cursor_index = cursor_index
+        self.moves = []
+
+    def cursor_to(self, id, on_complete=None):
+        self.moves.append(id)
+
+
+class TestSkipFillers(unittest.TestCase):
+    """``_skip_fillers`` bounces up/down off filler rows to the next commit.
+
+    The synthetic ordered list mirrors what ``_commit_graph_items`` records:
+    commits and fillers interleaved in git order, stored in the module dict
+    ``_graph_rows_by_ns`` keyed by build namespace, each value a list of
+    ``(id, is_filler)`` pairs. Filler ids are namespaced (``filler:<ns>:<n>``)
+    so they're globally unique across builds. ``cursor_index`` is only ever
+    used to infer travel direction (sign of the delta from the previous
+    index); the actual neighbour search walks the owning ns's list by id
+    position, never by cursor index.
+    """
+
+    # Ordered build list under ns 'root': commit, filler, filler, commit,
+    # filler, commit. Indices: 0 1 2 3 4 5.
+    _ROWS = [
+        ('commit:aaaa', False),
+        ('filler:root:0', True),
+        ('filler:root:1', True),
+        ('commit:bbbb', False),
+        ('filler:root:2', True),
+        ('commit:cccc', False),
+    ]
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self.r._tree_mode = True
+        self.r._graph_rows_by_ns = {'root': list(self._ROWS)}
+        # Seed prev index to a sentinel that doesn't bias direction; each
+        # test sets it explicitly to model the prior cursor position.
+        self.r._prev_cursor_index = 0
+
+    def test_down_into_single_filler_skips_to_next_commit_below(self):
+        # Was on commit:aaaa (idx 0); pressed down onto filler:root:0 (idx 1).
+        self.r._prev_cursor_index = 0
+        ctx = _FakeCursorCtx('filler:root:0', 1)
+        self.r._skip_fillers(ctx, 'filler:root:0')
+        # Down direction -> next non-filler below filler:root:0 is commit:bbbb.
+        self.assertEqual(ctx.moves, ['commit:bbbb'])
+
+    def test_up_into_single_filler_skips_to_next_commit_above(self):
+        # Lone filler:root:2 (idx 4) reached by pressing up FROM commit:cccc
+        # (5) -> nearest non-filler above is commit:bbbb.
+        self.r._prev_cursor_index = 5
+        ctx = _FakeCursorCtx('filler:root:2', 4)
+        self.r._skip_fillers(ctx, 'filler:root:2')
+        self.assertEqual(ctx.moves, ['commit:bbbb'])
+
+    def test_down_through_run_of_fillers_skips_all(self):
+        # A run of two consecutive fillers. Coming down from commit:aaaa onto
+        # the FIRST filler must skip the whole run to commit:bbbb.
+        self.r._prev_cursor_index = 0
+        ctx = _FakeCursorCtx('filler:root:0', 1)
+        self.r._skip_fillers(ctx, 'filler:root:0')
+        self.assertEqual(ctx.moves, ['commit:bbbb'])
+
+    def test_up_through_run_of_fillers_skips_all(self):
+        # Coming UP from commit:bbbb (idx 3) onto filler:root:1 (idx 2) must
+        # skip back past both fillers to commit:aaaa.
+        self.r._prev_cursor_index = 3
+        ctx = _FakeCursorCtx('filler:root:1', 2)
+        self.r._skip_fillers(ctx, 'filler:root:1')
+        self.assertEqual(ctx.moves, ['commit:aaaa'])
+
+    def test_bottom_edge_filler_reverses_up(self):
+        # A filler that is the LAST row with no commit below it: travelling
+        # down must reverse and land on the nearest commit above.
+        rows = [
+            ('commit:aaaa', False),
+            ('filler:root:0', True),
+            ('filler:root:1', True),
+        ]
+        self.r._graph_rows_by_ns = {'root': rows}
+        # Pressed down (prev 0 -> now 2) onto the trailing filler.
+        self.r._prev_cursor_index = 0
+        ctx = _FakeCursorCtx('filler:root:1', 2)
+        self.r._skip_fillers(ctx, 'filler:root:1')
+        # No commit below -> reverse: nearest commit above is commit:aaaa.
+        self.assertEqual(ctx.moves, ['commit:aaaa'])
+
+    def test_top_edge_filler_reverses_down(self):
+        # A filler that is the FIRST row with no commit above it: travelling
+        # up must reverse and land on the nearest commit below.
+        rows = [
+            ('filler:root:0', True),
+            ('filler:root:1', True),
+            ('commit:bbbb', False),
+        ]
+        self.r._graph_rows_by_ns = {'root': rows}
+        # Pressed up (prev 2 -> now 0) onto the leading filler.
+        self.r._prev_cursor_index = 2
+        ctx = _FakeCursorCtx('filler:root:0', 0)
+        self.r._skip_fillers(ctx, 'filler:root:0')
+        # No commit above -> reverse: nearest commit below is commit:bbbb.
+        self.assertEqual(ctx.moves, ['commit:bbbb'])
+
+    def test_equal_index_defaults_to_down(self):
+        # Defensive: if cursor_index == prev_index (no movement delta), the
+        # direction defaults to +1 (down) per the spec.
+        self.r._prev_cursor_index = 1
+        ctx = _FakeCursorCtx('filler:root:0', 1)
+        self.r._skip_fillers(ctx, 'filler:root:0')
+        self.assertEqual(ctx.moves, ['commit:bbbb'])
+
+    def test_landing_on_commit_records_index_and_no_move(self):
+        # cur_id is a commit (not a filler): the hook must just record the
+        # position (for the NEXT move's direction inference) and never move.
+        self.r._prev_cursor_index = 99
+        ctx = _FakeCursorCtx('commit:bbbb', 3)
+        self.r._skip_fillers(ctx, 'commit:bbbb')
+        self.assertEqual(ctx.moves, [])
+        self.assertEqual(self.r._prev_cursor_index, 3)
+
+    def test_bounce_does_not_update_prev_index(self):
+        # On the bounce fire (cur_id IS a filler), prev_index must NOT be set
+        # to the filler's index — it stays so the non-filler re-fire sets it.
+        self.r._prev_cursor_index = 0
+        ctx = _FakeCursorCtx('filler:root:0', 1)
+        self.r._skip_fillers(ctx, 'filler:root:0')
+        # prev_index unchanged by the bounce (still 0, not the filler's 1).
+        self.assertEqual(self.r._prev_cursor_index, 0)
+
+    def test_no_infinite_loop_reentry_on_nonfiller_refire(self):
+        # Model the framework's async re-fire: cursor_to(commit) settles, the
+        # hook fires AGAIN with the non-filler id at its new index. That
+        # second fire must NOT issue another move (only records position).
+        self.r._prev_cursor_index = 0
+        ctx = _FakeCursorCtx('filler:root:0', 1)
+        self.r._skip_fillers(ctx, 'filler:root:0')
+        self.assertEqual(ctx.moves, ['commit:bbbb'])
+        # Re-fire with the landed-on commit (index 3 in _ROWS).
+        ctx2 = _FakeCursorCtx('commit:bbbb', 3)
+        self.r._skip_fillers(ctx2, 'commit:bbbb')
+        self.assertEqual(ctx2.moves, [])
+        self.assertEqual(self.r._prev_cursor_index, 3)
+
+    def test_tree_off_is_noop_records_index(self):
+        # With tree mode off there are no fillers; even a filler-looking id
+        # is ignored — record the position and return (no move).
+        self.r._tree_mode = False
+        self.r._prev_cursor_index = 99
+        ctx = _FakeCursorCtx('filler:root:0', 1)
+        self.r._skip_fillers(ctx, 'filler:root:0')
+        self.assertEqual(ctx.moves, [])
+        self.assertEqual(self.r._prev_cursor_index, 1)
+
+    def test_none_cur_id_is_noop(self):
+        # A placeholder / scope-root row (cur_id None) just records and
+        # returns — never indexes the ordered list.
+        self.r._prev_cursor_index = 99
+        ctx = _FakeCursorCtx(None, 2)
+        self.r._skip_fillers(ctx, None)
+        self.assertEqual(ctx.moves, [])
+        self.assertEqual(self.r._prev_cursor_index, 2)
+
+    def test_filler_absent_from_any_list_is_noop(self):
+        # Defensive: a filler id present in no ns list (e.g. a stale cursor
+        # after a refresh) can't be located, so no move is issued.
+        self.r._prev_cursor_index = 0
+        ctx = _FakeCursorCtx('filler:gone:9', 1)
+        self.r._skip_fillers(ctx, 'filler:gone:9')
+        self.assertEqual(ctx.moves, [])
+
+    def test_cross_ref_namespaces_do_not_collide(self):
+        # The reviewer's branches-mode scenario: two refs drilled in, each its
+        # own ns. Both builds happen to assign filler:<ns>:0, but the ns makes
+        # the ids distinct, and each list resolves to ITS OWN neighbour commit
+        # — never the other ref's. Lists are kept side by side (a fresh build
+        # of one ref does not clobber the other).
+        self.r._graph_rows_by_ns = {
+            'ref:A': [
+                ('commit:a1', False),
+                ('filler:ref:A:0', True),
+                ('commit:a2', False),
+            ],
+            'ref:B': [
+                ('commit:b1', False),
+                ('filler:ref:B:0', True),
+                ('commit:b2', False),
+            ],
+        }
+        # Bounce DOWN on A's filler -> A's neighbour below (commit:a2), not B's.
+        self.r._prev_cursor_index = 0
+        ctx_a = _FakeCursorCtx('filler:ref:A:0', 1)
+        self.r._skip_fillers(ctx_a, 'filler:ref:A:0')
+        self.assertEqual(ctx_a.moves, ['commit:a2'])
+        # Bounce UP on B's filler -> B's neighbour above (commit:b1), not A's.
+        self.r._prev_cursor_index = 5
+        ctx_b = _FakeCursorCtx('filler:ref:B:0', 1)
+        self.r._skip_fillers(ctx_b, 'filler:ref:B:0')
+        self.assertEqual(ctx_b.moves, ['commit:b1'])
+
+    def test_commit_graph_items_records_list_under_ns(self):
+        # The builder must record its ordered (id, is_filler) list under the
+        # build's ns so the hook can scan it later; filler ids carry the ns.
+        self.r._log_limit = 1000
+        s1 = 'a' * 40
+        s2 = 'b' * 40
+        out = '\n'.join([
+            '\x1f'.join(['* ', s1, 'A', 'now', 's1', '']),
+            '|\\  ',
+            '\x1f'.join(['| * ', s2, 'B', 'now', 's2', '']),
+        ])
+
+        def fake_run_git(*args):
+            if args and args[0] == 'log':
+                return subprocess.CompletedProcess(args, 0, out, '')
+            if args and args[0] == 'remote':
+                return subprocess.CompletedProcess(args, 0, '', '')
+            return subprocess.CompletedProcess(args, 1, '', '')
+
+        self.r._run_git = fake_run_git
+        self.r._graph_rows_by_ns = {}
+        self.r._commit_graph_items([], [], 'ref:feat')
+        self.assertEqual(self.r._graph_rows_by_ns['ref:feat'], [
+            (f'commit:{s1}', False),
+            ('filler:ref:feat:0', True),
+            (f'commit:{s2}', False),
+        ])
+
+    def test_concurrent_builds_keep_separate_entries(self):
+        # Two builds (root + a ref) each write their own ns entry; neither
+        # clobbers the other, so both lists remain available to the hook.
+        self.r._log_limit = 1000
+        s1 = 'a' * 40
+
+        def make_out(sha):
+            return '\x1f'.join(['* ', sha, 'A', 'now', 's', ''])
+
+        def fake_run_git(*args):
+            if args and args[0] == 'log':
+                return subprocess.CompletedProcess(args, 0, make_out(s1), '')
+            if args and args[0] == 'remote':
+                return subprocess.CompletedProcess(args, 0, '', '')
+            return subprocess.CompletedProcess(args, 1, '', '')
+
+        self.r._run_git = fake_run_git
+        self.r._graph_rows_by_ns = {}
+        self.r._commit_graph_items([], [], 'root')
+        self.r._commit_graph_items([], [], 'ref:x')
+        self.assertEqual(set(self.r._graph_rows_by_ns), {'root', 'ref:x'})
 
 
 if __name__ == '__main__':
