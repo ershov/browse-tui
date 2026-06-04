@@ -1,14 +1,22 @@
 #!/usr/bin/env -S browse-tui --run-py
 """browse-md — markdown browser supporting one or more files.
 
-Parses each markdown file on argv into a tree of headings (h1..h6);
+Positionals may be files OR directories: a directory expands to the
+``.md`` / ``.MD`` files directly inside it (non-recursive, sorted by
+name). With no positionals at all the recipe browses the current
+directory (equivalent to ``browse-md .``).
+
+Parses each resulting markdown file into a tree of headings (h1..h6);
 list items under each section can optionally be surfaced as tree
 rows via the ``-l`` / ``--list`` / ``--lists`` flag (default:
 headings only). Per-file roots ARE the top-level entries: with a
 single file the browser opens scoped into that file's headings;
 with multiple files each file shows as a top-level row and the
 framework's ``get_children(None)`` returns the per-file roots in
-argv order.
+argv order. Each top-level row is normally labeled by its bare
+basename; when the final file list spans more than one directory the
+labels go relative to a shared root instead, disambiguating
+same-named files across directories.
 
 Anchor syntax (``FILE.md#name`` / ``FILE.md#<line>``) seeds the
 initial scope so deep links open directly on the targeted section.
@@ -39,7 +47,7 @@ Custom actions on top of the framework defaults:
       sections in one keystroke. The same cascade runs on the
       single-file startup auto-expand.
 
-Usage:  browse-md [-l] FILE.md[#anchor] [FILE.md[#anchor] ...]
+Usage:  browse-md [-l] [FILE.md[#anchor] | DIR ...]
 """
 
 import bisect
@@ -143,7 +151,12 @@ _HEADING_STYLES = {
 _INCLUDE_LISTS = False
 
 
-_USAGE = 'usage: browse-md [-l] FILE.md[#anchor] [FILE.md[#anchor] ...]'
+_USAGE = 'usage: browse-md [-l] [FILE.md[#anchor] | DIR ...]'
+
+# Markdown file extensions recognised when a positional names a directory.
+# A directory argument expands to every direct child with one of these
+# extensions; case is significant, so both spellings are listed.
+_MD_EXTS = ('.md', '.MD')
 
 
 class _FileState:
@@ -713,6 +726,28 @@ def _md_ref_label(abspath, cwd, project_root):
     return _collapse_home(abspath)
 
 
+def _root_label_map(paths):
+    """Map each post-expansion input path to its top-level row label.
+
+    ``paths`` is the abs path of every FINAL (post-expansion) input file.
+    When they all share ONE directory — the common case, including a lone
+    file — labels stay bare basenames (today's single-dir UX). Only once
+    the list spans MORE than one directory do labels go relative, so a
+    flat top-level list disambiguates same-named files across dirs.
+
+    The relative branch anchors every label against ONE shared origin —
+    the cwd's git root (else cwd) — via ``_md_ref_label``, matching how
+    referenced ``.md`` siblings are labeled. ``md_doc`` may be unavailable
+    (optional import), in which case ``project_root`` falls back to cwd.
+    """
+    dirs = {os.path.dirname(p) for p in paths}
+    if len(dirs) <= 1:
+        return {p: os.path.basename(p) for p in paths}
+    cwd = os.getcwd()
+    project_root = (md_doc.find_git_root(cwd) or cwd) if md_doc else cwd
+    return {p: _md_ref_label(p, cwd, project_root) for p in paths}
+
+
 def _md_resolved_refs(text, doc_dir, cwd, project_root):
     """Resolve the ``.md`` refs in ``text`` to existing ``(abspath, label)`` pairs.
 
@@ -1055,6 +1090,11 @@ def _reparse():
     if not input_files and _ROOT_PATH is not None:
         input_files = [(_ROOT_PATH, '')]
 
+    # Per-file root labels: bare basenames when every input shares one
+    # directory (today's UX), else relative paths that disambiguate
+    # same-named files across dirs. Computed once over the final file list.
+    labels = _root_label_map([p for p, _ in input_files])
+
     file_states = []
     for path, _anchor in input_files:
         with open(path, 'r', encoding='utf-8', errors='replace') as f:
@@ -1062,6 +1102,9 @@ def _reparse():
         ls = _line_starts(text)
         events = _parse(text)
         file_root, by_id = _build_nodes(events, text, ls, path)
+        # Override ``_build_nodes``'s basename default with the resolved
+        # per-root label (basename when single-dir, relative otherwise).
+        file_root.title = labels[path]
         # The per-file root carries an expansion arrow when it has headings
         # (set by ``_build_nodes``) OR references at least one existing ``.md``
         # file — so a heading-less file that links to a real ``.md`` is still
@@ -1692,12 +1735,14 @@ def _on_expand(ctx, ids):
 _HELP_INTRO = """\
 browse-md — markdown browser for one or more files.
 
-Usage: browse-md [-l] FILE.md[#anchor] [FILE.md[#anchor] ...]
+Usage: browse-md [-l] [FILE.md[#anchor] | DIR ...]
   -l, --list, --lists  Also surface list items (default: headings).
   FILE.md   One or more markdown files. Each file shows as a
             top-level row in the tree; there is no synthetic root
             above them. With a single file the browser opens scoped
             into that file's headings.
+  DIR       Expands to the ``.md`` / ``.MD`` files directly inside it
+            (non-recursive). No args ⇒ browse ``.``.
   #anchor   Deep-link target — 0-based line number or heading name
             (exact / prefix / substring tiers; first hit wins). When
             multiple files carry anchors, the FIRST anchored file in
@@ -1715,6 +1760,82 @@ Usage: browse-md [-l] FILE.md[#anchor] [FILE.md[#anchor] ...]
           per-file / cross-file rules as V).
   Ctrl-R  Re-slurp every input file and rebuild the tree.\
 """
+
+
+def _dir_md_files(dirpath):
+    """Abs paths of the markdown files directly inside ``dirpath``.
+
+    Non-recursive: only entries whose extension is in ``_MD_EXTS`` and
+    that are files (subdirectories and non-markdown files are ignored).
+    Returned as absolute paths sorted by name so a directory argument
+    expands to a stable, alphabetical top-level list.
+    """
+    out = []
+    for entry in os.scandir(dirpath):
+        if not entry.is_file():
+            continue
+        if os.path.splitext(entry.name)[1] in _MD_EXTS:
+            out.append(os.path.abspath(entry.path))
+    out.sort(key=os.path.basename)
+    return out
+
+
+def _collect_input_files(positionals):
+    """Resolve raw positionals into ``(input_files, anchor, anchor_path)``.
+
+    For each raw positional token, in order:
+
+      * If the token (verbatim — checked BEFORE any ``#`` split, so a real
+        file whose name contains ``#`` is unaffected) names a directory,
+        expand it to its direct markdown files via ``_dir_md_files``, each
+        paired with an empty anchor (directories never carry an anchor).
+      * Otherwise split once on the first ``#`` into ``(file_part, anchor)``
+        and validate ``file_part`` resolves to an existing file; ``_die`` on
+        a missing path, echoing the user's raw token.
+
+    Paths are deduped by abspath, first-seen order preserved. "First anchor
+    wins" is tracked across the whole expanded list: the first non-empty
+    anchor (and its owning path) is recorded, later anchors ignored. An
+    empty aggregate (e.g. an empty directory) is an error.
+
+    Returns ``(input_files, first_anchor, first_anchor_path)`` where
+    ``input_files`` is a list of ``(abs_path, anchor)`` pairs.
+    """
+    input_files = []
+    seen = set()
+    first_anchor = ''
+    first_anchor_path = None
+
+    def _add(path, anchor):
+        nonlocal first_anchor, first_anchor_path
+        if path in seen:
+            return
+        seen.add(path)
+        input_files.append((path, anchor))
+        if anchor and first_anchor_path is None:
+            first_anchor = anchor
+            first_anchor_path = path
+
+    for raw in positionals:
+        # Directory check runs on the RAW token (before any ``#`` split)
+        # so a real file whose name contains ``#`` is unaffected.
+        raw_path = os.path.abspath(os.path.expanduser(raw))
+        if os.path.isdir(raw_path):
+            for path in _dir_md_files(raw_path):
+                _add(path, '')
+            continue
+        # Not a directory: split once on the first ``#`` for the anchor.
+        file_part, sep, anchor = raw.partition('#')
+        anchor = anchor if sep else ''
+        path = os.path.abspath(os.path.expanduser(file_part))
+        if not os.path.isfile(path):
+            # Echo the user's raw token so the error names what they typed.
+            _die(f'no such file or directory: {raw}', with_usage=False)
+        _add(path, anchor)
+
+    if not input_files:
+        _die('no markdown files to browse')
+    return input_files, first_anchor, first_anchor_path
 
 
 def _die(msg, *, with_usage=True):
@@ -1785,32 +1906,17 @@ def main():
         if tok.startswith('-') and tok != '-':
             _die(f'unrecognised option: {tok}')
     positionals = [t for t in leftover if not (t.startswith('-') and t != '-')]
+    # No positionals ⇒ browse the current directory (``browse-md .``).
     if not positionals:
-        _die('missing FILE.md[#anchor]')
+        positionals = ['.']
 
-    # Walk every positional, split into (file_part, anchor) at the
-    # first ``#``, validate the file exists, and collect into the
-    # argv-ordered ``_INPUT_FILES`` list of (abs_path, anchor) pairs.
-    # The first anchored entry (if any) seeds ``_ANCHOR`` for the
-    # initial-scope resolution downstream.
-    input_files = []
-    first_anchor = ''
-    first_anchor_path = None
-    for raw in positionals:
-        # Split once on the first ``#`` — anything after is the anchor.
-        file_part, sep, anchor = raw.partition('#')
-        anchor = anchor if sep else ''
-        path = os.path.abspath(os.path.expanduser(file_part))
-        if not os.path.isfile(path):
-            # Echo the user's INPUT (pre-expanduser, pre-abspath) so
-            # the error names exactly what they typed.
-            _die(f'no such file: {file_part}', with_usage=False)
-        input_files.append((path, anchor))
-        # "First anchor wins" — record the first non-empty anchor and
-        # its owning path; subsequent anchors are ignored.
-        if anchor and first_anchor_path is None:
-            first_anchor = anchor
-            first_anchor_path = path
+    # Resolve every positional into the argv-ordered ``_INPUT_FILES``
+    # list of (abs_path, anchor) pairs: directories expand to their
+    # direct markdown files, plain tokens split on the first ``#`` for
+    # an anchor. The first anchored entry (if any) seeds ``_ANCHOR`` for
+    # the initial-scope resolution downstream.
+    input_files, first_anchor, first_anchor_path = _collect_input_files(
+        positionals)
 
     _INPUT_FILES = input_files
     _ANCHOR = first_anchor
