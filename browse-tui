@@ -4044,6 +4044,12 @@ def default_row(item, ctx):
     return chrome + default_row_content(item, ctx)
 
 
+# Default info-bar hint line. Shared between ``BrowserConfig.hint``
+# (and ``Browser._hint``) and ``render_info_bar``'s fallback so the
+# literal lives in exactly one place.
+DEFAULT_HINT = ' /:search  ?:help  q:quit '
+
+
 @dataclass
 class BrowserConfig:
     """Construction parameters for :class:`Browser`.
@@ -4054,6 +4060,10 @@ class BrowserConfig:
     reads the fields once, after firing those hooks.
     """
     title: str = 'browse-tui'
+    # Info-bar hint line (the ` /:search  ?:help  q:quit ` text). Recipes
+    # set it to surface their own action keys; mutable at runtime via
+    # ``Browser.set_hint`` / ``Context.set_hint``.
+    hint: str = DEFAULT_HINT
     get_children: Optional[Callable[[Any], Any]] = None
     get_preview: Optional[Callable[[Any], Optional[str]]] = None
     actions: Optional[list] = None
@@ -4323,6 +4333,9 @@ class Browser:
         # stays None -- the preview worker treats None as "always returns
         # ''" rather than calling a no-op lambda needlessly.
         self.title = config.title
+        # Info-bar hint line — read once here; mutated thereafter via the
+        # thread-safe ``set_hint``. The renderer reads ``self.hint``.
+        self._hint = config.hint
         self.get_children = config.get_children or (lambda _id, *, reload=False: [])
         self.get_preview = config.get_preview
         # actions/on_enter are stored opaquely in phase 1;
@@ -5742,6 +5755,31 @@ class Browser:
     def clear_search(self) -> None:
         """(thread-safe) Drop the search query; alias for ``set_search_query('')``."""
         self.set_search_query('')
+
+    # ---- info-bar hint --------------------------------------------------
+
+    @property
+    def hint(self) -> str:
+        """The info-bar hint line (``' /:search  ?:help  q:quit '`` default).
+
+        The grey text the renderer shows on the left of the info bar in
+        normal mode. Search / filter prompts temporarily replace it.
+        Recipes can rewrite it to advertise their own action keys.
+        """
+        return self._hint
+
+    def set_hint(self, text: str) -> None:
+        """(thread-safe) Replace the info-bar hint line with ``text``.
+
+        Repaints the info bar on the next drain. Has no effect while a
+        search / filter prompt is open, since the prompt text takes the
+        same slot — the new hint reappears once the prompt closes.
+        """
+        new_hint = '' if text is None else str(text)
+        def _do():
+            self._hint = new_hint
+            self._needs_redraw.add('info')
+        self.post(_do)
 
     # ---- scope ----------------------------------------------------------
 
@@ -9084,6 +9122,22 @@ def _reconcile_pane_caches(browser, layout):
 
     for name, rect in cache_rects.items():
         cache = browser._pane_cache.setdefault(name, PaneCache())
+        # Visible→hidden transition (#718): the pane held a real rect on
+        # the previous frame and is absent this frame. The renderers only
+        # paint a pane when its rect is non-None, so nothing would clear
+        # the rows it just vacated — they stay stale unless a neighbour
+        # happens to grow over them AND gets repainted this frame (true
+        # for cursor moves, which mark all panes dirty, but NOT for paths
+        # like ``update_data`` that flag only list/children). Blank the
+        # vacated cells here, the single per-frame site that already owns
+        # the layout→cache mapping and runs inside the sync region for
+        # both render_full and render_partial. ``isinstance(..., Rect)``
+        # excludes the disappeared-pane sentinel (a real prior geometry
+        # is always a Rect) so an already-hidden pane is a no-op.
+        prev = cache.rect
+        if rect is None and isinstance(prev, Rect):
+            for row in range(prev.top, prev.bottom):
+                clear_columns(row, prev.left, prev.right)
         cache.update_rect(rect)
 
 
@@ -11251,9 +11305,10 @@ def render_info_bar(row, cols, label, *, info=False, browser=None,
         reset_style()
         set_style(fg=8)
     elif info and pos < cols:
-        # Hint text — kept generic; phase-3 ticket #32 will let recipes
-        # surface their own action keys here.
-        hints = ' /:search  ?:help  q:quit '
+        # Hint text — recipe-overridable via ``Browser.set_hint`` /
+        # ``Context.set_hint``. Fall back to the shared default so a
+        # browser without the attribute still renders the stock hint.
+        hints = getattr(browser, 'hint', DEFAULT_HINT)
         avail = cols - pos - len(label_str) - 3
         if avail > 10:
             h = hints[:avail]
@@ -12015,6 +12070,22 @@ class Context:
         return self._browser.clear_search()
 
     @property
+    def hint(self) -> str:
+        """The info-bar hint line.
+
+        Pass-through to :attr:`Browser.hint`. Defaults to
+        ``' /:search  ?:help  q:quit '``.
+        """
+        return self._browser.hint
+
+    def set_hint(self, text: str) -> None:
+        """Replace the info-bar hint line.
+
+        Pass-through to :meth:`Browser.set_hint`. Repaints the info bar.
+        """
+        return self._browser.set_hint(text)
+
+    @property
     def scope(self):
         """Current scope id, or ``None`` at the root.
 
@@ -12693,13 +12764,56 @@ def _pick_on_info_bar(browser, label, options, *, _read_key=None):
         ``prev_top`` (note: ``prev_top`` is the preview's *separator*
         row in the regular renderer; the picker repurposes it as the
         first option row, which is fine because exiting the picker
-        always sets ``_needs_redraw = {'all'}`` so the next render
-        repaints the separator over the leftover row).
+        drops the per-pane row cache and requests a full redraw, so the
+        next render re-emits the separator over the leftover row).
 
-    On exit (enter or esc) we mark the layout dirty so the main loop
-    repaints the regular UI on its next pass.
+    On exit (enter or esc) ``_restore`` invalidates the row cache and
+    marks the layout dirty so the main loop fully repaints the regular
+    UI on its next pass (the picker drew directly to the screen, so a
+    plain ``'all'`` request alone would cache-hit and skip the cells the
+    picker overdrew).
     """
     rk = _read_key if _read_key is not None else read_key
+
+    def _restore():
+        # Repaint the regular UI over the picker overlay. Two facts make
+        # this more than a plain ``_needs_redraw`` flag:
+        #
+        #   1. The picker drew its prompt + options with direct
+        #      ``move``/``write``/``clear_columns`` calls that bypass the
+        #      per-pane row cache. That cache still holds the pre-picker
+        #      UI content for those cells, so the next ``render_full``
+        #      cache-hits (identical buffered bytes, unchanged rect) and
+        #      emits nothing — the overlay survives. Dropping the row
+        #      cache forces an unconditional re-emit (same recovery the
+        #      screen-lost / resume paths use after an external overdraw).
+        #
+        #   2. With a freshly-cleared cache the renderer takes the
+        #      "first paint" branch, which emits NO trailing clear — it
+        #      assumes the cells below the content are already blank.
+        #      That holds at startup / after a real screen reset, but NOT
+        #      here: the picker left option text on the preview's blank
+        #      rows, so a content-only repaint would leave the last few
+        #      options (e.g. a trailing ``wontfix``) on screen. Blank the
+        #      whole preview pane + info bar first so the assumption is
+        #      true again.
+        cols, rows_total = term_size()
+        layout = layout_panes(
+            cols, rows_total,
+            split=getattr(browser, 'split', 'h'),
+            show_preview=browser.show_preview,
+            list_ratio=browser.list_ratio,
+        )
+        preview_rect = layout.get('preview')
+        info_bar = layout.get('info_bar')
+        if preview_rect is not None:
+            for row in range(preview_rect.top, preview_rect.bottom):
+                clear_columns(row, preview_rect.left, preview_rect.right)
+        if info_bar is not None:
+            clear_columns(info_bar.top, info_bar.left,
+                          info_bar.left + info_bar.width)
+        browser._pane_cache.clear()
+        browser._needs_redraw.add('all')
 
     filter_query = ''
     cursor = 0
@@ -12816,11 +12930,11 @@ def _pick_on_info_bar(browser, label, options, *, _read_key=None):
                 cursor = len(visible) - 1
         elif key == 'enter':
             if visible:
-                browser._needs_redraw.add('all')
+                _restore()
                 return visible[cursor]
             # No matches; ignore enter.
         elif key in ('esc', 'ctrl-c'):
-            browser._needs_redraw.add('all')
+            _restore()
             return None
         elif key == 'backspace':
             if filter_query:

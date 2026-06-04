@@ -78,9 +78,11 @@ Coverage (ticket #702 — skip filler rows on up/down):
 """
 
 import importlib.util
+import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import types
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -361,6 +363,99 @@ class TestClassifyPositionals(unittest.TestCase):
         revs, paths = self._run('-h')
         self.assertEqual(revs, [])
         self.assertEqual(paths, [])
+
+
+@unittest.skipUnless(shutil.which('git'), 'git not available')
+class TestPopRepoDir(unittest.TestCase):
+    """``_pop_repo_dir`` redirects the cwd into a leading repo-dir positional.
+
+    Uses real throwaway repos (the helper shells out to ``git rev-parse
+    --show-toplevel``) and restores ``sys.argv`` / the cwd after each test.
+    """
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self._orig_argv = sys.argv
+        self._orig_cwd = os.getcwd()
+
+    def tearDown(self):
+        sys.argv = self._orig_argv
+        os.chdir(self._orig_cwd)
+
+    @staticmethod
+    def _make_repo():
+        d = tempfile.mkdtemp()
+        env = {**os.environ,
+               'GIT_AUTHOR_NAME': 'T', 'GIT_AUTHOR_EMAIL': 't@t',
+               'GIT_COMMITTER_NAME': 'T', 'GIT_COMMITTER_EMAIL': 't@t'}
+        subprocess.run(['git', '-C', d, 'init', '-q'], check=True,
+                       capture_output=True, env=env)
+        subprocess.run(['git', '-C', d, 'commit', '-q', '--allow-empty',
+                        '-m', 'c0'], check=True, capture_output=True, env=env)
+        return os.path.realpath(d)
+
+    def _run(self, *args):
+        sys.argv = ['browse-git', *args]
+        self.r._pop_repo_dir()
+        return sys.argv[1:]
+
+    def test_repo_dir_from_non_repo_cwd_chdirs_and_drops_arg(self):
+        repo = self._make_repo()
+        nonrepo = tempfile.mkdtemp()
+        os.chdir(nonrepo)
+        rest = self._run(repo)
+        self.assertEqual(rest, [])
+        self.assertEqual(os.path.realpath(os.getcwd()), repo)
+
+    def test_other_repo_dir_redirects_and_keeps_trailing_args(self):
+        repo_a = self._make_repo()
+        repo_b = self._make_repo()
+        os.chdir(repo_a)
+        rest = self._run(repo_b, 'HEAD')
+        # The dir is consumed; the trailing rev stays for _classify_positionals.
+        self.assertEqual(rest, ['HEAD'])
+        self.assertEqual(os.path.realpath(os.getcwd()), repo_b)
+
+    def test_subdir_of_current_repo_stays_pathspec(self):
+        repo = self._make_repo()
+        sub = os.path.join(repo, 'sub')
+        os.mkdir(sub)
+        os.chdir(repo)
+        rest = self._run('sub')
+        # Same toplevel -> no redirect; the arg is left as a pathspec filter.
+        self.assertEqual(rest, ['sub'])
+        self.assertEqual(os.path.realpath(os.getcwd()), repo)
+
+    def test_after_double_dash_is_never_a_repo_dir(self):
+        repo = self._make_repo()
+        nonrepo = tempfile.mkdtemp()
+        os.chdir(nonrepo)
+        rest = self._run('--', repo)
+        self.assertEqual(rest, ['--', repo])
+        self.assertEqual(os.path.realpath(os.getcwd()), os.path.realpath(nonrepo))
+
+    def test_leading_flag_is_skipped_dir_still_honored(self):
+        repo = self._make_repo()
+        nonrepo = tempfile.mkdtemp()
+        os.chdir(nonrepo)
+        rest = self._run('-x', repo)
+        self.assertEqual(rest, ['-x'])
+        self.assertEqual(os.path.realpath(os.getcwd()), repo)
+
+    def test_non_repo_dir_arg_stays_pathspec(self):
+        repo = self._make_repo()
+        plain = tempfile.mkdtemp()
+        os.chdir(repo)
+        rest = self._run(plain)
+        self.assertEqual(rest, [plain])
+        self.assertEqual(os.path.realpath(os.getcwd()), repo)
+
+    def test_leading_rev_is_not_a_repo_dir(self):
+        repo = self._make_repo()
+        os.chdir(repo)
+        rest = self._run('HEAD')
+        self.assertEqual(rest, ['HEAD'])
+        self.assertEqual(os.path.realpath(os.getcwd()), repo)
 
 
 class TestParseDecorations(unittest.TestCase):

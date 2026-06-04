@@ -2781,6 +2781,12 @@ def default_row(item, ctx):
     return chrome + default_row_content(item, ctx)
 
 
+# Default info-bar hint line. Shared between ``BrowserConfig.hint``
+# (and ``Browser._hint``) and ``render_info_bar``'s fallback so the
+# literal lives in exactly one place.
+DEFAULT_HINT = ' /:search  ?:help  q:quit '
+
+
 @dataclass
 class BrowserConfig:
     """Construction parameters for :class:`Browser`.
@@ -2791,6 +2797,10 @@ class BrowserConfig:
     reads the fields once, after firing those hooks.
     """
     title: str = 'browse-tui'
+    # Info-bar hint line (the ` /:search  ?:help  q:quit ` text). Recipes
+    # set it to surface their own action keys; mutable at runtime via
+    # ``Browser.set_hint`` / ``Context.set_hint``.
+    hint: str = DEFAULT_HINT
     get_children: Optional[Callable[[Any], Any]] = None
     get_preview: Optional[Callable[[Any], Optional[str]]] = None
     actions: Optional[list] = None
@@ -3060,6 +3070,9 @@ class Browser:
         # stays None -- the preview worker treats None as "always returns
         # ''" rather than calling a no-op lambda needlessly.
         self.title = config.title
+        # Info-bar hint line — read once here; mutated thereafter via the
+        # thread-safe ``set_hint``. The renderer reads ``self.hint``.
+        self._hint = config.hint
         self.get_children = config.get_children or (lambda _id, *, reload=False: [])
         self.get_preview = config.get_preview
         # actions/on_enter are stored opaquely in phase 1;
@@ -4479,6 +4492,31 @@ class Browser:
     def clear_search(self) -> None:
         """(thread-safe) Drop the search query; alias for ``set_search_query('')``."""
         self.set_search_query('')
+
+    # ---- info-bar hint --------------------------------------------------
+
+    @property
+    def hint(self) -> str:
+        """The info-bar hint line (``' /:search  ?:help  q:quit '`` default).
+
+        The grey text the renderer shows on the left of the info bar in
+        normal mode. Search / filter prompts temporarily replace it.
+        Recipes can rewrite it to advertise their own action keys.
+        """
+        return self._hint
+
+    def set_hint(self, text: str) -> None:
+        """(thread-safe) Replace the info-bar hint line with ``text``.
+
+        Repaints the info bar on the next drain. Has no effect while a
+        search / filter prompt is open, since the prompt text takes the
+        same slot — the new hint reappears once the prompt closes.
+        """
+        new_hint = '' if text is None else str(text)
+        def _do():
+            self._hint = new_hint
+            self._needs_redraw.add('info')
+        self.post(_do)
 
     # ---- scope ----------------------------------------------------------
 

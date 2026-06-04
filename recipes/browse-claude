@@ -3371,7 +3371,7 @@ _TREE_CACHE = {}   # path → TreeData
 _SCAN_LOCKS = {}            # path → threading.Lock
 _SCAN_LOCKS_LOCK = threading.Lock()
 _TREE_MODE = True  # default; --no-tree CLI flag or 't' action flips it.
-_FILTER_VOICE_ONLY = False  # default; --no-show-all flag or 'h' flips it.
+_FILTER_VOICE_ONLY = True  # default; --show-all flag or '.' flips it.
 
 
 # Live-tail worker state, keyed by .jsonl path. The worker resumes
@@ -5775,6 +5775,10 @@ def _focus_latest_voice_when_ready(b, target_jsonl):
         # cursor_to.
         ancestors = _ancestor_ids_for(last_id) if _TREE_MODE else []
         _chain_expand_then_cursor(b, ancestors, last_id)
+    # Claim the scope_root's cursor-on-open landing so the generic
+    # ``on_expand`` jump steps aside for the deeper focus below (#720).
+    # Registered before the owning ``expand`` fires its hook.
+    _DEFERRED_FOCUS_SCOPE_ROOT.add(target_jsonl)
     b.expand(target_jsonl).then(_fire)
 
 
@@ -5867,6 +5871,16 @@ def _on_scope_change(ctx, scope_id, prev_scope_id, direction):
 # composition.
 _AWAITING_VOICE_JUMP = set()
 
+# Session scope_root ids whose cursor-on-open landing is owned by
+# ``_focus_latest_voice_when_ready`` (the no-``--item`` deferred focus).
+# ``_on_expand`` skips its single-level jump-to-latest-voice for these so
+# it doesn't race the focus's deeper landing and strand the cursor on a
+# not-yet-streamed umbrella (#720). Populated before the owning expand
+# fires; only the startup scope_root is ever added. Consumed (discarded)
+# by ``_on_expand`` on that first expand so a later manual collapse +
+# re-expand of the scope_root still drills in normally.
+_DEFERRED_FOCUS_SCOPE_ROOT = set()
+
 
 def _jump_to_latest_voice(ctx, item_id):
     """Move the cursor to the latest voice among ``item_id``'s children.
@@ -5921,9 +5935,39 @@ def _on_expand(ctx, ids):
     This replaces the old ``→`` override's ``ctx.expand(id).then(_land)``
     chain, which only fired for an expand the recipe itself issued —
     the hook composition fires for user-driven keyboard expansion too.
+
+    Exception — the scope_root the deferred startup focus owns (#720):
+    when launched without ``--item``, ``_focus_latest_voice_when_ready``
+    drives its own cursor-on-open jump for the session scope_root,
+    landing on the *deepest* latest message (walking the ancestor
+    umbrellas). That same scope_root expand also fires this hook, whose
+    single-level ``_jump_to_latest_voice`` targets the top-level umbrella
+    instead — so two jumps race through the post queue, and when the
+    umbrella jump wins last the cursor strands on a ``<prompt>`` umbrella
+    whose heavy streaming preview hasn't composed yet (a blank pane until
+    the cascade lands). ``_focus_latest_voice_when_ready`` records the
+    scope_root it owns in ``_DEFERRED_FOCUS_SCOPE_ROOT``; we skip the
+    jump for that id and let the deep-landing focus win. The cross-file
+    preview upgrade above still applies (the scope_root must go heavy).
+    With ``--item`` (no deferred focus) the set is empty, so the
+    scope_root keeps its latest-voice landing as before.
+
+    The claim is **consumed once**: we discard the id as we skip it, so
+    only the FIRST (startup) expand of that scope_root is suppressed. A
+    later *manual* collapse + re-expand of the scope_root row (``nav-left``
+    drops it from ``expanded``, ``nav-right`` → ``ctx.expand`` fires this
+    hook again) must drill in to the latest voice like any other row — a
+    persistent claim would suppress that legitimate jump forever. Add-
+    before-the-owning-expand ordering guarantees the id is present when
+    the startup ``_on_expand`` runs, so the startup jump is still
+    suppressed; consuming here is robust whether ``_fire`` proceeds or
+    cancels (both ride the same ``b.expand(target_jsonl)`` resolution).
     """
     for id in ids:
         _invalidate_if_cross_file(id)
+        if id in _DEFERRED_FOCUS_SCOPE_ROOT:
+            _DEFERRED_FOCUS_SCOPE_ROOT.discard(id)
+            continue
         if ctx.cached_children(id) is not None:
             _jump_to_latest_voice(ctx, id)
         else:
@@ -6154,9 +6198,9 @@ Usage: browse-claude [OPTIONS] [PROJECT]
   --tree          Show sessions as a tree, grouped by turn (default).
                   Subagents nest inline under their assistant rows.
   --no-tree       Show sessions as a flat reverse-time list.
-  --show-all      Show every record (default).
-  --no-show-all   Start in voice-only mode (hide tool calls, system
-                  records, etc.; press 'h' to toggle).
+  --show-all      Show every record (tool calls, system records, etc.).
+  --no-show-all   Start in voice-only mode, hiding tool calls / system
+                  records (default; press '.' to toggle).
   PROJECT         Project directory name under ~/.claude/projects/ to
                   drill into on launch. Ignored when --session / --pid /
                   --file is given.
@@ -6172,7 +6216,7 @@ a transcript with Right/Alt-Down; preview shows the rendered turn.
   M       render the preview via $MD2ANSI / md2ansi (external).
   J / K   jump cursor to next / previous user-or-assistant voice.
   t       toggle flat / tree view.
-  h       toggle voice-only filter (hide tool calls / machinery).\
+  .       toggle voice-only filter (hide tool calls / machinery).\
 """
 
 
@@ -6200,7 +6244,9 @@ def main():
     elif no_tree_flag:
         _TREE_MODE = False
 
-    # Voice-only filter (--show-all wins over --no-show-all if both passed).
+    # Voice-only filter: on by default. --show-all turns it off; the
+    # --no-show-all flag is a redundant no-op kept for explicitness, and
+    # --show-all wins over --no-show-all when both are passed.
     show_all_flag    = _pop_flag('--show-all')
     no_show_all_flag = _pop_flag('--no-show-all')
     if show_all_flag:
@@ -6315,7 +6361,7 @@ def main():
             Action('J',     'Jump to next voice (user/asst)',  _action_next_voice,  'none'),
             Action('K',     'Jump to prev voice (user/asst)',  _action_prev_voice,  'none'),
             Action('t',     'Toggle flat / tree view',         _action_toggle_tree, 'none'),
-            Action('h',     'Toggle voice-only filter',        _action_toggle_filter, 'none'),
+            Action('.',     'Toggle voice-only filter',        _action_toggle_filter, 'none'),
             # Right: the framework default expands a collapsed row; the
             # ``on_expand`` / ``on_children_loaded`` hooks then jump the
             # cursor to the latest voice (for every expansion source, not

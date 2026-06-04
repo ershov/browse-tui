@@ -1281,6 +1281,16 @@ class TestTreeChildrenPreview(unittest.TestCase):
     def setUpClass(cls):
         cls.r = _load_recipe()
 
+    def setUp(self):
+        # These tests assert the full "show everything" baseline (incl.
+        # non-voice tool rows), so pin the voice-only filter OFF — it's
+        # on by default and would otherwise hide that content.
+        self._saved_FILTER = self.r._FILTER_VOICE_ONLY
+        self.r._FILTER_VOICE_ONLY = False
+
+    def tearDown(self):
+        self.r._FILTER_VOICE_ONLY = self._saved_FILTER
+
     def _write_jsonl(self, records):
         import json as _json
         import tempfile
@@ -3534,7 +3544,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
                              'subagent transcript')
 
     def test_tool_umbrella_for_agent_dispatch_passes_voice_filter(self):
-        # The voice-only filter (`h` key) must keep <tool:Agent> rows
+        # The voice-only filter (`.` key) must keep <tool:Agent> rows
         # visible when they wrap a resolvable subagent — the umbrella
         # carries the subagent voice stripe, so filtering them out
         # would hide the visual cue.
@@ -3545,11 +3555,12 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             self.r._scan_tree(sess)
             tool_id = f'{sess}#tool:1'
             # With voice-only filter ON, the <tool:Agent> id passes.
+            saved = self.r._FILTER_VOICE_ONLY
             self.r._FILTER_VOICE_ONLY = True
             try:
                 self.assertTrue(self.r._passes_filter(tool_id))
             finally:
-                self.r._FILTER_VOICE_ONLY = False
+                self.r._FILTER_VOICE_ONLY = saved
 
     def test_tool_umbrella_for_bash_filtered_out_in_voice_only(self):
         # Non-Agent tool (e.g. Bash) — no voice content, no subagent
@@ -3575,11 +3586,12 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             self.r._TREE_CACHE.clear()
             self.r._scan_tree(sess)
             tool_id = f'{sess}#tool:1'
+            saved = self.r._FILTER_VOICE_ONLY
             self.r._FILTER_VOICE_ONLY = True
             try:
                 self.assertFalse(self.r._passes_filter(tool_id))
             finally:
-                self.r._FILTER_VOICE_ONLY = False
+                self.r._FILTER_VOICE_ONLY = saved
 
     def test_umbrella_preview_omits_chrome_even_after_direct_leaf_visit(self):
         # Regression: previously, when a leaf had been visited directly
@@ -3629,7 +3641,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
 
     def test_toggle_filter_drops_preview_cache_for_synthetic_row(self):
         # Regression #4 (user-reported): on a freshly-opened jsonl,
-        # cursor on the synthetic top row, pressing `h` (toggle
+        # cursor on the synthetic top row, pressing `.` (toggle
         # voice-only filter) must drop the cached preview so the
         # umbrella is re-streamed against the new filter.
         #
@@ -3663,6 +3675,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             self.r._TREE_CACHE.clear()
 
             # With filter OFF, the umbrella body contains both records.
+            saved = self.r._FILTER_VOICE_ONLY
             self.r._FILTER_VOICE_ONLY = False
             try:
                 with_all = ''.join(self.r._preview_umbrella(sess))
@@ -3685,7 +3698,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
                     'tool_use record from the umbrella preview',
                 )
             finally:
-                self.r._FILTER_VOICE_ONLY = False
+                self.r._FILTER_VOICE_ONLY = saved
 
     def test_focus_latest_voice_when_ready_jumps_after_load(self):
         # _focus_latest_voice_when_ready chains:
@@ -3837,6 +3850,272 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
                 )
             finally:
                 self.r.visible_items = saved_vi
+
+    def _make_two_turn_session(self, tmp):
+        """A session whose tree has two ``<prompt>`` umbrellas.
+
+        ``_latest_voice_among_children(sess)`` resolves to the *second*
+        umbrella (latest top-level voice), which is the row the generic
+        ``on_expand`` jump would land on — distinct from the deep latest
+        message the dedicated startup focus targets.
+        """
+        import json as _json
+        proj = os.path.join(tmp, '-x')
+        os.makedirs(proj)
+        sess = os.path.join(proj, 'sess.jsonl')
+        recs = [
+            {'type': 'user', 'uuid': 'u1', 'parentUuid': None,
+             'promptId': 'P1',
+             'message': {'role': 'user', 'content': 'TURN1_USER'}},
+            {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+             'message': {'role': 'assistant',
+                         'content': [{'type': 'text',
+                                      'text': 'TURN1_REPLY'}]}},
+            {'type': 'user', 'uuid': 'u2', 'parentUuid': 'a1',
+             'promptId': 'P2',
+             'message': {'role': 'user', 'content': 'TURN2_USER'}},
+            {'type': 'assistant', 'uuid': 'a2', 'parentUuid': 'u2',
+             'message': {'role': 'assistant',
+                         'content': [{'type': 'text',
+                                      'text': 'TURN2_REPLY'}]}},
+        ]
+        with open(sess, 'w') as f:
+            for r in recs:
+                f.write(_json.dumps(r) + '\n')
+        return sess
+
+    def test_on_expand_does_not_jump_on_scope_root(self):
+        """#720: the scope_root's startup expand must NOT fire a
+        competing jump-to-latest-voice.
+
+        Two cursor-on-open jumps fire for the session scope_root opening:
+        ``_focus_latest_voice_when_ready`` (deep latest message, the
+        intended landing) and the generic ``on_expand`` hook
+        (``_jump_to_latest_voice`` → the latest *top-level* umbrella).
+        They race through the post queue; when the umbrella jump wins
+        the cursor strands on a ``<prompt>`` umbrella whose heavy
+        streaming preview hasn't composed yet, leaving the preview pane
+        blank. The fix: ``_focus_latest_voice_when_ready`` records the
+        scope_root it owns in ``_DEFERRED_FOCUS_SCOPE_ROOT``, and
+        ``_on_expand`` skips its jump for that id, letting the deep
+        landing win. The cross-file preview upgrade still fires.
+        """
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._make_two_turn_session(tmp)
+            self.r._TREE_CACHE.clear()
+            saved_mode = self.r._TREE_MODE
+            self.r._TREE_MODE = True
+            calls = {'cursor_to': [], 'invalidate': []}
+
+            class _FakeBrowser:
+                _state = type('S', (), {'scope_stack': [sess],
+                                        'expanded': set()})()
+                def get_item(self, _id):
+                    return None
+                def invalidate_preview(self, id_):
+                    calls['invalidate'].append(id_)
+
+            class _Ctx:
+                state = type('S', (), {'expanded': set()})()
+                def cached_children(self, _id):
+                    # Children ARE cached (immediate-jump branch); the
+                    # fix must suppress regardless of cache state.
+                    return [object()]
+                def cursor_to(self, id_):
+                    calls['cursor_to'].append(id_)
+
+            saved_browser = self.r._BROWSER
+            self.r._BROWSER = _FakeBrowser()
+            # Simulate _focus_latest_voice_when_ready claiming the
+            # scope_root's landing (the no-``--item`` path).
+            self.r._DEFERRED_FOCUS_SCOPE_ROOT.add(sess)
+            self.addCleanup(self.r._DEFERRED_FOCUS_SCOPE_ROOT.discard, sess)
+            try:
+                # Sanity: the competing target exists and is a top-level
+                # umbrella (NOT the scope_root itself).
+                latest = self.r._latest_voice_among_children(sess)
+                self.assertIsNotNone(latest)
+                self.assertNotEqual(latest, sess)
+                self.assertIn('#prompt:', latest)
+
+                self.r._on_expand(_Ctx(), [sess])
+
+                # No competing jump for the scope_root.
+                self.assertEqual(
+                    calls['cursor_to'], [],
+                    'on_expand must not jump-to-latest-voice for the '
+                    'scope_root the deferred focus owns',
+                )
+                # And the scope_root must NOT be parked for a deferred
+                # jump either.
+                self.assertNotIn(sess, self.r._AWAITING_VOICE_JUMP)
+                # The cross-file preview upgrade still fires (scope_root
+                # must go heavy).
+                self.assertIn(sess, calls['invalidate'])
+            finally:
+                self.r._BROWSER = saved_browser
+                self.r._TREE_MODE = saved_mode
+                self.r._AWAITING_VOICE_JUMP.discard(sess)
+                self.r._DEFERRED_FOCUS_SCOPE_ROOT.discard(sess)
+
+    def test_on_expand_scope_root_claim_is_consumed_once(self):
+        """#720: the deferred-focus claim is one-shot.
+
+        The startup ``on_expand`` of the scope_root is suppressed (the
+        focus owns that landing), but the claim must be CONSUMED so a
+        later *manual* collapse + re-expand of the scope_root row drills
+        in to the latest voice normally. A persistent claim would
+        suppress that legitimate jump for the process lifetime — the
+        regression the consume-once discard fixes.
+        """
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._make_two_turn_session(tmp)
+            self.r._TREE_CACHE.clear()
+            saved_mode = self.r._TREE_MODE
+            self.r._TREE_MODE = True
+            calls = {'cursor_to': []}
+
+            class _FakeBrowser:
+                _state = type('S', (), {'scope_stack': [sess],
+                                        'expanded': set()})()
+                def get_item(self, _id):
+                    return None
+                def invalidate_preview(self, id_):
+                    pass
+
+            class _Ctx:
+                state = type('S', (), {'expanded': set()})()
+                def cached_children(self, _id):
+                    return [object()]
+                def cursor_to(self, id_):
+                    calls['cursor_to'].append(id_)
+
+            saved_browser = self.r._BROWSER
+            self.r._BROWSER = _FakeBrowser()
+            # Focus claims the scope_root's startup landing.
+            self.r._DEFERRED_FOCUS_SCOPE_ROOT.add(sess)
+            self.addCleanup(self.r._DEFERRED_FOCUS_SCOPE_ROOT.discard, sess)
+            ctx = _Ctx()
+            try:
+                # 1st expand (startup) — suppressed AND the claim is
+                # consumed.
+                self.r._on_expand(ctx, [sess])
+                self.assertEqual(
+                    calls['cursor_to'], [],
+                    'startup scope_root expand must be suppressed',
+                )
+                self.assertNotIn(
+                    sess, self.r._DEFERRED_FOCUS_SCOPE_ROOT,
+                    'the claim must be consumed on the first expand',
+                )
+                # 2nd expand (manual re-expand) — drills in normally now.
+                self.r._on_expand(ctx, [sess])
+                expected = self.r._latest_voice_among_children(sess)
+                self.assertIsNotNone(expected)
+                self.assertEqual(
+                    calls['cursor_to'], [expected],
+                    'a manual re-expand of the scope_root must jump to '
+                    'the latest voice (claim was consumed)',
+                )
+            finally:
+                self.r._BROWSER = saved_browser
+                self.r._TREE_MODE = saved_mode
+                self.r._AWAITING_VOICE_JUMP.discard(sess)
+
+    def test_on_expand_scope_root_jumps_when_focus_not_active(self):
+        """#720 guard: with no deferred focus (``--item`` launch) the
+        scope_root keeps its latest-voice landing.
+
+        ``_DEFERRED_FOCUS_SCOPE_ROOT`` is empty when launched with
+        ``--item`` (no ``_focus_latest_voice_when_ready``). The generic
+        ``on_expand`` jump must then still land the scope_root on its
+        latest top-level voice, preserving the long-standing flat-mode
+        behavior (e.g. the SendMessage round-trip UI tests).
+        """
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._make_two_turn_session(tmp)
+            self.r._TREE_CACHE.clear()
+            saved_mode = self.r._TREE_MODE
+            self.r._TREE_MODE = True
+            calls = {'cursor_to': []}
+
+            class _FakeBrowser:
+                _state = type('S', (), {'scope_stack': [sess],
+                                        'expanded': set()})()
+                def get_item(self, _id):
+                    return None
+                def invalidate_preview(self, id_):
+                    pass
+
+            class _Ctx:
+                state = type('S', (), {'expanded': set()})()
+                def cached_children(self, _id):
+                    return [object()]
+                def cursor_to(self, id_):
+                    calls['cursor_to'].append(id_)
+
+            saved_browser = self.r._BROWSER
+            self.r._BROWSER = _FakeBrowser()
+            # No deferred-focus claim — the --item launch path.
+            self.r._DEFERRED_FOCUS_SCOPE_ROOT.discard(sess)
+            try:
+                self.r._on_expand(_Ctx(), [sess])
+                expected = self.r._latest_voice_among_children(sess)
+                self.assertIsNotNone(expected)
+                self.assertEqual(calls['cursor_to'], [expected])
+            finally:
+                self.r._BROWSER = saved_browser
+                self.r._TREE_MODE = saved_mode
+
+    def test_on_expand_still_jumps_on_non_scope_umbrella(self):
+        """#720 guard: suppressing the scope_root jump must not break the
+        jump for a normal umbrella expansion.
+
+        Expanding a ``<prompt>`` umbrella (not claimed by the deferred
+        focus) must still land the cursor on its latest voice — the
+        signature drill-in gesture is unchanged.
+        """
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._make_two_turn_session(tmp)
+            self.r._TREE_CACHE.clear()
+            saved_mode = self.r._TREE_MODE
+            self.r._TREE_MODE = True
+            umbrella = f'{sess}#prompt:2'  # turn-2 umbrella (TURN2_USER)
+            calls = {'cursor_to': []}
+
+            class _FakeBrowser:
+                _state = type('S', (), {'scope_stack': [sess],
+                                        'expanded': set()})()
+                def get_item(self, _id):
+                    return None
+                def invalidate_preview(self, id_):
+                    pass
+
+            class _Ctx:
+                state = type('S', (), {'expanded': set()})()
+                def cached_children(self, _id):
+                    return [object()]
+                def cursor_to(self, id_):
+                    calls['cursor_to'].append(id_)
+
+            saved_browser = self.r._BROWSER
+            self.r._BROWSER = _FakeBrowser()
+            # The scope_root claim must not suppress a different id.
+            self.r._DEFERRED_FOCUS_SCOPE_ROOT.add(sess)
+            self.addCleanup(self.r._DEFERRED_FOCUS_SCOPE_ROOT.discard, sess)
+            try:
+                self.r._on_expand(_Ctx(), [umbrella])
+                # The umbrella's latest voice must be landed on.
+                expected = self.r._latest_voice_among_children(umbrella)
+                self.assertIsNotNone(expected)
+                self.assertEqual(calls['cursor_to'], [expected])
+            finally:
+                self.r._BROWSER = saved_browser
+                self.r._TREE_MODE = saved_mode
 
     def test_scan_tree_serializes_concurrent_callers(self):
         # Two threads calling _scan_tree on the same path concurrently
@@ -4955,8 +5234,9 @@ class TestSummariseTitles(unittest.TestCase):
 
 
 class TestVoiceOnlyFilter(unittest.TestCase):
-    """``h`` hotkey + ``--no-show-all`` filter: hide everything that
-    isn't voice or a subagent umbrella.
+    """``.`` hotkey + ``--show-all`` filter: hide everything that
+    isn't voice or a subagent umbrella. Voice-only is the default;
+    ``--show-all`` is the escape hatch that turns it off.
 
     Predicate lives in ``_passes_filter`` and is consulted by every
     Item builder. Toggle emits a single ``mod`` batch — the framework's
@@ -5511,20 +5791,35 @@ class TestVoiceOnlyFilter(unittest.TestCase):
 
     # ---- CLI + help -----------------------------------------------------
 
-    def test_help_text_mentions_h_hotkey(self):
-        self.assertIn(' h ', self.r._HELP_INTRO_TMPL,
-                      'help intro should list the h hotkey')
+    def test_help_text_mentions_dot_hotkey(self):
+        self.assertIn(' .  ', self.r._HELP_INTRO_TMPL,
+                      'help intro should list the . hotkey')
         self.assertIn('--show-all', self.r._HELP_INTRO_TMPL)
         self.assertIn('--no-show-all', self.r._HELP_INTRO_TMPL)
+        # The old 'h' hotkey is gone from the help intro.
+        self.assertNotIn(' h ', self.r._HELP_INTRO_TMPL,
+                         "the 'h' hotkey should no longer appear")
 
-    def test_h_action_registered(self):
-        # Sanity: the recipe registers an 'h' action with the expected
-        # handler. We can't run the full main() under unit test (it
-        # touches argv / stdin) — inspect the source for the binding.
+    def test_dot_action_registered(self):
+        # Sanity: the recipe registers a '.' action with the expected
+        # handler (and no longer an 'h' one). We can't run the full
+        # main() under unit test (it touches argv / stdin) — inspect the
+        # source for the binding.
         with open(_RECIPE) as f:
             source = f.read()
-        self.assertIn("Action('h',", source)
+        self.assertIn("Action('.',", source)
         self.assertIn('_action_toggle_filter', source)
+        self.assertNotIn(
+            "Action('h',", source,
+            "the 'h' binding for the voice-only filter should be gone")
+
+    def test_filter_voice_only_default_is_on(self):
+        # Voice-only is the default at module load; --show-all is the
+        # escape hatch that turns it off.
+        with open(_RECIPE) as f:
+            source = f.read()
+        self.assertIn('_FILTER_VOICE_ONLY = True', source)
+        self.assertNotIn('_FILTER_VOICE_ONLY = False  #', source)
 
 
 # ---- #424: composer ↔ framework cache integration ----------------------
@@ -5669,11 +5964,17 @@ class TestUmbrellaPreviewCacheIntegration(unittest.TestCase):
     def setUp(self):
         self._saved_BROWSER = self.r._BROWSER
         self._saved_TREE_MODE = self.r._TREE_MODE
+        self._saved_FILTER = self.r._FILTER_VOICE_ONLY
         self.r._TREE_MODE = True
+        # These tests assert the full "show everything" baseline (incl.
+        # non-voice tool rows), so pin the voice-only filter OFF — it's
+        # on by default and would otherwise hide that content.
+        self.r._FILTER_VOICE_ONLY = False
 
     def tearDown(self):
         self.r._BROWSER = self._saved_BROWSER
         self.r._TREE_MODE = self._saved_TREE_MODE
+        self.r._FILTER_VOICE_ONLY = self._saved_FILTER
         # Drop the recipe-level tree cache so each test gets a fresh
         # scan of its synthetic .jsonl.
         self.r._TREE_CACHE.clear()

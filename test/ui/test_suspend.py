@@ -12,10 +12,10 @@ Two complementary flows:
 
   * ``test_sigstop_then_sigcont_via_fg_pid`` (phase 2, ticket #25) —
     direct SIGSTOP from outside the process. SIGSTOP cannot be caught,
-    so the process freezes mid-syscall with no cleanup. SIGCONT routes
-    through ``_handle_sigcont`` which re-enters raw mode and sets the
-    resize flag, so the next loop iteration repaints. The test asserts
-    that the screen is identical pre- and post-suspend.
+    so the process freezes mid-syscall with no cleanup. The job is then
+    resumed through bash job control (``fg``), which routes a SIGCONT
+    through ``_handle_sigcont``. The test asserts the two observable
+    state transitions: SIGSTOP -> stopped ('T'), resume -> running.
 """
 
 import os
@@ -46,6 +46,24 @@ def _proc_state(pid):
         ['ps', '-o', 'stat=', '-p', str(pid)],
         capture_output=True, text=True).stdout.strip()
     return out[:1] if out else ''
+
+
+def _wait_state(pid, accept, timeout=2.0, interval=0.02):
+    """Poll until ``_proc_state(pid)`` is one of ``accept``; return bool.
+
+    Synchronises on the kernel's reported process state rather than a
+    fixed sleep, so SIGSTOP/SIGCONT round-trips are deterministic.
+    ``accept`` is a string of acceptable single-char states, e.g. ``'T'``
+    for stopped or ``'SRD'`` for any running state (sleeping / on-CPU /
+    uninterruptible disk wait).
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        st = _proc_state(pid)
+        if st and st in accept:
+            return True
+        time.sleep(interval)
+    return False
 
 
 class TestSuspend(unittest.TestCase):
@@ -94,27 +112,31 @@ class TestSuspend(unittest.TestCase):
             t.wait_for(re.compile(r'(?m)^\$ *$'), timeout=3.0)
 
     def test_sigstop_then_sigcont_via_fg_pid(self):
-        """SIGSTOP can't be caught — process freezes mid-syscall.
+        """External SIGSTOP stops the job; ``fg`` resumes it via SIGCONT.
 
-        SIGCONT resumes; the SIGCONT handler in 020-terminal re-enters
-        raw mode + alt-screen and sets ``g_resize_flag``. This test
-        bypasses the SIGTSTP handler (Ctrl-Z's clean-suspend path) by
-        sending SIGSTOP directly to the foreground browse-tui PID via
-        the fixture's ``fg_pid()`` helper.
+        This exercises the SIGCONT path *without* going through the
+        SIGTSTP handler (Ctrl-Z's clean-suspend path — covered by
+        ``test_ctrl_z_then_fg_round_trip``): SIGSTOP is sent directly to
+        the foreground browse-tui PID via the fixture's ``fg_pid()``
+        helper, so the process freezes mid-syscall with no handler run.
 
-        We verify three observable signals of the round-trip:
+        We verify the two observable state transitions:
           1. SIGSTOP transitions the process into the stopped state ('T').
-          2. SIGCONT transitions it back to running ('S').
-          3. The TUI is interactive afterwards — ``fg`` then ``q`` returns
-             cleanly to the bash prompt.
+          2. ``fg`` resumes it and the process returns to a running state.
 
-        Note: with bash as parent, sending SIGSTOP causes bash's
-        job-control to write a "Stopped" notice to the tty, so a strict
-        screen-equality assertion is not feasible without help from the
-        SIGCONT handler (which also does not currently issue a
-        ``notify_wake``). The state-transition + clean-quit checks above
-        are the strongest behavioural guarantees we can make against the
-        current implementation.
+        Resume MUST go through bash job control (``fg``), not a bare
+        ``os.kill(pid, SIGCONT)``. The launch line is a pipeline
+        (``printf … | browse-tui``), so browse-tui's process group is
+        NOT the terminal's foreground group while bash sits at its
+        prompt. A bare SIGCONT to that *background* group lets
+        ``_handle_sigcont``'s ``tcsetattr``/terminal writes draw
+        SIGTTOU (default disposition: stop), which intermittently
+        RE-STOPS the process — the historical flake (it would stay 'T'
+        and the poll for 'S' would time out). ``fg`` makes the group the
+        terminal's foreground group *before* delivering SIGCONT, so the
+        handler's terminal I/O is legal and no SIGTTOU fires. We also
+        accept any running state (S/R/D), not just 'S', so a process
+        that happens to be on-CPU at poll time isn't misread as stuck.
 
         Uses direct ``send_line`` (not ``bash -c``) so browse-tui is a
         one-level child of bash and ``fg_pid()`` returns the python3
@@ -139,30 +161,23 @@ class TestSuspend(unittest.TestCase):
                              f'fg_pid returned {comm!r}, expected python3')
 
             # 1. SIGSTOP → process freezes mid-syscall, no handler runs.
+            #    Poll until the kernel reports it stopped.
             t.signal(signal.SIGSTOP)
-            deadline = time.time() + 1.0
-            while time.time() < deadline:
-                if _proc_state(pid) == 'T':
-                    break
-                time.sleep(0.02)
-            else:
-                self.fail('process did not enter stopped state after SIGSTOP')
+            self.assertTrue(
+                _wait_state(pid, 'T', timeout=2.0),
+                'process did not enter stopped state after SIGSTOP')
 
-            # 2. SIGCONT → handler in 020-terminal runs (re-enters raw
-            #    mode), process returns to running state.
-            t.signal(signal.SIGCONT)
-            deadline = time.time() + 2.0
-            while time.time() < deadline:
-                if _proc_state(pid) == 'S':
-                    break
-                time.sleep(0.02)
-            else:
-                self.fail('process did not return to sleeping state after SIGCONT')
+            # Wait for bash's job-control "Stopped" notice so the job is
+            # registered as stopped before we resume it. This also makes
+            # ``fg`` deterministic: it has a stopped job to foreground.
+            t.wait_for('Stopped', timeout=3.0)
 
-            # 3. Interactive afterwards: ``fg`` foregrounds the job and
-            #    ``q`` quits cleanly. This proves the SIGCONT handler
-            #    didn't leave the process wedged or crashed — the main
-            #    loop is still reading keys and the action layer
-            #    responds.
+            # 2. Resume via bash job control. ``fg`` makes the job's
+            #    process group the terminal's foreground group, THEN
+            #    sends SIGCONT — so ``_handle_sigcont`` re-enters raw
+            #    mode without tripping SIGTTOU. The process must return
+            #    to a running state (any of sleeping/running/disk-wait).
             t.fg()
-            t.wait_for(re.compile(r'(?m)^\$ *$'), timeout=5.0)
+            self.assertTrue(
+                _wait_state(pid, 'SRD', timeout=3.0),
+                'process did not return to a running state after fg/SIGCONT')

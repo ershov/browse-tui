@@ -382,6 +382,22 @@ def _reconcile_pane_caches(browser, layout):
 
     for name, rect in cache_rects.items():
         cache = browser._pane_cache.setdefault(name, PaneCache())
+        # Visible→hidden transition (#718): the pane held a real rect on
+        # the previous frame and is absent this frame. The renderers only
+        # paint a pane when its rect is non-None, so nothing would clear
+        # the rows it just vacated — they stay stale unless a neighbour
+        # happens to grow over them AND gets repainted this frame (true
+        # for cursor moves, which mark all panes dirty, but NOT for paths
+        # like ``update_data`` that flag only list/children). Blank the
+        # vacated cells here, the single per-frame site that already owns
+        # the layout→cache mapping and runs inside the sync region for
+        # both render_full and render_partial. ``isinstance(..., Rect)``
+        # excludes the disappeared-pane sentinel (a real prior geometry
+        # is always a Rect) so an already-hidden pane is a no-op.
+        prev = cache.rect
+        if rect is None and isinstance(prev, Rect):
+            for row in range(prev.top, prev.bottom):
+                clear_columns(row, prev.left, prev.right)
         cache.update_rect(rect)
 
 
@@ -2549,9 +2565,10 @@ def render_info_bar(row, cols, label, *, info=False, browser=None,
         reset_style()
         set_style(fg=8)
     elif info and pos < cols:
-        # Hint text — kept generic; phase-3 ticket #32 will let recipes
-        # surface their own action keys here.
-        hints = ' /:search  ?:help  q:quit '
+        # Hint text — recipe-overridable via ``Browser.set_hint`` /
+        # ``Context.set_hint``. Fall back to the shared default so a
+        # browser without the attribute still renders the stock hint.
+        hints = getattr(browser, 'hint', DEFAULT_HINT)
         avail = cols - pos - len(label_str) - 3
         if avail > 10:
             h = hints[:avail]

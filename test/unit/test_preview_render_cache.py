@@ -48,6 +48,7 @@ _state._sanitize_preview = _render._sanitize_preview
 _render.Item = _data.Item
 _render.PreviewRender = _data.PreviewRender
 _render.Mode = _state.Mode
+_render.DEFAULT_HINT = _state.DEFAULT_HINT
 _render.VisibleEntry = _state.VisibleEntry
 _render.PaneCache = _state.PaneCache
 _render.visible_items = _state.visible_items

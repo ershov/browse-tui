@@ -196,7 +196,10 @@ class TestBrowseClaude(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             _make_fake_claude(tmp)
             with TmuxFixture(cols=120, rows=30, env=self._launch_env(tmp)) as t:
-                t.launch(_BIN, '--run-py', _RECIPE)
+                # --show-all: the fixture's records (last-prompt,
+                # permission-mode) are machinery the voice-only default
+                # would hide; this test asserts every per-line record.
+                t.launch(_BIN, '--run-py', _RECIPE, '--show-all')
                 t.wait_for('/home/test/project')
                 t.send('Right')
                 t.wait_for('abcd1234-deadbeef')
@@ -663,23 +666,31 @@ class TestBrowseClaude(unittest.TestCase):
                 t.launch(_BIN, '--run-py', _RECIPE,
                          '--tree', '--file', sess)
                 t.wait_for('PROBE_TURN2_REPLY', timeout=3.0)
-                # Capture cursor row's preview-pane body BEFORE toggle.
-                cap_tree = t.capture()
-                self.assertIn('PROBE_TURN2_REPLY', cap_tree)
+                # We synchronise on observable state transitions rather
+                # than a fixed sleep, so the assertion never races a
+                # mid-toggle repaint (or the async child-load that backs
+                # the tree rebuild) under load. Each toggle:
+                #   1. wait for a MODE-SPECIFIC marker that is absent in
+                #      the other mode — proves the toggle was processed
+                #      (not a stale pre-toggle frame). Tree mode shows
+                #      ``<prompt>`` turn-root markers; flat mode replaces
+                #      them with collapsed subagent rows (``[Explore``).
+                #   2. wait for PROBE_TURN2_REPLY — proves the cursor's
+                #      message re-rendered (the tree expand briefly shows
+                #      a ``⧗ loading…`` placeholder before children land).
+                self.assertIn('<prompt>', t.capture())
                 # Flip to flat — preview should still target the same
-                # message (PROBE_TURN2_REPLY). The structure changes
-                # (no ▼ tree markers under the scope row in flat).
+                # message (PROBE_TURN2_REPLY).
                 t.send('t')
-                # Wait long enough for refresh + cursor_to to land.
-                import time
-                time.sleep(0.15)
-                cap_flat = t.capture()
+                t.wait_for('[Explore', timeout=3.0)
+                cap_flat = t.wait_for('PROBE_TURN2_REPLY', timeout=3.0)
                 self.assertIn('PROBE_TURN2_REPLY', cap_flat,
                               f'cursor lost on tree→flat: {cap_flat[:400]!r}')
-                # Flip back to tree.
+                # Flip back to tree — the ``<prompt>`` turn-root marker
+                # returns once the tree view is rebuilt.
                 t.send('t')
-                time.sleep(0.15)
-                cap_back = t.capture()
+                t.wait_for('<prompt>', timeout=3.0)
+                cap_back = t.wait_for('PROBE_TURN2_REPLY', timeout=3.0)
                 self.assertIn('PROBE_TURN2_REPLY', cap_back,
                               f'cursor lost on flat→tree: {cap_back[:400]!r}')
                 t.send('q')
@@ -936,7 +947,10 @@ class TestBrowseClaude(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             _make_fake_claude(tmp, with_subagents=True)
             with TmuxFixture(cols=140, rows=30, env=self._launch_env(tmp)) as t:
-                t.launch(_BIN, '--run-py', _RECIPE, '--no-tree')
+                # --show-all: the navigation below counts on all 3 record
+                # rows being visible; the voice-only default would hide
+                # the two machinery records and break the Up-press math.
+                t.launch(_BIN, '--run-py', _RECIPE, '--no-tree', '--show-all')
                 t.wait_for('/home/test/project')
                 t.send('Right')
                 t.wait_for('abcd1234-deadbeef')
@@ -1009,7 +1023,10 @@ class TestBrowseClaude(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             _make_fake_claude(tmp, relocated=True)
             with TmuxFixture(cols=140, rows=30, env=self._launch_env(tmp)) as t:
-                t.launch(_BIN, '--run-py', _RECIPE, '--no-tree')
+                # --show-all: the navigation below counts on every record
+                # row being visible; the voice-only default would hide the
+                # machinery rows and break the Up-press math.
+                t.launch(_BIN, '--run-py', _RECIPE, '--no-tree', '--show-all')
                 t.wait_for('/home/test/project')
                 t.send('Right')
                 t.wait_for('abcd1234-deadbeef')
@@ -1031,15 +1048,19 @@ class TestBrowseClaude(unittest.TestCase):
                 t.send('q')
 
 
-    def test_h_toggle_hides_non_voice_rows(self):
-        """Pressing 'h' hides non-voice umbrellas and leaves in tree mode.
+    def test_dot_toggle_hides_non_voice_rows(self):
+        """Pressing '.' hides non-voice umbrellas and leaves in tree mode.
 
         Fixture has a user voice (``PROBE_VOICE``) and one assistant
         tool_use (``PROBE_TOOL_CALL``). Under ``--tree``, the tool wraps
         in a ``<tool:Bash>`` umbrella that is **not** voice-bearing
-        (pure tool_use, no text), so after ``h`` the umbrella row and
+        (pure tool_use, no text), so after ``.`` the umbrella row and
         its leaf both disappear and the preview composes only from the
         voice content.
+
+        Boots with ``--show-all`` so both rows are visible up front
+        (voice-only is now the default); ``.`` then flips into the
+        filtered view.
         """
         import json as _json
         with tempfile.TemporaryDirectory() as tmp:
@@ -1060,18 +1081,19 @@ class TestBrowseClaude(unittest.TestCase):
                          'input': {'command': 'PROBE_TOOL_CALL'}},
                     ]}},
                 ) + '\n')
-            import time
             with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
                 t.launch(_BIN, '--run-py', _RECIPE,
-                         '--tree', '--file', sess)
+                         '--tree', '--show-all', '--file', sess)
                 t.wait_for('PROBE_VOICE', timeout=3.0)
                 t.wait_for('PROBE_TOOL_CALL', timeout=3.0)
-                t.send('h')
-                # Allow the mod batch + preview re-fetch to settle.
-                time.sleep(0.4)
+                t.send('.')
+                # Synchronise on the observable transition: the tool row
+                # is the only thing that changes, so wait until the
+                # repaint settles, then assert it is gone. PROBE_VOICE is
+                # our anchor that the list still rendered.
+                cap = t.wait_stable(timeout=3.0)
                 # PROBE_VOICE survives in the (still-visible) prompt
                 # umbrella and the user-voice leaf.
-                cap = t.capture()
                 self.assertIn('PROBE_VOICE', cap)
                 # PROBE_TOOL_CALL should be gone from list AND preview
                 # (preview respects ``hidden`` on children).
@@ -1081,8 +1103,49 @@ class TestBrowseClaude(unittest.TestCase):
                                  + cap[-1000:])
                 t.send('q')
 
-    def test_h_toggle_round_trip_restores_view(self):
-        """``h h`` round-trip restores the original visible list."""
+    def test_h_no_longer_toggles_filter(self):
+        """The old 'h' hotkey is unbound: pressing it must NOT filter.
+
+        Boots with ``--show-all`` so the non-voice tool row is visible,
+        presses 'h', and confirms the tool row is still present (the
+        binding moved to '.').
+        """
+        import json as _json
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, '.claude', 'projects', '-home-test-hnop')
+            os.makedirs(proj)
+            sess = os.path.join(proj, 'hnop.jsonl')
+            with open(sess, 'w') as f:
+                f.write(_json.dumps({
+                    'type': 'user', 'uuid': 'u1',
+                    'message': {'role': 'user', 'content': 'PROBE_HNOP_VOICE'},
+                }) + '\n')
+                f.write(_json.dumps({
+                    'type': 'assistant', 'uuid': 'a1',
+                    'parentUuid': 'u1',
+                    'message': {'role': 'assistant', 'content': [
+                        {'type': 'tool_use', 'id': 't1',
+                         'name': 'Bash',
+                         'input': {'command': 'PROBE_HNOP_TOOL'}},
+                    ]}},
+                ) + '\n')
+            with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE,
+                         '--tree', '--show-all', '--file', sess)
+                t.wait_for('PROBE_HNOP_VOICE', timeout=3.0)
+                t.wait_for('PROBE_HNOP_TOOL', timeout=3.0)
+                t.send('h')
+                # Let any (incorrect) repaint settle, then confirm the
+                # tool row is STILL there — 'h' is a no-op now.
+                cap = t.wait_stable(timeout=3.0)
+                self.assertIn('PROBE_HNOP_TOOL', cap,
+                              "'h' must not toggle the voice-only filter; "
+                              'tool row should still be visible. got: '
+                              + cap[-1000:])
+                t.send('q')
+
+    def test_dot_toggle_round_trip_restores_view(self):
+        """``. .`` round-trip restores the original visible list."""
         import json as _json
         with tempfile.TemporaryDirectory() as tmp:
             proj = os.path.join(tmp, '.claude', 'projects', '-home-test-hrt')
@@ -1102,23 +1165,59 @@ class TestBrowseClaude(unittest.TestCase):
                          'input': {'command': 'PROBE_RT_TOOL'}},
                     ]}},
                 ) + '\n')
-            import time
             with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
                 t.launch(_BIN, '--run-py', _RECIPE,
-                         '--tree', '--file', sess)
+                         '--tree', '--show-all', '--file', sess)
                 t.wait_for('PROBE_RT_VOICE', timeout=3.0)
                 t.wait_for('PROBE_RT_TOOL', timeout=3.0)
-                t.send('h')
-                time.sleep(0.4)
-                cap_on = t.capture()
+                t.send('.')
+                cap_on = t.wait_stable(timeout=3.0)
                 self.assertNotIn('PROBE_RT_TOOL', cap_on,
                                  'filter on: tool should be hidden')
-                t.send('h')
-                time.sleep(0.4)
-                cap_off = t.capture()
+                t.send('.')
+                # The tool row reappearing is the deterministic signal
+                # that the second toggle was processed.
+                cap_off = t.wait_for('PROBE_RT_TOOL', timeout=3.0)
                 self.assertIn('PROBE_RT_VOICE', cap_off)
                 self.assertIn('PROBE_RT_TOOL', cap_off,
                               'filter off: tool should be visible again')
+                t.send('q')
+
+    def test_default_boot_is_voice_only(self):
+        """Launching with no filter flag boots straight into voice-only.
+
+        Voice-only is now the default (#716): a non-voice tool row is
+        hidden on boot without any ``--no-show-all`` flag.
+        """
+        import json as _json
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, '.claude', 'projects', '-home-test-defv')
+            os.makedirs(proj)
+            sess = os.path.join(proj, 'defv.jsonl')
+            with open(sess, 'w') as f:
+                f.write(_json.dumps({
+                    'type': 'user', 'uuid': 'u1',
+                    'message': {'role': 'user', 'content': 'PROBE_DEF_VOICE'},
+                }) + '\n')
+                f.write(_json.dumps({
+                    'type': 'assistant', 'uuid': 'a1',
+                    'parentUuid': 'u1',
+                    'message': {'role': 'assistant', 'content': [
+                        {'type': 'tool_use', 'id': 't1',
+                         'name': 'Bash',
+                         'input': {'command': 'PROBE_DEF_TOOL'}},
+                    ]}},
+                ) + '\n')
+            with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
+                # No --show-all / --no-show-all: rely on the default.
+                t.launch(_BIN, '--run-py', _RECIPE,
+                         '--tree', '--file', sess)
+                t.wait_for('PROBE_DEF_VOICE', timeout=3.0)
+                cap = t.wait_stable(timeout=3.0)
+                self.assertNotIn('PROBE_DEF_TOOL', cap,
+                                 'tool row should be hidden on default boot '
+                                 '(voice-only is the default); got: '
+                                 + cap[-800:])
                 t.send('q')
 
     def test_cursor_lands_on_last_voice_in_large_file(self):
@@ -1182,7 +1281,12 @@ class TestBrowseClaude(unittest.TestCase):
                 t.send('q')
 
     def test_no_show_all_starts_in_filtered_mode(self):
-        """``--no-show-all`` boots straight into the voice-only view."""
+        """``--no-show-all`` boots straight into the voice-only view.
+
+        Voice-only is the default now (#716), so this flag is a
+        redundant no-op — but it must still resolve to the filtered
+        view rather than accidentally toggling it off.
+        """
         import json as _json
         with tempfile.TemporaryDirectory() as tmp:
             proj = os.path.join(tmp, '.claude', 'projects', '-home-test-cli')
@@ -1317,11 +1421,16 @@ class TestBrowseClaude(unittest.TestCase):
                 # Drill into the outbound row's preview: header + markdown.
                 # Cursor lands on the latest voice (the reply, bottom row);
                 # K walks up to the outbound SendMessage voice row.
+                # Synchronise on PROBE_SEND_BODY: it lives only in the
+                # SendMessage ``message`` field, so it appears solely in
+                # the preview once the cursor reaches the outbound row —
+                # unlike ``→ PROBE_WORKER_7`` which is also in the list
+                # row and would match before the preview rendered.
                 t.send('K')
-                cap2 = t.wait_for('→ PROBE_WORKER_7', timeout=3.0)
-                self.assertIn('PROBE_SEND_BODY', cap2,
-                              'outbound preview should render message '
-                              'markdown; got: ' + cap2[-1200:])
+                cap2 = t.wait_for('PROBE_SEND_BODY', timeout=3.0)
+                self.assertIn('→ PROBE_WORKER_7', cap2,
+                              'outbound preview should render the '
+                              'recipient header; got: ' + cap2[-1200:])
                 t.send('q')
 
     def test_flat_sendmessage_inbound_preview_and_ack(self):
@@ -1336,8 +1445,12 @@ class TestBrowseClaude(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             sess = self._make_sendmessage_fixture(tmp)
             with TmuxFixture(cols=160, rows=40, env=self._launch_env(tmp)) as t:
+                # --show-all: this test navigates onto the ack tool_result
+                # row, which the voice-only default hides (its hiding is
+                # covered by test_flat_sendmessage_voice_filter_*).
                 t.launch(_BIN, '--run-py', _RECIPE,
-                         '--no-tree', '--file', sess, '--item', '0')
+                         '--no-tree', '--show-all', '--file', sess,
+                         '--item', '0')
                 # Inbound reply preview on first paint.
                 cap = t.wait_for('← task-notification', timeout=3.0)
                 self.assertIn('PROBE_REPLY_BODY', cap,

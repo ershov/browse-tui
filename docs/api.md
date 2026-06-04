@@ -308,6 +308,8 @@ ctx.mode                              -> Mode    # NORMAL / SEARCH_EDIT / FILTER
 ctx.search_query                      -> str     # active /-search query
 ctx.set_search_query(text)            -> None    # replace; '' clears; forces NORMAL
 ctx.clear_search()                    -> None    # alias for set_search_query('')
+ctx.hint                              -> str     # info-bar hint line
+ctx.set_hint(text)                    -> None    # replace info-bar hint; repaints
 ctx.run_in_worker(fn)                 -> threading.Thread
 ```
 
@@ -1434,6 +1436,7 @@ shared registry at module-body time (`preview_formatters['markdown']
 @dataclass
 class BrowserConfig:
     title: str = 'browse-tui'
+    hint: str = ' /:search  ?:help  q:quit '   # info-bar hint line
     get_children: Callable | None = None
     get_preview:  Callable | None = None
     actions: list | None = None
