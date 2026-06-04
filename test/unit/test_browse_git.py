@@ -843,6 +843,34 @@ class TestGitRowContent(unittest.TestCase):
         self.assertEqual(len(segs_a[1][0]), 7 + 2)
         self.assertEqual(len(segs_a[2][0]), 12 + 2)
 
+    def test_worktree_group_row_aligns_label_under_subject(self):
+        # A synthetic worktree-group row carries EMPTY column strings, so it
+        # stays on the column path (not the fallback) and pads the three
+        # leading columns to the commit widths — the label then begins at
+        # the same offset as a commit subject (no decoration chips).
+        ctx = _FakeCtx(self._widths(sha=7, author=5, date=12))
+        item = self.r.Item(id='wc:untracked', title='Untracked changes',
+                           col_sha='', col_author='', col_date='',
+                           has_children=True)
+        segs = self.r.git_row_content(item, ctx)
+        # Three padded (empty) columns + the label, no chips.
+        self.assertEqual(len(segs), 4)
+        # Each column is just its gap-padded width of spaces.
+        self.assertEqual(segs[0], (' ' * 7 + '  ', _YELLOW[0], _YELLOW[1]))
+        self.assertEqual(segs[1], (' ' * 5 + '  ', _DIM[0], _DIM[1]))
+        self.assertEqual(segs[2], (' ' * 12 + '  ', _DIM[0], _DIM[1]))
+        # The label is the last (subject) segment, plain — same slot a
+        # commit subject occupies, so they line up vertically.
+        self.assertEqual(segs[-1], ('Untracked changes', None, False))
+        # Leading text width matches a commit's three columns exactly.
+        commit = self._commit_item(
+            col_sha='deadbee', col_author='Al', col_date='2 days ago',
+            title='subj', chips=[])
+        csegs = self.r.git_row_content(commit, _FakeCtx(
+            self._widths(sha=7, author=5, date=12)))
+        lead = lambda s: sum(len(seg[0]) for seg in s[:3])
+        self.assertEqual(lead(segs), lead(csegs))
+
     def test_non_commit_row_falls_back(self):
         # A status/stash/ref/file row (no col_sha) must return EXACTLY
         # default_row_content(item, ctx) and never measure a column.
@@ -1013,6 +1041,14 @@ class TestWorktreeGroups(unittest.TestCase):
              ('wc:staged', 'Staged changes'),
              ('wc:conflicts', 'Conflicts')])
         self.assertTrue(all(it.has_children for it in items))
+
+    def test_rows_carry_empty_alignment_columns(self):
+        # Each row leaves col_sha/col_author/col_date empty so
+        # git_row_content aligns the label under the commit subjects.
+        self.r._worktree_status = lambda paths: [('??', 'new.txt')]
+        item, = self.r._worktree_groups([])
+        self.assertEqual(
+            (item.col_sha, item.col_author, item.col_date), ('', '', ''))
 
     def test_only_non_empty_buckets_appear(self):
         # Only untracked + staged have files → only those two rows, in order.

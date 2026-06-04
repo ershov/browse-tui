@@ -640,13 +640,24 @@ def _worktree_groups(paths):
     buckets and emits one expandable ``wc:<bucket>`` row per NON-empty
     bucket, in ``_WC_GROUPS`` order, titled by the group label. A clean
     tree (no changes) yields ``[]`` — no rows at all.
+
+    Each row carries empty ``col_sha`` / ``col_author`` / ``col_date``
+    strings so ``git_row_content`` aligns its label under the sibling
+    commit subjects (empty columns pad to the commit column widths)
+    instead of rendering flush-left.
     """
     buckets = _classify_worktree(_worktree_status(paths))
     items = []
     for bucket, label in _WC_GROUPS:
         if buckets[bucket]:
-            items.append(Item(id=f'wc:{bucket}', title=label,
-                              has_children=True))
+            item = Item(id=f'wc:{bucket}', title=label, has_children=True)
+            # Empty leading columns so git_row_content pads them to the
+            # commit column widths — the label then lines up under the
+            # commit subjects rather than at the start of the row.
+            item.col_sha = ''
+            item.col_author = ''
+            item.col_date = ''
+            items.append(item)
     return items
 
 
@@ -713,10 +724,12 @@ def git_row_content(item, ctx):
     chips come next, then the subject (the title) LAST so a narrow pane
     truncates the subject rather than the metadata columns.
 
-    Only commit rows carry ``col_sha``; every other row kind
-    (status/stash/ref/file/reflog and the synthetic error / "clean" /
-    "no stashes" rows) lacks it and falls back to the framework default
-    content — keeping their tag chips and trailing decorations unchanged.
+    Commit rows and the synthetic worktree-group rows carry ``col_sha``
+    (the groups leave it empty so their label aligns under the commit
+    subjects); every other row kind (status/stash/ref/file/reflog and the
+    synthetic error / "clean" / "no stashes" rows) lacks it and falls back
+    to the framework default content — keeping their tag chips and trailing
+    decorations unchanged.
     Only the content region is taken over; chrome (tree indent + ▼/▶) stays
     framework-owned.
     """
