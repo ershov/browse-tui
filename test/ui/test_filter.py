@@ -152,6 +152,11 @@ class TestFilterAmpBashRegression(unittest.TestCase):
         Returns the .jsonl path. The session lives under
         ``$HOME/.claude/projects/-home-test-ampbash/`` so the recipe's
         project-scan picks it up if launched without ``--file``.
+
+        These tools are pure tool_use (no voice text), so the launches
+        below pass ``--show-all`` to defeat browse-claude's voice-only
+        default — the point here is the engine's ``&`` filter, not the
+        recipe's voice filter.
         """
         proj = os.path.join(tmp, '.claude', 'projects', '-home-test-ampbash')
         os.makedirs(proj)
@@ -208,7 +213,7 @@ class TestFilterAmpBashRegression(unittest.TestCase):
             sess = self._make_session_fixture(tmp)
             with TmuxFixture(cols=160, rows=30, env={'HOME': tmp}) as t:
                 t.launch(_BIN, '--run-py', _RECIPE,
-                         '--tree', '--file', sess)
+                         '--tree', '--show-all', '--file', sess)
                 # All three tool umbrellas visible on launch (the
                 # cursor-on-open expanded the <prompt>).
                 t.wait_for('<tool:Bash>', timeout=5.0)
@@ -257,7 +262,7 @@ class TestFilterAmpBashRegression(unittest.TestCase):
             sess = self._make_session_fixture(tmp)
             with TmuxFixture(cols=160, rows=30, env={'HOME': tmp}) as t:
                 t.launch(_BIN, '--run-py', _RECIPE,
-                         '--tree', '--file', sess)
+                         '--tree', '--show-all', '--file', sess)
                 t.wait_for('<tool:Bash>', timeout=5.0)
                 t.wait_for('<tool:Write>', timeout=3.0)
                 t.wait_for('<tool:Read>', timeout=3.0)
@@ -309,7 +314,7 @@ class TestFilterAmpBashRegression(unittest.TestCase):
             sess = self._make_session_fixture(tmp)
             with TmuxFixture(cols=160, rows=30, env={'HOME': tmp}) as t:
                 t.launch(_BIN, '--run-py', _RECIPE,
-                         '--tree', '--file', sess)
+                         '--tree', '--show-all', '--file', sess)
                 t.wait_for('<tool:Bash>', timeout=5.0)
                 t.wait_for('<tool:Write>', timeout=3.0)
                 t.wait_for('<tool:Read>', timeout=3.0)

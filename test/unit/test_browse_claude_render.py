@@ -1281,6 +1281,16 @@ class TestTreeChildrenPreview(unittest.TestCase):
     def setUpClass(cls):
         cls.r = _load_recipe()
 
+    def setUp(self):
+        # These tests assert the full "show everything" baseline (incl.
+        # non-voice tool rows), so pin the voice-only filter OFF — it's
+        # on by default and would otherwise hide that content.
+        self._saved_FILTER = self.r._FILTER_VOICE_ONLY
+        self.r._FILTER_VOICE_ONLY = False
+
+    def tearDown(self):
+        self.r._FILTER_VOICE_ONLY = self._saved_FILTER
+
     def _write_jsonl(self, records):
         import json as _json
         import tempfile
@@ -3534,7 +3544,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
                              'subagent transcript')
 
     def test_tool_umbrella_for_agent_dispatch_passes_voice_filter(self):
-        # The voice-only filter (`h` key) must keep <tool:Agent> rows
+        # The voice-only filter (`.` key) must keep <tool:Agent> rows
         # visible when they wrap a resolvable subagent — the umbrella
         # carries the subagent voice stripe, so filtering them out
         # would hide the visual cue.
@@ -3545,11 +3555,12 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             self.r._scan_tree(sess)
             tool_id = f'{sess}#tool:1'
             # With voice-only filter ON, the <tool:Agent> id passes.
+            saved = self.r._FILTER_VOICE_ONLY
             self.r._FILTER_VOICE_ONLY = True
             try:
                 self.assertTrue(self.r._passes_filter(tool_id))
             finally:
-                self.r._FILTER_VOICE_ONLY = False
+                self.r._FILTER_VOICE_ONLY = saved
 
     def test_tool_umbrella_for_bash_filtered_out_in_voice_only(self):
         # Non-Agent tool (e.g. Bash) — no voice content, no subagent
@@ -3575,11 +3586,12 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             self.r._TREE_CACHE.clear()
             self.r._scan_tree(sess)
             tool_id = f'{sess}#tool:1'
+            saved = self.r._FILTER_VOICE_ONLY
             self.r._FILTER_VOICE_ONLY = True
             try:
                 self.assertFalse(self.r._passes_filter(tool_id))
             finally:
-                self.r._FILTER_VOICE_ONLY = False
+                self.r._FILTER_VOICE_ONLY = saved
 
     def test_umbrella_preview_omits_chrome_even_after_direct_leaf_visit(self):
         # Regression: previously, when a leaf had been visited directly
@@ -3629,7 +3641,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
 
     def test_toggle_filter_drops_preview_cache_for_synthetic_row(self):
         # Regression #4 (user-reported): on a freshly-opened jsonl,
-        # cursor on the synthetic top row, pressing `h` (toggle
+        # cursor on the synthetic top row, pressing `.` (toggle
         # voice-only filter) must drop the cached preview so the
         # umbrella is re-streamed against the new filter.
         #
@@ -3663,6 +3675,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             self.r._TREE_CACHE.clear()
 
             # With filter OFF, the umbrella body contains both records.
+            saved = self.r._FILTER_VOICE_ONLY
             self.r._FILTER_VOICE_ONLY = False
             try:
                 with_all = ''.join(self.r._preview_umbrella(sess))
@@ -3685,7 +3698,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
                     'tool_use record from the umbrella preview',
                 )
             finally:
-                self.r._FILTER_VOICE_ONLY = False
+                self.r._FILTER_VOICE_ONLY = saved
 
     def test_focus_latest_voice_when_ready_jumps_after_load(self):
         # _focus_latest_voice_when_ready chains:
@@ -4955,8 +4968,9 @@ class TestSummariseTitles(unittest.TestCase):
 
 
 class TestVoiceOnlyFilter(unittest.TestCase):
-    """``h`` hotkey + ``--no-show-all`` filter: hide everything that
-    isn't voice or a subagent umbrella.
+    """``.`` hotkey + ``--show-all`` filter: hide everything that
+    isn't voice or a subagent umbrella. Voice-only is the default;
+    ``--show-all`` is the escape hatch that turns it off.
 
     Predicate lives in ``_passes_filter`` and is consulted by every
     Item builder. Toggle emits a single ``mod`` batch — the framework's
@@ -5511,20 +5525,35 @@ class TestVoiceOnlyFilter(unittest.TestCase):
 
     # ---- CLI + help -----------------------------------------------------
 
-    def test_help_text_mentions_h_hotkey(self):
-        self.assertIn(' h ', self.r._HELP_INTRO_TMPL,
-                      'help intro should list the h hotkey')
+    def test_help_text_mentions_dot_hotkey(self):
+        self.assertIn(' .  ', self.r._HELP_INTRO_TMPL,
+                      'help intro should list the . hotkey')
         self.assertIn('--show-all', self.r._HELP_INTRO_TMPL)
         self.assertIn('--no-show-all', self.r._HELP_INTRO_TMPL)
+        # The old 'h' hotkey is gone from the help intro.
+        self.assertNotIn(' h ', self.r._HELP_INTRO_TMPL,
+                         "the 'h' hotkey should no longer appear")
 
-    def test_h_action_registered(self):
-        # Sanity: the recipe registers an 'h' action with the expected
-        # handler. We can't run the full main() under unit test (it
-        # touches argv / stdin) — inspect the source for the binding.
+    def test_dot_action_registered(self):
+        # Sanity: the recipe registers a '.' action with the expected
+        # handler (and no longer an 'h' one). We can't run the full
+        # main() under unit test (it touches argv / stdin) — inspect the
+        # source for the binding.
         with open(_RECIPE) as f:
             source = f.read()
-        self.assertIn("Action('h',", source)
+        self.assertIn("Action('.',", source)
         self.assertIn('_action_toggle_filter', source)
+        self.assertNotIn(
+            "Action('h',", source,
+            "the 'h' binding for the voice-only filter should be gone")
+
+    def test_filter_voice_only_default_is_on(self):
+        # Voice-only is the default at module load; --show-all is the
+        # escape hatch that turns it off.
+        with open(_RECIPE) as f:
+            source = f.read()
+        self.assertIn('_FILTER_VOICE_ONLY = True', source)
+        self.assertNotIn('_FILTER_VOICE_ONLY = False  #', source)
 
 
 # ---- #424: composer ↔ framework cache integration ----------------------
@@ -5669,11 +5698,17 @@ class TestUmbrellaPreviewCacheIntegration(unittest.TestCase):
     def setUp(self):
         self._saved_BROWSER = self.r._BROWSER
         self._saved_TREE_MODE = self.r._TREE_MODE
+        self._saved_FILTER = self.r._FILTER_VOICE_ONLY
         self.r._TREE_MODE = True
+        # These tests assert the full "show everything" baseline (incl.
+        # non-voice tool rows), so pin the voice-only filter OFF — it's
+        # on by default and would otherwise hide that content.
+        self.r._FILTER_VOICE_ONLY = False
 
     def tearDown(self):
         self.r._BROWSER = self._saved_BROWSER
         self.r._TREE_MODE = self._saved_TREE_MODE
+        self.r._FILTER_VOICE_ONLY = self._saved_FILTER
         # Drop the recipe-level tree cache so each test gets a fresh
         # scan of its synthetic .jsonl.
         self.r._TREE_CACHE.clear()

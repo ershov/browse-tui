@@ -3371,7 +3371,7 @@ _TREE_CACHE = {}   # path → TreeData
 _SCAN_LOCKS = {}            # path → threading.Lock
 _SCAN_LOCKS_LOCK = threading.Lock()
 _TREE_MODE = True  # default; --no-tree CLI flag or 't' action flips it.
-_FILTER_VOICE_ONLY = False  # default; --no-show-all flag or 'h' flips it.
+_FILTER_VOICE_ONLY = True  # default; --show-all flag or '.' flips it.
 
 
 # Live-tail worker state, keyed by .jsonl path. The worker resumes
@@ -6154,9 +6154,9 @@ Usage: browse-claude [OPTIONS] [PROJECT]
   --tree          Show sessions as a tree, grouped by turn (default).
                   Subagents nest inline under their assistant rows.
   --no-tree       Show sessions as a flat reverse-time list.
-  --show-all      Show every record (default).
-  --no-show-all   Start in voice-only mode (hide tool calls, system
-                  records, etc.; press 'h' to toggle).
+  --show-all      Show every record (tool calls, system records, etc.).
+  --no-show-all   Start in voice-only mode, hiding tool calls / system
+                  records (default; press '.' to toggle).
   PROJECT         Project directory name under ~/.claude/projects/ to
                   drill into on launch. Ignored when --session / --pid /
                   --file is given.
@@ -6172,7 +6172,7 @@ a transcript with Right/Alt-Down; preview shows the rendered turn.
   M       render the preview via $MD2ANSI / md2ansi (external).
   J / K   jump cursor to next / previous user-or-assistant voice.
   t       toggle flat / tree view.
-  h       toggle voice-only filter (hide tool calls / machinery).\
+  .       toggle voice-only filter (hide tool calls / machinery).\
 """
 
 
@@ -6200,7 +6200,9 @@ def main():
     elif no_tree_flag:
         _TREE_MODE = False
 
-    # Voice-only filter (--show-all wins over --no-show-all if both passed).
+    # Voice-only filter: on by default. --show-all turns it off; the
+    # --no-show-all flag is a redundant no-op kept for explicitness, and
+    # --show-all wins over --no-show-all when both are passed.
     show_all_flag    = _pop_flag('--show-all')
     no_show_all_flag = _pop_flag('--no-show-all')
     if show_all_flag:
@@ -6315,7 +6317,7 @@ def main():
             Action('J',     'Jump to next voice (user/asst)',  _action_next_voice,  'none'),
             Action('K',     'Jump to prev voice (user/asst)',  _action_prev_voice,  'none'),
             Action('t',     'Toggle flat / tree view',         _action_toggle_tree, 'none'),
-            Action('h',     'Toggle voice-only filter',        _action_toggle_filter, 'none'),
+            Action('.',     'Toggle voice-only filter',        _action_toggle_filter, 'none'),
             # Right: the framework default expands a collapsed row; the
             # ``on_expand`` / ``on_children_loaded`` hooks then jump the
             # cursor to the latest voice (for every expansion source, not
