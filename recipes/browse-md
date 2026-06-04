@@ -1741,18 +1741,12 @@ Usage: browse-md [-l] [FILE.md[#anchor] | DIR ...]
             top-level row in the tree; there is no synthetic root
             above them. With a single file the browser opens scoped
             into that file's headings.
-  DIR       A directory expands to the ``.md`` / ``.MD`` files
-            directly inside it (non-recursive, sorted by name). With
-            no positionals at all the current directory is browsed
-            (same as ``browse-md .``).
+  DIR       Expands to the ``.md`` / ``.MD`` files directly inside it
+            (non-recursive). No args ⇒ browse ``.``.
   #anchor   Deep-link target — 0-based line number or heading name
             (exact / prefix / substring tiers; first hit wins). When
             multiple files carry anchors, the FIRST anchored file in
             argv order wins.
-
-  Top-level rows are labeled by basename; when the files span more
-  than one directory the labels go relative to a shared root to
-  disambiguate same-named files.
 
   m       Toggle md2ansi coloring.
   M       Render the preview through ``$MD2ANSI`` / md2ansi.

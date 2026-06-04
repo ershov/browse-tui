@@ -1979,9 +1979,9 @@ class TestHelpIntro(unittest.TestCase):
         self.assertTrue(self.r._HELP_INTRO.strip())
 
     def test_contains_usage_form(self):
-        # The usage line documents the optional ``-l`` flag, the
-        # required file, and (further down) the anchor syntax.
-        self.assertIn('browse-md [-l] FILE.md', self.r._HELP_INTRO)
+        # The usage line documents the optional ``-l`` flag and the
+        # file/dir positionals (with the anchor syntax detailed below).
+        self.assertIn('browse-md [-l] [FILE.md', self.r._HELP_INTRO)
 
     def test_mentions_lists_flag(self):
         # The ``-l`` / ``--list`` / ``--lists`` flag toggles list-item
