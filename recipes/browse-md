@@ -145,6 +145,11 @@ _INCLUDE_LISTS = False
 
 _USAGE = 'usage: browse-md [-l] FILE.md[#anchor] [FILE.md[#anchor] ...]'
 
+# Markdown file extensions recognised when a positional names a directory.
+# A directory argument expands to every direct child with one of these
+# extensions; case is significant, so both spellings are listed.
+_MD_EXTS = ('.md', '.MD')
+
 
 class _FileState:
     """Per-file parser state bundle held inside ``_FILES``.
@@ -1747,6 +1752,82 @@ Usage: browse-md [-l] FILE.md[#anchor] [FILE.md[#anchor] ...]
 """
 
 
+def _dir_md_files(dirpath):
+    """Abs paths of the markdown files directly inside ``dirpath``.
+
+    Non-recursive: only entries whose extension is in ``_MD_EXTS`` and
+    that are files (subdirectories and non-markdown files are ignored).
+    Returned as absolute paths sorted by name so a directory argument
+    expands to a stable, alphabetical top-level list.
+    """
+    out = []
+    for entry in os.scandir(dirpath):
+        if not entry.is_file():
+            continue
+        if os.path.splitext(entry.name)[1] in _MD_EXTS:
+            out.append(os.path.abspath(entry.path))
+    out.sort(key=os.path.basename)
+    return out
+
+
+def _collect_input_files(positionals):
+    """Resolve raw positionals into ``(input_files, anchor, anchor_path)``.
+
+    For each raw positional token, in order:
+
+      * If the token (verbatim — checked BEFORE any ``#`` split, so a real
+        file whose name contains ``#`` is unaffected) names a directory,
+        expand it to its direct markdown files via ``_dir_md_files``, each
+        paired with an empty anchor (directories never carry an anchor).
+      * Otherwise split once on the first ``#`` into ``(file_part, anchor)``
+        and validate ``file_part`` resolves to an existing file; ``_die`` on
+        a missing path, echoing the user's raw token.
+
+    Paths are deduped by abspath, first-seen order preserved. "First anchor
+    wins" is tracked across the whole expanded list: the first non-empty
+    anchor (and its owning path) is recorded, later anchors ignored. An
+    empty aggregate (e.g. an empty directory) is an error.
+
+    Returns ``(input_files, first_anchor, first_anchor_path)`` where
+    ``input_files`` is a list of ``(abs_path, anchor)`` pairs.
+    """
+    input_files = []
+    seen = set()
+    first_anchor = ''
+    first_anchor_path = None
+
+    def _add(path, anchor):
+        nonlocal first_anchor, first_anchor_path
+        if path in seen:
+            return
+        seen.add(path)
+        input_files.append((path, anchor))
+        if anchor and first_anchor_path is None:
+            first_anchor = anchor
+            first_anchor_path = path
+
+    for raw in positionals:
+        # Directory check runs on the RAW token (before any ``#`` split)
+        # so a real file whose name contains ``#`` is unaffected.
+        raw_path = os.path.abspath(os.path.expanduser(raw))
+        if os.path.isdir(raw_path):
+            for path in _dir_md_files(raw_path):
+                _add(path, '')
+            continue
+        # Not a directory: split once on the first ``#`` for the anchor.
+        file_part, sep, anchor = raw.partition('#')
+        anchor = anchor if sep else ''
+        path = os.path.abspath(os.path.expanduser(file_part))
+        if not os.path.isfile(path):
+            # Echo the user's raw token so the error names what they typed.
+            _die(f'no such file or directory: {raw}', with_usage=False)
+        _add(path, anchor)
+
+    if not input_files:
+        _die('no markdown files to browse')
+    return input_files, first_anchor, first_anchor_path
+
+
 def _die(msg, *, with_usage=True):
     """Emit ``browse-md: <msg>`` (and optionally the usage line) and exit 2.
 
@@ -1815,32 +1896,17 @@ def main():
         if tok.startswith('-') and tok != '-':
             _die(f'unrecognised option: {tok}')
     positionals = [t for t in leftover if not (t.startswith('-') and t != '-')]
+    # No positionals ⇒ browse the current directory (``browse-md .``).
     if not positionals:
-        _die('missing FILE.md[#anchor]')
+        positionals = ['.']
 
-    # Walk every positional, split into (file_part, anchor) at the
-    # first ``#``, validate the file exists, and collect into the
-    # argv-ordered ``_INPUT_FILES`` list of (abs_path, anchor) pairs.
-    # The first anchored entry (if any) seeds ``_ANCHOR`` for the
-    # initial-scope resolution downstream.
-    input_files = []
-    first_anchor = ''
-    first_anchor_path = None
-    for raw in positionals:
-        # Split once on the first ``#`` — anything after is the anchor.
-        file_part, sep, anchor = raw.partition('#')
-        anchor = anchor if sep else ''
-        path = os.path.abspath(os.path.expanduser(file_part))
-        if not os.path.isfile(path):
-            # Echo the user's INPUT (pre-expanduser, pre-abspath) so
-            # the error names exactly what they typed.
-            _die(f'no such file: {file_part}', with_usage=False)
-        input_files.append((path, anchor))
-        # "First anchor wins" — record the first non-empty anchor and
-        # its owning path; subsequent anchors are ignored.
-        if anchor and first_anchor_path is None:
-            first_anchor = anchor
-            first_anchor_path = path
+    # Resolve every positional into the argv-ordered ``_INPUT_FILES``
+    # list of (abs_path, anchor) pairs: directories expand to their
+    # direct markdown files, plain tokens split on the first ``#`` for
+    # an anchor. The first anchored entry (if any) seeds ``_ANCHOR`` for
+    # the initial-scope resolution downstream.
+    input_files, first_anchor, first_anchor_path = _collect_input_files(
+        positionals)
 
     _INPUT_FILES = input_files
     _ANCHOR = first_anchor

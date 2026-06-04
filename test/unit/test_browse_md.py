@@ -2120,18 +2120,34 @@ class TestArgvErrors(unittest.TestCase):
         code = cm.exception.code
         return code, buf.getvalue()
 
-    def test_no_args_reports_missing_file_with_usage(self):
-        self._set_argv(['browse-md'])
-        code, err = self._run_main_capture()
-        self.assertEqual(code, 2)
-        self.assertIn('missing FILE.md', err)
-        self.assertIn(self.r._USAGE, err)
+    def test_no_args_defaults_to_current_directory(self):
+        # No positionals ⇒ ``browse-md .`` — the current directory is
+        # expanded to its markdown files rather than dying.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = os.path.realpath(tmp)
+            md = os.path.join(tmp, 'doc.md')
+            with open(md, 'w') as f:
+                f.write('# H\n')
+            saved = os.getcwd()
+            os.chdir(tmp)
+            try:
+                self._set_argv(['browse-md'])
+                # Builds a Browser over the cwd's files (no SystemExit).
+                # The stubbed Browser has no ``run`` method, so ``main()``
+                # raises ``AttributeError`` just past construction — by
+                # which point ``_INPUT_FILES`` is populated.
+                with self.assertRaises(AttributeError):
+                    self.r.main()
+                self.assertEqual(self.r._INPUT_FILES, [(md, '')])
+            finally:
+                os.chdir(saved)
 
     def test_missing_file_path_reports_path_without_usage(self):
         self._set_argv(['browse-md', '/no/such/path.md'])
         code, err = self._run_main_capture()
         self.assertEqual(code, 2)
-        self.assertIn('no such file: /no/such/path.md', err)
+        self.assertIn('no such file or directory: /no/such/path.md', err)
         # ``with_usage=False`` for the file-not-found path — the user
         # already got the positional shape right syntactically.
         self.assertNotIn(self.r._USAGE, err)
@@ -2180,7 +2196,7 @@ class TestArgvErrors(unittest.TestCase):
             self._set_argv(['browse-md', tmp_path, 'extra'])
             code, err = self._run_main_capture()
             self.assertEqual(code, 2)
-            self.assertIn('no such file: extra', err)
+            self.assertIn('no such file or directory: extra', err)
         finally:
             import os as _os
             _os.unlink(tmp_path)
@@ -2628,7 +2644,8 @@ class TestArgvMulti(_MultiCaseBase):
             with self.assertRaises(SystemExit) as cm:
                 self.r.main()
         self.assertEqual(cm.exception.code, 2)
-        self.assertIn('no such file: /no/such/middle.md', buf.getvalue())
+        self.assertIn('no such file or directory: /no/such/middle.md',
+                      buf.getvalue())
 
 
 class TestBuildMulti(_MultiCaseBase):
@@ -3991,6 +4008,142 @@ class TestRootLabelMap(unittest.TestCase):
         finally:
             import shutil
             shutil.rmtree(base, ignore_errors=True)
+
+
+class TestDirMdFiles(unittest.TestCase):
+    """``_dir_md_files`` — non-recursive ``.md``/``.MD`` listing."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_returns_only_markdown_sorted_abs_nonrecursive(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = os.path.realpath(tmp)
+            # Markdown files (both extension casings), out of name order.
+            for name in ('b.md', 'a.MD', 'c.md'):
+                with open(os.path.join(tmp, name), 'w') as f:
+                    f.write('# x\n')
+            # Non-markdown siblings that must be ignored.
+            for name in ('notes.txt', 'readme.markdown', 'plain', 'd.mdx'):
+                with open(os.path.join(tmp, name), 'w') as f:
+                    f.write('x\n')
+            # A subdirectory containing a .md — must NOT be recursed into.
+            sub = os.path.join(tmp, 'sub')
+            os.mkdir(sub)
+            with open(os.path.join(sub, 'deep.md'), 'w') as f:
+                f.write('# deep\n')
+
+            got = self.r._dir_md_files(tmp)
+            self.assertEqual(
+                got,
+                [os.path.join(tmp, 'a.MD'),
+                 os.path.join(tmp, 'b.md'),
+                 os.path.join(tmp, 'c.md')],
+            )
+            # Every entry is an absolute path.
+            for p in got:
+                self.assertTrue(os.path.isabs(p))
+
+    def test_empty_dir_returns_empty_list(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self.r._dir_md_files(tmp), [])
+
+
+class TestCollectInputFiles(unittest.TestCase):
+    """``_collect_input_files`` — directory expansion, dedup, anchors."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _write(self, path, body='# h\n'):
+        with open(path, 'w') as f:
+            f.write(body)
+
+    def test_single_dir_expansion(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = os.path.realpath(tmp)
+            a = os.path.join(tmp, 'a.md')
+            b = os.path.join(tmp, 'b.md')
+            self._write(a)
+            self._write(b)
+            files, anchor, anchor_path = self.r._collect_input_files([tmp])
+            self.assertEqual(files, [(a, ''), (b, '')])
+            self.assertEqual(anchor, '')
+            self.assertIsNone(anchor_path)
+
+    def test_mixed_file_and_dir(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = os.path.realpath(tmp)
+            d = os.path.join(tmp, 'd')
+            os.mkdir(d)
+            da = os.path.join(d, 'a.md')
+            self._write(da)
+            solo = os.path.join(tmp, 'solo.md')
+            self._write(solo)
+            files, anchor, anchor_path = self.r._collect_input_files([solo, d])
+            self.assertEqual(files, [(solo, ''), (da, '')])
+            self.assertEqual(anchor, '')
+            self.assertIsNone(anchor_path)
+
+    def test_dedup_repeated_path_first_seen_order(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = os.path.realpath(tmp)
+            a = os.path.join(tmp, 'a.md')
+            b = os.path.join(tmp, 'b.md')
+            self._write(a)
+            self._write(b)
+            files, _anchor, _ap = self.r._collect_input_files([a, b, a])
+            self.assertEqual(files, [(a, ''), (b, '')])
+
+    def test_directory_with_hash_treated_as_path_no_anchor(self):
+        # A directory positional carrying a ``#`` is treated as a path
+        # (no anchor split): the dir is expanded and no anchor recorded.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = os.path.realpath(tmp)
+            sub = os.path.join(tmp, 'sec#tion')
+            os.mkdir(sub)
+            a = os.path.join(sub, 'a.md')
+            self._write(a)
+            files, anchor, anchor_path = self.r._collect_input_files([sub])
+            self.assertEqual(files, [(a, '')])
+            self.assertEqual(anchor, '')
+            self.assertIsNone(anchor_path)
+
+    def test_first_anchor_wins_across_files(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = os.path.realpath(tmp)
+            a = os.path.join(tmp, 'a.md')
+            b = os.path.join(tmp, 'b.md')
+            self._write(a)
+            self._write(b)
+            files, anchor, anchor_path = self.r._collect_input_files(
+                [a + '#first', b + '#second'])
+            self.assertEqual(files, [(a, 'first'), (b, 'second')])
+            self.assertEqual(anchor, 'first')
+            self.assertEqual(anchor_path, a)
+
+    def test_empty_aggregate_raises(self):
+        # An empty directory expands to nothing → SystemExit.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SystemExit):
+                self.r._collect_input_files([tmp])
+
+    def test_nonexistent_path_raises(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, 'nope.md')
+            with self.assertRaises(SystemExit):
+                self.r._collect_input_files([missing])
 
 
 if __name__ == '__main__':
