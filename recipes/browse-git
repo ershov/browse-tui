@@ -89,11 +89,12 @@ _MODES = ('commits', 'status', 'reflog', 'branches', 'stash')
 # dot so git's connectors — not the node shape — convey merges. Built once
 # as a str.translate table (see ``_graph_translate``).
 _GRAPH_GLYPHS = {
-    '*': '·',     # commit node           -> middle dot (U+00B7)
+    '*': '•',     # commit node           -> bullet (U+2022)
     '|': '│',     # vertical lane         -> box vertical (U+2502)
-    '/': '╱',     # ascending diagonal    -> light up-right diag (U+2571)
-    '\\': '╲',    # descending diagonal   -> light down-right diag (U+2572)
-    '_': '─',     # horizontal connector  -> box horizontal (U+2500)
+    #'/': '╱',     # ascending diagonal    -> light up-right diag (U+2571)
+    #'\\': '╲',    # descending diagonal   -> light down-right diag (U+2572)
+    #'_': '─',     # horizontal connector  -> box horizontal (U+2500)
+    '_': '▁',     # horizontal connector  -> lower eights block
 }
 _GRAPH_TABLE = str.maketrans(_GRAPH_GLYPHS)
 
@@ -800,11 +801,11 @@ def _commit_log_items(revs, paths):
 def _graph_translate(art):
     """Glyph-substitute one line of ``git log --graph`` art.
 
-    Maps git's ASCII connectors to box-drawing / dot glyphs via the module
-    ``_GRAPH_TABLE`` (``*``→``·``, ``|``→``│``, ``/``→``╱``, ``\\``→``╲``,
-    ``_``→``─``). Internal spacing is git's lane alignment and is preserved;
-    only trailing spaces are stripped (git right-pads every art cell, and a
-    trailing run carries no lane information).
+    Maps git's ASCII connectors to box-drawing / block glyphs via the module
+    ``_GRAPH_TABLE`` (``*``→``•``, ``|``→``│``, ``_``→``▁``); the diagonals
+    ``/`` and ``\\`` pass through unchanged. Internal spacing is git's lane
+    alignment and is preserved; only trailing spaces are stripped (git
+    right-pads every art cell, and a trailing run carries no lane information).
     """
     return art.translate(_GRAPH_TABLE).rstrip()
 

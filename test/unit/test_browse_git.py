@@ -50,8 +50,9 @@ Coverage (ticket #662 — commits columnar list):
 
 Coverage (ticket #701 — tree-mode commit graph):
 
-* ``_graph_translate``     maps all 5 git art glyphs (``*|/\\_``) to their
-  box/dot glyphs, preserves internal spacing, rstrips trailing pad
+* ``_graph_translate``     maps the ``*|_`` git art glyphs to their box/block
+  glyphs (diagonals ``/`` ``\\`` pass through), preserves internal spacing,
+  rstrips trailing pad
 * ``_commit_graph_items``  ``git log --graph`` lines → commit Items (with
   ``col_graph``) interleaved with inert filler Items (``filler:<n>``,
   ``has_children`` False, no ``col_sha``); git line order preserved
@@ -1206,33 +1207,37 @@ class TestGraphTranslate(unittest.TestCase):
     def setUpClass(cls):
         cls.r = _load_recipe()
 
-    def test_all_five_glyphs_mapped(self):
-        # Every art char the map covers is substituted 1:1.
-        self.assertEqual(self.r._graph_translate('*'), '·')  # · node
+    def test_mapped_glyphs_substituted(self):
+        # The node / lane / horizontal art chars are substituted 1:1.
+        self.assertEqual(self.r._graph_translate('*'), '•')  # • node
         self.assertEqual(self.r._graph_translate('|'), '│')  # │ vertical
-        self.assertEqual(self.r._graph_translate('/'), '╱')  # ╱ asc diag
-        self.assertEqual(self.r._graph_translate('\\'), '╲')  # ╲ desc diag
-        self.assertEqual(self.r._graph_translate('_'), '─')  # ─ horizontal
+        self.assertEqual(self.r._graph_translate('_'), '▁')  # ▁ horizontal
+
+    def test_diagonals_pass_through(self):
+        # The merge diagonals are left as git's own ASCII art.
+        self.assertEqual(self.r._graph_translate('/'), '/')    # asc diag
+        self.assertEqual(self.r._graph_translate('\\'), '\\')  # desc diag
 
     def test_internal_spacing_preserved(self):
         # A multi-lane row keeps its inter-lane spaces (git's alignment);
         # only the trailing pad is stripped.
         self.assertEqual(
             self.r._graph_translate('| * | '),
-            '│ · │')
+            '│ • │')
 
-    def test_merge_art_substituted(self):
-        # A typical merge fan-out: '|\' -> '│╲', '|/' -> '│╱'.
-        self.assertEqual(self.r._graph_translate('|\\  '), '│╲')
-        self.assertEqual(self.r._graph_translate('|/  '), '│╱')
+    def test_merge_fanout_mixes_box_and_ascii(self):
+        # A typical merge fan-out: the vertical lane is substituted while
+        # the diagonal passes through — '|\' -> '│\', '|/' -> '│/'.
+        self.assertEqual(self.r._graph_translate('|\\  '), '│\\')
+        self.assertEqual(self.r._graph_translate('|/  '), '│/')
 
     def test_trailing_spaces_only_rstripped(self):
         # Leading/internal spaces stay; trailing run goes.
-        self.assertEqual(self.r._graph_translate('  *   '), '  ·')
+        self.assertEqual(self.r._graph_translate('  *   '), '  •')
 
     def test_unmapped_chars_pass_through(self):
-        # Chars outside the map (e.g. the '·'-like nothing) are untouched.
-        self.assertEqual(self.r._graph_translate('* x'), '· x')
+        # Chars outside the map are untouched.
+        self.assertEqual(self.r._graph_translate('* x'), '• x')
 
 
 class TestCommitGraphItems(unittest.TestCase):
@@ -1283,8 +1288,8 @@ class TestCommitGraphItems(unittest.TestCase):
         self.assertEqual(it.col_author, 'Alice')
         self.assertEqual(it.col_date, '2 days ago')
         self.assertEqual(it.chips, [('HEAD', 'green'), ('main', 'cyan')])
-        # …plus the translated graph art ('* ' -> '·').
-        self.assertEqual(it.col_graph, '·')
+        # …plus the translated graph art ('* ' -> '•').
+        self.assertEqual(it.col_graph, '•')
 
     def test_filler_line_builds_inert_item(self):
         # A pure-art line (no \x1f) is a filler: inert, no col_sha, art only.
@@ -1303,8 +1308,9 @@ class TestCommitGraphItems(unittest.TestCase):
         self.assertFalse(filler.has_children)
         # No col_sha on a filler (so git_row_content takes the filler path).
         self.assertIsNone(getattr(filler, 'col_sha', None))
-        # The whole line is the (translated) art: '|\' -> '│╲'.
-        self.assertEqual(filler.col_graph, '│╲')
+        # The whole line is the (translated) art: '|\' -> '│\' (the lane
+        # becomes box-vertical, the diagonal passes through).
+        self.assertEqual(filler.col_graph, '│\\')
         # _parse_id partitions on the first ':' so a namespaced filler id is
         # still kind 'other' (inert everywhere); rest keeps the ns:n tail.
         self.assertEqual(self.r._parse_id(filler.id), ('other', 'root:0'))
@@ -1324,8 +1330,8 @@ class TestCommitGraphItems(unittest.TestCase):
         self.assertEqual([it.id for it in items], [
             f'commit:{s1}', 'filler:root:0', f'commit:{s2}', 'filler:root:1',
         ])
-        # The second commit's art keeps its leading lane: '| * ' -> '│ ·'.
-        self.assertEqual(items[2].col_graph, '│ ·')
+        # The second commit's art keeps its leading lane: '| * ' -> '│ •'.
+        self.assertEqual(items[2].col_graph, '│ •')
 
     def test_log_failure_returns_error_row(self):
         def fake_run_git(*args):
@@ -1402,13 +1408,13 @@ class TestGitRowContentGraph(unittest.TestCase):
         item = self.r.Item(
             id='commit:deadbee', title='subj', col_sha='deadbee',
             col_author='Al', col_date='2 days ago',
-            chips=[('HEAD', 'green')], col_graph='·')
+            chips=[('HEAD', 'green')], col_graph='•')
         segs = self.r.git_row_content(item, ctx)
         # sha, author, date, GRAPH, [HEAD], subject.
         self.assertEqual(len(segs), 6)
         graph_seg = segs[3]
         # Graph art + a single trailing space; GFG is terminal default.
-        self.assertEqual(graph_seg, ('· ', None, False))
+        self.assertEqual(graph_seg, ('• ', None, False))
         # The chip follows the graph, the subject is still last.
         self.assertEqual(segs[4], ('[HEAD] ', *self.r.style('green')))
         self.assertEqual(segs[-1], ('subj', None, False))
@@ -1434,14 +1440,14 @@ class TestGitRowContentGraph(unittest.TestCase):
         # span then renders its art; both segments use the graph fg.
         ctx = _FakeCtx(self._widths(sha=7, author=5, date=12))
         item = self.r.Item(id='filler:root:0', title='', has_children=False,
-                           col_graph='│╲')
+                           col_graph='│\\')
         segs = self.r.git_row_content(item, ctx)
         self.assertEqual(len(segs), 2)
         pad_seg, art_seg = segs
         # pad width = 7+2 + 5+2 + 12+2 = 30 spaces.
         expected_pad = ' ' * (7 + 2 + 5 + 2 + 12 + 2)
         self.assertEqual(pad_seg, (expected_pad, None, False))
-        self.assertEqual(art_seg, ('│╲', None, False))
+        self.assertEqual(art_seg, ('│\\', None, False))
         # The filler measured exactly the three metadata columns.
         self.assertEqual(ctx.calls, ['col_sha', 'col_author', 'col_date'])
 
@@ -1452,7 +1458,7 @@ class TestGitRowContentGraph(unittest.TestCase):
         commit = self.r.Item(
             id='commit:abc1234', title='c', col_sha='abc1234',
             col_author='Bernard', col_date='3 weeks ago', chips=[],
-            col_graph='·')
+            col_graph='•')
         filler = self.r.Item(id='filler:root:0', title='', has_children=False,
                              col_graph='│')
         c_segs = self.r.git_row_content(commit, _FakeCtx(widths))
