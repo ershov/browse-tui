@@ -2656,6 +2656,36 @@ class TestBuildMulti(_MultiCaseBase):
             os.path.basename(self.path_b),
         ])
 
+    def test_per_file_root_titles_relative_when_spanning_dirs(self):
+        # When the input files span more than one directory, ``_reparse``
+        # overrides each per-file root title with its ``_md_ref_label``
+        # (relative to the cwd's git root / cwd) so same-named files
+        # across dirs disambiguate. Build a two-dir fixture under a git
+        # root and drive it through the real reparse path.
+        import os
+        import shutil
+        import tempfile
+        root = tempfile.mkdtemp()
+        try:
+            os.mkdir(os.path.join(root, '.git'))
+            os.makedirs(os.path.join(root, 'sub'))
+            pa = os.path.join(root, 'top.md')
+            pb = os.path.join(root, 'sub', 'nested.md')
+            with open(pa, 'w', encoding='utf-8') as f:
+                f.write(self.A_TEXT)
+            with open(pb, 'w', encoding='utf-8') as f:
+                f.write(self.B_TEXT)
+            saved = os.getcwd()
+            os.chdir(root)
+            try:
+                self._load_multi(pa, pb)
+                titles = [c.title for c in self.r.get_children(None)]
+            finally:
+                os.chdir(saved)
+            self.assertEqual(titles, ['top.md', os.path.join('sub', 'nested.md')])
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
     def test_per_file_root_has_expected_headings(self):
         # Each per-file root carries its own headings (h1/h2) — the
         # exact tree shape from single-file ``_build_nodes``.
@@ -3881,6 +3911,86 @@ class TestMdRefFollowing(unittest.TestCase):
         refs = self._refs(L)
         self.assertEqual([k.title for k in refs], ['B.md'])
         self.assertTrue(getattr(refs[0], 'boundary', False))
+
+
+class TestRootLabelMap(unittest.TestCase):
+    """``_root_label_map`` — relative per-file-root labeling (ticket #715).
+
+    Files in ONE directory (or a single file) keep today's bare-basename
+    UX. Once the final file list spans MORE than one directory, each label
+    is computed via ``_md_ref_label`` against the cwd's git root (or cwd),
+    so the flat top-level list disambiguates same-named files across dirs
+    without ``../`` noise.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_single_file_label_is_basename(self):
+        labels = self.r._root_label_map(['/proj/docs/README.md'])
+        self.assertEqual(labels, {'/proj/docs/README.md': 'README.md'})
+
+    def test_same_dir_labels_are_basenames(self):
+        paths = ['/proj/docs/a.md', '/proj/docs/b.md']
+        labels = self.r._root_label_map(paths)
+        self.assertEqual(labels, {
+            '/proj/docs/a.md': 'a.md',
+            '/proj/docs/b.md': 'b.md',
+        })
+
+    def test_multi_dir_labels_relative_to_git_root(self):
+        # Two dirs under one git root → labels are project_root-relative
+        # (the disambiguating path, not a bare basename).
+        import os
+        import tempfile
+        root = tempfile.mkdtemp()
+        try:
+            os.mkdir(os.path.join(root, '.git'))
+            os.makedirs(os.path.join(root, 'sub'))
+            a = os.path.join(root, 'guide.md')
+            b = os.path.join(root, 'sub', 'guide.md')
+            saved = os.getcwd()
+            os.chdir(root)
+            try:
+                labels = self.r._root_label_map([a, b])
+            finally:
+                os.chdir(saved)
+            self.assertEqual(labels, {
+                a: 'guide.md',
+                b: os.path.join('sub', 'guide.md'),
+            })
+        finally:
+            import shutil
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_multi_dir_labels_match_md_ref_label(self):
+        # The multi-dir branch delegates to ``_md_ref_label`` verbatim —
+        # assert the computed labels equal a direct call with the same
+        # cwd / project_root anchors (no git root → falls back to cwd).
+        import os
+        import tempfile
+        base = tempfile.mkdtemp()
+        try:
+            os.makedirs(os.path.join(base, 'x'))
+            os.makedirs(os.path.join(base, 'y'))
+            a = os.path.join(base, 'x', 'one.md')
+            b = os.path.join(base, 'y', 'two.md')
+            saved = os.getcwd()
+            os.chdir(base)
+            try:
+                labels = self.r._root_label_map([a, b])
+                cwd = os.getcwd()
+                project_root = self.r.md_doc.find_git_root(cwd) or cwd
+                self.assertEqual(labels, {
+                    a: self.r._md_ref_label(a, cwd, project_root),
+                    b: self.r._md_ref_label(b, cwd, project_root),
+                })
+            finally:
+                os.chdir(saved)
+        finally:
+            import shutil
+            shutil.rmtree(base, ignore_errors=True)
 
 
 if __name__ == '__main__':

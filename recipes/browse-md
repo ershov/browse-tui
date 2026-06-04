@@ -713,6 +713,28 @@ def _md_ref_label(abspath, cwd, project_root):
     return _collapse_home(abspath)
 
 
+def _root_label_map(paths):
+    """Map each post-expansion input path to its top-level row label.
+
+    ``paths`` is the abs path of every FINAL (post-expansion) input file.
+    When they all share ONE directory — the common case, including a lone
+    file — labels stay bare basenames (today's single-dir UX). Only once
+    the list spans MORE than one directory do labels go relative, so a
+    flat top-level list disambiguates same-named files across dirs.
+
+    The relative branch anchors every label against ONE shared origin —
+    the cwd's git root (else cwd) — via ``_md_ref_label``, matching how
+    referenced ``.md`` siblings are labeled. ``md_doc`` may be unavailable
+    (optional import), in which case ``project_root`` falls back to cwd.
+    """
+    dirs = {os.path.dirname(p) for p in paths}
+    if len(dirs) <= 1:
+        return {p: os.path.basename(p) for p in paths}
+    cwd = os.getcwd()
+    project_root = (md_doc.find_git_root(cwd) or cwd) if md_doc else cwd
+    return {p: _md_ref_label(p, cwd, project_root) for p in paths}
+
+
 def _md_resolved_refs(text, doc_dir, cwd, project_root):
     """Resolve the ``.md`` refs in ``text`` to existing ``(abspath, label)`` pairs.
 
@@ -1055,6 +1077,11 @@ def _reparse():
     if not input_files and _ROOT_PATH is not None:
         input_files = [(_ROOT_PATH, '')]
 
+    # Per-file root labels: bare basenames when every input shares one
+    # directory (today's UX), else relative paths that disambiguate
+    # same-named files across dirs. Computed once over the final file list.
+    labels = _root_label_map([p for p, _ in input_files])
+
     file_states = []
     for path, _anchor in input_files:
         with open(path, 'r', encoding='utf-8', errors='replace') as f:
@@ -1062,6 +1089,9 @@ def _reparse():
         ls = _line_starts(text)
         events = _parse(text)
         file_root, by_id = _build_nodes(events, text, ls, path)
+        # Override ``_build_nodes``'s basename default with the resolved
+        # per-root label (basename when single-dir, relative otherwise).
+        file_root.title = labels[path]
         # The per-file root carries an expansion arrow when it has headings
         # (set by ``_build_nodes``) OR references at least one existing ``.md``
         # file — so a heading-less file that links to a real ``.md`` is still
