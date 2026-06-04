@@ -382,6 +382,22 @@ def _reconcile_pane_caches(browser, layout):
 
     for name, rect in cache_rects.items():
         cache = browser._pane_cache.setdefault(name, PaneCache())
+        # Visible→hidden transition (#718): the pane held a real rect on
+        # the previous frame and is absent this frame. The renderers only
+        # paint a pane when its rect is non-None, so nothing would clear
+        # the rows it just vacated — they stay stale unless a neighbour
+        # happens to grow over them AND gets repainted this frame (true
+        # for cursor moves, which mark all panes dirty, but NOT for paths
+        # like ``update_data`` that flag only list/children). Blank the
+        # vacated cells here, the single per-frame site that already owns
+        # the layout→cache mapping and runs inside the sync region for
+        # both render_full and render_partial. ``isinstance(..., Rect)``
+        # excludes the disappeared-pane sentinel (a real prior geometry
+        # is always a Rect) so an already-hidden pane is a no-op.
+        prev = cache.rect
+        if rect is None and isinstance(prev, Rect):
+            for row in range(prev.top, prev.bottom):
+                clear_columns(row, prev.left, prev.right)
         cache.update_rect(rect)
 
 

@@ -93,6 +93,17 @@ _actions.point_in_rect = _render.point_in_rect
 _actions._sub_needed_rows = _render._sub_needed_rows
 _actions._fmt_child = _render._fmt_child
 
+# Children-pane layout sizing (#718 regression test). ``_layout_for``
+# routes a branch's cached children through ``Browser.children_grid_layout``
+# which calls ``_sub_layout`` / ``_sub_total_rows`` (render layer) and
+# coerces the result into the ``ChildrenGridLayout`` namedtuple (data
+# layer). The concatenated build resolves these by name; the standalone
+# loader needs them injected onto the modules that reference them.
+_state._sub_layout = _render._sub_layout
+_state._sub_total_rows = _render._sub_total_rows
+_state.ChildrenGridLayout = _data.ChildrenGridLayout
+_render.ChildrenGridLayout = _data.ChildrenGridLayout
+
 
 Item = _data.Item
 Browser = _state.Browser
@@ -800,6 +811,221 @@ class TestPreviewScrollClamp(_RenderCacheBase):
         self.browser._preview_scroll = 50
         _render.render_full(self.browser)
         self.assertEqual(self.browser._preview_scroll, 0)
+
+
+# --- 12. Vacated-pane clear on visible→hidden transition (#718) -----------
+
+
+# Minimal VT applier: replays the captured byte stream onto a character
+# grid so a test can assert what cells actually hold after a frame. Only
+# the sequences the renderer emits matter — cursor-position (CSI H),
+# erase-to-EOL (CSI K), and printable text; SGR (CSI m) and the sync
+# brackets carry no cell content and are skipped.
+_CSI_RE = re.compile(r'\x1b\[([0-9;?]*)([A-Za-z])')
+
+
+def _apply_to_grid(text, cols, rows):
+    """Return a list-of-strings screen grid after replaying ``text``."""
+    grid = [[' '] * cols for _ in range(rows)]
+    r = c = 1
+    i = 0
+    while i < len(text):
+        m = _CSI_RE.match(text, i)
+        if m:
+            params, final = m.group(1), m.group(2)
+            if final == 'H':
+                nums = [int(x) for x in params.split(';') if x != ''] \
+                    if params else []
+                r = nums[0] if len(nums) >= 1 else 1
+                c = nums[1] if len(nums) >= 2 else 1
+            elif final == 'K' and 1 <= r <= rows:
+                for cc in range(c, cols + 1):
+                    grid[r - 1][cc - 1] = ' '
+            i = m.end()
+            continue
+        ch = text[i]
+        if ch == '\n':
+            r += 1
+            c = 1
+        elif ch == '\r':
+            c = 1
+        else:
+            if 1 <= r <= rows and 1 <= c <= cols:
+                grid[r - 1][c - 1] = ch
+            c += 1
+        i += 1
+    return [''.join(row) for row in grid]
+
+
+class TestVacatedPaneClear(_RenderCacheBase):
+    """A pane that goes visible→hidden has its rows blanked (#718).
+
+    When the cursor sits on a branch the children pane is part of the
+    layout; an ``update_data`` op that turns that branch into a leaf
+    drops the pane from the layout. That path flags only ``list`` /
+    ``children`` for redraw (NOT ``preview`` / ``all``), so the pane
+    that would otherwise grow over the vacated columns is never
+    repainted — and the renderers only paint a pane when its rect is
+    non-None. Before the fix the children cells kept their stale child
+    titles; ``_reconcile_pane_caches`` now clears the vacated rect.
+    """
+
+    def _make_v_browser(self):
+        # Vertical split, children pane on, NOT headless (the children
+        # pane is gated on ``not browser._headless`` in ``_layout_for``).
+        items = [
+            Item(id='A', title='AAA', has_children=True),
+            Item(id='B', title='BBB'),
+        ]
+        b = _make_browser(
+            items, split='v', show_preview=True,
+            show_children_pane=True, _headless=False, show_ids='always',
+        )
+        # Cache A's children + previews so the pane renders real rows.
+        b._state._children['A'] = [
+            _data.to_item(Item(id='a1', title='a1xyz')),
+            _data.to_item(Item(id='a2', title='a2xyz')),
+        ]
+        for it in b._state._children['A']:
+            b._state._items_by_id[it.id] = it
+        for iid, it in b._state._items_by_id.items():
+            it.preview = 'pv-{}'.format(iid)
+        _state.mark_visible_dirty(b._state)
+        b._state.cursor = 0  # on branch A
+        return b
+
+    def test_children_pane_cleared_when_branch_becomes_leaf(self):
+        cols, rows = _render.term_size()
+        self.browser = self._make_v_browser()
+
+        # First full paint: cursor on A, children pane shows a1/a2.
+        _render.render_full(self.browser)
+        first = self.cap.drain()
+        layout_a = _render._layout_for(self.browser)
+        children_rect = layout_a['children']
+        self.assertIsNotNone(
+            children_rect,
+            'precondition: children pane must be present on a branch',
+        )
+        grid_a = _apply_to_grid(first, cols, rows)
+        cl, cr = children_rect.left, children_rect.right
+        pane_a = '\n'.join(
+            line[cl - 1:cr - 1]
+            for line in grid_a[children_rect.top - 1:children_rect.bottom - 1]
+        )
+        self.assertIn('a1xyz', pane_a,
+                      'precondition: child a1 must render in the pane')
+        self.assertIn('a2xyz', pane_a,
+                      'precondition: child a2 must render in the pane')
+
+        # update_data turns A into a leaf — flags only list/children
+        # dirty (NOT preview/all), so nothing grows over the children
+        # columns this frame.
+        self.browser.update_data([
+            _state.set_item('A', None, has_children=False),
+            _state.clear_children('A'),
+        ])
+        self.browser.drain_main_queue()
+        self.assertNotIn(
+            'preview', self.browser._needs_redraw,
+            'guard: the update_data path must NOT flag preview/all '
+            '(otherwise the neighbour repaint would mask the bug)',
+        )
+        self.assertNotIn(
+            'all', self.browser._needs_redraw,
+            'guard: the update_data path must NOT flag preview/all',
+        )
+
+        # Now the layout drops the children pane.
+        self.assertIsNone(
+            _render._layout_for(self.browser)['children'],
+            'children pane must be hidden once the branch is a leaf',
+        )
+
+        # Replay the FULL frame (both the prior content and this partial)
+        # onto one grid so we test the on-screen result, not just bytes.
+        _render.render_partial(self.browser)
+        partial = self.cap.drain()
+        grid_b = _apply_to_grid(first + partial, cols, rows)
+        vacated = '\n'.join(
+            line[cl - 1:cr - 1]
+            for line in grid_b[children_rect.top - 1:children_rect.bottom - 1]
+        )
+        self.assertNotIn(
+            'a1xyz', vacated,
+            'stale child a1 left in the vacated children columns:\n'
+            + '\n'.join(grid_b),
+        )
+        self.assertNotIn(
+            'a2xyz', vacated,
+            'stale child a2 left in the vacated children columns:\n'
+            + '\n'.join(grid_b),
+        )
+
+    def test_clear_is_one_shot_not_per_frame(self):
+        """The vacated-clear fires once on the transition, not every frame.
+
+        After the children pane has been hidden, the cache holds the
+        disappeared-pane sentinel (not a real Rect), so re-running the
+        reconcile on the steady leaf state must NOT re-emit the clear
+        sequence (a cursor-move to the children pane's old left column
+        on each previously-occupied row). We render twice more on the
+        settled leaf state and assert the children-column clears do not
+        recur on the second of those frames.
+        """
+        cols, rows = _render.term_size()
+        self.browser = self._make_v_browser()
+        _render.render_full(self.browser)
+        self.cap.drain()
+        children_rect = _render._layout_for(self.browser)['children']
+        old_left = children_rect.left
+
+        self.browser.update_data([
+            _state.set_item('A', None, has_children=False),
+            _state.clear_children('A'),
+        ])
+        self.browser.drain_main_queue()
+        _render.render_partial(self.browser)  # the transition frame
+        self.cap.drain()
+
+        # One settled full repaint to let any one-shot work flush.
+        _render.render_full(self.browser)
+        self.cap.drain()
+
+        # A second settled full repaint must not re-issue clears over
+        # the children pane's old left column — the sentinel makes the
+        # ``isinstance(prev, Rect)`` guard False so the clear is skipped.
+        _render.render_full(self.browser)
+        moves = _moves_in(self.cap.drain())
+        body_rows = range(children_rect.top, children_rect.bottom)
+        recurring_clears = [
+            (r, c) for (r, c) in moves
+            if c == old_left and r in body_rows
+        ]
+        self.assertEqual(
+            recurring_clears, [],
+            'vacated-clear must not re-fire on steady-state frames; '
+            f'saw repeated moves to col {old_left}: {recurring_clears}',
+        )
+
+    def test_no_clear_on_stable_branch_fast_path(self):
+        """No transition → no clear; steady-state repaint stays silent.
+
+        Guards the incremental fast path: while the cursor sits on a
+        branch (children pane present and unchanged), a no-op full
+        repaint must still emit only the sync brackets. The #718 clear
+        runs only on a visible→hidden transition, so it must add nothing
+        here.
+        """
+        self.browser = self._make_v_browser()
+        _render.render_full(self.browser)
+        self.cap.drain()
+        # Nothing changed — repaint must be a pure cache hit.
+        _render.render_full(self.browser)
+        self.assertEqual(
+            self.cap.drain(), '\033[?2026h\033[?2026l',
+            'steady-state repaint on a branch must emit only brackets',
+        )
 
 
 if __name__ == '__main__':
