@@ -1,0 +1,1214 @@
+diff --git a/browse-tui b/browse-tui
+index b04831f..386587b 100755
+--- a/browse-tui
++++ b/browse-tui
+@@ -13,6 +13,108 @@ invoked from ``090-main.py``.
+ """
+ 
+ __version__ = '0.1.0'
++
++
++# ---- profiling -----------------------------------------------------------
++#
++# Opt-in via ``BROWSE_TUI_PROFILE=1``. When enabled, ``_perf_log`` /
++# ``_perf_section`` append timing lines to a per-PID log file (override
++# the path with ``BROWSE_TUI_PROFILE_LOG``). The helpers are no-ops when
++# the env var is unset — a single boolean check per call. The TUI owns
++# stdout/stderr in raw mode so output MUST go to a file; never print.
++#
++# Log line format (tab-free, grep-friendly):
++#
++#   t=<perf_counter> event=<name> dt=<seconds> k1=v1 k2=v2 ...
++#
++# Two scenarios we want to distinguish from one log:
++#
++#   1. Initial load of a large file — look for ``event=scan_tree``,
++#      ``event=list_messages``, the first ``event=apply_ops``, etc.
++#   2. Expanding a big subtree — look for ``event=do_expand`` followed
++#      by ``event=worker_get_children`` and the subsequent
++#      ``event=update_data_apply`` / ``event=sub_layout``.
++#
++# Recipes can import these via ``from browse_tui import _perf_log,
++# _perf_section`` (the running module is aliased as ``browse_tui``).
++
++import os as _perf_os
++import threading as _perf_threading
++import time as _perf_time
++
++_PERF_ENABLED = bool(_perf_os.environ.get('BROWSE_TUI_PROFILE'))
++_PERF_LOG_PATH = _perf_os.environ.get(
++    'BROWSE_TUI_PROFILE_LOG',
++    f'/tmp/browse-tui-perf-{_perf_os.getpid()}.log',
++)
++_PERF_LOG_FH = None
++_PERF_LOG_LOCK = _perf_threading.Lock()
++
++
++def _perf_open_log():
++    """Lazy-open the log file. Returns the file handle, or False on failure."""
++    global _PERF_LOG_FH
++    if _PERF_LOG_FH is not None:
++        return _PERF_LOG_FH
++    try:
++        _PERF_LOG_FH = open(_PERF_LOG_PATH, 'a', buffering=1)
++    except OSError:
++        _PERF_LOG_FH = False
++    return _PERF_LOG_FH
++
++
++def _perf_log(event, **fields):
++    """Append a perf event line. No-op when profiling is disabled."""
++    if not _PERF_ENABLED:
++        return
++    fh = _perf_open_log()
++    if not fh:
++        return
++    t = _perf_time.perf_counter()
++    parts = [f't={t:.6f}', f'event={event}']
++    for k, v in fields.items():
++        parts.append(f'{k}={v}')
++    line = ' '.join(parts) + '\n'
++    with _PERF_LOG_LOCK:
++        try:
++            fh.write(line)
++        except OSError:
++            pass
++
++
++class _PerfSection:
++    """Context manager — times its body, emits one event with ``dt=``."""
++
++    __slots__ = ('_event', '_fields', '_t0')
++
++    def __init__(self, event, **fields):
++        self._event = event
++        self._fields = fields
++        self._t0 = 0.0
++
++    def __enter__(self):
++        if _PERF_ENABLED:
++            self._t0 = _perf_time.perf_counter()
++        return self
++
++    def __exit__(self, exc_type, exc, tb):
++        if _PERF_ENABLED:
++            dt = _perf_time.perf_counter() - self._t0
++            _perf_log(self._event, dt=f'{dt:.6f}', **self._fields)
++        return False
++
++    def set(self, **fields):
++        """Update fields mid-section (e.g., add ``n=`` once counted)."""
++        self._fields.update(fields)
++
++
++def _perf_section(event, **fields):
++    """Return a context manager that times its body and logs one event."""
++    return _PerfSection(event, **fields)
++
++
++if _PERF_ENABLED:
++    _perf_log('profile_start', pid=_perf_os.getpid(), version=__version__)
+ # }}} # SOURCE END: 010-prelude.py
+ 
+ # SOURCE START: 020-terminal.py {{{
+@@ -1059,6 +1161,35 @@ from dataclasses import dataclass, field, fields as _dc_fields
+ from typing import Any, Callable, Optional
+ 
+ 
++# Perf helpers — defined in 010-prelude.py for the concatenated build. The
++# test loader imports each src-tui file as a standalone module, so the
++# names from the prelude aren't visible here under tests. Install no-op
++# fallbacks only when the prelude's definitions haven't been concatenated
++# in (NameError branch); the concatenated production binary keeps the
++# real implementations.
++try:
++    _perf_log  # noqa: F821
++except NameError:
++    def _perf_log(event, **fields):
++        pass
++
++    class _PerfSection:
++        def __init__(self, *a, **kw):
++            pass
++
++        def __enter__(self):
++            return self
++
++        def __exit__(self, *a):
++            return False
++
++        def set(self, **kw):
++            pass
++
++    def _perf_section(event, **fields):
++        return _PerfSection()
++
++
+ # Cross-module symbol: ``registered_plugins`` is defined by
+ # ``035-plugins.py`` in the concatenated build. When this file is
+ # loaded standalone (tests), ``setdefault`` installs an empty list
+@@ -2179,43 +2310,45 @@ def apply_ops(state: State, ops) -> None:
+     Unknown ops raise ``ValueError`` — silent drops would mask recipe
+     typos.
+     """
++    n_ops = len(ops) if hasattr(ops, '__len__') else -1
+     structural = False
+-    for op in ops:
+-        kind = op[0]
+-        if kind == 'upsert':
+-            # 4-tuple (legacy) or 5-tuple (with positioning descriptor).
+-            _, id_, parent_id, fields, *rest = op
+-            where = rest[0] if rest else None
+-            if _apply_upsert(state, id_, parent_id, fields, where):
+-                structural = True
+-        elif kind == 'set':
+-            _, id_, parent_id, fields, *rest = op
+-            where = rest[0] if rest else None
+-            if _apply_set(state, id_, parent_id, fields, where):
+-                structural = True
+-        elif kind == 'mod':
+-            _, id_, parent_id, fields, *rest = op
+-            where = rest[0] if rest else None
+-            if _apply_mod(state, id_, parent_id, fields, where):
+-                structural = True
+-        elif kind == 'remove':
+-            _, id_ = op
+-            if _apply_remove(state, id_):
+-                structural = True
+-        elif kind == 'clear_children':
+-            _, parent_id = op
+-            if _apply_clear_children(state, parent_id):
+-                structural = True
+-        elif kind == 'complete':
+-            _, parent_id = op
+-            state._loading[parent_id] = False
+-        elif kind == 'incomplete':
+-            _, parent_id = op
+-            state._loading[parent_id] = True
+-        else:
+-            raise ValueError(f'apply_ops: unknown op kind {kind!r}')
+-    if structural:
+-        state._visible_dirty = True
++    with _perf_section('apply_ops', n=n_ops):
++        for op in ops:
++            kind = op[0]
++            if kind == 'upsert':
++                # 4-tuple (legacy) or 5-tuple (with positioning descriptor).
++                _, id_, parent_id, fields, *rest = op
++                where = rest[0] if rest else None
++                if _apply_upsert(state, id_, parent_id, fields, where):
++                    structural = True
++            elif kind == 'set':
++                _, id_, parent_id, fields, *rest = op
++                where = rest[0] if rest else None
++                if _apply_set(state, id_, parent_id, fields, where):
++                    structural = True
++            elif kind == 'mod':
++                _, id_, parent_id, fields, *rest = op
++                where = rest[0] if rest else None
++                if _apply_mod(state, id_, parent_id, fields, where):
++                    structural = True
++            elif kind == 'remove':
++                _, id_ = op
++                if _apply_remove(state, id_):
++                    structural = True
++            elif kind == 'clear_children':
++                _, parent_id = op
++                if _apply_clear_children(state, parent_id):
++                    structural = True
++            elif kind == 'complete':
++                _, parent_id = op
++                state._loading[parent_id] = False
++            elif kind == 'incomplete':
++                _, parent_id = op
++                state._loading[parent_id] = True
++            else:
++                raise ValueError(f'apply_ops: unknown op kind {kind!r}')
++        if structural:
++            state._visible_dirty = True
+ 
+ 
+ # ---- helpers for the children-worker → update_data delivery (#271) -------
+@@ -2311,6 +2444,8 @@ def visible_items(state: State) -> list:
+     if not state._visible_dirty:
+         return state._visible_cache
+ 
++    _perf_sec = _perf_section('visible_items_rebuild')
++    _perf_sec.__enter__()
+     out: list = []
+ 
+     scope_root_id = current_scope(state)
+@@ -2346,6 +2481,8 @@ def visible_items(state: State) -> list:
+ 
+     state._visible_cache = out
+     state._visible_dirty = False
++    _perf_sec.set(n=len(out))
++    _perf_sec.__exit__(None, None, None)
+     return out
+ 
+ 
+@@ -2555,6 +2692,8 @@ def _recompute_filter_hidden(state, filters) -> None:
+     if not active:
+         return
+ 
++    _perf_sec = _perf_section('recompute_filter_hidden', n_filters=len(active))
++    _perf_sec.__enter__()
+     visited: set = set()
+ 
+     def visit(item):
+@@ -2586,6 +2725,8 @@ def _recompute_filter_hidden(state, filters) -> None:
+     for parent_id in list(state._children.keys()):
+         for child in state._children[parent_id]:
+             visit(child)
++    _perf_sec.set(visited=len(visited))
++    _perf_sec.__exit__(None, None, None)
+ 
+ 
+ # ---- insert-mode placement helpers (ticket #21) -------------------------
+@@ -3676,6 +3817,8 @@ class Browser:
+         ops_list = list(ops)
+ 
+         def _apply():
++            _ud_sec = _perf_section('update_data_apply', n=len(ops_list))
++            _ud_sec.__enter__()
+             # Snapshot the pre-mutation visible list and cursor index
+             # so hide-driven displacement can walk back through what
+             # the user was looking at. See
+@@ -3740,6 +3883,7 @@ class Browser:
+             # row affect what the grid shows.
+             self._needs_redraw.add('list')
+             self._needs_redraw.add('children')
++            _ud_sec.__exit__(None, None, None)
+ 
+         self.post(_apply)
+ 
+@@ -4443,6 +4587,9 @@ class Browser:
+         next user keystroke -- otherwise the screen lags behind the
+         cache when ``_notify`` is the only thing waking the loop.
+         """
++        _acr_sec = _perf_section('apply_children_results')
++        _acr_sec.__enter__()
++        total_items = 0
+         n = 0
+         while self._children_results:
+             id_, items = self._children_results.popleft()
+@@ -4453,6 +4600,7 @@ class Browser:
+             _index_drop_children(self._state, id_)
+             self._state._children[id_] = items
+             _index_add_children(self._state, id_, items)
++            total_items += len(items) if items else 0
+             self._state._children_pending.discard(id_)
+             # Worker delivered → no longer loading. Stays addressable
+             # via ``_loading`` rather than implied membership in
+@@ -4501,6 +4649,8 @@ class Browser:
+             # shrink to make room. A full repaint is cheaper than
+             # tracking that delta by hand.
+             self._needs_redraw.add('all')
++        _acr_sec.set(batches=n, n_items=total_items)
++        _acr_sec.__exit__(None, None, None)
+         return n
+ 
+     def apply_preview_result(self) -> bool:
+@@ -4685,6 +4835,12 @@ class Browser:
+         as the subtree streams in.
+         """
+         was_expanded = id_ in self._state.expanded
++        cached = id_ in self._state._children
++        n_cached = len(self._state._children[id_]) if cached else -1
++        _perf_log(
++            'do_expand', id=id_, cached=int(cached),
++            was_expanded=int(was_expanded), n=n_cached,
++        )
+         self._state.expanded.add(id_)
+         # Set the scroll-to-fit goal on a fresh expansion (the first
+         # transition from collapsed to expanded). Subsequent calls on
+@@ -4809,6 +4965,7 @@ class Browser:
+                 items = None
+                 gen = None
+                 error = False
++                _wgc_t0 = time.perf_counter()
+                 try:
+                     raw = self.get_children(id_)
+                 except Exception as e:
+@@ -4837,6 +4994,14 @@ class Browser:
+                                 f'get_children({id_!r}): '
+                                 f'{type(e).__name__}: {e}'
+                             )
++                _perf_log(
++                    'worker_get_children',
++                    id=id_,
++                    dt=f'{time.perf_counter() - _wgc_t0:.6f}',
++                    n=(len(items) if items is not None else -1),
++                    gen=int(gen is not None),
++                    error=int(error),
++                )
+ 
+                 if error:
+                     # Synthesise an empty delivery so the placeholder
+@@ -6195,6 +6360,32 @@ Out of scope (deferred to phase 2/3):
+ """
+ 
+ 
++# Perf helpers — see the matching block in 040-state.py for the rationale.
++# Concatenated build picks up the real definitions from 010-prelude.py;
++# the test loader's standalone module load lands in this no-op fallback.
++try:
++    _perf_log  # noqa: F821
++except NameError:
++    def _perf_log(event, **fields):
++        pass
++
++    class _PerfSection:
++        def __init__(self, *a, **kw):
++            pass
++
++        def __enter__(self):
++            return self
++
++        def __exit__(self, *a):
++            return False
++
++        def set(self, **kw):
++            pass
++
++    def _perf_section(event, **fields):
++        return _PerfSection()
++
++
+ # tag_style name → (fg color, bold flag). Values are 256-colour palette
+ # indices that ``020-terminal.set_style`` understands. The empty-string
+ # entry is the default — callers do ``_TAG_STYLE.get(name, _TAG_STYLE[''])``
+@@ -7234,6 +7425,8 @@ def _sub_layout(children, cols, show_ids='auto'):
+     if not children:
+         return (1, cols, [], [])
+ 
++    _sl_sec = _perf_section('sub_layout', n=len(children), cols=cols)
++    _sl_sec.__enter__()
+     raw = [_fmt_child(c, show_ids=show_ids) for c in children]
+     entry_lines = [_wrap_entry(e, _SUB_WRAP) for e in raw]
+     slot_rows = [len(lines) for lines in entry_lines]
+@@ -7246,6 +7439,7 @@ def _sub_layout(children, cols, show_ids='auto'):
+     full_cols = max(1, (cols + gap) // col_width)
+     num_cols = min(full_cols + 1, len(children))
+ 
++    _sl_sec.__exit__(None, None, None)
+     return (num_cols, col_width, slot_rows, entry_lines)
+ 
+ 
+@@ -8436,6 +8630,8 @@ def _layout_for(browser):
+     yields ``children_rows_needed=0`` *unless* the branch has children
+     (in which case we reserve one row for the ``⧗ loading…`` hint).
+     """
++    _lf_sec = _perf_section('layout_for')
++    _lf_sec.__enter__()
+     cols, rows = term_size()
+     children_rows = 0
+     if browser.show_children_pane and not browser._headless:
+@@ -8496,6 +8692,7 @@ def _layout_for(browser):
+     # renderer treats every paint target uniformly.
+     layout['sep_main_rightmost'] = _is_rightmost(layout.get('sep_main'))
+     layout['sep_inner_rightmost'] = _is_rightmost(layout.get('sep_inner'))
++    _lf_sec.__exit__(None, None, None)
+     return layout
+ 
+ 
+@@ -8566,6 +8763,8 @@ def render_full(browser):
+     is gone (#185–#188): the differential renderer relies on the row
+     cache to detect stale columns rather than forcing a flash repaint.
+     """
++    _rf_sec = _perf_section('render_full')
++    _rf_sec.__enter__()
+     begin_sync()
+     layout = _layout_for(browser)
+     _reconcile_pane_caches(browser, layout)
+@@ -8631,6 +8830,7 @@ def render_full(browser):
+     end_sync()
+     flush()
+     browser._needs_redraw = set()
++    _rf_sec.__exit__(None, None, None)
+ 
+ 
+ def render_partial(browser):
+@@ -8655,6 +8855,8 @@ def render_partial(browser):
+     if not needs:
+         return
+ 
++    _rp_sec = _perf_section('render_partial', needs='+'.join(sorted(needs)))
++    _rp_sec.__enter__()
+     begin_sync()
+     layout = _layout_for(browser)
+     _reconcile_pane_caches(browser, layout)
+@@ -8736,6 +8938,7 @@ def render_partial(browser):
+     end_sync()
+     flush()
+     browser._needs_redraw = set()
++    _rp_sec.__exit__(None, None, None)
+ 
+ 
+ def _preview_label(browser):
+diff --git a/recipes/browse-claude b/recipes/browse-claude
+index 0ce10bf..29e2b3b 100755
+--- a/recipes/browse-claude
++++ b/recipes/browse-claude
+@@ -45,6 +45,30 @@ import sys
+ import threading
+ 
+ from browse_tui import Action, Browser, BrowserConfig, Item, mod, upsert
++# Profiling helpers are optional — older browse_tui binaries (and the
++# test stub used in ``test_browse_claude_render``) don't export them.
++# Install no-op fallbacks so the import order isn't a hard requirement.
++try:
++    from browse_tui import _perf_log, _perf_section
++except ImportError:
++    def _perf_log(event, **fields):
++        pass
++
++    class _PerfSection:
++        def __init__(self, *a, **kw):
++            pass
++
++        def __enter__(self):
++            return self
++
++        def __exit__(self, *a):
++            return False
++
++        def set(self, **kw):
++            pass
++
++    def _perf_section(event, **fields):
++        return _PerfSection()
+ 
+ # Optional md2ansi plugin — colors user/assistant voice content inline.
+ try:
+@@ -396,6 +420,15 @@ def _indent_continuations(text, indent):
+ 
+ 
+ def get_children(item_id):
++    _gc_sec = _perf_section('recipe_get_children', id=item_id)
++    _gc_sec.__enter__()
++    try:
++        return _get_children_impl(item_id)
++    finally:
++        _gc_sec.__exit__(None, None, None)
++
++
++def _get_children_impl(item_id):
+     if item_id is None:
+         # Indirect ``re-read all`` signal: the framework calls this on
+         # initial load AND every time ``ctx.refresh()`` / Ctrl-R fires
+@@ -730,6 +763,8 @@ def _list_messages(jsonl_path, limit=None):
+             tag='err',
+             tag_style='red',
+         )]
++    _lm_sec = _perf_section('list_messages', path=jsonl_path)
++    _lm_sec.__enter__()
+     td = _scan_tree(jsonl_path)
+     total = len(td.records)
+     truncated = total > limit
+@@ -773,6 +808,8 @@ def _list_messages(jsonl_path, limit=None):
+             tag='…',
+             tag_style='dim',
+         ))
++    _lm_sec.set(n=len(out), total_records=total, truncated=int(truncated))
++    _lm_sec.__exit__(None, None, None)
+     return out
+ 
+ 
+@@ -2744,8 +2781,11 @@ def _scan_tree(path):
+     """
+     cached = _TREE_CACHE.get(path)
+     if cached is not None:
++        _perf_log('scan_tree_hit', path=path, n=len(cached.records))
+         return cached
+ 
++    _st_sec = _perf_section('scan_tree', path=path)
++    _st_sec.__enter__()
+     td = _TreeData()
+     cur = _ScanCursor()
+     sub_dir = _subagents_dir(path)
+@@ -2753,6 +2793,8 @@ def _scan_tree(path):
+         f = open(path, 'r', encoding='utf-8', errors='replace')
+     except OSError:
+         _TREE_CACHE[path] = td
++        _st_sec.set(n=0, error=1)
++        _st_sec.__exit__(None, None, None)
+         return td
+     # Use readline() (not ``for line in f``) so ``f.tell()`` is legal —
+     # the iterator protocol disables tell() to protect its read-ahead
+@@ -2802,6 +2844,8 @@ def _scan_tree(path):
+         error=False,
+     )
+     _TREE_CACHE[path] = td
++    _st_sec.set(n=n, bytes=last_full_offset)
++    _st_sec.__exit__(None, None, None)
+     return td
+ 
+ 
+@@ -3191,18 +3235,20 @@ def _list_tree_roots(jsonl_path):
+     records. The first message is no longer also the expandable node —
+     that's the umbrella's job.
+     """
+-    td = _scan_tree(jsonl_path)
+-    out = []
+-    for entry in td.roots_in_order:
+-        if entry['kind'] == 'turn':
+-            line = entry['line']
+-            rec = entry['rec']
+-            out.append(_prompt_umbrella_item(jsonl_path, line, rec, td))
+-        else:   # 'span'
+-            out.append(_span_umbrella_item(
+-                jsonl_path, entry['start'], entry['records'],
+-            ))
+-    return out
++    with _perf_section('list_tree_roots', path=jsonl_path) as _sec:
++        td = _scan_tree(jsonl_path)
++        out = []
++        for entry in td.roots_in_order:
++            if entry['kind'] == 'turn':
++                line = entry['line']
++                rec = entry['rec']
++                out.append(_prompt_umbrella_item(jsonl_path, line, rec, td))
++            else:   # 'span'
++                out.append(_span_umbrella_item(
++                    jsonl_path, entry['start'], entry['records'],
++                ))
++        _sec.set(n=len(out))
++        return out
+ 
+ 
+ def _list_prompt_children(jsonl_path, turn_root_line):
+@@ -3214,37 +3260,43 @@ def _list_prompt_children(jsonl_path, turn_root_line):
+     tool_result has arrived yet — the umbrella shape stays stable as
+     the transcript grows).
+     """
+-    td = _scan_tree(jsonl_path)
+-    if not (0 <= turn_root_line < len(td.records)):
+-        return []
+-    rec = td.records[turn_root_line]
+-    if rec is None:
+-        return []
+-    uuid = rec.get('uuid')
+-    out = []
+-    # 1) The turn root itself, as a leaf — visible at the top of the
+-    # expansion so the user prompt content is readable at the same
+-    # indent as the assistant replies that follow. Keeps its
+-    # ``row_bg`` voice stripe; the user's voice deserves the marker
+-    # whether or not it happens to be folded under an umbrella.
+-    leaf = _tree_item(jsonl_path, rec, td)
+-    if leaf is not None:
+-        out.append(leaf)
+-    # 2) Each turn member.
+-    if uuid is None:
++    with _perf_section('list_prompt_children', path=jsonl_path,
++                       turn_root_line=turn_root_line) as _sec:
++        td = _scan_tree(jsonl_path)
++        if not (0 <= turn_root_line < len(td.records)):
++            _sec.set(n=0)
++            return []
++        rec = td.records[turn_root_line]
++        if rec is None:
++            _sec.set(n=0)
++            return []
++        uuid = rec.get('uuid')
++        out = []
++        # 1) The turn root itself, as a leaf — visible at the top of the
++        # expansion so the user prompt content is readable at the same
++        # indent as the assistant replies that follow. Keeps its
++        # ``row_bg`` voice stripe; the user's voice deserves the marker
++        # whether or not it happens to be folded under an umbrella.
++        leaf = _tree_item(jsonl_path, rec, td)
++        if leaf is not None:
++            out.append(leaf)
++        # 2) Each turn member.
++        if uuid is None:
++            _sec.set(n=len(out))
++            return out
++        for child in td.turn_direct.get(uuid, []):
++            cuuid = child.get('uuid')
++            if cuuid in td.assistant_has_tool_use:
++                cline = td.line_of.get(cuuid)
++                if cline is None:
++                    continue
++                out.append(_tool_umbrella_item(jsonl_path, cline, child, td))
++            else:
++                it = _tree_item(jsonl_path, child, td)
++                if it is not None:
++                    out.append(it)
++        _sec.set(n=len(out))
+         return out
+-    for child in td.turn_direct.get(uuid, []):
+-        cuuid = child.get('uuid')
+-        if cuuid in td.assistant_has_tool_use:
+-            cline = td.line_of.get(cuuid)
+-            if cline is None:
+-                continue
+-            out.append(_tool_umbrella_item(jsonl_path, cline, child, td))
+-        else:
+-            it = _tree_item(jsonl_path, child, td)
+-            if it is not None:
+-                out.append(it)
+-    return out
+ 
+ 
+ def _list_tool_children(jsonl_path, assistant_line):
+@@ -3256,54 +3308,62 @@ def _list_tool_children(jsonl_path, assistant_line):
+     umbrella exists even when no tool_result has arrived yet so the
+     shape is stable across in-flight transcripts.
+     """
+-    td = _scan_tree(jsonl_path)
+-    if not (0 <= assistant_line < len(td.records)):
+-        return []
+-    rec = td.records[assistant_line]
+-    if rec is None:
+-        return []
+-    uuid = rec.get('uuid')
+-    out = []
+-    # 1) Assistant tool_use record as a leaf. Keeps its ``row_bg``
+-    # voice stripe if the assistant has text content (mixed text +
+-    # tool_use case) — same reasoning as the prompt umbrella's first
+-    # leaf: voice markers belong on voice rows, regardless of nesting.
+-    leaf = _tree_item(jsonl_path, rec, td)
+-    if leaf is not None:
+-        out.append(leaf)
+-    # 2) Paired tool_children (tool_result, hook attachments, …).
+-    for child in td.tool_children.get(uuid, []):
+-        it = _tree_item(jsonl_path, child, td)
+-        if it is not None:
+-            out.append(it)
+-    # 3) Subagent pseudo-rows for Agent/Task tool_uses with a
+-    # resolvable transcript.
+-    msg = rec.get('message') or {}
+-    if isinstance(msg, dict):
+-        content = msg.get('content') or []
+-        if isinstance(content, list):
+-            for p in content:
+-                if (isinstance(p, dict)
+-                        and p.get('type') == 'tool_use'
+-                        and p.get('name') in ('Agent', 'Task')):
+-                    link = td.agent_link.get(p.get('id'))
+-                    if link:
+-                        out.append(_subagent_pseudo_item(
+-                            jsonl_path,
+-                            link['agent_id'], link['agent_path'],
+-                        ))
+-    return out
++    with _perf_section('list_tool_children', path=jsonl_path,
++                       assistant_line=assistant_line) as _sec:
++        td = _scan_tree(jsonl_path)
++        if not (0 <= assistant_line < len(td.records)):
++            _sec.set(n=0)
++            return []
++        rec = td.records[assistant_line]
++        if rec is None:
++            _sec.set(n=0)
++            return []
++        uuid = rec.get('uuid')
++        out = []
++        # 1) Assistant tool_use record as a leaf. Keeps its ``row_bg``
++        # voice stripe if the assistant has text content (mixed text +
++        # tool_use case) — same reasoning as the prompt umbrella's first
++        # leaf: voice markers belong on voice rows, regardless of nesting.
++        leaf = _tree_item(jsonl_path, rec, td)
++        if leaf is not None:
++            out.append(leaf)
++        # 2) Paired tool_children (tool_result, hook attachments, …).
++        for child in td.tool_children.get(uuid, []):
++            it = _tree_item(jsonl_path, child, td)
++            if it is not None:
++                out.append(it)
++        # 3) Subagent pseudo-rows for Agent/Task tool_uses with a
++        # resolvable transcript.
++        msg = rec.get('message') or {}
++        if isinstance(msg, dict):
++            content = msg.get('content') or []
++            if isinstance(content, list):
++                for p in content:
++                    if (isinstance(p, dict)
++                            and p.get('type') == 'tool_use'
++                            and p.get('name') in ('Agent', 'Task')):
++                        link = td.agent_link.get(p.get('id'))
++                        if link:
++                            out.append(_subagent_pseudo_item(
++                                jsonl_path,
++                                link['agent_id'], link['agent_path'],
++                            ))
++        _sec.set(n=len(out))
++        return out
+ 
+ 
+ def _list_span_records(jsonl_path, start_line):
+     """Children of a ``<system>`` umbrella: the records of one span."""
+-    td = _scan_tree(jsonl_path)
+-    out = []
+-    for rec in td.span_records.get(start_line, []):
+-        it = _tree_item(jsonl_path, rec, td)
+-        if it is not None:
+-            out.append(it)
+-    return out
++    with _perf_section('list_span_records', path=jsonl_path,
++                       start_line=start_line) as _sec:
++        td = _scan_tree(jsonl_path)
++        out = []
++        for rec in td.span_records.get(start_line, []):
++            it = _tree_item(jsonl_path, rec, td)
++            if it is not None:
++                out.append(it)
++        _sec.set(n=len(out))
++        return out
+ 
+ 
+ def _tree_item(jsonl_path, rec, td):
+diff --git a/src-tui/010-prelude.py b/src-tui/010-prelude.py
+index 037b376..0954528 100644
+--- a/src-tui/010-prelude.py
++++ b/src-tui/010-prelude.py
+@@ -10,3 +10,105 @@ invoked from ``090-main.py``.
+ """
+ 
+ __version__ = '0.1.0'
++
++
++# ---- profiling -----------------------------------------------------------
++#
++# Opt-in via ``BROWSE_TUI_PROFILE=1``. When enabled, ``_perf_log`` /
++# ``_perf_section`` append timing lines to a per-PID log file (override
++# the path with ``BROWSE_TUI_PROFILE_LOG``). The helpers are no-ops when
++# the env var is unset — a single boolean check per call. The TUI owns
++# stdout/stderr in raw mode so output MUST go to a file; never print.
++#
++# Log line format (tab-free, grep-friendly):
++#
++#   t=<perf_counter> event=<name> dt=<seconds> k1=v1 k2=v2 ...
++#
++# Two scenarios we want to distinguish from one log:
++#
++#   1. Initial load of a large file — look for ``event=scan_tree``,
++#      ``event=list_messages``, the first ``event=apply_ops``, etc.
++#   2. Expanding a big subtree — look for ``event=do_expand`` followed
++#      by ``event=worker_get_children`` and the subsequent
++#      ``event=update_data_apply`` / ``event=sub_layout``.
++#
++# Recipes can import these via ``from browse_tui import _perf_log,
++# _perf_section`` (the running module is aliased as ``browse_tui``).
++
++import os as _perf_os
++import threading as _perf_threading
++import time as _perf_time
++
++_PERF_ENABLED = bool(_perf_os.environ.get('BROWSE_TUI_PROFILE'))
++_PERF_LOG_PATH = _perf_os.environ.get(
++    'BROWSE_TUI_PROFILE_LOG',
++    f'/tmp/browse-tui-perf-{_perf_os.getpid()}.log',
++)
++_PERF_LOG_FH = None
++_PERF_LOG_LOCK = _perf_threading.Lock()
++
++
++def _perf_open_log():
++    """Lazy-open the log file. Returns the file handle, or False on failure."""
++    global _PERF_LOG_FH
++    if _PERF_LOG_FH is not None:
++        return _PERF_LOG_FH
++    try:
++        _PERF_LOG_FH = open(_PERF_LOG_PATH, 'a', buffering=1)
++    except OSError:
++        _PERF_LOG_FH = False
++    return _PERF_LOG_FH
++
++
++def _perf_log(event, **fields):
++    """Append a perf event line. No-op when profiling is disabled."""
++    if not _PERF_ENABLED:
++        return
++    fh = _perf_open_log()
++    if not fh:
++        return
++    t = _perf_time.perf_counter()
++    parts = [f't={t:.6f}', f'event={event}']
++    for k, v in fields.items():
++        parts.append(f'{k}={v}')
++    line = ' '.join(parts) + '\n'
++    with _PERF_LOG_LOCK:
++        try:
++            fh.write(line)
++        except OSError:
++            pass
++
++
++class _PerfSection:
++    """Context manager — times its body, emits one event with ``dt=``."""
++
++    __slots__ = ('_event', '_fields', '_t0')
++
++    def __init__(self, event, **fields):
++        self._event = event
++        self._fields = fields
++        self._t0 = 0.0
++
++    def __enter__(self):
++        if _PERF_ENABLED:
++            self._t0 = _perf_time.perf_counter()
++        return self
++
++    def __exit__(self, exc_type, exc, tb):
++        if _PERF_ENABLED:
++            dt = _perf_time.perf_counter() - self._t0
++            _perf_log(self._event, dt=f'{dt:.6f}', **self._fields)
++        return False
++
++    def set(self, **fields):
++        """Update fields mid-section (e.g., add ``n=`` once counted)."""
++        self._fields.update(fields)
++
++
++def _perf_section(event, **fields):
++    """Return a context manager that times its body and logs one event."""
++    return _PerfSection(event, **fields)
++
++
++if _PERF_ENABLED:
++    _perf_log('profile_start', pid=_perf_os.getpid(), version=__version__)
+diff --git a/src-tui/040-state.py b/src-tui/040-state.py
+index 31895c5..02cb0e4 100644
+--- a/src-tui/040-state.py
++++ b/src-tui/040-state.py
+@@ -11,6 +11,35 @@ from dataclasses import dataclass, field, fields as _dc_fields
+ from typing import Any, Callable, Optional
+ 
+ 
++# Perf helpers — defined in 010-prelude.py for the concatenated build. The
++# test loader imports each src-tui file as a standalone module, so the
++# names from the prelude aren't visible here under tests. Install no-op
++# fallbacks only when the prelude's definitions haven't been concatenated
++# in (NameError branch); the concatenated production binary keeps the
++# real implementations.
++try:
++    _perf_log  # noqa: F821
++except NameError:
++    def _perf_log(event, **fields):
++        pass
++
++    class _PerfSection:
++        def __init__(self, *a, **kw):
++            pass
++
++        def __enter__(self):
++            return self
++
++        def __exit__(self, *a):
++            return False
++
++        def set(self, **kw):
++            pass
++
++    def _perf_section(event, **fields):
++        return _PerfSection()
++
++
+ # Cross-module symbol: ``registered_plugins`` is defined by
+ # ``035-plugins.py`` in the concatenated build. When this file is
+ # loaded standalone (tests), ``setdefault`` installs an empty list
+@@ -1131,43 +1160,45 @@ def apply_ops(state: State, ops) -> None:
+     Unknown ops raise ``ValueError`` — silent drops would mask recipe
+     typos.
+     """
++    n_ops = len(ops) if hasattr(ops, '__len__') else -1
+     structural = False
+-    for op in ops:
+-        kind = op[0]
+-        if kind == 'upsert':
+-            # 4-tuple (legacy) or 5-tuple (with positioning descriptor).
+-            _, id_, parent_id, fields, *rest = op
+-            where = rest[0] if rest else None
+-            if _apply_upsert(state, id_, parent_id, fields, where):
+-                structural = True
+-        elif kind == 'set':
+-            _, id_, parent_id, fields, *rest = op
+-            where = rest[0] if rest else None
+-            if _apply_set(state, id_, parent_id, fields, where):
+-                structural = True
+-        elif kind == 'mod':
+-            _, id_, parent_id, fields, *rest = op
+-            where = rest[0] if rest else None
+-            if _apply_mod(state, id_, parent_id, fields, where):
+-                structural = True
+-        elif kind == 'remove':
+-            _, id_ = op
+-            if _apply_remove(state, id_):
+-                structural = True
+-        elif kind == 'clear_children':
+-            _, parent_id = op
+-            if _apply_clear_children(state, parent_id):
+-                structural = True
+-        elif kind == 'complete':
+-            _, parent_id = op
+-            state._loading[parent_id] = False
+-        elif kind == 'incomplete':
+-            _, parent_id = op
+-            state._loading[parent_id] = True
+-        else:
+-            raise ValueError(f'apply_ops: unknown op kind {kind!r}')
+-    if structural:
+-        state._visible_dirty = True
++    with _perf_section('apply_ops', n=n_ops):
++        for op in ops:
++            kind = op[0]
++            if kind == 'upsert':
++                # 4-tuple (legacy) or 5-tuple (with positioning descriptor).
++                _, id_, parent_id, fields, *rest = op
++                where = rest[0] if rest else None
++                if _apply_upsert(state, id_, parent_id, fields, where):
++                    structural = True
++            elif kind == 'set':
++                _, id_, parent_id, fields, *rest = op
++                where = rest[0] if rest else None
++                if _apply_set(state, id_, parent_id, fields, where):
++                    structural = True
++            elif kind == 'mod':
++                _, id_, parent_id, fields, *rest = op
++                where = rest[0] if rest else None
++                if _apply_mod(state, id_, parent_id, fields, where):
++                    structural = True
++            elif kind == 'remove':
++                _, id_ = op
++                if _apply_remove(state, id_):
++                    structural = True
++            elif kind == 'clear_children':
++                _, parent_id = op
++                if _apply_clear_children(state, parent_id):
++                    structural = True
++            elif kind == 'complete':
++                _, parent_id = op
++                state._loading[parent_id] = False
++            elif kind == 'incomplete':
++                _, parent_id = op
++                state._loading[parent_id] = True
++            else:
++                raise ValueError(f'apply_ops: unknown op kind {kind!r}')
++        if structural:
++            state._visible_dirty = True
+ 
+ 
+ # ---- helpers for the children-worker → update_data delivery (#271) -------
+@@ -1263,6 +1294,8 @@ def visible_items(state: State) -> list:
+     if not state._visible_dirty:
+         return state._visible_cache
+ 
++    _perf_sec = _perf_section('visible_items_rebuild')
++    _perf_sec.__enter__()
+     out: list = []
+ 
+     scope_root_id = current_scope(state)
+@@ -1298,6 +1331,8 @@ def visible_items(state: State) -> list:
+ 
+     state._visible_cache = out
+     state._visible_dirty = False
++    _perf_sec.set(n=len(out))
++    _perf_sec.__exit__(None, None, None)
+     return out
+ 
+ 
+@@ -1507,6 +1542,8 @@ def _recompute_filter_hidden(state, filters) -> None:
+     if not active:
+         return
+ 
++    _perf_sec = _perf_section('recompute_filter_hidden', n_filters=len(active))
++    _perf_sec.__enter__()
+     visited: set = set()
+ 
+     def visit(item):
+@@ -1538,6 +1575,8 @@ def _recompute_filter_hidden(state, filters) -> None:
+     for parent_id in list(state._children.keys()):
+         for child in state._children[parent_id]:
+             visit(child)
++    _perf_sec.set(visited=len(visited))
++    _perf_sec.__exit__(None, None, None)
+ 
+ 
+ # ---- insert-mode placement helpers (ticket #21) -------------------------
+@@ -2628,6 +2667,8 @@ class Browser:
+         ops_list = list(ops)
+ 
+         def _apply():
++            _ud_sec = _perf_section('update_data_apply', n=len(ops_list))
++            _ud_sec.__enter__()
+             # Snapshot the pre-mutation visible list and cursor index
+             # so hide-driven displacement can walk back through what
+             # the user was looking at. See
+@@ -2692,6 +2733,7 @@ class Browser:
+             # row affect what the grid shows.
+             self._needs_redraw.add('list')
+             self._needs_redraw.add('children')
++            _ud_sec.__exit__(None, None, None)
+ 
+         self.post(_apply)
+ 
+@@ -3395,6 +3437,9 @@ class Browser:
+         next user keystroke -- otherwise the screen lags behind the
+         cache when ``_notify`` is the only thing waking the loop.
+         """
++        _acr_sec = _perf_section('apply_children_results')
++        _acr_sec.__enter__()
++        total_items = 0
+         n = 0
+         while self._children_results:
+             id_, items = self._children_results.popleft()
+@@ -3405,6 +3450,7 @@ class Browser:
+             _index_drop_children(self._state, id_)
+             self._state._children[id_] = items
+             _index_add_children(self._state, id_, items)
++            total_items += len(items) if items else 0
+             self._state._children_pending.discard(id_)
+             # Worker delivered → no longer loading. Stays addressable
+             # via ``_loading`` rather than implied membership in
+@@ -3453,6 +3499,8 @@ class Browser:
+             # shrink to make room. A full repaint is cheaper than
+             # tracking that delta by hand.
+             self._needs_redraw.add('all')
++        _acr_sec.set(batches=n, n_items=total_items)
++        _acr_sec.__exit__(None, None, None)
+         return n
+ 
+     def apply_preview_result(self) -> bool:
+@@ -3637,6 +3685,12 @@ class Browser:
+         as the subtree streams in.
+         """
+         was_expanded = id_ in self._state.expanded
++        cached = id_ in self._state._children
++        n_cached = len(self._state._children[id_]) if cached else -1
++        _perf_log(
++            'do_expand', id=id_, cached=int(cached),
++            was_expanded=int(was_expanded), n=n_cached,
++        )
+         self._state.expanded.add(id_)
+         # Set the scroll-to-fit goal on a fresh expansion (the first
+         # transition from collapsed to expanded). Subsequent calls on
+@@ -3761,6 +3815,7 @@ class Browser:
+                 items = None
+                 gen = None
+                 error = False
++                _wgc_t0 = time.perf_counter()
+                 try:
+                     raw = self.get_children(id_)
+                 except Exception as e:
+@@ -3789,6 +3844,14 @@ class Browser:
+                                 f'get_children({id_!r}): '
+                                 f'{type(e).__name__}: {e}'
+                             )
++                _perf_log(
++                    'worker_get_children',
++                    id=id_,
++                    dt=f'{time.perf_counter() - _wgc_t0:.6f}',
++                    n=(len(items) if items is not None else -1),
++                    gen=int(gen is not None),
++                    error=int(error),
++                )
+ 
+                 if error:
+                     # Synthesise an empty delivery so the placeholder
+diff --git a/src-tui/050-render.py b/src-tui/050-render.py
+index 2acad6e..9409ab0 100644
+--- a/src-tui/050-render.py
++++ b/src-tui/050-render.py
+@@ -42,6 +42,32 @@ Out of scope (deferred to phase 2/3):
+ """
+ 
+ 
++# Perf helpers — see the matching block in 040-state.py for the rationale.
++# Concatenated build picks up the real definitions from 010-prelude.py;
++# the test loader's standalone module load lands in this no-op fallback.
++try:
++    _perf_log  # noqa: F821
++except NameError:
++    def _perf_log(event, **fields):
++        pass
++
++    class _PerfSection:
++        def __init__(self, *a, **kw):
++            pass
++
++        def __enter__(self):
++            return self
++
++        def __exit__(self, *a):
++            return False
++
++        def set(self, **kw):
++            pass
++
++    def _perf_section(event, **fields):
++        return _PerfSection()
++
++
+ # tag_style name → (fg color, bold flag). Values are 256-colour palette
+ # indices that ``020-terminal.set_style`` understands. The empty-string
+ # entry is the default — callers do ``_TAG_STYLE.get(name, _TAG_STYLE[''])``
+@@ -1081,6 +1107,8 @@ def _sub_layout(children, cols, show_ids='auto'):
+     if not children:
+         return (1, cols, [], [])
+ 
++    _sl_sec = _perf_section('sub_layout', n=len(children), cols=cols)
++    _sl_sec.__enter__()
+     raw = [_fmt_child(c, show_ids=show_ids) for c in children]
+     entry_lines = [_wrap_entry(e, _SUB_WRAP) for e in raw]
+     slot_rows = [len(lines) for lines in entry_lines]
+@@ -1093,6 +1121,7 @@ def _sub_layout(children, cols, show_ids='auto'):
+     full_cols = max(1, (cols + gap) // col_width)
+     num_cols = min(full_cols + 1, len(children))
+ 
++    _sl_sec.__exit__(None, None, None)
+     return (num_cols, col_width, slot_rows, entry_lines)
+ 
+ 
+@@ -2283,6 +2312,8 @@ def _layout_for(browser):
+     yields ``children_rows_needed=0`` *unless* the branch has children
+     (in which case we reserve one row for the ``⧗ loading…`` hint).
+     """
++    _lf_sec = _perf_section('layout_for')
++    _lf_sec.__enter__()
+     cols, rows = term_size()
+     children_rows = 0
+     if browser.show_children_pane and not browser._headless:
+@@ -2343,6 +2374,7 @@ def _layout_for(browser):
+     # renderer treats every paint target uniformly.
+     layout['sep_main_rightmost'] = _is_rightmost(layout.get('sep_main'))
+     layout['sep_inner_rightmost'] = _is_rightmost(layout.get('sep_inner'))
++    _lf_sec.__exit__(None, None, None)
+     return layout
+ 
+ 
+@@ -2413,6 +2445,8 @@ def render_full(browser):
+     is gone (#185–#188): the differential renderer relies on the row
+     cache to detect stale columns rather than forcing a flash repaint.
+     """
++    _rf_sec = _perf_section('render_full')
++    _rf_sec.__enter__()
+     begin_sync()
+     layout = _layout_for(browser)
+     _reconcile_pane_caches(browser, layout)
+@@ -2478,6 +2512,7 @@ def render_full(browser):
+     end_sync()
+     flush()
+     browser._needs_redraw = set()
++    _rf_sec.__exit__(None, None, None)
+ 
+ 
+ def render_partial(browser):
+@@ -2502,6 +2537,8 @@ def render_partial(browser):
+     if not needs:
+         return
+ 
++    _rp_sec = _perf_section('render_partial', needs='+'.join(sorted(needs)))
++    _rp_sec.__enter__()
+     begin_sync()
+     layout = _layout_for(browser)
+     _reconcile_pane_caches(browser, layout)
+@@ -2583,6 +2620,7 @@ def render_partial(browser):
+     end_sync()
+     flush()
+     browser._needs_redraw = set()
++    _rp_sec.__exit__(None, None, None)
+ 
+ 
+ def _preview_label(browser):

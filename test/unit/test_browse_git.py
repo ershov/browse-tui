@@ -1806,5 +1806,98 @@ class TestSkipFillers(unittest.TestCase):
         self.assertEqual(set(self.r._graph_rows_by_ns), {'root', 'ref:x'})
 
 
+class _FakeSelItem:
+    """An Item stand-in for a selected row: only ``.id`` is read."""
+
+    def __init__(self, item_id):
+        self.id = item_id
+
+
+class _FakeSelCtx:
+    """Stand-in for the ``on_selection_change`` ctx.
+
+    Exposes ``selected`` (the Items currently selected), ``select(ids,
+    replace)`` (records calls and updates the set), and the cursor surfaces
+    the shared bounce reads (``cursor`` / ``cursor_index`` / ``cursor_to``).
+    """
+
+    def __init__(self, selected_ids, cur_id, cursor_index):
+        self._sel = list(selected_ids)
+        self.cursor = _FakeCursorItem(cur_id) if cur_id is not None else None
+        self.cursor_index = cursor_index
+        self.moves = []
+        self.select_calls = []
+
+    @property
+    def selected(self):
+        return [_FakeSelItem(i) for i in self._sel]
+
+    def select(self, ids, replace=False):
+        self.select_calls.append((list(ids), replace))
+        self._sel = (list(ids) if replace
+                     else self._sel + [i for i in ids if i not in self._sel])
+
+    def cursor_to(self, id, on_complete=None):
+        self.moves.append(id)
+
+
+class TestSelectionChange(unittest.TestCase):
+    """``_on_selection_change`` keeps fillers unselectable and bounces the
+    cursor off a filler after a space / alt-space select-and-move (which
+    mutates ``state.cursor`` directly and so bypasses ``on_cursor_change``).
+    """
+
+    _ROWS = [
+        ('commit:aaaa', False),
+        ('filler:root:0', True),
+        ('commit:bbbb', False),
+    ]
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self.r._tree_mode = True
+        self.r._graph_rows_by_ns = {'root': list(self._ROWS)}
+        self.r._prev_cursor_index = 0
+
+    def test_filler_stripped_from_selection(self):
+        # A filler that slipped into the selection is removed (unselectable);
+        # the cursor is on a commit, so no bounce.
+        ctx = _FakeSelCtx(['commit:aaaa', 'filler:root:0'], 'commit:aaaa', 0)
+        self.r._on_selection_change(ctx, list(ctx._sel))
+        self.assertEqual(ctx._sel, ['commit:aaaa'])
+        self.assertEqual(ctx.select_calls, [(['commit:aaaa'], True)])
+        self.assertEqual(ctx.moves, [])
+
+    def test_no_strip_when_selection_has_no_fillers(self):
+        ctx = _FakeSelCtx(['commit:aaaa', 'commit:bbbb'], 'commit:bbbb', 2)
+        self.r._on_selection_change(ctx, list(ctx._sel))
+        self.assertEqual(ctx.select_calls, [])
+        self.assertEqual(ctx.moves, [])
+
+    def test_select_all_strips_every_filler(self):
+        ctx = _FakeSelCtx(['commit:aaaa', 'filler:root:0', 'commit:bbbb'],
+                          'commit:aaaa', 0)
+        self.r._on_selection_change(ctx, list(ctx._sel))
+        self.assertEqual(ctx._sel, ['commit:aaaa', 'commit:bbbb'])
+
+    def test_bounce_off_filler_after_space_move(self):
+        # Space toggled commit:aaaa (idx 0) then stepped onto a filler (idx 1):
+        # no filler in the selection, but the cursor must skip past it.
+        self.r._prev_cursor_index = 0
+        ctx = _FakeSelCtx(['commit:aaaa'], 'filler:root:0', 1)
+        self.r._on_selection_change(ctx, list(ctx._sel))
+        self.assertEqual(ctx.select_calls, [])
+        self.assertEqual(ctx.moves, ['commit:bbbb'])
+
+    def test_reentry_after_strip_terminates(self):
+        # The real ctx.select re-fires the hook; a second pass on the now-clean
+        # selection must not strip again (no loop).
+        ctx = _FakeSelCtx(['filler:root:0', 'commit:aaaa'], 'commit:aaaa', 0)
+        self.r._on_selection_change(ctx, list(ctx._sel))
+        n = len(ctx.select_calls)
+        self.r._on_selection_change(ctx, list(ctx._sel))
+        self.assertEqual(len(ctx.select_calls), n)
+
+
 if __name__ == '__main__':
     unittest.main()

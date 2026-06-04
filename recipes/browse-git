@@ -1425,6 +1425,30 @@ def _next_non_filler(filler_id, direction):
     return None
 
 
+def _on_selection_change(ctx, ids):
+    """``on_selection_change`` hook — keep filler rows unselectable and bounce
+    the cursor off a filler after a select-and-move.
+
+    The framework calls this with the current selected ids (``ids``). Space
+    (``_select_toggle_down``) / Alt-Space (``_select_toggle_up``) toggle the
+    cursor row and step the cursor by mutating ``state.cursor`` directly,
+    which does NOT fire ``on_cursor_change`` — so ``_skip_fillers`` never runs
+    for those moves. We therefore re-run the same bounce here.
+
+    We also strip any ``filler:`` ids out of the selection: a filler is an
+    inert connector row and must not be selectable. Doing it here covers every
+    selection path (space, Ctrl-A select-all, invert). ``ctx.select`` re-fires
+    this hook, but the next pass finds no fillers and stops, so there is no
+    loop.
+    """
+    keep = [i for i in ids
+            if not (isinstance(i, str) and i.startswith('filler:'))]
+    if len(keep) != len(ids):
+        ctx.select(keep, replace=True)
+    cur = ctx.cursor
+    _skip_fillers(ctx, cur.id if cur is not None else None)
+
+
 # ---- entry point ---------------------------------------------------------
 
 
@@ -1555,6 +1579,7 @@ def main():
         actions=actions,
         on_enter=on_enter,
         on_cursor_change=_skip_fillers,
+        on_selection_change=_on_selection_change,
         show_ids='never',
         help_intro=_HELP_INTRO_TMPL.format(
             default=_LOG_LIMIT, modes=', '.join(_MODES)),
