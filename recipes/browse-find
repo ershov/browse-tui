@@ -42,4 +42,5 @@ exec "$BIN" \
     --input tsv --fields id \
     --record-sep null \
     --path-sep / \
+    --show-ids never \
     --preview-cmd '[[ -d "$TUI_ID" ]] && ls -lA --color=always "$TUI_ID" || head -1000 "$TUI_ID" 2>/dev/null'
