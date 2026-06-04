@@ -2549,9 +2549,10 @@ def render_info_bar(row, cols, label, *, info=False, browser=None,
         reset_style()
         set_style(fg=8)
     elif info and pos < cols:
-        # Hint text — kept generic; phase-3 ticket #32 will let recipes
-        # surface their own action keys here.
-        hints = ' /:search  ?:help  q:quit '
+        # Hint text — recipe-overridable via ``Browser.set_hint`` /
+        # ``Context.set_hint``. Fall back to the shared default so a
+        # browser without the attribute still renders the stock hint.
+        hints = getattr(browser, 'hint', DEFAULT_HINT)
         avail = cols - pos - len(label_str) - 3
         if avail > 10:
             h = hints[:avail]

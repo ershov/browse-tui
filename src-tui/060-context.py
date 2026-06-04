@@ -269,6 +269,22 @@ class Context:
         return self._browser.clear_search()
 
     @property
+    def hint(self) -> str:
+        """The info-bar hint line.
+
+        Pass-through to :attr:`Browser.hint`. Defaults to
+        ``' /:search  ?:help  q:quit '``.
+        """
+        return self._browser.hint
+
+    def set_hint(self, text: str) -> None:
+        """Replace the info-bar hint line.
+
+        Pass-through to :meth:`Browser.set_hint`. Repaints the info bar.
+        """
+        return self._browser.set_hint(text)
+
+    @property
     def scope(self):
         """Current scope id, or ``None`` at the root.
 
