@@ -1,14 +1,22 @@
 #!/usr/bin/env -S browse-tui --run-py
 """browse-md — markdown browser supporting one or more files.
 
-Parses each markdown file on argv into a tree of headings (h1..h6);
+Positionals may be files OR directories: a directory expands to the
+``.md`` / ``.MD`` files directly inside it (non-recursive, sorted by
+name). With no positionals at all the recipe browses the current
+directory (equivalent to ``browse-md .``).
+
+Parses each resulting markdown file into a tree of headings (h1..h6);
 list items under each section can optionally be surfaced as tree
 rows via the ``-l`` / ``--list`` / ``--lists`` flag (default:
 headings only). Per-file roots ARE the top-level entries: with a
 single file the browser opens scoped into that file's headings;
 with multiple files each file shows as a top-level row and the
 framework's ``get_children(None)`` returns the per-file roots in
-argv order.
+argv order. Each top-level row is normally labeled by its bare
+basename; when the final file list spans more than one directory the
+labels go relative to a shared root instead, disambiguating
+same-named files across directories.
 
 Anchor syntax (``FILE.md#name`` / ``FILE.md#<line>``) seeds the
 initial scope so deep links open directly on the targeted section.
@@ -39,7 +47,7 @@ Custom actions on top of the framework defaults:
       sections in one keystroke. The same cascade runs on the
       single-file startup auto-expand.
 
-Usage:  browse-md [-l] FILE.md[#anchor] [FILE.md[#anchor] ...]
+Usage:  browse-md [-l] [FILE.md[#anchor] | DIR ...]
 """
 
 import bisect
@@ -143,7 +151,7 @@ _HEADING_STYLES = {
 _INCLUDE_LISTS = False
 
 
-_USAGE = 'usage: browse-md [-l] FILE.md[#anchor] [FILE.md[#anchor] ...]'
+_USAGE = 'usage: browse-md [-l] [FILE.md[#anchor] | DIR ...]'
 
 # Markdown file extensions recognised when a positional names a directory.
 # A directory argument expands to every direct child with one of these
@@ -1727,16 +1735,24 @@ def _on_expand(ctx, ids):
 _HELP_INTRO = """\
 browse-md — markdown browser for one or more files.
 
-Usage: browse-md [-l] FILE.md[#anchor] [FILE.md[#anchor] ...]
+Usage: browse-md [-l] [FILE.md[#anchor] | DIR ...]
   -l, --list, --lists  Also surface list items (default: headings).
   FILE.md   One or more markdown files. Each file shows as a
             top-level row in the tree; there is no synthetic root
             above them. With a single file the browser opens scoped
             into that file's headings.
+  DIR       A directory expands to the ``.md`` / ``.MD`` files
+            directly inside it (non-recursive, sorted by name). With
+            no positionals at all the current directory is browsed
+            (same as ``browse-md .``).
   #anchor   Deep-link target — 0-based line number or heading name
             (exact / prefix / substring tiers; first hit wins). When
             multiple files carry anchors, the FIRST anchored file in
             argv order wins.
+
+  Top-level rows are labeled by basename; when the files span more
+  than one directory the labels go relative to a shared root to
+  disambiguate same-named files.
 
   m       Toggle md2ansi coloring.
   M       Render the preview through ``$MD2ANSI`` / md2ansi.
