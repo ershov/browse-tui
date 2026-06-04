@@ -265,6 +265,59 @@ class TestBrowseClaude(unittest.TestCase):
                 t.wait_for('hello world', timeout=3.0)
                 t.send('q')
 
+    def test_direct_launch_scope_root_real_item_and_preview(self):
+        """#730: direct launch must give the scope-root row a REAL session
+        Item with a populated preview — not a synthetic raw-path stub
+        whose preview is blank.
+
+        On ``browse-claude <file.jsonl>`` the framework scopes straight
+        into the session before its parent dir is listed, so the
+        scope-root row had no Item and ``visible_items`` synthesised a
+        placeholder (raw-path title, ``boundary`` unset). browse-claude's
+        ``_is_cross_file_id`` then read that bare stub as in-file and
+        ``get_preview`` returned '' → permanently blank top preview.
+
+        We launch directly on the .jsonl, navigate to the TOP scope-root
+        row (``g``), and assert (a) the row carries the rich session tag
+        (``… msg``) — only a real Item has it — and (b) the preview shows
+        the umbrella's scope card (the unique ``sessionId`` only the card
+        renders), proving the preview is the cascade, not blank.
+        """
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, '.claude', 'projects', '-home-x')
+            os.makedirs(proj)
+            sess = os.path.join(proj, 'direct730.jsonl')
+            recs = [
+                {'type': 'user', 'uuid': 'u1', 'parentUuid': None,
+                 'promptId': 'P1', 'sessionId': 'SCOPECARD730PROBE',
+                 'message': {'role': 'user', 'content': 'PROBE730_BODY'}},
+                {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+                 'message': {'role': 'assistant', 'content': [
+                     {'type': 'text', 'text': 'PROBE730_REPLY'}]}},
+            ]
+            with open(sess, 'w') as f:
+                for r in recs:
+                    f.write(json.dumps(r) + '\n')
+            with TmuxFixture(cols=140, rows=30, env=self._launch_env(tmp)) as t:
+                # Positional .jsonl path — the user's reported launch shape.
+                t.launch(_BIN, '--run-py', _RECIPE, '--no-tree', sess)
+                # The conversation loads (cursor jumps to the latest voice).
+                t.wait_for('PROBE730_REPLY', timeout=3.0)
+                # Go to the TOP scope-root row.
+                t.send('g')
+                # (a) Real Item: the scope-root header carries the session
+                # tag ("N msg …"). A synthetic placeholder would show only
+                # the raw path with no tag.
+                cap = t.wait_for(' msg', timeout=3.0)
+                self.assertIn('direct730.jsonl', cap)
+                # (b) Preview populated with the umbrella cascade — the
+                # scope card's sessionId line only appears in the preview
+                # pane (the row title uses the filename, never the
+                # sessionId), so this is unambiguous proof it's not blank.
+                t.wait_for('SCOPECARD730PROBE', timeout=3.0)
+                t.send('q')
+
     def test_J_K_jump_between_voice_rows(self):
         """``J``/``K`` skip over tool_use / tool_result / metadata rows.
 

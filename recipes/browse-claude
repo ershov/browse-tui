@@ -573,6 +573,70 @@ def _list_projects():
     return out
 
 
+def _session_item(full, st=None):
+    """Build the rich session-row Item for the ``.jsonl`` at ``full``.
+
+    Single source of truth for the session-row shape, shared by
+    :func:`_list_sessions` (project listing) and the direct-launch
+    scope-root seed (:func:`_seed_scope_root_item`, #730). ``st`` is an
+    optional pre-fetched ``os.stat`` result; when omitted it's stat'd
+    here. Returns ``None`` if the file can't be stat'd or ``--running``
+    is active and this session has no live process.
+    """
+    if st is None:
+        try:
+            st = os.stat(full)
+        except OSError:
+            return None
+    # Line count is a fast O(file-size) proxy for message count and
+    # subsumes the "is this session non-empty?" check we need for
+    # has_children. Cheaper than json-parsing every line just to count.
+    try:
+        with open(full, 'rb') as f:
+            count = sum(1 for _ in f)
+    except OSError:
+        count = 0
+    sid = os.path.basename(full)[:-len('.jsonl')]
+    running_meta = _RUNNING_INDEX.get(sid)
+    # --running: hide sessions whose claude process isn't alive.
+    if _RUNNING_ONLY and not running_meta:
+        return None
+    n_subs = _count_subagents(full)
+    tag = f'{count} msg'
+    if n_subs:
+        tag += f' · {n_subs} sub'
+    tag += f' · {_human_time(st.st_mtime)}'
+    if running_meta:
+        tag = f'pid {running_meta["pid"]} · ' + tag
+    item = Item(
+        id=full,
+        title=sid,
+        # When this session becomes the current scope, show the
+        # full filesystem path on the synthetic scope-header row
+        # (the listing-pane title stays short — the session id).
+        # Matches the display you get when opening the session
+        # directly from the command line.
+        scope_title=full,
+        tag=tag,
+        tag_style=('green' if running_meta else 'dim'),
+        has_children=count > 0 or n_subs > 0,
+        # A bare session row anchors a whole other file — a
+        # self-contained foreign subtree. ``boundary`` is what the
+        # migrated ``_is_cross_file_id`` reads to render the cheap
+        # metadata card until the row is committed (scoped/expanded),
+        # and what stops a recursive expand from walking the whole
+        # transcript in one go.
+        boundary=True,
+    )
+    item.kind = 'session'
+    item.line_count = count
+    item.subagent_count = n_subs
+    item.mtime = st.st_mtime
+    item.pid = running_meta['pid'] if running_meta else None
+    item.status = running_meta.get('status') if running_meta else None
+    return item
+
+
 def _list_sessions(project_dir):
     out = []
     try:
@@ -583,57 +647,9 @@ def _list_sessions(project_dir):
         if not name.endswith('.jsonl'):
             continue
         full = os.path.join(project_dir, name)
-        try:
-            st = os.stat(full)
-        except OSError:
-            continue
-        # Line count is a fast O(file-size) proxy for message count and
-        # subsumes the "is this session non-empty?" check we need for
-        # has_children. Cheaper than json-parsing every line just to count.
-        try:
-            with open(full, 'rb') as f:
-                count = sum(1 for _ in f)
-        except OSError:
-            count = 0
-        sid = name[:-len('.jsonl')]
-        running_meta = _RUNNING_INDEX.get(sid)
-        # --running: hide sessions whose claude process isn't alive.
-        if _RUNNING_ONLY and not running_meta:
-            continue
-        n_subs = _count_subagents(full)
-        tag = f'{count} msg'
-        if n_subs:
-            tag += f' · {n_subs} sub'
-        tag += f' · {_human_time(st.st_mtime)}'
-        if running_meta:
-            tag = f'pid {running_meta["pid"]} · ' + tag
-        item = Item(
-            id=full,
-            title=sid,
-            # When this session becomes the current scope, show the
-            # full filesystem path on the synthetic scope-header row
-            # (the listing-pane title stays short — the session id).
-            # Matches the display you get when opening the session
-            # directly from the command line.
-            scope_title=full,
-            tag=tag,
-            tag_style=('green' if running_meta else 'dim'),
-            has_children=count > 0 or n_subs > 0,
-            # A bare session row anchors a whole other file — a
-            # self-contained foreign subtree. ``boundary`` is what the
-            # migrated ``_is_cross_file_id`` reads to render the cheap
-            # metadata card until the row is committed (scoped/expanded),
-            # and what stops a recursive expand from walking the whole
-            # transcript in one go.
-            boundary=True,
-        )
-        item.kind = 'session'
-        item.line_count = count
-        item.subagent_count = n_subs
-        item.mtime = st.st_mtime
-        item.pid = running_meta['pid'] if running_meta else None
-        item.status = running_meta.get('status') if running_meta else None
-        out.append(item)
+        item = _session_item(full)
+        if item is not None:
+            out.append(item)
     out.sort(key=lambda it: -it.mtime)
     return out
 
@@ -5707,6 +5723,50 @@ def _ancestor_ids_for(item_id):
     return _ancestor_ids_for(parent_id) + [parent_id]
 
 
+def _seed_scope_root_item(b, target_jsonl, parent_scope):
+    """Register a REAL session Item for the initial scope_root (#730).
+
+    On direct launch (``browse-claude <file.jsonl>`` / ``--file`` / etc.)
+    the framework scopes straight into ``target_jsonl`` before its
+    children — or the parent dir's listing — have been fetched, so the
+    scope-root row has no Item in the index. ``visible_items`` then
+    fabricates a *synthetic* placeholder (raw-path title, ``boundary``
+    unset), and ``_is_cross_file_id`` reads that bare placeholder as
+    in-file → ``get_preview`` returns '' → the top preview is blank.
+
+    Seed the rich session Item (id, full-path scope_title, msg/sub-count
+    tag, ``boundary=True``, ``kind='session'``) under its parent dir so
+    ``visible_items`` finds a real Item instead of synthesizing one.
+
+    Registered by directly placing the Item in the framework's index
+    (``_items_by_id`` + ``_parent_of_id`` + the ``_children[parent_scope]``
+    list) — NOT via ``update_data``. That's deliberate: the
+    ``update_data`` apply path snapshots ``visible_items`` *before*
+    applying its ops, which would fabricate the synthetic stub first and
+    then merely patch it (leaving ``synthetic=True`` on the row). A direct
+    seed before ``run()`` puts the real Item in the index ahead of any
+    ``visible_items`` pass, so no placeholder is ever synthesized. This
+    mirrors the recipe's existing direct ``scope_stack`` manipulation at
+    startup (just below) and the engine's own scope-root indexing. The
+    eventual lazy ``_list_sessions(parent_scope)`` rebuilds the identical
+    Item under the same id, so this is a transient seed the real listing
+    reconciles.
+
+    No-op when the Item can't be built (file vanished, ``--running`` with
+    no live process) — the synthetic placeholder then stands and FIX A's
+    id-shape fallback keeps the preview correct.
+    """
+    item = _session_item(target_jsonl)
+    if item is None:
+        return
+    state = b._state
+    children = state._children.setdefault(parent_scope, [])
+    if not any(c.id == item.id for c in children):
+        children.append(item)
+    state._items_by_id[item.id] = item
+    state._parent_of_id[item.id] = parent_scope
+
+
 def _chain_expand_then_cursor(b, ancestor_ids, target_id):
     """Sequentially expand ``ancestor_ids`` (root → leaf), then ``cursor_to``.
 
@@ -5803,16 +5863,23 @@ def _is_cross_file_id(item_id):
     lookup, or a row referenced before its fetch) we fall back to the
     OLD id-shape predicate, so behaviour is identical for ``#agent:`` /
     bare-``.jsonl`` rows regardless of load state.
+
+    A SYNTHETIC placeholder (``synthetic=True``) is treated like "not
+    loaded" too: the engine fabricates one for a scope-root id with no
+    real Item yet (``boundary`` defaults to ``False`` on it), and trusting
+    that flag would mis-classify a bare ``.jsonl`` scope_root as in-file
+    and blank its preview (#730). Falling through to the id-shape test
+    keeps the cascade upgrade working until a real Item lands.
     """
     if not isinstance(item_id, str):
         return False
     get_item = getattr(_BROWSER, 'get_item', None)
     item = get_item(item_id) if get_item is not None else None
-    if item is not None:
+    if item is not None and not getattr(item, 'synthetic', False):
         return bool(getattr(item, 'boundary', False))
-    # Fallback (Item not loaded): the original id-shape test, so the
-    # cheap-preview / cascade-upgrade contract holds even before the
-    # row's Item exists in the index.
+    # Fallback (Item not loaded, or a synthetic placeholder): the
+    # original id-shape test, so the cheap-preview / cascade-upgrade
+    # contract holds even before the row's real Item exists in the index.
     if '#agent:' in item_id:
         return True
     if '#' not in item_id and item_id.endswith('.jsonl'):
@@ -6398,6 +6465,14 @@ def main():
     # bookkeeping the __init__ scope_into already established.
     if target_jsonl and parent_scope and parent_scope != target_jsonl:
         b._state.scope_stack.insert(0, parent_scope)
+
+    # Seed a REAL session Item for the scope_root so the framework never
+    # synthesizes a raw-path placeholder for the initial scope on direct
+    # launch — otherwise the top scope-root preview is blank (#730).
+    # Synchronous (before ``run()``), so the real Item is in the index
+    # ahead of the event loop's first ``visible_items`` pass.
+    if target_jsonl and parent_scope:
+        _seed_scope_root_item(b, target_jsonl, parent_scope)
 
     # Post-construction cursor positioning:
     #
