@@ -663,23 +663,31 @@ class TestBrowseClaude(unittest.TestCase):
                 t.launch(_BIN, '--run-py', _RECIPE,
                          '--tree', '--file', sess)
                 t.wait_for('PROBE_TURN2_REPLY', timeout=3.0)
-                # Capture cursor row's preview-pane body BEFORE toggle.
-                cap_tree = t.capture()
-                self.assertIn('PROBE_TURN2_REPLY', cap_tree)
+                # We synchronise on observable state transitions rather
+                # than a fixed sleep, so the assertion never races a
+                # mid-toggle repaint (or the async child-load that backs
+                # the tree rebuild) under load. Each toggle:
+                #   1. wait for a MODE-SPECIFIC marker that is absent in
+                #      the other mode — proves the toggle was processed
+                #      (not a stale pre-toggle frame). Tree mode shows
+                #      ``<prompt>`` turn-root markers; flat mode replaces
+                #      them with collapsed subagent rows (``[Explore``).
+                #   2. wait for PROBE_TURN2_REPLY — proves the cursor's
+                #      message re-rendered (the tree expand briefly shows
+                #      a ``⧗ loading…`` placeholder before children land).
+                self.assertIn('<prompt>', t.capture())
                 # Flip to flat — preview should still target the same
-                # message (PROBE_TURN2_REPLY). The structure changes
-                # (no ▼ tree markers under the scope row in flat).
+                # message (PROBE_TURN2_REPLY).
                 t.send('t')
-                # Wait long enough for refresh + cursor_to to land.
-                import time
-                time.sleep(0.15)
-                cap_flat = t.capture()
+                t.wait_for('[Explore', timeout=3.0)
+                cap_flat = t.wait_for('PROBE_TURN2_REPLY', timeout=3.0)
                 self.assertIn('PROBE_TURN2_REPLY', cap_flat,
                               f'cursor lost on tree→flat: {cap_flat[:400]!r}')
-                # Flip back to tree.
+                # Flip back to tree — the ``<prompt>`` turn-root marker
+                # returns once the tree view is rebuilt.
                 t.send('t')
-                time.sleep(0.15)
-                cap_back = t.capture()
+                t.wait_for('<prompt>', timeout=3.0)
+                cap_back = t.wait_for('PROBE_TURN2_REPLY', timeout=3.0)
                 self.assertIn('PROBE_TURN2_REPLY', cap_back,
                               f'cursor lost on flat→tree: {cap_back[:400]!r}')
                 t.send('q')
@@ -1317,11 +1325,16 @@ class TestBrowseClaude(unittest.TestCase):
                 # Drill into the outbound row's preview: header + markdown.
                 # Cursor lands on the latest voice (the reply, bottom row);
                 # K walks up to the outbound SendMessage voice row.
+                # Synchronise on PROBE_SEND_BODY: it lives only in the
+                # SendMessage ``message`` field, so it appears solely in
+                # the preview once the cursor reaches the outbound row —
+                # unlike ``→ PROBE_WORKER_7`` which is also in the list
+                # row and would match before the preview rendered.
                 t.send('K')
-                cap2 = t.wait_for('→ PROBE_WORKER_7', timeout=3.0)
-                self.assertIn('PROBE_SEND_BODY', cap2,
-                              'outbound preview should render message '
-                              'markdown; got: ' + cap2[-1200:])
+                cap2 = t.wait_for('PROBE_SEND_BODY', timeout=3.0)
+                self.assertIn('→ PROBE_WORKER_7', cap2,
+                              'outbound preview should render the '
+                              'recipient header; got: ' + cap2[-1200:])
                 t.send('q')
 
     def test_flat_sendmessage_inbound_preview_and_ack(self):
