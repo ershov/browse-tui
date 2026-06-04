@@ -236,8 +236,17 @@ def _m2a_fmt_hr(m, name, current_style, context, state):
     return _m2a_inject_color(bar, current_style, current_style)
 
 
+# `\`` → bare backtick. Inside a single-backtick code span `\` escapes ONLY a
+# backtick (so it can't close the span); every other backslash is left verbatim.
+_M2A_INLINE_CODE_UNESCAPE = re.compile(r"\\(`)")
+
+
 def _m2a_fmt_inline_code(m, name, current_style, context, state):
-    text = m.group(0).strip("`")
+    text = m.group(f"{name}_inner")
+    if name == "code_inline":
+        # Single-backtick spans honor `\`` so a backtick can be embedded;
+        # double-backtick spans keep backslashes verbatim per CommonMark.
+        text = _M2A_INLINE_CODE_UNESCAPE.sub(r"\1", text)
     return _m2a_styled(text, current_style, M2A_COLOR_STRING)
 
 
@@ -751,6 +760,12 @@ _MD_FOOTNOTE_DEF = r"""
 
 _MD_FOOTNOTE_REF = r" \[ \^ (?P<*id> [^\]\n]+ ) \] "
 
+# Backslash-escape token: `\<any char>`. Used as the first alternative in
+# every inline-delimiter rule's inner alternation so that `\*`, `\~`, `\[`,
+# `\\` etc. survive the wrapper rule as a single 2-char unit and don't
+# accidentally close the span.
+_MD_ESCAPED = r"\\."
+
 # Double-backtick inline code — body may contain single backticks; closes on
 # the first ``. Listed before the single-backtick rule so it wins on `` ``…`` ``.
 _MD_CODE_INLINE2 = rf"""
@@ -758,15 +773,12 @@ _MD_CODE_INLINE2 = rf"""
         (?: (?!``) (?: [^\n] | \n (?! {_BSA} ) ) )+
     ) ``
 """
-_MD_CODE_INLINE  = rf" ` (?P<*> (?: [^`\n] | \n (?! {_BSA} ) )+ ) ` "
+# Single-backtick inline code — like the emphasis rules, `{_MD_ESCAPED}` is the
+# first alternative (and `\\` is excluded from the negated class) so `\`` is a
+# literal backtick that doesn't close the span. The handler unwraps the escapes.
+_MD_CODE_INLINE  = rf" ` (?P<*> (?: {_MD_ESCAPED} | [^`\n\\] | \n (?! {_BSA} ) )+ ) ` "
 
 _MD_IMAGE = r" ! \[ (?P<*alt> [^\]\n]* ) \] \( (?P<*url> [^)\n]* ) \) "
-
-# Backslash-escape token: `\<any char>`. Used as the first alternative in
-# every inline-delimiter rule's inner alternation so that `\*`, `\~`, `\[`,
-# `\\` etc. survive the wrapper rule as a single 2-char unit and don't
-# accidentally close the span.
-_MD_ESCAPED = r"\\."
 
 # Standalone escape rule fires in the INLINE context so each `\<punct>`
 # token gets unwrapped to just the punctuation char. The `\n` in the
@@ -834,9 +846,9 @@ def _m2a_code_lambda(code_ctx, lang=None, label=None):
 _M2A_RULES_INLINE_RAW = (
     ("code_inline2",  _MD_CODE_INLINE2, _m2a_fmt_inline_code,  None),
     ("code_inline",   _MD_CODE_INLINE,  _m2a_fmt_inline_code,  None),
-    # Backslash escapes — placed AFTER inline code so backslashes inside
-    # ``…`` are preserved verbatim per CommonMark, but BEFORE every other
-    # delimiter so `\*`, `\~`, `\[` etc. don't trigger emphasis / links.
+    # Backslash escapes — placed AFTER inline code so a code span is captured
+    # whole (its own pattern/handler resolve any internal escapes), but BEFORE
+    # every other delimiter so `\*`, `\~`, `\[` etc. don't trigger emphasis / links.
     ("escape",        _MD_ESCAPE,       _m2a_fmt_escape,       None),
     ("image",         _MD_IMAGE,        _m2a_fmt_image,        None),
     ("link",          _MD_LINK,         M2A_COLOR_LINK,        _M2A_RECURSE_SELF),
