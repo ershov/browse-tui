@@ -58,7 +58,7 @@ Read-only with respect to history — the only mutation is ``E``'s
 working-tree edit.
 
 Usage:
-  browse-git [-n NUMBER] [--mode NAME] [--tree] [<revs>…] [-- <paths>…]
+  browse-git [<dir>] [-n NUMBER] [--mode NAME] [--tree] [<revs>…] [-- <paths>…]
 """
 
 import os
@@ -202,6 +202,43 @@ def _pop_tree_arg(default):
         else:
             i += 1
     return chosen
+
+
+def _pop_repo_dir():
+    """Honor a leading directory positional that points at another repo.
+
+    ``browse-git <dir>`` should browse the repo at ``<dir>`` even when the
+    cwd is unrelated (or not a repo at all). If the first non-flag
+    positional is a directory whose git work tree differs from the cwd's,
+    ``chdir`` into that tree and drop the arg from ``sys.argv`` so it isn't
+    re-read as a pathspec by ``_classify_positionals``. All later git
+    invocations then run against the new cwd.
+
+    A directory that is a *subdir of the current repo* resolves to the same
+    toplevel, so it's left in place to keep working as a pathspec filter.
+    Runs before the precondition check so launching from outside a repo
+    still works. Only the leading positional is considered; trailing dir
+    args stay pathspecs.
+    """
+    i = 1
+    while i < len(sys.argv):
+        a = sys.argv[i]
+        if a == '--':
+            return
+        if a.startswith('-'):
+            i += 1
+            continue
+        if not os.path.isdir(a):
+            return
+        top = _run_git('-C', a, 'rev-parse', '--show-toplevel')
+        if top.returncode != 0:
+            return
+        cwd_top = _run_git('rev-parse', '--show-toplevel')
+        if cwd_top.returncode == 0 and cwd_top.stdout == top.stdout:
+            return
+        os.chdir(top.stdout.strip())
+        del sys.argv[i]
+        return
 
 
 # ---- id parsing ----------------------------------------------------------
@@ -1455,7 +1492,10 @@ def _on_selection_change(ctx, ids):
 _HELP_INTRO_TMPL = """\
 browse-git — a tig-like browser over a git repository.
 
-Usage: browse-git [-n NUMBER] [--mode NAME] [--tree] [<rev>…] [-- <path>…]
+Usage: browse-git [<dir>] [-n NUMBER] [--mode NAME] [--tree] [<rev>…] [-- <path>…]
+  <dir>         A leading directory in another git repo browses THAT repo
+                (cwd need not be a repo). A subdir of the current repo
+                stays a pathspec filter instead.
   -n NUMBER     Cap the commit / reflog list to this many entries
                 (default: {default}).
   --mode NAME   Start in one of: {modes}. Default: commits.
@@ -1465,10 +1505,12 @@ Usage: browse-git [-n NUMBER] [--mode NAME] [--tree] [<rev>…] [-- <path>…]
   <path>…       A path filters the commits log to commits touching it.
   -- <path>…    Everything after -- is forced to be a pathspec.
 
-Positional args are auto-classified: an arg that names an existing file
-or directory is a pathspec; otherwise an arg git resolves as a commit is
-a rev; anything else is an error. They scope commits mode (an explicit
---mode other than commits ignores them).
+Positional args are auto-classified: a leading directory that is its own
+git work tree (distinct from the cwd's) selects the repo to browse; any
+other arg that names an existing file or directory is a pathspec;
+otherwise an arg git resolves as a commit is a rev; anything else is an
+error. They scope commits mode (an explicit --mode other than commits
+ignores them).
 
 The five view modes:
   commits   recent git log; drill commit -> changed files -> per-file diff
@@ -1551,6 +1593,10 @@ def main():
         if not shutil.which('git'):
             sys.stderr.write('browse-git: git not found on PATH\n')
             sys.exit(2)
+        # A leading directory positional pointing at another repo redirects
+        # the cwd into it (before the work-tree check below) so the recipe
+        # browses THAT repo rather than failing when launched from outside.
+        _pop_repo_dir()
         if _run_git('rev-parse', '--is-inside-work-tree').returncode != 0:
             sys.stderr.write('browse-git: not inside a git work tree\n')
             sys.exit(2)

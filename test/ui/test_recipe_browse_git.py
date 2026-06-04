@@ -194,6 +194,19 @@ class TestBrowseGit(unittest.TestCase):
                 t.wait_for('second commit add beta', timeout=5.0)
                 t.send('q')
 
+    def test_repo_dir_arg_browses_that_repo(self):
+        """A leading repo-dir arg browses THAT repo, even from a non-repo cwd."""
+        with tempfile.TemporaryDirectory() as repo, \
+                tempfile.TemporaryDirectory() as elsewhere:
+            _make_repo(repo)
+            with TmuxFixture(cols=120, rows=30) as t:
+                # Launch from an unrelated, non-repo cwd and point at the repo.
+                t.send_line(f'cd {elsewhere}')
+                t.launch(_BIN, '--run-py', _RECIPE, repo)
+                t.wait_for('first commit add alpha', timeout=5.0)
+                t.wait_for('second commit add beta', timeout=5.0)
+                t.send('q')
+
     def test_drills_into_commit_files(self):
         """Right-arrow on a commit reveals its changed files."""
         with tempfile.TemporaryDirectory() as tmp:
