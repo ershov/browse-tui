@@ -1,18 +1,17 @@
 # Meta rows — non-content rows the cursor skips
 
-**Status:** Draft for review
+**Status:** Draft for review (rev 2)
 **Date:** 2026-06-05
 **Branch:** `worktree-meta-rows`
 
 ## Problem
 
 Recipes need rows that are *not content* — dividers, section headers, and
-structural connector lines. Today the framework has no such concept: every row
-in the visible list is a landable, selectable content row. The row-kind
-discriminator that exists (`VisibleEntry.kind`, `040-state.py:297`) is
-`'normal'` / `'pending'`, both framework-injected and both landable — the cursor
-moves by raw index (`_nav_down`/`_nav_up`, `070-actions.py:101-115`) and never
-skips anything.
+structural connector lines. Today every row in the visible list is a landable,
+selectable content row. The row-kind discriminator that exists
+(`VisibleEntry.kind`, `040-state.py:297`) is `'normal'` / `'pending'`, both
+framework-injected and both landable — the cursor moves by raw index
+(`_nav_down`/`_nav_up`, `070-actions.py:101-115`) and never skips anything.
 
 The gap is already being paid for. `browse-git`'s `--graph` mode emits
 non-commit connector lines (`|\`, `|/`) that map to no commit. With no
@@ -20,327 +19,329 @@ primitive, it fakes them as inert `Item`s (`id='filler:<ns>:<n>'`,
 `recipes/browse-git:909`) and **reimplements non-selectability by hand**:
 
 - `_skip_fillers` (`recipes/browse-git:1391`) — an `on_cursor_change` hook that
-  *bounces* the cursor off a filler **after** it lands. Infers travel direction
-  from index deltas, scans a module-global ordered list (`_graph_rows_by_ns`) by
-  id-position, handles top/bottom runs by reversing, and carries loop-guard
-  logic because `cursor_to` re-fires the hook.
+  *bounces* the cursor off a filler **after** it lands (its own docstring calls
+  this "jarring"). Infers direction from index deltas, scans a module-global
+  ordered list (`_graph_rows_by_ns`) by id-position, handles end-runs by
+  reversing, and carries loop-guard logic because `cursor_to` re-fires it.
 - `_on_selection_change` (`recipes/browse-git:1466`) — a *second* hook, needed
   because space / Ctrl-A / invert mutate `state.cursor` directly without firing
-  `on_cursor_change`. It strips `filler:` ids out of the selection on every path
+  `on_cursor_change`. Strips `filler:` ids out of the selection on every path
   and re-runs the bounce.
-- Module globals `_graph_rows_by_ns` + `_prev_cursor_index` as scaffolding.
+- Module globals `_graph_rows_by_ns` + `_prev_cursor_index`.
 
-Three properties make this workaround a poor substitute for a primitive:
-
-1. **Reactive, not preventive.** The cursor lands on the filler, then bounces.
-   The docstring itself calls it "jarring."
-2. **Leaks across choke points.** Cursor motion happens through two paths —
-   `mark_cursor_changed` (arrows, mouse-click, `cursor_to`) and direct
-   `state.cursor` mutation (selection-toggle steps). That fragmentation is *why*
-   two hooks are needed. Any new move path is a new leak.
-3. **Non-reusable.** `browse-claude` (orphaned-subagent dividers) and any future
-   recipe would each reinvent it.
-
-The need was already diagnosed in
+The workaround is reactive (not preventive), leaks across the two cursor-move
+choke points (`mark_cursor_changed` vs. direct `state.cursor` writes), and is
+non-reusable. The need was already diagnosed in
 `docs/superpowers/specs/2026-06-01-browse-git-improvements-design.md:95`:
 connector rows "map to no `Item` — they'd need a **new synthetic,
 non-selectable row kind**."
 
 ## Goals
 
-- A recipe can mark a row as a **meta row**: a single line of display text
-  (ANSI/SGR allowed) that the cursor **skips**, that is **never selectable**,
-  and that carries **no chrome** (no selection marker, no `▼/▶`, no expansion).
-- Cursor-skip is **preventive** — the cursor never comes to rest on a meta row,
-  through any move path (arrows, page, home/end, mouse, selection-toggle steps).
-- Meta content can be **width-aware** (columns aligned via the existing `cell_*`
-  helpers) by giving the render path a `RowContext`.
+- A recipe marks a row `meta=True`: a non-content row the cursor **skips**
+  (best-effort, see below), that is **never selectable**, and **does not
+  participate in search/filter by default**.
+- Cursor-skip is **preventive** for sequential navigation (arrows, page) — no
+  bounce, no `on_cursor_change` round-trip.
+- Meta rows **reuse the normal chrome + content rendering pipeline**, so
+  indentation and alignment come for free and there is no second hook.
+- Row content may be **segments** (default; color via segment `fg`) **or a raw
+  ANSI string** (passthrough of pre-colored text), with defined ANSI handling
+  shared with the preview pane.
+- Per-Browser control over how meta rows behave under search and filter.
 - Migrate `browse-git` filler rows onto the primitive and **delete** the
   `_skip_fillers` / `_on_selection_change` / globals workaround.
 - Add `browse-claude` orphaned-subagent section dividers as meta rows.
-- A defined behavior for a list with **no landable row** (all-meta / empty).
 
 ## Non-goals
 
-- **A standalone `selectable=False` flag on *content* rows.** This is a genuinely
-  *orthogonal* axis (cursor still lands; the row is just excluded from the
-  selection set — e.g. a `load more…` sentinel). It shares no machinery with
-  meta rows (selection-set guards vs. cursor-skip) and is deferred to its own
-  change.
-- **A grouping / column engine.** Recipes inject meta rows positionally into
-  their own `get_children` list; the framework does not own "groups." Consistent
-  with the "primitives, not an engine" stance of the list-columns design
-  (`...2026-06-03-list-columns-design.md:90`).
-- **A `browse-fs` column header.** Dropped per review: the columns are
-  self-evident and a header steals a list row.
-- **Meta rows with children / expansion.** Meta rows are always leaves;
-  `has_children` is ignored on them.
+- **A navigable meta header** (cursor *lands* on a header, Enter collapses its
+  section). The design stays forward-compatible (landing is tolerated, see
+  §3.1), but skip-by-default ships and the opt-out is deferred.
+- **A standalone `selectable=False` on *content* rows** (the load-more
+  sentinel). Orthogonal axis, different machinery, deferred.
+- **Arbitrary non-hashable IDs (`==`-only).** Rejected: ids are dict keys / set
+  members on the hot path; `==`-only forces O(n) lookups. Structured *hashable*
+  ids (tuples / namedtuples) already work and are the recommendation (§6).
+- **A grouping / column engine, and a `browse-fs` column header.** Recipes
+  inject meta rows positionally; the framework owns no "groups." (browse-fs
+  header dropped per review — columns are self-evident, don't steal a row.)
+- **Meta rows with children / expansion.** Meta rows are always leaves.
 
 ## Naming
 
-The one naming decision to confirm. This spec uses **`meta`** throughout:
-`Item.meta` (the flag) → `VisibleEntry.kind == 'meta'` → `format_meta` (the
-render hook). Rationale: short, sits cleanly beside `'normal'`/`'pending'`, and
-reads as "about the list, not in it" — covering both a divider and a header.
-Alternatives considered: `aside` (evocative but less conventional); `filler`
-(too narrow — undersells a labeled header; stays as browse-git's local id
-prefix); `out-of-band` (accurate, clunky as an identifier). **If you prefer one
-of these, say so and I'll global-replace before planning.**
+Confirmed: **`meta`** — `Item.meta` (flag) → `VisibleEntry.kind == 'meta'`.
+No render hook is named (the pipeline is reused, §4).
 
 ## Design
 
 ### 1. Data model — `Item.meta` (`030-data.py`)
 
-Add one structural flag, alongside `hidden` / `boundary`:
+One structural flag, alongside `hidden` / `boundary`:
 
 ```python
 meta: bool = False
 ```
 
-A meta row is a display-only line. `meta=True` means: render as a single
-(optionally ANSI) line, skip the cursor over it, never select it, draw no
-chrome. `has_children` is ignored. Add `'meta'` to the two `known`-field sets in
-`to_item` (`030-data.py:197`, `030-data.py:240`) so dict/`Item` coercion accepts
-it. Docstring paragraph in the `Item` class matching the `hidden`/`boundary`
-style.
+`meta=True` means: render via the normal pipeline with chrome reduced to
+indentation, skip the cursor over it by default, never select it, and exclude it
+from search/filter (per §5). `has_children` is ignored (always a leaf). Add
+`'meta'` to the two `known`-field sets in `to_item` (`030-data.py:197,240`).
+Docstring paragraph matching the `hidden`/`boundary` style.
 
-A recipe declares a static divider with nothing more than:
+A static divider needs nothing more than:
 
 ```python
-Item(id='sep:subagents', title='── Subagents ──', meta=True)
+Item(id=('sep', 'subagents'), title='── Subagents ──', meta=True)
 ```
+
+**Why a single flag (not separate `meta`/`selectable`/`landable`).** The three
+are conceptually distinct, but only *landable* has independent value (a
+navigable header). Selecting a non-content row is meaningless, so non-selectable
+stays coupled to `meta`. Because landing is *tolerated* (§3.1), "non-landable"
+reduces to "nav-skips-by-default"; a future navigable header is `meta` +
+opt-out-of-skip — purely additive. Ship one flag.
 
 ### 2. Visible tree — emit `kind='meta'` (`040-state.py`)
 
-`_emit_children` (`040-state.py:1721`) sets the kind when emitting:
+`_emit_children` (`040-state.py:1721`) sets the kind:
 
 ```python
 kind = 'meta' if getattr(child, 'meta', False) else 'normal'
 out.append(VisibleEntry(item=child, depth=d, kind=kind))
 ```
 
-Meta rows occupy a visible-list slot (they take vertical space and a scroll
-position) but are never recursed into (treated as leaves regardless of
-`has_children`). Update the `VisibleEntry.kind` docstring to document `'meta'`.
+Meta rows occupy a visible-list slot (vertical space + scroll position) and are
+never recursed into. Update the `VisibleEntry.kind` docstring.
 
-### 3. Cursor navigation — preventive skip (`070-actions.py`, `040-state.py`)
+### 3. Cursor navigation
 
-This is the core of the change and the part that replaces browse-git's
-workaround.
+#### 3.1 Best-effort, not an invariant
 
-**Landability.** A row is *landable* when `kind != 'meta'`. (`'normal'` and the
-`'pending'` placeholder both stay landable — current behavior is unchanged for
-them. `'insert_marker'` is render-only and never appears in the real
-`visible_items` list.)
+The framework makes its **best effort** to never rest the cursor on a meta row,
+but it **can** happen (explicit `cursor_to`, a click policy edge, an all-meta
+list) and **this is not an error**. Recipes must tolerate it: `ctx.cursor`
+already returns `None` for non-`'normal'` rows (`050-render.py:1996`), so
+cursor-item actions no-op there today. The renderer must also paint a meta row
+*correctly even under the cursor* (no crash; see §4).
 
-**One helper, used by every move site:**
+#### 3.2 Move policy
+
+A row is *landable* when `kind != 'meta'` (`'normal'` and `'pending'` stay
+landable — unchanged). Sites:
+
+- **Arrows / page** (`_nav_down/up/pgdn/pgup`, `070-actions.py:101-167`): step in
+  the travel direction to the next landable row (page = jump then snap toward
+  travel, falling back the other way).
+- **Home / End** (`_nav_home/end`, `:118`): first / last **landable** row.
+- **Mouse click** (`_click_list_row`, `:1770`): snap to the **closest** landable
+  row; tie → down. (A click is spatial intent; a divider isn't actionable.)
+- **Selection-toggle steps** (`_select_toggle_down/up`, `:502,526`): route the
+  cursor step through the same skip helper — no separate hook (this is what
+  browse-git's second hook existed for).
+- **API `cursor_to(id)`**: honored **exactly** — explicit recipe intent; landing
+  tolerated per §3.1.
+
+One shared helper does the work:
 
 ```python
 def _next_landable(vis, start, direction):
-    """Nearest landable index from `start` (inclusive) moving `direction`
-    (+1/-1). Returns None when there is no landable row that way."""
+    """Nearest landable index from `start` moving `direction` (+1/-1);
+    None if there is none that way."""   # closest-variant for clicks
 ```
 
-Rewire the move sites so they compute the next landable index instead of
-`cursor ± 1`:
+#### 3.3 Complexity assumption (#4)
 
-- `_nav_down` / `_nav_up` (`070-actions.py:101`) — step to the next landable in
-  the travel direction.
-- `_nav_pgdn` / `_nav_pgup` (`070-actions.py:144`) — jump a page, then snap to
-  the nearest landable (preferring the travel direction, falling back the other
-  way so a page that lands in a meta run still resolves).
-- `_nav_home` / `_nav_end` (`070-actions.py:118`) — first / last **landable**
-  row (not raw index 0 / `len-1`).
-- `_click_list_row` (`070-actions.py:1770`) — a click on a meta row snaps to the
-  nearest landable (or no-ops if none).
-- Selection-toggle steps (`_select_toggle_down` / `_select_toggle_up`, the paths
-  `browse-git`'s second hook exists for) — route their cursor step through
-  `_next_landable` too, so meta is skipped without a separate hook.
+**We expect few meta rows and no long runs of them.** The skip is a plain linear
+scan from the cursor; in practice it advances 1–2 rows. No precomputed
+landable-index structure (browse-git's `_graph_rows_by_ns` exists only because
+its reactive hook couldn't scan the live list — the preventive design doesn't
+need it). Worst case (all-meta) is O(visible) but rare and bounded by one pass.
 
-Because the skip is centralized and applied *during* the move, the cursor never
-rests on a meta row — no bounce, no `on_cursor_change` round-trip.
+#### 3.4 Clamp / anchor / empty
 
-**Clamp / anchor / init.** The cursor-position invariants must also respect
-landability:
+Cursor-position invariants respect landability: initial / post-refresh clamps
+(`040-state.py:4130,5259,5971`) and `_apply_cursor_anchor` / `_reanchor_cursor`
+(`:7097,7005`) snap to the nearest landable. When `_next_landable` finds none
+(empty or all-meta), the cursor **parks** — existing `0 <= cursor < len(vis)`
+guards make row actions no-op. A `BrowserConfig.on_empty` option, fzf-style:
+`'wait'` (default — park and let the user exit) or `'exit'` (quit when no
+landable row exists).
 
-- Initial cursor and post-refresh clamps (`040-state.py` cursor-assignment
-  sites, e.g. `:4130`, `:5259`, `:5971`) snap to the nearest landable.
-- `_apply_cursor_anchor` (`040-state.py:7097`) and `_reanchor_cursor`
-  (`040-state.py:7005`) — when the anchored id resolves onto a meta row (or the
-  index it re-snaps to is meta), move to the nearest landable.
+### 4. Rendering — reuse the chrome + content pipeline
 
-**No-landable case.** When `_next_landable` finds nothing (empty or all-meta
-list), the cursor "parks" — it does not move onto a meta row, and the existing
-`0 <= cursor < len(vis)` guards in row actions make them no-op. See §7.
+Meta rows go through the **same** `_compose_row` path as normal rows
+(`040-state.py:3507` = `format_row_chrome(item, ctx) + format_row_content(item,
+ctx)`), with `ctx.kind == 'meta'` available so a shared hook can branch. **No
+`format_meta` hook.**
 
-### 4. Render — the meta branch (`050-render.py`)
+- **Chrome.** `default_row_chrome` (`040-state.py:2699`) already blanks the
+  selection marker when unselected and the expander when `not has_children`.
+  A meta row is never selected and is a leaf, so its chrome reduces to *aligned
+  indentation* — content lines up under normal rows' content. (The renderer
+  forces the blank marker/expander for `kind=='meta'` so this holds even if a
+  recipe leaves `has_children=True`.)
+- **Content.** Default = the title segment (no id/chips — those are content
+  decorations). Recipes override `format_row_content` (branching on `ctx.kind`)
+  for richer content; `browse-git`'s `git_row_content` filler branch
+  (`recipes/browse-git:950`) **already returns the right segments** and is reused
+  unchanged.
+- **Full-width** (divider spanning from column 0, no indentation): the recipe
+  overrides `format_row` (the whole-row hook) — same mechanism normal rows use.
+- **Content as a raw ANSI string.** `format_row_content` may return a `str`
+  (ANSI allowed) instead of a segment list — for passthrough of pre-colored
+  text (external tools, future colored graph spine). The renderer detects `str`
+  vs `list` and applies §4.5. (Segments stay the norm for normal rows so the
+  cursor reverse-video / search overlay compose cleanly; a raw ANSI string under
+  the cursor or matching search is best-effort.)
 
-Add a `kind == 'meta'` branch in `render_list` (beside the `'pending'` /
-`'insert_marker'` branches, `050-render.py:1544-1565`):
+Why reuse beats a separate hook, and why no `paint()` helper: see the rev-2
+review notes — segments already carry color via `fg`, so a "dim" divider is just
+`style('dim')`; a string is only needed for passthrough.
 
-- Resolve the row's text via the render hook (§5): a single `str` that may
-  contain SGR.
-- Truncate with `_truncate_visible` (`050-render.py:866`) — the existing
-  one-pass, ANSI-aware truncator — to the list-pane width, then pad to width.
-- Emit it with **no chrome**: no selection `*`, no `▼/▶`, no depth indent
-  imposed by the framework, no search highlight, no cursor reverse-video (the
-  cursor cannot land here, so the `is_cursor_line` path is never taken for meta).
-  The hook owns the whole row width — this is the "occupy the whole row" model.
+### 4.5 ANSI handling (#10)
 
-A meta row is cheaper to render than a normal row (it skips the segment /
-RowContext-content / search-overlay pipeline).
+Applies to any **raw ANSI string** rendered as row content, and to the **preview
+pane**. Shares the existing `_sanitize_preview` machinery (`050-render.py:142`).
 
-### 5. Render hook — `format_meta(item, ctx) -> str` (`BrowserConfig`, `050-render.py`)
+1. **Sanitize on receipt.** Strip every escape *except* SGR colour sequences:
+   keep `\e[…m`, drop all other CSI (cursor moves, clears, etc.) and bare `\e`.
+   (Intent of the user's `\e[.*[a-ln-z]|\e`; implemented as a robust
+   per-sequence scan, not a greedy regex.)
+2. **Truncate** to the pane width with `_truncate_visible` (`050-render.py:866`)
+   — one-pass, ANSI-aware (counts visible cells, passes escapes through).
+3. **Reset, conditionally.** If the (sanitized) string contains **no** ANSI,
+   emit nothing extra. If it contains any ANSI, emit `\e[m` at the end.
+4. **Background restore.** If a background colour is set for the row **and** the
+   string contains any background code (`40–49`, `100–109`), re-emit
+   `\e[<row-bg>m` after the reset so the trailing pad keeps the row background.
 
-Meta content is produced by an **optional** hook so the simple case stays
-trivial and the width-aware case is possible:
+### 5. Search and filtering (#11)
 
-- **Default** (no override): returns `item.title`. A static divider needs only
-  `meta=True` + a `title`.
-- **Override** `format_meta(item, ctx)`: returns a single `str` (ANSI allowed).
-  Receives a `RowContext` (`050-render.py:229`) — so the recipe has `depth`,
-  `list_width`, `max_col_width`, `is_current_scope`, and `kind='meta'`. This is
-  what lets `browse-git` align its graph art under the commit columns at render
-  time (it reads `ctx.max_col_width`, exactly as `git_row_content` does today —
-  `recipes/browse-git:948-956`).
+**Defaults:** meta rows do **not** participate in search or filtering, and when
+user filtering (`&`) is active **all meta rows are hidden**. (Search already
+skips non-`'normal'` entries — `040-state.py:1858`; this extends the same
+exclusion to filtering.)
 
-Wired in `Browser.__init__` like the other row hooks (bound once; never `None`
-at the call site).
+**Per-Browser overrides** (`BrowserConfig`):
 
-**Why a string, not segments.** The user requirement is a single ANSI line, and
-it unlocks the deferred colored-graph-spine future (a string *can* carry ANSI;
-normal-row titles cannot — `...browse-git-improvements-design.md:93`).
-`browse-git` fillers are monochrome today, so as strings they are literally
-`' ' * pad + graph`. Columnar/colored meta content composes with the existing
-`cell_*` helpers, which are already ANSI-aware (they strip escapes when
-measuring width — `050-render.py:983`): justify the plain text, then paint.
+- `meta_search_highlight: bool = False` — whether an active search query may
+  paint highlight spans on meta rows.
+- `meta_filter_mode: str = 'hide'`:
+  - `'hide'` (default) — meta rows hide while a filter is active (git-like; the
+    graph art is meaningless when filtered).
+  - `'show'` — meta rows stay visible regardless of filter (header-like; a
+    section divider survives even if its section filters away).
+  - `'filter'` — meta rows participate in filtering like content rows.
 
-### 6. Minor primitive — `paint(text, name_or_fg, bold=False) -> str`
+This subsumes the earlier "orphaned divider over an empty section" edge: a recipe
+that wants its header to persist uses `'show'`.
 
-`style()` returns a `(fg, bold)` tuple consumed by the segment writer; there is
-no string-emitting analogue, so a colored meta *string* would otherwise
-hand-roll `\033[…m`. Add a small `paint` helper (the string analogue of
-`style()` + the segment writer) so colored dividers are ergonomic:
-`paint('── Subagents ──', 'dim')`. Monochrome cases (browse-git fillers) need
-nothing. Exported to recipes alongside `style` / `cell_*`.
+### 6. IDs (note, not a change)
 
-### 7. Empty / all-meta mode (`BrowserConfig`)
+`Item.id` stays `Any`-*hashable*. Recipes that want structured ids for
+namespacing can already use tuples / namedtuples (`Item(id=('filler', n))`); only
+the bare-tuple *shorthand* is reserved for positional fields. With `meta` as a
+flag, recipes need not encode meta-ness in the id at all (browse-git's
+`'filler:'` prefix becomes unnecessary as a *marker*, though ids stay unique).
+Broadening to non-hashable ids is rejected (hot-path lookups) and out of scope.
 
-fzf-style, minimal. A config option `on_empty` (or similar) with values
-`'wait'` (default) and `'exit'`:
+### Config surface (new)
 
-- `'wait'`: the cursor parks (no landable row), all row-actions no-op, the user
-  exits manually. Matches today's genuinely-empty-list behavior.
-- `'exit'`: when the list has no landable row, the browser quits (cancel code),
-  like `fzf --exit-0`.
-
-The hard requirement is only that `_next_landable` returns `None` cleanly and
-nothing crashes; the auto-exit is a thin layer on top.
-
-### 8. Already-handled axes (verify, don't rebuild)
-
-- **Selection exclusion** is free: `select_all_visible` (`070-actions.py:562`),
-  `is_selected` (`050-render.py:1538`), and the toggle/invert paths already gate
-  on `kind == 'normal'`, so a meta row can never enter `state.selected`. This is
-  the ~45 lines of `filler:`-stripping browse-git deletes outright.
-- **Search exclusion** is free: `_search_find` already skips non-`'normal'`
-  entries (`040-state.py:1858`).
+`BrowserConfig`: `on_empty='wait'`, `meta_search_highlight=False`,
+`meta_filter_mode='hide'`. No new row hook.
 
 ## Migrations
 
 ### browse-git (the validation)
 
-- In `_commit_graph_items` (`recipes/browse-git:893`): set `meta=True` on filler
-  `Item`s; drop the `filler_n` counter's role as skip-scaffolding, the
-  `row_ids`/`(id, is_filler)` tracking, and the `_graph_rows_by_ns[ns] = …`
-  write. (Filler ids may stay unique for cache hygiene but no longer need
-  position-tracking.)
-- Convert the filler branch of `git_row_content` (`recipes/browse-git:950-956`)
-  into the `format_meta` override: return the string `' ' * pad + graph` using
-  `ctx.max_col_width`.
+- `_commit_graph_items` (`recipes/browse-git:893`): set `meta=True` on filler
+  `Item`s; drop the `(id, is_filler)` row-tracking and the `_graph_rows_by_ns`
+  write (ids may stay unique for cache hygiene). `git_row_content`'s filler
+  branch is **kept** — it already produces the aligned graph segments.
 - **Delete:** `_skip_fillers` (`:1391`), `_next_non_filler` (`:1441`),
-  `_on_selection_change` (`:1466`), the globals `_graph_rows_by_ns` /
-  `_prev_cursor_index`, the doc-comment block (`:109`), and the
-  `on_cursor_change=` / `on_selection_change=` wiring (`:1628`). Remove their
-  tests.
+  `_on_selection_change` (`:1466`), globals `_graph_rows_by_ns` /
+  `_prev_cursor_index`, the doc block (`:109`), the `on_cursor_change=` /
+  `on_selection_change=` wiring (`:1628`), and their tests.
+- `meta_filter_mode` stays `'hide'` (fillers vanish under filter — correct).
 
 The clean deletion is the proof the primitive is correctly shaped.
 
 ### browse-claude (orphaned-subagent dividers)
 
-In `_list_session_children` (`recipes/browse-claude:975`), when the session has
-subagents, bracket the subagent block with two meta divider rows:
+In `_list_session_children` (`recipes/browse-claude:975`), when a session has
+subagents, bracket the subagent block with two meta rows:
 
 ```
-── Subagents ──        (meta)
+── Subagents ──        (meta)   ← also an insertion sentinel
 <subagent group rows>
-── Session ──          (meta)
+── Session ──          (meta)   ← also an insertion sentinel
 <message rows>
 ```
 
-These give visual separation **and** double as **insertion sentinels**: the
-recipe can locate them to position new rows via the `update_data` positioning
-API. Emit them only when subagents are present (a session with none renders
-exactly as before).
+Emitted only when subagents are present. They give visual separation **and**
+double as **insertion sentinels** for positioning new rows via the `update_data`
+API. `meta_filter_mode` is likely `'show'` here (keep the labels under a filter)
+— recipe's call.
 
 ## Testing
 
-Following the repo convention of testing through a real headless `Browser`
-rather than a fabricated ctx (per prior hook-arity surprises):
+Through a real headless `Browser` (not a fabricated ctx — per prior hook-arity
+surprises):
 
-- **Nav skip:** down/up across a single meta row and a meta *run*; meta at top
-  (Home / first-down) and bottom (End / last-up); page jumps that land in a meta
-  run; mouse-click on a meta row; selection-toggle steps over meta.
-- **No-landable:** all-meta and empty lists — cursor parks, no crash; `on_empty`
-  `'exit'` quits, `'wait'` stays.
-- **Render:** meta branch emits the hook string; `_truncate_visible` trims
-  ANSI-bearing content to width; no chrome / no selection marker / no reverse
-  video; default hook returns `title`.
-- **Data:** `to_item` accepts `meta` via dict and `Item`; `meta` excluded from
-  nothing it shouldn't be.
-- **Selection / search:** a meta row never enters `selected` (space, Ctrl-A,
-  invert) and is never a search match.
-- **Migrations:** browse-git fillers are skipped *preventively* (no
-  `on_cursor_change` bounce) and unselectable; browse-claude dividers appear
-  around subagents and not otherwise.
-- Remove the obsolete browse-git filler-skip tests.
+- **Nav skip:** arrows/page across one meta row and a (short) run; Home/End;
+  click → closest (tie → down); selection-toggle steps; `cursor_to(meta)` lands
+  exactly and does not crash.
+- **No-landable:** all-meta and empty lists park cleanly; `on_empty='exit'`
+  quits, `'wait'` stays.
+- **Render:** chrome reduces to aligned indentation; default content = title;
+  `format_row_content` returning segments and returning an ANSI string both
+  render; a meta row painted *under* the cursor doesn't crash.
+- **ANSI handling:** non-SGR escapes stripped, SGR kept; no trailing reset for
+  plain strings, `\e[m` for ANSI ones; bg-restore fires only when a row bg is set
+  *and* a bg code is present; shared behavior verified against the preview path.
+- **Search/filter:** defaults (meta excluded from search, hidden under filter);
+  `meta_search_highlight=True`; `meta_filter_mode` `show` / `filter` / `hide`.
+- **Data:** `to_item` accepts `meta` via dict and `Item`; tuple/namedtuple ids.
+- **Selection:** a meta row never enters `selected` (space, Ctrl-A, invert).
+- **Migrations:** browse-git fillers skip *preventively* and are unselectable;
+  browse-claude dividers appear around subagents and not otherwise. Remove the
+  obsolete browse-git filler-skip tests.
 
 Baseline before work: **2989 tests, 0 failures, 4 skipped** (`main@43ea321`).
 
 ## Risks / edge cases
 
-- **Scroll geometry.** The cursor's landable row and the viewport math must stay
-  consistent when meta rows sit between content rows — `_snap_list_scroll_to_row`
-  (`040-state.py:6916`), `_active_list_row` (`040-state.py:6937`), and page-size
-  math. This is exactly the "perturbs scroll/`_layout_*` geometry" cost the
-  list-columns design flagged when deferring a header row
-  (`...2026-06-03-list-columns-design.md:92`); it is where the real care goes.
-- **Filtering.** With an active filter, a meta divider whose whole section
-  filters away would be left orphaned. v1 stance: meta rows are not subject to
-  `_filter_hidden` (they aren't content), and keeping a divider visible when its
-  section is empty is the recipe's concern (it chose to emit it). Revisit only
-  if it looks bad in practice.
-- **Scope row / insert mode.** The depth-0 scope row is always `'normal'`
-  (a real content row); meta interacts with neither it nor the render-only
-  insert marker beyond occupying ordinary list slots.
+- **Scroll geometry** is the real cost: the cursor's landable row and the
+  viewport math must stay consistent with meta rows interleaved
+  (`_snap_list_scroll_to_row` `:6916`, `_active_list_row` `:6937`, page math).
+  This is the "perturbs scroll/`_layout_*` geometry" concern the list-columns
+  design flagged (`...2026-06-03-list-columns-design.md:92`).
+- **Raw ANSI string under cursor / search** — reverse-video and highlight
+  overlay on embedded SGR is best-effort; meta rows avoid it (skip + no
+  highlight by default), normal rows should keep using segments.
+- **Scope row / insert mode** — the depth-0 scope row is always `'normal'`; meta
+  interacts with neither beyond occupying ordinary slots.
 
 ## Estimated impact
 
-Production code is roughly **net-flat** — the framework absorbs what browse-git
-sheds:
+Production code is roughly **net-flat-to-negative** — the framework absorbs what
+browse-git sheds, and reusing the pipeline (no `format_meta`, no `paint`) keeps
+additions small. The filter-mode logic is the main net-new piece.
 
 | Area | Added | Removed/moved | Net |
 |---|---|---|---|
-| `030-data.py` (flag + coercion + doc) | ~18 | 0 | +18 |
-| `040-state.py` (emit kind, `_next_landable`, clamp/anchor snap) | ~30 | mod ~8 | +28 |
-| `070-actions.py` (rewire ~7 move sites) | ~20 | mod ~20 | +20 |
-| `050-render.py` (meta branch + `paint`) | ~22 | 0 | +22 |
-| config (`format_meta` wiring, `on_empty`) | ~12 | 0 | +12 |
-| `browse-git` (delete workaround; set flag; `format_meta`) | ~6 | ~114 | −108 |
-| `browse-claude` (dividers) | ~8 | 0 | +8 |
-| **Production total** | **~116** | **~122** | **≈ flat** |
+| `030-data.py` (flag + coercion + doc) | ~16 | 0 | +16 |
+| `040-state.py` (emit kind, `_next_landable`, clamp/anchor, chrome guard) | ~32 | mod ~8 | +30 |
+| `070-actions.py` (rewire ~7 move sites incl. click-closest) | ~22 | mod ~22 | +22 |
+| `050-render.py` (str-content branch + §4.5 ANSI; share `_sanitize_preview`) | ~22 | 0 | +22 |
+| filter/search (3-mode + highlight gate) | ~25 | mod ~5 | +25 |
+| config (`on_empty`, `meta_filter_mode`, `meta_search_highlight`) | ~8 | 0 | +8 |
+| `browse-git` (delete workaround; `meta=True`) | ~3 | ~114 | −111 |
+| `browse-claude` (dividers) | ~10 | 0 | +10 |
+| **Production total** | **~138** | **~118** | **≈ +20** |
 
-Tests: roughly **+150–220** added, **~50–80** removed (obsolete filler-skip).
+Tests: roughly **+180–240** added, **~50–80** removed (obsolete filler-skip).
 
-The cost is not volume; it is the cursor/scroll-geometry correctness work in
-`040-state.py` / `070-actions.py`.
+The cost is the cursor/scroll-geometry correctness work in `040-state.py` /
+`070-actions.py` and the 3-mode filter logic — not code volume.
