@@ -1780,6 +1780,465 @@ class TestCursorPin(unittest.TestCase):
             b.stop_workers()
 
 
+# ---- 11b. Meta-row landability: clamp / anchor / displacement / empty ------
+#
+# §3.4 of the meta-rows design. The cursor-*position* invariants (the
+# clamp / anchor / hide-displacement paths that re-place the cursor when
+# the list changes underneath it) must land on a *landable* row, skipping
+# an adjacent meta divider — and honour ``on_empty`` when nothing landable
+# remains. Distinct from the cursor-*move* skip (arrows/page/Home/End),
+# which is covered by the UI nav tests through the resolver in
+# ``070-actions``.
+
+
+class TestMetaLandability(unittest.TestCase):
+    """Clamp / anchor / displacement land on a landable row, not a meta."""
+
+    def test_delete_under_cursor_reanchors_off_adjacent_meta(self):
+        # Visible: A / sep (meta) / B. Cursor on A; deleting A would let
+        # the anchor's next-sibling fallback land on the meta divider —
+        # it must skip past it onto B instead.
+        def gc(parent_id, *, reload=False):
+            return [
+                ('A',),
+                {'id': 'sep', 'title': '-- sep --', 'meta': True},
+                ('B',),
+            ]
+        b = make_browser(get_children=gc)
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.cursor_to('A')
+            b.run_until_idle()
+            self.assertEqual(b._state.cursor, 0)
+            b.update_data([_state.remove('A')])
+            b.run_until_idle()
+            vis = _state.visible_items(b._state)
+            self.assertEqual([e.item.id for e in vis], ['sep', 'B'])
+            # Anchor fallback would hit 'sep' (row 0); landability skips
+            # it to 'B' (row 1).
+            self.assertEqual(b._state.cursor, 1)
+            self.assertEqual(vis[b._state.cursor].item.id, 'B')
+            self.assertEqual(vis[b._state.cursor].kind, 'normal')
+        finally:
+            b.stop_workers()
+
+    def test_hide_under_cursor_walks_back_off_meta(self):
+        # Visible: A / sep (meta) / B. Cursor on B; hiding B sends the
+        # walk-back to row 1 (sep, meta) then row 0 (A) — but the
+        # walk-back lands on the first *surviving* row (sep) which is
+        # meta, so landability must skip it onto A.
+        def gc(parent_id, *, reload=False):
+            return [
+                ('A',),
+                {'id': 'sep', 'title': '-- sep --', 'meta': True},
+                ('B',),
+            ]
+        b = make_browser(get_children=gc)
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.cursor_to('B')
+            b.run_until_idle()
+            self.assertEqual(b._state.cursor, 2)
+            b.update_data([_state.mod('B', hidden=True)])
+            b.run_until_idle()
+            vis = _state.visible_items(b._state)
+            self.assertEqual([e.item.id for e in vis], ['A', 'sep'])
+            # Walk-back hits 'sep' (meta); landability scans up to 'A'.
+            self.assertEqual(b._state.cursor, 0)
+            self.assertEqual(vis[b._state.cursor].item.id, 'A')
+        finally:
+            b.stop_workers()
+
+    def test_refresh_shrinks_list_onto_meta_snaps_to_landable(self):
+        # First delivery: A / B / C / sep (meta). Cursor parked on C
+        # (row 2). A reload shrinks the list to A / sep (meta): the old
+        # cursor index 2 now points past the end; the clamp pulls it back
+        # to the last row (sep, meta) and landability snaps up to A.
+        state = {'rows': [
+            ('A',), ('B',), ('C',),
+            {'id': 'sep', 'title': '-- sep --', 'meta': True},
+        ]}
+
+        def gc(parent_id, *, reload=False):
+            return list(state['rows'])
+
+        b = make_browser(get_children=gc)
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.cursor_to('C')
+            b.run_until_idle()
+            self.assertEqual(b._state.cursor, 2)
+            # Shrink and reload via the children worker.
+            state['rows'] = [
+                ('A',),
+                {'id': 'sep', 'title': '-- sep --', 'meta': True},
+            ]
+            b.refresh()
+            b.run_until_idle()
+            vis = _state.visible_items(b._state)
+            self.assertEqual([e.item.id for e in vis], ['A', 'sep'])
+            # Old index 2 is past-end → clamp to last row (sep) → skip up
+            # to 'A'.
+            self.assertEqual(b._state.cursor, 0)
+            self.assertEqual(vis[b._state.cursor].item.id, 'A')
+        finally:
+            b.stop_workers()
+
+    def test_full_replacement_stale_cursor_on_meta_snaps_to_landable(self):
+        # The anchor totally fails (every snapshot id removed) AND the
+        # stale cursor index happens to fall on a meta row in the new
+        # list. This is a *displaced* landing (not an explicit
+        # cursor_to), so it must snap to the nearest landable row — the
+        # primary-id-mismatch test distinguishes it from cursor_to(meta).
+        def gc(parent_id, *, reload=False):
+            return [('A',), ('X',), ('B',)]
+        b = make_browser(get_children=gc)
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.cursor_to('X')
+            b.run_until_idle()
+            self.assertEqual(b._state.cursor, 1)
+            # Replace the entire list; new index 1 is a meta divider.
+            b.update_data([
+                _state.clear_children(None),
+                _state.upsert('P', None),
+                _state.upsert('sep', None, meta=True),
+                _state.upsert('Q', None),
+            ])
+            b.run_until_idle()
+            vis = _state.visible_items(b._state)
+            self.assertEqual(
+                [(e.item.id, e.kind) for e in vis],
+                [('P', 'normal'), ('sep', 'meta'), ('Q', 'normal')],
+            )
+            # Stale index 1 fell on 'sep' (meta); snap down to 'Q'.
+            self.assertEqual(vis[b._state.cursor].kind, 'normal')
+            self.assertNotEqual(vis[b._state.cursor].item.id, 'sep')
+        finally:
+            b.stop_workers()
+
+    def test_pin_first_lands_on_first_landable_past_leading_meta(self):
+        # Leading meta divider: sep (meta) / A / B. PIN_FIRST must land
+        # on the first *landable* row (A, row 1), not the meta at row 0.
+        def gc(parent_id, *, reload=False):
+            return [
+                {'id': 'sep', 'title': '-- sep --', 'meta': True},
+                ('A',),
+                ('B',),
+            ]
+        b = make_browser(get_children=gc)
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.cursor_to('B')
+            b.run_until_idle()
+            self.assertEqual(b._state.cursor, 2)
+            b.nav_home()
+            b.run_until_idle()
+            vis = _state.visible_items(b._state)
+            self.assertEqual(b._state.cursor, 1)
+            self.assertEqual(vis[b._state.cursor].item.id, 'A')
+            # Pin stays engaged and survives re-anchor (cursor IS on the
+            # first landable row, so the pin must not be dropped).
+            self.assertEqual(b._cursor_anchor, [_state.PIN_FIRST])
+        finally:
+            b.stop_workers()
+
+    def test_pin_last_lands_on_last_landable_before_trailing_meta(self):
+        # Trailing meta divider: A / B / sep (meta). PIN_LAST must land
+        # on the last *landable* row (B, row 1), not the meta at row 2.
+        def gc(parent_id, *, reload=False):
+            return [
+                ('A',),
+                ('B',),
+                {'id': 'sep', 'title': '-- sep --', 'meta': True},
+            ]
+        b = make_browser(get_children=gc)
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.nav_end()
+            b.run_until_idle()
+            vis = _state.visible_items(b._state)
+            self.assertEqual(b._state.cursor, 1)
+            self.assertEqual(vis[b._state.cursor].item.id, 'B')
+            self.assertEqual(b._cursor_anchor, [_state.PIN_LAST])
+        finally:
+            b.stop_workers()
+
+    def test_pin_first_survives_reanchor_with_leading_meta(self):
+        # Regression guard for ``_reanchor_cursor``: with a leading meta
+        # row the PIN_FIRST cursor parks on row 1, not row 0. A no-op
+        # background mutation (which re-anchors) must NOT drop the pin.
+        def gc(parent_id, *, reload=False):
+            return [
+                {'id': 'sep', 'title': '-- sep --', 'meta': True},
+                ('A',),
+                ('B',),
+            ]
+        b = make_browser(get_children=gc)
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.nav_home()
+            b.run_until_idle()
+            self.assertEqual(b._state.cursor, 1)
+            self.assertEqual(b._cursor_anchor, [_state.PIN_FIRST])
+            # Append a new trailing row — pin must still follow the first
+            # landable row and stay engaged.
+            b.update_data([_state.upsert('C', None)])
+            b.run_until_idle()
+            self.assertEqual(b._state.cursor, 1)
+            self.assertEqual(b._cursor_anchor, [_state.PIN_FIRST])
+        finally:
+            b.stop_workers()
+
+    def test_cursor_to_meta_lands_exactly_regression(self):
+        # The one exception: an explicit ``cursor_to(meta_id)`` honours
+        # the target exactly (§3.1, landing tolerated). The clamp/anchor
+        # routing must NOT skip it off the meta row.
+        def gc(parent_id, *, reload=False):
+            return [
+                ('A',),
+                {'id': 'sep', 'title': '-- sep --', 'meta': True},
+                ('B',),
+            ]
+        b = make_browser(get_children=gc)
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.cursor_to('sep')
+            b.run_until_idle()
+            vis = _state.visible_items(b._state)
+            self.assertEqual(b._state.cursor, 1)
+            self.assertEqual(vis[b._state.cursor].item.id, 'sep')
+            self.assertEqual(vis[b._state.cursor].kind, 'meta')
+            # A subsequent no-op background mutation (re-anchor on the
+            # exact meta primary) keeps it parked exactly there.
+            b.update_data([_state.upsert('C', None)])
+            b.run_until_idle()
+            vis = _state.visible_items(b._state)
+            self.assertEqual(vis[b._state.cursor].item.id, 'sep')
+        finally:
+            b.stop_workers()
+
+    def test_on_empty_exit_quits_on_all_meta_list(self):
+        # A list with no landable row (all-meta) under on_empty='exit'
+        # quits with the cancel exit code (1).
+        def gc(parent_id, *, reload=False):
+            return [
+                {'id': 's1', 'title': '-- s1 --', 'meta': True},
+                {'id': 's2', 'title': '-- s2 --', 'meta': True},
+            ]
+        b = make_browser(get_children=gc, on_empty='exit')
+        try:
+            b.refresh()
+            b.run_until_idle()
+            self.assertTrue(b._quit_requested)
+            self.assertEqual(b._quit_code, 1)
+        finally:
+            b.stop_workers()
+
+    def test_on_empty_wait_parks_on_all_meta_list(self):
+        # Default on_empty='wait' parks the cursor without crashing and
+        # without quitting; the cursor sits in range (row 0) but on a
+        # meta row, so ``ctx.cursor`` is None and row-actions no-op.
+        def gc(parent_id, *, reload=False):
+            return [
+                {'id': 's1', 'title': '-- s1 --', 'meta': True},
+                {'id': 's2', 'title': '-- s2 --', 'meta': True},
+            ]
+        b = make_browser(get_children=gc)  # on_empty defaults to 'wait'
+        try:
+            b.refresh()
+            b.run_until_idle()
+            self.assertFalse(b._quit_requested)
+            vis = _state.visible_items(b._state)
+            self.assertEqual(len(vis), 2)
+            self.assertTrue(0 <= b._state.cursor < len(vis))
+            self.assertEqual(vis[b._state.cursor].kind, 'meta')
+        finally:
+            b.stop_workers()
+
+    def test_on_empty_exit_quits_when_shrinks_to_all_meta(self):
+        # on_empty='exit' also fires when an update_data removal leaves
+        # the list all-meta (the displacement path detects no landable).
+        def gc(parent_id, *, reload=False):
+            return [
+                ('A',),
+                {'id': 'sep', 'title': '-- sep --', 'meta': True},
+            ]
+        b = make_browser(get_children=gc, on_empty='exit')
+        try:
+            b.refresh()
+            b.run_until_idle()
+            self.assertFalse(b._quit_requested)  # 'A' is landable
+            self.assertEqual(b._state.cursor, 0)
+            b.update_data([_state.remove('A')])
+            b.run_until_idle()
+            vis = _state.visible_items(b._state)
+            self.assertEqual([e.item.id for e in vis], ['sep'])
+            self.assertTrue(b._quit_requested)
+            self.assertEqual(b._quit_code, 1)
+        finally:
+            b.stop_workers()
+
+    def test_on_empty_exit_quits_on_truly_empty_list(self):
+        # An empty delivery (no rows at all) is also "no landable row".
+        b = make_browser(
+            get_children=lambda _id, *, reload=False: [],
+            on_empty='exit',
+        )
+        try:
+            b.refresh()
+            b.run_until_idle()
+            self.assertTrue(b._quit_requested)
+            self.assertEqual(b._quit_code, 1)
+        finally:
+            b.stop_workers()
+
+    def test_on_empty_wait_parks_on_truly_empty_list(self):
+        b = make_browser(get_children=lambda _id, *, reload=False: [])
+        try:
+            b.refresh()
+            b.run_until_idle()
+            self.assertFalse(b._quit_requested)
+            self.assertEqual(_state.visible_items(b._state), [])
+            self.assertEqual(b._state.cursor, 0)
+        finally:
+            b.stop_workers()
+
+    def test_invalid_on_empty_rejected(self):
+        with self.assertRaises(ValueError):
+            Browser(BrowserConfig(_headless=True, on_empty='nope'))
+
+    def test_no_spurious_cursor_change_when_index_unchanged(self):
+        # A no-op update_data on a list whose cursor is already on a
+        # landable row must not fire on_cursor_change (the id-dedup in
+        # _fire_cursor_change_if_pending guards it, but the clamp path
+        # must not move the index either).
+        fired = []
+
+        def gc(parent_id, *, reload=False):
+            return [
+                ('A',),
+                {'id': 'sep', 'title': '-- sep --', 'meta': True},
+                ('B',),
+            ]
+        b = make_browser(
+            get_children=gc,
+            on_cursor_change=lambda ctx, id: fired.append(id),
+        )
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.cursor_to('B')
+            b.run_until_idle()
+            fired.clear()
+            # A pure-preview-ish no-op structural touch that keeps B in
+            # place: re-upsert an unrelated trailing row.
+            b.update_data([_state.upsert('C', None)])
+            b.run_until_idle()
+            vis = _state.visible_items(b._state)
+            self.assertEqual(vis[b._state.cursor].item.id, 'B')
+            # Cursor id unchanged → no fire.
+            self.assertEqual(fired, [])
+        finally:
+            b.stop_workers()
+
+
+# ---- 11c. Scroll geometry with meta rows occupying slots -------------------
+#
+# Risk called out in the design: meta rows DO take visible-list slots and
+# scroll positions, so ``_snap_list_scroll_to_row`` / ``_active_list_row``
+# and the cursor's landable row must stay consistent. These verify the
+# scroll offset tracks the *landed* (landable) cursor row, counting the
+# meta slots that sit above it.
+
+
+class TestMetaScrollGeometry(unittest.TestCase):
+    """Scroll offset follows the landed cursor row across meta slots."""
+
+    def _pin_height(self, b, h):
+        # Mirror the helper used by TestExpandGoal: force a stable list
+        # pane height so scroll math is deterministic headless.
+        b._list_pane_height_safe = lambda: h
+
+    def test_scroll_counts_meta_slots_above_landed_cursor(self):
+        # 8 rows, a meta divider at index 3, pane height 3. End lands on
+        # the last landable row (index 7); the scroll offset must put
+        # that row on-screen counting the meta slot it scrolled past.
+        rows = [('A',), ('B',), ('C',)]
+        rows.append({'id': 'sep', 'title': '-- sep --', 'meta': True})
+        rows += [('D',), ('E',), ('F',), ('G',)]
+
+        def gc(parent_id, *, reload=False):
+            return list(rows)
+
+        b = make_browser(get_children=gc)
+        self._pin_height(b, 3)
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.nav_end()
+            b.run_until_idle()
+            vis = _state.visible_items(b._state)
+            # Last landable row is 'G' at index 7 (sep is index 3).
+            self.assertEqual(b._state.cursor, 7)
+            self.assertEqual(vis[7].item.id, 'G')
+            # _active_list_row reports the cursor row; the snap keeps it
+            # in the bottom of a height-3 pane: scroll = 7 - 3 + 1 = 5.
+            self.assertEqual(b._active_list_row(), 7)
+            b._snap_list_scroll_to_row(b._active_list_row())
+            self.assertEqual(b._list_scroll, 5)
+            # The on-screen window [5,6,7] includes the landed cursor.
+            self.assertTrue(
+                b._list_scroll
+                <= b._state.cursor
+                < b._list_scroll + 3
+            )
+        finally:
+            b.stop_workers()
+
+    def test_home_scroll_keeps_landed_cursor_visible_past_leading_meta(self):
+        # Leading meta at index 0; Home lands on index 1 (first
+        # landable). After scrolling to the bottom, Home's minimal-move
+        # snap pulls the viewport back up so the landed cursor row (1) is
+        # on-screen — the scroll offset must not strand it behind the
+        # meta slot.
+        rows = [{'id': 'sep', 'title': '-- sep --', 'meta': True}]
+        rows += [(c,) for c in 'ABCDEF']
+
+        def gc(parent_id, *, reload=False):
+            return list(rows)
+
+        b = make_browser(get_children=gc)
+        self._pin_height(b, 3)
+        try:
+            b.refresh()
+            b.run_until_idle()
+            b.nav_end()
+            b.run_until_idle()
+            b._snap_list_scroll_to_row(b._active_list_row())
+            self.assertGreater(b._list_scroll, 0)
+            b.nav_home()
+            b.run_until_idle()
+            self.assertEqual(b._state.cursor, 1)  # 'A', past the meta
+            b._snap_list_scroll_to_row(b._active_list_row())
+            # The landed cursor row sits inside the height-3 window.
+            self.assertTrue(
+                b._list_scroll
+                <= b._state.cursor
+                < b._list_scroll + 3
+            )
+        finally:
+            b.stop_workers()
+
+
 # ---- 12. Interactive filter (`&`) integration ----------------------------
 #
 # Covers the cross-cutting behaviours called out in the design spec:

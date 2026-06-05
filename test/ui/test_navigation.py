@@ -186,23 +186,24 @@ class TestMetaRowSkip(unittest.TestCase):
 
         top (meta) / a / m1 (meta) / m2 (meta) / b / bot (meta)
 
-    so the only landable rows are ``a`` and ``b``. The cursor's *initial*
-    placement onto a leading meta row is governed by the clamp/anchor
-    machinery (a separate ticket), so each test first issues a Down to
-    settle on a known landable row before exercising the move under test.
+    so the only landable rows are ``a`` and ``b``. The initial-placement
+    clamp lands the cursor on the first *landable* row directly (#737), so
+    it starts on ``a`` — past the leading ``top`` meta divider — with no
+    setup keystroke needed; each test then exercises the move under test.
     """
 
     def _launch_on_a(self, t):
-        """Launch the recipe and settle the cursor on landable row 'a'."""
+        """Launch the recipe and confirm the cursor starts on landable 'a'.
+
+        The initial-placement clamp lands the cursor on the first
+        *landable* row (#737), so it settles on 'a' directly — past the
+        leading 'top' meta divider — with no keystroke needed.
+        """
         t.launch(_BIN, '--run-py', _META_RECIPE)
         t.wait_for('a a')
         t.wait_stable()
-        # Initial placement may sit on the leading 'top' meta row; one
-        # Down resolves down onto 'a' (target index 1) regardless.
-        t.send('Down')
-        t.wait_stable()
         self.assertEqual(_cursor_row_id(t.capture(colors=True)), 'a',
-                         'Down from the top did not settle on a')
+                         'Initial placement did not settle on a')
 
     def test_down_arrow_skips_meta_run(self):
         """Down from 'a' skips the two-row meta run and lands on 'b'."""

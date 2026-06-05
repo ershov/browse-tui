@@ -4177,6 +4177,14 @@ class BrowserConfig:
     on_filter_change: Optional[Callable] = None
     on_resize: Optional[Callable] = None
     on_quit: Optional[Callable] = None
+    # Behaviour when the visible list has no *landable* row — empty, or
+    # every row is a ``meta`` divider (§3.4 of the meta-rows design).
+    #   * ``'wait'`` (default) — park the cursor; the ``0 <= cursor <
+    #     len(vis)`` guards already make every row-action no-op, so the
+    #     user can search / filter / quit out of it (fzf-style).
+    #   * ``'exit'`` — quit with the cancel exit code (1) the moment no
+    #     landable row remains.
+    on_empty: str = 'wait'
     _headless: bool = False
 
 
@@ -4394,6 +4402,11 @@ class Browser:
                 "show_ids must be one of 'always', 'auto', 'never'; "
                 f"got {config.show_ids!r}"
             )
+        if config.on_empty not in ('wait', 'exit'):
+            raise ValueError(
+                "on_empty must be one of 'wait', 'exit'; "
+                f"got {config.on_empty!r}"
+            )
         # --- user-supplied data callbacks -------------------------------
         # Default get_children to "no children" so a Browser constructed
         # with no kwargs still works (tests, smoke checks). get_preview
@@ -4496,6 +4509,10 @@ class Browser:
         self._on_filter_change = config.on_filter_change
         self._on_resize = config.on_resize
         self._on_quit = config.on_quit
+        # No-landable-row policy (§3.4). Read once here; consulted by
+        # ``_clamp_cursor_landable`` whenever the visible list ends up
+        # with no landable row (empty / all-meta).
+        self._on_empty = config.on_empty
         # Worker-slot registry for ``run_in_slot``. Each entry is the
         # currently-active CancellationToken for a named slot;
         # superseded tokens are removed lazily by the worker on exit.
@@ -5084,34 +5101,33 @@ class Browser:
         return pending
 
     def nav_home(self) -> None:
-        """(thread-safe) Move cursor to row 0 and pin it there.
+        """(thread-safe) Move cursor to the first landable row and pin it.
 
-        Posts a callable that sets ``state.cursor = 0`` and
-        ``_cursor_anchor = [PIN_FIRST]``. The cursor follows new
-        arrivals at the top until any non-home/non-end navigation
-        clears the pin. Returns ``None`` — there is nothing to await
-        (no fetches required).
+        Posts a callable that sets ``_cursor_anchor = [PIN_FIRST]`` and
+        applies it — ``_apply_cursor_anchor`` lands the cursor on the
+        first *landable* row, skipping a leading ``meta`` divider (§3.4).
+        The cursor follows new arrivals at the top until any
+        non-home/non-end navigation clears the pin. Returns ``None`` —
+        there is nothing to await (no fetches required).
         """
         def _do():
-            vis = visible_items(self._state)
-            self._state.cursor = 0 if vis else 0
             self._cursor_anchor = [PIN_FIRST]
-            mark_cursor_changed(self)
+            self._apply_cursor_anchor()
             self._needs_redraw.add('list')
         self.post(_do)
 
     def nav_end(self) -> None:
-        """(thread-safe) Move cursor to the last visible row and pin it there.
+        """(thread-safe) Move cursor to the last landable row and pin it.
 
-        Symmetric to ``nav_home``. The cursor follows new arrivals at
-        the bottom until any non-home/non-end navigation clears the
-        pin. Returns ``None``.
+        Symmetric to ``nav_home`` — sets ``PIN_LAST`` and applies it, so
+        the cursor lands on the last *landable* row, skipping a trailing
+        ``meta`` divider (§3.4). The cursor follows new arrivals at the
+        bottom until any non-home/non-end navigation clears the pin.
+        Returns ``None``.
         """
         def _do():
-            vis = visible_items(self._state)
-            self._state.cursor = max(0, len(vis) - 1)
             self._cursor_anchor = [PIN_LAST]
-            mark_cursor_changed(self)
+            self._apply_cursor_anchor()
             self._needs_redraw.add('list')
         self.post(_do)
 
@@ -5454,12 +5470,11 @@ class Browser:
             # ``apply_children_results``; without it, an ``update_data``
             # that shrinks the list past the cursor would leave the
             # cursor pointing past the end and the renderer would
-            # silently skip the row.
-            vis = visible_items(self._state)
-            if vis and self._state.cursor >= len(vis):
-                self._state.cursor = len(vis) - 1
-            elif not vis:
-                self._state.cursor = 0
+            # silently skip the row. Routes through
+            # ``_clamp_cursor_landable`` so a past-end clamp lands on a
+            # landable row (skips a trailing meta divider) and an
+            # all-meta / empty list honours ``on_empty`` (§3.4).
+            self._clamp_cursor_landable(self._state.cursor)
             # Flag list/children for redraw so background pushes (e.g.
             # from a watcher or a websocket bridge) become visible
             # without waiting for the user to press a key. ``apply_ops``
@@ -6583,12 +6598,11 @@ class Browser:
             # this, a watcher-driven refresh that removes items can
             # leave state.cursor past len(visible) — the renderer
             # skips the row (no crash) but the cursor effectively
-            # disappears until the user presses j/k.
-            vis = visible_items(self._state)
-            if vis and self._state.cursor >= len(vis):
-                self._state.cursor = len(vis) - 1
-            elif not vis:
-                self._state.cursor = 0
+            # disappears until the user presses j/k. Routes through
+            # ``_clamp_cursor_landable`` so a past-end clamp lands on a
+            # landable row and an all-meta / empty list honours
+            # ``on_empty`` (§3.4).
+            self._clamp_cursor_landable(self._state.cursor)
             self._needs_redraw.add('list')
             # The cache may have just filled the cursor item's
             # children — flag the grid pane for redraw too. Render-time
@@ -7295,12 +7309,11 @@ class Browser:
         # watcher-driven refresh that removes items, or empty
         # delivery). Without this, the renderer skips the row (no
         # crash) but the cursor effectively disappears until the user
-        # presses j/k. Regression guard from #125.
-        vis = visible_items(state)
-        if vis and state.cursor >= len(vis):
-            state.cursor = len(vis) - 1
-        elif not vis:
-            state.cursor = 0
+        # presses j/k. Regression guard from #125. Routes through
+        # ``_clamp_cursor_landable`` so a past-end clamp lands on a
+        # landable row and an all-meta / empty list honours
+        # ``on_empty`` (§3.4).
+        self._clamp_cursor_landable(state.cursor)
         self._needs_redraw.add('list')
         # Cache may have just filled the cursor item's children — flag
         # the grid pane for redraw too. Render-time checks gate the
@@ -8343,9 +8356,11 @@ class Browser:
         synthetic-row state doesn't discard a still-valid anchor.
 
         Positional pin survives this call iff the cursor is still at
-        the pinned row (row 0 for ``PIN_FIRST``, last row for
-        ``PIN_LAST``). Any other cursor position drops the pin and
-        captures a fresh id-based snapshot. See
+        the pinned row — the first *landable* row for ``PIN_FIRST``, the
+        last landable row for ``PIN_LAST`` (matching where
+        ``_apply_cursor_anchor`` lands the pin, which skips a leading /
+        trailing meta divider, §3.4). Any other cursor position drops
+        the pin and captures a fresh id-based snapshot. See
         ``docs/superpowers/specs/2026-05-17-cursor-pin-design.md``.
         """
         cur = self._cursor_anchor
@@ -8353,8 +8368,14 @@ class Browser:
             pin = cur[0]
             vis = visible_items(self._state)
             if vis:
-                target = 0 if pin is PIN_FIRST else len(vis) - 1
-                if self._state.cursor == target:
+                if pin is PIN_FIRST:
+                    target = _next_landable(vis, 0, +1)
+                else:
+                    target = _next_landable(vis, len(vis) - 1, -1)
+                # ``target is None`` (all-meta) → cursor can't be on the
+                # pinned row; fall through and re-snapshot. Otherwise the
+                # pin survives only if the cursor is parked on it.
+                if target is not None and self._state.cursor == target:
                     return
             else:
                 # Empty list — keep the pin parked.
@@ -8417,10 +8438,29 @@ class Browser:
             new_idx = 0
         if not post_vis:
             self._state.cursor = 0
-        elif self._state.cursor != new_idx:
-            self._state.cursor = new_idx
+            self._handle_no_landable()
+            self._reanchor_cursor()
+            return True
+        # The surviving row we picked (or the row-0 fallback) may itself
+        # be a meta divider — route the replacement index through
+        # ``_resolve_landing`` so it lands on a landable row (§3.4).
+        # ``before = pre_cursor``: displacement walks *up* to the nearest
+        # surviving row, so the resolver continues upward off a meta.
+        # NOTE: ``new_idx`` is a *post*-mutation index while ``pre_cursor``
+        # is *pre*-mutation — the two mix coordinate spaces, but it's sound
+        # for the hide/remove callers here because removal only shrinks the
+        # list, so a surviving earlier row's post-index is always
+        # ``<= pre_cursor`` (the resolver scans up, as intended). A future
+        # caller that *grows* the list around the cursor would need a
+        # before-index in post-mutation space instead.
+        landed = _resolve_landing(post_vis, new_idx, pre_cursor)
+        if landed is None:
+            # Every surviving row is meta — park and honour on_empty.
+            self._handle_no_landable()
+        elif self._state.cursor != landed:
+            self._state.cursor = landed
             mark_cursor_changed(self)
-            self._snap_list_scroll_to_row(new_idx)
+            self._snap_list_scroll_to_row(landed)
         self._reanchor_cursor()
         return True
 
@@ -8448,12 +8488,23 @@ class Browser:
         vis = visible_items(self._state)
         # Positional pin (``PIN_FIRST`` / ``PIN_LAST``) — short-circuit
         # before the id-based walk. Empty list is a no-op; the pin
-        # stays parked until rows arrive.
+        # stays parked until rows arrive. The pin resolves to the first
+        # / last *landable* row (§3.4): PIN_FIRST scans down from row 0,
+        # PIN_LAST scans up from the end, so a leading / trailing meta
+        # divider is skipped.
         first = self._cursor_anchor[0]
         if isinstance(first, _AnchorSentinel):
             if not vis:
                 return False
-            new_i = 0 if first is PIN_FIRST else len(vis) - 1
+            if first is PIN_FIRST:
+                new_i = _next_landable(vis, 0, +1)
+            else:
+                new_i = _next_landable(vis, len(vis) - 1, -1)
+            if new_i is None:
+                # All-meta list — nothing landable to pin onto. Leave
+                # the cursor parked and honour on_empty.
+                self._handle_no_landable()
+                return True
             if self._state.cursor != new_i:
                 self._state.cursor = new_i
                 mark_cursor_changed(self)
@@ -8469,6 +8520,23 @@ class Browser:
         for tier_idx, target_id in enumerate(self._cursor_anchor):
             if target_id in id_to_idx:
                 new_i = id_to_idx[target_id]
+                # Tier 0 (primary) is the exact id the cursor was last on
+                # — honour it verbatim, even if it's a meta row. This is
+                # what keeps an explicit ``cursor_to(meta_id)`` (which
+                # sets ``_cursor_anchor = [meta_id]``) landing exactly,
+                # per §3.1's "landing tolerated" rule. A tier ≥ 1 hit is
+                # a *fallback* (primary gone; we fell onto a neighbour /
+                # ancestor) — route it through ``_resolve_landing`` so a
+                # fallback onto a meta divider skips to the nearest
+                # landable row in the direction of the move (§3.4).
+                if tier_idx > 0:
+                    landed = _resolve_landing(vis, new_i, self._state.cursor)
+                    if landed is None:
+                        # Fallback id exists but no landable row anywhere
+                        # (all-meta) — park and honour on_empty.
+                        self._handle_no_landable()
+                        return True
+                    new_i = landed
                 if self._state.cursor != new_i:
                     self._state.cursor = new_i
                     mark_cursor_changed(self)
@@ -8479,6 +8547,95 @@ class Browser:
                         self._cursor_anchor = snap
                 return True
         return False
+
+    def _handle_no_landable(self) -> None:
+        """React to a visible list with no landable row (§3.4).
+
+        Called from the clamp / anchor / displacement paths once they've
+        determined the resolver found nothing to land on (empty list, or
+        every row is a ``meta`` divider). Under the default
+        ``on_empty='wait'`` this is a no-op — the cursor stays parked and
+        the ``0 <= cursor < len(vis)`` guards make every row-action a
+        no-op, exactly as today. Under ``on_empty='exit'`` it quits with
+        the cancel exit code (1), fzf-style.
+
+        Runs on the main thread (every caller is a main-thread mutation
+        hook), so it calls ``_do_quit`` directly rather than posting.
+        """
+        if self._on_empty == 'exit':
+            self._do_quit(1, '')
+
+    def _clamp_cursor_landable(self, before) -> bool:
+        """Clamp the cursor onto a landable row; honour on_empty.
+
+        The cursor-*position* invariant counterpart to the cursor-*move*
+        resolver in ``070-actions``. Called as the backstop at the tail of
+        the clamp / anchor / displacement paths, after
+        ``_apply_cursor_anchor`` has already had its say. Corrects three
+        cases (``before`` is the pre-clamp cursor index, for direction):
+
+          * **Past-end cursor** (``cursor >= len(vis)``) — the anchor walk
+            found no home, so pull the cursor back to the last *landable*
+            row (skips a trailing meta divider). ``before >= len(vis) >
+            target``, so ``_resolve_landing`` scans *up*.
+          * **In-range, parked on a meta row by a displaced re-snap** — the
+            anchored id is gone and the stale cursor index happens to fall
+            on a meta divider. Snap to the nearest landable row. This is
+            distinguished from an explicit ``cursor_to(meta_id)`` (§3.1,
+            honoured exactly) by checking whether the cursor row id still
+            matches the anchor's primary id: a genuine anchor lands tier-0
+            on its own id (and refreshes the snapshot so primary == cursor
+            id), so a *mismatch* means the cursor is a stale leftover.
+          * **No landable row at all** (empty / all-meta) — park the cursor
+            (row 0 when empty; left in place in-range) and consult
+            ``on_empty`` via ``_handle_no_landable``.
+
+        An in-range cursor genuinely anchored on its row (including an
+        explicit meta target) is left untouched. Fires
+        ``mark_cursor_changed`` only when the index actually moves. Returns
+        ``True`` when the cursor rests on a row (landable, or an explicit
+        meta target); ``False`` when the list has no landable row.
+        """
+        vis = visible_items(self._state)
+        if not vis:
+            self._state.cursor = 0
+            self._handle_no_landable()
+            return False
+        if self._state.cursor >= len(vis):
+            # Past-end: pull back to the last landable row.
+            idx = _resolve_landing(vis, len(vis) - 1, before)
+            if idx is None:
+                # All-meta — clamp into range (park) and honour on_empty.
+                self._state.cursor = len(vis) - 1
+                self._handle_no_landable()
+                return False
+            if self._state.cursor != idx:
+                self._state.cursor = idx
+                mark_cursor_changed(self)
+            return True
+        # In range, but on a meta row. Either an explicit cursor_to target
+        # (the anchor's primary id == this row's id — honour it), a stale
+        # displaced landing (anchor primary gone — snap to landable), or an
+        # all-meta list (nothing landable — honour on_empty).
+        if vis[self._state.cursor].kind == 'meta':
+            anchored_here = (
+                self._cursor_anchor
+                and not isinstance(self._cursor_anchor[0], _AnchorSentinel)
+                and self._cursor_anchor[0]
+                == vis[self._state.cursor].item.id
+            )
+            if anchored_here:
+                # Explicit meta target — landing tolerated (§3.1).
+                return True
+            idx = _resolve_landing(vis, self._state.cursor, before)
+            if idx is None:
+                # All-meta — nothing landable anywhere; park + on_empty.
+                self._handle_no_landable()
+                return False
+            if self._state.cursor != idx:
+                self._state.cursor = idx
+                mark_cursor_changed(self)
+        return True
 
     def _apply_expand_goal(self) -> None:
         """Adjust ``_list_scroll`` to fit the parked expansion goal.
