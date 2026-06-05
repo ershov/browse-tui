@@ -2116,6 +2116,10 @@ class TestMetaLandability(unittest.TestCase):
         with self.assertRaises(ValueError):
             Browser(BrowserConfig(_headless=True, on_empty='nope'))
 
+    def test_invalid_meta_filter_mode_rejected(self):
+        with self.assertRaises(ValueError):
+            Browser(BrowserConfig(_headless=True, meta_filter_mode='nope'))
+
     def test_no_spurious_cursor_change_when_index_unchanged(self):
         # A no-op update_data on a list whose cursor is already on a
         # landable row must not fire on_cursor_change (the id-dedup in
@@ -2354,9 +2358,13 @@ class TestFilterUpdateDataPerOpDispatch(unittest.TestCase):
             original = _state._propagate_filter_status_up
             calls = []
 
-            def _spy(state, item, filters, *, show_ids='auto'):
+            def _spy(state, item, filters, *, show_ids='auto',
+                     meta_filter_mode='hide'):
                 calls.append(getattr(item, 'id', None))
-                return original(state, item, filters, show_ids=show_ids)
+                return original(
+                    state, item, filters, show_ids=show_ids,
+                    meta_filter_mode=meta_filter_mode,
+                )
 
             _state._propagate_filter_status_up = _spy
             try:
@@ -2424,9 +2432,13 @@ class TestFilterUpdateDataPerOpDispatch(unittest.TestCase):
             original = _state._propagate_filter_status_up
             calls = []
 
-            def _spy(state, item, filters, *, show_ids='auto'):
+            def _spy(state, item, filters, *, show_ids='auto',
+                     meta_filter_mode='hide'):
                 calls.append(getattr(item, 'id', None))
-                return original(state, item, filters, show_ids=show_ids)
+                return original(
+                    state, item, filters, show_ids=show_ids,
+                    meta_filter_mode=meta_filter_mode,
+                )
 
             _state._propagate_filter_status_up = _spy
             try:
@@ -2477,9 +2489,13 @@ class TestFilterUpdateDataPerOpDispatch(unittest.TestCase):
             original = _state._propagate_filter_status_up
             calls = []
 
-            def _spy(state, item, filters, *, show_ids='auto'):
+            def _spy(state, item, filters, *, show_ids='auto',
+                     meta_filter_mode='hide'):
                 calls.append(getattr(item, 'id', None))
-                return original(state, item, filters, show_ids=show_ids)
+                return original(
+                    state, item, filters, show_ids=show_ids,
+                    meta_filter_mode=meta_filter_mode,
+                )
 
             _state._propagate_filter_status_up = _spy
             try:
@@ -2537,6 +2553,104 @@ class TestFilterUpdateDataPerOpDispatch(unittest.TestCase):
             self.assertTrue(b._state._items_by_id['other']._filter_hidden)
         finally:
             b.stop_workers()
+
+
+class TestMetaFilterModeIncrementalDispatch(unittest.TestCase):
+    """``meta_filter_mode`` is honoured by the INCREMENTAL per-op path.
+
+    #740 wired the meta-mode decision into both the full-walk recompute
+    AND ``_propagate_filter_status_up`` / ``_filter_visit_subtree``
+    driven by ``update_data._apply`` (``_dispatch_filter_propagation``).
+    These tests insert a ``meta=True`` row via ``update_data`` while a
+    filter is active and assert:
+
+      1. the incrementally-computed ``_filter_hidden`` matches the mode
+         (and, in ``'filter'`` mode, whether the row's text matches);
+      2. ``update_data`` took the incremental path — it did NOT fall
+         back to a full ``_recompute_filter_hidden`` walk;
+      3. the incremental result AGREES with a fresh full walk (so the
+         two code paths can't diverge).
+    """
+
+    def _insert_meta_under_filter(self, mode, *, title, filt='alpha'):
+        # A real headless Browser: one matching normal row 'alpha' so
+        # the filter is non-trivially active, then stream in a meta row.
+        b = make_browser(
+            get_children=lambda _id, *, reload=False: [],
+            meta_filter_mode=mode,
+        )
+        b.refresh()
+        b.run_until_idle()
+        b.update_data([('upsert', 'alpha', None, {'title': 'alpha'})])
+        b.run_until_idle()
+        b.set_filters([filt])
+        b.run_until_idle()
+        self.assertTrue(b._state._filter_active)
+
+        # Insert the meta row incrementally, spying on the FULL-walk
+        # recompute to prove the per-op dispatch (not the full walk)
+        # handled it.
+        original = _state._recompute_filter_hidden
+        full_walk_calls = []
+
+        def _spy(state, filters, *, show_ids='auto', meta_filter_mode='hide'):
+            full_walk_calls.append(True)
+            return original(
+                state, filters, show_ids=show_ids,
+                meta_filter_mode=meta_filter_mode,
+            )
+
+        _state._recompute_filter_hidden = _spy
+        try:
+            b.update_data([
+                ('upsert', 'sep', None, {'title': title, 'meta': True}),
+            ])
+            b.run_until_idle()
+        finally:
+            _state._recompute_filter_hidden = original
+
+        self.assertEqual(
+            full_walk_calls, [],
+            'update_data must use the incremental dispatch, not a full walk',
+        )
+        incremental = b._state._items_by_id['sep']._filter_hidden
+
+        # Agreement check: a fresh full walk must produce the same flag.
+        _state._recompute_filter_hidden(
+            b._state, b._filters, show_ids=b.show_ids,
+            meta_filter_mode=b.meta_filter_mode,
+        )
+        full = b._state._items_by_id['sep']._filter_hidden
+        self.assertEqual(
+            incremental, full,
+            f'incremental {incremental} != full-walk {full} ({mode})',
+        )
+        b.stop_workers()
+        return incremental
+
+    def test_incremental_hide_hides_inserted_meta(self):
+        hidden = self._insert_meta_under_filter(
+            'hide', title='alpha divider',
+        )
+        self.assertTrue(hidden)   # hidden under filter despite matching text
+
+    def test_incremental_show_keeps_inserted_meta(self):
+        hidden = self._insert_meta_under_filter(
+            'show', title='-- divider --',
+        )
+        self.assertFalse(hidden)  # visible regardless of (non-)match
+
+    def test_incremental_filter_keeps_matching_meta(self):
+        hidden = self._insert_meta_under_filter(
+            'filter', title='alpha section',
+        )
+        self.assertFalse(hidden)  # meta text matches 'alpha' -> visible
+
+    def test_incremental_filter_hides_non_matching_meta(self):
+        hidden = self._insert_meta_under_filter(
+            'filter', title='beta section',
+        )
+        self.assertTrue(hidden)   # meta text doesn't match -> hidden
 
 
 class TestFilterAppliesToStreamedChildren(unittest.TestCase):

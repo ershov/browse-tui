@@ -665,5 +665,124 @@ class TestPropagateFilterStatusUp(unittest.TestCase):
         self.assertFalse(scope._filter_hidden)
 
 
+class TestMetaFilterMode(unittest.TestCase):
+    """``meta_filter_mode`` governs ``meta=True`` rows under a filter (§5).
+
+    Three modes — ``'hide'`` (default: meta hides while filtering),
+    ``'show'`` (always visible), ``'filter'`` (participates like a
+    content row). The mode only matters while a filter is active; with
+    no filter, ``_recompute_filter_hidden`` is a no-op and meta rows
+    render normally regardless of mode.
+    """
+
+    def test_hide_mode_inactive_filter_leaves_meta_visible(self):
+        # No active filter → no-op walk; the meta row's flag stays its
+        # default (False = visible). Mode is irrelevant here.
+        m = Item(id='sep', title='-- divider --', meta=True)
+        s = _state_with({None: [Item(id='a'), m, Item(id='b')]})
+        _recompute_filter_hidden(s, [], meta_filter_mode='hide')
+        self.assertFalse(s._filter_active)
+        self.assertFalse(m._filter_hidden)
+
+    def test_hide_mode_active_filter_hides_all_meta(self):
+        # Default mode: a filter that matches a content row still hides
+        # every meta row, even one whose own text would match.
+        m_match = Item(id='sep-alpha', title='alpha divider', meta=True)
+        m_other = Item(id='sep-x', title='-- divider --', meta=True)
+        s = _state_with({None: [
+            Item(id='alpha'), m_match, Item(id='beta'), m_other,
+        ]})
+        _recompute_filter_hidden(s, ['alpha'], meta_filter_mode='hide')
+        flags = {it.id: it._filter_hidden for it in s._children[None]}
+        self.assertFalse(flags['alpha'])      # content match visible
+        self.assertTrue(flags['beta'])        # content non-match hidden
+        self.assertTrue(flags['sep-alpha'])   # meta hidden despite match
+        self.assertTrue(flags['sep-x'])       # meta hidden
+
+    def test_show_mode_keeps_meta_visible_under_filter(self):
+        # 'show': meta rows survive a filter even when no content in
+        # the list matches (header-like divider persists).
+        m = Item(id='sep', title='-- Section --', meta=True)
+        s = _state_with({None: [
+            Item(id='alpha'), m, Item(id='beta'),
+        ]})
+        # Filter matches nothing among content rows.
+        _recompute_filter_hidden(s, ['zzz'], meta_filter_mode='show')
+        flags = {it.id: it._filter_hidden for it in s._children[None]}
+        self.assertTrue(flags['alpha'])    # content non-match hidden
+        self.assertTrue(flags['beta'])     # content non-match hidden
+        self.assertFalse(flags['sep'])     # meta stays visible
+
+    def test_filter_mode_matches_meta_text_like_content(self):
+        # 'filter': a meta row whose own text matches the filter stays;
+        # one that doesn't is hidden — same rule as content rows.
+        m_match = Item(id='sep-keep', title='alpha section', meta=True)
+        m_miss = Item(id='sep-drop', title='beta section', meta=True)
+        s = _state_with({None: [
+            Item(id='alpha'), m_match, m_miss, Item(id='gamma'),
+        ]})
+        _recompute_filter_hidden(s, ['alpha'], meta_filter_mode='filter')
+        flags = {it.id: it._filter_hidden for it in s._children[None]}
+        self.assertFalse(flags['alpha'])      # content match
+        self.assertTrue(flags['gamma'])       # content non-match
+        self.assertFalse(flags['sep-keep'])   # meta text matches
+        self.assertTrue(flags['sep-drop'])    # meta text doesn't match
+
+    def test_modes_do_not_affect_normal_rows(self):
+        # Regression: a list with no meta rows behaves identically
+        # across all three modes (the mode only branches on meta=True).
+        def run(mode):
+            s = _state_with({None: [
+                Item(id='alpha'), Item(id='beta'), Item(id='gamma'),
+            ]})
+            _recompute_filter_hidden(s, ['beta'], meta_filter_mode=mode)
+            return {it.id: it._filter_hidden for it in s._children[None]}
+
+        expected = {'alpha': True, 'beta': False, 'gamma': True}
+        for mode in ('hide', 'show', 'filter'):
+            self.assertEqual(run(mode), expected, msg=mode)
+
+    def test_meta_default_is_hide_when_mode_omitted(self):
+        # The default arg must be 'hide': calling without the kwarg
+        # hides meta under an active filter.
+        m = Item(id='sep', title='alpha divider', meta=True)
+        s = _state_with({None: [Item(id='alpha'), m]})
+        _recompute_filter_hidden(s, ['alpha'])
+        self.assertTrue(m._filter_hidden)
+
+
+class TestMetaFilterPropagate(unittest.TestCase):
+    """``_propagate_filter_status_up`` honours ``meta_filter_mode`` too.
+
+    The per-op incremental path must agree with the full walk so an
+    ``update_data`` op touching a meta row doesn't flip its flag the
+    wrong way.
+    """
+
+    def test_propagate_hide_keeps_meta_hidden(self):
+        m = Item(id='sep', title='alpha divider', meta=True)
+        s = _state_with({None: [Item(id='alpha'), m]})
+        # Seed a stale "visible" flag, then propagate in hide mode.
+        m._filter_hidden = False
+        _propagate_filter_status_up(s, m, ['alpha'], meta_filter_mode='hide')
+        self.assertTrue(m._filter_hidden)
+
+    def test_propagate_show_keeps_meta_visible(self):
+        m = Item(id='sep', title='-- divider --', meta=True)
+        s = _state_with({None: [Item(id='alpha'), m]})
+        m._filter_hidden = True
+        _propagate_filter_status_up(s, m, ['alpha'], meta_filter_mode='show')
+        self.assertFalse(m._filter_hidden)
+
+    def test_propagate_filter_matches_meta_text(self):
+        m_match = Item(id='sep', title='alpha section', meta=True)
+        s = _state_with({None: [Item(id='x'), m_match]})
+        m_match._filter_hidden = True
+        _propagate_filter_status_up(
+            s, m_match, ['alpha'], meta_filter_mode='filter',
+        )
+        self.assertFalse(m_match._filter_hidden)
+
+
 if __name__ == '__main__':
     unittest.main()

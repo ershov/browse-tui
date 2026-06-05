@@ -2279,6 +2279,9 @@ class _MockBrowser:
         self._insert_depth = 0
         self._insert_label = ''
         self._search_query = ''
+        # Meta-row search-highlight gate (§5): off by default, like the
+        # real BrowserConfig. Tests flip it via the kwargs loop below.
+        self.meta_search_highlight = False
         self._mode = Mode.NORMAL
         self._error_text = ''
         self._help_mode = False
@@ -2757,6 +2760,66 @@ class TestRenderListRectClipping(unittest.TestCase):
                 for e in self.cap.events),
             'plain non-cursor row must not paint reverse-video',
         )
+
+    # --- #740: meta-row search-highlight gate ---------------------------
+    #
+    # A query-matching meta row paints highlight spans only when
+    # ``meta_search_highlight`` is True. The observable signal is the
+    # fragment style ``set_style(fg=3, bold=True)`` emitted by
+    # ``_write_highlighted`` on the matched span (non-cursor path).
+
+    def _has_highlight_style(self):
+        return any(
+            e[0] == 'set_style'
+            and e[1].get('fg') == 3 and e[1].get('bold')
+            for e in self.cap.events
+        )
+
+    def test_meta_row_no_highlight_when_gate_off(self):
+        # Default ``meta_search_highlight=False``: a meta row whose text
+        # matches the active query is NOT highlighted — it renders via
+        # the per-segment writer, so no fragment highlight style fires.
+        item = Item(id='sep', title='findme divider')
+        state = _MockState([self._entry(item, kind='meta')], cursor=5)
+        _render.visible_items = lambda s: state._visible
+        _render._search_matches = lambda text, q: q in text
+        _render._search_text = lambda item, **kw: item.title
+        browser = _MockBrowser(state, _search_query='findme',
+                               meta_search_highlight=False)
+        joined = self._render_one(browser)
+        # Text still renders, but no highlight style overlay.
+        self.assertIn('findme', joined)
+        self.assertFalse(self._has_highlight_style(),
+                         'meta row must not highlight when gate is off')
+
+    def test_meta_row_highlights_when_gate_on(self):
+        # ``meta_search_highlight=True``: a matching meta row paints the
+        # fragment highlight style like a normal row would.
+        item = Item(id='sep', title='findme divider')
+        state = _MockState([self._entry(item, kind='meta')], cursor=5)
+        _render.visible_items = lambda s: state._visible
+        _render._search_matches = lambda text, q: q in text
+        _render._search_text = lambda item, **kw: item.title
+        browser = _MockBrowser(state, _search_query='findme',
+                               meta_search_highlight=True)
+        joined = self._render_one(browser)
+        self.assertIn('findme', joined)
+        self.assertTrue(self._has_highlight_style(),
+                        'meta row must highlight when gate is on')
+
+    def test_normal_row_highlights_regardless_of_meta_gate(self):
+        # Regression: a NORMAL matching row highlights even with the
+        # meta gate off (the gate only governs meta rows).
+        item = Item(id='a', title='findme row')
+        state = _MockState([self._entry(item, kind='normal')], cursor=5)
+        _render.visible_items = lambda s: state._visible
+        _render._search_matches = lambda text, q: q in text
+        _render._search_text = lambda item, **kw: item.title
+        browser = _MockBrowser(state, _search_query='findme',
+                               meta_search_highlight=False)
+        self._render_one(browser)
+        self.assertTrue(self._has_highlight_style(),
+                        'normal row must highlight regardless of meta gate')
 
 
 class TestRenderChildrenList(unittest.TestCase):

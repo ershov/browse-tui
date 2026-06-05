@@ -1778,8 +1778,18 @@ def render_list(browser, rect, *, rightmost: bool = False):
             # match across the visible list, not only the cursor row.
             # Non-matches (and the no-query case) keep the per-segment
             # writer so tag colours and the #id segment stay coloured.
+            #
+            # Meta rows are highlight-gated by ``meta_search_highlight``
+            # (§5 meta-rows design): off by default so a meta row never
+            # lights up under a query; on lets a matching meta row paint
+            # spans like a normal row. Search *navigation* (n/N) always
+            # skips meta regardless — that is ``_search_find``'s job.
+            # ``_search_query`` gates the whole clause so the no-query
+            # path stays cheap (no kind / config / match work).
             if (browser._search_query
-                    and entry.kind == 'normal'
+                    and (entry.kind == 'normal'
+                         or (entry.kind == 'meta'
+                             and browser.meta_search_highlight))
                     and _search_matches(
                         _search_text(
                             item,

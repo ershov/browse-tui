@@ -338,5 +338,83 @@ class TestNonOverriddenKeysFallThrough(unittest.TestCase):
             b.stop_workers()
 
 
+# ---- meta_filter_mode end-to-end (#740) ---------------------------------
+
+
+class TestMetaFilterModeEndToEnd(unittest.TestCase):
+    """``meta_filter_mode`` drives meta-row visibility through a real
+    headless ``Browser`` and the live ``&`` filter path
+    (``_do_filter_change``), not just the state helper in isolation.
+
+    Fixture: alpha (normal), a meta divider, beta (normal). Typing the
+    filter 'alpha' matches only the normal row 'alpha'.
+    """
+
+    def _browser_with_meta(self, mode):
+        b = _make_browser(meta_filter_mode=mode)
+        b._state._children[None] = [
+            Item(id='alpha'),
+            Item(id='sep', title='alpha divider', meta=True),
+            Item(id='beta'),
+        ]
+        return b
+
+    def _visible_ids(self, b):
+        return [e.item.id for e in _state.visible_items(b._state)]
+
+    def _type_filter(self, b, ctx, text):
+        dispatch_key(b, ctx, '&')
+        for ch in text:
+            dispatch_key(b, ctx, ch)
+
+    def test_no_filter_shows_meta_in_every_mode(self):
+        # With no active filter the meta row is visible regardless of
+        # mode — the mode only governs behaviour under an active filter.
+        for mode in ('hide', 'show', 'filter'):
+            b = self._browser_with_meta(mode)
+            try:
+                self.assertIn('sep', self._visible_ids(b), msg=mode)
+            finally:
+                b.stop_workers()
+
+    def test_hide_mode_hides_meta_under_filter(self):
+        b = self._browser_with_meta('hide')
+        try:
+            ctx = _ctx_for(b)
+            self._type_filter(b, ctx, 'alpha')
+            ids = self._visible_ids(b)
+            self.assertIn('alpha', ids)       # content match
+            self.assertNotIn('beta', ids)     # content non-match hidden
+            self.assertNotIn('sep', ids)      # meta hidden (default)
+        finally:
+            b.stop_workers()
+
+    def test_show_mode_keeps_meta_under_filter(self):
+        b = self._browser_with_meta('show')
+        try:
+            ctx = _ctx_for(b)
+            # Filter matches nothing among content rows.
+            self._type_filter(b, ctx, 'zzz')
+            ids = self._visible_ids(b)
+            self.assertNotIn('alpha', ids)
+            self.assertNotIn('beta', ids)
+            self.assertIn('sep', ids)         # meta survives the filter
+        finally:
+            b.stop_workers()
+
+    def test_filter_mode_matches_meta_text(self):
+        b = self._browser_with_meta('filter')
+        try:
+            ctx = _ctx_for(b)
+            # 'divider' matches only the meta row's own text.
+            self._type_filter(b, ctx, 'divider')
+            ids = self._visible_ids(b)
+            self.assertIn('sep', ids)         # meta text matches
+            self.assertNotIn('alpha', ids)    # content non-match
+            self.assertNotIn('beta', ids)
+        finally:
+            b.stop_workers()
+
+
 if __name__ == '__main__':
     unittest.main()

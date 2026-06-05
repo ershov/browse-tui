@@ -1873,8 +1873,9 @@ def _search_find(state, query, start_idx, direction=1, *, show_ids='auto'):
 
     Walks the visible list starting from ``start_idx`` in ``direction``
     (1 forward, -1 backward), wrapping around. Skips non-``'normal'``
-    entries (``pending`` placeholders) so search never lands on a row
-    without a real id. The scope row at depth 0 (when scoped) is a
+    entries — ``pending`` placeholders (no real id) and ``meta`` rows
+    (excluded from search navigation by default, §5 meta-rows design) —
+    so search never lands on one. The scope row at depth 0 (when scoped) is a
     ``normal`` row and is searchable like any other. ``show_ids`` is
     plumbed through to ``_search_text`` so matches align with the
     rendered display (an id that isn't shown can't drive a match).
@@ -2014,7 +2015,29 @@ def _search_jump_nearest(browser):
 #   4. The current-scope row is exempt: always treated as a match.
 
 
-def _filter_visit_subtree(state, item, active, scope_id, show_ids):
+def _meta_filter_hidden(item, meta_filter_mode):
+    """Resolve a meta row's ``_filter_hidden`` under an active filter (§5).
+
+    Called only for ``meta=True`` rows while a filter is active.
+    Returns the ``_filter_hidden`` value for the row, or ``None`` to
+    mean "no meta override — evaluate this row like a normal content
+    row" (the ``'filter'`` mode). Meta rows are leaves, so the
+    self-match alone decides; there is no descendant to scaffold.
+
+    * ``'hide'`` (default) → ``True`` (hidden while filtering).
+    * ``'show'`` → ``False`` (always visible).
+    * ``'filter'`` → ``None`` (participate like a content row).
+    """
+    if meta_filter_mode == 'hide':
+        return True
+    if meta_filter_mode == 'show':
+        return False
+    return None
+
+
+def _filter_visit_subtree(
+    state, item, active, scope_id, show_ids, meta_filter_mode='hide',
+):
     """Bottom-up DFS over a visible subtree, writing ``_filter_hidden``.
 
     Mirrors the per-item evaluation used by ``_recompute_filter_hidden``:
@@ -2029,12 +2052,26 @@ def _filter_visit_subtree(state, item, active, scope_id, show_ids):
     call. This is shared between the full ``_recompute_filter_hidden``
     walk and the per-op dispatch's "force-evaluate a new item's
     subtree" hook (#499).
+
+    ``meta_filter_mode`` (§5 meta-rows design) governs ``meta=True``
+    rows: ``'hide'`` (default) hides them under an active filter,
+    ``'show'`` keeps them visible, ``'filter'`` evaluates them like a
+    content row.
     """
     # Rule 2: recipe-hidden rows aren't part of the visible tree. No
     # flag write; the renderer would skip them regardless and they
     # can't scaffold an ancestor.
     if getattr(item, 'hidden', False):
         return False
+
+    # Meta rows are leaves (no recursion) whose visibility under an
+    # active filter is governed by ``meta_filter_mode``. ``'filter'``
+    # falls through to the normal content-row evaluation below.
+    if getattr(item, 'meta', False):
+        hidden = _meta_filter_hidden(item, meta_filter_mode)
+        if hidden is not None:
+            item._filter_hidden = hidden
+            return not hidden
 
     # Descend only into expanded subtrees (Rule 1). Collapsed children
     # contribute nothing.
@@ -2043,6 +2080,7 @@ def _filter_visit_subtree(state, item, active, scope_id, show_ids):
         for child in state._children.get(item.id, ()):
             if _filter_visit_subtree(
                 state, child, active, scope_id, show_ids,
+                meta_filter_mode,
             ):
                 any_visible_desc_passes = True
 
@@ -2060,7 +2098,9 @@ def _filter_visit_subtree(state, item, active, scope_id, show_ids):
     return not item._filter_hidden
 
 
-def _recompute_filter_hidden(state, filters, *, show_ids='auto') -> None:
+def _recompute_filter_hidden(
+    state, filters, *, show_ids='auto', meta_filter_mode='hide',
+) -> None:
     """Re-evaluate filter visibility across the visible tree.
 
     ``filters`` is an iterable of filter strings (typically
@@ -2071,6 +2111,10 @@ def _recompute_filter_hidden(state, filters, *, show_ids='auto') -> None:
     ``show_ids`` is plumbed through to ``_search_text`` so the filter
     matches against the same haystack the user would search by ``/`` —
     a row whose id wouldn't render can't drive a filter match.
+
+    ``meta_filter_mode`` (§5 meta-rows design) is plumbed through to
+    ``_filter_visit_subtree`` to govern ``meta=True`` rows under an
+    active filter.
 
     No-op when no non-empty filter is present: existing
     ``_filter_hidden`` flags become stale-but-inert because the
@@ -2101,11 +2145,13 @@ def _recompute_filter_hidden(state, filters, *, show_ids='auto') -> None:
         if scope_item is not None:
             _filter_visit_subtree(
                 state, scope_item, active, scope_id, show_ids,
+                meta_filter_mode,
             )
     else:
         for child in state._children.get(state.root_id, ()):
             _filter_visit_subtree(
                 state, child, active, scope_id, show_ids,
+                meta_filter_mode,
             )
 
 
@@ -2138,7 +2184,9 @@ def _recompute_filter_hidden(state, filters, *, show_ids='auto') -> None:
 # A missing entry means "no parent known" -> we've reached the top.
 
 
-def _propagate_filter_status_up(state, item, filters, *, show_ids='auto'):
+def _propagate_filter_status_up(
+    state, item, filters, *, show_ids='auto', meta_filter_mode='hide',
+):
     """Re-evaluate one item's ``_filter_hidden`` and walk up ancestors.
 
     For each item visited the helper recomputes ``_filter_hidden`` from
@@ -2156,6 +2204,9 @@ def _propagate_filter_status_up(state, item, filters, *, show_ids='auto'):
     ``show_ids`` is plumbed through to ``_search_text`` so propagation
     sees the same haystack as the full walk.
 
+    ``meta_filter_mode`` (§5 meta-rows design) governs ``meta=True``
+    rows visited during the walk, matching ``_filter_visit_subtree``.
+
     No-op when no non-empty filter is present. Recipe-``hidden=True``
     items count as "not visible, doesn't scaffold" — propagation still
     continues through them upward (the parent gets re-evaluated against
@@ -2170,27 +2221,37 @@ def _propagate_filter_status_up(state, item, filters, *, show_ids='auto'):
     cur = item
     while cur is not None:
         if not getattr(cur, 'hidden', False):
-            # Recompute cur's flag from self-match + visible children's
-            # current flags. Recipe-hidden cur is skipped: it can't
-            # scaffold an ancestor and the renderer drops it anyway;
-            # we still walk upward so the parent re-evaluates against
-            # its other (non-hidden) children.
-            any_visible_desc_passes = False
-            if cur.has_children and cur.id in state.expanded:
-                for child in state._children.get(cur.id, ()):
-                    if getattr(child, 'hidden', False):
-                        continue
-                    if not child._filter_hidden:
-                        any_visible_desc_passes = True
-                        break
-            is_scope = (cur.id == scope_id)
-            text = _search_text(
-                cur, show_ids=show_ids, is_current_scope=is_scope,
-            )
-            self_passes = is_scope or all(
-                _search_matches(text, q) for q in active
-            )
-            new_hidden = not (self_passes or any_visible_desc_passes)
+            # Meta rows are leaves; their flag under an active filter
+            # is governed by ``meta_filter_mode`` (``'filter'`` ->
+            # ``None`` falls through to the normal content-row eval).
+            meta_hidden = None
+            if getattr(cur, 'meta', False):
+                meta_hidden = _meta_filter_hidden(cur, meta_filter_mode)
+            if meta_hidden is not None:
+                new_hidden = meta_hidden
+            else:
+                # Recompute cur's flag from self-match + visible
+                # children's current flags. Recipe-hidden cur is
+                # skipped above; we still walk upward so the parent
+                # re-evaluates against its other (non-hidden) children.
+                any_visible_desc_passes = False
+                if cur.has_children and cur.id in state.expanded:
+                    for child in state._children.get(cur.id, ()):
+                        if getattr(child, 'hidden', False):
+                            continue
+                        if not child._filter_hidden:
+                            any_visible_desc_passes = True
+                            break
+                is_scope = (cur.id == scope_id)
+                text = _search_text(
+                    cur, show_ids=show_ids, is_current_scope=is_scope,
+                )
+                self_passes = is_scope or all(
+                    _search_matches(text, q) for q in active
+                )
+                new_hidden = not (
+                    self_passes or any_visible_desc_passes
+                )
 
             if cur._filter_hidden == new_hidden:
                 # No change at this level: ancestors above us see the
@@ -2343,7 +2404,9 @@ def _is_parent_visible_expanded(state, parent_id):
     return parent_id in state.expanded
 
 
-def _dispatch_filter_propagation(state, dispatch_info, filters, show_ids):
+def _dispatch_filter_propagation(
+    state, dispatch_info, filters, show_ids, meta_filter_mode='hide',
+):
     """Apply per-op filter propagation for the captured dispatch info.
 
     Each entry comes from ``_filter_dispatch_pre_scan``. The visible-
@@ -2375,6 +2438,7 @@ def _dispatch_filter_propagation(state, dispatch_info, filters, show_ids):
         walked.add(target_id)
         _propagate_filter_status_up(
             state, item, filters, show_ids=show_ids,
+            meta_filter_mode=meta_filter_mode,
         )
 
     for entry in dispatch_info:
@@ -2419,6 +2483,7 @@ def _dispatch_filter_propagation(state, dispatch_info, filters, show_ids):
                 if new_item is not None:
                     _filter_visit_subtree(
                         state, new_item, active, scope_id, show_ids,
+                        meta_filter_mode,
                     )
                 _walk_from_id(new_parent_id)
             else:
@@ -2968,6 +3033,23 @@ class BrowserConfig:
     #   * ``'exit'`` — quit with the cancel exit code (1) the moment no
     #     landable row remains.
     on_empty: str = 'wait'
+    # Meta-row behaviour under search and user filter (§5 of the
+    # meta-rows design). Both default to the conservative "meta rows
+    # stay out of the way": search highlight off, hidden under a filter.
+    #   * ``meta_search_highlight`` — when True, a meta row whose text
+    #     matches the active ``/`` query may receive highlight spans;
+    #     when False (default) meta rows never get a search highlight.
+    #     Orthogonal to search *navigation*, which always skips meta.
+    #   * ``meta_filter_mode`` governs meta rows while a ``&`` filter is
+    #     active (no effect when no filter is set):
+    #       - ``'hide'`` (default) — all meta rows hide (git-like).
+    #       - ``'show'`` — meta rows stay visible regardless of filter
+    #         (header-like; a divider survives even if its section
+    #         filters away).
+    #       - ``'filter'`` — meta rows participate in filtering like
+    #         content rows; their own text is matched, non-matches hide.
+    meta_search_highlight: bool = False
+    meta_filter_mode: str = 'hide'
     _headless: bool = False
 
 
@@ -3190,6 +3272,11 @@ class Browser:
                 "on_empty must be one of 'wait', 'exit'; "
                 f"got {config.on_empty!r}"
             )
+        if config.meta_filter_mode not in ('hide', 'show', 'filter'):
+            raise ValueError(
+                "meta_filter_mode must be one of 'hide', 'show', "
+                f"'filter'; got {config.meta_filter_mode!r}"
+            )
         # --- user-supplied data callbacks -------------------------------
         # Default get_children to "no children" so a Browser constructed
         # with no kwargs still works (tests, smoke checks). get_preview
@@ -3296,6 +3383,11 @@ class Browser:
         # ``_clamp_cursor_landable`` whenever the visible list ends up
         # with no landable row (empty / all-meta).
         self._on_empty = config.on_empty
+        # Meta-row search/filter behaviour (§5 meta-rows design). Read by
+        # the render highlight gate (``meta_search_highlight``) and the
+        # filter machinery (``meta_filter_mode``). Validated above.
+        self.meta_search_highlight = config.meta_search_highlight
+        self.meta_filter_mode = config.meta_filter_mode
         # Worker-slot registry for ``run_in_slot``. Each entry is the
         # currently-active CancellationToken for a named slot;
         # superseded tokens are removed lazily by the worker on exit.
@@ -3958,6 +4050,7 @@ class Browser:
         pre_cursor = self._state.cursor
         _recompute_filter_hidden(
             self._state, self._filters, show_ids=self.show_ids,
+            meta_filter_mode=self.meta_filter_mode,
         )
         mark_visible_dirty(self._state)
         cur_anchor = self._cursor_anchor
@@ -4227,6 +4320,7 @@ class Browser:
                 _dispatch_filter_propagation(
                     self._state, filter_dispatch,
                     self._filters, self.show_ids,
+                    self.meta_filter_mode,
                 )
 
             # Positional pin owns the cursor position — skip
@@ -4706,6 +4800,7 @@ class Browser:
             if self._filters:
                 _recompute_filter_hidden(
                     self._state, self._filters, show_ids=self.show_ids,
+                    meta_filter_mode=self.meta_filter_mode,
                 )
             self._needs_redraw.add('all')
             mark_cursor_changed(self)
@@ -4748,6 +4843,7 @@ class Browser:
             if self._filters:
                 _recompute_filter_hidden(
                     self._state, self._filters, show_ids=self.show_ids,
+                    meta_filter_mode=self.meta_filter_mode,
                 )
             placed = False
             for i, entry in enumerate(visible_items(state)):
@@ -5370,6 +5466,7 @@ class Browser:
             if self._filters:
                 _recompute_filter_hidden(
             self._state, self._filters, show_ids=self.show_ids,
+            meta_filter_mode=self.meta_filter_mode,
         )
             # Re-snap the cursor onto its anchored id (or closest
             # fallback) before the index clamp runs, so the clamp only
@@ -5711,6 +5808,7 @@ class Browser:
                         _filter_visit_subtree(
                             self._state, child,
                             active, scope_id, self.show_ids,
+                            self.meta_filter_mode,
                         )
             # Children already cached — expanding inserts those rows
             # into the visible list immediately. Re-snap the cursor on

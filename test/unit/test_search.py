@@ -253,6 +253,31 @@ class TestSearchFind(unittest.TestCase):
         s = self._state_with([Item(id='alpha')])
         self.assertIsNone(_search_find(s, '', 0, 1))
 
+    def test_skips_meta_rows_by_default(self):
+        # #740: search navigation never lands on a meta row. The meta
+        # row's text matches 'sep', but ``_search_find`` skips it (the
+        # ``kind != 'normal'`` guard) and finds the normal row instead.
+        s = self._state_with([
+            Item(id='alpha'),
+            Item(id='sep', title='sep divider', meta=True),
+            Item(id='sep-real', title='sep content'),
+        ])
+        # Sanity: the visible list has the meta row at idx 1.
+        vis = visible_items(s)
+        self.assertEqual(vis[1].kind, 'meta')
+        # Forward from idx 0 for 'sep': skip meta idx 1, land on idx 2.
+        self.assertEqual(_search_find(s, 'sep', 0, 1), 2)
+
+    def test_meta_only_match_returns_none(self):
+        # When the ONLY row whose text matches is a meta row, search
+        # finds nothing — meta never participates in navigation.
+        s = self._state_with([
+            Item(id='alpha'),
+            Item(id='sep', title='unique-meta', meta=True),
+            Item(id='beta'),
+        ])
+        self.assertIsNone(_search_find(s, 'unique-meta', 0, 1))
+
 
 # --- search-mode key dispatch --------------------------------------------
 
