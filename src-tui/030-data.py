@@ -92,6 +92,14 @@ class Item:
     honoured by recipes that build such cascades; the framework has no
     cross-item preview concept.
 
+    ``meta`` (default ``False``) marks a *non-content* row — a divider,
+    section header, or structural connector line. The cursor skips it
+    (best-effort: explicit ``cursor_to`` or an all-meta list may still
+    land on it, which is not an error), it is never selectable, and it is
+    excluded from search/filter by default. ``has_children`` is ignored
+    on a meta row — it is always a leaf. See ``docs/superpowers/specs/
+    2026-06-05-meta-rows-design.md`` for the full semantics.
+
     ``_filter_hidden`` is a framework-internal flag written by the
     filter evaluator (see ``docs/superpowers/specs/2026-05-17-filter-
     design.md``). Recipes do not see or set it: ``init=False`` keeps
@@ -123,6 +131,7 @@ class Item:
     has_children: bool = False
     hidden: bool = False
     boundary: bool = False
+    meta: bool = False
     _filter_hidden: bool = field(
         default=False, init=False, repr=False, compare=False,
     )
@@ -195,7 +204,7 @@ def to_item(x: Any) -> Item:
         # Split known dataclass fields from extras so we can attach the
         # rest as arbitrary attributes (Item is intentionally non-slotted).
         known = {'id', 'title', 'tag', 'tag_style', 'has_children',
-                 'hidden', 'boundary'}
+                 'hidden', 'boundary', 'meta'}
         fields = {k: v for k, v in x.items() if k in known}
         extras = {k: v for k, v in x.items() if k not in known}
         item = Item(**fields)
