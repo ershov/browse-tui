@@ -270,21 +270,25 @@ The clean deletion is the proof the primitive is correctly shaped.
 
 ### browse-claude (orphaned-subagent dividers)
 
-In `_list_session_children` (`recipes/browse-claude:975`), when a session has
-subagents, bracket the subagent block with two meta rows (e.g.
-`'sep:subagents'` / `'sep:session'`):
+Tree mode (the default) surfaces *orphaned* subagents — those with no
+dispatching `Agent`/`Task` call in the main thread — at the top of the listing,
+in `_list_tree_roots` (`recipes/browse-claude`), ahead of the session's turn /
+span umbrellas. When that orphan block is non-empty, bracket it with two meta
+rows (session-namespaced ids so they stay unique and stable as sentinels, e.g.
+`f'{jsonl_path}#sep:subagents'` / `f'{jsonl_path}#sep:session'`):
 
 ```
-── Subagents ──        (meta)   ← also an insertion sentinel
-<subagent group rows>
-── Session ──          (meta)   ← also an insertion sentinel
-<message rows>
+--- Subagents:         (meta)   ← also an insertion sentinel
+<orphaned subagent rows>
+--- Session:           (meta)   ← also an insertion sentinel
+<turn / span umbrellas>
 ```
 
-Emitted only when subagents are present. They give visual separation **and**
-double as **insertion sentinels** for positioning new rows via the `update_data`
-API. `meta_filter_mode` is likely `'show'` here (keep the labels under a filter)
-— recipe's call.
+Emitted only when there are orphaned subagents (sessions without them render
+exactly as before). They give visual separation **and** double as **insertion
+sentinels** for positioning new rows via the `update_data` API — keep the ids
+stable. browse-claude sets `meta_filter_mode='show'` so the labels persist under
+an active filter.
 
 ## Testing
 

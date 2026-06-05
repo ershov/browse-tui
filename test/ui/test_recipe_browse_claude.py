@@ -1641,6 +1641,163 @@ class TestBrowseClaude(unittest.TestCase):
                                  'in tree mode; got: ' + cap[-1400:])
                 t.send('q')
 
+    def _make_orphan_fixture(self, tmp):
+        """A session with one real turn + one ORPHAN subagent.
+
+        The subagent ``agent-ORPH01.jsonl`` exists on disk but the main
+        thread carries NO ``Agent`` / ``Task`` dispatch wiring it, so
+        ``_orphan_subagents_for_session`` surfaces it at the top of the
+        tree listing. The lone user/assistant turn becomes a ``<prompt>``
+        umbrella that lands after the ``--- Session:`` divider.
+        """
+        import json as _json
+        root = os.path.join(tmp, '.claude', 'projects')
+        proj = os.path.join(root, '-home-test-orph')
+        os.makedirs(proj)
+        sess = os.path.join(proj, 'orph-sess.jsonl')
+        records = [
+            {'type': 'user', 'uuid': 'u1', 'parentUuid': None,
+             'message': {'role': 'user', 'content': 'PROBE_ORPH_USER'}},
+            {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'text', 'text': 'PROBE_ORPH_REPLY'},
+             ]}},
+        ]
+        with open(sess, 'w') as f:
+            for rec in records:
+                f.write(_json.dumps(rec) + '\n')
+        sub_dir = os.path.join(proj, 'orph-sess', 'subagents')
+        os.makedirs(sub_dir)
+        agent_path = os.path.join(sub_dir, 'agent-ORPH01.jsonl')
+        with open(agent_path, 'w') as f:
+            f.write(_json.dumps({
+                'type': 'user', 'uuid': 'agU1', 'parentUuid': None,
+                'message': {'role': 'user',
+                            'content': 'PROBE_ORPHAN_SUBAGENT'},
+            }) + '\n')
+        with open(os.path.join(sub_dir,
+                               'agent-ORPH01.meta.json'), 'w') as f:
+            _json.dump({'agentType': 'Explore',
+                        'description': 'PROBE_ORPHAN_DESC'}, f)
+        return sess
+
+    @staticmethod
+    def _cursor_line(colored_capture):
+        """Return the visible text of the reverse-video (cursor) line.
+
+        The cursor row is painted ``\\x1b[7m`` (reverse=True); find the
+        first screen line carrying that SGR and strip all escapes so the
+        caller can assert on the plain text the cursor sits on.
+        """
+        import re as _re
+        ansi = _re.compile(r'\x1b\[[0-9;]*m')
+        for raw in colored_capture.splitlines():
+            if '\x1b[7m' in raw:
+                return ansi.sub('', raw).rstrip()
+        return None
+
+    def test_tree_orphan_subagent_dividers_present(self):
+        """Tree mode brackets the orphan block with the two meta dividers.
+
+        ``--- Subagents:`` sits above the orphan subagent row;
+        ``--- Session:`` sits above the turn umbrella. The cursor never
+        rests on either divider (the framework skips meta rows).
+        """
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._make_orphan_fixture(tmp)
+            with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE,
+                         '--tree', '--show-all', '--file', sess)
+                # The session expands on launch; both dividers render
+                # around the orphan subagent row.
+                t.wait_for('--- Subagents:', timeout=4.0)
+                cap = t.wait_for('--- Session:', timeout=4.0)
+                self.assertIn('PROBE_ORPHAN_DESC', cap,
+                              'orphan subagent row should render between '
+                              'the dividers; got: ' + cap[-1400:])
+                # Order on screen: Subagents divider, then the orphan,
+                # then the Session divider.
+                i_sub = cap.index('--- Subagents:')
+                i_orph = cap.index('PROBE_ORPHAN_DESC')
+                i_sess = cap.index('--- Session:')
+                self.assertLess(i_sub, i_orph,
+                                '--- Subagents: should precede the orphan')
+                self.assertLess(i_orph, i_sess,
+                                'orphan should precede --- Session:')
+                # The cursor must never land on a meta divider. Home →
+                # first landable (the orphan, not the Subagents sep);
+                # End → last landable (a voice, not a divider).
+                t.send('Home')
+                t.wait_stable(timeout=3.0)
+                home_cur = self._cursor_line(t.capture(colors=True))
+                self.assertIsNotNone(home_cur,
+                                     'expected a reverse-video cursor line')
+                self.assertNotIn('--- Subagents:', home_cur or '')
+                self.assertNotIn('--- Session:', home_cur or '')
+                t.send('End')
+                t.wait_stable(timeout=3.0)
+                end_cur = self._cursor_line(t.capture(colors=True))
+                self.assertNotIn('--- Subagents:', end_cur or '')
+                self.assertNotIn('--- Session:', end_cur or '')
+                # Walk up across the Session divider with Up: the cursor
+                # steps over it onto the orphan row, never resting on the
+                # divider.
+                for _ in range(6):
+                    t.send('Up')
+                    t.wait_stable(timeout=3.0)
+                    cur = self._cursor_line(t.capture(colors=True))
+                    self.assertNotIn('--- Subagents:', cur or '',
+                                     'cursor landed on --- Subagents: '
+                                     'divider')
+                    self.assertNotIn('--- Session:', cur or '',
+                                     'cursor landed on --- Session: '
+                                     'divider')
+                t.send('q')
+
+    def test_tree_no_dividers_without_orphan(self):
+        """A session with NO orphaned subagents shows no dividers."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            # _make_tree_fixture wires AGENT01 via toolUseResult.agentId,
+            # so there is no orphan and no divider should appear.
+            sess = self._make_tree_fixture(tmp)
+            with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE,
+                         '--tree', '--show-all', '--file', sess)
+                cap = t.wait_for('PROBE_TURN2_REPLY', timeout=4.0)
+                self.assertNotIn('--- Subagents:', cap,
+                                 'no orphan → no Subagents divider; got: '
+                                 + cap[-1400:])
+                self.assertNotIn('--- Session:', cap,
+                                 'no orphan → no Session divider; got: '
+                                 + cap[-1400:])
+                t.send('q')
+
+    def test_tree_orphan_dividers_survive_voice_filter(self):
+        """meta_filter_mode='show': dividers persist under the '.' filter."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._make_orphan_fixture(tmp)
+            with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE,
+                         '--tree', '--show-all', '--file', sess)
+                t.wait_for('--- Subagents:', timeout=4.0)
+                t.wait_for('--- Session:', timeout=4.0)
+                # Turn on the voice-only filter. The orphan subagent row
+                # (non-voice) filters away, but the two meta dividers
+                # stay visible because meta_filter_mode='show'.
+                t.send('.')
+                cap = t.wait_stable(timeout=3.0)
+                self.assertIn('--- Subagents:', cap,
+                              '--- Subagents: divider should survive the '
+                              'voice-only filter (meta_filter_mode=show); '
+                              'got: ' + cap[-1400:])
+                self.assertIn('--- Session:', cap,
+                              '--- Session: divider should survive the '
+                              'voice-only filter; got: ' + cap[-1400:])
+                t.send('q')
+
 
 if __name__ == '__main__':
     unittest.main()
