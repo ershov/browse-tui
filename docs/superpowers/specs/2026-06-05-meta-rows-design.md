@@ -58,8 +58,6 @@ non-selectable row kind**."
   ships and the opt-out is deferred.
 - **A standalone `selectable=False` on *content* rows** (the load-more
   sentinel). Orthogonal axis, different machinery, deferred.
-- **Non-string IDs.** Split into its own epic — see
-  `2026-06-05-hashable-ids-design.md`. **This work uses string IDs throughout.**
 - **A grouping / column engine, and a `browse-fs` column header.** Recipes
   inject meta rows positionally; the framework owns no "groups." (browse-fs
   header dropped per review — columns are self-evident, don't steal a row.)
@@ -254,12 +252,12 @@ exclusion to filtering.)
 `BrowserConfig`: `on_empty='wait'`, `meta_search_highlight=False`,
 `meta_filter_mode='hide'`. No new row hook.
 
-## Migrations (string IDs only)
+## Migrations
 
 ### browse-git (the validation)
 
 - `_commit_graph_items` (`recipes/browse-git:893`): set `meta=True` on filler
-  `Item`s (id stays the string `'filler:<ns>:<n>'`); drop the `(id, is_filler)`
+  `Item`s (id `'filler:<ns>:<n>'`); drop the `(id, is_filler)`
   row-tracking and the `_graph_rows_by_ns` write. `git_row_content`'s filler
   branch is **kept** — it already produces the aligned graph segments.
 - **Delete:** `_skip_fillers` (`:1391`), `_next_non_filler` (`:1441`),
@@ -273,7 +271,7 @@ The clean deletion is the proof the primitive is correctly shaped.
 ### browse-claude (orphaned-subagent dividers)
 
 In `_list_session_children` (`recipes/browse-claude:975`), when a session has
-subagents, bracket the subagent block with two meta rows (string ids, e.g.
+subagents, bracket the subagent block with two meta rows (e.g.
 `'sep:subagents'` / `'sep:session'`):
 
 ```
