@@ -1307,6 +1307,7 @@ class TestExpandGoal(unittest.TestCase):
             _actions_mod.visible_items = _state_mod.visible_items
             _actions_mod.mark_visible_dirty = _state_mod.mark_visible_dirty
             _actions_mod.mark_cursor_changed = _state_mod.mark_cursor_changed
+            _actions_mod._resolve_landing = _state_mod._resolve_landing
             _actions_mod.Mode = _state_mod.Mode
             _state_mod.dispatch_key = _actions_mod.dispatch_key
             _state_mod._handle_insert_key = _actions_mod._handle_insert_key
@@ -1665,6 +1666,7 @@ class TestCursorPin(unittest.TestCase):
             _actions_mod.visible_items = _state.visible_items
             _actions_mod.mark_visible_dirty = _state.mark_visible_dirty
             _actions_mod.mark_cursor_changed = _state.mark_cursor_changed
+            _actions_mod._resolve_landing = _state._resolve_landing
             _actions_mod.PIN_FIRST = _state.PIN_FIRST
             _actions_mod.PIN_LAST = _state.PIN_LAST
             _actions_mod.Mode = _state.Mode
@@ -1760,6 +1762,7 @@ class TestCursorPin(unittest.TestCase):
             _actions_mod.visible_items = _state.visible_items
             _actions_mod.mark_visible_dirty = _state.mark_visible_dirty
             _actions_mod.mark_cursor_changed = _state.mark_cursor_changed
+            _actions_mod._resolve_landing = _state._resolve_landing
             _actions_mod.PIN_FIRST = _state.PIN_FIRST
             _actions_mod.PIN_LAST = _state.PIN_LAST
             _actions_mod.Mode = _state.Mode
@@ -1793,6 +1796,7 @@ def _wire_actions(b):
     _actions_mod.visible_items = _state.visible_items
     _actions_mod.mark_visible_dirty = _state.mark_visible_dirty
     _actions_mod.mark_cursor_changed = _state.mark_cursor_changed
+    _actions_mod._resolve_landing = _state._resolve_landing
     _actions_mod._recompute_filter_hidden = _state._recompute_filter_hidden
     _actions_mod._AnchorSentinel = _state._AnchorSentinel
     _actions_mod.PIN_FIRST = _state.PIN_FIRST

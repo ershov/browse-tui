@@ -98,21 +98,40 @@ def _gate_passes(action, ctx) -> bool:
 _DEFAULT_PAGE_ROWS = 20
 
 
+def _move_cursor_to(browser, target):
+    """Route a cursor MOVE to ``target`` through the meta-skip resolver.
+
+    Resolves ``target`` (the intended visible-list index) to the nearest
+    landable row in the direction of travel from the current cursor
+    (``_resolve_landing``), then applies it. No-ops — including
+    ``mark_cursor_changed`` — when the resolver lands back on the current
+    index (e.g. a down-step with only meta rows below) or returns
+    ``None`` (empty / all-meta list parks the cursor). Shared by every
+    keyboard / mouse move site so the skip policy is uniform; the
+    ``cursor_to`` API path deliberately bypasses it (lands exactly).
+    """
+    state = browser._state
+    vis = visible_items(state)
+    idx = _resolve_landing(vis, target, state.cursor)
+    if idx is None or idx == state.cursor:
+        return
+    state.cursor = idx
+    mark_cursor_changed(browser)
+
+
 def _nav_down(ctx):
     """Move cursor one row down (clamped to the visible list end)."""
     state = ctx._browser._state
     vis = visible_items(state)
     if state.cursor < len(vis) - 1:
-        state.cursor += 1
-        mark_cursor_changed(ctx._browser)
+        _move_cursor_to(ctx._browser, state.cursor + 1)
 
 
 def _nav_up(ctx):
     """Move cursor one row up (clamped to 0)."""
     state = ctx._browser._state
     if state.cursor > 0:
-        state.cursor -= 1
-        mark_cursor_changed(ctx._browser)
+        _move_cursor_to(ctx._browser, state.cursor - 1)
 
 
 def _nav_home(ctx):
@@ -124,9 +143,15 @@ def _nav_home(ctx):
     ``docs/superpowers/specs/2026-05-17-cursor-pin-design.md``.
     """
     b = ctx._browser
-    b._state.cursor = 0
+    vis = visible_items(b._state)
+    # target = 0; the resolver's direction is *up* (or tie→down), finds
+    # nothing landable above 0, then reverses to the first landable row
+    # going down — so a meta row at the very top is skipped.
+    idx = _resolve_landing(vis, 0, b._state.cursor)
+    if idx is not None and idx != b._state.cursor:
+        b._state.cursor = idx
+        mark_cursor_changed(b)
     b._cursor_anchor = [PIN_FIRST]
-    mark_cursor_changed(b)
 
 
 def _nav_end(ctx):
@@ -136,9 +161,13 @@ def _nav_end(ctx):
     """
     b = ctx._browser
     vis = visible_items(b._state)
-    b._state.cursor = max(0, len(vis) - 1)
+    # target = last row; the resolver scans down off the end, then
+    # reverses upward to the last landable row (skips a trailing meta).
+    idx = _resolve_landing(vis, max(0, len(vis) - 1), b._state.cursor)
+    if idx is not None and idx != b._state.cursor:
+        b._state.cursor = idx
+        mark_cursor_changed(b)
     b._cursor_anchor = [PIN_LAST]
-    mark_cursor_changed(b)
 
 
 def _nav_pgdn(ctx):
@@ -151,8 +180,8 @@ def _nav_pgdn(ctx):
     state = browser._state
     vis = visible_items(state)
     page = _list_pane_height(browser)
-    state.cursor = min(max(0, len(vis) - 1), state.cursor + page)
-    mark_cursor_changed(browser)
+    target = min(max(0, len(vis) - 1), state.cursor + page)
+    _move_cursor_to(browser, target)
 
 
 def _nav_pgup(ctx):
@@ -163,8 +192,8 @@ def _nav_pgup(ctx):
     browser = ctx._browser
     state = browser._state
     page = _list_pane_height(browser)
-    state.cursor = max(0, state.cursor - page)
-    mark_cursor_changed(browser)
+    target = max(0, state.cursor - page)
+    _move_cursor_to(browser, target)
 
 
 def _nav_right(ctx):
@@ -517,7 +546,9 @@ def _select_toggle_down(ctx):
         state.selected.add(item.id)
     vis = visible_items(state)
     if state.cursor < len(vis) - 1:
-        state.cursor += 1
+        # Route the cursor step through the resolver so the sweep skips
+        # meta rows (this is what browse-git's second hook existed for).
+        _move_cursor_to(ctx._browser, state.cursor + 1)
     ctx._browser._needs_redraw.add('list')
     ctx._browser._needs_redraw.add('info')
     ctx._browser._fire_selection_change()
@@ -539,7 +570,9 @@ def _select_toggle_up(ctx):
     else:
         state.selected.add(item.id)
     if state.cursor > 0:
-        state.cursor -= 1
+        # Route the cursor step through the resolver so the sweep skips
+        # meta rows (symmetric with ``_select_toggle_down``).
+        _move_cursor_to(ctx._browser, state.cursor - 1)
     ctx._browser._needs_redraw.add('list')
     ctx._browser._needs_redraw.add('info')
     ctx._browser._fire_selection_change()
@@ -1768,14 +1801,18 @@ def _pane_at(layout, row, col):
 
 
 def _click_list_row(browser, layout, row):
-    """Move ``state.cursor`` to the visible-list row at terminal ``row``."""
+    """Move ``state.cursor`` to the visible-list row at terminal ``row``.
+
+    Routed through the resolver: a click landing on a meta row skips in
+    the click's direction of travel (``before`` = current cursor), same
+    as keyboard moves.
+    """
     state = browser._state
     visible = visible_items(state)
     list_rect = layout['list']
     new_idx = browser._list_scroll + (row - list_rect.top)
-    if 0 <= new_idx < len(visible) and state.cursor != new_idx:
-        state.cursor = new_idx
-        mark_cursor_changed(browser)
+    if 0 <= new_idx < len(visible):
+        _move_cursor_to(browser, new_idx)
 
 
 def _scroll_list(browser, delta):

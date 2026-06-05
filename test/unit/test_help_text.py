@@ -51,6 +51,7 @@ _actions.current_scope = _state.current_scope
 _actions._search_find = _state._search_find
 _actions._search_jump_nearest = _state._search_jump_nearest
 _actions.mark_cursor_changed = _state.mark_cursor_changed
+_actions._resolve_landing = _state._resolve_landing
 _actions.PIN_FIRST = _state.PIN_FIRST
 _actions.PIN_LAST = _state.PIN_LAST
 _actions.Mode = _state.Mode

@@ -1901,6 +1901,47 @@ def _search_find(state, query, start_idx, direction=1, *, show_ids='auto'):
     return None
 
 
+def _next_landable(vis, start, direction):
+    """First landable row index from ``start`` (inclusive) in ``direction``.
+
+    A row is *landable* when its ``kind != 'meta'`` (``'normal'`` and
+    ``'pending'`` both land). ``direction`` is ``+1`` (down) or ``-1``
+    (up). Returns the index of the first landable row, or ``None`` if
+    the scan runs off the end without finding one.
+
+    Plain linear scan, no precomputed index: meta rows are expected to
+    be few and never form long runs (§3.3 of the meta-rows design), so
+    in practice this advances one or two rows.
+    """
+    i = start
+    n = len(vis)
+    while 0 <= i < n:
+        if vis[i].kind != 'meta':
+            return i
+        i += direction
+    return None
+
+
+def _resolve_landing(vis, target, before):
+    """Land on the nearest landable row from ``target`` (best-effort, §3.2).
+
+    Scans in the direction of travel — ``sign(target - before)``, tie
+    (``target == before``) → down — then the other way if that runs off
+    the end. Returns the resolved index, or ``None`` when ``vis`` has no
+    landable row at all (empty / all-meta), in which case the caller
+    parks the cursor rather than crashing.
+
+    This is the one resolver every cursor *move* routes through (arrows,
+    page, Home/End, mouse click, selection-toggle step); ``cursor_to``
+    is the deliberate exception — it honours the target exactly (§3.2).
+    """
+    direction = +1 if target >= before else -1
+    idx = _next_landable(vis, target, direction)
+    if idx is not None:
+        return idx
+    return _next_landable(vis, target, -direction)
+
+
 def mark_cursor_changed(browser) -> None:
     """Flag the redraw set for a cursor-position change.
 

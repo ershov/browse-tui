@@ -1,6 +1,7 @@
 """UI tests: initial render, j/k navigation, expand/collapse, quit."""
 
 import os
+import re
 import shutil
 import subprocess
 import unittest
@@ -11,6 +12,24 @@ from test.ui.fixtures.tmux import TmuxFixture
 _BIN = os.path.abspath('./browse-tui')
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _NAV_RECIPE = os.path.join(_REPO, 'test', 'ui', 'recipes', 'slow_children.py')
+_META_RECIPE = os.path.join(_REPO, 'test', 'ui', 'recipes', 'meta_rows.py')
+
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
+
+
+def _cursor_row_id(screen):
+    """Return the id token sitting on the reverse-video cursor row.
+
+    With ``--show-ids always`` each row renders ``<id> <title>``; the
+    cursor row carries the ``ESC[7m`` reverse-video sequence. Find that
+    line, strip ANSI, and read its first whitespace token (the id).
+    Returns ``None`` if no cursor marker is on screen.
+    """
+    for line in screen.splitlines():
+        if '\x1b[7m' in line:
+            plain = _ANSI_RE.sub('', line).strip()
+            return plain.split()[0] if plain else None
+    return None
 
 
 def setUpModule():
@@ -158,3 +177,71 @@ class TestNavigation(unittest.TestCase):
         self.assertGreater(cursor_big, cursor_small,
                            f'PageDown on 40-row ({cursor_big}) did not '
                            f'jump further than on 24-row ({cursor_small})')
+
+
+class TestMetaRowSkip(unittest.TestCase):
+    """End-to-end: the cursor skips meta rows through the real binary.
+
+    Uses the ``meta_rows.py`` recipe — visible order is::
+
+        top (meta) / a / m1 (meta) / m2 (meta) / b / bot (meta)
+
+    so the only landable rows are ``a`` and ``b``. The cursor's *initial*
+    placement onto a leading meta row is governed by the clamp/anchor
+    machinery (a separate ticket), so each test first issues a Down to
+    settle on a known landable row before exercising the move under test.
+    """
+
+    def _launch_on_a(self, t):
+        """Launch the recipe and settle the cursor on landable row 'a'."""
+        t.launch(_BIN, '--run-py', _META_RECIPE)
+        t.wait_for('a a')
+        t.wait_stable()
+        # Initial placement may sit on the leading 'top' meta row; one
+        # Down resolves down onto 'a' (target index 1) regardless.
+        t.send('Down')
+        t.wait_stable()
+        self.assertEqual(_cursor_row_id(t.capture(colors=True)), 'a',
+                         'Down from the top did not settle on a')
+
+    def test_down_arrow_skips_meta_run(self):
+        """Down from 'a' skips the two-row meta run and lands on 'b'."""
+        with TmuxFixture(cols=80, rows=24) as t:
+            self._launch_on_a(t)
+            t.send('Down')
+            t.wait_stable()
+            self.assertEqual(_cursor_row_id(t.capture(colors=True)), 'b',
+                             'Down did not skip the meta run onto b')
+
+    def test_up_arrow_skips_meta_run(self):
+        """Up from 'b' skips the two-row meta run back onto 'a'."""
+        with TmuxFixture(cols=80, rows=24) as t:
+            self._launch_on_a(t)
+            t.send('Down')          # a → b (over the meta run)
+            t.wait_stable()
+            self.assertEqual(_cursor_row_id(t.capture(colors=True)), 'b')
+            t.send('Up')            # b → a (back over the meta run)
+            t.wait_stable()
+            self.assertEqual(_cursor_row_id(t.capture(colors=True)), 'a',
+                             'Up did not skip the meta run back onto a')
+
+    def test_end_skips_trailing_meta(self):
+        """End lands on 'b' (last landable), not the trailing meta row."""
+        with TmuxFixture(cols=80, rows=24) as t:
+            self._launch_on_a(t)
+            t.send('End')
+            t.wait_stable()
+            self.assertEqual(_cursor_row_id(t.capture(colors=True)), 'b',
+                             'End did not skip the trailing meta row')
+
+    def test_home_skips_leading_meta(self):
+        """Home lands on 'a' (first landable), not the leading meta row."""
+        with TmuxFixture(cols=80, rows=24) as t:
+            self._launch_on_a(t)
+            t.send('End')           # → b
+            t.wait_stable()
+            self.assertEqual(_cursor_row_id(t.capture(colors=True)), 'b')
+            t.send('Home')          # → skip top meta → a
+            t.wait_stable()
+            self.assertEqual(_cursor_row_id(t.capture(colors=True)), 'a',
+                             'Home did not skip the leading meta row')
