@@ -301,6 +301,12 @@ class VisibleEntry:
             rather than a row-role discriminator.
           * ``'pending'`` — synthetic ``loading…`` placeholder under an
             expanded parent whose children haven't loaded yet.
+          * ``'meta'`` — a non-content row (divider, section header,
+            structural connector). Emitted for an Item with ``meta=True``.
+            Always a leaf — never recursed into, even when it carries
+            ``has_children`` and/or is in ``state.expanded``. The cursor
+            skips it by default and it is never selectable. See
+            ``docs/superpowers/specs/2026-06-05-meta-rows-design.md``.
     """
 
     item: Any
@@ -507,6 +513,13 @@ def _index_add_children(state: State, parent_id, items) -> None:
         state._parent_of_id[child.id] = parent_id
 
 
+# ``meta`` is deliberately absent: synthetics are only ever scope-root
+# stubs (the sole creation site fabricates one with ``has_children=True``
+# in ``visible_items``, always rendered kind ``'normal'``). A meta row is
+# an ordinary leaf from ``get_children`` that is never scoped into, so it
+# can never be the ``incoming`` Item matching a synthetic in
+# ``_promote_synthetics`` — there is nothing for a ``meta`` field to
+# propagate onto. See 2026-06-05-meta-rows-design.md.
 _PROMOTION_DATA_FIELDS = (
     'title', 'tag', 'tag_style', 'has_children', 'hidden', 'boundary',
     'scope_title',
@@ -1755,8 +1768,12 @@ def _emit_children(state, children, depth, out):
             # (now visible) ancestor. See
             # ``docs/superpowers/specs/2026-05-17-filter-design.md``.
             continue
-        out.append(VisibleEntry(item=child, depth=d, kind='normal'))
-        if not child.has_children or child.id not in state.expanded:
+        is_meta = getattr(child, 'meta', False)
+        kind = 'meta' if is_meta else 'normal'
+        out.append(VisibleEntry(item=child, depth=d, kind=kind))
+        # Meta rows are always leaves: never recurse into them even if
+        # ``has_children`` is set and/or the id is in ``state.expanded``.
+        if is_meta or not child.has_children or child.id not in state.expanded:
             continue
         sub = state._children.get(child.id)
         if sub is None:

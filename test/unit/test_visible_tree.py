@@ -440,5 +440,97 @@ class TestFilterHiddenFlag(unittest.TestCase):
         self.assertEqual(visible_items(s), [])
 
 
+class TestMetaKind(unittest.TestCase):
+    """``meta=True`` yields ``kind='meta'`` and is always a leaf."""
+
+    def test_meta_leaf_yields_meta_kind(self):
+        a = _kid('a')
+        sep = Item(id='sep', title='── divider ──', meta=True)
+        b = _kid('b')
+        s = _state_factory(root_id=None, _children={None: [a, sep, b]})
+        self.assertEqual(
+            _ids(visible_items(s)),
+            [('a', 0, 'normal'), ('sep', 0, 'meta'), ('b', 0, 'normal')],
+        )
+
+    def test_meta_with_children_not_recursed(self):
+        # A meta row carrying has_children + cached children is still a
+        # leaf: its children are never emitted.
+        sep = Item(id='sep', title='hdr', meta=True, has_children=True)
+        child = _kid('hidden-child')
+        s = _state_factory(
+            root_id=None,
+            _children={None: [sep], 'sep': [child]},
+        )
+        self.assertEqual(_ids(visible_items(s)), [('sep', 0, 'meta')])
+
+    def test_meta_in_expanded_set_not_recursed(self):
+        # Even forced into the expanded set, a meta row does not recurse
+        # (meta short-circuits before the expansion check).
+        sep = Item(id='sep', title='hdr', meta=True, has_children=True)
+        child = _kid('hidden-child')
+        s = _state_factory(
+            root_id=None,
+            _children={None: [sep], 'sep': [child]},
+            expanded={'sep'},
+        )
+        self.assertEqual(_ids(visible_items(s)), [('sep', 0, 'meta')])
+
+    def test_meta_expanded_emits_no_pending_placeholder(self):
+        # Expanded + has_children but no cached children would normally
+        # emit a 'pending' placeholder; a meta row suppresses recursion
+        # entirely, so no placeholder appears either.
+        sep = Item(id='sep', title='hdr', meta=True, has_children=True)
+        s = _state_factory(
+            root_id=None,
+            _children={None: [sep]},  # 'sep' missing from cache
+            expanded={'sep'},
+        )
+        self.assertEqual(_ids(visible_items(s)), [('sep', 0, 'meta')])
+
+    def test_mixed_normal_meta_ordering_preserved(self):
+        a = _kid('a')
+        s1 = Item(id='s1', meta=True)
+        b = _kid('b')
+        s2 = Item(id='s2', meta=True)
+        c = _kid('c')
+        s = _state_factory(
+            root_id=None,
+            _children={None: [a, s1, b, s2, c]},
+        )
+        self.assertEqual(
+            _ids(visible_items(s)),
+            [
+                ('a', 0, 'normal'),
+                ('s1', 0, 'meta'),
+                ('b', 0, 'normal'),
+                ('s2', 0, 'meta'),
+                ('c', 0, 'normal'),
+            ],
+        )
+
+    def test_meta_nested_under_expanded_normal_parent(self):
+        # A meta divider emitted among a normal parent's children gets
+        # the right depth and kind, and the normal siblings still recurse.
+        p = _kid('p', has_children=True)
+        c1 = _kid('c1')
+        sep = Item(id='sep', meta=True)
+        c2 = _kid('c2')
+        s = _state_factory(
+            root_id=None,
+            _children={None: [p], 'p': [c1, sep, c2]},
+            expanded={'p'},
+        )
+        self.assertEqual(
+            _ids(visible_items(s)),
+            [
+                ('p', 0, 'normal'),
+                ('c1', 1, 'normal'),
+                ('sep', 1, 'meta'),
+                ('c2', 1, 'normal'),
+            ],
+        )
+
+
 if __name__ == '__main__':
     unittest.main()
