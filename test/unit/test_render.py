@@ -481,7 +481,7 @@ class TestComposeRowStrContentProduction(unittest.TestCase):
         # crash (the bug a raw ``list + str`` would cause) and the visible
         # text must land in the row.
         b = self._browser(
-            format_row_content=lambda item, ctx: 'PLAIN ' + item.title)
+            format_row_content=lambda item, ctx: f'PLAIN {item.title}')
         item = visible_items(b._state)[0].item
         ctx = RowContext(b, item, depth=0, selected=False, expanded=False,
                          is_current_scope=False, kind='normal', list_width=40)
@@ -496,8 +496,7 @@ class TestComposeRowStrContentProduction(unittest.TestCase):
         # The str may carry SGR (passthrough, sec 4.1); the composer wraps it
         # verbatim into one segment — width math downstream is ANSI-aware.
         b = self._browser(
-            format_row_content=lambda item, ctx: '\033[31m' + item.title
-            + '\033[0m')
+            format_row_content=lambda item, ctx: f'\033[31m{item.title}\033[0m')
         item = visible_items(b._state)[0].item
         ctx = RowContext(b, item, depth=0, selected=False, expanded=False,
                          is_current_scope=False, kind='normal', list_width=40)
@@ -2453,7 +2452,7 @@ class TestRenderListRectClipping(unittest.TestCase):
         # renders on a NORMAL row: the chrome composes, the str becomes one
         # segment, and its visible text lands in the stream, width-correct.
         def content(item, ctx):
-            return 'just a string ' + item.title
+            return f'just a string {item.title}'
 
         item = Item(id='a', title='Row')
         state = _MockState([self._entry(item)], cursor=5)  # not the cursor
@@ -2471,7 +2470,7 @@ class TestRenderListRectClipping(unittest.TestCase):
         # indentation only — no '* ' / expander before the content.
         def content(item, ctx):
             # Recipes may branch on ctx.kind; here always a str.
-            return 'DIVIDER:' + item.title
+            return f'DIVIDER:{item.title}'
 
         item = Item(id='sep', title='hdr', has_children=True)
         state = _MockState([self._entry(item, depth=1, kind='meta')],
@@ -2509,7 +2508,7 @@ class TestRenderListRectClipping(unittest.TestCase):
         RESET = '\033[0m'
 
         def content(item, ctx):
-            return RED + 'colored ' + item.title + RESET
+            return f'{RED}colored {item.title}{RESET}'
 
         item = Item(id='a', title='Cursor')
         state = _MockState([self._entry(item)], cursor=0)  # IS the cursor
@@ -2531,7 +2530,7 @@ class TestRenderListRectClipping(unittest.TestCase):
         # visible text ANSI-aware (escapes passed through, width counted by
         # visible cells) — the visible glyphs appear and width stays exact.
         def content(item, ctx):
-            return '\033[32mgreen\033[0m ' + item.title
+            return f'\033[32mgreen\033[0m {item.title}'
 
         item = Item(id='a', title='Leaf')
         state = _MockState([self._entry(item)], cursor=5)  # not the cursor
@@ -2551,7 +2550,7 @@ class TestRenderListRectClipping(unittest.TestCase):
         # ``\e[1;1H``, erase ``\e[2J``) is stripped on receipt by the shared
         # sanitiser, so it never reaches the stream; the SGR colour stays.
         def content(item, ctx):
-            return '\033[1;1H\033[31mred\033[2J\033[0m ' + item.title
+            return f'\033[1;1H\033[31mred\033[2J\033[0m {item.title}'
 
         item = Item(id='a', title='Leaf')
         state = _MockState([self._entry(item)], cursor=5)  # not the cursor
@@ -2583,7 +2582,7 @@ class TestRenderListRectClipping(unittest.TestCase):
         # Rule 3 negative: a plain (no-ANSI) str row emits NO reset — the
         # stream is exactly chrome + the visible text, byte-for-byte.
         def content(item, ctx):
-            return 'plain ' + item.title
+            return f'plain {item.title}'
 
         item = Item(id='a', title='Row')
         state = _MockState([self._entry(item)], cursor=5)  # not the cursor

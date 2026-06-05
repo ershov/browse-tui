@@ -583,8 +583,7 @@ class TestAppendExtendMatchesFreshWrap(unittest.TestCase):
                 if ch == '\x1b':
                     self.assertEqual(
                         joined[i + 1:i + 2], '[',
-                        'bare ESC leaked into wrapped rows: {!r}'.format(
-                            joined),
+                        f'bare ESC leaked into wrapped rows: {joined!r}',
                     )
             self.assertNotIn('\x1b[2J', joined)   # non-SGR CSI dropped
             self.assertIn('\x1b[32m', joined)     # SGR colour kept
