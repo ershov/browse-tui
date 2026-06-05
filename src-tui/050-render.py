@@ -162,6 +162,61 @@ def _sanitize_preview(text, *, ansi_on=True):
     return text.translate(table)
 
 
+def _sanitize_ansi(s):
+    """Strip every escape from ``s`` *except* SGR colour sequences (sec 4.2 #1).
+
+    The shared escape-sanitiser for the two paths that pass attacker- or
+    recipe-supplied ANSI to the terminal: a raw ``str`` rendered as **row
+    content** (via :func:`_normalize_content`) and the **preview pane**
+    text (after :func:`_sanitize_preview`'s control-char pass). Both call
+    *this* function so they behave identically.
+
+    Kept verbatim: a complete SGR sequence ``\\e[ <params> m`` (final byte
+    ``m``) — that's the colour channel. Dropped:
+
+    * any other complete CSI (``\\e[ <params> <final>`` whose final byte is
+      not ``m`` — cursor moves ``H``/``A``, erases ``J``/``K``, scroll
+      regions, …);
+    * a **dangling** ``\\e[`` with no final byte before the end of string;
+    * a **bare** ``\\e`` not introducing a CSI (a lone ESC, or ESC starting
+      a non-CSI escape such as ``\\eM`` — only the ESC byte is removed).
+
+    A robust per-sequence scan, **not** a greedy regex like
+    ``\\e[.*[a-ln-z]|\\e`` (which would swallow text between two escapes and
+    mishandle the ``m`` boundary). Strings with no ESC return unchanged
+    (the common case — plain content never enters the scan loop).
+    """
+    if '\033' not in s:
+        return s
+    out = []
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if ch != '\033':
+            out.append(ch)
+            i += 1
+            continue
+        # ESC. A CSI is ESC '[' <0x20-0x3f intermediates/params> <0x40-0x7e
+        # final>. Anything else (lone ESC, ESC + non-'[') drops just the
+        # ESC byte.
+        if i + 1 < n and s[i + 1] == '[':
+            j = i + 2
+            while j < n and not ('@' <= s[j] <= '~'):
+                j += 1
+            if j < n:
+                # Complete CSI: keep iff it's SGR (final byte 'm').
+                if s[j] == 'm':
+                    out.append(s[i:j + 1])
+                i = j + 1
+                continue
+            # Dangling ESC '[' with no final byte — drop the remainder.
+            break
+        # Bare ESC (or ESC introducing a non-CSI escape): drop the ESC only.
+        i += 1
+    return ''.join(out)
+
+
 def _id_visible(item, show_ids):
     """Decide whether the id segment should be emitted for ``item``.
 
@@ -863,6 +918,61 @@ def layout_panes(cols, rows, *, split='h', show_preview=True,
 # ---------------------------------------------------------------------------
 
 
+def _has_bg_sgr(s):
+    """True iff ``s`` carries an SGR sequence that sets a background colour.
+
+    Background SGR parameters (design sec 4.2 #4): the 8-colour set
+    ``40``–``49`` (``49`` = default-bg; ``48`` opens the ``48;5;N`` /
+    ``48;2;R;G;B`` extended-bg form) and the bright set ``100``–``109``.
+    So ``\\e[1;41m`` (bold + red bg) and ``\\e[48;5;200m`` (256-colour bg)
+    both count, while a foreground code (``31``, ``38;5;…``) does not.
+
+    Parsed **positionally**: ``38`` / ``48`` / ``58`` (fg / bg / underline
+    extended colour) consume their ``5;N`` or ``2;R;G;B`` operands as a
+    unit, so an operand that happens to land in the bg range — e.g. the
+    ``48`` in a ``38;5;48m`` *foreground* — is never mistaken for a
+    standalone background param. A non-numeric / empty param (e.g. the
+    ``\\e[m`` reset) is skipped.
+
+    Used to gate the row-background *restore* (rule 4): re-emitting the
+    row bg after the trailing reset only matters when the content's own
+    bg code overrode it.
+    """
+    if '\033[' not in s:
+        return False
+    for m in _ANSI_CSI_RE.finditer(s):
+        seq = m.group(0)
+        if not seq.endswith('m'):
+            continue
+        params = seq[2:-1].split(';')
+        i = 0
+        n = len(params)
+        while i < n:
+            p = params[i]
+            if not p.isdigit():
+                i += 1
+                continue
+            v = int(p)
+            if v in (38, 48, 58):
+                # Extended colour introducer: skip it plus its operands so
+                # those inner values aren't tested as standalone bg codes.
+                # ``48`` itself is a bg introducer → that's caught below.
+                nxt = params[i + 1] if i + 1 < n else ''
+                if nxt == '5':
+                    i += 3      # <38/48/58> ; 5 ; <idx>
+                elif nxt == '2':
+                    i += 5      # <38/48/58> ; 2 ; <r> ; <g> ; <b>
+                else:
+                    i += 1      # malformed — step over the introducer only
+                if v == 48:
+                    return True
+                continue
+            if 40 <= v <= 49 or 100 <= v <= 109:
+                return True
+            i += 1
+    return False
+
+
 def _truncate_visible(s, max_cols):
     """Truncate ``s`` to ``max_cols`` *visible* columns, preserving SGR escapes.
 
@@ -1179,14 +1289,25 @@ def _write_segments(segments, max_width, *, pad_to=0, row_bg=None,
     via :func:`_truncate_visible` (escapes passed through, only visible
     cells counted) instead of the plain :func:`_truncate_by_cells`, so the
     escape bytes neither corrupt the width math nor get cut mid-sequence.
-    Passthrough of that embedded SGR is acceptable here; the full
-    sanitize / conditional-reset / bg-restore handling lands in #739. Plain
-    segments (the overwhelming common case — colour rides ``fg``, never the
-    text) keep the existing plain truncation byte-for-byte.
+    That embedded SGR was already **sanitised on receipt** by
+    :func:`_normalize_content` (design sec 4.2 #1 — only colour codes
+    survive), so the only escapes reaching here are SGR. This function then
+    finishes the §4.2 handling for such content: a **conditional trailing
+    reset** (#3 — ``\\e[m`` after the content iff any SGR was emitted, so a
+    colour run can't bleed into the pad / next pane) and the **background
+    restore** (#4 — re-emit the row bg after that reset when ``row_bg`` is
+    set *and* the content carried its own bg code). Plain segments (the
+    overwhelming common case — colour rides ``fg``, never the text) emit
+    nothing extra and keep the existing plain truncation byte-for-byte.
 
     Returns the number of cells written.
     """
     pos = 0
+    # Track ANSI / bg carried by the *emitted* content (design sec 4.2
+    # #3/#4), so the trailing reset / bg-restore fire on what actually
+    # reached the screen — not on text that fell outside the width budget.
+    content_ansi = False
+    content_bg = False
     for text, fg, bold in segments:
         if pos >= max_width:
             break
@@ -1199,6 +1320,10 @@ def _write_segments(segments, max_width, *, pad_to=0, row_bg=None,
             chunk, chunk_cells = _truncate_by_cells(text, remaining)
         if not chunk:
             continue
+        if '\033[' in chunk:
+            content_ansi = True
+            if not content_bg and _has_bg_sgr(chunk):
+                content_bg = True
         # Effective fg: segment's own ``fg`` wins; otherwise inherit
         # ``row_fg`` (when set).
         eff_fg = fg if fg is not None else row_fg
@@ -1209,6 +1334,23 @@ def _write_segments(segments, max_width, *, pad_to=0, row_bg=None,
         else:
             write(chunk)
         pos += chunk_cells
+    # Conditional trailing reset (design sec 4.2 #3): if the emitted content
+    # carried ANY SGR, close it with ``\e[m`` so an unterminated colour run
+    # can't bleed into the trailing pad / the next pane on this row. Plain
+    # content (the common case) emits nothing extra — byte-for-byte
+    # unchanged. (A styled chunk already had its own ``reset_style``; the
+    # extra reset here is harmless and keeps the rule uniform across the
+    # bare-write passthrough path, which has no per-chunk reset.)
+    if content_ansi:
+        write('\033[m')
+        # Background restore (design sec 4.2 #4): only when a row bg is set
+        # AND the content's own bg code overrode it — re-apply the row bg
+        # after the reset so the trailing pad keeps the row's stripe colour.
+        # Emitted as the bare background SGR (``\e[48;5;Nm``) rather than via
+        # ``set_style`` so it's the exact restore byte the rule specifies and
+        # is distinct from the stripe pad's own ``set_style`` below.
+        if row_bg is not None and content_bg:
+            write('\033[48;5;{}m'.format(row_bg))
     # ``row_bg`` extends the highlight across the trailing pad so the
     # row reads as a stripe rather than a tag-shaped patch. We bump
     # ``pad_to`` up to ``max_width`` in that case, but only locally —
@@ -1904,6 +2046,15 @@ def render_preview(browser, rect, *, info=False, has_header=True,
         # sequences. The walker below sees no ESC bytes in that case and
         # falls through to plain wrap.
         text = _sanitize_preview(text, ansi_on=ansi_on)
+        if ansi_on:
+            # Escape-level sanitise (sec 4.2 #1), shared with the row-content
+            # path: keep SGR, drop all other CSI and any bare/dangling ESC.
+            # ``_wrap_preview_line`` also drops non-SGR CSI token-by-token,
+            # but only the regex-matchable ones — this additionally removes a
+            # bare ESC the tokeniser would otherwise pass through as text, and
+            # makes the two paths behave identically. (Raw mode already
+            # mapped every ESC to '?', so there's nothing left to strip.)
+            text = _sanitize_ansi(text)
 
         # Wrap content to the rect's width.
         #

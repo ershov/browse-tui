@@ -71,9 +71,11 @@ _render._normalize_content = _state._normalize_content
 # reference render-layer constants/helpers (``_TAG_STYLE`` / ``_id_visible``
 # / ``_ID_COLOR`` / ``_MARKER_COLOR`` / ``cell_width``) at call time. The
 # concatenated production build resolves them by name; the isolated test
-# load has to inject them into the state module.
+# load has to inject them into the state module. ``_sanitize_ansi`` is the
+# shared escape-sanitiser (050-render) that ``_normalize_content`` applies
+# to a str row-content result on receipt (design sec 4.2 #1).
 for _name in ('_TAG_STYLE', '_id_visible', '_ID_COLOR', '_MARKER_COLOR',
-              'cell_width'):
+              'cell_width', '_sanitize_ansi'):
     setattr(_state, _name, getattr(_render, _name))
 
 Item = _data.Item
@@ -2008,6 +2010,145 @@ class TestTruncateVisible(unittest.TestCase):
         self.assertIn('\033[0m', out)
 
 
+# --- _sanitize_ansi: the shared escape-sanitiser (sec 4.2 #1) --------------
+
+
+_sanitize_ansi = _render._sanitize_ansi
+
+
+class TestSanitizeAnsi(unittest.TestCase):
+    """Keep SGR (\\e[..m); strip all other CSI and bare/dangling ESC.
+
+    Robust per-sequence scan — the shared sanitiser both the row-content
+    path (via ``_normalize_content``) and the preview pane use, so they
+    behave identically.
+    """
+
+    def test_plain_text_unchanged(self):
+        # No ESC at all → the fast path returns the input object untouched.
+        s = 'plain text, no escapes'
+        self.assertIs(_sanitize_ansi(s), s)
+
+    def test_empty_unchanged(self):
+        self.assertEqual(_sanitize_ansi(''), '')
+
+    def test_sgr_colour_kept(self):
+        self.assertEqual(_sanitize_ansi('\033[31mRED\033[0m'),
+                         '\033[31mRED\033[0m')
+
+    def test_sgr_reset_short_form_kept(self):
+        # ``\e[m`` (empty params) is a valid SGR reset — kept.
+        self.assertEqual(_sanitize_ansi('A\033[mB'), 'A\033[mB')
+
+    def test_compound_sgr_kept(self):
+        # Bold + 256-colour fg + bg in one sequence: all SGR, all kept.
+        s = 'x\033[1;38;5;200;48;5;17my'
+        self.assertEqual(_sanitize_ansi(s), s)
+
+    def test_cursor_move_csi_stripped(self):
+        # Cursor home ``\e[1;1H`` is a non-SGR CSI → dropped, text kept.
+        self.assertEqual(_sanitize_ansi('a\033[1;1Hb'), 'ab')
+
+    def test_clear_screen_csi_stripped(self):
+        # Erase-display ``\e[2J`` is non-SGR CSI → dropped.
+        self.assertEqual(_sanitize_ansi('\033[2Jhello'), 'hello')
+
+    def test_erase_line_csi_stripped(self):
+        self.assertEqual(_sanitize_ansi('x\033[Ky'), 'xy')
+
+    def test_bare_esc_stripped(self):
+        # A lone ESC with no following '[' → drop the ESC byte only.
+        self.assertEqual(_sanitize_ansi('a\033b'), 'ab')
+
+    def test_trailing_bare_esc_stripped(self):
+        self.assertEqual(_sanitize_ansi('abc\033'), 'abc')
+
+    def test_dangling_csi_stripped(self):
+        # ``\e[`` with no final byte before end-of-string → drop remainder.
+        self.assertEqual(_sanitize_ansi('keep\033[31'), 'keep')
+
+    def test_non_csi_escape_drops_only_esc(self):
+        # ``\eM`` (reverse-index, a non-CSI escape): only the ESC byte is
+        # removed, mirroring the documented intent (``…|\e`` matches the
+        # lone ESC); the trailing letter stays as text.
+        self.assertEqual(_sanitize_ansi('p\033Mq'), 'pMq')
+
+    def test_mixed_sgr_and_non_sgr(self):
+        # Interleaved SGR (kept) and cursor moves / clears (dropped).
+        s = '\033[31mR\033[2J\033[1mE\033[1;5HD\033[0m'
+        self.assertEqual(_sanitize_ansi(s), '\033[31mR\033[1mED\033[0m')
+
+    def test_idempotent(self):
+        once = _sanitize_ansi('\033[31mhi\033[2J\033there')
+        self.assertEqual(_sanitize_ansi(once), once)
+
+
+class TestHasBgSgr(unittest.TestCase):
+    """Detect a background SGR param (40-49 / 100-109) for the bg-restore."""
+
+    def test_no_ansi_is_false(self):
+        self.assertFalse(_render._has_bg_sgr('plain'))
+
+    def test_fg_only_is_false(self):
+        self.assertFalse(_render._has_bg_sgr('\033[31mred\033[0m'))
+
+    def test_256_fg_is_false(self):
+        # 38;5;N is a foreground code — 38 is NOT a bg param.
+        self.assertFalse(_render._has_bg_sgr('\033[38;5;200mx'))
+
+    def test_256_fg_with_bg_range_index_is_false(self):
+        # Positional parse: 38;5;48 is a *foreground* whose 256-index (48)
+        # falls in the bg range. The '5;48' operand must be consumed with
+        # the 38 introducer, NOT tested as a standalone bg code.
+        self.assertFalse(_render._has_bg_sgr('\033[38;5;48mx'))
+
+    def test_truecolor_fg_with_bg_range_channels_is_false(self):
+        # 38;2;R;G;B truecolor fg whose channels land in the bg range
+        # (40, 41, 42) — all are operands of the 38 introducer, none a bg.
+        self.assertFalse(_render._has_bg_sgr('\033[38;2;40;41;42mx'))
+
+    def test_256_bg_index_in_bg_range_still_true(self):
+        # 48;5;41 IS a background (the 48 introducer makes it one),
+        # regardless of the index value.
+        self.assertTrue(_render._has_bg_sgr('\033[48;5;41mx'))
+
+    def test_fg_then_bg_compound_is_true(self):
+        # A 256 fg whose index is in the bg range, FOLLOWED by a real bg —
+        # the fg operand is skipped, the trailing 41 is detected.
+        self.assertTrue(_render._has_bg_sgr('\033[38;5;48;41mx'))
+
+    def test_underline_color_extended_is_false(self):
+        # 58;5;N (extended underline colour) is not a background; its
+        # operand must be consumed too.
+        self.assertFalse(_render._has_bg_sgr('\033[58;5;42mx'))
+
+    def test_reset_only_is_false(self):
+        # \e[m / \e[0m carry no bg param.
+        self.assertFalse(_render._has_bg_sgr('\033[mx'))
+        self.assertFalse(_render._has_bg_sgr('\033[0mx'))
+
+    def test_basic_bg_is_true(self):
+        self.assertTrue(_render._has_bg_sgr('\033[41mx\033[0m'))
+
+    def test_default_bg_49_is_true(self):
+        self.assertTrue(_render._has_bg_sgr('\033[49mx'))
+
+    def test_bright_bg_is_true(self):
+        self.assertTrue(_render._has_bg_sgr('\033[102mx'))
+
+    def test_256_bg_is_true(self):
+        # 48;5;N — 48 is in the bg range.
+        self.assertTrue(_render._has_bg_sgr('\033[48;5;17mx'))
+
+    def test_bg_in_compound_is_true(self):
+        self.assertTrue(_render._has_bg_sgr('\033[1;41;32mx'))
+
+    def test_non_sgr_with_bg_digits_is_false(self):
+        # A cursor-move CSI that happens to contain '41' must not count —
+        # only ``…m`` (SGR) sequences are scanned.
+        self.assertFalse(_render._has_bg_sgr('\033[41Hx'))
+
+
 # --- clear_columns helper --------------------------------------------------
 
 
@@ -2460,13 +2601,60 @@ class TestRenderListRectClipping(unittest.TestCase):
         _render.visible_items = lambda s: state._visible
         browser = _MockBrowser(state, format_row_content=content)
         joined = self._render_one(browser)
-        # Passthrough (sec 4.1, full sanitize deferred to #739): the escapes
-        # ARE present in the stream, so strip them to read the visible text.
+        # SGR colour escapes survive (sec 4.2 rule 2 keeps them through
+        # ``_truncate_visible``); strip CSI to read the visible text.
         self.assertIn('\033[32m', joined)
         visible = _term._ANSI_CSI_RE.sub('', joined)
         self.assertEqual(visible, '    green Leaf')
         # Visible width is exact — the embedded escapes add zero cells.
         self.assertEqual(_term._visible_len(joined), 14)
+
+    def test_ansi_string_non_sgr_csi_stripped_on_receipt(self):
+        # Rule 1: a non-SGR CSI embedded in the content str (cursor home
+        # ``\e[1;1H``, erase ``\e[2J``) is stripped on receipt by the shared
+        # sanitiser, so it never reaches the stream; the SGR colour stays.
+        def content(item, ctx):
+            return '\033[1;1H\033[31mred\033[2J\033[0m ' + item.title
+
+        item = Item(id='a', title='Leaf')
+        state = _MockState([self._entry(item)], cursor=5)  # not the cursor
+        _render.visible_items = lambda s: state._visible
+        browser = _MockBrowser(state, format_row_content=content)
+        joined = self._render_one(browser)
+        # Non-SGR CSI gone; SGR colour kept.
+        self.assertNotIn('\033[1;1H', joined)
+        self.assertNotIn('\033[2J', joined)
+        self.assertIn('\033[31m', joined)
+        visible = _term._ANSI_CSI_RE.sub('', joined)
+        self.assertEqual(visible, '    red Leaf')
+
+    def test_ansi_string_emits_trailing_reset(self):
+        # Rule 3: content carrying SGR closes with a trailing ``\e[m`` so the
+        # colour can't bleed into the pad / next pane.
+        def content(item, ctx):
+            return '\033[31mred\033[31m'   # opens colour, never resets
+
+        item = Item(id='a', title='t')
+        state = _MockState([self._entry(item)], cursor=5)  # not the cursor
+        _render.visible_items = lambda s: state._visible
+        browser = _MockBrowser(state, format_row_content=content)
+        joined = self._render_one(browser)
+        # The very last emitted bytes are the conditional reset.
+        self.assertTrue(joined.endswith('\033[m'), repr(joined[-6:]))
+
+    def test_plain_str_content_emits_no_trailing_reset(self):
+        # Rule 3 negative: a plain (no-ANSI) str row emits NO reset — the
+        # stream is exactly chrome + the visible text, byte-for-byte.
+        def content(item, ctx):
+            return 'plain ' + item.title
+
+        item = Item(id='a', title='Row')
+        state = _MockState([self._entry(item)], cursor=5)  # not the cursor
+        _render.visible_items = lambda s: state._visible
+        browser = _MockBrowser(state, format_row_content=content)
+        joined = self._render_one(browser)
+        self.assertEqual(joined, '    plain Row')
+        self.assertNotIn('\033[', joined)
 
     def test_ansi_string_truncates_ansi_aware(self):
         # An ANSI-bearing content segment wider than the pane is truncated
@@ -2488,6 +2676,66 @@ class TestRenderListRectClipping(unittest.TestCase):
         self.assertEqual(visible, '    ' + 'X' * 6)
         # The leading colour escape survived (not cut mid-sequence).
         self.assertIn('\033[31m', joined)
+
+    def test_bg_restore_fires_when_row_bg_and_content_bg(self):
+        # Rule 4: row bg active AND content carries a bg code (\e[41m) →
+        # after the trailing reset the row bg is re-emitted (as the bare
+        # background SGR \e[48;5;17m) so the trailing pad keeps the stripe.
+        # Assert the observable order: the rule-3 reset \e[m, then the
+        # rule-4 restore byte immediately after it.
+        def content(item, ctx):
+            return '\033[41mX\033[0m'   # red background in the content
+
+        item = Item(id='a', title='t')
+        item.row_bg = 17
+        state = _MockState([self._entry(item)], cursor=5)  # not the cursor
+        _render.visible_items = lambda s: state._visible
+        browser = _MockBrowser(state, format_row_content=content)
+        joined = self._render_one(browser, width=40)
+        # The reset is immediately followed by the bg-restore byte.
+        self.assertIn('\033[m\033[48;5;17m', joined)
+
+    def test_bg_restore_skipped_when_no_content_bg(self):
+        # Rule 4 negative: row bg active but the content carries NO bg code
+        # (only a fg colour) → the rule-3 reset fires, but the bare bg-
+        # restore byte is NOT emitted. (The stripe pad still paints with
+        # row_bg via the existing set_style stripe logic — that's separate;
+        # what must be absent is the rule-4 *restore byte* \e[48;5;17m.)
+        def content(item, ctx):
+            return '\033[31mred\033[0m'   # fg only, no bg code
+
+        item = Item(id='a', title='t')
+        item.row_bg = 17
+        state = _MockState([self._entry(item)], cursor=5)  # not the cursor
+        _render.visible_items = lambda s: state._visible
+        browser = _MockBrowser(state, format_row_content=content)
+        joined = self._render_one(browser, width=40)
+        # Rule-3 reset present, rule-4 restore byte absent.
+        self.assertIn('\033[m', joined)
+        self.assertNotIn('\033[m\033[48;5;17m', joined)
+
+    def test_bg_restore_skipped_when_no_row_bg(self):
+        # Rule 4 negative: content carries a bg code but NO row bg is set →
+        # the trailing reset fires (rule 3) but there is no bg-restore, and
+        # no bg set_style anywhere (row_bg is None throughout).
+        def content(item, ctx):
+            return '\033[41mX\033[0m'
+
+        item = Item(id='a', title='t')   # no row_bg attribute
+        state = _MockState([self._entry(item)], cursor=5)  # not the cursor
+        _render.visible_items = lambda s: state._visible
+        browser = _MockBrowser(state, format_row_content=content)
+        joined = self._render_one(browser, width=40)
+        ops = self.cap.events
+        # Rule-3 reset present; rule-4 restore byte absent.
+        self.assertIn('\033[m', joined)
+        self.assertNotIn('\033[48;5;', joined)
+        # And no set_style carrying a bg anywhere (row_bg is None).
+        self.assertFalse(
+            any(e[0] == 'set_style' and e[1].get('bg') is not None
+                for e in ops),
+            'no bg set_style expected when row_bg is unset',
+        )
 
     def test_plain_segment_row_byte_for_byte_unchanged(self):
         # Regression: a plain segment row (no ANSI, no str content) produces

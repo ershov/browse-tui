@@ -111,6 +111,17 @@ def _render_preview(browser):
         sys.stdout = orig
 
 
+def _render_capture(browser):
+    """Run render_full and return the emitted byte string."""
+    orig = sys.stdout
+    sys.stdout = io.StringIO()
+    try:
+        _render.render_full(browser)
+        return sys.stdout.getvalue()
+    finally:
+        sys.stdout = orig
+
+
 # --- Defaults --------------------------------------------------------------
 
 
@@ -491,6 +502,47 @@ class TestInvalidatePreviewPreservesViewState(unittest.TestCase):
             b.drain_main_queue()
             self.assertIsNone(b._state._items_by_id['a'].preview)
             self.assertEqual(b._preview_req, 'a')
+        finally:
+            b.stop_workers()
+
+
+class TestPreviewSharedSanitizer(unittest.TestCase):
+    """Preview pane routes its text through the shared ``_sanitize_ansi``
+    (design sec 4.2 #1) — the SAME sanitiser the row-content path uses — so
+    both behave identically: keep SGR colour, drop all other CSI and bare
+    ESC. (Verified end-to-end through ``render_full``; the renderer emits
+    its own cursor-positioning ``\\e[..H`` moves, so assertions target the
+    preview *content*, not raw bytes that the framework legitimately emits.)
+    """
+
+    def test_preview_keeps_sgr_strips_other_csi_and_bare_esc(self):
+        # Content: red SGR (keep), an erase-screen \e[2J (drop), a cursor
+        # home \e[1;1H (drop), and a bare ESC (drop). The visible words must
+        # join — proving every non-SGR escape between them was removed —
+        # while the colour escape survives.
+        text = '\033[31mRED\033[2Jcursor\033[1;1Hhome\033bare\033[0m'
+        b = _make_browser(text)
+        try:
+            out = _render_capture(b)
+            # SGR colour kept.
+            self.assertIn('\033[31m', out)
+            # Erase-screen CSI (which the renderer never emits itself) gone.
+            self.assertNotIn('\033[2J', out)
+            # The non-SGR escapes were stripped on receipt, so the words run
+            # together in the preview content.
+            self.assertIn('RED', out)
+            self.assertIn('cursorhomebare', out)
+        finally:
+            b.stop_workers()
+
+    def test_preview_plain_text_unchanged_by_sanitiser(self):
+        # Regression: plain (no-ESC) preview text is untouched — the shared
+        # sanitiser's fast path returns it as-is, so the visible content is
+        # exactly the input.
+        b = _make_browser('plain preview line\n')
+        try:
+            out = _render_capture(b)
+            self.assertIn('plain preview line', out)
         finally:
             b.stop_workers()
 

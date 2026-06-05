@@ -2649,11 +2649,15 @@ def _extend_or_drop_preview_render(item, chunk, ansi_on) -> None:
         (eager invalidation should have dropped, defensive only),
       * width is non-positive (degenerate cache state).
 
-    Sanitisation: the chunk goes through ``_sanitize_preview`` (same
-    per-char ``str.translate`` pass the renderer uses) so the wrapped
-    output is byte-identical to a fresh full re-wrap. The sanitiser
-    is per-character with no cross-line state, so applying it to the
-    chunk alone matches applying it to the full preview text.
+    Sanitisation: the affected suffix goes through the SAME two-step pass
+    ``render_preview`` runs — ``_sanitize_preview`` (per-char control-char
+    ``str.translate``) then, when ``ansi_on``, the shared ``_sanitize_ansi``
+    (keep SGR, drop other CSI / bare ESC) — so the wrapped output is
+    byte-identical to a fresh full re-wrap. Both sanitisers are stateless
+    across line boundaries (``str.translate`` is per-char; ``_sanitize_ansi``
+    is per-escape-sequence and no escape spans a ``\\n``), and the suffix
+    starts right after a ``\\n`` (so it never begins mid-sequence) — hence
+    applying them to the suffix matches applying them to the full text.
     """
     cached = item.preview_render
     if cached is None:
@@ -2676,13 +2680,18 @@ def _extend_or_drop_preview_render(item, chunk, ansi_on) -> None:
     #
     # ``item.preview`` stores raw text (sanitisation happens at render
     # time in ``render_preview``). Re-sanitise the affected suffix here
-    # so the re-wrap path produces byte-identical output to a full
-    # re-wrap. ``_sanitize_preview`` is per-char via ``str.translate``,
-    # so applying it to a slice matches applying it to the full text.
+    # with the SAME two-step pass ``render_preview`` runs so the re-wrap
+    # path produces byte-identical output to a full re-wrap: the per-char
+    # ``_sanitize_preview`` then, in ANSI mode, the shared ``_sanitize_ansi``
+    # (strips a bare ESC the tokeniser would otherwise emit verbatim).
+    # Both are stateless across line boundaries and the suffix starts after
+    # a ``\n``, so slice-then-sanitise == sanitise-then-slice.
     preview = item.preview if item.preview is not None else ''
     raw_tail_text = _sanitize_preview(
         preview[cached.raw_tail_offset:], ansi_on=ansi_on,
     )
+    if ansi_on:
+        raw_tail_text = _sanitize_ansi(raw_tail_text)
 
     # Re-wrap the affected suffix. Note: this re-wraps the previous
     # partial last line together with the new content — that's required
@@ -2765,8 +2774,18 @@ def _normalize_content(content):
     rest of the pipeline then sees a uniform segment list. ``cell_width`` is
     ANSI-aware (strips escapes when measuring), so width math on a segment
     whose text carries SGR stays exact.
+
+    The ``str`` is **sanitised on receipt** (design sec 4.2 #1) via the
+    shared :func:`_sanitize_ansi` — the same escape-sanitiser the preview
+    pane uses — so only SGR colour sequences survive; all other CSI (cursor
+    moves, erases) and bare ESC bytes are stripped before the text reaches
+    width math or the terminal. A segment *list* is passed through untouched
+    (segments carry colour in ``fg``, never embedded escapes — sanitising
+    would be both wrong and wasteful).
     """
-    return content if isinstance(content, list) else [(content, None, False)]
+    if isinstance(content, list):
+        return content
+    return [(_sanitize_ansi(content), None, False)]
 
 
 def default_row_chrome(item, ctx):

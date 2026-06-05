@@ -44,6 +44,10 @@ _state.notify_wake = _term.notify_wake
 _state.PreviewRender = _data.PreviewRender
 _state._wrap_preview_line = _render._wrap_preview_line
 _state._sanitize_preview = _render._sanitize_preview
+# #739: the append path now mirrors render_preview's two-step sanitise —
+# control-char pass then the shared escape-sanitiser (keep SGR, drop other
+# CSI / bare ESC). Inject it for the isolated load too.
+_state._sanitize_ansi = _render._sanitize_ansi
 
 _render.Item = _data.Item
 _render.PreviewRender = _data.PreviewRender
@@ -545,6 +549,47 @@ class TestAppendExtendMatchesFreshWrap(unittest.TestCase):
         for k in (0, 1, 5, 6, 7, 15, 23, 27, len(full) - 1, len(full)):
             with self.subTest(split=k):
                 self._assert_match(full[:k], full[k:])
+
+    # --- #739: the append path uses the SAME shared sanitiser as the full
+    # render path. A bare ESC / non-SGR CSI in the appended tail must wrap
+    # byte-identically to a fresh full re-wrap (the full path strips them;
+    # if the append path skipped _sanitize_ansi the tokeniser would emit the
+    # bare ESC verbatim and the two would diverge).
+
+    def test_append_chunk_with_bare_esc_matches_fresh_wrap(self):
+        # A lone ESC (no '[') in the chunk — stripped by _sanitize_ansi on
+        # both paths, so the wraps stay identical.
+        self._assert_match('plain\n', 'tail\x1bwith bare esc')
+
+    def test_append_chunk_with_non_sgr_csi_matches_fresh_wrap(self):
+        # Cursor-home / erase CSI in the chunk — dropped on both paths.
+        self._assert_match('head\n', 'a\x1b[2Jb\x1b[1;1Hc')
+
+    def test_append_chunk_with_sgr_and_noise_matches_fresh_wrap(self):
+        # SGR colour (kept) interleaved with a bare ESC + non-SGR CSI
+        # (both dropped), appended onto an open partial line.
+        self._assert_match('open ', '\x1b[31mred\x1b[2J\x1bX done\x1b[0m')
+
+    def test_appended_bare_esc_absent_from_wrapped_rows(self):
+        # Direct check: after the incremental append the cached wrapped rows
+        # carry NO bare ESC (it was sanitised), while the SGR colour byte
+        # survives — confirming the append path ran _sanitize_ansi.
+        b = _build_incremental('hi\n', '\x1b[32mok\x1b\x1b[2Jend\x1b[0m')
+        try:
+            wrapped = b._state._items_by_id['a'].preview_render.wrapped
+            joined = '\n'.join(wrapped)
+            # A bare ESC is one not followed by '[' — none should remain.
+            for i, ch in enumerate(joined):
+                if ch == '\x1b':
+                    self.assertEqual(
+                        joined[i + 1:i + 2], '[',
+                        'bare ESC leaked into wrapped rows: {!r}'.format(
+                            joined),
+                    )
+            self.assertNotIn('\x1b[2J', joined)   # non-SGR CSI dropped
+            self.assertIn('\x1b[32m', joined)     # SGR colour kept
+        finally:
+            b.stop_workers()
 
 
 class TestAppendExtendOffsetsBookkeeping(unittest.TestCase):
