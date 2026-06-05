@@ -9168,6 +9168,12 @@ Out of scope (deferred to phase 2/3):
     already wired here so phase 2 only changes one site.
 """
 
+# In the concatenated production build ``re`` is already imported by an
+# earlier numbered file; the re-import is a harmless no-op there but lets the
+# module-level regex in ``_sanitize_ansi`` compile when this file is exec'd
+# standalone (the isolated unit-test load).
+import re
+
 
 # tag_style name → (fg color, bold flag). Values are 256-colour palette
 # indices that ``020-terminal.set_style`` understands. The empty-string
@@ -9284,6 +9290,25 @@ def _sanitize_preview(text, *, ansi_on=True):
     return text.translate(table)
 
 
+# Three left-to-right alternatives, matched per ESC by ``_sanitize_ansi``:
+#   1. ``\e[`` <non-final bytes> <final> — a *complete* CSI. ``[^@-~]*``
+#      consumes params/intermediates (and anything else not in the 0x40-0x7e
+#      final-byte range), then one final byte ``[@-~]`` captured in group 1.
+#      Bounded char-classes mean it never swallows text between two escapes.
+#   2. ``\e[`` <non-final bytes> end-of-string — a *dangling* CSI with no
+#      final byte; ``\Z`` anchors it to the true end (never before a newline).
+#   3. ``\e`` alone — a bare ESC (lone, or introducing a non-CSI escape).
+# The replacement keeps the match iff alt 1 matched with final byte ``m``
+# (an SGR sequence); every other match is dropped.
+_SANITIZE_ANSI_RE = re.compile(r'\x1b\[[^@-~]*([@-~])|\x1b\[[^@-~]*\Z|\x1b')
+
+
+def _sanitize_ansi_repl(m):
+    # Keep only complete SGR sequences (alt 1 with final byte 'm'); drop
+    # every other CSI, dangling ``\e[``, and bare ESC.
+    return m.group(0) if m.group(1) == 'm' else ''
+
+
 def _sanitize_ansi(s):
     """Strip every escape from ``s`` *except* SGR colour sequences (sec 4.2 #1).
 
@@ -9303,40 +9328,15 @@ def _sanitize_ansi(s):
     * a **bare** ``\\e`` not introducing a CSI (a lone ESC, or ESC starting
       a non-CSI escape such as ``\\eM`` — only the ESC byte is removed).
 
-    A robust per-sequence scan, **not** a greedy regex like
-    ``\\e[.*[a-ln-z]|\\e`` (which would swallow text between two escapes and
-    mishandle the ``m`` boundary). Strings with no ESC return unchanged
-    (the common case — plain content never enters the scan loop).
+    A single greedy :func:`re.sub` pass over :data:`_SANITIZE_ANSI_RE` (whose
+    three alternatives match exactly one ESC each, with bounded ``[^@-~]*``
+    runs so inter-escape text is never swallowed and the ``m`` boundary is
+    exact). Strings with no ESC return unchanged (the common case — plain
+    content never enters the substitution).
     """
     if '\033' not in s:
         return s
-    out = []
-    i = 0
-    n = len(s)
-    while i < n:
-        ch = s[i]
-        if ch != '\033':
-            out.append(ch)
-            i += 1
-            continue
-        # ESC. A CSI is ESC '[' <0x20-0x3f intermediates/params> <0x40-0x7e
-        # final>. Anything else (lone ESC, ESC + non-'[') drops just the
-        # ESC byte.
-        if i + 1 < n and s[i + 1] == '[':
-            j = i + 2
-            while j < n and not ('@' <= s[j] <= '~'):
-                j += 1
-            if j < n:
-                # Complete CSI: keep iff it's SGR (final byte 'm').
-                if s[j] == 'm':
-                    out.append(s[i:j + 1])
-                i = j + 1
-                continue
-            # Dangling ESC '[' with no final byte — drop the remainder.
-            break
-        # Bare ESC (or ESC introducing a non-CSI escape): drop the ESC only.
-        i += 1
-    return ''.join(out)
+    return _SANITIZE_ANSI_RE.sub(_sanitize_ansi_repl, s)
 
 
 def _id_visible(item, show_ids):
