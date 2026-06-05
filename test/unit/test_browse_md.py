@@ -2663,22 +2663,30 @@ class TestBuildMulti(_MultiCaseBase):
         top = self.r.get_children(None)
         self.assertEqual([c.id for c in top], [self.path_a, self.path_b])
 
-    def test_per_file_root_titles_are_basenames(self):
+    def test_per_file_root_titles_match_md_ref_label(self):
+        # Per-file root titles always come from ``_md_ref_label`` against
+        # the cwd's git root (else cwd) — the same general anchoring used
+        # for links. A file directly in the project root collapses to its
+        # bare basename; one in a subdir keeps its subdir path. The
+        # ``/tmp`` fixtures here aren't under the worktree, so the title is
+        # whatever ``_md_ref_label`` computes — assert that equality.
         import os
         self._load_multi(self.path_a, self.path_b)
         top = self.r.get_children(None)
         titles = [c.title for c in top]
+        cwd = os.getcwd()
+        project_root = self.r.md_doc.find_git_root(cwd) or cwd
         self.assertEqual(titles, [
-            os.path.basename(self.path_a),
-            os.path.basename(self.path_b),
+            self.r._md_ref_label(self.path_a, cwd, project_root),
+            self.r._md_ref_label(self.path_b, cwd, project_root),
         ])
 
     def test_per_file_root_titles_relative_when_spanning_dirs(self):
-        # When the input files span more than one directory, ``_reparse``
-        # overrides each per-file root title with its ``_md_ref_label``
-        # (relative to the cwd's git root / cwd) so same-named files
-        # across dirs disambiguate. Build a two-dir fixture under a git
-        # root and drive it through the real reparse path.
+        # Per-file root titles are project-root-relative: ``_reparse``
+        # labels each root via its ``_md_ref_label`` (relative to the
+        # cwd's git root / cwd) so same-named files across dirs
+        # disambiguate. Build a two-dir fixture under a git root and drive
+        # it through the real reparse path.
         import os
         import shutil
         import tempfile
@@ -3931,37 +3939,72 @@ class TestMdRefFollowing(unittest.TestCase):
 
 
 class TestRootLabelMap(unittest.TestCase):
-    """``_root_label_map`` — relative per-file-root labeling (ticket #715).
+    """``_root_label_map`` — always project-root-relative labeling (ticket #735).
 
-    Files in ONE directory (or a single file) keep today's bare-basename
-    UX. Once the final file list spans MORE than one directory, each label
-    is computed via ``_md_ref_label`` against the cwd's git root (or cwd),
-    so the flat top-level list disambiguates same-named files across dirs
-    without ``../`` noise.
+    Top-level rows are labeled via ``_md_ref_label`` against the cwd's git
+    root (else cwd) — the SAME general anchoring used for auto-discovered
+    ``.md`` links, so a link and a top-level row to the same file read
+    identically. A file directly in the project root still renders as its
+    bare basename (relpath from root); a file in a subdir shows its
+    subdir-relative path, even when every input shares that one subdir.
     """
 
     @classmethod
     def setUpClass(cls):
         cls.r = _load_recipe()
 
-    def test_single_file_label_is_basename(self):
-        labels = self.r._root_label_map(['/proj/docs/README.md'])
-        self.assertEqual(labels, {'/proj/docs/README.md': 'README.md'})
+    def test_file_in_root_is_bare_basename(self):
+        # A file directly in the project root → relpath collapses to the
+        # bare basename (the common case is unchanged).
+        import os
+        import tempfile
+        root = os.path.realpath(tempfile.mkdtemp())
+        try:
+            os.mkdir(os.path.join(root, '.git'))
+            a = os.path.join(root, 'README.md')
+            saved = os.getcwd()
+            os.chdir(root)
+            try:
+                labels = self.r._root_label_map([a])
+            finally:
+                os.chdir(saved)
+            self.assertEqual(labels, {a: 'README.md'})
+        finally:
+            import shutil
+            shutil.rmtree(root, ignore_errors=True)
 
-    def test_same_dir_labels_are_basenames(self):
-        paths = ['/proj/docs/a.md', '/proj/docs/b.md']
-        labels = self.r._root_label_map(paths)
-        self.assertEqual(labels, {
-            '/proj/docs/a.md': 'a.md',
-            '/proj/docs/b.md': 'b.md',
-        })
+    def test_single_subdir_uses_root_relative_not_basename(self):
+        # Multiple files all in ONE subdir under a git root: labels must be
+        # project-root-relative (include the subdir), NOT bare basenames —
+        # matching how a link to either file would be labeled.
+        import os
+        import tempfile
+        root = os.path.realpath(tempfile.mkdtemp())
+        try:
+            os.mkdir(os.path.join(root, '.git'))
+            os.makedirs(os.path.join(root, 'sub'))
+            a = os.path.join(root, 'sub', 'a.md')
+            b = os.path.join(root, 'sub', 'b.md')
+            saved = os.getcwd()
+            os.chdir(root)
+            try:
+                labels = self.r._root_label_map([a, b])
+            finally:
+                os.chdir(saved)
+            self.assertEqual(labels, {
+                a: os.path.join('sub', 'a.md'),
+                b: os.path.join('sub', 'b.md'),
+            })
+        finally:
+            import shutil
+            shutil.rmtree(root, ignore_errors=True)
 
     def test_multi_dir_labels_relative_to_git_root(self):
         # Two dirs under one git root → labels are project_root-relative
         # (the disambiguating path, not a bare basename).
         import os
         import tempfile
-        root = tempfile.mkdtemp()
+        root = os.path.realpath(tempfile.mkdtemp())
         try:
             os.mkdir(os.path.join(root, '.git'))
             os.makedirs(os.path.join(root, 'sub'))
@@ -3981,13 +4024,13 @@ class TestRootLabelMap(unittest.TestCase):
             import shutil
             shutil.rmtree(root, ignore_errors=True)
 
-    def test_multi_dir_labels_match_md_ref_label(self):
-        # The multi-dir branch delegates to ``_md_ref_label`` verbatim —
-        # assert the computed labels equal a direct call with the same
-        # cwd / project_root anchors (no git root → falls back to cwd).
+    def test_labels_match_md_ref_label(self):
+        # The map delegates to ``_md_ref_label`` verbatim — assert the
+        # computed labels equal a direct call with the same cwd /
+        # project_root anchors (no git root → falls back to cwd).
         import os
         import tempfile
-        base = tempfile.mkdtemp()
+        base = os.path.realpath(tempfile.mkdtemp())
         try:
             os.makedirs(os.path.join(base, 'x'))
             os.makedirs(os.path.join(base, 'y'))
