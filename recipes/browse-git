@@ -62,13 +62,14 @@ Usage:
 """
 
 import os
+import re
 import shutil
 import subprocess
 import sys
 
 from browse_tui import (
     Action, Browser, BrowserConfig, Item,
-    cell_ljust, default_row_content, style,
+    cell_ljust, default_row_content, sanitize_ansi, style,
 )
 
 # Optional md2ansi_lib plugin — gates md2ansi coloring of commit messages.
@@ -87,7 +88,10 @@ _MODES = ('commits', 'status', 'reflog', 'branches', 'stash')
 # Glyph substitution for ``git log --graph`` art (tree mode). Maps git's
 # ASCII art to box-drawing / dot glyphs: every node ('*') becomes the same
 # dot so git's connectors — not the node shape — convey merges. Built once
-# as a str.translate table (see ``_graph_translate``).
+# as a str.translate table (see ``_graph_translate``). The art carries git's
+# own ANSI colour (``--color=always``), so the substitution is applied only
+# to the plain-text runs *between* SGR sequences (see ``_graph_translate`` /
+# ``_SGR_RE``) — never to a byte inside an ``\e[…m`` escape.
 _GRAPH_GLYPHS = {
     '*': '•',     # commit node           -> bullet (U+2022)
     '|': '│',     # vertical lane         -> box vertical (U+2502)
@@ -97,6 +101,15 @@ _GRAPH_GLYPHS = {
     '_': '▁',     # horizontal connector  -> lower eights block
 }
 _GRAPH_TABLE = str.maketrans(_GRAPH_GLYPHS)
+
+# A complete SGR sequence ``\e[ <params> m``. The param class ``[^@-~]*``
+# exactly mirrors the kept-set of the framework ``sanitize_ansi`` (a CSI whose
+# final byte is ``m``), so EVERY sequence that survives sanitise is matched
+# here — not just the ``[0-9;]`` params real git emits. ``_graph_translate``
+# splits on this pattern to glyph-substitute the plain runs while passing each
+# SGR token through verbatim — guaranteeing no substitution lands inside an
+# escape and no colour run is split.
+_SGR_RE = re.compile(r'\x1b\[[^@-~]*m')
 
 # Module-level state, all set in main() before the Browser launches.
 _log_limit = _LOG_LIMIT
@@ -825,15 +838,40 @@ def _commit_log_items(revs, paths):
 
 
 def _graph_translate(art):
-    """Glyph-substitute one line of ``git log --graph`` art.
+    """Sanitise + glyph-substitute one line of coloured ``git log --graph`` art.
 
-    Maps git's ASCII connectors to box-drawing / block glyphs via the module
-    ``_GRAPH_TABLE`` (``*``→``•``, ``|``→``│``, ``_``→``▁``); the diagonals
-    ``/`` and ``\\`` pass through unchanged. Internal spacing is git's lane
-    alignment and is preserved; only trailing spaces are stripped (git
-    right-pads every art cell, and a trailing run carries no lane information).
+    The art carries git's native ANSI colour (``--color=always``). It is
+    treated as external input and first run through the shared framework
+    sanitiser :func:`sanitize_ansi`, which keeps only complete SGR colour
+    sequences (``\\e[…m``) and strips every other escape — so nothing but a
+    colour code can ever reach the screen.
+
+    Glyph substitution then maps git's ASCII connectors to box-drawing / block
+    glyphs via the module ``_GRAPH_TABLE`` (``*``→``•``, ``|``→``│``,
+    ``_``→``▁``); the diagonals ``/`` and ``\\`` pass through unchanged. The
+    substitution is ANSI-safe: ``_SGR_RE`` (whose param class matches exactly
+    what ``sanitize_ansi`` keeps) splits the line into SGR tokens and the plain
+    runs between them, and ``str.translate`` is applied **only** to the plain
+    runs — an SGR sequence is re-emitted verbatim, so a glyph is never
+    substituted for a byte inside an escape and a colour run is never split.
+
+    Internal spacing is git's lane alignment and is preserved; only trailing
+    spaces are stripped (git right-pads every art cell, and a trailing run
+    carries no lane information). ``rstrip`` strips whitespace only, leaving
+    any trailing reset (``\\e[m``) intact; the colour codes are zero-width, so
+    width / alignment math (``cell_width`` strips escapes) is unaffected.
     """
-    return art.translate(_GRAPH_TABLE).rstrip()
+    art = sanitize_ansi(art)
+    out = []
+    pos = 0
+    for m in _SGR_RE.finditer(art):
+        if m.start() > pos:
+            out.append(art[pos:m.start()].translate(_GRAPH_TABLE))
+        out.append(m.group(0))                      # SGR token, verbatim
+        pos = m.end()
+    if pos < len(art):
+        out.append(art[pos:].translate(_GRAPH_TABLE))
+    return ''.join(out).rstrip()
 
 
 def _commit_graph_items(revs, paths, ns):
@@ -841,10 +879,13 @@ def _commit_graph_items(revs, paths, ns):
 
     The tree-mode counterpart to ``_commit_log_items``. ``git log --graph``
     does ALL the lane assignment and prepends its art to every output line;
-    we render those lines verbatim (after glyph substitution) rather than
-    re-deriving the graph. The ``\\x1f`` (unit separator) format keeps the
-    art — which freely contains spaces and ``|`` / ``/`` — unambiguously
-    apart from the commit fields:
+    we render those lines verbatim (after sanitise + glyph substitution)
+    rather than re-deriving the graph. ``--color=always`` makes git colour the
+    graph drawing (and the ``%D`` decorations) with its own ANSI; the SGR uses
+    ``\\e``, never ``\\x1f``, so the field split below is unaffected. The
+    ``\\x1f`` (unit separator) format keeps the art — which freely contains
+    spaces, colour codes and ``|`` / ``/`` — unambiguously apart from the
+    commit fields:
 
       * ``<art>\\x1f%H\\x1f%an\\x1f%ar\\x1f%s\\x1f%D`` for a commit line —
         splitting on ``\\x1f`` yields the art then the five fields;
@@ -852,17 +893,18 @@ def _commit_graph_items(revs, paths, ns):
         split yields a single element.
 
     Commit lines build the same columnar Item as ``_commit_log_items`` and
-    additionally carry ``col_graph`` (the translated art). Filler lines
-    become ``meta=True`` Items (``id='filler:<ns>:<n>'`` — ``n`` is a running
-    counter that resets per build, ``ns`` is the caller's namespace key making
-    the id globally unique across builds; ``has_children=False``, no
+    additionally carry ``col_graph`` (the sanitised, coloured, translated art).
+    Filler lines become ``meta=True`` Items (``id='filler:<ns>:<n>'`` — ``n``
+    is a running counter that resets per build, ``ns`` is the caller's
+    namespace key making the id globally unique across builds;
+    ``has_children=False``, no
     ``col_sha``) carrying only ``col_graph``. ``_parse_id`` partitions on the
     first ``:`` so a ``filler:…`` id still maps to kind ``other`` and stays
     inert on every drill-down / action / preview path. ``meta=True`` makes the
     framework skip the cursor over the row (preventively) and never select it.
     git's line order (commits and fillers interleaved) is preserved.
     """
-    args = ['log', '--graph', '--no-color',
+    args = ['log', '--graph', '--color=always',
             '--format=\x1f%H\x1f%an\x1f%ar\x1f%s\x1f%D', '-n', str(_log_limit)]
     args += list(revs)
     if paths:
@@ -922,18 +964,22 @@ def git_row_content(item, ctx):
     decorations unchanged. Only the content region is taken over; chrome
     (tree indent + ▼/▶) stays framework-owned.
 
-    ``gfg`` (the graph foreground) is the terminal default — ``style('')`` —
-    so the art is monochrome and git's connectors read as plain box lines.
+    The art (``col_graph``) carries git's own ANSI colour, so it is emitted
+    as a segment with **no framework fg** (``(graph, None, False)``) — git's
+    SGR shows through unmodified. The per-segment writer truncates that text
+    ANSI-aware and the rule-3 conditional trailing reset (``\\e[m``) keeps the
+    colour from bleeding into the subject or the next pane. The colour codes
+    are zero-width (``cell_width`` strips them), so the columns stay aligned.
     """
     w = ctx.max_col_width
-    gfg, gbold = style('')                          # graph: terminal default
     if getattr(item, 'col_sha', None) is None:
         graph = getattr(item, 'col_graph', None)
         if graph is None:
             return default_row_content(item, ctx)   # non-commit / synthetic row
-        # Filler row: blank-pad the sha+author+date span, then the art.
+        # Filler row: blank-pad the sha+author+date span, then the coloured
+        # art (git's own SGR -> fg=None so it shows through).
         pad = (w('col_sha') + 2 + w('col_author') + 2 + w('col_date') + 2)
-        return [(' ' * pad, gfg, gbold), (graph, gfg, gbold)]
+        return [(' ' * pad, None, False), (graph, None, False)]
     yfg, ybold = style('yellow')
     dfg, dbold = style('dim')
     segments = [
@@ -941,10 +987,13 @@ def git_row_content(item, ctx):
         (cell_ljust(item.col_author, w('col_author')) + '  ', dfg, dbold),
         (cell_ljust(item.col_date, w('col_date')) + '  ', dfg, dbold),
     ]
-    # Commit graph art (tree mode) between the date column and the chips.
+    # Commit graph art (tree mode) between the date column and the chips —
+    # git's own ANSI colour, so fg=None lets its SGR show through. git
+    # closes each coloured connector with a reset, so the appended gap space
+    # is uncoloured; rule-3 adds a trailing reset besides.
     graph = getattr(item, 'col_graph', None)
     if graph is not None:
-        segments.append((graph + ' ', gfg, gbold))
+        segments.append((graph + ' ', None, False))
     # Ref decorations between the date column and the subject.
     for text, stylename in getattr(item, 'chips', None) or ():
         cfg, cbold = style(stylename)

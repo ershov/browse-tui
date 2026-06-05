@@ -651,6 +651,73 @@ class TestBrowseGitTreeMeta(unittest.TestCase):
                                  'filler connector art is not aligned under '
                                  f'the commit bullet column.\n{plain}')
 
+    def test_graph_art_is_colored_not_monochrome(self):
+        """The graph connectors render in git's NATIVE colour (ticket #756).
+
+        ``--color=always`` makes git colour the lane connectors; the recipe
+        passes that ANSI through (fg=None) so it reaches the screen. On a
+        ``--no-ff`` merge the lanes use *different* colours per lane, so the
+        coloured capture must show the connector glyphs (``│`` / ``\\`` /
+        ``/``) wrapped in an SGR *foreground* sequence, with at least two
+        DISTINCT colours present — proving the art is no longer monochrome.
+
+        Also asserts no colour bleeds into the subject: every connector
+        colour run is closed (by git's own reset and/or the framework's
+        rule-3 trailing ``\\e[m``) before the commit subject text, so a
+        subject line never carries a lane colour straight up to its words.
+        """
+        # An SGR foreground colour: 30-37 / 90-97 (basic) or 38;5;N (256).
+        fg_sgr = re.compile(r'\x1b\[(?:3[0-7]|9[0-7]|38;5;\d+)m')
+        # A connector glyph immediately following an SGR fg run.
+        colored_connector = re.compile(
+            r'(\x1b\[(?:3[0-7]|9[0-7]|38;5;\d+)m)[│\\/•]')
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_merge_repo(tmp)
+            with TmuxFixture(cols=120, rows=30) as t:
+                t.send_line(f'cd {tmp}')
+                t.launch(_BIN, '--run-py', _RECIPE, '--tree')
+                t.wait_for('merge feature', timeout=5.0)
+                t.wait_stable()
+                colored = t.capture(colors=True)
+                # The connector glyphs carry git's colour: find the SGR fg
+                # codes that immediately precede a lane glyph.
+                hits = colored_connector.findall(colored)
+                self.assertTrue(
+                    hits,
+                    'no coloured graph connector found — the art rendered '
+                    f'monochrome.\n{colored}')
+                distinct = set(hits)
+                self.assertGreaterEqual(
+                    len(distinct), 2,
+                    'expected at least two distinct lane colours in the '
+                    f'merge graph, saw {distinct!r}.\n{colored}')
+                # No colour bleed into the subject: on the line carrying a
+                # commit subject, the subject text must not be tinted by a
+                # still-open lane colour. Check the merge subject's row — its
+                # graph segment ('•') is uncoloured here, so the text up to
+                # and including the subject carries no lingering fg run.
+                for line in colored.splitlines():
+                    if 'feat commit' in line:
+                        before_subject = line.split('feat commit')[0]
+                        # The last SGR before the subject must be a reset
+                        # (\e[m or \e[39m), not a colour-set, so the subject
+                        # is not tinted by the lane colour.
+                        sgrs = re.findall(r'\x1b\[[0-9;]*m', before_subject)
+                        if any(fg_sgr.match(s) for s in sgrs):
+                            # A fg colour appears before the subject — the
+                            # last one must have been closed by a reset.
+                            last_fg = max(
+                                i for i, s in enumerate(sgrs)
+                                if fg_sgr.match(s))
+                            resets = [
+                                i for i, s in enumerate(sgrs)
+                                if s in ('\x1b[m', '\x1b[0m', '\x1b[39m')]
+                            self.assertTrue(
+                                any(r > last_fg for r in resets),
+                                'a lane colour bled into the commit subject '
+                                f'(unreset fg before text).\n{line!r}')
+                        break
+
     def test_filler_rows_are_unselectable(self):
         """Ctrl-A select-all marks every commit but no connector filler row.
 

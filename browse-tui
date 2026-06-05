@@ -9339,6 +9339,12 @@ def _sanitize_ansi(s):
     return _SANITIZE_ANSI_RE.sub(_sanitize_ansi_repl, s)
 
 
+# Public, recipe-facing name for sanitising external ANSI before embedding it
+# in a segment's text (segment text bypasses the framework's on-receipt
+# sanitise in ``_normalize_content``, which only sanitises *string* content).
+sanitize_ansi = _sanitize_ansi
+
+
 def _id_visible(item, show_ids):
     """Decide whether the id segment should be emitted for ``item``.
 

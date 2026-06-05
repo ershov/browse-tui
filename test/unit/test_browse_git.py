@@ -50,9 +50,10 @@ Coverage (ticket #662 — commits columnar list):
 
 Coverage (ticket #701 — tree-mode commit graph):
 
-* ``_graph_translate``     maps the ``*|_`` git art glyphs to their box/block
-  glyphs (diagonals ``/`` ``\\`` pass through), preserves internal spacing,
-  rstrips trailing pad
+* ``_graph_translate``     sanitises git's coloured art (keep only SGR) then
+  maps the ``*|_`` glyphs to their box/block glyphs (diagonals ``/`` ``\\``
+  pass through) — ANSI-safely, only on the plain runs between SGR sequences —
+  preserves internal spacing, rstrips trailing pad
 * ``_commit_graph_items``  ``git log --graph`` lines → commit Items (with
   ``col_graph``) interleaved with ``meta=True`` filler Items (``filler:<n>``,
   ``has_children`` False, no ``col_sha``); git line order preserved
@@ -75,6 +76,7 @@ covered end-to-end against a real headless Browser in
 
 import importlib.util
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -108,6 +110,11 @@ def _stub_browse_tui():
     ``str.ljust`` measures the same as the real cell-aware helper, which is
     enough to prove ``git_row_content`` wires them correctly. They mirror
     the stub in ``test_browse_fs.py``.
+
+    ``sanitize_ansi`` mirrors the framework's escape-sanitiser (050-render)
+    1:1 — keep complete SGR (``\\e[…m``), drop every other CSI / bare ESC —
+    so the recipe's coloured-graph path is exercised faithfully under the
+    stub (the recipe imports it for ``_graph_translate``).
     """
     mod = types.ModuleType('browse_tui')
 
@@ -138,6 +145,16 @@ def _stub_browse_tui():
         return [('DEFAULT', getattr(item, 'id', None), getattr(item, 'title', None))]
 
     mod.default_row_content = _default_row_content
+
+    _sanitize_re = re.compile(r'\x1b\[[^@-~]*([@-~])|\x1b\[[^@-~]*\Z|\x1b')
+
+    def sanitize_ansi(s):
+        if '\x1b' not in s:
+            return s
+        return _sanitize_re.sub(
+            lambda m: m.group(0) if m.group(1) == 'm' else '', s)
+
+    mod.sanitize_ansi = sanitize_ansi
     sys.modules['browse_tui'] = mod
 
 
@@ -1292,7 +1309,13 @@ class TestStatusLeafDedup(unittest.TestCase):
 
 
 class TestGraphTranslate(unittest.TestCase):
-    """``_graph_translate`` glyph-substitutes git's ASCII graph art."""
+    """``_graph_translate`` sanitises + glyph-substitutes git's graph art.
+
+    The art now carries git's native ANSI colour (``--color=always``);
+    ``_graph_translate`` runs it through the shared ``sanitize_ansi`` (keep
+    only SGR) and glyph-substitutes the plain runs **between** SGR sequences,
+    so a colour run is never split and no glyph lands inside an escape.
+    """
 
     @classmethod
     def setUpClass(cls):
@@ -1303,6 +1326,31 @@ class TestGraphTranslate(unittest.TestCase):
         self.assertEqual(self.r._graph_translate('*'), '•')  # • node
         self.assertEqual(self.r._graph_translate('|'), '│')  # │ vertical
         self.assertEqual(self.r._graph_translate('_'), '▁')  # ▁ horizontal
+
+    def test_sgr_preserved_and_glyph_substituted_inside_run(self):
+        # A coloured lane char: git wraps the '|' in SGR (\e[31m … \e[m).
+        # The escape is preserved verbatim and the '|' inside it becomes '│'.
+        self.assertEqual(
+            self.r._graph_translate('\x1b[31m|\x1b[m'),
+            '\x1b[31m│\x1b[m')
+        # A coloured merge fan-out: red '|' then green '\' — each kept in its
+        # own SGR run; '|' -> '│', the diagonal passes through.
+        self.assertEqual(
+            self.r._graph_translate('\x1b[31m|\x1b[m\x1b[32m\\\x1b[m  '),
+            '\x1b[31m│\x1b[m\x1b[32m\\\x1b[m')
+        # Mixed: a coloured lane then a PLAIN node (git leaves '*' uncoloured).
+        self.assertEqual(
+            self.r._graph_translate('\x1b[33m|\x1b[m * '),
+            '\x1b[33m│\x1b[m •')
+
+    def test_non_sgr_escapes_sanitised_out(self):
+        # The art is treated as external input: a non-SGR CSI (cursor move /
+        # erase) and a bare ESC are stripped, while the SGR colour survives
+        # and the lane glyph is still substituted.
+        self.assertEqual(
+            self.r._graph_translate('\x1b[2J\x1b[31m|\x1b[m\x1b[H'),
+            '\x1b[31m│\x1b[m')
+        self.assertEqual(self.r._graph_translate('\x1b|'), '│')
 
     def test_diagonals_pass_through(self):
         # The merge diagonals are left as git's own ASCII art.
@@ -1454,7 +1502,9 @@ class TestCommitGraphItems(unittest.TestCase):
         self.r._commit_graph_items(['HEAD~5'], ['src/'], 'root')
         args = captured['args']
         self.assertIn('--graph', args)
-        self.assertIn('--no-color', args)
+        # Native colour: git draws the graph + decorations in its own ANSI.
+        self.assertIn('--color=always', args)
+        self.assertNotIn('--no-color', args)
         self.assertIn('-n', args)
         self.assertIn('42', args)
         self.assertIn('HEAD~5', args)
@@ -1508,7 +1558,8 @@ class TestGitRowContentGraph(unittest.TestCase):
         # sha, author, date, GRAPH, [HEAD], subject.
         self.assertEqual(len(segs), 6)
         graph_seg = segs[3]
-        # Graph art + a single trailing space; GFG is terminal default.
+        # Graph art + a single trailing space; fg=None so git's own ANSI
+        # colour (carried in the art text) shows through unmodified.
         self.assertEqual(graph_seg, ('• ', None, False))
         # The chip follows the graph, the subject is still last.
         self.assertEqual(segs[4], ('[HEAD] ', *self.r.style('green')))
@@ -1532,7 +1583,8 @@ class TestGitRowContentGraph(unittest.TestCase):
 
     def test_filler_row_blank_pad_then_art(self):
         # A filler (col_graph set, no col_sha) blank-pads the sha+author+date
-        # span then renders its art; both segments use the graph fg.
+        # span then renders its art; both segments use fg=None so git's own
+        # colour codes in the art show through.
         ctx = _FakeCtx(self._widths(sha=7, author=5, date=12))
         item = self.r.Item(id='filler:root:0', title='', has_children=False,
                            col_graph='│\\')
