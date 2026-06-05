@@ -226,9 +226,11 @@ pane**. Shares the existing `_sanitize_preview` machinery (`050-render.py:142`).
    — one-pass, ANSI-aware (counts visible cells, passes escapes through).
 3. **Reset, conditionally.** No ANSI in the (sanitized) string → emit nothing
    extra. Any ANSI present → emit `\e[m` at the end.
-4. **Background restore.** If a background colour is set for the row **and** the
-   string contains any background code (`40–49`, `100–109`), re-emit
-   `\e[<row-bg>m` after the reset so the trailing pad keeps the row background.
+4. **Background restore.** Whenever the row has a background set (driven by the
+   row's `row_bg` attribute, **not** a content scan), re-emit `\e[<row-bg>m`
+   after the reset so the trailing pad keeps the row background. The reset
+   clears the bg regardless of whether the content set one, so restoring on the
+   attribute keeps the stripe alive even when the content carried only fg codes.
 
 ### 5. Search and filtering (#11)
 

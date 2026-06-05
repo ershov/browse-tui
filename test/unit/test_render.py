@@ -2083,72 +2083,6 @@ class TestSanitizeAnsi(unittest.TestCase):
         self.assertEqual(_sanitize_ansi(once), once)
 
 
-class TestHasBgSgr(unittest.TestCase):
-    """Detect a background SGR param (40-49 / 100-109) for the bg-restore."""
-
-    def test_no_ansi_is_false(self):
-        self.assertFalse(_render._has_bg_sgr('plain'))
-
-    def test_fg_only_is_false(self):
-        self.assertFalse(_render._has_bg_sgr('\033[31mred\033[0m'))
-
-    def test_256_fg_is_false(self):
-        # 38;5;N is a foreground code — 38 is NOT a bg param.
-        self.assertFalse(_render._has_bg_sgr('\033[38;5;200mx'))
-
-    def test_256_fg_with_bg_range_index_is_false(self):
-        # Positional parse: 38;5;48 is a *foreground* whose 256-index (48)
-        # falls in the bg range. The '5;48' operand must be consumed with
-        # the 38 introducer, NOT tested as a standalone bg code.
-        self.assertFalse(_render._has_bg_sgr('\033[38;5;48mx'))
-
-    def test_truecolor_fg_with_bg_range_channels_is_false(self):
-        # 38;2;R;G;B truecolor fg whose channels land in the bg range
-        # (40, 41, 42) — all are operands of the 38 introducer, none a bg.
-        self.assertFalse(_render._has_bg_sgr('\033[38;2;40;41;42mx'))
-
-    def test_256_bg_index_in_bg_range_still_true(self):
-        # 48;5;41 IS a background (the 48 introducer makes it one),
-        # regardless of the index value.
-        self.assertTrue(_render._has_bg_sgr('\033[48;5;41mx'))
-
-    def test_fg_then_bg_compound_is_true(self):
-        # A 256 fg whose index is in the bg range, FOLLOWED by a real bg —
-        # the fg operand is skipped, the trailing 41 is detected.
-        self.assertTrue(_render._has_bg_sgr('\033[38;5;48;41mx'))
-
-    def test_underline_color_extended_is_false(self):
-        # 58;5;N (extended underline colour) is not a background; its
-        # operand must be consumed too.
-        self.assertFalse(_render._has_bg_sgr('\033[58;5;42mx'))
-
-    def test_reset_only_is_false(self):
-        # \e[m / \e[0m carry no bg param.
-        self.assertFalse(_render._has_bg_sgr('\033[mx'))
-        self.assertFalse(_render._has_bg_sgr('\033[0mx'))
-
-    def test_basic_bg_is_true(self):
-        self.assertTrue(_render._has_bg_sgr('\033[41mx\033[0m'))
-
-    def test_default_bg_49_is_true(self):
-        self.assertTrue(_render._has_bg_sgr('\033[49mx'))
-
-    def test_bright_bg_is_true(self):
-        self.assertTrue(_render._has_bg_sgr('\033[102mx'))
-
-    def test_256_bg_is_true(self):
-        # 48;5;N — 48 is in the bg range.
-        self.assertTrue(_render._has_bg_sgr('\033[48;5;17mx'))
-
-    def test_bg_in_compound_is_true(self):
-        self.assertTrue(_render._has_bg_sgr('\033[1;41;32mx'))
-
-    def test_non_sgr_with_bg_digits_is_false(self):
-        # A cursor-move CSI that happens to contain '41' must not count —
-        # only ``…m`` (SGR) sequences are scanned.
-        self.assertFalse(_render._has_bg_sgr('\033[41Hx'))
-
-
 # --- clear_columns helper --------------------------------------------------
 
 
@@ -2680,12 +2614,14 @@ class TestRenderListRectClipping(unittest.TestCase):
         # The leading colour escape survived (not cut mid-sequence).
         self.assertIn('\033[31m', joined)
 
-    def test_bg_restore_fires_when_row_bg_and_content_bg(self):
-        # Rule 4: row bg active AND content carries a bg code (\e[41m) →
-        # after the trailing reset the row bg is re-emitted (as the bare
-        # background SGR \e[48;5;17m) so the trailing pad keeps the stripe.
-        # Assert the observable order: the rule-3 reset \e[m, then the
-        # rule-4 restore byte immediately after it.
+    def test_bg_restore_fires_when_row_bg_and_ansi_content(self):
+        # Rule 4: row bg active AND the content emitted SGR → after the
+        # trailing reset the row bg is re-emitted (as the bare background
+        # SGR \e[48;5;17m) so the trailing pad keeps the stripe. The restore
+        # is gated on the ``row_bg`` attribute, not a content bg scan; here
+        # the content carries a bg code, but any SGR would trigger it (see
+        # the fg-only case below). Assert the observable order: the rule-3
+        # reset \e[m, then the rule-4 restore byte immediately after it.
         def content(item, ctx):
             return '\033[41mX\033[0m'   # red background in the content
 
@@ -2698,12 +2634,13 @@ class TestRenderListRectClipping(unittest.TestCase):
         # The reset is immediately followed by the bg-restore byte.
         self.assertIn('\033[m\033[48;5;17m', joined)
 
-    def test_bg_restore_skipped_when_no_content_bg(self):
-        # Rule 4 negative: row bg active but the content carries NO bg code
-        # (only a fg colour) → the rule-3 reset fires, but the bare bg-
-        # restore byte is NOT emitted. (The stripe pad still paints with
-        # row_bg via the existing set_style stripe logic — that's separate;
-        # what must be absent is the rule-4 *restore byte* \e[48;5;17m.)
+    def test_bg_restore_fires_when_row_bg_and_fg_only_ansi(self):
+        # Rule 4 (attribute-driven): row bg active and the content carries
+        # ONLY a fg colour (no bg code) → the restore STILL fires. The
+        # rule-3 ``\e[m`` reset clears the bg the stripe needs, so re-emitting
+        # the row bg on the ``row_bg`` attribute keeps the stripe alive even
+        # when the content set no bg of its own. (This is the case the old
+        # content-bg-code gate missed.)
         def content(item, ctx):
             return '\033[31mred\033[0m'   # fg only, no bg code
 
@@ -2713,9 +2650,27 @@ class TestRenderListRectClipping(unittest.TestCase):
         _render.visible_items = lambda s: state._visible
         browser = _MockBrowser(state, format_row_content=content)
         joined = self._render_one(browser, width=40)
-        # Rule-3 reset present, rule-4 restore byte absent.
-        self.assertIn('\033[m', joined)
-        self.assertNotIn('\033[m\033[48;5;17m', joined)
+        # The reset is immediately followed by the bg-restore byte.
+        self.assertIn('\033[m\033[48;5;17m', joined)
+
+    def test_bg_restore_skipped_when_row_bg_but_no_ansi(self):
+        # Rule 4 negative: row bg active but the content is PLAIN (no SGR) →
+        # rule 3 fires no reset (nothing to close), so rule 4 emits no
+        # restore byte either. (The stripe pad still paints with row_bg via
+        # the existing set_style stripe logic — that's separate; what must be
+        # absent is the rule-3 reset \e[m and the rule-4 restore byte.)
+        def content(item, ctx):
+            return 'plain'   # no SGR at all
+
+        item = Item(id='a', title='t')
+        item.row_bg = 17
+        state = _MockState([self._entry(item)], cursor=5)  # not the cursor
+        _render.visible_items = lambda s: state._visible
+        browser = _MockBrowser(state, format_row_content=content)
+        joined = self._render_one(browser, width=40)
+        # No trailing reset (no ANSI content) and no rule-4 restore byte.
+        self.assertNotIn('\033[m', joined)
+        self.assertNotIn('\033[48;5;17m', joined)
 
     def test_bg_restore_skipped_when_no_row_bg(self):
         # Rule 4 negative: content carries a bg code but NO row bg is set →
