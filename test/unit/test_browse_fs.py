@@ -267,5 +267,35 @@ class TestGetChildren(unittest.TestCase):
                          self.r.default_row_content(err, _FakeCtx({})))
 
 
+class TestGetPreviewDir(unittest.TestCase):
+    """``get_preview`` on a directory matches the children view ordering.
+
+    Directories first, then files; each sorted case-insensitively by
+    name; directory lines get a trailing ``/`` and files do not. This is
+    the same ``(not _is_dir, name.lower())`` ordering and ``/`` suffix
+    that ``get_children`` uses.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_dirs_first_with_slash_suffix_case_insensitive(self):
+        with tempfile.TemporaryDirectory() as d:
+            # Mixed case across dirs and files to prove case-insensitive
+            # sort and dirs-before-files regardless of raw byte order.
+            os.mkdir(os.path.join(d, 'Bravo'))
+            os.mkdir(os.path.join(d, 'alpha'))
+            for name in ('Zeta.txt', 'apple.txt'):
+                with open(os.path.join(d, name), 'wb') as f:
+                    f.write(b'x')
+
+            lines = self.r.get_preview(d).split('\n')
+
+            # Dirs first (case-insensitive: alpha < Bravo), each with '/'.
+            # Then files (apple < Zeta), no suffix.
+            self.assertEqual(lines, ['alpha/', 'Bravo/', 'apple.txt', 'Zeta.txt'])
+
+
 if __name__ == '__main__':
     unittest.main()

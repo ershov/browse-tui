@@ -1,6 +1,6 @@
 #!/usr/bin/env -S browse-tui --run-py
 """browse-fs — filesystem browser. Lazy os.scandir; preview = file head
-or os.listdir; actions e:Edit ($EDITOR), o:Open (xdg-open), d:Delete
+or dirs-first directory listing; actions e:Edit ($EDITOR), o:Open (xdg-open), d:Delete
 (with ctx.confirm); background mtime watcher refreshes changed dirs.
 
 Usage:  browse-fs [PATH]   # PATH defaults to the current directory.
@@ -93,12 +93,26 @@ def fs_row_content(item, ctx):
     ]
 
 
+def _dir_listing(path):
+    """Plain-text directory listing matching the children view ordering.
+
+    Directories first, then files, sorted case-insensitively by name
+    (the same ``(not _is_dir, name.lower())`` key ``get_children`` uses),
+    with a ``/`` suffix on directory names. Capped at ~200 entries. This
+    is just the preview pane — no perms/size/mtime columns.
+    """
+    entries = sorted(os.scandir(path),
+                     key=lambda d: (not _is_dir(d), d.name.lower()))
+    return '\n'.join(d.name + ('/' if _is_dir(d) else '')
+                     for d in entries[:200])
+
+
 def get_preview(path):
     if isinstance(path, str) and path.startswith('__err__:'):
         return path
     try:
         if os.path.isdir(path):
-            return '\n'.join(sorted(os.listdir(path))[:200])
+            return _dir_listing(path)
         with open(path, 'rb') as f:
             text = f.read(100 * 1024 * 1024).decode('utf-8', errors='replace')
     except OSError as e:
