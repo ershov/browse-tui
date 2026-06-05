@@ -2754,6 +2754,21 @@ def _segments_cells(segments):
     return sum(cell_width(text) for text, _fg, _bold in segments)
 
 
+def _normalize_content(content):
+    """Coerce a row-content hook result to a segment list (design sec 4.1).
+
+    ``format_row_content`` / ``format_row`` may return either a list of
+    ``(text, fg, bold)`` segments (the structured default) **or** a single
+    ``str`` that may carry ANSI/SGR (free-form / passthrough content) — for
+    *any* row, normal or meta. A ``str`` becomes one segment
+    ``(text, None, False)`` whose text may contain embedded escapes; the
+    rest of the pipeline then sees a uniform segment list. ``cell_width`` is
+    ANSI-aware (strips escapes when measuring), so width math on a segment
+    whose text carries SGR stays exact.
+    """
+    return content if isinstance(content, list) else [(content, None, False)]
+
+
 def default_row_chrome(item, ctx):
     """The framework's default row *chrome* segments for a normal row.
 
@@ -2764,17 +2779,29 @@ def default_row_chrome(item, ctx):
     if ``item.has_children`` else ``'  '``). Chrome stays framework-owned
     unless a recipe overrides ``format_row_chrome``, so overriding only
     ``format_row_content`` keeps the tree intact.
+
+    A meta row (``ctx.kind == 'meta'``) is never selectable and is always a
+    leaf, so its chrome reduces to *aligned indentation*: the selection
+    marker and expander are forced blank (even if a recipe left
+    ``has_children=True``), keeping the depth indent so meta content lines
+    up under normal rows' content (design sec 4).
     """
     rel_depth = ctx.depth
     if rel_depth < 0:
         rel_depth = 0
     indent = '  ' * rel_depth
 
-    sel_marker = '* ' if ctx.selected else '  '
-    if item.has_children:
-        expand_marker = '▼ ' if ctx.expanded else '▶ '   # ▼ / ▶
-    else:
+    if ctx.kind == 'meta':
+        # Meta rows never select and never expand — blank both markers,
+        # keep only the depth indent so content aligns under normal rows.
+        sel_marker = '  '
         expand_marker = '  '
+    else:
+        sel_marker = '* ' if ctx.selected else '  '
+        if item.has_children:
+            expand_marker = '▼ ' if ctx.expanded else '▶ '   # ▼ / ▶
+        else:
+            expand_marker = '  '
 
     return [
         (sel_marker, None, False),
@@ -2798,7 +2825,16 @@ def default_row_content(item, ctx):
     expand markers stay non-bold (chrome, not content); the tag segment
     keeps its ``tag_style``-driven bold so explicit tag styles still
     control their own weight.
+
+    A meta row (``ctx.kind == 'meta'``) is a divider, not content: its
+    default content is just the title segment — no id segment, no tag /
+    chips (those are content decorations that don't belong on a divider).
+    Recipes override ``format_row_content`` (branching on ``ctx.kind``) for
+    richer meta content (design sec 4).
     """
+    if ctx.kind == 'meta':
+        return [(item.title, None, False)]
+
     is_current_scope = ctx.is_current_scope
     show_ids = ctx.browser.show_ids
 
@@ -3593,10 +3629,15 @@ class Browser:
         A whole-row ``format_row`` override bypasses this method, so under
         such an override ``ctx.content_width`` stays equal to
         ``ctx.list_width`` (the chrome split is unknown).
+
+        ``format_row_content`` may return a ``str`` (ANSI allowed) instead
+        of a segment list (design sec 4.1); :func:`_normalize_content`
+        coerces it to a single segment so the ``chrome + content``
+        concatenation always joins two lists. Chrome is always segments.
         """
         chrome = self.format_row_chrome(item, ctx)
         ctx._set_content_width(_segments_cells(chrome))
-        return chrome + self.format_row_content(item, ctx)
+        return chrome + _normalize_content(self.format_row_content(item, ctx))
 
     # ---- action registration -------------------------------------------
 

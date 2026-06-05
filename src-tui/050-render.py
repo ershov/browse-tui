@@ -1131,6 +1131,22 @@ def cell_fit(s, width, *, justify='left', trim='end', ellipsis='…',
     return pad(s, width, fill)
 
 
+def _collapse_visible(segments):
+    """Collapse ``segments`` to a single plain VISIBLE-TEXT line.
+
+    The cursor-row and search-match overlays render each row as plain text
+    under a reverse-video / highlight style, so all per-segment styling is
+    dropped: segment ``fg`` / ``bold`` are discarded (only ``s[0]``, the
+    text, is kept) **and** any SGR embedded in a segment's text is stripped
+    with the same ``_ANSI_CSI_RE`` strip ``cell_width`` / :func:`_visible_len`
+    use to measure. This keeps the overlay clean even for a row whose
+    content was a raw ANSI string (design sec 4.1) — the embedded colour
+    can't fight the reverse / highlight style. Width math is unaffected:
+    the stripped text has exactly the visible width the styled text did.
+    """
+    return ''.join(_ANSI_CSI_RE.sub('', s[0]) for s in segments)
+
+
 def _write_segments(segments, max_width, *, pad_to=0, row_bg=None,
                     row_fg=None):
     """Emit ``segments`` to the terminal, truncating at ``max_width`` cells.
@@ -1158,6 +1174,16 @@ def _write_segments(segments, max_width, *, pad_to=0, row_bg=None,
     pad on cell boundaries instead of overflowing the pane into the
     neighbour on the right.
 
+    A segment whose ``text`` carries embedded SGR (a raw ANSI string
+    normalised to one segment — design sec 4.1) is truncated **ANSI-aware**
+    via :func:`_truncate_visible` (escapes passed through, only visible
+    cells counted) instead of the plain :func:`_truncate_by_cells`, so the
+    escape bytes neither corrupt the width math nor get cut mid-sequence.
+    Passthrough of that embedded SGR is acceptable here; the full
+    sanitize / conditional-reset / bg-restore handling lands in #739. Plain
+    segments (the overwhelming common case — colour rides ``fg``, never the
+    text) keep the existing plain truncation byte-for-byte.
+
     Returns the number of cells written.
     """
     pos = 0
@@ -1165,7 +1191,12 @@ def _write_segments(segments, max_width, *, pad_to=0, row_bg=None,
         if pos >= max_width:
             break
         remaining = max_width - pos
-        chunk, chunk_cells = _truncate_by_cells(text, remaining)
+        if '\033[' in text:
+            # ANSI-bearing text: truncate by visible cells, escapes intact.
+            chunk = _truncate_visible(text, remaining)
+            chunk_cells = _visible_len(chunk)
+        else:
+            chunk, chunk_cells = _truncate_by_cells(text, remaining)
         if not chunk:
             continue
         # Effective fg: segment's own ``fg`` wins; otherwise inherit
@@ -1577,12 +1608,22 @@ def render_list(browser, rect, *, rightmost: bool = False):
                 kind=entry.kind,
                 list_width=width,
             )
-            segments = browser._row_segments(item, ctx)
+            # A whole-row ``format_row`` override may return a ``str`` (ANSI
+            # allowed) rather than a segment list (design sec 4.1);
+            # ``_normalize_content`` coerces it to a single segment so the
+            # rest of the pipeline sees a uniform segment list. The default
+            # composer already normalised its content hook, so this is a
+            # no-op on that path. (Same module namespace in the concatenated
+            # build; injected in the isolated unit-test load.)
+            segments = _normalize_content(browser._row_segments(item, ctx))
 
         if is_cursor_line:
             # Reverse video for the cursor line — collapse segments to a
-            # plain line so the search-highlighter can overlay it.
-            line = ''.join(s[0] for s in segments)
+            # plain VISIBLE-TEXT line so the search-highlighter can overlay
+            # it. ``_collapse_visible`` drops segment ``fg`` (as ``s[0]``
+            # always has) *and* any embedded SGR in a segment's text, so a
+            # str-content row under the cursor reverses cleanly (sec 4.1).
+            line = _collapse_visible(segments)
             line, _ = _truncate_by_cells(line, width)
             _write_highlighted(
                 line, reverse=True, pad_to=width,
@@ -1604,7 +1645,9 @@ def render_list(browser, rect, *, rightmost: bool = False):
                             is_current_scope=(item.id == current_scope_id),
                         ),
                         browser._search_query)):
-                line = ''.join(s[0] for s in segments)
+                # Same VISIBLE-TEXT collapse as the cursor line: drop fg and
+                # any embedded SGR so the highlight overlay reads cleanly.
+                line = _collapse_visible(segments)
                 line, _ = _truncate_by_cells(line, width)
                 _write_highlighted(
                     line, pad_to=0,
