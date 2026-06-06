@@ -224,9 +224,14 @@ it actually wanted. With a framework log it can do the real thing.
   notice > hint priority; error renders red; pane headers don't show it.
 - **Key path:** an error notice clears on a keypress at `>=1s`, not before,
   and the key still acts.
-- **browse-claude:** `y` invokes the pager with the cursor id (headless
-  `page` is a no-op, so assert via the call / a pty UI test).
-- **browse-plan:** a mutation logs its `plan` argv; `~` pages the log.
+- **browse-claude:** `y` invokes the pager with the cursor id. NOTE:
+  `ctx.page` is *not* a no-op in headless mode — it still spawns the real
+  `bat`/`less` subprocess (only terminal suspend/resume is skipped). So test at
+  the handler level with a fake ctx that records the `page(text)` call (assert
+  the cursor id is passed, and the None-cursor no-op), rather than driving a
+  real `y` keypress through a pty (which would launch a pager into the test).
+- **browse-plan:** a mutation logs its `plan` argv; `~` pages the log (use the
+  same record-the-`page`-call approach, not a real pager).
 - Update existing tests that asserted `_message_text` / `_error_text`
   (`test_context.py`, `test_background.py`, any browse-claude render tests).
 
