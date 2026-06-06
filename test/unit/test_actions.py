@@ -2118,7 +2118,7 @@ class TestViewEditDefaults(unittest.TestCase):
         ctx = _ctx_for(b)
 
         captured = {'cmd': None, 'bytes': None, 'existed': None,
-                    'messages': [], 'errors': []}
+                    'flashes': [], 'errors': []}
 
         def stub_run_external(cmd, env=None):
             captured['cmd'] = cmd
@@ -2131,14 +2131,14 @@ class TestViewEditDefaults(unittest.TestCase):
                     captured['bytes'] = f.read()
             return 0
 
-        def stub_message(text):
-            captured['messages'].append(text)
+        def stub_flash(text, log=False):
+            captured['flashes'].append(text)
 
         def stub_error(text):
             captured['errors'].append(text)
 
         ctx.run_external = stub_run_external
-        b.message = stub_message
+        b.flash = stub_flash
         b.error = stub_error
         return b, ctx, captured
 
@@ -2246,22 +2246,22 @@ class TestViewEditDefaults(unittest.TestCase):
         finally:
             b.stop_workers()
 
-    def test_v_messages_when_no_get_preview_and_no_cache(self):
+    def test_v_flashes_when_no_get_preview_and_no_cache(self):
         # No cache + no get_preview fetcher → 'No preview available'.
         b, ctx, cap = self._setup(preview_text=None, get_preview=None)
         try:
             _actions._view_in_pager(ctx)
             self.assertIsNone(cap['cmd'])
-            self.assertEqual(cap['messages'], ['No preview available'])
+            self.assertEqual(cap['flashes'], ['No preview available'])
         finally:
             b.stop_workers()
 
-    def test_e_messages_when_no_get_preview_and_no_cache(self):
+    def test_e_flashes_when_no_get_preview_and_no_cache(self):
         b, ctx, cap = self._setup(preview_text=None, get_preview=None)
         try:
             _actions._edit_in_editor(ctx)
             self.assertIsNone(cap['cmd'])
-            self.assertEqual(cap['messages'], ['No preview available'])
+            self.assertEqual(cap['flashes'], ['No preview available'])
         finally:
             b.stop_workers()
 
@@ -2346,7 +2346,7 @@ class TestViewEditDefaults(unittest.TestCase):
         finally:
             b.stop_workers()
 
-    def test_get_preview_returns_none_messages(self):
+    def test_get_preview_returns_none_flashes(self):
         # get_preview returned None → no content to show.
         b, ctx, cap = self._setup(
             preview_text=None,
@@ -2355,7 +2355,7 @@ class TestViewEditDefaults(unittest.TestCase):
         try:
             _actions._view_in_pager(ctx)
             self.assertIsNone(cap['cmd'])
-            self.assertEqual(cap['messages'], ['No preview available'])
+            self.assertEqual(cap['flashes'], ['No preview available'])
         finally:
             b.stop_workers()
 
@@ -2403,7 +2403,7 @@ class TestViewEditDefaults(unittest.TestCase):
         try:
             _actions._view_in_pager(ctx)
             self.assertIsNone(cap['cmd'])
-            self.assertEqual(cap['messages'], ['No preview available'])
+            self.assertEqual(cap['flashes'], ['No preview available'])
         finally:
             b.stop_workers()
 
@@ -2504,6 +2504,67 @@ class TestViewEditDefaults(unittest.TestCase):
         self.assertEqual(keys['e'].requires, 'none')
         self.assertEqual(keys['v'].section, 'OTHER')
         self.assertEqual(keys['e'].section, 'OTHER')
+
+
+class TestViewLog(unittest.TestCase):
+    """``~`` pages the session message log via the framework pager.
+
+    ``_view_log`` joins the browser ``_log`` ring buffer with newlines
+    (or the literal ``"(log empty)"`` when empty) and hands it to
+    :meth:`Context.page`. Headless ``page`` would shell out to a real
+    pager, so the tests monkeypatch ``ctx.page`` to capture the text it
+    would have rendered.
+    """
+
+    def test_tilde_in_default_actions(self):
+        # ``~`` is wired into default_actions() in the OTHER section,
+        # gated 'none' (the log is viewable whatever the cursor state).
+        keys = {a.key: a for a in default_actions()}
+        self.assertIn('~', keys)
+        self.assertIs(keys['~'].handler, _actions._view_log)
+        self.assertEqual(keys['~'].requires, 'none')
+        self.assertEqual(keys['~'].section, 'OTHER')
+
+    def test_tilde_resolves_in_keymap(self):
+        b = _make_browser()
+        try:
+            km = build_keymap(b)
+            self.assertIn('~', km)
+            self.assertIs(km['~'].handler, _actions._view_log)
+        finally:
+            b.stop_workers()
+
+    def test_view_log_pages_joined_entries(self):
+        b = _make_browser()
+        ctx = _ctx_for(b)
+        paged = []
+        ctx.page = lambda text, lang='': paged.append(text)
+        try:
+            # Populate via the real log primitive + drain (posted writes
+            # land on the main thread).
+            ctx.log('first thing')
+            ctx.log('second thing')
+            b.drain_main_queue()
+            _actions._view_log(ctx)
+            self.assertEqual(len(paged), 1)
+            text = paged[0]
+            lines = text.split('\n')
+            self.assertEqual(len(lines), 2)
+            self.assertIn('first thing', lines[0])
+            self.assertIn('second thing', lines[1])
+        finally:
+            b.stop_workers()
+
+    def test_view_log_empty_pages_placeholder(self):
+        b = _make_browser()
+        ctx = _ctx_for(b)
+        paged = []
+        ctx.page = lambda text, lang='': paged.append(text)
+        try:
+            _actions._view_log(ctx)
+            self.assertEqual(paged, ['(log empty)'])
+        finally:
+            b.stop_workers()
 
 
 # --- list/preview split resize -------------------------------------------

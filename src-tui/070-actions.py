@@ -403,7 +403,7 @@ def _run_external_on_preview(ctx, *, env_var, default):
     # before reading the cache rather than opening an empty pager.
     get_preview = getattr(ctx._browser, 'get_preview', None)
     if get_preview is None:
-        ctx.message('No preview available')
+        ctx.flash('No preview available')
         return
     text = getattr(item, 'preview', None)
     if text is None:
@@ -417,7 +417,7 @@ def _run_external_on_preview(ctx, *, env_var, default):
             ctx.error(f'preview: {type(e).__name__}: {e}')
             return
         if text is None:
-            ctx.message('No preview available')
+            ctx.flash('No preview available')
             return
         # Cache so the preview pane (if shown later) skips the refetch.
         item.preview = text
@@ -433,6 +433,21 @@ def _run_external_on_preview(ctx, *, env_var, default):
             os.unlink(path)
         except OSError:
             pass
+
+
+def _view_log(ctx):
+    """``~`` — page the session's message log.
+
+    Joins the browser's ``_log`` ring buffer (oldest first, each line
+    already wall-clock prefixed) with newlines and hands it to
+    :meth:`Context.page` — reusing the paste-friendly framework pager
+    (``bat``/``batcat``/``less``) rather than building a new in-TUI
+    surface. Shows the literal ``"(log empty)"`` when nothing has been
+    logged yet. Recipes can rebind ``~`` like any other default.
+    """
+    log = ctx._browser._log
+    text = '\n'.join(log) if log else '(log empty)'
+    ctx.page(text)
 
 
 def _scope_down(ctx):
@@ -1157,6 +1172,7 @@ def default_actions() -> list:
         # 'e' to make edits actually persist (the default discards).
         Action('v',         'View preview in $PAGER',  _view_in_pager,   'none', 'OTHER'),
         Action('e',         'Edit preview in $EDITOR (changes discarded)', _edit_in_editor, 'none', 'OTHER'),
+        Action('~',         'View message log', _view_log,  'none', 'OTHER'),
         Action('q',         'Quit',           _quit,        'none', 'OTHER'),
         Action('esc',       'Quit',           _quit,        'none', 'OTHER'),
         Action('ctrl-c',    'Quit',           _quit,        'none', 'OTHER'),
