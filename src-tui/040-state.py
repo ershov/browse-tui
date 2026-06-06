@@ -301,6 +301,12 @@ class VisibleEntry:
             rather than a row-role discriminator.
           * ``'pending'`` — synthetic ``loading…`` placeholder under an
             expanded parent whose children haven't loaded yet.
+          * ``'meta'`` — a non-content row (divider, section header,
+            structural connector). Emitted for an Item with ``meta=True``.
+            Always a leaf — never recursed into, even when it carries
+            ``has_children`` and/or is in ``state.expanded``. The cursor
+            skips it by default and it is never selectable. See
+            ``docs/superpowers/specs/2026-06-05-meta-rows-design.md``.
     """
 
     item: Any
@@ -507,6 +513,13 @@ def _index_add_children(state: State, parent_id, items) -> None:
         state._parent_of_id[child.id] = parent_id
 
 
+# ``meta`` is deliberately absent: synthetics are only ever scope-root
+# stubs (the sole creation site fabricates one with ``has_children=True``
+# in ``visible_items``, always rendered kind ``'normal'``). A meta row is
+# an ordinary leaf from ``get_children`` that is never scoped into, so it
+# can never be the ``incoming`` Item matching a synthetic in
+# ``_promote_synthetics`` — there is nothing for a ``meta`` field to
+# propagate onto. See 2026-06-05-meta-rows-design.md.
 _PROMOTION_DATA_FIELDS = (
     'title', 'tag', 'tag_style', 'has_children', 'hidden', 'boundary',
     'scope_title',
@@ -1755,8 +1768,12 @@ def _emit_children(state, children, depth, out):
             # (now visible) ancestor. See
             # ``docs/superpowers/specs/2026-05-17-filter-design.md``.
             continue
-        out.append(VisibleEntry(item=child, depth=d, kind='normal'))
-        if not child.has_children or child.id not in state.expanded:
+        is_meta = getattr(child, 'meta', False)
+        kind = 'meta' if is_meta else 'normal'
+        out.append(VisibleEntry(item=child, depth=d, kind=kind))
+        # Meta rows are always leaves: never recurse into them even if
+        # ``has_children`` is set and/or the id is in ``state.expanded``.
+        if is_meta or not child.has_children or child.id not in state.expanded:
             continue
         sub = state._children.get(child.id)
         if sub is None:
@@ -1856,8 +1873,9 @@ def _search_find(state, query, start_idx, direction=1, *, show_ids='auto'):
 
     Walks the visible list starting from ``start_idx`` in ``direction``
     (1 forward, -1 backward), wrapping around. Skips non-``'normal'``
-    entries (``pending`` placeholders) so search never lands on a row
-    without a real id. The scope row at depth 0 (when scoped) is a
+    entries — ``pending`` placeholders (no real id) and ``meta`` rows
+    (excluded from search navigation by default, §5 meta-rows design) —
+    so search never lands on one. The scope row at depth 0 (when scoped) is a
     ``normal`` row and is searchable like any other. ``show_ids`` is
     plumbed through to ``_search_text`` so matches align with the
     rendered display (an id that isn't shown can't drive a match).
@@ -1882,6 +1900,47 @@ def _search_find(state, query, start_idx, direction=1, *, show_ids='auto'):
         if _search_matches(text, query):
             return idx
     return None
+
+
+def _next_landable(vis, start, direction):
+    """First landable row index from ``start`` (inclusive) in ``direction``.
+
+    A row is *landable* when its ``kind != 'meta'`` (``'normal'`` and
+    ``'pending'`` both land). ``direction`` is ``+1`` (down) or ``-1``
+    (up). Returns the index of the first landable row, or ``None`` if
+    the scan runs off the end without finding one.
+
+    Plain linear scan, no precomputed index: meta rows are expected to
+    be few and never form long runs (§3.3 of the meta-rows design), so
+    in practice this advances one or two rows.
+    """
+    i = start
+    n = len(vis)
+    while 0 <= i < n:
+        if vis[i].kind != 'meta':
+            return i
+        i += direction
+    return None
+
+
+def _resolve_landing(vis, target, before):
+    """Land on the nearest landable row from ``target`` (best-effort, §3.2).
+
+    Scans in the direction of travel — ``sign(target - before)``, tie
+    (``target == before``) → down — then the other way if that runs off
+    the end. Returns the resolved index, or ``None`` when ``vis`` has no
+    landable row at all (empty / all-meta), in which case the caller
+    parks the cursor rather than crashing.
+
+    This is the one resolver every cursor *move* routes through (arrows,
+    page, Home/End, mouse click, selection-toggle step); ``cursor_to``
+    is the deliberate exception — it honours the target exactly (§3.2).
+    """
+    direction = +1 if target >= before else -1
+    idx = _next_landable(vis, target, direction)
+    if idx is not None:
+        return idx
+    return _next_landable(vis, target, -direction)
 
 
 def mark_cursor_changed(browser) -> None:
@@ -1956,7 +2015,29 @@ def _search_jump_nearest(browser):
 #   4. The current-scope row is exempt: always treated as a match.
 
 
-def _filter_visit_subtree(state, item, active, scope_id, show_ids):
+def _meta_filter_hidden(item, meta_filter_mode):
+    """Resolve a meta row's ``_filter_hidden`` under an active filter (§5).
+
+    Called only for ``meta=True`` rows while a filter is active.
+    Returns the ``_filter_hidden`` value for the row, or ``None`` to
+    mean "no meta override — evaluate this row like a normal content
+    row" (the ``'filter'`` mode). Meta rows are leaves, so the
+    self-match alone decides; there is no descendant to scaffold.
+
+    * ``'hide'`` (default) → ``True`` (hidden while filtering).
+    * ``'show'`` → ``False`` (always visible).
+    * ``'filter'`` → ``None`` (participate like a content row).
+    """
+    if meta_filter_mode == 'hide':
+        return True
+    if meta_filter_mode == 'show':
+        return False
+    return None
+
+
+def _filter_visit_subtree(
+    state, item, active, scope_id, show_ids, meta_filter_mode='hide',
+):
     """Bottom-up DFS over a visible subtree, writing ``_filter_hidden``.
 
     Mirrors the per-item evaluation used by ``_recompute_filter_hidden``:
@@ -1971,12 +2052,26 @@ def _filter_visit_subtree(state, item, active, scope_id, show_ids):
     call. This is shared between the full ``_recompute_filter_hidden``
     walk and the per-op dispatch's "force-evaluate a new item's
     subtree" hook (#499).
+
+    ``meta_filter_mode`` (§5 meta-rows design) governs ``meta=True``
+    rows: ``'hide'`` (default) hides them under an active filter,
+    ``'show'`` keeps them visible, ``'filter'`` evaluates them like a
+    content row.
     """
     # Rule 2: recipe-hidden rows aren't part of the visible tree. No
     # flag write; the renderer would skip them regardless and they
     # can't scaffold an ancestor.
     if getattr(item, 'hidden', False):
         return False
+
+    # Meta rows are leaves (no recursion) whose visibility under an
+    # active filter is governed by ``meta_filter_mode``. ``'filter'``
+    # falls through to the normal content-row evaluation below.
+    if getattr(item, 'meta', False):
+        hidden = _meta_filter_hidden(item, meta_filter_mode)
+        if hidden is not None:
+            item._filter_hidden = hidden
+            return not hidden
 
     # Descend only into expanded subtrees (Rule 1). Collapsed children
     # contribute nothing.
@@ -1985,6 +2080,7 @@ def _filter_visit_subtree(state, item, active, scope_id, show_ids):
         for child in state._children.get(item.id, ()):
             if _filter_visit_subtree(
                 state, child, active, scope_id, show_ids,
+                meta_filter_mode,
             ):
                 any_visible_desc_passes = True
 
@@ -2002,7 +2098,9 @@ def _filter_visit_subtree(state, item, active, scope_id, show_ids):
     return not item._filter_hidden
 
 
-def _recompute_filter_hidden(state, filters, *, show_ids='auto') -> None:
+def _recompute_filter_hidden(
+    state, filters, *, show_ids='auto', meta_filter_mode='hide',
+) -> None:
     """Re-evaluate filter visibility across the visible tree.
 
     ``filters`` is an iterable of filter strings (typically
@@ -2013,6 +2111,10 @@ def _recompute_filter_hidden(state, filters, *, show_ids='auto') -> None:
     ``show_ids`` is plumbed through to ``_search_text`` so the filter
     matches against the same haystack the user would search by ``/`` —
     a row whose id wouldn't render can't drive a filter match.
+
+    ``meta_filter_mode`` (§5 meta-rows design) is plumbed through to
+    ``_filter_visit_subtree`` to govern ``meta=True`` rows under an
+    active filter.
 
     No-op when no non-empty filter is present: existing
     ``_filter_hidden`` flags become stale-but-inert because the
@@ -2043,11 +2145,13 @@ def _recompute_filter_hidden(state, filters, *, show_ids='auto') -> None:
         if scope_item is not None:
             _filter_visit_subtree(
                 state, scope_item, active, scope_id, show_ids,
+                meta_filter_mode,
             )
     else:
         for child in state._children.get(state.root_id, ()):
             _filter_visit_subtree(
                 state, child, active, scope_id, show_ids,
+                meta_filter_mode,
             )
 
 
@@ -2080,7 +2184,9 @@ def _recompute_filter_hidden(state, filters, *, show_ids='auto') -> None:
 # A missing entry means "no parent known" -> we've reached the top.
 
 
-def _propagate_filter_status_up(state, item, filters, *, show_ids='auto'):
+def _propagate_filter_status_up(
+    state, item, filters, *, show_ids='auto', meta_filter_mode='hide',
+):
     """Re-evaluate one item's ``_filter_hidden`` and walk up ancestors.
 
     For each item visited the helper recomputes ``_filter_hidden`` from
@@ -2098,6 +2204,9 @@ def _propagate_filter_status_up(state, item, filters, *, show_ids='auto'):
     ``show_ids`` is plumbed through to ``_search_text`` so propagation
     sees the same haystack as the full walk.
 
+    ``meta_filter_mode`` (§5 meta-rows design) governs ``meta=True``
+    rows visited during the walk, matching ``_filter_visit_subtree``.
+
     No-op when no non-empty filter is present. Recipe-``hidden=True``
     items count as "not visible, doesn't scaffold" — propagation still
     continues through them upward (the parent gets re-evaluated against
@@ -2112,27 +2221,37 @@ def _propagate_filter_status_up(state, item, filters, *, show_ids='auto'):
     cur = item
     while cur is not None:
         if not getattr(cur, 'hidden', False):
-            # Recompute cur's flag from self-match + visible children's
-            # current flags. Recipe-hidden cur is skipped: it can't
-            # scaffold an ancestor and the renderer drops it anyway;
-            # we still walk upward so the parent re-evaluates against
-            # its other (non-hidden) children.
-            any_visible_desc_passes = False
-            if cur.has_children and cur.id in state.expanded:
-                for child in state._children.get(cur.id, ()):
-                    if getattr(child, 'hidden', False):
-                        continue
-                    if not child._filter_hidden:
-                        any_visible_desc_passes = True
-                        break
-            is_scope = (cur.id == scope_id)
-            text = _search_text(
-                cur, show_ids=show_ids, is_current_scope=is_scope,
-            )
-            self_passes = is_scope or all(
-                _search_matches(text, q) for q in active
-            )
-            new_hidden = not (self_passes or any_visible_desc_passes)
+            # Meta rows are leaves; their flag under an active filter
+            # is governed by ``meta_filter_mode`` (``'filter'`` ->
+            # ``None`` falls through to the normal content-row eval).
+            meta_hidden = None
+            if getattr(cur, 'meta', False):
+                meta_hidden = _meta_filter_hidden(cur, meta_filter_mode)
+            if meta_hidden is not None:
+                new_hidden = meta_hidden
+            else:
+                # Recompute cur's flag from self-match + visible
+                # children's current flags. Recipe-hidden cur is
+                # skipped above; we still walk upward so the parent
+                # re-evaluates against its other (non-hidden) children.
+                any_visible_desc_passes = False
+                if cur.has_children and cur.id in state.expanded:
+                    for child in state._children.get(cur.id, ()):
+                        if getattr(child, 'hidden', False):
+                            continue
+                        if not child._filter_hidden:
+                            any_visible_desc_passes = True
+                            break
+                is_scope = (cur.id == scope_id)
+                text = _search_text(
+                    cur, show_ids=show_ids, is_current_scope=is_scope,
+                )
+                self_passes = is_scope or all(
+                    _search_matches(text, q) for q in active
+                )
+                new_hidden = not (
+                    self_passes or any_visible_desc_passes
+                )
 
             if cur._filter_hidden == new_hidden:
                 # No change at this level: ancestors above us see the
@@ -2285,7 +2404,9 @@ def _is_parent_visible_expanded(state, parent_id):
     return parent_id in state.expanded
 
 
-def _dispatch_filter_propagation(state, dispatch_info, filters, show_ids):
+def _dispatch_filter_propagation(
+    state, dispatch_info, filters, show_ids, meta_filter_mode='hide',
+):
     """Apply per-op filter propagation for the captured dispatch info.
 
     Each entry comes from ``_filter_dispatch_pre_scan``. The visible-
@@ -2317,6 +2438,7 @@ def _dispatch_filter_propagation(state, dispatch_info, filters, show_ids):
         walked.add(target_id)
         _propagate_filter_status_up(
             state, item, filters, show_ids=show_ids,
+            meta_filter_mode=meta_filter_mode,
         )
 
     for entry in dispatch_info:
@@ -2361,6 +2483,7 @@ def _dispatch_filter_propagation(state, dispatch_info, filters, show_ids):
                 if new_item is not None:
                     _filter_visit_subtree(
                         state, new_item, active, scope_id, show_ids,
+                        meta_filter_mode,
                     )
                 _walk_from_id(new_parent_id)
             else:
@@ -2591,11 +2714,15 @@ def _extend_or_drop_preview_render(item, chunk, ansi_on) -> None:
         (eager invalidation should have dropped, defensive only),
       * width is non-positive (degenerate cache state).
 
-    Sanitisation: the chunk goes through ``_sanitize_preview`` (same
-    per-char ``str.translate`` pass the renderer uses) so the wrapped
-    output is byte-identical to a fresh full re-wrap. The sanitiser
-    is per-character with no cross-line state, so applying it to the
-    chunk alone matches applying it to the full preview text.
+    Sanitisation: the affected suffix goes through the SAME two-step pass
+    ``render_preview`` runs — ``_sanitize_preview`` (per-char control-char
+    ``str.translate``) then, when ``ansi_on``, the shared ``_sanitize_ansi``
+    (keep SGR, drop other CSI / bare ESC) — so the wrapped output is
+    byte-identical to a fresh full re-wrap. Both sanitisers are stateless
+    across line boundaries (``str.translate`` is per-char; ``_sanitize_ansi``
+    is per-escape-sequence and no escape spans a ``\\n``), and the suffix
+    starts right after a ``\\n`` (so it never begins mid-sequence) — hence
+    applying them to the suffix matches applying them to the full text.
     """
     cached = item.preview_render
     if cached is None:
@@ -2618,13 +2745,18 @@ def _extend_or_drop_preview_render(item, chunk, ansi_on) -> None:
     #
     # ``item.preview`` stores raw text (sanitisation happens at render
     # time in ``render_preview``). Re-sanitise the affected suffix here
-    # so the re-wrap path produces byte-identical output to a full
-    # re-wrap. ``_sanitize_preview`` is per-char via ``str.translate``,
-    # so applying it to a slice matches applying it to the full text.
+    # with the SAME two-step pass ``render_preview`` runs so the re-wrap
+    # path produces byte-identical output to a full re-wrap: the per-char
+    # ``_sanitize_preview`` then, in ANSI mode, the shared ``_sanitize_ansi``
+    # (strips a bare ESC the tokeniser would otherwise emit verbatim).
+    # Both are stateless across line boundaries and the suffix starts after
+    # a ``\n``, so slice-then-sanitise == sanitise-then-slice.
     preview = item.preview if item.preview is not None else ''
     raw_tail_text = _sanitize_preview(
         preview[cached.raw_tail_offset:], ansi_on=ansi_on,
     )
+    if ansi_on:
+        raw_tail_text = _sanitize_ansi(raw_tail_text)
 
     # Re-wrap the affected suffix. Note: this re-wraps the previous
     # partial last line together with the new content — that's required
@@ -2696,6 +2828,31 @@ def _segments_cells(segments):
     return sum(cell_width(text) for text, _fg, _bold in segments)
 
 
+def _normalize_content(content):
+    """Coerce a row-content hook result to a segment list (design sec 4.1).
+
+    ``format_row_content`` / ``format_row`` may return either a list of
+    ``(text, fg, bold)`` segments (the structured default) **or** a single
+    ``str`` that may carry ANSI/SGR (free-form / passthrough content) — for
+    *any* row, normal or meta. A ``str`` becomes one segment
+    ``(text, None, False)`` whose text may contain embedded escapes; the
+    rest of the pipeline then sees a uniform segment list. ``cell_width`` is
+    ANSI-aware (strips escapes when measuring), so width math on a segment
+    whose text carries SGR stays exact.
+
+    The ``str`` is **sanitised on receipt** (design sec 4.2 #1) via the
+    shared :func:`_sanitize_ansi` — the same escape-sanitiser the preview
+    pane uses — so only SGR colour sequences survive; all other CSI (cursor
+    moves, erases) and bare ESC bytes are stripped before the text reaches
+    width math or the terminal. A segment *list* is passed through untouched
+    (segments carry colour in ``fg``, never embedded escapes — sanitising
+    would be both wrong and wasteful).
+    """
+    if isinstance(content, list):
+        return content
+    return [(_sanitize_ansi(content), None, False)]
+
+
 def default_row_chrome(item, ctx):
     """The framework's default row *chrome* segments for a normal row.
 
@@ -2706,17 +2863,29 @@ def default_row_chrome(item, ctx):
     if ``item.has_children`` else ``'  '``). Chrome stays framework-owned
     unless a recipe overrides ``format_row_chrome``, so overriding only
     ``format_row_content`` keeps the tree intact.
+
+    A meta row (``ctx.kind == 'meta'``) is never selectable and is always a
+    leaf, so its chrome reduces to *aligned indentation*: the selection
+    marker and expander are forced blank (even if a recipe left
+    ``has_children=True``), keeping the depth indent so meta content lines
+    up under normal rows' content (design sec 4).
     """
     rel_depth = ctx.depth
     if rel_depth < 0:
         rel_depth = 0
     indent = '  ' * rel_depth
 
-    sel_marker = '* ' if ctx.selected else '  '
-    if item.has_children:
-        expand_marker = '▼ ' if ctx.expanded else '▶ '   # ▼ / ▶
-    else:
+    if ctx.kind == 'meta':
+        # Meta rows never select and never expand — blank both markers,
+        # keep only the depth indent so content aligns under normal rows.
+        sel_marker = '  '
         expand_marker = '  '
+    else:
+        sel_marker = '* ' if ctx.selected else '  '
+        if item.has_children:
+            expand_marker = '▼ ' if ctx.expanded else '▶ '   # ▼ / ▶
+        else:
+            expand_marker = '  '
 
     return [
         (sel_marker, None, False),
@@ -2740,7 +2909,16 @@ def default_row_content(item, ctx):
     expand markers stay non-bold (chrome, not content); the tag segment
     keeps its ``tag_style``-driven bold so explicit tag styles still
     control their own weight.
+
+    A meta row (``ctx.kind == 'meta'``) is a divider, not content: its
+    default content is just the title segment — no id segment, no tag /
+    chips (those are content decorations that don't belong on a divider).
+    Recipes override ``format_row_content`` (branching on ``ctx.kind``) for
+    richer meta content (design sec 4).
     """
+    if ctx.kind == 'meta':
+        return [(item.title, None, False)]
+
     is_current_scope = ctx.is_current_scope
     show_ids = ctx.browser.show_ids
 
@@ -2847,6 +3025,31 @@ class BrowserConfig:
     on_filter_change: Optional[Callable] = None
     on_resize: Optional[Callable] = None
     on_quit: Optional[Callable] = None
+    # Behaviour when the visible list has no *landable* row — empty, or
+    # every row is a ``meta`` divider (§3.4 of the meta-rows design).
+    #   * ``'wait'`` (default) — park the cursor; the ``0 <= cursor <
+    #     len(vis)`` guards already make every row-action no-op, so the
+    #     user can search / filter / quit out of it (fzf-style).
+    #   * ``'exit'`` — quit with the cancel exit code (1) the moment no
+    #     landable row remains.
+    on_empty: str = 'wait'
+    # Meta-row behaviour under search and user filter (§5 of the
+    # meta-rows design). Both default to the conservative "meta rows
+    # stay out of the way": search highlight off, hidden under a filter.
+    #   * ``meta_search_highlight`` — when True, a meta row whose text
+    #     matches the active ``/`` query may receive highlight spans;
+    #     when False (default) meta rows never get a search highlight.
+    #     Orthogonal to search *navigation*, which always skips meta.
+    #   * ``meta_filter_mode`` governs meta rows while a ``&`` filter is
+    #     active (no effect when no filter is set):
+    #       - ``'hide'`` (default) — all meta rows hide (git-like).
+    #       - ``'show'`` — meta rows stay visible regardless of filter
+    #         (header-like; a divider survives even if its section
+    #         filters away).
+    #       - ``'filter'`` — meta rows participate in filtering like
+    #         content rows; their own text is matched, non-matches hide.
+    meta_search_highlight: bool = False
+    meta_filter_mode: str = 'hide'
     _headless: bool = False
 
 
@@ -3064,6 +3267,16 @@ class Browser:
                 "show_ids must be one of 'always', 'auto', 'never'; "
                 f"got {config.show_ids!r}"
             )
+        if config.on_empty not in ('wait', 'exit'):
+            raise ValueError(
+                "on_empty must be one of 'wait', 'exit'; "
+                f"got {config.on_empty!r}"
+            )
+        if config.meta_filter_mode not in ('hide', 'show', 'filter'):
+            raise ValueError(
+                "meta_filter_mode must be one of 'hide', 'show', "
+                f"'filter'; got {config.meta_filter_mode!r}"
+            )
         # --- user-supplied data callbacks -------------------------------
         # Default get_children to "no children" so a Browser constructed
         # with no kwargs still works (tests, smoke checks). get_preview
@@ -3166,6 +3379,15 @@ class Browser:
         self._on_filter_change = config.on_filter_change
         self._on_resize = config.on_resize
         self._on_quit = config.on_quit
+        # No-landable-row policy (§3.4). Read once here; consulted by
+        # ``_clamp_cursor_landable`` whenever the visible list ends up
+        # with no landable row (empty / all-meta).
+        self._on_empty = config.on_empty
+        # Meta-row search/filter behaviour (§5 meta-rows design). Read by
+        # the render highlight gate (``meta_search_highlight``) and the
+        # filter machinery (``meta_filter_mode``). Validated above.
+        self.meta_search_highlight = config.meta_search_highlight
+        self.meta_filter_mode = config.meta_filter_mode
         # Worker-slot registry for ``run_in_slot``. Each entry is the
         # currently-active CancellationToken for a named slot;
         # superseded tokens are removed lazily by the worker on exit.
@@ -3518,10 +3740,15 @@ class Browser:
         A whole-row ``format_row`` override bypasses this method, so under
         such an override ``ctx.content_width`` stays equal to
         ``ctx.list_width`` (the chrome split is unknown).
+
+        ``format_row_content`` may return a ``str`` (ANSI allowed) instead
+        of a segment list (design sec 4.1); :func:`_normalize_content`
+        coerces it to a single segment so the ``chrome + content``
+        concatenation always joins two lists. Chrome is always segments.
         """
         chrome = self.format_row_chrome(item, ctx)
         ctx._set_content_width(_segments_cells(chrome))
-        return chrome + self.format_row_content(item, ctx)
+        return chrome + _normalize_content(self.format_row_content(item, ctx))
 
     # ---- action registration -------------------------------------------
 
@@ -3754,34 +3981,33 @@ class Browser:
         return pending
 
     def nav_home(self) -> None:
-        """(thread-safe) Move cursor to row 0 and pin it there.
+        """(thread-safe) Move cursor to the first landable row and pin it.
 
-        Posts a callable that sets ``state.cursor = 0`` and
-        ``_cursor_anchor = [PIN_FIRST]``. The cursor follows new
-        arrivals at the top until any non-home/non-end navigation
-        clears the pin. Returns ``None`` — there is nothing to await
-        (no fetches required).
+        Posts a callable that sets ``_cursor_anchor = [PIN_FIRST]`` and
+        applies it — ``_apply_cursor_anchor`` lands the cursor on the
+        first *landable* row, skipping a leading ``meta`` divider (§3.4).
+        The cursor follows new arrivals at the top until any
+        non-home/non-end navigation clears the pin. Returns ``None`` —
+        there is nothing to await (no fetches required).
         """
         def _do():
-            vis = visible_items(self._state)
-            self._state.cursor = 0 if vis else 0
             self._cursor_anchor = [PIN_FIRST]
-            mark_cursor_changed(self)
+            self._apply_cursor_anchor()
             self._needs_redraw.add('list')
         self.post(_do)
 
     def nav_end(self) -> None:
-        """(thread-safe) Move cursor to the last visible row and pin it there.
+        """(thread-safe) Move cursor to the last landable row and pin it.
 
-        Symmetric to ``nav_home``. The cursor follows new arrivals at
-        the bottom until any non-home/non-end navigation clears the
-        pin. Returns ``None``.
+        Symmetric to ``nav_home`` — sets ``PIN_LAST`` and applies it, so
+        the cursor lands on the last *landable* row, skipping a trailing
+        ``meta`` divider (§3.4). The cursor follows new arrivals at the
+        bottom until any non-home/non-end navigation clears the pin.
+        Returns ``None``.
         """
         def _do():
-            vis = visible_items(self._state)
-            self._state.cursor = max(0, len(vis) - 1)
             self._cursor_anchor = [PIN_LAST]
-            mark_cursor_changed(self)
+            self._apply_cursor_anchor()
             self._needs_redraw.add('list')
         self.post(_do)
 
@@ -3824,6 +4050,7 @@ class Browser:
         pre_cursor = self._state.cursor
         _recompute_filter_hidden(
             self._state, self._filters, show_ids=self.show_ids,
+            meta_filter_mode=self.meta_filter_mode,
         )
         mark_visible_dirty(self._state)
         cur_anchor = self._cursor_anchor
@@ -4093,6 +4320,7 @@ class Browser:
                 _dispatch_filter_propagation(
                     self._state, filter_dispatch,
                     self._filters, self.show_ids,
+                    self.meta_filter_mode,
                 )
 
             # Positional pin owns the cursor position — skip
@@ -4124,12 +4352,11 @@ class Browser:
             # ``apply_children_results``; without it, an ``update_data``
             # that shrinks the list past the cursor would leave the
             # cursor pointing past the end and the renderer would
-            # silently skip the row.
-            vis = visible_items(self._state)
-            if vis and self._state.cursor >= len(vis):
-                self._state.cursor = len(vis) - 1
-            elif not vis:
-                self._state.cursor = 0
+            # silently skip the row. Routes through
+            # ``_clamp_cursor_landable`` so a past-end clamp lands on a
+            # landable row (skips a trailing meta divider) and an
+            # all-meta / empty list honours ``on_empty`` (§3.4).
+            self._clamp_cursor_landable(self._state.cursor)
             # Flag list/children for redraw so background pushes (e.g.
             # from a watcher or a websocket bridge) become visible
             # without waiting for the user to press a key. ``apply_ops``
@@ -4573,6 +4800,7 @@ class Browser:
             if self._filters:
                 _recompute_filter_hidden(
                     self._state, self._filters, show_ids=self.show_ids,
+                    meta_filter_mode=self.meta_filter_mode,
                 )
             self._needs_redraw.add('all')
             mark_cursor_changed(self)
@@ -4615,6 +4843,7 @@ class Browser:
             if self._filters:
                 _recompute_filter_hidden(
                     self._state, self._filters, show_ids=self.show_ids,
+                    meta_filter_mode=self.meta_filter_mode,
                 )
             placed = False
             for i, entry in enumerate(visible_items(state)):
@@ -5237,6 +5466,7 @@ class Browser:
             if self._filters:
                 _recompute_filter_hidden(
             self._state, self._filters, show_ids=self.show_ids,
+            meta_filter_mode=self.meta_filter_mode,
         )
             # Re-snap the cursor onto its anchored id (or closest
             # fallback) before the index clamp runs, so the clamp only
@@ -5253,12 +5483,11 @@ class Browser:
             # this, a watcher-driven refresh that removes items can
             # leave state.cursor past len(visible) — the renderer
             # skips the row (no crash) but the cursor effectively
-            # disappears until the user presses j/k.
-            vis = visible_items(self._state)
-            if vis and self._state.cursor >= len(vis):
-                self._state.cursor = len(vis) - 1
-            elif not vis:
-                self._state.cursor = 0
+            # disappears until the user presses j/k. Routes through
+            # ``_clamp_cursor_landable`` so a past-end clamp lands on a
+            # landable row and an all-meta / empty list honours
+            # ``on_empty`` (§3.4).
+            self._clamp_cursor_landable(self._state.cursor)
             self._needs_redraw.add('list')
             # The cache may have just filled the cursor item's
             # children — flag the grid pane for redraw too. Render-time
@@ -5579,6 +5808,7 @@ class Browser:
                         _filter_visit_subtree(
                             self._state, child,
                             active, scope_id, self.show_ids,
+                            self.meta_filter_mode,
                         )
             # Children already cached — expanding inserts those rows
             # into the visible list immediately. Re-snap the cursor on
@@ -5965,12 +6195,11 @@ class Browser:
         # watcher-driven refresh that removes items, or empty
         # delivery). Without this, the renderer skips the row (no
         # crash) but the cursor effectively disappears until the user
-        # presses j/k. Regression guard from #125.
-        vis = visible_items(state)
-        if vis and state.cursor >= len(vis):
-            state.cursor = len(vis) - 1
-        elif not vis:
-            state.cursor = 0
+        # presses j/k. Regression guard from #125. Routes through
+        # ``_clamp_cursor_landable`` so a past-end clamp lands on a
+        # landable row and an all-meta / empty list honours
+        # ``on_empty`` (§3.4).
+        self._clamp_cursor_landable(state.cursor)
         self._needs_redraw.add('list')
         # Cache may have just filled the cursor item's children — flag
         # the grid pane for redraw too. Render-time checks gate the
@@ -7013,9 +7242,11 @@ class Browser:
         synthetic-row state doesn't discard a still-valid anchor.
 
         Positional pin survives this call iff the cursor is still at
-        the pinned row (row 0 for ``PIN_FIRST``, last row for
-        ``PIN_LAST``). Any other cursor position drops the pin and
-        captures a fresh id-based snapshot. See
+        the pinned row — the first *landable* row for ``PIN_FIRST``, the
+        last landable row for ``PIN_LAST`` (matching where
+        ``_apply_cursor_anchor`` lands the pin, which skips a leading /
+        trailing meta divider, §3.4). Any other cursor position drops
+        the pin and captures a fresh id-based snapshot. See
         ``docs/superpowers/specs/2026-05-17-cursor-pin-design.md``.
         """
         cur = self._cursor_anchor
@@ -7023,8 +7254,14 @@ class Browser:
             pin = cur[0]
             vis = visible_items(self._state)
             if vis:
-                target = 0 if pin is PIN_FIRST else len(vis) - 1
-                if self._state.cursor == target:
+                if pin is PIN_FIRST:
+                    target = _next_landable(vis, 0, +1)
+                else:
+                    target = _next_landable(vis, len(vis) - 1, -1)
+                # ``target is None`` (all-meta) → cursor can't be on the
+                # pinned row; fall through and re-snapshot. Otherwise the
+                # pin survives only if the cursor is parked on it.
+                if target is not None and self._state.cursor == target:
                     return
             else:
                 # Empty list — keep the pin parked.
@@ -7087,10 +7324,29 @@ class Browser:
             new_idx = 0
         if not post_vis:
             self._state.cursor = 0
-        elif self._state.cursor != new_idx:
-            self._state.cursor = new_idx
+            self._handle_no_landable()
+            self._reanchor_cursor()
+            return True
+        # The surviving row we picked (or the row-0 fallback) may itself
+        # be a meta divider — route the replacement index through
+        # ``_resolve_landing`` so it lands on a landable row (§3.4).
+        # ``before = pre_cursor``: displacement walks *up* to the nearest
+        # surviving row, so the resolver continues upward off a meta.
+        # NOTE: ``new_idx`` is a *post*-mutation index while ``pre_cursor``
+        # is *pre*-mutation — the two mix coordinate spaces, but it's sound
+        # for the hide/remove callers here because removal only shrinks the
+        # list, so a surviving earlier row's post-index is always
+        # ``<= pre_cursor`` (the resolver scans up, as intended). A future
+        # caller that *grows* the list around the cursor would need a
+        # before-index in post-mutation space instead.
+        landed = _resolve_landing(post_vis, new_idx, pre_cursor)
+        if landed is None:
+            # Every surviving row is meta — park and honour on_empty.
+            self._handle_no_landable()
+        elif self._state.cursor != landed:
+            self._state.cursor = landed
             mark_cursor_changed(self)
-            self._snap_list_scroll_to_row(new_idx)
+            self._snap_list_scroll_to_row(landed)
         self._reanchor_cursor()
         return True
 
@@ -7118,12 +7374,23 @@ class Browser:
         vis = visible_items(self._state)
         # Positional pin (``PIN_FIRST`` / ``PIN_LAST``) — short-circuit
         # before the id-based walk. Empty list is a no-op; the pin
-        # stays parked until rows arrive.
+        # stays parked until rows arrive. The pin resolves to the first
+        # / last *landable* row (§3.4): PIN_FIRST scans down from row 0,
+        # PIN_LAST scans up from the end, so a leading / trailing meta
+        # divider is skipped.
         first = self._cursor_anchor[0]
         if isinstance(first, _AnchorSentinel):
             if not vis:
                 return False
-            new_i = 0 if first is PIN_FIRST else len(vis) - 1
+            if first is PIN_FIRST:
+                new_i = _next_landable(vis, 0, +1)
+            else:
+                new_i = _next_landable(vis, len(vis) - 1, -1)
+            if new_i is None:
+                # All-meta list — nothing landable to pin onto. Leave
+                # the cursor parked and honour on_empty.
+                self._handle_no_landable()
+                return True
             if self._state.cursor != new_i:
                 self._state.cursor = new_i
                 mark_cursor_changed(self)
@@ -7139,6 +7406,23 @@ class Browser:
         for tier_idx, target_id in enumerate(self._cursor_anchor):
             if target_id in id_to_idx:
                 new_i = id_to_idx[target_id]
+                # Tier 0 (primary) is the exact id the cursor was last on
+                # — honour it verbatim, even if it's a meta row. This is
+                # what keeps an explicit ``cursor_to(meta_id)`` (which
+                # sets ``_cursor_anchor = [meta_id]``) landing exactly,
+                # per §3.1's "landing tolerated" rule. A tier ≥ 1 hit is
+                # a *fallback* (primary gone; we fell onto a neighbour /
+                # ancestor) — route it through ``_resolve_landing`` so a
+                # fallback onto a meta divider skips to the nearest
+                # landable row in the direction of the move (§3.4).
+                if tier_idx > 0:
+                    landed = _resolve_landing(vis, new_i, self._state.cursor)
+                    if landed is None:
+                        # Fallback id exists but no landable row anywhere
+                        # (all-meta) — park and honour on_empty.
+                        self._handle_no_landable()
+                        return True
+                    new_i = landed
                 if self._state.cursor != new_i:
                     self._state.cursor = new_i
                     mark_cursor_changed(self)
@@ -7149,6 +7433,95 @@ class Browser:
                         self._cursor_anchor = snap
                 return True
         return False
+
+    def _handle_no_landable(self) -> None:
+        """React to a visible list with no landable row (§3.4).
+
+        Called from the clamp / anchor / displacement paths once they've
+        determined the resolver found nothing to land on (empty list, or
+        every row is a ``meta`` divider). Under the default
+        ``on_empty='wait'`` this is a no-op — the cursor stays parked and
+        the ``0 <= cursor < len(vis)`` guards make every row-action a
+        no-op, exactly as today. Under ``on_empty='exit'`` it quits with
+        the cancel exit code (1), fzf-style.
+
+        Runs on the main thread (every caller is a main-thread mutation
+        hook), so it calls ``_do_quit`` directly rather than posting.
+        """
+        if self._on_empty == 'exit':
+            self._do_quit(1, '')
+
+    def _clamp_cursor_landable(self, before) -> bool:
+        """Clamp the cursor onto a landable row; honour on_empty.
+
+        The cursor-*position* invariant counterpart to the cursor-*move*
+        resolver in ``070-actions``. Called as the backstop at the tail of
+        the clamp / anchor / displacement paths, after
+        ``_apply_cursor_anchor`` has already had its say. Corrects three
+        cases (``before`` is the pre-clamp cursor index, for direction):
+
+          * **Past-end cursor** (``cursor >= len(vis)``) — the anchor walk
+            found no home, so pull the cursor back to the last *landable*
+            row (skips a trailing meta divider). ``before >= len(vis) >
+            target``, so ``_resolve_landing`` scans *up*.
+          * **In-range, parked on a meta row by a displaced re-snap** — the
+            anchored id is gone and the stale cursor index happens to fall
+            on a meta divider. Snap to the nearest landable row. This is
+            distinguished from an explicit ``cursor_to(meta_id)`` (§3.1,
+            honoured exactly) by checking whether the cursor row id still
+            matches the anchor's primary id: a genuine anchor lands tier-0
+            on its own id (and refreshes the snapshot so primary == cursor
+            id), so a *mismatch* means the cursor is a stale leftover.
+          * **No landable row at all** (empty / all-meta) — park the cursor
+            (row 0 when empty; left in place in-range) and consult
+            ``on_empty`` via ``_handle_no_landable``.
+
+        An in-range cursor genuinely anchored on its row (including an
+        explicit meta target) is left untouched. Fires
+        ``mark_cursor_changed`` only when the index actually moves. Returns
+        ``True`` when the cursor rests on a row (landable, or an explicit
+        meta target); ``False`` when the list has no landable row.
+        """
+        vis = visible_items(self._state)
+        if not vis:
+            self._state.cursor = 0
+            self._handle_no_landable()
+            return False
+        if self._state.cursor >= len(vis):
+            # Past-end: pull back to the last landable row.
+            idx = _resolve_landing(vis, len(vis) - 1, before)
+            if idx is None:
+                # All-meta — clamp into range (park) and honour on_empty.
+                self._state.cursor = len(vis) - 1
+                self._handle_no_landable()
+                return False
+            if self._state.cursor != idx:
+                self._state.cursor = idx
+                mark_cursor_changed(self)
+            return True
+        # In range, but on a meta row. Either an explicit cursor_to target
+        # (the anchor's primary id == this row's id — honour it), a stale
+        # displaced landing (anchor primary gone — snap to landable), or an
+        # all-meta list (nothing landable — honour on_empty).
+        if vis[self._state.cursor].kind == 'meta':
+            anchored_here = (
+                self._cursor_anchor
+                and not isinstance(self._cursor_anchor[0], _AnchorSentinel)
+                and self._cursor_anchor[0]
+                == vis[self._state.cursor].item.id
+            )
+            if anchored_here:
+                # Explicit meta target — landing tolerated (§3.1).
+                return True
+            idx = _resolve_landing(vis, self._state.cursor, before)
+            if idx is None:
+                # All-meta — nothing landable anywhere; park + on_empty.
+                self._handle_no_landable()
+                return False
+            if self._state.cursor != idx:
+                self._state.cursor = idx
+                mark_cursor_changed(self)
+        return True
 
     def _apply_expand_goal(self) -> None:
         """Adjust ``_list_scroll`` to fit the parked expansion goal.

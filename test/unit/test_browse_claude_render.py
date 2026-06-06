@@ -4911,12 +4911,64 @@ class TestOrphanSubagents(unittest.TestCase):
             ])
             self.r._TREE_CACHE.clear()
             roots = self.r._list_tree_roots(sess)
-            # First row is the orphan subagent; A1 (wired) is not at
-            # the top — it renders inline under its dispatching turn.
-            self.assertEqual(getattr(roots[0], 'kind', None), 'subagent')
-            self.assertEqual(roots[0].agent_id, 'A2')
+            # ``--- Subagents:`` divider, then the orphan subagent; A1
+            # (wired) is not at the top — it renders inline under its
+            # dispatching turn.
+            self.assertTrue(getattr(roots[0], 'meta', False))
+            self.assertEqual(roots[0].id, f'{sess}#sep:subagents')
+            self.assertEqual(roots[0].title, '--- Subagents:')
+            self.assertEqual(getattr(roots[1], 'kind', None), 'subagent')
+            self.assertEqual(roots[1].agent_id, 'A2')
             kinds = [getattr(r, 'kind', None) for r in roots]
-            self.assertNotIn('subagent', kinds[1:])
+            self.assertNotIn('subagent', kinds[2:])
+
+    def test_tree_roots_brackets_orphan_block_with_meta_dividers(self):
+        # A session WITH orphaned subagents brackets the orphan block:
+        # ``--- Subagents:`` (meta) → orphan rows → ``--- Session:``
+        # (meta) → the turn/span umbrellas. Both dividers are meta rows
+        # with session-namespaced, stable ids.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._build_fixture(tmp, [
+                ('A1', 'general-purpose', 'wired one',   True),
+                ('A2', 'general-purpose', 'orphan one',  False),
+                ('A3', 'general-purpose', 'orphan two',  False),
+            ])
+            self.r._TREE_CACHE.clear()
+            roots = self.r._list_tree_roots(sess)
+            # [subagents-sep, A2, A3, session-sep, <umbrellas...>].
+            self.assertTrue(getattr(roots[0], 'meta', False))
+            self.assertEqual(roots[0].id, f'{sess}#sep:subagents')
+            self.assertEqual(roots[0].title, '--- Subagents:')
+            self.assertEqual(getattr(roots[1], 'kind', None), 'subagent')
+            self.assertEqual(getattr(roots[2], 'kind', None), 'subagent')
+            self.assertEqual({roots[1].agent_id, roots[2].agent_id},
+                             {'A2', 'A3'})
+            self.assertTrue(getattr(roots[3], 'meta', False))
+            self.assertEqual(roots[3].id, f'{sess}#sep:session')
+            self.assertEqual(roots[3].title, '--- Session:')
+            # Everything after the session divider is a turn/span
+            # umbrella — never a subagent or a meta divider.
+            tail_kinds = [getattr(r, 'kind', None) for r in roots[4:]]
+            self.assertNotIn('subagent', tail_kinds)
+            self.assertTrue(roots[4:])  # at least one umbrella present
+            self.assertFalse(any(getattr(r, 'meta', False)
+                                 for r in roots[4:]))
+
+    def test_tree_roots_no_dividers_without_orphans(self):
+        # A session whose subagents are all wired (or has none) renders
+        # exactly as before — no meta dividers at all.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._build_fixture(tmp, [
+                ('A1', 'general-purpose', 'wired one',  True),
+                ('A2', 'general-purpose', 'wired two',  True),
+            ])
+            self.r._TREE_CACHE.clear()
+            roots = self.r._list_tree_roots(sess)
+            self.assertFalse(any(getattr(r, 'meta', False) for r in roots))
+            self.assertFalse(any(getattr(r, 'kind', None) == 'subagent'
+                                 for r in roots))
 
 
 class TestRowBgForKind(unittest.TestCase):

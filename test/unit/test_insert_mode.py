@@ -50,6 +50,7 @@ _context.auto_insert_depth = _state.auto_insert_depth
 _actions.visible_items = _state.visible_items
 _actions.mark_visible_dirty = _state.mark_visible_dirty
 _actions.mark_cursor_changed = _state.mark_cursor_changed
+_actions._resolve_landing = _state._resolve_landing
 _actions.PIN_FIRST = _state.PIN_FIRST
 _actions.PIN_LAST = _state.PIN_LAST
 _actions.Mode = _state.Mode

@@ -42,6 +42,11 @@ _render.Mode = _state.Mode
 # the ``_render.Item`` injection above). The ``max_col_width`` invalidation
 # tests drive ``apply_ops`` directly.
 _state.Item = _data.Item
+# A real headless ``Browser`` (the production-composer test below) drives
+# ``update_data`` (which calls ``to_item``) and ``drain_main_queue`` (which
+# calls ``notify_wake``) — inject both the same way ``Item`` is injected.
+_state.to_item = _data.to_item
+_state.notify_wake = _term.notify_wake
 # PaneCache is referenced by the four content renderers (#187) — they
 # call ``browser._pane_cache.setdefault(name, PaneCache())``. Inject the
 # state-layer type the same way Item is injected.
@@ -51,20 +56,34 @@ _render.PaneCache = _state.PaneCache
 # the concatenated build; the test loader has to wire them in.
 _render._char_width = _term._char_width
 _render._visible_len = _term._visible_len
+# ``_ANSI_CSI_RE`` (020-terminal) drives the visible-text collapse for
+# cursor / search rows (``_collapse_visible``) and the preview tokeniser.
+# The concatenated build resolves it by name; the isolated load wires it in.
+_render._ANSI_CSI_RE = _term._ANSI_CSI_RE
+# ``_normalize_content`` (040-state) coerces a str row-content result to a
+# segment list; ``render_list`` calls it by bare name (single source of
+# truth shared with ``Browser._compose_row``). Cross-module injection for
+# the isolated load, same as ``_ANSI_CSI_RE`` above.
+_render._normalize_content = _state._normalize_content
 
 # The default row-format handlers (``default_row_chrome`` /
 # ``default_row_content`` / ``default_row``) live in 040-state but
 # reference render-layer constants/helpers (``_TAG_STYLE`` / ``_id_visible``
 # / ``_ID_COLOR`` / ``_MARKER_COLOR`` / ``cell_width``) at call time. The
 # concatenated production build resolves them by name; the isolated test
-# load has to inject them into the state module.
+# load has to inject them into the state module. ``_sanitize_ansi`` is the
+# shared escape-sanitiser (050-render) that ``_normalize_content`` applies
+# to a str row-content result on receipt (design sec 4.2 #1).
 for _name in ('_TAG_STYLE', '_id_visible', '_ID_COLOR', '_MARKER_COLOR',
-              'cell_width'):
+              'cell_width', '_sanitize_ansi'):
     setattr(_state, _name, getattr(_render, _name))
 
 Item = _data.Item
 Mode = _state.Mode
 State = _state.State
+Browser = _state.Browser
+BrowserConfig = _state.BrowserConfig
+visible_items = _state.visible_items
 apply_ops = _state.apply_ops
 cache_invalidate_subtree = _state.cache_invalidate_subtree
 cache_invalidate_all = _state.cache_invalidate_all
@@ -375,6 +394,114 @@ class TestFormatItemSegmentsDefault(unittest.TestCase):
         d2 = default_segments(item, depth=2, base_depth=0)
         # Depth 2 - depth 0 = 2 levels = 4 spaces of additional indent.
         self.assertEqual(len(_joined(d2)) - len(_joined(d0)), 4)
+
+
+# --- default chrome + content for a meta row (#738, design sec 4) -----------
+
+
+class TestDefaultMetaRow(unittest.TestCase):
+    """A meta row (``ctx.kind == 'meta'``) reuses the normal chrome+content
+    pipeline, but chrome reduces to aligned indentation and default content
+    is just the title — no selection ``*``, no expander glyph, no id / tag /
+    chips."""
+
+    def test_meta_chrome_is_indentation_only(self):
+        # Default chrome for a meta row: blank selection marker + indent +
+        # blank expander. No '* ', no '▼'/'▶' — even though has_children is
+        # forced True and the row is (nonsensically) in the expanded set.
+        item = Item(id='sep', title='── Section ──', has_children=True)
+        ctx = _ctx(item, kind='meta', depth=1, selected=True, expanded=True)
+        chrome = default_row_chrome(item, ctx)
+        joined = ''.join(s[0] for s in chrome)
+        self.assertNotIn('*', joined)
+        self.assertNotIn('▼', joined)
+        self.assertNotIn('▶', joined)
+        # The depth indent survives: blank marker (2) + depth-1 indent (2) +
+        # blank expander (2) = 6 cells, all spaces.
+        self.assertEqual(joined, ' ' * 6)
+
+    def test_meta_chrome_blanks_markers_even_when_selected_and_expandable(self):
+        # The forced-blank rule holds regardless of selected / has_children /
+        # expanded — those flags are meaningless on a meta row.
+        item = Item(id='sep', title='hdr', has_children=True)
+        ctx = _ctx(item, kind='meta', depth=0, selected=True, expanded=False)
+        chrome = default_row_chrome(item, ctx)
+        joined = ''.join(s[0] for s in chrome)
+        self.assertEqual(joined.strip(), '')
+
+    def test_meta_default_content_is_title_only(self):
+        # Default meta content = a single title segment. No id segment (even
+        # when show_ids would surface it), no tag chip, no trailing chips.
+        item = Item(id='sep', title='── Subagents ──', tag='X',
+                    tag_style='green')
+        item.chips = [('note', 'cyan')]
+        ctx = _ctx(item, kind='meta', show_ids=True)
+        content = default_row_content(item, ctx)
+        self.assertEqual(content, [('── Subagents ──', None, False)])
+
+    def test_meta_default_content_unaffected_by_show_ids(self):
+        # Even with show_ids forced on and id != title, the id segment is
+        # suppressed on a meta row (dividers aren't content).
+        item = Item(id='sep:subagents', title='── Subagents ──')
+        ctx = _ctx(item, kind='meta', show_ids=True)
+        content = default_row_content(item, ctx)
+        self.assertEqual(content, [('── Subagents ──', None, False)])
+        self.assertNotIn('sep:subagents', _joined(content))
+
+    def test_normal_row_content_unchanged_by_meta_branch(self):
+        # Regression: the meta branch must not perturb a normal row — id +
+        # tag + title + chip all still present in order.
+        item = Item(id='x', title='Title', tag='T', tag_style='green')
+        item.chips = [('c', 'cyan')]
+        ctx = _ctx(item, kind='normal', show_ids=True)
+        content = default_row_content(item, ctx)
+        joined = _joined(content)
+        self.assertIn('x ', joined)
+        self.assertIn('[T]', joined)
+        self.assertIn('Title', joined)
+        self.assertIn('[c]', joined)
+
+
+class TestComposeRowStrContentProduction(unittest.TestCase):
+    """The PRODUCTION ``Browser._compose_row`` normalises a ``str`` content
+    result into a single segment (design sec 4.1) — covered here through a
+    real headless ``Browser`` (the render_list tests exercise the faithful
+    ``_MockBrowser`` copy; this pins the real composer)."""
+
+    def _browser(self, **cfg):
+        b = Browser(BrowserConfig(_headless=True, **cfg))
+        b.update_data([('upsert', 'a', None, {'title': 'Row'})])
+        b.drain_main_queue()
+        return b
+
+    def test_compose_row_wraps_str_content(self):
+        # A ``format_row_content`` returning a ``str`` flows through the real
+        # composer: chrome (segments) + the str wrapped as one
+        # ``(text, None, False)`` segment. ``chrome + content`` must not
+        # crash (the bug a raw ``list + str`` would cause) and the visible
+        # text must land in the row.
+        b = self._browser(
+            format_row_content=lambda item, ctx: f'PLAIN {item.title}')
+        item = visible_items(b._state)[0].item
+        ctx = RowContext(b, item, depth=0, selected=False, expanded=False,
+                         is_current_scope=False, kind='normal', list_width=40)
+        segs = b._compose_row(item, ctx)
+        # Result is a uniform segment list; the last segment is the wrapped
+        # string and the collapsed visible text contains it.
+        self.assertIsInstance(segs, list)
+        self.assertEqual(segs[-1], ('PLAIN Row', None, False))
+        self.assertIn('PLAIN Row', ''.join(s[0] for s in segs))
+
+    def test_compose_row_str_with_ansi_keeps_text(self):
+        # The str may carry SGR (passthrough, sec 4.1); the composer wraps it
+        # verbatim into one segment — width math downstream is ANSI-aware.
+        b = self._browser(
+            format_row_content=lambda item, ctx: f'\033[31m{item.title}\033[0m')
+        item = visible_items(b._state)[0].item
+        ctx = RowContext(b, item, depth=0, selected=False, expanded=False,
+                         is_current_scope=False, kind='normal', list_width=40)
+        segs = b._compose_row(item, ctx)
+        self.assertEqual(segs[-1], ('\033[31mRow\033[0m', None, False))
 
 
 # --- default content: is_current_scope (the scope row) ----------------------
@@ -1882,6 +2009,79 @@ class TestTruncateVisible(unittest.TestCase):
         self.assertIn('\033[0m', out)
 
 
+# --- _sanitize_ansi: the shared escape-sanitiser (sec 4.2 #1) --------------
+
+
+_sanitize_ansi = _render._sanitize_ansi
+
+
+class TestSanitizeAnsi(unittest.TestCase):
+    """Keep SGR (\\e[..m); strip all other CSI and bare/dangling ESC.
+
+    Robust per-sequence scan — the shared sanitiser both the row-content
+    path (via ``_normalize_content``) and the preview pane use, so they
+    behave identically.
+    """
+
+    def test_plain_text_unchanged(self):
+        # No ESC at all → the fast path returns the input object untouched.
+        s = 'plain text, no escapes'
+        self.assertIs(_sanitize_ansi(s), s)
+
+    def test_empty_unchanged(self):
+        self.assertEqual(_sanitize_ansi(''), '')
+
+    def test_sgr_colour_kept(self):
+        self.assertEqual(_sanitize_ansi('\033[31mRED\033[0m'),
+                         '\033[31mRED\033[0m')
+
+    def test_sgr_reset_short_form_kept(self):
+        # ``\e[m`` (empty params) is a valid SGR reset — kept.
+        self.assertEqual(_sanitize_ansi('A\033[mB'), 'A\033[mB')
+
+    def test_compound_sgr_kept(self):
+        # Bold + 256-colour fg + bg in one sequence: all SGR, all kept.
+        s = 'x\033[1;38;5;200;48;5;17my'
+        self.assertEqual(_sanitize_ansi(s), s)
+
+    def test_cursor_move_csi_stripped(self):
+        # Cursor home ``\e[1;1H`` is a non-SGR CSI → dropped, text kept.
+        self.assertEqual(_sanitize_ansi('a\033[1;1Hb'), 'ab')
+
+    def test_clear_screen_csi_stripped(self):
+        # Erase-display ``\e[2J`` is non-SGR CSI → dropped.
+        self.assertEqual(_sanitize_ansi('\033[2Jhello'), 'hello')
+
+    def test_erase_line_csi_stripped(self):
+        self.assertEqual(_sanitize_ansi('x\033[Ky'), 'xy')
+
+    def test_bare_esc_stripped(self):
+        # A lone ESC with no following '[' → drop the ESC byte only.
+        self.assertEqual(_sanitize_ansi('a\033b'), 'ab')
+
+    def test_trailing_bare_esc_stripped(self):
+        self.assertEqual(_sanitize_ansi('abc\033'), 'abc')
+
+    def test_dangling_csi_stripped(self):
+        # ``\e[`` with no final byte before end-of-string → drop remainder.
+        self.assertEqual(_sanitize_ansi('keep\033[31'), 'keep')
+
+    def test_non_csi_escape_drops_only_esc(self):
+        # ``\eM`` (reverse-index, a non-CSI escape): only the ESC byte is
+        # removed, mirroring the documented intent (``…|\e`` matches the
+        # lone ESC); the trailing letter stays as text.
+        self.assertEqual(_sanitize_ansi('p\033Mq'), 'pMq')
+
+    def test_mixed_sgr_and_non_sgr(self):
+        # Interleaved SGR (kept) and cursor moves / clears (dropped).
+        s = '\033[31mR\033[2J\033[1mE\033[1;5HD\033[0m'
+        self.assertEqual(_sanitize_ansi(s), '\033[31mR\033[1mED\033[0m')
+
+    def test_idempotent(self):
+        once = _sanitize_ansi('\033[31mhi\033[2J\033there')
+        self.assertEqual(_sanitize_ansi(once), once)
+
+
 # --- clear_columns helper --------------------------------------------------
 
 
@@ -2012,6 +2212,9 @@ class _MockBrowser:
         self._insert_depth = 0
         self._insert_label = ''
         self._search_query = ''
+        # Meta-row search-highlight gate (§5): off by default, like the
+        # real BrowserConfig. Tests flip it via the kwargs loop below.
+        self.meta_search_highlight = False
         self._mode = Mode.NORMAL
         self._error_text = ''
         self._help_mode = False
@@ -2039,9 +2242,13 @@ class _MockBrowser:
             setattr(self, k, v)
 
     def _compose_row(self, item, ctx):
+        # Mirrors production ``Browser._compose_row``: normalise a str
+        # content-hook result to a segment list before concatenating
+        # (design sec 4.1), so ``chrome + content`` always joins two lists.
         chrome = self.format_row_chrome(item, ctx)
         ctx._set_content_width(_segments_cells(chrome))
-        return chrome + self.format_row_content(item, ctx)
+        return chrome + _state._normalize_content(
+            self.format_row_content(item, ctx))
 
 
 class TestRenderListRectClipping(unittest.TestCase):
@@ -2231,6 +2438,342 @@ class TestRenderListRectClipping(unittest.TestCase):
         joined = ''.join(self.cap.flat)
         self.assertIn('PERMS', joined)
         self.assertIn('findme', joined)
+
+    # --- #738: str (ANSI-allowed) content on any row, meta chrome --------
+
+    def _render_one(self, browser, width=40):
+        rect = Rect(left=1, top=1, right=1 + width, bottom=2)
+        _reconcile(browser, 'list', rect)
+        _render.render_list(browser, rect)
+        return ''.join(self.cap.flat)
+
+    def test_str_content_renders_on_normal_row(self):
+        # A ``format_row_content`` returning a plain ``str`` (no segments)
+        # renders on a NORMAL row: the chrome composes, the str becomes one
+        # segment, and its visible text lands in the stream, width-correct.
+        def content(item, ctx):
+            return f'just a string {item.title}'
+
+        item = Item(id='a', title='Row')
+        state = _MockState([self._entry(item)], cursor=5)  # not the cursor
+        _render.visible_items = lambda s: state._visible
+        browser = _MockBrowser(state, format_row_content=content)
+        joined = self._render_one(browser)
+        # The str became one content segment: chrome (4 blank cells) then
+        # the visible text. A non-cursor, non-stripe row writes content
+        # only (the pane-edge pad is end_row's job, stubbed out here), so
+        # the captured stream is exactly chrome + the string.
+        self.assertEqual(joined, '    just a string Row')
+
+    def test_str_content_renders_on_meta_row(self):
+        # The same str-content path works on a META row, and meta chrome is
+        # indentation only — no '* ' / expander before the content.
+        def content(item, ctx):
+            # Recipes may branch on ctx.kind; here always a str.
+            return f'DIVIDER:{item.title}'
+
+        item = Item(id='sep', title='hdr', has_children=True)
+        state = _MockState([self._entry(item, depth=1, kind='meta')],
+                           cursor=5)
+        _render.visible_items = lambda s: state._visible
+        browser = _MockBrowser(state, format_row_content=content)
+        joined = self._render_one(browser)
+        self.assertIn('DIVIDER:hdr', joined)
+        self.assertNotIn('*', joined)
+        self.assertNotIn('▼', joined)
+        self.assertNotIn('▶', joined)
+        # Meta chrome = blank marker + depth-1 indent + blank expander = 6
+        # leading spaces, then the content.
+        self.assertTrue(joined.startswith('      DIVIDER:hdr'), repr(joined[:20]))
+
+    def test_default_meta_row_content_is_title(self):
+        # No content override: a meta row's default content is just its
+        # title (sec 4), with indentation-only chrome.
+        item = Item(id='sep', title='── Section ──')
+        state = _MockState([self._entry(item, depth=0, kind='meta')],
+                           cursor=5)
+        _render.visible_items = lambda s: state._visible
+        browser = _MockBrowser(state)
+        joined = self._render_one(browser)
+        self.assertIn('── Section ──', joined)
+        self.assertNotIn('sep', joined)   # no id segment
+        self.assertNotIn('*', joined)
+
+    def test_str_content_under_cursor_collapses_to_clean_reverse(self):
+        # A str row carrying embedded SGR, painted UNDER the cursor: the
+        # collapse drops the SGR (visible-text strip) so the reverse-video
+        # overlay reads cleanly. The escape bytes must not reach the stream;
+        # the visible text must, and a reverse style must fire.
+        RED = '\033[31m'
+        RESET = '\033[0m'
+
+        def content(item, ctx):
+            return f'{RED}colored {item.title}{RESET}'
+
+        item = Item(id='a', title='Cursor')
+        state = _MockState([self._entry(item)], cursor=0)  # IS the cursor
+        _render.visible_items = lambda s: state._visible
+        browser = _MockBrowser(state, format_row_content=content)
+        joined = self._render_one(browser)
+        # Visible text present, embedded SGR stripped from the content writes.
+        self.assertIn('colored Cursor', joined)
+        self.assertNotIn('\033[31m', ''.join(self.cap.flat))
+        # The cursor row paints reverse-video.
+        self.assertTrue(
+            any(e[0] == 'set_style' and e[1].get('reverse')
+                for e in self.cap.events),
+            'cursor row must paint reverse-video',
+        )
+
+    def test_ansi_string_non_cursor_renders_visible_text(self):
+        # A non-cursor row whose content is an ANSI string renders its
+        # visible text ANSI-aware (escapes passed through, width counted by
+        # visible cells) — the visible glyphs appear and width stays exact.
+        def content(item, ctx):
+            return f'\033[32mgreen\033[0m {item.title}'
+
+        item = Item(id='a', title='Leaf')
+        state = _MockState([self._entry(item)], cursor=5)  # not the cursor
+        _render.visible_items = lambda s: state._visible
+        browser = _MockBrowser(state, format_row_content=content)
+        joined = self._render_one(browser)
+        # SGR colour escapes survive (sec 4.2 rule 2 keeps them through
+        # ``_truncate_visible``); strip CSI to read the visible text.
+        self.assertIn('\033[32m', joined)
+        visible = _term._ANSI_CSI_RE.sub('', joined)
+        self.assertEqual(visible, '    green Leaf')
+        # Visible width is exact — the embedded escapes add zero cells.
+        self.assertEqual(_term._visible_len(joined), 14)
+
+    def test_ansi_string_non_sgr_csi_stripped_on_receipt(self):
+        # Rule 1: a non-SGR CSI embedded in the content str (cursor home
+        # ``\e[1;1H``, erase ``\e[2J``) is stripped on receipt by the shared
+        # sanitiser, so it never reaches the stream; the SGR colour stays.
+        def content(item, ctx):
+            return f'\033[1;1H\033[31mred\033[2J\033[0m {item.title}'
+
+        item = Item(id='a', title='Leaf')
+        state = _MockState([self._entry(item)], cursor=5)  # not the cursor
+        _render.visible_items = lambda s: state._visible
+        browser = _MockBrowser(state, format_row_content=content)
+        joined = self._render_one(browser)
+        # Non-SGR CSI gone; SGR colour kept.
+        self.assertNotIn('\033[1;1H', joined)
+        self.assertNotIn('\033[2J', joined)
+        self.assertIn('\033[31m', joined)
+        visible = _term._ANSI_CSI_RE.sub('', joined)
+        self.assertEqual(visible, '    red Leaf')
+
+    def test_ansi_string_emits_trailing_reset(self):
+        # Rule 3: content carrying SGR closes with a trailing ``\e[m`` so the
+        # colour can't bleed into the pad / next pane.
+        def content(item, ctx):
+            return '\033[31mred\033[31m'   # opens colour, never resets
+
+        item = Item(id='a', title='t')
+        state = _MockState([self._entry(item)], cursor=5)  # not the cursor
+        _render.visible_items = lambda s: state._visible
+        browser = _MockBrowser(state, format_row_content=content)
+        joined = self._render_one(browser)
+        # The very last emitted bytes are the conditional reset.
+        self.assertTrue(joined.endswith('\033[m'), repr(joined[-6:]))
+
+    def test_plain_str_content_emits_no_trailing_reset(self):
+        # Rule 3 negative: a plain (no-ANSI) str row emits NO reset — the
+        # stream is exactly chrome + the visible text, byte-for-byte.
+        def content(item, ctx):
+            return f'plain {item.title}'
+
+        item = Item(id='a', title='Row')
+        state = _MockState([self._entry(item)], cursor=5)  # not the cursor
+        _render.visible_items = lambda s: state._visible
+        browser = _MockBrowser(state, format_row_content=content)
+        joined = self._render_one(browser)
+        self.assertEqual(joined, '    plain Row')
+        self.assertNotIn('\033[', joined)
+
+    def test_ansi_string_truncates_ansi_aware(self):
+        # An ANSI-bearing content segment wider than the pane is truncated
+        # by VISIBLE cells, not raw chars: the escapes pass through intact
+        # (never cut mid-sequence) and don't consume width budget, so the
+        # rendered visible width equals the pane width exactly.
+        def content(item, ctx):
+            return '\033[31m' + ('X' * 50) + '\033[0m'
+
+        item = Item(id='a', title='t')
+        state = _MockState([self._entry(item)], cursor=5)  # not the cursor
+        _render.visible_items = lambda s: state._visible
+        browser = _MockBrowser(state)
+        browser.format_row_content = content
+        # Width 10: chrome eats 4 cells, content gets 6 visible X's.
+        joined = self._render_one(browser, width=10)
+        self.assertEqual(_term._visible_len(joined), 10)
+        visible = _term._ANSI_CSI_RE.sub('', joined)
+        self.assertEqual(visible, '    ' + 'X' * 6)
+        # The leading colour escape survived (not cut mid-sequence).
+        self.assertIn('\033[31m', joined)
+
+    def test_bg_restore_fires_when_row_bg_and_ansi_content(self):
+        # Rule 4: row bg active AND the content emitted SGR → after the
+        # trailing reset the row bg is re-emitted (as the bare background
+        # SGR \e[48;5;17m) so the trailing pad keeps the stripe. The restore
+        # is gated on the ``row_bg`` attribute, not a content bg scan; here
+        # the content carries a bg code, but any SGR would trigger it (see
+        # the fg-only case below). Assert the observable order: the rule-3
+        # reset \e[m, then the rule-4 restore byte immediately after it.
+        def content(item, ctx):
+            return '\033[41mX\033[0m'   # red background in the content
+
+        item = Item(id='a', title='t')
+        item.row_bg = 17
+        state = _MockState([self._entry(item)], cursor=5)  # not the cursor
+        _render.visible_items = lambda s: state._visible
+        browser = _MockBrowser(state, format_row_content=content)
+        joined = self._render_one(browser, width=40)
+        # The reset is immediately followed by the bg-restore byte.
+        self.assertIn('\033[m\033[48;5;17m', joined)
+
+    def test_bg_restore_fires_when_row_bg_and_fg_only_ansi(self):
+        # Rule 4 (attribute-driven): row bg active and the content carries
+        # ONLY a fg colour (no bg code) → the restore STILL fires. The
+        # rule-3 ``\e[m`` reset clears the bg the stripe needs, so re-emitting
+        # the row bg on the ``row_bg`` attribute keeps the stripe alive even
+        # when the content set no bg of its own. (This is the case the old
+        # content-bg-code gate missed.)
+        def content(item, ctx):
+            return '\033[31mred\033[0m'   # fg only, no bg code
+
+        item = Item(id='a', title='t')
+        item.row_bg = 17
+        state = _MockState([self._entry(item)], cursor=5)  # not the cursor
+        _render.visible_items = lambda s: state._visible
+        browser = _MockBrowser(state, format_row_content=content)
+        joined = self._render_one(browser, width=40)
+        # The reset is immediately followed by the bg-restore byte.
+        self.assertIn('\033[m\033[48;5;17m', joined)
+
+    def test_bg_restore_skipped_when_row_bg_but_no_ansi(self):
+        # Rule 4 negative: row bg active but the content is PLAIN (no SGR) →
+        # rule 3 fires no reset (nothing to close), so rule 4 emits no
+        # restore byte either. (The stripe pad still paints with row_bg via
+        # the existing set_style stripe logic — that's separate; what must be
+        # absent is the rule-3 reset \e[m and the rule-4 restore byte.)
+        def content(item, ctx):
+            return 'plain'   # no SGR at all
+
+        item = Item(id='a', title='t')
+        item.row_bg = 17
+        state = _MockState([self._entry(item)], cursor=5)  # not the cursor
+        _render.visible_items = lambda s: state._visible
+        browser = _MockBrowser(state, format_row_content=content)
+        joined = self._render_one(browser, width=40)
+        # No trailing reset (no ANSI content) and no rule-4 restore byte.
+        self.assertNotIn('\033[m', joined)
+        self.assertNotIn('\033[48;5;17m', joined)
+
+    def test_bg_restore_skipped_when_no_row_bg(self):
+        # Rule 4 negative: content carries a bg code but NO row bg is set →
+        # the trailing reset fires (rule 3) but there is no bg-restore, and
+        # no bg set_style anywhere (row_bg is None throughout).
+        def content(item, ctx):
+            return '\033[41mX\033[0m'
+
+        item = Item(id='a', title='t')   # no row_bg attribute
+        state = _MockState([self._entry(item)], cursor=5)  # not the cursor
+        _render.visible_items = lambda s: state._visible
+        browser = _MockBrowser(state, format_row_content=content)
+        joined = self._render_one(browser, width=40)
+        ops = self.cap.events
+        # Rule-3 reset present; rule-4 restore byte absent.
+        self.assertIn('\033[m', joined)
+        self.assertNotIn('\033[48;5;', joined)
+        # And no set_style carrying a bg anywhere (row_bg is None).
+        self.assertFalse(
+            any(e[0] == 'set_style' and e[1].get('bg') is not None
+                for e in ops),
+            'no bg set_style expected when row_bg is unset',
+        )
+
+    def test_plain_segment_row_byte_for_byte_unchanged(self):
+        # Regression: a plain segment row (no ANSI, no str content) produces
+        # exactly the chrome+content+pad it did before #738. Pin the full
+        # content-write stream and the event sequence shape.
+        item = Item(id='a', title='Name')   # id == 'a', title 'Name'
+        state = _MockState([self._entry(item)], cursor=5)  # not the cursor
+        _render.visible_items = lambda s: state._visible
+        browser = _MockBrowser(state)
+        joined = self._render_one(browser)
+        # Chrome '  ' (blank marker, leaf) + '' indent + '  ' (blank
+        # expander) = 4 cells, then id segment 'a ' (auto-shown since id !=
+        # title), then title 'Name'. A non-cursor, non-stripe plain row
+        # writes content only — exactly chrome + id + title, no pad.
+        self.assertEqual(joined, '    a Name')
+        # No reverse-video (plain non-cursor row).
+        self.assertFalse(
+            any(e[0] == 'set_style' and e[1].get('reverse')
+                for e in self.cap.events),
+            'plain non-cursor row must not paint reverse-video',
+        )
+
+    # --- #740: meta-row search-highlight gate ---------------------------
+    #
+    # A query-matching meta row paints highlight spans only when
+    # ``meta_search_highlight`` is True. The observable signal is the
+    # fragment style ``set_style(fg=3, bold=True)`` emitted by
+    # ``_write_highlighted`` on the matched span (non-cursor path).
+
+    def _has_highlight_style(self):
+        return any(
+            e[0] == 'set_style'
+            and e[1].get('fg') == 3 and e[1].get('bold')
+            for e in self.cap.events
+        )
+
+    def test_meta_row_no_highlight_when_gate_off(self):
+        # Default ``meta_search_highlight=False``: a meta row whose text
+        # matches the active query is NOT highlighted — it renders via
+        # the per-segment writer, so no fragment highlight style fires.
+        item = Item(id='sep', title='findme divider')
+        state = _MockState([self._entry(item, kind='meta')], cursor=5)
+        _render.visible_items = lambda s: state._visible
+        _render._search_matches = lambda text, q: q in text
+        _render._search_text = lambda item, **kw: item.title
+        browser = _MockBrowser(state, _search_query='findme',
+                               meta_search_highlight=False)
+        joined = self._render_one(browser)
+        # Text still renders, but no highlight style overlay.
+        self.assertIn('findme', joined)
+        self.assertFalse(self._has_highlight_style(),
+                         'meta row must not highlight when gate is off')
+
+    def test_meta_row_highlights_when_gate_on(self):
+        # ``meta_search_highlight=True``: a matching meta row paints the
+        # fragment highlight style like a normal row would.
+        item = Item(id='sep', title='findme divider')
+        state = _MockState([self._entry(item, kind='meta')], cursor=5)
+        _render.visible_items = lambda s: state._visible
+        _render._search_matches = lambda text, q: q in text
+        _render._search_text = lambda item, **kw: item.title
+        browser = _MockBrowser(state, _search_query='findme',
+                               meta_search_highlight=True)
+        joined = self._render_one(browser)
+        self.assertIn('findme', joined)
+        self.assertTrue(self._has_highlight_style(),
+                        'meta row must highlight when gate is on')
+
+    def test_normal_row_highlights_regardless_of_meta_gate(self):
+        # Regression: a NORMAL matching row highlights even with the
+        # meta gate off (the gate only governs meta rows).
+        item = Item(id='a', title='findme row')
+        state = _MockState([self._entry(item, kind='normal')], cursor=5)
+        _render.visible_items = lambda s: state._visible
+        _render._search_matches = lambda text, q: q in text
+        _render._search_text = lambda item, **kw: item.title
+        browser = _MockBrowser(state, _search_query='findme',
+                               meta_search_highlight=False)
+        self._render_one(browser)
+        self.assertTrue(self._has_highlight_style(),
+                        'normal row must highlight regardless of meta gate')
 
 
 class TestRenderChildrenList(unittest.TestCase):

@@ -60,6 +60,9 @@ _render._ANSI_CSI_RE = _term._ANSI_CSI_RE
 _render.SgrState = _term.SgrState
 _render._char_width = _term._char_width
 _render._visible_len = _term._visible_len
+# ``render_list`` coerces a str row-content result via ``_normalize_content``
+# (040-state); inject it for the isolated load (#738).
+_render._normalize_content = _state._normalize_content
 for _name in ('write', 'move', 'set_style', 'reset_style', 'clear_line',
               'clear_columns', 'begin_row', 'end_row', 'begin_sync',
               'end_sync', 'flush', 'term_size'):
@@ -86,6 +89,7 @@ _actions.current_scope = _state.current_scope
 _actions._search_find = _state._search_find
 _actions._search_jump_nearest = _state._search_jump_nearest
 _actions.mark_cursor_changed = _state.mark_cursor_changed
+_actions._resolve_landing = _state._resolve_landing
 _actions.PIN_FIRST = _state.PIN_FIRST
 _actions.PIN_LAST = _state.PIN_LAST
 _actions.Mode = _state.Mode

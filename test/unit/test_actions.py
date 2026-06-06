@@ -41,6 +41,7 @@ _actions.current_scope = _state.current_scope
 _actions._search_find = _state._search_find
 _actions._search_jump_nearest = _state._search_jump_nearest
 _actions.mark_cursor_changed = _state.mark_cursor_changed
+_actions._resolve_landing = _state._resolve_landing
 _actions.PIN_FIRST = _state.PIN_FIRST
 _actions.PIN_LAST = _state.PIN_LAST
 _actions.Mode = _state.Mode
@@ -276,6 +277,219 @@ class TestDispatchNav(unittest.TestCase):
             ctx = _ctx_for(b)
             self.assertTrue(dispatch_key(b, ctx, 'G'))
             self.assertEqual(b._state.cursor, 2)
+        finally:
+            b.stop_workers()
+
+
+# --- meta-row cursor skip (#736) ------------------------------------------
+
+class TestMetaRowSkip(unittest.TestCase):
+    """The unified ``_resolve_landing`` makes every cursor MOVE skip meta rows.
+
+    Tree (root children, visible-list indices):
+
+        0  A     (normal)
+        1  m0    (meta)              single meta
+        2  B     (normal)
+        3  m1    (meta)   ┐ short
+        4  m2    (meta)   ┘ meta run
+        5  C     (normal)
+        6  mEnd  (meta)              trailing meta
+
+    Landable rows are 0 (A), 2 (B), 5 (C). ``cursor_to`` is the one path
+    that is *not* routed through the resolver — it lands exactly.
+    """
+
+    def _browser(self):
+        b = _make_browser()
+        b._state._children[None] = [
+            Item(id='A'),
+            Item(id='m0', meta=True),
+            Item(id='B'),
+            Item(id='m1', meta=True),
+            Item(id='m2', meta=True),
+            Item(id='C'),
+            Item(id='mEnd', meta=True),
+        ]
+        return b
+
+    # ---- arrows ---------------------------------------------------------
+
+    def test_down_skips_single_meta(self):
+        b = self._browser()
+        try:
+            ctx = _ctx_for(b)
+            self.assertEqual(b._state.cursor, 0)        # A
+            dispatch_key(b, ctx, 'j')
+            self.assertEqual(b._state.cursor, 2)        # skip m0 → B
+        finally:
+            b.stop_workers()
+
+    def test_down_skips_meta_run(self):
+        b = self._browser()
+        b._state.cursor = 2                              # B
+        try:
+            ctx = _ctx_for(b)
+            dispatch_key(b, ctx, 'j')
+            self.assertEqual(b._state.cursor, 5)        # skip m1/m2 → C
+        finally:
+            b.stop_workers()
+
+    def test_up_skips_meta_run(self):
+        b = self._browser()
+        b._state.cursor = 5                              # C
+        try:
+            ctx = _ctx_for(b)
+            dispatch_key(b, ctx, 'k')
+            self.assertEqual(b._state.cursor, 2)        # skip m2/m1 → B
+        finally:
+            b.stop_workers()
+
+    def test_up_skips_single_meta(self):
+        b = self._browser()
+        b._state.cursor = 2                              # B
+        try:
+            ctx = _ctx_for(b)
+            dispatch_key(b, ctx, 'k')
+            self.assertEqual(b._state.cursor, 0)        # skip m0 → A
+        finally:
+            b.stop_workers()
+
+    # ---- page -----------------------------------------------------------
+
+    def test_pgdn_lands_on_landable(self):
+        """A short list: PageDown clamps to the end then reverses off the
+        trailing meta onto the last landable row (C)."""
+        b = self._browser()
+        try:
+            ctx = _ctx_for(b)
+            dispatch_key(b, ctx, 'pgdn')
+            self.assertEqual(b._state.cursor, 5)        # not mEnd (6)
+        finally:
+            b.stop_workers()
+
+    def test_pgup_lands_on_landable(self):
+        b = self._browser()
+        b._state.cursor = 5                              # C
+        try:
+            ctx = _ctx_for(b)
+            dispatch_key(b, ctx, 'pgup')
+            self.assertEqual(b._state.cursor, 0)        # back to A
+        finally:
+            b.stop_workers()
+
+    # ---- Home / End -----------------------------------------------------
+
+    def test_end_skips_trailing_meta(self):
+        b = self._browser()
+        try:
+            ctx = _ctx_for(b)
+            dispatch_key(b, ctx, 'G')
+            self.assertEqual(b._state.cursor, 5)        # C, not mEnd (6)
+        finally:
+            b.stop_workers()
+
+    def test_home_skips_leading_meta(self):
+        """Home with a leading meta lands on the first landable row.
+
+        Seed a leading meta so Home must reverse off index 0.
+        """
+        b = _make_browser()
+        b._state._children[None] = [
+            Item(id='top', meta=True),
+            Item(id='A'),
+            Item(id='B'),
+        ]
+        b._state.cursor = 2                              # B
+        try:
+            ctx = _ctx_for(b)
+            dispatch_key(b, ctx, 'g')
+            self.assertEqual(b._state.cursor, 1)        # A, not top (0)
+        finally:
+            b.stop_workers()
+
+    # ---- selection-toggle step ------------------------------------------
+
+    def test_select_toggle_down_skips_meta(self):
+        """Space toggles the (landable) cursor row, then steps over m0."""
+        b = self._browser()
+        try:
+            ctx = _ctx_for(b)
+            self.assertEqual(b._state.cursor, 0)        # A (landable)
+            dispatch_key(b, ctx, 'space')
+            self.assertIn('A', b._state.selected)       # toggled A
+            self.assertEqual(b._state.cursor, 2)        # stepped over m0 → B
+        finally:
+            b.stop_workers()
+
+    def test_select_toggle_up_skips_meta_run(self):
+        """Alt-space toggles C, then steps up over the m2/m1 run onto B."""
+        b = self._browser()
+        b._state.cursor = 5                              # C
+        try:
+            ctx = _ctx_for(b)
+            dispatch_key(b, ctx, 'alt- ')
+            self.assertIn('C', b._state.selected)       # toggled C
+            self.assertEqual(b._state.cursor, 2)        # over m2/m1 → B
+        finally:
+            b.stop_workers()
+
+    # ---- cursor_to is exact (NOT routed through the resolver) -----------
+
+    def test_cursor_to_lands_on_meta_exactly(self):
+        """``cursor_to`` onto a meta id lands on it (no skip), no crash."""
+        b = self._browser()
+        try:
+            # Register the meta item so the anchor can resolve it, then
+            # build the visible list once so it is indexable.
+            visible = _state.visible_items(b._state)
+            self.assertEqual(visible[3].item.id, 'm1')
+            b.cursor_to('m1')
+            b.drain_main_queue()
+            self.assertEqual(b._state.cursor, 3)        # exactly on m1
+        finally:
+            b.stop_workers()
+
+    # ---- no-landable / no-op edge cases ---------------------------------
+
+    def test_all_meta_list_parks_without_crash(self):
+        """An all-meta visible list: a move parks the cursor, no crash."""
+        b = _make_browser()
+        b._state._children[None] = [
+            Item(id='x', meta=True),
+            Item(id='y', meta=True),
+        ]
+        b._state.cursor = 0
+        try:
+            ctx = _ctx_for(b)
+            # Neither direction finds a landable row → cursor unchanged.
+            dispatch_key(b, ctx, 'j')
+            self.assertEqual(b._state.cursor, 0)
+            dispatch_key(b, ctx, 'G')
+            self.assertEqual(b._state.cursor, 0)
+        finally:
+            b.stop_workers()
+
+    def test_down_with_only_meta_below_is_noop(self):
+        """Down with only meta rows below resolves back to the current row.
+
+        The reverse-fallback legitimately returns the current index — this
+        must be a true no-op (no spurious cursor-change event).
+        """
+        b = _make_browser()
+        b._state._children[None] = [
+            Item(id='A'),
+            Item(id='m0', meta=True),
+            Item(id='m1', meta=True),
+        ]
+        b._state.cursor = 0                              # A; only meta below
+        try:
+            ctx = _ctx_for(b)
+            b._cursor_change_pending = False
+            dispatch_key(b, ctx, 'j')
+            self.assertEqual(b._state.cursor, 0)         # parked on A
+            self.assertFalse(b._cursor_change_pending,
+                             'spurious cursor-change fired on a no-op move')
         finally:
             b.stop_workers()
 
@@ -1071,6 +1285,51 @@ class TestMouseDispatch(unittest.TestCase):
             # Click well past the end.
             dispatch_key(b, ctx, f'mouse-click:{layout["list"].top + 8}:5')
             self.assertEqual(b._state.cursor, 1)
+        finally:
+            restore()
+            b.stop_workers()
+
+    def _browser_with_meta(self):
+        """A / m0(meta) / B / m1(meta) / m2(meta) / C — landable 0,2,5."""
+        b = _make_browser()
+        b._state._children[None] = [
+            Item(id='A'),
+            Item(id='m0', meta=True),
+            Item(id='B'),
+            Item(id='m1', meta=True),
+            Item(id='m2', meta=True),
+            Item(id='C'),
+        ]
+        return b
+
+    def test_click_on_meta_skips_downward(self):
+        """Clicking a meta row below the cursor skips down (B), not onto it."""
+        b = self._browser_with_meta()
+        restore = self._patch_term(80, 40)
+        try:
+            ctx = _ctx_for(b)
+            self.assertEqual(b._state.cursor, 0)        # A, above the click
+            layout = _render.layout_panes(80, 40, show_preview=True,
+                                          show_children_pane=True)
+            click_row = layout['list'].top + 1          # m0 (idx 1)
+            dispatch_key(b, ctx, f'mouse-click:{click_row}:5')
+            self.assertEqual(b._state.cursor, 2)        # skip down → B
+        finally:
+            restore()
+            b.stop_workers()
+
+    def test_click_on_meta_run_skips_upward(self):
+        """Clicking into a meta run from below skips up in the travel dir."""
+        b = self._browser_with_meta()
+        b._state.cursor = 5                              # C, below the click
+        restore = self._patch_term(80, 40)
+        try:
+            ctx = _ctx_for(b)
+            layout = _render.layout_panes(80, 40, show_preview=True,
+                                          show_children_pane=True)
+            click_row = layout['list'].top + 4          # m2 (idx 4)
+            dispatch_key(b, ctx, f'mouse-click:{click_row}:5')
+            self.assertEqual(b._state.cursor, 2)        # skip up → B
         finally:
             restore()
             b.stop_workers()

@@ -27,7 +27,7 @@ relies on hex-vs-word heuristics:
   wc:<bucket>           a status group (untracked/tracked/staged/conflicts)
   stash:<n>[:<path>]    a stash, or a file in one
   reflog:<n>:<sha>      a reflog entry    -> changed files
-  filler:<ns>:<n>       an inert tree-mode connector row (no children)
+  filler:<ns>:<n>       an inert tree-mode connector row (meta; no children)
 
 Commit rows render in columns — a yellow short-sha, a dim author and a
 dim relative date — followed by the branch / remote / tag refs parsed
@@ -48,7 +48,7 @@ toggles md2ansi message coloring (when available); ``E`` edits the real
 working-tree file for file/status rows in $EDITOR; the built-in ``v`` /
 ``e`` page / edit the preview text.
 
-With ``--tree`` (or the ``t`` toggle, default off) the commit log gains a
+By default (toggle off with ``--no-tree`` or the ``t`` key) the commit log has a
 tig-style graph column: ``git log --graph`` does all the lane assignment
 and its art is glyph-substituted and rendered after the date column, with
 its connector-only FILLER lines kept as inert blank rows so the lanes line
@@ -58,17 +58,18 @@ Read-only with respect to history — the only mutation is ``E``'s
 working-tree edit.
 
 Usage:
-  browse-git [<dir>] [-n NUMBER] [--mode NAME] [--tree] [<revs>…] [-- <paths>…]
+  browse-git [<dir>] [-n NUMBER] [--mode NAME] [--no-tree] [<revs>…] [-- <paths>…]
 """
 
 import os
+import re
 import shutil
 import subprocess
 import sys
 
 from browse_tui import (
     Action, Browser, BrowserConfig, Item,
-    cell_ljust, default_row_content, style,
+    cell_ljust, default_row_content, sanitize_ansi, style,
 )
 
 # Optional md2ansi_lib plugin — gates md2ansi coloring of commit messages.
@@ -87,7 +88,10 @@ _MODES = ('commits', 'status', 'reflog', 'branches', 'stash')
 # Glyph substitution for ``git log --graph`` art (tree mode). Maps git's
 # ASCII art to box-drawing / dot glyphs: every node ('*') becomes the same
 # dot so git's connectors — not the node shape — convey merges. Built once
-# as a str.translate table (see ``_graph_translate``).
+# as a str.translate table (see ``_graph_translate``). The art carries git's
+# own ANSI colour (``--color=always``), so the substitution is applied only
+# to the plain-text runs *between* SGR sequences (see ``_graph_translate`` /
+# ``_SGR_RE``) — never to a byte inside an ``\e[…m`` escape.
 _GRAPH_GLYPHS = {
     '*': '•',     # commit node           -> bullet (U+2022)
     '|': '│',     # vertical lane         -> box vertical (U+2502)
@@ -98,24 +102,22 @@ _GRAPH_GLYPHS = {
 }
 _GRAPH_TABLE = str.maketrans(_GRAPH_GLYPHS)
 
+# A complete SGR sequence ``\e[ <params> m``. The param class ``[^@-~]*``
+# exactly mirrors the kept-set of the framework ``sanitize_ansi`` (a CSI whose
+# final byte is ``m``), so EVERY sequence that survives sanitise is matched
+# here — not just the ``[0-9;]`` params real git emits. ``_graph_translate``
+# splits on this pattern to glyph-substitute the plain runs while passing each
+# SGR token through verbatim — guaranteeing no substitution lands inside an
+# escape and no colour run is split.
+_SGR_RE = re.compile(r'\x1b\[[^@-~]*m')
+
 # Module-level state, all set in main() before the Browser launches.
 _log_limit = _LOG_LIMIT
 _mode = 'commits'
-_tree_mode = False  # --tree / 't' — render git's commit graph as a column
+_tree_mode = True  # --tree / 't' — render git's commit graph as a column (default on)
 _browser = None  # set in main() — used for preview-width lookup
 _revs = []       # positional revisions scoping commits mode
 _paths = []      # positional pathspecs scoping commits mode
-
-# Tree-mode filler skipping (_skip_fillers). ``_graph_rows_by_ns`` maps a
-# build's namespace key (``'root'`` for the commits-mode log, ``'ref:<name>'``
-# for a branches-mode ref drill-down) to that build's rows as ordered
-# ``(id, is_filler)`` pairs (set by ``_commit_graph_items``). Each build owns
-# its own entry; keying by ns (and namespacing filler ids per build) keeps
-# two drilled-in refs from colliding on a shared ``filler:<n>`` counter.
-# ``_prev_cursor_index`` is the cursor position at the previous
-# on_cursor_change fire, used only to infer travel direction (index delta).
-_graph_rows_by_ns = {}
-_prev_cursor_index = 0
 
 
 # ---- argv helper ---------------------------------------------------------
@@ -723,15 +725,15 @@ def _log_items(revs, paths, ns):
 
     The single seam shared by commits-mode root and the branches-mode ref
     drill-down: when ``_tree_mode`` is on it routes to the ``git log
-    --graph`` builder (commit rows + inert filler rows carrying the graph
+    --graph`` builder (commit rows + meta filler rows carrying the graph
     art); otherwise it calls the plain ``_commit_log_items`` so the
     tree-off output is byte-identical to before this feature.
 
     ``ns`` is a stable per-build namespace key (``'root'`` for the
     commits-mode log, the ref item's id for a ref drill-down) that scopes
-    the graph builder's filler ids and ordered-row record so concurrent
-    builds (multiple drilled-in refs) can't collide. It's only consulted
-    in tree mode; the plain builder takes no namespace.
+    the graph builder's filler ids so concurrent builds (multiple drilled-in
+    refs) can't collide on a shared ``filler:<n>`` counter. It's only
+    consulted in tree mode; the plain builder takes no namespace.
     """
     if _tree_mode:
         return _commit_graph_items(revs, paths, ns)
@@ -836,15 +838,40 @@ def _commit_log_items(revs, paths):
 
 
 def _graph_translate(art):
-    """Glyph-substitute one line of ``git log --graph`` art.
+    """Sanitise + glyph-substitute one line of coloured ``git log --graph`` art.
 
-    Maps git's ASCII connectors to box-drawing / block glyphs via the module
-    ``_GRAPH_TABLE`` (``*``→``•``, ``|``→``│``, ``_``→``▁``); the diagonals
-    ``/`` and ``\\`` pass through unchanged. Internal spacing is git's lane
-    alignment and is preserved; only trailing spaces are stripped (git
-    right-pads every art cell, and a trailing run carries no lane information).
+    The art carries git's native ANSI colour (``--color=always``). It is
+    treated as external input and first run through the shared framework
+    sanitiser :func:`sanitize_ansi`, which keeps only complete SGR colour
+    sequences (``\\e[…m``) and strips every other escape — so nothing but a
+    colour code can ever reach the screen.
+
+    Glyph substitution then maps git's ASCII connectors to box-drawing / block
+    glyphs via the module ``_GRAPH_TABLE`` (``*``→``•``, ``|``→``│``,
+    ``_``→``▁``); the diagonals ``/`` and ``\\`` pass through unchanged. The
+    substitution is ANSI-safe: ``_SGR_RE`` (whose param class matches exactly
+    what ``sanitize_ansi`` keeps) splits the line into SGR tokens and the plain
+    runs between them, and ``str.translate`` is applied **only** to the plain
+    runs — an SGR sequence is re-emitted verbatim, so a glyph is never
+    substituted for a byte inside an escape and a colour run is never split.
+
+    Internal spacing is git's lane alignment and is preserved; only trailing
+    spaces are stripped (git right-pads every art cell, and a trailing run
+    carries no lane information). ``rstrip`` strips whitespace only, leaving
+    any trailing reset (``\\e[m``) intact; the colour codes are zero-width, so
+    width / alignment math (``cell_width`` strips escapes) is unaffected.
     """
-    return art.translate(_GRAPH_TABLE).rstrip()
+    art = sanitize_ansi(art)
+    out = []
+    pos = 0
+    for m in _SGR_RE.finditer(art):
+        if m.start() > pos:
+            out.append(art[pos:m.start()].translate(_GRAPH_TABLE))
+        out.append(m.group(0))                      # SGR token, verbatim
+        pos = m.end()
+    if pos < len(art):
+        out.append(art[pos:].translate(_GRAPH_TABLE))
+    return ''.join(out).rstrip()
 
 
 def _commit_graph_items(revs, paths, ns):
@@ -852,10 +879,13 @@ def _commit_graph_items(revs, paths, ns):
 
     The tree-mode counterpart to ``_commit_log_items``. ``git log --graph``
     does ALL the lane assignment and prepends its art to every output line;
-    we render those lines verbatim (after glyph substitution) rather than
-    re-deriving the graph. The ``\\x1f`` (unit separator) format keeps the
-    art — which freely contains spaces and ``|`` / ``/`` — unambiguously
-    apart from the commit fields:
+    we render those lines verbatim (after sanitise + glyph substitution)
+    rather than re-deriving the graph. ``--color=always`` makes git colour the
+    graph drawing (and the ``%D`` decorations) with its own ANSI; the SGR uses
+    ``\\e``, never ``\\x1f``, so the field split below is unaffected. The
+    ``\\x1f`` (unit separator) format keeps the art — which freely contains
+    spaces, colour codes and ``|`` / ``/`` — unambiguously apart from the
+    commit fields:
 
       * ``<art>\\x1f%H\\x1f%an\\x1f%ar\\x1f%s\\x1f%D`` for a commit line —
         splitting on ``\\x1f`` yields the art then the five fields;
@@ -863,24 +893,18 @@ def _commit_graph_items(revs, paths, ns):
         split yields a single element.
 
     Commit lines build the same columnar Item as ``_commit_log_items`` and
-    additionally carry ``col_graph`` (the translated art). Filler lines
-    become inert Items (``id='filler:<ns>:<n>'`` — ``n`` is a running counter
-    that resets per build, ``ns`` is the caller's namespace key making the id
-    globally unique across builds; ``has_children=False``, no ``col_sha``)
-    carrying only ``col_graph``. ``_parse_id`` partitions on the first ``:``
-    so a ``filler:…`` id still maps to kind ``other`` and stays inert on
-    every drill-down / action / preview path. git's line order (commits and
-    fillers interleaved) is preserved.
-
-    The ordered ``(id, is_filler)`` list is recorded under ``ns`` in the
-    module dict ``_graph_rows_by_ns`` so ``_skip_fillers`` can find a
-    filler's nearest non-filler neighbour by id position. Each ns owns its
-    own entry, so a fresh build of one ref doesn't clobber another's list.
-    Commits mode is flat, so a build's order matches the visible row order
-    until a commit is expanded — and the hook only uses it for *id*-relative
-    scanning, never by visible index, so an expansion can't desync it.
+    additionally carry ``col_graph`` (the sanitised, coloured, translated art).
+    Filler lines become ``meta=True`` Items (``id='filler:<ns>:<n>'`` — ``n``
+    is a running counter that resets per build, ``ns`` is the caller's
+    namespace key making the id globally unique across builds;
+    ``has_children=False``, no
+    ``col_sha``) carrying only ``col_graph``. ``_parse_id`` partitions on the
+    first ``:`` so a ``filler:…`` id still maps to kind ``other`` and stays
+    inert on every drill-down / action / preview path. ``meta=True`` makes the
+    framework skip the cursor over the row (preventively) and never select it.
+    git's line order (commits and fillers interleaved) is preserved.
     """
-    args = ['log', '--graph', '--no-color',
+    args = ['log', '--graph', '--color=always',
             '--format=\x1f%H\x1f%an\x1f%ar\x1f%s\x1f%D', '-n', str(_log_limit)]
     args += list(revs)
     if paths:
@@ -889,7 +913,6 @@ def _commit_graph_items(revs, paths, ns):
     if result.returncode != 0:
         return _err_item(f'git log failed: {result.stderr.strip()}')
     items = []
-    row_ids = []
     filler_n = 0
     for line in result.stdout.splitlines():
         parts = line.split('\x1f')
@@ -903,16 +926,15 @@ def _commit_graph_items(revs, paths, ns):
             item.chips = _parse_decorations(deco)
             item.col_graph = _graph_translate(art)
             items.append(item)
-            row_ids.append((item.id, False))
         else:
             # Filler line: the whole line is graph art (no commit fields).
+            # ``meta=True`` -> the framework skips the cursor over it and
+            # never selects it; the ns/counter id stays unique across builds.
             item = Item(id=f'filler:{ns}:{filler_n}', title='',
-                        has_children=False)
+                        has_children=False, meta=True)
             item.col_graph = _graph_translate(line)
             items.append(item)
-            row_ids.append((item.id, True))
             filler_n += 1
-    _graph_rows_by_ns[ns] = row_ids
     return items
 
 
@@ -942,18 +964,22 @@ def git_row_content(item, ctx):
     decorations unchanged. Only the content region is taken over; chrome
     (tree indent + ▼/▶) stays framework-owned.
 
-    ``gfg`` (the graph foreground) is the terminal default — ``style('')`` —
-    so the art is monochrome and git's connectors read as plain box lines.
+    The art (``col_graph``) carries git's own ANSI colour, so it is emitted
+    as a segment with **no framework fg** (``(graph, None, False)``) — git's
+    SGR shows through unmodified. The per-segment writer truncates that text
+    ANSI-aware and the rule-3 conditional trailing reset (``\\e[m``) keeps the
+    colour from bleeding into the subject or the next pane. The colour codes
+    are zero-width (``cell_width`` strips them), so the columns stay aligned.
     """
     w = ctx.max_col_width
-    gfg, gbold = style('')                          # graph: terminal default
     if getattr(item, 'col_sha', None) is None:
         graph = getattr(item, 'col_graph', None)
         if graph is None:
             return default_row_content(item, ctx)   # non-commit / synthetic row
-        # Filler row: blank-pad the sha+author+date span, then the art.
+        # Filler row: blank-pad the sha+author+date span, then the coloured
+        # art (git's own SGR -> fg=None so it shows through).
         pad = (w('col_sha') + 2 + w('col_author') + 2 + w('col_date') + 2)
-        return [(' ' * pad, gfg, gbold), (graph, gfg, gbold)]
+        return [(' ' * pad, None, False), (graph, None, False)]
     yfg, ybold = style('yellow')
     dfg, dbold = style('dim')
     segments = [
@@ -961,10 +987,13 @@ def git_row_content(item, ctx):
         (cell_ljust(item.col_author, w('col_author')) + '  ', dfg, dbold),
         (cell_ljust(item.col_date, w('col_date')) + '  ', dfg, dbold),
     ]
-    # Commit graph art (tree mode) between the date column and the chips.
+    # Commit graph art (tree mode) between the date column and the chips —
+    # git's own ANSI colour, so fg=None lets its SGR show through. git
+    # closes each coloured connector with a reset, so the appended gap space
+    # is uncoloured; rule-3 adds a trailing reset besides.
     graph = getattr(item, 'col_graph', None)
     if graph is not None:
-        segments.append((graph + ' ', gfg, gbold))
+        segments.append((graph + ' ', None, False))
     # Ref decorations between the date column and the subject.
     for text, stylename in getattr(item, 'chips', None) or ():
         cfg, cbold = style(stylename)
@@ -1388,120 +1417,21 @@ def toggle_tree(ctx):
     ctx.refresh()
 
 
-def _skip_fillers(ctx, cur_id):
-    """``on_cursor_change`` hook — bounce up/down off tree-mode filler rows.
-
-    Filler rows (``id='filler:<ns>:<n>'``) only exist in tree mode and carry
-    no content; landing on one with up/down is jarring, so we re-issue a move
-    past the filler to the next real commit row in the direction of travel.
-
-    Direction is inferred from the cursor's index delta: a ``ctx.cursor_index``
-    below the previous fire's index means we travelled up (-1); anything else
-    (advanced, or the degenerate equal case) is down (+1, the default). The
-    index is used ONLY for the sign — to find the neighbour we scan the
-    recipe's own ordered build list (the ``(id, is_filler)`` entry in
-    ``_graph_rows_by_ns`` that holds this filler) by *id position*, because an
-    expanded commit inserts file rows into the visible list and would desync a
-    visible-index walk. If the travel direction runs off the end (a filler run
-    at the top/bottom with no commit beyond it), we reverse and take the
-    nearest commit the other way.
-
-    Loop guard: ``cursor_to`` re-fires this hook with the landed-on id. When
-    ``cur_id`` is NOT a filler (the common case, and every bounce's
-    follow-up fire) we simply record the position and return — no second
-    move. We deliberately do NOT record the filler's own index on a bounce:
-    leaving ``_prev_cursor_index`` at the pre-bounce value lets the
-    non-filler re-fire set it, so the NEXT user move infers direction from
-    where the cursor actually came to rest. Cheap no-op when tree mode is
-    off or the row is anything but a filler.
-    """
-    global _prev_cursor_index
-    if (not _tree_mode or not isinstance(cur_id, str)
-            or not cur_id.startswith('filler:')):
-        # Not on a filler (or no fillers exist): just remember where the
-        # cursor is so the next move can infer its direction, then return.
-        _prev_cursor_index = ctx.cursor_index
-        return
-
-    # +1 (down) when the index advanced; -1 (up) only on a clear decrease.
-    # A non-decreasing delta (incl. the degenerate equal case) defaults to
-    # down, per the spec.
-    direction = -1 if ctx.cursor_index < _prev_cursor_index else 1
-    target = _next_non_filler(cur_id, direction)
-    if target is None:
-        # A run at the very top/bottom — nothing this way; reverse.
-        target = _next_non_filler(cur_id, -direction)
-    if target is not None:
-        # Re-fires this hook with the (non-filler) landed id, which the
-        # guard above turns into a position-record no-op. Leave
-        # _prev_cursor_index untouched so that re-fire sets it.
-        ctx.cursor_to(target)
-
-
-def _next_non_filler(filler_id, direction):
-    """Nearest non-filler id from ``filler_id``, scanning its build's list.
-
-    Filler ids are globally unique (namespaced per build), so ``filler_id``
-    lives in exactly one of the ordered ``(id, is_filler)`` lists in
-    ``_graph_rows_by_ns``. Locate that list, find ``filler_id`` in it, then
-    walk ``direction`` (+1 down / -1 up) to the first row whose ``is_filler``
-    is False and return its id. Returns ``None`` if the id is in no list
-    (e.g. a stale cursor after a refresh) or no commit lies that way.
-    """
-    for rows in _graph_rows_by_ns.values():
-        pos = next((i for i, (rid, _) in enumerate(rows)
-                    if rid == filler_id), None)
-        if pos is None:
-            continue
-        i = pos + direction
-        while 0 <= i < len(rows):
-            rid, is_filler = rows[i]
-            if not is_filler:
-                return rid
-            i += direction
-        return None
-    return None
-
-
-def _on_selection_change(ctx, ids):
-    """``on_selection_change`` hook — keep filler rows unselectable and bounce
-    the cursor off a filler after a select-and-move.
-
-    The framework calls this with the current selected ids (``ids``). Space
-    (``_select_toggle_down``) / Alt-Space (``_select_toggle_up``) toggle the
-    cursor row and step the cursor by mutating ``state.cursor`` directly,
-    which does NOT fire ``on_cursor_change`` — so ``_skip_fillers`` never runs
-    for those moves. We therefore re-run the same bounce here.
-
-    We also strip any ``filler:`` ids out of the selection: a filler is an
-    inert connector row and must not be selectable. Doing it here covers every
-    selection path (space, Ctrl-A select-all, invert). ``ctx.select`` re-fires
-    this hook, but the next pass finds no fillers and stops, so there is no
-    loop.
-    """
-    keep = [i for i in ids
-            if not (isinstance(i, str) and i.startswith('filler:'))]
-    if len(keep) != len(ids):
-        ctx.select(keep, replace=True)
-    cur = ctx.cursor
-    _skip_fillers(ctx, cur.id if cur is not None else None)
-
-
 # ---- entry point ---------------------------------------------------------
 
 
 _HELP_INTRO_TMPL = """\
 browse-git — a tig-like browser over a git repository.
 
-Usage: browse-git [<dir>] [-n NUMBER] [--mode NAME] [--tree] [<rev>…] [-- <path>…]
+Usage: browse-git [<dir>] [-n NUMBER] [--mode NAME] [--no-tree] [<rev>…] [-- <path>…]
   <dir>         A leading directory in another git repo browses THAT repo
                 (cwd need not be a repo). A subdir of the current repo
                 stays a pathspec filter instead.
   -n NUMBER     Cap the commit / reflog list to this many entries
                 (default: {default}).
   --mode NAME   Start in one of: {modes}. Default: commits.
-  --tree        Show git's commit-graph column in the commit log
-  --no-tree     (default off; toggle at runtime with 't').
+  --no-tree     Hide git's commit-graph column in the commit log
+  --tree        (default on; toggle at runtime with 't').
   <rev>…        A rev / sha roots the commits log at it (git log <rev>).
   <path>…       A path filters the commits log to commits touching it.
   -- <path>…    Everything after -- is forced to be a pathspec.
@@ -1625,8 +1555,6 @@ def main():
         format_row_content=git_row_content,
         actions=actions,
         on_enter=on_enter,
-        on_cursor_change=_skip_fillers,
-        on_selection_change=_on_selection_change,
         show_ids='never',
         help_intro=_HELP_INTRO_TMPL.format(
             default=_LOG_LIMIT, modes=', '.join(_MODES)),

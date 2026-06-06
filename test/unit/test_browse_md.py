@@ -3461,6 +3461,7 @@ def _load_framework():
     actions.mark_visible_dirty = state.mark_visible_dirty
     actions.current_scope = state.current_scope
     actions.mark_cursor_changed = state.mark_cursor_changed
+    actions._resolve_landing = state._resolve_landing
     actions.Mode = state.Mode
     actions.scope_into = state.scope_into
     actions.scope_out = state.scope_out

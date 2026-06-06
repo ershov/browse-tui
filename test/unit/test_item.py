@@ -13,6 +13,7 @@ _spec.loader.exec_module(_mod)
 
 Item = _mod.Item
 to_item = _mod.to_item
+_item_extras = _mod._item_extras
 
 
 class TestItemConstruction(unittest.TestCase):
@@ -46,6 +47,14 @@ class TestItemConstruction(unittest.TestCase):
     def test_boundary_flag_settable(self):
         item = Item(id='x', boundary=True)
         self.assertTrue(item.boundary)
+
+    def test_meta_defaults_false(self):
+        item = Item(id='x')
+        self.assertFalse(item.meta)
+
+    def test_meta_flag_settable(self):
+        item = Item(id='x', meta=True)
+        self.assertTrue(item.meta)
 
     def test_filter_hidden_defaults_false(self):
         item = Item(id='x')
@@ -93,6 +102,30 @@ class TestToItemFromItem(unittest.TestCase):
         original = Item(id='x', title='X')
         result = to_item(original)
         self.assertIs(result, original)
+
+    def test_passthrough_preserves_meta(self):
+        original = Item(id='x', meta=True)
+        result = to_item(original)
+        self.assertIs(result, original)
+        self.assertTrue(result.meta)
+
+
+class TestItemExtras(unittest.TestCase):
+    """_item_extras carries recipe attrs but excludes declared fields."""
+
+    def test_declared_meta_not_in_extras(self):
+        # ``meta`` is a declared dataclass field, so it is excluded from
+        # the carried-extras set (same as ``hidden`` / ``boundary``).
+        item = Item(id='x', meta=True)
+        extras = _item_extras(item)
+        self.assertNotIn('meta', extras)
+
+    def test_recipe_attr_in_extras_but_not_declared(self):
+        item = Item(id='x', meta=True)
+        item.size = 7
+        extras = _item_extras(item)
+        self.assertEqual(extras.get('size'), 7)
+        self.assertNotIn('meta', extras)
 
 
 class TestToItemFromStr(unittest.TestCase):
@@ -162,6 +195,17 @@ class TestToItemFromDict(unittest.TestCase):
         self.assertEqual(item.id, 'x')
         self.assertEqual(item.title, 'X')
         self.assertTrue(item.has_children)
+
+    def test_meta_via_dict(self):
+        item = to_item({'id': 'x', 'meta': True})
+        self.assertEqual(item.id, 'x')
+        self.assertTrue(item.meta)
+        # Declared field, so it is coerced — never carried as an extra.
+        self.assertNotIn('meta', _item_extras(item))
+
+    def test_meta_defaults_false_via_dict(self):
+        item = to_item({'id': 'x'})
+        self.assertFalse(item.meta)
 
     def test_extra_keys_become_attrs(self):
         item = to_item({'id': 'x', 'size': 1234})

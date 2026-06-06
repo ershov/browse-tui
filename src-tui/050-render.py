@@ -46,6 +46,12 @@ Out of scope (deferred to phase 2/3):
     already wired here so phase 2 only changes one site.
 """
 
+# In the concatenated production build ``re`` is already imported by an
+# earlier numbered file; the re-import is a harmless no-op there but lets the
+# module-level regex in ``_sanitize_ansi`` compile when this file is exec'd
+# standalone (the isolated unit-test load).
+import re
+
 
 # tag_style name → (fg color, bold flag). Values are 256-colour palette
 # indices that ``020-terminal.set_style`` understands. The empty-string
@@ -160,6 +166,61 @@ def _sanitize_preview(text, *, ansi_on=True):
     table = (_PREVIEW_SANITIZE_TABLE_ANSI if ansi_on
              else _PREVIEW_SANITIZE_TABLE_RAW)
     return text.translate(table)
+
+
+# Three left-to-right alternatives, matched per ESC by ``_sanitize_ansi``:
+#   1. ``\e[`` <non-final bytes> <final> — a *complete* CSI. ``[^@-~]*``
+#      consumes params/intermediates (and anything else not in the 0x40-0x7e
+#      final-byte range), then one final byte ``[@-~]`` captured in group 1.
+#      Bounded char-classes mean it never swallows text between two escapes.
+#   2. ``\e[`` <non-final bytes> end-of-string — a *dangling* CSI with no
+#      final byte; ``\Z`` anchors it to the true end (never before a newline).
+#   3. ``\e`` alone — a bare ESC (lone, or introducing a non-CSI escape).
+# The replacement keeps the match iff alt 1 matched with final byte ``m``
+# (an SGR sequence); every other match is dropped.
+_SANITIZE_ANSI_RE = re.compile(r'\x1b\[[^@-~]*([@-~])|\x1b\[[^@-~]*\Z|\x1b')
+
+
+def _sanitize_ansi_repl(m):
+    # Keep only complete SGR sequences (alt 1 with final byte 'm'); drop
+    # every other CSI, dangling ``\e[``, and bare ESC.
+    return m.group(0) if m.group(1) == 'm' else ''
+
+
+def _sanitize_ansi(s):
+    """Strip every escape from ``s`` *except* SGR colour sequences (sec 4.2 #1).
+
+    The shared escape-sanitiser for the two paths that pass attacker- or
+    recipe-supplied ANSI to the terminal: a raw ``str`` rendered as **row
+    content** (via :func:`_normalize_content`) and the **preview pane**
+    text (after :func:`_sanitize_preview`'s control-char pass). Both call
+    *this* function so they behave identically.
+
+    Kept verbatim: a complete SGR sequence ``\\e[ <params> m`` (final byte
+    ``m``) — that's the colour channel. Dropped:
+
+    * any other complete CSI (``\\e[ <params> <final>`` whose final byte is
+      not ``m`` — cursor moves ``H``/``A``, erases ``J``/``K``, scroll
+      regions, …);
+    * a **dangling** ``\\e[`` with no final byte before the end of string;
+    * a **bare** ``\\e`` not introducing a CSI (a lone ESC, or ESC starting
+      a non-CSI escape such as ``\\eM`` — only the ESC byte is removed).
+
+    A single greedy :func:`re.sub` pass over :data:`_SANITIZE_ANSI_RE` (whose
+    three alternatives match exactly one ESC each, with bounded ``[^@-~]*``
+    runs so inter-escape text is never swallowed and the ``m`` boundary is
+    exact). Strings with no ESC return unchanged (the common case — plain
+    content never enters the substitution).
+    """
+    if '\033' not in s:
+        return s
+    return _SANITIZE_ANSI_RE.sub(_sanitize_ansi_repl, s)
+
+
+# Public, recipe-facing name for sanitising external ANSI before embedding it
+# in a segment's text (segment text bypasses the framework's on-receipt
+# sanitise in ``_normalize_content``, which only sanitises *string* content).
+sanitize_ansi = _sanitize_ansi
 
 
 def _id_visible(item, show_ids):
@@ -1131,6 +1192,22 @@ def cell_fit(s, width, *, justify='left', trim='end', ellipsis='…',
     return pad(s, width, fill)
 
 
+def _collapse_visible(segments):
+    """Collapse ``segments`` to a single plain VISIBLE-TEXT line.
+
+    The cursor-row and search-match overlays render each row as plain text
+    under a reverse-video / highlight style, so all per-segment styling is
+    dropped: segment ``fg`` / ``bold`` are discarded (only ``s[0]``, the
+    text, is kept) **and** any SGR embedded in a segment's text is stripped
+    with the same ``_ANSI_CSI_RE`` strip ``cell_width`` / :func:`_visible_len`
+    use to measure. This keeps the overlay clean even for a row whose
+    content was a raw ANSI string (design sec 4.1) — the embedded colour
+    can't fight the reverse / highlight style. Width math is unaffected:
+    the stripped text has exactly the visible width the styled text did.
+    """
+    return ''.join(_ANSI_CSI_RE.sub('', s[0]) for s in segments)
+
+
 def _write_segments(segments, max_width, *, pad_to=0, row_bg=None,
                     row_fg=None):
     """Emit ``segments`` to the terminal, truncating at ``max_width`` cells.
@@ -1158,16 +1235,44 @@ def _write_segments(segments, max_width, *, pad_to=0, row_bg=None,
     pad on cell boundaries instead of overflowing the pane into the
     neighbour on the right.
 
+    A segment whose ``text`` carries embedded SGR (a raw ANSI string
+    normalised to one segment — design sec 4.1) is truncated **ANSI-aware**
+    via :func:`_truncate_visible` (escapes passed through, only visible
+    cells counted) instead of the plain :func:`_truncate_by_cells`, so the
+    escape bytes neither corrupt the width math nor get cut mid-sequence.
+    That embedded SGR was already **sanitised on receipt** by
+    :func:`_normalize_content` (design sec 4.2 #1 — only colour codes
+    survive), so the only escapes reaching here are SGR. This function then
+    finishes the §4.2 handling for such content: a **conditional trailing
+    reset** (#3 — ``\\e[m`` after the content iff any SGR was emitted, so a
+    colour run can't bleed into the pad / next pane) and the **background
+    restore** (#4 — re-emit the row bg (from the ``row_bg`` attribute) after
+    that reset whenever a row bg is set, since the reset clears the bg the
+    stripe needs). Plain segments (the overwhelming common case — colour
+    rides ``fg``, never the text) emit nothing extra and keep the existing
+    plain truncation byte-for-byte.
+
     Returns the number of cells written.
     """
     pos = 0
+    # Track whether the *emitted* content carried ANY SGR (design sec 4.2
+    # #3), so the trailing reset fires on what actually reached the screen
+    # — not on text that fell outside the width budget.
+    content_ansi = False
     for text, fg, bold in segments:
         if pos >= max_width:
             break
         remaining = max_width - pos
-        chunk, chunk_cells = _truncate_by_cells(text, remaining)
+        if '\033[' in text:
+            # ANSI-bearing text: truncate by visible cells, escapes intact.
+            chunk = _truncate_visible(text, remaining)
+            chunk_cells = _visible_len(chunk)
+        else:
+            chunk, chunk_cells = _truncate_by_cells(text, remaining)
         if not chunk:
             continue
+        if '\033[' in chunk:
+            content_ansi = True
         # Effective fg: segment's own ``fg`` wins; otherwise inherit
         # ``row_fg`` (when set).
         eff_fg = fg if fg is not None else row_fg
@@ -1178,6 +1283,26 @@ def _write_segments(segments, max_width, *, pad_to=0, row_bg=None,
         else:
             write(chunk)
         pos += chunk_cells
+    # Conditional trailing reset (design sec 4.2 #3): if the emitted content
+    # carried ANY SGR, close it with ``\e[m`` so an unterminated colour run
+    # can't bleed into the trailing pad / the next pane on this row. Plain
+    # content (the common case) emits nothing extra — byte-for-byte
+    # unchanged. (A styled chunk already had its own ``reset_style``; the
+    # extra reset here is harmless and keeps the rule uniform across the
+    # bare-write passthrough path, which has no per-chunk reset.)
+    if content_ansi:
+        write('\033[m')
+        # Background restore (design sec 4.2 #4): re-apply the row bg after
+        # the reset whenever ``row_bg`` is set (driven by the row's bg
+        # attribute, NOT a content scan). The ``\e[m`` reset clears the bg
+        # regardless of whether the content set one, so restoring on the
+        # attribute keeps the row stripe alive even when the content carried
+        # only fg codes. Emitted as the bare background SGR (``\e[48;5;Nm``)
+        # rather than via ``set_style`` so it's the exact restore byte the
+        # rule specifies and is distinct from the stripe pad's own
+        # ``set_style`` below.
+        if row_bg is not None:
+            write(f'\033[48;5;{row_bg}m')
     # ``row_bg`` extends the highlight across the trailing pad so the
     # row reads as a stripe rather than a tag-shaped patch. We bump
     # ``pad_to`` up to ``max_width`` in that case, but only locally —
@@ -1577,12 +1702,22 @@ def render_list(browser, rect, *, rightmost: bool = False):
                 kind=entry.kind,
                 list_width=width,
             )
-            segments = browser._row_segments(item, ctx)
+            # A whole-row ``format_row`` override may return a ``str`` (ANSI
+            # allowed) rather than a segment list (design sec 4.1);
+            # ``_normalize_content`` coerces it to a single segment so the
+            # rest of the pipeline sees a uniform segment list. The default
+            # composer already normalised its content hook, so this is a
+            # no-op on that path. (Same module namespace in the concatenated
+            # build; injected in the isolated unit-test load.)
+            segments = _normalize_content(browser._row_segments(item, ctx))
 
         if is_cursor_line:
             # Reverse video for the cursor line — collapse segments to a
-            # plain line so the search-highlighter can overlay it.
-            line = ''.join(s[0] for s in segments)
+            # plain VISIBLE-TEXT line so the search-highlighter can overlay
+            # it. ``_collapse_visible`` drops segment ``fg`` (as ``s[0]``
+            # always has) *and* any embedded SGR in a segment's text, so a
+            # str-content row under the cursor reverses cleanly (sec 4.1).
+            line = _collapse_visible(segments)
             line, _ = _truncate_by_cells(line, width)
             _write_highlighted(
                 line, reverse=True, pad_to=width,
@@ -1595,8 +1730,18 @@ def render_list(browser, rect, *, rightmost: bool = False):
             # match across the visible list, not only the cursor row.
             # Non-matches (and the no-query case) keep the per-segment
             # writer so tag colours and the #id segment stay coloured.
+            #
+            # Meta rows are highlight-gated by ``meta_search_highlight``
+            # (§5 meta-rows design): off by default so a meta row never
+            # lights up under a query; on lets a matching meta row paint
+            # spans like a normal row. Search *navigation* (n/N) always
+            # skips meta regardless — that is ``_search_find``'s job.
+            # ``_search_query`` gates the whole clause so the no-query
+            # path stays cheap (no kind / config / match work).
             if (browser._search_query
-                    and entry.kind == 'normal'
+                    and (entry.kind == 'normal'
+                         or (entry.kind == 'meta'
+                             and browser.meta_search_highlight))
                     and _search_matches(
                         _search_text(
                             item,
@@ -1604,7 +1749,9 @@ def render_list(browser, rect, *, rightmost: bool = False):
                             is_current_scope=(item.id == current_scope_id),
                         ),
                         browser._search_query)):
-                line = ''.join(s[0] for s in segments)
+                # Same VISIBLE-TEXT collapse as the cursor line: drop fg and
+                # any embedded SGR so the highlight overlay reads cleanly.
+                line = _collapse_visible(segments)
                 line, _ = _truncate_by_cells(line, width)
                 _write_highlighted(
                     line, pad_to=0,
@@ -1861,6 +2008,15 @@ def render_preview(browser, rect, *, info=False, has_header=True,
         # sequences. The walker below sees no ESC bytes in that case and
         # falls through to plain wrap.
         text = _sanitize_preview(text, ansi_on=ansi_on)
+        if ansi_on:
+            # Escape-level sanitise (sec 4.2 #1), shared with the row-content
+            # path: keep SGR, drop all other CSI and any bare/dangling ESC.
+            # ``_wrap_preview_line`` also drops non-SGR CSI token-by-token,
+            # but only the regex-matchable ones — this additionally removes a
+            # bare ESC the tokeniser would otherwise pass through as text, and
+            # makes the two paths behave identically. (Raw mode already
+            # mapped every ESC to '?', so there's nothing left to strip.)
+            text = _sanitize_ansi(text)
 
         # Wrap content to the rect's width.
         #

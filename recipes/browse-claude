@@ -4377,8 +4377,23 @@ def _list_tree_roots(jsonl_path):
     """
     td = _scan_tree(jsonl_path)
     out = []
-    for orphan in _orphan_subagents_for_session(jsonl_path, td):
-        out.append(orphan)
+    orphans = _orphan_subagents_for_session(jsonl_path, td)
+    # When the session has orphaned subagents, bracket the orphan block
+    # with two ``meta`` dividers so the user sees where the unwired
+    # subagents end and the turn/span umbrellas begin. Emit ONLY when
+    # orphans are present — a session without them renders exactly as
+    # before. Ids are session-namespaced (``<jsonl>#sep:...``) so they
+    # stay unique across cached sessions AND stable, doubling as insertion
+    # sentinels for the ``update_data`` positioning API (meta-rows design
+    # sec Migrations → browse-claude). The framework skips the cursor over
+    # them, never selects them, and (with ``meta_filter_mode='show'``)
+    # keeps them visible under an active filter.
+    if orphans:
+        out.append(Item(id=f'{jsonl_path}#sep:subagents',
+                        title='--- Subagents:', meta=True))
+        out.extend(orphans)
+        out.append(Item(id=f'{jsonl_path}#sep:session',
+                        title='--- Session:', meta=True))
     for entry in td.roots_in_order:
         if entry['kind'] == 'turn':
             line = entry['line']
@@ -6407,6 +6422,10 @@ def main():
         # the title alone identifies the row. ``y`` action still surfaces
         # the full id on demand.
         show_ids='never',
+        # Keep the tree-mode ``--- Subagents: / --- Session:`` meta
+        # dividers (emitted in ``_list_tree_roots``) visible even while a
+        # voice-only filter is active, so the section labels persist.
+        meta_filter_mode='show',
         get_children=get_children,
         get_preview=get_preview,
         root_id=None,

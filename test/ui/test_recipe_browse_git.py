@@ -179,6 +179,83 @@ def _make_repo_with_conflict(tmpdir):
     return tmpdir, conflicted
 
 
+def _make_merge_repo(tmpdir):
+    """Init a repo with a non-fast-forward merge so ``--graph`` emits fillers.
+
+    Builds ``base`` on ``main``, a divergent ``feat`` branch, more work on
+    ``main``, then a ``--no-ff`` merge. ``git log --graph`` then prints
+    connector-only lines (``|\\`` after the merge node, ``|/`` joining the
+    lanes back) that carry no commit — the recipe turns those into ``meta``
+    filler rows. Visible top-down order in tree mode is::
+
+        merge feature   (commit)
+        |\\              (filler, meta)
+        feat            (commit)
+        mainwork        (commit)
+        |/              (filler, meta)
+        base            (commit)
+    """
+    env = {
+        **os.environ,
+        'GIT_AUTHOR_NAME': 'Test', 'GIT_AUTHOR_EMAIL': 'test@example.com',
+        'GIT_COMMITTER_NAME': 'Test', 'GIT_COMMITTER_EMAIL': 'test@example.com',
+    }
+    def git(*args):
+        subprocess.run(['git', '-C', tmpdir, *args], check=True,
+                       capture_output=True, env=env)
+    git('init', '-q', '-b', 'main')
+    git('config', 'user.name', 'Test')
+    git('config', 'user.email', 'test@example.com')
+    for name, content in (('a.txt', 'base\n'),):
+        with open(os.path.join(tmpdir, name), 'w') as f:
+            f.write(content)
+        git('add', name)
+    git('commit', '-q', '-m', 'base commit')
+    git('checkout', '-q', '-b', 'feature')
+    with open(os.path.join(tmpdir, 'b.txt'), 'w') as f:
+        f.write('feat\n')
+    git('add', 'b.txt')
+    git('commit', '-q', '-m', 'feat commit')
+    git('checkout', '-q', 'main')
+    with open(os.path.join(tmpdir, 'c.txt'), 'w') as f:
+        f.write('mainwork\n')
+    git('add', 'c.txt')
+    git('commit', '-q', '-m', 'mainwork commit')
+    git('merge', '-q', '--no-ff', 'feature', '-m', 'merge feature')
+    return tmpdir
+
+
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
+
+
+def _cursor_row(screen):
+    """Return the ANSI-stripped text of the reverse-video cursor row.
+
+    The cursor row carries the ``ESC[7m`` reverse-video sequence; find it,
+    strip every escape, and return the plain text (trailing pad stripped).
+    Returns ``None`` when no cursor marker is on screen.
+    """
+    for line in screen.splitlines():
+        if '\x1b[7m' in line:
+            return _ANSI_RE.sub('', line).rstrip()
+    return None
+
+
+def _selection_marked_rows(screen):
+    """Plain text of every list row carrying the ``*`` selection marker.
+
+    A selected row renders ``*`` in its chrome's marker column; the cursor
+    row also carries the reverse-video escape. Strip ANSI, keep only rows
+    whose first non-space glyph is the selection ``*``.
+    """
+    rows = []
+    for line in screen.splitlines():
+        plain = _ANSI_RE.sub('', line)
+        if plain.lstrip().startswith('*'):
+            rows.append(plain.rstrip())
+    return rows
+
+
 class TestBrowseGit(unittest.TestCase):
 
     def test_lists_commits(self):
@@ -504,6 +581,175 @@ class TestBrowseGit(unittest.TestCase):
                 t.send('Right')
                 t.wait_for('conflict.txt', timeout=5.0)
                 t.send('q')
+
+
+class TestBrowseGitTreeMeta(unittest.TestCase):
+    """Tree-mode filler rows are framework ``meta`` rows (ticket #741).
+
+    Drives the real binary against a ``--no-ff`` merge repo whose
+    ``git log --graph`` emits connector-only filler lines. The recipe marks
+    those filler Items ``meta=True``; the framework then skips the cursor
+    over them (preventively, no bounce) and never selects them. Also checks
+    the graph art stays aligned under the commit rows' graph column.
+    """
+
+    def test_cursor_skips_filler_rows_preventively(self):
+        """Down from the merge commit lands on commits, never on a filler.
+
+        Visible order is merge / |\\ (filler) / feat / mainwork / |/
+        (filler) / base. Stepping Down must land on feat, then mainwork,
+        then base — each step skipping any interleaved filler with no
+        intermediate landing on the connector-only rows.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_merge_repo(tmp)
+            with TmuxFixture(cols=120, rows=30) as t:
+                t.send_line(f'cd {tmp}')
+                t.launch(_BIN, '--run-py', _RECIPE, '--tree')
+                t.wait_for('merge feature', timeout=5.0)
+                t.wait_stable()
+                # Cursor starts on the newest (merge) commit.
+                self.assertIn('merge feature', _cursor_row(t.capture(colors=True)))
+                # Each Down skips the connector filler(s) and lands on the
+                # next commit subject — never on a connector-only row.
+                for expected in ('feat commit', 'mainwork commit', 'base commit'):
+                    t.send('Down')
+                    t.wait_stable()
+                    row = _cursor_row(t.capture(colors=True))
+                    self.assertIsNotNone(row, 'cursor marker vanished')
+                    self.assertIn(expected, row,
+                                  f'Down did not land on {expected!r}; '
+                                  f'cursor row was {row!r}')
+
+    def test_graph_art_renders_aligned_under_commit_column(self):
+        """Filler connector art lines up under the commit rows' bullet column.
+
+        The merge node's bullet and the connector art on the surrounding
+        filler rows share the same horizontal offset — meta chrome blanks the
+        marker/expander glyphs but preserves their width, so the graph column
+        stays aligned.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_merge_repo(tmp)
+            with TmuxFixture(cols=120, rows=30) as t:
+                t.send_line(f'cd {tmp}')
+                t.launch(_BIN, '--run-py', _RECIPE, '--tree')
+                t.wait_for('merge feature', timeout=5.0)
+                t.wait_stable()
+                plain = _ANSI_RE.sub('', t.capture())
+                lines = plain.splitlines()
+                # The merge commit's row carries a bullet '•' (its node).
+                merge_row = next(ln for ln in lines if 'merge feature' in ln)
+                bullet_col = merge_row.index('•')
+                # A connector-only filler row (the '|\' below the merge node,
+                # translated to '│\') carries no commit text; its first lane
+                # glyph aligns at the same column as the commit bullet.
+                filler_row = next(
+                    ln for ln in lines
+                    if '│' in ln and 'commit' not in ln and 'merge' not in ln)
+                self.assertEqual(filler_row.index('│'), bullet_col,
+                                 'filler connector art is not aligned under '
+                                 f'the commit bullet column.\n{plain}')
+
+    def test_graph_art_is_colored_not_monochrome(self):
+        """The graph connectors render in git's NATIVE colour (ticket #756).
+
+        ``--color=always`` makes git colour the lane connectors; the recipe
+        passes that ANSI through (fg=None) so it reaches the screen. On a
+        ``--no-ff`` merge the lanes use *different* colours per lane, so the
+        coloured capture must show the connector glyphs (``│`` / ``\\`` /
+        ``/``) wrapped in an SGR *foreground* sequence, with at least two
+        DISTINCT colours present — proving the art is no longer monochrome.
+
+        Also asserts no colour bleeds into the subject: every connector
+        colour run is closed (by git's own reset and/or the framework's
+        rule-3 trailing ``\\e[m``) before the commit subject text, so a
+        subject line never carries a lane colour straight up to its words.
+        """
+        # An SGR foreground colour: 30-37 / 90-97 (basic) or 38;5;N (256).
+        fg_sgr = re.compile(r'\x1b\[(?:3[0-7]|9[0-7]|38;5;\d+)m')
+        # A connector glyph immediately following an SGR fg run.
+        colored_connector = re.compile(
+            r'(\x1b\[(?:3[0-7]|9[0-7]|38;5;\d+)m)[│\\/•]')
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_merge_repo(tmp)
+            with TmuxFixture(cols=120, rows=30) as t:
+                t.send_line(f'cd {tmp}')
+                t.launch(_BIN, '--run-py', _RECIPE, '--tree')
+                t.wait_for('merge feature', timeout=5.0)
+                t.wait_stable()
+                colored = t.capture(colors=True)
+                # The connector glyphs carry git's colour: find the SGR fg
+                # codes that immediately precede a lane glyph.
+                hits = colored_connector.findall(colored)
+                self.assertTrue(
+                    hits,
+                    'no coloured graph connector found — the art rendered '
+                    f'monochrome.\n{colored}')
+                distinct = set(hits)
+                self.assertGreaterEqual(
+                    len(distinct), 2,
+                    'expected at least two distinct lane colours in the '
+                    f'merge graph, saw {distinct!r}.\n{colored}')
+                # No colour bleed into the subject: on the line carrying a
+                # commit subject, the subject text must not be tinted by a
+                # still-open lane colour. Check the merge subject's row — its
+                # graph segment ('•') is uncoloured here, so the text up to
+                # and including the subject carries no lingering fg run.
+                for line in colored.splitlines():
+                    if 'feat commit' in line:
+                        before_subject = line.split('feat commit')[0]
+                        # The last SGR before the subject must be a reset
+                        # (\e[m or \e[39m), not a colour-set, so the subject
+                        # is not tinted by the lane colour.
+                        sgrs = re.findall(r'\x1b\[[0-9;]*m', before_subject)
+                        if any(fg_sgr.match(s) for s in sgrs):
+                            # A fg colour appears before the subject — the
+                            # last one must have been closed by a reset.
+                            last_fg = max(
+                                i for i, s in enumerate(sgrs)
+                                if fg_sgr.match(s))
+                            resets = [
+                                i for i, s in enumerate(sgrs)
+                                if s in ('\x1b[m', '\x1b[0m', '\x1b[39m')]
+                            self.assertTrue(
+                                any(r > last_fg for r in resets),
+                                'a lane colour bled into the commit subject '
+                                f'(unreset fg before text).\n{line!r}')
+                        break
+
+    def test_filler_rows_are_unselectable(self):
+        """Ctrl-A select-all marks every commit but no connector filler row.
+
+        A meta row is never selectable, so select-all adds the 4 commits to
+        the selection (status bar ``[4]``) and leaves both connector-only
+        filler rows unmarked.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_merge_repo(tmp)
+            with TmuxFixture(cols=120, rows=30) as t:
+                t.send_line(f'cd {tmp}')
+                t.launch(_BIN, '--run-py', _RECIPE, '--tree')
+                t.wait_for('merge feature', timeout=5.0)
+                t.wait_stable()
+                t.send('C-a')           # select all (landable) rows
+                t.wait_stable()
+                cap = t.capture(colors=True)
+                marked = _selection_marked_rows(cap)
+                # All four commits are marked; the two connector fillers are
+                # not (they carry no '*').
+                self.assertEqual(len(marked), 4,
+                                 f'expected 4 selected commit rows, got '
+                                 f'{len(marked)}:\n{marked}')
+                for row in marked:
+                    self.assertNotIn(
+                        '│\\', row,
+                        f'a connector filler row was selected: {row!r}')
+                    # Every marked row carries commit metadata (a subject),
+                    # never a connector-only line.
+                    self.assertTrue(
+                        'commit' in row or 'feat' in row,
+                        f'a non-commit row was selected: {row!r}')
 
 
 if __name__ == '__main__':
