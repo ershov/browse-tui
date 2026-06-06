@@ -482,8 +482,8 @@ class TestRunInWorker(unittest.TestCase):
             b.stop_workers()
 
     def test_exception_surfaces_via_browser_error(self):
-        # An unhandled exception inside the callable should land on
-        # browser._error_text (via post + drain), not crash the process.
+        # An unhandled exception inside the callable should land in the
+        # message log (via post + drain), not crash the process.
         b = _make_browser()
         try:
             ctx = Context(b)
@@ -503,12 +503,13 @@ class TestRunInWorker(unittest.TestCase):
             # Allow a brief moment for the post to land before draining.
             for _ in range(20):
                 b.drain_main_queue()
-                if b._error_text:
+                if b._log:
                     break
                 time.sleep(0.01)
-            self.assertIn('run_in_worker', b._error_text)
-            self.assertIn('ValueError', b._error_text)
-            self.assertIn('explode', b._error_text)
+            log = '\n'.join(b._log)
+            self.assertIn('run_in_worker', log)
+            self.assertIn('ValueError', log)
+            self.assertIn('explode', log)
         finally:
             b.stop_workers()
 

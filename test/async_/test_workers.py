@@ -156,8 +156,9 @@ class TestChildrenWorkerFifo(unittest.TestCase):
             b.run_until_idle()
             self.assertTrue(p.done)
             self.assertEqual(b._state._children['A'], [])
-            self.assertIn('kaboom', b.error_text)
-            self.assertIn('RuntimeError', b.error_text)
+            log = '\n'.join(b._log)
+            self.assertIn('kaboom', log)
+            self.assertIn('RuntimeError', log)
         finally:
             b.stop_workers()
 

@@ -339,9 +339,10 @@ class TestWatch(unittest.TestCase):
             self.assertFalse(t.is_alive())
             # The error message is delivered to the main thread via post().
             b.drain_main_queue()
-            self.assertIn('watcher', b.error_text)
-            self.assertIn('RuntimeError', b.error_text)
-            self.assertIn('exploded', b.error_text)
+            log = '\n'.join(b._log)
+            self.assertIn('watcher', log)
+            self.assertIn('RuntimeError', log)
+            self.assertIn('exploded', log)
         finally:
             b.stop_workers()
 

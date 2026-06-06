@@ -2965,6 +2965,39 @@ def default_row(item, ctx):
 DEFAULT_HINT = ' /:search  ?:help  q:quit '
 
 
+# ---- info-bar notice + message log (see the flash/log/error design) ------
+#
+# ``flash`` / ``error`` write a single ``Notice`` slot on the Browser that
+# the info bar renders in place of the hint; ``log`` / ``flash(log=True)``
+# / ``error`` also append to a bounded in-memory ring buffer viewable via
+# the framework log pager. A flash auto-clears after ``_FLASH_DURATION``;
+# an error clears on the first keypress landing ``_ERROR_MIN_DISPLAY``
+# after it appeared.
+_FLASH_DURATION = 1.0      # seconds a flash notice stays before auto-clear
+_ERROR_MIN_DISPLAY = 1.0   # seconds before a keypress may clear an error
+_LOG_MAXLEN = 1000         # ring-buffer cap for the message log
+
+
+@dataclass
+class Notice:
+    """The single info-bar notice slot (last-write-wins).
+
+    ``kind`` is ``'flash'`` (transient, neutral) or ``'error'`` (red,
+    sticky until acknowledged). ``shown_at`` is a ``time.monotonic``
+    stamp; ``seq`` is a monotonic id so a late flash timer only clears
+    the notice it armed for (a newer notice bumps ``seq`` and survives).
+    """
+    text: str
+    kind: str
+    shown_at: float
+    seq: int
+
+
+def _log_entry(text: str) -> str:
+    """Format one message-log line: ``"HH:MM:SS  <text>"`` (wall clock)."""
+    return f'{time.strftime("%H:%M:%S")}  {text}'
+
+
 @dataclass
 class BrowserConfig:
     """Construction parameters for :class:`Browser`.
@@ -3542,9 +3575,17 @@ class Browser:
         self._children_thread = None
         self._preview_thread = None
 
-        # --- surfaced state for the renderer (filled in by ticket #10) ---
-        self._error_text = ''
-        self._message_text = ''
+        # --- info-bar notice + message log -------------------------------
+        # Single notice slot rendered in the info bar by ``flash`` /
+        # ``error`` (last-write-wins); ``_notice_seq`` lets a flash timer
+        # clear only the notice it armed for. ``_log`` is the bounded
+        # ``console.log``-style record fed by ``log`` / ``error`` /
+        # ``flash(log=True)``. ``_flash_timer`` is the live auto-clear
+        # timer (cancelled on shutdown).
+        self._notice: Optional['Notice'] = None
+        self._notice_seq = 0
+        self._log = deque(maxlen=_LOG_MAXLEN)
+        self._flash_timer: Optional[threading.Timer] = None
 
         # --- render-layer bookkeeping (ticket #10) ----------------------
         # Selective-redraw flag set; values are strings: 'list', 'preview',
@@ -3781,9 +3822,9 @@ class Browser:
         Uncaught exceptions in the callback don't crash the process --
         they're surfaced via ``self.error('watcher: ...')``. The watcher
         thread itself dies on the exception (no auto-restart) so authors
-        learn about the bug quickly. We deliver the error via ``post``
-        rather than writing ``self._error_text`` directly so the message
-        lands on the main thread alongside any other errors.
+        learn about the bug quickly. We deliver the error via
+        ``self.error`` (which posts) so the message lands on the main
+        thread alongside any other errors.
         """
         def _runner():
             try:
@@ -3818,7 +3859,7 @@ class Browser:
     # the children-results deque, or the preview-result slot.
     #
     #   post(fn)                    — schedule fn() on the next main-thread drain
-    #   message(text) / error(text) — surface a status / error
+    #   flash(text) / log(text) / error(text) — info-bar notice / log / error
     #   refresh(id)                 — schedule re-fetch of children
     #   cursor_to(id)               — move cursor (expanding ancestors)
     #   expand(id)                  — expand a parent (and fetch if needed)
@@ -3848,27 +3889,85 @@ class Browser:
         self._main_queue.put(fn)
         notify_wake()
 
-    def message(self, text: str) -> None:
-        """(thread-safe) Surface ``text`` as a transient status message.
+    def flash(self, text: str, log: bool = False) -> None:
+        """(thread-safe) Surface ``text`` as a transient info-bar notice.
 
-        Stored on Browser; the renderer in ticket #10 picks it up. Uses
-        ``post`` under the hood so the write happens on the main thread.
+        Sets the single notice slot (kind ``'flash'``) and arms a
+        ``_FLASH_DURATION`` timer to clear it. ``log=True`` also appends
+        ``text`` to the message log (use it for side effects / degradation
+        warnings worth an audit trail; the bare form is for toggle / mode
+        acks). Routed through ``post`` so the write lands on the main
+        thread; the timer is armed there too (headless browsers have no
+        render loop and skip it).
         """
-        self.post(lambda: setattr(self, '_message_text', text))
+        self.post(lambda: self._set_notice('flash', text, log=log,
+                                           arm_timer=True))
+
+    def log(self, text: str) -> None:
+        """(thread-safe) Append ``text`` to the message log only.
+
+        No notice, no redraw — the ``console.log``-style record, viewed
+        on demand via the framework log pager. Posted so the append lands
+        on the main thread in order with the other notice writes.
+        """
+        self.post(lambda: self._log.append(_log_entry(text)))
 
     def error(self, text: str) -> None:
-        """(thread-safe) Surface ``text`` as an error message. Same lane as ``message``."""
-        self.post(lambda: setattr(self, '_error_text', text))
+        """(thread-safe) Surface ``text`` as a red, sticky info-bar notice.
 
-    @property
-    def error_text(self) -> str:
-        """Most recent error message surfaced via :meth:`error`."""
-        return self._error_text
+        Sets the notice slot (kind ``'error'``) and *always* appends to
+        the message log; no auto-clear timer. The notice is cleared by
+        the first keypress landing ``_ERROR_MIN_DISPLAY`` after it
+        appeared (see ``_handle_one_key``). Routed through ``post``.
+        """
+        self.post(lambda: self._set_notice('error', text, log=True,
+                                           arm_timer=False))
 
-    @property
-    def message_text(self) -> str:
-        """Most recent transient status message surfaced via :meth:`message`."""
-        return self._message_text
+    def _set_notice(self, kind: str, text: str, *, log: bool,
+                    arm_timer: bool) -> None:
+        """Main-thread: install a notice, bump the seq, flag an info redraw.
+
+        Optionally appends to the log and arms the flash auto-clear timer.
+        Centralises the last-write-wins slot update for ``flash`` /
+        ``error`` so the seq bump and (timer-captured) seq stay in sync.
+        """
+        self._notice_seq += 1
+        self._notice = Notice(text=text, kind=kind,
+                              shown_at=time.monotonic(),
+                              seq=self._notice_seq)
+        if log:
+            self._log.append(_log_entry(text))
+        self._needs_redraw.add('info')
+        if arm_timer and not self._headless:
+            self._arm_flash_timer(self._notice_seq)
+
+    def _arm_flash_timer(self, seq: int) -> None:
+        """Main-thread: (re)arm the daemon flash-clear timer for ``seq``.
+
+        Cancels any prior timer, then schedules a clear that fires only
+        if ``_notice`` still carries ``seq`` (a newer notice supersedes
+        it). The timer callback posts the clear so the mutation lands on
+        the main thread; ``post`` wakes the loop to repaint.
+        """
+        if self._flash_timer is not None:
+            self._flash_timer.cancel()
+        timer = threading.Timer(
+            _FLASH_DURATION,
+            lambda: self.post(lambda: self._clear_notice_if_seq(seq)),
+        )
+        timer.daemon = True
+        self._flash_timer = timer
+        timer.start()
+
+    def _clear_notice_if_seq(self, seq: int) -> None:
+        """Main-thread: drop the notice iff it still carries ``seq``.
+
+        Guards against a stale flash timer clearing a newer notice. Flags
+        an info redraw when it actually clears.
+        """
+        if self._notice is not None and self._notice.seq == seq:
+            self._notice = None
+            self._needs_redraw.add('info')
 
     # ---- cache introspection ---------------------------------------------
     #
@@ -4681,7 +4780,7 @@ class Browser:
         ``Mode.SEARCH_EDIT`` — ``/`` prompt open, user is typing a search.
         ``Mode.FILTER_EDIT`` — ``&`` prompt open, user is typing a filter.
 
-        Recipes can branch on this to decide whether a ``ctx.message``
+        Recipes can branch on this to decide whether a ``ctx.flash``
         write would clobber an in-progress prompt.
         """
         return self._mode
@@ -5098,8 +5197,14 @@ class Browser:
         """Signal both workers to exit and join with ``timeout``.
 
         Idempotent. Sets ``_stop``, then sets both events so each worker
-        wakes from its outer ``wait()`` and observes the stop flag.
+        wakes from its outer ``wait()`` and observes the stop flag. Also
+        cancels any live flash auto-clear timer so a pending fire can't
+        outlive the run loop (quit reaches here via the main loop's
+        ``finally``).
         """
+        if self._flash_timer is not None:
+            self._flash_timer.cancel()
+            self._flash_timer = None
         if not self._workers_running:
             return
         self._stop = True
@@ -6017,8 +6122,9 @@ class Browser:
         same id). Pendings registered against ``id_`` still resolve via
         ``_post_children_delivery``.
 
-        Errors at the boundary surface via ``self._error_text`` and a
-        synthesised empty delivery so the placeholder row clears.
+        Errors at the boundary surface via ``self.error`` (red info-bar
+        notice + log entry) and a synthesised empty delivery so the
+        placeholder row clears.
 
         Worker-thread only — main-thread mutations are routed through
         the post queue (``update_data`` / ``self.post(...)``). Calls
@@ -6039,10 +6145,9 @@ class Browser:
             raw = self.get_children(id_, reload=reload_)
         except Exception as e:
             error = True
-            # Cross-thread write to a Python str attribute is
-            # safe under the GIL; the renderer reads it later
-            # on the main thread.
-            self._error_text = (
+            # Thread-safe: ``error`` posts the notice + log write onto
+            # the main thread.
+            self.error(
                 f'get_children({id_!r}): {type(e).__name__}: {e}'
             )
         else:
@@ -6059,7 +6164,7 @@ class Browser:
                     items = [to_item(x) for x in raw]
                 except Exception as e:
                     error = True
-                    self._error_text = (
+                    self.error(
                         f'get_children({id_!r}): '
                         f'{type(e).__name__}: {e}'
                     )
@@ -6067,7 +6172,7 @@ class Browser:
         if error:
             # Synthesise an empty delivery so the placeholder
             # row clears and ``_loading`` flips to False; the
-            # error is surfaced via ``_error_text``.
+            # error is surfaced via ``self.error`` (notice + log).
             items = []
 
         if gen is not None:
@@ -7639,6 +7744,18 @@ class Browser:
         they're keyed by cursor id (not invocation count) and gated
         cheaply.
         """
+        # Error-notice acknowledgement: the first keypress landing at
+        # least ``_ERROR_MIN_DISPLAY`` after an error appeared clears it
+        # (the minimum guards against an in-flight key wiping an unread
+        # error). Non-swallowing — the key still dispatches normally
+        # below. Flash notices are the timer's job, not the keypress
+        # path's, so they're left alone here.
+        notice = self._notice
+        if (notice is not None and notice.kind == 'error'
+                and time.monotonic() - notice.shown_at >= _ERROR_MIN_DISPLAY):
+            self._notice = None
+            self._needs_redraw.add('info')
+
         prev_row = self._active_list_row()
         prev_insert = self._insert_mode
         if self._insert_mode:

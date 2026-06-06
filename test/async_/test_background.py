@@ -1,7 +1,7 @@
 """Background-thread tests: watchers, signal handlers, daemon-thread lifecycle.
 
 Covers the production pattern where a watcher thread (filesystem watcher,
-poller, MQ subscriber) calls ``browser.refresh()`` or ``browser.message()``
+poller, MQ subscriber) calls ``browser.refresh()`` or ``browser.flash()``
 from outside the main thread. The post queue ferries the call back to
 the main thread; the worker fetches; the cache populates.
 """
@@ -30,16 +30,17 @@ class TestBackgroundUpdates(unittest.TestCase):
         finally:
             b.stop_workers()
 
-    def test_watcher_thread_can_post_message(self):
+    def test_watcher_thread_can_post_flash(self):
         b = make_browser()
         try:
             def watcher():
-                b.message('hi')
+                b.flash('hi')
             t = threading.Thread(target=watcher)
             t.start()
             t.join()
             b.drain_main_queue()
-            self.assertEqual(b._message_text, 'hi')
+            self.assertEqual(b._notice.text, 'hi')
+            self.assertEqual(b._notice.kind, 'flash')
         finally:
             b.stop_workers()
 
@@ -83,14 +84,14 @@ class TestBackgroundUpdates(unittest.TestCase):
         stop = threading.Event()
         def watcher():
             while not stop.is_set():
-                b.message('tick')
+                b.flash('tick')
                 time.sleep(0.005)
         t = threading.Thread(target=watcher, daemon=True)
         t.start()
         try:
             time.sleep(0.02)  # let it tick a few times
             b.drain_main_queue()
-            self.assertEqual(b._message_text, 'tick')
+            self.assertEqual(b._notice.text, 'tick')
         finally:
             stop.set()
             t.join(timeout=1.0)
