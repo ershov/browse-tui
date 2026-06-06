@@ -79,6 +79,12 @@ _LIST_FORMAT = (
 # (PLAN_MD env var, .PLAN.md auto-discovery — see ``plan --help``).
 _PLAN_FILE = None
 
+# Audit-log sink. ``main`` points this at ``Browser.log`` (thread-safe)
+# once the Browser exists; ``_run_plan`` then records every mutation and
+# every failed call so the framework ``~`` viewer surfaces a plan-CLI
+# audit trail. ``None`` (headless helpers, unit tests) means no logging.
+_log_sink = None
+
 
 def _plan_argv():
     """Base ``plan`` argv with ``-f FILE`` prepended when set."""
@@ -91,10 +97,14 @@ def _run_plan(*args, capture=True):
     A 30s timeout matches plan-tui; in the rare timeout case we return
     a synthetic non-zero result so callers can surface the error
     uniformly via the ``ctx.error`` channel.
+
+    Every failed call (incl. the timeout fallback) and every successful
+    DB-mutating call is recorded to ``_log_sink`` for the framework ``~``
+    audit viewer; successful reads are not logged. See ``_log_plan_call``.
     """
     full = _plan_argv() + list(args)
     try:
-        return subprocess.run(
+        result = subprocess.run(
             full,
             capture_output=capture,
             text=True,
@@ -102,9 +112,38 @@ def _run_plan(*args, capture=True):
             timeout=30,
         )
     except Exception as e:
-        return subprocess.CompletedProcess(
+        result = subprocess.CompletedProcess(
             args=full, returncode=1, stdout='', stderr=str(e),
         )
+    if _log_sink is not None:
+        _log_plan_call(args, result)
+    return result
+
+
+def _is_read(args):
+    """True iff ``args`` is a read-only ``plan`` call (not worth an audit row).
+
+    Reads carry the ``list`` or ``get`` verb — covering ``list``,
+    ``-r list``, ``get``, ``project get``. Everything else (create /
+    status / close / move / comment / edit / add / …) mutates the DB.
+    """
+    return 'list' in args or 'get' in args
+
+
+def _log_plan_call(args, result):
+    """Record one ``plan`` call to ``_log_sink`` per the audit policy.
+
+    Any non-zero return (incl. the timeout/exception fallback) is logged
+    as an ``[error]`` line even for reads; otherwise only mutations are
+    logged. ``args`` is the meaningful subcommand portion (no ``plan``
+    binary / ``-f FILE`` prefix), rendered space-joined for the pager.
+    """
+    argv = ' '.join(str(a) for a in args)
+    if result.returncode != 0:
+        # ``stderr`` is None on a ``capture=False`` run — guard it.
+        _log_sink(f'[error] plan {argv}: {(result.stderr or "").strip()}')
+    elif not _is_read(args):
+        _log_sink(f'plan {argv}')
 
 
 def _parse_ticket_line(line):
@@ -237,7 +276,7 @@ def _action_toggle_md(ctx):
     global _MD_COLOR
     _MD_COLOR = not _MD_COLOR
     ctx.drop_preview_cache()
-    ctx.message(f'preview: {"colored" if _MD_COLOR else "raw"}')
+    ctx.flash(f'preview: {"colored" if _MD_COLOR else "raw"}')
 
 
 # ---- actions -------------------------------------------------------------
@@ -381,21 +420,6 @@ def _action_reopen(ctx):
     ctx.update_data([upsert(i, None, tag='open', tag_style=style) for i in ids])
 
 
-def _action_command_log(ctx):
-    """browse-plan equivalent of plan-tui's ``~`` command-log.
-
-    plan-tui keeps a per-process audit log of every ``plan`` call it
-    runs; that surface is plan-tui-internal and not generalisable, so
-    browse-plan instead surfaces the project's overall state via
-    ``plan project get``. The ticket spec calls this out explicitly.
-    """
-    result = _run_plan('project', 'get')
-    text = result.stdout if result.returncode == 0 else (
-        result.stderr.strip() or '(no project content)'
-    )
-    ctx.page(text, lang='md')
-
-
 # ---- entry point ---------------------------------------------------------
 
 
@@ -440,7 +464,7 @@ def _pop_file_arg():
 
 
 def main():
-    global _BROWSER, _PLAN_FILE
+    global _BROWSER, _PLAN_FILE, _log_sink
     _PLAN_FILE = _pop_file_arg()
     initial_scope = None
     # Skip argv[1] when it's a flag (e.g. -h / --help) — Browser.run()'s
@@ -480,11 +504,14 @@ def main():
             Action(move_key, move_label,                        _action_move,                          'targets'),
             Action('x', 'Close ticket',                         _action_close,                         'targets'),
             Action('o', 'Reopen closed ticket',                 _action_reopen,                        'targets'),
-            Action('~', 'Show recent plan-CLI command log',     _action_command_log,                   'none'),
         ] + toggle_action,
         help_intro=_HELP_INTRO,
     ))
     _BROWSER = b
+    # Route the plan-CLI audit trail (mutations + failures) into the
+    # framework message log; ``Browser.log`` is thread-safe. The ``~``
+    # default action pages it.
+    _log_sink = b.log
     sys.exit(b.run())
 
 
