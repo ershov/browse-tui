@@ -188,16 +188,22 @@ it actually wanted. With a framework log it can do the real thing.
 
 - **Remove** `_action_command_log` and its `~` binding (browse-plan:483); it
   inherits the framework `~` viewer.
-- **Add** `ctx.log(...)` recording the `plan` argv for **user-initiated
-  mutations** (status changes, edits, moves — the action handlers that already
-  hold `ctx`). Read-only refreshes (`get_children`/list/get) are *not* logged,
-  to avoid flooding the log on every expand.
-- Behavior change: `~` now shows the session's audit log of `plan` commands
+- **Log at the `_run_plan` chokepoint** (every `plan` shell-out passes through
+  it). Record exactly two kinds of call:
+  * **any call that errors** — non-zero `returncode` (including the 30s
+    timeout fallback), even read-only ones, as `[error] plan <argv>: <stderr>`;
+  * **any database-mutating call** on success — every subcommand *except* the
+    read set (`list` / `-r list`, `get`, `project get`), as `plan <argv>`.
+
+  Successful reads are not logged, so expands/refreshes don't flood the log.
+  The read set is recognized by the `list` / `get` verbs in the argv.
+- **Plumbing:** `_run_plan` has no `ctx` (it's also called by the ctx-less
+  `get_children` / `get_preview`). Wire a module-level sink in `main()` right
+  after the Browser is built — `_log_sink = b.log` (the thread-safe
+  `Browser.log`) — and have `_run_plan` call it when set. No `ctx` threading.
+- Behavior change: `~` now shows the session's audit log (errors + mutations)
   instead of `plan project get`. (This restores the originally-intended
   surface.)
-
-Granularity to confirm in review: mutations-only (recommended) vs. threading
-`ctx` into `_run_plan` to log every call.
 
 ## Removal checklist
 
