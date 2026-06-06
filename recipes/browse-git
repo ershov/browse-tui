@@ -48,7 +48,7 @@ toggles md2ansi message coloring (when available); ``E`` edits the real
 working-tree file for file/status rows in $EDITOR; the built-in ``v`` /
 ``e`` page / edit the preview text.
 
-With ``--tree`` (or the ``t`` toggle, default off) the commit log gains a
+By default (toggle off with ``--no-tree`` or the ``t`` key) the commit log has a
 tig-style graph column: ``git log --graph`` does all the lane assignment
 and its art is glyph-substituted and rendered after the date column, with
 its connector-only FILLER lines kept as inert blank rows so the lanes line
@@ -58,7 +58,7 @@ Read-only with respect to history — the only mutation is ``E``'s
 working-tree edit.
 
 Usage:
-  browse-git [<dir>] [-n NUMBER] [--mode NAME] [--tree] [<revs>…] [-- <paths>…]
+  browse-git [<dir>] [-n NUMBER] [--mode NAME] [--no-tree] [<revs>…] [-- <paths>…]
 """
 
 import os
@@ -114,7 +114,7 @@ _SGR_RE = re.compile(r'\x1b\[[^@-~]*m')
 # Module-level state, all set in main() before the Browser launches.
 _log_limit = _LOG_LIMIT
 _mode = 'commits'
-_tree_mode = False  # --tree / 't' — render git's commit graph as a column
+_tree_mode = True  # --tree / 't' — render git's commit graph as a column (default on)
 _browser = None  # set in main() — used for preview-width lookup
 _revs = []       # positional revisions scoping commits mode
 _paths = []      # positional pathspecs scoping commits mode
@@ -1423,15 +1423,15 @@ def toggle_tree(ctx):
 _HELP_INTRO_TMPL = """\
 browse-git — a tig-like browser over a git repository.
 
-Usage: browse-git [<dir>] [-n NUMBER] [--mode NAME] [--tree] [<rev>…] [-- <path>…]
+Usage: browse-git [<dir>] [-n NUMBER] [--mode NAME] [--no-tree] [<rev>…] [-- <path>…]
   <dir>         A leading directory in another git repo browses THAT repo
                 (cwd need not be a repo). A subdir of the current repo
                 stays a pathspec filter instead.
   -n NUMBER     Cap the commit / reflog list to this many entries
                 (default: {default}).
   --mode NAME   Start in one of: {modes}. Default: commits.
-  --tree        Show git's commit-graph column in the commit log
-  --no-tree     (default off; toggle at runtime with 't').
+  --no-tree     Hide git's commit-graph column in the commit log
+  --tree        (default on; toggle at runtime with 't').
   <rev>…        A rev / sha roots the commits log at it (git log <rev>).
   <path>…       A path filters the commits log to commits touching it.
   -- <path>…    Everything after -- is forced to be a pathspec.

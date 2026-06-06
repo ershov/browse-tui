@@ -1216,6 +1216,10 @@ class TestCommitsRootWorktreeScope(unittest.TestCase):
 
     def setUp(self):
         self.r = _load_recipe()
+        # Worktree-row prepending is tree-independent; pin tree mode off
+        # (default is now on) so the mocked plain ``_commit_log_items``
+        # seam is the active builder and the assertions stay deterministic.
+        self.r._tree_mode = False
 
     def test_revs_suppress_worktree_rows(self):
         # A positional rev makes the log historical — no live wc: rows.
@@ -1536,6 +1540,11 @@ class TestLogItemsRouting(unittest.TestCase):
             lambda revs, paths, ns: ['GRAPH', revs, paths, ns])
         self.assertEqual(self.r._log_items(['r'], ['p'], ns='ref:feat'),
                          ['GRAPH', ['r'], ['p'], 'ref:feat'])
+
+    def test_tree_mode_defaults_on(self):
+        # The commit-graph column is ON by default (toggle off with
+        # --no-tree / 't'); a fresh recipe load reflects that default.
+        self.assertIs(self.r._tree_mode, True)
 
 
 class TestGitRowContentGraph(unittest.TestCase):
