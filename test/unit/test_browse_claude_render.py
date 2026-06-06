@@ -5536,9 +5536,9 @@ class TestVoiceOnlyFilter(unittest.TestCase):
             def __init__(s):
                 s._browser = FakeBrowser()
                 s.browser = s._browser
-                s.messages = []
-            def message(s, m):
-                s.messages.append(m)
+                s.flashes = []
+            def flash(s, text, log=False):
+                s.flashes.append(text)
             def all_items(s):
                 return s._browser.all_items()
             def update_data(s, ops):
@@ -5872,6 +5872,60 @@ class TestVoiceOnlyFilter(unittest.TestCase):
             source = f.read()
         self.assertIn('_FILTER_VOICE_ONLY = True', source)
         self.assertNotIn('_FILTER_VOICE_ONLY = False  #', source)
+
+
+class TestShowId(unittest.TestCase):
+    """``y`` (`_action_show_id`) pages the cursor's full id.
+
+    A 1s flash can't be read or copied, so the action hands the full id
+    to the pager (full-screen, selectable). Headless ``page`` would
+    spawn a real pager, so we drive the handler directly with a fake
+    ``ctx`` that records the ``page`` call.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_pages_cursor_id(self):
+        paged = []
+
+        class _Cursor:
+            id = '/proj/sess.jsonl#prompt:abc123'
+
+        class _Ctx:
+            cursor = _Cursor()
+            def page(self, text, lang=''):
+                paged.append(text)
+
+        self.r._action_show_id(_Ctx())
+        self.assertEqual(paged, ['/proj/sess.jsonl#prompt:abc123'])
+
+    def test_no_cursor_is_noop(self):
+        # The 'cursor' gate normally prevents this, but the internal
+        # guard must also keep it a no-op (no page, no crash).
+        paged = []
+
+        class _Ctx:
+            cursor = None
+            def page(self, text, lang=''):
+                paged.append(text)
+
+        self.r._action_show_id(_Ctx())
+        self.assertEqual(paged, [])
+
+    def test_y_binding_wires_show_id_with_cursor_gate(self):
+        # The 'y' action must keep its 'cursor' gate and paste-friendly
+        # label while routing to the pager-backed handler.
+        with open(_RECIPE) as f:
+            source = f.read()
+        self.assertIn(
+            "Action('y',     'Show full id (paste-friendly)',"
+            "   _action_show_id,     'cursor')",
+            source,
+        )
+        # The handler pages the id; it must not fall back to a flash.
+        self.assertIn('ctx.page(ctx.cursor.id)', source)
 
 
 # ---- #424: composer ↔ framework cache integration ----------------------

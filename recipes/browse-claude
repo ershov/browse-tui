@@ -5437,7 +5437,7 @@ def _action_md_preview(ctx):
     import tempfile
     cmd = _resolve_md_pager()
     if cmd is None:
-        ctx.message('no markdown renderer found ($MD2ANSI / md2ansi)')
+        ctx.flash('no markdown renderer found ($MD2ANSI / md2ansi)', log=True)
         return
 
     item = ctx.cursor
@@ -5451,7 +5451,7 @@ def _action_md_preview(ctx):
             ctx.error(f'preview: {type(e).__name__}: {e}')
             return
     if text is None:
-        ctx.message('No preview available')
+        ctx.flash('No preview available')
         return
 
     tmp = tempfile.NamedTemporaryFile(
@@ -5474,14 +5474,18 @@ def _action_toggle_md(ctx):
     global _MD_COLOR
     _MD_COLOR = not _MD_COLOR
     ctx.drop_preview_cache()
-    ctx.message(f'voice rendering: {"colored" if _MD_COLOR else "raw"}')
+    ctx.flash(f'voice rendering: {"colored" if _MD_COLOR else "raw"}')
 
 
 def _action_show_id(ctx):
-    """Surface the cursor row's id on the info bar (handy for debugging)."""
+    """Page the cursor row's full id (paste-friendly, handy for debugging).
+
+    A 1s flash can't be read or copied; the pager is full-screen and
+    selectable, matching the action's "paste-friendly" label.
+    """
     if ctx.cursor is None:
         return
-    ctx.message(f'id: {ctx.cursor.id}')
+    ctx.page(ctx.cursor.id)
 
 
 def _jump_to_voice(ctx, direction):
@@ -5514,7 +5518,7 @@ def _jump_to_voice(ctx, direction):
         if getattr(item, 'row_bg', None) is not None:
             ctx.cursor_to(item.id)
             return
-    ctx.message('no more voice messages this way')
+    ctx.flash('no more voice messages this way')
 
 
 def _action_next_voice(ctx):
@@ -6207,7 +6211,7 @@ def _action_toggle_tree(ctx):
         target_id = cur.id
 
     _TREE_MODE = not _TREE_MODE
-    ctx.message(f"view: {'tree' if _TREE_MODE else 'flat'}")
+    ctx.flash(f"view: {'tree' if _TREE_MODE else 'flat'}")
 
     # Compute ancestor chain BEFORE refresh (we need a stable read of
     # the file; refresh doesn't touch the on-disk content).
@@ -6258,7 +6262,7 @@ def _action_toggle_filter(ctx):
     # for the current preview cursor and flag a redraw, preserving
     # view state (a user pinned to the tail keeps following).
     ctx.drop_preview_cache()
-    ctx.message(
+    ctx.flash(
         f"voice-only filter: {'on' if _FILTER_VOICE_ONLY else 'off'}"
     )
 

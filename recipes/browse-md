@@ -1344,7 +1344,7 @@ def _action_toggle_md(ctx):
     global _MD_COLOR
     _MD_COLOR = not _MD_COLOR
     ctx.drop_preview_cache()
-    ctx.message(f'md preview: {"colored" if _MD_COLOR else "raw"}')
+    ctx.flash(f'md preview: {"colored" if _MD_COLOR else "raw"}')
 
 
 def _resolve_md_pager():
@@ -1384,7 +1384,7 @@ def _action_md_preview(ctx):
     import tempfile
     cmd = _resolve_md_pager()
     if cmd is None:
-        ctx.message('no markdown renderer found ($MD2ANSI / md2ansi)')
+        ctx.flash('no markdown renderer found ($MD2ANSI / md2ansi)', log=True)
         return
 
     item = ctx.cursor
@@ -1398,7 +1398,7 @@ def _action_md_preview(ctx):
             ctx.error(f'preview: {type(e).__name__}: {e}')
             return
     if text is None:
-        ctx.message('No preview available')
+        ctx.flash('No preview available')
         return
 
     tmp = tempfile.NamedTemporaryFile(

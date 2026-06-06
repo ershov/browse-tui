@@ -1677,11 +1677,11 @@ class TestToggleTree(unittest.TestCase):
         self.r = _load_recipe()
 
     def test_flip_and_refresh(self):
-        calls = {'refresh': 0, 'messages': []}
+        calls = {'refresh': 0, 'flashes': []}
 
         class Ctx:
-            def message(self, text):
-                calls['messages'].append(text)
+            def flash(self, text, log=False):
+                calls['flashes'].append(text)
 
             def refresh(self, id=None, on_complete=None):
                 calls['refresh'] += 1
@@ -1691,12 +1691,12 @@ class TestToggleTree(unittest.TestCase):
         self.r.toggle_tree(ctx)
         self.assertTrue(self.r._tree_mode)
         self.assertEqual(calls['refresh'], 1)
-        self.assertEqual(calls['messages'], ['commit graph: on'])
+        self.assertEqual(calls['flashes'], ['commit graph: on'])
         # A second toggle flips it back and refreshes again.
         self.r.toggle_tree(ctx)
         self.assertFalse(self.r._tree_mode)
         self.assertEqual(calls['refresh'], 2)
-        self.assertEqual(calls['messages'][-1], 'commit graph: off')
+        self.assertEqual(calls['flashes'][-1], 'commit graph: off')
 
 
 if __name__ == '__main__':
