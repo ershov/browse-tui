@@ -323,13 +323,18 @@ def _action_edit(ctx, recursive=False):
     """Open ``$EDITOR`` on the cursor ticket via ``plan edit``."""
     if ctx.cursor is None:
         return
+    target = 'project' if ctx.cursor.id == 0 else str(ctx.cursor.id)
     cmd = _plan_argv() + ['edit']
     if recursive:
         cmd.append('-r')
-    cmd.append('project' if ctx.cursor.id == 0 else str(ctx.cursor.id))
+    cmd.append(target)
     rc = ctx.run_external(cmd)
     if rc != 0:
         ctx.error(f'edit exited {rc}')
+    elif _log_sink is not None:
+        # ``edit`` shells out to ``$EDITOR`` (not ``_run_plan``), so log the
+        # successful mutation here — concisely, without the noisy ``-e``.
+        _log_sink(f'plan edit {"-r " if recursive else ""}{target}')
     ctx.refresh()
 
 
@@ -365,6 +370,11 @@ def _action_create(ctx, recursive=False):
         rc = ctx.run_external(cmd)
         if rc != 0:
             ctx.error(f'create exited {rc}')
+        elif _log_sink is not None:
+            # ``create -e`` shells out to ``$EDITOR`` (not ``_run_plan``), so
+            # log the successful mutation here — using the concise ``label``
+            # rather than the noisy ``title=…, move=…`` expr.
+            _log_sink(f'plan {label}')
         ctx.refresh()
 
     ctx.insert(label, on_confirm)

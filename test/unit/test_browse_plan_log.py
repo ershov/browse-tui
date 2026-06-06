@@ -89,6 +89,39 @@ def _completed(returncode, *, stdout='', stderr=''):
     return _run
 
 
+class _FakeCtx:
+    """A ``Context`` stand-in for driving ``_action_create`` / ``_action_edit``.
+
+    ``run_external`` returns the canned ``rc`` (the editor exit code) and is a
+    leaf-level stub — these handlers shell out to ``$EDITOR`` rather than
+    going through ``_run_plan``, so no ``subprocess`` patching is needed. The
+    captured ``errors`` / ``refreshes`` let a test confirm the failure branch
+    routes through ``ctx.error`` (which logs ``[error] …`` in production, not
+    a ``plan …`` mutation row) and that ``refresh`` still fires either way.
+    ``insert`` records the ``on_confirm`` callback so a test can invoke it
+    directly, mirroring how the real insert-mode dispatch calls it.
+    """
+
+    def __init__(self, cursor_id, rc):
+        self.cursor = types.SimpleNamespace(id=cursor_id)
+        self._rc = rc
+        self.errors = []
+        self.refreshes = 0
+        self.on_confirm = None
+
+    def run_external(self, cmd, env=None):
+        return self._rc
+
+    def error(self, text):
+        self.errors.append(text)
+
+    def refresh(self, *a, **kw):
+        self.refreshes += 1
+
+    def insert(self, label, on_confirm):
+        self.on_confirm = on_confirm
+
+
 class TestRunPlanLogging(unittest.TestCase):
     """``_run_plan`` records the right audit lines through ``_log_sink``."""
 
@@ -192,6 +225,96 @@ class TestRunPlanLogging(unittest.TestCase):
             result = self.bp._run_plan('5', 'status', 'done')
         self.assertEqual(result.returncode, 0)
         self.assertEqual(self.captured, [])
+
+
+class TestCreateEditLogging(unittest.TestCase):
+    """``_action_create`` / ``_action_edit`` audit their successful mutations.
+
+    These handlers shell out to ``$EDITOR`` via ``ctx.run_external`` (not
+    ``_run_plan``), so they log the mutation themselves on a zero exit — in a
+    concise human-readable form (``create -r``, ``edit 5``, ``edit project``),
+    never the noisy ``-e`` / ``title=…, move=…`` argv. A non-zero exit takes
+    the ``ctx.error`` branch and emits no ``plan …`` row from this code.
+    """
+
+    def setUp(self):
+        self._saved = sys.modules.get('browse_tui')
+        _stub_browse_tui()
+        self.bp = _load_recipe('_browse_plan_createedit_under_test')
+        self.captured = []
+        self.bp._log_sink = self.captured.append
+        # Pin the binary so a logged line never carries a ``-f`` prefix.
+        self.bp._PLAN_FILE = None
+
+    def tearDown(self):
+        if self._saved is not None:
+            sys.modules['browse_tui'] = self._saved
+        else:
+            sys.modules.pop('browse_tui', None)
+
+    def _run_create(self, *, recursive, rc):
+        """Drive ``_action_create``, then fire the captured ``on_confirm``."""
+        ctx = _FakeCtx(cursor_id=0, rc=rc)
+        self.bp._action_create(ctx, recursive)
+        self.assertIsNotNone(ctx.on_confirm, 'handler should call ctx.insert')
+        ctx.on_confirm('after', 5)
+        return ctx
+
+    def test_create_success_logs_concise(self):
+        """A successful ``create`` logs ``plan create`` (no ``-e`` / expr)."""
+        self._run_create(recursive=False, rc=0)
+        self.assertEqual(self.captured, ['plan create'])
+
+    def test_create_recursive_success_logs_concise(self):
+        """A successful ``create -r`` logs ``plan create -r``."""
+        self._run_create(recursive=True, rc=0)
+        self.assertEqual(self.captured, ['plan create -r'])
+
+    def test_create_failure_logs_no_mutation_row(self):
+        """A failed ``create`` routes to ``ctx.error`` and logs no ``plan`` row."""
+        ctx = self._run_create(recursive=False, rc=1)
+        self.assertEqual(self.captured, [])
+        self.assertEqual(len(ctx.errors), 1)
+        self.assertIn('create exited 1', ctx.errors[0])
+
+    def test_edit_success_logs_id(self):
+        """A successful ``edit`` on a real ticket logs ``plan edit <id>``."""
+        ctx = _FakeCtx(cursor_id=5, rc=0)
+        self.bp._action_edit(ctx, False)
+        self.assertEqual(self.captured, ['plan edit 5'])
+
+    def test_edit_recursive_success_logs_id(self):
+        """A successful ``edit -r`` logs ``plan edit -r <id>``."""
+        ctx = _FakeCtx(cursor_id=5, rc=0)
+        self.bp._action_edit(ctx, True)
+        self.assertEqual(self.captured, ['plan edit -r 5'])
+
+    def test_edit_project_success_logs_project(self):
+        """Editing the root (cursor id 0) logs ``plan edit project``."""
+        ctx = _FakeCtx(cursor_id=0, rc=0)
+        self.bp._action_edit(ctx, False)
+        self.assertEqual(self.captured, ['plan edit project'])
+
+    def test_edit_failure_logs_no_mutation_row(self):
+        """A failed ``edit`` routes to ``ctx.error`` and logs no ``plan`` row."""
+        ctx = _FakeCtx(cursor_id=5, rc=2)
+        self.bp._action_edit(ctx, False)
+        self.assertEqual(self.captured, [])
+        self.assertEqual(len(ctx.errors), 1)
+        self.assertIn('edit exited 2', ctx.errors[0])
+
+    def test_no_sink_no_crash(self):
+        """With ``_log_sink`` unset (headless helpers) success logs nothing."""
+        self.bp._log_sink = None
+        edit_ctx = _FakeCtx(cursor_id=5, rc=0)
+        self.bp._action_edit(edit_ctx, False)
+        create_ctx = _FakeCtx(cursor_id=0, rc=0)
+        self.bp._action_create(create_ctx, False)
+        create_ctx.on_confirm('after', 5)
+        self.assertEqual(self.captured, [])
+        # The handlers still ran to completion (refresh fired).
+        self.assertEqual(edit_ctx.refreshes, 1)
+        self.assertEqual(create_ctx.refreshes, 1)
 
 
 class TestTildeBinding(unittest.TestCase):
