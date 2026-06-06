@@ -190,8 +190,9 @@ class TestGeneratorRaisesMidStream(unittest.TestCase):
         try:
             b.refresh('/')
             b.run_until_idle()
-            self.assertIn('boom', b.error_text)
-            self.assertIn('RuntimeError', b.error_text)
+            log = '\n'.join(b._log)
+            self.assertIn('boom', log)
+            self.assertIn('RuntimeError', log)
         finally:
             b.stop_workers()
 

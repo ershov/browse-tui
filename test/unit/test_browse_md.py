@@ -1265,14 +1265,14 @@ class _FakeCtx:
 
     def __init__(self):
         self.dropped = 0
-        self.messages = []
+        self.flashes = []
         self.errors = []
 
     def drop_preview_cache(self, id_=None):
         self.dropped += 1
 
-    def message(self, text):
-        self.messages.append(text)
+    def flash(self, text, log=False):
+        self.flashes.append(text)
 
     def error(self, text):
         self.errors.append(text)
@@ -1294,22 +1294,22 @@ class TestToggleMd(unittest.TestCase):
         self.r._action_toggle_md(self.ctx)
         self.assertFalse(self.r._MD_COLOR)
         self.assertEqual(self.ctx.dropped, 1)
-        self.assertEqual(self.ctx.messages, ['md preview: raw'])
+        self.assertEqual(self.ctx.flashes, ['md preview: raw'])
 
     def test_flip_back_round_trip(self):
         self.r._action_toggle_md(self.ctx)  # True -> False
         self.r._action_toggle_md(self.ctx)  # False -> True
         self.assertTrue(self.r._MD_COLOR)
         self.assertEqual(self.ctx.dropped, 2)
-        self.assertEqual(self.ctx.messages,
+        self.assertEqual(self.ctx.flashes,
                          ['md preview: raw', 'md preview: colored'])
 
     def test_flip_from_false(self):
-        # Starting from False — message reports the new state ("colored").
+        # Starting from False — flash reports the new state ("colored").
         self.r._MD_COLOR = False
         self.r._action_toggle_md(self.ctx)
         self.assertTrue(self.r._MD_COLOR)
-        self.assertEqual(self.ctx.messages, ['md preview: colored'])
+        self.assertEqual(self.ctx.flashes, ['md preview: colored'])
 
 
 class TestResolveMdPager(unittest.TestCase):
@@ -1554,7 +1554,7 @@ class _SrcCmdCtx:
         self.targets = list(targets)
         self.calls = []
         self.errors = []
-        self.messages = []
+        self.flashes = []
 
     def run_external(self, cmd):
         # Snapshot the argv list. The tempfile path (if any) needs to
@@ -1579,8 +1579,8 @@ class _SrcCmdCtx:
     def error(self, text):
         self.errors.append(text)
 
-    def message(self, text):
-        self.messages.append(text)
+    def flash(self, text, log=False):
+        self.flashes.append(text)
 
 
 class _SrcItem:

@@ -37,6 +37,9 @@ _render = load('_browse_tui_render', '050-render.py')
 _render.Item = _data.Item
 _render.PreviewRender = _data.PreviewRender
 _render.Mode = _state.Mode
+# ``render_info_bar``'s hint fallback references ``DEFAULT_HINT`` (040-state)
+# by bare name; inject it for the isolated load, like the names below.
+_render.DEFAULT_HINT = _state.DEFAULT_HINT
 # ``apply_ops`` (upsert/set ops) constructs ``Item`` instances inside the
 # state module; the isolated test load has to inject the real class (mirrors
 # the ``_render.Item`` injection above). The ``max_col_width`` invalidation
@@ -2216,7 +2219,7 @@ class _MockBrowser:
         # real BrowserConfig. Tests flip it via the kwargs loop below.
         self.meta_search_highlight = False
         self._mode = Mode.NORMAL
-        self._error_text = ''
+        self._notice = None
         self._help_mode = False
         self._preview_scroll = 0
         self._needs_redraw = set()
@@ -3439,6 +3442,113 @@ class TestSeparatorCacheZeroBytes(unittest.TestCase):
         _render.render_separator(rect_b, cache_key='sep_main', browser=browser)
         self.assertNotEqual(self._drain(), '',
                             'rect change must force emission')
+
+
+# --- info-bar notice rendering --------------------------------------------
+
+
+class TestInfoBarNotice(unittest.TestCase):
+    """``render_info_bar`` shows ``browser._notice`` in the middle region.
+
+    Priority in that region: search/filter prompt > notice > hint. Error
+    notices render red; pane headers (``info=False``) never show it. Drives
+    a real headless Browser (which carries ``_notice`` / ``_mode`` / the
+    hint) through the non-cached path with the real terminal funcs grafted
+    so we can capture the emitted bytes.
+    """
+
+    def setUp(self):
+        self._terminal = _loader.load(
+            '_browse_tui_terminal_notice', '020-terminal.py')
+        self._saved = {}
+        for name in ('move', 'write', 'set_style', 'reset_style',
+                     'clear_line', 'clear_columns'):
+            self._saved[name] = getattr(_render, name, None)
+            setattr(_render, name, getattr(self._terminal, name))
+        self._orig_stdout = sys.stdout
+        self._stdout = io.StringIO()
+        sys.stdout = self._stdout
+
+    def tearDown(self):
+        sys.stdout = self._orig_stdout
+        for name, value in self._saved.items():
+            if value is None:
+                if hasattr(_render, name):
+                    delattr(_render, name)
+            else:
+                setattr(_render, name, value)
+
+    def _drain(self):
+        text = self._stdout.getvalue()
+        self._stdout.truncate(0)
+        self._stdout.seek(0)
+        return text
+
+    def _browser(self):
+        return Browser(BrowserConfig(_headless=True))
+
+    def test_flash_notice_shows_in_info_bar(self):
+        b = self._browser()
+        try:
+            b._notice = _state.Notice(
+                text='did a thing', kind='flash', shown_at=0.0, seq=1)
+            _render.render_info_bar(24, 80, 'Preview', info=True, browser=b)
+            out = self._drain()
+            self.assertIn('did a thing', out)
+            # The hint is suppressed when a notice is present.
+            self.assertNotIn('?:help', out)
+        finally:
+            b.stop_workers()
+
+    def test_error_notice_renders_red(self):
+        b = self._browser()
+        try:
+            b._notice = _state.Notice(
+                text='kaboom', kind='error', shown_at=0.0, seq=1)
+            _render.render_info_bar(24, 80, 'Preview', info=True, browser=b)
+            out = self._drain()
+            self.assertIn('kaboom', out)
+            # Red foreground (256-colour code 9) in the SGR stream.
+            self.assertIn('38;5;9', out)
+        finally:
+            b.stop_workers()
+
+    def test_notice_absent_falls_back_to_hint(self):
+        b = self._browser()
+        try:
+            self.assertIsNone(b._notice)
+            _render.render_info_bar(24, 80, 'Preview', info=True, browser=b)
+            out = self._drain()
+            # Default hint renders when no notice is set.
+            self.assertIn('?:help', out)
+        finally:
+            b.stop_workers()
+
+    def test_search_prompt_outranks_notice(self):
+        b = self._browser()
+        try:
+            b._notice = _state.Notice(
+                text='notice text', kind='flash', shown_at=0.0, seq=1)
+            b._mode = Mode.SEARCH_EDIT
+            b._search_query = 'needle'
+            _render.render_info_bar(24, 80, 'Preview', info=True, browser=b)
+            out = self._drain()
+            self.assertIn('/needle', out)
+            self.assertNotIn('notice text', out)
+        finally:
+            b.stop_workers()
+
+    def test_pane_header_omits_notice(self):
+        b = self._browser()
+        try:
+            b._notice = _state.Notice(
+                text='hidden here', kind='error', shown_at=0.0, seq=1)
+            # info=False → pane separator header, never shows the notice.
+            _render.render_info_bar(24, 80, 'Preview', info=False, browser=b)
+            out = self._drain()
+            self.assertNotIn('hidden here', out)
+        finally:
+            b.stop_workers()
 
 
 if __name__ == '__main__':

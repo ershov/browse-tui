@@ -1364,7 +1364,7 @@ def switch_mode(ctx):
     if chosen is None or chosen == _mode:
         return
     _mode = chosen
-    ctx.message(f'mode: {_mode}')
+    ctx.flash(f'mode: {_mode}')
     # All five modes share one root scope (and thus one ``state.expanded``
     # set); drop the previous mode's expanded ids before re-listing so the
     # refresh doesn't re-fetch / re-expand rows that don't exist here.
@@ -1400,7 +1400,7 @@ def toggle_md(ctx):
     global _MD_COLOR
     _MD_COLOR = not _MD_COLOR
     ctx.drop_preview_cache()
-    ctx.message(f'message coloring: {"colored" if _MD_COLOR else "raw"}')
+    ctx.flash(f'message coloring: {"colored" if _MD_COLOR else "raw"}')
 
 
 def toggle_tree(ctx):
@@ -1413,7 +1413,7 @@ def toggle_tree(ctx):
     """
     global _tree_mode
     _tree_mode = not _tree_mode
-    ctx.message(f'commit graph: {"on" if _tree_mode else "off"}')
+    ctx.flash(f'commit graph: {"on" if _tree_mode else "off"}')
     ctx.refresh()
 
 

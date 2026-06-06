@@ -4237,6 +4237,39 @@ def default_row(item, ctx):
 DEFAULT_HINT = ' /:search  ?:help  q:quit '
 
 
+# ---- info-bar notice + message log (see the flash/log/error design) ------
+#
+# ``flash`` / ``error`` write a single ``Notice`` slot on the Browser that
+# the info bar renders in place of the hint; ``log`` / ``flash(log=True)``
+# / ``error`` also append to a bounded in-memory ring buffer viewable via
+# the framework log pager. A flash auto-clears after ``_FLASH_DURATION``;
+# an error clears on the first keypress landing ``_ERROR_MIN_DISPLAY``
+# after it appeared.
+_FLASH_DURATION = 1.0      # seconds a flash notice stays before auto-clear
+_ERROR_MIN_DISPLAY = 1.0   # seconds before a keypress may clear an error
+_LOG_MAXLEN = 1000         # ring-buffer cap for the message log
+
+
+@dataclass
+class Notice:
+    """The single info-bar notice slot (last-write-wins).
+
+    ``kind`` is ``'flash'`` (transient, neutral) or ``'error'`` (red,
+    sticky until acknowledged). ``shown_at`` is a ``time.monotonic``
+    stamp; ``seq`` is a monotonic id so a late flash timer only clears
+    the notice it armed for (a newer notice bumps ``seq`` and survives).
+    """
+    text: str
+    kind: str
+    shown_at: float
+    seq: int
+
+
+def _log_entry(text: str) -> str:
+    """Format one message-log line: ``"HH:MM:SS  <text>"`` (wall clock)."""
+    return f'{time.strftime("%H:%M:%S")}  {text}'
+
+
 @dataclass
 class BrowserConfig:
     """Construction parameters for :class:`Browser`.
@@ -4814,9 +4847,17 @@ class Browser:
         self._children_thread = None
         self._preview_thread = None
 
-        # --- surfaced state for the renderer (filled in by ticket #10) ---
-        self._error_text = ''
-        self._message_text = ''
+        # --- info-bar notice + message log -------------------------------
+        # Single notice slot rendered in the info bar by ``flash`` /
+        # ``error`` (last-write-wins); ``_notice_seq`` lets a flash timer
+        # clear only the notice it armed for. ``_log`` is the bounded
+        # ``console.log``-style record fed by ``log`` / ``error`` /
+        # ``flash(log=True)``. ``_flash_timer`` is the live auto-clear
+        # timer (cancelled on shutdown).
+        self._notice: Optional['Notice'] = None
+        self._notice_seq = 0
+        self._log = deque(maxlen=_LOG_MAXLEN)
+        self._flash_timer: Optional[threading.Timer] = None
 
         # --- render-layer bookkeeping (ticket #10) ----------------------
         # Selective-redraw flag set; values are strings: 'list', 'preview',
@@ -5053,9 +5094,9 @@ class Browser:
         Uncaught exceptions in the callback don't crash the process --
         they're surfaced via ``self.error('watcher: ...')``. The watcher
         thread itself dies on the exception (no auto-restart) so authors
-        learn about the bug quickly. We deliver the error via ``post``
-        rather than writing ``self._error_text`` directly so the message
-        lands on the main thread alongside any other errors.
+        learn about the bug quickly. We deliver the error via
+        ``self.error`` (which posts) so the message lands on the main
+        thread alongside any other errors.
         """
         def _runner():
             try:
@@ -5090,7 +5131,7 @@ class Browser:
     # the children-results deque, or the preview-result slot.
     #
     #   post(fn)                    — schedule fn() on the next main-thread drain
-    #   message(text) / error(text) — surface a status / error
+    #   flash(text) / log(text) / error(text) — info-bar notice / log / error
     #   refresh(id)                 — schedule re-fetch of children
     #   cursor_to(id)               — move cursor (expanding ancestors)
     #   expand(id)                  — expand a parent (and fetch if needed)
@@ -5120,27 +5161,85 @@ class Browser:
         self._main_queue.put(fn)
         notify_wake()
 
-    def message(self, text: str) -> None:
-        """(thread-safe) Surface ``text`` as a transient status message.
+    def flash(self, text: str, log: bool = False) -> None:
+        """(thread-safe) Surface ``text`` as a transient info-bar notice.
 
-        Stored on Browser; the renderer in ticket #10 picks it up. Uses
-        ``post`` under the hood so the write happens on the main thread.
+        Sets the single notice slot (kind ``'flash'``) and arms a
+        ``_FLASH_DURATION`` timer to clear it. ``log=True`` also appends
+        ``text`` to the message log (use it for side effects / degradation
+        warnings worth an audit trail; the bare form is for toggle / mode
+        acks). Routed through ``post`` so the write lands on the main
+        thread; the timer is armed there too (headless browsers have no
+        render loop and skip it).
         """
-        self.post(lambda: setattr(self, '_message_text', text))
+        self.post(lambda: self._set_notice('flash', text, log=log,
+                                           arm_timer=True))
+
+    def log(self, text: str) -> None:
+        """(thread-safe) Append ``text`` to the message log only.
+
+        No notice, no redraw — the ``console.log``-style record, viewed
+        on demand via the framework log pager. Posted so the append lands
+        on the main thread in order with the other notice writes.
+        """
+        self.post(lambda: self._log.append(_log_entry(text)))
 
     def error(self, text: str) -> None:
-        """(thread-safe) Surface ``text`` as an error message. Same lane as ``message``."""
-        self.post(lambda: setattr(self, '_error_text', text))
+        """(thread-safe) Surface ``text`` as a red, sticky info-bar notice.
 
-    @property
-    def error_text(self) -> str:
-        """Most recent error message surfaced via :meth:`error`."""
-        return self._error_text
+        Sets the notice slot (kind ``'error'``) and *always* appends to
+        the message log; no auto-clear timer. The notice is cleared by
+        the first keypress landing ``_ERROR_MIN_DISPLAY`` after it
+        appeared (see ``_handle_one_key``). Routed through ``post``.
+        """
+        self.post(lambda: self._set_notice('error', text, log=True,
+                                           arm_timer=False))
 
-    @property
-    def message_text(self) -> str:
-        """Most recent transient status message surfaced via :meth:`message`."""
-        return self._message_text
+    def _set_notice(self, kind: str, text: str, *, log: bool,
+                    arm_timer: bool) -> None:
+        """Main-thread: install a notice, bump the seq, flag an info redraw.
+
+        Optionally appends to the log and arms the flash auto-clear timer.
+        Centralises the last-write-wins slot update for ``flash`` /
+        ``error`` so the seq bump and (timer-captured) seq stay in sync.
+        """
+        self._notice_seq += 1
+        self._notice = Notice(text=text, kind=kind,
+                              shown_at=time.monotonic(),
+                              seq=self._notice_seq)
+        if log:
+            self._log.append(_log_entry(text))
+        self._needs_redraw.add('info')
+        if arm_timer and not self._headless:
+            self._arm_flash_timer(self._notice_seq)
+
+    def _arm_flash_timer(self, seq: int) -> None:
+        """Main-thread: (re)arm the daemon flash-clear timer for ``seq``.
+
+        Cancels any prior timer, then schedules a clear that fires only
+        if ``_notice`` still carries ``seq`` (a newer notice supersedes
+        it). The timer callback posts the clear so the mutation lands on
+        the main thread; ``post`` wakes the loop to repaint.
+        """
+        if self._flash_timer is not None:
+            self._flash_timer.cancel()
+        timer = threading.Timer(
+            _FLASH_DURATION,
+            lambda: self.post(lambda: self._clear_notice_if_seq(seq)),
+        )
+        timer.daemon = True
+        self._flash_timer = timer
+        timer.start()
+
+    def _clear_notice_if_seq(self, seq: int) -> None:
+        """Main-thread: drop the notice iff it still carries ``seq``.
+
+        Guards against a stale flash timer clearing a newer notice. Flags
+        an info redraw when it actually clears.
+        """
+        if self._notice is not None and self._notice.seq == seq:
+            self._notice = None
+            self._needs_redraw.add('info')
 
     # ---- cache introspection ---------------------------------------------
     #
@@ -5953,7 +6052,7 @@ class Browser:
         ``Mode.SEARCH_EDIT`` — ``/`` prompt open, user is typing a search.
         ``Mode.FILTER_EDIT`` — ``&`` prompt open, user is typing a filter.
 
-        Recipes can branch on this to decide whether a ``ctx.message``
+        Recipes can branch on this to decide whether a ``ctx.flash``
         write would clobber an in-progress prompt.
         """
         return self._mode
@@ -6370,8 +6469,14 @@ class Browser:
         """Signal both workers to exit and join with ``timeout``.
 
         Idempotent. Sets ``_stop``, then sets both events so each worker
-        wakes from its outer ``wait()`` and observes the stop flag.
+        wakes from its outer ``wait()`` and observes the stop flag. Also
+        cancels any live flash auto-clear timer so a pending fire can't
+        outlive the run loop (quit reaches here via the main loop's
+        ``finally``).
         """
+        if self._flash_timer is not None:
+            self._flash_timer.cancel()
+            self._flash_timer = None
         if not self._workers_running:
             return
         self._stop = True
@@ -7289,8 +7394,9 @@ class Browser:
         same id). Pendings registered against ``id_`` still resolve via
         ``_post_children_delivery``.
 
-        Errors at the boundary surface via ``self._error_text`` and a
-        synthesised empty delivery so the placeholder row clears.
+        Errors at the boundary surface via ``self.error`` (red info-bar
+        notice + log entry) and a synthesised empty delivery so the
+        placeholder row clears.
 
         Worker-thread only — main-thread mutations are routed through
         the post queue (``update_data`` / ``self.post(...)``). Calls
@@ -7311,10 +7417,9 @@ class Browser:
             raw = self.get_children(id_, reload=reload_)
         except Exception as e:
             error = True
-            # Cross-thread write to a Python str attribute is
-            # safe under the GIL; the renderer reads it later
-            # on the main thread.
-            self._error_text = (
+            # Thread-safe: ``error`` posts the notice + log write onto
+            # the main thread.
+            self.error(
                 f'get_children({id_!r}): {type(e).__name__}: {e}'
             )
         else:
@@ -7331,7 +7436,7 @@ class Browser:
                     items = [to_item(x) for x in raw]
                 except Exception as e:
                     error = True
-                    self._error_text = (
+                    self.error(
                         f'get_children({id_!r}): '
                         f'{type(e).__name__}: {e}'
                     )
@@ -7339,7 +7444,7 @@ class Browser:
         if error:
             # Synthesise an empty delivery so the placeholder
             # row clears and ``_loading`` flips to False; the
-            # error is surfaced via ``_error_text``.
+            # error is surfaced via ``self.error`` (notice + log).
             items = []
 
         if gen is not None:
@@ -8911,6 +9016,18 @@ class Browser:
         they're keyed by cursor id (not invocation count) and gated
         cheaply.
         """
+        # Error-notice acknowledgement: the first keypress landing at
+        # least ``_ERROR_MIN_DISPLAY`` after an error appeared clears it
+        # (the minimum guards against an in-flight key wiping an unread
+        # error). Non-swallowing — the key still dispatches normally
+        # below. Flash notices are the timer's job, not the keypress
+        # path's, so they're left alone here.
+        notice = self._notice
+        if (notice is not None and notice.kind == 'error'
+                and time.monotonic() - notice.shown_at >= _ERROR_MIN_DISPLAY):
+            self._notice = None
+            self._needs_redraw.add('info')
+
         prev_row = self._active_list_row()
         prev_insert = self._insert_mode
         if self._insert_mode:
@@ -11037,14 +11154,14 @@ def render_preview(browser, rect, *, info=False, has_header=True,
     non-'h' layouts where the info bar lives at the bottom of the
     screen, drawn by ``render_full`` independently).
 
-    The header label adapts to ``browser._error_text`` /
-    ``browser._help_mode`` (``Error`` / ``Help`` / ``Preview``).
+    The header label adapts to ``browser._help_mode`` (``Help`` /
+    ``Preview``). Errors no longer take over the pane — they surface as
+    an info-bar notice + log entry (see ``Browser.error``).
 
     Source priority for the content:
-      1. ``browser._error_text`` if set      → display the error text
-      2. ``browser._help_mode`` if True      → display ``compose_help_text``
-      3. ``item.preview`` (cursor item)      → per-item preview
-      4. fallthrough — empty preview         → blank rows
+      1. ``browser._help_mode`` if True      → display ``compose_help_text``
+      2. ``item.preview`` (cursor item)      → per-item preview
+      3. fallthrough — empty preview         → blank rows
 
     Content is wrapped at ``rect.width`` columns. Rows shorter than
     the rect width are blanked out to ``rect.right`` so stale content
@@ -11092,9 +11209,7 @@ def render_preview(browser, rect, *, info=False, has_header=True,
     # candidate; honour it when the geometry and ANSI policy still
     # match, otherwise regenerate.
     item = None
-    if browser._error_text:
-        text = browser._error_text
-    elif browser._help_mode:
+    if browser._help_mode:
         text = compose_help_text(browser, include_usage=False)
     else:
         cursor_id = _cursor_id(browser)
@@ -11105,11 +11220,10 @@ def render_preview(browser, rect, *, info=False, has_header=True,
                 text = item.preview
 
     # Wrap-cache fast path (#422) — only for per-item previews
-    # (error/help text is composed each paint anyway), and only when
+    # (help text is composed each paint anyway), and only when
     # geometry + ANSI policy match the cache.
     wrapped = None
-    if item is not None and not browser._error_text \
-            and not browser._help_mode:
+    if item is not None and not browser._help_mode:
         cached = item.preview_render
         if (cached is not None
                 and cached.width == width
@@ -11117,13 +11231,12 @@ def render_preview(browser, rect, *, info=False, has_header=True,
             wrapped = cached.wrapped
 
     if wrapped is None:
-        # Strip control chars before they hit the terminal. Covers all
-        # three sources (per-item preview, error text, help) so anything
-        # that reaches this pane is safe — preview data and action
-        # errors can carry attacker-controlled bytes (binary files, raw
-        # terminal captures, command stderr); help is composed in-process
-        # but cheap to filter and recipes may supply ``help_intro`` /
-        # ``help_outro``.
+        # Strip control chars before they hit the terminal. Covers both
+        # sources (per-item preview and help) so anything that reaches
+        # this pane is safe — preview data can carry attacker-controlled
+        # bytes (binary files, raw terminal captures, command stderr);
+        # help is composed in-process but cheap to filter and recipes
+        # may supply ``help_intro`` / ``help_outro``.
         #
         # In raw mode (``ansi_on=False``) the sanitiser also maps ESC to
         # '?' so untrusted content can never inject SGR or other escape
@@ -11167,8 +11280,8 @@ def render_preview(browser, rect, *, info=False, has_header=True,
                 line, width, ansi_on=ansi_on, drop_sgr=False))
 
         # Cache the wrap on the Item when it's a per-item render.
-        # Other branches (error/help) recompute on every paint and
-        # don't share the cache slot.
+        # The help branch recomputes on every paint and doesn't share
+        # the cache slot.
         #
         # ``raw_tail_offset`` is the position in ``item.preview`` just
         # after the last ``\n`` (or 0 if no newline yet, or
@@ -11176,8 +11289,7 @@ def render_preview(browser, rect, *, info=False, has_header=True,
         # falling out of ``rfind('\n') + 1`` naturally). This is the
         # start of the currently-open partial last raw line, which is
         # the splice point for #423 in-place ``append_preview``.
-        if item is not None and not browser._error_text \
-                and not browser._help_mode:
+        if item is not None and not browser._help_mode:
             raw_text = item.preview if item.preview is not None else ''
             last_nl = raw_text.rfind('\n')
             raw_tail_offset = 0 if last_nl < 0 else last_nl + 1
@@ -11217,10 +11329,9 @@ def render_preview(browser, rect, *, info=False, has_header=True,
 
     # #274: demand-pull signal. If the cursored id's preview generator
     # is paused at the cap and the user has scrolled near the buffered
-    # tail, wake the worker to resume pulling. Skip when showing
-    # error/help content (text source isn't the per-item preview).
-    if (not browser._error_text and not browser._help_mode
-            and len(wrapped) > 0):
+    # tail, wake the worker to resume pulling. Skip when showing help
+    # content (text source isn't the per-item preview).
+    if not browser._help_mode and len(wrapped) > 0:
         cursor_id = _cursor_id(browser)
         if cursor_id is not None:
             visible_end = scroll + content_lines  # exclusive row index
@@ -11718,7 +11829,11 @@ def render_info_bar(row, cols, label, *, info=False, browser=None,
       * a scope crumb path (when ``scope_stack`` is non-empty) — one
         ``▸ <id>`` segment per stack entry in bright cyan;
       * the search prompt + query (when ``browser._mode is Mode.SEARCH_EDIT``);
-      * a dim hint string about navigation keys (when not searching).
+      * an info-bar notice (``browser._notice``) in place of the hint —
+        red+bold for an error, dim for a flash;
+      * a dim hint string about navigation keys (when none of the above).
+
+    Middle-region priority: search / filter prompt > notice > hint.
 
     The right edge ends with the pane label (``Preview``, ``Help``, …).
 
@@ -11749,6 +11864,10 @@ def render_info_bar(row, cols, label, *, info=False, browser=None,
     if info and browser is not None:
         sel_count = len(browser._state.selected)
         search = browser._search_query if browser._mode is Mode.SEARCH_EDIT else None
+        # Info-bar notice (flash / error) — shown in the middle region in
+        # place of the hint, but below the search / filter prompt. Pane
+        # headers (info=False) never surface it.
+        notice = browser._notice
         crumb = (
             _scope_crumb_text(browser)
             if getattr(browser, 'show_scope_crumb', False)
@@ -11778,6 +11897,7 @@ def render_info_bar(row, cols, label, *, info=False, browser=None,
         search = None
         crumb = ''
         filt = None
+        notice = None
 
     label_str = ' {} '.format(label)
     pos = 0
@@ -11840,6 +11960,21 @@ def render_info_bar(row, cols, label, *, info=False, browser=None,
             set_style(fg=11, bold=True)
         write(line[:cols - pos])
         pos += len(line)
+        reset_style()
+        set_style(fg=8)
+    elif notice is not None and pos < cols:
+        # Info-bar notice — in place of the hint, truncated to the same
+        # budget. Red + bold for errors (loud); a quiet dim style for
+        # flashes (distinct from the dimmer hint, but not shouty).
+        avail = cols - pos - len(label_str) - 3
+        if avail > 10:
+            text = notice.text[:avail]
+            if notice.kind == 'error':
+                set_style(fg=9, bold=True)
+            else:
+                set_style(fg=250, bold=True)
+            write(text)
+            pos += len(text)
         reset_style()
         set_style(fg=8)
     elif info and pos < cols:
@@ -12206,8 +12341,6 @@ def render_partial(browser):
 
 def _preview_label(browser):
     """Pick the preview pane label based on browser state."""
-    if browser._error_text:
-        return 'Error'
     if browser._help_mode:
         return 'Help'
     return 'Preview'
@@ -12351,8 +12484,8 @@ split is deliberate:
 
 Affordances exposed on Context: ``cursor``, ``selected``, ``targets``,
 plus pass-through versions of ``refresh / cursor_to / expand / select /
-message / error / quit`` and the main-thread sub-flows ``run_external``,
-``page``, ``input``, ``confirm``, ``pick``, ``insert``.
+flash / log / error / quit`` and the main-thread sub-flows
+``run_external``, ``page``, ``input``, ``confirm``, ``pick``, ``insert``.
 """
 
 import os
@@ -12730,12 +12863,30 @@ class Context:
         """Drop all filters; alias for ``set_filters([])``."""
         self._browser.clear_filters()
 
-    def message(self, text: str) -> None:
-        """Surface ``text`` as a transient status message."""
-        self._browser.message(text)
+    def flash(self, text: str, log: bool = False) -> None:
+        """Surface ``text`` as a transient info-bar notice.
+
+        Pass-through to :meth:`Browser.flash`. Use for toggle / mode
+        acks and "nothing to show" notices; pass ``log=True`` to also
+        record it in the message log (side effects, degradation
+        warnings). Auto-clears after a short timeout.
+        """
+        self._browser.flash(text, log)
+
+    def log(self, text: str) -> None:
+        """Append ``text`` to the message log (no on-screen notice).
+
+        Pass-through to :meth:`Browser.log`. The ``console.log``-style
+        record; view it on demand via the framework log pager.
+        """
+        self._browser.log(text)
 
     def error(self, text: str) -> None:
-        """Surface ``text`` as an error message."""
+        """Surface ``text`` as a red, sticky info-bar notice.
+
+        Pass-through to :meth:`Browser.error`. Always logged; cleared by
+        the next keypress (after a brief minimum-display window).
+        """
         self._browser.error(text)
 
     def quit(self, code: int = 0, output: str = '') -> None:
@@ -13894,7 +14045,7 @@ def _run_external_on_preview(ctx, *, env_var, default):
     # before reading the cache rather than opening an empty pager.
     get_preview = getattr(ctx._browser, 'get_preview', None)
     if get_preview is None:
-        ctx.message('No preview available')
+        ctx.flash('No preview available')
         return
     text = getattr(item, 'preview', None)
     if text is None:
@@ -13908,7 +14059,7 @@ def _run_external_on_preview(ctx, *, env_var, default):
             ctx.error(f'preview: {type(e).__name__}: {e}')
             return
         if text is None:
-            ctx.message('No preview available')
+            ctx.flash('No preview available')
             return
         # Cache so the preview pane (if shown later) skips the refetch.
         item.preview = text
@@ -13924,6 +14075,21 @@ def _run_external_on_preview(ctx, *, env_var, default):
             os.unlink(path)
         except OSError:
             pass
+
+
+def _view_log(ctx):
+    """``~`` — page the session's message log.
+
+    Joins the browser's ``_log`` ring buffer (oldest first, each line
+    already wall-clock prefixed) with newlines and hands it to
+    :meth:`Context.page` — reusing the paste-friendly framework pager
+    (``bat``/``batcat``/``less``) rather than building a new in-TUI
+    surface. Shows the literal ``"(log empty)"`` when nothing has been
+    logged yet. Recipes can rebind ``~`` like any other default.
+    """
+    log = ctx._browser._log
+    text = '\n'.join(log) if log else '(log empty)'
+    ctx.page(text)
 
 
 def _scope_down(ctx):
@@ -14648,6 +14814,7 @@ def default_actions() -> list:
         # 'e' to make edits actually persist (the default discards).
         Action('v',         'View preview in $PAGER',  _view_in_pager,   'none', 'OTHER'),
         Action('e',         'Edit preview in $EDITOR (changes discarded)', _edit_in_editor, 'none', 'OTHER'),
+        Action('~',         'View message log', _view_log,  'none', 'OTHER'),
         Action('q',         'Quit',           _quit,        'none', 'OTHER'),
         Action('esc',       'Quit',           _quit,        'none', 'OTHER'),
         Action('ctrl-c',    'Quit',           _quit,        'none', 'OTHER'),

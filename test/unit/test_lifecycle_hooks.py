@@ -71,6 +71,11 @@ def _seed(b, items):
     b.drain_main_queue()
 
 
+def _err_log(b):
+    """Joined message log — ``Browser.error`` always appends to it."""
+    return '\n'.join(b._log)
+
+
 class TestOnCursorChange(unittest.TestCase):
 
     def test_fires_once_per_drain(self):
@@ -149,8 +154,8 @@ class TestOnCursorChange(unittest.TestCase):
         mark_cursor_changed(b)
         b._fire_cursor_change_if_pending()
         b.drain_main_queue()
-        self.assertIn('boom', b.error_text)
-        self.assertIn('on_cursor_change', b.error_text)
+        self.assertIn('boom', _err_log(b))
+        self.assertIn('on_cursor_change', _err_log(b))
 
 
 class TestOnScopeChange(unittest.TestCase):
@@ -233,8 +238,8 @@ class TestOnScopeChange(unittest.TestCase):
         b = Browser(BrowserConfig(_headless=True, on_scope_change=bad))
         b._fire_scope_change()
         b.drain_main_queue()
-        self.assertIn('nope', b.error_text)
-        self.assertIn('on_scope_change', b.error_text)
+        self.assertIn('nope', _err_log(b))
+        self.assertIn('on_scope_change', _err_log(b))
 
 
 class TestOnSelectionChange(unittest.TestCase):
@@ -304,8 +309,8 @@ class TestOnSelectionChange(unittest.TestCase):
         b._state.selected = {'a'}
         b.clear_selection()
         b.drain_main_queue()
-        self.assertIn('selection boom', b.error_text)
-        self.assertIn('on_selection_change', b.error_text)
+        self.assertIn('selection boom', _err_log(b))
+        self.assertIn('on_selection_change', _err_log(b))
 
 
 class TestOnQuit(unittest.TestCase):
@@ -571,8 +576,8 @@ class TestOnExpandCollapse(unittest.TestCase):
             b._state.expanded = {'A'}
             b._fire_expand_collapse_if_pending()
             b.drain_main_queue()
-            self.assertIn('expand boom', b.error_text)
-            self.assertIn('on_expand', b.error_text)
+            self.assertIn('expand boom', _err_log(b))
+            self.assertIn('on_expand', _err_log(b))
         finally:
             b.stop_workers()
 
@@ -861,8 +866,8 @@ class TestOnChildrenLoaded(unittest.TestCase):
         b.drain_main_queue()
         b._fire_children_loaded_if_pending()
         b.drain_main_queue()
-        self.assertIn('loaded boom', b.error_text)
-        self.assertIn('on_children_loaded', b.error_text)
+        self.assertIn('loaded boom', _err_log(b))
+        self.assertIn('on_children_loaded', _err_log(b))
         # Pending still cleared despite the throw.
         self.assertEqual(b._children_loaded_pending, set())
 
@@ -956,8 +961,8 @@ class TestOnSearchChange(unittest.TestCase):
         b.drain_main_queue()
         b._fire_search_change_if_pending()
         b.drain_main_queue()
-        self.assertIn('search boom', b.error_text)
-        self.assertIn('on_search_change', b.error_text)
+        self.assertIn('search boom', _err_log(b))
+        self.assertIn('on_search_change', _err_log(b))
 
 
 class TestOnFilterChange(unittest.TestCase):
@@ -1055,8 +1060,8 @@ class TestOnFilterChange(unittest.TestCase):
         b.drain_main_queue()
         b._fire_filter_change_if_pending()
         b.drain_main_queue()
-        self.assertIn('filter boom', b.error_text)
-        self.assertIn('on_filter_change', b.error_text)
+        self.assertIn('filter boom', _err_log(b))
+        self.assertIn('on_filter_change', _err_log(b))
 
 
 class TestOnResize(unittest.TestCase):
@@ -1219,8 +1224,8 @@ class TestOnResize(unittest.TestCase):
             b._resize_pending = True
             b._fire_resize_if_pending()
             b.drain_main_queue()
-            self.assertIn('resize boom', b.error_text)
-            self.assertIn('on_resize', b.error_text)
+            self.assertIn('resize boom', _err_log(b))
+            self.assertIn('on_resize', _err_log(b))
             # Size baseline still advanced despite the throw.
             self.assertEqual(b._last_size, (110, 35))
         finally:

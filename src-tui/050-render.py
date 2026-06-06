@@ -1915,14 +1915,14 @@ def render_preview(browser, rect, *, info=False, has_header=True,
     non-'h' layouts where the info bar lives at the bottom of the
     screen, drawn by ``render_full`` independently).
 
-    The header label adapts to ``browser._error_text`` /
-    ``browser._help_mode`` (``Error`` / ``Help`` / ``Preview``).
+    The header label adapts to ``browser._help_mode`` (``Help`` /
+    ``Preview``). Errors no longer take over the pane — they surface as
+    an info-bar notice + log entry (see ``Browser.error``).
 
     Source priority for the content:
-      1. ``browser._error_text`` if set      → display the error text
-      2. ``browser._help_mode`` if True      → display ``compose_help_text``
-      3. ``item.preview`` (cursor item)      → per-item preview
-      4. fallthrough — empty preview         → blank rows
+      1. ``browser._help_mode`` if True      → display ``compose_help_text``
+      2. ``item.preview`` (cursor item)      → per-item preview
+      3. fallthrough — empty preview         → blank rows
 
     Content is wrapped at ``rect.width`` columns. Rows shorter than
     the rect width are blanked out to ``rect.right`` so stale content
@@ -1970,9 +1970,7 @@ def render_preview(browser, rect, *, info=False, has_header=True,
     # candidate; honour it when the geometry and ANSI policy still
     # match, otherwise regenerate.
     item = None
-    if browser._error_text:
-        text = browser._error_text
-    elif browser._help_mode:
+    if browser._help_mode:
         text = compose_help_text(browser, include_usage=False)
     else:
         cursor_id = _cursor_id(browser)
@@ -1983,11 +1981,10 @@ def render_preview(browser, rect, *, info=False, has_header=True,
                 text = item.preview
 
     # Wrap-cache fast path (#422) — only for per-item previews
-    # (error/help text is composed each paint anyway), and only when
+    # (help text is composed each paint anyway), and only when
     # geometry + ANSI policy match the cache.
     wrapped = None
-    if item is not None and not browser._error_text \
-            and not browser._help_mode:
+    if item is not None and not browser._help_mode:
         cached = item.preview_render
         if (cached is not None
                 and cached.width == width
@@ -1995,13 +1992,12 @@ def render_preview(browser, rect, *, info=False, has_header=True,
             wrapped = cached.wrapped
 
     if wrapped is None:
-        # Strip control chars before they hit the terminal. Covers all
-        # three sources (per-item preview, error text, help) so anything
-        # that reaches this pane is safe — preview data and action
-        # errors can carry attacker-controlled bytes (binary files, raw
-        # terminal captures, command stderr); help is composed in-process
-        # but cheap to filter and recipes may supply ``help_intro`` /
-        # ``help_outro``.
+        # Strip control chars before they hit the terminal. Covers both
+        # sources (per-item preview and help) so anything that reaches
+        # this pane is safe — preview data can carry attacker-controlled
+        # bytes (binary files, raw terminal captures, command stderr);
+        # help is composed in-process but cheap to filter and recipes
+        # may supply ``help_intro`` / ``help_outro``.
         #
         # In raw mode (``ansi_on=False``) the sanitiser also maps ESC to
         # '?' so untrusted content can never inject SGR or other escape
@@ -2045,8 +2041,8 @@ def render_preview(browser, rect, *, info=False, has_header=True,
                 line, width, ansi_on=ansi_on, drop_sgr=False))
 
         # Cache the wrap on the Item when it's a per-item render.
-        # Other branches (error/help) recompute on every paint and
-        # don't share the cache slot.
+        # The help branch recomputes on every paint and doesn't share
+        # the cache slot.
         #
         # ``raw_tail_offset`` is the position in ``item.preview`` just
         # after the last ``\n`` (or 0 if no newline yet, or
@@ -2054,8 +2050,7 @@ def render_preview(browser, rect, *, info=False, has_header=True,
         # falling out of ``rfind('\n') + 1`` naturally). This is the
         # start of the currently-open partial last raw line, which is
         # the splice point for #423 in-place ``append_preview``.
-        if item is not None and not browser._error_text \
-                and not browser._help_mode:
+        if item is not None and not browser._help_mode:
             raw_text = item.preview if item.preview is not None else ''
             last_nl = raw_text.rfind('\n')
             raw_tail_offset = 0 if last_nl < 0 else last_nl + 1
@@ -2095,10 +2090,9 @@ def render_preview(browser, rect, *, info=False, has_header=True,
 
     # #274: demand-pull signal. If the cursored id's preview generator
     # is paused at the cap and the user has scrolled near the buffered
-    # tail, wake the worker to resume pulling. Skip when showing
-    # error/help content (text source isn't the per-item preview).
-    if (not browser._error_text and not browser._help_mode
-            and len(wrapped) > 0):
+    # tail, wake the worker to resume pulling. Skip when showing help
+    # content (text source isn't the per-item preview).
+    if not browser._help_mode and len(wrapped) > 0:
         cursor_id = _cursor_id(browser)
         if cursor_id is not None:
             visible_end = scroll + content_lines  # exclusive row index
@@ -2596,7 +2590,11 @@ def render_info_bar(row, cols, label, *, info=False, browser=None,
       * a scope crumb path (when ``scope_stack`` is non-empty) — one
         ``▸ <id>`` segment per stack entry in bright cyan;
       * the search prompt + query (when ``browser._mode is Mode.SEARCH_EDIT``);
-      * a dim hint string about navigation keys (when not searching).
+      * an info-bar notice (``browser._notice``) in place of the hint —
+        red+bold for an error, dim for a flash;
+      * a dim hint string about navigation keys (when none of the above).
+
+    Middle-region priority: search / filter prompt > notice > hint.
 
     The right edge ends with the pane label (``Preview``, ``Help``, …).
 
@@ -2627,6 +2625,10 @@ def render_info_bar(row, cols, label, *, info=False, browser=None,
     if info and browser is not None:
         sel_count = len(browser._state.selected)
         search = browser._search_query if browser._mode is Mode.SEARCH_EDIT else None
+        # Info-bar notice (flash / error) — shown in the middle region in
+        # place of the hint, but below the search / filter prompt. Pane
+        # headers (info=False) never surface it.
+        notice = browser._notice
         crumb = (
             _scope_crumb_text(browser)
             if getattr(browser, 'show_scope_crumb', False)
@@ -2656,6 +2658,7 @@ def render_info_bar(row, cols, label, *, info=False, browser=None,
         search = None
         crumb = ''
         filt = None
+        notice = None
 
     label_str = ' {} '.format(label)
     pos = 0
@@ -2718,6 +2721,21 @@ def render_info_bar(row, cols, label, *, info=False, browser=None,
             set_style(fg=11, bold=True)
         write(line[:cols - pos])
         pos += len(line)
+        reset_style()
+        set_style(fg=8)
+    elif notice is not None and pos < cols:
+        # Info-bar notice — in place of the hint, truncated to the same
+        # budget. Red + bold for errors (loud); a quiet dim style for
+        # flashes (distinct from the dimmer hint, but not shouty).
+        avail = cols - pos - len(label_str) - 3
+        if avail > 10:
+            text = notice.text[:avail]
+            if notice.kind == 'error':
+                set_style(fg=9, bold=True)
+            else:
+                set_style(fg=250, bold=True)
+            write(text)
+            pos += len(text)
         reset_style()
         set_style(fg=8)
     elif info and pos < cols:
@@ -3084,8 +3102,6 @@ def render_partial(browser):
 
 def _preview_label(browser):
     """Pick the preview pane label based on browser state."""
-    if browser._error_text:
-        return 'Error'
     if browser._help_mode:
         return 'Help'
     return 'Preview'

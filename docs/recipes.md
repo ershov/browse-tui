@@ -412,7 +412,7 @@ def get_preview(item_id):
 
 
 def my_action(ctx):
-    ctx.message(f'pressed e on {ctx.cursor.id}')
+    ctx.flash(f'pressed e on {ctx.cursor.id}')
 
 
 def main():
@@ -457,7 +457,7 @@ def get_children(_, *, reload=False):
 # When using a CLI --action, those attributes appear as $TUI_SIZE / $TUI_MTIME.
 # When using a Python Action handler, they're plain attributes on ctx.cursor:
 def show(ctx):
-    ctx.message(f'size: {ctx.cursor.size}')
+    ctx.flash(f'size: {ctx.cursor.size}')
 ```
 
 #### Background updates via a watcher

@@ -206,23 +206,41 @@ class TestPassThrough(unittest.TestCase):
         finally:
             b.stop_workers()
 
-    def test_message_sets_message_text(self):
+    def test_flash_sets_flash_notice(self):
         b = _make_browser()
         try:
             ctx = Context(b)
-            ctx.message('hello')
+            ctx.flash('hello')
             b.drain_main_queue()
-            self.assertEqual(b._message_text, 'hello')
+            self.assertIsNotNone(b._notice)
+            self.assertEqual(b._notice.text, 'hello')
+            self.assertEqual(b._notice.kind, 'flash')
         finally:
             b.stop_workers()
 
-    def test_error_sets_error_text(self):
+    def test_error_sets_error_notice_and_logs(self):
         b = _make_browser()
         try:
             ctx = Context(b)
             ctx.error('bad')
             b.drain_main_queue()
-            self.assertEqual(b._error_text, 'bad')
+            self.assertIsNotNone(b._notice)
+            self.assertEqual(b._notice.text, 'bad')
+            self.assertEqual(b._notice.kind, 'error')
+            self.assertEqual(len(b._log), 1)
+            self.assertTrue(b._log[-1].endswith('bad'))
+        finally:
+            b.stop_workers()
+
+    def test_log_appends_silently(self):
+        b = _make_browser()
+        try:
+            ctx = Context(b)
+            ctx.log('note')
+            b.drain_main_queue()
+            self.assertIsNone(b._notice)
+            self.assertEqual(len(b._log), 1)
+            self.assertTrue(b._log[-1].endswith('note'))
         finally:
             b.stop_workers()
 
@@ -247,6 +265,155 @@ class TestPassThrough(unittest.TestCase):
             self.assertEqual(b._state.selected, {'a', 'b'})
         finally:
             b.stop_workers()
+
+
+# --- flash / log / error notice primitives (Browser-level) ----------------
+
+
+class TestNoticePrimitives(unittest.TestCase):
+
+    def test_flash_headless_arms_no_timer(self):
+        b = _make_browser()
+        try:
+            b.flash('hi')
+            b.drain_main_queue()
+            self.assertEqual(b._notice.kind, 'flash')
+            self.assertIsNone(b._flash_timer)
+        finally:
+            b.stop_workers()
+
+    def test_flash_non_headless_arms_timer(self):
+        b = _make_browser()
+        # Flip the headless flag — arming a threading.Timer touches no
+        # terminal, so this is safe without a real TTY. Cancel it right
+        # away so the fire callback never runs during the test.
+        b._headless = False
+        try:
+            b.flash('hi')
+            b.drain_main_queue()
+            self.assertIsNotNone(b._flash_timer)
+        finally:
+            if b._flash_timer is not None:
+                b._flash_timer.cancel()
+            b.stop_workers()
+
+    def test_flash_log_true_appends(self):
+        b = _make_browser()
+        try:
+            b.flash('side effect', log=True)
+            b.drain_main_queue()
+            self.assertEqual(b._notice.kind, 'flash')
+            self.assertEqual(len(b._log), 1)
+            self.assertTrue(b._log[-1].endswith('side effect'))
+        finally:
+            b.stop_workers()
+
+    def test_flash_default_does_not_log(self):
+        b = _make_browser()
+        try:
+            b.flash('ack')
+            b.drain_main_queue()
+            self.assertEqual(len(b._log), 0)
+        finally:
+            b.stop_workers()
+
+    def test_log_sets_no_notice_and_no_redraw(self):
+        b = _make_browser()
+        try:
+            b._needs_redraw.clear()
+            b.log('note')
+            b.drain_main_queue()
+            self.assertIsNone(b._notice)
+            self.assertEqual(b._needs_redraw, set())
+            self.assertEqual(len(b._log), 1)
+        finally:
+            b.stop_workers()
+
+    def test_error_always_logs_and_no_timer(self):
+        b = _make_browser()
+        try:
+            b.error('boom')
+            b.drain_main_queue()
+            self.assertEqual(b._notice.kind, 'error')
+            self.assertEqual(len(b._log), 1)
+            self.assertTrue(b._log[-1].endswith('boom'))
+            self.assertIsNone(b._flash_timer)
+        finally:
+            b.stop_workers()
+
+    def test_log_entry_has_timestamp_prefix(self):
+        b = _make_browser()
+        try:
+            b.log('payload')
+            b.drain_main_queue()
+            entry = b._log[-1]
+            # "HH:MM:SS  payload" — a time prefix then two spaces.
+            self.assertRegex(entry, r'^\d\d:\d\d:\d\d  payload$')
+        finally:
+            b.stop_workers()
+
+    def test_ring_buffer_caps_at_maxlen(self):
+        b = _make_browser()
+        try:
+            for i in range(_state._LOG_MAXLEN + 50):
+                b.log(f'line {i}')
+            b.drain_main_queue()
+            self.assertEqual(len(b._log), _state._LOG_MAXLEN)
+            # Oldest entries dropped; newest retained.
+            self.assertTrue(b._log[-1].endswith(
+                f'line {_state._LOG_MAXLEN + 49}'))
+            self.assertTrue(b._log[0].endswith('line 50'))
+        finally:
+            b.stop_workers()
+
+    def test_last_write_wins_single_slot(self):
+        b = _make_browser()
+        try:
+            b.flash('first')
+            b.error('second')
+            b.drain_main_queue()
+            self.assertEqual(b._notice.kind, 'error')
+            self.assertEqual(b._notice.text, 'second')
+            # Each set bumped the sequence.
+            self.assertGreater(b._notice.seq, 0)
+        finally:
+            b.stop_workers()
+
+    def test_stale_seq_timer_does_not_clear_newer_notice(self):
+        b = _make_browser()
+        try:
+            b.flash('old')
+            b.drain_main_queue()
+            old_seq = b._notice.seq
+            b.flash('new')
+            b.drain_main_queue()
+            new_seq = b._notice.seq
+            self.assertNotEqual(old_seq, new_seq)
+            # Stale timer fires for the old seq — must NOT clear the
+            # newer notice.
+            b._clear_notice_if_seq(old_seq)
+            self.assertIsNotNone(b._notice)
+            self.assertEqual(b._notice.text, 'new')
+            # The matching-seq clear does remove it and flags a redraw.
+            b._needs_redraw.clear()
+            b._clear_notice_if_seq(new_seq)
+            self.assertIsNone(b._notice)
+            self.assertIn('info', b._needs_redraw)
+        finally:
+            b.stop_workers()
+
+    def test_stop_workers_cancels_flash_timer(self):
+        b = _make_browser()
+        b._headless = False
+        b.flash('hi')
+        b.drain_main_queue()
+        timer = b._flash_timer
+        self.assertIsNotNone(timer)
+        b.stop_workers()
+        # Timer cancelled (its ``finished`` event is set, so the action
+        # never runs) and the slot is cleared.
+        self.assertTrue(timer.finished.is_set())
+        self.assertIsNone(b._flash_timer)
 
 
 # --- run_external (headless) ----------------------------------------------

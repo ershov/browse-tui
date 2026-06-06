@@ -124,7 +124,7 @@ class TestOnChildrenLoadedTiming(unittest.TestCase):
             b.run_until_idle()
             b._fire_children_loaded_if_pending()
             self.assertEqual(seen, [{'p': []}])
-            self.assertIn('get_children', b.error_text)
+            self.assertIn('get_children', '\n'.join(b._log))
         finally:
             b.stop_workers()
 

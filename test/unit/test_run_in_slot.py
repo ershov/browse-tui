@@ -92,14 +92,15 @@ class TestRunInSlot(unittest.TestCase):
             raise RuntimeError('worker boom')
         b.run_in_slot('s', bad)
         done.wait(timeout=2.0)
-        # ``Browser.error`` posts; drain so error_text reflects it.
+        # ``Browser.error`` posts; drain so the error reaches the log.
         for _ in range(50):
             b.drain_main_queue()
-            if 'worker boom' in b.error_text:
+            if any('worker boom' in e for e in b._log):
                 break
             time.sleep(0.01)
-        self.assertIn('worker boom', b.error_text)
-        self.assertIn('run_in_slot', b.error_text)
+        log = '\n'.join(b._log)
+        self.assertIn('worker boom', log)
+        self.assertIn('run_in_slot', log)
 
     def test_slot_entry_removed_on_exit(self):
         b = Browser(BrowserConfig(_headless=True))

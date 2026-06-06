@@ -12,8 +12,8 @@ split is deliberate:
 
 Affordances exposed on Context: ``cursor``, ``selected``, ``targets``,
 plus pass-through versions of ``refresh / cursor_to / expand / select /
-message / error / quit`` and the main-thread sub-flows ``run_external``,
-``page``, ``input``, ``confirm``, ``pick``, ``insert``.
+flash / log / error / quit`` and the main-thread sub-flows
+``run_external``, ``page``, ``input``, ``confirm``, ``pick``, ``insert``.
 """
 
 import os
@@ -391,12 +391,30 @@ class Context:
         """Drop all filters; alias for ``set_filters([])``."""
         self._browser.clear_filters()
 
-    def message(self, text: str) -> None:
-        """Surface ``text`` as a transient status message."""
-        self._browser.message(text)
+    def flash(self, text: str, log: bool = False) -> None:
+        """Surface ``text`` as a transient info-bar notice.
+
+        Pass-through to :meth:`Browser.flash`. Use for toggle / mode
+        acks and "nothing to show" notices; pass ``log=True`` to also
+        record it in the message log (side effects, degradation
+        warnings). Auto-clears after a short timeout.
+        """
+        self._browser.flash(text, log)
+
+    def log(self, text: str) -> None:
+        """Append ``text`` to the message log (no on-screen notice).
+
+        Pass-through to :meth:`Browser.log`. The ``console.log``-style
+        record; view it on demand via the framework log pager.
+        """
+        self._browser.log(text)
 
     def error(self, text: str) -> None:
-        """Surface ``text`` as an error message."""
+        """Surface ``text`` as a red, sticky info-bar notice.
+
+        Pass-through to :meth:`Browser.error`. Always logged; cleared by
+        the next keypress (after a brief minimum-display window).
+        """
         self._browser.error(text)
 
     def quit(self, code: int = 0, output: str = '') -> None:

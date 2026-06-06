@@ -211,7 +211,8 @@ ctx.cursor_to(id, on_complete=None)   -> Pending
 ctx.expand(id, on_complete=None)      -> Pending
 ctx.collapse(id)                      -> None
 ctx.select(ids, replace=False)        -> None
-ctx.message(text)                     -> None
+ctx.flash(text, log=False)            -> None
+ctx.log(text)                         -> None
 ctx.error(text)                       -> None
 ctx.quit(code=0, output='')           -> None
 ```
@@ -223,8 +224,9 @@ ctx.quit(code=0, output='')           -> None
 | `expand`     | Add id to expanded; trigger fetch if not cached.                     |
 | `collapse`   | Remove id from expanded; fold its subtree (no-op if not expanded).   |
 | `select`     | Add ids to selection (or replace).                                   |
-| `message`    | Surface a transient status message in the info bar.                  |
-| `error`      | Surface an error message (red, sticks until next message).           |
+| `flash`      | Transient info-bar notice; `log=True` also records it in the log.    |
+| `log`        | Append to the message log silently (no on-screen notice).           |
+| `error`      | Red, sticky info-bar notice; always logged; cleared by next keypress.|
 | `quit`       | Exit the main loop with `code`; print `output` to stdout afterwards. |
 
 ### Cache introspection
@@ -605,7 +607,7 @@ def on_cursor_change(ctx, id):
 
 def on_scope_change(ctx, scope_id, prev_scope_id, direction):
     if direction == 'in':
-        ctx.message(f'scoped into {scope_id} (from {prev_scope_id})')
+        ctx.flash(f'scoped into {scope_id} (from {prev_scope_id})')
 
 def on_expand(ctx, ids):
     log.debug('expanded %s', ids)
@@ -980,7 +982,8 @@ browser.collapse(id)                       -> None   # remove id from expanded; 
 browser.nav_home()                         # cursor → row 0; engage PIN_FIRST
 browser.nav_end()                          # cursor → last row; engage PIN_LAST
 browser.select(ids, replace=False)
-browser.message(text)
+browser.flash(text, log=False)
+browser.log(text)
 browser.error(text)
 browser.quit(code=0, output='')
 browser.cancel(*pendings)                  # sugar for p.cancel()
@@ -1659,7 +1662,7 @@ applied to the cache.
 ```python
 ctx.expand('a').then(
     lambda: ctx.cursor_to('a-1').then(
-        lambda: ctx.message('navigated')))
+        lambda: ctx.flash('navigated')))
 ```
 
 ### `cancel()`

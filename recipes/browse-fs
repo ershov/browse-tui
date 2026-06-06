@@ -130,7 +130,7 @@ def toggle_md(ctx):
     global _MD_COLOR
     _MD_COLOR = not _MD_COLOR
     ctx.drop_preview_cache()
-    ctx.message(f'md preview: {"colored" if _MD_COLOR else "raw"}')
+    ctx.flash(f'md preview: {"colored" if _MD_COLOR else "raw"}')
 
 
 def edit(ctx):

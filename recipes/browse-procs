@@ -118,7 +118,7 @@ def kill_proc(ctx):
         return
     try:
         os.kill(pid, signal.SIGTERM)
-        ctx.message(f'sent SIGTERM to pid {pid}')
+        ctx.flash(f'sent SIGTERM to pid {pid}', log=True)
     except OSError as e:
         ctx.error(f'kill {pid}: {e}')
     ctx.refresh()
