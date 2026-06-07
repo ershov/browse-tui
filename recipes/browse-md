@@ -280,12 +280,16 @@ def _build_nodes(events, file_text, line_starts, path):
     wires ``item._children`` from ``MdNode.children``, and hangs the
     top-level nodes under a per-file root ``Item``.
 
-    ``events`` is the parallel ``_parse(file_text)`` event stream (same
-    document order as a pre-order walk of the structural tree, verified
-    1:1 by ``byte_offset``). It supplies the one bit ``MdNode`` doesn't
-    carry: a list item's ``ul`` vs ``ol`` tag (the marker kind). It must
-    be consistent with ``file_text`` — every caller derives it via
-    ``_parse`` under the same ``_INCLUDE_LISTS``.
+    ``events`` is the parallel ``_parse(file_text)`` event stream, in the
+    same document order as a pre-order walk of the structural tree and 1:1
+    with that walk's heading/list-item nodes by ``byte_offset`` (the
+    synthetic ``'text'`` nodes the lists-off walk also carries have no
+    event, so the full-walk 1:1 holds exactly in lists-on mode — the only
+    place ``events`` is consumed, via ``event_kinds`` for the ``ul``/``ol``
+    tag). It supplies the one bit ``MdNode`` doesn't carry: a list item's
+    ``ul`` vs ``ol`` tag (the marker kind). It must be consistent with
+    ``file_text`` — every caller derives it via ``_parse`` under the same
+    ``_INCLUDE_LISTS``.
 
     The per-file root owns every top-level heading and every
     pre-first-heading list item; ``by_id`` is the flat id-to-Item index
@@ -329,8 +333,15 @@ def _build_nodes(events, file_text, line_starts, path):
     line_size = [0] * n
     for i in range(n):
         cur = flat[i]
-        cur_is_heading = cur.kind == 'heading'
         cur_level = cur.level
+        if cur.kind == 'text':
+            # A ``'text'`` run (headings-only view) is the body before a
+            # scope's first heading, so its section ends at that very
+            # heading — always its immediately-following pre-order sibling.
+            # ``i + 1`` is therefore in range and is the heading it precedes.
+            line_size[i] = flat[i + 1].line_offset - cur.line_offset
+            continue
+        cur_is_heading = cur.kind == 'heading'
         j_lo = file_lines_eof
         for j in range(i + 1, n):
             nxt = flat[j]
@@ -356,11 +367,16 @@ def _build_nodes(events, file_text, line_starts, path):
     index_of = {id(node): i for i, node in enumerate(flat)}
 
     # Per-node tag, indexed by pre-order position. ``MdNode`` only
-    # records ``kind`` ('heading' / 'list-item'), so the ``ul`` vs ``ol``
-    # distinction comes from the matching event's kind. ``events`` is
-    # ``_parse(file_text)``, which walks the same ``md2ansi_scan`` spans
-    # as ``build_doc_tree``, so it is 1:1 with the pre-order ``flat`` by
-    # construction (``len(events) == n``).
+    # records ``kind`` ('heading' / 'list-item' / 'text'), so the ``ul``
+    # vs ``ol`` distinction comes from the matching event's kind. This
+    # index is consulted ONLY for list-item nodes (the ``else`` arm of
+    # ``_to_item``), and list items exist only with lists ON — where
+    # ``build_doc_tree`` synthesises NO ``'text'`` nodes, so ``flat`` is
+    # 1:1 with ``events`` (heading/list spans) by construction. With lists
+    # off ``flat`` additionally carries synthetic ``'text'`` nodes (no
+    # event), so it is longer than ``events`` — but those rows return from
+    # ``_to_item`` before the ``else`` arm, so ``event_kinds`` is never
+    # indexed with a shifted position.
     event_kinds = [k for k, _ in events]
 
     # Per-file root. Files ARE the top-level entries, so there's no
@@ -384,7 +400,16 @@ def _build_nodes(events, file_text, line_starts, path):
 
     def _to_item(node):
         index = index_of[id(node)]
-        if node.kind == 'heading':
+        if node.kind == 'text':
+            # A dim ``[text]`` leaf for a loose body run preceding a scope's
+            # first heading (headings-only view). Decide its tag here and
+            # fall through to the shared field-stamping — but BEFORE the
+            # list-item ``else`` arm, so we never index ``event_kinds`` with
+            # this node's ``flat`` position (text nodes have no event, so
+            # that index belongs to the next list/heading span).
+            tag = 'text'
+            tag_style = 'dim'
+        elif node.kind == 'heading':
             tag = f'h{node.level}'
             tag_style = _HEADING_STYLES[node.level]
         else:
@@ -815,6 +840,43 @@ def _md_heading_item(base, abspaths, node):
     return item
 
 
+def _md_text_item(base, abspaths, node):
+    """Map an ``md_doc`` ``'text'`` ``MdNode`` to a dim-leaf tree-row ``Item``.
+
+    The dim-leaf sibling of :func:`_md_heading_item`: a loose body run that
+    precedes a scope's first heading. Id = ``compose_md_id(base, abspaths,
+    node.line_offset)`` — selecting the run by its line within the chain's last
+    document, exactly like a heading (the preview slices its own byte range).
+    ``'text'`` nodes are always leaves (``node.children == []``), so
+    ``has_children`` is ``False`` and the row never needs a self-heal. Mirrors
+    browse-claude's ``_md_text_item``.
+    """
+    item = Item(
+        id=md_doc.compose_md_id(base, abspaths, line_offset=node.line_offset),
+        title=node.title,
+        tag='text',
+        tag_style='dim',
+        has_children=False,
+    )
+    item.kind = 'md-text'
+    return item
+
+
+def _md_node_item(base, abspaths, node):
+    """Map an ``md_doc`` child ``MdNode`` to its tree-row ``Item`` by kind.
+
+    The single dispatch ``_md_subtree_children`` uses for both its heading-
+    children and top-level-doc loops: a ``'text'`` run becomes a dim leaf
+    (:func:`_md_text_item`), anything else (a heading) becomes a heading row
+    (:func:`_md_heading_item`). The headings-only doc tree only ever holds
+    ``'heading'`` and ``'text'`` nodes (lists are off in ``get_doc``), so no
+    list-item arm is needed. Mirrors browse-claude's ``_md_node_item``.
+    """
+    if node.kind == 'text':
+        return _md_text_item(base, abspaths, node)
+    return _md_heading_item(base, abspaths, node)
+
+
 def _md_file_item(base, abspaths, label):
     """Map a referenced ``.md`` file to a document tree-row ``Item``.
 
@@ -968,11 +1030,15 @@ def _md_subtree_children(item_id):
 
       * **heading** (``line_offset`` set) → the sub-headings nested under it
         (walk the chain's last-document tree to the node at ``line_offset``,
-        return its children as heading rows). No ref children — refs live at the
-        document level, not under a heading.
+        return its children as heading rows, plus a dim ``[text]`` leaf for a
+        leading body run). No ref children — refs live at the document level,
+        not under a heading. A ``line_offset`` naming a dim ``'text'`` run
+        resolves here too, but a text node is a leaf (``children == []``) so it
+        yields ``[]``.
       * **file document** (``abspaths`` non-empty, no ``line_offset``) → the
-        top-level heading rows of that file PLUS a single ``[links]`` References
-        umbrella when THAT file references ≥1 existing ``.md`` (resolved against
+        top-level heading rows of that file (plus a dim ``[text]`` leaf for a
+        leading body run) PLUS a single ``[links]`` References umbrella when
+        THAT file references ≥1 existing ``.md`` (resolved against
         the file's own directory). The umbrella groups the nested refs; building
         the full ref list is deferred to its own expand, so here we only run the
         ``_file_has_existing_ref`` short-circuit. Recursion (file → file) falls
@@ -994,13 +1060,14 @@ def _md_subtree_children(item_id):
         node = md_doc.node_at_line(doc_tree, line_offset)
         if node is None:
             return []
-        return [_md_heading_item(base, abspaths, ch) for ch in node.children]
+        return [_md_node_item(base, abspaths, ch) for ch in node.children]
 
-    # File-document node → top-level headings, then (when the file references at
-    # least one existing ``.md``) a single References umbrella grouping the file's
-    # own refs. The full resolve is deferred to the umbrella's expand; here we
-    # just short-circuit on the first one.
-    out = [_md_heading_item(base, abspaths, node) for node in doc_tree]
+    # File-document node → top-level rows (headings + any leading text run),
+    # then (when the file references at least one existing ``.md``) a single
+    # References umbrella grouping the file's own refs. The full resolve is
+    # deferred to the umbrella's expand; here we just short-circuit on the
+    # first one.
+    out = [_md_node_item(base, abspaths, node) for node in doc_tree]
     if _file_has_existing_ref(text, abspaths[-1]):
         out.append(_md_refs_umbrella_item(item_id))
     return out
