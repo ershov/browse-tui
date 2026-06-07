@@ -1716,6 +1716,42 @@ def _md_heading_item(base, abspaths, node):
     return item
 
 
+def _md_text_item(base, abspaths, node):
+    """Map an ``md_doc`` ``'text'`` ``MdNode`` to a dim-leaf tree-row ``Item``.
+
+    The dim-leaf sibling of :func:`_md_heading_item`: a loose body run that
+    precedes a scope's first heading. Id = ``compose_md_id(base, abspaths,
+    node.line_offset)`` — selecting the run by its line within the chain's last
+    document, exactly like a heading (the preview slices its own byte range).
+    ``'text'`` nodes are always leaves (``node.children == []``), so
+    ``has_children`` is ``False`` and the row never needs self-heal.
+    """
+    item = Item(
+        id=_md_doc.compose_md_id(base, abspaths, line_offset=node.line_offset),
+        title=node.title,
+        tag='text',
+        tag_style='dim',
+        has_children=False,
+    )
+    item.kind = 'md-text'
+    return item
+
+
+def _md_node_item(base, abspaths, node):
+    """Map an ``md_doc`` child ``MdNode`` to its tree-row ``Item`` by kind.
+
+    The single dispatch ``_md_subtree_children`` uses for both its heading-
+    children and top-level-doc loops: a ``'text'`` run becomes a dim leaf
+    (:func:`_md_text_item`), anything else (a heading) becomes a heading row
+    (:func:`_md_heading_item`). The headings-only doc tree only ever holds
+    ``'heading'`` and ``'text'`` nodes (lists are off), so no list-item arm is
+    needed.
+    """
+    if node.kind == 'text':
+        return _md_text_item(base, abspaths, node)
+    return _md_heading_item(base, abspaths, node)
+
+
 def _md_file_item(base, abspaths, label):
     """Map a referenced ``.md`` file to a document tree-row ``Item``.
 
@@ -1959,13 +1995,17 @@ def _md_subtree_children(item_id):
 
       * **heading** (``line_offset`` set) → the sub-headings nested under it
         (walk the chain's last document tree to the node at ``line_offset``,
-        return its children as heading rows). No reference children — refs live
-        at the document level, not under a heading.
+        return its children). No reference children — refs live at the document
+        level, not under a heading. A ``line_offset`` naming a dim ``'text'``
+        run resolves here too, but a text node is a leaf (``children == []``)
+        so it yields ``[]``.
       * **inline document** (``abspaths == []``, no ``line_offset``) → the
-        top-level heading rows of the message's inline text. Its refs already
-        surface at the message level above, so none are added here.
+        top-level rows of the message's inline text (heading rows, plus a dim
+        ``[text]`` leaf for a leading body run). Its refs already surface at the
+        message level above, so none are added here.
       * **file document** (``abspaths`` non-empty, no ``line_offset``) → the
-        top-level heading rows of that file PLUS a single ``[links]``
+        top-level rows of that file (headings + any leading text) PLUS a single
+        ``[links]``
         References umbrella when THAT file references ≥1 existing ``.md``
         (resolved against the file's own directory). The umbrella groups the
         nested refs; building the full ref list is deferred to its own expand,
@@ -1988,12 +2028,13 @@ def _md_subtree_children(item_id):
         node = _md_doc.node_at_line(doc_tree, line_offset)
         if node is None:
             return []
-        return [_md_heading_item(base, abspaths, ch) for ch in node.children]
+        return [_md_node_item(base, abspaths, ch) for ch in node.children]
 
-    # Document node → top-level headings, then (file docs only) a References
-    # umbrella grouping the file's own refs. The full resolve is deferred to
-    # the umbrella's expand; here we just short-circuit on the first one.
-    out = [_md_heading_item(base, abspaths, node) for node in doc_tree]
+    # Document node → top-level rows (headings + any leading text run), then
+    # (file docs only) a References umbrella grouping the file's own refs. The
+    # full resolve is deferred to the umbrella's expand; here we just
+    # short-circuit on the first one.
+    out = [_md_node_item(base, abspaths, node) for node in doc_tree]
     if abspaths:
         cwd, project_root = _session_cwd_and_root(path)
         doc_dir = os.path.dirname(abspaths[-1])

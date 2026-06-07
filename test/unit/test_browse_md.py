@@ -2424,6 +2424,167 @@ class TestBuildNodesNoLists(unittest.TestCase):
         self.assertFalse(h1b.has_children)
 
 
+class TestTextNodes(unittest.TestCase):
+    """Loose body-text ``[text]`` leaves in the headings-only eager tree.
+
+    ``build_doc_tree`` (lists OFF — browse-md's default ``_INCLUDE_LISTS``)
+    synthesises a dim ``[text]`` leaf for the body run preceding a scope's
+    first heading, inserted as that scope's FIRST child. ``_build_nodes`` /
+    ``_to_item`` must map it onto a leaf ``Item`` (``[text]`` tag, ``dim``
+    style, no children), its preview must slice to just that run, and the
+    anchor flow must keep treating it correctly (title scan skips it; a
+    line anchor resolves to it). The same run surfaces in the lazy ``#md:``
+    ref subtree via ``_md_node_item``.
+
+    Fixture has a loose run before BOTH the root's first heading and a
+    nested heading, so the root-level and nested cases are both exercised::
+
+        intro paragraph   <- line 0  (before the root's first heading)
+        # Top             <- line 1
+        body before sub   <- line 2  (before ``# Top``'s first sub-heading)
+        ## Sub            <- line 3
+        sub body          <- line 4
+    """
+
+    FIXTURE = (
+        'intro paragraph\n'   # line 0
+        '# Top\n'             # line 1
+        'body before sub\n'   # line 2
+        '## Sub\n'            # line 3
+        'sub body\n'          # line 4
+    )
+
+    def _build(self, include_lists):
+        r = _load_recipe(include_lists=include_lists)
+        path = '/tmp/text-nodes.md'
+        line_starts = r._line_starts(self.FIXTURE)
+        events = r._parse(self.FIXTURE)
+        root, by_id = r._build_nodes(events, self.FIXTURE, line_starts, path)
+        return r, path, root, by_id
+
+    # --- eager primary-file tree -----------------------------------------
+
+    def test_root_first_child_is_dim_text_leaf(self):
+        # Headings-only: the loose run before ``# Top`` is the root's FIRST
+        # child — a leaf tagged ``[text]`` with the dim style, sitting ahead
+        # of the heading it precedes.
+        _r, path, root, _by_id = self._build(include_lists=False)
+        kids = root._children
+        self.assertEqual([(k.tag, k.title) for k in kids],
+                         [('text', 'intro paragraph'), ('h1', 'Top')])
+        text_leaf = kids[0]
+        self.assertEqual(text_leaf.kind, 'text')
+        self.assertEqual(text_leaf.tag_style, 'dim')
+        self.assertFalse(text_leaf.has_children)
+        self.assertEqual(text_leaf._children, [])
+        self.assertEqual(text_leaf.id, f'{path}#0')
+
+    def test_nested_scope_also_gets_text_leaf(self):
+        # The run before ``# Top``'s first sub-heading is ``# Top``'s first
+        # child, ahead of ``## Sub``.
+        _r, _path, root, _by_id = self._build(include_lists=False)
+        top = root._children[1]
+        self.assertEqual([(k.tag, k.title) for k in top._children],
+                         [('text', 'body before sub'), ('h2', 'Sub')])
+        self.assertEqual(top._children[0].kind, 'text')
+
+    def test_lists_mode_has_no_text_leaves(self):
+        # With ``-l`` (lists on) ``build_doc_tree`` synthesises NO text
+        # nodes, so the tree is heading-only at the top and nothing carries
+        # the ``[text]`` tag anywhere.
+        _r, _path, root, _by_id = self._build(include_lists=True)
+        self.assertEqual([(k.tag, k.title) for k in root._children],
+                         [('h1', 'Top')])
+        seen = []
+
+        def walk(node):
+            for kid in node._children:
+                seen.append(kid.tag)
+                walk(kid)
+
+        walk(root)
+        self.assertNotIn('text', seen)
+
+    def test_text_leaf_carries_contract_fields(self):
+        # ``_to_item`` stamps the hidden contract fields on a text node just
+        # like a heading: byte_offset/byte_size verbatim from the MdNode, the
+        # boundary-rule line_size, and the file back-reference.
+        _r, path, root, _by_id = self._build(include_lists=False)
+        text_leaf = root._children[0]
+        self.assertEqual(text_leaf.byte_offset, 0)
+        # The run is just its own line ``intro paragraph\n`` (16 chars).
+        self.assertEqual(text_leaf.byte_size, len('intro paragraph\n'))
+        self.assertEqual(text_leaf.line_offset, 0)
+        # Section ends at the heading it precedes (line 1) → one line.
+        self.assertEqual(text_leaf.line_size, 1)
+        self.assertEqual(text_leaf.file_path, path)
+
+    def test_by_id_indexes_text_leaves(self):
+        # ``flat`` (and thus ``by_id``) carries the text nodes even though
+        # ``events`` does not — root + 2 headings + 2 text runs = 5 entries,
+        # while only 2 heading events exist. (Confirms ``event_kinds`` is not
+        # indexed with a shifted position — headings still tag correctly.)
+        _r, _path, root, by_id = self._build(include_lists=False)
+        self.assertEqual(len(by_id), 5)
+        # Both heading rows kept their correct level tags despite the offset
+        # between ``flat`` and ``events``.
+        self.assertEqual(root._children[1].tag, 'h1')
+        self.assertEqual(root._children[1]._children[1].tag, 'h2')
+
+    # --- preview ----------------------------------------------------------
+
+    def test_text_leaf_preview_is_the_run(self):
+        # ``get_preview`` slices the text node's own byte window — exactly
+        # the loose run, nothing more.
+        r, path, root, by_id = self._build(include_lists=False)
+        r._FILE_TEXT = self.FIXTURE
+        r._BY_ID = by_id
+        r._BY_LINE, r._LINES_SORTED = r._build_line_index(by_id)
+        r._MD_COLOR = False
+        r._BROWSER = None
+        text_leaf = root._children[0]
+        self.assertEqual(r.get_preview(text_leaf.id), 'intro paragraph\n')
+
+    # --- anchor resolution ------------------------------------------------
+
+    def test_title_anchor_skips_text_leaves(self):
+        # A non-digit anchor scans HEADINGS only. ``intro`` is a substring of
+        # the text leaf's title but matches no heading, so the lookup falls
+        # through to the file root (not the text node).
+        r, path, root, by_id = self._build(include_lists=False)
+        r._BY_ID = by_id
+        r._BY_LINE, r._LINES_SORTED = r._build_line_index(by_id)
+        self.assertEqual(r._resolve_anchor('intro', path), path)
+        # A real heading title still resolves to its heading.
+        self.assertEqual(r._resolve_anchor('Top', path), f'{path}#1')
+
+    def test_line_anchor_resolves_to_text_leaf(self):
+        # A digit anchor goes through ``_node_at_line``, whose by-line index
+        # DOES include text nodes. Line 0 is the text run, so the anchor
+        # resolves to it (a valid id whose preview is the run) rather than
+        # falling back to root.
+        r, path, root, by_id = self._build(include_lists=False)
+        r._BY_ID = by_id
+        r._BY_LINE, r._LINES_SORTED = r._build_line_index(by_id)
+        self.assertEqual(r._resolve_anchor('0', path), f'{path}#0')
+        self.assertEqual(r._node_at_line(0).kind, 'text')
+
+    def test_lone_text_child_does_not_auto_expand(self):
+        # ``_lone_heading_child_id`` only cascades a sole HEADING child, so a
+        # file-root whose only child is a text leaf never auto-expands. (Real
+        # markdown can't actually produce a heading/root with a SOLE text
+        # child — a text run only exists ahead of a sibling heading — so the
+        # ``kind == 'heading'`` guard is the safety net; assert it directly on
+        # a synthetic single-text-child root.)
+        r, path, root, _by_id = self._build(include_lists=False)
+        text_leaf = root._children[0]
+        self.assertEqual(text_leaf.kind, 'text')
+        fake_root = type('FR', (), {'_children': [text_leaf]})()
+        fake_fs = type('FS', (), {'file_root': fake_root})()
+        r._FILES = {path: fake_fs}
+        self.assertIsNone(r._lone_heading_child_id(path))
+
+
 # ====================================================================
 # Multi-file support (#553)
 # ====================================================================
@@ -3799,15 +3960,41 @@ class TestMdRefFollowing(unittest.TestCase):
                          [os.path.realpath(self.B), os.path.realpath(self.A)])
 
     def test_ref_file_heading_node_has_subheading_children(self):
-        # A heading inside a referenced file expands to its sub-headings only
+        # A heading inside a referenced file expands to its sub-structure only
         # (no ref children / no umbrella under a heading — refs live at the
-        # document level).
+        # document level). ``# B one`` opens with a loose body run
+        # (``back to A.md again``) before ``## B sub``, so that surfaces as a
+        # leading dim ``[text]`` leaf, followed by the sub-heading.
         bnode = self._refs(self.A)[0]
         b_one = next(k for k in self.r.get_children(bnode.id)
                      if k.tag.startswith('h') and k.title == 'B one')
         sub = self.r.get_children(b_one.id)
-        self.assertEqual([(k.tag, k.title) for k in sub], [('h2', 'B sub')])
+        self.assertEqual([(k.tag, k.title) for k in sub],
+                         [('text', 'back to A.md again'), ('h2', 'B sub')])
         self.assertFalse(any(k.tag in ('md', 'links') for k in sub))
+
+    def test_ref_document_node_shows_leading_text_leaf(self):
+        # A referenced file that OPENS with a loose body run (before its first
+        # heading) surfaces that run as a dim ``[text]`` leaf at the top of its
+        # file-doc rows, ahead of the headings — same rule as the in-file tree,
+        # routed through the lazy ``_md_subtree_children`` / ``_md_node_item``.
+        self._write(self.B,
+                    'lead-in before any heading\n'
+                    '# B one\n'
+                    'beta body\n')
+        self.r.md_doc.clear_cache()
+        self.r._reparse()
+        bnode = self._refs(self.A)[0]
+        rows = self.r.get_children(bnode.id)
+        # First row is the leading text leaf; the heading follows.
+        self.assertEqual(rows[0].tag, 'text')
+        self.assertEqual(rows[0].title, 'lead-in before any heading')
+        self.assertEqual(rows[0].kind, 'md-text')
+        self.assertFalse(rows[0].has_children)
+        self.assertEqual([k.tag for k in rows if k.tag.startswith('h')], ['h1'])
+        # The text leaf previews to just its own run (its byte slice).
+        self.assertEqual(self.r.get_preview(rows[0].id),
+                         'lead-in before any heading\n')
 
     # --- preview routing --------------------------------------------------
 

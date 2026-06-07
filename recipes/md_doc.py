@@ -52,20 +52,30 @@ class MdNode:
     Plain data, no ``Item`` coupling — recipes map these onto their own row
     types. Fields:
 
-      * ``kind``        — ``'heading'`` or ``'list-item'``.
+      * ``kind``        — ``'heading'``, ``'list-item'``, or ``'text'`` (a dim
+                          run of body text preceding a scope's first heading,
+                          synthesised by ``build_doc_tree`` when lists are off).
       * ``level``       — heading level (1..6) or list indent level (0-based).
-      * ``title``       — the row label: source line with the leading sigil
-                          stripped (``##``/``-``/``1.`` + following whitespace)
-                          but inline markup (``**bold**``) preserved, matching
-                          ``browse-md``'s tree-row titles.
+                          A ``'text'`` node borrows the level of the first
+                          heading it precedes (so it renders alongside it).
+      * ``title``       — the row label: for headings/list-items the source
+                          line with the leading sigil stripped (``##``/``-``/
+                          ``1.`` + following whitespace) but inline markup
+                          (``**bold**``) preserved, matching ``browse-md``'s
+                          tree-row titles. For a ``'text'`` node it is the run's
+                          first non-blank line, ``.strip()``-ed (markup kept).
       * ``line_offset`` — 0-based line number of the node within the document.
       * ``byte_offset`` — character offset of the node's start in the text.
       * ``byte_size``   — character length of the node's section, per the
                           boundary rule (start of this node to the start of the
                           next sibling-or-shallower node, or EOF). Slicing
                           ``text[byte_offset : byte_offset + byte_size]`` yields
-                          the node's full section including descendants.
+                          the node's full section including descendants. For a
+                          ``'text'`` node the section is the body run itself —
+                          from its first non-blank line to the start of the
+                          heading it precedes.
       * ``children``    — nested ``MdNode``s (sub-headings; list children).
+                          Always empty for a ``'text'`` node.
     """
     kind: str
     level: int
@@ -185,6 +195,56 @@ def _scan_events(text, line_starts, include_lists):
     return events
 
 
+def _is_blank_line(text, line_starts, line):
+    """True if ``line`` (0-based) holds only whitespace (or is empty).
+
+    The line body is ``text[line_starts[line] : line_starts[line + 1]]`` (a
+    trailing line with no terminating ``\\n`` slices to EOF). A blank gap line
+    contributes no body run, so it is skipped when hunting the first content
+    line before a scope's opening heading.
+    """
+    start = line_starts[line]
+    end = line_starts[line + 1] if line + 1 < len(line_starts) else len(text)
+    return not text[start:end].strip()
+
+
+def _add_text_nodes(scope_children, content_start_line, text, line_starts):
+    """Synthesise leading ``'text'`` nodes into a built heading scope (in place).
+
+    ``scope_children`` is a scope's child list — at call time still ALL heading
+    nodes — and ``content_start_line`` is the scope's first body line (0 for the
+    root scope, ``scope_heading.line_offset + 1`` for a heading scope). For each
+    scope with >=1 heading child we look at the gap before the first heading:
+    the FIRST non-blank line there becomes a dim ``'text'`` node inserted as the
+    scope's new first child. We recurse into each heading child FIRST (so its
+    own children list is still heading-only, and the just-inserted text node is
+    never re-descended) and only then insert at index 0.
+    """
+    # Recurse into the real heading children before we mutate this list, so
+    # each nested scope is processed with its heading-only children.
+    for child in scope_children:
+        _add_text_nodes(child.children, child.line_offset + 1, text, line_starts)
+    if not scope_children:
+        return
+    first_child = scope_children[0]
+    for line in range(content_start_line, first_child.line_offset):
+        if _is_blank_line(text, line_starts, line):
+            continue
+        byte_offset = line_starts[line]
+        # The title is just this first non-blank line (sigil-free already, since
+        # it is body text); inline markup is kept, matching heading titles.
+        line_body = text[byte_offset:line_starts[line + 1]]
+        scope_children.insert(0, MdNode(
+            kind='text',
+            level=first_child.level,
+            title=line_body.rstrip('\n').strip(),
+            line_offset=line,
+            byte_offset=byte_offset,
+            byte_size=first_child.byte_offset - byte_offset,
+        ))
+        break  # only the first non-blank line of the gap
+
+
 def build_doc_tree(text, *, include_lists=False):
     """Build the heading (and optionally list) structure of ``text``.
 
@@ -201,7 +261,7 @@ def build_doc_tree(text, *, include_lists=False):
     grammar internally and only filters at yield time.
 
     This is ``browse-md``'s ``_build_nodes`` generalised and lifted out, minus
-    its ``Item`` construction and ``by_id``/``by_line`` indexing. Three passes:
+    its ``Item`` construction and ``by_id``/``by_line`` indexing. Passes:
 
       1. Per-event ``MdNode`` construction (heading kinds → ``'heading'``
          nodes, ``ul``/``ol`` → ``'list-item'`` nodes), with the title sigil
@@ -218,6 +278,11 @@ def build_doc_tree(text, *, include_lists=False):
          list stack mirrors that on indent and resets on every heading
          boundary; an orphan list item (no shallower list ancestor) attaches
          to the surrounding heading, else becomes a top-level node.
+      4. Leading body-text nodes (only when ``include_lists`` is off): for each
+         scope with >=1 heading child, the body run before its first heading
+         becomes a dim ``'text'`` node inserted as the scope's first child (see
+         ``_add_text_nodes``). With lists on this pass is skipped, so the
+         with-lists tree is byte-for-byte unchanged.
     """
     line_starts = _line_starts(text)
     events = _scan_events(text, line_starts, include_lists)
@@ -308,6 +373,14 @@ def build_doc_tree(text, *, include_lists=False):
             else:
                 roots.append(node)
             list_stack.append((L, node))
+
+    # --- Pass 4: leading body-text nodes (headings-only view) ---
+    # When lists are off, prepend a dim ``'text'`` node for the body run that
+    # precedes each scope's first heading, so the table-of-contents shows the
+    # intro paragraph. Gated on ``not include_lists`` so the with-lists tree is
+    # byte-for-byte unchanged.
+    if not include_lists:
+        _add_text_nodes(roots, 0, text, line_starts)
 
     return roots
 

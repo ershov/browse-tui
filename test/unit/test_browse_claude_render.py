@@ -7629,11 +7629,61 @@ class TestMarkdownSubtrees(unittest.TestCase):
             inline_id = self.r._md_doc.compose_md_id(base, [])
             kids = self.r._md_subtree_children(inline_id)
             # Inline text: "Plan" / "# Summary" / "## Risks" / "see report.md"
-            # → one top-level heading (Summary), Risks nests under it.
-            self.assertEqual([k.title for k in kids], ['Summary'])
-            self.assertEqual(kids[0].tag, 'h1')
-            self.assertTrue(kids[0].has_children)
-            self.assertFalse(getattr(kids[0], 'boundary', False))
+            # → a dim [text] leaf for the loose intro line "Plan", then one
+            # top-level heading (Summary) with Risks nested under it.
+            self.assertEqual([k.title for k in kids], ['Plan', 'Summary'])
+            text_row, summary = kids
+            self.assertEqual(text_row.tag, 'text')
+            self.assertEqual(text_row.tag_style, 'dim')
+            self.assertEqual(text_row.kind, 'md-text')
+            self.assertFalse(text_row.has_children)
+            self.assertEqual(summary.tag, 'h1')
+            self.assertTrue(summary.has_children)
+            self.assertFalse(getattr(summary, 'boundary', False))
+
+    def test_inline_doc_loose_text_is_dim_leaf_with_run_preview(self):
+        # A message whose inline markdown opens with a loose body run before its
+        # first heading: that run renders as a dim [text] leaf row in FIRST
+        # position (before the heading), its preview is the run itself (not the
+        # heading section), and it has no children — end-to-end through the
+        # get_children / get_preview routers.
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, 'proj')
+            os.makedirs(proj)
+            enc = self.r._encode_project_path(proj)
+            sess_dir = os.path.join(tmp, 'projects', enc)
+            os.makedirs(sess_dir)
+            sess = os.path.join(sess_dir, 'sid.jsonl')
+            # line0: loose intro run; line1: heading; line2: heading body.
+            inline = 'intro paragraph line\n# Heading One\nbody under heading'
+            with open(sess, 'w') as f:
+                f.write(_json.dumps({'type': 'user', 'cwd': proj, 'message': {
+                    'content': [{'type': 'text', 'text': inline}]}}) + '\n')
+            base = f'{sess}#0'
+            inline_id = self.r._md_doc.compose_md_id(base, [])
+            kids = self.r.get_children(inline_id)
+            # The dim [text] leaf comes first, before the heading row.
+            self.assertEqual([k.title for k in kids],
+                             ['intro paragraph line', 'Heading One'])
+            text_row = kids[0]
+            self.assertEqual(text_row.tag, 'text')
+            self.assertEqual(text_row.tag_style, 'dim')
+            self.assertEqual(text_row.kind, 'md-text')
+            self.assertFalse(text_row.has_children)
+            # Its id carries the run's line offset (0) within the inline doc.
+            self.assertEqual(self.r._md_doc.parse_md_id(text_row.id),
+                             (base, [], 0))
+            # Leaf: routing the id back through get_children yields [].
+            self.assertEqual(self.r.get_children(text_row.id), [])
+            # Preview is the loose run itself — NOT the following heading
+            # section (the boundary stops at the heading's start).
+            self.r._MD_COLOR = False
+            out = self.r.get_preview(text_row.id)
+            self.assertIn('intro paragraph line', out)
+            self.assertNotIn('Heading One', out)
+            self.assertNotIn('body under heading', out)
 
     def test_heading_children_are_subheadings(self):
         import tempfile
@@ -7833,10 +7883,12 @@ class TestMarkdownSubtrees(unittest.TestCase):
             via_router = self.r.get_children(base)
             self.assertEqual([k.title for k in via_router],
                              ['markdown', 'References'])
-            # #md: id → routed to the subtree builder.
+            # #md: id → routed to the subtree builder (the dim [text] intro
+            # leaf "Plan" then the "Summary" heading).
             inline_id = self.r._md_doc.compose_md_id(base, [])
             self.assertEqual(
-                [k.title for k in self.r.get_children(inline_id)], ['Summary'])
+                [k.title for k in self.r.get_children(inline_id)],
+                ['Plan', 'Summary'])
             # #refs umbrella id → routed (BEFORE the #md: branch) to the
             # umbrella builder; its child is the file doc.
             refs_id = self.r._md_doc.refs_umbrella_id(base)
