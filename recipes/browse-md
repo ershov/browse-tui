@@ -88,8 +88,10 @@ _BROWSER = None  # set in main() — used for preview-width lookup
 
 # Per-file state slot — populated by ``_reparse`` from
 # ``_INPUT_FILES``. Lookups in ``get_preview`` / classifier resolve
-# the right file's text + indexes via this dict; the per-Item
-# ``file_path`` back-reference (set in ``_build_nodes``) is the key.
+# the right file's text + indexes via this dict. Keyed by the file's
+# ABS PATH (a plain ``str``); the per-file root's id is the tuple
+# ``('file', abspath)`` (the ``file_path`` attribute on every Item is
+# that same abspath).
 _FILES = {}
 
 # Argv-derived list of ``(abs_path, anchor_or_empty)`` pairs, in argv
@@ -97,12 +99,13 @@ _FILES = {}
 # by Ctrl-R to know which files to re-slurp.
 _INPUT_FILES = []
 
-# Aggregate id-to-Item index — per-file roots + every heading /
-# list-item across every file. Read by ``get_children`` to
-# materialise tree rows on demand and by ``get_preview`` to look up
-# an id's owning file via ``item.file_path``. There is no synthetic
-# multi-root: ``get_children(None)`` returns the per-file roots in
-# argv order, so the files ARE the top-level entries.
+# Aggregate id-to-Item index — per-file roots ``('file', abspath)`` +
+# every in-file heading / list-item ``('content', abspath, line)``
+# across every file. Read by ``get_children`` to materialise tree rows
+# on demand and by ``get_preview`` to look up an id's owning file via
+# ``item.file_path``. There is no synthetic multi-root:
+# ``get_children(None)`` returns the per-file roots in argv order, so
+# the files ARE the top-level entries.
 _BY_ID = {}
 
 # --- Legacy single-file shims --------------------------------------
@@ -275,10 +278,11 @@ def _build_nodes(events, file_text, line_starts, path):
     nested ``MdNode``s already carrying ``kind`` / ``level`` /
     pre-stripped ``title`` / ``line_offset`` / ``byte_offset`` /
     ``byte_size`` / ``children``. This function maps each ``MdNode`` onto
-    a ``browse-md`` ``Item`` (id ``<path>#<line_offset>``, the ``[h1]`` /
-    ``[ul]`` / ``[ol]`` tag + style, the recipe's hidden contract fields),
-    wires ``item._children`` from ``MdNode.children``, and hangs the
-    top-level nodes under a per-file root ``Item``.
+    a ``browse-md`` ``Item`` (id ``('content', path, line_offset)``, the
+    ``[h1]`` / ``[ul]`` / ``[ol]`` tag + style, the recipe's hidden
+    contract fields), wires ``item._children`` from ``MdNode.children``,
+    and hangs the top-level nodes under a per-file root ``Item`` (id
+    ``('file', path)``).
 
     ``events`` is the parallel ``_parse(file_text)`` event stream, in the
     same document order as a pre-order walk of the structural tree and 1:1
@@ -381,11 +385,13 @@ def _build_nodes(events, file_text, line_starts, path):
 
     # Per-file root. Files ARE the top-level entries, so there's no
     # synthetic root above them; this one owns the file's top-level
-    # nodes. Seed ``by_id`` with it FIRST (its bare-``path`` id never
-    # collides with a ``<path>#<line>`` content id) so the rest of the
-    # index then fills in document (pre-order) order.
+    # nodes. Its id is the tagged tuple ``('file', path)`` — distinct
+    # from a ``('content', path, line)`` node by ``id[0]`` (and the
+    # tuple composes as the markdown ``anchor`` in the ref subtree).
+    # Seed ``by_id`` with it FIRST so the rest of the index then fills
+    # in document (pre-order) order.
     root = Item(
-        id=path,
+        id=('file', path),
         title=os.path.basename(path),
         has_children=bool(flat),
     )
@@ -418,7 +424,7 @@ def _build_nodes(events, file_text, line_starts, path):
             tag = event_kinds[index]
             tag_style = 'dim'
         item = Item(
-            id=f'{path}#{node.line_offset}',
+            id=('content', path, node.line_offset),
             title=node.title,
             tag=tag,
             tag_style=tag_style,
@@ -468,30 +474,29 @@ def _build_line_index(by_id):
 
 
 def _classify_id(node_id):
-    """Single-source classifier for an Item id.
+    """Single-source classifier for an in-file Item id.
 
-    Returns one of:
-      * ``('file-root', path)``    — a per-file root (id is the file's
-                                     abs path; ``_FILES[path]`` exists).
-      * ``('content', path)``      — a per-file heading or list-item.
-        ``path`` is the file abs path; the rest of the id is
-        ``#<line_offset>``.
-      * ``('unknown', None)``      — id doesn't fit any of the above.
-        Caller decides how to fail (usually empty preview or noop).
+    Dispatches purely on the tagged-tuple tag ``node_id[0]`` — no string
+    parsing. Returns one of:
+      * ``('file-root', path)``    — a per-file root ``('file', path)``;
+                                     ``path`` is the file abs path
+                                     (a key in ``_FILES``).
+      * ``('content', path)``      — a per-file heading / list-item
+                                     ``('content', path, line)``;
+                                     ``path`` is the file abs path.
+      * ``('unknown', None)``      — anything else (including the
+        markdown-ref tuples ``('md', …)`` / ``('refs', …)``, which
+        ``get_preview`` routes separately before reaching here).
 
-    Used by ``get_preview``, ``_run_source_command``, and any other
-    surface that needs to distinguish "open the file directly" from
+    Used by ``get_preview`` to distinguish "open the file directly" from
     "slice into a per-file body". Centralising the rule means a future
     id-shape change touches one place.
     """
-    if node_id in _FILES:
-        return ('file-root', node_id)
-    # Content id shape: ``<path>#<line>``. ``rpartition`` so paths
-    # that happen to contain ``#`` (rare) still split on the last one.
-    if '#' in node_id:
-        path, _, _ = node_id.rpartition('#')
-        if path in _FILES:
-            return ('content', path)
+    if isinstance(node_id, tuple) and node_id:
+        if node_id[0] == 'file':
+            return ('file-root', node_id[1])
+        if node_id[0] == 'content':
+            return ('content', node_id[1])
     return ('unknown', None)
 
 
@@ -502,16 +507,19 @@ def _lone_heading_child_id(file_root_id):
     top-level heading (commonly a ``# Title`` h1), so expanding the
     file row reveals just that one heading — a dead-end that needs a
     second expand before the sections beneath it show. When
-    ``file_root_id`` names a file (a key in ``_FILES``) whose per-file
-    root has exactly one child and that child is a heading of any level
-    (h1..h6), return the child's id so the caller can auto-expand it
-    alongside the file row.
+    ``file_root_id`` is a ``('file', path)`` id whose file (a key in
+    ``_FILES``) has a per-file root with exactly one child and that
+    child is a heading of any level (h1..h6), return the child's id so
+    the caller can auto-expand it alongside the file row.
 
     Returns ``None`` for every other shape: an id that isn't a file
     root, a root with zero or multiple children, or a sole child that
     isn't a heading (e.g. a list item surfaced under ``-l``).
     """
-    fs = _FILES.get(file_root_id)
+    if not (isinstance(file_root_id, tuple) and file_root_id
+            and file_root_id[0] == 'file'):
+        return None
+    fs = _FILES.get(file_root_id[1])
     if fs is None:
         return None
     children = fs.file_root._children
@@ -570,31 +578,37 @@ def _display_title(item):
     return item.title.strip()
 
 
-def _resolve_anchor(anchor, file_root_id):
-    """Resolve an anchor string to an Item id (for ``initial_scope``).
+def _resolve_anchor(anchor, path):
+    """Resolve a ``FILE.md#anchor`` anchor to a structured ``initial_scope`` id.
 
-    Three-way dispatch matching the spec's "Argument parsing" rules:
+    This is the recipe's ONLY string→id conversion (the argv seed): it
+    maps the user-typed ``#anchor`` onto the file's structured root /
+    content id. Three-way dispatch matching the spec's "Argument
+    parsing" rules:
 
-      * Empty anchor → ``file_root_id``.
+      * Empty anchor → the file root ``('file', path)``.
       * All-digit anchor → treat as a 0-indexed line number, look up
-        via ``_node_at_line``. Fall through silently to ``file_root_id``
-        when the lookup returns ``None`` (the anchor precedes every
-        parsed node — normal for early-file targets).
+        via ``_node_at_line`` and return that node's
+        ``('content', path, line)`` id. Fall through silently to the
+        file root when the lookup returns ``None`` (the anchor precedes
+        every parsed node — normal for early-file targets).
       * Non-digit anchor → three-tier scan over headings only, in
         source order: exact ``_display_title`` match, then prefix,
-        then substring. First hit in any tier wins. No match in any
-        tier emits a stderr warning and falls through to root.
+        then substring. First hit in any tier wins (its
+        ``('content', path, line)`` id). No match in any tier emits a
+        stderr warning and falls through to the file root.
 
     The tier loop runs each predicate as a separate pass over the
     heading list so a substring hit on heading A can't pre-empt an
     exact match on later heading B — matching the spec's "scan all
     headings before falling through" wording.
 
-    ``file_root_id`` is the per-file root id whose headings are
-    searched. In multi-file mode the caller picks the file via
-    "first anchored file wins" and passes its root id here; in
-    single-file mode it's just the lone root id.
+    ``path`` is the abs path of the file whose headings are searched.
+    In multi-file mode the caller picks the file via "first anchored
+    file wins" and passes its abspath here; in single-file mode it's
+    just the lone file's abspath.
     """
+    file_root_id = ('file', path)
     if not anchor:
         return file_root_id
     # Pick the file state to scan. ``_FILES`` is populated by
@@ -603,7 +617,7 @@ def _resolve_anchor(anchor, file_root_id):
     # in which case ``_FILES`` is empty and we fall back to the
     # module-level indexes by passing ``file_state=None`` to the
     # downstream helpers.
-    file_state = _FILES.get(file_root_id)
+    file_state = _FILES.get(path)
     if anchor.isdigit():
         item = _node_at_line(int(anchor), file_state)
         return item.id if item is not None else file_root_id
@@ -617,7 +631,7 @@ def _resolve_anchor(anchor, file_root_id):
         candidates = file_state.by_id.values()
     else:
         # Legacy: scan ``_BY_ID`` but filter to headings whose
-        # ``file_path`` matches ``file_root_id`` when present (so a
+        # ``file_path`` matches ``path`` when present (so a
         # multi-file aggregate-only test doesn't accidentally match
         # the wrong file's heading). Tests built without ``file_path``
         # (older fixtures) hit the ``getattr(..., None)`` fallback
@@ -626,7 +640,7 @@ def _resolve_anchor(anchor, file_root_id):
         candidates = []
         for it in _BY_ID.values():
             fp = getattr(it, 'file_path', None)
-            if fp is None or fp == file_root_id:
+            if fp is None or fp == path:
                 candidates.append(it)
     headings = sorted(
         (it for it in candidates if it.kind == 'heading'),
@@ -654,31 +668,35 @@ def _resolve_anchor(anchor, file_root_id):
     return file_root_id
 
 
-# --- Markdown reference-following (#md: subtrees) ------------------
+# --- Markdown reference-following (md subtrees) --------------------
 #
 # A markdown FILE references other ``.md`` files (a relative/absolute/``~``
 # path token captured by ``md_doc.find_md_refs``). A document's EXISTING
 # referenced files are grouped under one synthetic ``[links]`` References
-# umbrella (id ``<docid>#refs``, appended after the document's headings); each
-# ref is an expandable ``[md]`` file-doc UNDER that umbrella, drilling into ITS
-# headings and ITS refs, recursively. This MIRRORS browse-claude's identical
-# feature — the only difference is the base id: browse-md's base is the file's
-# bare-path id ``<file>`` (browse-claude's is a message id ``<sess>#<n>``).
-# Crucially, browse-md has NO "inline document" segment: the base IS a file, so
-# every ``#md:`` chain segment names a real file (browse-claude's empty-chain
-# inline-message case never arises here).
+# umbrella (appended after the document's headings); each ref is an expandable
+# ``[md]`` file-doc UNDER that umbrella, drilling into ITS headings and ITS
+# refs, recursively. This MIRRORS browse-claude's identical feature — the only
+# difference is the ``anchor`` the subtree hangs off: browse-md's anchor is the
+# per-file root ``('file', primary_abspath)`` (browse-claude's is a message id
+# ``('msg', jsonl, n)``). Crucially, browse-md has NO "inline document" case:
+# the anchor IS a file, so every chain segment names a real file (browse-claude's
+# empty-chain inline-message case never arises here — ``chain`` is non-empty for
+# every browse-md md id).
 #
-# Ids use the shared ``md_doc`` codec so routing stays a ``'#md:' in id``
-# substring test (``compose_md_id`` / ``parse_md_id``):
+# A markdown node id is the recipe-owned tagged tuple, built/destructured INLINE
+# here (NOT via any ``md_doc`` codec — ``md_doc`` is codec-free and only
+# contributes single-document operations). The shape is byte-identical to
+# browse-claude's:
 #
-#   ref child of <F>      <F>#md:<enc(B)>            (file doc, boundary=True)
-#   its heading           <F>#md:<enc(B)>#<lineoffset>
-#   nested ref            <F>#md:<enc(B)>#md:<enc(A)>
+#   ('md',  anchor, chain, line)         # heading / text leaf (line = line_offset)
+#   ('md',  anchor, chain, None)         # a referenced-file document root
+#   ('refs', anchor, chain)              # the References umbrella for that doc
+#   ('md',  anchor, chain + (abspath,), None)   # follow a resolved .md ref
 #
-# where ``<enc>`` = ``quote('file://' + abspath, safe='')``. browse-md's existing
-# heading id ``<F>#<lineoffset>`` already matches the trailing ``#<lineoffset>``
-# convention, so heading rows are uniform across the in-file tree and the
-# ``#md:`` subtrees.
+# where ``anchor = ('file', primary_abspath)`` and ``chain`` is a TUPLE of
+# referenced-file abspaths followed from the anchor. Routing is ``id[0] == 'md'``
+# / ``id[0] == 'refs'`` — order-independent (the substring-ordering hazard the
+# old string codec carried is gone).
 #
 # Build is LAZY: the in-file heading tree is pre-built eagerly in ``_reparse``,
 # but the References umbrella's full ref list (and everything under a referenced
@@ -693,9 +711,9 @@ def _resolve_anchor(anchor, file_root_id):
 # unavailable (the ``main()`` gate already fails fast in that case).
 
 # Heading level (1..6) → row tag / colour style — the same palette as the in-file
-# heading tree (``_HEADING_STYLES``); a ``#md:`` heading row should look identical
-# to an in-file one. Kept as a separate name purely so the mapping reads next to
-# the ``#md:`` helpers that use it.
+# heading tree (``_HEADING_STYLES``); a referenced-file (``('md', …)``) heading
+# row should look identical to an in-file one. Kept as a separate name purely so
+# the mapping reads next to the markdown-ref helpers that use it.
 _MD_HEADING_STYLE = _HEADING_STYLES
 
 
@@ -818,18 +836,18 @@ def _file_has_existing_ref(text, file_path):
     return False
 
 
-def _md_heading_item(base, abspaths, node):
+def _md_heading_item(anchor, chain, node):
     """Map an ``md_doc`` heading ``MdNode`` to a tree-row ``Item``.
 
-    Id = ``compose_md_id(base, abspaths, node.line_offset)`` — selecting the
-    heading by its line within the chain's last document. ``has_children`` is
-    authoritative (the node is already parsed), so heading rows never need a
-    self-heal. ``boundary`` stays ``False`` — a heading is same-document
-    structure, not a foreign subtree. The ``[h1]``..``[h6]`` tag + style match
-    the in-file heading rows. Mirrors browse-claude's ``_md_heading_item``.
+    Id = ``('md', anchor, chain, node.line_offset)`` — selecting the heading by
+    its line within the chain's last document. ``has_children`` is authoritative
+    (the node is already parsed), so heading rows never need a self-heal.
+    ``boundary`` stays ``False`` — a heading is same-document structure, not a
+    foreign subtree. The ``[h1]``..``[h6]`` tag + style match the in-file heading
+    rows. Mirrors browse-claude's ``_md_heading_item``.
     """
     item = Item(
-        id=md_doc.compose_md_id(base, abspaths, line_offset=node.line_offset),
+        id=('md', anchor, chain, node.line_offset),
         title=node.title,
         tag=f'h{node.level}',
         tag_style=_MD_HEADING_STYLE.get(node.level, ''),
@@ -840,11 +858,11 @@ def _md_heading_item(base, abspaths, node):
     return item
 
 
-def _md_text_item(base, abspaths, node):
+def _md_text_item(anchor, chain, node):
     """Map an ``md_doc`` ``'text'`` ``MdNode`` to a dim-leaf tree-row ``Item``.
 
     The dim-leaf sibling of :func:`_md_heading_item`: a loose body run that
-    precedes a scope's first heading. Id = ``compose_md_id(base, abspaths,
+    precedes a scope's first heading. Id = ``('md', anchor, chain,
     node.line_offset)`` — selecting the run by its line within the chain's last
     document, exactly like a heading (the preview slices its own byte range).
     ``'text'`` nodes are always leaves (``node.children == []``), so
@@ -852,7 +870,7 @@ def _md_text_item(base, abspaths, node):
     browse-claude's ``_md_text_item``.
     """
     item = Item(
-        id=md_doc.compose_md_id(base, abspaths, line_offset=node.line_offset),
+        id=('md', anchor, chain, node.line_offset),
         title=node.title,
         tag='text',
         tag_style='dim',
@@ -862,7 +880,7 @@ def _md_text_item(base, abspaths, node):
     return item
 
 
-def _md_node_item(base, abspaths, node):
+def _md_node_item(anchor, chain, node):
     """Map an ``md_doc`` child ``MdNode`` to its tree-row ``Item`` by kind.
 
     The single dispatch ``_md_subtree_children`` uses for both its heading-
@@ -873,14 +891,14 @@ def _md_node_item(base, abspaths, node):
     list-item arm is needed. Mirrors browse-claude's ``_md_node_item``.
     """
     if node.kind == 'text':
-        return _md_text_item(base, abspaths, node)
-    return _md_heading_item(base, abspaths, node)
+        return _md_text_item(anchor, chain, node)
+    return _md_heading_item(anchor, chain, node)
 
 
-def _md_file_item(base, abspaths, label):
+def _md_file_item(anchor, chain, label):
     """Map a referenced ``.md`` file to a document tree-row ``Item``.
 
-    ``abspaths`` is the full chain ending in this file (so the id nests under its
+    ``chain`` is the full tuple ending in this file (so the id nests under its
     referrer). ``has_children`` is optimistically ``True`` — the file is not read
     until expand; it self-heals to a leaf if the file has neither headings nor
     further refs. ``boundary=True`` marks it a self-contained foreign subtree so
@@ -888,7 +906,7 @@ def _md_file_item(base, abspaths, label):
     ``_md_file_item``.
     """
     item = Item(
-        id=md_doc.compose_md_id(base, abspaths),
+        id=('md', anchor, chain, None),
         title=label,
         tag='md',
         tag_style='blue',          # cross-file / attachment hue
@@ -896,20 +914,21 @@ def _md_file_item(base, abspaths, label):
         boundary=True,
     )
     item.kind = 'md-doc'
-    item.md_abspath = abspaths[-1]
+    item.md_abspath = chain[-1]
     return item
 
 
-def _md_refs_umbrella_item(docid):
-    """The synthetic ``[links]`` References umbrella for a document ``docid``.
+def _md_refs_umbrella_item(anchor, chain):
+    """The synthetic ``[links]`` References umbrella for a document.
 
     Groups every ``.md`` file a document references under ONE tree parent —
     instead of interleaving the ref rows directly after the document's headings.
-    ``docid`` is the document's own id: a per-file root (a bare file path) at the
-    file-root level, or a ``#md:`` file-doc id at the referenced-file level. The
-    umbrella id appends the ``#refs`` marker (``md_doc.refs_umbrella_id``); the
-    ref file-docs UNDER it keep their own ``<docid>#md:<enc>`` ids — the umbrella
-    is a grouping parent, not a new hop in the ref chain.
+    The grouped document is identified by ``(anchor, chain)``: an empty ``chain``
+    is the anchor's own primary file (the file-root umbrella); a non-empty
+    ``chain`` is a referenced file's full chain. The umbrella id is
+    ``('refs', anchor, chain)``; the ref file-docs UNDER it keep their own
+    ``('md', anchor, chain + (abspath,), None)`` ids — the umbrella is a grouping
+    parent, not a new hop in the ref chain.
 
     ``boundary=False`` (same-document grouping — Alt-Right reveals the ref entries
     but each ref file-doc under it stays a boundary). ``has_children=True`` is
@@ -918,7 +937,7 @@ def _md_refs_umbrella_item(docid):
     never needs self-heal. Mirrors browse-claude's ``_md_refs_umbrella_item``.
     """
     item = Item(
-        id=md_doc.refs_umbrella_id(docid),
+        id=('refs', anchor, chain),
         title='References',
         tag='links',
         tag_style='cyan',          # muted cross-file grouping hue
@@ -935,53 +954,38 @@ def _md_refs_umbrella_children(item_id):
     THIS is the lazy point: ``get_children`` (per-file root) and
     ``_md_subtree_children`` (file-doc) only short-circuit-detect a ref to decide
     whether to hang the umbrella; the full resolve (resolve all, dedup by abspath,
-    sort by label) runs here, once, on the umbrella's own expand. Splits the
-    ``#refs`` marker back to the grouped document's id
-    (``md_doc.split_refs_umbrella``) and recovers that document's text +
-    resolution anchors, then builds one ``[md]`` file-doc per existing ref — same
-    ids (``<docid>#md:<enc>``) and ``boundary=True`` the direct children carried
-    before the umbrella was introduced, so expansion below the umbrella is
-    unchanged. Mirrors browse-claude's ``_md_refs_umbrella_children``.
+    sort by label) runs here, once, on the umbrella's own expand. ``item_id`` is
+    ``('refs', anchor, chain)``; we recover the grouped document's text +
+    resolution anchors, then build one ``[md]`` file-doc per existing ref — same
+    ids (``('md', anchor, chain + (abspath,), None)``) and ``boundary=True`` the
+    direct children carried before the umbrella was introduced, so expansion
+    below the umbrella is unchanged. Mirrors browse-claude's
+    ``_md_refs_umbrella_children``.
 
     Two document shapes, mirroring the two callers:
 
-      * **per-file root** (``docid`` is a bare file path in ``_FILES``) → the
-        file's cached ``_FileState.text``, anchored on ``_md_resolution_context``
-        of that path; refs chain directly off the file-root id.
-      * **file-doc id** (``docid`` contains ``#md:``) → the referenced file's own
+      * **primary file** (``chain == ()``) → the anchor's own file
+        (``anchor[1]``) text, anchored on ``_md_resolution_context`` of that
+        path; refs chain directly off the anchor.
+      * **referenced file** (``chain`` non-empty) → the referenced file's own
         text (``_md_chain_doc``), anchored on its own directory; refs nest onto
-        the existing ``abspaths`` chain.
+        the existing ``chain``.
 
     Returns ``[]`` for an unreadable document (the umbrella is only built when a
     ref exists, so an empty result here means the doc became unreadable since).
     """
     if md_doc is None:
         return []
-    docid = md_doc.split_refs_umbrella(item_id)
-    if docid is None:
+    _, anchor, chain = item_id
+    text, doc_tree = _md_chain_doc(anchor, chain)
+    if doc_tree is None:
         return []
-    if '#md:' in docid:
-        # File-doc umbrella: resolve the referenced file's own refs, nested onto
-        # its chain.
-        base, abspaths, _ = md_doc.parse_md_id(docid)
-        text, doc_tree = _md_chain_doc(abspaths)
-        if doc_tree is None:
-            return []
-        doc_dir, cwd, project_root = _md_resolution_context(abspaths[-1])
-        return [
-            _md_file_item(base, abspaths + [ref_abspath], label)
-            for ref_abspath, label in _md_resolved_refs(
-                text, doc_dir, cwd, project_root)
-        ]
-    # Per-file-root umbrella: resolve the file's refs off its cached text.
-    fs = _FILES.get(docid)
-    if fs is None:
-        return []
-    doc_dir, cwd, project_root = _md_resolution_context(docid)
+    doc_dir, cwd, project_root = _md_resolution_context(
+        chain[-1] if chain else anchor[1])
     return [
-        _md_file_item(docid, [ref_abspath], label)
+        _md_file_item(anchor, chain + (ref_abspath,), label)
         for ref_abspath, label in _md_resolved_refs(
-            fs.text, doc_dir, cwd, project_root)
+            text, doc_dir, cwd, project_root)
     ]
 
 
@@ -1002,74 +1006,76 @@ def _preview_md_refs_umbrella(item_id):
     return '\n'.join([header, ''] + [k.title for k in kids])
 
 
-def _md_chain_doc(abspaths):
-    """Resolve a ``#md:`` chain's *last* document to ``(text, doc_tree)``.
+def _md_chain_doc(anchor, chain):
+    """Resolve a markdown ``chain``'s *last* document to ``(text, doc_tree)``.
 
-    The chain's terminal file is what both the subtree build and the preview
-    route operate on. Unlike browse-claude (whose empty chain is the base
-    message's inline content), EVERY browse-md chain segment names a file, so
-    ``abspaths`` is non-empty for any valid browse-md ``#md:`` id: read + parse
-    its last entry once via ``md_doc.get_doc``'s process-wide cache. Returns
-    ``(None, None)`` on an unreadable file or a (malformed) empty chain — the
-    callers treat that as "no children / empty preview".
+    The chain's terminal document is what both the subtree build and the preview
+    route operate on:
+
+      * a non-empty ``chain`` ends in a referenced file — read + parsed once via
+        ``md_doc.get_doc``'s process-wide cache;
+      * an empty ``chain`` is the anchor's own primary file (``anchor[1]``).
+        Unlike browse-claude (whose empty chain is a message's inline text),
+        browse-md's anchor is itself a file, so the empty-chain document is that
+        file read from disk via ``get_doc``.
+
+    Returns ``(None, None)`` when the document is unreadable — the callers treat
+    that as "no children / empty preview".
     """
-    if not abspaths:
-        return None, None
+    target = chain[-1] if chain else anchor[1]
     try:
-        return md_doc.get_doc(abspaths[-1])
+        return md_doc.get_doc(target)
     except OSError:
         return None, None
 
 
 def _md_subtree_children(item_id):
-    """Children for a ``#md:`` node — the lazy, authoritative build.
+    """Children for a ``('md', anchor, chain, line)`` node — the lazy build.
 
-    Routes on the parsed id shape (``md_doc.parse_md_id`` → ``(base, abspaths,
-    line_offset)``; ``base`` is browse-md's per-file root id, ``abspaths`` the
-    referenced-file chain):
+    Routes on the destructured id fields (``chain`` is the referenced-file
+    chain, always non-empty for a browse-md md node — the primary file is
+    browsed through the ``('file', …)`` / ``('content', …)`` ids, not here):
 
-      * **heading** (``line_offset`` set) → the sub-headings nested under it
-        (walk the chain's last-document tree to the node at ``line_offset``,
-        return its children as heading rows, plus a dim ``[text]`` leaf for a
-        leading body run). No ref children — refs live at the document level,
-        not under a heading. A ``line_offset`` naming a dim ``'text'`` run
-        resolves here too, but a text node is a leaf (``children == []``) so it
-        yields ``[]``.
-      * **file document** (``abspaths`` non-empty, no ``line_offset``) → the
-        top-level heading rows of that file (plus a dim ``[text]`` leaf for a
-        leading body run) PLUS a single ``[links]`` References umbrella when
-        THAT file references ≥1 existing ``.md`` (resolved against
-        the file's own directory). The umbrella groups the nested refs; building
-        the full ref list is deferred to its own expand, so here we only run the
-        ``_file_has_existing_ref`` short-circuit. Recursion (file → file) falls
-        out of this uniform rule once the umbrella expands; expand-in-place, no
-        cycle/alias detection.
+      * **heading** (``line`` set) → the sub-headings nested under it (walk the
+        chain's last-document tree to the node at ``line``, return its children
+        as heading rows, plus a dim ``[text]`` leaf for a leading body run). No
+        ref children — refs live at the document level, not under a heading. A
+        ``line`` naming a dim ``'text'`` run resolves here too, but a text node
+        is a leaf (``children == []``) so it yields ``[]``.
+      * **file document** (``line`` None) → the top-level heading rows of that
+        file (plus a dim ``[text]`` leaf for a leading body run) PLUS a single
+        ``[links]`` References umbrella when THAT file references ≥1 existing
+        ``.md`` (resolved against the file's own directory). The umbrella groups
+        the nested refs; building the full ref list is deferred to its own
+        expand, so here we only run the ``_file_has_existing_ref`` short-circuit.
+        Recursion (file → file) falls out of this uniform rule once the umbrella
+        expands; expand-in-place, no cycle/alias detection.
 
     File text + tree come from ``md_doc.get_doc`` (process-wide cache). Returns
     ``[]`` for an unreadable/heading-less-and-ref-less document (which self-heals
     the optimistic arrow). Mirrors browse-claude's ``_md_subtree_children`` minus
     its inline-document branch (browse-md has no inline segment).
     """
-    base, abspaths, line_offset = md_doc.parse_md_id(item_id)
-    text, doc_tree = _md_chain_doc(abspaths)
+    _, anchor, chain, line = item_id
+    text, doc_tree = _md_chain_doc(anchor, chain)
     if doc_tree is None:
         return []
 
     # Heading node → its nested sub-headings (no ref children).
-    if line_offset is not None:
-        node = md_doc.node_at_line(doc_tree, line_offset)
+    if line is not None:
+        node = md_doc.node_at_line(doc_tree, line)
         if node is None:
             return []
-        return [_md_node_item(base, abspaths, ch) for ch in node.children]
+        return [_md_node_item(anchor, chain, ch) for ch in node.children]
 
     # File-document node → top-level rows (headings + any leading text run),
     # then (when the file references at least one existing ``.md``) a single
     # References umbrella grouping the file's own refs. The full resolve is
     # deferred to the umbrella's expand; here we just short-circuit on the
     # first one.
-    out = [_md_node_item(base, abspaths, node) for node in doc_tree]
-    if _file_has_existing_ref(text, abspaths[-1]):
-        out.append(_md_refs_umbrella_item(item_id))
+    out = [_md_node_item(anchor, chain, node) for node in doc_tree]
+    if _file_has_existing_ref(text, chain[-1]):
+        out.append(_md_refs_umbrella_item(anchor, chain))
     return out
 
 
@@ -1092,14 +1098,14 @@ def _md_render(text):
 
 
 def _preview_md_node(item_id):
-    """Preview body for a ``#md:`` document or heading node.
+    """Preview body for a ``('md', anchor, chain, line)`` document/heading node.
 
     Reads ONLY the node's own document — never a cross-item cascade:
 
-      * **file-document node** (no ``line_offset``) → that referenced file's full
+      * **file-document node** (``line`` None) → that referenced file's full
         text (``md_doc.get_doc`` cache).
-      * **heading node** (``…#<lineoffset>``) → just that heading's section,
-        sliced ``text[byte_offset : byte_offset + byte_size]`` from the cached
+      * **heading node** (``line`` set) → just that heading's section, sliced
+        ``text[byte_offset : byte_offset + byte_size]`` from the cached
         ``doc_tree`` (the boundary rule includes the heading's own sub-sections
         and stops at the next sibling-or-shallower heading).
 
@@ -1108,13 +1114,13 @@ def _preview_md_node(item_id):
     matches no heading. Mirrors browse-claude's ``_preview_md_node`` minus its
     inline-document case (browse-md has no inline segment).
     """
-    _base, abspaths, line_offset = md_doc.parse_md_id(item_id)
-    text, doc_tree = _md_chain_doc(abspaths)
+    _, anchor, chain, line = item_id
+    text, doc_tree = _md_chain_doc(anchor, chain)
     if text is None:
         return ''
-    if line_offset is None:
+    if line is None:
         return _md_render(text)
-    node = md_doc.node_at_line(doc_tree, line_offset)
+    node = md_doc.node_at_line(doc_tree, line)
     if node is None:
         return ''
     return _md_render(text[node.byte_offset:node.byte_offset + node.byte_size])
@@ -1227,25 +1233,25 @@ def get_children(node_id, *, reload=False):
     expand). Unknown ids return ``[]`` so a stale anchor or scope id doesn't
     surface as a traceback.
 
-    Dispatch:
+    Dispatch (purely on the tagged-tuple tag ``node_id[0]`` — no string
+    parsing, no ordering hazard):
 
       * ``node_id is None`` — the framework's "top-level entries" probe (Browser
         ``root_id=None``): the per-file roots in argv order. Files ARE the
         top-level rows; there is no synthetic multi-root above them.
-      * ``…#md:…`` — a node inside a referenced-file subtree (a referenced ``.md``
-        document or one of its headings). Built lazily + authoritatively by
-        ``_md_subtree_children``. No-op when ``md_doc`` is unavailable.
-      * ``…#refs`` — a ``[links]`` References umbrella. Checked BEFORE the
-        ``#md:`` branch: a file-doc umbrella id ``<base>#md:<enc>#refs`` contains
-        ``#md:`` too, so the ``#refs`` test MUST come first or the ``#md:`` branch
-        would steal it. THIS is the lazy point — the full ref resolve happens
-        here, on umbrella expand (``_md_refs_umbrella_children``).
-      * a per-file root (``node_id in _FILES``) — its eager top-level headings
-        PLUS a single ``[links]`` References umbrella (appended AFTER the
-        headings) when the file references ≥1 existing ``.md``.
-      * any other in-file id (``<path>#<line>``) — the cached ``_children`` off
-        ``_BY_ID`` (headings have only sub-heading / list children — refs attach
-        at the document level, never under a heading).
+      * ``('refs', anchor, chain)`` — a ``[links]`` References umbrella. THIS is
+        the lazy point — the full ref resolve happens here, on umbrella expand
+        (``_md_refs_umbrella_children``). No-op when ``md_doc`` is unavailable.
+      * ``('md', anchor, chain, line)`` — a node inside a referenced-file subtree
+        (a referenced ``.md`` document or one of its headings). Built lazily +
+        authoritatively by ``_md_subtree_children``. No-op when ``md_doc`` is
+        unavailable.
+      * ``('file', path)`` — a per-file root: its eager top-level headings PLUS a
+        single ``[links]`` References umbrella (appended AFTER the headings) when
+        the file references ≥1 existing ``.md``.
+      * ``('content', path, line)`` — any other in-file id: the cached
+        ``_children`` off ``_BY_ID`` (headings have only sub-heading / list
+        children — refs attach at the document level, never under a heading).
 
     ``reload=True`` is honoured at the top-level probe (``node_id is None``) — the
     framework's Ctrl-R hook calls ``get_children(None, reload=True)``, and we use
@@ -1267,28 +1273,42 @@ def get_children(node_id, *, reload=False):
         # consult ``_INPUT_FILES`` for the ordering and pull each
         # file's root out of ``_FILES`` by path.
         return [_FILES[p].file_root for p, _ in _INPUT_FILES if p in _FILES]
-    if (md_doc is not None and isinstance(node_id, str)
-            and md_doc.split_refs_umbrella(node_id) is not None):
-        # ``<docid>#refs`` — a ``[links]`` References umbrella. Checked BEFORE the
-        # ``#md:`` branch: a file-doc umbrella id ``<base>#md:<enc>#refs`` contains
-        # ``#md:`` too, so the ``#refs`` test MUST come first or the ``#md:``
-        # branch would steal it. THIS is the lazy point — the full ref resolve
-        # happens here, on umbrella expand.
-        return _md_refs_umbrella_children(node_id)
-    if md_doc is not None and isinstance(node_id, str) and '#md:' in node_id:
-        # A node inside a referenced-file subtree — built lazily here. Routing
-        # stays a substring test; ``_md_subtree_children`` parses the chain.
-        return _md_subtree_children(node_id)
-    if node_id in _FILES:
-        # Per-file root: its eager in-file headings, then a single ``[links]``
-        # References umbrella when the file references ≥1 existing ``.md``. The
-        # full ref list is built lazily on the umbrella's own expand; here we just
-        # short-circuit on the first existing ref.
-        fs = _FILES[node_id]
+    if not isinstance(node_id, tuple) or not node_id:
+        # A stale anchor / scope id (or any non-tuple) returns empty rather
+        # than tracebacking on the ``node_id[0]`` dispatch below.
+        return []
+    tag = node_id[0]
+    if tag == 'refs':
+        # ``('refs', anchor, chain)`` — a ``[links]`` References umbrella. THIS
+        # is the lazy point — the full ref resolve happens here, on umbrella
+        # expand. No-op when ``md_doc`` is unavailable (no ref id can exist then).
+        return _md_refs_umbrella_children(node_id) if md_doc is not None else []
+    if tag == 'md':
+        # ``('md', anchor, chain, line)`` — a node inside a referenced-file
+        # subtree (a referenced ``.md`` document or one of its headings). Built
+        # lazily + authoritatively by ``_md_subtree_children``.
+        return _md_subtree_children(node_id) if md_doc is not None else []
+    if tag == 'file':
+        # ``('file', path)`` per-file root: its eager in-file headings, then a
+        # single ``[links]`` References umbrella when the file references ≥1
+        # existing ``.md``. The full ref list is built lazily on the umbrella's
+        # own expand; here we just short-circuit on the first existing ref. The
+        # umbrella groups the primary file's refs (``chain == ()``). When
+        # ``_FILES`` is unpopulated (legacy single-file tests that seed only
+        # ``_BY_ID``), fall back to the root Item's cached ``_children`` (it is
+        # in ``_BY_ID`` under the same id) — there is no on-disk ref context then.
+        path = node_id[1]
+        fs = _FILES.get(path)
+        if fs is None:
+            item = _BY_ID.get(node_id)
+            return list(item._children) if item is not None else []
         out = list(fs.file_root._children)
-        if md_doc is not None and _file_has_existing_ref(fs.text, node_id):
-            out.append(_md_refs_umbrella_item(node_id))
+        if md_doc is not None and _file_has_existing_ref(fs.text, path):
+            out.append(_md_refs_umbrella_item(node_id, ()))
         return out
+    # ``('content', path, line)`` — an in-file heading / list-item: its cached
+    # sub-headings / list children (refs attach at the document level, never
+    # under a heading).
     item = _BY_ID.get(node_id)
     if item is None:
         return []
@@ -1298,28 +1318,27 @@ def get_children(node_id, *, reload=False):
 def get_preview(node_id):
     """Return the preview slice for ``node_id``.
 
-    Three dispatch paths (via ``_classify_id`` when ``_FILES`` is
-    populated; legacy single-file callsites fall through to the
-    module-level ``_FILE_TEXT`` / ``_BY_LINE`` shims):
+    Dispatch is purely on the tagged-tuple tag ``node_id[0]`` — no string
+    parsing. In-file ids resolve through ``_classify_id`` against ``_FILES``
+    when it is populated; legacy single-file callsites (tests that populate
+    the module-level ``_FILE_TEXT`` / ``_BY_LINE`` shims directly, without
+    going through ``_reparse``) fall back to those shims:
 
-    1. ``node_id is None`` → empty string. The framework asks for a
-       preview at the "top-level entries" pseudo-row in some shells;
-       we have no aggregate content to show (files ARE the top-level
-       rows, each with its own preview).
-    2. Per-file root → the corresponding ``_FILES[path].text`` (the
-       whole file body).
-    3. Per-file content (``<path>#<n>``) → byte-range slice from the
-       right file's text. Resolved via ``_BY_ID[node_id].file_path``
-       to find the owning file, then ``_node_at_line`` against that
-       file's line index for off-grid anchors.
-    4. Anything else (unresolvable id) → ``''``. Defensive: a stale
+    1. ``node_id is None`` (or any non-tuple / stale id) → empty string.
+       The framework asks for a preview at the "top-level entries"
+       pseudo-row in some shells; we have no aggregate content to show
+       (files ARE the top-level rows, each with its own preview).
+    2. ``('refs', anchor, chain)`` → a PLAIN label list (never routed through
+       md2ansi), via ``_preview_md_refs_umbrella``.
+    3. ``('md', anchor, chain, line)`` → the referenced file's body / heading
+       section, via ``_preview_md_node`` — never a cross-item cascade.
+    4. ``('file', path)`` per-file root → the whole file body
+       (``_FILES[path].text``, else the legacy ``_FILE_TEXT`` shim).
+    5. ``('content', path, line)`` → the node's byte-range slice from the
+       right file's text, the ``line`` taken straight from the id (with a
+       ``_node_at_line`` fallback for an off-grid line).
+    6. Anything else (unresolvable id) → ``''``. Defensive: a stale
        cursor id from a previous scope mustn't crash the preview.
-
-    A ``#md:`` id (a referenced-file document or heading node) is routed FIRST,
-    before ``_classify_id`` / the generic ``<path>#<line>`` path: an md
-    file-document node ends in an encoded segment (and a heading node in
-    ``…#<line>``), so the generic ``rpartition('#')`` would otherwise mis-read it.
-    ``_preview_md_node`` renders the referenced file's body / heading section.
 
     When ``_MD_COLOR`` is on, the slice runs through
     ``_md2ansi_fn(text, line_width=…)`` for ANSI-coloured rendering. The
@@ -1327,68 +1346,53 @@ def get_preview(node_id):
     markdown can't crash the preview pane — we just fall back to the raw
     slice.
     """
-    if node_id is None:
+    if not isinstance(node_id, tuple) or not node_id:
+        # ``None`` (the top-level pseudo-row) or any non-tuple / stale cursor
+        # id → empty, rather than tracebacking on the ``node_id[0]`` dispatch.
         return ''
-    if (md_doc is not None and isinstance(node_id, str)
-            and md_doc.split_refs_umbrella(node_id) is not None):
-        # ``[links]`` References umbrella. Checked BEFORE the ``#md:`` path (a
-        # file-doc umbrella id ``<base>#md:<enc>#refs`` contains ``#md:``) and the
-        # in-file ``_classify_id`` path: render a PLAIN label list, not a document
-        # body (never routed through md2ansi).
+    if md_doc is not None and node_id[0] == 'refs':
+        # ``[links]`` References umbrella — render a PLAIN label list, not a
+        # document body (never routed through md2ansi).
         return _preview_md_refs_umbrella(node_id)
-    if md_doc is not None and isinstance(node_id, str) and '#md:' in node_id:
+    if md_doc is not None and node_id[0] == 'md':
         # Referenced-file document / heading node — its own document's text or
-        # heading section, never a cross-item cascade. Checked before the
-        # in-file ``_classify_id`` path so the trailing ``#<line>`` / encoded
-        # segment isn't mis-parsed as an in-file line number.
+        # heading section, never a cross-item cascade.
         return _preview_md_node(node_id)
     kind, path = _classify_id(node_id)
     if kind == 'file-root':
-        text = _FILES[path].text
-    elif kind == 'content':
-        fs = _FILES[path]
-        # ``<path>#<n>`` — parse the line number and resolve to a node
-        # in the right file's line index.
-        _, _, line_str = node_id.rpartition('#')
-        try:
-            line_no = int(line_str)
-        except ValueError:
+        fs = _FILES.get(path)
+        if fs is not None:
+            text = fs.text
+        elif _FILES:
+            # ``_FILES`` is live but doesn't know this path — a stale / foreign
+            # id. Return empty rather than the legacy shim's first-file body.
             return ''
-        item = fs.by_line.get(line_no)
-        if item is None:
-            item = _node_at_line(line_no, fs)
+        else:
+            # Legacy single-file shim: ``_FILES`` empty (a test that set
+            # ``_FILE_TEXT`` directly) → the whole shim body.
+            text = _FILE_TEXT
+    elif kind == 'content':
+        # ``('content', path, line)`` — the line is carried structurally; resolve
+        # to the node in the right file's line index. ``_FILES`` populated → the
+        # owning file's state; else the legacy module-level shim.
+        line_no = node_id[2]
+        fs = _FILES.get(path)
+        if fs is not None:
+            item = fs.by_line.get(line_no) or _node_at_line(line_no, fs)
+            file_text = fs.text
+        elif _FILES:
+            # Live multi-file mode but an unknown file path → unresolvable.
+            return ''
+        else:
+            item = _BY_LINE.get(line_no) or _node_at_line(line_no)
+            file_text = _FILE_TEXT
         if item is None:
             return ''
         bo = item.byte_offset
-        text = fs.text[bo:bo + item.byte_size]
+        text = file_text[bo:bo + item.byte_size]
     else:
-        # Classifier returned ``unknown``. If ``_FILES`` is populated
-        # (multi-file mode is live), an unknown id is genuinely
-        # unresolvable — return empty rather than hand back the
-        # legacy ``_FILE_TEXT`` shim (which would be a footgun:
-        # cursor-on-stale-id wouldn't show its old file's body).
-        if _FILES:
-            return ''
-        # Legacy single-file path: classifier failed because
-        # ``_FILES`` is empty (tests that populate ``_BY_ID`` /
-        # ``_FILE_TEXT`` directly without going through ``_reparse``).
-        # Fall back to the module-level shim — same code shape the
-        # pre-#553 recipe used.
-        if '#' not in node_id:
-            text = _FILE_TEXT
-        else:
-            _, _, line_str = node_id.rpartition('#')
-            try:
-                line_no = int(line_str)
-            except ValueError:
-                return ''
-            item = _BY_LINE.get(line_no)
-            if item is None:
-                item = _node_at_line(line_no)
-            if item is None:
-                return ''
-            bo = item.byte_offset
-            text = _FILE_TEXT[bo:bo + item.byte_size]
+        # Unknown / unresolvable id (incl. a stale cursor) → empty.
+        return ''
 
     if _MD_COLOR:
         try:
@@ -1651,30 +1655,39 @@ def _run_source_command(ctx, env_var, default):
 
     Empty ``targets`` (no cursor, no selection) is a no-op.
 
-    Root detection — there are two "open the file directly" shapes:
+    Root detection — there are two "open the file directly" shapes, both
+    carrying a ``('file', path)`` id:
       * Real per-file root: ``kind == 'root'``.
       * Framework's synthetic scope-root pseudo-Item (#552): no
-        ``kind`` attr at all; id matches a key in ``_FILES`` (or
-        ``_ROOT_PATH`` in the legacy single-file test path).
+        ``kind`` attr at all; its id is the scope id ``('file', path)``
+        whose ``path`` is a key in ``_FILES`` (or ``_ROOT_PATH`` in the
+        legacy single-file test path).
     """
     targets = ctx.targets
     if not targets:
         return
+
+    def _id_file_path(it):
+        # The abspath inside a ``('file', path)`` id, else ``None``.
+        if isinstance(it.id, tuple) and it.id and it.id[0] == 'file':
+            return it.id[1]
+        return None
 
     def _is_root(it):
         # Real per-file root attr first — common case.
         if getattr(it, 'kind', None) == 'root':
             return True
         # Framework's scope-root pseudo-Item lacks ``kind`` but its
-        # id matches a file path (any key in ``_FILES`` is a per-file
-        # root id). Legacy single-file callers fall through to
-        # ``_ROOT_PATH`` when ``_FILES`` is empty (tests don't go
-        # through ``_reparse``).
-        return it.id in _FILES or it.id == _ROOT_PATH
+        # id is ``('file', path)``: a root iff that path is a known
+        # file. Legacy single-file callers fall through to ``_ROOT_PATH``
+        # when ``_FILES`` is empty (tests don't go through ``_reparse``).
+        path = _id_file_path(it)
+        return path is not None and (path in _FILES or path == _ROOT_PATH)
 
     def _root_path(it):
-        # Real per-file root or pseudo-Item with a known path.
-        return it.id if it.id in _FILES else (_ROOT_PATH or it.id)
+        # The file abspath for a real per-file root or scope-root
+        # pseudo-Item (both carry a ``('file', path)`` id).
+        return _id_file_path(it) or _ROOT_PATH
 
     cmd = _split_cmd(os.environ.get(env_var) or default)
 

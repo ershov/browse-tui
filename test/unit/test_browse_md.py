@@ -378,7 +378,7 @@ class TestBuildNodes(unittest.TestCase):
         )
 
     def test_root_id_and_kind(self):
-        self.assertEqual(self.root.id, self.path)
+        self.assertEqual(self.root.id, ('file', self.path))
         self.assertEqual(self.root.kind, 'root')
         self.assertEqual(self.root.level, 0)
         self.assertTrue(self.root.has_children)
@@ -465,15 +465,15 @@ class TestBuildNodes(unittest.TestCase):
         self.assertEqual(a.byte_offset + a.byte_size <= h2b.byte_offset, True)
 
     def test_ids_for_non_root(self):
-        # Non-root ids: ``<path>#<line_offset>``.
+        # Non-root ids: ``('content', path, line_offset)``.
         h1 = self.root._children[0]
-        self.assertEqual(h1.id, f'{self.path}#0')
+        self.assertEqual(h1.id, ('content', self.path, 0))
         h2a = h1._children[0]
-        self.assertEqual(h2a.id, f'{self.path}#1')
+        self.assertEqual(h2a.id, ('content', self.path, 1))
         h2b = h1._children[1]
-        self.assertEqual(h2b.id, f'{self.path}#5')
+        self.assertEqual(h2b.id, ('content', self.path, 5))
         h1b = self.root._children[1]
-        self.assertEqual(h1b.id, f'{self.path}#7')
+        self.assertEqual(h1b.id, ('content', self.path, 7))
 
     def test_kind_field(self):
         # Every Item has a ``kind`` of root | heading | list-item.
@@ -544,7 +544,7 @@ class TestBuildNodes(unittest.TestCase):
     def test_by_id_contains_root_and_every_node(self):
         # Root + 9 events (2 H1 + 2 H2 + 4 list items + 1 ol).
         self.assertEqual(len(self.by_id), 1 + len(self.events))
-        self.assertIn(self.path, self.by_id)
+        self.assertIn(('file', self.path), self.by_id)
         # Each non-root id resolves to an Item.
         h1 = self.root._children[0]
         self.assertIs(self.by_id[h1.id], h1)
@@ -673,8 +673,20 @@ class TestGetChildren(unittest.TestCase):
         self.assertEqual(kids[0].tag, 'h2')
 
     def test_unknown_id_returns_empty(self):
-        self.assertEqual(self.r.get_children('nonexistent'), [])
-        self.assertEqual(self.r.get_children('/some/path#999'), [])
+        # An unknown content id (no matching node in ``_BY_ID``) and an
+        # unknown file id (no ``_FILES`` entry, not in ``_BY_ID``) both
+        # yield ``[]`` — a stale scope/cursor id mustn't traceback.
+        self.assertEqual(self.r.get_children(('content', '/some/path', 999)), [])
+        self.assertEqual(self.r.get_children(('file', '/no/such/path.md')), [])
+
+    def test_non_tuple_id_returns_empty_not_traceback(self):
+        # A stale NON-tuple id (e.g. a bare string left over from before the
+        # tuple migration, or an empty tuple) must return ``[]`` rather than
+        # tracebacking on the ``node_id[0]`` dispatch — the guard generalizes
+        # the ``None`` probe.
+        self.assertEqual(self.r.get_children('stale-string-id'), [])
+        self.assertEqual(self.r.get_children(()), [])
+        self.assertEqual(self.r.get_children(42), [])
 
     def test_returned_list_is_a_copy(self):
         # Mutating the returned list MUST NOT corrupt the cached
@@ -918,21 +930,21 @@ class TestResolveAnchor(unittest.TestCase):
             self.r._build_line_index(by_id))
 
     def _resolve(self, anchor):
-        return self.r._resolve_anchor(anchor, self.root.id)
+        return self.r._resolve_anchor(anchor, self.path)
 
     def test_empty_anchor_returns_root(self):
-        self.assertEqual(self._resolve(''), self.root.id)
+        self.assertEqual(self._resolve(''), ('file', self.path))
 
     def test_digit_anchor_exact_line(self):
         # ``#0`` resolves to ``# Intro`` (line 0).
-        self.assertEqual(self._resolve('0'), f'{self.path}#0')
+        self.assertEqual(self._resolve('0'), ('content', self.path, 0))
         # ``#3`` resolves to ``## Details`` (line 3).
-        self.assertEqual(self._resolve('3'), f'{self.path}#3')
+        self.assertEqual(self._resolve('3'), ('content', self.path, 3))
 
     def test_digit_anchor_inexact_falls_back_to_previous(self):
         # No node sits exactly on line 999999 → ``_node_at_line``
         # returns the last node; ``_resolve_anchor`` returns that id.
-        self.assertEqual(self._resolve('999999'), f'{self.path}#4')
+        self.assertEqual(self._resolve('999999'), ('content', self.path, 4))
 
     def test_digit_anchor_past_eof_does_not_warn(self):
         # All-digit anchors fall through silently (the spec says no
@@ -955,20 +967,20 @@ class TestResolveAnchor(unittest.TestCase):
         self.r._BY_LINE, self.r._LINES_SORTED = (
             self.r._build_line_index(by_id))
         # ``_node_at_line(0)`` is None → fall back to root.
-        self.assertEqual(self.r._resolve_anchor('0', root.id), root.id)
+        self.assertEqual(self.r._resolve_anchor('0', '/p.md'), ('file', '/p.md'))
 
     def test_exact_match_heading(self):
         # ``Overview`` matches ``## Overview`` exactly (display_title).
-        self.assertEqual(self._resolve('Overview'), f'{self.path}#1')
+        self.assertEqual(self._resolve('Overview'), ('content', self.path, 1))
 
     def test_prefix_match_heading(self):
         # ``Det`` matches ``## Details`` as a prefix; no exact match.
-        self.assertEqual(self._resolve('Det'), f'{self.path}#3')
+        self.assertEqual(self._resolve('Det'), ('content', self.path, 3))
 
     def test_substring_match_heading(self):
         # ``clus`` matches ``# Conclusion`` as a substring; no exact /
         # prefix match in the heading set.
-        self.assertEqual(self._resolve('clus'), f'{self.path}#4')
+        self.assertEqual(self._resolve('clus'), ('content', self.path, 4))
 
     def test_no_match_warns_and_returns_root(self):
         from io import StringIO
@@ -976,7 +988,7 @@ class TestResolveAnchor(unittest.TestCase):
         buf = StringIO()
         with redirect_stderr(buf):
             result = self._resolve('xyzzy-nonexistent')
-        self.assertEqual(result, self.root.id)
+        self.assertEqual(result, ('file', self.path))
         # Warning mentions the anchor (the exact wording is recipe-
         # owned; we assert the substring contract).
         self.assertIn('xyzzy-nonexistent', buf.getvalue())
@@ -997,7 +1009,8 @@ class TestResolveAnchor(unittest.TestCase):
         self.r._BY_LINE, self.r._LINES_SORTED = (
             self.r._build_line_index(by_id))
         # Exact match on line 1 wins over prefix match on line 0.
-        self.assertEqual(self.r._resolve_anchor('Foo', root.id), '/t.md#1')
+        self.assertEqual(
+            self.r._resolve_anchor('Foo', '/t.md'), ('content', '/t.md', 1))
 
     def test_source_order_tie_first_wins(self):
         # Two headings with the same exact display_title → first in
@@ -1012,7 +1025,8 @@ class TestResolveAnchor(unittest.TestCase):
         self.r._BY_ID = by_id
         self.r._BY_LINE, self.r._LINES_SORTED = (
             self.r._build_line_index(by_id))
-        self.assertEqual(self.r._resolve_anchor('Dup', root.id), '/d.md#0')
+        self.assertEqual(
+            self.r._resolve_anchor('Dup', '/d.md'), ('content', '/d.md', 0))
 
     def test_anchor_skips_list_items(self):
         # ``bullet`` matches the list-item ``- bullet`` text but
@@ -1023,7 +1037,7 @@ class TestResolveAnchor(unittest.TestCase):
         buf = StringIO()
         with redirect_stderr(buf):
             result = self._resolve('bullet')
-        self.assertEqual(result, self.root.id)
+        self.assertEqual(result, ('file', self.path))
         self.assertIn('bullet', buf.getvalue())
 
     def _build_goals_fixture(self):
@@ -1042,41 +1056,41 @@ class TestResolveAnchor(unittest.TestCase):
     def test_case_insensitive_exact_match(self):
         # Lower-case anchor ``goals`` matches stored title ``Goals``
         # via the exact tier (both sides lowered for comparison).
-        root = self._build_goals_fixture()
+        self._build_goals_fixture()
         self.assertEqual(
-            self.r._resolve_anchor('goals', root.id), '/g.md#0')
+            self.r._resolve_anchor('goals', '/g.md'), ('content', '/g.md', 0))
 
     def test_case_insensitive_all_caps_exact_match(self):
         # All-caps anchor still hits the exact tier — lowering both
         # sides means ``GOALS`` == ``goals`` == display ``Goals``.
-        root = self._build_goals_fixture()
+        self._build_goals_fixture()
         self.assertEqual(
-            self.r._resolve_anchor('GOALS', root.id), '/g.md#0')
+            self.r._resolve_anchor('GOALS', '/g.md'), ('content', '/g.md', 0))
 
     def test_case_insensitive_prefix_match(self):
         # ``GOA`` is not an exact match for ``Goals`` but is a prefix
         # (after both sides are lowered to ``goa`` / ``goals``).
-        root = self._build_goals_fixture()
+        self._build_goals_fixture()
         self.assertEqual(
-            self.r._resolve_anchor('GOA', root.id), '/g.md#0')
+            self.r._resolve_anchor('GOA', '/g.md'), ('content', '/g.md', 0))
 
     def test_case_insensitive_substring_match(self):
         # ``OAL`` is neither exact nor prefix; substring tier matches
         # ``goals`` (lowered display title) contains ``oal``.
-        root = self._build_goals_fixture()
+        self._build_goals_fixture()
         self.assertEqual(
-            self.r._resolve_anchor('OAL', root.id), '/g.md#0')
+            self.r._resolve_anchor('OAL', '/g.md'), ('content', '/g.md', 0))
 
     def test_no_match_warning_preserves_anchor_case(self):
         # The stderr warning echoes the user's anchor string verbatim
         # (including casing) — only the comparison key is lowered.
-        root = self._build_goals_fixture()
+        self._build_goals_fixture()
         from io import StringIO
         from contextlib import redirect_stderr
         buf = StringIO()
         with redirect_stderr(buf):
-            result = self.r._resolve_anchor('noMatch', root.id)
-        self.assertEqual(result, root.id)
+            result = self.r._resolve_anchor('noMatch', '/g.md')
+        self.assertEqual(result, ('file', '/g.md'))
         # ``'noMatch'`` (preserved casing) appears in the warning —
         # repr-quoted because the recipe uses ``{anchor!r}``.
         self.assertIn("'noMatch'", buf.getvalue())
@@ -1122,7 +1136,7 @@ class TestGetPreview(unittest.TestCase):
         self.r._BROWSER = None
 
     def test_root_id_returns_whole_file(self):
-        # Root id has no ``#`` — full file body comes back.
+        # ``('file', path)`` root id → full file body comes back.
         self.assertEqual(self.r.get_preview(self.root.id), self.FIXTURE)
 
     def test_heading_returns_section_slice(self):
@@ -1162,15 +1176,22 @@ class TestGetPreview(unittest.TestCase):
         self.assertEqual(out, '- a\n')
 
     def test_unknown_id_returns_empty(self):
-        # ``/path#999`` resolves to no node; ``_node_at_line`` will
-        # return the last node ≤ 999 (which is fine — but a
-        # non-integer suffix has nothing to fall back to).
-        self.assertEqual(self.r.get_preview('/some/path#notanumber'), '')
+        # An id that classifies as neither file-root nor content (here a
+        # bare unknown tuple) → empty preview, no crash.
+        self.assertEqual(self.r.get_preview(('mystery', '/some/path')), '')
+
+    def test_non_tuple_id_returns_empty_not_traceback(self):
+        # A stale NON-tuple id (bare string / empty tuple / scalar) must
+        # return '' rather than tracebacking on the ``node_id[0]`` dispatch —
+        # the guard generalizes the ``None`` pseudo-row case.
+        self.assertEqual(self.r.get_preview('stale-string-id'), '')
+        self.assertEqual(self.r.get_preview(()), '')
+        self.assertEqual(self.r.get_preview(42), '')
 
     def test_line_with_no_node_below_returns_empty(self):
         # Line ``-1`` is before every parsed node — _BY_LINE miss,
         # _node_at_line returns None → empty.
-        out = self.r.get_preview(f'{self.path}#-1')
+        out = self.r.get_preview(('content', self.path, -1))
         self.assertEqual(out, '')
 
     def test_md_color_off_returns_raw(self):
@@ -1658,7 +1679,7 @@ class TestRunSourceCommand(unittest.TestCase):
     def test_root_only_opens_original_path(self):
         # ``root.id`` is the absolute path; the command should be the
         # default split + that path. No tempfile.
-        root = _SrcItem(id=self.path, kind='root')
+        root = _SrcItem(id=('file', self.path), kind='root')
         ctx = _SrcCmdCtx(targets=[root])
         self.r._run_source_command(ctx, 'PAGER', 'less -R')
         self.assertEqual(ctx.calls, [['less', '-R', self.path]])
@@ -1670,7 +1691,7 @@ class TestRunSourceCommand(unittest.TestCase):
         # but pinned with the post-#572 name to document the
         # single-target shortcut contract.
         import os
-        root = _SrcItem(id=self.path, kind='root')
+        root = _SrcItem(id=('file', self.path), kind='root')
         ctx = _SrcCmdCtx(targets=[root])
         self.r._run_source_command(ctx, 'PAGER', 'less -R')
         self.assertEqual(ctx.calls, [['less', '-R', self.path]])
@@ -1685,7 +1706,7 @@ class TestRunSourceCommand(unittest.TestCase):
         # cursor-only; this asserts the contract still holds when
         # the single target came from a space-mark rather than the
         # cursor.
-        root = _SrcItem(id=self.path, kind='root')
+        root = _SrcItem(id=('file', self.path), kind='root')
         ctx = _SrcCmdCtx(targets=[root])
         self.r._run_source_command(ctx, 'PAGER', 'less -R')
         self.assertEqual(ctx.calls, [['less', '-R', self.path]])
@@ -1695,8 +1716,8 @@ class TestRunSourceCommand(unittest.TestCase):
         # file-root expands to the whole file range and merges with
         # the heading's sub-range (the whole-file range absorbs it),
         # producing a tempfile that contains the entire file body.
-        root = _SrcItem(id=self.path, kind='root')
-        leaf = _SrcItem(id=self.path + '#3', kind='heading',
+        root = _SrcItem(id=('file', self.path), kind='root')
+        leaf = _SrcItem(id=('content', self.path, 3), kind='heading',
                         byte_offset=0, byte_size=5)
         ctx = _SrcCmdCtx(targets=[leaf, root])
         self.r._run_source_command(ctx, 'PAGER', 'less -R')
@@ -1710,7 +1731,7 @@ class TestRunSourceCommand(unittest.TestCase):
         self.assertEqual(ctx.last_tmp_contents, self.r._FILE_TEXT)
 
     def test_single_non_root_writes_temp_and_runs(self):
-        leaf = _SrcItem(id=self.path + '#2', kind='heading',
+        leaf = _SrcItem(id=('content', self.path, 2), kind='heading',
                         byte_offset=10, byte_size=5)
         ctx = _SrcCmdCtx(targets=[leaf])
         self.r._run_source_command(ctx, 'PAGER', 'less -R')
@@ -1727,11 +1748,11 @@ class TestRunSourceCommand(unittest.TestCase):
         # produced temp file should contain merged ranges in file
         # order with no duplication. We use disjoint ranges so the
         # output is just concatenation (no slice loss).
-        a = _SrcItem(id=self.path + '#0', kind='heading',
+        a = _SrcItem(id=('content', self.path, 0), kind='heading',
                      byte_offset=0, byte_size=5)   # 'AAAA\n'
-        b = _SrcItem(id=self.path + '#2', kind='heading',
+        b = _SrcItem(id=('content', self.path, 2), kind='heading',
                      byte_offset=10, byte_size=5)  # 'CCCC\n'
-        c = _SrcItem(id=self.path + '#4', kind='heading',
+        c = _SrcItem(id=('content', self.path, 4), kind='heading',
                      byte_offset=20, byte_size=5)  # 'EEEE\n'
         # Out of file order.
         ctx = _SrcCmdCtx(targets=[c, a, b])
@@ -1743,9 +1764,9 @@ class TestRunSourceCommand(unittest.TestCase):
     def test_overlapping_ranges_deduped(self):
         # Two overlapping non-root targets → merged into one range,
         # no slice duplication in the temp file.
-        a = _SrcItem(id=self.path + '#0', kind='heading',
+        a = _SrcItem(id=('content', self.path, 0), kind='heading',
                      byte_offset=0, byte_size=10)   # 'AAAA\nBBBB\n'
-        b = _SrcItem(id=self.path + '#1', kind='heading',
+        b = _SrcItem(id=('content', self.path, 1), kind='heading',
                      byte_offset=5, byte_size=10)   # 'BBBB\nCCCC\n'
         ctx = _SrcCmdCtx(targets=[a, b])
         self.r._run_source_command(ctx, 'PAGER', 'less -R')
@@ -1757,7 +1778,7 @@ class TestRunSourceCommand(unittest.TestCase):
         # on disk after _run_source_command returns (unlinked in
         # ``finally``).
         import os
-        leaf = _SrcItem(id=self.path + '#0', kind='heading',
+        leaf = _SrcItem(id=('content', self.path, 0), kind='heading',
                         byte_offset=0, byte_size=5)
         ctx = _SrcCmdCtx(targets=[leaf])
         self.r._run_source_command(ctx, 'PAGER', 'less -R')
@@ -1770,7 +1791,7 @@ class TestRunSourceCommand(unittest.TestCase):
         import os
         os.environ['PAGER'] = 'bat --paging=always'
         try:
-            leaf = _SrcItem(id=self.path + '#0', kind='heading',
+            leaf = _SrcItem(id=('content', self.path, 0), kind='heading',
                             byte_offset=0, byte_size=5)
             ctx = _SrcCmdCtx(targets=[leaf])
             self.r._run_source_command(ctx, 'PAGER', 'less -R')
@@ -1790,9 +1811,9 @@ class TestRunSourceCommand(unittest.TestCase):
         # include every selected section. The ticket cites a
         # symptom where only the cursor's section appears even
         # though both items are marked.
-        a = _SrcItem(id=self.path + '#0', kind='heading',
+        a = _SrcItem(id=('content', self.path, 0), kind='heading',
                      byte_offset=0, byte_size=5)    # 'AAAA\n'
-        b = _SrcItem(id=self.path + '#2', kind='heading',
+        b = _SrcItem(id=('content', self.path, 2), kind='heading',
                      byte_offset=10, byte_size=5)   # 'CCCC\n'
         ctx = _SrcCmdCtx(targets=[a, b])
         self.r._run_source_command(ctx, 'PAGER', 'less -R')
@@ -1811,7 +1832,7 @@ class TestRunSourceCommand(unittest.TestCase):
         # pseudo-Item (no ``kind`` / ``byte_offset`` attrs but
         # ``id == _ROOT_PATH``), classify it as root and open the
         # original file directly — no tempfile, no AttributeError.
-        pseudo = _ScopeRootPseudoItem(id=self.path)
+        pseudo = _ScopeRootPseudoItem(id=('file', self.path))
         ctx = _SrcCmdCtx(targets=[pseudo])
         self.r._run_source_command(ctx, 'PAGER', 'less -R')
         self.assertEqual(ctx.calls, [['less', '-R', self.path]])
@@ -1821,8 +1842,8 @@ class TestRunSourceCommand(unittest.TestCase):
         # scope-root pseudo-Item, like a real root, expands to the
         # whole-file range and merges with the heading's sub-range.
         # Result: a tempfile containing the whole file body.
-        pseudo = _ScopeRootPseudoItem(id=self.path)
-        leaf = _SrcItem(id=self.path + '#3', kind='heading',
+        pseudo = _ScopeRootPseudoItem(id=('file', self.path))
+        leaf = _SrcItem(id=('content', self.path, 3), kind='heading',
                         byte_offset=0, byte_size=5)
         ctx = _SrcCmdCtx(targets=[leaf, pseudo])
         self.r._run_source_command(ctx, 'PAGER', 'less -R')
@@ -1935,7 +1956,7 @@ class TestReload(unittest.TestCase):
         # which is now just a per-file root, not the Browser root)
         # short-circuit to the cached branch.
         self._write('# Delta\n')
-        self.r.get_children(self.r._ROOT_PATH, reload=True)
+        self.r.get_children(('file', self.r._ROOT_PATH), reload=True)
         # Stale content survives — no reparse ran.
         self.assertEqual(self._heading_titles(), ['Alpha', 'Sub-Alpha'])
         # Reload at ``None`` does reparse.
@@ -2363,15 +2384,15 @@ class TestBuildNodesNoLists(unittest.TestCase):
             self.assertIn(item.kind, ('root', 'heading'))
 
     def test_heading_ids_unchanged(self):
-        # Heading ids are ``<path>#<line_offset>`` — they depend on
+        # Heading ids are ``('content', path, line_offset)`` — they depend on
         # the source line numbers, which the flag doesn't affect.
         h1 = self.root._children[0]
         h2a, h2b = h1._children
         h1b = self.root._children[1]
-        self.assertEqual(h1.id, f'{self.path}#0')
-        self.assertEqual(h2a.id, f'{self.path}#1')
-        self.assertEqual(h2b.id, f'{self.path}#5')
-        self.assertEqual(h1b.id, f'{self.path}#7')
+        self.assertEqual(h1.id, ('content', self.path, 0))
+        self.assertEqual(h2a.id, ('content', self.path, 1))
+        self.assertEqual(h2b.id, ('content', self.path, 5))
+        self.assertEqual(h1b.id, ('content', self.path, 7))
 
     def test_heading_byte_offsets_unchanged(self):
         # Heading byte offsets are the literal positions of the ``#``
@@ -2477,7 +2498,7 @@ class TestTextNodes(unittest.TestCase):
         self.assertEqual(text_leaf.tag_style, 'dim')
         self.assertFalse(text_leaf.has_children)
         self.assertEqual(text_leaf._children, [])
-        self.assertEqual(text_leaf.id, f'{path}#0')
+        self.assertEqual(text_leaf.id, ('content', path, 0))
 
     def test_nested_scope_also_gets_text_leaf(self):
         # The run before ``# Top``'s first sub-heading is ``# Top``'s first
@@ -2554,9 +2575,9 @@ class TestTextNodes(unittest.TestCase):
         r, path, root, by_id = self._build(include_lists=False)
         r._BY_ID = by_id
         r._BY_LINE, r._LINES_SORTED = r._build_line_index(by_id)
-        self.assertEqual(r._resolve_anchor('intro', path), path)
+        self.assertEqual(r._resolve_anchor('intro', path), ('file', path))
         # A real heading title still resolves to its heading.
-        self.assertEqual(r._resolve_anchor('Top', path), f'{path}#1')
+        self.assertEqual(r._resolve_anchor('Top', path), ('content', path, 1))
 
     def test_line_anchor_resolves_to_text_leaf(self):
         # A digit anchor goes through ``_node_at_line``, whose by-line index
@@ -2566,7 +2587,7 @@ class TestTextNodes(unittest.TestCase):
         r, path, root, by_id = self._build(include_lists=False)
         r._BY_ID = by_id
         r._BY_LINE, r._LINES_SORTED = r._build_line_index(by_id)
-        self.assertEqual(r._resolve_anchor('0', path), f'{path}#0')
+        self.assertEqual(r._resolve_anchor('0', path), ('content', path, 0))
         self.assertEqual(r._node_at_line(0).kind, 'text')
 
     def test_lone_text_child_does_not_auto_expand(self):
@@ -2582,7 +2603,7 @@ class TestTextNodes(unittest.TestCase):
         fake_root = type('FR', (), {'_children': [text_leaf]})()
         fake_fs = type('FS', (), {'file_root': fake_root})()
         r._FILES = {path: fake_fs}
-        self.assertIsNone(r._lone_heading_child_id(path))
+        self.assertIsNone(r._lone_heading_child_id(('file', path)))
 
 
 # ====================================================================
@@ -2822,7 +2843,8 @@ class TestBuildMulti(_MultiCaseBase):
         # path to the top-level rows — files in argv order.
         self._load_multi(self.path_a, self.path_b)
         top = self.r.get_children(None)
-        self.assertEqual([c.id for c in top], [self.path_a, self.path_b])
+        self.assertEqual([c.id for c in top],
+                         [('file', self.path_a), ('file', self.path_b)])
 
     def test_per_file_root_titles_match_md_ref_label(self):
         # Per-file root titles always come from ``_md_ref_label`` against
@@ -2904,18 +2926,18 @@ class TestBuildMulti(_MultiCaseBase):
 
     def test_aggregate_by_id_contains_per_file_ids(self):
         self._load_multi(self.path_a, self.path_b)
-        self.assertIn(self.path_a, self.r._BY_ID)
-        self.assertIn(self.path_b, self.r._BY_ID)
+        self.assertIn(('file', self.path_a), self.r._BY_ID)
+        self.assertIn(('file', self.path_b), self.r._BY_ID)
         # And the per-file headings — at least one from each file.
-        self.assertIn(f'{self.path_a}#0', self.r._BY_ID)
-        self.assertIn(f'{self.path_b}#0', self.r._BY_ID)
+        self.assertIn(('content', self.path_a, 0), self.r._BY_ID)
+        self.assertIn(('content', self.path_b, 0), self.r._BY_ID)
 
     def test_single_file_top_level_has_one_row(self):
         # With one file in ``_INPUT_FILES``, the top-level row count
         # is 1 — that file's per-file root. No synthetic multi-root.
         self._load_multi(self.path_a)
         top = self.r.get_children(None)
-        self.assertEqual([c.id for c in top], [self.path_a])
+        self.assertEqual([c.id for c in top], [('file', self.path_a)])
 
     def test_items_carry_file_path_back_reference(self):
         # Every Item built by ``_build_nodes`` carries ``file_path``
@@ -3009,7 +3031,7 @@ class TestAnchorMulti(_MultiCaseBase):
         # into B's H2 heading.
         scope = self._initial_scope(
             (self.path_a, ''), (self.path_b, 'B2'))
-        self.assertEqual(scope, f'{self.path_b}#1')
+        self.assertEqual(scope, ('content', self.path_b, 1))
 
     def test_anchor_on_first_file_resolves_in_that_file(self):
         # File A carries ``#A2``, file B unanchored → scope drills
@@ -3017,7 +3039,7 @@ class TestAnchorMulti(_MultiCaseBase):
         # symmetrically with anchor-on-second.
         scope = self._initial_scope(
             (self.path_a, 'A2'), (self.path_b, ''))
-        self.assertEqual(scope, f'{self.path_a}#1')
+        self.assertEqual(scope, ('content', self.path_a, 1))
 
     def test_both_anchored_first_wins(self):
         # Both files anchored → the FIRST one in argv order wins
@@ -3025,20 +3047,20 @@ class TestAnchorMulti(_MultiCaseBase):
         # anchor is recorded in ``_INPUT_FILES`` but ignored here.
         scope = self._initial_scope(
             (self.path_a, 'A2'), (self.path_b, 'B2'))
-        self.assertEqual(scope, f'{self.path_a}#1')
+        self.assertEqual(scope, ('content', self.path_a, 1))
 
     def test_digit_anchor_resolves_against_named_file(self):
         # Digit anchors are 0-based line numbers — resolution is
         # per-file. ``#0`` on B should hit B's first heading, not A's.
         scope = self._initial_scope(
             (self.path_a, ''), (self.path_b, '0'))
-        self.assertEqual(scope, f'{self.path_b}#0')
+        self.assertEqual(scope, ('content', self.path_b, 0))
 
     def test_single_file_anchor_resolves(self):
         # Single file with anchor → resolves via ``_resolve_anchor``
         # against that file's per-file root.
         scope = self._initial_scope((self.path_a, 'A2'))
-        self.assertEqual(scope, f'{self.path_a}#1')
+        self.assertEqual(scope, ('content', self.path_a, 1))
 
     def test_single_file_no_anchor_auto_expands_file_row(self):
         # Single-file no-anchor: ``initial_scope`` is ``None`` AND
@@ -3049,15 +3071,15 @@ class TestAnchorMulti(_MultiCaseBase):
         self.assertIsNone(b.config.initial_scope)
         self.assertEqual(len(b.expand_calls), 1)
         expanded_id, _, _ = b.expand_calls[0]
-        # The file's per-file-root id equals its abs path.
-        self.assertEqual(expanded_id, self.path_a)
+        # The file's per-file-root id is ``('file', abspath)``.
+        self.assertEqual(expanded_id, ('file', self.path_a))
 
     def test_single_file_with_anchor_does_not_auto_expand(self):
         # Single-file WITH anchor: ``initial_scope`` resolves to the
         # anchored heading and no auto-expand is issued (the anchor
         # drill-in already reveals the heading).
         b = self._run_main(['browse-md', f'{self.path_a}#A2'])
-        self.assertEqual(b.config.initial_scope, f'{self.path_a}#1')
+        self.assertEqual(b.config.initial_scope, ('content', self.path_a, 1))
         self.assertEqual(b.expand_calls, [])
 
     def test_multi_file_no_anchor_does_not_auto_expand(self):
@@ -3083,17 +3105,17 @@ class TestGetPreviewMulti(_MultiCaseBase):
     def test_per_file_root_preview_is_full_file_text(self):
         self._load_multi(self.path_a, self.path_b)
         self.r._MD_COLOR = False
-        self.assertEqual(self.r.get_preview(self.path_a), self.A_TEXT)
-        self.assertEqual(self.r.get_preview(self.path_b), self.B_TEXT)
+        self.assertEqual(self.r.get_preview(('file', self.path_a)), self.A_TEXT)
+        self.assertEqual(self.r.get_preview(('file', self.path_b)), self.B_TEXT)
 
     def test_per_file_heading_preview_is_file_slice(self):
-        # Heading id is ``<path>#<line>``; preview is the byte-slice
+        # Heading id is ``('content', path, line)``; preview is the byte-slice
         # of that file's text. Confirms ``get_preview`` routes to the
         # right file via the ``_classify_id('content', ...)`` branch.
         self._load_multi(self.path_a, self.path_b)
         self.r._MD_COLOR = False
         # Slice for ``# A1`` (line 0) — runs to ``# A1b`` at line 3.
-        a_h1_id = f'{self.path_a}#0'
+        a_h1_id = ('content', self.path_a, 0)
         out = self.r.get_preview(a_h1_id)
         self.assertTrue(out.startswith('# A1\n'))
         self.assertIn('body of A2', out)
@@ -3103,9 +3125,11 @@ class TestGetPreviewMulti(_MultiCaseBase):
     def test_unknown_id_returns_empty(self):
         self._load_multi(self.path_a, self.path_b)
         self.r._MD_COLOR = False
-        self.assertEqual(self.r.get_preview('/no/such/path.md'), '')
+        # A file id for a path not loaded, and a content id for a missing
+        # file, both preview empty (no ``_FILES`` entry → shim miss).
+        self.assertEqual(self.r.get_preview(('file', '/no/such/path.md')), '')
         self.assertEqual(
-            self.r.get_preview('/no/such/path.md#0'), '')
+            self.r.get_preview(('content', '/no/such/path.md', 0)), '')
 
 
 class TestRunSourceCommandMulti(_MultiCaseBase):
@@ -3178,8 +3202,8 @@ class TestRunSourceCommandMulti(_MultiCaseBase):
         # Two non-root targets from the SAME file → one tempfile, the
         # merged byte ranges in file order.
         self._load_multi(self.path_a, self.path_b)
-        a_h1 = self.r._BY_ID[f'{self.path_a}#0']
-        a_h1b = self.r._BY_ID[f'{self.path_a}#3']
+        a_h1 = self.r._BY_ID[('content', self.path_a, 0)]
+        a_h1b = self.r._BY_ID[('content', self.path_a, 3)]
         ctx = _SrcCmdCtx(targets=[a_h1b, a_h1])
         self.r._run_source_command(ctx, 'PAGER', 'less -R')
         self.assertEqual(len(ctx.calls), 1)
@@ -3195,8 +3219,8 @@ class TestRunSourceCommandMulti(_MultiCaseBase):
         # selection order.
         import os
         self._load_multi(self.path_a, self.path_b)
-        a_h1 = self.r._BY_ID[f'{self.path_a}#0']
-        b_h1 = self.r._BY_ID[f'{self.path_b}#0']
+        a_h1 = self.r._BY_ID[('content', self.path_a, 0)]
+        b_h1 = self.r._BY_ID[('content', self.path_b, 0)]
         ctx = _SrcCmdCtx(targets=[b_h1, a_h1])
         self.r._run_source_command(ctx, 'PAGER', 'less -R')
         self.assertEqual(len(ctx.calls), 1)
@@ -3223,8 +3247,8 @@ class TestRunSourceCommandMulti(_MultiCaseBase):
         # Even when B's target is listed FIRST in the selection, the
         # groups in the temp file appear in argv order (A then B).
         self._load_multi(self.path_a, self.path_b)
-        a_h1 = self.r._BY_ID[f'{self.path_a}#0']
-        b_h1 = self.r._BY_ID[f'{self.path_b}#0']
+        a_h1 = self.r._BY_ID[('content', self.path_a, 0)]
+        b_h1 = self.r._BY_ID[('content', self.path_b, 0)]
         ctx = _SrcCmdCtx(targets=[b_h1, a_h1])
         self.r._run_source_command(ctx, 'PAGER', 'less -R')
         out = ctx.last_tmp_contents
@@ -3238,7 +3262,7 @@ class TestRunSourceCommandMulti(_MultiCaseBase):
         import os
         self._load_multi(self.path_a, self.path_b)
         a_root = self.r._FILES[self.path_a].file_root
-        a_h1 = self.r._BY_ID[f'{self.path_a}#0']
+        a_h1 = self.r._BY_ID[('content', self.path_a, 0)]
         ctx = _SrcCmdCtx(targets=[a_root, a_h1])
         self.r._run_source_command(ctx, 'PAGER', 'less -R')
         self.assertEqual(len(ctx.calls), 1)
@@ -3260,7 +3284,7 @@ class TestRunSourceCommandMulti(_MultiCaseBase):
         import os
         self._load_multi(self.path_a, self.path_b)
         a_root = self.r._FILES[self.path_a].file_root
-        b_h1 = self.r._BY_ID[f'{self.path_b}#0']
+        b_h1 = self.r._BY_ID[('content', self.path_b, 0)]
         ctx = _SrcCmdCtx(targets=[a_root, b_h1])
         self.r._run_source_command(ctx, 'PAGER', 'less -R')
         self.assertEqual(len(ctx.calls), 1)
@@ -3294,8 +3318,8 @@ class TestReloadMulti(_MultiCaseBase):
         # Ctrl-R contract, confirm both files' new headings appear.
         self._load_multi(self.path_a, self.path_b)
         # Sanity: pre-mutation state.
-        self.assertIn(f'{self.path_a}#0', self.r._BY_ID)
-        self.assertIn(f'{self.path_b}#0', self.r._BY_ID)
+        self.assertIn(('content', self.path_a, 0), self.r._BY_ID)
+        self.assertIn(('content', self.path_b, 0), self.r._BY_ID)
         # Overwrite both files with new content.
         self._write(self.path_a, '# NewA\n')
         self._write(self.path_b, '# NewB\n## NewB2\n')
@@ -3345,27 +3369,34 @@ class TestClassifyId(_MultiCaseBase):
     def test_per_file_root_id(self):
         self._load_multi(self.path_a, self.path_b)
         self.assertEqual(
-            self.r._classify_id(self.path_a), ('file-root', self.path_a))
+            self.r._classify_id(('file', self.path_a)),
+            ('file-root', self.path_a))
         self.assertEqual(
-            self.r._classify_id(self.path_b), ('file-root', self.path_b))
+            self.r._classify_id(('file', self.path_b)),
+            ('file-root', self.path_b))
 
     def test_content_id(self):
         self._load_multi(self.path_a, self.path_b)
         self.assertEqual(
-            self.r._classify_id(f'{self.path_a}#0'),
+            self.r._classify_id(('content', self.path_a, 0)),
             ('content', self.path_a))
         self.assertEqual(
-            self.r._classify_id(f'{self.path_b}#1'),
+            self.r._classify_id(('content', self.path_b, 1)),
             ('content', self.path_b))
 
     def test_unknown_id(self):
         self._load_multi(self.path_a, self.path_b)
+        # Tags ``_classify_id`` doesn't own (the markdown-ref tuples and any
+        # stray shape) classify as unknown — ``get_preview`` routes ``md`` /
+        # ``refs`` separately before reaching here.
         self.assertEqual(
-            self.r._classify_id('/no/such/path.md'), ('unknown', None))
+            self.r._classify_id(('md', ('file', self.path_a), (), None)),
+            ('unknown', None))
         self.assertEqual(
-            self.r._classify_id('/no/such/path.md#3'), ('unknown', None))
+            self.r._classify_id(('refs', ('file', self.path_a), ())),
+            ('unknown', None))
         self.assertEqual(
-            self.r._classify_id('garbage'), ('unknown', None))
+            self.r._classify_id(('mystery', 'garbage')), ('unknown', None))
 
 
 class _SingleFileBase(unittest.TestCase):
@@ -3421,18 +3452,20 @@ class TestLoneHeadingChildId(_SingleFileBase):
         # exactly one child (the h1), so the helper returns the h1 id.
         path = self._load('# Title\n## Section\nbody\n')
         self.assertEqual(
-            self.r._lone_heading_child_id(path), f'{path}#0')
+            self.r._lone_heading_child_id(('file', path)),
+            ('content', path, 0))
 
     def test_single_h2_child_returns_its_id(self):
         # Any heading level qualifies, not just h1 — a file whose sole
         # child is an ``## h2`` still gets the cascade.
         path = self._load('## Only\nbody\n')
         self.assertEqual(
-            self.r._lone_heading_child_id(path), f'{path}#0')
+            self.r._lone_heading_child_id(('file', path)),
+            ('content', path, 0))
 
     def test_two_top_level_headings_returns_none(self):
         path = self._load('# A\n# B\n')
-        self.assertIsNone(self.r._lone_heading_child_id(path))
+        self.assertIsNone(self.r._lone_heading_child_id(('file', path)))
 
     def test_single_list_item_child_returns_none(self):
         # A lone non-heading child (list item) does not qualify.
@@ -3440,15 +3473,16 @@ class TestLoneHeadingChildId(_SingleFileBase):
         root = self.r._FILES[path].file_root
         self.assertEqual(len(root._children), 1)
         self.assertEqual(root._children[0].kind, 'list-item')
-        self.assertIsNone(self.r._lone_heading_child_id(path))
+        self.assertIsNone(self.r._lone_heading_child_id(('file', path)))
 
     def test_no_children_returns_none(self):
         path = self._load('plain body, no headings\n')
-        self.assertIsNone(self.r._lone_heading_child_id(path))
+        self.assertIsNone(self.r._lone_heading_child_id(('file', path)))
 
     def test_unknown_id_returns_none(self):
         self._load('# Title\n## Section\n')
-        self.assertIsNone(self.r._lone_heading_child_id('/no/such.md'))
+        self.assertIsNone(
+            self.r._lone_heading_child_id(('file', '/no/such.md')))
 
 
 class _CascadeCtx:
@@ -3485,14 +3519,14 @@ class TestOnExpand(_SingleFileBase):
         # (False) so it doesn't park a scroll goal.
         path = self._load('# Title\n## Section\nbody\n')
         ctx = _CascadeCtx()
-        self.r._on_expand(ctx, [path])
-        self.assertEqual(ctx.expand_calls, [(f'{path}#0', False)])
+        self.r._on_expand(ctx, [('file', path)])
+        self.assertEqual(ctx.expand_calls, [(('content', path, 0), False)])
 
     def test_two_top_level_headings_no_cascade(self):
         # A file with two top-level headings has no lone-heading child.
         path = self._load('# A\n# B\n')
         ctx = _CascadeCtx()
-        self.r._on_expand(ctx, [path])
+        self.r._on_expand(ctx, [('file', path)])
         self.assertEqual(ctx.expand_calls, [])
 
     def test_non_file_id_no_cascade(self):
@@ -3500,7 +3534,7 @@ class TestOnExpand(_SingleFileBase):
         # never qualifies, so nothing cascades.
         path = self._load('# Title\n## Section\nbody\n')
         ctx = _CascadeCtx()
-        self.r._on_expand(ctx, [f'{path}#0'])
+        self.r._on_expand(ctx, [('content', path, 0)])
         self.assertEqual(ctx.expand_calls, [])
 
     def test_cascade_id_does_not_re_cascade(self):
@@ -3510,7 +3544,7 @@ class TestOnExpand(_SingleFileBase):
         # expand). This is what bounds the recursion.
         path = self._load('# Title\n## Section\nbody\n')
         ctx = _CascadeCtx()
-        self.r._on_expand(ctx, [f'{path}#0'])  # the cascade target
+        self.r._on_expand(ctx, [('content', path, 0)])  # the cascade target
         self.assertEqual(ctx.expand_calls, [])
 
     def test_batch_cascades_each_qualifying_id(self):
@@ -3530,9 +3564,10 @@ class TestOnExpand(_SingleFileBase):
         self.r._reparse()
         p1, p2 = paths
         ctx = _CascadeCtx()
-        self.r._on_expand(ctx, [p1, p2])
+        self.r._on_expand(ctx, [('file', p1), ('file', p2)])
         self.assertEqual(
-            set(ctx.expand_calls), {(f'{p1}#0', False), (f'{p2}#0', False)})
+            set(ctx.expand_calls),
+            {(('content', p1, 0), False), (('content', p2, 0), False)})
 
 
 class TestStartupAutoExpand(unittest.TestCase):
@@ -3577,7 +3612,7 @@ class TestStartupAutoExpand(unittest.TestCase):
         b = self._run_main(path)
         ids = [c[0] for c in b.expand_calls]
         # Just the file-root expand; the cascade is the hook's job now.
-        self.assertEqual(ids, [path])
+        self.assertEqual(ids, [('file', path)])
         # And on_expand is wired into the config so the hook can run.
         self.assertIs(b.config.on_expand, self.r._on_expand)
 
@@ -3585,7 +3620,7 @@ class TestStartupAutoExpand(unittest.TestCase):
         path = self._write('# A\n# B\n')
         b = self._run_main(path)
         ids = [c[0] for c in b.expand_calls]
-        self.assertEqual(ids, [path])
+        self.assertEqual(ids, [('file', path)])
 
 
 def _load_framework():
@@ -3707,12 +3742,13 @@ class TestOnExpandCascadeLive(unittest.TestCase):
         b = self._browser_for(path)
         try:
             self.assertEqual(b._state.expanded, set())   # clean baseline
-            b.expand(path)                               # user/programmatic
+            b.expand(('file', path))                     # user/programmatic
             self._pump(b)
             # BOTH the file-root AND its lone heading end up expanded.
-            self.assertIn(path, b._state.expanded)
-            self.assertIn(f'{path}#0', b._state.expanded)
-            self.assertEqual(b._state.expanded, {path, f'{path}#0'})
+            self.assertIn(('file', path), b._state.expanded)
+            self.assertIn(('content', path, 0), b._state.expanded)
+            self.assertEqual(b._state.expanded,
+                             {('file', path), ('content', path, 0)})
         finally:
             b.stop_workers()
 
@@ -3725,9 +3761,10 @@ class TestOnExpandCascadeLive(unittest.TestCase):
         b = self._browser_for(path)
         try:
             self.assertEqual(b._last_expanded, set())
-            b.expand(path)
+            b.expand(('file', path))
             self._pump(b)
-            self.assertEqual(b._state.expanded, {path, f'{path}#0'})
+            self.assertEqual(b._state.expanded,
+                             {('file', path), ('content', path, 0)})
         finally:
             b.stop_workers()
 
@@ -3737,9 +3774,9 @@ class TestOnExpandCascadeLive(unittest.TestCase):
         path = self._load_md('# A\n# B\n')
         b = self._browser_for(path)
         try:
-            b.expand(path)
+            b.expand(('file', path))
             self._pump(b)
-            self.assertEqual(b._state.expanded, {path})
+            self.assertEqual(b._state.expanded, {('file', path)})
         finally:
             b.stop_workers()
 
@@ -3753,7 +3790,7 @@ class TestOnExpandCascadeLive(unittest.TestCase):
         b = self._browser_for(path)
         try:
             # Start from the fully-cascaded state, cursor on the file row.
-            b.expand(path)
+            b.expand(('file', path))
             self._pump(b)
             b._state.cursor = 0
             self._fwstate.mark_cursor_changed(b)
@@ -3771,8 +3808,8 @@ class TestOnExpandCascadeLive(unittest.TestCase):
 
 
 class TestMdRefFollowing(unittest.TestCase):
-    """Markdown reference-following — ``#md:`` ref children under a ``[links]``
-    References umbrella (tickets #664, #698, #703).
+    """Markdown reference-following — ``('md', …)`` ref children under a
+    ``[links]`` References umbrella (tickets #664, #698, #703).
 
     A markdown FILE references other ``.md`` files; the EXISTING referenced files
     are grouped under ONE ``[links]`` References umbrella child of the document
@@ -3843,6 +3880,10 @@ class TestMdRefFollowing(unittest.TestCase):
     def _refs(self, parent_id):
         # The ``[md]`` ref file-docs grouped under ``parent_id``'s umbrella —
         # expanding the parent, finding its umbrella, then expanding THAT.
+        # A bare path is wrapped into its per-file root id ``('file', path)``
+        # for convenience (the md-ref tuple ids are passed through as-is).
+        if isinstance(parent_id, str):
+            parent_id = ('file', parent_id)
         umbrella = self._umbrella(self.r.get_children(parent_id))
         return self.r.get_children(umbrella.id)
 
@@ -3852,7 +3893,7 @@ class TestMdRefFollowing(unittest.TestCase):
         # A's root children = its h1 heading + one ``[links]`` References
         # umbrella (refs are NO LONGER direct children). Expanding the umbrella
         # yields one ``[md]`` node for B.md; C.md is non-existent (existing-only).
-        kids = self.r.get_children(self.A)
+        kids = self.r.get_children(('file', self.A))
         # A heading row is present, refs grouped after it under the umbrella.
         self.assertEqual(kids[0].tag, 'h1')
         self.assertEqual(kids[0].title, 'A title')
@@ -3865,8 +3906,9 @@ class TestMdRefFollowing(unittest.TestCase):
         self.assertEqual(umbrella.kind, 'md-refs')
         self.assertFalse(umbrella.boundary)
         self.assertTrue(umbrella.has_children)
-        # Its id = the file-root id + ``#refs``.
-        self.assertEqual(umbrella.id, self.r.md_doc.refs_umbrella_id(self.A))
+        # Its id = ``('refs', anchor, ())`` — the primary file's refs, the
+        # anchor being the per-file root ``('file', A)`` (empty chain).
+        self.assertEqual(umbrella.id, ('refs', ('file', self.A), ()))
         # Expanding it yields the ref file-docs.
         refs = self.r.get_children(umbrella.id)
         self.assertEqual([k.title for k in refs], ['B.md'])
@@ -3907,14 +3949,17 @@ class TestMdRefFollowing(unittest.TestCase):
         # B.md deduped to one; D.md present; sorted by label.
         self.assertEqual(titles, ['B.md', 'D.md'])
 
-    def test_ref_node_id_uses_md_chain_codec(self):
-        # The ref child id composes the #md: chain onto A's base id (UNCHANGED
-        # by the umbrella — the umbrella is a grouping parent, not a chain hop).
+    def test_ref_node_id_is_md_tuple(self):
+        # The ref child id is the tuple ``('md', anchor, chain, line)`` — the
+        # anchor is A's per-file root ``('file', A)``, the chain is just the
+        # referenced file (off A directly), line is None (a doc root). The
+        # umbrella is a grouping parent, not a chain hop, so it doesn't appear.
         bnode = self._refs(self.A)[0]
-        base, abspaths, line_offset = self.r.md_doc.parse_md_id(bnode.id)
-        self.assertEqual(base, self.A)
-        self.assertEqual(abspaths, [os.path.realpath(self.B)])
-        self.assertIsNone(line_offset)
+        tag, anchor, chain, line = bnode.id
+        self.assertEqual(tag, 'md')
+        self.assertEqual(anchor, ('file', self.A))
+        self.assertEqual(chain, (os.path.realpath(self.B),))
+        self.assertIsNone(line)
 
     def test_umbrella_always_wraps_single_ref(self):
         # Even a single ref is grouped under the umbrella — never hung directly
@@ -3936,7 +3981,10 @@ class TestMdRefFollowing(unittest.TestCase):
         # own umbrella, whose id chains onto bnode.id.
         self.assertFalse(any(k.tag == 'md' for k in bkids))
         b_umbrella = self._umbrella(bkids)
-        self.assertEqual(b_umbrella.id, self.r.md_doc.refs_umbrella_id(bnode.id))
+        # B's own umbrella shares A's anchor; its chain is B's chain (the
+        # umbrella groups, it is not a new hop).
+        _, b_anchor, b_chain, _ = bnode.id
+        self.assertEqual(b_umbrella.id, ('refs', b_anchor, b_chain))
         back = self.r.get_children(b_umbrella.id)
         self.assertEqual(len(back), 1)
         self.assertEqual(back[0].title, 'A.md')
@@ -3954,10 +4002,10 @@ class TestMdRefFollowing(unittest.TestCase):
         # And B shows up again under this A's umbrella — the cycle just keeps
         # materialising lazily, one drill at a time.
         self.assertEqual([k.title for k in self._refs(a_under_b.id)], ['B.md'])
-        # The chain id has grown by one segment each level.
-        _, abspaths, _ = self.r.md_doc.parse_md_id(a_under_b.id)
-        self.assertEqual(abspaths,
-                         [os.path.realpath(self.B), os.path.realpath(self.A)])
+        # The chain has grown by one segment each level.
+        _, _anchor, chain, _line = a_under_b.id
+        self.assertEqual(chain,
+                         (os.path.realpath(self.B), os.path.realpath(self.A)))
 
     def test_ref_file_heading_node_has_subheading_children(self):
         # A heading inside a referenced file expands to its sub-structure only
@@ -4002,7 +4050,7 @@ class TestMdRefFollowing(unittest.TestCase):
         # The References umbrella preview is a PLAIN list of the ref labels
         # (one per line, a count header) — NOT routed through md2ansi (no ANSI
         # even with the color toggle ON), and never the file documents' bodies.
-        umbrella = self._umbrella(self.r.get_children(self.A))
+        umbrella = self._umbrella(self.r.get_children(('file', self.A)))
         self.r._MD_COLOR = True   # would colorise a markdown preview
         out = self.r.get_preview(umbrella.id)
         self.assertNotIn('\x1b', out, 'umbrella preview must be plain text')
@@ -4013,10 +4061,10 @@ class TestMdRefFollowing(unittest.TestCase):
         self.assertNotIn('beta body', out)
 
     def test_umbrella_preview_empty_when_unreadable(self):
-        # A #refs id whose document is gone yields '' (no crash, no header).
-        refs_id = self.r.md_doc.refs_umbrella_id(
-            self.r.md_doc.compose_md_id(
-                self.A, [os.path.join(self.dir, 'gone.md')]))
+        # A ``('refs', …)`` id whose document is gone yields '' (no crash,
+        # no header).
+        refs_id = ('refs', ('file', self.A),
+                   (os.path.join(self.dir, 'gone.md'),))
         self.assertEqual(self.r.get_preview(refs_id), '')
 
     def test_preview_ref_document_node_is_full_text(self):
@@ -4039,8 +4087,8 @@ class TestMdRefFollowing(unittest.TestCase):
 
     def test_preview_unreadable_ref_doc_is_empty(self):
         # An id naming a non-existent file previews '' (no crash).
-        bad = self.r.md_doc.compose_md_id(
-            self.A, [os.path.join(self.dir, 'gone.md')])
+        bad = ('md', ('file', self.A),
+               (os.path.join(self.dir, 'gone.md'),), None)
         self.assertEqual(self.r.get_preview(bad), '')
 
     # --- has_children / heading-less file --------------------------------
@@ -4064,7 +4112,7 @@ class TestMdRefFollowing(unittest.TestCase):
         self.assertTrue(root.has_children)
         # Eager heading tree is empty; the only child is the lazy umbrella.
         self.assertEqual(root._children, [])
-        kids = self.r.get_children(H)
+        kids = self.r.get_children(('file', H))
         self.assertEqual([(k.tag, k.title) for k in kids], [('links', 'References')])
         refs = self.r.get_children(kids[0].id)
         self.assertEqual([(k.tag, k.title) for k in refs], [('md', 'B.md')])
@@ -4080,7 +4128,7 @@ class TestMdRefFollowing(unittest.TestCase):
         self.r.md_doc.clear_cache()
         self.r._reparse()
         self.assertFalse(self.r._FILES[P].file_root.has_children)
-        self.assertEqual(self.r.get_children(P), [])
+        self.assertEqual(self.r.get_children(('file', P)), [])
 
     # --- unchanged in-file behaviour -------------------------------------
 
@@ -4094,7 +4142,7 @@ class TestMdRefFollowing(unittest.TestCase):
         self.r._ROOT_PATH = K
         self.r.md_doc.clear_cache()
         self.r._reparse()
-        kids = self.r.get_children(K)
+        kids = self.r.get_children(('file', K))
         self.assertEqual([(k.tag, k.title) for k in kids],
                          [('h1', 'K1'), ('h1', 'K2')])
         k1 = kids[0]
