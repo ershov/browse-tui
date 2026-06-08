@@ -55,13 +55,13 @@ class TestListYieldingGenerator(unittest.TestCase):
 
 
 class TestSingleItemYieldingGenerator(unittest.TestCase):
-    """Each yield is a single Item / tuple / dict / str — coerced via to_item."""
+    """Each yield is a single Item / hashable / dict / str — coerced via to_item."""
 
     def test_single_yields_all_coerced(self):
         def kids(_pid, *, reload=False):
             yield Item(id='a', title='A')
-            yield ('b', 'B')
-            yield {'id': 'c', 'title': 'C'}
+            yield ('b', 'sub')                   # tuple → id verbatim
+            yield {'id': 'c', 'title': 'C'}      # dict → sets title
             yield 'd'
 
         b = make_browser(get_children=kids, root_id='/')
@@ -70,9 +70,10 @@ class TestSingleItemYieldingGenerator(unittest.TestCase):
             b.run_until_idle()
             cached = b._state._children['/']
             ids = [k.id for k in cached]
-            self.assertEqual(ids, ['a', 'b', 'c', 'd'])
+            # The tuple is the id (no positional title shorthand).
+            self.assertEqual(ids, ['a', ('b', 'sub'), 'c', 'd'])
             self.assertEqual(cached[0].title, 'A')
-            self.assertEqual(cached[1].title, 'B')   # 2-tuple
+            self.assertEqual(cached[1].title, str(('b', 'sub')))  # tuple id
             self.assertEqual(cached[2].title, 'C')   # dict
             self.assertEqual(cached[3].title, 'd')   # str default
         finally:
@@ -86,7 +87,7 @@ class TestMixedYields(unittest.TestCase):
         def kids(_pid, *, reload=False):
             yield Item(id='a')                       # single Item
             yield [Item(id='b'), Item(id='c')]       # batch
-            yield ('d', 'D')                         # single tuple
+            yield ('d', 'sub')                       # single tuple → id
             yield [{'id': 'e'}, 'f']                 # batch (dict + str)
 
         b = make_browser(get_children=kids, root_id='/')
@@ -94,7 +95,7 @@ class TestMixedYields(unittest.TestCase):
             b.refresh('/')
             b.run_until_idle()
             ids = [k.id for k in b._state._children['/']]
-            self.assertEqual(ids, ['a', 'b', 'c', 'd', 'e', 'f'])
+            self.assertEqual(ids, ['a', 'b', 'c', ('d', 'sub'), 'e', 'f'])
         finally:
             b.stop_workers()
 

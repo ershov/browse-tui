@@ -129,7 +129,7 @@ class TestItemExtras(unittest.TestCase):
 
 
 class TestToItemFromStr(unittest.TestCase):
-    """to_item with a str produces a leaf Item."""
+    """to_item with a str produces a leaf Item (str is a hashable id)."""
 
     def test_str_becomes_id_and_title(self):
         item = to_item('foo')
@@ -138,53 +138,58 @@ class TestToItemFromStr(unittest.TestCase):
         self.assertFalse(item.has_children)
 
 
-class TestToItemFromTuple(unittest.TestCase):
-    """to_item with a tuple uses positional dataclass-init order."""
+class TestToItemAnyHashable(unittest.TestCase):
+    """to_item with any non-Item, non-dict value takes it as the id.
 
-    def test_empty_tuple_raises(self):
-        # Empty tuples have no id; treated as an unsupported shape.
-        with self.assertRaises(TypeError):
-            to_item(())
+    New contract (spec 5.1): *any hashable is an id* — ``to_item(x)`` is
+    ``Item(id=x)`` for ``str``, ``int``, ``tuple``, ``frozenset``, a frozen
+    dataclass, etc. There is NO positional-tuple shorthand: a tuple is an
+    id, not ``(id, title, ...)``.
+    """
 
-    def test_single_element(self):
-        item = to_item(('x',))
-        self.assertEqual(item.id, 'x')
-        self.assertEqual(item.title, 'x')
+    def test_int_becomes_id(self):
+        item = to_item(42)
+        self.assertEqual(item.id, 42)
+        self.assertEqual(item.title, '42')
+        self.assertFalse(item.has_children)
 
-    def test_two_elements(self):
-        item = to_item(('x', 'X'))
-        self.assertEqual(item.id, 'x')
-        self.assertEqual(item.title, 'X')
+    def test_none_becomes_id(self):
+        item = to_item(None)
+        self.assertIsNone(item.id)
 
-    def test_three_elements_with_tag(self):
-        item = to_item(('x', 'X', 'tag'))
-        self.assertEqual(item.id, 'x')
-        self.assertEqual(item.title, 'X')
-        self.assertEqual(item.tag, 'tag')
+    def test_tuple_is_the_id_not_positional_fields(self):
+        # Was the (id, title) shorthand; now the whole tuple IS the id.
+        item = to_item(('a', 'Apple'))
+        self.assertEqual(item.id, ('a', 'Apple'))
+        self.assertEqual(item.title, str(('a', 'Apple')))
+        self.assertEqual(item.tag, '')          # no positional spill-over
+        self.assertFalse(item.has_children)
 
-    def test_four_elements_with_tag_style(self):
-        item = to_item(('x', 'X', 'tag', 'green'))
-        self.assertEqual(item.tag, 'tag')
-        self.assertEqual(item.tag_style, 'green')
+    def test_tagged_tuple_id(self):
+        item = to_item(('msg', '/p.jsonl', 7))
+        self.assertEqual(item.id, ('msg', '/p.jsonl', 7))
 
-    def test_five_elements_with_has_children(self):
-        item = to_item(('x', 'X', 'tag', 'green', True))
-        self.assertEqual(item.id, 'x')
-        self.assertEqual(item.title, 'X')
-        self.assertEqual(item.tag, 'tag')
-        self.assertEqual(item.tag_style, 'green')
-        self.assertTrue(item.has_children)
+    def test_empty_tuple_is_a_valid_id(self):
+        # An empty tuple is a perfectly good (hashable) id now.
+        item = to_item(())
+        self.assertEqual(item.id, ())
 
-    def test_six_elements_with_hidden(self):
-        item = to_item(('x', 'X', 'tag', 'green', True, True))
-        self.assertEqual(item.id, 'x')
-        self.assertTrue(item.has_children)
-        self.assertTrue(item.hidden)
+    def test_frozenset_id(self):
+        fs = frozenset({1, 2, 3})
+        item = to_item(fs)
+        self.assertEqual(item.id, fs)
 
-    def test_seven_or_more_elements_raises(self):
-        # 7+ elements have no field to land in; reject explicitly.
-        with self.assertRaises(TypeError):
-            to_item(('x', 'X', 'tag', 'green', True, False, 'extra'))
+    def test_frozen_dataclass_id(self):
+        from dataclasses import dataclass as _dc
+
+        @_dc(frozen=True)
+        class Key:
+            kind: str
+            n: int
+
+        k = Key('commit', 3)
+        item = to_item(k)
+        self.assertEqual(item.id, k)
 
 
 class TestToItemFromDict(unittest.TestCase):
@@ -228,25 +233,23 @@ class TestToItemFromDict(unittest.TestCase):
             to_item({'title': 'no id here'})
 
 
-class TestToItemUnsupported(unittest.TestCase):
-    """to_item raises TypeError for shapes outside the documented set."""
+class TestToItemUnhashableDeferred(unittest.TestCase):
+    """An unhashable id is NOT rejected by ``to_item`` (spec 5.1/5.2).
 
-    def test_int_raises(self):
-        with self.assertRaises(TypeError):
-            to_item(42)
+    ``to_item`` does not hash the id — it just wraps it. A ``list`` (that
+    is not a dict payload) becomes ``Item(id=<list>)``; the hashability
+    error is raised later, at the ``_index_set`` choke point, when the id
+    actually enters the index (covered in ``test_state_indexes.py``).
+    """
 
-    def test_none_raises(self):
-        with self.assertRaises(TypeError):
-            to_item(None)
+    def test_list_becomes_id_no_raise(self):
+        item = to_item(['x', 'y'])
+        self.assertEqual(item.id, ['x', 'y'])
 
-    def test_list_raises(self):
-        # Lists are NOT coerced — callers iterate and call to_item per element.
-        with self.assertRaises(TypeError):
-            to_item(['x', 'y'])
-
-    def test_set_raises(self):
-        with self.assertRaises(TypeError):
-            to_item({'x', 'y'})
+    def test_set_becomes_id_no_raise(self):
+        s = {'x', 'y'}
+        item = to_item(s)
+        self.assertEqual(item.id, s)
 
 
 class TestMixedListCoercion(unittest.TestCase):
@@ -256,8 +259,8 @@ class TestMixedListCoercion(unittest.TestCase):
         raw = [
             Item(id='a'),
             'b',
-            ('c', 'C'),
-            ('d', 'D', 'tag'),
+            ('c', 'Apple'),          # the whole tuple is the id now
+            42,
             {'id': 'e', 'title': 'E', 'has_children': True},
         ]
         items = [to_item(x) for x in raw]
@@ -265,16 +268,15 @@ class TestMixedListCoercion(unittest.TestCase):
         # a — passthrough Item
         self.assertEqual(items[0].id, 'a')
         self.assertIs(items[0], raw[0])
-        # b — string
+        # b — string id
         self.assertEqual(items[1].id, 'b')
         self.assertEqual(items[1].title, 'b')
-        # c — 2-tuple
-        self.assertEqual(items[2].id, 'c')
-        self.assertEqual(items[2].title, 'C')
-        # d — 3-tuple
-        self.assertEqual(items[3].id, 'd')
-        self.assertEqual(items[3].title, 'D')
-        self.assertEqual(items[3].tag, 'tag')
+        # c — tuple id (NOT (id, title))
+        self.assertEqual(items[2].id, ('c', 'Apple'))
+        self.assertEqual(items[2].title, str(('c', 'Apple')))
+        # d — int id
+        self.assertEqual(items[3].id, 42)
+        self.assertEqual(items[3].title, '42')
         # e — dict
         self.assertEqual(items[4].id, 'e')
         self.assertEqual(items[4].title, 'E')

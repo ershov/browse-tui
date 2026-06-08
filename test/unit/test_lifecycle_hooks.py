@@ -312,6 +312,29 @@ class TestOnSelectionChange(unittest.TestCase):
         self.assertIn('selection boom', _err_log(b))
         self.assertIn('on_selection_change', _err_log(b))
 
+    def test_payload_is_in_selection_insertion_order(self):
+        # ``state.selected`` is an OrderedSet, so the emitted id list comes
+        # out in the order ids were selected — NOT sorted. Use ids whose
+        # selection order differs from their sorted order to pin it.
+        fired = []
+        b = Browser(BrowserConfig(_headless=True,
+                    on_selection_change=lambda ctx, ids: fired.append(ids)))
+        b.select(['c', 'a', 'b'], replace=True)
+        b.drain_main_queue()
+        self.assertEqual(fired, [['c', 'a', 'b']])
+
+    def test_incremental_adds_accumulate_in_order(self):
+        # Successive non-replace selects append in add-order; the final
+        # fire reflects the full insertion order (not sorted, no dupes).
+        fired = []
+        b = Browser(BrowserConfig(_headless=True,
+                    on_selection_change=lambda ctx, ids: fired.append(ids)))
+        b.select(['b'], replace=False)
+        b.select(['a'], replace=False)
+        b.select(['c'], replace=False)
+        b.drain_main_queue()
+        self.assertEqual(fired[-1], ['b', 'a', 'c'])
+
 
 class TestOnQuit(unittest.TestCase):
 

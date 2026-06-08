@@ -46,6 +46,7 @@ cache_invalidate_subtree = _state.cache_invalidate_subtree
 cache_invalidate_all = _state.cache_invalidate_all
 apply_ops = _state.apply_ops
 KEEP_PARENT = _state.KEEP_PARENT
+_index_set = _state._index_set
 
 
 class TestStateIndexDefaults(unittest.TestCase):
@@ -624,6 +625,42 @@ class TestEndToEndDispatchAndDelivery(unittest.TestCase):
             self.assertFalse(s._loading['P'])
         finally:
             b.stop_workers()
+
+
+class TestIndexSetHashability(unittest.TestCase):
+    """``_index_set`` raises a clear error on an unhashable id (spec 5.2).
+
+    The forward-index write is the single add-side choke point where a
+    recipe id is first hashed. A ``list`` / ``dict`` / ``set`` id must
+    surface a message that names the offender, not a bare
+    ``unhashable type`` from deep in framework internals.
+    """
+
+    def test_hashable_id_writes_through(self):
+        s = State()
+        it = Item(id=('msg', '/p.jsonl', 7))   # a structured (tuple) id
+        _index_set(s, it)
+        self.assertIs(s._items_by_id[('msg', '/p.jsonl', 7)], it)
+
+    def test_unhashable_list_id_raises_clear_error(self):
+        s = State()
+        it = Item(id=['not', 'hashable'])
+        with self.assertRaises(TypeError) as cm:
+            _index_set(s, it)
+        msg = str(cm.exception)
+        self.assertIn('Item.id must be hashable', msg)
+        self.assertIn("['not', 'hashable']", msg)   # names the value
+        self.assertIn('list', msg)                  # names the type
+
+    def test_unhashable_id_via_child_ingestion_raises(self):
+        # The recipe child-ingestion write goes through ``_index_set`` (via
+        # ``_index_add_children``), so a recipe that hands in an unhashable
+        # id gets the clear, offender-naming error at the write site.
+        s = State()
+        _index_add_children = _state._index_add_children
+        with self.assertRaises(TypeError) as cm:
+            _index_add_children(s, 'p', [Item(id=['bad'])])
+        self.assertIn('Item.id must be hashable', str(cm.exception))
 
 
 if __name__ == '__main__':

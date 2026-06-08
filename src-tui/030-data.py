@@ -157,9 +157,10 @@ class Item:
     # short id (e.g. a session GUID) but whose scope-header should
     # carry more context (full path, qualified name). ``None`` falls
     # back to ``title`` so the field is a pure opt-in for recipes that
-    # want the distinction. Placed after the cache fields so it stays
-    # out of positional-construction signatures (tuple → Item
-    # coercion); recipes set it by keyword or via attribute write.
+    # want the distinction. Placed after the cache fields to keep the
+    # field declaration order grouped (identity/data fields, then the
+    # derived cache slots, then this opt-in); recipes set it by keyword
+    # or via attribute write.
     scope_title: Any = None
     # Framework-owned provenance flag. ``True`` for Items fabricated by
     # ``visible_items`` as a stub when a scope-root id has no real Item
@@ -181,29 +182,24 @@ class Item:
 def to_item(x: Any) -> Item:
     """Coerce a flexible input shape into an ``Item``.
 
-    Accepted shapes:
+    *Any hashable is an id.* Accepted shapes:
       - ``Item`` — returned unchanged (identity).
-      - ``str`` — ``Item(id=x)`` (leaf; title defaults to the same string).
-      - ``tuple`` — positional dataclass init: 1-5 elements matching the
-        field order ``(id, title, tag, tag_style, has_children)``. Empty
-        tuples and tuples with 6+ elements raise ``TypeError``.
-      - ``dict`` — ``Item(**x)``. The dict must contain an ``'id'`` key;
-        extra keys land as arbitrary attributes on the resulting Item.
+      - ``dict`` — kwargs payload that must carry an ``'id'`` key. Known
+        dataclass fields become constructor args; any extra keys land as
+        arbitrary attributes on the resulting Item (``Item`` is non-slotted).
+      - anything else — taken as the id verbatim: ``Item(id=x)``. This
+        subsumes ``str``, ``int``, ``tuple``, ``frozenset``, a frozen
+        ``dataclass``, and every other hashable. There is no positional-
+        tuple shorthand: ``('a', 'Apple')`` is an id, not ``(id, title)``.
 
-    Anything else (including ``int``, ``None``, ``list``, ``set``) raises
-    ``TypeError``. Callers iterating over a heterogeneous source should
-    invoke ``to_item`` element-wise — ``to_item`` itself never iterates.
+    A genuinely unhashable id (``list``/``dict``-but-not-a-payload/``set``)
+    is *not* rejected here — the hash is taken (and a clear error raised)
+    only when the Item enters the id index, at ``_index_set``. Callers
+    iterating over a heterogeneous source invoke ``to_item`` element-wise;
+    ``to_item`` itself never iterates.
     """
     if isinstance(x, Item):
         return x
-    if isinstance(x, str):
-        return Item(id=x)
-    if isinstance(x, tuple):
-        if not 1 <= len(x) <= 6:
-            raise TypeError(
-                f'to_item: tuple must have 1-6 elements, got {len(x)}'
-            )
-        return Item(*x)
     if isinstance(x, dict):
         if 'id' not in x:
             raise TypeError("to_item: dict must contain 'id' key")
@@ -217,10 +213,7 @@ def to_item(x: Any) -> Item:
         for k, v in extras.items():
             setattr(item, k, v)
         return item
-    raise TypeError(
-        f'to_item: unsupported type {type(x).__name__}; '
-        f'expected Item, str, tuple, or dict'
-    )
+    return Item(id=x)
 
 
 def _split_path_row(row: Any):
