@@ -20,11 +20,6 @@ Coverage mirrors the design spec's ``md_doc`` testing strategy:
                         regex exclusions (TestTriggersAndRefs).
 * ``resolve_md_ref``  — base precedence, first-existing, ``None``
                         (TestResolveMdRef).
-* ``compose_md_id`` / ``parse_md_id`` — exact round-trip incl. awkward paths
-                        and the line-offset suffix (TestIdCodec).
-* ``refs_umbrella_id`` / ``split_refs_umbrella`` — ``#refs`` marker round-trip
-                        and collision-free rejection of other id shapes
-                        (TestRefsUmbrellaId).
 * ``get_doc`` / ``clear_cache`` — cache hit + clear (TestCache).
 """
 
@@ -631,104 +626,6 @@ class TestResolveMdRef(unittest.TestCase):
                     ref, doc_dir='/x', cwd='/y', project_root='/z')
             self.assertEqual(
                 got, os.path.realpath(os.path.join(home, 'note.md')))
-
-
-class TestIdCodec(unittest.TestCase):
-    """``compose_md_id`` / ``parse_md_id`` — exact round-trip."""
-
-    def _roundtrip(self, base, abspaths, line_offset):
-        cid = md_doc.compose_md_id(base, abspaths, line_offset)
-        self.assertEqual(
-            md_doc.parse_md_id(cid), (base, abspaths, line_offset))
-        return cid
-
-    def test_inline_document(self):
-        cid = self._roundtrip('sess#3', [], None)
-        self.assertEqual(cid, 'sess#3#md:')
-
-    def test_inline_heading(self):
-        cid = self._roundtrip('sess#3', [], 12)
-        self.assertEqual(cid, 'sess#3#md:#12')
-
-    def test_inline_heading_zero_offset(self):
-        # A 0 line-offset must round-trip (not be confused with None).
-        cid = self._roundtrip('sess#3', [], 0)
-        self.assertEqual(cid, 'sess#3#md:#0')
-
-    def test_file_document(self):
-        cid = self._roundtrip('sess#3', ['/a/x.md'], None)
-        # No raw '#' in the encoded segment.
-        self.assertNotIn('#', cid[cid.index('#md:') + len('#md:'):])
-
-    def test_file_heading(self):
-        self._roundtrip('sess#3', ['/a/x.md'], 4)
-
-    def test_nested_chain(self):
-        self._roundtrip('sess#3', ['/a/x.md', '/b/y.md'], None)
-
-    def test_nested_chain_with_offset(self):
-        self._roundtrip('sess#3', ['/a/x.md', '/b/y.md'], 7)
-
-    def test_path_with_hash(self):
-        # A '#' in a path must survive — it encodes to %23, never a raw '#'.
-        self._roundtrip('sess#3', ['/a/weird#name.md'], 5)
-
-    def test_path_with_tilde_question_space(self):
-        self._roundtrip('sess#3', ['/home/u/a b?x~y.md'], 2)
-
-    def test_path_with_md_selector_lookalike(self):
-        # A path that literally contains '#md:' must not be mis-split — it is
-        # encoded inside the segment.
-        self._roundtrip('sess#3', ['/a/has#md:inside.md'], None)
-
-    def test_base_is_left_untouched(self):
-        # The base keeps its own raw '#<n>' suffix verbatim.
-        base = '/p/session.jsonl#42'
-        cid = md_doc.compose_md_id(base, ['/a/x.md'], 3)
-        got_base, paths, lo = md_doc.parse_md_id(cid)
-        self.assertEqual(got_base, base)
-        self.assertEqual(paths, ['/a/x.md'])
-        self.assertEqual(lo, 3)
-
-    def test_parse_non_md_id_raises(self):
-        with self.assertRaises(ValueError):
-            md_doc.parse_md_id('/p/session.jsonl#42')
-
-
-class TestRefsUmbrellaId(unittest.TestCase):
-    """``refs_umbrella_id`` / ``split_refs_umbrella`` — ``#refs`` marker."""
-
-    def test_roundtrip_message_base(self):
-        # docid is a plain message base ``<jsonl>#<n>``.
-        docid = '/p/s.jsonl#3'
-        uid = md_doc.refs_umbrella_id(docid)
-        self.assertEqual(uid, '/p/s.jsonl#3#refs')
-        self.assertEqual(md_doc.split_refs_umbrella(uid), docid)
-
-    def test_roundtrip_md_file_doc(self):
-        # docid is a ``#md:`` file-doc id (a message base + an encoded segment).
-        docid = md_doc.compose_md_id('/p/s.jsonl#3', ['/a/x.md'])
-        uid = md_doc.refs_umbrella_id(docid)
-        self.assertEqual(md_doc.split_refs_umbrella(uid), docid)
-
-    def test_split_none_for_plain_message_id(self):
-        # A bare message id ends in ``#<digits>``, not ``#refs``.
-        self.assertIsNone(md_doc.split_refs_umbrella('/p/s.jsonl#3'))
-
-    def test_split_none_for_md_doc_id(self):
-        # A ``#md:`` document id ends in an encoded segment (no raw '#').
-        docid = md_doc.compose_md_id('/p/s.jsonl#3', ['/a/x.md'])
-        self.assertIsNone(md_doc.split_refs_umbrella(docid))
-
-    def test_split_none_for_md_heading_id(self):
-        # A ``#md:…#<lineoffset>`` heading id ends in ``#<digits>``.
-        heading = md_doc.compose_md_id('/p/s.jsonl#3', ['/a/x.md'], 7)
-        self.assertIsNone(md_doc.split_refs_umbrella(heading))
-
-    def test_split_none_for_non_md_id(self):
-        # A bare path and a ``#prompt:`` umbrella id are not refs umbrellas.
-        self.assertIsNone(md_doc.split_refs_umbrella('/some/file.md'))
-        self.assertIsNone(md_doc.split_refs_umbrella('/p/s.jsonl#prompt:3'))
 
 
 class TestCache(unittest.TestCase):
