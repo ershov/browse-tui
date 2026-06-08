@@ -436,6 +436,16 @@ class TestTriggersAndRefs(unittest.TestCase):
         self.assertFalse(md_doc.md_heading_trigger('a # mid-line hash'))
         self.assertFalse(md_doc.md_heading_trigger(''))
 
+    def test_trigger_requires_space_after_hash(self):
+        # The space after '#' is mandatory, matching the authoritative grammar
+        # (_MD_H1.._MD_H6 require [ \t]+): '#foo' is NOT a heading, '# foo' is.
+        self.assertFalse(md_doc.md_heading_trigger('#foo'))
+        self.assertFalse(md_doc.md_heading_trigger('intro\n##bar\n'))
+        self.assertFalse(md_doc.md_heading_trigger('###'))
+        self.assertTrue(md_doc.md_heading_trigger('# foo'))
+        self.assertTrue(md_doc.md_heading_trigger('intro\n## bar\n'))
+        self.assertTrue(md_doc.md_heading_trigger('#\tfoo'))
+
     def test_refs_basic_and_order(self):
         text = 'wrote docs/report.md then read NOTES.md'
         self.assertEqual(md_doc.find_md_refs(text), ['docs/report.md', 'NOTES.md'])

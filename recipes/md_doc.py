@@ -438,12 +438,15 @@ def node_at_line(tree, line_offset):
 # is kept so ``.mdx`` and a trailing ``.`` are still excluded.
 _MD_REF_RE = re.compile(r'(?<![^\s"`\\$*()\[\]<>])[^\s"`\\$*()\[\]<>]+\.(?:md|MD)\b')
 
-# Cheap heading-detection gate: a ``#`` at the start of a line (after optional
-# indent). Pure regex — NO ``md2ansi_scan`` — so it is fast enough to run on
-# every item at delivery time. It is intentionally *optimistic*: it also fires
-# on a ``#`` that lives only inside a fenced code block, which the authoritative
-# ``build_doc_tree`` later rejects (the recipe self-heals the stale arrow).
-_MD_HEADING_TRIGGER_RE = re.compile(r'(?:^|\n)[ \t]*#')
+# Cheap heading-detection gate: a run of ``#`` at the start of a line (after
+# optional indent) FOLLOWED by a mandatory space/tab — matching the authoritative
+# grammar (``_MD_H1``..``_MD_H6`` all require ``[ \t]+``), so ``#foo`` is not a
+# heading but ``# foo`` is. Pure regex — NO ``md2ansi_scan`` — so it is fast
+# enough to run on every item at delivery time. It is intentionally *optimistic*:
+# it also fires on a ``#`` that lives only inside a fenced code block, which the
+# authoritative ``build_doc_tree`` later rejects (the recipe self-heals the stale
+# arrow).
+_MD_HEADING_TRIGGER_RE = re.compile(r'(?:^|\n)[ \t]*#+[ \t]')
 
 
 def find_md_refs(text):
