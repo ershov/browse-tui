@@ -156,7 +156,7 @@ class TestCursorTo(unittest.TestCase):
 
     def _browser_with_root_children(self, ids):
         # One-level cache: root_id -> [Item, Item, ...]; no nested children.
-        b = make_browser(get_children=lambda _id, *, reload=False: [(i,) for i in ids])
+        b = make_browser(get_children=lambda _id, *, reload=False: list(ids))
         b.refresh()  # populate root
         b.run_until_idle()
         return b
@@ -205,7 +205,7 @@ class TestExpand(unittest.TestCase):
         seen = []
         def gc(id_, *, reload=False):
             seen.append(id_)
-            return [(f'{id_}/x',)]
+            return [f'{id_}/x']
         b = make_browser(get_children=gc)
         try:
             p = b.expand('A')
@@ -419,7 +419,7 @@ class TestFromFlatTree(unittest.TestCase):
         rows = [
             Item(id='x', has_children=True),  # Item
             {'id': 'y', 'parent': 'x'},        # dict
-            ('z', 'Title z', '', '', False),   # tuple (5-arg full)
+            'z',                               # bare scalar → id
         ]
         b = Browser.from_flat_tree(rows, _headless=True)
         try:
@@ -479,7 +479,7 @@ class TestThreadSafeOps(unittest.TestCase):
         seen = []
         def gc(id_, *, reload=False):
             seen.append(id_)
-            return [(f'{id_}/c',)]
+            return [f'{id_}/c']
         b = make_browser(get_children=gc)
         try:
             def submit():
@@ -493,7 +493,7 @@ class TestThreadSafeOps(unittest.TestCase):
             b.stop_workers()
 
     def test_cursor_to_from_background_thread(self):
-        b = make_browser(get_children=lambda _id, *, reload=False: [('A',), ('B',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: ['A', 'B'])
         try:
             b.refresh()
             b.run_until_idle()
@@ -548,7 +548,7 @@ class TestCursorAnchor(unittest.TestCase):
     def test_anchor_seeded_from_initial_cursor(self):
         # After the first apply_children_results, the anchor should be
         # primed with the cursor's row id (lazy init).
-        b = make_browser(get_children=lambda _id, *, reload=False: [('A',), ('B',), ('C',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: ['A', 'B', 'C'])
         try:
             b.refresh()
             b.run_until_idle()
@@ -563,7 +563,7 @@ class TestCursorAnchor(unittest.TestCase):
         # Cursor on 'B' (idx 1). update_data inserts a new row above it.
         # Without the anchor, cursor would stay at idx 1 (now 'NEW').
         # With the anchor, cursor follows 'B' to its new idx.
-        b = make_browser(get_children=lambda _id, *, reload=False: [('A',), ('B',), ('C',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: ['A', 'B', 'C'])
         try:
             b.refresh()
             b.run_until_idle()
@@ -590,7 +590,7 @@ class TestCursorAnchor(unittest.TestCase):
             b.stop_workers()
 
     def test_anchor_falls_back_to_next_sibling_when_primary_removed(self):
-        b = make_browser(get_children=lambda _id, *, reload=False: [('A',), ('B',), ('C',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: ['A', 'B', 'C'])
         try:
             b.refresh()
             b.run_until_idle()
@@ -613,7 +613,7 @@ class TestCursorAnchor(unittest.TestCase):
             b.stop_workers()
 
     def test_anchor_falls_back_to_prev_sibling_when_last_item(self):
-        b = make_browser(get_children=lambda _id, *, reload=False: [('A',), ('B',), ('C',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: ['A', 'B', 'C'])
         try:
             b.refresh()
             b.run_until_idle()
@@ -631,8 +631,8 @@ class TestCursorAnchor(unittest.TestCase):
         # Root has A; A has A1, A2, A3. Cursor on A2. Remove all of A's
         # children. Cursor should fall back to A (parent).
         gc = self._children_pair(
-            [('A', None, None, '', True)],
-            {'A': [('A1',), ('A2',), ('A3',)]},
+            [{'id': 'A', 'has_children': True}],
+            {'A': ['A1', 'A2', 'A3']},
         )
         b = make_browser(get_children=gc)
         try:
@@ -665,9 +665,9 @@ class TestCursorAnchor(unittest.TestCase):
         # the cursor falls all the way up when intermediates are
         # missing, then promotes back down as layers arrive.
         gc = self._children_pair(
-            [('A', None, None, '', True)],
-            {'A':     [('A.A', None, None, '', True)],
-             'A.A':   [('A.A.A',)]},
+            [{'id': 'A', 'has_children': True}],
+            {'A':     [{'id': 'A.A', 'has_children': True}],
+             'A.A':   ['A.A.A']},
         )
         b = make_browser(get_children=gc)
         try:
@@ -710,7 +710,7 @@ class TestCursorAnchor(unittest.TestCase):
         # When the primary lands, the snapshot is refreshed — capturing
         # the *current* neighbours. Later if primary is removed again,
         # the fallback uses fresh neighbours, not stale ones.
-        b = make_browser(get_children=lambda _id, *, reload=False: [('A',), ('B',), ('C',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: ['A', 'B', 'C'])
         try:
             b.refresh()
             b.run_until_idle()
@@ -739,7 +739,7 @@ class TestCursorAnchor(unittest.TestCase):
             b.stop_workers()
 
     def test_anchor_returns_to_primary_when_it_reappears(self):
-        b = make_browser(get_children=lambda _id, *, reload=False: [('A',), ('B',), ('C',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: ['A', 'B', 'C'])
         try:
             b.refresh()
             b.run_until_idle()
@@ -770,7 +770,7 @@ class TestCursorAnchor(unittest.TestCase):
         # The classic "Ctrl-R while parked on item C": the cursor must
         # be back on C once the refresh completes, regardless of how
         # long the worker took.
-        items = [('A',), ('B',), ('C',), ('D',), ('E',)]
+        items = ['A', 'B', 'C', 'D', 'E']
         def gc(_id, *, reload=False):
             # Tiny sleep simulates a slow recipe — long enough that the
             # cache invalidation between refresh start and worker
@@ -812,10 +812,10 @@ class TestCursorAnchor(unittest.TestCase):
         # By the time the refresh fully completes, the cursor must be
         # back on A.A.A (primary hit re-snapshots the chain).
         sub = {
-            'A':   [('A.A', None, None, '', True)],
-            'A.A': [('A.A.A',)],
+            'A':   [{'id': 'A.A', 'has_children': True}],
+            'A.A': ['A.A.A'],
         }
-        root = [('A', None, None, '', True)]
+        root = [{'id': 'A', 'has_children': True}]
 
         def gc(parent_id, *, reload=False):
             time.sleep(0.01)   # widen the loading window per level
@@ -863,9 +863,9 @@ class TestCursorAnchor(unittest.TestCase):
             time.sleep(0.02)
             if delivery['first']:
                 delivery['first'] = False
-                return [('A',), ('B',), ('C',), ('D',), ('E',)]
+                return ['A', 'B', 'C', 'D', 'E']
             # Second call (the refresh): C is gone.
-            return [('A',), ('B',), ('D',), ('E',)]
+            return ['A', 'B', 'D', 'E']
         b = make_browser(get_children=gc)
         try:
             b.refresh()
@@ -891,8 +891,8 @@ class TestCursorAnchor(unittest.TestCase):
         # rather than 'scope_root') — the cursor must anchor to it so
         # background mutations don't drift it.
         gc = self._children_pair(
-            [('P', None, None, '', True)],
-            {'P': [('X',), ('Y',)]},
+            [{'id': 'P', 'has_children': True}],
+            {'P': ['X', 'Y']},
         )
         b = make_browser(get_children=gc, initial_scope='P')
         try:
@@ -924,7 +924,7 @@ class TestCursorAnchor(unittest.TestCase):
     def test_anchor_clamps_to_index_when_entire_chain_missing(self):
         # When primary AND every fallback id is gone, the cursor falls
         # back to the index clamp (existing behavior).
-        b = make_browser(get_children=lambda _id, *, reload=False: [('A',), ('B',), ('C',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: ['A', 'B', 'C'])
         try:
             b.refresh()
             b.run_until_idle()
@@ -981,8 +981,8 @@ class TestExpandGoal(unittest.TestCase):
         # expanding P would leave P.1..P.4 below the bottom of the
         # 5-row pane (idx 5..8 visible).
         gc = self._tree({
-            None: [('P', None, None, '', True)] + [(f'X{i}',) for i in range(20)],
-            'P':  [(f'P.{i}',) for i in range(1, 5)],
+            None: [{'id': 'P', 'has_children': True}] + [f'X{i}' for i in range(20)],
+            'P':  [f'P.{i}' for i in range(1, 5)],
         })
         b = make_browser(get_children=gc)
         self._pin_height(b, 5)
@@ -1015,11 +1015,11 @@ class TestExpandGoal(unittest.TestCase):
         # height = 5. P has 3 children. After expand, subtree occupies
         # idx 5..8. Pane currently shows idx 0..4. Goal must scroll
         # down to put idx 8 at the bottom → scroll = 4.
-        rows = [('R0',), ('R1',), ('R2',), ('R3',), ('R4',),
-                ('P', None, None, '', True), ('Z',)]
+        rows = ['R0', 'R1', 'R2', 'R3', 'R4',
+                {'id': 'P', 'has_children': True}, 'Z']
         gc = self._tree({
             None: rows,
-            'P':  [(f'P.{i}',) for i in range(3)],
+            'P':  [f'P.{i}' for i in range(3)],
         })
         b = make_browser(get_children=gc)
         self._pin_height(b, 5)
@@ -1050,11 +1050,11 @@ class TestExpandGoal(unittest.TestCase):
         # 30-item list. P at idx 5. User scrolled past it (scroll=15)
         # so P is above the viewport. Programmatically expanding P
         # with autoscroll=True should scroll UP to bring P into view.
-        rows = [('R0',), ('R1',), ('R2',), ('R3',), ('R4',),
-                ('P', None, None, '', True)] + [(f'Z{i}',) for i in range(24)]
+        rows = ['R0', 'R1', 'R2', 'R3', 'R4',
+                {'id': 'P', 'has_children': True}] + [f'Z{i}' for i in range(24)]
         gc = self._tree({
             None: rows,
-            'P':  [(f'P.{i}',) for i in range(3)],
+            'P':  [f'P.{i}' for i in range(3)],
         })
         b = make_browser(get_children=gc)
         self._pin_height(b, 5)
@@ -1081,8 +1081,8 @@ class TestExpandGoal(unittest.TestCase):
         # P at idx 0, subtree of 3 children. Pane is 10 tall — the
         # whole thing already fits without scrolling.
         gc = self._tree({
-            None: [('P', None, None, '', True), ('Z',)],
-            'P':  [('P1',), ('P2',), ('P3',)],
+            None: [{'id': 'P', 'has_children': True}, 'Z'],
+            'P':  ['P1', 'P2', 'P3'],
         })
         b = make_browser(get_children=gc)
         self._pin_height(b, 10)
@@ -1106,8 +1106,8 @@ class TestExpandGoal(unittest.TestCase):
         # P has 20 children, pane height = 5. Subtree doesn't fit
         # below the parent → scroll-cap: parent at top, goal cleared.
         gc = self._tree({
-            None: [('P', None, None, '', True)],
-            'P':  [(f'P.{i}',) for i in range(20)],
+            None: [{'id': 'P', 'has_children': True}],
+            'P':  [f'P.{i}' for i in range(20)],
         })
         b = make_browser(get_children=gc)
         self._pin_height(b, 5)
@@ -1135,9 +1135,9 @@ class TestExpandGoal(unittest.TestCase):
         # [P, pending]; goal scrolls to put pending at bottom. As
         # delivery lands, goal re-applies and scrolls further to fit
         # the actual children.
-        children = [(f'P.{i}',) for i in range(3)]
-        rows = [('R0',), ('R1',), ('R2',), ('R3',), ('R4',),
-                ('P', None, None, '', True)]
+        children = [f'P.{i}' for i in range(3)]
+        rows = ['R0', 'R1', 'R2', 'R3', 'R4',
+                {'id': 'P', 'has_children': True}]
         delivered = {'first': True}
         def gc(parent_id, *, reload=False):
             if parent_id in ('', None):
@@ -1170,11 +1170,11 @@ class TestExpandGoal(unittest.TestCase):
     def test_programmatic_expand_default_autoscroll_false_no_scroll(self):
         # Browser.expand(id) without autoscroll=True must NOT scroll —
         # recipes doing bulk setup should not surprise the user.
-        rows = [('R0',), ('R1',), ('R2',), ('R3',), ('R4',),
-                ('P', None, None, '', True)]
+        rows = ['R0', 'R1', 'R2', 'R3', 'R4',
+                {'id': 'P', 'has_children': True}]
         gc = self._tree({
             None: rows,
-            'P':  [(f'P.{i}',) for i in range(3)],
+            'P':  [f'P.{i}' for i in range(3)],
         })
         b = make_browser(get_children=gc)
         self._pin_height(b, 5)
@@ -1204,9 +1204,9 @@ class TestExpandGoal(unittest.TestCase):
         #     - _expand_goal cleared (subtree fully loaded)
         #     - _list_scroll moved further to fit the last child
         delivery_gate = threading.Event()
-        children = [(f'P.{i}',) for i in range(3)]
-        rows = [('R0',), ('R1',), ('R2',), ('R3',), ('R4',),
-                ('P', None, None, '', True)]
+        children = [f'P.{i}' for i in range(3)]
+        rows = ['R0', 'R1', 'R2', 'R3', 'R4',
+                {'id': 'P', 'has_children': True}]
         def gc(parent_id, *, reload=False):
             if parent_id in ('', None):
                 return rows
@@ -1260,10 +1260,10 @@ class TestExpandGoal(unittest.TestCase):
     def test_user_cursor_move_clears_parked_goal(self):
         # Goal parked on a slow-loading subtree → user presses 'j'
         # mid-load → goal cleared, subsequent delivery doesn't snap.
-        children = [(f'P.{i}',) for i in range(3)]
+        children = [f'P.{i}' for i in range(3)]
         delivery_gate = threading.Event()
-        rows = [('R0',), ('R1',), ('R2',), ('R3',), ('R4',),
-                ('P', None, None, '', True)]
+        rows = ['R0', 'R1', 'R2', 'R3', 'R4',
+                {'id': 'P', 'has_children': True}]
         def gc(parent_id, *, reload=False):
             if parent_id in ('', None):
                 return rows
@@ -1330,8 +1330,8 @@ class TestExpandGoal(unittest.TestCase):
         # An already-expanded id, re-expanded with autoscroll=True, is
         # a no-op for the goal: nothing new is being revealed.
         gc = self._tree({
-            None: [('P', None, None, '', True)],
-            'P':  [(f'P.{i}',) for i in range(3)],
+            None: [{'id': 'P', 'has_children': True}],
+            'P':  [f'P.{i}' for i in range(3)],
         })
         b = make_browser(get_children=gc)
         self._pin_height(b, 5)
@@ -1364,7 +1364,7 @@ class TestHideDisplacement(unittest.TestCase):
 
     def test_cursor_on_hidden_row_walks_back(self):
         b = make_browser(get_children=lambda _id, *, reload=False: [
-            ('A',), ('B',), ('C',), ('D',),
+            'A', 'B', 'C', 'D',
         ])
         try:
             b.refresh()
@@ -1385,7 +1385,7 @@ class TestHideDisplacement(unittest.TestCase):
 
     def test_cursor_lands_on_first_when_all_above_hidden(self):
         b = make_browser(get_children=lambda _id, *, reload=False: [
-            ('A',), ('B',), ('C',),
+            'A', 'B', 'C',
         ])
         try:
             b.refresh()
@@ -1408,7 +1408,7 @@ class TestHideDisplacement(unittest.TestCase):
 
     def test_cursor_on_first_row_hidden_lands_on_new_first(self):
         b = make_browser(get_children=lambda _id, *, reload=False: [
-            ('A',), ('B',), ('C',),
+            'A', 'B', 'C',
         ])
         try:
             b.refresh()
@@ -1426,7 +1426,7 @@ class TestHideDisplacement(unittest.TestCase):
 
     def test_unrelated_hide_does_not_move_cursor(self):
         b = make_browser(get_children=lambda _id, *, reload=False: [
-            ('A',), ('B',), ('C',),
+            'A', 'B', 'C',
         ])
         try:
             b.refresh()
@@ -1445,13 +1445,13 @@ class TestHideDisplacement(unittest.TestCase):
             b.stop_workers()
 
     def test_hidden_ancestor_displaces_cursor_on_descendant(self):
-        gc_root = [('P', None, None, '', True), ('X',)]
+        gc_root = [{'id': 'P', 'has_children': True}, 'X']
 
         def gc(parent_id, *, reload=False):
             if parent_id in (None, ''):
                 return gc_root
             if parent_id == 'P':
-                return [('P1',), ('P2',)]
+                return ['P1', 'P2']
             return []
 
         b = make_browser(get_children=gc)
@@ -1478,7 +1478,7 @@ class TestHideDisplacement(unittest.TestCase):
         # If the cursor's id is *removed* (not hidden), the anchor's
         # fallback chain (next-sibling-first) handles it.
         b = make_browser(get_children=lambda _id, *, reload=False: [
-            ('A',), ('B',), ('C',), ('D',),
+            'A', 'B', 'C', 'D',
         ])
         try:
             b.refresh()
@@ -1499,7 +1499,7 @@ class TestHideDisplacement(unittest.TestCase):
         # After hide-displacement the new cursor row id becomes the
         # primary anchor.
         b = make_browser(get_children=lambda _id, *, reload=False: [
-            ('A',), ('B',), ('C',),
+            'A', 'B', 'C',
         ])
         try:
             b.refresh()
@@ -1516,7 +1516,7 @@ class TestHideDisplacement(unittest.TestCase):
 
     def test_hide_then_show_in_same_batch_no_net_movement(self):
         b = make_browser(get_children=lambda _id, *, reload=False: [
-            ('A',), ('B',), ('C',),
+            'A', 'B', 'C',
         ])
         try:
             b.refresh()
@@ -1559,7 +1559,7 @@ class TestCursorPin(unittest.TestCase):
         self.assertEqual(repr(_state.PIN_LAST), '<PIN_LAST>')
 
     def test_nav_home_sets_pin_first(self):
-        b = make_browser(get_children=lambda _id, *, reload=False: [('A',), ('B',), ('C',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: ['A', 'B', 'C'])
         try:
             b.refresh()
             b.run_until_idle()
@@ -1575,7 +1575,7 @@ class TestCursorPin(unittest.TestCase):
             b.stop_workers()
 
     def test_nav_end_sets_pin_last(self):
-        b = make_browser(get_children=lambda _id, *, reload=False: [('A',), ('B',), ('C',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: ['A', 'B', 'C'])
         try:
             b.refresh()
             b.run_until_idle()
@@ -1587,7 +1587,7 @@ class TestCursorPin(unittest.TestCase):
             b.stop_workers()
 
     def test_pin_first_follows_new_first_row(self):
-        b = make_browser(get_children=lambda _id, *, reload=False: [('B',), ('C',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: ['B', 'C'])
         try:
             b.refresh()
             b.run_until_idle()
@@ -1611,7 +1611,7 @@ class TestCursorPin(unittest.TestCase):
             b.stop_workers()
 
     def test_pin_last_follows_new_last_row(self):
-        b = make_browser(get_children=lambda _id, *, reload=False: [('A',), ('B',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: ['A', 'B'])
         try:
             b.refresh()
             b.run_until_idle()
@@ -1630,7 +1630,7 @@ class TestCursorPin(unittest.TestCase):
             b.stop_workers()
 
     def test_pin_last_follows_when_last_row_hidden(self):
-        b = make_browser(get_children=lambda _id, *, reload=False: [('A',), ('B',), ('C',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: ['A', 'B', 'C'])
         try:
             b.refresh()
             b.run_until_idle()
@@ -1650,7 +1650,7 @@ class TestCursorPin(unittest.TestCase):
     def test_pin_first_clears_on_j(self):
         # Pressing 'j' (cursor down) should clear PIN_FIRST and
         # capture an id-based anchor.
-        b = make_browser(get_children=lambda _id, *, reload=False: [('A',), ('B',), ('C',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: ['A', 'B', 'C'])
         try:
             b.refresh()
             b.run_until_idle()
@@ -1684,7 +1684,7 @@ class TestCursorPin(unittest.TestCase):
             b.stop_workers()
 
     def test_pin_first_swapped_by_pin_last(self):
-        b = make_browser(get_children=lambda _id, *, reload=False: [('A',), ('B',), ('C',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: ['A', 'B', 'C'])
         try:
             b.refresh()
             b.run_until_idle()
@@ -1699,7 +1699,7 @@ class TestCursorPin(unittest.TestCase):
             b.stop_workers()
 
     def test_pin_clears_on_cursor_to(self):
-        b = make_browser(get_children=lambda _id, *, reload=False: [('A',), ('B',), ('C',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: ['A', 'B', 'C'])
         try:
             b.refresh()
             b.run_until_idle()
@@ -1731,7 +1731,7 @@ class TestCursorPin(unittest.TestCase):
 
     def test_pin_first_with_hidden_first_row(self):
         # PIN_FIRST with the original first row hidden → cursor on new first.
-        b = make_browser(get_children=lambda _id, *, reload=False: [('A',), ('B',), ('C',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: ['A', 'B', 'C'])
         try:
             b.refresh()
             b.run_until_idle()
@@ -1748,7 +1748,7 @@ class TestCursorPin(unittest.TestCase):
 
     def test_action_layer_g_sets_pin(self):
         # `g` and `home` keybinds engage PIN_FIRST via _nav_home.
-        b = make_browser(get_children=lambda _id, *, reload=False: [('A',), ('B',), ('C',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: ['A', 'B', 'C'])
         try:
             b.refresh()
             b.run_until_idle()
@@ -1801,9 +1801,9 @@ class TestMetaLandability(unittest.TestCase):
         # it must skip past it onto B instead.
         def gc(parent_id, *, reload=False):
             return [
-                ('A',),
+                'A',
                 {'id': 'sep', 'title': '-- sep --', 'meta': True},
-                ('B',),
+                'B',
             ]
         b = make_browser(get_children=gc)
         try:
@@ -1831,9 +1831,9 @@ class TestMetaLandability(unittest.TestCase):
         # meta, so landability must skip it onto A.
         def gc(parent_id, *, reload=False):
             return [
-                ('A',),
+                'A',
                 {'id': 'sep', 'title': '-- sep --', 'meta': True},
-                ('B',),
+                'B',
             ]
         b = make_browser(get_children=gc)
         try:
@@ -1858,7 +1858,7 @@ class TestMetaLandability(unittest.TestCase):
         # cursor index 2 now points past the end; the clamp pulls it back
         # to the last row (sep, meta) and landability snaps up to A.
         state = {'rows': [
-            ('A',), ('B',), ('C',),
+            'A', 'B', 'C',
             {'id': 'sep', 'title': '-- sep --', 'meta': True},
         ]}
 
@@ -1874,7 +1874,7 @@ class TestMetaLandability(unittest.TestCase):
             self.assertEqual(b._state.cursor, 2)
             # Shrink and reload via the children worker.
             state['rows'] = [
-                ('A',),
+                'A',
                 {'id': 'sep', 'title': '-- sep --', 'meta': True},
             ]
             b.refresh()
@@ -1895,7 +1895,7 @@ class TestMetaLandability(unittest.TestCase):
         # cursor_to), so it must snap to the nearest landable row — the
         # primary-id-mismatch test distinguishes it from cursor_to(meta).
         def gc(parent_id, *, reload=False):
-            return [('A',), ('X',), ('B',)]
+            return ['A', 'X', 'B']
         b = make_browser(get_children=gc)
         try:
             b.refresh()
@@ -1928,8 +1928,8 @@ class TestMetaLandability(unittest.TestCase):
         def gc(parent_id, *, reload=False):
             return [
                 {'id': 'sep', 'title': '-- sep --', 'meta': True},
-                ('A',),
-                ('B',),
+                'A',
+                'B',
             ]
         b = make_browser(get_children=gc)
         try:
@@ -1954,8 +1954,8 @@ class TestMetaLandability(unittest.TestCase):
         # on the last *landable* row (B, row 1), not the meta at row 2.
         def gc(parent_id, *, reload=False):
             return [
-                ('A',),
-                ('B',),
+                'A',
+                'B',
                 {'id': 'sep', 'title': '-- sep --', 'meta': True},
             ]
         b = make_browser(get_children=gc)
@@ -1978,8 +1978,8 @@ class TestMetaLandability(unittest.TestCase):
         def gc(parent_id, *, reload=False):
             return [
                 {'id': 'sep', 'title': '-- sep --', 'meta': True},
-                ('A',),
-                ('B',),
+                'A',
+                'B',
             ]
         b = make_browser(get_children=gc)
         try:
@@ -2004,9 +2004,9 @@ class TestMetaLandability(unittest.TestCase):
         # routing must NOT skip it off the meta row.
         def gc(parent_id, *, reload=False):
             return [
-                ('A',),
+                'A',
                 {'id': 'sep', 'title': '-- sep --', 'meta': True},
-                ('B',),
+                'B',
             ]
         b = make_browser(get_children=gc)
         try:
@@ -2070,7 +2070,7 @@ class TestMetaLandability(unittest.TestCase):
         # the list all-meta (the displacement path detects no landable).
         def gc(parent_id, *, reload=False):
             return [
-                ('A',),
+                'A',
                 {'id': 'sep', 'title': '-- sep --', 'meta': True},
             ]
         b = make_browser(get_children=gc, on_empty='exit')
@@ -2130,9 +2130,9 @@ class TestMetaLandability(unittest.TestCase):
 
         def gc(parent_id, *, reload=False):
             return [
-                ('A',),
+                'A',
                 {'id': 'sep', 'title': '-- sep --', 'meta': True},
-                ('B',),
+                'B',
             ]
         b = make_browser(
             get_children=gc,
@@ -2177,9 +2177,9 @@ class TestMetaScrollGeometry(unittest.TestCase):
         # 8 rows, a meta divider at index 3, pane height 3. End lands on
         # the last landable row (index 7); the scroll offset must put
         # that row on-screen counting the meta slot it scrolled past.
-        rows = [('A',), ('B',), ('C',)]
+        rows = ['A', 'B', 'C']
         rows.append({'id': 'sep', 'title': '-- sep --', 'meta': True})
-        rows += [('D',), ('E',), ('F',), ('G',)]
+        rows += ['D', 'E', 'F', 'G']
 
         def gc(parent_id, *, reload=False):
             return list(rows)
@@ -2216,7 +2216,7 @@ class TestMetaScrollGeometry(unittest.TestCase):
         # on-screen — the scroll offset must not strand it behind the
         # meta slot.
         rows = [{'id': 'sep', 'title': '-- sep --', 'meta': True}]
-        rows += [(c,) for c in 'ABCDEF']
+        rows += [c for c in 'ABCDEF']
 
         def gc(parent_id, *, reload=False):
             return list(rows)
@@ -2660,7 +2660,7 @@ class TestFilterAppliesToStreamedChildren(unittest.TestCase):
 
     def test_get_children_children_get_flagged(self):
         b = make_browser(get_children=lambda _id, *, reload=False: [
-            ('apple',), ('banana',), ('cherry',),
+            'apple', 'banana', 'cherry',
         ])
         try:
             b.refresh()
@@ -2683,7 +2683,7 @@ class TestFilterAppliesToStreamedChildren(unittest.TestCase):
 
         def get_children(parent_id, *, reload=False):
             events.append(parent_id)
-            return [('apple',), ('banana',), ('cherry',)]
+            return ['apple', 'banana', 'cherry']
 
         b = make_browser(get_children=get_children)
         try:
@@ -2707,7 +2707,7 @@ class TestFilterCursorDisplacement(unittest.TestCase):
 
     def test_cursor_displaces_when_row_hidden_by_filter(self):
         b = make_browser(get_children=lambda _id, *, reload=False: [
-            ('apple',), ('banana',), ('cherry',),
+            'apple', 'banana', 'cherry',
         ])
         try:
             b.refresh()
@@ -2729,7 +2729,7 @@ class TestPinSurvivesFilter(unittest.TestCase):
 
     def test_pin_first_clamps_to_filter_top(self):
         b = make_browser(get_children=lambda _id, *, reload=False: [
-            ('apple',), ('banana',), ('cherry',),
+            'apple', 'banana', 'cherry',
         ])
         try:
             b.refresh()
@@ -2749,7 +2749,7 @@ class TestPinSurvivesFilter(unittest.TestCase):
 
     def test_pin_last_clamps_to_filter_bottom(self):
         b = make_browser(get_children=lambda _id, *, reload=False: [
-            ('apple',), ('banana',), ('apricot',),
+            'apple', 'banana', 'apricot',
         ])
         try:
             b.refresh()
@@ -2774,7 +2774,7 @@ class TestSelectAllRespectsFilter(unittest.TestCase):
 
     def test_select_all_keeps_only_visible(self):
         b = make_browser(get_children=lambda _id, *, reload=False: [
-            ('apple',), ('banana',), ('cherry',),
+            'apple', 'banana', 'cherry',
         ])
         try:
             b.refresh()
@@ -2797,7 +2797,7 @@ class TestSearchWithinFilter(unittest.TestCase):
 
     def test_search_only_finds_filter_passing_rows(self):
         b = make_browser(get_children=lambda _id, *, reload=False: [
-            ('apple-a',), ('apple-b',), ('banana-a',),
+            'apple-a', 'apple-b', 'banana-a',
         ])
         try:
             b.refresh()
@@ -2821,7 +2821,7 @@ class TestFilterApi(unittest.TestCase):
     """``Browser.filters`` / ``set_filters`` / ``add_filter`` / ``clear_filters``."""
 
     def test_filters_property_excludes_empty_placeholder(self):
-        b = make_browser(get_children=lambda _id, *, reload=False: [('a',), ('b',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: ['a', 'b'])
         try:
             b.refresh()
             b.run_until_idle()
@@ -2837,7 +2837,7 @@ class TestFilterApi(unittest.TestCase):
             b.stop_workers()
 
     def test_set_filters_forces_normal_mode(self):
-        b = make_browser(get_children=lambda _id, *, reload=False: [('a',), ('b',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: ['a', 'b'])
         try:
             b.refresh()
             b.run_until_idle()
@@ -2851,7 +2851,7 @@ class TestFilterApi(unittest.TestCase):
             b.stop_workers()
 
     def test_add_filter_appends(self):
-        b = make_browser(get_children=lambda _id, *, reload=False: [('a',), ('b',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: ['a', 'b'])
         try:
             b.refresh()
             b.run_until_idle()
@@ -2864,7 +2864,7 @@ class TestFilterApi(unittest.TestCase):
             b.stop_workers()
 
     def test_clear_filters_drops_all(self):
-        b = make_browser(get_children=lambda _id, *, reload=False: [('a',), ('b',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: ['a', 'b'])
         try:
             b.refresh()
             b.run_until_idle()
@@ -2892,9 +2892,9 @@ class TestFilterRecomputeOnScopeChange(unittest.TestCase):
         # as ``_filter_hidden=True``.
         def get_children(parent_id, *, reload=False):
             if parent_id is None:
-                return [('X', None, {'title': 'X', 'has_children': True})]
+                return [{'id': 'X', 'title': 'X', 'has_children': True}]
             if parent_id == 'X':
-                return [('x1',), ('x2',)]
+                return ['x1', 'x2']
             return []
         b = make_browser(get_children=get_children)
         try:
@@ -2946,11 +2946,11 @@ class TestFilterRecomputeOnScopeChange(unittest.TestCase):
         #    the post-scope-change recompute exempts A.
         def get_children(parent_id, *, reload=False):
             if parent_id is None:
-                return [('A', None, {'title': 'A', 'has_children': True})]
+                return [{'id': 'A', 'title': 'A', 'has_children': True}]
             if parent_id == 'A':
-                return [('B', None, {'title': 'B', 'has_children': True})]
+                return [{'id': 'B', 'title': 'B', 'has_children': True}]
             if parent_id == 'B':
-                return [('b1',)]
+                return ['b1']
             return []
         b = make_browser(get_children=get_children)
         try:

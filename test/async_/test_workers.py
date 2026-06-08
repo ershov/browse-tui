@@ -81,7 +81,7 @@ class TestChildrenWorkerFifo(unittest.TestCase):
         calls = []
         def get_children(id_, *, reload=False):
             calls.append(id_)
-            return [(f'{id_}/a',), (f'{id_}/b',)]
+            return [f'{id_}/a', f'{id_}/b']
         b = make_browser(get_children=get_children)
         try:
             p = b.refresh('A')

@@ -28,6 +28,30 @@ _REPO = Path(__file__).resolve().parents[2]
 _RECIPE = _REPO / 'recipes' / 'browse-claude'
 
 
+# ---- markdown id helpers (mirror the recipe's inline tuple construction) ----
+#
+# The recipe builds markdown ids inline as ``('md', anchor, chain, line)`` and
+# References-umbrella ids as ``('refs', anchor, chain)`` (md_doc is codec-free).
+# These mirror that construction so the tests build the same ids the recipe
+# does without re-encoding any string codec.
+
+def _md_id(anchor, chain=(), line_offset=None):
+    """Build a markdown-node id ``('md', anchor, chain, line)``."""
+    return ('md', anchor, tuple(chain), line_offset)
+
+
+def _refs_id(doc):
+    """Build a References-umbrella id ``('refs', anchor, chain)`` for a document.
+
+    ``doc`` is either a message anchor ``('msg', jsonl, n)`` (message-level
+    umbrella → empty chain) or an ``('md', anchor, chain, line)`` file-doc id
+    (file-doc umbrella → that file's anchor + chain).
+    """
+    if isinstance(doc, tuple) and doc and doc[0] == 'md':
+        return ('refs', doc[1], doc[2])
+    return ('refs', doc, ())
+
+
 def _stub_browse_tui():
     """Insert a no-op ``browse_tui`` module so the recipe can import."""
     if 'browse_tui' in sys.modules:
@@ -1316,7 +1340,7 @@ class TestTreeChildrenPreview(unittest.TestCase):
             saved = self.r._TREE_MODE
             try:
                 self.r._TREE_MODE = True
-                out = ''.join(self.r._preview_umbrella(f'{path}#prompt:0'))
+                out = ''.join(self.r._preview_umbrella(('prompt', path, 0)))
                 self.assertIn('PROBE_USER_PROMPT', out)
                 self.assertIn('PROBE_ASST_REPLY', out)
                 # Leaf preview: just the user prompt body (no children).
@@ -1352,7 +1376,7 @@ class TestTreeChildrenPreview(unittest.TestCase):
             saved = self.r._TREE_MODE
             try:
                 self.r._TREE_MODE = True
-                out = ''.join(self.r._preview_umbrella(f'{path}#prompt:0'))
+                out = ''.join(self.r._preview_umbrella(('prompt', path, 0)))
                 self.assertIn('PROBE_PROMPT', out)
                 self.assertIn('PROBE_BASH_CMD', out)
                 # Grandchild (inside the nested <tool> umbrella) is
@@ -1383,7 +1407,7 @@ class TestTreeChildrenPreview(unittest.TestCase):
                 def _boom(_obj):
                     raise RuntimeError('PROBE_BOOM_MSG')
                 self.r._RENDERERS['user'] = _boom
-                out = ''.join(self.r._preview_umbrella(f'{path}#prompt:0'))
+                out = ''.join(self.r._preview_umbrella(('prompt', path, 0)))
                 # The failing child's error appears…
                 self.assertIn('RuntimeError', out)
                 self.assertIn('PROBE_BOOM_MSG', out)
@@ -1417,7 +1441,7 @@ class TestTreeChildrenPreview(unittest.TestCase):
             saved = self.r._TREE_MODE
             try:
                 self.r._TREE_MODE = True
-                out = ''.join(self.r._preview_umbrella(f'{path}#tool:1'))
+                out = ''.join(self.r._preview_umbrella(('tool', path, 1)))
                 self.assertIn('PROBE_BASH_CMD', out)
                 self.assertIn('PROBE_BASH_OUTPUT', out)
             finally:
@@ -1460,16 +1484,16 @@ class TestAncestorIdsForSubagent(unittest.TestCase):
                     ]},
                 }) + '\n')
             # u1 at line 0 is a turn root; a1 at line 1 is a child.
-            ancestors = self.r._ancestor_ids_for(f'{agent_path}#1')
+            ancestors = self.r._ancestor_ids_for(('msg', agent_path, 1))
             # First ancestor (root) should be the outer subagent group
             # in the parent session.
             self.assertTrue(ancestors,
                             'expected at least one ancestor')
             self.assertEqual(ancestors[0],
-                             f'{sess_path}#agent:AGENT01')
+                             ('agent', sess_path, 'AGENT01'))
             # Direct parent is now the ``<prompt>`` umbrella wrapping
             # the subagent's turn root, NOT the turn root leaf itself.
-            self.assertEqual(ancestors[-1], f'{agent_path}#prompt:0')
+            self.assertEqual(ancestors[-1], ('prompt', agent_path, 0))
         finally:
             import shutil
             shutil.rmtree(tmp, ignore_errors=True)
@@ -1490,10 +1514,10 @@ class TestAncestorIdsForSubagent(unittest.TestCase):
                         {'type': 'text', 'text': 'r'},
                     ]},
                 }) + '\n')
-            ancestors = self.r._ancestor_ids_for(f'{sess_path}#1')
+            ancestors = self.r._ancestor_ids_for(('msg', sess_path, 1))
             # Direct parent is the ``<prompt>`` umbrella; no outer
             # subagent group.
-            self.assertEqual(ancestors, [f'{sess_path}#prompt:0'])
+            self.assertEqual(ancestors, [('prompt', sess_path, 0)])
 
     def test_full_chain_crosses_file_boundary(self):
         # Parent session: u1 (turn root) → a1 (Task tool_use) → u2 (tool_result).
@@ -1547,17 +1571,17 @@ class TestAncestorIdsForSubagent(unittest.TestCase):
                     ]},
                 }) + '\n')
 
-            chain = self.r._ancestor_ids_for(f'{agent_path}#1')
+            chain = self.r._ancestor_ids_for(('msg', agent_path, 1))
             # Expect (root → leaf), all umbrella ids:
             #   parent's <prompt> umbrella (line 0, wraps u1)
             #   parent's <tool:Task> umbrella (line 1, wraps a1)
             #   subagent group #agent:AGENT01
             #   subagent's <prompt> umbrella (line 0, wraps su1)
             self.assertEqual(chain, [
-                f'{sess_path}#prompt:0',
-                f'{sess_path}#tool:1',
-                f'{sess_path}#agent:AGENT01',
-                f'{agent_path}#prompt:0',
+                ('prompt', sess_path, 0),
+                ('tool', sess_path, 1),
+                ('agent', sess_path, 'AGENT01'),
+                ('prompt', agent_path, 0),
             ])
         finally:
             import shutil
@@ -1576,7 +1600,7 @@ class TestAncestorIdsForSubagent(unittest.TestCase):
                 f.write('{}\n')
             self.assertEqual(
                 self.r._outer_subagent_group_id(agent_path),
-                f'{sess_path}#agent:ABC',
+                ('agent', sess_path, 'ABC'),
             )
             # Non-subagent paths return None.
             self.assertIsNone(self.r._outer_subagent_group_id(sess_path))
@@ -1619,7 +1643,7 @@ class TestAncestorIdsForSubagent(unittest.TestCase):
             try:
                 self.assertEqual(
                     self.r._outer_subagent_group_id(agent_path),
-                    f'{sess_path}#agent:AGENT01',
+                    ('agent', sess_path, 'AGENT01'),
                 )
                 # A subagent whose <sid> matches no session anywhere → None.
                 orphan_sub = os.path.join(
@@ -2058,7 +2082,7 @@ class TestScanTree(unittest.TestCase):
              ]}},
         ])
         try:
-            self.assertEqual(self.r._last_voice_id(path), f'{path}#3')
+            self.assertEqual(self.r._last_voice_id(path), ('msg', path, 3))
         finally:
             os.unlink(path)
 
@@ -2100,16 +2124,16 @@ class TestTreeListings(unittest.TestCase):
             self.assertEqual(len(roots), 3)
             # Preamble span umbrella.
             self.assertEqual(roots[0].kind, 'span')
-            self.assertEqual(roots[0].id, f'{path}#span:0')
+            self.assertEqual(roots[0].id, ('span', path, 0))
             # u1 prompt umbrella (line 1).
             self.assertEqual(roots[1].kind, 'prompt')
             self.assertEqual(roots[1].line_no, 1)
-            self.assertEqual(roots[1].id, f'{path}#prompt:1')
+            self.assertEqual(roots[1].id, ('prompt', path, 1))
             self.assertTrue(roots[1].title.startswith('<prompt>'))
             # u2 prompt umbrella (line 3).
             self.assertEqual(roots[2].kind, 'prompt')
             self.assertEqual(roots[2].line_no, 3)
-            self.assertEqual(roots[2].id, f'{path}#prompt:3')
+            self.assertEqual(roots[2].id, ('prompt', path, 3))
         finally:
             os.unlink(path)
 
@@ -2139,23 +2163,23 @@ class TestTreeListings(unittest.TestCase):
             prompt_kids = self.r._list_prompt_children(path, 0)
             # [u1 leaf @ line 0, <tool:1> umbrella, a2 leaf @ line 3].
             self.assertEqual(len(prompt_kids), 3)
-            self.assertEqual(prompt_kids[0].id, f'{path}#0')
+            self.assertEqual(prompt_kids[0].id, ('msg', path, 0))
             self.assertEqual(prompt_kids[0].kind, 'message')
-            self.assertEqual(prompt_kids[1].id, f'{path}#tool:1')
+            self.assertEqual(prompt_kids[1].id, ('tool', path, 1))
             self.assertEqual(prompt_kids[1].kind, 'tool')
-            self.assertEqual(prompt_kids[2].id, f'{path}#3')
+            self.assertEqual(prompt_kids[2].id, ('msg', path, 3))
             self.assertEqual(prompt_kids[2].kind, 'message')
             # <tool:1>'s children = [a1 leaf, u2 leaf].
             tool_kids = self.r._list_tool_children(path, 1)
             self.assertEqual([it.id for it in tool_kids],
-                             [f'{path}#1', f'{path}#2'])
+                             [('msg', path, 1), ('msg', path, 2)])
             # Leaves have no children in tree-mode get_children.
             saved = self.r._TREE_MODE
             try:
                 self.r._TREE_MODE = True
-                self.assertEqual(self.r.get_children(f'{path}#0'), [])
-                self.assertEqual(self.r.get_children(f'{path}#2'), [])
-                self.assertEqual(self.r.get_children(f'{path}#3'), [])
+                self.assertEqual(self.r.get_children(('msg', path, 0)), [])
+                self.assertEqual(self.r.get_children(('msg', path, 2)), [])
+                self.assertEqual(self.r.get_children(('msg', path, 3)), [])
             finally:
                 self.r._TREE_MODE = saved
         finally:
@@ -2197,7 +2221,7 @@ class TestTreeListings(unittest.TestCase):
             # u1's prompt umbrella exposes [u1 leaf, a1 leaf].
             kids = self.r._list_prompt_children(path, 0)
             self.assertEqual([it.id for it in kids],
-                             [f'{path}#0', f'{path}#1'])
+                             [('msg', path, 0), ('msg', path, 1)])
         finally:
             os.unlink(path)
 
@@ -2250,14 +2274,14 @@ class TestTreeListings(unittest.TestCase):
             # leaf, <subagent> umbrella].
             kids = self.r._list_tool_children(sess_path, 1)
             self.assertEqual(len(kids), 3)
-            self.assertEqual(kids[0].id, f'{sess_path}#1')
+            self.assertEqual(kids[0].id, ('msg', sess_path, 1))
             self.assertEqual(kids[0].kind, 'message')
-            self.assertEqual(kids[1].id, f'{sess_path}#2')
+            self.assertEqual(kids[1].id, ('msg', sess_path, 2))
             self.assertEqual(kids[1].kind, 'message')   # tool_result
             self.assertEqual(kids[2].kind, 'subagent')
             self.assertEqual(kids[2].agent_id, 'AGENT01')
             self.assertEqual(kids[2].id,
-                             f'{sess_path}#agent:AGENT01')
+                             ('agent', sess_path, 'AGENT01'))
             # The assistant record itself is a leaf in tree mode now.
             td = self.r._scan_tree(sess_path)
             asst_item = self.r._tree_item(sess_path,
@@ -2268,7 +2292,7 @@ class TestTreeListings(unittest.TestCase):
                 sess_path, 1, td.records[1], td,
             )
             self.assertTrue(tool_item.has_children)
-            self.assertEqual(tool_item.id, f'{sess_path}#tool:1')
+            self.assertEqual(tool_item.id, ('tool', sess_path, 1))
         finally:
             import shutil
             shutil.rmtree(tmp, ignore_errors=True)
@@ -2290,26 +2314,26 @@ class TestTreeListings(unittest.TestCase):
                 # Tree mode: session jsonl → root-level rows (one
                 # ``<prompt>`` umbrella).
                 self.r._TREE_MODE = True
-                roots = self.r.get_children(path)
+                roots = self.r.get_children(('session', path))
                 self.assertEqual(len(roots), 1)
                 self.assertEqual(roots[0].kind, 'prompt')
                 self.assertEqual(roots[0].line_no, 0)   # u1
-                self.assertEqual(roots[0].id, f'{path}#prompt:0')
+                self.assertEqual(roots[0].id, ('prompt', path, 0))
                 # Prompt umbrella's children → [u1 leaf, a1 leaf].
-                kids = self.r.get_children(f'{path}#prompt:0')
+                kids = self.r.get_children(('prompt', path, 0))
                 self.assertEqual([it.id for it in kids],
-                                 [f'{path}#0', f'{path}#1'])
+                                 [('msg', path, 0), ('msg', path, 1)])
                 # Regular message ids are leaves in tree mode.
-                self.assertEqual(self.r.get_children(f'{path}#1'), [])
-                self.assertEqual(self.r.get_children(f'{path}#0'), [])
+                self.assertEqual(self.r.get_children(('msg', path, 1)), [])
+                self.assertEqual(self.r.get_children(('msg', path, 0)), [])
 
                 # Flat mode: session jsonl → messages newest-first list.
                 self.r._TREE_MODE = False
-                flat = self.r.get_children(path)
+                flat = self.r.get_children(('session', path))
                 titles = [it.title for it in flat if it.kind == 'message']
                 self.assertEqual(len(titles), 2)
                 # Message id has no children in flat mode.
-                self.assertEqual(self.r.get_children(f'{path}#0'), [])
+                self.assertEqual(self.r.get_children(('msg', path, 0)), [])
             finally:
                 self.r._TREE_MODE = saved
         finally:
@@ -2342,7 +2366,7 @@ class TestUmbrellaShapes(unittest.TestCase):
             self.assertEqual(len(roots), 1)
             it = roots[0]
             self.assertEqual(it.kind, 'prompt')
-            self.assertEqual(it.id, f'{path}#prompt:0')
+            self.assertEqual(it.id, ('prompt', path, 0))
             self.assertTrue(it.title.startswith('<prompt>'))
             self.assertIn('hello world', it.title)
         finally:
@@ -2364,7 +2388,7 @@ class TestUmbrellaShapes(unittest.TestCase):
             self.assertEqual(len(kids), 2)
             tool = kids[1]
             self.assertEqual(tool.kind, 'tool')
-            self.assertEqual(tool.id, f'{path}#tool:1')
+            self.assertEqual(tool.id, ('tool', path, 1))
             self.assertEqual(tool.tool_name, 'Bash')
             self.assertTrue(tool.title.startswith('<tool:Bash>'))
         finally:
@@ -2391,7 +2415,7 @@ class TestUmbrellaShapes(unittest.TestCase):
             item = self.r._subagent_pseudo_item(sess, 'A1', agent)
             self.assertTrue(item.title.startswith('<subagent>'))
             self.assertIn('do stuff', item.title)
-            self.assertEqual(item.id, f'{sess}#agent:A1')
+            self.assertEqual(item.id, ('agent', sess, 'A1'))
         finally:
             import shutil
             shutil.rmtree(tmp, ignore_errors=True)
@@ -2409,7 +2433,7 @@ class TestUmbrellaShapes(unittest.TestCase):
             self.assertEqual(roots[0].kind, 'prompt')
             kids = self.r._list_prompt_children(path, 0)
             self.assertEqual(len(kids), 1)
-            self.assertEqual(kids[0].id, f'{path}#0')
+            self.assertEqual(kids[0].id, ('msg', path, 0))
         finally:
             os.unlink(path)
 
@@ -2432,7 +2456,7 @@ class TestUmbrellaShapes(unittest.TestCase):
             self.assertEqual(tool.kind, 'tool')
             tool_kids = self.r._list_tool_children(path, 1)
             self.assertEqual(len(tool_kids), 1)
-            self.assertEqual(tool_kids[0].id, f'{path}#1')
+            self.assertEqual(tool_kids[0].id, ('msg', path, 1))
         finally:
             os.unlink(path)
 
@@ -2486,10 +2510,10 @@ class TestUmbrellaShapes(unittest.TestCase):
              ]}},
         ])
         try:
-            chain = self.r._ancestor_ids_for(f'{path}#2')
+            chain = self.r._ancestor_ids_for(('msg', path, 2))
             self.assertEqual(chain, [
-                f'{path}#prompt:0',
-                f'{path}#tool:1',
+                ('prompt', path, 0),
+                ('tool', path, 1),
             ])
         finally:
             os.unlink(path)
@@ -2661,7 +2685,7 @@ class TestLiveTail(unittest.TestCase):
             self.assertEqual(len(records), 1)
             self.assertEqual(records[0][1].get('uuid'), 'a1')
             # Tree fold: the new leaf belongs to <prompt:0>.
-            self.assertIn(f'{path}#prompt:0', dirty)
+            self.assertIn(('prompt', path, 0), dirty)
             self.assertEqual(len(td.turn_direct['u1']), 1)
             tail = self.r._TAIL_STATE[path]
             self.assertGreater(tail.byte_offset, 0)
@@ -2692,7 +2716,7 @@ class TestLiveTail(unittest.TestCase):
             ])
             records, dirty = self.r._read_new_records(path)
             self.assertEqual(len(records), 1)
-            self.assertIn(path, dirty)
+            self.assertIn(('session', path), dirty)
             self.assertEqual(
                 sum(1 for e in td.roots_in_order if e['kind'] == 'turn'),
                 2,
@@ -2731,7 +2755,7 @@ class TestLiveTail(unittest.TestCase):
                 f.write(full_line[split:] + '\n')
             records, dirty = self.r._read_new_records(path)
             self.assertEqual(len(records), 1)
-            self.assertIn(f'{path}#prompt:0', dirty)
+            self.assertIn(('prompt', path, 0), dirty)
             tail = self.r._TAIL_STATE[path]
             self.assertGreater(tail.byte_offset, offset_before)
             self.assertFalse(tail.error)
@@ -2868,13 +2892,13 @@ class TestLiveTail(unittest.TestCase):
             td_a_before = self.r._scan_tree(path_a)
             td_b_before = self.r._scan_tree(path_b)
             # Reload path_a — its _TreeData should be rebuilt.
-            self.r.get_children(path_a, reload=True)
+            self.r.get_children(('session', path_a), reload=True)
             self.assertIsNot(self.r._TREE_CACHE[path_a], td_a_before)
             # path_b's cache untouched.
             self.assertIs(self.r._TREE_CACHE[path_b], td_b_before)
             # Non-reload call leaves both alone.
             td_a_after = self.r._TREE_CACHE[path_a]
-            self.r.get_children(path_a)
+            self.r.get_children(('session', path_a))
             self.assertIs(self.r._TREE_CACHE[path_a], td_a_after)
         finally:
             os.unlink(path_a)
@@ -2882,10 +2906,12 @@ class TestLiveTail(unittest.TestCase):
 
     def _fake_browser_with_children(self, path, children):
         seen_ops = []
+        # Flat-mode session children are keyed under the ``('session', …)`` id.
+        session_id = ('session', path)
 
         class FakeState:
             def __init__(s):
-                s._children = {path: list(children)}
+                s._children = {session_id: list(children)}
                 s._items_by_id = {it.id: it for it in children}
         class FakeBrowser:
             def __init__(s):
@@ -2915,9 +2941,9 @@ class TestLiveTail(unittest.TestCase):
         ])
         try:
             fake_subs = [
-                self.r.Item(id=f'{path}#agent:SUB_A',
+                self.r.Item(id=('agent', path, 'SUB_A'),
                             title='<subagent>  A'),
-                self.r.Item(id=f'{path}#agent:SUB_B',
+                self.r.Item(id=('agent', path, 'SUB_B'),
                             title='<subagent>  B'),
             ]
             fake_subs[0].kind = 'subagent'
@@ -2972,8 +2998,8 @@ class TestLiveTail(unittest.TestCase):
             upserts = [op for op in ops if op[0] == 'upsert']
             self.assertEqual(len(upserts), 2)
             # Op order matches input order: line 1 first, then line 2.
-            self.assertEqual(upserts[0][1], f'{path}#1')
-            self.assertEqual(upserts[1][1], f'{path}#2')
+            self.assertEqual(upserts[0][1], ('msg', path, 1))
+            self.assertEqual(upserts[1][1], ('msg', path, 2))
             self.assertFalse(
                 [op for op in ops if op[0] == 'remove'],
             )
@@ -2981,21 +3007,21 @@ class TestLiveTail(unittest.TestCase):
             os.unlink(path)
 
     def test_cursor_tail_path_extraction(self):
-        # Plain file path: returned as-is when it exists.
+        # Session id: resolves to its .jsonl when it exists.
         path = self._write_jsonl([{'type': 'user'}])
         try:
-            self.assertEqual(self.r._cursor_tail_path(path), path)
-            # Message id (`<path>#N`).
-            self.assertEqual(self.r._cursor_tail_path(f'{path}#0'), path)
-            # Umbrella ids strip to the path.
-            self.assertEqual(self.r._cursor_tail_path(f'{path}#prompt:0'),
+            self.assertEqual(self.r._cursor_tail_path(('session', path)), path)
+            # Message id ``('msg', jsonl, n)``.
+            self.assertEqual(self.r._cursor_tail_path(('msg', path, 0)), path)
+            # Umbrella ids resolve to the path.
+            self.assertEqual(self.r._cursor_tail_path(('prompt', path, 0)),
                              path)
-            self.assertEqual(self.r._cursor_tail_path(f'{path}#tool:1'),
+            self.assertEqual(self.r._cursor_tail_path(('tool', path, 1)),
                              path)
-            self.assertEqual(self.r._cursor_tail_path(f'{path}#span:2'),
+            self.assertEqual(self.r._cursor_tail_path(('span', path, 2)),
                              path)
             # Non-jsonl path: None.
-            self.assertIsNone(self.r._cursor_tail_path('/etc/passwd'))
+            self.assertIsNone(self.r._cursor_tail_path(('session', '/etc/passwd')))
             self.assertIsNone(self.r._cursor_tail_path(None))
         finally:
             os.unlink(path)
@@ -3014,7 +3040,7 @@ class TestLiveTail(unittest.TestCase):
             agent = os.path.join(sub_dir, 'agent-AGENT01.jsonl')
             with open(agent, 'w') as f:
                 f.write('{}\n')
-            row_id = f'{sess}#agent:AGENT01'
+            row_id = ('agent', sess, 'AGENT01')
             saved = self.r._TREE_MODE
             try:
                 self.r._TREE_MODE = True
@@ -3051,19 +3077,19 @@ class TestViewEditSource(unittest.TestCase):
     def test_gather_line_source_classifies_ids(self):
         path = '/tmp/fake.jsonl'
         items = [
-            self.r.Item(id=f'{path}#3'),                  # message leaf
-            self.r.Item(id=f'{path}#5'),                  # message leaf
-            self.r.Item(id=f'{path}#prompt:10'),          # umbrella
-            self.r.Item(id=f'{path}#tool:11'),            # umbrella
-            self.r.Item(id=f'{path}#span:0'),             # umbrella
-            self.r.Item(id=f'{path}#agent:AAA'),          # subagent group
-            self.r.Item(id=path),                         # bare file
-            self.r.Item(id='/some/proj'),                 # directory
+            self.r.Item(id=('msg', path, 3)),                  # message leaf
+            self.r.Item(id=('msg', path, 5)),                  # message leaf
+            self.r.Item(id=('prompt', path, 10)),          # umbrella
+            self.r.Item(id=('tool', path, 11)),            # umbrella
+            self.r.Item(id=('span', path, 0)),             # umbrella
+            self.r.Item(id=('agent', path, 'AAA')),          # subagent group
+            self.r.Item(id=('session', path)),            # session row
+            self.r.Item(id=('project', '/some/proj')),    # project dir
         ]
         per_line, whole_paths = self.r._gather_line_source(items)
         # Two message leaves on the same path → grouped.
         self.assertEqual(per_line, {path: [3, 5]})
-        # Whole-path entries: umbrellas + subagent + bare file + dir.
+        # Whole-path entries: umbrellas + subagent + session + project dir.
         whole_paths_only = [p for p, _ in whole_paths]
         self.assertEqual(len(whole_paths_only), 6)
         # Subagent group resolves to the agent's jsonl, not the parent
@@ -3072,13 +3098,13 @@ class TestViewEditSource(unittest.TestCase):
             os.path.join(self.r._subagents_dir(path), 'agent-AAA.jsonl'),
             whole_paths_only,
         )
-        # Plain umbrella ids resolve to the file path.
-        for u in (f'{path}', f'{path}', f'{path}', '/some/proj', path):
-            pass
+        # The project dir resolves to its directory path.
+        self.assertIn('/some/proj', whole_paths_only)
+        # Plain umbrella ids + the session row resolve to the file path.
         self.assertEqual(whole_paths_only.count(path), 4)
         # __truncated__ falls back to whole-file.
         per_line2, whole2 = self.r._gather_line_source([
-            self.r.Item(id=f'{path}#__truncated__'),
+            self.r.Item(id=('trunc', path)),
         ])
         self.assertEqual(per_line2, {})
         self.assertEqual([p for p, _ in whole2], [path])
@@ -3143,12 +3169,12 @@ class TestViewEditSource(unittest.TestCase):
                 # Prompt umbrella → user msg (0), assistant tool_use
                 # (1), tool_result (2) in document order.
                 self.assertEqual(
-                    self.r._gather_umbrella_lines(f'{path}#prompt:0'),
+                    self.r._gather_umbrella_lines(('prompt', path, 0)),
                     [0, 1, 2],
                 )
                 # Tool umbrella alone → assistant + tool_result.
                 self.assertEqual(
-                    self.r._gather_umbrella_lines(f'{path}#tool:1'),
+                    self.r._gather_umbrella_lines(('tool', path, 1)),
                     [1, 2],
                 )
             finally:
@@ -3200,7 +3226,7 @@ class TestViewEditSource(unittest.TestCase):
             self.r._TREE_MODE = True
             try:
                 # All three parent-file leaves; nothing from subagent.
-                lines = self.r._gather_umbrella_lines(f'{sess_path}#prompt:0')
+                lines = self.r._gather_umbrella_lines(('prompt', sess_path, 0))
                 self.assertEqual(lines, [0, 1, 2])
             finally:
                 self.r._TREE_MODE = saved
@@ -3230,7 +3256,7 @@ class TestViewEditSource(unittest.TestCase):
             self.r._TREE_MODE = True
             try:
                 self.r._scan_tree(path)
-                items = [self.r.Item(id=f'{path}#prompt:0')]
+                items = [self.r.Item(id=('prompt', path, 0))]
                 per_line, whole = self.r._gather_line_source(items)
                 self.assertEqual(per_line, {path: [0, 1, 2]})
                 self.assertFalse(whole)
@@ -3283,16 +3309,16 @@ class TestViewEditSource(unittest.TestCase):
                 # Listing-order recursion may interleave; the test
                 # checks the canonicalised output from the V/E
                 # gather (dedupe + sort) is the full file range.
-                items = [self.r.Item(id=f'{path}#prompt:0')]
+                items = [self.r.Item(id=('prompt', path, 0))]
                 per_line, _ = self.r._gather_line_source(items)
                 self.assertEqual(per_line, {path: [0, 1, 2, 3, 4, 5, 6]})
                 # Each tool umbrella covers only its own pair.
                 self.assertEqual(
-                    sorted(self.r._gather_umbrella_lines(f'{path}#tool:1')),
+                    sorted(self.r._gather_umbrella_lines(('tool', path, 1))),
                     [1, 2],
                 )
                 self.assertEqual(
-                    sorted(self.r._gather_umbrella_lines(f'{path}#tool:4')),
+                    sorted(self.r._gather_umbrella_lines(('tool', path, 4))),
                     [4, 5],
                 )
             finally:
@@ -3328,8 +3354,8 @@ class TestViewEditSource(unittest.TestCase):
                 # contains lines 0..2. Pre-select must collapse the
                 # overlap and emit lines in file order.
                 items = [
-                    self.r.Item(id=f'{path}#2'),
-                    self.r.Item(id=f'{path}#prompt:0'),
+                    self.r.Item(id=('msg', path, 2)),
+                    self.r.Item(id=('prompt', path, 0)),
                 ]
                 per_line, _ = self.r._gather_line_source(items)
                 self.assertEqual(per_line, {path: [0, 1, 2]})
@@ -3522,7 +3548,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             self.r._TREE_CACHE.clear()
             # Compose the parent's <tool:Agent> umbrella preview — the
             # subagent's body must NOT bleed in via the umbrella cascade.
-            preview = ''.join(self.r._preview_umbrella(f'{sess}#tool:1'))
+            preview = ''.join(self.r._preview_umbrella(('tool', sess, 1)))
             self.assertNotIn('inside-subagent', preview)
 
     def test_tool_umbrella_for_agent_dispatch_has_subagent_bg(self):
@@ -3553,7 +3579,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             sess = self._build(tmp)
             self.r._TREE_CACHE.clear()
             self.r._scan_tree(sess)
-            tool_id = f'{sess}#tool:1'
+            tool_id = ('tool', sess, 1)
             # With voice-only filter ON, the <tool:Agent> id passes.
             saved = self.r._FILTER_VOICE_ONLY
             self.r._FILTER_VOICE_ONLY = True
@@ -3585,7 +3611,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
                     f.write(_json.dumps(r) + '\n')
             self.r._TREE_CACHE.clear()
             self.r._scan_tree(sess)
-            tool_id = f'{sess}#tool:1'
+            tool_id = ('tool', sess, 1)
             saved = self.r._FILTER_VOICE_ONLY
             self.r._FILTER_VOICE_ONLY = True
             try:
@@ -3624,7 +3650,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             # Step 1: simulate a direct leaf visit by writing the
             # chrome-bearing preview into the framework cache. (In real
             # usage, the framework's get_preview path produces this.)
-            leaf_id = f'{sess}#0'
+            leaf_id = ('msg', sess, 0)
             chrome_text = self.r._preview_message(sess, 0)
             self.assertIn('SID-XYZ', chrome_text,
                           'sanity: leaf preview should include sessionId chrome')
@@ -3632,7 +3658,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             # Step 2: build the umbrella for the prompt and consume it.
             # The umbrella cascade should NOT include the chrome line
             # even though the leaf has been visited directly.
-            umbrella = ''.join(self.r._preview_umbrella(f'{sess}#prompt:0'))
+            umbrella = ''.join(self.r._preview_umbrella(('prompt', sess, 0)))
             # The user's voice content is in the umbrella.
             self.assertIn('hello', umbrella)
             # Chrome (sessionId line) must NOT appear in the umbrella.
@@ -3678,7 +3704,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             saved = self.r._FILTER_VOICE_ONLY
             self.r._FILTER_VOICE_ONLY = False
             try:
-                with_all = ''.join(self.r._preview_umbrella(sess))
+                with_all = ''.join(self.r._preview_umbrella(('session', sess)))
                 self.assertIn('PROBE_VOICE_USER', with_all)
                 self.assertIn('PROBE_BASH_HIDDEN', with_all)
 
@@ -3690,7 +3716,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
                 # it builds children via get_children (mod ops aren't
                 # simulated here — we use the same predicate).
                 self.r._TREE_CACHE.clear()
-                with_voice = ''.join(self.r._preview_umbrella(sess))
+                with_voice = ''.join(self.r._preview_umbrella(('session', sess)))
                 self.assertIn('PROBE_VOICE_USER', with_voice)
                 self.assertNotIn(
                     'PROBE_BASH_HIDDEN', with_voice,
@@ -3761,15 +3787,16 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
                     calls['cursor_to'].append(_id)
 
             # Override visible_items so the scope-row check passes
-            # (cursor still on the row whose id == target_jsonl).
+            # (cursor still on the row whose id == ('session', target_jsonl)).
             saved_vi = self.r.visible_items
-            self.r.visible_items = lambda state: [_ScopeRowEntry(sess)]
+            self.r.visible_items = (
+                lambda state: [_ScopeRowEntry(('session', sess))])
             try:
                 b = _FakeBrowser()
                 self.r._focus_latest_voice_when_ready(b, sess)
-                # First expand call: target_jsonl (to wait for
-                # scope_root's children).
-                self.assertEqual(calls['expand_chain'], [sess])
+                # First expand call: the ('session', …) scope id (to wait
+                # for scope_root's children).
+                self.assertEqual(calls['expand_chain'], [('session', sess)])
                 # No cursor_to yet — Pending not resolved.
                 self.assertEqual(calls['cursor_to'], [])
                 # Resolve each pending in sequence — the chain calls
@@ -3781,7 +3808,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
                     fired += 1
                 # Now the chain should have fired cursor_to on the
                 # latest voice.
-                self.assertEqual(calls['cursor_to'], [f'{sess}#1'])
+                self.assertEqual(calls['cursor_to'], [('msg', sess, 1)])
             finally:
                 self.r.visible_items = saved_vi
 
@@ -3903,13 +3930,14 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess = self._make_two_turn_session(tmp)
+            scope = ('session', sess)
             self.r._TREE_CACHE.clear()
             saved_mode = self.r._TREE_MODE
             self.r._TREE_MODE = True
             calls = {'cursor_to': [], 'invalidate': []}
 
             class _FakeBrowser:
-                _state = type('S', (), {'scope_stack': [sess],
+                _state = type('S', (), {'scope_stack': [scope],
                                         'expanded': set()})()
                 def get_item(self, _id):
                     return None
@@ -3929,17 +3957,17 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             self.r._BROWSER = _FakeBrowser()
             # Simulate _focus_latest_voice_when_ready claiming the
             # scope_root's landing (the no-``--item`` path).
-            self.r._DEFERRED_FOCUS_SCOPE_ROOT.add(sess)
-            self.addCleanup(self.r._DEFERRED_FOCUS_SCOPE_ROOT.discard, sess)
+            self.r._DEFERRED_FOCUS_SCOPE_ROOT.add(scope)
+            self.addCleanup(self.r._DEFERRED_FOCUS_SCOPE_ROOT.discard, scope)
             try:
                 # Sanity: the competing target exists and is a top-level
                 # umbrella (NOT the scope_root itself).
-                latest = self.r._latest_voice_among_children(sess)
+                latest = self.r._latest_voice_among_children(scope)
                 self.assertIsNotNone(latest)
-                self.assertNotEqual(latest, sess)
-                self.assertIn('#prompt:', latest)
+                self.assertNotEqual(latest, scope)
+                self.assertEqual(latest[0], 'prompt')
 
-                self.r._on_expand(_Ctx(), [sess])
+                self.r._on_expand(_Ctx(), [scope])
 
                 # No competing jump for the scope_root.
                 self.assertEqual(
@@ -3949,15 +3977,15 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
                 )
                 # And the scope_root must NOT be parked for a deferred
                 # jump either.
-                self.assertNotIn(sess, self.r._AWAITING_VOICE_JUMP)
+                self.assertNotIn(scope, self.r._AWAITING_VOICE_JUMP)
                 # The cross-file preview upgrade still fires (scope_root
                 # must go heavy).
-                self.assertIn(sess, calls['invalidate'])
+                self.assertIn(scope, calls['invalidate'])
             finally:
                 self.r._BROWSER = saved_browser
                 self.r._TREE_MODE = saved_mode
-                self.r._AWAITING_VOICE_JUMP.discard(sess)
-                self.r._DEFERRED_FOCUS_SCOPE_ROOT.discard(sess)
+                self.r._AWAITING_VOICE_JUMP.discard(scope)
+                self.r._DEFERRED_FOCUS_SCOPE_ROOT.discard(scope)
 
     def test_on_expand_scope_root_claim_is_consumed_once(self):
         """#720: the deferred-focus claim is one-shot.
@@ -3972,13 +4000,14 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess = self._make_two_turn_session(tmp)
+            scope = ('session', sess)
             self.r._TREE_CACHE.clear()
             saved_mode = self.r._TREE_MODE
             self.r._TREE_MODE = True
             calls = {'cursor_to': []}
 
             class _FakeBrowser:
-                _state = type('S', (), {'scope_stack': [sess],
+                _state = type('S', (), {'scope_stack': [scope],
                                         'expanded': set()})()
                 def get_item(self, _id):
                     return None
@@ -3995,24 +4024,24 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             saved_browser = self.r._BROWSER
             self.r._BROWSER = _FakeBrowser()
             # Focus claims the scope_root's startup landing.
-            self.r._DEFERRED_FOCUS_SCOPE_ROOT.add(sess)
-            self.addCleanup(self.r._DEFERRED_FOCUS_SCOPE_ROOT.discard, sess)
+            self.r._DEFERRED_FOCUS_SCOPE_ROOT.add(scope)
+            self.addCleanup(self.r._DEFERRED_FOCUS_SCOPE_ROOT.discard, scope)
             ctx = _Ctx()
             try:
                 # 1st expand (startup) — suppressed AND the claim is
                 # consumed.
-                self.r._on_expand(ctx, [sess])
+                self.r._on_expand(ctx, [scope])
                 self.assertEqual(
                     calls['cursor_to'], [],
                     'startup scope_root expand must be suppressed',
                 )
                 self.assertNotIn(
-                    sess, self.r._DEFERRED_FOCUS_SCOPE_ROOT,
+                    scope, self.r._DEFERRED_FOCUS_SCOPE_ROOT,
                     'the claim must be consumed on the first expand',
                 )
                 # 2nd expand (manual re-expand) — drills in normally now.
-                self.r._on_expand(ctx, [sess])
-                expected = self.r._latest_voice_among_children(sess)
+                self.r._on_expand(ctx, [scope])
+                expected = self.r._latest_voice_among_children(scope)
                 self.assertIsNotNone(expected)
                 self.assertEqual(
                     calls['cursor_to'], [expected],
@@ -4022,7 +4051,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             finally:
                 self.r._BROWSER = saved_browser
                 self.r._TREE_MODE = saved_mode
-                self.r._AWAITING_VOICE_JUMP.discard(sess)
+                self.r._AWAITING_VOICE_JUMP.discard(scope)
 
     def test_on_expand_scope_root_jumps_when_focus_not_active(self):
         """#720 guard: with no deferred focus (``--item`` launch) the
@@ -4037,13 +4066,14 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess = self._make_two_turn_session(tmp)
+            scope = ('session', sess)
             self.r._TREE_CACHE.clear()
             saved_mode = self.r._TREE_MODE
             self.r._TREE_MODE = True
             calls = {'cursor_to': []}
 
             class _FakeBrowser:
-                _state = type('S', (), {'scope_stack': [sess],
+                _state = type('S', (), {'scope_stack': [scope],
                                         'expanded': set()})()
                 def get_item(self, _id):
                     return None
@@ -4060,10 +4090,10 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             saved_browser = self.r._BROWSER
             self.r._BROWSER = _FakeBrowser()
             # No deferred-focus claim — the --item launch path.
-            self.r._DEFERRED_FOCUS_SCOPE_ROOT.discard(sess)
+            self.r._DEFERRED_FOCUS_SCOPE_ROOT.discard(scope)
             try:
-                self.r._on_expand(_Ctx(), [sess])
-                expected = self.r._latest_voice_among_children(sess)
+                self.r._on_expand(_Ctx(), [scope])
+                expected = self.r._latest_voice_among_children(scope)
                 self.assertIsNotNone(expected)
                 self.assertEqual(calls['cursor_to'], [expected])
             finally:
@@ -4084,7 +4114,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             self.r._TREE_CACHE.clear()
             saved_mode = self.r._TREE_MODE
             self.r._TREE_MODE = True
-            umbrella = f'{sess}#prompt:2'  # turn-2 umbrella (TURN2_USER)
+            umbrella = ('prompt', sess, 2)  # turn-2 umbrella (TURN2_USER)
             calls = {'cursor_to': []}
 
             class _FakeBrowser:
@@ -4227,7 +4257,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
                 for r in recs:
                     f.write(_json.dumps(r) + '\n')
             self.r._TREE_CACHE.clear()
-            self.assertEqual(self.r._last_voice_id(sess), f'{sess}#1')
+            self.assertEqual(self.r._last_voice_id(sess), ('msg', sess, 1))
 
     def test_last_voice_id_none_when_no_voice_records(self):
         # Pure-machinery transcript: scan completes with
@@ -4301,7 +4331,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
 
             # Run the umbrella generator to completion — this used to
             # write leaf previews into the framework cache.
-            list(self.r._preview_umbrella(f'{sess}#prompt:0'))
+            list(self.r._preview_umbrella(('prompt', sess, 0)))
 
             # A subsequent leaf preview must still produce chrome.
             leaf_text = self.r._preview_message(sess, 0)
@@ -4411,7 +4441,7 @@ class TestSessionRowVsScopeRootPreview(unittest.TestCase):
             self.r._BROWSER = _B()
             self.r._TREE_CACHE.clear()
             try:
-                out = self.r.get_preview(path)
+                out = self.r.get_preview(('session', path))
             finally:
                 self.r._BROWSER = saved
             self.assertIn(path, out)
@@ -4437,12 +4467,12 @@ class TestSessionRowVsScopeRootPreview(unittest.TestCase):
                 def set_preview(self, _id, _text): pass
                 items_by_id = {}
             saved = self.r._BROWSER
-            self.r._BROWSER = _B(path)
+            self.r._BROWSER = _B(('session', path))
             self.r._TREE_CACHE.clear()
             try:
                 # Umbrella branches return a generator (#460) — drain
                 # it for the substring assertions below.
-                result = self.r.get_preview(path)
+                result = self.r.get_preview(('session', path))
                 out = (
                     ''.join(result) if not isinstance(result, str) else result
                 )
@@ -4472,11 +4502,11 @@ class TestSessionRowVsScopeRootPreview(unittest.TestCase):
                 def set_preview(self, _id, _text): pass
                 items_by_id = {}
             saved = self.r._BROWSER
-            self.r._BROWSER = _B({path})
+            self.r._BROWSER = _B({('session', path)})
             self.r._TREE_CACHE.clear()
             try:
                 # Umbrella branches return a generator (#460).
-                result = self.r.get_preview(path)
+                result = self.r.get_preview(('session', path))
                 out = (
                     ''.join(result) if not isinstance(result, str) else result
                 )
@@ -4537,7 +4567,7 @@ class TestSubagentRowLightweightPreview(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess, agent_path = self._build(tmp)
-            item_id = f'{sess}#agent:A1'
+            item_id = ('agent', sess, 'A1')
             class _S:
                 scope_stack = []
                 expanded = set()
@@ -4564,7 +4594,7 @@ class TestSubagentRowLightweightPreview(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess, agent_path = self._build(tmp)
-            item_id = f'{sess}#agent:A1'
+            item_id = ('agent', sess, 'A1')
             class _S:
                 def __init__(self, scope):
                     self.scope_stack = [scope]
@@ -4593,7 +4623,7 @@ class TestSubagentRowLightweightPreview(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess, agent_path = self._build(tmp)
-            item_id = f'{sess}#agent:A1'
+            item_id = ('agent', sess, 'A1')
             class _S:
                 def __init__(self, expanded):
                     self.scope_stack = []
@@ -4723,7 +4753,7 @@ class TestScopeCard(unittest.TestCase):
             # ``get_preview`` for a session id returns the umbrella
             # generator (cross-file scope_root path) — drain it for
             # the assertions below.
-            result = self.r.get_preview(path)
+            result = self.r.get_preview(('session', path))
             out = ''.join(result) if not isinstance(result, str) else result
             # Card sits at the head of the preview.
             self.assertIn('browse-claude', out)
@@ -4915,7 +4945,7 @@ class TestOrphanSubagents(unittest.TestCase):
             # (wired) is not at the top — it renders inline under its
             # dispatching turn.
             self.assertTrue(getattr(roots[0], 'meta', False))
-            self.assertEqual(roots[0].id, f'{sess}#sep:subagents')
+            self.assertEqual(roots[0].id, ('sep', sess, 'subagents'))
             self.assertEqual(roots[0].title, '--- Subagents:')
             self.assertEqual(getattr(roots[1], 'kind', None), 'subagent')
             self.assertEqual(roots[1].agent_id, 'A2')
@@ -4938,14 +4968,14 @@ class TestOrphanSubagents(unittest.TestCase):
             roots = self.r._list_tree_roots(sess)
             # [subagents-sep, A2, A3, session-sep, <umbrellas...>].
             self.assertTrue(getattr(roots[0], 'meta', False))
-            self.assertEqual(roots[0].id, f'{sess}#sep:subagents')
+            self.assertEqual(roots[0].id, ('sep', sess, 'subagents'))
             self.assertEqual(roots[0].title, '--- Subagents:')
             self.assertEqual(getattr(roots[1], 'kind', None), 'subagent')
             self.assertEqual(getattr(roots[2], 'kind', None), 'subagent')
             self.assertEqual({roots[1].agent_id, roots[2].agent_id},
                              {'A2', 'A3'})
             self.assertTrue(getattr(roots[3], 'meta', False))
-            self.assertEqual(roots[3].id, f'{sess}#sep:session')
+            self.assertEqual(roots[3].id, ('sep', sess, 'session'))
             self.assertEqual(roots[3].title, '--- Session:')
             # Everything after the session divider is a turn/span
             # umbrella — never a subagent or a meta divider.
@@ -5347,8 +5377,8 @@ class TestVoiceOnlyFilter(unittest.TestCase):
         try:
             self.r._scan_tree(path)
             self.r._FILTER_VOICE_ONLY = True
-            self.assertTrue(self.r._passes_filter(f'{path}#0'))
-            self.assertFalse(self.r._passes_filter(f'{path}#1'))
+            self.assertTrue(self.r._passes_filter(('msg', path, 0)))
+            self.assertFalse(self.r._passes_filter(('msg', path, 1)))
         finally:
             os.unlink(path)
 
@@ -5369,7 +5399,7 @@ class TestVoiceOnlyFilter(unittest.TestCase):
         try:
             self.r._scan_tree(path)
             self.r._FILTER_VOICE_ONLY = True
-            self.assertFalse(self.r._passes_filter(f'{path}#tool:0'))
+            self.assertFalse(self.r._passes_filter(('tool', path, 0)))
         finally:
             os.unlink(path)
 
@@ -5385,7 +5415,7 @@ class TestVoiceOnlyFilter(unittest.TestCase):
         try:
             self.r._scan_tree(path)
             self.r._FILTER_VOICE_ONLY = True
-            self.assertTrue(self.r._passes_filter(f'{path}#tool:0'))
+            self.assertTrue(self.r._passes_filter(('tool', path, 0)))
         finally:
             os.unlink(path)
 
@@ -5407,8 +5437,8 @@ class TestVoiceOnlyFilter(unittest.TestCase):
         self.r._TREE_CACHE[path] = td
         try:
             self.r._FILTER_VOICE_ONLY = True
-            self.assertFalse(self.r._passes_filter(f'{path}#span:0'))
-            self.assertTrue(self.r._passes_filter(f'{path}#span:5'))
+            self.assertFalse(self.r._passes_filter(('span', path, 0)))
+            self.assertTrue(self.r._passes_filter(('span', path, 5)))
         finally:
             self.r._TREE_CACHE.pop(path, None)
 
@@ -5440,11 +5470,10 @@ class TestVoiceOnlyFilter(unittest.TestCase):
             self.r._FILTER_VOICE_ONLY = True
             items = self.r._list_messages(path)
             # Filter out the synthetic truncation row if any.
-            by_id = {it.id: it for it in items
-                     if not it.id.endswith('__truncated__')}
-            self.assertFalse(by_id[f'{path}#0'].hidden,
+            by_id = {it.id: it for it in items if it.id[0] != 'trunc'}
+            self.assertFalse(by_id[('msg', path, 0)].hidden,
                              'voice leaf must be visible')
-            self.assertTrue(by_id[f'{path}#1'].hidden,
+            self.assertTrue(by_id[('msg', path, 1)].hidden,
                             'pure tool_use leaf must be hidden')
         finally:
             os.unlink(path)
@@ -5562,11 +5591,11 @@ class TestVoiceOnlyFilter(unittest.TestCase):
         ])
         try:
             self.r._scan_tree(path)
-            voice = self.r.Item(id=f'{path}#0')
+            voice = self.r.Item(id=('msg', path, 0))
             voice.hidden = False
-            tool = self.r.Item(id=f'{path}#1')
+            tool = self.r.Item(id=('msg', path, 1))
             tool.hidden = False
-            sub = self.r.Item(id=f'{path}#agent:ABC')
+            sub = self.r.Item(id=('agent', path, 'ABC'))
             sub.hidden = False
             ctx, seen = self._fake_browser_with_items({
                 voice.id: voice, tool.id: tool, sub.id: sub,
@@ -5597,7 +5626,7 @@ class TestVoiceOnlyFilter(unittest.TestCase):
         ])
         try:
             self.r._scan_tree(path)
-            tool = self.r.Item(id=f'{path}#0')
+            tool = self.r.Item(id=('msg', path, 0))
             tool.hidden = False
             ctx, seen = self._fake_browser_with_items({tool.id: tool})
             self.r._action_toggle_filter(ctx)
@@ -5645,8 +5674,8 @@ class TestVoiceOnlyFilter(unittest.TestCase):
         ])
         try:
             self.r._scan_tree(path)
-            it0 = self.r.Item(id=f'{path}#0'); it0.hidden = False
-            it1 = self.r.Item(id=f'{path}#1'); it1.hidden = False
+            it0 = self.r.Item(id=('msg', path, 0)); it0.hidden = False
+            it1 = self.r.Item(id=('msg', path, 1)); it1.hidden = False
             ctx, seen = self._fake_browser_with_items({
                 it0.id: it0, it1.id: it1,
             })
@@ -5688,7 +5717,7 @@ class TestVoiceOnlyFilter(unittest.TestCase):
 
             class FakeState:
                 def __init__(s):
-                    s._children = {path: []}
+                    s._children = {('session', path): []}
                     s._items_by_id = {}
             class FakeBrowser:
                 def __init__(s):
@@ -5708,9 +5737,9 @@ class TestVoiceOnlyFilter(unittest.TestCase):
             self.assertEqual(len(seen_ops), 1)
             ops = seen_ops[0]
             by_id = {op[1]: op[3] for op in ops if op[0] == 'upsert'}
-            self.assertEqual(by_id[f'{path}#1'].get('hidden'), False,
+            self.assertEqual(by_id[('msg', path, 1)].get('hidden'), False,
                              'voice row should arrive visible')
-            self.assertEqual(by_id[f'{path}#2'].get('hidden'), True,
+            self.assertEqual(by_id[('msg', path, 2)].get('hidden'), True,
                              'tool_use row should arrive hidden')
         finally:
             os.unlink(path)
@@ -5733,7 +5762,7 @@ class TestVoiceOnlyFilter(unittest.TestCase):
         td.records = [td.span_records[0][0]]
         self.r._TREE_CACHE[path] = td
         try:
-            span_id = f'{path}#span:0'
+            span_id = ('span', path, 0)
             span_item = self.r.Item(id=span_id)
             span_item.hidden = True   # was hidden before the voice arrival
 
@@ -5784,14 +5813,14 @@ class TestVoiceOnlyFilter(unittest.TestCase):
             self.r._FILTER_VOICE_ONLY = False
             # Session-path preview routes through the umbrella
             # generator (#460); drain it for the assertions.
-            full = ''.join(self.r.get_preview(path))
+            full = ''.join(self.r.get_preview(('session', path)))
             self.assertIn('PROBE_VOICE_TEXT', full)
             self.assertIn('PROBE_TOOL_NAME', full,
                           'without filter the tool body should appear')
             # Clear the tree cache so item builders re-read the filter.
             self.r._TREE_CACHE.clear()
             self.r._FILTER_VOICE_ONLY = True
-            filtered = ''.join(self.r.get_preview(path))
+            filtered = ''.join(self.r.get_preview(('session', path)))
             self.assertIn('PROBE_VOICE_TEXT', filtered)
             self.assertNotIn('PROBE_TOOL_NAME', filtered,
                              'with filter the tool body must be hidden')
@@ -5824,12 +5853,12 @@ class TestVoiceOnlyFilter(unittest.TestCase):
             self.r._scan_tree(path)
             self.r._FILTER_VOICE_ONLY = True
             preview_filtered = ''.join(
-                self.r._preview_umbrella(f'{path}#prompt:0'),
+                self.r._preview_umbrella(('prompt', path, 0)),
             )
             # Without the filter the tool's machinery would appear.
             self.r._FILTER_VOICE_ONLY = False
             preview_full = ''.join(
-                self.r._preview_umbrella(f'{path}#prompt:0'),
+                self.r._preview_umbrella(('prompt', path, 0)),
             )
             # Sanity: full preview contains the tool's input.
             self.assertIn('ls /secret', preview_full)
@@ -5924,8 +5953,9 @@ class TestShowId(unittest.TestCase):
             "   _action_show_id,     'cursor')",
             source,
         )
-        # The handler pages the id; it must not fall back to a flash.
-        self.assertIn('ctx.page(ctx.cursor.id)', source)
+        # The handler pages the id (stringified for the pager); it must
+        # not fall back to a flash.
+        self.assertIn('ctx.page(str(ctx.cursor.id))', source)
 
 
 # ---- #424: composer ↔ framework cache integration ----------------------
@@ -6132,7 +6162,7 @@ class TestUmbrellaPreviewCacheIntegration(unittest.TestCase):
         self.r._BROWSER = None
         path = self._make_three_record_session()
         try:
-            out = ''.join(self.r._preview_umbrella(f'{path}#prompt:0'))
+            out = ''.join(self.r._preview_umbrella(('prompt', path, 0)))
             self.assertIn('PROBE_USER', out)
             self.assertIn('PROBE_BASH', out)
             self.assertIn('PROBE_OUTPUT', out)
@@ -6147,14 +6177,14 @@ class TestUmbrellaPreviewCacheIntegration(unittest.TestCase):
         path = self._make_three_record_session()
         counter, restore = self._instrument_get_children()
         try:
-            ''.join(self.r._preview_umbrella(f'{path}#prompt:0'))
+            ''.join(self.r._preview_umbrella(('prompt', path, 0)))
             self.r._BROWSER.flush()
             first_pass_calls = list(counter['calls'])
             # First pass must have fetched both umbrellas.
-            self.assertIn(f'{path}#prompt:0', first_pass_calls)
-            self.assertIn(f'{path}#tool:1', first_pass_calls)
+            self.assertIn(('prompt', path, 0), first_pass_calls)
+            self.assertIn(('tool', path, 1), first_pass_calls)
 
-            ''.join(self.r._preview_umbrella(f'{path}#prompt:0'))
+            ''.join(self.r._preview_umbrella(('prompt', path, 0)))
             self.r._BROWSER.flush()
             # No additional ``get_children`` calls — cache served
             # every read.
@@ -6179,7 +6209,7 @@ class TestUmbrellaPreviewCacheIntegration(unittest.TestCase):
         self.r._BROWSER = _FakeBrowser()
         path = self._make_three_record_session()
         try:
-            ''.join(self.r._preview_umbrella(f'{path}#prompt:0'))
+            ''.join(self.r._preview_umbrella(('prompt', path, 0)))
             self.r._BROWSER.flush()
             # Leaves get *registered* in the index via eager-push
             # upserts (so the framework's tree expansion is cheap),
@@ -6187,7 +6217,7 @@ class TestUmbrellaPreviewCacheIntegration(unittest.TestCase):
             # by the framework's own worker when a direct cursor
             # visit calls ``get_preview(leaf_id)``.
             for n in (0, 1, 2):
-                cid = f'{path}#{n}'
+                cid = ('msg', path, n)
                 item = self.r._BROWSER.items_by_id.get(cid)
                 self.assertIsNotNone(item, f'leaf {cid} not in index')
                 self.assertFalse(
@@ -6207,7 +6237,7 @@ class TestUmbrellaPreviewCacheIntegration(unittest.TestCase):
         self.r._BROWSER = _FakeBrowser()
         path = self._make_three_record_session()
         try:
-            ''.join(self.r._preview_umbrella(f'{path}#prompt:0'))
+            ''.join(self.r._preview_umbrella(('prompt', path, 0)))
             self.assertEqual(
                 len(self.r._BROWSER.update_data_calls), 1,
                 'composer should flush exactly one update_data batch '
@@ -6242,7 +6272,7 @@ class TestUmbrellaPreviewCacheIntegration(unittest.TestCase):
 
         self.r._render_record_with_rule = _counting_render
         try:
-            ''.join(self.r._preview_umbrella(f'{path}#prompt:0'))
+            ''.join(self.r._preview_umbrella(('prompt', path, 0)))
             self.r._BROWSER.flush()
             calls_after_first = list(render_calls)
             self.assertEqual(
@@ -6252,7 +6282,7 @@ class TestUmbrellaPreviewCacheIntegration(unittest.TestCase):
             )
 
             render_calls.clear()
-            ''.join(self.r._preview_umbrella(f'{path}#prompt:0'))
+            ''.join(self.r._preview_umbrella(('prompt', path, 0)))
             self.r._BROWSER.flush()
             # Second pass: every leaf re-renders. There's no leaf
             # cache to hit.
@@ -6276,13 +6306,13 @@ class TestUmbrellaPreviewCacheIntegration(unittest.TestCase):
         self.r._BROWSER = _FakeBrowser()
         path = self._make_three_record_session()
         try:
-            ''.join(self.r._preview_umbrella(f'{path}#prompt:0'))
+            ''.join(self.r._preview_umbrella(('prompt', path, 0)))
             self.r._BROWSER.flush()
             # First expand: the framework consults its cache via
             # cached_children. The recipe-side composer has populated
             # it; the framework would now skip the children-queue
             # fetch entirely.
-            cached = self.r._BROWSER.cached_children(f'{path}#prompt:0')
+            cached = self.r._BROWSER.cached_children(('prompt', path, 0))
             self.assertIsNotNone(
                 cached, 'cached_children should be populated after '
                 'preview composition',
@@ -6295,10 +6325,10 @@ class TestUmbrellaPreviewCacheIntegration(unittest.TestCase):
             # never re-asks ``get_children`` for this id.
             counter, restore = self._instrument_get_children()
             try:
-                ''.join(self.r._preview_umbrella(f'{path}#prompt:0'))
+                ''.join(self.r._preview_umbrella(('prompt', path, 0)))
                 self.r._BROWSER.flush()
                 self.assertNotIn(
-                    f'{path}#prompt:0', counter['calls'],
+                    ('prompt', path, 0), counter['calls'],
                     'second composition must not re-fetch '
                     'cached umbrella children',
                 )
@@ -6367,7 +6397,7 @@ class TestUmbrellaGenerator(unittest.TestCase):
         self.r._BROWSER = None
         path = self._make_session(2)
         try:
-            gen = self.r._preview_umbrella(path)
+            gen = self.r._preview_umbrella(('session', path))
             first = next(gen)
             # The scope card prints the recipe banner string;
             # leaf chunks never carry it.
@@ -6386,7 +6416,7 @@ class TestUmbrellaGenerator(unittest.TestCase):
         self.r._BROWSER = None
         path = self._make_session(4)
         try:
-            chunks = list(self.r._preview_umbrella(path))
+            chunks = list(self.r._preview_umbrella(('session', path)))
             # First chunk is the scope card; the remaining ``n``
             # chunks should each carry exactly one PROBE_TURN_NNNN
             # marker in ascending order.
@@ -6406,7 +6436,7 @@ class TestUmbrellaGenerator(unittest.TestCase):
         self.r._BROWSER = None
         path = self._make_session(3)
         try:
-            full = ''.join(self.r._preview_umbrella(path))
+            full = ''.join(self.r._preview_umbrella(('session', path)))
             for i in range(3):
                 self.assertIn(f'PROBE_TURN_{i:04d}', full)
             # Scope card sits at the head.
@@ -6425,7 +6455,7 @@ class TestUmbrellaGenerator(unittest.TestCase):
         self.r._BROWSER = _FakeBrowser()
         path = self._make_session(60)
         try:
-            gen = self.r._preview_umbrella(path)
+            gen = self.r._preview_umbrella(('session', path))
             next(gen)   # scope card
             pulled = 0
             for _ in range(30):
@@ -6464,7 +6494,7 @@ class TestUmbrellaGenerator(unittest.TestCase):
         self.r._BROWSER = _FakeBrowser()
         path = self._make_session(10)
         try:
-            gen = self.r._preview_umbrella(path)
+            gen = self.r._preview_umbrella(('session', path))
             next(gen)   # scope card
             for _ in range(5):
                 next(gen)
@@ -6753,7 +6783,7 @@ class TestOnExpandJumpComposition(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess = self._write_session(tmp)
-            turn = f'{sess}#prompt:0'
+            turn = ('prompt', sess, 0)
             # Children NOT cached at expand time → defer, no jump yet.
             ctx, cursor_to_calls, _ = self._make_ctx(cached={turn: None})
             self.r._on_expand(ctx, [turn])
@@ -6764,7 +6794,7 @@ class TestOnExpandJumpComposition(unittest.TestCase):
             # Fetch settles → the children-loaded hook performs the jump
             # and clears the pending entry.
             self.r._on_children_loaded(ctx, [turn])
-            self.assertEqual(cursor_to_calls, [f'{sess}#2'],
+            self.assertEqual(cursor_to_calls, [('msg', sess, 2)],
                              'children-loaded must jump to the latest voice')
             self.assertNotIn(turn, self.r._AWAITING_VOICE_JUMP,
                              'pending id must be discarded after the jump')
@@ -6773,12 +6803,12 @@ class TestOnExpandJumpComposition(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess = self._write_session(tmp)
-            turn = f'{sess}#prompt:0'
+            turn = ('prompt', sess, 0)
             # Children already cached (non-None) → jump now, no defer.
             ctx, cursor_to_calls, _ = self._make_ctx(
                 cached={turn: ['sentinel']})
             self.r._on_expand(ctx, [turn])
-            self.assertEqual(cursor_to_calls, [f'{sess}#2'],
+            self.assertEqual(cursor_to_calls, [('msg', sess, 2)],
                              'cached expand must jump to the latest voice now')
             self.assertNotIn(turn, self.r._AWAITING_VOICE_JUMP,
                              'cached expand must not park a pending id')
@@ -6790,7 +6820,7 @@ class TestOnExpandJumpComposition(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess = self._write_session(tmp)
-            turn = f'{sess}#prompt:0'
+            turn = ('prompt', sess, 0)
             ctx, cursor_to_calls, _ = self._make_ctx(cached={turn: ['x']})
             # _AWAITING_VOICE_JUMP is empty (cleared in setUp).
             self.r._on_children_loaded(ctx, [turn])
@@ -6810,7 +6840,7 @@ class TestOnExpandJumpComposition(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess = self._write_session(tmp)
-            turn = f'{sess}#prompt:0'
+            turn = ('prompt', sess, 0)
             # Expanded set starts with the turn (it was just expanded).
             expanded = {turn}
             ctx, cursor_to_calls, _ = self._make_ctx(
@@ -6831,18 +6861,16 @@ class TestOnExpandJumpComposition(unittest.TestCase):
                              'the jump is skipped')
 
     def test_cross_file_id_invalidated_on_expand(self):
-        # Expanding a cross-file row (bare .jsonl / #agent:) drops its
-        # cached preview so it upgrades from the metadata card to the
-        # heavy umbrella cascade; non-cross-file ids are left alone.
+        # Expanding a cross-file row (session / agent) drops its cached
+        # preview so it upgrades from the metadata card to the heavy
+        # umbrella cascade; non-cross-file ids are left alone.
+        session_id = ('session', '/x/s.jsonl')
+        agent_id = ('agent', '/x/s.jsonl', 'AB')
+        prompt_id = ('prompt', '/x/s.jsonl', 0)
         ctx, _, invalidated = self._make_ctx(
-            cached={'/x/s.jsonl': ['k'],
-                    '/x/s.jsonl#agent:AB': ['k'],
-                    '/x/s.jsonl#prompt:0': ['k']})
-        self.r._on_expand(ctx, ['/x/s.jsonl',
-                                '/x/s.jsonl#agent:AB',
-                                '/x/s.jsonl#prompt:0'])
-        self.assertEqual(invalidated,
-                         ['/x/s.jsonl', '/x/s.jsonl#agent:AB'],
+            cached={session_id: ['k'], agent_id: ['k'], prompt_id: ['k']})
+        self.r._on_expand(ctx, [session_id, agent_id, prompt_id])
+        self.assertEqual(invalidated, [session_id, agent_id],
                          'only cross-file ids should be invalidated')
 
     def test_jump_no_voice_among_children_is_noop(self):
@@ -6861,7 +6889,7 @@ class TestOnExpandJumpComposition(unittest.TestCase):
                     f.write(_json.dumps(r) + '\n')
             ctx, cursor_to_calls, _ = self._make_ctx(cached={})
             # A bare message-leaf id resolves to no children at all.
-            self.r._jump_to_latest_voice(ctx, f'{sess}#0')
+            self.r._jump_to_latest_voice(ctx, ('msg', sess, 0))
             self.assertEqual(cursor_to_calls, [])
 
     def test_jump_skips_when_latest_voice_is_self(self):
@@ -6912,32 +6940,34 @@ class TestOnScopeChangeCrossFileUpgrade(unittest.TestCase):
         return invalidated
 
     def test_scope_in_cross_file_invalidates(self):
-        # Scope into a bare .jsonl (session row) → cache dropped so the
-        # next preview pass upgrades to the heavy umbrella cascade.
+        # Scope into a ('session', …) row → cache dropped so the next
+        # preview pass upgrades to the heavy umbrella cascade.
         invalidated = self._install_recorder()
-        self.r._on_scope_change(None, '/x/s.jsonl', None, 'in')
-        self.assertEqual(invalidated, ['/x/s.jsonl'])
+        session_id = ('session', '/x/s.jsonl')
+        self.r._on_scope_change(None, session_id, None, 'in')
+        self.assertEqual(invalidated, [session_id])
 
     def test_scope_in_agent_id_invalidates(self):
-        # ``#agent:`` rows are cross-file too.
+        # ``('agent', …)`` rows are cross-file too.
         invalidated = self._install_recorder()
-        self.r._on_scope_change(None, '/x/s.jsonl#agent:AB', '/x', 'in')
-        self.assertEqual(invalidated, ['/x/s.jsonl#agent:AB'])
+        agent_id = ('agent', '/x/s.jsonl', 'AB')
+        self.r._on_scope_change(None, agent_id, ('project', '/x'), 'in')
+        self.assertEqual(invalidated, [agent_id])
 
     def test_scope_in_in_file_id_does_not_invalidate(self):
-        # An in-file scope row (``#prompt:`` / ``#N``) is not cross-file:
+        # An in-file scope row (``prompt`` / ``msg``) is not cross-file:
         # it already renders the heavy cascade, so leave its cache alone.
         invalidated = self._install_recorder()
-        self.r._on_scope_change(None, '/x/s.jsonl#prompt:0', '/x/s.jsonl',
-                                'in')
+        self.r._on_scope_change(None, ('prompt', '/x/s.jsonl', 0),
+                                ('session', '/x/s.jsonl'), 'in')
         self.assertEqual(invalidated, [])
 
     def test_scope_out_does_not_invalidate(self):
         # Scope-OUT never invalidates — even when the id scoped out TO is
         # itself a cross-file id, it was already upgraded when scoped in.
         invalidated = self._install_recorder()
-        self.r._on_scope_change(None, '/x/s.jsonl', '/x/s.jsonl#prompt:0',
-                                'out')
+        self.r._on_scope_change(None, ('session', '/x/s.jsonl'),
+                                ('prompt', '/x/s.jsonl', 0), 'out')
         self.assertEqual(invalidated, [],
                          'scope-out must not invalidate the preview')
 
@@ -7452,19 +7482,19 @@ class TestMarkdownSubtrees(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess, proj, report, appendix = self._build_project(tmp)
-            base = f'{sess}#0'
+            base = ('msg', sess, 0)
             kids = self.r._md_message_children(base)
             self.assertEqual(len(kids), 2, kids)
             inline, refs = kids
-            # Inline document node: empty #md: chain, same-file (boundary off).
-            self.assertEqual(inline.id, f'{base}#md:')
+            # Inline document node: empty md chain, same-file (boundary off).
+            self.assertEqual(inline.id, _md_id(base))
             self.assertEqual(inline.title, 'markdown')
             self.assertFalse(inline.boundary)
             self.assertTrue(inline.has_children)
             self.assertEqual(inline.tag, 'md')
             # References umbrella: same-document grouping (boundary off), [links]
-            # tag, id = the message base + the #refs marker.
-            self.assertEqual(refs.id, self.r._md_doc.refs_umbrella_id(base))
+            # tag, id = the ('refs', anchor, ()) for the message.
+            self.assertEqual(refs.id, _refs_id(base))
             self.assertEqual(refs.title, 'References')
             self.assertEqual(refs.tag, 'links')
             self.assertEqual(refs.kind, 'md-refs')
@@ -7481,8 +7511,7 @@ class TestMarkdownSubtrees(unittest.TestCase):
             self.assertTrue(filedoc.has_children)
             self.assertEqual(filedoc.tag, 'md')
             self.assertEqual(
-                self.r._md_doc.parse_md_id(filedoc.id),
-                (base, [os.path.realpath(report)], None))
+                filedoc.id, _md_id(base, [os.path.realpath(report)]))
 
     def test_message_children_dedup_and_existing_only(self):
         # A message referencing the same existing file twice + a non-existent
@@ -7504,7 +7533,7 @@ class TestMarkdownSubtrees(unittest.TestCase):
                     'content': [{'type': 'text', 'text':
                                  'real.md and again real.md plus ghost.md'}]}})
                         + '\n')
-            kids = self.r._md_message_children(f'{sess}#0')
+            kids = self.r._md_message_children(('msg', sess, 0))
             # No heading in the text → no inline node; just the References
             # umbrella. The dedup/existing-only happens in its OWN children.
             self.assertEqual([k.title for k in kids], ['References'])
@@ -7549,7 +7578,7 @@ class TestMarkdownSubtrees(unittest.TestCase):
             self.assertIsNone(self.r._md_doc.resolve_md_ref(
                 deslashed, doc_dir=proj, cwd=proj, project_root=proj))
 
-            kids = self.r._md_message_children(f'{sess}#0')
+            kids = self.r._md_message_children(('msg', sess, 0))
             # No heading in the record → no inline node; just the References
             # umbrella, whose one child is the file doc.
             self.assertEqual([k.title for k in kids], ['References'])
@@ -7560,12 +7589,11 @@ class TestMarkdownSubtrees(unittest.TestCase):
             self.assertEqual(filedoc.kind, 'md-doc')
             self.assertTrue(filedoc.boundary)
             self.assertEqual(filedoc.md_abspath, report_abs)
-            # Id is abspath-canonical: it round-trips to the absolute realpath,
+            # Id is abspath-canonical: it carries the absolute realpath,
             # proving the leading '/' survived find_md_refs and resolved via
             # the absolute branch.
             self.assertEqual(
-                self.r._md_doc.parse_md_id(filedoc.id),
-                (f'{sess}#0', [report_abs], None))
+                filedoc.id, _md_id(('msg', sess, 0), [report_abs]))
             # Label is the recipe's own anchor-relative rule (outside the
             # project → home-collapsed absolute), not a hardcoded literal.
             self.assertEqual(
@@ -7590,7 +7618,7 @@ class TestMarkdownSubtrees(unittest.TestCase):
                     'content': [{'type': 'text',
                                  'text': 'first zeta.md then alpha.md'}]}})
                         + '\n')
-            kids = self.r._md_message_children(f'{sess}#0')
+            kids = self.r._md_message_children(('msg', sess, 0))
             # No heading → just the References umbrella; its children are the
             # refs, sorted by label.
             self.assertEqual([k.title for k in kids], ['References'])
@@ -7615,7 +7643,7 @@ class TestMarkdownSubtrees(unittest.TestCase):
                     'content': [{'type': 'text',
                                  'text': 'see x.md (no heading here)'}]}})
                         + '\n')
-            kids = self.r._md_message_children(f'{sess}#0')
+            kids = self.r._md_message_children(('msg', sess, 0))
             self.assertNotIn('markdown', [k.title for k in kids])
             self.assertEqual(len(kids), 1)
 
@@ -7625,8 +7653,8 @@ class TestMarkdownSubtrees(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess, proj, report, appendix = self._build_project(tmp)
-            base = f'{sess}#0'
-            inline_id = self.r._md_doc.compose_md_id(base, [])
+            base = ('msg', sess, 0)
+            inline_id = _md_id(base, [])
             kids = self.r._md_subtree_children(inline_id)
             # Inline text: "Plan" / "# Summary" / "## Risks" / "see report.md"
             # → a dim [text] leaf for the loose intro line "Plan", then one
@@ -7661,8 +7689,8 @@ class TestMarkdownSubtrees(unittest.TestCase):
             with open(sess, 'w') as f:
                 f.write(_json.dumps({'type': 'user', 'cwd': proj, 'message': {
                     'content': [{'type': 'text', 'text': inline}]}}) + '\n')
-            base = f'{sess}#0'
-            inline_id = self.r._md_doc.compose_md_id(base, [])
+            base = ('msg', sess, 0)
+            inline_id = _md_id(base, [])
             kids = self.r.get_children(inline_id)
             # The dim [text] leaf comes first, before the heading row.
             self.assertEqual([k.title for k in kids],
@@ -7673,8 +7701,7 @@ class TestMarkdownSubtrees(unittest.TestCase):
             self.assertEqual(text_row.kind, 'md-text')
             self.assertFalse(text_row.has_children)
             # Its id carries the run's line offset (0) within the inline doc.
-            self.assertEqual(self.r._md_doc.parse_md_id(text_row.id),
-                             (base, [], 0))
+            self.assertEqual(text_row.id, _md_id(base, [], 0))
             # Leaf: routing the id back through get_children yields [].
             self.assertEqual(self.r.get_children(text_row.id), [])
             # Preview is the loose run itself — NOT the following heading
@@ -7689,9 +7716,9 @@ class TestMarkdownSubtrees(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess, proj, report, appendix = self._build_project(tmp)
-            base = f'{sess}#0'
+            base = ('msg', sess, 0)
             # Summary heading sits at inline line_offset 1.
-            summary_id = self.r._md_doc.compose_md_id(base, [], line_offset=1)
+            summary_id = _md_id(base, [], line_offset=1)
             kids = self.r._md_subtree_children(summary_id)
             self.assertEqual([k.title for k in kids], ['Risks'])
             self.assertEqual(kids[0].tag, 'h2')
@@ -7703,9 +7730,9 @@ class TestMarkdownSubtrees(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess, proj, report, appendix = self._build_project(tmp)
-            base = f'{sess}#0'
+            base = ('msg', sess, 0)
             report_real = os.path.realpath(report)
-            file_id = self.r._md_doc.compose_md_id(base, [report_real])
+            file_id = _md_id(base, [report_real])
             kids = self.r._md_subtree_children(file_id)
             titles = [k.title for k in kids]
             # report.md: "# Findings" (with "## Detail" nested) + a ref to
@@ -7715,7 +7742,7 @@ class TestMarkdownSubtrees(unittest.TestCase):
             self.assertEqual(heading.tag, 'h1')
             self.assertFalse(getattr(heading, 'boundary', False))
             # Umbrella id = the file-doc id + #refs; same-document grouping.
-            self.assertEqual(refs.id, self.r._md_doc.refs_umbrella_id(file_id))
+            self.assertEqual(refs.id, _refs_id(file_id))
             self.assertEqual(refs.tag, 'links')
             self.assertFalse(refs.boundary)
             self.assertTrue(refs.has_children)
@@ -7727,16 +7754,16 @@ class TestMarkdownSubtrees(unittest.TestCase):
             self.assertEqual(nested.tag, 'md')
             self.assertTrue(nested.boundary)
             self.assertEqual(
-                self.r._md_doc.parse_md_id(nested.id),
-                (base, [report_real, os.path.realpath(appendix)], None))
+                nested.id,
+                _md_id(base, [report_real, os.path.realpath(appendix)]))
 
     def test_recursion_file_to_file_expands(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess, proj, report, appendix = self._build_project(tmp)
-            base = f'{sess}#0'
+            base = ('msg', sess, 0)
             chain = [os.path.realpath(report), os.path.realpath(appendix)]
-            appendix_id = self.r._md_doc.compose_md_id(base, chain)
+            appendix_id = _md_id(base, chain)
             kids = self.r._md_subtree_children(appendix_id)
             # appendix.md is a leaf doc: just its "# Appendix" heading, no refs.
             # No further ref → no References umbrella on a leaf doc.
@@ -7763,7 +7790,7 @@ class TestMarkdownSubtrees(unittest.TestCase):
                 f.write(_json.dumps({'type': 'user', 'cwd': proj, 'message': {
                     'content': [{'type': 'text',
                                  'text': 'just one ref: only.md'}]}}) + '\n')
-            kids = self.r._md_message_children(f'{sess}#0')
+            kids = self.r._md_message_children(('msg', sess, 0))
             self.assertEqual([k.title for k in kids], ['References'])
             self.assertEqual(kids[0].kind, 'md-refs')
             ref_kids = self.r._md_refs_umbrella_children(kids[0].id)
@@ -7776,8 +7803,8 @@ class TestMarkdownSubtrees(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess, proj, report, appendix = self._build_project(tmp)
-            base = f'{sess}#0'
-            refs_id = self.r._md_doc.refs_umbrella_id(base)
+            base = ('msg', sess, 0)
+            refs_id = _refs_id(base)
             self.r._MD_COLOR = True   # would colorise a markdown preview
             out = self.r.get_preview(refs_id)
             self.assertNotIn('\x1b', out, 'umbrella preview must be plain text')
@@ -7788,19 +7815,21 @@ class TestMarkdownSubtrees(unittest.TestCase):
             self.assertNotIn('body', out)
 
     def test_refs_umbrella_preview_empty_when_unreadable(self):
-        # A #refs id whose document is gone yields '' (no crash, no header).
-        refs_id = self.r._md_doc.refs_umbrella_id('/nope/s.jsonl#3')
+        # A refs id whose document is gone yields '' (no crash, no header).
+        refs_id = _refs_id(('msg', '/nope/s.jsonl', 3))
         self.assertEqual(self.r.get_preview(refs_id), '')
 
     def test_is_md_managed_id_covers_refs_umbrella(self):
         # Both umbrella shapes (message-level and file-doc-level) are md-managed
         # so the first-child landing drills INTO them.
-        self.assertTrue(self.r._is_md_managed_id('/p/s.jsonl#3#refs'))
-        self.assertTrue(self.r._is_md_managed_id('/p/s.jsonl#0#md:file%3A...#refs'))
+        msg_umb = _refs_id(('msg', '/p/s.jsonl', 3))
+        file_umb = _refs_id(_md_id(('msg', '/p/s.jsonl', 0), ['/p/x.md']))
+        self.assertTrue(self.r._is_md_managed_id(msg_umb))
+        self.assertTrue(self.r._is_md_managed_id(file_umb))
         saved = self.r._md_doc
         try:
             self.r._md_doc = None
-            self.assertFalse(self.r._is_md_managed_id('/p/s.jsonl#3#refs'))
+            self.assertFalse(self.r._is_md_managed_id(msg_umb))
         finally:
             self.r._md_doc = saved
 
@@ -7810,7 +7839,7 @@ class TestMarkdownSubtrees(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess, proj, report, appendix = self._build_project(tmp)
-            base = f'{sess}#0'
+            base = ('msg', sess, 0)
             refs = next(k for k in self.r.get_children(base)
                         if k.kind == 'md-refs')
             ref_kids = self.r.get_children(refs.id)
@@ -7822,17 +7851,18 @@ class TestMarkdownSubtrees(unittest.TestCase):
                              'expanding a References umbrella must land on its '
                              'first ref')
 
-    def test_file_doc_umbrella_routes_before_md_branch(self):
-        # A file-doc umbrella id ``<base>#md:<enc>#refs`` contains ``#md:``; the
-        # ``#refs`` routing MUST win in BOTH get_children and get_preview, or
-        # the ``#md:`` branch would steal it. Drive both through the routers.
+    def test_file_doc_umbrella_routes_by_refs_tag(self):
+        # A file-doc-level References umbrella ``('refs', anchor, chain)`` shares
+        # its ``(anchor, chain)`` with the file-doc node ``('md', anchor, chain,
+        # None)``, but the ``refs`` tag routes it to the umbrella builder in
+        # BOTH get_children and get_preview — never the md-subtree builder.
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess, proj, report, appendix = self._build_project(tmp)
-            base = f'{sess}#0'
-            file_id = self.r._md_doc.compose_md_id(base, [os.path.realpath(report)])
-            refs_id = self.r._md_doc.refs_umbrella_id(file_id)
-            self.assertIn('#md:', refs_id)   # the ordering hazard is real
+            base = ('msg', sess, 0)
+            file_id = _md_id(base, [os.path.realpath(report)])
+            refs_id = _refs_id(file_id)
+            self.assertEqual(refs_id[0], 'refs')   # tag-routed, no ambiguity
             # get_children: routed to the umbrella builder → the nested ref,
             # NOT the file-doc subtree (which would be ['Findings', 'References']).
             self.assertEqual(
@@ -7851,7 +7881,7 @@ class TestMarkdownSubtrees(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess, proj, report, appendix = self._build_project(tmp)
-            base = f'{sess}#0'
+            base = ('msg', sess, 0)
             calls = []
             real = self.r._md_resolved_refs
 
@@ -7877,7 +7907,7 @@ class TestMarkdownSubtrees(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess, proj, report, appendix = self._build_project(tmp)
-            base = f'{sess}#0'
+            base = ('msg', sess, 0)
             # Message id → inline doc + References umbrella (same as
             # _md_message_children).
             via_router = self.r.get_children(base)
@@ -7885,13 +7915,13 @@ class TestMarkdownSubtrees(unittest.TestCase):
                              ['markdown', 'References'])
             # #md: id → routed to the subtree builder (the dim [text] intro
             # leaf "Plan" then the "Summary" heading).
-            inline_id = self.r._md_doc.compose_md_id(base, [])
+            inline_id = _md_id(base, [])
             self.assertEqual(
                 [k.title for k in self.r.get_children(inline_id)],
                 ['Plan', 'Summary'])
             # #refs umbrella id → routed (BEFORE the #md: branch) to the
             # umbrella builder; its child is the file doc.
-            refs_id = self.r._md_doc.refs_umbrella_id(base)
+            refs_id = _refs_id(base)
             self.assertEqual(
                 [k.title for k in self.r.get_children(refs_id)], ['report.md'])
 
@@ -7903,7 +7933,7 @@ class TestMarkdownSubtrees(unittest.TestCase):
             saved = self.r._md_doc
             try:
                 self.r._md_doc = None
-                self.assertEqual(self.r.get_children(f'{sess}#0'), [])
+                self.assertEqual(self.r.get_children(('msg', sess, 0)), [])
             finally:
                 self.r._md_doc = saved
 
@@ -7912,10 +7942,10 @@ class TestMarkdownSubtrees(unittest.TestCase):
         # crucially does NOT fall through to the generic message-id path (which
         # would mis-int the ``#<lineoffset>`` suffix as a record line number).
         base = '/p/s.jsonl#3'
-        heading_id = self.r._md_doc.compose_md_id(base, [], line_offset=12)
+        heading_id = _md_id(base, [], line_offset=12)
         self.assertEqual(self.r.get_preview(heading_id), '')
         self.assertEqual(
-            self.r.get_preview(self.r._md_doc.compose_md_id(base, [])), '')
+            self.r.get_preview(_md_id(base, [])), '')
 
     # ---- preview routing: document & heading (#661) --------------------
 
@@ -7941,7 +7971,7 @@ class TestMarkdownSubtrees(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             sess, proj, report, appendix = self._build_project(tmp)
             self.r._MD_COLOR = False    # raw text → exact substring assertions
-            inline_id = self.r._md_doc.compose_md_id(f'{sess}#0', [])
+            inline_id = _md_id(('msg', sess, 0), [])
             out = self.r.get_preview(inline_id)
             # The whole inline document, not just a summary fragment.
             for token in ('Plan', 'Summary', 'Risks', 'report.md'):
@@ -7954,8 +7984,8 @@ class TestMarkdownSubtrees(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             sess, proj, report, appendix = self._build_project(tmp)
             self.r._MD_COLOR = False
-            file_id = self.r._md_doc.compose_md_id(
-                f'{sess}#0', [os.path.realpath(report)])
+            file_id = _md_id(
+                ('msg', sess, 0), [os.path.realpath(report)])
             out = self.r.get_preview(file_id)
             for token in ('Findings', 'body', 'appendix.md', 'Detail'):
                 self.assertIn(token, out)
@@ -7969,7 +7999,7 @@ class TestMarkdownSubtrees(unittest.TestCase):
             self.r._MD_COLOR = False
             base = '/p/s.jsonl#0'   # base record is irrelevant for a file chain
             # ``# First`` is at line 0; render its section.
-            first_id = self.r._md_doc.compose_md_id(base, [path], line_offset=0)
+            first_id = _md_id(base, [path], line_offset=0)
             out = self.r.get_preview(first_id)
             self.assertIn('First', out)
             self.assertIn('Sub', out)       # nested sub-section IS included
@@ -7982,7 +8012,7 @@ class TestMarkdownSubtrees(unittest.TestCase):
             self.assertEqual(
                 out, text[node.byte_offset:node.byte_offset + node.byte_size])
             # The sibling ``# Second`` (line 8) renders its own section.
-            second_id = self.r._md_doc.compose_md_id(
+            second_id = _md_id(
                 base, [path], line_offset=8)
             sec = self.r.get_preview(second_id)
             self.assertIn('Second', sec)
@@ -7994,7 +8024,7 @@ class TestMarkdownSubtrees(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             path, _ = self._sections_file(tmp)
-            bad = self.r._md_doc.compose_md_id(
+            bad = _md_id(
                 '/p/s.jsonl#0', [path], line_offset=999)
             self.assertEqual(self.r.get_preview(bad), '')
 
@@ -8003,7 +8033,7 @@ class TestMarkdownSubtrees(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess, proj, report, appendix = self._build_project(tmp)
-            inline_id = self.r._md_doc.compose_md_id(f'{sess}#0', [])
+            inline_id = _md_id(('msg', sess, 0), [])
             self.r._MD_COLOR = True
             self.assertIn('\x1b', self.r.get_preview(inline_id))
             self.r._md_doc.clear_cache()   # not strictly needed (inline), tidy
@@ -8019,7 +8049,7 @@ class TestMarkdownSubtrees(unittest.TestCase):
         # not-loaded fallback in _is_cross_file_id returns False — the id is
         # never mistaken for a cross-file (session/subagent) row by shape.
         # (The reorder, tested next, is what protects the *loaded* case.)
-        file_id = self.r._md_doc.compose_md_id(
+        file_id = _md_id(
             '/p/s.jsonl#0', ['/abs/report.md'])
         self.assertIsNone(self.r._BROWSER)   # setUp default → fallback path
         self.assertFalse(self.r._is_cross_file_id(file_id))
@@ -8037,7 +8067,7 @@ class TestMarkdownSubtrees(unittest.TestCase):
             report = os.path.join(tmp, 'report.md')
             with open(report, 'w') as f:
                 f.write('# Findings\n\nMD-FILE-DOC-BODY\n')
-            file_id = self.r._md_doc.compose_md_id(
+            file_id = _md_id(
                 '/p/s.jsonl#0', [os.path.realpath(report)])
 
             class _B:
@@ -8067,7 +8097,7 @@ class TestMarkdownSubtrees(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             sess, proj, report, appendix = self._build_project(tmp)
             self.r._MD_COLOR = False
-            inline_id = self.r._md_doc.compose_md_id(f'{sess}#0', [])
+            inline_id = _md_id(('msg', sess, 0), [])
             out = self.r.get_preview(inline_id)
             self.assertIn('Summary', out)
             self.assertNotIn('browse-claude', out)
@@ -8080,16 +8110,16 @@ class TestMarkdownSubtrees(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess, proj, report, appendix = self._build_project(tmp)
-            kids = self.r._md_message_children(f'{sess}#0')
+            kids = self.r._md_message_children(('msg', sess, 0))
             # The file doc lives under the References umbrella, not directly
             # under the message.
             refs = next(k for k in kids if k.kind == 'md-refs')
             ref_kids = self.r._md_refs_umbrella_children(refs.id)
             filedoc = next(k for k in ref_kids if k.tag == 'md' and k.boundary)
             self.assertEqual(filedoc.title, 'report.md')
-            # Id carries the absolute path, not the relative label.
-            _, abspaths, _ = self.r._md_doc.parse_md_id(filedoc.id)
-            self.assertEqual(abspaths, [os.path.realpath(report)])
+            # Id carries the absolute path (the chain), not the relative label.
+            self.assertEqual(filedoc.id[0], 'md')
+            self.assertEqual(list(filedoc.id[2]), [os.path.realpath(report)])
 
     def test_label_rule_anchor_precedence(self):
         # The label rule (``_md_ref_label``) is a pure function over the two
@@ -8124,7 +8154,7 @@ class TestMarkdownSubtrees(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess, proj, report, appendix = self._build_project(tmp)
-            kids = self.r._md_message_children(f'{sess}#0')
+            kids = self.r._md_message_children(('msg', sess, 0))
             inline = next(k for k in kids if not k.boundary)
             self.assertEqual(inline.title, 'markdown')
             self.assertEqual(inline.tag_style, 'dim')
@@ -8137,7 +8167,7 @@ class TestMarkdownSubtrees(unittest.TestCase):
             sess, proj, report, appendix = self._build_project(tmp)
             # Message #2 is the optimistic false positive: its only .md token
             # (missing.md) doesn't exist and it has no heading.
-            base = f'{sess}#2'
+            base = ('msg', sess, 2)
             self.assertTrue(self.r._md_has_children(
                 self.r._read_jsonl_line(sess, 2)))     # arrow was set
             self.assertEqual(self.r.get_children(base), [])  # build is empty
@@ -8185,10 +8215,10 @@ class TestMarkdownSubtrees(unittest.TestCase):
 
             ctx = _Ctx()
             # A real message id with NON-empty children: no retraction.
-            base0 = f'{sess}#0'
+            base0 = ('msg', sess, 0)
             fake._children_cache[base0] = [_RecordingItem('child')]
             # A non-md umbrella id settling empty: must be left alone.
-            umbrella = f'{sess}#prompt:0'
+            umbrella = ('prompt', sess, 0)
             fake._children_cache[umbrella] = []
             self.r._on_children_loaded(ctx, [base0, umbrella])
             fake.flush()
@@ -8267,7 +8297,7 @@ class TestMarkdownSubtrees(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess, proj, report, appendix = self._build_project(tmp)
-            base = f'{sess}#0'                       # message-with-md
+            base = ('msg', sess, 0)                       # message-with-md
             kids = self.r.get_children(base)
             self.assertTrue(kids, 'fixture should build md children')
             self.assertEqual(
@@ -8282,23 +8312,26 @@ class TestMarkdownSubtrees(unittest.TestCase):
         shown = _RecordingItem('v'); shown.hidden = False
         self.r.get_children = lambda _id: [hidden, shown]
         self.addCleanup(setattr, self.r, 'get_children', saved)
-        self.assertEqual(self.r._first_visible_child('x'), 'v')
+        self.assertEqual(
+            self.r._first_visible_child(('msg', '/x.jsonl', 0)), 'v')
 
     def test_is_md_managed_id_predicate(self):
-        # md-managed = md_doc live AND (#md: node OR plain <jsonl>#<n>).
-        self.assertTrue(self.r._is_md_managed_id('/p/s.jsonl#3'))
-        self.assertTrue(self.r._is_md_managed_id('/p/s.jsonl#0#md:'))
+        # md-managed = md_doc live AND id tag in ('md', 'refs', 'msg').
+        msg = ('msg', '/p/s.jsonl', 3)
+        inline = _md_id(('msg', '/p/s.jsonl', 0))
+        self.assertTrue(self.r._is_md_managed_id(msg))
+        self.assertTrue(self.r._is_md_managed_id(inline))
         # Umbrellas / sessions / subagent groups are NOT md-managed.
-        for not_md in ('/p/s.jsonl#prompt:0', '/p/s.jsonl#tool:1',
-                       '/p/s.jsonl#span:2', '/p/s.jsonl#agent:A1',
-                       '/p/s.jsonl', None):
+        for not_md in (('prompt', '/p/s.jsonl', 0), ('tool', '/p/s.jsonl', 1),
+                       ('span', '/p/s.jsonl', 2), ('agent', '/p/s.jsonl', 'A1'),
+                       ('session', '/p/s.jsonl'), None):
             self.assertFalse(self.r._is_md_managed_id(not_md), not_md)
         # Hard no-op when the feature is off.
         saved = self.r._md_doc
         try:
             self.r._md_doc = None
-            self.assertFalse(self.r._is_md_managed_id('/p/s.jsonl#3'))
-            self.assertFalse(self.r._is_md_managed_id('/p/s.jsonl#0#md:'))
+            self.assertFalse(self.r._is_md_managed_id(msg))
+            self.assertFalse(self.r._is_md_managed_id(inline))
         finally:
             self.r._md_doc = saved
 
@@ -8308,10 +8341,10 @@ class TestMarkdownSubtrees(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess, proj, report, appendix = self._build_project(tmp)
-            base = f'{sess}#0'
+            base = ('msg', sess, 0)
             kids = self.r.get_children(base)
             first = kids[0].id
-            self.assertEqual(first, f'{base}#md:')   # the inline doc node
+            self.assertEqual(first, _md_id(base))   # the inline doc node
             ctx, calls = self._make_jump_ctx(cached={base: kids})
             self.r._on_expand(ctx, [base])
             self.assertEqual(calls, [first],
@@ -8319,12 +8352,12 @@ class TestMarkdownSubtrees(unittest.TestCase):
                              'first child')
 
     def test_expand_inline_md_node_lands_on_first_child(self):
-        # Cached expand of the inline ``markdown`` (#md:) node lands on its
+        # Cached expand of the inline ``markdown`` (md) node lands on its
         # first heading row.
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess, proj, report, appendix = self._build_project(tmp)
-            inline = f'{sess}#0#md:'
+            inline = _md_id(('msg', sess, 0))
             kids = self.r.get_children(inline)
             self.assertTrue(kids, 'inline doc should have heading children')
             first = kids[0].id
@@ -8339,7 +8372,7 @@ class TestMarkdownSubtrees(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess, proj, report, appendix = self._build_project(tmp)
-            base = f'{sess}#0'
+            base = ('msg', sess, 0)
             refs = next(k for k in self.r.get_children(base)
                         if k.kind == 'md-refs')
             filedoc = next(k for k in self.r.get_children(refs.id)
@@ -8358,7 +8391,7 @@ class TestMarkdownSubtrees(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess, proj, report, appendix = self._build_project(tmp)
-            base = f'{sess}#0'
+            base = ('msg', sess, 0)
             first = self.r.get_children(base)[0].id
             saved_pending = set(self.r._AWAITING_VOICE_JUMP)
             self.addCleanup(self.r._AWAITING_VOICE_JUMP.clear)
@@ -8398,11 +8431,11 @@ class TestMarkdownSubtrees(unittest.TestCase):
             with open(sess, 'w') as f:
                 for rc in recs:
                     f.write(_json.dumps(rc) + '\n')
-            umb = f'{sess}#prompt:0'
+            umb = ('prompt', sess, 0)
             self.assertFalse(self.r._is_md_managed_id(umb))
             kids = self.r.get_children(umb)
             latest = self.r._latest_voice_among_children(umb)
-            self.assertEqual(latest, f'{sess}#2')        # the LAST voice
+            self.assertEqual(latest, ('msg', sess, 2))        # the LAST voice
             self.assertNotEqual(latest, kids[0].id)      # first != latest
             ctx, calls = self._make_jump_ctx(cached={umb: kids})
             self.r._on_expand(ctx, [umb])
@@ -8416,7 +8449,7 @@ class TestMarkdownSubtrees(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess, proj, report, appendix = self._build_project(tmp)
-            base = f'{sess}#2'                       # the optimistic positive
+            base = ('msg', sess, 2)                       # the optimistic positive
             self.assertTrue(self.r._md_has_children(
                 self.r._read_jsonl_line(sess, 2)))   # arrow was set
             self.assertEqual(self.r.get_children(base), [])  # build is empty
@@ -8556,10 +8589,10 @@ class TestBoundaryMigration(unittest.TestCase):
             sess, agent_path = self._project_with_subagent(tmp)
             (sub,) = self.r._list_subagents_for_session(sess)
             self.assertTrue(sub.boundary)
-            self.assertIn('#agent:', sub.id)
+            self.assertEqual(sub.id[0], 'agent')
             pseudo = self.r._subagent_pseudo_item(sess, 'A1', agent_path)
             self.assertTrue(pseudo.boundary)
-            self.assertIn('#agent:', pseudo.id)
+            self.assertEqual(pseudo.id[0], 'agent')
 
     def test_session_rows_are_boundary(self):
         # Bare .jsonl session rows in _list_sessions carry boundary=True.
@@ -8570,14 +8603,14 @@ class TestBoundaryMigration(unittest.TestCase):
             rows = self.r._list_sessions(proj)
             self.assertTrue(rows)
             for it in rows:
-                self.assertTrue(it.id.endswith('.jsonl'))
+                self.assertEqual(it.id[0], 'session')
                 self.assertTrue(it.boundary, it.id)
 
     # ---- (b) _is_cross_file_id parity (boundary + fallback) ------------
 
     def test_is_cross_file_via_boundary_when_loaded(self):
         # When the Item IS loaded, the predicate reads its boundary flag.
-        item_id = '/p/parent-sid.jsonl#agent:A1'
+        item_id = ('agent', '/p/parent-sid.jsonl', 'A1')
 
         class _B:
             def __init__(self, items):
@@ -8588,31 +8621,31 @@ class TestBoundaryMigration(unittest.TestCase):
         boundary_item = type('I', (), {'id': item_id, 'boundary': True})()
         self.r._BROWSER = _B({item_id: boundary_item})
         self.assertTrue(self.r._is_cross_file_id(item_id))
-        # A loaded, NON-boundary item is not cross-file even with a shape
-        # the old test would have matched — the attribute is authoritative.
-        bare = '/p/s.jsonl'
+        # A loaded, NON-boundary item is not cross-file even with a tag
+        # the fallback would have matched — the attribute is authoritative.
+        bare = ('session', '/p/s.jsonl')
         nonboundary = type('I', (), {'id': bare, 'boundary': False})()
         self.r._BROWSER = _B({bare: nonboundary})
         self.assertFalse(self.r._is_cross_file_id(bare))
 
     def test_is_cross_file_fallback_when_not_loaded(self):
-        # _BROWSER is None (this suite's default) → fall back to the OLD
-        # id-shape predicate; parity for #agent: / bare-.jsonl rows.
-        self.assertTrue(self.r._is_cross_file_id('/p/s.jsonl#agent:A1'))
-        self.assertTrue(self.r._is_cross_file_id('/p/s.jsonl'))
-        # Non-cross-file shapes stay False.
-        self.assertFalse(self.r._is_cross_file_id('/p/s.jsonl#3'))
-        self.assertFalse(self.r._is_cross_file_id('/p/s.jsonl#prompt:0'))
-        self.assertFalse(self.r._is_cross_file_id('/some/dir'))
+        # _BROWSER is None (this suite's default) → fall back to the id-tag
+        # predicate; parity for ('agent', …) / ('session', …) rows.
+        self.assertTrue(self.r._is_cross_file_id(('agent', '/p/s.jsonl', 'A1')))
+        self.assertTrue(self.r._is_cross_file_id(('session', '/p/s.jsonl')))
+        # Non-cross-file tags stay False.
+        self.assertFalse(self.r._is_cross_file_id(('msg', '/p/s.jsonl', 3)))
+        self.assertFalse(self.r._is_cross_file_id(('prompt', '/p/s.jsonl', 0)))
+        self.assertFalse(self.r._is_cross_file_id(('project', '/some/dir')))
         self.assertFalse(self.r._is_cross_file_id(None))
 
     def test_is_cross_file_fallback_when_browser_lacks_get_item(self):
         # A Browser stand-in without get_item (older fakes / headless) is
-        # treated like "not loaded" → id-shape fallback, never an
+        # treated like "not loaded" → id-tag fallback, never an
         # AttributeError.
         self.r._BROWSER = type('B', (), {})()
-        self.assertTrue(self.r._is_cross_file_id('/p/s.jsonl#agent:A1'))
-        self.assertFalse(self.r._is_cross_file_id('/p/s.jsonl#3'))
+        self.assertTrue(self.r._is_cross_file_id(('agent', '/p/s.jsonl', 'A1')))
+        self.assertFalse(self.r._is_cross_file_id(('msg', '/p/s.jsonl', 3)))
 
     # ---- (c) get_preview reorder + md file-doc fallback are exercised in
     #          TestMarkdownSubtrees (which loads the recipe with md_doc live,
@@ -8629,9 +8662,9 @@ class TestBoundaryMigration(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess, agent_path = self._project_with_subagent(tmp)
-            parent_id = f'{sess}#prompt:0'
-            agent_id = f'{sess}#agent:A1'
-            leaf_id = f'{sess}#0'   # the PARENT-LEAF-BODY user line
+            parent_id = ('prompt', sess, 0)
+            agent_id = ('agent', sess, 'A1')
+            leaf_id = ('msg', sess, 0)   # the PARENT-LEAF-BODY user line
 
             boundary_child = type(
                 'I', (), {'id': agent_id, 'boundary': True, 'hidden': False})()

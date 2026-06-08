@@ -2,14 +2,19 @@
 
 The recipe is a single-file ``--run-py`` script that imports
 ``browse_tui`` (only available when the binary loads it). To exercise
-the id parser, the diff colorizer, and the positional classifier
-directly we stub ``browse_tui`` in ``sys.modules`` and load the
-extension-less recipe via ``SourceFileLoader`` — the same pattern as
-``test/unit/test_browse_md.py``.
+the diff colorizer and the positional classifier directly we stub
+``browse_tui`` in ``sys.modules`` and load the extension-less recipe via
+``SourceFileLoader`` — the same pattern as ``test/unit/test_browse_md.py``.
+
+Row ids are tagged tuples (``('commit', sha)``, ``('file', sha, path)``,
+…) built directly by the construction sites; there is no id-string parser
+to test in isolation, so the id-shape coverage lives in the per-builder
+tests below (each asserts the tuple its rows carry) and the ``id[0]``
+dispatch is covered end-to-end against a real headless Browser in
+``test/ui/test_recipe_browse_git.py``.
 
 Coverage (ticket #616 — structural backbone):
 
-* ``_parse_id``            every kind, incl. colon paths / slash refnames
 * ``_colorize_diff``       ANSI on both the delta and git-fallback paths
 * ``_classify_positionals``  path / rev / ``--`` / unknown(→exit)
 
@@ -30,7 +35,7 @@ Coverage (ticket #619 — status mode):
 
 Coverage (ticket #620 — stash mode):
 
-* ``_stash_index``         ``stash@{n}`` → ``n`` (or None)
+* ``_stash_index``         ``stash@{n}`` → ``n`` int (or None)
 * ``_stash_row``           NUL record → stash Item (id/tag/title/chips)
 
 Coverage (ticket #621 — branches mode):
@@ -55,8 +60,9 @@ Coverage (ticket #701 — tree-mode commit graph):
   pass through) — ANSI-safely, only on the plain runs between SGR sequences —
   preserves internal spacing, rstrips trailing pad
 * ``_commit_graph_items``  ``git log --graph`` lines → commit Items (with
-  ``col_graph``) interleaved with ``meta=True`` filler Items (``filler:<n>``,
-  ``has_children`` False, no ``col_sha``); git line order preserved
+  ``col_graph``) interleaved with ``meta=True`` filler Items
+  (``('filler', ns, n)``, ``has_children`` False, no ``col_sha``); git line
+  order preserved
 * ``_log_items``           routes to the graph builder when ``_tree_mode``
   else the plain ``_commit_log_items`` (off-path unchanged)
 * ``git_row_content``      commit row inserts the graph after the date
@@ -196,77 +202,6 @@ class _FakeCtx:
         return self._widths[field]
 
 
-class TestParseId(unittest.TestCase):
-    """``_parse_id`` classifies every prefixed id shape."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.r = _load_recipe()
-
-    def test_root(self):
-        self.assertEqual(self.r._parse_id(None), ('root',))
-
-    def test_non_string(self):
-        self.assertEqual(self.r._parse_id(42), ('other', 42))
-
-    def test_error_row(self):
-        self.assertEqual(self.r._parse_id('__error__'), ('err', ''))
-
-    def test_commit(self):
-        self.assertEqual(self.r._parse_id('commit:abc123'),
-                         ('commit', 'abc123'))
-
-    def test_file(self):
-        self.assertEqual(self.r._parse_id('file:abc123:src/main.py'),
-                         ('file', 'abc123', 'src/main.py'))
-
-    def test_file_path_with_colon(self):
-        # A path may itself contain a colon — only the first ':' after the
-        # sha splits.
-        self.assertEqual(self.r._parse_id('file:abc123:a/b:c.txt'),
-                         ('file', 'abc123', 'a/b:c.txt'))
-
-    def test_status(self):
-        self.assertEqual(self.r._parse_id('status:M :src/x.py'),
-                         ('status', 'M ', 'src/x.py'))
-
-    def test_status_path_with_colon(self):
-        self.assertEqual(self.r._parse_id('status:??:weird:name'),
-                         ('status', '??', 'weird:name'))
-
-    def test_ref_simple(self):
-        self.assertEqual(self.r._parse_id('ref:main'), ('ref', 'main'))
-
-    def test_ref_with_slashes(self):
-        # Refnames carry '/' (origin/feature/x) — kept verbatim.
-        self.assertEqual(self.r._parse_id('ref:origin/feature/x'),
-                         ('ref', 'origin/feature/x'))
-
-    def test_ref_with_colon(self):
-        # A refname may (rarely) contain ':'; ref keeps all of rest.
-        self.assertEqual(self.r._parse_id('ref:weird:ref'),
-                         ('ref', 'weird:ref'))
-
-    def test_reflog(self):
-        self.assertEqual(self.r._parse_id('reflog:3:deadbeef'),
-                         ('reflog', '3', 'deadbeef'))
-
-    def test_stash_node(self):
-        self.assertEqual(self.r._parse_id('stash:0'), ('stash', '0'))
-
-    def test_stash_file(self):
-        self.assertEqual(self.r._parse_id('stash:0:src/x.py'),
-                         ('stash', '0', 'src/x.py'))
-
-    def test_stash_file_path_with_colon(self):
-        self.assertEqual(self.r._parse_id('stash:1:a:b.py'),
-                         ('stash', '1', 'a:b.py'))
-
-    def test_unknown_prefix(self):
-        self.assertEqual(self.r._parse_id('weird:thing'),
-                         ('other', 'thing'))
-
-
 class TestColorizeDiff(unittest.TestCase):
     """``_colorize_diff`` returns ANSI on both delta and fallback paths."""
 
@@ -319,6 +254,124 @@ class TestColorizeDiff(unittest.TestCase):
         out = self.r._colorize_diff(self.colored)
         self.assertIn('\x1b[', out)
         self.assertIn('rendered', out)
+
+
+class TestDispatchRoundTrip(unittest.TestCase):
+    """``get_children`` / ``get_preview`` / ``edit_file`` route on ``id[0]``.
+
+    The recipe carries every row's tagged tuple straight back through the
+    framework, so dispatch is a flat ``id[0]`` match with direct field access
+    (no string parsing). These tests stub each leaf builder to capture the
+    decoded fields and assert the tag routes to the right builder with the
+    fields intact — including the former colon-in-path / colon-or-slash-in-ref
+    hazards, which are now clean tuple fields — and that the root, sentinel,
+    and filler ids stay inert.
+    """
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self.r._paths = []
+
+    def test_get_children_routes_each_tag_to_its_builder(self):
+        shas = []
+        calls = {}
+        self.r._commit_files = lambda sha: shas.append(sha)
+        self.r._log_items = (
+            lambda revs, paths, ns: calls.__setitem__('ref', (revs, ns)))
+        self.r._worktree_files = (
+            lambda bucket, paths: calls.__setitem__('wc', bucket))
+        self.r._stash_files = lambda n: calls.__setitem__('stash', n)
+
+        # commit / reflog both drill the file list off a sha (id[1] / id[2]).
+        self.r.get_children(('commit', 'abc123'))
+        self.r.get_children(('reflog', 3, 'deadbeef'))
+        self.assertEqual(shas, ['abc123', 'deadbeef'])
+
+        # A ref drills into its commits; the full refname (slashes/colons and
+        # all) is the sole rev, and the id itself is threaded as the ns.
+        self.r.get_children(('ref', 'origin/feature/x'))
+        self.assertEqual(
+            calls['ref'], (['origin/feature/x'], ('ref', 'origin/feature/x')))
+
+        # A worktree group routes by bucket; a stash node by its int index.
+        self.r.get_children(('wc', 'staged'))
+        self.assertEqual(calls['wc'], 'staged')
+        self.r.get_children(('stash', 2))
+        self.assertEqual(calls['stash'], 2)
+
+    def test_get_children_leaves_and_sentinels_are_inert(self):
+        # Root → root children (stub the per-mode builder); everything else
+        # below is a leaf / sentinel / filler → empty, no builder reached.
+        self.r._root_children = lambda: ['ROOT']
+        self.assertEqual(self.r.get_children(None), ['ROOT'])
+        for leaf in (('file', 'sha', 'a/b:c.txt'), ('status', 'M ', 'p.txt'),
+                     ('stash', 0, 'p.txt'), ('status_clean',),
+                     ('stash_none',), ('err',), ('filler', 'root', 0)):
+            self.assertEqual(self.r.get_children(leaf), [], leaf)
+
+    def test_get_preview_routes_each_tag_with_fields_intact(self):
+        commit_shas = []
+        seen = {}
+        self.r._commit_preview = lambda sha: commit_shas.append(sha)
+        self.r._file_preview = (
+            lambda sha, path: seen.__setitem__('file', (sha, path)))
+        self.r._status_preview = (
+            lambda xy, path: seen.__setitem__('status', (xy, path)))
+        self.r._worktree_preview = (
+            lambda bucket, paths: seen.__setitem__('wc', bucket))
+        self.r._stash_preview = lambda n: seen.__setitem__('stash', n)
+        self.r._stash_file_preview = (
+            lambda n, path: seen.__setitem__('stashfile', (n, path)))
+
+        # commit + ref both resolve as a commit-ish → _commit_preview; a
+        # colon-bearing refname reaches it verbatim (no string splitting).
+        self.r.get_preview(('commit', 'abc'))
+        self.r.get_preview(('ref', 'weird:ref'))
+        self.assertEqual(commit_shas, ['abc', 'weird:ref'])
+
+        self.r.get_preview(('file', 'sha', 'a/b:c.txt'))  # colon-bearing path
+        self.r.get_preview(('status', 'M ', 'x:y.py'))
+        self.r.get_preview(('wc', 'tracked'))
+        self.r.get_preview(('stash', 1))
+        self.r.get_preview(('stash', 1, 'a:b.py'))
+        self.assertEqual(seen, {
+            'file': ('sha', 'a/b:c.txt'),
+            'status': ('M ', 'x:y.py'),
+            'wc': 'tracked',
+            'stash': 1,
+            'stashfile': (1, 'a:b.py'),
+        })
+
+    def test_get_preview_root_and_sentinels_are_empty(self):
+        for inert in (None, ('status_clean',), ('stash_none',), ('err',),
+                      ('filler', 'root', 0)):
+            self.assertEqual(self.r.get_preview(inert), '', inert)
+
+    def test_edit_file_reads_path_field_for_file_and_status(self):
+        targets = []
+        self.r._run_git = lambda *a: subprocess.CompletedProcess(a, 1, '', '')
+
+        class Ctx:
+            cursor = None
+
+            def run_external(self, argv):
+                targets.append(argv)
+
+        ctx = Ctx()
+        # file / status both carry the path at id[2]; a colon-bearing path is
+        # handed to $EDITOR verbatim (no repo root resolved here, rc != 0).
+        ctx.cursor = self.r.Item(id=('file', 'sha', 'a/b:c.txt'))
+        self.r.edit_file(ctx)
+        ctx.cursor = self.r.Item(id=('status', 'M ', 'x.py'))
+        self.r.edit_file(ctx)
+        self.assertEqual([argv[-1] for argv in targets], ['a/b:c.txt', 'x.py'])
+
+        # A commit / ref / stash row maps to no working-tree path → no-op.
+        targets.clear()
+        for nonfile in (('commit', 'sha'), ('ref', 'main'), ('stash', 0)):
+            ctx.cursor = self.r.Item(id=nonfile)
+            self.r.edit_file(ctx)
+        self.assertEqual(targets, [])
 
 
 class TestClassifyPositionals(unittest.TestCase):
@@ -568,9 +621,9 @@ class TestReflogRow(unittest.TestCase):
             'deadbeef0000000000000000000000000000abcd',
             'HEAD@{0}', '2 days ago', 'HEAD -> main', 'commit: two')
         item = self.r._reflog_row(0, line)
-        # id encodes the enumeration index n=0 + the sha.
+        # id is the tagged tuple ('reflog', n, sha) — n is the int index.
         self.assertEqual(
-            item.id, 'reflog:0:deadbeef0000000000000000000000000000abcd')
+            item.id, ('reflog', 0, 'deadbeef0000000000000000000000000000abcd'))
         self.assertEqual(item.tag, 'deadbee')
         self.assertEqual(item.tag_style, 'yellow')
         self.assertEqual(item.title, 'commit: two')
@@ -588,7 +641,7 @@ class TestReflogRow(unittest.TestCase):
         sha = 'cafe00000000000000000000000000000000babe'
         line = self._record(sha, 'HEAD@{3}', '1 hour ago', '', 'reset: moving')
         item = self.r._reflog_row(3, line)
-        self.assertEqual(item.id, f'reflog:3:{sha}')
+        self.assertEqual(item.id, ('reflog', 3, sha))
         self.assertEqual(item.chips, [('HEAD@{3}', 'dim'), ('1 hour ago', 'dim')])
 
     def test_malformed_returns_none(self):
@@ -717,10 +770,11 @@ class TestStashIndex(unittest.TestCase):
         cls.r = _load_recipe()
 
     def test_zero(self):
-        self.assertEqual(self.r._stash_index('stash@{0}'), '0')
+        # The index is a real int now (no longer the digit string).
+        self.assertEqual(self.r._stash_index('stash@{0}'), 0)
 
     def test_double_digit(self):
-        self.assertEqual(self.r._stash_index('stash@{12}'), '12')
+        self.assertEqual(self.r._stash_index('stash@{12}'), 12)
 
     def test_non_index_selector(self):
         self.assertIsNone(self.r._stash_index('garbage'))
@@ -740,7 +794,7 @@ class TestStashRow(unittest.TestCase):
     def test_full_record(self):
         item = self.r._stash_row(
             self._record('stash@{0}', '2 hours ago', 'WIP on main: abc init'))
-        self.assertEqual(item.id, 'stash:0')
+        self.assertEqual(item.id, ('stash', 0))
         self.assertEqual(item.tag, 'stash@{0}')
         self.assertEqual(item.tag_style, 'yellow')
         self.assertEqual(item.title, 'WIP on main: abc init')
@@ -751,7 +805,7 @@ class TestStashRow(unittest.TestCase):
         item = self.r._stash_row(
             self._record('stash@{3}', '1 day ago', 'On main: hotfix'))
         # id keys on the index extracted from the selector, not enumeration.
-        self.assertEqual(item.id, 'stash:3')
+        self.assertEqual(item.id, ('stash', 3))
         self.assertEqual(item.tag, 'stash@{3}')
 
     def test_malformed_returns_none(self):
@@ -855,7 +909,7 @@ class TestCommitLogItems(unittest.TestCase):
         self.assertEqual(len(items), 1)
         it = items[0]
         self.assertEqual(it.id,
-                         'commit:deadbeefcafe1234567890abcdef000000000000')
+                         ('commit', 'deadbeefcafe1234567890abcdef000000000000'))
         self.assertEqual(it.title, 'first subject')
         self.assertTrue(it.has_children)
 
@@ -893,7 +947,7 @@ class TestCommitLogItems(unittest.TestCase):
         self.r._run_git = fake_run_git
         items = self.r._commit_log_items([], [])
         self.assertEqual(len(items), 1)
-        self.assertEqual(items[0].id, '__error__')
+        self.assertEqual(items[0].id, ('err',))
         # The error row has no col_sha → git_row_content falls back for it.
         self.assertIsNone(getattr(items[0], 'col_sha', None))
 
@@ -909,7 +963,7 @@ class TestGitRowContent(unittest.TestCase):
         return {'col_sha': sha, 'col_author': author, 'col_date': date}
 
     def _commit_item(self, **kw):
-        defaults = dict(id='commit:deadbee', title='subj',
+        defaults = dict(id=('commit', 'deadbee'), title='subj',
                         col_sha='deadbee', col_author='Alice',
                         col_date='2 days ago', chips=[])
         defaults.update(kw)
@@ -985,7 +1039,7 @@ class TestGitRowContent(unittest.TestCase):
         # leading columns to the commit widths — the label then begins at
         # the same offset as a commit subject (no decoration chips).
         ctx = _FakeCtx(self._widths(sha=7, author=5, date=12))
-        item = self.r.Item(id='wc:untracked', title='Untracked changes',
+        item = self.r.Item(id=('wc', 'untracked'), title='Untracked changes',
                            col_sha='', col_author='', col_date='',
                            has_children=True)
         segs = self.r.git_row_content(item, ctx)
@@ -1011,44 +1065,22 @@ class TestGitRowContent(unittest.TestCase):
         # A status/stash/ref/file row (no col_sha) must return EXACTLY
         # default_row_content(item, ctx) and never measure a column.
         ctx = _FakeCtx(self._widths())
-        item = self.r.Item(id='status:M :beta.txt', title='beta.txt',
+        item = self.r.Item(id=('status', 'M ', 'beta.txt'), title='beta.txt',
                            tag='M', tag_style='yellow', has_children=False)
         segs = self.r.git_row_content(item, ctx)
         self.assertEqual(segs, self.r.default_row_content(item, ctx))
         self.assertEqual(segs,
-                         [('DEFAULT', 'status:M :beta.txt', 'beta.txt')])
+                         [('DEFAULT', ('status', 'M ', 'beta.txt'), 'beta.txt')])
         # The fallback path must not measure columns.
         self.assertEqual(ctx.calls, [])
 
     def test_explicit_none_col_sha_also_falls_back(self):
         # Defensive: col_sha present but None still takes the fallback.
         ctx = _FakeCtx(self._widths())
-        item = self.r.Item(id='__error__', title='boom', col_sha=None)
+        item = self.r.Item(id=('err',), title='boom', col_sha=None)
         segs = self.r.git_row_content(item, ctx)
         self.assertEqual(segs, self.r.default_row_content(item, ctx))
         self.assertEqual(ctx.calls, [])
-
-
-class TestParseIdWorktree(unittest.TestCase):
-    """``_parse_id`` understands the ``wc:<bucket>`` worktree-group kind."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.r = _load_recipe()
-
-    def test_untracked_bucket(self):
-        self.assertEqual(self.r._parse_id('wc:untracked'),
-                         ('wc', 'untracked'))
-
-    def test_tracked_bucket(self):
-        self.assertEqual(self.r._parse_id('wc:tracked'), ('wc', 'tracked'))
-
-    def test_staged_bucket(self):
-        self.assertEqual(self.r._parse_id('wc:staged'), ('wc', 'staged'))
-
-    def test_conflicts_bucket(self):
-        self.assertEqual(self.r._parse_id('wc:conflicts'),
-                         ('wc', 'conflicts'))
 
 
 class TestIsConflict(unittest.TestCase):
@@ -1162,7 +1194,7 @@ class TestWorktreeGroups(unittest.TestCase):
 
     def test_ordering_and_labels(self):
         # All four buckets non-empty: rows follow _WC_GROUPS order, ids are
-        # wc:<bucket>, titles are the group labels, all expandable.
+        # ('wc', bucket), titles are the group labels, all expandable.
         self.r._worktree_status = lambda paths: [
             ('??', 'new.txt'),
             (' M', 'w.txt'),
@@ -1172,10 +1204,10 @@ class TestWorktreeGroups(unittest.TestCase):
         items = self.r._worktree_groups([])
         self.assertEqual(
             [(it.id, it.title) for it in items],
-            [('wc:untracked', 'Untracked changes'),
-             ('wc:tracked', 'Tracked changes'),
-             ('wc:staged', 'Staged changes'),
-             ('wc:conflicts', 'Conflicts')])
+            [(('wc', 'untracked'), 'Untracked changes'),
+             (('wc', 'tracked'), 'Tracked changes'),
+             (('wc', 'staged'), 'Staged changes'),
+             (('wc', 'conflicts'), 'Conflicts')])
         self.assertTrue(all(it.has_children for it in items))
 
     def test_rows_carry_empty_alignment_columns(self):
@@ -1194,7 +1226,7 @@ class TestWorktreeGroups(unittest.TestCase):
         ]
         items = self.r._worktree_groups([])
         self.assertEqual([it.id for it in items],
-                         ['wc:untracked', 'wc:staged'])
+                         [('wc', 'untracked'), ('wc', 'staged')])
 
     def test_clean_tree_yields_no_rows(self):
         # A clean tree (status → []) produces no synthetic rows at all.
@@ -1222,29 +1254,30 @@ class TestCommitsRootWorktreeScope(unittest.TestCase):
         self.r._tree_mode = False
 
     def test_revs_suppress_worktree_rows(self):
-        # A positional rev makes the log historical — no live wc: rows.
+        # A positional rev makes the log historical — no live wc rows.
         self.r._revs = ['HEAD~1']
         self.r._paths = []
-        sentinel = self.r.Item(id='commit:sentinel', title='s',
+        sentinel = self.r.Item(id=('commit', 'sentinel'), title='s',
                                has_children=True)
         self.r._commit_log_items = lambda revs, paths: [sentinel]
         self.r._worktree_status = lambda paths: [('M ', 's.txt')]
         items = self.r._commits_root()
         ids = [getattr(it, 'id', None) for it in items]
-        self.assertIn('commit:sentinel', ids)
-        self.assertFalse(any(str(i).startswith('wc:') for i in ids))
+        self.assertIn(('commit', 'sentinel'), ids)
+        self.assertFalse(
+            any(isinstance(i, tuple) and i[0] == 'wc' for i in ids))
 
     def test_no_revs_prepends_worktree_rows(self):
-        # With no rev, the wc: rows appear BEFORE the commit rows.
+        # With no rev, the wc rows appear BEFORE the commit rows.
         self.r._revs = []
         self.r._paths = []
-        sentinel = self.r.Item(id='commit:sentinel', title='s',
+        sentinel = self.r.Item(id=('commit', 'sentinel'), title='s',
                                has_children=True)
         self.r._commit_log_items = lambda revs, paths: [sentinel]
         self.r._worktree_status = lambda paths: [('M ', 's.txt')]
         items = self.r._commits_root()
         ids = [getattr(it, 'id', None) for it in items]
-        self.assertEqual(ids, ['wc:staged', 'commit:sentinel'])
+        self.assertEqual(ids, [('wc', 'staged'), ('commit', 'sentinel')])
 
 
 class TestWorktreeFiles(unittest.TestCase):
@@ -1260,7 +1293,7 @@ class TestWorktreeFiles(unittest.TestCase):
             ('??', 'new.txt'),
         ]
         items = self.r._worktree_files('staged', [])
-        self.assertEqual([it.id for it in items], ['status:M :s.txt'])
+        self.assertEqual([it.id for it in items], [('status', 'M ', 's.txt')])
         it = items[0]
         self.assertEqual(it.title, 's.txt')
         self.assertEqual(it.tag, 'M')
@@ -1305,11 +1338,20 @@ class TestStatusLeafDedup(unittest.TestCase):
 
     def test_status_leaf_shape(self):
         leaf = self.r._status_leaf('??', 'new.txt')
-        self.assertEqual(leaf.id, 'status:??:new.txt')
+        self.assertEqual(leaf.id, ('status', '??', 'new.txt'))
         self.assertEqual(leaf.title, 'new.txt')
         self.assertEqual(leaf.tag, '?')
         self.assertEqual(leaf.tag_style, 'dim')
         self.assertFalse(leaf.has_children)
+
+    def test_colon_in_path_is_a_clean_field(self):
+        # The old string-id codec had to split a 'status:XY:path' string, so a
+        # path (or XY space) containing ':' was a documented hazard. As a tuple
+        # field the path rides verbatim — no splitting, no ambiguity, and the
+        # XY column (which carries a space) stays its own field.
+        leaf = self.r._status_leaf('M ', 'weird:name:with:colons.txt')
+        self.assertEqual(
+            leaf.id, ('status', 'M ', 'weird:name:with:colons.txt'))
 
 
 class TestGraphTranslate(unittest.TestCase):
@@ -1424,7 +1466,7 @@ class TestCommitGraphItems(unittest.TestCase):
         self.assertEqual(len(items), 1)
         it = items[0]
         # Same columnar commit Item as the plain builder…
-        self.assertEqual(it.id, f'commit:{sha}')
+        self.assertEqual(it.id, ('commit', sha))
         self.assertEqual(it.title, 'first subject')
         self.assertTrue(it.has_children)
         self.assertEqual(it.col_sha, 'deadbee')
@@ -1445,9 +1487,9 @@ class TestCommitGraphItems(unittest.TestCase):
         items = self.r._commit_graph_items([], [], 'root')
         self.assertEqual(len(items), 2)
         filler = items[1]
-        # Filler ids are namespaced by the build (ns='root' here) then a
-        # per-build running counter.
-        self.assertEqual(filler.id, 'filler:root:0')
+        # Filler ids are the tuple ('filler', ns, n) — ns='root' here, n the
+        # per-build running counter (an int).
+        self.assertEqual(filler.id, ('filler', 'root', 0))
         self.assertEqual(filler.title, '')
         self.assertFalse(filler.has_children)
         # meta=True is what makes the framework skip the cursor over the row
@@ -1458,9 +1500,10 @@ class TestCommitGraphItems(unittest.TestCase):
         # The whole line is the (translated) art: '|\' -> '│\' (the lane
         # becomes box-vertical, the diagonal passes through).
         self.assertEqual(filler.col_graph, '│\\')
-        # _parse_id partitions on the first ':' so a namespaced filler id is
-        # still kind 'other' (inert everywhere); rest keeps the ns:n tail.
-        self.assertEqual(self.r._parse_id(filler.id), ('other', 'root:0'))
+        # The 'filler' tag matches no get_children / get_preview branch, so the
+        # row is inert everywhere — no drill-down, no preview.
+        self.assertEqual(self.r.get_children(filler.id), [])
+        self.assertEqual(self.r.get_preview(filler.id), '')
 
     def test_order_preserved_and_filler_indices_run(self):
         # Commits + fillers interleave in git's emitted order; filler ids
@@ -1475,7 +1518,8 @@ class TestCommitGraphItems(unittest.TestCase):
         ])
         items = self.r._commit_graph_items([], [], 'root')
         self.assertEqual([it.id for it in items], [
-            f'commit:{s1}', 'filler:root:0', f'commit:{s2}', 'filler:root:1',
+            ('commit', s1), ('filler', 'root', 0),
+            ('commit', s2), ('filler', 'root', 1),
         ])
         # The second commit's art keeps its leading lane: '| * ' -> '│ •'.
         self.assertEqual(items[2].col_graph, '│ •')
@@ -1487,7 +1531,7 @@ class TestCommitGraphItems(unittest.TestCase):
         self.r._run_git = fake_run_git
         items = self.r._commit_graph_items([], [], 'root')
         self.assertEqual(len(items), 1)
-        self.assertEqual(items[0].id, '__error__')
+        self.assertEqual(items[0].id, ('err',))
 
     def test_revs_and_paths_threaded_into_args(self):
         # The rev/path args + the -n limit reach git log (alongside --graph).
@@ -1533,13 +1577,14 @@ class TestLogItemsRouting(unittest.TestCase):
                          ['PLAIN', ['r'], ['p']])
 
     def test_routes_to_graph_when_tree_on_threading_ns(self):
-        # Tree on: the graph builder is used and the ns is threaded through.
+        # Tree on: the graph builder is used and the ns is threaded through
+        # verbatim — a ref drill-down passes its ('ref', refname) id as ns.
         self.r._tree_mode = True
         self.r._commit_log_items = lambda revs, paths: ['PLAIN', revs, paths]
         self.r._commit_graph_items = (
             lambda revs, paths, ns: ['GRAPH', revs, paths, ns])
-        self.assertEqual(self.r._log_items(['r'], ['p'], ns='ref:feat'),
-                         ['GRAPH', ['r'], ['p'], 'ref:feat'])
+        self.assertEqual(self.r._log_items(['r'], ['p'], ns=('ref', 'feat')),
+                         ['GRAPH', ['r'], ['p'], ('ref', 'feat')])
 
     def test_tree_mode_defaults_on(self):
         # The commit-graph column is ON by default (toggle off with
@@ -1560,7 +1605,7 @@ class TestGitRowContentGraph(unittest.TestCase):
     def test_commit_graph_inserted_after_date_before_chips(self):
         ctx = _FakeCtx(self._widths(sha=7, author=5, date=12))
         item = self.r.Item(
-            id='commit:deadbee', title='subj', col_sha='deadbee',
+            id=('commit', 'deadbee'), title='subj', col_sha='deadbee',
             col_author='Al', col_date='2 days ago',
             chips=[('HEAD', 'green')], col_graph='•')
         segs = self.r.git_row_content(item, ctx)
@@ -1580,7 +1625,7 @@ class TestGitRowContentGraph(unittest.TestCase):
         # graph segment anywhere.
         ctx = _FakeCtx(self._widths(sha=7, author=5, date=12))
         item = self.r.Item(
-            id='commit:deadbee', title='subj', col_sha='deadbee',
+            id=('commit', 'deadbee'), title='subj', col_sha='deadbee',
             col_author='Al', col_date='2 days ago', chips=[])
         segs = self.r.git_row_content(item, ctx)
         self.assertEqual(segs, [
@@ -1595,8 +1640,8 @@ class TestGitRowContentGraph(unittest.TestCase):
         # span then renders its art; both segments use fg=None so git's own
         # colour codes in the art show through.
         ctx = _FakeCtx(self._widths(sha=7, author=5, date=12))
-        item = self.r.Item(id='filler:root:0', title='', has_children=False,
-                           col_graph='│\\')
+        item = self.r.Item(id=('filler', 'root', 0), title='',
+                           has_children=False, col_graph='│\\')
         segs = self.r.git_row_content(item, ctx)
         self.assertEqual(len(segs), 2)
         pad_seg, art_seg = segs
@@ -1612,11 +1657,11 @@ class TestGitRowContentGraph(unittest.TestCase):
         # prefix width so the two graph columns line up vertically.
         widths = self._widths(sha=7, author=7, date=12)
         commit = self.r.Item(
-            id='commit:abc1234', title='c', col_sha='abc1234',
+            id=('commit', 'abc1234'), title='c', col_sha='abc1234',
             col_author='Bernard', col_date='3 weeks ago', chips=[],
             col_graph='•')
-        filler = self.r.Item(id='filler:root:0', title='', has_children=False,
-                             col_graph='│')
+        filler = self.r.Item(id=('filler', 'root', 0), title='',
+                             has_children=False, col_graph='│')
         c_segs = self.r.git_row_content(commit, _FakeCtx(widths))
         f_segs = self.r.git_row_content(filler, _FakeCtx(widths))
         # Sum of the commit's three metadata column widths == filler pad len.
@@ -1627,7 +1672,7 @@ class TestGitRowContentGraph(unittest.TestCase):
         # A row with neither col_sha nor col_graph (status/ref/etc.) still
         # falls back to default_row_content and measures no column.
         ctx = _FakeCtx(self._widths())
-        item = self.r.Item(id='status:M :beta.txt', title='beta.txt',
+        item = self.r.Item(id=('status', 'M ', 'beta.txt'), title='beta.txt',
                            tag='M', tag_style='yellow', has_children=False)
         segs = self.r.git_row_content(item, ctx)
         self.assertEqual(segs, self.r.default_row_content(item, ctx))

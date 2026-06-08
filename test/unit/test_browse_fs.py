@@ -189,11 +189,11 @@ class TestFsRowContent(unittest.TestCase):
         # An item without col_perms (error / synthetic) must return EXACTLY
         # default_row_content(item, ctx) — no columns, no max_col_width call.
         ctx = _FakeCtx(self._widths())
-        item = _make_item(self.r, id='__err__:/x', title='[error] boom',
+        item = _make_item(self.r, id=('err', '/x'), title='[error] boom',
                           tag='err', tag_style='red')
         segs = self.r.fs_row_content(item, ctx)
         self.assertEqual(segs, self.r.default_row_content(item, ctx))
-        self.assertEqual(segs, [('DEFAULT', '__err__:/x', '[error] boom')])
+        self.assertEqual(segs, [('DEFAULT', ('err', '/x'), '[error] boom')])
         # The fallback path must not measure columns.
         self.assertEqual(ctx.calls, [])
 
@@ -257,7 +257,10 @@ class TestGetChildren(unittest.TestCase):
         items = self.r.get_children(missing)
         self.assertEqual(len(items), 1)
         err = items[0]
-        self.assertTrue(err.id.startswith('__err__:'))
+        # The error id is a tagged tuple carrying the failing dir path,
+        # not a magic-prefixed string (so a file named '__err__:foo'
+        # can't collide with it).
+        self.assertEqual(err.id, ('err', missing))
         self.assertEqual(err.tag, 'err')
         self.assertIsNone(getattr(err, 'col_perms', None))
         self.assertIsNone(getattr(err, 'col_size', None))
@@ -265,6 +268,9 @@ class TestGetChildren(unittest.TestCase):
         # And fs_row_content takes the fallback for it.
         self.assertEqual(self.r.fs_row_content(err, _FakeCtx({})),
                          self.r.default_row_content(err, _FakeCtx({})))
+        # get_preview routes the error id via its tuple tag (not os.scandir
+        # / open) and surfaces the failing path from id[1].
+        self.assertEqual(self.r.get_preview(err.id), missing)
 
 
 class TestGetPreviewDir(unittest.TestCase):
@@ -295,6 +301,97 @@ class TestGetPreviewDir(unittest.TestCase):
             # Dirs first (case-insensitive: alpha < Bravo), each with '/'.
             # Then files (apple < Zeta), no suffix.
             self.assertEqual(lines, ['alpha/', 'Bravo/', 'apple.txt', 'Zeta.txt'])
+
+
+class _ActionCtx:
+    """A minimal ``ctx`` for the e/o/d actions.
+
+    Records ``run_external`` argv lists and ``error`` messages; ``confirm``
+    is auto-answered (default yes) and remembered so a test can assert it
+    was never reached for a no-op. ``cursor`` is ``targets[0]``.
+    """
+
+    def __init__(self, targets, *, confirm=True):
+        self.targets = targets
+        self.cursor = targets[0] if targets else None
+        self._confirm_answer = confirm
+        self.external = []
+        self.errors = []
+        self.confirmed = False
+        self.refreshed = False
+
+    def run_external(self, argv):
+        self.external.append(argv)
+
+    def confirm(self, _msg):
+        self.confirmed = True
+        return self._confirm_answer
+
+    def error(self, msg):
+        self.errors.append(msg)
+
+    def refresh(self):
+        self.refreshed = True
+
+
+class TestActionsOnErrorRow(unittest.TestCase):
+    """The e/o/d actions are a safe no-op on the synthetic error row.
+
+    Its id is the tuple ``('err', path)``, not a filesystem path, so
+    feeding it to argv / ``os.path.isdir`` / ``os.remove`` would raise
+    ``TypeError`` (which ``delete``'s ``except OSError`` would NOT catch).
+    Each action must skip non-``str`` ids instead of crashing.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _err_item(self):
+        return _make_item(self.r, id=('err', '/nope'), title='[error] boom',
+                          tag='err', tag_style='red')
+
+    def test_edit_error_row_is_noop(self):
+        ctx = _ActionCtx([self._err_item()])
+        self.r.edit(ctx)                      # must not raise
+        self.assertEqual(ctx.external, [])    # no editor launched
+
+    def test_open_error_row_is_noop(self):
+        ctx = _ActionCtx([self._err_item()])
+        self.r.open_(ctx)                     # must not raise
+        self.assertEqual(ctx.external, [])    # nothing handed to xdg-open
+
+    def test_delete_error_row_is_noop(self):
+        ctx = _ActionCtx([self._err_item()])
+        self.r.delete(ctx)                    # must not raise (was TypeError)
+        # Nothing deleted, nothing refreshed, and confirm was never even
+        # reached (no real targets to act on).
+        self.assertFalse(ctx.confirmed)
+        self.assertFalse(ctx.refreshed)
+        self.assertEqual(ctx.errors, [])
+
+    def test_delete_skips_error_row_but_acts_on_real_targets(self):
+        # A mixed selection (one real file + the error row) deletes only
+        # the real file; the tuple id is filtered out without crashing.
+        with tempfile.TemporaryDirectory() as d:
+            fpath = os.path.join(d, 'real.txt')
+            with open(fpath, 'wb') as f:
+                f.write(b'x')
+            real = _make_item(self.r, id=fpath, title='real.txt')
+            ctx = _ActionCtx([real, self._err_item()])
+            self.r.delete(ctx)
+            self.assertTrue(ctx.confirmed)        # a real target was present
+            self.assertFalse(os.path.exists(fpath))  # only the file went
+            self.assertTrue(ctx.refreshed)
+            self.assertEqual(ctx.errors, [])
+
+    def test_edit_real_cursor_still_launches_editor(self):
+        # The str guard must not block a normal path id.
+        real = _make_item(self.r, id='/tmp/x.txt', title='x.txt')
+        ctx = _ActionCtx([real])
+        self.r.edit(ctx)
+        self.assertEqual(len(ctx.external), 1)
+        self.assertEqual(ctx.external[0][-1], '/tmp/x.txt')
 
 
 if __name__ == '__main__':

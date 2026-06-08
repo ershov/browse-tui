@@ -91,15 +91,15 @@ class TestNoneReturn(unittest.TestCase):
 
 
 class TestMixedShapeReturn(unittest.TestCase):
-    """Mixed Item / str / tuple / dict in one return list — all coerced."""
+    """Mixed Item / str / hashable / dict in one return list — all coerced."""
 
     def test_mixed_shapes_all_land_in_cache(self):
         def kids(_pid, *, reload=False):
             return [
                 Item(id='a', title='A'),                # Item
-                'b',                                    # str → leaf
-                ('c', 'C'),                             # 2-tuple → id+title
-                {'id': 'd', 'title': 'D', 'tag': '!'},  # dict
+                'b',                                    # str → id (leaf)
+                ('c', 'sub'),                           # tuple → id verbatim
+                {'id': 'd', 'title': 'D', 'tag': '!'},  # dict (sets title)
             ]
 
         b = make_browser(get_children=kids, root_id='/')
@@ -108,12 +108,13 @@ class TestMixedShapeReturn(unittest.TestCase):
             b.run_until_idle()
             kids_cached = b._state._children['/']
             ids = [k.id for k in kids_cached]
-            self.assertEqual(ids, ['a', 'b', 'c', 'd'])
+            # Any hashable is the id — the tuple is an id, not (id, title).
+            self.assertEqual(ids, ['a', 'b', ('c', 'sub'), 'd'])
             # to_item rules carried through to the batch.
             self.assertEqual(kids_cached[0].title, 'A')
             self.assertEqual(kids_cached[1].title, 'b')   # str defaults
-            self.assertEqual(kids_cached[2].title, 'C')   # 2-tuple
-            self.assertEqual(kids_cached[3].title, 'D')   # dict
+            self.assertEqual(kids_cached[2].title, str(('c', 'sub')))  # tuple id
+            self.assertEqual(kids_cached[3].title, 'D')   # dict sets title
             self.assertEqual(kids_cached[3].tag, '!')
         finally:
             b.stop_workers()

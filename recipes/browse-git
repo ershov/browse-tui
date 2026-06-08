@@ -17,17 +17,25 @@ files. They honor the same path filter and appear only on an unscoped log
   branches  branches / remotes / tags via ``git for-each-ref``
   stash     ``git stash list``
 
-Every row id carries a mandatory ``KIND:`` prefix so dispatch never
-relies on hex-vs-word heuristics:
+Every row id is a tagged tuple whose first element is a short string
+``kind`` tag, so dispatch is a flat ``id[0]`` match with direct field
+access — never a hex-vs-word heuristic or substring scan:
 
-  commit:<sha>          a commit          -> changed files
-  file:<sha>:<path>     a file in a commit (leaf) -> per-file diff
-  ref:<refname>         a branch/remote/tag -> commits on that ref
-  status:<XY>:<path>    a working-tree entry (leaf) -> staged/worktree diff
-  wc:<bucket>           a status group (untracked/tracked/staged/conflicts)
-  stash:<n>[:<path>]    a stash, or a file in one
-  reflog:<n>:<sha>      a reflog entry    -> changed files
-  filler:<ns>:<n>       an inert tree-mode connector row (meta; no children)
+  ('commit', sha)            a commit          -> changed files
+  ('file', sha, path)        a file in a commit (leaf) -> per-file diff
+  ('ref', refname)           a branch/remote/tag -> commits on that ref
+  ('status', xy, path)       a working-tree entry (leaf) -> staged/worktree diff
+  ('wc', bucket)             a status group (untracked/tracked/staged/conflicts)
+  ('stash', n[, path])       a stash (n int), or a file in one
+  ('reflog', n, sha)         a reflog entry (n int) -> changed files
+  ('filler', ns, n)          an inert tree-mode connector row (meta; no children)
+  ('status_clean',)          the "working tree clean" sentinel (no children)
+  ('stash_none',)            the "no stashes" sentinel (no children)
+  ('err',)                   an error row (no children)
+
+Because path / refname ride as their own tuple field, a path or ref
+containing ':' or '/' is never ambiguous — there is no string to
+re-split.
 
 Commit rows render in columns — a yellow short-sha, a dim author and a
 dim relative date — followed by the branch / remote / tag refs parsed
@@ -242,63 +250,6 @@ def _pop_repo_dir():
         os.chdir(top.stdout.strip())
         del sys.argv[i]
         return
-
-
-# ---- id parsing ----------------------------------------------------------
-
-
-def _parse_id(item_id):
-    """Split a ``KIND:REST`` id into a structured tuple keyed by kind.
-
-    Returns a tuple whose first element is the kind string; the
-    remaining elements depend on the kind (see the module docstring's
-    id table):
-
-      ('root',)                          item_id is None
-      ('commit', sha)
-      ('file', sha, path)                path may contain ':'
-      ('ref', refname)                   refname may contain ':' or '/'
-      ('status', xy, path)               path may contain ':'
-      ('wc', bucket)                     a status group node
-      ('stash', n)                       a stash node
-      ('stash', n, path)                 a file within a stash
-      ('reflog', n, sha)
-      ('err', rest)                      __error__ rows (no children)
-      ('other', rest)                    unrecognised prefix
-
-    ``rest`` is split with ``split(':', 1)`` for the kinds that carry a
-    trailing path so colons inside paths survive; ``ref`` keeps the
-    whole remainder verbatim.
-    """
-    if item_id is None:
-        return ('root',)
-    if not isinstance(item_id, str):
-        return ('other', item_id)
-    if item_id == '__error__':
-        return ('err', '')
-
-    kind, _, rest = item_id.partition(':')
-
-    if kind == 'commit':
-        return ('commit', rest)
-    if kind == 'wc':
-        # A status-group node — the remainder is the bucket name.
-        return ('wc', rest)
-    if kind == 'ref':
-        # Refnames carry '/' (origin/main) and, rarely, ':' — keep all.
-        return ('ref', rest)
-    if kind in ('file', 'status'):
-        head, _, path = rest.partition(':')
-        return (kind, head, path)
-    if kind == 'reflog':
-        n, _, sha = rest.partition(':')
-        return ('reflog', n, sha)
-    if kind == 'stash':
-        n, sep, path = rest.partition(':')
-        if sep:
-            return ('stash', n, path)
-        return ('stash', n)
-    return ('other', rest)
 
 
 # ---- subprocess + colorization helpers -----------------------------------
@@ -619,7 +570,7 @@ def _status_diff_plan(xy, path):
 
 
 def _status_leaf(xy, path):
-    """Build one ``status:<XY>:<path>`` working-tree leaf Item.
+    """Build one ``('status', xy, path)`` working-tree leaf Item.
 
     Shared by ``_status_root`` (status mode) and ``_worktree_files`` (the
     commits-mode worktree groups) so both render a working-tree entry the
@@ -628,7 +579,7 @@ def _status_leaf(xy, path):
     is the staged / worktree / untracked diff chosen from the ``XY`` code.
     """
     tag = _status_tag(xy)
-    return Item(id=f'status:{xy}:{path}', title=path,
+    return Item(id=('status', xy, path), title=path,
                 tag=tag,
                 tag_style=_STATUS_LETTER_STYLE.get(tag, ''),
                 has_children=False)
@@ -647,40 +598,42 @@ _WC_GROUPS = [
 
 def _err_item(msg):
     """Return a single non-expandable error Item to render in the list."""
-    return [Item(id='__error__', title=msg, tag='err', tag_style='red')]
+    return [Item(id=('err',), title=msg, tag='err', tag_style='red')]
 
 
 # ---- children ------------------------------------------------------------
 
 
 def get_children(item_id, *, reload=False):
-    parsed = _parse_id(item_id)
-    kind = parsed[0]
-
-    if kind == 'root':
+    # Every id is a tagged tuple (``id[0]`` is the kind), or ``None`` for the
+    # root. Routing is a flat ``id[0]`` dispatch with direct field access — no
+    # substring scans, no ordering hazards.
+    if item_id is None:
         return _root_children()
+    if not isinstance(item_id, tuple) or not item_id:
+        return []
+    kind = item_id[0]
     if kind == 'commit':
-        return _commit_files(parsed[1])
+        return _commit_files(item_id[1])
     if kind == 'reflog':
         # A reflog entry drills into the same file list as a commit —
-        # a sha is a sha. parsed = ('reflog', n, sha).
-        return _commit_files(parsed[2])
-    if kind == 'stash' and len(parsed) == 2:
-        # A stash node (parsed = ('stash', n)) drills into its files; a
-        # stash file leaf (('stash', n, path)) has none. The synthetic
-        # "no stashes" row has a non-numeric n and yields [] too.
-        return _stash_files(parsed[1])
+        # a sha is a sha. id = ('reflog', n, sha).
+        return _commit_files(item_id[2])
+    if kind == 'stash' and len(item_id) == 2:
+        # A stash node (('stash', n)) drills into its files; a stash file
+        # leaf (('stash', n, path)) has none.
+        return _stash_files(item_id[1])
     if kind == 'ref':
         # A ref drills into its commits — the shared commit-log builder
-        # with the refname as the sole rev. parsed = ('ref', refname). The
+        # with the refname as the sole rev. id = ('ref', refname). The
         # ref's own id namespaces its filler ids so two drilled-in refs
-        # don't collide on a shared ``filler:<n>`` counter.
-        return _log_items([parsed[1]], [], ns=item_id)
+        # don't collide on a shared filler counter.
+        return _log_items([item_id[1]], [], ns=item_id)
     if kind == 'wc':
-        # A worktree-status group drills into its files. parsed = ('wc',
+        # A worktree-status group drills into its files. id = ('wc',
         # bucket); scope by the same positional paths as the root.
-        return _worktree_files(parsed[1], _paths)
-    # file / leaf / error rows have no children.
+        return _worktree_files(item_id[1], _paths)
+    # file / status leaf / filler / error / sentinel rows have no children.
     return []
 
 
@@ -731,9 +684,10 @@ def _log_items(revs, paths, ns):
 
     ``ns`` is a stable per-build namespace key (``'root'`` for the
     commits-mode log, the ref item's id for a ref drill-down) that scopes
-    the graph builder's filler ids so concurrent builds (multiple drilled-in
-    refs) can't collide on a shared ``filler:<n>`` counter. It's only
-    consulted in tree mode; the plain builder takes no namespace.
+    the graph builder's filler ids (the ``ns`` field of ``('filler', ns,
+    n)``) so concurrent builds (multiple drilled-in refs) can't collide on a
+    shared filler counter. It's only consulted in tree mode; the plain
+    builder takes no namespace.
     """
     if _tree_mode:
         return _commit_graph_items(revs, paths, ns)
@@ -760,7 +714,7 @@ def _worktree_groups(paths):
     """Synthetic worktree-group rows for the commits-mode root.
 
     Classifies ``_worktree_status(paths)`` into the four ``_WC_GROUPS``
-    buckets and emits one expandable ``wc:<bucket>`` row per NON-empty
+    buckets and emits one expandable ``('wc', bucket)`` row per NON-empty
     bucket, in ``_WC_GROUPS`` order, titled by the group label. A clean
     tree (no changes) yields ``[]`` — no rows at all.
 
@@ -773,7 +727,7 @@ def _worktree_groups(paths):
     items = []
     for bucket, label in _WC_GROUPS:
         if buckets[bucket]:
-            item = Item(id=f'wc:{bucket}', title=label, has_children=True)
+            item = Item(id=('wc', bucket), title=label, has_children=True)
             # Empty leading columns so git_row_content pads them to the
             # commit column widths — the label then lines up under the
             # commit subjects rather than at the start of the row.
@@ -785,7 +739,7 @@ def _worktree_groups(paths):
 
 
 def _worktree_files(bucket, paths):
-    """Files in one worktree ``bucket`` as ``status:<XY>:<path>`` leaves.
+    """Files in one worktree ``bucket`` as ``('status', xy, path)`` leaves.
 
     Re-runs status + classify (cheap; keeps the groups self-contained) and
     returns that bucket's ``(XY, path)`` entries as the shared
@@ -796,7 +750,7 @@ def _worktree_files(bucket, paths):
 
 
 def _commit_log_items(revs, paths):
-    """``git log`` rows as ``commit:<sha>`` items, rendered in columns.
+    """``git log`` rows as ``('commit', sha)`` items, rendered in columns.
 
     Shared by commits mode (called with the positional ``_revs`` /
     ``_paths``) and branches-mode ref drill-down (called with
@@ -827,7 +781,7 @@ def _commit_log_items(revs, paths):
         if len(fields) < 5:
             continue
         sha, deco, author, reldate, subject = fields[:5]
-        item = Item(id=f'commit:{sha}', title=subject, has_children=True)
+        item = Item(id=('commit', sha), title=subject, has_children=True)
         # Column display strings (read by git_row_content via max_col_width).
         item.col_sha = sha[:7]
         item.col_author = author
@@ -875,7 +829,7 @@ def _graph_translate(art):
 
 
 def _commit_graph_items(revs, paths, ns):
-    """``git log --graph`` rows: commit ``commit:<sha>`` items + filler rows.
+    """``git log --graph`` rows: commit ``('commit', sha)`` items + filler rows.
 
     The tree-mode counterpart to ``_commit_log_items``. ``git log --graph``
     does ALL the lane assignment and prepends its art to every output line;
@@ -894,15 +848,15 @@ def _commit_graph_items(revs, paths, ns):
 
     Commit lines build the same columnar Item as ``_commit_log_items`` and
     additionally carry ``col_graph`` (the sanitised, coloured, translated art).
-    Filler lines become ``meta=True`` Items (``id='filler:<ns>:<n>'`` — ``n``
+    Filler lines become ``meta=True`` Items (``id=('filler', ns, n)`` — ``n``
     is a running counter that resets per build, ``ns`` is the caller's
     namespace key making the id globally unique across builds;
-    ``has_children=False``, no
-    ``col_sha``) carrying only ``col_graph``. ``_parse_id`` partitions on the
-    first ``:`` so a ``filler:…`` id still maps to kind ``other`` and stays
-    inert on every drill-down / action / preview path. ``meta=True`` makes the
-    framework skip the cursor over the row (preventively) and never select it.
-    git's line order (commits and fillers interleaved) is preserved.
+    ``has_children=False``, no ``col_sha``) carrying only ``col_graph``. A
+    ``('filler', …)`` tag matches no ``get_children`` / ``get_preview`` /
+    action dispatch branch, so the row stays inert on every drill-down /
+    preview / action path. ``meta=True`` makes the framework skip the cursor
+    over the row (preventively) and never select it. git's line order (commits
+    and fillers interleaved) is preserved.
     """
     args = ['log', '--graph', '--color=always',
             '--format=\x1f%H\x1f%an\x1f%ar\x1f%s\x1f%D', '-n', str(_log_limit)]
@@ -919,7 +873,7 @@ def _commit_graph_items(revs, paths, ns):
         if len(parts) > 1:
             # Commit line: parts[0] is the art, the rest are H/an/ar/s/D.
             art, sha, author, reldate, subject, deco = parts[:6]
-            item = Item(id=f'commit:{sha}', title=subject, has_children=True)
+            item = Item(id=('commit', sha), title=subject, has_children=True)
             item.col_sha = sha[:7]
             item.col_author = author
             item.col_date = reldate
@@ -929,8 +883,8 @@ def _commit_graph_items(revs, paths, ns):
         else:
             # Filler line: the whole line is graph art (no commit fields).
             # ``meta=True`` -> the framework skips the cursor over it and
-            # never selects it; the ns/counter id stays unique across builds.
-            item = Item(id=f'filler:{ns}:{filler_n}', title='',
+            # never selects it; the (ns, counter) id stays unique across builds.
+            item = Item(id=('filler', ns, filler_n), title='',
                         has_children=False, meta=True)
             item.col_graph = _graph_translate(line)
             items.append(item)
@@ -1003,12 +957,13 @@ def git_row_content(item, ctx):
 
 
 def _reflog_root():
-    """``git reflog`` rows as ``reflog:<n>:<sha>`` items, decorated.
+    """``git reflog`` rows as ``('reflog', n, sha)`` items, decorated.
 
     Each record is NUL-separated ``%H %gd %cr %D %gs`` (selector, relative
     date, decoration, action subject). The id carries the 0-based
-    enumeration index ``n`` for uniqueness — the reflog revisits the same
-    sha, so a bare ``reflog:<sha>`` would collapse duplicate rows.
+    enumeration index ``n`` (an int) for uniqueness — the reflog revisits
+    the same sha, so a bare ``('reflog', sha)`` would collapse duplicate
+    rows.
     """
     result = _run_git(
         'reflog', '--format=%H%x00%gd%x00%cr%x00%D%x00%gs', '-n',
@@ -1038,37 +993,38 @@ def _reflog_row(n, line):
     sha, selector, reldate, deco, subject = fields[:5]
     chips = [(selector, 'dim'), (reldate, 'dim')]
     chips.extend(_parse_decorations(deco))
-    item = Item(id=f'reflog:{n}:{sha}', title=subject,
+    item = Item(id=('reflog', n, sha), title=subject,
                 tag=sha[:7], tag_style='yellow', has_children=True)
     item.chips = chips
     return item
 
 
 def _status_root():
-    """``git status --porcelain -z`` rows as ``status:<XY>:<path>`` items.
+    """``git status --porcelain -z`` rows as ``('status', xy, path)`` items.
 
     Each entry becomes a non-expandable leaf tagged by its one-letter
     status (colored by kind); the leaf preview is the staged / worktree /
     untracked diff chosen by the ``XY`` code. A clean tree yields a single
-    dim, non-drillable "working tree clean" row.
+    dim, non-drillable "working tree clean" row (sentinel id
+    ``('status_clean',)``).
     """
     result = _run_git('status', '--porcelain', '-z')
     if result.returncode != 0:
         return _err_item(f'git status failed: {result.stderr.strip()}')
     rows = _parse_porcelain_z(result.stdout)
     if not rows:
-        return [Item(id='status:clean', title='working tree clean',
+        return [Item(id=('status_clean',), title='working tree clean',
                      tag_style='dim', has_children=False)]
     return [_status_leaf(xy, path) for xy, path in rows]
 
 
 def _stash_root():
-    """``git stash list`` rows as ``stash:<n>`` items, decorated.
+    """``git stash list`` rows as ``('stash', n)`` items, decorated.
 
     Each record is NUL-separated ``%gd %cr %gs`` (selector, relative date,
     subject). An empty stash list yields a single dim, non-drillable "no
-    stashes" row (sentinel id ``stash:none`` — its non-numeric ``n`` keeps
-    it out of the stash drill-down and preview paths).
+    stashes" row (sentinel id ``('stash_none',)`` — a distinct tag, so it
+    never reaches the stash drill-down / preview paths).
     """
     result = _run_git('stash', 'list', '--format=%gd%x00%cr%x00%gs')
     if result.returncode != 0:
@@ -1079,7 +1035,7 @@ def _stash_root():
         if row is not None:
             items.append(row)
     if not items:
-        return [Item(id='stash:none', title='no stashes',
+        return [Item(id=('stash_none',), title='no stashes',
                      tag_style='dim', has_children=False)]
     return items
 
@@ -1088,8 +1044,8 @@ def _stash_row(line):
     """Build one stash Item from a ``%gd %cr %gs`` NUL record.
 
     Returns ``None`` for a malformed (under-filled) line. The index ``n``
-    is extracted from the ``%gd`` selector (``stash@{2}`` → ``2``); the
-    relative date is a dim chip and the selector becomes the yellow tag.
+    is extracted from the ``%gd`` selector (``stash@{2}`` → ``2``, an int);
+    the relative date is a dim chip and the selector becomes the yellow tag.
     """
     if not line:
         return None
@@ -1100,33 +1056,32 @@ def _stash_row(line):
     n = _stash_index(selector)
     if n is None:
         return None
-    item = Item(id=f'stash:{n}', title=subject,
+    item = Item(id=('stash', n), title=subject,
                 tag=selector, tag_style='yellow', has_children=True)
     item.chips = [(reldate, 'dim')]
     return item
 
 
 def _stash_index(selector):
-    """Extract the 0-based index from a ``stash@{n}`` selector, or None."""
+    """Extract the 0-based index (int) from a ``stash@{n}`` selector, or None."""
     inner = selector.partition('{')[2].partition('}')[0]
-    return inner if inner.isdigit() else None
+    return int(inner) if inner.isdigit() else None
 
 
 def _stash_files(n):
-    """Files in stash ``n`` as ``stash:<n>:<path>`` rows.
+    """Files in stash ``n`` (int) as ``('stash', n, path)`` rows.
 
     Reuses ``git stash show --name-status stash@{n}`` + ``_parse_name_status``
-    so each row carries its status-letter tag. A non-numeric ``n`` (the
-    "no stashes" sentinel) yields no children.
+    so each row carries its status-letter tag. Reached only for a real
+    ``('stash', n)`` node — the "no stashes" sentinel is a distinct tag
+    (``('stash_none',)``) that never routes here.
     """
-    if not str(n).isdigit():
-        return []
     result = _run_git('stash', 'show', '--name-status', f'stash@{{{n}}}')
     if result.returncode != 0:
         return _err_item(f'git stash show failed: {result.stderr.strip()}')
     items = []
     for status, path in _parse_name_status(result.stdout):
-        items.append(Item(id=f'stash:{n}:{path}', title=path,
+        items.append(Item(id=('stash', n, path), title=path,
                           tag=status,
                           tag_style=_STATUS_LETTER_STYLE.get(status, ''),
                           has_children=False))
@@ -1143,7 +1098,7 @@ _REF_KIND_STYLE = {
 
 
 def _branches_root():
-    """``git for-each-ref`` rows as ``ref:<short>`` items, tagged by kind.
+    """``git for-each-ref`` rows as ``('ref', short)`` items, tagged by kind.
 
     One call over ``refs/heads`` / ``refs/remotes`` / ``refs/tags``,
     newest-commit-first. The format emits the full ``%(refname)`` (for
@@ -1162,7 +1117,7 @@ def _branches_root():
         if parsed is None:
             continue
         kind, short = parsed
-        items.append(Item(id=f'ref:{short}', title=short,
+        items.append(Item(id=('ref', short), title=short,
                           tag=kind, tag_style=_REF_KIND_STYLE.get(kind, ''),
                           has_children=True))
     return items
@@ -1193,18 +1148,18 @@ def _parse_for_each_ref_line(line):
 
 
 def _commit_files(sha):
-    """Changed files in commit ``sha`` as ``file:<sha>:<path>`` rows.
+    """Changed files in commit ``sha`` as ``('file', sha, path)`` rows.
 
     Uses ``--name-status`` so each row carries its A/M/D/R status letter
     in the ``tag`` chip (colored by kind). Renames/copies display the new
-    path, and the ``file:`` id keys on that same new path.
+    path, and the ``('file', …)`` id keys on that same new path.
     """
     result = _run_git('show', '--name-status', '--format=', sha)
     if result.returncode != 0:
         return _err_item(f'git show failed: {result.stderr.strip()}')
     items = []
     for status, path in _parse_name_status(result.stdout):
-        items.append(Item(id=f'file:{sha}:{path}', title=path,
+        items.append(Item(id=('file', sha, path), title=path,
                           tag=status,
                           tag_style=_STATUS_LETTER_STYLE.get(status, ''),
                           has_children=False))
@@ -1215,40 +1170,36 @@ def _commit_files(sha):
 
 
 def get_preview(item_id):
-    parsed = _parse_id(item_id)
-    kind = parsed[0]
-
+    # Flat ``id[0]`` dispatch with direct field access; root (``None``) and
+    # the synthetic sentinel/error tags fall through to the empty preview.
+    if not isinstance(item_id, tuple) or not item_id:
+        return ''
+    kind = item_id[0]
     if kind == 'commit':
-        return _commit_preview(parsed[1])
+        return _commit_preview(item_id[1])
     if kind == 'reflog':
-        # Same as a commit node — parsed = ('reflog', n, sha).
-        return _commit_preview(parsed[2])
+        # Same as a commit node — id = ('reflog', n, sha).
+        return _commit_preview(item_id[2])
     if kind == 'ref':
         # A refname resolves as a commit-ish, so the commit-node preview
-        # (message + show --stat) works unchanged. parsed = ('ref', name).
-        return _commit_preview(parsed[1])
+        # (message + show --stat) works unchanged. id = ('ref', refname).
+        return _commit_preview(item_id[1])
     if kind == 'file':
-        return _file_preview(parsed[1], parsed[2])
+        return _file_preview(item_id[1], item_id[2])
     if kind == 'status':
-        # parsed = ('status', XY, path). The synthetic clean row has no
-        # path, so guard before building a diff.
-        if parsed[2]:
-            return _status_preview(parsed[1], parsed[2])
-        return ''
+        # id = ('status', xy, path).
+        return _status_preview(item_id[1], item_id[2])
     if kind == 'wc':
         # A worktree-status group — combined colored diff for the bucket,
-        # scoped to the same positional paths. parsed = ('wc', bucket).
-        return _worktree_preview(parsed[1], _paths)
+        # scoped to the same positional paths. id = ('wc', bucket).
+        return _worktree_preview(item_id[1], _paths)
     if kind == 'stash':
-        # parsed = ('stash', n) node or ('stash', n, path) leaf. The "no
-        # stashes" sentinel has a non-numeric n — guard it out.
-        n = parsed[1]
-        if not n.isdigit():
-            return ''
-        if len(parsed) == 3:
-            return _stash_file_preview(n, parsed[2])
-        return _stash_preview(n)
-    # root / err / sentinel kinds have no preview.
+        # id = ('stash', n) node or ('stash', n, path) leaf. The "no stashes"
+        # sentinel is a distinct tag, so n is always a real int here.
+        if len(item_id) == 3:
+            return _stash_file_preview(item_id[1], item_id[2])
+        return _stash_preview(item_id[1])
+    # root / err / status_clean / stash_none / filler kinds have no preview.
     return ''
 
 
@@ -1376,16 +1327,15 @@ def edit_file(ctx):
     """``E`` — open the real working-tree file in $EDITOR.
 
     Only file/status rows map to a working-tree path; other row kinds
-    (commits, refs, stashes) are a no-op. ``file:`` paths are repo-root
-    relative, so resolve them against the work-tree root.
+    (commits, refs, stashes) are a no-op. ``('file', …)`` paths are
+    repo-root relative, so resolve them against the work-tree root.
     """
     item = ctx.cursor
-    if item is None:
+    if item is None or not isinstance(item.id, tuple):
         return
-    parsed = _parse_id(item.id)
-    kind = parsed[0]
-    if kind in ('file', 'status'):
-        path = parsed[2]
+    # ('file', sha, path) and ('status', xy, path) both carry the path at id[2].
+    if item.id[0] in ('file', 'status'):
+        path = item.id[2]
     else:
         return
     root = _run_git('rev-parse', '--show-toplevel')

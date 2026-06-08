@@ -40,7 +40,7 @@ import threading
 from browse_tui import Action, Browser, BrowserConfig, Item
 
 
-_ERROR_ID = '__error__'
+_ERROR = object()
 
 _REQUIRED_ENV = ('JIRA_URL', 'JIRA_USERNAME', 'JIRA_API_TOKEN')
 
@@ -93,7 +93,7 @@ def _resolve_jql():
 
 
 def _err(msg):
-    return [Item(id=_ERROR_ID, title=msg, tag='err', tag_style='red')]
+    return [Item(id=_ERROR, title=msg, tag='err', tag_style='red')]
 
 
 class _MCPClient:
@@ -259,7 +259,7 @@ def get_children(parent_id, *, reload=False):
 
 
 def get_preview(key):
-    if not isinstance(key, str) or key == _ERROR_ID:
+    if key is _ERROR:
         return ''
     try:
         result = _client.call_tool('jira_get_issue', {
@@ -308,7 +308,7 @@ def _ticket_url(key):
 
 def open_in_browser(ctx):
     """Hand the ticket URL off to ``$BROWSER`` / ``xdg-open``."""
-    if not ctx.cursor or ctx.cursor.id == _ERROR_ID:
+    if not ctx.cursor or ctx.cursor.id is _ERROR:
         return
     url = _ticket_url(ctx.cursor.id)
     cmd = os.environ.get('BROWSER') or 'xdg-open'

@@ -16,7 +16,7 @@ from test.async_._helpers import make_browser
 class TestBackgroundUpdates(unittest.TestCase):
 
     def test_watcher_thread_can_refresh(self):
-        b = make_browser(get_children=lambda _id, *, reload=False: [(f'{_id}/c',)])
+        b = make_browser(get_children=lambda _id, *, reload=False: [f'{_id}/c'])
         try:
             def watcher():
                 b.refresh('A')
@@ -53,7 +53,7 @@ class TestBackgroundUpdates(unittest.TestCase):
         b = make_browser(get_children=get_children)
         try:
             def watcher_tick(payload):
-                store['children'].append((payload,))
+                store['children'].append(payload)   # str → id
                 b.refresh('A')
             t1 = threading.Thread(target=watcher_tick, args=('one',))
             t1.start(); t1.join()

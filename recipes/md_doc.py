@@ -6,8 +6,7 @@ This module is the single source of truth for turning markdown text into a
 navigable *document structure* — a tree of heading (and optionally list-item)
 nodes — plus the cross-document plumbing both ``browse-md`` and
 ``browse-claude`` need: reference detection/resolution between ``.md`` files,
-the ``#md:`` id codec that chains documents into a recursive subtree, the
-cheap heading-detection gate, and a process-wide parse cache.
+the cheap heading-detection gate, and a process-wide parse cache.
 
 It deliberately knows nothing about ``browse_tui`` / ``Item``: it returns plain
 structural ``MdNode`` dataclasses, and each recipe maps those onto its own
@@ -31,7 +30,6 @@ markdown (the common case) chars and bytes coincide.
 import bisect
 import os
 import re
-import urllib.parse
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -90,7 +88,7 @@ class MdNode:
 
 # Lifted verbatim from ``browse-md`` (``_line_starts`` / ``_line_of``): the
 # offset→line conversion that ``build_doc_tree`` uses to stamp each node with a
-# stable ``line_offset`` (the id codec selects a heading by it).
+# stable ``line_offset`` (callers select a heading by it).
 
 def _line_starts(text):
     """Character offset of the start of each line in ``text``.
@@ -391,7 +389,7 @@ def node_at_line(tree, line_offset):
     Depth-first walk of an (already-built) ``MdNode`` tree — the list of
     top-level nodes from ``build_doc_tree`` and, recursively, each node's
     ``children``. Returns the first node whose ``line_offset`` *exactly*
-    equals the target (so the codec's heading selector is an O(nodes) lookup
+    equals the target (so a heading selector is an O(nodes) lookup
     that needs no by-line index stashed on the structural nodes); a
     ``line_offset`` that matches no node — including one before the first
     node — yields ``None``. The tree is one document's structure, so a linear
@@ -530,145 +528,6 @@ def find_git_root(start):
         if parent == d:
             return None
         d = parent
-
-
-# ### Section: #md: id codec ###############################################
-
-# An id naming a markdown subtree appends a ``#md:`` selector onto the
-# recipe's untouched base id (``<session_path>#<n>`` for browse-claude,
-# ``<file_path>`` for browse-md), per the existing ``#keyword:`` convention so
-# routing stays a substring test. Shapes:
-#
-#   inline document     <base>#md:
-#   inline heading      <base>#md:#<lineoffset>
-#   file document       <base>#md:<enc>
-#   file heading        <base>#md:<enc>#<lineoffset>
-#   nested file doc     <base>#md:<enc1>#md:<enc2>
-#   nested file heading <base>#md:<enc1>#md:<enc2>#<lineoffset>
-#
-# where ``<enc>`` = ``quote('file://' + abspath, safe='')`` — ``safe=''``
-# percent-encodes EVERY delimiter, notably ``#`` → ``%23``, so an encoded
-# segment never contains a raw ``#``. That is what makes parsing unambiguous:
-# the chain splits cleanly on ``#md:``, and a trailing ``#<digits>`` on the
-# last segment can only be the line offset. The ``file://`` prefix is
-# cosmetic-but-consistent flavour; resolution decodes the last segment back to
-# the abspath directly, so no lookup map is ever needed.
-
-_MD_SELECTOR = '#md:'
-
-
-def compose_md_id(base, abspaths, line_offset=None):
-    """Compose a ``#md:`` id from ``base``, a chain of file ``abspaths``, and an
-    optional heading ``line_offset``.
-
-    ``abspaths`` is the ordered chain of referenced files from the base
-    document down to the document this id names; an EMPTY chain means the
-    base's own inline document. Each abspath is encoded as
-    ``quote('file://' + abspath, safe='')`` and the segments are joined under
-    ``#md:`` markers. A non-``None`` ``line_offset`` (a heading's 0-based line
-    in the LAST document of the chain) is appended as ``#<lineoffset>``.
-
-    Examples (``base = 'sess#3'``)::
-
-        compose_md_id('sess#3', [])                 -> 'sess#3#md:'
-        compose_md_id('sess#3', [], 12)             -> 'sess#3#md:#12'
-        compose_md_id('sess#3', ['/a/x.md'])        -> 'sess#3#md:file%3A...'
-        compose_md_id('sess#3', ['/a/x.md'], 4)     -> 'sess#3#md:file%3A...#4'
-
-    Inverse of ``parse_md_id`` — the round-trip is exact.
-    """
-    segs = [urllib.parse.quote('file://' + p, safe='') for p in abspaths]
-    out = base + _MD_SELECTOR + _MD_SELECTOR.join(segs)
-    if line_offset is not None:
-        out += f'#{line_offset}'
-    return out
-
-
-def parse_md_id(item_id):
-    """Decompose a ``#md:`` id into ``(base, abspaths, line_offset)``.
-
-    Finds the FIRST ``#md:`` in ``item_id``: everything before it is the
-    untouched ``base`` (still human-readable); everything after is the chain.
-    The chain is split on ``#md:`` into encoded segments; because an encoded
-    segment never contains a raw ``#`` (``safe=''`` turned it into ``%23``), a
-    trailing ``#<digits>`` on the LAST segment can only be the line offset, so
-    it is peeled off first. Each remaining segment is decoded back to its
-    abspath (the cosmetic ``file://`` prefix is stripped). An empty chain
-    (``<base>#md:``) yields ``abspaths == []`` (the inline document).
-
-    Returns ``(base, abspaths, line_offset)`` where ``abspaths`` is a list of
-    decoded absolute paths and ``line_offset`` is an ``int`` or ``None``.
-    Raises ``ValueError`` if ``item_id`` contains no ``#md:`` (it is not a
-    markdown id — callers gate on ``'#md:' in item_id`` first).
-
-    Inverse of ``compose_md_id`` — the round-trip is exact.
-    """
-    marker = item_id.find(_MD_SELECTOR)
-    if marker < 0:
-        raise ValueError(f'parse_md_id: not a #md: id: {item_id!r}')
-    base = item_id[:marker]
-    chain = item_id[marker + len(_MD_SELECTOR):]
-
-    # Peel a trailing ``#<digits>`` line offset off the whole chain. It can
-    # only sit on the last segment, and encoded segments have no raw ``#``,
-    # so a single rsplit on the final ``#`` is unambiguous.
-    line_offset = None
-    hash_pos = chain.rfind('#')
-    if hash_pos >= 0 and chain[hash_pos + 1:].isdigit():
-        line_offset = int(chain[hash_pos + 1:])
-        chain = chain[:hash_pos]
-
-    # Empty chain → inline document (no file segments). A non-empty chain
-    # splits on the ``#md:`` marker into one encoded segment per file.
-    if chain == '':
-        abspaths = []
-    else:
-        abspaths = [
-            urllib.parse.unquote(seg)[len('file://'):]
-            for seg in chain.split(_MD_SELECTOR)
-        ]
-    return base, abspaths, line_offset
-
-
-# ### Section: References-umbrella id ######################################
-
-# A synthetic "References" umbrella node groups a document's discovered ``.md``
-# references under one tree parent. Its id appends a ``#refs`` marker onto the
-# document's id (``docid``), where ``docid`` is either a message base
-# (``<jsonl>#<n>``) or a ``#md:`` file-doc id (``<base>#md:<enc>``). The ref
-# file-docs UNDER the umbrella keep their own ``<docid>#md:<enc>`` ids — the
-# umbrella is a tree-grouping parent, NOT a new hop in the id chain.
-#
-# The ``#refs`` marker is unambiguous and cannot collide with any other id
-# shape: a percent-encoded ``#md:`` chain segment never contains a raw ``#``
-# (``safe=''`` turned every ``#`` into ``%23``), a heading id ends in
-# ``#<digits>``, and a message base ends in ``#<digits>`` — none of those end
-# in the literal ``#refs``. So ``endswith('#refs')`` is a sufficient test and
-# no regex is needed.
-
-_REFS_MARKER = '#refs'
-
-
-def refs_umbrella_id(docid):
-    """Compose the References-umbrella id for a document id.
-
-    Appends the ``#refs`` marker onto ``docid`` (a message base or a ``#md:``
-    file-doc id). Inverse of ``split_refs_umbrella``.
-    """
-    return docid + _REFS_MARKER
-
-
-def split_refs_umbrella(item_id):
-    """Return the ``docid`` of a References-umbrella id, or ``None``.
-
-    If ``item_id`` ends with the ``#refs`` marker it names a References
-    umbrella; strip the marker to recover the document id. Otherwise return
-    ``None`` (it is some other id — a message id, a ``#md:`` doc/heading id, or
-    a different umbrella). Inverse of ``refs_umbrella_id``.
-    """
-    if item_id.endswith(_REFS_MARKER):
-        return item_id[:-len(_REFS_MARKER)]
-    return None
 
 
 # ### Section: Process-wide parse cache ####################################

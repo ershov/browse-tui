@@ -314,6 +314,48 @@ class VisibleEntry:
     kind: str = 'normal'
 
 
+class OrderedSet(set):
+    """A ``set`` that remembers insertion order on iteration.
+
+    Backs ``State.selected`` so the ids handed to ``on_selection_change``
+    come out in the order the user selected them (rather than the
+    unspecified order of a plain ``set``). Subclasses ``set`` deliberately:
+    membership (``in``), ``len``, equality against a plain ``set`` /
+    ``frozenset`` (order-insensitive set equality — what the selection-
+    diff at ``_do_select`` relies on), and ``isinstance(x, set)`` (the
+    documented ``ctx.state.selected`` escape hatch) all come from the base
+    for free. Only the mutators and ``__iter__`` are overridden, using a
+    parallel insertion-ordered ``dict`` whose keys mirror the set's
+    members and whose order is the source of truth for iteration.
+    """
+
+    def __init__(self, iterable=()):
+        super().__init__()
+        self._order: dict = {}
+        for x in iterable:
+            self.add(x)
+
+    def add(self, x) -> None:
+        super().add(x)          # hashes ``x`` (TypeError on unhashable)
+        self._order[x] = None   # idempotent; preserves first-insert order
+
+    def discard(self, x) -> None:
+        super().discard(x)
+        self._order.pop(x, None)
+
+    def clear(self) -> None:
+        super().clear()
+        self._order.clear()
+
+    def update(self, *iterables) -> None:
+        for it in iterables:
+            for x in it:
+                self.add(x)
+
+    def __iter__(self):
+        return iter(self._order)
+
+
 @dataclass
 class State:
     """Container for the state that ``visible_items`` reads.
@@ -368,7 +410,14 @@ class State:
     # a Browser, and so the visible-tree builder can read ``selected``
     # later when it wires marker columns.
     cursor: int = 0
-    selected: set = field(default_factory=set)
+    # Insertion-ordered set (see ``OrderedSet``): preserves the order the
+    # user selected ids in so ``on_selection_change`` emits them in that
+    # order. Still a ``set`` subclass, so every membership / equality /
+    # ``isinstance`` use elsewhere is unaffected. The annotation is the
+    # bare name (not a string) so the dataclass decorator doesn't try to
+    # resolve it via ``sys.modules`` — which fails under the tests'
+    # ``spec_from_file_location`` standalone load of this file.
+    selected: OrderedSet = field(default_factory=OrderedSet)
     # Filter-active flag — derived state set by ``_recompute_filter_hidden``
     # in lockstep with the per-Item ``_filter_hidden`` flags. The
     # renderer checks this before consulting ``_filter_hidden`` so the
@@ -501,15 +550,38 @@ def _index_drop_children(state: State, parent_id) -> None:
             state._items_by_id.pop(child.id, None)
 
 
+def _index_set(state: State, item) -> None:
+    """Write ``state._items_by_id[item.id] = item`` — the add-side choke point.
+
+    The counterpart to ``_index_drop_children`` for the forward index.
+    Recipe-supplied children flow through here (via ``_index_add_children``),
+    so it is where an unhashable recipe id (``list`` / ``dict`` / ``set``)
+    is first hashed. The hash happens exactly once — the dict write that
+    occurs anyway — and the ``try``/``except`` is free in CPython when no
+    exception fires, so this adds a debug-quality error message, not a
+    runtime cost: a generic ``unhashable type`` deep in framework internals
+    becomes one that names the offending id value and type.
+    """
+    try:
+        state._items_by_id[item.id] = item
+    except TypeError as e:
+        raise TypeError(
+            f'Item.id must be hashable; got {item.id!r} '
+            f'({type(item.id).__name__})'
+        ) from e
+
+
 def _index_add_children(state: State, parent_id, items) -> None:
     """Add ``_items_by_id`` / ``_parent_of_id`` entries for one parent's children.
 
     Called whenever a list is being installed under ``_children[parent_id]``
     (worker delivery, eager pre-population). Doesn't touch ``_loading``
-    — that flag is owned by dispatch / delivery.
+    — that flag is owned by dispatch / delivery. The forward-index write
+    goes through ``_index_set`` so an unhashable recipe id surfaces a clear
+    error here rather than a bare ``unhashable type``.
     """
     for child in items:
-        state._items_by_id[child.id] = child
+        _index_set(state, child)
         state._parent_of_id[child.id] = parent_id
 
 
@@ -5304,14 +5376,17 @@ class Browser:
     def _fire_selection_change(self) -> None:
         """Fire ``on_selection_change`` if installed.
 
-        Passes the resulting selected ids as a list. ``state.selected``
-        is a set; we sort so the payload is stable across fires (the
-        underlying set order is unspecified).
+        Passes the resulting selected ids as a list, in selection
+        (insertion) order — ``state.selected`` is an ``OrderedSet`` so
+        ``list(...)`` preserves the order ids were added. We do NOT sort:
+        structured ids (heterogeneous-typed tuples, mixed id kinds) are
+        not order-comparable, and sorting them would raise ``TypeError``
+        and silently drop the fire.
         """
         if self._on_selection_change is None:
             return
         try:
-            ids = sorted(self._state.selected)
+            ids = list(self._state.selected)
             self._on_selection_change(self._make_ctx_for_hook(), ids)
         except Exception as e:
             self.error(f'on_selection_change: {type(e).__name__}: {e}')
@@ -5954,7 +6029,10 @@ class Browser:
         """Main-thread: update ``selected`` set + flag list-pane redraw."""
         before = frozenset(self._state.selected)
         if replace:
-            self._state.selected = set(ids)
+            # Rebuild as an OrderedSet so ``ids`` order is preserved (and
+            # the field keeps its insertion-ordered type). ``before`` is a
+            # frozenset, so the change check below is order-insensitive.
+            self._state.selected = OrderedSet(ids)
         else:
             self._state.selected.update(ids)
         mark_visible_dirty(self._state)
