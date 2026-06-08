@@ -79,18 +79,24 @@ class Item:
     ``boundary`` (default ``False``) marks a node that heads a
     *self-contained foreign subtree* — content sourced from outside the
     current document (a referenced file, a subagent transcript, a bare
-    session). Recursive / multi-expansion (``expand_subtree`` and the
-    Alt-Right path in ``040-state.py``) treats it as a leaf: it expands
-    *to* the boundary node — the node itself may join ``state.expanded``
-    — but never *through* it, so its children/descendants are not
-    recursively expanded, **even when they are already cached** from a
-    prior manual expand. (Lazy expansion already skips *uncached*
-    subtrees, so this is a no-op in the common case; ``boundary`` covers
-    the cached case and makes the contract explicit.) The node stays
-    manually expandable. The other half of the contract — *not folding a
-    boundary's descendants into an ancestor's preview cascade* — is
-    honoured by recipes that build such cascades; the framework has no
-    cross-item preview concept.
+    session). Recursive / multi-expansion — the Alt-Right action
+    (``_expand_recursive`` in ``070-actions.py``) and ``expand_subtree``
+    (``040-state.py``) — *reveals* a boundary but never *expands* it: a
+    boundary reached as a descendant of the walk is left out of
+    ``state.expanded`` (its row stays visible under its expanded parent,
+    but collapsed), and the walk never recurses *through* it into its
+    children, **even when they are already cached** from a prior manual
+    expand. This keeps a same-document bulk expand from dragging the
+    foreign subtree in, and — when the boundary's children are *not*
+    cached — avoids stranding a ``⧗ loading…`` placeholder that no
+    auto-dispatch would resolve (the cursor-prefetch fetches the cursor
+    row only). The node stays manually expandable: a single ``→`` / ``l``
+    on it — or ``expand_subtree`` called *directly* on it — opens that
+    one node, since that is an explicit "open this" rather than a walk
+    that merely passed over it (it still does not recurse through). The
+    other half of the contract — *not folding a boundary's descendants
+    into an ancestor's preview cascade* — is honoured by recipes that
+    build such cascades; the framework has no cross-item preview concept.
 
     ``meta`` (default ``False``) marks a *non-content* row — a divider,
     section header, or structural connector line. The cursor skips it

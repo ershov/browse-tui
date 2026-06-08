@@ -170,9 +170,11 @@ def _seed_boundary_tree(b, *, boundary):
 
     ``bnd``'s subtree is fully cached (every level's children list is in
     ``_children``). When ``boundary=True`` is set on ``bnd``, a recursive
-    expand of the ancestor ``a`` must reach ``bnd`` but stop there — even
-    though ``bnd_kid`` is a cached branch. ``boundary=False`` is the
-    control: ``bnd_kid`` then expands like any other cached branch.
+    expand of the ancestor ``a`` must *reveal* ``bnd`` but leave it
+    collapsed — it is never added to ``state.expanded`` and the walk does
+    not descend through it, even though ``bnd_kid`` is a cached branch.
+    ``boundary=False`` is the control: ``bnd_kid`` then expands like any
+    other cached branch.
     """
     b.update_data([
         ('upsert', 'a', None, {'has_children': True}),
@@ -185,14 +187,17 @@ def _seed_boundary_tree(b, *, boundary):
 
 
 class TestExpandSubtreeBoundary(unittest.TestCase):
-    """``expand_subtree`` treats a ``boundary`` node as a leaf.
+    """``expand_subtree`` reveals a ``boundary`` descendant but never expands it.
 
-    Expand *to* a boundary node (it joins ``state.expanded``) but never
-    *through* it — its children are not recursively expanded even when
-    they are already cached.
+    A boundary reached as a *descendant* of the walk is revealed (its row
+    stays visible under its expanded parent) but is not added to
+    ``state.expanded`` and is never recursed through — even when its
+    subtree is already cached. The explicitly-targeted root is the one
+    exception: ``expand_subtree(boundary_id)`` opens that node itself (you
+    asked to open it), but still does not descend through it.
     """
 
-    def test_boundary_node_expanded_but_children_not(self):
+    def test_boundary_descendant_revealed_not_expanded(self):
         b = Browser(BrowserConfig(_headless=True))
         _seed_boundary_tree(b, boundary=True)
         # Sanity: bnd's subtree is genuinely cached (the "even when
@@ -200,10 +205,12 @@ class TestExpandSubtreeBoundary(unittest.TestCase):
         self.assertIn('bnd_kid', b._state._children)
         b.expand_subtree('a')
         b.drain_main_queue()
-        # Expanded TO the boundary node: 'a' and 'bnd' are added.
+        # The ancestor 'a' expands; the boundary descendant 'bnd' is
+        # revealed but NOT expanded (Option B — never auto-expand a
+        # foreign subtree reached during a bulk walk).
         self.assertIn('a', b._state.expanded)
-        self.assertIn('bnd', b._state.expanded)
-        # NOT through it: the cached branch below 'bnd' stays collapsed.
+        self.assertNotIn('bnd', b._state.expanded)
+        # And nothing below 'bnd' is expanded either.
         self.assertNotIn('bnd_kid', b._state.expanded)
 
     def test_non_boundary_cached_node_is_expanded(self):

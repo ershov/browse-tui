@@ -337,7 +337,9 @@ class Context:
 
         Pass-through to :meth:`Browser.expand_subtree`. ``lazy=True``
         (default) only walks the cached part of the tree —
-        un-fetched branches stay collapsed.
+        un-fetched branches stay collapsed. A ``boundary`` descendant is
+        revealed but not expanded (only ``id`` itself joins when it is a
+        boundary) — see ``Item.boundary``.
         """
         return self._browser.expand_subtree(id, lazy=lazy)
 

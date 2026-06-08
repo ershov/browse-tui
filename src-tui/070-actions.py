@@ -714,7 +714,9 @@ def _expand_recursive(ctx):
     depth (that's the parent), then recursively expand every cached
     descendant of that parent that has children. For uncached branches
     we kick a fetch via ``ctx.expand`` so they resolve on the next
-    drain.
+    drain. A ``boundary`` child (a self-contained foreign subtree — a
+    subagent transcript, a referenced file, a bare session) is revealed
+    but never expanded and never recursed through; see ``Item.boundary``.
 
     No-op when the cursor row isn't a normal item (``pending``
     placeholder / empty list).
@@ -748,13 +750,22 @@ def _expand_recursive(ctx):
             ctx.expand(pid)
             return
         for c in children:
-            if getattr(c, 'has_children', False):
-                state.expanded.add(c.id)
-                # A boundary child is a self-contained foreign subtree:
-                # expand *to* it (added above), never *through* it —
-                # don't recurse into its descendants even when cached.
-                if not getattr(c, 'boundary', False):
-                    _expand_subtree(c.id)
+            if not getattr(c, 'has_children', False):
+                continue
+            # A boundary child heads a self-contained foreign subtree (a
+            # subagent transcript, a referenced file, a bare session).
+            # Recursive expand reveals it but never expands it: leave it
+            # out of ``state.expanded`` so it stays collapsed and
+            # manually openable, and don't recurse through it. Expanding
+            # it here would either drag foreign content into a
+            # same-document bulk expand, or — when its children aren't
+            # cached — strand a ``⧗ loading…`` placeholder that no
+            # auto-dispatch ever resolves (the cursor-prefetch fetches
+            # the cursor row only).
+            if getattr(c, 'boundary', False):
+                continue
+            state.expanded.add(c.id)
+            _expand_subtree(c.id)
 
     _expand_subtree(parent_id)
     mark_visible_dirty(state)

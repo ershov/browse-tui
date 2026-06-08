@@ -5005,29 +5005,40 @@ class Browser:
         currently behaves the same as ``True``.
 
         A node whose Item has ``Item.boundary=True`` is treated as a
-        leaf: the walk expands *to* it but never *through* it, so its
-        descendants are not recursively expanded even when cached. The
-        boundary node itself is still added to ``state.expanded``.
+        leaf: the walk never crosses *through* it into its descendants,
+        even when they are cached. A boundary reached as a *descendant*
+        of the walk is revealed but left collapsed (not added to
+        ``state.expanded``) so it stays manually openable; only an
+        ``id_`` passed in directly — an explicit "open this node" — joins
+        ``state.expanded`` when it is itself a boundary.
         """
         def _do():
             state = self._state
-            def _walk(pid):
-                state.expanded.add(pid)
-                # Boundary nodes are self-contained foreign subtrees:
-                # expand *to* this node (added above), never *through*
-                # it — skip recursing into its children even when they
-                # are already cached. (Lazy expansion below already skips
-                # uncached branches; this covers the cached case.)
+            def _walk(pid, is_root):
                 item = state._items_by_id.get(pid)
-                if item is not None and getattr(item, 'boundary', False):
+                is_boundary = (
+                    item is not None and getattr(item, 'boundary', False)
+                )
+                # A boundary heads a self-contained foreign subtree. When
+                # reached as a *descendant* of the walk it is revealed but
+                # never expanded — left out of ``state.expanded`` so it
+                # stays collapsed and manually openable. The explicitly
+                # targeted root is exempt (expand_subtree(boundary_id)
+                # opens that node itself). Either way the walk never
+                # descends *through* a boundary into its children, even
+                # when they are cached.
+                if is_boundary and not is_root:
+                    return
+                state.expanded.add(pid)
+                if is_boundary:
                     return
                 children = state._children.get(pid)
                 if children is None:
                     return
                 for c in children:
                     if getattr(c, 'has_children', False):
-                        _walk(c.id)
-            _walk(id_)
+                        _walk(c.id, False)
+            _walk(id_, True)
             mark_visible_dirty(state)
             self._needs_redraw.add('all')
         self.post(_do)

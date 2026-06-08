@@ -728,7 +728,13 @@ class TestExpandCollapseRecursive(unittest.TestCase):
 
 
 class TestExpandRecursiveBoundary(unittest.TestCase):
-    """alt-right stops at a ``boundary`` node (expand to, not through)."""
+    """alt-right reveals a ``boundary`` node but never expands it.
+
+    A boundary heads a self-contained foreign subtree (a subagent
+    transcript, a referenced file, a bare session). Recursive expand
+    walks the same-document tree up to the boundary row — leaving it
+    visible but collapsed — and never crosses into the foreign subtree.
+    """
 
     def _tree(self, *, boundary):
         # root: [A (boundary?, kids), C (leaf)]
@@ -746,28 +752,70 @@ class TestExpandRecursiveBoundary(unittest.TestCase):
         s._children['A1'] = [Item(id='A1a')]
         return b
 
-    def test_alt_right_expands_to_boundary_not_through(self):
+    def test_alt_right_leaves_boundary_collapsed(self):
         b = self._tree(boundary=True)
         try:
             ctx = _ctx_for(b)
             # Cursor on A (top level) → its parent is the root, so the
-            # recursive expand walks root's children.
+            # recursive expand walks root's children and reaches A.
             self.assertTrue(dispatch_key(b, ctx, 'alt-right'))
-            # A is reached and added (expand TO the boundary)...
-            self.assertIn('A', b._state.expanded)
-            # ...but the cached branch A1 below it is NOT (never THROUGH).
+            # A is a boundary: revealed but never expanded (not added),
+            # and nothing below it is expanded either — even though its
+            # subtree is fully cached.
+            self.assertNotIn('A', b._state.expanded)
             self.assertNotIn('A1', b._state.expanded)
         finally:
             b.stop_workers()
 
     def test_alt_right_non_boundary_control_recurses(self):
-        # Identical shape, A is not a boundary → A1 expands recursively.
+        # Identical shape, A is not a boundary → A and A1 expand recursively.
         b = self._tree(boundary=False)
         try:
             ctx = _ctx_for(b)
             self.assertTrue(dispatch_key(b, ctx, 'alt-right'))
             self.assertIn('A', b._state.expanded)
             self.assertIn('A1', b._state.expanded)
+        finally:
+            b.stop_workers()
+
+    def test_alt_right_does_not_strand_uncached_boundary(self):
+        # Regression (#785): the browse-claude agent-row case. A same-file
+        # umbrella U holds a boundary AG (agent group) whose children — the
+        # subagent's own .jsonl — are NOT cached. Recursive expand from U
+        # must reveal AG without expanding it: no entry in ``expanded``, no
+        # children fetch dispatched, and no stranded ``⧗ loading…``
+        # placeholder (which the cursor-prefetch — cursor row only — would
+        # never resolve for a non-cursor row, leaving it stuck until the
+        # user manually lands the cursor on it).
+        #   root: [U (kids), tail];  U: [AG (boundary, kids, UNCACHED), MSG]
+        b = _make_browser()
+        s = b._state
+        s._children[None] = [
+            Item(id='U', has_children=True),
+            Item(id='tail'),
+        ]
+        s._children['U'] = [
+            Item(id='AG', has_children=True, boundary=True),
+            Item(id='MSG'),
+        ]
+        # s._children['AG'] intentionally absent (uncached foreign subtree).
+        try:
+            ctx = _ctx_for(b)
+            s.cursor = 0  # cursor on U (the same-file umbrella)
+            self.assertTrue(dispatch_key(b, ctx, 'alt-right'))
+            # Run any posted ctx.expand work so a stray fetch would surface.
+            b.drain_main_queue()
+            # U (non-boundary) expands; AG (boundary) is revealed, not expanded.
+            self.assertIn('U', s.expanded)
+            self.assertNotIn('AG', s.expanded)
+            # No children fetch was dispatched for the boundary.
+            self.assertNotIn('AG', s._children_pending)
+            self.assertNotIn(
+                'AG', [q[0] for q in getattr(b, '_children_queue', [])],
+            )
+            # No stranded loading placeholder anywhere in the visible tree.
+            kinds = [e.kind for e in _state.visible_items(s)]
+            self.assertNotIn('pending', kinds)
         finally:
             b.stop_workers()
 
