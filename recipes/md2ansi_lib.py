@@ -49,9 +49,11 @@ class M2A_DocumentState:
     footnote_order: list = field(default_factory=list)
     cell_min_width: int = 20
     row_dividers: Any = None
-    # Table layout keys off this rather than `line_width` so the 150-char
-    # fallback used for HR sizing doesn't accidentally trigger shrinking.
-    table_fit_width: int = 0
+    # The requested wrap width (the caller's `line_width`), or 0 when wrapping
+    # is disabled. Drives table fitting, blockquote/list self-wrapping, and the
+    # post-render prose wrap. Kept distinct from `line_width` so the 150-char
+    # fallback used for HR sizing doesn't accidentally trigger any of those.
+    wrap_width: int = 0
 
 
 # ### Section: Shared regex fragments #######################################
@@ -82,10 +84,12 @@ _M2A_NUM = r"""
 """
 
 # Block-start lookahead — substituted into every cross-line inline rule's
-# soft-newline branch so inline matching stops at block boundaries.
+# soft-newline branch so inline matching stops at block boundaries. The `#`
+# branch requires 1–6 hashes followed by a space, matching a real ATX heading
+# (_MD_H1.._MD_H6); a bare `#word` is not a heading and must not stop a span.
 _M2A_BLOCK_START_AHEAD = r"""
     [ \t]* (?:
-        \#
+        \#{1,6} [ \t]
       | >
       | \|
       | `{3,}
@@ -200,6 +204,20 @@ def _m2a_prefix_lines(text, prefix):
     return "\n".join(prefix + ln for ln in text.split("\n"))
 
 
+# Block formatters that own their own layout (code frames, tables, headings,
+# blockquotes, lists, footnotes, HR) wrap themselves and then mark every output
+# line with this sentinel so the post-render wrap pass leaves their structure
+# untouched. NUL never occurs in real input; `md2ansi` strips any stray copy
+# from the source before rendering, and `_m2a_wrap_rendered` strips the markers
+# it consumes.
+_M2A_OPAQUE = "\x00"
+
+
+def _m2a_opaque(text):
+    """Mark every line of `text` as opaque — exempt from post-render wrapping."""
+    return "\n".join(_M2A_OPAQUE + ln for ln in text.split("\n"))
+
+
 def _m2a_inject_color(text, style, reset=None):
     """Wrap `text` in SGR codes so every line carries its own color setup.
 
@@ -233,7 +251,17 @@ def _m2a_styled(text, current_style, sgr):
 
 def _m2a_fmt_hr(m, name, current_style, context, state):
     bar = "─" * max(1, state.line_width - 1)
-    return _m2a_inject_color(bar, current_style, current_style)
+    return _m2a_opaque(_m2a_inject_color(bar, current_style, current_style))
+
+
+def _m2a_fmt_heading(m, name, current_style, context, state, sgr):
+    """Render an ATX heading: recurse the title through inline rules under the
+    level's color, then mark the line opaque so it's never wrapped (a heading
+    that overflows the width stays on one line, matching its block intent)."""
+    inner = m.group(f"{name}_inner")
+    new_style = f"{current_style};{sgr}"
+    inner = _md2ansi(inner, new_style, M2A_CONTEXT_MD_INLINE, state)
+    return _m2a_opaque(_m2a_inject_color(inner, new_style, current_style))
 
 
 # `\`` → bare backtick. Inside a single-backtick code span `\` escapes ONLY a
@@ -266,7 +294,16 @@ def _m2a_fmt_blockquote(m, name, current_style, context, state):
     stripped = "\n".join(re.sub(r"^>[ \t]?", "", ln) for ln in text.split("\n"))
     inner = _md2ansi(stripped, current_style, M2A_CONTEXT_MD_INLINE, state)
     bar = _m2a_styled("│", current_style, M2A_COLOR_DIM) + " "
-    return _m2a_prefix_lines(inner, bar)
+    # The quote owns its layout, so it wraps itself (visible-width aware) before
+    # the bar is prefixed — width less the 2-column bar — then marks the result
+    # opaque so the post-render pass won't reflow it.
+    if state.wrap_width > 0:
+        inner = "\n".join(
+            sub
+            for ln in inner.split("\n")
+            for sub in _m2a_wrap_ansi_line(ln, state.wrap_width - 2)
+        )
+    return _m2a_opaque(_m2a_prefix_lines(inner, bar))
 
 
 def _m2a_fmt_table(m, name, current_style, context, state):
@@ -324,7 +361,7 @@ def _m2a_fmt_table(m, name, current_style, context, state):
     # is pinned at cell_min_width and the remaining wide columns are
     # re-scaled. Per spec, if everything is pinned and the table still
     # overflows, we accept the overflow.
-    target_lw = state.table_fit_width
+    target_lw = state.wrap_width
     cell_min = state.cell_min_width
     if target_lw > 0:
         overhead = 3 * n_cols + 1
@@ -493,7 +530,7 @@ def _m2a_fmt_table(m, name, current_style, context, state):
             out_lines.append(border("├", "┼", "┤"))
         out_lines.extend(rl)
     out_lines.append(border("└", "┴", "┘"))
-    return "\n".join(out_lines)
+    return _m2a_opaque("\n".join(out_lines))
 
 
 def _m2a_fmt_list(m, name, current_style, context, state):
@@ -506,10 +543,19 @@ def _m2a_fmt_list(m, name, current_style, context, state):
             bullet = "·" if marker in ("-", "*", "+") else marker
             styled = _m2a_styled(bullet, current_style, "1")
             rendered = _md2ansi(content, current_style, M2A_CONTEXT_MD_INLINE, state)
-            out_lines.append(f"{'  ' * level}{styled} {rendered}")
+            line = f"{'  ' * level}{styled} {rendered}"
+            # The item is fully rendered before wrapping, so inline spans never
+            # straddle a wrap break. Continuations hang-indent two columns past
+            # the list indent (under the content, clear of the one-col bullet).
+            if state.wrap_width > 0:
+                out_lines.extend(
+                    _m2a_wrap_ansi_line(line, state.wrap_width, "  " * level + "  ")
+                )
+            else:
+                out_lines.append(line)
         else:
             out_lines.append(ln)
-    return "\n".join(out_lines)
+    return _m2a_opaque("\n".join(out_lines))
 
 
 def _m2a_fmt_footnote_def(m, name, current_style, context, state):
@@ -537,7 +583,7 @@ def _m2a_render_footnotes(state, current_style):
     for fid, text in entries:
         ref = _m2a_styled(f"[^{fid}]", current_style, M2A_COLOR_FOOTNOTE)
         out.append(f"  {ref} {text}")
-    return "\n".join(out) + "\n"
+    return _m2a_opaque("\n".join(out)) + "\n"
 
 
 def _m2a_fmt_code(m, name, current_style, context, state, code_context, lang=None, label=None):
@@ -582,7 +628,7 @@ def _m2a_fmt_code(m, name, current_style, context, state, code_context, lang=Non
     # inside a list/quote keeps its column.
     if indent:
         framed = _m2a_prefix_lines(framed, indent)
-    return framed
+    return _m2a_opaque(framed)
 
 
 # ### Section: Rule tables ##################################################
@@ -838,6 +884,10 @@ _MD_ITALIC = rf"""
 def _m2a_code_lambda(code_ctx, lang=None, label=None):
     return lambda m, name, cs, ctx, st: _m2a_fmt_code(m, name, cs, ctx, st, code_ctx, lang, label)
 
+# Lambda binding the level color for each heading rule (h1..h6).
+def _m2a_heading_lambda(sgr):
+    return lambda m, name, cs, ctx, st: _m2a_fmt_heading(m, name, cs, ctx, st, sgr)
+
 # Inline rules — used to build M2A_CONTEXT_MD_INLINE (where _M2A_RECURSE_SELF
 # resolves to INLINE itself), and reused inside _M2A_RULES_MD after rebinding
 # the sentinel to the now-built INLINE context. Block-level matches recurse
@@ -870,12 +920,12 @@ _M2A_RULES_INLINE_IN_MD = tuple(
 
 _M2A_RULES_MD = (
     ("frontmatter",   _MD_FRONTMATTER,  _m2a_code_lambda(M2A_CONTEXT_CODE_GENERIC, label="Frontmatter"), None),
-    ("h1",            _MD_H1,           M2A_COLOR_H1,                                 M2A_CONTEXT_MD_INLINE),
-    ("h2",            _MD_H2,           M2A_COLOR_H2,                                 M2A_CONTEXT_MD_INLINE),
-    ("h3",            _MD_H3,           M2A_COLOR_H3,                                 M2A_CONTEXT_MD_INLINE),
-    ("h4",            _MD_H4,           M2A_COLOR_H4,                                 M2A_CONTEXT_MD_INLINE),
-    ("h5",            _MD_H5,           M2A_COLOR_H5,                                 M2A_CONTEXT_MD_INLINE),
-    ("h6",            _MD_H6,           M2A_COLOR_H6,                                 M2A_CONTEXT_MD_INLINE),
+    ("h1",            _MD_H1,           _m2a_heading_lambda(M2A_COLOR_H1),            None),
+    ("h2",            _MD_H2,           _m2a_heading_lambda(M2A_COLOR_H2),            None),
+    ("h3",            _MD_H3,           _m2a_heading_lambda(M2A_COLOR_H3),            None),
+    ("h4",            _MD_H4,           _m2a_heading_lambda(M2A_COLOR_H4),            None),
+    ("h5",            _MD_H5,           _m2a_heading_lambda(M2A_COLOR_H5),            None),
+    ("h6",            _MD_H6,           _m2a_heading_lambda(M2A_COLOR_H6),            None),
     ("hr",            _MD_HR,           _m2a_fmt_hr,                                  None),
     ("code_python",   _MD_CODE_PY,      _m2a_code_lambda(M2A_CONTEXT_CODE_PYTHON,     "python"),     None),
     ("code_bash",     _MD_CODE_BASH,    _m2a_code_lambda(M2A_CONTEXT_CODE_BASH,       "bash"),       None),
@@ -916,84 +966,17 @@ def _md2ansi(text, current_style, context, state):
 
 # ### Section: Public md2ansi() entry point #################################
 
-# Line-wrapping helpers — applied to source by `md2ansi` before markdown
-# processing when line_width > 0. Wrapping is intentionally NOT done inside
-# `_md2ansi` because the dispatcher calls itself recursively; we want to wrap
-# once at the top.
-
-
-def _m2a_continuation_indent(line):
-    """Compute the prefix to prepend to wrapped continuation lines so that
-    the resulting block still parses as the same markdown construct.
-
-    - Blockquote (`^[> ]*>`): copy the leading `>`/space run verbatim.
-    - List item (`-`, `*`, `+`, `N.`): leading whitespace + 2 spaces.
-    - Paragraph: leading whitespace only.
-    """
-    if re.match(r"^[> ]*>", line):
-        return re.match(r"^[> ]*", line).group(0)
-    m = re.match(r"^([ \t]*)(?:[-*+]|\d+\.)[ \t]+", line)
-    if m:
-        return m.group(1) + "  "
-    return re.match(r"^[ \t]*", line).group(0)
-
-
-def _m2a_wrap_line(line, line_width, continuation):
-    """Greedy word-wrap with a small no-break zone at the start of each line.
-    A word that doesn't fit triggers a break unless the line is still under
-    20 visible chars (in which case we attach and accept the overflow — there's
-    no useful break point that close to the start).
-    """
-    if len(line) <= line_width:
-        return [line]
-    threshold = _m2a_no_break_zone(line_width)
-
-    # Fast-path: the first `threshold` chars are in the no-break zone — copy
-    # them verbatim, extended to the next word boundary so a word straddling
-    # `threshold` is kept intact. If there is no whitespace beyond `threshold`,
-    # the rest is one giant word and we can't usefully wrap.
-    if threshold > 0:
-        ws_after = re.search(r"\s+", line[threshold:])
-        if ws_after is None:
-            return [line]
-        split_pos = threshold + ws_after.start()
-        head = line[:split_pos]
-        tail = line[split_pos:]
-    else:
-        head = ""
-        tail = line
-
-    tokens = re.findall(r"\s+|\S+", tail)
-    if not tokens:
-        return [line]
-
-    lines_out = []
-    current = [head]
-    current_len = len(head)
-    pending_ws = ""
-    for tok in tokens:
-        if tok[0].isspace():
-            pending_ws = tok
-            continue
-        attempt_len = current_len + len(pending_ws) + len(tok)
-        # Attach if it fits, we're below threshold, or the current line is
-        # empty (no break possible before the first content).
-        if attempt_len <= line_width or current_len < threshold or current_len == 0:
-            current.append(pending_ws)
-            current.append(tok)
-            current_len = attempt_len
-        else:
-            lines_out.append("".join(current))
-            current = [continuation, tok]
-            current_len = len(continuation) + len(tok)
-        pending_ws = ""
-    lines_out.append("".join(current))
-    return lines_out
+# Line wrapping runs as a post-render pass over the already-styled output (see
+# `_m2a_wrap_rendered`). Wrapping after rendering — rather than pre-wrapping the
+# source — means inline spans are fully resolved before any break is inserted,
+# so a `**bold**` / `` `code` `` span can never be split mid-construct, and
+# widths are measured on visible characters rather than raw markdown.
 
 
 def _m2a_wrap_ansi_line(line, line_width, continuation="", reset_sgr=""):
-    """ANSI-aware variant of `_m2a_wrap_line`: wraps at visible-character
-    positions, leaves SGR escape sequences intact, and re-emits the last seen
+    """Greedy word-wrap over already-styled text: wraps at visible-character
+    positions (a small no-break zone at the line start, like the source wrapper
+    it replaced), leaves SGR escape sequences intact, and re-emits the last seen
     SGR at the start of each new line so any styling active at the break
     point survives onto the next line.
 
@@ -1049,61 +1032,38 @@ def _m2a_wrap_ansi_line(line, line_width, continuation="", reset_sgr=""):
     return lines_out
 
 
-def _m2a_wrap_source(text, line_width):
-    """Pre-pass over raw source: wrap long paragraph / list / blockquote
-    lines. Skip tables (TODO: cell-aware wrap), code blocks, headings,
-    footnote-def lines.
+def _m2a_wrap_rendered(text, line_width):
+    """Post-render word-wrap over already-styled output.
+
+    Each output line is wrapped to `line_width` measuring visible width and
+    re-emitting active SGR across breaks (`_m2a_wrap_ansi_line`); a prose line's
+    continuation inherits its leading whitespace. Lines a block formatter marked
+    opaque (`_M2A_OPAQUE`) own their own layout (code frames, tables, headings,
+    lists, blockquotes, footnotes, HR) — they pass through verbatim, with the
+    marker stripped. The marker is always stripped here, so this pass also runs
+    when wrapping is disabled (`line_width <= 0`) purely to remove markers.
     """
-    if line_width <= 0:
-        return text
-    lines = text.split("\n")
     out = []
-    start = 0
-    # Leading frontmatter (\A `---` … `---`): pass it through verbatim so its
-    # YAML lines aren't word-wrapped. Mirrors the _MD_FRONTMATTER rule exactly,
-    # including its strictness (no blank lines, no `#` comments in the body), so
-    # we only skip what the renderer will actually box. A mid-document `---` is
-    # an HR, not a fence, so `---` can't be a generic in/out toggle here.
-    if lines and re.match(r"^---[ \t]*$", lines[0]):
-        k = 1
-        while k < len(lines):
-            if re.match(r"^---[ \t]*$", lines[k]):
-                out.extend(lines[:k + 1])
-                start = k + 1
-                break
-            if lines[k].strip() == "" or re.match(r"^[ \t]*#", lines[k]):
-                break
-            k += 1
-    in_code = False
-    for ln in lines[start:]:
-        # Code-fence toggle — anything inside is left verbatim.
-        if re.match(r"^[ \t]*(```|~~~)", ln):
-            in_code = not in_code
+    for ln in text.split("\n"):
+        if ln.startswith(_M2A_OPAQUE):
+            out.append(ln[len(_M2A_OPAQUE):])
+        elif line_width > 0:
+            cont = re.match(r"[ \t]*", ln).group(0)
+            out.extend(_m2a_wrap_ansi_line(ln, line_width, cont))
+        else:
             out.append(ln)
-            continue
-        if in_code:
-            out.append(ln)
-            continue
-        # Skip: tables, headings, footnote definitions.
-        if (re.match(r"^[ \t]*\|", ln)
-                or re.match(r"^[ \t]*#{1,6}[ \t]+", ln)
-                or re.match(r"^\[\^[^\]]+\]:", ln)):
-            # TODO: cell-aware table wrapping.
-            out.append(ln)
-            continue
-        if len(ln) <= line_width:
-            out.append(ln)
-            continue
-        out.extend(_m2a_wrap_line(ln, line_width, _m2a_continuation_indent(ln)))
     return "\n".join(out)
 
 
 def md2ansi(text, current_style="0", line_width=0, cell_min_width=20, row_dividers=None):
     """Convert Markdown text to ANSI-colored output.
 
-    `line_width` > 0 enables source-level word wrapping for paragraphs, lists,
-    and blockquotes. It's also the width used by `_m2a_fmt_hr`. When 0 (the
-    default) no wrapping happens and HR falls back to a 150-char bar.
+    `line_width` > 0 enables word wrapping for paragraphs, lists, and
+    blockquotes. Wrapping runs as a post-render pass over the styled output
+    (`_m2a_wrap_rendered`), so inline spans are never split mid-construct and
+    widths count visible characters, not raw markdown. It's also the width used
+    by `_m2a_fmt_hr`. When 0 (the default) no wrapping happens and HR falls back
+    to a 150-char bar.
 
     `cell_min_width` is the minimum width a table column can be shrunk to when
     fitting the table into `line_width`; columns whose natural width is at or
@@ -1111,21 +1071,20 @@ def md2ansi(text, current_style="0", line_width=0, cell_min_width=20, row_divide
     `None` (default) emits inter-row dividers only when any body cell wraps;
     `True` always emits them; `False` never emits them.
     """
-    if line_width > 0:
-        text = _m2a_wrap_source(text, line_width)
-        state_lw = line_width
-    else:
-        state_lw = 150
+    # NUL is the opaque-line marker; strip any stray copy from the source so it
+    # can't be mistaken for one.
+    text = text.replace(_M2A_OPAQUE, "")
+    state_lw = line_width if line_width > 0 else 150
     state = M2A_DocumentState(
         line_width=state_lw,
         cell_min_width=cell_min_width,
         row_dividers=row_dividers,
-        table_fit_width=line_width,
+        wrap_width=line_width,
     )
     out = _md2ansi(text, current_style, M2A_CONTEXT_MD, state)
     if state.footnote_order:
         out += _m2a_render_footnotes(state, current_style)
-    return out
+    return _m2a_wrap_rendered(out, line_width)
 
 
 # ### Section: Structural scan API #########################################
