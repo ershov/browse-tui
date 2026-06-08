@@ -1525,7 +1525,7 @@ class TestAncestorIdsForSubagent(unittest.TestCase):
         # Ancestors of sa1 (deepest, line 1 in subagent) should walk:
         #   parent: <prompt> umbrella @ line 0 (wraps u1)
         #          → <tool:Task> umbrella @ line 1 (wraps a1)
-        #          → <subagent> group (#agent:AGENT01)
+        #          → <subagent> group (('agent', sess, 'AGENT01'))
         #          → <prompt> umbrella @ line 0 of subagent (wraps su1)
         #   → sa1 itself (target, not included)
         import json as _json
@@ -1575,7 +1575,7 @@ class TestAncestorIdsForSubagent(unittest.TestCase):
             # Expect (root → leaf), all umbrella ids:
             #   parent's <prompt> umbrella (line 0, wraps u1)
             #   parent's <tool:Task> umbrella (line 1, wraps a1)
-            #   subagent group #agent:AGENT01
+            #   subagent group ('agent', sess, 'AGENT01')
             #   subagent's <prompt> umbrella (line 0, wraps su1)
             self.assertEqual(chain, [
                 ('prompt', sess_path, 0),
@@ -4518,7 +4518,7 @@ class TestSessionRowVsScopeRootPreview(unittest.TestCase):
 
 
 class TestSubagentRowLightweightPreview(unittest.TestCase):
-    """``#agent:`` rows follow the same cross-file rule as session rows:
+    """``('agent', …)`` rows follow the same cross-file rule as session rows:
     lightweight metadata until the row is scope_root or expanded.
     """
 
@@ -5383,10 +5383,22 @@ class TestVoiceOnlyFilter(unittest.TestCase):
             os.unlink(path)
 
     def test_passes_filter_prompt_umbrella_always_true(self):
-        # ``#prompt:`` is always voice-bearing by construction.
-        self.r._FILTER_VOICE_ONLY = True
-        # No td needed; predicate short-circuits on the prompt prefix.
-        self.assertTrue(self.r._passes_filter('any/path#prompt:42'))
+        # A ``('prompt', …)`` umbrella is always voice-bearing by
+        # construction. Seed its record as a pure tool_use (non-voice as a
+        # plain message) and a tree-data entry, so a True result can ONLY
+        # come from the ``tag == 'prompt'`` rule — not the no-td guard nor
+        # the message fall-through (both of which we route past here).
+        path = '/tmp/fake-prompt.jsonl'
+        td = self.r._TreeData()
+        td.records = [{'type': 'assistant', 'message': {'role': 'assistant',
+                       'content': [{'type': 'tool_use', 'id': 't',
+                                    'name': 'X', 'input': {}}]}}]
+        self.r._TREE_CACHE[path] = td
+        try:
+            self.r._FILTER_VOICE_ONLY = True
+            self.assertTrue(self.r._passes_filter(('prompt', path, 0)))
+        finally:
+            self.r._TREE_CACHE.pop(path, None)
 
     def test_passes_filter_tool_umbrella_pure_tool_use(self):
         # Pure tool_use (no assistant text) doesn't pass.
@@ -5420,7 +5432,7 @@ class TestVoiceOnlyFilter(unittest.TestCase):
             os.unlink(path)
 
     def test_passes_filter_span_umbrella_membership(self):
-        # ``#span:`` passes iff any record in the span is voice.
+        # A ``('span', …)`` umbrella passes iff any record in the span is voice.
         # Fabricate a td directly to avoid relying on _scan_tree
         # producing a specific span layout.
         path = '/tmp/fake-span.jsonl'
@@ -5443,10 +5455,10 @@ class TestVoiceOnlyFilter(unittest.TestCase):
             self.r._TREE_CACHE.pop(path, None)
 
     def test_passes_filter_subagent_always_true(self):
-        # Subagent umbrellas are unconditionally visible — the recipe
-        # doesn't peek into another file to check.
+        # Subagent umbrellas (``('agent', …)``) are unconditionally
+        # visible — the recipe doesn't peek into another file to check.
         self.r._FILTER_VOICE_ONLY = True
-        self.assertTrue(self.r._passes_filter('whatever#agent:ABC-DEF'))
+        self.assertTrue(self.r._passes_filter(('agent', 'whatever', 'ABC-DEF')))
 
     def test_passes_filter_unparseable_id_is_permissive(self):
         # Synthetic ids (err rows, ``__truncated__``) must stay visible.
@@ -5830,7 +5842,7 @@ class TestVoiceOnlyFilter(unittest.TestCase):
     # ---- preview respects hidden ----------------------------------------
 
     def test_umbrella_preview_skips_hidden_children(self):
-        # A ``#prompt:`` preview composes from its non-hidden children
+        # A ``('prompt', …)`` preview composes from its non-hidden children
         # only. Under voice-only, a tool umbrella with no voice content
         # is hidden and should not contribute to the prompt's preview.
         path = self._write_jsonl([
@@ -5919,8 +5931,10 @@ class TestShowId(unittest.TestCase):
     def test_pages_cursor_id(self):
         paged = []
 
+        cursor_id = ('prompt', '/proj/sess.jsonl', 5)
+
         class _Cursor:
-            id = '/proj/sess.jsonl#prompt:abc123'
+            id = cursor_id
 
         class _Ctx:
             cursor = _Cursor()
@@ -5928,7 +5942,9 @@ class TestShowId(unittest.TestCase):
                 paged.append(text)
 
         self.r._action_show_id(_Ctx())
-        self.assertEqual(paged, ['/proj/sess.jsonl#prompt:abc123'])
+        # The id is a tuple, so ``str()`` is a real stringification (not
+        # a no-op) — the pager receives ``str(id)``.
+        self.assertEqual(paged, [str(cursor_id)])
 
     def test_no_cursor_is_noop(self):
         # The 'cursor' gate normally prevents this, but the internal
@@ -6753,12 +6769,12 @@ class TestOnExpandJumpComposition(unittest.TestCase):
     def _write_session(self, tmp):
         """A 2-voice turn: user FIRST_VOICE, a tool_use, asst LAST_VOICE.
 
-        Tree-mode listing for ``<sess>#prompt:0`` is::
+        Tree-mode listing for ``('prompt', sess, 0)`` is::
 
             #0 user FIRST_VOICE | #1 tool_use | #2 asst LAST_VOICE
 
-        so ``_latest_voice_among_children('<sess>#prompt:0')`` is the
-        final assistant text leaf, ``<sess>#2`` — the deterministic
+        so ``_latest_voice_among_children(('prompt', sess, 0))`` is the
+        final assistant text leaf, ``('msg', sess, 2)`` — the deterministic
         jump target used by these tests.
         """
         import json as _json
@@ -6913,7 +6929,7 @@ class TestOnScopeChangeCrossFileUpgrade(unittest.TestCase):
     gated on ``direction == 'in'``. So it fires for EVERY scope-in source
     — alt-down, programmatic ``ctx.scope_into``, startup ``initial_scope``
     — and only drops the cache for cross-file ids (bare ``.jsonl`` /
-    ``#agent:``), leaving in-file scope rows on their already-heavy
+    ``('agent', …)``), leaving in-file scope rows on their already-heavy
     preview. Scope-OUT must NOT invalidate.
 
     These drive the hook directly against a recorder ``_BROWSER``; the
@@ -7334,7 +7350,7 @@ class TestMarkdownSubtrees(unittest.TestCase):
     detection gate (``_md_has_children``), the lazy authoritative subtree build
     (``_md_message_children`` / ``_md_subtree_children``), recursion across
     referenced files, the ``_on_children_loaded`` self-heal, and (#661) the
-    ``#md:`` preview routing — full document text for a document node, the
+    ``('md', …)`` preview routing — full document text for a document node, the
     byte-range section slice for a heading node, the ``_MD_COLOR`` toggle, and
     the relative-label rule. The recipe is reloaded with ``md_doc`` live (see
     ``_load_recipe_with_md_doc``); a separate test forces ``_md_doc = None`` to
@@ -7741,7 +7757,7 @@ class TestMarkdownSubtrees(unittest.TestCase):
             heading, refs = kids
             self.assertEqual(heading.tag, 'h1')
             self.assertFalse(getattr(heading, 'boundary', False))
-            # Umbrella id = the file-doc id + #refs; same-document grouping.
+            # Umbrella id = ('refs', anchor, chain); same-document grouping.
             self.assertEqual(refs.id, _refs_id(file_id))
             self.assertEqual(refs.tag, 'links')
             self.assertFalse(refs.boundary)
@@ -7913,14 +7929,14 @@ class TestMarkdownSubtrees(unittest.TestCase):
             via_router = self.r.get_children(base)
             self.assertEqual([k.title for k in via_router],
                              ['markdown', 'References'])
-            # #md: id → routed to the subtree builder (the dim [text] intro
-            # leaf "Plan" then the "Summary" heading).
+            # ('md', …) id → routed to the subtree builder (the dim [text]
+            # intro leaf "Plan" then the "Summary" heading).
             inline_id = _md_id(base, [])
             self.assertEqual(
                 [k.title for k in self.r.get_children(inline_id)],
                 ['Plan', 'Summary'])
-            # #refs umbrella id → routed (BEFORE the #md: branch) to the
-            # umbrella builder; its child is the file doc.
+            # ('refs', …) umbrella id → routed by tag to the umbrella
+            # builder; its child is the file doc.
             refs_id = _refs_id(base)
             self.assertEqual(
                 [k.title for k in self.r.get_children(refs_id)], ['report.md'])
@@ -7938,9 +7954,10 @@ class TestMarkdownSubtrees(unittest.TestCase):
                 self.r._md_doc = saved
 
     def test_get_preview_md_id_unreadable_returns_empty(self):
-        # A #md: id whose base record / file is unreadable yields ''  — and
-        # crucially does NOT fall through to the generic message-id path (which
-        # would mis-int the ``#<lineoffset>`` suffix as a record line number).
+        # A ('md', …) id whose base record / file is unreadable yields '' —
+        # and crucially does NOT fall through to the generic message path:
+        # routing is by tag (``id[0] == 'md'``), so a missing doc simply
+        # produces an empty preview.
         base = '/p/s.jsonl#3'
         heading_id = _md_id(base, [], line_offset=12)
         self.assertEqual(self.r.get_preview(heading_id), '')
@@ -8045,9 +8062,9 @@ class TestMarkdownSubtrees(unittest.TestCase):
     # ---- boundary integration + get_preview reorder (#662) -------------
 
     def test_is_cross_file_fallback_for_md_file_doc_id(self):
-        # An md file-doc id matches neither #agent: nor bare-.jsonl, so the
-        # not-loaded fallback in _is_cross_file_id returns False — the id is
-        # never mistaken for a cross-file (session/subagent) row by shape.
+        # An ('md', …) file-doc id is neither ('agent', …) nor ('session', …),
+        # so the not-loaded fallback in _is_cross_file_id returns False — the id
+        # is never mistaken for a cross-file (session/subagent) row by shape.
         # (The reorder, tested next, is what protects the *loaded* case.)
         file_id = _md_id(
             '/p/s.jsonl#0', ['/abs/report.md'])
@@ -8059,9 +8076,9 @@ class TestMarkdownSubtrees(unittest.TestCase):
         # boundary=True; with a _BROWSER that returns it from get_item, the
         # (now boundary-based) _is_cross_file_id reports True for it. If the
         # cross-file check ran first it would hijack the preview into the
-        # metadata/umbrella path. Because '#md:' is checked BEFORE
-        # _is_cross_file_id, the node still routes to _preview_md_node and
-        # yields the file's own text — never the cross-file card.
+        # metadata/umbrella path. Because the ``tag == 'md'`` branch is checked
+        # BEFORE _is_cross_file_id, the node still routes to _preview_md_node
+        # and yields the file's own text — never the cross-file card.
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             report = os.path.join(tmp, 'report.md')
@@ -8092,7 +8109,8 @@ class TestMarkdownSubtrees(unittest.TestCase):
     def test_get_preview_inline_md_node_routes_to_md_node(self):
         # The inline (same-file, boundary=False) document node also routes to
         # _preview_md_node — confirms the reorder didn't regress the common
-        # case and that '#md:' precedes the generic '#' message branch too.
+        # case and that the ``tag == 'md'`` branch precedes the generic message
+        # branch too.
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess, proj, report, appendix = self._build_project(tmp)
@@ -8522,7 +8540,7 @@ class TestBoundaryMigration(unittest.TestCase):
     """#662: ``boundary`` flag integration + the id-shape ``if`` migration.
 
     Asserts (a) the rows the OLD ``_is_cross_file_id`` matched now carry
-    ``boundary=True`` (subagent-group ``#agent:`` rows and bare ``.jsonl``
+    ``boundary=True`` (subagent-group ``('agent', …)`` rows and ``('session', …)``
     session rows; md *inline* and message/umbrella rows do not); (b)
     ``_is_cross_file_id`` is behaviour-equivalent via the boundary lookup,
     with the OLD id-shape predicate preserved as the not-loaded fallback;
@@ -8581,7 +8599,7 @@ class TestBoundaryMigration(unittest.TestCase):
     # ---- (a) boundary set on the migrated rows -------------------------
 
     def test_subagent_group_rows_are_boundary(self):
-        # Both #agent: builders (the per-session lister and the inline
+        # Both ('agent', …) builders (the per-session lister and the inline
         # pseudo-item) and orphan rows (which delegate to the lister) must
         # set boundary=True so the migrated predicate matches them.
         import tempfile
@@ -8649,14 +8667,14 @@ class TestBoundaryMigration(unittest.TestCase):
 
     # ---- (c) get_preview reorder + md file-doc fallback are exercised in
     #          TestMarkdownSubtrees (which loads the recipe with md_doc live,
-    #          so '#md:' ids can be composed). See its
+    #          so ('md', …) ids can be composed). See its
     #          ``test_get_preview_md_file_doc_routes_to_md_node_despite_boundary``
     #          (THE reorder regression guard) and the file-doc fallback test.
 
     # ---- (d) _walk_umbrella skips boundary children --------------------
 
     def test_walk_umbrella_skips_boundary_child(self):
-        # A boundary child (here a subagent #agent: row pointing at another
+        # A boundary child (here a subagent ('agent', …) row pointing at another
         # file) must NOT have its content folded into the parent's cascade;
         # a same-file leaf sibling still renders.
         import tempfile

@@ -630,9 +630,9 @@ class TestEndToEndDispatchAndDelivery(unittest.TestCase):
 class TestIndexSetHashability(unittest.TestCase):
     """``_index_set`` raises a clear error on an unhashable id (spec 5.2).
 
-    The forward-index write is the single add-side choke point where a
-    recipe id is first hashed. A ``list`` / ``dict`` / ``set`` id must
-    surface a message that names the offender, not a bare
+    The forward-index write for child delivery goes through ``_index_set``,
+    where a recipe child id is first hashed. A ``list`` / ``dict`` / ``set``
+    id must surface a message that names the offender, not a bare
     ``unhashable type`` from deep in framework internals.
     """
 

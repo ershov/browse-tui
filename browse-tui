@@ -1822,16 +1822,21 @@ def _index_drop_children(state: State, parent_id) -> None:
 
 
 def _index_set(state: State, item) -> None:
-    """Write ``state._items_by_id[item.id] = item`` — the add-side choke point.
+    """Write ``state._items_by_id[item.id] = item`` — the choke point for
+    child delivery.
 
     The counterpart to ``_index_drop_children`` for the forward index.
     Recipe-supplied children flow through here (via ``_index_add_children``),
-    so it is where an unhashable recipe id (``list`` / ``dict`` / ``set``)
-    is first hashed. The hash happens exactly once — the dict write that
-    occurs anyway — and the ``try``/``except`` is free in CPython when no
-    exception fires, so this adds a debug-quality error message, not a
-    runtime cost: a generic ``unhashable type`` deep in framework internals
-    becomes one that names the offending id value and type.
+    so it is where an unhashable child id (``list`` / ``dict`` / ``set``) is
+    first hashed and turned into a clear, offender-naming error. It is *not*
+    the only forward-index writer: the ``update_data`` op handlers
+    (``_apply_upsert`` / ``_apply_set`` / ``_apply_mod``) and the
+    ``visible_items`` scope-root stub write ``_items_by_id`` directly and
+    still surface a bare ``unhashable type`` — that path is rare and
+    developer-facing, so it is left unwrapped. The hash happens exactly once
+    — the dict write that occurs anyway — and the ``try``/``except`` is free
+    in CPython when no exception fires, so this adds a debug-quality error
+    message, not a runtime cost.
     """
     try:
         state._items_by_id[item.id] = item

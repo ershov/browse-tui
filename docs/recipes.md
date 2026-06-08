@@ -191,9 +191,10 @@ at runtime, or auto-selection from positional args.
 
 **Demonstrates:**
 
-- A `KIND:`-prefixed id scheme (`commit:`, `file:`, `ref:`, `status:`,
-  `stash:`, `reflog:`) parsed by one `_parse_id` helper — no hex-vs-word
-  heuristics; `get_children` / `get_preview` dispatch on the kind.
+- A tagged-tuple id scheme (`('commit', sha)`, `('file', sha, path)`,
+  `('ref', name)`, `('status', xy, path)`, `('stash', n)`, `('reflog', n,
+  sha)`) — structured, hashable ids with no string parsing; `get_children`
+  / `get_preview` dispatch on the tag (`id[0]`).
 - Colorized previews: `git -c color.ui=always` for diffs / stat, piped
   through [`delta`](https://github.com/dandavison/delta) when it is on
   PATH (`--no-gitconfig --paging never --width <preview_width>`), with a

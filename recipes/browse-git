@@ -415,7 +415,7 @@ def _parse_name_status(text):
     and copies, ``<STATUS>\\t<old>\\t<new>`` where ``STATUS`` carries a
     similarity score (``R100`` / ``C75``). Returns the single status
     letter and the path to display — the *new* path for renames/copies,
-    which is also what the resulting ``file:`` id keys on.
+    which is also what the resulting ``('file', sha, path)`` id keys on.
     """
     rows = []
     for line in text.splitlines():
