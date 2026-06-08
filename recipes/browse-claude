@@ -23,17 +23,21 @@ the session's top-level messages — pick one to drill into its own
 transcript. See ``_candidate_subagents_dirs`` / ``_resolve_agent_jsonl``
 for the cross-project-dir lookup.
 
-Identifiers are kept simple and dispatchable purely by shape:
-  * project ids are absolute paths to the project directory.
-  * session ids are absolute paths to the .jsonl file.
-  * message ids are ``'<session_path>#<line_number>'`` strings — this
-    holds for both top-level session messages (where ``<session_path>``
-    is the main jsonl) and subagent messages (where it's the
-    ``agent-<id>.jsonl`` path). The shape collapse means $EDITOR
-    actions and message previews work uniformly across both.
-  * subagent group ids are ``'<session_path>#agent:<agent_id>'`` —
-    distinct shape so ``get_children`` can route them to the subagent's
-    own line listing.
+Identifiers are tagged tuples, dispatched on their first element
+(``id[0]``):
+  * ``('project', dir)``       — abspath of the project directory.
+  * ``('session', jsonl)``     — abspath of the .jsonl file.
+  * ``('msg', jsonl, n)``      — message at line ``n``; this holds for
+    both top-level session messages (``jsonl`` is the main jsonl) and
+    subagent messages (``jsonl`` is the ``agent-<id>.jsonl`` path), so
+    $EDITOR actions and message previews work uniformly across both.
+  * ``('agent', jsonl, agent_id)`` — subagent group; ``get_children``
+    routes it to the subagent's own line listing.
+  * ``('prompt'|'tool'|'span', jsonl, line)`` — synthetic tree-mode
+    umbrellas grouping a turn / tool-execution / metadata span.
+  * ``('md', anchor, chain, line)`` / ``('refs', anchor, chain)`` —
+    a markdown subtree node / its References umbrella (anchor is the
+    host ``('msg', …)``; see the markdown section).
 
 Phase-3 simplifications (intentionally out of scope):
   * No delete-session action — too dangerous with no undo.
@@ -69,8 +73,8 @@ except Exception:
 # import is guarded exactly like ``md2ansi`` above: when it fails (the sibling
 # recipe / its ``md2ansi_lib`` dep isn't importable) ``_md_doc`` is ``None`` and
 # the WHOLE feature degrades to a no-op — no message row gains markdown
-# children, detection never fires, and ``#md:`` routing is dead code. Every
-# other behaviour is unchanged.
+# children, detection never fires, and ``('md', …)`` routing is dead code.
+# Every other behaviour is unchanged.
 try:
     import md_doc as _md_doc
 except Exception:
@@ -389,15 +393,13 @@ def _find_session_by_pid(pid):
     return _find_session_by_id(data.get('sessionId'))
 
 
-# ---- get_children: dispatches by id shape --------------------------------
+# ---- get_children: dispatches by id tag ----------------------------------
 #
-# The Browser passes the raw item id back into ``get_children``. We use the
-# id's shape (None / dir-path / file-path / ``'…#N'`` / ``'…#agent:NAME'``)
-# to pick the right enumeration without threading any extra state through.
-#
-# Order matters: subagent-group ids (``'<sess>#agent:<id>'``) end with
-# ``.jsonl`` only on the prefix and contain ``'#agent:'``, so we test for
-# that shape before the plain-jsonl branch.
+# The Browser passes the raw item id back into ``get_children``. Every id is a
+# tagged tuple whose first element is a short string tag (or ``None`` for the
+# root), so routing is a flat ``id[0]`` dispatch with direct field access
+# (``id[1]`` = the .jsonl path, ``id[2]`` = a line / agent id). No substring
+# scans, no ordering hazards — the tags are unambiguous.
 
 
 def get_children(item_id, *, reload=False):
@@ -409,12 +411,12 @@ def get_children(item_id, *, reload=False):
     #
     # Granularity:
     #   * ``None``                — full wipe (root refresh / Ctrl-R).
-    #   * ``<jsonl>``             — bust just that file's _TreeData.
-    #   * ``<jsonl>#prompt/tool/span/…`` — bust the containing file's
-    #     _TreeData; one umbrella's children are derived from indexes
-    #     in the same file's TreeData so anything narrower is moot.
-    #   * ``<jsonl>#agent:<aid>`` — bust the subagent's file too.
-    #   * project dir            — nothing to bust (no _TreeData).
+    #   * ``('session', jsonl)``  — bust just that file's _TreeData.
+    #   * ``('prompt'|'tool'|'span', jsonl, line)`` — bust the containing
+    #     file's _TreeData; one umbrella's children are derived from
+    #     indexes in the same file's TreeData so anything narrower is moot.
+    #   * ``('agent', jsonl, aid)`` — bust the subagent's file too.
+    #   * ``('project', dir)``    — nothing to bust (no _TreeData).
     if reload and item_id is not None:
         _bust_caches_for(item_id)
     if item_id is None:
@@ -436,82 +438,71 @@ def get_children(item_id, *, reload=False):
             if _md_doc is not None:
                 _md_doc.clear_cache()
         return _list_projects()
-    if isinstance(item_id, str) and '#agent:' in item_id:
-        # Tree mode views the subagent .jsonl as its own tree, recursing
-        # into _list_tree_roots. Flat mode lists its lines newest-first.
+    if not isinstance(item_id, tuple) or not item_id:
+        return []
+    tag = item_id[0]
+    if tag == 'agent':
+        # ``('agent', jsonl, aid)``. Tree mode views the subagent .jsonl as
+        # its own tree, recursing into _list_tree_roots. Flat mode lists its
+        # lines newest-first.
+        session_path, agent_id = item_id[1], item_id[2]
         if _TREE_MODE:
-            session_path, _, suffix = item_id.partition('#agent:')
-            if not suffix:
+            if not agent_id:
                 return []
-            agent_path = _resolve_agent_jsonl(session_path, suffix)
+            agent_path = _resolve_agent_jsonl(session_path, agent_id)
             if not os.path.isfile(agent_path):
                 return []
             return _list_tree_roots(agent_path)
         return _list_subagent_messages(item_id)
-    if isinstance(item_id, str) and '#prompt:' in item_id:
-        # ``<jsonl>#prompt:<turn_root_line>`` — turn umbrella.
+    if tag == 'prompt':
+        # ``('prompt', jsonl, turn_root_line)`` — turn umbrella.
         if _TREE_MODE:
-            path, _, suffix = item_id.partition('#prompt:')
-            try:
-                n = int(suffix)
-            except ValueError:
-                return []
-            return _list_prompt_children(path, n)
+            return _list_prompt_children(item_id[1], item_id[2])
         return []
-    if isinstance(item_id, str) and '#tool:' in item_id:
-        # ``<jsonl>#tool:<assistant_line>`` — tool-execution umbrella.
+    if tag == 'tool':
+        # ``('tool', jsonl, assistant_line)`` — tool-execution umbrella.
         if _TREE_MODE:
-            path, _, suffix = item_id.partition('#tool:')
-            try:
-                n = int(suffix)
-            except ValueError:
-                return []
-            return _list_tool_children(path, n)
+            return _list_tool_children(item_id[1], item_id[2])
         return []
-    if isinstance(item_id, str) and '#span:' in item_id:
-        # ``<jsonl>#span:<start>`` — synthetic <system> umbrella in tree
+    if tag == 'span':
+        # ``('span', jsonl, start)`` — synthetic <system> umbrella in tree
         # mode. Children are the records of that span.
         if _TREE_MODE:
-            path, _, suffix = item_id.partition('#span:')
-            try:
-                start = int(suffix)
-            except ValueError:
-                return []
-            return _list_span_records(path, start)
+            return _list_span_records(item_id[1], item_id[2])
         return []
-    if (isinstance(item_id, str) and _md_doc is not None
-            and _md_doc.split_refs_umbrella(item_id) is not None):
-        # ``<docid>#refs`` — a ``[links]`` References umbrella. Checked BEFORE
-        # the ``#md:`` and plain-message branches: a file-doc umbrella id
-        # ``<base>#md:<enc>#refs`` contains ``#md:`` too, so the ``#refs`` test
-        # MUST come first or the ``#md:`` branch would steal it. THIS is the
-        # lazy point — the full ref resolve happens here, on umbrella expand.
-        return _md_refs_umbrella_children(item_id)
-    if isinstance(item_id, str) and _md_doc is not None and '#md:' in item_id:
-        # ``<base>#md:…`` — a node inside a message's markdown document
-        # subtree (inline doc, file doc, or heading). Built lazily and
-        # authoritatively here; mode-agnostic (works in tree AND flat). Dead
-        # code when ``_md_doc is None`` (the gate above never let a ``#md:``
-        # id be created, so this never fires either way).
-        return _md_subtree_children(item_id)
-    if isinstance(item_id, str) and '#' in item_id:
-        # Regular message id ``<path>#<n>``. When ``md_doc`` is present, a
-        # message gains markdown children (its inline document + referenced
+    if tag == 'refs':
+        # ``('refs', anchor, chain)`` — a ``[links]`` References umbrella.
+        # THIS is the lazy point: the full ref resolve happens here, on
+        # umbrella expand. No-op when ``_md_doc is None`` (no ref id can
+        # exist then).
+        return _md_refs_umbrella_children(item_id) if _md_doc is not None else []
+    if tag == 'md':
+        # ``('md', anchor, chain, line)`` — a node inside a message's markdown
+        # document subtree (inline doc, file doc, or heading). Built lazily
+        # and authoritatively here; mode-agnostic (works in tree AND flat).
+        return _md_subtree_children(item_id) if _md_doc is not None else []
+    if tag == 'msg':
+        # ``('msg', jsonl, n)`` — a message leaf. When ``md_doc`` is present,
+        # a message gains markdown children (its inline document + referenced
         # ``.md`` files) — built lazily here, mode-agnostic. Otherwise it is a
         # leaf in tree mode (umbrellas own all the expansion) and flat mode
         # never had children for these.
         if _md_doc is not None:
             return _md_message_children(item_id)
         return []
-    if isinstance(item_id, str) and item_id.endswith('.jsonl') and os.path.isfile(item_id):
+    if tag == 'session':
+        jsonl_path = item_id[1]
+        if not os.path.isfile(jsonl_path):
+            return []
         if _TREE_MODE:
             # Tree mode: subagents live inline under their assistant rows,
             # not as a separate prelude at the session level.
-            return _list_tree_roots(item_id)
-        return _list_session_children(item_id)
-    if isinstance(item_id, str) and os.path.isdir(item_id):
-        return _list_sessions(item_id)
-    # Anything else (unknown) — return empty.
+            return _list_tree_roots(jsonl_path)
+        return _list_session_children(jsonl_path)
+    if tag == 'project':
+        project_dir = item_id[1]
+        return _list_sessions(project_dir) if os.path.isdir(project_dir) else []
+    # Anything else (unknown / synthetic — 'sep', 'trunc', 'err') — empty.
     return []
 
 
@@ -555,7 +546,7 @@ def _list_projects():
         if running:
             tag = f'{running}/{sessions} live · {_human_time(latest)}'
         item = Item(
-            id=full,
+            id=('project', full),
             title=_real_project_path(full),
             tag=tag,
             tag_style=('green' if running else 'dim'),
@@ -609,7 +600,7 @@ def _session_item(full, st=None):
     if running_meta:
         tag = f'pid {running_meta["pid"]} · ' + tag
     item = Item(
-        id=full,
+        id=('session', full),
         title=sid,
         # When this session becomes the current scope, show the
         # full filesystem path on the synthetic scope-header row
@@ -938,7 +929,7 @@ def _list_subagents_for_session(session_jsonl_path):
             # agents without a meta file.
             title = description or f'agent {agent_id}'
             item = Item(
-                id=f'{session_jsonl_path}#agent:{agent_id}',
+                id=('agent', session_jsonl_path, agent_id),
                 title=title,
                 tag=f'{agent_type} · {count} msg · {_human_time(st.st_mtime)}',
                 tag_style='magenta',
@@ -948,7 +939,7 @@ def _list_subagents_for_session(session_jsonl_path):
                 # recursive/multi-expansion at the group row and keeps
                 # the agent's lines out of a parent's preview cascade
                 # (the attribute ``_is_cross_file_id`` / ``_walk_umbrella``
-                # consult instead of the old ``'#agent:' in id`` shape
+                # consult instead of the old ``id[0] == 'agent'`` tag
                 # test). Orphan rows inherit it via this builder.
                 boundary=True,
             )
@@ -985,11 +976,10 @@ def _list_session_children(jsonl_path):
 
 
 def _list_subagent_messages(item_id):
-    """Children for a subagent group: the lines of its .jsonl."""
-    session_path, _, suffix = item_id.partition('#agent:')
-    if not suffix:
+    """Children for a subagent group ``('agent', jsonl, aid)``: its .jsonl lines."""
+    session_path, agent_id = item_id[1], item_id[2]
+    if not agent_id:
         return []
-    agent_id = suffix
     agent_path = _resolve_agent_jsonl(session_path, agent_id)
     if not os.path.isfile(agent_path):
         return []
@@ -1020,7 +1010,7 @@ def _list_messages(jsonl_path, limit=None):
         limit = _message_limit
     if not os.path.isfile(jsonl_path):
         return [Item(
-            id=f'__err__:{jsonl_path}',
+            id=('err', jsonl_path),
             title=f'[error] no such file: {jsonl_path}',
             tag='err',
             tag_style='red',
@@ -1034,7 +1024,7 @@ def _list_messages(jsonl_path, limit=None):
     if truncated:
         older = start
         out.append(Item(
-            id=f'{jsonl_path}#__truncated__',
+            id=('trunc', jsonl_path),
             title=f'({older} older entries hidden; press e to view file)',
             tag='…',
             tag_style='dim',
@@ -1044,7 +1034,7 @@ def _list_messages(jsonl_path, limit=None):
         if obj is None:
             continue
         kind = _kind_of(obj)
-        item_id = f'{jsonl_path}#{n}'
+        item_id = ('msg', jsonl_path, n)
         item = Item(
             id=item_id,
             title=_oneline(_summarise_message(obj)),
@@ -1217,36 +1207,35 @@ def _passes_filter(item_id, td=None):
     predicate in both states.
 
     Predicate body when the filter is on:
-      * voice leaf (``<path>#<n>``)  → ``_is_voice(td.records[n])``
-      * ``#prompt:N``               → True (turns open at a user voice)
-      * ``#tool:N``                 → ``_is_voice(td.records[N])`` (the
-                                       mixed text+tool_use case passes)
-      * ``#span:N``                 → any voice record in the span
-      * ``#agent:...``              → True (subagent umbrella; always
-                                       shown — we don't peek into other
-                                       files at filter time)
-      * unparseable / synthetic id  → True (be permissive; framework
-                                       error rows and ``__truncated__``
-                                       stay visible)
+      * ``('msg', jsonl, n)``    → ``_is_voice(td.records[n])``
+      * ``('prompt', jsonl, n)`` → True (turns open at a user voice)
+      * ``('tool', jsonl, n)``   → ``_is_voice(td.records[n])`` (the
+                                    mixed text+tool_use case passes)
+      * ``('span', jsonl, n)``   → any voice record in the span
+      * ``('agent', …)``         → True (subagent umbrella; always
+                                    shown — we don't peek into other
+                                    files at filter time)
+      * any other id             → True (be permissive; framework
+                                    error rows and ``('trunc', …)``
+                                    fillers stay visible)
     """
     if not _FILTER_VOICE_ONLY:
         return True
-    if not isinstance(item_id, str) or '#' not in item_id:
+    if not isinstance(item_id, tuple) or not item_id:
         return True
-    path, _, suffix = item_id.rpartition('#')
-    if suffix.startswith('agent:'):
+    tag = item_id[0]
+    if tag == 'agent':
         return True
+    if tag not in ('msg', 'prompt', 'tool', 'span'):
+        return True
+    path, n = item_id[1], item_id[2]
     if td is None:
         td = _TREE_CACHE.get(path)
     if td is None:
         return True
-    if suffix.startswith('prompt:'):
+    if tag == 'prompt':
         return True
-    if suffix.startswith('tool:'):
-        try:
-            n = int(suffix[len('tool:'):])
-        except ValueError:
-            return True
+    if tag == 'tool':
         if 0 <= n < len(td.records):
             rec = td.records[n]
             if isinstance(rec, dict):
@@ -1260,19 +1249,12 @@ def _passes_filter(item_id, td=None):
                     return True
                 return _tool_umbrella_wraps_subagent(rec, td)
         return True
-    if suffix.startswith('span:'):
-        try:
-            n = int(suffix[len('span:'):])
-        except ValueError:
-            return True
+    if tag == 'span':
         for rec in td.span_records.get(n, []):
             if isinstance(rec, dict) and _is_voice(rec):
                 return True
         return False
-    try:
-        n = int(suffix)
-    except ValueError:
-        return True
+    # tag == 'msg'
     if 0 <= n < len(td.records):
         rec = td.records[n]
         if isinstance(rec, dict):
@@ -1573,9 +1555,18 @@ def _extract_text(content):
 # file, each drillable into its own heading tree, recursively. Detection is a
 # cheap regex gate run at item-build time (optimistic — it may over-trigger);
 # the authoritative tree is built lazily on expand in ``get_children`` and
-# self-heals a stale arrow via ``_on_children_loaded``. Ids use the ``#md:``
-# codec in ``md_doc`` so routing stays a ``'#md:' in item_id`` substring test.
-# The whole section is a no-op when ``_md_doc is None``.
+# self-heals a stale arrow via ``_on_children_loaded``.
+#
+# A markdown node id is the recipe-owned tuple ``('md', anchor, chain, line)``
+# (``('refs', anchor, chain)`` for the References umbrella), built/destructured
+# inline here — ``md_doc`` is codec-free and only contributes single-document
+# operations (``get_doc`` / ``node_at_line`` / ``find_md_refs`` /
+# ``resolve_md_ref`` / ``build_doc_tree``). ``anchor`` is the host message
+# ``('msg', jsonl, n)``; ``chain`` is a TUPLE of referenced-file abspaths
+# followed from the anchor (``()`` = the message's own inline doc); ``line`` is
+# a heading ``line_offset`` (int) or ``None`` for the doc root. Routing is
+# ``id[0] == 'md'`` / ``id[0] == 'refs'``. The whole section is a no-op when
+# ``_md_doc is None``.
 
 
 def _message_md_text(rec):
@@ -1695,17 +1686,17 @@ _MD_HEADING_STYLE = {
 }
 
 
-def _md_heading_item(base, abspaths, node):
+def _md_heading_item(anchor, chain, node):
     """Map an ``md_doc`` heading ``MdNode`` to a tree-row ``Item``.
 
-    Id = ``compose_md_id(base, abspaths, node.line_offset)`` — selecting the
-    heading by its line within the chain's last document. ``has_children`` is
+    Id = ``('md', anchor, chain, node.line_offset)`` — selecting the heading by
+    its line within the chain's last document. ``has_children`` is
     authoritative (we already have the parsed node), so heading rows never need
     self-heal. ``boundary`` is left ``False`` — a heading is same-document
     structure, not a foreign subtree.
     """
     item = Item(
-        id=_md_doc.compose_md_id(base, abspaths, line_offset=node.line_offset),
+        id=('md', anchor, chain, node.line_offset),
         title=node.title,
         tag=f'h{node.level}',
         tag_style=_MD_HEADING_STYLE.get(node.level, ''),
@@ -1716,18 +1707,18 @@ def _md_heading_item(base, abspaths, node):
     return item
 
 
-def _md_text_item(base, abspaths, node):
+def _md_text_item(anchor, chain, node):
     """Map an ``md_doc`` ``'text'`` ``MdNode`` to a dim-leaf tree-row ``Item``.
 
     The dim-leaf sibling of :func:`_md_heading_item`: a loose body run that
-    precedes a scope's first heading. Id = ``compose_md_id(base, abspaths,
+    precedes a scope's first heading. Id = ``('md', anchor, chain,
     node.line_offset)`` — selecting the run by its line within the chain's last
     document, exactly like a heading (the preview slices its own byte range).
     ``'text'`` nodes are always leaves (``node.children == []``), so
     ``has_children`` is ``False`` and the row never needs self-heal.
     """
     item = Item(
-        id=_md_doc.compose_md_id(base, abspaths, line_offset=node.line_offset),
+        id=('md', anchor, chain, node.line_offset),
         title=node.title,
         tag='text',
         tag_style='dim',
@@ -1737,7 +1728,7 @@ def _md_text_item(base, abspaths, node):
     return item
 
 
-def _md_node_item(base, abspaths, node):
+def _md_node_item(anchor, chain, node):
     """Map an ``md_doc`` child ``MdNode`` to its tree-row ``Item`` by kind.
 
     The single dispatch ``_md_subtree_children`` uses for both its heading-
@@ -1748,21 +1739,21 @@ def _md_node_item(base, abspaths, node):
     needed.
     """
     if node.kind == 'text':
-        return _md_text_item(base, abspaths, node)
-    return _md_heading_item(base, abspaths, node)
+        return _md_text_item(anchor, chain, node)
+    return _md_heading_item(anchor, chain, node)
 
 
-def _md_file_item(base, abspaths, label):
+def _md_file_item(anchor, chain, label):
     """Map a referenced ``.md`` file to a document tree-row ``Item``.
 
-    ``abspaths`` is the full chain ending in this file (so the id nests under
-    its referrer). ``has_children`` is optimistically ``True`` — we have not
-    read the file yet; it self-heals on expand if the file has no headings and
-    no further refs. ``boundary=True`` marks it a self-contained foreign
-    subtree so recursive/multi-expansion stops at it.
+    ``chain`` is the full tuple ending in this file (so the id nests under its
+    referrer). ``has_children`` is optimistically ``True`` — we have not read
+    the file yet; it self-heals on expand if the file has no headings and no
+    further refs. ``boundary=True`` marks it a self-contained foreign subtree
+    so recursive/multi-expansion stops at it.
     """
     item = Item(
-        id=_md_doc.compose_md_id(base, abspaths),
+        id=('md', anchor, chain, None),
         title=label,
         tag='md',
         tag_style='blue',          # cross-file / attachment hue (vs dim inline)
@@ -1770,7 +1761,7 @@ def _md_file_item(base, abspaths, label):
         boundary=True,
     )
     item.kind = 'md-doc'
-    item.md_abspath = abspaths[-1]
+    item.md_abspath = chain[-1]
     return item
 
 
@@ -1815,17 +1806,17 @@ def _has_any_existing_ref(text, doc_dir, cwd, project_root):
     return False
 
 
-def _md_refs_umbrella_item(docid):
-    """The synthetic ``[links]`` References umbrella for a document ``docid``.
+def _md_refs_umbrella_item(anchor, chain):
+    """The synthetic ``[links]`` References umbrella for a document.
 
     Groups every ``.md`` file a document references under one tree parent —
     mirroring the ``<prompt>`` / ``<tool>`` umbrella idiom — instead of
-    interleaving the ref rows as direct document children. ``docid`` is the
-    document's own id: a message base (``<jsonl>#<n>``) at the message level, or
-    a ``#md:`` file-doc id at the file-doc level. The umbrella id appends the
-    ``#refs`` marker (``md_doc.refs_umbrella_id``); the ref file-docs UNDER it
-    keep their own ``<docid>#md:<enc>`` ids — the umbrella is a grouping parent,
-    not a new hop in the ref chain.
+    interleaving the ref rows as direct document children. The grouped document
+    is identified by ``(anchor, chain)``: an empty ``chain`` is the message's
+    own inline document; a non-empty ``chain`` is a referenced file-doc. The
+    umbrella id is ``('refs', anchor, chain)``; the ref file-docs UNDER it keep
+    their own ``('md', anchor, chain + (abspath,), None)`` ids — the umbrella is
+    a grouping parent, not a new hop in the ref chain.
 
     ``boundary=False`` (same-document grouping, like the inline ``markdown``
     node — Alt-Right reveals the ref entries but each ref file-doc under it
@@ -1834,7 +1825,7 @@ def _md_refs_umbrella_item(docid):
     short-circuit), so the umbrella is never empty and never needs self-heal.
     """
     item = Item(
-        id=_md_doc.refs_umbrella_id(docid),
+        id=('refs', anchor, chain),
         title='References',
         tag='links',
         tag_style='cyan',          # muted cross-file grouping hue
@@ -1851,63 +1842,55 @@ def _md_refs_umbrella_children(item_id):
     THIS is the lazy point: ``_md_message_children`` / ``_md_subtree_children``
     only short-circuit-detect a ref to decide whether to hang the umbrella;
     the full resolve (resolve all, dedup by abspath, sort by label) runs here,
-    once, on the umbrella's own expand. Splits the ``#refs`` marker back to the
-    grouped document's id (``md_doc.split_refs_umbrella``) and recovers that
-    document's text + resolution anchors, then builds one ``[md]`` file-doc per
-    existing ref — same ids (``<docid>#md:<enc>``) and ``boundary=True`` the
-    direct children carried before the umbrella was introduced, so expansion
-    below the umbrella is unchanged.
+    once, on the umbrella's own expand. ``item_id`` is ``('refs', anchor,
+    chain)``; we recover the grouped document's text + resolution anchors, then
+    build one ``[md]`` file-doc per existing ref — same ids (``('md', anchor,
+    chain + (abspath,), None)``) and ``boundary=True`` the direct children
+    carried before the umbrella was introduced, so expansion below the umbrella
+    is unchanged.
 
     Two document shapes, mirroring the two callers:
 
-      * **message base** (``docid`` has no ``#md:``) → scan the whole record's
-        string leaves (prose + tool paths), anchored on
-        ``_session_cwd_and_root`` with ``doc_dir = cwd or project_root`` — the
-        message-level rule. Refs chain directly off the message base.
-      * **file-doc id** (``docid`` contains ``#md:``) → the file's own text
+      * **message base** (``chain == ()``) → scan the whole record's string
+        leaves (prose + tool paths), anchored on ``_session_cwd_and_root`` with
+        ``doc_dir = cwd or project_root`` — the message-level rule. Refs chain
+        directly off the message anchor.
+      * **file-doc** (``chain`` non-empty) → the file's own text
         (``_md_chain_doc``), anchored on ``dirname`` of the file — the file-doc
-        rule. Refs nest onto the existing ``abspaths`` chain.
+        rule. Refs nest onto the existing ``chain``.
 
     Returns ``[]`` for an unreadable document (the umbrella is only built when a
     ref exists, so an empty result here means the doc became unreadable since).
     """
-    docid = _md_doc.split_refs_umbrella(item_id)
-    if docid is None:
-        return []
-    path = docid.partition('#')[0]
-    cwd, project_root = _session_cwd_and_root(path)
-    if '#md:' in docid:
+    _, anchor, chain = item_id
+    jsonl_path = anchor[1]
+    cwd, project_root = _session_cwd_and_root(jsonl_path)
+    if chain:
         # File-doc umbrella: resolve the file's own refs, nested onto its chain.
-        base, abspaths, _ = _md_doc.parse_md_id(docid)
-        text, doc_tree = _md_chain_doc(base, abspaths)
+        text, doc_tree = _md_chain_doc(anchor, chain)
         if doc_tree is None:
             return []
-        doc_dir = os.path.dirname(abspaths[-1]) if abspaths else (cwd or project_root)
+        doc_dir = os.path.dirname(chain[-1])
         return [
-            _md_file_item(base, abspaths + [ref_abspath], label)
+            _md_file_item(anchor, chain + (ref_abspath,), label)
             for ref_abspath, label in _md_resolved_refs(
                 text, doc_dir, cwd or '', project_root or '')
         ]
     # Message-level umbrella: resolve every existing ref across the record.
-    suffix = docid.rpartition('#')[2]
-    try:
-        n = int(suffix)
-    except ValueError:
-        return []
-    rec = _read_jsonl_line(path, n)
+    rec = _read_jsonl_line(jsonl_path, anchor[2])
     if rec is None:
         return []
     doc_dir = cwd or project_root
     record_text = '\n'.join(_iter_str_leaves(rec))
     return [
-        _md_file_item(docid, [abspath], label)
+        _md_file_item(anchor, (abspath,), label)
         for abspath, label in _md_resolved_refs(
             record_text, doc_dir, cwd or '', project_root or '')
     ]
 
 
-def _md_message_children(base):
-    """Children of a markdown message row ``<base>`` (``<session>#<n>``).
+def _md_message_children(anchor):
+    """Children of a markdown message row ``anchor`` (``('msg', jsonl, n)``).
 
     The authoritative build (lazy, on expand): an inline ``markdown`` document
     node (only when the message's own text actually parses to ≥1 heading) plus a
@@ -1921,12 +1904,7 @@ def _md_message_children(base):
     ``[markdown (if headings), References (if any existing ref)]``; ``[]`` when
     neither holds (the optimistic detection arrow then self-heals).
     """
-    path = base.partition('#')[0]
-    suffix = base.rpartition('#')[2]
-    try:
-        n = int(suffix)
-    except ValueError:
-        return []
+    path, n = anchor[1], anchor[2]
     rec = _read_jsonl_line(path, n)
     if rec is None:
         return []
@@ -1936,7 +1914,7 @@ def _md_message_children(base):
     text = _message_md_text(rec)
     if _md_doc.build_doc_tree(text):
         inline = Item(
-            id=_md_doc.compose_md_id(base, []),
+            id=('md', anchor, (), None),
             title='markdown',
             tag='md',
             tag_style='dim',       # muted same-file index (vs blue file docs)
@@ -1948,39 +1926,34 @@ def _md_message_children(base):
 
     # References umbrella — one node grouping every existing ``.md`` ref in the
     # whole record. The full resolve happens lazily when the umbrella expands
-    # (its ``#refs`` id routes to ``_md_resolved_refs`` in ``get_children``);
-    # here we only short-circuit on the FIRST existing ref. The same
-    # concatenated string leaves (prose + tool paths) feed both halves.
+    # (its ``('refs', …)`` id routes to ``_md_refs_umbrella_children`` in
+    # ``get_children``); here we only short-circuit on the FIRST existing ref.
+    # The same concatenated string leaves (prose + tool paths) feed both halves.
     cwd, project_root = _session_cwd_and_root(path)
     doc_dir = cwd or project_root
     record_text = '\n'.join(_iter_str_leaves(rec))
     if _has_any_existing_ref(record_text, doc_dir, cwd or '', project_root or ''):
-        out.append(_md_refs_umbrella_item(base))
+        out.append(_md_refs_umbrella_item(anchor, ()))
     return out
 
 
-def _md_chain_doc(base, abspaths):
-    """Resolve a ``#md:`` chain's *last* document to ``(text, doc_tree)``.
+def _md_chain_doc(anchor, chain):
+    """Resolve a markdown ``chain``'s *last* document to ``(text, doc_tree)``.
 
     The chain's terminal document is what both the subtree build and the
-    preview route operate on: a non-empty ``abspaths`` ends in a referenced
-    file (read + parsed once via ``md_doc.get_doc``'s process-wide cache); an
-    empty chain is the message's own inline content (``_message_md_text`` of the
-    ``<base>`` record, parsed with ``build_doc_tree``). Returns ``(None, None)``
-    when the document is unreadable / the base id has no valid line number — the
-    callers treat that as "no children / empty preview".
+    preview route operate on: a non-empty ``chain`` ends in a referenced file
+    (read + parsed once via ``md_doc.get_doc``'s process-wide cache); an empty
+    chain is the message's own inline content (``_message_md_text`` of the
+    ``anchor`` record, parsed with ``build_doc_tree``). Returns ``(None, None)``
+    when the document is unreadable — the callers treat that as "no children /
+    empty preview".
     """
-    if abspaths:
+    if chain:
         try:
-            return _md_doc.get_doc(abspaths[-1])
+            return _md_doc.get_doc(chain[-1])
         except OSError:
             return None, None
-    suffix = base.rpartition('#')[2]
-    try:
-        n = int(suffix)
-    except ValueError:
-        return None, None
-    rec = _read_jsonl_line(base.partition('#')[0], n)
+    rec = _read_jsonl_line(anchor[1], anchor[2])
     if rec is None:
         return None, None
     text = _message_md_text(rec)
@@ -1988,71 +1961,67 @@ def _md_chain_doc(base, abspaths):
 
 
 def _md_subtree_children(item_id):
-    """Children for a ``#md:`` node — the lazy, authoritative build.
+    """Children for a ``('md', anchor, chain, line)`` node — the lazy build.
 
-    Routes on the parsed id shape (``md_doc.parse_md_id`` → ``(base, abspaths,
-    line_offset)``):
+    Routes on the destructured id fields:
 
-      * **heading** (``line_offset`` set) → the sub-headings nested under it
-        (walk the chain's last document tree to the node at ``line_offset``,
-        return its children). No reference children — refs live at the document
-        level, not under a heading. A ``line_offset`` naming a dim ``'text'``
-        run resolves here too, but a text node is a leaf (``children == []``)
-        so it yields ``[]``.
-      * **inline document** (``abspaths == []``, no ``line_offset``) → the
-        top-level rows of the message's inline text (heading rows, plus a dim
-        ``[text]`` leaf for a leading body run). Its refs already surface at the
-        message level above, so none are added here.
-      * **file document** (``abspaths`` non-empty, no ``line_offset``) → the
-        top-level rows of that file (headings + any leading text) PLUS a single
-        ``[links]``
-        References umbrella when THAT file references ≥1 existing ``.md``
-        (resolved against the file's own directory). The umbrella groups the
-        nested refs; building the full ref list is deferred to its own expand,
-        so here we only run the ``_has_any_existing_ref`` short-circuit.
+      * **heading** (``line`` set) → the sub-headings nested under it (walk the
+        chain's last document tree to the node at ``line``, return its
+        children). No reference children — refs live at the document level, not
+        under a heading. A ``line`` naming a dim ``'text'`` run resolves here
+        too, but a text node is a leaf (``children == []``) so it yields ``[]``.
+      * **inline document** (``chain == ()``, ``line`` None) → the top-level
+        rows of the message's inline text (heading rows, plus a dim ``[text]``
+        leaf for a leading body run). Its refs already surface at the message
+        level above, so none are added here.
+      * **file document** (``chain`` non-empty, ``line`` None) → the top-level
+        rows of that file (headings + any leading text) PLUS a single
+        ``[links]`` References umbrella when THAT file references ≥1 existing
+        ``.md`` (resolved against the file's own directory). The umbrella groups
+        the nested refs; building the full ref list is deferred to its own
+        expand, so here we only run the ``_has_any_existing_ref`` short-circuit.
         Recursion (file → file) falls out of this uniform rule once the
         umbrella expands; expand-in-place, no cycle/alias detection.
 
     File text + tree come from ``md_doc.get_doc`` (process-wide cache). Returns
     ``[]`` for an unreadable/heading-less document (self-heals the arrow).
     """
-    base, abspaths, line_offset = _md_doc.parse_md_id(item_id)
-    path = base.partition('#')[0]
+    _, anchor, chain, line = item_id
 
-    text, doc_tree = _md_chain_doc(base, abspaths)
+    text, doc_tree = _md_chain_doc(anchor, chain)
     if doc_tree is None:
         return []
 
     # Heading node → its nested sub-headings (no ref children).
-    if line_offset is not None:
-        node = _md_doc.node_at_line(doc_tree, line_offset)
+    if line is not None:
+        node = _md_doc.node_at_line(doc_tree, line)
         if node is None:
             return []
-        return [_md_node_item(base, abspaths, ch) for ch in node.children]
+        return [_md_node_item(anchor, chain, ch) for ch in node.children]
 
     # Document node → top-level rows (headings + any leading text run), then
     # (file docs only) a References umbrella grouping the file's own refs. The
     # full resolve is deferred to the umbrella's expand; here we just
     # short-circuit on the first one.
-    out = [_md_node_item(base, abspaths, node) for node in doc_tree]
-    if abspaths:
-        cwd, project_root = _session_cwd_and_root(path)
-        doc_dir = os.path.dirname(abspaths[-1])
+    out = [_md_node_item(anchor, chain, node) for node in doc_tree]
+    if chain:
+        cwd, project_root = _session_cwd_and_root(anchor[1])
+        doc_dir = os.path.dirname(chain[-1])
         if _has_any_existing_ref(text, doc_dir, cwd or '', project_root or ''):
-            out.append(_md_refs_umbrella_item(item_id))
+            out.append(_md_refs_umbrella_item(anchor, chain))
     return out
 
 
 def _preview_md_node(item_id):
-    """Preview body for a ``#md:`` document or heading node.
+    """Preview body for a ``('md', anchor, chain, line)`` document/heading node.
 
     Reads ONLY the node's own document — never a cross-item cascade:
 
-      * **document node** (no ``line_offset``) → that document's full text:
-        the message's inline content (empty chain) or the referenced file's
-        text (``md_doc.get_doc`` cache).
-      * **heading node** (``…#<lineoffset>``) → just that heading's section,
-        sliced ``text[byte_offset : byte_offset + byte_size]`` from the cached
+      * **document node** (``line`` None) → that document's full text: the
+        message's inline content (empty chain) or the referenced file's text
+        (``md_doc.get_doc`` cache).
+      * **heading node** (``line`` set) → just that heading's section, sliced
+        ``text[byte_offset : byte_offset + byte_size]`` from the cached
         ``doc_tree`` (the boundary rule includes the heading's own sub-sections
         and stops at the next sibling-or-shallower heading).
 
@@ -2061,13 +2030,13 @@ def _preview_md_node(item_id):
     string if md2ansi raises. Returns ``''`` for an unreadable document or a
     line offset that matches no heading.
     """
-    base, abspaths, line_offset = _md_doc.parse_md_id(item_id)
-    text, doc_tree = _md_chain_doc(base, abspaths)
+    _, anchor, chain, line = item_id
+    text, doc_tree = _md_chain_doc(anchor, chain)
     if text is None:
         return ''
-    if line_offset is None:
+    if line is None:
         return _md_voice(text)
-    node = _md_doc.node_at_line(doc_tree, line_offset)
+    node = _md_doc.node_at_line(doc_tree, line)
     if node is None:
         return ''
     return _md_voice(text[node.byte_offset:node.byte_offset + node.byte_size])
@@ -3238,38 +3207,36 @@ _RENDERERS = {
 def get_preview(item_id):
     """Preview-pane content for the cursor item.
 
-    * project (dir):       human-readable summary + session list
-    * session (.jsonl):    concatenated child previews (same machinery
-                            as the umbrella previews — uniform body
-                            cascade, honours the voice-only filter
-                            transparently via ``hidden`` on children).
-    * subagent (#agent:X): same uniform cascade against the subagent's
-                            own .jsonl.
-    * ``<prompt>`` / ``<tool>`` / ``<system>`` umbrella: concatenated
-                            bodies of the umbrella's direct children.
-    * message (#N):        pretty-printed JSON of the line
+    * ``('project', dir)``     : human-readable summary + session list
+    * ``('session', jsonl)``   : concatenated child previews (same machinery
+                                  as the umbrella previews — uniform body
+                                  cascade, honours the voice-only filter
+                                  transparently via ``hidden`` on children).
+    * ``('agent', jsonl, aid)``: same uniform cascade against the subagent's
+                                  own .jsonl.
+    * ``('prompt'|'tool'|'span', …)`` umbrella: concatenated bodies of the
+                                  umbrella's direct children.
+    * ``('msg', jsonl, n)``    : pretty-printed JSON of the line.
+    * ``('md'|'refs', …)``     : its own document / label-list preview.
     """
-    if not isinstance(item_id, str) or item_id.startswith('__err__:'):
+    if not isinstance(item_id, tuple) or not item_id:
         return ''
-    if _md_doc is not None and _md_doc.split_refs_umbrella(item_id) is not None:
-        # ``[links]`` References umbrella. Checked BEFORE ``#md:`` (a file-doc
-        # umbrella id ``<base>#md:<enc>#refs`` contains ``#md:``) and the
-        # generic ``#`` message path: render a plain label list, not a document.
-        return _preview_md_refs_umbrella(item_id)
-    if '#md:' in item_id:
-        # Markdown document/heading node. Checked FIRST — before both
-        # ``_is_cross_file_id`` and the generic '#' message path. The
-        # cross-file check is now boundary-based, and an md *file*-doc
-        # node carries ``boundary=True``, so it would otherwise be hijacked
-        # into the cross-file metadata/cascade path. md ids never contain
-        # ``#agent:`` and never end in ``.jsonl``, so claiming them here
-        # steals no cross-file id; it just routes every md node (inline
-        # OR file, regardless of its boundary flag) to its own document
-        # preview, and keeps a trailing ``#<lineoffset>`` from being
-        # mis-read as a record line number. A no-op when ``_md_doc is
-        # None`` (no ``#md:`` id can exist then, but the guard keeps the
-        # branch self-contained).
+    tag = item_id[0]
+    if tag == 'refs':
+        # ``[links]`` References umbrella — a plain label list, not a document.
+        return _preview_md_refs_umbrella(item_id) if _md_doc is not None else ''
+    if tag == 'md':
+        # Markdown document/heading node → its own document preview (inline OR
+        # file, regardless of its boundary flag). A no-op when ``_md_doc is
+        # None`` (no md id can exist then, but the guard keeps it self-contained).
         return _preview_md_node(item_id) if _md_doc is not None else ''
+    if tag == 'err':
+        return ''
+    if tag == 'trunc':
+        return (
+            f'(only the first {_message_limit} messages are listed)\n'
+            f'press e on this row to open the full file in $EDITOR'
+        )
     # Cross-file rows (subagent group, bare session): heavy umbrella
     # cascade only when committed (scope_root or expanded inline);
     # cheap metadata card otherwise so scrolling stays cheap.
@@ -3278,22 +3245,13 @@ def get_preview(item_id):
             return _preview_umbrella(item_id)
         file_path = _scope_card_path(item_id)
         return _preview_file_metadata(file_path) if file_path else ''
-    if '#prompt:' in item_id or '#tool:' in item_id or '#span:' in item_id:
+    if tag in ('prompt', 'tool', 'span'):
         return _preview_umbrella(item_id)
-    if '#' in item_id:
-        path, _, lineno = item_id.rpartition('#')
-        if lineno == '__truncated__':
-            return (
-                f'(only the first {_message_limit} messages are listed)\n'
-                f'press e on this row to open the full file in $EDITOR'
-            )
-        try:
-            n = int(lineno)
-        except ValueError:
-            return ''
-        return _preview_message(path, n)
-    if os.path.isdir(item_id):
-        return _preview_project(item_id)
+    if tag == 'msg':
+        return _preview_message(item_id[1], item_id[2])
+    if tag == 'project':
+        project_dir = item_id[1]
+        return _preview_project(project_dir) if os.path.isdir(project_dir) else ''
     return ''
 
 
@@ -3302,8 +3260,8 @@ def _item_is_active(item_id):
 
     Heavy = full umbrella cascade + scope card. Cheap = metadata-only
     card (path / sessionId / agentType / etc.). The rule is uniform
-    across cross-file row types (bare ``.jsonl`` session rows and
-    ``#agent:`` subagent umbrellas): the user has committed iff the
+    across cross-file row types (``('session', …)`` rows and
+    ``('agent', …)`` subagent umbrellas): the user has committed iff the
     row is the current scope_root or is currently expanded inline.
 
     ``_BROWSER is None`` (tests, headless mode) defaults to heavy so
@@ -3599,8 +3557,8 @@ class _TreeData:
         # needing a uuid (metadata records often have none).
         self.records_line = {}
         # line_no → parent_id — the parent **umbrella** id for that
-        # line's leaf row. One of: ``<jsonl>#prompt:<n>``,
-        # ``<jsonl>#tool:<n>``, or ``<jsonl>#span:<n>``. Top-level
+        # line's leaf row. One of: ``('prompt', jsonl, n)``,
+        # ``('tool', jsonl, n)``, or ``('span', jsonl, n)``. Top-level
         # rows (the umbrellas themselves) are absent — their parent
         # link lives in tool_to_turn_root_line / agent_to_assistant_line
         # or is None.
@@ -3709,8 +3667,8 @@ def _fold_record(td, cur, rec, n, path):
         if uuid is not None:
             td.turn_direct[uuid] = []
         td.roots_in_order.append({'kind': 'turn', 'rec': rec, 'line': n})
-        td.parent_id_of[n] = f'{path}#prompt:{n}'
-        dirty.add(path)   # new root-level umbrella
+        td.parent_id_of[n] = ('prompt', path, n)
+        dirty.add(('session', path))   # new root-level umbrella
         return dirty
 
     # --- record inside an open turn.
@@ -3739,10 +3697,10 @@ def _fold_record(td, cur, rec, n, path):
                         has_tool_use = True
             if has_tool_use:
                 td.turn_direct[turn_uuid].append(rec)
-                td.parent_id_of[n] = f'{path}#tool:{n}'
+                td.parent_id_of[n] = ('tool', path, n)
                 if turn_root_line is not None:
                     td.tool_to_turn_root_line[n] = turn_root_line
-                    dirty.add(f'{path}#prompt:{turn_root_line}')
+                    dirty.add(('prompt', path, turn_root_line))
                 if _is_turn_close(rec):
                     cur.turn_open_uuid = None
                     cur.tool_owner = {}
@@ -3756,16 +3714,16 @@ def _fold_record(td, cur, rec, n, path):
             owner_line = td.line_of.get(owner)
             td.tool_children.setdefault(owner, []).append(rec)
             if owner_line is not None:
-                td.parent_id_of[n] = f'{path}#tool:{owner_line}'
-                dirty.add(f'{path}#tool:{owner_line}')
+                td.parent_id_of[n] = ('tool', path, owner_line)
+                dirty.add(('tool', path, owner_line))
             # Subagent-link check: a tool_result whose
             # toolUseResult.agentId resolves an agent jsonl on disk.
             _maybe_link_subagent(td, rec, owner, path)
         else:
             td.turn_direct[turn_uuid].append(rec)
             if turn_root_line is not None:
-                td.parent_id_of[n] = f'{path}#prompt:{turn_root_line}'
-                dirty.add(f'{path}#prompt:{turn_root_line}')
+                td.parent_id_of[n] = ('prompt', path, turn_root_line)
+                dirty.add(('prompt', path, turn_root_line))
 
         if _is_turn_close(rec):
             cur.turn_open_uuid = None
@@ -3783,11 +3741,11 @@ def _fold_record(td, cur, rec, n, path):
             'kind': 'span', 'start': n,
             'records': td.span_records[n],
         })
-        dirty.add(path)   # new root-level span umbrella
+        dirty.add(('session', path))   # new root-level span umbrella
     span_start = cur.span_start
     td.span_records[span_start].append(rec)
-    td.parent_id_of[n] = f'{path}#span:{span_start}'
-    dirty.add(f'{path}#span:{span_start}')
+    td.parent_id_of[n] = ('span', path, span_start)
+    dirty.add(('span', path, span_start))
     return dirty
 
 
@@ -3877,27 +3835,29 @@ def _maybe_link_subagent(td, rec, owner_uuid, path):
 
 
 def _resolve_path_for_bust(item_id):
-    """Map an id shape to the .jsonl path whose ``_TreeData`` it depends on.
+    """Map an id to the .jsonl path whose ``_TreeData`` it depends on.
 
     Returns ``None`` when ``item_id`` doesn't reference per-file scanned
-    state (project dirs, unparseable ids).
+    state (project dirs, synthetic ids).
     """
-    if not isinstance(item_id, str):
+    if not isinstance(item_id, tuple) or not item_id:
         return None
-    # Subagent boundary: ``<sess>#agent:<aid>`` → subagent's own jsonl.
-    if '#agent:' in item_id:
-        sess, _, aid = item_id.partition('#agent:')
+    tag = item_id[0]
+    # Subagent boundary: ``('agent', sess, aid)`` → subagent's own jsonl.
+    if tag == 'agent':
+        sess, aid = item_id[1], item_id[2]
         if not aid:
             return None
         agent_path = _resolve_agent_jsonl(sess, aid)
         return agent_path if os.path.isfile(agent_path) else None
-    # Any other ``<path>#...`` id resolves to ``<path>``.
-    if '#' in item_id:
-        path = item_id.partition('#')[0]
-        return path if path.endswith('.jsonl') and os.path.isfile(path) else None
-    # Bare .jsonl path.
-    if item_id.endswith('.jsonl') and os.path.isfile(item_id):
-        return item_id
+    # Markdown ids carry the path inside their anchor ``('msg', jsonl, n)``.
+    if tag in ('md', 'refs'):
+        path = item_id[1][1]
+        return path if os.path.isfile(path) else None
+    # Any other per-file id ``(tag, jsonl, …)`` resolves to that jsonl.
+    if tag in ('session', 'prompt', 'tool', 'span', 'msg', 'trunc', 'err'):
+        path = item_id[1]
+        return path if os.path.isfile(path) else None
     return None
 
 
@@ -4175,7 +4135,7 @@ def _push_tail_diffs(b, dirty_parents):
     ops = []
     for parent_id in dirty_parents:
         # Under voice-only filter, a tail append (e.g., a voice record
-        # joining a previously-machinery-only ``#span:`` umbrella) can
+        # joining a previously-machinery-only ``span`` umbrella) can
         # cross the parent into voice-bearing. Reveal the parent first,
         # in the same batch as its new children. Skip when the parent
         # isn't in our index (yet to be upserted) — it'll be built with
@@ -4281,7 +4241,8 @@ def _push_flat_inserts(b, path, records):
     """
     if not records:
         return
-    existing = b.cached_children(path)
+    session_id = ('session', path)
+    existing = b.cached_children(session_id)
     if existing is None:
         return
     existing_ids = {it.id for it in existing}
@@ -4290,7 +4251,7 @@ def _push_flat_inserts(b, path, records):
     for n, rec in records:
         if rec is None:
             continue
-        item_id = f'{path}#{n}'
+        item_id = ('msg', path, n)
         if item_id in existing_ids:
             continue
         kind = _kind_of(rec)
@@ -4309,9 +4270,30 @@ def _push_flat_inserts(b, path, records):
             bg = _ROW_BG_FOR_KIND.get(kind)
             if bg is not None:
                 fields['row_bg'] = bg
-        ops.append(upsert(item_id, path, **fields))
+        ops.append(upsert(item_id, session_id, **fields))
     if ops:
         b.update_data(ops)
+
+
+def _id_jsonl(item_id):
+    """The session/file .jsonl path an id is keyed under, or ``None``.
+
+    For every per-file id this is the path that appears as the id's first
+    coordinate — the file the row is *displayed under*. A subagent group
+    ``('agent', sess, aid)`` resolves to ``sess`` (the session it nests in),
+    matching the old ``<sess>#...`` prefix semantics. Markdown ids read the
+    path out of their anchor. ``('project', dir)`` and synthetic ids yield
+    ``None``.
+    """
+    if not isinstance(item_id, tuple) or not item_id:
+        return None
+    tag = item_id[0]
+    if tag in ('session', 'agent', 'prompt', 'tool', 'span', 'msg',
+               'trunc', 'err'):
+        return item_id[1]
+    if tag in ('md', 'refs'):
+        return item_id[1][1]
+    return None
 
 
 def _bust_preview_for_path(b, path):
@@ -4325,11 +4307,10 @@ def _bust_preview_for_path(b, path):
     cache is dropped so the next visit re-fetches.
     """
     cur_id = b.preview_item_id
-    if cur_id == path or (isinstance(cur_id, str)
-                          and cur_id.startswith(path + '#')):
+    if cur_id == ('session', path) or _id_jsonl(cur_id) == path:
         b.invalidate_preview(cur_id)
     else:
-        b.drop_preview_cache(path)
+        b.drop_preview_cache(('session', path))
 
 
 def _resolve_tail_path_from_browser(b):
@@ -4360,34 +4341,30 @@ def _cursor_tail_path(item_id):
 
     Mode-dependent for the subagent group row:
 
-      * Tree mode: ``<sess>#agent:<aid>`` reflects activity in the
+      * Tree mode: ``('agent', sess, aid)`` reflects activity in the
         parent session's tree, so tail the parent.
-      * Flat mode: ``<sess>#agent:<aid>`` IS the subagent's listing
+      * Flat mode: ``('agent', sess, aid)`` IS the subagent's listing
         (drill-into row), so tail the subagent jsonl.
 
-    Other id shapes: take the path prefix. Returns ``None`` if the
+    Other id kinds: take the id's backing .jsonl. Returns ``None`` if the
     resolved path isn't a readable ``.jsonl``.
     """
-    if not isinstance(item_id, str):
+    if not isinstance(item_id, tuple) or not item_id:
         return None
-    if '#agent:' in item_id:
-        sess, _, aid = item_id.partition('#agent:')
+    if item_id[0] == 'agent':
+        sess, aid = item_id[1], item_id[2]
         if _TREE_MODE:
-            if isinstance(sess, str) and sess.endswith('.jsonl') and os.path.isfile(sess):
-                return sess
-            return None
+            return sess if os.path.isfile(sess) else None
         agent_path = _resolve_agent_jsonl(sess, aid)
         return agent_path if os.path.isfile(agent_path) else None
-    path = item_id.partition('#')[0] if '#' in item_id else item_id
-    if (isinstance(path, str)
-            and path.endswith('.jsonl')
-            and os.path.isfile(path)):
+    path = _id_jsonl(item_id)
+    if path is not None and path.endswith('.jsonl') and os.path.isfile(path):
         return path
     return None
 
 
 def _last_voice_id(jsonl_path):
-    """Return ``<jsonl>#<n>`` id of the most-recent voice record, or None.
+    """Return ``('msg', jsonl, n)`` id of the most-recent voice record, or None.
 
     "Voice" matches ``_is_voice`` (user prompt or assistant text).
     Reads the eagerly-tracked ``td.latest_voice_line`` populated by
@@ -4398,7 +4375,7 @@ def _last_voice_id(jsonl_path):
     n = td.latest_voice_line
     if n is None:
         return None
-    return f'{jsonl_path}#{n}'
+    return ('msg', jsonl_path, n)
 
 
 def _list_tree_roots(jsonl_path):
@@ -4423,17 +4400,17 @@ def _list_tree_roots(jsonl_path):
     # with two ``meta`` dividers so the user sees where the unwired
     # subagents end and the turn/span umbrellas begin. Emit ONLY when
     # orphans are present — a session without them renders exactly as
-    # before. Ids are session-namespaced (``<jsonl>#sep:...``) so they
+    # before. Ids are session-namespaced (``('sep', jsonl, which)``) so they
     # stay unique across cached sessions AND stable, doubling as insertion
     # sentinels for the ``update_data`` positioning API (meta-rows design
     # sec Migrations → browse-claude). The framework skips the cursor over
     # them, never selects them, and (with ``meta_filter_mode='show'``)
     # keeps them visible under an active filter.
     if orphans:
-        out.append(Item(id=f'{jsonl_path}#sep:subagents',
+        out.append(Item(id=('sep', jsonl_path, 'subagents'),
                         title='--- Subagents:', meta=True))
         out.extend(orphans)
-        out.append(Item(id=f'{jsonl_path}#sep:session',
+        out.append(Item(id=('sep', jsonl_path, 'session'),
                         title='--- Session:', meta=True))
     for entry in td.roots_in_order:
         if entry['kind'] == 'turn':
@@ -4593,7 +4570,7 @@ def _tree_item(jsonl_path, rec, td):
         return None
     kind = _kind_of(rec)
 
-    item_id = f'{jsonl_path}#{n}'
+    item_id = ('msg', jsonl_path, n)
     item = Item(
         id=item_id,
         title=_oneline(_summarise_message(rec)),
@@ -4619,7 +4596,7 @@ def _tree_item(jsonl_path, rec, td):
 def _prompt_umbrella_item(jsonl_path, turn_root_line, rec, td):
     """``<prompt>`` umbrella wrapping one turn.
 
-    Id shape: ``<jsonl>#prompt:<turn_root_line>``. Children are the turn
+    Id shape: ``('prompt', jsonl, turn_root_line)``. Children are the turn
     root user voice (as a leaf) followed by every turn member, with each
     assistant-with-tool_use member further wrapped in a ``<tool>``
     umbrella. The umbrella's title prefix mirrors the existing
@@ -4632,7 +4609,7 @@ def _prompt_umbrella_item(jsonl_path, turn_root_line, rec, td):
     # Count of direct children visible when expanded: the user voice
     # itself + each member (tool-using members collapse into one row).
     n_replies = len(members)
-    item_id = f'{jsonl_path}#prompt:{turn_root_line}'
+    item_id = ('prompt', jsonl_path, turn_root_line)
     # A turn opened by a worker→leader task-notification is agent voice,
     # not a human prompt — relabel its umbrella so the row doesn't
     # masquerade as one (a SendMessage-only assistant turn can't be a
@@ -4665,7 +4642,7 @@ def _prompt_umbrella_item(jsonl_path, turn_root_line, rec, td):
 def _tool_umbrella_item(jsonl_path, assistant_line, rec, td):
     """``<tool:Name>`` umbrella wrapping one tool-execution group.
 
-    Id shape: ``<jsonl>#tool:<assistant_line>``. Children are the
+    Id shape: ``('tool', jsonl, assistant_line)``. Children are the
     dispatching assistant itself (leaf), the paired ``tool_result`` +
     hook attachments, and a ``<subagent>`` umbrella for Agent/Task
     dispatches with a resolvable subagent transcript on disk. The tool
@@ -4681,7 +4658,7 @@ def _tool_umbrella_item(jsonl_path, assistant_line, rec, td):
     summary = _oneline(_summarise_message(rec))
     uuid = rec.get('uuid')
     tool_name = td.tool_use_name_of.get(uuid, 'tool')
-    item_id = f'{jsonl_path}#tool:{assistant_line}'
+    item_id = ('tool', jsonl_path, assistant_line)
     item = Item(
         id=item_id,
         title=f'<tool:{tool_name}>  {summary}',
@@ -4732,7 +4709,7 @@ def _tool_umbrella_wraps_subagent(rec, td):
 def _span_umbrella_item(jsonl_path, start_line, records):
     """Synthetic ``<system>`` row collapsing a metadata span.
 
-    Id shape: ``<jsonl>#span:<start_line>``. ``get_children`` routes
+    Id shape: ``('span', jsonl, start_line)``. ``get_children`` routes
     that id to ``_list_span_records`` which returns the span's records
     as flat children. Title shows the count + dominant types so the
     row's still informative when collapsed.
@@ -4763,7 +4740,7 @@ def _span_umbrella_item(jsonl_path, start_line, records):
         isinstance(r, dict) and _is_voice(r) for r in records
     )
     item = Item(
-        id=f'{jsonl_path}#span:{start_line}',
+        id=('span', jsonl_path, start_line),
         title=f'<system>  {types_summary}',
         tag=f'{len(records)} records',
         tag_style='dim',
@@ -4803,7 +4780,7 @@ def _subagent_pseudo_item(parent_jsonl, agent_id, agent_path):
     except OSError:
         count = 0
     item = Item(
-        id=f'{parent_jsonl}#agent:{agent_id}',
+        id=('agent', parent_jsonl, agent_id),
         title=title,
         tag=f'{agent_type} · {count} msg · {_human_time(mtime)}',
         tag_style='magenta',
@@ -4851,20 +4828,22 @@ def _scope_card_path(item_id):
     """Return the on-disk .jsonl whose scope card should prepend the
     preview, or None if ``item_id`` doesn't anchor a synthetic top row.
 
-    Two id shapes earn the card: the bare ``.jsonl`` path (top row in
+    Two id kinds earn the card: a ``('session', jsonl)`` row (top row in
     the project's session list, or when ``--file`` opens a transcript
-    directly) and a ``<sess>#agent:<aid>`` row whose preview is
+    directly) and an ``('agent', sess, aid)`` row whose preview is
     composed from the subagent's own jsonl.
     """
-    if isinstance(item_id, str) and '#agent:' in item_id:
-        sess, _, aid = item_id.partition('#agent:')
+    if not isinstance(item_id, tuple) or not item_id:
+        return None
+    if item_id[0] == 'agent':
+        sess, aid = item_id[1], item_id[2]
         if not aid:
             return None
         agent_path = _resolve_agent_jsonl(sess, aid)
         return agent_path if os.path.isfile(agent_path) else None
-    if (isinstance(item_id, str) and item_id.endswith('.jsonl')
-            and os.path.isfile(item_id)):
-        return item_id
+    if item_id[0] == 'session':
+        jsonl_path = item_id[1]
+        return jsonl_path if os.path.isfile(jsonl_path) else None
     return None
 
 
@@ -5074,7 +5053,7 @@ def _walk_umbrella(item_id, _state, _flush):
                 index = None
             for child in children:
                 cid = getattr(child, 'id', None)
-                if not isinstance(cid, str):
+                if not isinstance(cid, tuple):
                     continue
                 if index is not None and cid in index:
                     continue
@@ -5083,10 +5062,10 @@ def _walk_umbrella(item_id, _state, _flush):
                 ))
     for child in children:
         cid = getattr(child, 'id', None)
-        if not isinstance(cid, str):
+        if not isinstance(cid, tuple):
             continue
         # Honour the recipe's voice-only filter: a hidden child (e.g.,
-        # a non-voice-bearing ``#tool:`` umbrella, or a tool_result
+        # a non-voice-bearing ``tool`` umbrella, or a tool_result
         # leaf) is invisible in the list and shouldn't bleed into the
         # parent's preview either.
         if getattr(child, 'hidden', False):
@@ -5102,21 +5081,18 @@ def _walk_umbrella(item_id, _state, _flush):
                 # under the dispatching turn, so we don't even emit a
                 # stub — would just duplicate that pair. (md docs are
                 # never in this cascade, so this only fires for the
-                # ``#agent:`` rows it used to match by id shape.)
+                # ``agent`` rows it used to match by id shape.)
                 continue
-            if '#prompt:' in cid or '#tool:' in cid or '#span:' in cid:
+            if cid[0] in ('prompt', 'tool', 'span'):
                 # Same-file umbrella — recurse so the user sees every
                 # underlying line, not just the umbrella's first
                 # leaf. Pass the shared flush state so the whole
                 # descent stays in one batching window.
                 yield from _collect_umbrella_preview(cid, _state)
                 continue
-            if '#' not in cid:
+            if cid[0] != 'msg':
                 continue
-            cpath, _, lineno = cid.rpartition('#')
-            n = _parse_int(lineno)
-            if n is None:
-                continue
+            cpath, n = cid[1], cid[2]
             # Always render the leaf body fresh for the umbrella cascade.
             # We deliberately do NOT consult ``get_cached_preview(cid)``
             # nor write the rendered body back into the leaf's
@@ -5149,38 +5125,7 @@ def _render_record_with_rule(path, n):
     return _rule(kind, YELLOW) + '\n' + body
 
 
-def _parse_int(s):
-    """Tolerant int parser; returns None on failure."""
-    try:
-        return int(s)
-    except (TypeError, ValueError):
-        return None
-
-
 # ---- actions -------------------------------------------------------------
-
-
-def _resolve_path(item):
-    """Resolve the cursor row to the file you want $EDITOR to open.
-
-    * message id (``<path>#<line>``): return ``<path>``.
-    * subagent group id (``<sess>#agent:<aid>``): return the agent's
-      ``.jsonl`` file (subagents have their own transcript on disk).
-    * project / session id: return the id verbatim — it's the path.
-    """
-    if item is None:
-        return None
-    iid = item.id
-    if not isinstance(iid, str):
-        return None
-    if '#agent:' in iid:
-        session_path, _, suffix = iid.partition('#agent:')
-        if not suffix:
-            return session_path
-        return _resolve_agent_jsonl(session_path, suffix)
-    if '#' in iid:
-        iid, _, _ = iid.rpartition('#')
-    return iid
 
 
 def _current_view_targets(ctx):
@@ -5207,16 +5152,17 @@ def _current_view_targets(ctx):
 def _gather_line_source(items):
     """Group items into ``{path: [line_no, ...]}`` for byte extraction.
 
-    Each input item is classified by id shape:
+    Each input item is classified by id tag:
 
-      * ``<path>#<n>`` (message leaf) → ``(path, n)`` recorded.
-      * Umbrella ids (``#prompt:`` / ``#tool:`` / ``#span:``) → recurse
-        through the umbrella's same-file descendants and record each
-        leaf's line. ``#agent:`` boundaries are NOT crossed —
-        subagents live in their own ``.jsonl`` files.
-      * ``<sess>#agent:<aid>`` (subagent group row) → the subagent's
-        own ``.jsonl`` is the "whole file" to open.
-      * Bare ``.jsonl`` / project path → "whole path".
+      * ``('msg', jsonl, n)`` (message leaf) → ``(jsonl, n)`` recorded.
+      * Umbrella ids (``prompt`` / ``tool`` / ``span``) → recurse through the
+        umbrella's same-file descendants and record each leaf's line.
+        ``agent`` boundaries are NOT crossed — subagents live in their own
+        ``.jsonl`` files.
+      * ``('agent', sess, aid)`` (subagent group row) → the subagent's own
+        ``.jsonl`` is the "whole file" to open.
+      * ``('session', jsonl)`` / ``('trunc'|'err', jsonl)`` → that file
+        whole. ``('project', dir)`` → that directory whole.
 
     Returns ``(per_line, whole_paths)`` where ``per_line`` is the
     grouping dict (lines kept in document order) and ``whole_paths``
@@ -5226,16 +5172,16 @@ def _gather_line_source(items):
     whole_paths = []
     for item in items:
         iid = getattr(item, 'id', None)
-        if not isinstance(iid, str):
+        if not isinstance(iid, tuple) or not iid:
             continue
-        if '#agent:' in iid:
-            sess, _, aid = iid.partition('#agent:')
-            agent_path = _resolve_agent_jsonl(sess, aid)
+        tag = iid[0]
+        if tag == 'agent':
+            agent_path = _resolve_agent_jsonl(iid[1], iid[2])
             whole_paths.append((agent_path, item))
             continue
-        if '#prompt:' in iid or '#tool:' in iid or '#span:' in iid:
+        if tag in ('prompt', 'tool', 'span'):
             # Recurse through the umbrella's same-file leaves.
-            path = iid.partition('#')[0]
+            path = iid[1]
             same_file_lines = _gather_umbrella_lines(iid)
             if same_file_lines:
                 per_line.setdefault(path, []).extend(same_file_lines)
@@ -5245,18 +5191,15 @@ def _gather_line_source(items):
                 # nothing.
                 whole_paths.append((path, item))
             continue
-        if '#' in iid:
-            path, _, suffix = iid.rpartition('#')
-            try:
-                n = int(suffix)
-            except ValueError:
-                # Synthetic ids like ``#__truncated__`` — open the
-                # underlying file as a whole.
-                whole_paths.append((path, item))
-                continue
-            per_line.setdefault(path, []).append(n)
+        if tag == 'msg':
+            per_line.setdefault(iid[1], []).append(iid[2])
             continue
-        whole_paths.append((iid, item))
+        # Whole-file / whole-dir targets (session, trunc, err, project) and
+        # any other id: open the underlying path.
+        path = _id_jsonl(iid)
+        if path is None and tag == 'project':
+            path = iid[1]
+        whole_paths.append((path, item))
     # Pre-select pass: dedupe + sort each file's lines into
     # canonical (file) order. Multi-target invocations (umbrella +
     # one of its children, or two umbrellas with overlapping
@@ -5290,25 +5233,20 @@ def _walk_umbrella_lines(item_id, out):
         return
     for child in children:
         cid = getattr(child, 'id', None)
-        if not isinstance(cid, str):
+        if not isinstance(cid, tuple) or not cid:
             continue
         if getattr(child, 'boundary', False):
             # Boundary child — a self-contained foreign subtree (subagent
             # group): its content lives in a different file, so the
             # export excerpt stops at the group row (the user drills into
             # it separately). md docs never appear in this cascade, so
-            # this only matches the ``#agent:`` rows it did by id shape.
+            # this only matches the ``agent`` rows it did by id shape.
             continue
-        if '#prompt:' in cid or '#tool:' in cid or '#span:' in cid:
+        if cid[0] in ('prompt', 'tool', 'span'):
             _walk_umbrella_lines(cid, out)
             continue
-        if '#' in cid:
-            _, _, suffix = cid.rpartition('#')
-            try:
-                n = int(suffix)
-            except ValueError:
-                continue
-            out.append(n)
+        if cid[0] == 'msg':
+            out.append(cid[2])
 
 
 def _write_line_excerpts(per_line):
@@ -5526,7 +5464,7 @@ def _action_show_id(ctx):
     """
     if ctx.cursor is None:
         return
-    ctx.page(ctx.cursor.id)
+    ctx.page(str(ctx.cursor.id))
 
 
 def _jump_to_voice(ctx, direction):
@@ -5585,7 +5523,7 @@ def _latest_voice_among_children(item_id):
     as voice via ``row_bg``, ``<tool>`` umbrellas only do so if the
     assistant has text content, regular leaf voice rows match too.
     """
-    if not isinstance(item_id, str):
+    if not isinstance(item_id, tuple):
         return None
     children = get_children(item_id)
     latest = None
@@ -5608,7 +5546,7 @@ def _first_visible_child(item_id):
     lands on a hidden row). Returns ``None`` when there are no children
     or none are visible.
     """
-    if not isinstance(item_id, str):
+    if not isinstance(item_id, tuple):
         return None
     for it in get_children(item_id):
         if not getattr(it, 'hidden', False):
@@ -5656,7 +5594,7 @@ def _outer_subagent_group_id(path):
         <project_dir>/<parent_session_id>/subagents/agent-<aid>.jsonl
 
     and the parent session shows them as collapsible rows with id
-    ``<parent_session_path>#agent:<aid>``. That outer row is the
+    ``('agent', parent_session_path, aid)``. That outer row is the
     framework-visible parent of every record inside the subagent —
     if it isn't expanded, none of the subagent's records are
     reachable. Used by ``_ancestor_ids_for`` to prepend it to the
@@ -5688,22 +5626,22 @@ def _outer_subagent_group_id(path):
         sess_path = _session_path_for_sid(sid)
         if sess_path is None:
             return None
-    return f'{sess_path}#agent:{aid}'
+    return ('agent', sess_path, aid)
 
 
 def _ancestor_ids_for(item_id):
     """Return ids of every ancestor of ``item_id`` (root → direct parent).
 
     Walks the tree built in ``_scan_tree``. Every leaf in the displayed
-    tree is wrapped in at least one umbrella (``<prompt>`` / ``<tool>``
-    / ``<system>``), so the chain consists exclusively of umbrella ids
-    and subagent-group ids — never of raw message ids.
+    tree is wrapped in at least one umbrella (``prompt`` / ``tool`` /
+    ``span``), so the chain consists exclusively of umbrella ids and
+    subagent-group ids — never of raw message ids.
 
     Crosses file boundaries:
 
       * Records inside a subagent's ``.jsonl`` walk up through their
         in-file umbrellas, then across to the
-        ``<parent_session_path>#agent:<aid>`` subagent group row, then
+        ``('agent', parent_session_path, aid)`` subagent group row, then
         further into that group's own ancestors (its dispatching
         ``<tool:Task>`` umbrella and that umbrella's containing
         ``<prompt>``).
@@ -5715,28 +5653,28 @@ def _ancestor_ids_for(item_id):
     leaves it un-expanded, and cursor_to fails to find the target row
     in the visible list.
     """
-    if not isinstance(item_id, str) or '#' not in item_id:
+    if not isinstance(item_id, tuple) or not item_id:
         return []
+    tag = item_id[0]
 
     # Subagent group: parent is the ``<tool:Task>`` umbrella in the
     # outer session (the assistant that dispatched is wrapped in its
     # own tool umbrella in the new model).
-    if '#agent:' in item_id:
-        parent_session_path, _, aid = item_id.partition('#agent:')
+    if tag == 'agent':
+        parent_session_path, aid = item_id[1], item_id[2]
         if not os.path.isfile(parent_session_path):
             return []
         ptd = _scan_tree(parent_session_path)
         asst_line = ptd.agent_to_assistant_line.get(aid)
         if asst_line is None:
             return []
-        parent_id = f'{parent_session_path}#tool:{asst_line}'
+        parent_id = ('tool', parent_session_path, asst_line)
         return _ancestor_ids_for(parent_id) + [parent_id]
 
-    # ``<tool>`` umbrella: parent is the containing ``<prompt>``.
-    if '#tool:' in item_id:
-        path, _, suffix = item_id.partition('#tool:')
-        n = _parse_int(suffix)
-        if n is None or not os.path.isfile(path):
+    # ``tool`` umbrella: parent is the containing ``prompt``.
+    if tag == 'tool':
+        path, n = item_id[1], item_id[2]
+        if not os.path.isfile(path):
             return []
         td = _scan_tree(path)
         turn_line = td.tool_to_turn_root_line.get(n)
@@ -5745,22 +5683,13 @@ def _ancestor_ids_for(item_id):
             outer = _outer_subagent_group_id(path)
             return (_ancestor_ids_for(outer) + [outer]
                     if outer is not None else [])
-        parent_id = f'{path}#prompt:{turn_line}'
+        parent_id = ('prompt', path, turn_line)
         return _ancestor_ids_for(parent_id) + [parent_id]
 
-    # ``<prompt>`` umbrella: top-level in its file, but cross to outer
-    # subagent chain if the file is a subagent jsonl.
-    if '#prompt:' in item_id:
-        path, _, _ = item_id.partition('#prompt:')
-        outer = _outer_subagent_group_id(path)
-        if outer is None:
-            return []
-        return _ancestor_ids_for(outer) + [outer]
-
-    # ``<system>`` span umbrella: same shape as ``<prompt>`` — top-level
-    # in its file, unless the file is a subagent jsonl.
-    if '#span:' in item_id:
-        path, _, _ = item_id.partition('#span:')
+    # ``prompt`` / ``span`` umbrella: top-level in its file, but cross to
+    # the outer subagent chain if the file is a subagent jsonl.
+    if tag in ('prompt', 'span'):
+        path = item_id[1]
         outer = _outer_subagent_group_id(path)
         if outer is None:
             return []
@@ -5768,35 +5697,39 @@ def _ancestor_ids_for(item_id):
 
     # Regular message id (leaf): look up its parent umbrella, then walk
     # up from there.
-    path, _, lineno = item_id.rpartition('#')
-    n = _parse_int(lineno)
-    if n is None or not os.path.isfile(path):
-        return []
-    td = _scan_tree(path)
-    parent_id = td.parent_id_of.get(n)
-    if parent_id is None:
-        # Orphan leaf — likely a top-level metadata record that the
-        # scan didn't wrap in a span. Still cross to outer subagent.
-        outer = _outer_subagent_group_id(path)
-        return (_ancestor_ids_for(outer) + [outer]
-                if outer is not None else [])
-    return _ancestor_ids_for(parent_id) + [parent_id]
+    if tag == 'msg':
+        path, n = item_id[1], item_id[2]
+        if not os.path.isfile(path):
+            return []
+        td = _scan_tree(path)
+        parent_id = td.parent_id_of.get(n)
+        if parent_id is None:
+            # Orphan leaf — likely a top-level metadata record that the
+            # scan didn't wrap in a span. Still cross to outer subagent.
+            outer = _outer_subagent_group_id(path)
+            return (_ancestor_ids_for(outer) + [outer]
+                    if outer is not None else [])
+        return _ancestor_ids_for(parent_id) + [parent_id]
+
+    return []
 
 
 def _seed_scope_root_item(b, target_jsonl, parent_scope):
     """Register a REAL session Item for the initial scope_root (#730).
 
     On direct launch (``browse-claude <file.jsonl>`` / ``--file`` / etc.)
-    the framework scopes straight into ``target_jsonl`` before its
-    children — or the parent dir's listing — have been fetched, so the
-    scope-root row has no Item in the index. ``visible_items`` then
-    fabricates a *synthetic* placeholder (raw-path title, ``boundary``
-    unset), and ``_is_cross_file_id`` reads that bare placeholder as
-    in-file → ``get_preview`` returns '' → the top preview is blank.
+    the framework scopes straight into the ``('session', target_jsonl)``
+    id before its children — or the parent dir's listing — have been
+    fetched, so the scope-root row has no Item in the index.
+    ``visible_items`` then fabricates a *synthetic* placeholder
+    (``boundary`` unset), and ``_is_cross_file_id``'s tag fallback still
+    classifies it cross-file → the cascade upgrade keeps working, but
+    without the rich session Item the scope-header row has no metadata.
 
     Seed the rich session Item (id, full-path scope_title, msg/sub-count
-    tag, ``boundary=True``, ``kind='session'``) under its parent dir so
-    ``visible_items`` finds a real Item instead of synthesizing one.
+    tag, ``boundary=True``, ``kind='session'``) under its parent project
+    scope so ``visible_items`` finds a real Item instead of synthesizing
+    one.
 
     Registered by directly placing the Item in the framework's index
     (``_items_by_id`` + ``_parent_of_id`` + the ``_children[parent_scope]``
@@ -5813,8 +5746,8 @@ def _seed_scope_root_item(b, target_jsonl, parent_scope):
     reconciles.
 
     No-op when the Item can't be built (file vanished, ``--running`` with
-    no live process) — the synthetic placeholder then stands and FIX A's
-    id-shape fallback keeps the preview correct.
+    no live process) — the synthetic placeholder then stands and
+    ``_is_cross_file_id``'s id-tag fallback keeps the preview correct.
     """
     item = _session_item(target_jsonl)
     if item is None:
@@ -5875,20 +5808,22 @@ def _focus_latest_voice_when_ready(b, target_jsonl):
     "cursor still on the scope row at fire time" is a reliable proxy
     for "user hasn't touched it yet."
     """
+    scope_id = ('session', target_jsonl)
+
     def _fire():
         last_id = _last_voice_id(target_jsonl)
         if not last_id:
             return
         # Cancel if the user has navigated since startup. Post scope-
         # root unification the scope row is a normal row at depth 0
-        # whose item id is ``target_jsonl``; identify it that way
-        # rather than by the (deprecated) ``kind='scope_root'``.
+        # whose item id is ``('session', target_jsonl)``; identify it
+        # that way rather than by the (deprecated) ``kind='scope_root'``.
         state = b._state
         vis = visible_items(state)
         cur = state.cursor
-        if not (0 <= cur < len(vis) and vis[cur].item.id == target_jsonl):
+        if not (0 <= cur < len(vis) and vis[cur].item.id == scope_id):
             return
-        # Tree mode: walk the ancestor chain so each #prompt:N umbrella
+        # Tree mode: walk the ancestor chain so each prompt umbrella
         # is expanded before the final cursor_to lands. Flat mode: the
         # leaf is already directly visible under the scope_root, so the
         # ancestor list is empty and the chain collapses to one
@@ -5898,8 +5833,8 @@ def _focus_latest_voice_when_ready(b, target_jsonl):
     # Claim the scope_root's cursor-on-open landing so the generic
     # ``on_expand`` jump steps aside for the deeper focus below (#720).
     # Registered before the owning ``expand`` fires its hook.
-    _DEFERRED_FOCUS_SCOPE_ROOT.add(target_jsonl)
-    b.expand(target_jsonl).then(_fire)
+    _DEFERRED_FOCUS_SCOPE_ROOT.add(scope_id)
+    b.expand(scope_id).then(_fire)
 
 
 def _is_cross_file_id(item_id):
@@ -5915,36 +5850,32 @@ def _is_cross_file_id(item_id):
 
     Attribute-based since the ``boundary`` migration: a row is
     cross-file iff its loaded Item carries ``boundary=True`` — set on
-    subagent-group ``#agent:`` rows and bare ``.jsonl`` session rows
+    subagent-group ``('agent', …)`` rows and ``('session', …)`` rows
     (exactly the shapes the old id test matched), plus md *file*-doc
-    nodes (which never reach this path — ``get_preview`` routes ``#md:``
+    nodes (which never reach this path — ``get_preview`` routes ``md``
     ids out before the cross-file check). When the Item isn't loaded
     (``get_item`` → ``None``: no live Browser, a Browser without the
     lookup, or a row referenced before its fetch) we fall back to the
-    OLD id-shape predicate, so behaviour is identical for ``#agent:`` /
-    bare-``.jsonl`` rows regardless of load state.
+    id-tag predicate, so behaviour is identical for ``agent`` /
+    ``session`` rows regardless of load state.
 
     A SYNTHETIC placeholder (``synthetic=True``) is treated like "not
     loaded" too: the engine fabricates one for a scope-root id with no
     real Item yet (``boundary`` defaults to ``False`` on it), and trusting
-    that flag would mis-classify a bare ``.jsonl`` scope_root as in-file
-    and blank its preview (#730). Falling through to the id-shape test
+    that flag would mis-classify a ``('session', …)`` scope_root as in-file
+    and blank its preview (#730). Falling through to the id-tag test
     keeps the cascade upgrade working until a real Item lands.
     """
-    if not isinstance(item_id, str):
+    if not isinstance(item_id, tuple) or not item_id:
         return False
     get_item = getattr(_BROWSER, 'get_item', None)
     item = get_item(item_id) if get_item is not None else None
     if item is not None and not getattr(item, 'synthetic', False):
         return bool(getattr(item, 'boundary', False))
     # Fallback (Item not loaded, or a synthetic placeholder): the
-    # original id-shape test, so the cheap-preview / cascade-upgrade
-    # contract holds even before the row's real Item exists in the index.
-    if '#agent:' in item_id:
-        return True
-    if '#' not in item_id and item_id.endswith('.jsonl'):
-        return True
-    return False
+    # id-tag test, so the cheap-preview / cascade-upgrade contract holds
+    # even before the row's real Item exists in the index.
+    return item_id[0] in ('agent', 'session')
 
 
 def _invalidate_if_cross_file(item_id):
@@ -6155,9 +6086,9 @@ def _md_self_heal(ctx, parent_id):
 def _is_md_managed_id(item_id):
     """True iff ``item_id``'s children are owned by the markdown subtree.
 
-    Markdown-managed = ``md_doc`` is importable AND the id is a ``#md:`` node
-    (inline document, file doc, or heading), a ``[links]`` References umbrella
-    (``<docid>#refs``), or a plain message id ``<jsonl>#<n>`` (which gains
+    Markdown-managed = ``md_doc`` is importable AND the id is an ``('md', …)``
+    node (inline document, file doc, or heading), a ``[links]`` References umbrella
+    (``('refs', …)``), or a plain message id ``('msg', jsonl, n)`` (which gains
     markdown children when the message has a heading or references a ``.md``
     file). These are the rows whose post-expand cursor lands on the first child
     rather than a voice child (``_jump_to_latest_voice``) — so a single ``→``
@@ -6165,30 +6096,13 @@ def _is_md_managed_id(item_id):
     subtree. The message / file-doc / inline-doc arrows are set *optimistically*
     (so ``_md_self_heal`` may retract one that builds empty); the References
     umbrella is built only when a ref exists, so it never self-heals — but it is
-    still md-managed for the first-child landing. Umbrellas (turn / tool /
+    still md-managed for the first-child landing. Umbrellas (prompt / tool /
     span) and sessions are never md-managed. A no-op (``False``) when
     ``_md_doc is None`` — the whole markdown feature is dead code then.
     """
-    if _md_doc is None or not isinstance(item_id, str):
+    if _md_doc is None or not isinstance(item_id, tuple) or not item_id:
         return False
-    return ('#md:' in item_id
-            or _md_doc.split_refs_umbrella(item_id) is not None
-            or _is_md_message_id(item_id))
-
-
-def _is_md_message_id(item_id):
-    """True iff ``item_id`` is a plain message id ``<jsonl>#<n>``.
-
-    A message id whose markdown arrow the detection gate may have set
-    optimistically — the parent shape the self-heal also covers. Excludes the
-    keyword-selector ids (``#prompt:`` / ``#tool:`` / ``#span:`` / ``#agent:``
-    / ``#md:``) and the ``#__truncated__`` sentinel: those are not message
-    leaves and never carry a markdown arrow.
-    """
-    path, sep, suffix = item_id.rpartition('#')
-    if not sep or not suffix.isdigit():
-        return False
-    return path.endswith('.jsonl')
+    return item_id[0] in ('md', 'refs', 'msg')
 
 
 def _action_tree_right(ctx):
@@ -6417,16 +6331,19 @@ def main():
                   file=sys.stderr)
             sys.exit(2)
     elif len(sys.argv) > 1:
-        initial_scope = sys.argv[1]
-        # Promote a positional .jsonl path to ``target_jsonl`` so the
-        # cursor-on-open path treats it the same as ``--file <path>``.
-        # Without this, ``./browse-tui recipes/browse-claude
-        # /path/to/session.jsonl`` opens the file but leaves the cursor
-        # on the scope_root row.
-        if (isinstance(initial_scope, str)
-                and initial_scope.endswith('.jsonl')
-                and os.path.isfile(initial_scope)):
-            target_jsonl = os.path.abspath(initial_scope)
+        # Seed conversion (§4.3 — the ONLY string→id conversion): the
+        # user-typed positional PROJECT becomes the structured scope root.
+        # A .jsonl path is promoted to ``target_jsonl`` so the
+        # cursor-on-open path treats it the same as ``--file <path>``
+        # (without this, ``./browse-tui recipes/browse-claude
+        # /path/to/session.jsonl`` opens the file but leaves the cursor on
+        # the scope_root row); any other path is a project directory.
+        arg = sys.argv[1]
+        arg_abs = os.path.abspath(arg)
+        if arg.endswith('.jsonl') and os.path.isfile(arg_abs):
+            target_jsonl = arg_abs
+        else:
+            initial_scope = ('project', arg_abs)
 
     if item_arg is not None and not target_jsonl:
         print('browse-claude: --item requires --session/--pid/--file',
@@ -6444,10 +6361,13 @@ def main():
     #                           so alt-up pops one logical level (file →
     #                           project dir) instead of jumping to the
     #                           project root.
+    # Seed conversion (§4.3): the resolved target .jsonl becomes the
+    # structured ``('session', …)`` scope id, with its parent dir as the
+    # ``('project', …)`` scope under it.
     parent_scope = None
     if target_jsonl:
-        initial_scope = target_jsonl
-        parent_scope = os.path.dirname(target_jsonl) or '/'
+        initial_scope = ('session', target_jsonl)
+        parent_scope = ('project', os.path.dirname(target_jsonl) or '/')
 
     # 'M' always pages the preview through the external $MD2ANSI / md2ansi.
     # 'm' toggles inline markdown coloring iff the md2ansi_lib Python module
@@ -6461,9 +6381,10 @@ def main():
     b = Browser(BrowserConfig(
         title='browse-claude',
         show_children_pane=False,
-        # Item ids are file paths (project) / .jsonl paths (session) /
-        # ``<path>#<n>`` (message). They duplicate or contradict the
-        # title in every case, so suppress them from the row chrome —
+        # Item ids are tagged tuples (``('project', dir)`` /
+        # ``('session', jsonl)`` / ``('msg', jsonl, n)`` / …). Their
+        # ``str()`` would be noisy ``repr`` chrome that duplicates or
+        # contradicts the title, so suppress them from the row chrome —
         # the title alone identifies the row. ``y`` action still surfaces
         # the full id on demand.
         show_ids='never',
@@ -6520,14 +6441,14 @@ def main():
     ))
     _BROWSER = b
 
-    # Two-level scope_stack: [parent_dir, target_jsonl]. ``initial_scope``
-    # was set above to target_jsonl, so the framework's __init__ pushed
-    # that onto the stack as the current scope. Slot parent_dir UNDER it
-    # so alt-up from inside the file pops one logical level (file →
-    # project dir) instead of jumping straight to the project root.
-    # Direct list insert preserves the framework's _expanded_by_scope
+    # Two-level scope_stack: [('project', dir), ('session', jsonl)].
+    # ``initial_scope`` was set above to the session id, so the framework's
+    # __init__ pushed that onto the stack as the current scope. Slot the
+    # project scope UNDER it so alt-up from inside the file pops one logical
+    # level (file → project dir) instead of jumping straight to the project
+    # root. Direct list insert preserves the framework's _expanded_by_scope
     # bookkeeping the __init__ scope_into already established.
-    if target_jsonl and parent_scope and parent_scope != target_jsonl:
+    if target_jsonl and parent_scope and parent_scope != initial_scope:
         b._state.scope_stack.insert(0, parent_scope)
 
     # Seed a REAL session Item for the scope_root so the framework never
@@ -6540,8 +6461,8 @@ def main():
 
     # Post-construction cursor positioning:
     #
-    #   --item N:          cursor → ``<jsonl>#<N-1>``. Scope already the
-    #                      jsonl, so messages render on first paint.
+    #   --item N:          cursor → ``('msg', jsonl, N-1)``. Scope already
+    #                      the session, so messages render on first paint.
     #
     #   no --item:         cursor → last voice in the session. Deferred
     #                      until scope_root's children have loaded
@@ -6552,7 +6473,7 @@ def main():
     if target_jsonl:
         if item_arg is not None:
             n0 = max(1, item_arg) - 1
-            b.cursor_to(f'{target_jsonl}#{n0}')
+            b.cursor_to(('msg', target_jsonl, n0))
         else:
             _focus_latest_voice_when_ready(b, target_jsonl)
 
