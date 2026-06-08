@@ -49,7 +49,7 @@ def get_children(path, *, reload=False):
     try:
         entries = list(os.scandir(path))
     except OSError as e:
-        return [Item(id=f'__err__:{path}', title=f'[error] {e}',
+        return [Item(id=('err', path), title=f'[error] {e}',
                      tag='err', tag_style='red')]
     entries.sort(key=lambda d: (not _is_dir(d), d.name.lower()))
     items = []
@@ -108,8 +108,8 @@ def _dir_listing(path):
 
 
 def get_preview(path):
-    if isinstance(path, str) and path.startswith('__err__:'):
-        return path
+    if isinstance(path, tuple) and path[0] == 'err':
+        return path[1]
     try:
         if os.path.isdir(path):
             return _dir_listing(path)
@@ -134,17 +134,26 @@ def toggle_md(ctx):
 
 
 def edit(ctx):
+    # Only real entries have a str (path) id; the synthetic error row's id
+    # is a tuple — acting on it is a no-op rather than a bogus argv.
+    if not isinstance(ctx.cursor.id, str):
+        return
     editor = os.environ.get('EDITOR', 'vi')
     ctx.run_external([editor, ctx.cursor.id])
 
 
 def open_(ctx):
     for it in ctx.targets:
+        if not isinstance(it.id, str):     # skip the synthetic error row
+            continue
         ctx.run_external(['xdg-open', it.id])
 
 
 def delete(ctx):
-    targets = ctx.targets
+    # Skip non-path (tuple) ids — only real filesystem entries are deletable.
+    targets = [it for it in ctx.targets if isinstance(it.id, str)]
+    if not targets:
+        return
     label = targets[0].id if len(targets) == 1 else f'{len(targets)} items'
     if not ctx.confirm(f'delete {label}?'):
         return

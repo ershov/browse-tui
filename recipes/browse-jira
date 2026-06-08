@@ -28,11 +28,11 @@ import sys
 from browse_tui import Action, Browser, BrowserConfig, Item
 
 
-_ERROR_ID = '__error__'
+_ERROR = object()
 
 
 def _err(msg):
-    return [Item(id=_ERROR_ID, title=msg, tag='err', tag_style='red')]
+    return [Item(id=_ERROR, title=msg, tag='err', tag_style='red')]
 
 
 def _parse_list(text):
@@ -91,7 +91,7 @@ def get_children(_, *, reload=False):
 
 
 def get_preview(key):
-    if not isinstance(key, str) or key == _ERROR_ID:
+    if key is _ERROR:
         return ''
     try:
         result = subprocess.run(
@@ -104,7 +104,7 @@ def get_preview(key):
 
 def open_in_browser(ctx):
     """Hand the ticket key off to ``$BROWSER`` / ``xdg-open``."""
-    if not ctx.cursor or ctx.cursor.id == _ERROR_ID:
+    if not ctx.cursor or ctx.cursor.id is _ERROR:
         return
     key = ctx.cursor.id
     # Prefer $BROWSER for an explicit user choice; fall back to

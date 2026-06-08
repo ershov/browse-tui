@@ -36,11 +36,11 @@ import threading
 from browse_tui import Action, Browser, BrowserConfig, Item
 
 
-_ERROR_ID = '__error__'
+_ERROR = object()
 
 
 def _err(msg):
-    return [Item(id=_ERROR_ID, title=msg, tag='err', tag_style='red')]
+    return [Item(id=_ERROR, title=msg, tag='err', tag_style='red')]
 
 
 class _MCPClient:
@@ -217,7 +217,7 @@ def get_children(parent_id, *, reload=False):
 
 
 def get_preview(name):
-    if not isinstance(name, str) or name == _ERROR_ID:
+    if name is _ERROR:
         return ''
     try:
         tools = _list_tools()
