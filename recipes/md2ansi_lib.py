@@ -161,12 +161,30 @@ _M2A_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
 def _m2a_no_break_zone(line_width):
     return min(20, max(0, line_width - 30))
 
-# Markdown-table cell-content matcher. Each char is in exactly one branch — a
-# non-pipe non-backslash non-newline char, OR a backslash followed by any
-# single char (the markdown escape, including `\|`). The same tempered-greedy
-# shape we use for string-literal patterns; linear in input size.
+# Markdown-table cell-content matcher. Each char is in exactly one branch, tried
+# in order so the longest meaningful unit wins before the catch-all:
+#   \\.                       markdown escape (incl. `\|`, `\``) — kept first so
+#                             an escaped backtick can't open a code span.
+#   `` (?:(?!``)[^\n])* ``    double-backtick code span (may hold lone backticks).
+#   ` (?:\\.|[^`\n\\])* `      single-backtick code span.
+#   [^|\\\n]                   ordinary char (also a lone, unclosed `` ` ``).
+# The code-span branches make an un-escaped `|` inside backticks cell content
+# rather than a column divider; an unbalanced backtick falls through to the
+# catch-all so `|` still splits (the row was malformed anyway). Every branch is
+# tempered-greedy (the closer is excluded from its body), so matching stays
+# linear in input size.
 _M2A_TABLE_CELL_RE = re.compile(
-    r" ( (?: [^|\\\n] | \\. )* ) (?: \| | $ ) ",
+    r"""
+    (
+        (?:
+            \\.
+          | `` (?: (?! `` ) [^\n] )* ``
+          | ` (?: \\. | [^`\n\\] )* `
+          | [^|\\\n]
+        )*
+    )
+    (?: \| | $ )
+    """,
     re.VERBOSE,
 )
 
