@@ -831,6 +831,90 @@ class TestPreviewMessageDispatcher(unittest.TestCase):
             os.unlink(path)
 
 
+class TestTurnOffset(unittest.TestCase):
+    """``_ts_offset`` / ``_turn_root_ts`` + the chrome ``offset`` row.
+
+    The offset is the elapsed time of a message since the user request that
+    opens its turn. It rides in the chrome footer right after ``timestamp``
+    and is suppressed for the turn root itself and for out-of-turn records.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_ts_offset_formats(self):
+        f = self.r._ts_offset
+        base = '2026-06-09T00:00:00.000Z'
+        self.assertEqual(f(base, '2026-06-09T00:00:00.500Z'), '+0.5s')
+        self.assertEqual(f(base, '2026-06-09T00:01:30.000Z'), '+1m30s')
+        self.assertEqual(f(base, '2026-06-09T00:10:05.000Z'), '+10m05s')
+        self.assertEqual(f(base, '2026-06-09T01:02:05.000Z'), '+1h02m')
+
+    def test_ts_offset_missing_or_unparseable_is_none(self):
+        f = self.r._ts_offset
+        ok = '2026-06-09T00:00:00.000Z'
+        self.assertIsNone(f(None, ok))
+        self.assertIsNone(f(ok, ''))
+        self.assertIsNone(f('garbage', 'garbage'))
+
+    def _write(self, records):
+        import json as _json
+        import tempfile
+        with tempfile.NamedTemporaryFile('w', suffix='.jsonl',
+                                         delete=False) as f:
+            for r in records:
+                f.write(_json.dumps(r) + '\n')
+            return f.name
+
+    def _records(self):
+        # line 0: out-of-turn metadata (folds into a <system> span)
+        # line 1: user turn root          (ts T0)
+        # line 2: plain assistant reply   (ts T0 + 90s, direct turn member)
+        return [
+            {'type': 'summary', 'summary': 'pre-turn'},
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'do the thing'},
+             'timestamp': '2026-06-09T00:00:00.000Z'},
+            {'type': 'assistant', 'uuid': 'a1',
+             'message': {'role': 'assistant', 'model': 'm',
+                         'stop_reason': 'end_turn',
+                         'content': [{'type': 'text', 'text': 'done'}]},
+             'timestamp': '2026-06-09T00:01:30.000Z'},
+        ]
+
+    def test_turn_root_ts_resolution(self):
+        path = self._write(self._records())
+        try:
+            # Turn member resolves to the opening user request's timestamp.
+            self.assertEqual(self.r._turn_root_ts(path, 2),
+                             '2026-06-09T00:00:00.000Z')
+            # The turn root itself has no offset (it IS the request).
+            self.assertIsNone(self.r._turn_root_ts(path, 1))
+            # Out-of-turn span member has no umbrella request.
+            self.assertIsNone(self.r._turn_root_ts(path, 0))
+        finally:
+            os.unlink(path)
+
+    def test_chrome_offset_row_after_timestamp(self):
+        import re as _re
+        path = self._write(self._records())
+        sgr = _re.compile(r'\x1b\[[0-9;]*m')
+        try:
+            out = sgr.sub('', self.r._preview_message(path, 2))
+            lines = out.split('\n')
+            ts_i = next(i for i, ln in enumerate(lines)
+                        if ln.lstrip().startswith('timestamp'))
+            self.assertTrue(lines[ts_i + 1].lstrip().startswith('offset'),
+                            f'offset must follow timestamp: {lines}')
+            self.assertIn('+1m30s', lines[ts_i + 1])
+            # Turn root preview carries no offset row.
+            root_out = sgr.sub('', self.r._preview_message(path, 1))
+            self.assertNotIn('offset', root_out)
+        finally:
+            os.unlink(path)
+
+
 class TestRunningSessions(unittest.TestCase):
     """``_pid_alive`` + the running-session helpers, and --running filtering."""
 

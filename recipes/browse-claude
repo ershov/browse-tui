@@ -3141,8 +3141,68 @@ def _render_unknown(obj):
 # ---- chrome footer -------------------------------------------------------
 
 
-def _fmt_chrome(obj):
-    """Common metadata footer appended to every per-message preview."""
+def _ts_offset(root_ts, ts):
+    """``+1m30s``-style elapsed time of ``ts`` since the turn's user request.
+
+    Both are ISO-8601 stamps (``…Z``); on 3.10 ``fromisoformat`` rejects the
+    bare ``Z`` so we swap it for ``+00:00``. Returns ``None`` when either is
+    missing or unparseable so the chrome simply omits the row.
+    """
+    if not root_ts or not ts:
+        return None
+    try:
+        a = datetime.datetime.fromisoformat(root_ts.replace('Z', '+00:00'))
+        b = datetime.datetime.fromisoformat(ts.replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    secs = (b - a).total_seconds()
+    sign = '+' if secs >= 0 else '-'
+    secs = abs(secs)
+    if secs < 60:
+        return f'{sign}{secs:.1f}s'
+    if secs < 3600:
+        m, s = divmod(int(secs), 60)
+        return f'{sign}{m}m{s:02d}s'
+    h, rem = divmod(int(secs), 3600)
+    return f'{sign}{h}h{rem // 60:02d}m'
+
+
+def _turn_root_ts(path, n):
+    """ISO timestamp of the user request that opens line ``n``'s turn.
+
+    Resolves the leaf's parent umbrella (``parent_id_of``) to the turn-root
+    line and returns that record's ``timestamp``. Returns ``None`` when the
+    line *is* the turn root (its own offset is always zero), when it sits in
+    an out-of-turn ``<system>`` span (no umbrella request), or when no
+    timestamp is on the root. Stays within ``path`` — a subagent transcript
+    times against its own dispatch prompt, not the parent session's request.
+    """
+    td = _scan_tree(path)
+    parent_id = td.parent_id_of.get(n)
+    if parent_id is None:
+        return None
+    tag = parent_id[0]
+    if tag == 'prompt':
+        root_line = parent_id[2]
+    elif tag == 'tool':
+        root_line = td.tool_to_turn_root_line.get(parent_id[2])
+    else:  # 'span' — out-of-turn metadata, no umbrella request
+        return None
+    if root_line is None or root_line == n:
+        return None
+    if not (0 <= root_line < len(td.records)):
+        return None
+    root = td.records[root_line]
+    return root.get('timestamp') if isinstance(root, dict) else None
+
+
+def _fmt_chrome(obj, turn_root_ts=None):
+    """Common metadata footer appended to every per-message preview.
+
+    ``turn_root_ts`` is the ISO timestamp of the message's umbrella user
+    request (from ``_turn_root_ts``); when set, an ``offset`` row showing the
+    elapsed time since that request is emitted right after ``timestamp``.
+    """
     if not isinstance(obj, dict):
         return ''
     rows = []
@@ -3162,6 +3222,9 @@ def _fmt_chrome(obj):
     ver = obj.get('version', '')
     if ts or ver:
         rows.append(('timestamp', f'{ts}  {MUTE}version:{RESET} {ver}' if ver else ts))
+        offset = _ts_offset(turn_root_ts, ts)
+        if offset:
+            rows.append(('offset', offset))
     flags = []
     if obj.get('isSidechain'): flags.append('sidechain')
     if obj.get('isMeta'):      flags.append('meta')
@@ -4820,7 +4883,7 @@ def _preview_message(path, n):
         return ''
     kind = _classify(obj)
     body = _RENDERERS.get(kind, _render_unknown)(obj)
-    chrome = _fmt_chrome(obj)
+    chrome = _fmt_chrome(obj, _turn_root_ts(path, n))
     return body + ('\n' + chrome if chrome else '')
 
 
