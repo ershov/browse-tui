@@ -9,6 +9,12 @@ relpath() { # args: from, to
   python3 -c 'import os,sys; print(os.path.relpath(sys.argv[2], sys.argv[1]))' "$@"
 }
 
+file_alias() {
+  local FILE="$(basename "$1")"
+  ALIAS="${FILE/browse-/b-}"
+  [[ "$FILE" != "$ALIAS" ]]
+}
+
 install() {
   for DEST in "${DESTS[@]}"; do
     [[ ! -d "$DEST" ]] && continue
@@ -17,6 +23,10 @@ install() {
     for FILE in "${FILES[@]}"; do
       printf ' %q' "$@" "$(relpath "$DEST" "$FILE")" ./ 1>&2; echo 1>&2
       "$@" "$(relpath "$DEST" "$FILE")" ./
+      if file_alias "$(basename "$FILE")"; then
+        echo " symlink $ALIAS"
+        (cd "$DEST"; ln -s "$FILE" "$ALIAS")
+      fi
     done
     [[ ":$PATH:" == *":$DEST:"* ]] || echo "NOTE: $DEST is not in your \$PATH." 1>&2
     return 0
@@ -32,15 +42,22 @@ is_my_file() {
   grep -qsF browse-tui "$1" || [[ "$(readlink "$1" 2>/dev/null)" == *browse-tui* ]]
 }
 
+rm_my_file() {
+  [[ ! -e "$1" && ! -L "$1" ]] && return 0
+  is_my_file "$1" || { echo " ... skipped: $1" 1>&2; return 0; }
+  printf ' %q' rm -f "$1" 1>&2; echo 1>&2
+  rm -f "$1" || true
+}
+
 uninstall() {
   for DEST in "${DESTS[@]}"; do
     [[ ! -d "$DEST" ]] && continue
     for FILE in "${FILES[@]}"; do
-      F="$DEST"/"$(basename "$FILE")"
-      [[ ! -e "$F" && ! -L "$F" ]] && continue
-      is_my_file "$F" || { echo " ... skipped: $F" 1>&2; continue; }
-      printf ' %q' rm -f "$F" 1>&2; echo 1>&2
-      rm -f "$F" || true
+      FILE="$(basename "$FILE")"
+      rm_my_file "$DEST/$FILE"
+      if file_alias "$(basename "$FILE")"; then
+        rm_my_file "$DEST/$ALIAS"
+      fi
     done
   done
 }
