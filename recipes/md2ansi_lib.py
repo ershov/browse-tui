@@ -20,6 +20,7 @@ M2A_COLOR_STRING   = "38;5;114"   # green
 M2A_COLOR_NUMBER   = "38;5;220"   # yellow
 M2A_COLOR_KEYWORD  = "38;5;204"   # pink
 M2A_COLOR_BUILTIN  = "38;5;147"   # purple
+M2A_COLOR_PUNCT    = "38;5;246"   # dim gray — operators/punctuation (one step brighter than COMMENT's 245)
 
 # Markdown styling palette (headings, inline accents, frame chrome).
 M2A_COLOR_H1       = "38;5;226"   # yellow
@@ -72,6 +73,14 @@ _M2A_STR_BT  = r" ` (?: [^`\\]   | \\. )* `  "
 _M2A_STR_TDQ = r' """ (?: (?!""") [\s\S] )* """ '
 _M2A_STR_TSQ = r" ''' (?: (?!''') [\s\S] )* ''' "
 
+# Permissive multiline single/double-quoted strings — same shape as the strict
+# fragments but WITHOUT the `\n` exclusion, so a string may span linebreaks.
+# Used only by the unknown-language context, where over-matching an unbalanced
+# quote across lines is an accepted tradeoff (the language is unknown). The
+# backtick fragment (`_M2A_STR_BT`) is already newline-permissive.
+_M2A_STR_DQ_ML = r' " (?: [^"\\] | \\. )* "  '
+_M2A_STR_SQ_ML = r" ' (?: [^'\\] | \\. )* '  "
+
 # Numbers — hex, binary, octal, int, float, scientific, with `_` digit grouping.
 _M2A_NUM = r"""
     \b (?:
@@ -82,6 +91,14 @@ _M2A_NUM = r"""
       | \d [\d_]* (?:[eE][+-]?\d+)?
     ) \b
 """
+
+# Punctuation run — a maximal run of operator/bracket/separator chars, dimmed so
+# words read brighter by contrast. Used as the universal trailing rule in every
+# code context (appended LAST, so it never steals a `.` inside a float or a `/`
+# in `//`). Excludes `_` (word char), quotes/backtick (string rules), `\`
+# (escape), and `#` (often a comment/preprocessor marker handled earlier).
+# `-` leads the class so it's literal; `]` is escaped.
+_M2A_PUNCT = r"[-+*/%=<>!&|^~.,;:?@(){}\[\]]+"
 
 # Block-start lookahead — substituted into every cross-line inline rule's
 # soft-newline branch so inline matching stops at block boundaries. The `#`
@@ -639,6 +656,12 @@ def _m2a_fmt_code(m, name, current_style, context, state, code_context, lang=Non
 # - `fmt` — either an SGR-codes string (e.g., `"1;3"`) or a callable `(match, current_style, context, state) → str`
 # - `recurse` — `M2A_Context` to recurse content into, or `None` to leave content as a literal
 
+# Universal trailing rule, appended LAST to every code ruleset: dims any run of
+# punctuation the language-specific rules didn't already claim. Last position is
+# load-bearing — comments/strings/numbers must match first so their internal
+# punctuation isn't grabbed here.
+_M2A_RULE_PUNCT = ("punct", _M2A_PUNCT, M2A_COLOR_PUNCT, None)
+
 # Python keyword & builtin lists. `type` appears in both lists;
 # rule order ensures keyword wins.
 _M2A_PY_KEYWORDS = (
@@ -680,6 +703,7 @@ _M2A_RULES_CODE_PYTHON = (
     ("py_number",     _M2A_NUM,                                       M2A_COLOR_NUMBER,  None),
     ("py_keyword",    rf"\b(?:{_M2A_PY_KEYWORDS})\b",                 M2A_COLOR_KEYWORD, None),
     ("py_builtin",    rf"\b(?:{_M2A_PY_BUILTINS})\b",                 M2A_COLOR_BUILTIN, None),
+    _M2A_RULE_PUNCT,
 )
 
 # Bash keyword & builtin lists.
@@ -704,6 +728,7 @@ _M2A_RULES_CODE_BASH = (
     ("sh_number",    _M2A_NUM,                                      M2A_COLOR_NUMBER,  None),
     ("sh_keyword",   rf"\b(?:{_M2A_SH_KEYWORDS})\b",                M2A_COLOR_KEYWORD, None),
     ("sh_builtin",   rf"\b(?:{_M2A_SH_BUILTINS})\b",                M2A_COLOR_BUILTIN, None),
+    _M2A_RULE_PUNCT,
 )
 
 # JavaScript keyword & builtin lists.
@@ -729,9 +754,69 @@ _M2A_RULES_CODE_JAVASCRIPT = (
     ("js_number",        _M2A_NUM,                                   M2A_COLOR_NUMBER,  None),
     ("js_keyword",       rf"\b(?:{_M2A_JS_KEYWORDS})\b",             M2A_COLOR_KEYWORD, None),
     ("js_builtin",       rf"\b(?:{_M2A_JS_BUILTINS})\b",             M2A_COLOR_BUILTIN, None),
+    _M2A_RULE_PUNCT,
 )
 
-# Generic: no rules — fenced block content passes through unchanged.
+# C / C++ — one shared ruleset for both (simplicity over precision). Keywords
+# fold the C and C++ reserved words together with the fundamental types; the
+# fixed-width <stdint.h> types and common library names live in builtins.
+_M2A_C_KEYWORDS = (
+    "alignas|alignof|and|and_eq|asm|auto|bitand|bitor|bool|break|case|catch|char|"
+    "char8_t|char16_t|char32_t|class|compl|concept|const|consteval|constexpr|"
+    "constinit|const_cast|continue|co_await|co_return|co_yield|decltype|default|"
+    "delete|double|do|dynamic_cast|else|enum|explicit|export|extern|false|final|"
+    "float|for|friend|goto|if|inline|int|long|mutable|namespace|new|noexcept|"
+    "not_eq|not|nullptr|operator|or_eq|or|override|private|protected|public|"
+    "register|reinterpret_cast|requires|restrict|return|short|signed|sizeof|"
+    "static_assert|static_cast|static|struct|switch|template|this|thread_local|"
+    "throw|true|try|typedef|typeid|typename|union|unsigned|using|virtual|void|"
+    "volatile|wchar_t|while|xor_eq|xor|"
+    "_Alignas|_Alignof|_Atomic|_Bool|_Complex|_Generic|_Imaginary|_Noreturn|"
+    "_Static_assert|_Thread_local"
+)
+_M2A_C_BUILTINS = (
+    "size_t|ssize_t|ptrdiff_t|intptr_t|uintptr_t|"
+    "int8_t|int16_t|int32_t|int64_t|uint8_t|uint16_t|uint32_t|uint64_t|"
+    "FILE|NULL|EXIT_SUCCESS|EXIT_FAILURE|stdin|stdout|stderr|"
+    "printf|fprintf|snprintf|sprintf|sscanf|scanf|puts|putchar|getchar|fgets|"
+    "fputs|fopen|fclose|fread|fwrite|malloc|calloc|realloc|free|memcpy|memmove|"
+    "memset|strlen|strncmp|strcmp|strncpy|strcpy|strncat|strcat|strchr|strstr|"
+    "exit|abort|assert|"
+    "std|string_view|string|wstring|vector|array|unordered_map|map|unordered_set|"
+    "set|pair|tuple|optional|variant|list|deque|queue|stack|span|"
+    "shared_ptr|unique_ptr|weak_ptr|make_shared|make_unique|move|forward|"
+    "cout|cin|cerr|clog|endl"
+)
+
+# Order: a `#...` preprocessor directive is its own token and must match first
+# (C has no `#` comment). Comments precede strings/numbers; punct dims the rest.
+# Char literals reuse the single-quote string fragment and share the string color.
+_M2A_RULES_CODE_C = (
+    ("c_preproc",       r"^ [ \t]* \# [ \t]* \w+",                  M2A_COLOR_KEYWORD, None),
+    ("c_comment_line",  r"//[^\n]*",                                M2A_COLOR_COMMENT, None),
+    ("c_comment_block", r"/\*(?:(?!\*/)[\s\S])*\*/",                M2A_COLOR_COMMENT, None),
+    ("c_string",        _M2A_STR_DQ,                                M2A_COLOR_STRING,  None),
+    ("c_char",          _M2A_STR_SQ,                                M2A_COLOR_STRING,  None),
+    ("c_number",        _M2A_NUM,                                   M2A_COLOR_NUMBER,  None),
+    ("c_keyword",       rf"\b(?:{_M2A_C_KEYWORDS})\b",              M2A_COLOR_KEYWORD, None),
+    ("c_builtin",       rf"\b(?:{_M2A_C_BUILTINS})\b",              M2A_COLOR_BUILTIN, None),
+    _M2A_RULE_PUNCT,
+)
+
+# Unknown / unmarked blocks — no language to key off, so just the universal
+# tokens: permissive (newline-spanning) strings, numbers, and dimmed punctuation.
+# No comment rule (comment syntax is unknown). Strings come first so a number or
+# operator inside a quoted span isn't separately colored.
+_M2A_RULES_CODE_UNKNOWN = (
+    ("gen_string_dq", _M2A_STR_DQ_ML, M2A_COLOR_STRING, None),
+    ("gen_string_sq", _M2A_STR_SQ_ML, M2A_COLOR_STRING, None),
+    ("gen_string_bt", _M2A_STR_BT,    M2A_COLOR_STRING, None),
+    ("gen_number",    _M2A_NUM,       M2A_COLOR_NUMBER, None),
+    _M2A_RULE_PUNCT,
+)
+
+# Generic: no rules — fenced block content passes through unchanged. Reserved
+# for frontmatter, which must stay a verbatim passthrough (it is not code).
 _M2A_RULES_CODE_GENERIC = ()
 
 
@@ -740,6 +825,8 @@ _M2A_RULES_CODE_GENERIC = ()
 M2A_CONTEXT_CODE_PYTHON     = _m2a_build_context(_M2A_RULES_CODE_PYTHON)
 M2A_CONTEXT_CODE_BASH       = _m2a_build_context(_M2A_RULES_CODE_BASH)
 M2A_CONTEXT_CODE_JAVASCRIPT = _m2a_build_context(_M2A_RULES_CODE_JAVASCRIPT)
+M2A_CONTEXT_CODE_C          = _m2a_build_context(_M2A_RULES_CODE_C)
+M2A_CONTEXT_CODE_UNKNOWN    = _m2a_build_context(_M2A_RULES_CODE_UNKNOWN)
 M2A_CONTEXT_CODE_GENERIC    = _m2a_build_context(_M2A_RULES_CODE_GENERIC)
 
 
@@ -788,6 +875,7 @@ def _fenced(tag, fence=r"```"):
 _MD_CODE_PY   = _fenced("python")
 _MD_CODE_BASH = _fenced(r"(?:bash|sh)")
 _MD_CODE_JS   = _fenced(r"(?:javascript|js)")
+_MD_CODE_C    = _fenced(r"(?:c\+\+|cpp|cxx|cc|hpp|hxx|h|c)")
 _MD_CODE_GEN  = _fenced(r"(?P<*lang> \w* )", fence=r"(?:```|~~~)")
 
 _MD_BLOCKQUOTE = r"^ > [ \t]? [^\n]* (?: \n > [ \t]? [^\n]* )*"
@@ -930,7 +1018,8 @@ _M2A_RULES_MD = (
     ("code_python",   _MD_CODE_PY,      _m2a_code_lambda(M2A_CONTEXT_CODE_PYTHON,     "python"),     None),
     ("code_bash",     _MD_CODE_BASH,    _m2a_code_lambda(M2A_CONTEXT_CODE_BASH,       "bash"),       None),
     ("code_js",       _MD_CODE_JS,      _m2a_code_lambda(M2A_CONTEXT_CODE_JAVASCRIPT, "javascript"),None),
-    ("code_generic",  _MD_CODE_GEN,     _m2a_code_lambda(M2A_CONTEXT_CODE_GENERIC),   None),
+    ("code_c",        _MD_CODE_C,       _m2a_code_lambda(M2A_CONTEXT_CODE_C,          label="C/C++"),None),
+    ("code_generic",  _MD_CODE_GEN,     _m2a_code_lambda(M2A_CONTEXT_CODE_UNKNOWN),   None),
     ("blockquote",    _MD_BLOCKQUOTE,   _m2a_fmt_blockquote,                          None),
     ("table",         _MD_TABLE,        _m2a_fmt_table,                               None),
     ("list",          _MD_LIST,         _m2a_fmt_list,                                None),
@@ -1128,6 +1217,7 @@ _M2A_SPAN_KINDS = {
     "code_python":  ("code", "code-python"),
     "code_bash":    ("code", "code-bash"),
     "code_js":      ("code", "code-javascript"),
+    "code_c":       ("code", "code-c"),
     "code_generic": ("code", "code"),
     "code_inline2": ("code_inline", "code_inline"),
     "code_inline":  ("code_inline", "code_inline"),
