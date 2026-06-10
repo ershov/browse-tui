@@ -111,11 +111,12 @@ def _stub_browse_tui():
     attributes so the children-builder tests can read ``.id`` / ``.tag``
     if needed; ``Browser`` / ``BrowserConfig`` / ``Action`` are inert.
 
-    The column helpers (``cell_ljust`` / ``style`` / ``default_row_content``)
-    are functional-but-minimal — the test data is plain ASCII so
-    ``str.ljust`` measures the same as the real cell-aware helper, which is
-    enough to prove ``git_row_content`` wires them correctly. They mirror
-    the stub in ``test_browse_fs.py``.
+    The column helpers (``cell_ljust`` / ``cell_width`` / ``style`` /
+    ``default_row_content``) are functional-but-minimal — the test data is
+    plain ASCII so ``str.ljust`` / ``len`` measure the same as the real
+    cell-aware helpers, which is enough to prove ``git_row_content`` (and
+    ``_untracked_stat``) wire them correctly. They mirror the stub in
+    ``test_browse_fs.py``.
 
     ``sanitize_ansi`` mirrors the framework's escape-sanitiser (050-render)
     1:1 — keep complete SGR (``\\e[…m``), drop every other CSI / bare ESC —
@@ -136,6 +137,7 @@ def _stub_browse_tui():
     mod.Item = _Stub
 
     mod.cell_ljust = lambda s, width, fill=' ': s.ljust(width, fill)
+    mod.cell_width = len  # test data is plain ASCII → len == display width
 
     def _style(name):
         if name == 'dim':
@@ -1370,6 +1372,165 @@ class TestWorktreeFiles(unittest.TestCase):
     def test_empty_bucket_is_empty(self):
         self.r._worktree_status = lambda paths: [('M ', 's.txt')]
         self.assertEqual(self.r._worktree_files('conflicts', []), [])
+
+
+class TestWorktreePreviewStat(unittest.TestCase):
+    """``_worktree_preview`` summarises a bucket with ``--stat`` (like a commit).
+
+    The per-file diff now lives on the child ``('status', …)`` leaves, so the
+    bucket row previews a stat summary — git-colored but NOT piped through
+    ``delta`` (a diff renderer), exactly like ``_commit_preview``.
+    """
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self.calls = []
+
+        def fake_git_color(*args):
+            self.calls.append(args)
+            return 'STAT\n'
+
+        self.r._git_color = fake_git_color
+        # Mark delta so a test can prove the stat is NOT routed through it.
+        self.r._colorize_diff = lambda raw: 'DELTA(' + raw + ')'
+
+    def _set_status(self, rows):
+        self.r._worktree_status = lambda paths: rows
+
+    def test_staged_uses_diff_cached_stat(self):
+        self._set_status([('M ', 'a.txt')])
+        out = self.r._worktree_preview('staged', [])
+        self.assertEqual(self.calls,
+                         [('diff', '--cached', '--stat', '--', 'a.txt')])
+        self.assertEqual(out, 'STAT\n')        # raw stat …
+        self.assertNotIn('DELTA', out)         # … not piped through delta
+
+    def test_tracked_uses_diff_stat(self):
+        self._set_status([(' M', 'b.txt')])
+        out = self.r._worktree_preview('tracked', [])
+        self.assertEqual(self.calls, [('diff', '--stat', '--', 'b.txt')])
+        self.assertNotIn('DELTA', out)
+
+    def test_conflicts_uses_diff_stat(self):
+        self._set_status([('UU', 'c.txt')])
+        out = self.r._worktree_preview('conflicts', [])
+        self.assertEqual(self.calls, [('diff', '--stat', '--', 'c.txt')])
+        self.assertNotIn('DELTA', out)
+
+    def test_empty_bucket_is_empty(self):
+        self._set_status([])
+        self.assertEqual(self.r._worktree_preview('staged', []), '')
+        self.assertEqual(self.calls, [])
+
+
+class TestUntrackedStat(unittest.TestCase):
+    """Untracked bucket combines per-file stats into one cohesive summary."""
+
+    def setUp(self):
+        self.r = _load_recipe()
+
+    def test_strips_prefix_aligns_and_collapses_footers(self):
+        # Untracked files have no index entry, so each is statted alone via
+        # diff --no-index; git emits a `/dev/null =>` rename prefix and its
+        # own footer per file (a single git call would never split them).
+        # DIFFERENT name lengths so the `|` re-alignment is exercised.
+        per_file = {
+            'a.txt': (' /dev/null => a.txt | 3 \x1b[32m+++\x1b[m\n'
+                      ' 1 file changed, 3 insertions(+)\n'),
+            'longer.txt': (' /dev/null => longer.txt | 1 \x1b[32m+\x1b[m\n'
+                           ' 1 file changed, 1 insertion(+)\n'),
+        }
+
+        def fake_git_color(*args):
+            return per_file[args[-1]]  # last arg is the path
+
+        self.r._git_color = fake_git_color
+        self.r._worktree_status = lambda paths: [('??', 'a.txt'),
+                                                 ('??', 'longer.txt')]
+        out = self.r._worktree_preview('untracked', [])
+        lines = out.splitlines()
+        self.assertNotIn('/dev/null =>', out)            # rename arrow gone
+        self.assertIn('\x1b[32m', out)                   # colored bars kept
+        # Both files listed; their `|` separators line up in one column
+        # (shorter path padded) so it reads like a single git --stat.
+        sep_cols = [ln.index('|') for ln in lines if '|' in ln]
+        self.assertEqual(len(sep_cols), 2)
+        self.assertEqual(sep_cols[0], sep_cols[1])
+        self.assertTrue(any('a.txt' in ln for ln in lines))
+        self.assertTrue(any('longer.txt' in ln for ln in lines))
+        # The two per-file footers collapse into ONE combined footer.
+        footers = [ln for ln in lines if 'changed' in ln]
+        self.assertEqual(footers, [' 2 files changed, 4 insertions(+)'])
+
+
+@unittest.skipUnless(shutil.which('git'), 'git not available')
+class TestUntrackedStatRealGit(unittest.TestCase):
+    """End-to-end guard: real ``git diff --no-index --stat`` for untracked.
+
+    The stubbed ``TestUntrackedStat`` bakes in git's ``/dev/null => `` line
+    format; this runs the real command so a cross-version change in that
+    prefix / footer can't slip past the unit suite unnoticed. ``_untracked_stat``
+    is the only spot that PARSES git's stat text (the other buckets pass a
+    single ``git diff --stat`` through untouched), so it's the one that needs
+    a real-git guard.
+    """
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self._orig_cwd = os.getcwd()
+
+    def tearDown(self):
+        os.chdir(self._orig_cwd)
+
+    def test_untracked_preview_is_a_clean_aligned_stat(self):
+        d = tempfile.mkdtemp()
+        env = {**os.environ,
+               'GIT_AUTHOR_NAME': 'T', 'GIT_AUTHOR_EMAIL': 't@t',
+               'GIT_COMMITTER_NAME': 'T', 'GIT_COMMITTER_EMAIL': 't@t'}
+        subprocess.run(['git', '-C', d, 'init', '-q'], check=True,
+                       capture_output=True, env=env)
+        # Two untracked files of different name length / line count.
+        Path(d, 'a.txt').write_text('one\ntwo\nthree\n')
+        Path(d, 'a-longer-name.txt').write_text('x\n')
+        os.chdir(d)
+        out = self.r._worktree_preview('untracked', [])
+        plain = [re.sub(r'\x1b\[[0-9;]*m', '', ln) for ln in out.splitlines()]
+        # git's /dev/null rename arrow is fully stripped; both files listed.
+        self.assertNotIn('/dev/null', out)
+        self.assertTrue(any('a.txt' in ln for ln in plain))
+        self.assertTrue(any('a-longer-name.txt' in ln for ln in plain))
+        # The `|` separators align into one column (the short name padded).
+        seps = [ln.index('|') for ln in plain if '|' in ln]
+        self.assertEqual(len(seps), 2)
+        self.assertEqual(seps[0], seps[1])
+        # Exactly one combined footer summing both files (3 + 1 insertions).
+        footers = [ln for ln in plain if 'changed' in ln]
+        self.assertEqual(len(footers), 1)
+        self.assertIn('2 files changed', footers[0])
+        self.assertIn('4 insertions(+)', footers[0])
+
+
+class TestStashPreviewStat(unittest.TestCase):
+    """``_stash_preview`` summarises a stash with ``--stat`` (like a commit)."""
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self.calls = []
+
+        def fake_git_color(*args):
+            self.calls.append(args)
+            return 'STASHSTAT\n'
+
+        self.r._git_color = fake_git_color
+        self.r._colorize_diff = lambda raw: 'DELTA(' + raw + ')'
+
+    def test_uses_stash_show_stat_not_patch(self):
+        out = self.r._stash_preview(2)
+        self.assertEqual(self.calls,
+                         [('stash', 'show', '--stat', 'stash@{2}')])
+        self.assertEqual(out, 'STASHSTAT\n')
+        self.assertNotIn('DELTA', out)
+        self.assertNotIn('-p', self.calls[0])  # diff lives on the leaves now
 
 
 class TestStatusLeafDedup(unittest.TestCase):

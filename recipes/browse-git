@@ -81,7 +81,7 @@ import sys
 
 from browse_tui import (
     Action, Browser, BrowserConfig, Item,
-    cell_ljust, default_row_content, sanitize_ansi, style,
+    cell_ljust, cell_width, default_row_content, sanitize_ansi, style,
 )
 
 # Optional md2ansi_lib plugin — gates md2ansi coloring of commit messages.
@@ -1226,8 +1226,9 @@ def get_preview(item_id):
         # id = ('status', xy, path).
         return _status_preview(item_id[1], item_id[2])
     if kind == 'wc':
-        # A worktree-status group — combined colored diff for the bucket,
-        # scoped to the same positional paths. id = ('wc', bucket).
+        # A worktree-status group — a --stat summary of the bucket (the
+        # per-file diff lives on its child leaves), scoped to the same
+        # positional paths. id = ('wc', bucket).
         return _worktree_preview(item_id[1], _paths)
     if kind == 'stash':
         # id = ('stash', n) node or ('stash', n, path) leaf. The "no stashes"
@@ -1278,43 +1279,92 @@ def _status_preview(xy, path):
 
 
 def _worktree_preview(bucket, paths):
-    """Combined colored diff for a worktree ``bucket``, scoped to its files.
+    """``--stat`` summary for a worktree ``bucket``, scoped to its files.
 
-    Computes the bucket's own paths via ``_classify_worktree`` so e.g. the
-    tracked preview never pulls in staged-only files. The diff command is
-    chosen by bucket:
+    Mirrors the commit-node preview (``git show --stat``): the bucket row
+    summarises its changed files and the per-file diff lives on the child
+    ``('status', …)`` leaves (``_status_preview``), so a worktree group
+    drills down exactly like a commit. ``_classify_worktree`` scopes each
+    bucket's paths so e.g. the tracked summary never pulls in staged-only
+    files. The stat command is chosen by bucket:
 
-      * ``staged``    → ``diff --cached -- <bucket paths>``
-      * ``tracked``   → ``diff -- <bucket paths>``
-      * ``conflicts`` → ``diff -- <bucket paths>`` (git renders unmerged
-        paths in combined ``--cc`` form)
-      * ``untracked`` → per file, ``diff --no-index -- /dev/null <path>``,
-        concatenated (untracked files have no index entry to diff against)
+      * ``staged``    → ``diff --cached --stat -- <bucket paths>``
+      * ``tracked``   → ``diff --stat -- <bucket paths>``
+      * ``conflicts`` → ``diff --stat -- <bucket paths>``
+      * ``untracked`` → ``_untracked_stat`` (per-file ``diff --no-index
+        --stat`` combined, since untracked files have no index entry)
 
-    Each diff is run git-colored and piped through ``_colorize_diff``.
-    Returns ``''`` for an empty bucket or an unknown name.
+    Stat output is git-colored via ``_git_color`` and returned as-is — NOT
+    piped through ``_colorize_diff`` / ``delta``, which renders diffs, not
+    stats (again matching ``_commit_preview``). Returns ``''`` for an empty
+    bucket or an unknown name.
     """
     buckets = _classify_worktree(_worktree_status(paths))
     bucket_paths = [path for _xy, path in buckets.get(bucket, [])]
     if not bucket_paths:
         return ''
     if bucket == 'staged':
-        raw = _git_color('diff', '--cached', '--', *bucket_paths)
-    elif bucket in ('tracked', 'conflicts'):
-        raw = _git_color('diff', '--', *bucket_paths)
-    elif bucket == 'untracked':
-        raw = ''.join(
-            _git_color('diff', '--no-index', '--', '/dev/null', path)
-            for path in bucket_paths)
-    else:
+        return _git_color('diff', '--cached', '--stat', '--', *bucket_paths)
+    if bucket in ('tracked', 'conflicts'):
+        return _git_color('diff', '--stat', '--', *bucket_paths)
+    if bucket == 'untracked':
+        return _untracked_stat(bucket_paths)
+    return ''
+
+
+def _untracked_stat(paths):
+    """Combined ``--stat`` summary for untracked files.
+
+    Untracked files have no index entry, so each is statted on its own via
+    ``diff --no-index --stat`` against ``/dev/null`` (git takes only two
+    paths per invocation). git prefixes each file line with a ``/dev/null
+    => `` rename arrow and prints a per-file ``N file changed`` footer; the
+    arrow is stripped and the per-file footers are dropped in favour of one
+    combined footer, so the bucket reads as a single cohesive stat like the
+    staged / tracked buckets. Because the per-file calls can't align the
+    ``|`` column the way a single ``git diff --stat`` would, the path column
+    is re-padded here (``cell_ljust`` to the widest path). The ``+`` bars
+    stay git-colored; the synthesised footer is plain (git's stat footer is
+    uncolored too).
+    """
+    rows = []          # (left = ' path', right = 'N <bars>') split at ' | '
+    insertions = 0
+    for path in paths:
+        raw = _git_color('diff', '--no-index', '--stat', '--', '/dev/null',
+                         path)
+        for line in raw.splitlines():
+            plain = _SGR_RE.sub('', line)
+            if re.match(r'\s*\d+ files? changed', plain):
+                continue                       # per-file footer — re-synthesised
+            if ' | ' not in plain:
+                continue                       # blank / stray line
+            left, _, right = line.replace(
+                ' /dev/null => ', ' ', 1).rpartition(' | ')
+            rows.append((left, right))
+            m = re.match(r'\s*(\d+)\b', _SGR_RE.sub('', right))
+            if m:
+                insertions += int(m.group(1))
+    if not rows:
         return ''
-    return _colorize_diff(raw)
+    width = max(cell_width(left) for left, _ in rows)
+    out = [f'{cell_ljust(left, width)} | {right}' for left, right in rows]
+    n = len(rows)
+    files_word = 'file' if n == 1 else 'files'
+    ins_word = 'insertion' if insertions == 1 else 'insertions'
+    out.append(f' {n} {files_word} changed, {insertions} {ins_word}(+)')
+    return '\n'.join(out)
 
 
 def _stash_preview(n):
-    """Stash node preview = colored full ``stash show -p stash@{n}`` diff."""
-    raw = _git_color('stash', 'show', '-p', f'stash@{{{n}}}')
-    return _colorize_diff(raw)
+    """Stash node preview = colored ``stash show --stat stash@{n}`` summary.
+
+    Mirrors the commit-node preview: the stash row summarises its files and
+    the per-file diff lives on the child ``('stash', n, path)`` leaves
+    (``_stash_file_preview``). ``--stat`` excludes untracked entries exactly
+    like the ``--name-status`` children (``_stash_files``), so the summary
+    and the drill-down list stay consistent. Returned as-is — NOT piped
+    through ``_colorize_diff`` / ``delta`` (a diff renderer)."""
+    return _git_color('stash', 'show', '--stat', f'stash@{{{n}}}')
 
 
 def _stash_file_preview(n, path):
