@@ -173,7 +173,8 @@ on commit rows.
 **Modes:**
 
 - **commits** — recent `git log`; drill commit → changed files →
-  per-file diff. Scoped by positional revs / paths. An unscoped log is
+  per-file diff. Scoped by positional revs / paths, or spanned over every
+  local branch with `--all` (git log's `--branches`). An unscoped log is
   preceded by up to four synthetic working-change rows — `Untracked
   changes` / `Tracked changes` / `Staged changes` / `Conflicts` — each
   shown only when non-empty and drillable into its files.
@@ -218,6 +219,7 @@ at runtime, or auto-selection from positional args.
 ```bash
 cd /path/to/your/repo
 ./recipes/browse-git                    # commits mode
+./recipes/browse-git --all              # log spanning every local branch
 ./recipes/browse-git --mode status      # working-tree changes
 ./recipes/browse-git -n 200 HEAD~50     # cap + root the log at a rev
 ./recipes/browse-git -- src/            # filter the log to a path

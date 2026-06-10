@@ -65,8 +65,12 @@ up. The flag scopes the commit log (commits mode + the ref drill-down).
 Read-only with respect to history — the only mutation is ``E``'s
 working-tree edit.
 
+In commits mode ``--all`` spans the log over every local branch (git
+log's ``--branches``) — equivalent to ``browse-git $(git branch
+--format='%(refname:short)')`` — instead of only HEAD's history.
+
 Usage:
-  browse-git [<dir>] [-n NUMBER] [--mode NAME] [--no-tree] [<revs>…] [-- <paths>…]
+  browse-git [<dir>] [-n NUMBER] [--mode NAME] [--no-tree] [--all] [<revs>…] [-- <paths>…]
 """
 
 import os
@@ -126,6 +130,7 @@ _tree_mode = True  # --tree / 't' — render git's commit graph as a column (def
 _browser = None  # set in main() — used for preview-width lookup
 _revs = []       # positional revisions scoping commits mode
 _paths = []      # positional pathspecs scoping commits mode
+_all_branches = False  # --all — span the commits log over every local branch
 
 
 # ---- argv helper ---------------------------------------------------------
@@ -213,6 +218,29 @@ def _pop_tree_arg(default):
         else:
             i += 1
     return chosen
+
+
+def _pop_all_arg():
+    """Pop the ``--all`` flag out of ``sys.argv``; return ``True`` if present.
+
+    ``--all`` spans the commits-mode log over every local branch — equivalent
+    to launching ``browse-git $(git branch --format='%(refname:short)')``,
+    realised as ``git log --branches`` (see ``_commits_root``) so it also
+    stays correct on a detached HEAD, where that branch-name expansion would
+    feed a bogus ``(HEAD detached …)`` token to the positional classifier.
+    Every occurrence is removed (so the flag never reaches the positional
+    classifier or ``Browser.run()``); mirrors ``_pop_tree_arg``'s in-place
+    argv editing.
+    """
+    found = False
+    i = 1
+    while i < len(sys.argv):
+        if sys.argv[i] == '--all':
+            found = True
+            del sys.argv[i]
+        else:
+            i += 1
+    return found
 
 
 def _pop_repo_dir():
@@ -656,20 +684,28 @@ def _commits_root():
     """Commits-mode root = worktree status groups + the ``git log``.
 
     The synthetic worktree-status rows (``_worktree_groups``) are prepended
-    ONLY when no positional rev is in play: a rev roots the log at a
-    historical point, where live working-tree rows would be misleading. A
-    path filter is still honored (passed through to both the groups and the
-    log), so e.g. ``browse-git src/`` shows the working-tree changes under
-    ``src/`` above its commit history.
+    ONLY when the log is the plain HEAD log — no positional rev and no
+    ``--all``, either of which moves the log off HEAD's history, where live
+    working-tree rows would be misleading. A path filter is still honored
+    (passed through to both the groups and the log), so e.g. ``browse-git
+    src/`` shows the working-tree changes under ``src/`` above its commit
+    history.
 
-    The commit portion goes through the ``_log_items`` seam so it honors
-    tree mode (the ``--tree`` graph column) exactly as the ref drill-down
-    does; the synthetic rows are not commits and carry no graph art.
+    ``--all`` (``_all_branches``) appends git log's ``--branches`` selector
+    to the revs, spanning the log over every local branch — equivalent to
+    passing all branch names positionally (and unioned with any explicit
+    rev). The commit portion goes through the ``_log_items`` seam so it
+    honors tree mode (the ``--tree`` graph column) exactly as the ref
+    drill-down does; the synthetic rows are not commits and carry no graph
+    art.
     """
+    revs = list(_revs)
+    if _all_branches:
+        revs.append('--branches')
     items = []
-    if not _revs:
+    if not revs:
         items.extend(_worktree_groups(_paths))
-    items.extend(_log_items(_revs, _paths, ns='root'))
+    items.extend(_log_items(revs, _paths, ns='root'))
     return items
 
 
@@ -1373,7 +1409,7 @@ def toggle_tree(ctx):
 _HELP_INTRO_TMPL = """\
 browse-git — a tig-like browser over a git repository.
 
-Usage: browse-git [<dir>] [-n NUMBER] [--mode NAME] [--no-tree] [<rev>…] [-- <path>…]
+Usage: browse-git [<dir>] [-n NUMBER] [--mode NAME] [--no-tree] [--all] [<rev>…] [-- <path>…]
   <dir>         A leading directory in another git repo browses THAT repo
                 (cwd need not be a repo). A subdir of the current repo
                 stays a pathspec filter instead.
@@ -1382,6 +1418,8 @@ Usage: browse-git [<dir>] [-n NUMBER] [--mode NAME] [--no-tree] [<rev>…] [-- <
   --mode NAME   Start in one of: {modes}. Default: commits.
   --no-tree     Hide git's commit-graph column in the commit log
   --tree        (default on; toggle at runtime with 't').
+  --all         Span the commits log over every local branch, not just
+                HEAD's history (like git log --branches).
   <rev>…        A rev / sha roots the commits log at it (git log <rev>).
   <path>…       A path filters the commits log to commits touching it.
   -- <path>…    Everything after -- is forced to be a pathspec.
@@ -1455,17 +1493,18 @@ def _window_title():
 
     There is no runtime retitle API, so the filter is baked into the
     construction-time title — e.g. ``browse-git [commits: src/ HEAD~5]``.
-    Modes other than ``commits`` don't take a filter, so only the mode is
-    shown for them.
+    ``--all`` shows as the literal ``--all`` token (not the every-branch
+    list it expands to). Modes other than ``commits`` don't take a filter,
+    so only the mode is shown for them.
     """
-    if _mode == 'commits' and (_revs or _paths):
-        filt = ' '.join(_revs + _paths)
-        return f'browse-git [{_mode}: {filt}]'
+    parts = (['--all'] if _all_branches else []) + _revs + _paths
+    if _mode == 'commits' and parts:
+        return f'browse-git [{_mode}: {" ".join(parts)}]'
     return f'browse-git [{_mode}]'
 
 
 def main():
-    global _browser, _log_limit, _mode, _tree_mode
+    global _browser, _log_limit, _mode, _tree_mode, _all_branches
     # git presence + a work tree are preconditions — fail fast before the
     # TUI launches rather than surfacing an in-list error row. Skip the
     # checks when a help token is present so ``--help`` still reaches
@@ -1485,6 +1524,7 @@ def main():
     _log_limit = _pop_limit_arg(_LOG_LIMIT)
     requested_mode = _pop_mode_arg()
     _tree_mode = _pop_tree_arg(_tree_mode)
+    _all_branches = _pop_all_arg()
     _classify_positionals()
     if requested_mode is not None:
         _mode = requested_mode

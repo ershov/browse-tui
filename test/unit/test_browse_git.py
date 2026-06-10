@@ -1280,6 +1280,69 @@ class TestCommitsRootWorktreeScope(unittest.TestCase):
         self.assertEqual(ids, [('wc', 'staged'), ('commit', 'sentinel')])
 
 
+class TestCommitsRootAllBranches(unittest.TestCase):
+    """``--all`` (``_all_branches``) spans the commits log over every branch."""
+
+    def setUp(self):
+        self.r = _load_recipe()
+        # Pin tree mode off so the plain ``_commit_log_items`` seam is the
+        # active builder and the captured revs stay deterministic.
+        self.r._tree_mode = False
+
+    def test_appends_branches_rev_and_suppresses_worktree_rows(self):
+        # With no positional rev, --all spans the log over all local branches
+        # by passing ``--branches`` to git log — and, like passing branch
+        # names positionally, the live worktree rows are suppressed.
+        self.r._revs = []
+        self.r._paths = []
+        self.r._all_branches = True
+        captured = {}
+        sentinel = self.r.Item(id=('commit', 'sentinel'), title='s',
+                               has_children=True)
+
+        def fake_log(revs, paths):
+            captured['revs'] = list(revs)
+            return [sentinel]
+
+        self.r._commit_log_items = fake_log
+        self.r._worktree_status = lambda paths: [('M ', 's.txt')]
+        items = self.r._commits_root()
+        self.assertEqual(captured['revs'], ['--branches'])
+        ids = [getattr(it, 'id', None) for it in items]
+        self.assertEqual(ids, [('commit', 'sentinel')])
+
+    def test_unions_with_positional_revs(self):
+        # An explicit rev plus --all → both reach git log (git log <rev>
+        # --branches), matching ``browse-git <rev> $(git branch …)``.
+        self.r._revs = ['HEAD~3']
+        self.r._paths = []
+        self.r._all_branches = True
+        captured = {}
+
+        def fake_log(revs, paths):
+            captured['revs'] = list(revs)
+            return []
+
+        self.r._commit_log_items = fake_log
+        self.r._commits_root()
+        self.assertEqual(captured['revs'], ['HEAD~3', '--branches'])
+
+    def test_off_by_default_no_branches_rev(self):
+        # Without --all the revs reach git log untouched (no ``--branches``).
+        self.r._revs = []
+        self.r._paths = []
+        captured = {}
+
+        def fake_log(revs, paths):
+            captured['revs'] = list(revs)
+            return []
+
+        self.r._commit_log_items = fake_log
+        self.r._worktree_status = lambda paths: []
+        self.r._commits_root()
+        self.assertEqual(captured['revs'], [])
+
+
 class TestWorktreeFiles(unittest.TestCase):
     """``_worktree_files`` returns one bucket's files as ``status:`` leaves."""
 
@@ -1713,6 +1776,59 @@ class TestPopTreeArg(unittest.TestCase):
         sys.argv = ['browse-git', '--no-tree', '--tree']
         self.assertTrue(self.r._pop_tree_arg(False))
         self.assertEqual(sys.argv, ['browse-git'])
+
+
+class TestPopAllArg(unittest.TestCase):
+    """``_pop_all_arg`` pops ``--all`` and reports whether it was present."""
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self._orig_argv = sys.argv
+
+    def tearDown(self):
+        sys.argv = self._orig_argv
+
+    def test_absent_returns_false_argv_untouched(self):
+        sys.argv = ['browse-git', 'HEAD']
+        self.assertFalse(self.r._pop_all_arg())
+        self.assertEqual(sys.argv, ['browse-git', 'HEAD'])
+
+    def test_all_sets_true_and_pops(self):
+        sys.argv = ['browse-git', '--all', 'HEAD']
+        self.assertTrue(self.r._pop_all_arg())
+        self.assertEqual(sys.argv, ['browse-git', 'HEAD'])
+
+    def test_every_occurrence_popped(self):
+        sys.argv = ['browse-git', '--all', '--all']
+        self.assertTrue(self.r._pop_all_arg())
+        self.assertEqual(sys.argv, ['browse-git'])
+
+
+class TestWindowTitleAll(unittest.TestCase):
+    """``_window_title`` surfaces ``--all`` in the commits-mode title."""
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self.r._mode = 'commits'
+
+    def test_all_branches_shown_as_all(self):
+        self.r._all_branches = True
+        self.r._revs = []
+        self.r._paths = []
+        self.assertEqual(self.r._window_title(), 'browse-git [commits: --all]')
+
+    def test_all_combines_with_paths(self):
+        self.r._all_branches = True
+        self.r._revs = []
+        self.r._paths = ['src/']
+        self.assertEqual(self.r._window_title(),
+                         'browse-git [commits: --all src/]')
+
+    def test_no_all_unchanged(self):
+        self.r._all_branches = False
+        self.r._revs = ['HEAD']
+        self.r._paths = []
+        self.assertEqual(self.r._window_title(), 'browse-git [commits: HEAD]')
 
 
 class TestToggleTree(unittest.TestCase):
