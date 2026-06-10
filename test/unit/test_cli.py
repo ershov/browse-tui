@@ -1056,9 +1056,6 @@ class TestTerminalColsForAuto(unittest.TestCase):
         # value so the fallback is the only return path. Patches:
         #   * ``builtins.open`` so /dev/tty (used by both the ioctl
         #     probe and the stty fallback) raises OSError;
-        #   * ``os.get_terminal_size`` so all three fd-keyed probes
-        #     raise (and shutil's internal call falls back to its
-        #     default 80,24);
         #   * ``shutil.get_terminal_size`` so its 80-fallback doesn't
         #     swallow the chain;
         #   * ``subprocess.run`` so the stty probe never spawns a real
@@ -1079,23 +1076,24 @@ class TestTerminalColsForAuto(unittest.TestCase):
             raise OSError('no stty in test')
 
         with mock.patch('builtins.open', side_effect=fake_open), \
-             mock.patch.object(_cli.os, 'get_terminal_size',
-                               side_effect=fake_size), \
              mock.patch.object(_cli.shutil, 'get_terminal_size',
                                side_effect=fake_size), \
              mock.patch.object(_cli.subprocess, 'run',
                                side_effect=fake_run):
             self.assertEqual(_cli._terminal_cols_for_auto(default=42), 42)
 
-    def test_falls_back_through_chain_when_tty_ioctl_fails(self):
-        """When /dev/tty ioctl fails, falls through to fd-based probes.
+    def test_default_mode_does_not_probe_std_fds(self):
+        """In /dev/tty mode, a failed device ioctl never falls to the std fds.
 
-        Regression for ticket #167: in some environments /dev/tty
-        returns 0 cols or fails, and the previous fallback was just
-        ``os.get_terminal_size()`` (default fd=stdout). If stdout was
-        piped that also failed, dropping to default=80 → narrow split
-        even on a wide terminal. The detector must keep searching:
-        try stdin/stderr fds, then shutil, then stty.
+        The terminal device is a deliberate choice (spec §1.4), not
+        "whichever std fd is a tty" — so when the /dev/tty ioctl fails,
+        resolution drops to shutil / stty / default, NOT to
+        ``os.get_terminal_size`` on fd 0/1/2. (Pre-#830 this DID probe
+        the std fds; that std-fd-first fallback is intentionally gone so
+        the chosen width tracks the real UI device, not a piped
+        stdout/stderr.) Here every fallback is forced to fail, so a std-fd
+        probe — if it still existed and the runner's fds were a tty —
+        would be the only way to beat the default; we assert it doesn't.
         """
         import builtins
         from unittest import mock
@@ -1106,21 +1104,58 @@ class TestTerminalColsForAuto(unittest.TestCase):
                 raise OSError('no tty in test')
             return real_open(path, *a, **kw)
 
-        # Make stdout (fd=1) fail but stderr (fd=2) succeed. This
-        # simulates ``browse-tui … | tee out.log`` on a wide terminal:
-        # stdout is a pipe, but stderr still points at the tty.
         from collections import namedtuple
         Size = namedtuple('Size', ('columns', 'lines'))
 
+        # If the function still probed the std fds, fd 2 would yield 242
+        # and win. The new policy ignores the std fds in /dev/tty mode.
         def fake_size(fd=1):
             if fd == 2:
+                return Size(242, 40)
+            raise OSError(f'fd {fd} not a tty')
+
+        def fake_run(*_a, **_kw):
+            raise OSError('no stty in test')
+
+        with mock.patch('builtins.open', side_effect=fake_open), \
+             mock.patch.object(_cli.os, 'get_terminal_size',
+                               side_effect=fake_size), \
+             mock.patch.object(_cli.shutil, 'get_terminal_size',
+                               side_effect=fake_size), \
+             mock.patch.object(_cli.subprocess, 'run',
+                               side_effect=fake_run):
+            self.assertEqual(_cli._terminal_cols_for_auto(default=80), 80)
+
+    def test_tty_dash_probes_std_fds(self):
+        """``--tty -`` mode probes the std fds (the UI rides on them).
+
+        With ``tty_path='-'`` the terminal device *is* the process std
+        streams, so width comes from ``os.get_terminal_size`` on fd 0
+        then fd 1 — never opening /dev/tty.
+        """
+        import builtins
+        from unittest import mock
+        real_open = builtins.open
+
+        def fake_open(path, *a, **kw):
+            if path == '/dev/tty':
+                raise AssertionError('--tty - must not open /dev/tty')
+            return real_open(path, *a, **kw)
+
+        from collections import namedtuple
+        Size = namedtuple('Size', ('columns', 'lines'))
+
+        # fd 0 (stdin) is a pipe; fd 1 (stdout) is the pty → 242 cols.
+        def fake_size(fd=1):
+            if fd == 1:
                 return Size(242, 40)
             raise OSError(f'fd {fd} not a tty')
 
         with mock.patch('builtins.open', side_effect=fake_open), \
              mock.patch.object(_cli.os, 'get_terminal_size',
                                side_effect=fake_size):
-            self.assertEqual(_cli._terminal_cols_for_auto(default=80), 242)
+            self.assertEqual(
+                _cli._terminal_cols_for_auto('-', default=80), 242)
 
 
 if __name__ == '__main__':

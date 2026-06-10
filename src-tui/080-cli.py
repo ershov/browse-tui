@@ -508,6 +508,14 @@ def build_argparser() -> argparse.ArgumentParser:
                         'picks vertical if terminal is at least 230 '
                         'columns wide, else horizontal. Resolved at '
                         'startup; not auto-recomputed on resize.')
+    p.add_argument('--tty', metavar='TTY_PATH', default='/dev/tty',
+                   help='Terminal device for the UI. The UI is painted '
+                        'to, and keys are read from, this device while '
+                        'stdin/stdout stay free for content/results, so '
+                        'a command substitution captures only the '
+                        'selection. Default /dev/tty. The sentinel - '
+                        'runs the UI over the process std streams '
+                        '(fd 0/1), which must be a terminal.')
     p.add_argument('--show-ids', metavar='MODE', default='auto',
                    choices=('always', 'auto', 'never'),
                    help='Whether to render the per-row id before the '
@@ -1213,28 +1221,6 @@ def cmd_run(script: str, mode: str, extras: list,
 # ---- TUI mode -------------------------------------------------------------
 
 
-def _reopen_stdin_from_tty():
-    """Replace ``sys.stdin`` with /dev/tty so the TUI can read keystrokes.
-
-    Called after ``--root-cmd cat`` has consumed the original stdin (a
-    pipe in the common case — ``printf '…' | browse-tui --root-cmd
-    cat``). Without this, ``read_key`` would see EOF immediately and the
-    UI would exit. If /dev/tty isn't openable (e.g. running detached) we
-    leave sys.stdin alone — the TUI then exits cleanly via EOF→esc.
-    """
-    try:
-        tty_in = open('/dev/tty', 'rb', buffering=0)
-    except OSError:
-        return
-    try:
-        os.dup2(tty_in.fileno(), 0)
-    finally:
-        tty_in.close()
-    # Refresh sys.stdin to point at the new fd 0 — the io stack caches
-    # the previous file descriptor in sys.stdin.buffer.
-    sys.stdin = os.fdopen(0, 'r', buffering=1)
-
-
 def _resolve_list_size(spec, default=0.30):
     """Resolve a ``--list-size`` spec to a list-pane ratio (float in (0, 1)).
 
@@ -1307,30 +1293,39 @@ _SPLIT_ALIASES = {
 }
 
 
-def _terminal_cols_for_auto(default=80):
+def _terminal_cols_for_auto(tty_path=None, default=80):
     """Best-effort terminal width for ``--split-type=auto`` resolution.
+
+    Runs *before* ``term_init`` (auto must be resolved before the
+    terminal device is opened), so it probes the same device ``--tty``
+    will resolve to (§3.5) rather than guessing from the std streams.
+    ``tty_path`` is the resolved ``--tty`` value: ``None`` / ``/dev/tty``
+    / a device path mean "probe that terminal device"; the sentinel
+    ``'-'`` means "the UI rides on the std streams, so probe fd 0/1".
 
     Order of attempts (each is checked for ``cols > 0`` before being
     accepted — a zero return from the OS is as good as a failure):
 
-    1. ``/dev/tty`` via ``TIOCGWINSZ`` — works even when stdin AND
-       stdout are both pipes (e.g.
+    1. The resolved terminal device via ``TIOCGWINSZ`` — for the
+       ``/dev/tty`` default (or an explicit path) this works even when
+       stdin AND stdout are pipes (e.g.
        ``printf … | browse-tui --root-cmd cat | cat``), because the
-       controlling terminal is independent of the standard streams.
-       This is the only source that reliably reflects the real
-       interactive terminal in piped scenarios.
-    2. Each of the three standard fds (stdin, stdout, stderr) via
-       ``os.get_terminal_size(fd)`` — covers cases where /dev/tty
-       isn't openable but at least one std stream is still a TTY
-       (e.g. some sandboxed / containerised environments where
-       /dev/tty is restricted).
-    3. ``shutil.get_terminal_size()`` — honours ``$COLUMNS`` /
-       ``$LINES`` and runs its own fd-fallback chain.
-    4. ``stty size`` via subprocess against ``/dev/tty`` — last-resort
-       external probe; some restricted environments expose tty info
-       via stty even when ioctl is filtered.
-    5. ``default`` (80) — last resort. Auto then resolves to
+       terminal is independent of the std streams. For ``--tty -`` the
+       device *is* the std streams, so this probes fd 0 then fd 1.
+    2. ``shutil.get_terminal_size()`` — honours an explicit
+       ``$COLUMNS`` / ``$LINES`` override and runs its own fallback
+       chain.
+    3. ``stty size`` via subprocess against the resolved device —
+       last-resort external probe; some restricted environments expose
+       tty info via stty even when ioctl is filtered.
+    4. ``default`` (80) — last resort. Auto then resolves to
        horizontal, which is the safer choice for a narrow display.
+
+    Deliberately does *not* fall back to probing the std fds in the
+    ``/dev/tty`` / path modes: the UI device is a deliberate choice, not
+    "whichever std fd happens to be a tty" (§1.4). When ``/dev/tty`` is
+    unopenable there is no terminal, and ``term_init`` will surface a
+    clean error moments later.
 
     Set ``BROWSE_TUI_DEBUG_AUTO=1`` in the environment to print a
     one-line trace of which probes succeeded / failed (and the value
@@ -1341,6 +1336,8 @@ def _terminal_cols_for_auto(default=80):
     user can override with ``--split-type=v`` (or cycle with ``\\``)
     at runtime.
     """
+    std_streams = tty_path == '-'
+    device = '/dev/tty' if tty_path in (None, '-') else tty_path
     debug = os.environ.get('BROWSE_TUI_DEBUG_AUTO') == '1'
     trace = [] if debug else None
 
@@ -1351,63 +1348,53 @@ def _terminal_cols_for_auto(default=80):
             else:
                 trace.append(f'{source}={value}')
 
-    # 1. /dev/tty via TIOCGWINSZ (most reliable in piped scenarios).
-    try:
-        import fcntl
-        import struct
-        import termios
-        with open('/dev/tty', 'rb') as f:
-            buf = fcntl.ioctl(f.fileno(), termios.TIOCGWINSZ, b'\0' * 8)
-            _rows, cols, _, _ = struct.unpack('HHHH', buf)
-            _record('tty_ioctl', cols)
-            if cols > 0:
-                if debug:
-                    sys.stderr.write(
-                        f'[browse-tui auto] {" ".join(trace)} -> {cols}\n'
-                    )
-                return cols
-    except Exception as e:
-        _record('tty_ioctl', None, err=e)
+    def _emit(cols):
+        if debug:
+            sys.stderr.write(f'[browse-tui auto] {" ".join(trace)} -> {cols}\n')
+        return cols
 
-    # 2. os.get_terminal_size on each std fd. The default fd is 1
-    # (stdout); if stdout is piped it raises OSError or returns 0.
-    # Try each std fd in turn so we still get a useful answer when
-    # only one of them is a TTY.
-    for fd, name in ((0, 'stdin'), (1, 'stdout'), (2, 'stderr')):
+    # 1. The resolved terminal device. In --tty - mode the device is the
+    # std streams, so query fd 0 then fd 1 directly; otherwise open the
+    # device path (/dev/tty or an explicit --tty) and ask via ioctl.
+    if std_streams:
+        for fd, name in ((0, 'stdin'), (1, 'stdout')):
+            try:
+                size = os.get_terminal_size(fd)
+                _record(f'os_termsize_{name}', size.columns)
+                if size.columns > 0:
+                    return _emit(size.columns)
+            except OSError as e:
+                _record(f'os_termsize_{name}', None, err=e)
+    else:
         try:
-            size = os.get_terminal_size(fd)
-            _record(f'os_termsize_{name}', size.columns)
-            if size.columns > 0:
-                if debug:
-                    sys.stderr.write(
-                        f'[browse-tui auto] {" ".join(trace)} -> '
-                        f'{size.columns}\n'
-                    )
-                return size.columns
-        except OSError as e:
-            _record(f'os_termsize_{name}', None, err=e)
+            import fcntl
+            import struct
+            import termios
+            with open(device, 'rb') as f:
+                buf = fcntl.ioctl(f.fileno(), termios.TIOCGWINSZ, b'\0' * 8)
+                _rows, cols, _, _ = struct.unpack('HHHH', buf)
+                _record('tty_ioctl', cols)
+                if cols > 0:
+                    return _emit(cols)
+        except Exception as e:
+            _record('tty_ioctl', None, err=e)
 
-    # 3. shutil.get_terminal_size — honours $COLUMNS, has its own
+    # 2. shutil.get_terminal_size — honours $COLUMNS, has its own
     # fallback chain. Returns the fallback (default 80,24) rather
     # than raising, so accept its answer only if it looks plausible.
     try:
         size = shutil.get_terminal_size()
         _record('shutil_termsize', size.columns)
         if size.columns > 0:
-            if debug:
-                sys.stderr.write(
-                    f'[browse-tui auto] {" ".join(trace)} -> '
-                    f'{size.columns}\n'
-                )
-            return size.columns
+            return _emit(size.columns)
     except Exception as e:
         _record('shutil_termsize', None, err=e)
 
-    # 4. stty size — external probe against /dev/tty. Spawning a
-    # subprocess is expensive, but this only runs once at startup and
-    # only when the cheaper probes have all failed.
+    # 3. stty size — external probe against the resolved device.
+    # Spawning a subprocess is expensive, but this only runs once at
+    # startup and only when the cheaper probes have all failed.
     try:
-        with open('/dev/tty', 'rb') as tty_in:
+        with open(device, 'rb') as tty_in:
             proc = subprocess.run(
                 ['stty', 'size'],
                 stdin=tty_in,
@@ -1421,12 +1408,7 @@ def _terminal_cols_for_auto(default=80):
                 cols = int(parts[1])
                 _record('stty_size', cols)
                 if cols > 0:
-                    if debug:
-                        sys.stderr.write(
-                            f'[browse-tui auto] {" ".join(trace)} -> '
-                            f'{cols}\n'
-                        )
-                    return cols
+                    return _emit(cols)
         else:
             _record('stty_size', None, err=RuntimeError(
                 f'rc={proc.returncode}'))
@@ -1560,11 +1542,11 @@ def _build_eager_browser(args, fields, record_sep, *, split='h'):
     """
     if args.root_cmd == 'cat':
         data = sys.stdin.buffer.read()
-        # The TUI's read_key reads from sys.stdin; if stdin was a pipe
-        # (the common case — ``printf '...' | browse-tui --root-cmd cat``)
-        # it's now closed, which would make read_key return EOF
-        # immediately. Reopen stdin from /dev/tty so keystrokes work.
-        _reopen_stdin_from_tty()
+        # The UI reads keys from the terminal device (``--tty``, default
+        # /dev/tty), not from sys.stdin — so consuming the piped stdin
+        # here (the common case, ``printf '…' | browse-tui --root-cmd
+        # cat``) leaves fd 0 alone and the keyboard still works. No
+        # stdin reopen is needed (and none happens).
     else:
         try:
             proc = subprocess.run(
@@ -1638,8 +1620,12 @@ def run_tui(args):
 
     # Resolve --split-type once at startup. Width is read here (not in
     # the builders) so the auto threshold is evaluated against the
-    # actual launching terminal; later resizes don't re-pick.
-    cols = _terminal_cols_for_auto()
+    # actual launching terminal; later resizes don't re-pick. The width
+    # is probed from the resolved --tty device (default /dev/tty), the
+    # same device the UI will paint to — not from the std streams,
+    # which may be pipes carrying content/results.
+    tty_path = getattr(args, 'tty', None)
+    cols = _terminal_cols_for_auto(tty_path)
     try:
         split = _resolve_split_type(getattr(args, 'split_type', None), cols)
     except ValueError as e:
@@ -1683,6 +1669,12 @@ def run_tui(args):
             sys.stderr.write(f'error: {e}\n')
             return 2
 
+    # ``Browser.run`` opens the terminal via ``term_init`` (default
+    # /dev/tty). When no controlling terminal is available ``term_init``
+    # raises a clean ``SystemExit`` (``browse-tui: no controlling
+    # terminal; pass --tty - to run over stdin/stdout``) — printed to
+    # stderr, non-zero exit, no traceback. We deliberately do NOT wrap
+    # this: SystemExit must propagate out of ``main`` untouched.
     return b.run()
 
 
