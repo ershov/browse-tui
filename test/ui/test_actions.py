@@ -125,6 +125,53 @@ class TestActions(unittest.TestCase):
                              'escape bytes contaminated the captured stdout')
             self.assertEqual(captured, 'a\n')
 
+    def test_navigated_selection_is_the_only_thing_on_stdout(self):
+        """Result-capture separation: the *chosen* row lands cleanly on stdout.
+
+        The terminal-separation contract (spec §5): the UI paints to the
+        terminal device while stdout carries only the print-exit result,
+        so a command substitution captures exactly the selection. The
+        sibling #832 test proves this for the *default* row (``a``); this
+        one navigates first (``j`` → cursor on ``b``) and presses Enter,
+        proving the captured stdout is the *navigated* value (``b\\n``) —
+        not a hardcoded first-row capture — with zero escape bytes from
+        the alt-screen UI.
+
+        Driven over a pty (tmux) with the binary's stdout redirected to a
+        file: the live TUI renders to the pane while the file accumulates
+        only the result. Regression shapes this would catch: the UI
+        bytes bleeding into stdout (would add ``\\x1b``), or the wrong row
+        being emitted (would fail the ``b\\n`` equality).
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            cap = os.path.join(tmp, 'stdout.txt')
+            with TmuxFixture(cols=80, rows=24) as t:
+                t.launch('bash', '-c',
+                         f"printf 'a\\nb\\n' | "
+                         f"{_BIN} --show-ids always --root-cmd cat > {cap}")
+                # Both rows must be present before we navigate, else the
+                # ``j`` could land before ``b`` exists in the list.
+                t.wait_for('a a')
+                t.wait_for('b b')
+                t.wait_stable()
+                t.send('j')          # cursor: a → b
+                t.wait_stable()
+                t.send('Enter')      # print-exit emits the cursor's id
+                # Poll the captured stdout until the result lands.
+                deadline = time.time() + 3.0
+                captured = ''
+                while time.time() < deadline:
+                    if os.path.exists(cap):
+                        with open(cap) as f:
+                            captured = f.read()
+                        if captured.strip():
+                            break
+                    time.sleep(0.03)
+            # The navigated selection — and only that — reached stdout.
+            self.assertEqual(captured, 'b\n')
+            self.assertNotIn('\x1b', captured,
+                             'escape bytes contaminated the captured stdout')
+
     def test_tty_dash_page_degrade_is_non_corrupting(self):
         """The ``--tty -`` page degrade emits text without corrupting the TUI.
 
