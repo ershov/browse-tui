@@ -27,6 +27,49 @@ mode. In recipe mode, no other browse-tui flags are accepted.
 
 ---
 
+## Contents
+
+- [Data sources](#data-sources)
+  - [`-c, --children-cmd CMD`](#-c---children-cmd-cmd)
+  - [`--root-id ID`](#--root-id-id)
+  - [`-p, --preview-cmd CMD`](#-p---preview-cmd-cmd)
+  - [`--root-cmd CMD`](#--root-cmd-cmd)
+- [Input formats](#input-formats)
+  - [Bare formats](#bare-formats)
+  - [Prefix formats (parameterised)](#prefix-formats-parameterised)
+  - [Fields](#fields)
+  - [Record separator](#record-separator)
+  - [Path separator](#path-separator)
+  - [Worked examples per format](#worked-examples-per-format)
+  - [Coercion](#coercion)
+- [Actions](#actions)
+  - [`-a, --action 'KEY:LABEL:CMD'`](#-a---action-keylabelcmd)
+  - [`--action-timeout SECS`](#--action-timeout-secs)
+  - [`--on-enter MODE`](#--on-enter-mode)
+  - [`--print-format FMT`](#--print-format-fmt)
+- [Layout / display](#layout--display)
+  - [Layouts](#layouts)
+- [Install / uninstall](#install--uninstall)
+- [Recipe mode](#recipe-mode)
+  - [Auto-detection rules (`--run` and bare positional)](#auto-detection-rules---run-and-bare-positional)
+  - [Python recipes (`--run-py`)](#python-recipes---run-py)
+  - [Binary recipes (`--run-cli`)](#binary-recipes---run-cli)
+  - [Shebang trick](#shebang-trick)
+- [Plugins](#plugins)
+- [Default keybindings](#default-keybindings)
+- [Environment variables](#environment-variables)
+- [Debug / ops](#debug--ops)
+- [Worked examples](#worked-examples)
+  - [1. fzf-style flat selector](#1-fzf-style-flat-selector)
+  - [2. Filesystem tree (lazy)](#2-filesystem-tree-lazy)
+  - [3. /etc/passwd browser (eager, IFS-split)](#3-etcpasswd-browser-eager-ifs-split)
+  - [4. find with NUL safety](#4-find-with-nul-safety)
+  - [5. ls -l with named-regex](#5-ls--l-with-named-regex)
+  - [6. Run a recipe directly](#6-run-a-recipe-directly)
+  - [7. Install to ~/.local/bin](#7-install-to-localbin)
+  - [8. Action that re-invokes browse-tui (recursive)](#8-action-that-re-invokes-browse-tui-recursive)
+- [See also](#see-also)
+
 ## Data sources
 
 ### `-c, --children-cmd CMD`

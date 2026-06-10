@@ -19,6 +19,53 @@ see [recipes.md](recipes.md); for the CLI surface see
 
 ---
 
+## Contents
+
+- [`Item`](#item)
+  - [Title fallback](#title-fallback)
+  - [Example](#example)
+  - [Coercion: `to_item(x)`](#coercion-to_itemx)
+- [`Action`](#action)
+  - [`requires` gating](#requires-gating)
+  - [Example](#example-1)
+  - [Key names](#key-names)
+- [`Context`](#context)
+  - [Selection helpers](#selection-helpers)
+  - [Thread-safe ops (pass-through to Browser)](#thread-safe-ops-pass-through-to-browser)
+  - [Cache introspection](#cache-introspection)
+  - [Push-API pass-throughs](#push-api-pass-throughs)
+  - [Worker supersede: `ctx.run_in_slot(name, fn)`](#worker-supersede-ctxrun_in_slotname-fn)
+  - [Escape hatches (advanced; unstable surface)](#escape-hatches-advanced-unstable-surface)
+  - [Main-thread sub-flows](#main-thread-sub-flows)
+- [`Browser`](#browser)
+  - [Constructor](#constructor)
+  - [Lifecycle hooks](#lifecycle-hooks)
+  - [Callbacks](#callbacks)
+  - [Lifecycle](#lifecycle)
+  - [Thread-safe public ops](#thread-safe-public-ops)
+- [Plugin system](#plugin-system)
+  - [`BrowserConfig`](#browserconfig)
+  - [`PluginConfig`](#pluginconfig)
+  - [`register_plugin(cfg)` and `registered_plugins`](#register_plugincfg-and-registered_plugins)
+  - [Lifecycle hooks](#lifecycle-hooks-1)
+  - [Hooking patterns](#hooking-patterns)
+  - [`--plugin` CLI flag](#--plugin-cli-flag)
+  - [Module discovery (`sys.path`)](#module-discovery-syspath)
+- [`Pending`](#pending)
+  - [`then(cb)`](#thencb)
+  - [`cancel()`](#cancel)
+  - [Three usage styles](#three-usage-styles)
+- [Helper functions](#helper-functions)
+  - [Op constructors for `update_data`](#op-constructors-for-update_data)
+  - [`to_item(x) -> Item`](#to_itemx---item)
+  - [`parse_input(data, *, fmt, fields=None, record_sep=b'\n', strict=False)`](#parse_inputdata--fmt-fieldsnone-record_sepbn-strictfalse)
+  - [`coerce_has_children(raw) -> bool`](#coerce_has_childrenraw---bool)
+  - [Cell-accurate string helpers](#cell-accurate-string-helpers)
+  - [Styles](#styles)
+  - [Module exports](#module-exports)
+- [Putting it together](#putting-it-together)
+- [See also](#see-also)
+
 ## `Item`
 
 The basic record type — one node in the hierarchy.
