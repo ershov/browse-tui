@@ -219,11 +219,37 @@ class TestColorizeDiff(unittest.TestCase):
             '\x1b[32m+new\x1b[m\n'
         )
 
+    def _capture_run(self, width):
+        """Run ``_colorize_diff`` with delta forced on at preview ``width``.
+
+        Swaps the recipe module's ``subprocess`` for a fake that records
+        the delta argv (never spawning a real process) and ``_browser``
+        for a stub reporting ``width``; returns the captured argv list.
+        """
+        self.r.HAVE_DELTA = '/usr/bin/delta'
+        self.r._browser = types.SimpleNamespace(preview_width=width)
+        captured = []
+
+        def fake_run(cmd, **kw):
+            captured.append(cmd)
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout='\x1b[34mrendered\x1b[0m\n', stderr='')
+
+        self.r.subprocess = types.SimpleNamespace(
+            run=fake_run, CompletedProcess=subprocess.CompletedProcess)
+        self.r._colorize_diff(self.colored)
+        self.assertEqual(len(captured), 1)
+        return captured[0]
+
     def test_fallback_path_returns_colored_text(self):
-        # Force the no-delta branch by swapping the recipe module's
-        # ``shutil`` so which() reports delta absent (a fake namespace,
-        # not the shared module, so the patch can't leak).
-        self.r.shutil = types.SimpleNamespace(which=lambda name: None)
+        # Force the no-delta branch by clearing the module-level
+        # ``HAVE_DELTA`` probe (resolved once at load); the helper now
+        # gates on it, not a per-render ``shutil.which`` call.
+        self.r.HAVE_DELTA = None
+        # A subprocess that would explode if the no-delta branch ever
+        # spawned — proving it spawns nothing.
+        self.r.subprocess = types.SimpleNamespace(
+            run=lambda *a, **k: self.fail('no-delta path must not spawn'))
         out = self.r._colorize_diff(self.colored)
         self.assertIn('\x1b[', out)
         # Fallback returns the caller's already-colored text unchanged.
@@ -232,18 +258,18 @@ class TestColorizeDiff(unittest.TestCase):
     def test_delta_path_returns_ansi(self):
         if shutil.which('delta') is None:
             self.skipTest('delta not on PATH')
-        # Real which() finds delta; the helper pipes through it. The fresh
-        # recipe module references the genuine ``subprocess`` module, so
-        # this exercises the real delta binary end to end.
+        # ``HAVE_DELTA`` is truthy at load (delta on PATH); the helper
+        # pipes through the genuine ``subprocess`` module, exercising the
+        # real delta binary end to end.
         out = self.r._colorize_diff(self.colored)
         self.assertIn('\x1b[', out)
 
     def test_delta_path_monkeypatched(self):
         # Prove the delta branch produces ANSI-bearing text without
-        # depending on a delta install: swap which() + a fake subprocess
-        # namespace on the recipe module only (never the shared
-        # ``subprocess`` module, which would leak into other tests).
-        self.r.shutil = types.SimpleNamespace(which=lambda name: '/usr/bin/delta')
+        # depending on a delta install: force ``HAVE_DELTA`` truthy + a
+        # fake subprocess namespace on the recipe module only (never the
+        # shared ``subprocess`` module, which would leak into other tests).
+        self.r.HAVE_DELTA = '/usr/bin/delta'
 
         def fake_run(cmd, **kw):
             self.assertEqual(cmd[0], 'delta')
@@ -256,6 +282,141 @@ class TestColorizeDiff(unittest.TestCase):
         out = self.r._colorize_diff(self.colored)
         self.assertIn('\x1b[', out)
         self.assertIn('rendered', out)
+
+    # --- side-by-side gating (>=160) -------------------------------------
+    # delta renders two-column at a wide preview; the recipe appends
+    # ``--side-by-side`` + ``--line-fill-method=spaces`` iff width >= 160.
+    # ``--width <width>`` is passed in BOTH modes (delta splits it into two
+    # columns for side-by-side), so it must always be present and the only
+    # difference across the threshold is the two extra flags.
+
+    _SBS_FLAGS = ('--side-by-side', '--line-fill-method=spaces')
+
+    def test_below_threshold_is_unified_no_sbs_flags(self):
+        # 159 < 160 → unified: neither side-by-side flag, width still passed.
+        argv = self._capture_run(159)
+        for flag in self._SBS_FLAGS:
+            self.assertNotIn(flag, argv)
+        self.assertIn('--width', argv)
+        self.assertEqual(argv[argv.index('--width') + 1], '159')
+
+    def test_at_threshold_adds_side_by_side_flags(self):
+        # 160 is the inclusive boundary → side-by-side on.
+        argv = self._capture_run(160)
+        for flag in self._SBS_FLAGS:
+            self.assertIn(flag, argv)
+        self.assertIn('--width', argv)
+        self.assertEqual(argv[argv.index('--width') + 1], '160')
+
+    def test_wide_adds_side_by_side_flags(self):
+        # Comfortably wide → side-by-side on; width passed once (delta
+        # splits it), not doubled.
+        argv = self._capture_run(200)
+        for flag in self._SBS_FLAGS:
+            self.assertIn(flag, argv)
+        self.assertEqual(argv.count('--width'), 1)
+        self.assertEqual(argv[argv.index('--width') + 1], '200')
+
+
+class _ResizeCtx:
+    """A ``RowContext`` stand-in for ``_on_resize``.
+
+    ``preview_width`` is set by the test before each fire; every
+    ``drop_preview_cache`` is counted so a test can assert how many fires
+    dropped the cache.
+    """
+
+    def __init__(self):
+        self.preview_width = 0
+        self.drops = 0
+
+    def drop_preview_cache(self):
+        self.drops += 1
+
+
+class TestOnResize(unittest.TestCase):
+    """``_on_resize`` drops the preview cache only when a width change
+    flips delta's layout (side-by-side is/was active and the width moved).
+
+    The handler keeps a module-level ``_prev_pw`` baseline and fires from
+    the run loop (main thread). Each case resets that baseline and pins
+    ``HAVE_DELTA`` on the recipe module so the matrix is deterministic.
+    """
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self.r._prev_pw = None
+
+    def _fire(self, ctx, width):
+        """Drive one ``on_resize`` fire at preview ``width``; return drops."""
+        ctx.preview_width = width
+        before = ctx.drops
+        self.r._on_resize(ctx, 0, 0)  # cols/rows unused by the handler
+        return ctx.drops - before
+
+    def test_first_fire_sets_baseline_no_drop(self):
+        # prev is None on the first fire → baseline only, never a drop,
+        # and ``_prev_pw`` advances to the seen width.
+        self.r.HAVE_DELTA = '/usr/bin/delta'
+        ctx = _ResizeCtx()
+        self.assertEqual(self._fire(ctx, 170), 0)
+        self.assertEqual(self.r._prev_pw, 170)
+
+    def test_same_width_does_not_drop(self):
+        # Height-only resizes re-fire at an unchanged width → no drop even
+        # well above the threshold; baseline still tracks the width.
+        self.r.HAVE_DELTA = '/usr/bin/delta'
+        ctx = _ResizeCtx()
+        self._fire(ctx, 200)            # baseline
+        self.assertEqual(self._fire(ctx, 200), 0)
+        self.assertEqual(self.r._prev_pw, 200)
+
+    def test_both_below_threshold_does_not_drop(self):
+        # A width change that stays entirely unified (both < 160) does not
+        # change delta's layout → no drop.
+        self.r.HAVE_DELTA = '/usr/bin/delta'
+        ctx = _ResizeCtx()
+        self._fire(ctx, 100)            # baseline
+        self.assertEqual(self._fire(ctx, 120), 0)
+        self.assertEqual(self.r._prev_pw, 120)
+
+    def test_cross_up_drops(self):
+        # 150 → 170 crosses 160 upward (unified → side-by-side) → drop.
+        self.r.HAVE_DELTA = '/usr/bin/delta'
+        ctx = _ResizeCtx()
+        self._fire(ctx, 150)            # baseline
+        self.assertEqual(self._fire(ctx, 170), 1)
+        self.assertEqual(self.r._prev_pw, 170)
+
+    def test_cross_down_drops(self):
+        # 170 → 150 crosses 160 downward (side-by-side → unified) → drop.
+        self.r.HAVE_DELTA = '/usr/bin/delta'
+        ctx = _ResizeCtx()
+        self._fire(ctx, 170)            # baseline
+        self.assertEqual(self._fire(ctx, 150), 1)
+        self.assertEqual(self.r._prev_pw, 150)
+
+    def test_wider_both_above_threshold_drops(self):
+        # 170 → 200 stays side-by-side but the column widths change → drop.
+        self.r.HAVE_DELTA = '/usr/bin/delta'
+        ctx = _ResizeCtx()
+        self._fire(ctx, 170)            # baseline
+        self.assertEqual(self._fire(ctx, 200), 1)
+        self.assertEqual(self.r._prev_pw, 200)
+
+    def test_no_delta_never_drops(self):
+        # With delta absent the diff text never depends on width, so no
+        # width change drops — across the full matrix — yet the baseline
+        # still advances each fire.
+        self.r.HAVE_DELTA = None
+        ctx = _ResizeCtx()
+        self.assertEqual(self._fire(ctx, 170), 0)   # first fire
+        self.assertEqual(self._fire(ctx, 170), 0)   # same width
+        self.assertEqual(self._fire(ctx, 120), 0)   # both <160 (170→120)
+        self.assertEqual(self._fire(ctx, 200), 0)   # cross-up 120→200
+        self.assertEqual(self._fire(ctx, 150), 0)   # cross-down 200→150
+        self.assertEqual(self._fire(ctx, 100), 0)   # wider/both moot
+        self.assertEqual(self.r._prev_pw, 100)
 
 
 class TestDispatchRoundTrip(unittest.TestCase):

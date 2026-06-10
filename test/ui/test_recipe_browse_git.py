@@ -583,6 +583,124 @@ class TestBrowseGit(unittest.TestCase):
                 t.send('q')
 
 
+def _make_repo_with_context_diff(tmpdir):
+    """Init a repo whose newest commit's diff carries UNCHANGED context.
+
+    A multi-line file (committed, then one line changed) so the file
+    diff has context lines (``alpha`` / ``gamma`` / …) that stay put.
+    delta renders those unchanged lines once per row in unified mode but
+    TWICE (old + new column) in side-by-side — the marker the wide-pane
+    tests key on. Mirrors ``_make_repo``'s git-env + local user setup;
+    returns the repo directory.
+    """
+    env = {
+        **os.environ,
+        'GIT_AUTHOR_NAME': 'Test', 'GIT_AUTHOR_EMAIL': 'test@example.com',
+        'GIT_COMMITTER_NAME': 'Test', 'GIT_COMMITTER_EMAIL': 'test@example.com',
+    }
+    def git(*args):
+        subprocess.run(['git', '-C', tmpdir, *args], check=True,
+                       capture_output=True, env=env)
+    git('init', '-q', '-b', 'main')
+    git('config', 'user.name', 'Test')
+    git('config', 'user.email', 'test@example.com')
+    path = os.path.join(tmpdir, 'ctx.txt')
+    with open(path, 'w') as f:
+        f.write('alpha\nbeta\ngamma\ndelta\nepsilon\n')
+    git('add', 'ctx.txt')
+    git('commit', '-q', '-m', 'first add ctx')
+    with open(path, 'w') as f:
+        f.write('alpha\nBETA-changed\ngamma\ndelta\nepsilon\n')
+    git('add', 'ctx.txt')
+    git('commit', '-q', '-m', 'second change beta line')
+    return tmpdir
+
+
+@unittest.skipUnless(shutil.which('delta'), 'delta not on PATH')
+class TestBrowseGitSideBySide(unittest.TestCase):
+    """Wide-pane delta diffs render side-by-side, and a resize across the
+    160-col threshold re-renders with no keypress (ticket #838).
+
+    In the default 'h' split the preview pane spans the full terminal
+    width, so ``preview_width == cols``: a 120-col terminal is unified,
+    a 170-col terminal is side-by-side. The marker is delta's column
+    duplication — an UNCHANGED context line (``alpha``) appears once per
+    row in unified output but twice (old + new column) side-by-side.
+    """
+
+    @staticmethod
+    def _sbs_rows(cap):
+        """How many captured rows carry ``alpha`` twice (both columns)."""
+        return sum(1 for ln in cap.splitlines() if ln.count('alpha') >= 2)
+
+    def _wait_sbs(self, t, want, timeout=4.0):
+        """Poll until the diff is painted with ``want`` side-by-side rows.
+
+        The re-render is async (``on_resize`` drops the cache, the
+        framework refetches the cursor preview a frame later), so we poll
+        rather than snapshot. We require ``alpha`` to be present in every
+        accepted capture so a transient empty/loading preview frame
+        (where the count is 0 but no diff is shown) is never mistaken for
+        the unified (``want == 0``) state.
+        """
+        deadline = time.time() + timeout
+        last = ''
+        while time.time() < deadline:
+            last = t.capture()
+            if 'alpha' in last and self._sbs_rows(last) == want:
+                return last
+            time.sleep(0.05)
+        self.fail(f'expected {want} side-by-side row(s); last capture had '
+                  f'{self._sbs_rows(last)}:\n{last}')
+
+    def _open_file_diff(self, t):
+        """Drive the cursor onto the newest commit's file row and wait for
+        its diff to render.
+
+        Waiting for the context line (``alpha``) to actually paint matters
+        for the resize test: it guarantees the launch-width preview has
+        rendered AND the baseline ``on_resize`` has fired (recording
+        ``_prev_pw``) before the test resizes — so the resize is a genuine
+        width *change*, not the first (baseline-only) fire.
+        """
+        t.wait_for('second change beta line', timeout=5.0)
+        t.send('Right')                       # expand newest commit
+        t.wait_for('ctx.txt', timeout=5.0)
+        t.send('Down')                        # cursor -> ctx.txt file row
+        t.wait_for('alpha', timeout=5.0)      # diff preview has painted
+
+    def test_wide_pane_renders_side_by_side(self):
+        """A 170-col launch shows the file diff in two columns."""
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_repo_with_context_diff(tmp)
+            with TmuxFixture(cols=170, rows=30) as t:
+                t.send_line(f'cd {tmp}')
+                t.launch(_BIN, '--run-py', _RECIPE)
+                self._open_file_diff(t)
+                # The unchanged context line is duplicated across columns.
+                self._wait_sbs(t, 1)
+                t.send('q')
+
+    def test_resize_across_threshold_reflows_without_keypress(self):
+        """Crossing 160 up then down re-renders the diff with no keypress."""
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_repo_with_context_diff(tmp)
+            with TmuxFixture(cols=120, rows=30) as t:
+                t.send_line(f'cd {tmp}')
+                t.launch(_BIN, '--run-py', _RECIPE)
+                self._open_file_diff(t)
+                # 120 < 160 → unified: the context line is NOT duplicated.
+                self._wait_sbs(t, 0)
+                # Resize wide — NO keypress. on_resize drops the cache and
+                # the framework refetches, re-rendering side-by-side.
+                t.resize(170, 30)
+                self._wait_sbs(t, 1)
+                # Resize back narrow — again no keypress; reflows to unified.
+                t.resize(120, 30)
+                self._wait_sbs(t, 0)
+                t.send('q')
+
+
 class TestBrowseGitTreeMeta(unittest.TestCase):
     """Tree-mode filler rows are framework ``meta`` rows (ticket #741).
 

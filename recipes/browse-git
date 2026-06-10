@@ -94,6 +94,12 @@ except Exception:
 
 _MD_COLOR = _md2ansi_fn is not None  # default on when available
 
+# Probe ``delta`` once at load (not per render): used to pipe the
+# git-colored diff through delta for terminal-native rendering, and — via
+# the same flag — to gate side-by-side mode + the conditional preview
+# cache-drop on resize (see ``_colorize_diff`` / ``_on_resize``).
+HAVE_DELTA = shutil.which('delta')
+
 _LOG_LIMIT = 1000
 _MODES = ('commits', 'status', 'reflog', 'branches', 'stash')
 
@@ -128,6 +134,7 @@ _log_limit = _LOG_LIMIT
 _mode = 'commits'
 _tree_mode = True  # --tree / 't' — render git's commit graph as a column (default on)
 _browser = None  # set in main() — used for preview-width lookup
+_prev_pw = None  # last preview width seen by _on_resize (main-thread only)
 _revs = []       # positional revisions scoping commits mode
 _paths = []      # positional pathspecs scoping commits mode
 _all_branches = False  # --all — span the commits log over every local branch
@@ -315,25 +322,31 @@ def _colorize_diff(raw):
 
     Contract: ``raw`` is the diff text produced *once* by the caller,
     already SGR-colored (e.g. via ``_git_color('show', …)`` which runs
-    with ``color.ui=always``). When ``delta`` is on PATH the text is
-    piped through it for terminal-native rendering; ``delta`` parses the
-    colored diff and re-emits its own SGR. When ``delta`` is absent the
-    git-colored ``raw`` is returned unchanged — so either path yields
-    ANSI-bearing text and the caller never has to generate the diff
-    twice.
+    with ``color.ui=always``). When ``delta`` is on PATH (``HAVE_DELTA``)
+    the text is piped through it for terminal-native rendering; ``delta``
+    parses the colored diff and re-emits its own SGR. When ``delta`` is
+    absent the git-colored ``raw`` is returned unchanged — so either path
+    yields ANSI-bearing text and the caller never has to generate the
+    diff twice.
 
     ``--no-gitconfig`` ignores the user's theme and suppresses the OSC-8
     hyperlink emission the preview pane can't render; ``--paging never``
     stops delta spawning a pager off-tty; ``--width`` matches the pane
     (read from the module-level ``_browser`` since ``get_preview`` gets
-    no ``ctx``).
+    no ``ctx``). At a wide pane (``width >= 160``) delta lays the diff out
+    side-by-side, splitting that same ``--width`` into two columns
+    (``--line-fill-method=spaces`` pads each side so the gutter aligns) —
+    this render is width-dependent, which ``_on_resize`` accounts for.
     """
-    if shutil.which('delta'):
+    if HAVE_DELTA:
         width = (_browser.preview_width if _browser else 0) or 80
+        argv = ['delta', '--no-gitconfig', '--paging', 'never',
+                '--width', str(width)]
+        if width >= 160:
+            # Wide pane: two columns out of the one --width above.
+            argv += ['--side-by-side', '--line-fill-method=spaces']
         proc = subprocess.run(
-            ['delta', '--no-gitconfig', '--paging', 'never',
-             '--width', str(width)],
-            input=raw, capture_output=True, text=True, check=False)
+            argv, input=raw, capture_output=True, text=True, check=False)
         if proc.returncode == 0:
             return proc.stdout
         # delta failed unexpectedly — fall back to the git-colored text.
@@ -1453,6 +1466,32 @@ def toggle_tree(ctx):
     ctx.refresh()
 
 
+def _on_resize(ctx, cols, rows):
+    """Drop the preview cache when a resize flips delta's diff layout.
+
+    Fires on any pane-layout change (terminal resize, split, list-ratio).
+    The diff preview is width-dependent only through delta: side-by-side
+    turns on at ``width >= 160`` and its two columns re-flow with the
+    pane (see ``_colorize_diff``). So drop the (width-agnostic) preview
+    cache — forcing a re-render at the new width — only when delta is in
+    play AND the preview width actually changed AND side-by-side is or was
+    active (``cur`` or ``prev`` >= 160).
+
+    Everything else is left cached: the first fire just records the
+    baseline (the startup preview is already at the current width); a
+    same-width fire (a height-only resize the broadened hook also emits)
+    and a change that stays unified (both < 160 — delta's unified output
+    doesn't depend on width) leave the cache intact. ``_prev_pw`` is
+    main-thread only: ``on_resize`` fires from the run loop.
+    """
+    global _prev_pw
+    cur = ctx.preview_width or 0
+    prev, _prev_pw = _prev_pw, cur
+    if (prev is not None and cur != prev and HAVE_DELTA
+            and (cur >= 160 or prev >= 160)):
+        ctx.drop_preview_cache()
+
+
 # ---- entry point ---------------------------------------------------------
 
 
@@ -1595,6 +1634,7 @@ def main():
         format_row_content=git_row_content,
         actions=actions,
         on_enter=on_enter,
+        on_resize=_on_resize,
         show_ids='never',
         help_intro=_HELP_INTRO_TMPL.format(
             default=_LOG_LIMIT, modes=', '.join(_MODES)),
