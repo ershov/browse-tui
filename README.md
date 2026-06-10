@@ -133,4 +133,4 @@ specs](docs/superpowers/specs/2026-04-30-browse-tui-design.md).
 
 ## License
 
-Same license as the parent repo.
+Licensed under the Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
