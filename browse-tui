@@ -70,6 +70,13 @@ import unicodedata
 # ---------------------------------------------------------------------------
 
 _saved_termios = None
+# True only between a fully successful _enter_raw (enter-bytes written) and the
+# matching _leave_raw. Guards _leave_raw so teardown bytes are emitted exactly
+# once and never when raw mode was never entered -- notably the --tty - piped
+# case, where _enter_raw raises at tcgetattr before writing anything but
+# _tty_writer is sys.stdout (not None). More precise than a _tty_writer-None
+# check, and still keeps term_restore idempotent.
+_in_raw = False
 _orig_sigtstp_handler = None
 
 # ---- terminal device (set by term_init; see module docstring) ------------
@@ -499,13 +506,17 @@ def _enter_raw():
     supported configuration (single-device, and ``--tty -`` where both
     fds are the std streams of one pty).
     """
-    global _saved_termios
+    global _saved_termios, _in_raw
     if _saved_termios is None:
         _saved_termios = termios.tcgetattr(_tty_fd_in)
     tty.setraw(_tty_fd_in)
     # Alternate screen buffer, hide cursor, enable SGR mouse tracking
     _tty_writer.buffer.write(b'\033[?1049h\033[?25l\033[?1000h\033[?1006h')
     _tty_writer.buffer.flush()
+    # Mark raw entered only now -- after the enter-bytes are out -- so a
+    # tcgetattr failure above (the --tty - piped case) leaves _in_raw False
+    # and the following _leave_raw is a clean no-op.
+    _in_raw = True
 
 def notify_wake():
     """Wake up read_key() from another thread (e.g. after async preview load)."""
@@ -613,20 +624,26 @@ def term_child_fds():
 def _leave_raw():
     """Restore termios and leave alternate screen, but keep the notification pipe.
 
-    No-op once the terminal is already torn down (``_tty_writer is None``)
-    so ``term_restore`` stays idempotent: a second ``term_restore`` (or any
+    No-op unless raw mode is actually entered (``_in_raw``). This keeps
+    ``term_restore`` idempotent -- a second ``term_restore`` (or any
     ``_leave_raw`` after teardown) cleanly returns instead of dereferencing
-    the nulled writer / writing to the closed device fd. ``_tty_writer`` and
-    ``_tty_fd_in`` are nulled together in ``term_restore``, so this one guard
-    covers both the byte-write and the ``termios`` call below.
+    the nulled writer / writing to the closed device fd -- and, crucially,
+    skips teardown on the ``term_init`` error path where ``_enter_raw``
+    raised at ``tcgetattr`` before entering raw (the ``--tty -`` piped case),
+    so no teardown bytes leak to stdout. Subsumes the old ``_tty_writer is
+    None`` guard: ``_leave_raw`` inside ``term_restore`` clears ``_in_raw``
+    before the writer is nulled, so the byte-write and ``termios`` call below
+    are never reached after teardown.
     """
-    if _tty_writer is None:
+    global _in_raw
+    if not _in_raw:
         return
     # Disable mouse tracking, show cursor, leave alternate screen
     _tty_writer.buffer.write(b'\033[?1006l\033[?1000l\033[?25h\033[?1049l')
     _tty_writer.buffer.flush()
     if _saved_termios is not None:
         termios.tcsetattr(_tty_fd_in, termios.TCSAFLUSH, _saved_termios)
+    _in_raw = False
 
 def term_restore():
     """Full cleanup: restore termios, leave alternate screen, close fds.
