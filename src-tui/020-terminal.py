@@ -603,6 +603,17 @@ def term_child_fds():
     """
     return (_tty_fd_in, _tty_fd_out)
 
+def term_is_std_streams():
+    """True iff the terminal rides on the std streams (``--tty -`` mode).
+
+    In that mode there is no separate ``/dev/tty`` device: ``_tty_fd_in`` /
+    ``_tty_fd_out`` *are* the process's std fds (0/1) and we do not own them
+    (see :func:`_resolve_terminal`). Callers that need a private terminal
+    for a child -- e.g. ``page``, where stdin already carries the text so a
+    pager has nowhere to read keys from -- key off this to degrade.
+    """
+    return not _tty_owns_fd and _tty_fd_in == 0 and _tty_fd_out == 1
+
 def _leave_raw():
     """Restore termios and leave alternate screen, but keep the notification pipe.
 

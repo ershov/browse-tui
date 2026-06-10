@@ -865,14 +865,19 @@ def write_ids_file(ids):
 
 def run_action_cmd(cmd, item, *,
                    targets='cursor', target_ids=None, bin_path=None,
-                   timeout=600.0):
+                   timeout=600.0, stdin=None, stdout=None, stderr=None):
     """Execute ``bash -c CMD`` with TUI_* env vars set. Returns exit code.
 
     Creates and cleans up the ``$TUI_IDS_FILE`` temp file; honours the
     per-action ``timeout`` (returning 124 — GNU-timeout convention — on
-    expiry). Stdout/stderr are inherited; the caller is responsible for
-    suspending/resuming the terminal around this call when running under
-    a real TTY.
+    expiry).
+
+    ``stdin`` / ``stdout`` / ``stderr`` are passed straight to
+    ``subprocess.run``; ``None`` (the default) inherits the parent's fds.
+    The caller is responsible for suspending/resuming the terminal around
+    this call when running under a real TTY, and for handing the terminal
+    fds in so an interactive action paints to the terminal rather than a
+    captured ``stdout`` (see :func:`make_cli_action`).
     """
     target_ids = target_ids or []
     ids_path = write_ids_file(target_ids) if target_ids else None
@@ -887,6 +892,7 @@ def run_action_cmd(cmd, item, *,
                 ['/bin/bash', '-c', cmd],
                 env=env,
                 timeout=timeout,
+                stdin=stdin, stdout=stdout, stderr=stderr,
             )
             return result.returncode
         except subprocess.TimeoutExpired:
@@ -922,9 +928,12 @@ def make_cli_action(spec: str, *, bin_path=None,
 
     Action runs only when ``ctx.targets`` is non-empty (gate
     ``'targets'``). The handler suspends the terminal in non-headless
-    mode, calls ``run_action_cmd`` (which manages the temp ids file),
-    then resumes and triggers a full redraw. Non-zero exit codes are
-    surfaced via ``ctx.error``.
+    mode and hands the terminal fds to the child (so an interactive
+    action -- an editor/pager -- paints to the terminal, not a captured
+    ``stdout``, without touching the parent's fd 0/1), calls
+    ``run_action_cmd`` (which manages the temp ids file), then resumes
+    and triggers a full redraw. Non-zero exit codes are surfaced via
+    ``ctx.error``.
 
     ``Action`` is referenced by name — the test harness injects it (the
     concatenated build resolves it from earlier modules).
@@ -938,14 +947,18 @@ def make_cli_action(spec: str, *, bin_path=None,
             return
         target_ids = [t.id for t in ctx.targets]
         targets_label = 'selection' if ctx.selected else 'cursor'
+        child_fds = {}
         if not ctx._browser._headless:
             term_suspend()
+            in_fd, out_fd = term_child_fds()
+            child_fds = {'stdin': in_fd, 'stdout': out_fd, 'stderr': out_fd}
         try:
             rc = run_action_cmd(cmd, primary,
                                 targets=targets_label,
                                 target_ids=target_ids,
                                 bin_path=bin_path,
-                                timeout=timeout)
+                                timeout=timeout,
+                                **child_fds)
         finally:
             if not ctx._browser._headless:
                 term_resume()
