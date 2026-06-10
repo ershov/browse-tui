@@ -25,7 +25,7 @@
 
 Decouple the terminal I/O substrate (`src-tui/020-terminal.py`) from the
 process's standard streams. After stage 1 the UI is painted to, and keystrokes
-are read from, a single **terminal device fd** (`/dev/tty` by default), while
+are read from, a single **terminal device** (`/dev/tty` by default), while
 `sys.stdin`/`sys.stdout` are left untouched for content and results.
 
 The observable payoff: `sel=$(browse-tui --root-cmd cat …)` works — the UI
@@ -34,18 +34,18 @@ with zero escape-sequence contamination.
 
 ### 1.2 In scope (stage 1)
 
-1. A terminal-device abstraction in `020-terminal.py` (`_term_in_fd` +
-   `_term_out`) that every output/input/lifecycle helper uses instead of
-   `sys.stdin`/`sys.stdout`.
-2. Terminal-fd **resolution policy** + a new `--tty PATH` flag (with the
+1. A terminal-device abstraction in `020-terminal.py` (`_tty_fd_in` /
+   `_tty_fd_out` / `_tty_writer`) that every output/input/lifecycle helper uses
+   instead of `sys.stdin`/`sys.stdout`.
+2. Terminal-device **resolution policy** + a new `--tty TTY_PATH` flag (with the
    sentinel `--tty -` meaning "use the std streams").
 3. **Clean-error** behaviour when no terminal is available (replacing today's
    `termios` traceback).
 4. Retargeting of raw-mode setup, the `read_key`/`select` loop, the
    SIGWINCH/SIGTSTP/SIGCONT handlers, `term_suspend`/`term_resume`, and
-   `term_size` to the terminal fd.
+   `term_size` to the terminal device.
 5. **Interactive shell-out handoff**: `run_external` / `page` (and any other
-   interactive spawn) hand the terminal fd to the child as its `stdin`/
+   interactive spawn) hand the terminal fds to the child as its `stdin`/
    `stdout`/`stderr`.
 6. Removal of the now-redundant `_reopen_stdin_from_tty` dup2 hack.
 7. Tests proving the separation (result-capture, shell-out, no-tty error,
@@ -152,29 +152,33 @@ either a working `/dev/tty` session or a clean error.
 
 ### 3.1 The terminal device
 
-Two module-level globals in `020-terminal.py`, set by `term_init`:
+Three module-level globals in `020-terminal.py`, set by `term_init`:
 
 | Name | Meaning |
 |------|---------|
-| `_term_in_fd` | int fd read by `os.read` / `select`; the target of raw-mode `termios`. |
-| `_term_out` | a text writer (`.write(str)`, `.flush()`, `.buffer.write(bytes)`) for all UI output. |
+| `_tty_fd_in` | int fd read by `os.read` / `select`; the target of raw-mode `termios`. |
+| `_tty_fd_out` | int fd the UI is written to. |
+| `_tty_writer` | buffered text writer over `_tty_fd_out` (`.write(str)`, `.flush()`, `.buffer.write(bytes)`). |
 
-Every current use of `sys.stdout` in the module becomes `_term_out`; every
-`sys.stdin.fileno()` becomes `_term_in_fd`. The self-pipe `_notify_r` is still
-`select`ed alongside `_term_in_fd`.
+**Why two fds.** A terminal is full-duplex, so the common case needs only one —
+and in single-device mode (`/dev/tty` or an explicit `--tty TTY_PATH`)
+`_tty_fd_in == _tty_fd_out`, one fd opened `O_RDWR`. The two names exist for the
+`--tty -` case, where input is fd 0 and output is fd 1 (the std streams carry
+read and write on separate fds). Naming them separately lets the rest of the
+layer treat both cases uniformly.
 
-In the single-device case (`/dev/tty` or an explicit `--tty PATH`) both views
-are one underlying fd opened `O_RDWR`; reads use raw `os.read(_term_in_fd, …)`
-(as today — the text wrapper's read buffer is never used), writes use
-`_term_out`. In `--tty -` mode they are fd 0 (in) and fd 1 (out).
+Every current use of `sys.stdout` in the module becomes `_tty_writer`; every
+`sys.stdin.fileno()` becomes `_tty_fd_in`. The self-pipe `_notify_r` is still
+`select`ed alongside `_tty_fd_in`. Reads use raw `os.read(_tty_fd_in, …)` (as
+today — `_tty_writer` is write-only; its text read buffer is never used).
 
 ### 3.2 Resolution order
 
 `term_init(tty_path=None)` resolves the device in this strict order:
 
-1. **`tty_path == '-'`** → `_term_in_fd = 0`, `_term_out = sys.stdout` (reuse the
-   existing stream; no second wrapper). Asserts the std streams are a tty
-   (§3.8).
+1. **`tty_path == '-'`** → `_tty_fd_in = 0`, `_tty_fd_out = 1`,
+   `_tty_writer = sys.stdout` (reuse the existing stream; no second wrapper).
+   Asserts the std streams are a tty (§3.8).
 2. **`tty_path` is a device path** → `open(tty_path, O_RDWR)`.
 3. **`tty_path is None`** → `open('/dev/tty', O_RDWR)`.
 4. **open fails** → raise a clean error (§3.8); **never** fall back to probing
@@ -191,23 +195,23 @@ not closed by us.
 
 ### 3.3 Output retargeting + buffering
 
-`_term_out` is built once in `term_init`:
+`_tty_writer` is built once in `term_init`:
 
-- single-device: `_term_out = os.fdopen(out_fd, 'w', encoding='utf-8',
+- single-device: `_tty_writer = os.fdopen(_tty_fd_out, 'w', encoding='utf-8',
   newline='')` (a `TextIOWrapper` — `.buffer` exposes the `BufferedWriter` for
   the byte-level alt-screen/mouse sequences, exactly mirroring today's
   `sys.stdout` / `sys.stdout.buffer` split).
-- `--tty -`: `_term_out = sys.stdout`.
+- `--tty -`: `_tty_writer = sys.stdout`.
 
 The batch-writes-then-one-flush-per-frame discipline (and the DEC 2026
 `begin_sync`/`end_sync` bracketing the renderer relies on) is preserved
 verbatim — only the destination object changes. `flush()` calls
-`_term_out.flush()`.
+`_tty_writer.flush()`.
 
 ### 3.4 Input retargeting
 
-`read_key` / `input_ready` read and `select` on `_term_in_fd`. Raw-mode setup
-(`tty.setraw`, `termios.tcgetattr`/`tcsetattr`) targets `_term_in_fd`. Setting
+`read_key` / `input_ready` read and `select` on `_tty_fd_in`. Raw-mode setup
+(`tty.setraw`, `termios.tcgetattr`/`tcsetattr`) targets `_tty_fd_in`. Setting
 raw on the readable side affects the underlying terminal device, which is shared
 with the writable side in every supported configuration, so this is correct for
 both the single-device and `--tty -` cases.
@@ -215,11 +219,11 @@ both the single-device and `--tty -` cases.
 ### 3.5 Signals, suspend/resume, size
 
 - SIGWINCH/SIGTSTP/SIGCONT handlers and `term_suspend`/`term_resume` write
-  through `_term_out` and operate termios on `_term_in_fd`. The
+  through `_tty_writer` and operate termios on `_tty_fd_in`. The
   bytecode-checkpoint subtlety in `_handle_sigtstp` is preserved unchanged.
-- `term_size` queries `os.get_terminal_size(_term_in_fd)` first, then falls
+- `term_size` queries `os.get_terminal_size(_tty_fd_in)` first, then falls
   back to `/dev/tty`, then `(80, 24)`. The 3-std-fd probe is dropped (the
-  terminal fd is now the authoritative source).
+  terminal device is now the authoritative source).
 - `_terminal_cols_for_auto` (`080-cli.py`, runs *before* `term_init` to resolve
   `--split-type=auto`) is aligned to the same policy: prefer the resolved
   `--tty` target / `/dev/tty`, not a std-fd-first probe.
@@ -230,7 +234,7 @@ The child gets the terminal on fd 0/1/2 by **passing the terminal fds to
 subprocess**, not by closing/reopening fds in the parent. `020-terminal.py`
 exposes a small accessor returning the child's `(in_fd, out_fd)` — the single
 `O_RDWR` device fd for both in single-device mode, or `(0, 1)` in `--tty -`
-mode (i.e. `_term_in_fd` and `_term_out.fileno()`):
+mode (i.e. `_tty_fd_in` and `_tty_fd_out`):
 
 - `run_external`: `subprocess.run(cmd, stdin=in_fd, stdout=out_fd,
   stderr=out_fd, …)`. subprocess `dup2`s them onto the child's 0/1/2 after
@@ -243,11 +247,11 @@ Rationale (chosen over close-and-reopen-onto-0/1 in the parent):
 
 - The parent's fd 0/1 are **never touched** — essential for stage 2, where they
   are the content channels.
-- The parent keeps `term_fd` open for `term_resume` (termios continuity; no
+- The parent keeps the device fd open for `term_resume` (termios continuity; no
   reopen). `O_CLOEXEC` + the explicit pass means no stray fd leaks into the
   child beyond 0/1/2.
 - Uniform across modes and needs no `preexec_fn`. In `--tty -` mode the terminal
-  fd already *is* the std streams, so the pass is effectively today's
+  fds already *are* the std streams, so the pass is effectively today's
   inherit-the-std-fds behaviour.
 
 `stderr` → terminal (fd 2 included): during the suspend window the child owns
@@ -262,7 +266,7 @@ same way).
 **Known limitation — `--tty -` + pager.** When the terminal *is* the std
 streams there is no separate `/dev/tty` for the pager to read keys from while
 its stdin carries the text. `page` degrades in that mode: write the text to
-`_term_out` without interactive paging. Acceptable for a narrow fallback.
+`_tty_writer` without interactive paging. Acceptable for a narrow fallback.
 
 ### 3.7 Result & help routing (std streams freed)
 
@@ -270,7 +274,7 @@ its stdin carries the text. `page` degrades in that mode: write the text to
   (`040-state.py:6962-6964`, `:7169-7171`) — now uncontaminated by UI bytes in
   the default `/dev/tty` mode.
 - `--root-cmd cat` keeps reading `sys.stdin`, but `_reopen_stdin_from_tty` is
-  **deleted**: keys now come from `_term_in_fd` (`/dev/tty`) directly, so fd 0
+  **deleted**: keys now come from `_tty_fd_in` (`/dev/tty`) directly, so fd 0
   is left as-is after the read.
 
 ### 3.8 No-terminal policy & errors
@@ -290,17 +294,17 @@ the `--tty -` mode (which runs the full terminal lifecycle on the std fds).
 
 ### 4.1 CLI
 
-`--tty PATH` (metavar `PATH`, default `/dev/tty`). The sentinel value `-`
-selects the std-streams mode. `run_tui` resolves it and passes it to
+`--tty TTY_PATH` (metavar `TTY_PATH`, default `/dev/tty`). The sentinel value
+`-` selects the std-streams mode. `run_tui` resolves it and passes it to
 `term_init(tty_path=…)`.
 
 ### 4.2 Recipes
 
 `Browser.run()` already auto-detects `-h`/`--help` in `sys.argv[1:]`
-(`040-state.py:6962`). It is extended to also recognise `--tty PATH` / `--tty -`
-the same way, so a recipe (`./my-recipe --tty -`) gets the behaviour without
-wiring its own argparse. Recipes that consume `--tty` via their own argparse
-first are unaffected (they strip it from `sys.argv`). Default remains
+(`040-state.py:6962`). It is extended to also recognise `--tty TTY_PATH` /
+`--tty -` the same way, so a recipe (`./my-recipe --tty -`) gets the behaviour
+without wiring its own argparse. Recipes that consume `--tty` via their own
+argparse first are unaffected (they strip it from `sys.argv`). Default remains
 `/dev/tty`.
 
 ## 5. Testing
@@ -328,10 +332,10 @@ first are unaffected (they strip it from `sys.argv`). Default remains
 
 | File | Change |
 |------|--------|
-| `src-tui/020-terminal.py` | `_term_in_fd`/`_term_out` globals; resolution in `term_init(tty_path)`; retarget all `sys.stdout`/`sys.stdin` uses, signals, suspend/resume, `term_size`; delete dependence on std streams. |
+| `src-tui/020-terminal.py` | `_tty_fd_in`/`_tty_fd_out`/`_tty_writer` globals; resolution in `term_init(tty_path)`; retarget all `sys.stdout`/`sys.stdin` uses, signals, suspend/resume, `term_size`; child-fd accessor for shell-out. |
 | `src-tui/080-cli.py` | `--tty` arg; pass to `term_init`; delete `_reopen_stdin_from_tty`; `--root-cmd cat` no longer reopens; align `_terminal_cols_for_auto`; no-tty error. |
 | `src-tui/040-state.py` | `run()` auto-detect of `--tty`; pass `tty_path` into `term_init`; (result/help stdout writes unchanged). |
-| `src-tui/060-context.py` | `run_external` / `page` pass the terminal fd as child 0/1/2; `page` degrade under `--tty -`. |
+| `src-tui/060-context.py` | `run_external` / `page` pass the terminal fds as child 0/1/2; `page` degrade under `--tty -`. |
 | `test/ui/…`, `test/unit/…` | New separation/shell-out/no-tty/`--tty -` tests. |
 | `docs/cli.md` | Document `--tty`, the capturable-result contract, the no-tty error. |
 
@@ -344,10 +348,10 @@ first are unaffected (they strip it from `sys.argv`). Default remains
 - **D3.** One terminal device used for both read and write. No split-terminal
   support; no auto-probe of the std fds; `/dev/tty` is the default.
 - **D4.** Interactive children get the terminal via `subprocess`
-  `stdin=stdout=stderr=term_fd` (parent fds untouched, parent keeps `term_fd`),
-  not close-and-reopen. `stderr` → terminal too.
-- **D5.** Flag spelling: `--tty PATH`, default `/dev/tty`, sentinel `-` = std
-  streams.
+  `stdin=in_fd, stdout=stderr=out_fd` (parent fds untouched, parent keeps the
+  device fd), not close-and-reopen. `stderr` → terminal too.
+- **D5.** Flag spelling: `--tty TTY_PATH`, default `/dev/tty`, sentinel `-` =
+  std streams.
 - **D6.** `_reopen_stdin_from_tty` is removed.
 - **D7.** `--tty -` mode degrades the interactive pager (no `/dev/tty` for keys).
 
@@ -355,11 +359,12 @@ first are unaffected (they strip it from `sys.argv`). Default remains
 
 - **tmux fixture `/dev/tty` resolution** — the one thing that could ripple
   through the whole UI suite. Verify early (§5).
-- **Double-buffering in `--tty -`** — `_term_out = sys.stdout` shares fd 1 with
-  the result write; flush `_term_out` before the post-teardown result write.
-  (Accepted that UI + result co-mingle in this mode.)
+- **`--tty -` write ordering** — `_tty_writer` *is* `sys.stdout` in this mode
+  (one buffer, no double-wrapping); flush it before the post-teardown result
+  write so UI and result don't interleave. (Accepted that they co-mingle on one
+  stream in this mode.)
 - **fd ownership** — close the opened `/dev/tty` fd on `term_restore` only when
   we own it (cases 2–3), never the std fds.
-- **`O_CLOEXEC` + subprocess** — confirm the passed `term_fd` reaches the child
+- **`O_CLOEXEC` + subprocess** — confirm the passed device fd reaches the child
   as 0/1/2 while not leaking as a higher fd (subprocess `close_fds=True` default
   + explicit pass).
