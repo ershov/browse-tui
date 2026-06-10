@@ -3,8 +3,8 @@
 What you need to know to navigate, modify, and extend the source. Aimed at
 contributors, not recipe authors.
 
-For the user-facing surface see [docs/api.md](api.md), [docs/cli.md](cli.md),
-[docs/recipes.md](recipes.md). For the original architectural rationale see
+For the user-facing surface see [MANUAL/api.md](../MANUAL/api.md), [MANUAL/cli.md](../MANUAL/cli.md),
+[MANUAL/recipes.md](../MANUAL/recipes.md). For the original architectural rationale see
 [docs/superpowers/specs/2026-04-30-browse-tui-design.md](superpowers/specs/2026-04-30-browse-tui-design.md).
 
 ---
@@ -206,7 +206,7 @@ The six op kinds — `upsert`, `set`, `remove`, `clear_children`,
 `complete`, `incomplete` — are each implemented by a small `_apply_*`
 helper plus a module-level helper constructor (`upsert`, `set_item`,
 `remove`, `clear_children`, `complete`, `incomplete`). Exported from
-`browse_tui` for recipes; see [docs/api.md](api.md) for the
+`browse_tui` for recipes; see [MANUAL/api.md](../MANUAL/api.md) for the
 reference table.
 
 `Context` exposes pass-throughs (`update_data`, `upsert`, `set_item`,
@@ -576,8 +576,8 @@ A worked walkthrough — add a "copy id to clipboard" action.
    ./run-tests.sh
    ```
 
-7. **Update docs.** [docs/cli.md](cli.md) (default keybindings table),
-   [docs/api.md](api.md) (if the action shape or context surface changed),
+7. **Update docs.** [MANUAL/cli.md](../MANUAL/cli.md) (default keybindings table),
+   [MANUAL/api.md](../MANUAL/api.md) (if the action shape or context surface changed),
    [README.md](../README.md) (if it's a top-tier feature worth the
    one-screen budget).
 
@@ -588,9 +588,9 @@ concentrated in `080-cli.py`:
   wire it into `parse_input`, register in `_BARE_INPUT_FORMATS` or
   `_PREFIX_INPUT_FORMATS`, add to `_validate_input_format`'s message.
 - New flag → add to `build_argparser`, route through `run_tui` (or a new
-  top-level branch in `main`), document in [docs/cli.md](cli.md).
+  top-level branch in `main`), document in [MANUAL/cli.md](../MANUAL/cli.md).
 - New action gate → extend `_gate_passes` in `070-actions.py`, document
-  in [docs/api.md](api.md).
+  in [MANUAL/api.md](../MANUAL/api.md).
 
 ---
 
@@ -639,8 +639,8 @@ concentrated in `080-cli.py`:
 ## See also
 
 - [README.md](../README.md) — quickstart.
-- [docs/api.md](api.md) — public API for recipe authors.
-- [docs/cli.md](cli.md) — full CLI surface.
-- [docs/recipes.md](recipes.md) — shipped recipes + writing-your-own walkthrough.
+- [MANUAL/api.md](../MANUAL/api.md) — public API for recipe authors.
+- [MANUAL/cli.md](../MANUAL/cli.md) — full CLI surface.
+- [MANUAL/recipes.md](../MANUAL/recipes.md) — shipped recipes + writing-your-own walkthrough.
 - [docs/superpowers/specs/2026-04-30-browse-tui-design.md](superpowers/specs/2026-04-30-browse-tui-design.md) — original architectural spec.
 - [docs/superpowers/specs/2026-05-08-streaming-push-api-design.md](superpowers/specs/2026-05-08-streaming-push-api-design.md) — streaming / push API design rationale.

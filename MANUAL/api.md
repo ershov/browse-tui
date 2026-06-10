@@ -1,7 +1,8 @@
 # browse-tui — Python API Reference
 
-The `browse_tui` module exposes five public types and a handful of helpers.
-Recipes import them directly:
+The `browse_tui` module exposes a handful of public types — `Browser`,
+`Item`, `Action`, `Context`, `BrowserConfig`, `Pending` — plus helper
+functions. Recipes import what they need directly:
 
 ```python
 from browse_tui import Browser, Item, Action
@@ -12,9 +13,9 @@ The same import works whether the recipe is run via `browse-tui --run-py …`
 or as part of a regular Python project that has the binary on `sys.path`.
 
 This document is a cross-reference for every public surface. For tutorials
-see [docs/recipes.md](recipes.md); for the CLI surface see
-[docs/cli.md](cli.md); for the underlying threading model see
-[docs/internals.md](internals.md).
+see [recipes.md](recipes.md); for the CLI surface see
+[cli.md](cli.md); for the underlying threading model see
+[docs/internals.md](../docs/internals.md).
 
 ---
 
@@ -1949,8 +1950,8 @@ the [recipes index](recipes.md) walks through each.
 ## See also
 
 - [README.md](../README.md) — quickstart.
-- [docs/cli.md](cli.md) — CLI surface.
-- [docs/recipes.md](recipes.md) — shipped recipes.
-- [docs/internals.md](internals.md) — module layout, threading model.
-- [docs/superpowers/specs/2026-04-30-browse-tui-design.md](superpowers/specs/2026-04-30-browse-tui-design.md) — original design spec.
-- [docs/superpowers/specs/2026-05-08-streaming-push-api-design.md](superpowers/specs/2026-05-08-streaming-push-api-design.md) — streaming / push API design rationale.
+- [cli.md](cli.md) — CLI surface.
+- [recipes.md](recipes.md) — shipped recipes.
+- [docs/internals.md](../docs/internals.md) — module layout, threading model.
+- [docs/superpowers/specs/2026-04-30-browse-tui-design.md](../docs/superpowers/specs/2026-04-30-browse-tui-design.md) — original design spec.
+- [docs/superpowers/specs/2026-05-08-streaming-push-api-design.md](../docs/superpowers/specs/2026-05-08-streaming-push-api-design.md) — streaming / push API design rationale.

@@ -451,6 +451,18 @@ charge of how the Browser is configured.
 
 ---
 
+## Plugins
+
+`--plugin SPEC` loads a plugin at launch — SPEC is a module name or a
+filesystem path, and the flag is repeatable. Plugins are ordinary Python
+modules that extend the framework or a recipe (registering a preview
+formatter, taking lifecycle callbacks via `register_plugin(PluginConfig(...))`,
+and so on); a recipe can also load one with a plain `import`. See the
+[Plugin system](api.md#plugin-system) section of the API reference for the
+hook surface and module-discovery rules.
+
+---
+
 ## Default keybindings
 
 | Key            | Action                                                      |
@@ -468,11 +480,14 @@ charge of how the Browser is configured.
 | Alt-Down       | Scope into cursor item                                      |
 | Alt-Up         | Scope out                                                   |
 | Ctrl-P         | Toggle preview pane                                         |
+| Alt-P          | Toggle children-grid pane                                   |
 | `R`            | Toggle preview ANSI colours (override `--preview-ansi`)     |
 | Shift-Down     | Scroll preview down by 1 line                               |
 | Shift-Up       | Scroll preview up by 1 line                                 |
 | Alt-PgDn       | Scroll preview down by a page                               |
 | Alt-PgUp       | Scroll preview up by a page                                 |
+| Shift-Home     | Scroll preview to top                                       |
+| Shift-End      | Scroll preview to bottom                                    |
 | `-` / `_`      | Shrink list pane (no-op when preview hidden)                |
 | `=` / `+`      | Grow list pane (no-op when preview hidden)                  |
 | `\`            | Cycle pane layout (`v`→`h`→`m`→`pc`→`v`)                    |
@@ -488,6 +503,7 @@ charge of how the Browser is configured.
 | Ctrl-L         | Force redraw                                                |
 | `v`            | View cursor item's preview in `$PAGER` (default `less -R`)  |
 | `e`            | Edit cursor item's preview in `$EDITOR` (default `vi`)      |
+| `~`            | Page the session message log in `$PAGER`                    |
 | `/`            | Enter search mode                                           |
 | `&`            | Enter filter mode (stacking; less-style)                    |
 | Enter          | In search mode → next match; in filter mode → commit (or clear-all on empty); otherwise → `--on-enter` |
@@ -655,7 +671,7 @@ sub-views with no install dependency.
 
 ## See also
 
-- [docs/api.md](api.md) — Python API for richer recipes.
-- [docs/recipes.md](recipes.md) — `browse-fs`, `browse-plan`, `browse-claude`.
-- [docs/internals.md](internals.md) — module layout and threading model.
+- [api.md](api.md) — Python API for richer recipes.
+- [recipes.md](recipes.md) — shipped recipes and how to write your own.
+- [docs/internals.md](../docs/internals.md) — module layout and threading model.
 - [README.md](../README.md) — quickstart.
