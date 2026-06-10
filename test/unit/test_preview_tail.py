@@ -102,24 +102,25 @@ def _ctx_for(browser):
 
 
 def _render_preview(browser):
-    """Run render_full while capturing stdout. Returns nothing."""
-    orig = sys.stdout
-    sys.stdout = io.StringIO()
+    """Run render_full, swallowing the emitted terminal output."""
+    orig = _term._tty_writer
+    _term._tty_writer = io.StringIO()
     try:
         _render.render_full(browser)
     finally:
-        sys.stdout = orig
+        _term._tty_writer = orig
 
 
 def _render_capture(browser):
     """Run render_full and return the emitted byte string."""
-    orig = sys.stdout
-    sys.stdout = io.StringIO()
+    orig = _term._tty_writer
+    buf = io.StringIO()
+    _term._tty_writer = buf
     try:
         _render.render_full(browser)
-        return sys.stdout.getvalue()
+        return buf.getvalue()
     finally:
-        sys.stdout = orig
+        _term._tty_writer = orig
 
 
 # --- Defaults --------------------------------------------------------------

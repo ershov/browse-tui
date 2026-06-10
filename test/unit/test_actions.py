@@ -3070,13 +3070,13 @@ class TestRedrawAction(unittest.TestCase):
         b = _make_browser()
         try:
             ctx = _ctx_for(b)
-            saved = sys.stdout
+            saved = _term._tty_writer
             buf = io.StringIO()
-            sys.stdout = buf
+            _term._tty_writer = buf
             try:
                 _actions._redraw(ctx)
             finally:
-                sys.stdout = saved
+                _term._tty_writer = saved
             self.assertIn('\033[2J', buf.getvalue())
         finally:
             b.stop_workers()
@@ -3088,12 +3088,12 @@ class TestRedrawAction(unittest.TestCase):
             # Seed the cache with a sentinel so we can confirm it's wiped.
             b._pane_cache['list'] = object()
             b._pane_cache['preview'] = object()
-            saved = sys.stdout
-            sys.stdout = io.StringIO()
+            saved = _term._tty_writer
+            _term._tty_writer = io.StringIO()
             try:
                 _actions._redraw(ctx)
             finally:
-                sys.stdout = saved
+                _term._tty_writer = saved
             self.assertEqual(b._pane_cache, {})
         finally:
             b.stop_workers()
@@ -3103,12 +3103,12 @@ class TestRedrawAction(unittest.TestCase):
         try:
             ctx = _ctx_for(b)
             b._needs_redraw.clear()
-            saved = sys.stdout
-            sys.stdout = io.StringIO()
+            saved = _term._tty_writer
+            _term._tty_writer = io.StringIO()
             try:
                 _actions._redraw(ctx)
             finally:
-                sys.stdout = saved
+                _term._tty_writer = saved
             self.assertIn('all', b._needs_redraw)
         finally:
             b.stop_workers()
@@ -3240,22 +3240,21 @@ class TestAltDigitParsing(unittest.TestCase):
     """
 
     def _read_key_from_bytes(self, payload: bytes) -> str:
-        # ``read_key`` reads from ``sys.stdin.fileno()`` directly; a pipe
-        # dup'd over fd 0 is the simplest way to feed canned bytes
-        # through the production parser without monkey-patching the
-        # module's internals.
-        import sys
+        # ``read_key`` reads/selects on the terminal device ``_tty_fd_in``;
+        # point it at fd 0 and dup a canned-bytes pipe over fd 0, so the
+        # production parser runs unmodified (it uses os.read on the bare
+        # fd) without monkey-patching the module's internals.
         r, w = os.pipe()
         os.write(w, payload)
         os.close(w)
         saved_stdin_fd = os.dup(0)
+        saved_fd_in = _term._tty_fd_in
         try:
             os.dup2(r, 0)
-            # ``sys.stdin`` caches the underlying fd object; clear any
-            # buffered state by ensuring we read via fileno() (read_key
-            # uses os.read on the bare fd, so the cache is irrelevant).
+            _term._tty_fd_in = 0
             return _term.read_key()
         finally:
+            _term._tty_fd_in = saved_fd_in
             os.dup2(saved_stdin_fd, 0)
             os.close(saved_stdin_fd)
             try:

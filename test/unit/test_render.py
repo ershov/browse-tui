@@ -3214,17 +3214,18 @@ class TestSeparatorCacheZeroBytes(unittest.TestCase):
                      'clear_line', 'clear_columns', 'begin_row', 'end_row'):
             self._saved[name] = getattr(_render, name, None)
             setattr(_render, name, getattr(self._terminal, name))
-        # Stdout capture: real shim emits via sys.stdout.write on miss.
-        self._orig_stdout = sys.stdout
+        # Capture: the real shim emits through the terminal device writer
+        # (``_tty_writer``) on a cache miss; point it at a StringIO.
+        self._orig_writer = self._terminal._tty_writer
         self._stdout = io.StringIO()
-        sys.stdout = self._stdout
+        self._terminal._tty_writer = self._stdout
         # Defensive: clear shim capture state.
         self._terminal._row_capture_active = False
         self._terminal._row_buf = []
         self._terminal._row_meta = None
 
     def tearDown(self):
-        sys.stdout = self._orig_stdout
+        self._terminal._tty_writer = self._orig_writer
         for name, value in self._saved.items():
             if value is None:
                 if hasattr(_render, name):
@@ -3465,12 +3466,13 @@ class TestInfoBarNotice(unittest.TestCase):
                      'clear_line', 'clear_columns'):
             self._saved[name] = getattr(_render, name, None)
             setattr(_render, name, getattr(self._terminal, name))
-        self._orig_stdout = sys.stdout
+        # Capture the emitted bytes via the terminal device writer.
+        self._orig_writer = self._terminal._tty_writer
         self._stdout = io.StringIO()
-        sys.stdout = self._stdout
+        self._terminal._tty_writer = self._stdout
 
     def tearDown(self):
-        sys.stdout = self._orig_stdout
+        self._terminal._tty_writer = self._orig_writer
         for name, value in self._saved.items():
             if value is None:
                 if hasattr(_render, name):

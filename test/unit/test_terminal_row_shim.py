@@ -8,13 +8,12 @@ get diffed against a per-pane line cache. ``begin_row`` redirects
 appropriate padding (or ``\\e[K``) when content is shorter than what's
 already on screen.
 
-These tests stub stdout to capture emitted bytes and use a minimal
-duck-typed ``PaneCache`` stand-in (the real type lives in 040-state.py
-and is added by ticket #186).
+These tests capture the terminal device's emitted bytes (by swapping in
+a StringIO writer) and use a minimal duck-typed ``PaneCache`` stand-in
+(the real type lives in 040-state.py and is added by ticket #186).
 """
 
 import io
-import sys
 import types
 import unittest
 
@@ -48,22 +47,23 @@ def _make_cache(rect, height, prev_rect=None):
 
 
 class _StdoutCapture:
-    """Replace ``sys.stdout`` with a StringIO during a test.
+    """Point the terminal device's writer at a StringIO during a test.
 
-    The shim writes to stdout via ``sys.stdout.write`` for direct emits
+    ``write()`` emits to the module's ``_tty_writer`` for direct emits
     (when capture is inactive) and via the same path on cache miss after
-    ``end_row`` resets the flag. Capturing stdout lets tests assert on
-    the exact byte stream emitted.
+    ``end_row`` resets the flag. Swapping ``_tty_writer`` for a StringIO
+    lets tests assert on the exact byte stream emitted -- without running
+    ``term_init`` (which would need a real terminal device).
     """
 
     def __enter__(self):
-        self._orig = sys.stdout
+        self._orig = _terminal._tty_writer
         self.buf = io.StringIO()
-        sys.stdout = self.buf
+        _terminal._tty_writer = self.buf
         return self
 
     def __exit__(self, *args):
-        sys.stdout = self._orig
+        _terminal._tty_writer = self._orig
 
     @property
     def text(self):

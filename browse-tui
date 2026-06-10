@@ -34,6 +34,24 @@ Provides the low-level I/O substrate the UI builds on:
 This module is pure I/O and contains nothing application-specific. It has
 no tests of its own; coverage comes from the Layer 3 UI tests that drive
 the full Browser through scripted key streams.
+
+**Terminal device.** All UI I/O rides on a dedicated *terminal device*,
+never on ``sys.stdin`` / ``sys.stdout``. ``term_init`` resolves it (see
+:func:`term_init` for the policy) and sets three module globals:
+
+* ``_tty_fd_in``  -- the fd read by ``os.read`` / ``select``; the target
+  of the raw-mode ``termios`` calls.
+* ``_tty_fd_out`` -- the fd the UI is written to.
+* ``_tty_writer`` -- a buffered text writer over ``_tty_fd_out``
+  (``.write(str)`` / ``.flush()`` / ``.buffer.write(bytes)``).
+
+A terminal is full-duplex, so in single-device mode (``/dev/tty`` or an
+explicit ``--tty TTY_PATH``) ``_tty_fd_in == _tty_fd_out`` -- one fd
+opened ``O_RDWR``. The two names exist for the ``--tty -`` case, where
+input is fd 0 and output is fd 1 (the std streams carry read and write on
+separate fds). Decoupling the terminal from the std streams is what makes
+the print-exit result cleanly capturable (``sel=$(browse-tui …)``): UI
+bytes go to the device, ``stdout`` carries only the result.
 """
 
 import errno
@@ -53,6 +71,20 @@ import unicodedata
 
 _saved_termios = None
 _orig_sigtstp_handler = None
+
+# ---- terminal device (set by term_init; see module docstring) ------------
+#
+# Every UI read/write goes through these instead of sys.stdin/sys.stdout.
+# Unset (term_init not yet run / after term_restore): fds are -1 and the
+# writer is None.
+_tty_fd_in = -1        # int fd: os.read / select / raw-mode termios target
+_tty_fd_out = -1       # int fd: UI output destination
+_tty_writer = None     # buffered text writer over _tty_fd_out (.write/.flush/.buffer)
+# True when term_init opened the device fd itself (a path or /dev/tty) and
+# therefore owns it -- term_restore closes it. False for --tty - (the fds
+# are the std streams: not ours to close).
+_tty_owns_fd = False
+
 g_resize_flag = False
 # Set when the alt-screen content has been blown away externally —
 # e.g. resume from SIGTSTP+SIGCONT (the kernel/shell re-enters the alt
@@ -85,20 +117,22 @@ _row_meta = None       # dict | None: pane_cache, rel_row, abs_row, left, right,
 # ---- output helpers -------------------------------------------------------
 
 def write(s):
-    """Write string to stdout without flushing.
+    """Write string to the terminal device without flushing.
 
     When a row capture is active (see :func:`begin_row`), appends to the
-    capture buffer instead of stdout; the captured bytes are diffed
-    against the pane's line cache by :func:`end_row`.
+    capture buffer instead; the captured bytes are diffed against the
+    pane's line cache by :func:`end_row`. Otherwise the bytes are batched
+    in ``_tty_writer``'s buffer and emitted on the next :func:`flush`
+    (one flush per frame -- see :func:`begin_sync`).
     """
     if _row_capture_active:
         _row_buf.append(s)
     else:
-        sys.stdout.write(s)
+        _tty_writer.write(s)
 
 def flush():
-    """Flush stdout."""
-    sys.stdout.flush()
+    """Flush the terminal device (one call per rendered frame)."""
+    _tty_writer.flush()
 
 def move(row, col):
     """Move cursor to 1-based (row, col) position."""
@@ -374,13 +408,15 @@ def end_sync():
 def term_size():
     """Return (cols, rows) tuple for the current terminal.
 
-    Tries each std fd in turn, then /dev/tty, so the function works even
-    when stdin/stdout/stderr are pipes. Falls back to (80, 24) if all
-    probes fail.
+    Queries the resolved terminal device (``_tty_fd_in``) first -- the
+    authoritative source now that the layer no longer rides on the std
+    streams -- then falls back to ``/dev/tty``, then ``(80, 24)``. The
+    ``/dev/tty`` fallback covers the window before ``term_init`` has set
+    ``_tty_fd_in`` (e.g. an early size probe).
     """
-    for fd in (1, 2, 0):
+    if _tty_fd_in >= 0:
         try:
-            sz = os.get_terminal_size(fd)
+            sz = os.get_terminal_size(_tty_fd_in)
             if sz.columns > 0 and sz.lines > 0:
                 return (sz.columns, sz.lines)
         except OSError:
@@ -430,7 +466,7 @@ def _handle_sigtstp(signum, frame):
 def _handle_sigcont(signum, frame):
     """Re-enter raw mode after being resumed from a SIGTSTP stop.
 
-    Note: ``_enter_raw`` performs buffered stdio (``sys.stdout.buffer.write``
+    Note: ``_enter_raw`` performs buffered stdio (``_tty_writer.buffer.write``
     + ``flush``), which is safe here BECAUSE Python dispatches signal
     handlers only at bytecode checkpoints between interpreter ops — not
     inside arbitrary C calls — so we cannot re-enter stdio mid-write. See
@@ -454,14 +490,22 @@ def _handle_sigcont(signum, frame):
 # ---- raw mode / alternate screen -----------------------------------------
 
 def _enter_raw():
-    """Enter raw mode and switch to the alternate screen."""
+    """Enter raw mode and switch to the alternate screen.
+
+    Raw-mode ``termios`` is applied to ``_tty_fd_in``; the alt-screen /
+    cursor-hide / mouse-enable bytes go out the device writer's byte
+    buffer. Setting raw on the readable side affects the underlying
+    terminal device, which is shared with the writable side in every
+    supported configuration (single-device, and ``--tty -`` where both
+    fds are the std streams of one pty).
+    """
     global _saved_termios
     if _saved_termios is None:
-        _saved_termios = termios.tcgetattr(sys.stdin.fileno())
-    tty.setraw(sys.stdin.fileno())
+        _saved_termios = termios.tcgetattr(_tty_fd_in)
+    tty.setraw(_tty_fd_in)
     # Alternate screen buffer, hide cursor, enable SGR mouse tracking
-    sys.stdout.buffer.write(b'\033[?1049h\033[?25l\033[?1000h\033[?1006h')
-    sys.stdout.buffer.flush()
+    _tty_writer.buffer.write(b'\033[?1049h\033[?25l\033[?1000h\033[?1006h')
+    _tty_writer.buffer.flush()
 
 def notify_wake():
     """Wake up read_key() from another thread (e.g. after async preview load)."""
@@ -471,32 +515,130 @@ def notify_wake():
         except OSError:
             pass
 
-def term_init():
-    """Save termios, enter raw mode, alternate screen, hide cursor.
+def _resolve_terminal(tty_path):
+    """Resolve the terminal device and set the device globals.
+
+    Implements the strict resolution order (no std-fd auto-probe -- the
+    terminal is a deliberate choice, which is what keeps result capture a
+    contract rather than an accident of how the caller wired their fds):
+
+    1. ``tty_path == '-'`` -> use the std streams: ``_tty_fd_in = 0``,
+       ``_tty_fd_out = 1``, ``_tty_writer = sys.stdout`` (reuse the
+       existing stream; no second wrapper). Not owned -- the std fds are
+       never closed by us.
+    2. ``tty_path`` is a device path -> ``os.open(path, O_RDWR)``.
+    3. ``tty_path is None`` -> ``os.open('/dev/tty', O_RDWR)``.
+
+    Cases 2-3 open a single full-duplex fd (``_tty_fd_in == _tty_fd_out``),
+    mark it ``O_CLOEXEC`` (so it does not leak into children -- shell-out
+    passes it explicitly), build a UTF-8 text writer over it, and take
+    ownership (``term_restore`` closes it). An open failure raises a clean
+    ``SystemExit`` (no traceback), never falling back to the std fds.
+    """
+    global _tty_fd_in, _tty_fd_out, _tty_writer, _tty_owns_fd
+
+    if tty_path == '-':
+        _tty_fd_in = 0
+        _tty_fd_out = 1
+        _tty_writer = sys.stdout
+        _tty_owns_fd = False
+        return
+
+    device = tty_path if tty_path is not None else '/dev/tty'
+    try:
+        fd = os.open(device, os.O_RDWR | os.O_CLOEXEC)
+    except OSError:
+        if tty_path is None:
+            raise SystemExit(
+                'browse-tui: no controlling terminal; '
+                'pass --tty - to run over stdin/stdout')
+        raise SystemExit(f'browse-tui: cannot open terminal {device!r}')
+    _tty_fd_in = fd
+    _tty_fd_out = fd
+    # TextIOWrapper with newline='' (no translation) over the device, with
+    # .buffer exposing the BufferedWriter for the byte-level alt-screen /
+    # mouse sequences -- mirroring the old sys.stdout / sys.stdout.buffer
+    # split exactly.
+    _tty_writer = os.fdopen(fd, 'w', encoding='utf-8', newline='')
+    _tty_owns_fd = True
+
+
+def term_init(tty_path=None):
+    """Resolve the terminal device, save termios, enter raw mode + alt screen.
+
+    ``tty_path`` selects the device (see :func:`_resolve_terminal` for the
+    full policy): ``None`` (default) opens ``/dev/tty``; an explicit path
+    opens that device; the sentinel ``'-'`` uses the process's std streams
+    (fd 0 in, fd 1 out). All subsequent UI I/O rides on the resolved
+    device, never on ``sys.stdin`` / ``sys.stdout``.
+
     Also registers signal handlers for SIGWINCH, SIGTSTP, and SIGCONT.
+
+    Raises a clean ``SystemExit`` (no traceback) when no terminal is
+    available -- either the device cannot be opened, or it is not a tty
+    (e.g. ``--tty -`` with piped std streams, where the raw-mode
+    ``termios`` call fails).
     """
     global _orig_sigtstp_handler, _notify_r, _notify_w
+    _resolve_terminal(tty_path)
     _orig_sigtstp_handler = signal.getsignal(signal.SIGTSTP)
     # Create self-pipe for async notification
     _notify_r, _notify_w = os.pipe()
     os.set_blocking(_notify_r, False)
     os.set_blocking(_notify_w, False)
-    _enter_raw()
+    try:
+        _enter_raw()
+    except termios.error:
+        # The resolved device is not a tty (the --tty - piped case). Tear
+        # down the half-built state and surface a clean error rather than
+        # a termios traceback.
+        term_restore()
+        raise SystemExit('browse-tui: not a terminal')
     signal.signal(signal.SIGWINCH, _handle_sigwinch)
     signal.signal(signal.SIGTSTP, _handle_sigtstp)
     signal.signal(signal.SIGCONT, _handle_sigcont)
 
+
+def term_child_fds():
+    """Return ``(in_fd, out_fd)`` for handing the terminal to a child.
+
+    The shell-out path (``run_external`` / ``page``) passes these to
+    ``subprocess`` as the child's stdin/stdout/stderr so an interactive
+    editor/pager talks to the same terminal -- without the parent ever
+    touching its own fd 0/1. In single-device mode both values are the one
+    ``O_RDWR`` device fd; in ``--tty -`` mode they are ``(0, 1)``.
+    """
+    return (_tty_fd_in, _tty_fd_out)
+
 def _leave_raw():
-    """Restore termios and leave alternate screen, but keep the notification pipe."""
+    """Restore termios and leave alternate screen, but keep the notification pipe.
+
+    No-op once the terminal is already torn down (``_tty_writer is None``)
+    so ``term_restore`` stays idempotent: a second ``term_restore`` (or any
+    ``_leave_raw`` after teardown) cleanly returns instead of dereferencing
+    the nulled writer / writing to the closed device fd. ``_tty_writer`` and
+    ``_tty_fd_in`` are nulled together in ``term_restore``, so this one guard
+    covers both the byte-write and the ``termios`` call below.
+    """
+    if _tty_writer is None:
+        return
     # Disable mouse tracking, show cursor, leave alternate screen
-    sys.stdout.buffer.write(b'\033[?1006l\033[?1000l\033[?25h\033[?1049l')
-    sys.stdout.buffer.flush()
+    _tty_writer.buffer.write(b'\033[?1006l\033[?1000l\033[?25h\033[?1049l')
+    _tty_writer.buffer.flush()
     if _saved_termios is not None:
-        termios.tcsetattr(sys.stdin.fileno(), termios.TCSAFLUSH, _saved_termios)
+        termios.tcsetattr(_tty_fd_in, termios.TCSAFLUSH, _saved_termios)
 
 def term_restore():
-    """Full cleanup: restore termios, leave alternate screen, close notification pipe."""
+    """Full cleanup: restore termios, leave alternate screen, close fds.
+
+    Closes the notification pipe and -- when we opened the terminal device
+    ourselves (a path or ``/dev/tty``) -- the device fd too, flushing it
+    via the owning writer. The std streams (``--tty -`` mode) are never
+    closed. Resets the device globals so a later ``term_init`` starts
+    clean.
+    """
     global _notify_r, _notify_w
+    global _tty_fd_in, _tty_fd_out, _tty_writer, _tty_owns_fd
     _leave_raw()
     for fd in (_notify_r, _notify_w):
         if fd >= 0:
@@ -505,6 +647,16 @@ def term_restore():
             except OSError:
                 pass
     _notify_r = _notify_w = -1
+    if _tty_owns_fd and _tty_writer is not None:
+        # Closing the owning TextIOWrapper flushes it and closes the
+        # underlying O_RDWR device fd exactly once.
+        try:
+            _tty_writer.close()
+        except OSError:
+            pass
+    _tty_fd_in = _tty_fd_out = -1
+    _tty_writer = None
+    _tty_owns_fd = False
 
 # ---- suspend / resume for shelling out -----------------------------------
 
@@ -526,18 +678,18 @@ def term_resume():
 # ---- keystroke reader -----------------------------------------------------
 
 def input_ready():
-    """Return True iff more keyboard input is buffered on stdin right now.
+    """Return True iff more keyboard input is buffered on the device right now.
 
     Non-blocking poll (``select`` with a zero timeout). Used by the main
     loop to coalesce a burst of keystrokes (e.g. a held-down arrow or a
     pasted command) into a single render — dispatch the queued keys
     back-to-back, paint once at the end.
 
-    Watches stdin only — the notification pipe is intentionally NOT
-    polled here so async worker deliveries break the coalescing loop
-    and the next outer iteration sees their state changes.
+    Watches the terminal device only — the notification pipe is
+    intentionally NOT polled here so async worker deliveries break the
+    coalescing loop and the next outer iteration sees their state changes.
     """
-    fd = sys.stdin.fileno()
+    fd = _tty_fd_in
     while True:
         try:
             r, _, _ = select.select([fd], [], [], 0)
@@ -556,9 +708,9 @@ def read_key():
     Retries on EINTR (e.g. from SIGWINCH).
     Also wakes up on the notification pipe and returns '_notify'.
     """
-    fd = sys.stdin.fileno()
+    fd = _tty_fd_in
 
-    # Wait for stdin or notification pipe
+    # Wait for the terminal device or the notification pipe
     watch_fds = [fd]
     if _notify_r >= 0:
         watch_fds.append(_notify_r)
@@ -575,12 +727,12 @@ def read_key():
                 os.read(_notify_r, 1024)
             except OSError:
                 pass
-            # Always deliver _notify first; stdin stays buffered for next call
+            # Always deliver _notify first; the device stays buffered for next call
             return '_notify'
-        break  # stdin is ready
+        break  # the terminal device is ready
 
     def _read1():
-        """Read a single byte from stdin, retrying on EINTR."""
+        """Read a single byte from the terminal device, retrying on EINTR."""
         while True:
             try:
                 b = os.read(fd, 1)
