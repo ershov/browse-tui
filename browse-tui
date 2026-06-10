@@ -8352,9 +8352,10 @@ class Browser:
                 # on_expand), then children-arrival (on_children_loaded),
                 # then the cursor. (on_resize compares the layout signature
                 # recorded by the PREVIOUS iteration's render against the
-                # last-fired one — so a layout change this iteration paints
-                # below and fires on the next drain, like the old SIGWINCH
-                # latch did. #828.)
+                # last-fired one — so a layout change paints below this
+                # iteration and fires on the next one, which the post-render
+                # wake below re-enters so it self-completes with no user
+                # input. #828, #834.)
                 self._fire_resize_if_layout_changed()
                 self._fire_search_change_if_pending()
                 self._fire_filter_change_if_pending()
@@ -8373,10 +8374,12 @@ class Browser:
                     # so the next paint regenerates at the new width.
                     self._invalidate_all_preview_renders()
                     # No explicit ``on_resize`` latch (#828): the forced
-                    # full redraw above recomputes ``_layout_for``, whose
-                    # signature now carries the new ``cols``/``rows`` — the
-                    # next drain's ``_fire_resize_if_layout_changed`` sees
-                    # the change and fires.
+                    # full redraw below recomputes ``_layout_for``, whose
+                    # signature picks up the new ``cols``/``rows``. The
+                    # post-render wake (#834) then re-enters the loop so the
+                    # next iteration's ``_fire_resize_if_layout_changed``
+                    # sees the change and fires — without it the fire would
+                    # stall until the user's next keypress.
                 # Screen-lost flag — set by SIGCONT / term_resume after the
                 # alt-screen content was destroyed externally. Drop the
                 # per-pane row caches so ``end_row`` doesn't cache-hit
@@ -8392,6 +8395,26 @@ class Browser:
                     else:
                         render_partial(self)
 
+                # Self-complete the broadened ``on_resize`` fire (#834).
+                # ``render`` above recomputed ``_layout_sig``, but
+                # ``_fire_resize_if_layout_changed`` ran at the top of THIS
+                # iteration against the previous paint's signature — so a
+                # layout change painted now only reaches the fire on the
+                # NEXT iteration, and after consuming the wake that brought
+                # us here ``read_key`` would block until the user's next
+                # keypress (the lag #829 papered over with Ctrl-L). When a
+                # handler is registered and the freshly-painted layout
+                # differs from the last-fired one, wake the loop so the
+                # next iteration runs the fire. The fire advances
+                # ``_last_resize_sig`` to match, so the following paint's
+                # signature is equal and this emits no further wake — a
+                # single nudge, not a spin. (The handler's own reaction —
+                # e.g. ``drop_preview_cache`` — re-wakes via its ``post``
+                # for the refetch + corrected repaint.)
+                if (self._on_resize is not None
+                        and self._layout_sig != self._last_resize_sig):
+                    notify_wake()
+
                 if self._quit_requested:
                     break
 
@@ -8405,7 +8428,8 @@ class Browser:
                     self._needs_redraw.add('all')
                     self._invalidate_all_preview_renders()
                     # on_resize fires off the layout signature (#828); the
-                    # forced redraw recomputes it with the new dimensions.
+                    # forced redraw recomputes it with the new dimensions and
+                    # the post-render wake (#834) drives the fire next loop.
                 if globals().get('g_screen_lost_flag', False):
                     globals()['g_screen_lost_flag'] = False
                     self._pane_cache.clear()
