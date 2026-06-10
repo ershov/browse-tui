@@ -31,6 +31,8 @@ ls | browse-tui --root-cmd cat --input tsv --fields id
 ```
 
 Selection is printed to stdout, exit code 0. Cancel with `q`/`Esc` (exit 1).
+The UI is painted to the terminal (`--tty`, default `/dev/tty`), not stdout,
+so `sel=$(ls | browse-tui --root-cmd cat …)` captures only the selection.
 
 ### CLI — drill into a tree (lazy):
 

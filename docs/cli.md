@@ -83,9 +83,11 @@ carry an explicit `parent`/`depth` column, the flag is ignored and
 `browse-tui: --path-sep ignored: rows carry explicit parent/depth` is
 printed to stderr.
 
-Special case: `--root-cmd cat` reads stdin verbatim (no subprocess). After
-consuming stdin, the binary reopens stdin from `/dev/tty` so keyboard input
-still works.
+Special case: `--root-cmd cat` reads stdin verbatim (no subprocess). The
+UI is painted to the terminal device (`--tty`, default `/dev/tty`), not to
+`stdin`/`stdout`, so keyboard input keeps working after stdin is consumed
+and `stdout` stays free for the selection — see
+[Terminal & capturable result](#terminal--capturable-result).
 
 ```bash
 # Pipe-in friendly:
@@ -341,6 +343,83 @@ Mixed (`m`, Alt-3):              Preview-children (`pc`, Alt-4):
   full height on the right. Children gets ~25% of the left-side height.
 * **Preview-children** — currently the same shape as Vertical; reserved
   as a distinct slot for future tweaks (and may be consolidated later).
+
+---
+
+## Terminal & capturable result
+
+`browse-tui` paints the UI to — and reads keys from — a dedicated **terminal
+device**, keeping the process's `stdin`/`stdout` free for content and results.
+That separation is what makes the selection cleanly capturable.
+
+### `--tty TTY_PATH`
+
+Terminal device for the UI. Default `/dev/tty` (the controlling terminal).
+The UI is drawn to, and keys are read from, this device while `stdin`/`stdout`
+stay free for piped content and the printed result.
+
+| `TTY_PATH`     | Behaviour                                                       |
+| -------------- | --------------------------------------------------------------- |
+| `/dev/tty`     | (default) Open the controlling terminal `O_RDWR`. `stdin`/`stdout` untouched. |
+| *device path*  | A specific terminal, e.g. `--tty /dev/pts/3`. Opened the same way. |
+| `-`            | Run the UI over the process's std streams (fd 0 in, fd 1 out), which must themselves be a terminal. The escape hatch for environments with no openable `/dev/tty`. |
+
+The flag works for **both** the CLI and Python recipes. Recipes get it for
+free: `Browser.run()` auto-detects `--tty TTY_PATH` / `--tty=TTY_PATH` in
+`sys.argv` and forwards the value to the terminal layer, so
+`./my-recipe --tty -` works without the recipe wiring its own argparse. A
+recipe that does argparse `--tty` itself (stripping it before `run()`) is
+unaffected.
+
+### Capturable result
+
+Because the UI lives on the terminal device (default `/dev/tty`) and never on
+`stdout`, `stdout` carries **only** the `print-exit` result — zero escape
+sequences. A command substitution captures just the selection:
+
+```bash
+# $sel is exactly the chosen id(s) — no UI bytes leak into the capture:
+sel=$(ls | browse-tui --root-cmd cat --input tsv --fields id)
+
+# Same for a redirect:
+ls | browse-tui --root-cmd cat --input tsv --fields id > picked.txt
+```
+
+The UI is fully interactive on the terminal the whole time; the result is
+delivered on `stdout` only when Enter fires `print-exit` (the default
+`--on-enter`; see [`--on-enter`](#--on-enter-mode) and
+[`--print-format`](#--print-format-fmt) for the result formatting).
+
+### No controlling terminal
+
+With no openable `/dev/tty` and no `--tty -` (cron, daemons, detached
+sessions), `browse-tui` exits non-zero with a clean one-line error on stderr —
+no Python traceback:
+
+```
+browse-tui: no controlling terminal; pass --tty - to run over stdin/stdout
+```
+
+`--tty -` is the escape hatch. But the std streams it adopts must be a real
+terminal: pointing `--tty -` at piped/redirected std streams exits 1 with
+
+```
+browse-tui: not a terminal
+```
+
+(An explicit device path that cannot be opened fails the same clean way:
+`browse-tui: cannot open terminal '<path>'`.)
+
+### `--tty -` limitation: no interactive pager
+
+In `--tty -` mode the UI rides on `stdin`/`stdout`, so there is **no separate
+terminal** for an interactive pager to read keys from while its stdin carries
+text. The pager paths — `v` (view preview in `$PAGER`), `~` (view the message
+log), and the `Context.page` API — therefore **degrade**: instead of launching
+`less`/`bat` interactively, the text is written straight to the terminal
+(primary screen / scrollback) and the UI repaints over it. Everything else
+works normally; this only affects interactive paging. Prefer the default
+`/dev/tty` (or an explicit device path) whenever one is available.
 
 ---
 
