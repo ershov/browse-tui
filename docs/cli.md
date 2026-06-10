@@ -413,13 +413,13 @@ browse-tui: not a terminal
 ### `--tty -` limitation: no interactive pager
 
 In `--tty -` mode the UI rides on `stdin`/`stdout`, so there is **no separate
-terminal** for an interactive pager to read keys from while its stdin carries
-text. The pager paths — `v` (view preview in `$PAGER`), `~` (view the message
-log), and the `Context.page` API — therefore **degrade**: instead of launching
-`less`/`bat` interactively, the text is written straight to the terminal
-(primary screen / scrollback) and the UI repaints over it. Everything else
-works normally; this only affects interactive paging. Prefer the default
-`/dev/tty` (or an explicit device path) whenever one is available.
+terminal** for a pager or editor to read keys from while its stdin carries
+text — the pager paths (`v` view preview, `~` view the message log, the
+`Context.page` API) and shell-outs to `$EDITOR` have no private `/dev/tty`.
+browse-tui does not special-case this: it runs `$PAGER`/`$EDITOR` normally
+(bracketed by suspend/resume so the screen stays safe), so configure them for
+non-interactive use if needed. Prefer the default `/dev/tty` (or an explicit
+device path) whenever one is available.
 
 ---
 

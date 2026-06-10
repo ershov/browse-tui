@@ -717,42 +717,19 @@ class Context:
         terminal layer's child-fd accessor) while its stdin carries the
         text -- so it paints to the terminal even when the parent's
         ``stdout`` is piped, and reads keys from the terminal device
-        itself (as ``cmd | less`` always has).
-
-        **``--tty -`` degradation.** When the terminal *is* the std
-        streams there is no separate device for the pager to read keys
-        from while its stdin carries the text, so interactive paging is
-        impossible. In that mode this writes the text straight to the
-        terminal (no pager) and returns -- but still through the same
-        ``term_suspend`` / ``term_resume`` bracket the pager path uses, so
-        the write lands on the *primary* screen (scrollback), not raw onto
-        the alt screen, and ``term_resume`` drops the row cache so the next
-        ``render_full`` repaints cleanly rather than leaving the alt screen
-        corrupted by the scrolled-in text.
+        itself (as ``cmd | less`` always has). In ``--tty -`` mode the
+        terminal rides on the std streams, so there is no separate device
+        for the pager to read keys from while its stdin carries the text;
+        whatever the pager does without a private ``/dev/tty`` is up to it
+        (configure ``$PAGER``/``$EDITOR`` for non-interactive use if
+        needed) -- the suspend/resume bracket keeps the screen safe either
+        way.
 
         Headless Browsers skip the suspend/resume + fd-passing (no term
         layer); the pager then inherits the test runner's stdin and just
         exits on EOF.
         """
         non_headless = not self._browser._headless
-        if non_headless and term_is_std_streams():
-            # No private terminal for the pager to read keys from — emit
-            # the text to the terminal directly and skip interactive paging.
-            # Reuse the pager path's suspend/resume bracket: term_suspend
-            # leaves the alt screen + restores cooked mode (the write then
-            # lands on the primary screen / scrollback), and term_resume
-            # re-enters raw + sets g_screen_lost_flag so render_full fully
-            # repaints over it.
-            term_suspend()
-            try:
-                _tty_writer.write(text if text.endswith('\n') else text + '\n')
-                _tty_writer.flush()
-            except Exception as e:
-                self.error(f'page: {type(e).__name__}: {e}')
-            finally:
-                term_resume()
-                self._browser._needs_redraw.add('all')
-            return
 
         pager = None
         for cand in ('bat', 'batcat'):
