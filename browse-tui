@@ -4623,6 +4623,20 @@ class Browser:
                 this to keep a status counter, sidebar, or external
                 pane in sync. Exceptions are caught and routed to
                 :meth:`error`.
+            on_resize: Optional ``(ctx, cols, rows) -> None`` callback
+                fired once per main-loop tick on which the pane layout
+                changed — terminal resize (SIGWINCH), split selector,
+                list-ratio nudge, or pane toggle (NOT just a terminal-
+                size change; the signature is unchanged but the fire is
+                a superset of the old SIGWINCH-only behaviour). ``cols``/
+                ``rows`` are the current terminal dimensions. The handler
+                does not get a "what changed" reason — a recipe that
+                cares re-reads the environment (e.g. ``ctx.preview_width``,
+                current when the callback runs) itself. Recipes use this
+                to refresh width-dependent state, e.g.
+                ``lambda ctx, c, r: ctx.drop_preview_cache()`` to
+                re-render previews at the new preview-pane width.
+                Exceptions are caught and routed to :meth:`error`.
             on_quit: Optional ``(ctx) -> None`` callback fired once
                 during main-loop shutdown, after the screen is
                 restored but before ``Browser.run`` returns. Recipes
@@ -4747,9 +4761,11 @@ class Browser:
         # ``_last_filters`` (so every mutation source — live edit, commit,
         # ``set_search_query`` / ``set_filters`` / ``add_filter`` /
         # ``clear_*`` — coalesces to one fire per drain). ``on_resize``
-        # fires once when an observed SIGWINCH changes ``term_size()`` vs
-        # ``_last_size``. ``on_quit`` fires once during shutdown after the
-        # screen is restored.
+        # fires once per drain when the pane layout changed (terminal
+        # resize, split selector, list-ratio nudge, pane toggle) — a
+        # drain-time diff of the layout signature recorded by
+        # ``_layout_for`` against ``_last_resize_sig`` (#828). ``on_quit``
+        # fires once during shutdown after the screen is restored.
         self._on_cursor_change = config.on_cursor_change
         self._on_scope_change = config.on_scope_change
         self._on_selection_change = config.on_selection_change
@@ -4793,15 +4809,16 @@ class Browser:
         # Snapshots for the input-state / geometry diffs. ``on_search_change``
         # / ``on_filter_change`` fire when the effective query / filter tuple
         # differs from these (clearing to ``''`` / ``()`` is a real change →
-        # fires once). ``_last_size`` is ``None`` until the first observed
-        # resize so the first SIGWINCH always fires. ``_resize_pending`` is
-        # latched at the SIGWINCH observation points (mirrors
-        # ``_cursor_change_pending``); the drain consumes it so ``term_size``
-        # is only read on an actual resize, not every tick.
+        # fires once). ``_last_resize_sig`` is the layout signature
+        # (``(cols, rows, preview_rect, children_rect)``) as of the last
+        # ``on_resize`` fire; ``_layout_sig`` is the signature recorded by
+        # the most recent ``_layout_for`` render pass (``None`` until the
+        # first paint — headless never paints, so it stays ``None`` there).
+        # The drain fires ``on_resize`` when the two differ (#828).
         self._last_search_query = ''
         self._last_filters: tuple = ()
-        self._last_size = None
-        self._resize_pending = False
+        self._layout_sig = None
+        self._last_resize_sig = None
         self._headless = config._headless
 
         # --- domain state ------------------------------------------------
@@ -6797,48 +6814,52 @@ class Browser:
             except Exception as e:
                 self.error(f'on_filter_change: {type(e).__name__}: {e}')
 
-    def _fire_resize_if_pending(self) -> None:
-        """Fire ``on_resize`` once when an observed resize changed the size.
+    def _fire_resize_if_layout_changed(self) -> None:
+        """Fire ``on_resize`` once when the pane layout changed since last fire.
 
-        Gated by ``_resize_pending`` — latched at the SIGWINCH observation
-        points in the run loop (mirrors ``_cursor_change_pending``) so
-        ``term_size()`` is only read on an actual resize, not every tick.
-        When pending, reads ``term_size()`` and, if ``(cols, rows)`` differs
-        from ``_last_size``, fires ``on_resize(ctx, cols, rows)`` and
-        re-snapshots.
+        Broadened from the historic SIGWINCH-only behaviour (#828): fires
+        on ANY pane-layout change — terminal resize, split selector,
+        list-ratio nudge, pane toggle — not just a terminal-size change.
+        ``_layout_for`` (050-render) records a layout signature
+        ``(cols, rows, preview_rect, children_rect)`` on ``_layout_sig``
+        every render pass; this compares it against ``_last_resize_sig``
+        (the signature as of the last fire) and, when they differ, fires
+        ``on_resize(ctx, cols, rows)`` and advances the baseline. Including
+        ``cols``/``rows`` preserves the old "terminal resize always fires"
+        contract; the preview/children rects pick up split/ratio/toggle
+        changes that leave the terminal size untouched.
 
-        When ``on_resize`` is unset (#627) the pending flag is still cleared
-        (so a single SIGWINCH never lingers) but the method early-returns
-        BEFORE reading ``term_size()`` — the syscall and the snapshot are
-        skipped, so ``_last_size`` may go stale; fine because hooks are
-        construction-time-fixed (matches ``on_cursor_change``).
+        Called from the run loop's post-drain settle pass (the same site
+        the old SIGWINCH-only fire used), which runs AFTER the previous
+        iteration's render — so the signature reflects the just-painted
+        layout and a handler reading ``ctx.preview_width`` sees the current
+        value. Advancing the baseline on every fire means the next
+        unchanged paint produces an equal signature and does NOT re-fire
+        (no loop). The SIGWINCH path still works through this: its
+        forced redraw recomputes ``_layout_for`` with the new ``cols``/
+        ``rows``, changing the signature.
 
-        ``term_size`` can be missing, raise, or return ``(0, 0)`` in a
-        headless / no-tty context (mirrors ``_clamp_split`` /
-        ``_list_pane_height_safe``); in any of those cases we don't fire
-        garbage dimensions and leave ``_last_size`` untouched.
+        When ``on_resize`` is unset (#627) the method early-returns without
+        touching the baseline — hooks are construction-time-fixed (matches
+        ``on_cursor_change``). ``_layout_sig`` is ``None`` until the first
+        paint (headless never paints), and ``cols``/``rows`` are the raw,
+        unclamped ``term_size()`` values, ``(0, 0)`` in a headless / no-tty
+        context — in either case we don't fire garbage dimensions and leave
+        the baseline untouched.
         """
-        if not self._resize_pending:
-            return
-        self._resize_pending = False
         if self._on_resize is None:
             return
-        ts = globals().get('term_size')
-        if ts is None:
+        sig = self._layout_sig
+        if sig is None or sig == self._last_resize_sig:
             return
-        try:
-            cols, rows = ts()
-        except Exception:
-            return
+        cols, rows = sig[0], sig[1]
         if not cols or not rows:
             return
-        size = (cols, rows)
-        if size != self._last_size:
-            self._last_size = size
-            try:
-                self._on_resize(self._make_ctx_for_hook(), cols, rows)
-            except Exception as e:
-                self.error(f'on_resize: {type(e).__name__}: {e}')
+        self._last_resize_sig = sig
+        try:
+            self._on_resize(self._make_ctx_for_hook(), cols, rows)
+        except Exception as e:
+            self.error(f'on_resize: {type(e).__name__}: {e}')
 
     def _fire_on_quit(self) -> None:
         """Fire ``on_quit`` once during shutdown.
@@ -8329,10 +8350,12 @@ class Browser:
                 # (on_search_change → on_filter_change) first since they may
                 # reshape the visible tree, then structure (on_collapse →
                 # on_expand), then children-arrival (on_children_loaded),
-                # then the cursor. (on_resize consumes the ``_resize_pending``
-                # flag latched at the SIGWINCH observation points below, so
-                # a resize observed this iteration fires on the next drain.)
-                self._fire_resize_if_pending()
+                # then the cursor. (on_resize compares the layout signature
+                # recorded by the PREVIOUS iteration's render against the
+                # last-fired one — so a layout change this iteration paints
+                # below and fires on the next drain, like the old SIGWINCH
+                # latch did. #828.)
+                self._fire_resize_if_layout_changed()
                 self._fire_search_change_if_pending()
                 self._fire_filter_change_if_pending()
                 self._fire_expand_collapse_if_pending()
@@ -8349,10 +8372,11 @@ class Browser:
                     # Walk loaded items and drop every ``preview_render``
                     # so the next paint regenerates at the new width.
                     self._invalidate_all_preview_renders()
-                    # Latch for the ``on_resize`` hook — the next drain's
-                    # ``_fire_resize_if_pending`` reads ``term_size`` and
-                    # fires if the dimensions actually changed.
-                    self._resize_pending = True
+                    # No explicit ``on_resize`` latch (#828): the forced
+                    # full redraw above recomputes ``_layout_for``, whose
+                    # signature now carries the new ``cols``/``rows`` — the
+                    # next drain's ``_fire_resize_if_layout_changed`` sees
+                    # the change and fires.
                 # Screen-lost flag — set by SIGCONT / term_resume after the
                 # alt-screen content was destroyed externally. Drop the
                 # per-pane row caches so ``end_row`` doesn't cache-hit
@@ -8380,7 +8404,8 @@ class Browser:
                     globals()['g_resize_flag'] = False
                     self._needs_redraw.add('all')
                     self._invalidate_all_preview_renders()
-                    self._resize_pending = True
+                    # on_resize fires off the layout signature (#828); the
+                    # forced redraw recomputes it with the new dimensions.
                 if globals().get('g_screen_lost_flag', False):
                     globals()['g_screen_lost_flag'] = False
                     self._pane_cache.clear()
@@ -12180,6 +12205,21 @@ def _layout_for(browser):
     browser._preview_width = (
         prect.width if prect is not None and prect.width > 0 else 0
     )
+    # Layout signature for the broadened ``on_resize`` hook (#828). The
+    # run loop fires ``on_resize`` whenever this differs from the
+    # last-fired value, so it must change on EVERY pane-layout change the
+    # hook cares about — terminal resize, split selector, list-ratio
+    # nudge, pane toggle — and on nothing else. ``cols``/``rows`` are the
+    # RAW ``term_size()`` values (NOT ``layout['cols']/['rows']``, which
+    # ``layout_panes`` clamps to >=1): the fire path passes them to the
+    # callback and skips firing when they're zero (headless / no-tty), so
+    # the unclamped pair is what preserves the "don't fire garbage dims"
+    # guard. The preview + children rects (position AND size) capture
+    # every geometric reshape — a list-ratio change moves the preview's
+    # height in 'h' and its width in 'v', and pane toggles flip a rect
+    # to/from ``None`` — which is exactly when a width-dependent preview
+    # may need re-rendering (height-only changes fire too, harmlessly).
+    browser._layout_sig = (cols, rows, prect, layout.get('children'))
     # The info bar always spans the full width in current layouts (the
     # pane separator that owns it is full-width by construction), so
     # it's rightmost whenever it exists.

@@ -1088,155 +1088,169 @@ class TestOnFilterChange(unittest.TestCase):
 
 
 class TestOnResize(unittest.TestCase):
-    """``on_resize(ctx, cols, rows)`` — fires once when an observed resize
-    changes ``term_size()`` vs ``_last_size``; unchanged size fires
-    nothing. A staged ``_resize_pending`` flag (set at the SIGWINCH
-    observation points) gates the diff. ``term_size`` is stubbed onto the
-    state module here (the production build resolves it by concatenation).
+    """``on_resize(ctx, cols, rows)`` — fires once per main-loop tick when
+    the *pane layout* changed since the last fire (terminal resize, split
+    selector, list-ratio nudge, pane toggle), not just on SIGWINCH.
+
+    ``_layout_for`` (050-render) records a layout SIGNATURE on the Browser
+    every paint — ``(cols, rows, preview_rect, children_rect)`` — and
+    ``_fire_resize_if_layout_changed`` fires when that differs from the
+    last-fired signature, passing the signature's ``cols``/``rows`` to the
+    callback. ``term_size`` is stubbed onto the render module here (the
+    production build resolves it by concatenation); ``set_split`` /
+    ``set_list_ratio`` are driven through their real (post → drain) path
+    so the wiring is exercised end-to-end.
     """
 
     def _stub_term_size(self, ret):
-        """Patch ``term_size`` onto _state; return a restorer. ``ret`` is a
-        ``(cols, rows)`` tuple or a callable returning one (or raising).
+        """Patch ``term_size`` onto _render (read by ``_layout_for``); return
+        a restorer. ``ret`` is a ``(cols, rows)`` tuple or a callable
+        returning one (or raising).
         """
-        prev = getattr(_state, 'term_size', None)
-        had = hasattr(_state, 'term_size')
-        _state.term_size = ret if callable(ret) else (lambda: ret)
+        prev = getattr(_render, 'term_size', None)
+        had = hasattr(_render, 'term_size')
+        _render.term_size = ret if callable(ret) else (lambda: ret)
 
         def restore():
             if had:
-                _state.term_size = prev
-            elif hasattr(_state, 'term_size'):
-                del _state.term_size
+                _render.term_size = prev
+            elif hasattr(_render, 'term_size'):
+                del _render.term_size
         return restore
 
-    def test_fires_once_on_changed_size(self):
-        fired = []
-        b = Browser(BrowserConfig(_headless=True,
-                    on_resize=lambda ctx, c, r: fired.append((c, r))))
-        restore = self._stub_term_size((120, 40))
-        try:
-            b._resize_pending = True          # SIGWINCH observed
-            b._fire_resize_if_pending()
-            self.assertEqual(fired, [(120, 40)])
-            self.assertEqual(b._last_size, (120, 40))
-        finally:
-            restore()
+    def _paint(self, b):
+        """Recompute + record the layout signature, mirroring a render pass
+        (the run loop calls ``_layout_for`` from ``render_full`` /
+        ``render_partial`` right before re-deriving fires next tick).
+        """
+        _render._layout_for(b)
 
-    def test_unchanged_size_fires_nothing(self):
+    def test_fires_on_terminal_size_change(self):
         fired = []
         b = Browser(BrowserConfig(_headless=True,
                     on_resize=lambda ctx, c, r: fired.append((c, r))))
         restore = self._stub_term_size((80, 24))
         try:
-            b._last_size = (80, 24)           # already at this size
-            b._resize_pending = True
-            b._fire_resize_if_pending()
-            self.assertEqual(fired, [])
+            self._paint(b)                    # baseline at 80x24
+            b._fire_resize_if_layout_changed()
+            fired.clear()                     # ignore the initial fire
+            restore()
+            restore = self._stub_term_size((120, 40))
+            self._paint(b)                    # terminal grew
+            b._fire_resize_if_layout_changed()
+            self.assertEqual(fired, [(120, 40)])
         finally:
             restore()
 
-    def test_no_pending_no_term_size_read(self):
-        # Without the staged flag the diff doesn't run at all.
+    def test_fires_on_split_change_same_size(self):
+        # A split-selector change leaves cols/rows untouched but reshapes
+        # the preview pane — must still fire (the SIGWINCH-only path didn't).
         fired = []
-        reads = []
+        b = Browser(BrowserConfig(_headless=True, split='h', show_preview=True,
+                    on_resize=lambda ctx, c, r: fired.append((c, r))))
+        restore = self._stub_term_size((100, 40))
+        try:
+            self._paint(b)
+            b._fire_resize_if_layout_changed()
+            fired.clear()
+            b.set_split('v')                  # real post → drain path
+            b.drain_main_queue()
+            self.assertEqual(b.split, 'v')
+            self._paint(b)
+            b._fire_resize_if_layout_changed()
+            self.assertEqual(fired, [(100, 40)])   # cols/rows unchanged
+        finally:
+            restore()
+
+    def test_fires_on_list_ratio_change_same_size(self):
+        # A list-ratio nudge leaves cols/rows untouched but moves the
+        # preview pane (its height in 'h', width in 'v') — must fire.
+        fired = []
+        b = Browser(BrowserConfig(_headless=True, split='h', list_ratio=0.30,
+                    show_preview=True,
+                    on_resize=lambda ctx, c, r: fired.append((c, r))))
+        restore = self._stub_term_size((100, 40))
+        try:
+            self._paint(b)
+            b._fire_resize_if_layout_changed()
+            fired.clear()
+            b.set_list_ratio(0.70)            # real post → drain path
+            b.drain_main_queue()
+            self._paint(b)
+            b._fire_resize_if_layout_changed()
+            self.assertEqual(fired, [(100, 40)])   # cols/rows unchanged
+        finally:
+            restore()
+
+    def test_no_fire_when_layout_unchanged(self):
+        # Two identical paints: the signature matches the baseline, so a
+        # second fire is a no-op (the broadened fire must not loop).
+        fired = []
         b = Browser(BrowserConfig(_headless=True,
                     on_resize=lambda ctx, c, r: fired.append((c, r))))
-
-        def counting():
-            reads.append(1)
-            return (100, 30)
-        restore = self._stub_term_size(counting)
+        restore = self._stub_term_size((100, 40))
         try:
-            b._fire_resize_if_pending()       # _resize_pending is False
-            self.assertEqual(fired, [])
-            self.assertEqual(reads, [])
+            self._paint(b)
+            b._fire_resize_if_layout_changed()    # initial fire
+            self._paint(b)                        # nothing changed
+            b._fire_resize_if_layout_changed()
+            self.assertEqual(fired, [(100, 40)])  # exactly once
         finally:
             restore()
 
-    def test_missing_handler_skips_term_size_read_but_clears_flag(self):
-        # No on_resize (#627): even with the SIGWINCH flag staged, the fire
-        # path early-returns BEFORE reading term_size() (the syscall is
-        # skipped). The pending flag is still cleared so a single SIGWINCH
-        # never lingers, and ``_last_size`` is left untouched.
-        reads = []
-
-        def counting():
-            reads.append(1)
-            return (100, 30)
-        b = Browser(BrowserConfig(_headless=True))   # no on_resize
-        restore = self._stub_term_size(counting)
-        try:
-            b._resize_pending = True
-            b._fire_resize_if_pending()
-            self.assertEqual(reads, [])               # term_size NOT read
-            self.assertFalse(b._resize_pending)       # flag still cleared
-            self.assertIsNone(b._last_size)           # snapshot untouched
-        finally:
-            restore()
-
-    def test_second_drain_does_not_refire(self):
+    def test_second_call_does_not_refire(self):
+        # No-loop guard: after a fire, repeated calls with no new paint and
+        # an unchanged signature do nothing.
         fired = []
         b = Browser(BrowserConfig(_headless=True,
                     on_resize=lambda ctx, c, r: fired.append((c, r))))
         restore = self._stub_term_size((90, 30))
         try:
-            b._resize_pending = True
-            b._fire_resize_if_pending()
-            # Flag cleared on fire; a second call with no new SIGWINCH and
-            # the same size does nothing.
-            b._fire_resize_if_pending()
+            self._paint(b)
+            b._fire_resize_if_layout_changed()
+            b._fire_resize_if_layout_changed()
+            b._fire_resize_if_layout_changed()
             self.assertEqual(fired, [(90, 30)])
         finally:
             restore()
 
-    def test_zero_dims_do_not_fire(self):
-        # Headless / no-tty term_size often returns (0, 0); don't fire
-        # garbage dimensions.
+    def test_unset_handler_is_noop(self):
+        # No on_resize (#627): a layout change + fire is a safe no-op.
+        b = Browser(BrowserConfig(_headless=True, show_preview=True))  # no on_resize
+        restore = self._stub_term_size((100, 40))
+        try:
+            self._paint(b)
+            b._fire_resize_if_layout_changed()       # must not raise
+            b.set_split('v')
+            b.drain_main_queue()
+            self._paint(b)
+            b._fire_resize_if_layout_changed()       # still a no-op
+        finally:
+            restore()
+
+    def test_no_layout_yet_does_not_fire(self):
+        # Before the first paint the signature is unset → no fire, no crash
+        # (headless runs never paint, so this is also the headless contract).
+        fired = []
+        b = Browser(BrowserConfig(_headless=True,
+                    on_resize=lambda ctx, c, r: fired.append((c, r))))
+        self.assertIsNone(b._layout_sig)
+        b._fire_resize_if_layout_changed()
+        self.assertEqual(fired, [])
+
+    def test_no_tty_zero_dims_do_not_fire(self):
+        # Headless / no-tty term_size returns (0, 0); ``_layout_for`` still
+        # records a signature, but the fire must not emit garbage dims.
         fired = []
         b = Browser(BrowserConfig(_headless=True,
                     on_resize=lambda ctx, c, r: fired.append((c, r))))
         restore = self._stub_term_size((0, 0))
         try:
-            b._resize_pending = True
-            b._fire_resize_if_pending()
-            self.assertEqual(fired, [])
-            self.assertIsNone(b._last_size)
-        finally:
-            restore()
-
-    def test_term_size_raising_is_graceful(self):
-        fired = []
-        b = Browser(BrowserConfig(_headless=True,
-                    on_resize=lambda ctx, c, r: fired.append((c, r))))
-
-        def raising():
-            raise OSError('no tty')
-        restore = self._stub_term_size(raising)
-        try:
-            b._resize_pending = True
-            b._fire_resize_if_pending()       # must not raise
+            self._paint(b)
+            b._fire_resize_if_layout_changed()
             self.assertEqual(fired, [])
         finally:
             restore()
-
-    def test_missing_term_size_is_graceful(self):
-        # term_size not wired onto the module at all (the default in many
-        # headless test modules) → no fire, no crash.
-        fired = []
-        b = Browser(BrowserConfig(_headless=True,
-                    on_resize=lambda ctx, c, r: fired.append((c, r))))
-        prev = getattr(_state, 'term_size', None)
-        had = hasattr(_state, 'term_size')
-        if had:
-            del _state.term_size
-        try:
-            b._resize_pending = True
-            b._fire_resize_if_pending()
-            self.assertEqual(fired, [])
-        finally:
-            if had:
-                _state.term_size = prev
 
     def test_exception_in_handler_routed_to_error(self):
         def bad(ctx, c, r):
@@ -1244,13 +1258,16 @@ class TestOnResize(unittest.TestCase):
         b = Browser(BrowserConfig(_headless=True, on_resize=bad))
         restore = self._stub_term_size((110, 35))
         try:
-            b._resize_pending = True
-            b._fire_resize_if_pending()
+            self._paint(b)
+            b._fire_resize_if_layout_changed()
             b.drain_main_queue()
             self.assertIn('resize boom', _err_log(b))
             self.assertIn('on_resize', _err_log(b))
-            # Size baseline still advanced despite the throw.
-            self.assertEqual(b._last_size, (110, 35))
+            # Baseline still advanced despite the throw — a re-fire loop on
+            # the same (still-failing) layout would spam the error log.
+            fired_again = []
+            b._fire_resize_if_layout_changed()
+            self.assertEqual(_err_log(b).count('resize boom'), 1)
         finally:
             restore()
 
@@ -1274,8 +1291,8 @@ class TestDefaultsAreNoOp(unittest.TestCase):
         b.set_filters(['f'])
         b.drain_main_queue()
         b._fire_filter_change_if_pending()
-        b._resize_pending = True
-        b._fire_resize_if_pending()
+        b._layout_sig = (80, 24, None, None)
+        b._fire_resize_if_layout_changed()
         b._fire_on_quit()
 
 

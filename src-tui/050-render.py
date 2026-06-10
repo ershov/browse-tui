@@ -2848,6 +2848,21 @@ def _layout_for(browser):
     browser._preview_width = (
         prect.width if prect is not None and prect.width > 0 else 0
     )
+    # Layout signature for the broadened ``on_resize`` hook (#828). The
+    # run loop fires ``on_resize`` whenever this differs from the
+    # last-fired value, so it must change on EVERY pane-layout change the
+    # hook cares about — terminal resize, split selector, list-ratio
+    # nudge, pane toggle — and on nothing else. ``cols``/``rows`` are the
+    # RAW ``term_size()`` values (NOT ``layout['cols']/['rows']``, which
+    # ``layout_panes`` clamps to >=1): the fire path passes them to the
+    # callback and skips firing when they're zero (headless / no-tty), so
+    # the unclamped pair is what preserves the "don't fire garbage dims"
+    # guard. The preview + children rects (position AND size) capture
+    # every geometric reshape — a list-ratio change moves the preview's
+    # height in 'h' and its width in 'v', and pane toggles flip a rect
+    # to/from ``None`` — which is exactly when a width-dependent preview
+    # may need re-rendering (height-only changes fire too, harmlessly).
+    browser._layout_sig = (cols, rows, prect, layout.get('children'))
     # The info bar always spans the full width in current layouts (the
     # pane separator that owns it is full-width by construction), so
     # it's rightmost whenever it exists.
