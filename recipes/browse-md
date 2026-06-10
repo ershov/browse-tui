@@ -2064,6 +2064,17 @@ def main():
         initial_scope=initial_scope,
         actions=actions,
         on_expand=_on_expand,
+        # Preview content is width-dependent: ``get_preview`` (and
+        # ``_md_render``) lay markdown out — prose wrap AND table column
+        # widths — through md2ansi at ``ctx.preview_width``. The framework
+        # caches that rendered text by id (width-agnostic) and, on a layout
+        # change, only re-wraps the already-laid-out text — it can't re-pack
+        # an md2ansi table to a new width. So on ANY pane-layout change
+        # (terminal resize, split selector, list-ratio nudge — #828 broadened
+        # on_resize to fire on all of them) drop the preview cache; the
+        # framework then refetches and ``get_preview`` re-renders at the
+        # now-current preview width.
+        on_resize=lambda ctx, cols, rows: ctx.drop_preview_cache(),
         help_intro=_HELP_INTRO,
     ))
     # Stash the Browser on the module so ``get_preview`` can read

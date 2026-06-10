@@ -4425,5 +4425,41 @@ class TestCollectInputFiles(unittest.TestCase):
                 self.r._collect_input_files([missing])
 
 
+class TestOnResize(unittest.TestCase):
+    """#830: the recipe registers ``on_resize`` -> ``drop_preview_cache``."""
+
+    def test_on_resize_drops_preview_cache(self):
+        # #830: the recipe registers an on_resize handler that drops the
+        # whole preview cache, so a pane-layout change (terminal resize OR
+        # split/ratio — the broadened on_resize, #828) triggers a refetch
+        # and ``get_preview`` re-lays width-dependent previews (md2ansi
+        # tables / wrapped markdown prose) at the new ctx.preview_width.
+        # We can't run main() under unit test (it touches argv / the
+        # md2ansi dependency gate), so confirm (a) the exact registration
+        # is present in source, and (b) that handler shape actually calls
+        # ``drop_preview_cache()`` when invoked.
+        source = _RECIPE.read_text()
+        self.assertIn(
+            'on_resize=lambda ctx, cols, rows: ctx.drop_preview_cache(),',
+            source,
+            'browse-md must register on_resize -> drop_preview_cache so '
+            'width-dependent previews refetch on a layout change')
+        # Behavioural check on the registered handler shape: a spy ctx
+        # records the drop call. (The end-to-end re-render is covered by
+        # test/ui/test_recipe_browse_md.py.)
+        drops = []
+
+        class _SpyCtx:
+            def drop_preview_cache(self, id_=None):
+                drops.append(id_)
+
+        on_resize = lambda ctx, cols, rows: ctx.drop_preview_cache()
+        on_resize(_SpyCtx(), 120, 40)
+        self.assertEqual(
+            drops, [None],
+            'on_resize must drop the entire preview cache (id=None) so the '
+            'framework re-fetches the cursor preview at the new width')
+
+
 if __name__ == '__main__':
     unittest.main()
