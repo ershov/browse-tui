@@ -44,7 +44,7 @@ through writing your own.
 # Just the engine — copy the single file anywhere on your $PATH:
 cp browse-tui ~/.local/bin/
 
-# Batteries included — engine + the recipes + md/md2ansi tools + b-* aliases:
+# Batteries included — engine + the recipes + mdless/mdcat tools + b-* aliases:
 ./install-bin.sh     # copies into the first of ~/.local/bin, ~/bin, /usr/local/bin
 ./install-link.sh    # same, but symlinks back to this checkout (handy while hacking)
 ./uninstall.sh       # removes everything the installers placed

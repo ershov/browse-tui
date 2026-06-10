@@ -43,7 +43,7 @@ files or directories; `FILE.md#section` deep-links straight to a heading.
 ```
 
 Keys: `m` toggle md2ansi coloring, `M` page the preview through
-`$MD2ANSI` / `md2ansi`, `V` page the source in `$PAGER`, `E` edit the
+`$MDCAT` / `mdcat`, `V` page the source in `$PAGER`, `E` edit the
 source in `$EDITOR`, `→` expand (auto-expands a single-heading file),
 `Ctrl-R` re-slurp every file from disk.
 

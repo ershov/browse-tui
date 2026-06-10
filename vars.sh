@@ -2,7 +2,7 @@
 set -ueo pipefail
 
 MYDIR="$(realpath "$(dirname -- "${BASH_SOURCE[0]}")")"
-FILES=("$MYDIR"/{browse-tui,md,md2ansi,recipes/{browse-claude,browse-find,browse-fs,browse-git,browse-jira,browse-jira-mcp,browse-mcp,browse-md,browse-plan,browse-procs,md2ansi_lib.py,md_doc.py}})
+FILES=("$MYDIR"/{browse-tui,mdless,mdcat,recipes/{browse-claude,browse-find,browse-fs,browse-git,browse-jira,browse-jira-mcp,browse-mcp,browse-md,browse-plan,browse-procs,md2ansi_lib.py,md_doc.py}})
 DESTS=("$HOME/.local/bin" "$HOME/bin" "/usr/local/bin")
 
 relpath() { # args: from, to

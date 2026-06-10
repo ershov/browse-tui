@@ -1334,7 +1334,7 @@ class TestToggleMd(unittest.TestCase):
 
 
 class TestResolveMdPager(unittest.TestCase):
-    """``_resolve_md_pager`` walks ``$MD2ANSI`` / ``md2ansi+less`` in order."""
+    """``_resolve_md_pager`` walks ``$MDCAT`` / ``mdcat+less`` in order."""
 
     @classmethod
     def setUpClass(cls):
@@ -1368,15 +1368,15 @@ class TestResolveMdPager(unittest.TestCase):
             os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
 
     def test_env_var_wins(self):
-        restore = self._with_env(MD2ANSI='md2ansi')
+        restore = self._with_env(MDCAT='mdcat')
         try:
-            self.assertEqual(self.r._resolve_md_pager(), ['md2ansi'])
+            self.assertEqual(self.r._resolve_md_pager(), ['mdcat'])
         finally:
             restore()
 
     def test_env_var_shlex_splits(self):
         # ``shlex.split`` keeps the flag separate from the binary name.
-        restore = self._with_env(MD2ANSI='my-md-cmd --flag')
+        restore = self._with_env(MDCAT='my-md-cmd --flag')
         try:
             self.assertEqual(self.r._resolve_md_pager(),
                              ['my-md-cmd', '--flag'])
@@ -1384,47 +1384,47 @@ class TestResolveMdPager(unittest.TestCase):
             restore()
 
     def test_env_pipeline_uses_bash_dash_c(self):
-        # ``|`` in $MD2ANSI → bash wrapper so the pipe runs.
-        restore = self._with_env(MD2ANSI='md2ansi | less -R')
+        # ``|`` in $MDCAT → bash wrapper so the pipe runs.
+        restore = self._with_env(MDCAT='mdcat | less -R')
         try:
             cmd = self.r._resolve_md_pager()
             self.assertEqual(cmd[0], 'bash')
             self.assertEqual(cmd[1], '-c')
-            self.assertIn('md2ansi | less -R', cmd[2])
+            self.assertIn('mdcat | less -R', cmd[2])
         finally:
             restore()
 
-    def test_md2ansi_plus_less_pipes_to_less_rs(self):
-        # Default fallback when both md2ansi and less exist: pipe
-        # md2ansi output through ``less -RS`` via bash.
+    def test_mdcat_plus_less_pipes_to_less_rs(self):
+        # Default fallback when both mdcat and less exist: pipe
+        # mdcat output through ``less -RS`` via bash.
         import os
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
-            self._scratch_bin(tmp, ['md2ansi', 'less'])
+            self._scratch_bin(tmp, ['mdcat', 'less'])
             saved_path = os.environ['PATH']
-            restore = self._with_env(MD2ANSI=None)
+            restore = self._with_env(MDCAT=None)
             try:
                 os.environ['PATH'] = tmp
                 cmd = self.r._resolve_md_pager()
                 self.assertEqual(cmd[0], 'bash')
                 self.assertEqual(cmd[1], '-c')
-                self.assertIn('md2ansi', cmd[2])
+                self.assertIn('mdcat', cmd[2])
                 self.assertIn('less -RS', cmd[2])
             finally:
                 os.environ['PATH'] = saved_path
                 restore()
 
-    def test_md2ansi_alone_no_pipe(self):
-        # Without ``less`` on PATH, fall back to bare ``md2ansi``.
+    def test_mdcat_alone_no_pipe(self):
+        # Without ``less`` on PATH, fall back to bare ``mdcat``.
         import os
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
-            self._scratch_bin(tmp, ['md2ansi'])
+            self._scratch_bin(tmp, ['mdcat'])
             saved_path = os.environ['PATH']
-            restore = self._with_env(MD2ANSI=None)
+            restore = self._with_env(MDCAT=None)
             try:
                 os.environ['PATH'] = tmp
-                self.assertEqual(self.r._resolve_md_pager(), ['md2ansi'])
+                self.assertEqual(self.r._resolve_md_pager(), ['mdcat'])
             finally:
                 os.environ['PATH'] = saved_path
                 restore()
@@ -1432,7 +1432,7 @@ class TestResolveMdPager(unittest.TestCase):
     def test_none_when_nothing_resolves(self):
         # No env var, no binaries on PATH → ``None``.
         import os
-        restore = self._with_env(MD2ANSI=None)
+        restore = self._with_env(MDCAT=None)
         saved_path = os.environ.get('PATH', '')
         try:
             os.environ['PATH'] = '/nonexistent-' + str(os.getpid())

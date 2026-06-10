@@ -33,7 +33,7 @@ tree in place.
 Custom actions on top of the framework defaults:
 
   m   toggle md2ansi coloring of the preview.
-  M   page the preview through ``$MD2ANSI`` / external ``md2ansi``.
+  M   page the preview through ``$MDCAT`` / external ``mdcat``.
   V   page the source for cursor/selection in ``$PAGER``. On a
       per-file root opens that file; on non-root rows pages a temp
       file containing the merged byte-range slices. Cross-file
@@ -1421,25 +1421,25 @@ def _action_toggle_md(ctx):
 def _resolve_md_pager():
     """Return the resolved markdown-pager command, or ``None``.
 
-    Order: ``$MD2ANSI`` (shell-split), then ``md2ansi | less -RS`` if
-    both binaries are on PATH, then bare ``md2ansi``. Recipes that
-    want a different fallback can set ``$MD2ANSI`` to anything —
-    including a piped chain like ``md2ansi | less -R``, which we
+    Order: ``$MDCAT`` (shell-split), then ``mdcat | less -RS`` if
+    both binaries are on PATH, then bare ``mdcat``. Recipes that
+    want a different fallback can set ``$MDCAT`` to anything —
+    including a piped chain like ``mdcat | less -R``, which we
     shell out via ``bash -c`` so the pipe works. Lifted verbatim from
     browse-claude's same-named helper.
     """
     import shlex
     import shutil
-    env_cmd = os.environ.get('MD2ANSI')
+    env_cmd = os.environ.get('MDCAT')
     if env_cmd:
         if '|' in env_cmd or '<' in env_cmd or '>' in env_cmd:
             # User-supplied pipeline — hand to a shell so the pipe runs.
             return ['bash', '-c', f'{env_cmd} "$0"']
         return shlex.split(env_cmd)
-    if shutil.which('md2ansi') and shutil.which('less'):
-        return ['bash', '-c', 'md2ansi "$0" | less -RS']
-    if shutil.which('md2ansi'):
-        return ['md2ansi']
+    if shutil.which('mdcat') and shutil.which('less'):
+        return ['bash', '-c', 'mdcat "$0" | less -RS']
+    if shutil.which('mdcat'):
+        return ['mdcat']
     return None
 
 
@@ -1455,7 +1455,7 @@ def _action_md_preview(ctx):
     import tempfile
     cmd = _resolve_md_pager()
     if cmd is None:
-        ctx.flash('no markdown renderer found ($MD2ANSI / md2ansi)', log=True)
+        ctx.flash('no markdown renderer found ($MDCAT / mdcat)', log=True)
         return
 
     item = ctx.cursor
@@ -1829,7 +1829,7 @@ Usage: browse-md [-l] [FILE.md[#anchor] | DIR ...]
             argv order wins.
 
   m       Toggle md2ansi coloring.
-  M       Render the preview through ``$MD2ANSI`` / md2ansi.
+  M       Render the preview through ``$MDCAT`` / mdcat.
   V       Page source for cursor/selection in ``$PAGER``. On a
           per-file root opens that file directly; on non-root rows
           pages a temp file with the merged byte-range slices.
@@ -2033,14 +2033,14 @@ def main():
         initial_scope = None
 
     # ``m`` (toggle library coloring) and ``M`` (page through the
-    # external ``$MD2ANSI`` / ``md2ansi`` program) are both always
+    # external ``$MDCAT`` / ``mdcat`` program) are both always
     # bound. ``m`` is safe to wire unconditionally because md2ansi_lib
     # is a hard dependency past the gate above, so ``_md2ansi_fn`` is
     # always present. ``M`` errors gracefully when no external renderer
     # is found, so users still discover the env-var hook.
     actions = [Action('m', 'Toggle markdown coloring',
                       _action_toggle_md, 'none'),
-               Action('M', 'View preview via $MD2ANSI / md2ansi',
+               Action('M', 'View preview via $MDCAT / mdcat',
                       _action_md_preview, 'cursor')]
     # ``V`` / ``E`` operate on ``ctx.targets`` (selection-or-cursor),
     # including the synthetic root row where ``ctx.cursor`` is None

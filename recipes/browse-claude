@@ -5445,24 +5445,24 @@ def _split_cmd(s):
 def _resolve_md_pager():
     """Return the resolved markdown-pager command, or None.
 
-    Order: ``$MD2ANSI`` (shell-split), then ``md2ansi | less -RS`` if
+    Order: ``$MDCAT`` (shell-split), then ``mdcat | less -RS`` if
     both binaries are on PATH. Recipes that want a different fallback
-    can set ``$MD2ANSI`` to anything — including a piped chain like
-    ``md2ansi | less -R``, which we shell out via ``bash -c`` so the
+    can set ``$MDCAT`` to anything — including a piped chain like
+    ``mdcat | less -R``, which we shell out via ``bash -c`` so the
     pipe works.
     """
     import shlex
     import shutil
-    env_cmd = os.environ.get('MD2ANSI')
+    env_cmd = os.environ.get('MDCAT')
     if env_cmd:
         if '|' in env_cmd or '<' in env_cmd or '>' in env_cmd:
             # User-supplied pipeline — hand to a shell so the pipe runs.
             return ['bash', '-c', f'{env_cmd} "$0"']
         return shlex.split(env_cmd)
-    if shutil.which('md2ansi') and shutil.which('less'):
-        return ['bash', '-c', 'md2ansi "$0" | less -RS']
-    if shutil.which('md2ansi'):
-        return ['md2ansi']
+    if shutil.which('mdcat') and shutil.which('less'):
+        return ['bash', '-c', 'mdcat "$0" | less -RS']
+    if shutil.which('mdcat'):
+        return ['mdcat']
     return None
 
 
@@ -5479,7 +5479,7 @@ def _action_md_preview(ctx):
     import tempfile
     cmd = _resolve_md_pager()
     if cmd is None:
-        ctx.flash('no markdown renderer found ($MD2ANSI / md2ansi)', log=True)
+        ctx.flash('no markdown renderer found ($MDCAT / mdcat)', log=True)
         return
 
     item = ctx.cursor
@@ -6317,7 +6317,7 @@ a transcript with Right/Alt-Down; preview shows the rendered turn.
   e / E   open the preview (e) / the source .jsonl (E) in $EDITOR.
   m       toggle inline markdown coloring of voice content (only bound
           when the md2ansi_lib Python module is importable).
-  M       render the preview via $MD2ANSI / md2ansi (external).
+  M       render the preview via $MDCAT / mdcat (external).
   J / K   jump cursor to next / previous user-or-assistant voice.
   t       toggle flat / tree view.
   .       toggle voice-only filter (hide tool calls / machinery).\
@@ -6432,10 +6432,10 @@ def main():
         initial_scope = ('session', target_jsonl)
         parent_scope = ('project', os.path.dirname(target_jsonl) or '/')
 
-    # 'M' always pages the preview through the external $MD2ANSI / md2ansi.
+    # 'M' always pages the preview through the external $MDCAT / mdcat.
     # 'm' toggles inline markdown coloring iff the md2ansi_lib Python module
     # was importable; otherwise it's left unbound.
-    actions_m = [Action('M', 'View preview via $MD2ANSI / md2ansi',
+    actions_m = [Action('M', 'View preview via $MDCAT / mdcat',
                         _action_md_preview, 'cursor')]
     if _md2ansi_fn is not None:
         actions_m.insert(0, Action('m', 'Toggle voice markdown coloring',
