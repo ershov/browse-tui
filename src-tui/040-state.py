@@ -2,6 +2,7 @@
 
 import enum
 import inspect
+import os
 import queue
 import sys
 import threading
@@ -6980,7 +6981,8 @@ class Browser:
         ``--split-type=auto`` width probe. Recipes that argparse
         ``--tty`` themselves are unaffected (they strip it first).
 
-        Cross-module symbols (``term_init``/``term_restore``/``read_key``/
+        Cross-module symbols (``term_init``/``term_restore``/
+        ``term_stdout_was_tty``/``term_result_fd``/``read_key``/
         ``g_resize_flag``/``Context``/``dispatch_key``/``render_full``/
         ``render_partial``/``compose_help_text``) are resolved as bare
         globals — in the concatenated production build that's the
@@ -7245,9 +7247,33 @@ class Browser:
         # After teardown — print captured output (e.g. from on_enter
         # print-exit). Done outside the alternate screen so the user's
         # shell sees the result.
+        #
+        # Destination depends on the fd hygiene applied at term_init. When
+        # stdout was a tty, fd 1 (and thus ``sys.stdout``) now points at
+        # ``/dev/null`` — writing the result through ``sys.stdout`` would
+        # silently vanish — so it goes to the saved real stdout fd via
+        # ``os.write``, which then needs closing (term_restore deliberately
+        # left it open for exactly this write). Otherwise (headless / piped
+        # / file stdout / ``--tty -``) ``sys.stdout`` is the right sink and
+        # the plain write preserves buffering + redirect semantics.
+        #
+        # Interim arrangement: a later stage replaces this with the shared
+        # output buffer drained inside the teardown sequence.
         if self._quit_output:
-            sys.stdout.write(self._quit_output)
-            sys.stdout.flush()
+            if term_stdout_was_tty():
+                result_fd = term_result_fd()
+                # Blocking full write to the saved tty (the UI is gone, so
+                # waiting on the terminal is fine); surrogateescape mirrors
+                # how stdin-ingested bytes were decoded. Loop in case a
+                # signal yields a short write.
+                payload = self._quit_output.encode('utf-8', 'surrogateescape')
+                written = 0
+                while written < len(payload):
+                    written += os.write(result_fd, payload[written:])
+                os.close(result_fd)
+            else:
+                sys.stdout.write(self._quit_output)
+                sys.stdout.flush()
 
         return self._quit_code
 

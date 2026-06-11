@@ -57,6 +57,12 @@ _cli.term_resume = lambda: None
 # For Browser.run() — inject the names it references at runtime.
 _state.term_init = lambda tty_path=None: None
 _state.term_restore = lambda: None
+# Teardown output routing (#856): the real accessors read the terminal
+# module's fd-hygiene globals, which stay at their defaults here (no real
+# term_init runs in the headless tests), so term_stdout_was_tty() is False
+# and the quit-output dump takes the ``sys.stdout`` path the tests patch.
+_state.term_stdout_was_tty = _term.term_stdout_was_tty
+_state.term_result_fd = _term.term_result_fd
 _state.read_key = lambda: 'q'  # tests override per-case
 _state.input_ready = lambda: False  # tests override for burst tests
 _state.g_resize_flag = False
