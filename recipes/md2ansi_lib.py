@@ -932,6 +932,12 @@ _MD_CODE_INLINE  = rf" ` (?P<*> (?: {_MD_ESCAPED} | [^`\n\\] | \n (?! {_BSA} ) )
 
 _MD_IMAGE = r" ! \[ (?P<*alt> [^\]\n]* ) \] \( (?P<*url> [^)\n]* ) \) "
 
+# Non-capturing twin of _MD_IMAGE, embeddable inside other rules' bodies
+# without colliding on group names. Used in link text (below) so a linked
+# image `[![alt](img)](url)` is consumed whole — otherwise the image's `](…)`
+# is mistaken for the link's own close + URL and the rest leaks as literal text.
+_MD_IMAGE_INLINE = r" ! \[ [^\]\n]* \] \( [^)\n]* \) "
+
 # Standalone escape rule fires in the INLINE context so each `\<punct>`
 # token gets unwrapped to just the punctuation char. The `\n` in the
 # class implements CommonMark's hard-line-break syntax (`\` at end of
@@ -944,7 +950,7 @@ _MD_ESCAPE = r"""
 
 _MD_LINK = rf"""
     (?<!!) \[ (?P<*>
-        (?: {_MD_ESCAPED} | [^\]\n\\] | \n (?! {_BSA} ) )+
+        (?: {_MD_IMAGE_INLINE} | {_MD_ESCAPED} | [^\]\n\\] | \n (?! {_BSA} ) )+
     ) \] \( (?P<*url> [^)\n]* ) \)
 """
 
