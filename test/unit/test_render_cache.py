@@ -125,16 +125,22 @@ def _ctx_for(browser):
 
 
 class _Capture:
-    """Replace sys.stdout with a StringIO; drain it on demand."""
+    """Point the terminal device's writer at a StringIO; drain it on demand.
+
+    The render path emits through ``_term.write`` / ``begin_sync`` etc.,
+    which target the module global ``_tty_writer``. Swap it for a StringIO
+    so tests can assert on the emitted byte stream without running
+    ``term_init`` (no real terminal device under unittest).
+    """
 
     def __enter__(self):
-        self._orig = sys.stdout
+        self._orig = _term._tty_writer
         self.buf = io.StringIO()
-        sys.stdout = self.buf
+        _term._tty_writer = self.buf
         return self
 
     def __exit__(self, *args):
-        sys.stdout = self._orig
+        _term._tty_writer = self._orig
 
     def drain(self):
         text = self.buf.getvalue()

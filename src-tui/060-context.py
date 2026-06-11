@@ -675,18 +675,28 @@ class Context:
         Returns the subprocess exit code, or ``-1`` if launching the
         process raised. Errors are also surfaced via ``ctx.error``.
 
-        Headless Browsers skip the suspend/resume calls (term layer is
-        not initialised) so unit tests can exercise the run path
-        without a real TTY. The ``_needs_redraw`` flag is still set so
-        the next render pass repaints over whatever the external
-        process drew.
+        The child is handed the terminal on its stdin/stdout/stderr (via
+        the terminal layer's child-fd accessor) so an interactive editor
+        runs on the terminal regardless of how the parent's own fd 0/1
+        are wired -- crucially without touching them, so a piped/captured
+        ``stdout`` stays clean. In ``--tty -`` mode those fds already are
+        the std streams, so this is the usual inherit behaviour.
+
+        Headless Browsers skip the suspend/resume + fd-passing (term layer
+        is not initialised) so unit tests can exercise the run path
+        without a real TTY -- the child then inherits the test runner's
+        fds. The ``_needs_redraw`` flag is still set so the next render
+        pass repaints over whatever the external process drew.
         """
+        child_fds = {}
         if not self._browser._headless:
             term_suspend()
+            in_fd, out_fd = term_child_fds()
+            child_fds = {'stdin': in_fd, 'stdout': out_fd, 'stderr': out_fd}
         try:
             full_env = None if env is None else {**os.environ, **env}
             shell = isinstance(cmd, str)
-            result = subprocess.run(cmd, shell=shell, env=full_env)
+            result = subprocess.run(cmd, shell=shell, env=full_env, **child_fds)
             return result.returncode
         except Exception as e:
             self.error(f'run_external: {type(e).__name__}: {e}')
@@ -703,11 +713,24 @@ class Context:
         ``less -R``) otherwise. ``lang`` is forwarded to bat as
         ``--language=<lang>`` for syntax highlighting; ignored by less.
 
-        Headless Browsers skip the suspend/resume calls, so this is
-        callable from tests but the pager will inherit the test
-        runner's stdin (which is usually fine — the pager will just
-        exit immediately on EOF).
+        The pager's stdout/stderr are pointed at the terminal (via the
+        terminal layer's child-fd accessor) while its stdin carries the
+        text -- so it paints to the terminal even when the parent's
+        ``stdout`` is piped, and reads keys from the terminal device
+        itself (as ``cmd | less`` always has). In ``--tty -`` mode the
+        terminal rides on the std streams, so there is no separate device
+        for the pager to read keys from while its stdin carries the text;
+        whatever the pager does without a private ``/dev/tty`` is up to it
+        (configure ``$PAGER``/``$EDITOR`` for non-interactive use if
+        needed) -- the suspend/resume bracket keeps the screen safe either
+        way.
+
+        Headless Browsers skip the suspend/resume + fd-passing (no term
+        layer); the pager then inherits the test runner's stdin and just
+        exits on EOF.
         """
+        non_headless = not self._browser._headless
+
         pager = None
         for cand in ('bat', 'batcat'):
             p = shutil.which(cand)
@@ -719,10 +742,13 @@ class Context:
         if pager is None:
             pager = [os.environ.get('PAGER') or 'less', '-R']
 
-        if not self._browser._headless:
+        out_fds = {}
+        if non_headless:
             term_suspend()
+            _, out_fd = term_child_fds()
+            out_fds = {'stdout': out_fd, 'stderr': out_fd}
         try:
-            proc = subprocess.Popen(pager, stdin=subprocess.PIPE)
+            proc = subprocess.Popen(pager, stdin=subprocess.PIPE, **out_fds)
             try:
                 proc.stdin.write(text.encode('utf-8', errors='replace'))
                 proc.stdin.close()
@@ -732,7 +758,7 @@ class Context:
         except Exception as e:
             self.error(f'page: {type(e).__name__}: {e}')
         finally:
-            if not self._browser._headless:
+            if non_headless:
                 term_resume()
             self._browser._needs_redraw.add('all')
 

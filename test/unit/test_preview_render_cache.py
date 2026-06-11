@@ -326,13 +326,13 @@ class TestUpdateDataMutationDropsBoth(unittest.TestCase):
 
 
 def _render_preview(browser):
-    """Run render_full while capturing stdout."""
-    orig = sys.stdout
-    sys.stdout = io.StringIO()
+    """Run render_full, swallowing the emitted terminal output."""
+    orig = _term._tty_writer
+    _term._tty_writer = io.StringIO()
     try:
         _render.render_full(browser)
     finally:
-        sys.stdout = orig
+        _term._tty_writer = orig
 
 
 def _make_browser_with_preview(text):

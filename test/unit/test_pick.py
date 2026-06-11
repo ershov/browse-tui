@@ -118,8 +118,8 @@ class _StubTerminal:
         self._saved = {}
 
     def __enter__(self):
-        names = ('move', 'clear_line', 'set_style', 'reset_style',
-                 'write', 'flush')
+        names = ('move', 'clear_line', 'clear_columns', 'set_style',
+                 'reset_style', 'write', 'flush')
         for n in names:
             self._saved[n] = getattr(_context, n)
             setattr(_context, n, lambda *a, **kw: None)

@@ -1056,9 +1056,6 @@ class TestTerminalColsForAuto(unittest.TestCase):
         # value so the fallback is the only return path. Patches:
         #   * ``builtins.open`` so /dev/tty (used by both the ioctl
         #     probe and the stty fallback) raises OSError;
-        #   * ``os.get_terminal_size`` so all three fd-keyed probes
-        #     raise (and shutil's internal call falls back to its
-        #     default 80,24);
         #   * ``shutil.get_terminal_size`` so its 80-fallback doesn't
         #     swallow the chain;
         #   * ``subprocess.run`` so the stty probe never spawns a real
@@ -1079,23 +1076,24 @@ class TestTerminalColsForAuto(unittest.TestCase):
             raise OSError('no stty in test')
 
         with mock.patch('builtins.open', side_effect=fake_open), \
-             mock.patch.object(_cli.os, 'get_terminal_size',
-                               side_effect=fake_size), \
              mock.patch.object(_cli.shutil, 'get_terminal_size',
                                side_effect=fake_size), \
              mock.patch.object(_cli.subprocess, 'run',
                                side_effect=fake_run):
             self.assertEqual(_cli._terminal_cols_for_auto(default=42), 42)
 
-    def test_falls_back_through_chain_when_tty_ioctl_fails(self):
-        """When /dev/tty ioctl fails, falls through to fd-based probes.
+    def test_default_mode_does_not_probe_std_fds(self):
+        """In /dev/tty mode, a failed device ioctl never falls to the std fds.
 
-        Regression for ticket #167: in some environments /dev/tty
-        returns 0 cols or fails, and the previous fallback was just
-        ``os.get_terminal_size()`` (default fd=stdout). If stdout was
-        piped that also failed, dropping to default=80 → narrow split
-        even on a wide terminal. The detector must keep searching:
-        try stdin/stderr fds, then shutil, then stty.
+        The terminal device is a deliberate choice (spec §1.4), not
+        "whichever std fd is a tty" — so when the /dev/tty ioctl fails,
+        resolution drops to shutil / stty / default, NOT to
+        ``os.get_terminal_size`` on fd 0/1/2. (Pre-#830 this DID probe
+        the std fds; that std-fd-first fallback is intentionally gone so
+        the chosen width tracks the real UI device, not a piped
+        stdout/stderr.) Here every fallback is forced to fail, so a std-fd
+        probe — if it still existed and the runner's fds were a tty —
+        would be the only way to beat the default; we assert it doesn't.
         """
         import builtins
         from unittest import mock
@@ -1106,21 +1104,152 @@ class TestTerminalColsForAuto(unittest.TestCase):
                 raise OSError('no tty in test')
             return real_open(path, *a, **kw)
 
-        # Make stdout (fd=1) fail but stderr (fd=2) succeed. This
-        # simulates ``browse-tui … | tee out.log`` on a wide terminal:
-        # stdout is a pipe, but stderr still points at the tty.
         from collections import namedtuple
         Size = namedtuple('Size', ('columns', 'lines'))
 
+        # If the function still probed the std fds, fd 2 would yield 242
+        # and win. The new policy ignores the std fds in /dev/tty mode.
         def fake_size(fd=1):
             if fd == 2:
+                return Size(242, 40)
+            raise OSError(f'fd {fd} not a tty')
+
+        def fake_run(*_a, **_kw):
+            raise OSError('no stty in test')
+
+        with mock.patch('builtins.open', side_effect=fake_open), \
+             mock.patch.object(_cli.os, 'get_terminal_size',
+                               side_effect=fake_size), \
+             mock.patch.object(_cli.shutil, 'get_terminal_size',
+                               side_effect=fake_size), \
+             mock.patch.object(_cli.subprocess, 'run',
+                               side_effect=fake_run):
+            self.assertEqual(_cli._terminal_cols_for_auto(default=80), 80)
+
+    def test_tty_dash_probes_std_fds(self):
+        """``--tty -`` mode probes the std fds (the UI rides on them).
+
+        With ``tty_path='-'`` the terminal device *is* the process std
+        streams, so width comes from ``os.get_terminal_size`` on fd 0
+        then fd 1 — never opening /dev/tty.
+        """
+        import builtins
+        from unittest import mock
+        real_open = builtins.open
+
+        def fake_open(path, *a, **kw):
+            if path == '/dev/tty':
+                raise AssertionError('--tty - must not open /dev/tty')
+            return real_open(path, *a, **kw)
+
+        from collections import namedtuple
+        Size = namedtuple('Size', ('columns', 'lines'))
+
+        # fd 0 (stdin) is a pipe; fd 1 (stdout) is the pty → 242 cols.
+        def fake_size(fd=1):
+            if fd == 1:
                 return Size(242, 40)
             raise OSError(f'fd {fd} not a tty')
 
         with mock.patch('builtins.open', side_effect=fake_open), \
              mock.patch.object(_cli.os, 'get_terminal_size',
                                side_effect=fake_size):
-            self.assertEqual(_cli._terminal_cols_for_auto(default=80), 242)
+            self.assertEqual(
+                _cli._terminal_cols_for_auto('-', default=80), 242)
+
+
+class TestTerminalSeparationErrors(unittest.TestCase):
+    """No-tty / piped ``--tty -`` clean-error contract (spec §5).
+
+    Both paths must fail *cleanly*: a one-line diagnostic on stderr, a
+    non-zero exit, ZERO bytes on stdout (so a command substitution never
+    captures terminal-control noise or a half-built UI), and no Python
+    traceback. These exercise the real binary as a subprocess because the
+    contract is about process-level stdin/stdout/stderr wiring, not an
+    in-process function call.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        root = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        )
+        cls.binary = os.path.join(root, 'browse-tui')
+        if not os.path.exists(cls.binary):
+            raise unittest.SkipTest(
+                'browse-tui binary not built (run ./build-tui.sh)')
+
+    def test_no_controlling_terminal_clean_error(self):
+        """No ``/dev/tty`` + no ``--tty -`` → clean error, no traceback.
+
+        ``start_new_session=True`` runs the child via ``setsid(2)`` so it
+        has *no* controlling terminal; stdin/stdout/stderr are pipes (not
+        a tty). With neither a controlling terminal nor ``--tty -`` to
+        ride the std streams, ``term_init``'s ``/dev/tty`` open fails and
+        the binary must surface the exact ``no controlling terminal``
+        guidance — pointing the user at ``--tty -`` — and exit non-zero.
+
+        Strong assertions (each would flip if the behaviour regressed):
+          * exit code is exactly 1 (SystemExit(str) → rc 1), not 0;
+          * stderr is *exactly* the guidance line (a regression that
+            dropped the ``pass --tty -`` hint, or leaked a usage banner,
+            would fail the equality);
+          * stdout is empty — a half-initialised UI painting escape bytes
+            to stdout (the pre-separation bug) would make this non-zero;
+          * no ``Traceback`` — an unhandled ``OSError``/``termios.error``
+            instead of the clean ``SystemExit`` would print one.
+        """
+        import subprocess
+        proc = subprocess.run(
+            [self.binary, '--root-cmd', 'cat'],
+            input=b'a\nb\n',
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+            timeout=10,
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(
+            proc.stderr,
+            b'browse-tui: no controlling terminal; '
+            b'pass --tty - to run over stdin/stdout\n',
+        )
+        self.assertEqual(len(proc.stdout), 0,
+                         f'stdout must be empty, got {proc.stdout!r}')
+        self.assertNotIn(b'Traceback', proc.stderr)
+
+    def test_piped_tty_dash_writes_zero_stdout(self):
+        """Piped ``--tty -`` → clean error, ZERO stdout bytes, no traceback.
+
+        Regression guard for the ``--tty -`` teardown leak (#841):
+        ``printf 'a\\nb\\n' | browse-tui --root-cmd cat --tty -`` resolves
+        the UI device to the std streams (fd 0/1), but stdin here is a
+        *pipe*, so the raw-mode ``tcgetattr`` fails. The teardown that
+        follows must NOT emit any alt-screen / cursor-restore bytes to
+        stdout (fd 1 is the captured stream) — the ``_in_raw`` guard means
+        ``_leave_raw`` is a no-op when raw was never entered.
+
+        The byte-exact ``len(stdout) == 0`` is the load-bearing
+        assertion: the pre-#841 bug leaked teardown escape bytes here,
+        contaminating what a command substitution would capture. stderr
+        must be exactly ``not a terminal`` (distinct from the no-tty
+        message: here the device resolved but isn't a tty), rc 1, and no
+        traceback.
+        """
+        import subprocess
+        proc = subprocess.run(
+            [self.binary, '--root-cmd', 'cat', '--tty', '-'],
+            input=b'a\nb\n',
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(len(proc.stdout), 0,
+                         f'stdout must be empty (teardown leak?), '
+                         f'got {proc.stdout!r}')
+        self.assertEqual(proc.stderr, b'browse-tui: not a terminal\n')
+        self.assertNotIn(b'Traceback', proc.stderr)
 
 
 if __name__ == '__main__':

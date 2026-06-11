@@ -55,7 +55,7 @@ _cli.term_suspend = lambda: None
 _cli.term_resume = lambda: None
 
 # For Browser.run() — inject the names it references at runtime.
-_state.term_init = lambda: None
+_state.term_init = lambda tty_path=None: None
 _state.term_restore = lambda: None
 _state.read_key = lambda: 'q'  # tests override per-case
 _state.input_ready = lambda: False  # tests override for burst tests

@@ -6968,6 +6968,18 @@ class Browser:
         ``--help`` themselves before calling ``run()`` are unaffected
         (their argparse strips the flag from sys.argv first).
 
+        Also auto-detects ``--tty TTY_PATH`` / ``--tty=TTY_PATH`` in
+        ``sys.argv[1:]`` and passes the value to ``term_init`` as the
+        terminal device, so ``./recipe --tty -`` drives the session
+        over the std streams without the recipe wiring its own
+        argparse (and ``--tty /dev/pts/N`` targets that device).
+        Absent ``--tty``, the device defaults to ``/dev/tty``. This is
+        the same mechanism the CLI relies on: argparse does not strip
+        ``--tty`` from ``sys.argv``, so the resolved value reaches
+        ``term_init`` here, keeping it in agreement with the CLI's
+        ``--split-type=auto`` width probe. Recipes that argparse
+        ``--tty`` themselves are unaffected (they strip it first).
+
         Cross-module symbols (``term_init``/``term_restore``/``read_key``/
         ``g_resize_flag``/``Context``/``dispatch_key``/``render_full``/
         ``render_partial``/``compose_help_text``) are resolved as bare
@@ -6984,9 +6996,27 @@ class Browser:
             sys.stdout.write(compose_help_text(self, include_usage=False))
             return 0
 
+        # Terminal-device auto-detect: scan sys.argv[1:] for ``--tty``
+        # the same way as the help flag above, so a recipe gets the
+        # device behaviour without its own argparse. Both spellings are
+        # honoured: ``--tty VALUE`` (value is the next token) and
+        # ``--tty=VALUE``. The value is passed verbatim to ``term_init``
+        # (``-`` -> std streams, a path -> that device, None -> the
+        # /dev/tty default). A trailing ``--tty`` with no following
+        # value is ignored (left to default) rather than crashing. The
+        # last occurrence wins, mirroring argparse.
+        tty_path = None
+        args = sys.argv[1:]
+        for i, arg in enumerate(args):
+            if arg == '--tty':
+                if i + 1 < len(args):
+                    tty_path = args[i + 1]
+            elif arg.startswith('--tty='):
+                tty_path = arg[len('--tty='):]
+
         self.start_workers()
         if not self._headless:
-            term_init()
+            term_init(tty_path)
         ctx = Context(self)
         self._ctx = ctx
 
