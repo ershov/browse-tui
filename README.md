@@ -131,6 +131,24 @@ For contributors, `docs/` holds [internals.md](docs/internals.md) (module
 layout, threading model) and the [design
 specs](docs/superpowers/specs/2026-04-30-browse-tui-design.md).
 
+## Screenshots
+
+**`b-git`** — a generic `tig`: commit graph, ref/author/date chips, delta diffs.
+
+[![b-git](media/browse-git.png)](media/browse-git.png)
+
+**`b-claude`** — your Claude Code history: projects → sessions → messages.
+
+[![b-claude](media/browse-claude.png)](media/browse-claude.png)
+
+**`b-md`** — any Markdown file as a navigable heading tree with a rendered preview.
+
+[![b-md](media/browse-md-doc.png)](media/browse-md-doc.png)
+
+**`b-md`** — drilling a design spec; `FILE.md#section` deep-links.
+
+[![b-md design spec](media/browse-md-design.png)](media/browse-md-design.png)
+
 ## License
 
 Licensed under the Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
