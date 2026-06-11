@@ -1,6 +1,6 @@
 # Stage 2 — stdin/stdout content channels (design)
 
-- **Date:** 2026-06-11 (rev 2 — same day; rev 1 feedback folded in)
+- **Date:** 2026-06-11 (rev 3 — ingest is plain `sys.stdin`; pre-run tty reads are cat-like)
 - **Status:** Draft for review
 - **Branch:** `worktree-stdio`
 - **Epic:** #849 (terminal separation + content channels); this is its stage-2 deliverable **#835**.
@@ -25,7 +25,7 @@ buffered output.
 - fd hygiene at startup: fd 0 / fd 1 detached from the terminal when they are ttys;
   `stderr` untouched.
 - Buffered output: `ctx.print()`; tty-stdout output delivered at exit (D3).
-- Synchronous initial input: `ctx.stdin`.
+- Synchronous initial input: plain `sys.stdin` reads (no new API).
 - Streaming input: opt-in `on_stdin` hook with raw-chunk and delimited-record modes.
 - CLI: `--root-cmd -` (canonical direct stdin list); bare `--root-cmd cat` kept as an alias.
 - Recipe conversions (explicit `-` argument): `browse-md -`, `browse-fs -`, `browse-git -`.
@@ -44,8 +44,8 @@ buffered output.
 ### 3.1 fd hygiene at startup (normal mode only)
 
 In normal mode (UI on `/dev/tty`), during `term_init`:
-- if `os.isatty(0)`: `dup2(/dev/null, 0)` — a recipe read gets immediate EOF instead of
-  blocking on, or stealing keystrokes from, the UI.
+- if `os.isatty(0)`: `dup2(/dev/null, 0)` — a mid-session recipe read gets immediate EOF
+  instead of blocking on, or stealing keystrokes from, the UI.
 - if `os.isatty(1)`: save the real stdout fd (`os.dup`), then `dup2(/dev/null, 1)` — a
   stray raw `print()` mid-session vanishes harmlessly instead of painting over the
   alt-screen. Buffered output (`ctx.print`, quit output) is written to the **saved** fd at
@@ -84,16 +84,19 @@ then quit output).
 
 ### 3.3 Input — initial ingest (synchronous, before run)
 
-`ctx.stdin` exposes a prepared text stream over fd 0 (`ctx.stdin.buffer` for bytes). A
-recipe reads whatever it needs **before** `browser.run()`:
-- slurp → `ctx.stdin.read()`
-- lines → `for line in ctx.stdin`
-- NUL / custom records → `ctx.stdin.buffer.read().split(b'\0')`
-- partial → read some and stop
+Initial ingest is **plain `sys.stdin`** — no framework API (and none is possible: `ctx`
+does not exist before `browser.run()`). Recipes read before `run()` — i.e. before
+`term_init` — where stdin is still whatever the caller provided:
+- slurp → `sys.stdin.read()`
+- lines → `for line in sys.stdin`
+- NUL / custom records → `sys.stdin.buffer.read().split(b'\0')`
+- partial → read some and stop (pre-read on `sys.stdin.buffer` — the bytes layer — when
+  combining with `on_stdin`; see §3.4)
 
-When `stdin` was a tty, fd 0 is `/dev/null` (§3.1), so these reads return EOF immediately —
-a recipe uniformly does "read; if empty, fall back to args / path." (No `read_stdin()`
-helper: plain reads on the prepared stream suffice.)
+With an explicit `-` argument and stdin on a tty, the pre-run read blocks until the user
+ends input with `^D` — exactly `cat`'s behavior: standard unix, not babysat. Once
+`term_init` runs, fd 0 hygiene (§3.1) takes over: mid-session reads and the streaming
+phase see immediate EOF when stdin was a tty.
 
 **One-shot + reload semantics.** stdin cannot be re-read; whoever parses it keeps the parse.
 `ctrl-r` reload re-invokes `get_children`, which serves the parsed in-memory data — identical
@@ -131,10 +134,12 @@ on_stdin(ctx, data, *, delimiter, is_eof, errno)
   check `is_eof` handle error-end correctly for free).
 
 Streaming begins **where ingest left off** — synchronous reads (§3.3) happen first, and the
-loop streams the unread remainder; slurp-then-stream compose (e.g. read a header, then
-stream records). Any bytes the sync phase read-ahead-buffered but did not hand to the recipe
-are delivered to `on_stdin` before the loop reads more from fd 0, so no bytes are lost at
-the hand-off.
+loop streams the unread remainder. The framework reads via `sys.stdin.buffer` (`read1` with
+fd 0 set non-blocking), so read-ahead bytes left in the buffer layer are served to
+`on_stdin` before any new fd read — a sync phase that pre-reads on `sys.stdin.buffer`
+composes losslessly (e.g. read a header, then stream records). Partial *text-layer*
+(`sys.stdin`) reads do not compose — the text wrapper hides its residue; read to EOF or use
+the bytes layer when combining with `on_stdin`.
 
 The hook folds incoming data into the tree via the existing `ctx.update_data` / `ctx.upsert`.
 
@@ -200,8 +205,8 @@ All via an explicit `-` argument (no auto-detection — D8):
   backpressuring reader does not block the UI (loop-drain); tty stdout → output appears in
   scrollback after exit (pty test: prints, then selection, after alt-screen teardown);
   consumer closes early (`EPIPE`) → UI stays alive, buffer dropped, later prints no-op.
-- **ingest:** slurp / lines / NUL / partial via `ctx.stdin`; tty stdin → immediate EOF;
-  reload after stdin ingest re-serves the parsed data.
+- **ingest:** slurp / lines / NUL / partial via `sys.stdin`; post-`term_init` reads on
+  tty-stdin return EOF; reload after stdin ingest re-serves the parsed data.
 - **streaming:** raw chunks arrive as read; record mode framing (records split exactly on
   the delimiter, empty records preserved, trailing unterminated record delivered on EOF);
   multibyte utf-8 split across chunk boundaries; bytes mode; EOF call shape; read-error →
