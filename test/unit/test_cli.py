@@ -816,6 +816,102 @@ class TestPathSep(unittest.TestCase):
                 b.stop_workers()
 
 
+class TestRootCmdStdin(unittest.TestCase):
+    """``--root-cmd -`` (canonical) and the bare ``cat`` alias read stdin.
+
+    ``-`` is the canonical spelling for "read the root tree directly
+    from stdin" (no subprocess); bare ``cat`` is kept as a back-compat
+    alias. Exactly ``cat`` aliases — ``--root-cmd 'cat file'`` still runs
+    as a command.
+    """
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _piped_stdin(payload):
+        # The direct-read branch consumes ``sys.stdin.buffer.read()``;
+        # feed it a fake byte stream (matching the headless harness used
+        # elsewhere — no real tty/pipe needed).
+        original = sys.stdin
+        sys.stdin = type('S', (), {'buffer': io.BytesIO(payload)})()
+        try:
+            yield
+        finally:
+            sys.stdin = original
+
+    def test_dash_reads_stdin_into_tree(self):
+        # ``--root-cmd -``: the piped list lands in the tree verbatim,
+        # without spawning a subprocess.
+        args, _ = _cli.parse_args(['--root-cmd', '-'])
+        with self._piped_stdin(b'x\ny\nz\n'):
+            b = _cli._build_eager_browser(
+                args, fields=['id', 'title'], record_sep=b'\n',
+            )
+        try:
+            self.assertIsNotNone(b)
+            self.assertEqual(
+                [it.id for it in b._state._children['']], ['x', 'y', 'z'],
+            )
+        finally:
+            if b is not None:
+                b.stop_workers()
+
+    def test_bare_cat_alias_matches_dash(self):
+        # The bare ``cat`` alias is identical to ``-`` for the same input.
+        def build(root_cmd):
+            args, _ = _cli.parse_args(['--root-cmd', root_cmd])
+            with self._piped_stdin(b'a\nb\n'):
+                return _cli._build_eager_browser(
+                    args, fields=['id', 'title'], record_sep=b'\n',
+                )
+
+        dash = build('-')
+        cat = build('cat')
+        try:
+            self.assertIsNotNone(dash)
+            self.assertIsNotNone(cat)
+            self.assertEqual(
+                [it.id for it in dash._state._children['']],
+                [it.id for it in cat._state._children['']],
+            )
+            self.assertEqual(
+                [it.id for it in cat._state._children['']], ['a', 'b'],
+            )
+        finally:
+            for b in (dash, cat):
+                if b is not None:
+                    b.stop_workers()
+
+    def test_cat_with_file_still_runs_as_command(self):
+        # ``--root-cmd 'cat <file>'`` is NOT the alias: it runs via bash
+        # and consumes the command's stdout (here, the file's contents).
+        with tempfile.NamedTemporaryFile('w', suffix='.tsv', delete=False) as f:
+            f.write('p\nq\n')
+            path = f.name
+        self.addCleanup(os.unlink, path)
+        args, _ = _cli.parse_args(['--root-cmd', f'cat {path}'])
+        # stdin is empty: if this wrongly took the direct-read alias the
+        # tree would be empty rather than carrying the file's rows.
+        with self._piped_stdin(b''):
+            b = _cli._build_eager_browser(
+                args, fields=['id', 'title'], record_sep=b'\n',
+            )
+        try:
+            self.assertIsNotNone(b)
+            self.assertEqual(
+                [it.id for it in b._state._children['']], ['p', 'q'],
+            )
+        finally:
+            if b is not None:
+                b.stop_workers()
+
+    def test_dash_documented_in_help(self):
+        # The argparse help presents ``-`` (canonical) and notes ``cat``
+        # as the accepted alias.
+        help_text = _cli.build_argparser().format_help()
+        self.assertIn("'-'", help_text)
+        self.assertIn('alias', help_text)
+
+
 class TestResolveListSize(unittest.TestCase):
     """``--list-size`` parses ``N`` (lines) or ``N%`` (percentage)."""
 
