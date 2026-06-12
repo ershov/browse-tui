@@ -13,6 +13,7 @@ independent of the user's PATH.
 
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -220,6 +221,76 @@ class TestBrowseMdPreviewResize(unittest.TestCase):
                     f'miss it — the broadened on_resize + drop_preview_cache '
                     f'is what re-renders here. capture:\n{t.capture()}')
 
+                t.send('q')
+
+
+class TestBrowseMdStdin(unittest.TestCase):
+    """``browse-md -`` reads ONE document from stdin (spec §3.3 / §3.7).
+
+    End-to-end against the shipped binary: we launch the recipe with its
+    stdin redirected from a temp file (``... browse-md - < doc.md``).
+    Because ``browse-md`` slurps ``sys.stdin`` BEFORE the UI starts, the
+    redirect's EOF is reached during ingest and the parsed document drives
+    the tree — the UI itself stays on the tmux pane's terminal. This is
+    the faithful piped-input shape without needing a separate content fd:
+    a file redirect is just a pipe that is already closed.
+    """
+
+    def _launch_stdin(self, t, doc_path):
+        """Send ``browse-tui --run-py browse-md - < doc_path`` to the pane."""
+        line = '{bin} --run-py {recipe} - < {doc}'.format(
+            bin=shlex.quote(_BIN),
+            recipe=shlex.quote(_RECIPE),
+            doc=shlex.quote(doc_path),
+        )
+        t.send_line(line)
+
+    def test_piped_document_tree_title_and_preview(self):
+        # A small doc with a lone h1 (which the single-heading startup
+        # cascade auto-expands) plus a nested h2 and a body run.
+        body = (
+            '# Piped Heading\n'
+            '\n'
+            'intro body text\n'
+            '\n'
+            '## Sub Section\n'
+            'section body\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = os.path.join(tmp, 'doc.md')
+            with open(doc, 'w') as f:
+                f.write(body)
+            with TmuxFixture(cols=100, rows=40) as t:
+                self._launch_stdin(t, doc)
+                # The top-level row is titled ``(stdin)`` (no file name).
+                t.wait_for('(stdin)', timeout=6.0)
+                # The heading tree is built from the piped text: the lone
+                # h1 auto-expands, revealing its body run and the h2.
+                t.wait_for('Piped Heading', timeout=4.0)
+                t.wait_for('Sub Section', timeout=4.0)
+                # The preview pane shows the document body (cursor lands on
+                # the stdin root, whose preview is the whole text).
+                t.wait_for('intro body text', timeout=4.0)
+                t.send('q')
+
+    def test_empty_stdin_is_an_empty_document(self):
+        # Empty input behaves exactly like an empty .md file: the
+        # ``(stdin)`` row shows with no expansion arrow / children. We
+        # assert ``(stdin)`` appears and stays childless (no ``[h*]`` row).
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = os.path.join(tmp, 'empty.md')
+            with open(doc, 'w') as f:
+                f.write('')
+            with TmuxFixture(cols=100, rows=40) as t:
+                self._launch_stdin(t, doc)
+                cap = t.wait_for('(stdin)', timeout=6.0)
+                t.wait_stable(timeout=3.0)
+                cap = t.capture()
+                # No heading rows — an empty document has no structure.
+                self.assertNotRegex(
+                    cap, r'\[h[1-6]\]',
+                    f'empty stdin should yield a childless document; '
+                    f'capture:\n{cap}')
                 t.send('q')
 
 

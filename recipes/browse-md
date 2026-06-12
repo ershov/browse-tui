@@ -4,7 +4,12 @@
 Positionals may be files OR directories: a directory expands to the
 ``.md`` / ``.MD`` files directly inside it (non-recursive, sorted by
 name). With no positionals at all the recipe browses the current
-directory (equivalent to ``browse-md .``).
+directory (equivalent to ``browse-md .``). The lone argument ``-``
+reads ONE document from ``sys.stdin`` (slurped to EOF before the UI
+starts) and browses it like a file — its top-level row is titled
+``(stdin)``. Editing/paging the on-disk source (``V`` / ``E``) is
+unavailable for that document (it has no file); the actions flash a
+message instead.
 
 Parses each resulting markdown file into a tree of headings (h1..h6);
 list items under each section can optionally be surfaced as tree
@@ -48,7 +53,7 @@ Custom actions on top of the framework defaults:
       sections in one keystroke. The same cascade runs on the
       single-file startup auto-expand.
 
-Usage:  browse-md [-l] [FILE.md[#anchor] | DIR ...]
+Usage:  browse-md [-l] [FILE.md[#anchor] | DIR ... | -]
 """
 
 import bisect
@@ -98,6 +103,23 @@ _FILES = {}
 # order. Populated by ``main()`` before the first ``_reparse``; used
 # by Ctrl-R to know which files to re-slurp.
 _INPUT_FILES = []
+
+# Stdin-document mode (the ``browse-md -`` argument). ``main()`` slurps
+# ``sys.stdin`` once before the UI starts and stores the text here; the
+# fixed sentinel path ``_STDIN_PATH`` then stands in for a real file
+# throughout — it is the lone ``_INPUT_FILES`` entry, the per-file
+# root's id ``('file', _STDIN_PATH)``, and every Item's ``file_path``.
+# ``_reparse`` serves ``_STDIN_TEXT`` for that path instead of reading
+# disk (so Ctrl-R re-serves the same parse — stdin can't be re-read,
+# matching the eager ``--root-cmd`` semantics) and titles the root
+# ``(stdin)``. The sentinel lives under the cwd so the document's
+# relative ``.md`` links resolve against the cwd (a coherent anchor for
+# a piped doc); it is never opened, so the basename ``<stdin>`` only
+# needs to be filesystem-implausible enough not to collide with a real
+# positional. ``None`` whenever no document was piped (every other
+# invocation mode).
+_STDIN_PATH = os.path.join(os.getcwd(), '<stdin>')
+_STDIN_TEXT = None
 
 # Aggregate id-to-Item index — per-file roots ``('file', abspath)`` +
 # every in-file heading / list-item ``('content', abspath, line)``
@@ -155,7 +177,7 @@ _HEADING_STYLES = {
 _INCLUDE_LISTS = False
 
 
-_USAGE = 'usage: browse-md [-l] [FILE.md[#anchor] | DIR ...]'
+_USAGE = 'usage: browse-md [-l] [FILE.md[#anchor] | DIR ... | -]'
 
 # Markdown file extensions recognised when a positional names a directory.
 # A directory argument expands to every direct child with one of these
@@ -824,8 +846,15 @@ def _file_has_existing_ref(text, file_path):
     ``resolve_md_ref``'s ``os.path.exists`` probes, but never the referenced
     files themselves — those are read lazily on expand. ``text`` is already in
     ``_FileState`` (no extra read of the primary file).
+
+    The stdin document (``_STDIN_PATH``) is excluded: it is self-contained,
+    has no on-disk file to read on a ref expand (``get_doc`` of the sentinel
+    would fail), and is the single chokepoint both the ``_reparse`` arrow and
+    the ``get_children`` umbrella gate on — so returning ``False`` here keeps
+    the References subtree off the stdin root entirely rather than hanging an
+    umbrella that can't be expanded.
     """
-    if md_doc is None:
+    if md_doc is None or file_path == _STDIN_PATH:
         return False
     doc_dir, cwd, project_root = _md_resolution_context(file_path)
     for captured in md_doc.find_md_refs(text):
@@ -1169,15 +1198,27 @@ def _reparse():
 
     file_states = []
     for path, _anchor in input_files:
-        with open(path, 'r', encoding='utf-8', errors='replace') as f:
-            text = f.read()
+        # The stdin sentinel serves its pre-slurped text (set once by
+        # ``main()`` before the UI started — stdin can't be re-read, so
+        # Ctrl-R re-serves the same parse). Every other path is read
+        # from disk. This is the whole "content from a string" seam:
+        # downstream the sentinel is just another file path.
+        if path == _STDIN_PATH and _STDIN_TEXT is not None:
+            text = _STDIN_TEXT
+        else:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                text = f.read()
         ls = _line_starts(text)
         events = _parse(text)
         file_root, by_id = _build_nodes(events, text, ls, path)
         # Override ``_build_nodes``'s basename default with the resolved
         # per-root label (always project-root-relative; a file sitting
-        # directly in the root collapses to its bare basename).
-        file_root.title = labels[path]
+        # directly in the root collapses to its bare basename). The
+        # stdin document has no on-disk name, so it shows ``(stdin)``.
+        file_root.title = (
+            '(stdin)' if path == _STDIN_PATH and _STDIN_TEXT is not None
+            else labels[path]
+        )
         # The per-file root carries an expansion arrow when it has headings
         # (set by ``_build_nodes``) OR references at least one existing ``.md``
         # file — so a heading-less file that links to a real ``.md`` is still
@@ -1653,7 +1694,9 @@ def _run_source_command(ctx, env_var, default):
         ``===== <basename> =====`` header — including the first —
         so the reader can spot file boundaries.
 
-    Empty ``targets`` (no cursor, no selection) is a no-op.
+    Empty ``targets`` (no cursor, no selection) is a no-op. The stdin
+    document has no on-disk source, so both ``V`` and ``E`` flash a
+    message and return rather than fabricating a temp file.
 
     Root detection — there are two "open the file directly" shapes, both
     carrying a ``('file', path)`` id:
@@ -1665,6 +1708,18 @@ def _run_source_command(ctx, env_var, default):
     """
     targets = ctx.targets
     if not targets:
+        return
+
+    # The stdin document has no on-disk source to page/edit. ``V`` / ``E``
+    # are about the file on disk; there is none, and we add no temp-file
+    # machinery for it. Degrade gracefully with a flash — the framework's
+    # built-in ``v`` / ``e`` (which act on the rendered preview text, not
+    # the source) still work for the piped document. Stdin mode is always
+    # a single document, so its presence in ``_FILES`` means every target
+    # belongs to it.
+    if _STDIN_PATH in _FILES:
+        ctx.flash('no source file for the stdin document — use v/e for '
+                  'the preview text')
         return
 
     def _id_file_path(it):
@@ -1815,7 +1870,7 @@ def _on_expand(ctx, ids):
 _HELP_INTRO = """\
 browse-md — markdown browser for one or more files.
 
-Usage: browse-md [-l] [FILE.md[#anchor] | DIR ...]
+Usage: browse-md [-l] [FILE.md[#anchor] | DIR ... | -]
   -l, --list, --lists  Also surface list items (default: headings).
   FILE.md   One or more markdown files. Each file shows as a
             top-level row in the tree; there is no synthetic root
@@ -1823,6 +1878,8 @@ Usage: browse-md [-l] [FILE.md[#anchor] | DIR ...]
             into that file's headings.
   DIR       Expands to the ``.md`` / ``.MD`` files directly inside it
             (non-recursive). No args ⇒ browse ``.``.
+  -         Read ONE document from stdin and browse it like a file
+            (row titled ``(stdin)``; V/E have no source — they flash).
   #anchor   Deep-link target — 0-based line number or heading name
             (exact / prefix / substring tiers; first hit wins). When
             multiple files carry anchors, the FIRST anchored file in
@@ -1832,10 +1889,8 @@ Usage: browse-md [-l] [FILE.md[#anchor] | DIR ...]
   M       Render the preview through ``$MDCAT`` / mdcat.
   V       Page source for cursor/selection in ``$PAGER``. On a
           per-file root opens that file directly; on non-root rows
-          pages a temp file with the merged byte-range slices.
-          Cross-file selections group by file in argv order and
-          concatenate the per-file slices separated by
-          ``\\n===== <filename> =====\\n``.
+          pages a temp file with the merged byte-range slices
+          (cross-file selections group by file with a per-file header).
   E       Edit source for cursor/selection in ``$EDITOR`` (same
           per-file / cross-file rules as V).
   Ctrl-R  Re-slurp every input file and rebuild the tree.\
@@ -1958,7 +2013,7 @@ def _pop_flag(name, alts=()):
 
 
 def main():
-    global _ANCHOR, _BROWSER, _INCLUDE_LISTS, _INPUT_FILES
+    global _ANCHOR, _BROWSER, _INCLUDE_LISTS, _INPUT_FILES, _STDIN_TEXT
     # Hard-dependency gate. ``md_doc.build_doc_tree`` derives the whole
     # tree from ``md2ansi_scan``; without either there is nothing to
     # build, so fail fast with a clear message rather than running
@@ -1986,20 +2041,38 @@ def main():
         if tok.startswith('-') and tok != '-':
             _die(f'unrecognised option: {tok}')
     positionals = [t for t in leftover if not (t.startswith('-') and t != '-')]
-    # No positionals ⇒ browse the current directory (``browse-md .``).
-    if not positionals:
-        positionals = ['.']
 
-    # Resolve every positional into the argv-ordered ``_INPUT_FILES``
-    # list of (abs_path, anchor) pairs: directories expand to their
-    # direct markdown files, plain tokens split on the first ``#`` for
-    # an anchor. The first anchored entry (if any) seeds ``_ANCHOR`` for
-    # the initial-scope resolution downstream.
-    input_files, first_anchor, first_anchor_path = _collect_input_files(
-        positionals)
+    # The lone ``-`` reads ONE document from stdin (spec §3.3 / §3.7).
+    # Slurp it HERE — before ``b.run()`` / ``term_init``, while fd 0 is
+    # still whatever the caller provided (on a tty this blocks cat-like
+    # until ^D; standard unix, no isatty babysitting). After ``term_init``
+    # a tty fd 0 is detached, so a later read would only see EOF — the
+    # one chance to read piped input is now. The text is stashed on the
+    # sentinel path and parsed through the same ``_reparse`` pipeline as
+    # a file; an anchor with ``-`` (e.g. ``-#x``) is out of scope and is
+    # not a lone ``-``, so it never reaches here (``-#x`` is rejected as
+    # an unrecognised option by the leftover-scan above). Empty input
+    # parses to an empty document — exactly an empty ``.md`` file.
+    if positionals == ['-']:
+        _STDIN_TEXT = sys.stdin.read()
+        _INPUT_FILES = [(_STDIN_PATH, '')]
+        _ANCHOR = ''
+        first_anchor_path = None
+    else:
+        # No positionals ⇒ browse the current directory (``browse-md .``).
+        if not positionals:
+            positionals = ['.']
 
-    _INPUT_FILES = input_files
-    _ANCHOR = first_anchor
+        # Resolve every positional into the argv-ordered ``_INPUT_FILES``
+        # list of (abs_path, anchor) pairs: directories expand to their
+        # direct markdown files, plain tokens split on the first ``#`` for
+        # an anchor. The first anchored entry (if any) seeds ``_ANCHOR`` for
+        # the initial-scope resolution downstream.
+        input_files, first_anchor, first_anchor_path = _collect_input_files(
+            positionals)
+
+        _INPUT_FILES = input_files
+        _ANCHOR = first_anchor
 
     # First parse runs through the shared ``_reparse`` helper — same
     # path that Ctrl-R uses, so any rebuild bug surfaces at startup
