@@ -46,11 +46,13 @@ Out of scope (deferred to phase 2/3):
     already wired here so phase 2 only changes one site.
 """
 
-# In the concatenated production build ``re`` is already imported by an
-# earlier numbered file; the re-import is a harmless no-op there but lets the
-# module-level regex in ``_sanitize_ansi`` compile when this file is exec'd
-# standalone (the isolated unit-test load).
+# In the concatenated production build these are already imported by an
+# earlier numbered file; the re-imports are harmless no-ops there but let
+# the module-level regex in ``_sanitize_ansi`` and the ``_PreviewSnapshot``
+# namedtuple resolve when this file is exec'd standalone (the isolated
+# unit-test load).
 import re
+from collections import namedtuple
 
 
 # tag_style name → (fg color, bold flag). Values are 256-colour palette
@@ -1899,6 +1901,78 @@ def _wrap_preview_line(line, width, *, ansi_on, drop_sgr=False):
     return rows
 
 
+# Stale-hold snapshot (preview-flicker design §B): the last successfully
+# painted per-item preview, stored on ``Browser._preview_snapshot`` and
+# painted in place of blank rows while the cursored row's preview is
+# pending. Mirrors ``PreviewRender`` — ``wrapped`` plus the ``(width,
+# ansi_on)`` geometry it was built for — extended with the raw ``text``
+# (so a geometry/ANSI mismatch can re-wrap at paint time; the raw text
+# is also what survives the #456 abandoned-partial cache clear) and the
+# clamped ``scroll`` the paint showed (a held view is frozen there).
+# Captured by reference assignment, never invalidated.
+_PreviewSnapshot = namedtuple(
+    '_PreviewSnapshot',
+    ['text', 'scroll', 'wrapped', 'width', 'ansi_on'],
+)
+
+
+def _sanitize_and_wrap_preview(text, width, *, ansi_on):
+    """Sanitize ``text`` and wrap it into preview rows ``width`` cols wide.
+
+    The preview pane's shared content pipeline — the per-item and help
+    paints and the stale-hold re-wrap all route through here. Returns
+    ``(wrapped, wrapped_tail_offset)`` where ``wrapped_tail_offset`` is
+    the index in ``wrapped`` at which the wrap of the last raw line
+    starts — needed by the #423 in-place append-extension path to
+    splice new wrapped rows over the previously-open tail line's wrap
+    (callers that never splice ignore it).
+    """
+    # Strip control chars before they hit the terminal. Covers every
+    # source so anything that reaches this pane is safe — preview data
+    # can carry attacker-controlled bytes (binary files, raw terminal
+    # captures, command stderr); help is composed in-process but cheap
+    # to filter and recipes may supply ``help_intro`` / ``help_outro``.
+    #
+    # In raw mode (``ansi_on=False``) the sanitiser also maps ESC to
+    # '?' so untrusted content can never inject SGR or other escape
+    # sequences. The walker below sees no ESC bytes in that case and
+    # falls through to plain wrap.
+    text = _sanitize_preview(text, ansi_on=ansi_on)
+    if ansi_on:
+        # Escape-level sanitise (sec 4.2 #1), shared with the row-content
+        # path: keep SGR, drop all other CSI and any bare/dangling ESC.
+        # ``_wrap_preview_line`` also drops non-SGR CSI token-by-token,
+        # but only the regex-matchable ones — this additionally removes a
+        # bare ESC the tokeniser would otherwise pass through as text, and
+        # makes the two paths behave identically. (Raw mode already
+        # mapped every ESC to '?', so there's nothing left to strip.)
+        text = _sanitize_ansi(text)
+
+    # Wrap content to ``width`` columns.
+    #
+    # The wrap goes through ``_wrap_preview_line`` (#242) which
+    # tokenises SGR sequences and emits self-contained visual rows
+    # (active SGR re-opened at row start, trailing ``\e[m`` iff the
+    # row carries any SGR). Plain rows are byte-identical whether
+    # ``ansi_on`` is True or False — preserves the cache-hit
+    # invariant for plain content.
+    raw = text.split('\n') if text else []
+    wrapped = []
+    # ``wrapped_tail_offset`` is recorded just before extending
+    # ``wrapped`` with the last raw line's rows. Defaults to
+    # ``len(wrapped)`` (post-wrap) so an empty preview / no-raw-lines
+    # branch records 0.
+    wrapped_tail_offset = 0
+    last_idx = len(raw) - 1
+    for i, line in enumerate(raw):
+        line = line.replace('\t', '    ')
+        if i == last_idx:
+            wrapped_tail_offset = len(wrapped)
+        wrapped.extend(_wrap_preview_line(
+            line, width, ansi_on=ansi_on, drop_sgr=False))
+    return wrapped, wrapped_tail_offset
+
+
 def render_preview(browser, rect, *, info=False, has_header=True,
                    rightmost: bool = False):
     """Render the preview pane (header + content) within ``rect``.
@@ -1922,7 +1996,10 @@ def render_preview(browser, rect, *, info=False, has_header=True,
     Source priority for the content:
       1. ``browser._help_mode`` if True      → display ``compose_help_text``
       2. ``item.preview`` (cursor item)      → per-item preview
-      3. fallthrough — empty preview         → blank rows
+      3. stale-hold — cursor row's preview
+         pending and a snapshot of the last
+         painted preview exists              → hold the snapshot
+      4. fallthrough — empty preview         → blank rows
 
     Content is wrapped at ``rect.width`` columns. Rows shorter than
     the rect width are blanked out to ``rect.right`` so stale content
@@ -1969,16 +2046,69 @@ def render_preview(browser, rect, *, info=False, has_header=True,
     # land on a real item, ``item.preview_render`` is the wrap cache
     # candidate; honour it when the geometry and ANSI policy still
     # match, otherwise regenerate.
+    #
+    # ``pending`` marks a cursor row whose preview is awaited rather
+    # than delivered: the synthetic ``'pending'`` placeholder row, or a
+    # ``'normal'`` row whose item has ``preview is None`` (#442: every
+    # fetch delivers at least ``''``, so ``None`` means a delivery is
+    # pending or imminent). Delivered text — including ``''`` — paints
+    # as-is. Meta rows resolve their item like normal rows but never
+    # pend: ``_update_preview_for_cursor`` requests nothing for them,
+    # so no delivery would ever end a hold — a missing preview just
+    # blanks. An empty visible list is never pending either: the pane
+    # isn't waiting for anything.
     item = None
+    pending = False
     if browser._help_mode:
         text = compose_help_text(browser, include_usage=False)
     else:
-        cursor_id = _cursor_id(browser)
         text = ''
-        if cursor_id is not None:
-            item = browser._state._items_by_id.get(cursor_id)
-            if item is not None and item.preview is not None:
-                text = item.preview
+        vis = visible_items(browser._state)
+        cur = browser._state.cursor
+        if 0 <= cur < len(vis):
+            entry = vis[cur]
+            if entry.kind == 'pending':
+                pending = True
+            else:
+                item = browser._state._items_by_id.get(entry.item.id)
+                if item is not None and item.preview is not None:
+                    text = item.preview
+                elif entry.kind == 'normal':
+                    pending = True
+
+    # Stale-hold (preview-flicker design §B): while the cursor row's
+    # preview is pending, keep painting the last successfully painted
+    # per-item preview instead of blanking — the real content swaps in
+    # one step when it delivers. The branch is self-contained: the held
+    # view is frozen at the snapshot's clamped scroll, the snapshot's
+    # wrap is never written into the cursored item's ``preview_render``,
+    # the snapshot itself is never updated from here, and the
+    # scroll/tail-pin writebacks and #274 demand signal below are
+    # skipped. The row cache makes repeated identical held paints emit
+    # zero bytes.
+    if pending:
+        snap = browser._preview_snapshot
+        if snap is not None:
+            wrapped = snap.wrapped
+            if snap.width != width or snap.ansi_on != ansi_on:
+                # Pane geometry / ANSI policy changed since the capture
+                # (resize, screen-restore, ansi toggle) — re-wrap from
+                # the snapshot's raw text for this paint.
+                wrapped, _ = _sanitize_and_wrap_preview(
+                    snap.text, width, ansi_on=ansi_on,
+                )
+            max_scroll = max(0, len(wrapped) - content_lines)
+            scroll = max(0, min(snap.scroll, max_scroll))
+            for i in range(content_lines):
+                row = content_top + i
+                rel_row = content_row_offset + i
+                begin_row(cache, rel_row, row, left, right,
+                          rightmost=rightmost)
+                src_idx = i + scroll
+                if src_idx < len(wrapped):
+                    write(wrapped[src_idx])
+                end_row()
+            return
 
     # Wrap-cache fast path (#422) — only for per-item previews
     # (help text is composed each paint anyway), and only when
@@ -1992,53 +2122,9 @@ def render_preview(browser, rect, *, info=False, has_header=True,
             wrapped = cached.wrapped
 
     if wrapped is None:
-        # Strip control chars before they hit the terminal. Covers both
-        # sources (per-item preview and help) so anything that reaches
-        # this pane is safe — preview data can carry attacker-controlled
-        # bytes (binary files, raw terminal captures, command stderr);
-        # help is composed in-process but cheap to filter and recipes
-        # may supply ``help_intro`` / ``help_outro``.
-        #
-        # In raw mode (``ansi_on=False``) the sanitiser also maps ESC to
-        # '?' so untrusted content can never inject SGR or other escape
-        # sequences. The walker below sees no ESC bytes in that case and
-        # falls through to plain wrap.
-        text = _sanitize_preview(text, ansi_on=ansi_on)
-        if ansi_on:
-            # Escape-level sanitise (sec 4.2 #1), shared with the row-content
-            # path: keep SGR, drop all other CSI and any bare/dangling ESC.
-            # ``_wrap_preview_line`` also drops non-SGR CSI token-by-token,
-            # but only the regex-matchable ones — this additionally removes a
-            # bare ESC the tokeniser would otherwise pass through as text, and
-            # makes the two paths behave identically. (Raw mode already
-            # mapped every ESC to '?', so there's nothing left to strip.)
-            text = _sanitize_ansi(text)
-
-        # Wrap content to the rect's width.
-        #
-        # The wrap goes through ``_wrap_preview_line`` (#242) which
-        # tokenises SGR sequences and emits self-contained visual rows
-        # (active SGR re-opened at row start, trailing ``\e[m`` iff the
-        # row carries any SGR). Plain rows are byte-identical whether
-        # ``ansi_on`` is True or False — preserves the cache-hit
-        # invariant for plain content.
-        raw = text.split('\n') if text else []
-        wrapped = []
-        # ``wrapped_tail_offset`` is the index in ``wrapped`` where the
-        # wrap of the last raw line starts — needed by the #423 in-place
-        # append-extension path to splice new wrapped rows over the
-        # previously-open tail line's wrap. Recorded just before
-        # extending ``wrapped`` with the last raw line's rows. Defaults
-        # to ``len(wrapped)`` (post-wrap) so an empty preview / no-raw-
-        # lines branch records 0.
-        wrapped_tail_offset = 0
-        last_idx = len(raw) - 1
-        for i, line in enumerate(raw):
-            line = line.replace('\t', '    ')
-            if i == last_idx:
-                wrapped_tail_offset = len(wrapped)
-            wrapped.extend(_wrap_preview_line(
-                line, width, ansi_on=ansi_on, drop_sgr=False))
+        wrapped, wrapped_tail_offset = _sanitize_and_wrap_preview(
+            text, width, ansi_on=ansi_on,
+        )
 
         # Cache the wrap on the Item when it's a per-item render.
         # The help branch recomputes on every paint and doesn't share
@@ -2120,6 +2206,22 @@ def render_preview(browser, rect, *, info=False, has_header=True,
         if src_idx < len(wrapped):
             write(wrapped[src_idx])
         end_row()
+
+    # Stale-hold snapshot: capture this paint (reference assignments, no
+    # copying) so a later pending row holds it. Per-item delivered
+    # paints only — help mode never owns the snapshot, and a pending row
+    # that fell through above (no snapshot yet) painted blank, which is
+    # not content worth holding. A delivered ``''`` is: a held view must
+    # match whatever the last paint actually showed.
+    if (item is not None and not browser._help_mode
+            and item.preview is not None):
+        browser._preview_snapshot = _PreviewSnapshot(
+            text=item.preview,
+            scroll=scroll,
+            wrapped=wrapped,
+            width=width,
+            ansi_on=ansi_on,
+        )
 
 
 def _cursor_id(browser):

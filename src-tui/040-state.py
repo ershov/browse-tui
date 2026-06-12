@@ -3841,6 +3841,14 @@ class Browser:
         # action, cursor-item change, and help-mode toggle. See
         # ``docs/superpowers/specs/2026-05-17-preview-tail-design.md``.
         self._preview_at_tail = False
+        # Stale-hold snapshot (preview-flicker design §B): the last
+        # successfully painted per-item preview (a ``_PreviewSnapshot``,
+        # 050-render). ``render_preview`` captures it at the end of
+        # every normal per-item content paint and paints it instead of
+        # blank rows while the cursor row's preview is pending. Owned
+        # by the render layer; never invalidated — a geometry/ANSI
+        # mismatch re-wraps from its raw text at paint time.
+        self._preview_snapshot = None
         # Help-mode toggle — when True, the preview pane shows the
         # composed help text (``compose_help_text(self)`` from the
         # render layer) instead of the per-item preview. The handler
