@@ -126,15 +126,17 @@ carry an explicit `parent`/`depth` column, the flag is ignored and
 `browse-tui: --path-sep ignored: rows carry explicit parent/depth` is
 printed to stderr.
 
-Special case: `--root-cmd cat` reads stdin verbatim (no subprocess). The
-UI is painted to the terminal device (`--tty`, default `/dev/tty`), not to
-`stdin`/`stdout`, so keyboard input keeps working after stdin is consumed
-and `stdout` stays free for the selection — see
-[Terminal & capturable result](#terminal--capturable-result).
+Special case: `--root-cmd -` reads stdin verbatim (no subprocess) — the
+canonical spelling for "the root list comes straight from stdin". Bare
+`--root-cmd cat` is kept as an alias for it (exactly `cat`; `--root-cmd
+'cat file'` still runs as a command). The UI is painted to the terminal
+device (`--tty`, default `/dev/tty`), not to `stdin`/`stdout`, so keyboard
+input keeps working after stdin is consumed and `stdout` stays free for the
+selection — see [Terminal & capturable result](#terminal--capturable-result).
 
 ```bash
 # Pipe-in friendly:
-ls | browse-tui --root-cmd cat --input tsv --fields id
+ls | browse-tui --root-cmd - --input tsv --fields id
 
 # Or run a real command:
 browse-tui --root-cmd 'cat /etc/passwd' --input ifs:: \
@@ -432,6 +434,49 @@ The UI is fully interactive on the terminal the whole time; the result is
 delivered on `stdout` only when Enter fires `print-exit` (the default
 `--on-enter`; see [`--on-enter`](#--on-enter-mode) and
 [`--print-format`](#--print-format-fmt) for the result formatting).
+
+### Content channels: stdin in, stdout out
+
+With the UI on its own terminal device, the process's `stdin` and `stdout`
+are free to carry **content** — input piped in, results printed out — while
+the UI runs. `stderr` is left untouched throughout (an escape hatch for
+ad-hoc recipe diagnostics; uncaught tracebacks still reach it).
+
+**Reading stdin.** `--root-cmd -` (and the `cat` alias) reads the root list
+directly from stdin, parsed per `--input` / `--fields` exactly as a command's
+output would be — see [`--root-cmd`](#--root-cmd-cmd). The read happens once,
+before the UI opens:
+
+- A **pipe or file** is slurped and parsed up front.
+- A **tty** blocks until you end input with `^D`, exactly like `cat` —
+  standard unix, not special-cased. (Type your rows, then `^D`.)
+- stdin is **one-shot**: it cannot be re-read. `Ctrl-R` reload re-serves the
+  already-parsed in-memory data — the same as eager `--root-cmd`, which does
+  not re-run its command on reload either.
+
+Once the UI is up, a tty stdin is detached (reads return immediate EOF) so a
+mid-session read can never steal your keystrokes.
+
+**Printing to stdout.** The `print-exit` selection is written to `stdout`
+when Enter fires (above). A recipe may also emit its own text through the
+`Context.print` API; from the CLI user's side the delivery is what matters:
+
+- **Piped / redirected stdout** (`| consumer`, `> file`): output is
+  **streamed live** as the consumer keeps up — a slow or backpressuring
+  reader never blocks the UI.
+- **A terminal stdout** (a bare interactive run): output is **held for the
+  whole session and delivered to normal scrollback at exit**, after the UI
+  closes — the `fzf` model, so a bare run still prints its result where you'd
+  expect. (browse-tui's own selection prints last.)
+- **Consumer gone** (it closed its read end — `EPIPE`): output simply stops;
+  the UI stays alive on its terminal and later prints are dropped.
+
+In every case the order is strict FIFO: anything printed during the session
+arrives before the final `print-exit` / quit output.
+
+(The Python-side contract — the `Context.print` and streaming `on_stdin`
+APIs a recipe author wires up — is in
+[api.md](api.md#output--ctxprint) and [api.md](api.md#streaming-input--on_stdin).)
 
 ### No controlling terminal
 

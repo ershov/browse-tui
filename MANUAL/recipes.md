@@ -24,6 +24,85 @@ rest each demonstrate a different data-source pattern.
 walks through a recipe skeleton, common patterns, and the framework
 constraints to keep in mind.
 
+## Reading from stdin (`-`)
+
+Three recipes accept a lone `-` argument and take their data from stdin
+instead of the filesystem / repo. The read happens once, before the UI
+opens (a pipe is slurped, a tty blocks until `^D` like `cat`); stdin is
+one-shot, so `Ctrl-R` re-serves the same parse. In every case `-` is the
+whole data source — it combines with no other argument, and the bare form
+of each recipe is unchanged (still browses the cwd / current repo):
+
+- **`browse-md -`** — read **one** Markdown document from stdin and browse
+  it as a heading tree. The root row is titled `(stdin)`; it has no on-disk
+  source, so the `V` / `E` (page / edit the source file) actions have
+  nothing to open and flash instead of acting. Empty input is an empty
+  document (an empty tree), not an error.
+
+  ```bash
+  glow-flavoured-render | browse-md -
+  ```
+
+- **`browse-fs -`** — read a **newline-separated list of paths** (one per
+  line; blank lines skipped, duplicates dropped) and show them as the root
+  rows, in order. Each path is shown verbatim as the row title; existing
+  directories expand and files preview as usual, and a path that **does not
+  exist** shows a dim **`[missing]`** tag instead of a tree. Empty input is
+  a clean empty list.
+
+  ```bash
+  fd -e py | browse-fs -            # or: git ls-files | browse-fs -
+  ```
+
+- **`browse-git -`** — read **git output** from stdin and sniff its kind
+  from the first non-blank line (color-agnostic), building the matching
+  view:
+
+  | Sniffed kind | Recognised by | Tree |
+  | --- | --- | --- |
+  | **diff** | a `diff --git` header or a bare `--- a/` hunk | one row per file block; that block (delta-rendered) as the preview |
+  | **log** | `commit <sha>` blocks (`--stat` / `-p` included) | one row per commit block; the whole block as the preview |
+  | **status** | porcelain `XY path` lines (the `-z` form too) or the human `On branch …` / `HEAD detached …` prose | the status view's leaf rows |
+
+  The slurped text is the only data source — git is never run, no repo is
+  required, and the actions that would re-run git (the `` ` `` mode picker,
+  the `t` graph toggle) flash instead of acting. Empty or unrecognised
+  input is a clean error on stderr (exit 2) before the UI starts.
+
+  ```bash
+  git diff | browse-git -           # also: git log -p | browse-git -
+  ```
+
+> **`--tty -` interplay.** The framework's `--tty -` flag (run the UI over
+> the std streams — see [cli.md](cli.md#--tty-tty_path)) consumes the `-`
+> as *its own value*, so it is never read as the content-mode `-`. The `-`
+> content modes are therefore unavailable under `--tty -`: there fd 0/1
+> *are* the UI, leaving no free stdin to ingest. `browse-md --tty -` (etc.)
+> falls back to the bare form (browse the cwd / repo).
+
+## Content channels in your own recipe
+
+A recipe can read stdin and write results to stdout while the UI runs on
+its own terminal — the same mechanism the `-` modes above use:
+
+- **Initial input** is plain `sys.stdin`, read in the recipe's setup
+  *before* `Browser.run()` (slurp, iterate lines, or split records on the
+  bytes layer), then build the tree from it. There is no framework API for
+  this — and none is needed.
+- **`ctx.print(text, end='\n')`** writes to the stdout content channel
+  (mirrors builtin `print`): streamed live to a pipe, or delivered to
+  scrollback at exit on a tty, never blocking the UI. `ctx.quit(code,
+  output)` appends `output` to the same channel (strict FIFO — prints
+  first).
+- **`on_stdin`** (a `BrowserConfig` hook) consumes stdin **live** while the
+  UI runs — raw chunks or framed records (`stdin_delimiter`), `str` or
+  `bytes` (`stdin_raw_bytes`) — folding each delivery into the tree via
+  `ctx.update_data`.
+
+The full contract (the `on_stdin` signature, record framing, EOF / error
+shape, and how a synchronous read composes with streaming) is in
+[api.md](api.md#content-channels-stdin--stdout).
+
 ## See also
 
 - [api.md](api.md) — full Python API.
