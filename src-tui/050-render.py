@@ -1989,9 +1989,10 @@ def render_preview(browser, rect, *, info=False, has_header=True,
     non-'h' layouts where the info bar lives at the bottom of the
     screen, drawn by ``render_full`` independently).
 
-    The header label adapts to ``browser._help_mode`` (``Help`` /
-    ``Preview``). Errors no longer take over the pane — they surface as
-    an info-bar notice + log entry (see ``Browser.error``).
+    The header label adapts to browser state (``Help`` / ``Preview`` /
+    ``⧗ Preview`` while a fetch for the cursored item is outstanding —
+    see ``_preview_label``). Errors no longer take over the pane — they
+    surface as an info-bar notice + log entry (see ``Browser.error``).
 
     Source priority for the content:
       1. ``browser._help_mode`` if True      → display ``compose_help_text``
@@ -3218,9 +3219,16 @@ def render_partial(browser):
 
 
 def _preview_label(browser):
-    """Pick the preview pane label based on browser state."""
+    """Pick the preview pane label based on browser state.
+
+    ``⧗ Preview`` while a fetch for the cursored item is outstanding
+    (preview-flicker design §C) — the glyph leads because the label is
+    right-aligned in the divider. Help mode never shows it.
+    """
     if browser._help_mode:
         return 'Help'
+    if browser._preview_loading():
+        return '⧗ Preview'
     return 'Preview'
 
 

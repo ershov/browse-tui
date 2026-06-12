@@ -3862,6 +3862,13 @@ class Browser:
         # dismiss the help overlay so the user sees the new item's
         # preview, not stale state from the previous one.
         self._preview_cursor_id = None
+        # Loading-indicator memo (preview-flicker design §C): the
+        # ``_preview_loading()`` value last observed by the main loop.
+        # The loop re-evaluates once per tick and flags 'preview' +
+        # 'info' redraws on a flip — the ``⧗`` label prefix lives in
+        # the 'h'-layout preview header and the standalone bottom info
+        # bar. See ``_flag_preview_loading_if_changed``.
+        self._preview_loading_memo = False
         # Last computed width of the preview pane in terminal columns.
         # Refreshed by ``_layout_for`` (050-render) on every render pass.
         # Zero until the first paint, or while the preview pane isn't
@@ -7358,6 +7365,14 @@ class Browser:
                 self._update_preview_for_cursor()
                 self._update_children_for_cursor()
 
+                # Loading-indicator label (preview-flicker design §C):
+                # repaint when the cursored item's fetch-outstanding
+                # state flips. Every transition wakes the loop — cursor
+                # moves are in-loop, deliveries post + wake, the stream
+                # pause / exhaustion paths call notify_wake — so this
+                # once-per-tick memo check needs no per-site wiring.
+                self._flag_preview_loading_if_changed()
+
                 # Post-drain lifecycle-hook settle pass. NOTE: this is
                 # only PART of the hook firing — ``on_scope_change`` and
                 # ``on_selection_change`` already fired synchronously at
@@ -7819,6 +7834,42 @@ class Browser:
             except OSError:
                 pass
             self._stdin_nonblock_set = False
+
+    def _preview_loading(self) -> bool:
+        """True while a preview fetch for the cursored item is outstanding.
+
+        Display predicate for the ``⧗`` label prefix (preview-flicker
+        design §C): the request slot holds the cursored id and no
+        paused stream matches it. ON from the cursor move — the slot
+        stays set through the debounce window, the fetch, and an
+        actively pulling stream. OFF once a delivery or stream
+        exhaustion drains the slot, and OFF while a streaming
+        generator is paused at its buffer cap: the slot still points
+        at the paused id, but the worker has voluntarily stopped
+        pulling (the same paused-is-idle call ``run_until_idle``
+        makes — that predicate is kept separate because it gates on
+        the slot alone, regardless of the cursor).
+        """
+        req = self._preview_req
+        if req is None or req != self._preview_cursor_id:
+            return False
+        paused = self._preview_paused
+        return paused is None or paused.get('id') != req
+
+    def _flag_preview_loading_if_changed(self) -> None:
+        """Flag label repaints when ``_preview_loading()`` flips (§C).
+
+        Called by the main loop once per tick, after
+        ``_update_preview_for_cursor`` refreshed the request slot. The
+        label lives in two places — the 'h'-layout preview header
+        ('preview' redraw key) and the standalone bottom info bar
+        ('info') — so a flip flags both; the row cache no-ops
+        whichever paint didn't actually change.
+        """
+        loading = self._preview_loading()
+        if loading != self._preview_loading_memo:
+            self._preview_loading_memo = loading
+            self._needs_redraw.update(('preview', 'info'))
 
     def _update_preview_for_cursor(self) -> None:
         """Request a preview fetch for the current cursor item.
