@@ -3,7 +3,15 @@
 or dirs-first directory listing; actions e:Edit ($EDITOR), o:Open (xdg-open), d:Delete
 (with ctx.confirm); background mtime watcher refreshes changed dirs.
 
-Usage:  browse-fs [PATH]   # PATH defaults to the current directory.
+The lone argument ``-`` reads a newline-separated list of paths from
+``sys.stdin`` (one per line, blank lines skipped, duplicates dropped
+keeping the first) BEFORE the UI starts and displays exactly those
+entries as the root level — ``ls *.py | browse-fs -``. Each row keeps
+the path verbatim as it arrived on stdin; directories among them expand
+into their real children via the normal lazy listing, files preview as
+usual, and a path that does not exist shows a dim ``[missing]`` row.
+
+Usage:  browse-fs [PATH | -]   # no argument ⇒ the current directory.
 """
 
 import os
@@ -27,6 +35,17 @@ except Exception:
 _MD_COLOR = _md2ansi_fn is not None  # default on when available
 _BROWSER = None  # set in main() — used for preview-width lookup
 
+# Stdin-list mode (the ``browse-fs -`` argument). ``main()`` reads the
+# newline-separated paths from ``sys.stdin`` once, before the UI starts,
+# and stores them here as a list of ``(label, abspath)`` pairs in input
+# order — ``label`` is the verbatim stdin line (shown as the row title),
+# ``abspath`` its cwd-resolved absolute path (the Item id / fs target).
+# ``get_children(None)`` serves this list as the root level instead of
+# scanning a single directory. ``None`` in every other invocation mode
+# (bare / single-PATH), in which case the root is a directory path and
+# nothing here is consulted.
+_STDIN_ROOTS = None
+
 
 def human_size(n):
     for unit in ('B', 'K', 'M', 'G', 'T'):
@@ -43,7 +62,57 @@ def _is_dir(dirent):
         return False
 
 
+def _set_columns(item, st, is_dir):
+    """Attach the perms / size / mtime display columns from a stat result.
+
+    Shared by the directory-scan rows and the stdin-list roots so both
+    render identical metadata columns. ``st`` is a no-follow stat (the
+    row describes the entry itself, e.g. a symlink, not its target).
+    """
+    # Size moved out of the `tag` chip into the col_size column; rows
+    # carry no tag now (fs_row_content renders the metadata columns).
+    item.col_perms = stat.filemode(st.st_mode)
+    item.col_size = '' if is_dir else human_size(st.st_size)
+    item.col_mtime = time.strftime('%b %d %H:%M', time.localtime(st.st_mtime))
+
+
+def _stdin_root_item(label, path):
+    """Build a root-level Item for one stdin-listed path.
+
+    ``label`` is shown verbatim (the line as piped); ``path`` is its
+    cwd-resolved absolute path and the Item id, so a directory expands
+    via the normal path-based ``get_children`` and a file previews as
+    usual. A path that does not exist (``lstat`` fails) becomes a dim
+    ``[missing]`` row whose id is the tagged tuple ``('missing', label,
+    path)`` — a non-``str`` id, so the e/o/d actions skip it exactly as
+    they skip the error row, and ``get_preview`` surfaces the stat error
+    instead of crashing. A broken symlink still ``lstat``s fine, so it
+    is a normal (existing-but-broken) row, not a missing one.
+    """
+    try:
+        st = os.lstat(path)
+    except OSError as e:
+        # Title stays the verbatim label; the dim ``[missing]`` tag chip
+        # is the marker (the same chip convention the error row uses).
+        # The id carries the path so ``get_preview`` can surface the
+        # stat error (re-statted there, so a path that appeared in the
+        # meantime previews normally).
+        return Item(id=('missing', label, path),
+                    title=label, tag='missing', tag_style='dim')
+    is_dir = stat.S_ISDIR(st.st_mode)
+    item = Item(id=path, title=label, has_children=is_dir)
+    _set_columns(item, st, is_dir)
+    return item
+
+
 def get_children(path, *, reload=False):
+    # Root level in stdin-list mode (``browse-fs -``): serve the paths
+    # read from stdin verbatim, in order, instead of scanning a dir.
+    # Directories among them carry their real abspath id, so expanding
+    # one re-enters this function with that path and lists it normally.
+    if path is None and _STDIN_ROOTS is not None:
+        return [_stdin_root_item(label, abspath)
+                for label, abspath in _STDIN_ROOTS]
     if not path:
         path = os.getcwd()
     try:
@@ -60,13 +129,8 @@ def get_children(path, *, reload=False):
             continue
         is_dir = stat.S_ISDIR(st.st_mode)
         title = d.name + ('/' if is_dir else '')
-        # Size moved out of the `tag` chip into the col_size column; rows
-        # carry no tag now (fs_row_content renders the metadata columns).
         item = Item(id=d.path, title=title, has_children=is_dir)
-        # Column display strings (read by fs_row_content via max_col_width).
-        item.col_perms = stat.filemode(st.st_mode)
-        item.col_size = '' if is_dir else human_size(st.st_size)
-        item.col_mtime = time.strftime('%b %d %H:%M', time.localtime(st.st_mtime))
+        _set_columns(item, st, is_dir)
         items.append(item)
     return items
 
@@ -110,6 +174,15 @@ def _dir_listing(path):
 def get_preview(path):
     if isinstance(path, tuple) and path[0] == 'err':
         return path[1]
+    if isinstance(path, tuple) and path[0] == 'missing':
+        # ('missing', label, abspath): a stdin-listed path that does not
+        # exist. Show the verbatim label and the underlying stat error.
+        _, label, abspath = path
+        try:
+            os.lstat(abspath)
+            return label  # raced into existence between list and preview
+        except OSError as e:
+            return f'{label}\n\n[missing] {e}'
     try:
         if os.path.isdir(path):
             return _dir_listing(path)
@@ -167,7 +240,16 @@ def delete(ctx):
 
 
 def mtime_watcher(browser):
-    """Poll mtime of each currently-cached directory; refresh on change."""
+    """Poll mtime of each currently-cached directory; refresh on change.
+
+    Works unchanged in stdin-list mode (``browse-fs -``): the root key
+    there is ``None`` (not a directory), so it is skipped by the
+    ``isinstance(d, str)`` guard below and the stdin root list itself is
+    not polled — there is no single directory backing it. Real
+    directories expanded from that list have ordinary path ids, so they
+    are watched naturally once their children are cached. No new watcher
+    machinery is added for the stdin roots.
+    """
     last = {}
     while True:
         time.sleep(1.0)
@@ -183,11 +265,19 @@ def mtime_watcher(browser):
             last[d] = m
 
 
+_USAGE = 'usage: browse-fs [PATH | -]'
+
 _HELP_INTRO = """\
 browse-fs — interactive filesystem browser.
 
-Usage: browse-fs [ROOT]
-  ROOT    Directory to start in. Defaults to the current working directory.
+Usage: browse-fs [PATH | -]
+  PATH    Directory to start in. Defaults to the current working directory.
+  -       Read a newline-separated list of paths from stdin and show
+          exactly those entries as the root level (one path per line,
+          blank lines skipped, duplicates dropped keeping the first).
+          Directories expand normally, files preview, a path that does
+          not exist shows a dim '[missing]' row. Cannot be combined with
+          a PATH argument.
 
 Lazily walks directories with os.scandir; the preview pane shows file
 heads or directory listings. The selection / cursor seeds $TUI_IDS_FILE
@@ -196,9 +286,48 @@ automatically. Press Enter (or 'e') to open the cursor row in $EDITOR.\
 """
 
 
+def _read_stdin_roots():
+    """Parse the newline-separated stdin path list into ``(label, abspath)``.
+
+    One path per line; blank lines are skipped and the trailing newline
+    is optional. Lines are taken verbatim otherwise — no quoting or
+    escaping — so a path with spaces just works (the delimiter is the
+    newline). Duplicates are dropped keeping the first occurrence (keyed
+    on the verbatim line). ``label`` is the line as given (the row
+    title); ``abspath`` is its cwd-resolved absolute path. Reading
+    happens before the UI starts; on a tty this blocks cat-like until
+    ^D (standard unix — no isatty guard).
+    """
+    roots = []
+    seen = set()
+    for line in sys.stdin.read().splitlines():
+        if not line or line in seen:
+            continue
+        seen.add(line)
+        roots.append((line, os.path.abspath(line)))
+    return roots
+
+
 def main():
-    global _BROWSER
-    root = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.getcwd()
+    global _BROWSER, _STDIN_ROOTS
+    args = sys.argv[1:]
+    # The lone ``-`` reads the root path list from stdin (spec §3.7).
+    # Reading here — before ``b.run()`` / ``term_init`` — is deliberate:
+    # fd 0 is still whatever the caller provided, so a pipe is consumed
+    # and a tty blocks cat-like until ^D. Once ``term_init`` runs, a tty
+    # fd 0 is detached and a later read would only see EOF. ``-`` cannot
+    # be combined with a PATH (the two name the root in conflicting ways);
+    # reject that with the usage error rather than guessing. Empty stdin
+    # yields an empty root list (a clean "no items" UI, no crash).
+    if '-' in args:
+        if args != ['-']:
+            sys.exit(f'{_USAGE}\nbrowse-fs: - (stdin) cannot be combined '
+                     f'with a path argument')
+        _STDIN_ROOTS = _read_stdin_roots()
+        root = None
+    else:
+        # Bare / single-PATH mode unchanged: stdin is never touched.
+        root = os.path.abspath(args[0]) if args else os.getcwd()
     actions = [
         Action('e', 'Edit cursor in $EDITOR',     edit,   'cursor'),
         Action('o', 'Open with xdg-open',         open_,  'targets'),
