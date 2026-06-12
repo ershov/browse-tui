@@ -12,7 +12,7 @@ split is deliberate:
 
 Affordances exposed on Context: ``cursor``, ``selected``, ``targets``,
 plus pass-through versions of ``refresh / cursor_to / expand / select /
-flash / log / error / quit`` and the main-thread sub-flows
+flash / log / error / print / quit`` and the main-thread sub-flows
 ``run_external``, ``page``, ``input``, ``confirm``, ``pick``, ``insert``.
 """
 
@@ -419,8 +419,25 @@ class Context:
         """
         self._browser.error(text)
 
+    def print(self, text, end: str = '\n') -> None:
+        """Append ``text`` + ``end`` to the stdout content channel.
+
+        Pass-through to :meth:`Browser.print`. Mirrors builtin ``print``
+        (newline-terminated; ``end`` overridable) and never blocks the
+        UI: a pipe/file stdout is drained by the event loop as the
+        consumer keeps up, a tty stdout is held and delivered to normal
+        scrollback after the UI exits — in strict FIFO order, ahead of
+        any ``quit`` output. After the consumer goes away (``EPIPE``)
+        calls become no-ops for the rest of the session.
+        """
+        self._browser.print(text, end)
+
     def quit(self, code: int = 0, output: str = '') -> None:
-        """Request the main loop to exit with ``code`` and stdout ``output``."""
+        """Request the main loop to exit with ``code`` and stdout ``output``.
+
+        ``output`` joins the stdout content channel at teardown, after
+        anything written via :meth:`print`.
+        """
         self._browser.quit(code, output)
 
     # ---- cache introspection ------------------------------------------

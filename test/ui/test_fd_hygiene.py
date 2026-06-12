@@ -3,7 +3,7 @@
 The unit suite (``test/unit/test_terminal_fd_hygiene``) verifies the
 ``term_init`` fd mechanics directly. This module exercises the *shipped
 binary* under a real terminal (tmux pane, so stdout is a tty), proving the
-interim teardown routing actually delivers the print-exit result: with
+teardown output delivery actually carries the print-exit result: with
 stdout redirected to ``/dev/null`` mid-session, the selection still lands
 in the user's normal scrollback after the UI exits — written to the saved
 real stdout via ``term_result_fd()`` (the fzf model).
@@ -73,7 +73,7 @@ def _result_line_above_sentinel(cap):
 class TestTtyStdoutResultDelivery(unittest.TestCase):
     """print-exit selection reaches tty scrollback after the UI exits.
 
-    Regression guard for the interim final-write routing: ``term_init``
+    Regression guard for the teardown output delivery: ``term_init``
     redirects a tty fd 1 to ``/dev/null``, so a result written through
     ``sys.stdout`` would silently vanish. The teardown must instead write
     it to the saved real stdout (``term_result_fd()``) once the alt-screen

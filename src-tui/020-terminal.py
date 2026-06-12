@@ -11,7 +11,7 @@ Provides the low-level I/O substrate the UI builds on:
   wake the main loop's ``select`` via ``notify_wake``
 * ``read_key`` -- a VT100/SGR/CSI-u escape-sequence parser that returns
   string keynames like ``'up'``, ``'ctrl-r'``, ``'shift-enter'``,
-  ``'mouse-click:R:C'``, ``'_notify'`` and ``'esc'``
+  ``'mouse-click:R:C'``, ``'_notify'``, ``'_writable'`` and ``'esc'``
 
 This module is pure I/O and contains nothing application-specific. It has
 no tests of its own; coverage comes from the Layer 3 UI tests that drive
@@ -48,7 +48,8 @@ std streams become safe content channels (see :func:`term_init`):
 
 ``stderr`` (fd 2) is left untouched. ``--tty -`` is excluded (there the
 std fds *are* the UI). Consumers reach the saved-output state through
-:func:`term_result_fd` / :func:`term_stdout_was_tty`, never the privates.
+:func:`term_result_fd` / :func:`term_stdout_was_tty` and hand it back via
+:func:`term_release_result_fd`, never touching the privates.
 """
 
 import errno
@@ -101,9 +102,9 @@ _tty_owns_fd = False
 #                     redirected to /dev/null with the real fd saved below).
 # _saved_stdout_fd -- the os.dup of the original fd 1 when _stdout_was_tty,
 #                     else -1. term_restore deliberately leaves it open for
-#                     the post-restore teardown dump (which closes it); a
-#                     stray fd from an unmatched restore is reclaimed by the
-#                     next term_init.
+#                     the post-restore teardown dump, which closes it via
+#                     term_release_result_fd(); a stray fd from an unmatched
+#                     restore is reclaimed by the next term_init.
 _stdout_was_tty = False
 _saved_stdout_fd = -1
 
@@ -661,18 +662,11 @@ def term_init(tty_path=None):
     ``termios`` call fails).
     """
     global _orig_sigtstp_handler, _notify_r, _notify_w
-    global _stdout_was_tty, _saved_stdout_fd
-    # Clean slate for the fd-hygiene state. Defensive close of a stray
+    # Clean slate for the fd-hygiene state: defensive release of a stray
     # saved fd from an unmatched prior init (real runs pair term_init with
-    # a term_restore + teardown dump that closes it; this guards repeated
+    # a term_restore + teardown dump that releases it; this guards repeated
     # init/restore cycles, e.g. in tests, against an fd leak).
-    if _saved_stdout_fd >= 0:
-        try:
-            os.close(_saved_stdout_fd)
-        except OSError:
-            pass
-    _stdout_was_tty = False
-    _saved_stdout_fd = -1
+    term_release_result_fd()
     _resolve_terminal(tty_path)
     _orig_sigtstp_handler = signal.getsignal(signal.SIGTSTP)
     # Create self-pipe for async notification
@@ -739,6 +733,25 @@ def term_stdout_was_tty():
     """
     return _stdout_was_tty
 
+def term_release_result_fd():
+    """Close the saved real-stdout fd (if any) and reset the hygiene state.
+
+    The final step of the teardown output dump: once the buffered / quit
+    output has been written to ``term_result_fd()``, this closes the
+    saved fd and clears ``term_stdout_was_tty()`` back to False, so the
+    save/dump/close lifecycle stays inside the terminal layer (callers
+    never close a terminal-private fd themselves). Idempotent; a no-op
+    when fd 1 was never redirected.
+    """
+    global _stdout_was_tty, _saved_stdout_fd
+    if _saved_stdout_fd >= 0:
+        try:
+            os.close(_saved_stdout_fd)
+        except OSError:
+            pass
+    _saved_stdout_fd = -1
+    _stdout_was_tty = False
+
 def _leave_raw():
     """Restore termios and leave alternate screen, but keep the notification pipe.
 
@@ -776,9 +789,9 @@ def term_restore():
     stdout (when ``term_stdout_was_tty``) is back in the normal screen and
     ready to receive the buffered / quit output. That saved fd is therefore
     NOT closed here: the teardown output dump writes to ``term_result_fd``
-    *after* this returns, then closes it (a later stage folds the dump and
-    the close into one teardown step). A stray saved fd left by an
-    unmatched ``term_restore`` is reclaimed by the next ``term_init``.
+    *after* this returns, then hands the fd back via
+    ``term_release_result_fd`` (which closes it). A stray saved fd left by
+    an unmatched ``term_restore`` is reclaimed by the next ``term_init``.
     """
     global _notify_r, _notify_w
     global _tty_fd_in, _tty_fd_out, _tty_writer, _tty_owns_fd
@@ -843,13 +856,19 @@ def input_ready():
             raise
 
 
-def read_key():
+def read_key(write_fd=None):
     """Read one keystroke and return a string name for it.
 
     Handles multi-byte escape sequences, alt-combos, and bare ESC
     (disambiguated via a 50 ms timeout after the initial ESC byte).
     Retries on EINTR (e.g. from SIGWINCH).
     Also wakes up on the notification pipe and returns '_notify'.
+
+    ``write_fd`` (optional) is additionally watched for *writability*;
+    when it is ready the call returns ``'_writable'`` instead of a key.
+    The main loop passes its buffered-output fd here only while there
+    are bytes to drain, so a backpressuring consumer never blocks the
+    UI and an idle channel adds nothing to the select set.
     """
     fd = _tty_fd_in
 
@@ -857,13 +876,18 @@ def read_key():
     watch_fds = [fd]
     if _notify_r >= 0:
         watch_fds.append(_notify_r)
+    wfds = [write_fd] if write_fd is not None else []
     while True:
         try:
-            ready, _, _ = select.select(watch_fds, [], [])
+            ready, wready, _ = select.select(watch_fds, wfds, [])
         except OSError as e:
             if e.errno == errno.EINTR:
                 continue
             raise
+        if wready:
+            # Deliver writability first; any pending key / notify stays
+            # buffered for the next call (same model as '_notify').
+            return '_writable'
         if _notify_r >= 0 and _notify_r in ready:
             # Drain the notification pipe
             try:

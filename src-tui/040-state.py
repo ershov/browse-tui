@@ -3775,10 +3775,32 @@ class Browser:
 
         # --- quit bookkeeping (read by the main loop in #13) ------------
         # quit() flips _quit_requested; the main loop watches the flag
-        # and exits with _quit_code, printing _quit_output if non-empty.
+        # and exits with _quit_code, delivering _quit_output via the
+        # output channel at teardown.
         self._quit_requested = False
         self._quit_code = 0
         self._quit_output = ''
+
+        # --- output channel (ctx.print / quit output; spec §3.2) --------
+        # ``print()`` appends utf-8 bytes here under ``_out_lock``; the
+        # quit output joins the same stream at teardown (strict FIFO:
+        # prints first, then quit output). Delivery depends on what
+        # stdout is — ``run()`` sets ``_out_stream_live`` True only for
+        # a pipe/file stdout, where the main loop drains the buffer
+        # non-blocking whenever select reports fd 1 writable; a tty
+        # stdout is held whole-session and dumped to the saved real
+        # stdout after terminal restore; headless / ``--tty -`` flush
+        # through ``sys.stdout`` at teardown. ``_out_dead`` marks a
+        # permanently failed channel (EPIPE etc.): buffer dropped, fd 1
+        # leaves the select set forever, ``print()`` becomes a no-op.
+        # ``_out_nonblock_set`` records that the live drain flipped fd 1
+        # to O_NONBLOCK (undone at teardown before the final blocking
+        # write).
+        self._out_buf = bytearray()
+        self._out_lock = threading.Lock()
+        self._out_dead = False
+        self._out_stream_live = False
+        self._out_nonblock_set = False
 
         # --- sticky cursor anchor (id-based positioning) ---------------
         # The cursor's identity is its *item id*, not its row index. The
@@ -3967,6 +3989,7 @@ class Browser:
     #   set_split(s)                — change the split layout
     #   select(ids, replace=False)  — set the multi-select set
     #   cancel(*pendings)           — cancel one or more Pending handles
+    #   print(text, end='\n')       — append to the stdout content channel
     #   quit(code=0, output='')     — exit the run loop
     #
     # Methods OUTSIDE this block are main-thread-only.
@@ -5260,12 +5283,40 @@ class Browser:
         for p in pendings:
             p.cancel()
 
+    def print(self, text, end: str = '\n') -> None:
+        """(thread-safe) Append ``text`` + ``end`` to the stdout content channel.
+
+        Mirrors builtin ``print``: ``text`` is coerced with ``str()`` and
+        newline-terminated unless ``end`` overrides it. The bytes (utf-8,
+        ``surrogateescape``) join the FIFO output buffer ahead of any quit
+        output. Never blocks the UI — a pipe/file stdout is drained by the
+        main loop as the consumer keeps up; a tty stdout is held and
+        delivered to the terminal's normal scrollback after the UI exits;
+        headless / ``--tty -`` runs flush via ``sys.stdout`` at teardown.
+        After a write error (consumer gone — EPIPE) the channel is dead
+        for the rest of the session and calls become no-ops.
+        """
+        if self._out_dead:
+            return
+        data = (str(text) + end).encode('utf-8', 'surrogateescape')
+        with self._out_lock:
+            self._out_buf += data
+        # Live pipe/file stdout: nudge the select loop so the new bytes
+        # are offered to the consumer without waiting for a keypress.
+        # Held / teardown-flushed channels skip the wake (nothing to do
+        # until exit), so chatty printers cost nothing extra there.
+        if self._out_stream_live:
+            notify_wake()
+
     def quit(self, code: int = 0, output: str = '') -> None:
         """(thread-safe) Request the main loop to exit with the given exit code.
 
         Phase 1 stores ``_quit_requested``/``_quit_code``/
         ``_quit_output`` on Browser; the main loop in #13 reads these
-        and shuts down once the current drain finishes.
+        and shuts down once the current drain finishes. ``output`` is
+        written to the stdout content channel at teardown, after any
+        buffered ``print()`` text (strict FIFO: prints first, then the
+        quit output).
         """
         self.post(lambda: self._do_quit(code, output))
 
@@ -6958,8 +7009,10 @@ class Browser:
         via the signal handlers in 020-terminal.
 
         Returns the exit code stored by ctx.quit() (or browser.quit()),
-        plus prints any captured ``_quit_output`` to stdout after
-        ``term_restore``.
+        after delivering the output channel — buffered ``print()`` text,
+        then any captured ``_quit_output`` — per ``_teardown_output``
+        (a pipe/file stdout additionally streams prints live during the
+        session via the select loop; see ``_drain_output``).
 
         Auto-detects ``-h`` / ``--help`` in ``sys.argv[1:]`` so recipes
         that call ``Browser.run()`` without their own argparse get
@@ -6982,7 +7035,8 @@ class Browser:
         ``--tty`` themselves are unaffected (they strip it first).
 
         Cross-module symbols (``term_init``/``term_restore``/
-        ``term_stdout_was_tty``/``term_result_fd``/``read_key``/
+        ``term_stdout_was_tty``/``term_result_fd``/
+        ``term_release_result_fd``/``read_key``/
         ``g_resize_flag``/``Context``/``dispatch_key``/``render_full``/
         ``render_partial``/``compose_help_text``) are resolved as bare
         globals — in the concatenated production build that's the
@@ -7019,6 +7073,14 @@ class Browser:
         self.start_workers()
         if not self._headless:
             term_init(tty_path)
+        # Output-channel routing for this run (spec §3.2): the select
+        # loop live-drains the buffer to fd 1 only when stdout is a
+        # pipe/file content channel — never when it was a tty (held and
+        # dumped to the saved real stdout at teardown), never in
+        # ``--tty -`` (fd 1 IS the UI device), never headless (no
+        # terminal layer; the teardown flush uses ``sys.stdout``).
+        self._out_stream_live = (not self._headless and tty_path != '-'
+                                 and not term_stdout_was_tty())
         ctx = Context(self)
         self._ctx = ctx
 
@@ -7180,7 +7242,17 @@ class Browser:
                     break
 
                 try:
-                    key = read_key()
+                    # fd 1 joins the select write-set only while a live
+                    # pipe/file stdout has buffered output to offer
+                    # (spec §3.5) — recipes that never print keep the
+                    # select sets exactly as before. The zero-arg call
+                    # stays on the no-output path so test stubs of
+                    # ``read_key`` need no signature change.
+                    if (self._out_stream_live and not self._out_dead
+                            and self._out_buf):
+                        key = read_key(write_fd=1)
+                    else:
+                        key = read_key()
                 except KeyboardInterrupt:
                     key = 'ctrl-c'
 
@@ -7195,6 +7267,12 @@ class Browser:
                     globals()['g_screen_lost_flag'] = False
                     self._pane_cache.clear()
                     self._needs_redraw.add('all')
+
+                if key == '_writable':
+                    # stdout can take bytes again — drain what it will
+                    # accept (non-blocking) and re-enter the loop.
+                    self._drain_output()
+                    continue
 
                 if key == '_notify':
                     # Worker delivered something; loop and drain.
@@ -7244,38 +7322,116 @@ class Browser:
                 if _plugin_cfg.on_after_run is not None:
                     _plugin_cfg.on_after_run(self)
 
-        # After teardown — print captured output (e.g. from on_enter
-        # print-exit). Done outside the alternate screen so the user's
-        # shell sees the result.
-        #
-        # Destination depends on the fd hygiene applied at term_init. When
-        # stdout was a tty, fd 1 (and thus ``sys.stdout``) now points at
-        # ``/dev/null`` — writing the result through ``sys.stdout`` would
-        # silently vanish — so it goes to the saved real stdout fd via
-        # ``os.write``, which then needs closing (term_restore deliberately
-        # left it open for exactly this write). Otherwise (headless / piped
-        # / file stdout / ``--tty -``) ``sys.stdout`` is the right sink and
-        # the plain write preserves buffering + redirect semantics.
-        #
-        # Interim arrangement: a later stage replaces this with the shared
-        # output buffer drained inside the teardown sequence.
-        if self._quit_output:
-            if term_stdout_was_tty():
-                result_fd = term_result_fd()
-                # Blocking full write to the saved tty (the UI is gone, so
-                # waiting on the terminal is fine); surrogateescape mirrors
-                # how stdin-ingested bytes were decoded. Loop in case a
-                # signal yields a short write.
-                payload = self._quit_output.encode('utf-8', 'surrogateescape')
+        # After teardown — deliver the output channel (buffered prints,
+        # then the quit output). Done outside the alternate screen so
+        # the user's shell sees the result.
+        self._teardown_output()
+
+        return self._quit_code
+
+    # ---- output channel: drain + teardown delivery (spec §3.2) ----------
+
+    def _drain_output(self) -> None:
+        """Main-thread: offer buffered output to fd 1, never blocking.
+
+        Called by the main loop when select reports fd 1 writable (the
+        fd is in the write-set only while ``_out_buf`` is non-empty and
+        the channel is alive, so this never busy-spins). Writes with
+        O_NONBLOCK set — flipped lazily on the first drain and undone at
+        teardown — so a consumer that stops reading leaves the remainder
+        buffered (select re-arms when it catches up) and the UI keeps
+        running. Any write error other than backpressure (``EPIPE``,
+        consumer gone) kills the channel permanently: buffer dropped,
+        fd 1 never re-enters the select set, ``print()`` no-ops from
+        then on. The UI itself rides the terminal device and stays up.
+        """
+        if self._out_dead or not self._out_stream_live:
+            return
+        if not self._out_nonblock_set:
+            try:
+                os.set_blocking(1, False)
+            except OSError:
+                self._out_dead = True
+                with self._out_lock:
+                    self._out_buf.clear()
+                return
+            self._out_nonblock_set = True
+        with self._out_lock:
+            while self._out_buf:
+                try:
+                    n = os.write(1, self._out_buf)
+                except BlockingIOError:
+                    break  # consumer backpressure; rest stays buffered
+                except OSError:
+                    self._out_dead = True
+                    self._out_buf.clear()
+                    break
+                if n <= 0:
+                    break
+                del self._out_buf[:n]
+
+    def _teardown_output(self) -> None:
+        """Deliver the output channel once the UI is gone (post-restore).
+
+        One stream, strict FIFO: buffered ``print()`` bytes first, then
+        the quit output. The sink depends on what stdout was:
+
+        * **tty** (``term_stdout_was_tty``): fd 1 — and thus
+          ``sys.stdout`` — now points at ``/dev/null``, so the payload
+          goes to the saved real stdout via ``os.write`` and lands in
+          normal scrollback exactly where an fzf result would; the saved
+          fd is then handed back (``term_release_result_fd`` closes it).
+        * **pipe / file** (``_out_stream_live``): blocking ``os.write``
+          of the remainder to fd 1 (the UI is gone; waiting on the
+          consumer is correct backpressure now), after undoing the
+          drain's O_NONBLOCK. Skipped entirely when the channel died.
+        * **headless / ``--tty -``**: through ``sys.stdout`` — keeps
+          buffering / redirect / ``StringIO``-patch semantics for tests
+          and matches the pre-channel behavior.
+
+        fd-level writes encode utf-8 with ``surrogateescape`` (both tty
+        and pipe branches — mirrors how stdin-ingested bytes were
+        decoded); write errors at this point are swallowed (there is no
+        UI left to complain to, and a dead consumer must not turn a
+        clean quit into a traceback).
+        """
+        if self._out_nonblock_set:
+            try:
+                os.set_blocking(1, True)
+            except OSError:
+                pass
+            self._out_nonblock_set = False
+        if self._out_dead:
+            return
+        with self._out_lock:
+            buf = bytes(self._out_buf)
+            self._out_buf.clear()
+        if term_stdout_was_tty():
+            payload = buf + self._quit_output.encode('utf-8',
+                                                     'surrogateescape')
+            result_fd = term_result_fd()
+            try:
+                # Loop in case a signal yields a short write.
                 written = 0
                 while written < len(payload):
                     written += os.write(result_fd, payload[written:])
-                os.close(result_fd)
-            else:
-                sys.stdout.write(self._quit_output)
+            except OSError:
+                pass
+            term_release_result_fd()
+        elif self._out_stream_live:
+            payload = buf + self._quit_output.encode('utf-8',
+                                                     'surrogateescape')
+            try:
+                written = 0
+                while written < len(payload):
+                    written += os.write(1, payload[written:])
+            except OSError:
+                self._out_dead = True
+        else:
+            text = buf.decode('utf-8', 'surrogateescape') + self._quit_output
+            if text:
+                sys.stdout.write(text)
                 sys.stdout.flush()
-
-        return self._quit_code
 
     def _update_preview_for_cursor(self) -> None:
         """Request a preview fetch for the current cursor item.

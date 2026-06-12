@@ -254,6 +254,28 @@ class TestFdHygiene(unittest.TestCase):
         self.assertIn(b'fd1_tty=True', out,
                       '--tty - must leave fd 1 as the tty UI device')
 
+    def test_release_result_fd_closes_and_resets(self):
+        """``term_release_result_fd`` closes the saved fd and clears the state.
+
+        The teardown output dump hands the saved real-stdout fd back to
+        the terminal layer once written: the fd must be closed and the
+        accessors must report the no-redirect state again. Idempotent —
+        a second call (and a call when nothing was saved) is a no-op.
+        Runs in-process on a fresh module instance with the saved-fd
+        globals planted directly; no terminal needed.
+        """
+        term = load('term_fdhyg_release', '020-terminal.py')
+        saved = os.open(os.devnull, os.O_WRONLY)
+        term._saved_stdout_fd = saved
+        term._stdout_was_tty = True
+        term.term_release_result_fd()
+        with self.assertRaises(OSError):
+            os.fstat(saved)
+        self.assertFalse(term.term_stdout_was_tty())
+        self.assertEqual(term.term_result_fd(), 1)
+        term.term_release_result_fd()  # idempotent no-op
+        self.assertEqual(term.term_result_fd(), 1)
+
     def test_child_fds_unaffected_by_redirect(self):
         """Shell-out children still get the terminal via ``term_child_fds``.
 
