@@ -1037,12 +1037,11 @@ class TestBrowseGitStdin(unittest.TestCase):
                 self.assertIn('[?]', untracked)
                 t.send('q')
 
-    # ---- the diff-mode --stat umbrella (#917) ----------------------------
+    # ---- the diff-mode stat umbrella (#917 / Option B #938) --------------
 
-    # A two-file diff whose files differ a lot in size, so the stat
-    # histogram bars are visibly different lengths: big.txt gets many
-    # added lines, small.txt one. Written directly (a valid unified diff)
-    # so the row counts are deterministic regardless of git's heuristics.
+    # A two-file diff. Written directly (a valid unified diff) so the row
+    # counts are deterministic regardless of git's heuristics: big.txt
+    # gets 8 added lines, small.txt one swap (1/1).
     _STAT_DIFF = (
         'diff --git a/big.txt b/big.txt\n'
         '--- a/big.txt\n'
@@ -1060,8 +1059,8 @@ class TestBrowseGitStdin(unittest.TestCase):
     def test_piped_diff_umbrella_auto_expands_with_stat_preview(self):
         # The umbrella row carries the short stats title and is
         # auto-expanded so both file rows are visible immediately; its own
-        # preview is the synthesised --stat table (per-file bars + the git
-        # summary footer).
+        # preview is the synthesised stat table (per-file ``+N -M`` + the
+        # git summary footer).
         with tempfile.TemporaryDirectory() as elsewhere:
             payload = self._payload(elsewhere, self._STAT_DIFF)
             with TmuxFixture(cols=120, rows=30) as t:
@@ -1072,27 +1071,66 @@ class TestBrowseGitStdin(unittest.TestCase):
                 self.assertIn('big.txt', cap)
                 self.assertIn('small.txt', cap)
                 # Cursor starts on the umbrella → the stat table is the
-                # preview: a per-file bar row and the git summary footer.
+                # preview: a ``<path> | +N -M`` row per file + the footer.
                 cap = t.wait_for('2 files changed', timeout=5.0)
-                bar_rows = [ln for ln in cap.splitlines()
-                            if ' | ' in ln and ('+' in ln or '-' in ln)
-                            and ('big.txt' in ln or 'small.txt' in ln)]
-                self.assertTrue(bar_rows, f'no bar rows in:\n{cap}')
+                count_rows = [re.sub(r'\x1b\[[0-9;]*m', '', ln)
+                              for ln in cap.splitlines()
+                              if ' | ' in ln
+                              and ('big.txt' in ln or 'small.txt' in ln)]
+                self.assertTrue(count_rows, f'no count rows in:\n{cap}')
+                # The Option-B layout: ``+N -M`` (no histogram bars after).
+                self.assertTrue(any(re.search(r'\| \+8 -0$', r)
+                                    for r in count_rows), count_rows)
+                self.assertTrue(any(re.search(r'\| \+1 -1$', r)
+                                    for r in count_rows), count_rows)
                 self.assertIn('insertions(+)', cap)
                 self.assertIn('deletion(-)', cap)     # singular: 1 deletion
                 t.send('q')
 
-    def test_piped_diff_stat_fits_narrow_and_reflows_on_resize(self):
-        # A single LONG-PATH file with 40 added lines at a 35-col launch:
-        # the name column is capped (front-elided) so the graph keeps its
-        # guaranteed share — bars render even though the path alone is
-        # wider than the pane — and the 40 raw bars overflow the budget,
-        # scaling down to fit. Then resize wider with NO keypress — the
-        # umbrella preview re-renders via the existing on_resize
-        # cache-drop and the bars grow back toward the raw count. The
-        # cursor is the umbrella throughout (its preview is the stat
-        # table). The preview pane spans the full terminal width in the
-        # default split, so preview_width tracks cols.
+    def test_piped_diff_stat_counts_are_colored(self):
+        # The preview's per-file ``+N`` carries green SGR, ``-M`` red —
+        # the raw escapes survive to the rendered pane (capture -e). The
+        # framework strips them when ANSI is off (R) — asserted too.
+        with tempfile.TemporaryDirectory() as elsewhere:
+            payload = self._payload(elsewhere, self._STAT_DIFF)
+            with TmuxFixture(cols=120, rows=30) as t:
+                self._launch_stdin(t, elsewhere, payload)
+                t.wait_for('2 files changed', timeout=8.0)
+                deadline = time.time() + 5.0
+                while time.time() < deadline:
+                    cap = t.capture(colors=True)
+                    if '\x1b[32m' in cap and '\x1b[31m' in cap:
+                        break
+                    time.sleep(0.05)
+                else:
+                    self.fail(f'count colors never painted:\n{cap!r}')
+                # The colors ride the count cell of a file row.
+                row = next(ln for ln in cap.splitlines()
+                           if 'big.txt' in ln and ' | ' in ln)
+                self.assertIn('\x1b[32m', row)     # green add
+                self.assertIn('\x1b[31m', row)     # red remove
+                # Toggle ANSI off (R): the framework neutralises the SGR.
+                t.send('R')
+                deadline = time.time() + 5.0
+                while time.time() < deadline:
+                    cap = t.capture(colors=True)
+                    row = next((ln for ln in cap.splitlines()
+                                if 'big.txt' in ln and ' | ' in ln), '')
+                    if row and '\x1b[32m' not in row:
+                        break
+                    time.sleep(0.05)
+                else:
+                    self.fail(f'ANSI-off did not strip count color:\n{row!r}')
+                t.send('q')
+
+    def test_piped_diff_stat_fits_narrow_and_refits_on_resize(self):
+        # A single LONG-PATH file at a 35-col launch: the path is
+        # front-elided (``...`` prefix) so the ``+N -M`` counts still fit
+        # the pane. Then resize wider with NO keypress — the umbrella
+        # preview re-renders via the existing on_resize cache-drop and
+        # more of the path shows. The cursor is the umbrella throughout
+        # (its preview is the stat table). The preview pane spans the full
+        # terminal width in the default split, so preview_width tracks cols.
         path = 'some/long/nested/path/big-changes.txt'
         big = ''.join(f'+added line {n}\n' for n in range(1, 41))   # 40 adds
         diff = (f'diff --git a/{path} b/{path}\n'
@@ -1100,47 +1138,46 @@ class TestBrowseGitStdin(unittest.TestCase):
         with tempfile.TemporaryDirectory() as elsewhere:
             payload = self._payload(elsewhere, diff)
 
-            def bar_len(cap):
+            def name_len(cap):
+                # The visible (SGR-stripped) name segment before ' | '.
                 for ln in cap.splitlines():
                     if 'big-changes.txt' in ln and ' | ' in ln:
-                        m = re.search(r'([+-]+)\s*$', ln)
-                        return len(m.group(1)) if m else 0
+                        plain = re.sub(r'\x1b\[[0-9;]*m', '', ln)
+                        return len(plain.split(' | ', 1)[0])
                 return None
 
             with TmuxFixture(cols=35, rows=30) as t:
                 self._launch_stdin(t, elsewhere, payload)
                 t.wait_for('1 file changed', timeout=8.0)
                 # Poll until the narrow-width stat row paints: elided
-                # name, bars PRESENT (the graph's guaranteed minimum),
-                # row within the pane.
+                # name, counts present, row within the pane.
                 deadline = time.time() + 5.0
-                narrow_len = None
+                narrow_name = None
                 while time.time() < deadline:
                     cap = t.capture()
                     row = next((ln for ln in cap.splitlines()
                                 if 'big-changes.txt' in ln and ' | ' in ln),
                                None)
-                    if row is not None and re.search(r'[+-]\s*$', row):
+                    if row is not None and re.search(r'\+40 -0', row):
                         self.assertLessEqual(len(row), 35, repr(row))
                         self.assertIn('...', row)   # front-elided path
-                        narrow_len = bar_len(cap)
+                        narrow_name = name_len(cap)
                         break
                     time.sleep(0.05)
-                self.assertIsNotNone(narrow_len, 'narrow stat row never painted')
-                self.assertGreaterEqual(narrow_len, 1)  # bars render at 35
-                self.assertLess(narrow_len, 40)     # scaled down to fit
+                self.assertIsNotNone(narrow_name,
+                                     'narrow stat row never painted')
                 # Resize wider — no keypress. on_resize drops the umbrella
-                # preview; the framework refetches and the bars grow.
+                # preview; the framework refetches and the path re-fits.
                 t.resize(100, 30)
                 deadline = time.time() + 5.0
                 while time.time() < deadline:
-                    wide_len = bar_len(t.capture())
-                    if wide_len is not None and wide_len > narrow_len:
+                    wide_name = name_len(t.capture())
+                    if wide_name is not None and wide_name > narrow_name:
                         break
                     time.sleep(0.05)
                 else:
-                    self.fail(f'bars did not grow on resize (narrow='
-                              f'{narrow_len}, last={bar_len(t.capture())})')
+                    self.fail(f'name did not grow on resize (narrow='
+                              f'{narrow_name}, last={name_len(t.capture())})')
                 t.send('q')
 
     def test_piped_diff_umbrella_actions_do_not_crash(self):

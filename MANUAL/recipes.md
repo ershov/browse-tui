@@ -66,7 +66,7 @@ repo):
 
   | Sniffed kind | Recognised by | Tree |
   | --- | --- | --- |
-  | **diff** | a `diff --git` header or a bare `--- a/` hunk | a synthesized `git diff --stat` umbrella row (auto-expanded) over one row per file; the stat table as the umbrella's preview, the delta-rendered block per file |
+  | **diff** | a `diff --git` header or a bare `--- a/` hunk | an auto-expanded umbrella row (`diff: N files +X -Y`) over one row per file; its preview is a per-file `path \| +N -M` table with green adds / red removes plus the `N files changed …` summary, and each file row previews its delta-rendered block |
   | **log** | `commit <sha>` blocks (`--stat` / `-p` included) | one row per commit block; the whole block as the preview |
   | **status** | porcelain `XY path` lines (the `-z` form too) or the human `On branch …` / `HEAD detached …` prose | the status view's leaf rows |
 

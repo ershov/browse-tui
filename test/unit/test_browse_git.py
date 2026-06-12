@@ -2634,8 +2634,7 @@ class TestStdinDiffUmbrella(unittest.TestCase):
         self.assertEqual(self.r._diff_block_counts(blocks[0]), (3, 2, False))
         # And the umbrella title carries the corrected totals.
         self._seed(_DIFF_LITERAL_MARKERS)
-        self.assertEqual(self.r.get_children(None)[0].title,
-                         'diff: 1 file +3 -2')
+        self.assertEqual(self._title(), 'diff: 1 file +3 -2')
 
     # ---- umbrella title + auto-expand -----------------------------------
 
@@ -2645,25 +2644,28 @@ class TestStdinDiffUmbrella(unittest.TestCase):
         self.r._STDIN_ROWS, self.r._STDIN_BLOCKS = rows, blocks
         return rows, blocks
 
+    def _title(self):
+        """The umbrella row title, SGR-stripped (the +X/-Y are colored)."""
+        return re.sub(r'\x1b\[[0-9;]*m', '',
+                      self.r.get_children(None)[0].title)
+
     def test_umbrella_title_short_form(self):
         self._seed(_DIFF_TEXT)        # 4 files, +2 (1+1) / -2 (1+1)
         root = self.r.get_children(None)
         self.assertEqual(len(root), 1)
         self.assertEqual(root[0].id, ('sdiff',))
-        self.assertEqual(root[0].title, 'diff: 4 files +2 -2')
+        self.assertEqual(self._title(), 'diff: 4 files +2 -2')
         self.assertTrue(root[0].has_children)
 
     def test_umbrella_title_counts_exclude_binary(self):
         # Binary file contributes a file to the count but no +/- lines.
         self._seed(_DIFF_TEXT + _DIFF_BINARY)
-        root = self.r.get_children(None)
-        self.assertEqual(root[0].title, 'diff: 5 files +2 -2')
+        self.assertEqual(self._title(), 'diff: 5 files +2 -2')
 
     def test_umbrella_title_singular_one_file(self):
         # One file → 'file', matching the footer's pluralisation.
         self._seed(_DIFF_RENAME_HUNKS)
-        self.assertEqual(self.r.get_children(None)[0].title,
-                         'diff: 1 file +1 -1')
+        self.assertEqual(self._title(), 'diff: 1 file +1 -1')
 
     def test_umbrella_children_are_the_sfile_leaves(self):
         rows, _blocks = self._seed(_DIFF_TEXT)
@@ -2740,10 +2742,9 @@ class TestStdinDiffUmbrella(unittest.TestCase):
     # ---- stat preview ----------------------------------------------------
 
     @staticmethod
-    def _bars(line):
-        """The ``+``/``-`` run at the end of a stat row (the histogram)."""
-        m = re.search(r'([+-]+)\s*$', line)
-        return m.group(1) if m else ''
+    def _plain(line):
+        """The SGR-stripped form of a stat row (drops the +/- colors)."""
+        return re.sub(r'\x1b\[[0-9;]*m', '', line)
 
     def test_stat_preview_routes_through_sdiff_id(self):
         self._seed(_DIFF_TEXT)
@@ -2754,53 +2755,47 @@ class TestStdinDiffUmbrella(unittest.TestCase):
         self.assertEqual(self.r.get_preview(('sdiff',)), 'STAT')
         self.assertEqual(seen['w'], 80)        # current preview width
 
-    def test_stat_rows_and_summary_plain(self):
+    def test_stat_rows_and_summary(self):
+        # Option B (#938): per file ``<path> | +N -M`` then the footer.
         self._seed(_DIFF_TEXT)
         out = self.r._stdin_diff_stat(80).splitlines()
         # One row per file (4) + the summary footer.
         self.assertEqual(len(out), 5)
-        # Each file row is ``<name> | <count> <bars>``.
-        self.assertIn('keep.txt', out[0])
-        self.assertIn(' | ', out[0])
-        self.assertTrue(out[-1].startswith(' 4 files changed'))
-        self.assertIn('2 insertions(+)', out[-1])
-        self.assertIn('2 deletions(-)', out[-1])
+        plain = [self._plain(ln) for ln in out]
+        self.assertEqual(plain[0], ' keep.txt | +1 -1')
+        self.assertEqual(plain[1], ' brand.txt | +1 -0')
+        self.assertEqual(plain[2], ' gone.txt | +0 -1')
+        self.assertEqual(plain[3], ' new.txt | +0 -0')   # hunkless rename
+        self.assertTrue(plain[-1].startswith(' 4 files changed'))
+        self.assertIn('2 insertions(+)', plain[-1])
+        self.assertIn('2 deletions(-)', plain[-1])
 
-    def test_stat_bars_scale_relative_at_fixed_width(self):
-        # big.txt (12 changes) vs small.txt (2 changes) at a wide width:
-        # the big file's bar is longer than the small file's, and both
-        # nonzero files get at least one bar.
-        self._seed(_DIFF_SCALING)
-        rows = self.r._stdin_diff_stat(80).splitlines()[:2]
-        big_bars, small_bars = self._bars(rows[0]), self._bars(rows[1])
-        self.assertGreater(len(big_bars), len(small_bars))
-        self.assertGreaterEqual(len(small_bars), 1)
-        # big.txt: 9 added / 3 removed → more '+' than '-' in its bar.
-        self.assertGreater(big_bars.count('+'), big_bars.count('-'))
-        self.assertIn('-', big_bars)
+    def test_stat_counts_are_colored_green_add_red_remove(self):
+        # The ``+N`` carries the green SGR, the ``-M`` the red SGR — the
+        # raw escapes, not a screenshot. (The framework strips them when
+        # ANSI is off; see the row-render test in the UI suite.)
+        self._seed(_DIFF_TEXT)
+        rows = self.r._stdin_diff_stat(80).splitlines()
+        self.assertIn('\x1b[32m+1\x1b[m', rows[0])    # keep.txt added
+        self.assertIn('\x1b[31m-1\x1b[m', rows[0])    # keep.txt removed
+        # A zero side is still colored (the number is the signal — #938).
+        self.assertIn('\x1b[31m-0\x1b[m', rows[1])    # brand.txt: -0
+        self.assertIn('\x1b[32m+0\x1b[m', rows[2])    # gone.txt: +0
 
-    def test_stat_bars_shrink_when_budget_overflows(self):
-        # git shows one bar per changed line while the busiest file fits
-        # the graph budget, and scales DOWN only once it overflows. At a
-        # wide pane big.txt's 12 changes fit → 12 bars; at a pane narrow
-        # enough that the budget is < 12 the bars scale down (but a
-        # nonzero change never drops below one char).
-        self._seed(_DIFF_SCALING)
-        wide = self._bars(self.r._stdin_diff_stat(120).splitlines()[0])
-        self.assertEqual(len(wide), 12)        # raw: 9 added + 3 removed
-        narrow = self._bars(self.r._stdin_diff_stat(26).splitlines()[0])
-        self.assertLess(len(narrow), len(wide))
-        self.assertGreaterEqual(len(narrow), 1)
+    def test_stat_counts_survive_sanitize_ansi(self):
+        # The colors are complete SGR sequences, so the framework's
+        # escape-sanitiser (kept SGR, dropped other CSI) leaves them whole
+        # — the green/red reaches the rendered preview unchanged.
+        self._seed(_DIFF_TEXT)
+        out = self.r._stdin_diff_stat(80)
+        self.assertEqual(self.r.sanitize_ansi(out), out)
 
-    def test_stat_file_rows_fit_within_narrow_width(self):
-        # Every per-file row fits within the requested width — a long path
-        # is front-elided and the histogram shrinks to make room. (The
-        # summary footer, like git's, is not width-constrained.)
-        self._seed(_DIFF_SCALING + _DIFF_RENAME_HUNKLESS)
-        width = 28
-        for line in self.r._stdin_diff_stat(width).splitlines()[:-1]:
-            self.assertLessEqual(self.r.cell_width(line), width,
-                                 repr(line))
+    def test_stat_no_histogram_bars(self):
+        # Option B dropped the bars: after the colored ``+N -M`` there is
+        # no trailing run of bare '+'/'-' glyphs.
+        self._seed(_DIFF_SCALING)        # big.txt 9/3, small.txt 1/1
+        for ln in self.r._stdin_diff_stat(80).splitlines()[:-1]:
+            self.assertRegex(self._plain(ln), r'\| \+\d+ -\d+$')
 
     def test_stat_long_path_is_front_elided(self):
         self.r._STDIN_KIND = 'diff'
@@ -2810,51 +2805,29 @@ class TestStdinDiffUmbrella(unittest.TestCase):
             f'diff --git a/{long_path} b/{long_path}\n'
             f'--- a/{long_path}\n+++ b/{long_path}\n'
             '@@ -1 +1 @@\n-old\n+new\n']
-        row = self.r._stdin_diff_stat(30).splitlines()[0]
-        # git keeps the readable tail behind a ``...`` prefix, advanced
-        # to the next '/' so the elision lands on a path boundary.
-        self.assertIn('.../longfilename.txt', row)
-        self.assertLessEqual(self.r.cell_width(row), 30)
-        # And bars still render — the graph keeps its share of the budget
-        # even when the path alone would consume the whole width.
-        self.assertEqual(self._bars(row), '+-')
+        row = self._plain(self.r._stdin_diff_stat(30).splitlines()[0])
+        # The readable tail is kept behind a ``...`` prefix (no '/'-snap):
+        # whatever fits the name budget, ending at the path's tail.
+        self.assertTrue(row.lstrip().startswith('...'), row)
+        self.assertIn('ilename.txt', row)        # the path's own tail
+        # The counts always follow, whatever the path length.
+        self.assertRegex(row, r'\| \+1 -1$')
+        # A wider pane keeps more of the path.
+        wide = self._plain(self.r._stdin_diff_stat(80).splitlines()[0])
+        self.assertEqual(wide, f' {long_path} | +1 -1')
 
-    def test_stat_tiny_width_clamps_to_floor(self):
-        # git floors the effective width at 16 + 6 + number_width; a pane
-        # narrower than that renders AT the floor — identical output for
-        # every width at or below it — instead of squeezing the graph to
-        # zero or overflowing the requested width.
-        self._seed(_DIFF_SCALING)               # max change 12 → 2 digits
-        floor = 16 + 6 + 2
-        at_floor = self.r._stdin_diff_stat(floor)
-        self.assertEqual(self.r._stdin_diff_stat(1), at_floor)
-        self.assertEqual(self.r._stdin_diff_stat(12), at_floor)
-        self.assertEqual(self.r._stdin_diff_stat(20), at_floor)
-        for line in at_floor.splitlines()[:-1]:
-            self.assertLessEqual(self.r.cell_width(line), floor, repr(line))
-        # Bars survive even down here (>=6 graph columns guaranteed).
-        self.assertNotEqual(self._bars(at_floor.splitlines()[0]), '')
+    def test_stat_short_path_is_not_padded(self):
+        # No fixed-width name column any more — a short path is verbatim.
+        self._seed(_DIFF_RENAME_HUNKS)       # new.txt, 1/1
+        row = self._plain(self.r._stdin_diff_stat(80).splitlines()[0])
+        self.assertEqual(row, ' new.txt | +1 -1')
 
-    def test_stat_balanced_file_keeps_both_glyphs_when_scaled(self):
-        # A 1-added/1-removed file scaled next to a much busier file
-        # computes a one-bar total; git widens it to two so BOTH glyphs
-        # stay visible ('+-', never just '-'). The long name forces the
-        # name column to its cap, pinning the graph at its 6-column
-        # minimum, where scale_linear(2, 6, 12) is 1 → the guard fires.
-        balanced = ('diff --git a/balanced-file.txt b/balanced-file.txt\n'
-                    '--- a/balanced-file.txt\n+++ b/balanced-file.txt\n'
-                    '@@ -1 +1 @@\n-old\n+new\n')
-        self._seed(_DIFF_SCALING + balanced)
-        rows = self.r._stdin_diff_stat(24).splitlines()    # the floor
-        # The 17-char name is elided into the 10-column name field.
-        bal = next(ln for ln in rows if '...ile.txt' in ln)
-        self.assertEqual(self._bars(bal), '+-')
-
-    def test_stat_binary_row_shows_Bin_no_bars(self):
+    def test_stat_binary_row_shows_Bin_no_counts(self):
         self._seed(_DIFF_BINARY)
         rows = self.r._stdin_diff_stat(80).splitlines()
-        self.assertIn('Bin', rows[0])
-        self.assertEqual(self._bars(rows[0]), '')      # no histogram
+        self.assertEqual(self._plain(rows[0]), ' img.bin | Bin')
+        # No +/- counts for a binary file, and no color either.
+        self.assertNotIn('\x1b[', rows[0])
         # A binary-only diff still prints both zero clauses, like git.
         self.assertEqual(rows[-1],
                          ' 1 file changed, 0 insertions(+), 0 deletions(-)')
@@ -2873,12 +2846,11 @@ class TestStdinDiffUmbrella(unittest.TestCase):
         self.assertEqual(self.r._diff_stat_summary(1, 0, 0),
                          ' 1 file changed, 0 insertions(+), 0 deletions(-)')
 
-    def test_stat_hunkless_rename_row_shows_zero_no_bars(self):
+    def test_stat_hunkless_rename_row_shows_zero_counts(self):
         self._seed(_DIFF_RENAME_HUNKLESS)
         rows = self.r._stdin_diff_stat(80).splitlines()
-        # The rename file's count is 0 and it carries no histogram.
-        self.assertRegex(rows[0], r'\|\s+0\s*$')
-        self.assertEqual(self._bars(rows[0]), '')
+        # The rename file's count is +0 -0 (no hunks → no changes).
+        self.assertEqual(self._plain(rows[0]), ' new.txt | +0 -0')
 
     def test_stat_empty_diff_is_just_the_summary(self):
         self.r._STDIN_KIND = 'diff'
@@ -2886,141 +2858,18 @@ class TestStdinDiffUmbrella(unittest.TestCase):
         self.assertEqual(self.r._stdin_diff_stat(80),
                          ' 0 files changed, 0 insertions(+), 0 deletions(-)')
 
+    # ---- umbrella title color -------------------------------------------
 
-@unittest.skipUnless(shutil.which('git'), 'git not available')
-class TestStdinDiffStatVsGit(unittest.TestCase):
-    """The synthesised ``--stat`` is byte-identical to ``git diff --stat=W``.
-
-    Each case builds a throwaway repo whose dirty diff has a controlled
-    shape, slurps the REAL ``git diff`` output through the stdin parser,
-    and compares ``_stdin_diff_stat(W)`` against the REAL
-    ``git diff --stat=W`` of the same repo, byte for byte — long paths
-    at narrow widths, the balanced-file scaling guard, hunk body lines
-    that literally start ``+++``/``---``, and the tiny-width floor.
-    Binary files and renames stay in the canned tests instead: their
-    rows deviate from git deliberately (no ``X -> Y bytes`` tail — byte
-    sizes aren't in the slurped text — and the new-path-only display
-    name).
-    """
-
-    def setUp(self):
-        self.r = _load_recipe()
-
-    def _repo(self, spec):
-        """Build a temp repo: ``spec[path] = (old_lines, new_lines)``.
-
-        The old contents are committed; the new contents are left dirty,
-        so ``git diff`` shows exactly the prescribed per-file changes.
-        Returns a ``git(*args) -> stdout`` runner bound to the repo.
-        """
-        repo = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, repo, ignore_errors=True)
-        env = {**os.environ, 'LC_ALL': 'C',
-               'GIT_AUTHOR_NAME': 'T', 'GIT_AUTHOR_EMAIL': 't@t',
-               'GIT_COMMITTER_NAME': 'T', 'GIT_COMMITTER_EMAIL': 't@t'}
-
-        def git(*args):
-            return subprocess.run(['git', '-C', repo, *args], check=True,
-                                  capture_output=True, text=True,
-                                  env=env).stdout
-
-        def write(path, lines):
-            full = os.path.join(repo, path)
-            if '/' in path:
-                os.makedirs(os.path.dirname(full), exist_ok=True)
-            with open(full, 'w') as f:
-                f.write(''.join(f'{line}\n' for line in lines))
-
-        git('init', '-q', '-b', 'main')
-        for path, (old, _new) in spec.items():
-            write(path, old)
-        git('add', '-A')
-        git('commit', '-q', '-m', 'base')
-        for path, (_old, new) in spec.items():
-            write(path, new)
-        return git
-
-    def _seed_from(self, git):
-        """Parse the repo's real ``git diff`` into the stdin-diff state."""
-        rows, blocks = self.r._parse_stdin_diff(git('diff'))
-        self.r._STDIN_KIND = 'diff'
-        self.r._STDIN_ROWS, self.r._STDIN_BLOCKS = rows, blocks
-
-    def _assert_stat_matches(self, git, widths):
-        for w in widths:
-            want = git('-c', 'color.ui=never', 'diff', f'--stat={w}')
-            self.assertEqual(self.r._stdin_diff_stat(w) + '\n', want,
-                             f'--stat={w} diverged')
-
-    def _assert_counts_match_numstat(self, git):
-        ours = {path: self.r._diff_block_counts(self.r._STDIN_BLOCKS[i])[:2]
-                for i, (_l, path) in enumerate(self.r._STDIN_ROWS)}
-        for line in git('diff', '--numstat').splitlines():
-            a, d, path = line.split('\t')
-            self.assertEqual(ours[path], (int(a), int(d)), path)
-
-    def test_short_and_long_paths_at_review_widths(self):
-        # The budget split between a short and a deeply nested path —
-        # name capping, slash-snapped elision, scaled bars — across the
-        # narrow widths where a name-greedy budget loses its graph.
-        git = self._repo({
-            'short.txt': (['a', 'b', 'c', 'd', 'e'],
-                          ['a'] + [f'new {i}' for i in range(10)]),
-            'very/deeply/nested/directory/structure/longfilename.txt':
-                (['x'], ['y', 'z']),
-        })
-        self._seed_from(git)
-        self._assert_counts_match_numstat(git)
-        self._assert_stat_matches(git, (20, 30, 40, 80))
-
-    def test_balanced_file_guard_vs_git(self):
-        # A 1/1 file beside a 12-change file at the floor width: the
-        # scaled total computes to one bar and git's both-sides guard
-        # widens it to '+-' — ours must match git exactly there.
-        git = self._repo({
-            'busy.txt': ([f'l{i}' for i in range(7)],
-                         ['l0'] + [f'n{i}' for i in range(9)]),
-            'balanced-file.txt': (['ctx', 'old'], ['ctx', 'new']),
-        })
-        self._seed_from(git)
-        self._assert_stat_matches(git, (22, 24, 30, 40, 80))
-
-    def test_literal_marker_body_lines_vs_git(self):
-        # Hunk body lines literally starting '+++ '/'--- ' count like any
-        # change line — both in --numstat and in the --stat table.
-        git = self._repo({
-            'lit.txt': (['base', '+++ a', '--- b'],
-                        ['base', '+++ x', '--- y', 'normal']),
-        })
-        self._seed_from(git)
-        self._assert_counts_match_numstat(git)
-        self._assert_stat_matches(git, (30, 40, 80))
-
-    def test_tiny_widths_clamp_like_git(self):
-        # Below git's width floor (16 + 6 + number_width) every width
-        # renders identically — to git's own --stat at the same widths.
-        git = self._repo({
-            'short.txt': (['a', 'b', 'c', 'd', 'e'],
-                          ['a'] + [f'new {i}' for i in range(10)]),
-            'very/deeply/nested/directory/structure/longfilename.txt':
-                (['x'], ['y', 'z']),
-        })
-        self._seed_from(git)
-        self._assert_stat_matches(git, (8, 12, 16, 24))
-
-    def test_single_long_path_file_keeps_bars_at_35(self):
-        # The narrow-pane regression shape: one long-path file whose 40
-        # changes overflow a 35-col pane — the graph keeps its minimum
-        # share (bars render) and the row matches git exactly.
-        path = 'some/quite/long/path/to/the/file/changed.txt'
-        git = self._repo({
-            path: ([f'old {i}' for i in range(20)],
-                   [f'new {i}' for i in range(20)]),
-        })
-        self._seed_from(git)
-        self._assert_stat_matches(git, (35,))
-        row = self.r._stdin_diff_stat(35).splitlines()[0]
-        self.assertNotEqual(re.search(r'([+-]+)\s*$', row), None, row)
+    def test_umbrella_title_totals_are_colored(self):
+        # The row title's ``+X`` / ``-Y`` carry the same green/red SGR as
+        # the preview (rendered as row-text SGR, like the commit graph).
+        self._seed(_DIFF_TEXT)           # +2 -2
+        title = self.r.get_children(None)[0].title
+        self.assertIn('\x1b[32m+2\x1b[m', title)
+        self.assertIn('\x1b[31m-2\x1b[m', title)
+        # SGR-stripped, the title reads as before.
+        self.assertEqual(
+            re.sub(r'\x1b\[[0-9;]*m', '', title), 'diff: 4 files +2 -2')
 
 
 class TestParseStdinLog(unittest.TestCase):

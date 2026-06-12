@@ -157,6 +157,15 @@ _GRAPH_TABLE = str.maketrans(_GRAPH_GLYPHS)
 # escape and no colour run is split.
 _SGR_RE = re.compile(r'\x1b\[[^@-~]*m')
 
+# git's default diff colors, used raw for the synthesised stat counts
+# (``_stat_counts``) and the umbrella row title's totals — green added,
+# red removed, then a reset. Complete SGR sequences, so they survive the
+# framework ``sanitize_ansi`` (and the row-text / preview ANSI-aware
+# truncation); the framework strips them when ANSI is off.
+_GREEN = '\033[32m'
+_RED = '\033[31m'
+_RESET = '\033[m'
+
 # Module-level state, all set in main() before the Browser launches.
 _log_limit = _LOG_LIMIT
 _mode = 'commits'
@@ -890,122 +899,64 @@ def _diff_stat_summary(n_files, insertions, deletions):
     return ', '.join(parts)
 
 
-def _scale_linear(it, width, max_change):
-    """git diff.c ``scale_linear``: map ``it`` changes into ``width`` bars.
+def _stat_name(path, width):
+    """A ``--stat`` row's path, fit to ``width`` cells (front-elided).
 
-    Integer arithmetic, verbatim from git: scale as if the budget were
-    one column shorter, then add 1 — so any non-zero change always
-    renders at least one bar. Returns 0 for no change.
+    A path wider than the column keeps its readable tail behind a ``...``
+    prefix — the last ``width - 3`` cells of the path. No ``/``-boundary
+    snapping (Option B, #938): the kept tail is whatever fits, ellipsis
+    first. Shorter paths are returned as-is (no padding — the counts that
+    follow don't need a fixed-width name column any more).
     """
-    if not it:
-        return 0
-    return 1 + it * (width - 1) // max_change
+    if cell_width(path) <= width:
+        return path
+    return '...' + path[cell_width(path) - (width - 3):]
 
 
-def _stat_name(path, name_width):
-    """The name cell of a ``--stat`` row: ``path`` fitted to ``name_width``.
+def _stat_counts(added, removed, is_bin):
+    """The colored ``+N -M`` (or ``Bin``) count cell for one stat row.
 
-    git's ``show_stats`` filename "scaling", verbatim: a path wider than
-    the column keeps its tail behind a ``...`` prefix — the kept tail is
-    the last ``name_width - 3`` characters, then advanced to the next
-    ``/`` (if any) so the elision lands on a directory boundary (e.g.
-    ``.../structure/longfilename.txt``). The result is padded to
-    ``name_width`` (the budget logic guarantees ``name_width >= 10``).
+    Option B (#938): no histogram bars — the green ``+N`` / red ``-M``
+    carry the magnitude the bars used to. A binary file shows ``Bin``
+    (git reports no +/- tally for one). Both sides are always shown and
+    always colored, including a zero side (``+0`` green / ``-0`` red): the
+    number is the signal, so dimming a zero would only add code. Colors
+    are git's diff defaults (green add / red remove); the framework strips
+    them in the preview when ANSI is off (``--no-preview-ansi`` / R).
     """
-    if cell_width(path) <= name_width:
-        return cell_ljust(path, name_width)
-    tail = path[cell_width(path) - (name_width - 3):]
-    slash = tail.find('/')
-    if slash != -1:
-        tail = tail[slash:]
-    return cell_ljust('...' + tail, name_width)
+    if is_bin:
+        return 'Bin'
+    return f'{_GREEN}+{added}{_RESET} {_RED}-{removed}{_RESET}'
 
 
 def _stdin_diff_stat(width):
-    """Synthesised ``git diff --stat`` table for the piped diff, at ``width``.
+    """Synthesised stat table for the piped diff, fit to ``width``.
 
     Re-derives the per-file counts from ``_STDIN_BLOCKS`` (aligned with
-    ``_STDIN_ROWS``) and lays them out as ``<name> | <count> <bars>``
-    rows + the standard summary footer, replicating git diff.c
-    ``show_stats`` (verified byte-for-byte against ``git diff --stat=W``
-    on non-binary diffs):
+    ``_STDIN_ROWS``) and lays them out as ``<path> | +N -M`` rows + the
+    standard summary footer (``_diff_stat_summary``). Option B (#938): no
+    ``git diff --stat`` byte-for-byte match and no histogram bars — the
+    colored counts (``_stat_counts``: green ``+N`` / red ``-M``, ``Bin``
+    for a binary file, ``+0 -0`` for a hunkless rename/copy) carry the
+    magnitude instead.
 
-      * ``width`` floors at ``16 + 6 + number_width`` — git's guarantee
-        of >=10 name / >=6 graph columns. A pane narrower than that
-        renders at the floor (identical output for every width at or
-        below it) rather than squeezing further.
-      * number column = the digits of the largest change count, widened
-        to 3 when a binary file's ``Bin`` shares it.
-      * the graph wants one column per changed line of the busiest file;
-        when name + number + 6 (separators incl. one trailing blank) +
-        graph exceed ``width``, the graph is first capped at
-        ``width*3/8 - number_width - 6`` (floored at 6), then the name
-        column gets the remainder (or returns its slack to the graph).
-      * a long path is front-elided to the name column via ``_stat_name``
-        (``...`` + tail snapped to a ``/`` boundary).
-      * bars: raw one-char-per-line when the graph budget covers
-        ``max_change``; otherwise ``_scale_linear`` shrinks them
-        proportionally, with git's guards — a non-zero change never drops
-        below one bar, and a file with BOTH adds and removes gets at
-        least two so both glyphs stay visible. The smaller side is scaled
-        first and the larger side takes the rest.
-      * a binary file shows ``Bin`` in the number column — with no
-        ``X -> Y bytes`` tail, since byte sizes aren't recoverable from
-        the slurped text (the one deviation from git); a hunkless
-        rename/copy shows ``0`` (no bars).
-
-    ``width`` is the CURRENT preview width (``ctx.preview_width`` /
-    ``_browser.preview_width``); the umbrella preview re-renders on a
-    width change via ``_on_resize`` so the layout always tracks the pane.
+    ``width`` is only used to front-elide an over-long path
+    (``_stat_name``); the counts always fit. It is the CURRENT preview
+    width (``ctx.preview_width`` / ``_browser.preview_width``), and the
+    umbrella preview re-renders on a width change via ``_on_resize`` so a
+    long path re-fits to the pane.
     """
     files = [(path, *_diff_block_counts(_STDIN_BLOCKS[i]))
              for i, (_letter, path) in enumerate(_STDIN_ROWS)]
     if not files:
         return _diff_stat_summary(0, 0, 0)
 
-    max_len = max(cell_width(p) for p, _a, _r, _b in files)
-    max_change = max((a + r for _p, a, r, b in files if not b), default=0)
-    number_width = len(str(max_change))
-    if any(b for _p, _a, _r, b in files):
-        number_width = max(number_width, 3)    # "Bin" shares the column
-
-    # git's minimum effective width: 10 name + 6 graph + separators.
-    width = max(width, 16 + 6 + number_width)
-
-    # Desired widths first, then git's adjustment when they overflow.
-    graph_width = max_change
-    name_width = max_len
-    if name_width + number_width + 6 + graph_width > width:
-        cap = width * 3 // 8 - number_width - 6
-        if graph_width > cap:
-            graph_width = max(cap, 6)
-        if name_width > width - number_width - 6 - graph_width:
-            name_width = width - number_width - 6 - graph_width
-        else:
-            graph_width = width - number_width - 6 - name_width
-
     out = []
     for path, added, removed, is_bin in files:
-        name = _stat_name(path, name_width)
-        if is_bin:
-            out.append(f' {name} | {"Bin".rjust(number_width)}')
-            continue
-        change = added + removed
-        add, dele = added, removed
-        if graph_width <= max_change:
-            total = _scale_linear(change, graph_width, max_change)
-            if total < 2 and added and removed:
-                total = 2          # both sides present -> both glyphs show
-            if add < dele:
-                add = _scale_linear(added, graph_width, max_change)
-                dele = total - add
-            else:
-                dele = _scale_linear(removed, graph_width, max_change)
-                add = total - dele
-        line = f' {name} | {str(change).rjust(number_width)}'
-        if change:
-            line += ' ' + '+' * add + '-' * dele
-        out.append(line)
+        # The counts cell is short and ANSI-only-wide; reserve a small,
+        # fixed budget for it so the name truncation tracks the pane.
+        name = _stat_name(path, max(width - 16, 10))
+        out.append(f' {name} | {_stat_counts(added, removed, is_bin)}')
 
     insertions = sum(a for _p, a, _r, b in files if not b)
     deletions = sum(r for _p, _a, r, b in files if not b)
@@ -1174,12 +1125,20 @@ def _stdin_diff_root():
     """Piped-diff root: a single synthetic ``('sdiff',)`` umbrella row.
 
     The umbrella groups every file under one stats row (title
-    ``diff: N files +X -Y``; preview a synthesised ``--stat`` table) so
-    the tree gains a summary at the top while navigation is unchanged —
-    ``main()`` auto-expands it on startup (the same posted-expand the
-    single-doc convention uses) so the file rows are visible immediately.
-    Its children are the per-file ``('sfile', …)`` leaves
+    ``diff: N files +X -Y`` with the totals colored — green ``+X`` / red
+    ``-Y``; preview the synthesised stat table) so the tree gains a
+    summary at the top while navigation is unchanged — ``main()``
+    auto-expands it on startup (the same posted-expand the single-doc
+    convention uses) so the file rows are visible immediately. Its
+    children are the per-file ``('sfile', …)`` leaves
     (``_stdin_diff_files``).
+
+    The title carries raw SGR for its ``+X`` / ``-Y`` (the same git diff
+    colors the preview uses): browse-git already renders SGR embedded in
+    row text — the commit graph column does — so the framework
+    (``default_row_content`` → ``_normalize_content`` keeps the segment's
+    SGR, ``_write_segments`` truncates it ANSI-aware and adds a trailing
+    reset). The codes are zero-width, so list-row width math is unchanged.
     """
     added = removed = 0
     for i in range(len(_STDIN_ROWS)):
@@ -1188,7 +1147,8 @@ def _stdin_diff_root():
         removed += r
     n = len(_STDIN_ROWS)
     files_word = 'file' if n == 1 else 'files'
-    title = f'diff: {n} {files_word} +{added} -{removed}'
+    title = (f'diff: {n} {files_word} '
+             f'{_GREEN}+{added}{_RESET} {_RED}-{removed}{_RESET}')
     return [Item(id=('sdiff',), title=title, has_children=True)]
 
 
@@ -1855,9 +1815,10 @@ def get_preview(item_id):
     if kind == 'file':
         return _file_preview(item_id[1], item_id[2])
     if kind == 'sdiff':
-        # The piped-diff umbrella — a synthesised ``--stat`` table over
-        # all files, scaled to the current preview width (re-rendered on a
-        # width change via ``_on_resize``). id = ('sdiff',).
+        # The piped-diff umbrella — a synthesised stat table (per-file
+        # colored +N -M) over all files, fit to the current preview width
+        # for long-path elision (re-rendered on a width change via
+        # ``_on_resize``). id = ('sdiff',).
         return _stdin_diff_stat((_browser.preview_width if _browser else 0) or 80)
     if kind == 'sfile':
         # A per-file block of a piped diff — the same delta pipeline as a
@@ -2124,9 +2085,9 @@ def _on_resize(ctx, cols, rows):
         at ``width >= 160`` and its two columns re-flow with the pane (see
         ``_colorize_diff``). Its unified output (both widths < 160) does
         not depend on width.
-      * the piped-diff ``('sdiff',)`` umbrella's ``--stat`` table — its
-        histogram is scaled to the preview width (``_stdin_diff_stat``),
-        so ANY width change re-flows it, with or without delta.
+      * the piped-diff ``('sdiff',)`` umbrella's stat table — a long
+        path is front-elided to the preview width (``_stdin_diff_stat``),
+        so ANY width change re-fits it, with or without delta.
 
     So on a genuine width change (``prev`` recorded, ``cur != prev``):
     when the delta layout flips (delta present and ``cur``/``prev``
