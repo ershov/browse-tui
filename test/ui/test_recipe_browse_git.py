@@ -944,20 +944,26 @@ class TestBrowseGitStdin(unittest.TestCase):
         return path
 
     def test_piped_diff_file_rows_preview_and_gating(self):
-        # `git diff` → one [M] row per file; the preview pane shows the
-        # file's own hunks from the text (delta-rendered when present —
-        # either way the changed line's text appears). The backtick mode
-        # picker is gated off with a flash; launched from a non-repo cwd.
+        # `git diff` → a synthetic umbrella stats row, auto-expanded over
+        # one [M] row per file. Stepping onto the file row shows its own
+        # hunks from the text (delta-rendered when present — either way
+        # the changed line's text appears). The backtick mode picker is
+        # gated off with a flash; launched from a non-repo cwd.
         with tempfile.TemporaryDirectory() as repo, \
                 tempfile.TemporaryDirectory() as elsewhere:
             _make_stdin_repo(repo)
             payload = self._payload(elsewhere, _git_stdout(repo, 'diff'))
             with TmuxFixture(cols=120, rows=30) as t:
                 self._launch_stdin(t, elsewhere, payload)
+                # The umbrella row is visible and auto-expanded, with the
+                # file row beneath it (this payload is a single-file diff
+                # → the singular 'file' form).
                 cap = t.wait_for('beta.txt', timeout=8.0)
+                self.assertRegex(cap, r'diff: 1 file \+\d+ -\d+')
                 row = next(ln for ln in cap.splitlines() if 'beta.txt' in ln)
                 self.assertIn('[M]', row)
-                # Cursor starts on the row → its block is the preview.
+                # Step onto the file row → its block is the preview.
+                t.send('Down')
                 t.wait_for('beta worktree edit', timeout=5.0)
                 # Mode switching re-runs git → flashes in stdin mode.
                 t.send('`')
@@ -1029,6 +1035,147 @@ class TestBrowseGitStdin(unittest.TestCase):
                 untracked = next(ln for ln in cap.splitlines()
                                  if 'untracked.txt' in ln)
                 self.assertIn('[?]', untracked)
+                t.send('q')
+
+    # ---- the diff-mode --stat umbrella (#917) ----------------------------
+
+    # A two-file diff whose files differ a lot in size, so the stat
+    # histogram bars are visibly different lengths: big.txt gets many
+    # added lines, small.txt one. Written directly (a valid unified diff)
+    # so the row counts are deterministic regardless of git's heuristics.
+    _STAT_DIFF = (
+        'diff --git a/big.txt b/big.txt\n'
+        '--- a/big.txt\n'
+        '+++ b/big.txt\n'
+        '@@ -1,1 +1,9 @@\n'
+        ' ctx\n'
+        + ''.join(f'+added line {n}\n' for n in range(1, 9))
+        + 'diff --git a/small.txt b/small.txt\n'
+        '--- a/small.txt\n'
+        '+++ b/small.txt\n'
+        '@@ -1 +1 @@\n'
+        '-old\n'
+        '+new\n')
+
+    def test_piped_diff_umbrella_auto_expands_with_stat_preview(self):
+        # The umbrella row carries the short stats title and is
+        # auto-expanded so both file rows are visible immediately; its own
+        # preview is the synthesised --stat table (per-file bars + the git
+        # summary footer).
+        with tempfile.TemporaryDirectory() as elsewhere:
+            payload = self._payload(elsewhere, self._STAT_DIFF)
+            with TmuxFixture(cols=120, rows=30) as t:
+                self._launch_stdin(t, elsewhere, payload)
+                # Title: 2 files, +9 (8+1) / -1.
+                cap = t.wait_for('diff: 2 files +9 -1', timeout=8.0)
+                # Auto-expanded: both file rows visible without a keypress.
+                self.assertIn('big.txt', cap)
+                self.assertIn('small.txt', cap)
+                # Cursor starts on the umbrella → the stat table is the
+                # preview: a per-file bar row and the git summary footer.
+                cap = t.wait_for('2 files changed', timeout=5.0)
+                bar_rows = [ln for ln in cap.splitlines()
+                            if ' | ' in ln and ('+' in ln or '-' in ln)
+                            and ('big.txt' in ln or 'small.txt' in ln)]
+                self.assertTrue(bar_rows, f'no bar rows in:\n{cap}')
+                self.assertIn('insertions(+)', cap)
+                self.assertIn('deletion(-)', cap)     # singular: 1 deletion
+                t.send('q')
+
+    def test_piped_diff_stat_fits_narrow_and_reflows_on_resize(self):
+        # A single LONG-PATH file with 40 added lines at a 35-col launch:
+        # the name column is capped (front-elided) so the graph keeps its
+        # guaranteed share — bars render even though the path alone is
+        # wider than the pane — and the 40 raw bars overflow the budget,
+        # scaling down to fit. Then resize wider with NO keypress — the
+        # umbrella preview re-renders via the existing on_resize
+        # cache-drop and the bars grow back toward the raw count. The
+        # cursor is the umbrella throughout (its preview is the stat
+        # table). The preview pane spans the full terminal width in the
+        # default split, so preview_width tracks cols.
+        path = 'some/long/nested/path/big-changes.txt'
+        big = ''.join(f'+added line {n}\n' for n in range(1, 41))   # 40 adds
+        diff = (f'diff --git a/{path} b/{path}\n'
+                f'--- a/{path}\n+++ b/{path}\n@@ -1 +1,40 @@\n ctx\n' + big)
+        with tempfile.TemporaryDirectory() as elsewhere:
+            payload = self._payload(elsewhere, diff)
+
+            def bar_len(cap):
+                for ln in cap.splitlines():
+                    if 'big-changes.txt' in ln and ' | ' in ln:
+                        m = re.search(r'([+-]+)\s*$', ln)
+                        return len(m.group(1)) if m else 0
+                return None
+
+            with TmuxFixture(cols=35, rows=30) as t:
+                self._launch_stdin(t, elsewhere, payload)
+                t.wait_for('1 file changed', timeout=8.0)
+                # Poll until the narrow-width stat row paints: elided
+                # name, bars PRESENT (the graph's guaranteed minimum),
+                # row within the pane.
+                deadline = time.time() + 5.0
+                narrow_len = None
+                while time.time() < deadline:
+                    cap = t.capture()
+                    row = next((ln for ln in cap.splitlines()
+                                if 'big-changes.txt' in ln and ' | ' in ln),
+                               None)
+                    if row is not None and re.search(r'[+-]\s*$', row):
+                        self.assertLessEqual(len(row), 35, repr(row))
+                        self.assertIn('...', row)   # front-elided path
+                        narrow_len = bar_len(cap)
+                        break
+                    time.sleep(0.05)
+                self.assertIsNotNone(narrow_len, 'narrow stat row never painted')
+                self.assertGreaterEqual(narrow_len, 1)  # bars render at 35
+                self.assertLess(narrow_len, 40)     # scaled down to fit
+                # Resize wider — no keypress. on_resize drops the umbrella
+                # preview; the framework refetches and the bars grow.
+                t.resize(100, 30)
+                deadline = time.time() + 5.0
+                while time.time() < deadline:
+                    wide_len = bar_len(t.capture())
+                    if wide_len is not None and wide_len > narrow_len:
+                        break
+                    time.sleep(0.05)
+                else:
+                    self.fail(f'bars did not grow on resize (narrow='
+                              f'{narrow_len}, last={bar_len(t.capture())})')
+                t.send('q')
+
+    def test_piped_diff_umbrella_actions_do_not_crash(self):
+        # The umbrella's ('sdiff',) id is an unknown kind to the file-only
+        # actions: E is a no-op, Enter folds/unfolds it, and the gated
+        # mode/tree pickers flash — none crash the UI. The tree-list row
+        # carries the ▼ (expanded) / ▶ (collapsed) glyph; the Children /
+        # Preview panes keep showing the umbrella's files either way, so
+        # the fold is asserted on the umbrella's own list row.
+        def umbrella_row(cap):
+            return next(ln for ln in cap.splitlines() if 'diff: 2 files' in ln)
+
+        with tempfile.TemporaryDirectory() as elsewhere:
+            payload = self._payload(elsewhere, self._STAT_DIFF)
+            with TmuxFixture(cols=120, rows=30) as t:
+                self._launch_stdin(t, elsewhere, payload)
+                cap = t.wait_for('diff: 2 files', timeout=8.0)
+                self.assertIn('▼', umbrella_row(cap))   # ▼ expanded
+                t.send('E')                 # no-op on the umbrella
+                t.send('Enter')             # collapse the umbrella
+                deadline = time.time() + 5.0
+                while time.time() < deadline:
+                    if '▶' in umbrella_row(t.capture()):  # ▶ collapsed
+                        break
+                    time.sleep(0.05)
+                else:
+                    self.fail('umbrella did not collapse on Enter')
+                t.send('Enter')             # re-expand
+                deadline = time.time() + 5.0
+                while time.time() < deadline:
+                    if '▼' in umbrella_row(t.capture()):
+                        break
+                    time.sleep(0.05)
+                else:
+                    self.fail('umbrella did not re-expand on Enter')
                 t.send('q')
 
     # -- pre-UI error paths (headless: the recipe exits before any UI) --

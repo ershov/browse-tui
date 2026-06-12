@@ -22,8 +22,10 @@ FROM STDIN: the stream is slurped to EOF before the UI starts (on a
 tty: until ^D, like cat) and its type is sniffed from the first
 non-blank line —
 
-  diff      a ``diff --git`` header or ``--- a/`` hunk → one row per
-            file block, that block (delta-rendered) as the preview
+  diff      a ``diff --git`` header or ``--- a/`` hunk → an auto-expanded
+            ``diff: N files +X -Y`` umbrella (a synthesised ``--stat``
+            table as its preview) over one row per file block, each
+            block (delta-rendered) as that row's preview
   log       ``commit <sha>`` blocks (--stat / -p included) → one commit
             row per block (sha / author / date columns + decoration
             chips), the whole block as the preview
@@ -50,6 +52,7 @@ access — never a hex-vs-word heuristic or substring scan:
   ('stash', n[, path])       a stash (n int), or a file in one
   ('reflog', n, sha)         a reflog entry (n int) -> changed files
   ('filler', ns, n)          an inert tree-mode connector row (meta; no children)
+  ('sdiff',)                 the piped-diff --stat umbrella -> its sfile rows
   ('sfile', i, path)         a file block of a piped diff (leaf; stdin mode)
   ('slog', i)                a commit block of a piped log (leaf; stdin mode)
   ('status_clean',)          the "working tree clean" sentinel (no children)
@@ -826,6 +829,190 @@ def _parse_stdin_diff(text):
     return [_diff_block_row(b) for b in blocks], blocks
 
 
+def _diff_block_counts(block):
+    """One block's ``(added, removed, is_binary)`` change counts.
+
+    A single pass over the SGR-stripped lines, split at the first hunk
+    header (``@@``) into the file-header region and the hunk body:
+
+      * header region — nothing is counted (this is where the ``---`` /
+        ``+++`` file headers live, so they are excluded by POSITION, not
+        by prefix); git's binary markers (``Binary files … differ`` /
+        ``GIT binary patch``) are detected here.
+      * inside hunks — EVERY line starting ``+`` counts as added and
+        every ``-`` as removed, exactly like ``git diff --numstat``. A
+        body line whose own content starts ``+++``/``---`` (rendered
+        ``++++ x`` / ``---- y`` with the diff prefix) is a normal change
+        line and counts.
+
+    A binary file yields ``(0, 0, True)`` and is never line-counted (git
+    reports such files as ``Bin``, not a +/- tally). A hunkless rename or
+    copy has no hunks at all, so it falls out as ``(0, 0, False)``
+    naturally.
+    """
+    added = removed = 0
+    binary = False
+    in_hunk = False
+    for line in _SGR_RE.sub('', block).splitlines():
+        if line.startswith('@@'):
+            in_hunk = True
+        elif not in_hunk:
+            if line.startswith(('Binary files ', 'GIT binary patch')):
+                binary = True
+        elif line.startswith('+'):
+            added += 1
+        elif line.startswith('-'):
+            removed += 1
+    if binary:
+        return 0, 0, True
+    return added, removed, False
+
+
+def _diff_stat_summary(n_files, insertions, deletions):
+    """git's ``N files changed, X insertions(+), Y deletions(-)`` footer.
+
+    Mirrors git's ``print_stat_summary`` pluralisation and zero-part
+    elision: the insertions clause is shown when ``insertions`` is
+    non-zero OR ``deletions`` is zero, the deletions clause when
+    ``deletions`` is non-zero OR ``insertions`` is zero. So a one-sided
+    change drops the zero half (``…, 3 insertions(+)`` with no
+    ``, 0 deletions(-)``) while an all-zero diff (e.g. binary-only) still
+    prints both zero clauses, exactly as git does.
+    """
+    files_word = 'file' if n_files == 1 else 'files'
+    parts = [f' {n_files} {files_word} changed']
+    if insertions or not deletions:
+        word = 'insertion' if insertions == 1 else 'insertions'
+        parts.append(f'{insertions} {word}(+)')
+    if deletions or not insertions:
+        word = 'deletion' if deletions == 1 else 'deletions'
+        parts.append(f'{deletions} {word}(-)')
+    return ', '.join(parts)
+
+
+def _scale_linear(it, width, max_change):
+    """git diff.c ``scale_linear``: map ``it`` changes into ``width`` bars.
+
+    Integer arithmetic, verbatim from git: scale as if the budget were
+    one column shorter, then add 1 — so any non-zero change always
+    renders at least one bar. Returns 0 for no change.
+    """
+    if not it:
+        return 0
+    return 1 + it * (width - 1) // max_change
+
+
+def _stat_name(path, name_width):
+    """The name cell of a ``--stat`` row: ``path`` fitted to ``name_width``.
+
+    git's ``show_stats`` filename "scaling", verbatim: a path wider than
+    the column keeps its tail behind a ``...`` prefix — the kept tail is
+    the last ``name_width - 3`` characters, then advanced to the next
+    ``/`` (if any) so the elision lands on a directory boundary (e.g.
+    ``.../structure/longfilename.txt``). The result is padded to
+    ``name_width`` (the budget logic guarantees ``name_width >= 10``).
+    """
+    if cell_width(path) <= name_width:
+        return cell_ljust(path, name_width)
+    tail = path[cell_width(path) - (name_width - 3):]
+    slash = tail.find('/')
+    if slash != -1:
+        tail = tail[slash:]
+    return cell_ljust('...' + tail, name_width)
+
+
+def _stdin_diff_stat(width):
+    """Synthesised ``git diff --stat`` table for the piped diff, at ``width``.
+
+    Re-derives the per-file counts from ``_STDIN_BLOCKS`` (aligned with
+    ``_STDIN_ROWS``) and lays them out as ``<name> | <count> <bars>``
+    rows + the standard summary footer, replicating git diff.c
+    ``show_stats`` (verified byte-for-byte against ``git diff --stat=W``
+    on non-binary diffs):
+
+      * ``width`` floors at ``16 + 6 + number_width`` — git's guarantee
+        of >=10 name / >=6 graph columns. A pane narrower than that
+        renders at the floor (identical output for every width at or
+        below it) rather than squeezing further.
+      * number column = the digits of the largest change count, widened
+        to 3 when a binary file's ``Bin`` shares it.
+      * the graph wants one column per changed line of the busiest file;
+        when name + number + 6 (separators incl. one trailing blank) +
+        graph exceed ``width``, the graph is first capped at
+        ``width*3/8 - number_width - 6`` (floored at 6), then the name
+        column gets the remainder (or returns its slack to the graph).
+      * a long path is front-elided to the name column via ``_stat_name``
+        (``...`` + tail snapped to a ``/`` boundary).
+      * bars: raw one-char-per-line when the graph budget covers
+        ``max_change``; otherwise ``_scale_linear`` shrinks them
+        proportionally, with git's guards — a non-zero change never drops
+        below one bar, and a file with BOTH adds and removes gets at
+        least two so both glyphs stay visible. The smaller side is scaled
+        first and the larger side takes the rest.
+      * a binary file shows ``Bin`` in the number column — with no
+        ``X -> Y bytes`` tail, since byte sizes aren't recoverable from
+        the slurped text (the one deviation from git); a hunkless
+        rename/copy shows ``0`` (no bars).
+
+    ``width`` is the CURRENT preview width (``ctx.preview_width`` /
+    ``_browser.preview_width``); the umbrella preview re-renders on a
+    width change via ``_on_resize`` so the layout always tracks the pane.
+    """
+    files = [(path, *_diff_block_counts(_STDIN_BLOCKS[i]))
+             for i, (_letter, path) in enumerate(_STDIN_ROWS)]
+    if not files:
+        return _diff_stat_summary(0, 0, 0)
+
+    max_len = max(cell_width(p) for p, _a, _r, _b in files)
+    max_change = max((a + r for _p, a, r, b in files if not b), default=0)
+    number_width = len(str(max_change))
+    if any(b for _p, _a, _r, b in files):
+        number_width = max(number_width, 3)    # "Bin" shares the column
+
+    # git's minimum effective width: 10 name + 6 graph + separators.
+    width = max(width, 16 + 6 + number_width)
+
+    # Desired widths first, then git's adjustment when they overflow.
+    graph_width = max_change
+    name_width = max_len
+    if name_width + number_width + 6 + graph_width > width:
+        cap = width * 3 // 8 - number_width - 6
+        if graph_width > cap:
+            graph_width = max(cap, 6)
+        if name_width > width - number_width - 6 - graph_width:
+            name_width = width - number_width - 6 - graph_width
+        else:
+            graph_width = width - number_width - 6 - name_width
+
+    out = []
+    for path, added, removed, is_bin in files:
+        name = _stat_name(path, name_width)
+        if is_bin:
+            out.append(f' {name} | {"Bin".rjust(number_width)}')
+            continue
+        change = added + removed
+        add, dele = added, removed
+        if graph_width <= max_change:
+            total = _scale_linear(change, graph_width, max_change)
+            if total < 2 and added and removed:
+                total = 2          # both sides present -> both glyphs show
+            if add < dele:
+                add = _scale_linear(added, graph_width, max_change)
+                dele = total - add
+            else:
+                dele = _scale_linear(removed, graph_width, max_change)
+                add = total - dele
+        line = f' {name} | {str(change).rjust(number_width)}'
+        if change:
+            line += ' ' + '+' * add + '-' * dele
+        out.append(line)
+
+    insertions = sum(a for _p, a, _r, b in files if not b)
+    deletions = sum(r for _p, _a, r, b in files if not b)
+    out.append(_diff_stat_summary(len(files), insertions, deletions))
+    return '\n'.join(out)
+
+
 def _log_block_row(block):
     """Derive one log block's ``(sha, author, date, subject, deco)``.
 
@@ -984,7 +1171,30 @@ def _ingest_stdin():
 
 
 def _stdin_diff_root():
-    """Piped-diff root: one ``('sfile', i, path)`` leaf per file block.
+    """Piped-diff root: a single synthetic ``('sdiff',)`` umbrella row.
+
+    The umbrella groups every file under one stats row (title
+    ``diff: N files +X -Y``; preview a synthesised ``--stat`` table) so
+    the tree gains a summary at the top while navigation is unchanged —
+    ``main()`` auto-expands it on startup (the same posted-expand the
+    single-doc convention uses) so the file rows are visible immediately.
+    Its children are the per-file ``('sfile', …)`` leaves
+    (``_stdin_diff_files``).
+    """
+    added = removed = 0
+    for i in range(len(_STDIN_ROWS)):
+        a, r, _bin = _diff_block_counts(_STDIN_BLOCKS[i])
+        added += a
+        removed += r
+    n = len(_STDIN_ROWS)
+    files_word = 'file' if n == 1 else 'files'
+    title = f'diff: {n} {files_word} +{added} -{removed}'
+    return [Item(id=('sdiff',), title=title, has_children=True)]
+
+
+def _stdin_diff_files():
+    """The piped-diff umbrella's children: one ``('sfile', i, path)`` leaf
+    per file block.
 
     Mirrors the commit file list's row shape (path title + colored
     status-letter tag); the leaf preview is the file's own block from
@@ -1064,6 +1274,10 @@ def get_children(item_id, *, reload=False):
         # A worktree-status group drills into its files. id = ('wc',
         # bucket); scope by the same positional paths as the root.
         return _worktree_files(item_id[1], _paths)
+    if kind == 'sdiff':
+        # The piped-diff umbrella drills into its per-file leaves.
+        # id = ('sdiff',).
+        return _stdin_diff_files()
     # file / status / sfile / slog leaves and filler / error / sentinel
     # rows have no children.
     return []
@@ -1640,6 +1854,11 @@ def get_preview(item_id):
         return _commit_preview(item_id[1])
     if kind == 'file':
         return _file_preview(item_id[1], item_id[2])
+    if kind == 'sdiff':
+        # The piped-diff umbrella — a synthesised ``--stat`` table over
+        # all files, scaled to the current preview width (re-rendered on a
+        # width change via ``_on_resize``). id = ('sdiff',).
+        return _stdin_diff_stat((_browser.preview_width if _browser else 0) or 80)
     if kind == 'sfile':
         # A per-file block of a piped diff — the same delta pipeline as a
         # repo diff, fed from the slurped text. id = ('sfile', i, path).
@@ -1896,29 +2115,41 @@ def toggle_tree(ctx):
 
 
 def _on_resize(ctx, cols, rows):
-    """Drop the preview cache when a resize flips delta's diff layout.
+    """Drop the preview cache when a resize changes a width-dependent preview.
 
     Fires on any pane-layout change (terminal resize, split, list-ratio).
-    The diff preview is width-dependent only through delta: side-by-side
-    turns on at ``width >= 160`` and its two columns re-flow with the
-    pane (see ``_colorize_diff``). So drop the (width-agnostic) preview
-    cache — forcing a re-render at the new width — only when delta is in
-    play AND the preview width actually changed AND side-by-side is or was
-    active (``cur`` or ``prev`` >= 160).
+    Two previews depend on the preview width:
 
-    Everything else is left cached: the first fire just records the
-    baseline (the startup preview is already at the current width); a
-    same-width fire (a height-only resize the broadened hook also emits)
-    and a change that stays unified (both < 160 — delta's unified output
-    doesn't depend on width) leave the cache intact. ``_prev_pw`` is
-    main-thread only: ``on_resize`` fires from the run loop.
+      * a per-file delta diff — only through delta: side-by-side turns on
+        at ``width >= 160`` and its two columns re-flow with the pane (see
+        ``_colorize_diff``). Its unified output (both widths < 160) does
+        not depend on width.
+      * the piped-diff ``('sdiff',)`` umbrella's ``--stat`` table — its
+        histogram is scaled to the preview width (``_stdin_diff_stat``),
+        so ANY width change re-flows it, with or without delta.
+
+    So on a genuine width change (``prev`` recorded, ``cur != prev``):
+    when the delta layout flips (delta present and ``cur``/``prev``
+    straddles or sits at 160) drop the WHOLE (width-agnostic) preview
+    cache — every diff preview re-renders; otherwise, in piped-diff mode,
+    drop ONLY the umbrella's entry (``drop_preview_cache(('sdiff',))``) —
+    the stat is the one preview that re-flows on a unified-range change,
+    and the per-file delta/verbatim previews stay warm. Everything else
+    is left cached: the first fire just records the baseline (the startup
+    preview is already at the current width); a same-width fire (a
+    height-only resize the broadened hook also emits) and a unified-only
+    width change with no piped diff leave the cache intact. ``_prev_pw``
+    is main-thread only: ``on_resize`` fires from the run loop.
     """
     global _prev_pw
     cur = ctx.preview_width or 0
     prev, _prev_pw = _prev_pw, cur
-    if (prev is not None and cur != prev and HAVE_DELTA
-            and (cur >= 160 or prev >= 160)):
+    if prev is None or cur == prev:
+        return
+    if HAVE_DELTA and (cur >= 160 or prev >= 160):
         ctx.drop_preview_cache()
+    elif _STDIN_KIND == 'diff':
+        ctx.drop_preview_cache(('sdiff',))
 
 
 # ---- entry point ---------------------------------------------------------
@@ -1935,11 +2166,13 @@ Usage: browse-git [<dir>] [-n NUMBER] [--mode NAME] [--no-tree] [--all] [<rev>�
   -             Read git output from stdin instead of running git (no
                 repo needed). The type is sniffed from the first
                 non-blank line: a diff (a 'diff --git' header or
-                '--- a/' hunk) lists one row per file with its hunks as
-                the preview; a log ('commit <sha>' blocks, --stat / -p
-                included) lists commit rows with each commit's block as
-                the preview; status output (porcelain 'XY path' lines
-                or the human 'On branch …' form) shows the status view.
+                '--- a/' hunk) lists the files under an auto-expanded
+                'diff: N files +X -Y' umbrella (a synthesised --stat
+                table as its preview), each file's hunks as its preview;
+                a log ('commit <sha>' blocks, --stat / -p included)
+                lists commit rows with each commit's block as the
+                preview; status output (porcelain 'XY path' lines or the
+                human 'On branch …' form) shows the status view.
                 Previews come from the piped text only; reload (ctrl-r)
                 re-serves it; ` and t need git and flash instead.
                 Combines with no other argument or flag. Empty or
@@ -2109,6 +2342,13 @@ def main():
             default=_LOG_LIMIT, modes=', '.join(_MODES)),
     ))
     _browser = b
+    # Piped-diff mode wraps the file rows under one synthetic ``('sdiff',)``
+    # umbrella (a stats row); auto-expand it before the run loop so the file
+    # rows are visible immediately — the same posted-expand the single-doc
+    # convention uses (a ``b.expand`` issued before ``run()``). Other stdin
+    # kinds / repo modes have no umbrella and start as before.
+    if _STDIN_KIND == 'diff':
+        b.expand(('sdiff',))
     sys.exit(b.run())
 
 
