@@ -90,16 +90,18 @@ class TestChildrenPaneRedraw(unittest.TestCase):
                 sep_cols0,
                 f'no vertical separator columns at startup:\n{screen0}')
 
-            # Move cursor to B (no children) → preview expands.
+            # Move cursor to B (no children) → preview expands. The
+            # preview repaint is debounced (preview_debounce) and the
+            # pane holds A's content until B's arrives — wait for the
+            # replacement content itself, not just a stable screen.
             t.send('Down')
-            t.wait_stable(timeout=3.0)
-            screen_b = t.capture()
-            self.assertIn(
-                'BBBBPREVIEW', screen_b,
-                f'preview for B not visible after Down:\n{screen_b}')
+            t.wait_for('BBBBPREVIEW', timeout=3.0)
 
-            # Move cursor back to A → children pane should redraw.
+            # Move cursor back to A → children pane should redraw. The
+            # held BBBBPREVIEW stays painted until A's preview repaints
+            # after the debounce — wait for it before asserting.
             t.send('Up')
+            t.wait_for('preview-of-A', timeout=3.0)
             t.wait_stable(timeout=3.0)
             screen_a = t.capture()
 

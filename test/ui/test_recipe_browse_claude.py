@@ -770,8 +770,10 @@ class TestBrowseClaude(unittest.TestCase):
                 # Latest turn root (PROBE_TURN2_USER) is where the
                 # cursor should land.
                 t.wait_for('PROBE_TURN2_USER', timeout=3.0)
-                cap = t.capture()
-                self.assertIn('▶ user', cap)
+                # '▶ user' is the cursored turn's preview header; the
+                # preview repaint is debounced, so wait for it rather
+                # than capturing immediately.
+                cap = t.wait_for('▶ user', timeout=3.0)
                 self.assertIn('PROBE_TURN2_USER', cap)
                 # Pressing Right again should drill into turn 2 and
                 # land on its latest voice (PROBE_TURN2_REPLY).
