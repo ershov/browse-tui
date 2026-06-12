@@ -1,7 +1,9 @@
 # browse-claude: markdown launcher rows (replacing inline markdown subtrees)
 
 **Date:** 2026-06-12
-**Status:** approved (design discussion in session; this records the outcome)
+**Status:** approved; implementation deferred until browse-md stdin input
+lands (the in-flight terminal/stdio separation work) — launch mechanics to be
+refined after rebasing this worktree onto it.
 **Supersedes:** `2026-06-03-markdown-document-subtrees-design.md` *for browse-claude only* — browse-md keeps its full inline markdown feature unchanged and remains the single home of the deep markdown-browsing UX.
 
 ## Decision
@@ -32,18 +34,21 @@ references an existing `.md` file, carries an expansion arrow (the existing
 optimistic `_md_has_children` gate: `md_heading_trigger` + first-existing-ref
 short-circuit; no disk reads at delivery time).
 
-Expanding shows **flat leaf rows** — browse targets, not content:
+Expanding shows **flat leaf rows** — browse targets, not content. Rows render
+through the framework default content (`[tag]` chip, then title — browse-claude
+has no columns):
 
 ```
-▶ assistant: Here's the design...        [md]
-    ▼
-      ↗ message markdown                 [md]
-      ↗ docs/design.md                   [md]
-      ↗ MANUAL/api.md                    [md]
+▼ [assistant] Here's the design...
+      [md] » message markdown
+      [md] » docs/design.md
+      [md] » MANUAL/api.md
 ```
 
-* Titles carry a `↗ ` prefix to signal "Enter launches something" (no other
-  row in the recipe launches).
+* Titles carry a `» ` prefix to signal "Enter launches something" (no other
+  row in the recipe launches). The glyph is a one-char constant, trivially
+  swappable; chosen single-cell and font-safe, deliberately avoiding glyphs
+  that mimic the expander (`▶`/`▸`) or the expand key's arrow (`→`).
 * One `↗ message markdown` row when the message's own text has headings
   (verified — see Mechanics); one row per resolved `.md` reference
   (existing-only, deduped by abspath, sorted by label; labels via the
@@ -59,10 +64,13 @@ Expanding shows **flat leaf rows** — browse targets, not content:
   rendered through the existing `_md_voice` toggle path. The user sees the
   content before committing to a launch.
 
-Deliberate non-feature: when a message has exactly one target, the subtree is
-a one-row menu (one extra keystroke vs. the old inline tree). Uniformity wins;
-the preview pane already shows the content. Enter on the *message* row itself
-is NOT overloaded to launch — it keeps print-and-exit.
+Deliberate non-features: when a message has exactly one target, the subtree
+is a one-row menu (one extra keystroke vs. the old inline tree). Uniformity
+wins; the preview pane already shows the content. Enter on the *message* row
+itself is NOT overloaded to launch — it keeps print-and-exit. Alt-Down
+(scope-into) is not overloaded either: it stays an in-app navigation
+everywhere and keeps its standard no-op on launcher leaves; Enter is the one
+launch trigger.
 
 ## Mechanics
 
@@ -87,21 +95,26 @@ authoritatively:
 3. Both empty → `[]`; the retained self-heal retracts the arrow on
    `on_children_loaded`, same honesty as the current feature.
 
-Launcher ids use a fresh simple tag, e.g. `('mdlaunch', anchor, 'inline')`
-and `('mdlaunch', anchor, abspath)` — no chain component. The old
-`('md', …)` / `('refs', …)` id shapes disappear.
+Launcher ids use a generic tag so future rows can launch other tools, not
+just browse-md: `('launch', anchor, kind, *params)` — e.g.
+`('launch', anchor, 'md-inline')` and `('launch', anchor, 'md-file',
+abspath)`. Params are flat tuple elements (ids must stay hashable — never
+lists). The id stores *what to launch*, not the command line: argv is derived
+in the Enter handler at launch time, so ids stay stable across rebuilds and
+environment changes (cwd anchoring, stdin-vs-file delivery) and command
+strings never leak into identity, cursor anchors, or the `y` show-id action.
+The old `('md', …)` / `('refs', …)` id shapes disappear.
 
 **Launch.**
 
-* Ref row → `cd <session_cwd> && browse-md <abspath>` via `run_external`'s
-  shell-string form (cwd anchoring keeps browse-md's own ref resolution
-  consistent with the session's world; falls back to the project root / no
-  `cd` when the session has no recorded cwd).
-* Inline row → write `_message_md_text(rec)` to a temp file (own temp dir,
-  meaningful basename such as `message-<line>.md`), launch the same way,
-  unlink after `run_external` returns (it blocks until the child exits).
-  Inside browse-md the message's refs surface again via browse-md's own
-  References umbrella, since resolution is anchored at the session cwd.
+* Ref row → launch `browse-md <abspath>`, anchored at the session's recorded
+  cwd (shell-string form of `run_external`) so browse-md's own ref resolution
+  matches the session's world; plain launch when the session has no cwd.
+* Inline row → feed `_message_md_text(rec)` to browse-md on **stdin**. This
+  depends on the in-flight browse-md stdin-input work (terminal/stdio
+  separation) — no temp files, no temp-dir cwd problems. The exact invocation
+  (and how the message's own refs resolve inside browse-md) is pinned when
+  this design is refined after rebasing onto that work.
 * `browse-md` is resolved like the other external tools the recipe shells out
   to (PATH); a launch failure surfaces through `run_external`'s normal
   `ctx.error` path. No babysitting beyond that.
@@ -125,9 +138,9 @@ framework.
 Replace `TestMarkdownSubtrees` with launcher-row coverage: detection gate
 unchanged-behavior checks, children-builder shapes (inline-only / refs-only /
 both / neither + self-heal), id routing, `↗ ` titles, preview routing,
-on_enter dispatch (launcher row launches, other rows keep default), launch
-command construction (cwd anchoring, temp-file write/cleanup) with
-`run_external` stubbed. Headless `Browser` / existing harness as per
+on_enter dispatch (launcher row launches, other rows keep default), and
+launch invocation construction (cwd anchoring; stdin delivery for inline
+content) with `run_external` stubbed. Headless `Browser` / existing harness as per
 TESTING.md; no real TTY needed since `run_external` is stubbed.
 
 ## Out of scope / follow-ups
@@ -137,8 +150,9 @@ TESTING.md; no real TTY needed since `run_external` is stubbed.
   temp file, outline implications) — same pattern, separate tasks.
 * Shrinking browse-md's own cross-file recursion in favor of launches —
   explicitly NOT decided; browse-md stays the full-featured markdown home.
-* A mnemonic action key (e.g. `b`) to launch from the message row without
-  expanding — possible later sugar, omitted for minimalism.
+* Extra launch triggers (a mnemonic action key, or overloading Alt-Down on
+  launcher leaves where it currently no-ops) — possible later sugar, omitted
+  for minimalism.
 
 ## Alternatives considered (and why not)
 
@@ -153,4 +167,4 @@ TESTING.md; no real TTY needed since `run_external` is stubbed.
 * **Launching on expansion (`→`) instead of Enter:** no pre-expand veto hook
   exists, so it would need leaf-faking plus a global key override; and a
   high-frequency navigation key that suspends the UI is a surprise. Enter on
-  an explicitly `↗ `-marked leaf is the legitimate version of the instinct.
+  an explicitly `» `-marked leaf is the legitimate version of the instinct.
