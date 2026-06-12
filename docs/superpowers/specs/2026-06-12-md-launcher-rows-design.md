@@ -1,9 +1,9 @@
 # browse-claude: markdown launcher rows (replacing inline markdown subtrees)
 
 **Date:** 2026-06-12
-**Status:** approved; implementation deferred until browse-md stdin input
-lands (the in-flight terminal/stdio separation work) — launch mechanics to be
-refined after rebasing this worktree onto it.
+**Status:** approved — rebased onto the landed stdin/stdout content-channel
+work (browse-md `-` stdin documents + repeatable `--root` resolution bases);
+launch mechanics below are pinned against that surface. Ready for planning.
 **Supersedes:** `2026-06-03-markdown-document-subtrees-design.md` *for browse-claude only* — browse-md keeps its full inline markdown feature unchanged and remains the single home of the deep markdown-browsing UX.
 
 ## Decision
@@ -107,14 +107,26 @@ The old `('md', …)` / `('refs', …)` id shapes disappear.
 
 **Launch.**
 
-* Ref row → launch `browse-md <abspath>`, anchored at the session's recorded
-  cwd (shell-string form of `run_external`) so browse-md's own ref resolution
-  matches the session's world; plain launch when the session has no cwd.
-* Inline row → feed `_message_md_text(rec)` to browse-md on **stdin**. This
-  depends on the in-flight browse-md stdin-input work (terminal/stdio
-  separation) — no temp files, no temp-dir cwd problems. The exact invocation
-  (and how the message's own refs resolve inside browse-md) is pinned when
-  this design is refined after rebasing onto that work.
+Both row kinds anchor browse-md's cross-file resolution at the session's
+world via the repeatable `--root` flag — the session's recorded cwd and its
+git root (the same `_session_cwd_and_root` pair), in that order, skipping
+whichever is unset. No `cd` wrapper is needed.
+
+* Ref row → `browse-md <abspath> --root <cwd> --root <project_root>` (plain
+  argv via `run_external`). The file's own directory remains the first
+  resolution base (the CommonMark norm — `--root` bases are tried after it),
+  so a self-contained doc tree behaves identically to opening it directly.
+* Inline row → pipe `_message_md_text(rec)` to `browse-md - --root …` on
+  **stdin** (no temp files). A stdin document's reference-following is
+  suppressed unless `--root` bases are supplied, so the roots are precisely
+  what lets the message's own refs resolve — the manual's
+  `git show … | browse-md - --root "$(git rev-parse --show-toplevel)"`
+  pattern. Delivery uses `run_external`'s shell-string form with the document
+  passed through an env var (`printf '%s' "$VAR" | browse-md - …`, roots
+  shell-quoted) rather than quoting the document into the command line.
+  Env-var delivery is ARG_MAX-bounded (~2 MB) — a pathological message fails
+  the launch through the normal error path. Keys come from the terminal as
+  always (that is the stdio-separation contract); suspend/resume unchanged.
 * `browse-md` is resolved like the other external tools the recipe shells out
   to (PATH); a launch failure surfaces through `run_external`'s normal
   `ctx.error` path. No babysitting beyond that.
@@ -139,8 +151,9 @@ Replace `TestMarkdownSubtrees` with launcher-row coverage: detection gate
 unchanged-behavior checks, children-builder shapes (inline-only / refs-only /
 both / neither + self-heal), id routing, `↗ ` titles, preview routing,
 on_enter dispatch (launcher row launches, other rows keep default), and
-launch invocation construction (cwd anchoring; stdin delivery for inline
-content) with `run_external` stubbed. Headless `Browser` / existing harness as per
+launch invocation construction (`--root` ordering and omission when the
+session has no cwd; stdin env-var pipeline for inline content) with
+`run_external` stubbed. Headless `Browser` / existing harness as per
 TESTING.md; no real TTY needed since `run_external` is stubbed.
 
 ## Out of scope / follow-ups
