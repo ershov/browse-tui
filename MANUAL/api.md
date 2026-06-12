@@ -1048,11 +1048,13 @@ knobs; there is no CLI flag.
 
 While a fetch for the cursored row is outstanding, the pane keeps showing the
 last preview it painted rather than blanking — including when the cursor lands
-on a still-loading placeholder row, and across the debounce wait. The held view
-is frozen at its previous scroll offset; the cursor-move scroll reset and any
-scroll keys take effect once the new content swaps in. A *delivered* empty
-preview (`''`, including `None` coerced to `''`) is a real result and blanks the
-pane; only a not-yet-delivered fetch holds.
+on a still-loading placeholder row, and across the debounce wait. Rows with an
+already-cached preview hold the same way: the pane swaps only once the cursor
+settles on them, without re-running `get_preview` for the revisit. The held
+view is frozen at its previous scroll offset; the cursor-move scroll reset and
+any scroll keys take effect once the new content swaps in. A *delivered* empty
+preview (`''`, including `None` coerced to `''`) is a real result and blanks
+the pane once the cursor settles; only an unsettled or undelivered row holds.
 
 Whenever a fetch for the cursored row is outstanding, the right-aligned pane
 label reads `⧗ Preview` instead of `Preview` — through the debounce wait, the

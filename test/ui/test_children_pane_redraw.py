@@ -313,6 +313,12 @@ class TestChildrenPaneRedraw(unittest.TestCase):
                 t.send('Up')
                 t.wait_stable(timeout=3.0)
 
+            # The pane holds B's preview until the revisit to A settles
+            # (#954: cached rows swap on settle, and a holding screen is
+            # already "stable") — wait for A's replacement content
+            # before asserting B's text is gone.
+            t.wait_for('preview-of-A', timeout=3.0)
+            t.wait_stable(timeout=3.0)
             screen = t.capture()
             self.assertIn(
                 'a1', screen,

@@ -1,17 +1,21 @@
 """Unit tests for the preview stale-hold (preview-flicker design §B).
 
 ``render_preview`` keeps painting the last successfully painted
-per-item preview (``Browser._preview_snapshot``) while the cursor row's
-preview is pending — the synthetic placeholder row or a normal item
-with ``preview is None`` — and blanks only when no snapshot exists yet,
-the visible list is empty, or the item has a delivered value
-(including ``''``).
+per-item preview (``Browser._preview_snapshot``) while the cursor row
+pends — the synthetic placeholder row, or a normal item with
+``preview is None`` OR no delivery for the current visit yet (#954:
+cached rows hold until the cursor settles) — and blanks only when no
+snapshot exists yet, the visible list is empty, or the item has a
+delivered value for a settled visit (including ``''``).
 
 Covers:
 
   * Move from a painted item to an uncached one — the pane keeps the
     old content until the delivery lands, then swaps.
-  * Delivered ``''`` blanks (delivered-empty is a real result).
+  * Move to a cached row — the pane keeps the old content until the
+    worker's settle nudge, then swaps without any delivery (#954).
+  * Delivered ``''`` blanks once the visit settles (delivered-empty
+    is a real result).
   * Streaming: the first ``append_preview`` chunk swaps the held view.
   * #456 guard: the snapshot survives the abandoned-partial cache
     clear, and a revisit still refetches fresh.
@@ -203,6 +207,35 @@ class TestHoldUntilDelivery(_StaleHoldBase):
         finally:
             b.stop_workers()
 
+    def test_move_to_cached_holds_until_settle_nudge(self):
+        # #954: a row with a CACHED preview holds the old content too —
+        # the swap signal is the worker's settle nudge, not the cursor
+        # move. No delivery ever happens for the cached row.
+        b = _make_browser([('a', 'alpha-content'), ('c', 'charlie-cached')])
+        try:
+            _move_cursor(b, 0)
+            _render_full(b)
+            self.assertIn('alpha-content', _pane_text(b))
+
+            # Cursor onto the cached row: visit not settled → hold.
+            _move_cursor(b, 1)
+            self.assertFalse(b._preview_visit_delivered)
+            _render_full(b)
+            self.assertIn('alpha-content', _pane_text(b))
+            self.assertNotIn('charlie-cached', _pane_text(b))
+
+            # The settle nudge ends the hold; the cached content swaps
+            # in with the cache untouched.
+            b._settle_cached_preview('c')
+            self.assertTrue(b._preview_visit_delivered)
+            _render_full(b)
+            self.assertIn('charlie-cached', _pane_text(b))
+            self.assertNotIn('alpha-content', _pane_text(b))
+            self.assertEqual(
+                b._state._items_by_id['c'].preview, 'charlie-cached')
+        finally:
+            b.stop_workers()
+
     def test_no_snapshot_yet_blanks(self):
         # Startup shape: the first cursor row is still pending and
         # nothing has been painted — current (blank) behavior.
@@ -248,8 +281,11 @@ class TestDeliveredValues(_StaleHoldBase):
             _render_full(b)
             self.assertIn('alpha-content', _pane_text(b))
 
-            # '' is a delivered result: the pane must blank, not hold.
+            # '' is a delivered result: the pane must blank, not hold —
+            # but only once the visit settles (#954); inject the
+            # worker's cache-hit nudge to end the settle window.
             _move_cursor(b, 1)
+            b._settle_cached_preview('c')
             _render_full(b)
             self.assertEqual(_pane_text(b).strip(), '')
         finally:

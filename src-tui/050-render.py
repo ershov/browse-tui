@@ -1996,10 +1996,13 @@ def render_preview(browser, rect, *, info=False, has_header=True,
 
     Source priority for the content:
       1. ``browser._help_mode`` if True      → display ``compose_help_text``
-      2. ``item.preview`` (cursor item)      → per-item preview
+      2. ``item.preview`` (cursor item),
+         delivered for this visit            → per-item preview
       3. stale-hold — cursor row's preview
-         pending and a snapshot of the last
-         painted preview exists              → hold the snapshot
+         pending (undelivered, or cached but
+         the visit hasn't settled) and a
+         snapshot of the last painted
+         preview exists                      → hold the snapshot
       4. fallthrough — empty preview         → blank rows
 
     Content is wrapped at ``rect.width`` columns. Rows shorter than
@@ -2048,16 +2051,23 @@ def render_preview(browser, rect, *, info=False, has_header=True,
     # candidate; honour it when the geometry and ANSI policy still
     # match, otherwise regenerate.
     #
-    # ``pending`` marks a cursor row whose preview is awaited rather
-    # than delivered: the synthetic ``'pending'`` placeholder row, or a
-    # ``'normal'`` row whose item has ``preview is None`` (#442: every
-    # fetch delivers at least ``''``, so ``None`` means a delivery is
-    # pending or imminent). Delivered text — including ``''`` — paints
-    # as-is. Meta rows resolve their item like normal rows but never
-    # pend: ``_update_preview_for_cursor`` requests nothing for them,
-    # so no delivery would ever end a hold — a missing preview just
-    # blanks. An empty visible list is never pending either: the pane
-    # isn't waiting for anything.
+    # ``pending`` marks a cursor row the pane must keep holding over:
+    # the synthetic ``'pending'`` placeholder row, or a ``'normal'``
+    # row with ``preview is None OR not _preview_visit_delivered``
+    # (#954). The two legs cover distinct waits: ``preview is None``
+    # keeps its #940 meaning — a delivery is pending or imminent
+    # (#442: every fetch delivers at least ``''``), which also
+    # preserves the hold across invalidate-on-the-cursored-item; the
+    # per-visit bit adds the cached-row settle window — content is in
+    # hand but the cursor hasn't settled on it, so swapping now would
+    # churn during a scroll burst over visited rows. A streaming first
+    # chunk sets the bit (apply path), so progressive streaming still
+    # swaps immediately. Delivered text for a settled visit — including
+    # ``''`` — paints as-is. Meta rows resolve their item like normal
+    # rows but never pend: ``_update_preview_for_cursor`` requests
+    # nothing for them, so no delivery or nudge would ever end a hold
+    # — a missing preview just blanks. An empty visible list is never
+    # pending either: the pane isn't waiting for anything.
     item = None
     pending = False
     if browser._help_mode:
@@ -2074,13 +2084,18 @@ def render_preview(browser, rect, *, info=False, has_header=True,
                 item = browser._state._items_by_id.get(entry.item.id)
                 if item is not None and item.preview is not None:
                     text = item.preview
+                    if (entry.kind == 'normal'
+                            and not browser._preview_visit_delivered):
+                        pending = True
                 elif entry.kind == 'normal':
                     pending = True
 
-    # Stale-hold (preview-flicker design §B): while the cursor row's
-    # preview is pending, keep painting the last successfully painted
-    # per-item preview instead of blanking — the real content swaps in
-    # one step when it delivers. The branch is self-contained: the held
+    # Stale-hold (preview-flicker design §B): while the cursor row
+    # pends, keep painting the last successfully painted per-item
+    # preview — instead of blanking (undelivered row) or swapping
+    # early (cached row whose visit hasn't settled, #954). The real
+    # content swaps in one step when the delivery or settle nudge
+    # lands. The branch is self-contained: the held
     # view is frozen at the snapshot's clamped scroll, the snapshot's
     # wrap is never written into the cursored item's ``preview_render``,
     # the snapshot itself is never updated from here, and the
@@ -2209,11 +2224,14 @@ def render_preview(browser, rect, *, info=False, has_header=True,
         end_row()
 
     # Stale-hold snapshot: capture this paint (reference assignments, no
-    # copying) so a later pending row holds it. Per-item delivered
-    # paints only — help mode never owns the snapshot, and a pending row
+    # copying) so a later pending row holds it. Per-item content paints
+    # only — help mode never owns the snapshot, and an undelivered row
     # that fell through above (no snapshot yet) painted blank, which is
     # not content worth holding. A delivered ``''`` is: a held view must
-    # match whatever the last paint actually showed.
+    # match whatever the last paint actually showed. A cached-but-
+    # unsettled row that fell through (#954, also only when no snapshot
+    # exists yet) painted its own real cache and is captured like any
+    # content paint.
     if (item is not None and not browser._help_mode
             and item.preview is not None):
         browser._preview_snapshot = _PreviewSnapshot(
