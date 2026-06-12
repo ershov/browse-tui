@@ -205,14 +205,59 @@ replaces the built-in quit on the same key.
 
 ### Key names
 
-Key strings come from the terminal layer (`020-terminal.read_key`):
+Key strings come from the terminal layer (`020-terminal.read_key`), which
+decodes raw escape sequences into canonical lowercase names. An `Action.key`
+must match the canonical name exactly — dispatch is case-sensitive string
+equality, with no aliases, normalization, or patterns (`'Ctrl-R'`, `'C-r'`,
+and `'F1'` match nothing; spell them `'ctrl-r'` and `'f1'`).
 
-- single chars: `'a'`, `'A'`, `'/'`, `'?'`
-- arrows: `'up'`, `'down'`, `'left'`, `'right'`
-- modifiers: `'ctrl-a'`, `'alt-down'`, `'shift-up'`, `'shift-enter'`
-- specials: `'enter'`, `'esc'`, `'space'`, `'backspace'`, `'home'`, `'end'`,
-  `'pgup'`, `'pgdn'`, `'tab'`, `'f1'`, `'ctrl-c'`, `'ctrl-z'`, `'ctrl-p'`, …
-- `'alt-space'` arrives as the literal `'alt- '` (alt-prefix + space).
+**Plain keys**
+
+- Single printable characters, as typed: `'a'`, `'A'`, `'/'`, `'?'` —
+  Shift+letter is just the uppercase character, there is no `'shift-a'`.
+- Named specials: `'enter'`, `'esc'`, `'space'`, `'tab'`,
+  `'btab'` (Shift-Tab), `'backspace'`, `'up'`, `'down'`, `'left'`,
+  `'right'`, `'home'`, `'end'`, `'pgup'`, `'pgdn'`, `'insert'`,
+  `'delete'`, `'f1'` … `'f12'`.
+
+**Modifier prefixes**
+
+Exactly five prefixes exist, in these fixed spellings — the framework never
+emits `'shift-ctrl-'`, `'ctrl-alt-'`, or any other permutation:
+
+- single: `'shift-'`, `'alt-'`, `'ctrl-'`
+- combined: `'ctrl-shift-'`, `'alt-ctrl-'`
+
+(Alt-Shift and Alt-Ctrl-Shift combinations are not decoded: depending on the
+terminal they arrive as the bare key name or are silently ignored.)
+
+What composes with what:
+
+- `'ctrl-a'` … `'ctrl-z'` — note Ctrl-I / Ctrl-M / Ctrl-H arrive as
+  `'tab'` / `'enter'` / `'backspace'` (same control byte).
+- `'alt-'` + any printable character: `'alt-x'`, `'alt-X'`, `'alt-1'`,
+  `'alt-*'`. Alt-Space arrives as the literal `'alt- '` (alt-prefix +
+  space character).
+- `'alt-ctrl-a'` … `'alt-ctrl-z'`.
+- Named specials (arrows, `home`, `end`, `pgup`, `pgdn`, `insert`,
+  `delete`, `f1`-`f12`) take all five prefixes, terminal permitting:
+  `'shift-up'`, `'ctrl-pgdn'`, `'alt-f6'`, `'ctrl-shift-home'`,
+  `'alt-ctrl-left'`, …
+- Enter only takes `'shift-enter'` and `'alt-enter'`; Shift-Tab is
+  `'btab'`.
+
+**Internal pseudo-keys** (not bindable)
+
+`read_key` also returns names for events the framework consumes itself,
+before the action keymap is consulted. They are listed here so you can
+recognize them in code and logs — an `Action` bound to one never fires:
+
+- `'mouse-click:ROW:COL'`, `'scroll-up:ROW:COL'`, `'scroll-down:ROW:COL'` —
+  mouse reports with the coordinates baked into the name, routed to the
+  built-in mouse dispatch (cursor placement, pane scrolling).
+- `'_notify'` — wakeup from the internal notification pipe (background ops).
+- `'_unknown'` — unrecognized escape sequence; silently ignored.
+- `'_mouse'` — ignored mouse event (button release, right-click, drag, …).
 
 ---
 

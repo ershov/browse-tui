@@ -872,6 +872,30 @@ def read_key():
     return ch
 
 
+# CSI modifier parameter -> key-name prefix (xterm encoding: the second
+# numeric parameter is 1 + a bitmask of Shift=1, Alt=2, Ctrl=4). Only
+# these five combinations are decoded — anything else (e.g. alt-shift)
+# falls back to the bare key name.
+_CSI_MOD_PREFIX = {
+    2: 'shift-',
+    3: 'alt-',
+    5: 'ctrl-',
+    6: 'ctrl-shift-',
+    7: 'alt-ctrl-',
+}
+
+# Tilde-sequence keycode -> key name (ESC [ <num> ~).
+_CSI_TILDE_KEYS = {
+    '1': 'home', '7': 'home',
+    '4': 'end', '8': 'end',
+    '2': 'insert', '3': 'delete',
+    '5': 'pgup', '6': 'pgdn',
+    '11': 'f1', '12': 'f2', '13': 'f3', '14': 'f4',
+    '15': 'f5', '17': 'f6', '18': 'f7', '19': 'f8',
+    '20': 'f9', '21': 'f10', '23': 'f11', '24': 'f12',
+}
+
+
 def _read_csi(fd, _read1, _peek):
     """Parse a CSI (ESC [) escape sequence and return a key name."""
     buf = ''
@@ -905,93 +929,40 @@ def _read_csi(fd, _read1, _peek):
     if buf == 'Z':
         return 'btab'
 
-    # Home / End (rxvt, xterm without application mode)
-    if buf == 'H':
-        return 'home'
-    if buf == 'F':
-        return 'end'
-
     # Tilde sequences: ESC [ <number> ~ or ESC [ <number> ; <mod> ~
     if buf.endswith('~'):
         raw = buf[:-1]
         mod_prefix = ''
         if ';' in raw:
-            parts = raw.split(';')
-            num = parts[0]
+            num, _, mod_s = raw.partition(';')
             try:
-                mod = int(parts[1])
+                mod_prefix = _CSI_MOD_PREFIX.get(int(mod_s), '')
             except ValueError:
-                mod = 0
-            if mod == 2:
-                mod_prefix = 'shift-'
-            elif mod == 3:
-                mod_prefix = 'alt-'
-            elif mod == 5:
-                mod_prefix = 'ctrl-'
+                pass
         else:
             num = raw
-        if num == '1' or num == '7':
-            return mod_prefix + 'home'
-        if num == '4' or num == '8':
-            return mod_prefix + 'end'
-        if num == '5':
-            return mod_prefix + 'pgup'
-        if num == '6':
-            return mod_prefix + 'pgdn'
-        if num == '2':
-            return 'insert'
-        if num == '3':
-            return 'delete'
-        if num == '11':
-            return 'f1'
-        if num == '12':
-            return 'f2'
-        if num == '13':
-            return 'f3'
-        if num == '14':
-            return 'f4'
-        if num == '15':
-            return 'f5'
-        if num == '17':
-            return 'f6'
-        if num == '18':
-            return 'f7'
-        if num == '19':
-            return 'f8'
-        if num == '20':
-            return 'f9'
-        if num == '21':
-            return 'f10'
-        if num == '23':
-            return 'f11'
-        if num == '24':
-            return 'f12'
+        name = _CSI_TILDE_KEYS.get(num)
+        if name is not None:
+            return mod_prefix + name
 
-    # Shift/Ctrl/Alt modified arrows + Home/End: ESC [ 1 ; <mod> <A-D|H|F>
-    # Same encoding for arrows and Home/End — modifier in the second
-    # parameter, terminal letter selects the key.
-    if len(buf) >= 3 and buf[-1] in 'ABCDHF' and ';' in buf:
+    # Shift/Ctrl/Alt modified arrows, Home/End, and F1-F4:
+    # ESC [ 1 ; <mod> <A-D|H|F|P-S> — the modifier sits in the second
+    # parameter, the final letter selects the key. xterm-family
+    # terminals send *modified* F1-F4 in this form (bare F1-F4 arrive
+    # as SS3 ESC O P..S, handled in ``read_key``).
+    if len(buf) >= 3 and buf[-1] in 'ABCDHFPQRS' and ';' in buf:
         key_name = {
             'A': 'up', 'B': 'down', 'C': 'right', 'D': 'left',
             'H': 'home', 'F': 'end',
+            'P': 'f1', 'Q': 'f2', 'R': 'f3', 'S': 'f4',
         }[buf[-1]]
-        # Extract modifier: 2=shift, 3=alt, 5=ctrl, etc.
         parts = buf[:-1].split(';')
         if len(parts) == 2:
             try:
                 mod = int(parts[1])
             except ValueError:
                 return key_name
-            if mod == 2:
-                return 'shift-' + key_name
-            if mod == 3:
-                return 'alt-' + key_name
-            if mod == 5:
-                return 'ctrl-' + key_name
-            if mod == 6:
-                return 'ctrl-shift-' + key_name
-            if mod == 7:
-                return 'alt-ctrl-' + key_name
+            return _CSI_MOD_PREFIX.get(mod, '') + key_name
         return key_name
 
     # SGR mouse: ESC [ < Cb ; Cx ; Cy M/m

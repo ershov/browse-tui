@@ -543,9 +543,43 @@ class TestReadCsi(unittest.TestCase):
         self.assertEqual(_csi('1;3A'), 'alt-up')
         self.assertEqual(_csi('1;5D'), 'ctrl-left')
 
+    def test_bare_fkeys_tilde_form(self):
+        self.assertEqual(_csi('11~'), 'f1')
+        self.assertEqual(_csi('15~'), 'f5')
+        self.assertEqual(_csi('24~'), 'f12')
+
+    def test_modified_fkeys_tilde_form(self):
+        # ESC [ 15 ; 2 ~ == Shift-F5. The parser used to compute the
+        # modifier prefix and then drop it, dispatching as plain 'f5'.
+        self.assertEqual(_csi('15;2~'), 'shift-f5')
+        self.assertEqual(_csi('17;3~'), 'alt-f6')
+        self.assertEqual(_csi('24;5~'), 'ctrl-f12')
+        self.assertEqual(_csi('11;6~'), 'ctrl-shift-f1')
+
+    def test_modified_fkeys_letter_form(self):
+        # xterm-family terminals send modified F1-F4 as ESC [ 1;<mod>P..S
+        # (bare F1-F4 arrive as SS3, outside the CSI parser).
+        self.assertEqual(_csi('1;2P'), 'shift-f1')
+        self.assertEqual(_csi('1;3Q'), 'alt-f2')
+        self.assertEqual(_csi('1;5R'), 'ctrl-f3')
+        self.assertEqual(_csi('1;7S'), 'alt-ctrl-f4')
+
+    def test_modified_insert_delete_page_keys(self):
+        self.assertEqual(_csi('3;2~'), 'shift-delete')
+        self.assertEqual(_csi('2;5~'), 'ctrl-insert')
+        self.assertEqual(_csi('5;6~'), 'ctrl-shift-pgup')
+        self.assertEqual(_csi('6;7~'), 'alt-ctrl-pgdn')
+
+    def test_undecoded_modifier_falls_back_to_bare_key(self):
+        # mod=4 (alt-shift) is deliberately not decoded — the key must
+        # still arrive (bare), not vanish as '_unknown'.
+        self.assertEqual(_csi('15;4~'), 'f5')
+        self.assertEqual(_csi('1;4A'), 'up')
+
     def test_unknown_csi_returns_unknown_sentinel(self):
         # A garbage CSI must NOT return 'esc' (which would quit the app).
         self.assertEqual(_csi('99~'), '_unknown')
+        self.assertEqual(_csi('99;2~'), '_unknown')
         # Unknown final byte (no handler for ESC [ X or ESC [ 1;2x).
         self.assertEqual(_csi('X'), '_unknown')
         self.assertEqual(_csi('1;2x'), '_unknown')
