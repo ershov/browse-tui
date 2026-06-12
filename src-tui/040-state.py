@@ -3165,6 +3165,10 @@ class BrowserConfig:
     show_scope_crumb: bool = False
     preview_buffer_cap_chars: int = 100_000
     preview_buffer_cap_lines: int = 1000
+    # Seconds of cursor quiet before the preview worker fetches; 0
+    # disables (immediate fetch). Coalesces the per-row fetches a held
+    # j/k would otherwise fire (preview-flicker design §A).
+    preview_debounce: float = 0.15
     on_cursor_change: Optional[Callable] = None
     on_scope_change: Optional[Callable] = None
     on_selection_change: Optional[Callable] = None
@@ -3393,6 +3397,11 @@ class Browser:
             preview_buffer_cap_lines: Soft cap on buffered preview lines
                 (``\\n`` count) before the worker pauses pulling. Default
                 1000. Counterpart to ``preview_buffer_cap_chars``.
+            preview_debounce: Seconds of cursor quiet before the preview
+                worker calls ``get_preview`` (default 0.15). A newer
+                request landing during the wait restarts it, so rapid
+                cursor movement coalesces into one fetch for the row the
+                cursor settles on. ``0`` disables (immediate fetch).
             on_cursor_change: Optional ``(ctx) -> None`` callback fired
                 once per main-loop tick on which the cursor row id
                 changed. Debounced: rapid intermediate moves coalesce
@@ -3739,6 +3748,10 @@ class Browser:
         # needed for this slot. ``_preview_event`` is the wake signal.
         self._preview_req = None
         self._preview_event = threading.Event()
+        # Debounce: seconds of cursor quiet before the worker fetches
+        # (0 disables). The worker sleeps after adopting a request and
+        # re-reads the slot — see ``_preview_worker``.
+        self._preview_debounce = float(config.preview_debounce)
 
         # Preview generator support (#273). When ``get_preview`` returns
         # a generator, the worker eagerly pulls each yield, calls
@@ -6640,12 +6653,20 @@ class Browser:
              Then ``wait()`` if there's still nothing new. Resets
              ``local_id`` to ``None`` on sleep so a re-request of the
              same id after we've gone idle fires again.
-          2. Otherwise adopt the new id, clear the event (arming "next
-             request landed during fetch"), and call ``get_preview``.
-          3. Generator results route through
+          2. Otherwise adopt the new id and clear the event (arming
+             "next request landed during fetch").
+          3. Debounce (preview-flicker design §A): if
+             ``preview_debounce`` > 0, sleep it out, then re-check
+             ``_stop`` (exit) and re-read the slot. A changed slot
+             drops the ``local_id`` memo (nothing was fetched) and
+             restarts at step 1, so rapid cursor movement coalesces
+             into one fetch for the row the cursor settles on. An
+             unchanged slot — including a move-away-and-back within
+             the window — falls through to fetch.
+          4. Call ``get_preview``. Generator results route through
              ``_stream_preview_from_generator`` (unchanged) which
              delivers via ``append_preview`` — also on the post queue.
-          4. Non-generator results post a ``_deliver_preview`` closure
+          5. Non-generator results post a ``_deliver_preview`` closure
              that caches the text on ``Item.preview`` and conditionally
              flags redraw. Lambdas capture ``id_`` and ``text`` by
              default-arg to avoid the late-binding pitfall.
@@ -6690,6 +6711,20 @@ class Browser:
             # while get_preview is running, the event will be set and
             # the next iteration's read will see the new id.
             self._preview_event.clear()
+            # Debounce: let the cursor settle before paying for a
+            # fetch. A newer id in the slot restarts the wait at the
+            # loop top; the slot landing back on ``req`` (move away
+            # and back) falls through — the fetch is still wanted.
+            if self._preview_debounce > 0:
+                time.sleep(self._preview_debounce)
+                if self._stop:
+                    break
+                if self._preview_req != req:
+                    # ``req`` was never fetched — drop the memo so a
+                    # slot that flips back to it before the top-of-loop
+                    # read isn't absorbed by the same-id dedup.
+                    local_id = None
+                    continue
             # If a paused generator from an earlier request is still
             # alive (cursor moved between yields), close it so its
             # recipe's ``finally`` runs before we serve the new request.

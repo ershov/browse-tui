@@ -189,7 +189,8 @@ class TestPreviewWorker(unittest.TestCase):
             if id_ == 'A':
                 gate.wait(timeout=1.0)
             return f'preview of {id_}'
-        b = make_browser(get_preview=get_preview)
+        # debounce=0: B must land while A's fetch is genuinely in flight.
+        b = make_browser(get_preview=get_preview, preview_debounce=0)
         try:
             b._state._items_by_id['A'] = Item(id='A')
             b._state._items_by_id['B'] = Item(id='B')
@@ -269,7 +270,9 @@ class TestPreviewWorkerSingleFlight(unittest.TestCase):
                 state['in_flight'] -= 1
             return f'preview of {id_}'
 
-        b = make_browser(get_preview=get_preview)
+        # debounce=0: the burst must reach several sequential fetches —
+        # the settle wait would coalesce it to one, voiding the test.
+        b = make_browser(get_preview=get_preview, preview_debounce=0)
         try:
             ids = [f'id-{n}' for n in range(20)]
             for id_ in ids:
@@ -322,7 +325,9 @@ class TestSetPreviewWorkerRaceSemantics(unittest.TestCase):
             gate.wait(timeout=2.0)
             return 'from-worker'
 
-        b = make_browser(get_preview=get_preview)
+        # debounce=0: the recipe write must queue while the worker is
+        # inside get_preview, not still waiting out the settle window.
+        b = make_browser(get_preview=get_preview, preview_debounce=0)
         try:
             b._state._items_by_id['a'] = Item(id='a')
             # Kick the worker; it blocks inside get_preview.
@@ -522,7 +527,9 @@ class TestPreviewWorkerRedesign442(unittest.TestCase):
                 gate.wait(timeout=2.0)
             return f'preview-{id_}'
 
-        b = make_browser(get_preview=get_preview)
+        # debounce=0: A must be mid-fetch when B/C clobber the slot;
+        # the settle wait would supersede A before it ever fetches.
+        b = make_browser(get_preview=get_preview, preview_debounce=0)
         try:
             items = _seed_two_items(b, ids=('A', 'B', 'C'))
             b.request_preview('A')
@@ -613,7 +620,9 @@ class TestPreviewWorkerRedesign442(unittest.TestCase):
                 state['in_flight'] -= 1
             return f'p-{id_}'
 
-        b = make_browser(get_preview=get_preview)
+        # debounce=0: the burst must reach several sequential fetches —
+        # the settle wait would coalesce it to one, voiding the test.
+        b = make_browser(get_preview=get_preview, preview_debounce=0)
         try:
             ids = [f'id-{n}' for n in range(20)]
             for id_ in ids:
