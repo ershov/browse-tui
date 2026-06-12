@@ -30,17 +30,23 @@ Three recipes accept a lone `-` argument and take their data from stdin
 instead of the filesystem / repo. The read happens once, before the UI
 opens (a pipe is slurped, a tty blocks until `^D` like `cat`); stdin is
 one-shot, so `Ctrl-R` re-serves the same parse. In every case `-` is the
-whole data source — it combines with no other argument, and the bare form
-of each recipe is unchanged (still browses the cwd / current repo):
+whole data source — it combines with no other positional argument, and the
+bare form of each recipe is unchanged (still browses the cwd / current
+repo):
 
 - **`browse-md -`** — read **one** Markdown document from stdin and browse
   it as a heading tree. The root row is titled `-` (matching the invocation); it has no on-disk
   source, so the `V` / `E` (page / edit the source file) actions have
   nothing to open and flash instead of acting. Empty input is an empty
-  document (an empty tree), not an error.
+  document (an empty tree), not an error. Cross-file reference following
+  is off for the piped doc unless you supply candidate base directories
+  with the repeatable `--root DIR` flag — which also adds extra resolution
+  bases (tried after the file's own directory) in file mode, for refs that
+  live outside the file's tree.
 
   ```bash
   glow-flavoured-render | browse-md -
+  git show HEAD:README.md | browse-md - --root "$(git rev-parse --show-toplevel)"
   ```
 
 - **`browse-fs -`** — read a **newline-separated list of paths** (one per
@@ -60,7 +66,7 @@ of each recipe is unchanged (still browses the cwd / current repo):
 
   | Sniffed kind | Recognised by | Tree |
   | --- | --- | --- |
-  | **diff** | a `diff --git` header or a bare `--- a/` hunk | one row per file block; that block (delta-rendered) as the preview |
+  | **diff** | a `diff --git` header or a bare `--- a/` hunk | a synthesized `git diff --stat` umbrella row (auto-expanded) over one row per file; the stat table as the umbrella's preview, the delta-rendered block per file |
   | **log** | `commit <sha>` blocks (`--stat` / `-p` included) | one row per commit block; the whole block as the preview |
   | **status** | porcelain `XY path` lines (the `-z` form too) or the human `On branch …` / `HEAD detached …` prose | the status view's leaf rows |
 

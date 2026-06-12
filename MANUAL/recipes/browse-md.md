@@ -29,6 +29,10 @@ files or directories; `FILE.md#section` deep-links straight to a heading.
 - Cross-file multi-select actions — `V` / `E` group selected rows by
   file, merge their byte ranges, and concatenate the slices with a
   per-file separator.
+- Repeatable `--root DIR` — extra base directories for resolving a
+  document's relative cross-file references (tried after the file's own
+  directory), and the only way references resolve for a stdin (`-`)
+  document.
 - An `on_enter` / `→` override that flips expand/collapse and
   auto-expands a single-heading document in one keystroke.
 
@@ -40,6 +44,8 @@ files or directories; `FILE.md#section` deep-links straight to a heading.
 ./recipes/browse-md docs/                # every .md directly inside docs/
 ./recipes/browse-md -l NOTES.md          # also surface list items as rows
 ./recipes/browse-md README.md#install    # deep-link straight to a section
+cat NOTES.md | ./recipes/browse-md -     # one document from stdin (row titled '-')
+git show HEAD:README.md | ./recipes/browse-md - --root "$(git rev-parse --show-toplevel)"
 ```
 
 Keys: `m` toggle md2ansi coloring, `M` page the preview through
