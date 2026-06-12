@@ -45,6 +45,27 @@ _RECIPE = _REPO / 'recipes' / 'browse-fs'
 _DIM = (242, False)
 
 
+def _stub_recipe_argv(argv=None):
+    """Stub of the framework's ``recipe_argv`` (mirrors 040-state.py):
+    ``sys.argv[1:]`` (or ``argv``) minus the framework's ``--tty VALUE`` /
+    ``--tty=VALUE`` flag. Tests patch ``sys.argv`` before driving ``main()``,
+    so reading it here matches what the recipe sees."""
+    if argv is None:
+        argv = sys.argv[1:]
+    out, skip_next = [], False
+    for arg in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == '--tty':
+            skip_next = True
+            continue
+        if arg.startswith('--tty='):
+            continue
+        out.append(arg)
+    return out
+
+
 def _stub_browse_tui():
     """Insert a ``browse_tui`` stub the recipe can import from.
 
@@ -79,6 +100,7 @@ def _stub_browse_tui():
         return [('DEFAULT', getattr(item, 'id', None), getattr(item, 'title', None))]
 
     mod.default_row_content = _default_row_content
+    mod.recipe_argv = _stub_recipe_argv
     sys.modules['browse_tui'] = mod
 
 

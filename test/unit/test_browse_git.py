@@ -134,6 +134,27 @@ _DIM = (242, False)
 _YELLOW = (3, False)
 
 
+def _stub_recipe_argv(argv=None):
+    """Stub of the framework's ``recipe_argv`` (mirrors 040-state.py):
+    ``sys.argv[1:]`` (or ``argv``) minus the framework's ``--tty VALUE`` /
+    ``--tty=VALUE`` flag. Tests patch ``sys.argv`` before driving ``main()``,
+    so reading it here matches what the recipe sees."""
+    if argv is None:
+        argv = sys.argv[1:]
+    out, skip_next = [], False
+    for arg in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == '--tty':
+            skip_next = True
+            continue
+        if arg.startswith('--tty='):
+            continue
+        out.append(arg)
+    return out
+
+
 def _stub_browse_tui():
     """Insert a no-op ``browse_tui`` module so the recipe can import.
 
@@ -194,6 +215,7 @@ def _stub_browse_tui():
             lambda m: m.group(0) if m.group(1) == 'm' else '', s)
 
     mod.sanitize_ansi = sanitize_ansi
+    mod.recipe_argv = _stub_recipe_argv
     sys.modules['browse_tui'] = mod
 
 
@@ -623,6 +645,18 @@ class TestClassifyPositionals(unittest.TestCase):
         revs, paths = self._run('-h')
         self.assertEqual(revs, [])
         self.assertEqual(paths, [])
+
+    def test_tty_flag_and_value_are_not_positionals(self):
+        # The framework's ``--tty VALUE`` is dropped via ``recipe_argv()``
+        # before classification: neither the flag nor its value is taken
+        # as a rev/pathspec. The value used here is an EXISTING path
+        # (``_RECIPE`` certainly exists), so a regression that failed to
+        # strip it would wrongly land it in ``_paths`` — the assertion
+        # below would catch it. ``--tty=`` (one token) is covered too.
+        for args in (['--tty', str(_RECIPE)], [f'--tty={_RECIPE}']):
+            revs, paths = self._run(*args)
+            self.assertEqual(revs, [], args)
+            self.assertEqual(paths, [], args)
 
 
 @unittest.skipUnless(shutil.which('git'), 'git not available')
@@ -2887,6 +2921,30 @@ class TestStdinMain(unittest.TestCase):
         code, _err = self._run_main(' M beta.txt\n', ['browse-git', '-'])
         self.assertIsNone(code)
         self.assertEqual(self.r._STDIN_KIND, 'status')
+
+    def test_tty_device_path_is_consumed_not_a_positional(self):
+        # ``browse-git --tty /dev/pts/N`` runs in normal repo mode: the
+        # ``--tty`` value (a terminal device path, consumed by
+        # Browser.run()) must NOT be classified as a pathspec/rev. Stub
+        # git present + inside a work tree so main() reaches the Browser;
+        # the raise-on-read stdin proves repo mode (no ``-`` ingest), and
+        # the empty rev/path filters + plain ``[commits]`` title prove the
+        # device path was not taken as a positional. ``--tty=PATH`` too.
+        for argv in (['browse-git', '--tty', '/dev/pts/9'],
+                     ['browse-git', '--tty=/dev/pts/9']):
+            self.r = _load_recipe()
+            self.r.shutil = types.SimpleNamespace(
+                which=lambda name: f'/usr/bin/{name}')
+            self.r._run_git = (
+                lambda *a: subprocess.CompletedProcess(a, 0, '', ''))
+            code, err = self._run_main(_RaiseOnRead(), argv)
+            self.assertIsNone(code, argv)
+            self.assertEqual(err, '', argv)
+            self.assertIsNone(self.r._STDIN_KIND, argv)
+            self.assertEqual(self.r._revs, [], argv)
+            self.assertEqual(self.r._paths, [], argv)
+            self.assertEqual(self.r._browser._args[0].title,
+                             'browse-git [commits]', argv)
 
     def test_help_invocation_never_reads_stdin(self):
         code, _err = self._run_main(_RaiseOnRead(), ['browse-git', '--help'])

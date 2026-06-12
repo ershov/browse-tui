@@ -59,6 +59,25 @@ def _stub_browse_tui():
     mod.BrowserConfig = _Stub
     mod.Item = _Stub
     mod.upsert = lambda *a, **kw: (a, kw)
+
+    def _recipe_argv(argv=None):
+        # Mirrors the framework's recipe_argv (040-state.py): drop the
+        # framework-owned --tty VALUE / --tty=VALUE flag.
+        if argv is None:
+            argv = sys.argv[1:]
+        out, skip_next = [], False
+        for arg in argv:
+            if skip_next:
+                skip_next = False
+                continue
+            if arg == '--tty':
+                skip_next = True
+                continue
+            if arg.startswith('--tty='):
+                continue
+            out.append(arg)
+        return out
+    mod.recipe_argv = _recipe_argv
     sys.modules['browse_tui'] = mod
 
 
@@ -388,6 +407,73 @@ class TestTildeBinding(unittest.TestCase):
         """``main`` points ``_log_sink`` at the Browser's thread-safe ``log``."""
         browser = self._build_browser()
         self.assertEqual(self.bp._log_sink, browser.log)
+
+
+class TestTtyArgv(unittest.TestCase):
+    """The framework ``--tty`` flag (auto-detected by ``Browser.run()``,
+    left in ``sys.argv``) must NOT be misread as the positional TICKET_ID,
+    and must not shadow a real one. Drives ``main()`` against the REAL
+    framework (the generated binary loaded as ``browse_tui``) up to — not
+    through — ``Browser.run()``, then reads the resolved initial scope off
+    the Browser's ``scope_stack`` (``initial_scope`` is pushed there at
+    construction). Uses the real ``recipe_argv``, exercising the actual
+    integration.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if not _BIN.exists():
+            raise unittest.SkipTest(
+                'generated browse-tui binary missing; run ./build-tui.sh'
+            )
+
+    def setUp(self):
+        self._saved = sys.modules.get('browse_tui')
+        loader = SourceFileLoader('browse_tui', str(_BIN))
+        spec = importlib.util.spec_from_loader('browse_tui', loader)
+        self.bt = importlib.util.module_from_spec(spec)
+        loader.exec_module(self.bt)
+        sys.modules['browse_tui'] = self.bt
+        self.bp = _load_recipe('_browse_plan_tty_under_test')
+
+    def tearDown(self):
+        if self._saved is not None:
+            sys.modules['browse_tui'] = self._saved
+        else:
+            sys.modules.pop('browse_tui', None)
+
+    def _scope_for(self, argv):
+        """Drive ``main()`` with ``argv``; return the resolved scope_stack."""
+        orig_run = self.bt.Browser.run
+        self.bt.Browser.run = lambda self: 0
+        saved_argv = sys.argv
+        sys.argv = ['browse-plan', *argv]
+        try:
+            try:
+                self.bp.main()
+            except SystemExit:
+                pass
+        finally:
+            self.bt.Browser.run = orig_run
+            sys.argv = saved_argv
+        return list(self.bp._BROWSER._state.scope_stack)
+
+    def test_tty_flag_is_not_the_ticket_id(self):
+        # ``--tty -`` / ``--tty=-`` / ``--tty /dev/pts/N`` is the framework
+        # UI-device flag, not a TICKET_ID: no initial scope is pushed (and
+        # no "invalid ticket id" error). Without the fix the device path
+        # would be parsed as an int and exit 2.
+        for argv in ([ '--tty', '-'], ['--tty=-'], ['--tty', '/dev/pts/9']):
+            self.assertEqual(self._scope_for(argv), [], argv)
+
+    def test_real_ticket_id_still_scopes(self):
+        # A bare ticket id still becomes the initial scope.
+        self.assertEqual(self._scope_for(['7']), [7])
+
+    def test_tty_before_ticket_id_resolves_the_ticket(self):
+        # ``--tty - 7`` strips the flag/value and still scopes ticket 7
+        # (the flag preceding the id no longer shadows it).
+        self.assertEqual(self._scope_for(['--tty', '-', '7']), [7])
 
 
 if __name__ == '__main__':

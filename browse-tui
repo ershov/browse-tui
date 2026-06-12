@@ -4671,6 +4671,42 @@ def default_row(item, ctx):
     return chrome + default_row_content(item, ctx)
 
 
+def recipe_argv(argv=None):
+    """Return ``argv`` (default ``sys.argv[1:]``) with framework-owned flags stripped.
+
+    A recipe that scans its own positionals / options should read from
+    this instead of ``sys.argv[1:]`` directly. :meth:`Browser.run`
+    auto-detects the terminal-device flag — ``--tty VALUE`` /
+    ``--tty=VALUE`` — but does NOT remove it from ``sys.argv``, so a
+    recipe's own argv scan would otherwise misread the flag (or its
+    value, e.g. ``-`` or a ``/dev/pts/N`` path) as a positional. This
+    drops exactly those framework-owned tokens — today only the ``--tty``
+    flag and its value — leaving the recipe's own arguments in order.
+
+    Strips the same two forms ``run`` recognises: ``--tty VALUE``
+    (the value is the following token, consumed too) and ``--tty=VALUE``
+    (one token). A trailing bare ``--tty`` with no following token is
+    dropped on its own. Returns a fresh list; ``sys.argv`` is left
+    untouched on purpose — ``run`` still needs ``--tty`` there to resolve
+    the device.
+    """
+    if argv is None:
+        argv = sys.argv[1:]
+    out = []
+    skip_next = False
+    for arg in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == '--tty':
+            skip_next = True  # consume the following VALUE token too
+            continue
+        if arg.startswith('--tty='):
+            continue
+        out.append(arg)
+    return out
+
+
 # Default info-bar hint line. Shared between ``BrowserConfig.hint``
 # (and ``Browser._hint``) and ``render_info_bar``'s fallback so the
 # literal lives in exactly one place.

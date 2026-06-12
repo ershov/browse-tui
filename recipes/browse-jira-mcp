@@ -37,7 +37,7 @@ import subprocess
 import sys
 import threading
 
-from browse_tui import Action, Browser, BrowserConfig, Item
+from browse_tui import Action, Browser, BrowserConfig, Item, recipe_argv
 
 
 _ERROR = object()
@@ -81,14 +81,20 @@ def _pop_limit_arg(default):
 
 
 def _resolve_jql():
-    """Return the JQL to query. argv[1] overrides the default.
+    """Return the JQL to query. The first positional overrides the default.
 
-    Flag-shaped argv (``-h``, ``--help``) is left for Browser.run() to
-    auto-detect; treating it as JQL would put ``-h`` into the help
-    intro and confuse the user reading their own help text.
+    Reads ``recipe_argv()`` so the framework's ``--tty`` flag (and its
+    value) is dropped first — ``Browser.run()`` auto-detects ``--tty`` but
+    leaves it in ``sys.argv``, so a raw ``sys.argv[1]`` read would take a
+    leading ``--tty -`` / ``--tty /dev/pts/N`` as the JQL (or, when it
+    precedes the JQL, shadow it). Flag-shaped tokens (``-h``, ``--help``)
+    are left for Browser.run() to auto-detect; treating one as JQL would
+    put ``-h`` into the help intro and confuse the user reading their own
+    help text.
     """
-    if len(sys.argv) > 1 and sys.argv[1].strip() and not sys.argv[1].startswith('-'):
-        return sys.argv[1]
+    args = recipe_argv()
+    if args and args[0].strip() and not args[0].startswith('-'):
+        return args[0]
     return _JQL_DEFAULT
 
 

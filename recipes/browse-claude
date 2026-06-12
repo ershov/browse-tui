@@ -56,7 +56,7 @@ import sys
 import threading
 
 from browse_tui import (
-    Action, Browser, BrowserConfig, Item, mod, set_preview_op,
+    Action, Browser, BrowserConfig, Item, mod, recipe_argv, set_preview_op,
     upsert, visible_items,
 )
 
@@ -6362,6 +6362,14 @@ def main():
     # tagging sessions with PIDs also depends on it.
     _scan_running_sessions()
 
+    # The recipe's own positionals: everything left after the flag pops
+    # above, minus the framework's ``--tty`` flag (and its value).
+    # ``Browser.run()`` auto-detects ``--tty`` but leaves it in
+    # ``sys.argv``, so reading ``sys.argv[1]`` directly would misread
+    # ``browse-claude --tty -`` / ``--tty /dev/pts/N`` as the PROJECT
+    # positional (a bogus ``('project', abspath('--tty'))`` scope).
+    pos_args = recipe_argv()
+
     # Resolve the initial scope: --file / --session / --pid are mutually
     # exclusive (claude-data semantics). Fall back to positional PROJECT.
     targets = sum(1 for v in (session_id, pid_arg, file_arg) if v)
@@ -6393,7 +6401,7 @@ def main():
             print(f'browse-claude: no live session for pid {pid_arg}',
                   file=sys.stderr)
             sys.exit(2)
-    elif len(sys.argv) > 1:
+    elif pos_args:
         # Seed conversion (§4.3 — the ONLY string→id conversion): the
         # user-typed positional PROJECT becomes the structured scope root.
         # A .jsonl path is promoted to ``target_jsonl`` so the
@@ -6401,7 +6409,7 @@ def main():
         # (without this, ``./browse-tui recipes/browse-claude
         # /path/to/session.jsonl`` opens the file but leaves the cursor on
         # the scope_root row); any other path is a project directory.
-        arg = sys.argv[1]
+        arg = pos_args[0]
         arg_abs = os.path.abspath(arg)
         if arg.endswith('.jsonl') and os.path.isfile(arg_abs):
             target_jsonl = arg_abs

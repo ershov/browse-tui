@@ -105,7 +105,8 @@ import sys
 
 from browse_tui import (
     Action, Browser, BrowserConfig, Item,
-    cell_ljust, cell_width, default_row_content, sanitize_ansi, style,
+    cell_ljust, cell_width, default_row_content, recipe_argv,
+    sanitize_ansi, style,
 )
 
 # Optional md2ansi_lib plugin — gates md2ansi coloring of commit messages.
@@ -1997,8 +1998,15 @@ def _classify_positionals():
     is fatal (stderr + exit 2). Leftover flag-like tokens (``-h`` /
     ``--help``) before the ``--`` are skipped so the framework's help
     auto-detect still fires.
+
+    Scans ``recipe_argv()`` so the framework's ``--tty`` flag and its
+    value are dropped first — otherwise a ``--tty /dev/pts/N`` device
+    path would be misclassified as a pathspec (or fail as an unknown
+    rev). ``_pop_repo_dir`` may already have removed a leading repo-dir
+    positional from ``sys.argv``; ``recipe_argv()`` reads ``sys.argv``
+    live, so that removal is honoured here.
     """
-    args = sys.argv[1:]
+    args = recipe_argv()
     if '--' in args:
         cut = args.index('--')
         head, tail = args[:cut], args[cut + 1:]
@@ -2044,13 +2052,12 @@ def main():
     # error. The repo preconditions below are skipped — piped input needs
     # neither git on PATH nor a work tree. The remaining argv plumbing
     # (flag pops, the positional classifier) is inert on a lone ``-``.
-    # A ``-`` that is the VALUE of the framework's ``--tty`` flag
-    # (``--tty -``: UI over the std streams, consumed by Browser.run())
-    # is not the stdin positional and must fall through to repo mode;
-    # the one-token ``--tty=-`` form never equals a bare ``-`` anyway.
-    args = sys.argv[1:]
-    if any(a == '-' and (i == 0 or args[i - 1] != '--tty')
-           for i, a in enumerate(args)):
+    # ``recipe_argv()`` drops the framework's ``--tty`` flag (and its
+    # value) first, so a ``-`` that is the VALUE of ``--tty -`` (UI over
+    # the std streams, consumed by Browser.run()) is gone and only a
+    # genuine stdin ``-`` is left to match here.
+    args = recipe_argv()
+    if '-' in args:
         if args != ['-']:
             sys.stderr.write('browse-git: - (stdin) cannot be combined '
                              'with other arguments or flags\n')

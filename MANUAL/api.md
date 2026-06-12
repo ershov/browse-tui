@@ -1103,6 +1103,23 @@ Start workers, set up the terminal, run the main loop, tear down. Blocks
 until `ctx.quit()` (or `q`/`Esc`). Returns the exit code stashed via `quit`
 (or the cancel code 1 from a default-quit).
 
+#### `recipe_argv(argv=None) -> list`
+
+Return `argv` (default `sys.argv[1:]`) with the framework-owned terminal-device
+flag removed — `--tty VALUE` (value is the following token, consumed too) and
+`--tty=VALUE`. `run()` auto-detects that flag but leaves it in `sys.argv`, so a
+recipe scanning its own positionals should read from this instead, or it would
+misread `--tty` / its value (`-` or a `/dev/pts/N` path) as one of its own
+arguments. Returns a fresh list; `sys.argv` is left untouched on purpose — `run()`
+still reads `--tty` from it to resolve the device.
+
+```python
+from browse_tui import recipe_argv
+
+args = recipe_argv()            # this recipe's own positionals, --tty dropped
+root = args[0] if args else '.'
+```
+
 #### `Browser.add_action(action) -> None`
 
 Register an `Action` after construction. If an existing entry binds the same

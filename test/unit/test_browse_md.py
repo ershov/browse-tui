@@ -39,6 +39,27 @@ _REPO = Path(__file__).resolve().parents[2]
 _RECIPE = _REPO / 'recipes' / 'browse-md'
 
 
+def _stub_recipe_argv(argv=None):
+    """Stub of the framework's ``recipe_argv`` (mirrors 040-state.py):
+    ``sys.argv[1:]`` (or ``argv``) minus the framework's ``--tty VALUE`` /
+    ``--tty=VALUE`` flag. Tests patch ``sys.argv`` before driving ``main()``,
+    so reading it here matches what the recipe sees."""
+    if argv is None:
+        argv = sys.argv[1:]
+    out, skip_next = [], False
+    for arg in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == '--tty':
+            skip_next = True
+            continue
+        if arg.startswith('--tty='):
+            continue
+        out.append(arg)
+    return out
+
+
 def _stub_browse_tui():
     """Insert a no-op ``browse_tui`` module so the recipe can import.
 
@@ -81,6 +102,7 @@ def _stub_browse_tui():
     mod.Browser = _BrowserStub
     mod.BrowserConfig = _Stub
     mod.Item = _Stub
+    mod.recipe_argv = _stub_recipe_argv
     sys.modules['browse_tui'] = mod
 
 

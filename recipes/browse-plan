@@ -15,7 +15,7 @@ import shutil
 import subprocess
 import sys
 
-from browse_tui import Action, Browser, BrowserConfig, Item, upsert
+from browse_tui import Action, Browser, BrowserConfig, Item, recipe_argv, upsert
 
 # Optional md2ansi_lib plugin — colors ticket previews when available.
 try:
@@ -477,15 +477,20 @@ def main():
     global _BROWSER, _PLAN_FILE, _log_sink
     _PLAN_FILE = _pop_file_arg()
     initial_scope = None
-    # Skip argv[1] when it's a flag (e.g. -h / --help) — Browser.run()'s
-    # auto-detect short-circuits to print recipe-aware help, and parsing
-    # '--help' as an int would otherwise produce a misleading
+    # Read the ticket-id positional from ``recipe_argv()`` so the framework's
+    # ``--tty`` flag (and its value) is dropped first: ``Browser.run()``
+    # auto-detects ``--tty`` but leaves it in ``sys.argv``, so a leading
+    # ``--tty -`` / ``--tty /dev/pts/N`` would otherwise shadow (or be
+    # misread as) the ticket id. A flag-shaped token (e.g. -h / --help) is
+    # skipped — Browser.run()'s auto-detect short-circuits to recipe-aware
+    # help, and parsing '--help' as an int would give a misleading
     # "invalid ticket id" error.
-    if len(sys.argv) > 1 and not sys.argv[1].startswith('-'):
+    args = recipe_argv()
+    if args and not args[0].startswith('-'):
         try:
-            initial_scope = int(sys.argv[1])
+            initial_scope = int(args[0])
         except ValueError:
-            sys.stderr.write(f'browse-plan: invalid ticket id {sys.argv[1]!r}\n')
+            sys.stderr.write(f'browse-plan: invalid ticket id {args[0]!r}\n')
             sys.exit(2)
 
     # 'm' is the move action by default; when md2ansi_lib is available we

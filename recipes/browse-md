@@ -60,7 +60,7 @@ import bisect
 import os
 import sys
 
-from browse_tui import Action, Browser, BrowserConfig, Item
+from browse_tui import Action, Browser, BrowserConfig, Item, recipe_argv
 
 # md2ansi_lib + md_doc — both HARD dependencies. ``md_doc.build_doc_tree``
 # derives the heading / list structure from ``md2ansi_scan`` (one source of
@@ -2031,27 +2031,13 @@ def main():
     # interchangeably (``--list`` / ``--lists``); the flag has no
     # arguments — its mere presence flips emission on.
     _INCLUDE_LISTS = _pop_flag('-l', alts=('--list', '--lists'))
-    # The framework's ``--tty PATH`` / ``--tty=PATH`` flag is auto-detected
-    # by ``Browser.run()`` but NOT stripped from ``sys.argv``, so drop it
-    # (and the value after a bare ``--tty``) before the option scan —
-    # otherwise ``browse-md --tty -`` would die "unrecognised option:
-    # --tty" here, and a stray ``--tty /dev/pts/N`` device path would be
-    # mistaken for a FILE positional. The dropped value may itself be
-    # ``-`` (the ``--tty -`` case), so consuming it also keeps that ``-``
-    # from being read as the stdin positional below; ``--tty=-`` is one
-    # token and never looks like a bare ``-`` either.
-    leftover = []
-    skip_next = False
-    for tok in sys.argv[1:]:
-        if skip_next:
-            skip_next = False
-            continue
-        if tok == '--tty':
-            skip_next = True  # consume the following VALUE token too
-            continue
-        if tok.startswith('--tty='):
-            continue
-        leftover.append(tok)
+    # Read the recipe's own tokens via ``recipe_argv()``, which drops the
+    # framework's ``--tty PATH`` / ``--tty=PATH`` flag: ``Browser.run()``
+    # auto-detects it but leaves it in ``sys.argv``, so the option scan
+    # below would otherwise die "unrecognised option: --tty", and a stray
+    # ``--tty /dev/pts/N`` device path (or a ``--tty -`` value) would be
+    # mistaken for a FILE / stdin positional.
+    leftover = recipe_argv()
     # After ``_pop_flag`` consumed every known flag, anything starting
     # with ``-`` left in argv is an unrecognised option. Surface those
     # first (most useful diagnostic) before positional-count checks.
