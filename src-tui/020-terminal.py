@@ -11,7 +11,8 @@ Provides the low-level I/O substrate the UI builds on:
   wake the main loop's ``select`` via ``notify_wake``
 * ``read_key`` -- a VT100/SGR/CSI-u escape-sequence parser that returns
   string keynames like ``'up'``, ``'ctrl-r'``, ``'shift-enter'``,
-  ``'mouse-click:R:C'``, ``'_notify'``, ``'_writable'`` and ``'esc'``
+  ``'mouse-click:R:C'``, ``'_notify'``, ``'_writable'``, ``'_stdin'``
+  and ``'esc'``
 
 This module is pure I/O and contains nothing application-specific. It has
 no tests of its own; coverage comes from the Layer 3 UI tests that drive
@@ -856,7 +857,7 @@ def input_ready():
             raise
 
 
-def read_key(write_fd=None):
+def read_key(write_fd=None, aux_read_fd=None):
     """Read one keystroke and return a string name for it.
 
     Handles multi-byte escape sequences, alt-combos, and bare ESC
@@ -869,6 +870,19 @@ def read_key(write_fd=None):
     The main loop passes its buffered-output fd here only while there
     are bytes to drain, so a backpressuring consumer never blocks the
     UI and an idle channel adds nothing to the select set.
+
+    ``aux_read_fd`` (optional) is additionally watched for
+    *readability*; when it is ready — and the terminal device is NOT —
+    the call returns ``'_stdin'`` instead of a key. The terminal
+    outranks the aux fd on a shared wake: keystrokes are scarce, while
+    a saturated content stream (a ``yes``-style producer) keeps fd 0
+    readable at every select and would otherwise starve the keyboard
+    indefinitely — unquittable in raw mode, where even ctrl-c is just
+    another starved key. stdin loses nothing to the reorder: its data
+    stays buffered and the next select reports it again. The main loop
+    passes fd 0 here only while the streaming-input hook is armed
+    (``on_stdin`` set, stream not ended), so recipes without the hook
+    keep the select set exactly as before.
     """
     fd = _tty_fd_in
 
@@ -876,6 +890,8 @@ def read_key(write_fd=None):
     watch_fds = [fd]
     if _notify_r >= 0:
         watch_fds.append(_notify_r)
+    if aux_read_fd is not None:
+        watch_fds.append(aux_read_fd)
     wfds = [write_fd] if write_fd is not None else []
     while True:
         try:
@@ -896,6 +912,13 @@ def read_key(write_fd=None):
                 pass
             # Always deliver _notify first; the device stays buffered for next call
             return '_notify'
+        if (aux_read_fd is not None and aux_read_fd in ready
+                and fd not in ready):
+            # Content-input readiness — only when no key is pending.
+            # The terminal outranks the content stream (see docstring):
+            # a pending key falls through to the read below, and the
+            # aux fd's data stays buffered for the next select.
+            return '_stdin'
         break  # the terminal device is ready
 
     def _read1():

@@ -1,9 +1,12 @@
 """browse-tui: state layer (visible tree, cursor/scope, async workers, post queue, Pending)."""
 
+import codecs
 import enum
+import errno
 import inspect
 import os
 import queue
+import select
 import sys
 import threading
 import time
@@ -3136,6 +3139,23 @@ class BrowserConfig:
     on_filter_change: Optional[Callable] = None
     on_resize: Optional[Callable] = None
     on_quit: Optional[Callable] = None
+    # Streaming input (spec §3.4): ``on_stdin(ctx, data, *, delimiter,
+    # is_eof, errno)`` opts in to live delivery from the stdin content
+    # channel through the select loop, picking up where any pre-run
+    # ``sys.stdin`` ingest left off. ``stdin_delimiter`` is ``None``
+    # (default) for raw chunks as they arrive, or a non-empty delimiter
+    # (``'\n'`` lines, ``'\0'`` NUL records, multi-char ok): the
+    # framework buffers partial records and delivers ONE complete record
+    # per call, delimiter stripped into the ``delimiter`` kwarg.
+    # ``stdin_raw_bytes`` False (default) decodes utf-8 incrementally
+    # (``errors='replace'``); True delivers raw ``bytes``. The delimiter
+    # type must match the data mode — ``str`` by default, ``bytes`` when
+    # ``stdin_raw_bytes`` is set; no implicit encoding, a mismatch is a
+    # construction-time ValueError. Full contract in
+    # ``Browser.__init__``'s docstring.
+    on_stdin: Optional[Callable] = None
+    stdin_delimiter: str | bytes | None = None
+    stdin_raw_bytes: bool = False
     # Behaviour when the visible list has no *landable* row — empty, or
     # every row is a ``meta`` divider (§3.4 of the meta-rows design).
     #   * ``'wait'`` (default) — park the cursor; the ``0 <= cursor <
@@ -3373,6 +3393,47 @@ class Browser:
                 use this to clean up worker threads, temp files, file
                 handles. Exceptions are swallowed silently (a failing
                 cleanup hook should not block exit).
+            on_stdin: Optional ``(ctx, data, *, delimiter, is_eof,
+                errno) -> None`` hook: opt-in live streaming from the
+                stdin content channel while the UI runs (spec §3.4).
+                While set, fd 0 joins the select read-set and input is
+                delivered as it arrives, starting where any pre-run
+                ``sys.stdin`` ingest left off (a composing recipe's
+                bounded ``sys.stdin.buffer`` pre-read leaves read-ahead
+                in the buffer layer; that residue is served to the hook
+                first — partial *text-layer* ``sys.stdin`` reads do not
+                compose). All keywords are always passed. ``data`` is
+                ``str`` decoded incrementally as utf-8
+                (``errors='replace'``; multibyte sequences split across
+                chunk reads decode correctly), or raw ``bytes`` when
+                ``stdin_raw_bytes=True`` — never ``None``, may be empty.
+                Raw-chunk mode (``stdin_delimiter=None``): one call per
+                chunk read, ``delimiter=''``. Record mode: one call per
+                completed record, the stripped delimiter passed in
+                ``delimiter``; empty records are preserved (``'a\\n\\n'``
+                delivers ``'a'`` then ``''``). The final call has
+                ``is_eof=True`` and ``data`` = the trailing unterminated
+                record (or empty), ``delimiter=''``; a read error ends
+                the stream the same way with the numeric ``errno``
+                (``0`` on all other calls). After the EOF / error
+                delivery fd 0 leaves the select set for good. A tty
+                stdin (fd 0 → ``/dev/null`` after fd hygiene) streams
+                instant EOF through the same path. Exceptions are
+                caught and routed to :meth:`error`. Unavailable in
+                headless and ``--tty -`` runs (there fd 0 is the UI
+                device).
+            stdin_delimiter: ``None`` (default) for raw-chunk delivery,
+                or a non-empty delimiter (``'\\n'`` lines, ``'\\0'`` NUL
+                records, multi-char supported) — the framework owns
+                partial-record buffering and hands ``on_stdin`` one
+                complete record per call, delimiter stripped. Its type
+                must match the data mode: ``str`` by default, ``bytes``
+                when ``stdin_raw_bytes=True`` — no implicit encoding
+                between the two; a type mismatch (or an empty delimiter
+                of either type) raises ``ValueError`` at construction.
+            stdin_raw_bytes: When ``True``, ``on_stdin`` receives raw
+                ``bytes`` (``data`` and ``delimiter`` alike) instead of
+                decoded ``str``. Default ``False``.
             _headless: Skip terminal init/teardown — used by tests.
         """
         if config is None:
@@ -3402,6 +3463,19 @@ class Browser:
                 "meta_filter_mode must be one of 'hide', 'show', "
                 f"'filter'; got {config.meta_filter_mode!r}"
             )
+        if config.stdin_delimiter is not None:
+            # The delimiter type must match the data mode — no implicit
+            # encoding between the two; empty delimiters of either type
+            # are meaningless (raw-chunk mode is spelled ``None``).
+            _want = bytes if config.stdin_raw_bytes else str
+            if (not isinstance(config.stdin_delimiter, _want)
+                    or not config.stdin_delimiter):
+                raise ValueError(
+                    "stdin_delimiter must be None (raw chunks) or a "
+                    f"non-empty {_want.__name__} matching the data mode "
+                    f"(stdin_raw_bytes={config.stdin_raw_bytes}); got "
+                    f"{config.stdin_delimiter!r}"
+                )
         # --- user-supplied data callbacks -------------------------------
         # Default get_children to "no children" so a Browser constructed
         # with no kwargs still works (tests, smoke checks). get_preview
@@ -3496,6 +3570,9 @@ class Browser:
         # drain-time diff of the layout signature recorded by
         # ``_layout_for`` against ``_last_resize_sig`` (#828). ``on_quit``
         # fires once during shutdown after the screen is restored.
+        # ``on_stdin`` is not drain-fired at all — the select loop
+        # delivers it directly as stdin data arrives (see the stdin
+        # streaming block below for its state).
         self._on_cursor_change = config.on_cursor_change
         self._on_scope_change = config.on_scope_change
         self._on_selection_change = config.on_selection_change
@@ -3506,6 +3583,7 @@ class Browser:
         self._on_filter_change = config.on_filter_change
         self._on_resize = config.on_resize
         self._on_quit = config.on_quit
+        self._on_stdin = config.on_stdin
         # No-landable-row policy (§3.4). Read once here; consulted by
         # ``_clamp_cursor_landable`` whenever the visible list ends up
         # with no landable row (empty / all-meta).
@@ -3801,6 +3879,33 @@ class Browser:
         self._out_dead = False
         self._out_stream_live = False
         self._out_nonblock_set = False
+
+        # --- stdin streaming channel (on_stdin; spec §3.4) ---------------
+        # Armed by ``run()`` via ``_arm_stdin_stream`` only when the hook
+        # is registered and fd 0 is a content channel (never headless /
+        # ``--tty -``). ``_stdin_live`` is True from arming until the
+        # EOF / error delivery — exactly the window fd 0 spends in the
+        # select read-set; it never re-arms, so an ended stream costs the
+        # loop one attribute check per iteration (and an unset hook never
+        # arms at all). Text mode decodes through ``_stdin_decoder``, an
+        # incremental utf-8 decoder (``errors='replace'``), so multibyte
+        # sequences split across chunk reads decode correctly; record
+        # mode accumulates the trailing partial record in
+        # ``_stdin_rec_buf``. ``_stdin_delim`` is the configured
+        # delimiter, validated above to match the data mode (``str`` in
+        # text mode, ``bytes`` in raw-bytes mode — no implicit
+        # encoding). ``_stdin_nonblock_set`` records that arming flipped
+        # fd 0 to O_NONBLOCK (run phase only — undone at teardown, so
+        # pre-run ingest by a composing recipe stays blocking).
+        self._stdin_raw_bytes = bool(config.stdin_raw_bytes)
+        self._stdin_delim = config.stdin_delimiter
+        self._stdin_rec_buf = b'' if self._stdin_raw_bytes else ''
+        self._stdin_decoder = (
+            codecs.getincrementaldecoder('utf-8')('replace')
+            if (config.on_stdin is not None and not self._stdin_raw_bytes)
+            else None)
+        self._stdin_live = False
+        self._stdin_nonblock_set = False
 
         # --- sticky cursor anchor (id-based positioning) ---------------
         # The cursor's identity is its *item id*, not its row index. The
@@ -7012,7 +7117,11 @@ class Browser:
         after delivering the output channel — buffered ``print()`` text,
         then any captured ``_quit_output`` — per ``_teardown_output``
         (a pipe/file stdout additionally streams prints live during the
-        session via the select loop; see ``_drain_output``).
+        session via the select loop; see ``_drain_output``). When an
+        ``on_stdin`` hook is registered, the loop also streams the stdin
+        content channel to it (spec §3.4): fd 0 sits in the select
+        read-set from arming (``_arm_stdin_stream``) until the EOF /
+        error delivery.
 
         Auto-detects ``-h`` / ``--help`` in ``sys.argv[1:]`` so recipes
         that call ``Browser.run()`` without their own argparse get
@@ -7135,6 +7244,21 @@ class Browser:
             if _plugin_cfg.on_before_run is not None:
                 _plugin_cfg.on_before_run(self)
 
+        # Streaming-input arming (spec §3.4/§3.5): when an ``on_stdin``
+        # hook is registered, flip fd 0 non-blocking for the run phase
+        # and serve any BufferedReader read-ahead left by pre-run
+        # ``sys.stdin.buffer`` ingest, which select (kernel-buffer only)
+        # would never wake the loop for; kernel-side data is left to
+        # the select loop (bounded drain — see ``_pump_stdin``). Never
+        # in ``--tty -`` (fd 0 IS the UI device) or headless (no
+        # terminal layer; fd 0 belongs to the host process). A tty
+        # stdin needs no special case: fd hygiene pointed fd 0 at
+        # /dev/null, so this drain sees instant EOF and the fd never
+        # enters the select set.
+        if (self._on_stdin is not None and not self._headless
+                and tty_path != '-'):
+            self._arm_stdin_stream()
+
         try:
             while not self._quit_requested:
                 # Drain pending updates from any thread, then render if
@@ -7243,14 +7367,19 @@ class Browser:
 
                 try:
                     # fd 1 joins the select write-set only while a live
-                    # pipe/file stdout has buffered output to offer
-                    # (spec §3.5) — recipes that never print keep the
-                    # select sets exactly as before. The zero-arg call
-                    # stays on the no-output path so test stubs of
-                    # ``read_key`` need no signature change.
-                    if (self._out_stream_live and not self._out_dead
-                            and self._out_buf):
-                        key = read_key(write_fd=1)
+                    # pipe/file stdout has buffered output to offer, and
+                    # fd 0 joins the read-set only while the streaming-
+                    # input hook is armed (spec §3.5) — recipes that use
+                    # neither channel keep the select sets exactly as
+                    # before. The zero-arg call stays on the no-channel
+                    # path so test stubs of ``read_key`` need no
+                    # signature change.
+                    wfd = (1 if (self._out_stream_live
+                                 and not self._out_dead and self._out_buf)
+                           else None)
+                    rfd = 0 if self._stdin_live else None
+                    if wfd is not None or rfd is not None:
+                        key = read_key(write_fd=wfd, aux_read_fd=rfd)
                     else:
                         key = read_key()
                 except KeyboardInterrupt:
@@ -7272,6 +7401,14 @@ class Browser:
                     # stdout can take bytes again — drain what it will
                     # accept (non-blocking) and re-enter the loop.
                     self._drain_output()
+                    continue
+
+                if key == '_stdin':
+                    # fd 0 has data (or EOF) for the streaming-input
+                    # hook — pump one chunk and re-enter the loop (the
+                    # top-of-loop drain + render pick up whatever the
+                    # hook mutated).
+                    self._pump_stdin()
                     continue
 
                 if key == '_notify':
@@ -7308,6 +7445,7 @@ class Browser:
         finally:
             if not self._headless:
                 term_restore()
+            self._teardown_stdin()
             self.stop_workers()
             # Lifecycle hook: fired after screen restore, before
             # ``run`` returns. Exceptions swallowed (see
@@ -7432,6 +7570,176 @@ class Browser:
             if text:
                 sys.stdout.write(text)
                 sys.stdout.flush()
+
+    # ---- stdin streaming channel: arm, pump, end (spec §3.4 / §3.5) -----
+
+    def _arm_stdin_stream(self) -> None:
+        """Start the streaming-input phase: O_NONBLOCK on fd 0 + residue drain.
+
+        Called once by ``run()`` at loop start when ``on_stdin`` is
+        registered. Flips fd 0 non-blocking for the run phase (pre-run
+        ingest stays blocking; ``_teardown_stdin`` restores it), then
+        runs a BOUNDED drain whose only hard job is the BufferedReader
+        read-ahead left by a composing recipe's bounded pre-run
+        ``sys.stdin.buffer`` reads — select watches the kernel buffer
+        only, so that residue would otherwise sit invisible forever.
+        Kernel-side data needs no such treatment (it wakes select on
+        its own), so the drain hands back to the loop as soon as the
+        kernel reports more (see ``_pump_stdin``) — arming never
+        synchronously ingests a whole file or a saturated pipe. A tty
+        stdin (fd 0 → ``/dev/null`` after fd hygiene) reads instant
+        EOF here and never enters the select set — the same code path
+        as a real pipe ending.
+        """
+        try:
+            os.set_blocking(0, False)
+        except OSError as e:
+            # fd 0 unusable — end the stream with the error before it
+            # ever joins the select set.
+            self._end_stdin(e.errno or errno.EIO)
+            return
+        self._stdin_nonblock_set = True
+        self._stdin_live = True
+        self._pump_stdin(drain=True)
+
+    def _pump_stdin(self, drain: bool = False) -> None:
+        """Main-thread: read fd 0 and deliver ``on_stdin`` calls, never blocking.
+
+        Called by the main loop when select reports fd 0 readable —
+        one chunk per wake, so a firehose producer still yields to
+        renders between chunks (``read_key``'s terminal-first priority
+        keeps keystrokes ahead of a saturated stream) — and by
+        ``_arm_stdin_stream`` with ``drain=True``: keep reading while
+        the data is coming out of the buffer layer or is already in
+        flight, but hand back to the loop as soon as the kernel side
+        reports more data (select wakes for that on its own, and the
+        per-wake read goes through ``read1`` too, so ordering is
+        preserved) or a quit has been requested. The bound matters:
+        a regular file never EAGAINs and a saturated pipe never runs
+        dry, so an unbounded drain would synchronously ingest the
+        whole stream with no renders or keys in between.
+
+        Reads via ``sys.stdin.buffer.read1`` so buffer-layer read-ahead
+        is served before any new fd read. A falsy ``read1`` result is
+        ambiguous — EOF, or no-data-now on a buffered non-blocking
+        stream (the BufferedReader can swallow the raw layer's
+        would-block into ``b''``) — so it is settled against the raw
+        fd, whose contract is exact: ``BlockingIOError`` = no data now
+        (select re-arms), ``b''`` = genuine EOF, bytes = data that
+        raced in (delivered; this is what makes the probe race-free).
+        ``read1`` returning falsy implies the buffer layer is empty, so
+        the raw read cannot bypass buffered bytes. Any other ``OSError``
+        ends the stream with its errno.
+        """
+        while self._stdin_live:
+            try:
+                chunk = sys.stdin.buffer.read1(65536)
+            except BlockingIOError:
+                return
+            except OSError as e:
+                self._end_stdin(e.errno or errno.EIO)
+                return
+            if not chunk:
+                try:
+                    chunk = os.read(0, 65536)
+                except BlockingIOError:
+                    return
+                except OSError as e:
+                    self._end_stdin(e.errno or errno.EIO)
+                    return
+                if not chunk:
+                    self._end_stdin(0)
+                    return
+            self._deliver_stdin_chunk(chunk)
+            if not drain:
+                return
+            # Arming-drain bound: once the kernel side has data the
+            # select loop takes over (it wakes for kernel data; only
+            # buffer-layer residue needed serving outside select), and
+            # a quit requested by the hook ends the drain immediately.
+            if self._quit_requested or select.select([0], [], [], 0)[0]:
+                return
+
+    def _deliver_stdin_chunk(self, chunk: bytes) -> None:
+        """Decode + frame one fd-0 chunk into ``on_stdin`` deliveries.
+
+        Text mode first runs the bytes through the incremental utf-8
+        decoder — a chunk ending mid-multibyte-sequence may decode to
+        ``''``, with the held bytes completing on the next chunk. Raw
+        mode (no ``stdin_delimiter``) then delivers one call per chunk;
+        record mode appends to the partial buffer and delivers one call
+        per completed record, delimiter stripped and passed in the
+        ``delimiter`` kwarg (empty records included: ``'a\\n\\n'`` is
+        records ``'a'`` and ``''``). The trailing unterminated record
+        stays buffered for the next chunk (or the EOF flush).
+        """
+        if self._stdin_decoder is not None:
+            data = self._stdin_decoder.decode(chunk)
+        else:
+            data = chunk
+        delim = self._stdin_delim
+        if delim is None:
+            # Raw mode: one call per chunk. A chunk that decoded to
+            # nothing (mid-sequence bytes only) delivers nothing — its
+            # text surfaces with the next chunk.
+            if data:
+                self._fire_on_stdin(
+                    data, b'' if self._stdin_raw_bytes else '', False, 0)
+            return
+        parts = (self._stdin_rec_buf + data).split(delim)
+        self._stdin_rec_buf = parts.pop()
+        for rec in parts:
+            self._fire_on_stdin(rec, delim, False, 0)
+
+    def _end_stdin(self, err: int) -> None:
+        """Deliver the final ``on_stdin`` call (EOF or read error).
+
+        ``err`` is 0 for a clean EOF, else the numeric errno of the
+        failed read. The stream is marked ended FIRST — fd 0 leaves the
+        select read-set forever, even if the hook raises. The final
+        call flushes the decoder (a trailing incomplete multibyte
+        sequence becomes U+FFFD via ``errors='replace'``) and, in
+        record mode, carries the trailing unterminated record as
+        ``data`` — empty when the stream ended on a delimiter — with
+        ``delimiter=''`` and ``is_eof=True``.
+        """
+        self._stdin_live = False
+        empty = b'' if self._stdin_raw_bytes else ''
+        tail = empty
+        if self._stdin_decoder is not None:
+            tail = self._stdin_decoder.decode(b'', final=True)
+        if self._stdin_delim is not None:
+            tail = self._stdin_rec_buf + tail
+            self._stdin_rec_buf = empty
+        self._fire_on_stdin(tail, empty, True, err)
+
+    def _fire_on_stdin(self, data, delimiter, is_eof, err) -> None:
+        """Invoke ``on_stdin`` with the full kwarg contract (D6).
+
+        The framework always passes every keyword — no signature
+        adaptation. Exceptions are caught and routed to :meth:`error`,
+        matching the other lifecycle hooks, so a buggy hook never
+        crashes the main loop (and never un-ends the stream).
+        """
+        try:
+            self._on_stdin(self._make_ctx_for_hook(), data,
+                           delimiter=delimiter, is_eof=is_eof, errno=err)
+        except Exception as e:
+            self.error(f'on_stdin: {type(e).__name__}: {e}')
+
+    def _teardown_stdin(self) -> None:
+        """Undo the streaming phase's O_NONBLOCK on fd 0 (run phase only).
+
+        No-op unless ``_arm_stdin_stream`` flipped it. Restored even
+        when the stream already ended, so fd 0 leaves the session as it
+        entered it.
+        """
+        if self._stdin_nonblock_set:
+            try:
+                os.set_blocking(0, True)
+            except OSError:
+                pass
+            self._stdin_nonblock_set = False
 
     def _update_preview_for_cursor(self) -> None:
         """Request a preview fetch for the current cursor item.

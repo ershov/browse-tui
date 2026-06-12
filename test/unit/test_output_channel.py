@@ -368,7 +368,7 @@ class TestRunLoopDrainIntegration(unittest.TestCase):
 
         calls = []
 
-        def fake_read_key(write_fd=None):
+        def fake_read_key(write_fd=None, aux_read_fd=None):
             calls.append(write_fd)
             if write_fd is not None:
                 return '_writable'

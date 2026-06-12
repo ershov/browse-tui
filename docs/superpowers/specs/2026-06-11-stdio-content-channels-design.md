@@ -107,10 +107,13 @@ memoization machinery is needed.
 
 A recipe opts in via `BrowserConfig` fields (the established hook surface):
 - `on_stdin` — the hook (callable);
-- `stdin_delimiter` — `None` (default): raw chunks as they arrive; or any string
+- `stdin_delimiter` — `None` (default): raw chunks as they arrive; or a delimiter
   (`'\n'` for lines, `'\0'` for NUL records, …): the framework owns partial-record
-  buffering and delivers **one complete record per call**, delimiter stripped;
-- `stdin_bytes` — `False` (default): `data` is `str`, decoded with an **incremental
+  buffering and delivers **one complete record per call**, delimiter stripped. The
+  delimiter's type must match the data mode — `str` in the default str mode, `bytes`
+  when `stdin_raw_bytes=True`; a mismatch (or an empty delimiter) raises `ValueError` at
+  config time;
+- `stdin_raw_bytes` — `False` (default): `data` is `str`, decoded with an **incremental
   utf-8 decoder** (multibyte sequences split across chunk boundaries are handled
   correctly); `True`: raw `bytes`.
 
@@ -191,7 +194,7 @@ All via an explicit `-` argument (no auto-detection — D8):
 - **D3 — tty stdout output is delivered at exit** (rev 1 reversed): `ctx.print` output + selection are written to the terminal's normal scrollback after the UI exits — the fzf model, matching user expectation that a bare run still prints its result. Pipe stdout streams live during the session instead.
 - **D4 — `stderr` untouched.** Escape hatch; no save/restore; tracebacks stay visible. User-facing messages use `flash` / `error` / `log`.
 - **D5 — slurp + stream compose; stdin is one-shot.** Sync reads pre-run, streaming continues from the unread remainder; reload re-serves the in-memory parse (matches eager `--root-cmd` semantics).
-- **D6 — `on_stdin(ctx, data, *, delimiter, is_eof, errno)`.** `data` never `None`; `str` via incremental utf-8 by default, `bytes` opt-in (`stdin_bytes`); record mode via `stdin_delimiter` delivers one stripped record per call with the stripped text in `delimiter`; EOF = final call with `is_eof=True` (data = trailing partial or empty); error end = numeric `errno` + `is_eof=True`.
+- **D6 — `on_stdin(ctx, data, *, delimiter, is_eof, errno)`.** `data` never `None`; `str` via incremental utf-8 by default, `bytes` opt-in (`stdin_raw_bytes`); record mode via `stdin_delimiter` delivers one stripped record per call with the stripped text in `delimiter`; the delimiter's type matches the mode (str mode → `str`, bytes mode → `bytes`; mismatch raises at config time); EOF = final call with `is_eof=True` (data = trailing partial or empty); error end = numeric `errno` + `is_eof=True`.
 - **D7 — `ctx.print` mirrors builtin `print`** (newline default, `end` overridable); single FIFO buffer shared with quit output; never blocks the UI; permanently no-ops after a dead-pipe error.
 - **D8 — no auto-detection of piped stdin; explicit `-` only.** "stdin is not a tty" ≠ "content was piped": in scripted contexts (ssh, make, git hooks, CI) stdin is routinely a pipe or `/dev/null` with nothing in it, and auto mode would shadow the recipes' meaningful bare forms (browse cwd / repo log) with an empty UI; "pipe with data" cannot be probed without blocking or racing the producer.
 - **D9 — no `--root-file`.** Covered by existing mechanisms; revisit only if a real need appears.
