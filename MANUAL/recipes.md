@@ -34,7 +34,7 @@ whole data source — it combines with no other argument, and the bare form
 of each recipe is unchanged (still browses the cwd / current repo):
 
 - **`browse-md -`** — read **one** Markdown document from stdin and browse
-  it as a heading tree. The root row is titled `(stdin)`; it has no on-disk
+  it as a heading tree. The root row is titled `-` (matching the invocation); it has no on-disk
   source, so the `V` / `E` (page / edit the source file) actions have
   nothing to open and flash instead of acting. Empty input is an empty
   document (an empty tree), not an error.

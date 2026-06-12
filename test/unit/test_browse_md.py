@@ -4488,7 +4488,7 @@ class TestStdinDocument(unittest.TestCase):
 
     ``main()`` slurps ``sys.stdin`` before the UI starts and parses the
     text through the same ``_reparse`` pipeline as a file, stamping the
-    sentinel path ``_STDIN_PATH`` and a ``(stdin)`` root title. These
+    sentinel path ``_STDIN_PATH`` and a ``-`` root title. These
     tests drive ``main()`` with a stubbed stdin and the no-op
     ``browse_tui`` stub (so the run loop is never reached — construction
     raises ``AttributeError`` past which all the state we assert on has
@@ -4547,10 +4547,10 @@ class TestStdinDocument(unittest.TestCase):
         # No anchor for a lone ``-``.
         self.assertEqual(self.r._ANCHOR, '')
 
-    def test_root_title_is_stdin(self):
+    def test_root_title_is_dash(self):
         self._run_main('# Title\n## Section\nbody\n')
         fs = self.r._FILES[self.r._STDIN_PATH]
-        self.assertEqual(fs.file_root.title, '(stdin)')
+        self.assertEqual(fs.file_root.title, '-')
 
     def test_heading_tree_built_from_piped_text(self):
         self._run_main('# Title\n## Section\nbody\n')
@@ -4627,7 +4627,7 @@ class TestStdinDocument(unittest.TestCase):
             try:
                 self._run_main(piped)
                 fs = self.r._FILES[disk]
-                self.assertEqual(fs.file_root.title, '(stdin)')
+                self.assertEqual(fs.file_root.title, '-')
                 self.assertEqual(
                     self.r.get_preview(('file', disk)), piped)
             finally:

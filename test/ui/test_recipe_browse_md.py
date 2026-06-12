@@ -224,6 +224,21 @@ class TestBrowseMdPreviewResize(unittest.TestCase):
                 t.send('q')
 
 
+# The stdin document's root row is titled ``-`` (matching the ``browse-md
+# -`` invocation). A naked ``-`` on the rendered screen is a weak match
+# (dashes turn up in separators / UI chrome), so we anchor on the *row*:
+# the framework's row chrome is ``<sel-marker><indent><expander><title>``,
+# and the per-file root carries no id / tag (``show_ids='never'`` and the
+# root Item has no tag), so the title ``-`` sits immediately after the
+# expander glyph. With at least one heading the root is expandable
+# (``▼``/``▶`` glyph), giving a tight ``"▼ -"``/``"▶ -"`` witness. An empty
+# document has no children, so its expander is blank — there the row is a
+# line that is whitespace-only up to the lone ``-`` title (and the
+# childlessness is what the empty-doc test really asserts anyway).
+_RE_STDIN_ROW = re.compile(r'[▼▶] -(?:\s|$)', re.MULTILINE)
+_RE_STDIN_ROW_EMPTY = re.compile(r'^\s*-\s*$', re.MULTILINE)
+
+
 class TestBrowseMdStdin(unittest.TestCase):
     """``browse-md -`` reads ONE document from stdin (spec §3.3 / §3.7).
 
@@ -262,8 +277,10 @@ class TestBrowseMdStdin(unittest.TestCase):
                 f.write(body)
             with TmuxFixture(cols=100, rows=40) as t:
                 self._launch_stdin(t, doc)
-                # The top-level row is titled ``(stdin)`` (no file name).
-                t.wait_for('(stdin)', timeout=6.0)
+                # The top-level row is titled ``-`` (no file name). Match the
+                # rendered row (expander glyph + the ``-`` title) rather than a
+                # bare ``-`` substring, which UI chrome would also satisfy.
+                t.wait_for(_RE_STDIN_ROW, timeout=6.0)
                 # The heading tree is built from the piped text: the lone
                 # h1 auto-expands, revealing its body run and the h2.
                 t.wait_for('Piped Heading', timeout=4.0)
@@ -274,16 +291,18 @@ class TestBrowseMdStdin(unittest.TestCase):
                 t.send('q')
 
     def test_empty_stdin_is_an_empty_document(self):
-        # Empty input behaves exactly like an empty .md file: the
-        # ``(stdin)`` row shows with no expansion arrow / children. We
-        # assert ``(stdin)`` appears and stays childless (no ``[h*]`` row).
+        # Empty input behaves exactly like an empty .md file: the ``-`` row
+        # shows with no expansion arrow / children. With no heading the root
+        # is childless, so its expander glyph is blank — the row is a
+        # whitespace-only line ending in the lone ``-`` title. We assert that
+        # row appears and stays childless (no ``[h*]`` row).
         with tempfile.TemporaryDirectory() as tmp:
             doc = os.path.join(tmp, 'empty.md')
             with open(doc, 'w') as f:
                 f.write('')
             with TmuxFixture(cols=100, rows=40) as t:
                 self._launch_stdin(t, doc)
-                cap = t.wait_for('(stdin)', timeout=6.0)
+                cap = t.wait_for(_RE_STDIN_ROW_EMPTY, timeout=6.0)
                 t.wait_stable(timeout=3.0)
                 cap = t.capture()
                 # No heading rows — an empty document has no structure.

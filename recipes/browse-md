@@ -7,7 +7,7 @@ name). With no positionals at all the recipe browses the current
 directory (equivalent to ``browse-md .``). The lone argument ``-``
 reads ONE document from ``sys.stdin`` (slurped to EOF before the UI
 starts) and browses it like a file — its top-level row is titled
-``(stdin)``. Editing/paging the on-disk source (``V`` / ``E``) is
+``-`` (matching the invocation). Editing/paging the on-disk source (``V`` / ``E``) is
 unavailable for that document (it has no file); the actions flash a
 message instead.
 
@@ -112,7 +112,8 @@ _INPUT_FILES = []
 # ``_reparse`` serves ``_STDIN_TEXT`` for that path instead of reading
 # disk (so Ctrl-R re-serves the same parse — stdin can't be re-read,
 # matching the eager ``--root-cmd`` semantics) and titles the root
-# ``(stdin)``. The sentinel lives under the cwd so the document's
+# ``-`` (matching the ``browse-md -`` invocation). The sentinel lives
+# under the cwd so the document's
 # relative ``.md`` links resolve against the cwd (a coherent anchor for
 # a piped doc); it is never opened, so the basename ``<stdin>`` only
 # needs to be filesystem-implausible enough not to collide with a real
@@ -1214,9 +1215,10 @@ def _reparse():
         # Override ``_build_nodes``'s basename default with the resolved
         # per-root label (always project-root-relative; a file sitting
         # directly in the root collapses to its bare basename). The
-        # stdin document has no on-disk name, so it shows ``(stdin)``.
+        # stdin document has no on-disk name, so it shows ``-`` (matching
+        # the ``browse-md -`` invocation that produced it).
         file_root.title = (
-            '(stdin)' if path == _STDIN_PATH and _STDIN_TEXT is not None
+            '-' if path == _STDIN_PATH and _STDIN_TEXT is not None
             else labels[path]
         )
         # The per-file root carries an expansion arrow when it has headings
@@ -1879,7 +1881,7 @@ Usage: browse-md [-l] [FILE.md[#anchor] | DIR ... | -]
   DIR       Expands to the ``.md`` / ``.MD`` files directly inside it
             (non-recursive). No args ⇒ browse ``.``.
   -         Read ONE document from stdin and browse it like a file
-            (row titled ``(stdin)``; V/E have no source — they flash).
+            (row titled ``-``; V/E have no source — they flash).
   #anchor   Deep-link target — 0-based line number or heading name
             (exact / prefix / substring tiers; first hit wins). When
             multiple files carry anchors, the FIRST anchored file in
