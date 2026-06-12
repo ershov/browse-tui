@@ -177,8 +177,24 @@ _HEADING_STYLES = {
 # unchanged regardless of the flag.
 _INCLUDE_LISTS = False
 
+# Extra candidate base directories for resolving a document's relative
+# cross-file ``.md`` references, in priority order — the repeatable
+# ``--root DIR`` flag. ``main()`` fills this with the absolute, existing
+# directories supplied on the command line (a non-directory value is
+# warned about and dropped). Threaded into ``md_doc.resolve_md_ref`` as
+# its ``extra_bases`` at the two resolution sites (``_file_has_existing_ref``
+# and ``_md_resolved_refs``) so a document piped from — or referencing —
+# a project root that the file's own directory / cwd / git-root defaults
+# don't reach still resolves. Empty (the default) leaves resolution exactly
+# as it was before the flag existed, AND keeps the stdin document's
+# reference-following suppressed; a non-empty list lifts that suppression
+# (the stdin doc has no on-disk directory of its own, so the supplied roots
+# become its only resolution bases). RESOLUTION ONLY — display labels and
+# browse-root selection are unaffected.
+_ROOTS = []
 
-_USAGE = 'usage: browse-md [-l] [FILE.md[#anchor] | DIR ... | -]'
+
+_USAGE = 'usage: browse-md [-l] [--root DIR ...] [FILE.md[#anchor] | DIR ... | -]'
 
 # Markdown file extensions recognised when a positional names a directory.
 # A directory argument expands to every direct child with one of these
@@ -825,7 +841,8 @@ def _md_resolved_refs(text, doc_dir, cwd, project_root):
     out = []
     for captured in md_doc.find_md_refs(text):
         abspath = md_doc.resolve_md_ref(
-            captured, doc_dir=doc_dir, cwd=cwd, project_root=project_root)
+            captured, doc_dir=doc_dir, cwd=cwd, project_root=project_root,
+            extra_bases=_ROOTS)
         if abspath is None or abspath in seen:
             continue
         seen.add(abspath)
@@ -843,25 +860,32 @@ def _file_has_existing_ref(text, file_path):
     references an existing ``.md`` still carries an expansion arrow. Returns
     ``False`` immediately when ``md_doc`` is unavailable.
 
-    This does read the referencing file's own directory off disk via
-    ``resolve_md_ref``'s ``os.path.exists`` probes, but never the referenced
-    files themselves — those are read lazily on expand. ``text`` is already in
-    ``_FileState`` (no extra read of the primary file).
+    This does read the referencing file's own directory (and any ``--root``
+    bases) off disk via ``resolve_md_ref``'s ``os.path.exists`` probes, but
+    never the referenced files themselves — those are read lazily on expand.
+    ``text`` is already in ``_FileState`` (no extra read of the primary file).
 
-    The stdin document (``_STDIN_PATH``) is excluded: it is self-contained,
-    has no on-disk file to read on a ref expand (``get_doc`` of the sentinel
-    would fail), and is the single chokepoint both the ``_reparse`` arrow and
-    the ``get_children`` umbrella gate on — so returning ``False`` here keeps
-    the References subtree off the stdin root entirely rather than hanging an
-    umbrella that can't be expanded.
+    The stdin document (``_STDIN_PATH``) is excluded UNLESS ``--root`` bases
+    were supplied: by default it is self-contained, has no on-disk file to read
+    on a ref expand (the umbrella serves ``_STDIN_TEXT`` for it, but with no
+    resolution base its relative refs can't resolve anyway), and is the single
+    chokepoint both the ``_reparse`` arrow and the ``get_children`` umbrella
+    gate on — so returning ``False`` keeps the References subtree off the stdin
+    root entirely rather than hanging an umbrella that resolves nothing. When
+    ``_ROOTS`` is non-empty the supplied roots ARE on-disk resolution bases for
+    the piped document, so the suppression is lifted and the probe runs against
+    them (the umbrella, cross-file expansion and this probe all share the same
+    ``extra_bases`` seam).
     """
-    if md_doc is None or file_path == _STDIN_PATH:
+    if md_doc is None:
+        return False
+    if file_path == _STDIN_PATH and not _ROOTS:
         return False
     doc_dir, cwd, project_root = _md_resolution_context(file_path)
     for captured in md_doc.find_md_refs(text):
         if md_doc.resolve_md_ref(
                 captured, doc_dir=doc_dir, cwd=cwd,
-                project_root=project_root) is not None:
+                project_root=project_root, extra_bases=_ROOTS) is not None:
             return True
     return False
 
@@ -1047,12 +1071,20 @@ def _md_chain_doc(anchor, chain):
       * an empty ``chain`` is the anchor's own primary file (``anchor[1]``).
         Unlike browse-claude (whose empty chain is a message's inline text),
         browse-md's anchor is itself a file, so the empty-chain document is that
-        file read from disk via ``get_doc``.
+        file read from disk via ``get_doc`` — EXCEPT the stdin sentinel
+        (``_STDIN_PATH``), whose text was pre-slurped into ``_STDIN_TEXT`` and
+        has no on-disk file: it is served from that buffer (same headings-only
+        tree shape ``get_doc`` builds) so the stdin document's own References
+        umbrella can resolve its refs against the ``--root`` bases. In
+        practice only the empty chain names the sentinel — a referenced file
+        is an existing on-disk path.
 
     Returns ``(None, None)`` when the document is unreadable — the callers treat
     that as "no children / empty preview".
     """
     target = chain[-1] if chain else anchor[1]
+    if target == _STDIN_PATH and _STDIN_TEXT is not None:
+        return _STDIN_TEXT, md_doc.build_doc_tree(_STDIN_TEXT)
     try:
         return md_doc.get_doc(target)
     except OSError:
@@ -1872,8 +1904,13 @@ def _on_expand(ctx, ids):
 _HELP_INTRO = """\
 browse-md — markdown browser for one or more files.
 
-Usage: browse-md [-l] [FILE.md[#anchor] | DIR ... | -]
+Usage: browse-md [-l] [--root DIR ...] [FILE.md[#anchor] | DIR ... | -]
   -l, --list, --lists  Also surface list items (default: headings).
+  --root DIR  Extra base for resolving a doc's relative ``.md`` refs.
+            Repeatable; tried in order AFTER the doc's own directory (so
+            a doc — including one piped via ``-`` — resolves refs against
+            a project root its dir / cwd don't reach). Missing DIR warns
+            and is skipped. Resolution only; labels are unchanged.
   FILE.md   One or more markdown files. Each file shows as a
             top-level row in the tree; there is no synthetic root
             above them. With a single file the browser opens scoped
@@ -2014,8 +2051,75 @@ def _pop_flag(name, alts=()):
     return found
 
 
+def _pop_value_flag(name):
+    """Pop every value-taking ``name`` occurrence from ``sys.argv``.
+
+    The value-taking sibling of ``_pop_flag``: walks ``sys.argv`` from index 1
+    and removes each occurrence of ``name`` together with its value, returning
+    the values (raw, in argv order) as a list. Both spellings are accepted, to
+    match how the framework's ``recipe_argv`` treats ``--tty``:
+
+      * ``name VALUE`` — two tokens; the following token is the value and is
+        removed too. A trailing ``name`` with no following token contributes
+        no value (and is simply dropped).
+      * ``name=VALUE`` — one token; everything after the ``=`` is the value
+        (so ``--root=`` yields an empty string, left for the caller to reject).
+
+    Like ``_pop_flag`` it mutates ``sys.argv`` in place and keeps scanning, so
+    a repeated flag (``--root A --root B``) returns ``['A', 'B']``. Used by
+    ``main()`` to extract the repeatable ``--root DIR`` before the positionals
+    are read, alongside the ``-l`` extraction.
+    """
+    prefix = name + '='
+    values = []
+    i = 1
+    while i < len(sys.argv):
+        tok = sys.argv[i]
+        if tok == name:
+            # ``name VALUE``: consume this token and the value after it. A
+            # trailing ``name`` (no value) is just dropped — no value added.
+            del sys.argv[i]
+            if i < len(sys.argv):
+                values.append(sys.argv[i])
+                del sys.argv[i]
+            continue
+        if tok.startswith(prefix):
+            values.append(tok[len(prefix):])
+            del sys.argv[i]
+            continue
+        i += 1
+    return values
+
+
+def _resolve_roots(raw_values):
+    """Resolve raw ``--root`` values to absolute, existing directories.
+
+    Each raw value is ``expanduser`` + ``abspath``-ed against the process cwd at
+    startup (so a relative ``--root sub`` is anchored to where ``browse-md`` was
+    launched). A value that does NOT name an existing directory is reported with
+    a single non-fatal warning to stderr — running pre-UI, so stderr is the right
+    channel — and dropped, so a typo'd root surfaces loudly instead of silently
+    failing to resolve, while the remaining roots still take effect. The
+    surviving absolute directories are returned in the order given (which is the
+    resolution-priority order ``md_doc.resolve_md_ref`` walks them in).
+    """
+    roots = []
+    for raw in raw_values:
+        # An empty value (``--root=``) would abspath to the cwd and silently
+        # pass the isdir check — warn and drop it like any other bad value.
+        if not raw.strip():
+            print('browse-md: --root: empty value', file=sys.stderr)
+            continue
+        abs_root = os.path.abspath(os.path.expanduser(raw))
+        if os.path.isdir(abs_root):
+            roots.append(abs_root)
+        else:
+            print(f'browse-md: --root: not a directory: {raw}', file=sys.stderr)
+    return roots
+
+
 def main():
-    global _ANCHOR, _BROWSER, _INCLUDE_LISTS, _INPUT_FILES, _STDIN_TEXT
+    global _ANCHOR, _BROWSER, _INCLUDE_LISTS, _INPUT_FILES, _ROOTS, _STDIN_TEXT
     # Hard-dependency gate. ``md_doc.build_doc_tree`` derives the whole
     # tree from ``md2ansi_scan``; without either there is nothing to
     # build, so fail fast with a clear message rather than running
@@ -2033,6 +2137,14 @@ def main():
     # interchangeably (``--list`` / ``--lists``); the flag has no
     # arguments — its mere presence flips emission on.
     _INCLUDE_LISTS = _pop_flag('-l', alts=('--list', '--lists'))
+    # Pop the repeatable, value-taking ``--root DIR`` (and ``--root=DIR``) the
+    # same way and BEFORE the positionals/leftover scan, so its value is never
+    # mistaken for a FILE positional. Each value is resolved to an absolute
+    # existing directory (relative to the startup cwd); a non-directory is
+    # warned about (non-fatal) and dropped by ``_resolve_roots``. These are the
+    # extra candidate bases for resolving cross-file ``.md`` references — see
+    # ``_ROOTS``.
+    _ROOTS = _resolve_roots(_pop_value_flag('--root'))
     # Read the recipe's own tokens via ``recipe_argv()``, which drops the
     # framework's ``--tty PATH`` / ``--tty=PATH`` flag: ``Browser.run()``
     # auto-detects it but leaves it in ``sys.argv``, so the option scan

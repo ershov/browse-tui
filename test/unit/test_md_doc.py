@@ -573,6 +573,86 @@ class TestResolveMdRef(unittest.TestCase):
             self.assertIsNone(md_doc.resolve_md_ref(
                 'nope.md', doc_dir=d, cwd=d, project_root=d))
 
+    def test_extra_bases_default_empty_unchanged(self):
+        # The default ``extra_bases=()`` leaves the candidate order exactly
+        # ``[doc_dir, cwd, project_root]`` — same as before the hook existed.
+        with tempfile.TemporaryDirectory() as d:
+            cwd = os.path.join(d, 'cwd')
+            self._write(os.path.join(cwd, 'r.md'), 'CWD')
+            # No doc copy, no extra bases -> falls through to cwd.
+            got = md_doc.resolve_md_ref(
+                'r.md', doc_dir=os.path.join(d, 'doc'),
+                cwd=cwd, project_root=os.path.join(d, 'proj'))
+            with open(got) as f:
+                self.assertEqual(f.read(), 'CWD')
+
+    def test_extra_base_resolves_when_nothing_else_does(self):
+        # A ref present ONLY in an extra base resolves there (the flagship
+        # ``--root`` case: doc_dir / cwd / project_root all lack it).
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, 'root')
+            self._write(os.path.join(root, 'r.md'), 'ROOT')
+            got = md_doc.resolve_md_ref(
+                'r.md', doc_dir=os.path.join(d, 'doc'),
+                cwd=os.path.join(d, 'cwd'),
+                project_root=os.path.join(d, 'proj'),
+                extra_bases=[root])
+            with open(got) as f:
+                self.assertEqual(f.read(), 'ROOT')
+
+    def test_doc_dir_beats_extra_base(self):
+        # ``doc_dir`` is tried BEFORE any extra base, so when the ref exists in
+        # both the file's own dir and a supplied root, the file's dir wins.
+        with tempfile.TemporaryDirectory() as d:
+            doc = os.path.join(d, 'doc')
+            root = os.path.join(d, 'root')
+            self._write(os.path.join(doc, 'r.md'), 'DOC')
+            self._write(os.path.join(root, 'r.md'), 'ROOT')
+            got = md_doc.resolve_md_ref(
+                'r.md', doc_dir=doc, cwd='/nowhere',
+                project_root='/nowhere', extra_bases=[root])
+            with open(got) as f:
+                self.assertEqual(f.read(), 'DOC')
+
+    def test_first_extra_base_wins(self):
+        # Multiple extra bases are tried in order: when the ref exists in two
+        # of them, the first-listed wins.
+        with tempfile.TemporaryDirectory() as d:
+            r1 = os.path.join(d, 'r1')
+            r2 = os.path.join(d, 'r2')
+            self._write(os.path.join(r1, 'r.md'), 'R1')
+            self._write(os.path.join(r2, 'r.md'), 'R2')
+            got = md_doc.resolve_md_ref(
+                'r.md', doc_dir=os.path.join(d, 'doc'), cwd='/nowhere',
+                project_root='/nowhere', extra_bases=[r1, r2])
+            with open(got) as f:
+                self.assertEqual(f.read(), 'R1')
+
+    def test_extra_base_after_doc_before_cwd(self):
+        # Full precedence chain: doc_dir, then extra bases, then cwd. With no
+        # doc copy but a copy in BOTH an extra base and cwd, the extra base
+        # wins (it precedes cwd in the candidate list).
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, 'root')
+            cwd = os.path.join(d, 'cwd')
+            self._write(os.path.join(root, 'r.md'), 'ROOT')
+            self._write(os.path.join(cwd, 'r.md'), 'CWD')
+            got = md_doc.resolve_md_ref(
+                'r.md', doc_dir=os.path.join(d, 'doc'), cwd=cwd,
+                project_root='/nowhere', extra_bases=[root])
+            with open(got) as f:
+                self.assertEqual(f.read(), 'ROOT')
+
+    def test_extra_bases_ignored_for_absolute_ref(self):
+        # An absolute ref is taken as-is (rule #1); extra bases never join it.
+        with tempfile.TemporaryDirectory() as d:
+            ap = os.path.join(d, 'sub', 'abs.md')
+            self._write(ap, 'ABS')
+            got = md_doc.resolve_md_ref(
+                ap, doc_dir='/nowhere', cwd='/nowhere',
+                project_root='/nowhere', extra_bases=['/also-nowhere'])
+            self.assertEqual(got, os.path.realpath(ap))
+
     def test_absolute_path_used_directly(self):
         with tempfile.TemporaryDirectory() as d:
             ap = os.path.join(d, 'sub', 'abs.md')

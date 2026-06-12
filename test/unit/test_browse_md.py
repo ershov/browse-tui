@@ -2022,9 +2022,11 @@ class TestHelpIntro(unittest.TestCase):
         self.assertTrue(self.r._HELP_INTRO.strip())
 
     def test_contains_usage_form(self):
-        # The usage line documents the optional ``-l`` flag and the
-        # file/dir positionals (with the anchor syntax detailed below).
-        self.assertIn('browse-md [-l] [FILE.md', self.r._HELP_INTRO)
+        # The usage line documents the optional ``-l`` flag, the repeatable
+        # ``--root DIR`` flag, and the file/dir positionals (with the anchor
+        # syntax detailed below).
+        self.assertIn(
+            'browse-md [-l] [--root DIR ...] [FILE.md', self.r._HELP_INTRO)
 
     def test_mentions_lists_flag(self):
         # The ``-l`` / ``--list`` / ``--lists`` flag toggles list-item
@@ -2033,6 +2035,11 @@ class TestHelpIntro(unittest.TestCase):
         self.assertIn('-l', self.r._HELP_INTRO)
         self.assertIn('--list', self.r._HELP_INTRO)
         self.assertIn('--lists', self.r._HELP_INTRO)
+
+    def test_mentions_root_flag(self):
+        # The repeatable ``--root DIR`` reference-resolution flag should be
+        # discoverable from the intro alongside a brief description.
+        self.assertIn('--root DIR', self.r._HELP_INTRO)
 
     def test_mentions_anchor(self):
         # Anchor syntax is a load-bearing feature; document it.
@@ -2053,9 +2060,10 @@ class TestHelpIntro(unittest.TestCase):
         self.assertIn('Ctrl-R', self.r._HELP_INTRO)
 
     def test_compact_size(self):
-        # browse-fs-style compact help — should comfortably fit under
-        # the ~25-line budget noted in the ticket.
-        self.assertLessEqual(self.r._HELP_INTRO.count('\n'), 25)
+        # browse-fs-style compact help — kept tight even with the
+        # ``--root`` entry added; a low-30s line budget still fits a
+        # screen comfortably.
+        self.assertLessEqual(self.r._HELP_INTRO.count('\n'), 32)
 
 
 class TestArgvFlag(unittest.TestCase):
@@ -2124,6 +2132,172 @@ class TestArgvFlag(unittest.TestCase):
         self.assertFalse(self.r._pop_flag('-l', alts=('--list', '--lists')))
         self.assertEqual(
             self.r.sys.argv, ['browse-md', '--frobnicate', 'FILE.md'])
+
+
+class TestArgvValueFlag(unittest.TestCase):
+    """``_pop_value_flag`` — extract the value-taking ``--root DIR`` from argv.
+
+    The value-taking sibling of ``_pop_flag``: like the ``-l`` extraction it
+    runs before the positionals are read and mutates ``sys.argv`` in place,
+    but each occurrence consumes a VALUE — either the following token
+    (``--root DIR``) or an inline ``--root=DIR`` — and the values are returned
+    in argv order. Verified directly by patching ``sys.argv`` on the recipe.
+    """
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self._saved_argv = list(self.r.sys.argv)
+
+    def tearDown(self):
+        self.r.sys.argv[:] = self._saved_argv
+
+    def _set_argv(self, argv):
+        self.r.sys.argv[:] = argv
+
+    def test_absent_returns_empty(self):
+        self._set_argv(['browse-md', 'FILE.md'])
+        self.assertEqual(self.r._pop_value_flag('--root'), [])
+        self.assertEqual(self.r.sys.argv, ['browse-md', 'FILE.md'])
+
+    def test_space_form_single(self):
+        self._set_argv(['browse-md', '--root', '/a', 'FILE.md'])
+        self.assertEqual(self.r._pop_value_flag('--root'), ['/a'])
+        # Both the flag AND its value are removed; the positional survives.
+        self.assertEqual(self.r.sys.argv, ['browse-md', 'FILE.md'])
+
+    def test_equals_form_single(self):
+        self._set_argv(['browse-md', '--root=/a', 'FILE.md'])
+        self.assertEqual(self.r._pop_value_flag('--root'), ['/a'])
+        self.assertEqual(self.r.sys.argv, ['browse-md', 'FILE.md'])
+
+    def test_repeatable_mixed_forms_in_order(self):
+        # Multiple occurrences (mixing both spellings) all pop; values come
+        # back in argv order and the positional is left in place.
+        self._set_argv(
+            ['browse-md', '--root', '/a', '--root=/b', 'FILE.md',
+             '--root', '/c'])
+        self.assertEqual(self.r._pop_value_flag('--root'), ['/a', '/b', '/c'])
+        self.assertEqual(self.r.sys.argv, ['browse-md', 'FILE.md'])
+
+    def test_equals_empty_value_kept_for_caller(self):
+        # ``--root=`` yields an empty-string value verbatim — rejecting it is
+        # ``_resolve_roots``'s job (see TestResolveRoots), not this helper's.
+        self._set_argv(['browse-md', '--root=', 'FILE.md'])
+        self.assertEqual(self.r._pop_value_flag('--root'), [''])
+        self.assertEqual(self.r.sys.argv, ['browse-md', 'FILE.md'])
+
+    def test_trailing_bare_flag_dropped_no_value(self):
+        # A trailing ``--root`` with no following token contributes no value
+        # and is simply removed (no IndexError).
+        self._set_argv(['browse-md', 'FILE.md', '--root'])
+        self.assertEqual(self.r._pop_value_flag('--root'), [])
+        self.assertEqual(self.r.sys.argv, ['browse-md', 'FILE.md'])
+
+    def test_does_not_consume_unrelated_args(self):
+        self._set_argv(['browse-md', '--frobnicate', 'FILE.md'])
+        self.assertEqual(self.r._pop_value_flag('--root'), [])
+        self.assertEqual(
+            self.r.sys.argv, ['browse-md', '--frobnicate', 'FILE.md'])
+
+    def test_value_after_flag_taken_even_if_dash_prefixed(self):
+        # ``--root`` consumes the very next token as its value unconditionally
+        # (matching ``recipe_argv``'s ``--tty VALUE`` consumption), so a
+        # ``-``-looking value isn't re-scanned as another option.
+        self._set_argv(['browse-md', '--root', '--weird', 'FILE.md'])
+        self.assertEqual(self.r._pop_value_flag('--root'), ['--weird'])
+        self.assertEqual(self.r.sys.argv, ['browse-md', 'FILE.md'])
+
+
+class TestResolveRoots(unittest.TestCase):
+    """``_resolve_roots`` — raw ``--root`` values → abs existing directories.
+
+    Each raw value is ``expanduser`` + ``abspath``-ed against the startup cwd;
+    a non-directory is reported with ONE non-fatal stderr warning and dropped,
+    the survivors kept in order (the resolution-priority order).
+    """
+
+    def setUp(self):
+        self.r = _load_recipe()
+
+    def _resolve(self, raws):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            out = self.r._resolve_roots(raws)
+        return out, buf.getvalue()
+
+    def test_existing_dir_kept_absolute(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            # ``d`` is already absolute; ``_resolve_roots`` abspaths (not
+            # realpaths) so it is preserved verbatim.
+            out, err = self._resolve([d])
+            self.assertEqual(out, [os.path.abspath(d)])
+            self.assertEqual(err, '')
+
+    def test_empty_value_warns_and_is_dropped(self):
+        # ``--root=`` must not silently become the cwd (``abspath('')`` IS
+        # the cwd, which isdir accepts) — it warns and is dropped like any
+        # other bad value.
+        out, err = self._resolve([''])
+        self.assertEqual(out, [])
+        self.assertEqual(err, 'browse-md: --root: empty value\n')
+
+    def test_nonexistent_warns_once_and_dropped(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            bogus = os.path.join(d, 'nope')
+            out, err = self._resolve([bogus])
+            self.assertEqual(out, [])
+            self.assertEqual(err.count('\n'), 1)
+            self.assertIn('--root: not a directory: ' + bogus, err)
+
+    def test_file_is_not_a_directory_warns(self):
+        # A path that exists but is a FILE (not a dir) is rejected too.
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            f = os.path.join(d, 'f.md')
+            with open(f, 'w') as fh:
+                fh.write('x')
+            out, err = self._resolve([f])
+            self.assertEqual(out, [])
+            self.assertIn('--root: not a directory: ' + f, err)
+
+    def test_mix_keeps_good_drops_bad_in_order(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            a = os.path.join(d, 'a')
+            b = os.path.join(d, 'b')
+            os.mkdir(a)
+            os.mkdir(b)
+            bogus = os.path.join(d, 'nope')
+            out, err = self._resolve([a, bogus, b])
+            self.assertEqual(out, [a, b])
+            self.assertEqual(err.count('\n'), 1)
+
+    def test_tilde_expanded(self):
+        import tempfile
+        import unittest.mock as mock
+        with tempfile.TemporaryDirectory() as home:
+            with mock.patch.dict(os.environ, {'HOME': home}):
+                out, err = self._resolve(['~'])
+            self.assertEqual(out, [os.path.abspath(home)])
+            self.assertEqual(err, '')
+
+    def test_relative_resolved_against_cwd(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            sub = os.path.join(d, 'sub')
+            os.mkdir(sub)
+            cwd = os.getcwd()
+            os.chdir(d)
+            try:
+                out, err = self._resolve(['sub'])
+            finally:
+                os.chdir(cwd)
+            self.assertEqual(out, [sub])
+            self.assertEqual(err, '')
 
 
 class TestArgvErrors(unittest.TestCase):
@@ -4196,6 +4370,200 @@ class TestMdRefFollowing(unittest.TestCase):
         self.assertTrue(getattr(refs[0], 'boundary', False))
 
 
+class TestMdRefFollowingWithRoot(unittest.TestCase):
+    """``--root DIR`` extends reference resolution to extra base directories.
+
+    Drives the real ``_reparse`` / ``get_children`` path (refs read from disk)
+    with the recipe's ``_ROOTS`` global populated as ``main()`` would after
+    parsing ``--root``. The flagship case: a document references ``target.md``
+    by a bare relative token, but that file lives ONLY under a supplied root
+    (not the document's own directory / cwd / git-root) — so without ``--root``
+    it would silently fail to resolve, and with it the ref surfaces under the
+    ``[links]`` References umbrella and expands into the referenced file.
+
+    Fixtures live in a private temp dir (no ``.git``, so ``project_root`` falls
+    back to the doc's own dir — labels are bare basenames):
+      * ``docdir/main.md`` — references ``target.md`` (bare relative token),
+        which does NOT exist beside it.
+      * ``rootA/target.md`` — the only copy of ``target.md`` (carries a heading
+        so the expanded ref shows structure).
+    """
+
+    def setUp(self):
+        import os
+        import tempfile
+        self.r = _load_recipe(include_lists=False)
+        self.r.md_doc.clear_cache()
+        self.r._MD_COLOR = False
+        self.r._BROWSER = None
+        self.dir = tempfile.mkdtemp()
+        self.docdir = os.path.join(self.dir, 'docdir')
+        self.rootA = os.path.join(self.dir, 'rootA')
+        os.makedirs(self.docdir)
+        os.makedirs(self.rootA)
+        self.main_md = os.path.join(self.docdir, 'main.md')
+        self._write(self.main_md,
+                    '# Main\n'
+                    'see target.md for the rest\n')
+        self._write(os.path.join(self.rootA, 'target.md'),
+                    '# Target heading\nbody\n')
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.dir, ignore_errors=True)
+        self.r.md_doc.clear_cache()
+
+    def _write(self, path, text):
+        import os
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(text)
+
+    def _reparse_with_roots(self, roots):
+        # Populate the recipe state exactly as ``main()`` does before the first
+        # ``_reparse``: the input file list, the resolved ``_ROOTS``, a clear
+        # parse cache.
+        self.r._INPUT_FILES = [(self.main_md, '')]
+        self.r._ROOT_PATH = self.main_md
+        self.r._ROOTS = list(roots)
+        self.r.md_doc.clear_cache()
+        self.r._reparse()
+
+    def _umbrella(self, kids):
+        umbrellas = [k for k in kids if k.tag == 'links']
+        self.assertEqual(len(umbrellas), 1,
+                         'expected exactly one References umbrella')
+        return umbrellas[0]
+
+    def _refs(self, file_path):
+        umbrella = self._umbrella(self.r.get_children(('file', file_path)))
+        return self.r.get_children(umbrella.id)
+
+    # --- without --root: today's behavior (ref unresolvable) -------------
+
+    def test_without_root_ref_does_not_resolve(self):
+        # No ``--root``: ``target.md`` exists nowhere the defaults search, so
+        # the file has no resolvable ref — no umbrella, no expansion arrow.
+        self._reparse_with_roots([])
+        root = self.r._FILES[self.main_md].file_root
+        # The only structure is the lone h1; no References umbrella.
+        kids = self.r.get_children(('file', self.main_md))
+        self.assertFalse(any(k.tag == 'links' for k in kids),
+                         'no umbrella without a resolvable ref')
+
+    # --- with --root: the ref resolves via the supplied root -------------
+
+    def test_root_only_ref_resolves_and_expands(self):
+        # With ``--root rootA``, ``target.md`` resolves there: the file gains a
+        # References umbrella, and expanding it yields the referenced file,
+        # which itself drills into its heading.
+        self._reparse_with_roots([self.rootA])
+        root = self.r._FILES[self.main_md].file_root
+        self.assertTrue(root.has_children)
+        refs = self._refs(self.main_md)
+        # Exactly one ref, resolved to rootA's copy (the only one on disk). The
+        # label is project-anchored display text (here the abspath, since the
+        # file lives outside the doc's project_root); ``md_abspath`` is the
+        # canonical resolved path the resolution itself produced.
+        self.assertEqual(len(refs), 1)
+        self.assertEqual(
+            refs[0].md_abspath,
+            os.path.realpath(os.path.join(self.rootA, 'target.md')))
+        # The ref node is a boundary doc; expanding it shows target's heading.
+        target_node = refs[0]
+        self.assertTrue(getattr(target_node, 'boundary', False))
+        sub = self.r.get_children(target_node.id)
+        self.assertEqual([(k.tag, k.title) for k in sub],
+                         [('h1', 'Target heading')])
+
+    def test_has_existing_ref_flips_with_root(self):
+        # The cheap existence probe used by ``_reparse`` for the arrow flips
+        # from False (no root) to True (root supplied) for the same file/text.
+        text = '# Main\nsee target.md for the rest\n'
+        self.r._ROOTS = []
+        self.assertFalse(
+            self.r._file_has_existing_ref(text, self.main_md))
+        self.r._ROOTS = [self.rootA]
+        self.assertTrue(
+            self.r._file_has_existing_ref(text, self.main_md))
+
+    # --- precedence: the document's own directory wins over a root -------
+
+    def test_doc_dir_beats_root(self):
+        # Same relative ref exists in BOTH the doc's own dir and a supplied
+        # root → the doc's own directory wins (today's resolution order is
+        # unchanged; the root is only an ADDED, lower-priority candidate).
+        self._write(os.path.join(self.docdir, 'target.md'),
+                    '# Local target\nlocal body\n')
+        self._reparse_with_roots([self.rootA])
+        refs = self._refs(self.main_md)
+        # Resolved to the LOCAL copy beside the doc, not rootA's.
+        self.assertEqual(len(refs), 1)
+        self.assertEqual(
+            refs[0].md_abspath,
+            os.path.realpath(os.path.join(self.docdir, 'target.md')))
+        # ...confirmed by its heading.
+        sub = self.r.get_children(refs[0].id)
+        self.assertEqual([(k.tag, k.title) for k in sub],
+                         [('h1', 'Local target')])
+
+    # --- precedence: first-listed root wins ------------------------------
+
+    def test_first_root_wins_when_both_have_ref(self):
+        # Two roots both contain the ref → the FIRST-listed root wins.
+        rootB = os.path.join(self.dir, 'rootB')
+        self._write(os.path.join(rootB, 'target.md'),
+                    '# B target\nb body\n')
+        # rootA already holds ``# Target heading``; list rootA first.
+        self._reparse_with_roots([self.rootA, rootB])
+        refs = self._refs(self.main_md)
+        # Resolved to rootA (first-listed), not rootB.
+        self.assertEqual(len(refs), 1)
+        self.assertEqual(
+            refs[0].md_abspath,
+            os.path.realpath(os.path.join(self.rootA, 'target.md')))
+        sub = self.r.get_children(refs[0].id)
+        self.assertEqual([(k.tag, k.title) for k in sub],
+                         [('h1', 'Target heading')])
+
+    def test_second_root_used_when_first_lacks_ref(self):
+        # The first root lacks the ref; resolution falls through to the second.
+        empty_root = os.path.join(self.dir, 'empty')
+        os.makedirs(empty_root)
+        self._reparse_with_roots([empty_root, self.rootA])
+        refs = self._refs(self.main_md)
+        self.assertEqual(len(refs), 1)
+        self.assertEqual(
+            refs[0].md_abspath,
+            os.path.realpath(os.path.join(self.rootA, 'target.md')))
+        sub = self.r.get_children(refs[0].id)
+        self.assertEqual([(k.tag, k.title) for k in sub],
+                         [('h1', 'Target heading')])
+
+    # --- nonexistent root is non-fatal (handled at parse time) -----------
+
+    def test_nonexistent_root_does_not_break_resolution(self):
+        # A bogus root never reaches ``_ROOTS`` (``_resolve_roots`` drops it),
+        # so resolution against the surviving real root still works. We model
+        # the post-parse state: only the valid root is in ``_ROOTS``.
+        self._reparse_with_roots([self.rootA])  # bogus already filtered out
+        refs = self._refs(self.main_md)
+        self.assertEqual(len(refs), 1)
+        self.assertEqual(
+            refs[0].md_abspath,
+            os.path.realpath(os.path.join(self.rootA, 'target.md')))
+
+    # --- preview of the ref under the umbrella ---------------------------
+
+    def test_ref_preview_renders_target_body(self):
+        # The referenced file's preview (slice of its body) is available once
+        # resolved through the root.
+        self._reparse_with_roots([self.rootA])
+        refs = self._refs(self.main_md)
+        preview = self.r.get_preview(refs[0].id)
+        self.assertIn('Target heading', preview)
+
+
 class TestRootLabelMap(unittest.TestCase):
     """``_root_label_map`` — always project-root-relative labeling (ticket #735).
 
@@ -4750,6 +5118,128 @@ class TestStdinDocument(unittest.TestCase):
                                  'no external tool should run for stdin')
                 self.assertEqual(len(ctx.flashes), 1)
                 self.assertIn('stdin', ctx.flashes[0])
+
+    # -- stdin doc reference suppression: on without --root, off with it --
+
+    def test_stdin_without_root_suppresses_references(self):
+        # Without ``--root``, a piped document's relative ``.md`` refs are
+        # fully suppressed (today's behavior): the stdin root has no
+        # References umbrella even when the referenced file exists in cwd.
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, 'target.md'), 'w') as f:
+                f.write('# Target\n')
+            cwd = os.getcwd()
+            os.chdir(tmp)
+            try:
+                # Reload so ``_STDIN_PATH`` is anchored under this cwd (where
+                # ``target.md`` exists) — proving suppression, not a failed
+                # resolve, is what keeps the umbrella away.
+                self.r = _load_recipe()
+                self._run_main('# Piped\nsee target.md\n')
+                root_id = ('file', self.r._STDIN_PATH)
+                kids = self.r.get_children(root_id)
+                self.assertFalse(any(k.tag == 'links' for k in kids),
+                                 'stdin refs must stay suppressed without --root')
+                fs = self.r._FILES[self.r._STDIN_PATH]
+                # The arrow comes only from the h1, never from a ref.
+                self.assertEqual([k.tag for k in kids], ['h1'])
+            finally:
+                os.chdir(cwd)
+
+    def test_stdin_with_root_lifts_suppression_and_resolves(self):
+        # With ``--root DIR``, the piped doc's refs resolve against the
+        # supplied root: the References umbrella appears and expanding it
+        # yields the referenced file (cross-file expansion works).
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, 'root')
+            os.mkdir(root)
+            with open(os.path.join(root, 'target.md'), 'w') as f:
+                f.write('# Target heading\nbody\n')
+            # ``target.md`` is NOT in cwd (the repo root): only the supplied
+            # root can resolve it, so this exercises the root, not a fallback.
+            self.r = _load_recipe()
+            self._run_main(
+                '# Piped\nsee target.md\n',
+                argv=('browse-md', '--root', root, '-'))
+            # The supplied root landed in ``_ROOTS``.
+            self.assertEqual(self.r._ROOTS, [root])
+            root_id = ('file', self.r._STDIN_PATH)
+            kids = self.r.get_children(root_id)
+            umbrellas = [k for k in kids if k.tag == 'links']
+            self.assertEqual(len(umbrellas), 1,
+                             'stdin doc should gain a References umbrella')
+            refs = self.r.get_children(umbrellas[0].id)
+            # The ref resolved against the supplied root (its abspath; the
+            # display label may be the abspath since it lies outside cwd/root).
+            self.assertEqual(len(refs), 1)
+            self.assertEqual(
+                refs[0].md_abspath,
+                os.path.realpath(os.path.join(root, 'target.md')))
+            # Cross-file expansion: the ref drills into target's heading.
+            sub = self.r.get_children(refs[0].id)
+            self.assertEqual([(k.tag, k.title) for k in sub],
+                             [('h1', 'Target heading')])
+
+    def test_stdin_with_root_preview_of_ref(self):
+        # The referenced file's preview is reachable from the stdin doc once a
+        # root resolves it.
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, 'root')
+            os.mkdir(root)
+            with open(os.path.join(root, 'target.md'), 'w') as f:
+                f.write('# Target heading\ntarget body\n')
+            self.r = _load_recipe()
+            self.r._MD_COLOR = False
+            self._run_main(
+                '# Piped\nsee target.md\n',
+                argv=('browse-md', '--root', root, '-'))
+            root_id = ('file', self.r._STDIN_PATH)
+            umbrella = [k for k in self.r.get_children(root_id)
+                        if k.tag == 'links'][0]
+            ref = self.r.get_children(umbrella.id)[0]
+            self.assertIn('Target heading', self.r.get_preview(ref.id))
+
+    def test_stdin_with_nonexistent_root_warns_non_fatal(self):
+        # A bogus ``--root`` warns to stderr but does not abort: the stdin
+        # document still loads. With no valid root the refs stay suppressed.
+        self.r = _load_recipe()
+        self._run_main(
+            '# Piped\nsee target.md\n',
+            argv=('browse-md', '--root', '/no/such/dir/here', '-'))
+        self.assertIn('--root: not a directory: /no/such/dir/here',
+                      self._stderr)
+        # Non-fatal: the stdin doc loaded normally.
+        self.assertEqual(self.r._INPUT_FILES, [(self.r._STDIN_PATH, '')])
+        self.assertEqual(self.r._ROOTS, [])
+        root_id = ('file', self.r._STDIN_PATH)
+        kids = self.r.get_children(root_id)
+        self.assertFalse(any(k.tag == 'links' for k in kids))
+
+    def test_root_equals_form_resolved_relative_to_cwd(self):
+        # ``--root=DIR`` (the inline form) is accepted, and a RELATIVE DIR is
+        # resolved against the startup cwd.
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            os.mkdir(os.path.join(tmp, 'root'))
+            with open(os.path.join(tmp, 'root', 'target.md'), 'w') as f:
+                f.write('# T\n')
+            cwd = os.getcwd()
+            os.chdir(tmp)
+            try:
+                self.r = _load_recipe()
+                self._run_main(
+                    '# Piped\nsee target.md\n',
+                    argv=('browse-md', '--root=root', '-'))
+            finally:
+                os.chdir(cwd)
+            self.assertEqual(self.r._ROOTS, [os.path.join(tmp, 'root')])
 
 
 class _RaiseOnRead:

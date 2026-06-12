@@ -313,5 +313,103 @@ class TestBrowseMdStdin(unittest.TestCase):
                 t.send('q')
 
 
+class TestBrowseMdRoot(unittest.TestCase):
+    """``--root DIR`` extends reference resolution to extra base directories.
+
+    End-to-end against the shipped binary: a document references a ``.md`` file
+    that exists ONLY under a supplied ``--root`` (not the document's own
+    directory / cwd / git-root), so without the flag the reference would be
+    silently unresolvable. With it the ``[links]`` References umbrella appears
+    and expands into the referenced file. Covers both the file-mode doc and the
+    stdin (``-``) doc — for stdin the flag is what lifts the otherwise-total
+    reference suppression.
+
+    The doc and the root live in SEPARATE temp dirs (neither under a ``.git``),
+    so the referenced file is outside the doc's resolution defaults and its
+    display label is the absolute path — which still contains ``target.md`` as
+    a screen witness.
+    """
+
+    def _make_fixture(self, tmp):
+        """Write ``docdir/main.md`` (refs ``target.md``) + ``rootA/target.md``.
+
+        Returns ``(main_md, rootA)``. ``main.md`` has a single h1 and a bare
+        relative ``target.md`` token; ``target.md`` lives only under ``rootA``
+        and carries its own heading so the expanded ref shows structure.
+        """
+        docdir = os.path.join(tmp, 'docdir')
+        rootA = os.path.join(tmp, 'rootA')
+        os.makedirs(docdir)
+        os.makedirs(rootA)
+        main_md = os.path.join(docdir, 'main.md')
+        with open(main_md, 'w') as f:
+            f.write('# Main heading\nsee target.md for the rest\n')
+        with open(os.path.join(rootA, 'target.md'), 'w') as f:
+            f.write('# Target heading\nbody\n')
+        return main_md, rootA
+
+    def _expand_references(self, t):
+        """Move the cursor onto the ``References`` umbrella row and expand it.
+
+        The single-file startup auto-expands the file root, so its children —
+        the lone ``[h1]`` heading and the ``[links] References`` umbrella — are
+        on screen. Step Down twice (root → h1 → References) and press Right to
+        expand the umbrella, revealing the referenced file row.
+        """
+        t.wait_for('References', timeout=6.0)
+        t.send('Down')   # file root -> [h1] Main heading
+        t.send('Down')   # -> [links] References
+        t.send('Right')  # expand the umbrella
+
+    def test_file_mode_ref_resolves_only_via_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            main_md, rootA = self._make_fixture(tmp)
+            with TmuxFixture(cols=100, rows=40) as t:
+                t.launch(_BIN, '--run-py', _RECIPE, '--root', rootA, main_md)
+                # The file's own heading renders, and — because the ref
+                # resolves via --root — a References umbrella appears.
+                t.wait_for('Main heading', timeout=6.0)
+                self._expand_references(t)
+                # The referenced file (resolved under rootA) shows up; its
+                # label is the abspath, which contains 'target.md'.
+                t.wait_for('target.md', timeout=4.0)
+                t.send('q')
+
+    def test_file_mode_without_root_has_no_references(self):
+        # Control: the SAME doc without --root has no resolvable ref, so no
+        # References umbrella ever renders (today's behavior, unchanged).
+        with tempfile.TemporaryDirectory() as tmp:
+            main_md, _rootA = self._make_fixture(tmp)
+            with TmuxFixture(cols=100, rows=40) as t:
+                t.launch(_BIN, '--run-py', _RECIPE, main_md)
+                t.wait_for('Main heading', timeout=6.0)
+                cap = t.wait_stable(timeout=3.0)
+                self.assertNotIn(
+                    'References', cap,
+                    f'no References umbrella without --root; capture:\n{cap}')
+                t.send('q')
+
+    def test_stdin_doc_ref_resolves_via_root(self):
+        # The piped doc's refs are suppressed by default; --root lifts that and
+        # resolves them against the root, surfacing the References umbrella.
+        with tempfile.TemporaryDirectory() as tmp:
+            main_md, rootA = self._make_fixture(tmp)
+            with TmuxFixture(cols=100, rows=40) as t:
+                line = '{bin} --run-py {recipe} --root {root} - < {doc}'.format(
+                    bin=shlex.quote(_BIN),
+                    recipe=shlex.quote(_RECIPE),
+                    root=shlex.quote(rootA),
+                    doc=shlex.quote(main_md),
+                )
+                t.send_line(line)
+                # The stdin row is titled ``-``; its heading renders, and the
+                # ref resolves via --root into a References umbrella.
+                t.wait_for(_RE_STDIN_ROW, timeout=6.0)
+                t.wait_for('Main heading', timeout=4.0)
+                self._expand_references(t)
+                t.wait_for('target.md', timeout=4.0)
+                t.send('q')
+
+
 if __name__ == '__main__':
     unittest.main()

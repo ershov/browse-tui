@@ -471,7 +471,7 @@ def md_heading_trigger(text):
     return _MD_HEADING_TRIGGER_RE.search(text) is not None
 
 
-def resolve_md_ref(captured, *, doc_dir, cwd, project_root):
+def resolve_md_ref(captured, *, doc_dir, cwd, project_root, extra_bases=()):
     """Resolve a captured ``.md`` token to an existing absolute path, or None.
 
     Tries candidate bases in order and returns the FIRST one that exists on
@@ -481,8 +481,13 @@ def resolve_md_ref(captured, *, doc_dir, cwd, project_root):
          ``expanduser`` (already rooted, so no base is joined);
       2. relative to ``doc_dir`` — the referencing document's own directory
          (the CommonMark norm; for an inline document ``doc_dir == cwd``);
-      3. relative to ``cwd`` — the record's working directory;
-      4. relative to ``project_root`` — the git/project root.
+      3. relative to each of ``extra_bases`` in order — caller-supplied
+         candidate roots (e.g. ``browse-md``'s repeatable ``--root DIR``), so a
+         document whose real root is somewhere the defaults don't reach still
+         resolves. Empty by default, which leaves the candidate list — and so
+         every resolution — exactly as it was before this hook existed;
+      4. relative to ``cwd`` — the record's working directory;
+      5. relative to ``project_root`` — the git/project root.
 
     Returns ``os.path.realpath`` of the first existing candidate (canonical, so
     callers can dedup by plain string compare), or ``None`` if none exists.
@@ -493,8 +498,12 @@ def resolve_md_ref(captured, *, doc_dir, cwd, project_root):
         # Absolute (or ``~``-expanded to absolute) — used directly, no base.
         candidates = [expanded]
     else:
-        candidates = [
-            os.path.join(doc_dir, captured),
+        # ``doc_dir`` first (CommonMark norm), then the caller's extra roots,
+        # then the ``cwd`` / ``project_root`` fallbacks. With no extra roots the
+        # list is the original ``[doc_dir, cwd, project_root]``.
+        candidates = [os.path.join(doc_dir, captured)]
+        candidates += [os.path.join(base, captured) for base in extra_bases]
+        candidates += [
             os.path.join(cwd, captured),
             os.path.join(project_root, captured),
         ]
