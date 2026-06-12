@@ -1056,6 +1056,18 @@ any scroll keys take effect once the new content swaps in. A *delivered* empty
 preview (`''`, including `None` coerced to `''`) is a real result and blanks
 the pane once the cursor settles; only an unsettled or undelivered row holds.
 
+The children pane holds and settles together with the preview: during a scroll
+burst it keeps showing the previous row's children (or stays hidden, if that
+row was a leaf) instead of reshaping per row, then swaps in the same paint
+that swaps the preview — the two panes always describe the same row. Children
+fetches still start on every cursor move, so they are usually cached by the
+time the cursor settles and the swap is content-to-content; when a
+`get_children` is still running at settle time, the pane shows its
+`⧗ loading…` row for the newly settled branch — only after settle, never for
+rows the cursor merely skimmed — and fills in when the fetch lands. With
+`show_preview=False` there is no settle signal and the children pane follows
+the cursor immediately, as before.
+
 Whenever a fetch for the cursored row is outstanding, the right-aligned pane
 label reads `⧗ Preview` instead of `Preview` — through the debounce wait, the
 fetch itself, and an actively streaming generator. It reverts to `Preview` on

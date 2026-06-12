@@ -1692,6 +1692,19 @@ class TestDispatchMouseLayouts(unittest.TestCase):
             restore()
             b.stop_workers()
 
+    def _seed_children_display(self, b, parent_id):
+        """Settle the children pane's displayed parent (#959).
+
+        The dispatcher sizes the grid from ``_children_displayed_id``
+        (resolved through ``_items_by_id``) — the same subject the
+        renderer paints — not the live cursor. These tests drive
+        ``_dispatch_mouse`` without the main loop, so seed the settled
+        state the loop's advance rule would have produced.
+        """
+        for it in b._state._children[None]:
+            b._state._items_by_id[it.id] = it
+        b._children_displayed_id = parent_id
+
     def test_dispatch_mouse_vertical_with_children(self):
         # Per #166 layout 'v' is structurally identical to 'pc':
         # ``list | (children-above-preview)`` — children is a ROW at the
@@ -1705,6 +1718,7 @@ class TestDispatchMouseLayouts(unittest.TestCase):
             *[Item(id=f'I{i}') for i in range(1, 5)],
         ]
         b._state.cursor = 0
+        self._seed_children_display(b, 'I0')
         restore = self._patch_term(120, 40)
         try:
             ctx = _ctx_for(b)
@@ -1762,6 +1776,7 @@ class TestDispatchMouseLayouts(unittest.TestCase):
             *[Item(id=f'I{i}') for i in range(1, 5)],
         ]
         b._state.cursor = 0
+        self._seed_children_display(b, 'I0')
         restore = self._patch_term(120, 60)
         try:
             ctx = _ctx_for(b)
@@ -1804,6 +1819,7 @@ class TestDispatchMouseLayouts(unittest.TestCase):
             *[Item(id=f'I{i}') for i in range(1, 5)],
         ]
         b._state.cursor = 0
+        self._seed_children_display(b, 'I0')
         restore = self._patch_term(120, 60)
         try:
             ctx = _ctx_for(b)
@@ -1814,11 +1830,11 @@ class TestDispatchMouseLayouts(unittest.TestCase):
             list_rect = layout['list']
             preview_rect = layout['preview']
             children_rect = layout.get('children')
-            # Click left → list. Land on row 0 (item I0) so the cursor
-            # stays on the branch with children — the dispatcher
-            # re-derives the layout per click using the cursor's children
-            # to size the grid, so a click that moved the cursor onto a
-            # leaf would collapse the children pane.
+            # Click left → list. Land on row 0 (item I0) so the
+            # displayed parent stays honest — the dispatcher re-derives
+            # the layout per click from the DISPLAYED parent's children
+            # (#959), which only re-advances off I0 once a later settle
+            # lands.
             dispatch_key(b, ctx,
                          f'mouse-click:{list_rect.top + 0}:'
                          f'{list_rect.left + 1}')

@@ -1665,25 +1665,21 @@ def _preview_pane_height(browser):
 _WHEEL_LINES = 3
 
 
-def _cursor_item_for_dispatch(browser):
-    """Return the Item under the cursor for dispatch's layout sizing.
+def _children_displayed_item_for_dispatch(browser):
+    """Return the Item the children pane currently shows, for hit-testing.
 
-    Mirrors render.py's ``_cursor_item`` (only ``kind='normal'`` rows
-    have an Item). Returns ``None`` for placeholder / scope-root rows
-    or when the visible list is empty. The dispatcher uses this only
-    to size the children grid when computing the layout for hit-testing
-    — a None result simply collapses the grid the same way it does in
-    the renderer.
+    Mirrors render.py's ``_children_displayed_item`` (#959): the pane
+    renders the settled ``_children_displayed_id``, not the live
+    cursor, so the dispatcher must size the grid from the same item —
+    otherwise clicks landing during a settle hold would be hit-tested
+    against a layout that isn't on screen. A ``None`` result (nothing
+    displayed yet, or the parent was removed by a data update) simply
+    collapses the grid the same way it does in the renderer.
     """
-    state = browser._state
-    vis = visible_items(state)
-    cur = state.cursor
-    if not (0 <= cur < len(vis)):
+    id_ = browser._children_displayed_id
+    if id_ is None:
         return None
-    entry = vis[cur]
-    if entry.kind != 'normal':
-        return None
-    return entry.item
+    return browser._state._items_by_id.get(id_)
 
 
 def _dispatch_mouse(browser, ctx, key):
@@ -1721,17 +1717,17 @@ def _dispatch_mouse(browser, ctx, key):
     except Exception:
         return True
     # Match the rendered layout exactly: the children grid sizes itself
-    # from the cursor item's cached children (see ``_layout_for`` in
-    # 050-render). The dispatcher must use the same children_rows_needed
-    # so a click on a column the user can see actually routes to the
-    # pane that's drawn there. Falling back to 0 (no children) matches
-    # the conservative pre-#152 behaviour for headless tests where the
-    # render helpers aren't injected.
+    # from the DISPLAYED parent's cached children (#959; see
+    # ``_layout_for`` in 050-render). The dispatcher must use the same
+    # children_rows_needed so a click on a column the user can see
+    # actually routes to the pane that's drawn there. Falling back to 0
+    # (no children) matches the conservative pre-#152 behaviour for
+    # headless tests where the render helpers aren't injected.
     children_rows_needed = 0
     if browser.show_children_pane:
-        cur_item = _cursor_item_for_dispatch(browser)
-        if cur_item is not None and getattr(cur_item, 'has_children', False):
-            cached = browser._state._children.get(cur_item.id)
+        shown = _children_displayed_item_for_dispatch(browser)
+        if shown is not None and getattr(shown, 'has_children', False):
+            cached = browser._state._children.get(shown.id)
             sub_needed = globals().get('_sub_needed_rows')
             if cached:
                 if sub_needed is not None:

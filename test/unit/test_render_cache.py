@@ -902,6 +902,10 @@ class TestVacatedPaneClear(_RenderCacheBase):
             it.preview = 'pv-{}'.format(iid)
         _state.mark_visible_dirty(b._state)
         b._state.cursor = 0  # on branch A
+        # Settled display (#959): layout + renderers size the pane from
+        # the displayed parent, advanced by the main loop at settle —
+        # these tests drive the renderers directly, so seed it.
+        b._children_displayed_id = 'A'
         return b
 
     def test_children_pane_cleared_when_branch_becomes_leaf(self):

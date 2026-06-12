@@ -161,8 +161,13 @@ class TestChildrenPaneRedraw(unittest.TestCase):
                 f'{screen_a1}')
 
             # Press Left — cursor should jump back to A. Children pane
-            # MUST now show A's children (a1, a2) again.
+            # MUST now show A's children (a1, a2) again. The pane swaps
+            # together with the preview when the revisit settles (#959 /
+            # #954), and a holding screen is already "stable" — wait for
+            # A's preview to be (back) on screen, which the settle paint
+            # guarantees alongside the restored pane.
             t.send('Left')
+            t.wait_for('preview-of-A', timeout=3.0)
             t.wait_stable(timeout=3.0)
             screen_back = t.capture()
 

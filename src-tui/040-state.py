@@ -2028,12 +2028,15 @@ def mark_cursor_changed(browser) -> None:
     """Flag the redraw set for a cursor-position change.
 
     Any code path that moves ``state.cursor`` MUST call this helper —
-    the list pane needs to repaint the new selected row, the children
-    grid needs to refresh to reflect the new cursor item's children,
-    and the preview pane needs to re-render the new cursor item's
-    preview text. Forgetting any one of those leaves a stale pane
-    until the next user keystroke (regression in #206 / commit
-    0c8769d, fix tracked under #223).
+    the list pane needs to repaint the new selected row, the preview
+    pane needs to re-render (or hold, §B) for the new cursor item,
+    and the children grid gets a repaint of its held content (#959:
+    the grid renders the displayed parent, which lags the cursor
+    until the preview settles — its CONTENT changes via the advance
+    rule's ``'all'`` flag and children deliveries, and the row cache
+    no-ops an unchanged held paint). Forgetting any one of those
+    leaves a stale pane until the next user keystroke (regression in
+    #206 / commit 0c8769d, fix tracked under #223).
 
     Centralising the set here means new cursor-move sites just call
     one function instead of recopying a hand-written triplet. Also
@@ -3729,6 +3732,17 @@ class Browser:
         # docs/superpowers/specs/2026-05-27-children-prefetch-slot-design.md.
         self._children_prefetch_req = None
         self._children_prefetch_local_id = None
+
+        # Children-pane displayed id (#959): the parent id the children
+        # pane currently RENDERS. Lags the cursor — advanced by the
+        # main loop's per-tick rule (``_advance_children_displayed_id``)
+        # only once the preview settles on the cursored row, so the
+        # pane always describes the same row the preview pane does:
+        # old/old during a scroll burst, new/new (or new + loading
+        # hint) in the settle paint, never new-preview/old-children.
+        # Main-thread render-side state only; the request pipeline
+        # above keeps following the live cursor.
+        self._children_displayed_id = None
 
         # Preview worker: post-queue delivery + local-id dedup (#442).
         # The worker keeps a ``local_id`` of the most recently fetched
@@ -5943,10 +5957,11 @@ class Browser:
             # ``on_empty`` (§3.4).
             self._clamp_cursor_landable(self._state.cursor)
             self._needs_redraw.add('list')
-            # The cache may have just filled the cursor item's
-            # children — flag the grid pane for redraw too. Render-time
-            # checks gate the actual paint so this is harmless when the
-            # grid is hidden / disabled.
+            # The cache may have just filled the DISPLAYED parent's
+            # children (#959: the grid renders the displayed id, which
+            # is usually the settled cursor row) — flag the grid pane
+            # for redraw too. Render-time checks gate the actual paint
+            # so this is harmless when the grid is hidden / disabled.
             self._needs_redraw.add('children')
             # Layout depends on grid sizing: when the grid was hidden
             # waiting for children to arrive, the preview now needs to
@@ -6706,9 +6721,11 @@ class Browser:
         # ``on_empty`` (§3.4).
         self._clamp_cursor_landable(state.cursor)
         self._needs_redraw.add('list')
-        # Cache may have just filled the cursor item's children — flag
-        # the grid pane for redraw too. Render-time checks gate the
-        # actual paint so this is harmless when the grid is hidden.
+        # Cache may have just filled the DISPLAYED parent's children
+        # (#959: the grid renders the displayed id, which is usually
+        # the settled cursor row) — flag the grid pane for redraw too.
+        # Render-time checks gate the actual paint so this is harmless
+        # when the grid is hidden.
         self._needs_redraw.add('children')
         # Layout depends on grid sizing: when the grid was hidden
         # waiting for children to arrive, the preview now needs to
@@ -7461,6 +7478,13 @@ class Browser:
                 # once-per-tick memo check needs no per-site wiring.
                 self._flag_preview_loading_if_changed()
 
+                # Children-pane displayed-id advance (#959): the pane
+                # follows the preview's settle, not the cursor, so the
+                # two panes always describe the same row. Runs after
+                # the drain so a delivery that just set the per-visit
+                # bit advances (and repaints) in this same tick.
+                self._advance_children_displayed_id()
+
                 # Post-drain lifecycle-hook settle pass. NOTE: this is
                 # only PART of the hook firing — ``on_scope_change`` and
                 # ``on_selection_change`` already fired synchronously at
@@ -7960,6 +7984,57 @@ class Browser:
         if loading != self._preview_loading_memo:
             self._preview_loading_memo = loading
             self._needs_redraw.update(('preview', 'info'))
+
+    def _advance_children_displayed_id(self) -> None:
+        """Advance the children pane's displayed parent id (#959).
+
+        Called by the main loop once per tick, next to the loading-
+        label memo. The children pane renders ``_children_displayed_id``
+        — not the live cursor — so during a scroll burst it keeps
+        describing the row the preview pane still shows, and both
+        panes swap in the same paint. The advance target is the
+        visible cursor entry:
+
+          * normal row — advance only once the preview visit has
+            settled (``_preview_visit_delivered``: a delivery, an
+            apply-path write, or the worker's settle nudge). With
+            ``show_preview`` off the bit keeps its ``True`` init —
+            ``_update_preview_for_cursor`` returns before ever
+            clearing it — so this degrades to advance-every-tick,
+            the pre-#959 immediate pane.
+          * meta row — advance immediately. Mirrors the #940 meta
+            exemption: no preview is ever requested for meta rows, so
+            no delivery would end a settle gate, and the preview pane
+            paints meta rows honestly right away — the children pane
+            must match rather than keep describing the previous
+            branch. Navigation skips meta rows, so this can't fire
+            mid-scroll.
+          * pending placeholder / no cursor row — hold (no advance).
+            A placeholder holds both panes (the preview keeps its
+            snapshot); an empty visible list blanks the preview while
+            this pane holds — deliberate: hold-on-no-cursor is the
+            contract.
+
+        An actual id change flags a full repaint: the pane's geometry
+        derives from the displayed item (``_layout_for`` sizes the
+        grid from its cached children), so an id change can reshape
+        the layout — the same ``'all'`` a children delivery flags
+        today. Cost is once per settle, not per cursor move.
+        """
+        if not self.show_children_pane:
+            return
+        state = self._state
+        vis = visible_items(state)
+        if not (0 <= state.cursor < len(vis)):
+            return
+        entry = vis[state.cursor]
+        if entry.kind == 'pending':
+            return
+        if entry.kind == 'normal' and not self._preview_visit_delivered:
+            return
+        if entry.item.id != self._children_displayed_id:
+            self._children_displayed_id = entry.item.id
+            self._needs_redraw.add('all')
 
     def _update_preview_for_cursor(self) -> None:
         """Request a preview fetch for the current cursor item.

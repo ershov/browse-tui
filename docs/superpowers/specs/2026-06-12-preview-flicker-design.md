@@ -37,12 +37,16 @@ Three independent, composable changes:
 * **C. Loading indicator** — a `⧗ ` prefix on the right-aligned
   `Preview` label while a fetch for the cursored item is outstanding, so
   held-over content is distinguishable from settled content.
+* **D. Children pane settles with the preview** (#959 follow-up) — the
+  children pane renders a displayed parent id that lags the cursor
+  until the preview settles, so the grid stops reshaping mid-scroll
+  and both panes always describe the same row.
 
-Together: a held `j` shows the original preview steadily with `⧗`
-in the divider; after the cursor settles, one fetch fires and the pane
-swaps once. Cached rows behave identically (#954) — the only
-difference is that the settled row is served from cache (no
-`get_preview` re-run) instead of fetched.
+Together: a held `j` shows the original preview *and* the original
+children grid steadily with `⧗` in the divider; after the cursor
+settles, one fetch fires and both panes swap in one paint. Cached rows
+behave identically (#954) — the only difference is that the settled
+row is served from cache (no `get_preview` re-run) instead of fetched.
 
 ## A. Debounce in `_preview_worker`
 
@@ -229,6 +233,75 @@ loop: cursor moves happen in-loop, deliveries post + wake, and the
 streaming pause/exhaustion paths call `notify_wake()`. The row cache
 no-ops whichever of the two paints didn't actually change.
 
+## D. Children pane settles with the preview (#959)
+
+With A–C in place the children pane became the remaining churn: its
+subject was the live cursor, so a scroll burst reshaped the grid (and
+the whole layout — the pane's height derives from its content) on
+every row, and after the burst the pane described the new row while
+the preview still held the old one. The invariant this section adds:
+the children pane always describes the same row the preview pane does
+— old/old before settle, new/new (or new + loading hint) in the
+settle paint, never new-preview/old-children.
+
+### Displayed-id lag
+
+`Browser._children_displayed_id` — the parent id the children pane
+currently renders. The render layer (`_layout_for`,
+`render_children_grid`, `render_children_list`, and the mouse
+dispatcher's layout mirror) resolves the pane's subject from it via
+`_items_by_id` instead of from the cursor. The children REQUEST
+pipeline (prefetch slot, FIFO, worker, `_update_children_for_cursor`)
+is untouched and keeps following the live cursor — only DISPLAY lags,
+so fetches still start at move time and are usually cached by settle.
+
+A displayed parent that a data update has removed resolves to `None`
+and the pane hides — honest (the branch is gone), and the next settle
+re-advances.
+
+### Advance rule
+
+The main loop advances the id once per tick (next to the §C label
+memo; inert when the pane is disabled), resolving the visible cursor
+entry:
+
+* **normal row** — advance only when `_preview_visit_delivered` is
+  set (§B): the preview's settle signal is the pane's swap signal,
+  which is what makes the swap joint. With `show_preview` off the bit
+  keeps its `True` init (the preview helper returns before ever
+  clearing it), so the rule degrades to advance-every-tick — the
+  pre-#959 immediate pane. Verified, not special-cased.
+* **meta row** — advance immediately. Mirrors the §B meta exemption:
+  no preview is ever requested for meta rows, so no delivery would end
+  a settle gate, and the preview paints meta rows honestly right away
+  — the pane must match rather than keep describing the previous
+  branch. Navigation skips meta, so this can't fire mid-scroll.
+* **pending placeholder / no cursor row** — hold. A placeholder holds
+  both panes (the preview keeps its snapshot, §B); an empty visible
+  list blanks the preview while the children pane holds — deliberate:
+  hold-on-no-cursor is the contract.
+
+An actual id change flags `'all'`: the pane's geometry derives from
+the displayed item, so an id change can reshape the layout — the same
+full repaint a children delivery flags today. Cost is once per
+settle, not per move.
+
+### What falls out (no special cases)
+
+* Children cached by settle time (the usual case — the fetch started
+  at move time) → the settle paint swaps preview and pane together.
+* Children still in flight at settle → the same paint shows the new
+  preview and the existing cached-is-`None` rendering for the NEW
+  branch: the one-row `⧗ loading…` hint, which the delivery's
+  existing `'all'`-flag + wake then grows into the grid. The hint can
+  only ever appear for the settled row — never for rows the cursor
+  merely skimmed.
+* Leaf at settle → the pane hides in the settle paint, not mid-scroll.
+* `clear_children` on the settled row → the hint reappears (id
+  unchanged, cache `None`) and regrows on the re-delivery; the
+  cursor-based re-fire in `_update_children_for_cursor` covers the
+  refetch.
+
 ## Out of scope / rejected
 
 * **Adaptive debounce** (immediate fetch on the first move after quiet,
@@ -254,6 +327,17 @@ no-ops whichever of the two paints didn't actually change.
   `read_key` has no timeout, so an idle loop would never wake to end
   the settle without new wake machinery. The worker already owns the
   settle wait.
+* **Children fetched by the preview worker, delivered as one batch**
+  (#959) — rejected: serializes the two fetches behind one thread,
+  breaks `get_children`'s single-thread contract (it would now run on
+  the preview worker too), and needs cross-worker dedup/waiting
+  against the children pipeline. The displayed-id lag gets the joint
+  swap from rendering alone.
+* **Joint release that also delays the preview on slow children**
+  (#959) — holding the preview hostage to the slower fetch punishes
+  the common case; superseded by the hint-at-settle rule (§D), which
+  swaps the preview on time and is honest about the children still
+  loading.
 
 ## Testing
 
@@ -275,6 +359,15 @@ no-ops whichever of the two paints didn't actually change.
 * **Indicator:** label is `⧗ Preview` during debounce + fetch and while
   a stream pulls; drops to `Preview` on delivery, on exhaustion, and
   while paused at the cap; reappears on demand-resume.
+* **Children settle (#959, headless render + UI):** the displayed id
+  holds through an open visit and advances (flagging `'all'`, once)
+  when the delivery bit flips; both delivery orderings (cached by
+  settle → one paint swaps both panes; still fetching → settle paint
+  shows hint for the new branch, grows on delivery); leaf-hide
+  deferred to settle; placeholder/empty hold; meta advances
+  immediately; `show_preview=False` degrades to per-move advance;
+  removed displayed parent hides the pane; `clear_children` on the
+  settled row re-hints and regrows.
 * **Suite impact:** the 0.15 s default adds latency wherever existing
   tests await a preview delivery. Expectation: most waits use the 2 s
   `run_until_idle` default and just get slower; any test that becomes

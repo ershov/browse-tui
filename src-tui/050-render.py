@@ -2252,21 +2252,21 @@ def _cursor_id(browser):
     return None
 
 
-def _cursor_item(browser):
-    """Return the Item under the cursor (only for ``kind='normal'``).
+def _children_displayed_item(browser):
+    """Return the Item the children pane currently describes (#959).
 
-    Returns None for placeholder rows / scope-root rows / empty visible
-    list — the children grid only meaningfully renders for a cursor on
-    a real item.
+    The pane renders ``browser._children_displayed_id`` — advanced by
+    the main loop only once the preview settles on the cursored row —
+    rather than the live cursor, so during a scroll burst it keeps
+    matching the held preview and both panes swap in one paint.
+    Resolves through ``_items_by_id`` so a displayed parent removed by
+    a data update yields ``None`` and the pane hides (honest; the next
+    settle re-advances).
     """
-    vis = visible_items(browser._state)
-    cur = browser._state.cursor
-    if not (0 <= cur < len(vis)):
+    id_ = browser._children_displayed_id
+    if id_ is None:
         return None
-    entry = vis[cur]
-    if entry.kind != 'normal':
-        return None
-    return entry.item
+    return browser._state._items_by_id.get(id_)
 
 
 def render_children_grid(browser, rect, *, info=False, has_header=True,
@@ -2285,17 +2285,22 @@ def render_children_grid(browser, rect, *, info=False, has_header=True,
     (used by non-'h' layouts where the info bar lives at the bottom of
     the screen).
 
-    The children come from ``browser._state._children.get(cursor_item.id, [])``
-    — direct children of the cursor item, fetched lazily by the
-    children worker.
+    The pane's subject is the DISPLAYED parent (#959) —
+    ``_children_displayed_item``, which lags the cursor until the
+    preview settles — and the children come from
+    ``browser._state._children.get(parent.id, [])``, fetched lazily by
+    the children worker (whose requests keep following the live cursor).
 
     Behaviour:
-      * Cursor on a leaf or empty cached children → blank content area
-        (the layout normally already set ``sub_height = 0`` to elide
-        the pane entirely; we render defensively).
-      * Cursor on a branch whose children aren't cached yet → single
+      * Displayed parent is a leaf or has empty cached children →
+        blank content area (the layout normally already set
+        ``sub_height = 0`` to elide the pane entirely; we render
+        defensively).
+      * Displayed branch whose children aren't cached yet → single
         ``⧗ loading…`` row in dim, mirroring the placeholder used in
-        the list pane.
+        the list pane. Because the displayed id only advances at
+        settle, this hint appears for the settled row — never for
+        rows skimmed mid-scroll.
       * Cached children → multi-column flowed layout via ``_sub_layout``
         / ``_distribute_to_columns``. Each entry's tag picks up its
         colour from ``_TAG_STYLE``.
@@ -2330,8 +2335,8 @@ def render_children_grid(browser, rect, *, info=False, has_header=True,
     if content_lines <= 0:
         return
 
-    cursor = _cursor_item(browser)
-    if cursor is None:
+    parent = _children_displayed_item(browser)
+    if parent is None:
         for i in range(content_lines):
             row = content_top + i
             rel_row = content_row_offset + i
@@ -2340,10 +2345,10 @@ def render_children_grid(browser, rect, *, info=False, has_header=True,
         return
 
     state = browser._state
-    children = state._children.get(cursor.id)
+    children = state._children.get(parent.id)
 
-    # Pending: cursor on a branch whose children aren't cached yet.
-    if children is None and cursor.has_children:
+    # Pending: displayed branch whose children aren't cached yet.
+    if children is None and parent.has_children:
         begin_row(cache, content_row_offset, content_top, left, right,
                   rightmost=rightmost)
         set_style(fg=_PENDING_FG)
@@ -2435,12 +2440,13 @@ def render_children_list(browser, rect, *, info=False, has_header=True,
 
     Used by the vertical (``split='v'``) layout per #176, where the
     children column sits between the list and the preview, occupying the
-    full body height. Each direct child of the cursor item is written on
-    its own row, truncated to the column width. The cursor item itself
-    is read from ``_cursor_item``; the children come from
-    ``browser._state._children.get(cursor.id, [])``.
+    full body height. Each direct child of the displayed parent is
+    written on its own row, truncated to the column width. The parent is
+    read from ``_children_displayed_item`` (#959 — it lags the cursor
+    until the preview settles); the children come from
+    ``browser._state._children.get(parent.id, [])``.
 
-    The header / no-cursor / loading / empty branches mirror
+    The header / no-parent / loading / empty branches mirror
     :func:`render_children_grid` so the two renderers degrade identically.
     """
     if rect is None or rect.height <= 0 or rect.width <= 0:
@@ -2472,8 +2478,8 @@ def render_children_list(browser, rect, *, info=False, has_header=True,
     if content_lines <= 0:
         return
 
-    cursor = _cursor_item(browser)
-    if cursor is None:
+    parent = _children_displayed_item(browser)
+    if parent is None:
         for i in range(content_lines):
             row = content_top + i
             rel_row = content_row_offset + i
@@ -2482,10 +2488,10 @@ def render_children_list(browser, rect, *, info=False, has_header=True,
         return
 
     state = browser._state
-    children = state._children.get(cursor.id)
+    children = state._children.get(parent.id)
 
-    # Pending: cursor on a branch whose children aren't cached yet.
-    if children is None and cursor.has_children:
+    # Pending: displayed branch whose children aren't cached yet.
+    if children is None and parent.has_children:
         begin_row(cache, content_row_offset, content_top, left, right,
                   rightmost=rightmost)
         set_style(fg=_PENDING_FG)
@@ -2904,20 +2910,24 @@ def render_info_bar(row, cols, label, *, info=False, browser=None,
 def _layout_for(browser):
     """Build the geometry dict from current terminal size + browser flags.
 
-    Cursor-aware: if ``show_children_pane`` is set and the cursor is on
-    a branch whose children are cached, we ask the multi-column layout
-    helpers how many content rows it would need and pass the answer to
-    ``layout_panes`` so the grid pane shrinks to fit. A cursor on a
-    leaf, or on a branch whose children haven't been fetched yet,
-    yields ``children_rows_needed=0`` *unless* the branch has children
-    (in which case we reserve one row for the ``⧗ loading…`` hint).
+    Children sizing follows the DISPLAYED parent (#959): if
+    ``show_children_pane`` is set and the displayed parent is a branch
+    whose children are cached, we ask the multi-column layout helpers
+    how many content rows it would need and pass the answer to
+    ``layout_panes`` so the grid pane shrinks to fit. A displayed leaf
+    (or no displayed parent yet) yields ``children_rows_needed=0``; a
+    displayed branch whose children haven't been fetched reserves one
+    row for the ``⧗ loading…`` hint. Because the displayed id only
+    advances when the preview settles, none of these transitions can
+    reshape the layout mid-scroll — the pane swaps, grows, or hides in
+    the settle paint, together with the preview.
     """
     cols, rows = term_size()
     children_rows = 0
     if browser.show_children_pane and not browser._headless:
-        cursor = _cursor_item(browser)
-        if cursor is not None and cursor.has_children:
-            cached = browser._state._children.get(cursor.id)
+        parent = _children_displayed_item(browser)
+        if parent is not None and parent.has_children:
+            cached = browser._state._children.get(parent.id)
             if cached:
                 # Route through ``children_grid_layout`` which
                 # recomputes via ``_sub_layout`` and stores the result
