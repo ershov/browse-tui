@@ -310,7 +310,25 @@ def _read_stdin_roots():
 
 def main():
     global _BROWSER, _STDIN_ROOTS
-    args = sys.argv[1:]
+    # The framework's ``--tty PATH`` / ``--tty=PATH`` flag is auto-detected
+    # by ``Browser.run()`` but NOT stripped from ``sys.argv``, so drop it
+    # (and the value after a bare ``--tty``) before reading the recipe's
+    # own positionals — otherwise ``browse-fs --tty -`` would mistake the
+    # flag value ``-`` for the stdin positional, and ``--tty /dev/pts/N``
+    # would mistake the device path for a root PATH. ``--tty=-`` is one
+    # token, so it never looks like a bare ``-`` either way.
+    args = []
+    skip_next = False
+    for a in sys.argv[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if a == '--tty':
+            skip_next = True  # consume the following VALUE token too
+            continue
+        if a.startswith('--tty='):
+            continue
+        args.append(a)
     # The lone ``-`` reads the root path list from stdin (spec §3.7).
     # Reading here — before ``b.run()`` / ``term_init`` — is deliberate:
     # fd 0 is still whatever the caller provided, so a pipe is consumed

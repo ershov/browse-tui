@@ -652,6 +652,61 @@ class TestStdinRoots(unittest.TestCase):
             self.assertEqual(self._config(b).root_id, os.path.abspath(d))
         self.assertIsNone(self.r._STDIN_ROOTS)
 
+    # -- --tty - is the framework UI-over-streams flag, not stdin -------
+
+    def test_tty_dash_value_is_not_the_stdin_positional(self):
+        # ``--tty -`` is the framework's UI-over-std-streams flag value
+        # (auto-detected by Browser.run(), left in sys.argv): the recipe
+        # must drop it, fall through to bare mode (browse cwd), and never
+        # read stdin. Same for the one-token ``--tty=-`` spelling and the
+        # device-path form ``--tty /dev/pts/N`` (the path is not a root).
+        with tempfile.TemporaryDirectory() as d:
+            cwd = os.getcwd()
+            os.chdir(d)
+            try:
+                for argv in (('browse-fs', '--tty', '-'),
+                             ('browse-fs', '--tty=-'),
+                             ('browse-fs', '--tty', '/dev/pts/9')):
+                    self.r = _load_recipe()
+                    # _RaiseOnRead fires if main() touches stdin here.
+                    b = self._run_main(_RaiseOnRead(), argv=argv)
+                    self.assertEqual(self._config(b).root_id, os.getcwd(),
+                                     argv)
+                    self.assertIsNone(self.r._STDIN_ROOTS, argv)
+            finally:
+                os.chdir(cwd)
+        # Contrast: a true positional ``-`` still enters stdin mode and
+        # reads the piped list (proving the strip didn't disarm ``-``).
+        self.r = _load_recipe()
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, 'real.txt'), 'w') as f:
+                f.write('x')
+            cwd = os.getcwd()
+            os.chdir(d)
+            try:
+                b = self._run_main('real.txt\n')
+                self.assertIsNone(self._config(b).root_id)
+                self.assertEqual([it.title for it in self.r.get_children(None)],
+                                 ['real.txt'])
+            finally:
+                os.chdir(cwd)
+
+    def test_tty_dash_combined_with_path_still_a_usage_error(self):
+        # Stripping ``--tty -`` must not weaken the ``- + PATH`` guard:
+        # ``browse-fs --tty - somepath -`` is still a genuine ``-`` plus a
+        # path positional, so it must exit via the usage error with stdin
+        # untouched.
+        with self.assertRaises(SystemExit) as cm:
+            saved = self.r.sys.stdin
+            self.r.sys.stdin = _RaiseOnRead()
+            self.r.sys.argv[:] = ['browse-fs', '--tty', '-', 'somepath', '-']
+            try:
+                self.r.main()
+            finally:
+                self.r.sys.stdin = saved
+        self.assertIn('cannot be combined', str(cm.exception.code))
+        self.assertIsNone(self.r._STDIN_ROOTS)
+
 
 if __name__ == '__main__':
     unittest.main()

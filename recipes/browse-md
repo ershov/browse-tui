@@ -2031,12 +2031,32 @@ def main():
     # interchangeably (``--list`` / ``--lists``); the flag has no
     # arguments — its mere presence flips emission on.
     _INCLUDE_LISTS = _pop_flag('-l', alts=('--list', '--lists'))
+    # The framework's ``--tty PATH`` / ``--tty=PATH`` flag is auto-detected
+    # by ``Browser.run()`` but NOT stripped from ``sys.argv``, so drop it
+    # (and the value after a bare ``--tty``) before the option scan —
+    # otherwise ``browse-md --tty -`` would die "unrecognised option:
+    # --tty" here, and a stray ``--tty /dev/pts/N`` device path would be
+    # mistaken for a FILE positional. The dropped value may itself be
+    # ``-`` (the ``--tty -`` case), so consuming it also keeps that ``-``
+    # from being read as the stdin positional below; ``--tty=-`` is one
+    # token and never looks like a bare ``-`` either.
+    leftover = []
+    skip_next = False
+    for tok in sys.argv[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok == '--tty':
+            skip_next = True  # consume the following VALUE token too
+            continue
+        if tok.startswith('--tty='):
+            continue
+        leftover.append(tok)
     # After ``_pop_flag`` consumed every known flag, anything starting
     # with ``-`` left in argv is an unrecognised option. Surface those
     # first (most useful diagnostic) before positional-count checks.
     # We intentionally don't support ``--`` as end-of-options here:
     # ``-``-prefixed filenames can be passed as ``./-strange-name.md``.
-    leftover = sys.argv[1:]
     for tok in leftover:
         if tok.startswith('-') and tok != '-':
             _die(f'unrecognised option: {tok}')

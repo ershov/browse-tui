@@ -4670,6 +4670,48 @@ class TestStdinDocument(unittest.TestCase):
         # Stdin was never stamped.
         self.assertIsNone(self.r._STDIN_TEXT)
 
+    # -- --tty - is the framework UI flag, not stdin / not an option --
+
+    def test_tty_dash_value_is_not_an_option_or_positional(self):
+        # ``--tty -`` / ``--tty=-`` is the framework's UI-over-std-streams
+        # flag (auto-detected by Browser.run(), left in sys.argv). The
+        # recipe must drop it before the leftover-option scan — NOT die
+        # "unrecognised option: --tty" — and must not read stdin: with no
+        # real positional it falls through to bare mode (browse cwd). A
+        # ``--tty /dev/pts/N`` device path is dropped too, not taken as a
+        # FILE positional.
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, 'a.md'), 'w') as f:
+                f.write('# A\n')
+            cwd = os.getcwd()
+            os.chdir(tmp)
+            try:
+                for argv in (('browse-md', '--tty', '-'),
+                             ('browse-md', '--tty=-'),
+                             ('browse-md', '--tty', '/dev/pts/9')):
+                    self.r = _load_recipe()
+                    # _RaiseOnRead fires if main() touched stdin here.
+                    self._run_main(_RaiseOnRead(), argv=argv)
+                    self.assertEqual(self._stderr, '', argv)
+                    self.assertIsNone(self.r._STDIN_TEXT, argv)
+                    # Bare mode: the cwd's file is the input, not the
+                    # sentinel; the device path never became a positional.
+                    self.assertNotIn(
+                        self.r._STDIN_PATH,
+                        [p for p, _ in self.r._INPUT_FILES], argv)
+                    self.assertEqual(len(self.r._INPUT_FILES), 1, argv)
+            finally:
+                os.chdir(cwd)
+
+    def test_tty_dash_does_not_disarm_real_stdin_dash(self):
+        # Stripping ``--tty -`` must leave a genuine positional ``-``
+        # reading stdin: ``browse-md --tty - -`` still slurps the doc.
+        self._run_main('# Piped\n## S\n', argv=('browse-md', '--tty', '-', '-'))
+        self.assertEqual(self.r._INPUT_FILES, [(self.r._STDIN_PATH, '')])
+        self.assertEqual(self.r._STDIN_TEXT, '# Piped\n## S\n')
+
     # -- V / E degrade gracefully on the stdin document ---------------
 
     def test_view_edit_source_flash_on_stdin_document(self):

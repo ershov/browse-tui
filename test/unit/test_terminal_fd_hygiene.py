@@ -220,6 +220,113 @@ class TestFdHygiene(unittest.TestCase):
         self.assertIn(b"stdin=b'piped-stdin-payload'", out,
                       'piped fd 0 must be left readable')
 
+    def test_mixed_pipe_stdin_tty_stdout(self):
+        """Mixed cell: pipe fd 0 untouched, tty fd 1 redirected + saved.
+
+        The hygiene keys on ``isatty(0)`` and ``isatty(1)`` independently,
+        so a stream of one kind must not influence the other. Here fd 0 is
+        a pipe (a content channel — left readable) while fd 1 is a tty
+        (redirected to /dev/null with the real stdout saved). Both
+        decisions land correctly in the same ``term_init``:
+          * fd 0 still serves its piped payload;
+          * a raw fd-1 write vanishes; the saved fd reaches the tty;
+          * ``term_stdout_was_tty()`` is True (it keyed on fd 1 alone).
+        """
+        in_r, in_w = os.pipe()          # parent -> child stdin (a pipe)
+        master, slave = pty.openpty()   # child stdout/stderr (a tty)
+        os.write(in_w, b'pipe-in-payload')
+        os.close(in_w)
+
+        def body(report):
+            assert not os.isatty(0) and os.isatty(1)
+            term = _term_with_private_device()
+            term.term_init(None)
+            result_fd = term.term_result_fd()
+            was_tty = term.term_stdout_was_tty()
+            os.write(result_fd, b'RESULT_ON_TTY\n')   # -> saved real stdout
+            os.write(1, b'VANISH_TO_DEVNULL\n')        # fd 1 is /dev/null now
+            data = os.read(0, 64)                      # pipe fd 0 still live
+            term.term_restore()
+            report(f'result_fd_is_1={result_fd == 1} was_tty={was_tty} '
+                   f'stdin={data!r}'.encode())
+
+        out = _run_in_child((in_r, slave, slave), body)
+        os.close(in_r)
+        os.set_blocking(master, False)
+        seen = b''
+        try:
+            while True:
+                chunk = os.read(master, 4096)
+                if not chunk:
+                    break
+                seen += chunk
+        except (OSError, BlockingIOError):
+            pass
+        os.close(master)
+        os.close(slave)
+        self.assertIn(b'RESULT_ON_TTY', seen,
+                      'saved-fd write must reach the tty stdout')
+        self.assertNotIn(b'VANISH_TO_DEVNULL', seen,
+                         'a raw fd-1 write must vanish (tty fd 1 redirected)')
+        self.assertIn(b'result_fd_is_1=False', out,
+                      'tty fd 1 saved -> result_fd is not 1')
+        self.assertIn(b'was_tty=True', out,
+                      'stdout-was-tty keys on fd 1 alone, regardless of fd 0')
+        self.assertIn(b"stdin=b'pipe-in-payload'", out,
+                      'pipe fd 0 must stay readable while fd 1 is redirected')
+
+    def test_mixed_tty_stdin_pipe_stdout(self):
+        """Mixed cell: tty fd 0 -> /dev/null, pipe fd 1 left untouched.
+
+        The converse of the case above: fd 0 is a tty (redirected to
+        /dev/null, so a mid-session read sees EOF) while fd 1 is a pipe (a
+        content channel — left intact, no save). ``term_stdout_was_tty()``
+        is False (it keyed on the pipe fd 1), and ``term_result_fd()`` is
+        the unchanged fd 1 — even though fd 0 *was* a tty and got
+        redirected.
+        """
+        master, slave = pty.openpty()   # child stdin (a tty)
+        out_r, out_w = os.pipe()        # child stdout -> parent (a pipe)
+        err_r, err_w = os.pipe()
+        # Keep the master's write end live so a *non*-redirected read on the
+        # slave would have data — proving the EOF comes from the redirect.
+        os.write(master, b'keystrokes-that-must-not-be-read')
+
+        def body(report):
+            assert os.isatty(0) and not os.isatty(1)
+            term = _term_with_private_device()
+            term.term_init(None)
+            result_fd = term.term_result_fd()
+            was_tty = term.term_stdout_was_tty()
+            os.write(1, b'STDOUT_PIPE_INTACT\n')   # pipe fd 1 untouched
+            os.set_blocking(0, True)
+            data = os.read(0, 64)                  # tty fd 0 -> /dev/null -> EOF
+            term.term_restore()
+            report(f'result_fd_is_1={result_fd == 1} was_tty={was_tty} '
+                   f'stdin_eof={data == b""}'.encode())
+
+        out = _run_in_child((slave, out_w, err_w), body)
+        os.close(master)
+        os.close(slave)
+        os.close(err_w)
+        os.close(err_r)
+        os.close(out_w)
+        child_stdout = b''
+        while True:
+            chunk = os.read(out_r, 4096)
+            if not chunk:
+                break
+            child_stdout += chunk
+        os.close(out_r)
+        self.assertIn(b'STDOUT_PIPE_INTACT', child_stdout,
+                      'pipe fd 1 must be left untouched while fd 0 is redirected')
+        self.assertIn(b'result_fd_is_1=True', out,
+                      'pipe fd 1 -> no save -> result_fd is 1')
+        self.assertIn(b'was_tty=False', out,
+                      'stdout-was-tty keys on fd 1 (a pipe), not on the tty fd 0')
+        self.assertIn(b'stdin_eof=True', out,
+                      'tty fd 0 must be redirected to /dev/null -> read EOF')
+
     def test_tty_dash_does_not_redirect(self):
         """``--tty -`` (tty_path='-') performs NO fd 0/1 hygiene.
 
