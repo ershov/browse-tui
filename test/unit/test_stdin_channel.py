@@ -190,7 +190,7 @@ class TestRecordFraming(unittest.TestCase):
         # Raw-bytes mode: data AND delimiter are bytes — the delimiter
         # is configured as bytes to match the data mode.
         b, calls = _make_recording_browser(stdin_delimiter=b'\0',
-                                           stdin_raw_bytes=True)
+                                           stdin_want_bytes=True)
         try:
             self.assertEqual(b._stdin_delim, b'\x00')
             b._deliver_stdin_chunk(b'x\x00y\x00z')
@@ -217,7 +217,7 @@ class TestRawMode(unittest.TestCase):
             b.stop_workers()
 
     def test_raw_bytes_mode_passes_chunks_undecoded(self):
-        b, calls = _make_recording_browser(stdin_raw_bytes=True)
+        b, calls = _make_recording_browser(stdin_want_bytes=True)
         try:
             b._deliver_stdin_chunk(b'\xff\xfe')  # invalid utf-8: untouched
             b._end_stdin(0)
@@ -309,10 +309,10 @@ class TestEndShapeAndHookSafety(unittest.TestCase):
             ('\n', True),      # str delimiter in raw-bytes mode
         ]
         for delim, raw in cases:
-            with self.subTest(delimiter=delim, stdin_raw_bytes=raw):
+            with self.subTest(delimiter=delim, stdin_want_bytes=raw):
                 with self.assertRaises(ValueError):
                     Browser(BrowserConfig(stdin_delimiter=delim,
-                                          stdin_raw_bytes=raw,
+                                          stdin_want_bytes=raw,
                                           _headless=True))
 
 

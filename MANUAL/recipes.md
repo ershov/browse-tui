@@ -96,7 +96,7 @@ its own terminal — the same mechanism the `-` modes above use:
   first).
 - **`on_stdin`** (a `BrowserConfig` hook) consumes stdin **live** while the
   UI runs — raw chunks or framed records (`stdin_delimiter`), `str` or
-  `bytes` (`stdin_raw_bytes`) — folding each delivery into the tree via
+  `bytes` (`stdin_want_bytes`) — folding each delivery into the tree via
   `ctx.update_data`.
 
 The full contract (the `on_stdin` signature, record framing, EOF / error

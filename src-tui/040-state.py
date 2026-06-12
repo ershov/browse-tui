@@ -3183,15 +3183,15 @@ class BrowserConfig:
     # (``'\n'`` lines, ``'\0'`` NUL records, multi-char ok): the
     # framework buffers partial records and delivers ONE complete record
     # per call, delimiter stripped into the ``delimiter`` kwarg.
-    # ``stdin_raw_bytes`` False (default) decodes utf-8 incrementally
+    # ``stdin_want_bytes`` False (default) decodes utf-8 incrementally
     # (``errors='replace'``); True delivers raw ``bytes``. The delimiter
     # type must match the data mode — ``str`` by default, ``bytes`` when
-    # ``stdin_raw_bytes`` is set; no implicit encoding, a mismatch is a
+    # ``stdin_want_bytes`` is set; no implicit encoding, a mismatch is a
     # construction-time ValueError. Full contract in
     # ``Browser.__init__``'s docstring.
     on_stdin: Optional[Callable] = None
     stdin_delimiter: str | bytes | None = None
-    stdin_raw_bytes: bool = False
+    stdin_want_bytes: bool = False
     # Behaviour when the visible list has no *landable* row — empty, or
     # every row is a ``meta`` divider (§3.4 of the meta-rows design).
     #   * ``'wait'`` (default) — park the cursor; the ``0 <= cursor <
@@ -3442,7 +3442,7 @@ class Browser:
                 ``str`` decoded incrementally as utf-8
                 (``errors='replace'``; multibyte sequences split across
                 chunk reads decode correctly), or raw ``bytes`` when
-                ``stdin_raw_bytes=True`` — never ``None``, may be empty.
+                ``stdin_want_bytes=True`` — never ``None``, may be empty.
                 Raw-chunk mode (``stdin_delimiter=None``): one call per
                 chunk read, ``delimiter=''``. Record mode: one call per
                 completed record, the stripped delimiter passed in
@@ -3464,10 +3464,10 @@ class Browser:
                 partial-record buffering and hands ``on_stdin`` one
                 complete record per call, delimiter stripped. Its type
                 must match the data mode: ``str`` by default, ``bytes``
-                when ``stdin_raw_bytes=True`` — no implicit encoding
+                when ``stdin_want_bytes=True`` — no implicit encoding
                 between the two; a type mismatch (or an empty delimiter
                 of either type) raises ``ValueError`` at construction.
-            stdin_raw_bytes: When ``True``, ``on_stdin`` receives raw
+            stdin_want_bytes: When ``True``, ``on_stdin`` receives raw
                 ``bytes`` (``data`` and ``delimiter`` alike) instead of
                 decoded ``str``. Default ``False``.
             _headless: Skip terminal init/teardown — used by tests.
@@ -3503,13 +3503,13 @@ class Browser:
             # The delimiter type must match the data mode — no implicit
             # encoding between the two; empty delimiters of either type
             # are meaningless (raw-chunk mode is spelled ``None``).
-            _want = bytes if config.stdin_raw_bytes else str
+            _want = bytes if config.stdin_want_bytes else str
             if (not isinstance(config.stdin_delimiter, _want)
                     or not config.stdin_delimiter):
                 raise ValueError(
                     "stdin_delimiter must be None (raw chunks) or a "
                     f"non-empty {_want.__name__} matching the data mode "
-                    f"(stdin_raw_bytes={config.stdin_raw_bytes}); got "
+                    f"(stdin_want_bytes={config.stdin_want_bytes}); got "
                     f"{config.stdin_delimiter!r}"
                 )
         # --- user-supplied data callbacks -------------------------------
@@ -3933,12 +3933,12 @@ class Browser:
         # encoding). ``_stdin_nonblock_set`` records that arming flipped
         # fd 0 to O_NONBLOCK (run phase only — undone at teardown, so
         # pre-run ingest by a composing recipe stays blocking).
-        self._stdin_raw_bytes = bool(config.stdin_raw_bytes)
+        self._stdin_want_bytes = bool(config.stdin_want_bytes)
         self._stdin_delim = config.stdin_delimiter
-        self._stdin_rec_buf = b'' if self._stdin_raw_bytes else ''
+        self._stdin_rec_buf = b'' if self._stdin_want_bytes else ''
         self._stdin_decoder = (
             codecs.getincrementaldecoder('utf-8')('replace')
-            if (config.on_stdin is not None and not self._stdin_raw_bytes)
+            if (config.on_stdin is not None and not self._stdin_want_bytes)
             else None)
         self._stdin_live = False
         self._stdin_nonblock_set = False
@@ -7720,7 +7720,7 @@ class Browser:
             # text surfaces with the next chunk.
             if data:
                 self._fire_on_stdin(
-                    data, b'' if self._stdin_raw_bytes else '', False, 0)
+                    data, b'' if self._stdin_want_bytes else '', False, 0)
             return
         parts = (self._stdin_rec_buf + data).split(delim)
         self._stdin_rec_buf = parts.pop()
@@ -7740,7 +7740,7 @@ class Browser:
         ``delimiter=''`` and ``is_eof=True``.
         """
         self._stdin_live = False
-        empty = b'' if self._stdin_raw_bytes else ''
+        empty = b'' if self._stdin_want_bytes else ''
         tail = empty
         if self._stdin_decoder is not None:
             tail = self._stdin_decoder.decode(b'', final=True)

@@ -859,7 +859,7 @@ stream), opt in via three `BrowserConfig` fields:
 Browser(...,
         on_stdin=handle,                 # the hook
         stdin_delimiter=None,            # None = raw chunks; or a delimiter
-        stdin_raw_bytes=False)           # False = decoded str; True = bytes
+        stdin_want_bytes=False)           # False = decoded str; True = bytes
 ```
 
 The hook signature — the framework **always** passes every keyword:
@@ -869,7 +869,7 @@ def on_stdin(ctx, data, *, delimiter, is_eof, errno):
     ...
 ```
 
-- **`data`** — `str` (or `bytes` when `stdin_raw_bytes=True`), **never
+- **`data`** — `str` (or `bytes` when `stdin_want_bytes=True`), **never
   `None`**; may be empty (`''` / `b''`, e.g. an empty record). `str` is
   decoded with an **incremental utf-8 decoder** (`errors='replace'`), so a
   multibyte sequence split across chunk boundaries decodes correctly and
@@ -885,7 +885,7 @@ def on_stdin(ctx, data, *, delimiter, is_eof, errno):
     stripped delimiter passed back in `delimiter`. **Empty records are
     preserved** — `"a\n\n"` delivers record `"a"`, then `""`, then the EOF
     call. The delimiter's **type must match the data mode** — `str` in the
-    default mode, `bytes` when `stdin_raw_bytes=True`; a type mismatch (or
+    default mode, `bytes` when `stdin_want_bytes=True`; a type mismatch (or
     an empty delimiter of either type) raises **`ValueError` at
     construction**.
 - **`is_eof`** — `True` on the **final** call; its `data` is the trailing
@@ -1717,7 +1717,7 @@ class BrowserConfig:
     on_quit: Callable | None = None                # (ctx, code)
     on_stdin: Callable | None = None               # (ctx, data, *, delimiter, is_eof, errno)
     stdin_delimiter: str | bytes | None = None     # None = raw chunks; else record delimiter
-    stdin_raw_bytes: bool = False                  # True = bytes (data + delimiter), not str
+    stdin_want_bytes: bool = False                  # True = bytes (data + delimiter), not str
     _headless: bool = False
 ```
 
