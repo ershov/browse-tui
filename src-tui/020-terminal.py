@@ -11,7 +11,8 @@ Provides the low-level I/O substrate the UI builds on:
   wake the main loop's ``select`` via ``notify_wake``
 * ``read_key`` -- a VT100/SGR/CSI-u escape-sequence parser that returns
   string keynames like ``'up'``, ``'ctrl-r'``, ``'shift-enter'``,
-  ``'mouse-click:R:C'``, ``'_notify'`` and ``'esc'``
+  ``'mouse-click:R:C'``, ``'_notify'``, ``'_writable'``, ``'_stdin'``
+  and ``'esc'``
 
 This module is pure I/O and contains nothing application-specific. It has
 no tests of its own; coverage comes from the Layer 3 UI tests that drive
@@ -34,6 +35,22 @@ input is fd 0 and output is fd 1 (the std streams carry read and write on
 separate fds). Decoupling the terminal from the std streams is what makes
 the print-exit result cleanly capturable (``sel=$(browse-tui …)``): UI
 bytes go to the device, ``stdout`` carries only the result.
+
+**fd hygiene at startup.** In single-device mode ``term_init`` also
+detaches fd 0 / fd 1 from the terminal when they are ttys, so the freed
+std streams become safe content channels (see :func:`term_init`):
+
+* a tty fd 0 is pointed at ``/dev/null`` -- a mid-session recipe read gets
+  immediate EOF instead of blocking on, or stealing keystrokes from, the
+  UI;
+* a tty fd 1 is saved (``os.dup``) and then pointed at ``/dev/null`` -- a
+  stray raw ``print()`` vanishes instead of painting over the alt-screen,
+  while the saved fd carries the buffered / quit output at teardown.
+
+``stderr`` (fd 2) is left untouched. ``--tty -`` is excluded (there the
+std fds *are* the UI). Consumers reach the saved-output state through
+:func:`term_result_fd` / :func:`term_stdout_was_tty` and hand it back via
+:func:`term_release_result_fd`, never touching the privates.
 """
 
 import errno
@@ -73,6 +90,24 @@ _tty_writer = None     # buffered text writer over _tty_fd_out (.write/.flush/.b
 # therefore owns it -- term_restore closes it. False for --tty - (the fds
 # are the std streams: not ours to close).
 _tty_owns_fd = False
+
+# ---- fd hygiene state (set by term_init; see module docstring) -----------
+#
+# In single-device mode term_init detaches a tty fd 0 / fd 1 from the
+# terminal (-> /dev/null) so the std streams are safe content channels.
+# These record the fd-1 side so the buffered / quit output reaches the
+# user's real stdout at teardown; consumer modules read them only through
+# term_result_fd() / term_stdout_was_tty().
+#
+# _stdout_was_tty  -- True iff fd 1 was a tty at term_init (and was thus
+#                     redirected to /dev/null with the real fd saved below).
+# _saved_stdout_fd -- the os.dup of the original fd 1 when _stdout_was_tty,
+#                     else -1. term_restore deliberately leaves it open for
+#                     the post-restore teardown dump, which closes it via
+#                     term_release_result_fd(); a stray fd from an unmatched
+#                     restore is reclaimed by the next term_init.
+_stdout_was_tty = False
+_saved_stdout_fd = -1
 
 g_resize_flag = False
 # Set when the alt-screen content has been blown away externally —
@@ -556,6 +591,54 @@ def _resolve_terminal(tty_path):
     _tty_owns_fd = True
 
 
+def _redirect_std_fds():
+    """Detach a tty fd 0 / fd 1 from the terminal (single-device mode only).
+
+    Called by :func:`term_init` after the terminal device is up. For each
+    of fd 0 and fd 1, acts *only* when that fd is a tty -- a pipe or file
+    is a content channel and is left untouched, and there is zero cost when
+    neither is a tty:
+
+    * fd 0 a tty -> ``dup2(/dev/null, 0)``: a mid-session recipe read sees
+      immediate EOF instead of blocking on, or stealing keystrokes from,
+      the UI on the same terminal.
+    * fd 1 a tty -> save the real fd (``os.dup`` -> ``_saved_stdout_fd``,
+      marked non-inheritable so it does not leak into shell-outs) and then
+      ``dup2(/dev/null, 1)``: a stray raw ``print()`` vanishes instead of
+      painting over the alt-screen. The buffered / quit output is written
+      to the saved fd at teardown (see :func:`term_result_fd`).
+
+    ``sys.stdout`` itself is unchanged -- it still wraps fd 1, so after the
+    redirect a Python-level ``print()`` writes to ``/dev/null``; the saved
+    fd is reached only via :func:`term_result_fd`. ``stderr`` (fd 2) is
+    never touched. Excluded from ``--tty -`` (the caller gates on it):
+    there fd 0/1 are the UI device, not redirectable.
+    """
+    global _stdout_was_tty, _saved_stdout_fd
+    if os.isatty(0):
+        devnull_rd = os.open(os.devnull, os.O_RDONLY)
+        try:
+            os.dup2(devnull_rd, 0)
+        finally:
+            # fd 0 now refers to /dev/null's open file description; the
+            # temporary fd is redundant.
+            os.close(devnull_rd)
+    if os.isatty(1):
+        # Save the real stdout before clobbering fd 1. Mark it
+        # non-inheritable (close-on-exec) so it stays out of shell-out
+        # children -- they get the terminal via term_child_fds(), not this
+        # fd. (os.dup already returns a non-inheritable fd under PEP 446;
+        # the explicit call documents and guarantees the intent.)
+        _saved_stdout_fd = os.dup(1)
+        os.set_inheritable(_saved_stdout_fd, False)
+        _stdout_was_tty = True
+        devnull_wr = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(devnull_wr, 1)
+        finally:
+            os.close(devnull_wr)
+
+
 def term_init(tty_path=None):
     """Resolve the terminal device, save termios, enter raw mode + alt screen.
 
@@ -565,6 +648,13 @@ def term_init(tty_path=None):
     (fd 0 in, fd 1 out). All subsequent UI I/O rides on the resolved
     device, never on ``sys.stdin`` / ``sys.stdout``.
 
+    In single-device mode (every ``tty_path`` except ``'-'``), once raw
+    mode is up, also applies fd hygiene to the now-freed std streams (see
+    :func:`_redirect_std_fds`): a tty fd 0 / fd 1 is detached from the
+    terminal so the streams are safe content channels. ``--tty -`` is
+    excluded -- there fd 0/1 are the UI device. (Headless never calls
+    ``term_init`` at all, so the std fds stay intact for tests.)
+
     Also registers signal handlers for SIGWINCH, SIGTSTP, and SIGCONT.
 
     Raises a clean ``SystemExit`` (no traceback) when no terminal is
@@ -573,6 +663,11 @@ def term_init(tty_path=None):
     ``termios`` call fails).
     """
     global _orig_sigtstp_handler, _notify_r, _notify_w
+    # Clean slate for the fd-hygiene state: defensive release of a stray
+    # saved fd from an unmatched prior init (real runs pair term_init with
+    # a term_restore + teardown dump that releases it; this guards repeated
+    # init/restore cycles, e.g. in tests, against an fd leak).
+    term_release_result_fd()
     _resolve_terminal(tty_path)
     _orig_sigtstp_handler = signal.getsignal(signal.SIGTSTP)
     # Create self-pipe for async notification
@@ -587,6 +682,12 @@ def term_init(tty_path=None):
         # a termios traceback.
         term_restore()
         raise SystemExit('browse-tui: not a terminal')
+    # fd hygiene: detach a tty fd 0/1 from the terminal so the std streams
+    # are safe content channels. Single-device mode only -- in --tty - the
+    # std fds ARE the UI. Done after _enter_raw succeeds, so the --tty -
+    # piped error path above never touches fd 0/1.
+    if tty_path != '-':
+        _redirect_std_fds()
     signal.signal(signal.SIGWINCH, _handle_sigwinch)
     signal.signal(signal.SIGTSTP, _handle_sigtstp)
     signal.signal(signal.SIGCONT, _handle_sigcont)
@@ -602,6 +703,55 @@ def term_child_fds():
     ``O_RDWR`` device fd; in ``--tty -`` mode they are ``(0, 1)``.
     """
     return (_tty_fd_in, _tty_fd_out)
+
+def term_result_fd():
+    """Return the fd that buffered / final output must be written to.
+
+    The destination for ``ctx.print`` output and the print-exit selection
+    at teardown:
+
+    * when fd 1 was a tty, ``term_init`` redirected fd 1 to ``/dev/null``
+      and saved the real stdout -- this returns that saved fd, so the
+      result lands in the user's normal scrollback (after the alt-screen is
+      exited), exactly where an ``fzf`` result would;
+    * otherwise (pipe / file stdout, or ``--tty -``) fd 1 was left intact
+      -- this returns ``1``, the live content channel.
+
+    Note ``sys.stdout`` is *not* a substitute here: after the redirect it
+    still wraps fd 1 (now ``/dev/null``), so a tty-stdout result written
+    through ``sys.stdout`` would silently vanish. Write the encoded text
+    to this fd with ``os.write`` instead.
+    """
+    return _saved_stdout_fd if _stdout_was_tty else 1
+
+def term_stdout_was_tty():
+    """Return True iff fd 1 was a tty at ``term_init`` (and so was redirected).
+
+    Lets the teardown decide *when* to deliver buffered output: a tty
+    stdout is held and dumped after the alt-screen is restored (the fzf
+    model), whereas a pipe / file streams during the session. False in
+    headless / ``--tty -`` / piped-stdout runs.
+    """
+    return _stdout_was_tty
+
+def term_release_result_fd():
+    """Close the saved real-stdout fd (if any) and reset the hygiene state.
+
+    The final step of the teardown output dump: once the buffered / quit
+    output has been written to ``term_result_fd()``, this closes the
+    saved fd and clears ``term_stdout_was_tty()`` back to False, so the
+    save/dump/close lifecycle stays inside the terminal layer (callers
+    never close a terminal-private fd themselves). Idempotent; a no-op
+    when fd 1 was never redirected.
+    """
+    global _stdout_was_tty, _saved_stdout_fd
+    if _saved_stdout_fd >= 0:
+        try:
+            os.close(_saved_stdout_fd)
+        except OSError:
+            pass
+    _saved_stdout_fd = -1
+    _stdout_was_tty = False
 
 def _leave_raw():
     """Restore termios and leave alternate screen, but keep the notification pipe.
@@ -635,6 +785,14 @@ def term_restore():
     via the owning writer. The std streams (``--tty -`` mode) are never
     closed. Resets the device globals so a later ``term_init`` starts
     clean.
+
+    Leaves the alternate screen first (``_leave_raw``), so the saved real
+    stdout (when ``term_stdout_was_tty``) is back in the normal screen and
+    ready to receive the buffered / quit output. That saved fd is therefore
+    NOT closed here: the teardown output dump writes to ``term_result_fd``
+    *after* this returns, then hands the fd back via
+    ``term_release_result_fd`` (which closes it). A stray saved fd left by
+    an unmatched ``term_restore`` is reclaimed by the next ``term_init``.
     """
     global _notify_r, _notify_w
     global _tty_fd_in, _tty_fd_out, _tty_writer, _tty_owns_fd
@@ -699,13 +857,32 @@ def input_ready():
             raise
 
 
-def read_key():
+def read_key(write_fd=None, aux_read_fd=None):
     """Read one keystroke and return a string name for it.
 
     Handles multi-byte escape sequences, alt-combos, and bare ESC
     (disambiguated via a 50 ms timeout after the initial ESC byte).
     Retries on EINTR (e.g. from SIGWINCH).
     Also wakes up on the notification pipe and returns '_notify'.
+
+    ``write_fd`` (optional) is additionally watched for *writability*;
+    when it is ready the call returns ``'_writable'`` instead of a key.
+    The main loop passes its buffered-output fd here only while there
+    are bytes to drain, so a backpressuring consumer never blocks the
+    UI and an idle channel adds nothing to the select set.
+
+    ``aux_read_fd`` (optional) is additionally watched for
+    *readability*; when it is ready — and the terminal device is NOT —
+    the call returns ``'_stdin'`` instead of a key. The terminal
+    outranks the aux fd on a shared wake: keystrokes are scarce, while
+    a saturated content stream (a ``yes``-style producer) keeps fd 0
+    readable at every select and would otherwise starve the keyboard
+    indefinitely — unquittable in raw mode, where even ctrl-c is just
+    another starved key. stdin loses nothing to the reorder: its data
+    stays buffered and the next select reports it again. The main loop
+    passes fd 0 here only while the streaming-input hook is armed
+    (``on_stdin`` set, stream not ended), so recipes without the hook
+    keep the select set exactly as before.
     """
     fd = _tty_fd_in
 
@@ -713,13 +890,20 @@ def read_key():
     watch_fds = [fd]
     if _notify_r >= 0:
         watch_fds.append(_notify_r)
+    if aux_read_fd is not None:
+        watch_fds.append(aux_read_fd)
+    wfds = [write_fd] if write_fd is not None else []
     while True:
         try:
-            ready, _, _ = select.select(watch_fds, [], [])
+            ready, wready, _ = select.select(watch_fds, wfds, [])
         except OSError as e:
             if e.errno == errno.EINTR:
                 continue
             raise
+        if wready:
+            # Deliver writability first; any pending key / notify stays
+            # buffered for the next call (same model as '_notify').
+            return '_writable'
         if _notify_r >= 0 and _notify_r in ready:
             # Drain the notification pipe
             try:
@@ -728,6 +912,13 @@ def read_key():
                 pass
             # Always deliver _notify first; the device stays buffered for next call
             return '_notify'
+        if (aux_read_fd is not None and aux_read_fd in ready
+                and fd not in ready):
+            # Content-input readiness — only when no key is pending.
+            # The terminal outranks the content stream (see docstring):
+            # a pending key falls through to the read below, and the
+            # aux fd's data stays buffered for the next select.
+            return '_stdin'
         break  # the terminal device is ready
 
     def _read1():

@@ -57,6 +57,13 @@ _cli.term_resume = lambda: None
 # For Browser.run() — inject the names it references at runtime.
 _state.term_init = lambda tty_path=None: None
 _state.term_restore = lambda: None
+# Teardown output routing (#856/#857): the real accessors read the terminal
+# module's fd-hygiene globals, which stay at their defaults here (no real
+# term_init runs in the headless tests), so term_stdout_was_tty() is False
+# and the teardown output flush takes the ``sys.stdout`` path the tests patch.
+_state.term_stdout_was_tty = _term.term_stdout_was_tty
+_state.term_result_fd = _term.term_result_fd
+_state.term_release_result_fd = _term.term_release_result_fd
 _state.read_key = lambda: 'q'  # tests override per-case
 _state.input_ready = lambda: False  # tests override for burst tests
 _state.g_resize_flag = False
@@ -153,8 +160,24 @@ class TestRunTuiArgsToBrowser(unittest.TestCase):
         items = b._state._children['']
         self.assertEqual([it.id for it in items], ['a', 'b', 'c'])
 
+    def test_root_cmd_dash_reads_stdin(self):
+        # The canonical ``--root-cmd -``: read directly from stdin and
+        # run end to end (run loop reached → rc 42, tree populated).
+        fake_stdin = io.BytesIO(b'x\ny\n')
+        original = sys.stdin
+        try:
+            sys.stdin = type('S', (), {'buffer': fake_stdin})()
+            args = _make_args(root_cmd='-')
+            rc = _cli.run_tui(args)
+        finally:
+            sys.stdin = original
+        self.assertEqual(rc, 42)
+        b = self._captured[0]
+        items = b._state._children['']
+        self.assertEqual([it.id for it in items], ['x', 'y'])
+
     def test_root_cmd_cat_reads_stdin(self):
-        # The --root-cmd cat shortcut: read directly from stdin.
+        # The bare ``--root-cmd cat`` alias: same direct-stdin read as -.
         fake_stdin = io.BytesIO(b'x\ny\n')
         original = sys.stdin
         try:

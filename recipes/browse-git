@@ -17,6 +17,27 @@ files. They honor the same path filter and appear only on an unscoped log
   branches  branches / remotes / tags via ``git for-each-ref``
   stash     ``git stash list``
 
+With ``-`` as the sole argument the recipe instead reads GIT OUTPUT
+FROM STDIN: the stream is slurped to EOF before the UI starts (on a
+tty: until ^D, like cat) and its type is sniffed from the first
+non-blank line —
+
+  diff      a ``diff --git`` header or ``--- a/`` hunk → one row per
+            file block, that block (delta-rendered) as the preview
+  log       ``commit <sha>`` blocks (--stat / -p included) → one commit
+            row per block (sha / author / date columns + decoration
+            chips), the whole block as the preview
+  status    porcelain ``XY path`` lines (the ``-z`` form too) or the
+            human ``On branch …`` form → the status view's leaf rows
+
+The slurped text is the ONLY data source in this mode — git is never
+run for it and no repo is required: previews come from the text,
+reload (ctrl-r) re-serves the parse, and the actions that re-run git
+(the `` ` `` mode picker, the ``t`` graph toggle) flash instead of
+acting. ``-`` combines with no other argument or flag; empty or
+unrecognized input is a clean error on stderr (exit 2) before the UI
+starts. Bare ``browse-git`` never reads stdin.
+
 Every row id is a tagged tuple whose first element is a short string
 ``kind`` tag, so dispatch is a flat ``id[0]`` match with direct field
 access — never a hex-vs-word heuristic or substring scan:
@@ -29,6 +50,8 @@ access — never a hex-vs-word heuristic or substring scan:
   ('stash', n[, path])       a stash (n int), or a file in one
   ('reflog', n, sha)         a reflog entry (n int) -> changed files
   ('filler', ns, n)          an inert tree-mode connector row (meta; no children)
+  ('sfile', i, path)         a file block of a piped diff (leaf; stdin mode)
+  ('slog', i)                a commit block of a piped log (leaf; stdin mode)
   ('status_clean',)          the "working tree clean" sentinel (no children)
   ('stash_none',)            the "no stashes" sentinel (no children)
   ('err',)                   an error row (no children)
@@ -71,6 +94,7 @@ log's ``--branches``) — equivalent to ``browse-git $(git branch
 
 Usage:
   browse-git [<dir>] [-n NUMBER] [--mode NAME] [--no-tree] [--all] [<revs>…] [-- <paths>…]
+  git diff | browse-git -      (also git log / log -p / status output)
 """
 
 import os
@@ -81,7 +105,8 @@ import sys
 
 from browse_tui import (
     Action, Browser, BrowserConfig, Item,
-    cell_ljust, cell_width, default_row_content, sanitize_ansi, style,
+    cell_ljust, cell_width, default_row_content, recipe_argv,
+    sanitize_ansi, style,
 )
 
 # Optional md2ansi_lib plugin — gates md2ansi coloring of commit messages.
@@ -138,6 +163,14 @@ _prev_pw = None  # last preview width seen by _on_resize (main-thread only)
 _revs = []       # positional revisions scoping commits mode
 _paths = []      # positional pathspecs scoping commits mode
 _all_branches = False  # --all — span the commits log over every local branch
+
+# ``browse-git -`` (stdin) state, set once by ``_ingest_stdin`` before the
+# Browser launches. ``_STDIN_KIND`` doubles as the mode flag: ``None`` is
+# the normal repo mode; 'diff' / 'log' / 'status' select the stdin root
+# builders and gate every path that would otherwise run git.
+_STDIN_KIND = None   # None | 'diff' | 'log' | 'status'
+_STDIN_ROWS = []     # per-row parsed spec (kind-specific tuples, see parsers)
+_STDIN_BLOCKS = []   # per-row verbatim slice of the slurped text (previews)
 
 
 # ---- argv helper ---------------------------------------------------------
@@ -294,10 +327,21 @@ def _run_git(*args):
     """Run ``git args…``; return CompletedProcess (returncode + stdout/err).
 
     Uses ``check=False`` so the recipe can branch on ``returncode``
-    rather than raise. Errors surface as Items / preview text.
+    rather than raise. Errors surface as Items / preview text. A missing
+    git binary is folded into the same shape — a failed CompletedProcess
+    (rc 127, the command-not-found convention) instead of a
+    ``FileNotFoundError`` — so every caller's existing ``rc != 0``
+    handling covers the gitless environment too. That is in-contract:
+    ``browse-git -`` starts without the git-on-PATH precondition, and a
+    mid-session call there (``E``'s work-tree-root resolve) must degrade,
+    not take down the key dispatch.
     """
-    return subprocess.run(['git'] + list(args), check=False,
-                          capture_output=True, text=True)
+    try:
+        return subprocess.run(['git'] + list(args), check=False,
+                              capture_output=True, text=True)
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(
+            ['git', *args], 127, stdout='', stderr='git not found on PATH')
 
 
 def _git_color(*args):
@@ -642,6 +686,352 @@ def _err_item(msg):
     return [Item(id=('err',), title=msg, tag='err', tag_style='red')]
 
 
+# ---- stdin ingest (browse-git -) -------------------------------------------
+#
+# ``browse-git -`` slurps git output from stdin BEFORE the UI starts and
+# builds the matching tree from that text alone. Classification and field
+# extraction always look at the SGR-stripped line (``_SGR_RE``) so input
+# piped with ``--color=always`` sniffs / splits identically, while the
+# stored blocks keep the original colour for the preview pane.
+
+# First line of ``git status --porcelain``: two status columns (at least
+# one of them set — XY is never two spaces) + a space + the path. The
+# column class is porcelain v1's letter set; '?' / '!' cover untracked /
+# ignored entries.
+_PORCELAIN_LINE_RE = re.compile(r'(?:[MTADRCU?!][ MTADRCU?!]| [MTADRCU?!]) \S')
+
+# A ``commit <sha>`` block header, with the optional ``(decorations)``
+# suffix the human log emits — used both to sniff/split log input and to
+# pull the sha + ``%D``-style decoration string out of a block.
+_COMMIT_LINE_RE = re.compile(r'commit ([0-9a-f]{7,40})\b(?: \((.*)\))?')
+
+# A ``diff --git a/… b/…`` per-file header (block splitter for diff input).
+_DIFF_HEADER_RE = re.compile(r'diff --git ')
+
+
+def _sniff_stdin_kind(text):
+    """Classify slurped stdin by its first non-blank line.
+
+    Returns 'diff' (a ``diff --git`` header or a bare ``--- a/`` hunk
+    fragment), 'log' (a ``commit <sha>`` block), 'porcelain' (a status
+    ``XY path`` line — the NUL ``-z`` form matches too, its first "line"
+    being the whole record stream), 'human' (``git status`` prose
+    starting ``On branch`` / ``HEAD detached``), or ``None`` when the
+    first non-blank line is none of those (including empty input). The
+    match is on the SGR-stripped line, so colored input classifies the
+    same as plain.
+    """
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        plain = _SGR_RE.sub('', line)
+        if plain.startswith('diff --git ') or plain.startswith('--- a/'):
+            return 'diff'
+        if _COMMIT_LINE_RE.match(plain):
+            return 'log'
+        if plain.startswith('On branch ') or plain.startswith('HEAD detached'):
+            return 'human'
+        if _PORCELAIN_LINE_RE.match(plain):
+            return 'porcelain'
+        return None
+    return None
+
+
+def _split_blocks(text, header_re):
+    """Split ``text`` into blocks opening at lines matching ``header_re``.
+
+    The shared splitter behind the diff (``diff --git ``) and log
+    (``commit <sha>``) block builders: a new block starts at every line
+    whose SGR-stripped form matches ``header_re``; everything up to the
+    next header (hunks, message, --stat, -p patches…) stays in the block.
+    Text before the first header — e.g. a headerless ``--- a/`` diff
+    fragment — is its own leading block; whitespace-only blocks (blank
+    leading lines) are dropped. Blocks keep their original lines
+    verbatim, colour and all.
+    """
+    blocks = []
+    cur = []
+    for line in text.splitlines(keepends=True):
+        if cur and header_re.match(_SGR_RE.sub('', line)):
+            blocks.append(''.join(cur))
+            cur = []
+        cur.append(line)
+    if cur:
+        blocks.append(''.join(cur))
+    return [b for b in blocks if b.strip()]
+
+
+def _diff_path(p):
+    """Display path from a ``---``/``+++`` header payload.
+
+    Drops a GNU-diff trailing ``\\t<timestamp>`` part and ONE leading
+    ``a/`` / ``b/`` prefix (git's diff mnemonics — a repo path that
+    itself starts ``b/`` arrives as ``b/b/…`` and survives intact).
+    """
+    p = p.split('\t', 1)[0]
+    return p[2:] if p.startswith(('a/', 'b/')) else p
+
+
+def _diff_block_row(block):
+    """Derive one diff block's ``(status letter, display path)``.
+
+    The letter mirrors the recipe's name-status conventions: ``A`` for a
+    new file (``new file mode`` marker, or a ``--- /dev/null`` old side),
+    ``D`` for a deletion, ``R`` / ``C`` for renames / copies, ``M``
+    otherwise. The display path is the NEW path — preferring the ``+++``
+    header, then ``rename to`` (a pure rename has no ``---``/``+++``
+    lines), then the ``---`` side (deletions), then the ``diff --git``
+    header itself. All matching is on the SGR-stripped text.
+    """
+    lines = _SGR_RE.sub('', block).splitlines()
+
+    def has(prefix):
+        return any(l.startswith(prefix) for l in lines)
+
+    if has('new file mode') or has('--- /dev/null'):
+        letter = 'A'
+    elif has('deleted file mode') or has('+++ /dev/null'):
+        letter = 'D'
+    elif has('rename from '):
+        letter = 'R'
+    elif has('copy from '):
+        letter = 'C'
+    else:
+        letter = 'M'
+
+    plus = minus = rename = None
+    for l in lines:
+        if plus is None and l.startswith('+++ ') and l[4:] != '/dev/null':
+            plus = _diff_path(l[4:])
+        elif minus is None and l.startswith('--- ') and l[4:] != '/dev/null':
+            minus = _diff_path(l[4:])
+        elif rename is None and l.startswith('rename to '):
+            rename = l[len('rename to '):]
+    # New path first; a deletion's name only exists on the old side.
+    path = (minus or plus) if letter == 'D' else (plus or rename or minus)
+    if path is None:
+        m = re.match(r'diff --git a/(.*?) b/(.*)$', lines[0]) if lines else None
+        path = m.group(2) if m else '(unknown file)'
+    return letter, path
+
+
+def _parse_stdin_diff(text):
+    """Parse slurped diff text into aligned ``(rows, blocks)``.
+
+    ``blocks[i]`` is the i-th per-file slice of the text (the preview
+    source, colour preserved); ``rows[i]`` is its ``(letter, path)``
+    display spec from ``_diff_block_row``.
+    """
+    blocks = _split_blocks(text, _DIFF_HEADER_RE)
+    return [_diff_block_row(b) for b in blocks], blocks
+
+
+def _log_block_row(block):
+    """Derive one log block's ``(sha, author, date, subject, deco)``.
+
+    ``sha`` + the parenthesized decoration string come off the ``commit``
+    header line; ``author`` is the ``Author:`` name with the ``<email>``
+    dropped; ``date`` is the ``Date:`` payload verbatim; ``subject`` is
+    the first non-blank message line (git indents the message by four
+    spaces, which nothing else in log / --stat / -p output uses, and the
+    scan stops there — --stat / -p content never reaches the fields).
+    Headers a variant may omit yield ``''`` for that field.
+    """
+    sha = deco = author = date = subject = ''
+    for line in _SGR_RE.sub('', block).splitlines():
+        if not sha:
+            m = _COMMIT_LINE_RE.match(line)
+            if m:
+                sha, deco = m.group(1), m.group(2) or ''
+                continue
+        if line.startswith('Author:'):
+            author = line[len('Author:'):].strip().split(' <')[0]
+        elif line.startswith('Date:'):
+            date = line[len('Date:'):].strip()
+        elif line.startswith('    ') and line.strip():
+            subject = line.strip()
+            break
+    return sha, author, date, subject, deco
+
+
+def _parse_stdin_log(text):
+    """Parse slurped ``git log`` text into aligned ``(rows, blocks)``.
+
+    ``blocks[i]`` is the i-th whole-commit slice (message and any --stat
+    / -p payload included — the preview source); ``rows[i]`` is its
+    ``(sha, author, date, subject, deco)`` spec from ``_log_block_row``.
+    """
+    blocks = _split_blocks(text, _COMMIT_LINE_RE)
+    return [_log_block_row(b) for b in blocks], blocks
+
+
+def _parse_porcelain_lines(text):
+    """Parse line-form ``git status --porcelain`` text into ``[(XY, path)]``.
+
+    The newline-separated sibling of ``_parse_porcelain_z``: each entry
+    line is ``XY<space><path>`` (validated against the same pattern the
+    sniffer uses; anything else is skipped). A rename/copy (``X`` is
+    ``R``/``C``) carries an inline ``old -> new`` arrow — the new path is
+    kept, matching the ``-z`` parser. Paths git C-quoted are left
+    verbatim.
+    """
+    rows = []
+    for line in text.splitlines():
+        plain = _SGR_RE.sub('', line)
+        if not _PORCELAIN_LINE_RE.match(plain):
+            continue
+        xy, path = plain[:2], plain[3:]
+        if xy[0] in 'RC' and ' -> ' in path:
+            path = path.split(' -> ', 1)[1]
+        rows.append((xy, path))
+    return rows
+
+
+# Human ``git status`` section headers → the porcelain side they stand for.
+_HUMAN_SECTIONS = {
+    'Changes to be committed:': 'staged',
+    'Changes not staged for commit:': 'unstaged',
+    'Untracked files:': 'untracked',
+    'Unmerged paths:': 'unmerged',
+}
+
+# Human entry verb → one-letter status (the porcelain column letter).
+_HUMAN_VERB_LETTER = {
+    'modified': 'M',
+    'new file': 'A',
+    'deleted': 'D',
+    'renamed': 'R',
+    'copied': 'C',
+    'typechange': 'T',
+}
+
+
+def _parse_human_status(text):
+    """Parse human ``git status`` prose into porcelain-style ``[(XY, path)]``.
+
+    Tracks the current section by its header line (``_HUMAN_SECTIONS``)
+    and reads the tab-indented entry lines under it — the hint lines
+    (``(use "git …)``) are space-indented and fall through harmlessly.
+    Staged entries synthesize ``X<space>`` codes, unstaged ``<space>Y``,
+    untracked ``??``, and any unmerged entry ``UU`` (the exact unmerged
+    pair is not recoverable from the prose; ``UU`` keeps the conflict
+    classification + ``U`` tag). Renames/copies keep the new path. A
+    clean-tree status has no sections → ``[]`` → the existing "working
+    tree clean" sentinel.
+    """
+    rows = []
+    section = None
+    for line in text.splitlines():
+        plain = _SGR_RE.sub('', line)
+        if not plain.startswith('\t'):
+            section = _HUMAN_SECTIONS.get(plain.strip(), section)
+            continue
+        if section is None:
+            continue
+        entry = plain[1:]
+        if section == 'untracked':
+            rows.append(('??', entry))
+            continue
+        verb, sep, path = entry.partition(':')
+        verb, path = verb.strip(), path.strip()
+        if not sep:
+            continue
+        if verb in ('renamed', 'copied') and ' -> ' in path:
+            path = path.split(' -> ', 1)[1]
+        if section == 'unmerged':
+            rows.append(('UU', path))
+            continue
+        letter = _HUMAN_VERB_LETTER.get(verb)
+        if letter is None:
+            continue
+        rows.append((f'{letter} ' if section == 'staged' else f' {letter}',
+                     path))
+    return rows
+
+
+def _ingest_stdin():
+    """Slurp + sniff + parse stdin for ``browse-git -`` (pre-run).
+
+    Reads ``sys.stdin`` to EOF before the Browser starts — fd 0 is still
+    whatever the caller provided, so a pipe is consumed and a tty blocks
+    cat-like until ^D. The content type is sniffed from the first
+    non-blank line and the text parsed into the module ``_STDIN_*``
+    state that the root builders / previews serve; the slurped text is
+    the ONLY data source in this mode and git is never run for it.
+    Empty or unrecognized input is fatal: a clean message on stderr +
+    exit 2, before any UI exists.
+    """
+    global _STDIN_KIND, _STDIN_ROWS, _STDIN_BLOCKS
+    text = sys.stdin.read()
+    kind = _sniff_stdin_kind(text)
+    if kind is None:
+        reason = ('empty stdin input' if not text.strip() else
+                  'unrecognized stdin input — expected git diff, log, '
+                  'or status output')
+        sys.stderr.write(f'browse-git: {reason}\n')
+        sys.exit(2)
+    if kind == 'diff':
+        _STDIN_ROWS, _STDIN_BLOCKS = _parse_stdin_diff(text)
+    elif kind == 'log':
+        _STDIN_ROWS, _STDIN_BLOCKS = _parse_stdin_log(text)
+    elif kind == 'porcelain':
+        # The NUL ``-z`` form parses with the existing porcelain parser.
+        _STDIN_ROWS = (_parse_porcelain_z(text) if '\x00' in text
+                       else _parse_porcelain_lines(text))
+    else:  # 'human'
+        _STDIN_ROWS = _parse_human_status(text)
+    _STDIN_KIND = 'status' if kind in ('porcelain', 'human') else kind
+
+
+def _stdin_diff_root():
+    """Piped-diff root: one ``('sfile', i, path)`` leaf per file block.
+
+    Mirrors the commit file list's row shape (path title + colored
+    status-letter tag); the leaf preview is the file's own block from
+    the slurped text. Rebuilt from the parsed ``_STDIN_ROWS`` on every
+    (re)list — reload re-serves the parse.
+    """
+    return [Item(id=('sfile', i, path), title=path,
+                 tag=letter,
+                 tag_style=_STATUS_LETTER_STYLE.get(letter, ''),
+                 has_children=False)
+            for i, (letter, path) in enumerate(_STDIN_ROWS)]
+
+
+def _stdin_log_root():
+    """Piped-log root: one ``('slog', i)`` leaf per commit block.
+
+    The rows reuse the commit-row column conventions (short sha / author
+    / date columns + decoration chips via ``git_row_content``); the
+    decorations parse with ``remotes=set()`` so no git runs — a
+    remote-tracking ref styles as a local branch, the one concession.
+    Leaves: the per-commit file drill-down would need git; the whole
+    block is the preview instead.
+    """
+    items = []
+    for i, (sha, author, date, subject, deco) in enumerate(_STDIN_ROWS):
+        item = Item(id=('slog', i), title=subject, has_children=False)
+        item.col_sha = sha[:7]
+        item.col_author = author
+        item.col_date = date
+        item.chips = _parse_decorations(deco, remotes=set())
+        items.append(item)
+    return items
+
+
+def _stdin_log_preview(i):
+    """Piped-log preview: the commit's own block from the slurped text.
+
+    A block carrying patch content (``log -p``) goes through the same
+    delta pipeline as a repo diff; plain / --stat blocks are returned
+    verbatim (stat output is not a diff — matching ``_commit_preview``).
+    """
+    block = _STDIN_BLOCKS[i]
+    if re.search(r'^diff --git ', _SGR_RE.sub('', block), flags=re.MULTILINE):
+        return _colorize_diff(block)
+    return block
+
+
 # ---- children ------------------------------------------------------------
 
 
@@ -674,12 +1064,20 @@ def get_children(item_id, *, reload=False):
         # A worktree-status group drills into its files. id = ('wc',
         # bucket); scope by the same positional paths as the root.
         return _worktree_files(item_id[1], _paths)
-    # file / status leaf / filler / error / sentinel rows have no children.
+    # file / status / sfile / slog leaves and filler / error / sentinel
+    # rows have no children.
     return []
 
 
 def _root_children():
-    """Top-level rows for the active mode."""
+    """Top-level rows for the active mode (stdin kind first, then ``_mode``)."""
+    if _STDIN_KIND == 'diff':
+        return _stdin_diff_root()
+    if _STDIN_KIND == 'log':
+        return _stdin_log_root()
+    if _STDIN_KIND == 'status':
+        # The shared status builder, fed from the parsed stdin rows.
+        return _status_root()
     if _mode == 'commits':
         return _commits_root()
     if _mode == 'reflog':
@@ -1056,11 +1454,18 @@ def _status_root():
     untracked diff chosen by the ``XY`` code. A clean tree yields a single
     dim, non-drillable "working tree clean" row (sentinel id
     ``('status_clean',)``).
+
+    The ``(XY, path)`` rows come from git in repo mode and from the
+    pre-parsed stdin state in ``browse-git -`` status mode — the one
+    data-source seam; everything downstream (leaves, sentinel) is shared.
     """
-    result = _run_git('status', '--porcelain', '-z')
-    if result.returncode != 0:
-        return _err_item(f'git status failed: {result.stderr.strip()}')
-    rows = _parse_porcelain_z(result.stdout)
+    if _STDIN_KIND == 'status':
+        rows = _STDIN_ROWS
+    else:
+        result = _run_git('status', '--porcelain', '-z')
+        if result.returncode != 0:
+            return _err_item(f'git status failed: {result.stderr.strip()}')
+        rows = _parse_porcelain_z(result.stdout)
     if not rows:
         return [Item(id=('status_clean',), title='working tree clean',
                      tag_style='dim', has_children=False)]
@@ -1235,8 +1640,18 @@ def get_preview(item_id):
         return _commit_preview(item_id[1])
     if kind == 'file':
         return _file_preview(item_id[1], item_id[2])
+    if kind == 'sfile':
+        # A per-file block of a piped diff — the same delta pipeline as a
+        # repo diff, fed from the slurped text. id = ('sfile', i, path).
+        return _colorize_diff(_STDIN_BLOCKS[item_id[1]])
+    if kind == 'slog':
+        # A commit block of a piped log. id = ('slog', i).
+        return _stdin_log_preview(item_id[1])
     if kind == 'status':
         # id = ('status', xy, path).
+        if _STDIN_KIND == 'status':
+            # Piped status carries no diff text — show the entry itself.
+            return f'{item_id[1]} {item_id[2]}'
         return _status_preview(item_id[1], item_id[2])
     if kind == 'wc':
         # A worktree-status group — a --stat summary of the bucket (the
@@ -1408,8 +1823,15 @@ def on_enter(ctx):
 
 
 def switch_mode(ctx):
-    """Backtick — pick one of the five modes, then re-list the root."""
+    """Backtick — pick one of the five modes, then re-list the root.
+
+    In stdin mode (``browse-git -``) every other view would re-run git,
+    which piped input forbids — flash and stay put instead.
+    """
     global _mode
+    if _STDIN_KIND is not None:
+        ctx.flash('mode switch not available for piped input')
+        return
     chosen = ctx.pick('mode', list(_MODES))
     if chosen is None or chosen == _mode:
         return
@@ -1425,15 +1847,18 @@ def switch_mode(ctx):
 def edit_file(ctx):
     """``E`` — open the real working-tree file in $EDITOR.
 
-    Only file/status rows map to a working-tree path; other row kinds
-    (commits, refs, stashes) are a no-op. ``('file', …)`` paths are
-    repo-root relative, so resolve them against the work-tree root.
+    Only file/status rows (and a piped diff's file rows) map to a
+    working-tree path; other row kinds (commits, refs, stashes) are a
+    no-op. ``('file', …)`` paths are repo-root relative, so resolve them
+    against the work-tree root — outside a repo (possible in stdin mode)
+    the rev-parse fails and the path opens cwd-relative.
     """
     item = ctx.cursor
     if item is None or not isinstance(item.id, tuple):
         return
-    # ('file', sha, path) and ('status', xy, path) both carry the path at id[2].
-    if item.id[0] in ('file', 'status'):
+    # ('file', sha, path) / ('status', xy, path) / ('sfile', i, path) all
+    # carry the path at id[2].
+    if item.id[0] in ('file', 'status', 'sfile'):
         path = item.id[2]
     else:
         return
@@ -1458,9 +1883,13 @@ def toggle_tree(ctx):
     Toggles ``_tree_mode`` and refreshes the root so the commit log is
     rebuilt through the now-current builder — adding (or dropping) git's
     graph column and the interleaved filler rows. Affects commits mode and
-    the branches-mode ref drill-down; other modes ignore the flag.
+    the branches-mode ref drill-down; other modes ignore the flag. In
+    stdin mode the graph would need ``git log --graph`` — flash instead.
     """
     global _tree_mode
+    if _STDIN_KIND is not None:
+        ctx.flash('commit graph not available for piped input')
+        return
     _tree_mode = not _tree_mode
     ctx.flash(f'commit graph: {"on" if _tree_mode else "off"}')
     ctx.refresh()
@@ -1499,9 +1928,23 @@ _HELP_INTRO_TMPL = """\
 browse-git — a tig-like browser over a git repository.
 
 Usage: browse-git [<dir>] [-n NUMBER] [--mode NAME] [--no-tree] [--all] [<rev>…] [-- <path>…]
+       git diff | browse-git -     (also git log / log -p / status output)
   <dir>         A leading directory in another git repo browses THAT repo
                 (cwd need not be a repo). A subdir of the current repo
                 stays a pathspec filter instead.
+  -             Read git output from stdin instead of running git (no
+                repo needed). The type is sniffed from the first
+                non-blank line: a diff (a 'diff --git' header or
+                '--- a/' hunk) lists one row per file with its hunks as
+                the preview; a log ('commit <sha>' blocks, --stat / -p
+                included) lists commit rows with each commit's block as
+                the preview; status output (porcelain 'XY path' lines
+                or the human 'On branch …' form) shows the status view.
+                Previews come from the piped text only; reload (ctrl-r)
+                re-serves it; ` and t need git and flash instead.
+                Combines with no other argument or flag. Empty or
+                unrecognized input is an error before the UI starts.
+                Bare browse-git never reads stdin.
   -n NUMBER     Cap the commit / reflog list to this many entries
                 (default: {default}).
   --mode NAME   Start in one of: {modes}. Default: commits.
@@ -1555,8 +1998,15 @@ def _classify_positionals():
     is fatal (stderr + exit 2). Leftover flag-like tokens (``-h`` /
     ``--help``) before the ``--`` are skipped so the framework's help
     auto-detect still fires.
+
+    Scans ``recipe_argv()`` so the framework's ``--tty`` flag and its
+    value are dropped first — otherwise a ``--tty /dev/pts/N`` device
+    path would be misclassified as a pathspec (or fail as an unknown
+    rev). ``_pop_repo_dir`` may already have removed a leading repo-dir
+    positional from ``sys.argv``; ``recipe_argv()`` reads ``sys.argv``
+    live, so that removal is honoured here.
     """
-    args = sys.argv[1:]
+    args = recipe_argv()
     if '--' in args:
         cut = args.index('--')
         head, tail = args[:cut], args[cut + 1:]
@@ -1584,8 +2034,10 @@ def _window_title():
     construction-time title — e.g. ``browse-git [commits: src/ HEAD~5]``.
     ``--all`` shows as the literal ``--all`` token (not the every-branch
     list it expands to). Modes other than ``commits`` don't take a filter,
-    so only the mode is shown for them.
+    so only the mode is shown for them. Stdin mode shows the sniffed kind.
     """
+    if _STDIN_KIND is not None:
+        return f'browse-git [stdin: {_STDIN_KIND}]'
     parts = (['--all'] if _all_branches else []) + _revs + _paths
     if _mode == 'commits' and parts:
         return f'browse-git [{_mode}: {" ".join(parts)}]'
@@ -1594,11 +2046,28 @@ def _window_title():
 
 def main():
     global _browser, _log_limit, _mode, _tree_mode, _all_branches
+    # ``browse-git -`` ingests git output from stdin (explicit ``-`` only —
+    # the bare form never reads stdin). It names the whole data source, so
+    # it combines with nothing: any other argument or flag is a usage
+    # error. The repo preconditions below are skipped — piped input needs
+    # neither git on PATH nor a work tree. The remaining argv plumbing
+    # (flag pops, the positional classifier) is inert on a lone ``-``.
+    # ``recipe_argv()`` drops the framework's ``--tty`` flag (and its
+    # value) first, so a ``-`` that is the VALUE of ``--tty -`` (UI over
+    # the std streams, consumed by Browser.run()) is gone and only a
+    # genuine stdin ``-`` is left to match here.
+    args = recipe_argv()
+    if '-' in args:
+        if args != ['-']:
+            sys.stderr.write('browse-git: - (stdin) cannot be combined '
+                             'with other arguments or flags\n')
+            sys.exit(2)
+        _ingest_stdin()
     # git presence + a work tree are preconditions — fail fast before the
     # TUI launches rather than surfacing an in-list error row. Skip the
     # checks when a help token is present so ``--help`` still reaches
     # Browser.run()'s help auto-detect even outside a repo.
-    if not any(a in ('-h', '--help') for a in sys.argv[1:]):
+    elif not any(a in ('-h', '--help') for a in sys.argv[1:]):
         if not shutil.which('git'):
             sys.stderr.write('browse-git: git not found on PATH\n')
             sys.exit(2)

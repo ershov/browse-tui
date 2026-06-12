@@ -444,7 +444,9 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument('-p', '--preview-cmd', metavar='CMD',
                    help='Bash command for the preview pane.')
     p.add_argument('--root-cmd', metavar='CMD',
-                   help='Eager mode — emits the entire tree on stdout.')
+                   help='Eager mode — CMD emits the entire tree on stdout. '
+                        "Use '-' to read the tree directly from stdin "
+                        "('cat' is accepted as an alias).")
     # Input format
     p.add_argument('-i', '--input', metavar='FMT', default='tsv',
                    type=_validate_input_format,
@@ -1322,7 +1324,7 @@ def _terminal_cols_for_auto(tty_path=None, default=80):
     1. The resolved terminal device via ``TIOCGWINSZ`` — for the
        ``/dev/tty`` default (or an explicit path) this works even when
        stdin AND stdout are pipes (e.g.
-       ``printf … | browse-tui --root-cmd cat | cat``), because the
+       ``printf … | browse-tui --root-cmd - | cat``), because the
        terminal is independent of the std streams. For ``--tty -`` the
        device *is* the std streams, so this probes fd 0 then fd 1.
     2. ``shutil.get_terminal_size()`` — honours an explicit
@@ -1546,20 +1548,21 @@ def _build_lazy_browser(args, fields, record_sep, *, split='h'):
 def _build_eager_browser(args, fields, record_sep, *, split='h'):
     """Build a Browser whose root data was produced eagerly by ``--root-cmd``.
 
-    The special-case ``--root-cmd cat`` reads stdin verbatim (so a pipe
-    like ``printf 'a\\nb\\nc\\n' | browse-tui --root-cmd cat`` works
-    without spawning anything). Any other value runs the command via
-    bash and consumes its stdout. The parsed rows feed
-    ``Browser.from_flat_tree`` — hierarchy detection (parent / depth /
-    flat) is handled there.
+    The canonical ``--root-cmd -`` reads stdin verbatim (so a pipe like
+    ``printf 'a\\nb\\nc\\n' | browse-tui --root-cmd -`` works without
+    spawning anything); bare ``--root-cmd cat`` is kept as an alias for
+    ``-`` (exactly ``cat`` — ``--root-cmd 'cat file'`` still runs as a
+    command). Any other value runs the command via bash and consumes its
+    stdout. The parsed rows feed ``Browser.from_flat_tree`` — hierarchy
+    detection (parent / depth / flat) is handled there.
     """
-    if args.root_cmd == 'cat':
+    if args.root_cmd in ('-', 'cat'):
         data = sys.stdin.buffer.read()
         # The UI reads keys from the terminal device (``--tty``, default
         # /dev/tty), not from sys.stdin — so consuming the piped stdin
         # here (the common case, ``printf '…' | browse-tui --root-cmd
-        # cat``) leaves fd 0 alone and the keyboard still works. No
-        # stdin reopen is needed (and none happens).
+        # -``) leaves fd 0 alone and the keyboard still works. No stdin
+        # reopen is needed (and none happens).
     else:
         try:
             proc = subprocess.run(

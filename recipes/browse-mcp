@@ -33,7 +33,7 @@ import subprocess
 import sys
 import threading
 
-from browse_tui import Action, Browser, BrowserConfig, Item
+from browse_tui import Action, Browser, BrowserConfig, Item, recipe_argv
 
 
 _ERROR = object()
@@ -290,9 +290,14 @@ def _usage_error():
 
 def main():
     global _client
-    if len(sys.argv) < 2:
+    # The whole argv tail is the MCP server command. Read it via
+    # ``recipe_argv()`` so the framework's ``--tty`` flag (and its value)
+    # is dropped first: ``Browser.run()`` auto-detects ``--tty`` but leaves
+    # it in ``sys.argv``, so a raw ``sys.argv[1:]`` would leak ``--tty -`` /
+    # ``--tty /dev/pts/N`` into the spawned server command.
+    cmd = recipe_argv()
+    if not cmd:
         _usage_error()
-    cmd = sys.argv[1:]
     _client = _MCPClient(cmd)
     title = f'browse-mcp: {" ".join(cmd)}'
     sys.exit(Browser(BrowserConfig(

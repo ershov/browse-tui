@@ -104,6 +104,27 @@ def _stub_browse_tui():
     # focus flow directly, so a no-op returning [] is fine.
     mod.visible_items = lambda state: []
 
+    # ``recipe_argv`` drops the framework's ``--tty VALUE`` / ``--tty=VALUE``
+    # flag from the recipe's positional scan (mirrors 040-state.py). Tests
+    # patch ``sys.argv`` before driving ``main()``, so reading it here
+    # matches what the recipe sees.
+    def _recipe_argv(argv=None):
+        if argv is None:
+            argv = sys.argv[1:]
+        out, skip_next = [], False
+        for arg in argv:
+            if skip_next:
+                skip_next = False
+                continue
+            if arg == '--tty':
+                skip_next = True
+                continue
+            if arg.startswith('--tty='):
+                continue
+            out.append(arg)
+        return out
+    mod.recipe_argv = _recipe_argv
+
     sys.modules['browse_tui'] = mod
 
 
@@ -8818,6 +8839,84 @@ class TestBoundaryMigration(unittest.TestCase):
             # NOT bleed in.
             self.assertIn('PARENT-LEAF-BODY', out)
             self.assertNotIn('AGENT-INTERNAL-BODY', out)
+
+
+class _StopMain(Exception):
+    """Raised by the recording Browser stub to halt ``main()`` right after
+    the ``BrowserConfig`` is built — before the live-tail thread / ``run()``."""
+
+
+class TestMainScopeArgv(unittest.TestCase):
+    """``main()`` scope resolution from argv — the framework ``--tty`` flag
+    (auto-detected by ``Browser.run()``, left in ``sys.argv``) must NOT be
+    misread as the positional PROJECT scope, while real positionals still work.
+
+    Drives ``main()`` with a recording ``Browser`` stub that captures the
+    constructed ``BrowserConfig`` and raises ``_StopMain`` so the tail
+    thread / ``run()`` are never reached. ``_scan_running_sessions`` is
+    stubbed to a no-op (no live-session probe under test).
+    """
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self._saved_argv = list(sys.argv)
+        self.r._scan_running_sessions = lambda: None
+
+    def tearDown(self):
+        sys.argv[:] = self._saved_argv
+
+    def _run_main(self, argv):
+        """Drive ``main()`` with ``argv``; return the captured BrowserConfig."""
+        captured = {}
+
+        def _rec_browser(config, *a, **kw):
+            captured['config'] = config
+            raise _StopMain
+
+        self.r.Browser = _rec_browser
+        sys.argv[:] = ['browse-claude', *argv]
+        try:
+            self.r.main()
+        except _StopMain:
+            pass
+        return captured.get('config')
+
+    def test_tty_flag_is_not_the_project_scope(self):
+        # ``--tty -`` / ``--tty=-`` / ``--tty /dev/pts/N`` are the framework
+        # UI-device flag, not a PROJECT positional: no initial_scope is set
+        # (without the fix, ``--tty`` became a bogus ('project', abspath)).
+        for argv in (['--tty', '-'], ['--tty=-'], ['--tty', '/dev/pts/9']):
+            cfg = self._run_main(argv)
+            self.assertIsNotNone(cfg, argv)
+            self.assertIsNone(cfg.initial_scope, argv)
+
+    def test_positional_project_still_becomes_scope(self):
+        # A real positional PROJECT dir is still seeded as the scope root.
+        import tempfile
+        with tempfile.TemporaryDirectory() as proj:
+            cfg = self._run_main([proj])
+            self.assertEqual(cfg.initial_scope,
+                             ('project', os.path.abspath(proj)))
+
+    def test_tty_before_positional_project_resolves_the_project(self):
+        # ``--tty - PROJECT`` strips the flag/value and still scopes PROJECT
+        # (the flag preceding the positional no longer shadows it).
+        import tempfile
+        with tempfile.TemporaryDirectory() as proj:
+            cfg = self._run_main(['--tty', '-', proj])
+            self.assertEqual(cfg.initial_scope,
+                             ('project', os.path.abspath(proj)))
+
+    def test_positional_jsonl_is_promoted_to_session_scope(self):
+        # A ``.jsonl`` positional is promoted to the target session (scope
+        # becomes ('session', abspath)), unaffected by a preceding ``--tty``.
+        import tempfile
+        with tempfile.TemporaryDirectory() as proj:
+            jsonl = os.path.join(proj, 'sess.jsonl')
+            with open(jsonl, 'w') as f:
+                f.write('{}\n')
+            cfg = self._run_main(['--tty', '/dev/pts/9', jsonl])
+            self.assertEqual(cfg.initial_scope, ('session', jsonl))
 
 
 if __name__ == '__main__':

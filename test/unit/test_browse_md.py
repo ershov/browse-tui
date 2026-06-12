@@ -39,6 +39,27 @@ _REPO = Path(__file__).resolve().parents[2]
 _RECIPE = _REPO / 'recipes' / 'browse-md'
 
 
+def _stub_recipe_argv(argv=None):
+    """Stub of the framework's ``recipe_argv`` (mirrors 040-state.py):
+    ``sys.argv[1:]`` (or ``argv``) minus the framework's ``--tty VALUE`` /
+    ``--tty=VALUE`` flag. Tests patch ``sys.argv`` before driving ``main()``,
+    so reading it here matches what the recipe sees."""
+    if argv is None:
+        argv = sys.argv[1:]
+    out, skip_next = [], False
+    for arg in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == '--tty':
+            skip_next = True
+            continue
+        if arg.startswith('--tty='):
+            continue
+        out.append(arg)
+    return out
+
+
 def _stub_browse_tui():
     """Insert a no-op ``browse_tui`` module so the recipe can import.
 
@@ -81,6 +102,7 @@ def _stub_browse_tui():
     mod.Browser = _BrowserStub
     mod.BrowserConfig = _Stub
     mod.Item = _Stub
+    mod.recipe_argv = _stub_recipe_argv
     sys.modules['browse_tui'] = mod
 
 
@@ -4459,6 +4481,283 @@ class TestOnResize(unittest.TestCase):
             drops, [None],
             'on_resize must drop the entire preview cache (id=None) so the '
             'framework re-fetches the cursor preview at the new width')
+
+
+class TestStdinDocument(unittest.TestCase):
+    """``browse-md -`` reads ONE document from stdin (spec §3.3 / §3.7).
+
+    ``main()`` slurps ``sys.stdin`` before the UI starts and parses the
+    text through the same ``_reparse`` pipeline as a file, stamping the
+    sentinel path ``_STDIN_PATH`` and a ``(stdin)`` root title. These
+    tests drive ``main()`` with a stubbed stdin and the no-op
+    ``browse_tui`` stub (so the run loop is never reached — construction
+    raises ``AttributeError`` past which all the state we assert on has
+    already landed), then inspect the module globals / the constructed
+    Browser config exactly like the file-mode argv tests above.
+    """
+
+    def setUp(self):
+        self.r = _load_recipe()
+
+    def _run_main(self, stdin, argv=('browse-md', '-')):
+        """Drive ``main()`` with ``stdin`` piped in; return Browser.
+
+        ``stdin`` is either the text to slurp (wrapped in a minimal
+        object whose ``.read()`` yields it, matching the recipe's
+        ``sys.stdin.read()`` call) OR a ready-made stdin stand-in (any
+        object that already has a ``.read`` method — e.g.
+        ``_RaiseOnRead`` for the modes that must NOT touch stdin).
+        ``SystemExit`` (error paths) and ``AttributeError`` (the stubbed
+        Browser lacking ``run``) are swallowed; the returned value is
+        ``self.r._BROWSER`` (set just before ``b.run()``), or ``None`` if
+        main exited earlier.
+        """
+        import contextlib
+        import io
+
+        class _FakeStdin:
+            def __init__(self, text):
+                self._text = text
+
+            def read(self):
+                return self._text
+
+        fake = stdin if hasattr(stdin, 'read') else _FakeStdin(stdin)
+        saved_stdin = self.r.sys.stdin
+        self.r.sys.argv[:] = list(argv)
+        buf = io.StringIO()
+        try:
+            self.r.sys.stdin = fake
+            with contextlib.redirect_stderr(buf):
+                try:
+                    self.r.main()
+                except (SystemExit, AttributeError):
+                    pass
+        finally:
+            self.r.sys.stdin = saved_stdin
+        self._stderr = buf.getvalue()
+        return self.r._BROWSER
+
+    # -- piped document: tree + preview + title -----------------------
+
+    def test_input_files_is_the_stdin_sentinel(self):
+        self._run_main('# Title\n## Section\nbody\n')
+        self.assertEqual(self.r._INPUT_FILES, [(self.r._STDIN_PATH, '')])
+        self.assertEqual(self.r._STDIN_TEXT, '# Title\n## Section\nbody\n')
+        # No anchor for a lone ``-``.
+        self.assertEqual(self.r._ANCHOR, '')
+
+    def test_root_title_is_stdin(self):
+        self._run_main('# Title\n## Section\nbody\n')
+        fs = self.r._FILES[self.r._STDIN_PATH]
+        self.assertEqual(fs.file_root.title, '(stdin)')
+
+    def test_heading_tree_built_from_piped_text(self):
+        self._run_main('# Title\n## Section\nbody\n')
+        root_id = ('file', self.r._STDIN_PATH)
+        # Top-level entries: exactly the one stdin doc.
+        tops = self.r.get_children(None)
+        self.assertEqual([t.id for t in tops], [root_id])
+        # The file root's children: the single h1.
+        kids = self.r.get_children(root_id)
+        self.assertEqual([k.tag for k in kids], ['h1'])
+        # ...and the h1's child: the h2.
+        sub = self.r.get_children(kids[0].id)
+        self.assertEqual([s.tag for s in sub], ['h2'])
+
+    def test_preview_of_stdin_root_is_full_text(self):
+        # md2ansi colouring off so the preview is the raw body verbatim.
+        self.r._MD_COLOR = False
+        text = '# Title\n## Section\nbody\n'
+        self._run_main(text)
+        preview = self.r.get_preview(('file', self.r._STDIN_PATH))
+        self.assertEqual(preview, text)
+
+    def test_preview_of_heading_is_its_section_slice(self):
+        self.r._MD_COLOR = False
+        self._run_main('# Title\n## Section\nbody\n')
+        kids = self.r.get_children(('file', self.r._STDIN_PATH))
+        h1_id = kids[0].id
+        # The h1 spans the whole document (it's the only top-level
+        # heading), so its slice is the full body.
+        self.assertEqual(self.r.get_preview(h1_id), '# Title\n## Section\nbody\n')
+
+    def test_single_doc_auto_expands_like_single_file(self):
+        # One stdin doc behaves like a single file: main() posts exactly
+        # one expand on the file root (the lone-heading cascade is the
+        # on_expand hook's job, not recorded by the stub).
+        b = self._run_main('# Title\n## Section\nbody\n')
+        ids = [c[0] for c in b.expand_calls]
+        self.assertEqual(ids, [('file', self.r._STDIN_PATH)])
+        # initial_scope stays None — we auto-expand rather than scope in.
+        self.assertIsNone(b.config.initial_scope)
+        self.assertIsNone(b.config.root_id)
+
+    # -- empty stdin behaves like an empty .md file -------------------
+
+    def test_empty_stdin_is_an_empty_document(self):
+        # Match an empty file: a root with no children, has_children
+        # False (same assertions as TestEdgeCases.test_empty_file, but
+        # reached through the stdin path).
+        self._run_main('')
+        self.assertEqual(self.r._STDIN_TEXT, '')
+        fs = self.r._FILES[self.r._STDIN_PATH]
+        self.assertEqual(fs.file_root._children, [])
+        self.assertFalse(fs.file_root.has_children)
+        self.assertEqual(self.r.get_children(('file', self.r._STDIN_PATH)), [])
+
+    # -- sentinel collision is harmless --------------------------------
+
+    def test_piped_content_wins_over_same_named_disk_file(self):
+        # Interception-before-open: with a REAL file sitting at the
+        # sentinel path (a file literally named like the sentinel in
+        # cwd), stdin mode still serves the piped text — the sentinel
+        # never reaches ``open()``. Pins the seam's "the sentinel is
+        # intercepted before any filesystem call" guarantee.
+        import os
+        import tempfile
+        self.r._MD_COLOR = False
+        piped = '# Piped\nbody\n'
+        with tempfile.TemporaryDirectory() as tmp:
+            disk = os.path.join(tmp, os.path.basename(self.r._STDIN_PATH))
+            with open(disk, 'w', encoding='utf-8') as f:
+                f.write('# Disk\nWRONG\n')
+            saved = self.r._STDIN_PATH
+            self.r._STDIN_PATH = disk
+            try:
+                self._run_main(piped)
+                fs = self.r._FILES[disk]
+                self.assertEqual(fs.file_root.title, '(stdin)')
+                self.assertEqual(
+                    self.r.get_preview(('file', disk)), piped)
+            finally:
+                self.r._STDIN_PATH = saved
+
+    # -- bare / FILE modes untouched ----------------------------------
+
+    def test_bare_invocation_still_browses_cwd(self):
+        # No ``-``: the recipe browses ``.`` and never touches stdin.
+        # We drive a no-positional argv in a temp dir holding one .md so
+        # the directory expansion has something to find.
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, 'a.md'), 'w') as f:
+                f.write('# A\n')
+            cwd = os.getcwd()
+            os.chdir(tmp)
+            try:
+                # ``read()`` would raise if main() touched stdin in this
+                # mode — it must not.
+                self._run_main(
+                    _RaiseOnRead(), argv=('browse-md',))
+            finally:
+                os.chdir(cwd)
+        # stdin was never consumed; the input is the cwd's file, not the
+        # sentinel.
+        self.assertIsNone(self.r._STDIN_TEXT)
+        self.assertNotIn(self.r._STDIN_PATH,
+                         [p for p, _ in self.r._INPUT_FILES])
+        self.assertEqual(len(self.r._INPUT_FILES), 1)
+
+    def test_file_mode_untouched(self):
+        # ``browse-md FILE`` never touches stdin and never stamps the
+        # sentinel.
+        import os
+        import tempfile
+        f = tempfile.NamedTemporaryFile(
+            'w', suffix='.md', delete=False, encoding='utf-8')
+        f.write('# F\n## S\n')
+        f.close()
+        self.addCleanup(os.unlink, f.name)
+        self._run_main(_RaiseOnRead(), argv=('browse-md', f.name))
+        self.assertIsNone(self.r._STDIN_TEXT)
+        self.assertEqual(self.r._INPUT_FILES, [(f.name, '')])
+
+    # -- '-#anchor' is out of scope: rejected, never half-works -------
+
+    def test_dash_anchor_rejected_as_unrecognised_option(self):
+        # ``-#section`` is NOT a lone ``-`` and starts with ``-``, so the
+        # leftover-option scan rejects it (exit 2) before any stdin read.
+        # It must never half-work as a stdin deep-link.
+        import contextlib
+        import io
+        self.r.sys.argv[:] = ['browse-md', '-#section']
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            with self.assertRaises(SystemExit) as cm:
+                self.r.main()
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn('unrecognised option: -#section', buf.getvalue())
+        # Stdin was never stamped.
+        self.assertIsNone(self.r._STDIN_TEXT)
+
+    # -- --tty - is the framework UI flag, not stdin / not an option --
+
+    def test_tty_dash_value_is_not_an_option_or_positional(self):
+        # ``--tty -`` / ``--tty=-`` is the framework's UI-over-std-streams
+        # flag (auto-detected by Browser.run(), left in sys.argv). The
+        # recipe must drop it before the leftover-option scan — NOT die
+        # "unrecognised option: --tty" — and must not read stdin: with no
+        # real positional it falls through to bare mode (browse cwd). A
+        # ``--tty /dev/pts/N`` device path is dropped too, not taken as a
+        # FILE positional.
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, 'a.md'), 'w') as f:
+                f.write('# A\n')
+            cwd = os.getcwd()
+            os.chdir(tmp)
+            try:
+                for argv in (('browse-md', '--tty', '-'),
+                             ('browse-md', '--tty=-'),
+                             ('browse-md', '--tty', '/dev/pts/9')):
+                    self.r = _load_recipe()
+                    # _RaiseOnRead fires if main() touched stdin here.
+                    self._run_main(_RaiseOnRead(), argv=argv)
+                    self.assertEqual(self._stderr, '', argv)
+                    self.assertIsNone(self.r._STDIN_TEXT, argv)
+                    # Bare mode: the cwd's file is the input, not the
+                    # sentinel; the device path never became a positional.
+                    self.assertNotIn(
+                        self.r._STDIN_PATH,
+                        [p for p, _ in self.r._INPUT_FILES], argv)
+                    self.assertEqual(len(self.r._INPUT_FILES), 1, argv)
+            finally:
+                os.chdir(cwd)
+
+    def test_tty_dash_does_not_disarm_real_stdin_dash(self):
+        # Stripping ``--tty -`` must leave a genuine positional ``-``
+        # reading stdin: ``browse-md --tty - -`` still slurps the doc.
+        self._run_main('# Piped\n## S\n', argv=('browse-md', '--tty', '-', '-'))
+        self.assertEqual(self.r._INPUT_FILES, [(self.r._STDIN_PATH, '')])
+        self.assertEqual(self.r._STDIN_TEXT, '# Piped\n## S\n')
+
+    # -- V / E degrade gracefully on the stdin document ---------------
+
+    def test_view_edit_source_flash_on_stdin_document(self):
+        # With the stdin doc active, ``V`` / ``E`` (on-disk source) have
+        # no file to act on: they flash and run nothing. Built-in v/e
+        # (preview text) are unaffected and not exercised here.
+        self._run_main('# Title\n## Section\nbody\n')
+        root = _SrcItem(id=('file', self.r._STDIN_PATH), kind='root')
+        for env_var, default in (('PAGER', 'less -R'), ('EDITOR', 'vim')):
+            with self.subTest(env_var=env_var):
+                ctx = _SrcCmdCtx(targets=[root])
+                self.r._run_source_command(ctx, env_var, default)
+                self.assertEqual(ctx.calls, [],
+                                 'no external tool should run for stdin')
+                self.assertEqual(len(ctx.flashes), 1)
+                self.assertIn('stdin', ctx.flashes[0])
+
+
+class _RaiseOnRead:
+    """A stdin stand-in whose ``read()`` raises — proves stdin is NOT
+    consumed in the non-stdin invocation modes (bare / FILE)."""
+
+    def read(self):  # pragma: no cover - only hit on a regression
+        raise AssertionError('sys.stdin.read() called outside stdin mode')
 
 
 if __name__ == '__main__':

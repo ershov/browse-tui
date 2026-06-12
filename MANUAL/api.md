@@ -40,6 +40,7 @@ see [recipes.md](recipes.md); for the CLI surface see
 - [`Browser`](#browser)
   - [Constructor](#constructor)
   - [Lifecycle hooks](#lifecycle-hooks)
+  - [Content channels (stdin / stdout)](#content-channels-stdin--stdout)
   - [Callbacks](#callbacks)
   - [Lifecycle](#lifecycle)
   - [Thread-safe public ops](#thread-safe-public-ops)
@@ -256,6 +257,10 @@ recognize them in code and logs — an `Action` bound to one never fires:
   mouse reports with the coordinates baked into the name, routed to the
   built-in mouse dispatch (cursor placement, pane scrolling).
 - `'_notify'` — wakeup from the internal notification pipe (background ops).
+- `'_writable'` — stdout content channel can take more bytes; drains the
+  `ctx.print` buffer (see [Content channels](#content-channels-stdin--stdout)).
+- `'_stdin'` — stdin content channel has data or hit EOF; pumps the
+  `on_stdin` stream.
 - `'_unknown'` — unrecognized escape sequence; silently ignored.
 - `'_mouse'` — ignored mouse event (button release, right-click, drag, …).
 
@@ -307,6 +312,7 @@ ctx.select(ids, replace=False)        -> None
 ctx.flash(text, log=False)            -> None
 ctx.log(text)                         -> None
 ctx.error(text)                       -> None
+ctx.print(text, end='\n')             -> None
 ctx.quit(code=0, output='')           -> None
 ```
 
@@ -320,7 +326,8 @@ ctx.quit(code=0, output='')           -> None
 | `flash`      | Transient info-bar notice; `log=True` also records it in the log.    |
 | `log`        | Append to the message log silently (no on-screen notice).           |
 | `error`      | Red, sticky info-bar notice; always logged; cleared by next keypress.|
-| `quit`       | Exit the main loop with `code`; print `output` to stdout afterwards. |
+| `print`      | Write to the stdout content channel (see *Output — `ctx.print`*).    |
+| `quit`       | Exit the main loop with `code`; `output` joins the stdout channel after any `print` (strict FIFO). |
 
 ### Cache introspection
 
@@ -639,13 +646,13 @@ default content handler is the one that consults `show_ids`).
 
 ### Lifecycle hooks
 
-Ten optional callback kwargs let recipes react to framework events
+These optional callback kwargs let recipes react to framework events
 without polling. Every hook takes `ctx` followed by **the subject of
 the change** — there is no `(ctx)`-only hook. Recipes can still read
 the same data off `ctx` (`ctx.cursor`, `ctx.selected`, `ctx.filters`,
-…); the payload is the convenient, uniform path. All ten are
-optional `BrowserConfig` fields, mirrored as `Browser(...)` kwargs,
-`None` by default and a no-op when unset:
+…); the payload is the convenient, uniform path. All are optional
+`BrowserConfig` fields, mirrored as `Browser(...)` kwargs, `None` by
+default and a no-op when unset:
 
 ```python
 Browser(...,
@@ -661,7 +668,9 @@ Browser(...,
         # input state / geometry
         on_search_change=cb,     # (ctx, query)  effective search query changed
         on_filter_change=cb,     # (ctx, filters)  active filter tuple changed
-        on_resize=cb)            # (ctx, cols, rows)  terminal resized
+        on_resize=cb,            # (ctx, cols, rows)  terminal resized
+        # content channel (NOT drain-time; see Content channels below)
+        on_stdin=cb)             # (ctx, data, *, delimiter, is_eof, errno)
 ```
 
 | Hook | Signature | When it fires | Notes |
@@ -676,14 +685,19 @@ Browser(...,
 | `on_search_change` | `(ctx, query)` | When the effective search query changes — live per keystroke in search-edit mode, and on `set_search_query` / `clear_search`. | `query` is the new string (also `ctx.search_query`). Debounced to one fire per drain on the final value; clearing to `''` fires once. |
 | `on_filter_change` | `(ctx, filters)` | When the committed-plus-live filter list changes (`&` typing/commit/clear, `set_filters` / `add_filter` / `clear_filters`). | `filters` is the `tuple[str, ...]` also returned by `ctx.filters`. Debounced per drain; an identical re-set is a no-op; `add_filter('')` is a no-op. |
 | `on_resize` | `(ctx, cols, rows)` | When the terminal dimensions change (SIGWINCH path). | `cols` / `rows` are the new dimensions. Lets recipes drop width-dependent caches up front rather than lazily on the next `get_preview`. |
+| `on_stdin` | `(ctx, data, *, delimiter, is_eof, errno)` | As bytes arrive on the stdin content channel during the run (not a state transition). | The streaming-input channel — a different mechanism from the observed-state hooks above. Full contract in [Content channels](#content-channels-stdin--stdout) below. |
 
-All hooks are **source-agnostic** (they fire on the state transition,
-not the keystroke — keyboard, mouse, programmatic call, and startup
+The observed-state hooks (everything except `on_stdin`) are
+**source-agnostic** (they fire on the state transition, not the
+keystroke — keyboard, mouse, programmatic call, and startup
 auto-expands all count) and **drain-time / debounced** (coalesced to
 one fire per main-loop tick; set / burst events deliver the whole
-burst as one list). Every hook except `on_quit` routes exceptions to
-`Browser.error` (a red info-bar message) and never crashes the loop;
-`on_quit` swallows silently so a failing cleanup can't block exit.
+burst as one list). `on_stdin` is neither: it is driven by the select
+loop as input arrives, one delivery per chunk / record — see
+[Content channels](#content-channels-stdin--stdout). Every hook except
+`on_quit` routes exceptions to `Browser.error` (a red info-bar message)
+and never crashes the loop; `on_quit` swallows silently so a failing
+cleanup can't block exit.
 
 > **Note:** `on_expand` / `on_collapse` are source-agnostic about the
 > *gesture* too — insert-mode marker movement that re-roots the tree
@@ -795,6 +809,125 @@ mutation sites (as the scope / selection change is applied), while
 `on_expand`, `on_children_loaded`, and `on_cursor_change` fire in a
 post-drain settle pass. Each hook still fires at most once per logical
 change per drain.
+
+### Content channels (stdin / stdout)
+
+With the UI on its own terminal device, the process's `stdin` and
+`stdout` are free to carry content while the UI runs. `stderr` is left
+untouched — an escape hatch for diagnostics; tracebacks still reach it.
+The CLI-user-facing side of this is in
+[cli.md](cli.md#content-channels-stdin-in-stdout-out); the recipe-author
+APIs are below.
+
+**Initial input** is plain `sys.stdin` read *before* `Browser.run()` —
+there is no framework API, and none is possible (`ctx` does not exist
+yet). Slurp (`sys.stdin.read()`), iterate lines (`for line in
+sys.stdin`), or split records (`sys.stdin.buffer.read().split(b'\0')`)
+in the recipe's setup, then build the tree. On a tty the read blocks
+until `^D` (standard `cat` behaviour). stdin is one-shot — `Ctrl-R`
+reload re-serves the parsed in-memory data, so no re-read is needed.
+
+#### Output — `ctx.print`
+
+```python
+ctx.print(text, end='\n')             -> None
+```
+
+Mirrors builtin `print` (`text` is `str()`-coerced and newline-terminated
+unless `end` overrides it) and appends to a single output buffer shared
+with `ctx.quit`'s `output`, so everything is delivered in strict **FIFO**
+order — prints first, then the quit output. It **never blocks the UI**;
+delivery depends on what `stdout` is:
+
+- **pipe / file:** drained live by the event loop as the consumer keeps
+  up — a slow / backpressuring reader does not stall the UI.
+- **tty:** held for the whole session and written to normal scrollback at
+  exit, after the UI closes (the `fzf` model — a bare interactive run
+  still prints its result, with the selection last).
+- **consumer gone (`EPIPE`):** the channel is dead for the rest of the
+  session — the buffer is dropped and later `ctx.print` calls are no-ops.
+  The UI stays alive (it is on the terminal device, independent of stdout).
+
+`ctx.print` is thread-safe (callable from worker threads).
+
+#### Streaming input — `on_stdin`
+
+To consume stdin **live while the UI runs** (a tail-feed, a record
+stream), opt in via three `BrowserConfig` fields:
+
+```python
+Browser(...,
+        on_stdin=handle,                 # the hook
+        stdin_delimiter=None,            # None = raw chunks; or a delimiter
+        stdin_raw_bytes=False)           # False = decoded str; True = bytes
+```
+
+The hook signature — the framework **always** passes every keyword:
+
+```python
+def on_stdin(ctx, data, *, delimiter, is_eof, errno):
+    ...
+```
+
+- **`data`** — `str` (or `bytes` when `stdin_raw_bytes=True`), **never
+  `None`**; may be empty (`''` / `b''`, e.g. an empty record). `str` is
+  decoded with an **incremental utf-8 decoder** (`errors='replace'`), so a
+  multibyte sequence split across chunk boundaries decodes correctly and
+  invalid bytes become U+FFFD. Empty `data` flows through typical
+  processing as zero records, so a hook that ignores the flags never
+  crashes on it.
+- **`stdin_delimiter`** selects the framing:
+  - **`None` (raw-chunk mode):** one call per chunk as it arrives;
+    `delimiter` is always `''` (or `b''`).
+  - **a delimiter** (`'\n'` for lines, `'\0'` for NUL records,
+    multi-char supported): the framework owns partial-record buffering and
+    delivers **one complete record per call**, delimiter stripped, with the
+    stripped delimiter passed back in `delimiter`. **Empty records are
+    preserved** — `"a\n\n"` delivers record `"a"`, then `""`, then the EOF
+    call. The delimiter's **type must match the data mode** — `str` in the
+    default mode, `bytes` when `stdin_raw_bytes=True`; a type mismatch (or
+    an empty delimiter of either type) raises **`ValueError` at
+    construction**.
+- **`is_eof`** — `True` on the **final** call; its `data` is the trailing
+  *unterminated* record (or empty if the stream ended on a delimiter), with
+  `delimiter` empty. Record mode is therefore unambiguous about whether a
+  trailing partial existed.
+- **`errno`** — `0` on every normal call; on a read error the stream ends
+  with a final call carrying the numeric errno **and** `is_eof=True`
+  (error implies no more data, so a hook that only checks `is_eof` handles
+  error-end correctly for free).
+
+After the EOF / error call the stream **never resumes** — fd 0 leaves the
+select set for good. The hook typically folds incoming data into the tree
+via `ctx.update_data` / `ctx.upsert`. Exceptions are caught and routed to
+`ctx.error` (like the observed-state hooks).
+
+**Fairness:** the keyboard outranks the stream — a saturating producer
+(a `yes`-style firehose) still leaves the session quittable, because
+`read_key` reads the terminal before the loop pumps another stdin chunk.
+
+**Cost when unset:** zero. With no `on_stdin` the select read-set is
+exactly as without the feature; an ended stream costs one attribute check
+per loop iteration and then drops out entirely.
+
+**Composing initial reads with streaming.** Streaming begins *where the
+synchronous ingest left off*. The framework reads via `sys.stdin.buffer`,
+so a pre-run read on the **bytes** layer (`sys.stdin.buffer`) composes
+losslessly — read a header synchronously, then stream the records, with no
+bytes lost across the hand-off. A partial **text-layer** read
+(`sys.stdin.read(n)` / `sys.stdin`) does **not** compose: the text wrapper
+hides its residue. Read to EOF, or use the bytes layer, when combining a
+synchronous read with `on_stdin`.
+
+> `on_stdin` is unavailable in headless runs and under `--tty -` (there
+> fd 0 *is* the UI device). A tty stdin in normal mode is detached to
+> `/dev/null` at startup, so the hook simply receives an immediate EOF
+> call through the same code path as a closed pipe.
+
+> **Signature note:** as with every hook, the framework does not validate
+> the signature in this release — a wrong-arity `on_stdin` is the recipe
+> author's bug (caught the moment the hook first fires, surfaced via
+> `ctx.error`).
 
 ### Callbacks
 
@@ -1018,6 +1151,23 @@ Advanced escape hatch (mirrors `Context.browser`, unstable surface):
 Start workers, set up the terminal, run the main loop, tear down. Blocks
 until `ctx.quit()` (or `q`/`Esc`). Returns the exit code stashed via `quit`
 (or the cancel code 1 from a default-quit).
+
+#### `recipe_argv(argv=None) -> list`
+
+Return `argv` (default `sys.argv[1:]`) with the framework-owned terminal-device
+flag removed — `--tty VALUE` (value is the following token, consumed too) and
+`--tty=VALUE`. `run()` auto-detects that flag but leaves it in `sys.argv`, so a
+recipe scanning its own positionals should read from this instead, or it would
+misread `--tty` / its value (`-` or a `/dev/pts/N` path) as one of its own
+arguments. Returns a fresh list; `sys.argv` is left untouched on purpose — `run()`
+still reads `--tty` from it to resolve the device.
+
+```python
+from browse_tui import recipe_argv
+
+args = recipe_argv()            # this recipe's own positionals, --tty dropped
+root = args[0] if args else '.'
+```
 
 #### `Browser.add_action(action) -> None`
 
@@ -1565,6 +1715,9 @@ class BrowserConfig:
     on_filter_change: Callable | None = None       # (ctx, filters)
     on_resize: Callable | None = None              # (ctx, cols, rows)
     on_quit: Callable | None = None                # (ctx, code)
+    on_stdin: Callable | None = None               # (ctx, data, *, delimiter, is_eof, errno)
+    stdin_delimiter: str | bytes | None = None     # None = raw chunks; else record delimiter
+    stdin_raw_bytes: bool = False                  # True = bytes (data + delimiter), not str
     _headless: bool = False
 ```
 

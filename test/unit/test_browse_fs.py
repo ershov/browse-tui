@@ -26,6 +26,7 @@ Coverage:
 """
 
 import importlib.util
+import io
 import os
 import stat
 import sys
@@ -42,6 +43,27 @@ _RECIPE = _REPO / 'recipes' / 'browse-fs'
 # Sentinel the stub ``style('dim')`` returns; ``fs_row_content`` must put
 # this exact (fg, bold) pair on every metadata segment.
 _DIM = (242, False)
+
+
+def _stub_recipe_argv(argv=None):
+    """Stub of the framework's ``recipe_argv`` (mirrors 040-state.py):
+    ``sys.argv[1:]`` (or ``argv``) minus the framework's ``--tty VALUE`` /
+    ``--tty=VALUE`` flag. Tests patch ``sys.argv`` before driving ``main()``,
+    so reading it here matches what the recipe sees."""
+    if argv is None:
+        argv = sys.argv[1:]
+    out, skip_next = [], False
+    for arg in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == '--tty':
+            skip_next = True
+            continue
+        if arg.startswith('--tty='):
+            continue
+        out.append(arg)
+    return out
 
 
 def _stub_browse_tui():
@@ -78,6 +100,7 @@ def _stub_browse_tui():
         return [('DEFAULT', getattr(item, 'id', None), getattr(item, 'title', None))]
 
     mod.default_row_content = _default_row_content
+    mod.recipe_argv = _stub_recipe_argv
     sys.modules['browse_tui'] = mod
 
 
@@ -392,6 +415,319 @@ class TestActionsOnErrorRow(unittest.TestCase):
         self.r.edit(ctx)
         self.assertEqual(len(ctx.external), 1)
         self.assertEqual(ctx.external[0][-1], '/tmp/x.txt')
+
+
+class _RaiseOnRead:
+    """A stdin stand-in whose ``read()`` raises — proves stdin is NOT
+    consumed in the non-stdin invocation modes (bare / PATH)."""
+
+    def read(self):  # pragma: no cover - only hit on a regression
+        raise AssertionError('sys.stdin.read() called outside stdin mode')
+
+
+class TestStdinRoots(unittest.TestCase):
+    """``browse-fs -`` displays the stdin path list as the root level.
+
+    ``main()`` reads the newline-separated paths from ``sys.stdin`` once,
+    before the UI starts, into ``_STDIN_ROOTS`` and runs with
+    ``root_id=None`` so ``get_children(None)`` serves that list. These
+    tests drive ``main()`` with a stubbed stdin and the no-op
+    ``browse_tui`` stub (the run loop is never reached — ``b.watch`` /
+    ``b.run`` raise ``AttributeError`` past which all the state we assert
+    on has already landed), then inspect the module globals / the
+    constructed Browser config, plus ``get_children`` / ``get_preview``
+    directly — the same loader + stub pattern as the rest of the file.
+    """
+
+    def setUp(self):
+        self.r = _load_recipe()
+
+    def _run_main(self, stdin, argv=('browse-fs', '-')):
+        """Drive ``main()`` with ``stdin`` piped in; return the Browser.
+
+        ``stdin`` is either the raw text to slurp (wrapped so ``.read()``
+        yields it, matching the recipe's ``sys.stdin.read()``) OR a
+        ready-made stand-in that already has ``.read`` (e.g.
+        ``_RaiseOnRead`` for the modes that must NOT touch stdin).
+        ``SystemExit`` (the ``-``-plus-PATH usage error) and
+        ``AttributeError`` (the stub Browser lacking ``watch`` / ``run``)
+        are swallowed; the return value is ``self.r._BROWSER`` (set just
+        before ``b.watch`` / ``b.run``), or ``None`` if main exited
+        earlier.
+        """
+        fake = stdin if hasattr(stdin, 'read') else io.StringIO(stdin)
+        saved_stdin = self.r.sys.stdin
+        self.r.sys.argv[:] = list(argv)
+        try:
+            self.r.sys.stdin = fake
+            try:
+                self.r.main()
+            except (SystemExit, AttributeError):
+                pass
+        finally:
+            self.r.sys.stdin = saved_stdin
+        return self.r._BROWSER
+
+    def _config(self, b):
+        # The recipe calls ``Browser(BrowserConfig(...))``; the stub
+        # Browser stashes that config as its sole positional arg.
+        return b._args[0]
+
+    # -- piped path list becomes the root level -----------------------
+
+    def test_roots_are_the_piped_paths_in_order(self):
+        # A mixed list: a file, a dir, a missing path, a path with spaces,
+        # and a duplicate of the first file. Roots come out in stdin order,
+        # the blank line is skipped, and the duplicate is dropped (first
+        # occurrence kept).
+        with tempfile.TemporaryDirectory() as d:
+            os.mkdir(os.path.join(d, 'adir'))
+            with open(os.path.join(d, 'plain.txt'), 'w') as f:
+                f.write('body')
+            with open(os.path.join(d, 'a file.txt'), 'w') as f:
+                f.write('spaced')
+            cwd = os.getcwd()
+            os.chdir(d)
+            try:
+                b = self._run_main(
+                    'plain.txt\n'
+                    '\n'                       # blank line: skipped
+                    'adir\n'
+                    'missing-xyz\n'
+                    'a file.txt\n'             # path with spaces: verbatim
+                    'plain.txt\n')             # duplicate: dropped
+                # root_id is None (multi-root mode), not a single dir.
+                self.assertIsNone(self._config(b).root_id)
+                roots = self.r.get_children(None)
+            finally:
+                os.chdir(cwd)
+
+        # Titles are the verbatim stdin lines (the missing row carries
+        # its marker in the tag chip, not the title), in order, duplicate
+        # gone, blank skipped.
+        titles = [it.title for it in roots]
+        self.assertEqual(titles,
+                         ['plain.txt', 'adir', 'missing-xyz', 'a file.txt'])
+        # The missing row is tagged (dim) while the real rows are not.
+        by_title = {it.title: it for it in roots}
+        self.assertEqual(by_title['missing-xyz'].tag, 'missing')
+        self.assertEqual(by_title['missing-xyz'].tag_style, 'dim')
+
+    def test_dir_root_expands_to_real_children(self):
+        # A directory among the roots carries its real abspath id, so
+        # expanding it re-enters get_children and lists its contents.
+        with tempfile.TemporaryDirectory() as d:
+            os.mkdir(os.path.join(d, 'adir'))
+            with open(os.path.join(d, 'adir', 'child.txt'), 'w') as f:
+                f.write('x')
+            cwd = os.getcwd()
+            os.chdir(d)
+            try:
+                self._run_main('adir\n')
+                roots = self.r.get_children(None)
+                adir = next(it for it in roots if it.title == 'adir')
+                self.assertTrue(adir.has_children)
+                self.assertEqual(adir.id, os.path.join(d, 'adir'))
+                kids = self.r.get_children(adir.id)
+            finally:
+                os.chdir(cwd)
+        self.assertEqual([it.title for it in kids], ['child.txt'])
+
+    def test_file_root_previews_and_has_no_children(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, 'plain.txt'), 'w') as f:
+                f.write('hello body')
+            cwd = os.getcwd()
+            os.chdir(d)
+            try:
+                self._run_main('plain.txt\n')
+                roots = self.r.get_children(None)
+                f_it = next(it for it in roots if it.title == 'plain.txt')
+                self.assertFalse(f_it.has_children)
+                # The file id is its abspath; preview is the file head.
+                self.assertEqual(f_it.id, os.path.join(d, 'plain.txt'))
+                self.assertEqual(self.r.get_preview(f_it.id), 'hello body')
+            finally:
+                os.chdir(cwd)
+
+    def test_missing_path_is_a_dim_row_with_sensible_preview(self):
+        with tempfile.TemporaryDirectory() as d:
+            cwd = os.getcwd()
+            os.chdir(d)
+            try:
+                self._run_main('ghost.txt\n')
+                roots = self.r.get_children(None)
+            finally:
+                os.chdir(cwd)
+        self.assertEqual(len(roots), 1)
+        miss = roots[0]
+        # A tagged-tuple id (not a str path) so the e/o/d actions skip it
+        # exactly as they skip the synthetic error row; dim tag style.
+        self.assertEqual(miss.id[0], 'missing')
+        self.assertEqual(miss.id[1], 'ghost.txt')
+        self.assertFalse(isinstance(miss.id, str))
+        self.assertEqual(miss.tag, 'missing')
+        self.assertEqual(miss.tag_style, 'dim')
+        self.assertEqual(miss.title, 'ghost.txt')      # verbatim label
+        # No metadata columns ⇒ fs_row_content falls back (and the row
+        # renders without crashing on absent col_*).
+        self.assertIsNone(getattr(miss, 'col_perms', None))
+        # Preview shows the label and the stat error, not a crash.
+        preview = self.r.get_preview(miss.id)
+        self.assertIn('ghost.txt', preview)
+        self.assertIn('[missing]', preview)
+
+    def test_broken_symlink_is_existing_not_missing(self):
+        # A broken symlink lstats fine, so it is a normal (existing) row
+        # with metadata columns — NOT a missing row, and not a crash.
+        with tempfile.TemporaryDirectory() as d:
+            link = os.path.join(d, 'broken')
+            os.symlink(os.path.join(d, 'no-such-target'), link)
+            cwd = os.getcwd()
+            os.chdir(d)
+            try:
+                self._run_main('broken\n')
+                roots = self.r.get_children(None)
+            finally:
+                os.chdir(cwd)
+        self.assertEqual(len(roots), 1)
+        it = roots[0]
+        self.assertIsInstance(it.id, str)              # a real path id
+        self.assertEqual(it.title, 'broken')           # no (missing) marker
+        self.assertTrue(it.col_perms.startswith('l'))  # symlink perms
+
+    def test_relative_paths_resolve_against_cwd(self):
+        # Labels stay verbatim; the abspath id is cwd-resolved so the
+        # right file is read even though only a bare name was piped.
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, 'rel.txt'), 'w') as f:
+                f.write('relbody')
+            cwd = os.getcwd()
+            os.chdir(d)
+            try:
+                self._run_main('rel.txt\n')
+                roots = self.r.get_children(None)
+                it = roots[0]
+                self.assertEqual(it.title, 'rel.txt')        # verbatim label
+                self.assertEqual(it.id, os.path.join(d, 'rel.txt'))
+                self.assertEqual(self.r.get_preview(it.id), 'relbody')
+            finally:
+                os.chdir(cwd)
+
+    def test_empty_stdin_is_an_empty_root_list(self):
+        b = self._run_main('')
+        self.assertIsNone(self._config(b).root_id)
+        self.assertEqual(self.r._STDIN_ROOTS, [])
+        # No crash, no items.
+        self.assertEqual(self.r.get_children(None), [])
+
+    def test_trailing_newline_optional(self):
+        # The last line need not be newline-terminated.
+        with tempfile.TemporaryDirectory() as d:
+            for name in ('one.txt', 'two.txt'):
+                with open(os.path.join(d, name), 'w') as f:
+                    f.write('x')
+            cwd = os.getcwd()
+            os.chdir(d)
+            try:
+                self._run_main('one.txt\ntwo.txt')   # no trailing \n
+                roots = self.r.get_children(None)
+            finally:
+                os.chdir(cwd)
+        self.assertEqual([it.title for it in roots], ['one.txt', 'two.txt'])
+
+    # -- '-' + PATH is rejected ---------------------------------------
+
+    def test_dash_plus_path_is_a_usage_error(self):
+        # ``-`` cannot be combined with a path argument: main() exits via
+        # SystemExit with a usage message, and stdin is never read.
+        with self.assertRaises(SystemExit) as cm:
+            saved = self.r.sys.stdin
+            self.r.sys.stdin = _RaiseOnRead()
+            self.r.sys.argv[:] = ['browse-fs', '-', 'extra']
+            try:
+                self.r.main()
+            finally:
+                self.r.sys.stdin = saved
+        # A non-zero / message exit (SystemExit with a str message → the
+        # framework prints it and exits 1).
+        self.assertIn('cannot be combined', str(cm.exception.code))
+        self.assertIsNone(self.r._STDIN_ROOTS)
+
+    # -- bare / PATH modes never touch stdin --------------------------
+
+    def test_bare_invocation_browses_cwd_and_ignores_stdin(self):
+        with tempfile.TemporaryDirectory() as d:
+            cwd = os.getcwd()
+            os.chdir(d)
+            try:
+                # _RaiseOnRead would fire if main() read stdin here.
+                b = self._run_main(_RaiseOnRead(), argv=('browse-fs',))
+                self.assertEqual(self._config(b).root_id, os.getcwd())
+            finally:
+                os.chdir(cwd)
+        self.assertIsNone(self.r._STDIN_ROOTS)
+
+    def test_path_mode_uses_abspath_and_ignores_stdin(self):
+        with tempfile.TemporaryDirectory() as d:
+            b = self._run_main(_RaiseOnRead(), argv=('browse-fs', d))
+            self.assertEqual(self._config(b).root_id, os.path.abspath(d))
+        self.assertIsNone(self.r._STDIN_ROOTS)
+
+    # -- --tty - is the framework UI-over-streams flag, not stdin -------
+
+    def test_tty_dash_value_is_not_the_stdin_positional(self):
+        # ``--tty -`` is the framework's UI-over-std-streams flag value
+        # (auto-detected by Browser.run(), left in sys.argv): the recipe
+        # must drop it, fall through to bare mode (browse cwd), and never
+        # read stdin. Same for the one-token ``--tty=-`` spelling and the
+        # device-path form ``--tty /dev/pts/N`` (the path is not a root).
+        with tempfile.TemporaryDirectory() as d:
+            cwd = os.getcwd()
+            os.chdir(d)
+            try:
+                for argv in (('browse-fs', '--tty', '-'),
+                             ('browse-fs', '--tty=-'),
+                             ('browse-fs', '--tty', '/dev/pts/9')):
+                    self.r = _load_recipe()
+                    # _RaiseOnRead fires if main() touches stdin here.
+                    b = self._run_main(_RaiseOnRead(), argv=argv)
+                    self.assertEqual(self._config(b).root_id, os.getcwd(),
+                                     argv)
+                    self.assertIsNone(self.r._STDIN_ROOTS, argv)
+            finally:
+                os.chdir(cwd)
+        # Contrast: a true positional ``-`` still enters stdin mode and
+        # reads the piped list (proving the strip didn't disarm ``-``).
+        self.r = _load_recipe()
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, 'real.txt'), 'w') as f:
+                f.write('x')
+            cwd = os.getcwd()
+            os.chdir(d)
+            try:
+                b = self._run_main('real.txt\n')
+                self.assertIsNone(self._config(b).root_id)
+                self.assertEqual([it.title for it in self.r.get_children(None)],
+                                 ['real.txt'])
+            finally:
+                os.chdir(cwd)
+
+    def test_tty_dash_combined_with_path_still_a_usage_error(self):
+        # Stripping ``--tty -`` must not weaken the ``- + PATH`` guard:
+        # ``browse-fs --tty - somepath -`` is still a genuine ``-`` plus a
+        # path positional, so it must exit via the usage error with stdin
+        # untouched.
+        with self.assertRaises(SystemExit) as cm:
+            saved = self.r.sys.stdin
+            self.r.sys.stdin = _RaiseOnRead()
+            self.r.sys.argv[:] = ['browse-fs', '--tty', '-', 'somepath', '-']
+            try:
+                self.r.main()
+            finally:
+                self.r.sys.stdin = saved
+        self.assertIn('cannot be combined', str(cm.exception.code))
+        self.assertIsNone(self.r._STDIN_ROOTS)
 
 
 if __name__ == '__main__':

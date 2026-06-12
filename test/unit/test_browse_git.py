@@ -71,6 +71,36 @@ Coverage (ticket #701 — tree-mode commit graph):
 * ``_pop_tree_arg``        pops ``--tree`` / ``--no-tree`` (last wins)
 * ``toggle_tree``          flips ``_tree_mode`` and refreshes
 
+Coverage (ticket #862 — ``browse-git -``, git output from stdin):
+
+* ``_sniff_stdin_kind``      first non-blank line → diff / log / porcelain /
+  human / None (colored input sniffs the same; prose is unrecognized)
+* ``_parse_stdin_diff``      per-file block split + (letter, path) rows —
+  A/M/D/R letters, new-path display, headerless ``--- a/`` fragments,
+  GNU ``\\t<timestamp>`` suffixes, ``--color=always`` input
+* ``_parse_stdin_log``       ``commit <sha>`` blocks → (sha, author, date,
+  subject, deco) rows; --stat / -p payload stays in the block
+* ``_parse_porcelain_lines`` line porcelain → (XY, path), rename arrow
+* ``_parse_human_status``    human sections / verbs → porcelain-style rows
+* stdin tree + previews      the root builders / ``get_preview`` serve the
+  parsed text with git fully poisoned (the no-git guarantee), and the
+  ``_status_root`` seam reuses the repo-mode leaf/sentinel shape
+* ``main()``                 ``-`` ingest end-to-end (no git at startup);
+  empty / unrecognized / combined-args errors (exit 2, stderr only);
+  bare and ``--help`` invocations never read stdin; ``--tty -`` /
+  ``--tty=-`` (the framework flag's value) is NOT the stdin positional
+* action gating              `` ` `` / ``t`` flash in stdin mode (no state
+  change); ``E`` covers ('sfile', i, path) rows; the stdin window title
+* ``_run_git`` gitless       a missing git binary folds into a failed
+  CompletedProcess (rc 127) — ``E`` degrades to the cwd-relative path
+  and previews surface the message instead of crashing the key dispatch
+
+The stdin parsers are additionally exercised against REAL ``git diff`` /
+``log`` / ``log -p`` / ``log --stat`` / ``status --porcelain`` /
+``status`` output captured from a throwaway temp repo
+(``TestStdinRealGitOutputs``), so the literal fixtures can't drift from
+what git actually emits.
+
 Filler rows are ``meta=True`` (ticket #741): the framework skips the cursor
 over them (preventively) and never selects them — the recipe no longer
 hand-rolls an ``on_cursor_change`` bounce or an ``on_selection_change`` strip,
@@ -81,6 +111,7 @@ covered end-to-end against a real headless Browser in
 """
 
 import importlib.util
+import io
 import os
 import re
 import shutil
@@ -101,6 +132,27 @@ _RECIPE = _REPO / 'recipes' / 'browse-git'
 # columns in ``git_row_content`` must carry these exact (fg, bold) pairs.
 _DIM = (242, False)
 _YELLOW = (3, False)
+
+
+def _stub_recipe_argv(argv=None):
+    """Stub of the framework's ``recipe_argv`` (mirrors 040-state.py):
+    ``sys.argv[1:]`` (or ``argv``) minus the framework's ``--tty VALUE`` /
+    ``--tty=VALUE`` flag. Tests patch ``sys.argv`` before driving ``main()``,
+    so reading it here matches what the recipe sees."""
+    if argv is None:
+        argv = sys.argv[1:]
+    out, skip_next = [], False
+    for arg in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == '--tty':
+            skip_next = True
+            continue
+        if arg.startswith('--tty='):
+            continue
+        out.append(arg)
+    return out
 
 
 def _stub_browse_tui():
@@ -163,6 +215,7 @@ def _stub_browse_tui():
             lambda m: m.group(0) if m.group(1) == 'm' else '', s)
 
     mod.sanitize_ansi = sanitize_ansi
+    mod.recipe_argv = _stub_recipe_argv
     sys.modules['browse_tui'] = mod
 
 
@@ -592,6 +645,18 @@ class TestClassifyPositionals(unittest.TestCase):
         revs, paths = self._run('-h')
         self.assertEqual(revs, [])
         self.assertEqual(paths, [])
+
+    def test_tty_flag_and_value_are_not_positionals(self):
+        # The framework's ``--tty VALUE`` is dropped via ``recipe_argv()``
+        # before classification: neither the flag nor its value is taken
+        # as a rev/pathspec. The value used here is an EXISTING path
+        # (``_RECIPE`` certainly exists), so a regression that failed to
+        # strip it would wrongly land it in ``_paths`` — the assertion
+        # below would catch it. ``--tty=`` (one token) is covered too.
+        for args in (['--tty', str(_RECIPE)], [f'--tty={_RECIPE}']):
+            revs, paths = self._run(*args)
+            self.assertEqual(revs, [], args)
+            self.assertEqual(paths, [], args)
 
 
 @unittest.skipUnless(shutil.which('git'), 'git not available')
@@ -2151,6 +2216,866 @@ class TestWindowTitleAll(unittest.TestCase):
         self.r._revs = ['HEAD']
         self.r._paths = []
         self.assertEqual(self.r._window_title(), 'browse-git [commits: HEAD]')
+
+
+# ---- browse-git - (stdin ingest) -------------------------------------------
+
+
+# A four-kind ``git diff``: modify, add, delete, pure rename (no hunks).
+_DIFF_TEXT = """\
+diff --git a/keep.txt b/keep.txt
+index 0000001..0000002 100644
+--- a/keep.txt
++++ b/keep.txt
+@@ -1 +1 @@
+-keep v1
++keep v2
+diff --git a/brand.txt b/brand.txt
+new file mode 100644
+index 0000000..0000003
+--- /dev/null
++++ b/brand.txt
+@@ -0,0 +1 @@
++brand new
+diff --git a/gone.txt b/gone.txt
+deleted file mode 100644
+index 0000004..0000000
+--- a/gone.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-gone v1
+diff --git a/old.txt b/new.txt
+similarity index 100%
+rename from old.txt
+rename to new.txt
+"""
+
+# A two-commit human ``git log`` (decoration on the newest, multi-line
+# message whose body must NOT become the subject, merge header skipped).
+_LOG_TEXT = """\
+commit deadbeefcafe1234567890abcdef000000000000 (HEAD -> main, tag: v1.0)
+Merge: 0123456 fedcba9
+Author: Alice Dev <alice@example.com>
+Date:   Thu Jun 11 10:00:00 2026 +0000
+
+    second subject line
+
+    body paragraph that is not the subject
+
+commit 0123456789abcdef0123456789abcdef01234567
+Author: Bob <bob@example.com>
+Date:   Wed Jun 10 09:00:00 2026 +0000
+
+    first subject
+"""
+
+# Human ``git status`` covering every section + verb the parser maps.
+_HUMAN_STATUS_TEXT = """\
+On branch main
+Your branch is up to date with 'origin/main'.
+
+Changes to be committed:
+  (use "git restore --staged <file>..." to unstage)
+\tmodified:   gamma.txt
+\tnew file:   fresh.txt
+\trenamed:    old.txt -> new.txt
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+\tmodified:   beta.txt
+\tdeleted:    dropped.txt
+
+Unmerged paths:
+  (use "git add <file>..." to mark resolution)
+\tboth modified:   conflict.txt
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+\tuntracked.txt
+
+no changes added to commit (use "git add" and/or "git commit -a")
+"""
+
+
+def _colored(text, prefixes):
+    """Wrap every line starting with one of ``prefixes`` in bold SGR.
+
+    Mimics ``--color=always`` output closely enough for the sniff/split
+    tests: classification must look at the SGR-stripped line.
+    """
+    out = []
+    for line in text.splitlines(keepends=True):
+        body = line.rstrip('\n')
+        if body.startswith(prefixes):
+            out.append(f'\x1b[1m{body}\x1b[m\n')
+        else:
+            out.append(line)
+    return ''.join(out)
+
+
+class TestSniffStdinKind(unittest.TestCase):
+    """``_sniff_stdin_kind`` classifies by the first non-blank line."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_diff_header(self):
+        self.assertEqual(self.r._sniff_stdin_kind(_DIFF_TEXT), 'diff')
+
+    def test_diff_headerless_fragment(self):
+        frag = '--- a/x.txt\n+++ b/x.txt\n@@ -1 +1 @@\n-o\n+n\n'
+        self.assertEqual(self.r._sniff_stdin_kind(frag), 'diff')
+
+    def test_log_commit_block(self):
+        self.assertEqual(self.r._sniff_stdin_kind(_LOG_TEXT), 'log')
+
+    def test_log_short_sha_also_matches(self):
+        self.assertEqual(
+            self.r._sniff_stdin_kind('commit deadbee\nAuthor: A <a@a>\n'),
+            'log')
+
+    def test_human_status_on_branch(self):
+        self.assertEqual(
+            self.r._sniff_stdin_kind(_HUMAN_STATUS_TEXT), 'human')
+
+    def test_human_status_detached_head(self):
+        self.assertEqual(
+            self.r._sniff_stdin_kind('HEAD detached at deadbee\n'
+                                     'nothing to commit\n'),
+            'human')
+
+    def test_porcelain_lines(self):
+        for first in (' M beta.txt', 'M  alpha.txt', '?? untracked.txt',
+                      'MM both.txt', 'R  old.txt -> new.txt'):
+            self.assertEqual(
+                self.r._sniff_stdin_kind(f'{first}\n'), 'porcelain', first)
+
+    def test_porcelain_z_blob(self):
+        # The -z form has no newlines; its first "line" is the whole
+        # record stream and still starts with a valid XY code.
+        self.assertEqual(
+            self.r._sniff_stdin_kind('M  a.txt\x00?? u.txt\x00'),
+            'porcelain')
+
+    def test_leading_blank_lines_skipped(self):
+        self.assertEqual(
+            self.r._sniff_stdin_kind('\n   \n' + _DIFF_TEXT), 'diff')
+
+    def test_colored_input_sniffs_the_same(self):
+        self.assertEqual(
+            self.r._sniff_stdin_kind(_colored(_DIFF_TEXT, ('diff --git',))),
+            'diff')
+        self.assertEqual(
+            self.r._sniff_stdin_kind(_colored(_LOG_TEXT, ('commit ',))),
+            'log')
+
+    def test_unrecognized_inputs_are_none(self):
+        for text in ('hello world\n',           # prose
+                     'abc1234 subject\n',       # git log --oneline
+                     '   indented prose\n',     # must not look porcelain
+                     ' beta.txt | 2 +-\n',      # bare --stat output
+                     '## main...origin/main\n', # status -sb branch line
+                     '', '   \n\n'):            # empty / whitespace-only
+            self.assertIsNone(self.r._sniff_stdin_kind(text), repr(text))
+
+
+class TestParseStdinDiff(unittest.TestCase):
+    """``_parse_stdin_diff`` splits per-file blocks and derives rows."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_four_kinds_rows_and_block_alignment(self):
+        rows, blocks = self.r._parse_stdin_diff(_DIFF_TEXT)
+        self.assertEqual(rows, [
+            ('M', 'keep.txt'),
+            ('A', 'brand.txt'),
+            ('D', 'gone.txt'),
+            ('R', 'new.txt'),
+        ])
+        self.assertEqual(len(blocks), 4)
+        # Each block carries its own file's content and nobody else's.
+        self.assertIn('+keep v2', blocks[0])
+        self.assertNotIn('brand new', blocks[0])
+        self.assertIn('+brand new', blocks[1])
+        self.assertIn('-gone v1', blocks[2])
+        self.assertIn('rename to new.txt', blocks[3])
+        # Blocks are verbatim slices: joining them restores the text.
+        self.assertEqual(''.join(blocks), _DIFF_TEXT)
+
+    def test_headerless_fragment_is_one_block(self):
+        frag = '--- a/x.txt\n+++ b/x.txt\n@@ -1 +1 @@\n-o\n+n\n'
+        rows, blocks = self.r._parse_stdin_diff(frag)
+        self.assertEqual(rows, [('M', 'x.txt')])
+        self.assertEqual(blocks, [frag])
+
+    def test_gnu_diff_timestamp_suffix_stripped(self):
+        # Plain unified diffs suffix the +++/--- paths with a tab +
+        # timestamp and use no a/ b/ prefixes.
+        frag = ('--- a/x.txt\t2026-06-11 10:00:00\n'
+                '+++ b/x.txt\t2026-06-11 10:00:01\n'
+                '@@ -1 +1 @@\n-o\n+n\n')
+        rows, _blocks = self.r._parse_stdin_diff(frag)
+        self.assertEqual(rows, [('M', 'x.txt')])
+
+    def test_colored_input_splits_and_classifies(self):
+        colored = _colored(
+            _DIFF_TEXT,
+            ('diff --git', '---', '+++', 'new file', 'deleted file',
+             'rename from', 'rename to'))
+        rows, blocks = self.r._parse_stdin_diff(colored)
+        self.assertEqual([row[0] for row in rows], ['M', 'A', 'D', 'R'])
+        self.assertEqual([row[1] for row in rows],
+                         ['keep.txt', 'brand.txt', 'gone.txt', 'new.txt'])
+        # Blocks keep the original colour for the preview pane.
+        self.assertEqual(len(blocks), 4)
+        self.assertIn('\x1b[1m', blocks[0])
+
+
+class TestParseStdinLog(unittest.TestCase):
+    """``_parse_stdin_log`` splits commit blocks and extracts the fields."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_rows_fields_and_block_alignment(self):
+        rows, blocks = self.r._parse_stdin_log(_LOG_TEXT)
+        self.assertEqual(rows, [
+            ('deadbeefcafe1234567890abcdef000000000000', 'Alice Dev',
+             'Thu Jun 11 10:00:00 2026 +0000', 'second subject line',
+             'HEAD -> main, tag: v1.0'),
+            ('0123456789abcdef0123456789abcdef01234567', 'Bob',
+             'Wed Jun 10 09:00:00 2026 +0000', 'first subject', ''),
+        ])
+        self.assertEqual(len(blocks), 2)
+        # The whole block — message body included — is the preview source.
+        self.assertIn('body paragraph that is not the subject', blocks[0])
+        self.assertNotIn('first subject', blocks[0])
+        self.assertEqual(''.join(blocks), _LOG_TEXT)
+
+    def test_stat_payload_stays_in_block_not_fields(self):
+        text = (_LOG_TEXT.split('\ncommit ')[0]
+                + '\n a.txt | 2 +-\n 1 file changed, 1 insertion(+)\n')
+        rows, blocks = self.r._parse_stdin_log(text)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][3], 'second subject line')
+        self.assertIn(' a.txt | 2 +-', blocks[0])
+
+    def test_patch_payload_stays_in_block(self):
+        # log -p: the diff rides in the block; commit fields untouched.
+        text = _LOG_TEXT + 'diff --git a/x b/x\n--- a/x\n+++ b/x\n+new\n'
+        rows, blocks = self.r._parse_stdin_log(text)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[1][3], 'first subject')
+        self.assertIn('diff --git a/x b/x', blocks[1])
+
+    def test_colored_input_parses_the_same(self):
+        colored = _colored(_LOG_TEXT, ('commit ',))
+        rows, _blocks = self.r._parse_stdin_log(colored)
+        self.assertEqual([row[3] for row in rows],
+                         ['second subject line', 'first subject'])
+        self.assertEqual(rows[0][4], 'HEAD -> main, tag: v1.0')
+
+
+class TestParsePorcelainLines(unittest.TestCase):
+    """``_parse_porcelain_lines`` parses newline porcelain into (XY, path)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_codes_and_untracked(self):
+        text = ('M  alpha.txt\n'
+                ' M beta.txt\n'
+                'MM both.txt\n'
+                '?? untracked.txt\n')
+        self.assertEqual(self.r._parse_porcelain_lines(text), [
+            ('M ', 'alpha.txt'),
+            (' M', 'beta.txt'),
+            ('MM', 'both.txt'),
+            ('??', 'untracked.txt'),
+        ])
+
+    def test_rename_arrow_keeps_new_path(self):
+        self.assertEqual(
+            self.r._parse_porcelain_lines('R  old.txt -> new.txt\n'),
+            [('R ', 'new.txt')])
+        # The rename+modified two-sided code too.
+        self.assertEqual(
+            self.r._parse_porcelain_lines('RM old.txt -> new.txt\n'),
+            [('RM', 'new.txt')])
+
+    def test_arrow_in_a_non_rename_path_is_kept(self):
+        # ' -> ' only splits rename/copy entries; an M path keeps it.
+        self.assertEqual(
+            self.r._parse_porcelain_lines(' M a -> b.txt\n'),
+            [(' M', 'a -> b.txt')])
+
+    def test_blank_and_malformed_lines_skipped(self):
+        self.assertEqual(
+            self.r._parse_porcelain_lines('\nnot porcelain\n M ok.txt\n'),
+            [(' M', 'ok.txt')])
+
+
+class TestParseHumanStatus(unittest.TestCase):
+    """``_parse_human_status`` maps the prose sections to porcelain rows."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_all_sections_and_verbs(self):
+        self.assertEqual(self.r._parse_human_status(_HUMAN_STATUS_TEXT), [
+            ('M ', 'gamma.txt'),       # staged modify
+            ('A ', 'fresh.txt'),       # staged add ("new file")
+            ('R ', 'new.txt'),         # staged rename → new path
+            (' M', 'beta.txt'),        # unstaged modify
+            (' D', 'dropped.txt'),     # unstaged delete
+            ('UU', 'conflict.txt'),    # any unmerged entry
+            ('??', 'untracked.txt'),   # untracked (bare path, no verb)
+        ])
+
+    def test_clean_tree_yields_no_rows(self):
+        clean = ('On branch main\n'
+                 "Your branch is up to date with 'origin/main'.\n"
+                 '\n'
+                 'nothing to commit, working tree clean\n')
+        self.assertEqual(self.r._parse_human_status(clean), [])
+
+    def test_hint_lines_never_become_rows(self):
+        rows = self.r._parse_human_status(_HUMAN_STATUS_TEXT)
+        self.assertFalse(any('use "git' in path for _xy, path in rows))
+
+    def test_colon_in_path_survives(self):
+        text = ('On branch main\n'
+                'Changes not staged for commit:\n'
+                '\tmodified:   weird:name.txt\n')
+        self.assertEqual(self.r._parse_human_status(text),
+                         [(' M', 'weird:name.txt')])
+
+
+class _GitPoison:
+    """Callable that fails the test if any git helper runs in stdin mode."""
+
+    def __init__(self, test):
+        self._test = test
+
+    def __call__(self, *args, **kwargs):
+        self._test.fail(f'git invoked in stdin mode: {args!r}')
+
+
+class TestStdinTreeAndPreviews(unittest.TestCase):
+    """The stdin root builders / previews serve the parsed text, never git.
+
+    Sets the ``_STDIN_*`` module state directly (the parsers have their
+    own tests above) and poisons ``_run_git`` / ``_git_color`` so any
+    code path that shells out fails the test — the no-git guarantee of
+    ``browse-git -``.
+    """
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self.r._run_git = _GitPoison(self)
+        self.r._git_color = _GitPoison(self)
+        self.r.HAVE_DELTA = None       # _colorize_diff → verbatim text
+
+    def test_diff_rows_are_sfile_leaves_with_block_previews(self):
+        rows, blocks = self.r._parse_stdin_diff(_DIFF_TEXT)
+        self.r._STDIN_KIND = 'diff'
+        self.r._STDIN_ROWS, self.r._STDIN_BLOCKS = rows, blocks
+        items = self.r.get_children(None)
+        self.assertEqual([it.id for it in items], [
+            ('sfile', 0, 'keep.txt'),
+            ('sfile', 1, 'brand.txt'),
+            ('sfile', 2, 'gone.txt'),
+            ('sfile', 3, 'new.txt'),
+        ])
+        self.assertEqual([it.tag for it in items], ['M', 'A', 'D', 'R'])
+        self.assertEqual(items[0].tag_style, 'yellow')
+        self.assertEqual(items[1].tag_style, 'green')
+        self.assertTrue(all(not it.has_children for it in items))
+        # Leaves: drilling yields nothing; preview is the file's block.
+        self.assertEqual(self.r.get_children(items[0].id), [])
+        self.assertEqual(self.r.get_preview(items[0].id), blocks[0])
+        self.assertIn('+brand new', self.r.get_preview(items[1].id))
+
+    def test_log_rows_carry_columns_chips_and_block_previews(self):
+        rows, blocks = self.r._parse_stdin_log(_LOG_TEXT)
+        self.r._STDIN_KIND = 'log'
+        self.r._STDIN_ROWS, self.r._STDIN_BLOCKS = rows, blocks
+        items = self.r.get_children(None)
+        self.assertEqual([it.id for it in items],
+                         [('slog', 0), ('slog', 1)])
+        first = items[0]
+        self.assertEqual(first.title, 'second subject line')
+        self.assertEqual(first.col_sha, 'deadbee')
+        self.assertEqual(first.col_author, 'Alice Dev')
+        self.assertEqual(first.col_date, 'Thu Jun 11 10:00:00 2026 +0000')
+        # Decorations parse without git (remotes=set()): HEAD chip green,
+        # branch cyan, tag yellow.
+        self.assertEqual(first.chips, [
+            ('HEAD', 'green'), ('main', 'cyan'), ('v1.0', 'yellow')])
+        self.assertFalse(first.has_children)
+        # A plain log block previews verbatim (no delta involved).
+        self.assertEqual(self.r.get_preview(('slog', 0)), blocks[0])
+
+    def test_log_p_block_routes_through_colorize_diff(self):
+        text = _LOG_TEXT + 'diff --git a/x b/x\n--- a/x\n+++ b/x\n+new\n'
+        rows, blocks = self.r._parse_stdin_log(text)
+        self.r._STDIN_KIND = 'log'
+        self.r._STDIN_ROWS, self.r._STDIN_BLOCKS = rows, blocks
+        seen = []
+        self.r._colorize_diff = lambda raw: seen.append(raw) or 'RENDERED'
+        # Block 1 carries the patch → goes through the diff pipeline.
+        self.assertEqual(self.r.get_preview(('slog', 1)), 'RENDERED')
+        self.assertEqual(seen, [blocks[1]])
+        # Block 0 is patch-free → verbatim, pipeline untouched.
+        self.assertEqual(self.r.get_preview(('slog', 0)), blocks[0])
+        self.assertEqual(len(seen), 1)
+
+    def test_status_rows_reuse_status_leaf_shape_and_text_preview(self):
+        self.r._STDIN_KIND = 'status'
+        self.r._STDIN_ROWS = [('M ', 'alpha.txt'), ('??', 'untracked.txt')]
+        items = self.r.get_children(None)
+        # The shared ('status', xy, path) leaves — same shape as repo mode.
+        self.assertEqual([it.id for it in items], [
+            ('status', 'M ', 'alpha.txt'),
+            ('status', '??', 'untracked.txt'),
+        ])
+        self.assertEqual([it.tag for it in items], ['M', '?'])
+        self.assertTrue(all(not it.has_children for it in items))
+        # Piped status has no diff text — preview is the entry line.
+        self.assertEqual(self.r.get_preview(items[0].id), 'M  alpha.txt')
+        self.assertEqual(self.r.get_preview(items[1].id), '?? untracked.txt')
+
+    def test_status_empty_rows_serve_the_clean_sentinel(self):
+        self.r._STDIN_KIND = 'status'
+        self.r._STDIN_ROWS = []
+        items = self.r.get_children(None)
+        self.assertEqual([it.id for it in items], [('status_clean',)])
+
+    def test_repo_mode_status_preview_still_routes_to_git_builder(self):
+        # With no stdin state the status branch routes to _status_preview
+        # exactly as before — the seam changes nothing in repo mode.
+        self.assertIsNone(self.r._STDIN_KIND)
+        seen = {}
+        self.r._status_preview = (
+            lambda xy, path: seen.__setitem__('args', (xy, path)) or 'REPO')
+        self.assertEqual(self.r.get_preview(('status', 'M ', 'x.py')), 'REPO')
+        self.assertEqual(seen['args'], ('M ', 'x.py'))
+
+
+@unittest.skipUnless(shutil.which('git'), 'git not available')
+class TestStdinRealGitOutputs(unittest.TestCase):
+    """Sniff + parse REAL git output captured from a throwaway temp repo.
+
+    Guards the literal fixtures above against drift: a temp repo is
+    built once with two commits and a dirty worktree (staged modify,
+    unstaged modify, staged rename, untracked file), and each canned
+    command's actual output must sniff to the right kind and parse to
+    the expected rows. ``LC_ALL=C`` pins the human-status prose.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+        cls.repo = tempfile.mkdtemp()
+        cls.addClassCleanup(shutil.rmtree, cls.repo, ignore_errors=True)
+        env = {**os.environ, 'LC_ALL': 'C',
+               'GIT_AUTHOR_NAME': 'T', 'GIT_AUTHOR_EMAIL': 't@t',
+               'GIT_COMMITTER_NAME': 'T', 'GIT_COMMITTER_EMAIL': 't@t'}
+
+        def git(*args):
+            return subprocess.run(
+                ['git', '-C', cls.repo, *args], check=True,
+                capture_output=True, text=True, env=env).stdout
+
+        cls.git = staticmethod(git)
+        for name in ('alpha.txt', 'beta.txt', 'gamma.txt'):
+            with open(os.path.join(cls.repo, name), 'w') as f:
+                f.write(f'{name} v1\n')
+        git('init', '-q', '-b', 'main')
+        git('add', '.')
+        git('commit', '-q', '-m', 'first commit')
+        with open(os.path.join(cls.repo, 'delta.txt'), 'w') as f:
+            f.write('delta v1\n')
+        git('add', 'delta.txt')
+        git('commit', '-q', '-m', 'second commit adds delta')
+        # Dirty worktree: staged modify / unstaged modify / staged
+        # rename / untracked.
+        with open(os.path.join(cls.repo, 'alpha.txt'), 'w') as f:
+            f.write('alpha v2\n')
+        git('add', 'alpha.txt')
+        with open(os.path.join(cls.repo, 'beta.txt'), 'w') as f:
+            f.write('beta v2\n')
+        git('mv', 'gamma.txt', 'moved.txt')
+        with open(os.path.join(cls.repo, 'untracked.txt'), 'w') as f:
+            f.write('new\n')
+
+    def test_real_diff(self):
+        text = self.git('diff')
+        self.assertEqual(self.r._sniff_stdin_kind(text), 'diff')
+        rows, blocks = self.r._parse_stdin_diff(text)
+        self.assertEqual(rows, [('M', 'beta.txt')])
+        self.assertIn('+beta v2', blocks[0])
+
+    def test_real_diff_with_added_file(self):
+        text = self.git('diff', 'HEAD~1', 'HEAD')
+        self.assertEqual(self.r._sniff_stdin_kind(text), 'diff')
+        rows, _blocks = self.r._parse_stdin_diff(text)
+        self.assertEqual(rows, [('A', 'delta.txt')])
+
+    def test_real_diff_cached_rename(self):
+        text = self.git('diff', '--cached')
+        rows, _blocks = self.r._parse_stdin_diff(text)
+        self.assertIn(('M', 'alpha.txt'), rows)
+        self.assertIn(('R', 'moved.txt'), rows)
+
+    def test_real_log_and_variants(self):
+        for args in (['log'], ['log', '-p'], ['log', '--stat'],
+                     ['log', '--decorate']):
+            text = self.git(*args)
+            self.assertEqual(self.r._sniff_stdin_kind(text), 'log', args)
+            rows, blocks = self.r._parse_stdin_log(text)
+            self.assertEqual(
+                [row[3] for row in rows],
+                ['second commit adds delta', 'first commit'], args)
+            self.assertEqual([row[1] for row in rows], ['T', 'T'], args)
+            self.assertEqual(len(blocks), 2, args)
+        # -p blocks carry their patch; --decorate carries the HEAD deco.
+        _rows, blocks = self.r._parse_stdin_log(self.git('log', '-p'))
+        self.assertIn('diff --git a/delta.txt b/delta.txt', blocks[0])
+        rows, _blocks = self.r._parse_stdin_log(self.git('log', '--decorate'))
+        self.assertIn('HEAD', rows[0][4])
+
+    def test_real_porcelain_line_and_z_forms_agree(self):
+        line_text = self.git('status', '--porcelain')
+        z_text = self.git('status', '--porcelain', '-z')
+        self.assertEqual(self.r._sniff_stdin_kind(line_text), 'porcelain')
+        self.assertEqual(self.r._sniff_stdin_kind(z_text), 'porcelain')
+        line_rows = self.r._parse_porcelain_lines(line_text)
+        z_rows = self.r._parse_porcelain_z(z_text)
+        self.assertEqual(sorted(line_rows), sorted(z_rows))
+        self.assertIn(('M ', 'alpha.txt'), line_rows)
+        self.assertIn((' M', 'beta.txt'), line_rows)
+        self.assertIn(('R ', 'moved.txt'), line_rows)   # arrow → new path
+        self.assertIn(('??', 'untracked.txt'), line_rows)
+
+    def test_real_human_status(self):
+        text = self.git('status')
+        self.assertEqual(self.r._sniff_stdin_kind(text), 'human')
+        rows = self.r._parse_human_status(text)
+        self.assertIn(('M ', 'alpha.txt'), rows)
+        self.assertIn((' M', 'beta.txt'), rows)
+        self.assertIn(('R ', 'moved.txt'), rows)
+        self.assertIn(('??', 'untracked.txt'), rows)
+
+
+class _RaiseOnRead:
+    """A stdin stand-in whose ``read()`` raises — proves stdin is NOT
+    consumed outside the explicit ``-`` mode."""
+
+    def read(self):  # pragma: no cover - only hit on a regression
+        raise AssertionError('sys.stdin.read() called outside - mode')
+
+
+class TestStdinMain(unittest.TestCase):
+    """``main()`` wires ``-`` to the ingest path and errors out cleanly.
+
+    Drives ``main()`` with a stubbed stdin / stderr and the no-op
+    ``browse_tui`` stub (the run loop is never reached — the stub
+    Browser lacking ``run`` raises ``AttributeError``, by which point
+    everything asserted on has landed) — the harness mirrors the other
+    recipes' stdin-mode unit tests.
+    """
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self._argv = list(sys.argv)
+
+    def tearDown(self):
+        sys.argv[:] = self._argv
+
+    def _run_main(self, stdin, argv):
+        """Drive ``main()``; return ``(exit_code_or_None, stderr_text)``."""
+        fake = stdin if hasattr(stdin, 'read') else io.StringIO(stdin)
+        err = io.StringIO()
+        saved_in, saved_err = self.r.sys.stdin, self.r.sys.stderr
+        self.r.sys.argv[:] = list(argv)
+        code = None
+        try:
+            self.r.sys.stdin, self.r.sys.stderr = fake, err
+            try:
+                self.r.main()
+            except SystemExit as e:
+                code = e.code
+            except AttributeError:
+                pass        # stub Browser has no .run — past everything asserted
+        finally:
+            self.r.sys.stdin, self.r.sys.stderr = saved_in, saved_err
+        return code, err.getvalue()
+
+    def test_stdin_diff_ingests_without_any_git(self):
+        # Poison EVERY git seam: a `-` startup must touch none of them
+        # (no `git` binary and no repo are required for piped input).
+        self.r._run_git = _GitPoison(self)
+        self.r._git_color = _GitPoison(self)
+        self.r.shutil = types.SimpleNamespace(which=_GitPoison(self))
+        code, err = self._run_main(_DIFF_TEXT, ['browse-git', '-'])
+        self.assertIsNone(code)
+        self.assertEqual(err, '')
+        self.assertEqual(self.r._STDIN_KIND, 'diff')
+        self.assertEqual([row[1] for row in self.r._STDIN_ROWS],
+                         ['keep.txt', 'brand.txt', 'gone.txt', 'new.txt'])
+        # The Browser was constructed with the stdin window title.
+        self.assertEqual(self.r._browser._args[0].title,
+                         'browse-git [stdin: diff]')
+
+    def test_stdin_log_and_status_set_their_kinds(self):
+        code, _err = self._run_main(_LOG_TEXT, ['browse-git', '-'])
+        self.assertIsNone(code)
+        self.assertEqual(self.r._STDIN_KIND, 'log')
+
+        self.r = _load_recipe()
+        code, _err = self._run_main(' M beta.txt\n', ['browse-git', '-'])
+        self.assertIsNone(code)
+        self.assertEqual(self.r._STDIN_KIND, 'status')
+        self.assertEqual(self.r._STDIN_ROWS, [(' M', 'beta.txt')])
+
+        self.r = _load_recipe()
+        code, _err = self._run_main(_HUMAN_STATUS_TEXT, ['browse-git', '-'])
+        self.assertIsNone(code)
+        self.assertEqual(self.r._STDIN_KIND, 'status')
+        self.assertIn(('??', 'untracked.txt'), self.r._STDIN_ROWS)
+
+    def test_unrecognized_stdin_exits_2_with_stderr_only(self):
+        out = io.StringIO()
+        saved_out = self.r.sys.stdout
+        try:
+            self.r.sys.stdout = out
+            code, err = self._run_main('not git output at all\n',
+                                       ['browse-git', '-'])
+        finally:
+            self.r.sys.stdout = saved_out
+        self.assertEqual(code, 2)
+        self.assertIn('unrecognized stdin input', err)
+        self.assertEqual(out.getvalue(), '')      # nothing on stdout
+        self.assertIsNone(self.r._STDIN_KIND)
+        self.assertIsNone(self.r._browser)        # the UI never started
+
+    def test_empty_stdin_exits_2(self):
+        code, err = self._run_main('', ['browse-git', '-'])
+        self.assertEqual(code, 2)
+        self.assertIn('empty stdin input', err)
+        self.assertIsNone(self.r._browser)
+
+    def test_dash_with_other_args_is_a_usage_error_stdin_unread(self):
+        for argv in (['browse-git', '-', 'HEAD'],
+                     ['browse-git', 'HEAD', '-'],
+                     ['browse-git', '--mode', 'status', '-'],
+                     ['browse-git', '-n', '5', '-'],
+                     ['browse-git', '-', '--all']):
+            self.r = _load_recipe()
+            code, err = self._run_main(_RaiseOnRead(), argv)
+            self.assertEqual(code, 2, argv)
+            self.assertIn('cannot be combined', err)
+            self.assertIsNone(self.r._STDIN_KIND)
+
+    def test_bare_invocation_never_reads_stdin(self):
+        # Preconditions are stubbed green (git present, inside a work
+        # tree) so main() runs through to the Browser; the raise-on-read
+        # stdin proves the bare form never touches the stream (D8).
+        self.r.shutil = types.SimpleNamespace(
+            which=lambda name: f'/usr/bin/{name}')
+        self.r._run_git = (
+            lambda *a: subprocess.CompletedProcess(a, 0, '', ''))
+        code, err = self._run_main(_RaiseOnRead(), ['browse-git'])
+        self.assertIsNone(code)
+        self.assertEqual(err, '')
+        self.assertIsNone(self.r._STDIN_KIND)
+        self.assertEqual(self.r._browser._args[0].title,
+                         'browse-git [commits]')
+
+    def test_tty_dash_value_is_not_the_stdin_positional(self):
+        # ``--tty -`` is the framework's UI-over-std-streams flag value
+        # (consumed by Browser.run()), not the stdin positional: main()
+        # must fall through to repo mode — no usage error, no ingest,
+        # stdin untouched. Same for the one-token ``--tty=-`` spelling.
+        for argv in (['browse-git', '--tty', '-'],
+                     ['browse-git', '--tty=-']):
+            self.r = _load_recipe()
+            self.r.shutil = types.SimpleNamespace(
+                which=lambda name: f'/usr/bin/{name}')
+            self.r._run_git = (
+                lambda *a: subprocess.CompletedProcess(a, 0, '', ''))
+            code, err = self._run_main(_RaiseOnRead(), argv)
+            self.assertIsNone(code, argv)
+            self.assertEqual(err, '', argv)
+            self.assertIsNone(self.r._STDIN_KIND, argv)
+        # Contrast: a true positional ``-`` still enters stdin mode.
+        self.r = _load_recipe()
+        code, _err = self._run_main(' M beta.txt\n', ['browse-git', '-'])
+        self.assertIsNone(code)
+        self.assertEqual(self.r._STDIN_KIND, 'status')
+
+    def test_tty_device_path_is_consumed_not_a_positional(self):
+        # ``browse-git --tty /dev/pts/N`` runs in normal repo mode: the
+        # ``--tty`` value (a terminal device path, consumed by
+        # Browser.run()) must NOT be classified as a pathspec/rev. Stub
+        # git present + inside a work tree so main() reaches the Browser;
+        # the raise-on-read stdin proves repo mode (no ``-`` ingest), and
+        # the empty rev/path filters + plain ``[commits]`` title prove the
+        # device path was not taken as a positional. ``--tty=PATH`` too.
+        for argv in (['browse-git', '--tty', '/dev/pts/9'],
+                     ['browse-git', '--tty=/dev/pts/9']):
+            self.r = _load_recipe()
+            self.r.shutil = types.SimpleNamespace(
+                which=lambda name: f'/usr/bin/{name}')
+            self.r._run_git = (
+                lambda *a: subprocess.CompletedProcess(a, 0, '', ''))
+            code, err = self._run_main(_RaiseOnRead(), argv)
+            self.assertIsNone(code, argv)
+            self.assertEqual(err, '', argv)
+            self.assertIsNone(self.r._STDIN_KIND, argv)
+            self.assertEqual(self.r._revs, [], argv)
+            self.assertEqual(self.r._paths, [], argv)
+            self.assertEqual(self.r._browser._args[0].title,
+                             'browse-git [commits]', argv)
+
+    def test_help_invocation_never_reads_stdin(self):
+        code, _err = self._run_main(_RaiseOnRead(), ['browse-git', '--help'])
+        self.assertIsNone(code)
+        self.assertIsNone(self.r._STDIN_KIND)
+
+
+class TestStdinActionGating(unittest.TestCase):
+    """In stdin mode the git-rerunning actions flash instead of acting."""
+
+    def setUp(self):
+        self.r = _load_recipe()
+
+    def _ctx(self):
+        calls = {'flashes': [], 'refresh': 0}
+
+        class Ctx:
+            def flash(self, text, log=False):
+                calls['flashes'].append(text)
+
+            def refresh(self, id=None, on_complete=None):
+                calls['refresh'] += 1
+
+            def collapse_all(self):
+                pass
+
+            def pick(self, *_a, **_kw):
+                raise AssertionError('pick reached in stdin mode')
+
+        return Ctx(), calls
+
+    def test_switch_mode_flashes_and_stays(self):
+        self.r._STDIN_KIND = 'diff'
+        ctx, calls = self._ctx()
+        self.r.switch_mode(ctx)
+        self.assertEqual(calls['flashes'],
+                         ['mode switch not available for piped input'])
+        self.assertEqual(calls['refresh'], 0)
+        self.assertEqual(self.r._mode, 'commits')   # unchanged
+
+    def test_toggle_tree_flashes_and_keeps_flag(self):
+        self.r._STDIN_KIND = 'log'
+        before = self.r._tree_mode
+        ctx, calls = self._ctx()
+        self.r.toggle_tree(ctx)
+        self.assertEqual(calls['flashes'],
+                         ['commit graph not available for piped input'])
+        self.assertEqual(calls['refresh'], 0)
+        self.assertEqual(self.r._tree_mode, before)
+
+    def test_repo_mode_toggle_tree_unaffected_by_gate(self):
+        self.assertIsNone(self.r._STDIN_KIND)
+        ctx, calls = self._ctx()
+        self.r.toggle_tree(ctx)
+        self.assertEqual(calls['refresh'], 1)       # still refreshes
+
+    def test_edit_file_covers_sfile_rows(self):
+        # A piped-diff file row maps to a working-tree path at id[2];
+        # outside a repo the rev-parse fails and the path opens as-is.
+        self.r._run_git = (
+            lambda *a: subprocess.CompletedProcess(a, 1, '', ''))
+        opened = []
+
+        class Ctx:
+            cursor = self.r.Item(id=('sfile', 0, 'keep.txt'))
+
+            def run_external(self, argv):
+                opened.append(argv)
+
+        ctx = Ctx()
+        self.r.edit_file(ctx)
+        self.assertEqual([argv[-1] for argv in opened], ['keep.txt'])
+        # A piped-log commit row has no path → no-op.
+        ctx.cursor = self.r.Item(id=('slog', 0))
+        self.r.edit_file(ctx)
+        self.assertEqual(len(opened), 1)
+
+    def test_window_title_shows_stdin_kind(self):
+        for kind in ('diff', 'log', 'status'):
+            self.r._STDIN_KIND = kind
+            self.assertEqual(self.r._window_title(),
+                             f'browse-git [stdin: {kind}]')
+
+
+class TestRunGitWithoutGit(unittest.TestCase):
+    """A missing git binary degrades, never raises (gitless regression).
+
+    ``browse-git -`` starts without the git-on-PATH precondition, so a
+    gitless environment is in-contract there. ``_run_git`` folds the
+    spawn's ``FileNotFoundError`` into the failed-CompletedProcess shape
+    (rc 127, message in stderr) every caller already branches on —
+    before this, ``E`` on a piped-diff row crashed the whole UI through
+    the unguarded key dispatch.
+    """
+
+    def setUp(self):
+        self.r = _load_recipe()
+
+        def no_git(cmd, **kwargs):
+            raise FileNotFoundError(2, 'No such file or directory', 'git')
+
+        # Same recipe-module-only subprocess swap as TestColorizeDiff;
+        # CompletedProcess stays real for the fold-to-failure branch.
+        self.r.subprocess = types.SimpleNamespace(
+            run=no_git, CompletedProcess=subprocess.CompletedProcess)
+
+    def test_run_git_returns_failed_completedprocess(self):
+        result = self.r._run_git('rev-parse', '--show-toplevel')
+        self.assertEqual(result.returncode, 127)
+        self.assertEqual(result.stdout, '')
+        self.assertIn('git not found', result.stderr)
+
+    def test_edit_file_on_sfile_degrades_to_cwd_relative_path(self):
+        # E in a gitless stdin session: no exception, the work-tree-root
+        # resolve fails quietly, and the cwd-relative path opens in
+        # $EDITOR — the session stays alive.
+        self.r._STDIN_KIND = 'diff'
+        opened = []
+
+        class Ctx:
+            cursor = self.r.Item(id=('sfile', 0, 'keep.txt'))
+
+            def run_external(self, argv):
+                opened.append(argv)
+
+        self.r.edit_file(Ctx())
+        self.assertEqual([argv[-1] for argv in opened], ['keep.txt'])
+
+    def test_git_color_surfaces_the_message_not_an_exception(self):
+        # Preview helpers built on _git_color show the message as text.
+        self.assertIn('git not found', self.r._git_color('show', 'HEAD'))
 
 
 class TestToggleTree(unittest.TestCase):

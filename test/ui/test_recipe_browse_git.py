@@ -13,6 +13,7 @@ are independent of the user's PATH.
 
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -868,6 +869,194 @@ class TestBrowseGitTreeMeta(unittest.TestCase):
                     self.assertTrue(
                         'commit' in row or 'feat' in row,
                         f'a non-commit row was selected: {row!r}')
+
+
+def _make_stdin_repo(tmpdir):
+    """Repo + dirty worktree whose git output feeds the ``-`` payloads.
+
+    Two commits over ``alpha.txt`` (``alpha payload v1`` → ``v2``, plus a
+    committed ``beta.txt``), then a dirty tree: an unstaged ``beta.txt``
+    edit (``beta worktree edit``) and an ``untracked.txt`` — distinctive
+    strings so the preview-pane assertions can't match a file name.
+    ``LC_ALL=C`` callers get stable human-status prose. Returns tmpdir.
+    """
+    env = {
+        **os.environ, 'LC_ALL': 'C',
+        'GIT_AUTHOR_NAME': 'Test', 'GIT_AUTHOR_EMAIL': 'test@example.com',
+        'GIT_COMMITTER_NAME': 'Test', 'GIT_COMMITTER_EMAIL': 'test@example.com',
+    }
+    def git(*args):
+        subprocess.run(['git', '-C', tmpdir, *args], check=True,
+                       capture_output=True, env=env)
+    git('init', '-q', '-b', 'main')
+    git('config', 'user.name', 'Test')
+    git('config', 'user.email', 'test@example.com')
+    with open(os.path.join(tmpdir, 'alpha.txt'), 'w') as f:
+        f.write('alpha payload v1\n')
+    with open(os.path.join(tmpdir, 'beta.txt'), 'w') as f:
+        f.write('beta payload v1\n')
+    git('add', 'alpha.txt', 'beta.txt')
+    git('commit', '-q', '-m', 'first commit add alpha')
+    with open(os.path.join(tmpdir, 'alpha.txt'), 'w') as f:
+        f.write('alpha payload v2\n')
+    git('add', 'alpha.txt')
+    git('commit', '-q', '-m', 'second commit change alpha')
+    # Dirty worktree: unstaged tracked edit + an untracked file.
+    with open(os.path.join(tmpdir, 'beta.txt'), 'w') as f:
+        f.write('beta worktree edit\n')
+    with open(os.path.join(tmpdir, 'untracked.txt'), 'w') as f:
+        f.write('brand new\n')
+    return tmpdir
+
+
+def _git_stdout(repo, *args):
+    """Return real ``git -C repo args…`` output (the stdin payload)."""
+    env = {**os.environ, 'LC_ALL': 'C'}
+    return subprocess.run(['git', '-C', repo, *args], check=True,
+                          capture_output=True, text=True, env=env).stdout
+
+
+class TestBrowseGitStdin(unittest.TestCase):
+    """``browse-git -`` browses git output slurped from stdin (#862).
+
+    End-to-end against the shipped binary: real ``git diff`` / ``log`` /
+    ``status`` output is captured from a temp fixture repo into a
+    payload file and the recipe launched with stdin redirected from it
+    (``… browse-git - < payload``) — a file redirect is a pipe that is
+    already closed, the faithful piped-input shape. The launches happen
+    from a separate NON-repo cwd, proving the slurped text (not git, not
+    a work tree) is the data source. The pre-UI error paths (empty /
+    unrecognized input) run the binary headlessly — they exit before any
+    terminal is touched.
+    """
+
+    def _launch_stdin(self, t, cwd, payload):
+        """``cd <cwd> && browse-tui --run-py browse-git - < payload``."""
+        t.send_line(f'cd {shlex.quote(cwd)} && {shlex.quote(_BIN)} '
+                    f'--run-py {shlex.quote(_RECIPE)} - '
+                    f'< {shlex.quote(payload)}')
+
+    @staticmethod
+    def _payload(elsewhere, text):
+        path = os.path.join(elsewhere, 'payload.txt')
+        with open(path, 'w') as f:
+            f.write(text)
+        return path
+
+    def test_piped_diff_file_rows_preview_and_gating(self):
+        # `git diff` → one [M] row per file; the preview pane shows the
+        # file's own hunks from the text (delta-rendered when present —
+        # either way the changed line's text appears). The backtick mode
+        # picker is gated off with a flash; launched from a non-repo cwd.
+        with tempfile.TemporaryDirectory() as repo, \
+                tempfile.TemporaryDirectory() as elsewhere:
+            _make_stdin_repo(repo)
+            payload = self._payload(elsewhere, _git_stdout(repo, 'diff'))
+            with TmuxFixture(cols=120, rows=30) as t:
+                self._launch_stdin(t, elsewhere, payload)
+                cap = t.wait_for('beta.txt', timeout=8.0)
+                row = next(ln for ln in cap.splitlines() if 'beta.txt' in ln)
+                self.assertIn('[M]', row)
+                # Cursor starts on the row → its block is the preview.
+                t.wait_for('beta worktree edit', timeout=5.0)
+                # Mode switching re-runs git → flashes in stdin mode.
+                t.send('`')
+                t.wait_for('mode switch not available for piped input',
+                           timeout=5.0)
+                t.send('q')
+
+    def test_piped_log_lists_commit_rows(self):
+        # `git log` → one columnar commit row per block: subject last,
+        # short-sha + author columns leading. 200 cols so the long
+        # absolute Date column doesn't push the subject off the pane.
+        with tempfile.TemporaryDirectory() as repo, \
+                tempfile.TemporaryDirectory() as elsewhere:
+            _make_stdin_repo(repo)
+            payload = self._payload(elsewhere, _git_stdout(repo, 'log'))
+            with TmuxFixture(cols=200, rows=30) as t:
+                self._launch_stdin(t, elsewhere, payload)
+                cap = t.wait_for('second commit change alpha', timeout=8.0)
+                t.wait_for('first commit add alpha', timeout=5.0)
+                row = next(ln for ln in cap.splitlines()
+                           if 'second commit change alpha' in ln)
+                # The author column and a 7-hex short sha lead the row.
+                self.assertIn('Test', row)
+                self.assertRegex(row, r'\b[0-9a-f]{7}\b')
+                t.send('q')
+
+    def test_piped_log_p_block_previews_its_patch(self):
+        # `git log -p` → the newest commit's preview carries its own
+        # patch text from the slurped block (delta or verbatim).
+        with tempfile.TemporaryDirectory() as repo, \
+                tempfile.TemporaryDirectory() as elsewhere:
+            _make_stdin_repo(repo)
+            payload = self._payload(elsewhere, _git_stdout(repo, 'log', '-p'))
+            with TmuxFixture(cols=200, rows=30) as t:
+                self._launch_stdin(t, elsewhere, payload)
+                t.wait_for('second commit change alpha', timeout=8.0)
+                # Cursor starts on the newest commit; its block contains
+                # the alpha v1→v2 patch.
+                t.wait_for('alpha payload v2', timeout=5.0)
+                t.send('q')
+
+    def test_piped_porcelain_status_rows(self):
+        with tempfile.TemporaryDirectory() as repo, \
+                tempfile.TemporaryDirectory() as elsewhere:
+            _make_stdin_repo(repo)
+            payload = self._payload(
+                elsewhere, _git_stdout(repo, 'status', '--porcelain'))
+            with TmuxFixture(cols=120, rows=30) as t:
+                self._launch_stdin(t, elsewhere, payload)
+                cap = t.wait_for('untracked.txt', timeout=8.0)
+                beta = next(ln for ln in cap.splitlines() if 'beta.txt' in ln)
+                self.assertIn('[M]', beta)
+                untracked = next(ln for ln in cap.splitlines()
+                                 if 'untracked.txt' in ln)
+                self.assertIn('[?]', untracked)
+                t.send('q')
+
+    def test_piped_human_status_rows(self):
+        # The prose `git status` form builds the same status-view rows.
+        with tempfile.TemporaryDirectory() as repo, \
+                tempfile.TemporaryDirectory() as elsewhere:
+            _make_stdin_repo(repo)
+            payload = self._payload(elsewhere, _git_stdout(repo, 'status'))
+            with TmuxFixture(cols=120, rows=30) as t:
+                self._launch_stdin(t, elsewhere, payload)
+                cap = t.wait_for('untracked.txt', timeout=8.0)
+                beta = next(ln for ln in cap.splitlines() if 'beta.txt' in ln)
+                self.assertIn('[M]', beta)
+                untracked = next(ln for ln in cap.splitlines()
+                                 if 'untracked.txt' in ln)
+                self.assertIn('[?]', untracked)
+                t.send('q')
+
+    # -- pre-UI error paths (headless: the recipe exits before any UI) --
+
+    def test_unrecognized_stdin_errors_before_ui(self):
+        proc = subprocess.run(
+            [_BIN, '--run-py', _RECIPE, '-'],
+            input='certainly not git output\n',
+            capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn('unrecognized stdin input', proc.stderr)
+        self.assertEqual(proc.stdout, '')
+
+    def test_empty_stdin_errors_before_ui(self):
+        proc = subprocess.run(
+            [_BIN, '--run-py', _RECIPE, '-'],
+            input='', capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn('empty stdin input', proc.stderr)
+        self.assertEqual(proc.stdout, '')
+
+    def test_dash_with_other_args_errors_before_ui(self):
+        proc = subprocess.run(
+            [_BIN, '--run-py', _RECIPE, '-', '--mode', 'status'],
+            input='?? x\n', capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn('cannot be combined', proc.stderr)
+        self.assertEqual(proc.stdout, '')
 
 
 if __name__ == '__main__':

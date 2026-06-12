@@ -11,6 +11,8 @@ test is independent of the user's PATH.
 """
 
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -73,6 +75,91 @@ class TestBrowseFs(unittest.TestCase):
                 except AssertionError:
                     t.redraw()
                     t.wait_for('two.txt', timeout=2.0)
+                t.send('q')
+
+
+class TestBrowseFsStdin(unittest.TestCase):
+    """``browse-fs -`` displays the stdin path list as the root level.
+
+    End-to-end against the shipped binary: we pipe a newline-separated
+    path list into the recipe (``printf '…' | browse-tui … browse-fs
+    -``) with the shell ``cd``'d into the temp dir so the relative paths
+    resolve there. Because the recipe slurps ``sys.stdin`` BEFORE the UI
+    starts, the pipe's EOF is reached during ingest and the parsed list
+    drives the tree — the UI itself stays on the tmux pane's terminal.
+    """
+
+    def _launch_piped(self, t, tmp, lines):
+        """``cd tmp && printf '<lines>' | browse-tui --run-py browse-fs -``."""
+        payload = ''.join(f'{line}\n' for line in lines)
+        cmd = (
+            f'cd {shlex.quote(tmp)} && '
+            f'printf %s {shlex.quote(payload)} | '
+            f'{shlex.quote(_BIN)} --run-py {shlex.quote(_RECIPE)} -'
+        )
+        t.send_line(cmd)
+
+    def test_piped_mixed_list_roots_expand_and_preview(self):
+        # A mixed list: a file, a directory (with a child), a missing
+        # path, and a path with spaces — all relative to the temp dir.
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, 'adir'))
+            with open(os.path.join(tmp, 'adir', 'child.txt'), 'w') as f:
+                f.write('child body')
+            with open(os.path.join(tmp, 'plain.txt'), 'w') as f:
+                f.write('plain file body')
+            with open(os.path.join(tmp, 'a file.txt'), 'w') as f:
+                f.write('spaced body')
+            with TmuxFixture(cols=120, rows=30) as t:
+                self._launch_piped(
+                    t, tmp,
+                    ['plain.txt', 'adir', 'missing-xyz', 'a file.txt'])
+                # The roots are exactly the piped entries (verbatim labels;
+                # the missing one carries the dim marker).
+                t.wait_for('plain.txt', timeout=6.0)
+                t.wait_for('adir', timeout=4.0)
+                t.wait_for('a file.txt', timeout=4.0)
+                # The missing row renders with a dim ``[missing]`` chip
+                # before the verbatim label.
+                t.wait_for(re.compile(r'\[missing\]\s+missing-xyz'),
+                           timeout=4.0)
+                # The cursor starts on the first root (plain.txt) → its
+                # preview is the file head.
+                t.wait_for('plain file body', timeout=4.0)
+                # Expanding the directory reveals its real child.
+                t.wait_for('adir', timeout=4.0)
+                t.send('Down')                 # move onto adir
+                t.send('Right')                # expand it
+                t.wait_for('child.txt', timeout=4.0)
+                t.send('q')
+
+    def test_missing_path_preview_shows_error_not_crash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with TmuxFixture(cols=120, rows=30) as t:
+                self._launch_piped(t, tmp, ['ghost.txt'])
+                # The lone missing row renders with the dim chip.
+                t.wait_for(re.compile(r'\[missing\]\s+ghost.txt'),
+                           timeout=6.0)
+                # The cursor lands on it; the preview shows the underlying
+                # stat error (its text, distinct from the row's chip)
+                # rather than crashing.
+                t.wait_for(re.compile(r'No such file'), timeout=4.0)
+                t.send('q')
+
+    def test_empty_stdin_clean_ui(self):
+        # Empty input ⇒ an empty root list. The recipe must not crash;
+        # the framework shows its "no items" state and quits cleanly.
+        with tempfile.TemporaryDirectory() as tmp:
+            with TmuxFixture(cols=120, rows=30) as t:
+                cmd = (
+                    f'cd {shlex.quote(tmp)} && '
+                    f'printf %s "" | '
+                    f'{shlex.quote(_BIN)} --run-py {shlex.quote(_RECIPE)} -'
+                )
+                t.send_line(cmd)
+                # The title bar renders (the UI came up) and stays stable.
+                t.wait_for('browse-fs', timeout=6.0)
+                t.wait_stable(timeout=3.0)
                 t.send('q')
 
 
