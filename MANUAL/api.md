@@ -992,8 +992,9 @@ returns initial data *and* expects later watcher pushes to keep showing
 #### `get_preview(item_id) -> str | Generator[str] | None`
 
 Optional. Called per cursor-move, on a worker thread (latest-wins:
-rapid moves coalesce to one in-flight fetch). Return any string; it's shown
-verbatim in the preview pane.
+rapid moves coalesce to one in-flight fetch). The worker also waits for the
+cursor to settle before fetching — see `preview_debounce` below. Return any
+string; it's shown verbatim in the preview pane.
 
 `None` from the callback is treated as `''`. Errors are caught and rendered
 as `[error] ExceptionName: message`.
@@ -1030,6 +1031,36 @@ def get_preview(item_id):
         finally:
             pass  # f's context manager closes on cursor-move
 ```
+
+##### Settle debounce
+
+`BrowserConfig.preview_debounce` (float seconds, default `0.15`) is how long
+the cursor must sit still before the worker fetches. A held `j`/`k` or a
+mouse-wheel burst keeps restarting the timer, so only the row the cursor
+settles on is fetched — the per-row fetches and generator open/close churn in
+between are skipped. The wait is deliberately imprecise (a sleep-and-recheck,
+not a timer): under continuous movement the effective delay can stretch toward
+twice the configured value. Set it to `0` to fetch immediately on every move
+(the historical behavior). It is a `Browser(...)` kwarg like the other preview
+knobs; there is no CLI flag.
+
+##### Hold-last-preview and the loading label
+
+While a fetch for the cursored row is outstanding, the pane keeps showing the
+last preview it painted rather than blanking — including when the cursor lands
+on a still-loading placeholder row, and across the debounce wait. The held view
+is frozen at its previous scroll offset; the cursor-move scroll reset and any
+scroll keys take effect once the new content swaps in. A *delivered* empty
+preview (`''`, including `None` coerced to `''`) is a real result and blanks the
+pane; only a not-yet-delivered fetch holds.
+
+Whenever a fetch for the cursored row is outstanding, the right-aligned pane
+label reads `⧗ Preview` instead of `Preview` — through the debounce wait, the
+fetch itself, and an actively streaming generator. It reverts to `Preview` on
+delivery, on stream exhaustion or error, and while a streaming preview is
+*paused* at its buffer cap (the worker has voluntarily stopped pulling);
+scrolling near the buffered tail resumes the stream and brings the glyph back.
+Help mode always shows `Help`, never the glyph.
 
 #### `on_enter` modes
 
@@ -1705,6 +1736,7 @@ class BrowserConfig:
     show_scope_crumb: bool = False
     preview_buffer_cap_chars: int = 100_000
     preview_buffer_cap_lines: int = 1000
+    preview_debounce: float = 0.15                 # seconds of cursor quiet before a fetch; 0 = immediate
     on_cursor_change: Callable | None = None      # (ctx, id)
     on_scope_change: Callable | None = None        # (ctx, scope_id, prev_scope_id, direction)
     on_selection_change: Callable | None = None    # (ctx, ids)

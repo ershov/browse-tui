@@ -99,8 +99,13 @@ root.
 
 Bash command run for the preview pane. The id of the cursor item is `$TUI_ID`.
 Stdout (utf-8, errors replaced) is shown verbatim in the preview pane. The
-preview worker is latest-wins: rapid cursor moves coalesce to one in-flight
-fetch.
+preview worker is latest-wins and waits for the cursor to settle (~0.15s)
+before running `CMD`, so a held `j`/`k` coalesces to one run for the row the
+cursor lands on. While that run is outstanding the pane keeps the previously
+shown preview rather than blanking, and the pane label reads `⧗ Preview`;
+both revert once the new output arrives. (The settle delay is the
+`preview_debounce` knob — see [api.md](api.md); recipes can tune or disable
+it, there is no CLI flag.)
 
 ```bash
 --preview-cmd '[[ -d "$TUI_ID" ]] && ls -lA "$TUI_ID" || head -200 "$TUI_ID"'
