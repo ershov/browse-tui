@@ -830,5 +830,163 @@ class TestStdinRoots(unittest.TestCase):
         self.assertIsNone(self.r._STDIN_ROOTS)
 
 
+class _EnterCtx:
+    """A ``ctx`` stand-in for ``_on_enter`` / launch tests.
+
+    ``cursor`` is the row Enter fires on; ``run_external`` records the argv
+    each call receives so a test can assert what was launched.
+    """
+
+    def __init__(self, cursor):
+        self.cursor = cursor
+        self.calls = []
+
+    def run_external(self, cmd, env=None):
+        self.calls.append(cmd)
+        return 0
+
+
+class TestMdLauncher(unittest.TestCase):
+    """browse-fs markdown launcher rows: a .md row opens in browse-md (#968)."""
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self.r._MD_COLOR = False  # raw previews keep assertions ANSI-free
+        self.d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__('shutil').rmtree(self.d, ignore_errors=True))
+
+    def _w(self, name, text=''):
+        p = os.path.join(self.d, name)
+        with open(p, 'w') as f:
+            f.write(text)
+        return p
+
+    # ---- has_children gate ------------------------------------------------
+
+    def test_md_file_row_gets_arrow_others_do_not(self):
+        self._w('a.md', '# A\n')
+        self._w('x.txt', 'hi\n')
+        os.mkdir(os.path.join(self.d, 'sub'))
+        rows = {r.title: r for r in self.r.get_children(self.d)}
+        self.assertTrue(rows['a.md'].has_children)      # .md → launcher arrow
+        self.assertFalse(rows['x.txt'].has_children)    # plain file → leaf
+        self.assertTrue(rows['sub/'].has_children)      # dir → unchanged
+
+    def test_md_capital_extension_also_arrows(self):
+        self._w('READ.MD', '# x\n')
+        rows = {r.title: r for r in self.r.get_children(self.d)}
+        self.assertTrue(rows['READ.MD'].has_children)
+
+    def test_stdin_root_md_gets_arrow(self):
+        p = self._w('note.md', '# n\n')
+        item = self.r._stdin_root_item('note.md', p)
+        self.assertTrue(item.has_children)
+
+    def test_inert_when_md_doc_absent(self):
+        self._w('a.md', '# A\nlinks [b](b.md)\n')
+        self._w('b.md', '# B\n')
+        self.r._md_doc = None
+        rows = {r.title: r for r in self.r.get_children(self.d)}
+        self.assertFalse(rows['a.md'].has_children)     # no arrow
+        # And the path no longer intercepts: a .md "expanded" falls through
+        # to scandir, which errors on a non-dir (a plain leaf in practice).
+        self.assertFalse(self.r._md_launchable(os.path.join(self.d, 'a.md')))
+
+    # ---- launcher children ------------------------------------------------
+
+    def test_self_open_row_first_then_links(self):
+        a = self._w('a.md', '# A\nSee [b](b.md).\n')
+        b = self._w('b.md', '# B\n')
+        rows = self.r._md_launcher_children(a)
+        self.assertEqual(len(rows), 2)
+        # Self-open row first, target == the file itself.
+        self.assertEqual(rows[0].id, ('launch', a, 'md-file', a))
+        self.assertEqual(rows[1].id[3], os.path.realpath(b))
+        # All launcher rows: leaf, md tag, » prefix.
+        for row in rows:
+            self.assertFalse(row.has_children)
+            self.assertEqual(row.tag, 'md')
+            self.assertEqual(row.tag_style, 'blue')
+            self.assertTrue(row.title.startswith('» '))
+
+    def test_links_deduped_and_sorted_by_label(self):
+        # Reference z then a (and b twice) — links come out sorted, deduped,
+        # after the self row.
+        a = self._w('a.md', 'see z.md and b.md then b.md again and a.md\n')
+        self._w('z.md', '')
+        self._w('b.md', '')
+        rows = self.r._md_launcher_children(a)
+        labels = [r.title for r in rows]
+        self.assertEqual(labels, ['» a.md', '» b.md', '» z.md'])  # self, then sorted
+
+    def test_nonexistent_and_non_md_refs_dropped(self):
+        a = self._w('a.md', 'missing nope.md, code config.txt, real real.md\n')
+        self._w('real.md', '')
+        rows = self.r._md_launcher_children(a)
+        targets = [os.path.basename(r.id[3]) for r in rows]
+        self.assertEqual(targets, ['a.md', 'real.md'])  # self + the one existing .md
+
+    def test_self_reference_not_duplicated(self):
+        a = self._w('a.md', 'I link to myself: a.md\n')
+        rows = self.r._md_launcher_children(a)
+        self.assertEqual(len(rows), 1)                  # only the self-open row
+        self.assertEqual(rows[0].id[3], a)
+
+    def test_no_links_yields_lone_self_row(self):
+        a = self._w('a.md', '# just headings\n## no refs\n')
+        rows = self.r._md_launcher_children(a)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].id, ('launch', a, 'md-file', a))
+
+    def test_unreadable_file_still_yields_self_row(self):
+        a = os.path.join(self.d, 'gone.md')  # never created
+        rows = self.r._md_launcher_children(a)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].id[3], a)
+
+    def test_get_children_intercepts_md_path(self):
+        a = self._w('a.md', 'see b.md\n')
+        self._w('b.md', '')
+        via_children = [r.id for r in self.r.get_children(a)]
+        via_builder = [r.id for r in self.r._md_launcher_children(a)]
+        self.assertEqual(via_children, via_builder)
+
+    # ---- preview ----------------------------------------------------------
+
+    def test_preview_of_launch_id_shows_target(self):
+        a = self._w('a.md', '# A\n')
+        b = self._w('b.md', 'BODY-OF-B\n')
+        rows = self.r._md_launcher_children(self._w('a.md', 'see b.md\n'))
+        link = next(r for r in rows if r.id[3] == os.path.realpath(b))
+        self.assertIn('BODY-OF-B', self.r.get_preview(link.id))
+
+    # ---- Enter dispatch / launch -----------------------------------------
+
+    def test_enter_on_launcher_launches_browse_md(self):
+        a = self._w('a.md', '# A\n')
+        row = self.r._md_launcher_children(a)[0]   # the self-open row
+        ctx = _EnterCtx(row)
+        self.r._on_enter(ctx)
+        self.assertEqual(len(ctx.calls), 1)
+        cmd = ctx.calls[0]
+        self.assertEqual(cmd[0], 'browse-md')
+        self.assertEqual(cmd[1], a)
+        self.assertIn('--root', cmd)
+        # --root value is the project root (here: the file's own dir).
+        self.assertEqual(cmd[cmd.index('--root') + 1], self.r._project_root_for(a))
+
+    def test_enter_on_regular_file_row_edits(self):
+        a = self._w('a.md', '# A\n')
+        ctx = _EnterCtx(self.r.Item(id=a))   # a plain str-id row (not a launcher)
+        with mock.patch.dict(os.environ, {'EDITOR': 'ed'}):
+            self.r._on_enter(ctx)
+        self.assertEqual(ctx.calls, [['ed', a]])
+
+    def test_enter_with_no_cursor_is_noop(self):
+        ctx = _EnterCtx(None)
+        self.r._on_enter(ctx)                # must not raise
+        self.assertEqual(ctx.calls, [])
+
+
 if __name__ == '__main__':
     unittest.main()
