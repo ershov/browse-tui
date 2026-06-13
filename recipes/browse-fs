@@ -16,6 +16,13 @@ the ``-`` is optional, so ``ls *.py | browse-fs`` works too. ``-`` stays
 the explicit form, needed only to read stdin when stdin is a tty
 (type/paste the list, end with ^D).
 
+A markdown file row (``*.md`` / ``*.MD``) carries an expansion arrow:
+opening it lists ``»`` launcher rows — the document itself plus every
+existing ``.md`` file it links to — and Enter on one opens that file in
+``browse-md`` (``--root`` anchored at the project root so the document's
+own links resolve). Needs the optional ``md_doc`` plugin; without it,
+``*.md`` rows stay leaves.
+
 Usage:  browse-fs [PATH | -]   # no argument ⇒ the current directory
                                # (or stdin, when piped).
 """
@@ -418,7 +425,11 @@ Usage: browse-fs [PATH | -]
 Lazily walks directories with os.scandir; the preview pane shows file
 heads or directory listings. The selection / cursor seeds $TUI_IDS_FILE
 for the actions below; mtime changes refresh the affected directory
-automatically. Press Enter (or 'e') to open the cursor row in $EDITOR.\
+automatically. Press Enter (or 'e') to open the cursor row in $EDITOR.
+
+A markdown file (*.md / *.MD) gets an expansion arrow: open it to list
+'»' launcher rows — the document itself and the .md files it links to —
+and press Enter on one to open that file in browse-md.\
 """
 
 
