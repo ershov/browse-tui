@@ -133,6 +133,26 @@ class TestBrowseFsStdin(unittest.TestCase):
                 t.wait_for('child.txt', timeout=4.0)
                 t.send('q')
 
+    def test_piped_without_dash_auto_engages_stdin(self):
+        # ``cmd | browse-fs`` with NO ``-`` on the command line: the recipe
+        # auto-detects the piped (non-tty) stdin and shows the path list
+        # exactly as the explicit ``-`` form would.
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, 'plain.txt'), 'w') as f:
+                f.write('plain file body')
+            payload = 'plain.txt\n'
+            cmd = (
+                f'cd {shlex.quote(tmp)} && '
+                f'printf %s {shlex.quote(payload)} | '
+                f'{shlex.quote(_BIN)} --run-py {shlex.quote(_RECIPE)}'
+            )
+            with TmuxFixture(cols=120, rows=30) as t:
+                t.send_line(cmd)
+                # The piped path is the root (stdin mode) without typing ``-``.
+                t.wait_for('plain.txt', timeout=6.0)
+                t.wait_for('plain file body', timeout=4.0)
+                t.send('q')
+
     def test_missing_path_preview_shows_error_not_crash(self):
         with tempfile.TemporaryDirectory() as tmp:
             with TmuxFixture(cols=120, rows=30) as t:

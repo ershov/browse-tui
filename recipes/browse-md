@@ -9,7 +9,10 @@ reads ONE document from ``sys.stdin`` (slurped to EOF before the UI
 starts) and browses it like a file — its top-level row is titled
 ``-`` (matching the invocation). Editing/paging the on-disk source (``V`` / ``E``) is
 unavailable for that document (it has no file); the actions flash a
-message instead.
+message instead. When stdin is a pipe or redirect (not a tty), this
+mode auto-engages — the ``-`` is optional, so ``cmd | browse-md`` works
+too. ``-`` stays the explicit form, needed only to read stdin when
+stdin is a tty (type/paste the document, end with ^D).
 
 Parses each resulting markdown file into a tree of headings (h1..h6);
 list items under each section can optionally be surfaced as tree
@@ -1918,7 +1921,9 @@ Usage: browse-md [-l] [--root DIR ...] [FILE.md[#anchor] | DIR ... | -]
   DIR       Expands to the ``.md`` / ``.MD`` files directly inside it
             (non-recursive). No args ⇒ browse ``.``.
   -         Read ONE document from stdin and browse it like a file
-            (row titled ``-``; V/E have no source — they flash).
+            (row titled ``-``; V/E have no source — they flash). A pipe
+            auto-engages this, so ``-`` is optional when piping; type it
+            to read a tty stdin (paste, then ^D).
   #anchor   Deep-link target — 0-based line number or heading name
             (exact / prefix / substring tiers; first hit wins). When
             multiple files carry anchors, the FIRST anchored file in
@@ -2162,17 +2167,29 @@ def main():
             _die(f'unrecognised option: {tok}')
     positionals = [t for t in leftover if not (t.startswith('-') and t != '-')]
 
+    # Auto-detect a piped/redirected stdin: when fd 0 is not a tty and the
+    # user didn't already type ``-``, synthesize it so a bare
+    # ``cmd | browse-md`` browses the piped document without the explicit
+    # token. An interactive tty stdin leaves ``positionals`` untouched
+    # (bare/FILE mode). The synthesized ``-`` then flows through the same
+    # logic below: a lone ``-`` reads the doc; ``- FILE`` (a piped run that
+    # still names a file) falls into the file branch where ``-`` fails to
+    # resolve and errors. Inject into the positional list only — ``-l`` /
+    # ``--root`` were already popped above and still compose.
+    if '-' not in positionals and not os.isatty(0):
+        positionals.append('-')
+
     # The lone ``-`` reads ONE document from stdin (spec §3.3 / §3.7).
     # Slurp it HERE — before ``b.run()`` / ``term_init``, while fd 0 is
-    # still whatever the caller provided (on a tty this blocks cat-like
-    # until ^D; standard unix, no isatty babysitting). After ``term_init``
-    # a tty fd 0 is detached, so a later read would only see EOF — the
-    # one chance to read piped input is now. The text is stashed on the
-    # sentinel path and parsed through the same ``_reparse`` pipeline as
-    # a file; an anchor with ``-`` (e.g. ``-#x``) is out of scope and is
-    # not a lone ``-``, so it never reaches here (``-#x`` is rejected as
-    # an unrecognised option by the leftover-scan above). Empty input
-    # parses to an empty document — exactly an empty ``.md`` file.
+    # still whatever the caller provided (an explicit ``-`` on a tty blocks
+    # cat-like until ^D; standard unix, no isatty babysitting on the read).
+    # After ``term_init`` a tty fd 0 is detached, so a later read would only
+    # see EOF — the one chance to read piped input is now. The text is
+    # stashed on the sentinel path and parsed through the same ``_reparse``
+    # pipeline as a file; an anchor with ``-`` (e.g. ``-#x``) is out of
+    # scope and is not a lone ``-``, so it never reaches here (``-#x`` is
+    # rejected as an unrecognised option by the leftover-scan above). Empty
+    # input parses to an empty document — exactly an empty ``.md`` file.
     if positionals == ['-']:
         _STDIN_TEXT = sys.stdin.read()
         _INPUT_FILES = [(_STDIN_PATH, '')]

@@ -971,6 +971,27 @@ class TestBrowseGitStdin(unittest.TestCase):
                            timeout=5.0)
                 t.send('q')
 
+    def test_piped_without_dash_auto_engages_stdin(self):
+        # ``git diff | browse-git`` with NO ``-`` on the command line: the
+        # recipe auto-detects the piped (non-tty) stdin and ingests the diff
+        # exactly as the explicit ``-`` form would. Same redirect shape, the
+        # ``-`` token simply dropped from the launch line; from a non-repo
+        # cwd so the slurped text (not git) is provably the source.
+        with tempfile.TemporaryDirectory() as repo, \
+                tempfile.TemporaryDirectory() as elsewhere:
+            _make_stdin_repo(repo)
+            payload = self._payload(elsewhere, _git_stdout(repo, 'diff'))
+            with TmuxFixture(cols=120, rows=30) as t:
+                t.send_line(
+                    f'cd {shlex.quote(elsewhere)} && {shlex.quote(_BIN)} '
+                    f'--run-py {shlex.quote(_RECIPE)} '
+                    f'< {shlex.quote(payload)}')
+                cap = t.wait_for('beta.txt', timeout=8.0)
+                self.assertRegex(cap, r'diff: 1 file \+\d+ -\d+')
+                row = next(ln for ln in cap.splitlines() if 'beta.txt' in ln)
+                self.assertIn('[M]', row)
+                t.send('q')
+
     def test_piped_log_lists_commit_rows(self):
         # `git log` → one columnar commit row per block: subject last,
         # short-sha + author columns leading. 200 cols so the long

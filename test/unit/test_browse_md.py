@@ -26,6 +26,7 @@ tree linking + Item construction), #521 (line lookup + anchor
 resolution), and #522 (preview pipeline + ``m`` / ``M`` toggles).
 """
 
+import contextlib
 import importlib.util
 import os
 import sys
@@ -33,10 +34,42 @@ import types
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from unittest import mock
 
 
 _REPO = Path(__file__).resolve().parents[2]
 _RECIPE = _REPO / 'recipes' / 'browse-md'
+
+
+# ``main()`` auto-detects a piped stdin via ``os.isatty(0)``: a non-tty fd 0
+# synthesizes the lone ``-`` (stdin mode). The test runner's fd 0 is itself a
+# pipe (non-tty), which would spuriously trip that auto-detect for the
+# bare/FILE-mode cases below. Pin the whole module to an INTERACTIVE tty so
+# those tests keep exercising bare/FILE mode (the historical default); the
+# dedicated auto-detect tests opt back into a pipe via ``_piped_stdin``.
+_isatty_patch = None
+
+
+def setUpModule():
+    global _isatty_patch
+    _isatty_patch = mock.patch('os.isatty', return_value=True)
+    _isatty_patch.start()
+
+
+def tearDownModule():
+    if _isatty_patch is not None:
+        _isatty_patch.stop()
+
+
+@contextlib.contextmanager
+def _piped_stdin():
+    """Within the block, ``os.isatty(0)`` is False (a piped/redirected stdin).
+
+    Restores the module-wide interactive default on exit, so the auto-detect
+    tests can simulate ``cmd | browse-md`` without leaking the False into
+    neighbouring bare/FILE-mode cases."""
+    with mock.patch('os.isatty', return_value=False):
+        yield
 
 
 def _stub_recipe_argv(argv=None):
@@ -5042,6 +5075,54 @@ class TestStdinDocument(unittest.TestCase):
         self.assertIsNone(self.r._STDIN_TEXT)
         self.assertEqual(self.r._INPUT_FILES, [(f.name, '')])
 
+    # -- auto-detect: a piped (non-tty) stdin synthesizes ``-`` --------
+
+    def test_piped_no_positional_engages_stdin_without_dash(self):
+        # ``cmd | browse-md`` (no explicit ``-``): a non-tty fd 0 makes
+        # main() synthesize ``-`` and browse the piped document, exactly
+        # as if ``-`` had been typed.
+        with _piped_stdin():
+            self._run_main('# Title\n## Section\nbody\n', argv=('browse-md',))
+        self.assertEqual(self.r._INPUT_FILES, [(self.r._STDIN_PATH, '')])
+        self.assertEqual(self.r._STDIN_TEXT, '# Title\n## Section\nbody\n')
+        self.assertEqual(self.r._ANCHOR, '')
+
+    def test_piped_with_file_positional_errors(self):
+        # ``cmd | browse-md FILE``: the synthesized ``-`` joins the
+        # positional list, so it falls into the FILE branch where ``-``
+        # fails to resolve as a path and main() dies (exit 2). stdin is
+        # never read (the lone-``-`` slurp is only the ``== ['-']`` case).
+        import contextlib
+        import io
+        import os
+        import tempfile
+        f = tempfile.NamedTemporaryFile(
+            'w', suffix='.md', delete=False, encoding='utf-8')
+        f.write('# F\n')
+        f.close()
+        self.addCleanup(os.unlink, f.name)
+        self.r.sys.argv[:] = ['browse-md', f.name]
+        self.r.sys.stdin = _RaiseOnRead()
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            with self.assertRaises(SystemExit) as cm:
+                with _piped_stdin():
+                    self.r.main()
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn('no such file or directory: -', buf.getvalue())
+        self.assertIsNone(self.r._STDIN_TEXT)
+
+    def test_piped_empty_is_an_empty_document(self):
+        # A non-tty empty stdin synthesizes ``-`` and flows into the
+        # existing empty handling: an empty document, no crash. No
+        # emptiness special-casing.
+        with _piped_stdin():
+            self._run_main('', argv=('browse-md',))
+        self.assertEqual(self.r._STDIN_TEXT, '')
+        fs = self.r._FILES[self.r._STDIN_PATH]
+        self.assertEqual(fs.file_root._children, [])
+        self.assertFalse(fs.file_root.has_children)
+
     # -- '-#anchor' is out of scope: rejected, never half-works -------
 
     def test_dash_anchor_rejected_as_unrecognised_option(self):
@@ -5183,6 +5264,32 @@ class TestStdinDocument(unittest.TestCase):
             sub = self.r.get_children(refs[0].id)
             self.assertEqual([(k.tag, k.title) for k in sub],
                              [('h1', 'Target heading')])
+
+    def test_auto_detected_stdin_composes_with_root_and_lists(self):
+        # ``cmd | browse-md --root DIR -l`` (no explicit ``-``): the
+        # behavior flags are popped first, fd 0 is non-tty, so ``-`` is
+        # synthesized and the piped doc is browsed with the root + lists
+        # flags still in effect.
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, 'root')
+            os.mkdir(root)
+            with open(os.path.join(root, 'target.md'), 'w') as f:
+                f.write('# Target heading\nbody\n')
+            self.r = _load_recipe()
+            with _piped_stdin():
+                self._run_main(
+                    '# Piped\nsee target.md\n',
+                    argv=('browse-md', '--root', root, '-l'))
+            # Auto-detected stdin mode AND the flags composed.
+            self.assertEqual(self.r._INPUT_FILES, [(self.r._STDIN_PATH, '')])
+            self.assertEqual(self.r._ROOTS, [root])
+            self.assertTrue(self.r._INCLUDE_LISTS)
+            # The root resolved the piped doc's ref (umbrella present).
+            kids = self.r.get_children(('file', self.r._STDIN_PATH))
+            self.assertTrue(any(k.tag == 'links' for k in kids),
+                            '--root must still lift ref suppression')
 
     def test_stdin_with_root_preview_of_ref(self):
         # The referenced file's preview is reachable from the stdin doc once a

@@ -110,6 +110,7 @@ covered end-to-end against a real headless Browser in
 ``test/ui/test_recipe_browse_git.py``.
 """
 
+import contextlib
 import importlib.util
 import io
 import os
@@ -122,10 +123,42 @@ import types
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from unittest import mock
 
 
 _REPO = Path(__file__).resolve().parents[2]
 _RECIPE = _REPO / 'recipes' / 'browse-git'
+
+
+# ``main()`` auto-detects a piped stdin via ``os.isatty(0)``: a non-tty fd 0
+# synthesizes the lone ``-`` (stdin ingest). The test runner's fd 0 is itself
+# a pipe (non-tty), which would spuriously trip that auto-detect for the bare/
+# repo-mode cases below. Pin the whole module to an INTERACTIVE tty so those
+# tests keep exercising bare/repo mode (the historical default); the dedicated
+# auto-detect tests opt back into a pipe via ``_piped_stdin``.
+_isatty_patch = None
+
+
+def setUpModule():
+    global _isatty_patch
+    _isatty_patch = mock.patch('os.isatty', return_value=True)
+    _isatty_patch.start()
+
+
+def tearDownModule():
+    if _isatty_patch is not None:
+        _isatty_patch.stop()
+
+
+@contextlib.contextmanager
+def _piped_stdin():
+    """Within the block, ``os.isatty(0)`` is False (a piped/redirected stdin).
+
+    Restores the module-wide interactive default on exit, so the auto-detect
+    tests can simulate ``git diff | browse-git`` without leaking the False
+    into neighbouring bare/repo-mode cases."""
+    with mock.patch('os.isatty', return_value=False):
+        yield
 
 
 # Sentinel the stub ``style('dim')`` / ``style('yellow')`` return; the
@@ -3391,6 +3424,56 @@ class TestStdinMain(unittest.TestCase):
     def test_help_invocation_never_reads_stdin(self):
         code, _err = self._run_main(_RaiseOnRead(), ['browse-git', '--help'])
         self.assertIsNone(code)
+        self.assertIsNone(self.r._STDIN_KIND)
+
+    # -- auto-detect: a piped (non-tty) stdin synthesizes ``-`` --------
+
+    def test_piped_no_positional_ingests_without_dash(self):
+        # ``git diff | browse-git`` (no explicit ``-``): a non-tty fd 0
+        # makes main() synthesize ``-`` and ingest the piped output —
+        # skipping the git/repo preconditions, exactly as the lone ``-``
+        # does. Poison every git seam to prove none is touched.
+        self.r._run_git = _GitPoison(self)
+        self.r._git_color = _GitPoison(self)
+        self.r.shutil = types.SimpleNamespace(which=_GitPoison(self))
+        with _piped_stdin():
+            code, err = self._run_main(_DIFF_TEXT, ['browse-git'])
+        self.assertIsNone(code)
+        self.assertEqual(err, '')
+        self.assertEqual(self.r._STDIN_KIND, 'diff')
+        self.assertEqual(self.r._browser._args[0].title,
+                         'browse-git [stdin: diff]')
+
+    def test_piped_with_positional_is_a_usage_error(self):
+        # ``git diff | browse-git HEAD``: the synthesized ``-`` collides
+        # with the rev/path positional, so the existing combine error
+        # fires (exit 2) and stdin is never read.
+        with _piped_stdin():
+            code, err = self._run_main(_RaiseOnRead(), ['browse-git', 'HEAD'])
+        self.assertEqual(code, 2)
+        self.assertIn('cannot be combined', err)
+        self.assertIsNone(self.r._STDIN_KIND)
+
+    def test_piped_empty_exits_2(self):
+        # A non-tty empty stdin synthesizes ``-`` and flows into the
+        # existing empty handling: the "empty stdin input" error (exit 2).
+        # No emptiness special-casing.
+        with _piped_stdin():
+            code, err = self._run_main('', ['browse-git'])
+        self.assertEqual(code, 2)
+        self.assertIn('empty stdin input', err)
+        self.assertIsNone(self.r._browser)
+
+    def test_piped_help_flag_is_exempt_from_auto_detect(self):
+        # ``git diff | browse-git --help``: the synthesized ``-`` must NOT
+        # be injected (it would trip the combine error before the
+        # framework's -h/--help auto-detect). stdin is left untouched and
+        # no usage error fires. (End-to-end help output is covered in
+        # test/ui/test_help_text.py.)
+        with _piped_stdin():
+            code, err = self._run_main(_RaiseOnRead(), ['browse-git', '--help'])
+        self.assertIsNone(code)
+        self.assertEqual(err, '')
         self.assertIsNone(self.r._STDIN_KIND)
 
 

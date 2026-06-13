@@ -38,7 +38,11 @@ reload (ctrl-r) re-serves the parse, and the actions that re-run git
 (the `` ` `` mode picker, the ``t`` graph toggle) flash instead of
 acting. ``-`` combines with no other argument or flag; empty or
 unrecognized input is a clean error on stderr (exit 2) before the UI
-starts. Bare ``browse-git`` never reads stdin.
+starts. When stdin is a pipe or redirect (not a tty), this mode
+auto-engages — the ``-`` is optional, so ``git diff | browse-git``
+works too. ``-`` stays the explicit form, needed only to read stdin
+when stdin is a tty (type/paste the output, end with ^D). Bare
+``browse-git`` on a terminal (tty stdin) never reads stdin.
 
 Every row id is a tagged tuple whose first element is a short string
 ``kind`` tag, so dispatch is a flat ``id[0]`` match with direct field
@@ -2120,7 +2124,7 @@ _HELP_INTRO_TMPL = """\
 browse-git — a tig-like browser over a git repository.
 
 Usage: browse-git [<dir>] [-n NUMBER] [--mode NAME] [--no-tree] [--all] [<rev>…] [-- <path>…]
-       git diff | browse-git -     (also git log / log -p / status output)
+       git diff | browse-git      (also git log / log -p / status output; the '-' is optional when piping)
   <dir>         A leading directory in another git repo browses THAT repo
                 (cwd need not be a repo). A subdir of the current repo
                 stays a pathspec filter instead.
@@ -2137,8 +2141,11 @@ Usage: browse-git [<dir>] [-n NUMBER] [--mode NAME] [--no-tree] [--all] [<rev>�
                 Previews come from the piped text only; reload (ctrl-r)
                 re-serves it; ` and t need git and flash instead.
                 Combines with no other argument or flag. Empty or
-                unrecognized input is an error before the UI starts.
-                Bare browse-git never reads stdin.
+                unrecognized input is an error before the UI starts. A
+                pipe/redirect auto-engages this mode, so '-' is optional
+                when piping ('git diff | browse-git'); type it explicitly
+                to read a tty stdin (paste, then ^D). Bare browse-git on a
+                terminal never reads stdin.
   -n NUMBER     Cap the commit / reflog list to this many entries
                 (default: {default}).
   --mode NAME   Start in one of: {modes}. Default: commits.
@@ -2251,6 +2258,20 @@ def main():
     # the std streams, consumed by Browser.run()) is gone and only a
     # genuine stdin ``-`` is left to match here.
     args = recipe_argv()
+    # Auto-detect a piped/redirected stdin: when fd 0 is not a tty and the
+    # user didn't already type ``-``, synthesize it so a bare
+    # ``git diff | browse-git`` ingests the piped output without the
+    # explicit token. An interactive tty stdin leaves ``args`` untouched
+    # (the bare repo modes never read stdin). The synthesized ``-`` then
+    # flows through the same logic below: a lone ``-`` ingests stdin (and
+    # skips the repo preconditions); ``- ARG`` (a piped run that still names
+    # a rev/path/flag) hits the combine error. Inject into the positional
+    # list only — flags still compose via the pops further down. A help
+    # request is exempt: ``git diff | browse-git --help`` must still reach
+    # ``Browser.run()``'s -h/--help auto-detect, not trip the combine error.
+    if ('-' not in args and not os.isatty(0)
+            and not any(a in ('-h', '--help') for a in sys.argv[1:])):
+        args.append('-')
     if '-' in args:
         if args != ['-']:
             sys.stderr.write('browse-git: - (stdin) cannot be combined '

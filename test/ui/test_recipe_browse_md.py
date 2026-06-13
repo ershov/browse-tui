@@ -290,6 +290,29 @@ class TestBrowseMdStdin(unittest.TestCase):
                 t.wait_for('intro body text', timeout=4.0)
                 t.send('q')
 
+    def test_piped_without_dash_auto_engages_stdin(self):
+        # ``cmd | browse-md`` with NO ``-`` on the command line: the recipe
+        # auto-detects the piped (non-tty) stdin and browses the document
+        # exactly as the explicit ``-`` form. Same redirect shape, just the
+        # token dropped from the launch line.
+        body = '# Auto Piped\nintro body text\n'
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = os.path.join(tmp, 'doc.md')
+            with open(doc, 'w') as f:
+                f.write(body)
+            line = '{bin} --run-py {recipe} < {doc}'.format(
+                bin=shlex.quote(_BIN),
+                recipe=shlex.quote(_RECIPE),
+                doc=shlex.quote(doc),
+            )
+            with TmuxFixture(cols=100, rows=40) as t:
+                t.send_line(line)
+                # The ``-`` root row appears (stdin mode) without us typing it.
+                t.wait_for(_RE_STDIN_ROW, timeout=6.0)
+                t.wait_for('Auto Piped', timeout=4.0)
+                t.wait_for('intro body text', timeout=4.0)
+                t.send('q')
+
     def test_empty_stdin_is_an_empty_document(self):
         # Empty input behaves exactly like an empty .md file: the ``-`` row
         # shows with no expansion arrow / children. With no heading the root

@@ -31,8 +31,17 @@ instead of the filesystem / repo. The read happens once, before the UI
 opens (a pipe is slurped, a tty blocks until `^D` like `cat`); stdin is
 one-shot, so `Ctrl-R` re-serves the same parse. In every case `-` is the
 whole data source — it combines with no other positional argument, and the
-bare form of each recipe is unchanged (still browses the cwd / current
-repo):
+bare form of each recipe on a terminal is unchanged (still browses the cwd
+/ current repo):
+
+**Piping auto-engages stdin mode — `-` is optional.** When stdin is a pipe
+or redirect (not a tty), each recipe detects it and behaves as if `-` were
+passed, so `cmd | browse-md` is equivalent to `cmd | browse-md -`. The `-`
+remains the *explicit* form, and is required only to read stdin when stdin
+is a terminal (type/paste the input, then `^D`). Auto-detect changes
+nothing else: piped data **plus** a positional path is still an error (the
+two name the data source in conflicting ways), and a bare invocation on an
+interactive terminal still browses the cwd / repo without touching stdin.
 
 - **`browse-md -`** — read **one** Markdown document from stdin and browse
   it as a heading tree. The root row is titled `-` (matching the invocation); it has no on-disk
@@ -45,8 +54,8 @@ repo):
   live outside the file's tree.
 
   ```bash
-  glow-flavoured-render | browse-md -
-  git show HEAD:README.md | browse-md - --root "$(git rev-parse --show-toplevel)"
+  glow-flavoured-render | browse-md            # '-' optional when piping
+  git show HEAD:README.md | browse-md --root "$(git rev-parse --show-toplevel)"
   ```
 
 - **`browse-fs -`** — read a **newline-separated list of paths** (one per
@@ -57,7 +66,7 @@ repo):
   a clean empty list.
 
   ```bash
-  fd -e py | browse-fs -            # or: git ls-files | browse-fs -
+  fd -e py | browse-fs              # '-' optional; or: git ls-files | browse-fs
   ```
 
 - **`browse-git -`** — read **git output** from stdin and sniff its kind
@@ -76,7 +85,7 @@ repo):
   input is a clean error on stderr (exit 2) before the UI starts.
 
   ```bash
-  git diff | browse-git -           # also: git log -p | browse-git -
+  git diff | browse-git             # '-' optional; also: git log -p | browse-git
   ```
 
 > **`--tty -` interplay.** The framework's `--tty -` flag (run the UI over

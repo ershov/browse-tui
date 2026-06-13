@@ -25,6 +25,7 @@ Coverage:
   carries no ``col_*`` (so it falls back).
 """
 
+import contextlib
 import importlib.util
 import io
 import os
@@ -35,10 +36,42 @@ import types
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from unittest import mock
 
 
 _REPO = Path(__file__).resolve().parents[2]
 _RECIPE = _REPO / 'recipes' / 'browse-fs'
+
+
+# ``main()`` auto-detects a piped stdin via ``os.isatty(0)``: a non-tty fd 0
+# synthesizes the lone ``-`` (stdin-list mode). The test runner's fd 0 is
+# itself a pipe (non-tty), which would spuriously trip that auto-detect for
+# the bare/PATH-mode cases below. Pin the whole module to an INTERACTIVE tty
+# so those tests keep exercising bare/PATH mode (the historical default); the
+# dedicated auto-detect tests opt back into a pipe via ``_piped_stdin``.
+_isatty_patch = None
+
+
+def setUpModule():
+    global _isatty_patch
+    _isatty_patch = mock.patch('os.isatty', return_value=True)
+    _isatty_patch.start()
+
+
+def tearDownModule():
+    if _isatty_patch is not None:
+        _isatty_patch.stop()
+
+
+@contextlib.contextmanager
+def _piped_stdin():
+    """Within the block, ``os.isatty(0)`` is False (a piped/redirected stdin).
+
+    Restores the module-wide interactive default on exit, so the auto-detect
+    tests can simulate ``cmd | browse-fs`` without leaking the False into
+    neighbouring bare/PATH-mode cases."""
+    with mock.patch('os.isatty', return_value=False):
+        yield
 
 # Sentinel the stub ``style('dim')`` returns; ``fs_row_content`` must put
 # this exact (fg, bold) pair on every metadata segment.
@@ -652,6 +685,72 @@ class TestStdinRoots(unittest.TestCase):
         # A non-zero / message exit (SystemExit with a str message → the
         # framework prints it and exits 1).
         self.assertIn('cannot be combined', str(cm.exception.code))
+        self.assertIsNone(self.r._STDIN_ROOTS)
+
+    # -- auto-detect: a piped (non-tty) stdin synthesizes ``-`` --------
+
+    def test_piped_no_positional_engages_stdin_without_dash(self):
+        # ``cmd | browse-fs`` (no explicit ``-``): a non-tty fd 0 makes
+        # main() synthesize ``-`` and read the path list, exactly as if
+        # ``-`` had been typed.
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, 'real.txt'), 'w') as f:
+                f.write('x')
+            cwd = os.getcwd()
+            os.chdir(d)
+            try:
+                with _piped_stdin():
+                    b = self._run_main('real.txt\n', argv=('browse-fs',))
+                self.assertIsNone(self._config(b).root_id)
+                roots = self.r.get_children(None)
+            finally:
+                os.chdir(cwd)
+        self.assertEqual([it.title for it in roots], ['real.txt'])
+
+    def test_piped_with_positional_is_a_usage_error(self):
+        # ``cmd | browse-fs PATH``: the synthesized ``-`` collides with the
+        # path positional, so the existing ``- + PATH`` usage error fires
+        # (and stdin is never read).
+        with self.assertRaises(SystemExit) as cm:
+            saved = self.r.sys.stdin
+            self.r.sys.stdin = _RaiseOnRead()
+            self.r.sys.argv[:] = ['browse-fs', 'somepath']
+            try:
+                with _piped_stdin():
+                    self.r.main()
+            finally:
+                self.r.sys.stdin = saved
+        self.assertIn('cannot be combined', str(cm.exception.code))
+        self.assertIsNone(self.r._STDIN_ROOTS)
+
+    def test_piped_empty_is_an_empty_root_list(self):
+        # A non-tty empty stdin synthesizes ``-`` and flows into the
+        # existing empty handling: an empty (clean "no items") root list,
+        # no crash. No emptiness special-casing.
+        with _piped_stdin():
+            b = self._run_main('', argv=('browse-fs',))
+        self.assertIsNone(self._config(b).root_id)
+        self.assertEqual(self.r._STDIN_ROOTS, [])
+        self.assertEqual(self.r.get_children(None), [])
+
+    def test_piped_help_flag_is_exempt_from_auto_detect(self):
+        # ``cmd | browse-fs --help``: the synthesized ``-`` must NOT be
+        # injected (it would trip the ``- + PATH`` error before the
+        # framework's -h/--help auto-detect). stdin is left untouched and
+        # no usage error fires for the dash. (End-to-end help output is
+        # covered in test/ui/test_help_text.py.)
+        saved = self.r.sys.stdin
+        self.r.sys.stdin = _RaiseOnRead()
+        self.r.sys.argv[:] = ['browse-fs', '--help']
+        try:
+            with _piped_stdin():
+                # Stub Browser has no help-detecting ``run`` — it raises
+                # AttributeError past construction; the point is that we
+                # reach bare mode WITHOUT injecting ``-`` / reading stdin.
+                with self.assertRaises(AttributeError):
+                    self.r.main()
+        finally:
+            self.r.sys.stdin = saved
         self.assertIsNone(self.r._STDIN_ROOTS)
 
     # -- bare / PATH modes never touch stdin --------------------------

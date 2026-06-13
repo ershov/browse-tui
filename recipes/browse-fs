@@ -11,7 +11,13 @@ the path verbatim as it arrived on stdin; directories among them expand
 into their real children via the normal lazy listing, files preview as
 usual, and a path that does not exist shows a dim ``[missing]`` row.
 
-Usage:  browse-fs [PATH | -]   # no argument ⇒ the current directory.
+When stdin is a pipe or redirect (not a tty), this mode auto-engages —
+the ``-`` is optional, so ``ls *.py | browse-fs`` works too. ``-`` stays
+the explicit form, needed only to read stdin when stdin is a tty
+(type/paste the list, end with ^D).
+
+Usage:  browse-fs [PATH | -]   # no argument ⇒ the current directory
+                               # (or stdin, when piped).
 """
 
 import os
@@ -277,7 +283,9 @@ Usage: browse-fs [PATH | -]
           blank lines skipped, duplicates dropped keeping the first).
           Directories expand normally, files preview, a path that does
           not exist shows a dim '[missing]' row. Cannot be combined with
-          a PATH argument.
+          a PATH argument. A pipe/redirect auto-engages this mode, so the
+          '-' is optional when piping ('ls | browse-fs'); type it
+          explicitly to read a tty stdin (paste, then ^D).
 
 Lazily walks directories with os.scandir; the preview pane shows file
 heads or directory listings. The selection / cursor seeds $TUI_IDS_FILE
@@ -316,6 +324,19 @@ def main():
     # mistake ``browse-fs --tty -``'s value ``-`` for the stdin positional, or
     # ``--tty /dev/pts/N``'s device path for a root PATH.
     args = recipe_argv()
+    # Auto-detect a piped/redirected stdin: when fd 0 is not a tty and the
+    # user didn't already type ``-``, synthesize it so a bare
+    # ``cmd | browse-fs`` engages stdin mode without the explicit token.
+    # An interactive tty stdin leaves ``args`` untouched (bare/PATH mode).
+    # The synthesized ``-`` then flows through the same logic below: a lone
+    # ``-`` reads the list; ``- PATH`` (a piped run that still names a path)
+    # hits the conflict error. Inject into the positional list only — flags
+    # were already dropped by ``recipe_argv()``. A help request is exempt:
+    # ``cmd | browse-fs --help`` must still reach ``Browser.run()``'s
+    # -h/--help auto-detect, not trip the synthesized ``- + PATH`` error.
+    if ('-' not in args and not os.isatty(0)
+            and not any(a in ('-h', '--help') for a in sys.argv[1:])):
+        args.append('-')
     # The lone ``-`` reads the root path list from stdin (spec §3.7).
     # Reading here — before ``b.run()`` / ``term_init`` — is deliberate:
     # fd 0 is still whatever the caller provided, so a pipe is consumed
