@@ -99,7 +99,7 @@ root.
 
 Bash command run for the preview pane. The id of the cursor item is `$TUI_ID`.
 Stdout (utf-8, errors replaced) is shown verbatim in the preview pane. The
-preview worker is latest-wins and waits for the cursor to settle (~0.15s)
+preview worker is latest-wins and waits for the cursor to settle (~0.2s)
 before running `CMD`, so a held `j`/`k` coalesces to one run for the row the
 cursor lands on. While that run is outstanding the pane keeps the previously
 shown preview rather than blanking, and the pane label reads `⧗ Preview`;

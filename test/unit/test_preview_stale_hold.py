@@ -106,7 +106,7 @@ def _make_browser(specs, **kw):
     ``append_preview``); no test here wants a live worker fetch, which
     would flip a pending row to delivered-``''`` mid-assertion. The 5s
     debounce parks any requested fetch far past the assertion window
-    instead of leaning on the 0.15s default (#939).
+    instead of leaning on the 0.2s default (#939).
     """
     kw.setdefault('_headless', True)
     kw.setdefault('get_preview', lambda _id: '')

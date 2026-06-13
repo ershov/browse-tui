@@ -3182,7 +3182,7 @@ class BrowserConfig:
     # Seconds of cursor quiet before the preview worker fetches; 0
     # disables (immediate fetch). Coalesces the per-row fetches a held
     # j/k would otherwise fire (preview-flicker design §A).
-    preview_debounce: float = 0.15
+    preview_debounce: float = 0.2
     on_cursor_change: Optional[Callable] = None
     on_scope_change: Optional[Callable] = None
     on_selection_change: Optional[Callable] = None
@@ -3413,7 +3413,7 @@ class Browser:
                 1000. Counterpart to ``preview_buffer_cap_chars``.
             preview_debounce: Seconds of cursor quiet before the preview
                 worker serves the request — a ``get_preview`` fetch or
-                the cached-settle nudge (default 0.15). A newer request
+                the cached-settle nudge (default 0.2). A newer request
                 landing during the wait restarts it, so rapid cursor
                 movement coalesces into one serve for the row the
                 cursor settles on. ``0`` disables (no settle wait).

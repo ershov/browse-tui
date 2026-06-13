@@ -108,7 +108,7 @@ masks all of them.
 
 ### Config
 
-`BrowserConfig.preview_debounce: float = 0.15` — seconds of cursor
+`BrowserConfig.preview_debounce: float = 0.2` — seconds of cursor
 quiet before a preview fetch; `0` disables (immediate fetch, current
 behavior). Mirrored onto `Browser` like the other preview knobs.
 
@@ -309,7 +309,7 @@ settle, not per move.
   favor of the fixed sleep; revisit only if the fixed delay feels bad.
 * **Dimming/styling the held-over content** — the `⧗` label prefix is
   the only staleness cue; keep the content itself plain.
-* **Exempting the startup fetch from the debounce** — accepted ~150 ms
+* **Exempting the startup fetch from the debounce** — accepted ~200 ms
   later first preview; the startup `run_until_idle` wait usually still
   absorbs it.
 * **Relaxing the #456 abandoned-partial clear** (e.g. an "incomplete"
@@ -368,7 +368,7 @@ settle, not per move.
   immediately; `show_preview=False` degrades to per-move advance;
   removed displayed parent hides the pane; `clear_children` on the
   settled row re-hints and regrows.
-* **Suite impact:** the 0.15 s default adds latency wherever existing
+* **Suite impact:** the 0.2 s default adds latency wherever existing
   tests await a preview delivery. Expectation: most waits use the 2 s
   `run_until_idle` default and just get slower; any test that becomes
   timing-sensitive sets `preview_debounce=0` explicitly. Verified by a

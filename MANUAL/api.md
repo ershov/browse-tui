@@ -1034,7 +1034,7 @@ def get_preview(item_id):
 
 ##### Settle debounce
 
-`BrowserConfig.preview_debounce` (float seconds, default `0.15`) is how long
+`BrowserConfig.preview_debounce` (float seconds, default `0.2`) is how long
 the cursor must sit still before the worker fetches. A held `j`/`k` or a
 mouse-wheel burst keeps restarting the timer, so only the row the cursor
 settles on is fetched — the per-row fetches and generator open/close churn in
@@ -1750,7 +1750,7 @@ class BrowserConfig:
     show_scope_crumb: bool = False
     preview_buffer_cap_chars: int = 100_000
     preview_buffer_cap_lines: int = 1000
-    preview_debounce: float = 0.15                 # seconds of cursor quiet before a fetch; 0 = immediate
+    preview_debounce: float = 0.2                  # seconds of cursor quiet before a fetch; 0 = immediate
     on_cursor_change: Callable | None = None      # (ctx, id)
     on_scope_change: Callable | None = None        # (ctx, scope_id, prev_scope_id, direction)
     on_selection_change: Callable | None = None    # (ctx, ids)
