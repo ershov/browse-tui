@@ -960,6 +960,15 @@ class TestMdLauncher(unittest.TestCase):
         link = next(r for r in rows if r.id[3] == os.path.realpath(b))
         self.assertIn('BODY-OF-B', self.r.get_preview(link.id))
 
+    def test_capital_md_preview_colored_like_lowercase(self):
+        # The preview color gate uses _MD_EXTS, so a .MD file colors like .md
+        # (it now gets launcher rows / previews, so the two must agree).
+        if self.r._md2ansi_fn is None:
+            self.skipTest('md2ansi_lib not available')
+        self.r._MD_COLOR = True
+        p = self._w('R.MD', '# Heading\n')
+        self.assertIn('\x1b[', self.r.get_preview(p))   # md2ansi fired for .MD
+
     # ---- Enter dispatch / launch -----------------------------------------
 
     def test_enter_on_launcher_launches_browse_md(self):
