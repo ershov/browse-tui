@@ -14643,6 +14643,334 @@ class ListContent:
 
         # Unrecognized key — ignored, loop continues.
         return (False, None)
+
+
+# ---------------------------------------------------------------------------
+# Content — choice (message + button row; confirm / alert)
+# ---------------------------------------------------------------------------
+
+
+class _Button:
+    """One parsed button: its on-screen display, hotkey, and return label.
+
+    The constructor resolves the standard ``&`` hotkey convention once so
+    drawing and key handling read plain fields:
+
+      * ``display`` — what's shown inside the ``[ … ]`` cell (markers
+        resolved: ``&X`` → ``X``, ``&&`` → a literal ``&``).
+      * ``label`` — the value :meth:`ChoiceContent.handle_key` returns for
+        this button. Same as ``display`` — the markers are resolved away.
+      * ``hotkey`` — the lowercased hotkey char (case-insensitive match), or
+        ``None`` for a label with no ``&``-marked char (``&&`` doesn't count).
+      * ``hot_index`` — the index of the hotkey char within ``display`` (so
+        ``draw_row`` can underline exactly that cell), or ``None``.
+    """
+
+    def __init__(self, raw):
+        chars = []          # display chars accumulated
+        hotkey = None
+        hot_index = None
+        i = 0
+        n = len(raw)
+        while i < n:
+            ch = raw[i]
+            if ch == '&':
+                nxt = raw[i + 1] if i + 1 < n else ''
+                if nxt == '&':
+                    chars.append('&')   # literal ampersand, not a hotkey
+                    i += 2
+                    continue
+                if nxt:
+                    # ``&X`` — X is shown and (the FIRST such) is the hotkey.
+                    if hotkey is None:
+                        hotkey = nxt.lower()
+                        hot_index = len(chars)
+                    chars.append(nxt)
+                    i += 2
+                    continue
+                # A lone trailing ``&`` — drop it (no display char, no hotkey).
+                i += 1
+                continue
+            chars.append(ch)
+            i += 1
+        self.display = ''.join(chars)
+        self.label = self.display
+        self.hotkey = hotkey
+        self.hot_index = hot_index
+
+
+def _button_cells(display):
+    """Cell width of a button's ``[ {display} ]`` box (``+4`` chrome)."""
+    return cell_width(display) + 4
+
+
+class ChoiceContent:
+    """A message + button row — backs both ``ctx.confirm`` and ``ctx.alert``.
+
+    A wrapped message body (ANSI per the design's "Text handling": embedded
+    SGR colours render, all other CSI is neutralised), a blank spacer row,
+    then one centered row of buttons. The focused button is reverse-video and
+    its hotkey char is underlined; the first button is focused initially.
+
+    ``buttons`` is a sequence of label strings using the standard ``&``
+    hotkey convention (``'&Yes'`` → ``Yes`` with ``Y`` the hotkey; ``&&`` a
+    literal ``&``; no ``&`` → no hotkey). An empty ``buttons`` raises
+    ``ValueError`` — a programming error, not a user condition. With a single
+    button (the alert case) ``space`` also activates it.
+
+    :meth:`handle_key` returns the chosen button's label with the markers
+    resolved (``'&Yes'`` → ``'Yes'``); the engine's cancel path returns
+    ``None``. Implements the content protocol consumed by :func:`run_modal`
+    (``title`` / ``measure`` / ``draw_row`` / ``handle_key``).
+    """
+
+    def __init__(self, message, buttons, *, title=None):
+        if not buttons:
+            raise ValueError('ChoiceContent: at least one button is required')
+        self.title = title
+        self._message = message
+        self._buttons = [_Button(b) for b in buttons]
+        self.focus = 0          # index of the focused button
+        # Filled by ``measure`` (the engine calls it before the first paint):
+        # the final size, the wrapped body lines (already clipped to fit), and
+        # whether the body was clipped (last visible row carries a ``…``).
+        self._w = 0
+        self._h = 0
+        self._body = []                 # wrapped body rows actually drawn
+        self._body_lines_shown = 0
+        self._clipped = False
+
+    # -- geometry -----------------------------------------------------------
+
+    @property
+    def _button_row_cells(self):
+        """Cell width of the whole button row (boxes joined by one space)."""
+        cells = sum(_button_cells(b.display) for b in self._buttons)
+        return cells + max(0, len(self._buttons) - 1)
+
+    def measure(self, max_w, max_h):
+        """Content size: widest of (wrapped body, button row), by line count.
+
+        Width is the wider of the longest wrapped body line and the button
+        row, capped at ``max_w``. Height is the body line count plus one
+        spacer row plus one button row, capped at ``max_h``. When the height
+        clamps, the body is CLIPPED to the rows left after the spacer + button
+        row and the last visible body row gets a ``…`` marker (drawn by
+        :meth:`draw_row`). The final size, the clipped body lines, and the
+        clip flag are stored — ``draw_row`` reads them.
+        """
+        button_cells = self._button_row_cells
+        # Wrap the body to ``max_w`` first to find the longest line, then fix
+        # the content width as the wider of body / buttons (capped). The body
+        # is RE-wrapped to that final width below so its rows match the box.
+        probe = self._wrap_body(max_w)
+        longest = max((cell_width(line) for line in probe), default=0)
+        self._w = min(max(longest, button_cells), max_w)
+
+        body = self._wrap_body(self._w)
+        # Rows available for the body = everything except the spacer + button
+        # row. Clip vertically when the full body wouldn't fit.
+        body_room = max(0, max_h - 2)
+        if len(body) > body_room:
+            body = body[:body_room]
+            self._clipped = True
+        else:
+            self._clipped = False
+        self._body = body
+        self._body_lines_shown = len(body)
+        # Height is the drawn body + spacer + button row, capped (the body is
+        # already clipped to fit, so this only re-clamps a tiny terminal).
+        self._h = min(len(body) + 2, max_h)
+        return self._w, self._h
+
+    def _wrap_body(self, width):
+        """Wrap the message to ``width`` cells with Preview's ANSI treatment.
+
+        Same pipeline as the preview pane: :func:`_sanitize_preview` defangs
+        control chars (ESC kept so SGR survives), then each logical line is
+        run through :func:`_wrap_preview_line`, which keeps SGR inline, drops
+        every other CSI, and emits self-contained visual rows. Returns the
+        list of wrapped rows (pre-rendered strings, ready to ``write``).
+        """
+        if width <= 0:
+            return []
+        text = _sanitize_preview(self._message, ansi_on=True)
+        rows = []
+        for line in text.split('\n'):
+            line = line.replace('\t', '    ')
+            rows.extend(_wrap_preview_line(line, width, ansi_on=True))
+        return rows
+
+    # -- drawing ------------------------------------------------------------
+
+    def draw_row(self, row, width):
+        """Emit ONE content row, filling exactly ``width`` cells.
+
+        The body lines occupy the top rows; then a blank spacer row; then the
+        centered button row. Any leftover row (a tiny-terminal frame whose
+        interior outsizes the content) is blank-filled. Every row is padded to
+        exactly ``width`` so no stale cell bleeds through ``end_row``.
+        """
+        if row < self._body_lines_shown:
+            self._draw_body_row(row, width)
+            return
+        # The button row is the LAST content row (index height - 1); the
+        # single row between it and the body is the spacer.
+        if row == self._h - 1:
+            self._draw_button_row(width)
+            return
+        # Spacer row, or any leftover row beyond the content area.
+        write(' ' * width)
+
+    def _draw_body_row(self, row, width):
+        """Draw one wrapped body row, padded to ``width`` (clip marker last).
+
+        Unclipped rows go through :func:`_write_segments` (a single
+        ANSI-bearing segment) exactly like a preview row, so embedded SGR
+        renders and the row pads to ``width``. The last visible row of a
+        CLIPPED body instead fills ``width - 1`` cells and ends with a dim
+        ``…`` — its content is truncated (ANSI-aware) to leave room for the
+        marker.
+        """
+        line = self._body[row]
+        is_last_clipped = self._clipped and row == self._body_lines_shown - 1
+        if not is_last_clipped:
+            _write_segments([(line, None, False)], width, pad_to=width)
+            return
+        # Clipped tail: emit the content trimmed to width-1 (ANSI-aware so the
+        # truncation never cuts an SGR sequence), pad it out, then a dim ``…``
+        # in the final cell. ``_write_segments`` pads to ``width - 1``.
+        clipped = _truncate_visible(line, max(0, width - 1))
+        _write_segments([(clipped, None, False)], width - 1, pad_to=width - 1)
+        set_style(fg=8)         # dim chrome, matching the frame borders
+        write('…')
+        reset_style()
+
+    def _draw_button_row(self, width):
+        """Compose the centered button row to EXACTLY ``width`` cells.
+
+        The boxes (``[ {display} ]`` joined by single spaces) are centered:
+        the leftover slack splits into a left pad and a right pad (extra cell
+        on the right). The focused box is reverse-video; each box's hotkey
+        char is underlined.
+
+        The composed row is emitted through a single budget-bounded pass
+        (:meth:`_emit_spans`) that trims to ``width`` visible cells — never
+        more. ``end_row`` only PADS short rows, never truncates long ones, so
+        if a box (or the whole row) is wider than ``width`` (a narrow terminal,
+        or the engine handing a content width below the button row's cell
+        count) the row MUST clamp itself; the box then shows clipped, but the
+        frame's right border stays in its column.
+        """
+        # Build the row as ordered ``(text, reverse, underline)`` spans: the
+        # left pad, each box (with one-space gaps), then the right pad. Pads
+        # are plain spans; ``_emit_spans`` trims and pads to exactly ``width``.
+        total = self._button_row_cells
+        slack = max(0, width - total)
+        left_pad = slack // 2
+        right_pad = slack - left_pad
+        spans = [(' ' * left_pad, False, False)]
+        for i, button in enumerate(self._buttons):
+            if i:
+                spans.append((' ', False, False))   # one-space gap between boxes
+            spans.extend(self._button_spans(button, focused=i == self.focus))
+        spans.append((' ' * right_pad, False, False))
+        self._emit_spans(spans, width)
+
+    @staticmethod
+    def _button_spans(button, *, focused):
+        """Styled spans for one ``[ {display} ]`` box.
+
+        Returns ``(text, reverse, underline)`` triples: the box carries
+        reverse video when ``focused``, and the hotkey char alone carries the
+        underline (both attributes compose on that char). The display is split
+        around the hotkey so only its single cell is underlined.
+        """
+        rev = focused
+        disp = button.display
+        hi = button.hot_index
+        spans = [('[ ', rev, False)]
+        if hi is None:
+            spans.append((disp, rev, False))
+        else:
+            if hi:
+                spans.append((disp[:hi], rev, False))
+            spans.append((disp[hi], rev, True))     # hotkey char, underlined
+            if hi + 1 < len(disp):
+                spans.append((disp[hi + 1:], rev, False))
+        spans.append((' ]', rev, False))
+        return spans
+
+    @staticmethod
+    def _emit_spans(spans, width):
+        """Emit ``(text, reverse, underline)`` spans, clamped to ``width`` cells.
+
+        Mirrors :func:`_write_segments`' contract for the reverse/underline
+        styling the button row needs: each span's PLAIN text (no embedded SGR
+        — the style rides the ``set_style`` call) is cell-trimmed to the
+        remaining budget so the total visible width never exceeds ``width``;
+        once the budget is spent, emission stops. A trailing ``reset_style``
+        fires iff any styled span was emitted, so no SGR dangles into the
+        frame border. Finally the row is padded with plain spaces to exactly
+        ``width`` cells.
+        """
+        pos = 0
+        styled_emitted = False
+        for text, reverse, underline in spans:
+            if pos >= width:
+                break
+            chunk, n = _truncate_by_cells(text, width - pos)
+            if not chunk:
+                continue
+            if reverse or underline:
+                set_style(reverse=reverse, underline=underline)
+                write(chunk)
+                reset_style()
+                styled_emitted = True
+            else:
+                write(chunk)
+            pos += n
+        # A styled chunk already reset itself; this extra reset is harmless and
+        # guarantees no SGR leaks past the row even if the last styled span was
+        # trimmed away at the budget boundary.
+        if styled_emitted:
+            reset_style()
+        if pos < width:
+            write(' ' * (width - pos))
+
+    # -- keys ---------------------------------------------------------------
+
+    def handle_key(self, key):
+        """Process one key; return ``(done, result)`` per the protocol.
+
+        ``left``/``right``/``tab`` move focus WRAPPING (``tab`` forward like
+        ``right``). ``enter`` closes with the focused button's resolved label.
+        A hotkey letter (case-insensitive) closes with THAT button's label
+        immediately, regardless of focus. With a single button, ``space`` also
+        activates it. Every other key is ignored.
+        """
+        n = len(self._buttons)
+        if key in ('right', 'tab'):
+            self.focus = (self.focus + 1) % n
+            return (False, None)
+        if key == 'left':
+            self.focus = (self.focus - 1) % n
+            return (False, None)
+        if key == 'enter':
+            return (True, self._buttons[self.focus].label)
+        if key == 'space' and n == 1:
+            return (True, self._buttons[0].label)
+        # Hotkey: case-insensitive match against the parsed hotkeys. A
+        # single-char key whose lowercase matches a button's hotkey activates
+        # it. (``&&`` parsed to no hotkey, so a literal ``&`` never matches.)
+        if len(key) == 1:
+            k = key.lower()
+            for button in self._buttons:
+                if button.hotkey is not None and button.hotkey == k:
+                    return (True, button.label)
+
+        # Unrecognized key — ignored, loop continues.
+        return (False, None)
 # }}} # SOURCE END: 055-modal.py
 
 # SOURCE START: 060-context.py {{{
