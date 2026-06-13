@@ -17,7 +17,7 @@ the explicit form, needed only to read stdin when stdin is a tty
 (type/paste the list, end with ^D).
 
 A markdown file row (``*.md`` / ``*.MD``) carries an expansion arrow:
-opening it lists ``»`` launcher rows — the document itself plus every
+opening it lists ``[md ↗]`` launcher rows — the document itself plus every
 existing ``.md`` file it links to — and Enter on one opens that file in
 ``browse-md`` (``--root`` anchored at the project root so the document's
 own links resolve). Needs the optional ``md_doc`` plugin; without it,
@@ -166,16 +166,16 @@ def _md_ref_label(abspath, project_root):
 
 
 def _launcher_item(parent_path, target_abspath, project_root):
-    """One ``»``-prefixed launcher row that opens ``target_abspath`` in browse-md.
+    """One ``[md ↗]`` launcher row that opens ``target_abspath`` in browse-md.
 
     Leaf row with a generic launch id ``('launch', parent_path, 'md-file',
     target_abspath)`` — the id stores *what* to launch, not the command line
-    (built at Enter time). The ``»`` title prefix signals that Enter launches
-    an external browser rather than expanding or editing.
+    (built at Enter time). The ``↗`` in the ``[md ↗]`` tag chip signals that
+    Enter launches an external browser rather than expanding or editing.
     """
     return Item(id=('launch', parent_path, 'md-file', target_abspath),
-                title='» ' + _md_ref_label(target_abspath, project_root),
-                tag='md', tag_style='blue', has_children=False)
+                title=_md_ref_label(target_abspath, project_root),
+                tag='md ↗', tag_style='yellow', has_children=False)
 
 
 def _md_launcher_children(path):
@@ -341,7 +341,7 @@ def _launch_browse_md(ctx, target):
 
 
 def _on_enter(ctx):
-    """Enter dispatch: launch on a ``»`` launcher row, else edit (the default).
+    """Enter dispatch: launch on a ``[md ↗]`` launcher row, else edit (the default).
 
     A launcher row carries a ``('launch', …, target)`` id — Enter opens its
     target in browse-md. Every other row keeps browse-fs's original Enter
@@ -428,8 +428,8 @@ for the actions below; mtime changes refresh the affected directory
 automatically. Press Enter (or 'e') to open the cursor row in $EDITOR.
 
 A markdown file (*.md / *.MD) gets an expansion arrow: open it to list
-'»' launcher rows — the document itself and the .md files it links to —
-and press Enter on one to open that file in browse-md.\
+'[md ↗]' launcher rows — the document itself and the .md files it links
+to — and press Enter on one to open that file in browse-md.\
 """
 
 

@@ -20,7 +20,7 @@ changed directories.
   survive the full pipeline.
 - `browser.watch(callback)` — a daemon thread polling mtimes and calling
   `browser.refresh(d)` on change.
-- Cross-recipe launch ("detach"): a `*.md` row expands into `»` launcher
+- Cross-recipe launch ("detach"): a `*.md` row expands into `[md ↗]` launcher
   rows (the document plus the `.md` files it links to), and Enter on one
   opens it in `browse-md` via `ctx.run_external`. Structure/link detection
   reuses the optional `md_doc` plugin; targets are real files, so the launch
@@ -36,7 +36,7 @@ changed directories.
 
 Keys (in addition to defaults): `e` edit (`$EDITOR`), `o` open (`xdg-open`),
 `d` delete (with confirmation). Enter opens the cursor row in `$EDITOR`,
-except on a `»` markdown launcher row, where it opens the target in
+except on a `[md ↗]` markdown launcher row, where it opens the target in
 `browse-md`.
 
 **Source:** [`recipes/browse-fs`](../../recipes/browse-fs)

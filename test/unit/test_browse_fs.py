@@ -902,12 +902,13 @@ class TestMdLauncher(unittest.TestCase):
         # Self-open row first, target == the file itself.
         self.assertEqual(rows[0].id, ('launch', a, 'md-file', a))
         self.assertEqual(rows[1].id[3], os.path.realpath(b))
-        # All launcher rows: leaf, md tag, » prefix.
+        # All launcher rows: leaf, [md ↗] tag, bare relative-label title.
         for row in rows:
             self.assertFalse(row.has_children)
-            self.assertEqual(row.tag, 'md')
-            self.assertEqual(row.tag_style, 'blue')
-            self.assertTrue(row.title.startswith('» '))
+            self.assertEqual(row.tag, 'md ↗')
+            self.assertEqual(row.tag_style, 'yellow')
+        self.assertEqual(rows[0].title, 'a.md')   # self, labelled as the file
+        self.assertEqual(rows[1].title, 'b.md')
 
     def test_links_deduped_and_sorted_by_label(self):
         # Reference z then a (and b twice) — links come out sorted, deduped,
@@ -917,7 +918,7 @@ class TestMdLauncher(unittest.TestCase):
         self._w('b.md', '')
         rows = self.r._md_launcher_children(a)
         labels = [r.title for r in rows]
-        self.assertEqual(labels, ['» a.md', '» b.md', '» z.md'])  # self, then sorted
+        self.assertEqual(labels, ['a.md', 'b.md', 'z.md'])  # self, then sorted
 
     def test_nonexistent_and_non_md_refs_dropped(self):
         a = self._w('a.md', 'missing nope.md, code config.txt, real real.md\n')
