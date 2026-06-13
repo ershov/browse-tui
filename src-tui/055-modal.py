@@ -480,3 +480,236 @@ def _draw_bottom_border(width):
     write('─' * max(0, width - 2))
     write('┘')
     reset_style()
+
+
+# ---------------------------------------------------------------------------
+# Content — selection list (picker / context menu)
+# ---------------------------------------------------------------------------
+
+
+# Minimum width a selection list requests, so a list of very short options
+# (or empty strings) still reads as a box rather than a sliver.
+_LIST_MIN_WIDTH = 8
+
+
+class ListContent:
+    """A selection list — backs both ``ctx.pick`` and ``ctx.menu``.
+
+    One content kind covers the fzf-style filtered picker and the context
+    menu; the difference is the ``filter`` flag, not the structure:
+
+      * ``filter=True`` (picker) — a ``> {query}`` prompt row and a separator
+        sit above the options; typing narrows the visible list. Wired
+        centered behind ``ctx.pick``.
+      * ``filter=False`` (menu) — no prompt/separator; the options start at
+        row 0. Wired anchored behind ``ctx.menu``.
+
+    ``options`` is a list of strings (an option's text may carry embedded
+    SGR — it renders normally on an unselected row and is stripped to plain
+    reverse video on the selected one, exactly the list pane's rule). The
+    chosen option STRING is returned by :meth:`handle_key`; ``None`` on an
+    enter with an empty filtered list is left to the engine's cancel path.
+
+    Implements the content protocol consumed by :func:`run_modal`
+    (``title`` / ``measure`` / ``draw_row`` / ``handle_key``).
+    """
+
+    def __init__(self, options, *, filter=True, title=None):
+        self.title = title
+        self._options = list(options)
+        self._filter = filter
+        # Two extra rows for the prompt + separator only in filter mode.
+        self._chrome = 2 if filter else 0
+        self.filter_query = ''
+        self.cursor = 0          # index into the FILTERED list
+        self._scroll = 0         # first visible filtered index (windowing)
+        # Filled by ``measure`` (the engine calls it before the first paint);
+        # ``draw_row`` needs the option-row count to window the list.
+        self._w = 0
+        self._h = 0
+
+    # -- geometry -----------------------------------------------------------
+
+    @property
+    def _rows_visible(self):
+        """Number of option rows on screen (total height minus the chrome)."""
+        return max(0, self._h - self._chrome)
+
+    def measure(self, max_w, max_h):
+        """Content size: longest option (floor 8) by option-count + chrome.
+
+        Width is the widest option's cell width (so wide glyphs measure
+        correctly), floored at :data:`_LIST_MIN_WIDTH` and capped at
+        ``max_w``. Height is the option count plus the filter chrome (the
+        prompt + separator rows when filtering), capped at ``max_h``. Both
+        results are stored — ``draw_row`` reads the height to window the
+        list — and clamped to the caps as the protocol requires.
+        """
+        widest = max((cell_width(o) for o in self._options), default=0)
+        self._w = min(max(widest, _LIST_MIN_WIDTH), max_w)
+        self._h = min(len(self._options) + self._chrome, max_h)
+        return self._w, self._h
+
+    # -- filtering / windowing ---------------------------------------------
+
+    def _filtered(self):
+        """The currently visible options (case-insensitive substring filter).
+
+        In menu mode (``filter=False``) the query is always empty, so this
+        returns every option. Order is preserved.
+        """
+        if not self.filter_query:
+            return self._options
+        q = self.filter_query.lower()
+        return [o for o in self._options if q in o.lower()]
+
+    def _clamp(self, filtered):
+        """Clamp ``cursor`` to ``filtered`` and scroll it back into view.
+
+        Called after any change to the filter (narrows the list) or the
+        cursor (moves the selection). Keeps the selected option inside the
+        ``[_scroll, _scroll + _rows_visible)`` window so it is always drawn.
+        """
+        n = len(filtered)
+        if n == 0:
+            self.cursor = 0
+            self._scroll = 0
+            return
+        if self.cursor >= n:
+            self.cursor = n - 1
+        if self.cursor < 0:
+            self.cursor = 0
+        rows = self._rows_visible
+        if rows <= 0:
+            self._scroll = 0
+            return
+        # Scroll the window just far enough to contain the cursor: down when
+        # it fell below the bottom edge, up when it rose above the top.
+        if self.cursor < self._scroll:
+            self._scroll = self.cursor
+        elif self.cursor >= self._scroll + rows:
+            self._scroll = self.cursor - rows + 1
+        # Don't scroll past the end (leaves a blank tail when the list
+        # shrinks under a filter): keep the window full where possible.
+        self._scroll = max(0, min(self._scroll, max(0, n - rows)))
+
+    # -- drawing ------------------------------------------------------------
+
+    def draw_row(self, row, width):
+        """Emit ONE content row, filling exactly ``width`` cells.
+
+        With ``filter=True``: row 0 is the ``> {query}`` prompt, row 1 the
+        dim separator, rows 2.. the windowed options. With ``filter=False``
+        the options start at row 0. An option row beyond the filtered list's
+        end (the list is shorter than the area) is blank-filled.
+
+        Selection follows the list pane's rule (``render_list``): the
+        selected option renders as PLAIN VISIBLE text in reverse video
+        (embedded SGR stripped via ``_collapse_visible`` so the highlight
+        reads cleanly), while unselected rows render their embedded ANSI
+        normally through ``_write_segments``. Options are single-line
+        (cell-trimmed, never wrapped).
+        """
+        if self._filter:
+            if row == 0:
+                self._draw_prompt(width)
+                return
+            if row == 1:
+                # Dim separator under the prompt.
+                set_style(fg=8)
+                write('─' * width)
+                reset_style()
+                return
+        option_row = row - self._chrome
+        filtered = self._filtered()
+        vis_idx = self._scroll + option_row
+        if not (0 <= vis_idx < len(filtered)):
+            # No option maps to this row (shorter list / blank tail).
+            write(' ' * width)
+            return
+        self._draw_option(filtered[vis_idx], vis_idx == self.cursor, width)
+
+    def _draw_prompt(self, width):
+        """Draw the ``> {query}`` filter prompt, trimmed/padded to ``width``."""
+        text = '> ' + self.filter_query
+        # Keep the tail visible as the query grows past the box (trim the
+        # FRONT), then pad out so the row fills the inner width exactly.
+        text = cell_trim(text, width, where='start')
+        write(cell_ljust(text, width))
+
+    def _draw_option(self, option, selected, width):
+        """Draw one option row to exactly ``width`` cells.
+
+        Reuses the list pane's selection machinery: a one-segment list so
+        ``_collapse_visible`` / ``_write_segments`` treat the option's text
+        the same way they treat a str-content list row.
+        """
+        segments = [(option, None, False)]
+        if selected:
+            # Plain visible text in reverse video — strip embedded SGR so the
+            # highlight can't fight the option's own colours (sec 4.1).
+            line = _collapse_visible(segments)
+            line, _ = _truncate_by_cells(line, width)
+            _write_highlighted(line, reverse=True, pad_to=width)
+        else:
+            # Unselected: embedded ANSI renders normally; pad to the full
+            # width so a shorter option leaves no stale cells.
+            _write_segments(segments, width, pad_to=width)
+
+    # -- keys ---------------------------------------------------------------
+
+    def handle_key(self, key):
+        """Process one key; return ``(done, result)`` per the protocol.
+
+        ``enter`` closes with the selected option string (a no-op on an empty
+        filtered list). Selection moves (``down``/``ctrl-n``,
+        ``up``/``ctrl-p``) WRAP; ``home``/``end`` jump to the ends. In filter
+        mode a printable char / ``space`` extends the query and ``backspace``
+        deletes; both re-filter and re-clamp the cursor + scroll. Every other
+        key is ignored.
+        """
+        filtered = self._filtered()
+
+        if key in ('down', 'ctrl-n'):
+            if filtered:
+                self.cursor = (self.cursor + 1) % len(filtered)
+                self._clamp(filtered)
+            return (False, None)
+        if key in ('up', 'ctrl-p'):
+            if filtered:
+                self.cursor = (self.cursor - 1) % len(filtered)
+                self._clamp(filtered)
+            return (False, None)
+        if key == 'home':
+            self.cursor = 0
+            self._clamp(filtered)
+            return (False, None)
+        if key == 'end':
+            if filtered:
+                self.cursor = len(filtered) - 1
+                self._clamp(filtered)
+            return (False, None)
+        if key == 'enter':
+            if filtered:
+                return (True, filtered[self.cursor])
+            return (False, None)   # empty filtered list — no-op
+
+        # Filter editing only applies in filter mode; in menu mode these keys
+        # fall through to the ignore path below.
+        if self._filter:
+            if key == 'backspace':
+                if self.filter_query:
+                    self.filter_query = self.filter_query[:-1]
+                    self._clamp(self._filtered())
+                return (False, None)
+            if key == 'space':
+                self.filter_query += ' '
+                self._clamp(self._filtered())
+                return (False, None)
+            if len(key) == 1 and key.isprintable():
+                self.filter_query += key
+                self._clamp(self._filtered())
+                return (False, None)
+
+        # Unrecognized key — ignored, loop continues.
+        return (False, None)
