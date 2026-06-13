@@ -14342,6 +14342,12 @@ def run_modal(browser, content, *, placement='center', anchor=None,
             done, result = content.handle_key(key)
             if done:
                 break
+            # The key may have changed what the dialog shows (moved the
+            # selection, edited the filter, typed into the field). Repaint
+            # so the change is visible — without this the dialog is frozen
+            # at the first paint. Cheap: the private cache makes it
+            # differential, re-emitting only the rows whose bytes changed.
+            _paint(frame, content_h)
     finally:
         # Restore (always runs, even if content raised): poison every pane
         # cache row the dialog overdrew so the next ``render_full`` repaints

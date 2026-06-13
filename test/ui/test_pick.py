@@ -128,6 +128,64 @@ class TestPick(unittest.TestCase):
                 content = _read_log_when_ready(log)
             self.assertEqual(content, 'done')
 
+    def test_pick_filter_narrows_on_screen(self):
+        """Typing into the filter repaints LIVE: the visible list narrows.
+
+        Regression for the dialog freezing at its first paint — a key that
+        edited the filter changed the picker's state but the loop never
+        repainted, so the box stayed stuck showing the full option set and
+        an empty ``>`` prompt. Here we assert the on-screen effect (not just
+        the recorded outcome): after 'wont' only 'wontfix' remains and the
+        prompt echoes the query.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, 'pick.log')
+            with TmuxFixture(cols=120, rows=40, env={'PICK_LOG': log}) as t:
+                t.launch(_BIN, '--run-py', _RECIPE)
+                t.wait_for('item one')
+                t.send('s')
+                t.wait_for('in-progress')
+                t.type('wont')
+                # The prompt now echoes 'wont' and the list narrows to the
+                # single match — both require a live repaint per key.
+                cap = t.wait_for('> wont')
+                self.assertIn('wontfix', cap)
+                self.assertNotIn('in-progress', cap)
+                self.assertNotIn('open', cap)
+                t.send('Escape')
+
+    def test_pick_arrow_moves_highlight_on_screen(self):
+        """Down repaints the moved reverse-video selection (live).
+
+        The user-reported symptom: arrow keys "don't change the selection".
+        The cursor row is reverse-video, so this is the one picker assertion
+        that must read tmux's style capture — text capture is blind to the
+        highlight. After one Down the reverse attribute is on 'in-progress'
+        (row 1), not 'open' (row 0).
+        """
+        def _reverse(line):
+            return ('\x1b[7m' in line or ';7m' in line or '\x1b[7;' in line)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, 'pick.log')
+            with TmuxFixture(cols=120, rows=40, env={'PICK_LOG': log}) as t:
+                t.launch(_BIN, '--run-py', _RECIPE)
+                t.wait_for('item one')
+                t.send('s')
+                t.wait_for('in-progress')
+                t.send('Down')
+                t.wait_stable()
+                colored = t.capture(colors=True)
+                open_line = next(
+                    (l for l in colored.splitlines() if 'open' in l), '')
+                sel_line = next(
+                    (l for l in colored.splitlines() if 'in-progress' in l), '')
+                self.assertTrue(_reverse(sel_line),
+                                f'selected row not highlighted: {sel_line!r}')
+                self.assertFalse(_reverse(open_line),
+                                 f'old row still highlighted: {open_line!r}')
+                t.send('Escape')
+
 
 class TestPickRedrawOnExit(unittest.TestCase):
     """Regression: after pick() returns to the UI, the dialog repaints away.

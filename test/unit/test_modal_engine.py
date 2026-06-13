@@ -399,6 +399,24 @@ class TestKeyDispatch(unittest.TestCase):
         self.assertEqual(res, 'done')
         self.assertEqual(content.handled, ['a', 'enter'])
 
+    def test_repaints_after_nonterminal_key(self):
+        # A non-terminal key (moved selection, edited filter, typed char)
+        # must trigger a repaint so its effect is visible. Without it the
+        # dialog is frozen at the first paint — the bug behind "arrow keys
+        # don't change the selection" (the cursor moves internally, so
+        # ``enter`` still returns the moved item and outcome-based tests
+        # pass, but the screen never updates). The private cache makes the
+        # repaint differential, but it must be CALLED. Each full paint draws
+        # content row 0 exactly once, so the row-0 draw count == paint count.
+        b = _FakeBrowser()
+        content = _StubContent(key_handler={'enter': (True, 'done')})
+        with _FixedTermSize(), _Capture():
+            res = run_modal(b, content, _read_key=_scripted(['a', 'enter']))
+        self.assertEqual(res, 'done')
+        paints = sum(1 for (row, _w) in content.drawn if row == 0)
+        # One paint at open, one after the non-terminal 'a'.
+        self.assertEqual(paints, 2)
+
     def test_esc_cancels_to_none(self):
         b = _FakeBrowser()
         content = _StubContent(key_handler={'enter': (True, 'x')})
