@@ -189,7 +189,8 @@ class TestPreviewWorker(unittest.TestCase):
             if id_ == 'A':
                 gate.wait(timeout=1.0)
             return f'preview of {id_}'
-        b = make_browser(get_preview=get_preview)
+        # debounce=0: B must land while A's fetch is genuinely in flight.
+        b = make_browser(get_preview=get_preview, preview_debounce=0)
         try:
             b._state._items_by_id['A'] = Item(id='A')
             b._state._items_by_id['B'] = Item(id='B')
@@ -269,7 +270,9 @@ class TestPreviewWorkerSingleFlight(unittest.TestCase):
                 state['in_flight'] -= 1
             return f'preview of {id_}'
 
-        b = make_browser(get_preview=get_preview)
+        # debounce=0: the burst must reach several sequential fetches —
+        # the settle wait would coalesce it to one, voiding the test.
+        b = make_browser(get_preview=get_preview, preview_debounce=0)
         try:
             ids = [f'id-{n}' for n in range(20)]
             for id_ in ids:
@@ -322,7 +325,9 @@ class TestSetPreviewWorkerRaceSemantics(unittest.TestCase):
             gate.wait(timeout=2.0)
             return 'from-worker'
 
-        b = make_browser(get_preview=get_preview)
+        # debounce=0: the recipe write must queue while the worker is
+        # inside get_preview, not still waiting out the settle window.
+        b = make_browser(get_preview=get_preview, preview_debounce=0)
         try:
             b._state._items_by_id['a'] = Item(id='a')
             # Kick the worker; it blocks inside get_preview.
@@ -361,10 +366,13 @@ class TestSetPreviewWorkerRaceSemantics(unittest.TestCase):
 # The preview worker's redesign (#442) replaces the single-slot
 # ``_preview_result`` lane with FIFO post-queue delivery, dedups by
 # ``local_id``, re-fires when ``item.preview`` is cleared while the
-# cursor sits still, and skips ``request_preview`` for already-cached
-# items on cursor moves. These tests pin those four behaviors plus
-# scroll preservation, conditional redraw, and the preserved
-# single-flight invariant.
+# cursor sits still, and never re-runs ``get_preview`` for an
+# already-cached id. Since #954 every cursor move fires
+# ``request_preview`` (cached or not) and the worker serves cache hits
+# with a settle nudge — the preserved #442 promise is "no fetch", not
+# "no request". These tests pin those behaviors plus scroll
+# preservation, conditional redraw, and the preserved single-flight
+# invariant.
 
 
 def _seed_two_items(b, ids=('A', 'B')):
@@ -421,8 +429,10 @@ class TestPreviewWorkerRedesign442(unittest.TestCase):
             b.stop_workers()
 
     def test_skip_fetch_when_cursor_moves_to_already_cached_item(self):
-        # Cursor moves A → B with B.preview already populated. No
-        # get_preview call should fire (cache paint is sufficient).
+        # Cursor moves A → B with B.preview already populated. The move
+        # fires a request (#954: every move routes through the worker)
+        # but no get_preview call may result — the worker serves the
+        # cache hit with a settle nudge instead of a refetch.
         calls = []
 
         def get_preview(id_):
@@ -439,7 +449,8 @@ class TestPreviewWorkerRedesign442(unittest.TestCase):
 
             b._state.cursor = 0
             b._update_preview_for_cursor()
-            # No fetch should have fired (cache covers A).
+            # No fetch may have fired (cache covers A) — the nudge
+            # drained the request slot instead.
             b.run_until_idle()
             self.assertEqual(calls, [])
 
@@ -450,6 +461,10 @@ class TestPreviewWorkerRedesign442(unittest.TestCase):
             self.assertEqual(calls, [],
                              'cursor move to cached item must not fetch')
             self.assertEqual(b._preview_cursor_id, 'B')
+            # The nudge landed: B's visit counts as delivered and the
+            # caches are untouched.
+            self.assertTrue(b._preview_visit_delivered)
+            self.assertEqual(items['B'].preview, 'cached-B')
         finally:
             b.stop_workers()
 
@@ -522,7 +537,9 @@ class TestPreviewWorkerRedesign442(unittest.TestCase):
                 gate.wait(timeout=2.0)
             return f'preview-{id_}'
 
-        b = make_browser(get_preview=get_preview)
+        # debounce=0: A must be mid-fetch when B/C clobber the slot;
+        # the settle wait would supersede A before it ever fetches.
+        b = make_browser(get_preview=get_preview, preview_debounce=0)
         try:
             items = _seed_two_items(b, ids=('A', 'B', 'C'))
             b.request_preview('A')
@@ -586,8 +603,9 @@ class TestPreviewWorkerRedesign442(unittest.TestCase):
             self.assertNotIn('preview', b._needs_redraw)
 
             # Move cursor to A → _update_preview_for_cursor flags
-            # redraw (cursor-change branch) and skips the fetch
-            # because A is already cached.
+            # redraw (cursor-change branch); the re-request for the
+            # already-cached A resolves as a worker settle nudge, not
+            # a refetch (#954).
             b._state.cursor = 0
             b._update_preview_for_cursor()
             self.assertIn('preview', b._needs_redraw)
@@ -613,7 +631,9 @@ class TestPreviewWorkerRedesign442(unittest.TestCase):
                 state['in_flight'] -= 1
             return f'p-{id_}'
 
-        b = make_browser(get_preview=get_preview)
+        # debounce=0: the burst must reach several sequential fetches —
+        # the settle wait would coalesce it to one, voiding the test.
+        b = make_browser(get_preview=get_preview, preview_debounce=0)
         try:
             ids = [f'id-{n}' for n in range(20)]
             for id_ in ids:

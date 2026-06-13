@@ -90,16 +90,18 @@ class TestChildrenPaneRedraw(unittest.TestCase):
                 sep_cols0,
                 f'no vertical separator columns at startup:\n{screen0}')
 
-            # Move cursor to B (no children) → preview expands.
+            # Move cursor to B (no children) → preview expands. The
+            # preview repaint is debounced (preview_debounce) and the
+            # pane holds A's content until B's arrives — wait for the
+            # replacement content itself, not just a stable screen.
             t.send('Down')
-            t.wait_stable(timeout=3.0)
-            screen_b = t.capture()
-            self.assertIn(
-                'BBBBPREVIEW', screen_b,
-                f'preview for B not visible after Down:\n{screen_b}')
+            t.wait_for('BBBBPREVIEW', timeout=3.0)
 
-            # Move cursor back to A → children pane should redraw.
+            # Move cursor back to A → children pane should redraw. The
+            # held BBBBPREVIEW stays painted until A's preview repaints
+            # after the debounce — wait for it before asserting.
             t.send('Up')
+            t.wait_for('preview-of-A', timeout=3.0)
             t.wait_stable(timeout=3.0)
             screen_a = t.capture()
 
@@ -159,8 +161,13 @@ class TestChildrenPaneRedraw(unittest.TestCase):
                 f'{screen_a1}')
 
             # Press Left — cursor should jump back to A. Children pane
-            # MUST now show A's children (a1, a2) again.
+            # MUST now show A's children (a1, a2) again. The pane swaps
+            # together with the preview when the revisit settles (#959 /
+            # #954), and a holding screen is already "stable" — wait for
+            # A's preview to be (back) on screen, which the settle paint
+            # guarantees alongside the restored pane.
             t.send('Left')
+            t.wait_for('preview-of-A', timeout=3.0)
             t.wait_stable(timeout=3.0)
             screen_back = t.capture()
 
@@ -311,6 +318,12 @@ class TestChildrenPaneRedraw(unittest.TestCase):
                 t.send('Up')
                 t.wait_stable(timeout=3.0)
 
+            # The pane holds B's preview until the revisit to A settles
+            # (#954: cached rows swap on settle, and a holding screen is
+            # already "stable") — wait for A's replacement content
+            # before asserting B's text is gone.
+            t.wait_for('preview-of-A', timeout=3.0)
+            t.wait_stable(timeout=3.0)
             screen = t.capture()
             self.assertIn(
                 'a1', screen,

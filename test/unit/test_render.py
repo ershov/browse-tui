@@ -2162,6 +2162,9 @@ class _MockState:
         self.scope_stack = scope_stack
         self._preview = {}
         self._children = {}
+        # Read by ``_children_displayed_item`` (#959) to resolve the
+        # children pane's displayed parent.
+        self._items_by_id = {}
         # Read by ``RowContext.__init__`` (``_parent_of_id.get(item.id)``)
         # to populate ``ctx.parent_id``.
         self._parent_of_id = parent_of_id or {}
@@ -2222,6 +2225,10 @@ class _MockBrowser:
         self._notice = None
         self._help_mode = False
         self._preview_scroll = 0
+        # Children-pane displayed parent (#959): the renderers read this
+        # — not the cursor — as the pane's subject. Tests seed it to the
+        # settled state they want painted.
+        self._children_displayed_id = None
         self._needs_redraw = set()
         # Per-pane row cache used by the differential renderer (#187).
         # Tests that call renderers directly must reconcile the cache
@@ -2819,8 +2826,12 @@ class TestRenderChildrenList(unittest.TestCase):
         visible = [_Entry(parent)]
         state = _MockState(visible, cursor=0)
         state._children = {parent.id: children}
+        state._items_by_id = {parent.id: parent}
         _render.visible_items = lambda s: state._visible
-        return _MockBrowser(state, split='v', show_children_pane=True)
+        # Settled display (#959): the pane renders the displayed parent,
+        # not the cursor — seed it as the main loop's advance would.
+        return _MockBrowser(state, split='v', show_children_pane=True,
+                            _children_displayed_id=parent.id)
 
     def test_one_child_per_row(self):
         parent = Item(id='p', title='parent', has_children=True)
@@ -2891,8 +2902,12 @@ class TestRenderChildrenList(unittest.TestCase):
         visible = [_Entry(parent)]
         state = _MockState(visible, cursor=0)
         state._children = {}  # not cached
+        state._items_by_id = {parent.id: parent}
         _render.visible_items = lambda s: state._visible
-        browser = _MockBrowser(state, split='v', show_children_pane=True)
+        # Settled display on the uncached branch (#959) — the loading
+        # hint paints only for the displayed (settled) parent.
+        browser = _MockBrowser(state, split='v', show_children_pane=True,
+                               _children_displayed_id=parent.id)
         rect = Rect(left=10, top=1, right=30, bottom=5)
         _reconcile(browser, 'children', rect)
         _render.render_children_list(browser, rect, has_header=False)

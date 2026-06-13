@@ -2028,12 +2028,15 @@ def mark_cursor_changed(browser) -> None:
     """Flag the redraw set for a cursor-position change.
 
     Any code path that moves ``state.cursor`` MUST call this helper —
-    the list pane needs to repaint the new selected row, the children
-    grid needs to refresh to reflect the new cursor item's children,
-    and the preview pane needs to re-render the new cursor item's
-    preview text. Forgetting any one of those leaves a stale pane
-    until the next user keystroke (regression in #206 / commit
-    0c8769d, fix tracked under #223).
+    the list pane needs to repaint the new selected row, the preview
+    pane needs to re-render (or hold, §B) for the new cursor item,
+    and the children grid gets a repaint of its held content (#959:
+    the grid renders the displayed parent, which lags the cursor
+    until the preview settles — its CONTENT changes via the advance
+    rule's ``'all'`` flag and children deliveries, and the row cache
+    no-ops an unchanged held paint). Forgetting any one of those
+    leaves a stale pane until the next user keystroke (regression in
+    #206 / commit 0c8769d, fix tracked under #223).
 
     Centralising the set here means new cursor-move sites just call
     one function instead of recopying a hand-written triplet. Also
@@ -3165,6 +3168,10 @@ class BrowserConfig:
     show_scope_crumb: bool = False
     preview_buffer_cap_chars: int = 100_000
     preview_buffer_cap_lines: int = 1000
+    # Seconds of cursor quiet before the preview worker fetches; 0
+    # disables (immediate fetch). Coalesces the per-row fetches a held
+    # j/k would otherwise fire (preview-flicker design §A).
+    preview_debounce: float = 0.15
     on_cursor_change: Optional[Callable] = None
     on_scope_change: Optional[Callable] = None
     on_selection_change: Optional[Callable] = None
@@ -3393,6 +3400,12 @@ class Browser:
             preview_buffer_cap_lines: Soft cap on buffered preview lines
                 (``\\n`` count) before the worker pauses pulling. Default
                 1000. Counterpart to ``preview_buffer_cap_chars``.
+            preview_debounce: Seconds of cursor quiet before the preview
+                worker serves the request — a ``get_preview`` fetch or
+                the cached-settle nudge (default 0.15). A newer request
+                landing during the wait restarts it, so rapid cursor
+                movement coalesces into one serve for the row the
+                cursor settles on. ``0`` disables (no settle wait).
             on_cursor_change: Optional ``(ctx) -> None`` callback fired
                 once per main-loop tick on which the cursor row id
                 changed. Debounced: rapid intermediate moves coalesce
@@ -3720,6 +3733,17 @@ class Browser:
         self._children_prefetch_req = None
         self._children_prefetch_local_id = None
 
+        # Children-pane displayed id (#959): the parent id the children
+        # pane currently RENDERS. Lags the cursor — advanced by the
+        # main loop's per-tick rule (``_advance_children_displayed_id``)
+        # only once the preview settles on the cursored row, so the
+        # pane always describes the same row the preview pane does:
+        # old/old during a scroll burst, new/new (or new + loading
+        # hint) in the settle paint, never new-preview/old-children.
+        # Main-thread render-side state only; the request pipeline
+        # above keeps following the live cursor.
+        self._children_displayed_id = None
+
         # Preview worker: post-queue delivery + local-id dedup (#442).
         # The worker keeps a ``local_id`` of the most recently fetched
         # request. On each iteration it reads ``_preview_req``: if it
@@ -3739,6 +3763,10 @@ class Browser:
         # needed for this slot. ``_preview_event`` is the wake signal.
         self._preview_req = None
         self._preview_event = threading.Event()
+        # Debounce: seconds of cursor quiet before the worker fetches
+        # (0 disables). The worker sleeps after adopting a request and
+        # re-reads the slot — see ``_preview_worker``.
+        self._preview_debounce = float(config.preview_debounce)
 
         # Preview generator support (#273). When ``get_preview`` returns
         # a generator, the worker eagerly pulls each yield, calls
@@ -3828,6 +3856,14 @@ class Browser:
         # action, cursor-item change, and help-mode toggle. See
         # ``docs/superpowers/specs/2026-05-17-preview-tail-design.md``.
         self._preview_at_tail = False
+        # Stale-hold snapshot (preview-flicker design §B): the last
+        # successfully painted per-item preview (a ``_PreviewSnapshot``,
+        # 050-render). ``render_preview`` captures it at the end of
+        # every normal per-item content paint and paints it instead of
+        # blank rows while the cursor row's preview is pending. Owned
+        # by the render layer; never invalidated — a geometry/ANSI
+        # mismatch re-wraps from its raw text at paint time.
+        self._preview_snapshot = None
         # Help-mode toggle — when True, the preview pane shows the
         # composed help text (``compose_help_text(self)`` from the
         # render layer) instead of the per-item preview. The handler
@@ -3841,6 +3877,26 @@ class Browser:
         # dismiss the help overlay so the user sees the new item's
         # preview, not stale state from the previous one.
         self._preview_cursor_id = None
+        # Per-visit delivery bit (preview-flicker design §B): True once
+        # preview content for the current cursor visit has landed.
+        # Cleared when ``_update_preview_for_cursor`` observes a cursor
+        # change; set — only when the delivered id is still cursored —
+        # by ``_deliver_preview``, the set/append preview apply paths
+        # in ``update_data``, and the worker's cache-hit settle nudge
+        # (``_settle_cached_preview``). While False, ``render_preview``
+        # holds the stale snapshot even over a cached preview, so
+        # revisited rows swap on cursor settle rather than on every
+        # move. Starts True: no visit window exists until the cursor
+        # helper observes one, and render paths that never run the
+        # helper must keep painting straight from cache.
+        self._preview_visit_delivered = True
+        # Loading-indicator memo (preview-flicker design §C): the
+        # ``_preview_loading()`` value last observed by the main loop.
+        # The loop re-evaluates once per tick and flags 'preview' +
+        # 'info' redraws on a flip — the ``⧗`` label prefix lives in
+        # the 'h'-layout preview header and the standalone bottom info
+        # bar. See ``_flag_preview_loading_if_changed``.
+        self._preview_loading_memo = False
         # Last computed width of the preview pane in terminal columns.
         # Refreshed by ``_layout_for`` (050-render) on every render pass.
         # Zero until the first paint, or while the preview pane isn't
@@ -4580,6 +4636,7 @@ class Browser:
                 )
                 if self._state._preview_dirty:
                     self._needs_redraw.add('preview')
+                    self._mark_visit_delivered_from_ops(ops_list)
                 for kick in self._state._preview_kicks:
                     kind = kick[0]
                     if kind == 'id':
@@ -4643,6 +4700,7 @@ class Browser:
             # while ``self`` is still in scope.
             if self._state._preview_dirty:
                 self._needs_redraw.add('preview')
+                self._mark_visit_delivered_from_ops(ops_list)
             for kick in self._state._preview_kicks:
                 kind = kick[0]
                 if kind == 'id':
@@ -5899,10 +5957,11 @@ class Browser:
             # ``on_empty`` (§3.4).
             self._clamp_cursor_landable(self._state.cursor)
             self._needs_redraw.add('list')
-            # The cache may have just filled the cursor item's
-            # children — flag the grid pane for redraw too. Render-time
-            # checks gate the actual paint so this is harmless when the
-            # grid is hidden / disabled.
+            # The cache may have just filled the DISPLAYED parent's
+            # children (#959: the grid renders the displayed id, which
+            # is usually the settled cursor row) — flag the grid pane
+            # for redraw too. Render-time checks gate the actual paint
+            # so this is harmless when the grid is hidden / disabled.
             self._needs_redraw.add('children')
             # Layout depends on grid sizing: when the grid was hidden
             # waiting for children to arrive, the preview now needs to
@@ -5946,9 +6005,57 @@ class Browser:
             self._preview_req = None
         # Conditional redraw: cursor may have moved during the fetch.
         # A delivery for the still-current id is what the user is
-        # waiting to see; everything else just fills the cache.
+        # waiting to see; everything else just fills the cache. The
+        # delivery also ends the visit's hold window (§B) — the
+        # renderer may now swap to this content.
         if id_ == self._preview_cursor_id:
+            self._preview_visit_delivered = True
             self._needs_redraw.add('preview')
+
+    def _settle_cached_preview(self, id_) -> None:
+        """Main-thread settle nudge for a cache-hit preview (§A/§B, #954).
+
+        Posted by ``_preview_worker`` in place of a fetch when the
+        debounce settles on an id whose preview is already cached —
+        the delivery-shaped signal that ends the cached row's hold
+        window without re-running ``get_preview`` (the #442
+        cached-revisit promise). Drains ``_preview_req`` exactly like
+        ``_deliver_preview`` (latest-wins: a newer request landed
+        mid-settle is left alone) and, when ``id_`` is still cursored,
+        opens the swap: per-visit delivery bit + preview redraw.
+
+        If the cache was cleared between the worker's off-thread read
+        and this running, the renderer keeps holding (``preview is
+        None`` wins the hold rule) and the #442 same-cursor re-fire
+        requests again next tick — no special-casing needed here.
+        """
+        if self._preview_req == id_:
+            self._preview_req = None
+        if id_ == self._preview_cursor_id:
+            self._preview_visit_delivered = True
+            self._needs_redraw.add('preview')
+
+    def _mark_visit_delivered_from_ops(self, ops_list) -> None:
+        """Set the per-visit delivery bit when a batch wrote the
+        cursored id's preview (§B, #954).
+
+        Called by ``update_data._apply`` next to the ``_preview_dirty``
+        redraw flag. ``set_preview`` / ``append_preview`` ops are
+        deliveries — recipe pushes and streamed chunks alike end the
+        cursored row's hold window (a streaming first chunk must swap
+        the pane immediately). The clear/invalidate/drop ops are not:
+        they null the cache, and the ``preview is None`` hold leg
+        already covers that state.
+        """
+        if self._preview_visit_delivered:
+            return
+        cur = self._preview_cursor_id
+        if cur is None:
+            return
+        for op in ops_list:
+            if op[0] in ('set_preview', 'append_preview') and op[1] == cur:
+                self._preview_visit_delivered = True
+                return
 
     def run_until_idle(self, timeout: float = 2.0) -> None:
         """Test affordance: drain queues + wait for workers, until idle.
@@ -6614,9 +6721,11 @@ class Browser:
         # ``on_empty`` (§3.4).
         self._clamp_cursor_landable(state.cursor)
         self._needs_redraw.add('list')
-        # Cache may have just filled the cursor item's children — flag
-        # the grid pane for redraw too. Render-time checks gate the
-        # actual paint so this is harmless when the grid is hidden.
+        # Cache may have just filled the DISPLAYED parent's children
+        # (#959: the grid renders the displayed id, which is usually
+        # the settled cursor row) — flag the grid pane for redraw too.
+        # Render-time checks gate the actual paint so this is harmless
+        # when the grid is hidden.
         self._needs_redraw.add('children')
         # Layout depends on grid sizing: when the grid was hidden
         # waiting for children to arrive, the preview now needs to
@@ -6640,12 +6749,34 @@ class Browser:
              Then ``wait()`` if there's still nothing new. Resets
              ``local_id`` to ``None`` on sleep so a re-request of the
              same id after we've gone idle fires again.
-          2. Otherwise adopt the new id, clear the event (arming "next
-             request landed during fetch"), and call ``get_preview``.
-          3. Generator results route through
-             ``_stream_preview_from_generator`` (unchanged) which
-             delivers via ``append_preview`` — also on the post queue.
-          4. Non-generator results post a ``_deliver_preview`` closure
+          2. Otherwise adopt the new id and clear the event (arming
+             "next request landed during fetch").
+          3. Debounce (preview-flicker design §A): if
+             ``preview_debounce`` > 0, sleep it out, then re-check
+             ``_stop`` (exit) and re-read the slot. A changed slot
+             drops the ``local_id`` memo (nothing was fetched) and
+             restarts at step 1, so rapid cursor movement coalesces
+             into one fetch for the row the cursor settles on. An
+             unchanged slot — including a move-away-and-back within
+             the window — falls through.
+          4. Cache hit → settle nudge (#954). Every cursor move routes
+             through the worker (``_update_preview_for_cursor`` no
+             longer skips cached ids), so a settled id whose
+             ``Item.preview`` is already cached is served by posting a
+             ``_settle_cached_preview`` closure — never a
+             ``get_preview`` re-run (the #442 cached-revisit promise).
+             ``local_id`` stays adopted, same memo semantics as a
+             delivery. The off-thread cache read races main-thread
+             mutation exactly like the ``_preview_req`` reads in this
+             loop; a misread either nudges a just-cleared cache
+             (recovered by the #442 same-cursor re-fire next tick) or
+             refetches a just-filled one (harmless overwrite). No
+             locking.
+          5. Cache miss → call ``get_preview``. Generator results route
+             through ``_stream_preview_from_generator`` (unchanged)
+             which delivers via ``append_preview`` — also on the post
+             queue.
+          6. Non-generator results post a ``_deliver_preview`` closure
              that caches the text on ``Item.preview`` and conditionally
              flags redraw. Lambdas capture ``id_`` and ``text`` by
              default-arg to avoid the late-binding pitfall.
@@ -6690,6 +6821,30 @@ class Browser:
             # while get_preview is running, the event will be set and
             # the next iteration's read will see the new id.
             self._preview_event.clear()
+            # Debounce: let the cursor settle before paying for a
+            # fetch. A newer id in the slot restarts the wait at the
+            # loop top; the slot landing back on ``req`` (move away
+            # and back) falls through — the fetch is still wanted.
+            if self._preview_debounce > 0:
+                time.sleep(self._preview_debounce)
+                if self._stop:
+                    break
+                if self._preview_req != req:
+                    # ``req`` was never fetched — drop the memo so a
+                    # slot that flips back to it before the top-of-loop
+                    # read isn't absorbed by the same-id dedup.
+                    local_id = None
+                    continue
+            # Cache hit → settle nudge, no refetch (#954, docstring
+            # step 4). Read raced against main-thread mutation by
+            # design — misreads self-correct, see docstring.
+            item = self._state._items_by_id.get(req)
+            if item is not None and item.preview is not None:
+                self.post(
+                    lambda id_=req: self._settle_cached_preview(id_)
+                )
+                notify_wake()
+                continue
             # If a paused generator from an earlier request is still
             # alive (cursor moved between yields), close it so its
             # recipe's ``finally`` runs before we serve the new request.
@@ -7315,6 +7470,21 @@ class Browser:
                 self._update_preview_for_cursor()
                 self._update_children_for_cursor()
 
+                # Loading-indicator label (preview-flicker design §C):
+                # repaint when the cursored item's fetch-outstanding
+                # state flips. Every transition wakes the loop — cursor
+                # moves are in-loop, deliveries post + wake, the stream
+                # pause / exhaustion paths call notify_wake — so this
+                # once-per-tick memo check needs no per-site wiring.
+                self._flag_preview_loading_if_changed()
+
+                # Children-pane displayed-id advance (#959): the pane
+                # follows the preview's settle, not the cursor, so the
+                # two panes always describe the same row. Runs after
+                # the drain so a delivery that just set the per-visit
+                # bit advances (and repaints) in this same tick.
+                self._advance_children_displayed_id()
+
                 # Post-drain lifecycle-hook settle pass. NOTE: this is
                 # only PART of the hook firing — ``on_scope_change`` and
                 # ``on_selection_change`` already fired synchronously at
@@ -7777,6 +7947,95 @@ class Browser:
                 pass
             self._stdin_nonblock_set = False
 
+    def _preview_loading(self) -> bool:
+        """True while a preview request for the cursored item is
+        outstanding — a fetch in flight, or a cached row's settle
+        window (#954).
+
+        Display predicate for the ``⧗`` label prefix (preview-flicker
+        design §C): the request slot holds the cursored id and no
+        paused stream matches it. ON from the cursor move — the slot
+        stays set through the debounce window, the fetch, and an
+        actively pulling stream. OFF once a delivery, the settle
+        nudge, or stream exhaustion drains the slot, and OFF while a streaming
+        generator is paused at its buffer cap: the slot still points
+        at the paused id, but the worker has voluntarily stopped
+        pulling (the same paused-is-idle call ``run_until_idle``
+        makes — that predicate is kept separate because it gates on
+        the slot alone, regardless of the cursor).
+        """
+        req = self._preview_req
+        if req is None or req != self._preview_cursor_id:
+            return False
+        paused = self._preview_paused
+        return paused is None or paused.get('id') != req
+
+    def _flag_preview_loading_if_changed(self) -> None:
+        """Flag label repaints when ``_preview_loading()`` flips (§C).
+
+        Called by the main loop once per tick, after
+        ``_update_preview_for_cursor`` refreshed the request slot. The
+        label lives in two places — the 'h'-layout preview header
+        ('preview' redraw key) and the standalone bottom info bar
+        ('info') — so a flip flags both; the row cache no-ops
+        whichever paint didn't actually change.
+        """
+        loading = self._preview_loading()
+        if loading != self._preview_loading_memo:
+            self._preview_loading_memo = loading
+            self._needs_redraw.update(('preview', 'info'))
+
+    def _advance_children_displayed_id(self) -> None:
+        """Advance the children pane's displayed parent id (#959).
+
+        Called by the main loop once per tick, next to the loading-
+        label memo. The children pane renders ``_children_displayed_id``
+        — not the live cursor — so during a scroll burst it keeps
+        describing the row the preview pane still shows, and both
+        panes swap in the same paint. The advance target is the
+        visible cursor entry:
+
+          * normal row — advance only once the preview visit has
+            settled (``_preview_visit_delivered``: a delivery, an
+            apply-path write, or the worker's settle nudge). With
+            ``show_preview`` off the bit keeps its ``True`` init —
+            ``_update_preview_for_cursor`` returns before ever
+            clearing it — so this degrades to advance-every-tick,
+            the pre-#959 immediate pane.
+          * meta row — advance immediately. Mirrors the #940 meta
+            exemption: no preview is ever requested for meta rows, so
+            no delivery would end a settle gate, and the preview pane
+            paints meta rows honestly right away — the children pane
+            must match rather than keep describing the previous
+            branch. Navigation skips meta rows, so this can't fire
+            mid-scroll.
+          * pending placeholder / no cursor row — hold (no advance).
+            A placeholder holds both panes (the preview keeps its
+            snapshot); an empty visible list blanks the preview while
+            this pane holds — deliberate: hold-on-no-cursor is the
+            contract.
+
+        An actual id change flags a full repaint: the pane's geometry
+        derives from the displayed item (``_layout_for`` sizes the
+        grid from its cached children), so an id change can reshape
+        the layout — the same ``'all'`` a children delivery flags
+        today. Cost is once per settle, not per cursor move.
+        """
+        if not self.show_children_pane:
+            return
+        state = self._state
+        vis = visible_items(state)
+        if not (0 <= state.cursor < len(vis)):
+            return
+        entry = vis[state.cursor]
+        if entry.kind == 'pending':
+            return
+        if entry.kind == 'normal' and not self._preview_visit_delivered:
+            return
+        if entry.item.id != self._children_displayed_id:
+            self._children_displayed_id = entry.item.id
+            self._needs_redraw.add('all')
+
     def _update_preview_for_cursor(self) -> None:
         """Request a preview fetch for the current cursor item.
 
@@ -7789,7 +8048,7 @@ class Browser:
         by the main loop at the top of every iteration (post-#124) so
         cursor moves and worker deliveries both trigger preview fetches.
 
-        Three behaviors (#442):
+        Behaviors (#442, request-always since #954):
 
           * Same cursor + cached: no-op. The renderer paints from cache.
           * Same cursor + cache cleared (``item.preview is None``):
@@ -7800,12 +8059,15 @@ class Browser:
             This fixes the "stuck blank" failure mode: previously, if
             the cursor stayed put while something nulled the cache, the
             renderer would read ``None`` and never trigger a re-fetch.
-          * Cursor moved + new id already cached: skip the fetch; just
-            reset scroll/help and flag redraw. The renderer paints from
-            cache. Saves a redundant ``get_preview`` round-trip for
-            navigation across already-visited rows.
-          * Cursor moved + new id not cached (or ``None``): request a
-            fetch and reset scroll/help.
+          * Cursor moved to a normal item: clear the per-visit delivery
+            bit and ``request_preview`` — cached or not (#954). The
+            worker is the single settle authority: it debounces, then
+            either fetches (uncached) or posts a settle nudge that
+            serves the cache hit without re-running ``get_preview``
+            (the #442 cached-revisit promise). Either delivery shape
+            ends the renderer's hold for this visit.
+          * Cursor moved off any normal item (``None``): clear the
+            request slot and reset scroll/help.
 
         Idempotency note: the gate is ``_preview_cursor_id`` (only
         updated when the cursor moves to a different item), NOT
@@ -7837,6 +8099,10 @@ class Browser:
             return
 
         self._preview_cursor_id = new_id
+        # New visit: nothing delivered for it yet — the renderer holds
+        # the stale snapshot over this row (cached previews included)
+        # until a delivery or the worker's settle nudge flips the bit.
+        self._preview_visit_delivered = False
         self._preview_scroll = 0
         # ``_preview_at_tail`` is intentionally NOT cleared here: the
         # tail pin is a sticky user intent that carries across cursor-
@@ -7860,12 +8126,11 @@ class Browser:
             self._preview_resume_event.set()
             return
 
-        # Cursor landed on a new id with a cached preview — paint from
-        # cache, skip the round-trip. The renderer's clamp keeps
-        # ``_preview_scroll`` valid even though we reset it to 0 above.
-        item = state._items_by_id.get(new_id)
-        if item is not None and item.preview is not None:
-            return
+        # Always request — cached or not (#954). The worker resolves
+        # cache hits with a settle nudge instead of a ``get_preview``
+        # re-run, so this costs no extra fetch; what it buys is one
+        # swap signal for every move, which is what lets the renderer
+        # hold steadily during a scroll burst over visited rows.
         self.request_preview(new_id)
 
     def _list_pane_height_safe(self) -> int:

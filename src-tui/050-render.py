@@ -46,11 +46,13 @@ Out of scope (deferred to phase 2/3):
     already wired here so phase 2 only changes one site.
 """
 
-# In the concatenated production build ``re`` is already imported by an
-# earlier numbered file; the re-import is a harmless no-op there but lets the
-# module-level regex in ``_sanitize_ansi`` compile when this file is exec'd
-# standalone (the isolated unit-test load).
+# In the concatenated production build these are already imported by an
+# earlier numbered file; the re-imports are harmless no-ops there but let
+# the module-level regex in ``_sanitize_ansi`` and the ``_PreviewSnapshot``
+# namedtuple resolve when this file is exec'd standalone (the isolated
+# unit-test load).
 import re
+from collections import namedtuple
 
 
 # tag_style name → (fg color, bold flag). Values are 256-colour palette
@@ -1899,6 +1901,78 @@ def _wrap_preview_line(line, width, *, ansi_on, drop_sgr=False):
     return rows
 
 
+# Stale-hold snapshot (preview-flicker design §B): the last successfully
+# painted per-item preview, stored on ``Browser._preview_snapshot`` and
+# painted in place of blank rows while the cursored row's preview is
+# pending. Mirrors ``PreviewRender`` — ``wrapped`` plus the ``(width,
+# ansi_on)`` geometry it was built for — extended with the raw ``text``
+# (so a geometry/ANSI mismatch can re-wrap at paint time; the raw text
+# is also what survives the #456 abandoned-partial cache clear) and the
+# clamped ``scroll`` the paint showed (a held view is frozen there).
+# Captured by reference assignment, never invalidated.
+_PreviewSnapshot = namedtuple(
+    '_PreviewSnapshot',
+    ['text', 'scroll', 'wrapped', 'width', 'ansi_on'],
+)
+
+
+def _sanitize_and_wrap_preview(text, width, *, ansi_on):
+    """Sanitize ``text`` and wrap it into preview rows ``width`` cols wide.
+
+    The preview pane's shared content pipeline — the per-item and help
+    paints and the stale-hold re-wrap all route through here. Returns
+    ``(wrapped, wrapped_tail_offset)`` where ``wrapped_tail_offset`` is
+    the index in ``wrapped`` at which the wrap of the last raw line
+    starts — needed by the #423 in-place append-extension path to
+    splice new wrapped rows over the previously-open tail line's wrap
+    (callers that never splice ignore it).
+    """
+    # Strip control chars before they hit the terminal. Covers every
+    # source so anything that reaches this pane is safe — preview data
+    # can carry attacker-controlled bytes (binary files, raw terminal
+    # captures, command stderr); help is composed in-process but cheap
+    # to filter and recipes may supply ``help_intro`` / ``help_outro``.
+    #
+    # In raw mode (``ansi_on=False``) the sanitiser also maps ESC to
+    # '?' so untrusted content can never inject SGR or other escape
+    # sequences. The walker below sees no ESC bytes in that case and
+    # falls through to plain wrap.
+    text = _sanitize_preview(text, ansi_on=ansi_on)
+    if ansi_on:
+        # Escape-level sanitise (sec 4.2 #1), shared with the row-content
+        # path: keep SGR, drop all other CSI and any bare/dangling ESC.
+        # ``_wrap_preview_line`` also drops non-SGR CSI token-by-token,
+        # but only the regex-matchable ones — this additionally removes a
+        # bare ESC the tokeniser would otherwise pass through as text, and
+        # makes the two paths behave identically. (Raw mode already
+        # mapped every ESC to '?', so there's nothing left to strip.)
+        text = _sanitize_ansi(text)
+
+    # Wrap content to ``width`` columns.
+    #
+    # The wrap goes through ``_wrap_preview_line`` (#242) which
+    # tokenises SGR sequences and emits self-contained visual rows
+    # (active SGR re-opened at row start, trailing ``\e[m`` iff the
+    # row carries any SGR). Plain rows are byte-identical whether
+    # ``ansi_on`` is True or False — preserves the cache-hit
+    # invariant for plain content.
+    raw = text.split('\n') if text else []
+    wrapped = []
+    # ``wrapped_tail_offset`` is recorded just before extending
+    # ``wrapped`` with the last raw line's rows. Defaults to
+    # ``len(wrapped)`` (post-wrap) so an empty preview / no-raw-lines
+    # branch records 0.
+    wrapped_tail_offset = 0
+    last_idx = len(raw) - 1
+    for i, line in enumerate(raw):
+        line = line.replace('\t', '    ')
+        if i == last_idx:
+            wrapped_tail_offset = len(wrapped)
+        wrapped.extend(_wrap_preview_line(
+            line, width, ansi_on=ansi_on, drop_sgr=False))
+    return wrapped, wrapped_tail_offset
+
+
 def render_preview(browser, rect, *, info=False, has_header=True,
                    rightmost: bool = False):
     """Render the preview pane (header + content) within ``rect``.
@@ -1915,14 +1989,21 @@ def render_preview(browser, rect, *, info=False, has_header=True,
     non-'h' layouts where the info bar lives at the bottom of the
     screen, drawn by ``render_full`` independently).
 
-    The header label adapts to ``browser._help_mode`` (``Help`` /
-    ``Preview``). Errors no longer take over the pane — they surface as
-    an info-bar notice + log entry (see ``Browser.error``).
+    The header label adapts to browser state (``Help`` / ``Preview`` /
+    ``⧗ Preview`` while a fetch for the cursored item is outstanding —
+    see ``_preview_label``). Errors no longer take over the pane — they
+    surface as an info-bar notice + log entry (see ``Browser.error``).
 
     Source priority for the content:
       1. ``browser._help_mode`` if True      → display ``compose_help_text``
-      2. ``item.preview`` (cursor item)      → per-item preview
-      3. fallthrough — empty preview         → blank rows
+      2. ``item.preview`` (cursor item),
+         delivered for this visit            → per-item preview
+      3. stale-hold — cursor row's preview
+         pending (undelivered, or cached but
+         the visit hasn't settled) and a
+         snapshot of the last painted
+         preview exists                      → hold the snapshot
+      4. fallthrough — empty preview         → blank rows
 
     Content is wrapped at ``rect.width`` columns. Rows shorter than
     the rect width are blanked out to ``rect.right`` so stale content
@@ -1969,16 +2050,81 @@ def render_preview(browser, rect, *, info=False, has_header=True,
     # land on a real item, ``item.preview_render`` is the wrap cache
     # candidate; honour it when the geometry and ANSI policy still
     # match, otherwise regenerate.
+    #
+    # ``pending`` marks a cursor row the pane must keep holding over:
+    # the synthetic ``'pending'`` placeholder row, or a ``'normal'``
+    # row with ``preview is None OR not _preview_visit_delivered``
+    # (#954). The two legs cover distinct waits: ``preview is None``
+    # keeps its #940 meaning — a delivery is pending or imminent
+    # (#442: every fetch delivers at least ``''``), which also
+    # preserves the hold across invalidate-on-the-cursored-item; the
+    # per-visit bit adds the cached-row settle window — content is in
+    # hand but the cursor hasn't settled on it, so swapping now would
+    # churn during a scroll burst over visited rows. A streaming first
+    # chunk sets the bit (apply path), so progressive streaming still
+    # swaps immediately. Delivered text for a settled visit — including
+    # ``''`` — paints as-is. Meta rows resolve their item like normal
+    # rows but never pend: ``_update_preview_for_cursor`` requests
+    # nothing for them, so no delivery or nudge would ever end a hold
+    # — a missing preview just blanks. An empty visible list is never
+    # pending either: the pane isn't waiting for anything.
     item = None
+    pending = False
     if browser._help_mode:
         text = compose_help_text(browser, include_usage=False)
     else:
-        cursor_id = _cursor_id(browser)
         text = ''
-        if cursor_id is not None:
-            item = browser._state._items_by_id.get(cursor_id)
-            if item is not None and item.preview is not None:
-                text = item.preview
+        vis = visible_items(browser._state)
+        cur = browser._state.cursor
+        if 0 <= cur < len(vis):
+            entry = vis[cur]
+            if entry.kind == 'pending':
+                pending = True
+            else:
+                item = browser._state._items_by_id.get(entry.item.id)
+                if item is not None and item.preview is not None:
+                    text = item.preview
+                    if (entry.kind == 'normal'
+                            and not browser._preview_visit_delivered):
+                        pending = True
+                elif entry.kind == 'normal':
+                    pending = True
+
+    # Stale-hold (preview-flicker design §B): while the cursor row
+    # pends, keep painting the last successfully painted per-item
+    # preview — instead of blanking (undelivered row) or swapping
+    # early (cached row whose visit hasn't settled, #954). The real
+    # content swaps in one step when the delivery or settle nudge
+    # lands. The branch is self-contained: the held
+    # view is frozen at the snapshot's clamped scroll, the snapshot's
+    # wrap is never written into the cursored item's ``preview_render``,
+    # the snapshot itself is never updated from here, and the
+    # scroll/tail-pin writebacks and #274 demand signal below are
+    # skipped. The row cache makes repeated identical held paints emit
+    # zero bytes.
+    if pending:
+        snap = browser._preview_snapshot
+        if snap is not None:
+            wrapped = snap.wrapped
+            if snap.width != width or snap.ansi_on != ansi_on:
+                # Pane geometry / ANSI policy changed since the capture
+                # (resize, screen-restore, ansi toggle) — re-wrap from
+                # the snapshot's raw text for this paint.
+                wrapped, _ = _sanitize_and_wrap_preview(
+                    snap.text, width, ansi_on=ansi_on,
+                )
+            max_scroll = max(0, len(wrapped) - content_lines)
+            scroll = max(0, min(snap.scroll, max_scroll))
+            for i in range(content_lines):
+                row = content_top + i
+                rel_row = content_row_offset + i
+                begin_row(cache, rel_row, row, left, right,
+                          rightmost=rightmost)
+                src_idx = i + scroll
+                if src_idx < len(wrapped):
+                    write(wrapped[src_idx])
+                end_row()
+            return
 
     # Wrap-cache fast path (#422) — only for per-item previews
     # (help text is composed each paint anyway), and only when
@@ -1992,53 +2138,9 @@ def render_preview(browser, rect, *, info=False, has_header=True,
             wrapped = cached.wrapped
 
     if wrapped is None:
-        # Strip control chars before they hit the terminal. Covers both
-        # sources (per-item preview and help) so anything that reaches
-        # this pane is safe — preview data can carry attacker-controlled
-        # bytes (binary files, raw terminal captures, command stderr);
-        # help is composed in-process but cheap to filter and recipes
-        # may supply ``help_intro`` / ``help_outro``.
-        #
-        # In raw mode (``ansi_on=False``) the sanitiser also maps ESC to
-        # '?' so untrusted content can never inject SGR or other escape
-        # sequences. The walker below sees no ESC bytes in that case and
-        # falls through to plain wrap.
-        text = _sanitize_preview(text, ansi_on=ansi_on)
-        if ansi_on:
-            # Escape-level sanitise (sec 4.2 #1), shared with the row-content
-            # path: keep SGR, drop all other CSI and any bare/dangling ESC.
-            # ``_wrap_preview_line`` also drops non-SGR CSI token-by-token,
-            # but only the regex-matchable ones — this additionally removes a
-            # bare ESC the tokeniser would otherwise pass through as text, and
-            # makes the two paths behave identically. (Raw mode already
-            # mapped every ESC to '?', so there's nothing left to strip.)
-            text = _sanitize_ansi(text)
-
-        # Wrap content to the rect's width.
-        #
-        # The wrap goes through ``_wrap_preview_line`` (#242) which
-        # tokenises SGR sequences and emits self-contained visual rows
-        # (active SGR re-opened at row start, trailing ``\e[m`` iff the
-        # row carries any SGR). Plain rows are byte-identical whether
-        # ``ansi_on`` is True or False — preserves the cache-hit
-        # invariant for plain content.
-        raw = text.split('\n') if text else []
-        wrapped = []
-        # ``wrapped_tail_offset`` is the index in ``wrapped`` where the
-        # wrap of the last raw line starts — needed by the #423 in-place
-        # append-extension path to splice new wrapped rows over the
-        # previously-open tail line's wrap. Recorded just before
-        # extending ``wrapped`` with the last raw line's rows. Defaults
-        # to ``len(wrapped)`` (post-wrap) so an empty preview / no-raw-
-        # lines branch records 0.
-        wrapped_tail_offset = 0
-        last_idx = len(raw) - 1
-        for i, line in enumerate(raw):
-            line = line.replace('\t', '    ')
-            if i == last_idx:
-                wrapped_tail_offset = len(wrapped)
-            wrapped.extend(_wrap_preview_line(
-                line, width, ansi_on=ansi_on, drop_sgr=False))
+        wrapped, wrapped_tail_offset = _sanitize_and_wrap_preview(
+            text, width, ansi_on=ansi_on,
+        )
 
         # Cache the wrap on the Item when it's a per-item render.
         # The help branch recomputes on every paint and doesn't share
@@ -2121,6 +2223,25 @@ def render_preview(browser, rect, *, info=False, has_header=True,
             write(wrapped[src_idx])
         end_row()
 
+    # Stale-hold snapshot: capture this paint (reference assignments, no
+    # copying) so a later pending row holds it. Per-item content paints
+    # only — help mode never owns the snapshot, and an undelivered row
+    # that fell through above (no snapshot yet) painted blank, which is
+    # not content worth holding. A delivered ``''`` is: a held view must
+    # match whatever the last paint actually showed. A cached-but-
+    # unsettled row that fell through (#954, also only when no snapshot
+    # exists yet) painted its own real cache and is captured like any
+    # content paint.
+    if (item is not None and not browser._help_mode
+            and item.preview is not None):
+        browser._preview_snapshot = _PreviewSnapshot(
+            text=item.preview,
+            scroll=scroll,
+            wrapped=wrapped,
+            width=width,
+            ansi_on=ansi_on,
+        )
+
 
 def _cursor_id(browser):
     """Return the id of the item currently under the cursor, or None."""
@@ -2131,21 +2252,21 @@ def _cursor_id(browser):
     return None
 
 
-def _cursor_item(browser):
-    """Return the Item under the cursor (only for ``kind='normal'``).
+def _children_displayed_item(browser):
+    """Return the Item the children pane currently describes (#959).
 
-    Returns None for placeholder rows / scope-root rows / empty visible
-    list — the children grid only meaningfully renders for a cursor on
-    a real item.
+    The pane renders ``browser._children_displayed_id`` — advanced by
+    the main loop only once the preview settles on the cursored row —
+    rather than the live cursor, so during a scroll burst it keeps
+    matching the held preview and both panes swap in one paint.
+    Resolves through ``_items_by_id`` so a displayed parent removed by
+    a data update yields ``None`` and the pane hides (honest; the next
+    settle re-advances).
     """
-    vis = visible_items(browser._state)
-    cur = browser._state.cursor
-    if not (0 <= cur < len(vis)):
+    id_ = browser._children_displayed_id
+    if id_ is None:
         return None
-    entry = vis[cur]
-    if entry.kind != 'normal':
-        return None
-    return entry.item
+    return browser._state._items_by_id.get(id_)
 
 
 def render_children_grid(browser, rect, *, info=False, has_header=True,
@@ -2164,17 +2285,22 @@ def render_children_grid(browser, rect, *, info=False, has_header=True,
     (used by non-'h' layouts where the info bar lives at the bottom of
     the screen).
 
-    The children come from ``browser._state._children.get(cursor_item.id, [])``
-    — direct children of the cursor item, fetched lazily by the
-    children worker.
+    The pane's subject is the DISPLAYED parent (#959) —
+    ``_children_displayed_item``, which lags the cursor until the
+    preview settles — and the children come from
+    ``browser._state._children.get(parent.id, [])``, fetched lazily by
+    the children worker (whose requests keep following the live cursor).
 
     Behaviour:
-      * Cursor on a leaf or empty cached children → blank content area
-        (the layout normally already set ``sub_height = 0`` to elide
-        the pane entirely; we render defensively).
-      * Cursor on a branch whose children aren't cached yet → single
+      * Displayed parent is a leaf or has empty cached children →
+        blank content area (the layout normally already set
+        ``sub_height = 0`` to elide the pane entirely; we render
+        defensively).
+      * Displayed branch whose children aren't cached yet → single
         ``⧗ loading…`` row in dim, mirroring the placeholder used in
-        the list pane.
+        the list pane. Because the displayed id only advances at
+        settle, this hint appears for the settled row — never for
+        rows skimmed mid-scroll.
       * Cached children → multi-column flowed layout via ``_sub_layout``
         / ``_distribute_to_columns``. Each entry's tag picks up its
         colour from ``_TAG_STYLE``.
@@ -2209,8 +2335,8 @@ def render_children_grid(browser, rect, *, info=False, has_header=True,
     if content_lines <= 0:
         return
 
-    cursor = _cursor_item(browser)
-    if cursor is None:
+    parent = _children_displayed_item(browser)
+    if parent is None:
         for i in range(content_lines):
             row = content_top + i
             rel_row = content_row_offset + i
@@ -2219,10 +2345,10 @@ def render_children_grid(browser, rect, *, info=False, has_header=True,
         return
 
     state = browser._state
-    children = state._children.get(cursor.id)
+    children = state._children.get(parent.id)
 
-    # Pending: cursor on a branch whose children aren't cached yet.
-    if children is None and cursor.has_children:
+    # Pending: displayed branch whose children aren't cached yet.
+    if children is None and parent.has_children:
         begin_row(cache, content_row_offset, content_top, left, right,
                   rightmost=rightmost)
         set_style(fg=_PENDING_FG)
@@ -2314,12 +2440,13 @@ def render_children_list(browser, rect, *, info=False, has_header=True,
 
     Used by the vertical (``split='v'``) layout per #176, where the
     children column sits between the list and the preview, occupying the
-    full body height. Each direct child of the cursor item is written on
-    its own row, truncated to the column width. The cursor item itself
-    is read from ``_cursor_item``; the children come from
-    ``browser._state._children.get(cursor.id, [])``.
+    full body height. Each direct child of the displayed parent is
+    written on its own row, truncated to the column width. The parent is
+    read from ``_children_displayed_item`` (#959 — it lags the cursor
+    until the preview settles); the children come from
+    ``browser._state._children.get(parent.id, [])``.
 
-    The header / no-cursor / loading / empty branches mirror
+    The header / no-parent / loading / empty branches mirror
     :func:`render_children_grid` so the two renderers degrade identically.
     """
     if rect is None or rect.height <= 0 or rect.width <= 0:
@@ -2351,8 +2478,8 @@ def render_children_list(browser, rect, *, info=False, has_header=True,
     if content_lines <= 0:
         return
 
-    cursor = _cursor_item(browser)
-    if cursor is None:
+    parent = _children_displayed_item(browser)
+    if parent is None:
         for i in range(content_lines):
             row = content_top + i
             rel_row = content_row_offset + i
@@ -2361,10 +2488,10 @@ def render_children_list(browser, rect, *, info=False, has_header=True,
         return
 
     state = browser._state
-    children = state._children.get(cursor.id)
+    children = state._children.get(parent.id)
 
-    # Pending: cursor on a branch whose children aren't cached yet.
-    if children is None and cursor.has_children:
+    # Pending: displayed branch whose children aren't cached yet.
+    if children is None and parent.has_children:
         begin_row(cache, content_row_offset, content_top, left, right,
                   rightmost=rightmost)
         set_style(fg=_PENDING_FG)
@@ -2783,20 +2910,24 @@ def render_info_bar(row, cols, label, *, info=False, browser=None,
 def _layout_for(browser):
     """Build the geometry dict from current terminal size + browser flags.
 
-    Cursor-aware: if ``show_children_pane`` is set and the cursor is on
-    a branch whose children are cached, we ask the multi-column layout
-    helpers how many content rows it would need and pass the answer to
-    ``layout_panes`` so the grid pane shrinks to fit. A cursor on a
-    leaf, or on a branch whose children haven't been fetched yet,
-    yields ``children_rows_needed=0`` *unless* the branch has children
-    (in which case we reserve one row for the ``⧗ loading…`` hint).
+    Children sizing follows the DISPLAYED parent (#959): if
+    ``show_children_pane`` is set and the displayed parent is a branch
+    whose children are cached, we ask the multi-column layout helpers
+    how many content rows it would need and pass the answer to
+    ``layout_panes`` so the grid pane shrinks to fit. A displayed leaf
+    (or no displayed parent yet) yields ``children_rows_needed=0``; a
+    displayed branch whose children haven't been fetched reserves one
+    row for the ``⧗ loading…`` hint. Because the displayed id only
+    advances when the preview settles, none of these transitions can
+    reshape the layout mid-scroll — the pane swaps, grows, or hides in
+    the settle paint, together with the preview.
     """
     cols, rows = term_size()
     children_rows = 0
     if browser.show_children_pane and not browser._headless:
-        cursor = _cursor_item(browser)
-        if cursor is not None and cursor.has_children:
-            cached = browser._state._children.get(cursor.id)
+        parent = _children_displayed_item(browser)
+        if parent is not None and parent.has_children:
+            cached = browser._state._children.get(parent.id)
             if cached:
                 # Route through ``children_grid_layout`` which
                 # recomputes via ``_sub_layout`` and stores the result
@@ -3116,9 +3247,16 @@ def render_partial(browser):
 
 
 def _preview_label(browser):
-    """Pick the preview pane label based on browser state."""
+    """Pick the preview pane label based on browser state.
+
+    ``⧗ Preview`` while a fetch for the cursored item is outstanding
+    (preview-flicker design §C) — the glyph leads because the label is
+    right-aligned in the divider. Help mode never shows it.
+    """
     if browser._help_mode:
         return 'Help'
+    if browser._preview_loading():
+        return '⧗ Preview'
     return 'Preview'
 
 

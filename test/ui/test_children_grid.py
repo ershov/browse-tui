@@ -3,6 +3,7 @@
 import os
 import shutil
 import subprocess
+import time
 import unittest
 
 from test.ui.fixtures.tmux import TmuxFixture
@@ -46,15 +47,31 @@ class TestChildrenGrid(unittest.TestCase):
             t.wait_for('parent parent')
             t.redraw()
             t.wait_for('a1 [running] alpha', timeout=3.0)
-            # Move cursor to the second row ('leaf').
+            # Move cursor to the second row ('leaf'). The grid keeps
+            # showing the old branch until the preview settles (#959 —
+            # the hide lands in the settle paint, ~preview_debounce
+            # later), so wait for the pane to actually drop rather
+            # than for a stable screen (a holding screen is stable).
             t.send('Down')
-            t.redraw()
-            # The grid should disappear — no Children label visible.
-            screen = t.wait_stable()
+            screen = self._wait_gone(t, 'Children', timeout=3.0)
             self.assertNotIn('a1 [running] alpha', screen)
             self.assertNotIn('a2 bravo', screen)
             # 'Children' separator label gone.
             self.assertNotIn('Children', screen)
+
+    @staticmethod
+    def _wait_gone(t, needle, timeout=3.0, interval=0.03):
+        """Poll until ``needle`` is absent from the capture."""
+        deadline = time.time() + timeout
+        last = ''
+        while time.time() < deadline:
+            last = t.capture()
+            if needle not in last:
+                return last
+            time.sleep(interval)
+        raise AssertionError(
+            f'{needle!r} still on screen after {timeout}s.\n'
+            f'last capture:\n{last}')
 
     def test_grid_renders_tag_colors(self):
         """Grid uses styled tags — a1 has tag='running' tag_style='green'.
