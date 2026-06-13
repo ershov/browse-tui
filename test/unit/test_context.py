@@ -475,6 +475,31 @@ class TestRunExternalKeepScreen(unittest.TestCase):
         self.assertFalse(self._suspend_kwarg())
 
 
+class TestAltScreenFlag(unittest.TestCase):
+    """The --alt-screen / --no-alt-screen flag pair: strip + resolution."""
+
+    def test_recipe_argv_strips_both_forms(self):
+        argv = ['--no-alt-screen', 'a.md', '--tty', '/dev/tty',
+                '--alt-screen', 'b.md']
+        # Framework flags (both alt-screen forms + --tty VALUE) dropped;
+        # the recipe's own positionals are left in order.
+        self.assertEqual(_state.recipe_argv(argv), ['a.md', 'b.md'])
+
+    def test_resolve_defaults_to_config(self):
+        self.assertTrue(_state._resolve_alt_screen(True, []))
+        self.assertFalse(_state._resolve_alt_screen(False, []))
+
+    def test_resolve_flag_overrides_config(self):
+        self.assertFalse(_state._resolve_alt_screen(True, ['--no-alt-screen']))
+        self.assertTrue(_state._resolve_alt_screen(False, ['--alt-screen']))
+
+    def test_resolve_last_occurrence_wins(self):
+        self.assertTrue(_state._resolve_alt_screen(
+            True, ['--no-alt-screen', '--alt-screen']))
+        self.assertFalse(_state._resolve_alt_screen(
+            False, ['--alt-screen', '--no-alt-screen']))
+
+
 # --- input (headless) -----------------------------------------------------
 
 

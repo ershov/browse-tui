@@ -77,6 +77,12 @@ _saved_termios = None
 # check, and still keeps term_restore idempotent.
 _in_raw = False
 _orig_sigtstp_handler = None
+# Whether the UI uses the alternate screen buffer. Set by ``term_init`` from
+# the Browser's ``alt_screen`` config (default True). When False the UI runs
+# on the current screen with NO buffer switch (no ``?1049h``/``?1049l``) — a
+# general "don't take over the screen" mode, and the piece that makes a
+# kept-screen sub-recipe launch switch-free in both directions.
+_alt_screen = True
 
 # ---- terminal device (set by term_init; see module docstring) ------------
 #
@@ -532,14 +538,23 @@ def _enter_raw():
     the parent's UI and leave its untouched cells showing through. In the
     normal (own-switch) case the buffer is already blank, so the clear is a
     cheap no-op.
+
+    When ``_alt_screen`` is False (the no-alt mode) the ``?1049h`` switch is
+    omitted entirely — the UI renders on the current screen — but the clear
+    still fires, so it starts from a blank canvas all the same.
     """
     global _saved_termios, _in_raw
     if _saved_termios is None:
         _saved_termios = termios.tcgetattr(_tty_fd_in)
     tty.setraw(_tty_fd_in)
-    # Alternate screen buffer, clear it (see docstring), home the cursor,
-    # hide the cursor, enable SGR mouse tracking.
-    _tty_writer.buffer.write(b'\033[?1049h\033[2J\033[H\033[?25l\033[?1000h\033[?1006h')
+    # Switch to the alternate screen (skipped in no-alt mode — then we render
+    # on the current screen with no switch), clear it, home + hide the cursor,
+    # enable SGR mouse tracking. The clear is UNCONDITIONAL: it guarantees a
+    # blank canvas even when ``?1049h`` was skipped (alt off) or was a no-op
+    # switch (a kept-active alt screen handed down by a parent recipe).
+    enter_alt = b'\033[?1049h' if _alt_screen else b''
+    _tty_writer.buffer.write(
+        enter_alt + b'\033[2J\033[H\033[?25l\033[?1000h\033[?1006h')
     _tty_writer.buffer.flush()
     # Mark raw entered only now -- after the enter-bytes are out -- so a
     # tcgetattr failure above (the --tty - piped case) leaves _in_raw False
@@ -650,8 +665,13 @@ def _redirect_std_fds():
             os.close(devnull_wr)
 
 
-def term_init(tty_path=None):
+def term_init(tty_path=None, *, alt_screen=True):
     """Resolve the terminal device, save termios, enter raw mode + alt screen.
+
+    ``alt_screen=False`` runs the UI on the current screen with no
+    alternate-screen switch (no ``?1049h``/``?1049l``); ``_enter_raw`` /
+    ``_leave_raw`` read the stored flag. Set from ``BrowserConfig.alt_screen``
+    (and the ``--no-alt-screen`` flag) by ``Browser.run``.
 
     ``tty_path`` selects the device (see :func:`_resolve_terminal` for the
     full policy): ``None`` (default) opens ``/dev/tty``; an explicit path
@@ -673,7 +693,8 @@ def term_init(tty_path=None):
     (e.g. ``--tty -`` with piped std streams, where the raw-mode
     ``termios`` call fails).
     """
-    global _orig_sigtstp_handler, _notify_r, _notify_w
+    global _orig_sigtstp_handler, _notify_r, _notify_w, _alt_screen
+    _alt_screen = alt_screen
     # Clean slate for the fd-hygiene state: defensive release of a stray
     # saved fd from an unmatched prior init (real runs pair term_init with
     # a term_restore + teardown dump that releases it; this guards repeated
@@ -786,18 +807,30 @@ def _leave_raw(keep_screen=False):
     our UI and the child's, and the child paints over our buffer on init.
     The default leaves the alt screen, as teardown and a plain editor/pager
     need.
+
+    In no-alt mode (``_alt_screen`` False) there is no alt screen to leave:
+    ``?1049l`` is never emitted, and instead the cursor is parked at the
+    bottom-left so the shell prompt continues below the final frame.
     """
     global _in_raw
     if not _in_raw:
         return
-    # Disable mouse tracking, show cursor; also leave the alternate screen
-    # UNLESS we're handing off to a child that owns it (keep_screen) -- then
-    # staying on the alt screen avoids a primary-screen flash, and we emit no
-    # clear so the child's own init paints over our buffer.
-    if keep_screen:
-        _tty_writer.buffer.write(b'\033[?1006l\033[?1000l\033[?25h')
+    # Always disable mouse tracking and show the cursor.
+    seq = b'\033[?1006l\033[?1000l\033[?25h'
+    if _alt_screen:
+        # Leave the alternate screen back to the primary one -- UNLESS we are
+        # handing off to a child that owns the alt screen (keep_screen), where
+        # staying on it avoids a primary-screen flash and the child's own init
+        # paints over our buffer.
+        if not keep_screen:
+            seq += b'\033[?1049l'
     else:
-        _tty_writer.buffer.write(b'\033[?1006l\033[?1000l\033[?25h\033[?1049l')
+        # No-alt mode: we never switched buffers, so don't switch now. Park the
+        # cursor at the bottom-left so the shell prompt continues below the
+        # final frame rather than overwriting it mid-screen.
+        rows = term_size()[1]
+        seq += f'\033[{rows};1H'.encode()
+    _tty_writer.buffer.write(seq)
     _tty_writer.buffer.flush()
     if _saved_termios is not None:
         termios.tcsetattr(_tty_fd_in, termios.TCSAFLUSH, _saved_termios)

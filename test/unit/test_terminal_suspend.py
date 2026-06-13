@@ -100,5 +100,47 @@ class TestEnterRawClearsScreen(unittest.TestCase):
         self.assertLess(out.index(b'\033[?1049h'), out.index(b'\033[2J'))
 
 
+class TestNoAltScreen(unittest.TestCase):
+    """``_alt_screen=False`` runs on the current screen with no buffer switch.
+
+    No ``?1049h`` on entry and no ``?1049l`` on leave; the clear still fires
+    so the canvas is blank, and on leave the cursor parks at the bottom.
+    """
+
+    def _enter(self):
+        term = load('_term_noalt_enter', '020-terminal.py')
+        term._alt_screen = False
+        term._saved_termios = object()   # skip tcgetattr
+        term._in_raw = False
+        term._tty_fd_in = -1
+        term._tty_writer = _Writer()
+        with mock.patch.object(term.tty, 'setraw', lambda fd: None):
+            term._enter_raw()
+        return term._tty_writer.buffer.getvalue()
+
+    def _leave(self):
+        term = load('_term_noalt_leave', '020-terminal.py')
+        term._alt_screen = False
+        term._saved_termios = None       # skip tcsetattr
+        term._in_raw = True
+        term._tty_fd_in = -1
+        term._tty_writer = _Writer()
+        term._leave_raw()
+        return term._tty_writer.buffer.getvalue()
+
+    def test_enter_skips_alt_switch_keeps_clear(self):
+        out = self._enter()
+        self.assertNotIn(b'\033[?1049h', out)   # no switch into the alt buffer
+        self.assertIn(b'\033[2J', out)          # but still a blank canvas
+        self.assertIn(b'\033[?25l', out)        # cursor still hidden for the UI
+
+    def test_leave_skips_alt_switch_parks_cursor(self):
+        out = self._leave()
+        self.assertNotIn(b'\033[?1049l', out)   # no switch back to primary
+        self.assertIn(b'\033[?25h', out)        # cursor shown again
+        # Cursor parked at the bottom-left (row from term_size, col 1).
+        self.assertRegex(out.decode('latin1'), r'\x1b\[\d+;1H')
+
+
 if __name__ == '__main__':
     unittest.main()

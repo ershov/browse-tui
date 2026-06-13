@@ -63,7 +63,7 @@ _actions.PIN_LAST = _state.PIN_LAST
 _actions.Mode = _state.Mode
 
 # For Browser.run() — names it resolves at runtime.
-_state.term_init = lambda tty_path=None: None
+_state.term_init = lambda tty_path=None, **kw: None
 _state.term_restore = lambda: None
 _state.term_stdout_was_tty = _term.term_stdout_was_tty
 _state.term_result_fd = _term.term_result_fd

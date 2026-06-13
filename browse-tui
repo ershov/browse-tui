@@ -95,6 +95,12 @@ _saved_termios = None
 # check, and still keeps term_restore idempotent.
 _in_raw = False
 _orig_sigtstp_handler = None
+# Whether the UI uses the alternate screen buffer. Set by ``term_init`` from
+# the Browser's ``alt_screen`` config (default True). When False the UI runs
+# on the current screen with NO buffer switch (no ``?1049h``/``?1049l``) — a
+# general "don't take over the screen" mode, and the piece that makes a
+# kept-screen sub-recipe launch switch-free in both directions.
+_alt_screen = True
 
 # ---- terminal device (set by term_init; see module docstring) ------------
 #
@@ -550,14 +556,23 @@ def _enter_raw():
     the parent's UI and leave its untouched cells showing through. In the
     normal (own-switch) case the buffer is already blank, so the clear is a
     cheap no-op.
+
+    When ``_alt_screen`` is False (the no-alt mode) the ``?1049h`` switch is
+    omitted entirely — the UI renders on the current screen — but the clear
+    still fires, so it starts from a blank canvas all the same.
     """
     global _saved_termios, _in_raw
     if _saved_termios is None:
         _saved_termios = termios.tcgetattr(_tty_fd_in)
     tty.setraw(_tty_fd_in)
-    # Alternate screen buffer, clear it (see docstring), home the cursor,
-    # hide the cursor, enable SGR mouse tracking.
-    _tty_writer.buffer.write(b'\033[?1049h\033[2J\033[H\033[?25l\033[?1000h\033[?1006h')
+    # Switch to the alternate screen (skipped in no-alt mode — then we render
+    # on the current screen with no switch), clear it, home + hide the cursor,
+    # enable SGR mouse tracking. The clear is UNCONDITIONAL: it guarantees a
+    # blank canvas even when ``?1049h`` was skipped (alt off) or was a no-op
+    # switch (a kept-active alt screen handed down by a parent recipe).
+    enter_alt = b'\033[?1049h' if _alt_screen else b''
+    _tty_writer.buffer.write(
+        enter_alt + b'\033[2J\033[H\033[?25l\033[?1000h\033[?1006h')
     _tty_writer.buffer.flush()
     # Mark raw entered only now -- after the enter-bytes are out -- so a
     # tcgetattr failure above (the --tty - piped case) leaves _in_raw False
@@ -668,8 +683,13 @@ def _redirect_std_fds():
             os.close(devnull_wr)
 
 
-def term_init(tty_path=None):
+def term_init(tty_path=None, *, alt_screen=True):
     """Resolve the terminal device, save termios, enter raw mode + alt screen.
+
+    ``alt_screen=False`` runs the UI on the current screen with no
+    alternate-screen switch (no ``?1049h``/``?1049l``); ``_enter_raw`` /
+    ``_leave_raw`` read the stored flag. Set from ``BrowserConfig.alt_screen``
+    (and the ``--no-alt-screen`` flag) by ``Browser.run``.
 
     ``tty_path`` selects the device (see :func:`_resolve_terminal` for the
     full policy): ``None`` (default) opens ``/dev/tty``; an explicit path
@@ -691,7 +711,8 @@ def term_init(tty_path=None):
     (e.g. ``--tty -`` with piped std streams, where the raw-mode
     ``termios`` call fails).
     """
-    global _orig_sigtstp_handler, _notify_r, _notify_w
+    global _orig_sigtstp_handler, _notify_r, _notify_w, _alt_screen
+    _alt_screen = alt_screen
     # Clean slate for the fd-hygiene state: defensive release of a stray
     # saved fd from an unmatched prior init (real runs pair term_init with
     # a term_restore + teardown dump that releases it; this guards repeated
@@ -804,18 +825,30 @@ def _leave_raw(keep_screen=False):
     our UI and the child's, and the child paints over our buffer on init.
     The default leaves the alt screen, as teardown and a plain editor/pager
     need.
+
+    In no-alt mode (``_alt_screen`` False) there is no alt screen to leave:
+    ``?1049l`` is never emitted, and instead the cursor is parked at the
+    bottom-left so the shell prompt continues below the final frame.
     """
     global _in_raw
     if not _in_raw:
         return
-    # Disable mouse tracking, show cursor; also leave the alternate screen
-    # UNLESS we're handing off to a child that owns it (keep_screen) -- then
-    # staying on the alt screen avoids a primary-screen flash, and we emit no
-    # clear so the child's own init paints over our buffer.
-    if keep_screen:
-        _tty_writer.buffer.write(b'\033[?1006l\033[?1000l\033[?25h')
+    # Always disable mouse tracking and show the cursor.
+    seq = b'\033[?1006l\033[?1000l\033[?25h'
+    if _alt_screen:
+        # Leave the alternate screen back to the primary one -- UNLESS we are
+        # handing off to a child that owns the alt screen (keep_screen), where
+        # staying on it avoids a primary-screen flash and the child's own init
+        # paints over our buffer.
+        if not keep_screen:
+            seq += b'\033[?1049l'
     else:
-        _tty_writer.buffer.write(b'\033[?1006l\033[?1000l\033[?25h\033[?1049l')
+        # No-alt mode: we never switched buffers, so don't switch now. Park the
+        # cursor at the bottom-left so the shell prompt continues below the
+        # final frame rather than overwriting it mid-screen.
+        rows = term_size()[1]
+        seq += f'\033[{rows};1H'.encode()
+    _tty_writer.buffer.write(seq)
     _tty_writer.buffer.flush()
     if _saved_termios is not None:
         termios.tcsetattr(_tty_fd_in, termios.TCSAFLUSH, _saved_termios)
@@ -4696,15 +4729,16 @@ def recipe_argv(argv=None):
     ``--tty=VALUE`` — but does NOT remove it from ``sys.argv``, so a
     recipe's own argv scan would otherwise misread the flag (or its
     value, e.g. ``-`` or a ``/dev/pts/N`` path) as a positional. This
-    drops exactly those framework-owned tokens — today only the ``--tty``
-    flag and its value — leaving the recipe's own arguments in order.
+    drops exactly those framework-owned tokens — the ``--tty`` flag and
+    its value, and the bare ``--alt-screen`` / ``--no-alt-screen`` flags —
+    leaving the recipe's own arguments in order.
 
-    Strips the same two forms ``run`` recognises: ``--tty VALUE``
-    (the value is the following token, consumed too) and ``--tty=VALUE``
-    (one token). A trailing bare ``--tty`` with no following token is
-    dropped on its own. Returns a fresh list; ``sys.argv`` is left
-    untouched on purpose — ``run`` still needs ``--tty`` there to resolve
-    the device.
+    Strips the same forms ``run`` recognises: ``--tty VALUE`` (the value is
+    the following token, consumed too), ``--tty=VALUE`` (one token), and the
+    bare ``--alt-screen`` / ``--no-alt-screen`` flags. A trailing bare
+    ``--tty`` with no following token is dropped on its own. Returns a fresh
+    list; ``sys.argv`` is left untouched on purpose — ``run`` still needs
+    these flags there to resolve the device / alt-screen mode.
     """
     if argv is None:
         argv = sys.argv[1:]
@@ -4719,8 +4753,28 @@ def recipe_argv(argv=None):
             continue
         if arg.startswith('--tty='):
             continue
+        if arg in ('--alt-screen', '--no-alt-screen'):
+            continue  # framework-owned, auto-detected by run() — not a positional
         out.append(arg)
     return out
+
+
+def _resolve_alt_screen(default, argv):
+    """Effective alt-screen setting from the config default + CLI flags.
+
+    ``default`` is the ``BrowserConfig.alt_screen`` value (or a recipe's
+    explicit setting); a ``--alt-screen`` / ``--no-alt-screen`` token on the
+    command line overrides it, last occurrence winning — mirroring argparse's
+    ``BooleanOptionalAction`` so recipes (which don't argparse) honour the
+    flag pair the same way the ``browse-tui`` CLI does. ``run`` calls this.
+    """
+    result = default
+    for arg in argv:
+        if arg == '--alt-screen':
+            result = True
+        elif arg == '--no-alt-screen':
+            result = False
+    return result
 
 
 # Default info-bar hint line. Shared between ``BrowserConfig.hint``
@@ -4801,6 +4855,12 @@ class BrowserConfig:
     # explicitly overrides the auto rule.
     show_preview: Optional[bool] = None
     show_children_pane: bool = True
+    # When False, run the UI on the current screen with no alternate-screen
+    # switch (no ?1049h/?1049l). A general "don't take over the screen" mode
+    # (also set via the ``--no-alt-screen`` flag); combined with a parent's
+    # ``run_external(keep_screen=True)`` it makes a sub-recipe launch
+    # switch-free in both directions.
+    alt_screen: bool = True
     preview_ansi: bool = True
     list_ratio: float = 0.30
     split: str = 'auto'
@@ -5204,6 +5264,7 @@ class Browser:
         else:
             self.show_preview = config.show_preview
         self.show_children_pane = config.show_children_pane
+        self.alt_screen = config.alt_screen
         self.show_scope_crumb = config.show_scope_crumb
         # Honour ANSI SGR escapes in the preview pane (default True).
         # Toggled at runtime via capital-R; see ``_toggle_preview_ansi``
@@ -9014,9 +9075,15 @@ class Browser:
             elif arg.startswith('--tty='):
                 tty_path = arg[len('--tty='):]
 
+        # ``--alt-screen`` / ``--no-alt-screen`` auto-detect (mirrors the
+        # ``--tty`` scan above): a recipe gets the flag pair without its own
+        # argparse, and ``recipe_argv`` strips both forms. Config default is
+        # the baseline; a CLI flag overrides it (see ``_resolve_alt_screen``).
+        alt_screen = _resolve_alt_screen(self.alt_screen, args)
+
         self.start_workers()
         if not self._headless:
-            term_init(tty_path)
+            term_init(tty_path, alt_screen=alt_screen)
         # Output-channel routing for this run (spec §3.2): the select
         # loop live-drains the buffer to fd 1 only when stdout is a
         # pipe/file content channel — never when it was a tty (held and
@@ -18786,6 +18853,12 @@ def build_argparser() -> argparse.ArgumentParser:
                         'selection. Default /dev/tty. The sentinel - '
                         'runs the UI over the process std streams '
                         '(fd 0/1), which must be a terminal.')
+    p.add_argument('--alt-screen', action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help='Use the alternate screen buffer (default). '
+                        '--no-alt-screen runs the UI on the current screen '
+                        'with no switch (no save/restore); the final frame '
+                        'stays after exit.')
     p.add_argument('--show-ids', metavar='MODE', default='auto',
                    choices=('always', 'auto', 'never'),
                    help='Whether to render the per-row id before the '
@@ -19809,6 +19882,7 @@ def _build_lazy_browser(args, fields, record_sep, *, split='h'):
         help_outro=_resolve_help_text(args.help_outro) if args.help_outro else None,
         show_ids=args.show_ids,
         show_scope_crumb=args.show_scope_crumb,
+        alt_screen=args.alt_screen,
         split=split,
     ))
 
@@ -19888,6 +19962,7 @@ def _build_eager_browser(args, fields, record_sep, *, split='h'):
         show_ids=args.show_ids,
         show_scope_crumb=args.show_scope_crumb,
         get_preview=_make_preview_fetcher(args.preview_cmd, args.action_timeout),
+        alt_screen=args.alt_screen,
         split=split,
     )
 

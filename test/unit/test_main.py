@@ -55,7 +55,7 @@ _cli.term_suspend = lambda: None
 _cli.term_resume = lambda: None
 
 # For Browser.run() — inject the names it references at runtime.
-_state.term_init = lambda tty_path=None: None
+_state.term_init = lambda tty_path=None, **kw: None
 _state.term_restore = lambda: None
 # Teardown output routing (#856/#857): the real accessors read the terminal
 # module's fd-hygiene globals, which stay at their defaults here (no real
