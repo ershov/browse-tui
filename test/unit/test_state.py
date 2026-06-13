@@ -421,17 +421,41 @@ class TestPaneCacheUpdateRect(unittest.TestCase):
         # ticket targets (#221).
         self.assertNotEqual(c.prev_rect, c.rect)
 
-    def test_update_rect_none_on_unpainted_cache_is_noop(self):
-        """An empty cache stays empty when ``update_rect(None)`` runs.
+    def test_update_rect_none_on_unpainted_cache_stamps_sentinel(self):
+        """A never-shown pane reconciled as hidden gets the sentinel.
 
-        No populated state to invalidate; the sentinel stamp is skipped
-        so we don't accumulate phantom history.
+        A pane can be hidden before it is ever painted — e.g. the
+        vertical children column while the cursor sits on a childless
+        node from launch. It must still carry the sentinel so its
+        FIRST-EVER appearance routes through the rect-changed full-pad
+        path, clearing cells a neighbour (the preview) painted and
+        vacated. Previously this no-op'd (rect stayed ``None``), so the
+        first appearance hit ``end_row``'s ``prev_rect is None`` "first
+        paint, no padding" branch and leaked the neighbour's cells.
         """
         c = PaneCache()
         c.update_rect(None)
-        self.assertIsNone(c.rect)
-        self.assertIsNone(c.prev_rect)
+        # Sentinel stamped: non-None and unequal to any real rect.
+        self.assertIsNotNone(c.rect)
+        self.assertNotEqual(c.rect, _FakeRect(1, 1, 81, 25))
         self.assertEqual(c.lines, [])
+
+    def test_never_shown_pane_first_appearance_forces_full_pad(self):
+        """Never-shown → hidden → shown ends with ``prev_rect != rect``.
+
+        ``end_row`` pads to full pane width only when ``prev_rect`` is
+        both non-None and ``!= rect``. A pane hidden before it was ever
+        painted must still reach that state on first appearance so the
+        cells a neighbour vacated get cleared (the children-column
+        stale-cell bug in vertical layout).
+        """
+        c = PaneCache()
+        c.update_rect(None)          # hidden before it ever paints
+        r = _FakeRect(73, 1, 114, 40)
+        c.update_rect(r)             # first-ever appearance
+        self.assertEqual(c.rect, r)
+        self.assertIsNotNone(c.prev_rect)
+        self.assertNotEqual(c.prev_rect, c.rect)
 
     def test_update_rect_none_on_already_sentinel_is_noop(self):
         """Repeated ``update_rect(None)`` doesn't churn the cache."""

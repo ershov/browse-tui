@@ -211,12 +211,17 @@ class PaneCache:
 
         Three branches:
 
-          * ``rect is None`` — the pane is hidden this frame. If the
-            cache currently holds a real geometry (not the sentinel and
-            not unpainted), stamp the sentinel so the next ``update_rect``
-            with a real rect is forced through the rect-changed path
-            (full pad on reappear, clearing cells overwritten by
-            neighbouring panes while the pane was hidden).
+          * ``rect is None`` — the pane is hidden this frame. Unless the
+            cache already holds the sentinel, stamp it so the next
+            ``update_rect`` with a real rect is forced through the
+            rect-changed path (full pad on appear, clearing cells
+            overwritten by neighbouring panes while the pane was hidden).
+            This covers a pane that was visible and just disappeared AND
+            one that was never painted (e.g. the vertical children
+            column while the cursor sits on a childless node from
+            launch) — the latter's first-ever appearance would otherwise
+            hit ``end_row``'s ``prev_rect is None`` "no padding" branch
+            and leak the neighbour's vacated cells (#961).
           * ``rect == self.rect`` — steady state. On the second call
             after an ``invalidate`` (where ``prev_rect != rect``), roll
             ``prev_rect`` forward so subsequent paints take the
@@ -230,7 +235,11 @@ class PaneCache:
         ``end_row`` into steady-state regime and under-padding the row.
         """
         if rect is None:
-            if self.rect is not None and self.rect != _SENTINEL_RECT:
+            # Stamp the sentinel for any hidden pane that isn't already
+            # sentinel-marked — including one that was never painted, so
+            # its first-ever appearance full-pads (#961). A no-op only
+            # when already sentinel, keeping repeated hidden frames cheap.
+            if self.rect != _SENTINEL_RECT:
                 self.rect = _SENTINEL_RECT
                 self.lines = []
             return
@@ -243,13 +252,15 @@ class PaneCache:
             self.prev_rect = self.rect
 
 
-# Sentinel rect used by :meth:`PaneCache.update_rect` to mark a cache
-# whose pane was hidden between paints (e.g. layout 'v'/'m'/'pc'
-# children/sep_inner panes when the cursor moves onto a no-children
-# item). Stored in ``cache.rect`` so the next ``update_rect(real_rect)``
-# sees a mismatch and runs ``invalidate``, routing ``end_row`` through
-# the "rect changed → full pad" path and clearing cells the neighbour
-# overwrote while the pane was hidden. The negative-coordinate values
+# Sentinel rect used by :meth:`PaneCache.update_rect` to mark a hidden
+# pane — whether it was just hidden between paints (e.g. layout
+# 'v'/'m'/'pc' children/sep_inner panes when the cursor moves onto a
+# no-children item) or was never painted at all (the same panes when
+# the cursor sits on a childless node from launch, #961). Stored in
+# ``cache.rect`` so the next ``update_rect(real_rect)`` sees a mismatch
+# and runs ``invalidate``, routing ``end_row`` through the "rect changed
+# → full pad" path and clearing cells the neighbour overwrote while the
+# pane was hidden. The negative-coordinate values
 # can never collide with a real screen rect (which uses 1-based positive
 # coords). The sentinel is constructed from a duck-typed shim with the
 # same surface area as ``Rect`` (``__eq__`` / ``__hash__`` / ``height``)
