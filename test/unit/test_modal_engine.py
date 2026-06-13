@@ -50,6 +50,13 @@ _modal.reset_style = _term.reset_style
 _modal.write = _term.write
 _modal.read_key = _term.read_key
 _modal.term_size = _term.term_size
+# Delay-interaction defaults (ticket #971): the engine reads ``time`` and
+# ``input_ready`` as bare names when the per-call seams aren't injected.
+# Wire both so the production-default path (e.g. delay_interaction=False
+# tests that pass no seams) resolves them.
+_modal.input_ready = _term.input_ready
+import time as _time  # noqa: E402  (after the loader wiring block)
+_modal.time = _time
 
 
 Rect = _render.Rect
@@ -90,6 +97,51 @@ def _scripted(keys):
     """Zero-arg callable yielding successive keys (the picker's seam)."""
     it = iter(keys)
     return lambda: next(it)
+
+
+class _KeySource:
+    """A controllable key source for delay-interaction tests.
+
+    Backs BOTH the engine's ``_read_key`` (via :meth:`read`) and its
+    open-time drain poll ``_input_ready`` (via :meth:`pending`). ``drain``
+    keys are the ones the open-time drain should eat (``pending()`` reports
+    True while any remain); ``loop`` keys are what the read loop then sees.
+    Records every key actually read so a test can assert what got drained
+    vs. dispatched.
+    """
+
+    def __init__(self, drain=(), loop=()):
+        self._drain = list(drain)
+        self._loop = list(loop)
+        self.read_log = []
+
+    def pending(self):
+        # Zero-arg poll: True iff the open-time drain still has keys to eat.
+        return bool(self._drain)
+
+    def read(self):
+        # Zero-arg read (the injected-seam contract): serve drain keys
+        # first, then loop keys.
+        key = self._drain.pop(0) if self._drain else self._loop.pop(0)
+        self.read_log.append(key)
+        return key
+
+
+class _FakeClock:
+    """A controllable monotonic clock — a zero-arg callable returning secs.
+
+    Starts at ``start`` and returns the current value WITHOUT advancing, so
+    tests step it explicitly via :meth:`advance`. Deterministic, no sleeps.
+    """
+
+    def __init__(self, start=0.0):
+        self.t = start
+
+    def advance(self, dt):
+        self.t += dt
+
+    def __call__(self):
+        return self.t
 
 
 # --- Stub content ----------------------------------------------------------
@@ -667,6 +719,202 @@ class TestResizeRepaint(unittest.TestCase):
         # _notify drain did NOT run for that iteration: the resize check
         # consumes the wake before the event dispatch.
         self.assertEqual(b.calls['drain_main_queue'], 0)
+
+
+class TestDelayInteraction(unittest.TestCase):
+    """``delay_interaction`` — open-time input drain + threshold gate.
+
+    Deterministic: a ``_KeySource`` backs both the read seam and the
+    open-time ``_input_ready`` poll; a ``_FakeClock`` is the monotonic
+    source; ``_delay_threshold`` is set explicitly. No real sleeps.
+    """
+
+    def setUp(self):
+        _modal.__dict__.pop('g_resize_flag', None)
+        _modal.__dict__.pop('g_screen_lost_flag', None)
+
+    def tearDown(self):
+        _modal.__dict__.pop('g_resize_flag', None)
+        _modal.__dict__.pop('g_screen_lost_flag', None)
+
+    def test_pending_keys_drained_at_open_when_true(self):
+        # Two keys typed at the previous screen are drained at open; the
+        # dialog then dispatches 'enter'. The drained keys never reach
+        # content.handle_key.
+        b = _FakeBrowser()
+        content = _StubContent(key_handler={'enter': (True, 'ok')})
+        src = _KeySource(drain=['x', 'y'], loop=['enter'])
+        clock = _FakeClock()
+        with _FixedTermSize(), _Capture():
+            res = run_modal(
+                b, content, delay_interaction=True,
+                _read_key=src.read, _input_ready=src.pending,
+                _now=clock, _delay_threshold=0.0)
+        self.assertEqual(res, 'ok')
+        # Drain consumed x, y; loop read enter.
+        self.assertEqual(src.read_log, ['x', 'y', 'enter'])
+        # content saw only 'enter' (drained keys discarded).
+        self.assertEqual(content.handled, ['enter'])
+
+    def test_no_drain_when_false(self):
+        # With the default (False), the open-time drain must NOT run even
+        # when _input_ready would report pending keys — the poll is never
+        # consulted, so the "drain" keys stay unread and 'enter' dispatches.
+        b = _FakeBrowser()
+        content = _StubContent(key_handler={'enter': (True, 'ok')})
+        polled = {'n': 0}
+
+        def poll():
+            polled['n'] += 1
+            return True  # would loop forever IF the drain ran
+
+        src = _KeySource(drain=[], loop=['enter'])
+        with _FixedTermSize(), _Capture():
+            res = run_modal(
+                b, content, delay_interaction=False,
+                _read_key=src.read, _input_ready=poll,
+                _now=_FakeClock(), _delay_threshold=0.0)
+        self.assertEqual(res, 'ok')
+        self.assertEqual(polled['n'], 0)  # poll never consulted
+        self.assertEqual(content.handled, ['enter'])
+
+    def test_keys_inside_window_discarded(self):
+        # Threshold 0.5; clock does not advance. Keys 'a','b' arrive inside
+        # the window and are discarded; only after we advance past the
+        # threshold does 'enter' dispatch and close.
+        b = _FakeBrowser()
+        content = _StubContent(key_handler={'enter': (True, 'ok')})
+        clock = _FakeClock(start=100.0)
+
+        # The read seam advances the clock past the gate ONLY when it serves
+        # 'enter', so 'a' and 'b' are read while now() < gate_until.
+        keys = iter(['a', 'b', 'enter'])
+
+        def rk():
+            k = next(keys)
+            if k == 'enter':
+                clock.advance(1.0)  # now past the 0.5 gate
+            return k
+
+        with _FixedTermSize(), _Capture():
+            res = run_modal(
+                b, content, delay_interaction=True,
+                _read_key=rk, _input_ready=lambda: False,
+                _now=clock, _delay_threshold=0.5)
+        self.assertEqual(res, 'ok')
+        # 'a' and 'b' were discarded by the gate; only 'enter' dispatched.
+        self.assertEqual(content.handled, ['enter'])
+
+    def test_key_after_window_dispatched(self):
+        # A single key that arrives AFTER the window dispatches normally.
+        # ``gate_until`` is computed from the first-paint time, so the clock
+        # must advance past the threshold after open — done in the read seam.
+        b = _FakeBrowser()
+        content = _StubContent(key_handler={'enter': (True, 'ok')})
+        clock = _FakeClock(start=0.0)
+
+        def rk():
+            clock.advance(1.0)  # now past the 0.5 gate (set at first paint)
+            return 'enter'
+
+        with _FixedTermSize(), _Capture():
+            res = run_modal(
+                b, content, delay_interaction=True,
+                _read_key=rk, _input_ready=lambda: False,
+                _now=clock, _delay_threshold=0.5)
+        self.assertEqual(res, 'ok')
+        self.assertEqual(content.handled, ['enter'])
+
+    def test_notify_serviced_during_window(self):
+        # Inside the window, '_notify' is still drained (background work
+        # keeps flowing); the normal key after the clock advances dispatches.
+        b = _FakeBrowser()
+        content = _StubContent(key_handler={'enter': (True, 'ok')})
+        clock = _FakeClock(start=0.0)
+        keys = iter(['_notify', 'enter'])
+
+        def rk():
+            k = next(keys)
+            if k == 'enter':
+                clock.advance(1.0)  # past the gate for the final dispatch
+            return k
+
+        with _FixedTermSize(), _Capture():
+            res = run_modal(
+                b, content, delay_interaction=True,
+                _read_key=rk, _input_ready=lambda: False,
+                _now=clock, _delay_threshold=0.5)
+        self.assertEqual(res, 'ok')
+        # _notify drained even though we were inside the window.
+        self.assertEqual(b.calls['drain_main_queue'], 1)
+        self.assertEqual(b.calls['apply_children_results'], 1)
+        self.assertEqual(content.handled, ['enter'])
+
+    def test_channel_event_serviced_during_window(self):
+        # '_writable' is serviced inside the window too (a streaming recipe
+        # behind the dialog keeps draining output).
+        b = _FakeBrowser()
+        content = _StubContent(key_handler={'enter': (True, 'ok')})
+        clock = _FakeClock(start=0.0)
+        keys = iter(['_writable', 'enter'])
+
+        def rk():
+            k = next(keys)
+            if k == 'enter':
+                clock.advance(1.0)
+            return k
+
+        with _FixedTermSize(), _Capture():
+            res = run_modal(
+                b, content, delay_interaction=True,
+                _read_key=rk, _input_ready=lambda: False,
+                _now=clock, _delay_threshold=0.5)
+        self.assertEqual(res, 'ok')
+        self.assertEqual(b.calls['drain_output'], 1)
+        self.assertEqual(content.handled, ['enter'])
+
+    def test_default_false_no_gating(self):
+        # Sanity: with no delay-interaction args at all (the production
+        # default for everything ctx exposes), the very first key dispatches
+        # with no drain and no gate — existing behavior intact.
+        b = _FakeBrowser()
+        content = _StubContent(key_handler={'enter': (True, 'ok')})
+        with _FixedTermSize(), _Capture():
+            res = run_modal(b, content, _read_key=_scripted(['enter']))
+        self.assertEqual(res, 'ok')
+        self.assertEqual(content.handled, ['enter'])
+
+    def test_esc_gated_during_window(self):
+        # Even esc/ctrl-c can't dismiss the dialog inside the window — the
+        # gate sits above the cancel branch. esc inside the window is
+        # discarded; esc after the clock advances cancels to None.
+        b = _FakeBrowser()
+        content = _StubContent(key_handler={'enter': (True, 'x')})
+        clock = _FakeClock(start=0.0)
+        keys = iter(['esc', 'esc'])
+
+        def rk():
+            k = next(keys)
+            return k
+
+        # First esc inside window (discarded), then advance and second esc
+        # cancels. Advance via a side channel: read twice, advancing between.
+        reads = {'n': 0}
+
+        def rk2():
+            reads['n'] += 1
+            if reads['n'] == 2:
+                clock.advance(1.0)
+            return 'esc'
+
+        with _FixedTermSize(), _Capture():
+            res = run_modal(
+                b, content, delay_interaction=True,
+                _read_key=rk2, _input_ready=lambda: False,
+                _now=clock, _delay_threshold=0.5)
+        self.assertIsNone(res)  # cancelled by the second esc
+        self.assertEqual(reads['n'], 2)  # first esc was gated, not a cancel
+        self.assertEqual(content.handled, [])  # esc never reaches content
 
 
 if __name__ == '__main__':

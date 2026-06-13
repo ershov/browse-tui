@@ -118,6 +118,16 @@ def _modal_place(cols, rows, w, h, *, placement, anchor):
 _MODAL_POISON = '\x00\x00MODAL\x00\x00'
 
 
+# Grace period (seconds, ``time.monotonic`` scale) after a
+# ``delay_interaction=True`` dialog's first paint during which normal
+# keystrokes are discarded — see ``run_modal`` and the design's "Delayed
+# interaction". Stops a dialog the user didn't ask for (a background error,
+# an async event) from eating keys they were typing at the previous screen.
+# Injectable per-call via ``run_modal(..., _delay_threshold=...)``; tests
+# pass 0.0 to disable the gate deterministically.
+_MODAL_INTERACTION_DELAY = 0.5
+
+
 def _rects_intersect(a, b):
     """Return the overlapping :class:`Rect`, or ``None`` if they're disjoint.
 
@@ -139,7 +149,8 @@ def _rects_intersect(a, b):
 
 
 def run_modal(browser, content, *, placement='center', anchor=None,
-              delay_interaction=False, _read_key=None):
+              delay_interaction=False, _read_key=None,
+              _delay_threshold=None, _now=None, _input_ready=None):
     """Run one blocking modal dialog to completion; return its result.
 
     A modal dialog is the single overlay window the framework allows at a
@@ -164,14 +175,38 @@ def run_modal(browser, content, *, placement='center', anchor=None,
         dialog and makes ``run_modal`` return ``result``.
 
     ``placement`` / ``anchor`` are forwarded to :func:`_modal_place`.
-    ``delay_interaction`` is accepted and threaded for API stability but is
-    a no-op in this slice (its behavior — draining/ignoring keystrokes the
-    user typed at the previous screen — lands in a later ticket; the default
-    ``False`` changes nothing). ``_read_key`` is the test-injection seam: a
-    callable returning decoded key names, defaulting to the terminal layer's
-    ``read_key``. The injected variant is called with NO arguments (matching
-    the picker's scripted-key tests); only the real ``read_key`` is handed
-    the channel fds — see the read step below.
+
+    ``delay_interaction`` distinguishes a dialog the user asked for from one
+    that appears on its own (a background error, an async event). When
+    ``True`` (default ``False`` — unchanged behavior for everything ``ctx``
+    exposes today):
+
+      * At open, pending input is drained (``while _input_ready():
+        read_key()``, discarded) so keystrokes the user typed at the
+        PREVIOUS screen don't instantly dismiss the dialog.
+      * Until ``_delay_threshold`` seconds have elapsed since the first
+        paint, NORMAL keys are discarded; ``'_notify'`` / ``'_writable'`` /
+        ``'_stdin'`` and resize/screen-lost are still serviced (a streaming
+        recipe behind the dialog keeps running, the dialog still repaints on
+        resize). After the window, keys dispatch as usual.
+
+    Injection seams (all default to production behavior; tests pass
+    deterministic stand-ins so there are no real sleeps):
+
+      * ``_read_key`` — callable returning decoded key names; defaults to the
+        terminal layer's ``read_key``. The injected variant is called with NO
+        arguments (matching the picker's scripted-key tests); only the real
+        ``read_key`` is handed the channel fds (see the read step below).
+      * ``_delay_threshold`` — grace-period length in seconds; defaults to
+        ``_MODAL_INTERACTION_DELAY``. Tests pass ``0.0`` to disable the gate.
+      * ``_now`` — monotonic clock, a zero-arg callable returning seconds;
+        defaults to ``time.monotonic``. Tests pass a controllable source.
+      * ``_input_ready`` — zero-arg "is a key buffered right now?" poll used
+        ONLY by the open-time drain; defaults to the terminal layer's
+        ``input_ready``. Tests pass a stand-in that simulates N pending keys
+        then empty. (The drain reads discarded keys through the same key
+        source the loop uses — ``_read_key`` when injected, else the real
+        ``read_key`` — so a deterministic test drives both from one script.)
 
     Raises ``RuntimeError`` if a modal is already open: one window at a time
     is a hard invariant, so re-entry is a programming error.
@@ -180,15 +215,30 @@ def run_modal(browser, content, *, placement='center', anchor=None,
         raise RuntimeError('run_modal: a modal dialog is already open')
     browser._modal_open = True
 
-    # ``delay_interaction`` is threaded but unused this slice; bind it so
-    # linters/readers see it's intentional rather than dropped.
-    _ = delay_interaction
-
     # The real terminal ``read_key`` takes the channel fds; the injected
     # test seam is a zero-arg callable. Branch once here so the loop body
     # stays uniform.
     injected = _read_key is not None
     rk = _read_key if injected else read_key
+
+    # Resolve the delay-interaction seams to their production defaults. All
+    # three are bare names in the concatenated build (``time`` is imported in
+    # 040-state, ``input_ready`` in 020-terminal); the isolated test load
+    # wires them or passes explicit stand-ins.
+    threshold = _delay_threshold if _delay_threshold is not None \
+        else _MODAL_INTERACTION_DELAY
+    now = _now if _now is not None else time.monotonic
+    poll_ready = _input_ready if _input_ready is not None else input_ready
+
+    # Open-time input drain (design §"Delayed interaction"): eat keystrokes
+    # the user typed at the previous screen so an unexpectedly-appearing
+    # dialog isn't instantly dismissed. Reads go through the same key source
+    # the loop uses (``rk``) so a scripted test drives drain + loop from one
+    # stream; ``poll_ready`` decides when to stop. Only for self-appearing
+    # dialogs — user-invoked ones (``delay_interaction=False``) skip it.
+    if delay_interaction:
+        while poll_ready():
+            rk()  # discard
 
     # Private row cache: the dialog paints through the same differential
     # machinery as the panes, but its cache is NEVER registered in
@@ -270,6 +320,10 @@ def run_modal(browser, content, *, placement='center', anchor=None,
     try:
         frame, content_h = _measure_frame()
         _paint(frame, content_h)
+        # Start the interaction-grace clock at the first paint. With
+        # ``delay_interaction=False`` the gate below is never consulted, so
+        # this is only meaningful for self-appearing dialogs.
+        gate_until = now() + threshold if delay_interaction else None
 
         while True:
             if injected:
@@ -326,6 +380,16 @@ def run_modal(browser, content, *, placement='center', anchor=None,
                 # time ``'all'`` absorbs them.
                 browser.drain_main_queue()
                 browser.apply_children_results()
+                continue
+
+            # Interaction-grace gate (design §"Delayed interaction"): for a
+            # self-appearing dialog, discard NORMAL keys (everything that
+            # reached here — channel/notify/resize already handled and
+            # continued above) until the grace window since first paint
+            # elapses. This sits below the channel handlers so a streaming
+            # recipe keeps running during the window, and above cancel /
+            # content so even esc/ctrl-c can't fire early.
+            if gate_until is not None and now() < gate_until:
                 continue
 
             # Mouse events are swallowed (no in-dialog mouse this round).
