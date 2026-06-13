@@ -11,6 +11,7 @@ real terminal) are deferred to ticket #14's UI tests.
 """
 
 import unittest
+from unittest import mock
 
 from test.unit._loader import load
 
@@ -440,6 +441,38 @@ class TestRunExternalHeadless(unittest.TestCase):
             self.assertNotEqual(rc, 0)
         finally:
             b.stop_workers()
+
+
+class TestRunExternalKeepScreen(unittest.TestCase):
+    """run_external threads ``keep_screen`` through to ``term_suspend``."""
+
+    def _suspend_kwarg(self, **run_external_kw):
+        # Exercise the non-headless path with the terminal handoff stubbed:
+        # capture what keep_screen term_suspend is called with.
+        b = _make_browser()
+        b._headless = False
+        captured = {}
+        with mock.patch.object(
+                _context, 'term_suspend',
+                lambda keep_screen=False: captured.__setitem__('ks', keep_screen)), \
+             mock.patch.object(_context, 'term_resume', lambda: None), \
+             mock.patch.object(_context, 'term_child_fds',
+                               lambda: (None, None), create=True), \
+             mock.patch.object(_context.subprocess, 'run',
+                               return_value=mock.Mock(returncode=0)):
+            try:
+                rc = ctx_rc = Context(b).run_external(['true'], **run_external_kw)
+            finally:
+                b._headless = True
+                b.stop_workers()
+        self.assertEqual(ctx_rc, 0)
+        return captured['ks']
+
+    def test_keep_screen_true_threads_through(self):
+        self.assertTrue(self._suspend_kwarg(keep_screen=True))
+
+    def test_default_is_false(self):
+        self.assertFalse(self._suspend_kwarg())
 
 
 # --- input (headless) -----------------------------------------------------

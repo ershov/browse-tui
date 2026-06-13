@@ -834,15 +834,18 @@ class _EnterCtx:
     """A ``ctx`` stand-in for ``_on_enter`` / launch tests.
 
     ``cursor`` is the row Enter fires on; ``run_external`` records the argv
-    each call receives so a test can assert what was launched.
+    and the ``keep_screen`` flag each call receives so a test can assert
+    both what was launched and how.
     """
 
     def __init__(self, cursor):
         self.cursor = cursor
         self.calls = []
+        self.keep_screen = None
 
-    def run_external(self, cmd, env=None):
+    def run_external(self, cmd, env=None, *, keep_screen=False):
         self.calls.append(cmd)
+        self.keep_screen = keep_screen
         return 0
 
 
@@ -984,6 +987,8 @@ class TestMdLauncher(unittest.TestCase):
         self.assertIn('--root', cmd)
         # --root value is the project root (here: the file's own dir).
         self.assertEqual(cmd[cmd.index('--root') + 1], self.r._project_root_for(a))
+        # browse-md owns the alt screen, so the launch keeps it (no flicker).
+        self.assertTrue(ctx.keep_screen)
 
     def test_enter_on_regular_file_row_edits(self):
         a = self._w('a.md', '# A\n')

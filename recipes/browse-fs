@@ -336,8 +336,13 @@ def _launch_browse_md(ctx, target):
     ``--root`` anchors browse-md's cross-file reference resolution at the
     target's project root (git root, else its own directory), so links inside
     the opened document resolve the same way they do here.
+
+    ``keep_screen=True``: browse-md owns the alternate screen itself, so we
+    hand it over without dropping back to the primary screen first (no
+    flicker between the two full-screen UIs).
     """
-    ctx.run_external(['browse-md', target, '--root', _project_root_for(target)])
+    ctx.run_external(['browse-md', target, '--root', _project_root_for(target)],
+                     keep_screen=True)
 
 
 def _on_enter(ctx):

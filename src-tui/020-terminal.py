@@ -753,7 +753,7 @@ def term_release_result_fd():
     _saved_stdout_fd = -1
     _stdout_was_tty = False
 
-def _leave_raw():
+def _leave_raw(keep_screen=False):
     """Restore termios and leave alternate screen, but keep the notification pipe.
 
     No-op unless raw mode is actually entered (``_in_raw``). This keeps
@@ -766,12 +766,27 @@ def _leave_raw():
     None`` guard: ``_leave_raw`` inside ``term_restore`` clears ``_in_raw``
     before the writer is nulled, so the byte-write and ``termios`` call below
     are never reached after teardown.
+
+    ``keep_screen=True`` is for handing the terminal to another full-screen
+    application that owns the alternate screen itself (launching another
+    browse-tui recipe): mouse tracking and the cursor are reset and termios
+    is restored, but we STAY on the alternate screen (no ``\\033[?1049l``)
+    and emit no clear -- so there is no flash of the primary screen between
+    our UI and the child's, and the child paints over our buffer on init.
+    The default leaves the alt screen, as teardown and a plain editor/pager
+    need.
     """
     global _in_raw
     if not _in_raw:
         return
-    # Disable mouse tracking, show cursor, leave alternate screen
-    _tty_writer.buffer.write(b'\033[?1006l\033[?1000l\033[?25h\033[?1049l')
+    # Disable mouse tracking, show cursor; also leave the alternate screen
+    # UNLESS we're handing off to a child that owns it (keep_screen) -- then
+    # staying on the alt screen avoids a primary-screen flash, and we emit no
+    # clear so the child's own init paints over our buffer.
+    if keep_screen:
+        _tty_writer.buffer.write(b'\033[?1006l\033[?1000l\033[?25h')
+    else:
+        _tty_writer.buffer.write(b'\033[?1006l\033[?1000l\033[?25h\033[?1049l')
     _tty_writer.buffer.flush()
     if _saved_termios is not None:
         termios.tcsetattr(_tty_fd_in, termios.TCSAFLUSH, _saved_termios)
@@ -817,9 +832,14 @@ def term_restore():
 
 # ---- suspend / resume for shelling out -----------------------------------
 
-def term_suspend():
-    """Restore terminal for an external command (editor, pager, etc.)."""
-    _leave_raw()
+def term_suspend(keep_screen=False):
+    """Restore terminal for an external command (editor, pager, etc.).
+
+    ``keep_screen=True`` stays on the alternate screen and emits no clear,
+    for handing off to a child that manages its own full screen (another
+    browse-tui recipe) without a primary-screen flash -- see ``_leave_raw``.
+    """
+    _leave_raw(keep_screen)
 
 def term_resume():
     """Re-enter raw mode and alternate screen after an external command."""

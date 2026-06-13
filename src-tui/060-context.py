@@ -683,12 +683,20 @@ class Context:
 
     # ---- main-thread sub-flows ----------------------------------------
 
-    def run_external(self, cmd, env=None) -> int:
+    def run_external(self, cmd, env=None, *, keep_screen=False) -> int:
         """Suspend the terminal, run ``cmd``, then resume.
 
         ``cmd`` is either a list of argv strings or a shell string (the
         latter triggers ``shell=True``). ``env`` is merged with the
         parent environment — pass ``None`` to inherit unchanged.
+
+        ``keep_screen=True`` hands the terminal to a child that owns the
+        alternate screen itself (e.g. launching another browse-tui recipe):
+        the pre-launch suspend stays on the alt screen and emits no clear, so
+        there is no flash of the primary screen before the child paints over
+        our buffer. Resume is unchanged (re-enters the alt screen and forces a
+        full repaint once the child exits). The default fully leaves the alt
+        screen, as a plain editor/pager needs.
 
         Returns the subprocess exit code, or ``-1`` if launching the
         process raised. Errors are also surfaced via ``ctx.error``.
@@ -708,7 +716,7 @@ class Context:
         """
         child_fds = {}
         if not self._browser._headless:
-            term_suspend()
+            term_suspend(keep_screen=keep_screen)
             in_fd, out_fd = term_child_fds()
             child_fds = {'stdin': in_fd, 'stdout': out_fd, 'stderr': out_fd}
         try:
