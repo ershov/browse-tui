@@ -41,6 +41,18 @@ except Exception:
 _MD_COLOR = _md2ansi_fn is not None  # default on when available
 _BROWSER = None  # set in main() — used for preview-width lookup
 
+# Optional md_doc plugin — gates the markdown launcher rows: a *.md row
+# expands into browse-md launcher targets (the file itself + the .md files
+# it links to). Inert when md_doc isn't importable, exactly like the
+# md2ansi_lib gate above — *.md rows then stay plain leaves.
+try:
+    import md_doc as _md_doc
+except Exception:
+    _md_doc = None
+
+# File extensions that get a markdown launcher subtree.
+_MD_EXTS = ('.md', '.MD')
+
 # Stdin-list mode (the ``browse-fs -`` argument). ``main()`` reads the
 # newline-separated paths from ``sys.stdin`` once, before the UI starts,
 # and stores them here as a list of ``(label, abspath)`` pairs in input
@@ -106,9 +118,90 @@ def _stdin_root_item(label, path):
         return Item(id=('missing', label, path),
                     title=label, tag='missing', tag_style='dim')
     is_dir = stat.S_ISDIR(st.st_mode)
-    item = Item(id=path, title=label, has_children=is_dir)
+    item = Item(id=path, title=label,
+                has_children=is_dir or _md_launchable(path))
     _set_columns(item, st, is_dir)
     return item
+
+
+def _md_launchable(path):
+    """True if ``path`` is a markdown file we offer a browse-md launcher for.
+
+    Pure extension check (no I/O), cheap enough to call at listing time for
+    every row. Gated on ``md_doc`` being importable — absent it, the whole
+    launcher feature is inert and *.md rows stay leaves.
+    """
+    return _md_doc is not None and isinstance(path, str) and path.endswith(_MD_EXTS)
+
+
+def _project_root_for(abspath):
+    """Project-root resolution base for ``abspath`` — its git root, else its dir."""
+    d = os.path.dirname(abspath)
+    if _md_doc is not None:
+        return _md_doc.find_git_root(d) or d
+    return d
+
+
+def _md_ref_label(abspath, project_root):
+    """Display label for a launcher target, anchored like the design's ref labels.
+
+    Relative to ``project_root`` when the target is inside it, else a
+    ``~``-collapsed absolute path — so the flat launcher list reads cleanly
+    without ``../`` noise.
+    """
+    if project_root and (abspath == project_root
+                         or abspath.startswith(project_root.rstrip('/') + '/')):
+        return os.path.relpath(abspath, project_root)
+    home = os.path.expanduser('~')
+    if abspath == home or abspath.startswith(home + os.sep):
+        return '~' + abspath[len(home):]
+    return abspath
+
+
+def _launcher_item(parent_path, target_abspath, project_root):
+    """One ``»``-prefixed launcher row that opens ``target_abspath`` in browse-md.
+
+    Leaf row with a generic launch id ``('launch', parent_path, 'md-file',
+    target_abspath)`` — the id stores *what* to launch, not the command line
+    (built at Enter time). The ``»`` title prefix signals that Enter launches
+    an external browser rather than expanding or editing.
+    """
+    return Item(id=('launch', parent_path, 'md-file', target_abspath),
+                title='» ' + _md_ref_label(target_abspath, project_root),
+                tag='md', tag_style='blue', has_children=False)
+
+
+def _md_launcher_children(path):
+    """Launcher rows for a *.md file row: the file itself, then its links.
+
+    The self-open row comes first (so a *.md row always has >=1 child — no
+    empty-subtree self-heal needed), followed by one row per DISTINCT, EXISTING
+    ``.md`` file the document references (``md_doc.find_md_refs`` +
+    ``resolve_md_ref``, anchored on the file's own directory / cwd / project
+    root), sorted by display label. An unreadable file still yields the lone
+    self-open row.
+    """
+    project_root = _project_root_for(path)
+    rows = [_launcher_item(path, path, project_root)]
+    try:
+        with open(path, 'rb') as f:
+            text = f.read(100 * 1024 * 1024).decode('utf-8', errors='replace')
+    except OSError:
+        return rows
+    doc_dir = os.path.dirname(path)
+    cwd = os.getcwd()
+    seen = {os.path.realpath(path)}
+    targets = []
+    for captured in _md_doc.find_md_refs(text):
+        ab = _md_doc.resolve_md_ref(captured, doc_dir=doc_dir, cwd=cwd,
+                                    project_root=project_root)
+        if ab is None or ab in seen:
+            continue
+        seen.add(ab)
+        targets.append(ab)
+    targets.sort(key=lambda ab: _md_ref_label(ab, project_root))
+    rows.extend(_launcher_item(path, ab, project_root) for ab in targets)
+    return rows
 
 
 def get_children(path, *, reload=False):
@@ -121,6 +214,10 @@ def get_children(path, *, reload=False):
                 for label, abspath in _STDIN_ROOTS]
     if not path:
         path = os.getcwd()
+    # A markdown file row expands into browse-md launcher rows (the file
+    # itself + the .md files it links to) rather than a directory scan.
+    if _md_launchable(path) and os.path.isfile(path):
+        return _md_launcher_children(path)
     try:
         entries = list(os.scandir(path))
     except OSError as e:
@@ -135,7 +232,8 @@ def get_children(path, *, reload=False):
             continue
         is_dir = stat.S_ISDIR(st.st_mode)
         title = d.name + ('/' if is_dir else '')
-        item = Item(id=d.path, title=title, has_children=is_dir)
+        item = Item(id=d.path, title=title,
+                    has_children=is_dir or _md_launchable(d.path))
         _set_columns(item, st, is_dir)
         items.append(item)
     return items
@@ -189,6 +287,10 @@ def get_preview(path):
             return label  # raced into existence between list and preview
         except OSError as e:
             return f'{label}\n\n[missing] {e}'
+    if isinstance(path, tuple) and path and path[0] == 'launch':
+        # ('launch', parent, 'md-file', target): show what would open — the
+        # target file, rendered through the same path as a normal file row.
+        return get_preview(path[3])
     try:
         if os.path.isdir(path):
             return _dir_listing(path)
@@ -219,6 +321,32 @@ def edit(ctx):
         return
     editor = os.environ.get('EDITOR', 'vi')
     ctx.run_external([editor, ctx.cursor.id])
+
+
+def _launch_browse_md(ctx, target):
+    """Open ``target`` (a markdown file path) in browse-md as an external process.
+
+    ``--root`` anchors browse-md's cross-file reference resolution at the
+    target's project root (git root, else its own directory), so links inside
+    the opened document resolve the same way they do here.
+    """
+    ctx.run_external(['browse-md', target, '--root', _project_root_for(target)])
+
+
+def _on_enter(ctx):
+    """Enter dispatch: launch on a ``»`` launcher row, else edit (the default).
+
+    A launcher row carries a ``('launch', …, target)`` id — Enter opens its
+    target in browse-md. Every other row keeps browse-fs's original Enter
+    behaviour (edit the cursor in ``$EDITOR``).
+    """
+    cur = ctx.cursor
+    if cur is None:
+        return
+    if isinstance(cur.id, tuple) and cur.id and cur.id[0] == 'launch':
+        _launch_browse_md(ctx, cur.id[3])
+        return
+    edit(ctx)
 
 
 def open_(ctx):
@@ -370,7 +498,7 @@ def main():
         format_row_content=fs_row_content,
         root_id=root,
         actions=actions,
-        on_enter='action:e',
+        on_enter=_on_enter,
         help_intro=_HELP_INTRO,
     ))
     _BROWSER = b
