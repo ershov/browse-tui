@@ -540,13 +540,24 @@ def _enter_raw():
     terminal device, which is shared with the writable side in every
     supported configuration (single-device, and ``--tty -`` where both
     fds are the std streams of one pty).
+
+    The alt-screen enter is followed by an explicit clear (``\\033[2J``):
+    ``?1049h`` only clears the alt buffer when it actually *switches* into
+    it, which it does NOT when we are handed an already-active alt screen by
+    a parent recipe that kept it (``run_external(keep_screen=True)``). The
+    differential renderer dropped the historical blanket clear and relies on
+    a blank buffer at entry, so without this a nested child would paint over
+    the parent's UI and leave its untouched cells showing through. In the
+    normal (own-switch) case the buffer is already blank, so the clear is a
+    cheap no-op.
     """
     global _saved_termios, _in_raw
     if _saved_termios is None:
         _saved_termios = termios.tcgetattr(_tty_fd_in)
     tty.setraw(_tty_fd_in)
-    # Alternate screen buffer, hide cursor, enable SGR mouse tracking
-    _tty_writer.buffer.write(b'\033[?1049h\033[?25l\033[?1000h\033[?1006h')
+    # Alternate screen buffer, clear it (see docstring), home the cursor,
+    # hide the cursor, enable SGR mouse tracking.
+    _tty_writer.buffer.write(b'\033[?1049h\033[2J\033[H\033[?25l\033[?1000h\033[?1006h')
     _tty_writer.buffer.flush()
     # Mark raw entered only now -- after the enter-bytes are out -- so a
     # tcgetattr failure above (the --tty - piped case) leaves _in_raw False

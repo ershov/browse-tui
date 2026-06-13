@@ -1,17 +1,20 @@
-"""term_suspend(keep_screen=...) — stay on the alt screen for a TUI child.
+"""Alt-screen entry/suspend control bytes for cross-recipe handoff.
 
-A plain editor/pager needs the terminal back on the primary screen, so the
+``term_suspend(keep_screen=...)`` stays on the alt screen for a TUI child:
+a plain editor/pager needs the terminal back on the primary screen, so the
 default suspend emits the leave-alt-screen sequence (``\\033[?1049l``).
 Handing off to another full-screen app that owns the alt screen itself
 (launching another browse-tui recipe) must NOT leave the alt screen —
 otherwise the primary screen flashes between the two UIs — and must emit no
-clear. These tests assert exactly which control bytes each mode writes, with
-the ``termios`` call short-circuited (``_saved_termios=None``) so no real
-device is needed.
+clear. Symmetrically, ``_enter_raw`` clears the alt buffer on entry so the
+child handed that kept alt screen starts from a blank canvas. These tests
+assert exactly which control bytes each path writes, with the device calls
+short-circuited so no real terminal is needed.
 """
 
 import io
 import unittest
+from unittest import mock
 
 from test.unit._loader import load
 
@@ -70,6 +73,31 @@ class TestSuspendKeepScreen(unittest.TestCase):
     def test_term_suspend_threads_keep_screen(self):
         self.assertNotIn(_LEAVE_ALT, self._emit(keep_screen=True, via_suspend=True))
         self.assertIn(_LEAVE_ALT, self._emit(keep_screen=False, via_suspend=True))
+
+
+class TestEnterRawClearsScreen(unittest.TestCase):
+    """Entering the alt screen clears it (``\\033[2J``).
+
+    ``?1049h`` clears only when it actually switches into the alt buffer, NOT
+    when a parent recipe kept the alt screen active for us
+    (``run_external(keep_screen=True)``). The explicit clear gives such a
+    nested child a blank canvas so the parent's UI doesn't show through.
+    """
+
+    def test_enter_raw_clears_after_alt_enter(self):
+        term = load('_term_enter_under_test', '020-terminal.py')
+        term._saved_termios = object()   # skip tcgetattr (no real fd needed)
+        term._in_raw = False
+        term._tty_fd_in = -1
+        term._tty_writer = _Writer()
+        with mock.patch.object(term.tty, 'setraw', lambda fd: None):
+            term._enter_raw()
+        out = term._tty_writer.buffer.getvalue()
+        self.assertIn(b'\033[?1049h', out)        # entered the alt screen
+        self.assertIn(b'\033[2J', out)            # ...and cleared it
+        self.assertTrue(term._in_raw)
+        # The clear must come AFTER the alt-screen enter (right buffer).
+        self.assertLess(out.index(b'\033[?1049h'), out.index(b'\033[2J'))
 
 
 if __name__ == '__main__':
