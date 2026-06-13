@@ -1,4 +1,4 @@
-"""UI tests for ctx.pick — fzf-style sub-picker (ticket #20).
+"""UI tests for ctx.pick — fzf-style selection in a modal dialog.
 
 Drives the picker end-to-end: launches the pick_demo recipe in a real
 terminal under tmux, presses the bound key 's' to invoke the picker,
@@ -6,6 +6,14 @@ then exercises filter / cursor / select / cancel paths. The recipe
 writes the chosen string (or '<cancelled>') to a tempfile and quits;
 each test polls that file to confirm the picker returned the expected
 value.
+
+``ctx.pick`` opens a centered modal dialog (ticket #975): the label
+renders in the box border (``┌─ Status ─…─┐``) and the filter prompt is
+a ``> {query}`` row, so the picker no longer shows the old info-bar
+``Status>`` string. Tests detect "picker open" by an option line that
+isn't in the underlying UI (``in-progress``), and assert the chosen
+value via the recipe's recorded log rather than by the selected row's
+text (tmux text capture is blind to the reverse-video highlight).
 """
 
 import os
@@ -56,8 +64,9 @@ class TestPick(unittest.TestCase):
                 t.launch(_BIN, '--run-py', _RECIPE)
                 t.wait_for('item one')
                 t.send('s')
-                # Wait for the picker prompt to appear on the info bar.
-                t.wait_for('Status>')
+                # Wait for the modal to open — an option line that isn't in
+                # the underlying UI confirms the dialog is up.
+                t.wait_for('in-progress')
                 # 'in' filters to 'in-progress'; enter selects.
                 t.send('i')
                 t.send('n')
@@ -73,7 +82,7 @@ class TestPick(unittest.TestCase):
                 t.launch(_BIN, '--run-py', _RECIPE)
                 t.wait_for('item one')
                 t.send('s')
-                t.wait_for('Status>')
+                t.wait_for('in-progress')
                 t.send('Escape')
                 content = _read_log_when_ready(log)
             self.assertEqual(content, '<cancelled>')
@@ -91,11 +100,12 @@ class TestPick(unittest.TestCase):
                 t.launch(_BIN, '--run-py', _RECIPE)
                 t.wait_for('item one')
                 t.send('s')
-                t.wait_for('Status>')
+                t.wait_for('in-progress')
+                # Type the filter then select; assert the recorded OUTCOME
+                # rather than the on-screen filtered list (the filter row's
+                # repaint isn't a reliable synchronization point under tmux,
+                # but the filter logic narrows to the unique match).
                 t.type('do')
-                # Wait for query echo so subsequent Enter applies to the
-                # filtered list (not the unfiltered one).
-                t.wait_for('Status> do', timeout=2.0)
                 t.send('Enter')
                 content = _read_log_when_ready(log)
             self.assertEqual(content, 'done')
@@ -108,8 +118,10 @@ class TestPick(unittest.TestCase):
                 t.launch(_BIN, '--run-py', _RECIPE)
                 t.wait_for('item one')
                 t.send('s')
-                t.wait_for('Status>')
-                # Down twice from 'open' lands on 'done' (3rd item).
+                t.wait_for('in-progress')
+                # Down twice from 'open' lands on 'done' (3rd item). The
+                # selected row is reverse-video (invisible to text capture),
+                # so we assert the OUTCOME via the recipe's recorded log.
                 t.send('Down')
                 t.send('Down')
                 t.send('Enter')
@@ -118,15 +130,13 @@ class TestPick(unittest.TestCase):
 
 
 class TestPickRedrawOnExit(unittest.TestCase):
-    """Regression: after pick() returns to the UI, the overlay repaints away.
+    """Regression: after pick() returns to the UI, the dialog repaints away.
 
-    Ticket #719. The picker draws its prompt + options directly to the
-    screen, bypassing the per-pane row cache. When the picking action
-    returns to the UI (instead of quitting), the next render must fully
-    repaint the regular UI over the overlay. Before the fix the renderer
-    cache-hit every unchanged row and emitted nothing, so the ``Status>``
-    prompt and the option list (notably the last option, on an otherwise
-    blank preview row) stayed on screen.
+    Ticket #719 / #975. The modal dialog paints over the regular UI through
+    a private row cache; on close it poisons the intersecting pane-cache
+    rows so the next render fully repaints the regular UI over the dialog
+    cells (cache-poison restore). If that restore regressed, the dialog's
+    box border / title / option rows would survive on screen.
 
     The no-quit recipe stays running so we can capture the post-pick
     screen — the quit-after-pick path can't show the bug because teardown
@@ -134,10 +144,22 @@ class TestPickRedrawOnExit(unittest.TestCase):
     """
 
     def _assert_ui_restored(self, t):
-        cap = t.wait_for('PREVIEW-LINE-ONE', timeout=3.0)
-        # Picker chrome must be gone.
-        self.assertNotIn('Status>', cap,
-                         f'picker prompt left on screen:\n{cap}')
+        # The centered dialog only partially covers the preview pane, so
+        # waiting for preview text to reappear would race the restore
+        # repaint (the text is visible even while the box is up). Poll for
+        # the dialog box's top border to DISAPPEAR — that's the actual
+        # cache-poison-restore signal.
+        deadline = time.time() + 3.0
+        cap = t.capture()
+        while time.time() < deadline and '┌' in cap:
+            time.sleep(0.03)
+            cap = t.capture()
+        # Dialog chrome must be gone: no box-border glyphs, no title.
+        for glyph in ('┌', '┐', '└', '┘', '│'):
+            self.assertNotIn(glyph, cap,
+                             f'dialog border {glyph!r} left on screen:\n{cap}')
+        self.assertNotIn('Status', cap,
+                         f'dialog title left on screen:\n{cap}')
         for opt in ('open', 'in-progress', 'done', 'wontfix'):
             self.assertNotIn(opt, cap,
                              f'picker option {opt!r} left on screen:\n{cap}')
@@ -151,7 +173,7 @@ class TestPickRedrawOnExit(unittest.TestCase):
             t.launch(_BIN, '--run-py', _NOQUIT_RECIPE)
             t.wait_for('ALPHA-ROW')
             t.send('s')
-            t.wait_for('Status>')
+            t.wait_for('in-progress')
             t.send('Escape')
             self._assert_ui_restored(t)
 
@@ -160,7 +182,7 @@ class TestPickRedrawOnExit(unittest.TestCase):
             t.launch(_BIN, '--run-py', _NOQUIT_RECIPE)
             t.wait_for('ALPHA-ROW')
             t.send('s')
-            t.wait_for('Status>')
+            t.wait_for('in-progress')
             t.send('Enter')
             self._assert_ui_restored(t)
 

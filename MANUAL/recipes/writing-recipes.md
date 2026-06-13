@@ -118,7 +118,7 @@ See [api.md](../api.md#browserfrom_flat_treerows--root_idnone-kwargs-class-metho
 
 ```python
 def delete(ctx):
-    if not ctx.confirm(f'delete {len(ctx.targets)} items?'):
+    if ctx.confirm(f'delete {len(ctx.targets)} items?') != 'Yes':
         return
     for it in ctx.targets:
         os.remove(it.id)

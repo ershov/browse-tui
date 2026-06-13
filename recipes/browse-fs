@@ -234,7 +234,7 @@ def delete(ctx):
     if not targets:
         return
     label = targets[0].id if len(targets) == 1 else f'{len(targets)} items'
-    if not ctx.confirm(f'delete {label}?'):
+    if ctx.confirm(f'delete {label}?') != 'Yes':
         return
     for it in targets:
         try:

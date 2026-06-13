@@ -469,11 +469,13 @@ class TestInputHeadless(unittest.TestCase):
 
 class TestConfirmHeadless(unittest.TestCase):
 
-    def test_returns_false_in_headless(self):
+    def test_returns_none_in_headless(self):
         b = _make_browser()
         try:
             ctx = Context(b)
-            self.assertFalse(ctx.confirm('proceed?'))
+            # Contract change: confirm now returns the chosen label or None;
+            # headless yields None (the no-open, safe-default outcome).
+            self.assertIsNone(ctx.confirm('proceed?'))
         finally:
             b.stop_workers()
 

@@ -359,7 +359,8 @@ optional.
   string). The in-tree callers that use it — the browse-fs delete
   guard and the browse-procs SIGTERM guard — and the `ctx.confirm`
   tests are updated in the same change.
-- `ctx.prompt(prompt, default='') -> str | None` — input dialog.
+- `ctx.prompt(prompt, default='') -> str | None` — input dialog (shipped
+  as the pre-existing method name `ctx.input`).
 - `ctx.alert(text, *, title=None) -> None` — choice dialog with a
   single `('&OK',)` button; sugar for notifications.
 

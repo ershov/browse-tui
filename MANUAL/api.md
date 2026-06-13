@@ -292,7 +292,7 @@ def delete(ctx):
     targets = ctx.targets
     if not targets:
         return
-    if not ctx.confirm(f'delete {len(targets)} item(s)?'):
+    if ctx.confirm(f'delete {len(targets)} item(s)?') != 'Yes':
         return
     for it in targets:
         os.remove(it.id)
@@ -521,9 +521,9 @@ def view(ctx):
 
 #### `ctx.input(prompt, default='') -> str | None`
 
-Read a single-line string from the user on the info bar. Returns the typed
-text (empty string if the user just hit Enter), or `None` if cancelled with
-Esc / Ctrl-C.
+Read a single-line string in a modal input dialog (`prompt` above an entry
+field pre-filled with `default`). Returns the typed text (empty string if the
+user just hit Enter), or `None` if cancelled with Esc / Ctrl-C.
 
 ```python
 def rename(ctx):
@@ -534,18 +534,31 @@ def rename(ctx):
     ctx.refresh()
 ```
 
-#### `ctx.confirm(prompt) -> bool`
+#### `ctx.confirm(message, buttons=('&Yes', '&No'), *, title=None) -> str | None`
 
-Show `prompt` followed by `(y/n)` on the info bar. Returns `True` for `y`/`Y`,
-`False` for `n`/`N` / Esc / Ctrl-C.
+Open a modal choice dialog: `message` above a row of `buttons`. Each label
+uses the `&` hotkey convention (`'&Yes'` shows `Yes` with `Y` underlined;
+pressing `y` activates it). Returns the chosen button's resolved label
+(`'Yes'`, `'No'`, …, with the `&` stripped), or `None` on Esc / Ctrl-C.
+
+Compare the result explicitly — `ctx.confirm(...) == 'Yes'`. A cancel returns
+`None`, which is never equal to a label, so it reads as "not Yes" for free.
+The truthiness idiom `if ctx.confirm(...)` is **wrong**: `'No'` is a truthy
+string.
+
+#### `ctx.alert(text, *, title=None) -> None`
+
+Open a modal notification: `text` above a single `[ OK ]` button, dismissed
+with Enter / Space / Esc. Returns `None`.
 
 #### `ctx.pick(label, options) -> str | None`
 
-fzf-style filterable picker overlaid on the preview pane. The user types to
-filter (case-insensitive substring match), Up/Down/Ctrl-P/Ctrl-N to move,
-Enter to choose, Esc to cancel.
+fzf-style filterable picker in a centered modal dialog (`label` is the
+title). The user types to filter (case-insensitive substring match),
+Up/Down/Ctrl-P/Ctrl-N to move, Enter to choose, Esc to cancel.
 
-Returns the chosen option string, or `None` if cancelled.
+Returns the chosen option string, or `None` if cancelled (or if `options` is
+empty — the dialog doesn't open).
 
 ```python
 def set_status(ctx):
@@ -556,8 +569,12 @@ def set_status(ctx):
     ctx.refresh()
 ```
 
-The picker is **not re-entrant** — calling `ctx.pick` from inside another
-`ctx.pick`'s handler is undefined behaviour.
+#### `ctx.menu(items, *, anchor=None) -> str | None`
+
+A context menu: an unfiltered modal selection list. `anchor` is an optional
+`(row, col)` screen cell the menu drops below; it defaults to the list
+cursor's cell so the menu reads as attached to the current row. Returns the
+chosen item string, or `None` on cancel (or empty `items`).
 
 #### `ctx.insert(label, on_confirm)`
 

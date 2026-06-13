@@ -75,9 +75,11 @@ class TestBrowsePlan(unittest.TestCase):
                 # Move past the synthetic Project entry onto ticket #1.
                 t.wait_for('Solo', timeout=5.0)
                 t.send('Down')
-                # Open status picker.
+                # Open status picker (a modal dialog). The 'custom...'
+                # option is an unambiguous marker that the picker is open —
+                # the old info-bar 'status>' prompt no longer exists.
                 t.send('s')
-                t.wait_for('status>', timeout=3.0)
+                t.wait_for('custom...', timeout=3.0)
                 # Filter to "done" and confirm.
                 t.type('done')
                 t.send('Enter')

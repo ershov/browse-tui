@@ -101,7 +101,7 @@ class TestCtrlCParity(unittest.TestCase):
             self.assertEqual(content, '<cancelled>')
 
     def test_pick_ctrl_c_returns_none(self):
-        """Ctrl-C inside the pick picker returns None (cancel)."""
+        """Ctrl-C inside the pick dialog returns None (cancel)."""
         recipe_path = os.path.join(_REPO, 'test', 'ui', 'recipes', 'pick_demo.py')
         with tempfile.TemporaryDirectory() as tmp:
             log = os.path.join(tmp, 'pick.log')
@@ -109,7 +109,8 @@ class TestCtrlCParity(unittest.TestCase):
                 t.launch(_BIN, '--run-py', recipe_path)
                 t.wait_for('item one')
                 t.send('s')
-                t.wait_for('Status>')
+                # Wait for the modal to open (an option line confirms it).
+                t.wait_for('in-progress')
                 t.send_bytes('\x03')
                 content = _read_log_when_ready(log)
             self.assertEqual(content, '<cancelled>')
@@ -142,8 +143,8 @@ class TestCtrlCParity(unittest.TestCase):
                 content = _read_log_when_ready(log)
             self.assertEqual(content, 'NONE')
 
-    def test_confirm_ctrl_c_returns_false(self):
-        """Ctrl-C inside ctx.confirm returns False (treats as 'no')."""
+    def test_confirm_ctrl_c_returns_none(self):
+        """Ctrl-C inside ctx.confirm returns None (uniform modal cancel)."""
         with tempfile.TemporaryDirectory() as tmp:
             recipe = os.path.join(tmp, 'r.py')
             log = os.path.join(tmp, 'log')
@@ -155,7 +156,7 @@ class TestCtrlCParity(unittest.TestCase):
                     "    return [Item(id='a')]\n"
                     "def go(ctx):\n"
                     f"    val = ctx.confirm('Sure?')\n"
-                    f"    open({log!r}, 'w').write('YES' if val else 'NO')\n"
+                    f"    open({log!r}, 'w').write('NONE' if val is None else 'VAL:' + repr(val))\n"
                     "    ctx.quit()\n"
                     "b = Browser(BrowserConfig(get_children=get_children, "
                     "actions=[Action('d', 'Delete', go, 'cursor')], "
@@ -168,7 +169,7 @@ class TestCtrlCParity(unittest.TestCase):
                 t.wait_for('Sure?')
                 t.send_bytes('\x03')
                 content = _read_log_when_ready(log)
-            self.assertEqual(content, 'NO')
+            self.assertEqual(content, 'NONE')
 
 
 if __name__ == '__main__':

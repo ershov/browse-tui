@@ -1054,7 +1054,7 @@ _INPUT_MIN_WIDTH = 16
 
 
 class InputContent:
-    """A single-line text entry — backs ``ctx.prompt``.
+    """A single-line text entry — backs ``ctx.input``.
 
     The wrapped prompt text (ANSI per the design's "Text handling": embedded
     SGR colours render, all other CSI is neutralised) sits above a one-row
@@ -1201,3 +1201,86 @@ class InputContent:
 
         # Unrecognized key — ignored, loop continues.
         return (False, None)
+
+
+# ---------------------------------------------------------------------------
+# Convenience wrappers — the surface ``ctx`` delegates to
+# ---------------------------------------------------------------------------
+#
+# Each builds the right content object + placement and forwards to
+# ``run_modal``. The empty-collection short-circuits for the two list-backed
+# dialogs live HERE (return ``None`` without opening), so ``ctx`` and any
+# other caller get the no-open behavior uniformly. ``delay_interaction`` and
+# the ``_read_key`` test seam are threaded straight through.
+
+
+def modal_pick(browser, label, options, *, delay_interaction=False,
+               _read_key=None):
+    """Centered, filtered selection list (``ctx.pick``).
+
+    ``options`` becomes a filterable list with ``label`` as the title.
+    Returns the chosen option string, or ``None`` on cancel. An empty
+    ``options`` returns ``None`` WITHOUT opening a dialog.
+    """
+    options = list(options)
+    if not options:
+        return None
+    content = ListContent(options, filter=True, title=label)
+    return run_modal(browser, content, placement='center',
+                     delay_interaction=delay_interaction, _read_key=_read_key)
+
+
+def modal_menu(browser, items, *, anchor=None, delay_interaction=False,
+               _read_key=None):
+    """Anchored, unfiltered selection list — a context menu (``ctx.menu``).
+
+    ``items`` is shown without a filter row. ``anchor`` is an ``(row, col)``
+    1-based screen cell the menu drops below (see :func:`_modal_place`); when
+    ``None`` the dialog centers. Returns the chosen item string, or ``None``
+    on cancel. Empty ``items`` returns ``None`` WITHOUT opening a dialog.
+    """
+    items = list(items)
+    if not items:
+        return None
+    content = ListContent(items, filter=False)
+    placement = 'anchor' if anchor is not None else 'center'
+    return run_modal(browser, content, placement=placement, anchor=anchor,
+                     delay_interaction=delay_interaction, _read_key=_read_key)
+
+
+def modal_confirm(browser, message, buttons=('&Yes', '&No'), *, title=None,
+                  delay_interaction=False, _read_key=None):
+    """Message + button row — a confirmation / single choice (``ctx.confirm``).
+
+    Returns the chosen button's resolved label (``'Yes'`` / ``'No'`` / …), or
+    ``None`` on cancel. An empty ``buttons`` raises ``ValueError`` (a
+    programming error — surfaced by :class:`ChoiceContent`).
+    """
+    content = ChoiceContent(message, buttons, title=title)
+    return run_modal(browser, content, placement='center',
+                     delay_interaction=delay_interaction, _read_key=_read_key)
+
+
+def modal_input(browser, prompt, *, default='', delay_interaction=False,
+                _read_key=None):
+    """Single-line text entry (``ctx.input``).
+
+    ``default`` pre-fills the field. Returns the entered string (possibly
+    empty), or ``None`` on cancel.
+    """
+    content = InputContent(prompt, default=default)
+    return run_modal(browser, content, placement='center',
+                     delay_interaction=delay_interaction, _read_key=_read_key)
+
+
+def modal_alert(browser, text, *, title=None, delay_interaction=False,
+                _read_key=None):
+    """Static notification — a message with a single OK button (``ctx.alert``).
+
+    Always returns ``None``: the activation result (the ``'OK'`` label) is
+    discarded since an alert conveys nothing back to the caller.
+    """
+    content = ChoiceContent(text, ('&OK',), title=title)
+    run_modal(browser, content, placement='center',
+              delay_interaction=delay_interaction, _read_key=_read_key)
+    return None
