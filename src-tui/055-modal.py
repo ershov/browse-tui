@@ -1041,3 +1041,163 @@ class ChoiceContent:
 
         # Unrecognized key — ignored, loop continues.
         return (False, None)
+
+
+# ---------------------------------------------------------------------------
+# Content — single-line text entry (prompt)
+# ---------------------------------------------------------------------------
+
+
+# Minimum width an input dialog requests, so a short prompt + an empty field
+# still reads as a box wide enough to type into rather than a sliver.
+_INPUT_MIN_WIDTH = 16
+
+
+class InputContent:
+    """A single-line text entry — backs ``ctx.prompt``.
+
+    The wrapped prompt text (ANSI per the design's "Text handling": embedded
+    SGR colours render, all other CSI is neutralised) sits above a one-row
+    entry field showing the edit buffer. When the buffer is wider than the
+    field, its TAIL is shown (suffix-trimmed by cells) so the end the user is
+    typing stays visible; a visible cursor cell (a reverse-video space) sits
+    just after the last char.
+
+    Editing is end-only this round, matching the old info-bar prompt: a
+    printable char / ``space`` appends, ``backspace`` deletes the last char,
+    and there is no in-buffer cursor movement. ``enter`` returns the buffer
+    STRING — possibly empty (a valid result); ``None`` comes only from the
+    engine's cancel path. ``default`` pre-fills the buffer.
+
+    Implements the content protocol consumed by :func:`run_modal`
+    (``title`` / ``measure`` / ``draw_row`` / ``handle_key``).
+    """
+
+    def __init__(self, prompt, *, default=''):
+        self.title = None
+        self._prompt = prompt
+        self.buffer = default          # the edit buffer (end-only editing)
+        # Filled by ``measure`` (the engine calls it before the first paint):
+        # the final size and the wrapped prompt rows ``draw_row`` emits above
+        # the entry field.
+        self._w = 0
+        self._h = 0
+        self._prompt_lines = []        # wrapped prompt rows actually drawn
+
+    # -- geometry -----------------------------------------------------------
+
+    def measure(self, max_w, max_h):
+        """Content size: wrapped prompt above one entry-field row.
+
+        Width is the widest of (longest wrapped prompt line, the default's
+        cell width, a small floor), capped at ``max_w`` — so the field is
+        roomy even for a short prompt, and a long ``default`` is visible
+        without forcing the box wider than the cap. The prompt is wrapped to
+        ``max_w`` first to find the longest line, then RE-wrapped to the final
+        width below (the same two-pass approach :class:`ChoiceContent` uses).
+        Height is the prompt line count plus one field row, capped at
+        ``max_h``. The final size and the re-wrapped prompt rows are stored —
+        :meth:`draw_row` reads them.
+        """
+        probe = self._wrap_prompt(max_w)
+        longest = max((cell_width(line) for line in probe), default=0)
+        floor = max(longest, cell_width(self.buffer), _INPUT_MIN_WIDTH)
+        self._w = min(floor, max_w)
+
+        self._prompt_lines = self._wrap_prompt(self._w)
+        # Height = prompt rows + the single field row, capped. When the cap
+        # clamps it, ``draw_row`` still puts the field on the last row and the
+        # prompt fills the rows above (some prompt rows then clip off-screen).
+        self._h = min(len(self._prompt_lines) + 1, max_h)
+        return self._w, self._h
+
+    def _wrap_prompt(self, width):
+        """Wrap the prompt to ``width`` cells with Preview's ANSI treatment.
+
+        The same pipeline :class:`ChoiceContent` runs on its body:
+        :func:`_sanitize_preview` defangs control chars (ESC kept so SGR
+        survives), then each logical line goes through
+        :func:`_wrap_preview_line`, which keeps SGR inline, drops every other
+        CSI, and emits self-contained visual rows. Returns the wrapped rows
+        (pre-rendered strings, ready to ``write``).
+        """
+        if width <= 0:
+            return []
+        text = _sanitize_preview(self._prompt, ansi_on=True)
+        rows = []
+        for line in text.split('\n'):
+            line = line.replace('\t', '    ')
+            rows.extend(_wrap_preview_line(line, width, ansi_on=True))
+        return rows
+
+    # -- drawing ------------------------------------------------------------
+
+    def draw_row(self, row, width):
+        """Emit ONE content row, filling exactly ``width`` cells.
+
+        The wrapped prompt occupies the top rows; the entry field is the LAST
+        content row (index ``height - 1``). Prompt rows go through
+        :func:`_write_segments` (one ANSI-bearing segment) exactly like a
+        preview row, so embedded SGR renders and the row pads to ``width``.
+        """
+        if row == self._h - 1:
+            self._draw_field(width)
+            return
+        line = self._prompt_lines[row]
+        _write_segments([(line, None, False)], width, pad_to=width)
+
+    def _draw_field(self, width):
+        """Compose the entry-field row to EXACTLY ``width`` cells.
+
+        The field reserves its final cell for a visible cursor (a reverse-
+        video space), so the buffer occupies the leading ``width - 1`` cells.
+        When the buffer overflows that space its TAIL is shown — the suffix
+        that fits in ``width - 1`` cells via :func:`_suffix_by_cells` — so the
+        end the user is typing stays on screen. The layout is therefore
+        ``tail`` (≤ ``width - 1`` cells) + the cursor cell + right pad, summing
+        to exactly ``width``.
+        """
+        if width <= 0:
+            return
+        # Tail of the buffer that fits before the cursor cell (cell-aware
+        # suffix trim — never hand-rolled codepoint slicing). The cursor sits
+        # in the final cell; with ``width == 1`` there's no room for any
+        # buffer, so the field is just the cursor.
+        tail = _suffix_by_cells(self.buffer, width - 1)
+        write(tail)
+        # Reverse-video cursor cell just after the last buffer char.
+        set_style(reverse=True)
+        write(' ')
+        reset_style()
+        # Pad any remaining cells so the row fills ``width`` exactly (a wide
+        # char straddling the tail budget can leave the tail one cell short).
+        pad = width - cell_width(tail) - 1
+        if pad > 0:
+            write(' ' * pad)
+
+    # -- keys ---------------------------------------------------------------
+
+    def handle_key(self, key):
+        """Process one key; return ``(done, result)`` per the protocol.
+
+        A printable char (``len == 1`` and ``str.isprintable``) or ``space``
+        APPENDS to the buffer; ``backspace`` deletes the last char (a no-op on
+        an empty buffer). ``enter`` closes with the buffer string — which may
+        be empty (a valid result; ``None`` is reserved for the engine's cancel
+        path). End-only editing: there is no in-buffer cursor movement this
+        round, so every other key is ignored.
+        """
+        if key == 'enter':
+            return (True, self.buffer)
+        if key == 'backspace':
+            self.buffer = self.buffer[:-1]
+            return (False, None)
+        if key == 'space':
+            self.buffer += ' '
+            return (False, None)
+        if len(key) == 1 and key.isprintable():
+            self.buffer += key
+            return (False, None)
+
+        # Unrecognized key — ignored, loop continues.
+        return (False, None)
