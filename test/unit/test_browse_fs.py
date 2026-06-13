@@ -983,11 +983,13 @@ class TestMdLauncher(unittest.TestCase):
         self.assertEqual(len(ctx.calls), 1)
         cmd = ctx.calls[0]
         self.assertEqual(cmd[0], 'browse-md')
-        self.assertEqual(cmd[1], a)
+        self.assertIn(a, cmd)                  # the target file
         self.assertIn('--root', cmd)
         # --root value is the project root (here: the file's own dir).
         self.assertEqual(cmd[cmd.index('--root') + 1], self.r._project_root_for(a))
-        # browse-md owns the alt screen, so the launch keeps it (no flicker).
+        # Switch-free handoff: child renders without its own alt-screen switch
+        # (--no-alt-screen) and the parent keeps the alt screen (keep_screen).
+        self.assertIn('--no-alt-screen', cmd)
         self.assertTrue(ctx.keep_screen)
 
     def test_enter_on_regular_file_row_edits(self):
