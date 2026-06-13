@@ -235,9 +235,11 @@ When `g_resize_flag` or `g_screen_lost_flag` is set: clear the entire
 screen, `browser._pane_cache.clear()`, recompute geometry (re-running
 `measure` with the new caps), repaint the frame and content. The
 regular UI underneath stays blank until the dialog closes — resizes
-are rare, and with the caches cleared and the screen genuinely blank,
-the close-time repaint's first-paint branch is valid. This is
-deliberately the simplest correct behavior.
+are rare. This is deliberately the simplest correct behavior. Note the
+screen is *not* blank under the dialog at close time (the dialog
+repainted over the cleared screen), and with the caches cleared the
+close-time repaint takes `end_row`'s first-paint branch, which emits no
+padding — so the close must re-blank the screen; see the next section.
 
 ### Close and restore: cache poisoning
 
@@ -261,9 +263,16 @@ cell the dialog can overdraw.
 
 Restore runs in a `try/finally` around the dialog loop, so a buggy
 content object cannot leave the screen corrupted with a stale cache.
-(After a resize-while-open the caches are already cleared and the
-poisoning pass is a no-op over empty caches — the blank screen plus
-first-paint repaint handles it.)
+
+A close **after a resize/screen-lost** is the one exception: the caches
+were already cleared, so poisoning is a no-op over empty caches *and*
+the next `render_full` rebuilds them fresh and takes `end_row`'s
+first-paint branch (no padding), which would NOT clear the dialog's own
+cells — the resize's earlier `\e[2J` was overdrawn by the dialog
+repaint. So in that case the close instead re-blanks the screen
+(`\e[2J`) rather than poisoning; the subsequent full repaint's
+first-paint branch then lands on a genuinely empty screen and leaves no
+dialog cells behind.
 
 ### Text handling
 

@@ -720,6 +720,54 @@ class TestResizeRepaint(unittest.TestCase):
         # consumes the wake before the event dispatch.
         self.assertEqual(b.calls['drain_main_queue'], 0)
 
+    def test_resized_close_blanks_screen_again(self):
+        """After a resize-while-open, close blanks the screen a SECOND time.
+
+        Cache-poisoning can't clear the dialog's own cells once the caches
+        were cleared by the resize (the next ``render_full`` rebuilds them
+        fresh and first-paints with no padding). So the close-time restore
+        must blank the screen again, leaving the genuinely-empty precondition
+        that first-paint assumes. Without the resize the close emits no
+        ``\\e[2J`` at all (it poisons instead) — assert both: the resized
+        close emits a close-time clear AFTER the dialog's last paint, and the
+        non-resized close emits none.
+        """
+        # Resized close: two \e[2J total — one at the resize repaint, one at
+        # close — and the close-time one comes after the final frame paint.
+        b = _FakeBrowser()
+        b._pane_cache['list'] = PaneCache()
+        b._pane_cache['list'].invalidate(Rect(1, 1, 81, 25))
+        content = _StubContent(title='T', w=20, h=2,
+                               key_handler={'enter': (True, 'done')})
+        state = {'n': 0}
+
+        def rk():
+            state['n'] += 1
+            if state['n'] == 1:
+                _modal.__dict__['g_resize_flag'] = True
+                return '_notify'
+            return 'enter'
+
+        with _FixedTermSize(80, 24), _Capture() as cap:
+            run_modal(b, content, _read_key=rk)
+        self.assertEqual(cap.text.count('\033[2J'), 2,
+                         'expected a resize clear AND a close clear')
+        # The close-time clear is the LAST \e[2J, emitted after the dialog's
+        # final repaint (so it wipes the box the resize repaint drew back).
+        self.assertGreater(cap.text.rfind('\033[2J'), cap.text.find('T'),
+                           'close-time clear must follow the dialog paint')
+
+        # No-resize close: the restore poisons caches and emits NO \e[2J.
+        b2 = _FakeBrowser()
+        b2._pane_cache['list'] = PaneCache()
+        b2._pane_cache['list'].invalidate(Rect(1, 1, 81, 25))
+        content2 = _StubContent(title='T', w=20, h=2,
+                                key_handler={'enter': (True, 'done')})
+        with _FixedTermSize(80, 24), _Capture() as cap2:
+            run_modal(b2, content2, _read_key=_scripted(['enter']))
+        self.assertNotIn('\033[2J', cap2.text,
+                         'a non-resized close must not blank the screen')
+
 
 class TestDelayInteraction(unittest.TestCase):
     """``delay_interaction`` — open-time input drain + threshold gate.
