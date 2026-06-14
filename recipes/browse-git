@@ -588,6 +588,29 @@ def _md_file_children(item_id, spec):
     return [_md_doc.launcher_row(item_id, spec, '→ browse')]
 
 
+def _md_launch_preview(spec):
+    """Markdown preview for a ``('launch', anchor, *spec)`` row.
+
+    ``spec`` (the launcher id's ``[2:]``) names the document the row would
+    open: a ``('wtfile', abspath)`` on-disk file or a ``('blob', rev, path)``
+    revision blob (``git show rev:path``). Rendered through ``_md_message``
+    (md2ansi when the toggle/library allow, else raw) — the same colored-
+    markdown view browse-md would open, so the preview matches the launch.
+    Returns ``''`` when the target is unreadable / spec is unrecognised.
+    """
+    if len(spec) == 2 and spec[0] == 'wtfile':
+        try:
+            with open(spec[1], 'rb') as f:
+                text = f.read().decode('utf-8', errors='replace')
+        except OSError as e:
+            return f'[error] {e}'
+        return _md_message(text)
+    if len(spec) == 3 and spec[0] == 'blob':
+        text = _blob_text(spec[1], spec[2])
+        return _md_message(text) if text is not None else ''
+    return ''
+
+
 def _parse_decorations(deco, remotes=None):
     """Parse a ``%D`` decoration string into ``[(text, style)]`` chips.
 
@@ -2035,6 +2058,14 @@ def get_preview(item_id):
         if len(item_id) == 3:
             return _stash_file_preview(item_id[1], item_id[2])
         return _stash_preview(item_id[1])
+    if kind == 'launch':
+        # A '→ browse' / References launcher row — preview the markdown it
+        # would open, rendered like a message. id = ('launch', anchor, *spec).
+        return _md_launch_preview(item_id[2:])
+    if kind == 'md-refs':
+        # The [md] References umbrella over a commit message's refs — show the
+        # commit it groups them from. id = ('md-refs', sha).
+        return _commit_preview(item_id[1])
     # root / err / status_clean / stash_none / filler kinds have no preview.
     return ''
 

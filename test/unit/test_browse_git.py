@@ -3703,14 +3703,14 @@ class _LaunchCtx:
 
     def __init__(self, cursor, expanded=None):
         self.cursor = cursor
-        self.calls = []          # (cmd, env, keep_screen)
+        self.calls = []          # (cmd, env, keep_screen, stdin_text)
         self.flashes = []
         self.expanded = expanded if expanded is not None else set()
         self.collapsed = []
         self.state = types.SimpleNamespace(expanded=self.expanded)
 
-    def run_external(self, cmd, env=None, *, keep_screen=False):
-        self.calls.append((cmd, env, keep_screen))
+    def run_external(self, cmd, env=None, *, keep_screen=False, stdin_text=None):
+        self.calls.append((cmd, env, keep_screen, stdin_text))
         return 0
 
     def flash(self, text, log=False):
@@ -3906,14 +3906,15 @@ class TestMdLauncherEnterDispatch(unittest.TestCase):
         ctx = _LaunchCtx(row)
         self.r.on_enter(ctx)
         self.assertEqual(len(ctx.calls), 1)
-        cmd, env, keep = ctx.calls[0]
-        # Content form: a shell string piping the env-carried doc into browse-md.
-        self.assertIsInstance(cmd, str)
-        self.assertIn('browse-md', cmd)
-        self.assertIn(self.r._md_doc.LAUNCH_STDIN_ENV, cmd)
-        self.assertEqual(env, {self.r._md_doc.LAUNCH_STDIN_ENV: '# Doc A\nbody\n'})
-        self.assertIn('--root', cmd)
-        self.assertIn('/repo', cmd)
+        cmd, env, keep, stdin_text = ctx.calls[0]
+        # Content form: plain argv reading from stdin (`-`); the blob text rides
+        # the stdin pipe, NOT argv or env (the E2BIG-safe channel).
+        self.assertIsInstance(cmd, list)
+        self.assertEqual(cmd[:2], ['browse-md', '-'])
+        self.assertEqual(stdin_text, '# Doc A\nbody\n')
+        self.assertIsNone(env)
+        self.assertNotIn('# Doc A\nbody\n', cmd)
+        self.assertEqual(cmd[cmd.index('--root') + 1], '/repo')
         self.assertTrue(keep)               # parent keeps the alt screen
         self.assertIn('--no-alt-screen', cmd)
         self.assertIn('--quit-on-scope-up', cmd)
@@ -3928,11 +3929,12 @@ class TestMdLauncherEnterDispatch(unittest.TestCase):
         ctx = _LaunchCtx(row)
         self.r.on_enter(ctx)
         self.assertEqual(len(ctx.calls), 1)
-        cmd, env, keep = ctx.calls[0]
+        cmd, env, keep, stdin_text = ctx.calls[0]
         self.assertIsInstance(cmd, list)        # path form is plain argv
         self.assertEqual(cmd[0], 'browse-md')
         self.assertIn('/repo/a.md', cmd)
         self.assertIsNone(env)
+        self.assertIsNone(stdin_text)           # path form: no stdin pipe
         self.assertEqual(cmd[cmd.index('--root') + 1], '/repo')
         self.assertTrue(keep)
 
@@ -3977,6 +3979,46 @@ class TestMdLauncherEnterDispatch(unittest.TestCase):
         ctx = _LaunchCtx(row)
         self.r.on_enter(ctx)                    # guarded no-op
         self.assertEqual(ctx.calls, [])
+
+
+class TestMdLauncherPreview(unittest.TestCase):
+    """get_preview renders the markdown a launcher row would open."""
+
+    def setUp(self):
+        sys.modules.pop('md_doc', None)
+        self.r = _load_recipe()
+        self.assertTrue(hasattr(self.r._md_doc, 'launcher_row'))
+        self.r._MD_COLOR = False   # raw text so we can assert content directly
+
+    def test_preview_wtfile_launcher_shows_file_content(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, 'a.md')
+            with open(p, 'w', encoding='utf-8') as f:
+                f.write('# Working tree\nhello\n')
+            pv = self.r.get_preview(('launch', ('status', 'M ', 'a.md'),
+                                     'wtfile', p))
+        self.assertIn('# Working tree', pv)
+        self.assertIn('hello', pv)
+
+    def test_preview_blob_launcher_shows_git_show_content(self):
+        self.r._run_git = _FakeGit({('show', 'SHA:docs/a.md'): (0, '# Blob\nx\n')})
+        pv = self.r.get_preview(('launch', 'SHA', 'blob', 'SHA', 'docs/a.md'))
+        self.assertIn('# Blob', pv)
+        self.assertIn('x', pv)
+
+    def test_preview_wtfile_unreadable_returns_error(self):
+        pv = self.r.get_preview(('launch', ('status', '??', 'gone.md'),
+                                 'wtfile', '/no/such/gone.md'))
+        self.assertIn('error', pv.lower())
+
+    def test_preview_blob_missing_returns_empty(self):
+        self.r._run_git = _FakeGit({})   # git show fails → None → ''
+        pv = self.r.get_preview(('launch', 'SHA', 'blob', 'SHA', 'gone.md'))
+        self.assertEqual(pv, '')
+
+    def test_preview_md_refs_umbrella_delegates_to_commit(self):
+        self.r._commit_preview = lambda sha: f'COMMIT {sha}'
+        self.assertEqual(self.r.get_preview(('md-refs', 'SHA')), 'COMMIT SHA')
 
 
 if __name__ == '__main__':
