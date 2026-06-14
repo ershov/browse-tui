@@ -114,7 +114,7 @@ def kill_proc(ctx):
     if not ctx.cursor:
         return
     pid = ctx.cursor.id
-    if ctx.confirm(f'send SIGTERM to pid {pid} ({ctx.cursor.title})?') != 'Yes':
+    if not ctx.confirm(f'send SIGTERM to pid {pid} ({ctx.cursor.title})?', [('&Yes', True), ('&No', False)]):
         return
     try:
         os.kill(pid, signal.SIGTERM)
