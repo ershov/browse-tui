@@ -443,6 +443,41 @@ class TestRunExternalHeadless(unittest.TestCase):
             b.stop_workers()
 
 
+class TestRunExternalStdinText(unittest.TestCase):
+    """run_external feeds ``stdin_text`` to the child via a real pipe."""
+
+    def _run_capturing_stdin(self, text):
+        import os as _os
+        import tempfile as _tf
+        b = _make_browser()   # headless: no terminal, child inherits test fds
+        try:
+            ctx = Context(b)
+            with _tf.TemporaryDirectory() as d:
+                out = _os.path.join(d, 'out')
+                # 'sh -c "cat > $1" sh OUT' writes the child's stdin to OUT and
+                # nothing to stdout — so we read back exactly what was piped.
+                rc = ctx.run_external(['sh', '-c', 'cat > "$1"', 'sh', out],
+                                      stdin_text=text)
+                with open(out, encoding='utf-8') as f:
+                    return rc, f.read()
+        finally:
+            b.stop_workers()
+
+    def test_stdin_text_reaches_child(self):
+        rc, got = self._run_capturing_stdin('# Doc\nbody\n')
+        self.assertEqual(rc, 0)
+        self.assertEqual(got, '# Doc\nbody\n')
+
+    def test_large_stdin_text_no_e2big(self):
+        # Regression for the launcher's E2BIG bug: a document well over the
+        # 128 KB MAX_ARG_STRLEN limit goes through fine on the pipe (it would
+        # have failed had it ridden argv or the environment).
+        big = 'lorem ipsum ' * 60_000   # ~720 KB
+        rc, got = self._run_capturing_stdin(big)
+        self.assertEqual(rc, 0)
+        self.assertEqual(got, big)
+
+
 class TestRunExternalKeepScreen(unittest.TestCase):
     """run_external threads ``keep_screen`` through to ``term_suspend``."""
 

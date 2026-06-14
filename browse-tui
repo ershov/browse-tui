@@ -1376,6 +1376,14 @@ class Item:
     debug dumps, ``compare=False`` keeps it out of ``__eq__`` /
     ``__hash__``.
 
+    ``id_hidden`` (default ``False``) suppresses the id segment for this
+    one row regardless of the Browser's ``show_ids`` mode — for rows whose
+    id is internal routing state, not a user-facing identifier (e.g. the
+    ``('launch', …)`` / ``('md-refs', …)`` rows ``md_doc`` builds, whose
+    tuple ids would otherwise render verbatim under ``show_ids='auto'``).
+    Distinct from ``hidden`` (which hides the whole row): the row still
+    shows, only its id is dropped.
+
     ``preview`` is the per-item preview text cache (string or
     ``None``). Lives on the Item rather than a side-table dict so it
     survives the Item's lifetime naturally and is dropped with it.
@@ -1401,6 +1409,7 @@ class Item:
     hidden: bool = False
     boundary: bool = False
     meta: bool = False
+    id_hidden: bool = False
     _filter_hidden: bool = field(
         default=False, init=False, repr=False, compare=False,
     )
@@ -10910,8 +10919,12 @@ def _id_visible(item, show_ids):
     ``'auto'`` mode the id is suppressed when ``str(item.id) ==
     item.title`` — the common shape for line-based CLI input where the
     id and title are the same string and showing both is pure
-    duplication.
+    duplication. A per-row ``item.id_hidden`` forces suppression
+    regardless of ``show_ids`` — for rows whose id is internal routing
+    state rather than a user-facing identifier.
     """
+    if getattr(item, 'id_hidden', False):
+        return False   # routing-only id, never displayed (e.g. launcher rows)
     if show_ids == 'always':
         return True
     if show_ids == 'never':
@@ -16110,12 +16123,24 @@ class Context:
 
     # ---- main-thread sub-flows ----------------------------------------
 
-    def run_external(self, cmd, env=None, *, keep_screen=False) -> int:
+    def run_external(self, cmd, env=None, *, keep_screen=False,
+                     stdin_text=None) -> int:
         """Suspend the terminal, run ``cmd``, then resume.
 
         ``cmd`` is either a list of argv strings or a shell string (the
         latter triggers ``shell=True``). ``env`` is merged with the
         parent environment — pass ``None`` to inherit unchanged.
+
+        ``stdin_text`` (a ``str``, default ``None``) feeds the child a
+        document on its **stdin via a real pipe** while its stdout/stderr stay
+        the terminal — for launching a child that reads a document from stdin
+        and runs its own UI on the terminal device (e.g. ``browse-md -``, which
+        slurps stdin then opens ``/dev/tty`` for keys). Unlike argv/env, a pipe
+        has no size limit, so this is the correct channel for arbitrarily large
+        content; passing it via env would hit ``MAX_ARG_STRLEN`` → ``E2BIG``.
+        ``cmd`` must be an argv list when ``stdin_text`` is given. When ``None``
+        (the default) the child inherits the terminal on stdin too, as an
+        interactive editor needs.
 
         ``keep_screen=True`` hands the terminal to a child that owns the
         alternate screen itself (e.g. launching another browse-tui recipe):
@@ -16145,11 +16170,25 @@ class Context:
         if not self._browser._headless:
             term_suspend(keep_screen=keep_screen)
             in_fd, out_fd = term_child_fds()
-            child_fds = {'stdin': in_fd, 'stdout': out_fd, 'stderr': out_fd}
+            # With piped stdin the child reads its document from the pipe and
+            # runs its UI on the terminal device itself, so we hand it only
+            # stdout/stderr; otherwise it inherits the terminal on stdin too.
+            if stdin_text is None:
+                child_fds = {'stdin': in_fd, 'stdout': out_fd, 'stderr': out_fd}
+            else:
+                child_fds = {'stdout': out_fd, 'stderr': out_fd}
         try:
             full_env = None if env is None else {**os.environ, **env}
-            shell = isinstance(cmd, str)
-            result = subprocess.run(cmd, shell=shell, env=full_env, **child_fds)
+            if stdin_text is not None:
+                # ``input=`` opens stdin as a pipe and writes the document
+                # to it — no argv/env size limit.
+                result = subprocess.run(
+                    cmd, input=stdin_text.encode('utf-8', errors='replace'),
+                    env=full_env, **child_fds)
+            else:
+                shell = isinstance(cmd, str)
+                result = subprocess.run(cmd, shell=shell, env=full_env,
+                                        **child_fds)
             return result.returncode
         except Exception as e:
             self.error(f'run_external: {type(e).__name__}: {e}')

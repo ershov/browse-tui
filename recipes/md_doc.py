@@ -667,12 +667,6 @@ def resolve_refs(text, *, doc_dir, cwd, project_root):
 # stay hashable (flat tuple, never a list) and store *what* to launch, not a
 # command line, so they survive rebuilds and environment changes.
 
-# Env var carrying the stdin document for the shell-string ``launch`` form.
-# Passing the document through the environment (rather than quoting it onto the
-# command line) keeps it off ``argv`` — bounded by ARG_MAX (~2 MB), past which
-# the launch fails through ``run_external``'s normal error path.
-LAUNCH_STDIN_ENV = 'BROWSE_MD_STDIN'
-
 # Embedding flags for a browse-md launched from inside another browse-tui:
 # ``--no-alt-screen`` renders on the parent's alternate screen without the
 # child's own switch (paired with ``run_external(keep_screen=True)`` so neither
@@ -696,7 +690,7 @@ try:
         launcher rows flat and does not use it.
         """
         return Item(id=('md-refs', anchor), title='References',
-                    tag='md', has_children=True)
+                    tag='md', has_children=True, id_hidden=True)
 
     def launcher_row(anchor, spec, label):
         """One ``[md ↗]`` launcher row titled ``label``.
@@ -705,10 +699,12 @@ try:
         ``('launch', anchor, *spec)`` — ``spec`` is the opaque launch target
         (e.g. ``('md-file', abspath)``) the recipe unpacks at Enter time. The
         ``↗`` in the ``[md ↗]`` tag chip signals that Enter launches an external
-        browser rather than expanding or editing the row.
+        browser rather than expanding or editing the row. ``id_hidden=True``
+        so the routing tuple is never displayed even under ``show_ids='auto'``.
         """
         return Item(id=('launch', anchor, *spec), title=label,
-                    tag='md ↗', tag_style='yellow', has_children=False)
+                    tag='md ↗', tag_style='yellow', has_children=False,
+                    id_hidden=True)
 
     def launch(ctx, *, path=None, content=None, label=None, roots=()):
         """Open a markdown document in ``browse-md`` as an external process.
@@ -719,15 +715,14 @@ try:
           * ``path`` — an on-disk ``.md`` file. Launched by plain argv:
             ``['browse-md', *flags, path, '--root', *roots]``.
           * ``content`` — markdown text NOT backed by a file (e.g. a transcript
-            message). Piped to ``browse-md -`` on stdin via ``run_external``'s
-            shell-string form, with the document handed through the
-            ``BROWSE_MD_STDIN`` env var rather than quoted onto the command
-            line: ``printf '%s' "$BROWSE_MD_STDIN" | browse-md - *flags --root
-            …`` (roots shell-quoted). Env-var delivery is ARG_MAX-bounded
-            (~2 MB); a pathological document fails the launch through
-            ``run_external``'s normal ``ctx.error`` path. A stdin document's
-            own reference-following is suppressed unless ``--root`` bases are
-            supplied, so ``roots`` is precisely what lets its refs resolve.
+            message). Fed to ``browse-md -`` on its **stdin via a real pipe**
+            (``run_external(stdin_text=…)``): ``['browse-md', '-', *flags,
+            --root …]`` with the document written to the child's stdin. A pipe
+            has no size limit, so an arbitrarily large document is fine — an
+            earlier env-var delivery hit ``MAX_ARG_STRLEN`` → ``E2BIG``. A stdin
+            document's own reference-following is suppressed unless ``--root``
+            bases are supplied, so ``roots`` is precisely what lets its refs
+            resolve.
 
         ``roots`` is an ordered sequence of ``--root`` resolution bases (the
         file's own directory is always browse-md's first base, so these are
@@ -743,12 +738,10 @@ try:
             ctx.run_external(['browse-md', *flags, path, *root_args],
                              keep_screen=True)
             return
-        # ``content`` form: pipe via stdin, document carried in the environment.
-        import shlex
-        cmd = (f'printf \'%s\' "${LAUNCH_STDIN_ENV}" | browse-md - '
-               + ' '.join(shlex.quote(a) for a in (*flags, *root_args)))
-        ctx.run_external(cmd, {LAUNCH_STDIN_ENV: content or ''},
-                         keep_screen=True)
+        # ``content`` form: feed the document to ``browse-md -`` on a real
+        # stdin pipe — no argv/env size limit (see run_external ``stdin_text``).
+        ctx.run_external(['browse-md', '-', *flags, *root_args],
+                         keep_screen=True, stdin_text=(content or ''))
 
 except ImportError:
     pass

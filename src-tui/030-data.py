@@ -113,6 +113,14 @@ class Item:
     debug dumps, ``compare=False`` keeps it out of ``__eq__`` /
     ``__hash__``.
 
+    ``id_hidden`` (default ``False``) suppresses the id segment for this
+    one row regardless of the Browser's ``show_ids`` mode — for rows whose
+    id is internal routing state, not a user-facing identifier (e.g. the
+    ``('launch', …)`` / ``('md-refs', …)`` rows ``md_doc`` builds, whose
+    tuple ids would otherwise render verbatim under ``show_ids='auto'``).
+    Distinct from ``hidden`` (which hides the whole row): the row still
+    shows, only its id is dropped.
+
     ``preview`` is the per-item preview text cache (string or
     ``None``). Lives on the Item rather than a side-table dict so it
     survives the Item's lifetime naturally and is dropped with it.
@@ -138,6 +146,7 @@ class Item:
     hidden: bool = False
     boundary: bool = False
     meta: bool = False
+    id_hidden: bool = False
     _filter_hidden: bool = field(
         default=False, init=False, repr=False, compare=False,
     )

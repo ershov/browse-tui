@@ -836,16 +836,18 @@ class TestCache(unittest.TestCase):
 class _LaunchCtx:
     """A ``ctx`` stand-in for ``md_doc.launch``.
 
-    Records each ``run_external`` call's ``cmd`` (argv list OR shell string),
-    the merged ``env`` dict, and the ``keep_screen`` flag, so a test can assert
-    both what was launched and how. Mirrors the recipe tests' launch ctx.
+    Records each ``run_external`` call's ``cmd`` (argv list), the merged
+    ``env`` dict, the ``keep_screen`` flag, and ``stdin_text`` (the piped
+    document, for the content form), so a test can assert both what was
+    launched and how. Mirrors the recipe tests' launch ctx.
     """
 
     def __init__(self):
         self.calls = []
 
-    def run_external(self, cmd, env=None, *, keep_screen=False):
-        self.calls.append({'cmd': cmd, 'env': env, 'keep_screen': keep_screen})
+    def run_external(self, cmd, env=None, *, keep_screen=False, stdin_text=None):
+        self.calls.append({'cmd': cmd, 'env': env, 'keep_screen': keep_screen,
+                           'stdin_text': stdin_text})
         return 0
 
 
@@ -926,6 +928,7 @@ class TestLauncherApi(unittest.TestCase):
         self.assertEqual(row.tag, 'md ↗')
         self.assertEqual(row.tag_style, 'yellow')
         self.assertFalse(row.has_children)
+        self.assertTrue(row.id_hidden)   # routing tuple, not for display
 
     def test_launcher_row_spec_is_opaque(self):
         # md_doc does not interpret the spec — an arbitrary tuple flows into
@@ -939,6 +942,7 @@ class TestLauncherApi(unittest.TestCase):
         self.assertEqual(u.title, 'References')
         self.assertEqual(u.tag, 'md')
         self.assertTrue(u.has_children)
+        self.assertTrue(u.id_hidden)     # routing tuple, not for display
 
     # ---- launch -----------------------------------------------------------
 
@@ -968,39 +972,49 @@ class TestLauncherApi(unittest.TestCase):
         self.assertEqual(cmd, ['browse-md', '--no-alt-screen',
                                '--quit-on-scope-up', '/docs/a.md'])
 
-    def test_launch_content_pipes_via_stdin_env(self):
+    def test_launch_content_pipes_via_stdin(self):
         ctx = _LaunchCtx()
         md_doc.launch(ctx, content='# Inline\nbody\n', roots=('/proj',))
         call = ctx.calls[0]
         cmd = call['cmd']
-        # Shell-string form (triggers shell=True in the real run_external).
-        self.assertIsInstance(cmd, str)
-        # Document carried in the env var, NOT quoted onto the command line.
-        self.assertEqual(call['env'], {md_doc.LAUNCH_STDIN_ENV: '# Inline\nbody\n'})
-        self.assertNotIn('# Inline', cmd)
-        # Pipeline shape: printf the env var into ``browse-md -``.
-        self.assertTrue(cmd.startswith(
-            f'printf \'%s\' "${md_doc.LAUNCH_STDIN_ENV}" | browse-md - '))
-        # Embedding flags + repeatable --root are shell-quoted onto the tail.
+        # Plain argv (no shell string), reading the document from stdin (`-`).
+        self.assertIsInstance(cmd, list)
+        self.assertEqual(cmd[:2], ['browse-md', '-'])
+        # The document rides the stdin pipe — NOT argv, NOT env.
+        self.assertEqual(call['stdin_text'], '# Inline\nbody\n')
+        self.assertIsNone(call['env'])
+        self.assertNotIn('# Inline\nbody\n', cmd)
+        # Embedding flags + repeatable --root on argv after `-`.
         self.assertIn('--no-alt-screen', cmd)
         self.assertIn('--quit-on-scope-up', cmd)
-        self.assertIn('--root /proj', cmd)
+        self.assertEqual(cmd[-2:], ['--root', '/proj'])
         self.assertTrue(call['keep_screen'])
+
+    def test_launch_content_large_document_not_on_argv_or_env(self):
+        # Regression for the E2BIG bug: a big document must not land on argv
+        # or env (both ARG_MAX/MAX_ARG_STRLEN-bounded) — only the stdin pipe.
+        ctx = _LaunchCtx()
+        big = '#x\n' + ('lorem ipsum ' * 50_000)   # ~600 KB, well over 128 KB
+        md_doc.launch(ctx, content=big, roots=())
+        call = ctx.calls[0]
+        self.assertEqual(call['stdin_text'], big)
+        self.assertIsNone(call['env'])
+        self.assertNotIn(big, call['cmd'])
 
     def test_launch_content_empty_roots_omits_root_flag(self):
         ctx = _LaunchCtx()
         md_doc.launch(ctx, content='hi')
         cmd = ctx.calls[0]['cmd']
         self.assertNotIn('--root', cmd)
-        self.assertTrue(cmd.endswith('--no-alt-screen --quit-on-scope-up'))
+        self.assertEqual(cmd, ['browse-md', '-', '--no-alt-screen',
+                               '--quit-on-scope-up'])
 
     def test_launch_content_none_sends_empty_string(self):
-        # Defensive: ``content`` defaulting through (None) still sets the env
-        # to the empty string rather than dropping it / passing None.
+        # Defensive: ``content`` defaulting through (None) still pipes the empty
+        # string rather than dropping it / passing None to stdin_text.
         ctx = _LaunchCtx()
         md_doc.launch(ctx, content=None, roots=())
-        # (path is None and content is None → still takes the stdin branch.)
-        self.assertEqual(ctx.calls[0]['env'], {md_doc.LAUNCH_STDIN_ENV: ''})
+        self.assertEqual(ctx.calls[0]['stdin_text'], '')
 
 
 if __name__ == '__main__':

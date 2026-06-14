@@ -232,8 +232,12 @@ def _id_visible(item, show_ids):
     ``'auto'`` mode the id is suppressed when ``str(item.id) ==
     item.title`` — the common shape for line-based CLI input where the
     id and title are the same string and showing both is pure
-    duplication.
+    duplication. A per-row ``item.id_hidden`` forces suppression
+    regardless of ``show_ids`` — for rows whose id is internal routing
+    state rather than a user-facing identifier.
     """
+    if getattr(item, 'id_hidden', False):
+        return False   # routing-only id, never displayed (e.g. launcher rows)
     if show_ids == 'always':
         return True
     if show_ids == 'never':
