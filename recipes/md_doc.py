@@ -8,11 +8,23 @@ nodes — plus the cross-document plumbing both ``browse-md`` and
 ``browse-claude`` need: reference detection/resolution between ``.md`` files,
 the cheap heading-detection gate, and a process-wide parse cache.
 
-It deliberately knows nothing about ``browse_tui`` / ``Item``: it returns plain
-structural ``MdNode`` dataclasses, and each recipe maps those onto its own
+Its STRUCTURAL half deliberately knows nothing about ``browse_tui`` / ``Item``:
+it returns plain ``MdNode`` dataclasses, and each recipe maps those onto its own
 ``Item``/id space, tags, and styling. That keeps the markdown logic unit-testable
 in isolation and decoupled from the TUI framework. ``browse-md`` and
 ``browse-claude`` import THIS module; it never imports them.
+
+A second, ``browse_tui``-AWARE section at the end of the file (after the
+structural logic, guarded by the same optional ``from browse_tui import …`` the
+plugin-registration block uses) is the single home for the *markdown launcher
+rows* shared between recipes: it resolves a document's ``.md`` references to
+labelled targets (``resolve_refs`` / ``ref_label``), builds the ``[md]
+References`` umbrella + ``[md ↗]`` launcher-row ``Item``s, and owns the one
+``launch`` helper that shells out to ``browse-md`` (the embedding flags + the
+stdin-vs-file delivery policy live there and nowhere else). The launch *target*
+inside a launcher-row id is opaque to ``md_doc`` — the hosting recipe interprets
+it at activate time. With ``browse_tui`` absent these helpers are simply not
+defined; the structural half above stays importable standalone regardless.
 
 The heading/list tree builder is ``browse-md``'s ``_build_nodes`` generalised
 and lifted out: same ``md2ansi_scan`` source-of-truth scan, same line/byte
@@ -583,6 +595,163 @@ def get_doc(abspath):
 def clear_cache():
     """Drop every cached document. Called on the recipes' reload paths."""
     _DOC_CACHE.clear()
+
+
+# ### Section: Reference label + filesystem reference resolution ###########
+
+# These two helpers sit just above the ``browse_tui``-aware launcher block but
+# need no ``Item`` — they are pure path logic, so they stay in the
+# framework-agnostic half and the launcher builders below call them.
+
+def ref_label(abspath, project_root):
+    """Display label for a launcher target, anchored on ``project_root``.
+
+    Relative to ``project_root`` when the target is inside it, else a
+    ``~``-collapsed absolute path — so a flat launcher list reads cleanly
+    without ``../`` noise. Lifted from browse-fs's ``_md_ref_label``; it is
+    also the natural sort key for ``resolve_refs``.
+    """
+    if project_root and (abspath == project_root
+                         or abspath.startswith(project_root.rstrip('/') + '/')):
+        return os.path.relpath(abspath, project_root)
+    home = os.path.expanduser('~')
+    if abspath == home or abspath.startswith(home + os.sep):
+        return '~' + abspath[len(home):]
+    return abspath
+
+
+def resolve_refs(text, *, doc_dir, cwd, project_root):
+    """Distinct existing ``.md`` references in ``text`` as ``(abspath, label)``.
+
+    Runs ``find_md_refs`` over ``text``, resolves each captured token with
+    ``resolve_md_ref`` (FILESYSTEM resolution only — a caller that follows
+    git-tree blobs does its own resolution), drops the ones that don't exist or
+    repeat an already-seen file (deduped by canonical abspath), and returns the
+    survivors sorted by display ``label`` (``ref_label`` against
+    ``project_root``). The referencing document's own path is NOT excluded — a
+    caller that lists a self-open row first dedups it via the ``seen`` set it
+    threads in (browse-fs seeds ``seen`` with the file itself).
+
+    ``doc_dir`` / ``cwd`` / ``project_root`` are the resolution bases, same
+    meaning as ``resolve_md_ref``'s. Returns ``[]`` when nothing resolves.
+    """
+    seen = set()
+    out = []
+    for captured in find_md_refs(text):
+        ab = resolve_md_ref(captured, doc_dir=doc_dir, cwd=cwd,
+                            project_root=project_root)
+        if ab is None or ab in seen:
+            continue
+        seen.add(ab)
+        out.append((ab, ref_label(ab, project_root)))
+    out.sort(key=lambda pair: pair[1])
+    return out
+
+
+# ### Section: browse_tui-aware launcher rows ##############################
+
+# Everything below needs the framework's ``Item`` (and, for the launch helper,
+# a live ``ctx``). The import is guarded exactly like the plugin-registration
+# block: under a browse-tui interpreter these names are defined and recipes use
+# them; as a standalone library (``browse_tui`` not on the path) they are simply
+# absent and only the structural half above is importable.
+#
+# The launcher-row id convention is generic and recipe-routable:
+#
+#     ('launch', anchor, *spec)
+#
+# ``anchor`` ties the row to the thing it expanded from (a parent path, a
+# message id, …) so sibling rows stay distinct; ``*spec`` is the launch target,
+# OPAQUE to md_doc — the recipe's Enter handler unpacks it and calls ``launch``.
+# browse-fs uses ``('launch', parent_path, 'md-file', target_abspath)``. Ids
+# stay hashable (flat tuple, never a list) and store *what* to launch, not a
+# command line, so they survive rebuilds and environment changes.
+
+# Env var carrying the stdin document for the shell-string ``launch`` form.
+# Passing the document through the environment (rather than quoting it onto the
+# command line) keeps it off ``argv`` — bounded by ARG_MAX (~2 MB), past which
+# the launch fails through ``run_external``'s normal error path.
+LAUNCH_STDIN_ENV = 'BROWSE_MD_STDIN'
+
+# Embedding flags for a browse-md launched from inside another browse-tui:
+# ``--no-alt-screen`` renders on the parent's alternate screen without the
+# child's own switch (paired with ``run_external(keep_screen=True)`` so neither
+# the launch nor the return flashes the primary screen), and
+# ``--quit-on-scope-up`` makes Alt-Up at the child's top quit it (returning to
+# the parent) rather than no-op'ing. This tuple + the stdin policy in ``launch``
+# are the single home for "how a recipe embeds browse-md".
+_LAUNCH_FLAGS = ('--no-alt-screen', '--quit-on-scope-up')
+
+try:
+    from browse_tui import Item
+
+    def references_umbrella(anchor):
+        """A ``[md] References`` umbrella ``Item`` over a document's links.
+
+        Expandable grouping row (``has_children=True``) whose id is
+        ``('md-refs', anchor)`` — distinct from the ``('launch', …)`` leaf ids
+        so a recipe routes the two apart. The caller supplies the umbrella's
+        children (one ``launcher_row`` per ``resolve_refs`` result). Provided
+        for callers that group references under a parent; browse-fs lists its
+        launcher rows flat and does not use it.
+        """
+        return Item(id=('md-refs', anchor), title='References',
+                    tag='md', has_children=True)
+
+    def launcher_row(anchor, spec, label):
+        """One ``[md ↗]`` launcher row titled ``label``.
+
+        Leaf row (``has_children=False``) with the generic, recipe-routable id
+        ``('launch', anchor, *spec)`` — ``spec`` is the opaque launch target
+        (e.g. ``('md-file', abspath)``) the recipe unpacks at Enter time. The
+        ``↗`` in the ``[md ↗]`` tag chip signals that Enter launches an external
+        browser rather than expanding or editing the row.
+        """
+        return Item(id=('launch', anchor, *spec), title=label,
+                    tag='md ↗', tag_style='yellow', has_children=False)
+
+    def launch(ctx, *, path=None, content=None, label=None, roots=()):
+        """Open a markdown document in ``browse-md`` as an external process.
+
+        The single home for the embedding flags + the stdin-vs-file delivery
+        policy. Exactly one of ``path`` / ``content`` is given:
+
+          * ``path`` — an on-disk ``.md`` file. Launched by plain argv:
+            ``['browse-md', *flags, path, '--root', *roots]``.
+          * ``content`` — markdown text NOT backed by a file (e.g. a transcript
+            message). Piped to ``browse-md -`` on stdin via ``run_external``'s
+            shell-string form, with the document handed through the
+            ``BROWSE_MD_STDIN`` env var rather than quoted onto the command
+            line: ``printf '%s' "$BROWSE_MD_STDIN" | browse-md - *flags --root
+            …`` (roots shell-quoted). Env-var delivery is ARG_MAX-bounded
+            (~2 MB); a pathological document fails the launch through
+            ``run_external``'s normal ``ctx.error`` path. A stdin document's
+            own reference-following is suppressed unless ``--root`` bases are
+            supplied, so ``roots`` is precisely what lets its refs resolve.
+
+        ``roots`` is an ordered sequence of ``--root`` resolution bases (the
+        file's own directory is always browse-md's first base, so these are
+        tried after it). ``label`` is accepted for symmetry / future surfacing
+        and otherwise unused. The handoff keeps the parent on the alternate
+        screen (``keep_screen=True``); see ``_LAUNCH_FLAGS`` for the flags.
+        """
+        flags = list(_LAUNCH_FLAGS)
+        root_args = []
+        for r in roots:
+            root_args += ['--root', r]
+        if path is not None:
+            ctx.run_external(['browse-md', *flags, path, *root_args],
+                             keep_screen=True)
+            return
+        # ``content`` form: pipe via stdin, document carried in the environment.
+        import shlex
+        cmd = (f'printf \'%s\' "${LAUNCH_STDIN_ENV}" | browse-md - '
+               + ' '.join(shlex.quote(a) for a in (*flags, *root_args)))
+        ctx.run_external(cmd, {LAUNCH_STDIN_ENV: content or ''},
+                         keep_screen=True)
+
+except ImportError:
+    pass
 
 
 # ### Section: Plugin registration #########################################

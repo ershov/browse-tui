@@ -149,33 +149,17 @@ def _project_root_for(abspath):
     return d
 
 
-def _md_ref_label(abspath, project_root):
-    """Display label for a launcher target, anchored like the design's ref labels.
-
-    Relative to ``project_root`` when the target is inside it, else a
-    ``~``-collapsed absolute path — so the flat launcher list reads cleanly
-    without ``../`` noise.
-    """
-    if project_root and (abspath == project_root
-                         or abspath.startswith(project_root.rstrip('/') + '/')):
-        return os.path.relpath(abspath, project_root)
-    home = os.path.expanduser('~')
-    if abspath == home or abspath.startswith(home + os.sep):
-        return '~' + abspath[len(home):]
-    return abspath
-
-
 def _launcher_item(parent_path, target_abspath, project_root):
     """One ``[md ↗]`` launcher row that opens ``target_abspath`` in browse-md.
 
-    Leaf row with a generic launch id ``('launch', parent_path, 'md-file',
-    target_abspath)`` — the id stores *what* to launch, not the command line
-    (built at Enter time). The ``↗`` in the ``[md ↗]`` tag chip signals that
-    Enter launches an external browser rather than expanding or editing.
+    Thin wrapper over ``md_doc.launcher_row``: the id is
+    ``('launch', parent_path, 'md-file', target_abspath)`` and the title is the
+    target's ``md_doc.ref_label`` anchored on ``project_root``. md_doc owns the
+    row shape (leaf, ``[md ↗]`` tag); browse-fs only supplies the opaque
+    ``('md-file', target_abspath)`` launch spec and the label anchoring.
     """
-    return Item(id=('launch', parent_path, 'md-file', target_abspath),
-                title=_md_ref_label(target_abspath, project_root),
-                tag='md ↗', tag_style='yellow', has_children=False)
+    return _md_doc.launcher_row(parent_path, ('md-file', target_abspath),
+                                _md_doc.ref_label(target_abspath, project_root))
 
 
 def _md_launcher_children(path):
@@ -183,10 +167,10 @@ def _md_launcher_children(path):
 
     The self-open row comes first (so a *.md row always has >=1 child — no
     empty-subtree self-heal needed), followed by one row per DISTINCT, EXISTING
-    ``.md`` file the document references (``md_doc.find_md_refs`` +
-    ``resolve_md_ref``, anchored on the file's own directory / cwd / project
-    root), sorted by display label. An unreadable file still yields the lone
-    self-open row.
+    ``.md`` file the document references (``md_doc.resolve_refs``, anchored on
+    the file's own directory / cwd / project root), sorted by display label —
+    the self file is excluded from that list (it is already the first row). An
+    unreadable file still yields the lone self-open row.
     """
     project_root = _project_root_for(path)
     rows = [_launcher_item(path, path, project_root)]
@@ -195,19 +179,13 @@ def _md_launcher_children(path):
             text = f.read(100 * 1024 * 1024).decode('utf-8', errors='replace')
     except OSError:
         return rows
-    doc_dir = os.path.dirname(path)
-    cwd = os.getcwd()
-    seen = {os.path.realpath(path)}
-    targets = []
-    for captured in _md_doc.find_md_refs(text):
-        ab = _md_doc.resolve_md_ref(captured, doc_dir=doc_dir, cwd=cwd,
-                                    project_root=project_root)
-        if ab is None or ab in seen:
+    self_abspath = os.path.realpath(path)
+    for ab, _label in _md_doc.resolve_refs(text, doc_dir=os.path.dirname(path),
+                                           cwd=os.getcwd(),
+                                           project_root=project_root):
+        if ab == self_abspath:
             continue
-        seen.add(ab)
-        targets.append(ab)
-    targets.sort(key=lambda ab: _md_ref_label(ab, project_root))
-    rows.extend(_launcher_item(path, ab, project_root) for ab in targets)
+        rows.append(_launcher_item(path, ab, project_root))
     return rows
 
 
@@ -330,40 +308,22 @@ def edit(ctx):
     ctx.run_external([editor, ctx.cursor.id])
 
 
-def _launch_browse_md(ctx, target):
-    """Open ``target`` (a markdown file path) in browse-md as an external process.
-
-    ``--root`` anchors browse-md's cross-file reference resolution at the
-    target's project root (git root, else its own directory), so links inside
-    the opened document resolve the same way they do here.
-
-    The handoff is switch-free in both directions: ``keep_screen=True`` keeps
-    us on the alternate screen rather than dropping to the primary one before
-    launch, and ``--no-alt-screen`` tells browse-md to render on that same
-    screen without its own alt-screen switch — so neither the launch nor the
-    return flashes the primary screen.
-
-    ``--quit-on-scope-up`` makes Alt-Up at the top of the launched browse-md
-    quit it (returning here) rather than no-op'ing.
-    """
-    ctx.run_external(
-        ['browse-md', '--no-alt-screen', '--quit-on-scope-up',
-         target, '--root', _project_root_for(target)],
-        keep_screen=True)
-
-
 def _on_enter(ctx):
     """Enter dispatch: launch on a ``[md ↗]`` launcher row, else edit (the default).
 
-    A launcher row carries a ``('launch', …, target)`` id — Enter opens its
-    target in browse-md. Every other row keeps browse-fs's original Enter
-    behaviour (edit the cursor in ``$EDITOR``).
+    A launcher row carries a ``('launch', parent, 'md-file', target)`` id —
+    Enter opens its target file in browse-md via ``md_doc.launch`` (which owns
+    the embedding flags + handoff). ``--root`` is anchored at the target's
+    project root (git root, else its own directory) so links inside the opened
+    document resolve the same way they do here. Every other row keeps browse-fs's
+    original Enter behaviour (edit the cursor in ``$EDITOR``).
     """
     cur = ctx.cursor
     if cur is None:
         return
     if isinstance(cur.id, tuple) and cur.id and cur.id[0] == 'launch':
-        _launch_browse_md(ctx, cur.id[3])
+        target = cur.id[3]
+        _md_doc.launch(ctx, path=target, roots=(_project_root_for(target),))
         return
     edit(ctx)
 
