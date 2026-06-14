@@ -14679,15 +14679,21 @@ class ListContent:
 
 
 class _Button:
-    """One parsed button: its on-screen display, hotkey, and return label.
+    """One parsed button: its on-screen display, hotkey, and return value.
 
-    The constructor resolves the standard ``&`` hotkey convention once so
-    drawing and key handling read plain fields:
+    The raw button is either a label ``str`` or a ``(label, value)`` 2-tuple.
+    Only the LABEL is parsed for the ``&`` hotkey convention; a tuple's
+    ``value`` is kept verbatim (it may be any type and is never scanned for
+    ``&``). The constructor resolves everything once so drawing and key
+    handling read plain fields:
 
       * ``display`` — what's shown inside the ``[ … ]`` cell (markers
         resolved: ``&X`` → ``X``, ``&&`` → a literal ``&``).
-      * ``label`` — the value :meth:`ChoiceContent.handle_key` returns for
-        this button. Same as ``display`` — the markers are resolved away.
+      * ``value`` — what :meth:`ChoiceContent.handle_key` returns for this
+        button. For a tuple it's the supplied ``value`` (any type); for a bare
+        string it's the resolved ``display`` (so a plain label returns itself).
+      * ``label`` — the resolved display, kept as a separate field for callers
+        that introspect a button. Always equals ``display``.
       * ``hotkey`` — the lowercased hotkey char (case-insensitive match), or
         ``None`` for a label with no ``&``-marked char (``&&`` doesn't count).
       * ``hot_index`` — the index of the hotkey char within ``display`` (so
@@ -14695,15 +14701,22 @@ class _Button:
     """
 
     def __init__(self, raw):
+        if isinstance(raw, tuple):
+            label, value = raw
+            has_value = True
+        else:
+            label = raw
+            value = None
+            has_value = False
         chars = []          # display chars accumulated
         hotkey = None
         hot_index = None
         i = 0
-        n = len(raw)
+        n = len(label)
         while i < n:
-            ch = raw[i]
+            ch = label[i]
             if ch == '&':
-                nxt = raw[i + 1] if i + 1 < n else ''
+                nxt = label[i + 1] if i + 1 < n else ''
                 if nxt == '&':
                     chars.append('&')   # literal ampersand, not a hotkey
                     i += 2
@@ -14723,6 +14736,9 @@ class _Button:
             i += 1
         self.display = ''.join(chars)
         self.label = self.display
+        # A bare string returns its own resolved display; a tuple returns the
+        # supplied value verbatim.
+        self.value = value if has_value else self.display
         self.hotkey = hotkey
         self.hot_index = hot_index
 
@@ -14740,16 +14756,19 @@ class ChoiceContent:
     then one centered row of buttons. The focused button is reverse-video and
     its hotkey char is underlined; the first button is focused initially.
 
-    ``buttons`` is a sequence of label strings using the standard ``&``
-    hotkey convention (``'&Yes'`` → ``Yes`` with ``Y`` the hotkey; ``&&`` a
-    literal ``&``; no ``&`` → no hotkey). An empty ``buttons`` raises
+    ``buttons`` is a sequence whose items are each a label ``str`` OR a
+    ``(label, value)`` 2-tuple. The label uses the standard ``&`` hotkey
+    convention (``'&Yes'`` → ``Yes`` with ``Y`` the hotkey; ``&&`` a literal
+    ``&``; no ``&`` → no hotkey); a tuple's ``value`` may be any type and is
+    kept verbatim (never scanned for ``&``). An empty ``buttons`` raises
     ``ValueError`` — a programming error, not a user condition. With a single
     button (the alert case) ``space`` also activates it.
 
-    :meth:`handle_key` returns the chosen button's label with the markers
-    resolved (``'&Yes'`` → ``'Yes'``); the engine's cancel path returns
-    ``None``. Implements the content protocol consumed by :func:`run_modal`
-    (``title`` / ``measure`` / ``draw_row`` / ``handle_key``).
+    :meth:`handle_key` returns the chosen button's VALUE — the supplied
+    ``value`` for a tuple, or the resolved display for a bare string
+    (``'&Yes'`` → ``'Yes'``); the engine's cancel path returns ``None``.
+    Implements the content protocol consumed by :func:`run_modal` (``title`` /
+    ``measure`` / ``draw_row`` / ``handle_key``).
     """
 
     def __init__(self, message, buttons, *, title=None):
@@ -14972,10 +14991,12 @@ class ChoiceContent:
         """Process one key; return ``(done, result)`` per the protocol.
 
         ``left``/``right``/``tab`` move focus WRAPPING (``tab`` forward like
-        ``right``). ``enter`` closes with the focused button's resolved label.
-        A hotkey letter (case-insensitive) closes with THAT button's label
-        immediately, regardless of focus. With a single button, ``space`` also
-        activates it. Every other key is ignored.
+        ``right``). ``enter`` closes with the focused button's value. A hotkey
+        letter (case-insensitive) closes with THAT button's value immediately,
+        regardless of focus. With a single button, ``space`` also activates it.
+        Every other key is ignored. (A button's value is its resolved display
+        for a bare string, or the supplied value for a ``(label, value)``
+        tuple — see :class:`_Button`.)
         """
         n = len(self._buttons)
         if key in ('right', 'tab'):
@@ -14985,9 +15006,9 @@ class ChoiceContent:
             self.focus = (self.focus - 1) % n
             return (False, None)
         if key == 'enter':
-            return (True, self._buttons[self.focus].label)
+            return (True, self._buttons[self.focus].value)
         if key == 'space' and n == 1:
-            return (True, self._buttons[0].label)
+            return (True, self._buttons[0].value)
         # Hotkey: case-insensitive match against the parsed hotkeys. A
         # single-char key whose lowercase matches a button's hotkey activates
         # it. (``&&`` parsed to no hotkey, so a literal ``&`` never matches.)
@@ -14995,7 +15016,7 @@ class ChoiceContent:
             k = key.lower()
             for button in self._buttons:
                 if button.hotkey is not None and button.hotkey == k:
-                    return (True, button.label)
+                    return (True, button.value)
 
         # Unrecognized key — ignored, loop continues.
         return (False, None)
@@ -15210,9 +15231,12 @@ def modal_confirm(browser, message, buttons=('&Yes', '&No'), *, title=None,
                   delay_interaction=False, _read_key=None):
     """Message + button row — a confirmation / single choice (``ctx.confirm``).
 
-    Returns the chosen button's resolved label (``'Yes'`` / ``'No'`` / …), or
-    ``None`` on cancel. An empty ``buttons`` raises ``ValueError`` (a
-    programming error — surfaced by :class:`ChoiceContent`).
+    Each item of ``buttons`` is a label ``str`` OR a ``(label, value)``
+    2-tuple. Returns the chosen button's value: the supplied ``value`` for a
+    tuple (any type — bool, int, an object, …), or the resolved label for a
+    bare string (``'Yes'`` / ``'No'`` / …). Returns ``None`` on cancel. An
+    empty ``buttons`` raises ``ValueError`` (a programming error — surfaced by
+    :class:`ChoiceContent`).
     """
     content = ChoiceContent(message, buttons, title=title)
     return run_modal(browser, content, placement='center',
@@ -16050,20 +16074,30 @@ class Context:
 
     def confirm(self, message: str, buttons=('&Yes', '&No'), *,
                 title: Optional[str] = None,
-                delay_interaction: bool = False) -> Optional[str]:
+                delay_interaction: bool = False) -> Optional[Any]:
         """Ask the user to choose a button in a modal choice dialog.
 
         Opens a centered modal showing ``message`` above a row of
-        ``buttons``. Each label uses the ``&`` hotkey convention
-        (``'&Yes'`` shows ``Yes`` with ``Y`` underlined; pressing ``y``
-        activates it). Returns the chosen button's resolved label —
-        ``'Yes'`` / ``'No'`` / … (the ``&`` stripped) — or ``None`` on
+        ``buttons``. Each item is a label ``str`` OR a ``(label, value)``
+        2-tuple; the label uses the ``&`` hotkey convention (``'&Yes'``
+        shows ``Yes`` with ``Y`` underlined; pressing ``y`` activates it).
+
+        Returns the chosen button's VALUE: the supplied ``value`` for a
+        tuple (any type), or the resolved label for a bare string
+        (``'Yes'`` / ``'No'`` / …, the ``&`` stripped). ``None`` on
         esc/ctrl-c cancel.
 
-        Compare the result explicitly: ``ctx.confirm(...) == 'Yes'``.
-        ``None`` (cancel) is never equal to a label, so a cancel reads as
-        "not Yes" for free; the truthiness idiom ``if ctx.confirm(...)``
-        is wrong because ``'No'`` is a truthy string.
+        Map buttons to values so the result is used directly, sidestepping
+        string comparison::
+
+            if ctx.confirm(msg, [('&Yes', True), ('&No', False)]):
+                ...
+
+        With bare-string buttons, compare explicitly
+        (``ctx.confirm(...) == 'Yes'``) — the truthiness idiom
+        ``if ctx.confirm(...)`` is wrong because ``'No'`` is a truthy
+        string. (Cancel returns ``None``, so mapping a button to ``None``
+        makes a confirmed-``None`` indistinguishable from a cancel.)
 
         ``delay_interaction`` is forwarded to the modal engine. Headless
         Browsers return ``None`` immediately (the safe-default, no-open

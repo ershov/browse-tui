@@ -803,20 +803,30 @@ class Context:
 
     def confirm(self, message: str, buttons=('&Yes', '&No'), *,
                 title: Optional[str] = None,
-                delay_interaction: bool = False) -> Optional[str]:
+                delay_interaction: bool = False) -> Optional[Any]:
         """Ask the user to choose a button in a modal choice dialog.
 
         Opens a centered modal showing ``message`` above a row of
-        ``buttons``. Each label uses the ``&`` hotkey convention
-        (``'&Yes'`` shows ``Yes`` with ``Y`` underlined; pressing ``y``
-        activates it). Returns the chosen button's resolved label —
-        ``'Yes'`` / ``'No'`` / … (the ``&`` stripped) — or ``None`` on
+        ``buttons``. Each item is a label ``str`` OR a ``(label, value)``
+        2-tuple; the label uses the ``&`` hotkey convention (``'&Yes'``
+        shows ``Yes`` with ``Y`` underlined; pressing ``y`` activates it).
+
+        Returns the chosen button's VALUE: the supplied ``value`` for a
+        tuple (any type), or the resolved label for a bare string
+        (``'Yes'`` / ``'No'`` / …, the ``&`` stripped). ``None`` on
         esc/ctrl-c cancel.
 
-        Compare the result explicitly: ``ctx.confirm(...) == 'Yes'``.
-        ``None`` (cancel) is never equal to a label, so a cancel reads as
-        "not Yes" for free; the truthiness idiom ``if ctx.confirm(...)``
-        is wrong because ``'No'`` is a truthy string.
+        Map buttons to values so the result is used directly, sidestepping
+        string comparison::
+
+            if ctx.confirm(msg, [('&Yes', True), ('&No', False)]):
+                ...
+
+        With bare-string buttons, compare explicitly
+        (``ctx.confirm(...) == 'Yes'``) — the truthiness idiom
+        ``if ctx.confirm(...)`` is wrong because ``'No'`` is a truthy
+        string. (Cancel returns ``None``, so mapping a button to ``None``
+        makes a confirmed-``None`` indistinguishable from a cancel.)
 
         ``delay_interaction`` is forwarded to the modal engine. Headless
         Browsers return ``None`` immediately (the safe-default, no-open

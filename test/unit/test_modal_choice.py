@@ -533,6 +533,116 @@ class TestActivation(unittest.TestCase):
         self.assertEqual(c.focus, 0)
 
 
+# --- (display, value) tuple buttons: value mapping (ticket #998) ------------
+
+
+class TestValueMapping(unittest.TestCase):
+    """A button may be a ``(display, value)`` tuple: the display half is parsed
+    for the ``&`` hotkey convention EXACTLY as a bare string is, but activating
+    the button returns the tuple's ``value`` (any type) rather than the resolved
+    display. A bare string keeps today's behavior — it returns its own resolved
+    display, so ``b.value == b.display``."""
+
+    def test_bare_string_value_is_resolved_display(self):
+        # Backward compat: a bare string's value is its resolved display.
+        c = ChoiceContent('m', ['&Yes', 'O&K', 'a&&b', 'Plain'])
+        b = c._buttons
+        self.assertEqual([x.value for x in b], ['Yes', 'OK', 'a&b', 'Plain'])
+        # ``label`` stays the resolved display too (existing callers/tests).
+        self.assertEqual([x.label for x in b], ['Yes', 'OK', 'a&b', 'Plain'])
+
+    def test_tuple_parses_display_for_hotkey(self):
+        # The display half is parsed identically to a bare string; the value
+        # half is NOT scanned for ``&``.
+        c = ChoiceContent('m', [('&Yes', 1)])
+        b = c._buttons[0]
+        self.assertEqual(b.display, 'Yes')
+        self.assertEqual(b.label, 'Yes')      # label still tracks display
+        self.assertEqual(b.hotkey, 'y')
+        self.assertEqual(b.hot_index, 0)
+        self.assertEqual(b.value, 1)          # the tuple's value, verbatim
+
+    def test_tuple_value_not_parsed_for_ampersand(self):
+        # A ``&`` living in the VALUE must survive untouched — only the display
+        # half goes through the hotkey parser.
+        c = ChoiceContent('m', [('&Save', 'a&&b')])
+        b = c._buttons[0]
+        self.assertEqual(b.display, 'Save')
+        self.assertEqual(b.value, 'a&&b')     # value kept verbatim, not 'a&b'
+
+    def test_enter_returns_tuple_value(self):
+        c = ChoiceContent('m', [('&Yes', True), ('&No', False)])
+        c.measure(40, 24)
+        done, result = c.handle_key('enter')   # focus on first button
+        self.assertTrue(done)
+        self.assertIs(result, True)
+        c2 = ChoiceContent('m', [('&Yes', True), ('&No', False)])
+        c2.measure(40, 24)
+        c2.handle_key('right')                 # focus -> second button
+        done, result = c2.handle_key('enter')
+        self.assertTrue(done)
+        self.assertIs(result, False)
+
+    def test_hotkey_returns_tuple_value(self):
+        c = ChoiceContent('m', [('&Yes', True), ('&No', False)])
+        c.measure(40, 24)
+        done, result = c.handle_key('n')       # 'No' hotkey, focus still Yes
+        self.assertTrue(done)
+        self.assertIs(result, False)
+
+    def test_single_button_space_returns_tuple_value(self):
+        sentinel = object()
+        c = ChoiceContent('m', [('&OK', sentinel)])
+        c.measure(40, 24)
+        done, result = c.handle_key('space')
+        self.assertTrue(done)
+        self.assertIs(result, sentinel)
+
+    def test_mixed_string_and_tuple_sequence(self):
+        # A sequence may freely mix bare strings and tuples; each returns the
+        # right thing (string -> resolved display, tuple -> its value).
+        c = ChoiceContent('m', ['&Yes', ('&No', 0), '&Maybe'])
+        c.measure(40, 24)
+        done, result = c.handle_key('y')       # bare string -> resolved display
+        self.assertEqual(result, 'Yes')
+        c2 = ChoiceContent('m', ['&Yes', ('&No', 0), '&Maybe'])
+        c2.measure(40, 24)
+        done, result = c2.handle_key('n')      # tuple -> its value (the int 0)
+        self.assertIs(result, 0)
+        c3 = ChoiceContent('m', ['&Yes', ('&No', 0), '&Maybe'])
+        c3.measure(40, 24)
+        done, result = c3.handle_key('m')      # bare string -> resolved display
+        self.assertEqual(result, 'Maybe')
+
+    def test_double_amp_literal_unaffected_in_tuple_display(self):
+        # ``&&`` in a tuple's display still resolves to a literal '&' and is
+        # NOT a hotkey; the value half is independent.
+        c = ChoiceContent('m', [('a&&b', 99)])
+        c.measure(40, 24)
+        b = c._buttons[0]
+        self.assertEqual(b.display, 'a&b')
+        self.assertIsNone(b.hotkey)
+        done, result = c.handle_key('enter')
+        self.assertIs(result, 99)
+        # The literal '&' still doesn't activate.
+        c2 = ChoiceContent('m', [('a&&b', 99)])
+        c2.measure(40, 24)
+        done2, result2 = c2.handle_key('&')
+        self.assertFalse(done2)
+        self.assertIsNone(result2)
+
+    def test_non_string_values_round_trip(self):
+        # bool / int / arbitrary object all come back unchanged via enter.
+        marker = object()
+        cases = [True, 0, 42, marker, None, ['a', 'b'], {'k': 'v'}]
+        for val in cases:
+            c = ChoiceContent('m', [('&Go', val)])
+            c.measure(40, 24)
+            done, result = c.handle_key('enter')
+            self.assertTrue(done)
+            self.assertIs(result, val)
+
+
 # --- integration through run_modal -----------------------------------------
 
 
@@ -567,6 +677,14 @@ class TestThroughRunModal(unittest.TestCase):
         with _FixedTermSize(80, 24), _Capture():
             res = run_modal(b, c, _read_key=_scripted(['esc']))
         self.assertIsNone(res)
+
+    def test_tuple_value_through_engine(self):
+        # A (display, value) tuple's value comes back through the full loop.
+        b = _FakeBrowser()
+        c = ChoiceContent('Delete?', [('&Yes', True), ('&No', False)])
+        with _FixedTermSize(80, 24), _Capture():
+            res = run_modal(b, c, _read_key=_scripted(['right', 'enter']))
+        self.assertIs(res, False)
 
 
 if __name__ == '__main__':

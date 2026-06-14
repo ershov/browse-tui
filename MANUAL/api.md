@@ -534,17 +534,29 @@ def rename(ctx):
     ctx.refresh()
 ```
 
-#### `ctx.confirm(message, buttons=('&Yes', '&No'), *, title=None) -> str | None`
+#### `ctx.confirm(message, buttons=('&Yes', '&No'), *, title=None) -> Any | None`
 
-Open a modal choice dialog: `message` above a row of `buttons`. Each label
-uses the `&` hotkey convention (`'&Yes'` shows `Yes` with `Y` underlined;
-pressing `y` activates it). Returns the chosen button's resolved label
-(`'Yes'`, `'No'`, …, with the `&` stripped), or `None` on Esc / Ctrl-C.
+Open a modal choice dialog: `message` above a row of `buttons`. Each button is
+a label `str` **or** a `(display, value)` tuple. The display uses the `&`
+hotkey convention (`'&Yes'` shows `Yes` with `Y` underlined; pressing `y`
+activates it).
 
-Compare the result explicitly — `ctx.confirm(...) == 'Yes'`. A cancel returns
-`None`, which is never equal to a label, so it reads as "not Yes" for free.
-The truthiness idiom `if ctx.confirm(...)` is **wrong**: `'No'` is a truthy
-string.
+The dialog returns the chosen button's **value**: the tuple's `value` (any
+type — `True`, an int, an object, …) for a tuple, or the displayed text (with
+the `&` stripped) for a bare string. A cancel (Esc / Ctrl-C) returns `None`.
+
+Map buttons to values so the result is used directly:
+
+```python
+if ctx.confirm('Delete?', [('&Yes', True), ('&No', False)]):
+    do_delete()
+```
+
+With bare-string buttons, compare explicitly — `ctx.confirm(...) == 'Yes'`. A
+cancel returns `None`, which is never equal to a label, so it reads as "not
+Yes" for free. The truthiness idiom `if ctx.confirm(...)` is **wrong** with
+bare strings: `'No'` is a truthy string. (Cancel returns `None`, so mapping a
+button to `None` makes a confirmed-`None` indistinguishable from a cancel.)
 
 #### `ctx.alert(text, *, title=None) -> None`
 

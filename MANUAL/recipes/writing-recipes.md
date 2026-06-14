@@ -125,6 +125,17 @@ def delete(ctx):
     ctx.refresh()
 ```
 
+A button may also be a `(display, value)` tuple, so the result is used
+directly instead of comparing label strings:
+
+```python
+def delete(ctx):
+    if not ctx.confirm(f'delete {len(ctx.targets)} items?',
+                       [('&Yes', True), ('&No', False)]):
+        return
+    ...
+```
+
 ### Picker (fzf-style sub-flow)
 
 ```python
