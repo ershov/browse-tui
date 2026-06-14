@@ -2313,6 +2313,7 @@ def main():
 
     b = Browser(BrowserConfig(
         title=_window_title(),
+        show_children_pane=False,
         get_children=get_children,
         get_preview=get_preview,
         format_row_content=git_row_content,

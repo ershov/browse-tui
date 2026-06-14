@@ -325,10 +325,10 @@ class TestBrowseGit(unittest.TestCase):
     def test_enter_toggles_file_list(self):
         """Enter opens a commit's file list, and a second Enter closes it.
 
-        The standalone Children pane always shows the cursor's children,
-        so we assert on the *tree* instead: an expanded commit shows its
-        file as an indented ``[A] beta.txt`` row in the list pane, and the
-        collapse removes that indented row. The commit's expand marker
+        The recipe runs with no children pane, so we assert on the
+        *tree*: an expanded commit shows its file as an indented
+        ``[A] beta.txt`` row in the list pane, and the collapse removes
+        that indented row. The commit's expand marker
         flips ``▼`` (open) ↔ ``▶`` (closed) in lockstep, which we also
         check on the subject's row.
         """
@@ -455,6 +455,10 @@ class TestBrowseGit(unittest.TestCase):
     def test_rapid_scroll_children_pane_lands(self):
         """Rapid 25-key burst lands the children pane within ~2s.
 
+        The recipe hides the children pane by default (the preview
+        already lists the changed files), so we first toggle it on with
+        Alt+P — its files-changed behaviour still has to be correct.
+
         Pre-#481 the cursor-driven children prefetch was FIFO, so a
         25-keystroke burst accumulated 25 ``get_children`` calls and
         the cursor's children pane appeared only after every visited
@@ -463,8 +467,10 @@ class TestBrowseGit(unittest.TestCase):
         files-changed list appears within a fixed budget regardless
         of burst depth.
 
-        Asserts the children pane shows at least one ``f###.txt`` row
-        (the committed file path) inside 2s of the burst settling.
+        Asserts the children pane shows at least one ``[A] f###.txt``
+        row. The ``[A]`` status prefix is the children grid's row
+        format — it pins the match to the pane, since the preview's
+        ``--stat`` lists the same file as a bare ``f###.txt | +N``.
         """
         with tempfile.TemporaryDirectory() as tmp:
             _make_repo_with_n_commits(tmp, n=30)
@@ -474,14 +480,19 @@ class TestBrowseGit(unittest.TestCase):
                 # Wait for the recipe to render the list (any commit
                 # message is enough; commits are named 'commit 000'..).
                 t.wait_for('commit 029', timeout=5.0)
+                # Toggle the children pane on (Alt+P) and wait for its
+                # separator before bursting, so the burst exercises the
+                # pane's prefetch path rather than racing its first paint.
+                t.send('M-p')
+                t.wait_for('Children', timeout=5.0)
                 # Burst 25 j keys.
                 for _ in range(25):
                     t.send('j')
                 # After cursor stops, the children pane should populate
-                # within 2s. Look for any ``f###.txt`` path — those are
-                # the file ids displayed in the children grid pane.
+                # within 2s. Look for any ``[A] f###.txt`` row — the file
+                # ids the children grid renders for the cursor's commit.
                 deadline = time.time() + 2.0
-                file_re = re.compile(r'f\d{3}\.txt')
+                file_re = re.compile(r'\[A\] f\d{3}\.txt')
                 found = False
                 while time.time() < deadline:
                     pane = t.capture()
@@ -491,7 +502,7 @@ class TestBrowseGit(unittest.TestCase):
                     time.sleep(0.05)
                 self.assertTrue(
                     found,
-                    'children pane did not show any f###.txt entry '
+                    'children pane did not show any [A] f###.txt entry '
                     'within 2s of cursor settling — prefetch slot may '
                     'not be coalescing.',
                 )
