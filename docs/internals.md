@@ -596,10 +596,11 @@ concentrated in `080-cli.py`:
 
 ## Common gotchas
 
-- **Re-entrancy.** `ctx.pick`, `ctx.input`, `ctx.confirm` block reading
-  keys. Calling one inside another's handler is undefined; `ctx.pick` is
-  documented as not-re-entrant. (`ctx.run_external` and `ctx.page` are
-  fine — they suspend the entire terminal.)
+- **Re-entrancy.** `ctx.pick`, `ctx.menu`, `ctx.confirm`, `ctx.alert`,
+  `ctx.input` open modal dialogs (a nested key loop). Only one modal may
+  be open at a time: `run_modal` raises `RuntimeError` if one is already
+  open, so every modal dialog is non-re-entrant. (`ctx.run_external` and
+  `ctx.page` are fine — they suspend the entire terminal.)
 
 - **Thread safety.** Browser methods document themselves as thread-safe
   (everything goes through `post()`). Direct `state._children[…]` writes
@@ -608,8 +609,9 @@ concentrated in `080-cli.py`:
 
 - **`_notify` keys.** `read_key()` returns the synthetic key `'_notify'`
   on a self-pipe wake. Action handlers and sub-flow loops must drain on
-  this key (the main loop does it automatically; sub-flows like
-  `_pick_on_info_bar` do it explicitly).
+  this key (the main loop does it automatically; the modal loop
+  `run_modal` in `055-modal.py` drains `_notify` and channel events
+  without rendering while a dialog is open).
 
 - **`ctx.cursor` can be None.** When the visible list is empty, when the
   cursor sits on a placeholder (`⧗ loading…`), or when scoped to an empty

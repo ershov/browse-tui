@@ -1659,8 +1659,9 @@ def _preview_pane_height(browser):
 # Search / filter edit modes route through here too — the prompt stays
 # open, the mouse just moves the cursor or scrolls the pane like in
 # normal mode. Insert-mode runs in _handle_insert_key (and silently
-# ignores what it doesn't recognize). Pickers in _pick_on_info_bar
-# swallow unknowns, so this dispatcher never fires while a picker is up.
+# ignores what it doesn't recognize). Modal dialogs (run_modal) run their
+# own nested key loop and swallow mouse events, so this dispatcher never
+# fires while a dialog is up.
 
 _WHEEL_LINES = 3
 

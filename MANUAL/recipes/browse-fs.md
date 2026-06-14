@@ -12,7 +12,8 @@ changed directories.
 - `get_preview` branching on dir vs file (head of file, or `os.listdir`).
 - Custom `Action` handlers using `ctx.run_external` for `$EDITOR` /
   `xdg-open`.
-- `ctx.confirm` as a y/n prompt before destructive operations.
+- `ctx.confirm` as a modal Yes/No dialog before destructive operations
+  (compares the returned label against `'Yes'`).
 - `ctx.error` and `ctx.refresh` for error reporting and post-action UI
   refresh.
 - Recipe-set Item attributes (`item.size`, `item.mode`, `item.mtime`) that

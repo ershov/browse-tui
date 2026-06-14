@@ -363,11 +363,12 @@ class _ActionCtx:
     """A minimal ``ctx`` for the e/o/d actions.
 
     Records ``run_external`` argv lists and ``error`` messages; ``confirm``
-    is auto-answered (default yes) and remembered so a test can assert it
+    is auto-answered (default ``'Yes'`` — the recipe compares the modal's
+    returned label against ``'Yes'``) and remembered so a test can assert it
     was never reached for a no-op. ``cursor`` is ``targets[0]``.
     """
 
-    def __init__(self, targets, *, confirm=True):
+    def __init__(self, targets, *, confirm='Yes'):
         self.targets = targets
         self.cursor = targets[0] if targets else None
         self._confirm_answer = confirm

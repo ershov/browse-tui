@@ -6,14 +6,15 @@ split is deliberate:
 * **Browser** is the thread-safe surface — every public op is callable
   from any thread (``post()`` shuttles work onto the main thread).
 * **Context** wraps Browser and adds main-thread-only sub-flows like
-  ``input``, ``confirm``, ``run_external``, and ``page``. These read
-  keys synchronously or suspend the terminal to launch external
-  processes; they are *not* safe to call from a worker thread.
+  ``input``, ``confirm``, ``run_external``, and ``page``. These open
+  modal dialogs (a nested key loop) or suspend the terminal to launch
+  external processes; they are *not* safe to call from a worker thread.
 
 Affordances exposed on Context: ``cursor``, ``selected``, ``targets``,
 plus pass-through versions of ``refresh / cursor_to / expand / select /
 flash / log / error / print / quit`` and the main-thread sub-flows
-``run_external``, ``page``, ``input``, ``confirm``, ``pick``, ``insert``.
+``run_external``, ``page``, ``input``, ``confirm``, ``alert``, ``pick``,
+``menu``, ``insert``.
 """
 
 import os
@@ -779,31 +780,68 @@ class Context:
                 term_resume()
             self._browser._needs_redraw.add('all')
 
-    def input(self, prompt: str, default: str = '') -> Optional[str]:
-        """Read a single-line string from the user on the info bar.
+    def input(self, prompt: str, default: str = '',
+              *, delay_interaction: bool = False) -> Optional[str]:
+        """Prompt for a single-line string in a modal input dialog.
 
-        Returns the text typed (empty string if the user just hit
-        Enter), or ``None`` if the user cancelled with esc/ctrl-c.
+        Opens a centered modal with the wrapped ``prompt`` above a one-row
+        entry field pre-filled with ``default``. Returns the text typed
+        (empty string if the user just hit Enter), or ``None`` if the user
+        cancelled with esc/ctrl-c.
 
-        Headless Browsers return ``default`` immediately so unit tests
-        can drive deterministic flows; the real TTY path defers to
-        ``_read_line_on_info_bar`` and is exercised by UI tests in
-        ticket #14.
+        ``delay_interaction`` (forwarded to the modal engine) ignores keys
+        the user was typing at the previous screen for a short grace window
+        — for dialogs that appear on their own rather than on request.
+
+        Headless Browsers return ``default`` immediately so unit tests can
+        drive deterministic flows without opening a dialog.
         """
         if self._browser._headless:
             return default
-        return _read_line_on_info_bar(self._browser, prompt, default)
+        return modal_input(self._browser, prompt, default=default,
+                           delay_interaction=delay_interaction)
 
-    def confirm(self, prompt: str) -> bool:
-        """Show ``prompt`` and read y/n on the info bar.
+    def confirm(self, message: str, buttons=('&Yes', '&No'), *,
+                title: Optional[str] = None,
+                delay_interaction: bool = False) -> Optional[str]:
+        """Ask the user to choose a button in a modal choice dialog.
 
-        Returns ``True`` for ``y``/``Y``, ``False`` for ``n``/``N`` or
-        cancel. Headless Browsers return ``False`` so unit tests can
-        rely on the safe-default outcome.
+        Opens a centered modal showing ``message`` above a row of
+        ``buttons``. Each label uses the ``&`` hotkey convention
+        (``'&Yes'`` shows ``Yes`` with ``Y`` underlined; pressing ``y``
+        activates it). Returns the chosen button's resolved label —
+        ``'Yes'`` / ``'No'`` / … (the ``&`` stripped) — or ``None`` on
+        esc/ctrl-c cancel.
+
+        Compare the result explicitly: ``ctx.confirm(...) == 'Yes'``.
+        ``None`` (cancel) is never equal to a label, so a cancel reads as
+        "not Yes" for free; the truthiness idiom ``if ctx.confirm(...)``
+        is wrong because ``'No'`` is a truthy string.
+
+        ``delay_interaction`` is forwarded to the modal engine. Headless
+        Browsers return ``None`` immediately (the safe-default, no-open
+        outcome) so unit tests don't drive a key stream.
         """
         if self._browser._headless:
-            return False
-        return _confirm_on_info_bar(self._browser, prompt)
+            return None
+        return modal_confirm(self._browser, message, buttons, title=title,
+                             delay_interaction=delay_interaction)
+
+    def alert(self, text: str, *, title: Optional[str] = None,
+              delay_interaction: bool = False) -> None:
+        """Show ``text`` in a modal notification with a single OK button.
+
+        Opens a centered modal showing ``text`` above one ``[ OK ]`` button;
+        the user dismisses it with enter/space/esc. Returns ``None`` always
+        — an alert conveys nothing back to the caller.
+
+        ``delay_interaction`` is forwarded to the modal engine. Headless
+        Browsers are a no-op (nothing is drawn, nothing is read).
+        """
+        if self._browser._headless:
+            return None
+        return modal_alert(self._browser, text, title=title,
+                           delay_interaction=delay_interaction)
 
     def insert(self, label: str,
                on_confirm: Callable[[str, Any], None]) -> None:
@@ -860,353 +898,90 @@ class Context:
         self._browser._insert_callback = on_confirm
         self._browser._needs_redraw.add('all')
 
-    def pick(self, label: str, options) -> Optional[str]:
-        """fzf-style filterable picker overlaid on the preview pane.
+    def pick(self, label: str, options,
+             *, delay_interaction: bool = False) -> Optional[str]:
+        """fzf-style filterable picker in a centered modal dialog.
 
-        Renders a ``label> `` prompt on the info bar and the filtered
-        list of ``options`` in the preview pane area. The user can:
+        Opens a centered modal with a ``> `` filter row above the list of
+        ``options`` (``label`` becomes the dialog title). The user can:
 
           * type to filter (case-insensitive substring match);
-          * up / down / ctrl-p / ctrl-n to move the picker cursor;
+          * up / down / ctrl-p / ctrl-n to move the selection (wrapping);
           * home / end to jump to the first / last filtered match;
           * enter to select the highlighted option;
           * esc / ctrl-c to cancel;
           * backspace to edit the filter.
 
-        Returns the selected option string, or ``None`` if cancelled.
-        Headless Browsers return ``None`` immediately so unit tests can
-        rely on the cancel outcome without driving a key stream.
-
-        The picker is **not re-entrant** — calling ``ctx.pick`` from
-        inside another ``ctx.pick`` handler is unsupported and will
-        produce undefined screen state.
+        Returns the selected option string, or ``None`` if cancelled. An
+        empty ``options`` returns ``None`` without opening. Headless
+        Browsers return ``None`` immediately so unit tests can rely on the
+        cancel outcome without driving a key stream. ``delay_interaction``
+        is forwarded to the modal engine.
         """
         if self._browser._headless:
             return None
-        return _pick_on_info_bar(self._browser, label, list(options))
+        return modal_pick(self._browser, label, list(options),
+                          delay_interaction=delay_interaction)
+
+    def menu(self, items, *, anchor=None,
+             delay_interaction: bool = False) -> Optional[str]:
+        """Anchored, unfiltered selection list — a context menu.
+
+        Opens a modal selection list WITHOUT a filter row. ``anchor`` is an
+        optional ``(row, col)`` 1-based screen cell the menu drops below;
+        when ``None`` it defaults to the list cursor's screen cell so a
+        menu reads as attached to the current row. The user moves with
+        up/down (wrapping), jumps with home/end, picks with enter, cancels
+        with esc/ctrl-c.
+
+        Returns the chosen item string, or ``None`` on cancel. An empty
+        ``items`` returns ``None`` without opening. Headless Browsers return
+        ``None`` immediately. ``delay_interaction`` is forwarded to the
+        modal engine.
+        """
+        if self._browser._headless:
+            return None
+        if anchor is None:
+            anchor = _list_cursor_cell(self._browser)
+        return modal_menu(self._browser, list(items), anchor=anchor,
+                          delay_interaction=delay_interaction)
 
 
-# ---- info-bar prompt helpers ----------------------------------------------
+# ---- modal helpers --------------------------------------------------------
 #
-# The implementations below mirror plan-tui's ``_read_string`` and
-# ``_status_bar_message`` patterns (see plan-source/src-tui/060-actions.py).
-# Phase 1 here implements the minimum necessary for production runs; full
-# polish (cursor visibility, scroll-back, history) is out of scope. UI
-# tests in ticket #14 exercise these by driving a real terminal.
+# Geometry derivation for ``ctx.menu``. The info-bar / preview-pane prompt
+# loops (``_draw_info_prompt``, ``_read_line_on_info_bar``,
+# ``_confirm_on_info_bar``, ``_pick_on_info_bar``, ``_info_bar_geometry``)
+# that used to live here are gone — those sub-flows are modal dialogs now
+# (see ``055-modal.py`` and the ``ctx`` methods above).
 
 
-def _info_bar_geometry(browser):
-    """Return ``(row, left, width)`` for the info bar, or ``(0, 0, 0)`` if no room.
+def _list_cursor_cell(browser):
+    """Screen cell ``(row, col)`` of the list cursor, or ``None``.
 
-    The render layer owns ``layout_panes`` and the actual geometry; we
-    re-derive it here so the prompt helpers don't have to thread layout
-    state through every call. Returns ``(0, 0, 0)`` when the terminal is
-    too small to host the info bar. ``left`` and ``width`` come from the
-    info-bar Rect so non-'h' layouts (v/m/pc) — where the info bar is a
-    standalone bottom row, currently full-width — still resolve to the
-    right span; if a future layout makes the info bar narrower this
-    helper will track that automatically.
+    ``ctx.menu`` drops a context menu just below the active list row when no
+    explicit anchor is given, so it reads as attached to the cursor. This
+    re-derives that cell the same way ``render_list`` (050-render.py) paints
+    it: the list pane's :class:`Rect` from :func:`layout_panes`, then the
+    cursor's visible-row index ``state.cursor - browser._list_scroll`` added
+    to the pane top, with the column at the pane's left edge. There is no
+    header offset — the list pane paints rows starting at ``rect.top``.
+
+    Returns ``None`` (caller falls back to a centered dialog) when the
+    geometry can't be derived: no list pane in the current layout, or the
+    cursor row scrolled out of the pane's visible span (so an anchor cell
+    would point off the list).
     """
     cols, rows = term_size()
     layout = layout_panes(cols, rows,
                           split=getattr(browser, 'split', 'h'),
                           show_preview=browser.show_preview,
                           list_ratio=browser.list_ratio)
-    info_bar = layout.get('info_bar')
-    if info_bar is None:
-        return 0, 0, 0
-    return info_bar.top, info_bar.left, info_bar.width
-
-
-def _draw_info_prompt(browser, prompt, buf):
-    """Paint ``prompt + buf`` on the info bar.
-
-    Mirrors plan-tui's _read_string drawing: prompt in bold yellow on
-    blue, buf in normal text, fill rest of the row with separator
-    characters in gray. Doesn't read input — callers loop with
-    ``read_key`` and call this after each key.
-
-    Uses the info-bar Rect (``left``..``left+width``) rather than the
-    full screen width so the prompt overlays exactly the info-bar row,
-    leaving the rest of the screen alone.
-    """
-    row, left, width = _info_bar_geometry(browser)
-    if row <= 0 or width <= 0:
-        return
-    move(row, left)
-    clear_columns(row, left, left + width)
-    move(row, left)
-    set_style(fg=11, bg=4, bold=True)
-    write(prompt[:width])
-    pos = len(prompt) if len(prompt) < width else width
-    if pos < width:
-        set_style()
-        remaining = width - pos
-        write(buf[:remaining])
-        pos += min(len(buf), remaining)
-    if pos < width:
-        set_style(fg=8)
-        write('─' * (width - pos))
-    set_style()
-    flush()
-
-
-def _read_line_on_info_bar(browser, prompt, default=''):
-    """Drive a single-line text-entry prompt on the info bar.
-
-    Returns the typed string on Enter, or None on esc/ctrl-c. ``default``
-    pre-fills the input (so editors and rename flows can offer the
-    current value).
-
-    Resize events (``_notify`` after a SIGWINCH) cause a redraw of the
-    info bar; the typed buffer is preserved across resizes.
-    """
-    buf = default
-    while True:
-        _draw_info_prompt(browser, prompt, buf)
-        key = read_key()
-        if key == '_notify':
-            # SIGWINCH or other notification — repaint and continue.
-            continue
-        if key == 'enter':
-            return buf
-        if key in ('esc', 'ctrl-c'):
-            return None
-        if key == 'backspace':
-            if buf:
-                buf = buf[:-1]
-            continue
-        if key == 'space':
-            buf += ' '
-            continue
-        if len(key) == 1 and key.isprintable():
-            buf += key
-
-
-def _confirm_on_info_bar(browser, prompt):
-    """Drive a y/n prompt on the info bar.
-
-    Returns True for y/Y, False for n/N or esc/ctrl-c. Other keys are
-    ignored (the prompt re-paints and waits for a fresh key).
-    """
-    while True:
-        _draw_info_prompt(browser, prompt + ' (y/n) ', '')
-        key = read_key()
-        if key == '_notify':
-            continue
-        if key in ('y', 'Y'):
-            return True
-        if key in ('n', 'N', 'esc', 'ctrl-c'):
-            return False
-
-
-# ---- pick / picker overlay ------------------------------------------------
-#
-# fzf-style sub-flow: prompt 'label> ' on the info bar, filtered list of
-# options overlaid in the preview pane area. Mirrors plan-tui's
-# ``action_status`` (see plan-source/src-tui/060-actions.py:134) — same
-# key dispatch, simpler cancel/return contract. Resize handling inside
-# the picker is deferred to phase 3 (the helper just continues the loop
-# on ``_notify`` / SIGWINCH; the next iteration re-reads geometry and
-# repaints).
-
-
-def _pick_on_info_bar(browser, label, options, *, _read_key=None):
-    """Run the fzf-style picker loop. Returns the chosen string or None.
-
-    ``_read_key`` is an injection seam for unit tests — when None we
-    defer to the module-level ``read_key`` from ``020-terminal``. Tests
-    pass an iterator-backed callable to drive a deterministic key stream
-    without a real TTY.
-
-    Layout:
-      * filter prompt on ``info_row`` (yellow-on-blue label, then the
-        current filter string, then dim filler ─);
-      * filtered options overlaid on the preview-pane area starting at
-        ``prev_top`` (note: ``prev_top`` is the preview's *separator*
-        row in the regular renderer; the picker repurposes it as the
-        first option row, which is fine because exiting the picker
-        drops the per-pane row cache and requests a full redraw, so the
-        next render re-emits the separator over the leftover row).
-
-    On exit (enter or esc) ``_restore`` invalidates the row cache and
-    marks the layout dirty so the main loop fully repaints the regular
-    UI on its next pass (the picker drew directly to the screen, so a
-    plain ``'all'`` request alone would cache-hit and skip the cells the
-    picker overdrew).
-    """
-    rk = _read_key if _read_key is not None else read_key
-
-    def _restore():
-        # Repaint the regular UI over the picker overlay. Two facts make
-        # this more than a plain ``_needs_redraw`` flag:
-        #
-        #   1. The picker drew its prompt + options with direct
-        #      ``move``/``write``/``clear_columns`` calls that bypass the
-        #      per-pane row cache. That cache still holds the pre-picker
-        #      UI content for those cells, so the next ``render_full``
-        #      cache-hits (identical buffered bytes, unchanged rect) and
-        #      emits nothing — the overlay survives. Dropping the row
-        #      cache forces an unconditional re-emit (same recovery the
-        #      screen-lost / resume paths use after an external overdraw).
-        #
-        #   2. With a freshly-cleared cache the renderer takes the
-        #      "first paint" branch, which emits NO trailing clear — it
-        #      assumes the cells below the content are already blank.
-        #      That holds at startup / after a real screen reset, but NOT
-        #      here: the picker left option text on the preview's blank
-        #      rows, so a content-only repaint would leave the last few
-        #      options (e.g. a trailing ``wontfix``) on screen. Blank the
-        #      whole preview pane + info bar first so the assumption is
-        #      true again.
-        cols, rows_total = term_size()
-        layout = layout_panes(
-            cols, rows_total,
-            split=getattr(browser, 'split', 'h'),
-            show_preview=browser.show_preview,
-            list_ratio=browser.list_ratio,
-        )
-        preview_rect = layout.get('preview')
-        info_bar = layout.get('info_bar')
-        if preview_rect is not None:
-            for row in range(preview_rect.top, preview_rect.bottom):
-                clear_columns(row, preview_rect.left, preview_rect.right)
-        if info_bar is not None:
-            clear_columns(info_bar.top, info_bar.left,
-                          info_bar.left + info_bar.width)
-        browser._pane_cache.clear()
-        browser._needs_redraw.add('all')
-
-    filter_query = ''
-    cursor = 0
-
-    def _filtered():
-        if not filter_query:
-            return list(options)
-        q = filter_query.lower()
-        return [o for o in options if q in o.lower()]
-
-    while True:
-        # Re-derive layout each iteration so a SIGWINCH-triggered redraw
-        # picks up the new terminal size on the next paint.
-        cols, rows_total = term_size()
-        layout = layout_panes(
-            cols, rows_total,
-            split=getattr(browser, 'split', 'h'),
-            show_preview=browser.show_preview,
-            list_ratio=browser.list_ratio,
-        )
-        cols = layout['cols']
-        preview_rect = layout.get('preview')
-        info_bar = layout.get('info_bar')
-        prev_top = preview_rect.top if preview_rect is not None else 0
-        prev_left = preview_rect.left if preview_rect is not None else 1
-        prev_right = preview_rect.right if preview_rect is not None else cols + 1
-        prev_height = preview_rect.height if preview_rect is not None else 0
-        info_row = info_bar.top if info_bar is not None else 0
-        info_left = info_bar.left if info_bar is not None else 1
-        info_width = info_bar.width if info_bar is not None else 0
-
-        # When the info row coincides with the preview's top (i.e. no
-        # children-grid pane, layout 'h'), the filter prompt and the
-        # options list would otherwise overdraw the same row. Reserve
-        # the top row for the prompt and slide the options down by
-        # one. In v/m/pc layouts the info bar is a standalone bottom
-        # row and never overlaps the preview rect.
-        if info_row > 0 and info_row == prev_top and prev_height > 0:
-            options_top = prev_top + 1
-            options_height = prev_height - 1
-        else:
-            options_top = prev_top
-            options_height = prev_height
-
-        visible = _filtered()
-        if cursor >= len(visible):
-            cursor = max(0, len(visible) - 1)
-
-        # ---- filter prompt on the info bar ------------------------
-        # Use the info-bar Rect's left/width so the prompt overlays
-        # exactly the info bar in any layout (today the info bar is
-        # full-width in every layout, but using the rect keeps this
-        # robust to future narrower info bars).
-        if info_row > 0 and info_width > 0:
-            move(info_row, info_left)
-            clear_columns(info_row, info_left, info_left + info_width)
-            move(info_row, info_left)
-            S = '─'
-            prompt = ' {}> '.format(label)
-            set_style(fg=11, bg=4, bold=True)
-            write(prompt[:info_width])
-            pos = min(len(prompt), info_width)
-            if pos < info_width:
-                set_style(fg=252, bg=236)
-                write(filter_query[:info_width - pos])
-                pos += min(len(filter_query), info_width - pos)
-            if pos < info_width:
-                set_style(fg=8)
-                write(S * (info_width - pos))
-            reset_style()
-
-        # ---- options list in the preview-pane area ----------------
-        # Use the preview rect's left/right so options overlay only the
-        # preview pane (not the whole row) in v/m/pc layouts where the
-        # preview pane is narrower than the screen.
-        prev_width = max(0, prev_right - prev_left)
-        if options_height > 0 and prev_width > 0:
-            for i in range(options_height):
-                move(options_top + i, prev_left)
-                clear_columns(options_top + i, prev_left, prev_right)
-                if i < len(visible):
-                    move(options_top + i, prev_left)
-                    label_text = visible[i]
-                    if i == cursor:
-                        set_style(reverse=True)
-                        line = ('  ' + label_text).ljust(prev_width)[:prev_width]
-                        write(line)
-                        reset_style()
-                    else:
-                        write(('  ' + label_text)[:prev_width])
-
-        flush()
-
-        key = rk()
-
-        if key == '_notify':
-            # Background workers nudged us — drain main-thread work and
-            # re-render on the next iteration. Resize is handled
-            # implicitly by re-deriving the layout above.
-            browser.drain_main_queue()
-            browser.apply_children_results()
-            continue
-
-        if key in ('down', 'ctrl-n'):
-            if visible:
-                cursor = (cursor + 1) % len(visible)
-        elif key in ('up', 'ctrl-p'):
-            if visible:
-                cursor = (cursor - 1) % len(visible)
-        elif key == 'home':
-            cursor = 0
-        elif key == 'end':
-            if visible:
-                cursor = len(visible) - 1
-        elif key == 'enter':
-            if visible:
-                _restore()
-                return visible[cursor]
-            # No matches; ignore enter.
-        elif key in ('esc', 'ctrl-c'):
-            _restore()
-            return None
-        elif key == 'backspace':
-            if filter_query:
-                filter_query = filter_query[:-1]
-                cursor = 0
-        elif key == 'space':
-            filter_query += ' '
-            cursor = 0
-        elif len(key) == 1 and key.isprintable():
-            filter_query += key
-            cursor = 0
-        # Other keys (alt-*, ctrl-* not handled, mouse, function keys) —
-        # silently ignored, loop continues.
+    list_rect = layout.get('list')
+    if list_rect is None or list_rect.height <= 0 or list_rect.width <= 0:
+        return None
+    rel = browser._state.cursor - browser._list_scroll
+    if not (0 <= rel < list_rect.height):
+        # Cursor isn't on screen in the list pane — no sensible anchor.
+        return None
+    return (list_rect.top + rel, list_rect.left)
