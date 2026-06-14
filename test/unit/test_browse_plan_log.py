@@ -59,6 +59,7 @@ def _stub_browse_tui():
     mod.BrowserConfig = _Stub
     mod.Item = _Stub
     mod.upsert = lambda *a, **kw: (a, kw)
+    mod.mod = lambda *a, **kw: (a, kw)
 
     def _recipe_argv(argv=None):
         # Mirrors the framework's recipe_argv (040-state.py): drop the

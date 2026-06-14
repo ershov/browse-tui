@@ -15,7 +15,7 @@ import shutil
 import subprocess
 import sys
 
-from browse_tui import Action, Browser, BrowserConfig, Item, recipe_argv, upsert
+from browse_tui import Action, Browser, BrowserConfig, Item, mod, recipe_argv, upsert
 
 # Optional md2ansi_lib plugin — colors ticket previews when available.
 try:
@@ -24,6 +24,18 @@ try:
         _md2ansi_fn = None
 except Exception:
     _md2ansi_fn = None
+
+# Optional md_doc plugin — gates the markdown launcher rows: a ticket whose
+# BODY references one or more existing ``.md`` files gains a ``[md] References``
+# umbrella child (alongside its subtasks), whose launcher rows open each
+# referenced file in browse-md. Inert when md_doc isn't importable, exactly
+# like the md2ansi_lib gate above — tickets then carry only their subtasks and
+# leaf tickets stay plain leaves. md_doc owns the launcher Item shapes + the
+# embedding flags / launch policy in ``md_doc.launch``.
+try:
+    import md_doc as _md_doc
+except Exception:
+    _md_doc = None
 
 _MD_COLOR = _md2ansi_fn is not None  # default on when available
 _BROWSER = None  # set in main() — used for preview-width lookup
@@ -147,7 +159,17 @@ def _log_plan_call(args, result):
 
 
 def _parse_ticket_line(line):
-    """Parse one line of ``_LIST_FORMAT`` into an ``Item`` (or None)."""
+    """Parse one line of ``_LIST_FORMAT`` into an ``Item`` (or None).
+
+    A ticket with subtasks always carries an expansion arrow. When ``md_doc``
+    is importable, a *leaf* ticket (no subtasks) gets an OPTIMISTIC arrow too —
+    its body is not in hand at listing time, so we cannot yet know whether it
+    references any ``.md`` file. ``get_children`` fetches + scans the body on
+    expand; if neither subtasks nor refs come back the arrow self-heals away
+    (``_on_children_loaded`` → ``mod(id, has_children=False)``), mirroring the
+    browse-claude / browse-fs optimistic-arrow idea. With ``md_doc`` absent the
+    arrow reflects the real subtask flag exactly as before.
+    """
     parts = line.split('\t', 5)
     if len(parts) < 6:
         return None
@@ -157,13 +179,13 @@ def _parse_ticket_line(line):
         return None
     status = parts[2]
     title = parts[5]
-    has_children = parts[3] == '1'
+    has_subtasks = parts[3] == '1'
     return Item(
         id=tid,
         title=title,
         tag=status,
         tag_style=_STATUS_TAG_STYLE.get(status, ''),
-        has_children=has_children,
+        has_children=has_subtasks or _md_doc is not None,
     )
 
 
@@ -182,7 +204,19 @@ def get_children(parent_id, *, reload=False):
     at id=0 above the real root tickets so the user can ``view`` /
     ``edit`` the project preamble. We do the same — see ``visible_tickets``
     in plan-source/src-tui/040-state.py.
+
+    A ticket row (positive int id) drills into its direct subtasks; when its
+    BODY references one or more existing ``.md`` files a ``[md] References``
+    umbrella (``_ticket_md_prefix``) is prepended above them. The umbrella's
+    own id is the tuple ``('md-refs', tid)`` — expanding it yields the
+    per-file launcher rows (``_ticket_md_children``).
     """
+    # The ``[md] References`` umbrella under a ticket — its launcher rows.
+    # id = ('md-refs', tid). Distinct from the int ticket ids so the two route
+    # apart here and in ``get_preview`` / ``on_enter``.
+    if isinstance(parent_id, tuple) and parent_id and parent_id[0] == 'md-refs':
+        return _ticket_md_children(parent_id[1])
+
     if parent_id is None:
         # Top of the Browser tree: insert the synthetic Project entry as
         # a non-expandable header, followed by every root-level ticket.
@@ -200,9 +234,20 @@ def get_children(parent_id, *, reload=False):
         items.extend(_list_root_tickets())
         return items
 
-    # Real ticket id — fetch its direct children. plan-tui uses ``-r list``
-    # and post-filters by depth (the parent always sits at the smallest
-    # depth in the result; direct children are at parent_depth + 1).
+    # Real ticket id — its subtasks, with the body-References umbrella (if any)
+    # prepended. The umbrella is decided by re-scanning the body here on expand
+    # (the body is not in hand at listing time), so a leaf ticket's optimistic
+    # arrow either reveals the umbrella or self-heals away.
+    return _ticket_md_prefix(parent_id) + _list_subtasks(parent_id)
+
+
+def _list_subtasks(parent_id):
+    """The direct subtasks of ticket ``parent_id`` as ``Item``s.
+
+    plan-tui uses ``-r list`` and post-filters by depth (the parent always sits
+    at the smallest depth in the result; direct children are at
+    parent_depth + 1).
+    """
     result = _run_plan(str(parent_id), '-r', 'list', '--format', _LIST_FORMAT)
     if result.returncode != 0:
         return []
@@ -255,14 +300,33 @@ def _list_root_tickets():
 
 
 def get_preview(item_id):
-    """Preview pane content = ``plan get`` output for the ticket / project."""
+    """Preview pane content for a row.
+
+    A ticket / Project (int id) previews its ``plan get`` body. The markdown
+    launcher rows carry tuple ids and preview what Enter would open: the
+    ``[md] References`` umbrella (``('md-refs', tid)``) shows the ticket body
+    (the source of the refs); a ``[md ↗]`` launcher row (``('launch', tid,
+    'file', abspath)``) shows the referenced file's own contents. Both render
+    through the same ``_render_md`` markdown-coloring path as a ticket body.
+    """
+    if isinstance(item_id, tuple) and item_id:
+        kind = item_id[0]
+        if kind == 'md-refs':
+            return _render_md(_ticket_body(item_id[1]) or '(no preview)')
+        if kind == 'launch':
+            return _md_file_preview(item_id)
+        return ''
     if item_id == 0:
         result = _run_plan('project', 'get')
     else:
         result = _run_plan(str(item_id), 'get')
     if result.returncode != 0:
         return result.stderr.strip() or '(no preview)'
-    text = result.stdout
+    return _render_md(result.stdout)
+
+
+def _render_md(text):
+    """Colorize ``text`` as markdown when md2ansi is on, else return it raw."""
     if _MD_COLOR and _md2ansi_fn is not None:
         try:
             width = (_BROWSER.preview_width if _BROWSER else 0) or 80
@@ -277,6 +341,114 @@ def _action_toggle_md(ctx):
     _MD_COLOR = not _MD_COLOR
     ctx.drop_preview_cache()
     ctx.flash(f'preview: {"colored" if _MD_COLOR else "raw"}')
+
+
+# ---- markdown launcher rows ----------------------------------------------
+#
+# When a ticket's BODY references one or more existing ``.md`` files, the
+# ticket gains a ``[md] References`` umbrella child (``md_doc.references_umbrella``)
+# alongside its subtasks; expanding the umbrella reveals one ``[md ↗]`` launcher
+# row per referenced file, and Enter on a launcher row opens that real file in
+# browse-md by PATH (``md_doc.launch(ctx, path=…)``).
+#
+# Detection is DEFERRED to expansion: the body is not in hand at listing time
+# (it costs a ``plan N get`` per row), so a leaf ticket carries an OPTIMISTIC
+# arrow (``_parse_ticket_line``) that self-heals away on expand if neither
+# subtasks nor refs come back (``_on_children_loaded``).
+#
+# The launcher-row id is md_doc's generic ``('launch', anchor, *spec)``: the
+# anchor is the ticket id and the opaque spec this recipe encodes is
+# ``('file', abspath)`` — plan refs are real on-disk files, so ``on_enter``
+# opens them by path. Refs are resolved on the FILESYSTEM (plan refs are
+# repo-relative) anchored on the git root (``md_doc.find_git_root``). Inert
+# unless ``md_doc`` is importable.
+
+
+def _git_root():
+    """The git root anchoring filesystem ref resolution, or ``None``.
+
+    Plan refs are repo-root-relative, so the git root containing the plan file
+    (``find_git_root`` walking up from the cwd) is the resolution anchor passed
+    as ``doc_dir`` / ``cwd`` / ``project_root`` to ``md_doc.resolve_refs``.
+    ``None`` only when md_doc is absent or no ``.git`` is found.
+    """
+    if _md_doc is None:
+        return None
+    return _md_doc.find_git_root(os.getcwd())
+
+
+def _ticket_body(tid):
+    """The raw ``plan TID get`` body text, or ``None`` on failure.
+
+    The same call ``get_preview`` makes — the ticket's full rendered record,
+    which is what we scan for ``.md`` references.
+    """
+    result = _run_plan(str(tid), 'get')
+    return result.stdout if result.returncode == 0 else None
+
+
+def _ticket_md_refs(tid):
+    """Distinct existing ``.md`` refs in ticket ``tid``'s body, on the filesystem.
+
+    Fetches the body (``_ticket_body``) and resolves its ``.md`` tokens via
+    ``md_doc.resolve_refs`` against the git root (plan refs are repo-relative).
+    Returns ordered ``(abspath, label)`` pairs (deduped by canonical abspath,
+    sorted by display label), or ``[]`` when the body has no resolving refs or
+    md_doc / the git root is unavailable.
+    """
+    if _md_doc is None:
+        return []
+    root = _git_root()
+    if not root:
+        return []
+    body = _ticket_body(tid)
+    if not body:
+        return []
+    return _md_doc.resolve_refs(body, doc_dir=root, cwd=root, project_root=root)
+
+
+def _ticket_md_prefix(tid):
+    """The ``[md] References`` umbrella for ticket ``tid``, or ``[]``.
+
+    Prepended above the ticket's subtasks when its body references any existing
+    ``.md`` file (``_ticket_md_refs``). The umbrella is an expandable grouping
+    row (``md_doc.references_umbrella``); its launcher children are built lazily
+    when it expands (``_ticket_md_children``) — the body is scanned once here to
+    decide whether to show it and again on expand to build the rows.
+    """
+    if _md_doc is None or not _ticket_md_refs(tid):
+        return []
+    return [_md_doc.references_umbrella(tid)]
+
+
+def _ticket_md_children(tid):
+    """Launcher rows under a ticket's ``[md] References`` umbrella.
+
+    One ``[md ↗]`` row per resolving body ref (``_ticket_md_refs``), each
+    carrying a ``('file', abspath)`` spec so ``on_enter`` opens the real file
+    by path. Titled by the ref's display label; the anchor is the ticket id.
+    """
+    if _md_doc is None:
+        return []
+    return [_md_doc.launcher_row(tid, ('file', ab), label)
+            for ab, label in _ticket_md_refs(tid)]
+
+
+def _md_file_preview(launch_id):
+    """Preview for a ``[md ↗]`` launcher row — the referenced file's contents.
+
+    ``launch_id`` is ``('launch', tid, 'file', abspath)``; the file is read and
+    rendered through the same markdown-coloring path as a ticket body. A
+    spec we don't recognise, or an unreadable file, previews empty.
+    """
+    spec = launch_id[2:]
+    if len(spec) != 2 or spec[0] != 'file':
+        return ''
+    try:
+        with open(spec[1], encoding='utf-8', errors='replace') as f:
+            return _render_md(f.read())
+    except OSError as e:
+        return f'(cannot read {spec[1]}: {e})'
 
 
 # ---- actions -------------------------------------------------------------
@@ -430,6 +602,78 @@ def _action_reopen(ctx):
     ctx.update_data([upsert(i, None, tag='open', tag_style=style) for i in ids])
 
 
+# ---- key handlers --------------------------------------------------------
+
+
+def on_enter(ctx):
+    """Launch a ``[md ↗]`` row, else flip expand/collapse; NEVER prints the id.
+
+    browse-plan is a BROWSER, not a picker — without this handler the framework
+    default (``print-exit``) would print the cursor id and quit on Enter. Here
+    a launcher row (id ``('launch', tid, 'file', abspath)``) opens its target
+    file in browse-md via ``md_doc.launch`` (anchored ``--root`` on the git
+    root so links inside the opened document resolve against the repo); every
+    other row keeps the expand/collapse toggle (mirroring browse-git's
+    ``on_enter``): leaves are a no-op, and a second Enter on an open row folds
+    it back up (``ctx.state.expanded`` is the open-id set in the current scope).
+    """
+    item = ctx.cursor
+    if item is None:
+        return
+    if isinstance(item.id, tuple) and item.id and item.id[0] == 'launch':
+        _md_launch(ctx, item.id[2:])
+        return
+    if not item.has_children:
+        return
+    if item.id in ctx.state.expanded:
+        ctx.collapse(item.id)
+    else:
+        # User-driven navigation — autoscroll the newly-revealed children
+        # into view, matching the built-in Right-arrow handler.
+        ctx.expand(item.id, autoscroll=True)
+
+
+def _md_launch(ctx, spec):
+    """Open the document a launcher-row ``spec`` points at in browse-md.
+
+    ``spec`` is the opaque tuple this recipe encoded onto the launcher id
+    (``id[2:]``): ``('file', abspath)`` — a plan ref is a real on-disk file, so
+    it opens by path. ``--root`` is the git root so references inside the
+    opened document resolve the same way they do in the repo. A guarded no-op
+    when md_doc is unavailable or the spec is unrecognised.
+    """
+    if _md_doc is None or len(spec) != 2 or spec[0] != 'file':
+        return
+    root = _git_root()
+    roots = (root,) if root else ()
+    _md_doc.launch(ctx, path=spec[1], roots=roots)
+
+
+def _on_children_loaded(ctx, parent_ids):
+    """Retract a leaf ticket's optimistic arrow once its expand builds empty.
+
+    A leaf ticket carries an OPTIMISTIC expansion arrow (``_parse_ticket_line``,
+    when md_doc is importable) because its body — the only place a ``[md]
+    References`` umbrella could come from — is not read at listing time. When
+    such a ticket settles to NO children (no subtasks AND no resolving body
+    refs), push a ``mod(id, has_children=False)`` so the arrow disappears on
+    next render, mirroring the browse-claude / browse-fs self-heal. A ticket
+    with real children (subtasks or the umbrella) keeps its arrow; the umbrella
+    itself is built only when a ref exists, so it never lands empty. No-op when
+    md_doc is absent (no optimistic arrows were set) or the children aren't
+    cached / are non-empty.
+    """
+    if _md_doc is None:
+        return
+    for pid in parent_ids:
+        # Only plain int ticket ids carry the optimistic arrow; the umbrella
+        # (a tuple id) is never empty, so leave tuple ids untouched.
+        if not isinstance(pid, int):
+            continue
+        if ctx.cached_children(pid) == []:
+            ctx.update_data([mod(pid, has_children=False)])
+
+
 # ---- entry point ---------------------------------------------------------
 
 
@@ -520,6 +764,13 @@ def main():
             Action('x', 'Close ticket',                         _action_close,                         'targets'),
             Action('o', 'Reopen closed ticket',                 _action_reopen,                        'targets'),
         ] + toggle_action,
+        # Enter is a browser action here, NOT the picker default: a ``[md ↗]``
+        # launcher row opens its file in browse-md, every other row toggles
+        # expand/collapse — Enter never prints the id and quits.
+        on_enter=on_enter,
+        # Retract a leaf ticket's optimistic arrow when its expand reveals
+        # neither subtasks nor body ``.md`` refs (the self-heal).
+        on_children_loaded=_on_children_loaded,
         help_intro=_HELP_INTRO,
     ))
     _BROWSER = b
