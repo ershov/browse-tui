@@ -500,6 +500,33 @@ class TestAltScreenFlag(unittest.TestCase):
             False, ['--alt-screen', '--no-alt-screen']))
 
 
+class TestQuitOnScopeUpFlag(unittest.TestCase):
+    """--quit-on-scope-up / --no-quit-on-scope-up flag pair: strip + resolution."""
+
+    def test_recipe_argv_strips_both_forms(self):
+        argv = ['--no-quit-on-scope-up', 'a.md', '--tty', '/dev/tty',
+                '--quit-on-scope-up', 'b.md']
+        # Framework flags (both quit-on-scope-up forms + --tty VALUE) dropped;
+        # the recipe's own positionals are left in order.
+        self.assertEqual(_state.recipe_argv(argv), ['a.md', 'b.md'])
+
+    def test_resolve_defaults_to_config(self):
+        self.assertTrue(_state._resolve_quit_on_scope_up(True, []))
+        self.assertFalse(_state._resolve_quit_on_scope_up(False, []))
+
+    def test_resolve_flag_overrides_config(self):
+        self.assertFalse(_state._resolve_quit_on_scope_up(
+            True, ['--no-quit-on-scope-up']))
+        self.assertTrue(_state._resolve_quit_on_scope_up(
+            False, ['--quit-on-scope-up']))
+
+    def test_resolve_last_occurrence_wins(self):
+        self.assertTrue(_state._resolve_quit_on_scope_up(
+            True, ['--no-quit-on-scope-up', '--quit-on-scope-up']))
+        self.assertFalse(_state._resolve_quit_on_scope_up(
+            False, ['--quit-on-scope-up', '--no-quit-on-scope-up']))
+
+
 # --- input (headless) -----------------------------------------------------
 
 

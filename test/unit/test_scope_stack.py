@@ -355,6 +355,51 @@ class TestAltUpDispatch(unittest.TestCase):
         finally:
             b.stop_workers()
 
+    def test_alt_up_at_root_does_not_quit_by_default(self):
+        # Default (quit_on_scope_up off): scope-up at the root is a plain
+        # no-op — no quit requested.
+        b = _make_browser()
+        try:
+            b._state._children[None] = [Item(id='A'), Item(id='B')]
+            ctx = _ctx_for(b)
+            dispatch_key(b, ctx, 'alt-up')
+            b.drain_main_queue()  # nothing should have been posted to quit
+            self.assertEqual(b._state.scope_stack, [])
+            self.assertFalse(b._quit_requested)
+        finally:
+            b.stop_workers()
+
+    def test_alt_up_at_root_quits_when_flag_set(self):
+        # quit_on_scope_up on: scope-up at the root scope exits the browser.
+        b = _make_browser(quit_on_scope_up=True)
+        try:
+            b._state._children[None] = [Item(id='A'), Item(id='B')]
+            ctx = _ctx_for(b)
+            dispatch_key(b, ctx, 'alt-up')
+            # ctx.quit() posts _do_quit; drain so the request applies.
+            b.drain_main_queue()
+            # Still at root (no spurious pop) and a quit was requested.
+            self.assertEqual(b._state.scope_stack, [])
+            self.assertTrue(b._quit_requested)
+        finally:
+            b.stop_workers()
+
+    def test_alt_up_with_flag_pops_before_quitting_at_root(self):
+        # With the flag on but a non-empty scope stack, scope-up still just
+        # pops one level (no quit) — quit only fires once already at root.
+        b = _make_browser(quit_on_scope_up=True)
+        try:
+            b._state._children[None] = [Item(id='A', has_children=True)]
+            b._state._children['A'] = [Item(id='a1')]
+            scope_into(b._state, 'A')
+            ctx = _ctx_for(b)
+            dispatch_key(b, ctx, 'alt-up')
+            b.drain_main_queue()  # pop only — no quit posted
+            self.assertEqual(b._state.scope_stack, [])
+            self.assertFalse(b._quit_requested)
+        finally:
+            b.stop_workers()
+
     def test_alt_up_fires_scope_change_with_direction_out(self):
         # Keyboard scope-out to root delivers (None, popped, 'out').
         fired = []

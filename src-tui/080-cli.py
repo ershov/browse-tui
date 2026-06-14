@@ -524,6 +524,10 @@ def build_argparser() -> argparse.ArgumentParser:
                         '--no-alt-screen runs the UI on the current screen '
                         'with no switch (no save/restore); the final frame '
                         'stays after exit.')
+    p.add_argument('--quit-on-scope-up', action=argparse.BooleanOptionalAction,
+                   default=False,
+                   help='Quit when scope-up (alt-up) is pressed at the root '
+                        'scope, instead of the default no-op.')
     p.add_argument('--show-ids', metavar='MODE', default='auto',
                    choices=('always', 'auto', 'never'),
                    help='Whether to render the per-row id before the '
@@ -1548,6 +1552,7 @@ def _build_lazy_browser(args, fields, record_sep, *, split='h'):
         show_ids=args.show_ids,
         show_scope_crumb=args.show_scope_crumb,
         alt_screen=args.alt_screen,
+        quit_on_scope_up=args.quit_on_scope_up,
         split=split,
     ))
 
@@ -1628,6 +1633,7 @@ def _build_eager_browser(args, fields, record_sep, *, split='h'):
         show_scope_crumb=args.show_scope_crumb,
         get_preview=_make_preview_fetcher(args.preview_cmd, args.action_timeout),
         alt_screen=args.alt_screen,
+        quit_on_scope_up=args.quit_on_scope_up,
         split=split,
     )
 
