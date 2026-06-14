@@ -14713,8 +14713,6 @@ class _Button:
       * ``value`` — what :meth:`ChoiceContent.handle_key` returns for this
         button. For a tuple it's the supplied ``value`` (any type); for a bare
         string it's the resolved ``display`` (so a plain label returns itself).
-      * ``label`` — the resolved display, kept as a separate field for callers
-        that introspect a button. Always equals ``display``.
       * ``hotkey`` — the lowercased hotkey char (case-insensitive match), or
         ``None`` for a label with no ``&``-marked char (``&&`` doesn't count).
       * ``hot_index`` — the index of the hotkey char within ``display`` (so
@@ -14756,7 +14754,6 @@ class _Button:
             chars.append(ch)
             i += 1
         self.display = ''.join(chars)
-        self.label = self.display
         # A bare string returns its own resolved display; a tuple returns the
         # supplied value verbatim.
         self.value = value if has_value else self.display

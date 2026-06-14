@@ -188,7 +188,7 @@ class TestHotkeyParsing(unittest.TestCase):
         c = ChoiceContent('m', ['&Yes'])
         b = self._buttons(c)[0]
         self.assertEqual(b.display, 'Yes')
-        self.assertEqual(b.label, 'Yes')      # resolved return value
+        self.assertEqual(b.value, 'Yes')      # resolved return value
         self.assertEqual(b.hotkey, 'y')       # lowercased
         self.assertEqual(b.hot_index, 0)      # 'Y' is at display index 0
 
@@ -196,7 +196,7 @@ class TestHotkeyParsing(unittest.TestCase):
         c = ChoiceContent('m', ['O&K'])
         b = self._buttons(c)[0]
         self.assertEqual(b.display, 'OK')
-        self.assertEqual(b.label, 'OK')
+        self.assertEqual(b.value, 'OK')       # resolved return value
         self.assertEqual(b.hotkey, 'k')
         self.assertEqual(b.hot_index, 1)
 
@@ -204,7 +204,7 @@ class TestHotkeyParsing(unittest.TestCase):
         c = ChoiceContent('m', ['a&&b'])
         b = self._buttons(c)[0]
         self.assertEqual(b.display, 'a&b')    # literal ampersand
-        self.assertEqual(b.label, 'a&b')      # resolved return value
+        self.assertEqual(b.value, 'a&b')      # resolved return value
         self.assertIsNone(b.hotkey)           # && is NOT a hotkey
         self.assertIsNone(b.hot_index)
 
@@ -212,7 +212,7 @@ class TestHotkeyParsing(unittest.TestCase):
         c = ChoiceContent('m', ['Plain'])
         b = self._buttons(c)[0]
         self.assertEqual(b.display, 'Plain')
-        self.assertEqual(b.label, 'Plain')
+        self.assertEqual(b.value, 'Plain')    # resolved return value
         self.assertIsNone(b.hotkey)
 
     def test_first_amp_marked_char_wins(self):
@@ -548,8 +548,8 @@ class TestValueMapping(unittest.TestCase):
         c = ChoiceContent('m', ['&Yes', 'O&K', 'a&&b', 'Plain'])
         b = c._buttons
         self.assertEqual([x.value for x in b], ['Yes', 'OK', 'a&b', 'Plain'])
-        # ``label`` stays the resolved display too (existing callers/tests).
-        self.assertEqual([x.label for x in b], ['Yes', 'OK', 'a&b', 'Plain'])
+        # ...and a bare string's value is exactly its resolved display.
+        self.assertEqual([x.value for x in b], [x.display for x in b])
 
     def test_tuple_parses_display_for_hotkey(self):
         # The display half is parsed identically to a bare string; the value
@@ -557,7 +557,6 @@ class TestValueMapping(unittest.TestCase):
         c = ChoiceContent('m', [('&Yes', 1)])
         b = c._buttons[0]
         self.assertEqual(b.display, 'Yes')
-        self.assertEqual(b.label, 'Yes')      # label still tracks display
         self.assertEqual(b.hotkey, 'y')
         self.assertEqual(b.hot_index, 0)
         self.assertEqual(b.value, 1)          # the tuple's value, verbatim
