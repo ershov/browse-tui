@@ -563,14 +563,17 @@ button to `None` makes a confirmed-`None` indistinguishable from a cancel.)
 Open a modal notification: `text` above a single `[ OK ]` button, dismissed
 with Enter / Space / Esc. Returns `None`.
 
-#### `ctx.pick(label, options) -> str | None`
+#### `ctx.pick(label, options) -> Any | None`
 
 fzf-style filterable picker in a centered modal dialog (`label` is the
 title). The user types to filter (case-insensitive substring match),
 Up/Down/Ctrl-P/Ctrl-N to move, Enter to choose, Esc to cancel.
 
-Returns the chosen option string, or `None` if cancelled (or if `options` is
-empty — the dialog doesn't open).
+Each option is a display `str` **or** a `(display, value)` tuple. The filter
+matches the **display**; the dialog returns the chosen option's **value** —
+the tuple's `value` (any type) for a tuple, or the string itself for a bare
+option. Returns `None` if cancelled (or if `options` is empty — the dialog
+doesn't open).
 
 ```python
 def set_status(ctx):
@@ -581,12 +584,20 @@ def set_status(ctx):
     ctx.refresh()
 ```
 
-#### `ctx.menu(items, *, anchor=None) -> str | None`
+Map a display to a value when the two differ — the result is used directly:
 
-A context menu: an unfiltered modal selection list. `anchor` is an optional
-`(row, col)` screen cell the menu drops below; it defaults to the list
-cursor's cell so the menu reads as attached to the current row. Returns the
-chosen item string, or `None` on cancel (or empty `items`).
+```python
+choice = ctx.pick('open as', [('Pretty (rendered)', 'html'),
+                              ('Raw source', 'raw')])
+```
+
+#### `ctx.menu(items, *, anchor=None) -> Any | None`
+
+A context menu: an unfiltered modal selection list. Each item is a display
+`str` **or** a `(display, value)` tuple, returning the chosen item's value as
+`ctx.pick` does. `anchor` is an optional `(row, col)` screen cell the menu
+drops below; it defaults to the list cursor's cell so the menu reads as
+attached to the current row. Returns `None` on cancel (or empty `items`).
 
 #### `ctx.insert(label, on_confirm)`
 

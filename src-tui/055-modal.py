@@ -532,11 +532,21 @@ class ListContent:
       * ``filter=False`` (menu) — no prompt/separator; the options start at
         row 0. Wired anchored behind ``ctx.menu``.
 
-    ``options`` is a list of strings (an option's text may carry embedded
-    SGR — it renders normally on an unselected row and is stripped to plain
-    reverse video on the selected one, exactly the list pane's rule). The
-    chosen option STRING is returned by :meth:`handle_key`; ``None`` on an
-    enter with an empty filtered list is left to the engine's cancel path.
+    ``options`` is a sequence whose items are each a display ``str`` OR a
+    ``(display, value)`` 2-tuple. Each is normalized to a ``(display, value)``
+    pair stored in ``self._options``; a bare string ``s`` becomes ``(s, s)``,
+    so its value IS the string verbatim (lists have NO ``&`` hotkey
+    convention — unlike :class:`ChoiceContent`, a bare option is never scanned
+    for markers). The display half is shown and filtered on (it may carry
+    embedded SGR — it renders normally on an unselected row and is stripped to
+    plain reverse video on the selected one, exactly the list pane's rule);
+    displays need not be unique, which is why display and value are kept as a
+    pair rather than a ``display -> value`` dict.
+
+    The chosen option's VALUE is returned by :meth:`handle_key` (the supplied
+    value for a tuple — any type; the string itself for a bare option);
+    ``None`` on an enter with an empty filtered list is left to the engine's
+    cancel path.
 
     Implements the content protocol consumed by :func:`run_modal`
     (``title`` / ``measure`` / ``draw_row`` / ``handle_key``).
@@ -544,7 +554,11 @@ class ListContent:
 
     def __init__(self, options, *, filter=True, title=None):
         self.title = title
-        self._options = list(options)
+        # Normalize each option to a ``(display, value)`` pair: a bare string
+        # ``s`` -> ``(s, s)`` (value is the string verbatim), a 2-tuple kept
+        # as-is. Keeping pairs (not a dict) lets duplicate displays coexist.
+        self._options = [o if isinstance(o, tuple) else (o, o)
+                         for o in options]
         self._filter = filter
         # Two extra rows for the prompt + separator only in filter mode.
         self._chrome = 2 if filter else 0
@@ -566,14 +580,16 @@ class ListContent:
     def measure(self, max_w, max_h):
         """Content size: longest option (floor 8) by option-count + chrome.
 
-        Width is the widest option's cell width (so wide glyphs measure
-        correctly), floored at :data:`_LIST_MIN_WIDTH` and capped at
-        ``max_w``. Height is the option count plus the filter chrome (the
-        prompt + separator rows when filtering), capped at ``max_h``. Both
-        results are stored — ``draw_row`` reads the height to window the
-        list — and clamped to the caps as the protocol requires.
+        Width is the widest option DISPLAY's cell width (so wide glyphs
+        measure correctly; the value half never affects layout), floored at
+        :data:`_LIST_MIN_WIDTH` and capped at ``max_w``. Height is the option
+        count plus the filter chrome (the prompt + separator rows when
+        filtering), capped at ``max_h``. Both results are stored — ``draw_row``
+        reads the height to window the list — and clamped to the caps as the
+        protocol requires.
         """
-        widest = max((cell_width(o) for o in self._options), default=0)
+        widest = max((cell_width(disp) for disp, _ in self._options),
+                     default=0)
         self._w = min(max(widest, _LIST_MIN_WIDTH), max_w)
         self._h = min(len(self._options) + self._chrome, max_h)
         return self._w, self._h
@@ -581,15 +597,17 @@ class ListContent:
     # -- filtering / windowing ---------------------------------------------
 
     def _filtered(self):
-        """The currently visible options (case-insensitive substring filter).
+        """Currently visible ``(display, value)`` pairs (substring filter).
 
-        In menu mode (``filter=False``) the query is always empty, so this
-        returns every option. Order is preserved.
+        The case-insensitive substring match is on the DISPLAY half only — a
+        query that occurs solely in an option's value never makes it match. In
+        menu mode (``filter=False``) the query is always empty, so this returns
+        every pair. Order is preserved.
         """
         if not self.filter_query:
             return self._options
         q = self.filter_query.lower()
-        return [o for o in self._options if q in o.lower()]
+        return [pair for pair in self._options if q in pair[0].lower()]
 
     def _clamp(self, filtered):
         """Clamp ``cursor`` to ``filtered`` and scroll it back into view.
@@ -655,7 +673,9 @@ class ListContent:
             # No option maps to this row (shorter list / blank tail).
             write(' ' * width)
             return
-        self._draw_option(filtered[vis_idx], vis_idx == self.cursor, width)
+        # Render the DISPLAY half of the pair; the value never appears.
+        display = filtered[vis_idx][0]
+        self._draw_option(display, vis_idx == self.cursor, width)
 
     def _draw_prompt(self, width):
         """Draw the ``> {query}`` filter prompt, trimmed/padded to ``width``."""
@@ -689,12 +709,13 @@ class ListContent:
     def handle_key(self, key):
         """Process one key; return ``(done, result)`` per the protocol.
 
-        ``enter`` closes with the selected option string (a no-op on an empty
-        filtered list). Selection moves (``down``/``ctrl-n``,
-        ``up``/``ctrl-p``) WRAP; ``home``/``end`` jump to the ends. In filter
-        mode a printable char / ``space`` extends the query and ``backspace``
-        deletes; both re-filter and re-clamp the cursor + scroll. Every other
-        key is ignored.
+        ``enter`` closes with the focused option's VALUE — the supplied value
+        for a ``(display, value)`` option, or the string itself for a bare one
+        (a no-op on an empty filtered list). Selection moves (``down``/
+        ``ctrl-n``, ``up``/``ctrl-p``) WRAP; ``home``/``end`` jump to the ends.
+        In filter mode a printable char / ``space`` extends the query and
+        ``backspace`` deletes; both re-filter and re-clamp the cursor + scroll.
+        Every other key is ignored.
         """
         filtered = self._filtered()
 
@@ -719,7 +740,7 @@ class ListContent:
             return (False, None)
         if key == 'enter':
             if filtered:
-                return (True, filtered[self.cursor])
+                return (True, filtered[self.cursor][1])   # the pair's value
             return (False, None)   # empty filtered list — no-op
 
         # Filter editing only applies in filter mode; in menu mode these keys
@@ -1267,9 +1288,11 @@ def modal_pick(browser, label, options, *, delay_interaction=False,
                _read_key=None):
     """Centered, filtered selection list (``ctx.pick``).
 
-    ``options`` becomes a filterable list with ``label`` as the title.
-    Returns the chosen option string, or ``None`` on cancel. An empty
-    ``options`` returns ``None`` WITHOUT opening a dialog.
+    ``options`` becomes a filterable list with ``label`` as the title. Each
+    item is a display ``str`` OR a ``(display, value)`` 2-tuple; the filter
+    matches the display and the dialog returns the chosen option's VALUE (the
+    tuple's value, or the string itself for a bare option). Returns ``None`` on
+    cancel. An empty ``options`` returns ``None`` WITHOUT opening a dialog.
     """
     options = list(options)
     if not options:
@@ -1283,9 +1306,11 @@ def modal_menu(browser, items, *, anchor=None, delay_interaction=False,
                _read_key=None):
     """Anchored, unfiltered selection list — a context menu (``ctx.menu``).
 
-    ``items`` is shown without a filter row. ``anchor`` is an ``(row, col)``
-    1-based screen cell the menu drops below (see :func:`_modal_place`); when
-    ``None`` the dialog centers. Returns the chosen item string, or ``None``
+    ``items`` is shown without a filter row. Each item is a display ``str`` OR
+    a ``(display, value)`` 2-tuple; the dialog returns the chosen item's VALUE
+    (the tuple's value, or the string itself for a bare item). ``anchor`` is an
+    ``(row, col)`` 1-based screen cell the menu drops below (see
+    :func:`_modal_place`); when ``None`` the dialog centers. Returns ``None``
     on cancel. Empty ``items`` returns ``None`` WITHOUT opening a dialog.
     """
     items = list(items)

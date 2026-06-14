@@ -228,7 +228,9 @@ class TestModalPickWiring(unittest.TestCase):
         self.assertIsInstance(content, ListContent)
         self.assertTrue(content._filter)             # filter row present
         self.assertEqual(content.title, 'Status')    # label becomes the title
-        self.assertEqual(content._options, ['open', 'done'])
+        # Bare strings normalize to ``(display, value)`` pairs == ``(s, s)``.
+        self.assertEqual(content._options,
+                         [('open', 'open'), ('done', 'done')])
         self.assertEqual(captured['placement'], 'center')
         self.assertIsNone(captured['anchor'])
 
@@ -298,6 +300,22 @@ class TestPickLoop(unittest.TestCase):
                     _read_key=_scripted(['z', 'enter', 'esc']),
                 )
             self.assertIsNone(result)
+        finally:
+            b.stop_workers()
+
+    def test_tuple_option_value_through_engine(self):
+        # A (display, value) option's VALUE comes back through the full loop;
+        # the filter still matches on the display half.
+        b = _make_browser(_headless=False)
+        try:
+            with _Capture():
+                result = modal_pick(
+                    b, 'Status',
+                    [('Open', 1), ('In progress', 2), ('Closed', 3)],
+                    # 'gr' matches only 'In progress' (display), then enter.
+                    _read_key=_scripted(['g', 'r', 'enter']),
+                )
+            self.assertEqual(result, 2)
         finally:
             b.stop_workers()
 

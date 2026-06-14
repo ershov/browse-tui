@@ -909,24 +909,27 @@ class Context:
         self._browser._needs_redraw.add('all')
 
     def pick(self, label: str, options,
-             *, delay_interaction: bool = False) -> Optional[str]:
+             *, delay_interaction: bool = False) -> Optional[Any]:
         """fzf-style filterable picker in a centered modal dialog.
 
         Opens a centered modal with a ``> `` filter row above the list of
-        ``options`` (``label`` becomes the dialog title). The user can:
+        ``options`` (``label`` becomes the dialog title). Each item is a
+        display ``str`` OR a ``(display, value)`` 2-tuple; the filter matches
+        the DISPLAY half (case-insensitive substring). The user can:
 
-          * type to filter (case-insensitive substring match);
+          * type to filter (case-insensitive substring match on the display);
           * up / down / ctrl-p / ctrl-n to move the selection (wrapping);
           * home / end to jump to the first / last filtered match;
           * enter to select the highlighted option;
           * esc / ctrl-c to cancel;
           * backspace to edit the filter.
 
-        Returns the selected option string, or ``None`` if cancelled. An
-        empty ``options`` returns ``None`` without opening. Headless
-        Browsers return ``None`` immediately so unit tests can rely on the
-        cancel outcome without driving a key stream. ``delay_interaction``
-        is forwarded to the modal engine.
+        Returns the chosen option's VALUE — the supplied ``value`` for a tuple
+        (any type), or the string itself for a bare option — or ``None`` if
+        cancelled. An empty ``options`` returns ``None`` without opening.
+        Headless Browsers return ``None`` immediately so unit tests can rely
+        on the cancel outcome without driving a key stream.
+        ``delay_interaction`` is forwarded to the modal engine.
         """
         if self._browser._headless:
             return None
@@ -934,20 +937,22 @@ class Context:
                           delay_interaction=delay_interaction)
 
     def menu(self, items, *, anchor=None,
-             delay_interaction: bool = False) -> Optional[str]:
+             delay_interaction: bool = False) -> Optional[Any]:
         """Anchored, unfiltered selection list — a context menu.
 
-        Opens a modal selection list WITHOUT a filter row. ``anchor`` is an
+        Opens a modal selection list WITHOUT a filter row. Each item is a
+        display ``str`` OR a ``(display, value)`` 2-tuple. ``anchor`` is an
         optional ``(row, col)`` 1-based screen cell the menu drops below;
         when ``None`` it defaults to the list cursor's screen cell so a
         menu reads as attached to the current row. The user moves with
         up/down (wrapping), jumps with home/end, picks with enter, cancels
         with esc/ctrl-c.
 
-        Returns the chosen item string, or ``None`` on cancel. An empty
-        ``items`` returns ``None`` without opening. Headless Browsers return
-        ``None`` immediately. ``delay_interaction`` is forwarded to the
-        modal engine.
+        Returns the chosen item's VALUE — the supplied ``value`` for a tuple
+        (any type), or the string itself for a bare item — or ``None`` on
+        cancel. An empty ``items`` returns ``None`` without opening. Headless
+        Browsers return ``None`` immediately. ``delay_interaction`` is
+        forwarded to the modal engine.
         """
         if self._browser._headless:
             return None

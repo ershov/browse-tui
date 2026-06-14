@@ -274,19 +274,25 @@ class TestFiltering(unittest.TestCase):
         c.handle_key('i')        # query 'i'
         self.assertEqual(c.filter_query, 'i')
         # 'i' appears in 'in-progress', 'wontfix' — substring, case-insens.
-        self.assertEqual(c._filtered(), ['in-progress', 'wontfix'])
+        # ``_filtered`` returns (display, value) pairs; bare strings are (s, s).
+        self.assertEqual(c._filtered(),
+                         [('in-progress', 'in-progress'),
+                          ('wontfix', 'wontfix')])
 
     def test_filter_case_insensitive(self):
         c = ListContent(['Open', 'CLOSED'], filter=True)
         c.measure(40, 20)
         c.handle_key('o')
-        self.assertEqual(c._filtered(), ['Open', 'CLOSED'])  # both contain o/O
+        # both contain o/O
+        self.assertEqual(c._filtered(),
+                         [('Open', 'Open'), ('CLOSED', 'CLOSED')])
 
     def test_filter_preserves_order(self):
         c = ListContent(['ab', 'xb', 'cb'], filter=True)
         c.measure(40, 20)
         c.handle_key('b')
-        self.assertEqual(c._filtered(), ['ab', 'xb', 'cb'])
+        self.assertEqual(c._filtered(),
+                         [('ab', 'ab'), ('xb', 'xb'), ('cb', 'cb')])
 
     def test_backspace_widens_list(self):
         c = ListContent(['open', 'closed'], filter=True)
@@ -303,7 +309,7 @@ class TestFiltering(unittest.TestCase):
         c.handle_key('a')
         c.handle_key('space')
         self.assertEqual(c.filter_query, 'a ')
-        self.assertEqual(c._filtered(), ['a b'])
+        self.assertEqual(c._filtered(), [('a b', 'a b')])
 
     def test_cursor_clamped_as_filter_narrows(self):
         c = ListContent(['open', 'in-progress', 'closed', 'wontfix'],
@@ -314,7 +320,7 @@ class TestFiltering(unittest.TestCase):
         # 'o' in open/in-progress/closed/wontfix -> all four still match.
         c.handle_key('p')        # 'op' -> only 'open'? in-progress has 'p'..
         # query 'op': substring 'op' present only in 'open'.
-        self.assertEqual(c._filtered(), ['open'])
+        self.assertEqual(c._filtered(), [('open', 'open')])
         self.assertLess(c.cursor, len(c._filtered()))   # clamped into range
 
     def test_menu_mode_ignores_printable_keys(self):
@@ -324,7 +330,8 @@ class TestFiltering(unittest.TestCase):
         done, _ = c.handle_key('o')
         self.assertFalse(done)
         self.assertEqual(c.filter_query, '')
-        self.assertEqual(c._filtered(), ['Open', 'Rename'])
+        self.assertEqual(c._filtered(),
+                         [('Open', 'Open'), ('Rename', 'Rename')])
 
 
 # --- selection movement (wrap, home/end) -----------------------------------
@@ -453,7 +460,7 @@ class TestWindowing(unittest.TestCase):
         self.assertGreater(c._scroll, 0)
         c.handle_key('1')         # query '1' still matches many (item1x, *1*)
         c.handle_key('9')         # 'item19' is the only one with '19'
-        self.assertEqual(c._filtered(), ['item19'])
+        self.assertEqual(c._filtered(), [('item19', 'item19')])
         self.assertEqual(c._scroll, 0)   # clamped back to the start
 
 
@@ -517,7 +524,7 @@ class TestEnter(unittest.TestCase):
         c.measure(40, 20)
         c.handle_key('i')         # filter -> ['in-progress'] ('i' in others?)
         # 'i' substring: 'in-progress' yes, 'open' no, 'closed' no.
-        self.assertEqual(c._filtered(), ['in-progress'])
+        self.assertEqual(c._filtered(), [('in-progress', 'in-progress')])
         done, result = c.handle_key('enter')
         self.assertTrue(done)
         self.assertEqual(result, 'in-progress')
@@ -544,6 +551,114 @@ class TestIgnoredKeys(unittest.TestCase):
             self.assertFalse(done)
             self.assertIsNone(result)
         self.assertEqual(c.cursor, 0)   # nothing moved
+
+
+# --- (display, value) tuple options: value mapping (ticket #999) ------------
+
+
+class TestValueMapping(unittest.TestCase):
+    """An option may be a ``(display, value)`` 2-tuple: the DISPLAY half is
+    shown and filtered on, but ``enter`` returns the tuple's ``value`` (any
+    type). A bare string keeps today's behavior — its value IS the string
+    verbatim (no ``&`` hotkey convention for lists), so the pair is ``(s, s)``.
+    """
+
+    def test_bare_string_normalizes_to_self_pair(self):
+        # Backward compat: a bare string becomes ``(s, s)`` — display == value.
+        c = ListContent(['open', 'closed'], filter=False)
+        self.assertEqual(c._options, [('open', 'open'), ('closed', 'closed')])
+
+    def test_tuple_keeps_display_and_value_separate(self):
+        c = ListContent([('Open', 1), ('Closed', 2)], filter=False)
+        self.assertEqual(c._options, [('Open', 1), ('Closed', 2)])
+
+    def test_enter_returns_tuple_value(self):
+        c = ListContent([('Open', 1), ('Closed', 2)], filter=False)
+        c.measure(40, 20)
+        c.handle_key('down')          # cursor -> ('Closed', 2)
+        done, result = c.handle_key('enter')
+        self.assertTrue(done)
+        self.assertEqual(result, 2)   # the value, not the display
+
+    def test_enter_returns_bare_string_itself(self):
+        c = ListContent(['open', 'closed'], filter=False)
+        c.measure(40, 20)
+        c.handle_key('down')          # cursor -> 'closed'
+        done, result = c.handle_key('enter')
+        self.assertTrue(done)
+        self.assertEqual(result, 'closed')
+
+    def test_filter_matches_display_not_value(self):
+        # The query matches the DISPLAY half; a substring living only in the
+        # value must NOT make the option match.
+        c = ListContent([('Open', 'xyzzy'), ('Closed', 'abc')], filter=True)
+        c.measure(40, 20)
+        c.handle_key('x')             # 'x' is in the value 'xyzzy', not display
+        self.assertEqual(c._filtered(), [])   # no display contains 'x'
+        c.handle_key('backspace')
+        c.handle_key('o')             # 'o' is in both displays (Open/Closed)
+        self.assertEqual(c._filtered(), [('Open', 'xyzzy'), ('Closed', 'abc')])
+
+    def test_filter_then_enter_returns_value(self):
+        c = ListContent([('Open', 1), ('In progress', 2), ('Closed', 3)],
+                        filter=True)
+        c.measure(40, 20)
+        c.handle_key('g')             # 'g' substring present only in 'progress'
+        c.handle_key('r')             # 'gr' -> 'In progress' alone
+        self.assertEqual(c._filtered(), [('In progress', 2)])
+        done, result = c.handle_key('enter')
+        self.assertTrue(done)
+        self.assertEqual(result, 2)
+
+    def test_mixed_string_and_tuple_sequence(self):
+        # A sequence may freely mix bare strings and tuples; each returns the
+        # right thing (string -> itself, tuple -> its value).
+        c = ListContent(['plain', ('Display', 99), 'other'], filter=False)
+        c.measure(40, 20)
+        self.assertEqual(c._options,
+                         [('plain', 'plain'), ('Display', 99),
+                          ('other', 'other')])
+        done, result = c.handle_key('enter')   # cursor 0 -> 'plain'
+        self.assertEqual(result, 'plain')
+        c2 = ListContent(['plain', ('Display', 99), 'other'], filter=False)
+        c2.measure(40, 20)
+        c2.handle_key('down')                   # cursor 1 -> ('Display', 99)
+        done, result = c2.handle_key('enter')
+        self.assertIs(result, 99)               # the tuple's value, verbatim
+
+    def test_menu_tuple_round_trips(self):
+        # filter=False (menu): a tuple option's value comes back on enter.
+        c = ListContent([('Rename…', 'rename'), ('Delete', 'delete')],
+                        filter=False)
+        c.measure(40, 20)
+        c.handle_key('down')          # cursor -> ('Delete', 'delete')
+        done, result = c.handle_key('enter')
+        self.assertTrue(done)
+        self.assertEqual(result, 'delete')
+
+    def test_non_string_values_round_trip(self):
+        # bool / int / arbitrary object all come back unchanged via enter.
+        marker = object()
+        for val in (True, 0, 42, marker, None, ['a', 'b'], {'k': 'v'}):
+            c = ListContent([('Go', val)], filter=False)
+            c.measure(40, 20)
+            done, result = c.handle_key('enter')
+            self.assertTrue(done)
+            self.assertIs(result, val)
+
+    def test_display_is_rendered_not_value(self):
+        # The drawn row shows the DISPLAY half, never the value.
+        c = ListContent([('Pretty', 'ugly-value')], filter=False)
+        c.measure(40, 20)
+        out = _plain(_draw(c, 0, 20))
+        self.assertIn('Pretty', out)
+        self.assertNotIn('ugly-value', out)
+
+    def test_measure_width_from_display(self):
+        # Width comes from the DISPLAY half's cell width, not the value's.
+        c = ListContent([('ab', 'a-very-long-value-string')], filter=False)
+        w, _ = c.measure(100, 100)
+        self.assertEqual(w, 8)        # display 'ab' floors to 8; value ignored
 
 
 # --- integration through run_modal -----------------------------------------
