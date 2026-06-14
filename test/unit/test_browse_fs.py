@@ -990,6 +990,8 @@ class TestMdLauncher(unittest.TestCase):
         # Switch-free handoff: child renders without its own alt-screen switch
         # (--no-alt-screen) and the parent keeps the alt screen (keep_screen).
         self.assertIn('--no-alt-screen', cmd)
+        # Alt-Up at the top of the launched browse-md returns here.
+        self.assertIn('--quit-on-scope-up', cmd)
         self.assertTrue(ctx.keep_screen)
 
     def test_enter_on_regular_file_row_edits(self):

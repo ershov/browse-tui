@@ -342,9 +342,13 @@ def _launch_browse_md(ctx, target):
     launch, and ``--no-alt-screen`` tells browse-md to render on that same
     screen without its own alt-screen switch — so neither the launch nor the
     return flashes the primary screen.
+
+    ``--quit-on-scope-up`` makes Alt-Up at the top of the launched browse-md
+    quit it (returning here) rather than no-op'ing.
     """
     ctx.run_external(
-        ['browse-md', '--no-alt-screen', target, '--root', _project_root_for(target)],
+        ['browse-md', '--no-alt-screen', '--quit-on-scope-up',
+         target, '--root', _project_root_for(target)],
         keep_screen=True)
 
 
