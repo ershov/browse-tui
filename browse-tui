@@ -4950,6 +4950,18 @@ class BrowserConfig:
     on_filter_change: Optional[Callable] = None
     on_resize: Optional[Callable] = None
     on_quit: Optional[Callable] = None
+    # Context-menu hook (option A): a ``(ctx) -> None`` callback the
+    # framework fires on the uniform context-menu gesture — a right-click,
+    # or ``\`` / F1 in NORMAL mode. The recipe builds the option list from
+    # ``ctx.cursor`` / ``ctx.targets`` and opens it via ``ctx.menu(...)``;
+    # the framework supplies only the trigger plumbing, never the menu
+    # content. The ``\`` / F1 triggers are conditional — they fire the menu
+    # only while this hook is set, else fall through to their defaults
+    # (``\`` cycle-layout, F1 help) — so non-menu recipes are unaffected.
+    # Exceptions are caught and routed to :meth:`error` like the other on_*
+    # hooks. ``None`` (default) makes the triggers no-ops — no menu, no
+    # cursor move for a right-click.
+    on_context_menu: Optional[Callable] = None
     # Streaming input (spec §3.4): ``on_stdin(ctx, data, *, delimiter,
     # is_eof, errno)`` opts in to live delivery from the stdin content
     # channel through the select loop, picking up where any pre-run
@@ -5210,6 +5222,22 @@ class Browser:
                 use this to clean up worker threads, temp files, file
                 handles. Exceptions are swallowed silently (a failing
                 cleanup hook should not block exit).
+            on_context_menu: Optional ``(ctx) -> None`` callback fired on
+                the uniform context-menu gesture: a right-click, or the
+                ``\\`` / F1 keys in NORMAL mode. The handler reads
+                ``ctx.cursor`` / ``ctx.targets`` and opens a menu with
+                ``ctx.menu(...)``; the framework supplies only the trigger,
+                never the content (option A). A right-click first moves the
+                cursor onto the clicked row (so ``ctx.cursor`` is the
+                target) and the menu anchors under the click cell; a
+                keyboard trigger anchors under the list cursor. The ``\\``
+                and F1 triggers are conditional: they fire the menu only
+                while this handler is set, and otherwise keep their default
+                meaning (``\\`` cycles the layout, F1 toggles help), so a
+                recipe that doesn't set this hook is unaffected. ``None``
+                (default) makes every trigger a no-op — no menu, and no
+                cursor move for a right-click. Exceptions are caught and
+                routed to :meth:`error`.
             on_stdin: Optional ``(ctx, data, *, delimiter, is_eof,
                 errno) -> None`` hook: opt-in live streaming from the
                 stdin content channel while the UI runs (spec §3.4).
@@ -5402,6 +5430,14 @@ class Browser:
         self._on_filter_change = config.on_filter_change
         self._on_resize = config.on_resize
         self._on_quit = config.on_quit
+        # ``on_context_menu`` fires synchronously from dispatch (not at
+        # drain time) and itself opens a modal via ``ctx.menu`` — see
+        # ``_fire_context_menu``. ``_context_menu_anchor`` carries the
+        # click cell of a right-click trigger to ``ctx.menu``'s default-
+        # anchor path for the duration of one fire (``None`` otherwise, so
+        # keyboard triggers anchor to the list cursor as usual).
+        self._on_context_menu = config.on_context_menu
+        self._context_menu_anchor = None
         self._on_stdin = config.on_stdin
         # No-landable-row policy (§3.4). Read once here; consulted by
         # ``_clamp_cursor_landable`` whenever the visible list ends up
@@ -7433,6 +7469,31 @@ class Browser:
             self._on_selection_change(self._make_ctx_for_hook(), ids)
         except Exception as e:
             self.error(f'on_selection_change: {type(e).__name__}: {e}')
+
+    def _fire_context_menu(self, anchor=None) -> None:
+        """Fire ``on_context_menu`` if installed.
+
+        Called synchronously from the dispatch path (not at drain time):
+        the handler reads ``ctx.cursor`` / ``ctx.targets`` and typically
+        opens a modal via ``ctx.menu`` — a nested key loop, which is fine
+        here. The hook takes EXACTLY one argument, a Context; the optional
+        ``anchor`` (a 1-based ``(row, col)`` click cell, only supplied by
+        the right-click trigger) is threaded to ``ctx.menu``'s default-
+        anchor path via ``_context_menu_anchor`` for the duration of the
+        fire so a no-arg ``ctx.menu()`` drops under the click cell. A
+        keyboard trigger passes ``anchor=None``, leaving the default anchor
+        on the list cursor. Exceptions are caught and routed to
+        :meth:`error` like the other on_* hooks.
+        """
+        if self._on_context_menu is None:
+            return
+        self._context_menu_anchor = anchor
+        try:
+            self._on_context_menu(self._make_ctx_for_hook())
+        except Exception as e:
+            self.error(f'on_context_menu: {type(e).__name__}: {e}')
+        finally:
+            self._context_menu_anchor = None
 
     def _fire_expand_collapse_if_pending(self) -> None:
         """Fire ``on_collapse`` / ``on_expand`` from a drain-time set diff.
@@ -16458,7 +16519,13 @@ class Context:
         if self._browser._headless:
             return None
         if anchor is None:
-            anchor = _list_cursor_cell(self._browser)
+            # A right-click context-menu trigger stashes the click cell on
+            # the Browser for the duration of the ``on_context_menu`` fire
+            # (see ``Browser._fire_context_menu``); prefer it so the menu
+            # drops under the pointer. Otherwise default to the list
+            # cursor cell so the menu reads as attached to the current row.
+            anchor = (self._browser._context_menu_anchor
+                      or _list_cursor_cell(self._browser))
         return modal_menu(self._browser, list(items), anchor=anchor,
                           delay_interaction=delay_interaction)
 
@@ -17745,6 +17812,7 @@ def dispatch_key(browser, ctx: 'Context', key: str) -> bool:
     # moves the cursor / scrolls the pane like in normal mode. Insert
     # mode never reaches here (it runs in ``_handle_insert_key``).
     if (key.startswith('mouse-click:')
+            or key.startswith('right-click:')
             or key.startswith('scroll-up:')
             or key.startswith('scroll-down:')):
         return _dispatch_mouse(browser, ctx, key)
@@ -17905,6 +17973,23 @@ def dispatch_key(browser, ctx: 'Context', key: str) -> bool:
     # Enter handling — outside search mode this falls to on_enter.
     if key == 'enter':
         return _handle_enter(browser, ctx)
+
+    # Context-menu keyboard triggers (option A). ``\`` and F1 open the
+    # recipe's context menu ONLY when an ``on_context_menu`` handler is
+    # installed AND we're in NORMAL mode — strictly gated because ``f1``
+    # (a multi-char name) falls through the SEARCH_EDIT / FILTER_EDIT
+    # blocks above into this normal dispatch, and the menu must not pop
+    # while the user is editing a query. ``\`` is consumed as a printable
+    # char by the SEARCH_EDIT handler before reaching here, so only F1 is
+    # actually at risk, but gating on NORMAL covers both. When no handler
+    # is set this branch is skipped and the keymap lookup below reaches
+    # the default Actions unchanged (``\`` → cycle layout, ``f1`` → help),
+    # so these keys keep their old meaning for non-menu recipes.
+    if (browser._mode is Mode.NORMAL
+            and key in ('\\', 'f1')
+            and browser._on_context_menu is not None):
+        browser._fire_context_menu()
+        return True
 
     keymap = build_keymap(browser)
     if key in keymap:
@@ -18219,6 +18304,13 @@ def _dispatch_mouse(browser, ctx, key):
     except ValueError:
         return True
 
+    # Right-click is the context-menu gesture (option A). When no
+    # ``on_context_menu`` handler is installed it's a pure no-op — bail
+    # before any prep (no layout resolution, no cursor move, no anchor
+    # calc), matching the "no work when the hook is unset" contract.
+    if kind == 'right-click' and browser._on_context_menu is None:
+        return True
+
     ts = globals().get('term_size')
     lp = globals().get('layout_panes')
     if ts is None or lp is None:
@@ -18271,6 +18363,18 @@ def _dispatch_mouse(browser, ctx, key):
                 browser._help_mode = False
                 browser._needs_redraw.add('preview')
         # children grid / info bar / separator → no-op
+        return True
+    if kind == 'right-click':
+        # Context-menu gesture (handler presence already confirmed above).
+        # Reposition the cursor onto the clicked row exactly like a
+        # left-click — reusing ``_click_list_row`` — so ``ctx.cursor`` is
+        # the click target, then fire the hook with the click cell as the
+        # menu anchor (so a no-arg ``ctx.menu()`` drops under the pointer).
+        # A right-click outside the list pane fires the menu for the
+        # current cursor without moving it.
+        if pane == 'list':
+            _click_list_row(browser, layout, row)
+        browser._fire_context_menu(anchor=(row, col))
         return True
     if kind in ('scroll-up', 'scroll-down'):
         delta = -_WHEEL_LINES if kind == 'scroll-up' else _WHEEL_LINES

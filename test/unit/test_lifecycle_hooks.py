@@ -55,6 +55,7 @@ Browser = _state.Browser
 BrowserConfig = _state.BrowserConfig
 Item = _data.Item
 Context = _context.Context
+Mode = _state.Mode
 mark_cursor_changed = _state.mark_cursor_changed
 dispatch_key = _actions.dispatch_key
 complete = _state.complete
@@ -1294,6 +1295,236 @@ class TestDefaultsAreNoOp(unittest.TestCase):
         b._layout_sig = (80, 24, None, None)
         b._fire_resize_if_layout_changed()
         b._fire_on_quit()
+        # on_context_menu fire is a no-op when unset (with and without an
+        # anchor — the right-click trigger always passes one).
+        b._fire_context_menu()
+        b._fire_context_menu(anchor=(3, 5))
+
+
+class TestOnContextMenu(unittest.TestCase):
+    """The ``on_context_menu`` hook + its right-click default trigger.
+
+    These drive a REAL headless Browser (not a fake ctx) so the hook is
+    called with exactly the Context the framework builds — browse-tui
+    swallows hook exceptions, so a fake ctx would hide an arity bug. The
+    right-click cases feed a synthesized ``right-click:R:C`` through the
+    same ``dispatch_key`` entry the app uses, patching ``term_size`` /
+    ``layout_panes`` onto ``_actions`` like ``TestMouseDispatch`` does so
+    the list-pane geometry resolves.
+    """
+
+    def _patch_term(self, cols, rows):
+        prev_ts = getattr(_actions, 'term_size', None)
+        prev_lp = getattr(_actions, 'layout_panes', None)
+        had_ts = hasattr(_actions, 'term_size')
+        had_lp = hasattr(_actions, 'layout_panes')
+        _actions.term_size = lambda: (cols, rows)
+        _actions.layout_panes = _render.layout_panes
+
+        def restore():
+            if had_ts:
+                _actions.term_size = prev_ts
+            elif hasattr(_actions, 'term_size'):
+                del _actions.term_size
+            if had_lp:
+                _actions.layout_panes = prev_lp
+            elif hasattr(_actions, 'layout_panes'):
+                del _actions.layout_panes
+
+        return restore
+
+    def test_fire_calls_handler_with_single_context_arg(self):
+        """The hook is invoked with EXACTLY one positional arg, a Context."""
+        seen = []
+        b = Browser(BrowserConfig(_headless=True,
+                    on_context_menu=lambda ctx: seen.append(ctx)))
+        try:
+            b._fire_context_menu()
+            self.assertEqual(len(seen), 1)
+            self.assertIsInstance(seen[0], Context)
+        finally:
+            b.stop_workers()
+
+    def test_fire_threads_anchor_to_ctx_menu_default(self):
+        """During the fire, the supplied click cell is the menu's default anchor."""
+        anchors = []
+
+        def handler(ctx):
+            # ``ctx.menu`` is a no-op on a headless Browser (returns None
+            # before opening), so observe the resolved default anchor
+            # directly off the Browser instead.
+            anchors.append(ctx._browser._context_menu_anchor)
+
+        b = Browser(BrowserConfig(_headless=True, on_context_menu=handler))
+        try:
+            b._fire_context_menu(anchor=(7, 3))
+            self.assertEqual(anchors, [(7, 3)])
+            # Cleared after the fire so later (keyboard) triggers default
+            # back to the list cursor.
+            self.assertIsNone(b._context_menu_anchor)
+        finally:
+            b.stop_workers()
+
+    def test_fire_swallows_handler_exception_to_error_log(self):
+        def boom(ctx):
+            raise RuntimeError('kaboom')
+
+        b = Browser(BrowserConfig(_headless=True, on_context_menu=boom))
+        try:
+            b._fire_context_menu()  # must not raise
+            b.drain_main_queue()
+            self.assertIn('on_context_menu', _err_log(b))
+            self.assertIn('kaboom', _err_log(b))
+            # Anchor still cleared even when the handler raised.
+            self.assertIsNone(b._context_menu_anchor)
+        finally:
+            b.stop_workers()
+
+    def test_right_click_fires_and_repositions_cursor(self):
+        """A right-click on a list row moves the cursor there, then fires."""
+        seen_cursor = []
+        b = Browser(BrowserConfig(
+            _headless=True,
+            on_context_menu=lambda ctx: seen_cursor.append(
+                ctx.cursor.id if ctx.cursor else None)))
+        _seed(b, [Item(id='a'), Item(id='b'), Item(id='c'), Item(id='d')])
+        restore = self._patch_term(80, 40)
+        try:
+            ctx = _ctx(b)
+            layout = _render.layout_panes(80, 40, show_preview=False,
+                                          show_children_pane=False)
+            target_row = layout['list'].top + 2  # third row → item 'c'
+            self.assertTrue(
+                dispatch_key(b, ctx, f'right-click:{target_row}:5'))
+            self.assertEqual(b._state.cursor, 2)        # cursor moved first
+            self.assertEqual(seen_cursor, ['c'])        # then fired w/ target
+        finally:
+            restore()
+            b.stop_workers()
+
+    def test_right_click_anchor_is_click_cell(self):
+        """The right-click trigger passes the click cell as the menu anchor."""
+        anchors = []
+        b = Browser(BrowserConfig(
+            _headless=True,
+            on_context_menu=lambda ctx: anchors.append(
+                ctx._browser._context_menu_anchor)))
+        _seed(b, [Item(id='a'), Item(id='b'), Item(id='c')])
+        restore = self._patch_term(80, 40)
+        try:
+            ctx = _ctx(b)
+            layout = _render.layout_panes(80, 40, show_preview=False,
+                                          show_children_pane=False)
+            r = layout['list'].top + 1
+            dispatch_key(b, ctx, f'right-click:{r}:9')
+            self.assertEqual(anchors, [(r, 9)])
+        finally:
+            restore()
+            b.stop_workers()
+
+    def test_right_click_no_handler_is_noop_cursor_unmoved(self):
+        """A None handler: right-click moves nothing and raises nothing."""
+        b = Browser(BrowserConfig(_headless=True))  # no on_context_menu
+        _seed(b, [Item(id='a'), Item(id='b'), Item(id='c'), Item(id='d')])
+        b._state.cursor = 1
+        restore = self._patch_term(80, 40)
+        try:
+            ctx = _ctx(b)
+            layout = _render.layout_panes(80, 40, show_preview=False,
+                                          show_children_pane=False)
+            target_row = layout['list'].top + 3  # would be item 'd'
+            # Returns True (event consumed) but does no prep / no fire.
+            self.assertTrue(
+                dispatch_key(b, ctx, f'right-click:{target_row}:5'))
+            self.assertEqual(b._state.cursor, 1)        # unmoved
+            self.assertEqual(_err_log(b), '')           # nothing logged
+        finally:
+            restore()
+            b.stop_workers()
+
+    # ---- keyboard triggers (\ and F1, conditional override) -------------
+
+    def test_backslash_fires_when_handler_set_in_normal_mode(self):
+        fired = []
+        b = Browser(BrowserConfig(
+            _headless=True, on_context_menu=lambda ctx: fired.append(ctx)))
+        _seed(b, [Item(id='a'), Item(id='b')])
+        try:
+            ctx = _ctx(b)
+            self.assertIs(b._mode, Mode.NORMAL)
+            self.assertTrue(dispatch_key(b, ctx, '\\'))
+            self.assertEqual(len(fired), 1)
+        finally:
+            b.stop_workers()
+
+    def test_f1_fires_when_handler_set_in_normal_mode(self):
+        fired = []
+        b = Browser(BrowserConfig(
+            _headless=True, on_context_menu=lambda ctx: fired.append(ctx)))
+        _seed(b, [Item(id='a'), Item(id='b')])
+        try:
+            ctx = _ctx(b)
+            self.assertTrue(dispatch_key(b, ctx, 'f1'))
+            self.assertEqual(len(fired), 1)
+            # The default F1 (help toggle) was pre-empted, not also run.
+            self.assertFalse(b._help_mode)
+        finally:
+            b.stop_workers()
+
+    def test_backslash_falls_back_to_cycle_layout_when_no_handler(self):
+        """No handler: ``\\`` keeps its default — cycle the layout split."""
+        b = Browser(BrowserConfig(_headless=True))  # no on_context_menu
+        _seed(b, [Item(id='a'), Item(id='b')])
+        try:
+            ctx = _ctx(b)
+            before = b.split
+            self.assertTrue(dispatch_key(b, ctx, '\\'))
+            b.drain_main_queue()  # set_split defers via post()
+            self.assertNotEqual(b.split, before)        # layout cycled
+        finally:
+            b.stop_workers()
+
+    def test_f1_falls_back_to_help_toggle_when_no_handler(self):
+        """No handler: F1 keeps its default — toggle the help screen."""
+        b = Browser(BrowserConfig(_headless=True))  # no on_context_menu
+        _seed(b, [Item(id='a'), Item(id='b')])
+        try:
+            ctx = _ctx(b)
+            self.assertFalse(b._help_mode)
+            self.assertTrue(dispatch_key(b, ctx, 'f1'))
+            self.assertTrue(b._help_mode)               # help toggled on
+        finally:
+            b.stop_workers()
+
+    def test_f1_does_not_fire_menu_in_search_edit_mode(self):
+        """F1 falls through SEARCH_EDIT into normal dispatch — but the
+        context-menu trigger is gated on NORMAL, so the menu must NOT
+        open while a search query is being edited."""
+        fired = []
+        b = Browser(BrowserConfig(
+            _headless=True, on_context_menu=lambda ctx: fired.append(ctx)))
+        _seed(b, [Item(id='a'), Item(id='b')])
+        try:
+            ctx = _ctx(b)
+            b._mode = Mode.SEARCH_EDIT
+            dispatch_key(b, ctx, 'f1')
+            self.assertEqual(fired, [])                  # menu not opened
+        finally:
+            b.stop_workers()
+
+    def test_f1_does_not_fire_menu_in_filter_edit_mode(self):
+        """Same gating for FILTER_EDIT: editing a filter must not pop the menu."""
+        fired = []
+        b = Browser(BrowserConfig(
+            _headless=True, on_context_menu=lambda ctx: fired.append(ctx)))
+        _seed(b, [Item(id='a'), Item(id='b')])
+        try:
+            ctx = _ctx(b)
+            b._mode = Mode.FILTER_EDIT
+            dispatch_key(b, ctx, 'f1')
+            self.assertEqual(fired, [])                  # menu not opened
+        finally:
+            b.stop_workers()
 
 
 if __name__ == '__main__':

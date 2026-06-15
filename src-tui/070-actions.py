@@ -1239,6 +1239,7 @@ def dispatch_key(browser, ctx: 'Context', key: str) -> bool:
     # moves the cursor / scrolls the pane like in normal mode. Insert
     # mode never reaches here (it runs in ``_handle_insert_key``).
     if (key.startswith('mouse-click:')
+            or key.startswith('right-click:')
             or key.startswith('scroll-up:')
             or key.startswith('scroll-down:')):
         return _dispatch_mouse(browser, ctx, key)
@@ -1399,6 +1400,23 @@ def dispatch_key(browser, ctx: 'Context', key: str) -> bool:
     # Enter handling — outside search mode this falls to on_enter.
     if key == 'enter':
         return _handle_enter(browser, ctx)
+
+    # Context-menu keyboard triggers (option A). ``\`` and F1 open the
+    # recipe's context menu ONLY when an ``on_context_menu`` handler is
+    # installed AND we're in NORMAL mode — strictly gated because ``f1``
+    # (a multi-char name) falls through the SEARCH_EDIT / FILTER_EDIT
+    # blocks above into this normal dispatch, and the menu must not pop
+    # while the user is editing a query. ``\`` is consumed as a printable
+    # char by the SEARCH_EDIT handler before reaching here, so only F1 is
+    # actually at risk, but gating on NORMAL covers both. When no handler
+    # is set this branch is skipped and the keymap lookup below reaches
+    # the default Actions unchanged (``\`` → cycle layout, ``f1`` → help),
+    # so these keys keep their old meaning for non-menu recipes.
+    if (browser._mode is Mode.NORMAL
+            and key in ('\\', 'f1')
+            and browser._on_context_menu is not None):
+        browser._fire_context_menu()
+        return True
 
     keymap = build_keymap(browser)
     if key in keymap:
@@ -1713,6 +1731,13 @@ def _dispatch_mouse(browser, ctx, key):
     except ValueError:
         return True
 
+    # Right-click is the context-menu gesture (option A). When no
+    # ``on_context_menu`` handler is installed it's a pure no-op — bail
+    # before any prep (no layout resolution, no cursor move, no anchor
+    # calc), matching the "no work when the hook is unset" contract.
+    if kind == 'right-click' and browser._on_context_menu is None:
+        return True
+
     ts = globals().get('term_size')
     lp = globals().get('layout_panes')
     if ts is None or lp is None:
@@ -1765,6 +1790,18 @@ def _dispatch_mouse(browser, ctx, key):
                 browser._help_mode = False
                 browser._needs_redraw.add('preview')
         # children grid / info bar / separator → no-op
+        return True
+    if kind == 'right-click':
+        # Context-menu gesture (handler presence already confirmed above).
+        # Reposition the cursor onto the clicked row exactly like a
+        # left-click — reusing ``_click_list_row`` — so ``ctx.cursor`` is
+        # the click target, then fire the hook with the click cell as the
+        # menu anchor (so a no-arg ``ctx.menu()`` drops under the pointer).
+        # A right-click outside the list pane fires the menu for the
+        # current cursor without moving it.
+        if pane == 'list':
+            _click_list_row(browser, layout, row)
+        browser._fire_context_menu(anchor=(row, col))
         return True
     if kind in ('scroll-up', 'scroll-down'):
         delta = -_WHEEL_LINES if kind == 'scroll-up' else _WHEEL_LINES

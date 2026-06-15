@@ -3251,6 +3251,18 @@ class BrowserConfig:
     on_filter_change: Optional[Callable] = None
     on_resize: Optional[Callable] = None
     on_quit: Optional[Callable] = None
+    # Context-menu hook (option A): a ``(ctx) -> None`` callback the
+    # framework fires on the uniform context-menu gesture — a right-click,
+    # or ``\`` / F1 in NORMAL mode. The recipe builds the option list from
+    # ``ctx.cursor`` / ``ctx.targets`` and opens it via ``ctx.menu(...)``;
+    # the framework supplies only the trigger plumbing, never the menu
+    # content. The ``\`` / F1 triggers are conditional — they fire the menu
+    # only while this hook is set, else fall through to their defaults
+    # (``\`` cycle-layout, F1 help) — so non-menu recipes are unaffected.
+    # Exceptions are caught and routed to :meth:`error` like the other on_*
+    # hooks. ``None`` (default) makes the triggers no-ops — no menu, no
+    # cursor move for a right-click.
+    on_context_menu: Optional[Callable] = None
     # Streaming input (spec §3.4): ``on_stdin(ctx, data, *, delimiter,
     # is_eof, errno)`` opts in to live delivery from the stdin content
     # channel through the select loop, picking up where any pre-run
@@ -3511,6 +3523,22 @@ class Browser:
                 use this to clean up worker threads, temp files, file
                 handles. Exceptions are swallowed silently (a failing
                 cleanup hook should not block exit).
+            on_context_menu: Optional ``(ctx) -> None`` callback fired on
+                the uniform context-menu gesture: a right-click, or the
+                ``\\`` / F1 keys in NORMAL mode. The handler reads
+                ``ctx.cursor`` / ``ctx.targets`` and opens a menu with
+                ``ctx.menu(...)``; the framework supplies only the trigger,
+                never the content (option A). A right-click first moves the
+                cursor onto the clicked row (so ``ctx.cursor`` is the
+                target) and the menu anchors under the click cell; a
+                keyboard trigger anchors under the list cursor. The ``\\``
+                and F1 triggers are conditional: they fire the menu only
+                while this handler is set, and otherwise keep their default
+                meaning (``\\`` cycles the layout, F1 toggles help), so a
+                recipe that doesn't set this hook is unaffected. ``None``
+                (default) makes every trigger a no-op — no menu, and no
+                cursor move for a right-click. Exceptions are caught and
+                routed to :meth:`error`.
             on_stdin: Optional ``(ctx, data, *, delimiter, is_eof,
                 errno) -> None`` hook: opt-in live streaming from the
                 stdin content channel while the UI runs (spec §3.4).
@@ -3703,6 +3731,14 @@ class Browser:
         self._on_filter_change = config.on_filter_change
         self._on_resize = config.on_resize
         self._on_quit = config.on_quit
+        # ``on_context_menu`` fires synchronously from dispatch (not at
+        # drain time) and itself opens a modal via ``ctx.menu`` — see
+        # ``_fire_context_menu``. ``_context_menu_anchor`` carries the
+        # click cell of a right-click trigger to ``ctx.menu``'s default-
+        # anchor path for the duration of one fire (``None`` otherwise, so
+        # keyboard triggers anchor to the list cursor as usual).
+        self._on_context_menu = config.on_context_menu
+        self._context_menu_anchor = None
         self._on_stdin = config.on_stdin
         # No-landable-row policy (§3.4). Read once here; consulted by
         # ``_clamp_cursor_landable`` whenever the visible list ends up
@@ -5734,6 +5770,31 @@ class Browser:
             self._on_selection_change(self._make_ctx_for_hook(), ids)
         except Exception as e:
             self.error(f'on_selection_change: {type(e).__name__}: {e}')
+
+    def _fire_context_menu(self, anchor=None) -> None:
+        """Fire ``on_context_menu`` if installed.
+
+        Called synchronously from the dispatch path (not at drain time):
+        the handler reads ``ctx.cursor`` / ``ctx.targets`` and typically
+        opens a modal via ``ctx.menu`` — a nested key loop, which is fine
+        here. The hook takes EXACTLY one argument, a Context; the optional
+        ``anchor`` (a 1-based ``(row, col)`` click cell, only supplied by
+        the right-click trigger) is threaded to ``ctx.menu``'s default-
+        anchor path via ``_context_menu_anchor`` for the duration of the
+        fire so a no-arg ``ctx.menu()`` drops under the click cell. A
+        keyboard trigger passes ``anchor=None``, leaving the default anchor
+        on the list cursor. Exceptions are caught and routed to
+        :meth:`error` like the other on_* hooks.
+        """
+        if self._on_context_menu is None:
+            return
+        self._context_menu_anchor = anchor
+        try:
+            self._on_context_menu(self._make_ctx_for_hook())
+        except Exception as e:
+            self.error(f'on_context_menu: {type(e).__name__}: {e}')
+        finally:
+            self._context_menu_anchor = None
 
     def _fire_expand_collapse_if_pending(self) -> None:
         """Fire ``on_collapse`` / ``on_expand`` from a drain-time set diff.

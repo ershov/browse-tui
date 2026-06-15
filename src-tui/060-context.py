@@ -991,7 +991,13 @@ class Context:
         if self._browser._headless:
             return None
         if anchor is None:
-            anchor = _list_cursor_cell(self._browser)
+            # A right-click context-menu trigger stashes the click cell on
+            # the Browser for the duration of the ``on_context_menu`` fire
+            # (see ``Browser._fire_context_menu``); prefer it so the menu
+            # drops under the pointer. Otherwise default to the list
+            # cursor cell so the menu reads as attached to the current row.
+            anchor = (self._browser._context_menu_anchor
+                      or _list_cursor_cell(self._browser))
         return modal_menu(self._browser, list(items), anchor=anchor,
                           delay_interaction=delay_interaction)
 
