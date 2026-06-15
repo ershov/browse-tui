@@ -229,20 +229,20 @@ def _id_visible(item, show_ids):
     """Decide whether the id segment should be emitted for ``item``.
 
     ``show_ids`` is one of ``'always'``, ``'auto'``, ``'never'``. In
-    ``'auto'`` mode the id is suppressed when ``str(item.id) ==
-    item.title`` — the common shape for line-based CLI input where the
-    id and title are the same string and showing both is pure
-    duplication. A per-row ``item.id_hidden`` forces suppression
-    regardless of ``show_ids`` — for rows whose id is internal routing
-    state rather than a user-facing identifier.
+    ``'auto'`` mode the id is shown only when it is a *scalar* (``str`` /
+    ``int``) that differs from the title — the common shape for line-based
+    CLI input where the id is a user-facing identifier and showing it
+    alongside an equal title would be pure duplication. A structured id
+    (tuple, dataclass, …) is internal routing state, never a display
+    identifier, so ``'auto'`` always suppresses it — e.g. the ``('launch',
+    …)`` / ``('md-refs', …)`` rows ``md_doc`` builds. ``'always'`` /
+    ``'never'`` force the id on / off regardless of its type.
     """
-    if getattr(item, 'id_hidden', False):
-        return False   # routing-only id, never displayed (e.g. launcher rows)
     if show_ids == 'always':
         return True
     if show_ids == 'never':
         return False
-    return str(item.id) != item.title
+    return isinstance(item.id, (str, int)) and str(item.id) != item.title
 
 
 # Sentinel for ``RowContext.max_col_width(field, parent_id=...)``: lets an

@@ -113,6 +113,14 @@ class TestSearchText(unittest.TestCase):
         # id segment isn't repeated; text is just 'same'.
         self.assertEqual(text, 'same')
 
+    def test_id_omitted_when_show_ids_auto_and_non_scalar(self):
+        # A structured (non-scalar) id is routing state, never rendered in
+        # 'auto' — so it must not leak into the search haystack either.
+        item = Item(id=('launch', 1, 'file', '/x/a.md'), title='a.md')
+        text = _search_text(item, show_ids='auto')
+        self.assertNotIn('launch', text)
+        self.assertEqual(text, 'a.md')
+
     def test_id_kept_when_show_ids_always(self):
         item = Item(id='same', title='same')
         text = _search_text(item, show_ids='always')

@@ -928,7 +928,6 @@ class TestLauncherApi(unittest.TestCase):
         self.assertEqual(row.tag, 'md ↗')
         self.assertEqual(row.tag_style, 'yellow')
         self.assertFalse(row.has_children)
-        self.assertTrue(row.id_hidden)   # routing tuple, not for display
 
     def test_launcher_row_spec_is_opaque(self):
         # md_doc does not interpret the spec — an arbitrary tuple flows into
@@ -942,7 +941,6 @@ class TestLauncherApi(unittest.TestCase):
         self.assertEqual(u.title, 'References')
         self.assertEqual(u.tag, 'md')
         self.assertTrue(u.has_children)
-        self.assertTrue(u.id_hidden)     # routing tuple, not for display
 
     # ---- launch -----------------------------------------------------------
 

@@ -1915,7 +1915,8 @@ def _search_text(item, *, show_ids='auto', is_current_scope=False):
 
       * id segment — only when it would be rendered (``show_ids`` resolves
         to visible per ``_id_visible``: ``'always'`` always, ``'auto'``
-        when ``str(id) != title``, ``'never'`` never). Without this gate
+        when the id is a scalar (``str``/``int``) differing from the title,
+        ``'never'`` never). Without this gate
         a recipe like browse-claude (``show_ids='never'``, voice ids
         carry the full file path) would match every row when the user
         searches for a path fragment that's only visible on the scope
@@ -1928,7 +1929,9 @@ def _search_text(item, *, show_ids='auto', is_current_scope=False):
     parts = []
     id_visible = (
         show_ids == 'always'
-        or (show_ids != 'never' and str(item.id) != item.title)
+        or (show_ids != 'never'
+            and isinstance(item.id, (str, int))
+            and str(item.id) != item.title)
     )
     if id_visible:
         parts.append(str(item.id))

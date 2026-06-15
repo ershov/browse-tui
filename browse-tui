@@ -1376,14 +1376,6 @@ class Item:
     debug dumps, ``compare=False`` keeps it out of ``__eq__`` /
     ``__hash__``.
 
-    ``id_hidden`` (default ``False``) suppresses the id segment for this
-    one row regardless of the Browser's ``show_ids`` mode — for rows whose
-    id is internal routing state, not a user-facing identifier (e.g. the
-    ``('launch', …)`` / ``('md-refs', …)`` rows ``md_doc`` builds, whose
-    tuple ids would otherwise render verbatim under ``show_ids='auto'``).
-    Distinct from ``hidden`` (which hides the whole row): the row still
-    shows, only its id is dropped.
-
     ``preview`` is the per-item preview text cache (string or
     ``None``). Lives on the Item rather than a side-table dict so it
     survives the Item's lifetime naturally and is dropped with it.
@@ -1409,7 +1401,6 @@ class Item:
     hidden: bool = False
     boundary: bool = False
     meta: bool = False
-    id_hidden: bool = False
     _filter_hidden: bool = field(
         default=False, init=False, repr=False, compare=False,
     )
@@ -3590,7 +3581,8 @@ def _search_text(item, *, show_ids='auto', is_current_scope=False):
 
       * id segment — only when it would be rendered (``show_ids`` resolves
         to visible per ``_id_visible``: ``'always'`` always, ``'auto'``
-        when ``str(id) != title``, ``'never'`` never). Without this gate
+        when the id is a scalar (``str``/``int``) differing from the title,
+        ``'never'`` never). Without this gate
         a recipe like browse-claude (``show_ids='never'``, voice ids
         carry the full file path) would match every row when the user
         searches for a path fragment that's only visible on the scope
@@ -3603,7 +3595,9 @@ def _search_text(item, *, show_ids='auto', is_current_scope=False):
     parts = []
     id_visible = (
         show_ids == 'always'
-        or (show_ids != 'never' and str(item.id) != item.title)
+        or (show_ids != 'never'
+            and isinstance(item.id, (str, int))
+            and str(item.id) != item.title)
     )
     if id_visible:
         parts.append(str(item.id))
@@ -10916,20 +10910,20 @@ def _id_visible(item, show_ids):
     """Decide whether the id segment should be emitted for ``item``.
 
     ``show_ids`` is one of ``'always'``, ``'auto'``, ``'never'``. In
-    ``'auto'`` mode the id is suppressed when ``str(item.id) ==
-    item.title`` — the common shape for line-based CLI input where the
-    id and title are the same string and showing both is pure
-    duplication. A per-row ``item.id_hidden`` forces suppression
-    regardless of ``show_ids`` — for rows whose id is internal routing
-    state rather than a user-facing identifier.
+    ``'auto'`` mode the id is shown only when it is a *scalar* (``str`` /
+    ``int``) that differs from the title — the common shape for line-based
+    CLI input where the id is a user-facing identifier and showing it
+    alongside an equal title would be pure duplication. A structured id
+    (tuple, dataclass, …) is internal routing state, never a display
+    identifier, so ``'auto'`` always suppresses it — e.g. the ``('launch',
+    …)`` / ``('md-refs', …)`` rows ``md_doc`` builds. ``'always'`` /
+    ``'never'`` force the id on / off regardless of its type.
     """
-    if getattr(item, 'id_hidden', False):
-        return False   # routing-only id, never displayed (e.g. launcher rows)
     if show_ids == 'always':
         return True
     if show_ids == 'never':
         return False
-    return str(item.id) != item.title
+    return isinstance(item.id, (str, int)) and str(item.id) != item.title
 
 
 # Sentinel for ``RowContext.max_col_width(field, parent_id=...)``: lets an

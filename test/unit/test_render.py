@@ -318,19 +318,22 @@ class TestFormatItemSegmentsDefault(unittest.TestCase):
         self.assertNotIn('a ', joined)
         self.assertIn('Alpha', joined)
 
-    def test_id_hidden_suppresses_id_regardless_of_show_ids(self):
-        # A routing-only id (e.g. a launcher row's ('launch', …) tuple) is
-        # never displayed, even under show_ids='always'.
-        item = Item(id=('launch', 1, 'file', '/x/a.md'), title='a.md',
-                    id_hidden=True)
-        for mode in ('always', 'auto', 'never'):
-            self.assertFalse(_render._id_visible(item, mode))
-            joined = _joined(default_segments(item, show_ids=mode))
-            self.assertNotIn('launch', joined)   # the tuple id never renders
-            self.assertIn('a.md', joined)         # the title still does
-        # Without the flag, show_ids='always' would emit the id.
-        self.assertTrue(_render._id_visible(
-            Item(id=('launch', 1), title='x'), 'always'))
+    def test_auto_hides_non_scalar_routing_id(self):
+        # In 'auto' only a scalar (str/int) id is a user-facing identifier;
+        # a structured id (e.g. a launcher row's ('launch', …) tuple) is
+        # routing state and is never displayed, even though str(id) != title.
+        item = Item(id=('launch', 1, 'file', '/x/a.md'), title='a.md')
+        self.assertFalse(_render._id_visible(item, 'auto'))
+        joined = _joined(default_segments(item, show_ids='auto'))
+        self.assertNotIn('launch', joined)   # the tuple id never renders
+        self.assertIn('a.md', joined)         # the title still does
+        # A scalar id differing from the title is still shown in 'auto'
+        # (e.g. browse-plan's numeric ticket ids).
+        self.assertTrue(_render._id_visible(Item(id=5, title='Fix it'), 'auto'))
+        self.assertTrue(
+            _render._id_visible(Item(id='a', title='Alpha'), 'auto'))
+        # 'always' is an explicit opt-in and still emits a structured id.
+        self.assertTrue(_render._id_visible(item, 'always'))
 
     def test_collapsed_parent_uses_right_arrow(self):
         item = Item(id='a', has_children=True)

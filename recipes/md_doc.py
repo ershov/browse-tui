@@ -690,7 +690,7 @@ try:
         launcher rows flat and does not use it.
         """
         return Item(id=('md-refs', anchor), title='References',
-                    tag='md', has_children=True, id_hidden=True)
+                    tag='md', has_children=True)
 
     def launcher_row(anchor, spec, label):
         """One ``[md ↗]`` launcher row titled ``label``.
@@ -699,12 +699,11 @@ try:
         ``('launch', anchor, *spec)`` — ``spec`` is the opaque launch target
         (e.g. ``('md-file', abspath)``) the recipe unpacks at Enter time. The
         ``↗`` in the ``[md ↗]`` tag chip signals that Enter launches an external
-        browser rather than expanding or editing the row. ``id_hidden=True``
-        so the routing tuple is never displayed even under ``show_ids='auto'``.
+        browser rather than expanding or editing the row. The id is a structural
+        routing tuple, so ``show_ids='auto'`` never displays it.
         """
         return Item(id=('launch', anchor, *spec), title=label,
-                    tag='md ↗', tag_style='yellow', has_children=False,
-                    id_hidden=True)
+                    tag='md ↗', tag_style='yellow', has_children=False)
 
     def launch(ctx, *, path=None, content=None, label=None, roots=()):
         """Open a markdown document in ``browse-md`` as an external process.
