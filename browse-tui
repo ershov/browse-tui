@@ -1221,6 +1221,17 @@ def _read_csi(fd, _read1, _peek):
         return key_name
 
     # SGR mouse: ESC [ < Cb ; Cx ; Cy M/m
+    #
+    # ``Cb`` is a bitfield (xterm SGR encoding):
+    #   bits 0-1 — button: 0=left, 1=middle, 2=right
+    #   bit 2 (+4)  — Shift
+    #   bit 3 (+8)  — Alt (Meta)
+    #   bit 4 (+16) — Ctrl
+    #   bit 5 (+32) — motion/drag (only under ?1002/?1003, which we don't
+    #                 enable — so it never arrives and is not decoded here)
+    #   bit 6 (+64) — wheel / extended button (64 up, 65 down, 66 left,
+    #                 67 right)
+    # The final byte is 'M' for press and 'm' for release.
     if buf.startswith('<') and buf[-1] in ('M', 'm'):
         parts = buf[1:-1].split(';')
         if len(parts) == 3:
@@ -1228,13 +1239,35 @@ def _read_csi(fd, _read1, _peek):
                 cb, cx, cy = int(parts[0]), int(parts[1]), int(parts[2])
             except ValueError:
                 return '_mouse'
-            if cb == 64:
-                return 'scroll-up:{}:{}'.format(cy, cx)
-            if cb == 65:
-                return 'scroll-down:{}:{}'.format(cy, cx)
-            if cb == 0 and buf[-1] == 'M':  # left press only
-                return 'mouse-click:{}:{}'.format(cy, cx)
-            return '_mouse'  # ignore release, right-click, etc.
+            # Wheel / extended-button family (bit 6). The low two bits
+            # select the direction. Wheel notches carry no press/release
+            # semantics, so the modifier bits and final byte are ignored
+            # here — the bare cb 64/65 case stays byte-for-byte as before.
+            if cb & 64:
+                return ('scroll-up', 'scroll-down',
+                        'scroll-left', 'scroll-right')[cb & 3] + \
+                    ':{}:{}'.format(cy, cx)
+            # Translate the SGR modifier bits (Shift=4, Alt=8, Ctrl=16)
+            # into the xterm *keyboard* modifier parameter (1 + Shift=1,
+            # Alt=2, Ctrl=4) so we reuse _CSI_MOD_PREFIX verbatim — mouse
+            # modifier names then match key modifier names exactly, and
+            # unsupported combos (e.g. shift-alt) fall back to no prefix.
+            kbd_mask = (
+                (1 if cb & 4 else 0)    # Shift
+                | (2 if cb & 8 else 0)  # Alt
+                | (4 if cb & 16 else 0)  # Ctrl
+            )
+            mod = _CSI_MOD_PREFIX.get(kbd_mask + 1, '') if kbd_mask else ''
+            if buf[-1] == 'm':  # button release (any button)
+                return '{}mouse-release:{}:{}'.format(mod, cy, cx)
+            button = cb & 3
+            if button == 0:
+                return '{}mouse-click:{}:{}'.format(mod, cy, cx)
+            if button == 1:
+                return '{}middle-click:{}:{}'.format(mod, cy, cx)
+            if button == 2:
+                return '{}right-click:{}:{}'.format(mod, cy, cx)
+            return '_mouse'  # button 3 (legacy release sentinel) — drop
         return '_mouse'
 
     # CSI u encoding (kitty keyboard protocol): ESC [ <keycode> ; <mod> u
