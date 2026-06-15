@@ -48,13 +48,17 @@ Every row id is a tagged tuple whose first element is a short string
 ``kind`` tag, so dispatch is a flat ``id[0]`` match with direct field
 access — never a hex-vs-word heuristic or substring scan:
 
-  ('commit', sha)            a commit          -> changed files
-  ('file', sha, path)        a file in a commit (leaf) -> per-file diff
+  ('commit', sha)            a commit          -> changed files (+ md refs)
+  ('file', sha, path)        a file in a commit -> per-file diff; a .md file
+                             also -> a browse-md launcher
   ('ref', refname)           a branch/remote/tag -> commits on that ref
-  ('status', xy, path)       a working-tree entry (leaf) -> staged/worktree diff
+  ('status', xy, path)       a working-tree entry -> staged/worktree diff; a
+                             .md file also -> a browse-md launcher
   ('wc', bucket)             a status group (untracked/tracked/staged/conflicts)
-  ('stash', n[, path])       a stash (n int), or a file in one
+  ('stash', n[, path])       a stash (n int), or a file in one (.md -> launcher)
   ('reflog', n, sha)         a reflog entry (n int) -> changed files
+  ('md-refs', sha)           a commit's [md] References umbrella -> launcher rows
+  ('launch', anchor, *spec)  a [md ↗] launcher row -> opens a .md in browse-md
   ('filler', ns, n)          an inert tree-mode connector row (meta; no children)
   ('sdiff',)                 the piped-diff --stat umbrella -> its sfile rows
   ('sfile', i, path)         a file block of a piped diff (leaf; stdin mode)
@@ -66,6 +70,14 @@ access — never a hex-vs-word heuristic or substring scan:
 Because path / refname ride as their own tuple field, a path or ref
 containing ':' or '/' is never ambiguous — there is no string to
 re-split.
+
+When the ``md_doc`` plugin is importable, a commit's message is scanned for
+``.md`` references that resolve in ITS tree (not the working tree) and
+surfaced under a ``[md] References`` umbrella, and any ``.md`` file row gains
+a ``→ browse`` launcher child; Enter on a ``[md ↗]`` launcher row opens the
+document in ``browse-md`` (a committed / stashed / message-referenced blob is
+piped on stdin; an on-disk working-tree file is opened by path). Without
+``md_doc`` these rows are absent and ``.md`` rows stay plain leaves.
 
 Commit rows render in columns — a yellow short-sha, a dim author and a
 dim relative date — followed by the branch / remote / tag refs parsed
@@ -80,7 +92,8 @@ and per-file diffs are rendered through ``delta`` when it is on PATH
 be md2ansi-colored when ``md2ansi_lib`` is importable (toggle with
 ``m``).
 
-Keys: Enter flips expand/collapse of the cursor row; `` ` `` opens the
+Keys: Enter opens a ``[md ↗]`` launcher row in browse-md, else flips
+expand/collapse of the cursor row; `` ` `` opens the
 mode picker; ``t`` toggles the commit-graph column (``--tree``); ``m``
 toggles md2ansi message coloring (when available); ``E`` edits the real
 working-tree file for file/status rows in $EDITOR; the built-in ``v`` /
@@ -125,6 +138,17 @@ except Exception:
     _md2ansi_fn = None
 
 _MD_COLOR = _md2ansi_fn is not None  # default on when available
+
+# Optional md_doc plugin — gates the markdown launcher rows: a commit's
+# message references and any ``.md`` file row expand into ``browse-md``
+# launcher targets. Inert when md_doc isn't importable, exactly like the
+# md2ansi_lib gate above — ``.md`` rows then stay plain leaves and a commit
+# row carries only its files. md_doc owns the launcher Item shapes + the
+# embedding flags / stdin policy in ``md_doc.launch``.
+try:
+    import md_doc as _md_doc
+except Exception:
+    _md_doc = None
 
 # Probe ``delta`` once at load (not per render): used to pipe the
 # git-colored diff through delta for terminal-native rendering, and — via
@@ -424,6 +448,169 @@ def _md_message(text):
     return text
 
 
+# ---- markdown launcher rows ----------------------------------------------
+
+# Two launch targets, surfaced via the shared ``md_doc`` launcher Items:
+#
+#   * a commit's MESSAGE references — a ``[md] References`` umbrella prepended
+#     to the commit's files, its launcher rows opening each referenced ``.md``
+#     resolved against THE COMMIT TREE (not the working tree);
+#   * any ``.md`` FILE row — a single ``→ browse`` launcher child opening that
+#     file (from the working tree for a real on-disk path, or extracted from
+#     its revision for a committed / stashed blob).
+#
+# The launcher-row id is md_doc's generic ``('launch', anchor, *spec)``: the
+# ``anchor`` is one element (a commit sha for an umbrella row, or the parent
+# row's own id-tuple for a ``.md`` file child) so the launch ``spec`` is always
+# ``id[2:]`` regardless of the anchor's internals. ``spec`` is OUR opaque,
+# discriminator-led tuple that ``on_enter`` decodes to choose path-vs-stdin:
+#
+#   ('blob', rev, path)  — extract ``git show rev:path`` and launch via stdin
+#                          (``rev`` is a commit sha or a ``stash@{n}`` selector)
+#   ('wtfile', abspath)  — launch the on-disk working-tree file by path
+#
+# Inert unless ``md_doc`` imported (the launcher Items live in its
+# browse_tui-aware half); ``_md_launchable`` is the single gate the builders
+# and the get_children dispatch share.
+
+_MD_EXTS = ('.md', '.MD')
+
+
+def _md_launchable(path):
+    """True if ``path`` is a markdown file we offer a browse-md launcher for.
+
+    Gated on ``md_doc`` being importable — absent it the whole launcher
+    feature is inert and ``.md`` file rows stay plain leaves. Mirrors
+    browse-fs's gate so the two recipes agree on what is launchable.
+    """
+    return _md_doc is not None and isinstance(path, str) and path.endswith(_MD_EXTS)
+
+
+def _repo_root():
+    """Work-tree root via ``git rev-parse --show-toplevel``, or ``''``.
+
+    The ``--root`` resolution base for every launched document (so links
+    inside the opened markdown resolve against the repo). Empty outside a
+    repo / when git is absent — the launch still works, only refs in a
+    stdin-launched document then can't resolve. Same resolve ``E`` uses for
+    the working-tree path.
+    """
+    result = _run_git('rev-parse', '--show-toplevel')
+    return result.stdout.strip() if result.returncode == 0 else ''
+
+
+def _blob_text(rev, path):
+    """Contents of ``path`` at ``rev`` (``git show rev:path``), or ``None``.
+
+    ``rev`` is a commit sha or a ``stash@{n}`` selector. ``None`` on any git
+    failure (path absent from the revision, gitless) so the caller flashes
+    rather than launching an empty document.
+    """
+    result = _run_git('show', f'{rev}:{path}')
+    return result.stdout if result.returncode == 0 else None
+
+
+def _commit_md_refs(sha):
+    """Distinct ``.md`` refs in commit ``sha``'s message resolving in its TREE.
+
+    Scans the full commit message (``git show -s --format=%B``) for ``.md``
+    tokens via ``md_doc.find_md_refs``, then resolves each against the COMMIT
+    TREE — ``git cat-file -e sha:<token>`` — NOT the filesystem (the working
+    tree may not match the commit, and a committed doc need not exist on disk
+    at all). Returns ordered, de-duplicated ``(path, label)`` pairs: ``path``
+    is the repo-relative token that exists in the tree (a leading ``./`` is
+    normalised off so the launch ``rev:path`` and the label agree) and
+    ``label`` is its display form (``md_doc.ref_label`` against the repo
+    root). ``[]`` when the message has no resolving refs (so the umbrella is
+    omitted) or md_doc / git is unavailable.
+    """
+    if _md_doc is None:
+        return []
+    msg = _run_git('show', '-s', '--format=%B', sha)
+    if msg.returncode != 0:
+        return []
+    root = _repo_root()
+    seen = set()
+    out = []
+    for token in _md_doc.find_md_refs(msg.stdout):
+        # ``git show`` / ``cat-file`` take a repo-root-relative path; a leading
+        # ``./`` is accepted by git but would split the dedup key from the
+        # label, so normalise it off. Absolute / ``..`` tokens simply fail the
+        # existence probe and fall away.
+        path = token[2:] if token.startswith('./') else token
+        if path in seen:
+            continue
+        if _run_git('cat-file', '-e', f'{sha}:{path}').returncode != 0:
+            continue
+        seen.add(path)
+        label = _md_doc.ref_label(os.path.join(root, path), root) if root else path
+        out.append((path, label))
+    return out
+
+
+def _commit_md_prefix(sha):
+    """The ``[md] References`` umbrella for commit ``sha``, or ``[]``.
+
+    Prepended to the commit's file rows when its message references any ``.md``
+    file that resolves in the commit tree (``_commit_md_refs``). The umbrella
+    is an expandable grouping row (``md_doc.references_umbrella``); its launcher
+    children are built lazily when it expands (``_commit_md_children``), so the
+    message is scanned once here to decide whether to show it and again on
+    expand to build the rows — each scan self-contained, no shared state.
+    """
+    if _md_doc is None or not _commit_md_refs(sha):
+        return []
+    return [_md_doc.references_umbrella(sha)]
+
+
+def _commit_md_children(sha):
+    """Launcher rows under a commit's ``[md] References`` umbrella.
+
+    One ``[md ↗]`` row per resolving message ref (``_commit_md_refs``), each
+    carrying a ``('blob', sha, path)`` spec so ``on_enter`` extracts
+    ``git show sha:path`` and launches it via stdin. Titled by the ref's
+    display label; the anchor is the commit sha.
+    """
+    return [_md_doc.launcher_row(sha, ('blob', sha, path), label)
+            for path, label in _commit_md_refs(sha)]
+
+
+def _md_file_children(item_id, spec):
+    """The single ``→ browse`` launcher child for a ``.md`` file row.
+
+    Shared by the committed / working-tree / stash file rows: each ``.md`` row
+    gets exactly one launcher child, anchored on the row's own id (so sibling
+    rows stay distinct) and carrying the caller's opaque ``spec`` — a
+    ``('blob', rev, path)`` for a revision blob or a ``('wtfile', abspath)``
+    for an on-disk file. Titled ``→ browse`` (the lone child needs no
+    path label — its parent already names the file).
+    """
+    return [_md_doc.launcher_row(item_id, spec, '→ browse')]
+
+
+def _md_launch_preview(spec):
+    """Markdown preview for a ``('launch', anchor, *spec)`` row.
+
+    ``spec`` (the launcher id's ``[2:]``) names the document the row would
+    open: a ``('wtfile', abspath)`` on-disk file or a ``('blob', rev, path)``
+    revision blob (``git show rev:path``). Rendered through ``_md_message``
+    (md2ansi when the toggle/library allow, else raw) — the same colored-
+    markdown view browse-md would open, so the preview matches the launch.
+    Returns ``''`` when the target is unreadable / spec is unrecognised.
+    """
+    if len(spec) == 2 and spec[0] == 'wtfile':
+        try:
+            with open(spec[1], 'rb') as f:
+                text = f.read().decode('utf-8', errors='replace')
+        except OSError as e:
+            return f'[error] {e}'
+        return _md_message(text)
+    if len(spec) == 3 and spec[0] == 'blob':
+        text = _blob_text(spec[1], spec[2])
+        return _md_message(text) if text is not None else ''
+    return ''
+
+
 def _parse_decorations(deco, remotes=None):
     """Parse a ``%D`` decoration string into ``[(text, style)]`` chips.
 
@@ -683,7 +870,7 @@ def _status_leaf(xy, path):
     return Item(id=('status', xy, path), title=path,
                 tag=tag,
                 tag_style=_STATUS_LETTER_STYLE.get(tag, ''),
-                has_children=False)
+                has_children=_md_launchable(path))
 
 
 # Worktree groups for commits mode — the ordered (bucket, label) pairs
@@ -1219,14 +1406,37 @@ def get_children(item_id, *, reload=False):
         return []
     kind = item_id[0]
     if kind == 'commit':
-        return _commit_files(item_id[1])
+        # A commit drills into its files; when its MESSAGE references one or
+        # more ``.md`` files resolving in the commit tree, a ``[md]
+        # References`` umbrella is prepended (``_commit_md_prefix``).
+        return _commit_md_prefix(item_id[1]) + _commit_files(item_id[1])
+    if kind == 'md-refs':
+        # The ``[md] References`` umbrella under a commit — its launcher rows.
+        # id = ('md-refs', sha).
+        return _commit_md_children(item_id[1])
     if kind == 'reflog':
         # A reflog entry drills into the same file list as a commit —
         # a sha is a sha. id = ('reflog', n, sha).
         return _commit_files(item_id[2])
+    if kind == 'file' and len(item_id) == 3 and _md_launchable(item_id[2]):
+        # A committed ``.md`` file leaf expands into its single ``→ browse``
+        # launcher child, extracted from the commit. id = ('file', sha, path).
+        return _md_file_children(item_id, ('blob', item_id[1], item_id[2]))
+    if kind == 'status' and len(item_id) == 3 and _md_launchable(item_id[2]):
+        # A working-tree / untracked ``.md`` leaf expands into a ``→ browse``
+        # launcher opening the real on-disk file by PATH (the working copy is
+        # the live document). id = ('status', xy, path).
+        root = _repo_root()
+        abspath = os.path.join(root, item_id[2]) if root else item_id[2]
+        return _md_file_children(item_id, ('wtfile', abspath))
+    if kind == 'stash' and len(item_id) == 3 and _md_launchable(item_id[2]):
+        # A stashed ``.md`` file leaf expands into a ``→ browse`` launcher
+        # extracted from the stash blob. id = ('stash', n, path).
+        return _md_file_children(
+            item_id, ('blob', f'stash@{{{item_id[1]}}}', item_id[2]))
     if kind == 'stash' and len(item_id) == 2:
         # A stash node (('stash', n)) drills into its files; a stash file
-        # leaf (('stash', n, path)) has none.
+        # leaf (('stash', n, path)) without a launcher has none.
         return _stash_files(item_id[1])
     if kind == 'ref':
         # A ref drills into its commits — the shared commit-log builder
@@ -1716,7 +1926,7 @@ def _stash_files(n):
         items.append(Item(id=('stash', n, path), title=path,
                           tag=status,
                           tag_style=_STATUS_LETTER_STYLE.get(status, ''),
-                          has_children=False))
+                          has_children=_md_launchable(path)))
     return items
 
 
@@ -1794,7 +2004,7 @@ def _commit_files(sha):
         items.append(Item(id=('file', sha, path), title=path,
                           tag=status,
                           tag_style=_STATUS_LETTER_STYLE.get(status, ''),
-                          has_children=False))
+                          has_children=_md_launchable(path)))
     return items
 
 
@@ -1848,6 +2058,14 @@ def get_preview(item_id):
         if len(item_id) == 3:
             return _stash_file_preview(item_id[1], item_id[2])
         return _stash_preview(item_id[1])
+    if kind == 'launch':
+        # A '→ browse' / References launcher row — preview the markdown it
+        # would open, rendered like a message. id = ('launch', anchor, *spec).
+        return _md_launch_preview(item_id[2:])
+    if kind == 'md-refs':
+        # The [md] References umbrella over a commit message's refs — show the
+        # commit it groups them from. id = ('md-refs', sha).
+        return _commit_preview(item_id[1])
     # root / err / status_clean / stash_none / filler kinds have no preview.
     return ''
 
@@ -1989,14 +2207,25 @@ def _stash_file_preview(n, path):
 
 
 def on_enter(ctx):
-    """Flip expand/collapse of the cursor row; never quits, never prints.
+    """Launch a ``[md ↗]`` row, else flip expand/collapse; never quits/prints.
 
-    Leaves (rows without children) are a no-op. The decision reads
-    ``ctx.state.expanded`` — the set of expanded ids in the current
-    scope — so a second Enter on an open row folds it back up.
+    A launcher row (id ``('launch', anchor, *spec)``) opens its target in
+    ``browse-md`` via ``md_doc.launch`` — the ``spec`` (``id[2:]``) decides
+    HOW: ``('blob', rev, path)`` extracts ``git show rev:path`` and pipes it on
+    stdin (a committed / stashed / message-referenced doc need not exist on
+    disk); ``('wtfile', abspath)`` opens the on-disk working-tree file by path.
+    ``--root`` is the repo root so links inside the opened document resolve
+    against the repo. Every other row keeps the expand/collapse toggle: leaves
+    are a no-op, and a second Enter on an open row folds it back up
+    (``ctx.state.expanded`` is the open-id set in the current scope).
     """
     item = ctx.cursor
-    if item is None or not item.has_children:
+    if item is None:
+        return
+    if isinstance(item.id, tuple) and item.id and item.id[0] == 'launch':
+        _md_launch(ctx, item.id[2:])
+        return
+    if not item.has_children:
         return
     if item.id in ctx.state.expanded:
         ctx.collapse(item.id)
@@ -2004,6 +2233,38 @@ def on_enter(ctx):
         # User-driven navigation — autoscroll the newly-revealed children
         # into view, matching the built-in Right-arrow handler.
         ctx.expand(item.id, autoscroll=True)
+
+
+def _md_launch(ctx, spec):
+    """Open the document a launcher-row ``spec`` points at in ``browse-md``.
+
+    ``spec`` is the opaque tuple this recipe encoded onto the launcher id
+    (``id[2:]``); its leading discriminator chooses the delivery md_doc owns:
+
+      * ``('blob', rev, path)``  — ``git show rev:path`` content, launched on
+        stdin (``rev`` is a commit sha or ``stash@{n}``). A blob that no longer
+        resolves flashes instead of opening an empty document.
+      * ``('wtfile', abspath)``  — the on-disk working-tree file, by path.
+
+    ``--root`` is anchored at the repo root so references inside the opened
+    document resolve the same way they do in the repo. A no-op (guarded flash)
+    when md_doc is unavailable or the spec is unrecognised.
+    """
+    if _md_doc is None or not spec:
+        return
+    root = _repo_root()
+    roots = (root,) if root else ()
+    kind = spec[0]
+    if kind == 'wtfile':
+        _md_doc.launch(ctx, path=spec[1], roots=roots)
+        return
+    if kind == 'blob':
+        rev, path = spec[1], spec[2]
+        text = _blob_text(rev, path)
+        if text is None:
+            ctx.flash(f'cannot read {path} at {rev}')
+            return
+        _md_doc.launch(ctx, content=text, label=path, roots=roots)
 
 
 def switch_mode(ctx):

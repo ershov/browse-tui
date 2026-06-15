@@ -291,7 +291,9 @@ recipes only). All already use `str()`/`format()` and need **no code change**.
 For structured ids:
 - `show_ids`: a tuple renders verbosely as `str(tuple)`; recipes with tuple ids
   keep `show_ids='never'` (browse-claude/git/md already do) or supply a
-  `format_row_content`.
+  `format_row_content`. *(Updated 2026-06-15: `'auto'` now shows only scalar
+  `str`/`int` ids and suppresses non-scalar ids itself, so a tuple is no longer
+  displayed verbosely and `show_ids='never'` is not required solely to hide it.)*
 - `print_format` `{id}`: renders `str(id)`. Recipes that print a useful value
   either keep a bare-`str` path id (browse-fs) or emit a dedicated attribute/field
   (browse-md's `file_path`) / override `on_enter`.

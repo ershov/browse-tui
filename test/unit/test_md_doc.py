@@ -1,10 +1,14 @@
 """Unit tests for ``recipes/md_doc`` — the shared markdown-structure module.
 
-Unlike the recipe test files, ``md_doc`` imports no ``browse_tui`` (it is the
-framework-agnostic half of the markdown work), so no stub is needed: we just
-put ``recipes/`` on ``sys.path`` — which also resolves ``md_doc``'s own
-``from md2ansi_lib import md2ansi_scan`` to the real library, the same thing
-``--run-py`` does at runtime — and import it directly.
+``md_doc``'s STRUCTURAL half imports no ``browse_tui`` (it is the
+framework-agnostic part of the markdown work): we just put ``recipes/`` on
+``sys.path`` — which also resolves ``md_doc``'s own ``from md2ansi_lib import
+md2ansi_scan`` to the real library, the same thing ``--run-py`` does at runtime
+— and import it. Its framework-AWARE launcher block is guarded behind
+``from browse_tui import Item`` (like a recipe), so to cover that API we import
+``md_doc`` under a temporary ``browse_tui`` stub and then restore ``sys.modules``
+(see ``_import_md_doc_with_launcher``); the structural tests below use the same
+real module.
 
 Coverage mirrors the design spec's ``md_doc`` testing strategy:
 
@@ -21,11 +25,16 @@ Coverage mirrors the design spec's ``md_doc`` testing strategy:
 * ``resolve_md_ref``  — base precedence, first-existing, ``None``
                         (TestResolveMdRef).
 * ``get_doc`` / ``clear_cache`` — cache hit + clear (TestCache).
+* launcher API       — ``ref_label`` anchoring; ``resolve_refs`` dedup / sort /
+                        drop-nonexistent; the ``Item`` builders' id + tag shape;
+                        and ``launch`` path-arg vs stdin-content invocation with
+                        ``run_external`` stubbed (TestLauncherApi).
 """
 
 import os
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -36,7 +45,63 @@ _RECIPES = str(Path(__file__).resolve().parents[2] / 'recipes')
 if _RECIPES not in sys.path:
     sys.path.insert(0, _RECIPES)
 
-import md_doc  # noqa: E402  (path insert must precede import)
+
+def _import_md_doc_with_launcher():
+    """Import ``md_doc`` with its framework-aware launcher block defined.
+
+    ``md_doc``'s structural half needs no ``browse_tui``, but its launcher block
+    (``launcher_row`` / ``references_umbrella`` / ``launch``) is guarded behind
+    ``from browse_tui import Item`` — exactly like a recipe — so it only exists
+    when ``browse_tui`` is importable at import time. The builders capture that
+    ``Item`` into the module namespace, so once defined they keep working even
+    if the stub is later removed.
+
+    To exercise the launcher API we import ``md_doc`` under a TEMPORARY stub
+    whose ``Item`` keeps its kwargs as attributes (the builder tests read
+    ``.id`` / ``.tag`` / ``.has_children``), then RESTORE ``sys.modules`` to its
+    prior state. The restore is what keeps this module a good citizen: a leftover
+    lean ``browse_tui`` stub would bleed into the recipe test modules (whose own
+    stubs early-return when ``browse_tui`` is already present) and break their
+    richer imports — the order-sensitivity TESTING.md documents. We also drop a
+    stubless ``md_doc`` already cached by another module so the re-import under
+    the stub actually defines the launcher block.
+
+    Returns the imported ``md_doc`` module (also left in ``sys.modules`` for the
+    structural tests — that is the real library, not a stub).
+    """
+    saved_bt = sys.modules.get('browse_tui')
+    # If md_doc was already imported WITHOUT the launcher block (some other
+    # module imported it stubless), drop it so the re-import below redefines it.
+    cached = sys.modules.get('md_doc')
+    if cached is not None and not hasattr(cached, 'launcher_row'):
+        del sys.modules['md_doc']
+
+    if saved_bt is None:
+        stub = types.ModuleType('browse_tui')
+
+        class _Item:
+            def __init__(self, *a, **kw):
+                for k, v in kw.items():
+                    setattr(self, k, v)
+
+        stub.Item = _Item
+        stub.PluginConfig = lambda **kw: None
+        stub.register_plugin = lambda cfg: None
+        sys.modules['browse_tui'] = stub
+    try:
+        import md_doc as _m
+    finally:
+        # Restore the prior browse_tui (remove our stub) so it never bleeds
+        # into another test module's load. The launcher builders have already
+        # captured ``Item``, so they keep working without the stub present.
+        if saved_bt is None:
+            sys.modules.pop('browse_tui', None)
+        else:
+            sys.modules['browse_tui'] = saved_bt
+    return _m
+
+
+md_doc = _import_md_doc_with_launcher()  # noqa: E402 (path insert precedes import)
 
 
 def _headings(nodes):
@@ -766,6 +831,188 @@ class TestCache(unittest.TestCase):
             self.assertEqual([n.title for n in tree], ['Heading'])
             self.assertEqual([c.title for c in _headings(tree[0].children)], ['Sub'])
             self.assertIn('�', text)  # the bad byte was replaced
+
+
+class _LaunchCtx:
+    """A ``ctx`` stand-in for ``md_doc.launch``.
+
+    Records each ``run_external`` call's ``cmd`` (argv list), the merged
+    ``env`` dict, the ``keep_screen`` flag, and ``stdin_text`` (the piped
+    document, for the content form), so a test can assert both what was
+    launched and how. Mirrors the recipe tests' launch ctx.
+    """
+
+    def __init__(self):
+        self.calls = []
+
+    def run_external(self, cmd, env=None, *, keep_screen=False, stdin_text=None):
+        self.calls.append({'cmd': cmd, 'env': env, 'keep_screen': keep_screen,
+                           'stdin_text': stdin_text})
+        return 0
+
+
+class TestLauncherApi(unittest.TestCase):
+    """The ``browse_tui``-aware launcher API: labels, refs, builders, launch."""
+
+    def _write(self, path, body=''):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w') as f:
+            f.write(body)
+
+    # ---- ref_label --------------------------------------------------------
+
+    def test_ref_label_inside_project_is_relative(self):
+        self.assertEqual(
+            md_doc.ref_label('/proj/docs/a.md', '/proj'), 'docs/a.md')
+        # The project root itself collapses to its basename via relpath.
+        self.assertEqual(md_doc.ref_label('/proj/a.md', '/proj'), 'a.md')
+
+    def test_ref_label_outside_project_collapses_home(self):
+        home = os.path.expanduser('~')
+        self.assertEqual(
+            md_doc.ref_label(os.path.join(home, 'n.md'), '/proj'), '~/n.md')
+
+    def test_ref_label_outside_project_and_home_is_absolute(self):
+        # Neither under project_root nor under ~: the bare absolute path.
+        self.assertEqual(md_doc.ref_label('/elsewhere/x.md', '/proj'),
+                         '/elsewhere/x.md')
+
+    def test_ref_label_prefix_is_path_boundary_not_substring(self):
+        # ``/proj2`` is not inside ``/proj`` even though the string starts with
+        # it — the boundary check appends a '/'.
+        self.assertEqual(md_doc.ref_label('/proj2/a.md', '/proj'), '/proj2/a.md')
+
+    # ---- resolve_refs -----------------------------------------------------
+
+    def test_resolve_refs_dedup_sort_drop_nonexistent(self):
+        # References z, a, b (b twice), a missing file, and a non-.md token.
+        # Result: existing .md only, deduped by abspath, sorted by label.
+        with tempfile.TemporaryDirectory() as d:
+            for name in ('a.md', 'b.md', 'z.md'):
+                self._write(os.path.join(d, name))
+            text = ('see z.md and b.md then b.md again and a.md, '
+                    'plus missing nope.md and code conf.txt')
+            refs = md_doc.resolve_refs(text, doc_dir=d, cwd=d, project_root=d)
+            self.assertEqual([label for _ab, label in refs],
+                             ['a.md', 'b.md', 'z.md'])
+            # Each pair's abspath is the canonical realpath of an existing file.
+            for ab, label in refs:
+                self.assertTrue(os.path.exists(ab))
+                self.assertEqual(ab, os.path.realpath(ab))
+                self.assertEqual(label, md_doc.ref_label(ab, d))
+
+    def test_resolve_refs_none_when_nothing_resolves(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(
+                md_doc.resolve_refs('only missing.md here',
+                                    doc_dir=d, cwd=d, project_root=d),
+                [])
+
+    def test_resolve_refs_two_tokens_one_file_deduped(self):
+        # A markdown inline link yields the same token twice (label + target);
+        # both resolve to one file, so the result has a single pair.
+        with tempfile.TemporaryDirectory() as d:
+            self._write(os.path.join(d, 'cli.md'))
+            refs = md_doc.resolve_refs('[cli.md](cli.md)',
+                                       doc_dir=d, cwd=d, project_root=d)
+            self.assertEqual(len(refs), 1)
+            self.assertEqual(refs[0][1], 'cli.md')
+
+    # ---- Item builders ----------------------------------------------------
+
+    def test_launcher_row_id_and_shape(self):
+        row = md_doc.launcher_row('/anchor.md', ('md-file', '/t/x.md'), 'x.md')
+        # Generic routable id: ('launch', anchor, *spec).
+        self.assertEqual(row.id, ('launch', '/anchor.md', 'md-file', '/t/x.md'))
+        self.assertEqual(row.title, 'x.md')
+        self.assertEqual(row.tag, 'md ↗')
+        self.assertEqual(row.tag_style, 'yellow')
+        self.assertFalse(row.has_children)
+
+    def test_launcher_row_spec_is_opaque(self):
+        # md_doc does not interpret the spec — an arbitrary tuple flows into
+        # the id verbatim after the ('launch', anchor) prefix.
+        row = md_doc.launcher_row('msg-7', ('md-inline',), 'message markdown')
+        self.assertEqual(row.id, ('launch', 'msg-7', 'md-inline'))
+
+    def test_references_umbrella_shape(self):
+        u = md_doc.references_umbrella('msg-7')
+        self.assertEqual(u.id, ('md-refs', 'msg-7'))
+        self.assertEqual(u.title, 'References')
+        self.assertEqual(u.tag, 'md')
+        self.assertTrue(u.has_children)
+
+    # ---- launch -----------------------------------------------------------
+
+    def test_launch_path_is_plain_argv(self):
+        ctx = _LaunchCtx()
+        md_doc.launch(ctx, path='/docs/a.md', roots=('/proj', '/cwd'))
+        self.assertEqual(len(ctx.calls), 1)
+        call = ctx.calls[0]
+        cmd = call['cmd']
+        self.assertIsInstance(cmd, list)        # argv, not a shell string
+        self.assertEqual(cmd[0], 'browse-md')
+        # Embedding flags present; target before the --root bases.
+        self.assertIn('--no-alt-screen', cmd)
+        self.assertIn('--quit-on-scope-up', cmd)
+        self.assertIn('/docs/a.md', cmd)
+        # Repeatable --root, in order.
+        self.assertEqual(cmd[cmd.index('/docs/a.md') + 1:],
+                         ['--root', '/proj', '--root', '/cwd'])
+        # No stdin env for the path form; handoff keeps the alt screen.
+        self.assertIsNone(call['env'])
+        self.assertTrue(call['keep_screen'])
+
+    def test_launch_path_no_roots(self):
+        ctx = _LaunchCtx()
+        md_doc.launch(ctx, path='/docs/a.md')
+        cmd = ctx.calls[0]['cmd']
+        self.assertEqual(cmd, ['browse-md', '--no-alt-screen',
+                               '--quit-on-scope-up', '/docs/a.md'])
+
+    def test_launch_content_pipes_via_stdin(self):
+        ctx = _LaunchCtx()
+        md_doc.launch(ctx, content='# Inline\nbody\n', roots=('/proj',))
+        call = ctx.calls[0]
+        cmd = call['cmd']
+        # Plain argv (no shell string), reading the document from stdin (`-`).
+        self.assertIsInstance(cmd, list)
+        self.assertEqual(cmd[:2], ['browse-md', '-'])
+        # The document rides the stdin pipe — NOT argv, NOT env.
+        self.assertEqual(call['stdin_text'], '# Inline\nbody\n')
+        self.assertIsNone(call['env'])
+        self.assertNotIn('# Inline\nbody\n', cmd)
+        # Embedding flags + repeatable --root on argv after `-`.
+        self.assertIn('--no-alt-screen', cmd)
+        self.assertIn('--quit-on-scope-up', cmd)
+        self.assertEqual(cmd[-2:], ['--root', '/proj'])
+        self.assertTrue(call['keep_screen'])
+
+    def test_launch_content_large_document_not_on_argv_or_env(self):
+        # Regression for the E2BIG bug: a big document must not land on argv
+        # or env (both ARG_MAX/MAX_ARG_STRLEN-bounded) — only the stdin pipe.
+        ctx = _LaunchCtx()
+        big = '#x\n' + ('lorem ipsum ' * 50_000)   # ~600 KB, well over 128 KB
+        md_doc.launch(ctx, content=big, roots=())
+        call = ctx.calls[0]
+        self.assertEqual(call['stdin_text'], big)
+        self.assertIsNone(call['env'])
+        self.assertNotIn(big, call['cmd'])
+
+    def test_launch_content_empty_roots_omits_root_flag(self):
+        ctx = _LaunchCtx()
+        md_doc.launch(ctx, content='hi')
+        cmd = ctx.calls[0]['cmd']
+        self.assertNotIn('--root', cmd)
+        self.assertEqual(cmd, ['browse-md', '-', '--no-alt-screen',
+                               '--quit-on-scope-up'])
+
+    def test_launch_content_none_sends_empty_string(self):
+        # Defensive: ``content`` defaulting through (None) still pipes the empty
+        # string rather than dropping it / passing None to stdin_text.
+        ctx = _LaunchCtx()
+        md_doc.launch(ctx, content=None, roots=())
+        self.assertEqual(ctx.calls[0]['stdin_text'], '')
 
 
 if __name__ == '__main__':

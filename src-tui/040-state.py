@@ -1915,7 +1915,8 @@ def _search_text(item, *, show_ids='auto', is_current_scope=False):
 
       * id segment — only when it would be rendered (``show_ids`` resolves
         to visible per ``_id_visible``: ``'always'`` always, ``'auto'``
-        when ``str(id) != title``, ``'never'`` never). Without this gate
+        when the id is a scalar (``str``/``int``) differing from the title,
+        ``'never'`` never). Without this gate
         a recipe like browse-claude (``show_ids='never'``, voice ids
         carry the full file path) would match every row when the user
         searches for a path fragment that's only visible on the scope
@@ -1928,7 +1929,9 @@ def _search_text(item, *, show_ids='auto', is_current_scope=False):
     parts = []
     id_visible = (
         show_ids == 'always'
-        or (show_ids != 'never' and str(item.id) != item.title)
+        or (show_ids != 'never'
+            and isinstance(item.id, (str, int))
+            and str(item.id) != item.title)
     )
     if id_visible:
         parts.append(str(item.id))
@@ -3063,15 +3066,18 @@ def recipe_argv(argv=None):
     ``--tty=VALUE`` — but does NOT remove it from ``sys.argv``, so a
     recipe's own argv scan would otherwise misread the flag (or its
     value, e.g. ``-`` or a ``/dev/pts/N`` path) as a positional. This
-    drops exactly those framework-owned tokens — today only the ``--tty``
-    flag and its value — leaving the recipe's own arguments in order.
+    drops exactly those framework-owned tokens — the ``--tty`` flag and
+    its value, and the bare ``--alt-screen`` / ``--no-alt-screen`` and
+    ``--quit-on-scope-up`` / ``--no-quit-on-scope-up`` flags — leaving the
+    recipe's own arguments in order.
 
-    Strips the same two forms ``run`` recognises: ``--tty VALUE``
-    (the value is the following token, consumed too) and ``--tty=VALUE``
-    (one token). A trailing bare ``--tty`` with no following token is
-    dropped on its own. Returns a fresh list; ``sys.argv`` is left
-    untouched on purpose — ``run`` still needs ``--tty`` there to resolve
-    the device.
+    Strips the same forms ``run`` recognises: ``--tty VALUE`` (the value is
+    the following token, consumed too), ``--tty=VALUE`` (one token), and the
+    bare ``--alt-screen`` / ``--no-alt-screen`` and ``--quit-on-scope-up`` /
+    ``--no-quit-on-scope-up`` flags. A trailing bare ``--tty`` with no
+    following token is dropped on its own. Returns a fresh list; ``sys.argv``
+    is left untouched on purpose — ``run`` still needs these flags there to
+    resolve the device / alt-screen / scope-up modes.
     """
     if argv is None:
         argv = sys.argv[1:]
@@ -3086,8 +3092,49 @@ def recipe_argv(argv=None):
             continue
         if arg.startswith('--tty='):
             continue
+        if arg in ('--alt-screen', '--no-alt-screen'):
+            continue  # framework-owned, auto-detected by run() — not a positional
+        if arg in ('--quit-on-scope-up', '--no-quit-on-scope-up'):
+            continue  # framework-owned, auto-detected by run() — not a positional
         out.append(arg)
     return out
+
+
+def _resolve_alt_screen(default, argv):
+    """Effective alt-screen setting from the config default + CLI flags.
+
+    ``default`` is the ``BrowserConfig.alt_screen`` value (or a recipe's
+    explicit setting); a ``--alt-screen`` / ``--no-alt-screen`` token on the
+    command line overrides it, last occurrence winning — mirroring argparse's
+    ``BooleanOptionalAction`` so recipes (which don't argparse) honour the
+    flag pair the same way the ``browse-tui`` CLI does. ``run`` calls this.
+    """
+    result = default
+    for arg in argv:
+        if arg == '--alt-screen':
+            result = True
+        elif arg == '--no-alt-screen':
+            result = False
+    return result
+
+
+def _resolve_quit_on_scope_up(default, argv):
+    """Effective quit-on-scope-up setting from the config default + CLI flags.
+
+    ``default`` is the ``BrowserConfig.quit_on_scope_up`` value (or a recipe's
+    explicit setting); a ``--quit-on-scope-up`` / ``--no-quit-on-scope-up``
+    token on the command line overrides it, last occurrence winning —
+    mirroring argparse's ``BooleanOptionalAction`` so recipes (which don't
+    argparse) honour the flag pair the same way the ``browse-tui`` CLI does.
+    ``run`` calls this.
+    """
+    result = default
+    for arg in argv:
+        if arg == '--quit-on-scope-up':
+            result = True
+        elif arg == '--no-quit-on-scope-up':
+            result = False
+    return result
 
 
 # Default info-bar hint line. Shared between ``BrowserConfig.hint``
@@ -3168,6 +3215,17 @@ class BrowserConfig:
     # explicitly overrides the auto rule.
     show_preview: Optional[bool] = None
     show_children_pane: bool = True
+    # When False, run the UI on the current screen with no alternate-screen
+    # switch (no ?1049h/?1049l). A general "don't take over the screen" mode
+    # (also set via the ``--no-alt-screen`` flag); combined with a parent's
+    # ``run_external(keep_screen=True)`` it makes a sub-recipe launch
+    # switch-free in both directions.
+    alt_screen: bool = True
+    # When True, pressing scope-up (alt-up) at the root scope quits the
+    # browser instead of being a no-op. Off by default; also set via the
+    # ``--quit-on-scope-up`` flag. ``_scope_up`` reads the resolved value
+    # off the Browser at keypress time.
+    quit_on_scope_up: bool = False
     preview_ansi: bool = True
     list_ratio: float = 0.30
     split: str = 'auto'
@@ -3571,6 +3629,8 @@ class Browser:
         else:
             self.show_preview = config.show_preview
         self.show_children_pane = config.show_children_pane
+        self.alt_screen = config.alt_screen
+        self.quit_on_scope_up = config.quit_on_scope_up
         self.show_scope_crumb = config.show_scope_crumb
         # Honour ANSI SGR escapes in the preview pane (default True).
         # Toggled at runtime via capital-R; see ``_toggle_preview_ansi``
@@ -7381,9 +7441,22 @@ class Browser:
             elif arg.startswith('--tty='):
                 tty_path = arg[len('--tty='):]
 
+        # ``--alt-screen`` / ``--no-alt-screen`` auto-detect (mirrors the
+        # ``--tty`` scan above): a recipe gets the flag pair without its own
+        # argparse, and ``recipe_argv`` strips both forms. Config default is
+        # the baseline; a CLI flag overrides it (see ``_resolve_alt_screen``).
+        alt_screen = _resolve_alt_screen(self.alt_screen, args)
+
+        # ``--quit-on-scope-up`` / ``--no-quit-on-scope-up`` auto-detect, same
+        # as above: config default is the baseline, a CLI flag overrides it
+        # (see ``_resolve_quit_on_scope_up``). Stored back on ``self`` because
+        # ``_scope_up`` reads it off the Browser at keypress time.
+        self.quit_on_scope_up = _resolve_quit_on_scope_up(
+            self.quit_on_scope_up, args)
+
         self.start_workers()
         if not self._headless:
-            term_init(tty_path)
+            term_init(tty_path, alt_screen=alt_screen)
         # Output-channel routing for this run (spec §3.2): the select
         # loop live-drains the buffer to fd 1 only when stdout is a
         # pipe/file content channel — never when it was a tty (held and

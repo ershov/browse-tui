@@ -677,7 +677,13 @@ class TestBrowseGitSideBySide(unittest.TestCase):
         """
         t.wait_for('second change beta line', timeout=5.0)
         t.send('Right')                       # expand newest commit
-        t.wait_for('ctx.txt', timeout=5.0)
+        # Wait for the expanded file ROW, not the bare 'ctx.txt' — the
+        # commit preview's --stat ('ctx.txt | 2 +-') already shows that
+        # at startup, so a bare match returns before the async expansion
+        # paints and 'Down' would race onto the next commit. The '[M] '
+        # status prefix pins the wait to the row (cf. the '[A]'-prefix fix
+        # in test_rapid_scroll_children_pane_lands).
+        t.wait_for('[M] ctx.txt', timeout=5.0)
         t.send('Down')                        # cursor -> ctx.txt file row
         t.wait_for('alpha', timeout=5.0)      # diff preview has painted
 

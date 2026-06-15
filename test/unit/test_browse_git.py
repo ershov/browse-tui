@@ -569,7 +569,12 @@ class TestDispatchRoundTrip(unittest.TestCase):
     def test_get_children_routes_each_tag_to_its_builder(self):
         shas = []
         calls = {}
-        self.r._commit_files = lambda sha: shas.append(sha)
+        self.r._commit_files = lambda sha: shas.append(sha) or []
+        # The commit branch prepends the md-refs umbrella; that has its own
+        # tests (TestMdLauncherCommitMessage) — here stub it inert so this
+        # routing check neither shells out for the message nor concatenates a
+        # None return from the _commit_files stub above.
+        self.r._commit_md_prefix = lambda sha: []
         self.r._log_items = (
             lambda revs, paths, ns: calls.__setitem__('ref', (revs, ns)))
         self.r._worktree_files = (
@@ -3668,6 +3673,352 @@ class TestToggleTree(unittest.TestCase):
         self.assertFalse(self.r._tree_mode)
         self.assertEqual(calls['refresh'], 2)
         self.assertEqual(calls['flashes'][-1], 'commit graph: off')
+
+
+class _FakeGit:
+    """A stub ``_run_git`` driven by a {argv-tuple: (rc, stdout)} table.
+
+    Maps the EXACT git arg tuple to a CompletedProcess; an unlisted arg
+    tuple is a failed (rc 1) process, so a path absent from the canned
+    ``cat-file`` / ``show`` set simply "doesn't resolve" rather than raising.
+    Records every invocation in ``calls`` for argv assertions.
+    """
+
+    def __init__(self, table):
+        self._table = {tuple(k): v for k, v in table.items()}
+        self.calls = []
+
+    def __call__(self, *args):
+        self.calls.append(args)
+        rc, out = self._table.get(args, (1, ''))
+        return subprocess.CompletedProcess(['git', *args], rc, out, '')
+
+
+class _LaunchCtx:
+    """A ``ctx`` stand-in for ``on_enter`` / ``_md_launch`` tests.
+
+    Records ``run_external`` calls (argv-or-shell-string, env, ``keep_screen``)
+    and any ``flash`` text, plus the expand/collapse a toggle would issue.
+    """
+
+    def __init__(self, cursor, expanded=None):
+        self.cursor = cursor
+        self.calls = []          # (cmd, env, keep_screen, stdin_text)
+        self.flashes = []
+        self.expanded = expanded if expanded is not None else set()
+        self.collapsed = []
+        self.state = types.SimpleNamespace(expanded=self.expanded)
+
+    def run_external(self, cmd, env=None, *, keep_screen=False, stdin_text=None):
+        self.calls.append((cmd, env, keep_screen, stdin_text))
+        return 0
+
+    def flash(self, text, log=False):
+        self.flashes.append(text)
+
+    def expand(self, id, autoscroll=False):
+        self.expanded.add(id)
+
+    def collapse(self, id):
+        self.collapsed.append(id)
+        self.expanded.discard(id)
+
+
+class TestMdLauncherCommitMessage(unittest.TestCase):
+    """Commit-message ``[md] References`` umbrella, resolved in the TREE (#1017).
+
+    A commit's message ``.md`` refs are resolved against the COMMIT TREE
+    (``git cat-file -e sha:path``), NOT the working tree — git is stubbed so
+    the tests pin which paths exist in the revision, never the filesystem.
+    """
+
+    def setUp(self):
+        # Force a launcher-capable md_doc: drop any stubless md_doc cached by
+        # another module so _load_recipe's import (under its browse_tui stub)
+        # redefines the launcher block. See TESTING.md's import-order note.
+        sys.modules.pop('md_doc', None)
+        self.r = _load_recipe()
+        self.assertTrue(hasattr(self.r._md_doc, 'launcher_row'),
+                        'md_doc launcher block must be importable for these tests')
+
+    def _git(self, message, *, tree=(), root='/repo'):
+        """Stub ``_run_git``: ``message`` is the commit body, ``tree`` the set
+        of paths that exist at ``SHA``; ``--show-toplevel`` reports ``root``."""
+        table = {
+            ('show', '-s', '--format=%B', 'SHA'): (0, message),
+            ('rev-parse', '--show-toplevel'): (0, root + '\n'),
+        }
+        for p in tree:
+            table[('cat-file', '-e', f'SHA:{p}')] = (0, '')
+        self.r._run_git = _FakeGit(table)
+
+    def test_refs_resolve_against_tree_not_filesystem(self):
+        # docs/real.md exists in the tree → kept; gone.md does not → dropped;
+        # the captured tokens come straight from the message prose.
+        self._git('See docs/real.md and gone.md for details\n',
+                  tree=('docs/real.md',))
+        refs = self.r._commit_md_refs('SHA')
+        self.assertEqual([p for p, _ in refs], ['docs/real.md'])
+        self.assertEqual(refs[0][1], 'docs/real.md')   # label = repo-rel path
+
+    def test_dotslash_normalised_and_deduped(self):
+        # ``./a.md`` and ``a.md`` are the same tree path: the leading ./ is
+        # normalised off so the dedup key + the launch ``sha:path`` agree.
+        self._git('first ./a.md then a.md again\n', tree=('a.md',))
+        refs = self.r._commit_md_refs('SHA')
+        self.assertEqual([p for p, _ in refs], ['a.md'])   # one entry, no ./
+
+    def test_no_resolving_refs_yields_no_umbrella(self):
+        self._git('plain subject, no markdown links\n')
+        self.assertEqual(self.r._commit_md_refs('SHA'), [])
+        self.assertEqual(self.r._commit_md_prefix('SHA'), [])
+
+    def test_prefix_is_the_references_umbrella(self):
+        self._git('see r.md\n', tree=('r.md',))
+        prefix = self.r._commit_md_prefix('SHA')
+        self.assertEqual(len(prefix), 1)
+        umb = prefix[0]
+        self.assertEqual(umb.id, ('md-refs', 'SHA'))
+        self.assertEqual(umb.tag, 'md')
+        self.assertTrue(umb.has_children)
+
+    def test_get_children_commit_prepends_umbrella_before_files(self):
+        # The commit row's children = umbrella FIRST, then its files.
+        self._git('refs a.md\n', tree=('a.md',))
+        self.r._commit_files = lambda sha: [
+            self.r.Item(id=('file', sha, 'src/x.py'), title='src/x.py')]
+        rows = self.r.get_children(('commit', 'SHA'))
+        self.assertEqual([r.id for r in rows],
+                         [('md-refs', 'SHA'), ('file', 'SHA', 'src/x.py')])
+
+    def test_get_children_commit_no_refs_is_files_only(self):
+        self._git('no links here\n')
+        self.r._commit_files = lambda sha: ['FILES']
+        self.assertEqual(self.r.get_children(('commit', 'SHA')), ['FILES'])
+
+    def test_umbrella_children_are_blob_launcher_rows(self):
+        # Expanding ('md-refs', SHA) yields one [md ↗] row per resolving ref,
+        # each carrying a ('blob', SHA, path) spec for a stdin launch.
+        self._git('see a.md and docs/b.md\n', tree=('a.md', 'docs/b.md'))
+        rows = self.r.get_children(('md-refs', 'SHA'))
+        self.assertEqual([r.id for r in rows], [
+            ('launch', 'SHA', 'blob', 'SHA', 'a.md'),
+            ('launch', 'SHA', 'blob', 'SHA', 'docs/b.md'),
+        ])
+        for r in rows:
+            self.assertFalse(r.has_children)
+            self.assertEqual(r.tag, 'md ↗')
+
+    def test_inert_when_md_doc_absent(self):
+        self._git('see a.md\n', tree=('a.md',))
+        self.r._md_doc = None
+        self.assertEqual(self.r._commit_md_refs('SHA'), [])
+        self.assertEqual(self.r._commit_md_prefix('SHA'), [])
+
+
+class TestMdLauncherFileRows(unittest.TestCase):
+    """A ``.md`` file row gets one ``→ browse`` child; spec depends on kind."""
+
+    def setUp(self):
+        sys.modules.pop('md_doc', None)
+        self.r = _load_recipe()
+        self.assertTrue(hasattr(self.r._md_doc, 'launcher_row'))
+
+    def test_md_leaves_become_expandable_others_stay_leaves(self):
+        # _md_launchable gates has_children on the three .md leaf builders.
+        self.assertTrue(self.r._md_launchable('docs/x.md'))
+        self.assertTrue(self.r._md_launchable('R.MD'))
+        self.assertFalse(self.r._md_launchable('src/x.py'))
+        self.assertFalse(self.r._md_launchable(('file', 'sha', 'x.md')))  # not a str
+
+        # _status_leaf is the shared working-tree/commit leaf builder.
+        md_leaf = self.r._status_leaf('M ', 'notes.md')
+        txt_leaf = self.r._status_leaf('M ', 'code.py')
+        self.assertTrue(md_leaf.has_children)
+        self.assertFalse(txt_leaf.has_children)
+
+    def test_committed_md_file_child_is_blob_spec(self):
+        # ('file', sha, path).md → ('blob', sha, path): extracted from the rev.
+        rows = self.r.get_children(('file', 'SHA', 'docs/g.md'))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].id,
+                         ('launch', ('file', 'SHA', 'docs/g.md'), 'blob', 'SHA', 'docs/g.md'))
+        self.assertEqual(rows[0].title, '→ browse')
+        self.assertEqual(rows[0].tag, 'md ↗')
+        self.assertFalse(rows[0].has_children)
+
+    def test_worktree_md_file_child_is_wtfile_spec(self):
+        # ('status', xy, path).md → ('wtfile', <root>/<path>): the on-disk file.
+        self.r._run_git = _FakeGit(
+            {('rev-parse', '--show-toplevel'): (0, '/repo\n')})
+        rows = self.r.get_children(('status', 'M ', 'a.md'))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].id,
+                         ('launch', ('status', 'M ', 'a.md'), 'wtfile', '/repo/a.md'))
+
+    def test_untracked_md_file_child_is_wtfile_spec(self):
+        # Untracked rows are ('status', '??', path) too → same wtfile path.
+        self.r._run_git = _FakeGit(
+            {('rev-parse', '--show-toplevel'): (0, '/repo\n')})
+        rows = self.r.get_children(('status', '??', 'new.md'))
+        self.assertEqual(rows[0].id[2:], ('wtfile', '/repo/new.md'))
+
+    def test_worktree_md_child_path_relative_when_no_repo_root(self):
+        # Outside a repo (rev-parse fails) the path opens cwd-relative (as-is).
+        self.r._run_git = _FakeGit({})   # rev-parse → rc 1
+        rows = self.r.get_children(('status', 'M ', 'a.md'))
+        self.assertEqual(rows[0].id[2:], ('wtfile', 'a.md'))
+
+    def test_stash_md_file_child_is_blob_with_stash_rev(self):
+        # ('stash', n, path).md → ('blob', 'stash@{n}', path).
+        rows = self.r.get_children(('stash', 2, 'd.md'))
+        self.assertEqual(rows[0].id[2:], ('blob', 'stash@{2}', 'd.md'))
+
+    def test_non_md_file_rows_stay_leaves(self):
+        # A non-.md file/status/stash leaf still routes to no children.
+        for leaf in (('file', 'SHA', 'x.py'), ('status', 'M ', 'y.txt'),
+                     ('stash', 0, 'z.rs')):
+            self.assertEqual(self.r.get_children(leaf), [], leaf)
+
+    def test_inert_when_md_doc_absent(self):
+        self.r._md_doc = None
+        # No arrow on the leaf, and an "expanded" .md leaf falls through to [].
+        self.assertFalse(self.r._status_leaf('M ', 'a.md').has_children)
+        self.assertEqual(self.r.get_children(('file', 'SHA', 'a.md')), [])
+
+
+class TestMdLauncherEnterDispatch(unittest.TestCase):
+    """Enter launches a ``[md ↗]`` row, else keeps the expand/collapse toggle."""
+
+    def setUp(self):
+        sys.modules.pop('md_doc', None)
+        self.r = _load_recipe()
+        self.assertTrue(hasattr(self.r._md_doc, 'launcher_row'))
+
+    def test_enter_on_blob_launcher_pipes_git_show_on_stdin(self):
+        # A blob launcher row: Enter fetches ``git show rev:path`` and launches
+        # it on stdin (content form), with the repo root as --root.
+        self.r._run_git = _FakeGit({
+            ('rev-parse', '--show-toplevel'): (0, '/repo\n'),
+            ('show', 'SHA:docs/a.md'): (0, '# Doc A\nbody\n'),
+        })
+        row = self.r.Item(id=('launch', 'SHA', 'blob', 'SHA', 'docs/a.md'))
+        ctx = _LaunchCtx(row)
+        self.r.on_enter(ctx)
+        self.assertEqual(len(ctx.calls), 1)
+        cmd, env, keep, stdin_text = ctx.calls[0]
+        # Content form: plain argv reading from stdin (`-`); the blob text rides
+        # the stdin pipe, NOT argv or env (the E2BIG-safe channel).
+        self.assertIsInstance(cmd, list)
+        self.assertEqual(cmd[:2], ['browse-md', '-'])
+        self.assertEqual(stdin_text, '# Doc A\nbody\n')
+        self.assertIsNone(env)
+        self.assertNotIn('# Doc A\nbody\n', cmd)
+        self.assertEqual(cmd[cmd.index('--root') + 1], '/repo')
+        self.assertTrue(keep)               # parent keeps the alt screen
+        self.assertIn('--no-alt-screen', cmd)
+        self.assertIn('--quit-on-scope-up', cmd)
+
+    def test_enter_on_wtfile_launcher_opens_by_path(self):
+        # A wtfile launcher row: Enter opens the on-disk file by argv (no git
+        # show), repo root as --root.
+        self.r._run_git = _FakeGit(
+            {('rev-parse', '--show-toplevel'): (0, '/repo\n')})
+        row = self.r.Item(id=('launch', ('status', 'M ', 'a.md'),
+                              'wtfile', '/repo/a.md'))
+        ctx = _LaunchCtx(row)
+        self.r.on_enter(ctx)
+        self.assertEqual(len(ctx.calls), 1)
+        cmd, env, keep, stdin_text = ctx.calls[0]
+        self.assertIsInstance(cmd, list)        # path form is plain argv
+        self.assertEqual(cmd[0], 'browse-md')
+        self.assertIn('/repo/a.md', cmd)
+        self.assertIsNone(env)
+        self.assertIsNone(stdin_text)           # path form: no stdin pipe
+        self.assertEqual(cmd[cmd.index('--root') + 1], '/repo')
+        self.assertTrue(keep)
+
+    def test_enter_on_missing_blob_flashes_and_does_not_launch(self):
+        # The blob no longer resolves (git show fails) → flash, no launch.
+        self.r._run_git = _FakeGit(
+            {('rev-parse', '--show-toplevel'): (0, '/repo\n')})   # show absent
+        row = self.r.Item(id=('launch', 'SHA', 'blob', 'SHA', 'gone.md'))
+        ctx = _LaunchCtx(row)
+        self.r.on_enter(ctx)
+        self.assertEqual(ctx.calls, [])
+        self.assertEqual(len(ctx.flashes), 1)
+        self.assertIn('gone.md', ctx.flashes[0])
+
+    def test_enter_on_expandable_non_launcher_toggles(self):
+        # A normal expandable row keeps the expand/collapse toggle — no launch.
+        item = self.r.Item(id=('commit', 'SHA'), has_children=True)
+        ctx = _LaunchCtx(item)
+        self.r._run_git = _GitPoison(self)      # toggling must not shell out
+        self.r.on_enter(ctx)                    # closed → expand
+        self.assertIn(('commit', 'SHA'), ctx.expanded)
+        self.assertEqual(ctx.calls, [])
+        self.r.on_enter(ctx)                    # open → collapse
+        self.assertEqual(ctx.collapsed, [('commit', 'SHA')])
+
+    def test_enter_on_leaf_is_noop(self):
+        item = self.r.Item(id=('file', 'SHA', 'x.py'), has_children=False)
+        ctx = _LaunchCtx(item)
+        self.r.on_enter(ctx)
+        self.assertEqual(ctx.calls, [])
+        self.assertEqual(ctx.collapsed, [])
+        self.assertEqual(ctx.expanded, set())
+
+    def test_enter_with_no_cursor_is_noop(self):
+        ctx = _LaunchCtx(None)
+        self.r.on_enter(ctx)                    # must not raise
+        self.assertEqual(ctx.calls, [])
+
+    def test_launch_inert_when_md_doc_absent(self):
+        self.r._md_doc = None
+        row = self.r.Item(id=('launch', 'SHA', 'blob', 'SHA', 'a.md'))
+        ctx = _LaunchCtx(row)
+        self.r.on_enter(ctx)                    # guarded no-op
+        self.assertEqual(ctx.calls, [])
+
+
+class TestMdLauncherPreview(unittest.TestCase):
+    """get_preview renders the markdown a launcher row would open."""
+
+    def setUp(self):
+        sys.modules.pop('md_doc', None)
+        self.r = _load_recipe()
+        self.assertTrue(hasattr(self.r._md_doc, 'launcher_row'))
+        self.r._MD_COLOR = False   # raw text so we can assert content directly
+
+    def test_preview_wtfile_launcher_shows_file_content(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, 'a.md')
+            with open(p, 'w', encoding='utf-8') as f:
+                f.write('# Working tree\nhello\n')
+            pv = self.r.get_preview(('launch', ('status', 'M ', 'a.md'),
+                                     'wtfile', p))
+        self.assertIn('# Working tree', pv)
+        self.assertIn('hello', pv)
+
+    def test_preview_blob_launcher_shows_git_show_content(self):
+        self.r._run_git = _FakeGit({('show', 'SHA:docs/a.md'): (0, '# Blob\nx\n')})
+        pv = self.r.get_preview(('launch', 'SHA', 'blob', 'SHA', 'docs/a.md'))
+        self.assertIn('# Blob', pv)
+        self.assertIn('x', pv)
+
+    def test_preview_wtfile_unreadable_returns_error(self):
+        pv = self.r.get_preview(('launch', ('status', '??', 'gone.md'),
+                                 'wtfile', '/no/such/gone.md'))
+        self.assertIn('error', pv.lower())
+
+    def test_preview_blob_missing_returns_empty(self):
+        self.r._run_git = _FakeGit({})   # git show fails → None → ''
+        pv = self.r.get_preview(('launch', 'SHA', 'blob', 'SHA', 'gone.md'))
+        self.assertEqual(pv, '')
+
+    def test_preview_md_refs_umbrella_delegates_to_commit(self):
+        self.r._commit_preview = lambda sha: f'COMMIT {sha}'
+        self.assertEqual(self.r.get_preview(('md-refs', 'SHA')), 'COMMIT SHA')
 
 
 if __name__ == '__main__':

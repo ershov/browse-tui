@@ -683,12 +683,32 @@ class Context:
 
     # ---- main-thread sub-flows ----------------------------------------
 
-    def run_external(self, cmd, env=None) -> int:
+    def run_external(self, cmd, env=None, *, keep_screen=False,
+                     stdin_text=None) -> int:
         """Suspend the terminal, run ``cmd``, then resume.
 
         ``cmd`` is either a list of argv strings or a shell string (the
         latter triggers ``shell=True``). ``env`` is merged with the
         parent environment — pass ``None`` to inherit unchanged.
+
+        ``stdin_text`` (a ``str``, default ``None``) feeds the child a
+        document on its **stdin via a real pipe** while its stdout/stderr stay
+        the terminal — for launching a child that reads a document from stdin
+        and runs its own UI on the terminal device (e.g. ``browse-md -``, which
+        slurps stdin then opens ``/dev/tty`` for keys). Unlike argv/env, a pipe
+        has no size limit, so this is the correct channel for arbitrarily large
+        content; passing it via env would hit ``MAX_ARG_STRLEN`` → ``E2BIG``.
+        ``cmd`` must be an argv list when ``stdin_text`` is given. When ``None``
+        (the default) the child inherits the terminal on stdin too, as an
+        interactive editor needs.
+
+        ``keep_screen=True`` hands the terminal to a child that owns the
+        alternate screen itself (e.g. launching another browse-tui recipe):
+        the pre-launch suspend stays on the alt screen and emits no clear, so
+        there is no flash of the primary screen before the child paints over
+        our buffer. Resume is unchanged (re-enters the alt screen and forces a
+        full repaint once the child exits). The default fully leaves the alt
+        screen, as a plain editor/pager needs.
 
         Returns the subprocess exit code, or ``-1`` if launching the
         process raised. Errors are also surfaced via ``ctx.error``.
@@ -708,13 +728,27 @@ class Context:
         """
         child_fds = {}
         if not self._browser._headless:
-            term_suspend()
+            term_suspend(keep_screen=keep_screen)
             in_fd, out_fd = term_child_fds()
-            child_fds = {'stdin': in_fd, 'stdout': out_fd, 'stderr': out_fd}
+            # With piped stdin the child reads its document from the pipe and
+            # runs its UI on the terminal device itself, so we hand it only
+            # stdout/stderr; otherwise it inherits the terminal on stdin too.
+            if stdin_text is None:
+                child_fds = {'stdin': in_fd, 'stdout': out_fd, 'stderr': out_fd}
+            else:
+                child_fds = {'stdout': out_fd, 'stderr': out_fd}
         try:
             full_env = None if env is None else {**os.environ, **env}
-            shell = isinstance(cmd, str)
-            result = subprocess.run(cmd, shell=shell, env=full_env, **child_fds)
+            if stdin_text is not None:
+                # ``input=`` opens stdin as a pipe and writes the document
+                # to it — no argv/env size limit.
+                result = subprocess.run(
+                    cmd, input=stdin_text.encode('utf-8', errors='replace'),
+                    env=full_env, **child_fds)
+            else:
+                shell = isinstance(cmd, str)
+                result = subprocess.run(cmd, shell=shell, env=full_env,
+                                        **child_fds)
             return result.returncode
         except Exception as e:
             self.error(f'run_external: {type(e).__name__}: {e}')

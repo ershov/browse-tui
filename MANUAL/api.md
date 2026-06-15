@@ -677,7 +677,7 @@ Controls whether the per-row id segment is rendered in front of the title.
 | Value      | Behaviour                                                              |
 | ---------- | ---------------------------------------------------------------------- |
 | `'always'` | Always emit `'<id> <title>'` (yellow id, then title).                  |
-| `'auto'`   | Default. Emit the id only when `str(item.id) != item.title`. The line-based CLI shape (`Item(id='README.md')`) renders as just `'README.md'`; tracker-style sources (`Item(id=42, title='Implement feature')`) render as `'42 Implement feature'`. |
+| `'auto'`   | Default. Emit the id only when it is a scalar (`str`/`int`) that differs from the title. The line-based CLI shape (`Item(id='README.md')`) renders as just `'README.md'`; tracker-style sources (`Item(id=42, title='Implement feature')`) render as `'42 Implement feature'`. A structured id (tuple/object) is routing state, not a display identifier, so it is never emitted in `auto`. |
 | `'never'`  | Never emit the id segment.                                             |
 
 A `format_row` or `format_row_content` hook that doesn't emit the id segment

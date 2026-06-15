@@ -11,6 +11,7 @@ real terminal) are deferred to ticket #14's UI tests.
 """
 
 import unittest
+from unittest import mock
 
 from test.unit._loader import load
 
@@ -440,6 +441,125 @@ class TestRunExternalHeadless(unittest.TestCase):
             self.assertNotEqual(rc, 0)
         finally:
             b.stop_workers()
+
+
+class TestRunExternalStdinText(unittest.TestCase):
+    """run_external feeds ``stdin_text`` to the child via a real pipe."""
+
+    def _run_capturing_stdin(self, text):
+        import os as _os
+        import tempfile as _tf
+        b = _make_browser()   # headless: no terminal, child inherits test fds
+        try:
+            ctx = Context(b)
+            with _tf.TemporaryDirectory() as d:
+                out = _os.path.join(d, 'out')
+                # 'sh -c "cat > $1" sh OUT' writes the child's stdin to OUT and
+                # nothing to stdout — so we read back exactly what was piped.
+                rc = ctx.run_external(['sh', '-c', 'cat > "$1"', 'sh', out],
+                                      stdin_text=text)
+                with open(out, encoding='utf-8') as f:
+                    return rc, f.read()
+        finally:
+            b.stop_workers()
+
+    def test_stdin_text_reaches_child(self):
+        rc, got = self._run_capturing_stdin('# Doc\nbody\n')
+        self.assertEqual(rc, 0)
+        self.assertEqual(got, '# Doc\nbody\n')
+
+    def test_large_stdin_text_no_e2big(self):
+        # Regression for the launcher's E2BIG bug: a document well over the
+        # 128 KB MAX_ARG_STRLEN limit goes through fine on the pipe (it would
+        # have failed had it ridden argv or the environment).
+        big = 'lorem ipsum ' * 60_000   # ~720 KB
+        rc, got = self._run_capturing_stdin(big)
+        self.assertEqual(rc, 0)
+        self.assertEqual(got, big)
+
+
+class TestRunExternalKeepScreen(unittest.TestCase):
+    """run_external threads ``keep_screen`` through to ``term_suspend``."""
+
+    def _suspend_kwarg(self, **run_external_kw):
+        # Exercise the non-headless path with the terminal handoff stubbed:
+        # capture what keep_screen term_suspend is called with.
+        b = _make_browser()
+        b._headless = False
+        captured = {}
+        with mock.patch.object(
+                _context, 'term_suspend',
+                lambda keep_screen=False: captured.__setitem__('ks', keep_screen)), \
+             mock.patch.object(_context, 'term_resume', lambda: None), \
+             mock.patch.object(_context, 'term_child_fds',
+                               lambda: (None, None), create=True), \
+             mock.patch.object(_context.subprocess, 'run',
+                               return_value=mock.Mock(returncode=0)):
+            try:
+                rc = ctx_rc = Context(b).run_external(['true'], **run_external_kw)
+            finally:
+                b._headless = True
+                b.stop_workers()
+        self.assertEqual(ctx_rc, 0)
+        return captured['ks']
+
+    def test_keep_screen_true_threads_through(self):
+        self.assertTrue(self._suspend_kwarg(keep_screen=True))
+
+    def test_default_is_false(self):
+        self.assertFalse(self._suspend_kwarg())
+
+
+class TestAltScreenFlag(unittest.TestCase):
+    """The --alt-screen / --no-alt-screen flag pair: strip + resolution."""
+
+    def test_recipe_argv_strips_both_forms(self):
+        argv = ['--no-alt-screen', 'a.md', '--tty', '/dev/tty',
+                '--alt-screen', 'b.md']
+        # Framework flags (both alt-screen forms + --tty VALUE) dropped;
+        # the recipe's own positionals are left in order.
+        self.assertEqual(_state.recipe_argv(argv), ['a.md', 'b.md'])
+
+    def test_resolve_defaults_to_config(self):
+        self.assertTrue(_state._resolve_alt_screen(True, []))
+        self.assertFalse(_state._resolve_alt_screen(False, []))
+
+    def test_resolve_flag_overrides_config(self):
+        self.assertFalse(_state._resolve_alt_screen(True, ['--no-alt-screen']))
+        self.assertTrue(_state._resolve_alt_screen(False, ['--alt-screen']))
+
+    def test_resolve_last_occurrence_wins(self):
+        self.assertTrue(_state._resolve_alt_screen(
+            True, ['--no-alt-screen', '--alt-screen']))
+        self.assertFalse(_state._resolve_alt_screen(
+            False, ['--alt-screen', '--no-alt-screen']))
+
+
+class TestQuitOnScopeUpFlag(unittest.TestCase):
+    """--quit-on-scope-up / --no-quit-on-scope-up flag pair: strip + resolution."""
+
+    def test_recipe_argv_strips_both_forms(self):
+        argv = ['--no-quit-on-scope-up', 'a.md', '--tty', '/dev/tty',
+                '--quit-on-scope-up', 'b.md']
+        # Framework flags (both quit-on-scope-up forms + --tty VALUE) dropped;
+        # the recipe's own positionals are left in order.
+        self.assertEqual(_state.recipe_argv(argv), ['a.md', 'b.md'])
+
+    def test_resolve_defaults_to_config(self):
+        self.assertTrue(_state._resolve_quit_on_scope_up(True, []))
+        self.assertFalse(_state._resolve_quit_on_scope_up(False, []))
+
+    def test_resolve_flag_overrides_config(self):
+        self.assertFalse(_state._resolve_quit_on_scope_up(
+            True, ['--no-quit-on-scope-up']))
+        self.assertTrue(_state._resolve_quit_on_scope_up(
+            False, ['--quit-on-scope-up']))
+
+    def test_resolve_last_occurrence_wins(self):
+        self.assertTrue(_state._resolve_quit_on_scope_up(
+            True, ['--no-quit-on-scope-up', '--quit-on-scope-up']))
+        self.assertFalse(_state._resolve_quit_on_scope_up(
+            False, ['--quit-on-scope-up', '--no-quit-on-scope-up']))
 
 
 # --- input (headless) -----------------------------------------------------

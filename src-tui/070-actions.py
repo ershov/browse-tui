@@ -514,6 +514,10 @@ def _scope_up(ctx):
     prev_scope_id = ctx.scope
     popped = scope_out(state)
     if popped is None:
+        # Already at root. With ``quit_on_scope_up`` set, scope-up here exits
+        # the browser instead of being a no-op (default off — a bare return).
+        if b.quit_on_scope_up:
+            ctx.quit()
         return  # already at root
     new_top = current_scope(state)
     if new_top is not None and new_top not in state._children:
