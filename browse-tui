@@ -15605,11 +15605,22 @@ split is deliberate:
   modal dialogs (a nested key loop) or suspend the terminal to launch
   external processes; they are *not* safe to call from a worker thread.
 
+The thread-safe exception: the ``*_async`` dialog variants
+(``confirm_async`` / ``alert_async`` / ``pick_async`` / ``menu_async`` /
+``input_async``) and the dialog-control pass-throughs
+(``is_dialog_open`` / ``close_dialog``) ARE callable from any thread. The
+``*_async`` methods delegate to :meth:`Browser.open_dialog_async`, which
+posts the open onto the main thread; the dialog opens there and its
+``on_result`` callback fires there too (exactly once, exceptions caught).
+A worker that needs to interact with the user therefore uses the async
+variants — the blocking ``input`` / ``confirm`` / … remain main-thread-only.
+
 Affordances exposed on Context: ``cursor``, ``selected``, ``targets``,
 plus pass-through versions of ``refresh / cursor_to / expand / select /
 flash / log / error / print / quit`` and the main-thread sub-flows
 ``run_external``, ``page``, ``input``, ``confirm``, ``alert``, ``pick``,
-``menu``, ``insert``.
+``menu``, ``insert`` (each with a thread-safe ``*_async`` sibling for the
+dialog flows).
 """
 
 import os
@@ -16607,6 +16618,129 @@ class Context:
             anchor = _list_cursor_cell(self._browser)
         return modal_menu(self._browser, list(items), anchor=anchor,
                           delay_interaction=delay_interaction)
+
+    # ---- thread-safe async dialog variants ----------------------------
+    #
+    # An async sibling for every dialog flow, callable FROM ANY THREAD (the
+    # documented exception to "Context is main-thread-only"). Each builds the
+    # SAME content object its blocking sibling builds, then delegates to
+    # ``Browser.open_dialog_async`` — which posts the open onto the main
+    # thread and fires ``on_result`` THERE, exactly once, with exceptions
+    # caught (see ``_fire_dialog_cb``). All return ``None`` immediately. The
+    # result is the chosen value, or ``None`` for any no-answer path (cancel,
+    # programmatic ``close_dialog``, override by a later dialog, displacement
+    # while still pending, or headless). They open the same content as the
+    # blocking methods so async dialogs look and behave identically.
+
+    def confirm_async(self, message: str, buttons=('&Yes', '&No'), *,
+                      title: Optional[str] = None,
+                      on_result: Optional[Callable[[Any], None]] = None) -> None:
+        """(thread-safe) Async :meth:`confirm` — open from any thread.
+
+        Builds the same :class:`ChoiceContent` (``message`` above a row of
+        ``buttons``) as :meth:`confirm` and opens it centered via
+        :meth:`Browser.open_dialog_async`. ``on_result`` receives the chosen
+        button's VALUE (the tuple's value, or the resolved label for a bare
+        string) or ``None`` for any no-answer path. Returns ``None`` at once.
+        """
+        content = ChoiceContent(message, buttons, title=title)
+        self._browser.open_dialog_async(content, on_result=on_result,
+                                        placement='center')
+
+    def alert_async(self, text: str, *, title: Optional[str] = None,
+                    on_result: Optional[Callable[[Any], None]] = None) -> None:
+        """(thread-safe) Async :meth:`alert` — open from any thread.
+
+        Builds the same single-``&OK`` :class:`ChoiceContent` as :meth:`alert`
+        and opens it centered. An alert conveys nothing back, so ``on_result``
+        always receives ``None`` (the callback merely signals "dismissed"):
+        the activation value is dropped in a wrapper, mirroring the blocking
+        :meth:`alert` returning ``None``. Returns ``None`` at once.
+        """
+        content = ChoiceContent(text, ('&OK',), title=title)
+        # Drop whatever the &OK dialog resolves to ('OK', or None on
+        # cancel/override) and hand the callback None — an alert's result is
+        # always "dismissed". Only wrap when a callback is registered so a
+        # bare alert posts nothing extra.
+        cb = None
+        if on_result is not None:
+            cb = lambda _value, _f=on_result: _f(None)
+        self._browser.open_dialog_async(content, on_result=cb,
+                                        placement='center')
+
+    def pick_async(self, label: str, options, *,
+                   on_result: Optional[Callable[[Any], None]] = None) -> None:
+        """(thread-safe) Async :meth:`pick` — open from any thread.
+
+        Builds the same filterable :class:`ListContent` (``label`` as the
+        title) as :meth:`pick` and opens it centered. ``on_result`` receives
+        the chosen option's VALUE or ``None``. An empty ``options`` fires
+        ``on_result(None)`` WITHOUT opening (mirroring the blocking
+        short-circuit) — once, on the main thread, caught. Returns ``None``.
+        """
+        options = list(options)
+        if not options:
+            self._deliver_none(on_result)
+            return
+        content = ListContent(options, filter=True, title=label)
+        self._browser.open_dialog_async(content, on_result=on_result,
+                                        placement='center')
+
+    def menu_async(self, items, *, anchor=None,
+                   on_result: Optional[Callable[[Any], None]] = None) -> None:
+        """(thread-safe) Async :meth:`menu` — open from any thread.
+
+        Builds the same unfiltered :class:`ListContent` as :meth:`menu`.
+        ``anchor`` is an optional ``(row, col)`` 1-based screen cell the menu
+        drops below; with ``anchor`` the dialog is anchor-placed, else
+        centered. Unlike the blocking :meth:`menu`, ``anchor`` is NOT
+        defaulted to the list cursor's cell — that derivation reads live
+        geometry on the main thread and is meaningless from a worker. An empty
+        ``items`` fires ``on_result(None)`` WITHOUT opening (once, main thread,
+        caught). ``on_result`` receives the chosen item's VALUE or ``None``.
+        Returns ``None``.
+        """
+        items = list(items)
+        if not items:
+            self._deliver_none(on_result)
+            return
+        content = ListContent(items, filter=False)
+        placement = 'anchor' if anchor is not None else 'center'
+        self._browser.open_dialog_async(content, on_result=on_result,
+                                        placement=placement, anchor=anchor)
+
+    def input_async(self, prompt: str, *, default: str = '',
+                    on_result: Optional[Callable[[Any], None]] = None) -> None:
+        """(thread-safe) Async :meth:`input` — open from any thread.
+
+        Builds the same :class:`InputContent` (``prompt`` above a field
+        pre-filled with ``default``) as :meth:`input` and opens it centered.
+        ``on_result`` receives the entered string (possibly empty), or ``None``
+        on cancel / any no-answer path. Returns ``None`` at once.
+        """
+        content = InputContent(prompt, default=default)
+        self._browser.open_dialog_async(content, on_result=on_result,
+                                        placement='center')
+
+    def _deliver_none(self, on_result) -> None:
+        """Fire ``on_result(None)`` on the main thread, once, caught.
+
+        The empty-``pick``/``menu`` short-circuit: deliver ``None`` the same
+        way :meth:`Browser.open_dialog_async` does, WITHOUT opening a dialog.
+        Headless fires inline (no loop to post into); otherwise the firing is
+        posted as a closure over the engine's one caught callback site
+        (:meth:`Browser._fire_dialog_cb`) so it lands on the main thread and a
+        throwing callback can't escape the drain — never as a bare posted
+        ``on_result`` closure (the drain runs queued callables uncaught).
+        Safe to call from any thread (``post`` is thread-safe).
+        """
+        b = self._browser
+        if on_result is None:
+            return
+        if b._headless:
+            b._fire_dialog_cb(on_result, None)
+        else:
+            b.post(lambda: b._fire_dialog_cb(on_result, None))
 
 
 # ---- modal helpers --------------------------------------------------------

@@ -271,7 +271,9 @@ recognize them in code and logs — an `Action` bound to one never fires:
 What action handlers receive (one argument). `Context` is the main-thread-only
 surface — it adds blocking sub-flows (`pick`, `input`, `confirm`, `insert`,
 `run_external`, `page`) that read keys synchronously, plus pass-throughs for
-the thread-safe Browser ops.
+the thread-safe Browser ops. The exceptions safe to call from any thread are
+the [`*_async` dialog variants](#async-dialog-variants--open-a-dialog-from-any-thread)
+and the dialog-control pass-throughs (`is_dialog_open` / `close_dialog`).
 
 You never construct a `Context` yourself; the main loop builds one per
 dispatched action.
@@ -331,7 +333,10 @@ ctx.close_dialog(value=None)          -> None
 | `print`      | Write to the stdout content channel (see *Output — `ctx.print`*).    |
 | `quit`       | Exit the main loop with `code`; `output` joins the stdout channel after any `print` (strict FIFO). |
 | `is_dialog_open` | Whether a modal dialog (`confirm` / `alert` / `pick` / `menu` / `input`) is currently displayed. Cross-thread it is a best-effort snapshot. |
-| `close_dialog` | Dismiss the open dialog, delivering `value` to whoever waits on it (the blocking return). `value=None` means "no answer." No-op if nothing is open. |
+| `close_dialog` | Dismiss the open dialog, delivering `value` to whoever waits on it (the blocking return, or an async `on_result`). `value=None` means "no answer." No-op if nothing is open. |
+
+To **open** a dialog from a worker thread, use the `*_async` variants (see
+[Async dialog variants](#async-dialog-variants--open-a-dialog-from-any-thread)).
 
 ### Cache introspection
 
@@ -602,6 +607,64 @@ A context menu: an unfiltered modal selection list. Each item is a display
 `ctx.pick` does. `anchor` is an optional `(row, col)` screen cell the menu
 drops below; it defaults to the list cursor's cell so the menu reads as
 attached to the current row. Returns `None` on cancel (or empty `items`).
+
+#### Async dialog variants — open a dialog from any thread
+
+The blocking `input` / `confirm` / `alert` / `pick` / `menu` above run a nested
+key loop on the **main thread**, so a recipe's background thread
+(`ctx.run_in_worker` / `ctx.run_in_slot`) can't use them. Each has a thread-safe
+`*_async` sibling that **is** callable from any thread: it opens the *same*
+dialog (identical content, placement, behavior) on the main thread and delivers
+the outcome through an `on_result(value)` callback instead of a return value.
+
+```python
+ctx.confirm_async(message, buttons=('&Yes', '&No'), *, title=None, on_result=None) -> None
+ctx.alert_async(text, *, title=None, on_result=None)                              -> None
+ctx.pick_async(label, options, *, on_result=None)                                 -> None
+ctx.menu_async(items, *, anchor=None, on_result=None)                             -> None
+ctx.input_async(prompt, *, default='', on_result=None)                            -> None
+```
+
+Each returns `None` **immediately** — the dialog opens asynchronously. The
+`value` passed to `on_result` matches the blocking sibling's return: the chosen
+button/option value or entered string, or **`None` for any no-answer reason**
+(Esc / Ctrl-C cancel, programmatic `close_dialog`, being overridden by a later
+dialog, being displaced while still pending, or running headless). `alert_async`
+always delivers `None` (an alert conveys nothing back — the callback just
+signals "dismissed"). An empty `options` / `items` fires `on_result(None)`
+without opening a dialog, mirroring the blocking `pick` / `menu`.
+
+**Callback contract:** `on_result` fires **exactly once**, **on the main
+thread** (so it may freely touch `ctx`), with **exceptions caught** and routed
+to `ctx.error`. On **quit**, a pending / open dialog's callback may be dropped —
+the framework guarantees only that `on_quit` fires.
+
+```python
+def delete_in_background(ctx):
+    targets = list(ctx.targets)
+
+    def work():
+        # Runs on a worker thread; ask the user via the async variant.
+        def answered(yes):
+            if not yes:
+                return
+            for it in targets:
+                os.remove(it.id)
+            ctx.refresh()           # callback is on the main thread — safe
+        ctx.confirm_async(f'Delete {len(targets)} item(s)?',
+                          [('&Yes', True), ('&No', False)],
+                          on_result=answered)
+
+    ctx.run_in_worker(work)
+```
+
+Opening a second dialog while one is shown **overrides** it: the displaced
+dialog's `on_result` fires `None` and the new one is shown (override is
+unconditional — there is at most one dialog, no queue). A worker can also
+dismiss an open dialog with [`ctx.close_dialog(value)`](#thread-safe-ops-pass-through-to-browser)
+and query [`ctx.is_dialog_open()`](#thread-safe-ops-pass-through-to-browser).
+There is no synchronous-wait variant — to block a worker on the answer, build a
+`threading.Event` around the callback yourself (but never on the main thread).
 
 #### `ctx.insert(label, on_confirm)`
 
