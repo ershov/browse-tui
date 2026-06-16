@@ -134,14 +134,18 @@ class TestPlaceCenter(unittest.TestCase):
 
 
 class TestPlaceAnchor(unittest.TestCase):
-    """``placement='anchor'`` — vertical drops below the anchor row (flips
-    above on bottom overflow), horizontal is CENTERED on screen (#1040).
+    """``placement='anchor'`` WITHOUT ``bounds`` — vertical drops below the
+    anchor row (flips above on bottom overflow), horizontal is CENTERED on
+    screen (#1040).
 
-    The anchor's COLUMN no longer drives the horizontal position: a
+    The anchor's COLUMN does not drive the horizontal position: a
     keyboard-triggered context menu anchors at the list pane's left edge,
-    and using that column hugged the screen left. The box is now centered
-    horizontally — the same ``left`` the ``'center'`` branch computes —
-    while the anchor's ROW still drives the vertical placement.
+    and using that column hugged the screen left. With no ``bounds`` the box
+    centers horizontally — the same ``left`` the ``'center'`` branch computes —
+    while the anchor's ROW drives the vertical placement. (#1051 then clamps
+    that centered TARGET into the list-pane span when ``bounds`` is supplied;
+    those cases live in :class:`TestPlaceAnchorBounds` below. With no bound the
+    target is used as-is, so these remain the unchanged full-screen centering.)
     """
 
     def _centered_left(self, cols, w):
@@ -217,6 +221,145 @@ class TestPlaceAnchor(unittest.TestCase):
                                         placement='center', anchor=None)
                 self.assertEqual(anchored.left, centered.left)
                 self.assertEqual(anchored.right, centered.right)
+
+
+# --- Anchored placement: lean toward center, clamp to list bounds (#1051) ---
+
+
+class TestPlaceAnchorBounds(unittest.TestCase):
+    """``placement='anchor', bounds=(L, R)`` — lean the menu X toward screen
+    center but keep its painted FOOTPRINT within the list pane span ``[L, R]``.
+
+    #1051 REVISES #1040's full-screen centering: an anchored context menu
+    targets the screen-centered ``left`` (the lean), then CLAMPS that target so
+    the footprint — the box plus the two #1043 outer-margin columns, spanning
+    ``[left - 1, left + w]`` — fits within the inclusive 1-based list-pane span
+    ``[L, R]``. The vertical placement (drop / sticky side) is untouched.
+
+    The footprint's right EDGE is the right MARGIN column at ``left + w``
+    (= ``Rect.right``, exclusive of the box, the cell ``_paint`` overdraws just
+    outside the border); the box's right BORDER is the column before it,
+    ``left + w - 1``. The assertions below speak in terms of that footprint
+    edge — the column the ticket's worked example pins at ``R``.
+    """
+
+    @staticmethod
+    def _footprint(rect):
+        """Inclusive 1-based ``(first, last)`` columns the footprint covers.
+
+        The box owns ``[rect.left, rect.right - 1]``; the #1043 margins add one
+        column on each side, so the footprint spans
+        ``[rect.left - 1, rect.right]``.
+        """
+        return (rect.left - 1, rect.right)
+
+    def test_pane_left_of_center_pins_footprint_right_edge_to_R(self):
+        # THE worked example. List pane [1, 40] on a 300-col screen: the pane
+        # lies entirely left of screen center (~150), so the centered target is
+        # far to the right of the bound and the clamp pins the footprint's RIGHT
+        # edge to R = 40 (NOT centered at ~150). Asserts the INTENT — the
+        # footprint's right margin lands exactly at R — not a magic number.
+        L, R = 1, 40
+        w = 20
+        r = _modal_place(300, 24, w, 6, placement='anchor',
+                         anchor=(5, 1), bounds=(L, R))
+        first, last = self._footprint(r)
+        self.assertEqual(last, R)                 # right margin column at R = 40
+        self.assertEqual(r.right - 1, R - 1)      # box's right border just inside
+        self.assertGreaterEqual(first, L)         # left margin not before L
+        # And it is NOT the full-screen centered placement (#1040 would do):
+        centered = _modal_place(300, 24, w, 6, placement='center', anchor=None)
+        self.assertNotEqual(r.left, centered.left)
+        self.assertLess(r.right, centered.left)   # pinned far left of center
+
+    def test_footprint_stays_within_bounds_when_pane_left_of_center(self):
+        # General invariant for a left-of-center pane across pane widths and
+        # box widths: the whole footprint [left-1, left+w] sits inside [L, R].
+        for R in (30, 40, 60):
+            for w in (10, 20, 24):
+                with self.subTest(R=R, w=w):
+                    L = 1
+                    if R - w < L + 1:
+                        continue   # wider-than-bound case covered separately
+                    r = _modal_place(300, 24, w, 6, placement='anchor',
+                                     anchor=(5, 1), bounds=(L, R))
+                    first, last = self._footprint(r)
+                    self.assertGreaterEqual(first, L)
+                    self.assertLessEqual(last, R)
+
+    def test_pane_straddling_center_keeps_centered_target(self):
+        # When the screen-centered target already fits within the bound the
+        # clamp is a no-op: the box stays at the centered ``left`` (the lean
+        # wins). Bound [50, 250] on a 300-col screen brackets center (~150), so
+        # a 20-wide box centered at left = 1 + (300-20)//2 = 141 fits with both
+        # margins inside the bound and is used unchanged.
+        w = 20
+        r = _modal_place(300, 24, w, 6, placement='anchor',
+                         anchor=(5, 60), bounds=(50, 250))
+        centered = _modal_place(300, 24, w, 6, placement='center', anchor=None)
+        self.assertEqual(r.left, centered.left)   # centered target untouched
+        first, last = self._footprint(r)
+        self.assertGreaterEqual(first, 50)
+        self.assertLessEqual(last, 250)
+
+    def test_pane_right_of_center_pins_footprint_left_edge_to_L(self):
+        # Mirror of the worked example: a pane entirely RIGHT of center clamps
+        # the centered target up to the bound's LEFT edge, landing the
+        # footprint's left margin at L.
+        L, R = 250, 290
+        w = 20
+        r = _modal_place(300, 24, w, 6, placement='anchor',
+                         anchor=(5, 250), bounds=(L, R))
+        first, last = self._footprint(r)
+        self.assertEqual(first, L)                # left margin column at L
+        self.assertLessEqual(last, R)
+
+    def test_footprint_wider_than_bound_falls_back_to_screen(self):
+        # FALLBACK: a menu wider than its list pane can't fit the bound
+        # (R - w < L + 1), so the clamp ignores the bound and falls back to the
+        # full-screen #1043 clamp. Narrow pane [1, 20] but a 30-wide box on an
+        # 80-col screen: it lands exactly where the unbounded (full-screen)
+        # placement would, with both margins on-screen.
+        L, R = 1, 20
+        w, cols = 30, 80
+        self.assertLess(R - w, L + 1)             # precondition: wider than bound
+        bounded = _modal_place(cols, 24, w, 6, placement='anchor',
+                               anchor=(5, 1), bounds=(L, R))
+        unbounded = _modal_place(cols, 24, w, 6, placement='anchor',
+                                 anchor=(5, 1), bounds=None)
+        self.assertEqual(bounded, unbounded)      # bound ignored — screen clamp
+        self.assertGreaterEqual(bounded.left - 1, 1)   # left margin on-screen
+        self.assertLessEqual(bounded.right, cols)      # right margin on-screen
+
+    def test_full_screen_bound_matches_unbounded(self):
+        # ``bounds=(1, cols)`` is exactly the full-screen default: the #1043
+        # margin clamp is just this clamp with the screen as the bound, so an
+        # explicit full-screen bound is byte-for-byte the ``bounds=None`` path.
+        for cols in (40, 80, 120, 300):
+            with self.subTest(cols=cols):
+                with_bound = _modal_place(cols, 24, 20, 6, placement='anchor',
+                                          anchor=(5, 3), bounds=(1, cols))
+                no_bound = _modal_place(cols, 24, 20, 6, placement='anchor',
+                                        anchor=(5, 3), bounds=None)
+                self.assertEqual(with_bound, no_bound)
+
+    def test_bounds_do_not_affect_vertical(self):
+        # #1051 is X-only: the vertical drop/flip is identical with and without
+        # a bound (the bound only enters the horizontal clamp).
+        bounded = _modal_place(300, 24, 20, 6, placement='anchor',
+                               anchor=(5, 1), bounds=(1, 40))
+        unbounded = _modal_place(300, 24, 20, 6, placement='anchor',
+                                 anchor=(5, 1), bounds=None)
+        self.assertEqual(bounded.top, unbounded.top)
+        self.assertEqual(bounded.bottom, unbounded.bottom)
+
+    def test_center_placement_ignores_bounds(self):
+        # A centered modal never leans/clamps to a list pane — passing a bound
+        # (defensive; ``ctx`` never does for centered dialogs) must not move it.
+        base = _modal_place(300, 24, 40, 10, placement='center', anchor=None)
+        withb = _modal_place(300, 24, 40, 10, placement='center',
+                             anchor=None, bounds=(1, 40))
+        self.assertEqual(withb, base)
 
 
 # --- Anchored placement: forced SIDE for chained submenus (#1041) --------

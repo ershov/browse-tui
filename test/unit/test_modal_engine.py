@@ -1309,5 +1309,55 @@ class TestContextMenuSideSlot(unittest.TestCase):
         self.assertIsNone(b._context_menu_side)          # untouched
 
 
+class TestRunModalBoundsThreading(unittest.TestCase):
+    """``run_modal(..., bounds=(L, R))`` threads the bound to ``_modal_place``.
+
+    End-to-end through the engine: ``bounds`` flows ``run_modal`` →
+    ``_measure_frame`` → ``_modal_place``, leaning the anchored menu X toward
+    screen center but clamping its footprint into ``[L, R]`` (#1051). The frame
+    is painted top-down, so the first cursor-move recovers where the box landed
+    — asserted against an independent ``_modal_place`` call (the threading), and
+    against the worked-example intent (footprint right edge pinned to R).
+    """
+
+    def _menu(self, *, anchor, bounds, cols, rows=24, w=20, h=4):
+        """Open one anchored menu with ``bounds``; return its placed ``left``
+        plus the frame width (content ``w`` + 4) so callers can locate the
+        footprint's right-margin column (``left + frame_w``)."""
+        b = _FakeBrowser()
+        b._context_menu_side = None
+        content = _StubContent(title=None, w=w, h=h,
+                               key_handler={'enter': (True, None)})
+        with _FixedTermSize(cols, rows), _Capture() as cap:
+            run_modal(b, content, placement='anchor', anchor=anchor,
+                      bounds=bounds, _read_key=_scripted(['enter']))
+        _top, left = _frame_top_left(cap.text)
+        return left, w + 4
+
+    def test_left_of_center_bound_pins_footprint_right_edge_to_R(self):
+        # The worked example through the engine: list pane [1, 40] on a 300-col
+        # screen pins the footprint's right margin column to R = 40 (NOT the
+        # ~150 screen-centered position #1040 produced). The box left equals
+        # what ``_modal_place`` computes for the same inputs (threading), and
+        # left + frame_w == R (the footprint's right edge).
+        L, R = 1, 40
+        left, frame_w = self._menu(anchor=(5, 1), bounds=(L, R), cols=300)
+        expect = _modal._modal_place(300, 24, frame_w, 6, placement='anchor',
+                                     anchor=(5, 1), bounds=(L, R))
+        self.assertEqual(left, expect.left)          # bound reached _modal_place
+        self.assertEqual(left + frame_w, R)          # footprint right edge at R
+
+    def test_no_bounds_keeps_full_screen_centering(self):
+        # Same anchor/screen but ``bounds=None``: the menu keeps the #1040
+        # full-screen centering (markedly different from the bounded placement),
+        # confirming the bound is what changed the position.
+        bounded, frame_w = self._menu(anchor=(5, 1), bounds=(1, 40), cols=300)
+        unbounded, _ = self._menu(anchor=(5, 1), bounds=None, cols=300)
+        centered = _modal._modal_place(300, 24, frame_w, 6,
+                                       placement='center', anchor=None)
+        self.assertEqual(unbounded, centered.left)   # full-screen centered
+        self.assertNotEqual(bounded, unbounded)      # bound moved it
+
+
 if __name__ == '__main__':
     unittest.main()

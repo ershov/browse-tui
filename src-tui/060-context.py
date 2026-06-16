@@ -978,9 +978,11 @@ class Context:
         display ``str`` OR a ``(display, value)`` 2-tuple. ``anchor`` is an
         optional ``(row, col)`` 1-based screen cell the menu drops below;
         when ``None`` it defaults to the list cursor's screen cell so a
-        menu reads as attached to the current row. The user moves with
-        up/down (wrapping), jumps with home/end, picks with enter, cancels
-        with esc/ctrl-c.
+        menu reads as attached to the current row. Horizontally an anchored
+        menu leans toward screen center but keeps its footprint within the
+        list pane's columns, so it hangs off its row rather than drifting onto
+        a neighbouring pane (#1051). The user moves with up/down (wrapping),
+        jumps with home/end, picks with enter, cancels with esc/ctrl-c.
 
         Returns the chosen item's VALUE — the supplied ``value`` for a tuple
         (any type), or the string itself for a bare item — or ``None`` on
@@ -998,8 +1000,15 @@ class Context:
             # cursor cell so the menu reads as attached to the current row.
             anchor = (self._browser._context_menu_anchor
                       or _list_cursor_cell(self._browser))
+        # An anchored menu leans toward screen center but keeps its footprint
+        # within the LIST pane's columns (#1051) — derive that span here, where
+        # the layout is already known. ``None`` (no resolvable list pane) lets
+        # the menu keep the full-screen #1040 centering. A centered menu (no
+        # anchor) passes no bound either.
+        bounds = (_list_pane_bounds(self._browser)
+                  if anchor is not None else None)
         return modal_menu(self._browser, list(items), anchor=anchor,
-                          delay_interaction=delay_interaction)
+                          bounds=bounds, delay_interaction=delay_interaction)
 
 
 # ---- modal helpers --------------------------------------------------------
@@ -1009,6 +1018,42 @@ class Context:
 # ``_confirm_on_info_bar``, ``_pick_on_info_bar``, ``_info_bar_geometry``)
 # that used to live here are gone — those sub-flows are modal dialogs now
 # (see ``055-modal.py`` and the ``ctx`` methods above).
+
+
+def _list_pane_rect(browser):
+    """The list pane's :class:`Rect` in the current layout, or ``None``.
+
+    Re-runs :func:`layout_panes` against the live terminal size and split /
+    preview / ratio state — the single spot both :func:`_list_cursor_cell` (the
+    keyboard anchor) and :func:`_list_pane_bounds` (the #1051 horizontal clamp
+    span) read the list pane from. Returns ``None`` (no list pane, or a
+    zero-area one) so callers fall back to their full-screen default.
+    """
+    cols, rows = term_size()
+    layout = layout_panes(cols, rows,
+                          split=getattr(browser, 'split', 'h'),
+                          show_preview=browser.show_preview,
+                          list_ratio=browser.list_ratio)
+    list_rect = layout.get('list')
+    if list_rect is None or list_rect.height <= 0 or list_rect.width <= 0:
+        return None
+    return list_rect
+
+
+def _list_pane_bounds(browser):
+    """List pane's inclusive 1-based column span ``(L, R)``, or ``None``.
+
+    The horizontal bound an anchored ``ctx.menu`` clamps its footprint within
+    (#1051): ``L`` is the pane's first column (``rect.left``) and ``R`` its last
+    (``rect.right - 1`` — ``Rect.right`` is exclusive). ``None`` when there's no
+    resolvable list pane (or it's zero-area), so ``ctx.menu`` passes no bound
+    and the menu keeps the full-screen #1040 centering — the safe headless
+    default.
+    """
+    list_rect = _list_pane_rect(browser)
+    if list_rect is None:
+        return None
+    return (list_rect.left, list_rect.right - 1)
 
 
 def _list_cursor_cell(browser):
@@ -1027,13 +1072,8 @@ def _list_cursor_cell(browser):
     cursor row scrolled out of the pane's visible span (so an anchor cell
     would point off the list).
     """
-    cols, rows = term_size()
-    layout = layout_panes(cols, rows,
-                          split=getattr(browser, 'split', 'h'),
-                          show_preview=browser.show_preview,
-                          list_ratio=browser.list_ratio)
-    list_rect = layout.get('list')
-    if list_rect is None or list_rect.height <= 0 or list_rect.width <= 0:
+    list_rect = _list_pane_rect(browser)
+    if list_rect is None:
         return None
     rel = browser._state.cursor - browser._list_scroll
     if not (0 <= rel < list_rect.height):

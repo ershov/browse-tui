@@ -62,7 +62,8 @@ def _modal_is_tiny(cols, rows):
     return cols < _MODAL_MIN_COLS or rows < _MODAL_MIN_ROWS
 
 
-def _modal_place(cols, rows, w, h, *, placement, anchor, side=None):
+def _modal_place(cols, rows, w, h, *, placement, anchor, side=None,
+                 bounds=None):
     """Place a ``w`` × ``h`` frame on a ``cols`` × ``rows`` screen.
 
     Returns the frame ``Rect`` (1-based, exclusive right/bottom).
@@ -76,10 +77,11 @@ def _modal_place(cols, rows, w, h, *, placement, anchor, side=None):
 
     ``placement='anchor'`` takes ``anchor=(row, col)`` in 1-based screen
     coordinates and uses ONLY the anchor's row for vertical placement.
-    Horizontally the frame is CENTERED on screen — the same ``left`` the
-    ``'center'`` branch computes — so a menu triggered by keyboard (whose
-    anchor column is the list pane's left edge) sits closest to the screen
-    center rather than hugging the left.
+    Horizontally the frame LEANS toward screen center but its full painted
+    footprint (the box plus the two #1043 outer-margin columns) is clamped to
+    stay within the horizontal ``bounds`` — see below — so a keyboard-triggered
+    context menu hangs off its list row instead of drifting onto a neighbouring
+    pane.
 
     The vertical SIDE of the anchor row is chosen by ``side``:
 
@@ -104,14 +106,28 @@ def _modal_place(cols, rows, w, h, *, placement, anchor, side=None):
     than the room available is shifted on-screen rather than truncated);
     horizontally as below.
 
-    The horizontal clamp also reserves one blank column just outside each
-    vertical border for the #1043 outer margin: when the frame is narrow
-    enough to leave room (``w <= cols - 2``) the box columns are kept
-    within ``[2, cols - 1]`` (so column 1 holds the left margin and column
-    ``cols`` the right). A frame that already spans the screen width
-    (``w > cols - 2``, including the tiny full-screen fallback) has no room
-    for margins and falls back to the plain on-screen clamp (left ≥ 1);
-    :func:`_paint` then omits the margins that would land off-screen.
+    The horizontal clamp keeps the frame's full painted FOOTPRINT — the box
+    plus one blank #1043 outer-margin column just outside each vertical border
+    — within a horizontal ``bounds = (L, R)`` (1-based, inclusive first/last
+    column). ``bounds=None`` (the default, used by centered modals and any
+    standalone anchored use) means the whole screen, ``(1, cols)`` — so this is
+    the unchanged #1040/#1043 behavior. ``ctx.menu`` passes the LIST pane's
+    column span so a context menu's footprint stays over its row (#1051).
+
+    With room for the margins (``w <= R - L - 1``: the box plus its two margin
+    columns fit in the bound) the box ``left`` is constrained to
+    ``[L + 1, R - w]`` — column ``L`` and column ``R`` then hold the margins.
+    The TARGET is the screen-centered ``left`` (``1 + (cols - w) // 2``, the
+    "lean toward screen center" intent), CLAMPED into that range: when the
+    bound lies entirely left of screen center the clamp pins ``left = R - w``,
+    landing the footprint's right margin at column ``R``; a bound straddling
+    center keeps the box more centered.
+
+    A footprint WIDER than the bound (``R - w < L + 1``) cannot fit within it,
+    so it FALLS BACK to the full-screen clamp: ``[2, cols - w]`` when there's
+    screen room for margins (``w <= cols - 2``), else the plain on-screen clamp
+    ``[1, cols - w + 1]`` (a frame spanning the screen width, including the tiny
+    full-screen fallback); :func:`_paint` then omits any margin off-screen.
     """
     if _modal_is_tiny(cols, rows):
         return Rect(1, 1, cols + 1, rows + 1)
@@ -147,11 +163,12 @@ def _modal_place(cols, rows, w, h, *, placement, anchor, side=None):
     # (right/bottom not past the edge), then guarantee top/left in range.
     # The second step wins when the frame is larger than the screen.
     #
-    # Horizontally, reserve the #1043 outer-margin columns when the frame
-    # is narrow enough (``w <= cols - 2``): keep the box within
-    # ``[2, cols - w]`` so column 1 / column ``cols`` stay free for the
-    # margins. Otherwise the frame spans the screen width and there's no
-    # room — fall back to the plain ``[1, cols - w + 1]`` clamp.
+    # Horizontally, keep the frame's FOOTPRINT (box + the two #1043 margin
+    # columns) within ``bounds`` (the list pane span for ``ctx.menu``; the
+    # whole screen otherwise — see the docstring and :func:`_clamp_left_into`).
+    # ``left`` arrives as the screen-centered target; the clamp leans it back
+    # into the bound, pinning the footprint's right margin at the bound's right
+    # edge when the bound is entirely left of center (#1051).
     #
     # Vertically, ``top`` is clamped into ``[1, rows - h + 1]``. For a forced
     # SIDE (#1041) this is the SHIFT that keeps an oversized submenu on the
@@ -159,13 +176,39 @@ def _modal_place(cols, rows, w, h, *, placement, anchor, side=None):
     # up, an ``'above'`` box that would start off the top slides down — both
     # land fully on-screen (overlapping the subject row if need be) rather
     # than flipping to the opposite side.
-    if w <= cols - 2:
-        left = max(2, min(left, cols - w))
-    else:
-        left = max(1, min(left, cols - w + 1))
+    left = _clamp_left_into(left, w, cols, bounds)
     top = max(1, min(top, rows - h + 1))
 
     return Rect(left, top, left + w, top + h)
+
+
+def _clamp_left_into(left, w, cols, bounds):
+    """Clamp a box ``left`` so its #1043 footprint stays within ``bounds``.
+
+    The footprint is the box (width ``w``) plus one outer-margin column just
+    outside each vertical border, so it spans ``[left - 1, left + w]`` — width
+    ``w + 2``. Keeping it within an inclusive 1-based span ``bounds = (L, R)``
+    means ``left - 1 >= L`` and ``left + w <= R``, i.e. ``left`` in
+    ``[L + 1, R - w]``; ``left`` is clamped into that range (it arrives as the
+    screen-centered TARGET, so the clamp is what leans it toward center yet pins
+    it to a bound edge when the bound is off to one side).
+
+    ``bounds=None`` means the whole screen, ``(1, cols)`` — the unchanged
+    #1040/#1043 behavior. If the footprint is wider than the bound
+    (``R - w < L + 1`` — a menu wider than its list pane), it can't fit, so we
+    FALL BACK to the screen: ``[2, cols - w]`` when the screen has margin room
+    (``w <= cols - 2``), else the plain on-screen clamp ``[1, cols - w + 1]`` (a
+    frame spanning the screen width has no room for margins; :func:`_paint`
+    omits the off-screen one).
+    """
+    if bounds is not None:
+        L, R = bounds
+        if R - w >= L + 1:                  # footprint fits within the bound
+            return max(L + 1, min(left, R - w))
+        # else: wider than the bound — fall back to the screen clamp below.
+    if w <= cols - 2:
+        return max(2, min(left, cols - w))
+    return max(1, min(left, cols - w + 1))
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +269,7 @@ def _rects_intersect(a, b):
 
 
 def run_modal(browser, content, *, placement='center', anchor=None,
-              delay_interaction=False, cancel_keys=frozenset(),
+              bounds=None, delay_interaction=False, cancel_keys=frozenset(),
               cancel_on_right_click=False, _read_key=None,
               _delay_threshold=None, _now=None, _input_ready=None):
     """Run one blocking modal dialog to completion; return its result.
@@ -252,7 +295,11 @@ def run_modal(browser, content, *, placement='center', anchor=None,
         ``(False, _)`` continues the loop; ``(True, result)`` closes the
         dialog and makes ``run_modal`` return ``result``.
 
-    ``placement`` / ``anchor`` are forwarded to :func:`_modal_place`.
+    ``placement`` / ``anchor`` / ``bounds`` are forwarded to
+    :func:`_modal_place`. ``bounds=(L, R)`` (default ``None`` = full screen)
+    is the inclusive 1-based horizontal span the dialog's painted footprint is
+    kept within; only the ``ctx.menu`` anchored path supplies it (the list
+    pane's columns, #1051), so every centered modal is unaffected.
 
     ``delay_interaction`` distinguishes a dialog the user asked for from one
     that appears on its own (a background error, an async event). When
@@ -382,7 +429,7 @@ def run_modal(browser, content, *, placement='center', anchor=None,
                 if hasattr(browser, '_context_menu_side'):
                     browser._context_menu_side = side
         return _modal_place(cols, rows, fw, fh, placement=placement,
-                            anchor=anchor, side=side), content_h
+                            anchor=anchor, side=side, bounds=bounds), content_h
 
     def _paint(frame, content_h):
         """Paint the whole frame through the private cache, in one sync.
@@ -1526,16 +1573,20 @@ def modal_pick(browser, label, options, *, delay_interaction=False,
                      delay_interaction=delay_interaction, _read_key=_read_key)
 
 
-def modal_menu(browser, items, *, anchor=None, delay_interaction=False,
-               _read_key=None):
+def modal_menu(browser, items, *, anchor=None, bounds=None,
+               delay_interaction=False, _read_key=None):
     """Anchored, unfiltered selection list — a context menu (``ctx.menu``).
 
     ``items`` is shown without a filter row. Each item is a display ``str`` OR
     a ``(display, value)`` 2-tuple; the dialog returns the chosen item's VALUE
     (the tuple's value, or the string itself for a bare item). ``anchor`` is an
     ``(row, col)`` 1-based screen cell the menu drops below (see
-    :func:`_modal_place`); when ``None`` the dialog centers. Returns ``None``
-    on cancel. Empty ``items`` returns ``None`` WITHOUT opening a dialog.
+    :func:`_modal_place`); when ``None`` the dialog centers. ``bounds=(L, R)``
+    (default ``None`` = full screen) is the inclusive 1-based horizontal span
+    the menu's footprint is kept within — ``ctx.menu`` passes the list pane's
+    columns so the menu leans toward screen center but stays over its row
+    (#1051). Returns ``None`` on cancel. Empty ``items`` returns ``None``
+    WITHOUT opening a dialog.
     """
     items = list(items)
     if not items:
@@ -1549,7 +1600,7 @@ def modal_menu(browser, items, *, anchor=None, delay_interaction=False,
     # input/alert leave these at their off defaults, so ``\`` / right-click keep
     # their normal meaning there.
     return run_modal(browser, content, placement=placement, anchor=anchor,
-                     delay_interaction=delay_interaction,
+                     bounds=bounds, delay_interaction=delay_interaction,
                      cancel_keys=CONTEXT_MENU_TRIGGER_KEYS,
                      cancel_on_right_click=True, _read_key=_read_key)
 
