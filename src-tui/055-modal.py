@@ -870,9 +870,13 @@ class ListContent:
         for a ``(display, value)`` option, or the string itself for a bare one
         (a no-op on an empty filtered list). Selection moves (``down``/
         ``ctrl-n``, ``up``/``ctrl-p``) WRAP; ``home``/``end`` jump to the ends.
-        In filter mode a printable char / ``space`` extends the query and
-        ``backspace`` deletes; both re-filter and re-clamp the cursor + scroll.
-        Every other key is ignored.
+        In filter mode (``filter=True``, the picker) a printable char /
+        ``space`` extends the query and ``backspace`` deletes; both re-filter
+        and re-clamp the cursor + scroll. In menu mode (``filter=False``) there
+        is no query: a single printable char is type-ahead instead — it jumps
+        the selection to the NEXT option whose visible display starts with that
+        character (case-insensitive), cycling forward from the current
+        selection (see :meth:`_typeahead`). Every other key is ignored.
         """
         filtered = self._filtered()
 
@@ -900,8 +904,9 @@ class ListContent:
                 return (True, filtered[self.cursor][1])   # the pair's value
             return (False, None)   # empty filtered list — no-op
 
-        # Filter editing only applies in filter mode; in menu mode these keys
-        # fall through to the ignore path below.
+        # A printable char means different things by mode. In filter mode it
+        # edits the query (with ``space`` / ``backspace``); in menu mode it is
+        # type-ahead — jump to the next display starting with that char.
         if self._filter:
             if key == 'backspace':
                 if self.filter_query:
@@ -916,9 +921,40 @@ class ListContent:
                 self.filter_query += key
                 self._clamp(self._filtered())
                 return (False, None)
+        elif len(key) == 1 and key.isprintable():
+            self._typeahead(key)
+            return (False, None)
 
         # Unrecognized key — ignored, loop continues.
         return (False, None)
+
+    def _typeahead(self, char):
+        """Menu type-ahead: jump the selection to the next match for ``char``.
+
+        Single-letter type-ahead (NOT a multi-character prefix buffer): search
+        forward from the option AFTER the current selection, wrapping around,
+        for the first option whose visible display starts with ``char``
+        (case-insensitive, leading whitespace ignored). The current option is
+        considered last, so pressing the same letter repeatedly cycles through
+        all matches and wraps. If a match is found, ``cursor`` lands on it (and
+        the window scrolls to keep it visible); with no match anywhere the
+        selection is left unchanged.
+
+        Matching is on the DISPLAY half's VISIBLE text — embedded SGR is
+        stripped first (via the same ``_collapse_visible`` the rows use) so the
+        comparison sees what the user sees, not escape bytes.
+        """
+        target = char.lower()
+        # In menu mode the visible list is every option (no filter narrowing).
+        options = self._filtered()
+        n = len(options)
+        for step in range(1, n + 1):
+            idx = (self.cursor + step) % n
+            display = _collapse_visible([(options[idx][0], None, False)])
+            if display.lstrip()[:1].lower() == target:
+                self.cursor = idx
+                self._clamp(options)
+                return
 
 
 # ---------------------------------------------------------------------------
