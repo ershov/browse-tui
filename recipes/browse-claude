@@ -6285,6 +6285,400 @@ def _action_toggle_filter(ctx):
     )
 
 
+# ---- context menu --------------------------------------------------------
+#
+# A right-click / `` ` ``-F1 menu over the cursor's row, branching on its KIND
+# (``id[0]``). Following the committed convention (browse-procs the pilot,
+# browse-git the rich multi-kind case): a PURE ``context_menu_options(ctx)``
+# builds the ``(label, token)`` rows by kind (opening no modal, so it is
+# unit-testable), a flat ``{token: handler}`` table (``_MENU_ACTIONS``)
+# dispatches the chosen token, and a thin ``on_context_menu(ctx)`` ties the
+# two together. Submenus are just a handler re-invoking ``ctx.menu``. Hotkey
+# hints are LITERAL text — menus don't parse ``&`` — so an entry duplicating a
+# global keybinding shows it in parens (``Edit source in $EDITOR (E)``). The
+# existing per-row actions (V / E / M / y / m) are reused directly so the menu
+# rows stay single-sourced with the keybindings. No clipboard rows (the values
+# aren't visible — paths/ids surface via ``ctx.alert``); pop-ups via
+# ``ctx.alert``. The menu is read-only-friendly: a missing tool flashes via
+# ``run_external``'s own error rather than crashing (browse-tui swallows
+# ``on_context_menu`` exceptions besides).
+#
+# The DIRECTORY cluster is the actions-first hierarchy described in the ticket.
+# A session/project/message row resolves up to three CONTEXT DIRS — the
+# project source dir, the session's recorded cwd, and the enclosing git
+# worktree — which usually coincide. They are deduped by ``os.path.realpath``
+# (``_dedup_dirs``); each Level-1 action is shown only if it applies to ≥1
+# deduped dir, and a Level-2 directory chooser appears only when >1 DISTINCT
+# dir qualifies for the chosen action. The action set is built once and shared
+# across the dirs (not duplicated per directory). See ``_dir_action_rows`` /
+# ``_run_dir_action``.
+
+
+# -- context dirs: project / cwd / worktree ---------------------------------
+
+
+def _cursor_context_dirs(item_id):
+    """``[(role, abspath), …]`` context dirs for ``item_id`` — project/cwd/worktree.
+
+    A project / session / message / subagent row all anchor on the same
+    Claude project dir (a session row's project dir is its .jsonl's parent),
+    so the three dirs come from that one anchor, in role order:
+
+      * ``project``  — the Claude project's real source directory
+        (``_real_project_cwd``).
+      * ``cwd``      — the session's recorded working directory. For a Claude
+        project this is the same dir as ``project`` (the dir name IS one cwd's
+        encoding); both roles are surfaced so the chooser can label a single
+        dir by every role it fills, and dedup collapses them.
+      * ``worktree`` — the enclosing git work-tree root of ``cwd``
+        (``md_doc.find_git_root``; a ``.git`` *file* is how a worktree records
+        its gitdir, so this resolves worktree sessions too). Omitted when cwd
+        isn't under a git work tree, or when md_doc is unavailable.
+
+    Returns raw (un-deduped) ``(role, abspath)`` pairs with falsy paths
+    dropped; ``_dedup_dirs`` collapses coincident roles by realpath. A
+    project / session / message row always resolves at least one dir (its
+    real cwd, or the decoded project dir as a fallback); a synthetic /
+    markdown / non-tuple cursor yields ``[]`` so the directory cluster is
+    simply omitted.
+    """
+    if not isinstance(item_id, tuple) or not item_id:
+        return []
+    kind = item_id[0]
+    if kind == 'project':
+        project_dir = item_id[1]
+    elif kind in ('session', 'agent', 'msg', 'prompt', 'tool', 'span'):
+        # A session/message/subagent row is keyed under its .jsonl, whose
+        # containing dir is the Claude project dir.
+        project_dir = os.path.dirname(item_id[1])
+    else:
+        return []
+
+    # cwd: the session's recorded working directory (read straight from the
+    # project dir's sessions — no md_doc dependency). project and cwd are the
+    # same directory for a Claude project (a project dir IS one cwd's encoding),
+    # so dedup collapses them; we surface both roles for the chooser labels.
+    # Fall back to the lossy name-decode when no session records a readable cwd
+    # (an empty/unreadable project dir) so the row still browses *something*.
+    cwd = _real_project_cwd(project_dir)
+    project = cwd or os.path.expanduser(
+        _decode_project_path(os.path.basename(project_dir.rstrip('/'))))
+
+    # worktree: the enclosing git work-tree root of cwd. Guarded on md_doc
+    # (the only piece here that needs it) so the cluster still resolves
+    # project / cwd when the md_doc plugin failed to import.
+    worktree = None
+    if _md_doc is not None and cwd:
+        root = _md_doc.find_git_root(cwd)
+        if root:
+            worktree = root
+
+    out = []
+    for role, path in (('project', project), ('cwd', cwd),
+                       ('worktree', worktree)):
+        if path:
+            out.append((role, path))
+    return out
+
+
+def _dedup_dirs(role_paths):
+    """Collapse ``[(role, path), …]`` by ``os.path.realpath``, merging roles.
+
+    Returns ``[(roles, realpath), …]`` in first-seen order, where ``roles`` is
+    the list of roles that resolved to the same real path (e.g.
+    ``['project', 'cwd', 'worktree']`` when all three coincide — the common
+    case). Merging the roles lets a chooser entry label a single dir by every
+    role it fills (``project / cwd: /p``) instead of listing it thrice.
+    """
+    by_real = {}
+    order = []
+    for role, path in role_paths:
+        real = os.path.realpath(path)
+        if real not in by_real:
+            by_real[real] = []
+            order.append(real)
+        by_real[real].append(role)
+    return [(by_real[real], real) for real in order]
+
+
+def _is_git_repo(path):
+    """True iff ``path`` is inside a git work tree (``find_git_root`` hits).
+
+    Reuses md_doc's ``.git``-walk (a worktree's ``.git`` file counts), so the
+    git-mode rows light up for both a plain repo and a worktree. ``False`` when
+    md_doc is unavailable — the git rows then never appear.
+    """
+    if _md_doc is None or not path:
+        return False
+    return _md_doc.find_git_root(path) is not None
+
+
+def _has_plan_md(path):
+    """True iff ``path`` contains a ``.PLAN.md`` file (gates the browse-plan row)."""
+    return bool(path) and os.path.isfile(os.path.join(path, '.PLAN.md'))
+
+
+# Git-mode rows: ``(label, token, browse-git --mode NAME)``. Each is shown
+# when ≥1 context dir is a git repo, and launches ``browse-git <dir> --mode
+# NAME`` on the chosen dir (browse-git's verified ``<dir> --mode`` interface).
+_DIR_GIT_MODES = [
+    ('Browse commits',  'dir.git.commits',  'commits'),
+    ('Browse branches', 'dir.git.branches', 'branches'),
+    ('Browse status',   'dir.git.status',   'status'),
+    ('Browse stashes',  'dir.git.stash',    'stash'),
+    ('Browse reflog',   'dir.git.reflog',   'reflog'),
+]
+
+
+def _dir_action_rows(dirs):
+    """Level-1 directory-action rows for the deduped ``dirs`` (pure — no modal).
+
+    ``dirs`` is the ``_dedup_dirs`` output (``[(roles, realpath), …]``). Builds
+    the SHARED action set once (not per directory); each row is shown only if
+    its action applies to ≥1 dir:
+
+      * Open in browse-fs        — always (every dir is browsable).
+      * Browse commits/branches/status/stashes/reflog — when ≥1 dir is a git
+        repo (``_is_git_repo``).
+      * Browse plan in browse-plan — when ≥1 dir has ``.PLAN.md``.
+      * Show full path           — always (pops up every distinct dir's path).
+
+    Returns ``(label, token)`` rows; the token half is dispatched by
+    ``_run_dir_action`` (via ``_MENU_ACTIONS``). ``[]`` when ``dirs`` is empty,
+    so a row with no resolvable context dir gets no directory cluster.
+    """
+    if not dirs:
+        return []
+    paths = [path for _roles, path in dirs]
+    rows = [('Open in browse-fs', 'dir.fs')]
+    if any(_is_git_repo(p) for p in paths):
+        rows.extend((label, token) for label, token, _mode in _DIR_GIT_MODES)
+    if any(_has_plan_md(p) for p in paths):
+        rows.append(('Browse plan in browse-plan', 'dir.plan'))
+    rows.append(('Show full path', 'dir.path'))
+    return rows
+
+
+def _dir_chooser_rows(dirs):
+    """``(label, realpath)`` chooser rows for ``dirs`` — role-labelled paths.
+
+    Each entry is labelled by the dir's role(s) plus its path
+    (``project / cwd: /p``, ``worktree: /w``), so a user disambiguating two
+    distinct dirs sees what each is. Pure; the Level-2 chooser handler
+    (``_choose_dir``) re-invokes ``ctx.menu`` over these.
+    """
+    return [(f"{' / '.join(roles)}: {path}", path) for roles, path in dirs]
+
+
+def _choose_dir(ctx, dirs):
+    """Resolve which dir an action runs on: skip the chooser when only one qualifies.
+
+    With exactly one ``dirs`` entry, return its path directly (no modal — the
+    Level-2 chooser only appears when >1 DISTINCT dir applies). With more, open
+    the role-labelled chooser via ``ctx.menu`` and return the chosen path (or
+    ``None`` on cancel). Pure list-building lives in ``_dir_chooser_rows`` so
+    the chooser content is unit-testable without a modal.
+    """
+    if len(dirs) == 1:
+        return dirs[0][1]
+    return ctx.menu(_dir_chooser_rows(dirs))
+
+
+def _run_dir_action(ctx, token, dirs):
+    """Dispatch a Level-1 directory action ``token`` against the deduped ``dirs``.
+
+    Filters ``dirs`` to those the action applies to (git modes → repo dirs,
+    browse-plan → dirs with ``.PLAN.md``; browse-fs / show-path apply to all),
+    then:
+
+      * "Show full path" pops up every distinct dir's path (one per line) — no
+        chooser, per the ticket exception.
+      * Otherwise picks the dir via ``_choose_dir`` (which skips the chooser
+        when exactly one qualifies) and launches the external tool through
+        ``ctx.run_external``. browse-fs / browse-git / browse-plan are other
+        browse-tui recipes, so ``keep_screen=True`` hands them the alt screen.
+    """
+    if token == 'dir.path':
+        ctx.alert('\n'.join(path for _roles, path in dirs), title='paths')
+        return
+
+    if token == 'dir.fs':
+        applicable = dirs
+    elif token == 'dir.plan':
+        applicable = [d for d in dirs if _has_plan_md(d[1])]
+    else:  # a git-mode token
+        applicable = [d for d in dirs if _is_git_repo(d[1])]
+    if not applicable:
+        return
+
+    path = _choose_dir(ctx, applicable)
+    if path is None:
+        return
+
+    if token == 'dir.fs':
+        ctx.run_external(['browse-fs', path], keep_screen=True)
+        return
+    if token == 'dir.plan':
+        ctx.run_external(['browse-plan', '-f', os.path.join(path, '.PLAN.md')],
+                         keep_screen=True)
+        return
+    for _label, git_token, mode in _DIR_GIT_MODES:
+        if git_token == token:
+            ctx.run_external(['browse-git', path, '--mode', mode],
+                             keep_screen=True)
+            return
+
+
+# -- per-kind menu builders -------------------------------------------------
+
+
+def context_menu_message(ctx, item_id):
+    """``(label, token)`` rows for a ``('msg', jsonl, n)`` cursor row.
+
+    Reuses the existing message actions (E / V / M / y / m), so the duplicate
+    rows carry the literal hotkey hint per the convention. "Toggle markdown
+    coloring" is offered only when md2ansi_lib loaded (the ``m`` action is only
+    bound then). The directory cluster is appended (the message's session
+    resolves project/cwd/worktree).
+    """
+    rows = [
+        ('Edit source in $EDITOR (E)',     'msg.edit'),
+        ('View source in $PAGER (V)',      'msg.view'),
+        ('Render markdown via mdcat (M)',  'msg.mdcat'),
+        ('Show full id (y)',               'msg.id'),
+    ]
+    if _md2ansi_fn is not None:
+        rows.append(('Toggle markdown coloring (m)', 'msg.toggle_md'))
+    return rows
+
+
+def context_menu_session(ctx, item_id):
+    """``(label, token)`` rows for a ``('session', jsonl)`` cursor row.
+
+    Open the transcript in $PAGER (reuses the ``V`` source path) and show the
+    session path (pop-up). The directory cluster is appended.
+    """
+    return [
+        ('Open transcript in $PAGER (V)', 'session.view'),
+        ('Show session path',             'session.path'),
+    ]
+
+
+def context_menu_agent(ctx, item_id):
+    """``(label, token)`` rows for an ``('agent', jsonl, aid)`` subagent row.
+
+    Open the subagent transcript in $PAGER and show the agent id (pop-up). The
+    directory cluster is appended (a subagent shares its session's dirs).
+    """
+    return [
+        ('Open agent transcript in $PAGER (V)', 'agent.view'),
+        ('Show agent id',                       'agent.id'),
+    ]
+
+
+def context_menu_project(ctx, item_id):
+    """``(label, token)`` rows for a ``('project', dir)`` cursor row.
+
+    A project row carries no per-row actions of its own beyond the directory
+    cluster — which is exactly the point of surfacing it here (the project /
+    cwd / worktree dirs are most directly resolvable from a project row). The
+    cluster is appended by ``context_menu_options``.
+    """
+    return []
+
+
+# -- dispatch + the hook ----------------------------------------------------
+#
+# ``_MENU_ACTIONS`` maps every token a ``context_menu_*`` builder can emit to
+# its handler ``(ctx, item_id)``. The per-row message/session/agent actions
+# reuse the recipe's existing action handlers directly (``_action_edit_source``
+# / ``_action_view_source`` / ``_action_md_preview`` / ``_action_show_id`` /
+# ``_action_toggle_md``), which read ``ctx.cursor`` themselves — so the menu
+# rows stay single-sourced with the E / V / M / y / m keybindings. The
+# directory tokens route through ``_run_dir_action`` against the cursor's
+# deduped context dirs.
+
+
+def _dispatch_dir(ctx, item_id, token):
+    """Run a ``dir.*`` token against the cursor's deduped context dirs."""
+    dirs = _dedup_dirs(_cursor_context_dirs(item_id))
+    _run_dir_action(ctx, token, dirs)
+
+
+_MENU_ACTIONS = {
+    # message — reuse the existing E / V / M / y / m action handlers.
+    'msg.edit':      lambda c, i: _action_edit_source(c),
+    'msg.view':      lambda c, i: _action_view_source(c),
+    'msg.mdcat':     lambda c, i: _action_md_preview(c),
+    'msg.id':        lambda c, i: _action_show_id(c),
+    'msg.toggle_md': lambda c, i: _action_toggle_md(c),
+    # session
+    'session.view':  lambda c, i: _action_view_source(c),
+    'session.path':  lambda c, i: c.alert(i[1], title='session'),
+    # agent / subagent
+    'agent.view':    lambda c, i: _action_view_source(c),
+    'agent.id':      lambda c, i: c.alert(i[2], title='agent'),
+    # directory cluster (shared across project / session / message rows)
+    'dir.fs':           lambda c, i: _dispatch_dir(c, i, 'dir.fs'),
+    'dir.git.commits':  lambda c, i: _dispatch_dir(c, i, 'dir.git.commits'),
+    'dir.git.branches': lambda c, i: _dispatch_dir(c, i, 'dir.git.branches'),
+    'dir.git.status':   lambda c, i: _dispatch_dir(c, i, 'dir.git.status'),
+    'dir.git.stash':    lambda c, i: _dispatch_dir(c, i, 'dir.git.stash'),
+    'dir.git.reflog':   lambda c, i: _dispatch_dir(c, i, 'dir.git.reflog'),
+    'dir.plan':         lambda c, i: _dispatch_dir(c, i, 'dir.plan'),
+    'dir.path':         lambda c, i: _dispatch_dir(c, i, 'dir.path'),
+}
+
+
+def context_menu_options(ctx):
+    """``(label, token)`` rows for the browse-claude context menu (pure — no modal).
+
+    Branches on the cursor item's KIND (``id[0]``): a message
+    (``('msg', jsonl, n)``), session (``('session', jsonl)``), subagent
+    (``('agent', jsonl, aid)``) or project (``('project', dir)``) row gets its
+    per-kind rows, then the SHARED directory cluster (``_dir_action_rows``
+    against the cursor's deduped context dirs) when those rows resolve. A
+    synthetic / markdown / cursorless row has no menu (``[]``), so the hook
+    opens nothing. The token half is dispatched by ``_MENU_ACTIONS`` /
+    ``on_context_menu``.
+    """
+    item_id = ctx.cursor.id if ctx.cursor else None
+    if not isinstance(item_id, tuple) or not item_id:
+        return []
+    kind = item_id[0]
+    if kind == 'msg' and len(item_id) == 3:
+        rows = context_menu_message(ctx, item_id)
+    elif kind == 'session':
+        rows = context_menu_session(ctx, item_id)
+    elif kind == 'agent' and len(item_id) == 3:
+        rows = context_menu_agent(ctx, item_id)
+    elif kind == 'project':
+        rows = context_menu_project(ctx, item_id)
+    else:
+        return []
+    # Append the shared directory cluster (project / cwd / worktree), deduped.
+    dirs = _dedup_dirs(_cursor_context_dirs(item_id))
+    return list(rows) + _dir_action_rows(dirs)
+
+
+def on_context_menu(ctx):
+    """Open the browse-claude context menu and dispatch the chosen entry.
+
+    The hook the framework fires on right-click / `` ` ``-F1: build the (pure)
+    per-kind option list, open it with ``ctx.menu``, and route the chosen token
+    through ``_MENU_ACTIONS`` (passing the cursor's id so each handler reads its
+    own fields). A cancel (``None``) or an empty list is a no-op. The cursor id
+    is re-read at dispatch time so a token always pairs with the row it came
+    from.
+    """
+    token = ctx.menu(context_menu_options(ctx))
+    handler = _MENU_ACTIONS.get(token)
+    if handler is None:
+        return
+    item = ctx.cursor
+    handler(ctx, item.id if item is not None else None)
+
+
 # ---- entry point ---------------------------------------------------------
 
 
@@ -6320,7 +6714,14 @@ a transcript with Right/Alt-Down; preview shows the rendered turn.
   M       render the preview via $MDCAT / mdcat (external).
   J / K   jump cursor to next / previous user-or-assistant voice.
   t       toggle flat / tree view.
-  .       toggle voice-only filter (hide tool calls / machinery).\
+  .       toggle voice-only filter (hide tool calls / machinery).
+
+Right-click a row (or the backslash / F1 keys) for a menu: message rows
+offer the source actions above (edit / view / mdcat / id); session and
+subagent rows open the transcript and show their path / id. Every project,
+session, message and subagent row also surfaces a directory cluster over its
+project / cwd / worktree dirs — open in browse-fs, browse the git history (commits /
+branches / status / stashes / reflog), or browse its .PLAN.md.\
 """
 
 
@@ -6508,6 +6909,12 @@ def main():
         # the lightweight metadata card to the heavy umbrella cascade.
         # Fires for alt-down, programmatic scope, and startup alike.
         on_scope_change=_on_scope_change,
+        # Right-click (or the backslash / F1 keys) opens a per-kind menu:
+        # message (E/V/M/y/m source actions), session / subagent transcript +
+        # path, and a shared directory cluster over the row's project / cwd /
+        # worktree dirs (browse-fs, browse-git modes, browse-plan). See
+        # ``on_context_menu``.
+        on_context_menu=on_context_menu,
         # Preview content is width-dependent: ``_md_voice`` lays out voice
         # markdown (prose wrap AND table column widths) through md2ansi at
         # ``ctx.preview_width``. The framework caches that rendered text by
