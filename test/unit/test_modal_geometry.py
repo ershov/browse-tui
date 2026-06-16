@@ -134,37 +134,59 @@ class TestPlaceCenter(unittest.TestCase):
 
 
 class TestPlaceAnchor(unittest.TestCase):
-    """``placement='anchor'`` — top-left just below the anchor cell,
-    flipping above / shifting left / clamping as needed."""
+    """``placement='anchor'`` — vertical drops below the anchor row (flips
+    above on bottom overflow), horizontal is CENTERED on screen (#1040).
 
-    def test_below_anchor(self):
-        # Anchor at row 5, col 10 on a roomy screen: top-left at
-        # (6, 10), no overflow.
+    The anchor's COLUMN no longer drives the horizontal position: a
+    keyboard-triggered context menu anchors at the list pane's left edge,
+    and using that column hugged the screen left. The box is now centered
+    horizontally — the same ``left`` the ``'center'`` branch computes —
+    while the anchor's ROW still drives the vertical placement.
+    """
+
+    def _centered_left(self, cols, w):
+        """The ``left`` a centered frame of width ``w`` lands at."""
+        return _modal_place(cols, 24, w, 6,
+                            placement='center', anchor=None).left
+
+    def test_horizontal_is_centered_not_anchor_column(self):
+        # Anchor column (10) is well left of center on an 80-col screen;
+        # the box must center horizontally, NOT sit at left == 10.
         r = _modal_place(80, 24, 20, 6, placement='anchor', anchor=(5, 10))
-        self.assertEqual(r, Rect(10, 6, 30, 12))
+        self.assertNotEqual(r.left, 10)               # not the anchor column
+        self.assertEqual(r.left, self._centered_left(80, 20))  # centered X
+        # Vertical still drops just below the anchor row (5 -> top 6).
+        self.assertEqual(r.top, 6)
+
+    def test_left_edge_anchor_still_centers(self):
+        # The motivating case (#1040): a keyboard trigger anchors at the
+        # pane's LEFT edge (col 1). The menu must NOT hug the left — it
+        # centers on screen, dropping below the anchor row.
+        r = _modal_place(80, 24, 20, 6, placement='anchor', anchor=(5, 1))
+        self.assertGreater(r.left, 1)                 # does not hug the left
+        self.assertEqual(r.left, self._centered_left(80, 20))  # centered X
+        self.assertEqual(r.top, 6)                    # below the anchor row
+
+    def test_centered_x_independent_of_anchor_column(self):
+        # The horizontal position depends only on the screen + frame width,
+        # never on the anchor column — far-left and far-right anchors at the
+        # same row land at the identical (centered) left.
+        left_anchor = _modal_place(80, 24, 20, 6,
+                                   placement='anchor', anchor=(5, 1))
+        right_anchor = _modal_place(80, 24, 20, 6,
+                                    placement='anchor', anchor=(5, 78))
+        self.assertEqual(left_anchor.left, right_anchor.left)
+        self.assertEqual(left_anchor.left, self._centered_left(80, 20))
 
     def test_flip_above_when_bottom_overflows(self):
         # Anchor near the bottom (row 22) with a 6-row frame: below would
         # start at row 23 and occupy 23..28 > 24. Flip above: bottom just
-        # above the anchor -> top = 22 - 6 = 16, occupies 16..21.
+        # above the anchor -> top = 22 - 6 = 16, occupies 16..21. (X stays
+        # centered, unaffected by the vertical flip.)
         r = _modal_place(80, 24, 20, 6, placement='anchor', anchor=(22, 10))
         self.assertEqual(r.top, 16)
         self.assertEqual(r.bottom, 22)
-
-    def test_shift_left_when_right_overflows(self):
-        # Anchor at col 70 with a 20-wide frame: left=70 occupies 70..89 >
-        # 80. Shift left so the right edge fits AND column 80 stays free
-        # for the right outer margin (#1043): left = 80 - 20 = 60, so the
-        # box occupies 60..79 and the margin lands in column 80.
-        r = _modal_place(80, 24, 20, 6, placement='anchor', anchor=(5, 70))
-        self.assertEqual(r.left, 60)
-        self.assertEqual(r.right, 80)
-
-    def test_clamp_left_to_one(self):
-        # Anchor at col 1 is fine (left=1); a frame wider than the screen
-        # still clamps to left=1 rather than going negative.
-        r = _modal_place(40, 24, 100, 6, placement='anchor', anchor=(5, 1))
-        self.assertEqual(r.left, 1)
+        self.assertEqual(r.left, self._centered_left(80, 20))  # centered X
 
     def test_clamp_top_to_one(self):
         # 80x10 screen, 8-row frame, anchor at row 7: below (top=8) would
@@ -174,19 +196,27 @@ class TestPlaceAnchor(unittest.TestCase):
         self.assertEqual(r.top, 1)
 
     def test_anchor_top_left_corner(self):
-        # Anchor at (1, 1): below the anchor row -> top (2). The left edge
-        # is clamped to column 2 so column 1 stays free for the left outer
-        # margin (#1043), giving top-left (2, 2).
+        # Anchor at (1, 1): vertical drops below the anchor row -> top 2.
+        # Horizontal centers on screen (NOT the anchor column 1), so the
+        # box matches the centered ``left`` and keeps column 1 free for the
+        # left outer margin (#1043).
         r = _modal_place(80, 24, 20, 6, placement='anchor', anchor=(1, 1))
-        self.assertEqual(r, Rect(2, 2, 22, 8))
+        self.assertEqual(r.top, 2)                    # below the anchor row
+        self.assertEqual(r.left, self._centered_left(80, 20))  # centered X
+        self.assertGreaterEqual(r.left, 2)            # left margin on-screen
 
-    def test_flip_and_shift_together(self):
-        # Bottom-right corner anchor forces BOTH a flip-above and a
-        # shift-left; the shift also reserves the right margin column, so
-        # left lands at 60 (box 60..79, margin in column 80).
-        r = _modal_place(80, 24, 20, 6, placement='anchor', anchor=(22, 70))
-        self.assertEqual(r.left, 60)   # shifted left (margin column reserved)
-        self.assertEqual(r.top, 16)    # flipped above
+    def test_centered_x_matches_center_branch_exactly(self):
+        # The anchored horizontal placement is byte-for-byte the centered
+        # branch's ``left`` across screen widths (the stated #1040 intent),
+        # while the anchored vertical comes from the anchor row.
+        for cols in (40, 80, 81, 120):
+            with self.subTest(cols=cols):
+                anchored = _modal_place(cols, 24, 20, 6,
+                                        placement='anchor', anchor=(5, 3))
+                centered = _modal_place(cols, 24, 20, 6,
+                                        placement='center', anchor=None)
+                self.assertEqual(anchored.left, centered.left)
+                self.assertEqual(anchored.right, centered.right)
 
 
 # --- Outer-margin room (#1043) -------------------------------------------
@@ -220,19 +250,21 @@ class TestPlaceMarginRoom(unittest.TestCase):
                 self.assertLessEqual(r.right, cols)      # right margin on-screen
 
     def test_capped_frame_fits_with_margins_anchored(self):
-        # Anchored at a far-right / bottom cell still leaves both margin
-        # columns on-screen (the clamp reserves them).
+        # Anchored placement now centers horizontally (#1040), so a
+        # cap-width frame leaves both outer-margin columns on-screen for any
+        # anchor column — checked here at a far-right / bottom anchor cell.
         for cols in (20, 40, 80, 120):
             with self.subTest(cols=cols):
                 fw, fh = self._frame_at_cap(cols, 24)
                 r = _modal_place(cols, 24, fw, fh,
                                  placement='anchor', anchor=(20, cols))
-                self.assertGreaterEqual(r.left - 1, 1)
-                self.assertLessEqual(r.right, cols)
+                self.assertGreaterEqual(r.left - 1, 1)   # left margin on-screen
+                self.assertLessEqual(r.right, cols)      # right margin on-screen
 
     def test_narrow_frame_keeps_left_margin_column(self):
-        # Even a tiny frame on a roomy screen never sits in column 1 —
-        # column 1 is reserved for the left margin.
+        # A narrow anchored frame centers horizontally (#1040) regardless of
+        # the anchor column, so it never sits in column 1 — column 1 stays
+        # free for the left outer margin even when the anchor is at col 1.
         r = _modal_place(80, 24, 10, 5, placement='anchor', anchor=(3, 1))
         self.assertGreaterEqual(r.left, 2)
 

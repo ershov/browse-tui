@@ -75,11 +75,15 @@ def _modal_place(cols, rows, w, h, *, placement, anchor):
     extra cell toward the right/bottom (floor division).
 
     ``placement='anchor'`` takes ``anchor=(row, col)`` in 1-based screen
-    coordinates and lands the frame's top-left just below the anchor, at
-    ``(row + 1, col)``, so the anchor row stays visible. If the frame
-    would overflow the bottom edge it flips above the anchor; if it would
-    overflow the right edge it shifts left. Both axes are then clamped so
-    the frame stays on-screen (top ≥ 1, fully visible where it fits).
+    coordinates and uses ONLY the anchor's row for vertical placement: the
+    frame drops just below the anchor row (``top = row + 1``) so that row
+    stays visible, flipping above the anchor (``top = row - h``) if dropping
+    below would overflow the bottom edge. Horizontally the frame is CENTERED
+    on screen — the same ``left`` the ``'center'`` branch computes — so a
+    menu triggered by keyboard (whose anchor column is the list pane's left
+    edge) sits closest to the screen center rather than hugging the left.
+    Both axes are then clamped so the frame stays on-screen (top ≥ 1, fully
+    visible where it fits).
 
     The horizontal clamp also reserves one blank column just outside each
     vertical border for the #1043 outer margin: when the frame is narrow
@@ -94,16 +98,18 @@ def _modal_place(cols, rows, w, h, *, placement, anchor):
         return Rect(1, 1, cols + 1, rows + 1)
 
     if placement == 'anchor':
-        row, col = anchor
-        left = col
+        row, _col = anchor
+        # Horizontal: center on screen (closest to screen center), exactly
+        # like the ``'center'`` branch — the anchor column is NOT used for
+        # ``left`` (a keyboard-triggered menu anchors at the pane's left
+        # edge, which would hug the screen left).
+        left = 1 + (cols - w) // 2
+        # Vertical: drop just below the anchor row so it stays visible, and
+        # flip above if dropping below would overflow the bottom edge — the
+        # frame's last row is ``top + h - 1``.
         top = row + 1
-        # Flip above the anchor if dropping below would overflow the
-        # bottom edge — the frame's last row is ``top + h - 1``.
         if top + h - 1 > rows:
             top = row - h
-        # Shift left so the right edge fits — last column is ``left + w - 1``.
-        if left + w - 1 > cols:
-            left = cols - w + 1
     else:  # 'center'
         left = 1 + (cols - w) // 2
         top = 1 + (rows - h) // 2
