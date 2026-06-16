@@ -1380,6 +1380,49 @@ class TestOnContextMenu(unittest.TestCase):
         finally:
             b.stop_workers()
 
+    def test_fire_resets_and_clears_per_chain_side(self):
+        """The per-chain side slot (#1041) is reset at the start of the fire
+        and cleared afterwards.
+
+        ``_fire_context_menu`` is the chain boundary: it must reset
+        ``_context_menu_side`` to ``None`` BEFORE the handler runs (so a fresh
+        chain decides anew, ignoring any stale value), and clear it back to
+        ``None`` AFTER (so the slot doesn't leak across fires). The first
+        ``ctx.menu`` of the chain would store its chosen side here, but
+        ``ctx.menu`` is a no-op on a headless Browser — so observe the slot
+        directly off the Browser inside the handler.
+        """
+        seen_side = []
+        b = Browser(BrowserConfig(
+            _headless=True,
+            on_context_menu=lambda ctx: seen_side.append(
+                ctx._browser._context_menu_side)))
+        try:
+            # Pre-seed a STALE side: the start-of-fire reset must wipe it so
+            # the handler sees a fresh (None) chain, not last chain's side.
+            b._context_menu_side = 'above'
+            b._fire_context_menu()
+            self.assertEqual(seen_side, [None])      # reset before handler ran
+            self.assertIsNone(b._context_menu_side)  # cleared after the fire
+        finally:
+            b.stop_workers()
+
+    def test_fire_clears_side_even_when_handler_raises(self):
+        """The side slot is cleared in ``finally`` — a raising handler that
+        had set a side does not leak it past the fire."""
+        def boom(ctx):
+            # Simulate the first menu having fixed the chain's side, then the
+            # handler blowing up before the fire returns normally.
+            ctx._browser._context_menu_side = 'below'
+            raise RuntimeError('kaboom')
+
+        b = Browser(BrowserConfig(_headless=True, on_context_menu=boom))
+        try:
+            b._fire_context_menu()  # must not raise
+            self.assertIsNone(b._context_menu_side)  # cleared despite raise
+        finally:
+            b.stop_workers()
+
     def test_right_click_fires_and_repositions_cursor(self):
         """A right-click on a list row moves the cursor there, then fires."""
         seen_cursor = []

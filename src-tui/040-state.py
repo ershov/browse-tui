@@ -3739,6 +3739,17 @@ class Browser:
         # keyboard triggers anchor to the list cursor as usual).
         self._on_context_menu = config.on_context_menu
         self._context_menu_anchor = None
+        # Per-chain side slot (#1041). A context menu can chain — the chosen
+        # entry re-invokes ``ctx.menu`` to open a submenu — and those modals
+        # run SEQUENTIALLY within one ``on_context_menu`` fire (one open at a
+        # time). The FIRST menu in the chain decides above/below the anchor
+        # row from its own height; ``_measure_frame`` stores that side here so
+        # EVERY subsequent menu in the same chain opens on the SAME side (an
+        # oversized submenu shifts to fit instead of flipping to the other
+        # side, so the chain reads as descending levels). ``None`` outside a
+        # fire and at the start of each fire (a fresh chain decides anew);
+        # set/cleared around the hook call in ``_fire_context_menu``.
+        self._context_menu_side = None
         self._on_stdin = config.on_stdin
         # No-landable-row policy (§3.4). Read once here; consulted by
         # ``_clamp_cursor_landable`` whenever the visible list ends up
@@ -5785,16 +5796,25 @@ class Browser:
         keyboard trigger passes ``anchor=None``, leaving the default anchor
         on the list cursor. Exceptions are caught and routed to
         :meth:`error` like the other on_* hooks.
+
+        This call is also the chain boundary for the per-chain menu SIDE
+        (#1041): ``_context_menu_side`` is reset to ``None`` here so a fresh
+        chain decides above/below anew, and cleared in ``finally`` alongside
+        ``_context_menu_anchor``. The first ``ctx.menu`` of the chain records
+        its side via ``_measure_frame``; any submenu opened from the same
+        fire reuses it.
         """
         if self._on_context_menu is None:
             return
         self._context_menu_anchor = anchor
+        self._context_menu_side = None
         try:
             self._on_context_menu(self._make_ctx_for_hook())
         except Exception as e:
             self.error(f'on_context_menu: {type(e).__name__}: {e}')
         finally:
             self._context_menu_anchor = None
+            self._context_menu_side = None
 
     def _fire_expand_collapse_if_pending(self) -> None:
         """Fire ``on_collapse`` / ``on_expand`` from a drain-time set diff.

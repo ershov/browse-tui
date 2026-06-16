@@ -219,6 +219,156 @@ class TestPlaceAnchor(unittest.TestCase):
                 self.assertEqual(anchored.right, centered.right)
 
 
+# --- Anchored placement: forced SIDE for chained submenus (#1041) --------
+
+
+class TestPlaceAnchorSide(unittest.TestCase):
+    """``placement='anchor', side=…`` — keep a chained submenu on the side the
+    first menu picked instead of independently flipping.
+
+    A context menu can chain (a chosen entry re-opens ``ctx.menu``). The FIRST
+    menu decides above/below from its own height; ``_measure_frame`` stores
+    that ``side`` and forces EVERY later menu in the chain onto it. The point
+    of forcing is the tall-submenu case: a submenu too tall for the chosen
+    side must SHIFT to fit (clamped onto the screen, overlapping the subject
+    row if need be) rather than flip to the opposite side and read as a
+    disjoint box. ``side=None`` keeps today's below-if-fits-else-above
+    decision (the first menu / any standalone anchored use).
+    """
+
+    # -- side=None: unchanged below-if-fits-else-above (regression guard) ---
+
+    def test_side_none_matches_legacy_decision_across_rows(self):
+        # With no forced side the anchored vertical is exactly today's rule:
+        # below (top = row + 1) while the box fits, flipping above
+        # (top = row - h) only once below would overflow the bottom. Sweep
+        # the anchor row down an 80x24 screen with a 6-row frame and assert
+        # the boundary lands where the overflow predicate flips, NOT at a
+        # hard-coded row.
+        rows, h = 24, 6
+        for row in range(1, rows + 1):
+            with self.subTest(row=row):
+                r = _modal_place(80, rows, 20, h,
+                                 placement='anchor', anchor=(row, 10))
+                fits_below = (row + 1) + h - 1 <= rows
+                if fits_below:
+                    self.assertEqual(r.top, row + 1, 'should drop below')
+                else:
+                    # Flipped above (then clamped to >= 1 near the top).
+                    self.assertEqual(r.top, max(1, row - h),
+                                     'should flip above')
+
+    def test_side_none_default_argument(self):
+        # ``side`` defaults to None, so the existing keyword-free call sites
+        # keep their behavior — below for an anchor with room beneath it.
+        explicit = _modal_place(80, 24, 20, 6,
+                                placement='anchor', anchor=(5, 10),
+                                side=None)
+        default = _modal_place(80, 24, 20, 6,
+                               placement='anchor', anchor=(5, 10))
+        self.assertEqual(explicit, default)
+        self.assertEqual(default.top, 6)             # below the anchor row
+
+    # -- side='below': forced below, shift (never flip) when too tall ------
+
+    def test_below_when_it_fits_is_just_below_anchor(self):
+        # A small forced-below menu sits one row under the anchor — same as
+        # the fresh decision when it fits.
+        r = _modal_place(80, 24, 20, 6, placement='anchor',
+                         anchor=(5, 10), side='below')
+        self.assertEqual(r.top, 6)
+        self.assertEqual(r.bottom, 12)
+
+    def test_tall_below_submenu_clamps_instead_of_flipping(self):
+        # THE motivating #1041 case. Anchor at row 5; the chain's side is
+        # 'below'. A TALL submenu (18 rows) dropped below would occupy
+        # 6..23 — fits here, so first take a frame that DOESN'T fit below to
+        # force the shift: 20-row frame below row 5 would be 6..25 > 24.
+        # With side='below' it must NOT flip above (top would be 5 - 20 =
+        # -15); instead it clamps DOWN onto the screen: top = rows - h + 1 =
+        # 24 - 20 + 1 = 5, occupying 5..24. So it stays anchored to the
+        # SAME (below) side and merely shifted up to fit, overlapping the
+        # subject row — exactly the "reads as going down a level" intent.
+        rows, h = 24, 20
+        r = _modal_place(80, rows, 20, h, placement='anchor',
+                         anchor=(5, 10), side='below')
+        # Did NOT flip to the above position (which would be row - h = -15,
+        # clamped to 1 — top == 1). It stayed below-anchored and clamped to
+        # the bottom of the screen instead.
+        flipped_above_top = 1
+        self.assertNotEqual(r.top, flipped_above_top,
+                            'tall below submenu must not flip above')
+        self.assertEqual(r.top, rows - h + 1)        # clamped to fit
+        self.assertEqual(r.bottom, rows + 1)         # extends to screen bottom
+        # Contrast: the FRESH decision for the same tall frame WOULD flip
+        # above (and clamp to top 1). Forcing 'below' is what differs.
+        fresh = _modal_place(80, rows, 20, h, placement='anchor',
+                             anchor=(5, 10), side=None)
+        self.assertEqual(fresh.top, 1)               # fresh flips above
+        self.assertNotEqual(r.top, fresh.top)        # forced-below diverges
+
+    # -- side='above': forced above, shift (never flip) when too tall ------
+
+    def test_above_when_it_fits_sits_just_above_anchor(self):
+        # Forced above with room: bottom just above the anchor row.
+        r = _modal_place(80, 24, 20, 6, placement='anchor',
+                         anchor=(15, 10), side='above')
+        self.assertEqual(r.top, 9)                   # 15 - 6
+        self.assertEqual(r.bottom, 15)               # last row just above 15
+
+    def test_tall_above_submenu_clamps_to_top_instead_of_flipping(self):
+        # Mirror of the below case. Anchor near the top (row 4); chain side
+        # 'above'. A tall submenu above row 4 would start at 4 - 18 = -14,
+        # off the top. With side='above' it must NOT flip below; it clamps
+        # to top = 1 and extends downward, overlapping the subject row.
+        rows, h = 24, 18
+        r = _modal_place(80, rows, 20, h, placement='anchor',
+                         anchor=(4, 10), side='above')
+        self.assertEqual(r.top, 1)                   # clamped to the top edge
+        # NOT the below position (top = row + 1 = 5).
+        self.assertNotEqual(r.top, 5, 'tall above submenu must not flip below')
+
+    # -- composition with #1040 (centered X) and #1043 (margin) ------------
+
+    def test_forced_side_keeps_centered_x(self):
+        # The forced vertical side never disturbs the centered-X (#1040):
+        # left matches the centered branch for both sides, independent of the
+        # anchor column.
+        centered_left = _modal_place(80, 24, 20, 6,
+                                     placement='center', anchor=None).left
+        for side in ('below', 'above'):
+            with self.subTest(side=side):
+                r = _modal_place(80, 24, 20, 6, placement='anchor',
+                                 anchor=(12, 1), side=side)
+                self.assertEqual(r.left, centered_left)
+
+    def test_forced_side_keeps_outer_margin_columns(self):
+        # A cap-width forced-side frame still leaves both #1043 margin
+        # columns on-screen (left >= 2, right <= cols) — the horizontal
+        # clamp is unchanged by the side parameter.
+        cols = 80
+        max_w, _max_h = _modal_caps(cols, 24)
+        fw, fh = _frame_size(max_w, 4)
+        for side in ('below', 'above'):
+            with self.subTest(side=side):
+                r = _modal_place(cols, 24, fw, fh, placement='anchor',
+                                 anchor=(12, cols), side=side)
+                self.assertGreaterEqual(r.left - 1, 1)
+                self.assertLessEqual(r.right, cols)
+
+    # -- side is meaningless for centered placement ------------------------
+
+    def test_side_ignored_for_center_placement(self):
+        # A centered dialog never consults ``side`` — passing one must not
+        # change the centered position.
+        base = _modal_place(80, 24, 40, 10, placement='center', anchor=None)
+        for side in ('below', 'above'):
+            with self.subTest(side=side):
+                r = _modal_place(80, 24, 40, 10,
+                                 placement='center', anchor=None, side=side)
+                self.assertEqual(r, base)
+
+
 # --- Outer-margin room (#1043) -------------------------------------------
 
 

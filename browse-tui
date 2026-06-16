@@ -5438,6 +5438,17 @@ class Browser:
         # keyboard triggers anchor to the list cursor as usual).
         self._on_context_menu = config.on_context_menu
         self._context_menu_anchor = None
+        # Per-chain side slot (#1041). A context menu can chain — the chosen
+        # entry re-invokes ``ctx.menu`` to open a submenu — and those modals
+        # run SEQUENTIALLY within one ``on_context_menu`` fire (one open at a
+        # time). The FIRST menu in the chain decides above/below the anchor
+        # row from its own height; ``_measure_frame`` stores that side here so
+        # EVERY subsequent menu in the same chain opens on the SAME side (an
+        # oversized submenu shifts to fit instead of flipping to the other
+        # side, so the chain reads as descending levels). ``None`` outside a
+        # fire and at the start of each fire (a fresh chain decides anew);
+        # set/cleared around the hook call in ``_fire_context_menu``.
+        self._context_menu_side = None
         self._on_stdin = config.on_stdin
         # No-landable-row policy (§3.4). Read once here; consulted by
         # ``_clamp_cursor_landable`` whenever the visible list ends up
@@ -7484,16 +7495,25 @@ class Browser:
         keyboard trigger passes ``anchor=None``, leaving the default anchor
         on the list cursor. Exceptions are caught and routed to
         :meth:`error` like the other on_* hooks.
+
+        This call is also the chain boundary for the per-chain menu SIDE
+        (#1041): ``_context_menu_side`` is reset to ``None`` here so a fresh
+        chain decides above/below anew, and cleared in ``finally`` alongside
+        ``_context_menu_anchor``. The first ``ctx.menu`` of the chain records
+        its side via ``_measure_frame``; any submenu opened from the same
+        fire reuses it.
         """
         if self._on_context_menu is None:
             return
         self._context_menu_anchor = anchor
+        self._context_menu_side = None
         try:
             self._on_context_menu(self._make_ctx_for_hook())
         except Exception as e:
             self.error(f'on_context_menu: {type(e).__name__}: {e}')
         finally:
             self._context_menu_anchor = None
+            self._context_menu_side = None
 
     def _fire_expand_collapse_if_pending(self) -> None:
         """Fire ``on_collapse`` / ``on_expand`` from a drain-time set diff.
@@ -14227,7 +14247,7 @@ def _modal_is_tiny(cols, rows):
     return cols < _MODAL_MIN_COLS or rows < _MODAL_MIN_ROWS
 
 
-def _modal_place(cols, rows, w, h, *, placement, anchor):
+def _modal_place(cols, rows, w, h, *, placement, anchor, side=None):
     """Place a ``w`` × ``h`` frame on a ``cols`` × ``rows`` screen.
 
     Returns the frame ``Rect`` (1-based, exclusive right/bottom).
@@ -14240,15 +14260,34 @@ def _modal_place(cols, rows, w, h, *, placement, anchor):
     extra cell toward the right/bottom (floor division).
 
     ``placement='anchor'`` takes ``anchor=(row, col)`` in 1-based screen
-    coordinates and uses ONLY the anchor's row for vertical placement: the
-    frame drops just below the anchor row (``top = row + 1``) so that row
-    stays visible, flipping above the anchor (``top = row - h``) if dropping
-    below would overflow the bottom edge. Horizontally the frame is CENTERED
-    on screen — the same ``left`` the ``'center'`` branch computes — so a
-    menu triggered by keyboard (whose anchor column is the list pane's left
-    edge) sits closest to the screen center rather than hugging the left.
-    Both axes are then clamped so the frame stays on-screen (top ≥ 1, fully
-    visible where it fits).
+    coordinates and uses ONLY the anchor's row for vertical placement.
+    Horizontally the frame is CENTERED on screen — the same ``left`` the
+    ``'center'`` branch computes — so a menu triggered by keyboard (whose
+    anchor column is the list pane's left edge) sits closest to the screen
+    center rather than hugging the left.
+
+    The vertical SIDE of the anchor row is chosen by ``side``:
+
+      * ``side=None`` — DECIDE fresh from the frame height (the first menu of
+        a chain, or any standalone anchored use): drop just below the anchor
+        row (``top = row + 1``) so that row stays visible, flipping above
+        (``top = row - h``) only if dropping below would overflow the bottom
+        edge.
+      * ``side='below'`` — force below (``top = row + 1``) even if the frame
+        overflows the bottom; the shared clamp then shifts it up so it fits.
+      * ``side='above'`` — force above (``top = row - h``) even if the frame
+        overflows the top; the shared clamp then shifts it down so it fits.
+
+    The forced sides exist so a chained context menu (#1041) keeps every
+    submenu on the side the FIRST menu picked: an oversized submenu SHIFTS to
+    fit (clamped onto the screen, overlapping the subject row if need be)
+    rather than independently flipping to the opposite side and reading as a
+    disjoint box. ``side`` is ignored for ``placement='center'``.
+
+    Both axes are then clamped so the frame stays on-screen: vertically
+    ``top`` lands in ``[1, rows - h + 1]`` (so a frame taller-on-this-side
+    than the room available is shifted on-screen rather than truncated);
+    horizontally as below.
 
     The horizontal clamp also reserves one blank column just outside each
     vertical border for the #1043 outer margin: when the frame is narrow
@@ -14269,12 +14308,22 @@ def _modal_place(cols, rows, w, h, *, placement, anchor):
         # ``left`` (a keyboard-triggered menu anchors at the pane's left
         # edge, which would hug the screen left).
         left = 1 + (cols - w) // 2
-        # Vertical: drop just below the anchor row so it stays visible, and
-        # flip above if dropping below would overflow the bottom edge — the
-        # frame's last row is ``top + h - 1``.
-        top = row + 1
-        if top + h - 1 > rows:
+        # Vertical: pick the side of the anchor row.
+        #   * ``side is None`` → decide from this frame's height: below if it
+        #     fits, else flip above (the first menu of a chain, or a
+        #     standalone anchored use — unchanged behavior).
+        #   * ``side == 'below'`` / ``'above'`` → forced (a chained submenu
+        #     reusing the chain's side); the shared clamp below shifts an
+        #     oversized box onto the screen instead of flipping it.
+        # The frame's last row is ``top + h - 1``.
+        if side == 'above':
             top = row - h
+        elif side == 'below':
+            top = row + 1
+        else:  # decide fresh
+            top = row + 1
+            if top + h - 1 > rows:
+                top = row - h
     else:  # 'center'
         left = 1 + (cols - w) // 2
         top = 1 + (rows - h) // 2
@@ -14288,6 +14337,13 @@ def _modal_place(cols, rows, w, h, *, placement, anchor):
     # ``[2, cols - w]`` so column 1 / column ``cols`` stay free for the
     # margins. Otherwise the frame spans the screen width and there's no
     # room — fall back to the plain ``[1, cols - w + 1]`` clamp.
+    #
+    # Vertically, ``top`` is clamped into ``[1, rows - h + 1]``. For a forced
+    # SIDE (#1041) this is the SHIFT that keeps an oversized submenu on the
+    # chain's side: a ``'below'`` box that would overflow the bottom slides
+    # up, an ``'above'`` box that would start off the top slides down — both
+    # land fully on-screen (overlapping the subject row if need be) rather
+    # than flipping to the opposite side.
     if w <= cols - 2:
         left = max(2, min(left, cols - w))
     else:
@@ -14452,7 +14508,26 @@ def run_modal(browser, content, *, placement='center', anchor=None,
     cache = PaneCache()
 
     def _measure_frame():
-        """(Re)compute the frame ``Rect`` from the current terminal size."""
+        """(Re)compute the frame ``Rect`` from the current terminal size.
+
+        For an anchored placement this is also where the per-chain menu
+        SIDE (#1041) is resolved, because it's the one spot that knows BOTH
+        the anchor row and the measured frame height. ``browser`` carries a
+        ``_context_menu_side`` slot that ``Browser._fire_context_menu`` resets
+        to ``None`` at the start of each context-menu chain and clears when it
+        ends:
+
+          * unset (``None``) → DECIDE the side from the anchor row + this
+            frame's height (below if it fits, else above) and STORE it back,
+            so the first ``ctx.menu`` of a chain fixes the side;
+          * already set → REUSE it (a submenu opened later in the same chain
+            opens on the same side, shifting to fit rather than flipping).
+
+        Read via ``getattr`` so a Browser without the slot — or any non-chain
+        anchored use (no ``on_context_menu`` fire around it) — behaves like
+        "no preferred side" and decides fresh, never persisting one. Centered
+        placements never touch the slot.
+        """
         cols, rows = term_size()
         max_w, max_h = _modal_caps(cols, rows)
         content_w, content_h = content.measure(max_w, max_h)
@@ -14461,8 +14536,22 @@ def run_modal(browser, content, *, placement='center', anchor=None,
         content_w = max(0, min(content_w, max_w))
         content_h = max(0, min(content_h, max_h))
         fw, fh = _frame_size(content_w, content_h)
-        return _modal_place(cols, rows, fw, fh,
-                            placement=placement, anchor=anchor), content_h
+        side = None
+        if placement == 'anchor':
+            side = getattr(browser, '_context_menu_side', None)
+            if side is None:
+                # First menu of the chain (or a standalone anchored use):
+                # decide below-if-fits-else-above from this frame's height,
+                # mirroring the fresh-decision branch in ``_modal_place``.
+                row, _col = anchor
+                side = 'below' if row + 1 + fh - 1 <= rows else 'above'
+                # Persist only when the slot exists (a context-menu chain);
+                # a Browser without it stays sideless so a standalone use
+                # never leaks a side.
+                if hasattr(browser, '_context_menu_side'):
+                    browser._context_menu_side = side
+        return _modal_place(cols, rows, fw, fh, placement=placement,
+                            anchor=anchor, side=side), content_h
 
     def _paint(frame, content_h):
         """Paint the whole frame through the private cache, in one sync.

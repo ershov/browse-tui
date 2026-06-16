@@ -238,6 +238,22 @@ def _first_row_visible_cells(text):
     return _term._visible_len(text[start:end])
 
 
+def _frame_top_left(text):
+    """``(top, left)`` of the painted frame, from the FIRST cursor-move.
+
+    The engine paints the frame top-down; the first row emitted is the top
+    border at the frame's ``(top, left)`` (``begin_row`` does ``move(abs_row,
+    left)``). Parsing that first ``\\e[<row>;<col>H`` therefore recovers where
+    ``_modal_place`` put the box — used to assert anchored/side placement
+    end-to-end through ``run_modal`` rather than re-deriving the geometry.
+    """
+    import re
+    m = re.search(r'\033\[(\d+);(\d+)H', text)
+    if m is None:
+        return None
+    return int(m.group(1)), int(m.group(2))
+
+
 # --- Fake browser ----------------------------------------------------------
 
 
@@ -1095,6 +1111,118 @@ class TestDelayInteraction(unittest.TestCase):
         self.assertIsNone(res)  # cancelled by the second esc
         self.assertEqual(reads['n'], 2)  # first esc was gated, not a cancel
         self.assertEqual(content.handled, [])  # esc never reaches content
+
+
+class TestContextMenuSideSlot(unittest.TestCase):
+    """``_measure_frame`` decides / stores / reuses the per-chain menu side.
+
+    For an anchored placement the engine resolves the vertical SIDE through
+    ``browser._context_menu_side`` (#1041): unset → decide below-if-fits-else-
+    above from the measured frame height and STORE it; set → REUSE it so a
+    submenu opened later in the same chain stays on the side the first menu
+    picked, shifting (clamping) to fit rather than flipping. The slot is owned
+    by ``Browser._fire_context_menu`` (reset per chain, cleared after); here a
+    fake Browser stands in for it and is observed directly. ``run_modal``
+    paints the frame top-down, so the first cursor-move recovers its placement.
+    """
+
+    def _menu(self, browser, *, anchor, cols=80, rows=24, h=4):
+        """Open one anchored menu of content height ``h``; return its placed
+        ``(top, left)`` from the painted frame."""
+        content = _StubContent(title=None, w=20, h=h,
+                               key_handler={'enter': (True, None)})
+        with _FixedTermSize(cols, rows), _Capture() as cap:
+            run_modal(browser, content, placement='anchor', anchor=anchor,
+                      _read_key=_scripted(['enter']))
+        return _frame_top_left(cap.text)
+
+    def test_first_menu_that_fits_below_stores_below(self):
+        # Anchor high on the screen with room beneath: the engine decides
+        # 'below', stores it, and drops the box one row under the anchor.
+        b = _FakeBrowser()
+        b._context_menu_side = None
+        top, _left = self._menu(b, anchor=(5, 10), h=4)
+        self.assertEqual(b._context_menu_side, 'below')  # decided + stored
+        self.assertEqual(top, 6)                         # row + 1, below
+
+    def test_first_menu_near_bottom_stores_above(self):
+        # Anchor near the bottom: 'below' would overflow, so the first menu
+        # decides + stores 'above' and sits above the anchor row.
+        b = _FakeBrowser()
+        b._context_menu_side = None
+        # 80x24, content h=4 → frame h=6. Anchor at row 22: below = 23..28 >
+        # 24, so it flips above → top = 22 - 6 = 16.
+        top, _left = self._menu(b, anchor=(22, 10), h=4)
+        self.assertEqual(b._context_menu_side, 'above')
+        self.assertEqual(top, 16)
+
+    def test_tall_submenu_reuses_below_and_clamps_not_flips(self):
+        # THE end-to-end #1041 case. The chain's side is already 'below'
+        # (set by the first menu). A TALL submenu (content h=18 → frame
+        # h=20, so 20 rows on screen) dropped below row 5 would be 6..25 >
+        # 24. It must REUSE
+        # 'below' and CLAMP up (top = rows - h + 1 = 24 - 20 + 1 = 5),
+        # overlapping the subject row — NOT flip above (which would put top
+        # at 1). The stored side is unchanged by the reuse.
+        b = _FakeBrowser()
+        b._context_menu_side = 'below'           # chain already chose below
+        top, _left = self._menu(b, anchor=(5, 10), h=18)
+        self.assertEqual(b._context_menu_side, 'below')  # still below
+        self.assertEqual(top, 5)                 # clamped down to fit
+        self.assertNotEqual(top, 1)              # did NOT flip to the above pos
+
+    def test_submenu_reuses_above(self):
+        # Symmetric reuse: chain side 'above', a tall submenu near the top
+        # stays above-anchored and clamps to the top edge instead of flipping
+        # below.
+        b = _FakeBrowser()
+        b._context_menu_side = 'above'
+        # content h=16 → frame h=18. Anchor row 4: above = 4 - 18 = -14 →
+        # clamp to top 1. (Flipping below would be top = 5.)
+        top, _left = self._menu(b, anchor=(4, 10), h=16)
+        self.assertEqual(b._context_menu_side, 'above')
+        self.assertEqual(top, 1)
+        self.assertNotEqual(top, 5)
+
+    def test_fresh_anchored_placement_matches_legacy_decision(self):
+        # With the slot present-but-None the FIRST anchored menu reproduces
+        # today's below-if-fits-else-above rule — the stored side just records
+        # which way it went. Sweep the anchor row and assert the placement
+        # tracks the overflow predicate (asserting the rule, not a constant).
+        rows = 24
+        for row in (1, 5, 10, 17, 18, 22):
+            with self.subTest(row=row):
+                b = _FakeBrowser()
+                b._context_menu_side = None
+                top, _left = self._menu(b, anchor=(row, 10), rows=rows, h=4)
+                fh = 6  # content 4 + frame 2
+                if (row + 1) + fh - 1 <= rows:
+                    self.assertEqual(top, row + 1)
+                    self.assertEqual(b._context_menu_side, 'below')
+                else:
+                    self.assertEqual(top, max(1, row - fh))
+                    self.assertEqual(b._context_menu_side, 'above')
+
+    def test_browser_without_slot_decides_fresh_and_does_not_persist(self):
+        # A Browser lacking the slot (any non-context anchored use) must
+        # behave like "no preferred side" — decide fresh, never crash, and
+        # NOT grow the attribute (so nothing leaks a side onto it).
+        b = _FakeBrowser()
+        self.assertFalse(hasattr(b, '_context_menu_side'))
+        top, _left = self._menu(b, anchor=(5, 10), h=4)
+        self.assertEqual(top, 6)                         # fresh: below
+        self.assertFalse(hasattr(b, '_context_menu_side'))  # not persisted
+
+    def test_centered_placement_never_touches_slot(self):
+        # A centered dialog must not read or write the side slot.
+        b = _FakeBrowser()
+        b._context_menu_side = None
+        content = _StubContent(title=None, w=20, h=3,
+                               key_handler={'enter': (True, None)})
+        with _FixedTermSize(80, 24), _Capture():
+            run_modal(b, content, placement='center',
+                      _read_key=_scripted(['enter']))
+        self.assertIsNone(b._context_menu_side)          # untouched
 
 
 if __name__ == '__main__':
