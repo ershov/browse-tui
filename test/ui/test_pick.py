@@ -8,7 +8,7 @@ each test polls that file to confirm the picker returned the expected
 value.
 
 ``ctx.pick`` opens a centered modal dialog (ticket #975): the label
-renders in the box border (``┌─ Status ─…─┐``) and the filter prompt is
+renders in the box border (``╔═ Status ═…═╗``) and the filter prompt is
 a ``> {query}`` row, so the picker no longer shows the old info-bar
 ``Status>`` string. Tests detect "picker open" by an option line that
 isn't in the underlying UI (``in-progress``), and assert the chosen
@@ -209,11 +209,11 @@ class TestPickRedrawOnExit(unittest.TestCase):
         # cache-poison-restore signal.
         deadline = time.time() + 3.0
         cap = t.capture()
-        while time.time() < deadline and '┌' in cap:
+        while time.time() < deadline and '╔' in cap:
             time.sleep(0.03)
             cap = t.capture()
         # Dialog chrome must be gone: no box-border glyphs, no title.
-        for glyph in ('┌', '┐', '└', '┘', '│'):
+        for glyph in ('╔', '╗', '╚', '╝', '║'):
             self.assertNotIn(glyph, cap,
                              f'dialog border {glyph!r} left on screen:\n{cap}')
         self.assertNotIn('Status', cap,

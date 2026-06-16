@@ -302,7 +302,7 @@ class TestFrameDraw(unittest.TestCase):
         with _FixedTermSize(), _Capture() as cap:
             run_modal(b, content, _read_key=_scripted(['enter']))
         text = cap.text
-        for ch in ('┌', '┐', '└', '┘', '│', '─'):
+        for ch in ('╔', '╗', '╚', '╝', '║', '═'):
             self.assertIn(ch, text, f'missing border glyph {ch!r}')
         # Title shown, bold (set_style with bold emits the '1' SGR param).
         self.assertIn('Confirm', text)
@@ -318,9 +318,9 @@ class TestFrameDraw(unittest.TestCase):
         with _FixedTermSize(), _Capture() as cap:
             run_modal(b, content, _read_key=_scripted(['enter']))
         # Top border is a solid run between corners — at least one
-        # ``┌───`` style sequence with no title text injected.
-        self.assertIn('┌', cap.text)
-        self.assertIn('┐', cap.text)
+        # ``╔═══`` style sequence with no title text injected.
+        self.assertIn('╔', cap.text)
+        self.assertIn('╗', cap.text)
 
     def test_draw_row_called_with_inner_width(self):
         # content measures (10, 3) → inner_w = frame.width - 4 = 10.

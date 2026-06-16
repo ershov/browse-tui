@@ -14273,6 +14273,18 @@ def _modal_place(cols, rows, w, h, *, placement, anchor):
 # ---------------------------------------------------------------------------
 
 
+# Frame border glyphs (DOUBLE-line box-drawing) — centralized so a modal
+# reads visually distinct from the single-line pane splitters, and so the
+# style is one edit per glyph to change. Used by ``_draw_top_border``,
+# ``_draw_bottom_border``, and the side-border writes in ``_paint``.
+_BORDER_TL = '╔'   # top-left corner
+_BORDER_TR = '╗'   # top-right corner
+_BORDER_BL = '╚'   # bottom-left corner
+_BORDER_BR = '╝'   # bottom-right corner
+_BORDER_H = '═'    # horizontal run
+_BORDER_V = '║'    # vertical side
+
+
 # Restore marker planted into pane row caches on close (see ``run_modal``'s
 # restore step and the design's "Close and restore: cache poisoning"). It
 # contains NUL, which every content sanitizer strips, so no renderer can
@@ -14426,7 +14438,7 @@ def run_modal(browser, content, *, placement='center', anchor=None,
     def _paint(frame, content_h):
         """Paint the whole frame through the private cache, in one sync.
 
-        Composes every row — top border, content rows wrapped in ``│``
+        Composes every row — top border, content rows wrapped in ``║``
         borders + one column of inner padding, bottom border — to EXACTLY
         the frame width so no stale cell can bleed through ``end_row``'s
         pad math. ``update_rect`` runs exactly once per frame (the
@@ -14455,12 +14467,12 @@ def run_modal(browser, content, *, placement='center', anchor=None,
             elif rel == last:
                 _draw_bottom_border(frame.width)
             else:
-                # Interior row: engine draws ``│ `` … ` │``. ``content_row``
+                # Interior row: engine draws ``║ `` … ` ║``. ``content_row``
                 # is the 0-based index within the content area; rows the
                 # content doesn't cover are blank-filled to the inner width.
                 content_row = rel - 1
                 set_style(fg=8)
-                write('│')
+                write(_BORDER_V)
                 reset_style()
                 write(' ')
                 if content_row < content_h:
@@ -14469,7 +14481,7 @@ def run_modal(browser, content, *, placement='center', anchor=None,
                     write(' ' * inner_w)
                 write(' ')
                 set_style(fg=8)
-                write('│')
+                write(_BORDER_V)
                 reset_style()
             end_row()
         end_sync()
@@ -14623,26 +14635,26 @@ def run_modal(browser, content, *, placement='center', anchor=None,
 
 
 def _draw_top_border(title, width):
-    """Emit the top border row ``┌─ {title} ─…─┐`` to exactly ``width`` cells.
+    """Emit the top border row ``╔═ {title} ═…═╗`` to exactly ``width`` cells.
 
-    With no title it's a solid ``┌──…──┐`` run. The box-drawing chars use
+    With no title it's a solid ``╔══…══╗`` run. The box-drawing chars use
     the dim/gray separator chrome (palette index 8, matching
     ``render_separator``); the title renders bold in the default fg so it
     reads clearly against the dim frame. Must fill the full frame width so
     ``end_row``'s pad math leaves no stale cells.
     """
     set_style(fg=8)
-    write('┌')
+    write(_BORDER_TL)
     if title:
-        # ``┌─ title ─…─┐``: leading ``─ ``, the bold title, a trailing
+        # ``╔═ title ═…═╗``: leading ``═ ``, the bold title, a trailing
         # `` `` then dashes filling the remainder before the corner.
-        # Account for the four corner/space cells (``┌``, ``─``, two
-        # spaces) plus the closing ``┐`` and its leading ``─``.
-        write('─ ')
+        # Account for the four corner/space cells (``╔``, ``═``, two
+        # spaces) plus the closing ``╗`` and its leading ``═``.
+        write(_BORDER_H + ' ')
         reset_style()
         set_style(bold=True)
         # Clip an over-long title to whatever space the frame leaves between
-        # the fixed ``┌─ `` prefix (3 cells) and the `` ─┐`` suffix (minimum
+        # the fixed ``╔═ `` prefix (3 cells) and the `` ═╗`` suffix (minimum
         # 3 cells: a space, one dash, the corner). ``_truncate_by_cells``
         # clips by *cells* (wide-char aware) and is a no-op when it already
         # fits — a plain ``title[:avail]`` slice would emit up to 2×avail
@@ -14656,22 +14668,22 @@ def _draw_top_border(title, width):
         write(' ')
         # Fill the gap to the closing corner with dashes (using the exact
         # cell count, which may differ from ``len(shown)`` for wide glyphs).
-        used = 3 + shown_cells + 1  # ``┌─ `` + title + trailing space
-        dashes = max(0, width - used - 1)   # -1 for the closing ``┐``
-        write('─' * dashes)
-        write('┐')
+        used = 3 + shown_cells + 1  # ``╔═ `` + title + trailing space
+        dashes = max(0, width - used - 1)   # -1 for the closing ``╗``
+        write(_BORDER_H * dashes)
+        write(_BORDER_TR)
     else:
-        write('─' * max(0, width - 2))
-        write('┐')
+        write(_BORDER_H * max(0, width - 2))
+        write(_BORDER_TR)
     reset_style()
 
 
 def _draw_bottom_border(width):
-    """Emit the bottom border row ``└──…──┘`` to exactly ``width`` cells."""
+    """Emit the bottom border row ``╚══…══╝`` to exactly ``width`` cells."""
     set_style(fg=8)
-    write('└')
-    write('─' * max(0, width - 2))
-    write('┘')
+    write(_BORDER_BL)
+    write(_BORDER_H * max(0, width - 2))
+    write(_BORDER_BR)
     reset_style()
 
 
