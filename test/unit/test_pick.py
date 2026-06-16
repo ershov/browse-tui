@@ -55,6 +55,7 @@ _render.reset_style = _term.reset_style
 _modal.Rect = _render.Rect
 _modal.PaneCache = _state.PaneCache
 _modal.write = _term.write
+_modal.move = _term.move
 _modal.set_style = _term.set_style
 _modal.reset_style = _term.reset_style
 _modal.read_key = _term.read_key

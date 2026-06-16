@@ -14195,12 +14195,17 @@ _MODAL_MIN_ROWS = 8
 def _modal_caps(cols, rows):
     """Maximum content size a dialog may request, given the screen.
 
-    Width is capped at 80% of the screen; height leaves four rows of
-    breathing room (so the frame's two border rows never crowd the
-    screen edges). The content's ``measure`` is handed these caps and
-    must not exceed them. Returns ``(max_w, max_h)`` in content cells.
+    Width is capped at 80% of the screen, minus the two outer margin
+    columns the frame reserves (one blank cell just outside each vertical
+    border — see :func:`_paint`); this keeps the box PLUS its margins
+    within 80% and, in the non-tiny regime, guarantees the frame is at
+    most ``cols - 2`` wide so both margins land on-screen. Height leaves
+    four rows of breathing room (so the frame's two border rows never
+    crowd the screen edges). The content's ``measure`` is handed these
+    caps and must not exceed them. Returns ``(max_w, max_h)`` in content
+    cells.
     """
-    return int(0.8 * cols), rows - 4
+    return int(0.8 * cols) - 2, rows - 4
 
 
 def _frame_size(content_w, content_h):
@@ -14239,7 +14244,16 @@ def _modal_place(cols, rows, w, h, *, placement, anchor):
     ``(row + 1, col)``, so the anchor row stays visible. If the frame
     would overflow the bottom edge it flips above the anchor; if it would
     overflow the right edge it shifts left. Both axes are then clamped so
-    the frame stays on-screen (top/left ≥ 1, fully visible where it fits).
+    the frame stays on-screen (top ≥ 1, fully visible where it fits).
+
+    The horizontal clamp also reserves one blank column just outside each
+    vertical border for the #1043 outer margin: when the frame is narrow
+    enough to leave room (``w <= cols - 2``) the box columns are kept
+    within ``[2, cols - 1]`` (so column 1 holds the left margin and column
+    ``cols`` the right). A frame that already spans the screen width
+    (``w > cols - 2``, including the tiny full-screen fallback) has no room
+    for margins and falls back to the plain on-screen clamp (left ≥ 1);
+    :func:`_paint` then omits the margins that would land off-screen.
     """
     if _modal_is_tiny(cols, rows):
         return Rect(1, 1, cols + 1, rows + 1)
@@ -14260,9 +14274,18 @@ def _modal_place(cols, rows, w, h, *, placement, anchor):
         top = 1 + (rows - h) // 2
 
     # Clamp onto the screen: keep the frame fully visible where it fits
-    # (right/bottom not past the edge), then guarantee top/left ≥ 1. The
-    # second step wins when the frame is larger than the screen.
-    left = max(1, min(left, cols - w + 1))
+    # (right/bottom not past the edge), then guarantee top/left in range.
+    # The second step wins when the frame is larger than the screen.
+    #
+    # Horizontally, reserve the #1043 outer-margin columns when the frame
+    # is narrow enough (``w <= cols - 2``): keep the box within
+    # ``[2, cols - w]`` so column 1 / column ``cols`` stay free for the
+    # margins. Otherwise the frame spans the screen width and there's no
+    # room — fall back to the plain ``[1, cols - w + 1]`` clamp.
+    if w <= cols - 2:
+        left = max(2, min(left, cols - w))
+    else:
+        left = max(1, min(left, cols - w + 1))
     top = max(1, min(top, rows - h + 1))
 
     return Rect(left, top, left + w, top + h)
@@ -14451,12 +14474,22 @@ def run_modal(browser, content, *, placement='center', anchor=None,
         frame on a tiny terminal whose interior outsizes the content — are
         blank-filled here. Without this the loop would ask the content for
         out-of-range rows and a list-backed content would ``IndexError``.
+
+        After the frame rows, one blank-space margin column is overdrawn
+        just OUTSIDE each vertical border (#1043: column ``frame.left - 1``
+        and column ``frame.right``) for every painted row, so the box never
+        visually abuts the content behind it. Each side is painted only
+        when its column is on-screen; a frame at the screen edge (the tiny
+        full-screen fallback) simply omits the side(s) with no room. These
+        columns are direct writes (no row capture) inside the same sync;
+        the close-time restore widens its poisoned region to cover them.
         """
         inner_w = frame.width - 4  # minus left/right border + 1-col pad each
         left = frame.left
         right = frame.right
         rightmost = False  # the frame never owns the screen's right edge
         last = frame.height - 1
+        cols, _rows = term_size()
         begin_sync()
         cache.update_rect(frame)
         for rel in range(frame.height):
@@ -14484,6 +14517,28 @@ def run_modal(browser, content, *, placement='center', anchor=None,
                 write(_BORDER_V)
                 reset_style()
             end_row()
+        # Outer margin (#1043): one blank cell just outside each vertical
+        # border, on every painted row. Direct writes (the row capture is
+        # closed) into the open sync; a plain space over the background
+        # opens a clean 1-col gap. Each side is painted only when on-screen
+        # — column ``left - 1`` needs ``left >= 2``, column ``right`` needs
+        # ``right <= cols`` — so a frame flush against an edge (tiny
+        # full-screen fallback) drops that side's margin without overrunning.
+        lm = left - 1
+        rm = right            # box owns columns ``left..right-1``; ``right`` is just past it
+        paint_lm = lm >= 1
+        paint_rm = rm <= cols
+        if paint_lm or paint_rm:
+            for rel in range(frame.height):
+                abs_row = frame.top + rel
+                if paint_lm:
+                    move(abs_row, lm)
+                    reset_style()
+                    write(' ')
+                if paint_rm:
+                    move(abs_row, rm)
+                    reset_style()
+                    write(' ')
         end_sync()
         flush()
 
@@ -14603,6 +14658,17 @@ def run_modal(browser, content, *, placement='center', anchor=None,
         # cell the dialog touched; untouched rows cache-hit and emit
         # nothing.
         #
+        # The dialog's painted footprint is one column WIDER than the frame
+        # on each side: the #1043 outer margin overdraws column
+        # ``frame.left - 1`` and column ``frame.right``. Poison against that
+        # widened rect, not the bare frame — a pane that abuts a margin
+        # column without overlapping the frame proper (e.g. a left pane
+        # split exactly at ``frame.left``) would otherwise keep a stale
+        # blank there. Poisoning that pane repaints its whole row, clearing
+        # the margin cell. ``frame`` may be ``None`` (first measure raised),
+        # so only widen a real ``Rect``; the loop's ``_rects_intersect``
+        # still no-ops a ``None``.
+        #
         # After a resize-while-open the caches were CLEARED, so the poison
         # loop is a no-op over empty caches — and the next ``render_full``
         # rebuilds them fresh, taking ``end_row``'s ``prev_rect is None``
@@ -14619,8 +14685,12 @@ def run_modal(browser, content, *, placement='center', anchor=None,
             end_sync()
             flush()
         else:
+            restore_rect = frame
+            if isinstance(frame, Rect):
+                restore_rect = Rect(max(1, frame.left - 1), frame.top,
+                                    frame.right + 1, frame.bottom)
             for pane in browser._pane_cache.values():
-                overlap = _rects_intersect(pane.rect, frame)
+                overlap = _rects_intersect(pane.rect, restore_rect)
                 if overlap is None:
                     continue
                 pane_width = pane.rect.width

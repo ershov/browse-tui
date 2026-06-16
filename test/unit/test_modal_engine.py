@@ -48,6 +48,7 @@ _modal.flush = _term.flush
 _modal.set_style = _term.set_style
 _modal.reset_style = _term.reset_style
 _modal.write = _term.write
+_modal.move = _term.move
 _modal.read_key = _term.read_key
 _modal.term_size = _term.term_size
 # Delay-interaction defaults (ticket #971): the engine reads ``time`` and
@@ -577,6 +578,119 @@ class TestRestorePoison(unittest.TestCase):
         with _FixedTermSize(), _Capture():
             run_modal(b, content, _read_key=_scripted(['enter']))
         self.assertFalse(b._modal_open)
+
+
+class TestOuterMargin(unittest.TestCase):
+    """#1043: a blank-space column just outside each vertical border.
+
+    A centered frame at 80x24 with content (20, 2) measures to a 24-wide,
+    4-tall box at left=29 (cols 29..52), rows 11..14. The left margin
+    column is 28, the right is 53 (just past the box). Each painted row
+    overdraws a single blank space in those two columns.
+    """
+
+    # Frame geometry for content (20, 2) on an 80x24 screen, derived the
+    # same way the engine does (caps clamp 20 well under, +4 frame, center).
+    BOX_LEFT = 29
+    BOX_RIGHT = 53          # exclusive — box owns cols 29..52
+    TOP = 11
+    BOTTOM = 15             # exclusive — rows 11..14
+    LM = BOX_LEFT - 1       # 28
+    RM = BOX_RIGHT          # 53
+
+    def _run(self, browser=None):
+        b = browser or _FakeBrowser()
+        content = _StubContent(title='Confirm', w=20, h=2,
+                               key_handler={'enter': (True, 'OK')})
+        with _FixedTermSize(80, 24), _Capture() as cap:
+            run_modal(b, content, _read_key=_scripted(['enter']))
+        return b, cap.text
+
+    def test_margin_columns_painted_blank_each_row(self):
+        # Every painted row gets a reset + single space at the left margin
+        # (col 28) and the right margin (col 53). ``move`` emits
+        # ``\e[<row>;<col>H``; the margin then writes ``\e[0m`` + ' '.
+        _b, text = self._run()
+        for abs_row in range(self.TOP, self.BOTTOM):
+            self.assertIn(f'\033[{abs_row};{self.LM}H\033[0m ', text,
+                          f'left margin not blank at row {abs_row}')
+            self.assertIn(f'\033[{abs_row};{self.RM}H\033[0m ', text,
+                          f'right margin not blank at row {abs_row}')
+
+    def test_margins_inside_the_open_sync(self):
+        # The margins are part of the single synchronized paint — they land
+        # between the sync open and close, not after the frame flushed.
+        _b, text = self._run()
+        open_i = text.index('\033[?2026h')
+        close_i = text.rindex('\033[?2026l')
+        margin_i = text.index(f'\033[{self.TOP};{self.LM}H\033[0m ')
+        self.assertTrue(open_i < margin_i < close_i)
+
+    def test_margin_columns_outside_the_box(self):
+        # The margins must NOT be inside the box: no margin write targets a
+        # box column (29..52). They sit strictly at 28 and 53.
+        _b, text = self._run()
+        for col in range(self.BOX_LEFT, self.BOX_RIGHT):
+            self.assertNotIn(f'\033[{self.TOP};{col}H\033[0m ', text,
+                             f'a margin landed inside the box at col {col}')
+
+    def test_close_poisons_pane_holding_the_left_margin(self):
+        # A pane split EXACTLY at the box's left edge (cols 1..28) does not
+        # overlap the frame proper, but it OWNS the left-margin column (28).
+        # The close-time restore widens its poisoned region by one column
+        # per side, so this pane IS poisoned — without that widening the
+        # blank margin cell it overdrew would survive on close.
+        b = _FakeBrowser()
+        left_pane = Rect(1, 1, self.BOX_LEFT, 25)   # cols 1..28
+        cache = PaneCache()
+        cache.invalidate(left_pane)
+        cache.lines = [(left_pane.width, 'old') for _ in range(left_pane.height)]
+        cache.prev_rect = left_pane
+        b._pane_cache['left'] = cache
+        self._run(b)
+        poisoned = [i for i, ln in enumerate(cache.lines)
+                    if ln == (left_pane.width, _modal._MODAL_POISON)]
+        self.assertTrue(
+            poisoned,
+            'pane owning the left-margin column was not poisoned — its '
+            'blank margin cell would leak on close')
+        # The poisoned rows are exactly the box's row span (11..14 -> rel
+        # 10..13 in this top=1 pane).
+        self.assertEqual(poisoned, list(range(self.TOP - 1, self.BOTTOM - 1)))
+
+    def test_close_poisons_pane_holding_the_right_margin(self):
+        # Symmetric: a pane starting just past the box (col 53) owns the
+        # right-margin column and must be poisoned by the widened restore.
+        b = _FakeBrowser()
+        right_pane = Rect(self.BOX_RIGHT, 1, 81, 25)   # cols 53..80
+        cache = PaneCache()
+        cache.invalidate(right_pane)
+        cache.lines = [(right_pane.width, 'old')
+                       for _ in range(right_pane.height)]
+        cache.prev_rect = right_pane
+        b._pane_cache['right'] = cache
+        self._run(b)
+        poisoned = [i for i, ln in enumerate(cache.lines)
+                    if ln == (right_pane.width, _modal._MODAL_POISON)]
+        self.assertTrue(
+            poisoned,
+            'pane owning the right-margin column was not poisoned')
+
+    def test_tiny_full_screen_omits_margins(self):
+        # On a tiny terminal the frame spans the whole screen (cols 1..18),
+        # so both margin columns would fall off-screen (col 0 / col 19).
+        # The engine omits them — no off-screen move, no crash.
+        b = _FakeBrowser()
+        content = _ListBackedContent(title='T', rows_text=['aa', 'bb'],
+                                     key_handler={'enter': (True, None)})
+        with _FixedTermSize(18, 6), _Capture() as cap:
+            run_modal(b, content, _read_key=_scripted(['enter']))
+        text = cap.text
+        # No write addressed column 0 or column 19 (1 past the 18-col edge).
+        self.assertNotIn('\033[1;0H', text)
+        self.assertNotIn('\033[1;19H', text)
+        # And the frame still painted full-screen (sanity).
+        self.assertIn('\033[1;1H', text)
 
 
 class TestOpenFailure(unittest.TestCase):

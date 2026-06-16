@@ -34,15 +34,23 @@ _modal_place = _modal._modal_place
 
 
 class TestModalCaps(unittest.TestCase):
-    """``_modal_caps`` — 80% width, rows-4 height."""
+    """``_modal_caps`` — 80% width minus the two outer-margin columns,
+    rows-4 height."""
 
     def test_basic_80x24(self):
-        self.assertEqual(_modal_caps(80, 24), (64, 20))
+        # 0.8 * 80 = 64, minus the 2 reserved outer-margin columns -> 62.
+        self.assertEqual(_modal_caps(80, 24), (62, 20))
 
     def test_width_floors_fractional(self):
-        # 0.8 * 100 = 80.0; 0.8 * 99 = 79.2 -> floored to 79.
-        self.assertEqual(_modal_caps(100, 30), (80, 26))
-        self.assertEqual(_modal_caps(99, 30), (79, 26))
+        # 0.8 * 100 = 80.0 -> 78 after the -2 margin reserve; 0.8 * 99 =
+        # 79.2 -> floored to 79 -> 77 after the reserve.
+        self.assertEqual(_modal_caps(100, 30), (78, 26))
+        self.assertEqual(_modal_caps(99, 30), (77, 26))
+
+    def test_width_reserves_two_margin_columns(self):
+        # The cap is exactly two less than the bare 80% width — the room
+        # for the left + right outer-margin columns (#1043).
+        self.assertEqual(_modal_caps(80, 24)[0], int(0.8 * 80) - 2)
 
     def test_height_is_rows_minus_four(self):
         self.assertEqual(_modal_caps(80, 50)[1], 46)
@@ -145,10 +153,12 @@ class TestPlaceAnchor(unittest.TestCase):
 
     def test_shift_left_when_right_overflows(self):
         # Anchor at col 70 with a 20-wide frame: left=70 occupies 70..89 >
-        # 80. Shift left so the right edge fits: left = 80 - 20 + 1 = 61.
+        # 80. Shift left so the right edge fits AND column 80 stays free
+        # for the right outer margin (#1043): left = 80 - 20 = 60, so the
+        # box occupies 60..79 and the margin lands in column 80.
         r = _modal_place(80, 24, 20, 6, placement='anchor', anchor=(5, 70))
-        self.assertEqual(r.left, 61)
-        self.assertEqual(r.right, 81)
+        self.assertEqual(r.left, 60)
+        self.assertEqual(r.right, 80)
 
     def test_clamp_left_to_one(self):
         # Anchor at col 1 is fine (left=1); a frame wider than the screen
@@ -164,16 +174,75 @@ class TestPlaceAnchor(unittest.TestCase):
         self.assertEqual(r.top, 1)
 
     def test_anchor_top_left_corner(self):
-        # Anchor at (1, 1): below the anchor row -> top-left (2, 1).
+        # Anchor at (1, 1): below the anchor row -> top (2). The left edge
+        # is clamped to column 2 so column 1 stays free for the left outer
+        # margin (#1043), giving top-left (2, 2).
         r = _modal_place(80, 24, 20, 6, placement='anchor', anchor=(1, 1))
-        self.assertEqual(r, Rect(1, 2, 21, 8))
+        self.assertEqual(r, Rect(2, 2, 22, 8))
 
     def test_flip_and_shift_together(self):
         # Bottom-right corner anchor forces BOTH a flip-above and a
-        # shift-left.
+        # shift-left; the shift also reserves the right margin column, so
+        # left lands at 60 (box 60..79, margin in column 80).
         r = _modal_place(80, 24, 20, 6, placement='anchor', anchor=(22, 70))
-        self.assertEqual(r.left, 61)   # shifted left
+        self.assertEqual(r.left, 60)   # shifted left (margin column reserved)
         self.assertEqual(r.top, 16)    # flipped above
+
+
+# --- Outer-margin room (#1043) -------------------------------------------
+
+
+class TestPlaceMarginRoom(unittest.TestCase):
+    """The geometry reserves the #1043 outer-margin columns.
+
+    For any frame sized through ``_modal_caps`` on a non-tiny screen the
+    frame width is at most ``cols - 2``, and ``_modal_place`` then keeps
+    ``frame.left >= 2`` and ``frame.right <= cols`` — so column
+    ``frame.left - 1`` and column ``frame.right`` (the margins) are both
+    on-screen. Checked across screen sizes and both placements, with the
+    frame pinned at the width cap (the binding case).
+    """
+
+    def _frame_at_cap(self, cols, rows):
+        """Frame ``Rect`` for a content area pinned at the width cap."""
+        max_w, _max_h = _modal_caps(cols, rows)
+        fw, fh = _frame_size(max_w, 4)
+        return fw, fh
+
+    def test_capped_frame_fits_with_margins_centered(self):
+        for cols in (20, 21, 40, 80, 81, 120, 200):
+            with self.subTest(cols=cols):
+                fw, fh = self._frame_at_cap(cols, 24)
+                self.assertLessEqual(fw, cols - 2)
+                r = _modal_place(cols, 24, fw, fh,
+                                 placement='center', anchor=None)
+                self.assertGreaterEqual(r.left - 1, 1)   # left margin on-screen
+                self.assertLessEqual(r.right, cols)      # right margin on-screen
+
+    def test_capped_frame_fits_with_margins_anchored(self):
+        # Anchored at a far-right / bottom cell still leaves both margin
+        # columns on-screen (the clamp reserves them).
+        for cols in (20, 40, 80, 120):
+            with self.subTest(cols=cols):
+                fw, fh = self._frame_at_cap(cols, 24)
+                r = _modal_place(cols, 24, fw, fh,
+                                 placement='anchor', anchor=(20, cols))
+                self.assertGreaterEqual(r.left - 1, 1)
+                self.assertLessEqual(r.right, cols)
+
+    def test_narrow_frame_keeps_left_margin_column(self):
+        # Even a tiny frame on a roomy screen never sits in column 1 —
+        # column 1 is reserved for the left margin.
+        r = _modal_place(80, 24, 10, 5, placement='anchor', anchor=(3, 1))
+        self.assertGreaterEqual(r.left, 2)
+
+    def test_full_width_frame_omits_margins(self):
+        # A frame that spans the screen width (w == cols) has no room for
+        # margins: the clamp falls back to left >= 1 (column 1), so the box
+        # keeps the screen edge and _paint omits that side's margin.
+        r = _modal_place(40, 24, 40, 6, placement='center', anchor=None)
+        self.assertEqual(r.left, 1)
+        self.assertEqual(r.right, 41)   # right edge at the screen edge
 
 
 # --- Tiny terminal -> full screen ----------------------------------------
