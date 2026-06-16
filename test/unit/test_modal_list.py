@@ -891,28 +891,37 @@ class TestMenuCloseGesture(unittest.TestCase):
         self.assertEqual(res, 'Rename')
 
 
-class TestPickNoCloseGesture(unittest.TestCase):
-    """Regression: ``ctx.pick`` (``modal_pick``, ``filter=True``) does NOT opt
-    into the menu close gestures — ``\\`` stays a valid filter character."""
+class TestPickCloseGesture(unittest.TestCase):
+    """``ctx.pick`` (``modal_pick``, ``filter=True``) is dismissed by the
+    context-menu trigger (#1063) — but RESPECTING text entry: F1 and right-click
+    (never text) cancel, while ``\\`` stays a literal filter character (it must
+    NOT close, since the filter row is text)."""
 
     def test_backslash_extends_filter_not_close(self):
         # Items chosen so a '\' in the query filters to exactly one, which
-        # 'enter' then selects — proving '\' extended the filter (the menu
-        # would have closed to None instead).
+        # 'enter' then selects — proving '\' extended the filter (a close
+        # would have returned None instead). This is the text-respect case.
         b = _FakeBrowser()
         with _FixedTermSize(80, 24), _Capture():
             res = modal_pick(b, 'Pick', ['a/b', r'a\b', 'cc'],
                              _read_key=_scripted(['\\', 'enter']))
         self.assertEqual(res, r'a\b')
 
-    def test_right_click_swallowed_not_close(self):
-        # A right-click in a pick is swallowed (not a close); enter still
-        # selects the focused option.
+    def test_f1_closes_pick(self):
+        # F1 is never text → it cancels the pick (returns None) before content.
         b = _FakeBrowser()
         with _FixedTermSize(80, 24), _Capture():
             res = modal_pick(b, 'Pick', ['one', 'two'],
-                             _read_key=_scripted(['right-click:9:9', 'enter']))
-        self.assertEqual(res, 'one')
+                             _read_key=_scripted(['f1']))
+        self.assertIsNone(res)
+
+    def test_right_click_closes_pick(self):
+        # A right-click is never text → it cancels the pick (returns None).
+        b = _FakeBrowser()
+        with _FixedTermSize(80, 24), _Capture():
+            res = modal_pick(b, 'Pick', ['one', 'two'],
+                             _read_key=_scripted(['right-click:9:9']))
+        self.assertIsNone(res)
 
 
 if __name__ == '__main__':

@@ -1553,6 +1553,16 @@ class InputContent:
 # dialogs live HERE (return ``None`` without opening), so ``ctx`` and any
 # other caller get the no-open behavior uniformly. ``delay_interaction`` and
 # the ``_read_key`` test seam are threaded straight through.
+#
+# The context-menu trigger gesture dismisses ANY open modal (#1063), but text
+# entry is respected. Every wrapper passes ``cancel_on_right_click=True`` (a
+# right-click and F1 are never text), so right-click / F1 close any dialog. The
+# ``\`` key is the split: in the NON-text modals (menu / confirm / alert) it is
+# a close gesture too — those pass the full ``CONTEXT_MENU_TRIGGER_KEYS``
+# (``{'\\', 'f1'}``) — but in ``pick`` (the filter row) and ``input`` (the
+# field) ``\`` is a literal character, so those pass only ``F1_CANCEL_KEYS``
+# (F1 alone), leaving ``\`` to reach the content.
+F1_CANCEL_KEYS = frozenset({'f1'})
 
 
 def modal_pick(browser, label, options, *, delay_interaction=False,
@@ -1564,13 +1574,18 @@ def modal_pick(browser, label, options, *, delay_interaction=False,
     matches the display and the dialog returns the chosen option's VALUE (the
     tuple's value, or the string itself for a bare option). Returns ``None`` on
     cancel. An empty ``options`` returns ``None`` WITHOUT opening a dialog.
+
+    F1 and right-click dismiss the dialog (#1063); ``\\`` is NOT a cancel here —
+    it is a literal filter character — so only ``F1_CANCEL_KEYS`` is passed.
     """
     options = list(options)
     if not options:
         return None
     content = ListContent(options, filter=True, title=label)
     return run_modal(browser, content, placement='center',
-                     delay_interaction=delay_interaction, _read_key=_read_key)
+                     delay_interaction=delay_interaction,
+                     cancel_keys=F1_CANCEL_KEYS, cancel_on_right_click=True,
+                     _read_key=_read_key)
 
 
 def modal_menu(browser, items, *, anchor=None, bounds=None,
@@ -1615,10 +1630,16 @@ def modal_confirm(browser, message, buttons=('&Yes', '&No'), *, title=None,
     bare string (``'Yes'`` / ``'No'`` / …). Returns ``None`` on cancel. An
     empty ``buttons`` raises ``ValueError`` (a programming error — surfaced by
     :class:`ChoiceContent`).
+
+    The context-menu trigger dismisses it (#1063): ``\\`` / F1 / right-click all
+    cancel (a confirm has no text entry, so ``\\`` is a close gesture) — it
+    passes the full ``CONTEXT_MENU_TRIGGER_KEYS`` plus right-click.
     """
     content = ChoiceContent(message, buttons, title=title)
     return run_modal(browser, content, placement='center',
-                     delay_interaction=delay_interaction, _read_key=_read_key)
+                     delay_interaction=delay_interaction,
+                     cancel_keys=CONTEXT_MENU_TRIGGER_KEYS,
+                     cancel_on_right_click=True, _read_key=_read_key)
 
 
 def modal_input(browser, prompt, *, default='', delay_interaction=False,
@@ -1627,10 +1648,16 @@ def modal_input(browser, prompt, *, default='', delay_interaction=False,
 
     ``default`` pre-fills the field. Returns the entered string (possibly
     empty), or ``None`` on cancel.
+
+    F1 and right-click dismiss the dialog (#1063); ``\\`` is NOT a cancel here —
+    it is a literal character typed into the field — so only ``F1_CANCEL_KEYS``
+    is passed.
     """
     content = InputContent(prompt, default=default)
     return run_modal(browser, content, placement='center',
-                     delay_interaction=delay_interaction, _read_key=_read_key)
+                     delay_interaction=delay_interaction,
+                     cancel_keys=F1_CANCEL_KEYS, cancel_on_right_click=True,
+                     _read_key=_read_key)
 
 
 def modal_alert(browser, text, *, title=None, delay_interaction=False,
@@ -1639,8 +1666,14 @@ def modal_alert(browser, text, *, title=None, delay_interaction=False,
 
     Always returns ``None``: the activation result (the ``'OK'`` label) is
     discarded since an alert conveys nothing back to the caller.
+
+    The context-menu trigger dismisses it (#1063): ``\\`` / F1 / right-click all
+    cancel (an alert has no text entry, so ``\\`` is a close gesture) — it
+    passes the full ``CONTEXT_MENU_TRIGGER_KEYS`` plus right-click.
     """
     content = ChoiceContent(text, ('&OK',), title=title)
     run_modal(browser, content, placement='center',
-              delay_interaction=delay_interaction, _read_key=_read_key)
+              delay_interaction=delay_interaction,
+              cancel_keys=CONTEXT_MENU_TRIGGER_KEYS,
+              cancel_on_right_click=True, _read_key=_read_key)
     return None
