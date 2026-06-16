@@ -692,7 +692,13 @@ _CWD_RE = re.compile(rb'"cwd"\s*:\s*"([^"]*)"')
 
 
 def _session_cwds(session_jsonl_path):
-    """Return the set of distinct ``cwd`` strings recorded in a session.
+    """Return the distinct ``cwd`` strings recorded in a session, first-seen order.
+
+    A session can span several working directories over its life (it starts in
+    one repo, then enters a git worktree, …); each is recorded verbatim in the
+    records' ``cwd`` field. We return them de-duplicated in the order they first
+    appear, so callers that surface them (e.g. the context-menu directory
+    cluster) list the primary cwd first.
 
     Cheap single-pass regex over the raw bytes (no JSON parse). Cached by
     ``(path, size, mtime)`` so we read each session file at most once per
@@ -701,21 +707,25 @@ def _session_cwds(session_jsonl_path):
     try:
         st = os.stat(session_jsonl_path)
     except OSError:
-        return set()
+        return []
     key = (session_jsonl_path, st.st_size, st.st_mtime)
     cached = _SESSION_CWDS_CACHE.get(key)
     if cached is not None:
         return cached
-    cwds = set()
+    cwds = []
+    seen = set()
     try:
         with open(session_jsonl_path, 'rb') as f:
             for m in _CWD_RE.finditer(f.read()):
                 try:
-                    cwds.add(m.group(1).decode('utf-8'))
+                    cwd = m.group(1).decode('utf-8')
                 except UnicodeDecodeError:
                     continue
+                if cwd not in seen:
+                    seen.add(cwd)
+                    cwds.append(cwd)
     except OSError:
-        cwds = set()
+        cwds = []
     _SESSION_CWDS_CACHE[key] = cwds
     return cwds
 
@@ -6304,81 +6314,103 @@ def _action_toggle_filter(ctx):
 # ``on_context_menu`` exceptions besides).
 #
 # The DIRECTORY cluster is the actions-first hierarchy described in the ticket.
-# A session/project/message row resolves up to three CONTEXT DIRS — the
-# project source dir, the session's recorded cwd, and the enclosing git
-# worktree — which usually coincide. They are deduped by ``os.path.realpath``
-# (``_dedup_dirs``); each Level-1 action is shown only if it applies to ≥1
-# deduped dir, and a Level-2 directory chooser appears only when >1 DISTINCT
-# dir qualifies for the chosen action. The action set is built once and shared
-# across the dirs (not duplicated per directory). See ``_dir_action_rows`` /
-# ``_run_dir_action``.
+# A session/project/message row resolves its CONTEXT DIRS — the project source
+# dir, every distinct working dir the session recorded (a session can span more
+# than one, e.g. when it enters a git worktree), and each one's enclosing git
+# work-tree root — which usually coincide. They are deduped by
+# ``os.path.realpath`` (``_dedup_dirs``); each Level-1 action is shown only if
+# it applies to ≥1 deduped dir, and a Level-2 directory chooser appears only
+# when >1 DISTINCT dir qualifies for the chosen action (so a session that
+# worked in two directories offers both). The action set is built once and
+# shared across the dirs (not duplicated per directory). See
+# ``_dir_action_rows`` / ``_run_dir_action``.
 
 
-# -- context dirs: project / cwd / worktree ---------------------------------
+# -- context dirs: project / cwd(s) / worktree ------------------------------
 
 
 def _cursor_context_dirs(item_id):
-    """``[(role, abspath), …]`` context dirs for ``item_id`` — project/cwd/worktree.
+    """``[(role, abspath), …]`` context dirs for ``item_id`` — project / cwd(s) / worktree.
 
-    A project / session / message / subagent row all anchor on the same
-    Claude project dir (a session row's project dir is its .jsonl's parent),
-    so the three dirs come from that one anchor, in role order:
+    A project / session / message / subagent row anchors on a Claude project
+    dir (a session row's project dir is its .jsonl's parent). A single session
+    can span SEVERAL working directories over its life (it starts in one repo,
+    then enters a git worktree, …) — each recorded in the records' ``cwd`` — so
+    we surface every distinct one, in role order:
 
-      * ``project``  — the Claude project's real source directory
-        (``_real_project_cwd``).
-      * ``cwd``      — the session's recorded working directory. For a Claude
-        project this is the same dir as ``project`` (the dir name IS one cwd's
-        encoding); both roles are surfaced so the chooser can label a single
-        dir by every role it fills, and dedup collapses them.
-      * ``worktree`` — the enclosing git work-tree root of ``cwd``
+      * ``project``   — the Claude project's real source directory
+        (``_real_project_cwd``), the canonical anchor.
+      * ``cwd``       — the session's PRIMARY recorded working directory (the
+        one that round-trips to the project dir name). For the common case this
+        is the same dir as ``project``; both roles are surfaced so the chooser
+        can label a single dir by every role it fills, and dedup collapses them.
+      * ``workspace`` — each ADDITIONAL distinct working directory the session
+        recorded (e.g. a git worktree it entered). This is the case the chooser
+        exists for: a session that genuinely worked in two directories offers
+        both.
+      * ``worktree``  — the enclosing git work-tree root of each cwd
         (``md_doc.find_git_root``; a ``.git`` *file* is how a worktree records
-        its gitdir, so this resolves worktree sessions too). Omitted when cwd
-        isn't under a git work tree, or when md_doc is unavailable.
+        its gitdir, so this resolves worktree sessions too). Omitted for a cwd
+        that isn't under a git work tree, or when md_doc is unavailable.
+
+    The session's cwds are read from its OWN .jsonl (``_session_cwds``) for a
+    session / message / subagent row, so a row resolves the dirs *that session*
+    touched. A ``project`` row has no single session, so it falls back to the
+    project-wide ``_real_project_cwd`` (one representative cwd) — unchanged.
 
     Returns raw (un-deduped) ``(role, abspath)`` pairs with falsy paths
-    dropped; ``_dedup_dirs`` collapses coincident roles by realpath. A
-    project / session / message row always resolves at least one dir (its
-    real cwd, or the decoded project dir as a fallback); a synthetic /
-    markdown / non-tuple cursor yields ``[]`` so the directory cluster is
-    simply omitted.
+    dropped; ``_dedup_dirs`` collapses coincident roles by realpath, so a
+    single-cwd session still yields ONE dir (no chooser). A project / session /
+    message row always resolves at least one dir (its real cwd, or the decoded
+    project dir as a fallback); a synthetic / markdown / non-tuple cursor
+    yields ``[]`` so the directory cluster is simply omitted.
     """
     if not isinstance(item_id, tuple) or not item_id:
         return []
     kind = item_id[0]
+    session_jsonl = None
     if kind == 'project':
         project_dir = item_id[1]
     elif kind in ('session', 'agent', 'msg', 'prompt', 'tool', 'span'):
         # A session/message/subagent row is keyed under its .jsonl, whose
         # containing dir is the Claude project dir.
-        project_dir = os.path.dirname(item_id[1])
+        session_jsonl = item_id[1]
+        project_dir = os.path.dirname(session_jsonl)
     else:
         return []
 
-    # cwd: the session's recorded working directory (read straight from the
-    # project dir's sessions — no md_doc dependency). project and cwd are the
-    # same directory for a Claude project (a project dir IS one cwd's encoding),
-    # so dedup collapses them; we surface both roles for the chooser labels.
-    # Fall back to the lossy name-decode when no session records a readable cwd
-    # (an empty/unreadable project dir) so the row still browses *something*.
-    cwd = _real_project_cwd(project_dir)
-    project = cwd or os.path.expanduser(
+    # project: the Claude project's canonical source dir. Read straight from
+    # the project dir's sessions (no md_doc dependency); fall back to the lossy
+    # name-decode when no session records a readable cwd (an empty/unreadable
+    # project dir) so the row still browses *something*.
+    project = _real_project_cwd(project_dir) or os.path.expanduser(
         _decode_project_path(os.path.basename(project_dir.rstrip('/'))))
 
-    # worktree: the enclosing git work-tree root of cwd. Guarded on md_doc
-    # (the only piece here that needs it) so the cluster still resolves
-    # project / cwd when the md_doc plugin failed to import.
-    worktree = None
-    if _md_doc is not None and cwd:
-        root = _md_doc.find_git_root(cwd)
-        if root:
-            worktree = root
+    # The session's recorded working dirs, first-seen order. For a session /
+    # message / subagent row read THIS session's .jsonl (the dirs that session
+    # touched); a project row has no single session, so use its primary cwd.
+    if session_jsonl is not None:
+        cwds = _session_cwds(session_jsonl)
+    else:
+        cwds = [project] if project else []
+    # The primary cwd (the one that round-trips to the project dir name) is the
+    # ``cwd`` role; any other distinct cwd is a ``workspace``. Lacking that the
+    # first recorded cwd is primary.
+    base = os.path.basename(project_dir.rstrip('/'))
+    primary = next((c for c in cwds if _encode_project_path(c) == base),
+                   cwds[0] if cwds else None)
 
-    out = []
-    for role, path in (('project', project), ('cwd', cwd),
-                       ('worktree', worktree)):
-        if path:
-            out.append((role, path))
-    return out
+    out = [('project', project)]
+    for cwd in cwds:
+        out.append(('cwd' if cwd == primary else 'workspace', cwd))
+        # worktree: the enclosing git work-tree root of this cwd. Guarded on
+        # md_doc (the only piece here that needs it) so the cluster still
+        # resolves project / cwd(s) when the md_doc plugin failed to import.
+        if _md_doc is not None:
+            root = _md_doc.find_git_root(cwd)
+            if root:
+                out.append(('worktree', root))
+    return [(role, path) for role, path in out if path]
 
 
 def _dedup_dirs(role_paths):

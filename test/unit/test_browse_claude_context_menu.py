@@ -529,6 +529,162 @@ class TestDirHierarchyRealFixture(unittest.TestCase):
 # ----- Level-2 chooser dispatch (filter + skip + launch) -------------------
 
 
+# ----- a session spanning TWO cwds (main repo + a worktree under it) -------
+
+
+class TestMultiCwdSession(unittest.TestCase):
+    """A session whose records span TWO distinct cwds surfaces BOTH dirs.
+
+    Mirrors a real browse-claude transcript: most records carry one ``cwd``
+    (a main git repo), a minority carry a second (a git worktree nested under
+    it). The directory cluster must surface BOTH distinct working directories
+    so the Level-2 chooser appears (>1 distinct dir qualifies) — the bug was
+    that the derivation collapsed the session to a single cwd, so the chooser
+    never appeared even though the session genuinely worked in two directories.
+
+    The fixture builds a real ``~/.claude/projects/<enc>/`` tree (HOME pointed
+    at a throwaway dir) plus a real git repo and a real worktree under it, so
+    the git-root walk (``md_doc.find_git_root``) resolves both — a worktree's
+    ``.git`` is a *file*, which the walk follows.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import shutil
+        cls.tmp = tempfile.mkdtemp()
+        cls.addClassCleanup(shutil.rmtree, cls.tmp, ignore_errors=True)
+        cls._orig_home = os.environ.get('HOME')
+        cls.addClassCleanup(cls._restore_home)
+
+        cls.home = os.path.join(cls.tmp, 'home')
+        os.makedirs(os.path.join(cls.home, '.claude', 'projects'))
+
+        env = {**os.environ, 'LC_ALL': 'C',
+               'GIT_AUTHOR_NAME': 'T', 'GIT_AUTHOR_EMAIL': 't@t',
+               'GIT_COMMITTER_NAME': 'T', 'GIT_COMMITTER_EMAIL': 't@t'}
+        # The main repo the session started in.
+        cls.main = os.path.join(cls.tmp, 'proj')
+        os.makedirs(cls.main)
+        with open(os.path.join(cls.main, 'a.txt'), 'w') as f:
+            f.write('a\n')
+        _git(cls.main, 'init', '-q', '-b', 'main', env=env)
+        _git(cls.main, 'add', '.', env=env)
+        _git(cls.main, 'commit', '-q', '-m', 'init', env=env)
+        # A real git worktree nested UNDER the main repo (the second cwd) —
+        # mirrors .claude/worktrees/<name>. Its ``.git`` is a file pointing at
+        # the main repo's gitdir, so find_git_root resolves it to itself.
+        cls.wt = os.path.join(cls.main, '.claude', 'worktrees', 'wt')
+        os.makedirs(os.path.dirname(cls.wt))
+        _git(cls.main, 'worktree', 'add', '-q', cls.wt, env=env)
+
+    @classmethod
+    def _restore_home(cls):
+        if cls._orig_home is None:
+            os.environ.pop('HOME', None)
+        else:
+            os.environ['HOME'] = cls._orig_home
+
+    def setUp(self):
+        self.r = _load_recipe()
+        os.environ['HOME'] = self.home
+        self.r.CLAUDE_ROOT = os.path.join(self.home, '.claude', 'projects')
+
+    def tearDown(self):
+        b = getattr(self, 'b', None)
+        if b is not None:
+            b.stop_workers()
+
+    def _make_two_cwd_session(self):
+        """Create a session .jsonl whose records carry TWO distinct cwds.
+
+        The project dir is encoded from the MAIN cwd (as Claude Code names it).
+        Most records carry the main cwd; a minority carry the worktree cwd —
+        the real transcript shape (majority/minority split, main seen first).
+        """
+        enc = self.r._encode_project_path(self.main)
+        projdir = os.path.join(self.home, '.claude', 'projects', enc)
+        os.makedirs(projdir, exist_ok=True)
+        sess = os.path.join(projdir, 'sess-multi.jsonl')
+        line = ('{"type":"user","cwd":"%s",'
+                '"message":{"role":"user","content":"hi"}}\n')
+        with open(sess, 'w') as f:
+            for _ in range(5):           # majority: the main repo
+                f.write(line % self.main)
+            for _ in range(2):           # minority: the worktree
+                f.write(line % self.wt)
+        return projdir, sess
+
+    def test_session_surfaces_both_distinct_dirs(self):
+        # The crux: a two-cwd session must yield TWO distinct deduped dirs, so
+        # the chooser would appear. (Pre-fix the derivation collapsed to one.)
+        _projdir, sess = self._make_two_cwd_session()
+        dirs = self.r._dedup_dirs(
+            self.r._cursor_context_dirs(('session', sess)))
+        reals = {os.path.realpath(p) for _roles, p in dirs}
+        self.assertEqual(
+            reals,
+            {os.path.realpath(self.main), os.path.realpath(self.wt)},
+            'both the main repo and the worktree must surface as context dirs')
+        self.assertEqual(len(dirs), 2,
+                         'two distinct working dirs → two chooser entries')
+
+    def test_message_cursor_surfaces_both_dirs(self):
+        # Same crux from a message row (resolves to the same session anchor):
+        # both dirs surface, driven through the real headless Browser cursor.
+        _projdir, sess = self._make_two_cwd_session()
+        self.b = _browser_with_item(
+            Item(id=('msg', sess, 0), title='hi', has_children=False))
+        item_id = Context(self.b).cursor.id
+        dirs = self.r._dedup_dirs(self.r._cursor_context_dirs(item_id))
+        reals = {os.path.realpath(p) for _roles, p in dirs}
+        self.assertIn(os.path.realpath(self.wt), reals)
+        self.assertIn(os.path.realpath(self.main), reals)
+
+    def test_two_cwd_session_opens_chooser_for_git_action(self):
+        # End-to-end: a git action over a two-(repo-)cwd session opens the
+        # Level-2 chooser listing BOTH dirs (both are git repos here).
+        _projdir, sess = self._make_two_cwd_session()
+        dirs = self.r._dedup_dirs(
+            self.r._cursor_context_dirs(('session', sess)))
+
+        class RecCtx:
+            def __init__(self):
+                self.menu_items = None
+                self.external = None
+
+            def menu(self, items, **kw):
+                self.menu_items = list(items)
+                return None  # cancel — we only assert the chooser content
+
+            def run_external(self, cmd, **kw):
+                self.external = cmd
+
+        ctx = RecCtx()
+        self.r._run_dir_action(ctx, 'dir.git.status', dirs)
+        self.assertIsNotNone(ctx.menu_items,
+                             'two repo dirs → chooser must open')
+        chooser_paths = {v for _lbl, v in ctx.menu_items}
+        self.assertEqual(
+            {os.path.realpath(p) for p in chooser_paths},
+            {os.path.realpath(self.main), os.path.realpath(self.wt)})
+
+    def test_single_cwd_session_still_one_dir_no_chooser(self):
+        # Regression guard: a single-cwd session still dedups to ONE dir (no
+        # chooser), unchanged by the multi-cwd broadening.
+        enc = self.r._encode_project_path(self.main)
+        projdir = os.path.join(self.home, '.claude', 'projects', enc)
+        os.makedirs(projdir, exist_ok=True)
+        sess = os.path.join(projdir, 'sess-single.jsonl')
+        with open(sess, 'w') as f:
+            f.write('{"type":"user","cwd":"%s",'
+                    '"message":{"role":"user","content":"hi"}}\n' % self.main)
+        dirs = self.r._dedup_dirs(
+            self.r._cursor_context_dirs(('session', sess)))
+        self.assertEqual(len(dirs), 1)
+        self.assertEqual(os.path.realpath(dirs[0][1]),
+                         os.path.realpath(self.main))
+
+
 class TestRunDirAction(unittest.TestCase):
     """``_run_dir_action`` filters dirs, skips the chooser when one qualifies.
 
