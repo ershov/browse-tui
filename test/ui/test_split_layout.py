@@ -290,17 +290,19 @@ class TestExplicitSplitOverrides(unittest.TestCase):
 
 
 class TestSplitCycle(unittest.TestCase):
-    """The ``\\`` key cycles split modes — ``h`` → some vertical mode."""
+    """Layout split keys swap modes — ``h`` → vertical via Alt-1.
 
-    def test_backslash_cycles_from_horizontal_to_vertical(self):
-        """At 80 cols (auto→h), pressing ``\\`` switches into a vertical mode.
+    Since #1061 the layout keys are Alt-1..4 (``\\`` permanently triggers
+    the context menu instead); Alt-1 jumps straight to the vertical mode.
+    """
 
-        Verifies the runtime cycle action (``actions._action_cycle_split``)
-        actually swaps the layout — independently of how the initial
-        split was resolved. We can't assert the *exact* next layout
-        without reading ``Browser.split`` directly, but we can assert
-        that the body acquires a ``│`` (which it can't have under
-        layout ``h``) once we trigger the cycle in a wide-enough pane.
+    def test_alt1_switches_from_horizontal_to_vertical(self):
+        """At startup ``h``, pressing Alt-1 switches into the vertical mode.
+
+        Verifies the runtime layout action actually swaps the layout —
+        independently of how the initial split was resolved. We assert the
+        body acquires a ``│`` (which it can't have under layout ``h``) once
+        Alt-1 lands us in vertical, in a wide-enough pane.
         """
         # 120 cols is wide enough for vertical to actually render
         # (it has the down-fall to 'h' if the pane is too narrow).
@@ -312,23 +314,13 @@ class TestSplitCycle(unittest.TestCase):
                 _has_vertical_separator(initial),
                 f'expected horizontal at startup; got:\n{initial}',
             )
-            # ``\\`` cycles h → v → m → pc → h. One press lands us in v.
-            t.send_literal_bytes('\\')
-            # Cycle eventually leads to a layout with a vertical sep —
-            # in the worst case we may need to press up to 3 times if a
-            # future change reorders the cycle. Bound retries.
-            seen_vertical = False
-            screen = ''
-            for _ in range(4):
-                screen = t.wait_stable(timeout=3.0)
-                if _has_vertical_separator(screen):
-                    seen_vertical = True
-                    break
-                t.send_literal_bytes('\\')
+            # Alt-1 jumps directly to the vertical layout.
+            t.send('M-1')
+            screen = t.wait_stable(timeout=3.0)
             self.assertTrue(
-                seen_vertical,
-                f'cycling \\ from h never produced a vertical layout; '
-                f'last screen:\n{screen}',
+                _has_vertical_separator(screen),
+                f'Alt-1 from h did not produce a vertical layout; '
+                f'screen:\n{screen}',
             )
 
 

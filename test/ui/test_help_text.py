@@ -309,13 +309,14 @@ class TestRecipeHelpFlag(unittest.TestCase):
             self.assertNotIn('CUSTOM ACTIONS', out.stdout)
 
 
-class TestHelpContextMenuAware(unittest.TestCase):
-    """Help reflects the \\/F1/right-click context-menu trigger (#1053).
+class TestHelpContextMenuKeys(unittest.TestCase):
+    """Help statically documents the \\/F1/right-click context-menu trigger.
 
-    When a recipe installs ``on_context_menu``, those gestures open the
-    menu in NORMAL mode (#1027/#1039), so the composed help must say so
-    and move the layout-cycle / help notes to their fallback keys. With
-    no handler (the bare CLI) the original labels are kept verbatim.
+    Since #1061 ``\\`` and F1 PERMANENTLY open the context menu (no longer
+    cycle-layout / toggle-help), so the STATIC help labels are correct
+    regardless of whether a recipe installs ``on_context_menu`` — there is
+    no conditional rewriting. Layout selection is documented on ``alt-1..4``
+    and help on ``?``.
     """
 
     def _menu_recipe(self, tmp):
@@ -334,36 +335,33 @@ class TestHelpContextMenuAware(unittest.TestCase):
             )
         return script
 
-    def test_help_with_context_menu_surfaces_menu_line(self):
+    def _assert_context_menu_help(self, out):
+        # \, F1 and right-click open the context menu.
+        self.assertIn('Open context menu (\\ / F1 / right-click)', out)
+        # Layout selection lives on alt-1..4 (direct jump, not a cycle).
+        self.assertIn('Select layout (v/h/m/pc)', out)
+        # Help lives on ?.
+        self.assertIn('Toggle help', out)
+
+    def test_help_with_context_menu_recipe_shows_menu_keys(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = subprocess.run(
                 [_BIN, '--run-py', self._menu_recipe(tmp), '--help'],
                 capture_output=True, text=True, timeout=5,
             )
             self.assertEqual(out.returncode, 0)
-            # \, F1 and right-click open the menu; esc / repeat closes it.
-            self.assertIn(
-                'Open context menu (\\ / F1 / right-click; esc or repeat closes)',
-                out.stdout)
-            self.assertIn('Open context menu (esc or repeat closes)', out.stdout)
-            # Layout-cycle moves to alt-1..4 (with \ as the fallback).
-            self.assertIn(
-                'Cycle layouts (v/h/m/pc) — \\ when no context menu',
-                out.stdout)
-            # Help stays on ? (with F1 as the fallback).
-            self.assertIn('Toggle help (F1 when no context menu)', out.stdout)
+            self._assert_context_menu_help(out.stdout)
 
-    def test_bare_help_shows_fallback_meanings_not_menu(self):
-        # No on_context_menu handler → original labels, no menu wording.
+    def test_bare_help_shows_same_menu_keys(self):
+        # No on_context_menu handler → SAME static labels (the trigger is
+        # permanent, so the help text does not depend on the hook).
         out = subprocess.run(
             [_BIN, '--help'],
             capture_output=True, text=True, timeout=5,
         ).stdout
-        self.assertIn(
-            '\\ / alt-1..4: cycle layouts (v/h/m/pc) or jump direct', out)
-        # F1 and ? both plainly toggle help; nothing about a context menu.
-        self.assertIn('Toggle help', out)
-        self.assertNotIn('context menu', out)
+        self._assert_context_menu_help(out)
+        # The old layout-cycle wording on ``\`` is gone.
+        self.assertNotIn('cycle layouts (v/h/m/pc) or jump direct', out)
 
 
 if __name__ == '__main__':

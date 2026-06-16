@@ -3278,27 +3278,6 @@ def _preview_label(browser):
 
 _HELP_SECTIONS = ('NAVIGATION', 'PREVIEW', 'SEARCH', 'SELECTION', 'OTHER')
 
-# When the recipe installs an ``on_context_menu`` handler, the ``\``, F1 and
-# right-click gestures OPEN THAT MENU in NORMAL mode instead of running their
-# defaults (cycle layout / toggle help) — see ``dispatch_key`` and
-# ``_dispatch_mouse`` in 070-actions and ``CONTEXT_MENU_TRIGGER_KEYS``. The
-# help text has to mirror that conditional: with a handler set, ``\``/F1 point
-# at the context menu and their old jobs move to their fallback keys
-# (``alt-1..4`` for layout, ``?`` for help). Map the affected default-action
-# keys to their menu-aware labels here; ``compose_help_text`` swaps them in
-# ONLY when the handler is present, so the static ``default_actions()`` labels
-# stay the canonical text for the bare CLI / non-menu recipes. The ``\`` row's
-# old layout-cycle note is preserved by a synthetic ``alt-1..4`` row injected
-# into PREVIEW (the real alt-1..4 actions carry empty labels, so the composer
-# normally skips them — see #163 / ``default_actions``).
-_HELP_LABELS_WITH_CONTEXT_MENU = {
-    '\\': 'Open context menu (\\ / F1 / right-click; esc or repeat closes)',
-    'f1': 'Open context menu (esc or repeat closes)',
-    '?':  'Toggle help (F1 when no context menu)',
-}
-_HELP_LAYOUT_ROW_WITH_CONTEXT_MENU = (
-    'alt-1..4', 'Cycle layouts (v/h/m/pc) — \\ when no context menu')
-
 # Static fallback used only if the composer can't be reached (e.g. a
 # test loading 050-render in isolation without the action layer wired).
 _HELP_TEXT = """\
@@ -3375,23 +3354,14 @@ def compose_help_text(browser, *, include_usage: bool = False) -> str:
     # Group default actions by section, preserving the order
     # ``default_actions()`` declared (so ``j, down, k, up`` stay
     # adjacent — declaration order is the docstring's narrative order).
-    #
-    # When the recipe set ``on_context_menu``, ``\``/F1/right-click open
-    # that menu in NORMAL mode (070-actions); rewrite the affected rows to
-    # say so and append a synthetic ``alt-1..4`` layout-cycle row right
-    # after ``\`` so its old meaning isn't lost. Without a handler the
-    # static labels are emitted unchanged.
-    menu_aware = getattr(browser, '_on_context_menu', None) is not None
+    # ``\``/F1/right-click permanently open the context menu (#1061), so
+    # the static ``default_actions()`` labels are already correct — no
+    # conditional rewriting is needed.
     sections = {}   # section_name -> list[(key, label)]
     for a in default_actions():
         if not a.section or not a.label:
             continue
-        label = a.label
-        if menu_aware:
-            label = _HELP_LABELS_WITH_CONTEXT_MENU.get(a.key, label)
-        sections.setdefault(a.section, []).append((a.key, label))
-        if menu_aware and a.key == '\\':
-            sections[a.section].append(_HELP_LAYOUT_ROW_WITH_CONTEXT_MENU)
+        sections.setdefault(a.section, []).append((a.key, a.label))
 
     for name in _HELP_SECTIONS:
         rows = sections.get(name, [])

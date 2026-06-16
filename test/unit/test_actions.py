@@ -177,10 +177,13 @@ class TestDefaultActions(unittest.TestCase):
 
     def test_required_keys_present(self):
         keys = {a.key for a in default_actions()}
+        # Note: ``f1`` is intentionally NOT a default Action since #1061 —
+        # F1 (like ``\``) is handled in ``dispatch_key`` as the permanent
+        # context-menu trigger, before the keymap lookup.
         for required in ('j', 'k', 'down', 'up', 'home', 'end',
                          'pgdn', 'pgup', 'left', 'right',
                          'ctrl-r', 'ctrl-l', 'ctrl-p',
-                         '?', 'f1', '/', 'q', 'esc', 'ctrl-c'):
+                         '?', '/', 'q', 'esc', 'ctrl-c'):
             self.assertIn(required, keys, f'missing default key: {required!r}')
 
     def test_returns_fresh_list(self):
@@ -2967,58 +2970,17 @@ class TestLayoutSplitActions(unittest.TestCase):
         finally:
             b.stop_workers()
 
-    def test_cycle_layout_cycles_in_order(self):
-        # Starting at 'v', four cycles should return: h, m, pc, v.
-        b = _make_browser(split='v')
-        try:
-            ctx = _ctx_for(b)
-            seq = []
-            for _ in range(4):
-                _actions._cycle_layout(ctx)
-                b.drain_main_queue()
-                seq.append(b.split)
-            self.assertEqual(seq, ['h', 'm', 'pc', 'v'])
-        finally:
-            b.stop_workers()
-
-    def test_cycle_layout_from_each_starting_point(self):
-        # Symmetry check: every layout, when cycled once, lands on the
-        # documented next one.
-        next_of = {'v': 'h', 'h': 'm', 'm': 'pc', 'pc': 'v'}
-        for start, expected in next_of.items():
-            b = _make_browser(split=start)
-            try:
-                ctx = _ctx_for(b)
-                _actions._cycle_layout(ctx)
-                b.drain_main_queue()
-                self.assertEqual(
-                    b.split, expected,
-                    f'{start!r} should cycle to {expected!r}, got {b.split!r}',
-                )
-            finally:
-                b.stop_workers()
-
-    def test_cycle_layout_from_unknown_state_falls_back(self):
-        # Defensive: if browser.split somehow holds a value outside the
-        # cycle (set_split clamps inputs, but tests can poke directly),
-        # cycle should land on the first entry rather than raise.
-        b = _make_browser()
-        try:
-            ctx = _ctx_for(b)
-            b.split = 'bogus'  # bypass set_split's clamp on purpose
-            _actions._cycle_layout(ctx)
-            b.drain_main_queue()
-            self.assertEqual(b.split, _actions._LAYOUT_CYCLE[0])
-        finally:
-            b.stop_workers()
-
     def test_layout_keys_all_bound(self):
         keys = {a.key: a for a in default_actions()}
-        self.assertIs(keys['\\'].handler, _actions._cycle_layout)
+        # alt-1..4 jump DIRECTLY to a fixed layout (no cycle). ``\`` is NO
+        # LONGER bound to a layout action (#1061): it permanently triggers
+        # the context menu, handled in ``dispatch_key`` before the keymap,
+        # so its only remaining default Action is a handler-less help row.
         self.assertIs(keys['alt-1'].handler, _actions._set_layout_v)
         self.assertIs(keys['alt-2'].handler, _actions._set_layout_h)
         self.assertIs(keys['alt-3'].handler, _actions._set_layout_m)
         self.assertIs(keys['alt-4'].handler, _actions._set_layout_pc)
+        self.assertIsNone(keys['\\'].handler)
 
     def test_dispatch_alt_1_sets_layout_v(self):
         b = _make_browser(split='h')
@@ -3060,13 +3022,17 @@ class TestLayoutSplitActions(unittest.TestCase):
         finally:
             b.stop_workers()
 
-    def test_dispatch_backslash_cycles_layout(self):
+    def test_dispatch_backslash_no_longer_cycles_layout(self):
+        # Since #1061 ``\`` permanently triggers the context menu instead
+        # of cycling the layout. With no ``on_context_menu`` handler the
+        # press is consumed (returns True) but is a harmless no-op — the
+        # split must NOT change. Layout-cycle now lives on alt-1..4.
         b = _make_browser(split='v')
         try:
             ctx = _ctx_for(b)
             self.assertTrue(dispatch_key(b, ctx, '\\'))
             b.drain_main_queue()
-            self.assertEqual(b.split, 'h')
+            self.assertEqual(b.split, 'v')             # unchanged
         finally:
             b.stop_workers()
 

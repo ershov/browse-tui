@@ -1485,7 +1485,10 @@ class TestOnContextMenu(unittest.TestCase):
             restore()
             b.stop_workers()
 
-    # ---- keyboard triggers (\ and F1, conditional override) -------------
+    # ---- keyboard triggers (\ and F1, permanent context-menu) -----------
+    # Since #1061 ``\`` and F1 PERMANENTLY open the context menu in NORMAL
+    # mode (no longer cycle-layout / toggle-help). When the recipe sets no
+    # ``on_context_menu`` the press is a harmless no-op.
 
     def test_backslash_fires_when_handler_set_in_normal_mode(self):
         fired = []
@@ -1509,33 +1512,38 @@ class TestOnContextMenu(unittest.TestCase):
             ctx = _ctx(b)
             self.assertTrue(dispatch_key(b, ctx, 'f1'))
             self.assertEqual(len(fired), 1)
-            # The default F1 (help toggle) was pre-empted, not also run.
+            # F1 no longer toggles help — it triggered the menu instead.
             self.assertFalse(b._help_mode)
         finally:
             b.stop_workers()
 
-    def test_backslash_falls_back_to_cycle_layout_when_no_handler(self):
-        """No handler: ``\\`` keeps its default — cycle the layout split."""
+    def test_backslash_is_noop_when_no_handler(self):
+        """No handler: ``\\`` triggers the menu, which is a no-op — it must
+        NOT cycle the layout (its old default, removed in #1061) and must
+        not raise."""
         b = Browser(BrowserConfig(_headless=True))  # no on_context_menu
         _seed(b, [Item(id='a'), Item(id='b')])
         try:
             ctx = _ctx(b)
             before = b.split
-            self.assertTrue(dispatch_key(b, ctx, '\\'))
-            b.drain_main_queue()  # set_split defers via post()
-            self.assertNotEqual(b.split, before)        # layout cycled
+            self.assertTrue(dispatch_key(b, ctx, '\\'))  # consumed
+            b.drain_main_queue()
+            self.assertEqual(b.split, before)           # layout unchanged
+            self.assertEqual(_err_log(b), '')           # nothing logged
         finally:
             b.stop_workers()
 
-    def test_f1_falls_back_to_help_toggle_when_no_handler(self):
-        """No handler: F1 keeps its default — toggle the help screen."""
+    def test_f1_is_noop_when_no_handler(self):
+        """No handler: F1 triggers the menu (no-op) — it must NOT toggle the
+        help screen (its old default, removed in #1061) and must not raise."""
         b = Browser(BrowserConfig(_headless=True))  # no on_context_menu
         _seed(b, [Item(id='a'), Item(id='b')])
         try:
             ctx = _ctx(b)
             self.assertFalse(b._help_mode)
-            self.assertTrue(dispatch_key(b, ctx, 'f1'))
-            self.assertTrue(b._help_mode)               # help toggled on
+            self.assertTrue(dispatch_key(b, ctx, 'f1'))  # consumed
+            self.assertFalse(b._help_mode)              # help NOT toggled
+            self.assertEqual(_err_log(b), '')           # nothing logged
         finally:
             b.stop_workers()
 
