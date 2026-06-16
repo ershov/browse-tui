@@ -67,9 +67,17 @@ _modal._write_segments = _render._write_segments
 import time as _time  # noqa: E402  (after the loader wiring block)
 _modal.time = _time
 
+# ``modal_menu`` references ``CONTEXT_MENU_TRIGGER_KEYS`` — defined in
+# 070-actions (the OPEN path's source of truth) and resolved by concatenation
+# in the single-file build. The isolated load doesn't pull 070, so mirror the
+# literal here for the menu close-gesture tests (#1039).
+_modal.CONTEXT_MENU_TRIGGER_KEYS = frozenset({'\\', 'f1'})
+
 
 ListContent = _modal.ListContent
 run_modal = _modal.run_modal
+modal_menu = _modal.modal_menu
+modal_pick = _modal.modal_pick
 Rect = _render.Rect
 PaneCache = _state.PaneCache
 
@@ -811,6 +819,100 @@ class TestThroughRunModal(unittest.TestCase):
         with _FixedTermSize(80, 24), _Capture():
             res = run_modal(b, c, _read_key=_scripted(['esc']))
         self.assertIsNone(res)
+
+
+class TestMenuCloseGesture(unittest.TestCase):
+    """A repeated context-menu trigger (``\\`` / F1 / right-click) closes an
+    open ``ctx.menu`` (#1039). Driven through the real ``modal_menu`` so the
+    wiring of the centralized trigger set is exercised end-to-end. The CRITICAL
+    interaction with #1042 type-ahead: ``\\`` is printable, so the close check
+    must beat type-ahead — feeding ``\\`` returns None, NOT a type-ahead jump."""
+
+    _ITEMS = ['Open', 'Rename', 'Delete']
+
+    def test_backslash_closes_menu(self):
+        b = _FakeBrowser()
+        with _FixedTermSize(80, 24), _Capture():
+            res = modal_menu(b, self._ITEMS, anchor=(5, 10),
+                             _read_key=_scripted(['\\']))
+        self.assertIsNone(res)
+
+    def test_f1_closes_menu(self):
+        b = _FakeBrowser()
+        with _FixedTermSize(80, 24), _Capture():
+            res = modal_menu(b, self._ITEMS, anchor=(5, 10),
+                             _read_key=_scripted(['f1']))
+        self.assertIsNone(res)
+
+    def test_right_click_closes_menu(self):
+        b = _FakeBrowser()
+        with _FixedTermSize(80, 24), _Capture():
+            res = modal_menu(b, self._ITEMS, anchor=(5, 10),
+                             _read_key=_scripted(['right-click:9:9']))
+        self.assertIsNone(res)
+
+    def test_backslash_does_not_typeahead(self):
+        # If '\' were treated as a printable (type-ahead) it would NOT close,
+        # so 'enter' next would return a selection. Prove the opposite: '\'
+        # closes immediately and 'enter' is never consumed (returns None).
+        b = _FakeBrowser()
+        sentinel = object()
+
+        def _src():
+            for k in ('\\',):
+                yield k
+            # The menu must have closed on '\'; if it didn't, the loop would
+            # ask for another key — surface that as a clear failure.
+            raise AssertionError('menu did not close on "\\" (type-ahead?)')
+            yield sentinel  # pragma: no cover
+
+        gen = _src()
+        with _FixedTermSize(80, 24), _Capture():
+            res = modal_menu(b, self._ITEMS, anchor=(5, 10),
+                             _read_key=lambda: next(gen))
+        self.assertIsNone(res)
+
+    def test_normal_letter_still_typeaheads_not_close(self):
+        # A non-trigger printable letter is type-ahead (does NOT close): 'd'
+        # jumps to 'Delete', then enter selects it.
+        b = _FakeBrowser()
+        with _FixedTermSize(80, 24), _Capture():
+            res = modal_menu(b, self._ITEMS, anchor=(5, 10),
+                             _read_key=_scripted(['d', 'enter']))
+        self.assertEqual(res, 'Delete')
+
+    def test_enter_still_selects(self):
+        # The close gesture doesn't disturb normal selection: enter returns
+        # the focused item.
+        b = _FakeBrowser()
+        with _FixedTermSize(80, 24), _Capture():
+            res = modal_menu(b, self._ITEMS, anchor=(5, 10),
+                             _read_key=_scripted(['down', 'enter']))
+        self.assertEqual(res, 'Rename')
+
+
+class TestPickNoCloseGesture(unittest.TestCase):
+    """Regression: ``ctx.pick`` (``modal_pick``, ``filter=True``) does NOT opt
+    into the menu close gestures — ``\\`` stays a valid filter character."""
+
+    def test_backslash_extends_filter_not_close(self):
+        # Items chosen so a '\' in the query filters to exactly one, which
+        # 'enter' then selects — proving '\' extended the filter (the menu
+        # would have closed to None instead).
+        b = _FakeBrowser()
+        with _FixedTermSize(80, 24), _Capture():
+            res = modal_pick(b, 'Pick', ['a/b', r'a\b', 'cc'],
+                             _read_key=_scripted(['\\', 'enter']))
+        self.assertEqual(res, r'a\b')
+
+    def test_right_click_swallowed_not_close(self):
+        # A right-click in a pick is swallowed (not a close); enter still
+        # selects the focused option.
+        b = _FakeBrowser()
+        with _FixedTermSize(80, 24), _Capture():
+            res = modal_pick(b, 'Pick', ['one', 'two'],
+                             _read_key=_scripted(['right-click:9:9', 'enter']))
+        self.assertEqual(res, 'one')
 
 
 if __name__ == '__main__':

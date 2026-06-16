@@ -25,6 +25,27 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 
+# The context-menu trigger gesture — one source of truth shared by the OPEN
+# path (``dispatch_key`` + ``_dispatch_mouse`` below) and the CLOSE path (the
+# ``ctx.menu`` modal in 055-modal, which passes these into ``run_modal`` so a
+# repeated trigger toggles an open menu shut; see #1039). Defined here, where
+# the keyboard triggers were originally hardcoded.
+#
+#   * ``CONTEXT_MENU_TRIGGER_KEYS`` — the keyboard triggers (``\`` and F1). Only
+#     the BARE keys trigger; modifier-prefixed variants (e.g. ``ctrl-\``) are
+#     out of scope.
+#   * ``_is_context_menu_right_click`` — recognises the right-click trigger
+#     event. Only the BARE ``right-click:R:C`` counts, matching how the open
+#     path (#1027) ignores modifier-prefixed right-clicks (``alt-right-click:``
+#     etc. carry a prefix so they never ``startswith('right-click:')``).
+CONTEXT_MENU_TRIGGER_KEYS = frozenset({'\\', 'f1'})
+
+
+def _is_context_menu_right_click(key: str) -> bool:
+    """True if ``key`` is the bare right-click context-menu trigger event."""
+    return key.startswith('right-click:')
+
+
 @dataclass
 class Action:
     """A keybinding: key string -> handler.
@@ -1239,7 +1260,7 @@ def dispatch_key(browser, ctx: 'Context', key: str) -> bool:
     # moves the cursor / scrolls the pane like in normal mode. Insert
     # mode never reaches here (it runs in ``_handle_insert_key``).
     if (key.startswith('mouse-click:')
-            or key.startswith('right-click:')
+            or _is_context_menu_right_click(key)
             or key.startswith('scroll-up:')
             or key.startswith('scroll-down:')):
         return _dispatch_mouse(browser, ctx, key)
@@ -1413,7 +1434,7 @@ def dispatch_key(browser, ctx: 'Context', key: str) -> bool:
     # the default Actions unchanged (``\`` → cycle layout, ``f1`` → help),
     # so these keys keep their old meaning for non-menu recipes.
     if (browser._mode is Mode.NORMAL
-            and key in ('\\', 'f1')
+            and key in CONTEXT_MENU_TRIGGER_KEYS
             and browser._on_context_menu is not None):
         browser._fire_context_menu()
         return True

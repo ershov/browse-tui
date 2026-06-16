@@ -488,6 +488,90 @@ class TestKeyDispatch(unittest.TestCase):
         self.assertEqual(content.handled, ['enter'])
 
 
+class TestCancelGestures(unittest.TestCase):
+    """``cancel_keys`` / ``cancel_on_right_click`` close the dialog with None
+    BEFORE the key reaches ``content.handle_key`` (#1039 — the ctx.menu path
+    passes these so a repeated trigger toggles the menu shut). Defaults are
+    off, so every non-menu modal is unaffected (asserted last)."""
+
+    _CANCEL_KEYS = frozenset({'\\', 'f1'})
+
+    def test_cancel_key_closes_to_none_before_content(self):
+        # '\' is in cancel_keys → close with None; content never sees it.
+        b = _FakeBrowser()
+        content = _StubContent(key_handler={'enter': (True, 'x')})
+        with _FixedTermSize(), _Capture():
+            res = run_modal(b, content, cancel_keys=self._CANCEL_KEYS,
+                            _read_key=_scripted(['\\']))
+        self.assertIsNone(res)
+        self.assertEqual(content.handled, [])
+
+    def test_f1_in_cancel_keys_closes(self):
+        b = _FakeBrowser()
+        content = _StubContent(key_handler={'enter': (True, 'x')})
+        with _FixedTermSize(), _Capture():
+            res = run_modal(b, content, cancel_keys=self._CANCEL_KEYS,
+                            _read_key=_scripted(['f1']))
+        self.assertIsNone(res)
+        self.assertEqual(content.handled, [])
+
+    def test_right_click_closes_when_enabled(self):
+        b = _FakeBrowser()
+        content = _StubContent(key_handler={'enter': (True, 'x')})
+        with _FixedTermSize(), _Capture():
+            res = run_modal(b, content, cancel_on_right_click=True,
+                            _read_key=_scripted(['right-click:7:3']))
+        self.assertIsNone(res)
+        self.assertEqual(content.handled, [])
+
+    def test_non_cancel_key_still_reaches_content(self):
+        # A key NOT in cancel_keys is unaffected — reaches content as usual.
+        b = _FakeBrowser()
+        content = _StubContent(key_handler={'enter': (True, 'ok')})
+        with _FixedTermSize(), _Capture():
+            res = run_modal(b, content, cancel_keys=self._CANCEL_KEYS,
+                            cancel_on_right_click=True,
+                            _read_key=_scripted(['a', 'enter']))
+        self.assertEqual(res, 'ok')
+        self.assertEqual(content.handled, ['a', 'enter'])
+
+    def test_modifier_right_click_not_a_close_gesture(self):
+        # Only the BARE ``right-click:`` closes; a modifier-prefixed variant
+        # (``alt-right-click:`` …) is NOT a close gesture — the dialog stays
+        # open and the later ``enter`` decides the result (matching how the
+        # open path #1027 only fires on a bare right-click).
+        b = _FakeBrowser()
+        content = _StubContent(key_handler={'enter': (True, 'ok')})
+        with _FixedTermSize(), _Capture():
+            res = run_modal(b, content, cancel_on_right_click=True,
+                            _read_key=_scripted(
+                                ['alt-right-click:7:3', 'enter']))
+        self.assertEqual(res, 'ok')
+        # The modifier variant did not close the dialog.
+        self.assertIn('enter', content.handled)
+
+    def test_defaults_off_cancel_key_reaches_content(self):
+        # No cancel args (the pick/confirm/input/alert default): '\' is just
+        # another key handed to content, NOT a close gesture.
+        b = _FakeBrowser()
+        content = _StubContent(key_handler={'enter': (True, 'ok')})
+        with _FixedTermSize(), _Capture():
+            res = run_modal(b, content, _read_key=_scripted(['\\', 'enter']))
+        self.assertEqual(res, 'ok')
+        self.assertEqual(content.handled, ['\\', 'enter'])
+
+    def test_defaults_off_right_click_swallowed_not_close(self):
+        # No cancel_on_right_click: a right-click is swallowed (the existing
+        # mouse-swallow), neither closing nor reaching content.
+        b = _FakeBrowser()
+        content = _StubContent(key_handler={'enter': (True, 'ok')})
+        with _FixedTermSize(), _Capture():
+            res = run_modal(b, content,
+                            _read_key=_scripted(['right-click:7:3', 'enter']))
+        self.assertEqual(res, 'ok')
+        self.assertEqual(content.handled, ['enter'])
+
+
 class TestRestorePoison(unittest.TestCase):
     """Close-time cache poisoning + 'all' redraw flag."""
 

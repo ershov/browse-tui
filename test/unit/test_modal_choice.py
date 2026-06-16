@@ -73,6 +73,7 @@ _modal.time = _time
 
 ChoiceContent = _modal.ChoiceContent
 run_modal = _modal.run_modal
+modal_confirm = _modal.modal_confirm
 Rect = _render.Rect
 PaneCache = _state.PaneCache
 
@@ -685,6 +686,22 @@ class TestThroughRunModal(unittest.TestCase):
         with _FixedTermSize(80, 24), _Capture():
             res = run_modal(b, c, _read_key=_scripted(['right', 'enter']))
         self.assertIs(res, False)
+
+
+class TestConfirmNoCloseGesture(unittest.TestCase):
+    """Regression: ``ctx.confirm`` (``modal_confirm``) does NOT opt into the
+    menu close gestures (#1039) — ``\\`` is an ordinary (ignored) key, not a
+    cancel. The dialog stays open; a following ``enter`` returns a value."""
+
+    def test_backslash_does_not_close(self):
+        # '\' matches no hotkey, so ChoiceContent ignores it and the loop
+        # continues; 'enter' then returns the focused button. If '\' had
+        # closed the dialog, the result would be None.
+        b = _FakeBrowser()
+        with _FixedTermSize(80, 24), _Capture():
+            res = modal_confirm(b, 'Delete?', ['&Yes', '&No'],
+                                _read_key=_scripted(['\\', 'enter']))
+        self.assertEqual(res, 'Yes')
 
 
 if __name__ == '__main__':

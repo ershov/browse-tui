@@ -14411,7 +14411,8 @@ def _rects_intersect(a, b):
 
 
 def run_modal(browser, content, *, placement='center', anchor=None,
-              delay_interaction=False, _read_key=None,
+              delay_interaction=False, cancel_keys=frozenset(),
+              cancel_on_right_click=False, _read_key=None,
               _delay_threshold=None, _now=None, _input_ready=None):
     """Run one blocking modal dialog to completion; return its result.
 
@@ -14451,6 +14452,21 @@ def run_modal(browser, content, *, placement='center', anchor=None,
         ``'_stdin'`` and resize/screen-lost are still serviced (a streaming
         recipe behind the dialog keeps running, the dialog still repaints on
         resize). After the window, keys dispatch as usual.
+
+    ``cancel_keys`` / ``cancel_on_right_click`` extend the uniform esc/ctrl-c
+    cancel with extra close gestures, used ONLY by the ``ctx.menu`` path (#1039)
+    so pressing a context-menu trigger again toggles an open menu shut. Both
+    default to "off", leaving every other modal (``ctx.pick`` / ``ctx.confirm``
+    / ``ctx.input`` / ``ctx.alert``) unchanged — there ``\\`` is a valid filter /
+    text character and a right-click is just swallowed:
+
+      * ``cancel_keys`` — a frozenset of key names; any one closes the dialog
+        with result ``None`` (like esc). Checked alongside esc/ctrl-c, BEFORE
+        ``content.handle_key`` — so in a menu ``\\`` closes rather than being
+        consumed as type-ahead (#1042).
+      * ``cancel_on_right_click`` — when True, a bare ``right-click:R:C`` event
+        closes the dialog with ``None`` instead of being swallowed with the
+        other mouse events (other mouse events stay swallowed).
 
     Injection seams (all default to production behavior; tests pass
     deterministic stand-ins so there are no real sleeps):
@@ -14725,14 +14741,32 @@ def run_modal(browser, content, *, placement='center', anchor=None,
             if gate_until is not None and now() < gate_until:
                 continue
 
-            # Mouse events are swallowed (no in-dialog mouse this round).
+            # Context-menu close-on-trigger (#1039): a repeated right-click on
+            # an open ``ctx.menu`` toggles it shut. Only the menu path passes
+            # ``cancel_on_right_click``; for every other modal a right-click
+            # falls through to the swallow below. Checked before the swallow so
+            # the bare ``right-click:R:C`` closes instead of being eaten; only
+            # the menu path opts in, so other modals are unaffected.
+            if cancel_on_right_click and key.startswith('right-click:'):
+                result = None
+                break
+
+            # Mouse events are swallowed (no in-dialog mouse this round). A
+            # right-click that reaches here (no ``cancel_on_right_click``) is
+            # swallowed too — it never selects or cancels in a non-menu modal.
             if (key.startswith('mouse-click:')
+                    or key.startswith('right-click:')
                     or key.startswith('scroll-up:')
                     or key.startswith('scroll-down:')):
                 continue
 
-            # Uniform cancel: esc / ctrl-c close the dialog with None.
-            if key == 'esc' or key == 'ctrl-c':
+            # Uniform cancel: esc / ctrl-c close the dialog with None. The menu
+            # path (#1039) extends this with ``cancel_keys`` (``\`` / F1), so a
+            # repeated keyboard trigger toggles an open menu shut. This runs
+            # BEFORE ``content.handle_key`` so ``\`` closes rather than being
+            # consumed as menu type-ahead (#1042); ``cancel_keys`` is empty for
+            # every other modal, where ``\`` stays a valid filter / text char.
+            if key == 'esc' or key == 'ctrl-c' or key in cancel_keys:
                 result = None
                 break
 
@@ -15693,8 +15727,16 @@ def modal_menu(browser, items, *, anchor=None, delay_interaction=False,
         return None
     content = ListContent(items, filter=False)
     placement = 'anchor' if anchor is not None else 'center'
+    # A repeated context-menu trigger (``\`` / F1 / right-click) while the menu
+    # is open toggles it shut (#1039). The trigger set is centralized in
+    # 070-actions (``CONTEXT_MENU_TRIGGER_KEYS``), shared with the OPEN path so
+    # the gesture is defined once. ONLY ``ctx.menu`` opts in — pick/confirm/
+    # input/alert leave these at their off defaults, so ``\`` / right-click keep
+    # their normal meaning there.
     return run_modal(browser, content, placement=placement, anchor=anchor,
-                     delay_interaction=delay_interaction, _read_key=_read_key)
+                     delay_interaction=delay_interaction,
+                     cancel_keys=CONTEXT_MENU_TRIGGER_KEYS,
+                     cancel_on_right_click=True, _read_key=_read_key)
 
 
 def modal_confirm(browser, message, buttons=('&Yes', '&No'), *, title=None,
@@ -16809,6 +16851,27 @@ import signal
 import tempfile
 from dataclasses import dataclass
 from typing import Callable, Optional
+
+
+# The context-menu trigger gesture — one source of truth shared by the OPEN
+# path (``dispatch_key`` + ``_dispatch_mouse`` below) and the CLOSE path (the
+# ``ctx.menu`` modal in 055-modal, which passes these into ``run_modal`` so a
+# repeated trigger toggles an open menu shut; see #1039). Defined here, where
+# the keyboard triggers were originally hardcoded.
+#
+#   * ``CONTEXT_MENU_TRIGGER_KEYS`` — the keyboard triggers (``\`` and F1). Only
+#     the BARE keys trigger; modifier-prefixed variants (e.g. ``ctrl-\``) are
+#     out of scope.
+#   * ``_is_context_menu_right_click`` — recognises the right-click trigger
+#     event. Only the BARE ``right-click:R:C`` counts, matching how the open
+#     path (#1027) ignores modifier-prefixed right-clicks (``alt-right-click:``
+#     etc. carry a prefix so they never ``startswith('right-click:')``).
+CONTEXT_MENU_TRIGGER_KEYS = frozenset({'\\', 'f1'})
+
+
+def _is_context_menu_right_click(key: str) -> bool:
+    """True if ``key`` is the bare right-click context-menu trigger event."""
+    return key.startswith('right-click:')
 
 
 @dataclass
@@ -18025,7 +18088,7 @@ def dispatch_key(browser, ctx: 'Context', key: str) -> bool:
     # moves the cursor / scrolls the pane like in normal mode. Insert
     # mode never reaches here (it runs in ``_handle_insert_key``).
     if (key.startswith('mouse-click:')
-            or key.startswith('right-click:')
+            or _is_context_menu_right_click(key)
             or key.startswith('scroll-up:')
             or key.startswith('scroll-down:')):
         return _dispatch_mouse(browser, ctx, key)
@@ -18199,7 +18262,7 @@ def dispatch_key(browser, ctx: 'Context', key: str) -> bool:
     # the default Actions unchanged (``\`` → cycle layout, ``f1`` → help),
     # so these keys keep their old meaning for non-menu recipes.
     if (browser._mode is Mode.NORMAL
-            and key in ('\\', 'f1')
+            and key in CONTEXT_MENU_TRIGGER_KEYS
             and browser._on_context_menu is not None):
         browser._fire_context_menu()
         return True
