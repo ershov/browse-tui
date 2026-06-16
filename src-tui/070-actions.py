@@ -1173,7 +1173,10 @@ def default_actions() -> list:
         # them — their meaning is folded into the ``\`` line below to
         # keep the help screen compact (see #163). The bindings remain
         # fully functional in the dispatcher; they just don't take five
-        # lines of help-screen real estate apiece.
+        # lines of help-screen real estate apiece. (When a recipe sets
+        # ``on_context_menu``, ``\`` opens that menu instead; the composer
+        # then rewrites this row and emits a separate ``alt-1..4`` layout
+        # row — see ``_HELP_LABELS_WITH_CONTEXT_MENU`` in 050-render.)
         Action('\\',         '\\ / alt-1..4: cycle layouts (v/h/m/pc) or jump direct', _cycle_layout, 'none', 'PREVIEW'),
         Action('alt-1',      '', _set_layout_v,  'none', 'PREVIEW'),
         Action('alt-2',      '', _set_layout_h,  'none', 'PREVIEW'),
