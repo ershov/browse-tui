@@ -2094,9 +2094,9 @@ class TestHelpIntro(unittest.TestCase):
 
     def test_compact_size(self):
         # browse-fs-style compact help — kept tight even with the
-        # ``--root`` entry added; a low-30s line budget still fits a
-        # screen comfortably.
-        self.assertLessEqual(self.r._HELP_INTRO.count('\n'), 32)
+        # ``--root`` entry and the context-menu paragraph added; a
+        # high-30s line budget still fits a screen comfortably.
+        self.assertLessEqual(self.r._HELP_INTRO.count('\n'), 38)
 
 
 class TestArgvFlag(unittest.TestCase):

@@ -1904,6 +1904,292 @@ def _on_expand(ctx, ids):
             ctx.expand(cascade_id)
 
 
+# ---- context menu --------------------------------------------------------
+#
+# A right-click / `` ` ``-F1 menu over the cursor's row, branching on its KIND
+# (the tagged-tuple tag ``id[0]`` plus arity). Following the committed
+# convention (browse-procs the pilot, browse-git / browse-claude the rich
+# multi-kind cases): a PURE ``context_menu_options(ctx)`` builds the
+# ``(label, token)`` rows by kind (opening no modal, so it is unit-testable), a
+# flat ``{token: handler}`` table (``_MENU_ACTIONS``) dispatches the chosen
+# token, and a thin ``on_context_menu(ctx)`` ties the two together. Hotkey hints
+# are LITERAL text — menus don't parse ``&`` — so an entry duplicating a global
+# keybinding shows it in parens (``Edit at this line (E)``). The existing per-row
+# actions (E / V / M / m / Ctrl-R) are reused directly so the menu rows stay
+# single-sourced with the keybindings. No clipboard rows (the values aren't
+# visible — paths / anchors surface via ``ctx.alert``). The menu is
+# read-only-friendly: a missing external tool flashes via ``run_external``'s own
+# error rather than crashing (browse-tui swallows ``on_context_menu`` exceptions
+# besides).
+#
+# Cursor kinds and the menu each gets:
+#   * ``('file', path)``            — a per-file root: file-level source actions
+#                                     + open-containing-dir + show-path + rescan.
+#   * ``('content', path, line)``   — a heading / list-item: section source
+#                                     actions + show-anchor + expand/collapse.
+#   * ``('md', anchor, chain, *)``  — a cross-file reference node (a referenced
+#                                     ``.md`` doc root, or a heading inside one):
+#                                     open / edit the referenced file + show its
+#                                     resolved path. ``chain[-1]`` is that file.
+#   * everything else (the ``('refs', …)`` umbrella, a stale / synthetic id, no
+#     cursor) — only the shared "Toggle markdown coloring" row (when bound).
+
+
+def _slug(text):
+    """GitHub-style heading slug for ``text`` (the ``#name`` of an anchor).
+
+    Mirrors GitHub's algorithm closely enough for a human-readable anchor
+    pop-up: lower-case, drop everything that isn't a word char / space / hyphen,
+    then turn runs of whitespace into single hyphens. (GitHub also strips inline
+    markdown formatting; the stored heading title already has its leading ``#``s
+    removed, and residual ``*``/`` ` `` emphasis markers are dropped by the
+    non-word-char filter, so ``## My **bold** title`` → ``my-bold-title``.)
+    """
+    import re
+    text = text.strip().lower()
+    text = re.sub(r'[^\w\s-]', '', text)
+    return re.sub(r'\s+', '-', text)
+
+
+def _md_ref_target(node_id):
+    """The referenced-file abspath a cross-file ``('md', …)`` node points at.
+
+    Every browse-md markdown-ref id is ``('md', anchor, chain, line)`` with a
+    NON-empty ``chain`` (the primary file is browsed through ``('file', …)`` /
+    ``('content', …)`` ids, never here), and the chain's last entry is the
+    referenced file the node lives in — exactly the target ``_md_file_item``
+    stamps onto ``item.md_abspath``. Recovering it from the id keeps a single
+    dispatch signature for the handlers. Returns ``None`` for a malformed id.
+    """
+    if (isinstance(node_id, tuple) and len(node_id) == 4
+            and node_id[0] == 'md' and node_id[2]):
+        return node_id[2][-1]
+    return None
+
+
+# -- file root ('file', path) -----------------------------------------------
+
+
+def _cm_file_open_dir(ctx, path):
+    """Open the file's containing directory in browse-fs.
+
+    browse-fs is another browse-tui recipe, so ``keep_screen=True`` hands it the
+    alternate screen (no flash of the primary buffer); a missing ``browse-fs`` on
+    PATH surfaces via ``run_external``'s own error. The stdin sentinel has no
+    real directory on disk, but its dirname is the cwd (``_STDIN_PATH`` lives
+    under it), so the action still opens something sensible.
+    """
+    ctx.run_external(['browse-fs', os.path.dirname(path) or '.'],
+                     keep_screen=True)
+
+
+def context_menu_file(ctx, item_id):
+    """``(label, token)`` rows for a ``('file', path)`` per-file root.
+
+    Edit / View / Render duplicate the ``E`` / ``V`` / ``M`` actions, so their
+    rows carry the literal hotkey hint. "Re-scan all files" duplicates the
+    framework's Ctrl-R reload, hinted likewise. "Show full path" is ALWAYS
+    offered for a path-bearing row: the row title is the (relative) file label
+    but the list renderer cell-cuts a long row WITHOUT inserting an ellipsis, so
+    a pop-up is the reliable way to read the full path — and a redundant pop-up
+    of a short path is harmless. The truncated width varies per row depth /
+    chrome, so the recipe can't cheaply detect "is this row clipped"; always-show
+    beats a fragile ellipsis heuristic (the same call browse-git makes).
+    """
+    return [
+        ('Edit file in $EDITOR (E)',          'file.edit'),
+        ('View file in $PAGER (V)',           'file.view'),
+        ('Render with mdcat (M)',             'file.mdcat'),
+        ('Open containing dir in browse-fs',  'file.opendir'),
+        ('Show full path',                    'file.path'),
+        ('Re-scan all files (Ctrl-R)',        'file.rescan'),
+    ]
+
+
+# -- heading / list-item ('content', path, line) ----------------------------
+
+
+def _cm_content_anchor(ctx, item_id):
+    """Pop up the heading anchor ``basename.md#slug`` for a content row.
+
+    The slug is derived GitHub-style (``_slug``) from the row's stored title; the
+    file part is the owning file's basename (``item_id[1]``). A list-item row has
+    no meaningful heading anchor, so the gate in ``context_menu_options`` only
+    offers this entry for a heading — but if it is reached for any content row we
+    still build a best-effort anchor from the title.
+    """
+    path, line = item_id[1], item_id[2]
+    item = _BY_ID.get(item_id)
+    title = item.title if item is not None else ''
+    ctx.alert(f'{os.path.basename(path)}#{_slug(title)}', title='anchor')
+
+
+def _cm_content_expand(ctx, item_id):
+    """Expand the cursor row's whole subtree (reuses the framework op)."""
+    ctx.expand_subtree(item_id)
+
+
+def _cm_content_collapse(ctx, item_id):
+    """Collapse the cursor row (reuses the framework op)."""
+    ctx.collapse(item_id)
+
+
+def _content_is_heading(item_id):
+    """True iff the ``('content', path, line)`` row is a heading (not a list item).
+
+    Reads the row's ``kind`` off ``_BY_ID`` (stamped by ``_build_nodes``); the
+    "Show heading anchor" entry is heading-only. A row missing from the index
+    (stale id) is treated as not-a-heading, so the anchor entry is simply
+    omitted rather than tracebacking.
+    """
+    item = _BY_ID.get(item_id)
+    return item is not None and getattr(item, 'kind', None) == 'heading'
+
+
+def context_menu_content(ctx, item_id):
+    """``(label, token)`` rows for a ``('content', path, line)`` row.
+
+    A heading or a list item. Edit / View / Render duplicate the ``E`` / ``V`` /
+    ``M`` actions (which act on the section's byte range), so their rows carry
+    the hotkey hint. "Show heading anchor" is offered only for a heading
+    (``_content_is_heading``) — a list item has no anchor. Expand / Collapse
+    reuse the framework's subtree-expand / collapse on the cursor row.
+    """
+    rows = [
+        ('Edit at this line (E)',        'content.edit'),
+        ('View section in $PAGER (V)',   'content.view'),
+        ('Render section via mdcat (M)', 'content.mdcat'),
+    ]
+    if _content_is_heading(item_id):
+        rows.append(('Show heading anchor', 'content.anchor'))
+    rows.append(('Expand subtree', 'content.expand'))
+    rows.append(('Collapse', 'content.collapse'))
+    return rows
+
+
+# -- cross-file reference ('md', anchor, chain, line) -----------------------
+
+
+def _cm_ref_open(ctx, target):
+    """Open the referenced ``.md`` file in a nested browse-md."""
+    ctx.run_external(['browse-md', target], keep_screen=True)
+
+
+def _cm_ref_edit(ctx, target):
+    """Edit the referenced file in $EDITOR (default vim, like the ``E`` action)."""
+    cmd = _split_cmd(os.environ.get('EDITOR') or 'vim')
+    ctx.run_external(cmd + [target])
+
+
+def context_menu_ref(ctx, item_id):
+    """``(label, token)`` rows for a cross-file reference ``('md', …)`` node.
+
+    Serves a referenced-file document root and a heading inside one alike — both
+    resolve to the same referenced file (``_md_ref_target`` → ``chain[-1]``).
+    "Edit referenced file" launches $EDITOR but does NOT duplicate the ``E``
+    keybinding (``E`` edits the PRIMARY file's source, not the referenced one),
+    so it carries no hotkey hint. "Show link target" pops up the resolved
+    absolute path the reference points at.
+    """
+    return [
+        ('Open referenced doc in browse-md', 'ref.open'),
+        ('Edit referenced file',             'ref.edit'),
+        ('Show link target',                 'ref.target'),
+    ]
+
+
+# ---- menu dispatch + the hook --------------------------------------------
+#
+# ``_MENU_ACTIONS`` maps every token a ``context_menu_*`` builder can emit to
+# its handler ``(ctx, item_id)`` — a single uniform signature; each handler
+# pulls the fields it needs from the id tuple. The per-row source actions reuse
+# the recipe's existing action handlers (``_action_edit_source`` /
+# ``_action_view_source`` / ``_action_md_preview`` / ``_action_toggle_md``),
+# which read ``ctx.cursor`` / ``ctx.targets`` themselves, so the menu rows stay
+# single-sourced with the E / V / M / m keybindings. "Re-scan all files" reuses
+# the framework's reload via ``ctx.refresh()`` — the same call the Ctrl-R action
+# makes (a root refresh enqueues with ``reload=True`` → ``get_children(None,
+# reload=True)`` → ``_reparse`` + ``md_doc.clear_cache()``).
+
+
+_MENU_ACTIONS = {
+    # file root — reuse E / V / M, then open-dir / show-path / Ctrl-R reload.
+    'file.edit':     lambda c, i: _action_edit_source(c),
+    'file.view':     lambda c, i: _action_view_source(c),
+    'file.mdcat':    lambda c, i: _action_md_preview(c),
+    'file.opendir':  lambda c, i: _cm_file_open_dir(c, i[1]),
+    'file.path':     lambda c, i: c.alert(i[1], title='path'),
+    'file.rescan':   lambda c, i: c.refresh(),
+    # heading / list-item — reuse E / V / M, anchor pop-up, expand / collapse.
+    'content.edit':     lambda c, i: _action_edit_source(c),
+    'content.view':     lambda c, i: _action_view_source(c),
+    'content.mdcat':    lambda c, i: _action_md_preview(c),
+    'content.anchor':   lambda c, i: _cm_content_anchor(c, i),
+    'content.expand':   lambda c, i: _cm_content_expand(c, i),
+    'content.collapse': lambda c, i: _cm_content_collapse(c, i),
+    # cross-file reference — open / edit the referenced file, show its path.
+    'ref.open':    lambda c, i: _cm_ref_open(c, _md_ref_target(i)),
+    'ref.edit':    lambda c, i: _cm_ref_edit(c, _md_ref_target(i)),
+    'ref.target':  lambda c, i: c.alert(_md_ref_target(i), title='link target'),
+    # anywhere — reuse the ``m`` toggle.
+    'toggle_md':   lambda c, i: _action_toggle_md(c),
+}
+
+
+def context_menu_options(ctx):
+    """``(label, token)`` rows for the browse-md context menu (pure — no modal).
+
+    Branches on the cursor item's KIND (``id[0]`` plus arity) — every row id is
+    a tagged tuple, so this is a flat dispatch with direct field access:
+
+      * ``('file', path)``           → ``context_menu_file``.
+      * ``('content', path, line)``  → ``context_menu_content``.
+      * ``('md', anchor, chain, *)`` → ``context_menu_ref`` (a cross-file
+        reference node — a referenced doc root or a heading within it).
+      * anything else (the ``('refs', …)`` References umbrella, a stale /
+        synthetic id, or no cursor) → no per-kind rows.
+
+    Every menu ends with a shared "Toggle markdown coloring" row reusing the
+    ``m`` action — offered only when md2ansi_lib loaded (``_md2ansi_fn`` is the
+    same gate the ``m`` keybinding's render path uses), so its label carries the
+    ``m`` hotkey hint. The token half is dispatched by ``_MENU_ACTIONS`` /
+    ``on_context_menu``.
+    """
+    item_id = ctx.cursor.id if ctx.cursor else None
+    rows = []
+    if isinstance(item_id, tuple) and item_id:
+        kind = item_id[0]
+        if kind == 'file':
+            rows = context_menu_file(ctx, item_id)
+        elif kind == 'content' and len(item_id) == 3:
+            rows = context_menu_content(ctx, item_id)
+        elif kind == 'md' and len(item_id) == 4 and item_id[2]:
+            rows = context_menu_ref(ctx, item_id)
+    # Toggle markdown coloring is available anywhere — but only when md2ansi_lib
+    # loaded (matching the ``m`` keybinding's own gating). The hint shows ``m``.
+    if _md2ansi_fn is not None:
+        rows = list(rows) + [('Toggle markdown coloring (m)', 'toggle_md')]
+    return rows
+
+
+def on_context_menu(ctx):
+    """Open the browse-md context menu and dispatch the chosen entry.
+
+    The hook the framework fires on right-click / `` ` ``-F1: build the (pure)
+    per-kind option list, open it with ``ctx.menu``, and route the chosen token
+    through ``_MENU_ACTIONS`` (passing the cursor's id so each handler reads its
+    own fields). A cancel (``None``) or an empty list is a no-op. The cursor id
+    is re-read at dispatch time so a token always pairs with the row it came
+    from.
+    """
+    token = ctx.menu(context_menu_options(ctx))
+    handler = _MENU_ACTIONS.get(token)
+    if handler is None:
+        return
+    item = ctx.cursor
+    handler(ctx, item.id if item is not None else None)
+
+
 _HELP_INTRO = """\
 browse-md — markdown browser for one or more files.
 
@@ -1937,7 +2223,13 @@ Usage: browse-md [-l] [--root DIR ...] [FILE.md[#anchor] | DIR ... | -]
           (cross-file selections group by file with a per-file header).
   E       Edit source for cursor/selection in ``$EDITOR`` (same
           per-file / cross-file rules as V).
-  Ctrl-R  Re-slurp every input file and rebuild the tree.\
+  Ctrl-R  Re-slurp every input file and rebuild the tree.
+
+Right-click a row (or the backslash / F1 keys) for a menu keyed to its
+kind: a file row edits / views / renders the file, opens its dir in
+browse-fs, shows its path, or re-scans; a heading / list item acts on the
+section, shows the heading anchor, and expands / collapses; a cross-file
+reference opens / edits the referenced file and shows its resolved path.\
 """
 
 
@@ -2274,6 +2566,13 @@ def main():
         initial_scope=initial_scope,
         actions=actions,
         on_expand=_on_expand,
+        # Right-click (or the backslash / F1 keys) on a row opens a menu keyed
+        # to the cursor's kind: file roots offer file-level source actions +
+        # open-dir + show-path + rescan; headings / list items offer section
+        # source actions + show-anchor + expand/collapse; a cross-file reference
+        # opens / edits the referenced file + shows its resolved path. See
+        # ``on_context_menu``.
+        on_context_menu=on_context_menu,
         # Preview content is width-dependent: ``get_preview`` (and
         # ``_md_render``) lay markdown out — prose wrap AND table column
         # widths — through md2ansi at ``ctx.preview_width``. The framework
