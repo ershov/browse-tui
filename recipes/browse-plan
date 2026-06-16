@@ -888,14 +888,17 @@ def _on_children_loaded(ctx, parent_ids):
 # ---- entry point ---------------------------------------------------------
 
 
-_HELP_INTRO = """\
-browse-plan — drop-in replacement for plan-tui on the browse-tui core.
-
+_HELP_USAGE = """\
 Usage: browse-plan [-f FILE] [TICKET_ID]
   -f FILE      Plan file to operate on (passed through to ``plan -f FILE``).
   --file FILE  Long alias for -f.
   TICKET_ID    Numeric ticket id to drill into on launch (sets the initial
-               scope). Without an id, the tree opens at the project root.
+               scope). Without an id, the tree opens at the project root.\
+"""
+
+
+_HELP_INTRO = """\
+browse-plan — drop-in replacement for plan-tui on the browse-tui core.
 
 Browse the active plan-CLI tree by status, drill into subtrees, edit
 or view tickets, and bulk-pick statuses across selections. The cursor
@@ -994,6 +997,7 @@ def main():
         # Retract a leaf ticket's optimistic arrow when its expand reveals
         # neither subtasks nor body ``.md`` refs (the self-heal).
         on_children_loaded=_on_children_loaded,
+        help_usage=_HELP_USAGE,
         help_intro=_HELP_INTRO,
     ))
     _BROWSER = b

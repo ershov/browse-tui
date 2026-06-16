@@ -309,6 +309,62 @@ class TestRecipeHelpFlag(unittest.TestCase):
             self.assertNotIn('CUSTOM ACTIONS', out.stdout)
 
 
+class TestRecipeUsageBlock(unittest.TestCase):
+    """A recipe's CLI usage / flags block belongs to ``--help``, not ``?``.
+
+    Recipes that document command-line flags put that block in
+    ``help_usage`` (vs ``help_intro``). ``--help`` shows usage + the
+    in-app help; the in-app ``?`` shows only the in-app help (no flags).
+    browse-fs is the exemplar: its usage line is ``Usage: browse-fs
+    [PATH | -]`` and its in-app help opens ``browse-fs — interactive
+    filesystem browser.``.
+    """
+
+    _RECIPE = os.path.join(_REPO, 'recipes', 'browse-fs')
+    # Unique to help_usage (the CLI flags block).
+    _USAGE_MARKER = 'Usage: browse-fs [PATH | -]'
+    # Unique to help_intro (shown by BOTH --help and the in-app ?).
+    _INTRO_MARKER = 'Lazily walks directories with os.scandir'
+
+    def test_recipe_help_includes_usage_and_in_app_help(self):
+        # --help: usage flags block + the in-app help (intro + the
+        # composer's NAVIGATION key list) are ALL present.
+        out = subprocess.run(
+            [_BIN, '--run-py', self._RECIPE, '--help'],
+            capture_output=True, text=True, timeout=5,
+        )
+        self.assertEqual(out.returncode, 0)
+        self.assertIn(self._USAGE_MARKER, out.stdout)
+        self.assertIn(self._INTRO_MARKER, out.stdout)
+        self.assertIn('NAVIGATION', out.stdout)
+        # Usage sits above the in-app help in the --help output.
+        self.assertLess(
+            out.stdout.find(self._USAGE_MARKER),
+            out.stdout.find(self._INTRO_MARKER),
+        )
+
+    def test_recipe_in_app_help_omits_usage_block(self):
+        # The in-app ``?`` (driven in the real binary) shows the in-app
+        # help but NOT the CLI flags block.
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, 'a.txt'), 'w') as f:
+                f.write('hi')
+            with TmuxFixture(cols=100, rows=100) as t:
+                t.launch(_BIN, '--run-py', self._RECIPE, tmp)
+                t.wait_for('a.txt')
+                t.send('?')
+                # The in-app help renders the composer's section headers
+                # plus help_intro; wait on a marker unique to the intro.
+                t.wait_for('NAVIGATION')
+                t.wait_for('Lazily walks directories')
+                cap = t.capture()
+                self.assertIn('NAVIGATION', cap)
+                # The CLI flags block must NOT appear in the in-app help.
+                self.assertNotIn(self._USAGE_MARKER, cap)
+                t.send('?')   # close help
+                t.send('q')
+
+
 class TestHelpContextMenuKeys(unittest.TestCase):
     """Help statically documents the \\/F1/right-click context-menu trigger.
 

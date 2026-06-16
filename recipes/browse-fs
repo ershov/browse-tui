@@ -779,9 +779,7 @@ def mtime_watcher(browser):
 
 _USAGE = 'usage: browse-fs [PATH | -]'
 
-_HELP_INTRO = """\
-browse-fs — interactive filesystem browser.
-
+_HELP_USAGE = """\
 Usage: browse-fs [PATH | -]
   PATH    Directory to start in. Defaults to the current working directory.
   -       Read a newline-separated list of paths from stdin and show
@@ -791,7 +789,12 @@ Usage: browse-fs [PATH | -]
           not exist shows a dim '[missing]' row. Cannot be combined with
           a PATH argument. A pipe/redirect auto-engages this mode, so the
           '-' is optional when piping ('ls | browse-fs'); type it
-          explicitly to read a tty stdin (paste, then ^D).
+          explicitly to read a tty stdin (paste, then ^D).\
+"""
+
+
+_HELP_INTRO = """\
+browse-fs — interactive filesystem browser.
 
 Lazily walks directories with os.scandir; the preview pane shows file
 heads or directory listings. The selection / cursor seeds $TUI_IDS_FILE
@@ -896,6 +899,7 @@ def main():
         # multi-selection (delete N / open N), or a missing-path special (show
         # path only). See ``on_context_menu``.
         on_context_menu=on_context_menu,
+        help_usage=_HELP_USAGE,
         help_intro=_HELP_INTRO,
     ))
     _BROWSER = b

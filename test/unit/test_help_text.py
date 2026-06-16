@@ -211,15 +211,49 @@ class TestComposeHelpText(unittest.TestCase):
         # No double-trailing-newline either.
         self.assertFalse(text.endswith('\n\n'))
 
-    def test_include_usage_flag_is_accepted(self):
-        # The flag is currently a no-op in the composer (the argparse
-        # usage block is prepended by main()), but the API surface
-        # accepts it — make sure both shapes parse cleanly.
+    def test_include_usage_true_emits_help_usage(self):
+        # ``--help`` paths pass include_usage=True: the recipe's
+        # command-line usage / flags block (help_usage) is emitted at
+        # the very top, above help_intro.
+        b = _make_browser(
+            help_usage='USAGE-FLAGS-MARKER',
+            help_intro='INTRO-MARKER',
+        )
+        text = compose_help_text(b, include_usage=True)
+        i_usage = text.find('USAGE-FLAGS-MARKER')
+        i_intro = text.find('INTRO-MARKER')
+        i_nav = text.find('NAVIGATION')
+        self.assertGreaterEqual(i_usage, 0)
+        # Usage sits above both the intro and the key list.
+        self.assertLess(i_usage, i_intro)
+        self.assertLess(i_usage, i_nav)
+
+    def test_include_usage_false_omits_help_usage(self):
+        # The in-app ``?`` passes include_usage=False: the flags block is
+        # omitted entirely, but help_intro (relevant to ``?``) stays.
+        b = _make_browser(
+            help_usage='USAGE-FLAGS-MARKER',
+            help_intro='INTRO-MARKER',
+        )
+        text = compose_help_text(b, include_usage=False)
+        self.assertNotIn('USAGE-FLAGS-MARKER', text)
+        self.assertIn('INTRO-MARKER', text)
+
+    def test_help_usage_default_false_omits_block(self):
+        # The default (no include_usage) matches the in-app ``?`` path:
+        # help_usage is omitted unless explicitly requested.
+        b = _make_browser(help_usage='USAGE-FLAGS-MARKER')
+        self.assertNotIn('USAGE-FLAGS-MARKER', compose_help_text(b))
+
+    def test_include_usage_true_without_help_usage_adds_nothing(self):
+        # The bare CLI leaves help_usage unset and relies on argparse's
+        # print_help() for usage; include_usage=True must add nothing
+        # then (no double-printed usage, no stray blank line).
         b = _make_browser()
-        a = compose_help_text(b, include_usage=True)
-        c = compose_help_text(b, include_usage=False)
-        # Same body either way in this phase.
-        self.assertEqual(a, c)
+        self.assertEqual(
+            compose_help_text(b, include_usage=True),
+            compose_help_text(b, include_usage=False),
+        )
 
 
 # ---- _resolve_help_text ----------------------------------------------------

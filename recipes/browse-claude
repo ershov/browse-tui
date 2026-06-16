@@ -6682,9 +6682,7 @@ def on_context_menu(ctx):
 # ---- entry point ---------------------------------------------------------
 
 
-_HELP_INTRO_TMPL = """\
-browse-claude — Claude Code project / session / message browser.
-
+_HELP_USAGE_TMPL = """\
 Usage: browse-claude [OPTIONS] [PROJECT]
   -n NUMBER       Cap messages enumerated per session (default: {default}).
   --session ID    Open the .jsonl for that sessionId directly.
@@ -6701,7 +6699,12 @@ Usage: browse-claude [OPTIONS] [PROJECT]
                   records (default; press '.' to toggle).
   PROJECT         Project directory name under ~/.claude/projects/ to
                   drill into on launch. Ignored when --session / --pid /
-                  --file is given.
+                  --file is given.\
+"""
+
+
+_HELP_INTRO = """\
+browse-claude — Claude Code project / session / message browser.
 
 Walks ~/.claude/projects/ to surface a four-level tree: projects ->
 sessions -> messages (or subagents) -> subagent messages. Drill into
@@ -6925,7 +6928,8 @@ def main():
         # all of them) drop the preview cache; the framework then refetches
         # and ``get_preview`` re-renders at the now-current preview width.
         on_resize=lambda ctx, cols, rows: ctx.drop_preview_cache(),
-        help_intro=_HELP_INTRO_TMPL.format(default=_MESSAGE_LIMIT),
+        help_usage=_HELP_USAGE_TMPL.format(default=_MESSAGE_LIMIT),
+        help_intro=_HELP_INTRO,
     ))
     _BROWSER = b
 

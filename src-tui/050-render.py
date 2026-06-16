@@ -3316,6 +3316,8 @@ def compose_help_text(browser, *, include_usage: bool = False) -> str:
 
     Output structure::
 
+        [help_usage]              (only when include_usage and set)
+
         [help_intro]              (omitted when None / empty)
 
         NAVIGATION                (built-in default actions, grouped)
@@ -3338,14 +3340,22 @@ def compose_help_text(browser, *, include_usage: bool = False) -> str:
     Sections without content are omitted: no empty CUSTOM ACTIONS
     header, no leading or trailing blank lines.
 
-    ``include_usage`` is currently unused inside the composer — the
-    argparse usage block is prepended by ``main()`` at the CLI layer
-    when ``--help`` runs. The flag is reserved for future uses (e.g.
-    embedding usage when called from a non-CLI entrypoint).
+    ``include_usage`` selects whether the recipe's command-line usage /
+    flags block (``browser.help_usage``) is emitted. It is True for the
+    ``--help`` paths and False for the in-app ``?``: the flag list
+    belongs to ``--help``, not the interactive help. When True and
+    ``help_usage`` is set it is prepended above ``help_intro``; when
+    False (or when ``help_usage`` is None) it is omitted entirely. The
+    bare CLI's own usage comes from argparse's ``print_help()``, so it
+    leaves ``help_usage`` unset and this adds nothing there (no
+    double-printed usage).
     """
-    # Suppress unused-arg lint without surprising the caller.
-    _ = include_usage
     parts = []
+
+    if include_usage:
+        usage = getattr(browser, 'help_usage', None)
+        if usage:
+            parts.append(usage.rstrip())
 
     intro = getattr(browser, 'help_intro', None)
     if intro:

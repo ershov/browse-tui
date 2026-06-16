@@ -5990,12 +5990,16 @@ class TestVoiceOnlyFilter(unittest.TestCase):
     # ---- CLI + help -----------------------------------------------------
 
     def test_help_text_mentions_dot_hotkey(self):
-        self.assertIn(' .  ', self.r._HELP_INTRO_TMPL,
+        # The in-app ``.`` hotkey lives in the intro (shown by ``?``).
+        self.assertIn(' .  ', self.r._HELP_INTRO,
                       'help intro should list the . hotkey')
-        self.assertIn('--show-all', self.r._HELP_INTRO_TMPL)
-        self.assertIn('--no-show-all', self.r._HELP_INTRO_TMPL)
+        # The CLI flags live in the usage block (shown only by ``--help``).
+        self.assertIn('--show-all', self.r._HELP_USAGE_TMPL)
+        self.assertIn('--no-show-all', self.r._HELP_USAGE_TMPL)
+        # The flags block must NOT leak into the in-app intro.
+        self.assertNotIn('Usage:', self.r._HELP_INTRO)
         # The old 'h' hotkey is gone from the help intro.
-        self.assertNotIn(' h ', self.r._HELP_INTRO_TMPL,
+        self.assertNotIn(' h ', self.r._HELP_INTRO,
                          "the 'h' hotkey should no longer appear")
 
     def test_dot_action_registered(self):

@@ -2190,9 +2190,7 @@ def on_context_menu(ctx):
     handler(ctx, item.id if item is not None else None)
 
 
-_HELP_INTRO = """\
-browse-md — markdown browser for one or more files.
-
+_HELP_USAGE = """\
 Usage: browse-md [-l] [--root DIR ...] [FILE.md[#anchor] | DIR ... | -]
   -l, --list, --lists  Also surface list items (default: headings).
   --root DIR  Extra base for resolving a doc's relative ``.md`` refs.
@@ -2213,7 +2211,12 @@ Usage: browse-md [-l] [--root DIR ...] [FILE.md[#anchor] | DIR ... | -]
   #anchor   Deep-link target — 0-based line number or heading name
             (exact / prefix / substring tiers; first hit wins). When
             multiple files carry anchors, the FIRST anchored file in
-            argv order wins.
+            argv order wins.\
+"""
+
+
+_HELP_INTRO = """\
+browse-md — markdown browser for one or more files.
 
   m       Toggle md2ansi coloring.
   M       Render the preview through ``$MDCAT`` / mdcat.
@@ -2584,6 +2587,7 @@ def main():
         # framework then refetches and ``get_preview`` re-renders at the
         # now-current preview width.
         on_resize=lambda ctx, cols, rows: ctx.drop_preview_cache(),
+        help_usage=_HELP_USAGE,
         help_intro=_HELP_INTRO,
     ))
     # Stash the Browser on the module so ``get_preview`` can read

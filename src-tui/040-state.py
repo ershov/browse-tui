@@ -3231,6 +3231,7 @@ class BrowserConfig:
     split: str = 'auto'
     multi_select: bool = True
     print_format: str = '{id}'
+    help_usage: Optional[str] = None
     help_intro: Optional[str] = None
     help_outro: Optional[str] = None
     show_ids: str = 'auto'
@@ -3379,6 +3380,12 @@ class Browser:
       multi_select:       allow multi-selection (action layer in #12).
       print_format:       output format string used when on_enter is None
                           and the user picks the default action.
+      help_usage:         optional command-line usage / flags block.
+                          Shown ONLY by ``--help`` (prepended above
+                          ``help_intro``); the in-app ``?`` never shows
+                          it. Recipes that document CLI flags put that
+                          block here so it stays out of the interactive
+                          help. ``None`` elides it.
       help_intro:         optional prose shown at the top of the help
                           screen (and ``--help``); recipes use it to
                           describe what the tool does. ``None`` elides
@@ -3452,6 +3459,11 @@ class Browser:
                 stores this opaquely; the action layer reads it.
             print_format: ``str.format``-style template applied to each
                 target when ``on_enter`` resolves to print-exit.
+            help_usage: Optional command-line usage / flags block shown
+                ONLY by ``--help`` (prepended above ``help_intro``).
+                The in-app ``?`` never shows it, so a recipe's flag
+                list stays out of the interactive help. ``None`` elides
+                it.
             help_intro: Optional prose shown at the top of ``--help``
                 and the in-app help screen (``?``). Recipes use it to
                 describe what their tool does.
@@ -3683,10 +3695,15 @@ class Browser:
         self.split = _clamp_split(config.split)
         self.multi_select = config.multi_select
         self.print_format = config.print_format
-        # help_intro/help_outro are prose blurbs shown above/below the
-        # auto-generated key list in --help and the in-app help screen
-        # (?). Recipes set them to explain what their tool does;
-        # ``None`` (the default) elides the corresponding section.
+        # help_usage is the command-line usage / flags block. It is
+        # shown ONLY by --help (prepended above help_intro); the in-app
+        # ``?`` never shows it — see compose_help_text's include_usage
+        # argument. help_intro/help_outro are prose blurbs shown
+        # above/below the auto-generated key list in BOTH --help and the
+        # in-app help screen (?). Recipes set them to explain what their
+        # tool does; ``None`` (the default) elides the corresponding
+        # section.
+        self.help_usage = config.help_usage
         self.help_intro = config.help_intro
         self.help_outro = config.help_outro
         self.show_ids = config.show_ids
@@ -7495,13 +7512,16 @@ class Browser:
         unified namespace; in tests the loader injects them onto this
         module.
         """
-        # Help flag short-circuit: print composed help (intro + sections
-        # + CUSTOM ACTIONS + outro) and exit without entering the loop.
-        # Honours -h and --help as exact tokens; ``--help=foo`` style
-        # bundling is not relevant here (argparse-using recipes consume
-        # it first; the auto-detect target is recipes that don't argparse).
+        # Help flag short-circuit: print composed help (usage + intro +
+        # sections + CUSTOM ACTIONS + outro) and exit without entering
+        # the loop. This is a ``--help`` path, so ``include_usage=True``
+        # — the recipe's command-line flags block (help_usage) belongs
+        # here, unlike the in-app ``?`` which omits it. Honours -h and
+        # --help as exact tokens; ``--help=foo`` style bundling is not
+        # relevant here (argparse-using recipes consume it first; the
+        # auto-detect target is recipes that don't argparse).
         if any(arg in ('-h', '--help') for arg in sys.argv[1:]):
-            sys.stdout.write(compose_help_text(self, include_usage=False))
+            sys.stdout.write(compose_help_text(self, include_usage=True))
             return 0
 
         # Terminal-device auto-detect: scan sys.argv[1:] for ``--tty``

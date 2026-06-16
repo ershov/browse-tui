@@ -3015,9 +3015,7 @@ def on_context_menu(ctx):
 # ---- entry point ---------------------------------------------------------
 
 
-_HELP_INTRO_TMPL = """\
-browse-git — a tig-like browser over a git repository.
-
+_HELP_USAGE_TMPL = """\
 Usage: browse-git [<dir>] [-n NUMBER] [--mode NAME] [--no-tree] [--all] [<rev>…] [-- <path>…]
        git diff | browse-git      (also git log / log -p / status output; the '-' is optional when piping)
   <dir>         A leading directory in another git repo browses THAT repo
@@ -3057,7 +3055,12 @@ git work tree (distinct from the cwd's) selects the repo to browse; any
 other arg that names an existing file or directory is a pathspec;
 otherwise an arg git resolves as a commit is a rev; anything else is an
 error. They scope commits mode (an explicit --mode other than commits
-ignores them).
+ignores them).\
+"""
+
+
+_HELP_INTRO = """\
+browse-git — a tig-like browser over a git repository.
 
 The five view modes:
   commits   recent git log; drill commit -> changed files -> per-file diff
@@ -3226,8 +3229,9 @@ def main():
         # plus a shared Switch-mode entry. See ``on_context_menu``.
         on_context_menu=on_context_menu,
         show_ids='never',
-        help_intro=_HELP_INTRO_TMPL.format(
+        help_usage=_HELP_USAGE_TMPL.format(
             default=_LOG_LIMIT, modes=', '.join(_MODES)),
+        help_intro=_HELP_INTRO,
     ))
     _browser = b
     # Piped-diff mode wraps the file rows under one synthetic ``('sdiff',)``
