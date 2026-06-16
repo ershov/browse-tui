@@ -4022,6 +4022,17 @@ class Browser:
         self._quit_code = 0
         self._quit_output = ''
 
+        # --- modal dialog state (run_modal in 055-modal; ticket #1041) --
+        # ``_modal_open`` is set/cleared by ``run_modal`` while a dialog
+        # owns the screen; ``is_dialog_open()`` reads it. ``_modal_force``
+        # is the cross-thread close hook: ``close_dialog(value)`` arms it to
+        # a ``(value,)`` 1-tuple (``None`` = not armed; the tuple lets a
+        # force-close with ``None`` be distinguished from "not armed") and
+        # wakes the loop; ``run_modal`` clears it on entry, then breaks
+        # returning ``_modal_force[0]`` when it is armed.
+        self._modal_open = False
+        self._modal_force = None
+
         # --- output channel (ctx.print / quit output; spec §3.2) --------
         # ``print()`` appends utf-8 bytes here under ``_out_lock``; the
         # quit output joins the same stream at teardown (strict FIFO:
@@ -4259,6 +4270,8 @@ class Browser:
     #   cancel(*pendings)           — cancel one or more Pending handles
     #   print(text, end='\n')       — append to the stdout content channel
     #   quit(code=0, output='')     — exit the run loop
+    #   is_dialog_open()            — whether a modal dialog is displayed
+    #   close_dialog(value=None)    — dismiss the open dialog with value
     #
     # Methods OUTSIDE this block are main-thread-only.
     # =========================================================================
@@ -5589,6 +5602,29 @@ class Browser:
         quit output).
         """
         self.post(lambda: self._do_quit(code, output))
+
+    def is_dialog_open(self) -> bool:
+        """(thread-safe) Whether a modal dialog is currently displayed.
+
+        Reads the ``_modal_open`` flag ``run_modal`` sets while a dialog
+        owns the screen. Called cross-thread it is a best-effort snapshot
+        (the flag may flip the instant after it is read).
+        """
+        return self._modal_open
+
+    def close_dialog(self, value=None) -> None:
+        """(thread-safe) Dismiss the open dialog, delivering ``value`` to it.
+
+        Arms ``_modal_force`` to ``(value,)`` and wakes the loop; the open
+        ``run_modal`` observes it and returns ``value`` (whoever is waiting
+        on the dialog receives it). ``value=None`` means "no answer." The
+        single atomic write plus ``notify_wake`` makes this safe to call from
+        any thread. Effectively a no-op when no dialog is open: ``run_modal``
+        clears ``_modal_force`` on entry, so a stale arm cannot leak into the
+        next dialog.
+        """
+        self._modal_force = (value,)
+        notify_wake()
 
     # =========================================================================
     # End of public, thread-safe API

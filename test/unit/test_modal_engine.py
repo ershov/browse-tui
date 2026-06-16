@@ -252,6 +252,12 @@ class _FakeBrowser:
 
     def __init__(self):
         self._modal_open = False
+        # Cross-thread loop-control flags the engine reads (ticket #1041):
+        # ``_modal_force`` is a ``(value,)`` 1-tuple when an open dialog should
+        # force-close returning ``value`` (``None`` = not armed); the real
+        # Browser inits both, so the fake does too.
+        self._modal_force = None
+        self._quit_requested = False
         self._pane_cache = {}
         self._needs_redraw = set()
         self._out_stream_live = False
@@ -981,6 +987,146 @@ class TestDelayInteraction(unittest.TestCase):
         self.assertIsNone(res)  # cancelled by the second esc
         self.assertEqual(reads['n'], 2)  # first esc was gated, not a cancel
         self.assertEqual(content.handled, [])  # esc never reaches content
+
+
+class TestForceCloseAndQuitBreaks(unittest.TestCase):
+    """``_modal_force`` / ``_quit_requested`` break an open ``run_modal``.
+
+    These are the cross-thread dialog-control hooks (ticket #1041): a worker
+    that calls ``close_dialog(value)`` arms ``browser._modal_force = (value,)``
+    and wakes the loop; a worker that calls ``quit()`` flips
+    ``browser._quit_requested``. The engine must observe both promptly — both
+    as a top-of-loop check and right after the ``_notify`` drain (where a
+    posted close/quit lands) — and break, returning ``_modal_force[0]`` (the
+    forced value, including ``None``) or ``None`` on a quit-break.
+    """
+
+    def test_force_close_top_of_loop_returns_value(self):
+        # A worker arms _modal_force mid-loop. The seam arms it as a side
+        # effect and returns a content-ignored key ('a' → (False, None)),
+        # which repaints and loops back to the TOP-OF-LOOP check — that check
+        # (not the post-notify one) fires the force and run_modal returns it.
+        # (A force armed BEFORE entry is cleared on entry — see
+        # test_entry_clears_stale_force — so the realistic path arms after
+        # entry, from within the running loop.)
+        b = _FakeBrowser()
+        content = _StubContent(key_handler={'enter': (True, 'x')})
+
+        def rk():
+            b._modal_force = ('forced',)
+            return 'a'  # ignored by content → loop repaints, returns to top
+
+        with _FixedTermSize(), _Capture():
+            res = run_modal(b, content, _read_key=rk)
+        self.assertEqual(res, 'forced')
+        # 'a' was dispatched (ignored); 'enter' never reached.
+        self.assertEqual(content.handled, ['a'])
+        # The force is cleared so it can't leak into a later dialog.
+        self.assertIsNone(b._modal_force)
+
+    def test_force_close_with_none_returns_none(self):
+        # The 1-tuple ``(None,)`` is "force-close returning None" — distinct
+        # from ``None`` ("not armed"). The dialog must close with None.
+        b = _FakeBrowser()
+        content = _StubContent(key_handler={'enter': (True, 'x')})
+
+        def rk():
+            b._modal_force = (None,)
+            return 'a'
+
+        with _FixedTermSize(), _Capture():
+            res = run_modal(b, content, _read_key=rk)
+        self.assertIsNone(res)
+        self.assertEqual(content.handled, ['a'])
+        self.assertIsNone(b._modal_force)
+
+    def test_force_close_after_notify_drain(self):
+        # A close_dialog posted from a worker lands in the _notify drain. The
+        # scripted seam arms _modal_force then returns '_notify' (the wake);
+        # the engine drains and ``continue``s back to the top-of-loop force
+        # check, which breaks before the next blocking read. The following
+        # 'enter' is never reached, and the seam is never read a second time.
+        b = _FakeBrowser()
+        content = _StubContent(key_handler={'enter': (True, 'x')})
+
+        def rk():
+            b._modal_force = ('from-worker',)
+            return '_notify'
+
+        with _FixedTermSize(), _Capture():
+            res = run_modal(b, content, _read_key=rk)
+        self.assertEqual(res, 'from-worker')
+        # The _notify still drained the queue before the break.
+        self.assertEqual(b.calls['drain_main_queue'], 1)
+        self.assertEqual(b.calls['apply_children_results'], 1)
+        # Force fired and was cleared; the key was never dispatched.
+        self.assertEqual(content.handled, [])
+        self.assertIsNone(b._modal_force)
+
+    def test_quit_breaks_top_of_loop_returns_none(self):
+        # _quit_requested set before the first read breaks the loop with None
+        # (the quit contract: a worker's ctx.quit() tears the dialog down).
+        b = _FakeBrowser()
+        b._quit_requested = True
+        content = _StubContent(key_handler={'enter': (True, 'x')})
+        with _FixedTermSize(), _Capture():
+            res = run_modal(b, content, _read_key=_scripted([]))
+        self.assertIsNone(res)
+        self.assertEqual(content.handled, [])
+
+    def test_quit_breaks_after_notify_drain(self):
+        # A quit() posted from a worker lands in the _notify drain; the engine
+        # drains and ``continue``s back to the top-of-loop quit check, which
+        # breaks with None before the next blocking read.
+        b = _FakeBrowser()
+        content = _StubContent(key_handler={'enter': (True, 'x')})
+
+        def rk():
+            b._quit_requested = True
+            return '_notify'
+
+        with _FixedTermSize(), _Capture():
+            res = run_modal(b, content, _read_key=rk)
+        self.assertIsNone(res)
+        self.assertEqual(b.calls['drain_main_queue'], 1)
+        self.assertEqual(content.handled, [])
+
+    def test_entry_clears_stale_force(self):
+        # A force armed while NO dialog was open (close_dialog is effectively a
+        # no-op then) must not leak into the next dialog: run_modal clears
+        # _modal_force on entry, so the stale arm is ignored and the dialog
+        # runs to its normal 'enter' close.
+        b = _FakeBrowser()
+        b._modal_force = ('stale',)
+        content = _StubContent(key_handler={'enter': (True, 'normal')})
+        with _FixedTermSize(), _Capture():
+            res = run_modal(b, content, _read_key=_scripted(['enter']))
+        self.assertEqual(res, 'normal')
+        self.assertEqual(content.handled, ['enter'])
+        self.assertIsNone(b._modal_force)
+
+    def test_force_does_not_leak_into_subsequent_dialog(self):
+        # End-to-end of the "cleared on entry" guarantee across two dialogs:
+        # the first dialog is force-closed (force armed mid-loop via the seam),
+        # leaving _modal_force cleared; the second opens and runs normally (it
+        # must NOT immediately force-close).
+        b = _FakeBrowser()
+        first = _StubContent(key_handler={'enter': (True, 'x')})
+
+        def rk():
+            b._modal_force = ('one',)
+            return 'a'  # ignored → loop back to top → force breaks
+
+        with _FixedTermSize(), _Capture():
+            r1 = run_modal(b, first, _read_key=rk)
+        self.assertEqual(r1, 'one')
+        self.assertIsNone(b._modal_force)
+
+        second = _StubContent(key_handler={'enter': (True, 'two')})
+        with _FixedTermSize(), _Capture():
+            r2 = run_modal(b, second, _read_key=_scripted(['enter']))
+        self.assertEqual(r2, 'two')
+        self.assertEqual(second.handled, ['enter'])
 
 
 if __name__ == '__main__':

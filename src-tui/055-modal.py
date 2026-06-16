@@ -214,6 +214,10 @@ def run_modal(browser, content, *, placement='center', anchor=None,
     if getattr(browser, '_modal_open', False):
         raise RuntimeError('run_modal: a modal dialog is already open')
     browser._modal_open = True
+    # Clear any stale cross-thread force (ticket #1041): a ``close_dialog``
+    # armed while no dialog was open is effectively a no-op, so a leftover
+    # ``_modal_force`` must not leak into this dialog and instantly close it.
+    browser._modal_force = None
 
     # The real terminal ``read_key`` takes the channel fds; the injected
     # test seam is a zero-arg callable. Branch once here so the loop body
@@ -331,6 +335,23 @@ def run_modal(browser, content, *, placement='center', anchor=None,
         gate_until = now() + threshold if delay_interaction else None
 
         while True:
+            # Cross-thread close / quit (ticket #1041), checked at the top of
+            # the loop — BEFORE the blocking read — so a ``close_dialog`` /
+            # ``quit`` armed by a worker (or carried back here by a ``_notify``
+            # drain's ``continue``) breaks promptly without first waiting on a
+            # key. ``_modal_force`` is a ``(value,)`` 1-tuple when armed (so a
+            # force-close with ``None`` is distinct from "not armed"); it is
+            # cleared on break so it can't re-fire. A pending quit returns
+            # ``None`` (the quit contract: the dialog tears down so the app can
+            # exit; its callback is dropped by the caller).
+            if browser._modal_force is not None:
+                result = browser._modal_force[0]
+                browser._modal_force = None
+                break
+            if getattr(browser, '_quit_requested', False):
+                result = None
+                break
+
             if injected:
                 key = rk()
             else:
@@ -383,7 +404,10 @@ def run_modal(browser, content, *, placement='center', anchor=None,
                 # Drain background work WITHOUT rendering: the modal owns
                 # the screen, so pane redraw flags the drain sets just
                 # accumulate in ``browser._needs_redraw`` and the close-
-                # time ``'all'`` absorbs them.
+                # time ``'all'`` absorbs them. A ``close_dialog`` / ``quit``
+                # posted from a worker lands in this drain (ticket #1041); the
+                # ``continue`` returns to the top-of-loop force/quit check,
+                # which breaks before the next blocking read.
                 browser.drain_main_queue()
                 browser.apply_children_results()
                 continue

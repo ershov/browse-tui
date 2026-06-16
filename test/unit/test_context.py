@@ -268,6 +268,68 @@ class TestPassThrough(unittest.TestCase):
             b.stop_workers()
 
 
+# --- dialog control (is_dialog_open / close_dialog; ticket #1041) ----------
+
+
+class TestDialogControl(unittest.TestCase):
+    """``is_dialog_open`` / ``close_dialog`` on Browser + the ctx pass-throughs.
+
+    The engine's break logic lives in ``run_modal`` (see test_modal_engine.py);
+    here we verify the thread-safe Browser surface and the Context
+    pass-throughs: ``is_dialog_open()`` reflects ``_modal_open``, and
+    ``close_dialog(value)`` arms ``_modal_force = (value,)`` (the 1-tuple, so
+    ``None`` is "force-close with None", not "not armed").
+    """
+
+    def test_is_dialog_open_default_false(self):
+        b = _make_browser()
+        try:
+            self.assertFalse(b.is_dialog_open())
+            self.assertFalse(Context(b).is_dialog_open())
+        finally:
+            b.stop_workers()
+
+    def test_is_dialog_open_reflects_modal_open(self):
+        b = _make_browser()
+        try:
+            ctx = Context(b)
+            b._modal_open = True
+            self.assertTrue(b.is_dialog_open())
+            self.assertTrue(ctx.is_dialog_open())
+            b._modal_open = False
+            self.assertFalse(b.is_dialog_open())
+            self.assertFalse(ctx.is_dialog_open())
+        finally:
+            b.stop_workers()
+
+    def test_close_dialog_arms_force_tuple(self):
+        b = _make_browser()
+        try:
+            self.assertIsNone(b._modal_force)
+            b.close_dialog('chosen')
+            self.assertEqual(b._modal_force, ('chosen',))
+        finally:
+            b.stop_workers()
+
+    def test_close_dialog_default_arms_none_tuple(self):
+        # The 1-tuple distinguishes "force-close with None" from "not armed":
+        # close_dialog() (no value) arms (None,), not None.
+        b = _make_browser()
+        try:
+            b.close_dialog()
+            self.assertEqual(b._modal_force, (None,))
+        finally:
+            b.stop_workers()
+
+    def test_ctx_close_dialog_passes_through(self):
+        b = _make_browser()
+        try:
+            Context(b).close_dialog(42)
+            self.assertEqual(b._modal_force, (42,))
+        finally:
+            b.stop_workers()
+
+
 # --- flash / log / error notice primitives (Browser-level) ----------------
 
 

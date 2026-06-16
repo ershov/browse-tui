@@ -314,6 +314,8 @@ ctx.log(text)                         -> None
 ctx.error(text)                       -> None
 ctx.print(text, end='\n')             -> None
 ctx.quit(code=0, output='')           -> None
+ctx.is_dialog_open()                  -> bool
+ctx.close_dialog(value=None)          -> None
 ```
 
 | Method       | What it does                                                         |
@@ -328,6 +330,8 @@ ctx.quit(code=0, output='')           -> None
 | `error`      | Red, sticky info-bar notice; always logged; cleared by next keypress.|
 | `print`      | Write to the stdout content channel (see *Output — `ctx.print`*).    |
 | `quit`       | Exit the main loop with `code`; `output` joins the stdout channel after any `print` (strict FIFO). |
+| `is_dialog_open` | Whether a modal dialog (`confirm` / `alert` / `pick` / `menu` / `input`) is currently displayed. Cross-thread it is a best-effort snapshot. |
+| `close_dialog` | Dismiss the open dialog, delivering `value` to whoever waits on it (the blocking return). `value=None` means "no answer." No-op if nothing is open. |
 
 ### Cache introspection
 
@@ -1314,6 +1318,8 @@ browser.flash(text, log=False)
 browser.log(text)
 browser.error(text)
 browser.quit(code=0, output='')
+browser.is_dialog_open()                   -> bool   # is a modal dialog displayed?
+browser.close_dialog(value=None)           # dismiss the open dialog, delivering value
 browser.cancel(*pendings)                  # sugar for p.cancel()
 browser.post(callable_)                    # schedule fn on main thread
 browser.update_data(ops)                   # batched tree mutations

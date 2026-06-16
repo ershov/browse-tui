@@ -441,6 +441,24 @@ class Context:
         """
         self._browser.quit(code, output)
 
+    def is_dialog_open(self) -> bool:
+        """Whether a modal dialog is currently displayed.
+
+        Pass-through to :meth:`Browser.is_dialog_open`. Useful from the
+        main thread, or as a cross-thread hint (a best-effort snapshot).
+        """
+        return self._browser.is_dialog_open()
+
+    def close_dialog(self, value=None) -> None:
+        """Dismiss the open modal dialog, delivering ``value`` to its waiter.
+
+        Pass-through to :meth:`Browser.close_dialog`. Whoever is waiting on
+        the open dialog (the blocking return, or a future async callback)
+        receives ``value``; ``None`` means "no answer." A no-op if no dialog
+        is open. Thread-safe.
+        """
+        self._browser.close_dialog(value)
+
     # ---- cache introspection ------------------------------------------
     #
     # Read-only views into the framework's live item / children cache.
