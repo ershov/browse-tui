@@ -6492,7 +6492,7 @@ def _dir_action_rows(dirs):
     paths = [path for _roles, path in dirs]
     rows = [('Open in browse-fs', 'dir.fs'), ('Run shell here', 'dir.shell')]
     if any(_is_git_repo(p) for p in paths):
-        rows.append(('git', 'dir.git'))
+        rows.append(('git ▸', 'dir.git'))
     if any(_has_plan_md(p) for p in paths):
         rows.append(('Browse plan in browse-plan', 'dir.plan'))
     rows.append(('Show full path', 'dir.path'))
@@ -6525,17 +6525,21 @@ def _choose_dir(ctx, dirs):
 
 
 def _run_shell(ctx, cwd):
-    """Open the user's ``$SHELL`` with ``cwd`` as the working directory.
+    """Open an interactive ``$SHELL`` with ``cwd`` as the working directory.
 
     ``ctx.run_external`` has no ``cwd`` knob, so the directory change rides in a
-    shell-string command (run via ``sh -c``): ``cd <dir> && exec <$SHELL>``.
+    shell-string command (run via ``sh -c``): ``cd <dir> && exec <$SHELL> -l -i``.
     ``exec`` replaces the wrapping ``sh`` with the user's shell so signals / the
-    exit code pass through; ``$SHELL`` defaults to ``sh``. Mirrors browse-fs's
-    ``_run_shell``.
+    exit code pass through; ``-i`` makes it interactive and ``-l`` a login shell
+    so it loads the user's login startup files (and thus their real prompt) — a
+    plain ``-i`` non-login shell reads only ``~/.bashrc`` and misses a PS1 set up
+    only on login. The ``cd`` still wins (it runs before ``exec`` and login
+    startup doesn't change directory); ``$SHELL`` defaults to ``sh``. Mirrors
+    browse-fs's ``_run_shell``.
     """
     import shlex
     shell = os.environ.get('SHELL') or 'sh'
-    ctx.run_external(f'cd {shlex.quote(cwd)} && exec {shell}')
+    ctx.run_external(f'cd {shlex.quote(cwd)} && exec {shell} -l -i')
 
 
 def _run_git_mode(ctx, dirs, mode):

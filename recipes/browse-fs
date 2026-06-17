@@ -469,20 +469,27 @@ def _target_dir(path):
 
 
 def _run_shell(ctx, cwd):
-    """Open the user's ``$SHELL`` with ``cwd`` as the working directory.
+    """Open an interactive ``$SHELL`` with ``cwd`` as the working directory.
 
     For a directory row ``cwd`` is the directory itself; for a file row it is
     the file's parent directory. ``ctx.run_external`` has no ``cwd`` knob, so
     the directory change rides in a shell-string command (which it runs via
-    ``sh -c``): ``cd <dir> && exec <$SHELL>``. ``exec`` replaces the wrapping
-    ``sh`` with the user's shell so signals / the exit code pass through
-    naturally; ``$SHELL`` defaults to ``sh`` and may itself carry args
-    (``bash --login``), which the shell-string honours verbatim. The shell
-    inherits the terminal (a normal interactive child), so no ``keep_screen``.
+    ``sh -c``): ``cd <dir> && exec <$SHELL> -l -i``. ``exec`` replaces the
+    wrapping ``sh`` with the user's shell so signals / the exit code pass
+    through naturally; ``-i`` makes it interactive and ``-l`` a login shell, so
+    it loads the same startup files (``~/.bash_profile`` / ``~/.profile``) as
+    the user's normal terminal and thus their real prompt — a plain ``-i``
+    non-login shell reads only ``~/.bashrc`` and so misses any PS1 set up only
+    on login. ``$SHELL`` defaults to ``sh`` and may itself carry args
+    (``bash --login``), which the shell-string honours verbatim — appending
+    `` -l -i`` after it is correct (and harmless if ``--login`` is redundant).
+    The ``cd`` still wins: it runs in the wrapping ``sh`` before ``exec``, and
+    the login startup doesn't change directory. The shell inherits the terminal
+    (a normal interactive child), so no ``keep_screen``.
     """
     import shlex
     shell = os.environ.get('SHELL') or 'sh'
-    ctx.run_external(f'cd {shlex.quote(cwd)} && exec {shell}')
+    ctx.run_external(f'cd {shlex.quote(cwd)} && exec {shell} -l -i')
 
 
 def _new_file(ctx, dir_path):
@@ -641,7 +648,7 @@ def _dir_actions(dir_path):
     """
     rows = [('Run shell here', 'dir.shell')]
     if _is_git_repo(dir_path):
-        rows.append(('git', 'dir.git'))
+        rows.append(('git ▸', 'dir.git'))
     rows.extend([
         ('New file…', 'dir.newfile'),
         ('New directory…', 'dir.newdir'),

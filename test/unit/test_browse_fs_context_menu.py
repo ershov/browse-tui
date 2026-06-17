@@ -171,9 +171,9 @@ class TestPerKindMenus(unittest.TestCase):
             'dir.shell', 'dir.git',
             'dir.newfile', 'dir.newdir', 'dir.path', 'delete',
         ])
-        # The single git row carries the 'git' submenu label.
+        # The single git row carries the 'git ▸' submenu label.
         labels = dict((t, l) for l, t in rows)
-        self.assertEqual(labels['dir.git'], 'git')
+        self.assertEqual(labels['dir.git'], 'git ▸')
 
     def test_dir_show_full_path_always_and_delete_hint(self):
         d = self._subdir('plain')

@@ -504,8 +504,8 @@ class TestDirHierarchyRealFixture(unittest.TestCase):
             Item(id=('session', sess), title='sess-1', has_children=True))
         rows = self.r.context_menu_options(Context(self.b))
         by_tok = dict((t, l) for l, t in rows)
-        # A single Level-1 'git' row; the modes live in the Level-2 submenu.
-        self.assertEqual(by_tok['dir.git'], 'git')
+        # A single Level-1 'git ▸' row; the modes live in the Level-2 submenu.
+        self.assertEqual(by_tok['dir.git'], 'git ▸')
         self.assertEqual(by_tok['dir.plan'], 'Browse plan in browse-plan')
         self.assertEqual(
             self.r._DIR_GIT_MODES,
@@ -892,7 +892,7 @@ class TestRunDirAction(unittest.TestCase):
                                    [(['project', 'cwd'], '/p')])
         self.assertIsNone(ctx.menu_items)
         cmd, _kw = ctx.external
-        self.assertEqual(cmd, "cd /p && exec /bin/zsh")
+        self.assertEqual(cmd, "cd /p && exec /bin/zsh -l -i")
 
     def test_run_shell_opens_chooser_for_two_dirs(self):
         # >1 distinct dir → the dir chooser opens (run-shell applies to all).
@@ -903,7 +903,7 @@ class TestRunDirAction(unittest.TestCase):
         self.assertEqual([lbl for lbl, _v in ctx.menu_items],
                          ['project: /p', 'worktree: /w'])
         cmd, _kw = ctx.external
-        self.assertEqual(cmd, "cd /w && exec /bin/bash")
+        self.assertEqual(cmd, "cd /w && exec /bin/bash -l -i")
 
 
 # ----- dispatch table reuses the existing action handlers ------------------
