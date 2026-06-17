@@ -30,12 +30,17 @@ _MODAL_MIN_ROWS = 8
 def _modal_caps(cols, rows):
     """Maximum content size a dialog may request, given the screen.
 
-    Width is capped at 80% of the screen; height leaves four rows of
-    breathing room (so the frame's two border rows never crowd the
-    screen edges). The content's ``measure`` is handed these caps and
-    must not exceed them. Returns ``(max_w, max_h)`` in content cells.
+    Width is capped at 80% of the screen, minus the two outer margin
+    columns the frame reserves (one blank cell just outside each vertical
+    border — see :func:`_paint`); this keeps the box PLUS its margins
+    within 80% and, in the non-tiny regime, guarantees the frame is at
+    most ``cols - 2`` wide so both margins land on-screen. Height leaves
+    four rows of breathing room (so the frame's two border rows never
+    crowd the screen edges). The content's ``measure`` is handed these
+    caps and must not exceed them. Returns ``(max_w, max_h)`` in content
+    cells.
     """
-    return int(0.8 * cols), rows - 4
+    return int(0.8 * cols) - 2, rows - 4
 
 
 def _frame_size(content_w, content_h):
@@ -57,7 +62,8 @@ def _modal_is_tiny(cols, rows):
     return cols < _MODAL_MIN_COLS or rows < _MODAL_MIN_ROWS
 
 
-def _modal_place(cols, rows, w, h, *, placement, anchor):
+def _modal_place(cols, rows, w, h, *, placement, anchor, side=None,
+                 bounds=None):
     """Place a ``w`` × ``h`` frame on a ``cols`` × ``rows`` screen.
 
     Returns the frame ``Rect`` (1-based, exclusive right/bottom).
@@ -70,42 +76,156 @@ def _modal_place(cols, rows, w, h, *, placement, anchor):
     extra cell toward the right/bottom (floor division).
 
     ``placement='anchor'`` takes ``anchor=(row, col)`` in 1-based screen
-    coordinates and lands the frame's top-left just below the anchor, at
-    ``(row + 1, col)``, so the anchor row stays visible. If the frame
-    would overflow the bottom edge it flips above the anchor; if it would
-    overflow the right edge it shifts left. Both axes are then clamped so
-    the frame stays on-screen (top/left ≥ 1, fully visible where it fits).
+    coordinates and uses ONLY the anchor's row for vertical placement.
+    Horizontally the frame LEANS toward screen center but its full painted
+    footprint (the box plus the two #1043 outer-margin columns) is clamped to
+    stay within the horizontal ``bounds`` — see below — so a keyboard-triggered
+    context menu hangs off its list row instead of drifting onto a neighbouring
+    pane.
+
+    The vertical SIDE of the anchor row is chosen by ``side``:
+
+      * ``side=None`` — DECIDE fresh from the frame height (the first menu of
+        a chain, or any standalone anchored use): drop just below the anchor
+        row (``top = row + 1``) so that row stays visible, flipping above
+        (``top = row - h``) only if dropping below would overflow the bottom
+        edge.
+      * ``side='below'`` — force below (``top = row + 1``) even if the frame
+        overflows the bottom; the shared clamp then shifts it up so it fits.
+      * ``side='above'`` — force above (``top = row - h``) even if the frame
+        overflows the top; the shared clamp then shifts it down so it fits.
+
+    The forced sides exist so a chained context menu (#1041) keeps every
+    submenu on the side the FIRST menu picked: an oversized submenu SHIFTS to
+    fit (clamped onto the screen, overlapping the subject row if need be)
+    rather than independently flipping to the opposite side and reading as a
+    disjoint box. ``side`` is ignored for ``placement='center'``.
+
+    Both axes are then clamped so the frame stays on-screen: vertically
+    ``top`` lands in ``[1, rows - h + 1]`` (so a frame taller-on-this-side
+    than the room available is shifted on-screen rather than truncated);
+    horizontally as below.
+
+    The horizontal clamp keeps the frame's full painted FOOTPRINT — the box
+    plus one blank #1043 outer-margin column just outside each vertical border
+    — within a horizontal ``bounds = (L, R)`` (1-based, inclusive first/last
+    column). ``bounds=None`` (the default, used by centered modals and any
+    standalone anchored use) means the whole screen, ``(1, cols)`` — so this is
+    the unchanged #1040/#1043 behavior. ``ctx.menu`` passes the LIST pane's
+    column span so a context menu's footprint stays over its row (#1051).
+
+    With room for the margins (``w <= R - L - 1``: the box plus its two margin
+    columns fit in the bound) the box ``left`` is constrained to
+    ``[L + 1, R - w]`` — column ``L`` and column ``R`` then hold the margins.
+    The TARGET is the screen-centered ``left`` (``1 + (cols - w) // 2``, the
+    "lean toward screen center" intent), CLAMPED into that range: when the
+    bound lies entirely left of screen center the clamp pins ``left = R - w``,
+    landing the footprint's right margin at column ``R``; a bound straddling
+    center keeps the box more centered.
+
+    A footprint WIDER than the bound (``R - w < L + 1``) cannot fit within it,
+    so it FALLS BACK to the full-screen clamp: ``[2, cols - w]`` when there's
+    screen room for margins (``w <= cols - 2``), else the plain on-screen clamp
+    ``[1, cols - w + 1]`` (a frame spanning the screen width, including the tiny
+    full-screen fallback); :func:`_paint` then omits any margin off-screen.
     """
     if _modal_is_tiny(cols, rows):
         return Rect(1, 1, cols + 1, rows + 1)
 
     if placement == 'anchor':
-        row, col = anchor
-        left = col
-        top = row + 1
-        # Flip above the anchor if dropping below would overflow the
-        # bottom edge — the frame's last row is ``top + h - 1``.
-        if top + h - 1 > rows:
+        row, _col = anchor
+        # Horizontal: center on screen (closest to screen center), exactly
+        # like the ``'center'`` branch — the anchor column is NOT used for
+        # ``left`` (a keyboard-triggered menu anchors at the pane's left
+        # edge, which would hug the screen left).
+        left = 1 + (cols - w) // 2
+        # Vertical: pick the side of the anchor row.
+        #   * ``side is None`` → decide from this frame's height: below if it
+        #     fits, else flip above (the first menu of a chain, or a
+        #     standalone anchored use — unchanged behavior).
+        #   * ``side == 'below'`` / ``'above'`` → forced (a chained submenu
+        #     reusing the chain's side); the shared clamp below shifts an
+        #     oversized box onto the screen instead of flipping it.
+        # The frame's last row is ``top + h - 1``.
+        if side == 'above':
             top = row - h
-        # Shift left so the right edge fits — last column is ``left + w - 1``.
-        if left + w - 1 > cols:
-            left = cols - w + 1
+        elif side == 'below':
+            top = row + 1
+        else:  # decide fresh
+            top = row + 1
+            if top + h - 1 > rows:
+                top = row - h
     else:  # 'center'
         left = 1 + (cols - w) // 2
         top = 1 + (rows - h) // 2
 
     # Clamp onto the screen: keep the frame fully visible where it fits
-    # (right/bottom not past the edge), then guarantee top/left ≥ 1. The
-    # second step wins when the frame is larger than the screen.
-    left = max(1, min(left, cols - w + 1))
+    # (right/bottom not past the edge), then guarantee top/left in range.
+    # The second step wins when the frame is larger than the screen.
+    #
+    # Horizontally, keep the frame's FOOTPRINT (box + the two #1043 margin
+    # columns) within ``bounds`` (the list pane span for ``ctx.menu``; the
+    # whole screen otherwise — see the docstring and :func:`_clamp_left_into`).
+    # ``left`` arrives as the screen-centered target; the clamp leans it back
+    # into the bound, pinning the footprint's right margin at the bound's right
+    # edge when the bound is entirely left of center (#1051).
+    #
+    # Vertically, ``top`` is clamped into ``[1, rows - h + 1]``. For a forced
+    # SIDE (#1041) this is the SHIFT that keeps an oversized submenu on the
+    # chain's side: a ``'below'`` box that would overflow the bottom slides
+    # up, an ``'above'`` box that would start off the top slides down — both
+    # land fully on-screen (overlapping the subject row if need be) rather
+    # than flipping to the opposite side.
+    left = _clamp_left_into(left, w, cols, bounds)
     top = max(1, min(top, rows - h + 1))
 
     return Rect(left, top, left + w, top + h)
 
 
+def _clamp_left_into(left, w, cols, bounds):
+    """Clamp a box ``left`` so its #1043 footprint stays within ``bounds``.
+
+    The footprint is the box (width ``w``) plus one outer-margin column just
+    outside each vertical border, so it spans ``[left - 1, left + w]`` — width
+    ``w + 2``. Keeping it within an inclusive 1-based span ``bounds = (L, R)``
+    means ``left - 1 >= L`` and ``left + w <= R``, i.e. ``left`` in
+    ``[L + 1, R - w]``; ``left`` is clamped into that range (it arrives as the
+    screen-centered TARGET, so the clamp is what leans it toward center yet pins
+    it to a bound edge when the bound is off to one side).
+
+    ``bounds=None`` means the whole screen, ``(1, cols)`` — the unchanged
+    #1040/#1043 behavior. If the footprint is wider than the bound
+    (``R - w < L + 1`` — a menu wider than its list pane), it can't fit, so we
+    FALL BACK to the screen: ``[2, cols - w]`` when the screen has margin room
+    (``w <= cols - 2``), else the plain on-screen clamp ``[1, cols - w + 1]`` (a
+    frame spanning the screen width has no room for margins; :func:`_paint`
+    omits the off-screen one).
+    """
+    if bounds is not None:
+        L, R = bounds
+        if R - w >= L + 1:                  # footprint fits within the bound
+            return max(L + 1, min(left, R - w))
+        # else: wider than the bound — fall back to the screen clamp below.
+    if w <= cols - 2:
+        return max(2, min(left, cols - w))
+    return max(1, min(left, cols - w + 1))
+
+
 # ---------------------------------------------------------------------------
 # Engine — the shared modal lifecycle
 # ---------------------------------------------------------------------------
+
+
+# Frame border glyphs (DOUBLE-line box-drawing) — centralized so a modal
+# reads visually distinct from the single-line pane splitters, and so the
+# style is one edit per glyph to change. Used by ``_draw_top_border``,
+# ``_draw_bottom_border``, and the side-border writes in ``_paint``.
+_BORDER_TL = '╔'   # top-left corner
+_BORDER_TR = '╗'   # top-right corner
+_BORDER_BL = '╚'   # bottom-left corner
+_BORDER_BR = '╝'   # bottom-right corner
+_BORDER_H = '═'    # horizontal run
+_BORDER_V = '║'    # vertical side
 
 
 # Restore marker planted into pane row caches on close (see ``run_modal``'s
@@ -149,7 +269,8 @@ def _rects_intersect(a, b):
 
 
 def run_modal(browser, content, *, placement='center', anchor=None,
-              delay_interaction=False, _read_key=None,
+              bounds=None, delay_interaction=False, cancel_keys=frozenset(),
+              cancel_on_right_click=False, _read_key=None,
               _delay_threshold=None, _now=None, _input_ready=None):
     """Run one blocking modal dialog to completion; return its result.
 
@@ -174,7 +295,11 @@ def run_modal(browser, content, *, placement='center', anchor=None,
         ``(False, _)`` continues the loop; ``(True, result)`` closes the
         dialog and makes ``run_modal`` return ``result``.
 
-    ``placement`` / ``anchor`` are forwarded to :func:`_modal_place`.
+    ``placement`` / ``anchor`` / ``bounds`` are forwarded to
+    :func:`_modal_place`. ``bounds=(L, R)`` (default ``None`` = full screen)
+    is the inclusive 1-based horizontal span the dialog's painted footprint is
+    kept within; only the ``ctx.menu`` anchored path supplies it (the list
+    pane's columns, #1051), so every centered modal is unaffected.
 
     ``delay_interaction`` distinguishes a dialog the user asked for from one
     that appears on its own (a background error, an async event). When
@@ -189,6 +314,21 @@ def run_modal(browser, content, *, placement='center', anchor=None,
         ``'_stdin'`` and resize/screen-lost are still serviced (a streaming
         recipe behind the dialog keeps running, the dialog still repaints on
         resize). After the window, keys dispatch as usual.
+
+    ``cancel_keys`` / ``cancel_on_right_click`` extend the uniform esc/ctrl-c
+    cancel with extra close gestures, used ONLY by the ``ctx.menu`` path (#1039)
+    so pressing a context-menu trigger again toggles an open menu shut. Both
+    default to "off", leaving every other modal (``ctx.pick`` / ``ctx.confirm``
+    / ``ctx.input`` / ``ctx.alert``) unchanged — there ``\\`` is a valid filter /
+    text character and a right-click is just swallowed:
+
+      * ``cancel_keys`` — a frozenset of key names; any one closes the dialog
+        with result ``None`` (like esc). Checked alongside esc/ctrl-c, BEFORE
+        ``content.handle_key`` — so in a menu ``\\`` closes rather than being
+        consumed as type-ahead (#1042).
+      * ``cancel_on_right_click`` — when True, a bare ``right-click:R:C`` event
+        closes the dialog with ``None`` instead of being swallowed with the
+        other mouse events (other mouse events stay swallowed).
 
     Injection seams (all default to production behavior; tests pass
     deterministic stand-ins so there are no real sleeps):
@@ -246,7 +386,26 @@ def run_modal(browser, content, *, placement='center', anchor=None,
     cache = PaneCache()
 
     def _measure_frame():
-        """(Re)compute the frame ``Rect`` from the current terminal size."""
+        """(Re)compute the frame ``Rect`` from the current terminal size.
+
+        For an anchored placement this is also where the per-chain menu
+        SIDE (#1041) is resolved, because it's the one spot that knows BOTH
+        the anchor row and the measured frame height. ``browser`` carries a
+        ``_context_menu_side`` slot that ``Browser._fire_context_menu`` resets
+        to ``None`` at the start of each context-menu chain and clears when it
+        ends:
+
+          * unset (``None``) → DECIDE the side from the anchor row + this
+            frame's height (below if it fits, else above) and STORE it back,
+            so the first ``ctx.menu`` of a chain fixes the side;
+          * already set → REUSE it (a submenu opened later in the same chain
+            opens on the same side, shifting to fit rather than flipping).
+
+        Read via ``getattr`` so a Browser without the slot — or any non-chain
+        anchored use (no ``on_context_menu`` fire around it) — behaves like
+        "no preferred side" and decides fresh, never persisting one. Centered
+        placements never touch the slot.
+        """
         cols, rows = term_size()
         max_w, max_h = _modal_caps(cols, rows)
         content_w, content_h = content.measure(max_w, max_h)
@@ -255,13 +414,27 @@ def run_modal(browser, content, *, placement='center', anchor=None,
         content_w = max(0, min(content_w, max_w))
         content_h = max(0, min(content_h, max_h))
         fw, fh = _frame_size(content_w, content_h)
-        return _modal_place(cols, rows, fw, fh,
-                            placement=placement, anchor=anchor), content_h
+        side = None
+        if placement == 'anchor':
+            side = getattr(browser, '_context_menu_side', None)
+            if side is None:
+                # First menu of the chain (or a standalone anchored use):
+                # decide below-if-fits-else-above from this frame's height,
+                # mirroring the fresh-decision branch in ``_modal_place``.
+                row, _col = anchor
+                side = 'below' if row + 1 + fh - 1 <= rows else 'above'
+                # Persist only when the slot exists (a context-menu chain);
+                # a Browser without it stays sideless so a standalone use
+                # never leaks a side.
+                if hasattr(browser, '_context_menu_side'):
+                    browser._context_menu_side = side
+        return _modal_place(cols, rows, fw, fh, placement=placement,
+                            anchor=anchor, side=side, bounds=bounds), content_h
 
     def _paint(frame, content_h):
         """Paint the whole frame through the private cache, in one sync.
 
-        Composes every row — top border, content rows wrapped in ``│``
+        Composes every row — top border, content rows wrapped in ``║``
         borders + one column of inner padding, bottom border — to EXACTLY
         the frame width so no stale cell can bleed through ``end_row``'s
         pad math. ``update_rect`` runs exactly once per frame (the
@@ -274,12 +447,22 @@ def run_modal(browser, content, *, placement='center', anchor=None,
         frame on a tiny terminal whose interior outsizes the content — are
         blank-filled here. Without this the loop would ask the content for
         out-of-range rows and a list-backed content would ``IndexError``.
+
+        After the frame rows, one blank-space margin column is overdrawn
+        just OUTSIDE each vertical border (#1043: column ``frame.left - 1``
+        and column ``frame.right``) for every painted row, so the box never
+        visually abuts the content behind it. Each side is painted only
+        when its column is on-screen; a frame at the screen edge (the tiny
+        full-screen fallback) simply omits the side(s) with no room. These
+        columns are direct writes (no row capture) inside the same sync;
+        the close-time restore widens its poisoned region to cover them.
         """
         inner_w = frame.width - 4  # minus left/right border + 1-col pad each
         left = frame.left
         right = frame.right
         rightmost = False  # the frame never owns the screen's right edge
         last = frame.height - 1
+        cols, _rows = term_size()
         begin_sync()
         cache.update_rect(frame)
         for rel in range(frame.height):
@@ -290,12 +473,12 @@ def run_modal(browser, content, *, placement='center', anchor=None,
             elif rel == last:
                 _draw_bottom_border(frame.width)
             else:
-                # Interior row: engine draws ``│ `` … ` │``. ``content_row``
+                # Interior row: engine draws ``║ `` … ` ║``. ``content_row``
                 # is the 0-based index within the content area; rows the
                 # content doesn't cover are blank-filled to the inner width.
                 content_row = rel - 1
                 set_style(fg=8)
-                write('│')
+                write(_BORDER_V)
                 reset_style()
                 write(' ')
                 if content_row < content_h:
@@ -304,9 +487,31 @@ def run_modal(browser, content, *, placement='center', anchor=None,
                     write(' ' * inner_w)
                 write(' ')
                 set_style(fg=8)
-                write('│')
+                write(_BORDER_V)
                 reset_style()
             end_row()
+        # Outer margin (#1043): one blank cell just outside each vertical
+        # border, on every painted row. Direct writes (the row capture is
+        # closed) into the open sync; a plain space over the background
+        # opens a clean 1-col gap. Each side is painted only when on-screen
+        # — column ``left - 1`` needs ``left >= 2``, column ``right`` needs
+        # ``right <= cols`` — so a frame flush against an edge (tiny
+        # full-screen fallback) drops that side's margin without overrunning.
+        lm = left - 1
+        rm = right            # box owns columns ``left..right-1``; ``right`` is just past it
+        paint_lm = lm >= 1
+        paint_rm = rm <= cols
+        if paint_lm or paint_rm:
+            for rel in range(frame.height):
+                abs_row = frame.top + rel
+                if paint_lm:
+                    move(abs_row, lm)
+                    reset_style()
+                    write(' ')
+                if paint_rm:
+                    move(abs_row, rm)
+                    reset_style()
+                    write(' ')
         end_sync()
         flush()
 
@@ -398,14 +603,32 @@ def run_modal(browser, content, *, placement='center', anchor=None,
             if gate_until is not None and now() < gate_until:
                 continue
 
-            # Mouse events are swallowed (no in-dialog mouse this round).
+            # Context-menu close-on-trigger (#1039): a repeated right-click on
+            # an open ``ctx.menu`` toggles it shut. Only the menu path passes
+            # ``cancel_on_right_click``; for every other modal a right-click
+            # falls through to the swallow below. Checked before the swallow so
+            # the bare ``right-click:R:C`` closes instead of being eaten; only
+            # the menu path opts in, so other modals are unaffected.
+            if cancel_on_right_click and key.startswith('right-click:'):
+                result = None
+                break
+
+            # Mouse events are swallowed (no in-dialog mouse this round). A
+            # right-click that reaches here (no ``cancel_on_right_click``) is
+            # swallowed too — it never selects or cancels in a non-menu modal.
             if (key.startswith('mouse-click:')
+                    or key.startswith('right-click:')
                     or key.startswith('scroll-up:')
                     or key.startswith('scroll-down:')):
                 continue
 
-            # Uniform cancel: esc / ctrl-c close the dialog with None.
-            if key == 'esc' or key == 'ctrl-c':
+            # Uniform cancel: esc / ctrl-c close the dialog with None. The menu
+            # path (#1039) extends this with ``cancel_keys`` (``\`` / F1), so a
+            # repeated keyboard trigger toggles an open menu shut. This runs
+            # BEFORE ``content.handle_key`` so ``\`` closes rather than being
+            # consumed as menu type-ahead (#1042); ``cancel_keys`` is empty for
+            # every other modal, where ``\`` stays a valid filter / text char.
+            if key == 'esc' or key == 'ctrl-c' or key in cancel_keys:
                 result = None
                 break
 
@@ -426,6 +649,17 @@ def run_modal(browser, content, *, placement='center', anchor=None,
         # cell the dialog touched; untouched rows cache-hit and emit
         # nothing.
         #
+        # The dialog's painted footprint is one column WIDER than the frame
+        # on each side: the #1043 outer margin overdraws column
+        # ``frame.left - 1`` and column ``frame.right``. Poison against that
+        # widened rect, not the bare frame — a pane that abuts a margin
+        # column without overlapping the frame proper (e.g. a left pane
+        # split exactly at ``frame.left``) would otherwise keep a stale
+        # blank there. Poisoning that pane repaints its whole row, clearing
+        # the margin cell. ``frame`` may be ``None`` (first measure raised),
+        # so only widen a real ``Rect``; the loop's ``_rects_intersect``
+        # still no-ops a ``None``.
+        #
         # After a resize-while-open the caches were CLEARED, so the poison
         # loop is a no-op over empty caches — and the next ``render_full``
         # rebuilds them fresh, taking ``end_row``'s ``prev_rect is None``
@@ -442,8 +676,12 @@ def run_modal(browser, content, *, placement='center', anchor=None,
             end_sync()
             flush()
         else:
+            restore_rect = frame
+            if isinstance(frame, Rect):
+                restore_rect = Rect(max(1, frame.left - 1), frame.top,
+                                    frame.right + 1, frame.bottom)
             for pane in browser._pane_cache.values():
-                overlap = _rects_intersect(pane.rect, frame)
+                overlap = _rects_intersect(pane.rect, restore_rect)
                 if overlap is None:
                     continue
                 pane_width = pane.rect.width
@@ -458,26 +696,26 @@ def run_modal(browser, content, *, placement='center', anchor=None,
 
 
 def _draw_top_border(title, width):
-    """Emit the top border row ``┌─ {title} ─…─┐`` to exactly ``width`` cells.
+    """Emit the top border row ``╔═ {title} ═…═╗`` to exactly ``width`` cells.
 
-    With no title it's a solid ``┌──…──┐`` run. The box-drawing chars use
+    With no title it's a solid ``╔══…══╗`` run. The box-drawing chars use
     the dim/gray separator chrome (palette index 8, matching
     ``render_separator``); the title renders bold in the default fg so it
     reads clearly against the dim frame. Must fill the full frame width so
     ``end_row``'s pad math leaves no stale cells.
     """
     set_style(fg=8)
-    write('┌')
+    write(_BORDER_TL)
     if title:
-        # ``┌─ title ─…─┐``: leading ``─ ``, the bold title, a trailing
+        # ``╔═ title ═…═╗``: leading ``═ ``, the bold title, a trailing
         # `` `` then dashes filling the remainder before the corner.
-        # Account for the four corner/space cells (``┌``, ``─``, two
-        # spaces) plus the closing ``┐`` and its leading ``─``.
-        write('─ ')
+        # Account for the four corner/space cells (``╔``, ``═``, two
+        # spaces) plus the closing ``╗`` and its leading ``═``.
+        write(_BORDER_H + ' ')
         reset_style()
         set_style(bold=True)
         # Clip an over-long title to whatever space the frame leaves between
-        # the fixed ``┌─ `` prefix (3 cells) and the `` ─┐`` suffix (minimum
+        # the fixed ``╔═ `` prefix (3 cells) and the `` ═╗`` suffix (minimum
         # 3 cells: a space, one dash, the corner). ``_truncate_by_cells``
         # clips by *cells* (wide-char aware) and is a no-op when it already
         # fits — a plain ``title[:avail]`` slice would emit up to 2×avail
@@ -491,22 +729,22 @@ def _draw_top_border(title, width):
         write(' ')
         # Fill the gap to the closing corner with dashes (using the exact
         # cell count, which may differ from ``len(shown)`` for wide glyphs).
-        used = 3 + shown_cells + 1  # ``┌─ `` + title + trailing space
-        dashes = max(0, width - used - 1)   # -1 for the closing ``┐``
-        write('─' * dashes)
-        write('┐')
+        used = 3 + shown_cells + 1  # ``╔═ `` + title + trailing space
+        dashes = max(0, width - used - 1)   # -1 for the closing ``╗``
+        write(_BORDER_H * dashes)
+        write(_BORDER_TR)
     else:
-        write('─' * max(0, width - 2))
-        write('┐')
+        write(_BORDER_H * max(0, width - 2))
+        write(_BORDER_TR)
     reset_style()
 
 
 def _draw_bottom_border(width):
-    """Emit the bottom border row ``└──…──┘`` to exactly ``width`` cells."""
+    """Emit the bottom border row ``╚══…══╝`` to exactly ``width`` cells."""
     set_style(fg=8)
-    write('└')
-    write('─' * max(0, width - 2))
-    write('┘')
+    write(_BORDER_BL)
+    write(_BORDER_H * max(0, width - 2))
+    write(_BORDER_BR)
     reset_style()
 
 
@@ -713,9 +951,13 @@ class ListContent:
         for a ``(display, value)`` option, or the string itself for a bare one
         (a no-op on an empty filtered list). Selection moves (``down``/
         ``ctrl-n``, ``up``/``ctrl-p``) WRAP; ``home``/``end`` jump to the ends.
-        In filter mode a printable char / ``space`` extends the query and
-        ``backspace`` deletes; both re-filter and re-clamp the cursor + scroll.
-        Every other key is ignored.
+        In filter mode (``filter=True``, the picker) a printable char /
+        ``space`` extends the query and ``backspace`` deletes; both re-filter
+        and re-clamp the cursor + scroll. In menu mode (``filter=False``) there
+        is no query: a single printable char is type-ahead instead — it jumps
+        the selection to the NEXT option whose visible display starts with that
+        character (case-insensitive), cycling forward from the current
+        selection (see :meth:`_typeahead`). Every other key is ignored.
         """
         filtered = self._filtered()
 
@@ -743,8 +985,9 @@ class ListContent:
                 return (True, filtered[self.cursor][1])   # the pair's value
             return (False, None)   # empty filtered list — no-op
 
-        # Filter editing only applies in filter mode; in menu mode these keys
-        # fall through to the ignore path below.
+        # A printable char means different things by mode. In filter mode it
+        # edits the query (with ``space`` / ``backspace``); in menu mode it is
+        # type-ahead — jump to the next display starting with that char.
         if self._filter:
             if key == 'backspace':
                 if self.filter_query:
@@ -759,9 +1002,40 @@ class ListContent:
                 self.filter_query += key
                 self._clamp(self._filtered())
                 return (False, None)
+        elif len(key) == 1 and key.isprintable():
+            self._typeahead(key)
+            return (False, None)
 
         # Unrecognized key — ignored, loop continues.
         return (False, None)
+
+    def _typeahead(self, char):
+        """Menu type-ahead: jump the selection to the next match for ``char``.
+
+        Single-letter type-ahead (NOT a multi-character prefix buffer): search
+        forward from the option AFTER the current selection, wrapping around,
+        for the first option whose visible display starts with ``char``
+        (case-insensitive, leading whitespace ignored). The current option is
+        considered last, so pressing the same letter repeatedly cycles through
+        all matches and wraps. If a match is found, ``cursor`` lands on it (and
+        the window scrolls to keep it visible); with no match anywhere the
+        selection is left unchanged.
+
+        Matching is on the DISPLAY half's VISIBLE text — embedded SGR is
+        stripped first (via the same ``_collapse_visible`` the rows use) so the
+        comparison sees what the user sees, not escape bytes.
+        """
+        target = char.lower()
+        # In menu mode the visible list is every option (no filter narrowing).
+        options = self._filtered()
+        n = len(options)
+        for step in range(1, n + 1):
+            idx = (self.cursor + step) % n
+            display = _collapse_visible([(options[idx][0], None, False)])
+            if display.lstrip()[:1].lower() == target:
+                self.cursor = idx
+                self._clamp(options)
+                return
 
 
 # ---------------------------------------------------------------------------
@@ -1279,6 +1553,16 @@ class InputContent:
 # dialogs live HERE (return ``None`` without opening), so ``ctx`` and any
 # other caller get the no-open behavior uniformly. ``delay_interaction`` and
 # the ``_read_key`` test seam are threaded straight through.
+#
+# The context-menu trigger gesture dismisses ANY open modal (#1063), but text
+# entry is respected. Every wrapper passes ``cancel_on_right_click=True`` (a
+# right-click and F1 are never text), so right-click / F1 close any dialog. The
+# ``\`` key is the split: in the NON-text modals (menu / confirm / alert) it is
+# a close gesture too — those pass the full ``CONTEXT_MENU_TRIGGER_KEYS``
+# (``{'\\', 'f1'}``) — but in ``pick`` (the filter row) and ``input`` (the
+# field) ``\`` is a literal character, so those pass only ``F1_CANCEL_KEYS``
+# (F1 alone), leaving ``\`` to reach the content.
+F1_CANCEL_KEYS = frozenset({'f1'})
 
 
 def modal_pick(browser, label, options, *, delay_interaction=False,
@@ -1290,33 +1574,50 @@ def modal_pick(browser, label, options, *, delay_interaction=False,
     matches the display and the dialog returns the chosen option's VALUE (the
     tuple's value, or the string itself for a bare option). Returns ``None`` on
     cancel. An empty ``options`` returns ``None`` WITHOUT opening a dialog.
+
+    F1 and right-click dismiss the dialog (#1063); ``\\`` is NOT a cancel here —
+    it is a literal filter character — so only ``F1_CANCEL_KEYS`` is passed.
     """
     options = list(options)
     if not options:
         return None
     content = ListContent(options, filter=True, title=label)
     return run_modal(browser, content, placement='center',
-                     delay_interaction=delay_interaction, _read_key=_read_key)
+                     delay_interaction=delay_interaction,
+                     cancel_keys=F1_CANCEL_KEYS, cancel_on_right_click=True,
+                     _read_key=_read_key)
 
 
-def modal_menu(browser, items, *, anchor=None, delay_interaction=False,
-               _read_key=None):
+def modal_menu(browser, items, *, anchor=None, bounds=None,
+               delay_interaction=False, _read_key=None):
     """Anchored, unfiltered selection list — a context menu (``ctx.menu``).
 
     ``items`` is shown without a filter row. Each item is a display ``str`` OR
     a ``(display, value)`` 2-tuple; the dialog returns the chosen item's VALUE
     (the tuple's value, or the string itself for a bare item). ``anchor`` is an
     ``(row, col)`` 1-based screen cell the menu drops below (see
-    :func:`_modal_place`); when ``None`` the dialog centers. Returns ``None``
-    on cancel. Empty ``items`` returns ``None`` WITHOUT opening a dialog.
+    :func:`_modal_place`); when ``None`` the dialog centers. ``bounds=(L, R)``
+    (default ``None`` = full screen) is the inclusive 1-based horizontal span
+    the menu's footprint is kept within — ``ctx.menu`` passes the list pane's
+    columns so the menu leans toward screen center but stays over its row
+    (#1051). Returns ``None`` on cancel. Empty ``items`` returns ``None``
+    WITHOUT opening a dialog.
     """
     items = list(items)
     if not items:
         return None
     content = ListContent(items, filter=False)
     placement = 'anchor' if anchor is not None else 'center'
+    # A repeated context-menu trigger (``\`` / F1 / right-click) while the menu
+    # is open toggles it shut (#1039). The trigger set is centralized in
+    # 070-actions (``CONTEXT_MENU_TRIGGER_KEYS``), shared with the OPEN path so
+    # the gesture is defined once. ONLY ``ctx.menu`` opts in — pick/confirm/
+    # input/alert leave these at their off defaults, so ``\`` / right-click keep
+    # their normal meaning there.
     return run_modal(browser, content, placement=placement, anchor=anchor,
-                     delay_interaction=delay_interaction, _read_key=_read_key)
+                     bounds=bounds, delay_interaction=delay_interaction,
+                     cancel_keys=CONTEXT_MENU_TRIGGER_KEYS,
+                     cancel_on_right_click=True, _read_key=_read_key)
 
 
 def modal_confirm(browser, message, buttons=('&Yes', '&No'), *, title=None,
@@ -1329,10 +1630,16 @@ def modal_confirm(browser, message, buttons=('&Yes', '&No'), *, title=None,
     bare string (``'Yes'`` / ``'No'`` / …). Returns ``None`` on cancel. An
     empty ``buttons`` raises ``ValueError`` (a programming error — surfaced by
     :class:`ChoiceContent`).
+
+    The context-menu trigger dismisses it (#1063): ``\\`` / F1 / right-click all
+    cancel (a confirm has no text entry, so ``\\`` is a close gesture) — it
+    passes the full ``CONTEXT_MENU_TRIGGER_KEYS`` plus right-click.
     """
     content = ChoiceContent(message, buttons, title=title)
     return run_modal(browser, content, placement='center',
-                     delay_interaction=delay_interaction, _read_key=_read_key)
+                     delay_interaction=delay_interaction,
+                     cancel_keys=CONTEXT_MENU_TRIGGER_KEYS,
+                     cancel_on_right_click=True, _read_key=_read_key)
 
 
 def modal_input(browser, prompt, *, default='', delay_interaction=False,
@@ -1341,10 +1648,16 @@ def modal_input(browser, prompt, *, default='', delay_interaction=False,
 
     ``default`` pre-fills the field. Returns the entered string (possibly
     empty), or ``None`` on cancel.
+
+    F1 and right-click dismiss the dialog (#1063); ``\\`` is NOT a cancel here —
+    it is a literal character typed into the field — so only ``F1_CANCEL_KEYS``
+    is passed.
     """
     content = InputContent(prompt, default=default)
     return run_modal(browser, content, placement='center',
-                     delay_interaction=delay_interaction, _read_key=_read_key)
+                     delay_interaction=delay_interaction,
+                     cancel_keys=F1_CANCEL_KEYS, cancel_on_right_click=True,
+                     _read_key=_read_key)
 
 
 def modal_alert(browser, text, *, title=None, delay_interaction=False,
@@ -1353,8 +1666,14 @@ def modal_alert(browser, text, *, title=None, delay_interaction=False,
 
     Always returns ``None``: the activation result (the ``'OK'`` label) is
     discarded since an alert conveys nothing back to the caller.
+
+    The context-menu trigger dismisses it (#1063): ``\\`` / F1 / right-click all
+    cancel (an alert has no text entry, so ``\\`` is a close gesture) — it
+    passes the full ``CONTEXT_MENU_TRIGGER_KEYS`` plus right-click.
     """
     content = ChoiceContent(text, ('&OK',), title=title)
     run_modal(browser, content, placement='center',
-              delay_interaction=delay_interaction, _read_key=_read_key)
+              delay_interaction=delay_interaction,
+              cancel_keys=CONTEXT_MENU_TRIGGER_KEYS,
+              cancel_on_right_click=True, _read_key=_read_key)
     return None

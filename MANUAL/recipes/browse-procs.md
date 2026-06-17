@@ -17,6 +17,9 @@ after a y/n confirm.
   preview pane.
 - A destructive custom `Action` guarded by `ctx.confirm`, with
   `ctx.refresh` to redraw after the kill lands.
+- A right-click context menu (`on_context_menu`) that re-invokes
+  `ctx.menu` for a flat signal submenu and pages auxiliary process
+  data (`lsof`, `ss`, `/proc/<pid>/environ`, `/proc/<pid>/status`).
 
 **Usage:**
 
@@ -25,6 +28,10 @@ after a y/n confirm.
 ```
 
 Keys: `k` send SIGTERM (with confirmation), `ctrl-r` reload tree.
+Right-click a process (or the `\` / F1 keys) to open its context menu:
+send a signal (submenu; strong signals confirm, and the SIGTERM row
+shows the `k` hotkey), page open files / sockets / environment / full
+status, renice, or attach `strace`.
 
 **Source:** [`recipes/browse-procs`](../../recipes/browse-procs)
 

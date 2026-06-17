@@ -47,6 +47,7 @@ _render.SgrState = _term.SgrState
 _modal.Rect = _render.Rect
 _modal.PaneCache = _state.PaneCache
 _modal.write = _term.write
+_modal.move = _term.move
 _modal.set_style = _term.set_style
 _modal.reset_style = _term.reset_style
 _modal.read_key = _term.read_key
@@ -71,6 +72,7 @@ _modal.time = _time
 
 InputContent = _modal.InputContent
 run_modal = _modal.run_modal
+modal_input = _modal.modal_input
 Rect = _render.Rect
 PaneCache = _state.PaneCache
 
@@ -426,6 +428,45 @@ class TestThroughRunModal(unittest.TestCase):
         c = InputContent('Name?', default='alice')
         with _FixedTermSize(80, 24), _Capture():
             res = run_modal(b, c, _read_key=_scripted(['esc']))
+        self.assertIsNone(res)
+
+
+class TestInputCloseGesture(unittest.TestCase):
+    """``ctx.input`` (``modal_input``) is dismissed by the context-menu trigger
+    (#1063) RESPECTING text entry: F1 and right-click (never text) cancel, while
+    ``\\`` stays a literal character typed into the field (it must NOT close)."""
+
+    def test_backslash_typed_into_field_not_close(self):
+        # '\' is text here: it goes into the buffer, then 'enter' returns the
+        # field's contents (a close would have returned None instead). This is
+        # the text-respect case.
+        b = _FakeBrowser()
+        with _FixedTermSize(80, 24), _Capture():
+            res = modal_input(b, 'Path?', _read_key=_scripted(['\\', 'enter']))
+        self.assertEqual(res, '\\')
+
+    def test_backslash_appended_to_default(self):
+        # A pre-filled field keeps its default and appends the typed '\'.
+        b = _FakeBrowser()
+        with _FixedTermSize(80, 24), _Capture():
+            res = modal_input(b, 'Path?', default='a',
+                              _read_key=_scripted(['\\', 'enter']))
+        self.assertEqual(res, 'a\\')
+
+    def test_f1_closes_input(self):
+        # F1 is never text → it cancels the input (returns None) before content.
+        b = _FakeBrowser()
+        with _FixedTermSize(80, 24), _Capture():
+            res = modal_input(b, 'Path?', default='seed',
+                              _read_key=_scripted(['f1']))
+        self.assertIsNone(res)
+
+    def test_right_click_closes_input(self):
+        # A right-click is never text → it cancels the input (returns None).
+        b = _FakeBrowser()
+        with _FixedTermSize(80, 24), _Capture():
+            res = modal_input(b, 'Path?', default='seed',
+                              _read_key=_scripted(['right-click:9:9']))
         self.assertIsNone(res)
 
 

@@ -113,10 +113,11 @@ Make it executable and run it directly: `chmod +x my-recipe && ./my-recipe`.
 | Ctrl-P, Alt-P              | Toggle preview / children pane          |
 | `R`                        | Toggle preview ANSI colours             |
 | Shift-Up/Down, Alt-PgUp/Dn | Scroll preview (Shift-Home/End = ends)  |
-| `-`/`=` , `\`              | Resize split · cycle layout (v/h/m/pc)  |
+| `-`/`=` , Alt-1..4         | Resize split · select layout (v/h/m/pc) |
 | `v` , `~`                  | Page preview in `$PAGER` · message log  |
 | Ctrl-R / Ctrl-L            | Reload / redraw                         |
-| `?` / F1                   | Help (full key list)                    |
+| `\` / F1                   | Context menu (also right-click)         |
+| `?`                        | Help (full key list)                    |
 | Enter                      | `--on-enter` (default: print + exit)    |
 | `q`, Esc, Ctrl-C           | Quit (Ctrl-Z suspends)                  |
 

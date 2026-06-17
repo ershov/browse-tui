@@ -353,7 +353,7 @@ When a placeholder doesn't resolve, `browse-tui` falls back to the bare id.
 | `--preview-ansi` / `--no-preview-ansi` | Honour ANSI SGR colour codes in the preview pane (default on). Other escape sequences are stripped either way. Toggle live with capital `R`. |
 | `--no-multi-select`   | Disable the selection set (Space/Alt-Space/Ctrl-A become no-ops). |
 | `--list-size N\|N%`    | Initial list pane size. `N` is a line count (proportional to startup terminal — scales on resize); `N%` locks the proportion. Default `30%`. Adjust live with `-`/`_` (shrink) and `=`/`+` (grow); the ratio is preserved across terminal resizes. |
-| `--split-type TYPE`   | Initial pane layout. Accepts `h`/`horizontal`, `v`/`vertical`, `m`/`mixed`, `pc`/`preview-children`, or `a`/`auto` (default). `auto` picks `v` when terminal width >= 230 columns, else `h`; resolved once at startup and not recomputed on resize. Switch live with `\` (cycles `v`→`h`→`m`→`pc`) or Alt-1/2/3/4. See [Layouts](#layouts) below. |
+| `--split-type TYPE`   | Initial pane layout. Accepts `h`/`horizontal`, `v`/`vertical`, `m`/`mixed`, `pc`/`preview-children`, or `a`/`auto` (default). `auto` picks `v` when terminal width >= 230 columns, else `h`; resolved once at startup and not recomputed on resize. Switch live with Alt-1/2/3/4 (direct select: `v`/`h`/`m`/`pc`). See [Layouts](#layouts) below. |
 | `--show-ids MODE`     | Whether to render the id segment in front of each row's title: `always` / `auto` (default) / `never`. In `auto` mode the id is shown only when it is a scalar (`str`/`int`) differing from the title — for line-based CLI sources (filenames, `seq`, `xargs`) an id equal to the title would just be duplication and is suppressed; a `--python` recipe's structured ids (tuples/objects) are routing state and are never shown. |
 | `--title TITLE`       | Window title shown in the info bar.                          |
 | `--initial-scope ID`  | Start scoped to this id (Alt-Up to leave).                   |
@@ -361,8 +361,8 @@ When a placeholder doesn't resolve, `browse-tui` falls back to the bare id.
 
 ### Layouts
 
-Four pane layouts are available; switch live with `\` (cycle) or Alt-1/2/3/4
-(direct select). All layouts include a single-line info bar across the bottom.
+Four pane layouts are available; switch live with Alt-1/2/3/4 (direct
+select). All layouts include a single-line info bar across the bottom.
 
 ```
 Vertical (`v`, Alt-1):           Horizontal (`h`, Alt-2):
@@ -663,7 +663,6 @@ hook surface and module-discovery rules.
 | Shift-End      | Scroll preview to bottom                                    |
 | `-` / `_`      | Shrink list pane (no-op when preview hidden)                |
 | `=` / `+`      | Grow list pane (no-op when preview hidden)                  |
-| `\`            | Cycle pane layout (`v`→`h`→`m`→`pc`→`v`)                    |
 | Alt-1          | Switch to vertical layout (`v`)                             |
 | Alt-2          | Switch to horizontal layout (`h`)                           |
 | Alt-3          | Switch to mixed layout (`m`)                                |
@@ -683,7 +682,8 @@ hook surface and module-discovery rules.
 | Shift-Enter    | In search mode → previous match                             |
 | Ctrl-X         | In filter mode → clear all filters and exit                 |
 | Esc            | Exit search/filter mode (cancel current edit), else quit    |
-| `?` / F1       | Toggle help screen                                          |
+| `\` / F1       | Open the recipe's context menu (also right-click); no-op if none |
+| `?`            | Toggle help screen                                          |
 | `q`            | Quit (exit code 1)                                          |
 | Ctrl-C         | Quit (exit code 1)                                          |
 | Ctrl-Z         | Suspend (resume with `fg`)                                  |

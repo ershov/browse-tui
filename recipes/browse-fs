@@ -3,6 +3,14 @@
 or dirs-first directory listing; actions e:Edit ($EDITOR), o:Open (xdg-open), d:Delete
 (with ctx.confirm); background mtime watcher refreshes changed dirs.
 
+A right-click (or the backslash / F1 keys) opens a context menu keyed to the
+cursor row's kind — a directory (run shell here, open in browse-git by mode
+when it is a repo, new file / directory, show full path, delete), a file (edit /
+view in $PAGER / open / run shell in its dir / browse-md or browse-plan / render
+with mdcat / diff against a single other selected item / show full path /
+delete), a multi-selection (delete N, open N in $EDITOR), or a missing-path
+special (show full path only). See ``on_context_menu``.
+
 The lone argument ``-`` reads a newline-separated list of paths from
 ``sys.stdin`` (one per line, blank lines skipped, duplicates dropped
 keeping the first) BEFORE the UI starts and displays exactly those
@@ -28,7 +36,9 @@ Usage:  browse-fs [PATH | -]   # no argument ⇒ the current directory
 """
 
 import os
+import shutil
 import stat
+import subprocess
 import sys
 import time
 
@@ -36,6 +46,11 @@ from browse_tui import (
     Action, Browser, BrowserConfig, Item,
     cell_ljust, cell_rjust, default_row_content, recipe_argv, style,
 )
+
+# Probe ``delta`` once at load (not per render): the context-menu "Diff" entry
+# pipes ``diff``'s output through it for terminal-native rendering when it is
+# on PATH, falling back to the plain unified diff otherwise.
+HAVE_DELTA = shutil.which('delta')
 
 # Optional md2ansi_lib plugin — gates the colored *.md preview mode.
 try:
@@ -352,6 +367,441 @@ def delete(ctx):
     ctx.refresh()
 
 
+# ---- context menu --------------------------------------------------------
+#
+# Following the committed convention (browse-procs / git / claude / md / plan):
+# a PURE ``context_menu_options(ctx)`` builds the ``(label, token)`` rows by the
+# CURSOR ITEM'S KIND (opening no modal, so it is unit-testable), a flat
+# ``{token: handler}`` table (``_MENU_ACTIONS``) dispatches the chosen token,
+# and a thin ``on_context_menu(ctx)`` ties the two together. Rows that duplicate
+# a keybinding carry a LITERAL hotkey hint (menus don't parse ``&``): e (Edit /
+# Enter), o (Open with default app), d (Delete). The ``m`` markdown toggle is a
+# global preview knob (not a per-item action), so it is left to the keybinding
+# and gets no menu row. Destructive deletes reuse the existing ``delete``
+# handler's confirm; non-visible values (paths) pop up via ``ctx.alert`` — there
+# is NO clipboard. A file row also surfaces *.md / .PLAN.md launches plus the
+# shared directory actions (``_dir_actions``), which there act on the file's
+# PARENT — the directory being listed; the git-mode rows appear only for a repo
+# directory (the cursor dir, or a file's repo parent). The menu is
+# read-only-friendly:
+# a missing external tool surfaces via ``run_external``'s own error rather than
+# crashing (browse-tui swallows ``on_context_menu`` exceptions besides).
+
+
+# Git view modes browse-git accepts via ``--mode NAME`` (its verified
+# ``<dir> --mode`` interface), as ``(label, token, mode)``. Shown only when the
+# directory is a git repo; the chosen row launches ``browse-git <dir> --mode
+# NAME`` on that directory.
+_DIR_GIT_MODES = [
+    ('git commits',  'dir.git.commits',  'commits'),
+    ('git branches', 'dir.git.branches', 'branches'),
+    ('git status',   'dir.git.status',   'status'),
+    ('git stashes',  'dir.git.stash',    'stash'),
+    ('git reflog',   'dir.git.reflog',   'reflog'),
+]
+
+_PLAN_BASENAME = '.PLAN.md'
+
+
+def _is_git_repo(path):
+    """True iff ``path`` is inside a git work tree (``find_git_root`` hits).
+
+    Reuses md_doc's ``.git``-walk (a worktree's ``.git`` file counts), so the
+    git-mode rows light up for both a plain repo and a worktree — matching
+    browse-claude's same-named gate. ``False`` when md_doc is unavailable (the
+    git rows then never appear) or ``path`` is falsy.
+    """
+    return bool(path) and _md_doc is not None and _md_doc.find_git_root(path) is not None
+
+
+def _editor_argv():
+    """The user's editor as an argv prefix — ``$EDITOR`` (shell-split), else ``vi``."""
+    import shlex
+    return shlex.split(os.environ.get('EDITOR') or '') or ['vi']
+
+
+def _pager_argv():
+    """The user's pager as an argv prefix — ``$PAGER`` (shell-split), else ``less -R``."""
+    import shlex
+    return shlex.split(os.environ.get('PAGER') or '') or ['less', '-R']
+
+
+def _str_targets(ctx):
+    """The selected/cursor target Items with a real (``str`` path) id.
+
+    Mirrors the filter the e/o/d handlers apply: the synthetic ``missing`` /
+    ``err`` / ``launch`` rows have tuple ids, so they are dropped — the menu's
+    multi-target Delete / Open reuse this so they never feed a tuple to argv.
+    """
+    return [it for it in ctx.targets if isinstance(it.id, str)]
+
+
+def _selected_other_path(ctx, path):
+    """The single OTHER selected path, or ``None`` — gates the "Diff" entry.
+
+    Enabled only when exactly one selected row OTHER than the cursor's carries a
+    real (``str``) path id. None, or two-plus others (ambiguous), yields
+    ``None`` and the Diff entry is omitted.
+    """
+    others = [it.id for it in ctx.selected
+              if isinstance(it.id, str) and it.id != path]
+    return others[0] if len(others) == 1 else None
+
+
+# -- shared handlers --------------------------------------------------------
+
+
+def _target_dir(path):
+    """The directory a ``dir.*`` action operates on, given the cursor's path.
+
+    The directory actions (``_dir_actions``) are offered on BOTH a directory
+    cursor and a file cursor, where they act on the directory being listed: the
+    dir itself for a directory cursor, the file's PARENT for a file cursor. Their
+    handlers all receive the cursor row's ``path``; this collapses the two cases
+    so the same ``dir.*`` handler threads the right directory either way — the
+    dir verbatim, else the file's parent (``'.'`` for a bare basename). This
+    mirrors the original ``file.shell`` ``os.path.dirname(p) or '.'`` rule and is
+    what keeps the dir-cursor tokens unchanged (the token says WHICH action; the
+    cursor says WHICH directory).
+    """
+    return path if os.path.isdir(path) else (os.path.dirname(path) or '.')
+
+
+def _run_shell(ctx, cwd):
+    """Open the user's ``$SHELL`` with ``cwd`` as the working directory.
+
+    For a directory row ``cwd`` is the directory itself; for a file row it is
+    the file's parent directory. ``ctx.run_external`` has no ``cwd`` knob, so
+    the directory change rides in a shell-string command (which it runs via
+    ``sh -c``): ``cd <dir> && exec <$SHELL>``. ``exec`` replaces the wrapping
+    ``sh`` with the user's shell so signals / the exit code pass through
+    naturally; ``$SHELL`` defaults to ``sh`` and may itself carry args
+    (``bash --login``), which the shell-string honours verbatim. The shell
+    inherits the terminal (a normal interactive child), so no ``keep_screen``.
+    """
+    import shlex
+    shell = os.environ.get('SHELL') or 'sh'
+    ctx.run_external(f'cd {shlex.quote(cwd)} && exec {shell}')
+
+
+def _new_file(ctx, dir_path):
+    """Prompt for a name and create an empty file under ``dir_path``, then refresh.
+
+    ``open(..., 'x')`` fails if the file already exists; that and a permission
+    error surface via ``ctx.error`` rather than crashing. A cancel / blank name
+    is a no-op. On success the directory is refreshed so the new row shows.
+    """
+    name = ctx.input('New file name: ')
+    if name is None or not name.strip():
+        return
+    target = os.path.join(dir_path, name.strip())
+    try:
+        with open(target, 'x'):
+            pass
+    except OSError as e:
+        ctx.error(f'{target}: {e}')
+        return
+    ctx.refresh()
+
+
+def _new_dir(ctx, dir_path):
+    """Prompt for a name and ``mkdir`` it under ``dir_path``, then refresh.
+
+    ``os.mkdir`` fails if the directory already exists; that and a permission
+    error surface via ``ctx.error``. A cancel / blank name is a no-op.
+    """
+    name = ctx.input('New directory name: ')
+    if name is None or not name.strip():
+        return
+    target = os.path.join(dir_path, name.strip())
+    try:
+        os.mkdir(target)
+    except OSError as e:
+        ctx.error(f'{target}: {e}')
+        return
+    ctx.refresh()
+
+
+def _open_browse_git(ctx, dir_path, mode):
+    """Launch ``browse-git <dir> --mode NAME`` (another browse-tui recipe)."""
+    ctx.run_external(['browse-git', dir_path, '--mode', mode], keep_screen=True)
+
+
+def _view_pager(ctx, path):
+    """Page ``path`` in ``$PAGER`` (the file's contents — the View entry)."""
+    ctx.run_external(_pager_argv() + [path])
+
+
+def _render_mdcat(ctx, path):
+    """Render a markdown file through ``mdcat`` and page it (the Render entry).
+
+    ``mdcat <file> | less -RS`` when both are present (so a long render is
+    scrollable), else bare ``mdcat`` (which pages itself on a tty), else an
+    error. A missing tool surfaces via ``run_external`` / ``ctx.error``.
+    """
+    if shutil.which('mdcat') and shutil.which('less'):
+        ctx.run_external(['bash', '-c', 'mdcat "$0" | less -RS', path])
+    elif shutil.which('mdcat'):
+        ctx.run_external(['mdcat', path])
+    else:
+        ctx.error('mdcat not found on PATH')
+
+
+def _browse_md(ctx, path):
+    """Open a markdown file in browse-md (another browse-tui recipe)."""
+    ctx.run_external(['browse-md', path], keep_screen=True)
+
+
+def _browse_plan(ctx, path):
+    """Open a ``.PLAN.md`` file in browse-plan (another browse-tui recipe)."""
+    ctx.run_external(['browse-plan', '-f', path], keep_screen=True)
+
+
+def _edit_targets(ctx):
+    """Open every selected real-path target in ``$EDITOR`` in one invocation.
+
+    Most editors accept multiple files on one command line, so the whole
+    selection opens at once. The synthetic (tuple-id) rows are filtered out via
+    ``_str_targets``; nothing to edit is a no-op.
+    """
+    paths = [it.id for it in _str_targets(ctx)]
+    if paths:
+        ctx.run_external(_editor_argv() + paths)
+
+
+def _diff_selected(ctx, path):
+    """Page a diff of the cursor path vs the single OTHER selected path.
+
+    Gated by ``_selected_other_path`` — reached only when exactly one other real
+    path is selected. Runs ``diff -u OTHER CURSOR`` and pipes it through
+    ``delta`` when on PATH (terminal-native rendering), else pages the plain
+    unified diff. ``diff`` exits non-zero whenever the files differ, so the exit
+    code is NOT gated on; identical files (empty output) flash instead of paging
+    an empty pager. A spawn failure surfaces via ``ctx.error``.
+    """
+    other = _selected_other_path(ctx, path)
+    if other is None:
+        ctx.flash('select exactly one other item to diff against')
+        return
+    try:
+        result = subprocess.run(['diff', '-u', other, path],
+                                capture_output=True, text=True)
+    except OSError as e:
+        ctx.error(f'diff: {e}')
+        return
+    text = result.stdout
+    if not text.strip():
+        ctx.flash(f'no differences between {os.path.basename(other)} '
+                  f'and {os.path.basename(path)}')
+        return
+    if HAVE_DELTA:
+        try:
+            delta = subprocess.run(['delta', '--no-gitconfig', '--paging', 'never'],
+                                   input=text, capture_output=True, text=True)
+            if delta.returncode == 0:
+                text = delta.stdout
+        except OSError:
+            pass  # fall back to the plain unified diff
+    ctx.page(text, lang='diff')
+
+
+# -- per-kind menu builders -------------------------------------------------
+
+
+def _dir_actions(dir_path):
+    """``(label, token)`` rows for the NON-destructive actions on ``dir_path``.
+
+    The directory-related actions a browse-fs row can offer: Run-shell-here, the
+    git-mode launches (only when ``dir_path`` is a repo), and New file / New
+    directory (created IN ``dir_path``). Shared by a directory cursor (where
+    ``dir_path`` is the cursor dir) and a file cursor (where ``dir_path`` is the
+    file's PARENT — the directory being listed), so the same actions operate on
+    whichever directory is in play.
+
+    ``dir_path`` here gates the git-mode rows (``_is_git_repo``); the chosen
+    row's handler re-derives the same directory from the cursor via
+    ``_target_dir`` (so the token stays a plain string, and the dir-cursor tokens
+    are unchanged). Destructive Delete / "Show full path" are NOT here — those are
+    row-kind specific and stay with the per-kind builder.
+    """
+    rows = [('Run shell here', 'dir.shell')]
+    if _is_git_repo(dir_path):
+        rows.extend((label, token) for label, token, _mode in _DIR_GIT_MODES)
+    rows.extend([
+        ('New file…', 'dir.newfile'),
+        ('New directory…', 'dir.newdir'),
+    ])
+    return rows
+
+
+def context_menu_dir(ctx, path):
+    """``(label, token)`` rows for a directory cursor row.
+
+    The shared directory actions (``_dir_actions`` — Run-shell-here, git-mode
+    rows when a repo, New file / New directory), then Show full path and Delete
+    (reusing the ``d`` handler's confirm → ``(d)`` hint). "Show full path" is
+    ALWAYS offered for a path row — the row title is cell-cut WITHOUT an ellipsis
+    when the pane is narrow, so a pop-up is the reliable way to read a long path
+    (and a redundant pop-up of a short path is harmless); the recipe can't
+    cheaply detect render-time truncation, so always-show beats a fragile
+    heuristic.
+    """
+    rows = list(_dir_actions(path))
+    rows.extend([
+        ('Show full path', 'dir.path'),
+        ('Delete (d)', 'delete'),
+    ])
+    return rows
+
+
+def context_menu_file(ctx, path):
+    """``(label, token)`` rows for a file cursor row.
+
+    Edit / Open / Delete reuse the e / o / d handlers, so their rows carry the
+    literal hotkey hint. View pages the file in ``$PAGER``. A ``.PLAN.md`` file
+    gains a browse-plan row; any ``*.md`` file gains a browse-md row plus a
+    Render-with-mdcat row. "Diff against selected" appears only when exactly one
+    OTHER item is selected (``_selected_other_path``). "Show full path" is always
+    offered (see ``context_menu_dir``). Delete here removes the FILE.
+
+    The shared directory actions (``_dir_actions``) are appended, acting on the
+    file's PARENT — the directory being listed. That folds in Run-shell-here
+    (which therefore appears exactly once, no standalone file row), the git-mode
+    launches when the parent is a repo, and New file / New directory created in
+    that parent. The parent's Delete / Show-full-path are deliberately NOT
+    appended: Delete on a file row deletes the file, and the parent directory
+    must never be offered for deletion from a file cursor.
+    """
+    rows = [
+        ('Edit in $EDITOR (e)', 'file.edit'),
+        ('View in $PAGER', 'file.view'),
+        ('Open with default app (o)', 'file.open'),
+    ]
+    if os.path.basename(path) == _PLAN_BASENAME:
+        rows.append(('Browse in browse-plan', 'file.plan'))
+    if path.endswith(_MD_EXTS):
+        rows.append(('Browse in browse-md', 'file.md'))
+        rows.append(('Render with mdcat', 'file.mdcat'))
+    if _selected_other_path(ctx, path) is not None:
+        rows.append(('Diff against selected', 'file.diff'))
+    rows.extend([
+        ('Show full path', 'file.path'),
+        ('Delete (d)', 'delete'),
+    ])
+    rows.extend(_dir_actions(os.path.dirname(path) or '.'))
+    return rows
+
+
+def context_menu_multi(ctx):
+    """``(label, token)`` rows for a multi-row selection.
+
+    Reuses the ``d`` delete handler (its confirm already operates on the whole
+    selection — the label just shows the count) and an "Open N in $EDITOR" row
+    over the same targets. The count is the number of REAL (str-path) targets.
+    """
+    n = len(_str_targets(ctx))
+    return [
+        (f'Delete {n} items (d)', 'delete'),
+        (f'Open {n} in $EDITOR', 'multi.edit'),
+    ]
+
+
+# ---- menu dispatch + the hook --------------------------------------------
+#
+# ``_MENU_ACTIONS`` maps every token a ``context_menu_*`` builder can emit to
+# its handler ``(ctx, path)`` — a single uniform signature; ``path`` is the
+# cursor row's path (``None`` for a multi-select / specials menu, where the
+# handler reads ``ctx.targets`` itself). The e / o / d / m handlers (``edit`` /
+# ``open_`` / ``delete`` / ``toggle_md``) are reused directly so the menu's
+# Edit / Open / Delete / toggle rows stay single-sourced with the keybindings.
+
+
+_MENU_ACTIONS = {
+    # directory actions (``_dir_actions``) — offered on a directory cursor AND a
+    # file cursor; ``_target_dir`` re-derives WHICH dir from the cursor's path
+    # (the dir itself, else the file's parent), so one handler serves both.
+    'dir.shell':       lambda c, p: _run_shell(c, _target_dir(p)),
+    'dir.git.commits': lambda c, p: _open_browse_git(c, _target_dir(p), 'commits'),
+    'dir.git.branches': lambda c, p: _open_browse_git(c, _target_dir(p), 'branches'),
+    'dir.git.status':  lambda c, p: _open_browse_git(c, _target_dir(p), 'status'),
+    'dir.git.stash':   lambda c, p: _open_browse_git(c, _target_dir(p), 'stash'),
+    'dir.git.reflog':  lambda c, p: _open_browse_git(c, _target_dir(p), 'reflog'),
+    'dir.newfile':     lambda c, p: _new_file(c, _target_dir(p)),
+    'dir.newdir':      lambda c, p: _new_dir(c, _target_dir(p)),
+    # directory-row only — the cursor path IS the dir here.
+    'dir.path':        lambda c, p: c.alert(p, title='path'),
+    # file
+    'file.edit':       lambda c, p: edit(c),
+    'file.view':       lambda c, p: _view_pager(c, p),
+    'file.open':       lambda c, p: open_(c),
+    'file.plan':       lambda c, p: _browse_plan(c, p),
+    'file.md':         lambda c, p: _browse_md(c, p),
+    'file.mdcat':      lambda c, p: _render_mdcat(c, p),
+    'file.diff':       lambda c, p: _diff_selected(c, p),
+    'file.path':       lambda c, p: c.alert(p, title='path'),
+    # multi-select
+    'multi.edit':      lambda c, p: _edit_targets(c),
+    # missing special — only Show full path (its path is id[2]).
+    'missing.path':    lambda c, p: c.alert(p, title='path'),
+    # shared (file + dir + multi) — the existing d delete handler / confirm.
+    'delete':          lambda c, p: delete(c),
+}
+
+
+def context_menu_options(ctx):
+    """``(label, token)`` rows for the browse-fs context menu (pure — no modal).
+
+    Branches on the cursor row's KIND. A multi-row selection (>1 real target)
+    wins first — Delete N / Open N. Otherwise a single cursor: a ``str`` id is a
+    real path, dispatched to the directory or file builder by ``os.path.isdir``;
+    a tuple id is a synthetic row — a ``missing`` row offers only "Show full
+    path" (its path is ``id[2]``), and an ``err`` / ``launch`` row offers
+    nothing (no file/dir actions on a non-existent or launcher path). Returns
+    ``[]`` when there is no cursor, so the hook opens nothing.
+    """
+    cur = ctx.cursor
+    if cur is None:
+        return []
+    # Multi-row selection: the count-labelled Delete / Open rows take over.
+    if len(_str_targets(ctx)) > 1:
+        return context_menu_multi(ctx)
+    item_id = cur.id
+    if isinstance(item_id, str):
+        if os.path.isdir(item_id):
+            return context_menu_dir(ctx, item_id)
+        return context_menu_file(ctx, item_id)
+    # Synthetic rows: a missing path can still show its full path; an err /
+    # launch row gets no file/dir actions.
+    if isinstance(item_id, tuple) and item_id and item_id[0] == 'missing':
+        return [('Show full path', 'missing.path')]
+    return []
+
+
+def on_context_menu(ctx):
+    """Open the browse-fs context menu and dispatch the chosen entry.
+
+    The hook the framework fires on right-click / `` ` ``-F1: build the (pure)
+    per-kind option list, open it with ``ctx.menu``, and route the chosen token
+    through ``_MENU_ACTIONS``. Each handler is passed the cursor row's path (the
+    ``str`` id, or a ``missing`` row's ``id[2]``; ``None`` for a multi-select /
+    err / launch cursor — those handlers read ``ctx.targets`` themselves). A
+    cancel (``None``) or an empty list is a no-op.
+    """
+    token = ctx.menu(context_menu_options(ctx))
+    handler = _MENU_ACTIONS.get(token)
+    if handler is None:
+        return
+    cur = ctx.cursor
+    cid = cur.id if cur is not None else None
+    if isinstance(cid, str):
+        path = cid
+    elif isinstance(cid, tuple) and cid and cid[0] == 'missing':
+        path = cid[2]
+    else:
+        path = None
+    handler(ctx, path)
+
+
 def mtime_watcher(browser):
     """Poll mtime of each currently-cached directory; refresh on change.
 
@@ -380,9 +830,7 @@ def mtime_watcher(browser):
 
 _USAGE = 'usage: browse-fs [PATH | -]'
 
-_HELP_INTRO = """\
-browse-fs — interactive filesystem browser.
-
+_HELP_USAGE = """\
 Usage: browse-fs [PATH | -]
   PATH    Directory to start in. Defaults to the current working directory.
   -       Read a newline-separated list of paths from stdin and show
@@ -392,7 +840,12 @@ Usage: browse-fs [PATH | -]
           not exist shows a dim '[missing]' row. Cannot be combined with
           a PATH argument. A pipe/redirect auto-engages this mode, so the
           '-' is optional when piping ('ls | browse-fs'); type it
-          explicitly to read a tty stdin (paste, then ^D).
+          explicitly to read a tty stdin (paste, then ^D).\
+"""
+
+
+_HELP_INTRO = """\
+browse-fs — interactive filesystem browser.
 
 Lazily walks directories with os.scandir; the preview pane shows file
 heads or directory listings. The selection / cursor seeds $TUI_IDS_FILE
@@ -401,7 +854,15 @@ automatically. Press Enter (or 'e') to open the cursor row in $EDITOR.
 
 A markdown file (*.md / *.MD) gets an expansion arrow: open it to list
 '[md ↗]' launcher rows — the document itself and the .md files it links
-to — and press Enter on one to open that file in browse-md.\
+to — and press Enter on one to open that file in browse-md.
+
+Right-click a row (or the backslash / F1 keys) for a context menu keyed
+to its kind: a directory offers run-shell-here, open-in-browse-git by
+mode (when it is a git repo), new file / directory, show full path, and
+delete; a file offers edit / view in $PAGER / open / run-shell in its
+dir / browse-md or browse-plan / render with mdcat / diff against a
+single other selected item / show full path / delete; a multi-selection
+offers delete N / open N in $EDITOR.\
 """
 
 
@@ -482,6 +943,14 @@ def main():
         root_id=root,
         actions=actions,
         on_enter=_on_enter,
+        # Right-click (or the backslash / F1 keys) opens a context menu keyed
+        # to the cursor row's kind: a directory (run shell / git modes / new
+        # file+dir / show path / delete), a file (edit / view / open / shell /
+        # browse-md / browse-plan / mdcat / diff / show path / delete), a
+        # multi-selection (delete N / open N), or a missing-path special (show
+        # path only). See ``on_context_menu``.
+        on_context_menu=on_context_menu,
+        help_usage=_HELP_USAGE,
         help_intro=_HELP_INTRO,
     ))
     _BROWSER = b

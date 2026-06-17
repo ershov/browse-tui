@@ -48,6 +48,7 @@ _render.SgrState = _term.SgrState
 _modal.Rect = _render.Rect
 _modal.PaneCache = _state.PaneCache
 _modal.write = _term.write
+_modal.move = _term.move
 _modal.set_style = _term.set_style
 _modal.reset_style = _term.reset_style
 _modal.read_key = _term.read_key
@@ -69,9 +70,16 @@ _modal._write_segments = _render._write_segments
 import time as _time  # noqa: E402  (after the loader wiring block)
 _modal.time = _time
 
+# ``modal_confirm`` / ``modal_alert`` reference ``CONTEXT_MENU_TRIGGER_KEYS`` —
+# defined in 070-actions (the context-menu trigger's source of truth) and
+# resolved by concatenation in the real build; the isolated load wires it.
+_modal.CONTEXT_MENU_TRIGGER_KEYS = frozenset({'\\', 'f1'})
+
 
 ChoiceContent = _modal.ChoiceContent
 run_modal = _modal.run_modal
+modal_confirm = _modal.modal_confirm
+modal_alert = _modal.modal_alert
 Rect = _render.Rect
 PaneCache = _state.PaneCache
 
@@ -684,6 +692,60 @@ class TestThroughRunModal(unittest.TestCase):
         with _FixedTermSize(80, 24), _Capture():
             res = run_modal(b, c, _read_key=_scripted(['right', 'enter']))
         self.assertIs(res, False)
+
+
+class TestConfirmCloseGesture(unittest.TestCase):
+    """``ctx.confirm`` (``modal_confirm``) is dismissed by the context-menu
+    trigger (#1063). A confirm has NO text entry, so ALL three gestures cancel
+    it (return None) before content: ``\\``, F1, and a bare right-click."""
+
+    def test_backslash_closes_confirm(self):
+        # '\' is a close gesture for a non-text modal: it cancels before
+        # content, so the result is None (a following 'enter' is never read).
+        b = _FakeBrowser()
+        with _FixedTermSize(80, 24), _Capture():
+            res = modal_confirm(b, 'Delete?', ['&Yes', '&No'],
+                                _read_key=_scripted(['\\']))
+        self.assertIsNone(res)
+
+    def test_f1_closes_confirm(self):
+        b = _FakeBrowser()
+        with _FixedTermSize(80, 24), _Capture():
+            res = modal_confirm(b, 'Delete?', ['&Yes', '&No'],
+                                _read_key=_scripted(['f1']))
+        self.assertIsNone(res)
+
+    def test_right_click_closes_confirm(self):
+        b = _FakeBrowser()
+        with _FixedTermSize(80, 24), _Capture():
+            res = modal_confirm(b, 'Delete?', ['&Yes', '&No'],
+                                _read_key=_scripted(['right-click:9:9']))
+        self.assertIsNone(res)
+
+
+class TestAlertCloseGesture(unittest.TestCase):
+    """``ctx.alert`` (``modal_alert``) is dismissed by the context-menu trigger
+    (#1063). An alert always returns None, so the assertion is that the gesture
+    closes the loop at all — driven so the scripted stream is exhausted only if
+    the dialog closes on the single gesture (no trailing key is read)."""
+
+    def _closes_on(self, gesture):
+        # The scripted source yields exactly one key; if the dialog does not
+        # close on it the loop asks for another and StopIteration surfaces the
+        # failure. A clean return proves the single gesture dismissed it.
+        b = _FakeBrowser()
+        with _FixedTermSize(80, 24), _Capture():
+            res = modal_alert(b, 'Saved.', _read_key=_scripted([gesture]))
+        self.assertIsNone(res)
+
+    def test_backslash_closes_alert(self):
+        self._closes_on('\\')
+
+    def test_f1_closes_alert(self):
+        self._closes_on('f1')
+
+    def test_right_click_closes_alert(self):
+        self._closes_on('right-click:9:9')
 
 
 if __name__ == '__main__':

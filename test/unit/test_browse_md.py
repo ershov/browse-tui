@@ -2044,7 +2044,13 @@ class TestReload(unittest.TestCase):
 
 
 class TestHelpIntro(unittest.TestCase):
-    """``_HELP_INTRO`` — recipe-level prose shown above ``--help``."""
+    """``_HELP_INTRO`` / ``_HELP_USAGE`` — recipe-level help prose.
+
+    The command-line usage / flags block lives in ``_HELP_USAGE`` (shown
+    only by ``--help``); the description, in-app key list and
+    context-menu paragraph live in ``_HELP_INTRO`` (shown by both
+    ``--help`` and the in-app ``?``).
+    """
 
     @classmethod
     def setUpClass(cls):
@@ -2053,30 +2059,35 @@ class TestHelpIntro(unittest.TestCase):
     def test_is_non_empty_string(self):
         self.assertIsInstance(self.r._HELP_INTRO, str)
         self.assertTrue(self.r._HELP_INTRO.strip())
+        self.assertIsInstance(self.r._HELP_USAGE, str)
+        self.assertTrue(self.r._HELP_USAGE.strip())
 
     def test_contains_usage_form(self):
         # The usage line documents the optional ``-l`` flag, the repeatable
         # ``--root DIR`` flag, and the file/dir positionals (with the anchor
-        # syntax detailed below).
+        # syntax detailed below). It belongs to ``_HELP_USAGE`` (the
+        # ``--help`` flags block), not the in-app intro.
         self.assertIn(
-            'browse-md [-l] [--root DIR ...] [FILE.md', self.r._HELP_INTRO)
+            'browse-md [-l] [--root DIR ...] [FILE.md', self.r._HELP_USAGE)
+        # The flags block must NOT leak into the in-app help intro.
+        self.assertNotIn('Usage:', self.r._HELP_INTRO)
 
     def test_mentions_lists_flag(self):
         # The ``-l`` / ``--list`` / ``--lists`` flag toggles list-item
         # emission; all three aliases should be discoverable from the
-        # intro alongside a brief description.
-        self.assertIn('-l', self.r._HELP_INTRO)
-        self.assertIn('--list', self.r._HELP_INTRO)
-        self.assertIn('--lists', self.r._HELP_INTRO)
+        # usage block alongside a brief description.
+        self.assertIn('-l', self.r._HELP_USAGE)
+        self.assertIn('--list', self.r._HELP_USAGE)
+        self.assertIn('--lists', self.r._HELP_USAGE)
 
     def test_mentions_root_flag(self):
         # The repeatable ``--root DIR`` reference-resolution flag should be
-        # discoverable from the intro alongside a brief description.
-        self.assertIn('--root DIR', self.r._HELP_INTRO)
+        # discoverable from the usage block alongside a brief description.
+        self.assertIn('--root DIR', self.r._HELP_USAGE)
 
     def test_mentions_anchor(self):
         # Anchor syntax is a load-bearing feature; document it.
-        self.assertIn('#anchor', self.r._HELP_INTRO)
+        self.assertIn('#anchor', self.r._HELP_USAGE)
 
     def test_mentions_each_custom_action(self):
         # All four custom action keys should be discoverable from the
@@ -2094,9 +2105,9 @@ class TestHelpIntro(unittest.TestCase):
 
     def test_compact_size(self):
         # browse-fs-style compact help — kept tight even with the
-        # ``--root`` entry added; a low-30s line budget still fits a
-        # screen comfortably.
-        self.assertLessEqual(self.r._HELP_INTRO.count('\n'), 32)
+        # ``--root`` entry and the context-menu paragraph added; a
+        # high-30s line budget still fits a screen comfortably.
+        self.assertLessEqual(self.r._HELP_INTRO.count('\n'), 38)
 
 
 class TestArgvFlag(unittest.TestCase):

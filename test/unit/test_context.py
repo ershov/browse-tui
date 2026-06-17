@@ -600,5 +600,117 @@ class TestConfirmHeadless(unittest.TestCase):
             b.stop_workers()
 
 
+# --- ctx.menu threads the list-pane bounds (#1051) -------------------------
+
+
+class TestMenuBoundsThreading(unittest.TestCase):
+    """``ctx.menu`` derives the list-pane column span and threads it through
+    to ``modal_menu`` as ``bounds`` (#1051).
+
+    The menu leans toward screen center but clamps its footprint to the LIST
+    pane's columns, so the span ``[L, R]`` must REACH placement. ``ctx.menu``
+    is the one spot that knows the layout (it already computes
+    ``_list_cursor_cell`` for the anchor), so it derives ``bounds`` there.
+    These tests assert the derivation (``_list_pane_bounds``) and that
+    ``ctx.menu`` actually forwards that exact span — by spying on the bare-name
+    ``modal_menu`` the context module calls.
+    """
+
+    def _expected_bounds(self, b):
+        """Independently derive the list pane's inclusive ``(L, R)`` columns.
+
+        Re-runs ``layout_panes`` the way ``_list_pane_bounds`` does so the
+        assertion checks the THREADING (the span reaches ``modal_menu``), not a
+        hard-coded column pair — ``Rect.right`` is exclusive, so the last column
+        is ``right - 1``.
+        """
+        cols, rows = _term.term_size()
+        layout = _render.layout_panes(
+            cols, rows, split=getattr(b, 'split', 'h'),
+            show_preview=b.show_preview, list_ratio=b.list_ratio)
+        lr = layout['list']
+        return (lr.left, lr.right - 1)
+
+    def test_list_pane_bounds_matches_layout(self):
+        # ``_list_pane_bounds`` returns the list pane's [L, R] (R = right - 1).
+        b = _make_browser(split='v', show_preview=True)   # v-split: list pane on the left
+        try:
+            self.assertEqual(_context._list_pane_bounds(b),
+                             self._expected_bounds(b))
+        finally:
+            b.stop_workers()
+
+    def test_menu_passes_list_span_as_bounds(self):
+        # The end-to-end threading: a non-headless ``ctx.menu`` (anchored at the
+        # list cursor) forwards the list pane's [L, R] as ``bounds``. Spy on the
+        # bare-name ``modal_menu`` the context module invokes so no real dialog
+        # opens; assert the captured ``bounds`` equals the independently-derived
+        # list span, and that it's a left-of-center pane (so the bound differs
+        # from full-screen centering — the case #1051 exists for).
+        b = _make_browser(split='v', show_preview=True)
+        captured = {}
+
+        def _spy_modal_menu(browser, items, *, anchor=None, bounds=None,
+                            delay_interaction=False, _read_key=None):
+            captured['anchor'] = anchor
+            captured['bounds'] = bounds
+            return None
+
+        orig = getattr(_context, 'modal_menu', None)
+        _context.modal_menu = _spy_modal_menu
+        b._headless = False     # bypass the headless short-circuit
+        try:
+            Context(b).menu(['a', 'b', 'c'])
+        finally:
+            if orig is None:
+                del _context.modal_menu
+            else:
+                _context.modal_menu = orig
+            b._headless = True
+            b.stop_workers()
+
+        expected = self._expected_bounds(b)
+        self.assertEqual(captured['bounds'], expected)
+        self.assertIsNotNone(captured['anchor'])   # anchored at the list cursor
+        # The pane is genuinely left of screen center, so the bound is NOT the
+        # whole screen — this is the regime #1051 changes behavior in.
+        L, R = expected
+        cols, _rows = _term.term_size()
+        self.assertLess(R, cols)
+
+    def test_centered_menu_passes_no_bounds(self):
+        # With NO anchor resolvable (cursor scrolled off the list pane), the
+        # menu centers and must pass ``bounds=None`` so it keeps full-screen
+        # centering — the bound only applies to an anchored menu.
+        b = _make_browser(split='v', show_preview=True)
+        captured = {}
+
+        def _spy_modal_menu(browser, items, *, anchor=None, bounds=None,
+                            delay_interaction=False, _read_key=None):
+            captured['anchor'] = anchor
+            captured['bounds'] = bounds
+            return None
+
+        orig = getattr(_context, 'modal_menu', None)
+        _context.modal_menu = _spy_modal_menu
+        b._headless = False
+        # Force ``_list_cursor_cell`` to return None: park the cursor far below
+        # the list pane's visible span so ``rel`` is out of range.
+        b._state.cursor = 10_000
+        b._list_scroll = 0
+        try:
+            Context(b).menu(['a', 'b'])
+        finally:
+            if orig is None:
+                del _context.modal_menu
+            else:
+                _context.modal_menu = orig
+            b._headless = True
+            b.stop_workers()
+
+        self.assertIsNone(captured['anchor'])      # no anchor -> centered
+        self.assertIsNone(captured['bounds'])      # and no bound
+
+
 if __name__ == '__main__':
     unittest.main()

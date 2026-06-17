@@ -44,6 +44,7 @@ _render.reset_style = _term.reset_style
 _modal.Rect = _render.Rect
 _modal.PaneCache = _state.PaneCache
 _modal.write = _term.write
+_modal.move = _term.move
 _modal.set_style = _term.set_style
 _modal.reset_style = _term.reset_style
 _modal.read_key = _term.read_key
@@ -66,9 +67,17 @@ _modal._write_segments = _render._write_segments
 import time as _time  # noqa: E402  (after the loader wiring block)
 _modal.time = _time
 
+# ``modal_menu`` references ``CONTEXT_MENU_TRIGGER_KEYS`` — defined in
+# 070-actions (the OPEN path's source of truth) and resolved by concatenation
+# in the single-file build. The isolated load doesn't pull 070, so mirror the
+# literal here for the menu close-gesture tests (#1039).
+_modal.CONTEXT_MENU_TRIGGER_KEYS = frozenset({'\\', 'f1'})
+
 
 ListContent = _modal.ListContent
 run_modal = _modal.run_modal
+modal_menu = _modal.modal_menu
+modal_pick = _modal.modal_pick
 Rect = _render.Rect
 PaneCache = _state.PaneCache
 
@@ -386,6 +395,124 @@ class TestSelectionMovement(unittest.TestCase):
             self.assertEqual(c.cursor, 0)
 
 
+# --- type-ahead (filter=False menus only) ----------------------------------
+
+
+class TestTypeAhead(unittest.TestCase):
+    """In a NO-FILTER menu (``filter=False``) a single printable char is
+    single-letter type-ahead: it jumps the selection to the NEXT option whose
+    visible display starts with that char (case-insensitive), cycling forward
+    from the current selection and wrapping. No match → no move. (Filter mode
+    instead types into the query — covered in ``TestFiltering`` and the
+    regression test at the end of this class.)
+    """
+
+    def _menu(self, options):
+        c = ListContent(options, filter=False)
+        c.measure(40, 20)
+        return c
+
+    def test_letter_jumps_to_next_match(self):
+        c = self._menu(['Open', 'Rename', 'Save', 'Delete'])
+        done, result = c.handle_key('s')
+        self.assertFalse(done)            # type-ahead never closes the menu
+        self.assertIsNone(result)
+        self.assertEqual(c.cursor, 2)     # 'Save'
+
+    def test_repeated_letter_cycles_through_matches(self):
+        # Three options start with 'S'; pressing 's' walks them in order.
+        c = self._menu(['Save', 'Open', 'Send', 'Sync', 'Quit'])
+        self.assertEqual(c.cursor, 0)     # starts on 'Save'
+        c.handle_key('s')                 # next match after 'Save' -> 'Send'
+        self.assertEqual(c.cursor, 2)
+        c.handle_key('s')                 # -> 'Sync'
+        self.assertEqual(c.cursor, 3)
+        c.handle_key('s')                 # wraps back to 'Save'
+        self.assertEqual(c.cursor, 0)
+
+    def test_cycle_wraps_to_match_before_current(self):
+        # The only 'A' match sits before the current selection — the forward
+        # search wraps around to find it.
+        c = self._menu(['Apple', 'Open', 'Rename'])
+        c.handle_key('end')               # cursor -> 2 ('Rename'), last
+        self.assertEqual(c.cursor, 2)
+        c.handle_key('a')                 # wraps forward to 'Apple' at 0
+        self.assertEqual(c.cursor, 0)
+
+    def test_case_insensitive(self):
+        c = self._menu(['Open', 'Save'])
+        c.handle_key('S')                 # uppercase matches 'Save'
+        self.assertEqual(c.cursor, 1)
+        c.cursor = 0
+        c.handle_key('s')                 # lowercase matches the same item
+        self.assertEqual(c.cursor, 1)
+
+    def test_no_match_is_noop(self):
+        c = self._menu(['Open', 'Rename', 'Delete'])
+        c.handle_key('down')              # cursor -> 1 ('Rename')
+        done, result = c.handle_key('z')  # nothing starts with 'z'
+        self.assertFalse(done)
+        self.assertIsNone(result)
+        self.assertEqual(c.cursor, 1)     # unchanged
+
+    def test_single_match_on_current_stays_put(self):
+        # Only one option starts with 'O' and it IS the current selection;
+        # the forward-then-wrap search lands back on it (no spurious move).
+        c = self._menu(['Open', 'Rename', 'Delete'])
+        self.assertEqual(c.cursor, 0)     # 'Open'
+        c.handle_key('o')
+        self.assertEqual(c.cursor, 0)
+
+    def test_matches_display_half_of_tuple_not_value(self):
+        # The match is on the DISPLAY half; a value starting with the char
+        # must NOT make the option match.
+        c = self._menu([('Open', 'zzz'), ('Save', 'aaa')])
+        c.handle_key('z')                 # no DISPLAY starts with 'z'
+        self.assertEqual(c.cursor, 0)     # no move
+        c.handle_key('s')                 # display 'Save' matches
+        self.assertEqual(c.cursor, 1)
+
+    def test_matches_visible_text_ignoring_embedded_sgr(self):
+        # An option's display carries embedded SGR; type-ahead matches the
+        # VISIBLE first char ('D'), not the leading escape bytes.
+        red_delete = '\033[31mDelete\033[m'
+        c = self._menu(['Open', red_delete])
+        c.handle_key('d')
+        self.assertEqual(c.cursor, 1)
+
+    def test_matches_first_non_space_char(self):
+        # Leading whitespace in the display is skipped — the first VISIBLE
+        # char drives the match.
+        c = self._menu(['Open', '  Save'])
+        c.handle_key('s')
+        self.assertEqual(c.cursor, 1)
+
+    def test_typeahead_scrolls_window_to_match(self):
+        # Type-ahead must keep the landed-on option inside the visible window.
+        opts = [f'opt{i:02d}' for i in range(20)] + ['zebra']
+        c = ListContent(opts, filter=False)
+        c.measure(40, 5)                  # only 5 rows visible
+        self.assertEqual(c._rows_visible, 5)
+        c.handle_key('z')                 # jump to 'zebra' at index 20
+        self.assertEqual(c.cursor, 20)
+        # The window scrolled so the cursor is within [_scroll, _scroll+rows).
+        self.assertTrue(c._scroll <= c.cursor < c._scroll + c._rows_visible)
+
+    def test_filter_true_printable_still_extends_query(self):
+        # REGRESSION: in filter mode (the picker) a printable char must STILL
+        # type into the filter query — type-ahead is menu-only and must NOT
+        # leak into pick behavior.
+        c = ListContent(['Save', 'Send', 'Open'], filter=True)
+        c.measure(40, 20)
+        c.handle_key('s')
+        self.assertEqual(c.filter_query, 's')   # query extended, not a jump
+        self.assertEqual(c._filtered(),
+                         [('Save', 'Save'), ('Send', 'Send')])
+        c.handle_key('e')                       # 'se' narrows to 'Send'
+        self.assertEqual(c.filter_query, 'se')
+        self.assertEqual(c._filtered(), [('Send', 'Send')])
+
+
 # --- windowing (keep the cursor visible) -----------------------------------
 
 
@@ -691,6 +818,109 @@ class TestThroughRunModal(unittest.TestCase):
         c = ListContent(['a', 'b'], filter=True)
         with _FixedTermSize(80, 24), _Capture():
             res = run_modal(b, c, _read_key=_scripted(['esc']))
+        self.assertIsNone(res)
+
+
+class TestMenuCloseGesture(unittest.TestCase):
+    """A repeated context-menu trigger (``\\`` / F1 / right-click) closes an
+    open ``ctx.menu`` (#1039). Driven through the real ``modal_menu`` so the
+    wiring of the centralized trigger set is exercised end-to-end. The CRITICAL
+    interaction with #1042 type-ahead: ``\\`` is printable, so the close check
+    must beat type-ahead — feeding ``\\`` returns None, NOT a type-ahead jump."""
+
+    _ITEMS = ['Open', 'Rename', 'Delete']
+
+    def test_backslash_closes_menu(self):
+        b = _FakeBrowser()
+        with _FixedTermSize(80, 24), _Capture():
+            res = modal_menu(b, self._ITEMS, anchor=(5, 10),
+                             _read_key=_scripted(['\\']))
+        self.assertIsNone(res)
+
+    def test_f1_closes_menu(self):
+        b = _FakeBrowser()
+        with _FixedTermSize(80, 24), _Capture():
+            res = modal_menu(b, self._ITEMS, anchor=(5, 10),
+                             _read_key=_scripted(['f1']))
+        self.assertIsNone(res)
+
+    def test_right_click_closes_menu(self):
+        b = _FakeBrowser()
+        with _FixedTermSize(80, 24), _Capture():
+            res = modal_menu(b, self._ITEMS, anchor=(5, 10),
+                             _read_key=_scripted(['right-click:9:9']))
+        self.assertIsNone(res)
+
+    def test_backslash_does_not_typeahead(self):
+        # If '\' were treated as a printable (type-ahead) it would NOT close,
+        # so 'enter' next would return a selection. Prove the opposite: '\'
+        # closes immediately and 'enter' is never consumed (returns None).
+        b = _FakeBrowser()
+        sentinel = object()
+
+        def _src():
+            for k in ('\\',):
+                yield k
+            # The menu must have closed on '\'; if it didn't, the loop would
+            # ask for another key — surface that as a clear failure.
+            raise AssertionError('menu did not close on "\\" (type-ahead?)')
+            yield sentinel  # pragma: no cover
+
+        gen = _src()
+        with _FixedTermSize(80, 24), _Capture():
+            res = modal_menu(b, self._ITEMS, anchor=(5, 10),
+                             _read_key=lambda: next(gen))
+        self.assertIsNone(res)
+
+    def test_normal_letter_still_typeaheads_not_close(self):
+        # A non-trigger printable letter is type-ahead (does NOT close): 'd'
+        # jumps to 'Delete', then enter selects it.
+        b = _FakeBrowser()
+        with _FixedTermSize(80, 24), _Capture():
+            res = modal_menu(b, self._ITEMS, anchor=(5, 10),
+                             _read_key=_scripted(['d', 'enter']))
+        self.assertEqual(res, 'Delete')
+
+    def test_enter_still_selects(self):
+        # The close gesture doesn't disturb normal selection: enter returns
+        # the focused item.
+        b = _FakeBrowser()
+        with _FixedTermSize(80, 24), _Capture():
+            res = modal_menu(b, self._ITEMS, anchor=(5, 10),
+                             _read_key=_scripted(['down', 'enter']))
+        self.assertEqual(res, 'Rename')
+
+
+class TestPickCloseGesture(unittest.TestCase):
+    """``ctx.pick`` (``modal_pick``, ``filter=True``) is dismissed by the
+    context-menu trigger (#1063) — but RESPECTING text entry: F1 and right-click
+    (never text) cancel, while ``\\`` stays a literal filter character (it must
+    NOT close, since the filter row is text)."""
+
+    def test_backslash_extends_filter_not_close(self):
+        # Items chosen so a '\' in the query filters to exactly one, which
+        # 'enter' then selects — proving '\' extended the filter (a close
+        # would have returned None instead). This is the text-respect case.
+        b = _FakeBrowser()
+        with _FixedTermSize(80, 24), _Capture():
+            res = modal_pick(b, 'Pick', ['a/b', r'a\b', 'cc'],
+                             _read_key=_scripted(['\\', 'enter']))
+        self.assertEqual(res, r'a\b')
+
+    def test_f1_closes_pick(self):
+        # F1 is never text → it cancels the pick (returns None) before content.
+        b = _FakeBrowser()
+        with _FixedTermSize(80, 24), _Capture():
+            res = modal_pick(b, 'Pick', ['one', 'two'],
+                             _read_key=_scripted(['f1']))
+        self.assertIsNone(res)
+
+    def test_right_click_closes_pick(self):
+        # A right-click is never text → it cancels the pick (returns None).
+        b = _FakeBrowser()
+        with _FixedTermSize(80, 24), _Capture():
+            res = modal_pick(b, 'Pick', ['one', 'two'],
+                             _read_key=_scripted(['right-click:9:9']))
         self.assertIsNone(res)
 
 

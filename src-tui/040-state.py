@@ -3231,6 +3231,7 @@ class BrowserConfig:
     split: str = 'auto'
     multi_select: bool = True
     print_format: str = '{id}'
+    help_usage: Optional[str] = None
     help_intro: Optional[str] = None
     help_outro: Optional[str] = None
     show_ids: str = 'auto'
@@ -3251,6 +3252,18 @@ class BrowserConfig:
     on_filter_change: Optional[Callable] = None
     on_resize: Optional[Callable] = None
     on_quit: Optional[Callable] = None
+    # Context-menu hook (option A): a ``(ctx) -> None`` callback the
+    # framework fires on the uniform context-menu gesture — a right-click,
+    # or ``\`` / F1 in NORMAL mode. The recipe builds the option list from
+    # ``ctx.cursor`` / ``ctx.targets`` and opens it via ``ctx.menu(...)``;
+    # the framework supplies only the trigger plumbing, never the menu
+    # content. The ``\`` / F1 triggers are conditional — they fire the menu
+    # only while this hook is set, else fall through to their defaults
+    # (``\`` cycle-layout, F1 help) — so non-menu recipes are unaffected.
+    # Exceptions are caught and routed to :meth:`error` like the other on_*
+    # hooks. ``None`` (default) makes the triggers no-ops — no menu, no
+    # cursor move for a right-click.
+    on_context_menu: Optional[Callable] = None
     # Streaming input (spec §3.4): ``on_stdin(ctx, data, *, delimiter,
     # is_eof, errno)`` opts in to live delivery from the stdin content
     # channel through the select loop, picking up where any pre-run
@@ -3367,6 +3380,12 @@ class Browser:
       multi_select:       allow multi-selection (action layer in #12).
       print_format:       output format string used when on_enter is None
                           and the user picks the default action.
+      help_usage:         optional command-line usage / flags block.
+                          Shown ONLY by ``--help`` (prepended above
+                          ``help_intro``); the in-app ``?`` never shows
+                          it. Recipes that document CLI flags put that
+                          block here so it stays out of the interactive
+                          help. ``None`` elides it.
       help_intro:         optional prose shown at the top of the help
                           screen (and ``--help``); recipes use it to
                           describe what the tool does. ``None`` elides
@@ -3440,6 +3459,11 @@ class Browser:
                 stores this opaquely; the action layer reads it.
             print_format: ``str.format``-style template applied to each
                 target when ``on_enter`` resolves to print-exit.
+            help_usage: Optional command-line usage / flags block shown
+                ONLY by ``--help`` (prepended above ``help_intro``).
+                The in-app ``?`` never shows it, so a recipe's flag
+                list stays out of the interactive help. ``None`` elides
+                it.
             help_intro: Optional prose shown at the top of ``--help``
                 and the in-app help screen (``?``). Recipes use it to
                 describe what their tool does.
@@ -3511,6 +3535,22 @@ class Browser:
                 use this to clean up worker threads, temp files, file
                 handles. Exceptions are swallowed silently (a failing
                 cleanup hook should not block exit).
+            on_context_menu: Optional ``(ctx) -> None`` callback fired on
+                the uniform context-menu gesture: a right-click, or the
+                ``\\`` / F1 keys in NORMAL mode. The handler reads
+                ``ctx.cursor`` / ``ctx.targets`` and opens a menu with
+                ``ctx.menu(...)``; the framework supplies only the trigger,
+                never the content (option A). A right-click first moves the
+                cursor onto the clicked row (so ``ctx.cursor`` is the
+                target) and the menu anchors under the click cell; a
+                keyboard trigger anchors under the list cursor. The ``\\``
+                and F1 triggers are conditional: they fire the menu only
+                while this handler is set, and otherwise keep their default
+                meaning (``\\`` cycles the layout, F1 toggles help), so a
+                recipe that doesn't set this hook is unaffected. ``None``
+                (default) makes every trigger a no-op — no menu, and no
+                cursor move for a right-click. Exceptions are caught and
+                routed to :meth:`error`.
             on_stdin: Optional ``(ctx, data, *, delimiter, is_eof,
                 errno) -> None`` hook: opt-in live streaming from the
                 stdin content channel while the UI runs (spec §3.4).
@@ -3655,10 +3695,15 @@ class Browser:
         self.split = _clamp_split(config.split)
         self.multi_select = config.multi_select
         self.print_format = config.print_format
-        # help_intro/help_outro are prose blurbs shown above/below the
-        # auto-generated key list in --help and the in-app help screen
-        # (?). Recipes set them to explain what their tool does;
-        # ``None`` (the default) elides the corresponding section.
+        # help_usage is the command-line usage / flags block. It is
+        # shown ONLY by --help (prepended above help_intro); the in-app
+        # ``?`` never shows it — see compose_help_text's include_usage
+        # argument. help_intro/help_outro are prose blurbs shown
+        # above/below the auto-generated key list in BOTH --help and the
+        # in-app help screen (?). Recipes set them to explain what their
+        # tool does; ``None`` (the default) elides the corresponding
+        # section.
+        self.help_usage = config.help_usage
         self.help_intro = config.help_intro
         self.help_outro = config.help_outro
         self.show_ids = config.show_ids
@@ -3703,6 +3748,25 @@ class Browser:
         self._on_filter_change = config.on_filter_change
         self._on_resize = config.on_resize
         self._on_quit = config.on_quit
+        # ``on_context_menu`` fires synchronously from dispatch (not at
+        # drain time) and itself opens a modal via ``ctx.menu`` — see
+        # ``_fire_context_menu``. ``_context_menu_anchor`` carries the
+        # click cell of a right-click trigger to ``ctx.menu``'s default-
+        # anchor path for the duration of one fire (``None`` otherwise, so
+        # keyboard triggers anchor to the list cursor as usual).
+        self._on_context_menu = config.on_context_menu
+        self._context_menu_anchor = None
+        # Per-chain side slot (#1041). A context menu can chain — the chosen
+        # entry re-invokes ``ctx.menu`` to open a submenu — and those modals
+        # run SEQUENTIALLY within one ``on_context_menu`` fire (one open at a
+        # time). The FIRST menu in the chain decides above/below the anchor
+        # row from its own height; ``_measure_frame`` stores that side here so
+        # EVERY subsequent menu in the same chain opens on the SAME side (an
+        # oversized submenu shifts to fit instead of flipping to the other
+        # side, so the chain reads as descending levels). ``None`` outside a
+        # fire and at the start of each fire (a fresh chain decides anew);
+        # set/cleared around the hook call in ``_fire_context_menu``.
+        self._context_menu_side = None
         self._on_stdin = config.on_stdin
         # No-landable-row policy (§3.4). Read once here; consulted by
         # ``_clamp_cursor_landable`` whenever the visible list ends up
@@ -5735,6 +5799,40 @@ class Browser:
         except Exception as e:
             self.error(f'on_selection_change: {type(e).__name__}: {e}')
 
+    def _fire_context_menu(self, anchor=None) -> None:
+        """Fire ``on_context_menu`` if installed.
+
+        Called synchronously from the dispatch path (not at drain time):
+        the handler reads ``ctx.cursor`` / ``ctx.targets`` and typically
+        opens a modal via ``ctx.menu`` — a nested key loop, which is fine
+        here. The hook takes EXACTLY one argument, a Context; the optional
+        ``anchor`` (a 1-based ``(row, col)`` click cell, only supplied by
+        the right-click trigger) is threaded to ``ctx.menu``'s default-
+        anchor path via ``_context_menu_anchor`` for the duration of the
+        fire so a no-arg ``ctx.menu()`` drops under the click cell. A
+        keyboard trigger passes ``anchor=None``, leaving the default anchor
+        on the list cursor. Exceptions are caught and routed to
+        :meth:`error` like the other on_* hooks.
+
+        This call is also the chain boundary for the per-chain menu SIDE
+        (#1041): ``_context_menu_side`` is reset to ``None`` here so a fresh
+        chain decides above/below anew, and cleared in ``finally`` alongside
+        ``_context_menu_anchor``. The first ``ctx.menu`` of the chain records
+        its side via ``_measure_frame``; any submenu opened from the same
+        fire reuses it.
+        """
+        if self._on_context_menu is None:
+            return
+        self._context_menu_anchor = anchor
+        self._context_menu_side = None
+        try:
+            self._on_context_menu(self._make_ctx_for_hook())
+        except Exception as e:
+            self.error(f'on_context_menu: {type(e).__name__}: {e}')
+        finally:
+            self._context_menu_anchor = None
+            self._context_menu_side = None
+
     def _fire_expand_collapse_if_pending(self) -> None:
         """Fire ``on_collapse`` / ``on_expand`` from a drain-time set diff.
 
@@ -7414,13 +7512,16 @@ class Browser:
         unified namespace; in tests the loader injects them onto this
         module.
         """
-        # Help flag short-circuit: print composed help (intro + sections
-        # + CUSTOM ACTIONS + outro) and exit without entering the loop.
-        # Honours -h and --help as exact tokens; ``--help=foo`` style
-        # bundling is not relevant here (argparse-using recipes consume
-        # it first; the auto-detect target is recipes that don't argparse).
+        # Help flag short-circuit: print composed help (usage + intro +
+        # sections + CUSTOM ACTIONS + outro) and exit without entering
+        # the loop. This is a ``--help`` path, so ``include_usage=True``
+        # — the recipe's command-line flags block (help_usage) belongs
+        # here, unlike the in-app ``?`` which omits it. Honours -h and
+        # --help as exact tokens; ``--help=foo`` style bundling is not
+        # relevant here (argparse-using recipes consume it first; the
+        # auto-detect target is recipes that don't argparse).
         if any(arg in ('-h', '--help') for arg in sys.argv[1:]):
-            sys.stdout.write(compose_help_text(self, include_usage=False))
+            sys.stdout.write(compose_help_text(self, include_usage=True))
             return 0
 
         # Terminal-device auto-detect: scan sys.argv[1:] for ``--tty``

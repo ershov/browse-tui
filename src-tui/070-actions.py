@@ -25,6 +25,27 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 
+# The context-menu trigger gesture — one source of truth shared by the OPEN
+# path (``dispatch_key`` + ``_dispatch_mouse`` below) and the CLOSE path (the
+# ``ctx.menu`` modal in 055-modal, which passes these into ``run_modal`` so a
+# repeated trigger toggles an open menu shut; see #1039). Defined here, where
+# the keyboard triggers were originally hardcoded.
+#
+#   * ``CONTEXT_MENU_TRIGGER_KEYS`` — the keyboard triggers (``\`` and F1). Only
+#     the BARE keys trigger; modifier-prefixed variants (e.g. ``ctrl-\``) are
+#     out of scope.
+#   * ``_is_context_menu_right_click`` — recognises the right-click trigger
+#     event. Only the BARE ``right-click:R:C`` counts, matching how the open
+#     path (#1027) ignores modifier-prefixed right-clicks (``alt-right-click:``
+#     etc. carry a prefix so they never ``startswith('right-click:')``).
+CONTEXT_MENU_TRIGGER_KEYS = frozenset({'\\', 'f1'})
+
+
+def _is_context_menu_right_click(key: str) -> bool:
+    """True if ``key`` is the bare right-click context-menu trigger event."""
+    return key.startswith('right-click:')
+
+
 @dataclass
 class Action:
     """A keybinding: key string -> handler.
@@ -1028,7 +1049,7 @@ def _resize_list(ctx, *, direction):
 
 # ---- layout split selection -----------------------------------------------
 #
-# Five actions select / cycle between the four split layouts produced by
+# Four actions select between the four split layouts produced by
 # ``layout_panes`` in 050-render. ``Browser.set_split`` (040-state) clamps
 # unknown values back to ``'h'`` and adds ``'all'`` to ``_needs_redraw``, so
 # the handlers can stay one-liners — no need to re-add ``'all'`` here.
@@ -1038,10 +1059,7 @@ def _resize_list(ctx, *, direction):
 # encoding used by alacritty, kitty, gnome-terminal, iTerm2, xterm and
 # vt100-class emulators by default. Terminals running with xterm's
 # ``modifyOtherKeys`` (e.g. ``CSI 27;3;49~`` style) or kitty's full keyboard
-# protocol won't hit this path — for those we fall back to ``\`` (cycle),
-# which has no modifier and is universally reachable.
-
-_LAYOUT_CYCLE = ('v', 'h', 'm', 'pc')
+# protocol won't hit this path.
 
 
 def _set_layout_v(ctx):
@@ -1062,23 +1080,6 @@ def _set_layout_m(ctx):
 def _set_layout_pc(ctx):
     """Alt-4 — preview-children split."""
     ctx._browser.set_split('pc')
-
-
-def _cycle_layout(ctx):
-    """``\\`` — cycle through layouts in order ``v → h → m → pc → v``.
-
-    The cycle list is the canonical ordering documented in the Alt-N
-    bindings. If ``browser.split`` somehow holds a value outside the
-    cycle (defensive — ``set_split`` clamps inputs) we fall back to the
-    first entry so the next press lands on a known layout.
-    """
-    cur = getattr(ctx._browser, 'split', 'h')
-    try:
-        idx = _LAYOUT_CYCLE.index(cur)
-        nxt = _LAYOUT_CYCLE[(idx + 1) % len(_LAYOUT_CYCLE)]
-    except ValueError:
-        nxt = _LAYOUT_CYCLE[0]
-    ctx._browser.set_split(nxt)
 
 
 # ---- default keybindings list ---------------------------------------------
@@ -1142,18 +1143,21 @@ def default_actions() -> list:
         Action('_',          'Shrink list pane',         _shrink_list,         'none', 'PREVIEW'),
         Action('=',          'Grow list pane',           _grow_list,           'none', 'PREVIEW'),
         Action('+',          'Grow list pane',           _grow_list,           'none', 'PREVIEW'),
-        # Layout split selection. Alt-1..4 jump directly to a layout; ``\``
-        # cycles in canonical order (v → h → m → pc → v). The Alt-N bindings
-        # rely on the ``ESC + digit`` Meta-prefix encoding (see notes near
-        # ``_set_layout_v`` for terminal coverage); ``\`` is the universally
-        # reachable fallback for terminals that swallow Alt-modified keys.
-        # The four alt-N direct-jump bindings carry an empty ``label``
-        # so the help composer (050-render._format_help_section) skips
-        # them — their meaning is folded into the ``\`` line below to
-        # keep the help screen compact (see #163). The bindings remain
-        # fully functional in the dispatcher; they just don't take five
-        # lines of help-screen real estate apiece.
-        Action('\\',         '\\ / alt-1..4: cycle layouts (v/h/m/pc) or jump direct', _cycle_layout, 'none', 'PREVIEW'),
+        # Layout split selection. Alt-1..4 jump DIRECTLY to a fixed layout
+        # (alt-1=v, alt-2=h, alt-3=m, alt-4=pc — pressing one repeatedly
+        # stays put; there is no cycle; see notes near ``_set_layout_v``
+        # for the ``ESC + digit`` Meta-prefix terminal coverage). The four
+        # alt-N direct-jump bindings carry an empty ``label`` so the help
+        # composer (050-render._format_help_section) skips them; a single
+        # synthetic ``alt-1..4`` help row (handler-less, never matched at
+        # runtime) documents them on one line instead of taking five lines
+        # of help real estate (see #163). ``\`` is NO LONGER bound to a
+        # layout action: since #1061 ``\`` (and F1) PERMANENTLY open the
+        # recipe's context menu — handled unconditionally in
+        # ``dispatch_key`` before the keymap lookup, so they need no
+        # functional Action here. The two help-only rows below
+        # (``alt-1..4`` and ``\``) just surface them on the help screen.
+        Action('alt-1..4',   'Select layout (v/h/m/pc)', None, 'none', 'PREVIEW'),
         Action('alt-1',      '', _set_layout_v,  'none', 'PREVIEW'),
         Action('alt-2',      '', _set_layout_h,  'none', 'PREVIEW'),
         Action('alt-3',      '', _set_layout_m,  'none', 'PREVIEW'),
@@ -1175,7 +1179,13 @@ def default_actions() -> list:
         Action('ctrl-n',    'Deselect all',                _select_clear,       'none',   'SELECTION'),
         # Other.
         Action('?',         'Toggle help',    _toggle_help, 'none', 'OTHER'),
-        Action('f1',        'Toggle help',    _toggle_help, 'none', 'OTHER'),
+        # ``\`` and F1 PERMANENTLY open the recipe's context menu since
+        # #1061 — fired unconditionally in ``dispatch_key`` before the
+        # keymap lookup (a harmless no-op when the recipe sets no
+        # ``on_context_menu``). This handler-less row exists solely to
+        # surface the gesture on the help screen; the ``\`` key never
+        # reaches this Action at runtime.
+        Action('\\',        'Open context menu (\\ / F1 / right-click)', None, 'none', 'OTHER'),
         Action('ctrl-r',    'Reload',         _reload,      'none', 'OTHER'),
         Action('ctrl-l',    'Redraw',         _redraw,      'none', 'OTHER'),
         # View / edit the cursor row's preview text. Gate 'none' so
@@ -1239,6 +1249,7 @@ def dispatch_key(browser, ctx: 'Context', key: str) -> bool:
     # moves the cursor / scrolls the pane like in normal mode. Insert
     # mode never reaches here (it runs in ``_handle_insert_key``).
     if (key.startswith('mouse-click:')
+            or _is_context_menu_right_click(key)
             or key.startswith('scroll-up:')
             or key.startswith('scroll-down:')):
         return _dispatch_mouse(browser, ctx, key)
@@ -1399,6 +1410,22 @@ def dispatch_key(browser, ctx: 'Context', key: str) -> bool:
     # Enter handling — outside search mode this falls to on_enter.
     if key == 'enter':
         return _handle_enter(browser, ctx)
+
+    # Context-menu keyboard triggers. ``\`` and F1 PERMANENTLY open the
+    # recipe's context menu in NORMAL mode (#1061) — they are no longer
+    # bound to layout-cycle / help-toggle. ``_fire_context_menu`` is a
+    # harmless no-op when the recipe sets no ``on_context_menu``, so an
+    # unhandled press simply does nothing. Gated on NORMAL because ``f1``
+    # (a multi-char name) falls through the SEARCH_EDIT / FILTER_EDIT
+    # blocks above into this normal dispatch, and the menu must not pop
+    # while the user is editing a query. (``\`` is consumed as a printable
+    # char by the SEARCH_EDIT handler before reaching here, so only F1 is
+    # actually at risk, but gating on NORMAL covers both.) A REPEATED
+    # trigger while the menu is open closes it — that's the modal layer's
+    # ``cancel_keys`` (see ``modal_menu``), independent of this branch.
+    if browser._mode is Mode.NORMAL and key in CONTEXT_MENU_TRIGGER_KEYS:
+        browser._fire_context_menu()
+        return True
 
     keymap = build_keymap(browser)
     if key in keymap:
@@ -1713,6 +1740,13 @@ def _dispatch_mouse(browser, ctx, key):
     except ValueError:
         return True
 
+    # Right-click is the context-menu gesture (option A). When no
+    # ``on_context_menu`` handler is installed it's a pure no-op — bail
+    # before any prep (no layout resolution, no cursor move, no anchor
+    # calc), matching the "no work when the hook is unset" contract.
+    if kind == 'right-click' and browser._on_context_menu is None:
+        return True
+
     ts = globals().get('term_size')
     lp = globals().get('layout_panes')
     if ts is None or lp is None:
@@ -1765,6 +1799,18 @@ def _dispatch_mouse(browser, ctx, key):
                 browser._help_mode = False
                 browser._needs_redraw.add('preview')
         # children grid / info bar / separator → no-op
+        return True
+    if kind == 'right-click':
+        # Context-menu gesture (handler presence already confirmed above).
+        # Reposition the cursor onto the clicked row exactly like a
+        # left-click — reusing ``_click_list_row`` — so ``ctx.cursor`` is
+        # the click target, then fire the hook with the click cell as the
+        # menu anchor (so a no-arg ``ctx.menu()`` drops under the pointer).
+        # A right-click outside the list pane fires the menu for the
+        # current cursor without moving it.
+        if pane == 'list':
+            _click_list_row(browser, layout, row)
+        browser._fire_context_menu(anchor=(row, col))
         return True
     if kind in ('scroll-up', 'scroll-down'):
         delta = -_WHEEL_LINES if kind == 'scroll-up' else _WHEEL_LINES

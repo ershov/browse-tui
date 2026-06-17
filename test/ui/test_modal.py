@@ -68,9 +68,9 @@ def _read_log_when_ready(path, timeout=3.0):
 
 
 # Box-drawing glyphs the dialog frame is built from (top/bottom/side
-# borders) — used both to detect "dialog open" and to assert "dialog
-# gone" after a close.
-_BORDER_GLYPHS = ('┌', '┐', '└', '┘', '│')
+# borders, double-line) — used both to detect "dialog open" and to assert
+# "dialog gone" after a close.
+_BORDER_GLYPHS = ('╔', '╗', '╚', '╝', '║')
 
 
 class _ModalUITest(unittest.TestCase):
@@ -85,7 +85,7 @@ class _ModalUITest(unittest.TestCase):
     def _assert_ui_restored(self, t):
         """Strict restore check (the cache-poison restore the design hinges on).
 
-        Poll until the dialog's top border ``┌`` disappears — that's the
+        Poll until the dialog's top border ``╔`` disappears — that's the
         actual restore signal — then assert NO border glyph, title, or
         dialog-only content survives on screen, AND the regular UI (rows,
         preview, info-bar hints) is back. Mirrors
@@ -93,7 +93,7 @@ class _ModalUITest(unittest.TestCase):
         """
         deadline = time.time() + 3.0
         cap = t.capture()
-        while time.time() < deadline and '┌' in cap:
+        while time.time() < deadline and '╔' in cap:
             time.sleep(0.03)
             cap = t.capture()
         for glyph in _BORDER_GLYPHS:
@@ -284,13 +284,13 @@ class TestModalResize(_ModalUITest):
     """Resize while a dialog is open: the box repaints at the new geometry."""
 
     def _box_left_col(self, cap):
-        """Left column (0-based) of the dialog's top-border ``┌`` row.
+        """Left column (0-based) of the dialog's top-border ``╔`` row.
 
-        Returns the index of ``┌`` within its line — the box's left edge.
+        Returns the index of ``╔`` within its line — the box's left edge.
         Used to confirm the box re-centers after a resize.
         """
         for line in cap.splitlines():
-            i = line.find('┌')
+            i = line.find('╔')
             if i != -1:
                 return i
         raise AssertionError(f'no top border on screen:\n{cap}')

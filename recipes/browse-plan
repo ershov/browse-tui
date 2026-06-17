@@ -602,6 +602,217 @@ def _action_reopen(ctx):
     ctx.update_data([upsert(i, None, tag='open', tag_style=style) for i in ids])
 
 
+def _action_close_wontfix(ctx):
+    """``plan IDS close wontfix`` behind a value-mapped Yes/No confirm.
+
+    The destructive-class sibling of ``_action_close``: closing as ``wontfix``
+    abandons the ticket, so it gates on a confirm (mapped to ``True``/``False``
+    so the result is used directly) where the plain ``close`` does not. On
+    confirm it reuses the same ``plan … close RESOLUTION`` mutation +
+    ``update_data`` patch so the row's tag flips to ``wontfix`` in place.
+    """
+    ids = _selected_real_ids(ctx)
+    if not ids:
+        return
+    n = len(ids)
+    subject = f'ticket {ids[0]}' if n == 1 else f'{n} tickets'
+    if not ctx.confirm(f'Close {subject} as wontfix?',
+                       [('&Yes', True), ('&No', False)]):
+        return
+    args = [str(i) for i in ids] + ['close', 'wontfix']
+    result = _run_plan(*args)
+    if result.returncode != 0:
+        ctx.error(result.stderr.strip() or 'close command failed')
+        return
+    style = _STATUS_TAG_STYLE.get('wontfix', '')
+    ctx.update_data(
+        [upsert(i, None, tag='wontfix', tag_style=style) for i in ids])
+
+
+def _action_set_assignee(ctx):
+    """Prompt for a name, then ``plan IDS mod set(assignee=…)`` on the targets.
+
+    Assignee is a ticket attribute set via the ``mod`` (``~``) DSL verb —
+    ``plan N mod 'set(assignee="alice")'`` (see ``plan help mod``). Cancelling
+    the prompt is a no-op; an empty name CLEARS the assignee (``set(assignee="")``)
+    rather than erroring. The tag column shows status (not assignee), so there
+    is nothing to ``update_data`` — a ``refresh`` re-reads the affected rows so
+    a later ``v``/preview reflects the change.
+    """
+    ids = _selected_real_ids(ctx)
+    if not ids:
+        return
+    raw = ctx.input('Assignee (blank to clear): ')
+    if raw is None:
+        return
+    name = raw.strip()
+    args = [str(i) for i in ids] + ['mod', f'set(assignee="{name}")']
+    result = _run_plan(*args)
+    if result.returncode != 0:
+        ctx.error(result.stderr.strip() or 'set assignee failed')
+        return
+    ctx.flash(f'assignee = {name!r}' if name else 'assignee cleared', log=True)
+    ctx.refresh()
+
+
+def _action_add_comment(ctx):
+    """Prompt for comment text, then ``plan IDS comment add TEXT`` on the targets.
+
+    Reuses the recipe's ``plan`` mutation path (``plan N comment add "…"`` — see
+    ``plan help comment``). Cancelling the prompt, or entering blank/whitespace,
+    is a no-op (no empty comment). Comments don't show in the row, so a
+    ``refresh`` (not ``update_data``) is enough for the body/preview to pick the
+    new comment up.
+    """
+    ids = _selected_real_ids(ctx)
+    if not ids:
+        return
+    raw = ctx.input('Comment: ')
+    if raw is None or not raw.strip():
+        return
+    args = [str(i) for i in ids] + ['comment', 'add', raw.strip()]
+    result = _run_plan(*args)
+    if result.returncode != 0:
+        ctx.error(result.stderr.strip() or 'add comment failed')
+        return
+    ctx.flash('comment added', log=True)
+    ctx.refresh()
+
+
+def _one_other_ticket(ctx):
+    """The id of the single OTHER selected ticket, or ``None``.
+
+    Gates the menu's "Move under selected" entry: enabled only when exactly one
+    ticket OTHER than the cursor's is selected (the synthetic Project id=0 is
+    excluded). Zero or two-plus other tickets (ambiguous) yields ``None`` and
+    the entry is omitted. Mirrors browse-git's ``_one_other_commit`` gate.
+    """
+    if ctx.cursor is None:
+        return None
+    cursor_id = ctx.cursor.id
+    others = [it.id for it in ctx.selected if it.id not in (0, cursor_id)]
+    return others[0] if len(others) == 1 else None
+
+
+def _action_move_under_selected(ctx):
+    """Re-parent the cursor ticket as the last child of the one selected ticket.
+
+    Reuses the recipe's ``plan … move`` mutation (``plan N move last DEST`` —
+    reparent, see ``plan help move``) rather than insert mode: the destination
+    is already chosen (the single OTHER selected ticket, ``_one_other_ticket``),
+    so no placement marker is needed. A guarded no-op when the gate no longer
+    holds (selection changed between menu-build and dispatch).
+    """
+    if ctx.cursor is None:
+        return
+    dest = _one_other_ticket(ctx)
+    if dest is None:
+        ctx.flash('select exactly one other ticket to move under')
+        return
+    result = _run_plan(str(ctx.cursor.id), 'move', 'last', str(dest))
+    if result.returncode != 0:
+        ctx.error(result.stderr.strip() or 'move command failed')
+        return
+    ctx.refresh()
+
+
+# ---- context menu --------------------------------------------------------
+#
+# Following the committed recipe convention (browse-procs pilot, browse-git /
+# browse-claude): a PURE ``context_menu_options(ctx)`` builds the ``(label,
+# token)`` rows (opening no modal, so it is unit-testable), a flat ``{token:
+# handler}`` table (``_MENU_ACTIONS``) dispatches the chosen token, and a thin
+# ``on_context_menu(ctx)`` ties the two together. The per-row actions REUSE the
+# recipe's existing action handlers (``_action_status`` / ``_action_close`` /
+# … — each reads ``ctx.cursor`` / ``ctx.targets`` itself), so the menu rows
+# stay single-sourced with the keybindings; the rows that duplicate a hotkey
+# carry the LITERAL hint in parens (menus don't parse ``&``). The Move row's
+# hint tracks the same md2ansi gating as the ``m``/``M`` keybinding (``m`` is
+# the move key by default, ``M`` when md2ansi rebinds ``m`` to the coloring
+# toggle). "Close as wontfix" is the one destructive addition — it confirms.
+# "Move under selected" appears only when exactly one OTHER ticket is selected.
+
+
+def _move_hotkey():
+    """The literal hotkey the Move action is bound to: ``M`` or ``m``.
+
+    Mirrors ``main``'s keybinding gate — when md2ansi_lib is importable ``m``
+    is the markdown-coloring toggle and Move shifts to ``M``; otherwise Move
+    keeps ``m``. Kept in lock-step so the menu hint never disagrees with the
+    real keybinding.
+    """
+    return 'M' if _md2ansi_fn is not None else 'm'
+
+
+_MENU_ACTIONS = {
+    'status':       _action_status,
+    'assignee':     _action_set_assignee,
+    'comment':      _action_add_comment,
+    'close':        _action_close,
+    'reopen':       _action_reopen,
+    'wontfix':      _action_close_wontfix,
+    'edit':         lambda ctx: _action_edit(ctx),
+    'edit.sub':     lambda ctx: _action_edit(ctx, True),
+    'view':         lambda ctx: _action_view(ctx),
+    'view.sub':     lambda ctx: _action_view(ctx, True),
+    'child':        lambda ctx: _action_create(ctx),
+    'children':     lambda ctx: _action_create(ctx, True),
+    'move':         _action_move,
+    'move.under':   _action_move_under_selected,
+}
+
+
+def context_menu_options(ctx):
+    """``(label, token)`` rows for the browse-plan ticket context menu (pure).
+
+    Opens no modal — it inspects ``ctx.cursor`` / ``ctx.selected`` and returns
+    the entries; the token half is dispatched by ``_MENU_ACTIONS`` /
+    ``on_context_menu``. Returns ``[]`` for a non-ticket row: no cursor, the
+    synthetic Project (id=0), or a markdown launcher / umbrella (tuple id) —
+    those have no ticket mutations. Rows duplicating a keybinding carry the
+    literal hotkey in parens (``s`` / ``x`` / ``o`` / ``e`` / ``E`` / ``v`` /
+    ``V`` / ``c`` / ``C`` and Move's ``m``/``M`` per ``_move_hotkey``). The
+    final "Move under selected" row is added only when exactly one OTHER ticket
+    is selected (``_one_other_ticket``).
+    """
+    item = ctx.cursor
+    if item is None or not isinstance(item.id, int) or item.id == 0:
+        return []
+    move = _move_hotkey()
+    rows = [
+        ('Change status… (s)', 'status'),
+        ('Set assignee…', 'assignee'),
+        ('Add comment…', 'comment'),
+        ('Close (x)', 'close'),
+        ('Reopen (o)', 'reopen'),
+        ('Close as wontfix', 'wontfix'),
+        ('Edit body (e)', 'edit'),
+        ('Edit subtree (E)', 'edit.sub'),
+        ('View (v)', 'view'),
+        ('View subtree (V)', 'view.sub'),
+        ('Add child… (c)', 'child'),
+        ('Add children… (C)', 'children'),
+        (f'Move… ({move})', 'move'),
+    ]
+    if _one_other_ticket(ctx) is not None:
+        rows.append(('Move under selected', 'move.under'))
+    return rows
+
+
+def on_context_menu(ctx):
+    """Open the ticket context menu and dispatch the chosen entry.
+
+    The hook the framework fires on right-click / `` ` ``-F1: build the (pure)
+    option list, open it with ``ctx.menu``, and route the chosen token through
+    ``_MENU_ACTIONS``. A cancel (``None``) or an empty list is a no-op; the
+    handlers read ``ctx.cursor`` / ``ctx.targets`` themselves.
+    """
+    token = ctx.menu(context_menu_options(ctx))
+    handler = _MENU_ACTIONS.get(token)
+    if handler is not None:
+        handler(ctx)
+
+
 # ---- key handlers --------------------------------------------------------
 
 
@@ -677,19 +888,28 @@ def _on_children_loaded(ctx, parent_ids):
 # ---- entry point ---------------------------------------------------------
 
 
-_HELP_INTRO = """\
-browse-plan — drop-in replacement for plan-tui on the browse-tui core.
-
+_HELP_USAGE = """\
 Usage: browse-plan [-f FILE] [TICKET_ID]
   -f FILE      Plan file to operate on (passed through to ``plan -f FILE``).
   --file FILE  Long alias for -f.
   TICKET_ID    Numeric ticket id to drill into on launch (sets the initial
-               scope). Without an id, the tree opens at the project root.
+               scope). Without an id, the tree opens at the project root.\
+"""
+
+
+_HELP_INTRO = """\
+browse-plan — drop-in replacement for plan-tui on the browse-tui core.
 
 Browse the active plan-CLI tree by status, drill into subtrees, edit
 or view tickets, and bulk-pick statuses across selections. The cursor
 or selection seeds the actions below; the recipe shells out to the
-``plan`` CLI so the on-disk format stays single-sourced.\
+``plan`` CLI so the on-disk format stays single-sourced.
+
+Right-click a ticket (or the backslash / F1 keys) for a menu mirroring
+the keybindings — change status, close / reopen, edit / view (subtree
+too), add child / children, move — plus set assignee, add comment,
+close as wontfix (confirmed), and, when exactly one other ticket is
+selected, move the cursor ticket under it.\
 """
 
 
@@ -768,9 +988,16 @@ def main():
         # launcher row opens its file in browse-md, every other row toggles
         # expand/collapse — Enter never prints the id and quits.
         on_enter=on_enter,
+        # Right-click (or the backslash / F1 keys) on a ticket row opens a menu
+        # mirroring the keybindings (status / close / reopen / edit / view /
+        # add child / move) plus set-assignee, add-comment, close-as-wontfix,
+        # and (when one other ticket is selected) move-under-selected. See
+        # ``on_context_menu``.
+        on_context_menu=on_context_menu,
         # Retract a leaf ticket's optimistic arrow when its expand reveals
         # neither subtasks nor body ``.md`` refs (the self-heal).
         on_children_loaded=_on_children_loaded,
+        help_usage=_HELP_USAGE,
         help_intro=_HELP_INTRO,
     ))
     _BROWSER = b

@@ -97,7 +97,8 @@ expand/collapse of the cursor row; `` ` `` opens the
 mode picker; ``t`` toggles the commit-graph column (``--tree``); ``m``
 toggles md2ansi message coloring (when available); ``E`` edits the real
 working-tree file for file/status rows in $EDITOR; the built-in ``v`` /
-``e`` page / edit the preview text.
+``e`` page / edit the preview text. ``\\`` / F1 / right-click open a
+context menu keyed to the cursor's git-object kind (see ``on_context_menu``).
 
 By default (toggle off with ``--no-tree`` or the ``t`` key) the commit log has a
 tig-style graph column: ``git log --graph`` does all the lane assignment
@@ -105,8 +106,11 @@ and its art is glyph-substituted and rendered after the date column, with
 its connector-only FILLER lines kept as inert blank rows so the lanes line
 up. The flag scopes the commit log (commits mode + the ref drill-down).
 
-Read-only with respect to history — the only mutation is ``E``'s
-working-tree edit.
+Navigation and previews are read-only; the mutating operations
+(working-tree edits via ``E``, plus checkout / branch / tag / reset /
+cherry-pick / revert / merge / rebase / stage / discard / stash apply /
+drop) live behind the context menu, the destructive ones gated on a
+confirm dialog.
 
 In commits mode ``--all`` spans the log over every local branch (git
 log's ``--branches``) — equivalent to ``browse-git $(git branch
@@ -2378,12 +2382,640 @@ def _on_resize(ctx, cols, rows):
         ctx.drop_preview_cache(('sdiff',))
 
 
+# ---- context menu --------------------------------------------------------
+#
+# A right-click / `` ` ``-F1 menu over the cursor's git object, branching on
+# its KIND (``id[0]``). Following the pilot convention (browse-procs): a PURE
+# ``context_menu_options(ctx)`` builds the ``(label, token)`` rows by kind
+# (opening no modal, so it is unit-testable), a flat ``{token: handler}`` table
+# (``_MENU_ACTIONS``) dispatches the chosen token, and a thin
+# ``on_context_menu(ctx)`` ties the two together. Submenus (Reset ▸, Switch
+# mode) are just a handler re-invoking ``ctx.menu`` / ``ctx.pick``. Hotkey
+# hints are LITERAL text — menus don't parse ``&`` — so an entry duplicating a
+# keybinding shows it in parens (``Edit working-tree file (E)``, the mode entry
+# shows `` ` ``). Mutations route through ``_git_action`` (destructive ones gate
+# on a value-mapped ``ctx.confirm``); "Show"/"Diff" actions reuse the recipe's
+# existing diff/delta path and page the colored output to ``$PAGER``. The menu
+# is read-only-friendly: a missing tool or a git error flashes rather than
+# crashes (browse-tui swallows ``on_context_menu`` exceptions besides).
+
+
+def _page_diff(ctx, argv, *, empty_msg):
+    """Page the colored diff produced by ``git argv…`` through ``$PAGER``.
+
+    The shared "show a diff" path for the commit / file / reflog / stash Show
+    actions (the status entry's Diff is handled separately — its ``--no-index``
+    untracked case exits non-zero by design). ``color.ui=always`` forces SGR
+    even though stdout is a pipe (the same colors the preview uses), and the
+    diff is piped through ``_colorize_diff`` so ``delta`` renders it when on
+    PATH (and the git-colored text shows verbatim otherwise — delta-absent is
+    handled there). The result is paged with ``ctx.page`` (bat / ``$PAGER``).
+
+    A git failure (a bad ref, gitless → rc 127) surfaces via ``ctx.error``
+    rather than paging the stderr as if it were a diff; a successful but empty
+    diff flashes ``empty_msg`` instead of opening an empty pager.
+    """
+    result = _run_git('-c', 'color.ui=always', *argv)
+    if result.returncode != 0:
+        ctx.error((result.stderr or result.stdout).strip()
+                  or f'git {argv[0]} exited {result.returncode}')
+        return
+    if not result.stdout.strip():
+        ctx.flash(empty_msg)
+        return
+    ctx.page(_colorize_diff(result.stdout), lang='diff')
+
+
+def _page_show(ctx, argv, *, empty_msg, lang=''):
+    """Run ``git argv…`` and page its stdout; flash (don't crash) on failure.
+
+    For the non-diff "Show"/"View" actions (a file's contents at a revision,
+    file history, blame, a reflog/stash ``show``). A missing git binary folds
+    into rc 127 (``_run_git``), a non-zero exit surfaces stderr via
+    ``ctx.error``, and empty successful output flashes ``empty_msg``. ``lang``
+    is forwarded to ``ctx.page`` for bat syntax highlighting (e.g. the file's
+    extension for "View this file version").
+    """
+    result = _run_git(*argv)
+    if result.returncode != 0:
+        ctx.error((result.stderr or result.stdout).strip()
+                  or f'git {argv[0]} exited {result.returncode}')
+        return
+    if not result.stdout.strip():
+        ctx.flash(empty_msg)
+        return
+    ctx.page(result.stdout, lang=lang)
+
+
+def _git_action(ctx, argv, *, ok_msg, confirm_msg=None, strong=False):
+    """Run a mutating ``git argv…`` (optionally behind a confirm), then refresh.
+
+    The single mutation path for the menu's history/working-tree actions
+    (checkout, reset, branch/tag create + delete, cherry-pick, revert, merge,
+    rebase, stage/unstage/discard, stash apply/pop/drop). When ``confirm_msg``
+    is given a value-mapped Yes/No dialog gates the run (``ctx.confirm`` returns
+    the mapped ``True``/``False`` so the result is used directly); cancelling
+    is a no-op. ``strong=True`` flips the default button to ``No`` for the
+    irreversible cases (``reset --hard``, ``discard``) so an accidental Enter
+    doesn't fire them.
+
+    On success ``ok_msg`` flashes (logged) and the list is refreshed so the new
+    state shows; a git failure surfaces stderr via ``ctx.error`` and the tree
+    is left untouched. Returns ``True`` iff the command ran and succeeded.
+    """
+    if confirm_msg is not None:
+        buttons = ([('&No', False), ('&Yes', True)] if strong
+                   else [('&Yes', True), ('&No', False)])
+        if not ctx.confirm(confirm_msg, buttons):
+            return False
+    result = _run_git(*argv)
+    if result.returncode != 0:
+        ctx.error((result.stderr or result.stdout).strip()
+                  or f'git {argv[0]} exited {result.returncode}')
+        return False
+    ctx.flash(ok_msg, log=True)
+    ctx.refresh()
+    return True
+
+
+def _input_name(ctx, prompt):
+    """Prompt for a ref/tag name; return the stripped value, or ``None``.
+
+    Wraps ``ctx.input``: a cancel (esc → ``None``) or a blank/whitespace entry
+    both yield ``None`` so the caller bails without running git on an empty
+    name.
+    """
+    raw = ctx.input(prompt)
+    if raw is None or not raw.strip():
+        return None
+    return raw.strip()
+
+
+def _selected_commit_shas(ctx):
+    """The shas of all currently-selected ``('commit', sha)`` rows."""
+    return [it.id[1] for it in ctx.selected
+            if isinstance(it.id, tuple) and len(it.id) >= 2
+            and it.id[0] == 'commit']
+
+
+def _one_other_commit(ctx, sha):
+    """The sha of the single OTHER selected commit, or ``None``.
+
+    Gates the commit menu's "Diff against selected" entry: enabled only when
+    exactly one commit OTHER than the cursor's is in the selection. Two-plus
+    other commits (ambiguous) or none yields ``None`` and the entry is omitted.
+    """
+    others = [s for s in _selected_commit_shas(ctx) if s != sha]
+    return others[0] if len(others) == 1 else None
+
+
+def _has_plan_md(sha):
+    """True when ``.PLAN.md`` exists in commit ``sha``'s tree.
+
+    Probes the COMMIT TREE (``git cat-file -e sha:.PLAN.md``), not the working
+    tree — the file may be present in the commit yet absent on disk. Gates the
+    commit menu's browse-plan entry; ``False`` on any git failure.
+    """
+    return _run_git('cat-file', '-e', f'{sha}:.PLAN.md').returncode == 0
+
+
+# -- commit ('commit', sha) -------------------------------------------------
+
+
+def _cm_commit_full_sha(ctx, sha):
+    """Pop up the full commit SHA (the row shows only the abbreviation)."""
+    ctx.alert(sha, title='commit')
+
+
+def _cm_commit_checkout(ctx, sha):
+    _git_action(ctx, ['checkout', sha], ok_msg=f'checked out {sha[:7]}',
+                confirm_msg=f'git checkout {sha[:7]}?')
+
+
+def _cm_commit_branch(ctx, sha):
+    name = _input_name(ctx, f'New branch at {sha[:7]}: ')
+    if name is not None:
+        _git_action(ctx, ['branch', name, sha],
+                    ok_msg=f'created branch {name} at {sha[:7]}')
+
+
+def _cm_commit_tag(ctx, sha):
+    name = _input_name(ctx, f'New tag at {sha[:7]}: ')
+    if name is not None:
+        _git_action(ctx, ['tag', name, sha],
+                    ok_msg=f'created tag {name} at {sha[:7]}')
+
+
+def _cm_commit_cherry_pick(ctx, sha):
+    _git_action(ctx, ['cherry-pick', sha], ok_msg=f'cherry-picked {sha[:7]}',
+                confirm_msg=f'git cherry-pick {sha[:7]}?')
+
+
+def _cm_commit_revert(ctx, sha):
+    # Revert mutates history (a new commit) — a destructive-class action, so
+    # it confirms; ``--no-edit`` skips the editor the menu can't host inline.
+    _git_action(ctx, ['revert', '--no-edit', sha],
+                ok_msg=f'reverted {sha[:7]}',
+                confirm_msg=f'git revert {sha[:7]}?')
+
+
+# Reset ▸ submenu rows: ``(label, (mode, confirm_msg, strong))``. soft/mixed
+# confirm normally; hard gets a STRONG confirm (default button No) — it
+# discards working-tree changes irreversibly.
+def _cm_commit_reset(ctx, sha):
+    chosen = ctx.menu([
+        ('soft (keep index + working tree)', 'soft'),
+        ('mixed (keep working tree)', 'mixed'),
+        ('hard (DISCARD working tree)', 'hard'),
+    ])
+    if chosen is None:
+        return
+    strong = chosen == 'hard'
+    msg = (f'git reset --hard {sha[:7]}? This DISCARDS all '
+           'uncommitted changes.' if strong
+           else f'git reset --{chosen} {sha[:7]}?')
+    _git_action(ctx, ['reset', f'--{chosen}', sha],
+                ok_msg=f'reset --{chosen} to {sha[:7]}',
+                confirm_msg=msg, strong=strong)
+
+
+def _cm_commit_diff_selected(ctx, sha):
+    other = _one_other_commit(ctx, sha)
+    if other is None:
+        ctx.flash('select exactly one other commit to diff against')
+        return
+    _page_diff(ctx, ['diff', other, sha],
+               empty_msg=f'no differences between {other[:7]} and {sha[:7]}')
+
+
+def _cm_commit_browse_plan(ctx, sha):
+    """Open ``.PLAN.md`` at this commit in browse-plan (piped on stdin).
+
+    Reached only when ``_has_plan_md`` confirmed the file is in the commit
+    tree, but the extract can still fail (gitless mid-session) — flash rather
+    than launch an empty document. The blob is piped to ``browse-plan -`` so
+    no on-disk file is needed; a missing ``browse-plan`` on PATH surfaces via
+    ``run_external``'s own error.
+    """
+    text = _blob_text(sha, '.PLAN.md')
+    if text is None:
+        ctx.flash(f'cannot read .PLAN.md at {sha[:7]}')
+        return
+    ctx.run_external(['browse-plan', '-'], stdin_text=text, keep_screen=True)
+
+
+def context_menu_commit(ctx, item_id):
+    """``(label, token)`` rows for a ``('commit', sha)`` cursor row.
+
+    "Diff against selected" appears only when exactly one OTHER commit is
+    selected (``_one_other_commit``); the browse-plan row only when the commit
+    tree carries ``.PLAN.md`` (``_has_plan_md``). Reset is a submenu (``Reset
+    ▸``). No hotkey hints here — none of these duplicate a global keybinding.
+    """
+    sha = item_id[1]
+    rows = [
+        ('Show full SHA', 'commit.sha'),
+        ('Checkout', 'commit.checkout'),
+        ('Create branch here…', 'commit.branch'),
+        ('Create tag here…', 'commit.tag'),
+        ('Cherry-pick', 'commit.cherry'),
+        ('Revert', 'commit.revert'),
+        ('Reset ▸', 'commit.reset'),
+    ]
+    if _one_other_commit(ctx, sha) is not None:
+        rows.append(('Diff against selected', 'commit.diffsel'))
+    if _has_plan_md(sha):
+        rows.append(('Browse .PLAN.md at this commit', 'commit.plan'))
+    return rows
+
+
+# -- file in a commit ('file', sha, path) -----------------------------------
+
+
+def _cm_file_view(ctx, sha, path):
+    _page_show(ctx, ['show', f'{sha}:{path}'],
+               empty_msg=f'{path} is empty at {sha[:7]}',
+               lang=os.path.basename(path))
+
+
+def _cm_file_diff(ctx, sha, path):
+    _page_diff(ctx, ['show', sha, '--', path],
+               empty_msg=f'no diff for {path} in {sha[:7]}')
+
+
+def _cm_file_history(ctx, sha, path):
+    # History of the path itself (not pinned to this commit) — the full
+    # evolution, newest first, with patches.
+    _page_show(ctx, ['log', '-p', '--', path],
+               empty_msg=f'no history for {path}')
+
+
+def _cm_file_blame(ctx, sha, path):
+    _page_show(ctx, ['blame', sha, '--', path],
+               empty_msg=f'no blame for {path} at {sha[:7]}')
+
+
+def _file_rev(item_id):
+    """The rev a file-menu row targets: a commit sha, or a stash selector.
+
+    The file menu serves two leaf kinds — ``('file', sha, path)`` (rev is the
+    commit sha at ``id[1]``) and ``('stash', n, path)`` (rev is the int ``n``
+    at ``id[1]``, which git addresses as the ``stash@{n}`` selector). Mapping
+    the rev here lets one set of file handlers (view / diff / history / blame)
+    serve both without a kind branch in each.
+    """
+    return (f'stash@{{{item_id[1]}}}' if item_id[0] == 'stash'
+            else item_id[1])
+
+
+def context_menu_file(ctx, item_id):
+    """``(label, token)`` rows for a file-menu cursor row.
+
+    Serves a ``('file', sha, path)`` committed file and a ``('stash', n,
+    path)`` stashed file alike (the rev is resolved per-id by ``_file_rev``).
+    "Edit working-tree file" duplicates the ``E`` action, so its row carries
+    the ``(E)`` hint. "Show full path" is always offered: the row title is the
+    full path but the list renderer cell-cuts it (no ellipsis is inserted) when
+    the pane is narrow, so a pop-up is the reliable way to read a long path —
+    and a redundant pop-up of an already-visible short path is harmless. The
+    truncated width varies per row depth / chrome, so the recipe can't cheaply
+    detect "is this row clipped"; always-show beats a fragile heuristic.
+    """
+    return [
+        ('View this file version', 'file.view'),
+        ('Edit working-tree file (E)', 'file.edit'),
+        ('Diff this file in this commit', 'file.diff'),
+        ('File history', 'file.history'),
+        ('Blame at this commit', 'file.blame'),
+        ('Show full path', 'file.path'),
+    ]
+
+
+# -- ref / branch ('ref', name) ---------------------------------------------
+
+
+def _cm_ref_checkout(ctx, name):
+    _git_action(ctx, ['checkout', name], ok_msg=f'checked out {name}',
+                confirm_msg=f'git checkout {name}?')
+
+
+def _cm_ref_merge(ctx, name):
+    _git_action(ctx, ['merge', '--no-edit', name],
+                ok_msg=f'merged {name} into HEAD',
+                confirm_msg=f'git merge {name} into HEAD?')
+
+
+def _cm_ref_rebase(ctx, name):
+    _git_action(ctx, ['rebase', name], ok_msg=f'rebased HEAD onto {name}',
+                confirm_msg=f'git rebase HEAD onto {name}?')
+
+
+def _cm_ref_branch_from(ctx, name):
+    new = _input_name(ctx, f'New branch from {name}: ')
+    if new is not None:
+        _git_action(ctx, ['branch', new, name],
+                    ok_msg=f'created branch {new} from {name}')
+
+
+def _cm_ref_delete(ctx, name):
+    _git_action(ctx, ['branch', '-d', name], ok_msg=f'deleted branch {name}',
+                confirm_msg=f'git branch -d {name}?')
+
+
+def context_menu_ref(ctx, item_id):
+    """``(label, token)`` rows for a ``('ref', name)`` cursor row.
+
+    The full branch toolkit; no hotkey hints (none duplicate a keybinding).
+    Delete uses ``branch -d`` (safe delete — git refuses an unmerged branch)
+    behind a confirm.
+    """
+    return [
+        ('Checkout', 'ref.checkout'),
+        ('Merge into HEAD', 'ref.merge'),
+        ('Rebase HEAD onto this', 'ref.rebase'),
+        ('Create branch from here…', 'ref.branch'),
+        ('Delete branch', 'ref.delete'),
+    ]
+
+
+# -- status entry ('status', xy, path) --------------------------------------
+
+
+def _cm_status_stage(ctx, xy, path):
+    _git_action(ctx, ['add', '--', path], ok_msg=f'staged {path}')
+
+
+def _cm_status_unstage(ctx, xy, path):
+    _git_action(ctx, ['restore', '--staged', '--', path],
+                ok_msg=f'unstaged {path}')
+
+
+def _cm_status_discard(ctx, xy, path):
+    # Irreversible — strong confirm (default No). An untracked file (``??``)
+    # has nothing to restore from the index, so it's removed outright; a
+    # tracked change is reverted to HEAD's content.
+    if xy == '??':
+        _git_action(ctx, ['clean', '-f', '--', path],
+                    ok_msg=f'removed untracked {path}',
+                    confirm_msg=f'Delete untracked file {path}? '
+                                'This cannot be undone.', strong=True)
+    else:
+        _git_action(ctx, ['checkout', '--', path],
+                    ok_msg=f'discarded changes in {path}',
+                    confirm_msg=f'Discard changes in {path}? '
+                                'This cannot be undone.', strong=True)
+
+
+def _cm_status_diff(ctx, xy, path):
+    # Reuse the recipe's status diff-plan (staged / worktree / untracked) and
+    # page each section, so the menu Diff matches the preview pane.
+    plan = _status_diff_plan(xy, path)
+    multi = len(plan) > 1
+    sections = []
+    for header, argv in plan:
+        raw = _git_color(*argv)
+        if not raw.strip():
+            continue
+        body = _colorize_diff(raw)
+        sections.append(f'── {header} ──\n{body}' if multi else body)
+    text = '\n\n'.join(sections)
+    if not text.strip():
+        ctx.flash(f'no diff for {path}')
+        return
+    ctx.page(text, lang='diff')
+
+
+def _cm_status_open_dir(ctx, xy, path):
+    """Open the file's containing directory in browse-fs.
+
+    The path is repo-root relative, so resolve it against the work-tree root
+    (matching ``E`` / the launcher path resolve) before taking its dirname; a
+    missing ``browse-fs`` on PATH surfaces via ``run_external``'s own error.
+    """
+    root = _repo_root()
+    abspath = os.path.join(root, path) if root else path
+    ctx.run_external(['browse-fs', os.path.dirname(abspath) or '.'],
+                     keep_screen=True)
+
+
+def context_menu_status(ctx, item_id):
+    """``(label, token)`` rows for a ``('status', xy, path)`` cursor row.
+
+    "Edit in $EDITOR" duplicates the ``E`` action → ``(E)`` hint. Stage /
+    Unstage are both always offered (a two-sided ``MM`` entry is both staged
+    and unstaged); the underlying git command is a no-op for the side that
+    doesn't apply, which git reports cleanly.
+    """
+    return [
+        ('Stage', 'status.stage'),
+        ('Unstage', 'status.unstage'),
+        ('Discard changes', 'status.discard'),
+        ('Edit in $EDITOR (E)', 'status.edit'),
+        ('Diff', 'status.diff'),
+        ('Open containing dir in browse-fs', 'status.opendir'),
+    ]
+
+
+# -- stash ('stash', n) -----------------------------------------------------
+
+
+def _cm_stash_apply(ctx, n):
+    _git_action(ctx, ['stash', 'apply', f'stash@{{{n}}}'],
+                ok_msg=f'applied stash@{{{n}}}')
+
+
+def _cm_stash_pop(ctx, n):
+    _git_action(ctx, ['stash', 'pop', f'stash@{{{n}}}'],
+                ok_msg=f'popped stash@{{{n}}}')
+
+
+def _cm_stash_drop(ctx, n):
+    _git_action(ctx, ['stash', 'drop', f'stash@{{{n}}}'],
+                ok_msg=f'dropped stash@{{{n}}}',
+                confirm_msg=f'git stash drop stash@{{{n}}}?')
+
+
+def _cm_stash_show(ctx, n):
+    _page_diff(ctx, ['stash', 'show', '-p', f'stash@{{{n}}}'],
+               empty_msg=f'stash@{{{n}}} is empty')
+
+
+def context_menu_stash(ctx, item_id):
+    """``(label, token)`` rows for a ``('stash', n)`` cursor row.
+
+    Only a stash NODE (``len == 2``) gets the stash menu; a stashed file leaf
+    (``('stash', n, path)``) is handled as a file-style row (see
+    ``context_menu_options``). No hotkey hints.
+    """
+    return [
+        ('Apply', 'stash.apply'),
+        ('Pop', 'stash.pop'),
+        ('Drop', 'stash.drop'),
+        ('Show', 'stash.show'),
+    ]
+
+
+# -- reflog ('reflog', n, sha) ----------------------------------------------
+
+
+def _cm_reflog_checkout(ctx, sha):
+    _git_action(ctx, ['checkout', sha], ok_msg=f'checked out {sha[:7]}',
+                confirm_msg=f'git checkout {sha[:7]}?')
+
+
+def _cm_reflog_reset(ctx, sha):
+    _git_action(ctx, ['reset', '--hard', sha],
+                ok_msg=f'reset --hard to {sha[:7]}',
+                confirm_msg=f'git reset --hard {sha[:7]}? This DISCARDS all '
+                            'uncommitted changes.', strong=True)
+
+
+def _cm_reflog_show(ctx, sha):
+    """Show the reflog entry's commit (message + colored diff) via the pager."""
+    _page_diff(ctx, ['show', sha], empty_msg=f'nothing to show for {sha[:7]}')
+
+
+def context_menu_reflog(ctx, item_id):
+    """``(label, token)`` rows for a ``('reflog', n, sha)`` cursor row.
+
+    "Show full SHA" pops up the entry's commit sha (the row shows only the
+    abbreviation in its tag). "Reset to here" is the hard reset (the reflog's
+    purpose is recovering a position), so it gets the strong confirm.
+    """
+    return [
+        ('Checkout', 'reflog.checkout'),
+        ('Reset to here', 'reflog.reset'),
+        ('Show', 'reflog.show'),
+        ('Show full SHA', 'reflog.sha'),
+    ]
+
+
+# ---- menu dispatch + the hook --------------------------------------------
+#
+# ``_MENU_ACTIONS`` maps every token a ``context_menu_*`` builder can emit to
+# its handler. The handlers take ``(ctx, item_id)`` and pull the fields they
+# need from the tuple (sha / path / n / name) — keeping a single uniform
+# dispatch signature. ``edit_file`` (the ``E`` action) and ``switch_mode`` (the
+# `` ` `` action) are reused directly so the menu's Edit / Switch-mode rows
+# stay single-sourced with the keybindings.
+
+
+_MENU_ACTIONS = {
+    # commit
+    'commit.sha':      lambda c, i: _cm_commit_full_sha(c, i[1]),
+    'commit.checkout': lambda c, i: _cm_commit_checkout(c, i[1]),
+    'commit.branch':   lambda c, i: _cm_commit_branch(c, i[1]),
+    'commit.tag':      lambda c, i: _cm_commit_tag(c, i[1]),
+    'commit.cherry':   lambda c, i: _cm_commit_cherry_pick(c, i[1]),
+    'commit.revert':   lambda c, i: _cm_commit_revert(c, i[1]),
+    'commit.reset':    lambda c, i: _cm_commit_reset(c, i[1]),
+    'commit.diffsel':  lambda c, i: _cm_commit_diff_selected(c, i[1]),
+    'commit.plan':     lambda c, i: _cm_commit_browse_plan(c, i[1]),
+    # file in a commit (or in a stash — _file_rev maps the rev per-id)
+    'file.view':       lambda c, i: _cm_file_view(c, _file_rev(i), i[2]),
+    'file.edit':       lambda c, i: edit_file(c),
+    'file.diff':       lambda c, i: _cm_file_diff(c, _file_rev(i), i[2]),
+    'file.history':    lambda c, i: _cm_file_history(c, _file_rev(i), i[2]),
+    'file.blame':      lambda c, i: _cm_file_blame(c, _file_rev(i), i[2]),
+    'file.path':       lambda c, i: c.alert(i[2], title='path'),
+    # ref / branch
+    'ref.checkout':    lambda c, i: _cm_ref_checkout(c, i[1]),
+    'ref.merge':       lambda c, i: _cm_ref_merge(c, i[1]),
+    'ref.rebase':      lambda c, i: _cm_ref_rebase(c, i[1]),
+    'ref.branch':      lambda c, i: _cm_ref_branch_from(c, i[1]),
+    'ref.delete':      lambda c, i: _cm_ref_delete(c, i[1]),
+    # status entry
+    'status.stage':    lambda c, i: _cm_status_stage(c, i[1], i[2]),
+    'status.unstage':  lambda c, i: _cm_status_unstage(c, i[1], i[2]),
+    'status.discard':  lambda c, i: _cm_status_discard(c, i[1], i[2]),
+    'status.edit':     lambda c, i: edit_file(c),
+    'status.diff':     lambda c, i: _cm_status_diff(c, i[1], i[2]),
+    'status.opendir':  lambda c, i: _cm_status_open_dir(c, i[1], i[2]),
+    # stash
+    'stash.apply':     lambda c, i: _cm_stash_apply(c, i[1]),
+    'stash.pop':       lambda c, i: _cm_stash_pop(c, i[1]),
+    'stash.drop':      lambda c, i: _cm_stash_drop(c, i[1]),
+    'stash.show':      lambda c, i: _cm_stash_show(c, i[1]),
+    # reflog
+    'reflog.checkout': lambda c, i: _cm_reflog_checkout(c, i[2]),
+    'reflog.reset':    lambda c, i: _cm_reflog_reset(c, i[2]),
+    'reflog.show':     lambda c, i: _cm_reflog_show(c, i[2]),
+    'reflog.sha':      lambda c, i: c.alert(i[2], title='commit'),
+    # anywhere
+    'mode.switch':     lambda c, i: switch_mode(c),
+}
+
+
+def context_menu_options(ctx):
+    """``(label, token)`` rows for the git context menu (pure — no modal).
+
+    Branches on the cursor item's KIND (``id[0]``) — every row id is a tagged
+    tuple, so this is a flat dispatch with direct field access. A ``.md`` /
+    ``.PLAN.md`` row, a worktree-group (``wc``) row, a piped-diff row, and the
+    synthetic sentinel / filler / error rows have no per-kind menu; for those
+    (and a cursor on nothing) only the shared "Switch mode" row is offered.
+
+    Every menu ends with a ``Switch mode ▸`` row that reuses the `` ` ``
+    mode-switch action — so its label carries the `` ` `` hotkey hint per the
+    convention. The token half is dispatched by ``_MENU_ACTIONS`` /
+    ``on_context_menu``; the kind-specific rows come from the
+    ``context_menu_<kind>`` builders. A file/status/stash leaf that is also a
+    markdown launcher anchor still gets its file/status/stash menu — the menu
+    operates on the git object, not the launcher child.
+
+    Stash disambiguation: ``('stash', n)`` is a stash node (stash menu);
+    ``('stash', n, path)`` is a file inside a stash, which gets the file menu
+    (view/diff/history/blame against the ``stash@{n}`` rev).
+    """
+    item_id = ctx.cursor.id if ctx.cursor else None
+    rows = []
+    if isinstance(item_id, tuple) and item_id:
+        kind = item_id[0]
+        if kind == 'commit':
+            rows = context_menu_commit(ctx, item_id)
+        elif kind == 'file' and len(item_id) == 3:
+            rows = context_menu_file(ctx, item_id)
+        elif kind == 'ref':
+            rows = context_menu_ref(ctx, item_id)
+        elif kind == 'status' and len(item_id) == 3:
+            rows = context_menu_status(ctx, item_id)
+        elif kind == 'stash' and len(item_id) == 3:
+            # A file inside a stash → the file menu, against the stash rev.
+            rows = context_menu_file(ctx, item_id)
+        elif kind == 'stash' and len(item_id) == 2:
+            rows = context_menu_stash(ctx, item_id)
+        elif kind == 'reflog' and len(item_id) == 3:
+            rows = context_menu_reflog(ctx, item_id)
+    # Switch mode is available anywhere (reuses the ` action; the hint shows
+    # the backtick). Suppressed in stdin mode, where ` itself flashes.
+    if _STDIN_KIND is None:
+        rows = list(rows) + [('Switch mode ▸ (`)', 'mode.switch')]
+    return rows
+
+
+def on_context_menu(ctx):
+    """Open the git context menu and dispatch the chosen entry.
+
+    The hook the framework fires on right-click / `` ` ``-F1: build the (pure)
+    per-kind option list, open it with ``ctx.menu``, and route the chosen token
+    through ``_MENU_ACTIONS`` (passing the cursor's id so each handler reads its
+    own fields). A cancel (``None``) or an empty list is a no-op. The cursor id
+    is re-read at dispatch time so a token always pairs with the row it came
+    from.
+    """
+    options = context_menu_options(ctx)
+    token = ctx.menu(options)
+    handler = _MENU_ACTIONS.get(token)
+    if handler is None:
+        return
+    item = ctx.cursor
+    handler(ctx, item.id if item is not None else None)
+
+
 # ---- entry point ---------------------------------------------------------
 
 
-_HELP_INTRO_TMPL = """\
-browse-git — a tig-like browser over a git repository.
-
+_HELP_USAGE_TMPL = """\
 Usage: browse-git [<dir>] [-n NUMBER] [--mode NAME] [--no-tree] [--all] [<rev>…] [-- <path>…]
        git diff | browse-git      (also git log / log -p / status output; the '-' is optional when piping)
   <dir>         A leading directory in another git repo browses THAT repo
@@ -2423,7 +3055,12 @@ git work tree (distinct from the cwd's) selects the repo to browse; any
 other arg that names an existing file or directory is a pathspec;
 otherwise an arg git resolves as a commit is a rev; anything else is an
 error. They scope commits mode (an explicit --mode other than commits
-ignores them).
+ignores them).\
+"""
+
+
+_HELP_INTRO = """\
+browse-git — a tig-like browser over a git repository.
 
 The five view modes:
   commits   recent git log; drill commit -> changed files -> per-file diff
@@ -2437,6 +3074,10 @@ The five view modes:
 
 Keys:
   `         open the mode picker (switch view mode at runtime)
+  \\ / F1    open a context menu for the cursor row's git object —
+            checkout / branch / tag / reset (commit), view / diff /
+            blame (file), merge / rebase (ref), stage / discard
+            (status), apply / drop (stash); also right-click
   Enter     flip expand/collapse of the cursor row (never quits)
   t         toggle the commit-graph column (--tree) in the commit log
   E         edit the real working-tree file in $EDITOR (file/status rows)
@@ -2581,9 +3222,16 @@ def main():
         actions=actions,
         on_enter=on_enter,
         on_resize=_on_resize,
+        # Right-click (or the backslash / F1 keys) on a row opens a menu keyed
+        # to the cursor's git-object KIND — checkout / branch / tag / reset on
+        # a commit, view / diff / blame on a file, merge / rebase on a ref,
+        # stage / discard on a status entry, apply / drop on a stash, etc.,
+        # plus a shared Switch-mode entry. See ``on_context_menu``.
+        on_context_menu=on_context_menu,
         show_ids='never',
-        help_intro=_HELP_INTRO_TMPL.format(
+        help_usage=_HELP_USAGE_TMPL.format(
             default=_LOG_LIMIT, modes=', '.join(_MODES)),
+        help_intro=_HELP_INTRO,
     ))
     _browser = b
     # Piped-diff mode wraps the file rows under one synthetic ``('sdiff',)``

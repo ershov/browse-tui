@@ -55,6 +55,7 @@ _render.reset_style = _term.reset_style
 _modal.Rect = _render.Rect
 _modal.PaneCache = _state.PaneCache
 _modal.write = _term.write
+_modal.move = _term.move
 _modal.set_style = _term.set_style
 _modal.reset_style = _term.reset_style
 _modal.read_key = _term.read_key
@@ -205,10 +206,13 @@ class TestModalPickWiring(unittest.TestCase):
 
         def _fake_run_modal(browser, content, *, placement='center',
                             anchor=None, delay_interaction=False,
-                            _read_key=None):
+                            cancel_keys=frozenset(),
+                            cancel_on_right_click=False, _read_key=None):
             captured['content'] = content
             captured['placement'] = placement
             captured['anchor'] = anchor
+            captured['cancel_keys'] = cancel_keys
+            captured['cancel_on_right_click'] = cancel_on_right_click
             return 'sentinel'
 
         original = _modal.run_modal
@@ -233,6 +237,12 @@ class TestModalPickWiring(unittest.TestCase):
                          [('open', 'open'), ('done', 'done')])
         self.assertEqual(captured['placement'], 'center')
         self.assertIsNone(captured['anchor'])
+        # #1063: pick is dismissed by F1 / right-click (never text) but NOT by
+        # ``\`` (a literal filter char), so it passes the F1-only cancel set and
+        # opts into right-click close.
+        self.assertEqual(captured['cancel_keys'], frozenset({'f1'}))
+        self.assertNotIn('\\', captured['cancel_keys'])
+        self.assertTrue(captured['cancel_on_right_click'])
 
 
 # --- end-to-end through run_modal (injected key stream) -------------------

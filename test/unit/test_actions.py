@@ -177,10 +177,13 @@ class TestDefaultActions(unittest.TestCase):
 
     def test_required_keys_present(self):
         keys = {a.key for a in default_actions()}
+        # Note: ``f1`` is intentionally NOT a default Action since #1061 —
+        # F1 (like ``\``) is handled in ``dispatch_key`` as the permanent
+        # context-menu trigger, before the keymap lookup.
         for required in ('j', 'k', 'down', 'up', 'home', 'end',
                          'pgdn', 'pgup', 'left', 'right',
                          'ctrl-r', 'ctrl-l', 'ctrl-p',
-                         '?', 'f1', '/', 'q', 'esc', 'ctrl-c'):
+                         '?', '/', 'q', 'esc', 'ctrl-c'):
             self.assertIn(required, keys, f'missing default key: {required!r}')
 
     def test_returns_fresh_list(self):
@@ -2967,58 +2970,17 @@ class TestLayoutSplitActions(unittest.TestCase):
         finally:
             b.stop_workers()
 
-    def test_cycle_layout_cycles_in_order(self):
-        # Starting at 'v', four cycles should return: h, m, pc, v.
-        b = _make_browser(split='v')
-        try:
-            ctx = _ctx_for(b)
-            seq = []
-            for _ in range(4):
-                _actions._cycle_layout(ctx)
-                b.drain_main_queue()
-                seq.append(b.split)
-            self.assertEqual(seq, ['h', 'm', 'pc', 'v'])
-        finally:
-            b.stop_workers()
-
-    def test_cycle_layout_from_each_starting_point(self):
-        # Symmetry check: every layout, when cycled once, lands on the
-        # documented next one.
-        next_of = {'v': 'h', 'h': 'm', 'm': 'pc', 'pc': 'v'}
-        for start, expected in next_of.items():
-            b = _make_browser(split=start)
-            try:
-                ctx = _ctx_for(b)
-                _actions._cycle_layout(ctx)
-                b.drain_main_queue()
-                self.assertEqual(
-                    b.split, expected,
-                    f'{start!r} should cycle to {expected!r}, got {b.split!r}',
-                )
-            finally:
-                b.stop_workers()
-
-    def test_cycle_layout_from_unknown_state_falls_back(self):
-        # Defensive: if browser.split somehow holds a value outside the
-        # cycle (set_split clamps inputs, but tests can poke directly),
-        # cycle should land on the first entry rather than raise.
-        b = _make_browser()
-        try:
-            ctx = _ctx_for(b)
-            b.split = 'bogus'  # bypass set_split's clamp on purpose
-            _actions._cycle_layout(ctx)
-            b.drain_main_queue()
-            self.assertEqual(b.split, _actions._LAYOUT_CYCLE[0])
-        finally:
-            b.stop_workers()
-
     def test_layout_keys_all_bound(self):
         keys = {a.key: a for a in default_actions()}
-        self.assertIs(keys['\\'].handler, _actions._cycle_layout)
+        # alt-1..4 jump DIRECTLY to a fixed layout (no cycle). ``\`` is NO
+        # LONGER bound to a layout action (#1061): it permanently triggers
+        # the context menu, handled in ``dispatch_key`` before the keymap,
+        # so its only remaining default Action is a handler-less help row.
         self.assertIs(keys['alt-1'].handler, _actions._set_layout_v)
         self.assertIs(keys['alt-2'].handler, _actions._set_layout_h)
         self.assertIs(keys['alt-3'].handler, _actions._set_layout_m)
         self.assertIs(keys['alt-4'].handler, _actions._set_layout_pc)
+        self.assertIsNone(keys['\\'].handler)
 
     def test_dispatch_alt_1_sets_layout_v(self):
         b = _make_browser(split='h')
@@ -3060,13 +3022,17 @@ class TestLayoutSplitActions(unittest.TestCase):
         finally:
             b.stop_workers()
 
-    def test_dispatch_backslash_cycles_layout(self):
+    def test_dispatch_backslash_no_longer_cycles_layout(self):
+        # Since #1061 ``\`` permanently triggers the context menu instead
+        # of cycling the layout. With no ``on_context_menu`` handler the
+        # press is consumed (returns True) but is a harmless no-op — the
+        # split must NOT change. Layout-cycle now lives on alt-1..4.
         b = _make_browser(split='v')
         try:
             ctx = _ctx_for(b)
             self.assertTrue(dispatch_key(b, ctx, '\\'))
             b.drain_main_queue()
-            self.assertEqual(b.split, 'h')
+            self.assertEqual(b.split, 'v')             # unchanged
         finally:
             b.stop_workers()
 
@@ -3283,6 +3249,104 @@ class TestAltDigitParsing(unittest.TestCase):
             with self.subTest(digit=digit):
                 key = self._read_key_from_bytes(b'\x1b' + digit.encode())
                 self.assertEqual(key, 'alt-' + digit)
+
+
+class TestSgrMouseParsing(unittest.TestCase):
+    """``read_key`` (020-terminal) decodes SGR mouse reports.
+
+    Under the current reporting mode (DECSET ?1000h + ?1006h) the terminal
+    sends ``ESC [ < Cb ; Cx ; Cy M`` (press) / ``... m`` (release). ``Cb``
+    is a bitfield: low two bits select the button (0=left, 1=middle,
+    2=right); +4/+8/+16 are Shift/Alt/Ctrl; +64 marks the wheel family
+    (64 up, 65 down, 66 left, 67 right). These cases pin the exact event
+    strings ``_read_csi`` emits so the contract stays stable for the action
+    dispatcher and any future mouse-aware callers.
+    """
+
+    def _read_key_from_bytes(self, payload: bytes) -> str:
+        # Same fd-swap technique as TestAltDigitParsing: dup a canned-bytes
+        # pipe over fd 0 and run the production parser unmodified.
+        r, w = os.pipe()
+        os.write(w, payload)
+        os.close(w)
+        saved_stdin_fd = os.dup(0)
+        saved_fd_in = _term._tty_fd_in
+        try:
+            os.dup2(r, 0)
+            _term._tty_fd_in = 0
+            return _term.read_key()
+        finally:
+            _term._tty_fd_in = saved_fd_in
+            os.dup2(saved_stdin_fd, 0)
+            os.close(saved_stdin_fd)
+            try:
+                os.close(r)
+            except OSError:
+                pass
+
+    def _sgr(self, cb: int, final: str, row: int = 7, col: int = 3) -> str:
+        # Cx is the column, Cy the row; the emitted string is row:col, so
+        # feed col as Cx and row as Cy to mirror a real report.
+        payload = '\x1b[<{};{};{}{}'.format(cb, col, row, final).encode()
+        return self._read_key_from_bytes(payload)
+
+    def test_unmodified_left_press_is_mouse_click(self):
+        # Back-compat anchor: the existing event name must not drift.
+        self.assertEqual(self._sgr(0, 'M'), 'mouse-click:7:3')
+
+    def test_scroll_wheel_unchanged(self):
+        self.assertEqual(self._sgr(64, 'M'), 'scroll-up:7:3')
+        self.assertEqual(self._sgr(65, 'M'), 'scroll-down:7:3')
+
+    def test_horizontal_wheel(self):
+        self.assertEqual(self._sgr(66, 'M'), 'scroll-left:7:3')
+        self.assertEqual(self._sgr(67, 'M'), 'scroll-right:7:3')
+
+    def test_modified_wheel_stays_a_scroll(self):
+        # Ctrl+wheel must not be misread as a button click (bit 6 wins).
+        self.assertEqual(self._sgr(64 | 16, 'M'), 'scroll-up:7:3')
+        self.assertEqual(self._sgr(65 | 16, 'M'), 'scroll-down:7:3')
+
+    def test_middle_and_right_press(self):
+        self.assertEqual(self._sgr(1, 'M'), 'middle-click:7:3')
+        self.assertEqual(self._sgr(2, 'M'), 'right-click:7:3')
+
+    def test_releases_collapse_to_mouse_release(self):
+        # Every button's release reports the same event (no motion tracking
+        # means the button identity on release is not useful).
+        self.assertEqual(self._sgr(0, 'm'), 'mouse-release:7:3')
+        self.assertEqual(self._sgr(1, 'm'), 'mouse-release:7:3')
+        self.assertEqual(self._sgr(2, 'm'), 'mouse-release:7:3')
+
+    def test_modifier_prefixes_on_left_press(self):
+        # Prefix strings + ordering must match _CSI_MOD_PREFIX exactly.
+        self.assertEqual(self._sgr(0 | 4, 'M'), 'shift-mouse-click:7:3')
+        self.assertEqual(self._sgr(0 | 8, 'M'), 'alt-mouse-click:7:3')
+        self.assertEqual(self._sgr(0 | 16, 'M'), 'ctrl-mouse-click:7:3')
+        self.assertEqual(
+            self._sgr(0 | 16 | 4, 'M'), 'ctrl-shift-mouse-click:7:3')
+        self.assertEqual(
+            self._sgr(0 | 16 | 8, 'M'), 'alt-ctrl-mouse-click:7:3')
+
+    def test_modifier_prefixes_on_right_press(self):
+        self.assertEqual(self._sgr(2 | 4, 'M'), 'shift-right-click:7:3')
+        self.assertEqual(self._sgr(2 | 16, 'M'), 'ctrl-right-click:7:3')
+        self.assertEqual(
+            self._sgr(2 | 16 | 4, 'M'), 'ctrl-shift-right-click:7:3')
+
+    def test_modifier_prefix_on_release(self):
+        self.assertEqual(self._sgr(0 | 16, 'm'), 'ctrl-mouse-release:7:3')
+        self.assertEqual(self._sgr(2 | 4, 'm'), 'shift-mouse-release:7:3')
+
+    def test_unsupported_modifier_combo_falls_back_to_bare(self):
+        # Shift+Alt has no entry in _CSI_MOD_PREFIX — same as keys, it
+        # drops the prefix rather than inventing a name.
+        self.assertEqual(self._sgr(0 | 4 | 8, 'M'), 'mouse-click:7:3')
+
+    def test_row_col_ordering(self):
+        # Cy (row) comes before Cx (col) in the emitted string.
+        self.assertEqual(self._sgr(2, 'M', row=12, col=40),
+                         'right-click:12:40')
 
 
 if __name__ == '__main__':

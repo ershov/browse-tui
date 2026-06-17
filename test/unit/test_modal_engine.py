@@ -48,6 +48,7 @@ _modal.flush = _term.flush
 _modal.set_style = _term.set_style
 _modal.reset_style = _term.reset_style
 _modal.write = _term.write
+_modal.move = _term.move
 _modal.read_key = _term.read_key
 _modal.term_size = _term.term_size
 # Delay-interaction defaults (ticket #971): the engine reads ``time`` and
@@ -237,6 +238,22 @@ def _first_row_visible_cells(text):
     return _term._visible_len(text[start:end])
 
 
+def _frame_top_left(text):
+    """``(top, left)`` of the painted frame, from the FIRST cursor-move.
+
+    The engine paints the frame top-down; the first row emitted is the top
+    border at the frame's ``(top, left)`` (``begin_row`` does ``move(abs_row,
+    left)``). Parsing that first ``\\e[<row>;<col>H`` therefore recovers where
+    ``_modal_place`` put the box — used to assert anchored/side placement
+    end-to-end through ``run_modal`` rather than re-deriving the geometry.
+    """
+    import re
+    m = re.search(r'\033\[(\d+);(\d+)H', text)
+    if m is None:
+        return None
+    return int(m.group(1)), int(m.group(2))
+
+
 # --- Fake browser ----------------------------------------------------------
 
 
@@ -302,7 +319,7 @@ class TestFrameDraw(unittest.TestCase):
         with _FixedTermSize(), _Capture() as cap:
             run_modal(b, content, _read_key=_scripted(['enter']))
         text = cap.text
-        for ch in ('┌', '┐', '└', '┘', '│', '─'):
+        for ch in ('╔', '╗', '╚', '╝', '║', '═'):
             self.assertIn(ch, text, f'missing border glyph {ch!r}')
         # Title shown, bold (set_style with bold emits the '1' SGR param).
         self.assertIn('Confirm', text)
@@ -318,9 +335,9 @@ class TestFrameDraw(unittest.TestCase):
         with _FixedTermSize(), _Capture() as cap:
             run_modal(b, content, _read_key=_scripted(['enter']))
         # Top border is a solid run between corners — at least one
-        # ``┌───`` style sequence with no title text injected.
-        self.assertIn('┌', cap.text)
-        self.assertIn('┐', cap.text)
+        # ``╔═══`` style sequence with no title text injected.
+        self.assertIn('╔', cap.text)
+        self.assertIn('╗', cap.text)
 
     def test_draw_row_called_with_inner_width(self):
         # content measures (10, 3) → inner_w = frame.width - 4 = 10.
@@ -471,6 +488,90 @@ class TestKeyDispatch(unittest.TestCase):
         self.assertEqual(content.handled, ['enter'])
 
 
+class TestCancelGestures(unittest.TestCase):
+    """``cancel_keys`` / ``cancel_on_right_click`` close the dialog with None
+    BEFORE the key reaches ``content.handle_key`` (#1039 — the ctx.menu path
+    passes these so a repeated trigger toggles the menu shut). Defaults are
+    off, so every non-menu modal is unaffected (asserted last)."""
+
+    _CANCEL_KEYS = frozenset({'\\', 'f1'})
+
+    def test_cancel_key_closes_to_none_before_content(self):
+        # '\' is in cancel_keys → close with None; content never sees it.
+        b = _FakeBrowser()
+        content = _StubContent(key_handler={'enter': (True, 'x')})
+        with _FixedTermSize(), _Capture():
+            res = run_modal(b, content, cancel_keys=self._CANCEL_KEYS,
+                            _read_key=_scripted(['\\']))
+        self.assertIsNone(res)
+        self.assertEqual(content.handled, [])
+
+    def test_f1_in_cancel_keys_closes(self):
+        b = _FakeBrowser()
+        content = _StubContent(key_handler={'enter': (True, 'x')})
+        with _FixedTermSize(), _Capture():
+            res = run_modal(b, content, cancel_keys=self._CANCEL_KEYS,
+                            _read_key=_scripted(['f1']))
+        self.assertIsNone(res)
+        self.assertEqual(content.handled, [])
+
+    def test_right_click_closes_when_enabled(self):
+        b = _FakeBrowser()
+        content = _StubContent(key_handler={'enter': (True, 'x')})
+        with _FixedTermSize(), _Capture():
+            res = run_modal(b, content, cancel_on_right_click=True,
+                            _read_key=_scripted(['right-click:7:3']))
+        self.assertIsNone(res)
+        self.assertEqual(content.handled, [])
+
+    def test_non_cancel_key_still_reaches_content(self):
+        # A key NOT in cancel_keys is unaffected — reaches content as usual.
+        b = _FakeBrowser()
+        content = _StubContent(key_handler={'enter': (True, 'ok')})
+        with _FixedTermSize(), _Capture():
+            res = run_modal(b, content, cancel_keys=self._CANCEL_KEYS,
+                            cancel_on_right_click=True,
+                            _read_key=_scripted(['a', 'enter']))
+        self.assertEqual(res, 'ok')
+        self.assertEqual(content.handled, ['a', 'enter'])
+
+    def test_modifier_right_click_not_a_close_gesture(self):
+        # Only the BARE ``right-click:`` closes; a modifier-prefixed variant
+        # (``alt-right-click:`` …) is NOT a close gesture — the dialog stays
+        # open and the later ``enter`` decides the result (matching how the
+        # open path #1027 only fires on a bare right-click).
+        b = _FakeBrowser()
+        content = _StubContent(key_handler={'enter': (True, 'ok')})
+        with _FixedTermSize(), _Capture():
+            res = run_modal(b, content, cancel_on_right_click=True,
+                            _read_key=_scripted(
+                                ['alt-right-click:7:3', 'enter']))
+        self.assertEqual(res, 'ok')
+        # The modifier variant did not close the dialog.
+        self.assertIn('enter', content.handled)
+
+    def test_defaults_off_cancel_key_reaches_content(self):
+        # No cancel args (the pick/confirm/input/alert default): '\' is just
+        # another key handed to content, NOT a close gesture.
+        b = _FakeBrowser()
+        content = _StubContent(key_handler={'enter': (True, 'ok')})
+        with _FixedTermSize(), _Capture():
+            res = run_modal(b, content, _read_key=_scripted(['\\', 'enter']))
+        self.assertEqual(res, 'ok')
+        self.assertEqual(content.handled, ['\\', 'enter'])
+
+    def test_defaults_off_right_click_swallowed_not_close(self):
+        # No cancel_on_right_click: a right-click is swallowed (the existing
+        # mouse-swallow), neither closing nor reaching content.
+        b = _FakeBrowser()
+        content = _StubContent(key_handler={'enter': (True, 'ok')})
+        with _FixedTermSize(), _Capture():
+            res = run_modal(b, content,
+                            _read_key=_scripted(['right-click:7:3', 'enter']))
+        self.assertEqual(res, 'ok')
+        self.assertEqual(content.handled, ['enter'])
+
+
 class TestRestorePoison(unittest.TestCase):
     """Close-time cache poisoning + 'all' redraw flag."""
 
@@ -577,6 +678,119 @@ class TestRestorePoison(unittest.TestCase):
         with _FixedTermSize(), _Capture():
             run_modal(b, content, _read_key=_scripted(['enter']))
         self.assertFalse(b._modal_open)
+
+
+class TestOuterMargin(unittest.TestCase):
+    """#1043: a blank-space column just outside each vertical border.
+
+    A centered frame at 80x24 with content (20, 2) measures to a 24-wide,
+    4-tall box at left=29 (cols 29..52), rows 11..14. The left margin
+    column is 28, the right is 53 (just past the box). Each painted row
+    overdraws a single blank space in those two columns.
+    """
+
+    # Frame geometry for content (20, 2) on an 80x24 screen, derived the
+    # same way the engine does (caps clamp 20 well under, +4 frame, center).
+    BOX_LEFT = 29
+    BOX_RIGHT = 53          # exclusive — box owns cols 29..52
+    TOP = 11
+    BOTTOM = 15             # exclusive — rows 11..14
+    LM = BOX_LEFT - 1       # 28
+    RM = BOX_RIGHT          # 53
+
+    def _run(self, browser=None):
+        b = browser or _FakeBrowser()
+        content = _StubContent(title='Confirm', w=20, h=2,
+                               key_handler={'enter': (True, 'OK')})
+        with _FixedTermSize(80, 24), _Capture() as cap:
+            run_modal(b, content, _read_key=_scripted(['enter']))
+        return b, cap.text
+
+    def test_margin_columns_painted_blank_each_row(self):
+        # Every painted row gets a reset + single space at the left margin
+        # (col 28) and the right margin (col 53). ``move`` emits
+        # ``\e[<row>;<col>H``; the margin then writes ``\e[0m`` + ' '.
+        _b, text = self._run()
+        for abs_row in range(self.TOP, self.BOTTOM):
+            self.assertIn(f'\033[{abs_row};{self.LM}H\033[0m ', text,
+                          f'left margin not blank at row {abs_row}')
+            self.assertIn(f'\033[{abs_row};{self.RM}H\033[0m ', text,
+                          f'right margin not blank at row {abs_row}')
+
+    def test_margins_inside_the_open_sync(self):
+        # The margins are part of the single synchronized paint — they land
+        # between the sync open and close, not after the frame flushed.
+        _b, text = self._run()
+        open_i = text.index('\033[?2026h')
+        close_i = text.rindex('\033[?2026l')
+        margin_i = text.index(f'\033[{self.TOP};{self.LM}H\033[0m ')
+        self.assertTrue(open_i < margin_i < close_i)
+
+    def test_margin_columns_outside_the_box(self):
+        # The margins must NOT be inside the box: no margin write targets a
+        # box column (29..52). They sit strictly at 28 and 53.
+        _b, text = self._run()
+        for col in range(self.BOX_LEFT, self.BOX_RIGHT):
+            self.assertNotIn(f'\033[{self.TOP};{col}H\033[0m ', text,
+                             f'a margin landed inside the box at col {col}')
+
+    def test_close_poisons_pane_holding_the_left_margin(self):
+        # A pane split EXACTLY at the box's left edge (cols 1..28) does not
+        # overlap the frame proper, but it OWNS the left-margin column (28).
+        # The close-time restore widens its poisoned region by one column
+        # per side, so this pane IS poisoned — without that widening the
+        # blank margin cell it overdrew would survive on close.
+        b = _FakeBrowser()
+        left_pane = Rect(1, 1, self.BOX_LEFT, 25)   # cols 1..28
+        cache = PaneCache()
+        cache.invalidate(left_pane)
+        cache.lines = [(left_pane.width, 'old') for _ in range(left_pane.height)]
+        cache.prev_rect = left_pane
+        b._pane_cache['left'] = cache
+        self._run(b)
+        poisoned = [i for i, ln in enumerate(cache.lines)
+                    if ln == (left_pane.width, _modal._MODAL_POISON)]
+        self.assertTrue(
+            poisoned,
+            'pane owning the left-margin column was not poisoned — its '
+            'blank margin cell would leak on close')
+        # The poisoned rows are exactly the box's row span (11..14 -> rel
+        # 10..13 in this top=1 pane).
+        self.assertEqual(poisoned, list(range(self.TOP - 1, self.BOTTOM - 1)))
+
+    def test_close_poisons_pane_holding_the_right_margin(self):
+        # Symmetric: a pane starting just past the box (col 53) owns the
+        # right-margin column and must be poisoned by the widened restore.
+        b = _FakeBrowser()
+        right_pane = Rect(self.BOX_RIGHT, 1, 81, 25)   # cols 53..80
+        cache = PaneCache()
+        cache.invalidate(right_pane)
+        cache.lines = [(right_pane.width, 'old')
+                       for _ in range(right_pane.height)]
+        cache.prev_rect = right_pane
+        b._pane_cache['right'] = cache
+        self._run(b)
+        poisoned = [i for i, ln in enumerate(cache.lines)
+                    if ln == (right_pane.width, _modal._MODAL_POISON)]
+        self.assertTrue(
+            poisoned,
+            'pane owning the right-margin column was not poisoned')
+
+    def test_tiny_full_screen_omits_margins(self):
+        # On a tiny terminal the frame spans the whole screen (cols 1..18),
+        # so both margin columns would fall off-screen (col 0 / col 19).
+        # The engine omits them — no off-screen move, no crash.
+        b = _FakeBrowser()
+        content = _ListBackedContent(title='T', rows_text=['aa', 'bb'],
+                                     key_handler={'enter': (True, None)})
+        with _FixedTermSize(18, 6), _Capture() as cap:
+            run_modal(b, content, _read_key=_scripted(['enter']))
+        text = cap.text
+        # No write addressed column 0 or column 19 (1 past the 18-col edge).
+        self.assertNotIn('\033[1;0H', text)
+        self.assertNotIn('\033[1;19H', text)
+        # And the frame still painted full-screen (sanity).
+        self.assertIn('\033[1;1H', text)
 
 
 class TestOpenFailure(unittest.TestCase):
@@ -981,6 +1195,168 @@ class TestDelayInteraction(unittest.TestCase):
         self.assertIsNone(res)  # cancelled by the second esc
         self.assertEqual(reads['n'], 2)  # first esc was gated, not a cancel
         self.assertEqual(content.handled, [])  # esc never reaches content
+
+
+class TestContextMenuSideSlot(unittest.TestCase):
+    """``_measure_frame`` decides / stores / reuses the per-chain menu side.
+
+    For an anchored placement the engine resolves the vertical SIDE through
+    ``browser._context_menu_side`` (#1041): unset → decide below-if-fits-else-
+    above from the measured frame height and STORE it; set → REUSE it so a
+    submenu opened later in the same chain stays on the side the first menu
+    picked, shifting (clamping) to fit rather than flipping. The slot is owned
+    by ``Browser._fire_context_menu`` (reset per chain, cleared after); here a
+    fake Browser stands in for it and is observed directly. ``run_modal``
+    paints the frame top-down, so the first cursor-move recovers its placement.
+    """
+
+    def _menu(self, browser, *, anchor, cols=80, rows=24, h=4):
+        """Open one anchored menu of content height ``h``; return its placed
+        ``(top, left)`` from the painted frame."""
+        content = _StubContent(title=None, w=20, h=h,
+                               key_handler={'enter': (True, None)})
+        with _FixedTermSize(cols, rows), _Capture() as cap:
+            run_modal(browser, content, placement='anchor', anchor=anchor,
+                      _read_key=_scripted(['enter']))
+        return _frame_top_left(cap.text)
+
+    def test_first_menu_that_fits_below_stores_below(self):
+        # Anchor high on the screen with room beneath: the engine decides
+        # 'below', stores it, and drops the box one row under the anchor.
+        b = _FakeBrowser()
+        b._context_menu_side = None
+        top, _left = self._menu(b, anchor=(5, 10), h=4)
+        self.assertEqual(b._context_menu_side, 'below')  # decided + stored
+        self.assertEqual(top, 6)                         # row + 1, below
+
+    def test_first_menu_near_bottom_stores_above(self):
+        # Anchor near the bottom: 'below' would overflow, so the first menu
+        # decides + stores 'above' and sits above the anchor row.
+        b = _FakeBrowser()
+        b._context_menu_side = None
+        # 80x24, content h=4 → frame h=6. Anchor at row 22: below = 23..28 >
+        # 24, so it flips above → top = 22 - 6 = 16.
+        top, _left = self._menu(b, anchor=(22, 10), h=4)
+        self.assertEqual(b._context_menu_side, 'above')
+        self.assertEqual(top, 16)
+
+    def test_tall_submenu_reuses_below_and_clamps_not_flips(self):
+        # THE end-to-end #1041 case. The chain's side is already 'below'
+        # (set by the first menu). A TALL submenu (content h=18 → frame
+        # h=20, so 20 rows on screen) dropped below row 5 would be 6..25 >
+        # 24. It must REUSE
+        # 'below' and CLAMP up (top = rows - h + 1 = 24 - 20 + 1 = 5),
+        # overlapping the subject row — NOT flip above (which would put top
+        # at 1). The stored side is unchanged by the reuse.
+        b = _FakeBrowser()
+        b._context_menu_side = 'below'           # chain already chose below
+        top, _left = self._menu(b, anchor=(5, 10), h=18)
+        self.assertEqual(b._context_menu_side, 'below')  # still below
+        self.assertEqual(top, 5)                 # clamped down to fit
+        self.assertNotEqual(top, 1)              # did NOT flip to the above pos
+
+    def test_submenu_reuses_above(self):
+        # Symmetric reuse: chain side 'above', a tall submenu near the top
+        # stays above-anchored and clamps to the top edge instead of flipping
+        # below.
+        b = _FakeBrowser()
+        b._context_menu_side = 'above'
+        # content h=16 → frame h=18. Anchor row 4: above = 4 - 18 = -14 →
+        # clamp to top 1. (Flipping below would be top = 5.)
+        top, _left = self._menu(b, anchor=(4, 10), h=16)
+        self.assertEqual(b._context_menu_side, 'above')
+        self.assertEqual(top, 1)
+        self.assertNotEqual(top, 5)
+
+    def test_fresh_anchored_placement_matches_legacy_decision(self):
+        # With the slot present-but-None the FIRST anchored menu reproduces
+        # today's below-if-fits-else-above rule — the stored side just records
+        # which way it went. Sweep the anchor row and assert the placement
+        # tracks the overflow predicate (asserting the rule, not a constant).
+        rows = 24
+        for row in (1, 5, 10, 17, 18, 22):
+            with self.subTest(row=row):
+                b = _FakeBrowser()
+                b._context_menu_side = None
+                top, _left = self._menu(b, anchor=(row, 10), rows=rows, h=4)
+                fh = 6  # content 4 + frame 2
+                if (row + 1) + fh - 1 <= rows:
+                    self.assertEqual(top, row + 1)
+                    self.assertEqual(b._context_menu_side, 'below')
+                else:
+                    self.assertEqual(top, max(1, row - fh))
+                    self.assertEqual(b._context_menu_side, 'above')
+
+    def test_browser_without_slot_decides_fresh_and_does_not_persist(self):
+        # A Browser lacking the slot (any non-context anchored use) must
+        # behave like "no preferred side" — decide fresh, never crash, and
+        # NOT grow the attribute (so nothing leaks a side onto it).
+        b = _FakeBrowser()
+        self.assertFalse(hasattr(b, '_context_menu_side'))
+        top, _left = self._menu(b, anchor=(5, 10), h=4)
+        self.assertEqual(top, 6)                         # fresh: below
+        self.assertFalse(hasattr(b, '_context_menu_side'))  # not persisted
+
+    def test_centered_placement_never_touches_slot(self):
+        # A centered dialog must not read or write the side slot.
+        b = _FakeBrowser()
+        b._context_menu_side = None
+        content = _StubContent(title=None, w=20, h=3,
+                               key_handler={'enter': (True, None)})
+        with _FixedTermSize(80, 24), _Capture():
+            run_modal(b, content, placement='center',
+                      _read_key=_scripted(['enter']))
+        self.assertIsNone(b._context_menu_side)          # untouched
+
+
+class TestRunModalBoundsThreading(unittest.TestCase):
+    """``run_modal(..., bounds=(L, R))`` threads the bound to ``_modal_place``.
+
+    End-to-end through the engine: ``bounds`` flows ``run_modal`` →
+    ``_measure_frame`` → ``_modal_place``, leaning the anchored menu X toward
+    screen center but clamping its footprint into ``[L, R]`` (#1051). The frame
+    is painted top-down, so the first cursor-move recovers where the box landed
+    — asserted against an independent ``_modal_place`` call (the threading), and
+    against the worked-example intent (footprint right edge pinned to R).
+    """
+
+    def _menu(self, *, anchor, bounds, cols, rows=24, w=20, h=4):
+        """Open one anchored menu with ``bounds``; return its placed ``left``
+        plus the frame width (content ``w`` + 4) so callers can locate the
+        footprint's right-margin column (``left + frame_w``)."""
+        b = _FakeBrowser()
+        b._context_menu_side = None
+        content = _StubContent(title=None, w=w, h=h,
+                               key_handler={'enter': (True, None)})
+        with _FixedTermSize(cols, rows), _Capture() as cap:
+            run_modal(b, content, placement='anchor', anchor=anchor,
+                      bounds=bounds, _read_key=_scripted(['enter']))
+        _top, left = _frame_top_left(cap.text)
+        return left, w + 4
+
+    def test_left_of_center_bound_pins_footprint_right_edge_to_R(self):
+        # The worked example through the engine: list pane [1, 40] on a 300-col
+        # screen pins the footprint's right margin column to R = 40 (NOT the
+        # ~150 screen-centered position #1040 produced). The box left equals
+        # what ``_modal_place`` computes for the same inputs (threading), and
+        # left + frame_w == R (the footprint's right edge).
+        L, R = 1, 40
+        left, frame_w = self._menu(anchor=(5, 1), bounds=(L, R), cols=300)
+        expect = _modal._modal_place(300, 24, frame_w, 6, placement='anchor',
+                                     anchor=(5, 1), bounds=(L, R))
+        self.assertEqual(left, expect.left)          # bound reached _modal_place
+        self.assertEqual(left + frame_w, R)          # footprint right edge at R
+
+    def test_no_bounds_keeps_full_screen_centering(self):
+        # Same anchor/screen but ``bounds=None``: the menu keeps the #1040
+        # full-screen centering (markedly different from the bounded placement),
+        # confirming the bound is what changed the position.
+        bounded, frame_w = self._menu(anchor=(5, 1), bounds=(1, 40), cols=300)
+        unbounded, _ = self._menu(anchor=(5, 1), bounds=None, cols=300)
+        centered = _modal._modal_place(300, 24, frame_w, 6,
+                                       placement='center', anchor=None)
+        self.assertEqual(unbounded, centered.left)   # full-screen centered
+        self.assertNotEqual(bounded, unbounded)      # bound moved it
 
 
 if __name__ == '__main__':
