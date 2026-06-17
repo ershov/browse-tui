@@ -6454,11 +6454,11 @@ def _has_plan_md(path):
 # when ≥1 context dir is a git repo, and launches ``browse-git <dir> --mode
 # NAME`` on the chosen dir (browse-git's verified ``<dir> --mode`` interface).
 _DIR_GIT_MODES = [
-    ('Browse commits',  'dir.git.commits',  'commits'),
-    ('Browse branches', 'dir.git.branches', 'branches'),
-    ('Browse status',   'dir.git.status',   'status'),
-    ('Browse stashes',  'dir.git.stash',    'stash'),
-    ('Browse reflog',   'dir.git.reflog',   'reflog'),
+    ('git commits',  'dir.git.commits',  'commits'),
+    ('git branches', 'dir.git.branches', 'branches'),
+    ('git status',   'dir.git.status',   'status'),
+    ('git stashes',  'dir.git.stash',    'stash'),
+    ('git reflog',   'dir.git.reflog',   'reflog'),
 ]
 
 
@@ -6470,7 +6470,7 @@ def _dir_action_rows(dirs):
     its action applies to ≥1 dir:
 
       * Open in browse-fs        — always (every dir is browsable).
-      * Browse commits/branches/status/stashes/reflog — when ≥1 dir is a git
+      * git commits/branches/status/stashes/reflog — when ≥1 dir is a git
         repo (``_is_git_repo``).
       * Browse plan in browse-plan — when ≥1 dir has ``.PLAN.md``.
       * Show full path           — always (pops up every distinct dir's path).

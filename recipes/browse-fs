@@ -393,11 +393,11 @@ def delete(ctx):
 # directory is a git repo; the chosen row launches ``browse-git <dir> --mode
 # NAME`` on that directory.
 _DIR_GIT_MODES = [
-    ('Browse commits',  'dir.git.commits',  'commits'),
-    ('Browse branches', 'dir.git.branches', 'branches'),
-    ('Browse status',   'dir.git.status',   'status'),
-    ('Browse stashes',  'dir.git.stash',    'stash'),
-    ('Browse reflog',   'dir.git.reflog',   'reflog'),
+    ('git commits',  'dir.git.commits',  'commits'),
+    ('git branches', 'dir.git.branches', 'branches'),
+    ('git status',   'dir.git.status',   'status'),
+    ('git stashes',  'dir.git.stash',    'stash'),
+    ('git reflog',   'dir.git.reflog',   'reflog'),
 ]
 
 _PLAN_BASENAME = '.PLAN.md'

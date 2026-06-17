@@ -176,8 +176,8 @@ class TestPerKindMenus(unittest.TestCase):
         ])
         # The git rows carry the spec's labels.
         labels = dict((t, l) for l, t in rows)
-        self.assertEqual(labels['dir.git.commits'], 'Browse commits')
-        self.assertEqual(labels['dir.git.stash'], 'Browse stashes')
+        self.assertEqual(labels['dir.git.commits'], 'git commits')
+        self.assertEqual(labels['dir.git.stash'], 'git stashes')
 
     def test_dir_show_full_path_always_and_delete_hint(self):
         d = self._subdir('plain')

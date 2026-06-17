@@ -457,11 +457,11 @@ class TestDirHierarchyRealFixture(unittest.TestCase):
             Item(id=('session', sess), title='sess-1', has_children=True))
         rows = self.r.context_menu_options(Context(self.b))
         by_tok = dict((t, l) for l, t in rows)
-        self.assertEqual(by_tok['dir.git.commits'], 'Browse commits')
-        self.assertEqual(by_tok['dir.git.branches'], 'Browse branches')
-        self.assertEqual(by_tok['dir.git.status'], 'Browse status')
-        self.assertEqual(by_tok['dir.git.stash'], 'Browse stashes')
-        self.assertEqual(by_tok['dir.git.reflog'], 'Browse reflog')
+        self.assertEqual(by_tok['dir.git.commits'], 'git commits')
+        self.assertEqual(by_tok['dir.git.branches'], 'git branches')
+        self.assertEqual(by_tok['dir.git.status'], 'git status')
+        self.assertEqual(by_tok['dir.git.stash'], 'git stashes')
+        self.assertEqual(by_tok['dir.git.reflog'], 'git reflog')
         self.assertEqual(by_tok['dir.plan'], 'Browse plan in browse-plan')
 
     def test_project_row_resolves_same_dir_cluster(self):
