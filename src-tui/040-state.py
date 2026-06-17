@@ -4086,6 +4086,24 @@ class Browser:
         self._quit_code = 0
         self._quit_output = ''
 
+        # --- modal dialog state (run_modal in 055-modal; ticket #1041) --
+        # ``_modal_open`` is set/cleared by ``run_modal`` while a dialog
+        # owns the screen; ``is_dialog_open()`` reads it. ``_modal_force``
+        # is the cross-thread close hook: ``close_dialog(value)`` arms it to
+        # a ``(value,)`` 1-tuple (``None`` = not armed; the tuple lets a
+        # force-close with ``None`` be distinguished from "not armed") and
+        # wakes the loop; ``run_modal`` clears it on entry, then breaks
+        # returning ``_modal_force[0]`` when it is armed.
+        self._modal_open = False
+        self._modal_force = None
+        # ``_pending_dialog`` is the single "next dialog to show" slot
+        # (ticket #1042): ``(content, on_result, placement, anchor)`` or
+        # ``None``. MAIN-THREAD-ONLY -- only ``_enqueue_dialog`` (run during a
+        # drain) and the main-loop servicing step touch it. At most one dialog
+        # is ever pending; a second request replaces it (last wins), firing
+        # the displaced request's callback with ``None`` (never shown).
+        self._pending_dialog = None
+
         # --- output channel (ctx.print / quit output; spec §3.2) --------
         # ``print()`` appends utf-8 bytes here under ``_out_lock``; the
         # quit output joins the same stream at teardown (strict FIFO:
@@ -4323,6 +4341,11 @@ class Browser:
     #   cancel(*pendings)           — cancel one or more Pending handles
     #   print(text, end='\n')       — append to the stdout content channel
     #   quit(code=0, output='')     — exit the run loop
+    #   is_dialog_open()            — whether a modal dialog is displayed
+    #   close_dialog(value=None)    — dismiss the open dialog with value
+    #   open_dialog_async(content, *, on_result=None, placement, anchor)
+    #                               — open a dialog from any thread; deliver
+    #                                 the result to on_result on the main thread
     #
     # Methods OUTSIDE this block are main-thread-only.
     # =========================================================================
@@ -5654,9 +5677,99 @@ class Browser:
         """
         self.post(lambda: self._do_quit(code, output))
 
+    def is_dialog_open(self) -> bool:
+        """(thread-safe) Whether a modal dialog is currently displayed.
+
+        Reads the ``_modal_open`` flag ``run_modal`` sets while a dialog
+        owns the screen. Called cross-thread it is a best-effort snapshot
+        (the flag may flip the instant after it is read).
+        """
+        return self._modal_open
+
+    def close_dialog(self, value=None) -> None:
+        """(thread-safe) Dismiss the open dialog, delivering ``value`` to it.
+
+        Arms ``_modal_force`` to ``(value,)`` and wakes the loop; the open
+        ``run_modal`` observes it and returns ``value`` (whoever is waiting
+        on the dialog receives it). ``value=None`` means "no answer." The
+        single atomic write plus ``notify_wake`` makes this safe to call from
+        any thread. Effectively a no-op when no dialog is open: ``run_modal``
+        clears ``_modal_force`` on entry, so a stale arm cannot leak into the
+        next dialog.
+        """
+        self._modal_force = (value,)
+        notify_wake()
+
+    def open_dialog_async(self, content, *, on_result=None,
+                          placement='center', anchor=None) -> None:
+        """(thread-safe) Open a modal dialog from any thread.
+
+        Queues ``content`` to open on the main thread (via :meth:`post` ->
+        :meth:`_enqueue_dialog`, serviced by the main loop) and calls
+        ``on_result(value)`` THERE when it resolves, exactly once, with
+        exceptions caught (see :meth:`_fire_dialog_cb`). ``value`` is the
+        chosen result, or ``None`` for any no-answer path (cancel, programmatic
+        ``close_dialog``, being overridden by a later dialog, being displaced
+        while still pending, or headless).
+
+        Headless Browsers have no render loop to open a dialog, so the
+        callback fires with ``None`` immediately (inline, wrapped) -- matching
+        the blocking ``ctx.confirm`` returning ``None`` headless.
+
+        This is the internal/general entry; the per-kind ``ctx`` async methods
+        (``confirm_async`` etc.) are the public surface and post through here.
+        """
+        if self._headless:
+            self._fire_dialog_cb(on_result, None)
+            return
+        self.post(lambda: self._enqueue_dialog(
+            content, on_result, placement, anchor))
+
     # =========================================================================
     # End of public, thread-safe API
     # =========================================================================
+
+    # ---- async modal dialog open (main-thread internals; ticket #1042) --
+
+    def _fire_dialog_cb(self, cb, value) -> None:
+        """Fire an async dialog's ``on_result`` callback once, caught.
+
+        The SINGLE callback-firing site for the async-dialog feature, so the
+        callback contract holds uniformly: a ``None`` callback is a no-op;
+        otherwise ``cb(value)`` runs with exceptions caught and routed to
+        :meth:`error` (a throwing recipe callback must never escape into the
+        loop). Matches the recipe-hook fire pattern (e.g.
+        :meth:`_fire_cursor_change_if_pending`). Always called on the main
+        thread (the servicing step, :meth:`_enqueue_dialog` during a drain,
+        and the headless short-circuit are all main-thread sites).
+        """
+        if cb is None:
+            return
+        try:
+            cb(value)
+        except Exception as e:
+            self.error(f'dialog callback: {type(e).__name__}: {e}')
+
+    def _enqueue_dialog(self, content, on_result, placement, anchor) -> None:
+        """Main-thread: arm ``_pending_dialog`` for the next servicing step.
+
+        Runs during a :meth:`drain_main_queue` (posted by
+        :meth:`open_dialog_async`). At most one dialog is ever pending: a
+        request that arrives before the previous one was shown DISPLACES it --
+        the displaced request's callback fires immediately with ``None`` (it
+        was never shown, no flash), and the slot is overwritten. If a dialog is
+        currently open, the new request OVERRIDES it via ``close_dialog(None)``
+        (the active dialog's ``run_modal`` returns ``None`` to its waiter);
+        the main loop then services this pending request once the override
+        closes. Override is unconditional -- there is no conflict policy.
+        """
+        if self._pending_dialog is not None:
+            # Displaced while still pending -> its callback fires None now
+            # (never shown). Clearing the slot below means it cannot re-fire.
+            self._fire_dialog_cb(self._pending_dialog[1], None)
+        self._pending_dialog = (content, on_result, placement, anchor)
+        if self._modal_open:
+            self.close_dialog(None)
 
     # ---- worker lifecycle ----------------------------------------------
 
@@ -7643,6 +7756,30 @@ class Browser:
                 # next read_key wake.
                 self.drain_main_queue()
                 self.apply_children_results()
+
+                # Async dialog servicing (ticket #1042): the drain above
+                # emptied the entire main queue, so every async-open request
+                # already in flight has run through ``_enqueue_dialog`` and
+                # collapsed into the single ``_pending_dialog`` slot (earlier
+                # ones displaced, callback ``None``, never shown). Open the
+                # survivor with ``delay_interaction=True`` (drains in-flight
+                # keystrokes / grace-gates so a dialog appearing under the
+                # user's fingers isn't instantly dismissed) and fire its
+                # callback with the result. The ``while`` re-checks the slot
+                # because the dialog's own ``_notify`` drain can enqueue a
+                # follow-up (or override) that should be shown in this same
+                # tick. ``run_modal`` clears ``_modal_open`` on return, so the
+                # guard sees the slot drained between iterations. On a
+                # quit-break (a worker's ``ctx.quit()`` tearing the dialog
+                # down) the callback is DROPPED, per the quit contract.
+                while self._pending_dialog is not None and not self._modal_open \
+                        and not self._quit_requested:
+                    content, on_result, placement, anchor = self._pending_dialog
+                    self._pending_dialog = None
+                    result = run_modal(self, content, placement=placement,
+                                       anchor=anchor, delay_interaction=True)
+                    if not self._quit_requested:
+                        self._fire_dialog_cb(on_result, result)
 
                 # Re-derive preview / children fetches for the current
                 # cursor *after* applying worker deliveries — when a
