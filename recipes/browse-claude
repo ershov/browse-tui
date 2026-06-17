@@ -6298,12 +6298,15 @@ def _action_toggle_filter(ctx):
 # ---- context menu --------------------------------------------------------
 #
 # A right-click / `` ` ``-F1 menu over the cursor's row, branching on its KIND
-# (``id[0]``). Following the committed convention (browse-procs the pilot,
-# browse-git the rich multi-kind case): a PURE ``context_menu_options(ctx)``
+# (``id[0]``) — message / session / subagent / project, plus the tree-mode
+# ``prompt`` / ``tool`` / ``span`` umbrellas (whose rows act on the umbrella's
+# own grouped source). Following the committed convention (browse-procs the
+# pilot, browse-git the rich multi-kind case): a PURE ``context_menu_options(ctx)``
 # builds the ``(label, token)`` rows by kind (opening no modal, so it is
 # unit-testable), a flat ``{token: handler}`` table (``_MENU_ACTIONS``)
 # dispatches the chosen token, and a thin ``on_context_menu(ctx)`` ties the
-# two together. Submenus are just a handler re-invoking ``ctx.menu``. Hotkey
+# two together. Submenus are just a handler re-invoking ``ctx.menu`` (the
+# ``git`` row opens a mode submenu this way). Hotkey
 # hints are LITERAL text — menus don't parse ``&`` — so an entry duplicating a
 # global keybinding shows it in parens (``Edit source in $EDITOR (E)``). The
 # existing per-row actions (V / E / M / y / m) are reused directly so the menu
@@ -6318,12 +6321,14 @@ def _action_toggle_filter(ctx):
 # dir, every distinct working dir the session recorded (a session can span more
 # than one, e.g. when it enters a git worktree), and each one's enclosing git
 # work-tree root — which usually coincide. They are deduped by
-# ``os.path.realpath`` (``_dedup_dirs``); each Level-1 action is shown only if
-# it applies to ≥1 deduped dir, and a Level-2 directory chooser appears only
-# when >1 DISTINCT dir qualifies for the chosen action (so a session that
-# worked in two directories offers both). The action set is built once and
-# shared across the dirs (not duplicated per directory). See
-# ``_dir_action_rows`` / ``_run_dir_action``.
+# ``os.path.realpath`` (``_dedup_dirs``); each Level-1 action (Open in
+# browse-fs, Run shell here, git, Browse plan, Show full path) is shown only if
+# it applies to ≥1 deduped dir, and a directory chooser appears only when >1
+# DISTINCT dir qualifies for the chosen action (so a session that worked in two
+# directories offers both). The single ``git`` row opens a Level-2 mode submenu
+# (commits / branches / status / stashes / reflog) before that dir chooser. The
+# action set is built once and shared across the dirs (not duplicated per
+# directory). See ``_dir_action_rows`` / ``_run_dir_action``.
 
 
 # -- context dirs: project / cwd(s) / worktree ------------------------------
@@ -6437,8 +6442,8 @@ def _is_git_repo(path):
     """True iff ``path`` is inside a git work tree (``find_git_root`` hits).
 
     Reuses md_doc's ``.git``-walk (a worktree's ``.git`` file counts), so the
-    git-mode rows light up for both a plain repo and a worktree. ``False`` when
-    md_doc is unavailable — the git rows then never appear.
+    ``git`` submenu lights up for both a plain repo and a worktree. ``False``
+    when md_doc is unavailable — the ``git`` row then never appears.
     """
     if _md_doc is None or not path:
         return False
@@ -6450,15 +6455,17 @@ def _has_plan_md(path):
     return bool(path) and os.path.isfile(os.path.join(path, '.PLAN.md'))
 
 
-# Git-mode rows: ``(label, token, browse-git --mode NAME)``. Each is shown
-# when ≥1 context dir is a git repo, and launches ``browse-git <dir> --mode
-# NAME`` on the chosen dir (browse-git's verified ``<dir> --mode`` interface).
+# Git-mode submenu rows: ``(submenu_label, browse-git --mode NAME)``. The
+# single Level-1 ``git`` row (shown when ≥1 context dir is a git repo) opens a
+# Level-2 mode submenu built from these; the chosen mode launches ``browse-git
+# <dir> --mode NAME`` on the chosen dir (browse-git's verified ``<dir> --mode``
+# interface).
 _DIR_GIT_MODES = [
-    ('git commits',  'dir.git.commits',  'commits'),
-    ('git branches', 'dir.git.branches', 'branches'),
-    ('git status',   'dir.git.status',   'status'),
-    ('git stashes',  'dir.git.stash',    'stash'),
-    ('git reflog',   'dir.git.reflog',   'reflog'),
+    ('commits',  'commits'),
+    ('branches', 'branches'),
+    ('status',   'status'),
+    ('stashes',  'stash'),
+    ('reflog',   'reflog'),
 ]
 
 
@@ -6470,8 +6477,9 @@ def _dir_action_rows(dirs):
     its action applies to ≥1 dir:
 
       * Open in browse-fs        — always (every dir is browsable).
-      * git commits/branches/status/stashes/reflog — when ≥1 dir is a git
-        repo (``_is_git_repo``).
+      * Run shell here           — always (every dir is shell-able).
+      * git                      — when ≥1 dir is a git repo (``_is_git_repo``);
+        a single row whose handler opens a Level-2 mode submenu.
       * Browse plan in browse-plan — when ≥1 dir has ``.PLAN.md``.
       * Show full path           — always (pops up every distinct dir's path).
 
@@ -6482,9 +6490,9 @@ def _dir_action_rows(dirs):
     if not dirs:
         return []
     paths = [path for _roles, path in dirs]
-    rows = [('Open in browse-fs', 'dir.fs')]
+    rows = [('Open in browse-fs', 'dir.fs'), ('Run shell here', 'dir.shell')]
     if any(_is_git_repo(p) for p in paths):
-        rows.extend((label, token) for label, token, _mode in _DIR_GIT_MODES)
+        rows.append(('git', 'dir.git'))
     if any(_has_plan_md(p) for p in paths):
         rows.append(('Browse plan in browse-plan', 'dir.plan'))
     rows.append(('Show full path', 'dir.path'))
@@ -6516,30 +6524,69 @@ def _choose_dir(ctx, dirs):
     return ctx.menu(_dir_chooser_rows(dirs))
 
 
+def _run_shell(ctx, cwd):
+    """Open the user's ``$SHELL`` with ``cwd`` as the working directory.
+
+    ``ctx.run_external`` has no ``cwd`` knob, so the directory change rides in a
+    shell-string command (run via ``sh -c``): ``cd <dir> && exec <$SHELL>``.
+    ``exec`` replaces the wrapping ``sh`` with the user's shell so signals / the
+    exit code pass through; ``$SHELL`` defaults to ``sh``. Mirrors browse-fs's
+    ``_run_shell``.
+    """
+    import shlex
+    shell = os.environ.get('SHELL') or 'sh'
+    ctx.run_external(f'cd {shlex.quote(cwd)} && exec {shell}')
+
+
+def _run_git_mode(ctx, dirs, mode):
+    """Launch ``browse-git <dir> --mode <mode>`` on a chosen repo dir.
+
+    Filters ``dirs`` to the git repos, picks one via ``_choose_dir`` (Level-3
+    chooser only when >1 repo dir qualifies), and runs browse-git with
+    ``keep_screen=True`` (a sibling recipe gets the alt screen). No-op when no
+    dir is a repo or the chooser is cancelled.
+    """
+    applicable = [d for d in dirs if _is_git_repo(d[1])]
+    if not applicable:
+        return
+    path = _choose_dir(ctx, applicable)
+    if path is None:
+        return
+    ctx.run_external(['browse-git', path, '--mode', mode], keep_screen=True)
+
+
 def _run_dir_action(ctx, token, dirs):
     """Dispatch a Level-1 directory action ``token`` against the deduped ``dirs``.
 
-    Filters ``dirs`` to those the action applies to (git modes → repo dirs,
-    browse-plan → dirs with ``.PLAN.md``; browse-fs / show-path apply to all),
-    then:
+    Filters ``dirs`` to those the action applies to (browse-plan → dirs with
+    ``.PLAN.md``; browse-fs / run-shell / show-path apply to all), then:
 
       * "Show full path" pops up every distinct dir's path (one per line) — no
         chooser, per the ticket exception.
+      * ``dir.git`` opens a Level-2 mode submenu (commits / branches / …) and
+        threads the chosen mode into ``_run_git_mode`` (repo dirs only).
       * Otherwise picks the dir via ``_choose_dir`` (which skips the chooser
         when exactly one qualifies) and launches the external tool through
         ``ctx.run_external``. browse-fs / browse-git / browse-plan are other
-        browse-tui recipes, so ``keep_screen=True`` hands them the alt screen.
+        browse-tui recipes, so ``keep_screen=True`` hands them the alt screen;
+        run-shell replaces the wrapping ``sh`` with the user's interactive
+        ``$SHELL`` (so no ``keep_screen``).
     """
     if token == 'dir.path':
         ctx.alert('\n'.join(path for _roles, path in dirs), title='paths')
         return
 
-    if token == 'dir.fs':
-        applicable = dirs
-    elif token == 'dir.plan':
+    if token == 'dir.git':
+        # Level-2 mode submenu, then the shared git launch on a repo dir.
+        mode = ctx.menu(list(_DIR_GIT_MODES))
+        if mode is not None:
+            _run_git_mode(ctx, dirs, mode)
+        return
+
+    if token == 'dir.plan':
         applicable = [d for d in dirs if _has_plan_md(d[1])]
-    else:  # a git-mode token
-        applicable = [d for d in dirs if _is_git_repo(d[1])]
+    else:  # dir.fs / dir.shell apply to every dir
+        applicable = dirs
     if not applicable:
         return
 
@@ -6549,16 +6596,11 @@ def _run_dir_action(ctx, token, dirs):
 
     if token == 'dir.fs':
         ctx.run_external(['browse-fs', path], keep_screen=True)
-        return
-    if token == 'dir.plan':
+    elif token == 'dir.shell':
+        _run_shell(ctx, path)
+    elif token == 'dir.plan':
         ctx.run_external(['browse-plan', '-f', os.path.join(path, '.PLAN.md')],
                          keep_screen=True)
-        return
-    for _label, git_token, mode in _DIR_GIT_MODES:
-        if git_token == token:
-            ctx.run_external(['browse-git', path, '--mode', mode],
-                             keep_screen=True)
-            return
 
 
 # -- per-kind menu builders -------------------------------------------------
@@ -6619,6 +6661,24 @@ def context_menu_project(ctx, item_id):
     return []
 
 
+def context_menu_umbrella(ctx, item_id):
+    """``(label, token)`` rows for a ``('prompt'|'tool'|'span', jsonl, line)`` row.
+
+    A tree-mode umbrella groups a turn / tool-execution / metadata span; its
+    source actions act on the umbrella ITSELF — the grouped lines, resolved by
+    ``_gather_line_source`` / ``_gather_umbrella_lines``. Reuses the message
+    ``msg.*`` source tokens (E / V / y) so the rows stay single-sourced with
+    those handlers (which read ``ctx.cursor`` and already handle umbrellas). The
+    directory cluster is appended by ``context_menu_options`` (the umbrella's
+    session resolves project/cwd/worktree).
+    """
+    return [
+        ('Edit source in $EDITOR (E)', 'msg.edit'),
+        ('View source in $PAGER (V)',  'msg.view'),
+        ('Show full id (y)',           'msg.id'),
+    ]
+
+
 # -- dispatch + the hook ----------------------------------------------------
 #
 # ``_MENU_ACTIONS`` maps every token a ``context_menu_*`` builder can emit to
@@ -6650,13 +6710,11 @@ _MENU_ACTIONS = {
     # agent / subagent
     'agent.view':    lambda c, i: _action_view_source(c),
     'agent.id':      lambda c, i: c.alert(i[2], title='agent'),
-    # directory cluster (shared across project / session / message rows)
+    # directory cluster (shared across project / session / message / umbrella
+    # rows). ``dir.git`` opens a mode submenu inside ``_run_dir_action``.
     'dir.fs':           lambda c, i: _dispatch_dir(c, i, 'dir.fs'),
-    'dir.git.commits':  lambda c, i: _dispatch_dir(c, i, 'dir.git.commits'),
-    'dir.git.branches': lambda c, i: _dispatch_dir(c, i, 'dir.git.branches'),
-    'dir.git.status':   lambda c, i: _dispatch_dir(c, i, 'dir.git.status'),
-    'dir.git.stash':    lambda c, i: _dispatch_dir(c, i, 'dir.git.stash'),
-    'dir.git.reflog':   lambda c, i: _dispatch_dir(c, i, 'dir.git.reflog'),
+    'dir.shell':        lambda c, i: _dispatch_dir(c, i, 'dir.shell'),
+    'dir.git':          lambda c, i: _dispatch_dir(c, i, 'dir.git'),
     'dir.plan':         lambda c, i: _dispatch_dir(c, i, 'dir.plan'),
     'dir.path':         lambda c, i: _dispatch_dir(c, i, 'dir.path'),
 }
@@ -6667,12 +6725,12 @@ def context_menu_options(ctx):
 
     Branches on the cursor item's KIND (``id[0]``): a message
     (``('msg', jsonl, n)``), session (``('session', jsonl)``), subagent
-    (``('agent', jsonl, aid)``) or project (``('project', dir)``) row gets its
-    per-kind rows, then the SHARED directory cluster (``_dir_action_rows``
-    against the cursor's deduped context dirs) when those rows resolve. A
-    synthetic / markdown / cursorless row has no menu (``[]``), so the hook
-    opens nothing. The token half is dispatched by ``_MENU_ACTIONS`` /
-    ``on_context_menu``.
+    (``('agent', jsonl, aid)``), project (``('project', dir)``) or tree-mode
+    umbrella (``('prompt'|'tool'|'span', jsonl, line)``) row gets its per-kind
+    rows, then the SHARED directory cluster (``_dir_action_rows`` against the
+    cursor's deduped context dirs) when those rows resolve. A synthetic /
+    markdown / cursorless row has no menu (``[]``), so the hook opens nothing.
+    The token half is dispatched by ``_MENU_ACTIONS`` / ``on_context_menu``.
     """
     item_id = ctx.cursor.id if ctx.cursor else None
     if not isinstance(item_id, tuple) or not item_id:
@@ -6686,6 +6744,8 @@ def context_menu_options(ctx):
         rows = context_menu_agent(ctx, item_id)
     elif kind == 'project':
         rows = context_menu_project(ctx, item_id)
+    elif kind in ('prompt', 'tool', 'span') and len(item_id) == 3:
+        rows = context_menu_umbrella(ctx, item_id)
     else:
         return []
     # Append the shared directory cluster (project / cwd / worktree), deduped.
@@ -6751,12 +6811,13 @@ a transcript with Right/Alt-Down; preview shows the rendered turn.
   t       toggle flat / tree view.
   .       toggle voice-only filter (hide tool calls / machinery).
 
-Right-click a row (or the backslash / F1 keys) for a menu: message rows
-offer the source actions above (edit / view / mdcat / id); session and
-subagent rows open the transcript and show their path / id. Every project,
-session, message and subagent row also surfaces a directory cluster over its
-project / cwd / worktree dirs — open in browse-fs, browse the git history (commits /
-branches / status / stashes / reflog), or browse its .PLAN.md.\
+Right-click a row (or the backslash / F1 keys) for a menu: message and
+turn / tool / span umbrella rows offer the source actions above
+(edit / view / id, plus mdcat / toggle on a message); session and subagent
+rows open the transcript and show their path / id. Every row also surfaces a
+directory cluster over its project / cwd / worktree dirs — open in browse-fs,
+run a shell there, browse the git history (a submenu of commits / branches /
+status / stashes / reflog), or browse its .PLAN.md.\
 """
 
 
@@ -6945,10 +7006,11 @@ def main():
         # Fires for alt-down, programmatic scope, and startup alike.
         on_scope_change=_on_scope_change,
         # Right-click (or the backslash / F1 keys) opens a per-kind menu:
-        # message (E/V/M/y/m source actions), session / subagent transcript +
+        # message (E/V/M/y/m source actions), prompt/tool/span umbrellas
+        # (E/V/y on the umbrella's own source), session / subagent transcript +
         # path, and a shared directory cluster over the row's project / cwd /
-        # worktree dirs (browse-fs, browse-git modes, browse-plan). See
-        # ``on_context_menu``.
+        # worktree dirs (browse-fs, run-shell, a git mode submenu, browse-plan).
+        # See ``on_context_menu``.
         on_context_menu=on_context_menu,
         # Preview content is width-dependent: ``_md_voice`` lays out voice
         # markdown (prose wrap AND table column widths) through md2ansi at
