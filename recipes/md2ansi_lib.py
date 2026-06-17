@@ -327,7 +327,13 @@ def _m2a_fmt_image(m, name, current_style, context, state):
 def _m2a_fmt_blockquote(m, name, current_style, context, state):
     text = m.group(0)
     stripped = "\n".join(re.sub(r"^>[ \t]?", "", ln) for ln in text.split("\n"))
-    inner = _md2ansi(stripped, current_style, M2A_CONTEXT_MD_INLINE, state)
+    # Recurse through BLOCKLITE (not INLINE) so a `> ## x` line renders as a
+    # heading. Strip any opaque marker a nested heading added: the quote re-marks
+    # the whole block opaque below, and the post-render pass only consumes a
+    # line-leading marker, so an inner one (now after the bar) would leak as a
+    # literal NUL. The nested heading therefore wraps with the quote, not opaque.
+    inner = _md2ansi(stripped, current_style, M2A_CONTEXT_MD_BLOCKLITE, state)
+    inner = inner.replace(_M2A_OPAQUE, "")
     bar = _m2a_styled("│", current_style, M2A_COLOR_DIM) + " "
     # The quote owns its layout, so it wraps itself (visible-width aware) before
     # the bar is prefixed — width less the 2-column bar — then marks the result
@@ -577,7 +583,13 @@ def _m2a_fmt_list(m, name, current_style, context, state):
             level = len(indent.expandtabs(4)) // 2
             bullet = "·" if marker in ("-", "*", "+") else marker
             styled = _m2a_styled(bullet, current_style, "1")
-            rendered = _md2ansi(content, current_style, M2A_CONTEXT_MD_INLINE, state)
+            # BLOCKLITE (not INLINE) so a `- ## x` item renders its content as a
+            # heading. Drop any opaque marker the heading added: the list re-marks
+            # the whole block opaque below and the post-render pass only consumes a
+            # line-leading marker, so an inner one (after the bullet) would leak as
+            # a literal NUL. The nested heading thus wraps with the list item.
+            rendered = _md2ansi(content, current_style, M2A_CONTEXT_MD_BLOCKLITE, state)
+            rendered = rendered.replace(_M2A_OPAQUE, "")
             line = f"{'  ' * level}{styled} {rendered}"
             # The item is fully rendered before wrapping, so inline spans never
             # straddle a wrap break. Continuations hang-indent two columns past
@@ -1003,8 +1015,11 @@ def _m2a_heading_lambda(sgr):
 # Inline rules — used to build M2A_CONTEXT_MD_INLINE (where _M2A_RECURSE_SELF
 # resolves to INLINE itself), and reused inside _M2A_RULES_MD after rebinding
 # the sentinel to the now-built INLINE context. Block-level matches recurse
-# into INLINE so heading/quote/cell text never re-triggers block rules
-# (otherwise "1. Goals" inside `## 1. Goals` would render as a list).
+# into INLINE so their text never re-triggers the full block grammar (otherwise
+# "1. Goals" inside `## 1. Goals` would render as a list). The exceptions are
+# list items and blockquotes, which recurse into M2A_CONTEXT_MD_BLOCKLITE
+# (INLINE plus the heading rules) so a heading nested inside them is styled —
+# see that context's definition for what that does and does not cover.
 _M2A_RULES_INLINE_RAW = (
     ("code_inline2",  _MD_CODE_INLINE2, _m2a_fmt_inline_code,  None),
     ("code_inline",   _MD_CODE_INLINE,  _m2a_fmt_inline_code,  None),
@@ -1051,6 +1066,40 @@ _M2A_RULES_MD = (
 ) + _M2A_RULES_INLINE_IN_MD
 
 M2A_CONTEXT_MD = _m2a_build_context(_M2A_RULES_MD)
+
+# "Block-lite" recursion context: the six ATX heading rules plus the inline
+# rules, and nothing else. It is the recursion target for list items and
+# blockquotes (see `_m2a_fmt_list` / `_m2a_fmt_blockquote`) so that a heading
+# written inside one of them is styled instead of leaking its literal `#`s.
+#
+# How it works: the block rule (list/blockquote) claims the whole block first
+# and draws its own chrome (the bullet, or the `│` bar); it then recurses the
+# *leftover* line content through this context, where the `^#{1,6} ` heading
+# rules fire per line (the engine compiles with re.MULTILINE) exactly as they
+# do at top level. Going *through* the block formatter is what preserves the
+# chrome — a sibling top-level heading rule cannot, because the block rules
+# consume their own lines first (a flat heading rule placed beside `list` either
+# no-ops on multi-line lists or eats the bullet on single-line ones).
+#
+# Covered: a heading that is the direct line-content of a list item or a
+# blockquote line — `- ## h`, `1. ## h`, `> ## h`, multi-line quotes, and
+# headings in nested list items (`- a` then `  - ## h`), with inline emphasis
+# in the title still rendered.
+#
+# NOT covered (each would require real recursive block parsing, which this
+# regex engine does not do): a heading on a marker-less list *continuation*
+# line (`- a` then `  ## h` — the `_MD_LIST` grammar never captures that line
+# into the list block), and multi-level block nesting such as a list inside a
+# quote (`> - ## h`, where the blockquote recurses into this context, which has
+# no list rule).
+#
+# Deliberately distinct from M2A_CONTEXT_MD_INLINE: INLINE stays heading-free
+# because it also renders heading titles and table cells, where a literal
+# `## x` must survive untouched.
+_M2A_RULES_BLOCKLITE = tuple(
+    r for r in _M2A_RULES_MD if r[0] in {"h1", "h2", "h3", "h4", "h5", "h6"}
+) + _M2A_RULES_INLINE_IN_MD
+M2A_CONTEXT_MD_BLOCKLITE = _m2a_build_context(_M2A_RULES_BLOCKLITE)
 
 
 # ### Section: Internal _md2ansi() and replace dispatcher ###################
