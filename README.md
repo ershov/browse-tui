@@ -66,7 +66,7 @@ browse-tui \
 `$TUI_ID` is set per row; `$EDITOR` and the rest of the parent environment are
 inherited unchanged. For a flat `fzf`-style list, skip the tree entirely:
 `ls | browse-tui --root-cmd - --input tsv --fields id` prints the selection to
-stdout (exit 0; `q`/`Esc` cancels with exit 1). Recipes take piped input the
+stdout (exit 0; `q`/`Ctrl-C` cancels with exit 1). Recipes take piped input the
 same way — `git diff | b-git -` browses the diff with no repo at all.
 
 ### In Python — same idea, full API:
@@ -119,7 +119,7 @@ Make it executable and run it directly: `chmod +x my-recipe && ./my-recipe`.
 | `\` / F1                   | Context menu (also right-click)         |
 | `?`                        | Help (full key list)                    |
 | Enter                      | `--on-enter` (default: print + exit)    |
-| `q`, Esc, Ctrl-C           | Quit (Ctrl-Z suspends)                  |
+| `q`, Ctrl-C                | Quit (Ctrl-Z suspends)                  |
 
 ## Documentation
 

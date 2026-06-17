@@ -1301,7 +1301,7 @@ Advanced escape hatch (mirrors `Context.browser`, unstable surface):
 #### `Browser.run() -> int`
 
 Start workers, set up the terminal, run the main loop, tear down. Blocks
-until `ctx.quit()` (or `q`/`Esc`). Returns the exit code stashed via `quit`
+until `ctx.quit()` (or `q`/`Ctrl-C`). Returns the exit code stashed via `quit`
 (or the cancel code 1 from a default-quit).
 
 #### `recipe_argv(argv=None) -> list`

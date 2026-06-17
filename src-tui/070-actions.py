@@ -1199,7 +1199,6 @@ def default_actions() -> list:
         Action('e',         'Edit preview in $EDITOR (changes discarded)', _edit_in_editor, 'none', 'OTHER'),
         Action('~',         'View message log', _view_log,  'none', 'OTHER'),
         Action('q',         'Quit',           _quit,        'none', 'OTHER'),
-        Action('esc',       'Quit',           _quit,        'none', 'OTHER'),
         Action('ctrl-c',    'Quit',           _quit,        'none', 'OTHER'),
         Action('ctrl-z',    'Suspend',        _suspend,     'none', 'OTHER'),
     ]
