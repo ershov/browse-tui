@@ -379,8 +379,11 @@ def delete(ctx):
 # global preview knob (not a per-item action), so it is left to the keybinding
 # and gets no menu row. Destructive deletes reuse the existing ``delete``
 # handler's confirm; non-visible values (paths) pop up via ``ctx.alert`` — there
-# is NO clipboard. A file row also surfaces *.md / .PLAN.md launches; the
-# git-mode rows appear only for a repo directory. The menu is read-only-friendly:
+# is NO clipboard. A file row also surfaces *.md / .PLAN.md launches plus the
+# shared directory actions (``_dir_actions``), which there act on the file's
+# PARENT — the directory being listed; the git-mode rows appear only for a repo
+# directory (the cursor dir, or a file's repo parent). The menu is
+# read-only-friendly:
 # a missing external tool surfaces via ``run_external``'s own error rather than
 # crashing (browse-tui swallows ``on_context_menu`` exceptions besides).
 
@@ -446,6 +449,22 @@ def _selected_other_path(ctx, path):
 
 
 # -- shared handlers --------------------------------------------------------
+
+
+def _target_dir(path):
+    """The directory a ``dir.*`` action operates on, given the cursor's path.
+
+    The directory actions (``_dir_actions``) are offered on BOTH a directory
+    cursor and a file cursor, where they act on the directory being listed: the
+    dir itself for a directory cursor, the file's PARENT for a file cursor. Their
+    handlers all receive the cursor row's ``path``; this collapses the two cases
+    so the same ``dir.*`` handler threads the right directory either way — the
+    dir verbatim, else the file's parent (``'.'`` for a bare basename). This
+    mirrors the original ``file.shell`` ``os.path.dirname(p) or '.'`` rule and is
+    what keeps the dir-cursor tokens unchanged (the token says WHICH action; the
+    cursor says WHICH directory).
+    """
+    return path if os.path.isdir(path) else (os.path.dirname(path) or '.')
 
 
 def _run_shell(ctx, cwd):
@@ -589,23 +608,46 @@ def _diff_selected(ctx, path):
 # -- per-kind menu builders -------------------------------------------------
 
 
-def context_menu_dir(ctx, path):
-    """``(label, token)`` rows for a directory cursor row.
+def _dir_actions(dir_path):
+    """``(label, token)`` rows for the NON-destructive actions on ``dir_path``.
 
-    Run-shell-here, then the git-mode rows (only when ``path`` is a repo),
-    New file / New directory, Show full path, and Delete (reusing the ``d``
-    handler's confirm → ``(d)`` hint). "Show full path" is ALWAYS offered for a
-    path row — the row title is cell-cut WITHOUT an ellipsis when the pane is
-    narrow, so a pop-up is the reliable way to read a long path (and a redundant
-    pop-up of a short path is harmless); the recipe can't cheaply detect
-    render-time truncation, so always-show beats a fragile heuristic.
+    The directory-related actions a browse-fs row can offer: Run-shell-here, the
+    git-mode launches (only when ``dir_path`` is a repo), and New file / New
+    directory (created IN ``dir_path``). Shared by a directory cursor (where
+    ``dir_path`` is the cursor dir) and a file cursor (where ``dir_path`` is the
+    file's PARENT — the directory being listed), so the same actions operate on
+    whichever directory is in play.
+
+    ``dir_path`` here gates the git-mode rows (``_is_git_repo``); the chosen
+    row's handler re-derives the same directory from the cursor via
+    ``_target_dir`` (so the token stays a plain string, and the dir-cursor tokens
+    are unchanged). Destructive Delete / "Show full path" are NOT here — those are
+    row-kind specific and stay with the per-kind builder.
     """
     rows = [('Run shell here', 'dir.shell')]
-    if _is_git_repo(path):
+    if _is_git_repo(dir_path):
         rows.extend((label, token) for label, token, _mode in _DIR_GIT_MODES)
     rows.extend([
         ('New file…', 'dir.newfile'),
         ('New directory…', 'dir.newdir'),
+    ])
+    return rows
+
+
+def context_menu_dir(ctx, path):
+    """``(label, token)`` rows for a directory cursor row.
+
+    The shared directory actions (``_dir_actions`` — Run-shell-here, git-mode
+    rows when a repo, New file / New directory), then Show full path and Delete
+    (reusing the ``d`` handler's confirm → ``(d)`` hint). "Show full path" is
+    ALWAYS offered for a path row — the row title is cell-cut WITHOUT an ellipsis
+    when the pane is narrow, so a pop-up is the reliable way to read a long path
+    (and a redundant pop-up of a short path is harmless); the recipe can't
+    cheaply detect render-time truncation, so always-show beats a fragile
+    heuristic.
+    """
+    rows = list(_dir_actions(path))
+    rows.extend([
         ('Show full path', 'dir.path'),
         ('Delete (d)', 'delete'),
     ])
@@ -616,18 +658,24 @@ def context_menu_file(ctx, path):
     """``(label, token)`` rows for a file cursor row.
 
     Edit / Open / Delete reuse the e / o / d handlers, so their rows carry the
-    literal hotkey hint. View pages the file in ``$PAGER``; Run-shell-here opens
-    ``$SHELL`` in the file's PARENT directory. A ``.PLAN.md`` file gains a
-    browse-plan row; any ``*.md`` file gains a browse-md row plus a Render-with-
-    mdcat row. "Diff against selected" appears only when exactly one OTHER item
-    is selected (``_selected_other_path``). "Show full path" is always offered
-    (see ``context_menu_dir``).
+    literal hotkey hint. View pages the file in ``$PAGER``. A ``.PLAN.md`` file
+    gains a browse-plan row; any ``*.md`` file gains a browse-md row plus a
+    Render-with-mdcat row. "Diff against selected" appears only when exactly one
+    OTHER item is selected (``_selected_other_path``). "Show full path" is always
+    offered (see ``context_menu_dir``). Delete here removes the FILE.
+
+    The shared directory actions (``_dir_actions``) are appended, acting on the
+    file's PARENT — the directory being listed. That folds in Run-shell-here
+    (which therefore appears exactly once, no standalone file row), the git-mode
+    launches when the parent is a repo, and New file / New directory created in
+    that parent. The parent's Delete / Show-full-path are deliberately NOT
+    appended: Delete on a file row deletes the file, and the parent directory
+    must never be offered for deletion from a file cursor.
     """
     rows = [
         ('Edit in $EDITOR (e)', 'file.edit'),
         ('View in $PAGER', 'file.view'),
         ('Open with default app (o)', 'file.open'),
-        ('Run shell here', 'file.shell'),
     ]
     if os.path.basename(path) == _PLAN_BASENAME:
         rows.append(('Browse in browse-plan', 'file.plan'))
@@ -640,6 +688,7 @@ def context_menu_file(ctx, path):
         ('Show full path', 'file.path'),
         ('Delete (d)', 'delete'),
     ])
+    rows.extend(_dir_actions(os.path.dirname(path) or '.'))
     return rows
 
 
@@ -668,21 +717,23 @@ def context_menu_multi(ctx):
 
 
 _MENU_ACTIONS = {
-    # directory
-    'dir.shell':       lambda c, p: _run_shell(c, p),
-    'dir.git.commits': lambda c, p: _open_browse_git(c, p, 'commits'),
-    'dir.git.branches': lambda c, p: _open_browse_git(c, p, 'branches'),
-    'dir.git.status':  lambda c, p: _open_browse_git(c, p, 'status'),
-    'dir.git.stash':   lambda c, p: _open_browse_git(c, p, 'stash'),
-    'dir.git.reflog':  lambda c, p: _open_browse_git(c, p, 'reflog'),
-    'dir.newfile':     lambda c, p: _new_file(c, p),
-    'dir.newdir':      lambda c, p: _new_dir(c, p),
+    # directory actions (``_dir_actions``) — offered on a directory cursor AND a
+    # file cursor; ``_target_dir`` re-derives WHICH dir from the cursor's path
+    # (the dir itself, else the file's parent), so one handler serves both.
+    'dir.shell':       lambda c, p: _run_shell(c, _target_dir(p)),
+    'dir.git.commits': lambda c, p: _open_browse_git(c, _target_dir(p), 'commits'),
+    'dir.git.branches': lambda c, p: _open_browse_git(c, _target_dir(p), 'branches'),
+    'dir.git.status':  lambda c, p: _open_browse_git(c, _target_dir(p), 'status'),
+    'dir.git.stash':   lambda c, p: _open_browse_git(c, _target_dir(p), 'stash'),
+    'dir.git.reflog':  lambda c, p: _open_browse_git(c, _target_dir(p), 'reflog'),
+    'dir.newfile':     lambda c, p: _new_file(c, _target_dir(p)),
+    'dir.newdir':      lambda c, p: _new_dir(c, _target_dir(p)),
+    # directory-row only — the cursor path IS the dir here.
     'dir.path':        lambda c, p: c.alert(p, title='path'),
     # file
     'file.edit':       lambda c, p: edit(c),
     'file.view':       lambda c, p: _view_pager(c, p),
     'file.open':       lambda c, p: open_(c),
-    'file.shell':      lambda c, p: _run_shell(c, os.path.dirname(p) or '.'),
     'file.plan':       lambda c, p: _browse_plan(c, p),
     'file.md':         lambda c, p: _browse_md(c, p),
     'file.mdcat':      lambda c, p: _render_mdcat(c, p),

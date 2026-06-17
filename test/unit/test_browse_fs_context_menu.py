@@ -191,20 +191,27 @@ class TestPerKindMenus(unittest.TestCase):
     # -- file -------------------------------------------------------------
 
     def test_plain_file_menu_rows_and_hotkey_hints(self):
-        # A plain (non-md) file: edit / view / open / shell, then show path /
-        # delete. No browse-md / browse-plan / mdcat / diff rows.
+        # A plain (non-md) file whose parent is NOT a repo: edit / view / open,
+        # then show path / delete, then the shared directory actions on the
+        # parent (Run-shell-here + New file/dir — no git rows). No browse-md /
+        # browse-plan / mdcat / diff rows; the standalone file.shell row is gone
+        # (Run-shell-here now rides in via dir.shell, exactly once).
         p = self._file('app.py', 'print(1)\n')
         item = Item(id=p, title='app.py', has_children=False)
         rows = self.r.context_menu_options(self._ctx(item))
         self.assertEqual(_tokens(rows), [
-            'file.edit', 'file.view', 'file.open', 'file.shell',
+            'file.edit', 'file.view', 'file.open',
             'file.path', 'delete',
+            'dir.shell', 'dir.newfile', 'dir.newdir',
         ])
+        # The retired standalone file shell token is gone.
+        self.assertNotIn('file.shell', _tokens(rows))
         labels = dict((t, l) for l, t in rows)
         # e / o / d hotkey hints are literal text (menus don't parse '&').
         self.assertEqual(labels['file.edit'], 'Edit in $EDITOR (e)')
         self.assertEqual(labels['file.open'], 'Open with default app (o)')
         self.assertEqual(labels['delete'], 'Delete (d)')
+        self.assertEqual(labels['dir.shell'], 'Run shell here')
         self.assertIn('Show full path', _labels(rows))   # always offered
 
     def test_md_file_gets_browse_md_and_mdcat_rows(self):
@@ -243,6 +250,87 @@ class TestPerKindMenus(unittest.TestCase):
         toks = _tokens(self.r.context_menu_options(self._ctx(item)))
         for t in ('file.md', 'file.mdcat', 'file.plan', 'file.diff'):
             self.assertNotIn(t, toks)
+
+    # -- file cursor folds in its PARENT directory's actions (#1069) -------
+
+    def _file_in(self, dir_path, name, body=''):
+        """Create ``name`` under ``dir_path`` (a real subdir) and return it."""
+        p = os.path.join(dir_path, name)
+        with open(p, 'w') as f:
+            f.write(body)
+        return p
+
+    def test_file_with_repo_parent_includes_dir_actions(self):
+        # Cursor on a FILE whose parent IS a git repo: the menu carries the
+        # file actions AND the shared directory actions on the parent — the
+        # git-mode rows + New file/dir (targeting the parent). The ONLY Delete
+        # is the file delete; the parent's Delete / Show-full-path are NOT here.
+        repo = self._subdir('repo')
+        os.mkdir(os.path.join(repo, '.git'))   # find_git_root only checks .git
+        p = self._file_in(repo, 'app.py', 'print(1)\n')
+        item = Item(id=p, title='app.py', has_children=False)
+        rows = self.r.context_menu_options(self._ctx(item))
+        toks = _tokens(rows)
+        # File actions present.
+        for t in ('file.edit', 'file.view', 'file.open', 'file.path'):
+            self.assertIn(t, toks)
+        # The parent is a repo → all five git-mode rows appear.
+        for t in ('dir.git.commits', 'dir.git.branches', 'dir.git.status',
+                  'dir.git.stash', 'dir.git.reflog'):
+            self.assertIn(t, toks)
+        # New file/dir on the parent.
+        self.assertIn('dir.newfile', toks)
+        self.assertIn('dir.newdir', toks)
+        # The ONLY Delete is the file delete: 'delete' appears once, and there
+        # is NO 'dir.path' (the dir's Show-full-path) — only the file's.
+        self.assertEqual(toks.count('delete'), 1)
+        self.assertNotIn('dir.path', toks)
+        self.assertIn('file.path', toks)
+
+    def test_file_with_non_repo_parent_has_no_git_rows(self):
+        # Cursor on a FILE whose parent is NOT a repo: no git-mode rows, but the
+        # New file/dir rows are still present (created in the parent).
+        plain = self._subdir('plain')
+        p = self._file_in(plain, 'data.txt', 'x\n')
+        item = Item(id=p, title='data.txt', has_children=False)
+        toks = _tokens(self.r.context_menu_options(self._ctx(item)))
+        for t in toks:
+            self.assertFalse(t.startswith('dir.git.'),
+                             f'unexpected git row {t!r} on a non-repo parent')
+        self.assertIn('dir.newfile', toks)
+        self.assertIn('dir.newdir', toks)
+
+    def test_run_shell_here_appears_exactly_once_on_file_cursor(self):
+        # Run-shell-here used to be a standalone file row AND a dir row; it now
+        # comes only from _dir_actions, so it appears EXACTLY once on a file
+        # cursor (token dir.shell; the retired file.shell is gone). Asserted for
+        # both a repo-parent and a non-repo-parent file.
+        for sub, mkrepo in (('repo', True), ('plain', False)):
+            d = self._subdir(sub)
+            if mkrepo:
+                os.mkdir(os.path.join(d, '.git'))
+            p = self._file_in(d, 'app.py', 'x\n')
+            item = Item(id=p, title='app.py', has_children=False)
+            rows = self.r.context_menu_options(self._ctx(item))
+            toks = _tokens(rows)
+            self.assertNotIn('file.shell', toks)
+            self.assertEqual(toks.count('dir.shell'), 1)
+            shell_labels = [l for l, t in rows if t == 'dir.shell']
+            self.assertEqual(shell_labels, ['Run shell here'])
+            self.b.stop_workers()
+
+    def test_file_cursor_delete_is_only_the_file(self):
+        # On a file cursor, Delete deletes the FILE — the parent dir's Delete is
+        # never offered. The single 'delete' row carries the file's (d) hint and
+        # routes the shared delete handler (which operates on the cursor row).
+        repo = self._subdir('repo')
+        os.mkdir(os.path.join(repo, '.git'))
+        p = self._file_in(repo, 'app.py', 'x\n')
+        item = Item(id=p, title='app.py', has_children=False)
+        rows = self.r.context_menu_options(self._ctx(item))
+        delete_rows = [(l, t) for l, t in rows if t == 'delete']
+        self.assertEqual(len(delete_rows), 1)
+        self.assertEqual(delete_rows[0][0], 'Delete (d)')
 
     # -- synthetic rows ---------------------------------------------------
 
@@ -631,25 +719,87 @@ class TestShellHandler(unittest.TestCase):
         self.assertIn('exec sh', ctx.cmd)
 
 
-class TestFileShellUsesParentDir(unittest.TestCase):
-    """The file menu's Run-shell-here opens $SHELL in the file's PARENT dir."""
+class TestDirActionsTargetCursorDir(unittest.TestCase):
+    """The shared dir.* handlers act on the cursor's directory.
+
+    ``_target_dir(path)`` collapses the two cursor kinds: a directory cursor
+    passes its own path (the dir verbatim), a file cursor passes the file's
+    PARENT. The same dir.* token therefore threads the right directory to its
+    handler either way — so Run-shell-here / New file/dir (offered on both a
+    directory cursor and a file cursor via ``_dir_actions``) operate on the
+    directory being listed. Paths live under a real temp dir so ``os.path.isdir``
+    can distinguish the two.
+    """
 
     def setUp(self):
         self.r = _load_recipe()
+        self.d = tempfile.mkdtemp()
+        self.addCleanup(
+            lambda: __import__('shutil').rmtree(self.d, ignore_errors=True))
 
-    def test_file_shell_dispatch_targets_parent(self):
-        calls = []
+    class _ShellCtx:
+        def __init__(self):
+            self.cmd = None
+
+        def run_external(self, cmd, env=None, *, keep_screen=False):
+            self.cmd = cmd
+
+    def test_target_dir_of_real_file_is_parent(self):
+        p = os.path.join(self.d, 'app.py')
+        with open(p, 'w') as f:
+            f.write('x\n')
+        self.assertEqual(self.r._target_dir(p), self.d)
+
+    def test_target_dir_of_real_dir_is_itself(self):
+        sub = os.path.join(self.d, 'sub')
+        os.mkdir(sub)
+        self.assertEqual(self.r._target_dir(sub), sub)
+
+    def test_dir_shell_on_file_cursor_targets_parent(self):
+        # dir.shell dispatched with a FILE path cds into the file's parent dir
+        # (the directory being listed), not the file itself.
+        p = os.path.join(self.d, 'app.py')
+        with open(p, 'w') as f:
+            f.write('x\n')
+        ctx = self._ShellCtx()
+        self.r._MENU_ACTIONS['dir.shell'](ctx, p)
+        self.assertIsInstance(ctx.cmd, str)
+        self.assertIn(self.d, ctx.cmd)
+        # The shell cds to the parent dir, not into a path ending in the file.
+        self.assertNotIn('app.py', ctx.cmd)
+
+    def test_dir_shell_on_dir_cursor_targets_that_dir(self):
+        # dir.shell dispatched with a DIRECTORY path cds into that dir verbatim.
+        sub = os.path.join(self.d, 'sub')
+        os.mkdir(sub)
+        ctx = self._ShellCtx()
+        self.r._MENU_ACTIONS['dir.shell'](ctx, sub)
+        self.assertIn(sub, ctx.cmd)
+
+    def test_dir_newfile_on_file_cursor_creates_in_parent(self):
+        # New file… on a FILE cursor creates IN the parent dir (the listed dir),
+        # via the dir.newfile handler routed through _target_dir.
+        existing = os.path.join(self.d, 'app.py')
+        with open(existing, 'w') as f:
+            f.write('x\n')
+
+        created = []
 
         class Ctx:
-            def run_external(self, cmd, env=None, *, keep_screen=False):
-                calls.append(cmd)
+            def input(self_inner, prompt):
+                return 'fresh.txt'
 
-        # The file.shell handler computes os.path.dirname(path).
-        self.r._MENU_ACTIONS['file.shell'](Ctx(), '/home/u/proj/app.py')
-        self.assertEqual(len(calls), 1)
-        self.assertIn('/home/u/proj', calls[0])
-        # ...and not the file itself.
-        self.assertNotIn('app.py', calls[0].replace('/home/u/proj', ''))
+            def error(self_inner, msg):
+                created.append(('error', msg))
+
+            def refresh(self_inner, *a, **kw):
+                created.append('refresh')
+
+        self.r._MENU_ACTIONS['dir.newfile'](Ctx(), existing)
+        # Created under the parent dir (the file's containing dir), not nested
+        # under the file's own path.
+        self.assertTrue(os.path.exists(os.path.join(self.d, 'fresh.txt')))
+        self.assertIn('refresh', created)
 
 
 if __name__ == '__main__':
