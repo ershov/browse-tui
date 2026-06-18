@@ -314,22 +314,55 @@ class TestPlaceAnchorBounds(unittest.TestCase):
         self.assertEqual(first, L)                # left margin column at L
         self.assertLessEqual(last, R)
 
-    def test_footprint_wider_than_bound_falls_back_to_screen(self):
-        # FALLBACK: a menu wider than its list pane can't fit the bound
-        # (R - w < L + 1), so the clamp ignores the bound and falls back to the
-        # full-screen #1043 clamp. Narrow pane [1, 20] but a 30-wide box on an
-        # 80-col screen: it lands exactly where the unbounded (full-screen)
-        # placement would, with both margins on-screen.
+    def test_wider_than_offcenter_bound_centers_on_bound_midpoint(self):
+        # #1103: a menu wider than its bound can't sit inside it, so instead of
+        # drifting to SCREEN center (the old fallback) it centers on the BOUND's
+        # midpoint — staying over the parent selection. Off-center bound
+        # [200, 230] (midpoint 215, right of screen center ~150) on a 300-col
+        # screen, box w=60: wider than the bound, so it centers on 215, NOT at
+        # the unbounded screen-centered ~121.
+        L, R = 200, 230
+        w, cols = 60, 300
+        self.assertLess(R - w, L + 1)             # precondition: wider than bound
+        r = _modal_place(cols, 24, w, 6, placement='anchor',
+                         anchor=(5, 210), bounds=(L, R))
+        box_mid = r.left + w / 2
+        self.assertAlmostEqual(box_mid, (L + R) / 2, delta=1)  # centered on bound
+        # And NOT the unbounded (screen-centered) placement.
+        unbounded = _modal_place(cols, 24, w, 6, placement='anchor',
+                                 anchor=(5, 210), bounds=None)
+        self.assertNotEqual(r.left, unbounded.left)
+        self.assertGreater(r.left, unbounded.left)     # pulled right toward bound
+        self.assertLessEqual(r.right, cols)            # still on-screen
+
+    def test_wider_than_bound_clamps_to_screen_when_midpoint_off_edge(self):
+        # When centering on the bound midpoint would push the box off a screen
+        # edge, the on-screen clamp still applies. Narrow bound [1, 20]
+        # (midpoint 10) with a 30-wide box on an 80-col screen: midpoint-center
+        # would be left = 10 - 15 = -5, clamped to the left margin (left = 2).
         L, R = 1, 20
         w, cols = 30, 80
         self.assertLess(R - w, L + 1)             # precondition: wider than bound
-        bounded = _modal_place(cols, 24, w, 6, placement='anchor',
-                               anchor=(5, 1), bounds=(L, R))
-        unbounded = _modal_place(cols, 24, w, 6, placement='anchor',
-                                 anchor=(5, 1), bounds=None)
-        self.assertEqual(bounded, unbounded)      # bound ignored — screen clamp
-        self.assertGreaterEqual(bounded.left - 1, 1)   # left margin on-screen
-        self.assertLessEqual(bounded.right, cols)      # right margin on-screen
+        r = _modal_place(cols, 24, w, 6, placement='anchor',
+                         anchor=(5, 1), bounds=(L, R))
+        self.assertEqual(r.left, 2)               # clamped: left margin on-screen
+        self.assertGreaterEqual(r.left - 1, 1)    # left margin on-screen
+        self.assertLessEqual(r.right, cols)       # right edge on-screen
+
+    def test_wider_than_bound_clamps_to_right_edge(self):
+        # Mirror: a narrow bound near the RIGHT edge whose midpoint-centered box
+        # would overflow the right edge clamps back so its right margin lands at
+        # the screen's last column. Bound [70, 80] (midpoint 75) with a 30-wide
+        # box on an 80-col screen: midpoint-center = 75 - 15 = 60, box spans
+        # [60, 90) — right margin at col 90 > 80 — so it clamps to left = 50
+        # (cols - w), right margin column = 80.
+        L, R = 70, 80
+        w, cols = 30, 80
+        self.assertLess(R - w, L + 1)             # precondition: wider than bound
+        r = _modal_place(cols, 24, w, 6, placement='anchor',
+                         anchor=(5, 75), bounds=(L, R))
+        self.assertEqual(r.left, cols - w)        # clamped: right margin at cols
+        self.assertEqual(r.right, cols)           # box right border at last col
 
     def test_full_screen_bound_matches_unbounded(self):
         # ``bounds=(1, cols)`` is exactly the full-screen default: the #1043
@@ -355,10 +388,13 @@ class TestPlaceAnchorBounds(unittest.TestCase):
 
     def test_center_placement_ignores_bounds(self):
         # A centered modal never leans/clamps to a list pane — passing a bound
-        # (defensive; ``ctx`` never does for centered dialogs) must not move it.
+        # (defensive; ``ctx`` never does for centered dialogs) the centered box
+        # FITS within must not move it. (The footprint is the box + 2 margin
+        # columns = 42 wide; a bound it fits inside, e.g. [100, 200], leaves the
+        # screen-centered target untouched via the fits-within-bound branch.)
         base = _modal_place(300, 24, 40, 10, placement='center', anchor=None)
         withb = _modal_place(300, 24, 40, 10, placement='center',
-                             anchor=None, bounds=(1, 40))
+                             anchor=None, bounds=(100, 200))
         self.assertEqual(withb, base)
 
 

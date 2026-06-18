@@ -150,34 +150,30 @@ class TestPerKindMenus(unittest.TestCase):
 
     def test_dir_menu_rows_non_repo(self):
         # A plain (non-git) directory: run shell, new file/dir, show path,
-        # delete — and NO git-mode rows.
+        # delete — and NO 'git' submenu row.
         d = self._subdir('plain')
         item = Item(id=d, title='plain/', has_children=True)
         rows = self.r.context_menu_options(self._ctx(item))
         self.assertEqual(_tokens(rows), [
             'dir.shell', 'dir.newfile', 'dir.newdir', 'dir.path', 'delete',
         ])
-        # No git-mode rows on a non-repo dir.
-        for tok in _tokens(rows):
-            self.assertFalse(tok.startswith('dir.git.'))
+        # No git submenu row on a non-repo dir.
+        self.assertNotIn('dir.git', _tokens(rows))
 
     def test_dir_menu_rows_git_repo(self):
-        # A directory carrying a .git marker gets all five browse-git mode
-        # rows, between Run-shell-here and New file/dir.
+        # A directory carrying a .git marker gets a single 'git' submenu row,
+        # between Run-shell-here and New file/dir (the five modes nest under it).
         d = self._subdir('repo')
         os.mkdir(os.path.join(d, '.git'))   # find_git_root only checks .git
         item = Item(id=d, title='repo/', has_children=True)
         rows = self.r.context_menu_options(self._ctx(item))
         self.assertEqual(_tokens(rows), [
-            'dir.shell',
-            'dir.git.commits', 'dir.git.branches', 'dir.git.status',
-            'dir.git.stash', 'dir.git.reflog',
+            'dir.shell', 'dir.git',
             'dir.newfile', 'dir.newdir', 'dir.path', 'delete',
         ])
-        # The git rows carry the spec's labels.
+        # The single git row carries the 'git ▸' submenu label.
         labels = dict((t, l) for l, t in rows)
-        self.assertEqual(labels['dir.git.commits'], 'git commits')
-        self.assertEqual(labels['dir.git.stash'], 'git stashes')
+        self.assertEqual(labels['dir.git'], 'git ▸')
 
     def test_dir_show_full_path_always_and_delete_hint(self):
         d = self._subdir('plain')
@@ -263,8 +259,9 @@ class TestPerKindMenus(unittest.TestCase):
     def test_file_with_repo_parent_includes_dir_actions(self):
         # Cursor on a FILE whose parent IS a git repo: the menu carries the
         # file actions AND the shared directory actions on the parent — the
-        # git-mode rows + New file/dir (targeting the parent). The ONLY Delete
-        # is the file delete; the parent's Delete / Show-full-path are NOT here.
+        # 'git' submenu row + New file/dir (targeting the parent). The ONLY
+        # Delete is the file delete; the parent's Delete / Show-full-path are
+        # NOT here.
         repo = self._subdir('repo')
         os.mkdir(os.path.join(repo, '.git'))   # find_git_root only checks .git
         p = self._file_in(repo, 'app.py', 'print(1)\n')
@@ -274,10 +271,8 @@ class TestPerKindMenus(unittest.TestCase):
         # File actions present.
         for t in ('file.edit', 'file.view', 'file.open', 'file.path'):
             self.assertIn(t, toks)
-        # The parent is a repo → all five git-mode rows appear.
-        for t in ('dir.git.commits', 'dir.git.branches', 'dir.git.status',
-                  'dir.git.stash', 'dir.git.reflog'):
-            self.assertIn(t, toks)
+        # The parent is a repo → the 'git' submenu row appears.
+        self.assertIn('dir.git', toks)
         # New file/dir on the parent.
         self.assertIn('dir.newfile', toks)
         self.assertIn('dir.newdir', toks)
@@ -288,15 +283,13 @@ class TestPerKindMenus(unittest.TestCase):
         self.assertIn('file.path', toks)
 
     def test_file_with_non_repo_parent_has_no_git_rows(self):
-        # Cursor on a FILE whose parent is NOT a repo: no git-mode rows, but the
-        # New file/dir rows are still present (created in the parent).
+        # Cursor on a FILE whose parent is NOT a repo: no 'git' submenu row, but
+        # the New file/dir rows are still present (created in the parent).
         plain = self._subdir('plain')
         p = self._file_in(plain, 'data.txt', 'x\n')
         item = Item(id=p, title='data.txt', has_children=False)
         toks = _tokens(self.r.context_menu_options(self._ctx(item)))
-        for t in toks:
-            self.assertFalse(t.startswith('dir.git.'),
-                             f'unexpected git row {t!r} on a non-repo parent')
+        self.assertNotIn('dir.git', toks)
         self.assertIn('dir.newfile', toks)
         self.assertIn('dir.newdir', toks)
 
@@ -543,7 +536,7 @@ class TestDispatchTable(unittest.TestCase):
                 f.write('x\n')
 
             emitted = set()
-            # Directory (git repo → emits the git-mode rows too).
+            # Directory (git repo → emits the 'git' submenu row too).
             emitted |= set(_tokens(self.r.context_menu_options(
                 self._Ctx(self._Cur(repo)))))
             # File that is BOTH .PLAN.md (→ file.plan) AND *.md (→ file.md /
@@ -604,6 +597,68 @@ class TestGitRepoGate(unittest.TestCase):
             os.mkdir(os.path.join(repo, '.git'))
             self.r._md_doc = None
             self.assertFalse(self.r._is_git_repo(repo))
+
+
+class TestGitSubmenu(unittest.TestCase):
+    """The single ``git`` row opens a mode submenu that routes to browse-git.
+
+    ``_open_git_menu`` re-invokes ``ctx.menu`` over the five modes (the
+    second-level menu); the chosen mode launches ``browse-git <dir> --mode
+    NAME``. In headless mode the real ``ctx.menu`` returns None, so — as
+    browse-git's Reset ▸ test does — we drive the handler with a recording ctx
+    that scripts the submenu choice and captures the ``run_external`` argv.
+    """
+
+    def setUp(self):
+        self.r = _load_recipe()
+
+    class _Ctx:
+        def __init__(self, choice):
+            self._choice = choice
+            self.menu_items = None
+            self.cmd = None
+            self.keep_screen = None
+
+        def menu(self, items, **kw):
+            self.menu_items = list(items)
+            return self._choice
+
+        def run_external(self, cmd, env=None, *, keep_screen=False):
+            self.cmd = cmd
+            self.keep_screen = keep_screen
+
+    def test_submenu_lists_the_five_modes(self):
+        # Cancel (None) so nothing launches; assert the rows the submenu shows.
+        ctx = self._Ctx(None)
+        self.r._open_git_menu(ctx, '/some/repo')
+        self.assertEqual([tok for _label, tok in ctx.menu_items],
+                         ['commits', 'branches', 'status', 'stash', 'reflog'])
+        # Level-2 labels drop the 'git ' prefix.
+        labels = [label for label, _tok in ctx.menu_items]
+        self.assertEqual(labels,
+                         ['commits', 'branches', 'status', 'stashes', 'reflog'])
+        # A cancel is a no-op — nothing launched.
+        self.assertIsNone(ctx.cmd)
+
+    def test_chosen_mode_launches_browse_git(self):
+        # Picking 'stashes' (token 'stash') runs browse-git <dir> --mode stash.
+        ctx = self._Ctx('stash')
+        self.r._open_git_menu(ctx, '/some/repo')
+        self.assertEqual(ctx.cmd,
+                         ['browse-git', '/some/repo', '--mode', 'stash'])
+        self.assertTrue(ctx.keep_screen)
+
+    def test_dir_git_dispatch_threads_target_dir_for_file_cursor(self):
+        # The dir.git handler routes through _target_dir, so on a FILE path the
+        # submenu launch targets the file's PARENT directory.
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, 'app.py')
+            with open(p, 'w') as f:
+                f.write('x\n')
+            ctx = self._Ctx('commits')
+            self.r._MENU_ACTIONS['dir.git'](ctx, p)
+            self.assertEqual(ctx.cmd,
+                             ['browse-git', d, '--mode', 'commits'])
 
 
 class TestDiffHandler(unittest.TestCase):

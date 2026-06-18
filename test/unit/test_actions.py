@@ -183,7 +183,7 @@ class TestDefaultActions(unittest.TestCase):
         for required in ('j', 'k', 'down', 'up', 'home', 'end',
                          'pgdn', 'pgup', 'left', 'right',
                          'ctrl-r', 'ctrl-l', 'ctrl-p',
-                         '?', '/', 'q', 'esc', 'ctrl-c'):
+                         '?', '/', 'q', 'ctrl-c'):
             self.assertIn(required, keys, f'missing default key: {required!r}')
 
     def test_returns_fresh_list(self):

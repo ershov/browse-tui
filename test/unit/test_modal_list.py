@@ -591,6 +591,61 @@ class TestWindowing(unittest.TestCase):
         self.assertEqual(c._scroll, 0)   # clamped back to the start
 
 
+# --- selected_row_offset: the #1101 modal-anchor advance accessor ----------
+
+
+class TestSelectedRowOffset(unittest.TestCase):
+    """``selected_row_offset()`` — the content row the engine anchors the next
+    modal to (#1101). It is the selected option's row WITHIN the content area:
+    the filter chrome plus the in-window position (``cursor - scroll``) — the
+    same row ``draw_row`` highlights. ``None`` when the filtered list is empty.
+    """
+
+    def test_menu_offset_is_cursor_no_chrome(self):
+        # filter=False: no chrome, so the offset is the cursor (everything
+        # fits → scroll 0).
+        c = ListContent(['a', 'b', 'c'], filter=False)
+        c.measure(40, 20)
+        self.assertEqual(c.selected_row_offset(), 0)
+        c.handle_key('down')
+        self.assertEqual(c.selected_row_offset(), 1)
+        c.handle_key('end')
+        self.assertEqual(c.selected_row_offset(), 2)
+
+    def test_filter_offset_includes_chrome(self):
+        # filter=True: the prompt + separator add 2 rows of chrome, so the
+        # offset is cursor + 2 (everything fits → scroll 0).
+        c = ListContent(['alpha', 'beta', 'gamma'], filter=True)
+        c.measure(40, 20)
+        self.assertEqual(c.selected_row_offset(), 2)       # row 0 selected
+        c.handle_key('down')
+        self.assertEqual(c.selected_row_offset(), 3)       # row 1 → 1 + 2
+
+    def test_offset_is_in_window_position_when_scrolled(self):
+        # When the list scrolls, the offset is the cursor's position WITHIN the
+        # visible window (cursor - scroll), not its absolute index — exactly
+        # the on-screen row the highlight lands on.
+        opts = [f'opt{i:02d}' for i in range(20)]
+        c = ListContent(opts, filter=False)
+        c.measure(40, 5)            # 5 option rows, no chrome
+        for _ in range(12):
+            c.handle_key('down')    # cursor 12, window scrolled down
+        self.assertEqual(c.cursor, 12)
+        self.assertGreater(c._scroll, 0)
+        self.assertEqual(c.selected_row_offset(), c.cursor - c._scroll)
+        # And it stays within the visible window.
+        self.assertTrue(0 <= c.selected_row_offset() < c._rows_visible)
+
+    def test_offset_none_when_filtered_empty(self):
+        # A query matching nothing → no selection → None (the slot is left
+        # unchanged by the engine).
+        c = ListContent(['open', 'closed'], filter=True)
+        c.measure(40, 20)
+        c.handle_key('z')           # no option contains 'z'
+        self.assertEqual(c._filtered(), [])
+        self.assertIsNone(c.selected_row_offset())
+
+
 # --- selection rendering: ANSI passthrough vs plain reverse video ----------
 
 

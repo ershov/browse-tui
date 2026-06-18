@@ -24,7 +24,7 @@ per the one-rule result contract.
 import unittest
 
 from test.async_._helpers import (
-    Browser, BrowserConfig, make_browser, _state, _term,
+    Browser, BrowserConfig, make_browser, _state, _term, _context,
 )
 
 
@@ -103,7 +103,7 @@ class TestEnqueueDialog(unittest.TestCase):
         rec = _Recorder()
         self.b._enqueue_dialog('content-a', rec, 'center', None)
         self.assertEqual(
-            self.b._pending_dialog, ('content-a', rec, 'center', None))
+            self.b._pending_dialog, ('content-a', rec, 'center', None, None))
         # Nothing fired yet — it hasn't been shown.
         self.assertEqual(rec.calls, [])
         # No active dialog → no force armed.
@@ -118,7 +118,7 @@ class TestEnqueueDialog(unittest.TestCase):
         self.assertEqual(first.calls, [None])
         # The slot now holds the survivor; its cb has NOT fired.
         self.assertEqual(
-            self.b._pending_dialog, ('second', second, 'center', None))
+            self.b._pending_dialog, ('second', second, 'center', None, None))
         self.assertEqual(second.calls, [])
 
     def test_override_active_arms_close_dialog_none(self):
@@ -130,14 +130,16 @@ class TestEnqueueDialog(unittest.TestCase):
         self.assertEqual(self.b._modal_force, (None,))
         # The new request is now pending; not fired.
         self.assertEqual(
-            self.b._pending_dialog, ('new', rec, 'center', None))
+            self.b._pending_dialog, ('new', rec, 'center', None, None))
         self.assertEqual(rec.calls, [])
 
-    def test_placement_and_anchor_preserved(self):
+    def test_placement_anchor_and_bounds_preserved(self):
+        # #1101: the 5-tuple carries ``bounds`` alongside placement/anchor.
         rec = _Recorder()
-        self.b._enqueue_dialog('m', rec, 'anchor', ('id-7', 3))
+        self.b._enqueue_dialog('m', rec, 'anchor', ('id-7', 3), (3, 30))
         self.assertEqual(
-            self.b._pending_dialog, ('m', rec, 'anchor', ('id-7', 3)))
+            self.b._pending_dialog,
+            ('m', rec, 'anchor', ('id-7', 3), (3, 30)))
 
 
 # --- open_dialog_async -----------------------------------------------------
@@ -181,14 +183,16 @@ class TestOpenDialogAsyncLive(unittest.TestCase):
     def test_posts_and_enqueues_on_drain(self):
         rec = _Recorder()
         self.b.open_dialog_async('content-x', on_result=rec,
-                                 placement='anchor', anchor=('a', 1))
+                                 placement='anchor', anchor=('a', 1),
+                                 bounds=(2, 40))
         # Not enqueued yet — it was posted, not run inline.
         self.assertIsNone(self.b._pending_dialog)
         self.assertFalse(self.b._main_queue.empty())
         # Draining runs the posted closure → _enqueue_dialog.
         self.b.drain_main_queue()
         self.assertEqual(
-            self.b._pending_dialog, ('content-x', rec, 'anchor', ('a', 1)))
+            self.b._pending_dialog,
+            ('content-x', rec, 'anchor', ('a', 1), (2, 40)))
         self.assertEqual(rec.calls, [])  # not shown yet
 
     def test_two_posts_collapse_in_one_drain_earlier_displaced(self):
@@ -212,8 +216,9 @@ class _StubModal:
     """A stand-in for ``run_modal`` wired into the state module for the
     servicing-loop tests.
 
-    Records each call's ``(content, placement, anchor, delay_interaction)``
-    and returns scripted results in order. Mimics the real engine's
+    Records each call's ``(content, placement, anchor, bounds,
+    delay_interaction)`` and returns scripted results in order. Mimics the real
+    engine's
     ``_modal_open`` discipline: sets the flag True for the duration of the
     call and clears it on return, so the servicing while-loop's
     ``not self._modal_open`` guard behaves as in production. A per-call
@@ -227,10 +232,10 @@ class _StubModal:
         self.calls = []
 
     def __call__(self, browser, content, *, placement='center', anchor=None,
-                 delay_interaction=False, **kw):
+                 bounds=None, delay_interaction=False, **kw):
         self.calls.append({
             'content': content, 'placement': placement, 'anchor': anchor,
-            'delay_interaction': delay_interaction,
+            'bounds': bounds, 'delay_interaction': delay_interaction,
         })
         browser._modal_open = True
         try:
@@ -299,7 +304,7 @@ class TestRunServicing(unittest.TestCase):
     def test_choice_fires_callback_once_with_value(self):
         b = self._browser()
         rec = _Recorder()
-        b._pending_dialog = ('content', rec, 'center', None)
+        b._pending_dialog = ('content', rec, 'center', None, None)
         stub = _StubModal(results=['chosen'])
         try:
             with _ServicingDriver(stub) as drv:
@@ -318,7 +323,7 @@ class TestRunServicing(unittest.TestCase):
     def test_cancel_fires_callback_once_with_none(self):
         b = self._browser()
         rec = _Recorder()
-        b._pending_dialog = ('content', rec, 'center', None)
+        b._pending_dialog = ('content', rec, 'center', None, None)
         stub = _StubModal(results=[None])  # esc/cancel → None
         try:
             with _ServicingDriver(stub) as drv:
@@ -327,10 +332,10 @@ class TestRunServicing(unittest.TestCase):
             b.stop_workers()
         self.assertEqual(rec.calls, [None])
 
-    def test_placement_and_anchor_forwarded(self):
+    def test_placement_anchor_and_bounds_forwarded(self):
         b = self._browser()
         rec = _Recorder()
-        b._pending_dialog = ('m', rec, 'anchor', ('id-3', 9))
+        b._pending_dialog = ('m', rec, 'anchor', ('id-3', 9), (3, 30))
         stub = _StubModal(results=['ok'])
         try:
             with _ServicingDriver(stub) as drv:
@@ -339,13 +344,66 @@ class TestRunServicing(unittest.TestCase):
             b.stop_workers()
         self.assertEqual(stub.calls[0]['placement'], 'anchor')
         self.assertEqual(stub.calls[0]['anchor'], ('id-3', 9))
+        self.assertEqual(stub.calls[0]['bounds'], (3, 30))
+
+    def test_slot_sentinel_resolved_on_main_thread(self):
+        # #1101: an async menu/pick posts ``anchor='slot'`` (it can't read the
+        # live layout from a worker). The servicing step resolves it HERE via
+        # ``_modal_anchor_placement`` — with the slot set to (y, L, R) it yields
+        # placement='anchor', anchor=(y, L), bounds=(L, R).
+        b = self._browser()
+        rec = _Recorder()
+        b._modal_anchor = (7, 3, 30)
+        b._pending_dialog = ('m', rec, 'center', 'slot', None)
+        stub = _StubModal(results=['ok'])
+        try:
+            with _ServicingDriver(stub) as drv:
+                drv.run(b)
+        finally:
+            b.stop_workers()
+        self.assertEqual(stub.calls[0]['placement'], 'anchor')
+        self.assertEqual(stub.calls[0]['anchor'], (7, 3))
+        self.assertEqual(stub.calls[0]['bounds'], (3, 30))
+        self.assertEqual(rec.calls, ['ok'])
+
+    def test_slot_sentinel_falls_back_to_centered(self):
+        # With nothing derivable (no slot, no resolvable list pane) the
+        # sentinel resolves to a centered placement. Stub the two layout
+        # bare-names the standalone seed path consults so it returns no list
+        # pane (the isolated async load doesn't wire 050-render).
+        b = self._browser()
+        rec = _Recorder()
+        b._modal_anchor = None
+        b._pending_dialog = ('m', rec, 'center', 'slot', None)
+        stub = _StubModal(results=['ok'])
+        # ``_modal_anchor_placement`` and the ``_list_pane_rect`` chain live in
+        # 060-context, so the bare-name layout deps resolve in that module.
+        orig_ts = getattr(_context, 'term_size', None)
+        orig_lp = getattr(_context, 'layout_panes', None)
+        _context.term_size = lambda: (80, 24)
+        _context.layout_panes = lambda *a, **k: {}   # no 'list' pane
+        try:
+            with _ServicingDriver(stub) as drv:
+                drv.run(b)
+        finally:
+            b.stop_workers()
+            if orig_ts is None:
+                _context.__dict__.pop('term_size', None)
+            else:
+                _context.term_size = orig_ts
+            if orig_lp is None:
+                _context.__dict__.pop('layout_panes', None)
+            else:
+                _context.layout_panes = orig_lp
+        self.assertEqual(stub.calls[0]['placement'], 'center')
+        self.assertIsNone(stub.calls[0]['anchor'])
 
     def test_quit_during_dialog_drops_callback(self):
         # The dialog resolves but a quit was requested while it was open: the
         # servicing step must NOT fire the callback (quit contract).
         b = self._browser()
         rec = _Recorder()
-        b._pending_dialog = ('content', rec, 'center', None)
+        b._pending_dialog = ('content', rec, 'center', None, None)
         stub = _StubModal(
             results=['would-be-result'],
             side_effects=[lambda br: setattr(br, '_quit_requested', True)])
@@ -372,7 +430,7 @@ class TestRunServicing(unittest.TestCase):
         b = self._browser()
         active = _Recorder()
         new = _Recorder()
-        b._pending_dialog = ('active-content', active, 'center', None)
+        b._pending_dialog = ('active-content', active, 'center', None, None)
 
         def enqueue_override(br):
             # Runs "inside" dialog #1; overrides it with dialog #2.

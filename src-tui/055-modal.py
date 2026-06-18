@@ -195,17 +195,29 @@ def _clamp_left_into(left, w, cols, bounds):
 
     ``bounds=None`` means the whole screen, ``(1, cols)`` — the unchanged
     #1040/#1043 behavior. If the footprint is wider than the bound
-    (``R - w < L + 1`` — a menu wider than its list pane), it can't fit, so we
-    FALL BACK to the screen: ``[2, cols - w]`` when the screen has margin room
-    (``w <= cols - 2``), else the plain on-screen clamp ``[1, cols - w + 1]`` (a
-    frame spanning the screen width has no room for margins; :func:`_paint`
-    omits the off-screen one).
+    (``R - w < L + 1`` — a menu wider than its list pane / parent-selection
+    span), it can't sit INSIDE the bound, so instead of keeping the incoming
+    screen-centered target (which would drift an over-wide submenu to screen
+    center, away from its parent) we RE-TARGET ``left`` to center the box on the
+    bound's MIDPOINT — ``left = (L + R) // 2 - w // 2`` — so it stays over the
+    parent selection's column, the "lean to center within the given extents"
+    intent (#1103). The screen clamp below then shifts it onto the screen.
+
+    The final on-screen clamp applies to that re-targeted ``left`` (the
+    wider-than-bound case) AND to ``bounds=None`` (a standalone centered modal,
+    whose ``left`` arrives already screen-centered): ``[2, cols - w]`` when the
+    screen has margin room (``w <= cols - 2``), else the plain on-screen clamp
+    ``[1, cols - w + 1]`` (a frame spanning the screen width has no room for
+    margins; :func:`_paint` omits the off-screen one).
     """
     if bounds is not None:
         L, R = bounds
         if R - w >= L + 1:                  # footprint fits within the bound
             return max(L + 1, min(left, R - w))
-        # else: wider than the bound — fall back to the screen clamp below.
+        # Wider than the bound: can't sit inside it — center on the bound's
+        # midpoint (stay over the parent selection) instead of the incoming
+        # screen-centered target, then clamp to the screen below.
+        left = (L + R) // 2 - w // 2
     if w <= cols - 2:
         return max(2, min(left, cols - w))
     return max(1, min(left, cols - w + 1))
@@ -266,6 +278,42 @@ def _rects_intersect(a, b):
     if right <= left or bottom <= top:
         return None
     return Rect(left, top, right, bottom)
+
+
+def _advance_modal_anchor(browser, content, frame):
+    """Point ``browser._modal_anchor`` at the just-selected row (#1101).
+
+    Called from :func:`run_modal` when a modal closes WITH a selection, so the
+    NEXT anchored modal of the chain drops off the item this one selected. The
+    new slot is the selected row's screen geometry within ``frame`` (the live
+    frame :class:`Rect` at the moment of the selecting close):
+
+      * ``y`` — the selected row's absolute screen row. Content row 0 sits at
+        ``frame.top + 1`` (just inside the top border), so a content-relative
+        offset ``off`` lands at ``frame.top + 1 + off``.
+      * ``(x_left, x_right)`` — the frame's CONTENT column span: the inner area
+        runs from ``frame.left + 2`` (left border + one pad column) to
+        ``frame.right - 3`` inclusive (``frame.right`` is exclusive; minus the
+        right pad + border).
+
+    The offset comes from the content protocol's optional
+    ``selected_row_offset()`` — a 0-based content row, or ``None`` for a
+    content with no row selection (a choice / input dialog), in which case the
+    slot is left UNCHANGED (only row-backed menus/picks advance the chain). A
+    missing accessor (older content) is treated the same. ``frame`` may be a
+    non-``Rect`` only if the first measure failed, in which case the loop never
+    reached a selecting close, so it is always a real ``Rect`` here.
+    """
+    offset_fn = getattr(content, 'selected_row_offset', None)
+    if offset_fn is None:
+        return
+    offset = offset_fn()
+    if offset is None:
+        return
+    y = frame.top + 1 + offset
+    x_left = frame.left + 2
+    x_right = frame.right - 3
+    browser._modal_anchor = (y, x_left, x_right)
 
 
 def run_modal(browser, content, *, placement='center', anchor=None,
@@ -392,23 +440,16 @@ def run_modal(browser, content, *, placement='center', anchor=None,
     def _measure_frame():
         """(Re)compute the frame ``Rect`` from the current terminal size.
 
-        For an anchored placement this is also where the per-chain menu
-        SIDE (#1041) is resolved, because it's the one spot that knows BOTH
-        the anchor row and the measured frame height. ``browser`` carries a
-        ``_context_menu_side`` slot that ``Browser._fire_context_menu`` resets
-        to ``None`` at the start of each context-menu chain and clears when it
-        ends:
-
-          * unset (``None``) → DECIDE the side from the anchor row + this
-            frame's height (below if it fits, else above) and STORE it back,
-            so the first ``ctx.menu`` of a chain fixes the side;
-          * already set → REUSE it (a submenu opened later in the same chain
-            opens on the same side, shifting to fit rather than flipping).
-
-        Read via ``getattr`` so a Browser without the slot — or any non-chain
-        anchored use (no ``on_context_menu`` fire around it) — behaves like
-        "no preferred side" and decides fresh, never persisting one. Centered
-        placements never touch the slot.
+        For an anchored placement the vertical SIDE (above/below the anchor
+        row) is decided FRESH here each call (#1101) — this is the one spot
+        that knows BOTH the anchor row and the measured frame height — by the
+        usual below-if-fits-else-above rule. It is NOT persisted: every level
+        of a menu chain anchors to the previous level's selected row (carried
+        by ``browser._modal_anchor``) and picks its own side from that row, so
+        a submenu near the bottom flips above on its own merits. Passing the
+        decided side explicitly (rather than letting ``_modal_place`` redecide)
+        keeps the resize repaint stable — the same row + frame height always
+        yields the same side. Centered placements use no side.
         """
         cols, rows = term_size()
         max_w, max_h = _modal_caps(cols, rows)
@@ -420,18 +461,10 @@ def run_modal(browser, content, *, placement='center', anchor=None,
         fw, fh = _frame_size(content_w, content_h)
         side = None
         if placement == 'anchor':
-            side = getattr(browser, '_context_menu_side', None)
-            if side is None:
-                # First menu of the chain (or a standalone anchored use):
-                # decide below-if-fits-else-above from this frame's height,
-                # mirroring the fresh-decision branch in ``_modal_place``.
-                row, _col = anchor
-                side = 'below' if row + 1 + fh - 1 <= rows else 'above'
-                # Persist only when the slot exists (a context-menu chain);
-                # a Browser without it stays sideless so a standalone use
-                # never leaks a side.
-                if hasattr(browser, '_context_menu_side'):
-                    browser._context_menu_side = side
+            # Decide below-if-fits-else-above from this frame's height,
+            # mirroring the fresh-decision branch in ``_modal_place``.
+            row, _col = anchor
+            side = 'below' if row + 1 + fh - 1 <= rows else 'above'
         return _modal_place(cols, rows, fw, fh, placement=placement,
                             anchor=anchor, side=side, bounds=bounds), content_h
 
@@ -658,6 +691,8 @@ def run_modal(browser, content, *, placement='center', anchor=None,
 
             done, result = content.handle_key(key)
             if done:
+                if result is not None:
+                    _advance_modal_anchor(browser, content, frame)
                 break
             # The key may have changed what the dialog shows (moved the
             # selection, edited the filter, typed into the field). Repaint
@@ -790,7 +825,7 @@ class ListContent:
 
       * ``filter=True`` (picker) — a ``> {query}`` prompt row and a separator
         sit above the options; typing narrows the visible list. Wired
-        centered behind ``ctx.pick``.
+        anchored behind ``ctx.pick`` (#1101).
       * ``filter=False`` (menu) — no prompt/separator; the options start at
         row 0. Wired anchored behind ``ctx.menu``.
 
@@ -855,6 +890,22 @@ class ListContent:
         self._w = min(max(widest, _LIST_MIN_WIDTH), max_w)
         self._h = min(len(self._options) + self._chrome, max_h)
         return self._w, self._h
+
+    def selected_row_offset(self):
+        """Content-relative row of the current selection (#1101), or ``None``.
+
+        The engine reads this on a selecting close to anchor the NEXT modal of
+        a chain to the chosen item (see :func:`_advance_modal_anchor`). It is
+        the selected option's row WITHIN the content area: the filter chrome
+        (the prompt + separator rows, 0 in menu mode) plus the selected
+        option's position in the current scroll window (``cursor - scroll``) —
+        i.e. exactly the row :meth:`draw_row` paints the highlight on. ``None``
+        when the filtered list is empty (no selection to anchor to), so the
+        slot is left unchanged.
+        """
+        if not self._filtered():
+            return None
+        return self._chrome + (self.cursor - self._scroll)
 
     # -- filtering / windowing ---------------------------------------------
 
@@ -1589,15 +1640,21 @@ class InputContent:
 F1_CANCEL_KEYS = frozenset({'f1'})
 
 
-def modal_pick(browser, label, options, *, delay_interaction=False,
-               _read_key=None):
-    """Centered, filtered selection list (``ctx.pick``).
+def modal_pick(browser, label, options, *, anchor=None, bounds=None,
+               delay_interaction=False, _read_key=None):
+    """Anchored, filtered selection list (``ctx.pick``).
 
     ``options`` becomes a filterable list with ``label`` as the title. Each
     item is a display ``str`` OR a ``(display, value)`` 2-tuple; the filter
     matches the display and the dialog returns the chosen option's VALUE (the
     tuple's value, or the string itself for a bare option). Returns ``None`` on
     cancel. An empty ``options`` returns ``None`` WITHOUT opening a dialog.
+
+    ``anchor`` / ``bounds`` are forwarded to :func:`_modal_place` exactly like
+    ``modal_menu`` (#1101): with an ``anchor`` the picker drops off that row
+    (the modal-anchor slot — cursor row standalone, previous selection in a
+    chain), keeping its footprint within ``bounds``; with ``anchor=None`` it
+    centers (the headless / no-cursor fallback).
 
     F1 and right-click dismiss the dialog (#1063); ``\\`` is NOT a cancel here —
     it is a literal filter character — so only ``F1_CANCEL_KEYS`` is passed.
@@ -1606,8 +1663,9 @@ def modal_pick(browser, label, options, *, delay_interaction=False,
     if not options:
         return None
     content = ListContent(options, filter=True, title=label)
-    return run_modal(browser, content, placement='center',
-                     delay_interaction=delay_interaction,
+    placement = 'anchor' if anchor is not None else 'center'
+    return run_modal(browser, content, placement=placement, anchor=anchor,
+                     bounds=bounds, delay_interaction=delay_interaction,
                      cancel_keys=F1_CANCEL_KEYS, cancel_on_right_click=True,
                      _read_key=_read_key)
 

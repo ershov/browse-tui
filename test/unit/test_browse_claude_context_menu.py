@@ -130,6 +130,24 @@ def _git(repo, *args, env):
                    capture_output=True, text=True, env=env)
 
 
+import contextlib
+
+
+@contextlib.contextmanager
+def _env(**overrides):
+    """Temporarily set os.environ vars (e.g. ``SHELL``) for the block."""
+    saved = {k: os.environ.get(k) for k in overrides}
+    os.environ.update(overrides)
+    try:
+        yield
+    finally:
+        for k, old in saved.items():
+            if old is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old
+
+
 # ----- per-kind builders against a real cursor (no real dirs) --------------
 
 
@@ -217,6 +235,28 @@ class TestPerKindMenus(unittest.TestCase):
         # Every row is a directory-cluster row (no message/session/agent rows).
         self.assertTrue(all(t.startswith('dir.') for t in toks))
 
+    def test_umbrella_menus_carry_source_actions_and_dir_cluster(self):
+        # A prompt / tool / span umbrella row now returns a non-empty menu:
+        # the source actions on the umbrella itself (edit / view / id, reusing
+        # the msg.* tokens), then the shared directory cluster.
+        for kind in ('prompt', 'tool', 'span'):
+            item = Item(id=(kind, '/no/such/sess.jsonl', 7),
+                        title=f'<{kind}>', has_children=True)
+            rows = self.r.context_menu_options(self._ctx(item))
+            toks = _tokens(rows)
+            self.assertEqual(toks[:3], ['msg.edit', 'msg.view', 'msg.id'],
+                             f'{kind} umbrella source rows')
+            by_tok = dict((t, l) for l, t in rows)
+            self.assertEqual(by_tok['msg.edit'], 'Edit source in $EDITOR (E)')
+            self.assertEqual(by_tok['msg.view'], 'View source in $PAGER (V)')
+            self.assertEqual(by_tok['msg.id'], 'Show full id (y)')
+            # The directory cluster is appended (degrades to its always-on rows
+            # here — the jsonl path doesn't resolve to a real session).
+            dir_toks = [t for t in toks if t.startswith('dir.')]
+            self.assertEqual(dir_toks[0], 'dir.fs')
+            self.assertEqual(dir_toks[-1], 'dir.path')
+            self.b.stop_workers()
+
     def test_dir_cluster_appended_to_every_kind(self):
         # The directory cluster (browse-fs first, show-path last) is appended
         # after the per-kind rows for message / session / agent / project rows.
@@ -225,6 +265,9 @@ class TestPerKindMenus(unittest.TestCase):
             Item(id=('session', '/no/such/s.jsonl'), title='s'),
             Item(id=('agent', '/no/such/s.jsonl', 'a'), title='a'),
             Item(id=('project', '/no/such/p'), title='p'),
+            Item(id=('prompt', '/no/such/s.jsonl', 0), title='<prompt>'),
+            Item(id=('tool', '/no/such/s.jsonl', 0), title='<tool>'),
+            Item(id=('span', '/no/such/s.jsonl', 0), title='<span>'),
         ):
             toks = _tokens(self.r.context_menu_options(self._ctx(item)))
             dir_toks = [t for t in toks if t.startswith('dir.')]
@@ -269,6 +312,9 @@ class TestPerKindMenus(unittest.TestCase):
             Item(id=('session', '/s.jsonl'), title='s'),
             Item(id=('agent', '/s.jsonl', 'a'), title='a'),
             Item(id=('project', '/p'), title='p'),
+            Item(id=('prompt', '/s.jsonl', 0), title='<prompt>'),
+            Item(id=('tool', '/s.jsonl', 0), title='<tool>'),
+            Item(id=('span', '/s.jsonl', 0), title='<span>'),
         ):
             for _l, tok in self.r.context_menu_options(self._ctx(item)):
                 emitted.add(tok)
@@ -344,11 +390,12 @@ class TestDirHelpers(unittest.TestCase):
         self.assertEqual(self.r._dir_action_rows([]), [])
 
     def test_dir_action_rows_always_on_for_plain_dir(self):
-        # A non-repo dir with no .PLAN.md offers only browse-fs + show-path.
+        # A non-repo dir with no .PLAN.md offers only browse-fs, run-shell and
+        # show-path (no git / plan rows).
         tmp = tempfile.mkdtemp()
         self.addCleanup(__import__('shutil').rmtree, tmp, ignore_errors=True)
         rows = self.r._dir_action_rows([(['project', 'cwd'], tmp)])
-        self.assertEqual(_tokens(rows), ['dir.fs', 'dir.path'])
+        self.assertEqual(_tokens(rows), ['dir.fs', 'dir.shell', 'dir.path'])
 
 
 # ----- directory hierarchy against a REAL claude-projects + git fixture ----
@@ -440,40 +487,41 @@ class TestDirHierarchyRealFixture(unittest.TestCase):
             Item(id=('session', sess), title='sess-1', has_children=True))
         ctx = Context(self.b)
         rows = self.r.context_menu_options(ctx)
-        # Per-kind session rows, then the full directory cluster (git modes +
-        # browse-plan present because the dir is a repo with .PLAN.md).
+        # Per-kind session rows, then the full directory cluster (run-shell
+        # always; the single git row + browse-plan present because the dir is a
+        # repo with .PLAN.md).
         self.assertEqual(_tokens(rows), [
             'session.view', 'session.path',
-            'dir.fs',
-            'dir.git.commits', 'dir.git.branches', 'dir.git.status',
-            'dir.git.stash', 'dir.git.reflog',
+            'dir.fs', 'dir.shell',
+            'dir.git',
             'dir.plan',
             'dir.path',
         ])
 
-    def test_git_mode_labels(self):
+    def test_git_row_label_and_submenu_modes(self):
         _projdir, sess = self._make_session(self.repo)
         self.b = _browser_with_item(
             Item(id=('session', sess), title='sess-1', has_children=True))
         rows = self.r.context_menu_options(Context(self.b))
         by_tok = dict((t, l) for l, t in rows)
-        self.assertEqual(by_tok['dir.git.commits'], 'git commits')
-        self.assertEqual(by_tok['dir.git.branches'], 'git branches')
-        self.assertEqual(by_tok['dir.git.status'], 'git status')
-        self.assertEqual(by_tok['dir.git.stash'], 'git stashes')
-        self.assertEqual(by_tok['dir.git.reflog'], 'git reflog')
+        # A single Level-1 'git ▸' row; the modes live in the Level-2 submenu.
+        self.assertEqual(by_tok['dir.git'], 'git ▸')
         self.assertEqual(by_tok['dir.plan'], 'Browse plan in browse-plan')
+        self.assertEqual(
+            self.r._DIR_GIT_MODES,
+            [('commits', 'commits'), ('branches', 'branches'),
+             ('status', 'status'), ('stashes', 'stash'), ('reflog', 'reflog')])
 
     def test_project_row_resolves_same_dir_cluster(self):
         projdir, _sess = self._make_session(self.repo)
         self.b = _browser_with_item(
             Item(id=('project', projdir), title='proj', has_children=True))
         rows = self.r.context_menu_options(Context(self.b))
-        # No per-kind project rows; the directory cluster carries git + plan.
+        # No per-kind project rows; the directory cluster carries run-shell, the
+        # single git row + plan.
         self.assertEqual(_tokens(rows), [
-            'dir.fs',
-            'dir.git.commits', 'dir.git.branches', 'dir.git.status',
-            'dir.git.stash', 'dir.git.reflog',
+            'dir.fs', 'dir.shell',
+            'dir.git',
             'dir.plan',
             'dir.path',
         ])
@@ -486,7 +534,7 @@ class TestDirHierarchyRealFixture(unittest.TestCase):
         # Message rows + the same full directory cluster.
         self.assertEqual(_tokens(rows)[:4],
                          ['msg.edit', 'msg.view', 'msg.mdcat', 'msg.id'])
-        self.assertIn('dir.git.commits', _tokens(rows))
+        self.assertIn('dir.git', _tokens(rows))
         self.assertIn('dir.plan', _tokens(rows))
 
     def test_plain_dir_session_has_no_git_or_plan_rows(self):
@@ -495,10 +543,11 @@ class TestDirHierarchyRealFixture(unittest.TestCase):
             Item(id=('session', sess), title='sess', has_children=True))
         rows = self.r.context_menu_options(Context(self.b))
         toks = _tokens(rows)
-        self.assertNotIn('dir.git.commits', toks)
+        self.assertNotIn('dir.git', toks)
         self.assertNotIn('dir.plan', toks)
         # Always-on directory rows still present.
         self.assertIn('dir.fs', toks)
+        self.assertIn('dir.shell', toks)
         self.assertIn('dir.path', toks)
 
     def test_is_git_repo_and_has_plan_gates(self):
@@ -522,7 +571,7 @@ class TestDirHierarchyRealFixture(unittest.TestCase):
         self.b = _browser_with_item(
             Item(id=('session', sess), title='sess', has_children=True))
         toks = _tokens(self.r.context_menu_options(Context(self.b)))
-        self.assertNotIn('dir.git.commits', toks)
+        self.assertNotIn('dir.git', toks)
         self.assertIn('dir.fs', toks)
 
 
@@ -641,8 +690,9 @@ class TestMultiCwdSession(unittest.TestCase):
         self.assertIn(os.path.realpath(self.main), reals)
 
     def test_two_cwd_session_opens_chooser_for_git_action(self):
-        # End-to-end: a git action over a two-(repo-)cwd session opens the
-        # Level-2 chooser listing BOTH dirs (both are git repos here).
+        # End-to-end: the git launch over a two-(repo-)cwd session opens the
+        # dir chooser listing BOTH dirs (both are git repos here). Drives
+        # ``_run_git_mode`` — the shared launch the ``dir.git`` submenu feeds.
         _projdir, sess = self._make_two_cwd_session()
         dirs = self.r._dedup_dirs(
             self.r._cursor_context_dirs(('session', sess)))
@@ -660,7 +710,7 @@ class TestMultiCwdSession(unittest.TestCase):
                 self.external = cmd
 
         ctx = RecCtx()
-        self.r._run_dir_action(ctx, 'dir.git.status', dirs)
+        self.r._run_git_mode(ctx, dirs, 'status')
         self.assertIsNotNone(ctx.menu_items,
                              'two repo dirs → chooser must open')
         chooser_paths = {v for _lbl, v in ctx.menu_items}
@@ -731,6 +781,8 @@ class TestRunDirAction(unittest.TestCase):
 
     def test_git_mode_filters_to_repo_dirs(self):
         # Two dirs, only one a repo → no chooser, runs on the repo dir.
+        # ``_run_git_mode`` is the shared git launch the ``dir.git`` submenu
+        # threads the chosen mode into (here ``commits``).
         repo = tempfile.mkdtemp()
         self.addCleanup(__import__('shutil').rmtree, repo, ignore_errors=True)
         env = {**os.environ, 'GIT_AUTHOR_NAME': 'T', 'GIT_AUTHOR_EMAIL': 't@t',
@@ -739,14 +791,14 @@ class TestRunDirAction(unittest.TestCase):
         plain = tempfile.mkdtemp()
         self.addCleanup(__import__('shutil').rmtree, plain, ignore_errors=True)
         ctx = self._RecCtx()
-        self.r._run_dir_action(ctx, 'dir.git.commits',
-                               [(['project'], plain), (['worktree'], repo)])
+        self.r._run_git_mode(ctx, [(['project'], plain), (['worktree'], repo)],
+                             'commits')
         self.assertIsNone(ctx.menu_items)  # only one repo qualifies → no chooser
         cmd, _kw = ctx.external
         self.assertEqual(cmd, ['browse-git', repo, '--mode', 'commits'])
 
     def test_git_mode_opens_chooser_for_two_repos(self):
-        # Two repo dirs → the Level-2 chooser lists BOTH (filtered + labelled).
+        # Two repo dirs → the dir chooser lists BOTH (filtered + labelled).
         r1 = tempfile.mkdtemp()
         r2 = tempfile.mkdtemp()
         self.addCleanup(__import__('shutil').rmtree, r1, ignore_errors=True)
@@ -756,16 +808,46 @@ class TestRunDirAction(unittest.TestCase):
         _git(r1, 'init', '-q', '-b', 'main', env=env)
         _git(r2, 'init', '-q', '-b', 'main', env=env)
         ctx = self._RecCtx(menu_choice=r2)
-        self.r._run_dir_action(ctx, 'dir.git.status',
-                               [(['project'], r1), (['worktree'], r2)])
+        self.r._run_git_mode(ctx, [(['project'], r1), (['worktree'], r2)],
+                             'status')
         # Chooser opened, listing both repos role-labelled.
         self.assertEqual([lbl for lbl, _v in ctx.menu_items],
                          [f'project: {r1}', f'worktree: {r2}'])
         cmd, _kw = ctx.external
         self.assertEqual(cmd, ['browse-git', r2, '--mode', 'status'])
 
+    def test_git_submenu_routes_mode_to_launch(self):
+        # ``dir.git`` opens the Level-2 mode submenu, then launches browse-git
+        # with the chosen mode on the (single) repo dir — no dir chooser.
+        repo = tempfile.mkdtemp()
+        self.addCleanup(__import__('shutil').rmtree, repo, ignore_errors=True)
+        env = {**os.environ, 'GIT_AUTHOR_NAME': 'T', 'GIT_AUTHOR_EMAIL': 't@t',
+               'GIT_COMMITTER_NAME': 'T', 'GIT_COMMITTER_EMAIL': 't@t'}
+        _git(repo, 'init', '-q', '-b', 'main', env=env)
+        ctx = self._RecCtx(menu_choice='stash')  # picks the 'stashes' mode
+        self.r._run_dir_action(ctx, 'dir.git', [(['project', 'cwd'], repo)])
+        # The submenu offered the five modes (label, mode).
+        self.assertEqual(ctx.menu_items,
+                         [('commits', 'commits'), ('branches', 'branches'),
+                          ('status', 'status'), ('stashes', 'stash'),
+                          ('reflog', 'reflog')])
+        cmd, _kw = ctx.external
+        self.assertEqual(cmd, ['browse-git', repo, '--mode', 'stash'])
+
+    def test_git_submenu_cancel_is_a_noop(self):
+        # Cancelling the mode submenu (menu → None) launches nothing.
+        repo = tempfile.mkdtemp()
+        self.addCleanup(__import__('shutil').rmtree, repo, ignore_errors=True)
+        env = {**os.environ, 'GIT_AUTHOR_NAME': 'T', 'GIT_AUTHOR_EMAIL': 't@t',
+               'GIT_COMMITTER_NAME': 'T', 'GIT_COMMITTER_EMAIL': 't@t'}
+        _git(repo, 'init', '-q', '-b', 'main', env=env)
+        ctx = self._RecCtx(menu_choice=None)
+        self.r._run_dir_action(ctx, 'dir.git', [(['project', 'cwd'], repo)])
+        self.assertIsNotNone(ctx.menu_items)  # submenu was shown
+        self.assertIsNone(ctx.external)       # but nothing launched
+
     def test_chooser_cancel_is_a_noop(self):
-        # Cancelling the Level-2 chooser (menu → None) launches nothing.
+        # Cancelling the dir chooser (menu → None) launches nothing.
         r1 = tempfile.mkdtemp()
         r2 = tempfile.mkdtemp()
         self.addCleanup(__import__('shutil').rmtree, r1, ignore_errors=True)
@@ -775,8 +857,8 @@ class TestRunDirAction(unittest.TestCase):
         _git(r1, 'init', '-q', '-b', 'main', env=env)
         _git(r2, 'init', '-q', '-b', 'main', env=env)
         ctx = self._RecCtx(menu_choice=None)
-        self.r._run_dir_action(ctx, 'dir.git.commits',
-                               [(['project'], r1), (['worktree'], r2)])
+        self.r._run_git_mode(ctx, [(['project'], r1), (['worktree'], r2)],
+                             'commits')
         self.assertIsNotNone(ctx.menu_items)  # chooser was shown
         self.assertIsNone(ctx.external)       # but nothing launched
 
@@ -793,13 +875,35 @@ class TestRunDirAction(unittest.TestCase):
         self.assertTrue(kw.get('keep_screen'))
 
     def test_no_applicable_dir_is_a_noop(self):
-        # A git token with no repo dir filters to nothing → no chooser, no run.
+        # A git launch with no repo dir filters to nothing → no chooser, no run.
         plain = tempfile.mkdtemp()
         self.addCleanup(__import__('shutil').rmtree, plain, ignore_errors=True)
         ctx = self._RecCtx()
-        self.r._run_dir_action(ctx, 'dir.git.commits', [(['cwd'], plain)])
+        self.r._run_git_mode(ctx, [(['cwd'], plain)], 'commits')
         self.assertIsNone(ctx.menu_items)
         self.assertIsNone(ctx.external)
+
+    def test_run_shell_single_dir_skips_chooser(self):
+        # 'Run shell here' applies to every dir; a single dir skips the chooser
+        # and execs the user's $SHELL after cd-ing into it.
+        ctx = self._RecCtx()
+        with _env(SHELL='/bin/zsh'):
+            self.r._run_dir_action(ctx, 'dir.shell',
+                                   [(['project', 'cwd'], '/p')])
+        self.assertIsNone(ctx.menu_items)
+        cmd, _kw = ctx.external
+        self.assertEqual(cmd, "cd /p && exec /bin/zsh -l -i")
+
+    def test_run_shell_opens_chooser_for_two_dirs(self):
+        # >1 distinct dir → the dir chooser opens (run-shell applies to all).
+        ctx = self._RecCtx(menu_choice='/w')
+        with _env(SHELL='/bin/bash'):
+            self.r._run_dir_action(ctx, 'dir.shell',
+                                   [(['project'], '/p'), (['worktree'], '/w')])
+        self.assertEqual([lbl for lbl, _v in ctx.menu_items],
+                         ['project: /p', 'worktree: /w'])
+        cmd, _kw = ctx.external
+        self.assertEqual(cmd, "cd /w && exec /bin/bash -l -i")
 
 
 # ----- dispatch table reuses the existing action handlers ------------------

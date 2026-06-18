@@ -490,7 +490,7 @@ _visible_len = _terminal._visible_len
 #
 # These cover the bug fix for "Alt+key tears down the app": the CSI
 # parser used to fall back to ``return 'esc'`` for any unrecognised
-# sequence, and ``'esc'`` is bound to _quit. Now it returns
+# sequence, and ``'esc'`` used to be bound to _quit. Now it returns
 # ``'_unknown'`` (a sentinel the action dispatcher silently ignores)
 # and recognises bare + modified Home/End that some terminals emit.
 
@@ -577,7 +577,7 @@ class TestReadCsi(unittest.TestCase):
         self.assertEqual(_csi('1;4A'), 'up')
 
     def test_unknown_csi_returns_unknown_sentinel(self):
-        # A garbage CSI must NOT return 'esc' (which would quit the app).
+        # A garbage CSI must NOT return a spurious 'esc'.
         self.assertEqual(_csi('99~'), '_unknown')
         self.assertEqual(_csi('99;2~'), '_unknown')
         # Unknown final byte (no handler for ESC [ X or ESC [ 1;2x).

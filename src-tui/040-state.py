@@ -3750,23 +3750,24 @@ class Browser:
         self._on_quit = config.on_quit
         # ``on_context_menu`` fires synchronously from dispatch (not at
         # drain time) and itself opens a modal via ``ctx.menu`` — see
-        # ``_fire_context_menu``. ``_context_menu_anchor`` carries the
-        # click cell of a right-click trigger to ``ctx.menu``'s default-
-        # anchor path for the duration of one fire (``None`` otherwise, so
-        # keyboard triggers anchor to the list cursor as usual).
+        # ``_fire_context_menu``.
         self._on_context_menu = config.on_context_menu
-        self._context_menu_anchor = None
-        # Per-chain side slot (#1041). A context menu can chain — the chosen
-        # entry re-invokes ``ctx.menu`` to open a submenu — and those modals
-        # run SEQUENTIALLY within one ``on_context_menu`` fire (one open at a
-        # time). The FIRST menu in the chain decides above/below the anchor
-        # row from its own height; ``_measure_frame`` stores that side here so
-        # EVERY subsequent menu in the same chain opens on the SAME side (an
-        # oversized submenu shifts to fit instead of flipping to the other
-        # side, so the chain reads as descending levels). ``None`` outside a
-        # fire and at the start of each fire (a fresh chain decides anew);
-        # set/cleared around the hook call in ``_fire_context_menu``.
-        self._context_menu_side = None
+        # Unified modal anchor slot (#1101). One cross-call target the next
+        # anchored modal (``ctx.menu`` / ``ctx.pick``) places against, so a
+        # multi-level menu/dialog chain anchors each level to the SELECTED item
+        # of the previous level. Shape ``(y, x_left, x_right)`` — the target's
+        # 1-based screen ROW ``y`` and inclusive horizontal EXTENTS — or
+        # ``None`` (no target → the modal centers, the headless / no-cursor
+        # fallback). SEEDED from the cursor row + list pane span when a chain
+        # opens (``_fire_context_menu``) or on a standalone anchored open;
+        # OVERWRITTEN with the just-selected row's geometry each time a modal
+        # closes with a selection (``run_modal``), so the NEXT modal drops off
+        # that item; CLEARED when the top-level fire returns. The vertical side
+        # (above/below) is decided FRESH per modal from ``y`` + the frame's
+        # height — it is NOT persisted (so a submenu that would overflow below
+        # flips above on its own merits, like any first menu). This single slot
+        # supersedes the old separate click-cell and per-chain-side slots.
+        self._modal_anchor = None
         self._on_stdin = config.on_stdin
         # No-landable-row policy (§3.4). Read once here; consulted by
         # ``_clamp_cursor_landable`` whenever the visible list ends up
@@ -4097,11 +4098,15 @@ class Browser:
         self._modal_open = False
         self._modal_force = None
         # ``_pending_dialog`` is the single "next dialog to show" slot
-        # (ticket #1042): ``(content, on_result, placement, anchor)`` or
+        # (ticket #1042): ``(content, on_result, placement, anchor, bounds)`` or
         # ``None``. MAIN-THREAD-ONLY -- only ``_enqueue_dialog`` (run during a
         # drain) and the main-loop servicing step touch it. At most one dialog
         # is ever pending; a second request replaces it (last wins), firing
         # the displaced request's callback with ``None`` (never shown).
+        # ``anchor`` may be the sentinel ``'slot'`` (#1101): an async
+        # menu/pick that wants modal-anchor placement but can't read the live
+        # layout from its worker thread — the main-thread servicing step
+        # resolves it via ``_modal_anchor_placement`` just before opening.
         self._pending_dialog = None
 
         # --- output channel (ctx.print / quit output; spec §3.2) --------
@@ -5701,7 +5706,7 @@ class Browser:
         notify_wake()
 
     def open_dialog_async(self, content, *, on_result=None,
-                          placement='center', anchor=None) -> None:
+                          placement='center', anchor=None, bounds=None) -> None:
         """(thread-safe) Open a modal dialog from any thread.
 
         Queues ``content`` to open on the main thread (via :meth:`post` ->
@@ -5711,6 +5716,13 @@ class Browser:
         chosen result, or ``None`` for any no-answer path (cancel, programmatic
         ``close_dialog``, being overridden by a later dialog, being displaced
         while still pending, or headless).
+
+        ``placement`` / ``anchor`` / ``bounds`` are forwarded to ``run_modal``
+        when the dialog is finally shown. ``anchor='slot'`` — the sentinel
+        string ``'slot'`` — defers modal-anchor placement (#1101) to the main
+        thread: an async menu/pick can't read the live layout from its worker,
+        so the servicing step resolves ``anchor`` / ``bounds`` from the slot
+        there.
 
         Headless Browsers have no render loop to open a dialog, so the
         callback fires with ``None`` immediately (inline, wrapped) -- matching
@@ -5723,7 +5735,7 @@ class Browser:
             self._fire_dialog_cb(on_result, None)
             return
         self.post(lambda: self._enqueue_dialog(
-            content, on_result, placement, anchor))
+            content, on_result, placement, anchor, bounds))
 
     # =========================================================================
     # End of public, thread-safe API
@@ -5750,7 +5762,8 @@ class Browser:
         except Exception as e:
             self.error(f'dialog callback: {type(e).__name__}: {e}')
 
-    def _enqueue_dialog(self, content, on_result, placement, anchor) -> None:
+    def _enqueue_dialog(self, content, on_result, placement, anchor,
+                        bounds=None) -> None:
         """Main-thread: arm ``_pending_dialog`` for the next servicing step.
 
         Runs during a :meth:`drain_main_queue` (posted by
@@ -5767,7 +5780,7 @@ class Browser:
             # Displaced while still pending -> its callback fires None now
             # (never shown). Clearing the slot below means it cannot re-fire.
             self._fire_dialog_cb(self._pending_dialog[1], None)
-        self._pending_dialog = (content, on_result, placement, anchor)
+        self._pending_dialog = (content, on_result, placement, anchor, bounds)
         if self._modal_open:
             self.close_dialog(None)
 
@@ -5918,33 +5931,61 @@ class Browser:
         Called synchronously from the dispatch path (not at drain time):
         the handler reads ``ctx.cursor`` / ``ctx.targets`` and typically
         opens a modal via ``ctx.menu`` — a nested key loop, which is fine
-        here. The hook takes EXACTLY one argument, a Context; the optional
-        ``anchor`` (a 1-based ``(row, col)`` click cell, only supplied by
-        the right-click trigger) is threaded to ``ctx.menu``'s default-
-        anchor path via ``_context_menu_anchor`` for the duration of the
-        fire so a no-arg ``ctx.menu()`` drops under the click cell. A
-        keyboard trigger passes ``anchor=None``, leaving the default anchor
-        on the list cursor. Exceptions are caught and routed to
-        :meth:`error` like the other on_* hooks.
+        here. The hook takes EXACTLY one argument, a Context. Exceptions are
+        caught and routed to :meth:`error` like the other on_* hooks.
 
-        This call is also the chain boundary for the per-chain menu SIDE
-        (#1041): ``_context_menu_side`` is reset to ``None`` here so a fresh
-        chain decides above/below anew, and cleared in ``finally`` alongside
-        ``_context_menu_anchor``. The first ``ctx.menu`` of the chain records
-        its side via ``_measure_frame``; any submenu opened from the same
-        fire reuses it.
+        This call also opens (and closes) a modal-anchor CHAIN (#1101). The
+        unified ``_modal_anchor`` slot is SEEDED here so the first menu the
+        hook opens drops off the trigger row, and each subsequent level then
+        anchors to the previous level's selected item (``run_modal`` advances
+        the slot on a selecting close):
+
+          * a keyboard trigger (``anchor=None``) seeds the CURSOR row;
+          * a right-click trigger supplies its 1-based ``(row, col)`` click
+            cell, whose ROW seeds the anchor instead so the menu drops under
+            the pointer.
+
+        Either way the horizontal EXTENTS are the LIST pane's column span (the
+        menu belongs over the list), so the seed is ``(y, x_left, x_right)``.
+        The slot is cleared in ``finally`` so the next fire re-seeds — mirroring
+        the chain boundary the old per-chain side slot drew. A seed that can't
+        be derived (no on-screen cursor / no list pane — headless or scrolled
+        off) leaves the slot ``None`` and the menu centers.
         """
         if self._on_context_menu is None:
             return
-        self._context_menu_anchor = anchor
-        self._context_menu_side = None
+        self._modal_anchor = self._seed_modal_anchor(anchor)
         try:
             self._on_context_menu(self._make_ctx_for_hook())
         except Exception as e:
             self.error(f'on_context_menu: {type(e).__name__}: {e}')
         finally:
-            self._context_menu_anchor = None
-            self._context_menu_side = None
+            self._modal_anchor = None
+
+    def _seed_modal_anchor(self, click=None):
+        """Seed geometry ``(y, x_left, x_right)`` for a context-menu chain.
+
+        ``y`` is the trigger ROW — the right-click ``click`` cell's row when
+        given (a 1-based ``(row, col)``), else the list cursor's screen row.
+        ``(x_left, x_right)`` is the LIST pane's inclusive column span, so an
+        anchored menu leans toward screen center yet stays over its row (the
+        #1051 footprint clamp). Returns ``None`` when the geometry can't be
+        derived (no list pane, or the cursor scrolled out of view) — the
+        caller then centers, the headless-safe fallback. Both the cursor cell
+        and the pane span are re-derived from the live layout via the
+        ``_list_cursor_cell`` / ``_list_pane_bounds`` helpers (060-context).
+        """
+        bounds = _list_pane_bounds(self)
+        if bounds is None:
+            return None
+        if click is not None:
+            y = click[0]
+        else:
+            cell = _list_cursor_cell(self)
+            if cell is None:
+                return None
+            y = cell[0]
+        return (y, bounds[0], bounds[1])
 
     def _fire_expand_collapse_if_pending(self) -> None:
         """Fire ``on_collapse`` / ``on_expand`` from a drain-time set diff.
@@ -7774,10 +7815,22 @@ class Browser:
                 # down) the callback is DROPPED, per the quit contract.
                 while self._pending_dialog is not None and not self._modal_open \
                         and not self._quit_requested:
-                    content, on_result, placement, anchor = self._pending_dialog
+                    content, on_result, placement, anchor, bounds = \
+                        self._pending_dialog
                     self._pending_dialog = None
+                    if anchor == 'slot':
+                        # Async menu/pick that asked for modal-anchor placement
+                        # (#1101): resolve it HERE on the main thread, where the
+                        # live layout is readable. ``_modal_anchor_placement``
+                        # returns ``(None, None)`` (→ centered) when nothing is
+                        # derivable.
+                        place_anchor, bounds = _modal_anchor_placement(self)
+                        placement = 'anchor' if place_anchor is not None \
+                            else 'center'
+                        anchor = place_anchor
                     result = run_modal(self, content, placement=placement,
-                                       anchor=anchor, delay_interaction=True)
+                                       anchor=anchor, bounds=bounds,
+                                       delay_interaction=True)
                     if not self._quit_requested:
                         self._fire_dialog_cb(on_result, result)
 

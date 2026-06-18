@@ -681,7 +681,7 @@ hook surface and module-discovery rules.
 | Enter          | In search mode → next match; in filter mode → commit (or clear-all on empty); otherwise → `--on-enter` |
 | Shift-Enter    | In search mode → previous match                             |
 | Ctrl-X         | In filter mode → clear all filters and exit                 |
-| Esc            | Exit search/filter mode (cancel current edit), else quit    |
+| Esc            | Exit search/filter mode (cancel current edit)               |
 | `\` / F1       | Open the recipe's context menu (also right-click); no-op if none |
 | `?`            | Toggle help screen                                          |
 | `q`            | Quit (exit code 1)                                          |

@@ -4,8 +4,9 @@ or dirs-first directory listing; actions e:Edit ($EDITOR), o:Open (xdg-open), d:
 (with ctx.confirm); background mtime watcher refreshes changed dirs.
 
 A right-click (or the backslash / F1 keys) opens a context menu keyed to the
-cursor row's kind — a directory (run shell here, open in browse-git by mode
-when it is a repo, new file / directory, show full path, delete), a file (edit /
+cursor row's kind — a directory (run shell here, a ``git`` submenu opening
+browse-git by mode when it is a repo, new file / directory, show full path,
+delete), a file (edit /
 view in $PAGER / open / run shell in its dir / browse-md or browse-plan / render
 with mdcat / diff against a single other selected item / show full path /
 delete), a multi-selection (delete N, open N in $EDITOR), or a missing-path
@@ -381,23 +382,23 @@ def delete(ctx):
 # handler's confirm; non-visible values (paths) pop up via ``ctx.alert`` — there
 # is NO clipboard. A file row also surfaces *.md / .PLAN.md launches plus the
 # shared directory actions (``_dir_actions``), which there act on the file's
-# PARENT — the directory being listed; the git-mode rows appear only for a repo
-# directory (the cursor dir, or a file's repo parent). The menu is
+# PARENT — the directory being listed; the ``git`` submenu appears only for a
+# repo directory (the cursor dir, or a file's repo parent). The menu is
 # read-only-friendly:
 # a missing external tool surfaces via ``run_external``'s own error rather than
 # crashing (browse-tui swallows ``on_context_menu`` exceptions besides).
 
 
 # Git view modes browse-git accepts via ``--mode NAME`` (its verified
-# ``<dir> --mode`` interface), as ``(label, token, mode)``. Shown only when the
-# directory is a git repo; the chosen row launches ``browse-git <dir> --mode
-# NAME`` on that directory.
+# ``<dir> --mode`` interface), as ``(submenu_label, mode)``. Shown only when the
+# directory is a git repo, nested under a single ``git`` submenu row: the chosen
+# entry launches ``browse-git <dir> --mode NAME`` on that directory.
 _DIR_GIT_MODES = [
-    ('git commits',  'dir.git.commits',  'commits'),
-    ('git branches', 'dir.git.branches', 'branches'),
-    ('git status',   'dir.git.status',   'status'),
-    ('git stashes',  'dir.git.stash',    'stash'),
-    ('git reflog',   'dir.git.reflog',   'reflog'),
+    ('commits',  'commits'),
+    ('branches', 'branches'),
+    ('status',   'status'),
+    ('stashes',  'stash'),
+    ('reflog',   'reflog'),
 ]
 
 _PLAN_BASENAME = '.PLAN.md'
@@ -407,9 +408,9 @@ def _is_git_repo(path):
     """True iff ``path`` is inside a git work tree (``find_git_root`` hits).
 
     Reuses md_doc's ``.git``-walk (a worktree's ``.git`` file counts), so the
-    git-mode rows light up for both a plain repo and a worktree — matching
+    ``git`` submenu lights up for both a plain repo and a worktree — matching
     browse-claude's same-named gate. ``False`` when md_doc is unavailable (the
-    git rows then never appear) or ``path`` is falsy.
+    ``git`` row then never appears) or ``path`` is falsy.
     """
     return bool(path) and _md_doc is not None and _md_doc.find_git_root(path) is not None
 
@@ -468,20 +469,27 @@ def _target_dir(path):
 
 
 def _run_shell(ctx, cwd):
-    """Open the user's ``$SHELL`` with ``cwd`` as the working directory.
+    """Open an interactive ``$SHELL`` with ``cwd`` as the working directory.
 
     For a directory row ``cwd`` is the directory itself; for a file row it is
     the file's parent directory. ``ctx.run_external`` has no ``cwd`` knob, so
     the directory change rides in a shell-string command (which it runs via
-    ``sh -c``): ``cd <dir> && exec <$SHELL>``. ``exec`` replaces the wrapping
-    ``sh`` with the user's shell so signals / the exit code pass through
-    naturally; ``$SHELL`` defaults to ``sh`` and may itself carry args
-    (``bash --login``), which the shell-string honours verbatim. The shell
-    inherits the terminal (a normal interactive child), so no ``keep_screen``.
+    ``sh -c``): ``cd <dir> && exec <$SHELL> -l -i``. ``exec`` replaces the
+    wrapping ``sh`` with the user's shell so signals / the exit code pass
+    through naturally; ``-i`` makes it interactive and ``-l`` a login shell, so
+    it loads the same startup files (``~/.bash_profile`` / ``~/.profile``) as
+    the user's normal terminal and thus their real prompt — a plain ``-i``
+    non-login shell reads only ``~/.bashrc`` and so misses any PS1 set up only
+    on login. ``$SHELL`` defaults to ``sh`` and may itself carry args
+    (``bash --login``), which the shell-string honours verbatim — appending
+    `` -l -i`` after it is correct (and harmless if ``--login`` is redundant).
+    The ``cd`` still wins: it runs in the wrapping ``sh`` before ``exec``, and
+    the login startup doesn't change directory. The shell inherits the terminal
+    (a normal interactive child), so no ``keep_screen``.
     """
     import shlex
     shell = os.environ.get('SHELL') or 'sh'
-    ctx.run_external(f'cd {shlex.quote(cwd)} && exec {shell}')
+    ctx.run_external(f'cd {shlex.quote(cwd)} && exec {shell} -l -i')
 
 
 def _new_file(ctx, dir_path):
@@ -525,6 +533,20 @@ def _new_dir(ctx, dir_path):
 def _open_browse_git(ctx, dir_path, mode):
     """Launch ``browse-git <dir> --mode NAME`` (another browse-tui recipe)."""
     ctx.run_external(['browse-git', dir_path, '--mode', mode], keep_screen=True)
+
+
+def _open_git_menu(ctx, dir_path):
+    """Open the second-level ``git`` mode submenu, then launch browse-git.
+
+    The ``git`` Level-1 row's handler: re-invoke ``ctx.menu`` with the
+    ``_DIR_GIT_MODES`` rows — each a ``(submenu_label, mode)`` pair, so the chosen
+    token IS the mode — (the framework runs sequential submenus within one
+    ``on_context_menu`` fire, as browse-git's Reset ▸ does) and, on a non-``None``
+    choice, open ``browse-git <dir> --mode NAME``. A cancel (``None``) is a no-op.
+    """
+    mode = ctx.menu(_DIR_GIT_MODES)
+    if mode is not None:
+        _open_browse_git(ctx, dir_path, mode)
 
 
 def _view_pager(ctx, path):
@@ -612,21 +634,21 @@ def _dir_actions(dir_path):
     """``(label, token)`` rows for the NON-destructive actions on ``dir_path``.
 
     The directory-related actions a browse-fs row can offer: Run-shell-here, the
-    git-mode launches (only when ``dir_path`` is a repo), and New file / New
+    ``git`` submenu (only when ``dir_path`` is a repo), and New file / New
     directory (created IN ``dir_path``). Shared by a directory cursor (where
     ``dir_path`` is the cursor dir) and a file cursor (where ``dir_path`` is the
     file's PARENT — the directory being listed), so the same actions operate on
     whichever directory is in play.
 
-    ``dir_path`` here gates the git-mode rows (``_is_git_repo``); the chosen
-    row's handler re-derives the same directory from the cursor via
-    ``_target_dir`` (so the token stays a plain string, and the dir-cursor tokens
-    are unchanged). Destructive Delete / "Show full path" are NOT here — those are
-    row-kind specific and stay with the per-kind builder.
+    ``dir_path`` here gates the ``git`` row (``_is_git_repo``); the chosen row's
+    handler re-derives the same directory from the cursor via ``_target_dir`` (so
+    the token stays a plain string, and the dir-cursor tokens are unchanged).
+    Destructive Delete / "Show full path" are NOT here — those are row-kind
+    specific and stay with the per-kind builder.
     """
     rows = [('Run shell here', 'dir.shell')]
     if _is_git_repo(dir_path):
-        rows.extend((label, token) for label, token, _mode in _DIR_GIT_MODES)
+        rows.append(('git ▸', 'dir.git'))
     rows.extend([
         ('New file…', 'dir.newfile'),
         ('New directory…', 'dir.newdir'),
@@ -637,8 +659,8 @@ def _dir_actions(dir_path):
 def context_menu_dir(ctx, path):
     """``(label, token)`` rows for a directory cursor row.
 
-    The shared directory actions (``_dir_actions`` — Run-shell-here, git-mode
-    rows when a repo, New file / New directory), then Show full path and Delete
+    The shared directory actions (``_dir_actions`` — Run-shell-here, the ``git``
+    submenu when a repo, New file / New directory), then Show full path and Delete
     (reusing the ``d`` handler's confirm → ``(d)`` hint). "Show full path" is
     ALWAYS offered for a path row — the row title is cell-cut WITHOUT an ellipsis
     when the pane is narrow, so a pop-up is the reliable way to read a long path
@@ -666,8 +688,8 @@ def context_menu_file(ctx, path):
 
     The shared directory actions (``_dir_actions``) are appended, acting on the
     file's PARENT — the directory being listed. That folds in Run-shell-here
-    (which therefore appears exactly once, no standalone file row), the git-mode
-    launches when the parent is a repo, and New file / New directory created in
+    (which therefore appears exactly once, no standalone file row), the ``git``
+    submenu when the parent is a repo, and New file / New directory created in
     that parent. The parent's Delete / Show-full-path are deliberately NOT
     appended: Delete on a file row deletes the file, and the parent directory
     must never be offered for deletion from a file cursor.
@@ -721,11 +743,7 @@ _MENU_ACTIONS = {
     # file cursor; ``_target_dir`` re-derives WHICH dir from the cursor's path
     # (the dir itself, else the file's parent), so one handler serves both.
     'dir.shell':       lambda c, p: _run_shell(c, _target_dir(p)),
-    'dir.git.commits': lambda c, p: _open_browse_git(c, _target_dir(p), 'commits'),
-    'dir.git.branches': lambda c, p: _open_browse_git(c, _target_dir(p), 'branches'),
-    'dir.git.status':  lambda c, p: _open_browse_git(c, _target_dir(p), 'status'),
-    'dir.git.stash':   lambda c, p: _open_browse_git(c, _target_dir(p), 'stash'),
-    'dir.git.reflog':  lambda c, p: _open_browse_git(c, _target_dir(p), 'reflog'),
+    'dir.git':         lambda c, p: _open_git_menu(c, _target_dir(p)),
     'dir.newfile':     lambda c, p: _new_file(c, _target_dir(p)),
     'dir.newdir':      lambda c, p: _new_dir(c, _target_dir(p)),
     # directory-row only — the cursor path IS the dir here.
@@ -857,12 +875,12 @@ A markdown file (*.md / *.MD) gets an expansion arrow: open it to list
 to — and press Enter on one to open that file in browse-md.
 
 Right-click a row (or the backslash / F1 keys) for a context menu keyed
-to its kind: a directory offers run-shell-here, open-in-browse-git by
-mode (when it is a git repo), new file / directory, show full path, and
-delete; a file offers edit / view in $PAGER / open / run-shell in its
-dir / browse-md or browse-plan / render with mdcat / diff against a
-single other selected item / show full path / delete; a multi-selection
-offers delete N / open N in $EDITOR.\
+to its kind: a directory offers run-shell-here, a 'git' submenu opening
+browse-git by mode (when it is a git repo), new file / directory, show
+full path, and delete; a file offers edit / view in $PAGER / open /
+run-shell in its dir / browse-md or browse-plan / render with mdcat /
+diff against a single other selected item / show full path / delete; a
+multi-selection offers delete N / open N in $EDITOR.\
 """
 
 
@@ -944,7 +962,7 @@ def main():
         actions=actions,
         on_enter=_on_enter,
         # Right-click (or the backslash / F1 keys) opens a context menu keyed
-        # to the cursor row's kind: a directory (run shell / git modes / new
+        # to the cursor row's kind: a directory (run shell / git submenu / new
         # file+dir / show path / delete), a file (edit / view / open / shell /
         # browse-md / browse-plan / mdcat / diff / show path / delete), a
         # multi-selection (delete N / open N), or a missing-path special (show

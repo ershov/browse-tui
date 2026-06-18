@@ -7,7 +7,8 @@ writes the chosen string (or '<cancelled>') to a tempfile and quits;
 each test polls that file to confirm the picker returned the expected
 value.
 
-``ctx.pick`` opens a centered modal dialog (ticket #975): the label
+``ctx.pick`` opens a modal dialog anchored to the triggering row (tickets
+#975, #1101): the label
 renders in the box border (``╔═ Status ═…═╗``) and the filter prompt is
 a ``> {query}`` row, so the picker no longer shows the old info-bar
 ``Status>`` string. Tests detect "picker open" by an option line that
@@ -202,7 +203,7 @@ class TestPickRedrawOnExit(unittest.TestCase):
     """
 
     def _assert_ui_restored(self, t):
-        # The centered dialog only partially covers the preview pane, so
+        # The dialog only partially covers the preview pane, so
         # waiting for preview text to reappear would race the restore
         # repaint (the text is visible even while the box is up). Poll for
         # the dialog box's top border to DISAPPEAR — that's the actual
