@@ -14603,17 +14603,29 @@ def _clamp_left_into(left, w, cols, bounds):
 
     ``bounds=None`` means the whole screen, ``(1, cols)`` — the unchanged
     #1040/#1043 behavior. If the footprint is wider than the bound
-    (``R - w < L + 1`` — a menu wider than its list pane), it can't fit, so we
-    FALL BACK to the screen: ``[2, cols - w]`` when the screen has margin room
-    (``w <= cols - 2``), else the plain on-screen clamp ``[1, cols - w + 1]`` (a
-    frame spanning the screen width has no room for margins; :func:`_paint`
-    omits the off-screen one).
+    (``R - w < L + 1`` — a menu wider than its list pane / parent-selection
+    span), it can't sit INSIDE the bound, so instead of keeping the incoming
+    screen-centered target (which would drift an over-wide submenu to screen
+    center, away from its parent) we RE-TARGET ``left`` to center the box on the
+    bound's MIDPOINT — ``left = (L + R) // 2 - w // 2`` — so it stays over the
+    parent selection's column, the "lean to center within the given extents"
+    intent (#1103). The screen clamp below then shifts it onto the screen.
+
+    The final on-screen clamp applies to that re-targeted ``left`` (the
+    wider-than-bound case) AND to ``bounds=None`` (a standalone centered modal,
+    whose ``left`` arrives already screen-centered): ``[2, cols - w]`` when the
+    screen has margin room (``w <= cols - 2``), else the plain on-screen clamp
+    ``[1, cols - w + 1]`` (a frame spanning the screen width has no room for
+    margins; :func:`_paint` omits the off-screen one).
     """
     if bounds is not None:
         L, R = bounds
         if R - w >= L + 1:                  # footprint fits within the bound
             return max(L + 1, min(left, R - w))
-        # else: wider than the bound — fall back to the screen clamp below.
+        # Wider than the bound: can't sit inside it — center on the bound's
+        # midpoint (stay over the parent selection) instead of the incoming
+        # screen-centered target, then clamp to the screen below.
+        left = (L + R) // 2 - w // 2
     if w <= cols - 2:
         return max(2, min(left, cols - w))
     return max(1, min(left, cols - w + 1))
