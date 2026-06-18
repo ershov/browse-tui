@@ -29,6 +29,15 @@ _render.Item = _data.Item
 _render.PreviewRender = _data.PreviewRender
 _render.VisibleEntry = _state.VisibleEntry
 _context.visible_items = _state.visible_items
+# ``_fire_context_menu`` seeds the unified modal-anchor slot (#1101) via the
+# ``_list_pane_bounds`` / ``_list_cursor_cell`` helpers, which live in
+# 060-context and read the live layout through ``term_size`` / ``layout_panes``
+# there. The concatenated build resolves all these by shared namespace; the
+# isolated load wires them across modules.
+_state._list_pane_bounds = _context._list_pane_bounds
+_state._list_cursor_cell = _context._list_cursor_cell
+_context.term_size = _term.term_size
+_context.layout_panes = _render.layout_panes
 
 # The expand/collapse hook tests drive the real keyboard handlers
 # (`right`/`left`/alt-right/alt-left) through ``dispatch_key`` so the
@@ -1345,24 +1354,34 @@ class TestOnContextMenu(unittest.TestCase):
         finally:
             b.stop_workers()
 
-    def test_fire_threads_anchor_to_ctx_menu_default(self):
-        """During the fire, the supplied click cell is the menu's default anchor."""
-        anchors = []
+    def test_fire_seeds_modal_anchor_from_click_row(self):
+        """During the fire, a right-click click cell seeds the modal-anchor slot.
 
-        def handler(ctx):
-            # ``ctx.menu`` is a no-op on a headless Browser (returns None
-            # before opening), so observe the resolved default anchor
-            # directly off the Browser instead.
-            anchors.append(ctx._browser._context_menu_anchor)
-
-        b = Browser(BrowserConfig(_headless=True, on_context_menu=handler))
+        ``_fire_context_menu`` opens a modal-anchor CHAIN (#1101): the click
+        cell's ROW seeds ``_modal_anchor``'s ``y`` (the right-click trigger
+        drops the menu under the pointer), with the list pane's column span as
+        the horizontal extents. ``ctx.menu`` is a no-op on a headless Browser,
+        so observe the seeded slot directly off the Browser inside the handler.
+        """
+        slots = []
+        b = Browser(BrowserConfig(
+            _headless=True,
+            on_context_menu=lambda ctx: slots.append(ctx._browser._modal_anchor)))
+        _seed(b, [Item(id='a'), Item(id='b'), Item(id='c')])
+        restore = self._patch_term(80, 40)
         try:
+            _context.term_size = lambda: (80, 40)   # match the patched layout
+            layout = _render.layout_panes(80, 40, show_preview=False,
+                                          show_children_pane=False)
+            L = layout['list'].left
+            R = layout['list'].right - 1
             b._fire_context_menu(anchor=(7, 3))
-            self.assertEqual(anchors, [(7, 3)])
-            # Cleared after the fire so later (keyboard) triggers default
-            # back to the list cursor.
-            self.assertIsNone(b._context_menu_anchor)
+            self.assertEqual(slots, [(7, L, R)])     # click ROW + pane span
+            # Cleared after the fire so the next open re-seeds.
+            self.assertIsNone(b._modal_anchor)
         finally:
+            _context.term_size = _term.term_size
+            restore()
             b.stop_workers()
 
     def test_fire_swallows_handler_exception_to_error_log(self):
@@ -1375,51 +1394,24 @@ class TestOnContextMenu(unittest.TestCase):
             b.drain_main_queue()
             self.assertIn('on_context_menu', _err_log(b))
             self.assertIn('kaboom', _err_log(b))
-            # Anchor still cleared even when the handler raised.
-            self.assertIsNone(b._context_menu_anchor)
+            # Slot still cleared even when the handler raised.
+            self.assertIsNone(b._modal_anchor)
         finally:
             b.stop_workers()
 
-    def test_fire_resets_and_clears_per_chain_side(self):
-        """The per-chain side slot (#1041) is reset at the start of the fire
-        and cleared afterwards.
-
-        ``_fire_context_menu`` is the chain boundary: it must reset
-        ``_context_menu_side`` to ``None`` BEFORE the handler runs (so a fresh
-        chain decides anew, ignoring any stale value), and clear it back to
-        ``None`` AFTER (so the slot doesn't leak across fires). The first
-        ``ctx.menu`` of the chain would store its chosen side here, but
-        ``ctx.menu`` is a no-op on a headless Browser — so observe the slot
-        directly off the Browser inside the handler.
-        """
-        seen_side = []
-        b = Browser(BrowserConfig(
-            _headless=True,
-            on_context_menu=lambda ctx: seen_side.append(
-                ctx._browser._context_menu_side)))
-        try:
-            # Pre-seed a STALE side: the start-of-fire reset must wipe it so
-            # the handler sees a fresh (None) chain, not last chain's side.
-            b._context_menu_side = 'above'
-            b._fire_context_menu()
-            self.assertEqual(seen_side, [None])      # reset before handler ran
-            self.assertIsNone(b._context_menu_side)  # cleared after the fire
-        finally:
-            b.stop_workers()
-
-    def test_fire_clears_side_even_when_handler_raises(self):
-        """The side slot is cleared in ``finally`` — a raising handler that
-        had set a side does not leak it past the fire."""
+    def test_fire_clears_modal_anchor_even_when_handler_raises(self):
+        """The modal-anchor slot is cleared in ``finally`` — a raising handler
+        that had advanced the slot does not leak it past the fire."""
         def boom(ctx):
-            # Simulate the first menu having fixed the chain's side, then the
+            # Simulate a menu having advanced the chain's anchor, then the
             # handler blowing up before the fire returns normally.
-            ctx._browser._context_menu_side = 'below'
+            ctx._browser._modal_anchor = (9, 1, 20)
             raise RuntimeError('kaboom')
 
         b = Browser(BrowserConfig(_headless=True, on_context_menu=boom))
         try:
             b._fire_context_menu()  # must not raise
-            self.assertIsNone(b._context_menu_side)  # cleared despite raise
+            self.assertIsNone(b._modal_anchor)  # cleared despite raise
         finally:
             b.stop_workers()
 
@@ -1445,23 +1437,28 @@ class TestOnContextMenu(unittest.TestCase):
             restore()
             b.stop_workers()
 
-    def test_right_click_anchor_is_click_cell(self):
-        """The right-click trigger passes the click cell as the menu anchor."""
-        anchors = []
+    def test_right_click_seeds_modal_anchor_from_click_row(self):
+        """The right-click trigger seeds the modal-anchor slot from the click
+        ROW (#1101), with the list pane's column span as the extents."""
+        slots = []
         b = Browser(BrowserConfig(
             _headless=True,
-            on_context_menu=lambda ctx: anchors.append(
-                ctx._browser._context_menu_anchor)))
+            on_context_menu=lambda ctx: slots.append(
+                ctx._browser._modal_anchor)))
         _seed(b, [Item(id='a'), Item(id='b'), Item(id='c')])
         restore = self._patch_term(80, 40)
         try:
+            _context.term_size = lambda: (80, 40)   # match the patched layout
             ctx = _ctx(b)
             layout = _render.layout_panes(80, 40, show_preview=False,
                                           show_children_pane=False)
             r = layout['list'].top + 1
+            L = layout['list'].left
+            R = layout['list'].right - 1
             dispatch_key(b, ctx, f'right-click:{r}:9')
-            self.assertEqual(anchors, [(r, 9)])
+            self.assertEqual(slots, [(r, L, R)])     # click ROW + pane span
         finally:
+            _context.term_size = _term.term_size
             restore()
             b.stop_workers()
 

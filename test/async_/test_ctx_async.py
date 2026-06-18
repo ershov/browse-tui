@@ -72,10 +72,10 @@ class _Spy:
         self.calls = []
 
     def __call__(self, content, *, on_result=None, placement='center',
-                 anchor=None):
+                 anchor=None, bounds=None):
         self.calls.append({
             'content': content, 'on_result': on_result,
-            'placement': placement, 'anchor': anchor,
+            'placement': placement, 'anchor': anchor, 'bounds': bounds,
         })
 
 
@@ -185,7 +185,7 @@ class TestPickAsync(_CtxAsyncCase):
     def test_returns_none_immediately(self):
         self.assertIsNone(self.ctx.pick_async('label', ['a', 'b']))
 
-    def test_builds_filterable_list_titled_centered(self):
+    def test_builds_filterable_list_anchored_to_slot(self):
         rec = _Recorder()
         self.ctx.pick_async('pick one', ['a', ('B', 2)], on_result=rec)
         call = self._only_call()
@@ -194,8 +194,11 @@ class TestPickAsync(_CtxAsyncCase):
         self.assertTrue(content._filter)            # picker => filter row
         self.assertEqual(content.title, 'pick one')  # label is the title
         self.assertEqual(content._options, [('a', 'a'), ('B', 2)])
-        self.assertEqual(call['placement'], 'center')
-        self.assertIsNone(call['anchor'])
+        # #1101: pick_async enqueues the 'slot' sentinel so the main thread
+        # anchors it to the modal-anchor slot (cursor row / previous selection)
+        # — live geometry a worker can't read. With no active slot the servicing
+        # step resolves it to centered.
+        self.assertEqual(call['anchor'], 'slot')
         self.assertIs(call['on_result'], rec)
 
     def test_accepts_iterator_options(self):
@@ -210,7 +213,7 @@ class TestMenuAsync(_CtxAsyncCase):
     def test_returns_none_immediately(self):
         self.assertIsNone(self.ctx.menu_async(['a', 'b']))
 
-    def test_builds_unfiltered_list_centered_without_anchor(self):
+    def test_builds_unfiltered_list_anchored_to_slot_without_anchor(self):
         rec = _Recorder()
         self.ctx.menu_async(['open', ('Del', 'delete')], on_result=rec)
         call = self._only_call()
@@ -220,10 +223,11 @@ class TestMenuAsync(_CtxAsyncCase):
         self.assertIsNone(content.title)
         self.assertEqual(content._options,
                          [('open', 'open'), ('Del', 'delete')])
-        # No anchor => centered (NOT auto-derived from the list cursor — that
-        # is main-thread geometry, unsafe from a worker).
-        self.assertEqual(call['placement'], 'center')
-        self.assertIsNone(call['anchor'])
+        # #1101: with no explicit anchor, menu_async enqueues the 'slot'
+        # sentinel — the main thread anchors it to the modal-anchor slot
+        # (cursor row / previous selection), live geometry a worker can't read.
+        # With no active slot the servicing step resolves it to centered.
+        self.assertEqual(call['anchor'], 'slot')
 
     def test_anchor_forwarded_with_anchor_placement(self):
         self.ctx.menu_async(['a'], anchor=(5, 9))

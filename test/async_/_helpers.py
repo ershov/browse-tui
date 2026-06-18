@@ -23,6 +23,10 @@ _state.notify_wake = _term.notify_wake
 # test load has to inject it (and Context's own ``visible_items`` dep).
 _state.Context = _context.Context
 _context.visible_items = _state.visible_items
+# The run-loop's async-dialog servicing resolves an ``anchor='slot'`` request
+# (#1101) by calling ``_modal_anchor_placement`` by bare name; it lives in
+# 060-context, so inject it the same way ``Context`` is.
+_state._modal_anchor_placement = _context._modal_anchor_placement
 
 
 # Re-export the names tests want.

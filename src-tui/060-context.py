@@ -973,12 +973,12 @@ class Context:
 
     def pick(self, label: str, options,
              *, delay_interaction: bool = False) -> Optional[Any]:
-        """fzf-style filterable picker in a centered modal dialog.
+        """fzf-style filterable picker in an anchored modal dialog.
 
-        Opens a centered modal with a ``> `` filter row above the list of
-        ``options`` (``label`` becomes the dialog title). Each item is a
-        display ``str`` OR a ``(display, value)`` 2-tuple; the filter matches
-        the DISPLAY half (case-insensitive substring). The user can:
+        Opens a modal with a ``> `` filter row above the list of ``options``
+        (``label`` becomes the dialog title). Each item is a display ``str`` OR
+        a ``(display, value)`` 2-tuple; the filter matches the DISPLAY half
+        (case-insensitive substring). The user can:
 
           * type to filter (case-insensitive substring match on the display);
           * up / down / ctrl-p / ctrl-n to move the selection (wrapping);
@@ -986,6 +986,12 @@ class Context:
           * enter to select the highlighted option;
           * esc / ctrl-c to cancel;
           * backspace to edit the filter.
+
+        Like ``ctx.menu`` the picker ANCHORS to the unified modal-anchor slot
+        (#1101): the cursor row when opened standalone, or the previous level's
+        selected item inside a menu/dialog chain — so a backtick picker drops
+        off its row rather than centering. With no resolvable anchor (headless
+        / cursor scrolled off / no list pane) it falls back to centered.
 
         Returns the chosen option's VALUE — the supplied ``value`` for a tuple
         (any type), or the string itself for a bare option — or ``None`` if
@@ -996,7 +1002,9 @@ class Context:
         """
         if self._browser._headless:
             return None
+        anchor, bounds = _modal_anchor_placement(self._browser)
         return modal_pick(self._browser, label, list(options),
+                          anchor=anchor, bounds=bounds,
                           delay_interaction=delay_interaction)
 
     def menu(self, items, *, anchor=None,
@@ -1005,13 +1013,15 @@ class Context:
 
         Opens a modal selection list WITHOUT a filter row. Each item is a
         display ``str`` OR a ``(display, value)`` 2-tuple. ``anchor`` is an
-        optional ``(row, col)`` 1-based screen cell the menu drops below;
-        when ``None`` it defaults to the list cursor's screen cell so a
-        menu reads as attached to the current row. Horizontally an anchored
-        menu leans toward screen center but keeps its footprint within the
-        list pane's columns, so it hangs off its row rather than drifting onto
-        a neighbouring pane (#1051). The user moves with up/down (wrapping),
-        jumps with home/end, picks with enter, cancels with esc/ctrl-c.
+        optional ``(row, col)`` 1-based screen cell the menu drops below; when
+        ``None`` the menu places against the unified modal-anchor slot (#1101)
+        — the previous level's selected item inside a menu/dialog chain, or the
+        list cursor's row when opened standalone — so it reads as attached to
+        that item. Horizontally an anchored menu leans toward screen center but
+        keeps its footprint within the list pane's columns, so it hangs off its
+        row rather than drifting onto a neighbouring pane (#1051). The user
+        moves with up/down (wrapping), jumps with home/end, picks with enter,
+        cancels with esc/ctrl-c.
 
         Returns the chosen item's VALUE — the supplied ``value`` for a tuple
         (any type), or the string itself for a bare item — or ``None`` on
@@ -1021,22 +1031,15 @@ class Context:
         """
         if self._browser._headless:
             return None
-        if anchor is None:
-            # A right-click context-menu trigger stashes the click cell on
-            # the Browser for the duration of the ``on_context_menu`` fire
-            # (see ``Browser._fire_context_menu``); prefer it so the menu
-            # drops under the pointer. Otherwise default to the list
-            # cursor cell so the menu reads as attached to the current row.
-            anchor = (self._browser._context_menu_anchor
-                      or _list_cursor_cell(self._browser))
-        # An anchored menu leans toward screen center but keeps its footprint
-        # within the LIST pane's columns (#1051) — derive that span here, where
-        # the layout is already known. ``None`` (no resolvable list pane) lets
-        # the menu keep the full-screen #1040 centering. A centered menu (no
-        # anchor) passes no bound either.
-        bounds = (_list_pane_bounds(self._browser)
-                  if anchor is not None else None)
-        return modal_menu(self._browser, list(items), anchor=anchor,
+        if anchor is not None:
+            # Explicit ``(row, col)`` from the recipe: drop below that row, but
+            # still keep the footprint within the list pane's columns (#1051),
+            # exactly like the slot-derived path.
+            place_anchor = anchor
+            bounds = _list_pane_bounds(self._browser)
+        else:
+            place_anchor, bounds = _modal_anchor_placement(self._browser)
+        return modal_menu(self._browser, list(items), anchor=place_anchor,
                           bounds=bounds, delay_interaction=delay_interaction)
 
     # ---- thread-safe async dialog variants ----------------------------
@@ -1093,10 +1096,14 @@ class Context:
         """(thread-safe) Async :meth:`pick` — open from any thread.
 
         Builds the same filterable :class:`ListContent` (``label`` as the
-        title) as :meth:`pick` and opens it centered. ``on_result`` receives
-        the chosen option's VALUE or ``None``. An empty ``options`` fires
-        ``on_result(None)`` WITHOUT opening (mirroring the blocking
-        short-circuit) — once, on the main thread, caught. Returns ``None``.
+        title) as :meth:`pick` and, like the blocking :meth:`pick`, ANCHORS to
+        the modal-anchor slot (#1101): the ``anchor='slot'`` sentinel defers the
+        live-layout read to the main thread (a worker can't read it), so the
+        picker drops off the cursor row / previous selection there, falling back
+        to centered when nothing is derivable. ``on_result`` receives the chosen
+        option's VALUE or ``None``. An empty ``options`` fires ``on_result(None)``
+        WITHOUT opening (mirroring the blocking short-circuit) — once, on the
+        main thread, caught. Returns ``None``.
         """
         options = list(options)
         if not options:
@@ -1104,7 +1111,7 @@ class Context:
             return
         content = ListContent(options, filter=True, title=label)
         self._browser.open_dialog_async(content, on_result=on_result,
-                                        placement='center')
+                                        anchor='slot')
 
     def menu_async(self, items, *, anchor=None,
                    on_result: Optional[Callable[[Any], None]] = None) -> None:
@@ -1112,22 +1119,26 @@ class Context:
 
         Builds the same unfiltered :class:`ListContent` as :meth:`menu`.
         ``anchor`` is an optional ``(row, col)`` 1-based screen cell the menu
-        drops below; with ``anchor`` the dialog is anchor-placed, else
-        centered. Unlike the blocking :meth:`menu`, ``anchor`` is NOT
-        defaulted to the list cursor's cell — that derivation reads live
-        geometry on the main thread and is meaningless from a worker. An empty
-        ``items`` fires ``on_result(None)`` WITHOUT opening (once, main thread,
-        caught). ``on_result`` receives the chosen item's VALUE or ``None``.
-        Returns ``None``.
+        drops below; with an explicit ``anchor`` the dialog is anchor-placed at
+        that cell. With ``anchor=None`` it ANCHORS to the modal-anchor slot
+        (#1101) via the ``'slot'`` sentinel — the main-thread servicing step
+        reads the live cursor row / previous selection there (a worker can't),
+        falling back to centered when nothing is derivable. An empty ``items``
+        fires ``on_result(None)`` WITHOUT opening (once, main thread, caught).
+        ``on_result`` receives the chosen item's VALUE or ``None``. Returns
+        ``None``.
         """
         items = list(items)
         if not items:
             self._deliver_none(on_result)
             return
         content = ListContent(items, filter=False)
-        placement = 'anchor' if anchor is not None else 'center'
-        self._browser.open_dialog_async(content, on_result=on_result,
-                                        placement=placement, anchor=anchor)
+        if anchor is not None:
+            self._browser.open_dialog_async(content, on_result=on_result,
+                                            placement='anchor', anchor=anchor)
+        else:
+            self._browser.open_dialog_async(content, on_result=on_result,
+                                            anchor='slot')
 
     def input_async(self, prompt: str, *, default: str = '',
                     on_result: Optional[Callable[[Any], None]] = None) -> None:
@@ -1232,3 +1243,37 @@ def _list_cursor_cell(browser):
         # Cursor isn't on screen in the list pane — no sensible anchor.
         return None
     return (list_rect.top + rel, list_rect.left)
+
+
+def _modal_anchor_placement(browser):
+    """Resolve ``(anchor, bounds)`` for an anchored ``ctx.menu`` / ``ctx.pick``.
+
+    The single READ of the unified modal-anchor slot (#1101). Returns the
+    ``run_modal`` placement pair:
+
+      * ``anchor=(y, x_left)`` — the target ROW ``y`` (the only coordinate
+        :func:`_modal_place` reads for vertical placement) paired with the
+        bound's left column (the column half is unused, but the placement
+        signature takes a cell);
+      * ``bounds=(x_left, x_right)`` — the inclusive horizontal span the
+        footprint is kept within (lean-to-center-within-bounds, #1051).
+
+    When ``browser._modal_anchor`` is set (mid-chain: pointed at the previous
+    level's selected row, or seeded by ``_fire_context_menu``) it is used
+    verbatim. Otherwise this is a STANDALONE open (no context-menu chain
+    active) — seed from the live cursor row + list pane span, the same geometry
+    ``_fire_context_menu`` would, so e.g. browse-git's backtick ``ctx.pick``
+    anchors to the cursor row rather than centering. Returns ``(None, None)``
+    when nothing is derivable (headless / cursor scrolled off / no list pane),
+    so the caller falls back to centered.
+    """
+    slot = getattr(browser, '_modal_anchor', None)
+    if slot is None:
+        # Standalone open: seed from the cursor row + list pane span.
+        cell = _list_cursor_cell(browser)
+        bounds = _list_pane_bounds(browser)
+        if cell is None or bounds is None:
+            return (None, None)
+        slot = (cell[0], bounds[0], bounds[1])
+    y, x_left, x_right = slot
+    return (y, x_left), (x_left, x_right)

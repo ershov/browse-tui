@@ -161,15 +161,26 @@ class _StubContent:
     """
 
     def __init__(self, *, title='Stub', w=10, h=3, key_handler=None,
-                 raise_on=None, measure_raises=False):
+                 raise_on=None, measure_raises=False, selected_offset=None):
         self.title = title
         self._w = w
         self._h = h
         self._key_handler = key_handler or {}
         self._raise_on = raise_on
         self._measure_raises = measure_raises
+        # When set, the content advertises a selected-row offset to the engine
+        # (the #1101 modal-anchor advance reads ``selected_row_offset()`` on a
+        # selecting close). Left ``None`` to mimic a content with no row
+        # selection (a choice / input dialog) — the engine then leaves the
+        # slot unchanged.
+        self._selected_offset = selected_offset
         self.handled = []
         self.drawn = []
+        # Only expose the accessor when an offset was requested, so a stub can
+        # also stand in for content WITHOUT the optional protocol method (the
+        # engine's ``getattr(..., None)`` guard must skip it).
+        if selected_offset is not None:
+            self.selected_row_offset = lambda: self._selected_offset
 
     def measure(self, max_w, max_h):
         if self._measure_raises:
@@ -275,6 +286,9 @@ class _FakeBrowser:
         # Browser inits both, so the fake does too.
         self._modal_force = None
         self._quit_requested = False
+        # Unified modal-anchor slot (#1101): the engine OVERWRITES it with the
+        # selected row's geometry on a selecting close. Starts unset.
+        self._modal_anchor = None
         self._pane_cache = {}
         self._needs_redraw = set()
         self._out_stream_live = False
@@ -1203,17 +1217,16 @@ class TestDelayInteraction(unittest.TestCase):
         self.assertEqual(content.handled, [])  # esc never reaches content
 
 
-class TestContextMenuSideSlot(unittest.TestCase):
-    """``_measure_frame`` decides / stores / reuses the per-chain menu side.
+class TestAnchoredSideDecidedFresh(unittest.TestCase):
+    """``_measure_frame`` decides the anchored vertical SIDE FRESH each call.
 
-    For an anchored placement the engine resolves the vertical SIDE through
-    ``browser._context_menu_side`` (#1041): unset → decide below-if-fits-else-
-    above from the measured frame height and STORE it; set → REUSE it so a
-    submenu opened later in the same chain stays on the side the first menu
-    picked, shifting (clamping) to fit rather than flipping. The slot is owned
-    by ``Browser._fire_context_menu`` (reset per chain, cleared after); here a
-    fake Browser stands in for it and is observed directly. ``run_modal``
-    paints the frame top-down, so the first cursor-move recovers its placement.
+    Post-#1101 the side (above/below the anchor row) is NOT persisted across a
+    chain: every level anchors to the previous level's selected row (carried by
+    ``browser._modal_anchor``) and picks its own side by the below-if-fits-else-
+    above rule from THAT row + its frame height. So two menus at different rows
+    each decide independently, and there is no ``_context_menu_side`` slot left
+    to read or write. ``run_modal`` paints the frame top-down, so the first
+    cursor-move recovers its placement.
     """
 
     def _menu(self, browser, *, anchor, cols=80, rows=24, h=4):
@@ -1226,93 +1239,145 @@ class TestContextMenuSideSlot(unittest.TestCase):
                       _read_key=_scripted(['enter']))
         return _frame_top_left(cap.text)
 
-    def test_first_menu_that_fits_below_stores_below(self):
-        # Anchor high on the screen with room beneath: the engine decides
-        # 'below', stores it, and drops the box one row under the anchor.
+    def test_fits_below_drops_below(self):
+        # Anchor high with room beneath: drop the box one row under the anchor.
         b = _FakeBrowser()
-        b._context_menu_side = None
         top, _left = self._menu(b, anchor=(5, 10), h=4)
-        self.assertEqual(b._context_menu_side, 'below')  # decided + stored
         self.assertEqual(top, 6)                         # row + 1, below
 
-    def test_first_menu_near_bottom_stores_above(self):
-        # Anchor near the bottom: 'below' would overflow, so the first menu
-        # decides + stores 'above' and sits above the anchor row.
-        b = _FakeBrowser()
-        b._context_menu_side = None
+    def test_near_bottom_flips_above(self):
         # 80x24, content h=4 → frame h=6. Anchor at row 22: below = 23..28 >
         # 24, so it flips above → top = 22 - 6 = 16.
+        b = _FakeBrowser()
         top, _left = self._menu(b, anchor=(22, 10), h=4)
-        self.assertEqual(b._context_menu_side, 'above')
         self.assertEqual(top, 16)
 
-    def test_tall_submenu_reuses_below_and_clamps_not_flips(self):
-        # THE end-to-end #1041 case. The chain's side is already 'below'
-        # (set by the first menu). A TALL submenu (content h=18 → frame
-        # h=20, so 20 rows on screen) dropped below row 5 would be 6..25 >
-        # 24. It must REUSE
-        # 'below' and CLAMP up (top = rows - h + 1 = 24 - 20 + 1 = 5),
-        # overlapping the subject row — NOT flip above (which would put top
-        # at 1). The stored side is unchanged by the reuse.
+    def test_side_tracks_each_row_independently(self):
+        # The headline #1101 contract: the side is NOT sticky. The same Browser
+        # opens a menu at a high row (decides 'below') then another at a low row
+        # (decides 'above') — each flips on its own merits, no carried side.
         b = _FakeBrowser()
-        b._context_menu_side = 'below'           # chain already chose below
-        top, _left = self._menu(b, anchor=(5, 10), h=18)
-        self.assertEqual(b._context_menu_side, 'below')  # still below
-        self.assertEqual(top, 5)                 # clamped down to fit
-        self.assertNotEqual(top, 1)              # did NOT flip to the above pos
+        top_hi, _ = self._menu(b, anchor=(5, 10), h=4)
+        self.assertEqual(top_hi, 6)                      # below
+        top_lo, _ = self._menu(b, anchor=(22, 10), h=4)
+        self.assertEqual(top_lo, 16)                     # above — not reused
+        # And the engine never grew a per-chain side attribute.
+        self.assertFalse(hasattr(b, '_context_menu_side'))
 
-    def test_submenu_reuses_above(self):
-        # Symmetric reuse: chain side 'above', a tall submenu near the top
-        # stays above-anchored and clamps to the top edge instead of flipping
-        # below.
-        b = _FakeBrowser()
-        b._context_menu_side = 'above'
-        # content h=16 → frame h=18. Anchor row 4: above = 4 - 18 = -14 →
-        # clamp to top 1. (Flipping below would be top = 5.)
-        top, _left = self._menu(b, anchor=(4, 10), h=16)
-        self.assertEqual(b._context_menu_side, 'above')
-        self.assertEqual(top, 1)
-        self.assertNotEqual(top, 5)
-
-    def test_fresh_anchored_placement_matches_legacy_decision(self):
-        # With the slot present-but-None the FIRST anchored menu reproduces
-        # today's below-if-fits-else-above rule — the stored side just records
-        # which way it went. Sweep the anchor row and assert the placement
-        # tracks the overflow predicate (asserting the rule, not a constant).
+    def test_decision_tracks_overflow_predicate(self):
+        # Sweep the anchor row and assert the placement tracks the
+        # below-if-fits-else-above predicate (asserting the rule, not a
+        # constant) — each call decided fresh from its own row.
         rows = 24
         for row in (1, 5, 10, 17, 18, 22):
             with self.subTest(row=row):
                 b = _FakeBrowser()
-                b._context_menu_side = None
                 top, _left = self._menu(b, anchor=(row, 10), rows=rows, h=4)
                 fh = 6  # content 4 + frame 2
                 if (row + 1) + fh - 1 <= rows:
                     self.assertEqual(top, row + 1)
-                    self.assertEqual(b._context_menu_side, 'below')
                 else:
                     self.assertEqual(top, max(1, row - fh))
-                    self.assertEqual(b._context_menu_side, 'above')
 
-    def test_browser_without_slot_decides_fresh_and_does_not_persist(self):
-        # A Browser lacking the slot (any non-context anchored use) must
-        # behave like "no preferred side" — decide fresh, never crash, and
-        # NOT grow the attribute (so nothing leaks a side onto it).
-        b = _FakeBrowser()
-        self.assertFalse(hasattr(b, '_context_menu_side'))
-        top, _left = self._menu(b, anchor=(5, 10), h=4)
-        self.assertEqual(top, 6)                         # fresh: below
-        self.assertFalse(hasattr(b, '_context_menu_side'))  # not persisted
 
-    def test_centered_placement_never_touches_slot(self):
-        # A centered dialog must not read or write the side slot.
-        b = _FakeBrowser()
-        b._context_menu_side = None
-        content = _StubContent(title=None, w=20, h=3,
-                               key_handler={'enter': (True, None)})
-        with _FixedTermSize(80, 24), _Capture():
-            run_modal(b, content, placement='center',
+class TestModalAnchorAdvance(unittest.TestCase):
+    """``run_modal`` advances ``_modal_anchor`` to the just-selected row (#1101).
+
+    On a SELECTING close (``handle_key`` returns ``(True, result)`` with a
+    non-None result) the engine overwrites ``browser._modal_anchor`` with the
+    selected row's screen geometry — its absolute row ``y`` and the frame's
+    content column span — so the NEXT anchored modal drops off that item. A
+    cancel (result ``None``) and a content with no ``selected_row_offset()``
+    leave the slot unchanged. The selected ``y`` is ``frame.top + 1 + offset``;
+    the content column span is ``(frame.left + 2, frame.right - 3)``.
+    """
+
+    def _run(self, browser, *, anchor, offset, result, cols=80, rows=24, h=4):
+        """Open an anchored menu that closes returning ``result`` (with the
+        content advertising ``offset`` as its selected row); return the placed
+        ``(top, left)`` so the test can derive the expected slot geometry."""
+        content = _StubContent(title=None, w=20, h=h, selected_offset=offset,
+                               key_handler={'enter': (True, result)})
+        with _FixedTermSize(cols, rows), _Capture() as cap:
+            run_modal(browser, content, placement='anchor', anchor=anchor,
                       _read_key=_scripted(['enter']))
-        self.assertIsNone(b._context_menu_side)          # untouched
+        return _frame_top_left(cap.text)
+
+    def test_selecting_close_points_slot_at_selected_row(self):
+        # Anchor at row 5 (frame drops below → top=6), content selects its
+        # row-2. Expected slot: y = top + 1 + 2 = 9, content span from the
+        # frame's left.
+        b = _FakeBrowser()
+        top, left = self._run(b, anchor=(5, 10), offset=2, result='picked')
+        # frame width: content w=20 → 24; right = left + 24.
+        x_left = left + 2
+        x_right = (left + 24) - 3
+        self.assertEqual(b._modal_anchor, (top + 1 + 2, x_left, x_right))
+
+    def test_submenu_anchor_y_follows_parent_selection_not_cursor(self):
+        # End-to-end (a) in the ticket: a first menu's SELECTED row — not the
+        # original cursor/anchor row — drives where the next menu anchors. Open
+        # menu #1 at row 5; it selects row-3, advancing the slot's y to
+        # 6 + 1 + 3 = 10. A second menu placed at that y drops below row 10
+        # (top = 11), proving the chain followed the selection.
+        b = _FakeBrowser()
+        top1, _left = self._run(b, anchor=(5, 10), offset=3, result='x')
+        self.assertEqual(b._modal_anchor[0], top1 + 1 + 3)  # y followed sel
+        y2 = b._modal_anchor[0]
+        # Open the next level anchored at the advanced y (what ctx.menu would
+        # pass from the slot) and check it drops below that row.
+        content = _StubContent(title=None, w=20, h=4,
+                               key_handler={'enter': (True, None)})
+        with _FixedTermSize(80, 24), _Capture() as cap:
+            run_modal(b, content, placement='anchor', anchor=(y2, 10),
+                      _read_key=_scripted(['enter']))
+        self.assertEqual(_frame_top_left(cap.text)[0], y2 + 1)  # below sel row
+
+    def test_cancel_does_not_advance_slot(self):
+        # A cancelling close (result None) must NOT touch the slot.
+        b = _FakeBrowser()
+        b._modal_anchor = ('SENTINEL',)
+        self._run(b, anchor=(5, 10), offset=2, result=None)
+        self.assertEqual(b._modal_anchor, ('SENTINEL',))  # unchanged
+
+    def test_esc_cancel_does_not_advance_slot(self):
+        # Closing via esc (the engine's uniform cancel, result None) likewise
+        # leaves the slot unchanged.
+        b = _FakeBrowser()
+        b._modal_anchor = ('SENTINEL',)
+        content = _StubContent(title=None, w=20, h=4, selected_offset=1)
+        with _FixedTermSize(80, 24), _Capture():
+            run_modal(b, content, placement='anchor', anchor=(5, 10),
+                      _read_key=_scripted(['esc']))
+        self.assertEqual(b._modal_anchor, ('SENTINEL',))
+
+    def test_content_without_offset_accessor_leaves_slot(self):
+        # A content with NO selected_row_offset() (a choice / input dialog)
+        # selecting-closes without advancing the slot — only row-backed
+        # menus/picks chain.
+        b = _FakeBrowser()
+        b._modal_anchor = ('SENTINEL',)
+        content = _StubContent(title=None, w=20, h=4,   # no selected_offset
+                               key_handler={'enter': (True, 'ok')})
+        self.assertFalse(hasattr(content, 'selected_row_offset'))
+        with _FixedTermSize(80, 24), _Capture():
+            run_modal(b, content, placement='anchor', anchor=(5, 10),
+                      _read_key=_scripted(['enter']))
+        self.assertEqual(b._modal_anchor, ('SENTINEL',))
+
+    def test_offset_none_leaves_slot(self):
+        # The accessor present but returning None (an empty filtered list) is
+        # also a no-op on the slot.
+        b = _FakeBrowser()
+        b._modal_anchor = ('SENTINEL',)
+        # selected_offset=0 attaches the accessor; override it to return None.
+        content = _StubContent(title=None, w=20, h=4, selected_offset=0,
+                               key_handler={'enter': (True, 'ok')})
+        content.selected_row_offset = lambda: None
+        with _FixedTermSize(80, 24), _Capture():
+            run_modal(b, content, placement='anchor', anchor=(5, 10),
+                      _read_key=_scripted(['enter']))
+        self.assertEqual(b._modal_anchor, ('SENTINEL',))
 
 
 class TestRunModalBoundsThreading(unittest.TestCase):
@@ -1331,7 +1396,6 @@ class TestRunModalBoundsThreading(unittest.TestCase):
         plus the frame width (content ``w`` + 4) so callers can locate the
         footprint's right-margin column (``left + frame_w``)."""
         b = _FakeBrowser()
-        b._context_menu_side = None
         content = _StubContent(title=None, w=w, h=h,
                                key_handler={'enter': (True, None)})
         with _FixedTermSize(cols, rows), _Capture() as cap:

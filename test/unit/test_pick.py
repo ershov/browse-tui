@@ -1,18 +1,19 @@
 """Tests for ``ctx.pick`` — now backed by the modal selection list.
 
-``ctx.pick`` opens a centered, filtered modal (``ListContent`` driven by
-``run_modal``); the old ``_pick_on_info_bar`` info-bar/preview overlay is
-gone. The exhaustive ``ListContent`` behavior (filtering, windowing,
-selection rendering, key handling) is covered in ``test_modal_list.py``;
-this file pins the ``ctx.pick`` wiring:
+``ctx.pick`` opens an anchored, filtered modal (``ListContent`` driven by
+``run_modal``, anchored to the unified modal-anchor slot — #1101); the old
+``_pick_on_info_bar`` info-bar/preview overlay is gone. The exhaustive
+``ListContent`` behavior (filtering, windowing, selection rendering, key
+handling) is covered in ``test_modal_list.py``; this file pins the
+``ctx.pick`` wiring:
 
   * the headless short-circuit (returns ``None`` without driving a key
     stream), including the empty-options and no-key-consumption contracts;
   * ``modal_pick``'s empty-options short-circuit (returns ``None`` WITHOUT
     opening a dialog — asserted by a ``run_modal`` that would explode if
     called);
-  * that ``ctx.pick`` builds the right content + placement (a captured
-    ``run_modal`` records ``(content, placement)``);
+  * that ``ctx.pick`` builds the right content + anchored placement (a
+    captured ``run_modal`` records ``(content, placement, anchor, bounds)``);
   * a couple of end-to-end loop drives through ``run_modal`` with an
     injected ``_read_key`` stream (the seam still lives on ``run_modal``).
 
@@ -198,19 +199,22 @@ class TestModalPickWiring(unittest.TestCase):
         finally:
             _modal.run_modal = original
 
-    def test_builds_filtered_centered_list_content(self):
+    def test_builds_filtered_anchored_list_content(self):
         # ctx.pick should construct a filtered ListContent titled with the
-        # label and place it centered. Capture run_modal's (content,
-        # placement) without driving the loop.
+        # label and ANCHOR it to the modal-anchor slot (#1101): with the slot
+        # set, placement='anchor', anchor=(y, x_left), bounds=(x_left, x_right).
+        # Capture run_modal's (content, placement, anchor, bounds) without
+        # driving the loop.
         captured = {}
 
         def _fake_run_modal(browser, content, *, placement='center',
-                            anchor=None, delay_interaction=False,
+                            anchor=None, bounds=None, delay_interaction=False,
                             cancel_keys=frozenset(),
                             cancel_on_right_click=False, _read_key=None):
             captured['content'] = content
             captured['placement'] = placement
             captured['anchor'] = anchor
+            captured['bounds'] = bounds
             captured['cancel_keys'] = cancel_keys
             captured['cancel_on_right_click'] = cancel_on_right_click
             return 'sentinel'
@@ -220,6 +224,10 @@ class TestModalPickWiring(unittest.TestCase):
         try:
             b = _make_browser(_headless=False)
             try:
+                # Pin the slot so the placement is deterministic regardless of
+                # the test's layout — the read is what's under test, not the
+                # geometry (covered in the engine tests).
+                b._modal_anchor = (7, 3, 30)
                 ctx = Context(b)
                 result = ctx.pick('Status', ['open', 'done'])
             finally:
@@ -235,8 +243,9 @@ class TestModalPickWiring(unittest.TestCase):
         # Bare strings normalize to ``(display, value)`` pairs == ``(s, s)``.
         self.assertEqual(content._options,
                          [('open', 'open'), ('done', 'done')])
-        self.assertEqual(captured['placement'], 'center')
-        self.assertIsNone(captured['anchor'])
+        self.assertEqual(captured['placement'], 'anchor')
+        self.assertEqual(captured['anchor'], (7, 3))     # (y, x_left)
+        self.assertEqual(captured['bounds'], (3, 30))    # (x_left, x_right)
         # #1063: pick is dismissed by F1 / right-click (never text) but NOT by
         # ``\`` (a literal filter char), so it passes the F1-only cancel set and
         # opts into right-click close.
