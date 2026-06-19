@@ -15,10 +15,12 @@ full command line. CPU% is the instantaneous cumulative-time delta between the
 current and previous snapshot, falling back to the ``ps pcpu`` lifetime average
 on the first sample or for a freshly-appeared pid.
 
-Reload with ctrl-r. ``t`` toggles between the ppid tree (default) and a flat,
-pid-sorted list of every process (``--tree`` / ``--no-tree`` set the initial
-mode). Custom action ``k:Kill`` sends SIGTERM to the selected pid (with a y/n
-confirmation). A right-click context menu (``on_context_menu``) re-invokes
+Reload with ctrl-r. ``t`` toggles between the ppid tree (default) and a flat
+list of every process (``--tree`` / ``--no-tree`` set the initial mode). The
+htop-style capitals ``N`` / ``P`` / ``M`` / ``T`` / ``U`` sort by pid / CPU% /
+memory / CPU time / user (re-press the active key to reverse it; each key
+remembers its own direction). Custom action ``k:Kill`` sends SIGTERM to the
+selected pid (with a y/n confirmation). A right-click context menu (``on_context_menu``) re-invokes
 ``ctx.menu`` for a flat signal submenu and pages auxiliary process data
 (lsof / ss / /proc/<pid>/{environ,status}).
 
@@ -60,10 +62,36 @@ _UID_NAMES = {}
 _PREV_SNAPSHOT = None
 _CUR_SNAPSHOT = None
 
-# View mode: ``True`` = the ppid hierarchy (default), ``False`` = one flat,
-# pid-sorted list. The ``t`` action flips it; the ``--tree`` / ``--no-tree`` CLI
-# flags set it before launch. ``get_children`` dispatches on it (see B4).
+# View mode: ``True`` = the ppid hierarchy (default), ``False`` = one flat list
+# (ordered by the active sort key — pid by default). The ``t`` action flips it;
+# the ``--tree`` / ``--no-tree`` CLI flags set it before launch. ``get_children``
+# dispatches on it (see B4).
 _TREE_MODE = True
+
+# Sort state (B5, htop-style capitals). ``_SORT_KEY`` is the active ``ProcInfo``
+# field; ``_SORT_DIR`` remembers each key's last direction (``False`` = ascending,
+# ``True`` = descending) so switching away and back restores it. Pressing the
+# active key reverses its direction. Seeded with the spec defaults: pid/user
+# ascending, cpu%/mem/cpu_secs descending. ``_sort_procs`` applies the active
+# key to whichever list ``get_children`` is about to return (a parent's children
+# in tree mode, the whole table in flat mode), tie-breaking by pid.
+_SORT_KEY = 'pid'
+_SORT_DIR = {
+    'pid': False,        # ascending
+    'cpu_pct': True,     # descending
+    'mem_bytes': True,   # descending
+    'cpu_secs': True,    # descending
+    'user': False,       # ascending
+}
+
+# Per-sort-key display label, for the ``sort: <label> <arrow>`` flash.
+_SORT_LABELS = {
+    'pid': 'pid',
+    'cpu_pct': 'cpu%',
+    'mem_bytes': 'mem',
+    'cpu_secs': 'time',
+    'user': 'user',
+}
 
 
 class ProcInfo:
@@ -271,6 +299,35 @@ def _cpu_pct(info):
     return int(round(info.pcpu))
 
 
+# Primary sort value for each ``_SORT_KEY``. ``cpu_pct`` is computed by
+# ``_cpu_pct`` (not a stored attribute, hence defined after it); ``user`` is
+# lower-cased for a case-insensitive ordering; the rest read the ProcInfo field
+# straight. The pid tie-break is applied separately by ``_sort_procs``.
+_SORT_VALUES = {
+    'pid': lambda i: i.pid,
+    'cpu_pct': _cpu_pct,
+    'mem_bytes': lambda i: i.mem_bytes,
+    'cpu_secs': lambda i: i.cpu_secs,
+    'user': lambda i: i.user.lower(),
+}
+
+
+def _sort_procs(infos):
+    """Order a list of ``ProcInfo`` by the active sort key (B5).
+
+    Applied by ``get_children`` to whichever list it is about to return — a
+    parent's children in tree mode, the whole table in flat mode — so the
+    ordering is identical in both scopes. A stable two-pass sort (by pid first,
+    then by the active key) tie-breaks on ascending pid REGARDLESS of the active
+    direction: only the primary key honours ``_SORT_DIR``, so a descending cpu%
+    still lists equal-cpu rows in ascending-pid order (deterministic, and what
+    htop does). ``infos`` is not mutated (``sorted`` returns a new list).
+    """
+    by_pid = sorted(infos, key=lambda i: i.pid)
+    return sorted(by_pid, key=_SORT_VALUES[_SORT_KEY],
+                  reverse=_SORT_DIR[_SORT_KEY])
+
+
 def _proc_item(info, *, has_children):
     """Build one process ``Item`` carrying the gutter display columns.
 
@@ -300,14 +357,16 @@ def get_children(parent_id, *, reload=False):
       Linux. If we somehow can't find it (non-Linux, restricted environment),
       fall back to processes with ppid == 0 minus the kernel-thread PID 2.
       Otherwise the direct children of ``parent_id``.
-    - **flat**: ``None`` (root) returns *every* process as one pid-sorted list,
-      each a leaf (``has_children=False``); any non-None pid returns ``[]``
-      (flat rows don't expand).
+    - **flat**: ``None`` (root) returns *every* process as one list, each a leaf
+      (``has_children=False``); any non-None pid returns ``[]`` (flat rows don't
+      expand).
 
-    Each Item carries the gutter display columns (``col_pid`` / ``col_user`` /
-    ``col_cpu`` / ``col_mem``) and a title of the full command line; ``.pid`` /
-    ``.user`` are kept for the existing signal/preview handlers (see
-    ``_proc_item``).
+    Whichever list is about to be returned (a parent's children in tree mode,
+    the whole table in flat mode) is ordered by ``_sort_procs`` — the active
+    sort key (default pid; ``N``/``P``/``M``/``T``/``U`` switch it). Each Item
+    carries the gutter display columns (``col_pid`` / ``col_user`` / ``col_cpu``
+    / ``col_mem``) and a title of the full command line; ``.pid`` / ``.user`` are
+    kept for the existing signal/preview handlers (see ``_proc_item``).
     """
     procs = _snapshot(reload=reload)
     if not procs:
@@ -317,7 +376,7 @@ def get_children(parent_id, *, reload=False):
         if parent_id is not None:
             return []                            # flat rows are leaves
         return [_proc_item(info, has_children=False)
-                for info in sorted(procs.values(), key=lambda i: i.pid)]
+                for info in _sort_procs(procs.values())]
 
     by_ppid = {}
     for info in procs.values():
@@ -333,7 +392,7 @@ def get_children(parent_id, *, reload=False):
         targets = by_ppid.get(parent_id, [])
 
     return [_proc_item(info, has_children=bool(by_ppid.get(info.pid)))
-            for info in sorted(targets, key=lambda i: i.pid)]
+            for info in _sort_procs(targets)]
 
 
 # --- Gutter columns (B3) ----------------------------------------------------
@@ -441,6 +500,36 @@ def _action_toggle_tree(ctx):
     pending = ctx.refresh()
     if target_id is not None:
         pending.then(lambda: ctx.cursor_to(target_id))
+
+
+def _set_sort(ctx, key):
+    """Switch the active sort to ``key`` (B5), then flash + refresh.
+
+    Pressing the ACTIVE key reverses its remembered direction; switching to a
+    different key adopts THAT key's remembered direction (untouched since it was
+    last used). Either way the per-key ``_SORT_DIR`` entry is the source of
+    truth, so a later return to a key restores the direction it was left at. The
+    flash names the column and its arrow (``↓`` descending, ``↑`` ascending);
+    ``refresh()`` re-runs ``get_children``, which re-sorts via ``_sort_procs``.
+    """
+    global _SORT_KEY
+    if key == _SORT_KEY:
+        _SORT_DIR[key] = not _SORT_DIR[key]
+    _SORT_KEY = key
+    arrow = '↓' if _SORT_DIR[key] else '↑'
+    ctx.flash(f'sort: {_SORT_LABELS[key]} {arrow}')
+    ctx.refresh()
+
+
+def _sort_action(key):
+    """Build the ``ctx -> None`` handler that activates sort ``key``.
+
+    A small closure factory so the five htop-style sort actions
+    (``N``/``P``/``M``/``T``/``U``) share one body — each just binds a different
+    ``ProcInfo`` field. Kept out of a loop-over-Action so the handler captures
+    ``key`` by value, not by a late-bound loop variable.
+    """
+    return lambda ctx: _set_sort(ctx, key)
 
 
 # Signal menu, in the order shown. Each row is ``(name, signum, destructive)``;
@@ -690,7 +779,11 @@ ride along as columns. Reload the tree with Ctrl-R; preview reads
 /proc/<pid>/status.
 
   t       toggle flat / tree view (--tree / --no-tree set the initial
-          mode). Flat lists every process pid-sorted; tree groups by ppid.
+          mode). Flat lists every process; tree groups by ppid.
+  N P M T U  sort by pid / CPU% / memory / CPU time / user (htop-style
+          capitals). Re-press the active key to reverse it; each key
+          remembers its own direction. In tree mode each parent's
+          children are sorted; in flat mode the whole list is.
 
 Right-click a process (or the backslash / F1 keys) for a menu: send
 a signal (submenu), page its open files / sockets / environment /
@@ -724,6 +817,13 @@ def main():
             Action('k', 'Kill cursor pid (SIGTERM, with confirm)',
                    kill_proc, 'cursor'),
             Action('t', 'Toggle flat / tree view', _action_toggle_tree, 'none'),
+            # htop-style sort modes (B5): the active key reverses on repeat,
+            # otherwise switches to that key's remembered direction.
+            Action('N', 'Sort by pid (asc)',   _sort_action('pid'),       'none'),
+            Action('P', 'Sort by CPU% (desc)', _sort_action('cpu_pct'),   'none'),
+            Action('M', 'Sort by memory (desc)', _sort_action('mem_bytes'), 'none'),
+            Action('T', 'Sort by CPU time (desc)', _sort_action('cpu_secs'), 'none'),
+            Action('U', 'Sort by user (asc)',  _sort_action('user'),      'none'),
         ],
         # Right-click (or the backslash / F1 keys) on a process row opens a
         # menu: signals (submenu), open files / sockets / environment / status

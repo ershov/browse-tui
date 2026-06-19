@@ -638,6 +638,216 @@ class TestViewFlagsCli(unittest.TestCase):
         self.assertFalse(self._apply(['--tty', '/dev/pts/3', '--no-tree']))
 
 
+# --- Sort modes (B5) --------------------------------------------------------
+
+# Canned table whose pid / cpu% / mem / cpu_secs / user orderings are all
+# DISTINCT, so each sort key produces a different sequence. Every row is a
+# direct child of pid 1 (so the SAME set is sorted in both flat mode — the whole
+# list — and tree mode — pid 1's children). pids 100/200/300 carry deliberately
+# UN-pid-ordered metrics; pcpu doubles as cpu% here because there is no prior
+# snapshot (the lifetime-average fallback), so cpu% == round(pcpu).
+#
+#   pid  ppid user   pcpu  rss  time      → cpu%  mem(KiB) cpu_secs
+#   1    0    root    0.0  100  00:00:00       0     100        0
+#   100  1    Bob    10.0  300  00:00:30      10     300       30
+#   200  1    alice  30.0  100  00:02:00      30     100      120
+#   300  1    carol   5.0  500  00:00:10       5     500       10
+_PS_SORT = (
+    '    1     0 root   0.0  100 00:00:00 /sbin/init\n'
+    '  100     1 Bob   10.0  300 00:00:30 b\n'
+    '  200     1 alice 30.0  100 00:02:00 a\n'
+    '  300     1 carol  5.0  500 00:00:10 c\n'
+)
+
+# A pid-tie table: two rows share the SAME primary metric (mem 200 KiB) so the
+# pid tie-break decides their relative order. pids intentionally descending in
+# file order to prove the tie-break sorts them ascending.
+_PS_TIE = (
+    '    1     0 root  0.0  100 00:00:00 /sbin/init\n'
+    '  300     1 root  0.0  200 00:00:00 c\n'
+    '  200     1 root  0.0  200 00:00:00 b\n'
+)
+
+
+class TestSortProcs(_DataLayerBase):
+    """``_sort_procs`` / ``get_children`` order by the active key (B5).
+
+    The sort state is module-global, so reset it to the seed defaults after each
+    test (the per-test ``_load_recipe`` already gives a fresh module, but be
+    explicit per the ticket).
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(self._restore_sort)
+        self._seed_key = self.r._SORT_KEY
+        self._seed_dir = dict(self.r._SORT_DIR)
+
+    def _restore_sort(self):
+        self.r._SORT_KEY = self._seed_key
+        self.r._SORT_DIR = dict(self._seed_dir)
+
+    def _flat(self, ps_out=_PS_SORT):
+        # Flat mode root → the whole list, ordered by the active sort key.
+        self.r._TREE_MODE = False
+        with mock.patch.object(self.r.subprocess, 'run', _ps_completed(ps_out)), \
+             mock.patch.object(self.r.sys, 'platform', 'linux'), \
+             mock.patch.object(self.r, '_private_mem_bytes', lambda pid: None):
+            return [k.id for k in self.r.get_children(None, reload=True)]
+
+    def _tree_children(self, ps_out=_PS_SORT):
+        # Tree mode: pid 1's direct children, ordered by the active sort key.
+        self.r._TREE_MODE = True
+        with mock.patch.object(self.r.subprocess, 'run', _ps_completed(ps_out)), \
+             mock.patch.object(self.r.sys, 'platform', 'linux'), \
+             mock.patch.object(self.r, '_private_mem_bytes', lambda pid: None):
+            self.r.get_children(None, reload=True)          # samples the snapshot
+            return [k.id for k in self.r.get_children(1, reload=False)]
+
+    def test_defaults_are_seeded(self):
+        # The module seeds _SORT_KEY=pid and the spec per-key directions.
+        self.assertEqual(self.r._SORT_KEY, 'pid')
+        self.assertEqual(self.r._SORT_DIR, {
+            'pid': False, 'cpu_pct': True, 'mem_bytes': True,
+            'cpu_secs': True, 'user': False,
+        })
+
+    def test_pid_ascending(self):
+        self.r._SORT_KEY = 'pid'
+        self.assertEqual(self._flat(), [1, 100, 200, 300])
+
+    def test_cpu_descending(self):
+        # cpu% desc: 200(30) > 100(10) > 300(5) > 1(0).
+        self.r._SORT_KEY = 'cpu_pct'
+        self.assertEqual(self._flat(), [200, 100, 300, 1])
+
+    def test_mem_descending(self):
+        # mem desc: 300(500K) > 100(300K) > {1,200 both 100K → pid asc} → 1,200.
+        self.r._SORT_KEY = 'mem_bytes'
+        self.assertEqual(self._flat(), [300, 100, 1, 200])
+
+    def test_cpu_secs_descending(self):
+        # cpu_secs desc: 200(120) > 100(30) > 300(10) > 1(0).
+        self.r._SORT_KEY = 'cpu_secs'
+        self.assertEqual(self._flat(), [200, 100, 300, 1])
+
+    def test_user_ascending_case_insensitive(self):
+        # user asc, case-insensitive: alice(200) < Bob(100) < carol(300) < root(1).
+        # If it were case-SENSITIVE, capital 'Bob' would sort before 'alice'.
+        self.r._SORT_KEY = 'user'
+        self.assertEqual(self._flat(), [200, 100, 300, 1])
+
+    def test_reverse_direction_flips_order(self):
+        # The same key with the opposite direction reverses the sequence
+        # (modulo the always-ascending pid tie-break, not exercised here since
+        # cpu_secs values are distinct). cpu_secs is a stored attribute (unlike
+        # cpu%, which would become a zero delta on a second identical sample),
+        # so each fresh sample yields the same ordering.
+        self.r._SORT_KEY = 'cpu_secs'
+        self.r._SORT_DIR['cpu_secs'] = True               # descending
+        self.assertEqual(self._flat(), [200, 100, 300, 1])   # 120>30>10>0
+        self.r._SORT_DIR['cpu_secs'] = False              # ascending
+        self.assertEqual(self._flat(), [1, 300, 100, 200])   # 0<10<30<120
+
+    def test_pid_tiebreak_is_ascending_regardless_of_direction(self):
+        # Two rows tie on the primary metric (mem 200K). The pid tie-break is
+        # ascending (200 before 300) in BOTH directions — only the primary key
+        # honours the direction, so the tie-break stays deterministic.
+        self.r._SORT_KEY = 'mem_bytes'
+        self.r._SORT_DIR['mem_bytes'] = True              # descending
+        self.assertEqual(self._flat(_PS_TIE), [200, 300, 1])
+        self.r._SORT_DIR['mem_bytes'] = False             # ascending
+        self.assertEqual(self._flat(_PS_TIE), [1, 200, 300])
+
+    def test_sort_applies_in_tree_scope(self):
+        # The SAME ordering applies to a parent's children in tree mode.
+        self.r._SORT_KEY = 'cpu_pct'
+        self.assertEqual(self._tree_children(), [200, 100, 300])
+        self.r._SORT_KEY = 'mem_bytes'
+        self.assertEqual(self._tree_children(), [300, 100, 200])
+        self.r._SORT_KEY = 'pid'
+        self.assertEqual(self._tree_children(), [100, 200, 300])
+
+
+class TestSortActions(unittest.TestCase):
+    """The sort actions flip state, flash the key+arrow, and refresh (B5).
+
+    Uses a real headless Browser/Context (flash lands on ``b._notice``, refresh
+    re-runs get_children) — the same harness the ``t`` toggle test uses.
+    """
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self.addCleanup(self._restore_sort)
+        self._seed_key = self.r._SORT_KEY
+        self._seed_dir = dict(self.r._SORT_DIR)
+        self.b = make_browser(
+            get_children=lambda _id, *, reload=False:
+                [Item(id=1, title='proc', has_children=False)])
+        self.b.refresh()
+        self.b.run_until_idle()
+        self.ctx = Context(self.b)
+
+    def tearDown(self):
+        self.b.stop_workers()
+
+    def _restore_sort(self):
+        self.r._SORT_KEY = self._seed_key
+        self.r._SORT_DIR = dict(self._seed_dir)
+
+    def test_switching_key_sets_state_and_flashes_remembered_dir(self):
+        # P → cpu_pct, its remembered (default) direction is descending → ↓.
+        self.r._sort_action('cpu_pct')(self.ctx)
+        self.b.run_until_idle()
+        self.assertEqual(self.r._SORT_KEY, 'cpu_pct')
+        self.assertEqual(self.b._notice.text, 'sort: cpu% ↓')
+
+    def test_active_key_repress_reverses_direction(self):
+        # cpu_pct starts descending; activating it then re-pressing flips to asc.
+        self.r._sort_action('cpu_pct')(self.ctx)
+        self.b.run_until_idle()
+        self.assertTrue(self.r._SORT_DIR['cpu_pct'])           # descending
+        self.r._sort_action('cpu_pct')(self.ctx)              # re-press
+        self.b.run_until_idle()
+        self.assertFalse(self.r._SORT_DIR['cpu_pct'])          # now ascending
+        self.assertEqual(self.b._notice.text, 'sort: cpu% ↑')
+
+    def test_switching_away_does_not_reverse_inactive_key(self):
+        # Activate cpu_pct, reverse it (→ asc), switch to mem, then back to
+        # cpu_pct: it must restore the ascending direction it was LEFT at, not
+        # reset to its default descending.
+        a = self.r._sort_action
+        a('cpu_pct')(self.ctx)                                 # desc (default)
+        a('cpu_pct')(self.ctx)                                 # → asc (reversed)
+        a('mem_bytes')(self.ctx)                               # switch away
+        self.b.run_until_idle()
+        self.assertEqual(self.r._SORT_KEY, 'mem_bytes')
+        a('cpu_pct')(self.ctx)                                 # switch back
+        self.b.run_until_idle()
+        # Switching back is NOT a re-press → no reverse; remembered = ascending.
+        self.assertFalse(self.r._SORT_DIR['cpu_pct'])
+        self.assertEqual(self.b._notice.text, 'sort: cpu% ↑')
+
+    def test_pid_action_ascending_arrow(self):
+        # N → pid. pid is the DEFAULT active key, so switch away first; pressing
+        # N then switches back to pid at its remembered ascending direction → ↑.
+        self.r._sort_action('cpu_pct')(self.ctx)
+        self.r._sort_action('pid')(self.ctx)
+        self.b.run_until_idle()
+        self.assertEqual(self.r._SORT_KEY, 'pid')
+        self.assertEqual(self.b._notice.text, 'sort: pid ↑')
+
+    def test_each_action_refreshes(self):
+        # Every sort action must refresh() so get_children re-sorts.
+        for key in ('pid', 'cpu_pct', 'mem_bytes', 'cpu_secs', 'user'):
+            with self.subTest(key=key), \
+                 mock.patch.object(self.ctx, 'refresh',
+                                   wraps=self.ctx.refresh) as spy:
+                self.r._sort_action(key)(self.ctx)
+                self.b.run_until_idle()
+                spy.assert_called_once()
+
+
 # --- Gutter columns (B3) ----------------------------------------------------
 
 class _FakeCtx:
