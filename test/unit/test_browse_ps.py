@@ -26,20 +26,41 @@ from pathlib import Path
 from unittest import mock
 
 from test.async_._helpers import Browser, BrowserConfig, Context, Item, make_browser
+from test.unit._loader import load
 
 
 _REPO = Path(__file__).resolve().parents[2]
 _RECIPE = _REPO / 'recipes' / 'browse-ps'
 
 
+# Real framework render helpers (B3 gutter): the recipe's ``ps_chrome`` /
+# ``ps_gutter_segments`` compose the genuine chrome atoms and cell-justifiers,
+# so we load them from ``src-tui/`` rather than re-implement them. The chrome
+# atoms live in 040-state but reference a couple of render-layer names at call
+# time (``_MARKER_COLOR`` / ``_TAG_STYLE`` / ``cell_width``); inject them the
+# same way test/unit/test_render.py does for its isolated load.
+_FW_DATA = load('_browse_ps_fw_data', '030-data.py')
+_FW_TERM = load('_browse_ps_fw_term', '020-terminal.py')
+_FW_STATE = load('_browse_ps_fw_state', '040-state.py')
+_FW_RENDER = load('_browse_ps_fw_render', '050-render.py')
+_FW_RENDER._char_width = _FW_TERM._char_width
+_FW_RENDER._visible_len = _FW_TERM._visible_len
+_FW_RENDER._ANSI_CSI_RE = _FW_TERM._ANSI_CSI_RE
+for _name in ('_TAG_STYLE', '_MARKER_COLOR', 'cell_width'):
+    setattr(_FW_STATE, _name, getattr(_FW_RENDER, _name))
+
+
 def _stub_browse_tui():
-    """Insert a no-op ``browse_tui`` module so the recipe can import.
+    """Insert a ``browse_tui`` stub the recipe can import from.
 
     The recipe pulls ``Action`` / ``Browser`` / ``BrowserConfig`` / ``Item``
-    from ``browse_tui``; none are exercised by the pure builders under test
-    (the cursor item comes from the REAL Browser below), so inert stubs are
-    enough to let the module load. A fresh module each call keeps a stub left
-    by another recipe's test from bleeding in.
+    (inert here — the cursor item comes from the REAL Browser below) plus the
+    render helpers ``ps_chrome`` / ``ps_gutter_segments`` compose:
+    ``cell_rjust`` / ``cell_ljust`` / ``style`` and the three chrome atoms.
+    Those are wired to the GENUINE framework functions (loaded above) so the
+    gutter tests exercise real cell-width justification and real atom
+    composition, not a re-implementation. A fresh module each call keeps a
+    stub left by another recipe's test from bleeding in.
     """
     mod = types.ModuleType('browse_tui')
 
@@ -53,6 +74,12 @@ def _stub_browse_tui():
     mod.Browser = _Stub
     mod.BrowserConfig = _Stub
     mod.Item = _Stub
+    mod.cell_ljust = _FW_RENDER.cell_ljust
+    mod.cell_rjust = _FW_RENDER.cell_rjust
+    mod.style = _FW_RENDER.style
+    mod.default_row_selection = _FW_STATE.default_row_selection
+    mod.default_row_indent = _FW_STATE.default_row_indent
+    mod.default_row_expander = _FW_STATE.default_row_expander
     sys.modules['browse_tui'] = mod
 
 
@@ -71,12 +98,12 @@ def _browser_with_proc(pid=4242, title='myproc', user='alice'):
     """A real headless Browser whose cursor sits on a single process item.
 
     Mirrors what the recipe's ``get_children`` produces for a pid row (id is
-    the int pid; ``.pid`` / ``.user`` attributes hung on the Item), so the
-    builder reads a faithful cursor. The cursor is parked on the pid row via
-    ``cursor_to`` after the root children settle.
+    the int pid; ``.pid`` / ``.user`` attributes hung on the Item; no ``tag``
+    now that pid/user ride in the gutter), so the builder reads a faithful
+    cursor. The cursor is parked on the pid row via ``cursor_to`` after the
+    root children settle.
     """
-    item = Item(id=pid, title=title, tag=f'{user} pid={pid}',
-                tag_style='dim', has_children=False)
+    item = Item(id=pid, title=title, has_children=False)
     item.pid = pid
     item.user = user
     b = make_browser(get_children=lambda _id, *, reload=False: [item])
@@ -430,6 +457,158 @@ class TestGetChildrenColumns(_DataLayerBase):
         # The graceful ps-error → [] behaviour is preserved.
         kids = self._children(None, ps_out='', reload=True)
         self.assertEqual(kids, [])
+
+    def test_no_tag_chip_on_normal_rows(self):
+        # B3 moved pid/user into the gutter; the old ``tag='user pid=…'`` chip
+        # is gone (would otherwise render redundantly next to the title).
+        for parent in (None, 1, 100):
+            for item in self._children(parent, reload=(parent is None)):
+                self.assertIsNone(getattr(item, 'tag', None))
+                self.assertIsNone(getattr(item, 'tag_style', None))
+
+
+# --- Gutter columns (B3) ----------------------------------------------------
+
+class _FakeCtx:
+    """A ``RowContext`` stand-in for the gutter/chrome render hooks.
+
+    ``max_col_width_global(field)`` returns a fixed width per field (the GLOBAL
+    column width the recipe sizes its gutter to); ``kind`` / ``depth`` /
+    ``selected`` / ``expanded`` feed the framework chrome atoms the recipe
+    composes (``ps_chrome``).
+    """
+
+    def __init__(self, widths, *, depth=0, selected=False, expanded=False,
+                 kind='item'):
+        self._widths = widths
+        self.calls = []
+        self.depth = depth
+        self.selected = selected
+        self.expanded = expanded
+        self.kind = kind
+
+    def max_col_width_global(self, field):
+        self.calls.append(field)
+        return self._widths[field]
+
+
+def _ps_item(r, pid, user, cpu, mem, *, title='proc', has_children=False):
+    """Build a recipe ``Item`` carrying the four gutter columns."""
+    item = r.Item(id=pid, title=title, has_children=has_children)
+    item.col_pid = str(pid)
+    item.col_user = user
+    item.col_cpu = cpu
+    item.col_mem = mem
+    return item
+
+
+# Global column widths wide enough that every sample value pads (so the
+# justification is actually exercised): pid 5, user 8, cpu 4, mem 5.
+_GW = {'col_pid': 5, 'col_user': 8, 'col_cpu': 4, 'col_mem': 5}
+
+
+class TestPsGutterSegments(unittest.TestCase):
+    """``ps_gutter_segments`` builds the dim pid·user·cpu%·mem gutter columns."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+        cls.dim = cls.r.style('dim')          # the real (fg, bold) dim pair
+
+    def test_four_dim_columns_justified_and_spaced(self):
+        ctx = _FakeCtx(_GW)
+        item = _ps_item(self.r, 1, 'root', '10%', '100M')
+        segs = self.r.ps_gutter_segments(item, ctx)
+
+        self.assertEqual(len(segs), 4)
+        dfg, dbold = self.dim
+        # pid / cpu% / mem RIGHT-justified, user LEFT-justified, each + ' '.
+        self.assertEqual(segs[0], ('    1' + ' ', dfg, dbold))   # rjust 5
+        self.assertEqual(segs[1], ('root    ' + ' ', dfg, dbold))  # ljust 8
+        self.assertEqual(segs[2], (' 10%' + ' ', dfg, dbold))    # rjust 4
+        self.assertEqual(segs[3], (' 100M' + ' ', dfg, dbold))   # rjust 5
+        # Widths came from the GLOBAL measurement for each column field.
+        self.assertEqual(ctx.calls,
+                         ['col_pid', 'col_user', 'col_cpu', 'col_mem'])
+
+    def test_columns_align_across_rows(self):
+        # Two rows with differing raw values must, once padded to the global
+        # column width, yield equal per-column segment widths — the point of
+        # max_col_width_global-driven gutter alignment. The global widths are
+        # the max over both rows (pid 5, user 13, cpu 4, mem 6), exactly as the
+        # framework's max_col_width_global would report for this loaded set.
+        gw = {'col_pid': 5, 'col_user': 13, 'col_cpu': 4, 'col_mem': 6}
+        a = _ps_item(self.r, 1, 'root', '0%', '1M')
+        b = _ps_item(self.r, 32109, 'averylonguser', '100%', '12345M')
+        segs_a = self.r.ps_gutter_segments(a, _FakeCtx(gw))
+        segs_b = self.r.ps_gutter_segments(b, _FakeCtx(gw))
+        for col in range(4):
+            self.assertEqual(len(segs_a[col][0]), len(segs_b[col][0]),
+                             f'gutter column {col} widths differ between rows')
+
+    def test_missing_columns_yield_empty_gutter(self):
+        # A synthetic/edge row lacking col_* emits no gutter (so the default
+        # content still renders); no width measurement happens.
+        ctx = _FakeCtx(_GW)
+        bare = self.r.Item(id=0, title='synthetic', has_children=False)
+        self.assertEqual(self.r.ps_gutter_segments(bare, ctx), [])
+        self.assertEqual(ctx.calls, [])
+
+
+class TestPsChrome(unittest.TestCase):
+    """``ps_chrome`` puts the gutter between the selection marker and indent."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    @staticmethod
+    def _text(segs):
+        return ''.join(text for text, _fg, _bold in segs)
+
+    def test_order_selection_gutter_indent_expander(self):
+        # selection · pid · user · cpu% · mem · indent · expander; the NAME is
+        # NOT here (default content renders the flexible last column).
+        ctx = _FakeCtx(_GW, depth=0, expanded=True)
+        item = _ps_item(self.r, 1, 'root', '10%', '100M', has_children=True)
+        segs = self.r.ps_chrome(item, ctx)
+        # 1 selection + 4 gutter + 1 indent + 1 expander = 7 segments.
+        self.assertEqual(len(segs), 7)
+        text = self._text(segs)
+        # The gutter sits immediately after the 2-cell selection marker and
+        # before the expander glyph; the title never appears in chrome.
+        self.assertEqual(text, '      1 root      10%  100M ▼ ')
+        self.assertNotIn('proc', text)
+
+    def test_gutter_left_of_indent_regardless_of_depth(self):
+        # A deep row's gutter occupies the SAME leading cells as a shallow
+        # row's (the gutter is left of the indent, so depth pushes only the
+        # indent/expander/name rightward — not the columns).
+        shallow = self.r.ps_chrome(
+            _ps_item(self.r, 1, 'root', '1%', '1M', has_children=True),
+            _FakeCtx(_GW, depth=0, expanded=True))
+        deep = self.r.ps_chrome(
+            _ps_item(self.r, 999, 'bob', '5%', '9M'),
+            _FakeCtx(_GW, depth=3))
+
+        # The selection marker + four gutter segments (indices 0..4) are the
+        # leading chrome; their combined width is identical across depths, so
+        # the pid column's right edge aligns regardless of tree depth.
+        lead = lambda segs: ''.join(t for t, _f, _b in segs[:5])
+        self.assertEqual(len(lead(shallow)), len(lead(deep)))
+        # And the indent segment (index 5) is what grows with depth.
+        self.assertEqual(deep[5][0], '  ' * 3)
+        self.assertEqual(shallow[5][0], '')
+
+    def test_synthetic_row_has_empty_gutter(self):
+        # No col_* → empty gutter, but the structural chrome still composes
+        # (selection + indent + expander), so default content can render.
+        ctx = _FakeCtx(_GW, depth=1)
+        bare = self.r.Item(id=0, title='synthetic', has_children=False)
+        segs = self.r.ps_chrome(bare, ctx)
+        # selection + (no gutter) + indent + expander = 3 segments.
+        self.assertEqual(len(segs), 3)
+        self.assertEqual(self._text(segs), '    ' + '  ')  # sel + 1-level indent
 
 
 if __name__ == '__main__':

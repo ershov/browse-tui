@@ -32,7 +32,11 @@ import subprocess
 import sys
 import time
 
-from browse_tui import Action, Browser, BrowserConfig, Item
+from browse_tui import (
+    Action, Browser, BrowserConfig, Item,
+    cell_ljust, cell_rjust, default_row_expander, default_row_indent,
+    default_row_selection, style,
+)
 
 
 # --- Process data layer -----------------------------------------------------
@@ -293,8 +297,6 @@ def get_children(parent_id, *, reload=False):
         item = Item(
             id=info.pid,
             title=info.args,
-            tag=f'{info.user} pid={info.pid}',
-            tag_style='dim',
             has_children=bool(by_ppid.get(info.pid)),
         )
         item.user = info.user
@@ -305,6 +307,47 @@ def get_children(parent_id, *, reload=False):
         item.col_mem = human_size(info.mem_bytes)
         items.append(item)
     return items
+
+
+# --- Gutter columns (B3) ----------------------------------------------------
+
+def ps_gutter_segments(item, ctx):
+    """Fixed ``pid · user · cpu% · mem`` columns for the left gutter.
+
+    Sits between the selection marker and the tree indent (see ``ps_chrome``)
+    so the columns don't drift rightward as tree depth grows. pid / cpu% / mem
+    are RIGHT-justified, user LEFT-justified, each to its GLOBAL widest loaded
+    value (``ctx.max_col_width_global``) so the columns line up across the
+    whole tree regardless of each row's depth. A single space separates the
+    columns (and trails the last) to match the spec example spacing. All dim.
+
+    A row missing the ``col_*`` fields (no normal process row should) yields an
+    empty gutter so the default content still renders.
+    """
+    if getattr(item, 'col_pid', None) is None:
+        return []                                # synthetic/edge row → no gutter
+    w = ctx.max_col_width_global
+    dfg, dbold = style('dim')
+    return [
+        (cell_rjust(item.col_pid,  w('col_pid'))  + ' ', dfg, dbold),
+        (cell_ljust(item.col_user, w('col_user')) + ' ', dfg, dbold),
+        (cell_rjust(item.col_cpu,  w('col_cpu'))  + ' ', dfg, dbold),
+        (cell_rjust(item.col_mem,  w('col_mem'))  + ' ', dfg, dbold),
+    ]
+
+
+def ps_chrome(item, ctx):
+    """Row chrome with the gutter columns left of the tree indent (B3).
+
+    Composes the framework chrome atoms so the order is
+    ``selection · pid · user · cpu% · mem · indent · expander``; the name is
+    the default content (the flexible last segment that truncates at the pane
+    edge), so it is NOT rendered here.
+    """
+    return (default_row_selection(item, ctx)
+            + ps_gutter_segments(item, ctx)
+            + default_row_indent(item, ctx)
+            + default_row_expander(item, ctx))
 
 
 def get_preview(pid):
@@ -618,6 +661,9 @@ def main():
         # pagers, renice, and strace. See ``on_context_menu``.
         on_context_menu=on_context_menu,
         help_intro=_HELP_INTRO,
+        # pid / user / CPU% / memory ride in a fixed left gutter (left of the
+        # tree indent) via ps_chrome; the default content renders the name.
+        format_row_chrome=ps_chrome,
         # The pid is its own gutter column now (col_pid), so the framework
         # needn't echo it next to the title.
         show_ids='never',
