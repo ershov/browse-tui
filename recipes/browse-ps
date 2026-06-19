@@ -1,11 +1,19 @@
 #!/usr/bin/env -S browse-tui --run-py
 """browse-ps — interactive process tree.
 
-Builds a hierarchy from ``ps -eo pid,ppid,user,comm``. Each process is
-an Item; children are processes whose ``ppid == this pid``. The root
-of the tree is PID 1 (init / systemd) on Linux; everything else is
-descendants. Kernel threads (ppid == 0, except PID 1) are skipped to
-keep the tree readable.
+Builds a hierarchy from ``ps -eo pid=,ppid=,user=,pcpu=,rss=,time=,args=``.
+Each process is an Item; children are processes whose ``ppid == this pid``.
+The root of the tree is PID 1 (init / systemd) on Linux; everything else is
+descendants. Kernel threads (ppid == 0, except PID 1) are skipped to keep the
+tree readable.
+
+A single ``_snapshot`` per reload fetches the whole process table once and
+builds a ``{pid: ProcInfo}`` map (pid, ppid, user, cpu%, private/RSS memory,
+cumulative CPU time, full command line). Each Item carries display columns
+(``col_pid`` / ``col_user`` / ``col_cpu`` / ``col_mem``); the row title is the
+full command line. CPU% is the instantaneous cumulative-time delta between the
+current and previous snapshot, falling back to the ``ps pcpu`` lifetime average
+on the first sample or for a freshly-appeared pid.
 
 Reload with ctrl-r. Custom action ``k:Kill`` sends SIGTERM to the
 selected pid (with a y/n confirmation). A right-click context menu
@@ -22,77 +30,279 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 
 from browse_tui import Action, Browser, BrowserConfig, Item
 
 
-def _list_procs():
-    """Return ``[(pid, ppid, user, comm), …]`` from ``ps``.
+# --- Process data layer -----------------------------------------------------
 
-    Errors are swallowed: on a platform where ``ps`` is missing or the
-    output is malformed we return ``[]`` rather than crash the UI.
+# How wide to ask ``ps`` to render the user column on Linux (procps). Default is
+# 8 chars and truncates long account names; the ``user:<w>`` form widens it.
+# Verified honoured on this box (procps); a variant that ignores it triggers the
+# uid+pwd fallback in ``_snapshot`` (see ``_PS_USER_WIDTH_OK``).
+_PS_USER_WIDTH = 32
+
+# Linux only: when ``ps -o user:<w>`` is NOT honoured (the column still truncates
+# at 8), fall back to ``ps -o uid=`` + this per-UID pwd cache. ``None`` until the
+# first snapshot probes the width; thereafter ``True``/``False``.
+_PS_USER_WIDTH_OK = None
+_UID_NAMES = {}
+
+# Two most-recent snapshots, kept module-level so CPU% can diff cumulative CPU
+# time across reloads. Each is ``(wall_clock, {pid: ProcInfo})`` or ``None``.
+_PREV_SNAPSHOT = None
+_CUR_SNAPSHOT = None
+
+
+class ProcInfo:
+    """One process row from a snapshot.
+
+    Carries the raw fields parsed from ``ps`` (plus Linux private memory) so the
+    tree builder and the column/CPU% logic share one source of truth: ``pid`` /
+    ``ppid`` (ints), ``user`` (untruncated name), ``pcpu`` (the ps lifetime-
+    average percent, the CPU% fallback), ``rss_bytes`` (resident set), ``cpu_secs``
+    (cumulative CPU time, the delta input + time sort key), ``mem_bytes`` (the
+    chosen memory figure — private on Linux, RSS elsewhere), and ``args`` (the
+    full command line → row title).
+    """
+
+    def __init__(self, pid, ppid, user, pcpu, rss_bytes, cpu_secs, args):
+        self.pid = pid
+        self.ppid = ppid
+        self.user = user
+        self.pcpu = pcpu
+        self.rss_bytes = rss_bytes
+        self.cpu_secs = cpu_secs
+        self.args = args
+        # Memory figure shown in the gutter; private on Linux, RSS elsewhere.
+        # Defaults to RSS and is upgraded in ``_snapshot`` where smaps applies.
+        self.mem_bytes = rss_bytes
+
+
+def human_size(n):
+    """``1536`` → ``'1K'`` — compact binary size (matches browse-fs)."""
+    for unit in ('B', 'K', 'M', 'G', 'T'):
+        if n < 1024:
+            return f'{n}{unit}'
+        n //= 1024
+    return f'{n}P'
+
+
+def _parse_time(field):
+    """``[[DD-]HH:]MM:SS`` (ps ``time`` column) → integer seconds.
+
+    Accepts the POSIX ``MM:SS``, the ``HH:MM:SS`` and the BSD/long ``DD-HH:MM:SS``
+    shapes. Unparseable input yields ``0`` (graceful — the row still renders).
+    """
+    days = 0
+    if '-' in field:
+        d, _, field = field.partition('-')
+        try:
+            days = int(d)
+        except ValueError:
+            return 0
+    parts = field.split(':')
+    try:
+        nums = [int(p) for p in parts]
+    except ValueError:
+        return 0
+    secs = 0
+    for n in nums:                       # left-to-right: …:HH:MM:SS
+        secs = secs * 60 + n
+    return days * 86400 + secs
+
+
+def _private_mem_bytes(pid):
+    """Linux private memory (``Private_Clean + Private_Dirty``) for ``pid``.
+
+    Reads ``/proc/<pid>/smaps_rollup`` (one small file). Returns ``None`` when
+    the file is absent (old kernel), unreadable (permissions), or malformed, so
+    the caller can fall back to RSS.
     """
     try:
-        out = subprocess.run(
-            ['ps', '-eo', 'pid=,ppid=,user=,comm='],
+        with open(f'/proc/{pid}/smaps_rollup') as f:
+            text = f.read()
+    except OSError:
+        return None
+    total = 0
+    found = False
+    for line in text.splitlines():
+        if line.startswith(('Private_Clean:', 'Private_Dirty:')):
+            try:
+                total += int(line.split()[1]) * 1024   # the value is in kB
+                found = True
+            except (IndexError, ValueError):
+                return None
+    return total if found else None
+
+
+def _ps_user_args():
+    """``ps`` argv for the user column, probing the ``:width`` form on Linux.
+
+    On Linux (procps) we ask for ``user:<w>`` to defeat the 8-char truncation;
+    elsewhere (macOS/BSD) plain ``user=`` is already untruncated. Returns the
+    ``-o`` spec string for the user field.
+    """
+    if sys.platform == 'darwin':
+        return 'user='
+    return f'user:{_PS_USER_WIDTH}='
+
+
+def _resolve_uid(uid):
+    """Username for a numeric ``uid`` via a per-UID pwd cache (Linux fallback)."""
+    if uid in _UID_NAMES:
+        return _UID_NAMES[uid]
+    try:
+        import pwd
+        name = pwd.getpwuid(int(uid)).pw_name
+    except (KeyError, ValueError, ImportError):
+        name = str(uid)
+    _UID_NAMES[uid] = name
+    return name
+
+
+def _run_ps(user_field):
+    """Run ``ps`` for the snapshot; return stdout or ``''`` on any failure.
+
+    Errors are swallowed (missing ``ps`` / non-zero exit) so the UI degrades to
+    an empty tree rather than crashing — the original browse-procs behaviour.
+    """
+    try:
+        return subprocess.run(
+            ['ps', '-eo', f'pid=,ppid=,{user_field},pcpu=,rss=,time=,args='],
             check=True, capture_output=True, text=True).stdout
     except (OSError, subprocess.CalledProcessError):
-        return []
-    procs = []
+        return ''
+
+
+def _snapshot(*, reload=False):
+    """Return ``{pid: ProcInfo}`` for the current process table.
+
+    Resamples (fresh ``ps`` + a new ``ProcInfo`` map, rotating the previous one
+    into ``_PREV_SNAPSHOT``) when ``reload=True`` OR no snapshot exists yet;
+    otherwise reuses the cached ``_CUR_SNAPSHOT``. The framework enqueues only
+    the root with ``reload=True`` on a full refresh (descendant re-fetches and
+    lazy expansions pass ``reload=False``), so this yields exactly one sample
+    per reload cycle and every ``get_children`` in that cycle shares it.
+
+    Linux usernames come from ``ps -o user:<w>``; if that variant ignores the
+    width and truncates at 8, we re-run with ``uid=`` + a pwd cache (probed once
+    per process via ``_PS_USER_WIDTH_OK``). Memory is private (smaps_rollup) on
+    Linux where readable, else RSS.
+    """
+    global _PREV_SNAPSHOT, _CUR_SNAPSHOT, _PS_USER_WIDTH_OK
+
+    if not reload and _CUR_SNAPSHOT is not None:
+        return _CUR_SNAPSHOT[1]
+
+    use_uid = sys.platform != 'darwin' and _PS_USER_WIDTH_OK is False
+    out = _run_ps('uid=' if use_uid else _ps_user_args())
+
+    # Probe (Linux, once): a procps variant that ignores ``user:<w>`` caps every
+    # name at the legacy 8 chars. If the widest user field is exactly 8 we treat
+    # the width as unhonoured and latch the uid+pwd fallback (re-running with
+    # ``uid=``). The heuristic can't tell a genuine 8-char name from a truncated
+    # one, but uid+pwd then yields the same/better name, so a false latch is
+    # harmless. Probed against the parsed user column (3rd field).
+    if (_PS_USER_WIDTH_OK is None and sys.platform != 'darwin'):
+        widths = [len(line.split(None, 3)[2])
+                  for line in out.splitlines() if len(line.split(None, 3)) >= 3]
+        _PS_USER_WIDTH_OK = not (widths and max(widths) == 8)
+        if not _PS_USER_WIDTH_OK:
+            use_uid = True
+            out = _run_ps('uid=')
+
+    procs = {}
     for line in out.splitlines():
-        parts = line.split(None, 3)
-        if len(parts) < 4:
+        # Split into exactly 7 fields, KEEPING args (which contains spaces)
+        # intact via maxsplit=6.
+        parts = line.split(None, 6)
+        if len(parts) < 7:
             continue
         try:
             pid = int(parts[0])
             ppid = int(parts[1])
+            pcpu = float(parts[3])
+            rss_kb = int(parts[4])
         except ValueError:
             continue
-        procs.append((pid, ppid, parts[2], parts[3]))
+        user = _resolve_uid(parts[2]) if use_uid else parts[2]
+        info = ProcInfo(pid, ppid, user, pcpu, rss_kb * 1024,
+                        _parse_time(parts[5]), parts[6])
+        if sys.platform != 'darwin':
+            private = _private_mem_bytes(pid)
+            if private is not None:
+                info.mem_bytes = private
+        procs[pid] = info
+
+    _PREV_SNAPSHOT = _CUR_SNAPSHOT
+    _CUR_SNAPSHOT = (time.monotonic(), procs)
     return procs
 
 
-def _by_ppid(procs):
-    """Group ``procs`` by parent pid: ``{ppid: [proc, …]}``."""
-    out = {}
-    for p in procs:
-        out.setdefault(p[1], []).append(p)
-    return out
+def _cpu_pct(info):
+    """Instantaneous CPU% for ``info`` from the cumulative-time delta.
+
+    ``100 * Δcpu_secs / (Δwall_secs * ncpu)`` against the same pid in the
+    previous snapshot. With no prior sample (first load or a freshly-appeared
+    pid) — or a non-positive wall gap — fall back to ``ps pcpu`` (lifetime
+    average). Returned as an integer percent.
+    """
+    prev = _PREV_SNAPSHOT
+    cur = _CUR_SNAPSHOT
+    if prev is not None and cur is not None and info.pid in prev[1]:
+        dwall = cur[0] - prev[0]
+        ncpu = os.cpu_count() or 1
+        if dwall > 0:
+            dcpu = info.cpu_secs - prev[1][info.pid].cpu_secs
+            return int(round(100 * dcpu / (dwall * ncpu)))
+    return int(round(info.pcpu))
 
 
 def get_children(parent_id, *, reload=False):
-    """Children of ``parent_id``.
+    """Children of ``parent_id``, built from the per-reload snapshot.
 
     ``None`` (root): return the init process — PID 1 on Linux. If
     we somehow can't find it (non-Linux, restricted environment), fall
     back to processes with ppid == 0 minus the kernel-thread PID 2.
     Otherwise: direct children of ``parent_id``.
+
+    Each Item carries the gutter display columns (``col_pid`` / ``col_user`` /
+    ``col_cpu`` / ``col_mem``) and a title of the full command line; ``.pid`` /
+    ``.user`` are kept for the existing signal/preview handlers.
     """
-    procs = _list_procs()
+    procs = _snapshot(reload=reload)
     if not procs:
         return []
-    by_ppid = _by_ppid(procs)
+    by_ppid = {}
+    for info in procs.values():
+        by_ppid.setdefault(info.ppid, []).append(info)
 
     if parent_id is None:
-        init = next((p for p in procs if p[0] == 1), None)
+        init = procs.get(1)
         if init is not None:
             targets = [init]
         else:
-            targets = [p for p in by_ppid.get(0, []) if p[0] != 2]
+            targets = [info for info in by_ppid.get(0, []) if info.pid != 2]
     else:
         targets = by_ppid.get(parent_id, [])
 
     items = []
-    for pid, _ppid, user, comm in sorted(targets, key=lambda p: p[0]):
+    for info in sorted(targets, key=lambda i: i.pid):
         item = Item(
-            id=pid,
-            title=comm,
-            tag=f'{user} pid={pid}',
+            id=info.pid,
+            title=info.args,
+            tag=f'{info.user} pid={info.pid}',
             tag_style='dim',
-            has_children=bool(by_ppid.get(pid)),
+            has_children=bool(by_ppid.get(info.pid)),
         )
-        item.user = user
-        item.pid = pid
+        item.user = info.user
+        item.pid = info.pid
+        item.col_pid = str(info.pid)
+        item.col_user = info.user
+        item.col_cpu = f'{_cpu_pct(info)}%'
+        item.col_mem = human_size(info.mem_bytes)
         items.append(item)
     return items
 
@@ -382,9 +592,11 @@ def on_context_menu(ctx):
 _HELP_INTRO = """\
 browse-ps — interactive process tree.
 
-Builds the hierarchy from ``ps -eo pid,ppid,user,comm``: each row is
-a process, children are processes whose ppid equals this pid. Reload
-the tree with Ctrl-R; preview reads /proc/<pid>/status.
+Builds the hierarchy from ``ps -eo pid,ppid,user,pcpu,rss,time,args``:
+each row is a process, children are processes whose ppid equals this
+pid. The row title is the full command line; pid / user / CPU% / memory
+ride along as columns. Reload the tree with Ctrl-R; preview reads
+/proc/<pid>/status.
 
 Right-click a process (or the backslash / F1 keys) for a menu: send
 a signal (submenu), page its open files / sockets / environment /
@@ -406,6 +618,9 @@ def main():
         # pagers, renice, and strace. See ``on_context_menu``.
         on_context_menu=on_context_menu,
         help_intro=_HELP_INTRO,
+        # The pid is its own gutter column now (col_pid), so the framework
+        # needn't echo it next to the title.
+        show_ids='never',
     )).run())
 
 

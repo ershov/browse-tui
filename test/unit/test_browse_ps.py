@@ -17,11 +17,13 @@ is split out and tested directly.
 """
 
 import importlib.util
+import subprocess
 import sys
 import types
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from unittest import mock
 
 from test.async_._helpers import Browser, BrowserConfig, Context, Item, make_browser
 
@@ -179,6 +181,255 @@ class TestSignalMenuOptions(unittest.TestCase):
             'SIGTERM': True, 'SIGKILL': True, 'SIGHUP': True, 'SIGSTOP': True,
             'SIGINT': False, 'SIGCONT': False,
         })
+
+
+# --- Data layer (B0/B2/B6/B7) -----------------------------------------------
+
+def _ps_completed(stdout):
+    """A ``subprocess.run`` stand-in returning canned ``ps`` stdout (rc 0)."""
+    def _run(argv, *a, **kw):
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr='')
+    return _run
+
+
+# Canned ``ps -eo pid=,ppid=,user:32=,pcpu=,rss=,time=,args=`` output. The user
+# column is wide (untruncated) and args carries embedded spaces, so the split
+# (maxsplit=6) is exercised. cpu_secs come from the ``time`` column.
+_PS_OUT = (
+    '    1     0 root                              0.5  9164 00:03:29 /sbin/init splash\n'
+    '  100     1 alice                            12.0  4096 00:00:30 python3 -m http.server 8000\n'
+    '  200   100 averylongusername1234567890       0.0   512 01:02:03 /bin/sleep 99\n'
+)
+
+
+class _DataLayerBase(unittest.TestCase):
+    """Shared setup: load the recipe and reset its module-level snapshot state.
+
+    The snapshot/diff state is module-global (so CPU% can diff across reloads),
+    so each test reloads a fresh recipe module and the platform/user-width
+    probes start from their defaults.
+    """
+
+    def setUp(self):
+        self.r = _load_recipe()
+        # A reload returns a fresh module, but be explicit about the diff state.
+        self.r._PREV_SNAPSHOT = None
+        self.r._CUR_SNAPSHOT = None
+        self.r._PS_USER_WIDTH_OK = None
+        self.r._UID_NAMES = {}
+
+    def _snapshot(self, ps_out, *, platform='linux', private=None, reload=True):
+        """Run ``_snapshot`` with mocked ``ps`` / platform / smaps reads.
+
+        ``private`` maps pid → private-memory bytes (Linux smaps_rollup result);
+        a pid absent from the map (or ``private=None``) reads as ``None`` so the
+        snapshot falls back to RSS.
+        """
+        priv = private or {}
+        with mock.patch.object(self.r.subprocess, 'run', _ps_completed(ps_out)), \
+             mock.patch.object(self.r.sys, 'platform', platform), \
+             mock.patch.object(self.r, '_private_mem_bytes',
+                               lambda pid: priv.get(pid)):
+            return self.r._snapshot(reload=reload)
+
+
+class TestTimeParse(_DataLayerBase):
+    """``_parse_time`` handles the ``[[DD-]HH:]MM:SS`` shapes."""
+
+    def test_shapes(self):
+        cases = {
+            '00:00': 0,
+            '00:00:00': 0,
+            '00:03:29': 209,          # ps HH:MM:SS
+            '10:30': 630,             # POSIX MM:SS
+            '1-02:03:04': 93784,      # BSD/long DD-HH:MM:SS
+        }
+        for field, secs in cases.items():
+            with self.subTest(field=field):
+                self.assertEqual(self.r._parse_time(field), secs)
+
+    def test_garbage_is_zero(self):
+        # Unparseable input degrades to 0 (the row still renders).
+        self.assertEqual(self.r._parse_time('not-a-time'), 0)
+        self.assertEqual(self.r._parse_time('x-01:02'), 0)
+
+
+class TestSnapshotParsing(_DataLayerBase):
+    """``_snapshot`` splits 7 fields keeping args intact and parses each."""
+
+    def test_args_kept_intact(self):
+        procs = self._snapshot(_PS_OUT)
+        self.assertEqual(procs[100].args, 'python3 -m http.server 8000')
+        self.assertEqual(procs[1].args, '/sbin/init splash')
+
+    def test_fields_parsed(self):
+        procs = self._snapshot(_PS_OUT)
+        self.assertEqual(procs[1].ppid, 0)
+        self.assertEqual(procs[100].ppid, 1)
+        self.assertEqual(procs[100].pcpu, 12.0)
+        self.assertEqual(procs[100].rss_bytes, 4096 * 1024)
+        self.assertEqual(procs[200].cpu_secs, 3723)   # 01:02:03
+
+    def test_malformed_lines_skipped(self):
+        # Too few fields / non-int pid are dropped, not fatal.
+        out = _PS_OUT + 'garbage line\n' + '  abc 1 root 0 0 00:00:00 x\n'
+        procs = self._snapshot(out)
+        self.assertEqual(set(procs), {1, 100, 200})
+
+
+class TestUsername(_DataLayerBase):
+    """Untruncated usernames: wide ps column, else uid+pwd fallback."""
+
+    def test_wide_column_untruncated(self):
+        # The :32 form is honoured (max width > 8): names pass through verbatim.
+        procs = self._snapshot(_PS_OUT)
+        self.assertEqual(procs[200].user, 'averylongusername1234567890')
+        self.assertIs(self.r._PS_USER_WIDTH_OK, True)
+
+    def test_truncated_column_falls_back_to_uid(self):
+        # A procps variant that ignores :width truncates every name to 8 chars.
+        # The probe latches the fallback and re-runs with uid=, resolved via pwd.
+        trunc = (
+            '    1     0 root      0.0  100 00:00:01 /sbin/init\n'
+            '  100     1 alicelon  0.0  100 00:00:01 app\n'   # truncated at 8
+        )
+        uid_out = (
+            '    1     0 0    0.0  100 00:00:01 /sbin/init\n'
+            '  100     1 1000 0.0  100 00:00:01 app\n'
+        )
+        calls = []
+
+        def _run(argv, *a, **kw):
+            calls.append(argv)
+            # First call asks for user:32 (truncated variant); second for uid=.
+            spec = argv[2]
+            out = uid_out if 'uid=' in spec else trunc
+            return subprocess.CompletedProcess(argv, 0, stdout=out, stderr='')
+
+        with mock.patch.object(self.r.subprocess, 'run', _run), \
+             mock.patch.object(self.r.sys, 'platform', 'linux'), \
+             mock.patch.object(self.r, '_private_mem_bytes', lambda pid: None), \
+             mock.patch.dict(sys.modules,
+                             {'pwd': types.SimpleNamespace(
+                                 getpwuid=lambda u: types.SimpleNamespace(
+                                     pw_name={0: 'root', 1000: 'alice'}[int(u)]))}):
+            procs = self.r._snapshot(reload=True)
+
+        self.assertIs(self.r._PS_USER_WIDTH_OK, False)
+        self.assertEqual(procs[1].user, 'root')
+        self.assertEqual(procs[100].user, 'alice')
+        # Two ps invocations: the probe, then the uid= re-run.
+        self.assertEqual(len(calls), 2)
+        self.assertIn('uid=', calls[1][2])
+
+
+class TestMemorySelection(_DataLayerBase):
+    """Private memory on Linux (smaps), RSS on macOS / when smaps absent."""
+
+    def test_linux_private_when_available(self):
+        # smaps_rollup gives private bytes → used instead of RSS.
+        procs = self._snapshot(_PS_OUT, platform='linux',
+                               private={100: 2 * 1024 * 1024})
+        self.assertEqual(procs[100].mem_bytes, 2 * 1024 * 1024)
+        # pid 1 has no private figure → falls back to RSS (9164 KiB).
+        self.assertEqual(procs[1].mem_bytes, 9164 * 1024)
+
+    def test_macos_uses_rss(self):
+        # On darwin smaps is never consulted; RSS from the ps column is used.
+        procs = self._snapshot(_PS_OUT, platform='darwin',
+                               private={100: 2 * 1024 * 1024})
+        self.assertEqual(procs[100].mem_bytes, 4096 * 1024)
+
+
+class TestCpuPercent(_DataLayerBase):
+    """CPU% = cumulative-time delta, with the pcpu lifetime fallback."""
+
+    def test_first_sample_uses_pcpu(self):
+        # No prior snapshot → fall back to the ps pcpu lifetime average.
+        self._snapshot(_PS_OUT)
+        self.assertEqual(self.r._cpu_pct(self.r._CUR_SNAPSHOT[1][100]), 12)
+
+    def test_delta_overrides_pcpu(self):
+        # Two snapshots with a known wall + cpu_secs gap → instantaneous %.
+        self._snapshot(_PS_OUT)
+        # Advance: pid 100 burns +4 cpu_secs over a 1s wall gap on 8 cores
+        # → 100 * 4 / (1 * 8) = 50%.
+        prev_wall = self.r._CUR_SNAPSHOT[0]
+        out2 = (
+            '    1     0 root  0.5  9164 00:03:29 /sbin/init\n'
+            '  100     1 alice 12.0 4096 00:00:34 python3\n'   # 30s → 34s = +4
+        )
+        with mock.patch.object(self.r, '_private_mem_bytes', lambda pid: None), \
+             mock.patch.object(self.r.sys, 'platform', 'linux'), \
+             mock.patch.object(self.r.subprocess, 'run', _ps_completed(out2)), \
+             mock.patch.object(self.r.os, 'cpu_count', lambda: 8), \
+             mock.patch.object(self.r.time, 'monotonic', lambda: prev_wall + 1.0):
+            self.r._snapshot(reload=True)
+        self.assertEqual(self.r._cpu_pct(self.r._CUR_SNAPSHOT[1][100]), 50)
+
+    def test_new_pid_uses_pcpu(self):
+        # A pid present only in the current snapshot has no prior → pcpu.
+        self._snapshot(_PS_OUT)
+        out2 = _PS_OUT + '  300     1 bob  7.0  100 00:00:05 newproc\n'
+        procs = self._snapshot(out2)
+        self.assertEqual(self.r._cpu_pct(procs[300]), 7)
+
+
+class TestSnapshotReuse(_DataLayerBase):
+    """Resample on reload / first call; reuse the cache on reload=False."""
+
+    def test_reuse_when_not_reload(self):
+        first = self._snapshot(_PS_OUT, reload=True)
+        # A reload=False call must NOT re-run ps; it returns the same map.
+        def _boom(*a, **kw):
+            raise AssertionError('ps re-run on reload=False')
+        with mock.patch.object(self.r.subprocess, 'run', _boom):
+            again = self.r._snapshot(reload=False)
+        self.assertIs(again, first)
+
+    def test_first_call_samples_even_without_reload(self):
+        # No snapshot yet → resample regardless of the reload flag.
+        procs = self._snapshot(_PS_OUT, reload=False)
+        self.assertEqual(set(procs), {1, 100, 200})
+
+    def test_reload_rotates_previous(self):
+        self._snapshot(_PS_OUT, reload=True)
+        cur = self.r._CUR_SNAPSHOT
+        self._snapshot(_PS_OUT, reload=True)
+        self.assertIs(self.r._PREV_SNAPSHOT, cur)
+
+
+class TestGetChildrenColumns(_DataLayerBase):
+    """``get_children`` sets title=args and the col_* display fields."""
+
+    def _children(self, parent, ps_out=_PS_OUT, **kw):
+        with mock.patch.object(self.r.subprocess, 'run', _ps_completed(ps_out)), \
+             mock.patch.object(self.r.sys, 'platform', 'linux'), \
+             mock.patch.object(self.r, '_private_mem_bytes', lambda pid: None):
+            return self.r.get_children(parent, **kw)
+
+    def test_root_is_pid1_with_columns(self):
+        kids = self._children(None, reload=True)
+        self.assertEqual([k.id for k in kids], [1])
+        item = kids[0]
+        self.assertEqual(item.title, '/sbin/init splash')      # full args title
+        self.assertEqual(item.col_pid, '1')
+        self.assertEqual(item.col_user, 'root')
+        self.assertEqual(item.col_cpu, '0%')                   # round(0.5)
+        self.assertEqual(item.col_mem, self.r.human_size(9164 * 1024))
+        self.assertTrue(item.has_children)                     # pid 100 is a child
+
+    def test_child_listing(self):
+        # pid 100's child is pid 200 (untruncated username column).
+        kids = self._children(100, reload=False)
+        self.assertEqual([k.id for k in kids], [200])
+        self.assertEqual(kids[0].col_user, 'averylongusername1234567890')
+        self.assertEqual(kids[0].title, '/bin/sleep 99')
+
+    def test_empty_ps_yields_no_children(self):
+        # The graceful ps-error → [] behaviour is preserved.
+        kids = self._children(None, ps_out='', reload=True)
+        self.assertEqual(kids, [])
 
 
 if __name__ == '__main__':
