@@ -417,6 +417,18 @@ class State:
     # mutation it shadows. Lazily filled by ``max_col_width`` on first read of
     # a ``(parent_id, field)`` and rebuilt on the next render after a drop.
     _col_width_cache: dict = field(default_factory=dict)
+    # Global column-width cache for ``RowContext.max_col_width_global`` (design
+    # sec A2): ``field_name -> max display-cell width`` over ALL loaded items
+    # (the union of the cached child lists), the global analog of the
+    # per-parent ``_col_width_cache``. Lives on State (not Browser, despite the
+    # spec's loose ``browser._col_width_global_cache`` phrasing) for the same
+    # reason ``_col_width_cache`` does: every invalidation choke point —
+    # ``_index_drop_children`` (covering ``refresh`` / worker delivery and
+    # ``cache_invalidate_subtree``) and ``cache_invalidate_all`` — is a
+    # state-level function with no Browser handle. Cleared wholesale (not
+    # per-parent) there, since the global max can change when ANY parent's
+    # children change. Lazily filled by ``max_col_width_global`` on a miss.
+    _col_width_global_cache: dict = field(default_factory=dict)
     _visible_dirty: bool = True
     _visible_cache: list = field(default_factory=list)
     # Cursor index into the visible-tree list, and the user-selected ids
@@ -534,8 +546,20 @@ def _col_width_drop(state: State, parent_id) -> None:
     a missing key is ignored. Called from ``_index_drop_children`` (the
     drop/replace choke point), the ``_drop_subtree_indexes`` cascade, and the
     ``update_data`` op mutators that touch child lists in place.
+
+    The *global* ``max_col_width_global`` cache (design sec A2) is cleared
+    wholesale here too: this function is the single per-parent invalidation
+    primitive every drop/replace/mutate choke point funnels through —
+    ``_index_drop_children`` (covering ``refresh`` / worker delivery and
+    ``cache_invalidate_subtree``), ``_drop_subtree_indexes``, and the
+    ``update_data`` upsert/set/mod/remove/clear_children mutators — so
+    clearing the global max once here keeps it in lockstep without scattering
+    the call. (``cache_invalidate_all`` bypasses this primitive and clears
+    the global cache itself.) Any one parent's change can shift the global
+    max, hence the wholesale clear rather than a per-parent pop.
     """
     state._col_width_cache.pop(parent_id, None)
+    state._col_width_global_cache.clear()
 
 
 def _index_drop_children(state: State, parent_id) -> None:
@@ -546,10 +570,11 @@ def _index_drop_children(state: State, parent_id) -> None:
     for a parent with no cache entry. Doesn't touch ``_loading`` — that
     flag is owned by dispatch / delivery, not by index maintenance.
 
-    Also evicts the parent's ``max_col_width`` entry: this is the single
-    drop/replace choke point, so dropping here covers ``refresh`` / worker
-    delivery (``apply_children_results``) and ``cache_invalidate_subtree``
-    in one place.
+    Also evicts the parent's ``max_col_width`` entry (and, via
+    ``_col_width_drop``, clears the global ``max_col_width_global`` cache —
+    design sec A2): this is the single drop/replace choke point, so dropping
+    here covers ``refresh`` / worker delivery (``apply_children_results``)
+    and ``cache_invalidate_subtree`` in one place.
     """
     _col_width_drop(state, parent_id)
     items = state._children.get(parent_id)
@@ -724,14 +749,16 @@ def cache_invalidate_all(state: State) -> None:
     """Clear the entire children cache and mark the visible-tree dirty.
 
     Also clears the auxiliary indexes (``_items_by_id``,
-    ``_parent_of_id``, ``_loading``) and the per-parent column-width cache
-    (``_col_width_cache``) so they stay in lockstep with ``_children``.
+    ``_parent_of_id``, ``_loading``) and both column-width caches — the
+    per-parent ``_col_width_cache`` and the global ``_col_width_global_cache``
+    (design sec A2) — so they stay in lockstep with ``_children``.
     """
     state._children.clear()
     state._items_by_id.clear()
     state._parent_of_id.clear()
     state._loading.clear()
     state._col_width_cache.clear()
+    state._col_width_global_cache.clear()
     state._visible_dirty = True
 
 
@@ -2951,6 +2978,55 @@ def _normalize_content(content):
     return [(_sanitize_ansi(content), None, False)]
 
 
+def default_row_selection(item, ctx):
+    """The framework's default *selection-marker* segment(s) for a row.
+
+    One segment: ``'* '`` if ``ctx.selected`` else ``'  '``. A meta row
+    (``ctx.kind == 'meta'``) is never selectable, so the marker is forced
+    blank. Returns a single-element list so it concatenates cleanly with the
+    other chrome atoms (design sec A1).
+    """
+    if ctx.kind == 'meta':
+        # Meta rows never select — blank the marker (see default_row_chrome).
+        sel_marker = '  '
+    else:
+        sel_marker = '* ' if ctx.selected else '  '
+    return [(sel_marker, None, False)]
+
+
+def default_row_indent(item, ctx):
+    """The framework's default *indentation* segment(s) for a row.
+
+    One segment: ``'  '`` per tree level (``ctx.depth``, clamped at 0). The
+    indent is retained for meta rows so meta content aligns under normal
+    rows' content. Returns a single-element list so it concatenates cleanly
+    with the other chrome atoms (design sec A1).
+    """
+    rel_depth = ctx.depth
+    if rel_depth < 0:
+        rel_depth = 0
+    return [('  ' * rel_depth, None, False)]
+
+
+def default_row_expander(item, ctx):
+    """The framework's default *expander-glyph* segment(s) for a row.
+
+    One segment: ``'▼ '`` if ``ctx.expanded``, ``'▶ '`` if
+    ``item.has_children`` else ``'  '``. A meta row (``ctx.kind == 'meta'``)
+    is always a leaf, so the glyph is forced blank (even if a recipe left
+    ``has_children=True``). Returns a single-element list so it concatenates
+    cleanly with the other chrome atoms (design sec A1).
+    """
+    if ctx.kind == 'meta':
+        # Meta rows never expand — blank the glyph (see default_row_chrome).
+        expand_marker = '  '
+    elif item.has_children:
+        expand_marker = '▼ ' if ctx.expanded else '▶ '   # ▼ / ▶
+    else:
+        expand_marker = '  '
+    return [(expand_marker, _MARKER_COLOR, False)]
+
+
 def default_row_chrome(item, ctx):
     """The framework's default row *chrome* segments for a normal row.
 
@@ -2962,34 +3038,27 @@ def default_row_chrome(item, ctx):
     unless a recipe overrides ``format_row_chrome``, so overriding only
     ``format_row_content`` keeps the tree intact.
 
+    Composed from three public, individually-callable atoms —
+    :func:`default_row_selection`, :func:`default_row_indent`,
+    :func:`default_row_expander` — so the meta-row blanking rule lives in
+    exactly one place per atom and any of the three row-format hooks can call
+    them. A recipe may override ``format_row_chrome`` to inject fixed columns
+    into the structural prefix (between selection and indent) by composing
+    the atoms, e.g. ``default_row_selection(item, ctx) +
+    my_gutter_segments(item, ctx) + default_row_indent(item, ctx) +
+    default_row_expander(item, ctx)`` — gutter columns then sit left of the
+    tree indent rather than being pushed rightward as depth grows (design
+    sec A1).
+
     A meta row (``ctx.kind == 'meta'``) is never selectable and is always a
     leaf, so its chrome reduces to *aligned indentation*: the selection
     marker and expander are forced blank (even if a recipe left
     ``has_children=True``), keeping the depth indent so meta content lines
     up under normal rows' content (design sec 4).
     """
-    rel_depth = ctx.depth
-    if rel_depth < 0:
-        rel_depth = 0
-    indent = '  ' * rel_depth
-
-    if ctx.kind == 'meta':
-        # Meta rows never select and never expand — blank both markers,
-        # keep only the depth indent so content aligns under normal rows.
-        sel_marker = '  '
-        expand_marker = '  '
-    else:
-        sel_marker = '* ' if ctx.selected else '  '
-        if item.has_children:
-            expand_marker = '▼ ' if ctx.expanded else '▶ '   # ▼ / ▶
-        else:
-            expand_marker = '  '
-
-    return [
-        (sel_marker, None, False),
-        (indent, None, False),
-        (expand_marker, _MARKER_COLOR, False),
-    ]
+    return (default_row_selection(item, ctx)
+            + default_row_indent(item, ctx)
+            + default_row_expander(item, ctx))
 
 
 def default_row_content(item, ctx):

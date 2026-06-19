@@ -95,6 +95,9 @@ KEEP_PARENT = _state.KEEP_PARENT
 RowContext = _render.RowContext
 default_row = _state.default_row
 default_row_chrome = _state.default_row_chrome
+default_row_selection = _state.default_row_selection
+default_row_indent = _state.default_row_indent
+default_row_expander = _state.default_row_expander
 default_row_content = _state.default_row_content
 _segments_cells = _state._segments_cells
 layout_panes = _render.layout_panes
@@ -480,6 +483,129 @@ class TestDefaultMetaRow(unittest.TestCase):
         self.assertIn('[T]', joined)
         self.assertIn('Title', joined)
         self.assertIn('[c]', joined)
+
+
+# --- chrome atoms: selection / indent / expander (design sec A1) ------------
+
+
+class TestDefaultChromeAtoms(unittest.TestCase):
+    """``default_row_chrome`` is the concatenation of three public atoms —
+    ``default_row_selection`` + ``default_row_indent`` +
+    ``default_row_expander`` — and the result is byte-identical to the
+    pre-split single function for both normal and meta rows."""
+
+    def _atoms(self, item, ctx):
+        return (default_row_selection(item, ctx)
+                + default_row_indent(item, ctx)
+                + default_row_expander(item, ctx))
+
+    def test_atoms_compose_to_chrome_normal_row(self):
+        # A selected, expanded parent at depth 2: every atom contributes a
+        # non-blank piece. The concatenation must equal default_row_chrome
+        # segment-for-segment (text + fg + bold), not just the joined text.
+        item = Item(id='x', title='T', has_children=True)
+        ctx = _ctx(item, depth=2, selected=True, expanded=True)
+        self.assertEqual(self._atoms(item, ctx),
+                         default_row_chrome(item, ctx))
+
+    def test_atoms_compose_to_chrome_collapsed_leaf(self):
+        # A plain unselected leaf at depth 0 — every marker blank, indent
+        # empty — still composes identically.
+        item = Item(id='x', title='T')
+        ctx = _ctx(item, depth=0, selected=False, expanded=False)
+        self.assertEqual(self._atoms(item, ctx),
+                         default_row_chrome(item, ctx))
+
+    def test_atoms_compose_to_chrome_meta_row(self):
+        # Meta row with nonsensical selected/expanded/has_children flags: the
+        # atom composition must equal default_row_chrome (the golden), proving
+        # the blanking rule lives in the atoms and composes byte-identically.
+        item = Item(id='sep', title='── Section ──', has_children=True)
+        ctx = _ctx(item, kind='meta', depth=1, selected=True, expanded=True)
+        self.assertEqual(self._atoms(item, ctx),
+                         default_row_chrome(item, ctx))
+
+    def test_each_atom_returns_single_segment_list(self):
+        # Each atom returns a LIST of exactly one (text, fg, bold) segment so
+        # the call sites concatenate uniformly.
+        item = Item(id='x', title='T', has_children=True)
+        ctx = _ctx(item, depth=1, selected=True, expanded=True)
+        for atom in (default_row_selection, default_row_indent,
+                     default_row_expander):
+            segs = atom(item, ctx)
+            self.assertIsInstance(segs, list)
+            self.assertEqual(len(segs), 1)
+            text, fg, bold = segs[0]
+            self.assertIsInstance(text, str)
+            self.assertIsInstance(bold, bool)
+
+    def test_selection_atom_marks_selected_normal_row(self):
+        item = Item(id='x', title='T')
+        sel = _ctx(item, selected=True)
+        unsel = _ctx(item, selected=False)
+        self.assertEqual(default_row_selection(item, sel), [('* ', None, False)])
+        self.assertEqual(default_row_selection(item, unsel),
+                         [('  ', None, False)])
+
+    def test_selection_atom_blanks_on_meta(self):
+        # The meta-row blanking for the selection marker lives in the atom.
+        item = Item(id='sep', title='hdr')
+        ctx = _ctx(item, kind='meta', selected=True)
+        self.assertEqual(default_row_selection(item, ctx),
+                         [('  ', None, False)])
+
+    def test_indent_atom_scales_with_depth_and_survives_meta(self):
+        # Indent is depth*'  ' and is RETAINED on a meta row (only sel/expander
+        # blank) so meta content aligns under normal rows.
+        item = Item(id='x', title='T')
+        self.assertEqual(default_row_indent(item, _ctx(item, depth=0)),
+                         [('', None, False)])
+        self.assertEqual(default_row_indent(item, _ctx(item, depth=3)),
+                         [('      ', None, False)])
+        # depth-2 meta keeps its 4-cell indent.
+        meta = _ctx(item, kind='meta', depth=2)
+        self.assertEqual(default_row_indent(item, meta), [('    ', None, False)])
+
+    def test_indent_atom_clamps_negative_depth(self):
+        item = Item(id='x', title='T')
+        self.assertEqual(default_row_indent(item, _ctx(item, depth=-3)),
+                         [('', None, False)])
+
+    def test_expander_atom_glyph_by_state(self):
+        # ▼ when expanded, ▶ when has_children & collapsed, blank for a leaf —
+        # marker color rides the fg (carried by _MARKER_COLOR).
+        parent = Item(id='p', title='P', has_children=True)
+        leaf = Item(id='l', title='L')
+        mc = _render._MARKER_COLOR
+        self.assertEqual(
+            default_row_expander(parent, _ctx(parent, expanded=True)),
+            [('▼ ', mc, False)])
+        self.assertEqual(
+            default_row_expander(parent, _ctx(parent, expanded=False)),
+            [('▶ ', mc, False)])
+        self.assertEqual(
+            default_row_expander(leaf, _ctx(leaf)),
+            [('  ', mc, False)])
+
+    def test_expander_atom_blanks_on_meta_even_with_children(self):
+        # Meta rows never expand — the glyph blanks even if has_children=True.
+        item = Item(id='sep', title='hdr', has_children=True)
+        ctx = _ctx(item, kind='meta', expanded=True)
+        self.assertEqual(default_row_expander(item, ctx),
+                         [('  ', _render._MARKER_COLOR, False)])
+
+
+class TestChromeAtomsImportable(unittest.TestCase):
+    """All three atoms are exported as module-level names from the state
+    module (which the concatenated build re-exports via
+    ``sys.modules['browse_tui']`` — the end-to-end importability through the
+    real binary is covered by ``test/ui/test_chrome_atom_imports.py``)."""
+
+    def test_atoms_are_module_level_names(self):
+        for name in ('default_row_selection', 'default_row_indent',
+                     'default_row_expander'):
+            self.assertTrue(callable(getattr(_state, name)),
+                            f'{name} must be a module-level callable')
 
 
 class TestComposeRowStrContentProduction(unittest.TestCase):
@@ -875,11 +1001,13 @@ class TestRowContextContentWidth(unittest.TestCase):
 class _StateBrowser:
     """Minimal Browser stand-in wrapping a real ``State``.
 
-    ``RowContext.max_col_width`` reads/fills ``self._browser._state`` —
-    specifically ``_children`` (the sibling list), ``_parent_of_id`` (for
-    ``ctx.parent_id``) and ``_col_width_cache`` (the memo). A real ``State``
-    supplies all three, so the invalidation entry points (``apply_ops`` /
-    ``cache_invalidate_*``) can be exercised against the same object.
+    ``RowContext.max_col_width`` / ``max_col_width_global`` read/fill
+    ``self._browser._state`` — specifically ``_children`` (the sibling
+    lists), ``_parent_of_id`` (for ``ctx.parent_id``) and the two memos
+    ``_col_width_cache`` (per-parent) / ``_col_width_global_cache`` (global).
+    A real ``State`` supplies them all, so the invalidation entry points
+    (``apply_ops`` / ``cache_invalidate_*``) can be exercised against the
+    same object.
     """
 
     def __init__(self, state):
@@ -1201,6 +1329,232 @@ class TestMaxColWidthInvalidation(unittest.TestCase):
         apply_ops(s, [('mod', 'x', 'pb', {})])
         self.assertNotIn('pa', s._col_width_cache)
         self.assertNotIn('pb', s._col_width_cache)
+
+
+class TestMaxColWidthGlobalMeasurement(unittest.TestCase):
+    """``max_col_width_global`` measures the max in DISPLAY CELLS over ALL
+    loaded items — the union of every cached child list (design sec A2)."""
+
+    def _state_multi_parent(self):
+        # Two sibling groups: '/' has widths 3 and 5; 'p2' has width 9.
+        s = State(root_id='/')
+        a = Item(id='a'); a.col = 'abc'          # 3
+        b = Item(id='b'); b.col = 'abcde'        # 5
+        c = Item(id='c'); c.col = 'wiiiiiide'    # 9 (the global widest)
+        s._children = {'/': [a, b], 'p2': [c]}
+        s._parent_of_id = {'a': '/', 'b': '/', 'c': 'p2'}
+        return s, a, b, c
+
+    def test_returns_max_over_all_loaded_items(self):
+        # Not just one sibling group — the global max spans every parent.
+        s, a, *_ = self._state_multi_parent()
+        ctx = _state_ctx(s, a)
+        self.assertEqual(ctx.max_col_width_global('col'), 9)
+
+    def test_flat_list_matches_per_parent_value(self):
+        # A flat list (all rows under one parent) -> the global max equals the
+        # per-parent max for that group.
+        s = State(root_id='/')
+        vals = ['feat: a', 'fix: bug', 'refactor: the whole module']
+        items = []
+        for i, v in enumerate(vals):
+            it = Item(id=f'c{i}'); it.col = v
+            items.append(it)
+            s._parent_of_id[it.id] = '/'
+        s._children['/'] = items
+        ctx = _state_ctx(s, items[0])
+        self.assertEqual(ctx.max_col_width_global('col'),
+                         ctx.max_col_width('col'))
+
+    def test_wide_char_counts_as_two_cells(self):
+        s = State(root_id='/')
+        w = Item(id='w'); w.col = '日本語'        # 3 wide chars -> 6 cells
+        s._children['/'] = [w]
+        s._parent_of_id = {'w': '/'}
+        ctx = _state_ctx(s, w)
+        self.assertEqual(ctx.max_col_width_global('col'), 6)
+
+    def test_missing_field_contributes_zero(self):
+        # No loaded item carries 'ghost' -> every getattr default '' -> max 0.
+        s, a, *_ = self._state_multi_parent()
+        ctx = _state_ctx(s, a)
+        self.assertEqual(ctx.max_col_width_global('ghost'), 0)
+
+    def test_one_missing_field_among_present_does_not_lower_max(self):
+        s, a, b, c = self._state_multi_parent()
+        del c.col                                # c now missing 'col' -> 0
+        ctx = _state_ctx(s, a)
+        # Widest remaining is 'b' (abcde) = 5; the missing one doesn't drag it.
+        self.assertEqual(ctx.max_col_width_global('col'), 5)
+
+    def test_no_loaded_items_is_zero(self):
+        s = State(root_id='/')
+        ctx = _state_ctx(s, Item(id='ph'))
+        self.assertEqual(ctx.max_col_width_global('col'), 0)
+
+    def test_non_string_value_is_stringified(self):
+        s = State(root_id='/')
+        a = Item(id='a'); a.num = 12345          # str -> '12345' -> 5 cells
+        s._children['/'] = [a]
+        s._parent_of_id = {'a': '/'}
+        ctx = _state_ctx(s, a)
+        self.assertEqual(ctx.max_col_width_global('num'), 5)
+
+
+class TestMaxColWidthGlobalCache(unittest.TestCase):
+    """The global result is memoised per ``field`` on
+    ``State._col_width_global_cache``; a hit re-scans nothing."""
+
+    def _state_multi_parent(self):
+        s = State(root_id='/')
+        a = Item(id='a'); a.col = 'abc'
+        b = Item(id='b'); b.col = 'abcde'
+        c = Item(id='c'); c.col = 'wiiiiiide'    # 9
+        s._children = {'/': [a, b], 'p2': [c]}
+        s._parent_of_id = {'a': '/', 'b': '/', 'c': 'p2'}
+        return s, a, b, c
+
+    def test_first_call_fills_cache(self):
+        s, a, *_ = self._state_multi_parent()
+        self.assertEqual(s._col_width_global_cache, {})
+        _state_ctx(s, a).max_col_width_global('col')
+        self.assertEqual(s._col_width_global_cache, {'col': 9})
+
+    def test_second_call_hits_cache_no_rescan(self):
+        # Spy on cell_width: it must NOT be invoked on the cached second call,
+        # proving the hit re-scans nothing (O(1)).
+        s, a, *_ = self._state_multi_parent()
+        ctx = _state_ctx(s, a)
+        calls = {'n': 0}
+        real_cell_width = _render.cell_width
+
+        def counting(s_):
+            calls['n'] += 1
+            return real_cell_width(s_)
+
+        _render.cell_width = counting
+        try:
+            self.assertEqual(ctx.max_col_width_global('col'), 9)
+            after_first = calls['n']
+            self.assertGreater(after_first, 0)   # the fill scanned all items
+            # Second call: cached -> no further cell_width invocations.
+            self.assertEqual(ctx.max_col_width_global('col'), 9)
+            self.assertEqual(calls['n'], after_first)
+        finally:
+            _render.cell_width = real_cell_width
+
+    def test_cached_zero_still_hits_cache(self):
+        # A memoised 0 (missing field) must hit the cache, not re-scan: the
+        # `is not None` check distinguishes "cached 0" from "not computed".
+        s, a, *_ = self._state_multi_parent()
+        ctx = _state_ctx(s, a)
+        calls = {'n': 0}
+        real_cell_width = _render.cell_width
+
+        def counting(s_):
+            calls['n'] += 1
+            return real_cell_width(s_)
+
+        _render.cell_width = counting
+        try:
+            self.assertEqual(ctx.max_col_width_global('ghost'), 0)
+            after_first = calls['n']
+            self.assertEqual(ctx.max_col_width_global('ghost'), 0)
+            self.assertEqual(calls['n'], after_first)
+        finally:
+            _render.cell_width = real_cell_width
+
+    def test_distinct_fields_cached_independently(self):
+        s = State(root_id='/')
+        a = Item(id='a'); a.x = 'ab'; a.y = 'abcd'
+        s._children['/'] = [a]
+        s._parent_of_id = {'a': '/'}
+        ctx = _state_ctx(s, a)
+        self.assertEqual(ctx.max_col_width_global('x'), 2)
+        self.assertEqual(ctx.max_col_width_global('y'), 4)
+        self.assertEqual(s._col_width_global_cache, {'x': 2, 'y': 4})
+
+
+class TestMaxColWidthGlobalInvalidation(unittest.TestCase):
+    """The global cache is cleared wholesale at the per-parent invalidation
+    choke points (``_col_width_drop`` / ``cache_invalidate_all``), since the
+    global max can shift when ANY parent's children change."""
+
+    def _populate(self, root='/'):
+        s = State(root_id=root)
+        a = Item(id='a'); a.col = 'abc'          # 3
+        b = Item(id='b'); b.col = 'abcde'        # widest: 5
+        s._children[root] = [a, b]
+        s._items_by_id = {'a': a, 'b': b}
+        s._parent_of_id = {'a': root, 'b': root}
+        return s, a, b
+
+    def _fill(self, s, item):
+        w = _state_ctx(s, item).max_col_width_global('col')
+        self.assertIn('col', s._col_width_global_cache)
+        return w
+
+    def test_cache_invalidate_subtree_clears_global(self):
+        s, a, _ = self._populate()
+        self._fill(s, a)
+        cache_invalidate_subtree(s, '/')
+        self.assertEqual(s._col_width_global_cache, {})
+
+    def test_cache_invalidate_all_clears_global(self):
+        s, a, _ = self._populate()
+        self._fill(s, a)
+        cache_invalidate_all(s)
+        self.assertEqual(s._col_width_global_cache, {})
+
+    def test_index_drop_children_clears_global(self):
+        # The drop/replace choke point worker delivery (refresh) routes
+        # through -> clears the global cache for free.
+        s, a, _ = self._populate()
+        self._fill(s, a)
+        _index_drop_children(s, '/')
+        self.assertEqual(s._col_width_global_cache, {})
+
+    def test_update_data_upsert_clears_global(self):
+        s, a, _ = self._populate()
+        self._fill(s, a)
+        self.assertEqual(s._col_width_global_cache['col'], 5)
+        # Upsert a NEW, wider sibling under '/'.
+        apply_ops(s, [('upsert', 'c', '/', {'col': 'abcdefghij'})])  # 10
+        self.assertEqual(s._col_width_global_cache, {})
+        # Recompute reflects the new global widest.
+        self.assertEqual(_state_ctx(s, a).max_col_width_global('col'), 10)
+
+    def test_update_data_mod_clears_global(self):
+        s, a, _ = self._populate()
+        self._fill(s, a)
+        apply_ops(s, [('mod', 'a', KEEP_PARENT, {'col': 'XXXXXXXXXXXX'})])  # 12
+        self.assertEqual(s._col_width_global_cache, {})
+        self.assertEqual(_state_ctx(s, a).max_col_width_global('col'), 12)
+
+    def test_change_in_other_parent_invalidates_global(self):
+        # The global cache must drop even when a DIFFERENT parent's children
+        # change — its max spans every group. (A per-parent-only invalidation
+        # of '/' would leave the global stale here.)
+        s, a, b = self._populate()
+        # Add a second parent group, then fill the global cache.
+        c = Item(id='c'); c.col = 'cc'
+        s._children['p2'] = [c]
+        s._items_by_id['c'] = c
+        s._parent_of_id['c'] = 'p2'
+        self._fill(s, a)
+        self.assertEqual(s._col_width_global_cache['col'], 5)
+        # Mutate p2 (not '/') with a value wider than '/'s max.
+        apply_ops(s, [('mod', 'c', KEEP_PARENT, {'col': 'wiiiiiiiiiiide'})])  # 14
+        self.assertEqual(s._col_width_global_cache, {})
+        self.assertEqual(_state_ctx(s, a).max_col_width_global('col'), 14)
+
+    def test_noop_mod_does_not_clear_global(self):
+        # A mod targeting an UNKNOWN id is a silent no-op (not structural), so
+        # neither cache is touched.
+        s, a, _ = self._populate()
+        self._fill(s, a)
+        apply_ops(s, [('mod', 'nonexistent', KEEP_PARENT, {'col': 'z'})])
+        self.assertIn('col', s._col_width_global_cache)
 
 
 class TestDefaultHandlersExportedFromBrowseTui(unittest.TestCase):
