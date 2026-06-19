@@ -1107,6 +1107,7 @@ def main():
         title='browse-ps',
         get_children=get_children,
         get_preview=get_preview,
+        show_children_pane=False,
         actions=[
             Action('k', 'Kill cursor pid (SIGTERM, with confirm)',
                    kill_proc, 'cursor'),
