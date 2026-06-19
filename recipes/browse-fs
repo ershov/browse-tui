@@ -7,6 +7,12 @@ The number keys 1/2/3 pick the display mode — which columns the left gutter
 shows: 1 = name only (empty gutter, like ``ls -1``), 2 = perms · size · date
 (the default), 3 = + user · group (owner / group, resolved via pwd/grp).
 
+The capital keys N/S/T/U sort each directory's children — by name, size,
+date (mtime), or user (resolved owner name). Pressing the active sort key
+reverses its direction; each key remembers its own last direction. ``D``
+toggles whether directories group before files (the default) or sort in-line
+with files by the active key.
+
 A right-click (or the backslash / F1 keys) opens a context menu keyed to the
 cursor row's kind — a directory (run shell here, a ``git`` submenu opening
 browse-git by mode when it is a repo, new file / directory, show full path,
@@ -93,6 +99,25 @@ _MD_EXTS = ('.md', '.MD')
 # ``_set_columns`` (incl. col_user / col_group); the mode only gates which are
 # shown, so switching is a pure re-render — no refetch of the listing needed.
 _DISPLAY_MODE = 2
+
+# Sort mode (capital keys N/S/T/U, htop-style) — orders each directory's
+# children in ``get_children``. ``_FS_SORT_KEY`` is the active field;
+# ``_FS_SORT_DIR`` remembers a direction PER KEY (each key's last
+# ascending/descending choice), so switching back to a key restores how it
+# was last sorted, while pressing the ACTIVE key just reverses it. ``True`` =
+# ascending. The defaults match the spec (name asc, size/mtime desc, user
+# asc); name's ascending default also preserves the historical ordering.
+#   N → name (asc, case-insensitive)   S → size (desc)
+#   T → mtime (desc)                   U → user (asc, by resolved owner name)
+# ``_DIRS_FIRST`` (the ``D`` toggle) groups directories before files (the
+# historical behaviour, default on); off sorts dirs and files together
+# in-line by the active key. Switched by ``_set_sort`` / ``_toggle_dirs_first``
+# (flash + refresh); browse-fs is always a tree, so the sort applies WITHIN
+# each directory's children — never to the stdin-list roots, which stay in
+# verbatim input order (the mode's contract).
+_FS_SORT_KEY = 'name'
+_FS_SORT_DIR = {'name': True, 'size': False, 'mtime': False, 'user': True}
+_DIRS_FIRST = True
 
 # Stdin-list mode (the ``browse-fs -`` argument). ``main()`` reads the
 # newline-separated paths from ``sys.stdin`` once, before the UI starts,
@@ -264,6 +289,77 @@ def _md_launcher_children(path):
     return rows
 
 
+# The per-key sort-value extractor: maps each ``_FS_SORT_KEY`` to a function
+# of the no-follow ``stat`` and entry name producing the comparison value.
+# ``name`` is lower-cased (case-insensitive); the others read straight from
+# the stat. ``user`` resolves the numeric uid through the cached ``_uid_name``
+# so it sorts by the displayed owner name (the same string display mode 3
+# shows), not the raw number.
+_FS_SORT_VALUES = {
+    'name':  lambda st, name: name.lower(),
+    'size':  lambda st, name: st.st_size,
+    'mtime': lambda st, name: st.st_mtime,
+    'user':  lambda st, name: _uid_name(st.st_uid).lower(),
+}
+
+
+class _Rev:
+    """Reverse-ordering wrapper: ``sort`` ascends, this descends a sub-key.
+
+    Wraps the (value, name) tuple so a per-key descending direction reverses
+    BOTH the primary value and the name tie-break, while the dirs-first
+    ``not is_dir`` group term (placed outside it) keeps ascending — so dirs
+    stay grouped first regardless of the active key's direction. Avoids
+    ``reverse=True`` (which would also flip the group term and un-group the
+    listing) and the negate-the-value trick (which doesn't work for the
+    string ``name`` / ``user`` keys)."""
+
+    __slots__ = ('v',)
+
+    def __init__(self, v):
+        self.v = v
+
+    def __lt__(self, other):
+        return other.v < self.v
+
+    def __eq__(self, other):
+        return self.v == other.v
+
+
+def _sort_rows(rows):
+    """Sort ``(dirent, stat)`` pairs in place by the active sort mode.
+
+    The configurable replacement for the old fixed ``(not is_dir,
+    name.lower())`` key. The active key (``_FS_SORT_KEY``) picks the
+    comparison value via ``_FS_SORT_VALUES``; ``_FS_SORT_DIR`` gives its
+    direction (ascending when ``True``). Name is always the final tie-break
+    so the order is stable / deterministic even when the primary values are
+    equal (e.g. several same-size or same-mtime files); a descending
+    direction reverses the tie-break too (via ``_Rev``) so the order stays
+    fully defined.
+
+    When ``_DIRS_FIRST`` is on (the default), directories group before files
+    — each group then internally ordered by the active key; off, directories
+    and files are ordered together in-line by the key. The dirs-first split
+    is a leading ``not is_dir`` term that is NOT reversed by the direction
+    flag (only the active-key value and the name tie-break are), so flipping
+    the direction reorders within each group without un-grouping it.
+    """
+    value = _FS_SORT_VALUES[_FS_SORT_KEY]
+    ascending = _FS_SORT_DIR[_FS_SORT_KEY]
+
+    def key(row):
+        d, st = row
+        primary = (value(st, d.name), d.name.lower())
+        if not ascending:
+            primary = _Rev(primary)
+        if _DIRS_FIRST:
+            return (not stat.S_ISDIR(st.st_mode), primary)
+        return (primary,)
+
+    rows.sort(key=key)
+
+
 def get_children(path, *, reload=False):
     # Root level in stdin-list mode (``browse-fs -``): serve the paths
     # read from stdin verbatim, in order, instead of scanning a dir.
@@ -283,13 +379,20 @@ def get_children(path, *, reload=False):
     except OSError as e:
         return [Item(id=('err', path), title=f'[error] {e}',
                      tag='err', tag_style='red')]
-    entries.sort(key=lambda d: (not _is_dir(d), d.name.lower()))
-    items = []
+    # Stat every entry first (an unstattable entry is dropped, as before),
+    # then sort the (dirent, stat) pairs by the active mode — the sort keys
+    # (size / mtime / user) come from the same no-follow stat the columns do,
+    # so they need the stat already taken.
+    rows = []
     for d in entries:
         try:
             st = d.stat(follow_symlinks=False)
         except OSError:
             continue
+        rows.append((d, st))
+    _sort_rows(rows)
+    items = []
+    for d, st in rows:
         is_dir = stat.S_ISDIR(st.st_mode)
         title = d.name + ('/' if is_dir else '')
         item = Item(id=d.path, title=title,
@@ -353,12 +456,13 @@ def fs_chrome(item, ctx):
 
 
 def _dir_listing(path):
-    """Plain-text directory listing matching the children view ordering.
+    """Plain-text directory listing for the preview pane.
 
-    Directories first, then files, sorted case-insensitively by name
-    (the same ``(not _is_dir, name.lower())`` key ``get_children`` uses),
-    with a ``/`` suffix on directory names. Capped at ~200 entries. This
-    is just the preview pane — no perms/size/mtime columns.
+    Directories first, then files, sorted case-insensitively by name — a
+    fixed ordering, independent of the list's active sort mode (the preview
+    is a quick at-a-glance listing, not the columnar children view), with a
+    ``/`` suffix on directory names. Capped at ~200 entries. No
+    perms/size/mtime columns.
     """
     entries = sorted(os.scandir(path),
                      key=lambda d: (not _is_dir(d), d.name.lower()))
@@ -423,6 +527,45 @@ def _set_display_mode(ctx, mode):
     global _DISPLAY_MODE
     _DISPLAY_MODE = mode
     ctx.flash(f'display: {_MODE_LABELS[mode]}')
+    ctx.refresh()
+
+
+# Human-readable name for each sort key, used in the switch flash.
+_SORT_LABELS = {
+    'name': 'name',
+    'size': 'size',
+    'mtime': 'date',
+    'user': 'user',
+}
+
+
+def _set_sort(ctx, key):
+    """Activate sort ``key`` (one of name/size/mtime/user), flash, and refresh.
+
+    Pressing the ACTIVE key reverses its direction; switching to a different
+    key adopts that key's REMEMBERED direction (``_FS_SORT_DIR``) — so each
+    key keeps its own last ascending/descending choice. The sort happens in
+    ``get_children`` (``_sort_rows``), so a ``ctx.refresh()`` re-lists every
+    cached directory at the new order.
+    """
+    global _FS_SORT_KEY
+    if key == _FS_SORT_KEY:
+        _FS_SORT_DIR[key] = not _FS_SORT_DIR[key]
+    _FS_SORT_KEY = key
+    arrow = '↑' if _FS_SORT_DIR[key] else '↓'
+    ctx.flash(f'sort: {_SORT_LABELS[key]} {arrow}')
+    ctx.refresh()
+
+
+def _toggle_dirs_first(ctx):
+    """Toggle directories-first vs. directories in-line with files; flash + refresh.
+
+    On (the default) groups directories before files, each group sorted by the
+    active key; off sorts directories and files together in-line by the key.
+    """
+    global _DIRS_FIRST
+    _DIRS_FIRST = not _DIRS_FIRST
+    ctx.flash(f'dirs first: {"on" if _DIRS_FIRST else "off"}')
     ctx.refresh()
 
 
@@ -985,6 +1128,11 @@ The number keys 1/2/3 select the display mode (which columns the left
 gutter shows): 1 = name only (empty gutter, like 'ls -1'), 2 = perms,
 size, date (the default), 3 = + user and group (owner / group names).
 
+The capital keys N/S/T/U sort each directory's children by name, size,
+date, or user (resolved owner name); pressing the active sort key reverses
+it, and each key remembers its own direction. 'D' toggles whether
+directories group before files (the default) or sort in-line with them.
+
 A markdown file (*.md / *.MD) gets an expansion arrow: open it to list
 '[md ↗]' launcher rows — the document itself and the .md files it links
 to — and press Enter on one to open that file in browse-md.
@@ -1067,6 +1215,13 @@ def main():
         Action('1', 'Display: name only',         lambda c: _set_display_mode(c, 1), 'none'),
         Action('2', 'Display: perms/size/date',   lambda c: _set_display_mode(c, 2), 'none'),
         Action('3', 'Display: + user/group',      lambda c: _set_display_mode(c, 3), 'none'),
+        # Sort modes (capitals) — reorder each directory's children. Pressing
+        # the active key reverses it; ``D`` toggles directories-first.
+        Action('N', 'Sort by name',  lambda c: _set_sort(c, 'name'),  'none'),
+        Action('S', 'Sort by size',  lambda c: _set_sort(c, 'size'),  'none'),
+        Action('T', 'Sort by date',  lambda c: _set_sort(c, 'mtime'), 'none'),
+        Action('U', 'Sort by user',  lambda c: _set_sort(c, 'user'),  'none'),
+        Action('D', 'Toggle directories-first', _toggle_dirs_first,   'none'),
     ]
     if _md2ansi_fn is not None:
         actions.append(Action('m', 'Toggle markdown coloring', toggle_md, 'none'))

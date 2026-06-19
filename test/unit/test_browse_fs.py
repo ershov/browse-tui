@@ -1222,5 +1222,283 @@ class TestDisplayModes(unittest.TestCase):
         self.assertEqual(fresh._DISPLAY_MODE, 2)
 
 
+class _FakeDirEntry:
+    """A minimal ``os.DirEntry`` stand-in: name + path, used to drive
+    ``_sort_rows`` (which reads only ``.name`` and ``.path``)."""
+
+    def __init__(self, name):
+        self.name = name
+        self.path = '/d/' + name
+
+
+def _row(name, *, is_dir=False, size=0, mtime=0.0, uid=0):
+    """Build a ``(dirent, stat)`` row for ``_sort_rows``.
+
+    The fake stat carries only the fields the sort keys read — mode (for the
+    dirs-first split), size, mtime, and uid (the user key resolves it via
+    ``_uid_name``)."""
+    mode = (stat.S_IFDIR if is_dir else stat.S_IFREG) | 0o644
+    st = types.SimpleNamespace(st_mode=mode, st_size=size, st_mtime=mtime,
+                              st_uid=uid)
+    return (_FakeDirEntry(name), st)
+
+
+class TestSortModes(unittest.TestCase):
+    """Sort modes (capital keys N/S/T/U + D toggle) order each directory's
+    children in ``get_children`` (ticket #1116).
+
+    ``_FS_SORT_KEY`` / ``_FS_SORT_DIR`` / ``_DIRS_FIRST`` drive ``_sort_rows``;
+    the action handlers (``_set_sort`` / ``_toggle_dirs_first``) mutate that
+    state, flash, and refresh. Tests drive the globals directly and restore
+    them via ``addCleanup`` (they are module globals)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def setUp(self):
+        r = self.r
+        self._saved = (r._FS_SORT_KEY, dict(r._FS_SORT_DIR), r._DIRS_FIRST)
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        r = self.r
+        key, dirmap, dirs_first = self._saved
+        r._FS_SORT_KEY = key
+        r._FS_SORT_DIR.clear()
+        r._FS_SORT_DIR.update(dirmap)
+        r._DIRS_FIRST = dirs_first
+
+    def _names(self, rows):
+        return [d.name for d, _st in rows]
+
+    def _sorted(self, rows):
+        """Return the names after ``_sort_rows`` (which sorts in place)."""
+        rows = list(rows)
+        self.r._sort_rows(rows)
+        return self._names(rows)
+
+    # -- defaults ----------------------------------------------------------
+
+    def test_defaults(self):
+        # Fresh: sort by name ascending, directories first.
+        fresh = _load_recipe()
+        self.assertEqual(fresh._FS_SORT_KEY, 'name')
+        self.assertTrue(fresh._FS_SORT_DIR['name'])
+        self.assertFalse(fresh._FS_SORT_DIR['size'])
+        self.assertFalse(fresh._FS_SORT_DIR['mtime'])
+        self.assertTrue(fresh._FS_SORT_DIR['user'])
+        self.assertTrue(fresh._DIRS_FIRST)
+
+    # -- each key orders correctly -----------------------------------------
+
+    def _mixed(self):
+        # Two dirs + three files with distinct names/sizes/mtimes/uids.
+        return [
+            _row('Bravo', is_dir=True,  size=0,    mtime=300.0, uid=10),
+            _row('alpha', is_dir=True,  size=0,    mtime=100.0, uid=30),
+            _row('big.txt',   size=900, mtime=200.0, uid=20),
+            _row('mid.txt',   size=500, mtime=400.0, uid=10),
+            _row('small.txt', size=100, mtime=150.0, uid=30),
+        ]
+
+    def test_name_ascending_default_case_insensitive(self):
+        # Default state: dirs first (alpha < Bravo, case-insensitive), then
+        # files by name asc.
+        self.assertEqual(
+            self._sorted(self._mixed()),
+            ['alpha', 'Bravo', 'big.txt', 'mid.txt', 'small.txt'])
+
+    def test_size_descending(self):
+        # Size key, default direction descending: files big>mid>small. Dirs
+        # first (size 0, tied) → name tie-break, which follows the primary
+        # direction (descending) so the dirs list Bravo before alpha.
+        self.r._FS_SORT_KEY = 'size'
+        self.r._FS_SORT_DIR['size'] = False
+        self.assertEqual(
+            self._sorted(self._mixed()),
+            ['Bravo', 'alpha', 'big.txt', 'mid.txt', 'small.txt'])
+
+    def test_mtime_descending(self):
+        # mtime desc: files newest-first (mid 400 > big 200 > small 150);
+        # dirs first, ordered among themselves by mtime desc (Bravo 300 >
+        # alpha 100).
+        self.r._FS_SORT_KEY = 'mtime'
+        self.r._FS_SORT_DIR['mtime'] = False
+        self.assertEqual(
+            self._sorted(self._mixed()),
+            ['Bravo', 'alpha', 'mid.txt', 'big.txt', 'small.txt'])
+
+    def test_user_ascending_by_resolved_name(self):
+        # User key sorts by the RESOLVED owner name (not the raw uid). Map
+        # the uids to names whose alpha order differs from the numeric order
+        # to prove the resolution path is used.
+        self.r._FS_SORT_KEY = 'user'
+        self.r._FS_SORT_DIR['user'] = True
+        names = {10: 'carol', 20: 'alice', 30: 'bob'}
+        with mock.patch.object(self.r, '_uid_name', side_effect=lambda u: names[u]):
+            ordered = self._sorted(self._mixed())
+        # Dirs first by user asc: alpha(uid30→bob) vs Bravo(uid10→carol) →
+        # bob < carol → alpha, Bravo. Files by user asc:
+        # big(alice) < small(bob) < mid(carol).
+        self.assertEqual(
+            ordered, ['alpha', 'Bravo', 'big.txt', 'small.txt', 'mid.txt'])
+
+    # -- reverse-on-repeat / remembered direction --------------------------
+
+    def test_name_reverses_within_groups_keeping_dirs_first(self):
+        # Name descending: dirs stay first but reversed among themselves
+        # (Bravo > alpha), files reversed too.
+        self.r._FS_SORT_KEY = 'name'
+        self.r._FS_SORT_DIR['name'] = False
+        self.assertEqual(
+            self._sorted(self._mixed()),
+            ['Bravo', 'alpha', 'small.txt', 'mid.txt', 'big.txt'])
+
+    def test_size_ascending_when_reversed(self):
+        self.r._FS_SORT_KEY = 'size'
+        self.r._FS_SORT_DIR['size'] = True   # ascending
+        self.assertEqual(
+            self._sorted(self._mixed()),
+            ['alpha', 'Bravo', 'small.txt', 'mid.txt', 'big.txt'])
+
+    # -- the D toggle: dirs-first vs in-line -------------------------------
+
+    def test_dirs_inline_sorts_dirs_and_files_together(self):
+        # With _DIRS_FIRST off, dirs and files interleave by the active key.
+        # Name asc, all together: alpha, big.txt, Bravo, mid.txt, small.txt.
+        self.r._DIRS_FIRST = False
+        self.r._FS_SORT_KEY = 'name'
+        self.r._FS_SORT_DIR['name'] = True
+        self.assertEqual(
+            self._sorted(self._mixed()),
+            ['alpha', 'big.txt', 'Bravo', 'mid.txt', 'small.txt'])
+
+    def test_dirs_inline_by_size_desc(self):
+        # In-line + size desc: dirs (size 0) sink below the files; ties among
+        # the dirs broken by name, which follows the descending direction
+        # (Bravo before alpha). big(900) > mid(500) > small(100) > [dirs].
+        self.r._DIRS_FIRST = False
+        self.r._FS_SORT_KEY = 'size'
+        self.r._FS_SORT_DIR['size'] = False
+        self.assertEqual(
+            self._sorted(self._mixed()),
+            ['big.txt', 'mid.txt', 'small.txt', 'Bravo', 'alpha'])
+
+    # -- tie-break stability -----------------------------------------------
+
+    def test_equal_primary_values_tie_break_by_name(self):
+        # Several same-size files sort by name (asc) as the tie-break, even
+        # when the primary key is size; reversing the size direction reverses
+        # the tie-break too (descending name) so the order is fully defined.
+        rows = [_row('c.txt', size=10), _row('a.txt', size=10),
+                _row('b.txt', size=10)]
+        self.r._FS_SORT_KEY = 'size'
+        self.r._FS_SORT_DIR['size'] = True            # asc
+        self.assertEqual(self._sorted(rows), ['a.txt', 'b.txt', 'c.txt'])
+        self.r._FS_SORT_DIR['size'] = False           # desc → name desc too
+        self.assertEqual(self._sorted(rows), ['c.txt', 'b.txt', 'a.txt'])
+
+    # -- the action handlers (state + flash + refresh) ---------------------
+
+    def test_set_sort_switch_uses_remembered_direction(self):
+        # Start on name; switching to size adopts size's REMEMBERED direction
+        # (not name's) — the key is activated without flipping it.
+        self.r._FS_SORT_KEY = 'name'
+        self.r._FS_SORT_DIR.update({'name': True, 'size': False})
+        ctx = _ModeCtx()
+        self.r._set_sort(ctx, 'size')
+        self.assertEqual(self.r._FS_SORT_KEY, 'size')
+        self.assertFalse(self.r._FS_SORT_DIR['size'])   # unchanged (remembered)
+        self.assertTrue(self.r._FS_SORT_DIR['name'])    # untouched
+        self.assertEqual(ctx.refreshed, 1)
+        self.assertEqual(len(ctx.flashes), 1)
+        self.assertIn('size', ctx.flashes[0])
+
+    def test_set_sort_active_key_reverses(self):
+        # Pressing the ACTIVE key flips just that key's direction.
+        self.r._FS_SORT_KEY = 'size'
+        self.r._FS_SORT_DIR['size'] = False
+        ctx = _ModeCtx()
+        self.r._set_sort(ctx, 'size')
+        self.assertEqual(self.r._FS_SORT_KEY, 'size')
+        self.assertTrue(self.r._FS_SORT_DIR['size'])    # reversed
+        # Press again → flips back.
+        self.r._set_sort(_ModeCtx(), 'size')
+        self.assertFalse(self.r._FS_SORT_DIR['size'])
+
+    def test_switch_back_restores_each_keys_own_direction(self):
+        # name asc, size reversed to asc (by pressing it twice), then back to
+        # name → name still asc; size remembered as asc.
+        self.r._FS_SORT_KEY = 'name'
+        self.r._FS_SORT_DIR.update({'name': True, 'size': False})
+        self.r._set_sort(_ModeCtx(), 'size')   # active→size, dir flipped? no, switch
+        # switching to size does NOT flip (remembered desc)
+        self.assertFalse(self.r._FS_SORT_DIR['size'])
+        self.r._set_sort(_ModeCtx(), 'size')   # now active → reverse to asc
+        self.assertTrue(self.r._FS_SORT_DIR['size'])
+        self.r._set_sort(_ModeCtx(), 'name')   # switch back to name
+        self.assertEqual(self.r._FS_SORT_KEY, 'name')
+        self.assertTrue(self.r._FS_SORT_DIR['name'])    # name's own dir intact
+        self.r._set_sort(_ModeCtx(), 'size')   # switch to size again
+        self.assertTrue(self.r._FS_SORT_DIR['size'])    # size remembered asc
+
+    def test_toggle_dirs_first_flips_flashes_and_refreshes(self):
+        self.r._DIRS_FIRST = True
+        ctx = _ModeCtx()
+        self.r._toggle_dirs_first(ctx)
+        self.assertFalse(self.r._DIRS_FIRST)
+        self.assertEqual(ctx.refreshed, 1)
+        self.assertEqual(len(ctx.flashes), 1)
+        self.assertIn('off', ctx.flashes[0])
+        ctx2 = _ModeCtx()
+        self.r._toggle_dirs_first(ctx2)
+        self.assertTrue(self.r._DIRS_FIRST)
+        self.assertIn('on', ctx2.flashes[0])
+
+    # -- integration: get_children honours the active sort -----------------
+
+    def test_get_children_applies_active_sort(self):
+        # Drive get_children on a real fixture dir with distinct sizes, and
+        # confirm size-desc reorders the listing (dirs first).
+        with tempfile.TemporaryDirectory() as d:
+            os.mkdir(os.path.join(d, 'zdir'))
+            for name, body in (('big.txt', b'x' * 100),
+                               ('small.txt', b'x'),
+                               ('mid.txt', b'x' * 50)):
+                with open(os.path.join(d, name), 'wb') as f:
+                    f.write(body)
+            self.r._FS_SORT_KEY = 'size'
+            self.r._FS_SORT_DIR['size'] = False   # descending
+            names = [os.path.basename(it.id) for it in self.r.get_children(d)]
+        # Dir first, then files by size desc.
+        self.assertEqual(names, ['zdir', 'big.txt', 'mid.txt', 'small.txt'])
+
+    def test_stdin_roots_are_never_sorted(self):
+        # The stdin-list mode returns the piped paths in INPUT order — the
+        # configurable sort must NOT touch them, even when an aggressive sort
+        # mode is active. (The mode's contract is verbatim input order.)
+        with tempfile.TemporaryDirectory() as d:
+            for name in ('zzz.txt', 'aaa.txt', 'mmm.txt'):
+                with open(os.path.join(d, name), 'w') as f:
+                    f.write('x')
+            cwd = os.getcwd()
+            os.chdir(d)
+            try:
+                self.r._STDIN_ROOTS = [
+                    ('zzz.txt', os.path.join(d, 'zzz.txt')),
+                    ('aaa.txt', os.path.join(d, 'aaa.txt')),
+                    ('mmm.txt', os.path.join(d, 'mmm.txt')),
+                ]
+                self.addCleanup(setattr, self.r, '_STDIN_ROOTS', None)
+                self.r._FS_SORT_KEY = 'name'
+                self.r._FS_SORT_DIR['name'] = True   # name asc — would reorder
+                titles = [it.title for it in self.r.get_children(None)]
+            finally:
+                os.chdir(cwd)
+        # Verbatim input order, NOT sorted (which would be aaa, mmm, zzz).
+        self.assertEqual(titles, ['zzz.txt', 'aaa.txt', 'mmm.txt'])
+
+
 if __name__ == '__main__':
     unittest.main()
