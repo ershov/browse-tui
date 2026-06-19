@@ -773,7 +773,7 @@ class TestPreviewAPIRegistrationPrerequisite(unittest.TestCase):
         # request_preview, which should still run (it's the recipe's
         # responsibility to either tolerate that no-op or pre-register
         # the Item via upsert).
-        b.request_preview = lambda id_: None
+        b.request_preview = lambda id_, immediate=False: None
         # Should not raise; should not create an Item.
         b.invalidate_preview('ghost')
         b.drain_main_queue()

@@ -3898,6 +3898,15 @@ class Browser:
         # only). Single-attribute reads/writes are GIL-safe; no lock
         # needed for this slot. ``_preview_event`` is the wake signal.
         self._preview_req = None
+        # Companion bit to ``_preview_req``: when True the worker skips
+        # the debounce sleep for the pending request. Set by
+        # invalidation-driven refetches (``_kick_after_invalidate``),
+        # which refresh the row the cursor is already on — there is no
+        # cursor settling to coalesce, so waiting only delays the swap
+        # (e.g. preview-width resize flicker). Cursor-move requests
+        # leave it False. Same lock-free single-writer discipline as
+        # ``_preview_req``; a torn read only adds/skips one sleep window.
+        self._preview_immediate = False
         self._preview_event = threading.Event()
         # Debounce: seconds of cursor quiet before the worker fetches
         # (0 disables). The worker sleeps after adopting a request and
@@ -7075,13 +7084,17 @@ class Browser:
           2. Otherwise adopt the new id and clear the event (arming
              "next request landed during fetch").
           3. Debounce (preview-flicker design §A): if
-             ``preview_debounce`` > 0, sleep it out, then re-check
-             ``_stop`` (exit) and re-read the slot. A changed slot
-             drops the ``local_id`` memo (nothing was fetched) and
-             restarts at step 1, so rapid cursor movement coalesces
-             into one fetch for the row the cursor settles on. An
-             unchanged slot — including a move-away-and-back within
-             the window — falls through.
+             ``preview_debounce`` > 0 and the request was not flagged
+             ``immediate``, sleep it out, then re-check ``_stop``
+             (exit) and re-read the slot. A changed slot drops the
+             ``local_id`` memo (nothing was fetched) and restarts at
+             step 1, so rapid cursor movement coalesces into one fetch
+             for the row the cursor settles on. An unchanged slot —
+             including a move-away-and-back within the window — falls
+             through. ``immediate`` requests (set by
+             ``_kick_after_invalidate`` — invalidation refetches of the
+             current row) skip the sleep: there is no cursor settling
+             to coalesce, so waiting would only delay the swap.
           4. Cache hit → settle nudge (#954). Every cursor move routes
              through the worker (``_update_preview_for_cursor`` no
              longer skips cached ids), so a settled id whose
@@ -7140,6 +7153,10 @@ class Browser:
                 continue
             # New work — different id (or first iteration after wake).
             local_id = req
+            # Capture the immediate bit for the adopted request before
+            # clearing the event (a racing request_preview may rewrite
+            # both fields; we want the value that paired with ``req``).
+            immediate = self._preview_immediate
             # Arm "next request during fetch": if request_preview fires
             # while get_preview is running, the event will be set and
             # the next iteration's read will see the new id.
@@ -7148,7 +7165,9 @@ class Browser:
             # fetch. A newer id in the slot restarts the wait at the
             # loop top; the slot landing back on ``req`` (move away
             # and back) falls through — the fetch is still wanted.
-            if self._preview_debounce > 0:
+            # Skipped for ``immediate`` requests (invalidation refetches
+            # of the current row — no cursor settling to coalesce).
+            if self._preview_debounce > 0 and not immediate:
                 time.sleep(self._preview_debounce)
                 if self._stop:
                     break
@@ -7249,7 +7268,9 @@ class Browser:
                 # Python semantics; belt-and-braces against a recipe
                 # ``finally:`` that re-raises.
                 pass
-        self.request_preview(id_)
+        # Invalidation refetch: the cursor has not moved, so debouncing
+        # would only delay the swap (resize flicker). Fetch at once.
+        self.request_preview(id_, immediate=True)
 
     def _post_clear_abandoned_preview(self, item_id):
         """Post a main-thread cache-clear for an abandoned streaming preview (#456).
@@ -7571,11 +7592,20 @@ class Browser:
 
     # ---- internal: preview request slot ---------------------------------
 
-    def request_preview(self, id_: Any) -> None:
+    def request_preview(self, id_: Any, immediate: bool = False) -> None:
         """Set the latest-wins preview request slot.
 
         Called on the main thread (typically by cursor-move handlers in
         ticket #8). Idempotent for the same id.
+
+        ``immediate=True`` tells the worker to skip the debounce sleep
+        for this request — used by invalidation-driven refetches
+        (``_kick_after_invalidate``) where the cursor has not moved and
+        the only goal is to refresh the current row's content/geometry
+        (e.g. a preview-width resize). Cursor-move callers leave it
+        False so rapid navigation still coalesces. The flag rides
+        alongside the latest-wins slot, so a later request overwrites
+        it — whatever landed last wins, matching the id slot.
 
         Also wakes any paused preview generator so it can observe the
         new request and abandon (closing the generator, which fires the
@@ -7584,6 +7614,7 @@ class Browser:
         ``_preview_resume_event`` is purely a wake mechanism for the
         in-pause wait — see ``_preview_worker``.
         """
+        self._preview_immediate = immediate
         self._preview_req = id_
         self._preview_event.set()
         self._preview_resume_event.set()
@@ -8467,10 +8498,24 @@ class Browser:
             # re-fire request_preview — otherwise the renderer would
             # paint blank until the user navigates away and back.
             # See #442 "stuck blank" repro.
+            #
+            # ``immediate`` rides the per-visit delivery bit:
+            #   * delivered → the preview was already shown for this
+            #     visit and an invalidation nulled it (resize /
+            #     drop_preview_cache / clear_preview). No cursor settling
+            #     to coalesce, so refresh at once — and preserve the flag
+            #     a same-tick ``_kick_after_invalidate`` set (drain →
+            #     here, same iteration), or the resize flicker returns.
+            #   * not delivered → the first fetch is still in flight from
+            #     the cursor move; this re-derive runs every iteration,
+            #     so an async wake (e.g. browse-git posting a git result)
+            #     must NOT flip it to immediate and defeat the cursor-move
+            #     debounce.
             if new_id is not None:
                 item = state._items_by_id.get(new_id)
                 if item is not None and item.preview is None:
-                    self.request_preview(new_id)
+                    self.request_preview(
+                        new_id, immediate=self._preview_visit_delivered)
             return
 
         self._preview_cursor_id = new_id

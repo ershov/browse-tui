@@ -119,6 +119,128 @@ class TestPreviewDebounceCoalescing(unittest.TestCase):
             b.stop_workers()
 
 
+class TestPreviewImmediateBypass(unittest.TestCase):
+    """``immediate=True`` requests skip the debounce sleep.
+
+    The debounce coalesces cursor movement; an invalidation-driven
+    refetch (same view, changed content/geometry — e.g. a preview-width
+    resize) has no cursor settling to wait for, so it must fetch at once
+    instead of lingering on the stale-width preview for a window.
+    """
+
+    def test_immediate_request_skips_debounce(self):
+        calls = []
+
+        def get_preview(id_):
+            calls.append(id_)
+            return f'p-{id_}'
+
+        # Generous window — a debounced fetch would take >= 0.3s.
+        b = make_browser(get_preview=get_preview, preview_debounce=0.3)
+        try:
+            b._state._items_by_id['A'] = Item(id='A')
+            t0 = time.monotonic()
+            b.request_preview('A', immediate=True)
+            b.run_until_idle()
+            self.assertLess(time.monotonic() - t0, 0.1)
+            self.assertEqual(calls, ['A'])
+            self.assertEqual(get_preview_text(b, 'A'), 'p-A')
+        finally:
+            b.stop_workers()
+
+    def test_kick_after_invalidate_is_immediate(self):
+        calls = []
+
+        def get_preview(id_):
+            calls.append(id_)
+            return f'p-{id_}'
+
+        # The invalidate/drop_preview_cache path resolves through
+        # ``_kick_after_invalidate`` — it must not pay the debounce.
+        b = make_browser(get_preview=get_preview, preview_debounce=0.3)
+        try:
+            b._state._items_by_id['A'] = Item(id='A')
+            t0 = time.monotonic()
+            b._kick_after_invalidate('A')
+            b.run_until_idle()
+            self.assertLess(time.monotonic() - t0, 0.1)
+            self.assertEqual(calls, ['A'])
+            self.assertEqual(get_preview_text(b, 'A'), 'p-A')
+        finally:
+            b.stop_workers()
+
+    def test_same_cursor_recovery_after_delivery_is_immediate(self):
+        """Recovery of an already-shown preview re-fires ``immediate``.
+
+        The run loop re-derives the cursor preview every iteration via
+        ``_update_preview_for_cursor``. When an invalidation dropped the
+        current row's cache (``item.preview is None``) and the cursor
+        has not moved AFTER its preview was already delivered
+        (``_preview_visit_delivered``), that re-fire is an invalidation
+        recovery — it must be immediate so the resize refetch doesn't
+        debounce (flicker). Mirrors the run-loop order: drain (kick)
+        then _update_preview_for_cursor.
+        """
+        b = make_browser(get_preview=lambda id_: f'p-{id_}',
+                         preview_debounce=0.3)
+        try:
+            items = _seed_items(b, ['A'])
+            b._state.cursor = 0
+            b._preview_cursor_id = 'A'
+            b._preview_visit_delivered = True   # A's preview was shown
+            items['A'].preview = None           # cache just dropped (resize)
+            b.request_preview('A', immediate=True)   # _kick_after_invalidate
+            b._update_preview_for_cursor()           # same-tick re-derive
+            self.assertTrue(
+                b._preview_immediate,
+                'recovery of a shown preview must keep the immediate flag',
+            )
+        finally:
+            b.stop_workers()
+
+    def test_recovery_during_inflight_first_fetch_stays_debounced(self):
+        """In-flight first-fetch re-derive must NOT flip to immediate.
+
+        Cursor just moved to an uncached row: the bottom path requested
+        a debounced fetch and nothing has been delivered yet
+        (``_preview_visit_delivered`` False). An async wake (common in
+        browse-git: git subprocess results post + wake) re-enters the
+        loop and runs ``_update_preview_for_cursor`` while the cache is
+        still None. That re-derive must stay debounced — otherwise every
+        async wake during navigation defeats cursor-move coalescing.
+        """
+        b = make_browser(get_preview=lambda id_: f'p-{id_}',
+                         preview_debounce=0.3)
+        try:
+            items = _seed_items(b, ['A'])
+            b._state.cursor = 0
+            b._preview_cursor_id = 'A'
+            b._preview_visit_delivered = False  # first fetch still in flight
+            items['A'].preview = None
+            b.request_preview('A')              # cursor-move (debounced)
+            b._update_preview_for_cursor()      # async-wake re-derive
+            self.assertFalse(
+                b._preview_immediate,
+                'in-flight recovery must stay debounced',
+            )
+        finally:
+            b.stop_workers()
+
+    def test_default_request_still_debounces(self):
+        """A plain (cursor-move) request keeps the debounce wait."""
+        b = make_browser(get_preview=lambda id_: f'p-{id_}',
+                         preview_debounce=DEBOUNCE)
+        try:
+            b._state._items_by_id['A'] = Item(id='A')
+            t0 = time.monotonic()
+            b.request_preview('A')
+            b.run_until_idle()
+            self.assertGreaterEqual(time.monotonic() - t0, 0.14)
+            self.assertEqual(get_preview_text(b, 'A'), 'p-A')
+        finally:
+            b.stop_workers()
+
+
 class TestPreviewDebounceZeroAndIdle(unittest.TestCase):
     """Disable knob, run_until_idle interaction, shutdown mid-sleep."""
 

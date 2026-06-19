@@ -102,7 +102,7 @@ class TestDropPreviewCache(unittest.TestCase):
         _seed(b, 'cur', 'stale')
 
         kicked = []
-        b.request_preview = lambda id_: kicked.append(id_)
+        b.request_preview = lambda id_, immediate=False: kicked.append(id_)
 
         b.drop_preview_cache('cur')
         _drain(b)
@@ -114,7 +114,7 @@ class TestDropPreviewCache(unittest.TestCase):
         _seed(b, 'other', 'stale')
 
         kicked = []
-        b.request_preview = lambda id_: kicked.append(id_)
+        b.request_preview = lambda id_, immediate=False: kicked.append(id_)
 
         b.drop_preview_cache('other')
         _drain(b)
@@ -127,7 +127,7 @@ class TestDropPreviewCache(unittest.TestCase):
         _seed(b, 'other', 'B')
 
         kicked = []
-        b.request_preview = lambda id_: kicked.append(id_)
+        b.request_preview = lambda id_, immediate=False: kicked.append(id_)
 
         b.drop_preview_cache()
         _drain(b)
@@ -178,7 +178,7 @@ class TestBatchedPreviewOpsKickWorker(unittest.TestCase):
         b = Browser(BrowserConfig(_headless=True))
         _seed(b, 'x', 'old')
         kicked = []
-        b.request_preview = lambda id_: kicked.append(id_)
+        b.request_preview = lambda id_, immediate=False: kicked.append(id_)
 
         b.update_data([invalidate_preview_op('x')])
         _drain(b)
@@ -189,7 +189,7 @@ class TestBatchedPreviewOpsKickWorker(unittest.TestCase):
         # when the id is unregistered.
         b = Browser(BrowserConfig(_headless=True))
         kicked = []
-        b.request_preview = lambda id_: kicked.append(id_)
+        b.request_preview = lambda id_, immediate=False: kicked.append(id_)
 
         b.update_data([invalidate_preview_op('ghost')])
         _drain(b)
@@ -200,7 +200,7 @@ class TestBatchedPreviewOpsKickWorker(unittest.TestCase):
         b._preview_cursor_id = 'cur'
         _seed(b, 'cur', 'stale')
         kicked = []
-        b.request_preview = lambda id_: kicked.append(id_)
+        b.request_preview = lambda id_, immediate=False: kicked.append(id_)
 
         b.update_data([drop_preview_cache_op('cur')])
         _drain(b)
@@ -211,7 +211,7 @@ class TestBatchedPreviewOpsKickWorker(unittest.TestCase):
         b._preview_cursor_id = 'cur'
         _seed(b, 'other', 'stale')
         kicked = []
-        b.request_preview = lambda id_: kicked.append(id_)
+        b.request_preview = lambda id_, immediate=False: kicked.append(id_)
 
         b.update_data([drop_preview_cache_op('other')])
         _drain(b)
@@ -223,7 +223,7 @@ class TestBatchedPreviewOpsKickWorker(unittest.TestCase):
         _seed(b, 'cur', 'A')
         _seed(b, 'other', 'B')
         kicked = []
-        b.request_preview = lambda id_: kicked.append(id_)
+        b.request_preview = lambda id_, immediate=False: kicked.append(id_)
 
         b.update_data([drop_preview_cache_op()])
         _drain(b)
@@ -238,7 +238,7 @@ class TestBatchedPreviewOpsKickWorker(unittest.TestCase):
         _seed(b, 'a', 'A')
         _seed(b, 'b', 'B')
         kicked = []
-        b.request_preview = lambda id_: kicked.append(id_)
+        b.request_preview = lambda id_, immediate=False: kicked.append(id_)
 
         b.update_data([
             invalidate_preview_op('a'),
