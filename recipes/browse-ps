@@ -1,5 +1,5 @@
 #!/usr/bin/env -S browse-tui --run-py
-"""browse-procs — interactive process tree.
+"""browse-ps — interactive process tree.
 
 Builds a hierarchy from ``ps -eo pid,ppid,user,comm``. Each process is
 an Item; children are processes whose ``ppid == this pid``. The root
@@ -380,7 +380,7 @@ def on_context_menu(ctx):
 
 
 _HELP_INTRO = """\
-browse-procs — interactive process tree.
+browse-ps — interactive process tree.
 
 Builds the hierarchy from ``ps -eo pid,ppid,user,comm``: each row is
 a process, children are processes whose ppid equals this pid. Reload
@@ -394,7 +394,7 @@ full status, renice it, or attach strace.\
 
 def main():
     sys.exit(Browser(BrowserConfig(
-        title='browse-procs',
+        title='browse-ps',
         get_children=get_children,
         get_preview=get_preview,
         actions=[

@@ -6300,7 +6300,7 @@ def _action_toggle_filter(ctx):
 # A right-click / `` ` ``-F1 menu over the cursor's row, branching on its KIND
 # (``id[0]``) — message / session / subagent / project, plus the tree-mode
 # ``prompt`` / ``tool`` / ``span`` umbrellas (whose rows act on the umbrella's
-# own grouped source). Following the committed convention (browse-procs the
+# own grouped source). Following the committed convention (browse-ps the
 # pilot, browse-git the rich multi-kind case): a PURE ``context_menu_options(ctx)``
 # builds the ``(label, token)`` rows by kind (opening no modal, so it is
 # unit-testable), a flat ``{token: handler}`` table (``_MENU_ACTIONS``)

@@ -3,7 +3,7 @@
 browse-claude is the most complex recipe — an actions-first DIRECTORY
 hierarchy (over the cursor's project / cwd / worktree dirs) plus per-kind
 message / session / agent menus. Following the committed convention
-(browse-procs the pilot, browse-git the rich multi-kind case) the option list
+(browse-ps the pilot, browse-git the rich multi-kind case) the option list
 is a PURE builder, ``context_menu_options(ctx)``, that inspects ``ctx.cursor``
 and returns ``(label, token)`` rows WITHOUT opening a modal; a flat
 ``{token: handler}`` table (``_MENU_ACTIONS``) dispatches the chosen token.

@@ -1,4 +1,4 @@
-"""Unit tests for the ``recipes/browse-procs`` context menu.
+"""Unit tests for the ``recipes/browse-ps`` context menu.
 
 The recipe is a ``--run-py`` script that imports ``browse_tui`` (only a real
 module when the binary loads it), so we stub ``browse_tui`` in ``sys.modules``
@@ -27,7 +27,7 @@ from test.async_._helpers import Browser, BrowserConfig, Context, Item, make_bro
 
 
 _REPO = Path(__file__).resolve().parents[2]
-_RECIPE = _REPO / 'recipes' / 'browse-procs'
+_RECIPE = _REPO / 'recipes' / 'browse-ps'
 
 
 def _stub_browse_tui():
@@ -55,9 +55,9 @@ def _stub_browse_tui():
 
 
 def _load_recipe():
-    """Load (or reload) the browse-procs recipe; returns a fresh module."""
+    """Load (or reload) the browse-ps recipe; returns a fresh module."""
     _stub_browse_tui()
-    name = '_browse_procs_under_test'
+    name = '_browse_ps_under_test'
     loader = SourceFileLoader(name, str(_RECIPE))
     spec = importlib.util.spec_from_loader(name, loader)
     mod = importlib.util.module_from_spec(spec)

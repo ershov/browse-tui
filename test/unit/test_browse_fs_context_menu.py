@@ -4,7 +4,7 @@ browse-fs items are absolute paths: a ``str`` id is a real file/directory
 (distinguished by ``os.path.isdir``), while a tuple id is a synthetic row —
 ``('missing', label, path)`` / ``('err', path)`` / ``('launch', …)``. The
 context menu branches on that kind. Following the committed convention
-(browse-procs / git / claude / md / plan) the option list is a PURE builder,
+(browse-ps / git / claude / md / plan) the option list is a PURE builder,
 ``context_menu_options(ctx)``, that inspects ``ctx.cursor`` / ``ctx.selected``
 and returns ``(label, token)`` rows WITHOUT opening a modal; a flat
 ``{token: handler}`` table (``_MENU_ACTIONS``) dispatches the chosen token.

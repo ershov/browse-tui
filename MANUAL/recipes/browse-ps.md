@@ -1,4 +1,4 @@
-# recipes/browse-procs
+# recipes/browse-ps
 
 Live process tree from `ps` with kill action.
 
@@ -24,7 +24,7 @@ after a y/n confirm.
 **Usage:**
 
 ```bash
-./recipes/browse-procs
+./recipes/browse-ps
 ```
 
 Keys: `k` send SIGTERM (with confirmation), `ctrl-r` reload tree.
@@ -33,7 +33,7 @@ send a signal (submenu; strong signals confirm, and the SIGTERM row
 shows the `k` hotkey), page open files / sockets / environment / full
 status, renice, or attach `strace`.
 
-**Source:** [`recipes/browse-procs`](../../recipes/browse-procs)
+**Source:** [`recipes/browse-ps`](../../recipes/browse-ps)
 
 ---
 

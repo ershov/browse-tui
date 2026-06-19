@@ -2385,7 +2385,7 @@ def _on_resize(ctx, cols, rows):
 # ---- context menu --------------------------------------------------------
 #
 # A right-click / `` ` ``-F1 menu over the cursor's git object, branching on
-# its KIND (``id[0]``). Following the pilot convention (browse-procs): a PURE
+# its KIND (``id[0]``). Following the pilot convention (browse-ps): a PURE
 # ``context_menu_options(ctx)`` builds the ``(label, token)`` rows by kind
 # (opening no modal, so it is unit-testable), a flat ``{token: handler}`` table
 # (``_MENU_ACTIONS``) dispatches the chosen token, and a thin

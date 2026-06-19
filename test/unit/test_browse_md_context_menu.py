@@ -4,7 +4,7 @@ browse-md surfaces a markdown tree whose row ids are tagged tuples — a per-fil
 root ``('file', path)``, an in-file heading / list item ``('content', path,
 line)``, and the cross-file reference nodes ``('md', anchor, chain, line)`` /
 the ``('refs', anchor, chain)`` References umbrella. The context menu branches
-on that KIND. Following the committed convention (browse-procs the pilot,
+on that KIND. Following the committed convention (browse-ps the pilot,
 browse-git / browse-claude the rich multi-kind cases) the option list is a PURE
 builder, ``context_menu_options(ctx)``, that inspects ``ctx.cursor`` and returns
 ``(label, token)`` rows WITHOUT opening a modal; a flat ``{token: handler}``

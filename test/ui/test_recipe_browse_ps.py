@@ -1,4 +1,4 @@
-"""UI tests for the ``recipes/browse-procs`` process-tree recipe.
+"""UI tests for the ``recipes/browse-ps`` process-tree recipe.
 
 The recipe shells out to ``ps -eo …`` and reads ``/proc/<pid>/status``;
 both are universally available on Linux and don't need any special
@@ -8,7 +8,7 @@ process (PID 1) renders, plus that the preview pane shows the expected
 
 The shebang ``#!/usr/bin/env -S browse-tui --run-py`` requires the
 binary to be on PATH, which is fragile in tests; instead we invoke
-``./browse-tui --run-py recipes/browse-procs`` directly so the tests
+``./browse-tui --run-py recipes/browse-ps`` directly so the tests
 are independent of the user's PATH.
 """
 
@@ -22,21 +22,21 @@ from test.ui.fixtures.tmux import TmuxFixture
 
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _BIN = os.path.join(_REPO, 'browse-tui')
-_RECIPE = os.path.join(_REPO, 'recipes', 'browse-procs')
+_RECIPE = os.path.join(_REPO, 'recipes', 'browse-ps')
 
 
 def setUpModule():
     if not shutil.which('tmux'):
         raise unittest.SkipTest('tmux not available; UI tests skipped')
     if not shutil.which('ps'):
-        raise unittest.SkipTest('ps not available; browse-procs tests skipped')
+        raise unittest.SkipTest('ps not available; browse-ps tests skipped')
     if not os.path.isdir('/proc/1'):
-        raise unittest.SkipTest('/proc not available; browse-procs tests skipped')
+        raise unittest.SkipTest('/proc not available; browse-ps tests skipped')
     if not os.path.exists(_BIN):
         subprocess.run([os.path.join(_REPO, 'build-tui.sh')], check=True)
 
 
-class TestBrowseProcs(unittest.TestCase):
+class TestBrowsePs(unittest.TestCase):
 
     def test_lists_root_process(self):
         """Top-level renders PID 1 and quits cleanly."""

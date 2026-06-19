@@ -14,7 +14,7 @@ rest each demonstrate a different data-source pattern.
 | [`browse-md`](recipes/browse-md.md) | Markdown files as a navigable heading tree, previewed through md2ansi; `FILE.md#section` deep-links. |
 | [`browse-fs`](recipes/browse-fs.md) | Filesystem browser with a live mtime watcher; edit / open / delete actions. |
 | [`browse-plan`](recipes/browse-plan.md) | A project ticket tree over the `plan` CLI — status / edit / create / move flows. |
-| [`browse-procs`](recipes/browse-procs.md) | Live process tree from `ps`, with a kill action. |
+| [`browse-ps`](recipes/browse-ps.md) | Live process tree from `ps`, with a kill action. |
 | [`browse-mcp`](recipes/browse-mcp.md) | The tools exposed by any MCP (stdio) server, with their JSON schemas. |
 | [`browse-jira`](recipes/browse-jira.md) | Open Jira tickets via the `jira` CLI. |
 | [`browse-jira-mcp`](recipes/browse-jira-mcp.md) | Open Jira tickets via the Atlassian MCP server. |

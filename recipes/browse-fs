@@ -370,7 +370,7 @@ def delete(ctx):
 
 # ---- context menu --------------------------------------------------------
 #
-# Following the committed convention (browse-procs / git / claude / md / plan):
+# Following the committed convention (browse-ps / git / claude / md / plan):
 # a PURE ``context_menu_options(ctx)`` builds the ``(label, token)`` rows by the
 # CURSOR ITEM'S KIND (opening no modal, so it is unit-testable), a flat
 # ``{token: handler}`` table (``_MENU_ACTIONS``) dispatches the chosen token,
