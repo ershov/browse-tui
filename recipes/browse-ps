@@ -15,8 +15,10 @@ full command line. CPU% is the instantaneous cumulative-time delta between the
 current and previous snapshot, falling back to the ``ps pcpu`` lifetime average
 on the first sample or for a freshly-appeared pid.
 
-Reload with ctrl-r. ``t`` toggles between the ppid tree (default) and a flat
-list of every process (``--tree`` / ``--no-tree`` set the initial mode). The
+Reload with ctrl-r; a background daemon thread also auto-reloads every ``-d``
+seconds (default ``4.0``; ``-d 0`` disables it). ``t`` toggles between the ppid
+tree (default) and a flat list of every process (``--tree`` / ``--no-tree`` set
+the initial mode). The
 htop-style capitals ``N`` / ``P`` / ``M`` / ``T`` / ``U`` sort by pid / CPU% /
 memory / CPU time / user (re-press the active key to reverse it; each key
 remembers its own direction). Custom action ``k:Kill`` sends SIGTERM to the
@@ -34,6 +36,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 from browse_tui import (
@@ -92,6 +95,17 @@ _SORT_LABELS = {
     'cpu_secs': 'time',
     'user': 'user',
 }
+
+# Background updater (B8). ``-d <seconds>`` sets the refresh interval; the
+# default is auto-update ON every 4 s, and a value <= 0 disables it (no thread
+# started). The daemon worker ticks every interval and calls ``b.refresh()``
+# (thread-safe — it ``post``s ``_do_refresh`` onto the UI thread), which
+# re-samples the process snapshot (CPU% deltas + the new/finished diff ride that
+# same sample). ``_UPDATE_STOP`` / ``_UPDATE_THREAD`` are created in ``main`` and
+# torn down in its ``finally``. Mirrors browse-claude's tail-worker daemon.
+_DEFAULT_UPDATE_INTERVAL = 4.0
+_UPDATE_STOP = None    # threading.Event; created in main()
+_UPDATE_THREAD = None  # threading.Thread; created in main()
 
 
 class ProcInfo:
@@ -775,8 +789,9 @@ browse-ps — interactive process tree.
 Builds the hierarchy from ``ps -eo pid,ppid,user,pcpu,rss,time,args``:
 each row is a process, children are processes whose ppid equals this
 pid. The row title is the full command line; pid / user / CPU% / memory
-ride along as columns. Reload the tree with Ctrl-R; preview reads
-/proc/<pid>/status.
+ride along as columns. Reload the tree with Ctrl-R; a background thread
+also auto-reloads every -d seconds (default 4.0; -d 0 disables it).
+Preview reads /proc/<pid>/status.
 
   t       toggle flat / tree view (--tree / --no-tree set the initial
           mode). Flat lists every process; tree groups by ppid.
@@ -807,9 +822,54 @@ def _apply_view_flags():
         _TREE_MODE = False
 
 
+def _update_interval():
+    """Background-refresh interval in seconds from ``-d`` (B8).
+
+    Parsed off ``recipe_argv()`` (framework flags already stripped), alongside
+    ``_apply_view_flags``. Accepts ``-d <secs>`` and ``-d=<secs>`` with a
+    FRACTIONAL value; absent, the default ``4.0`` (auto-update on). A value
+    ``<= 0`` disables updates (the caller starts no thread). A malformed value
+    falls back to the default rather than aborting launch — a stray ``-d`` should
+    not stop the viewer from opening.
+    """
+    argv = recipe_argv()
+    raw = None
+    for i, arg in enumerate(argv):
+        if arg == '-d':
+            raw = argv[i + 1] if i + 1 < len(argv) else None
+        elif arg.startswith('-d='):
+            raw = arg[len('-d='):]
+    if raw is None:
+        return _DEFAULT_UPDATE_INTERVAL
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_UPDATE_INTERVAL
+
+
+def _update_worker(b, interval):
+    """Background loop: every ``interval`` seconds, trigger a full reload.
+
+    Calls ``b.refresh()`` (thread-safe — it ``post``s ``_do_refresh`` onto the
+    UI thread), which enqueues the root with ``reload=True`` and re-samples the
+    process snapshot (so CPU% deltas and the new/finished diff ride the same
+    sample), preserving the cursor by pid.
+
+    The wait is ``_UPDATE_STOP.wait(timeout=interval)`` — NOT ``time.sleep`` — so
+    setting the stop event wakes the worker immediately and shutdown stays
+    prompt. Marked daemon as a backstop. ``refresh`` failures are swallowed so a
+    transient error doesn't kill the worker; the next tick gets a clean shot.
+    """
+    while not _UPDATE_STOP.wait(timeout=interval):
+        try:
+            b.refresh()
+        except Exception:
+            pass
+
+
 def main():
     _apply_view_flags()
-    sys.exit(Browser(BrowserConfig(
+    b = Browser(BrowserConfig(
         title='browse-ps',
         get_children=get_children,
         get_preview=get_preview,
@@ -836,7 +896,31 @@ def main():
         # The pid is its own gutter column now (col_pid), so the framework
         # needn't echo it next to the title.
         show_ids='never',
-    )).run())
+    ))
+
+    # Background updater (B8): a daemon thread ticks every ``-d`` seconds and
+    # ``b.refresh()``es (re-sampling the snapshot — CPU% deltas + the
+    # new/finished diff ride that reload). ``-d <= 0`` disables it (no thread).
+    # Daemon so it never keeps the process alive; ``_UPDATE_STOP`` signals a
+    # clean shutdown before sys.exit, joined briefly in the ``finally`` so the
+    # worker wakes from its ``wait`` before the process exits (prompt shutdown).
+    global _UPDATE_STOP, _UPDATE_THREAD
+    interval = _update_interval()
+    if interval > 0:
+        _UPDATE_STOP = threading.Event()
+        _UPDATE_THREAD = threading.Thread(
+            target=_update_worker, args=(b, interval),
+            name='browse-ps-update', daemon=True,
+        )
+        _UPDATE_THREAD.start()
+
+    try:
+        rc = b.run()
+    finally:
+        if _UPDATE_STOP is not None:
+            _UPDATE_STOP.set()
+            _UPDATE_THREAD.join(timeout=1.0)
+    sys.exit(rc)
 
 
 if __name__ == '__main__':

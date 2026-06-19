@@ -19,6 +19,8 @@ is split out and tested directly.
 import importlib.util
 import subprocess
 import sys
+import threading
+import time
 import types
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -990,6 +992,222 @@ class TestPsChrome(unittest.TestCase):
         # selection + (no gutter) + indent + expander = 3 segments.
         self.assertEqual(len(segs), 3)
         self.assertEqual(self._text(segs), '    ' + '  ')  # sel + 1-level indent
+
+
+# --- Background updater (B8) -------------------------------------------------
+
+class TestUpdateIntervalCli(unittest.TestCase):
+    """``-d <seconds>`` parsing (B8) via the genuine ``recipe_argv``.
+
+    Mirrors ``TestViewFlagsCli``: ``_update_interval`` reads ``recipe_argv()``,
+    which sources the framework module's ``sys.argv`` — so the cases drive it by
+    patching ``_FW_STATE.sys.argv``.
+    """
+
+    def setUp(self):
+        self.r = _load_recipe()
+
+    def _interval(self, argv):
+        with mock.patch.object(_FW_STATE.sys, 'argv', ['browse-ps', *argv]):
+            return self.r._update_interval()
+
+    def test_default_is_four_seconds(self):
+        # Absent -d → auto-update on at the 4.0 s default.
+        self.assertEqual(self._interval([]), 4.0)
+        self.assertEqual(self.r._DEFAULT_UPDATE_INTERVAL, 4.0)
+
+    def test_fractional_value(self):
+        self.assertEqual(self._interval(['-d', '2.5']), 2.5)
+
+    def test_equals_form(self):
+        # ``-d=2.5`` (single token) parses the same as ``-d 2.5``.
+        self.assertEqual(self._interval(['-d=2.5']), 2.5)
+
+    def test_integer_value(self):
+        self.assertEqual(self._interval(['-d', '10']), 10.0)
+
+    def test_zero_disables(self):
+        # <= 0 disables updates (interval not > 0 → no thread started).
+        self.assertEqual(self._interval(['-d', '0']), 0.0)
+
+    def test_negative_disables(self):
+        self.assertEqual(self._interval(['-d', '-1']), -1.0)
+
+    def test_malformed_falls_back_to_default(self):
+        # A non-numeric value degrades to the default rather than aborting.
+        self.assertEqual(self._interval(['-d', 'nope']), 4.0)
+
+    def test_bare_trailing_flag_falls_back_to_default(self):
+        # ``-d`` with no following token → no value → default.
+        self.assertEqual(self._interval(['-d']), 4.0)
+
+    def test_last_occurrence_wins(self):
+        # A repeated -d takes the last value (consistent with the scan order).
+        self.assertEqual(self._interval(['-d', '1', '-d', '3']), 3.0)
+
+    def test_framework_tty_flag_not_misread(self):
+        # recipe_argv strips --tty + its value; -d after it still parses.
+        self.assertEqual(self._interval(['--tty', '/dev/pts/3', '-d', '2']), 2.0)
+
+
+class TestUpdateWorkerTick(unittest.TestCase):
+    """A worker tick calls ``b.refresh()``; the stop event halts it promptly.
+
+    Uses a real ``threading.Event`` for the stop flag and a Mock Browser (we
+    only assert the tick calls ``refresh``). Module globals are restored via
+    ``addCleanup`` per the ticket. No test sleeps for the real default interval.
+    """
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self._seed_stop = self.r._UPDATE_STOP
+        self._seed_thread = self.r._UPDATE_THREAD
+        self.addCleanup(self._restore_globals)
+
+    def _restore_globals(self):
+        self.r._UPDATE_STOP = self._seed_stop
+        self.r._UPDATE_THREAD = self._seed_thread
+
+    def test_tick_calls_refresh_then_stops(self):
+        # Drive the worker directly with a tiny interval: the FIRST wait()
+        # returns False (timeout) → one refresh; we set the stop event from the
+        # spy so the SECOND wait() returns True and the loop exits at once. The
+        # worker never sleeps for a real interval.
+        b = mock.Mock()
+        self.r._UPDATE_STOP = threading.Event()
+
+        def _refresh():
+            self.r._UPDATE_STOP.set()      # stop after the first tick
+        b.refresh.side_effect = _refresh
+
+        self.r._update_worker(b, 0.001)
+        b.refresh.assert_called_once_with()
+
+    def test_set_event_before_first_tick_yields_no_refresh(self):
+        # A stop event set before the loop runs → wait() returns True
+        # immediately → zero refreshes (prompt shutdown, no spurious tick).
+        b = mock.Mock()
+        self.r._UPDATE_STOP = threading.Event()
+        self.r._UPDATE_STOP.set()
+        self.r._update_worker(b, 0.001)
+        b.refresh.assert_not_called()
+
+    def test_refresh_exception_does_not_kill_worker(self):
+        # A transient refresh failure is swallowed; the loop survives to the
+        # next wait() (which we trip via the stop event to end the test).
+        b = mock.Mock()
+        self.r._UPDATE_STOP = threading.Event()
+        calls = []
+
+        def _refresh():
+            calls.append(1)
+            self.r._UPDATE_STOP.set()      # end after this (raising) tick
+            raise RuntimeError('boom')
+        b.refresh.side_effect = _refresh
+
+        self.r._update_worker(b, 0.001)    # must NOT propagate
+        self.assertEqual(len(calls), 1)
+
+
+class TestUpdateThreadLifecycle(unittest.TestCase):
+    """``main`` starts the daemon thread when interval > 0 and joins it promptly.
+
+    Patches ``Browser`` to a Mock and ``sys.exit`` to capture the return code,
+    so ``main`` runs without a real terminal. ``b.run`` blocks on a one-shot
+    event until the test releases it; the worker thread is asserted live during
+    that window, then ``main``'s ``finally`` join must return promptly. Module
+    globals restored via ``addCleanup``; no test sleeps for the default interval.
+    """
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self._seed_stop = self.r._UPDATE_STOP
+        self._seed_thread = self.r._UPDATE_THREAD
+        self.addCleanup(self._restore_globals)
+
+    def _restore_globals(self):
+        self.r._UPDATE_STOP = self._seed_stop
+        self.r._UPDATE_THREAD = self._seed_thread
+
+    def _run_main(self, argv):
+        """Run ``main`` with a Mock Browser whose ``run`` returns 0 at once.
+
+        Patches ``Browser`` / ``BrowserConfig`` / ``_apply_view_flags`` so
+        ``main`` runs headless, and ``sys.exit`` to capture the return code.
+        Returns ``(browser_mock, exit_spy)``.
+        """
+        b = mock.Mock()
+        b.run.return_value = 0
+        with mock.patch.object(self.r, 'Browser', return_value=b), \
+             mock.patch.object(self.r, 'BrowserConfig', return_value=object()), \
+             mock.patch.object(self.r, '_apply_view_flags', lambda: None), \
+             mock.patch.object(_FW_STATE.sys, 'argv', ['browse-ps', *argv]), \
+             mock.patch.object(self.r.sys, 'exit') as exit_spy:
+            self.r.main()
+        return b, exit_spy
+
+    def test_disabled_when_interval_not_positive(self):
+        # -d 0 → no thread started; main still runs and exits with run()'s rc.
+        b, exit_spy = self._run_main(['-d', '0'])
+        self.assertIsNone(self.r._UPDATE_THREAD)
+        b.run.assert_called_once_with()
+        exit_spy.assert_called_once_with(0)
+
+    def test_thread_started_and_joined_for_positive_interval(self):
+        # interval > 0 → a daemon thread starts; main's finally sets the stop
+        # event and joins it. run() returns at once here (no real-interval
+        # wait), so the worker — parked on its first stop_event.wait(interval) —
+        # is woken by the finally's set() and the join completes promptly.
+        b, exit_spy = self._run_main(['-d', '0.001'])
+        self.assertIsNotNone(self.r._UPDATE_THREAD)
+        self.assertTrue(self.r._UPDATE_STOP.is_set())     # finally set it
+        self.assertFalse(self.r._UPDATE_THREAD.is_alive())  # join completed
+        self.assertTrue(self.r._UPDATE_THREAD.daemon)
+        exit_spy.assert_called_once_with(0)
+
+    def test_thread_is_alive_during_run_then_dies(self):
+        # Hold run() open on an event, confirm the worker thread is alive, then
+        # release run() and let main's finally join it. No real-interval sleep:
+        # the worker waits on the stop event, which main sets in finally.
+        release = threading.Event()
+        captured = {}
+
+        def _blocking_run():
+            captured['thread'] = self.r._UPDATE_THREAD
+            captured['alive_during_run'] = self.r._UPDATE_THREAD.is_alive()
+            release.wait(timeout=5.0)
+            return 0
+
+        b = mock.Mock()
+        b.run.side_effect = _blocking_run
+        done = threading.Event()
+
+        def _main():
+            with mock.patch.object(self.r, 'Browser', return_value=b), \
+                 mock.patch.object(self.r, 'BrowserConfig',
+                                   return_value=object()), \
+                 mock.patch.object(self.r, '_apply_view_flags', lambda: None), \
+                 mock.patch.object(_FW_STATE.sys, 'argv',
+                                   ['browse-ps', '-d', '0.001']), \
+                 mock.patch.object(self.r.sys, 'exit'):
+                self.r.main()
+            done.set()
+
+        driver = threading.Thread(target=_main, daemon=True)
+        driver.start()
+        try:
+            # Wait until run() has captured the worker state (it runs once main
+            # has started the thread); a generous timeout, not a fixed sleep.
+            deadline = time.monotonic() + 5.0
+            while 'thread' not in captured and time.monotonic() < deadline:
+                time.sleep(0.001)
+            self.assertIn('thread', captured)
+            self.assertTrue(captured['alive_during_run'])
+        finally:
+            release.set()          # let run() return → main's finally joins
+        done.wait(timeout=5.0)
+        self.assertTrue(done.is_set())                    # main returned
+        self.assertFalse(captured['thread'].is_alive())   # worker joined
 
 
 if __name__ == '__main__':
