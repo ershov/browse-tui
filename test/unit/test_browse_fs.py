@@ -1072,5 +1072,155 @@ class TestMdLauncher(unittest.TestCase):
         self.assertEqual(ctx.calls, [])
 
 
+class _ModeCtx:
+    """A minimal ``ctx`` for the display-mode switch actions.
+
+    Records ``flash`` text and ``refresh`` calls — the two side-effects
+    ``_set_display_mode`` performs besides flipping the module global.
+    """
+
+    def __init__(self):
+        self.flashes = []
+        self.refreshed = 0
+
+    def flash(self, text, log=False):
+        self.flashes.append(text)
+
+    def refresh(self):
+        self.refreshed += 1
+
+
+class TestDisplayModes(unittest.TestCase):
+    """Display modes (number keys 1/2/3) gate the gutter column set (#1115).
+
+    ``_DISPLAY_MODE`` selects which columns ``_fs_gutter_segments`` emits:
+    mode 1 = empty gutter, mode 2 = perms/size/date, mode 3 = + user/group.
+    The strings are always computed in ``_set_columns`` (incl. col_user /
+    col_group); the mode only chooses which the gutter renders.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def setUp(self):
+        # Each test drives ``_DISPLAY_MODE`` explicitly; restore the default
+        # afterwards so tests stay isolated (it is a module global).
+        self._saved_mode = self.r._DISPLAY_MODE
+        self.addCleanup(setattr, self.r, '_DISPLAY_MODE', self._saved_mode)
+
+    def _widths(self, perms=10, size=4, mtime=12, user=5, group=5):
+        return {'col_perms': perms, 'col_size': size, 'col_mtime': mtime,
+                'col_user': user, 'col_group': group}
+
+    def _item(self):
+        return _make_item(
+            self.r, id='/d/f', title='f.txt',
+            col_perms='-rw-r--r--', col_size='12K', col_mtime='Jun 03 11:08',
+            col_user='alice', col_group='staff')
+
+    # -- the per-mode gutter column set ------------------------------------
+
+    def test_mode_1_is_empty_gutter(self):
+        # Mode 1 = name only → no gutter columns and no width measurement.
+        self.r._DISPLAY_MODE = 1
+        ctx = _FakeCtx(self._widths())
+        segs = self.r._fs_gutter_segments(self._item(), ctx)
+        self.assertEqual(segs, [])
+        self.assertEqual(ctx.calls, [])
+        # And the whole chrome is just selection + indent + expander.
+        self.assertEqual(len(self.r.fs_chrome(self._item(), _FakeCtx(self._widths()))), 3)
+
+    def test_mode_2_is_perms_size_date(self):
+        # Mode 2 = the default set: perms · size · date, in that order.
+        self.r._DISPLAY_MODE = 2
+        ctx = _FakeCtx(self._widths(perms=10, size=4, mtime=12))
+        segs = self.r._fs_gutter_segments(self._item(), ctx)
+        self.assertEqual(len(segs), 3)
+        self.assertEqual(segs[0], ('-rw-r--r--' + '  ', _DIM[0], _DIM[1]))
+        self.assertEqual(segs[1], (' 12K' + '  ', _DIM[0], _DIM[1]))    # rjust 4
+        self.assertEqual(segs[2], ('Jun 03 11:08' + '  ', _DIM[0], _DIM[1]))
+        self.assertEqual(ctx.calls, ['col_perms', 'col_size', 'col_mtime'])
+
+    def test_mode_3_appends_user_then_group(self):
+        # Mode 3 = perms · size · date · user · group; user/group are
+        # left-justified, dim, sized via max_col_width_global.
+        self.r._DISPLAY_MODE = 3
+        ctx = _FakeCtx(self._widths(perms=10, size=4, mtime=12, user=6, group=7))
+        segs = self.r._fs_gutter_segments(self._item(), ctx)
+        self.assertEqual(len(segs), 5)
+        # First three unchanged from mode 2.
+        self.assertEqual(segs[0], ('-rw-r--r--' + '  ', _DIM[0], _DIM[1]))
+        self.assertEqual(segs[1], (' 12K' + '  ', _DIM[0], _DIM[1]))
+        self.assertEqual(segs[2], ('Jun 03 11:08' + '  ', _DIM[0], _DIM[1]))
+        # user (ljust 6) then group (ljust 7), both dim.
+        self.assertEqual(segs[3], ('alice'.ljust(6) + '  ', _DIM[0], _DIM[1]))
+        self.assertEqual(segs[4], ('staff'.ljust(7) + '  ', _DIM[0], _DIM[1]))
+        # Measured in column order, user before group.
+        self.assertEqual(ctx.calls,
+                         ['col_perms', 'col_size', 'col_mtime',
+                          'col_user', 'col_group'])
+
+    # -- user / group resolution + numeric fallback ------------------------
+
+    def test_set_columns_resolves_user_and_group(self):
+        # _set_columns stores resolved owner / group names from st_uid/st_gid.
+        with tempfile.TemporaryDirectory() as d:
+            fpath = os.path.join(d, 'f.txt')
+            with open(fpath, 'wb') as f:
+                f.write(b'x')
+            st = os.stat(fpath)
+            item = _make_item(self.r, id=fpath, title='f.txt')
+            self.r._set_columns(item, st, is_dir=False)
+            import pwd as _pwd
+            import grp as _grp
+            self.assertEqual(item.col_user, _pwd.getpwuid(st.st_uid).pw_name)
+            self.assertEqual(item.col_group, _grp.getgrgid(st.st_gid).gr_name)
+
+    def test_unresolvable_uid_gid_fall_back_to_numeric(self):
+        # A uid/gid with no passwd/group entry (getpwuid/getgrgid raise
+        # KeyError) falls back to the numeric id rendered as a string.
+        self.r._UID_NAMES.clear()
+        self.r._GID_NAMES.clear()
+        with mock.patch('pwd.getpwuid', side_effect=KeyError), \
+                mock.patch('grp.getgrgid', side_effect=KeyError):
+            self.assertEqual(self.r._uid_name(4242), '4242')
+            self.assertEqual(self.r._gid_name(7777), '7777')
+
+    def test_uid_gid_resolution_is_cached(self):
+        # Per-uid / per-gid caching: a second lookup does NOT re-hit
+        # pwd/grp (so dozens of same-owner rows resolve once each).
+        self.r._UID_NAMES.clear()
+        self.r._GID_NAMES.clear()
+        with mock.patch('pwd.getpwuid',
+                        return_value=types.SimpleNamespace(pw_name='bob')) as pw, \
+                mock.patch('grp.getgrgid',
+                           return_value=types.SimpleNamespace(gr_name='wheel')) as gr:
+            self.assertEqual(self.r._uid_name(1000), 'bob')
+            self.assertEqual(self.r._uid_name(1000), 'bob')
+            self.assertEqual(self.r._gid_name(20), 'wheel')
+            self.assertEqual(self.r._gid_name(20), 'wheel')
+        self.assertEqual(pw.call_count, 1)
+        self.assertEqual(gr.call_count, 1)
+
+    # -- the mode-switch actions -------------------------------------------
+
+    def test_set_display_mode_flips_global_flashes_and_refreshes(self):
+        # Each action sets _DISPLAY_MODE, flashes the mode, and refreshes.
+        for mode in (1, 3, 2):
+            ctx = _ModeCtx()
+            self.r._set_display_mode(ctx, mode)
+            self.assertEqual(self.r._DISPLAY_MODE, mode)
+            self.assertEqual(ctx.refreshed, 1)
+            self.assertEqual(len(ctx.flashes), 1)
+            # The flash names the active mode's column set.
+            self.assertIn(self.r._MODE_LABELS[mode], ctx.flashes[0])
+
+    def test_default_display_mode_is_2(self):
+        # Freshly loaded, the recipe defaults to mode 2 (perms/size/date).
+        fresh = _load_recipe()
+        self.assertEqual(fresh._DISPLAY_MODE, 2)
+
+
 if __name__ == '__main__':
     unittest.main()

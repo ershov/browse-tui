@@ -3,6 +3,10 @@
 or dirs-first directory listing; actions e:Edit ($EDITOR), o:Open (xdg-open), d:Delete
 (with ctx.confirm); background mtime watcher refreshes changed dirs.
 
+The number keys 1/2/3 pick the display mode — which columns the left gutter
+shows: 1 = name only (empty gutter, like ``ls -1``), 2 = perms · size · date
+(the default), 3 = + user · group (owner / group, resolved via pwd/grp).
+
 A right-click (or the backslash / F1 keys) opens a context menu keyed to the
 cursor row's kind — a directory (run shell here, a ``git`` submenu opening
 browse-git by mode when it is a repo, new file / directory, show full path,
@@ -36,7 +40,9 @@ Usage:  browse-fs [PATH | -]   # no argument ⇒ the current directory
                                # (or stdin, when piped).
 """
 
+import grp
 import os
+import pwd
 import shutil
 import stat
 import subprocess
@@ -77,6 +83,17 @@ except Exception:
 # File extensions that get a markdown launcher subtree.
 _MD_EXTS = ('.md', '.MD')
 
+# Display mode (number keys 1/2/3) — selects which column set the LEFT gutter
+# (``fs_chrome`` / ``_fs_gutter_segments``) renders:
+#   1 = name only          → EMPTY gutter (mimics ``ls -1``)
+#   2 = perms · size · date → the default set
+#   3 = perms · size · date · user · group
+# Switched by the ``1`` / ``2`` / ``3`` Actions (``_set_display_mode``), each
+# flashing the mode and refreshing. The column STRINGS are always computed in
+# ``_set_columns`` (incl. col_user / col_group); the mode only gates which are
+# shown, so switching is a pure re-render — no refetch of the listing needed.
+_DISPLAY_MODE = 2
+
 # Stdin-list mode (the ``browse-fs -`` argument). ``main()`` reads the
 # newline-separated paths from ``sys.stdin`` once, before the UI starts,
 # and stores them here as a list of ``(label, abspath)`` pairs in input
@@ -97,6 +114,39 @@ def human_size(n):
     return f'{n}P'
 
 
+# Per-uid / per-gid name caches. A filesystem listing is dozens of rows (not
+# the thousands of processes browse-ps faces), so resolving every row's owner /
+# group via ``pwd`` / ``grp`` is fine here — and unlike a numeric pid there is
+# no other source for the name. A passwd/group lookup that misses (``KeyError``
+# — e.g. a uid with no entry) falls back to the numeric id as a string.
+_UID_NAMES = {}
+_GID_NAMES = {}
+
+
+def _uid_name(uid):
+    """Resolve ``uid`` to an owner name (cached); numeric string on miss."""
+    name = _UID_NAMES.get(uid)
+    if name is None:
+        try:
+            name = pwd.getpwuid(uid).pw_name
+        except KeyError:
+            name = str(uid)
+        _UID_NAMES[uid] = name
+    return name
+
+
+def _gid_name(gid):
+    """Resolve ``gid`` to a group name (cached); numeric string on miss."""
+    name = _GID_NAMES.get(gid)
+    if name is None:
+        try:
+            name = grp.getgrgid(gid).gr_name
+        except KeyError:
+            name = str(gid)
+        _GID_NAMES[gid] = name
+    return name
+
+
 def _is_dir(dirent):
     try:
         return dirent.is_dir(follow_symlinks=False)
@@ -105,17 +155,25 @@ def _is_dir(dirent):
 
 
 def _set_columns(item, st, is_dir):
-    """Attach the perms / size / mtime display columns from a stat result.
+    """Attach the perms / size / mtime / user / group display columns from a stat.
 
     Shared by the directory-scan rows and the stdin-list roots so both
     render identical metadata columns. ``st`` is a no-follow stat (the
     row describes the entry itself, e.g. a symlink, not its target).
+
+    All five columns are computed here regardless of the active display mode;
+    ``_fs_gutter_segments`` decides which to render (mode 1 = none, mode 2 =
+    perms/size/date, mode 3 = + user/group). user / group resolve ``st``'s
+    numeric ``st_uid`` / ``st_gid`` through the cached ``_uid_name`` /
+    ``_gid_name`` (numeric-string fallback when unresolved).
     """
     # Size moved out of the `tag` chip into the col_size column; rows
     # carry no tag now (fs_chrome renders the metadata columns in the gutter).
     item.col_perms = stat.filemode(st.st_mode)
     item.col_size = '' if is_dir else human_size(st.st_size)
     item.col_mtime = time.strftime('%b %d %H:%M', time.localtime(st.st_mtime))
+    item.col_user = _uid_name(st.st_uid)
+    item.col_group = _gid_name(st.st_gid)
 
 
 def _stdin_root_item(label, path):
@@ -242,7 +300,12 @@ def get_children(path, *, reload=False):
 
 
 def _fs_gutter_segments(item, ctx):
-    """The perms | size | mtime gutter columns for a normal row.
+    """The active display mode's gutter columns for a normal row.
+
+    Gated by ``_DISPLAY_MODE`` (the ``1`` / ``2`` / ``3`` keys):
+      * mode 1 → ``[]`` (an EMPTY gutter — name only, like ``ls -1``);
+      * mode 2 → perms · size · date;
+      * mode 3 → perms · size · date · user · group.
 
     Each column is left/right-justified to its GLOBAL width
     (``ctx.max_col_width_global`` over ALL loaded items, not just the row's
@@ -251,13 +314,21 @@ def _fs_gutter_segments(item, ctx):
     Rendered dim, with a two-space gap after each column (matching the old
     content layout). Returns a list so it concatenates with the chrome atoms.
     """
+    if _DISPLAY_MODE == 1:
+        return []
     gw = ctx.max_col_width_global
     dfg, dbold = style('dim')
-    return [
+    segs = [
         (cell_ljust(item.col_perms, gw('col_perms')) + '  ', dfg, dbold),
         (cell_rjust(item.col_size,  gw('col_size'))  + '  ', dfg, dbold),
         (cell_ljust(item.col_mtime, gw('col_mtime')) + '  ', dfg, dbold),
     ]
+    if _DISPLAY_MODE == 3:
+        segs.extend([
+            (cell_ljust(item.col_user,  gw('col_user'))  + '  ', dfg, dbold),
+            (cell_ljust(item.col_group, gw('col_group')) + '  ', dfg, dbold),
+        ])
+    return segs
 
 
 def fs_chrome(item, ctx):
@@ -332,6 +403,27 @@ def toggle_md(ctx):
     _MD_COLOR = not _MD_COLOR
     ctx.drop_preview_cache()
     ctx.flash(f'md preview: {"colored" if _MD_COLOR else "raw"}')
+
+
+# One-line labels for each display mode, used in the switch flash.
+_MODE_LABELS = {
+    1: 'name only',
+    2: 'perms · size · date',
+    3: 'perms · size · date · user · group',
+}
+
+
+def _set_display_mode(ctx, mode):
+    """Switch the gutter column set to ``mode`` (1/2/3), flash it, and refresh.
+
+    The mode only changes which columns ``_fs_gutter_segments`` emits (the
+    strings are already on every item), so a refresh is enough to repaint the
+    gutter at the new widths.
+    """
+    global _DISPLAY_MODE
+    _DISPLAY_MODE = mode
+    ctx.flash(f'display: {_MODE_LABELS[mode]}')
+    ctx.refresh()
 
 
 def edit(ctx):
@@ -889,6 +981,10 @@ heads or directory listings. The selection / cursor seeds $TUI_IDS_FILE
 for the actions below; mtime changes refresh the affected directory
 automatically. Press Enter (or 'e') to open the cursor row in $EDITOR.
 
+The number keys 1/2/3 select the display mode (which columns the left
+gutter shows): 1 = name only (empty gutter, like 'ls -1'), 2 = perms,
+size, date (the default), 3 = + user and group (owner / group names).
+
 A markdown file (*.md / *.MD) gets an expansion arrow: open it to list
 '[md ↗]' launcher rows — the document itself and the .md files it links
 to — and press Enter on one to open that file in browse-md.
@@ -967,6 +1063,10 @@ def main():
         Action('e', 'Edit cursor in $EDITOR',     edit,   'cursor'),
         Action('o', 'Open with xdg-open',         open_,  'targets'),
         Action('d', 'Delete (with confirmation)', delete, 'targets'),
+        # Display modes — the gutter column set (see ``_fs_gutter_segments``).
+        Action('1', 'Display: name only',         lambda c: _set_display_mode(c, 1), 'none'),
+        Action('2', 'Display: perms/size/date',   lambda c: _set_display_mode(c, 2), 'none'),
+        Action('3', 'Display: + user/group',      lambda c: _set_display_mode(c, 3), 'none'),
     ]
     if _md2ansi_fn is not None:
         actions.append(Action('m', 'Toggle markdown coloring', toggle_md, 'none'))
