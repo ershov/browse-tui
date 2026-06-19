@@ -1210,5 +1210,447 @@ class TestUpdateThreadLifecycle(unittest.TestCase):
         self.assertFalse(captured['thread'].is_alive())   # worker joined
 
 
+# --- New/finished highlighting (B9) -----------------------------------------
+
+# A two-level tree: pid 1 → pid 100 (a parent) → pid 200 (a leaf), plus pid 300
+# a second leaf directly under pid 1. Lets us prove leaf-death tombstones (200 /
+# 300 are leaves) vs. a parent-death (100 has child 200 → NOT tombstoned).
+_PS_HL = (
+    '    1     0 root  0.0  100 00:00:01 /sbin/init\n'
+    '  100     1 root  1.0  200 00:00:02 parent\n'
+    '  200   100 root  2.0  300 00:00:03 child\n'
+    '  300     1 root  3.0  400 00:00:04 sibling\n'
+)
+
+
+class _HighlightBase(unittest.TestCase):
+    """Shared setup for the highlight diff/display tests (B9).
+
+    Drives a FAKE clock (``_now`` patched to read ``self.clock``) so retention
+    is exercised WITHOUT sleeping. Resets the snapshot + highlight module globals
+    and restores them via ``addCleanup`` per the ticket.
+    """
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self.clock = 1000.0
+        # _now is the single clock the snapshot wall-time + highlight timers read.
+        self._orig_now = self.r._now
+        self.r._now = lambda: self.clock
+        self.addCleanup(self._restore)
+        # Explicit reset (a fresh module already defaults these, but be explicit).
+        self.r._PREV_SNAPSHOT = None
+        self.r._CUR_SNAPSHOT = None
+        self.r._PS_USER_WIDTH_OK = None
+        self.r._UID_NAMES = {}
+        self.r._APPEARED_AT = {}
+        self.r._TOMBSTONES = {}
+        self.r._HIGHLIGHT_MODE = False
+
+    def _restore(self):
+        self.r._now = self._orig_now
+        self.r._APPEARED_AT = {}
+        self.r._TOMBSTONES = {}
+        self.r._HIGHLIGHT_MODE = False
+
+    def _resample(self, ps_out):
+        """Take a fresh snapshot from canned ``ps`` output (reload=True).
+
+        Mocks ``ps`` / platform / smaps so only the diff is under test; the diff
+        runs inside ``_snapshot`` against the current ``self.clock``.
+        """
+        with mock.patch.object(self.r.subprocess, 'run', _ps_completed(ps_out)), \
+             mock.patch.object(self.r.sys, 'platform', 'linux'), \
+             mock.patch.object(self.r, '_private_mem_bytes', lambda pid: None):
+            return self.r._snapshot(reload=True)
+
+
+class TestSnapshotDiff(_HighlightBase):
+    """The always-on diff tracks appeared pids and finished-leaf tombstones."""
+
+    def test_first_sample_marks_nothing(self):
+        # No baseline → no pid is "new", nothing is tombstoned (else the whole
+        # tree would glow on launch).
+        self._resample(_PS_HL)
+        self.assertEqual(self.r._APPEARED_AT, {})
+        self.assertEqual(self.r._TOMBSTONES, {})
+
+    def test_appeared_pid_recorded_with_time(self):
+        # Second sample adds pid 400 (a new leaf under pid 1) → _APPEARED_AT[400].
+        self._resample(_PS_HL)
+        self.clock += 1.0
+        self._resample(_PS_HL + '  400     1 root 0.0 100 00:00:00 newproc\n')
+        self.assertIn(400, self.r._APPEARED_AT)
+        self.assertEqual(self.r._APPEARED_AT[400], 1001.0)
+        # Pre-existing pids are NOT (re)marked.
+        for pid in (1, 100, 200, 300):
+            self.assertNotIn(pid, self.r._APPEARED_AT)
+
+    def test_existing_pid_keeps_original_appeared_time(self):
+        # A pid appears, then survives a later resample: its timestamp is the
+        # FIRST-seen time, not refreshed on each sample.
+        self._resample(_PS_HL)
+        self.clock += 1.0
+        with_new = _PS_HL + '  400     1 root 0.0 100 00:00:00 newproc\n'
+        self._resample(with_new)
+        self.assertEqual(self.r._APPEARED_AT[400], 1001.0)
+        self.clock += 1.0
+        self._resample(with_new)                       # 400 still present
+        self.assertEqual(self.r._APPEARED_AT[400], 1001.0)   # unchanged
+
+    def test_finished_leaf_is_tombstoned_with_former_ppid(self):
+        # Leaf pid 300 (child of pid 1) vanishes → tombstone with former_ppid=1.
+        self._resample(_PS_HL)
+        self.clock += 1.0
+        gone_300 = (
+            '    1     0 root  0.0  100 00:00:01 /sbin/init\n'
+            '  100     1 root  1.0  200 00:00:02 parent\n'
+            '  200   100 root  2.0  300 00:00:03 child\n'
+        )
+        self._resample(gone_300)
+        self.assertIn(300, self.r._TOMBSTONES)
+        info, former_ppid, vanished_at = self.r._TOMBSTONES[300]
+        self.assertEqual(former_ppid, 1)
+        self.assertEqual(vanished_at, 1001.0)
+        self.assertEqual(info.pid, 300)
+        self.assertEqual(info.args, 'sibling')          # saved ProcInfo columns
+
+    def test_pid_with_children_is_not_tombstoned(self):
+        # pid 100 HAD a child (200) when it died, so it is NOT tombstoned: its
+        # row just vanishes (200 would reparent on the next build). Killing 100
+        # AND 200 together leaves only 200 untombstoned (its parent 100 is gone)?
+        # — here we kill ONLY 100's subtree-parent: drop 100 but keep 200 present
+        # so 100 clearly "had children" in the previous snapshot.
+        self._resample(_PS_HL)
+        self.clock += 1.0
+        gone_100 = (
+            '    1     0 root  0.0  100 00:00:01 /sbin/init\n'
+            '  200   100 root  2.0  300 00:00:03 child\n'   # orphan kept alive
+            '  300     1 root  3.0  400 00:00:04 sibling\n'
+        )
+        self._resample(gone_100)
+        self.assertNotIn(100, self.r._TOMBSTONES)       # had children → no tomb
+
+    def test_respawned_pid_clears_then_regreens(self):
+        # A leaf dies (tombstoned), then a pid with the same number reappears:
+        # the tombstone-clearing pops its stale _APPEARED_AT, and the reappearance
+        # records a fresh appeared-time.
+        self._resample(_PS_HL)
+        self.clock += 1.0
+        # pid 300 dies.
+        self._resample(
+            '    1     0 root  0.0  100 00:00:01 /sbin/init\n'
+            '  100     1 root  1.0  200 00:00:02 parent\n'
+            '  200   100 root  2.0  300 00:00:03 child\n')
+        self.assertIn(300, self.r._TOMBSTONES)
+        self.clock += 1.0
+        # pid 300 reappears (a recycled number).
+        self._resample(_PS_HL)
+        self.assertIn(300, self.r._APPEARED_AT)
+        self.assertEqual(self.r._APPEARED_AT[300], 1002.0)
+        # And its tombstone is gone (the parent is live + it reappeared).
+        self.assertNotIn(300, self.r._TOMBSTONES)
+
+
+class TestRetention(_HighlightBase):
+    """The 3.5 s retention window prunes appeared/tombstone entries."""
+
+    def test_appeared_within_window_survives(self):
+        self._resample(_PS_HL)
+        self.clock += 1.0
+        self._resample(_PS_HL + '  400     1 root 0.0 100 00:00:00 newproc\n')
+        # 2.0 s later (< 3.5) the green is still live.
+        self.clock += 2.0
+        self._resample(_PS_HL + '  400     1 root 0.0 100 00:00:00 newproc\n')
+        self.assertIn(400, self.r._APPEARED_AT)
+
+    def test_appeared_past_window_dropped(self):
+        self._resample(_PS_HL)
+        self.clock += 1.0
+        self._resample(_PS_HL + '  400     1 root 0.0 100 00:00:00 newproc\n')
+        # Jump well past 3.5 s and resample → the appeared entry expires.
+        self.clock += 4.0
+        self._resample(_PS_HL + '  400     1 root 0.0 100 00:00:00 newproc\n')
+        self.assertNotIn(400, self.r._APPEARED_AT)
+
+    def test_tombstone_within_window_survives_intervening_refresh(self):
+        # A tombstone persists across an intervening resample within the window
+        # (it must not blink away between auto-update ticks).
+        self._resample(_PS_HL)
+        self.clock += 1.0
+        gone_300 = (
+            '    1     0 root  0.0  100 00:00:01 /sbin/init\n'
+            '  100     1 root  1.0  200 00:00:02 parent\n'
+            '  200   100 root  2.0  300 00:00:03 child\n'
+        )
+        self._resample(gone_300)
+        self.assertIn(300, self.r._TOMBSTONES)
+        # 2.0 s later, another resample (300 still absent) keeps the tombstone.
+        self.clock += 2.0
+        self._resample(gone_300)
+        self.assertIn(300, self.r._TOMBSTONES)
+
+    def test_tombstone_past_window_dropped(self):
+        self._resample(_PS_HL)
+        self.clock += 1.0
+        gone_300 = (
+            '    1     0 root  0.0  100 00:00:01 /sbin/init\n'
+            '  100     1 root  1.0  200 00:00:02 parent\n'
+            '  200   100 root  2.0  300 00:00:03 child\n'
+        )
+        self._resample(gone_300)
+        self.clock += 4.0                              # past 3.5 s
+        self._resample(gone_300)
+        self.assertNotIn(300, self.r._TOMBSTONES)
+
+    def test_tombstone_dropped_when_parent_vanishes(self):
+        # A tombstone whose FORMER PARENT is no longer live is dropped EARLY
+        # (before the time window), since it has nowhere to render in tree mode.
+        # pid 100 has TWO leaf children (200, 250) so it always "has children":
+        # killing 200 tombstones it; later killing 100 (still parent of 250)
+        # leaves 100 untombstoned (had children) yet drops 200's tombstone.
+        base = (
+            '    1     0 root  0.0  100 00:00:01 /sbin/init\n'
+            '  100     1 root  1.0  200 00:00:02 parent\n'
+            '  200   100 root  2.0  300 00:00:03 child\n'
+            '  250   100 root  2.0  300 00:00:03 child2\n'
+        )
+        self._resample(base)
+        self.clock += 1.0
+        # pid 200 (leaf, child of 100) dies → tombstone with former_ppid=100.
+        gone_200 = (
+            '    1     0 root  0.0  100 00:00:01 /sbin/init\n'
+            '  100     1 root  1.0  200 00:00:02 parent\n'
+            '  250   100 root  2.0  300 00:00:03 child2\n'
+        )
+        self._resample(gone_200)
+        self.assertIn(200, self.r._TOMBSTONES)
+        self.assertEqual(self.r._TOMBSTONES[200][1], 100)   # former_ppid
+        # Now the parent (pid 100) dies too — only 0.5 s later (well within 3.5).
+        # It still had child 250 at death, so it is NOT tombstoned.
+        self.clock += 0.5
+        gone_100_too = (
+            '    1     0 root  0.0  100 00:00:01 /sbin/init\n'
+        )
+        self._resample(gone_100_too)
+        # 200's tombstone is dropped early (former parent 100 no longer live);
+        # 100 had a live child (250) → never tombstoned.
+        self.assertNotIn(200, self.r._TOMBSTONES)
+        self.assertNotIn(100, self.r._TOMBSTONES)
+
+
+class TestHighlightDisplayGating(_HighlightBase):
+    """``get_children`` colours/tombstones ONLY when highlight mode is on."""
+
+    def _children(self, parent, reload=False):
+        with mock.patch.object(self.r.subprocess, 'run',
+                               _ps_completed(_PS_HL)), \
+             mock.patch.object(self.r.sys, 'platform', 'linux'), \
+             mock.patch.object(self.r, '_private_mem_bytes', lambda pid: None):
+            return self.r.get_children(parent, reload=reload)
+
+    def _arm_appeared_and_tombstone(self):
+        """Set up state: pid 400 freshly appeared + pid 300 tombstoned (leaf)."""
+        # Sample 1: baseline.
+        self._resample(_PS_HL)
+        self.clock += 1.0
+        # Sample 2: pid 300 dies (tombstone), pid 400 appears (green). Both are
+        # leaves directly under pid 1.
+        self._resample(
+            '    1     0 root  0.0  100 00:00:01 /sbin/init\n'
+            '  100     1 root  1.0  200 00:00:02 parent\n'
+            '  200   100 root  2.0  300 00:00:03 child\n'
+            '  400     1 root  0.0  100 00:00:00 newproc\n')
+        # The display reads the CURRENT snapshot, so re-prime ps to that table.
+        self._cur_ps = (
+            '    1     0 root  0.0  100 00:00:01 /sbin/init\n'
+            '  100     1 root  1.0  200 00:00:02 parent\n'
+            '  200   100 root  2.0  300 00:00:03 child\n'
+            '  400     1 root  0.0  100 00:00:00 newproc\n')
+
+    def _children_cur(self, parent, reload=False):
+        with mock.patch.object(self.r.subprocess, 'run',
+                               _ps_completed(self._cur_ps)), \
+             mock.patch.object(self.r.sys, 'platform', 'linux'), \
+             mock.patch.object(self.r, '_private_mem_bytes', lambda pid: None):
+            return self.r.get_children(parent, reload=reload)
+
+    def test_off_no_row_fg_no_tombstones(self):
+        # Highlight OFF: appeared pids carry no row_fg and tombstone rows are
+        # absent (dead processes just disappear).
+        self.r._HIGHLIGHT_MODE = False
+        self._arm_appeared_and_tombstone()
+        kids = self._children_cur(1, reload=False)     # pid 1's children
+        ids = [k.id for k in kids]
+        self.assertNotIn(300, ids)                     # tombstone NOT shown
+        self.assertIn(400, ids)                        # live new pid IS shown
+        for k in kids:
+            self.assertIsNone(getattr(k, 'row_fg', None))
+
+    def test_on_green_on_new_red_on_tombstone(self):
+        # Highlight ON: pid 400 (new) gets the soft-green row_fg; pid 300
+        # (finished leaf) is included as a soft-red, non-expandable tombstone.
+        self.r._HIGHLIGHT_MODE = True
+        self._arm_appeared_and_tombstone()
+        kids = self._children_cur(1, reload=False)
+        by_id = {k.id: k for k in kids}
+        self.assertIn(400, by_id)
+        self.assertEqual(by_id[400].row_fg, self.r._HL_NEW_FG)
+        self.assertIn(300, by_id)                      # tombstone row present
+        self.assertEqual(by_id[300].row_fg, self.r._HL_GONE_FG)
+        self.assertFalse(by_id[300].has_children)      # tombstones are leaves
+        # The tombstone renders its saved columns (the finished process's args).
+        self.assertEqual(by_id[300].title, 'sibling')
+        # A live, unchanged pid carries no colour.
+        self.assertIsNone(getattr(by_id[100], 'row_fg', None))
+
+    def test_soft_colors_are_not_the_harsh_bright_ansi(self):
+        # The chosen highlight colours are the soft 256-palette values, not the
+        # bright ANSI 2 (green) / 1 (red).
+        self.assertNotIn(self.r._HL_NEW_FG, (2, 10))
+        self.assertNotIn(self.r._HL_GONE_FG, (1, 9))
+        self.assertEqual(self.r._HL_NEW_FG, 108)
+        self.assertEqual(self.r._HL_GONE_FG, 174)
+
+
+class TestHighlightPlacement(_HighlightBase):
+    """Tombstones land under their former parent (tree) / in the sorted flat list."""
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(self._restore_sort)
+        self._seed_key = self.r._SORT_KEY
+        self._seed_dir = dict(self.r._SORT_DIR)
+        self.r._HIGHLIGHT_MODE = True
+
+    def _restore_sort(self):
+        self.r._SORT_KEY = self._seed_key
+        self.r._SORT_DIR = dict(self._seed_dir)
+
+    def _arm(self):
+        """Baseline _PS_HL, then kill leaf 200 (under 100) and leaf 300 (under 1)."""
+        self._resample(_PS_HL)
+        self.clock += 1.0
+        self._cur = (
+            '    1     0 root  0.0  100 00:00:01 /sbin/init\n'
+            '  100     1 root  1.0  200 00:00:02 parent\n'
+        )
+        self._resample(self._cur)
+
+    def _children(self, parent, reload=False):
+        with mock.patch.object(self.r.subprocess, 'run',
+                               _ps_completed(self._cur)), \
+             mock.patch.object(self.r.sys, 'platform', 'linux'), \
+             mock.patch.object(self.r, '_private_mem_bytes', lambda pid: None):
+            return self.r.get_children(parent, reload=reload)
+
+    def test_tree_tombstone_under_former_parent(self):
+        # Tree mode: 200's tombstone shows under pid 100 (its former parent);
+        # 300's tombstone shows under pid 1.
+        self.r._TREE_MODE = True
+        self._arm()
+        root_kids = [k.id for k in self._children(None, reload=True)]
+        self.assertIn(1, root_kids)
+        under_1 = [k.id for k in self._children(1, reload=False)]
+        self.assertIn(300, under_1)                    # leaf under pid 1
+        self.assertIn(100, under_1)                    # live parent
+        under_100 = [k.id for k in self._children(100, reload=False)]
+        self.assertIn(200, under_100)                  # leaf under pid 100
+
+    def test_tree_parent_with_only_tombstone_child_is_expandable(self):
+        # pid 100's only surviving child (200) is a tombstone; it must still
+        # report has_children so the user can expand to the tombstone.
+        self.r._TREE_MODE = True
+        self._arm()
+        self._children(None, reload=True)
+        under_1 = {k.id: k for k in self._children(1, reload=False)}
+        self.assertTrue(under_1[100].has_children)
+
+    def test_flat_tombstones_sorted_into_the_list(self):
+        # Flat mode: every tombstone shows at the root, sorted in by the active
+        # key alongside the live rows. Sort by pid ascending → 1,100,200,300.
+        self.r._TREE_MODE = False
+        self.r._SORT_KEY = 'pid'
+        self._arm()
+        ids = [k.id for k in self._children(None, reload=True)]
+        self.assertEqual(ids, [1, 100, 200, 300])
+        by_id = {k.id: k for k in self._children(None, reload=False)}
+        # 200 & 300 are the red tombstones; 1 & 100 are live.
+        self.assertEqual(by_id[200].row_fg, self.r._HL_GONE_FG)
+        self.assertEqual(by_id[300].row_fg, self.r._HL_GONE_FG)
+        self.assertIsNone(getattr(by_id[1], 'row_fg', None))
+
+
+class TestHighlightToggleAction(unittest.TestCase):
+    """The ``h`` action flips ``_HIGHLIGHT_MODE``, flashes, and refreshes (B9).
+
+    Uses a real headless Browser/Context (flash lands on ``b._notice``), mirroring
+    the ``t`` / sort action tests. Module global restored via ``addCleanup``.
+    """
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self._seed_mode = self.r._HIGHLIGHT_MODE
+        self.addCleanup(lambda: setattr(self.r, '_HIGHLIGHT_MODE', self._seed_mode))
+        self.r._HIGHLIGHT_MODE = False
+        self.b = make_browser(
+            get_children=lambda _id, *, reload=False:
+                [Item(id=1, title='proc', has_children=False)])
+        self.b.refresh()
+        self.b.run_until_idle()
+        self.ctx = Context(self.b)
+
+    def tearDown(self):
+        self.b.stop_workers()
+
+    def test_flips_mode_and_flashes(self):
+        self.assertFalse(self.r._HIGHLIGHT_MODE)
+        self.r._action_toggle_highlight(self.ctx)
+        self.b.run_until_idle()
+        self.assertTrue(self.r._HIGHLIGHT_MODE)
+        self.assertEqual(self.b._notice.text, 'highlight: on')
+        # And back off again.
+        self.r._action_toggle_highlight(self.ctx)
+        self.b.run_until_idle()
+        self.assertFalse(self.r._HIGHLIGHT_MODE)
+        self.assertEqual(self.b._notice.text, 'highlight: off')
+
+    def test_refresh_is_invoked(self):
+        with mock.patch.object(self.ctx, 'refresh',
+                               wraps=self.ctx.refresh) as spy:
+            self.r._action_toggle_highlight(self.ctx)
+            self.b.run_until_idle()
+        spy.assert_called_once()
+
+    def test_h_action_registered_in_config(self):
+        # ``main`` builds a BrowserConfig whose actions include an ``h`` binding
+        # routed to the toggle handler. Run main headless (stub Browser/run) and
+        # inspect the captured config's ``actions`` (the Action stub keeps its
+        # positional args in ``_args``: key, label, handler, gate).
+        captured = {}
+
+        def _capture_config(*a, **kw):
+            cfg = types.SimpleNamespace(actions=kw.get('actions', []))
+            captured['cfg'] = cfg
+            return cfg
+
+        b = mock.Mock()
+        b.run.return_value = 0
+        with mock.patch.object(self.r, 'Browser', return_value=b), \
+             mock.patch.object(self.r, 'BrowserConfig', side_effect=_capture_config), \
+             mock.patch.object(self.r, '_apply_view_flags', lambda: None), \
+             mock.patch.object(_FW_STATE.sys, 'argv', ['browse-ps', '-d', '0']), \
+             mock.patch.object(self.r.sys, 'exit'):
+            self.r.main()
+
+        actions = captured['cfg'].actions
+        by_key = {act._args[0]: act for act in actions}
+        self.assertIn('h', by_key)
+        self.assertIs(by_key['h']._args[2], self.r._action_toggle_highlight)
+        # Sanity: ``h`` does not collide with the recipe's other bindings.
+        recipe_keys = [act._args[0] for act in actions]
+        self.assertEqual(recipe_keys.count('h'), 1)
+
+
 if __name__ == '__main__':
     unittest.main()

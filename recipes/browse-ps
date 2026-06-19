@@ -21,10 +21,13 @@ tree (default) and a flat list of every process (``--tree`` / ``--no-tree`` set
 the initial mode). The
 htop-style capitals ``N`` / ``P`` / ``M`` / ``T`` / ``U`` sort by pid / CPU% /
 memory / CPU time / user (re-press the active key to reverse it; each key
-remembers its own direction). Custom action ``k:Kill`` sends SIGTERM to the
-selected pid (with a y/n confirmation). A right-click context menu (``on_context_menu``) re-invokes
-``ctx.menu`` for a flat signal submenu and pages auxiliary process data
-(lsof / ss / /proc/<pid>/{environ,status}).
+remembers its own direction). ``h`` toggles htop-``-H``-style change
+highlighting: freshly-appeared pids glow soft green and finished leaf
+processes linger as soft-red tombstone rows for a few seconds (see B9). Custom
+action ``k:Kill`` sends SIGTERM to the selected pid (with a y/n confirmation). A
+right-click context menu (``on_context_menu``) re-invokes ``ctx.menu`` for a
+flat signal submenu and pages auxiliary process data (lsof / ss /
+/proc/<pid>/{environ,status}).
 
 Demonstrates: live system data, hierarchical children built from an
 external CLI, /proc-based preview, a destructive custom Action, and a
@@ -64,6 +67,54 @@ _UID_NAMES = {}
 # time across reloads. Each is ``(wall_clock, {pid: ProcInfo})`` or ``None``.
 _PREV_SNAPSHOT = None
 _CUR_SNAPSHOT = None
+
+
+def _now():
+    """Monotonic clock for the snapshot wall-clock + the highlight timers.
+
+    A thin module-level wrapper around ``time.monotonic`` so the new/finished
+    diff (B9) can be tested deterministically — tests patch ``_now`` to advance
+    time WITHOUT sleeping. The snapshot's CPU%-delta wall-clock reads it too, so
+    both the CPU% gap and the appeared/vanished timestamps share one clock.
+    """
+    return time.monotonic()
+
+
+# --- New/finished highlighting (B9) -----------------------------------------
+
+# How long (wall seconds) a change stays highlighted: a freshly-appeared pid
+# glows green, a finished leaf lingers as a red tombstone, then both expire.
+# Hardcoded per the spec.
+_HIGHLIGHT_SECS = 3.5
+
+# Soft 256-colour foreground codes for the ``item.row_fg`` highlight. Deliberately
+# the muted xterm-256 pastels, NOT the harsh bright green/red (ANSI 2/1):
+#   108 = #87af87 (sage green) for new pids; 174 = #d78787 (dusty rose) for
+# finished tombstones. Easy on the eyes for a whole row of dim gutter columns,
+# matching the htop-style "subtle change cue, not an alarm" intent.
+_HL_NEW_FG = 108
+_HL_GONE_FG = 174
+
+# ``{pid: monotonic_time}`` — when each currently-live pid was FIRST seen. Set on
+# the resample where a pid appears in the current snapshot but not the previous
+# one; existing pids keep their original timestamp. Entries older than
+# ``_HIGHLIGHT_SECS`` are pruned each resample. Drives the green ``row_fg``.
+_APPEARED_AT = {}
+
+# ``{pid: (ProcInfo, former_ppid, vanished_at)}`` — finished LEAF processes. On a
+# resample, a pid in the previous snapshot but not the current one that had NO
+# children in the previous snapshot becomes a tombstone: a saved ProcInfo (so the
+# row can still render its columns), its former ppid (for tree placement), and
+# the death time. A pid that HAD children is not tombstoned — its row just
+# vanishes and survivors reparent on the next build. Pruned each resample when
+# older than ``_HIGHLIGHT_SECS`` OR its former parent is no longer live.
+_TOMBSTONES = {}
+
+# Display toggle (the ``h`` action). The diff above ALWAYS runs (CPU% needs the
+# snapshot rotation), but the green row_fg / red tombstone ROWS only show when
+# this is on. htop's ``-H`` is opt-in, so default OFF; flipping ``h`` on
+# immediately surfaces whatever changed within the last ``_HIGHLIGHT_SECS``.
+_HIGHLIGHT_MODE = False
 
 # View mode: ``True`` = the ppid hierarchy (default), ``False`` = one flat list
 # (ordered by the active sort key — pid by default). The ``t`` action flips it;
@@ -290,8 +341,56 @@ def _snapshot(*, reload=False):
         procs[pid] = info
 
     _PREV_SNAPSHOT = _CUR_SNAPSHOT
-    _CUR_SNAPSHOT = (time.monotonic(), procs)
+    _CUR_SNAPSHOT = (_now(), procs)
+    _diff_snapshot(_PREV_SNAPSHOT, _CUR_SNAPSHOT)
     return procs
+
+
+def _diff_snapshot(prev, cur):
+    """Track appeared/vanished pids across a resample (B9) — always runs.
+
+    Called on every resample (right after ``_CUR_SNAPSHOT`` rotates), independent
+    of ``_HIGHLIGHT_MODE`` (the display toggle gates only the colours/tombstone
+    rows, not the bookkeeping). Maintains, keyed by pid:
+
+    - ``_APPEARED_AT[pid]`` — the monotonic time a pid was FIRST seen. Set when a
+      pid is in ``cur`` but not ``prev``; existing pids keep their timestamp.
+    - ``_TOMBSTONES[pid]`` — finished LEAF processes: a pid in ``prev`` but not
+      ``cur`` that had NO children in ``prev`` is recorded as
+      ``(saved ProcInfo, former_ppid, vanished_at)``. A pid that HAD children is
+      NOT tombstoned (its row vanishes; survivors reparent on the next build).
+
+    Then prunes (``_HIGHLIGHT_SECS`` retention): drop ``_APPEARED_AT`` and
+    ``_TOMBSTONES`` entries older than the retention window, and drop a tombstone
+    whose ``former_ppid`` is no longer a live pid (its parent vanished too).
+    """
+    now, cur_procs = cur
+    # First sample has no baseline to diff against — every pid would otherwise
+    # read as "new" and the whole tree would glow on launch. Treat it as the
+    # baseline instead (htop ``-H`` doesn't flag pre-existing processes): mark
+    # nothing appeared, tombstone nothing. The NEXT resample diffs against it.
+    if prev is not None:
+        prev_procs = prev[1]
+        prev_children = {info.ppid for info in prev_procs.values()}
+        for pid in cur_procs:
+            if pid not in prev_procs:
+                _APPEARED_AT.setdefault(pid, now)
+        for pid, info in prev_procs.items():
+            if pid not in cur_procs and pid not in prev_children:
+                _TOMBSTONES.setdefault(pid, (info, info.ppid, now))
+                # A pid can reappear later (recycled); clear any stale "appeared"
+                # so a tombstoned-then-respawned pid re-greens cleanly.
+                _APPEARED_AT.pop(pid, None)
+
+    cutoff = now - _HIGHLIGHT_SECS
+    for pid in [p for p, t in _APPEARED_AT.items() if t < cutoff]:
+        del _APPEARED_AT[pid]
+    # Drop a tombstone that has expired, whose former parent is no longer live
+    # (nowhere to render in tree mode), OR whose pid has reappeared (a recycled
+    # number — it is live again, so it should render as a normal/green row).
+    for pid in [p for p, (_i, ppid, t) in _TOMBSTONES.items()
+                if t < cutoff or ppid not in cur_procs or p in cur_procs]:
+        del _TOMBSTONES[pid]
 
 
 def _cpu_pct(info):
@@ -342,15 +441,19 @@ def _sort_procs(infos):
                   reverse=_SORT_DIR[_SORT_KEY])
 
 
-def _proc_item(info, *, has_children):
+def _proc_item(info, *, has_children, row_fg=None):
     """Build one process ``Item`` carrying the gutter display columns.
 
-    Shared by the tree and flat builders so the ``col_*`` gutter fields
-    (``col_pid`` / ``col_user`` / ``col_cpu`` / ``col_mem``) and the title (the
-    full command line) are assigned in exactly one place. ``.pid`` / ``.user``
-    ride along for the existing signal / preview handlers. ``has_children`` is
-    the caller's call: the ppid hierarchy in tree mode, always ``False`` in flat
-    mode (every flat row is a leaf).
+    Shared by the tree, flat AND tombstone builders so the ``col_*`` gutter
+    fields (``col_pid`` / ``col_user`` / ``col_cpu`` / ``col_mem``) and the title
+    (the full command line) are assigned in exactly one place — tombstone rows
+    pass their saved ``ProcInfo`` so a finished process still renders its
+    last-known columns. ``.pid`` / ``.user`` ride along for the existing signal /
+    preview handlers. ``has_children`` is the caller's call: the ppid hierarchy
+    in tree mode, always ``False`` in flat mode and for tombstones (every flat /
+    tombstone row is a leaf). ``row_fg`` (a soft 256-colour int) is the
+    highlight colour — soft green for a freshly-appeared pid, soft red for a
+    tombstone; ``None`` leaves the row uncoloured.
     """
     item = Item(id=info.pid, title=info.args, has_children=has_children)
     item.user = info.user
@@ -359,7 +462,55 @@ def _proc_item(info, *, has_children):
     item.col_user = info.user
     item.col_cpu = f'{_cpu_pct(info)}%'
     item.col_mem = human_size(info.mem_bytes)
+    if row_fg is not None:
+        item.row_fg = row_fg
     return item
+
+
+def _scoped_tombstones(parent_id):
+    """The finished-leaf ``ProcInfo``s to show in this scope (B9).
+
+    Empty unless ``_HIGHLIGHT_MODE`` is on (highlighting off → dead processes
+    just disappear). In **flat** mode every tombstone shows at the root (each is
+    trivially a leaf); a non-root scope shows none. In **tree** mode a tombstone
+    shows under its FORMER parent (``former_ppid == parent_id``). Returns the
+    saved ProcInfo objects so the caller can sort them in alongside the live rows
+    via the shared ``_sort_procs`` path.
+    """
+    if not _HIGHLIGHT_MODE or not _TOMBSTONES:
+        return []
+    if not _TREE_MODE:
+        if parent_id is not None:
+            return []
+        return [info for info, _ppid, _t in _TOMBSTONES.values()]
+    return [info for info, former_ppid, _t in _TOMBSTONES.values()
+            if former_ppid == parent_id]
+
+
+def _build_rows(live_infos, child_of, tombstones):
+    """Build the sorted Item list for one scope, with highlight colours (B9).
+
+    ``live_infos`` are the live ``ProcInfo``s for the scope; ``child_of(pid)``
+    reports whether a live pid has children (the tree expander; always ``False``
+    in flat mode); ``tombstones`` are the finished-leaf ProcInfos to interleave.
+    Live and tombstone infos are sorted TOGETHER by the active key (so tombstones
+    sort into the flat list / under their parent like any other row), then each
+    becomes an Item: live pids in ``_APPEARED_AT`` get the soft-green highlight
+    (when on), tombstones the soft-red one and ``has_children=False``. With
+    highlighting off ``tombstones`` is empty and ``_APPEARED_AT`` is ignored, so
+    no ``row_fg`` is set and dead rows are absent.
+    """
+    tomb_pids = {info.pid for info in tombstones}
+    items = []
+    for info in _sort_procs(list(live_infos) + list(tombstones)):
+        if info.pid in tomb_pids:
+            items.append(_proc_item(info, has_children=False, row_fg=_HL_GONE_FG))
+        else:
+            fg = (_HL_NEW_FG if _HIGHLIGHT_MODE and info.pid in _APPEARED_AT
+                  else None)
+            items.append(_proc_item(info, has_children=child_of(info.pid),
+                                    row_fg=fg))
+    return items
 
 
 def get_children(parent_id, *, reload=False):
@@ -381,16 +532,22 @@ def get_children(parent_id, *, reload=False):
     carries the gutter display columns (``col_pid`` / ``col_user`` / ``col_cpu``
     / ``col_mem``) and a title of the full command line; ``.pid`` / ``.user`` are
     kept for the existing signal/preview handlers (see ``_proc_item``).
+
+    When highlight mode is on (the ``h`` action), freshly-appeared pids get a
+    soft-green ``row_fg`` and non-expired finished-leaf TOMBSTONE rows (soft red)
+    are interleaved into the sorted list under their former parent (tree) or at
+    the flat root — see ``_build_rows`` / ``_scoped_tombstones``. The diff that
+    feeds this always runs in ``_snapshot``; ``h`` only gates the display.
     """
     procs = _snapshot(reload=reload)
-    if not procs:
+    tombstones = _scoped_tombstones(parent_id)
+    if not procs and not tombstones:
         return []
 
     if not _TREE_MODE:
         if parent_id is not None:
             return []                            # flat rows are leaves
-        return [_proc_item(info, has_children=False)
-                for info in _sort_procs(procs.values())]
+        return _build_rows(procs.values(), lambda _pid: False, tombstones)
 
     by_ppid = {}
     for info in procs.values():
@@ -405,8 +562,15 @@ def get_children(parent_id, *, reload=False):
     else:
         targets = by_ppid.get(parent_id, [])
 
-    return [_proc_item(info, has_children=bool(by_ppid.get(info.pid)))
-            for info in _sort_procs(targets)]
+    # A live parent whose only surviving "child" is a tombstone still needs
+    # ``has_children`` so the framework lets the user expand to it (its live
+    # children are gone from ``by_ppid``). Count tombstones under each pid too.
+    tomb_parents = {ppid for _i, ppid, _t in _TOMBSTONES.values()} \
+        if _HIGHLIGHT_MODE else set()
+    return _build_rows(
+        targets,
+        lambda pid: bool(by_ppid.get(pid)) or pid in tomb_parents,
+        tombstones)
 
 
 # --- Gutter columns (B3) ----------------------------------------------------
@@ -514,6 +678,23 @@ def _action_toggle_tree(ctx):
     pending = ctx.refresh()
     if target_id is not None:
         pending.then(lambda: ctx.cursor_to(target_id))
+
+
+def _action_toggle_highlight(ctx):
+    """Flip new/finished highlighting on/off (the ``h`` action, B9).
+
+    The snapshot diff always runs (CPU% needs it), so this toggles only the
+    DISPLAY: with it on, freshly-appeared pids glow soft green and finished-leaf
+    tombstone rows appear soft red; with it off, no ``row_fg`` is set and dead
+    rows vanish. Flips ``_HIGHLIGHT_MODE``, flashes the new state, and
+    ``refresh()``es so ``get_children`` re-builds with/without the colours and
+    tombstone rows. Flipping on immediately surfaces whatever changed within the
+    last ``_HIGHLIGHT_SECS`` (the diff kept running while it was off).
+    """
+    global _HIGHLIGHT_MODE
+    _HIGHLIGHT_MODE = not _HIGHLIGHT_MODE
+    ctx.flash(f"highlight: {'on' if _HIGHLIGHT_MODE else 'off'}")
+    ctx.refresh()
 
 
 def _set_sort(ctx, key):
@@ -799,6 +980,11 @@ Preview reads /proc/<pid>/status.
           capitals). Re-press the active key to reverse it; each key
           remembers its own direction. In tree mode each parent's
           children are sorted; in flat mode the whole list is.
+  h       toggle htop -H-style change highlighting: freshly-appeared
+          pids glow soft green and finished leaf processes linger as
+          soft-red tombstone rows for ~3.5 s, then fade. Off by
+          default; the diff still runs, so toggling on shows recent
+          changes at once.
 
 Right-click a process (or the backslash / F1 keys) for a menu: send
 a signal (submenu), page its open files / sockets / environment /
@@ -877,6 +1063,10 @@ def main():
             Action('k', 'Kill cursor pid (SIGTERM, with confirm)',
                    kill_proc, 'cursor'),
             Action('t', 'Toggle flat / tree view', _action_toggle_tree, 'none'),
+            # htop -H-style new/finished highlighting (B9): the snapshot diff
+            # always runs; ``h`` toggles the soft green/red display + tombstones.
+            Action('h', 'Toggle new/finished highlighting',
+                   _action_toggle_highlight, 'none'),
             # htop-style sort modes (B5): the active key reverses on repeat,
             # otherwise switches to that key's remembered direction.
             Action('N', 'Sort by pid (asc)',   _sort_action('pid'),       'none'),
