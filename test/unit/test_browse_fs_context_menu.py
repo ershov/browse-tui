@@ -70,7 +70,9 @@ def _stub_browse_tui():
     mod.cell_ljust = lambda s, width, fill=' ': s.ljust(width, fill)
     mod.cell_rjust = lambda s, width, fill=' ': s.rjust(width, fill)
     mod.style = lambda name: (None, False)
-    mod.default_row_content = lambda item, ctx: []
+    mod.default_row_selection = lambda item, ctx: []
+    mod.default_row_indent = lambda item, ctx: []
+    mod.default_row_expander = lambda item, ctx: []
     mod.recipe_argv = lambda: []
     sys.modules['browse_tui'] = mod
 

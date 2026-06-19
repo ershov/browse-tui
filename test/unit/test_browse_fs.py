@@ -1,8 +1,8 @@
-"""Unit tests for the ``recipes/browse-fs`` columnar list (ticket #661).
+"""Unit tests for the ``recipes/browse-fs`` columnar list (tickets #661, #1114).
 
 The recipe is a single-file ``--run-py`` script that imports
 ``browse_tui`` (only available when the binary loads it). To exercise
-``fs_row_content`` and ``get_children`` directly we stub ``browse_tui``
+``fs_chrome`` and ``get_children`` directly we stub ``browse_tui``
 in ``sys.modules`` and load the extension-less recipe via
 ``SourceFileLoader`` — the same pattern as ``test/unit/test_browse_git.py``.
 
@@ -10,19 +10,20 @@ The point of these tests is to verify the recipe *wires* the column
 helpers correctly, not to re-test the helpers themselves (``cell_ljust`` /
 ``cell_rjust`` are covered by Stage 1's ``test_render``). So the stub
 provides functional-enough ``cell_ljust`` / ``cell_rjust`` / ``style`` /
-``default_row_content`` and a fake ``ctx`` whose ``max_col_width(field)``
-returns a fixed width per field.
+chrome atoms (``default_row_selection`` / ``default_row_indent`` /
+``default_row_expander``) and a fake ``ctx`` whose
+``max_col_width_global(field)`` returns a fixed width per field.
 
 Coverage:
 
-* ``fs_row_content``  — pads each metadata column to its
-  ``max_col_width`` and emits the title segment LAST; rows of differing
-  perms/size/mtime lengths align (equal per-column segment widths); an
-  item WITHOUT ``col_perms`` falls back to exactly
-  ``default_row_content(item, ctx)``.
+* ``fs_chrome``       — the perms/size/date columns now sit in a LEFT
+  *gutter* (between the selection marker and the tree indent), padded to
+  their ``max_col_width_global`` width; columns align across rows of
+  differing depth; an item WITHOUT ``col_perms`` emits an EMPTY gutter
+  (just the default chrome atoms).
 * ``get_children``    — stores ``col_perms`` / ``col_size`` / ``col_mtime``
   on each Item and no longer stuffs the size into ``tag``; the error row
-  carries no ``col_*`` (so it falls back).
+  carries no ``col_*`` (so it gets an empty gutter).
 """
 
 import contextlib
@@ -106,10 +107,12 @@ def _stub_browse_tui():
     recipe's unit test doesn't bleed in. ``Item`` keeps its kwargs as
     attributes so ``get_children`` tests can read ``.col_*`` / ``.tag``;
     ``Browser`` / ``BrowserConfig`` / ``Action`` are inert. The column
-    helpers (``cell_ljust`` / ``cell_rjust`` / ``style`` /
-    ``default_row_content``) are functional-but-minimal: the test data is
+    helpers (``cell_ljust`` / ``cell_rjust`` / ``style``) and the chrome
+    atoms (``default_row_selection`` / ``default_row_indent`` /
+    ``default_row_expander``) are functional-but-minimal: the test data is
     plain ASCII, so ``str.ljust`` / ``str.rjust`` measure the same as the
-    real cell-aware helpers, and that is enough to prove the wiring.
+    real cell-aware helpers, and the atoms mirror the framework's segment
+    shape closely enough to prove the gutter composition.
     """
     mod = types.ModuleType('browse_tui')
 
@@ -128,11 +131,28 @@ def _stub_browse_tui():
     mod.cell_rjust = lambda s, width, fill=' ': s.rjust(width, fill)
     mod.style = lambda name: _DIM if name == 'dim' else (None, False)
 
-    def _default_row_content(item, ctx):
-        # A recognisable sentinel so the fallback path is unambiguous.
-        return [('DEFAULT', getattr(item, 'id', None), getattr(item, 'title', None))]
+    # Chrome atoms, mirroring the framework's segment shapes (040-state.py):
+    # a single-segment list each, with the meta-row blanking rules. The fake
+    # ctx below supplies the kind / selected / depth / expanded it reads.
+    def _default_row_selection(item, ctx):
+        marker = '  ' if ctx.kind == 'meta' else ('* ' if ctx.selected else '  ')
+        return [(marker, None, False)]
 
-    mod.default_row_content = _default_row_content
+    def _default_row_indent(item, ctx):
+        return [('  ' * max(ctx.depth, 0), None, False)]
+
+    def _default_row_expander(item, ctx):
+        if ctx.kind == 'meta':
+            marker = '  '
+        elif getattr(item, 'has_children', False):
+            marker = '▼ ' if ctx.expanded else '▶ '
+        else:
+            marker = '  '
+        return [(marker, None, False)]
+
+    mod.default_row_selection = _default_row_selection
+    mod.default_row_indent = _default_row_indent
+    mod.default_row_expander = _default_row_expander
     mod.recipe_argv = _stub_recipe_argv
     sys.modules['browse_tui'] = mod
 
@@ -156,13 +176,24 @@ def _load_recipe():
 
 
 class _FakeCtx:
-    """A ``RowContext`` stand-in: ``max_col_width(field)`` → fixed width."""
+    """A ``RowContext`` stand-in for the gutter chrome.
 
-    def __init__(self, widths):
+    ``max_col_width_global(field)`` returns a fixed width per field (and
+    records the order of lookups in ``calls``). The chrome atoms also read
+    ``kind`` / ``selected`` / ``depth`` / ``expanded``; defaults model an
+    unselected, top-level, collapsed normal row.
+    """
+
+    def __init__(self, widths, *, kind='item', selected=False, depth=0,
+                 expanded=False):
         self._widths = widths
         self.calls = []
+        self.kind = kind
+        self.selected = selected
+        self.depth = depth
+        self.expanded = expanded
 
-    def max_col_width(self, field, parent_id=None):
+    def max_col_width_global(self, field):
         self.calls.append(field)
         return self._widths[field]
 
@@ -172,8 +203,14 @@ def _make_item(r, **kw):
     return r.Item(**kw)
 
 
-class TestFsRowContent(unittest.TestCase):
-    """``fs_row_content`` assembles padded columns with the title last."""
+class TestFsChrome(unittest.TestCase):
+    """``fs_chrome`` puts perms/size/date in a LEFT gutter (ticket #1114).
+
+    Order is ``selection, <gutter: perms size date>, indent, expander`` — the
+    metadata columns sit BEFORE the tree indent/expander so they stay pinned
+    at the left edge regardless of depth. The name is rendered by the default
+    content (not by ``fs_chrome``), so the chrome ends at the expander.
+    """
 
     @classmethod
     def setUpClass(cls):
@@ -182,28 +219,33 @@ class TestFsRowContent(unittest.TestCase):
     def _widths(self, perms=10, size=4, mtime=12):
         return {'col_perms': perms, 'col_size': size, 'col_mtime': mtime}
 
-    def test_columns_padded_and_title_last(self):
+    def test_gutter_order_padding_and_no_title(self):
         ctx = _FakeCtx(self._widths(perms=10, size=4, mtime=12))
         item = _make_item(
             self.r, id='/d/f', title='f.txt',
             col_perms='-rw-r--r--', col_size='12K', col_mtime='Jun 03 11:08')
-        segs = self.r.fs_row_content(item, ctx)
+        segs = self.r.fs_chrome(item, ctx)
 
-        # Four segments: perms, size, mtime, title.
-        self.assertEqual(len(segs), 4)
-        perms_seg, size_seg, mtime_seg, title_seg = segs
+        # selection + 3 gutter columns + indent + expander = 6 segments.
+        # The title is NOT in chrome (the default content renders it).
+        self.assertEqual(len(segs), 6)
+        sel, perms_seg, size_seg, mtime_seg, indent_seg, expander_seg = segs
 
-        # Each metadata segment is the padded column + a two-space gap,
-        # carries the dim (fg, bold) from style('dim').
+        # Selection marker first (unselected, normal row → '  ').
+        self.assertEqual(sel, ('  ', None, False))
+
+        # Gutter columns: padded + two-space gap, dim (fg, bold) from
+        # style('dim'). perms ljust, size rjust, mtime ljust.
         self.assertEqual(perms_seg, ('-rw-r--r--' + '  ', _DIM[0], _DIM[1]))
-        self.assertEqual(size_seg, (' 12K' + '  ', _DIM[0], _DIM[1]))   # rjust to 4
+        self.assertEqual(size_seg, (' 12K' + '  ', _DIM[0], _DIM[1]))   # rjust 4
         self.assertEqual(mtime_seg, ('Jun 03 11:08' + '  ', _DIM[0], _DIM[1]))
 
-        # Title comes LAST and is the plain item title (no fg, not bold),
-        # so a narrow pane truncates the name not the metadata.
-        self.assertEqual(title_seg, ('f.txt', None, False))
+        # Indent (depth 0 → '') and expander (leaf → '  ') come AFTER the
+        # gutter — proving the columns sit LEFT of the tree chrome.
+        self.assertEqual(indent_seg, ('', None, False))
+        self.assertEqual(expander_seg[0], '  ')
 
-        # Widths were sourced from max_col_width for each column field.
+        # Columns measured via the GLOBAL width, in column order.
         self.assertEqual(ctx.calls, ['col_perms', 'col_size', 'col_mtime'])
 
     def test_size_is_right_justified(self):
@@ -213,53 +255,76 @@ class TestFsRowContent(unittest.TestCase):
         item = _make_item(
             self.r, id='/d/sub', title='sub/',
             col_perms='drwxr-xr-x', col_size='', col_mtime='Jun 03 11:08')
-        size_seg = self.r.fs_row_content(item, ctx)[1]
+        # Gutter is segments[1:4] (after the selection marker); size is [2].
+        size_seg = self.r.fs_chrome(item, ctx)[2]
         self.assertEqual(size_seg, ('     ' + '  ', _DIM[0], _DIM[1]))  # 5 spaces
 
-    def test_rows_align_across_differing_lengths(self):
-        # Two rows whose raw perms/size/mtime differ in length must, once
-        # padded to the per-column max, yield equal segment widths — that
-        # is the whole point of max_col_width-driven alignment.
+    def test_gutter_aligns_across_differing_depths(self):
+        # The whole point of max_col_width_global: a deep row's perms column
+        # lines up under a shallow row's perms column. The gutter sits BEFORE
+        # the indent, so the indent (which differs by depth) does NOT shift
+        # the columns — every gutter segment is byte-for-byte equal across
+        # rows regardless of depth.
         widths = self._widths(perms=10, size=6, mtime=12)
-        ctx = _FakeCtx(widths)
-        a = _make_item(
+        shallow = _make_item(
             self.r, id='/d/a', title='a',
             col_perms='-rw-r--r--', col_size='3B', col_mtime='Jun 03 11:08')
-        b = _make_item(
-            self.r, id='/d/bbbb', title='bbbb',
+        deep = _make_item(
+            self.r, id='/d/x/y/b', title='b',
             col_perms='drwxr-xr-x', col_size='123456', col_mtime='May 01 09:00')
-        segs_a = self.r.fs_row_content(a, _FakeCtx(widths))
-        segs_b = self.r.fs_row_content(b, ctx)
+        segs_shallow = self.r.fs_chrome(shallow, _FakeCtx(widths, depth=0))
+        segs_deep = self.r.fs_chrome(deep, _FakeCtx(widths, depth=3))
 
-        # Per metadata column (perms/size/mtime → indices 0/1/2) the text
-        # length is identical across the two rows.
-        for col in range(3):
-            self.assertEqual(len(segs_a[col][0]), len(segs_b[col][0]),
-                             f'column {col} widths differ between rows')
-        # Concrete widths: column field width + 2-space gap.
-        self.assertEqual(len(segs_a[0][0]), 10 + 2)
-        self.assertEqual(len(segs_a[1][0]), 6 + 2)
-        self.assertEqual(len(segs_a[2][0]), 12 + 2)
+        # Gutter columns are indices 1/2/3 (after the selection marker) in
+        # BOTH rows — byte-for-byte equal width, so a deep row's columns line
+        # up under a shallow row's. The deeper indent comes AFTER the gutter.
+        for col in (1, 2, 3):
+            self.assertEqual(len(segs_shallow[col][0]), len(segs_deep[col][0]),
+                             f'gutter column {col} widths differ across rows')
+        # Concrete widths: field width + 2-space gap.
+        self.assertEqual(len(segs_shallow[1][0]), 10 + 2)   # perms
+        self.assertEqual(len(segs_shallow[2][0]), 6 + 2)    # size
+        self.assertEqual(len(segs_shallow[3][0]), 12 + 2)   # mtime
 
-    def test_fallback_when_no_col_perms(self):
-        # An item without col_perms (error / synthetic) must return EXACTLY
-        # default_row_content(item, ctx) — no columns, no max_col_width call.
+        # The indent segment (index -2) reflects the depth and is LONGER for
+        # the deep row, confirming the gutter precedes (is unaffected by) it.
+        self.assertEqual(segs_shallow[-2][0], '')
+        self.assertEqual(segs_deep[-2][0], '  ' * 3)
+
+    def test_empty_gutter_when_no_col_perms(self):
+        # An item without col_perms (error / synthetic) emits an EMPTY gutter:
+        # just selection + indent + expander, no metadata columns and no
+        # global-width measurement. The default content then renders the row.
         ctx = _FakeCtx(self._widths())
         item = _make_item(self.r, id=('err', '/x'), title='[error] boom',
                           tag='err', tag_style='red')
-        segs = self.r.fs_row_content(item, ctx)
-        self.assertEqual(segs, self.r.default_row_content(item, ctx))
-        self.assertEqual(segs, [('DEFAULT', ('err', '/x'), '[error] boom')])
-        # The fallback path must not measure columns.
+        segs = self.r.fs_chrome(item, ctx)
+        # 3 segments only (selection, indent, expander) — no gutter columns.
+        self.assertEqual(len(segs), 3)
+        self.assertEqual(segs[0], ('  ', None, False))   # selection
+        self.assertEqual(segs[1], ('', None, False))     # indent (depth 0)
+        self.assertEqual(segs[2][0], '  ')               # expander (leaf)
+        # The empty-gutter path must not measure columns.
         self.assertEqual(ctx.calls, [])
 
-    def test_explicit_none_col_perms_also_falls_back(self):
-        # Defensive: col_perms present but None still takes the fallback.
+    def test_explicit_none_col_perms_also_empty_gutter(self):
+        # Defensive: col_perms present but None still emits the empty gutter.
         ctx = _FakeCtx(self._widths())
         item = _make_item(self.r, id='/d/x', title='x', col_perms=None)
-        segs = self.r.fs_row_content(item, ctx)
-        self.assertEqual(segs, self.r.default_row_content(item, ctx))
+        segs = self.r.fs_chrome(item, ctx)
+        self.assertEqual(len(segs), 3)
         self.assertEqual(ctx.calls, [])
+
+    def test_selected_marker_and_expander_glyph(self):
+        # A selected, expanded parent row shows '* ' and '▼ ' around the
+        # gutter — the gutter is invariant; the chrome atoms reflect state.
+        ctx = _FakeCtx(self._widths(), selected=True, expanded=True)
+        item = _make_item(
+            self.r, id='/d/sub', title='sub/', has_children=True,
+            col_perms='drwxr-xr-x', col_size='', col_mtime='Jun 03 11:08')
+        segs = self.r.fs_chrome(item, ctx)
+        self.assertEqual(segs[0], ('* ', None, False))   # selected
+        self.assertEqual(segs[-1][0], '▼ ')              # expanded parent
 
 
 class TestGetChildren(unittest.TestCase):
@@ -305,7 +370,7 @@ class TestGetChildren(unittest.TestCase):
 
     def test_error_row_has_no_columns(self):
         # A path that can't be scanned yields the single error Item, which
-        # must NOT carry col_* so fs_row_content falls back for it.
+        # must NOT carry col_* so fs_chrome emits an empty gutter for it.
         missing = os.path.join(tempfile.gettempdir(),
                                'definitely-missing-dir-xyz-661')
         # Ensure it truly doesn't exist.
@@ -321,9 +386,9 @@ class TestGetChildren(unittest.TestCase):
         self.assertIsNone(getattr(err, 'col_perms', None))
         self.assertIsNone(getattr(err, 'col_size', None))
         self.assertIsNone(getattr(err, 'col_mtime', None))
-        # And fs_row_content takes the fallback for it.
-        self.assertEqual(self.r.fs_row_content(err, _FakeCtx({})),
-                         self.r.default_row_content(err, _FakeCtx({})))
+        # And fs_chrome emits an EMPTY gutter for it (just the three chrome
+        # atoms — no metadata columns), so the default content renders it.
+        self.assertEqual(len(self.r.fs_chrome(err, _FakeCtx({}))), 3)
         # get_preview routes the error id via its tuple tag (not os.scandir
         # / open) and surfaces the failing path from id[1].
         self.assertEqual(self.r.get_preview(err.id), missing)

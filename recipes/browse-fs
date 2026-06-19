@@ -45,7 +45,8 @@ import time
 
 from browse_tui import (
     Action, Browser, BrowserConfig, Item,
-    cell_ljust, cell_rjust, default_row_content, recipe_argv, style,
+    cell_ljust, cell_rjust, default_row_expander, default_row_indent,
+    default_row_selection, recipe_argv, style,
 )
 
 # Probe ``delta`` once at load (not per render): the context-menu "Diff" entry
@@ -111,7 +112,7 @@ def _set_columns(item, st, is_dir):
     row describes the entry itself, e.g. a symlink, not its target).
     """
     # Size moved out of the `tag` chip into the col_size column; rows
-    # carry no tag now (fs_row_content renders the metadata columns).
+    # carry no tag now (fs_chrome renders the metadata columns in the gutter).
     item.col_perms = stat.filemode(st.st_mode)
     item.col_size = '' if is_dir else human_size(st.st_size)
     item.col_mtime = time.strftime('%b %d %H:%M', time.localtime(st.st_mtime))
@@ -240,26 +241,44 @@ def get_children(path, *, reload=False):
     return items
 
 
-def fs_row_content(item, ctx):
-    """Columnar content: perms | size | mtime | name (flexible, last).
+def _fs_gutter_segments(item, ctx):
+    """The perms | size | mtime gutter columns for a normal row.
 
-    Each metadata column is left/right-justified to the widest sibling
-    value (``ctx.max_col_width`` over the row's parent group) and rendered
-    dim; the title comes LAST so a narrow pane truncates the name rather
-    than the metadata. Error / synthetic rows (no ``col_perms``) fall back
-    to the framework default content. Only the content region is taken
-    over — chrome (tree indent + ▼/▶) stays framework-owned.
+    Each column is left/right-justified to its GLOBAL width
+    (``ctx.max_col_width_global`` over ALL loaded items, not just the row's
+    siblings) so the gutter lines up across the whole list regardless of
+    tree depth — a deep row's perms align under a shallow row's perms.
+    Rendered dim, with a two-space gap after each column (matching the old
+    content layout). Returns a list so it concatenates with the chrome atoms.
     """
-    if getattr(item, 'col_perms', None) is None:
-        return default_row_content(item, ctx)    # error/synthetic row
-    w = ctx.max_col_width
+    gw = ctx.max_col_width_global
     dfg, dbold = style('dim')
     return [
-        (cell_ljust(item.col_perms, w('col_perms')) + '  ', dfg, dbold),
-        (cell_rjust(item.col_size,  w('col_size'))  + '  ', dfg, dbold),
-        (cell_ljust(item.col_mtime, w('col_mtime')) + '  ', dfg, dbold),
-        (item.title, None, False),        # flexible column, last
+        (cell_ljust(item.col_perms, gw('col_perms')) + '  ', dfg, dbold),
+        (cell_rjust(item.col_size,  gw('col_size'))  + '  ', dfg, dbold),
+        (cell_ljust(item.col_mtime, gw('col_mtime')) + '  ', dfg, dbold),
     ]
+
+
+def fs_chrome(item, ctx):
+    """Row chrome with the perms/size/date columns in a LEFT gutter.
+
+    Order: ``selection, <gutter: perms size date>, indent, expander`` — the
+    gutter sits between the selection marker and the tree indent, so the
+    metadata columns stay fixed at the left edge instead of shifting right
+    with tree depth (the default content then renders the name as the
+    flexible last segment, truncating at the pane edge).
+
+    Error / synthetic rows (no ``col_perms``) emit an EMPTY gutter — just the
+    default chrome atoms — so the default content renders the error/tag row
+    normally.
+    """
+    chrome = default_row_selection(item, ctx)
+    if getattr(item, 'col_perms', None) is not None:
+        chrome += _fs_gutter_segments(item, ctx)
+    chrome += default_row_indent(item, ctx)
+    chrome += default_row_expander(item, ctx)
+    return chrome
 
 
 def _dir_listing(path):
@@ -957,7 +976,7 @@ def main():
         show_children_pane=False,
         get_children=get_children,
         get_preview=get_preview,
-        format_row_content=fs_row_content,
+        format_row_chrome=fs_chrome,
         root_id=root,
         actions=actions,
         on_enter=_on_enter,
