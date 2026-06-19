@@ -18,7 +18,10 @@ on the first sample or for a freshly-appeared pid.
 Reload with ctrl-r; a background daemon thread also auto-reloads every ``-d``
 seconds (default ``4.0``; ``-d 0`` disables it). ``t`` toggles between the ppid
 tree (default) and a flat list of every process (``--tree`` / ``--no-tree`` set
-the initial mode). The
+the initial mode). The number keys ``1`` / ``2`` / ``3`` pick the gutter
+display mode — which columns show left of the command line: ``1`` = command
+line only (empty gutter), ``2`` = pid only, ``3`` = pid · user · cpu% · mem
+(the default). The
 htop-style capitals ``N`` / ``P`` / ``M`` / ``T`` / ``U`` sort by pid / CPU% /
 memory / CPU time / user (re-press the active key to reverse it; each key
 remembers its own direction). ``h`` toggles htop-``-H``-style change
@@ -121,6 +124,19 @@ _HIGHLIGHT_MODE = False
 # the ``--tree`` / ``--no-tree`` CLI flags set it before launch. ``get_children``
 # dispatches on it (see B4).
 _TREE_MODE = True
+
+# Display mode (number keys 1/2/3) — selects which subset of the fixed
+# pid · user · cpu% · mem gutter (``ps_gutter_segments``) the LEFT gutter shows:
+#   1 = command line only → EMPTY gutter (just selection + indent + expander)
+#   2 = pid only
+#   3 = pid · user · cpu% · mem  (the default, full set)
+# Switched by the ``1`` / ``2`` / ``3`` Actions (``_set_display_mode``), each
+# flashing the mode and refreshing. The columns are always a SUBSET in the same
+# order — the mode only gates how many show, so switching is a pure re-render of
+# the existing ``col_*`` fields (no snapshot refetch). The command line (the row
+# title) is the flexible last column rendered by the default content in every
+# mode. Defaults to 3 (the full htop-like row).
+_DISPLAY_MODE = 3
 
 # Sort state (B5, htop-style capitals). ``_SORT_KEY`` is the active ``ProcInfo``
 # field; ``_SORT_DIR`` remembers each key's last direction (``False`` = ascending,
@@ -576,7 +592,7 @@ def get_children(parent_id, *, reload=False):
 # --- Gutter columns (B3) ----------------------------------------------------
 
 def ps_gutter_segments(item, ctx):
-    """Fixed ``pid · user · cpu% · mem`` columns for the left gutter.
+    """The active display mode's subset of the pid·user·cpu%·mem gutter columns.
 
     Sits between the selection marker and the tree indent (see ``ps_chrome``)
     so the columns don't drift rightward as tree depth grows. pid / cpu% / mem
@@ -585,19 +601,27 @@ def ps_gutter_segments(item, ctx):
     whole tree regardless of each row's depth. A single space separates the
     columns (and trails the last) to match the spec example spacing. All dim.
 
+    Gated by ``_DISPLAY_MODE`` (the ``1`` / ``2`` / ``3`` keys) — always a
+    leading SUBSET in the same order, never reordered:
+      * mode 1 → ``[]`` (an EMPTY gutter — the command line only);
+      * mode 2 → ``pid`` only;
+      * mode 3 → ``pid · user · cpu% · mem`` (the default, full set).
+
     A row missing the ``col_*`` fields (no normal process row should) yields an
     empty gutter so the default content still renders.
     """
-    if getattr(item, 'col_pid', None) is None:
-        return []                                # synthetic/edge row → no gutter
+    if _DISPLAY_MODE == 1 or getattr(item, 'col_pid', None) is None:
+        return []                # mode 1 / synthetic/edge row → no gutter
     w = ctx.max_col_width_global
     dfg, dbold = style('dim')
-    return [
-        (cell_rjust(item.col_pid,  w('col_pid'))  + ' ', dfg, dbold),
-        (cell_ljust(item.col_user, w('col_user')) + ' ', dfg, dbold),
-        (cell_rjust(item.col_cpu,  w('col_cpu'))  + ' ', dfg, dbold),
-        (cell_rjust(item.col_mem,  w('col_mem'))  + ' ', dfg, dbold),
-    ]
+    segs = [(cell_rjust(item.col_pid, w('col_pid')) + ' ', dfg, dbold)]
+    if _DISPLAY_MODE == 3:
+        segs.extend([
+            (cell_ljust(item.col_user, w('col_user')) + ' ', dfg, dbold),
+            (cell_rjust(item.col_cpu,  w('col_cpu'))  + ' ', dfg, dbold),
+            (cell_rjust(item.col_mem,  w('col_mem'))  + ' ', dfg, dbold),
+        ])
+    return segs
 
 
 def ps_chrome(item, ctx):
@@ -694,6 +718,27 @@ def _action_toggle_highlight(ctx):
     global _HIGHLIGHT_MODE
     _HIGHLIGHT_MODE = not _HIGHLIGHT_MODE
     ctx.flash(f"highlight: {'on' if _HIGHLIGHT_MODE else 'off'}")
+    ctx.refresh()
+
+
+# One-line label for each display mode, used in the switch flash.
+_MODE_LABELS = {
+    1: 'command line only',
+    2: 'pid',
+    3: 'pid · user · cpu% · mem',
+}
+
+
+def _set_display_mode(ctx, mode):
+    """Switch the gutter column set to ``mode`` (1/2/3), flash it, and refresh.
+
+    The mode only changes which columns ``ps_gutter_segments`` emits (the
+    ``col_*`` strings are already on every item), so a refresh is enough to
+    repaint the gutter at the new widths — no snapshot refetch needed.
+    """
+    global _DISPLAY_MODE
+    _DISPLAY_MODE = mode
+    ctx.flash(f'display: {_MODE_LABELS[mode]}')
     ctx.refresh()
 
 
@@ -974,6 +1019,9 @@ ride along as columns. Reload the tree with Ctrl-R; a background thread
 also auto-reloads every -d seconds (default 4.0; -d 0 disables it).
 Preview reads /proc/<pid>/status.
 
+  1 2 3   pick the gutter display mode (which columns show left of the
+          command line): 1 = command line only (empty gutter), 2 = pid
+          only, 3 = pid / user / CPU% / memory (the default).
   t       toggle flat / tree view (--tree / --no-tree set the initial
           mode). Flat lists every process; tree groups by ppid.
   N P M T U  sort by pid / CPU% / memory / CPU time / user (htop-style
@@ -1067,6 +1115,10 @@ def main():
             # always runs; ``h`` toggles the soft green/red display + tombstones.
             Action('h', 'Toggle new/finished highlighting',
                    _action_toggle_highlight, 'none'),
+            # Display modes — the gutter column set (see ``ps_gutter_segments``).
+            Action('1', 'Display: command line only', lambda c: _set_display_mode(c, 1), 'none'),
+            Action('2', 'Display: pid',               lambda c: _set_display_mode(c, 2), 'none'),
+            Action('3', 'Display: pid/user/cpu%/mem', lambda c: _set_display_mode(c, 3), 'none'),
             # htop-style sort modes (B5): the active key reverses on repeat,
             # otherwise switches to that key's remembered direction.
             Action('N', 'Sort by pid (asc)',   _sort_action('pid'),       'none'),

@@ -938,6 +938,114 @@ class TestPsGutterSegments(unittest.TestCase):
         self.assertEqual(ctx.calls, [])
 
 
+class _ModeCtx:
+    """A minimal ``ctx`` for the display-mode switch actions.
+
+    Records ``flash`` text and ``refresh`` calls — the two side-effects
+    ``_set_display_mode`` performs besides flipping the module global.
+    """
+
+    def __init__(self):
+        self.flashes = []
+        self.refreshed = 0
+
+    def flash(self, text, log=False):
+        self.flashes.append(text)
+
+    def refresh(self):
+        self.refreshed += 1
+
+
+class TestDisplayModes(unittest.TestCase):
+    """Display modes (number keys 1/2/3) gate the gutter column set (#1119).
+
+    ``_DISPLAY_MODE`` selects which leading SUBSET of the pid·user·cpu%·mem
+    columns ``ps_gutter_segments`` emits: mode 1 = empty gutter (command line
+    only), mode 2 = pid only, mode 3 = pid·user·cpu%·mem (the default). The
+    ``col_*`` strings are always on every item; the mode only chooses how many
+    the gutter renders, so a switch is a pure re-render. Each test drives
+    ``_DISPLAY_MODE`` directly and restores it via ``addCleanup`` (it is a
+    module global).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+        cls.dim = cls.r.style('dim')          # the real (fg, bold) dim pair
+
+    def setUp(self):
+        self._saved_mode = self.r._DISPLAY_MODE
+        self.addCleanup(setattr, self.r, '_DISPLAY_MODE', self._saved_mode)
+
+    # -- the per-mode gutter column set ------------------------------------
+
+    def test_mode_1_is_empty_gutter(self):
+        # Mode 1 = command line only → no gutter columns and no width
+        # measurement (the row is just selection + indent + expander + cmdline).
+        self.r._DISPLAY_MODE = 1
+        ctx = _FakeCtx(_GW)
+        item = _ps_item(self.r, 1, 'root', '10%', '100M')
+        self.assertEqual(self.r.ps_gutter_segments(item, ctx), [])
+        self.assertEqual(ctx.calls, [])
+        # And the whole chrome is just selection + indent + expander = 3.
+        self.assertEqual(len(self.r.ps_chrome(item, _FakeCtx(_GW))), 3)
+
+    def test_mode_2_is_pid_only(self):
+        # Mode 2 = pid only: one right-justified, dim, space-trailed column.
+        self.r._DISPLAY_MODE = 2
+        ctx = _FakeCtx(_GW)
+        item = _ps_item(self.r, 1, 'root', '10%', '100M')
+        segs = self.r.ps_gutter_segments(item, ctx)
+        dfg, dbold = self.dim
+        self.assertEqual(len(segs), 1)
+        self.assertEqual(segs[0], ('    1' + ' ', dfg, dbold))   # rjust 5
+        self.assertEqual(ctx.calls, ['col_pid'])
+
+    def test_mode_3_is_full_set(self):
+        # Mode 3 = pid · user · cpu% · mem (default): the full four columns,
+        # identical to the historical gutter (pid/cpu/mem rjust, user ljust).
+        self.r._DISPLAY_MODE = 3
+        ctx = _FakeCtx(_GW)
+        item = _ps_item(self.r, 1, 'root', '10%', '100M')
+        segs = self.r.ps_gutter_segments(item, ctx)
+        dfg, dbold = self.dim
+        self.assertEqual(len(segs), 4)
+        self.assertEqual(segs[0], ('    1' + ' ', dfg, dbold))     # rjust 5
+        self.assertEqual(segs[1], ('root    ' + ' ', dfg, dbold))  # ljust 8
+        self.assertEqual(segs[2], (' 10%' + ' ', dfg, dbold))      # rjust 4
+        self.assertEqual(segs[3], (' 100M' + ' ', dfg, dbold))     # rjust 5
+        self.assertEqual(ctx.calls,
+                         ['col_pid', 'col_user', 'col_cpu', 'col_mem'])
+
+    def test_modes_2_and_3_share_the_pid_column(self):
+        # Mode 2's gutter is exactly mode 3's leading prefix — same order, a
+        # strict subset (no reordering, no chrome change).
+        item = _ps_item(self.r, 1, 'root', '10%', '100M')
+        self.r._DISPLAY_MODE = 3
+        full = self.r.ps_gutter_segments(item, _FakeCtx(_GW))
+        self.r._DISPLAY_MODE = 2
+        pid_only = self.r.ps_gutter_segments(item, _FakeCtx(_GW))
+        self.assertEqual(pid_only, full[:1])
+
+    # -- the mode-switch actions -------------------------------------------
+
+    def test_set_display_mode_flips_global_flashes_and_refreshes(self):
+        # Each action sets _DISPLAY_MODE, flashes the mode, and refreshes.
+        for mode in (1, 2, 3):
+            ctx = _ModeCtx()
+            self.r._set_display_mode(ctx, mode)
+            self.assertEqual(self.r._DISPLAY_MODE, mode)
+            self.assertEqual(ctx.refreshed, 1)
+            self.assertEqual(len(ctx.flashes), 1)
+            # The flash names the active mode's column set.
+            self.assertIn(self.r._MODE_LABELS[mode], ctx.flashes[0])
+
+    def test_default_display_mode_is_3(self):
+        # Freshly loaded, the recipe defaults to mode 3 (the full gutter).
+        fresh = _load_recipe()
+        self.assertEqual(fresh._DISPLAY_MODE, 3)
+
+
 class TestPsChrome(unittest.TestCase):
     """``ps_chrome`` puts the gutter between the selection marker and indent."""
 
