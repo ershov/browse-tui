@@ -15,10 +15,12 @@ full command line. CPU% is the instantaneous cumulative-time delta between the
 current and previous snapshot, falling back to the ``ps pcpu`` lifetime average
 on the first sample or for a freshly-appeared pid.
 
-Reload with ctrl-r. Custom action ``k:Kill`` sends SIGTERM to the
-selected pid (with a y/n confirmation). A right-click context menu
-(``on_context_menu``) re-invokes ``ctx.menu`` for a flat signal submenu
-and pages auxiliary process data (lsof / ss / /proc/<pid>/{environ,status}).
+Reload with ctrl-r. ``t`` toggles between the ppid tree (default) and a flat,
+pid-sorted list of every process (``--tree`` / ``--no-tree`` set the initial
+mode). Custom action ``k:Kill`` sends SIGTERM to the selected pid (with a y/n
+confirmation). A right-click context menu (``on_context_menu``) re-invokes
+``ctx.menu`` for a flat signal submenu and pages auxiliary process data
+(lsof / ss / /proc/<pid>/{environ,status}).
 
 Demonstrates: live system data, hierarchical children built from an
 external CLI, /proc-based preview, a destructive custom Action, and a
@@ -35,7 +37,7 @@ import time
 from browse_tui import (
     Action, Browser, BrowserConfig, Item,
     cell_ljust, cell_rjust, default_row_expander, default_row_indent,
-    default_row_selection, style,
+    default_row_selection, recipe_argv, style,
 )
 
 
@@ -57,6 +59,11 @@ _UID_NAMES = {}
 # time across reloads. Each is ``(wall_clock, {pid: ProcInfo})`` or ``None``.
 _PREV_SNAPSHOT = None
 _CUR_SNAPSHOT = None
+
+# View mode: ``True`` = the ppid hierarchy (default), ``False`` = one flat,
+# pid-sorted list. The ``t`` action flips it; the ``--tree`` / ``--no-tree`` CLI
+# flags set it before launch. ``get_children`` dispatches on it (see B4).
+_TREE_MODE = True
 
 
 class ProcInfo:
@@ -264,21 +271,54 @@ def _cpu_pct(info):
     return int(round(info.pcpu))
 
 
+def _proc_item(info, *, has_children):
+    """Build one process ``Item`` carrying the gutter display columns.
+
+    Shared by the tree and flat builders so the ``col_*`` gutter fields
+    (``col_pid`` / ``col_user`` / ``col_cpu`` / ``col_mem``) and the title (the
+    full command line) are assigned in exactly one place. ``.pid`` / ``.user``
+    ride along for the existing signal / preview handlers. ``has_children`` is
+    the caller's call: the ppid hierarchy in tree mode, always ``False`` in flat
+    mode (every flat row is a leaf).
+    """
+    item = Item(id=info.pid, title=info.args, has_children=has_children)
+    item.user = info.user
+    item.pid = info.pid
+    item.col_pid = str(info.pid)
+    item.col_user = info.user
+    item.col_cpu = f'{_cpu_pct(info)}%'
+    item.col_mem = human_size(info.mem_bytes)
+    return item
+
+
 def get_children(parent_id, *, reload=False):
     """Children of ``parent_id``, built from the per-reload snapshot.
 
-    ``None`` (root): return the init process — PID 1 on Linux. If
-    we somehow can't find it (non-Linux, restricted environment), fall
-    back to processes with ppid == 0 minus the kernel-thread PID 2.
-    Otherwise: direct children of ``parent_id``.
+    Dispatches on ``_TREE_MODE`` (the ``t`` action / ``--tree`` flag):
+
+    - **tree** (default): ``None`` (root) returns the init process — PID 1 on
+      Linux. If we somehow can't find it (non-Linux, restricted environment),
+      fall back to processes with ppid == 0 minus the kernel-thread PID 2.
+      Otherwise the direct children of ``parent_id``.
+    - **flat**: ``None`` (root) returns *every* process as one pid-sorted list,
+      each a leaf (``has_children=False``); any non-None pid returns ``[]``
+      (flat rows don't expand).
 
     Each Item carries the gutter display columns (``col_pid`` / ``col_user`` /
     ``col_cpu`` / ``col_mem``) and a title of the full command line; ``.pid`` /
-    ``.user`` are kept for the existing signal/preview handlers.
+    ``.user`` are kept for the existing signal/preview handlers (see
+    ``_proc_item``).
     """
     procs = _snapshot(reload=reload)
     if not procs:
         return []
+
+    if not _TREE_MODE:
+        if parent_id is not None:
+            return []                            # flat rows are leaves
+        return [_proc_item(info, has_children=False)
+                for info in sorted(procs.values(), key=lambda i: i.pid)]
+
     by_ppid = {}
     for info in procs.values():
         by_ppid.setdefault(info.ppid, []).append(info)
@@ -292,21 +332,8 @@ def get_children(parent_id, *, reload=False):
     else:
         targets = by_ppid.get(parent_id, [])
 
-    items = []
-    for info in sorted(targets, key=lambda i: i.pid):
-        item = Item(
-            id=info.pid,
-            title=info.args,
-            has_children=bool(by_ppid.get(info.pid)),
-        )
-        item.user = info.user
-        item.pid = info.pid
-        item.col_pid = str(info.pid)
-        item.col_user = info.user
-        item.col_cpu = f'{_cpu_pct(info)}%'
-        item.col_mem = human_size(info.mem_bytes)
-        items.append(item)
-    return items
+    return [_proc_item(info, has_children=bool(by_ppid.get(info.pid)))
+            for info in sorted(targets, key=lambda i: i.pid)]
 
 
 # --- Gutter columns (B3) ----------------------------------------------------
@@ -393,6 +420,27 @@ def _send_signal(ctx, signum, name, *, confirm):
 def kill_proc(ctx):
     """Send SIGTERM to the cursor pid, behind a Yes/No confirm dialog."""
     _send_signal(ctx, signal.SIGTERM, 'SIGTERM', confirm=True)
+
+
+def _action_toggle_tree(ctx):
+    """Flip flat ↔ tree view; preserve the cursor on the same pid.
+
+    Mirrors browse-claude's ``t``: flip ``_TREE_MODE``, flash the new mode, and
+    ``refresh()`` (which refetches the root + every expanded parent). The pid is
+    a stable id across both layouts, so re-homing the cursor needs no ancestor
+    walk — capture the pid before the refresh wipes the cache and ``cursor_to``
+    it once the new root children settle (chained off the refresh ``Pending`` so
+    the row exists before the cursor move runs).
+    """
+    global _TREE_MODE
+    target_id = ctx.cursor.id if ctx.cursor else None
+
+    _TREE_MODE = not _TREE_MODE
+    ctx.flash(f"view: {'tree' if _TREE_MODE else 'flat'}")
+
+    pending = ctx.refresh()
+    if target_id is not None:
+        pending.then(lambda: ctx.cursor_to(target_id))
 
 
 # Signal menu, in the order shown. Each row is ``(name, signum, destructive)``;
@@ -641,13 +689,33 @@ pid. The row title is the full command line; pid / user / CPU% / memory
 ride along as columns. Reload the tree with Ctrl-R; preview reads
 /proc/<pid>/status.
 
+  t       toggle flat / tree view (--tree / --no-tree set the initial
+          mode). Flat lists every process pid-sorted; tree groups by ppid.
+
 Right-click a process (or the backslash / F1 keys) for a menu: send
 a signal (submenu), page its open files / sockets / environment /
 full status, renice it, or attach strace.\
 """
 
 
+def _apply_view_flags():
+    """Set ``_TREE_MODE`` from ``--tree`` / ``--no-tree`` on the command line.
+
+    Parsed off ``recipe_argv()`` (framework-owned flags like ``--tty`` already
+    stripped) so the recipe's own flags don't collide with the framework's.
+    ``--tree`` wins if both are passed; absent either, the default tree mode
+    stands.
+    """
+    global _TREE_MODE
+    argv = recipe_argv()
+    if '--tree' in argv:
+        _TREE_MODE = True
+    elif '--no-tree' in argv:
+        _TREE_MODE = False
+
+
 def main():
+    _apply_view_flags()
     sys.exit(Browser(BrowserConfig(
         title='browse-ps',
         get_children=get_children,
@@ -655,6 +723,7 @@ def main():
         actions=[
             Action('k', 'Kill cursor pid (SIGTERM, with confirm)',
                    kill_proc, 'cursor'),
+            Action('t', 'Toggle flat / tree view', _action_toggle_tree, 'none'),
         ],
         # Right-click (or the backslash / F1 keys) on a process row opens a
         # menu: signals (submenu), open files / sockets / environment / status

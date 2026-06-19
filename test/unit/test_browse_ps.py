@@ -80,6 +80,9 @@ def _stub_browse_tui():
     mod.default_row_selection = _FW_STATE.default_row_selection
     mod.default_row_indent = _FW_STATE.default_row_indent
     mod.default_row_expander = _FW_STATE.default_row_expander
+    # The genuine framework ``recipe_argv`` (strips --tty etc.); the CLI flag
+    # tests drive it by patching ``_FW_STATE.sys.argv`` (its argv source).
+    mod.recipe_argv = _FW_STATE.recipe_argv
     sys.modules['browse_tui'] = mod
 
 
@@ -465,6 +468,174 @@ class TestGetChildrenColumns(_DataLayerBase):
             for item in self._children(parent, reload=(parent is None)):
                 self.assertIsNone(getattr(item, 'tag', None))
                 self.assertIsNone(getattr(item, 'tag_style', None))
+
+
+# --- Flat / tree toggle (B4) ------------------------------------------------
+
+# A small canned table with a two-level hierarchy AND a grandchild, so flat
+# mode (every process, one list) is visibly distinct from tree mode (root →
+# pid 1; a pid → its direct children only).
+_PS_TREE = (
+    '    1     0 root  0.0  100 00:00:01 /sbin/init\n'
+    '  100     1 root  1.0  200 00:00:02 parent\n'
+    '  200   100 root  2.0  300 00:00:03 child\n'
+    '  300   200 root  3.0  400 00:00:04 grandchild\n'
+)
+
+
+class TestTreeFlatDispatch(_DataLayerBase):
+    """``get_children`` dispatches on ``_TREE_MODE`` (B4)."""
+
+    def _children(self, parent, *, tree, ps_out=_PS_TREE, reload=True):
+        self.r._TREE_MODE = tree
+        with mock.patch.object(self.r.subprocess, 'run', _ps_completed(ps_out)), \
+             mock.patch.object(self.r.sys, 'platform', 'linux'), \
+             mock.patch.object(self.r, '_private_mem_bytes', lambda pid: None):
+            return self.r.get_children(parent, reload=reload)
+
+    def test_tree_root_is_pid1(self):
+        # tree mode root → just the init process (current behavior).
+        kids = self._children(None, tree=True)
+        self.assertEqual([k.id for k in kids], [1])
+        self.assertTrue(kids[0].has_children)
+
+    def test_tree_child_listing(self):
+        # tree mode: a pid → its DIRECT children only (pid 100 → pid 200).
+        kids = self._children(100, tree=True, reload=False)
+        self.assertEqual([k.id for k in kids], [200])
+        self.assertTrue(kids[0].has_children)             # 200 has child 300
+
+    def test_flat_root_is_all_processes_pid_sorted(self):
+        # flat mode root → every process, ascending pid, all leaves.
+        kids = self._children(None, tree=False)
+        self.assertEqual([k.id for k in kids], [1, 100, 200, 300])
+        for k in kids:
+            self.assertFalse(k.has_children)
+
+    def test_flat_non_root_is_empty(self):
+        # flat rows don't expand: any non-None pid → [].
+        self.assertEqual(self._children(100, tree=False, reload=False), [])
+        self.assertEqual(self._children(1, tree=False, reload=False), [])
+
+    def test_flat_rows_carry_the_same_columns(self):
+        # The shared ``_proc_item`` builder gives flat rows the col_* gutter
+        # fields and the full-args title, exactly like tree rows.
+        kids = self._children(None, tree=False)
+        row = next(k for k in kids if k.id == 100)
+        self.assertEqual(row.title, 'parent')
+        self.assertEqual(row.col_pid, '100')
+        self.assertEqual(row.col_user, 'root')
+        self.assertEqual(row.col_mem, self.r.human_size(200 * 1024))
+        self.assertEqual(row.pid, 100)
+
+    def test_flat_empty_ps_yields_no_children(self):
+        # The graceful ps-error → [] behaviour holds in flat mode too.
+        self.assertEqual(self._children(None, tree=False, ps_out=''), [])
+
+
+class TestToggleTreeAction(unittest.TestCase):
+    """The ``t`` action flips ``_TREE_MODE``, flashes, refreshes, re-homes."""
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self.r._TREE_MODE = True
+        # A get_children that reads the live _TREE_MODE so a refresh actually
+        # rebuilds the list per the new mode (and the same pid survives the
+        # switch, so cursor restore has a target to land on).
+        def _kids(_id, *, reload=False):
+            if not self.r._TREE_MODE and _id is not None:
+                return []
+            item = Item(id=42, title='proc', has_children=False)
+            return [item]
+        self.b = make_browser(get_children=_kids)
+        self.b.refresh()
+        self.b.run_until_idle()
+        self.b.cursor_to(42)
+        self.b.run_until_idle()
+        self.ctx = Context(self.b)
+
+    def tearDown(self):
+        self.b.stop_workers()
+
+    def test_flips_mode_and_flashes(self):
+        self.assertTrue(self.r._TREE_MODE)
+        self.r._action_toggle_tree(self.ctx)
+        self.b.run_until_idle()
+        self.assertFalse(self.r._TREE_MODE)
+        self.assertEqual(self.b._notice.text, 'view: flat')
+        # And back again.
+        self.r._action_toggle_tree(self.ctx)
+        self.b.run_until_idle()
+        self.assertTrue(self.r._TREE_MODE)
+        self.assertEqual(self.b._notice.text, 'view: tree')
+
+    def test_cursor_restored_on_same_pid_after_refresh(self):
+        # The cursor sits on pid 42 before the toggle; after the refresh +
+        # chained cursor_to it must still sit on pid 42.
+        self.assertEqual(self.ctx.cursor.id, 42)
+        self.r._action_toggle_tree(self.ctx)
+        self.b.run_until_idle()
+        self.assertEqual(self.ctx.cursor.id, 42)
+
+    def test_refresh_is_invoked(self):
+        # The action must refresh() so the new mode's children are refetched.
+        with mock.patch.object(self.ctx, 'refresh',
+                               wraps=self.ctx.refresh) as spy:
+            self.r._action_toggle_tree(self.ctx)
+            self.b.run_until_idle()
+        spy.assert_called_once()
+
+    def test_no_cursor_still_flips_and_refreshes(self):
+        # An empty list (no cursor) must not crash the toggle: it flips,
+        # flashes and refreshes, just without a cursor restore.
+        empty = make_browser(get_children=lambda _id, *, reload=False: [])
+        try:
+            empty.refresh()
+            empty.run_until_idle()
+            ctx = Context(empty)
+            self.assertIsNone(ctx.cursor)
+            self.r._action_toggle_tree(ctx)
+            empty.run_until_idle()
+            self.assertFalse(self.r._TREE_MODE)
+            self.assertEqual(empty._notice.text, 'view: flat')
+        finally:
+            empty.stop_workers()
+
+
+class TestViewFlagsCli(unittest.TestCase):
+    """``--tree`` / ``--no-tree`` set the initial mode (parsed via recipe_argv)."""
+
+    def setUp(self):
+        self.r = _load_recipe()
+
+    def _apply(self, argv):
+        self.r._TREE_MODE = True
+        # ``_apply_view_flags`` reads the genuine ``recipe_argv()``, which
+        # sources from the framework module's ``sys.argv`` — patch that.
+        with mock.patch.object(_FW_STATE.sys, 'argv', ['browse-ps', *argv]):
+            self.r._apply_view_flags()
+        return self.r._TREE_MODE
+
+    def test_default_is_tree(self):
+        self.assertTrue(self._apply([]))
+
+    def test_no_tree_selects_flat(self):
+        self.assertFalse(self._apply(['--no-tree']))
+
+    def test_tree_selects_tree(self):
+        # Starting from flat, --tree restores tree mode.
+        self.r._TREE_MODE = False
+        with mock.patch.object(_FW_STATE.sys, 'argv', ['browse-ps', '--tree']):
+            self.r._apply_view_flags()
+        self.assertTrue(self.r._TREE_MODE)
+
+    def test_tree_wins_when_both_given(self):
+        self.assertTrue(self._apply(['--no-tree', '--tree']))
+
+    def test_framework_tty_flag_not_misread(self):
+        # recipe_argv strips --tty + its value; --no-tree after it still wins
+        # (and the device path is never mistaken for a positional / flag).
+        self.assertFalse(self._apply(['--tty', '/dev/pts/3', '--no-tree']))
 
 
 # --- Gutter columns (B3) ----------------------------------------------------
