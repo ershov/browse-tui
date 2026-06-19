@@ -42,16 +42,18 @@ class TestBrowsePs(unittest.TestCase):
         """Top-level renders PID 1 and quits cleanly."""
         with TmuxFixture(cols=120, rows=30) as t:
             t.launch(_BIN, '--run-py', _RECIPE)
-            # PID 1 always exists on Linux. ``pid=1`` is in the tag we
-            # render for every row, so it's a uniquely cheap match.
-            t.wait_for('pid=1', timeout=5.0)
+            # PID 1 always exists on Linux. It now rides in the left gutter as
+            # a right-justified ``pid`` column (the old ``pid=1`` tag chip is
+            # gone — B3), rendered immediately before its ``root`` user column.
+            # ``1 root`` is the cheapest unique signal the gutter rendered.
+            t.wait_for('1 root', timeout=5.0)
             t.send('q')
 
     def test_preview_shows_proc_status(self):
         """The preview pane renders /proc/<pid>/status content."""
         with TmuxFixture(cols=120, rows=30) as t:
             t.launch(_BIN, '--run-py', _RECIPE)
-            t.wait_for('pid=1', timeout=5.0)
+            t.wait_for('1 root', timeout=5.0)
             # /proc/<pid>/status always begins with a ``Name:`` line —
             # the cheapest signal that the preview worker fired.
             t.wait_for('Name:', timeout=5.0)

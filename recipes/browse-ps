@@ -1,16 +1,33 @@
 #!/usr/bin/env -S browse-tui --run-py
 """browse-ps — interactive process tree.
 
-Builds a hierarchy from ``ps -eo pid,ppid,user,comm``. Each process is
-an Item; children are processes whose ``ppid == this pid``. The root
-of the tree is PID 1 (init / systemd) on Linux; everything else is
-descendants. Kernel threads (ppid == 0, except PID 1) are skipped to
-keep the tree readable.
+Builds a hierarchy from ``ps -eo pid=,ppid=,user=,pcpu=,rss=,time=,args=``.
+Each process is an Item; children are processes whose ``ppid == this pid``.
+The root of the tree is PID 1 (init / systemd) on Linux; everything else is
+descendants. Kernel threads (ppid == 0, except PID 1) are skipped to keep the
+tree readable.
 
-Reload with ctrl-r. Custom action ``k:Kill`` sends SIGTERM to the
-selected pid (with a y/n confirmation). A right-click context menu
-(``on_context_menu``) re-invokes ``ctx.menu`` for a flat signal submenu
-and pages auxiliary process data (lsof / ss / /proc/<pid>/{environ,status}).
+A single ``_snapshot`` per reload fetches the whole process table once and
+builds a ``{pid: ProcInfo}`` map (pid, ppid, user, cpu%, private/RSS memory,
+cumulative CPU time, full command line). Each Item carries display columns
+(``col_pid`` / ``col_user`` / ``col_cpu`` / ``col_mem``); the row title is the
+full command line. CPU% is the instantaneous cumulative-time delta between the
+current and previous snapshot, falling back to the ``ps pcpu`` lifetime average
+on the first sample or for a freshly-appeared pid.
+
+Reload with ctrl-r; a background daemon thread also auto-reloads every ``-d``
+seconds (default ``4.0``; ``-d 0`` disables it). ``t`` toggles between the ppid
+tree (default) and a flat list of every process (``--tree`` / ``--no-tree`` set
+the initial mode). The
+htop-style capitals ``N`` / ``P`` / ``M`` / ``T`` / ``U`` sort by pid / CPU% /
+memory / CPU time / user (re-press the active key to reverse it; each key
+remembers its own direction). ``h`` toggles htop-``-H``-style change
+highlighting: freshly-appeared pids glow soft green and finished leaf
+processes linger as soft-red tombstone rows for a few seconds (see B9). Custom
+action ``k:Kill`` sends SIGTERM to the selected pid (with a y/n confirmation). A
+right-click context menu (``on_context_menu``) re-invokes ``ctx.menu`` for a
+flat signal submenu and pages auxiliary process data (lsof / ss /
+/proc/<pid>/{environ,status}).
 
 Demonstrates: live system data, hierarchical children built from an
 external CLI, /proc-based preview, a destructive custom Action, and a
@@ -22,79 +39,579 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
+import time
 
-from browse_tui import Action, Browser, BrowserConfig, Item
+from browse_tui import (
+    Action, Browser, BrowserConfig, Item,
+    cell_ljust, cell_rjust, default_row_expander, default_row_indent,
+    default_row_selection, recipe_argv, style,
+)
 
 
-def _list_procs():
-    """Return ``[(pid, ppid, user, comm), …]`` from ``ps``.
+# --- Process data layer -----------------------------------------------------
 
-    Errors are swallowed: on a platform where ``ps`` is missing or the
-    output is malformed we return ``[]`` rather than crash the UI.
+# How wide to ask ``ps`` to render the user column on Linux (procps). Default is
+# 8 chars and truncates long account names; the ``user:<w>`` form widens it.
+# Verified honoured on this box (procps); a variant that ignores it triggers the
+# uid+pwd fallback in ``_snapshot`` (see ``_PS_USER_WIDTH_OK``).
+_PS_USER_WIDTH = 32
+
+# Linux only: when ``ps -o user:<w>`` is NOT honoured (the column still truncates
+# at 8), fall back to ``ps -o uid=`` + this per-UID pwd cache. ``None`` until the
+# first snapshot probes the width; thereafter ``True``/``False``.
+_PS_USER_WIDTH_OK = None
+_UID_NAMES = {}
+
+# Two most-recent snapshots, kept module-level so CPU% can diff cumulative CPU
+# time across reloads. Each is ``(wall_clock, {pid: ProcInfo})`` or ``None``.
+_PREV_SNAPSHOT = None
+_CUR_SNAPSHOT = None
+
+
+def _now():
+    """Monotonic clock for the snapshot wall-clock + the highlight timers.
+
+    A thin module-level wrapper around ``time.monotonic`` so the new/finished
+    diff (B9) can be tested deterministically — tests patch ``_now`` to advance
+    time WITHOUT sleeping. The snapshot's CPU%-delta wall-clock reads it too, so
+    both the CPU% gap and the appeared/vanished timestamps share one clock.
+    """
+    return time.monotonic()
+
+
+# --- New/finished highlighting (B9) -----------------------------------------
+
+# How long (wall seconds) a change stays highlighted: a freshly-appeared pid
+# glows green, a finished leaf lingers as a red tombstone, then both expire.
+# Hardcoded per the spec.
+_HIGHLIGHT_SECS = 3.5
+
+# Soft 256-colour foreground codes for the ``item.row_fg`` highlight. Deliberately
+# the muted xterm-256 pastels, NOT the harsh bright green/red (ANSI 2/1):
+#   108 = #87af87 (sage green) for new pids; 174 = #d78787 (dusty rose) for
+# finished tombstones. Easy on the eyes for a whole row of dim gutter columns,
+# matching the htop-style "subtle change cue, not an alarm" intent.
+_HL_NEW_FG = 108
+_HL_GONE_FG = 174
+
+# ``{pid: monotonic_time}`` — when each currently-live pid was FIRST seen. Set on
+# the resample where a pid appears in the current snapshot but not the previous
+# one; existing pids keep their original timestamp. Entries older than
+# ``_HIGHLIGHT_SECS`` are pruned each resample. Drives the green ``row_fg``.
+_APPEARED_AT = {}
+
+# ``{pid: (ProcInfo, former_ppid, vanished_at)}`` — finished LEAF processes. On a
+# resample, a pid in the previous snapshot but not the current one that had NO
+# children in the previous snapshot becomes a tombstone: a saved ProcInfo (so the
+# row can still render its columns), its former ppid (for tree placement), and
+# the death time. A pid that HAD children is not tombstoned — its row just
+# vanishes and survivors reparent on the next build. Pruned each resample when
+# older than ``_HIGHLIGHT_SECS`` OR its former parent is no longer live.
+_TOMBSTONES = {}
+
+# Display toggle (the ``h`` action). The diff above ALWAYS runs (CPU% needs the
+# snapshot rotation), but the green row_fg / red tombstone ROWS only show when
+# this is on. htop's ``-H`` is opt-in, so default OFF; flipping ``h`` on
+# immediately surfaces whatever changed within the last ``_HIGHLIGHT_SECS``.
+_HIGHLIGHT_MODE = False
+
+# View mode: ``True`` = the ppid hierarchy (default), ``False`` = one flat list
+# (ordered by the active sort key — pid by default). The ``t`` action flips it;
+# the ``--tree`` / ``--no-tree`` CLI flags set it before launch. ``get_children``
+# dispatches on it (see B4).
+_TREE_MODE = True
+
+# Sort state (B5, htop-style capitals). ``_SORT_KEY`` is the active ``ProcInfo``
+# field; ``_SORT_DIR`` remembers each key's last direction (``False`` = ascending,
+# ``True`` = descending) so switching away and back restores it. Pressing the
+# active key reverses its direction. Seeded with the spec defaults: pid/user
+# ascending, cpu%/mem/cpu_secs descending. ``_sort_procs`` applies the active
+# key to whichever list ``get_children`` is about to return (a parent's children
+# in tree mode, the whole table in flat mode), tie-breaking by pid.
+_SORT_KEY = 'pid'
+_SORT_DIR = {
+    'pid': False,        # ascending
+    'cpu_pct': True,     # descending
+    'mem_bytes': True,   # descending
+    'cpu_secs': True,    # descending
+    'user': False,       # ascending
+}
+
+# Per-sort-key display label, for the ``sort: <label> <arrow>`` flash.
+_SORT_LABELS = {
+    'pid': 'pid',
+    'cpu_pct': 'cpu%',
+    'mem_bytes': 'mem',
+    'cpu_secs': 'time',
+    'user': 'user',
+}
+
+# Background updater (B8). ``-d <seconds>`` sets the refresh interval; the
+# default is auto-update ON every 4 s, and a value <= 0 disables it (no thread
+# started). The daemon worker ticks every interval and calls ``b.refresh()``
+# (thread-safe — it ``post``s ``_do_refresh`` onto the UI thread), which
+# re-samples the process snapshot (CPU% deltas + the new/finished diff ride that
+# same sample). ``_UPDATE_STOP`` / ``_UPDATE_THREAD`` are created in ``main`` and
+# torn down in its ``finally``. Mirrors browse-claude's tail-worker daemon.
+_DEFAULT_UPDATE_INTERVAL = 4.0
+_UPDATE_STOP = None    # threading.Event; created in main()
+_UPDATE_THREAD = None  # threading.Thread; created in main()
+
+
+class ProcInfo:
+    """One process row from a snapshot.
+
+    Carries the raw fields parsed from ``ps`` (plus Linux private memory) so the
+    tree builder and the column/CPU% logic share one source of truth: ``pid`` /
+    ``ppid`` (ints), ``user`` (untruncated name), ``pcpu`` (the ps lifetime-
+    average percent, the CPU% fallback), ``rss_bytes`` (resident set), ``cpu_secs``
+    (cumulative CPU time, the delta input + time sort key), ``mem_bytes`` (the
+    chosen memory figure — private on Linux, RSS elsewhere), and ``args`` (the
+    full command line → row title).
+    """
+
+    def __init__(self, pid, ppid, user, pcpu, rss_bytes, cpu_secs, args):
+        self.pid = pid
+        self.ppid = ppid
+        self.user = user
+        self.pcpu = pcpu
+        self.rss_bytes = rss_bytes
+        self.cpu_secs = cpu_secs
+        self.args = args
+        # Memory figure shown in the gutter; private on Linux, RSS elsewhere.
+        # Defaults to RSS and is upgraded in ``_snapshot`` where smaps applies.
+        self.mem_bytes = rss_bytes
+
+
+def human_size(n):
+    """``1536`` → ``'1K'`` — compact binary size (matches browse-fs)."""
+    for unit in ('B', 'K', 'M', 'G', 'T'):
+        if n < 1024:
+            return f'{n}{unit}'
+        n //= 1024
+    return f'{n}P'
+
+
+def _parse_time(field):
+    """``[[DD-]HH:]MM:SS`` (ps ``time`` column) → integer seconds.
+
+    Accepts the POSIX ``MM:SS``, the ``HH:MM:SS`` and the BSD/long ``DD-HH:MM:SS``
+    shapes. Unparseable input yields ``0`` (graceful — the row still renders).
+    """
+    days = 0
+    if '-' in field:
+        d, _, field = field.partition('-')
+        try:
+            days = int(d)
+        except ValueError:
+            return 0
+    parts = field.split(':')
+    try:
+        nums = [int(p) for p in parts]
+    except ValueError:
+        return 0
+    secs = 0
+    for n in nums:                       # left-to-right: …:HH:MM:SS
+        secs = secs * 60 + n
+    return days * 86400 + secs
+
+
+def _private_mem_bytes(pid):
+    """Linux private memory (``Private_Clean + Private_Dirty``) for ``pid``.
+
+    Reads ``/proc/<pid>/smaps_rollup`` (one small file). Returns ``None`` when
+    the file is absent (old kernel), unreadable (permissions), or malformed, so
+    the caller can fall back to RSS.
     """
     try:
-        out = subprocess.run(
-            ['ps', '-eo', 'pid=,ppid=,user=,comm='],
+        with open(f'/proc/{pid}/smaps_rollup') as f:
+            text = f.read()
+    except OSError:
+        return None
+    total = 0
+    found = False
+    for line in text.splitlines():
+        if line.startswith(('Private_Clean:', 'Private_Dirty:')):
+            try:
+                total += int(line.split()[1]) * 1024   # the value is in kB
+                found = True
+            except (IndexError, ValueError):
+                return None
+    return total if found else None
+
+
+def _ps_user_args():
+    """``ps`` argv for the user column, probing the ``:width`` form on Linux.
+
+    On Linux (procps) we ask for ``user:<w>`` to defeat the 8-char truncation;
+    elsewhere (macOS/BSD) plain ``user=`` is already untruncated. Returns the
+    ``-o`` spec string for the user field.
+    """
+    if sys.platform == 'darwin':
+        return 'user='
+    return f'user:{_PS_USER_WIDTH}='
+
+
+def _resolve_uid(uid):
+    """Username for a numeric ``uid`` via a per-UID pwd cache (Linux fallback)."""
+    if uid in _UID_NAMES:
+        return _UID_NAMES[uid]
+    try:
+        import pwd
+        name = pwd.getpwuid(int(uid)).pw_name
+    except (KeyError, ValueError, ImportError):
+        name = str(uid)
+    _UID_NAMES[uid] = name
+    return name
+
+
+def _run_ps(user_field):
+    """Run ``ps`` for the snapshot; return stdout or ``''`` on any failure.
+
+    Errors are swallowed (missing ``ps`` / non-zero exit) so the UI degrades to
+    an empty tree rather than crashing — the original browse-procs behaviour.
+    """
+    try:
+        return subprocess.run(
+            ['ps', '-eo', f'pid=,ppid=,{user_field},pcpu=,rss=,time=,args='],
             check=True, capture_output=True, text=True).stdout
     except (OSError, subprocess.CalledProcessError):
-        return []
-    procs = []
+        return ''
+
+
+def _snapshot(*, reload=False):
+    """Return ``{pid: ProcInfo}`` for the current process table.
+
+    Resamples (fresh ``ps`` + a new ``ProcInfo`` map, rotating the previous one
+    into ``_PREV_SNAPSHOT``) when ``reload=True`` OR no snapshot exists yet;
+    otherwise reuses the cached ``_CUR_SNAPSHOT``. The framework enqueues only
+    the root with ``reload=True`` on a full refresh (descendant re-fetches and
+    lazy expansions pass ``reload=False``), so this yields exactly one sample
+    per reload cycle and every ``get_children`` in that cycle shares it.
+
+    Linux usernames come from ``ps -o user:<w>``; if that variant ignores the
+    width and truncates at 8, we re-run with ``uid=`` + a pwd cache (probed once
+    per process via ``_PS_USER_WIDTH_OK``). Memory is private (smaps_rollup) on
+    Linux where readable, else RSS.
+    """
+    global _PREV_SNAPSHOT, _CUR_SNAPSHOT, _PS_USER_WIDTH_OK
+
+    if not reload and _CUR_SNAPSHOT is not None:
+        return _CUR_SNAPSHOT[1]
+
+    use_uid = sys.platform != 'darwin' and _PS_USER_WIDTH_OK is False
+    out = _run_ps('uid=' if use_uid else _ps_user_args())
+
+    # Probe (Linux, once): a procps variant that ignores ``user:<w>`` caps every
+    # name at the legacy 8 chars. If the widest user field is exactly 8 we treat
+    # the width as unhonoured and latch the uid+pwd fallback (re-running with
+    # ``uid=``). The heuristic can't tell a genuine 8-char name from a truncated
+    # one, but uid+pwd then yields the same/better name, so a false latch is
+    # harmless. Probed against the parsed user column (3rd field).
+    if (_PS_USER_WIDTH_OK is None and sys.platform != 'darwin'):
+        widths = [len(line.split(None, 3)[2])
+                  for line in out.splitlines() if len(line.split(None, 3)) >= 3]
+        _PS_USER_WIDTH_OK = not (widths and max(widths) == 8)
+        if not _PS_USER_WIDTH_OK:
+            use_uid = True
+            out = _run_ps('uid=')
+
+    procs = {}
     for line in out.splitlines():
-        parts = line.split(None, 3)
-        if len(parts) < 4:
+        # Split into exactly 7 fields, KEEPING args (which contains spaces)
+        # intact via maxsplit=6.
+        parts = line.split(None, 6)
+        if len(parts) < 7:
             continue
         try:
             pid = int(parts[0])
             ppid = int(parts[1])
+            pcpu = float(parts[3])
+            rss_kb = int(parts[4])
         except ValueError:
             continue
-        procs.append((pid, ppid, parts[2], parts[3]))
+        user = _resolve_uid(parts[2]) if use_uid else parts[2]
+        info = ProcInfo(pid, ppid, user, pcpu, rss_kb * 1024,
+                        _parse_time(parts[5]), parts[6])
+        if sys.platform != 'darwin':
+            private = _private_mem_bytes(pid)
+            if private is not None:
+                info.mem_bytes = private
+        procs[pid] = info
+
+    _PREV_SNAPSHOT = _CUR_SNAPSHOT
+    _CUR_SNAPSHOT = (_now(), procs)
+    _diff_snapshot(_PREV_SNAPSHOT, _CUR_SNAPSHOT)
     return procs
 
 
-def _by_ppid(procs):
-    """Group ``procs`` by parent pid: ``{ppid: [proc, …]}``."""
-    out = {}
-    for p in procs:
-        out.setdefault(p[1], []).append(p)
-    return out
+def _diff_snapshot(prev, cur):
+    """Track appeared/vanished pids across a resample (B9) — always runs.
+
+    Called on every resample (right after ``_CUR_SNAPSHOT`` rotates), independent
+    of ``_HIGHLIGHT_MODE`` (the display toggle gates only the colours/tombstone
+    rows, not the bookkeeping). Maintains, keyed by pid:
+
+    - ``_APPEARED_AT[pid]`` — the monotonic time a pid was FIRST seen. Set when a
+      pid is in ``cur`` but not ``prev``; existing pids keep their timestamp.
+    - ``_TOMBSTONES[pid]`` — finished LEAF processes: a pid in ``prev`` but not
+      ``cur`` that had NO children in ``prev`` is recorded as
+      ``(saved ProcInfo, former_ppid, vanished_at)``. A pid that HAD children is
+      NOT tombstoned (its row vanishes; survivors reparent on the next build).
+
+    Then prunes (``_HIGHLIGHT_SECS`` retention): drop ``_APPEARED_AT`` and
+    ``_TOMBSTONES`` entries older than the retention window, and drop a tombstone
+    whose ``former_ppid`` is no longer a live pid (its parent vanished too).
+    """
+    now, cur_procs = cur
+    # First sample has no baseline to diff against — every pid would otherwise
+    # read as "new" and the whole tree would glow on launch. Treat it as the
+    # baseline instead (htop ``-H`` doesn't flag pre-existing processes): mark
+    # nothing appeared, tombstone nothing. The NEXT resample diffs against it.
+    if prev is not None:
+        prev_procs = prev[1]
+        prev_children = {info.ppid for info in prev_procs.values()}
+        for pid in cur_procs:
+            if pid not in prev_procs:
+                _APPEARED_AT.setdefault(pid, now)
+        for pid, info in prev_procs.items():
+            if pid not in cur_procs and pid not in prev_children:
+                _TOMBSTONES.setdefault(pid, (info, info.ppid, now))
+                # A pid can reappear later (recycled); clear any stale "appeared"
+                # so a tombstoned-then-respawned pid re-greens cleanly.
+                _APPEARED_AT.pop(pid, None)
+
+    cutoff = now - _HIGHLIGHT_SECS
+    for pid in [p for p, t in _APPEARED_AT.items() if t < cutoff]:
+        del _APPEARED_AT[pid]
+    # Drop a tombstone that has expired, whose former parent is no longer live
+    # (nowhere to render in tree mode), OR whose pid has reappeared (a recycled
+    # number — it is live again, so it should render as a normal/green row).
+    for pid in [p for p, (_i, ppid, t) in _TOMBSTONES.items()
+                if t < cutoff or ppid not in cur_procs or p in cur_procs]:
+        del _TOMBSTONES[pid]
+
+
+def _cpu_pct(info):
+    """Instantaneous CPU% for ``info`` from the cumulative-time delta.
+
+    ``100 * Δcpu_secs / (Δwall_secs * ncpu)`` against the same pid in the
+    previous snapshot. With no prior sample (first load or a freshly-appeared
+    pid) — or a non-positive wall gap — fall back to ``ps pcpu`` (lifetime
+    average). Returned as an integer percent.
+    """
+    prev = _PREV_SNAPSHOT
+    cur = _CUR_SNAPSHOT
+    if prev is not None and cur is not None and info.pid in prev[1]:
+        dwall = cur[0] - prev[0]
+        ncpu = os.cpu_count() or 1
+        if dwall > 0:
+            dcpu = info.cpu_secs - prev[1][info.pid].cpu_secs
+            return int(round(100 * dcpu / (dwall * ncpu)))
+    return int(round(info.pcpu))
+
+
+# Primary sort value for each ``_SORT_KEY``. ``cpu_pct`` is computed by
+# ``_cpu_pct`` (not a stored attribute, hence defined after it); ``user`` is
+# lower-cased for a case-insensitive ordering; the rest read the ProcInfo field
+# straight. The pid tie-break is applied separately by ``_sort_procs``.
+_SORT_VALUES = {
+    'pid': lambda i: i.pid,
+    'cpu_pct': _cpu_pct,
+    'mem_bytes': lambda i: i.mem_bytes,
+    'cpu_secs': lambda i: i.cpu_secs,
+    'user': lambda i: i.user.lower(),
+}
+
+
+def _sort_procs(infos):
+    """Order a list of ``ProcInfo`` by the active sort key (B5).
+
+    Applied by ``get_children`` to whichever list it is about to return — a
+    parent's children in tree mode, the whole table in flat mode — so the
+    ordering is identical in both scopes. A stable two-pass sort (by pid first,
+    then by the active key) tie-breaks on ascending pid REGARDLESS of the active
+    direction: only the primary key honours ``_SORT_DIR``, so a descending cpu%
+    still lists equal-cpu rows in ascending-pid order (deterministic, and what
+    htop does). ``infos`` is not mutated (``sorted`` returns a new list).
+    """
+    by_pid = sorted(infos, key=lambda i: i.pid)
+    return sorted(by_pid, key=_SORT_VALUES[_SORT_KEY],
+                  reverse=_SORT_DIR[_SORT_KEY])
+
+
+def _proc_item(info, *, has_children, row_fg=None):
+    """Build one process ``Item`` carrying the gutter display columns.
+
+    Shared by the tree, flat AND tombstone builders so the ``col_*`` gutter
+    fields (``col_pid`` / ``col_user`` / ``col_cpu`` / ``col_mem``) and the title
+    (the full command line) are assigned in exactly one place — tombstone rows
+    pass their saved ``ProcInfo`` so a finished process still renders its
+    last-known columns. ``.pid`` / ``.user`` ride along for the existing signal /
+    preview handlers. ``has_children`` is the caller's call: the ppid hierarchy
+    in tree mode, always ``False`` in flat mode and for tombstones (every flat /
+    tombstone row is a leaf). ``row_fg`` (a soft 256-colour int) is the
+    highlight colour — soft green for a freshly-appeared pid, soft red for a
+    tombstone; ``None`` leaves the row uncoloured.
+    """
+    item = Item(id=info.pid, title=info.args, has_children=has_children)
+    item.user = info.user
+    item.pid = info.pid
+    item.col_pid = str(info.pid)
+    item.col_user = info.user
+    item.col_cpu = f'{_cpu_pct(info)}%'
+    item.col_mem = human_size(info.mem_bytes)
+    if row_fg is not None:
+        item.row_fg = row_fg
+    return item
+
+
+def _scoped_tombstones(parent_id):
+    """The finished-leaf ``ProcInfo``s to show in this scope (B9).
+
+    Empty unless ``_HIGHLIGHT_MODE`` is on (highlighting off → dead processes
+    just disappear). In **flat** mode every tombstone shows at the root (each is
+    trivially a leaf); a non-root scope shows none. In **tree** mode a tombstone
+    shows under its FORMER parent (``former_ppid == parent_id``). Returns the
+    saved ProcInfo objects so the caller can sort them in alongside the live rows
+    via the shared ``_sort_procs`` path.
+    """
+    if not _HIGHLIGHT_MODE or not _TOMBSTONES:
+        return []
+    if not _TREE_MODE:
+        if parent_id is not None:
+            return []
+        return [info for info, _ppid, _t in _TOMBSTONES.values()]
+    return [info for info, former_ppid, _t in _TOMBSTONES.values()
+            if former_ppid == parent_id]
+
+
+def _build_rows(live_infos, child_of, tombstones):
+    """Build the sorted Item list for one scope, with highlight colours (B9).
+
+    ``live_infos`` are the live ``ProcInfo``s for the scope; ``child_of(pid)``
+    reports whether a live pid has children (the tree expander; always ``False``
+    in flat mode); ``tombstones`` are the finished-leaf ProcInfos to interleave.
+    Live and tombstone infos are sorted TOGETHER by the active key (so tombstones
+    sort into the flat list / under their parent like any other row), then each
+    becomes an Item: live pids in ``_APPEARED_AT`` get the soft-green highlight
+    (when on), tombstones the soft-red one and ``has_children=False``. With
+    highlighting off ``tombstones`` is empty and ``_APPEARED_AT`` is ignored, so
+    no ``row_fg`` is set and dead rows are absent.
+    """
+    tomb_pids = {info.pid for info in tombstones}
+    items = []
+    for info in _sort_procs(list(live_infos) + list(tombstones)):
+        if info.pid in tomb_pids:
+            items.append(_proc_item(info, has_children=False, row_fg=_HL_GONE_FG))
+        else:
+            fg = (_HL_NEW_FG if _HIGHLIGHT_MODE and info.pid in _APPEARED_AT
+                  else None)
+            items.append(_proc_item(info, has_children=child_of(info.pid),
+                                    row_fg=fg))
+    return items
 
 
 def get_children(parent_id, *, reload=False):
-    """Children of ``parent_id``.
+    """Children of ``parent_id``, built from the per-reload snapshot.
 
-    ``None`` (root): return the init process — PID 1 on Linux. If
-    we somehow can't find it (non-Linux, restricted environment), fall
-    back to processes with ppid == 0 minus the kernel-thread PID 2.
-    Otherwise: direct children of ``parent_id``.
+    Dispatches on ``_TREE_MODE`` (the ``t`` action / ``--tree`` flag):
+
+    - **tree** (default): ``None`` (root) returns the init process — PID 1 on
+      Linux. If we somehow can't find it (non-Linux, restricted environment),
+      fall back to processes with ppid == 0 minus the kernel-thread PID 2.
+      Otherwise the direct children of ``parent_id``.
+    - **flat**: ``None`` (root) returns *every* process as one list, each a leaf
+      (``has_children=False``); any non-None pid returns ``[]`` (flat rows don't
+      expand).
+
+    Whichever list is about to be returned (a parent's children in tree mode,
+    the whole table in flat mode) is ordered by ``_sort_procs`` — the active
+    sort key (default pid; ``N``/``P``/``M``/``T``/``U`` switch it). Each Item
+    carries the gutter display columns (``col_pid`` / ``col_user`` / ``col_cpu``
+    / ``col_mem``) and a title of the full command line; ``.pid`` / ``.user`` are
+    kept for the existing signal/preview handlers (see ``_proc_item``).
+
+    When highlight mode is on (the ``h`` action), freshly-appeared pids get a
+    soft-green ``row_fg`` and non-expired finished-leaf TOMBSTONE rows (soft red)
+    are interleaved into the sorted list under their former parent (tree) or at
+    the flat root — see ``_build_rows`` / ``_scoped_tombstones``. The diff that
+    feeds this always runs in ``_snapshot``; ``h`` only gates the display.
     """
-    procs = _list_procs()
-    if not procs:
+    procs = _snapshot(reload=reload)
+    tombstones = _scoped_tombstones(parent_id)
+    if not procs and not tombstones:
         return []
-    by_ppid = _by_ppid(procs)
+
+    if not _TREE_MODE:
+        if parent_id is not None:
+            return []                            # flat rows are leaves
+        return _build_rows(procs.values(), lambda _pid: False, tombstones)
+
+    by_ppid = {}
+    for info in procs.values():
+        by_ppid.setdefault(info.ppid, []).append(info)
 
     if parent_id is None:
-        init = next((p for p in procs if p[0] == 1), None)
+        init = procs.get(1)
         if init is not None:
             targets = [init]
         else:
-            targets = [p for p in by_ppid.get(0, []) if p[0] != 2]
+            targets = [info for info in by_ppid.get(0, []) if info.pid != 2]
     else:
         targets = by_ppid.get(parent_id, [])
 
-    items = []
-    for pid, _ppid, user, comm in sorted(targets, key=lambda p: p[0]):
-        item = Item(
-            id=pid,
-            title=comm,
-            tag=f'{user} pid={pid}',
-            tag_style='dim',
-            has_children=bool(by_ppid.get(pid)),
-        )
-        item.user = user
-        item.pid = pid
-        items.append(item)
-    return items
+    # A live parent whose only surviving "child" is a tombstone still needs
+    # ``has_children`` so the framework lets the user expand to it (its live
+    # children are gone from ``by_ppid``). Count tombstones under each pid too.
+    tomb_parents = {ppid for _i, ppid, _t in _TOMBSTONES.values()} \
+        if _HIGHLIGHT_MODE else set()
+    return _build_rows(
+        targets,
+        lambda pid: bool(by_ppid.get(pid)) or pid in tomb_parents,
+        tombstones)
+
+
+# --- Gutter columns (B3) ----------------------------------------------------
+
+def ps_gutter_segments(item, ctx):
+    """Fixed ``pid · user · cpu% · mem`` columns for the left gutter.
+
+    Sits between the selection marker and the tree indent (see ``ps_chrome``)
+    so the columns don't drift rightward as tree depth grows. pid / cpu% / mem
+    are RIGHT-justified, user LEFT-justified, each to its GLOBAL widest loaded
+    value (``ctx.max_col_width_global``) so the columns line up across the
+    whole tree regardless of each row's depth. A single space separates the
+    columns (and trails the last) to match the spec example spacing. All dim.
+
+    A row missing the ``col_*`` fields (no normal process row should) yields an
+    empty gutter so the default content still renders.
+    """
+    if getattr(item, 'col_pid', None) is None:
+        return []                                # synthetic/edge row → no gutter
+    w = ctx.max_col_width_global
+    dfg, dbold = style('dim')
+    return [
+        (cell_rjust(item.col_pid,  w('col_pid'))  + ' ', dfg, dbold),
+        (cell_ljust(item.col_user, w('col_user')) + ' ', dfg, dbold),
+        (cell_rjust(item.col_cpu,  w('col_cpu'))  + ' ', dfg, dbold),
+        (cell_rjust(item.col_mem,  w('col_mem'))  + ' ', dfg, dbold),
+    ]
+
+
+def ps_chrome(item, ctx):
+    """Row chrome with the gutter columns left of the tree indent (B3).
+
+    Composes the framework chrome atoms so the order is
+    ``selection · pid · user · cpu% · mem · indent · expander``; the name is
+    the default content (the flexible last segment that truncates at the pane
+    edge), so it is NOT rendered here.
+    """
+    return (default_row_selection(item, ctx)
+            + ps_gutter_segments(item, ctx)
+            + default_row_indent(item, ctx)
+            + default_row_expander(item, ctx))
 
 
 def get_preview(pid):
@@ -140,6 +657,74 @@ def _send_signal(ctx, signum, name, *, confirm):
 def kill_proc(ctx):
     """Send SIGTERM to the cursor pid, behind a Yes/No confirm dialog."""
     _send_signal(ctx, signal.SIGTERM, 'SIGTERM', confirm=True)
+
+
+def _action_toggle_tree(ctx):
+    """Flip flat ↔ tree view; preserve the cursor on the same pid.
+
+    Mirrors browse-claude's ``t``: flip ``_TREE_MODE``, flash the new mode, and
+    ``refresh()`` (which refetches the root + every expanded parent). The pid is
+    a stable id across both layouts, so re-homing the cursor needs no ancestor
+    walk — capture the pid before the refresh wipes the cache and ``cursor_to``
+    it once the new root children settle (chained off the refresh ``Pending`` so
+    the row exists before the cursor move runs).
+    """
+    global _TREE_MODE
+    target_id = ctx.cursor.id if ctx.cursor else None
+
+    _TREE_MODE = not _TREE_MODE
+    ctx.flash(f"view: {'tree' if _TREE_MODE else 'flat'}")
+
+    pending = ctx.refresh()
+    if target_id is not None:
+        pending.then(lambda: ctx.cursor_to(target_id))
+
+
+def _action_toggle_highlight(ctx):
+    """Flip new/finished highlighting on/off (the ``h`` action, B9).
+
+    The snapshot diff always runs (CPU% needs it), so this toggles only the
+    DISPLAY: with it on, freshly-appeared pids glow soft green and finished-leaf
+    tombstone rows appear soft red; with it off, no ``row_fg`` is set and dead
+    rows vanish. Flips ``_HIGHLIGHT_MODE``, flashes the new state, and
+    ``refresh()``es so ``get_children`` re-builds with/without the colours and
+    tombstone rows. Flipping on immediately surfaces whatever changed within the
+    last ``_HIGHLIGHT_SECS`` (the diff kept running while it was off).
+    """
+    global _HIGHLIGHT_MODE
+    _HIGHLIGHT_MODE = not _HIGHLIGHT_MODE
+    ctx.flash(f"highlight: {'on' if _HIGHLIGHT_MODE else 'off'}")
+    ctx.refresh()
+
+
+def _set_sort(ctx, key):
+    """Switch the active sort to ``key`` (B5), then flash + refresh.
+
+    Pressing the ACTIVE key reverses its remembered direction; switching to a
+    different key adopts THAT key's remembered direction (untouched since it was
+    last used). Either way the per-key ``_SORT_DIR`` entry is the source of
+    truth, so a later return to a key restores the direction it was left at. The
+    flash names the column and its arrow (``↓`` descending, ``↑`` ascending);
+    ``refresh()`` re-runs ``get_children``, which re-sorts via ``_sort_procs``.
+    """
+    global _SORT_KEY
+    if key == _SORT_KEY:
+        _SORT_DIR[key] = not _SORT_DIR[key]
+    _SORT_KEY = key
+    arrow = '↓' if _SORT_DIR[key] else '↑'
+    ctx.flash(f'sort: {_SORT_LABELS[key]} {arrow}')
+    ctx.refresh()
+
+
+def _sort_action(key):
+    """Build the ``ctx -> None`` handler that activates sort ``key``.
+
+    A small closure factory so the five htop-style sort actions
+    (``N``/``P``/``M``/``T``/``U``) share one body — each just binds a different
+    ``ProcInfo`` field. Kept out of a loop-over-Action so the handler captures
+    ``key`` by value, not by a late-bound loop variable.
+    """
+    return lambda ctx: _set_sort(ctx, key)
 
 
 # Signal menu, in the order shown. Each row is ``(name, signum, destructive)``;
@@ -382,9 +967,24 @@ def on_context_menu(ctx):
 _HELP_INTRO = """\
 browse-ps — interactive process tree.
 
-Builds the hierarchy from ``ps -eo pid,ppid,user,comm``: each row is
-a process, children are processes whose ppid equals this pid. Reload
-the tree with Ctrl-R; preview reads /proc/<pid>/status.
+Builds the hierarchy from ``ps -eo pid,ppid,user,pcpu,rss,time,args``:
+each row is a process, children are processes whose ppid equals this
+pid. The row title is the full command line; pid / user / CPU% / memory
+ride along as columns. Reload the tree with Ctrl-R; a background thread
+also auto-reloads every -d seconds (default 4.0; -d 0 disables it).
+Preview reads /proc/<pid>/status.
+
+  t       toggle flat / tree view (--tree / --no-tree set the initial
+          mode). Flat lists every process; tree groups by ppid.
+  N P M T U  sort by pid / CPU% / memory / CPU time / user (htop-style
+          capitals). Re-press the active key to reverse it; each key
+          remembers its own direction. In tree mode each parent's
+          children are sorted; in flat mode the whole list is.
+  h       toggle htop -H-style change highlighting: freshly-appeared
+          pids glow soft green and finished leaf processes linger as
+          soft-red tombstone rows for ~3.5 s, then fade. Off by
+          default; the diff still runs, so toggling on shows recent
+          changes at once.
 
 Right-click a process (or the backslash / F1 keys) for a menu: send
 a signal (submenu), page its open files / sockets / environment /
@@ -392,21 +992,125 @@ full status, renice it, or attach strace.\
 """
 
 
+def _apply_view_flags():
+    """Set ``_TREE_MODE`` from ``--tree`` / ``--no-tree`` on the command line.
+
+    Parsed off ``recipe_argv()`` (framework-owned flags like ``--tty`` already
+    stripped) so the recipe's own flags don't collide with the framework's.
+    ``--tree`` wins if both are passed; absent either, the default tree mode
+    stands.
+    """
+    global _TREE_MODE
+    argv = recipe_argv()
+    if '--tree' in argv:
+        _TREE_MODE = True
+    elif '--no-tree' in argv:
+        _TREE_MODE = False
+
+
+def _update_interval():
+    """Background-refresh interval in seconds from ``-d`` (B8).
+
+    Parsed off ``recipe_argv()`` (framework flags already stripped), alongside
+    ``_apply_view_flags``. Accepts ``-d <secs>`` and ``-d=<secs>`` with a
+    FRACTIONAL value; absent, the default ``4.0`` (auto-update on). A value
+    ``<= 0`` disables updates (the caller starts no thread). A malformed value
+    falls back to the default rather than aborting launch — a stray ``-d`` should
+    not stop the viewer from opening.
+    """
+    argv = recipe_argv()
+    raw = None
+    for i, arg in enumerate(argv):
+        if arg == '-d':
+            raw = argv[i + 1] if i + 1 < len(argv) else None
+        elif arg.startswith('-d='):
+            raw = arg[len('-d='):]
+    if raw is None:
+        return _DEFAULT_UPDATE_INTERVAL
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_UPDATE_INTERVAL
+
+
+def _update_worker(b, interval):
+    """Background loop: every ``interval`` seconds, trigger a full reload.
+
+    Calls ``b.refresh()`` (thread-safe — it ``post``s ``_do_refresh`` onto the
+    UI thread), which enqueues the root with ``reload=True`` and re-samples the
+    process snapshot (so CPU% deltas and the new/finished diff ride the same
+    sample), preserving the cursor by pid.
+
+    The wait is ``_UPDATE_STOP.wait(timeout=interval)`` — NOT ``time.sleep`` — so
+    setting the stop event wakes the worker immediately and shutdown stays
+    prompt. Marked daemon as a backstop. ``refresh`` failures are swallowed so a
+    transient error doesn't kill the worker; the next tick gets a clean shot.
+    """
+    while not _UPDATE_STOP.wait(timeout=interval):
+        try:
+            b.refresh()
+        except Exception:
+            pass
+
+
 def main():
-    sys.exit(Browser(BrowserConfig(
+    _apply_view_flags()
+    b = Browser(BrowserConfig(
         title='browse-ps',
         get_children=get_children,
         get_preview=get_preview,
         actions=[
             Action('k', 'Kill cursor pid (SIGTERM, with confirm)',
                    kill_proc, 'cursor'),
+            Action('t', 'Toggle flat / tree view', _action_toggle_tree, 'none'),
+            # htop -H-style new/finished highlighting (B9): the snapshot diff
+            # always runs; ``h`` toggles the soft green/red display + tombstones.
+            Action('h', 'Toggle new/finished highlighting',
+                   _action_toggle_highlight, 'none'),
+            # htop-style sort modes (B5): the active key reverses on repeat,
+            # otherwise switches to that key's remembered direction.
+            Action('N', 'Sort by pid (asc)',   _sort_action('pid'),       'none'),
+            Action('P', 'Sort by CPU% (desc)', _sort_action('cpu_pct'),   'none'),
+            Action('M', 'Sort by memory (desc)', _sort_action('mem_bytes'), 'none'),
+            Action('T', 'Sort by CPU time (desc)', _sort_action('cpu_secs'), 'none'),
+            Action('U', 'Sort by user (asc)',  _sort_action('user'),      'none'),
         ],
         # Right-click (or the backslash / F1 keys) on a process row opens a
         # menu: signals (submenu), open files / sockets / environment / status
         # pagers, renice, and strace. See ``on_context_menu``.
         on_context_menu=on_context_menu,
         help_intro=_HELP_INTRO,
-    )).run())
+        # pid / user / CPU% / memory ride in a fixed left gutter (left of the
+        # tree indent) via ps_chrome; the default content renders the name.
+        format_row_chrome=ps_chrome,
+        # The pid is its own gutter column now (col_pid), so the framework
+        # needn't echo it next to the title.
+        show_ids='never',
+    ))
+
+    # Background updater (B8): a daemon thread ticks every ``-d`` seconds and
+    # ``b.refresh()``es (re-sampling the snapshot — CPU% deltas + the
+    # new/finished diff ride that reload). ``-d <= 0`` disables it (no thread).
+    # Daemon so it never keeps the process alive; ``_UPDATE_STOP`` signals a
+    # clean shutdown before sys.exit, joined briefly in the ``finally`` so the
+    # worker wakes from its ``wait`` before the process exits (prompt shutdown).
+    global _UPDATE_STOP, _UPDATE_THREAD
+    interval = _update_interval()
+    if interval > 0:
+        _UPDATE_STOP = threading.Event()
+        _UPDATE_THREAD = threading.Thread(
+            target=_update_worker, args=(b, interval),
+            name='browse-ps-update', daemon=True,
+        )
+        _UPDATE_THREAD.start()
+
+    try:
+        rc = b.run()
+    finally:
+        if _UPDATE_STOP is not None:
+            _UPDATE_STOP.set()
+            _UPDATE_THREAD.join(timeout=1.0)
+    sys.exit(rc)
 
 
 if __name__ == '__main__':
