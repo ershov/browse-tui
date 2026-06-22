@@ -1000,16 +1000,22 @@ class TestPsGutterSegments(unittest.TestCase):
 class _ModeCtx:
     """A minimal ``ctx`` for the display-mode switch actions.
 
-    Records ``flash`` text and ``refresh`` calls — the two side-effects
-    ``_set_display_mode`` performs besides flipping the module global.
+    Records ``flash`` text, ``redraw`` panes, and any ``refresh`` calls —
+    the side-effects ``_set_display_mode`` performs besides flipping the
+    module global. A mode switch must REPAINT (``redraw``) the loaded
+    rows, never refetch the snapshot (``refresh``).
     """
 
     def __init__(self):
         self.flashes = []
+        self.redraws = []
         self.refreshed = 0
 
     def flash(self, text, log=False):
         self.flashes.append(text)
+
+    def redraw(self, panes='all'):
+        self.redraws.append(panes)
 
     def refresh(self):
         self.refreshed += 1
@@ -1109,13 +1115,15 @@ class TestDisplayModes(unittest.TestCase):
 
     # -- the mode-switch actions -------------------------------------------
 
-    def test_set_display_mode_flips_global_flashes_and_refreshes(self):
-        # Each action sets _DISPLAY_MODE, flashes the mode, and refreshes.
+    def test_set_display_mode_flips_global_flashes_and_repaints(self):
+        # Each action sets _DISPLAY_MODE, flashes the mode, and REPAINTS the
+        # row panes (list + children) — a pure re-render, no refetch (#1119).
         for mode in (1, 2, 3):
             ctx = _ModeCtx()
             self.r._set_display_mode(ctx, mode)
             self.assertEqual(self.r._DISPLAY_MODE, mode)
-            self.assertEqual(ctx.refreshed, 1)
+            self.assertEqual(ctx.redraws, [['list', 'children']])
+            self.assertEqual(ctx.refreshed, 0)   # repaint, never refetch
             self.assertEqual(len(ctx.flashes), 1)
             # The flash names the active mode's column set.
             self.assertIn(self.r._MODE_LABELS[mode], ctx.flashes[0])

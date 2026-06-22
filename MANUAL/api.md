@@ -307,6 +307,7 @@ Each returns a `Pending` (where applicable) — see `Pending` below.
 
 ```python
 ctx.refresh(id=None, on_complete=None) -> Pending
+ctx.redraw(panes='all')               -> None
 ctx.cursor_to(id, on_complete=None)   -> Pending
 ctx.expand(id, on_complete=None)      -> Pending
 ctx.collapse(id)                      -> None
@@ -323,6 +324,7 @@ ctx.close_dialog(value=None)          -> None
 | Method       | What it does                                                         |
 | ------------ | -------------------------------------------------------------------- |
 | `refresh`    | Refetch one parent's children (or full root if id is None).          |
+| `redraw`     | Repaint panes from already-loaded data — no refetch. `panes` is a name or iterable of `list`/`children`/`preview`/`info`/`all`; unknown names ignored. Use after a render-time change (e.g. a display-mode global). |
 | `cursor_to`  | Move cursor to id; resolves once positioned (best-effort).           |
 | `expand`     | Add id to expanded; trigger fetch if not cached.                     |
 | `collapse`   | Remove id from expanded; fold its subtree (no-op if not expanded).   |

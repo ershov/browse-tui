@@ -183,6 +183,21 @@ class Context:
         """
         return self._browser.refresh(id, on_complete)
 
+    def redraw(self, panes='all') -> None:
+        """Flag one or more panes for repaint, without refetching data.
+
+        The lightweight counterpart to :meth:`refresh`: it marks panes
+        dirty so the next render pass repaints them from already-loaded
+        data — use it after changing a render-time setting (e.g. a
+        display-mode global) that changes how rows draw but not what data
+        backs them.
+
+        ``panes`` is a pane name or an iterable of names — ``'list'``,
+        ``'children'``, ``'preview'``, ``'info'``, or ``'all'``; unknown
+        names are ignored. Safe to call from any thread. Returns ``None``.
+        """
+        return self._browser.redraw(panes)
+
     def cursor_to(self, id: Any,
                   on_complete: Optional[Callable[[], None]] = None) -> 'Pending':
         """Move the cursor onto the item with ``id``.

@@ -367,6 +367,44 @@ class TestBrowseGit(unittest.TestCase):
                 self.assertIn('▶', subject_row)
                 t.send('q')
 
+    def test_display_mode_keys_repaint_columns(self):
+        """The 1/2/3 keys repaint the commit columns in place — no refetch.
+
+        Default mode 3 renders the author column (``Test``); pressing
+        ``1`` (subject only) must drop it from the already-loaded rows
+        while the subjects stay, and ``3`` must bring it back. This
+        exercises the lightweight ``ctx.redraw`` repaint path: the
+        per-mode column strings already live on every commit Item, so a
+        repaint — not a refetch of the log — is all the switch needs.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_repo(tmp)
+            with TmuxFixture(cols=120, rows=30) as t:
+                t.send_line(f'cd {tmp}')
+                t.launch(_BIN, '--run-py', _RECIPE)
+                # Default mode 3 shows the author column ("Test").
+                t.wait_for('first commit add alpha', timeout=5.0)
+                t.wait_for('Test', timeout=5.0)
+                # Mode 1 (subject only): the author column drops away, but
+                # the subjects (the loaded rows) remain — a pure repaint.
+                t.send('1')
+                deadline = time.time() + 5.0
+                dropped = False
+                while time.time() < deadline:
+                    cap = t.capture()
+                    if 'Test' not in cap and 'first commit add alpha' in cap:
+                        dropped = True
+                        break
+                    time.sleep(0.05)
+                self.assertTrue(
+                    dropped,
+                    'author column "Test" still present after pressing 1 — '
+                    'the display-mode switch did not repaint the list.')
+                # Mode 3 again: the author column comes back.
+                t.send('3')
+                t.wait_for('Test', timeout=5.0)
+                t.send('q')
+
     def test_mode_reflog_lists_entries(self):
         """``--reflog`` lists reflog entries with selector + action.
 

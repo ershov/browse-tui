@@ -2693,16 +2693,16 @@ _MODE_LABELS = {
 
 
 def _set_display_mode(ctx, mode):
-    """Switch the leading-column set to ``mode`` (1/2/3), flash it, and refresh.
+    """Switch the leading-column set to ``mode`` (1/2/3), flash it, and repaint.
 
     The mode only changes which leading columns ``git_row_content`` emits (the
-    strings are already on every commit Item), so a refresh is enough to
-    repaint the rows at the new widths — no refetch of the log needed.
+    strings are already on every commit Item), so a plain repaint picks up the
+    rows at their new widths — no refetch of the log needed.
     """
     global _DISPLAY_MODE
     _DISPLAY_MODE = mode
     ctx.flash(f'display: {_MODE_LABELS[mode]}')
-    ctx.refresh()
+    ctx.redraw(['list', 'children'])
 
 
 def toggle_tree(ctx):

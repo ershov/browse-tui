@@ -4618,6 +4618,27 @@ class Browser:
         self.post(lambda: self._do_refresh(id, pending))
         return pending
 
+    def redraw(self, panes='all') -> None:
+        """(thread-safe) Flag one or more panes for repaint — no refetch.
+
+        The lightweight counterpart to ``refresh``: where ``refresh``
+        invalidates the children cache and refetches data, ``redraw`` only
+        marks panes dirty so the next render pass repaints them from the
+        data already loaded. Use it after changing a *render-time* setting
+        (e.g. a recipe display-mode global selecting which precomputed
+        columns a row emits) where the rows themselves are unchanged.
+
+        ``panes`` names the panes to repaint — any of ``'list'``,
+        ``'children'``, ``'preview'``, ``'info'``, or ``'all'`` (repaint
+        everything). Accepts a single name or an iterable of names;
+        unrecognised names are ignored, so passing a pane the current
+        layout doesn't show (e.g. ``'children'`` outside the miller
+        layout) is harmless. Posted to the main thread, so it is safe to
+        call from any thread. Returns ``None`` — nothing to await.
+        """
+        names = (panes,) if isinstance(panes, str) else tuple(panes)
+        self.post(lambda: self._needs_redraw.update(names))
+
     def cursor_to(self, id: Any,
                   on_complete: Optional[Callable[[], None]] = None) -> 'Pending':
         """(thread-safe) Move cursor to the item with the given id, expanding ancestors as needed.

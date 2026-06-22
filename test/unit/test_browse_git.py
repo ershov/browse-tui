@@ -5218,14 +5218,18 @@ class TestDisplayMode(unittest.TestCase):
                              f'mode {mode}: not the fallback')
             self.assertEqual(ctx.calls, [], f'mode {mode}: measured a column')
 
-    def test_set_display_mode_flips_flashes_refreshes(self):
+    def test_set_display_mode_flips_flashes_repaints(self):
         # The 1/2/3 actions set _DISPLAY_MODE, flash the mode label, and
-        # refresh (a pure re-render — no refetch).
-        calls = {'refresh': 0, 'flashes': []}
+        # REPAINT the row panes (list + children) — a pure re-render, with
+        # no refetch of the log.
+        calls = {'refresh': 0, 'redraws': [], 'flashes': []}
 
         class Ctx:
             def flash(self, text, log=False):
                 calls['flashes'].append(text)
+
+            def redraw(self, panes='all'):
+                calls['redraws'].append(panes)
 
             def refresh(self, id=None, on_complete=None):
                 calls['refresh'] += 1
@@ -5238,7 +5242,8 @@ class TestDisplayMode(unittest.TestCase):
         ):
             self.r._set_display_mode(ctx, mode)
             self.assertEqual(self.r._DISPLAY_MODE, mode)
-        self.assertEqual(calls['refresh'], 3)
+        self.assertEqual(calls['refresh'], 0)   # repaint, never refetch
+        self.assertEqual(calls['redraws'], [['list', 'children']] * 3)
         self.assertEqual(calls['flashes'], [
             'display: subject only',
             'display: sha · subject',
@@ -5283,6 +5288,9 @@ class TestDisplayMode(unittest.TestCase):
 
         class Ctx:
             def flash(self, text, log=False):
+                pass
+
+            def redraw(self, panes='all'):
                 pass
 
             def refresh(self, id=None, on_complete=None):

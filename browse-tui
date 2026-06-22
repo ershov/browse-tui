@@ -6317,6 +6317,27 @@ class Browser:
         self.post(lambda: self._do_refresh(id, pending))
         return pending
 
+    def redraw(self, panes='all') -> None:
+        """(thread-safe) Flag one or more panes for repaint — no refetch.
+
+        The lightweight counterpart to ``refresh``: where ``refresh``
+        invalidates the children cache and refetches data, ``redraw`` only
+        marks panes dirty so the next render pass repaints them from the
+        data already loaded. Use it after changing a *render-time* setting
+        (e.g. a recipe display-mode global selecting which precomputed
+        columns a row emits) where the rows themselves are unchanged.
+
+        ``panes`` names the panes to repaint — any of ``'list'``,
+        ``'children'``, ``'preview'``, ``'info'``, or ``'all'`` (repaint
+        everything). Accepts a single name or an iterable of names;
+        unrecognised names are ignored, so passing a pane the current
+        layout doesn't show (e.g. ``'children'`` outside the miller
+        layout) is harmless. Posted to the main thread, so it is safe to
+        call from any thread. Returns ``None`` — nothing to await.
+        """
+        names = (panes,) if isinstance(panes, str) else tuple(panes)
+        self.post(lambda: self._needs_redraw.update(names))
+
     def cursor_to(self, id: Any,
                   on_complete: Optional[Callable[[], None]] = None) -> 'Pending':
         """(thread-safe) Move cursor to the item with the given id, expanding ancestors as needed.
@@ -16510,6 +16531,21 @@ class Context:
         delivered the new children list. Safe to call from any thread.
         """
         return self._browser.refresh(id, on_complete)
+
+    def redraw(self, panes='all') -> None:
+        """Flag one or more panes for repaint, without refetching data.
+
+        The lightweight counterpart to :meth:`refresh`: it marks panes
+        dirty so the next render pass repaints them from already-loaded
+        data — use it after changing a render-time setting (e.g. a
+        display-mode global) that changes how rows draw but not what data
+        backs them.
+
+        ``panes`` is a pane name or an iterable of names — ``'list'``,
+        ``'children'``, ``'preview'``, ``'info'``, or ``'all'``; unknown
+        names are ignored. Safe to call from any thread. Returns ``None``.
+        """
+        return self._browser.redraw(panes)
 
     def cursor_to(self, id: Any,
                   on_complete: Optional[Callable[[], None]] = None) -> 'Pending':

@@ -846,16 +846,16 @@ _MODE_LABELS = {
 
 
 def _set_display_mode(ctx, mode):
-    """Switch the gutter column set to ``mode`` (1/2/3), flash it, and refresh.
+    """Switch the gutter column set to ``mode`` (1/2/3), flash it, and repaint.
 
     The mode only changes which columns ``ps_gutter_segments`` emits (the
-    ``col_*`` strings are already on every item), so a refresh is enough to
-    repaint the gutter at the new widths — no snapshot refetch needed.
+    ``col_*`` strings are already on every item), so a plain repaint picks up
+    the gutter at its new widths — no snapshot refetch needed.
     """
     global _DISPLAY_MODE
     _DISPLAY_MODE = mode
     ctx.flash(f'display: {_MODE_LABELS[mode]}')
-    ctx.refresh()
+    ctx.redraw(['list', 'children'])
 
 
 def _set_sort(ctx, key):
