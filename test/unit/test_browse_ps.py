@@ -27,7 +27,10 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from unittest import mock
 
-from test.async_._helpers import Browser, BrowserConfig, Context, Item, make_browser
+from test.async_._helpers import (
+    Browser, BrowserConfig, Context, Item, make_browser,
+    mod as _fw_mod, remove as _fw_remove, upsert as _fw_upsert,
+)
 from test.unit._loader import load
 
 
@@ -85,6 +88,16 @@ def _stub_browse_tui():
     # The genuine framework ``recipe_argv`` (strips --tty etc.); the CLI flag
     # tests drive it by patching ``_FW_STATE.sys.argv`` (its argv source).
     mod.recipe_argv = _FW_STATE.recipe_argv
+    # The REAL op constructors the incremental ``-d`` tick builds with
+    # (``mod`` / ``upsert`` / ``remove``) — genuine tuples so the spied
+    # ``b.update_data`` batch is asserted against, and so applying it to a real
+    # headless Browser exercises the framework's actual apply path. Sourced from
+    # the SAME state module the headless ``Browser`` uses (via ``_helpers``) so
+    # ``mod``'s ``KEEP_PARENT`` default is the very sentinel ``apply_ops``
+    # checks — a distinct isolated load would carry a non-identical sentinel.
+    mod.mod = _fw_mod
+    mod.upsert = _fw_upsert
+    mod.remove = _fw_remove
     sys.modules['browse_tui'] = mod
 
 
@@ -1159,11 +1172,16 @@ class TestUpdateIntervalCli(unittest.TestCase):
 
 
 class TestUpdateWorkerTick(unittest.TestCase):
-    """A worker tick calls ``b.refresh()``; the stop event halts it promptly.
+    """A worker tick fetches off-thread + ``b.post``s a callback; NEVER refreshes.
 
-    Uses a real ``threading.Event`` for the stop flag and a Mock Browser (we
-    only assert the tick calls ``refresh``). Module globals are restored via
-    ``addCleanup`` per the ticket. No test sleeps for the real default interval.
+    The incremental updater (#1121) replaced the old full ``b.refresh()`` tick:
+    each tick fetches a snapshot via ``_fetch_procs`` (the slow ``ps`` half, here
+    stubbed so no real subprocess runs) then ``b.post``s ``_apply_tick`` — the
+    rotate/diff/``update_data`` happens on the UI thread. We assert the tick
+    NEVER calls ``b.refresh()`` (the no-flicker contract) and that the posted
+    callable is the marshalled apply. Uses a real ``threading.Event`` for the
+    stop flag and a Mock Browser; module globals restored via ``addCleanup``. No
+    test sleeps for the real default interval.
     """
 
     def setUp(self):
@@ -1176,45 +1194,71 @@ class TestUpdateWorkerTick(unittest.TestCase):
         self.r._UPDATE_STOP = self._seed_stop
         self.r._UPDATE_THREAD = self._seed_thread
 
-    def test_tick_calls_refresh_then_stops(self):
+    def test_tick_posts_callback_and_never_refreshes(self):
         # Drive the worker directly with a tiny interval: the FIRST wait()
-        # returns False (timeout) → one refresh; we set the stop event from the
-        # spy so the SECOND wait() returns True and the loop exits at once. The
-        # worker never sleeps for a real interval.
+        # returns False (timeout) → one tick; the ``_fetch_procs`` stub sets the
+        # stop event so the SECOND wait() exits at once. The tick must ``b.post``
+        # (the marshalled apply) and must NOT call ``b.refresh()``.
         b = mock.Mock()
         self.r._UPDATE_STOP = threading.Event()
+        fetched = {1: object()}
 
-        def _refresh():
+        def _fetch():
             self.r._UPDATE_STOP.set()      # stop after the first tick
-        b.refresh.side_effect = _refresh
+            return fetched
+        with mock.patch.object(self.r, '_fetch_procs', _fetch):
+            self.r._update_worker(b, 0.001)
+        b.refresh.assert_not_called()      # no full teardown — no flicker
+        b.post.assert_called_once()
 
-        self.r._update_worker(b, 0.001)
-        b.refresh.assert_called_once_with()
+    def test_posted_callback_runs_apply_tick_with_the_fetched_procs(self):
+        # The posted callable marshals ``_apply_tick(b, <fetched procs>)`` onto
+        # the UI thread — calling it directly (as a test can) must invoke
+        # ``_apply_tick`` with exactly the map ``_fetch_procs`` returned.
+        b = mock.Mock()
+        self.r._UPDATE_STOP = threading.Event()
+        fetched = {1: object(), 2: object()}
 
-    def test_set_event_before_first_tick_yields_no_refresh(self):
+        def _fetch():
+            self.r._UPDATE_STOP.set()
+            return fetched
+        seen = []
+        with mock.patch.object(self.r, '_fetch_procs', _fetch), \
+             mock.patch.object(self.r, '_apply_tick',
+                               lambda br, procs: seen.append((br, procs))):
+            self.r._update_worker(b, 0.001)
+            posted = b.post.call_args.args[0]
+            posted()                        # run the marshalled callback
+        self.assertEqual(seen, [(b, fetched)])
+
+    def test_set_event_before_first_tick_yields_no_work(self):
         # A stop event set before the loop runs → wait() returns True
-        # immediately → zero refreshes (prompt shutdown, no spurious tick).
+        # immediately → zero fetches/posts (prompt shutdown, no spurious tick).
         b = mock.Mock()
         self.r._UPDATE_STOP = threading.Event()
         self.r._UPDATE_STOP.set()
-        self.r._update_worker(b, 0.001)
+        with mock.patch.object(self.r, '_fetch_procs',
+                               side_effect=AssertionError('fetched on stop')):
+            self.r._update_worker(b, 0.001)
+        b.post.assert_not_called()
         b.refresh.assert_not_called()
 
-    def test_refresh_exception_does_not_kill_worker(self):
-        # A transient refresh failure is swallowed; the loop survives to the
-        # next wait() (which we trip via the stop event to end the test).
+    def test_fetch_exception_does_not_kill_worker(self):
+        # A transient fetch failure is swallowed; the loop survives to the next
+        # wait() (which we trip via the stop event to end the test). Nothing is
+        # posted for the failed tick.
         b = mock.Mock()
         self.r._UPDATE_STOP = threading.Event()
         calls = []
 
-        def _refresh():
+        def _fetch():
             calls.append(1)
             self.r._UPDATE_STOP.set()      # end after this (raising) tick
             raise RuntimeError('boom')
-        b.refresh.side_effect = _refresh
-
-        self.r._update_worker(b, 0.001)    # must NOT propagate
+        with mock.patch.object(self.r, '_fetch_procs', _fetch):
+            self.r._update_worker(b, 0.001)  # must NOT propagate
         self.assertEqual(len(calls), 1)
+        b.post.assert_not_called()
 
 
 class TestUpdateThreadLifecycle(unittest.TestCase):
@@ -1241,14 +1285,18 @@ class TestUpdateThreadLifecycle(unittest.TestCase):
         """Run ``main`` with a Mock Browser whose ``run`` returns 0 at once.
 
         Patches ``Browser`` / ``BrowserConfig`` / ``_apply_view_flags`` so
-        ``main`` runs headless, and ``sys.exit`` to capture the return code.
-        Returns ``(browser_mock, exit_spy)``.
+        ``main`` runs headless, and ``sys.exit`` to capture the return code. The
+        real worker thread starts here, so ``_fetch_procs`` is stubbed to ``{}``
+        — the lifecycle tests are about thread start/join, not the tick, and the
+        stub keeps a real ``ps`` from running in a tight loop. Returns
+        ``(browser_mock, exit_spy)``.
         """
         b = mock.Mock()
         b.run.return_value = 0
         with mock.patch.object(self.r, 'Browser', return_value=b), \
              mock.patch.object(self.r, 'BrowserConfig', return_value=object()), \
              mock.patch.object(self.r, '_apply_view_flags', lambda: None), \
+             mock.patch.object(self.r, '_fetch_procs', lambda: {}), \
              mock.patch.object(_FW_STATE.sys, 'argv', ['browse-ps', *argv]), \
              mock.patch.object(self.r.sys, 'exit') as exit_spy:
             self.r.main()
@@ -1295,6 +1343,7 @@ class TestUpdateThreadLifecycle(unittest.TestCase):
                  mock.patch.object(self.r, 'BrowserConfig',
                                    return_value=object()), \
                  mock.patch.object(self.r, '_apply_view_flags', lambda: None), \
+                 mock.patch.object(self.r, '_fetch_procs', lambda: {}), \
                  mock.patch.object(_FW_STATE.sys, 'argv',
                                    ['browse-ps', '-d', '0.001']), \
                  mock.patch.object(self.r.sys, 'exit'):
@@ -1758,6 +1807,386 @@ class TestHighlightToggleAction(unittest.TestCase):
         # Sanity: ``h`` does not collide with the recipe's other bindings.
         recipe_keys = [act._args[0] for act in actions]
         self.assertEqual(recipe_keys.count('h'), 1)
+
+
+# --- Incremental ``-d`` tick (#1121) ----------------------------------------
+
+class _TickBase(unittest.TestCase):
+    """Shared setup for the incremental-tick tests (#1121).
+
+    The ``-d`` tick rotates the snapshot, diffs it, and pushes ONE
+    ``update_data`` batch instead of a full ``refresh`` — so these drive a FAKE
+    clock (``_now`` patched to read ``self.clock``) for the 3.5 s tombstone
+    retention WITHOUT sleeping, seed the snapshot globals directly, and restore
+    them via ``addCleanup``. ``_apply_tick`` reads ``_CUR_SNAPSHOT`` as the
+    "previous" sample and installs the map handed in, so a test transition is
+    "seed prev, call ``_apply_tick(b, cur)``".
+    """
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self.clock = 1000.0
+        self._orig_now = self.r._now
+        self.r._now = lambda: self.clock
+        self.addCleanup(self._restore)
+        self.r._PREV_SNAPSHOT = None
+        self.r._CUR_SNAPSHOT = None
+        self.r._APPEARED_AT = {}
+        self.r._TOMBSTONES = {}
+        self.r._HIGHLIGHT_MODE = False
+        self.r._TREE_MODE = True
+        self._seed_key = self.r._SORT_KEY
+        self._seed_dir = dict(self.r._SORT_DIR)
+
+    def _restore(self):
+        self.r._now = self._orig_now
+        self.r._PREV_SNAPSHOT = None
+        self.r._CUR_SNAPSHOT = None
+        self.r._APPEARED_AT = {}
+        self.r._TOMBSTONES = {}
+        self.r._HIGHLIGHT_MODE = False
+        self.r._TREE_MODE = True
+        self.r._SORT_KEY = self._seed_key
+        self.r._SORT_DIR = dict(self._seed_dir)
+
+    def _info(self, pid, ppid, *, user='root', pcpu=0.0, mem_kb=100,
+              cpu_secs=0, args=None):
+        """Build one ``ProcInfo`` (mem given in KiB, like the ps RSS column)."""
+        info = self.r.ProcInfo(pid, ppid, user, pcpu, mem_kb * 1024, cpu_secs,
+                               args or f'proc{pid}')
+        return info
+
+    def _seed_prev(self, infos, *, wall=None):
+        """Install ``infos`` (a list of ProcInfo) as the current snapshot.
+
+        This becomes the "previous" sample the next ``_apply_tick`` rotates out.
+        ``_PREV_SNAPSHOT`` is left ``None`` so CPU% falls back to ``pcpu`` (the
+        diff treats a ``None`` prev as the baseline — see ``_diff_snapshot``).
+        """
+        procs = {i.pid: i for i in infos}
+        self.r._CUR_SNAPSHOT = (wall if wall is not None else self.clock, procs)
+        return procs
+
+    def _ops_by_kind(self, ops):
+        """Group an op-tuple batch into ``{kind: [op, ...]}`` for assertions."""
+        out = {}
+        for op in ops:
+            out.setdefault(op[0], []).append(op)
+        return out
+
+
+class TestSharedFieldBuilder(_TickBase):
+    """``_proc_fields`` is the single source of truth for both row paths (#1121).
+
+    The incremental tick patches rows with ``_proc_fields``; the full rebuild
+    (``_proc_item``) sets the same fields. They MUST be byte-identical for the
+    same ProcInfo or incremental and rebuilt rows would drift.
+    """
+
+    def test_fields_match_proc_item(self):
+        info = self._info(4242, 1, user='alice', pcpu=12.0, mem_kb=4096,
+                          args='python3 -m http.server 8000')
+        # The snapshot must be primed so ``_cpu_pct`` (read by both paths) has a
+        # current sample to read; first sample → pcpu fallback (12% here).
+        self._seed_prev([info])
+        fields = self.r._proc_fields(info)
+        item = self.r._proc_item(info, has_children=False)
+        for key, value in fields.items():
+            with self.subTest(field=key):
+                self.assertEqual(getattr(item, key), value)
+        # And the dict carries exactly the row display fields (no row_fg — the
+        # highlight is decided separately by ``_row_highlight_fg``).
+        self.assertEqual(set(fields),
+                         {'title', 'col_pid', 'col_user', 'col_cpu', 'col_mem'})
+
+    def test_cpu_and_mem_strings(self):
+        info = self._info(7, 1, pcpu=3.4, mem_kb=2048)
+        self._seed_prev([info])
+        fields = self.r._proc_fields(info)
+        self.assertEqual(fields['col_cpu'], '3%')           # round(3.4)
+        self.assertEqual(fields['col_mem'], self.r.human_size(2048 * 1024))
+        self.assertEqual(fields['col_pid'], '7')
+        self.assertEqual(fields['title'], 'proc7')
+
+
+class TestTickAlive(_TickBase):
+    """An alive pid whose cpu%/mem changed emits a ``mod`` carrying the new values."""
+
+    def test_alive_changed_emits_mod_with_updated_cols(self):
+        # Prev: pid 100 at 30 cpu_secs / 4 MiB. Cur: +4 cpu_secs over a 1 s wall
+        # gap on 8 cores → 50% (delta path), and memory grew to 8 MiB.
+        prev = self._info(100, 1, cpu_secs=30, mem_kb=4096)
+        self._seed_prev([self._info(1, 0), prev], wall=self.clock)
+        self.clock += 1.0
+        cur_100 = self._info(100, 1, cpu_secs=34, mem_kb=8192)
+        cur = {1: self._info(1, 0), 100: cur_100}
+        b = mock.Mock()
+        with mock.patch.object(self.r.os, 'cpu_count', lambda: 8):
+            self.r._apply_tick(b, cur)
+        ops = b.update_data.call_args.args[0]
+        mods = {op[1]: op for op in ops if op[0] == 'mod'}
+        self.assertIn(100, mods)
+        fields = mods[100][3]
+        self.assertEqual(fields['col_cpu'], '50%')
+        self.assertEqual(fields['col_mem'], self.r.human_size(8192 * 1024))
+        # No row was added/removed — only in-place mods this tick.
+        self.assertNotIn('upsert', self._ops_by_kind(ops))
+        self.assertNotIn('remove', self._ops_by_kind(ops))
+
+    def test_apply_tick_uses_update_data_not_refresh(self):
+        # The no-flicker contract: the tick converges via update_data, never the
+        # full-teardown refresh.
+        self._seed_prev([self._info(1, 0)])
+        b = mock.Mock()
+        self.r._apply_tick(b, {1: self._info(1, 0)})
+        b.refresh.assert_not_called()
+        # An unchanged single root still emits its (idempotent) mod batch.
+        b.update_data.assert_called_once()
+
+
+class TestTickNew(_TickBase):
+    """A freshly-appeared pid is ``upsert``ed under the right parent, in order."""
+
+    def test_new_pid_tree_mode_under_ppid_when_loaded(self):
+        self.r._TREE_MODE = True
+        self._seed_prev([self._info(1, 0), self._info(100, 1)])
+        # Parent pid 1's children are loaded (cached); pid 300 appears under it.
+        b = mock.Mock()
+        b.cached_children = lambda pid: [] if pid == 1 else None
+        cur = {1: self._info(1, 0), 100: self._info(100, 1),
+               300: self._info(300, 1, args='newproc')}
+        self.r._apply_tick(b, cur)
+        ops = b.update_data.call_args.args[0]
+        ups = {op[1]: op for op in ops if op[0] == 'upsert'}
+        self.assertIn(300, ups)
+        _kind, _id, parent_id, fields = ups[300][:4]
+        self.assertEqual(parent_id, 1)                      # ppid in tree mode
+        self.assertEqual(fields['title'], 'newproc')
+        self.assertEqual(fields['col_pid'], '300')
+
+    def test_new_pid_tree_mode_skipped_when_parent_unloaded(self):
+        # A new pid under a not-yet-expanded parent must NOT be upserted (it
+        # would create a partial child list the framework treats as complete);
+        # it appears the normal way on expand.
+        self.r._TREE_MODE = True
+        self._seed_prev([self._info(1, 0), self._info(100, 1)])
+        b = mock.Mock()
+        b.cached_children = lambda pid: None        # nothing expanded
+        cur = {1: self._info(1, 0), 100: self._info(100, 1),
+               300: self._info(300, 100)}           # under the (unloaded) pid 100
+        self.r._apply_tick(b, cur)
+        ops = b.update_data.call_args.args[0]
+        self.assertNotIn('upsert', self._ops_by_kind(ops))
+
+    def test_new_pid_flat_mode_under_root_in_sorted_position(self):
+        # Flat mode: root children are always loaded → the new pid upserts under
+        # the root (None) anchored before its sorted successor. Sort by pid asc:
+        # inserting 150 between loaded 100 and 200 → before the loaded INDEX of
+        # its successor 200 (index 1). pids are int ids and the ``where`` API
+        # reads an int ref as a positional index, so it carries the index, not
+        # the successor pid.
+        self.r._TREE_MODE = False
+        self.r._SORT_KEY = 'pid'
+        self._seed_prev([self._info(100, 1), self._info(200, 1)])
+        b = mock.Mock()
+        # Loaded root children in display (sorted) order, with real ids so the
+        # placement can locate the successor's index.
+        b.cached_children = lambda pid: [mock.Mock(id=100), mock.Mock(id=200)]
+        cur = {100: self._info(100, 1), 150: self._info(150, 1),
+               200: self._info(200, 1)}
+        self.r._apply_tick(b, cur)
+        ops = b.update_data.call_args.args[0]
+        up = next(op for op in ops if op[0] == 'upsert' and op[1] == 150)
+        self.assertIsNone(up[2])                            # parent = flat root
+        self.assertEqual(up[4], ('before', None, 1))        # before successor's index
+
+    def test_new_pid_last_when_it_sorts_to_the_end(self):
+        self.r._TREE_MODE = False
+        self.r._SORT_KEY = 'pid'
+        self._seed_prev([self._info(100, 1), self._info(200, 1)])
+        b = mock.Mock()
+        b.cached_children = lambda pid: [object(), object()]
+        cur = {100: self._info(100, 1), 200: self._info(200, 1),
+               300: self._info(300, 1)}                     # sorts last
+        self.r._apply_tick(b, cur)
+        ops = b.update_data.call_args.args[0]
+        up = next(op for op in ops if op[0] == 'upsert' and op[1] == 300)
+        self.assertEqual(up[4], ('last', None))
+
+
+class TestTickGone(_TickBase):
+    """A vanished pid is removed at once, or kept as a red tombstone then removed."""
+
+    def test_gone_pid_highlight_off_removed_immediately(self):
+        self.r._HIGHLIGHT_MODE = False
+        self._seed_prev([self._info(1, 0), self._info(300, 1)])
+        b = mock.Mock()
+        b.cached_children = lambda pid: None
+        cur = {1: self._info(1, 0)}                          # pid 300 gone
+        self.r._apply_tick(b, cur)
+        ops = b.update_data.call_args.args[0]
+        removes = [op[1] for op in ops if op[0] == 'remove']
+        self.assertIn(300, removes)
+        # The diff still records the tombstone (bookkeeping always runs), but
+        # with highlight off the tick removes the row outright — no red mod, to
+        # match ``_scoped_tombstones`` showing nothing when off.
+        mods = {op[1] for op in ops if op[0] == 'mod'}
+        self.assertNotIn(300, mods)
+
+    def test_gone_leaf_highlight_on_becomes_red_tombstone_then_removed(self):
+        # Highlight ON + the gone pid was a leaf → keep it as a soft-red
+        # tombstone (a ``mod`` setting row_fg), NOT removed yet.
+        self.r._HIGHLIGHT_MODE = True
+        self._seed_prev([self._info(1, 0), self._info(300, 1, args='sibling')])
+        b = mock.Mock()
+        b.cached_children = lambda pid: None
+        cur = {1: self._info(1, 0)}                          # leaf 300 dies
+        self.r._apply_tick(b, cur)
+        ops = b.update_data.call_args.args[0]
+        kinds = self._ops_by_kind(ops)
+        self.assertNotIn(300, [op[1] for op in kinds.get('remove', [])])
+        tomb_mod = next(op for op in ops if op[0] == 'mod' and op[1] == 300)
+        self.assertEqual(tomb_mod[3]['row_fg'], self.r._HL_GONE_FG)
+        # Its saved columns still render (the finished process's args/title).
+        self.assertEqual(tomb_mod[3]['title'], 'sibling')
+        self.assertIn(300, self.r._TOMBSTONES)               # retained
+
+        # Advance past the 3.5 s window; the NEXT tick prunes the tombstone and
+        # emits the deferred ``remove`` (cur unchanged otherwise).
+        self.clock += self.r._HIGHLIGHT_SECS + 0.1
+        b2 = mock.Mock()
+        b2.cached_children = lambda pid: None
+        self.r._apply_tick(b2, {1: self._info(1, 0)})
+        ops2 = b2.update_data.call_args.args[0]
+        self.assertIn(300, [op[1] for op in ops2 if op[0] == 'remove'])
+        self.assertNotIn(300, self.r._TOMBSTONES)
+
+    def test_gone_parent_with_children_removed_not_tombstoned(self):
+        # A vanished pid that HAD a child in the previous snapshot is NOT a
+        # tombstone (its row just goes); highlight on or not, it's a remove.
+        self.r._HIGHLIGHT_MODE = True
+        self._seed_prev([self._info(1, 0), self._info(100, 1),
+                         self._info(200, 100)])
+        b = mock.Mock()
+        b.cached_children = lambda pid: None
+        # Both 100 (parent) and 200 (its child) vanish at once.
+        cur = {1: self._info(1, 0)}
+        self.r._apply_tick(b, cur)
+        ops = b.update_data.call_args.args[0]
+        removes = {op[1] for op in ops if op[0] == 'remove'}
+        self.assertIn(100, removes)                          # parent → removed
+        self.assertNotIn(100, self.r._TOMBSTONES)            # not tombstoned
+
+
+class TestTickRowFgGating(_TickBase):
+    """The ops carry row_fg (green new / red tombstone) only when highlight on."""
+
+    def test_new_pid_green_when_on_none_when_off(self):
+        # New pid 300 under the loaded root in flat mode.
+        self.r._TREE_MODE = False
+        base = [self._info(100, 1)]
+
+        # Highlight ON → soft-green row_fg on the new upsert.
+        self.r._HIGHLIGHT_MODE = True
+        self._seed_prev(base)
+        b = mock.Mock(); b.cached_children = lambda pid: [object()]
+        self.r._apply_tick(b, {100: self._info(100, 1), 300: self._info(300, 1)})
+        up = next(op for op in b.update_data.call_args.args[0]
+                  if op[0] == 'upsert' and op[1] == 300)
+        self.assertEqual(up[3]['row_fg'], self.r._HL_NEW_FG)
+
+        # Highlight OFF → row_fg is None (identical to a rebuilt uncoloured row).
+        self.r._HIGHLIGHT_MODE = False
+        self.r._APPEARED_AT = {}
+        self._seed_prev(base)
+        b2 = mock.Mock(); b2.cached_children = lambda pid: [object()]
+        self.r._apply_tick(b2, {100: self._info(100, 1), 300: self._info(300, 1)})
+        up2 = next(op for op in b2.update_data.call_args.args[0]
+                   if op[0] == 'upsert' and op[1] == 300)
+        self.assertIsNone(up2[3]['row_fg'])
+
+    def test_alive_mod_clears_stale_green_after_window(self):
+        # A pid that appeared (green) must lose its green once the highlight
+        # window lapses: the alive ``mod`` carries row_fg=None then.
+        self.r._HIGHLIGHT_MODE = True
+        self._seed_prev([self._info(1, 0)])
+        b = mock.Mock(); b.cached_children = lambda pid: [object()]
+        # Tick 1: pid 400 appears → green.
+        self.r._apply_tick(b, {1: self._info(1, 0), 400: self._info(400, 1)})
+        up = next(op for op in b.update_data.call_args.args[0]
+                  if op[0] == 'upsert' and op[1] == 400)
+        self.assertEqual(up[3]['row_fg'], self.r._HL_NEW_FG)
+        # Tick 2 past the window: 400 is alive (mod) and no longer in
+        # _APPEARED_AT → row_fg cleared to None.
+        self.clock += self.r._HIGHLIGHT_SECS + 0.1
+        b2 = mock.Mock(); b2.cached_children = lambda pid: [object()]
+        self.r._apply_tick(b2, {1: self._info(1, 0), 400: self._info(400, 1)})
+        mod_400 = next(op for op in b2.update_data.call_args.args[0]
+                       if op[0] == 'mod' and op[1] == 400)
+        self.assertIsNone(mod_400[3]['row_fg'])
+        self.assertNotIn(400, self.r._APPEARED_AT)
+
+
+class TestTickAppliesToRealBrowser(_TickBase):
+    """End-to-end: a posted tick mutates a REAL headless Browser's loaded rows.
+
+    Proves the op batch the tick builds actually drives the framework apply path
+    (not just tuple shapes): a loaded row's columns change in place and a new pid
+    is inserted — with the cursor untouched (no refresh).
+    """
+
+    def _seed_browser(self, infos):
+        """Headless flat-mode Browser whose root children are ``infos`` rows.
+
+        Builds GENUINE framework ``Item``s (not the recipe's stubbed ``Item``)
+        carrying the same ``_proc_fields`` the recipe paints, so the rows the
+        framework stores and the ``update_data`` batch later patches are real.
+        """
+        self.r._TREE_MODE = False
+
+        def _row(info):
+            fields = self.r._proc_fields(info)
+            it = Item(id=info.pid, title=fields['title'], has_children=False)
+            for k, v in fields.items():
+                setattr(it, k, v)
+            it.pid = info.pid
+            it.user = info.user
+            return it
+
+        items = [_row(i) for i in infos]
+        b = make_browser(get_children=lambda _id, *, reload=False: list(items))
+        b.refresh()
+        b.run_until_idle()
+        self.addCleanup(b.stop_workers)
+        return b
+
+    def test_in_place_update_and_insert_no_cursor_jump(self):
+        self.r._SORT_KEY = 'pid'
+        a = self._info(100, 1, cpu_secs=10, mem_kb=1024, args='a')
+        c = self._info(300, 1, cpu_secs=10, mem_kb=1024, args='c')
+        self._seed_prev([a, c], wall=self.clock)
+        b = self._seed_browser([a, c])
+        b.cursor_to(300)
+        b.run_until_idle()
+        ctx = Context(b)
+        self.assertEqual(ctx.cursor.id, 300)
+
+        # Tick: pid 100 grows memory, pid 200 appears between 100 and 300.
+        self.clock += 1.0
+        cur = {100: self._info(100, 1, cpu_secs=10, mem_kb=4096, args='a'),
+               200: self._info(200, 1, cpu_secs=10, mem_kb=2048, args='b'),
+               300: self._info(300, 1, cpu_secs=10, mem_kb=1024, args='c')}
+        b.post(lambda: self.r._apply_tick(b, cur))
+        b.run_until_idle()
+
+        # The loaded row 100 repainted in place (new memory column).
+        self.assertEqual(b.get_item(100).col_mem,
+                         self.r.human_size(4096 * 1024))
+        # The new pid 200 was inserted in sorted position (between 100 and 300).
+        root_kids = [it.id for it in b.cached_children(None)]
+        self.assertEqual(root_kids, [100, 200, 300])
+        # Cursor stayed on pid 300 — no full teardown.
+        self.assertEqual(ctx.cursor.id, 300)
 
 
 if __name__ == '__main__':

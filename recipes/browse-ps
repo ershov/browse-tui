@@ -15,8 +15,12 @@ full command line. CPU% is the instantaneous cumulative-time delta between the
 current and previous snapshot, falling back to the ``ps pcpu`` lifetime average
 on the first sample or for a freshly-appeared pid.
 
-Reload with ctrl-r; a background daemon thread also auto-reloads every ``-d``
-seconds (default ``4.0``; ``-d 0`` disables it). ``t`` toggles between the ppid
+Reload with ctrl-r (a full re-fetch + re-sort); a background daemon thread also
+refreshes every ``-d`` seconds (default ``4.0``; ``-d 0`` disables it), but
+incrementally — it diffs the new snapshot against the old and pushes a single
+``update_data`` batch (loaded rows' cpu%/mem update in place, new/gone pids are
+added/removed surgically, the cursor + scroll stay put) rather than tearing the
+list down. ``t`` toggles between the ppid
 tree (default) and a flat list of every process (``--tree`` / ``--no-tree`` set
 the initial mode). The number keys ``1`` / ``2`` / ``3`` pick the gutter
 display mode — which columns show left of the command line: ``1`` = command
@@ -48,7 +52,7 @@ import time
 from browse_tui import (
     Action, Browser, BrowserConfig, Item,
     cell_ljust, cell_rjust, default_row_expander, default_row_indent,
-    default_row_selection, recipe_argv, style,
+    default_row_selection, mod, recipe_argv, remove, style, upsert,
 )
 
 
@@ -165,11 +169,15 @@ _SORT_LABELS = {
 
 # Background updater (B8). ``-d <seconds>`` sets the refresh interval; the
 # default is auto-update ON every 4 s, and a value <= 0 disables it (no thread
-# started). The daemon worker ticks every interval and calls ``b.refresh()``
-# (thread-safe — it ``post``s ``_do_refresh`` onto the UI thread), which
-# re-samples the process snapshot (CPU% deltas + the new/finished diff ride that
-# same sample). ``_UPDATE_STOP`` / ``_UPDATE_THREAD`` are created in ``main`` and
-# torn down in its ``finally``. Mirrors browse-claude's tail-worker daemon.
+# started). The daemon worker ticks every interval and pushes an INCREMENTAL
+# update: it fetches a fresh process table off the UI thread, then ``b.post``s a
+# callback that rotates the snapshot (CPU% deltas + the new/finished diff ride
+# that sample) and applies one ``b.update_data`` batch — loaded rows update in
+# place, new/gone pids are added/removed surgically, the cursor + scroll stay
+# put (NO full ``b.refresh()`` teardown, so no flicker). ``_UPDATE_STOP`` /
+# ``_UPDATE_THREAD`` are created in ``main`` and torn down in its ``finally``.
+# Mirrors browse-claude's tail-worker daemon (bg fetch → ``b.post`` →
+# ``b.update_data``).
 _DEFAULT_UPDATE_INTERVAL = 4.0
 _UPDATE_STOP = None    # threading.Event; created in main()
 _UPDATE_THREAD = None  # threading.Thread; created in main()
@@ -296,25 +304,24 @@ def _run_ps(user_field):
         return ''
 
 
-def _snapshot(*, reload=False):
-    """Return ``{pid: ProcInfo}`` for the current process table.
+def _fetch_procs():
+    """Run ``ps`` (+ smaps) and build a fresh ``{pid: ProcInfo}`` map.
 
-    Resamples (fresh ``ps`` + a new ``ProcInfo`` map, rotating the previous one
-    into ``_PREV_SNAPSHOT``) when ``reload=True`` OR no snapshot exists yet;
-    otherwise reuses the cached ``_CUR_SNAPSHOT``. The framework enqueues only
-    the root with ``reload=True`` on a full refresh (descendant re-fetches and
-    lazy expansions pass ``reload=False``), so this yields exactly one sample
-    per reload cycle and every ``get_children`` in that cycle shares it.
+    The slow half of a resample — the ``ps`` subprocess plus a per-pid
+    ``smaps_rollup`` read on Linux — with NO writes to the snapshot globals
+    (``_PREV_SNAPSHOT`` / ``_CUR_SNAPSHOT`` / the diff bookkeeping). Split out of
+    ``_snapshot`` so the background updater (B8) can do this fetch off the UI
+    thread and then ``b.post`` the cheap rotate+diff+ops onto the UI thread
+    (mirroring browse-claude's tail worker), keeping the shared snapshot state
+    single-threaded. The one global it may touch is ``_PS_USER_WIDTH_OK`` — a
+    once-per-process latch, idempotent and stable after the first real refresh.
 
     Linux usernames come from ``ps -o user:<w>``; if that variant ignores the
     width and truncates at 8, we re-run with ``uid=`` + a pwd cache (probed once
     per process via ``_PS_USER_WIDTH_OK``). Memory is private (smaps_rollup) on
     Linux where readable, else RSS.
     """
-    global _PREV_SNAPSHOT, _CUR_SNAPSHOT, _PS_USER_WIDTH_OK
-
-    if not reload and _CUR_SNAPSHOT is not None:
-        return _CUR_SNAPSHOT[1]
+    global _PS_USER_WIDTH_OK
 
     use_uid = sys.platform != 'darwin' and _PS_USER_WIDTH_OK is False
     out = _run_ps('uid=' if use_uid else _ps_user_args())
@@ -355,11 +362,42 @@ def _snapshot(*, reload=False):
             if private is not None:
                 info.mem_bytes = private
         procs[pid] = info
+    return procs
 
+
+def _install_snapshot(procs):
+    """Rotate ``procs`` into the snapshot pair and run the appeared/vanished diff.
+
+    The cheap half of a resample — rotate ``_CUR_SNAPSHOT`` into
+    ``_PREV_SNAPSHOT``, stamp the new sample with ``_now()``, and run
+    ``_diff_snapshot`` (CPU% deltas + the new/finished bookkeeping ride this).
+    Touches the shared snapshot globals, so it must run on the UI thread (the
+    synchronous ``get_children`` path is already there; the background tick
+    reaches it via ``b.post``). Returns the installed ``{pid: ProcInfo}`` map.
+    """
+    global _PREV_SNAPSHOT, _CUR_SNAPSHOT
     _PREV_SNAPSHOT = _CUR_SNAPSHOT
     _CUR_SNAPSHOT = (_now(), procs)
     _diff_snapshot(_PREV_SNAPSHOT, _CUR_SNAPSHOT)
     return procs
+
+
+def _snapshot(*, reload=False):
+    """Return ``{pid: ProcInfo}`` for the current process table.
+
+    Resamples (fresh ``ps`` + a new ``ProcInfo`` map, rotating the previous one
+    into ``_PREV_SNAPSHOT``) when ``reload=True`` OR no snapshot exists yet;
+    otherwise reuses the cached ``_CUR_SNAPSHOT``. The framework enqueues only
+    the root with ``reload=True`` on a full refresh (descendant re-fetches and
+    lazy expansions pass ``reload=False``), so this yields exactly one sample
+    per reload cycle and every ``get_children`` in that cycle shares it. A
+    resample is just ``_fetch_procs`` (the slow ``ps`` half) followed by
+    ``_install_snapshot`` (the rotate+diff half); the background updater (B8)
+    runs those two halves on separate threads (see ``_update_worker``).
+    """
+    if not reload and _CUR_SNAPSHOT is not None:
+        return _CUR_SNAPSHOT[1]
+    return _install_snapshot(_fetch_procs())
 
 
 def _diff_snapshot(prev, cur):
@@ -457,27 +495,65 @@ def _sort_procs(infos):
                   reverse=_SORT_DIR[_SORT_KEY])
 
 
+def _proc_fields(info):
+    """The row fields one ``ProcInfo`` paints — the SINGLE source of truth.
+
+    Returns the dict of every display field a process row carries: ``title``
+    (the full command line) plus the four gutter columns (``col_pid`` /
+    ``col_user`` / ``col_cpu`` / ``col_mem``). Used by BOTH the full-rebuild path
+    (``_proc_item``, via ``Item`` kwargs/attrs) and the incremental ``-d`` tick
+    (``_update_worker``, via ``mod`` / ``upsert`` patch fields) so a row updated
+    in place is byte-identical to one rebuilt from scratch — the two paths can
+    never drift. ``row_fg`` (the highlight) is decided separately by
+    ``_row_highlight_fg`` because it is gated on display mode + appeared/tombstone
+    state, not the raw ``ProcInfo``.
+    """
+    return {
+        'title': info.args,
+        'col_pid': str(info.pid),
+        'col_user': info.user,
+        'col_cpu': f'{_cpu_pct(info)}%',
+        'col_mem': human_size(info.mem_bytes),
+    }
+
+
+def _row_highlight_fg(pid, *, is_tombstone):
+    """The ``row_fg`` highlight colour for a row, or ``None`` (the lone decision).
+
+    The single place the new/finished colour is chosen, shared by the full
+    rebuild (``_build_rows``) and the incremental tick (``_update_worker``):
+    nothing when highlight mode is off; soft red for a tombstone; soft green for
+    a pid still inside its ``_APPEARED_AT`` window; otherwise ``None``.
+    """
+    if not _HIGHLIGHT_MODE:
+        return None
+    if is_tombstone:
+        return _HL_GONE_FG
+    return _HL_NEW_FG if pid in _APPEARED_AT else None
+
+
 def _proc_item(info, *, has_children, row_fg=None):
     """Build one process ``Item`` carrying the gutter display columns.
 
     Shared by the tree, flat AND tombstone builders so the ``col_*`` gutter
     fields (``col_pid`` / ``col_user`` / ``col_cpu`` / ``col_mem``) and the title
-    (the full command line) are assigned in exactly one place — tombstone rows
-    pass their saved ``ProcInfo`` so a finished process still renders its
-    last-known columns. ``.pid`` / ``.user`` ride along for the existing signal /
-    preview handlers. ``has_children`` is the caller's call: the ppid hierarchy
-    in tree mode, always ``False`` in flat mode and for tombstones (every flat /
-    tombstone row is a leaf). ``row_fg`` (a soft 256-colour int) is the
-    highlight colour — soft green for a freshly-appeared pid, soft red for a
-    tombstone; ``None`` leaves the row uncoloured.
+    (the full command line) are assigned in exactly one place — the
+    ``_proc_fields`` dict the incremental tick patches with too, so rebuilt and
+    in-place-updated rows stay identical. Tombstone rows pass their saved
+    ``ProcInfo`` so a finished process still renders its last-known columns.
+    ``.pid`` / ``.user`` ride along for the existing signal / preview handlers.
+    ``has_children`` is the caller's call: the ppid hierarchy in tree mode,
+    always ``False`` in flat mode and for tombstones (every flat / tombstone row
+    is a leaf). ``row_fg`` (a soft 256-colour int) is the highlight colour — soft
+    green for a freshly-appeared pid, soft red for a tombstone; ``None`` leaves
+    the row uncoloured.
     """
-    item = Item(id=info.pid, title=info.args, has_children=has_children)
+    fields = _proc_fields(info)
+    item = Item(id=info.pid, title=fields['title'], has_children=has_children)
     item.user = info.user
     item.pid = info.pid
-    item.col_pid = str(info.pid)
-    item.col_user = info.user
-    item.col_cpu = f'{_cpu_pct(info)}%'
-    item.col_mem = human_size(info.mem_bytes)
+    for field, value in fields.items():               # title + the col_* set
+        setattr(item, field, value)
     if row_fg is not None:
         item.row_fg = row_fg
     return item
@@ -519,13 +595,11 @@ def _build_rows(live_infos, child_of, tombstones):
     tomb_pids = {info.pid for info in tombstones}
     items = []
     for info in _sort_procs(list(live_infos) + list(tombstones)):
-        if info.pid in tomb_pids:
-            items.append(_proc_item(info, has_children=False, row_fg=_HL_GONE_FG))
-        else:
-            fg = (_HL_NEW_FG if _HIGHLIGHT_MODE and info.pid in _APPEARED_AT
-                  else None)
-            items.append(_proc_item(info, has_children=child_of(info.pid),
-                                    row_fg=fg))
+        is_tomb = info.pid in tomb_pids
+        items.append(_proc_item(
+            info,
+            has_children=False if is_tomb else child_of(info.pid),
+            row_fg=_row_highlight_fg(info.pid, is_tombstone=is_tomb)))
     return items
 
 
@@ -1081,22 +1155,154 @@ def _update_interval():
         return _DEFAULT_UPDATE_INTERVAL
 
 
-def _update_worker(b, interval):
-    """Background loop: every ``interval`` seconds, trigger a full reload.
+def _new_pid_placement(b, info, cur_procs):
+    """``(parent_id, where)`` for inserting a freshly-appeared pid, or ``None``.
 
-    Calls ``b.refresh()`` (thread-safe — it ``post``s ``_do_refresh`` onto the
-    UI thread), which enqueues the root with ``reload=True`` and re-samples the
-    process snapshot (so CPU% deltas and the new/finished diff ride the same
-    sample), preserving the cursor by pid.
+    A new pid is placed surgically, in sorted position, under the right parent:
+
+    - **flat** mode: the parent is the list root (``None``); the root children
+      are always loaded, so a new pid always places.
+    - **tree** mode: the parent is the pid's ``ppid``. We place ONLY when that
+      parent's children are already loaded (``cached_children`` is not ``None``);
+      under a not-yet-expanded parent we skip — inserting would create a partial
+      child list that the framework would then treat as authoritative, hiding the
+      real siblings. Such a pid simply appears the normal way (a fresh
+      ``get_children``) when the user expands its parent. Mirrors browse-claude's
+      ``_push_tail_diffs`` skipping parents absent from the cache.
+
+    ``where`` puts the row in the active sort order: we sort the live siblings
+    (the same ``_sort_procs`` the rebuild uses) and anchor ``before`` the new
+    pid's immediate successor, falling back to ``last`` when it sorts to the end.
+    Only NEW pids carry ``where`` — ``mod`` never repositions an existing row
+    (the default pid sort never moves; a changed key re-sorts on the next manual
+    refresh), per the ticket.
+    """
+    parent_id = None if not _TREE_MODE else info.ppid
+    loaded = b.cached_children(parent_id)
+    if loaded is None:
+        return None                    # parent not loaded → appears on expand
+    if not _TREE_MODE:
+        siblings = list(cur_procs.values())
+    else:
+        siblings = [s for s in cur_procs.values() if s.ppid == parent_id]
+    order = [s.pid for s in _sort_procs(siblings)]
+    successors = set(order[order.index(info.pid) + 1:])
+    # pids are INT ids, and the ``where`` API reads an int ref as a positional
+    # INDEX (not an id) — so anchor ``before`` the loaded-list INDEX of the new
+    # pid's first already-loaded successor, falling back to ``last`` when it
+    # sorts to the end. The tick emits upserts before removes, so a pre-batch
+    # index from ``cached_children`` is still valid when the upsert applies.
+    where = ('last', None)
+    if successors:                      # else it sorts to the end → append
+        for i, child in enumerate(loaded):
+            if child.id in successors:
+                where = ('before', None, i)
+                break
+    return parent_id, where
+
+
+def _tick_ops(b, prev_pids, tomb_before, cur_procs):
+    """Build the incremental ``update_data`` batch for one ``-d`` tick.
+
+    Diffs the just-rotated snapshot (``prev_pids`` are the previous sample's
+    pids, ``cur_procs`` the new ``{pid: ProcInfo}`` map) against the appeared /
+    tombstone bookkeeping ``_install_snapshot`` has already refreshed, and emits
+    exactly the ops needed to converge the loaded rows on what a full rebuild
+    would show — without tearing the list down:
+
+    - **alive** (prev ∩ cur): ``mod`` carrying the shared ``_proc_fields`` (the
+      refreshed cpu%/mem/user/title) plus the ``_row_highlight_fg`` decision.
+      ``mod`` is a silent no-op for unloaded pids, so emitting for every alive
+      pid is safe — only loaded rows repaint, in place. ``row_fg`` is always
+      included (it clears a stale green once a pid's highlight window lapses).
+    - **new** (cur − prev): ``upsert`` under the right parent in sorted position
+      (see ``_new_pid_placement``); skipped under an unexpanded tree parent.
+    - **gone** (prev − cur): if the diff turned it into a tombstone (highlight on
+      + was a leaf) ``mod`` it to the soft-red tombstone, kept until the 3.5 s
+      retention prunes it; otherwise ``remove`` it at once.
+    - **expired tombstones**: pids that WERE tombstones last tick and the diff
+      just pruned (window elapsed / parent gone) — ``remove`` them now. Tracked
+      via ``tomb_before`` minus the post-diff ``_TOMBSTONES`` (excluding any pid
+      that respawned, which the new branch handles).
+    """
+    cur_pids = set(cur_procs)
+    tomb_after = set(_TOMBSTONES)
+    ops = []
+
+    for pid in prev_pids & cur_pids:
+        ops.append(mod(pid, **_proc_fields(cur_procs[pid]),
+                       row_fg=_row_highlight_fg(pid, is_tombstone=False)))
+
+    for pid in cur_pids - prev_pids:
+        placement = _new_pid_placement(b, cur_procs[pid], cur_procs)
+        if placement is None:
+            continue
+        parent_id, where = placement
+        ops.append(upsert(pid, parent_id, where=where,
+                          **_proc_fields(cur_procs[pid]),
+                          row_fg=_row_highlight_fg(pid, is_tombstone=False)))
+
+    for pid in prev_pids - cur_pids:
+        # A finished leaf becomes a soft-red tombstone ONLY when highlighting is
+        # on (it must match ``_scoped_tombstones``, which shows nothing when
+        # off); otherwise — or for a non-leaf whose row just vanishes — remove.
+        if _HIGHLIGHT_MODE and pid in tomb_after:
+            info = _TOMBSTONES[pid][0]
+            ops.append(mod(pid, **_proc_fields(info), row_fg=_HL_GONE_FG))
+        else:
+            ops.append(remove(pid))
+
+    # A tombstone the diff just pruned (3.5 s window elapsed / parent gone, and
+    # not respawned) leaves the UI now. Only relevant while highlighting is on —
+    # off, the gone branch already removed it the tick it vanished.
+    if _HIGHLIGHT_MODE:
+        for pid in (tomb_before - tomb_after) - cur_pids:
+            ops.append(remove(pid))
+
+    return ops
+
+
+def _apply_tick(b, procs):
+    """UI-thread half of a ``-d`` tick: rotate, diff, then apply the batch.
+
+    Runs via ``b.post`` so it touches the shared snapshot globals
+    (``_PREV/_CUR_SNAPSHOT`` + ``_APPEARED_AT`` / ``_TOMBSTONES``) only on the UI
+    thread, never racing ``get_children`` / ``ps_gutter_segments`` reads. Reads
+    the pre-rotation pids + tombstone set, installs the freshly-fetched ``procs``
+    (rotate + ``_diff_snapshot``), builds the incremental op batch, and applies
+    it with ONE ``b.update_data`` — no ``b.refresh()``, so the cursor and scroll
+    are untouched and the loaded rows update in place (no flicker).
+    """
+    prev = _CUR_SNAPSHOT
+    prev_pids = set(prev[1]) if prev is not None else set()
+    tomb_before = set(_TOMBSTONES)
+    _install_snapshot(procs)
+    ops = _tick_ops(b, prev_pids, tomb_before, procs)
+    if ops:
+        b.update_data(ops)
+
+
+def _update_worker(b, interval):
+    """Background loop: every ``interval`` seconds, push an incremental update.
+
+    Each tick fetches a fresh process table OFF the UI thread
+    (``_fetch_procs`` — the slow ``ps`` + smaps half), then ``b.post``s
+    ``_apply_tick`` to rotate the snapshot, run the appeared/vanished diff, and
+    apply ONE ``b.update_data`` batch on the UI thread. This replaces the old
+    full ``b.refresh()`` tick: loaded rows' cpu%/mem update in place, new/gone
+    pids are added/removed surgically, and the cursor + scroll stay put (no
+    flicker). The fetch/post split mirrors browse-claude's ``_tail_worker`` and
+    keeps the shared snapshot globals single-threaded (see ``_apply_tick``).
 
     The wait is ``_UPDATE_STOP.wait(timeout=interval)`` — NOT ``time.sleep`` — so
     setting the stop event wakes the worker immediately and shutdown stays
-    prompt. Marked daemon as a backstop. ``refresh`` failures are swallowed so a
+    prompt. Marked daemon as a backstop. A failed tick is swallowed so a
     transient error doesn't kill the worker; the next tick gets a clean shot.
     """
     while not _UPDATE_STOP.wait(timeout=interval):
         try:
-            b.refresh()
+            procs = _fetch_procs()
+            b.post(lambda procs=procs: _apply_tick(b, procs))
         except Exception:
             pass
 
@@ -1141,12 +1347,14 @@ def main():
         show_ids='never',
     ))
 
-    # Background updater (B8): a daemon thread ticks every ``-d`` seconds and
-    # ``b.refresh()``es (re-sampling the snapshot — CPU% deltas + the
-    # new/finished diff ride that reload). ``-d <= 0`` disables it (no thread).
-    # Daemon so it never keeps the process alive; ``_UPDATE_STOP`` signals a
-    # clean shutdown before sys.exit, joined briefly in the ``finally`` so the
-    # worker wakes from its ``wait`` before the process exits (prompt shutdown).
+    # Background updater (B8): a daemon thread ticks every ``-d`` seconds,
+    # fetching a fresh snapshot off-thread and ``b.post``ing an INCREMENTAL
+    # ``b.update_data`` batch (CPU% deltas + the new/finished diff ride that
+    # sample; loaded rows update in place, no flicker — see ``_update_worker`` /
+    # ``_apply_tick``). ``-d <= 0`` disables it (no thread). Daemon so it never
+    # keeps the process alive; ``_UPDATE_STOP`` signals a clean shutdown before
+    # sys.exit, joined briefly in the ``finally`` so the worker wakes from its
+    # ``wait`` before the process exits (prompt shutdown).
     global _UPDATE_STOP, _UPDATE_THREAD
     interval = _update_interval()
     if interval > 0:
