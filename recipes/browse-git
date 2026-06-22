@@ -1,9 +1,10 @@
 #!/usr/bin/env -S browse-tui --run-py
 """browse-git — a tig-like browser over a git repository.
 
-Five view modes, switchable by ``--mode NAME`` at launch, by the
-backtick (`` ` ``) key at runtime, or auto-selected from positional
-arguments:
+Six view modes, switchable by a per-mode flag (``--commits`` /
+``--status`` / ``--reflog`` / ``--branches`` / ``--stash`` /
+``--worktrees``) at launch, by the backtick (`` ` ``) key at runtime, or
+auto-selected from positional arguments:
 
   commits   recent ``git log`` — drill commit -> changed files -> diff
   status    ``git status`` working-tree entries
@@ -16,6 +17,8 @@ files. They honor the same path filter and appear only on an unscoped log
   reflog    ``git reflog`` entries
   branches  branches / remotes / tags via ``git for-each-ref``
   stash     ``git stash list``
+  worktrees ``git worktree list`` — one row per worktree (main first,
+            relpath ``.``), drill into that worktree's branch commit log
 
 With ``-`` as the sole argument the recipe instead reads GIT OUTPUT
 FROM STDIN: the stream is slurped to EOF before the UI starts (on a
@@ -52,9 +55,16 @@ access — never a hex-vs-word heuristic or substring scan:
   ('file', sha, path)        a file in a commit -> per-file diff; a .md file
                              also -> a browse-md launcher
   ('ref', refname)           a branch/remote/tag -> commits on that ref
+  ('worktree', abspath, label)  a worktree (worktrees mode) -> the commits
+                             on its branch / sha; label is the branch
+                             short-name, or the short HEAD sha when detached
+                             (label is the drill rev), or ``(bare)`` for a
+                             bare worktree (a leaf — nothing to log)
   ('status', xy, path)       a working-tree entry -> staged/worktree diff; a
                              .md file also -> a browse-md launcher
-  ('wc', bucket)             a status group (untracked/tracked/staged/conflicts)
+  ('wc', bucket, wt_path)    a working-change group (untracked/tracked/staged/
+                             conflicts); wt_path None = current worktree (cwd),
+                             else the abspath of the worktree it sits atop
   ('stash', n[, path])       a stash (n int), or a file in one (.md -> launcher)
   ('reflog', n, sha)         a reflog entry (n int) -> changed files
   ('md-refs', sha)           a commit's [md] References umbrella -> launcher rows
@@ -117,7 +127,7 @@ log's ``--branches``) — equivalent to ``browse-git $(git branch
 --format='%(refname:short)')`` — instead of only HEAD's history.
 
 Usage:
-  browse-git [<dir>] [-n NUMBER] [--mode NAME] [--no-tree] [--all] [<revs>…] [-- <paths>…]
+  browse-git [<dir>] [-n NUMBER] [--commits|--status|--reflog|--branches|--stash] [--no-tree] [--all] [<revs>…] [-- <paths>…]
   git diff | browse-git -      (also git log / log -p / status output)
 """
 
@@ -126,6 +136,7 @@ import re
 import shutil
 import subprocess
 import sys
+from collections import namedtuple
 
 from browse_tui import (
     Action, Browser, BrowserConfig, Item,
@@ -161,7 +172,7 @@ except Exception:
 HAVE_DELTA = shutil.which('delta')
 
 _LOG_LIMIT = 1000
-_MODES = ('commits', 'status', 'reflog', 'branches', 'stash')
+_MODES = ('commits', 'status', 'reflog', 'branches', 'stash', 'worktrees')
 
 # Glyph substitution for ``git log --graph`` art (tree mode). Maps git's
 # ASCII art to box-drawing / dot glyphs: every node ('*') becomes the same
@@ -197,6 +208,13 @@ _SGR_RE = re.compile(r'\x1b\[[^@-~]*m')
 _GREEN = '\033[32m'
 _RED = '\033[31m'
 _RESET = '\033[m'
+
+# Full-row background (xterm-256 cube) painted on any commit row whose full
+# sha is a checked-out worktree HEAD (the main tree's HEAD and every linked
+# worktree's HEAD). 18 is a distinctly-blue dark cube cell (the 17-19 dark-blue
+# range), readable as blue rather than near-black. Read by the list renderer
+# via ``getattr(item, 'row_bg', None)``; left unset on non-HEAD rows.
+_HEAD_ROW_BG = 18
 
 # Module-level state, all set in main() before the Browser launches.
 _log_limit = _LOG_LIMIT
@@ -265,33 +283,33 @@ def _pop_limit_arg(default):
     return default
 
 
-def _pop_mode_arg():
-    """Pop ``--mode NAME`` (or ``--mode=NAME``) out of ``sys.argv``.
+def _pop_mode_flag():
+    """Pop a per-mode flag (``--commits`` / ``--status`` / …) out of ``sys.argv``.
 
-    Returns the chosen mode name, or ``None`` if the flag is absent. An
-    unknown mode name is fatal (stderr + exit 2) — the user asked for a
-    view that doesn't exist.
+    The accepted flags are derived from ``_MODES`` — one ``--{mode}`` per
+    mode — so appending a mode there grows the flag set for free. Every
+    occurrence is removed (so a flag never leaks into the positional
+    classifier), mirroring ``_pop_tree_arg`` / ``_pop_all_arg``'s in-place
+    argv editing. Returns the single chosen mode name, or ``None`` if none
+    appears. Selecting more than one DISTINCT mode is fatal (stderr + exit
+    2) — the modes are mutually exclusive.
     """
+    flag_to_mode = {f'--{m}': m for m in _MODES}
+    chosen = set()
     i = 1
     while i < len(sys.argv):
-        a = sys.argv[i]
-        value = None
-        if a == '--mode' and i + 1 < len(sys.argv):
-            value = sys.argv[i + 1]
-            del sys.argv[i:i + 2]
-        elif a.startswith('--mode='):
-            value = a.split('=', 1)[1]
+        m = flag_to_mode.get(sys.argv[i])
+        if m is not None:
+            chosen.add(m)
             del sys.argv[i]
         else:
             i += 1
-            continue
-        if value not in _MODES:
-            sys.stderr.write(
-                f'browse-git: unknown mode {value!r}; '
-                f'choose one of {", ".join(_MODES)}\n')
-            sys.exit(2)
-        return value
-    return None
+    if len(chosen) > 1:
+        sys.stderr.write(
+            'browse-git: choose at most one mode flag '
+            f'({", ".join("--" + m for m in _MODES)})\n')
+        sys.exit(2)
+    return chosen.pop() if chosen else None
 
 
 def _pop_tree_arg(default):
@@ -300,7 +318,7 @@ def _pop_tree_arg(default):
     Returns ``True`` for ``--tree``, ``False`` for ``--no-tree``, or
     ``default`` when neither appears. Every occurrence is removed (so the
     flag never leaks into the positional classifier) and the LAST one wins,
-    so ``--tree --no-tree`` resolves to off. Mirrors ``_pop_mode_arg``'s
+    so ``--tree --no-tree`` resolves to off. Mirrors ``_pop_mode_flag``'s
     in-place argv editing.
     """
     chosen = default
@@ -515,6 +533,35 @@ def _repo_root():
     """
     result = _run_git('rev-parse', '--show-toplevel')
     return result.stdout.strip() if result.returncode == 0 else ''
+
+
+def _shell_cwd(item_id):
+    """Directory a "Run shell here" should open in for the cursor row.
+
+    A ``('worktree', abspath, …)`` row (the only "a worktree" kind) opens its
+    own working directory; every other row opens the repo's work-tree root
+    (``'.'`` when outside a repo / gitless, so the shell still launches).
+    """
+    if (isinstance(item_id, tuple) and len(item_id) >= 2
+            and item_id[0] == 'worktree'):
+        return item_id[1]
+    return _repo_root() or '.'
+
+
+def _run_shell(ctx, cwd):
+    """Open an interactive ``$SHELL`` with ``cwd`` as the working directory.
+
+    ``ctx.run_external`` has no ``cwd`` knob, so the directory change rides in a
+    shell-string command (run via ``sh -c``): ``cd <dir> && exec <$SHELL> -l
+    -i``. ``exec`` replaces the wrapping ``sh`` with the user's shell so signals
+    / the exit code pass through; ``-l -i`` makes it a login interactive shell
+    that loads the same startup files (and thus the real prompt) as the user's
+    normal terminal. ``$SHELL`` defaults to ``sh`` and may carry args
+    (``bash --login``), which the shell-string honours verbatim.
+    """
+    import shlex
+    shell = os.environ.get('SHELL') or 'sh'
+    ctx.run_external(f'cd {shlex.quote(cwd)} && exec {shell} -l -i')
 
 
 def _blob_text(rev, path):
@@ -1460,12 +1507,40 @@ def get_children(item_id, *, reload=False):
         # A ref drills into its commits — the shared commit-log builder
         # with the refname as the sole rev. id = ('ref', refname). The
         # ref's own id namespaces its filler ids so two drilled-in refs
-        # don't collide on a shared filler counter.
-        return _log_items([item_id[1]], [], ns=item_id)
+        # don't collide on a shared filler counter. When the ref is a branch
+        # checked out in a SEPARATE (linked) worktree, that worktree's
+        # working-change groups are prepended above the log (like the
+        # worktree drill-down); the main worktree's branch, an uncheckedout
+        # branch, a remote, or a tag gets no groups (its log is HEAD-free /
+        # not a live working tree here).
+        log = _log_items([item_id[1]], [], ns=item_id)
+        linked = next((wt for wt in _worktrees()
+                       if not wt.is_main and wt.branch == item_id[1]), None)
+        if linked is not None:
+            return _worktree_groups([], linked.path) + log
+        return log
+    if kind == 'worktree':
+        # A worktree row drills into its branch's commits via the same
+        # commit-log seam as a ref. id = ('worktree', abspath, label) where
+        # label is the branch short-name, or the HEAD sha for a detached
+        # worktree — either way a valid rev. (A bare worktree's label is
+        # ``(bare)`` and the row is built as a leaf, so it never reaches
+        # here.) The id namespaces this build's filler ids so two
+        # drilled-in worktrees don't share a counter. THAT worktree's
+        # working-change groups are prepended above its log (scoped to the
+        # worktree abspath, no ``_paths`` — a drill-down is about that
+        # worktree, and the positional paths are cwd-relative).
+        return (_worktree_groups([], item_id[1])
+                + _log_items([item_id[2]], [], ns=item_id))
     if kind == 'wc':
         # A worktree-status group drills into its files. id = ('wc',
-        # bucket); scope by the same positional paths as the root.
-        return _worktree_files(item_id[1], _paths)
+        # bucket, wt_path). wt_path None means the current worktree (scope
+        # by the same positional ``_paths`` as the root); a non-None abspath
+        # is a specific (linked) worktree drilled via ``git -C`` with no
+        # path filter (the positional paths are cwd-relative).
+        return _worktree_files(item_id[1],
+                               _paths if item_id[2] is None else [],
+                               item_id[2])
     if kind == 'sdiff':
         # The piped-diff umbrella drills into its per-file leaves.
         # id = ('sdiff',).
@@ -1494,19 +1569,21 @@ def _root_children():
         return _stash_root()
     if _mode == 'branches':
         return _branches_root()
+    if _mode == 'worktrees':
+        return _worktrees_root()
     return []
 
 
 def _commits_root():
     """Commits-mode root = worktree status groups + the ``git log``.
 
-    The synthetic worktree-status rows (``_worktree_groups``) are prepended
-    ONLY when the log is the plain HEAD log — no positional rev and no
-    ``--all``, either of which moves the log off HEAD's history, where live
-    working-tree rows would be misleading. A path filter is still honored
-    (passed through to both the groups and the log), so e.g. ``browse-git
-    src/`` shows the working-tree changes under ``src/`` above its commit
-    history.
+    On the plain HEAD log (no positional rev, no ``--all``) the synthetic
+    worktree-status rows (``_worktree_groups``) are prepended above the log,
+    honoring the path filter (passed through to both the groups and the log)
+    so e.g. ``browse-git src/`` shows the working-tree changes under ``src/``
+    above its commit history. A positional rev moves the log off HEAD's
+    history (it becomes historical), so no live working-tree rows are shown
+    there.
 
     ``--all`` (``_all_branches``) appends git log's ``--branches`` selector
     to the revs, spanning the log over every local branch — equivalent to
@@ -1514,15 +1591,22 @@ def _commits_root():
     rev). The commit portion goes through the ``_log_items`` seam so it
     honors tree mode (the ``--tree`` graph column) exactly as the ref
     drill-down does; the synthetic rows are not commits and carry no graph
-    art.
+    art. Under ``--all`` the groups are spliced above EACH worktree's tip
+    wherever it sits in the flat/graph log (``_inject_worktree_tips``)
+    rather than only above HEAD.
     """
     revs = list(_revs)
     if _all_branches:
         revs.append('--branches')
-    items = []
-    if not revs:
-        items.extend(_worktree_groups(_paths))
-    items.extend(_log_items(revs, _paths, ns='root'))
+    items = _log_items(revs, _paths, ns='root')
+    if _all_branches:
+        # Splice every worktree's groups above its tip commit, wherever it
+        # sits in the all-branches log.
+        return _inject_worktree_tips(items, _paths)
+    if not _revs:
+        # Plain HEAD log: the current worktree's groups on top (unchanged).
+        return _worktree_groups(_paths, None) + items
+    # Positional rev scope: the log is historical — no live working changes.
     return items
 
 
@@ -1547,40 +1631,196 @@ def _log_items(revs, paths, ns):
     return _commit_log_items(revs, paths)
 
 
-def _worktree_status(paths):
+def _worktree_status(paths, wt_path=None):
     """``git status --porcelain -z`` rows as ``[(XY, path)]``, scoped by paths.
 
     Returns the parsed ``_parse_porcelain_z`` rows on success. On any git
     failure it returns ``[]`` — degrading quietly to "no worktree rows"
     rather than injecting an error row at the top of the commit log.
+
+    ``wt_path`` selects which worktree to inspect: ``None`` (the default)
+    runs in the current working directory exactly as before; a non-None
+    absolute path runs ``git -C <wt_path> …`` so the status comes from that
+    specific (linked) worktree. The ``paths`` filter is the caller's
+    responsibility — it is only meaningful for the cwd worktree (paths are
+    cwd-relative), so callers pass ``[]`` for a non-None ``wt_path``.
     """
     args = ['status', '--porcelain', '-z']
     if paths:
         args += ['--', *paths]
+    if wt_path is not None:
+        args = ['-C', wt_path, *args]
     result = _run_git(*args)
     if result.returncode != 0:
         return []
     return _parse_porcelain_z(result.stdout)
 
 
-def _worktree_groups(paths):
-    """Synthetic worktree-group rows for the commits-mode root.
+# One linked-or-main worktree, as parsed from ``git worktree list
+# --porcelain``: ``path`` is absolute, ``head`` the checked-out sha,
+# ``branch`` the short branch name (``None`` when detached or bare), and
+# ``is_main`` marks the first stanza (git always emits the main worktree
+# first). The shared foundation for the worktree-aware branch/status work.
+_Worktree = namedtuple('_Worktree', 'path head branch is_main')
 
-    Classifies ``_worktree_status(paths)`` into the four ``_WC_GROUPS``
-    buckets and emits one expandable ``('wc', bucket)`` row per NON-empty
-    bucket, in ``_WC_GROUPS`` order, titled by the group label. A clean
-    tree (no changes) yields ``[]`` — no rows at all.
+
+def _parse_worktree_list(text):
+    """Parse ``git worktree list --porcelain`` text into ``[_Worktree]``.
+
+    The porcelain output is blank-line-separated stanzas, one per worktree::
+
+        worktree <abspath>
+        HEAD <sha>
+        branch refs/heads/<name>      # or 'detached', or 'bare'
+
+    Each ``worktree`` line opens a stanza; ``HEAD`` / ``branch`` fill it; a
+    ``detached`` or ``bare`` line leaves ``branch`` as ``None``. The
+    ``refs/heads/`` prefix is stripped to the short name. The FIRST stanza
+    is the main worktree (``is_main=True``); the rest are linked. Pure: no
+    git call, so it unit-tests against sample text.
+    """
+    worktrees = []
+    path = head = branch = None
+    first = True
+
+    def _flush():
+        nonlocal path, head, branch, first
+        if path is not None:
+            worktrees.append(_Worktree(path, head, branch, first))
+            first = False
+        path = head = branch = None
+
+    for line in text.splitlines():
+        if not line:
+            _flush()
+            continue
+        key, _, value = line.partition(' ')
+        if key == 'worktree':
+            _flush()                       # close any unterminated stanza
+            path = value
+        elif key == 'HEAD':
+            head = value
+        elif key == 'branch':
+            branch = value[len('refs/heads/'):] if value.startswith(
+                'refs/heads/') else value
+        # 'detached' / 'bare' (and any other key) leave branch=None.
+    _flush()                               # trailing stanza (no blank line)
+    return worktrees
+
+
+def _worktrees():
+    """All worktrees (main first) via ``git worktree list --porcelain``.
+
+    Returns ``_parse_worktree_list`` records on success; degrades to ``[]``
+    on any git failure (missing binary, bare/odd repo) like
+    ``_worktree_status`` — callers treat "no worktree info" as "nothing to
+    annotate" rather than surfacing an error.
+    """
+    result = _run_git('worktree', 'list', '--porcelain')
+    if result.returncode != 0:
+        return []
+    return _parse_worktree_list(result.stdout)
+
+
+def _current_worktree_path():
+    """Absolute path of the CURRENT worktree, or ``None`` on failure.
+
+    ``git rev-parse --show-toplevel`` resolves to the same path
+    ``git worktree list`` reports for whichever worktree the cwd lives in,
+    so it is the key used to decide which ``_worktrees()`` record is the
+    current one (its groups then use the cwd convention ``wt_path=None`` and
+    honor ``_paths``). ``None`` when not in a repo / git is absent — the
+    degraded case where every worktree is treated as "not current".
+    """
+    return _repo_root() or None
+
+
+def _worktree_relpath(abspath, main_root):
+    """``abspath`` relative to the main worktree root (the main root -> '.').
+
+    Just ``os.path.relpath`` — yields ``.claude/worktrees/foo`` for a nested
+    linked worktree or ``../sibling`` for a sibling one; the main worktree
+    itself maps to ``.`` (``relpath`` of a path against itself).
+    """
+    return os.path.relpath(abspath, main_root)
+
+
+def _worktree_label(wt):
+    """The ``label`` for a ``_Worktree`` row: branch short-name, else short
+    HEAD sha (detached), else ``(bare)`` (no HEAD line in the porcelain).
+
+    Shared by ``_worktrees_root`` (the row title + id) and
+    ``_initial_cursor_id`` (the main-worktree cursor target) so the
+    ``('worktree', path, label)`` id shape can't drift between them.
+    """
+    if wt.branch is not None:
+        return wt.branch
+    if wt.head is not None:
+        return wt.head[:7]          # detached: short HEAD sha
+    return '(bare)'                 # bare worktree: no HEAD to show
+
+
+def _worktrees_root():
+    """Worktrees-mode root = one ``('worktree', abspath, label)`` row each.
+
+    From ``_worktrees()`` (main first), each row is titled ``<relpath>
+    <label>`` — the path relative to the main worktree root (the main
+    worktree itself is ``.``) followed by the checked-out branch short-name,
+    the short HEAD sha for a detached worktree, or ``(bare)`` for a bare
+    worktree (which has no HEAD line in the porcelain). For a branch or
+    detached worktree ``label`` doubles as the drill-down rev (see the
+    ``worktree`` branch of ``get_children``), so a detached worktree drills
+    via its sha; a bare worktree has nothing to log and is a non-expandable
+    leaf. Main vs linked is tagged with a small ``main`` / ``linked`` chip.
+    Degrades to an error row on git failure (empty ``_worktrees()``),
+    mirroring the other roots.
+    """
+    worktrees = _worktrees()
+    if not worktrees:
+        return _err_item('git worktree list failed')
+    main_root = next((wt.path for wt in worktrees if wt.is_main), None)
+    items = []
+    for wt in worktrees:
+        label = _worktree_label(wt)
+        relpath = (_worktree_relpath(wt.path, main_root)
+                   if main_root is not None else wt.path)
+        kind = 'main' if wt.is_main else 'linked'
+        items.append(Item(id=('worktree', wt.path, label),
+                          title=f'{relpath} {label}',
+                          tag=kind,
+                          tag_style='green' if wt.is_main else 'magenta',
+                          # Only branch/detached rows have a rev to log; a
+                          # bare worktree (no branch, no HEAD) is a leaf.
+                          has_children=bool(wt.branch or wt.head)))
+    return items
+
+
+def _worktree_groups(paths, wt_path=None):
+    """Synthetic worktree-group rows for a worktree's working changes.
+
+    Classifies ``_worktree_status(paths, wt_path)`` into the four
+    ``_WC_GROUPS`` buckets and emits one expandable
+    ``('wc', bucket, wt_path)`` row per NON-empty bucket, in ``_WC_GROUPS``
+    order, titled by the group label. A clean tree (no changes) yields
+    ``[]`` — no rows at all.
+
+    ``wt_path`` is carried into the row id so a drilled group fetches the
+    RIGHT worktree's files (see ``_worktree_files`` / ``_worktree_preview``):
+    ``None`` means the current working directory (the path filter applies);
+    an absolute path means that specific (linked) worktree (callers pass
+    ``paths=[]`` there, since paths are cwd-relative).
 
     Each row carries empty ``col_sha`` / ``col_author`` / ``col_date``
     strings so ``git_row_content`` aligns its label under the sibling
     commit subjects (empty columns pad to the commit column widths)
     instead of rendering flush-left.
     """
-    buckets = _classify_worktree(_worktree_status(paths))
+    buckets = _classify_worktree(_worktree_status(paths, wt_path))
     items = []
     for bucket, label in _WC_GROUPS:
         if buckets[bucket]:
-            item = Item(id=('wc', bucket), title=label, has_children=True)
+            item = Item(id=('wc', bucket, wt_path), title=label,
+                        has_children=True)
             # Empty leading columns so git_row_content pads them to the
             # commit column widths — the label then lines up under the
             # commit subjects rather than at the start of the row.
@@ -1591,15 +1831,56 @@ def _worktree_groups(paths):
     return items
 
 
-def _worktree_files(bucket, paths):
+def _worktree_files(bucket, paths, wt_path=None):
     """Files in one worktree ``bucket`` as ``('status', xy, path)`` leaves.
 
     Re-runs status + classify (cheap; keeps the groups self-contained) and
     returns that bucket's ``(XY, path)`` entries as the shared
-    ``_status_leaf`` items. An unknown bucket name yields ``[]``.
+    ``_status_leaf`` items. ``wt_path`` scopes the status to a specific
+    worktree (``None`` = cwd), mirroring ``_worktree_groups``. An unknown
+    bucket name yields ``[]``.
     """
-    buckets = _classify_worktree(_worktree_status(paths))
+    buckets = _classify_worktree(_worktree_status(paths, wt_path))
     return [_status_leaf(xy, path) for xy, path in buckets.get(bucket, [])]
+
+
+def _inject_worktree_tips(items, paths):
+    """Splice each worktree's working-change groups above its tip commit.
+
+    For ``--all`` commits mode: a flat/graph log can show several worktrees'
+    checked-out tips wherever they sit, so the synthetic ``_worktree_groups``
+    rows are inserted immediately BEFORE each ``('commit', sha)`` row whose
+    full sha is a worktree HEAD — making them read as "fake commits on top
+    of" that tip. A worktree whose HEAD isn't in ``items`` (off the log
+    window, or filtered out) is simply skipped: there's no row to attach to.
+
+    ``_worktrees()`` and the current-worktree path are resolved ONCE here
+    (not per row). The current worktree's groups use the cwd convention
+    (``wt_path=None``) and honor ``paths``; every other worktree's groups
+    are scoped to its abspath with no path filter (paths are cwd-relative).
+    Two worktrees sharing a HEAD each contribute their groups, in worktree
+    order. Filler / meta / non-commit rows pass through untouched; mid-graph
+    insertion may look slightly off (accepted — alignment is refined later).
+    """
+    worktrees = _worktrees()
+    if not worktrees:
+        return items
+    current = _current_worktree_path()
+    by_head = {}
+    for wt in worktrees:
+        if wt.head is not None:
+            by_head.setdefault(wt.head, []).append(wt)
+    out = []
+    for item in items:
+        item_id = getattr(item, 'id', None)
+        if (isinstance(item_id, tuple) and len(item_id) == 2
+                and item_id[0] == 'commit' and item_id[1] in by_head):
+            for wt in by_head[item_id[1]]:
+                wt_path = None if wt.path == current else wt.path
+                grp_paths = paths if wt_path is None else []
+                out.extend(_worktree_groups(grp_paths, wt_path))
+        out.append(item)
+    return out
 
 
 def _commit_log_items(revs, paths):
@@ -1626,6 +1907,9 @@ def _commit_log_items(revs, paths):
     result = _run_git(*args)
     if result.returncode != 0:
         return _err_item(f'git log failed: {result.stderr.strip()}')
+    # Checked-out HEAD shas (main tree + every linked worktree), built ONCE per
+    # build — a commit row whose full sha is here gets the dark-blue stripe.
+    heads = {wt.head for wt in _worktrees() if wt.head}
     items = []
     for line in result.stdout.splitlines():
         if not line:
@@ -1640,6 +1924,8 @@ def _commit_log_items(revs, paths):
         item.col_author = author
         item.col_date = reldate
         item.chips = _parse_decorations(deco)
+        if sha in heads:
+            item.row_bg = _HEAD_ROW_BG
         items.append(item)
     return items
 
@@ -1719,6 +2005,9 @@ def _commit_graph_items(revs, paths, ns):
     result = _run_git(*args)
     if result.returncode != 0:
         return _err_item(f'git log failed: {result.stderr.strip()}')
+    # Checked-out HEAD shas (main tree + every linked worktree), built ONCE per
+    # build — a commit row whose full sha is here gets the dark-blue stripe.
+    heads = {wt.head for wt in _worktrees() if wt.head}
     items = []
     filler_n = 0
     for line in result.stdout.splitlines():
@@ -1732,6 +2021,8 @@ def _commit_graph_items(revs, paths, ns):
             item.col_date = reldate
             item.chips = _parse_decorations(deco)
             item.col_graph = _graph_translate(art)
+            if sha in heads:
+                item.row_bg = _HEAD_ROW_BG
             items.append(item)
         else:
             # Filler line: the whole line is graph art (no commit fields).
@@ -1987,6 +2278,14 @@ def _branches_root():
     newest-commit-first. The format emits the full ``%(refname)`` (for
     kind classification) and ``%(refname:short)`` (for display + id),
     NUL-separated. Each ref drills into that ref's commits.
+
+    A local branch checked out in a SEPARATE (linked) worktree carries an
+    extra magenta chip with that worktree's path relative to the main
+    worktree root (e.g. ``.claude/worktrees/foo``). The main worktree's
+    branch is skipped (it's HEAD here, not "elsewhere"), and remotes / tags
+    never get the chip — only ``branch`` rows do. The map is keyed by short
+    branch name, so a branch checked out in two linked worktrees would show
+    the last one listed; git forbids that, so the key is effectively unique.
     """
     result = _run_git(
         'for-each-ref', '--sort=-committerdate',
@@ -1994,15 +2293,25 @@ def _branches_root():
         'refs/heads', 'refs/remotes', 'refs/tags')
     if result.returncode != 0:
         return _err_item(f'git for-each-ref failed: {result.stderr.strip()}')
+    # {short branch name -> linked worktree} for the NON-main worktrees with
+    # a branch checked out; main_root anchors the displayed relative path.
+    worktrees = _worktrees()
+    main_root = next((wt.path for wt in worktrees if wt.is_main), None)
+    linked = {wt.branch: wt for wt in worktrees
+              if not wt.is_main and wt.branch is not None}
     items = []
     for line in result.stdout.splitlines():
         parsed = _parse_for_each_ref_line(line)
         if parsed is None:
             continue
         kind, short = parsed
-        items.append(Item(id=('ref', short), title=short,
-                          tag=kind, tag_style=_REF_KIND_STYLE.get(kind, ''),
-                          has_children=True))
+        item = Item(id=('ref', short), title=short,
+                    tag=kind, tag_style=_REF_KIND_STYLE.get(kind, ''),
+                    has_children=True)
+        if kind == 'branch' and short in linked and main_root is not None:
+            relpath = _worktree_relpath(linked[short].path, main_root)
+            item.chips = [(relpath, 'magenta')]
+        items.append(item)
     return items
 
 
@@ -2090,9 +2399,12 @@ def get_preview(item_id):
         return _status_preview(item_id[1], item_id[2])
     if kind == 'wc':
         # A worktree-status group — a --stat summary of the bucket (the
-        # per-file diff lives on its child leaves), scoped to the same
-        # positional paths. id = ('wc', bucket).
-        return _worktree_preview(item_id[1], _paths)
+        # per-file diff lives on its child leaves). id = ('wc', bucket,
+        # wt_path); wt_path None = current worktree (scope by ``_paths``),
+        # an abspath = that specific worktree via ``git -C`` (no path filter).
+        return _worktree_preview(item_id[1],
+                                 _paths if item_id[2] is None else [],
+                                 item_id[2])
     if kind == 'stash':
         # id = ('stash', n) node or ('stash', n, path) leaf. The "no stashes"
         # sentinel is a distinct tag, so n is always a real int here.
@@ -2149,7 +2461,7 @@ def _status_preview(xy, path):
     return '\n\n'.join(s for s in sections if s)
 
 
-def _worktree_preview(bucket, paths):
+def _worktree_preview(bucket, paths, wt_path=None):
     """``--stat`` summary for a worktree ``bucket``, scoped to its files.
 
     Mirrors the commit-node preview (``git show --stat``): the bucket row
@@ -2165,25 +2477,32 @@ def _worktree_preview(bucket, paths):
       * ``untracked`` → ``_untracked_stat`` (per-file ``diff --no-index
         --stat`` combined, since untracked files have no index entry)
 
+    ``wt_path`` scopes both the status and the stat ``git diff`` to a
+    specific worktree (``None`` = cwd), so a group on a linked worktree's
+    tip previews THAT worktree's working changes (mirrors
+    ``_worktree_status`` / ``_worktree_files``).
+
     Stat output is git-colored via ``_git_color`` and returned as-is — NOT
     piped through ``_colorize_diff`` / ``delta``, which renders diffs, not
     stats (again matching ``_commit_preview``). Returns ``''`` for an empty
     bucket or an unknown name.
     """
-    buckets = _classify_worktree(_worktree_status(paths))
+    buckets = _classify_worktree(_worktree_status(paths, wt_path))
     bucket_paths = [path for _xy, path in buckets.get(bucket, [])]
     if not bucket_paths:
         return ''
+    scope = ['-C', wt_path] if wt_path is not None else []
     if bucket == 'staged':
-        return _git_color('diff', '--cached', '--stat', '--', *bucket_paths)
+        return _git_color(*scope, 'diff', '--cached', '--stat', '--',
+                          *bucket_paths)
     if bucket in ('tracked', 'conflicts'):
-        return _git_color('diff', '--stat', '--', *bucket_paths)
+        return _git_color(*scope, 'diff', '--stat', '--', *bucket_paths)
     if bucket == 'untracked':
-        return _untracked_stat(bucket_paths)
+        return _untracked_stat(bucket_paths, wt_path)
     return ''
 
 
-def _untracked_stat(paths):
+def _untracked_stat(paths, wt_path=None):
     """Combined ``--stat`` summary for untracked files.
 
     Untracked files have no index entry, so each is statted on its own via
@@ -2196,13 +2515,15 @@ def _untracked_stat(paths):
     ``|`` column the way a single ``git diff --stat`` would, the path column
     is re-padded here (``cell_ljust`` to the widest path). The ``+`` bars
     stay git-colored; the synthesised footer is plain (git's stat footer is
-    uncolored too).
+    uncolored too). ``wt_path`` scopes each per-file ``git diff`` to a
+    specific worktree (``None`` = cwd), mirroring ``_worktree_preview``.
     """
+    scope = ['-C', wt_path] if wt_path is not None else []
     rows = []          # (left = ' path', right = 'N <bars>') split at ' | '
     insertions = 0
     for path in paths:
-        raw = _git_color('diff', '--no-index', '--stat', '--', '/dev/null',
-                         path)
+        raw = _git_color(*scope, 'diff', '--no-index', '--stat', '--',
+                         '/dev/null', path)
         for line in raw.splitlines():
             plain = _SGR_RE.sub('', line)
             if re.match(r'\s*\d+ files? changed', plain):
@@ -2309,7 +2630,7 @@ def _md_launch(ctx, spec):
 
 
 def switch_mode(ctx):
-    """Backtick — pick one of the five modes, then re-list the root.
+    """Backtick — pick one of the six modes, then re-list the root.
 
     In stdin mode (``browse-git -``) every other view would re-run git,
     which piped input forbids — flash and stay put instead.
@@ -2323,7 +2644,7 @@ def switch_mode(ctx):
         return
     _mode = chosen
     ctx.flash(f'mode: {_mode}')
-    # All five modes share one root scope (and thus one ``state.expanded``
+    # All six modes share one root scope (and thus one ``state.expanded``
     # set); drop the previous mode's expanded ids before re-listing so the
     # refresh doesn't re-fetch / re-expand rows that don't exist here.
     ctx.collapse_all()
@@ -3000,6 +3321,7 @@ _MENU_ACTIONS = {
     'reflog.show':     lambda c, i: _cm_reflog_show(c, i[2]),
     'reflog.sha':      lambda c, i: c.alert(i[2], title='commit'),
     # anywhere
+    'shell.here':      lambda c, i: _run_shell(c, _shell_cwd(i)),
     'mode.switch':     lambda c, i: switch_mode(c),
 }
 
@@ -3011,11 +3333,12 @@ def context_menu_options(ctx):
     tuple, so this is a flat dispatch with direct field access. A ``.md`` /
     ``.PLAN.md`` row, a worktree-group (``wc``) row, a piped-diff row, and the
     synthetic sentinel / filler / error rows have no per-kind menu; for those
-    (and a cursor on nothing) only the shared "Switch mode" row is offered.
+    (and a cursor on nothing) only the shared trailing rows are offered.
 
-    Every menu ends with a ``Switch mode ▸`` row that reuses the `` ` ``
-    mode-switch action — so its label carries the `` ` `` hotkey hint per the
-    convention. The token half is dispatched by ``_MENU_ACTIONS`` /
+    Every menu ends with a shared "Run shell here" row and a ``Switch mode ▸``
+    row (the latter reuses the `` ` `` mode-switch action, so its label carries
+    the `` ` `` hotkey hint per the convention). The token half is dispatched
+    by ``_MENU_ACTIONS`` /
     ``on_context_menu``; the kind-specific rows come from the
     ``context_menu_<kind>`` builders. A file/status/stash leaf that is also a
     markdown launcher anchor still gets its file/status/stash menu — the menu
@@ -3044,10 +3367,12 @@ def context_menu_options(ctx):
             rows = context_menu_stash(ctx, item_id)
         elif kind == 'reflog' and len(item_id) == 3:
             rows = context_menu_reflog(ctx, item_id)
-    # Switch mode is available anywhere (reuses the ` action; the hint shows
-    # the backtick). Suppressed in stdin mode, where ` itself flashes.
+    # Run shell here + Switch mode are available anywhere (Switch mode reuses
+    # the ` action; the hint shows the backtick). Both are suppressed in stdin
+    # mode, where ` itself flashes and there's no repo to drop a shell into.
     if _STDIN_KIND is None:
-        rows = list(rows) + [('Switch mode ▸ (`)', 'mode.switch')]
+        rows = list(rows) + [('Run shell here', 'shell.here'),
+                             ('Switch mode ▸ (`)', 'mode.switch')]
     return rows
 
 
@@ -3074,7 +3399,7 @@ def on_context_menu(ctx):
 
 
 _HELP_USAGE_TMPL = """\
-Usage: browse-git [<dir>] [-n NUMBER] [--mode NAME] [--no-tree] [--all] [<rev>…] [-- <path>…]
+Usage: browse-git [<dir>] [-n NUMBER] [--commits|--status|--reflog|--branches|--stash|--worktrees] [--no-tree] [--all] [<rev>…] [-- <path>…]
        git diff | browse-git      (also git log / log -p / status output; the '-' is optional when piping)
   <dir>         A leading directory in another git repo browses THAT repo
                 (cwd need not be a repo). A subdir of the current repo
@@ -3099,7 +3424,8 @@ Usage: browse-git [<dir>] [-n NUMBER] [--mode NAME] [--no-tree] [--all] [<rev>�
                 terminal never reads stdin.
   -n NUMBER     Cap the commit / reflog list to this many entries
                 (default: {default}).
-  --mode NAME   Start in one of: {modes}. Default: commits.
+  --MODE        Start in that view: one of {mode_flags}
+                (at most one; default: commits).
   --no-tree     Hide git's commit-graph column in the commit log
   --tree        (default on; toggle at runtime with 't').
   --all         Span the commits log over every local branch, not just
@@ -3112,7 +3438,7 @@ Positional args are auto-classified: a leading directory that is its own
 git work tree (distinct from the cwd's) selects the repo to browse; any
 other arg that names an existing file or directory is a pathspec;
 otherwise an arg git resolves as a commit is a rev; anything else is an
-error. They scope commits mode (an explicit --mode other than commits
+error. They scope commits mode (a mode flag other than --commits
 ignores them).\
 """
 
@@ -3120,7 +3446,7 @@ ignores them).\
 _HELP_INTRO = """\
 browse-git — a tig-like browser over a git repository.
 
-The five view modes:
+The six view modes:
   commits   recent git log; drill commit -> changed files -> per-file diff
             (an unscoped log is preceded by working-change rows — Untracked
             / Tracked / Staged / Conflicts — each shown only when non-empty,
@@ -3129,6 +3455,8 @@ The five view modes:
   reflog    reflog entries; same drill-down as commits
   branches  branches / remotes / tags; drill a ref into its commits
   stash     stash entries; drill into the stash's files
+  worktrees one row per worktree (main first, relpath .); drill into that
+            worktree's branch commit log
 
 Keys:
   `         open the mode picker (switch view mode at runtime)
@@ -3186,6 +3514,49 @@ def _classify_positionals():
             continue
         sys.stderr.write(f'browse-git: unknown path or revision: {arg}\n')
         sys.exit(2)
+
+
+def _initial_cursor_id():
+    """The startup-cursor target row id for the active ``_mode``, or ``None``.
+
+    Lands the cursor on the currently checked-out row instead of the top:
+    the HEAD commit in commits mode, the current branch's ref in branches
+    mode, the main worktree in worktrees mode. Modes with no checked-out
+    concept (status / reflog / stash) and stdin mode return ``None`` — the
+    cursor stays at the top. The returned id matches the row id shape its
+    builder emits exactly (``_commit_log_items`` / ``_branches_root`` /
+    ``_worktrees_root``), so ``cursor_to`` can find the row.
+
+    Every git lookup degrades to ``None`` on failure (``_run_git`` folds a
+    missing binary into a failed CompletedProcess), so this never raises.
+    """
+    if _STDIN_KIND is not None:
+        return None
+    if _mode == 'commits':
+        # HEAD commit row — ids carry the FULL sha (git log %H), not the
+        # abbreviated col_sha; resolve the full sha via rev-parse.
+        result = _run_git('rev-parse', 'HEAD')
+        if result.returncode != 0:
+            return None
+        sha = result.stdout.strip()
+        return ('commit', sha) if sha else None
+    if _mode == 'branches':
+        # Current branch's ref row; a detached HEAD (rev-parse yields the
+        # literal 'HEAD') has no current-branch row -> no-op.
+        result = _run_git('rev-parse', '--abbrev-ref', 'HEAD')
+        if result.returncode != 0:
+            return None
+        short = result.stdout.strip()
+        if not short or short == 'HEAD':
+            return None
+        return ('ref', short)
+    if _mode == 'worktrees':
+        # The main worktree row; _worktree_label mirrors _worktrees_root.
+        main = next((wt for wt in _worktrees() if wt.is_main), None)
+        if main is None:
+            return None
+        return ('worktree', main.path, _worktree_label(main))
+    return None
 
 
 def _window_title():
@@ -3255,7 +3626,7 @@ def main():
             sys.exit(2)
 
     _log_limit = _pop_limit_arg(_LOG_LIMIT)
-    requested_mode = _pop_mode_arg()
+    requested_mode = _pop_mode_flag()
     _tree_mode = _pop_tree_arg(_tree_mode)
     _all_branches = _pop_all_arg()
     _classify_positionals()
@@ -3292,7 +3663,8 @@ def main():
         on_context_menu=on_context_menu,
         show_ids='never',
         help_usage=_HELP_USAGE_TMPL.format(
-            default=_LOG_LIMIT, modes=', '.join(_MODES)),
+            default=_LOG_LIMIT,
+            mode_flags=', '.join('--' + m for m in _MODES)),
         help_intro=_HELP_INTRO,
     ))
     _browser = b
@@ -3303,6 +3675,17 @@ def main():
     # kinds / repo modes have no umbrella and start as before.
     if _STDIN_KIND == 'diff':
         b.expand(('sdiff',))
+    # Land the cursor on the currently checked-out row (HEAD commit / current
+    # branch / main worktree, per mode) instead of the top — a posted
+    # ``cursor_to`` (best-effort for these top-level rows, thread-safe, a
+    # no-op if the id isn't present), issued before the run loop like the
+    # expand above. Defensive: ``_initial_cursor_id`` already returns None on
+    # any git failure, but never let a cursor placement take down the launch.
+    try:
+        if (tid := _initial_cursor_id()) is not None:
+            b.cursor_to(tid)
+    except Exception:
+        pass
     sys.exit(b.run())
 
 

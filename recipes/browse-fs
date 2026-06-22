@@ -643,10 +643,10 @@ def delete(ctx):
 # crashing (browse-tui swallows ``on_context_menu`` exceptions besides).
 
 
-# Git view modes browse-git accepts via ``--mode NAME`` (its verified
-# ``<dir> --mode`` interface), as ``(submenu_label, mode)``. Shown only when the
-# directory is a git repo, nested under a single ``git`` submenu row: the chosen
-# entry launches ``browse-git <dir> --mode NAME`` on that directory.
+# Git view modes browse-git accepts via a per-mode flag ``--<mode>`` (its
+# verified ``<dir> --<mode>`` interface), as ``(submenu_label, mode)``. Shown
+# only when the directory is a git repo, nested under a single ``git`` submenu
+# row: the chosen entry launches ``browse-git <dir> --<mode>`` on that directory.
 _DIR_GIT_MODES = [
     ('commits',  'commits'),
     ('branches', 'branches'),
@@ -785,8 +785,8 @@ def _new_dir(ctx, dir_path):
 
 
 def _open_browse_git(ctx, dir_path, mode):
-    """Launch ``browse-git <dir> --mode NAME`` (another browse-tui recipe)."""
-    ctx.run_external(['browse-git', dir_path, '--mode', mode], keep_screen=True)
+    """Launch ``browse-git <dir> --<mode>`` (another browse-tui recipe)."""
+    ctx.run_external(['browse-git', dir_path, f'--{mode}'], keep_screen=True)
 
 
 def _open_git_menu(ctx, dir_path):
@@ -796,7 +796,7 @@ def _open_git_menu(ctx, dir_path):
     ``_DIR_GIT_MODES`` rows — each a ``(submenu_label, mode)`` pair, so the chosen
     token IS the mode — (the framework runs sequential submenus within one
     ``on_context_menu`` fire, as browse-git's Reset ▸ does) and, on a non-``None``
-    choice, open ``browse-git <dir> --mode NAME``. A cancel (``None``) is a no-op.
+    choice, open ``browse-git <dir> --<mode>``. A cancel (``None``) is a no-op.
     """
     mode = ctx.menu(_DIR_GIT_MODES)
     if mode is not None:

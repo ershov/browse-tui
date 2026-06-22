@@ -140,7 +140,8 @@ class TestPerKindMenus(unittest.TestCase):
         # are absent here — no other commit selected, no real repo/.PLAN.md.
         self.assertEqual(_tokens(rows), [
             'commit.sha', 'commit.checkout', 'commit.branch', 'commit.tag',
-            'commit.cherry', 'commit.revert', 'commit.reset', 'mode.switch',
+            'commit.cherry', 'commit.revert', 'commit.reset',
+            'shell.here', 'mode.switch',
         ])
         self.assertIn('Show full SHA', _labels(rows))
         self.assertIn('Reset ▸', _labels(rows))
@@ -156,7 +157,7 @@ class TestPerKindMenus(unittest.TestCase):
         rows = self.r.context_menu_options(ctx)
         self.assertEqual(_tokens(rows), [
             'file.view', 'file.edit', 'file.diff', 'file.history',
-            'file.blame', 'file.path', 'mode.switch',
+            'file.blame', 'file.path', 'shell.here', 'mode.switch',
         ])
         edit_label = next(l for l, t in rows if t == 'file.edit')
         self.assertEqual(edit_label, 'Edit working-tree file (E)')
@@ -168,7 +169,7 @@ class TestPerKindMenus(unittest.TestCase):
         rows = self.r.context_menu_options(ctx)
         self.assertEqual(_tokens(rows), [
             'ref.checkout', 'ref.merge', 'ref.rebase', 'ref.branch',
-            'ref.delete', 'mode.switch',
+            'ref.delete', 'shell.here', 'mode.switch',
         ])
 
     def test_status_menu_rows_and_E_hint(self):
@@ -178,7 +179,8 @@ class TestPerKindMenus(unittest.TestCase):
         rows = self.r.context_menu_options(ctx)
         self.assertEqual(_tokens(rows), [
             'status.stage', 'status.unstage', 'status.discard',
-            'status.edit', 'status.diff', 'status.opendir', 'mode.switch',
+            'status.edit', 'status.diff', 'status.opendir',
+            'shell.here', 'mode.switch',
         ])
         edit_label = next(l for l, t in rows if t == 'status.edit')
         self.assertEqual(edit_label, 'Edit in $EDITOR (E)')
@@ -190,7 +192,7 @@ class TestPerKindMenus(unittest.TestCase):
         rows = self.r.context_menu_options(ctx)
         self.assertEqual(_tokens(rows), [
             'stash.apply', 'stash.pop', 'stash.drop', 'stash.show',
-            'mode.switch',
+            'shell.here', 'mode.switch',
         ])
 
     def test_stash_file_uses_file_menu(self):
@@ -201,7 +203,7 @@ class TestPerKindMenus(unittest.TestCase):
         rows = self.r.context_menu_options(ctx)
         self.assertEqual(_tokens(rows), [
             'file.view', 'file.edit', 'file.diff', 'file.history',
-            'file.blame', 'file.path', 'mode.switch',
+            'file.blame', 'file.path', 'shell.here', 'mode.switch',
         ])
 
     def test_reflog_menu_rows(self):
@@ -211,7 +213,7 @@ class TestPerKindMenus(unittest.TestCase):
         rows = self.r.context_menu_options(ctx)
         self.assertEqual(_tokens(rows), [
             'reflog.checkout', 'reflog.reset', 'reflog.show', 'reflog.sha',
-            'mode.switch',
+            'shell.here', 'mode.switch',
         ])
 
     def test_switch_mode_row_shows_backtick_hint(self):
@@ -225,18 +227,44 @@ class TestPerKindMenus(unittest.TestCase):
         self.assertIn('`', mode_label)
 
     def test_switch_mode_suppressed_in_stdin_mode(self):
-        # In stdin mode ` itself flashes, so the menu drops the Switch-mode
-        # row; a commit row then carries only its own (non-mode) entries.
+        # In stdin mode ` itself flashes, so the menu drops the shared trailing
+        # rows (Switch mode AND Run shell here); a commit row then carries only
+        # its own (non-shared) entries.
         self.r._STDIN_KIND = 'log'
         item = Item(id=('commit', 'abc'), title='x', has_children=True)
         ctx = self._ctx(item)
         rows = self.r.context_menu_options(ctx)
         self.assertNotIn('mode.switch', _tokens(rows))
+        self.assertNotIn('shell.here', _tokens(rows))
         self.assertEqual(_tokens(rows)[0], 'commit.sha')
 
-    def test_no_cursor_yields_only_switch_mode(self):
+    def test_run_shell_here_row_present_on_normal_and_worktree_rows(self):
+        # "Run shell here" is a shared, always-available row (repo mode), shown
+        # on a normal row and on a --worktrees row alike, just before Switch
+        # mode.
+        for item in (
+            Item(id=('commit', 'abc1234def'), title='x', has_children=True),
+            Item(id=('worktree', '/abs/wt', 'br'), title='wt br', tag='linked'),
+        ):
+            ctx = self._ctx(item)
+            rows = self.r.context_menu_options(ctx)
+            self.assertIn(('Run shell here', 'shell.here'), rows)
+            # Ordered just before the trailing Switch-mode row.
+            self.assertEqual(_tokens(rows)[-2:], ['shell.here', 'mode.switch'])
+            self.b.stop_workers()
+
+    def test_run_shell_here_suppressed_in_stdin_mode(self):
+        # Running a shell in the repo is meaningless for piped input → no row.
+        self.r._STDIN_KIND = 'diff'
+        item = Item(id=('commit', 'abc'), title='x', has_children=True)
+        ctx = self._ctx(item)
+        self.assertNotIn('shell.here',
+                         _tokens(self.r.context_menu_options(ctx)))
+
+    def test_no_cursor_yields_only_shared_rows(self):
         # An empty tree → no cursor item → no per-kind rows; the shared
-        # Switch-mode row is still offered (repo mode).
+        # trailing rows (Run shell here, Switch mode) are still offered (repo
+        # mode).
         empty = make_browser(get_children=lambda _id, *, reload=False: [])
         try:
             empty.refresh()
@@ -244,18 +272,18 @@ class TestPerKindMenus(unittest.TestCase):
             ctx = Context(empty)
             self.assertIsNone(ctx.cursor)
             self.assertEqual(_tokens(self.r.context_menu_options(ctx)),
-                             ['mode.switch'])
+                             ['shell.here', 'mode.switch'])
         finally:
             empty.stop_workers()
 
-    def test_unmenued_kind_yields_only_switch_mode(self):
-        # A worktree-group ('wc', bucket) / sentinel / filler row has no
-        # per-kind menu — only the shared Switch-mode row.
-        item = Item(id=('wc', 'staged'), title='Staged changes',
+    def test_unmenued_kind_yields_only_shared_rows(self):
+        # A worktree-group ('wc', bucket, wt_path) / sentinel / filler row
+        # has no per-kind menu — only the shared trailing rows.
+        item = Item(id=('wc', 'staged', None), title='Staged changes',
                     has_children=True)
         ctx = self._ctx(item)
         self.assertEqual(_tokens(self.r.context_menu_options(ctx)),
-                         ['mode.switch'])
+                         ['shell.here', 'mode.switch'])
 
     def test_no_clipboard_or_copy_entries(self):
         # Convention (#1028): recipe menus carry no clipboard / Copy rows.
@@ -271,6 +299,28 @@ class TestPerKindMenus(unittest.TestCase):
             for label in _labels(self.r.context_menu_options(ctx)):
                 self.assertNotIn('copy', label.lower())
             self.b.stop_workers()
+
+
+class TestShellCwd(unittest.TestCase):
+    """``_shell_cwd`` picks the worktree dir or falls back to the repo root."""
+
+    def setUp(self):
+        self.r = _load_recipe()
+
+    def test_worktree_row_uses_its_own_dir(self):
+        # The only "a worktree" kind: ('worktree', abspath, label) → abspath.
+        self.assertEqual(
+            self.r._shell_cwd(('worktree', '/abs/wt', 'br')), '/abs/wt')
+
+    def test_other_row_falls_back_to_repo_root(self):
+        # Any non-worktree row → the repo's work-tree root (stubbed here).
+        self.r._repo_root = lambda: '/repo/top'
+        self.assertEqual(self.r._shell_cwd(('commit', 'sha')), '/repo/top')
+
+    def test_dot_when_outside_repo(self):
+        # Outside a repo _repo_root() is '' → cwd defaults to '.'.
+        self.r._repo_root = lambda: ''
+        self.assertEqual(self.r._shell_cwd(('commit', 'sha')), '.')
 
 
 class TestResetSubmenu(unittest.TestCase):

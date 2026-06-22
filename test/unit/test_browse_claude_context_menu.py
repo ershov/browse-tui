@@ -795,7 +795,7 @@ class TestRunDirAction(unittest.TestCase):
                              'commits')
         self.assertIsNone(ctx.menu_items)  # only one repo qualifies → no chooser
         cmd, _kw = ctx.external
-        self.assertEqual(cmd, ['browse-git', repo, '--mode', 'commits'])
+        self.assertEqual(cmd, ['browse-git', repo, '--commits'])
 
     def test_git_mode_opens_chooser_for_two_repos(self):
         # Two repo dirs → the dir chooser lists BOTH (filtered + labelled).
@@ -814,7 +814,7 @@ class TestRunDirAction(unittest.TestCase):
         self.assertEqual([lbl for lbl, _v in ctx.menu_items],
                          [f'project: {r1}', f'worktree: {r2}'])
         cmd, _kw = ctx.external
-        self.assertEqual(cmd, ['browse-git', r2, '--mode', 'status'])
+        self.assertEqual(cmd, ['browse-git', r2, '--status'])
 
     def test_git_submenu_routes_mode_to_launch(self):
         # ``dir.git`` opens the Level-2 mode submenu, then launches browse-git
@@ -832,7 +832,7 @@ class TestRunDirAction(unittest.TestCase):
                           ('status', 'status'), ('stashes', 'stash'),
                           ('reflog', 'reflog')])
         cmd, _kw = ctx.external
-        self.assertEqual(cmd, ['browse-git', repo, '--mode', 'stash'])
+        self.assertEqual(cmd, ['browse-git', repo, '--stash'])
 
     def test_git_submenu_cancel_is_a_noop(self):
         # Cancelling the mode submenu (menu → None) launches nothing.
