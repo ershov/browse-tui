@@ -1186,6 +1186,212 @@ class TestForEachRefParse(unittest.TestCase):
             self.r._parse_for_each_ref_line('refs/heads/main'))  # no NUL
 
 
+# A representative ``git worktree list --porcelain`` dump: the main
+# worktree first (on 'main'), a nested linked worktree on a slash-bearing
+# branch, a sibling linked worktree, then a detached and a bare stanza.
+_WT_PORCELAIN = (
+    'worktree /repo\n'
+    'HEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'
+    'branch refs/heads/main\n'
+    '\n'
+    'worktree /repo/.claude/worktrees/foo\n'
+    'HEAD bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n'
+    'branch refs/heads/feature/x\n'
+    '\n'
+    'worktree /sibling\n'
+    'HEAD cccccccccccccccccccccccccccccccccccccccc\n'
+    'branch refs/heads/release\n'
+    '\n'
+    'worktree /repo/.claude/worktrees/det\n'
+    'HEAD dddddddddddddddddddddddddddddddddddddddd\n'
+    'detached\n'
+    '\n'
+    'worktree /repo/bare\n'
+    'HEAD eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n'
+    'bare\n'
+)
+
+
+class TestParseWorktreeList(unittest.TestCase):
+    """``_parse_worktree_list`` turns porcelain stanzas into ``_Worktree``s."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_records_and_order(self):
+        wts = self.r._parse_worktree_list(_WT_PORCELAIN)
+        # One record per stanza, in emission order.
+        self.assertEqual(
+            [(w.path, w.branch, w.is_main) for w in wts],
+            [('/repo', 'main', True),
+             ('/repo/.claude/worktrees/foo', 'feature/x', False),
+             ('/sibling', 'release', False),
+             ('/repo/.claude/worktrees/det', None, False),
+             ('/repo/bare', None, False)])
+
+    def test_first_is_main_rest_are_linked(self):
+        wts = self.r._parse_worktree_list(_WT_PORCELAIN)
+        self.assertTrue(wts[0].is_main)
+        self.assertFalse(any(w.is_main for w in wts[1:]))
+
+    def test_head_sha_captured(self):
+        first = self.r._parse_worktree_list(_WT_PORCELAIN)[0]
+        self.assertEqual(first.head, 'a' * 40)
+
+    def test_refs_heads_prefix_stripped(self):
+        # branch is the short name, not the full refs/heads/... ref.
+        foo = self.r._parse_worktree_list(_WT_PORCELAIN)[1]
+        self.assertEqual(foo.branch, 'feature/x')
+
+    def test_detached_and_bare_have_no_branch(self):
+        wts = self.r._parse_worktree_list(_WT_PORCELAIN)
+        self.assertIsNone(wts[3].branch)   # detached
+        self.assertIsNone(wts[4].branch)   # bare
+
+    def test_empty_input_yields_no_records(self):
+        self.assertEqual(self.r._parse_worktree_list(''), [])
+
+    def test_trailing_stanza_without_blank_line(self):
+        # A final stanza with no terminating blank line is still flushed.
+        text = ('worktree /repo\nHEAD ' + 'a' * 40 + '\nbranch refs/heads/main')
+        wts = self.r._parse_worktree_list(text)
+        self.assertEqual(len(wts), 1)
+        self.assertEqual((wts[0].path, wts[0].branch), ('/repo', 'main'))
+
+
+class TestWorktrees(unittest.TestCase):
+    """``_worktrees`` parses git output and degrades to [] on failure."""
+
+    def setUp(self):
+        self.r = _load_recipe()
+
+    def test_parses_run_git_output(self):
+        self.r._run_git = lambda *a: subprocess.CompletedProcess(
+            a, 0, _WT_PORCELAIN, '')
+        wts = self.r._worktrees()
+        self.assertEqual([w.branch for w in wts],
+                         ['main', 'feature/x', 'release', None, None])
+
+    def test_git_failure_degrades_to_empty(self):
+        # Non-zero rc (e.g. missing binary -> rc 127) -> [], never raises.
+        self.r._run_git = lambda *a: subprocess.CompletedProcess(
+            a, 127, '', 'git not found on PATH')
+        self.assertEqual(self.r._worktrees(), [])
+
+
+class TestWorktreeRelpath(unittest.TestCase):
+    """``_worktree_relpath`` is os.path.relpath; main root -> '.'."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_main_root_maps_to_dot(self):
+        self.assertEqual(self.r._worktree_relpath('/repo', '/repo'), '.')
+
+    def test_nested_worktree_is_relative(self):
+        self.assertEqual(
+            self.r._worktree_relpath('/repo/.claude/worktrees/foo', '/repo'),
+            '.claude/worktrees/foo')
+
+    def test_sibling_worktree_uses_dotdot(self):
+        self.assertEqual(
+            self.r._worktree_relpath('/sibling', '/repo'), '../sibling')
+
+
+class TestBranchesRootWorktreeChips(unittest.TestCase):
+    """``_branches_root`` chips linked-worktree branches with their relpath."""
+
+    def setUp(self):
+        self.r = _load_recipe()
+
+    def _stub_git(self, for_each_ref, worktree_porcelain):
+        """Stub ``_run_git`` to answer for-each-ref vs worktree-list."""
+        def fake(*args):
+            if 'for-each-ref' in args:
+                return subprocess.CompletedProcess(args, 0, for_each_ref, '')
+            if 'worktree' in args:
+                return subprocess.CompletedProcess(
+                    args, 0, worktree_porcelain, '')
+            return subprocess.CompletedProcess(args, 1, '', '')
+        self.r._run_git = fake
+
+    @staticmethod
+    def _ref_line(full, short):
+        return f'{full}\x00{short}'
+
+    def _chips(self, item):
+        return getattr(item, 'chips', None)
+
+    def test_linked_branch_gets_relpath_chip(self):
+        # main on 'main'; a linked worktree checks out 'feature/x'.
+        refs = '\n'.join([
+            self._ref_line('refs/heads/main', 'main'),
+            self._ref_line('refs/heads/feature/x', 'feature/x'),
+        ])
+        self._stub_git(refs, _WT_PORCELAIN)
+        by_id = {it.id: it for it in self.r._branches_root()}
+        # The linked branch carries one magenta chip = its relpath.
+        self.assertEqual(self._chips(by_id[('ref', 'feature/x')]),
+                         [('.claude/worktrees/foo', 'magenta')])
+        # The main worktree's branch is checked out here -> no path chip.
+        self.assertIn(self._chips(by_id[('ref', 'main')]), (None, []))
+
+    def test_chip_style_distinct_from_ref_kind_palette(self):
+        # The worktree path chip uses 'magenta' — distinct from the
+        # cyan/blue/yellow branch/remote/tag chip palette.
+        self.assertNotIn('magenta', self.r._REF_KIND_STYLE.values())
+
+    def test_unchecked_branch_has_no_chip(self):
+        # 'idle' isn't checked out anywhere -> no path chip.
+        refs = '\n'.join([
+            self._ref_line('refs/heads/main', 'main'),
+            self._ref_line('refs/heads/idle', 'idle'),
+        ])
+        self._stub_git(refs, _WT_PORCELAIN)
+        by_id = {it.id: it for it in self.r._branches_root()}
+        self.assertIn(self._chips(by_id[('ref', 'idle')]), (None, []))
+
+    def test_remote_and_tag_never_get_path_chip(self):
+        # Even if a remote/tag short-name collides with a linked branch
+        # name, only the 'branch' row is chipped.
+        refs = '\n'.join([
+            self._ref_line('refs/remotes/origin/feature/x', 'origin/feature/x'),
+            self._ref_line('refs/tags/feature/x', 'feature/x'),
+            self._ref_line('refs/heads/feature/x', 'feature/x'),
+        ])
+        self._stub_git(refs, _WT_PORCELAIN)
+        items = self.r._branches_root()
+        remote = next(it for it in items if it.tag == 'remote')
+        tag = next(it for it in items if it.tag == 'tag')
+        branch = next(it for it in items if it.tag == 'branch')
+        self.assertIn(self._chips(remote), (None, []))
+        self.assertIn(self._chips(tag), (None, []))
+        self.assertEqual(self._chips(branch),
+                         [('.claude/worktrees/foo', 'magenta')])
+
+    def test_sibling_worktree_relpath_uses_dotdot(self):
+        # 'release' is checked out in a sibling worktree (/sibling).
+        refs = self._ref_line('refs/heads/release', 'release')
+        self._stub_git(refs, _WT_PORCELAIN)
+        item, = self.r._branches_root()
+        self.assertEqual(self._chips(item), [('../sibling', 'magenta')])
+
+    def test_worktree_list_failure_means_no_chips(self):
+        # for-each-ref succeeds but worktree list fails -> branches still
+        # render, just without any path chips (graceful degrade).
+        def fake(*args):
+            if 'for-each-ref' in args:
+                return subprocess.CompletedProcess(
+                    args, 0, self._ref_line('refs/heads/feature/x', 'feature/x'),
+                    '')
+            return subprocess.CompletedProcess(args, 1, '', 'boom')
+        self.r._run_git = fake
+        item, = self.r._branches_root()
+        self.assertIn(self._chips(item), (None, []))
+
+
 class TestCommitLogItems(unittest.TestCase):
     """``_commit_log_items`` stores sha/author/date columns, no sha tag."""
 

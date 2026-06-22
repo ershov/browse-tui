@@ -127,6 +127,7 @@ import re
 import shutil
 import subprocess
 import sys
+from collections import namedtuple
 
 from browse_tui import (
     Action, Browser, BrowserConfig, Item,
@@ -1564,6 +1565,82 @@ def _worktree_status(paths):
     return _parse_porcelain_z(result.stdout)
 
 
+# One linked-or-main worktree, as parsed from ``git worktree list
+# --porcelain``: ``path`` is absolute, ``head`` the checked-out sha,
+# ``branch`` the short branch name (``None`` when detached or bare), and
+# ``is_main`` marks the first stanza (git always emits the main worktree
+# first). The shared foundation for the worktree-aware branch/status work.
+_Worktree = namedtuple('_Worktree', 'path head branch is_main')
+
+
+def _parse_worktree_list(text):
+    """Parse ``git worktree list --porcelain`` text into ``[_Worktree]``.
+
+    The porcelain output is blank-line-separated stanzas, one per worktree::
+
+        worktree <abspath>
+        HEAD <sha>
+        branch refs/heads/<name>      # or 'detached', or 'bare'
+
+    Each ``worktree`` line opens a stanza; ``HEAD`` / ``branch`` fill it; a
+    ``detached`` or ``bare`` line leaves ``branch`` as ``None``. The
+    ``refs/heads/`` prefix is stripped to the short name. The FIRST stanza
+    is the main worktree (``is_main=True``); the rest are linked. Pure: no
+    git call, so it unit-tests against sample text.
+    """
+    worktrees = []
+    path = head = branch = None
+    first = True
+
+    def _flush():
+        nonlocal path, head, branch, first
+        if path is not None:
+            worktrees.append(_Worktree(path, head, branch, first))
+            first = False
+        path = head = branch = None
+
+    for line in text.splitlines():
+        if not line:
+            _flush()
+            continue
+        key, _, value = line.partition(' ')
+        if key == 'worktree':
+            _flush()                       # close any unterminated stanza
+            path = value
+        elif key == 'HEAD':
+            head = value
+        elif key == 'branch':
+            branch = value[len('refs/heads/'):] if value.startswith(
+                'refs/heads/') else value
+        # 'detached' / 'bare' (and any other key) leave branch=None.
+    _flush()                               # trailing stanza (no blank line)
+    return worktrees
+
+
+def _worktrees():
+    """All worktrees (main first) via ``git worktree list --porcelain``.
+
+    Returns ``_parse_worktree_list`` records on success; degrades to ``[]``
+    on any git failure (missing binary, bare/odd repo) like
+    ``_worktree_status`` — callers treat "no worktree info" as "nothing to
+    annotate" rather than surfacing an error.
+    """
+    result = _run_git('worktree', 'list', '--porcelain')
+    if result.returncode != 0:
+        return []
+    return _parse_worktree_list(result.stdout)
+
+
+def _worktree_relpath(abspath, main_root):
+    """``abspath`` relative to the main worktree root (the main root -> '.').
+
+    Just ``os.path.relpath`` — yields ``.claude/worktrees/foo`` for a nested
+    linked worktree or ``../sibling`` for a sibling one; the main worktree
+    itself maps to ``.`` (``relpath`` of a path against itself).
+    """
+    return os.path.relpath(abspath, main_root)
+
+
 def _worktree_groups(paths):
     """Synthetic worktree-group rows for the commits-mode root.
 
@@ -1988,6 +2065,14 @@ def _branches_root():
     newest-commit-first. The format emits the full ``%(refname)`` (for
     kind classification) and ``%(refname:short)`` (for display + id),
     NUL-separated. Each ref drills into that ref's commits.
+
+    A local branch checked out in a SEPARATE (linked) worktree carries an
+    extra magenta chip with that worktree's path relative to the main
+    worktree root (e.g. ``.claude/worktrees/foo``). The main worktree's
+    branch is skipped (it's HEAD here, not "elsewhere"), and remotes / tags
+    never get the chip — only ``branch`` rows do. The map is keyed by short
+    branch name, so a branch checked out in two linked worktrees would show
+    the last one listed; git forbids that, so the key is effectively unique.
     """
     result = _run_git(
         'for-each-ref', '--sort=-committerdate',
@@ -1995,15 +2080,25 @@ def _branches_root():
         'refs/heads', 'refs/remotes', 'refs/tags')
     if result.returncode != 0:
         return _err_item(f'git for-each-ref failed: {result.stderr.strip()}')
+    # {short branch name -> linked worktree} for the NON-main worktrees with
+    # a branch checked out; main_root anchors the displayed relative path.
+    worktrees = _worktrees()
+    main_root = next((wt.path for wt in worktrees if wt.is_main), None)
+    linked = {wt.branch: wt for wt in worktrees
+              if not wt.is_main and wt.branch is not None}
     items = []
     for line in result.stdout.splitlines():
         parsed = _parse_for_each_ref_line(line)
         if parsed is None:
             continue
         kind, short = parsed
-        items.append(Item(id=('ref', short), title=short,
-                          tag=kind, tag_style=_REF_KIND_STYLE.get(kind, ''),
-                          has_children=True))
+        item = Item(id=('ref', short), title=short,
+                    tag=kind, tag_style=_REF_KIND_STYLE.get(kind, ''),
+                    has_children=True)
+        if kind == 'branch' and short in linked and main_root is not None:
+            relpath = _worktree_relpath(linked[short].path, main_root)
+            item.chips = [(relpath, 'magenta')]
+        items.append(item)
     return items
 
 
