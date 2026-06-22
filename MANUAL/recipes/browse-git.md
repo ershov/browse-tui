@@ -62,10 +62,13 @@ cd /path/to/your/repo
 ./recipes/browse-git -- src/            # filter the log to a path
 ```
 
-Keys: `` ` `` mode picker, `Enter` flip expand/collapse, `E` edit the
-working-tree file in `$EDITOR` (file/status rows), `m` toggle md2ansi
-message coloring (when available); the built-in `v` pages the colored
-diff in `$PAGER`, `e` edits the preview text.
+Keys: `` ` `` mode picker, `Enter` flip expand/collapse, `t` toggle the
+commit-graph column, `1` / `2` / `3` commit detail level (subject only ·
+short-hash·subject · short-hash·author·date·subject, the default — the graph
+keeps its own `t` toggle in every level), `E` edit the working-tree file in
+`$EDITOR` (file/status rows), `m` toggle md2ansi message coloring (when
+available); the built-in `v` pages the colored diff in `$PAGER`, `e` edits
+the preview text.
 
 **Source:** [`recipes/browse-git`](../../recipes/browse-git)
 

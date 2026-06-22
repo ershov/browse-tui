@@ -12,9 +12,9 @@ rest each demonstrate a different data-source pattern.
 | [`browse-git`](recipes/browse-git.md) | A tig-like git browser — commits · status · reflog · branches · stash, a colored commit graph, and `delta`-powered diffs. |
 | [`browse-claude`](recipes/browse-claude.md) | Claude Code history — projects → sessions → messages, with per-message JSON preview. |
 | [`browse-md`](recipes/browse-md.md) | Markdown files as a navigable heading tree, previewed through md2ansi; `FILE.md#section` deep-links. |
-| [`browse-fs`](recipes/browse-fs.md) | Filesystem browser with a live mtime watcher; edit / open / delete actions. |
+| [`browse-fs`](recipes/browse-fs.md) | Filesystem browser — metadata columns, sort & detail modes, a live mtime watcher, and edit / open / delete actions. |
 | [`browse-plan`](recipes/browse-plan.md) | A project ticket tree over the `plan` CLI — status / edit / create / move flows. |
-| [`browse-ps`](recipes/browse-ps.md) | Live process tree from `ps`, with a kill action. |
+| [`browse-ps`](recipes/browse-ps.md) | Live auto-updating process viewer — PID·user·CPU%·memory columns, htop-style sort / detail / flat-tree modes, change highlighting, and a kill action. |
 | [`browse-mcp`](recipes/browse-mcp.md) | The tools exposed by any MCP (stdio) server, with their JSON schemas. |
 | [`browse-jira`](recipes/browse-jira.md) | Open Jira tickets via the `jira` CLI. |
 | [`browse-jira-mcp`](recipes/browse-jira-mcp.md) | Open Jira tickets via the Atlassian MCP server. |

@@ -1265,6 +1265,16 @@ than reimplement them (importable from `browse_tui`):
   `ctx.content_width` along the way, so a whole-row `format_row` override
   can call it, tweak the result, and return it. It composes the *framework*
   defaults (not any other resolved hook).
+- **`default_row_selection(item, ctx)`** / **`default_row_indent(item, ctx)`**
+  / **`default_row_expander(item, ctx)`** — the three chrome atoms
+  `default_row_chrome` is composed from (selection marker, indentation,
+  expander glyph), each a one-segment list. Compose them in a
+  `format_row_chrome` override to inject fixed columns into the structural
+  prefix — e.g. a **left gutter** of metadata columns *between* the selection
+  marker and the tree indent (so they don't shift rightward with depth):
+  `default_row_selection(item, ctx) + my_columns(item, ctx) +
+  default_row_indent(item, ctx) + default_row_expander(item, ctx)`. (browse-ps
+  and browse-fs use this for their PID / permissions gutters.)
 
 #### `RowContext`
 
@@ -1290,6 +1300,17 @@ prefix). Under a whole-row `format_row` override it stays equal to
 `list_width` (the chrome split is unknown). Both dimensions are `0` before
 the first paint / in headless tests (matching the `preview_width` contract);
 pick a fallback explicitly (`ctx.list_width or 80`).
+
+Methods for sizing aligned columns:
+
+- **`ctx.max_col_width(field, parent_id=None)`** — the widest display-cell
+  width of `str(getattr(child, field, ''))` across a sibling group (this
+  row's parent by default), memoised per parent. Align a column to its
+  siblings (e.g. each directory's files).
+- **`ctx.max_col_width_global(field)`** — the same, measured over *all*
+  loaded items rather than one sibling group. This is what a **gutter**
+  column wants: columns that line up across the whole list regardless of each
+  row's tree depth.
 
 Advanced escape hatch (mirrors `Context.browser`, unstable surface):
 
@@ -2262,6 +2283,9 @@ What actually lives at `browse_tui.<name>`:
 | `default_row`             | function    |
 | `default_row_chrome`      | function    |
 | `default_row_content`     | function    |
+| `default_row_selection`   | function    |
+| `default_row_indent`      | function    |
+| `default_row_expander`    | function    |
 | `cell_width`              | function    |
 | `cell_ljust`              | function    |
 | `cell_rjust`              | function    |
