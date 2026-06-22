@@ -1189,6 +1189,8 @@ class TestForEachRefParse(unittest.TestCase):
 # A representative ``git worktree list --porcelain`` dump: the main
 # worktree first (on 'main'), a nested linked worktree on a slash-bearing
 # branch, a sibling linked worktree, then a detached and a bare stanza.
+# The bare stanza has NO ``HEAD`` line — real git omits it for a bare
+# worktree (just ``worktree <path>`` + ``bare``), so ``head`` stays None.
 _WT_PORCELAIN = (
     'worktree /repo\n'
     'HEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'
@@ -1207,7 +1209,6 @@ _WT_PORCELAIN = (
     'detached\n'
     '\n'
     'worktree /repo/bare\n'
-    'HEAD eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n'
     'bare\n'
 )
 
@@ -1248,6 +1249,13 @@ class TestParseWorktreeList(unittest.TestCase):
         wts = self.r._parse_worktree_list(_WT_PORCELAIN)
         self.assertIsNone(wts[3].branch)   # detached
         self.assertIsNone(wts[4].branch)   # bare
+
+    def test_bare_worktree_has_no_head(self):
+        # Real git emits no HEAD line for a bare worktree, so head is None
+        # (a detached worktree still has its HEAD sha).
+        wts = self.r._parse_worktree_list(_WT_PORCELAIN)
+        self.assertEqual(wts[3].head, 'd' * 40)  # detached keeps its sha
+        self.assertIsNone(wts[4].head)           # bare has none
 
     def test_empty_input_yields_no_records(self):
         self.assertEqual(self.r._parse_worktree_list(''), [])
@@ -1390,6 +1398,104 @@ class TestBranchesRootWorktreeChips(unittest.TestCase):
         self.r._run_git = fake
         item, = self.r._branches_root()
         self.assertIn(self._chips(item), (None, []))
+
+
+class TestWorktreesRoot(unittest.TestCase):
+    """``_worktrees_root`` = one ``('worktree', abspath, label)`` row each."""
+
+    def setUp(self):
+        self.r = _load_recipe()
+
+    def _stub_worktrees(self):
+        # Feed the shared porcelain fixture (main + nested/slash branch +
+        # sibling + detached + bare) through the real parser.
+        wts = self.r._parse_worktree_list(_WT_PORCELAIN)
+        self.r._worktrees = lambda: wts
+        return wts
+
+    def test_main_first_relpath_dot_and_branch_label(self):
+        self._stub_worktrees()
+        items = self.r._worktrees_root()
+        # Main worktree leads, titled '. <branch>' with the main tag.
+        self.assertEqual(items[0].title, '. main')
+        self.assertEqual(items[0].id, ('worktree', '/repo', 'main'))
+        self.assertEqual(items[0].tag, 'main')
+        self.assertTrue(items[0].has_children)
+
+    def test_linked_worktree_relpath_and_id_shape(self):
+        self._stub_worktrees()
+        items = self.r._worktrees_root()
+        # The nested linked worktree: '<relpath> <branch>', id carries the
+        # absolute path + branch label, tagged linked.
+        foo = items[1]
+        self.assertEqual(foo.title, '.claude/worktrees/foo feature/x')
+        self.assertEqual(
+            foo.id, ('worktree', '/repo/.claude/worktrees/foo', 'feature/x'))
+        self.assertEqual(foo.tag, 'linked')
+        # A sibling worktree's relpath uses '..'.
+        sibling = items[2]
+        self.assertEqual(sibling.title, '../sibling release')
+
+    def test_detached_worktree_uses_short_head_sha_label_and_drills(self):
+        self._stub_worktrees()
+        items = self.r._worktrees_root()
+        # Detached worktree: no branch -> short HEAD sha (head[:7]) is the
+        # label, in the title AND as the drill rev in the id; still drillable.
+        det = items[3]
+        self.assertEqual(det.title, '.claude/worktrees/det ddddddd')
+        self.assertEqual(
+            det.id, ('worktree', '/repo/.claude/worktrees/det', 'ddddddd'))
+        self.assertTrue(det.has_children)
+
+    def test_bare_worktree_labelled_bare_and_is_leaf(self):
+        # A bare worktree has no HEAD line (head=None) and no branch: it must
+        # NOT crash on head[:7], renders as '<relpath> (bare)', and — having
+        # nothing to log — is a non-drillable leaf.
+        self._stub_worktrees()
+        items = self.r._worktrees_root()   # must not raise
+        bare = items[4]
+        self.assertEqual(bare.title, 'bare (bare)')
+        self.assertEqual(bare.id, ('worktree', '/repo/bare', '(bare)'))
+        self.assertFalse(bare.has_children)
+
+    def test_all_worktrees_emitted_in_order(self):
+        wts = self._stub_worktrees()
+        items = self.r._worktrees_root()
+        self.assertEqual(len(items), len(wts))
+        self.assertEqual([it.id[1] for it in items], [w.path for w in wts])
+
+    def test_empty_worktrees_yields_error_row(self):
+        # git failure -> _worktrees() returns [] -> a single error row, no crash.
+        self.r._worktrees = lambda: []
+        items = self.r._worktrees_root()
+        self.assertEqual([it.id for it in items], [('err',)])
+
+
+class TestGetChildrenWorktree(unittest.TestCase):
+    """``get_children(('worktree', ...))`` drills the label via ``_log_items``."""
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self.r._paths = []
+
+    def test_branch_worktree_drills_its_branch_rev(self):
+        captured = {}
+        self.r._log_items = (
+            lambda revs, paths, ns: captured.update(revs=revs, ns=ns) or [])
+        item_id = ('worktree', '/repo/.claude/worktrees/foo', 'feature/x')
+        self.r.get_children(item_id)
+        # The label (branch short-name) is the sole rev; the id is the ns so
+        # two drilled-in worktrees don't share a filler counter.
+        self.assertEqual(captured['revs'], ['feature/x'])
+        self.assertEqual(captured['ns'], item_id)
+
+    def test_detached_worktree_drills_its_head_sha(self):
+        captured = {}
+        self.r._log_items = (
+            lambda revs, paths, ns: captured.update(revs=revs) or [])
+        # A detached worktree's label is its short HEAD sha — a valid rev.
+        self.r.get_children(('worktree', '/repo/.claude/worktrees/det', 'ddddddd'))
+        self.assertEqual(captured['revs'], ['ddddddd'])
 
 
 class TestCommitLogItems(unittest.TestCase):

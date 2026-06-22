@@ -1,11 +1,11 @@
 # recipes/browse-git
 
-A tig-like browser over a git repository, with five view modes.
+A tig-like browser over a git repository, with six view modes.
 
-**One-line summary:** five switchable modes — commits (default), status,
-reflog, branches, stash — over a mandatory `KIND:`-prefixed id scheme;
-colorized diff / message previews; ref-decoration and author·date chips
-on commit rows.
+**One-line summary:** six switchable modes — commits (default), status,
+reflog, branches, stash, worktrees — over a mandatory `KIND:`-prefixed id
+scheme; colorized diff / message previews; ref-decoration and author·date
+chips on commit rows.
 
 **Modes:**
 
@@ -23,6 +23,11 @@ on commit rows.
 - **branches** — branches / remotes / tags via `git for-each-ref`,
   tagged by kind; drill a ref into its commits.
 - **stash** — `git stash list`; drill into a stash's files.
+- **worktrees** — `git worktree list`; one row per worktree (main first,
+  shown with relpath `.`), titled `<relpath> <branch>`. Drill a worktree
+  into its branch's commit log. A detached worktree shows its short HEAD
+  sha in place of the branch (and drills via that sha); a bare worktree
+  shows `(bare)` and is a non-drillable leaf.
 
 Switch modes with `--mode NAME` at launch, the backtick (`` ` ``) picker
 at runtime, or auto-selection from positional args.

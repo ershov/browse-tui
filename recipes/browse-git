@@ -1,10 +1,10 @@
 #!/usr/bin/env -S browse-tui --run-py
 """browse-git — a tig-like browser over a git repository.
 
-Five view modes, switchable by a per-mode flag (``--commits`` /
-``--status`` / ``--reflog`` / ``--branches`` / ``--stash``) at launch, by
-the backtick (`` ` ``) key at runtime, or auto-selected from positional
-arguments:
+Six view modes, switchable by a per-mode flag (``--commits`` /
+``--status`` / ``--reflog`` / ``--branches`` / ``--stash`` /
+``--worktrees``) at launch, by the backtick (`` ` ``) key at runtime, or
+auto-selected from positional arguments:
 
   commits   recent ``git log`` — drill commit -> changed files -> diff
   status    ``git status`` working-tree entries
@@ -17,6 +17,8 @@ files. They honor the same path filter and appear only on an unscoped log
   reflog    ``git reflog`` entries
   branches  branches / remotes / tags via ``git for-each-ref``
   stash     ``git stash list``
+  worktrees ``git worktree list`` — one row per worktree (main first,
+            relpath ``.``), drill into that worktree's branch commit log
 
 With ``-`` as the sole argument the recipe instead reads GIT OUTPUT
 FROM STDIN: the stream is slurped to EOF before the UI starts (on a
@@ -53,6 +55,11 @@ access — never a hex-vs-word heuristic or substring scan:
   ('file', sha, path)        a file in a commit -> per-file diff; a .md file
                              also -> a browse-md launcher
   ('ref', refname)           a branch/remote/tag -> commits on that ref
+  ('worktree', abspath, label)  a worktree (worktrees mode) -> the commits
+                             on its branch / sha; label is the branch
+                             short-name, or the short HEAD sha when detached
+                             (label is the drill rev), or ``(bare)`` for a
+                             bare worktree (a leaf — nothing to log)
   ('status', xy, path)       a working-tree entry -> staged/worktree diff; a
                              .md file also -> a browse-md launcher
   ('wc', bucket)             a status group (untracked/tracked/staged/conflicts)
@@ -163,7 +170,7 @@ except Exception:
 HAVE_DELTA = shutil.which('delta')
 
 _LOG_LIMIT = 1000
-_MODES = ('commits', 'status', 'reflog', 'branches', 'stash')
+_MODES = ('commits', 'status', 'reflog', 'branches', 'stash', 'worktrees')
 
 # Glyph substitution for ``git log --graph`` art (tree mode). Maps git's
 # ASCII art to box-drawing / dot glyphs: every node ('*') becomes the same
@@ -1464,6 +1471,15 @@ def get_children(item_id, *, reload=False):
         # ref's own id namespaces its filler ids so two drilled-in refs
         # don't collide on a shared filler counter.
         return _log_items([item_id[1]], [], ns=item_id)
+    if kind == 'worktree':
+        # A worktree row drills into its branch's commits via the same
+        # commit-log seam as a ref. id = ('worktree', abspath, label) where
+        # label is the branch short-name, or the HEAD sha for a detached
+        # worktree — either way a valid rev. (A bare worktree's label is
+        # ``(bare)`` and the row is built as a leaf, so it never reaches
+        # here.) The id namespaces this build's filler ids so two
+        # drilled-in worktrees don't share a counter.
+        return _log_items([item_id[2]], [], ns=item_id)
     if kind == 'wc':
         # A worktree-status group drills into its files. id = ('wc',
         # bucket); scope by the same positional paths as the root.
@@ -1496,6 +1512,8 @@ def _root_children():
         return _stash_root()
     if _mode == 'branches':
         return _branches_root()
+    if _mode == 'worktrees':
+        return _worktrees_root()
     return []
 
 
@@ -1639,6 +1657,46 @@ def _worktree_relpath(abspath, main_root):
     itself maps to ``.`` (``relpath`` of a path against itself).
     """
     return os.path.relpath(abspath, main_root)
+
+
+def _worktrees_root():
+    """Worktrees-mode root = one ``('worktree', abspath, label)`` row each.
+
+    From ``_worktrees()`` (main first), each row is titled ``<relpath>
+    <label>`` — the path relative to the main worktree root (the main
+    worktree itself is ``.``) followed by the checked-out branch short-name,
+    the short HEAD sha for a detached worktree, or ``(bare)`` for a bare
+    worktree (which has no HEAD line in the porcelain). For a branch or
+    detached worktree ``label`` doubles as the drill-down rev (see the
+    ``worktree`` branch of ``get_children``), so a detached worktree drills
+    via its sha; a bare worktree has nothing to log and is a non-expandable
+    leaf. Main vs linked is tagged with a small ``main`` / ``linked`` chip.
+    Degrades to an error row on git failure (empty ``_worktrees()``),
+    mirroring the other roots.
+    """
+    worktrees = _worktrees()
+    if not worktrees:
+        return _err_item('git worktree list failed')
+    main_root = next((wt.path for wt in worktrees if wt.is_main), None)
+    items = []
+    for wt in worktrees:
+        if wt.branch is not None:
+            label = wt.branch
+        elif wt.head is not None:
+            label = wt.head[:7]          # detached: short HEAD sha
+        else:
+            label = '(bare)'             # bare worktree: no HEAD to show
+        relpath = (_worktree_relpath(wt.path, main_root)
+                   if main_root is not None else wt.path)
+        kind = 'main' if wt.is_main else 'linked'
+        items.append(Item(id=('worktree', wt.path, label),
+                          title=f'{relpath} {label}',
+                          tag=kind,
+                          tag_style='green' if wt.is_main else 'magenta',
+                          # Only branch/detached rows have a rev to log; a
+                          # bare worktree (no branch, no HEAD) is a leaf.
+                          has_children=bool(wt.branch or wt.head)))
+    return items
 
 
 def _worktree_groups(paths):
@@ -2405,7 +2463,7 @@ def _md_launch(ctx, spec):
 
 
 def switch_mode(ctx):
-    """Backtick — pick one of the five modes, then re-list the root.
+    """Backtick — pick one of the six modes, then re-list the root.
 
     In stdin mode (``browse-git -``) every other view would re-run git,
     which piped input forbids — flash and stay put instead.
@@ -2419,7 +2477,7 @@ def switch_mode(ctx):
         return
     _mode = chosen
     ctx.flash(f'mode: {_mode}')
-    # All five modes share one root scope (and thus one ``state.expanded``
+    # All six modes share one root scope (and thus one ``state.expanded``
     # set); drop the previous mode's expanded ids before re-listing so the
     # refresh doesn't re-fetch / re-expand rows that don't exist here.
     ctx.collapse_all()
@@ -3170,7 +3228,7 @@ def on_context_menu(ctx):
 
 
 _HELP_USAGE_TMPL = """\
-Usage: browse-git [<dir>] [-n NUMBER] [--commits|--status|--reflog|--branches|--stash] [--no-tree] [--all] [<rev>…] [-- <path>…]
+Usage: browse-git [<dir>] [-n NUMBER] [--commits|--status|--reflog|--branches|--stash|--worktrees] [--no-tree] [--all] [<rev>…] [-- <path>…]
        git diff | browse-git      (also git log / log -p / status output; the '-' is optional when piping)
   <dir>         A leading directory in another git repo browses THAT repo
                 (cwd need not be a repo). A subdir of the current repo
@@ -3217,7 +3275,7 @@ ignores them).\
 _HELP_INTRO = """\
 browse-git — a tig-like browser over a git repository.
 
-The five view modes:
+The six view modes:
   commits   recent git log; drill commit -> changed files -> per-file diff
             (an unscoped log is preceded by working-change rows — Untracked
             / Tracked / Staged / Conflicts — each shown only when non-empty,
@@ -3226,6 +3284,8 @@ The five view modes:
   reflog    reflog entries; same drill-down as commits
   branches  branches / remotes / tags; drill a ref into its commits
   stash     stash entries; drill into the stash's files
+  worktrees one row per worktree (main first, relpath .); drill into that
+            worktree's branch commit log
 
 Keys:
   `         open the mode picker (switch view mode at runtime)
