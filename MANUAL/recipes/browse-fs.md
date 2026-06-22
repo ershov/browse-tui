@@ -16,8 +16,11 @@ changed directories.
   (compares the returned label against `'Yes'`).
 - `ctx.error` and `ctx.refresh` for error reporting and post-action UI
   refresh.
-- Recipe-set Item attributes (`item.size`, `item.mode`, `item.mtime`) that
-  survive the full pipeline.
+- A **left gutter** of metadata columns — permissions, size, date, and (in
+  the fullest detail mode) owner user / group — via `format_row_chrome` and
+  the framework chrome atoms, each sized with `ctx.max_col_width_global` so
+  they align across the listing while the name stays the flexible last
+  column. Owner names resolve through `pwd` / `grp` (cached per id).
 - `browser.watch(callback)` — a daemon thread polling mtimes and calling
   `browser.refresh(d)` on change.
 - Cross-recipe launch ("detach"): a `*.md` row expands into `[md ↗]` launcher
@@ -35,9 +38,13 @@ changed directories.
 ```
 
 Keys (in addition to defaults): `e` edit (`$EDITOR`), `o` open (`xdg-open`),
-`d` delete (with confirmation). Enter opens the cursor row in `$EDITOR`,
-except on a `[md ↗]` markdown launcher row, where it opens the target in
-`browse-md`.
+`d` delete (with confirmation), `m` toggle markdown coloring (when
+available). `1` / `2` / `3` switch detail level — name only (like `ls -1`) ·
+permissions·size·date · plus owner user·group. `N` / `S` / `T` / `U` sort by
+name (asc, default) · size · time · user — press the active key to reverse
+(each remembers its direction) — and `D` toggles directories-first vs.
+sorted in-line with files. Enter opens the cursor row in `$EDITOR`, except on
+a `[md ↗]` markdown launcher row, where it opens the target in `browse-md`.
 
 **Source:** [`recipes/browse-fs`](../../recipes/browse-fs)
 

@@ -244,6 +244,64 @@ class TestColWidthCacheInvalidation(unittest.TestCase):
         self.assertEqual(s._col_width_cache, {})
 
 
+class TestColWidthGlobalCacheInvalidation(unittest.TestCase):
+    """The global ``max_col_width_global`` cache (``_col_width_global_cache``)
+    is cleared wholesale in lockstep with the ``_children`` mutation sites —
+    end-to-end through the real ``Browser`` for refresh and update_data
+    (design sec A2).
+
+    Like the per-parent tests above, these prime ``_col_width_global_cache``
+    directly (the measurement lives in 050-render, not loaded here); what's
+    under test is that the state-level mutation paths clear it wholesale.
+    """
+
+    def test_fresh_state_and_browser_have_empty_global_cache(self):
+        self.assertEqual(State()._col_width_global_cache, {})
+        self.assertEqual(
+            Browser(BrowserConfig(_headless=True))._state._col_width_global_cache,
+            {})
+
+    def test_refresh_delivery_clears_global(self):
+        b = Browser(BrowserConfig(_headless=True))
+        b.set_children('p', [{'id': 'x'}, {'id': 'y'}])
+        b.apply_children_results()
+        b._state._col_width_global_cache['col'] = 7   # prime (as a render would)
+        # Re-deliver under the same parent (a refresh / re-fetch).
+        b.set_children('p', [{'id': 'z'}])
+        b.apply_children_results()
+        self.assertEqual(b._state._col_width_global_cache, {})
+
+    def test_update_data_upsert_clears_global(self):
+        b = Browser(BrowserConfig(_headless=True))
+        b.set_children('p', [{'id': 'x'}])
+        b.apply_children_results()
+        b._state._col_width_global_cache['col'] = 3
+        apply_ops(b._state, [('upsert', 'w', 'p', {'col': 'wider-value'})])
+        self.assertEqual(b._state._col_width_global_cache, {})
+
+    def test_update_data_mod_clears_global(self):
+        b = Browser(BrowserConfig(_headless=True))
+        b.set_children('p', [{'id': 'x', 'col': 'a'}])
+        b.apply_children_results()
+        b._state._col_width_global_cache['col'] = 1
+        apply_ops(b._state, [('mod', 'x', KEEP_PARENT, {'col': 'longer'})])
+        self.assertEqual(b._state._col_width_global_cache, {})
+
+    def test_cache_invalidate_subtree_clears_global(self):
+        s = State(root_id='/')
+        s._children['/'] = [Item(id='a')]
+        s._parent_of_id = {'a': '/'}
+        s._col_width_global_cache['col'] = 9
+        cache_invalidate_subtree(s, '/')
+        self.assertEqual(s._col_width_global_cache, {})
+
+    def test_cache_invalidate_all_clears_global(self):
+        s = State(root_id='/')
+        s._col_width_global_cache = {'col': 9, 'other': 2}
+        cache_invalidate_all(s)
+        self.assertEqual(s._col_width_global_cache, {})
+
+
 class TestDispatchSetsLoading(unittest.TestCase):
     """Dispatch paths flip ``_loading[parent] = True`` synchronously."""
 

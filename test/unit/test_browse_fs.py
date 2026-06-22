@@ -1,8 +1,8 @@
-"""Unit tests for the ``recipes/browse-fs`` columnar list (ticket #661).
+"""Unit tests for the ``recipes/browse-fs`` columnar list (tickets #661, #1114).
 
 The recipe is a single-file ``--run-py`` script that imports
 ``browse_tui`` (only available when the binary loads it). To exercise
-``fs_row_content`` and ``get_children`` directly we stub ``browse_tui``
+``fs_chrome`` and ``get_children`` directly we stub ``browse_tui``
 in ``sys.modules`` and load the extension-less recipe via
 ``SourceFileLoader`` — the same pattern as ``test/unit/test_browse_git.py``.
 
@@ -10,19 +10,20 @@ The point of these tests is to verify the recipe *wires* the column
 helpers correctly, not to re-test the helpers themselves (``cell_ljust`` /
 ``cell_rjust`` are covered by Stage 1's ``test_render``). So the stub
 provides functional-enough ``cell_ljust`` / ``cell_rjust`` / ``style`` /
-``default_row_content`` and a fake ``ctx`` whose ``max_col_width(field)``
-returns a fixed width per field.
+chrome atoms (``default_row_selection`` / ``default_row_indent`` /
+``default_row_expander``) and a fake ``ctx`` whose
+``max_col_width_global(field)`` returns a fixed width per field.
 
 Coverage:
 
-* ``fs_row_content``  — pads each metadata column to its
-  ``max_col_width`` and emits the title segment LAST; rows of differing
-  perms/size/mtime lengths align (equal per-column segment widths); an
-  item WITHOUT ``col_perms`` falls back to exactly
-  ``default_row_content(item, ctx)``.
+* ``fs_chrome``       — the perms/size/date columns now sit in a LEFT
+  *gutter* (between the selection marker and the tree indent), padded to
+  their ``max_col_width_global`` width; columns align across rows of
+  differing depth; an item WITHOUT ``col_perms`` emits an EMPTY gutter
+  (just the default chrome atoms).
 * ``get_children``    — stores ``col_perms`` / ``col_size`` / ``col_mtime``
   on each Item and no longer stuffs the size into ``tag``; the error row
-  carries no ``col_*`` (so it falls back).
+  carries no ``col_*`` (so it gets an empty gutter).
 """
 
 import contextlib
@@ -106,10 +107,12 @@ def _stub_browse_tui():
     recipe's unit test doesn't bleed in. ``Item`` keeps its kwargs as
     attributes so ``get_children`` tests can read ``.col_*`` / ``.tag``;
     ``Browser`` / ``BrowserConfig`` / ``Action`` are inert. The column
-    helpers (``cell_ljust`` / ``cell_rjust`` / ``style`` /
-    ``default_row_content``) are functional-but-minimal: the test data is
+    helpers (``cell_ljust`` / ``cell_rjust`` / ``style``) and the chrome
+    atoms (``default_row_selection`` / ``default_row_indent`` /
+    ``default_row_expander``) are functional-but-minimal: the test data is
     plain ASCII, so ``str.ljust`` / ``str.rjust`` measure the same as the
-    real cell-aware helpers, and that is enough to prove the wiring.
+    real cell-aware helpers, and the atoms mirror the framework's segment
+    shape closely enough to prove the gutter composition.
     """
     mod = types.ModuleType('browse_tui')
 
@@ -128,11 +131,28 @@ def _stub_browse_tui():
     mod.cell_rjust = lambda s, width, fill=' ': s.rjust(width, fill)
     mod.style = lambda name: _DIM if name == 'dim' else (None, False)
 
-    def _default_row_content(item, ctx):
-        # A recognisable sentinel so the fallback path is unambiguous.
-        return [('DEFAULT', getattr(item, 'id', None), getattr(item, 'title', None))]
+    # Chrome atoms, mirroring the framework's segment shapes (040-state.py):
+    # a single-segment list each, with the meta-row blanking rules. The fake
+    # ctx below supplies the kind / selected / depth / expanded it reads.
+    def _default_row_selection(item, ctx):
+        marker = '  ' if ctx.kind == 'meta' else ('* ' if ctx.selected else '  ')
+        return [(marker, None, False)]
 
-    mod.default_row_content = _default_row_content
+    def _default_row_indent(item, ctx):
+        return [('  ' * max(ctx.depth, 0), None, False)]
+
+    def _default_row_expander(item, ctx):
+        if ctx.kind == 'meta':
+            marker = '  '
+        elif getattr(item, 'has_children', False):
+            marker = '▼ ' if ctx.expanded else '▶ '
+        else:
+            marker = '  '
+        return [(marker, None, False)]
+
+    mod.default_row_selection = _default_row_selection
+    mod.default_row_indent = _default_row_indent
+    mod.default_row_expander = _default_row_expander
     mod.recipe_argv = _stub_recipe_argv
     sys.modules['browse_tui'] = mod
 
@@ -156,13 +176,24 @@ def _load_recipe():
 
 
 class _FakeCtx:
-    """A ``RowContext`` stand-in: ``max_col_width(field)`` → fixed width."""
+    """A ``RowContext`` stand-in for the gutter chrome.
 
-    def __init__(self, widths):
+    ``max_col_width_global(field)`` returns a fixed width per field (and
+    records the order of lookups in ``calls``). The chrome atoms also read
+    ``kind`` / ``selected`` / ``depth`` / ``expanded``; defaults model an
+    unselected, top-level, collapsed normal row.
+    """
+
+    def __init__(self, widths, *, kind='item', selected=False, depth=0,
+                 expanded=False):
         self._widths = widths
         self.calls = []
+        self.kind = kind
+        self.selected = selected
+        self.depth = depth
+        self.expanded = expanded
 
-    def max_col_width(self, field, parent_id=None):
+    def max_col_width_global(self, field):
         self.calls.append(field)
         return self._widths[field]
 
@@ -172,8 +203,14 @@ def _make_item(r, **kw):
     return r.Item(**kw)
 
 
-class TestFsRowContent(unittest.TestCase):
-    """``fs_row_content`` assembles padded columns with the title last."""
+class TestFsChrome(unittest.TestCase):
+    """``fs_chrome`` puts perms/size/date in a LEFT gutter (ticket #1114).
+
+    Order is ``selection, <gutter: perms size date>, indent, expander`` — the
+    metadata columns sit BEFORE the tree indent/expander so they stay pinned
+    at the left edge regardless of depth. The name is rendered by the default
+    content (not by ``fs_chrome``), so the chrome ends at the expander.
+    """
 
     @classmethod
     def setUpClass(cls):
@@ -182,28 +219,33 @@ class TestFsRowContent(unittest.TestCase):
     def _widths(self, perms=10, size=4, mtime=12):
         return {'col_perms': perms, 'col_size': size, 'col_mtime': mtime}
 
-    def test_columns_padded_and_title_last(self):
+    def test_gutter_order_padding_and_no_title(self):
         ctx = _FakeCtx(self._widths(perms=10, size=4, mtime=12))
         item = _make_item(
             self.r, id='/d/f', title='f.txt',
             col_perms='-rw-r--r--', col_size='12K', col_mtime='Jun 03 11:08')
-        segs = self.r.fs_row_content(item, ctx)
+        segs = self.r.fs_chrome(item, ctx)
 
-        # Four segments: perms, size, mtime, title.
-        self.assertEqual(len(segs), 4)
-        perms_seg, size_seg, mtime_seg, title_seg = segs
+        # selection + 3 gutter columns + indent + expander = 6 segments.
+        # The title is NOT in chrome (the default content renders it).
+        self.assertEqual(len(segs), 6)
+        sel, perms_seg, size_seg, mtime_seg, indent_seg, expander_seg = segs
 
-        # Each metadata segment is the padded column + a two-space gap,
-        # carries the dim (fg, bold) from style('dim').
+        # Selection marker first (unselected, normal row → '  ').
+        self.assertEqual(sel, ('  ', None, False))
+
+        # Gutter columns: padded + two-space gap, dim (fg, bold) from
+        # style('dim'). perms ljust, size rjust, mtime ljust.
         self.assertEqual(perms_seg, ('-rw-r--r--' + '  ', _DIM[0], _DIM[1]))
-        self.assertEqual(size_seg, (' 12K' + '  ', _DIM[0], _DIM[1]))   # rjust to 4
+        self.assertEqual(size_seg, (' 12K' + '  ', _DIM[0], _DIM[1]))   # rjust 4
         self.assertEqual(mtime_seg, ('Jun 03 11:08' + '  ', _DIM[0], _DIM[1]))
 
-        # Title comes LAST and is the plain item title (no fg, not bold),
-        # so a narrow pane truncates the name not the metadata.
-        self.assertEqual(title_seg, ('f.txt', None, False))
+        # Indent (depth 0 → '') and expander (leaf → '  ') come AFTER the
+        # gutter — proving the columns sit LEFT of the tree chrome.
+        self.assertEqual(indent_seg, ('', None, False))
+        self.assertEqual(expander_seg[0], '  ')
 
-        # Widths were sourced from max_col_width for each column field.
+        # Columns measured via the GLOBAL width, in column order.
         self.assertEqual(ctx.calls, ['col_perms', 'col_size', 'col_mtime'])
 
     def test_size_is_right_justified(self):
@@ -213,53 +255,76 @@ class TestFsRowContent(unittest.TestCase):
         item = _make_item(
             self.r, id='/d/sub', title='sub/',
             col_perms='drwxr-xr-x', col_size='', col_mtime='Jun 03 11:08')
-        size_seg = self.r.fs_row_content(item, ctx)[1]
+        # Gutter is segments[1:4] (after the selection marker); size is [2].
+        size_seg = self.r.fs_chrome(item, ctx)[2]
         self.assertEqual(size_seg, ('     ' + '  ', _DIM[0], _DIM[1]))  # 5 spaces
 
-    def test_rows_align_across_differing_lengths(self):
-        # Two rows whose raw perms/size/mtime differ in length must, once
-        # padded to the per-column max, yield equal segment widths — that
-        # is the whole point of max_col_width-driven alignment.
+    def test_gutter_aligns_across_differing_depths(self):
+        # The whole point of max_col_width_global: a deep row's perms column
+        # lines up under a shallow row's perms column. The gutter sits BEFORE
+        # the indent, so the indent (which differs by depth) does NOT shift
+        # the columns — every gutter segment is byte-for-byte equal across
+        # rows regardless of depth.
         widths = self._widths(perms=10, size=6, mtime=12)
-        ctx = _FakeCtx(widths)
-        a = _make_item(
+        shallow = _make_item(
             self.r, id='/d/a', title='a',
             col_perms='-rw-r--r--', col_size='3B', col_mtime='Jun 03 11:08')
-        b = _make_item(
-            self.r, id='/d/bbbb', title='bbbb',
+        deep = _make_item(
+            self.r, id='/d/x/y/b', title='b',
             col_perms='drwxr-xr-x', col_size='123456', col_mtime='May 01 09:00')
-        segs_a = self.r.fs_row_content(a, _FakeCtx(widths))
-        segs_b = self.r.fs_row_content(b, ctx)
+        segs_shallow = self.r.fs_chrome(shallow, _FakeCtx(widths, depth=0))
+        segs_deep = self.r.fs_chrome(deep, _FakeCtx(widths, depth=3))
 
-        # Per metadata column (perms/size/mtime → indices 0/1/2) the text
-        # length is identical across the two rows.
-        for col in range(3):
-            self.assertEqual(len(segs_a[col][0]), len(segs_b[col][0]),
-                             f'column {col} widths differ between rows')
-        # Concrete widths: column field width + 2-space gap.
-        self.assertEqual(len(segs_a[0][0]), 10 + 2)
-        self.assertEqual(len(segs_a[1][0]), 6 + 2)
-        self.assertEqual(len(segs_a[2][0]), 12 + 2)
+        # Gutter columns are indices 1/2/3 (after the selection marker) in
+        # BOTH rows — byte-for-byte equal width, so a deep row's columns line
+        # up under a shallow row's. The deeper indent comes AFTER the gutter.
+        for col in (1, 2, 3):
+            self.assertEqual(len(segs_shallow[col][0]), len(segs_deep[col][0]),
+                             f'gutter column {col} widths differ across rows')
+        # Concrete widths: field width + 2-space gap.
+        self.assertEqual(len(segs_shallow[1][0]), 10 + 2)   # perms
+        self.assertEqual(len(segs_shallow[2][0]), 6 + 2)    # size
+        self.assertEqual(len(segs_shallow[3][0]), 12 + 2)   # mtime
 
-    def test_fallback_when_no_col_perms(self):
-        # An item without col_perms (error / synthetic) must return EXACTLY
-        # default_row_content(item, ctx) — no columns, no max_col_width call.
+        # The indent segment (index -2) reflects the depth and is LONGER for
+        # the deep row, confirming the gutter precedes (is unaffected by) it.
+        self.assertEqual(segs_shallow[-2][0], '')
+        self.assertEqual(segs_deep[-2][0], '  ' * 3)
+
+    def test_empty_gutter_when_no_col_perms(self):
+        # An item without col_perms (error / synthetic) emits an EMPTY gutter:
+        # just selection + indent + expander, no metadata columns and no
+        # global-width measurement. The default content then renders the row.
         ctx = _FakeCtx(self._widths())
         item = _make_item(self.r, id=('err', '/x'), title='[error] boom',
                           tag='err', tag_style='red')
-        segs = self.r.fs_row_content(item, ctx)
-        self.assertEqual(segs, self.r.default_row_content(item, ctx))
-        self.assertEqual(segs, [('DEFAULT', ('err', '/x'), '[error] boom')])
-        # The fallback path must not measure columns.
+        segs = self.r.fs_chrome(item, ctx)
+        # 3 segments only (selection, indent, expander) — no gutter columns.
+        self.assertEqual(len(segs), 3)
+        self.assertEqual(segs[0], ('  ', None, False))   # selection
+        self.assertEqual(segs[1], ('', None, False))     # indent (depth 0)
+        self.assertEqual(segs[2][0], '  ')               # expander (leaf)
+        # The empty-gutter path must not measure columns.
         self.assertEqual(ctx.calls, [])
 
-    def test_explicit_none_col_perms_also_falls_back(self):
-        # Defensive: col_perms present but None still takes the fallback.
+    def test_explicit_none_col_perms_also_empty_gutter(self):
+        # Defensive: col_perms present but None still emits the empty gutter.
         ctx = _FakeCtx(self._widths())
         item = _make_item(self.r, id='/d/x', title='x', col_perms=None)
-        segs = self.r.fs_row_content(item, ctx)
-        self.assertEqual(segs, self.r.default_row_content(item, ctx))
+        segs = self.r.fs_chrome(item, ctx)
+        self.assertEqual(len(segs), 3)
         self.assertEqual(ctx.calls, [])
+
+    def test_selected_marker_and_expander_glyph(self):
+        # A selected, expanded parent row shows '* ' and '▼ ' around the
+        # gutter — the gutter is invariant; the chrome atoms reflect state.
+        ctx = _FakeCtx(self._widths(), selected=True, expanded=True)
+        item = _make_item(
+            self.r, id='/d/sub', title='sub/', has_children=True,
+            col_perms='drwxr-xr-x', col_size='', col_mtime='Jun 03 11:08')
+        segs = self.r.fs_chrome(item, ctx)
+        self.assertEqual(segs[0], ('* ', None, False))   # selected
+        self.assertEqual(segs[-1][0], '▼ ')              # expanded parent
 
 
 class TestGetChildren(unittest.TestCase):
@@ -305,7 +370,7 @@ class TestGetChildren(unittest.TestCase):
 
     def test_error_row_has_no_columns(self):
         # A path that can't be scanned yields the single error Item, which
-        # must NOT carry col_* so fs_row_content falls back for it.
+        # must NOT carry col_* so fs_chrome emits an empty gutter for it.
         missing = os.path.join(tempfile.gettempdir(),
                                'definitely-missing-dir-xyz-661')
         # Ensure it truly doesn't exist.
@@ -321,9 +386,9 @@ class TestGetChildren(unittest.TestCase):
         self.assertIsNone(getattr(err, 'col_perms', None))
         self.assertIsNone(getattr(err, 'col_size', None))
         self.assertIsNone(getattr(err, 'col_mtime', None))
-        # And fs_row_content takes the fallback for it.
-        self.assertEqual(self.r.fs_row_content(err, _FakeCtx({})),
-                         self.r.default_row_content(err, _FakeCtx({})))
+        # And fs_chrome emits an EMPTY gutter for it (just the three chrome
+        # atoms — no metadata columns), so the default content renders it.
+        self.assertEqual(len(self.r.fs_chrome(err, _FakeCtx({}))), 3)
         # get_preview routes the error id via its tuple tag (not os.scandir
         # / open) and surfaces the failing path from id[1].
         self.assertEqual(self.r.get_preview(err.id), missing)
@@ -1005,6 +1070,434 @@ class TestMdLauncher(unittest.TestCase):
         ctx = _EnterCtx(None)
         self.r._on_enter(ctx)                # must not raise
         self.assertEqual(ctx.calls, [])
+
+
+class _ModeCtx:
+    """A minimal ``ctx`` for the display-mode switch actions.
+
+    Records ``flash`` text and ``refresh`` calls — the two side-effects
+    ``_set_display_mode`` performs besides flipping the module global.
+    """
+
+    def __init__(self):
+        self.flashes = []
+        self.refreshed = 0
+
+    def flash(self, text, log=False):
+        self.flashes.append(text)
+
+    def refresh(self):
+        self.refreshed += 1
+
+
+class TestDisplayModes(unittest.TestCase):
+    """Display modes (number keys 1/2/3) gate the gutter column set (#1115).
+
+    ``_DISPLAY_MODE`` selects which columns ``_fs_gutter_segments`` emits:
+    mode 1 = empty gutter, mode 2 = perms/size/date, mode 3 = + user/group.
+    The strings are always computed in ``_set_columns`` (incl. col_user /
+    col_group); the mode only chooses which the gutter renders.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def setUp(self):
+        # Each test drives ``_DISPLAY_MODE`` explicitly; restore the default
+        # afterwards so tests stay isolated (it is a module global).
+        self._saved_mode = self.r._DISPLAY_MODE
+        self.addCleanup(setattr, self.r, '_DISPLAY_MODE', self._saved_mode)
+
+    def _widths(self, perms=10, size=4, mtime=12, user=5, group=5):
+        return {'col_perms': perms, 'col_size': size, 'col_mtime': mtime,
+                'col_user': user, 'col_group': group}
+
+    def _item(self):
+        return _make_item(
+            self.r, id='/d/f', title='f.txt',
+            col_perms='-rw-r--r--', col_size='12K', col_mtime='Jun 03 11:08',
+            col_user='alice', col_group='staff')
+
+    # -- the per-mode gutter column set ------------------------------------
+
+    def test_mode_1_is_empty_gutter(self):
+        # Mode 1 = name only → no gutter columns and no width measurement.
+        self.r._DISPLAY_MODE = 1
+        ctx = _FakeCtx(self._widths())
+        segs = self.r._fs_gutter_segments(self._item(), ctx)
+        self.assertEqual(segs, [])
+        self.assertEqual(ctx.calls, [])
+        # And the whole chrome is just selection + indent + expander.
+        self.assertEqual(len(self.r.fs_chrome(self._item(), _FakeCtx(self._widths()))), 3)
+
+    def test_mode_2_is_perms_size_date(self):
+        # Mode 2 = the default set: perms · size · date, in that order.
+        self.r._DISPLAY_MODE = 2
+        ctx = _FakeCtx(self._widths(perms=10, size=4, mtime=12))
+        segs = self.r._fs_gutter_segments(self._item(), ctx)
+        self.assertEqual(len(segs), 3)
+        self.assertEqual(segs[0], ('-rw-r--r--' + '  ', _DIM[0], _DIM[1]))
+        self.assertEqual(segs[1], (' 12K' + '  ', _DIM[0], _DIM[1]))    # rjust 4
+        self.assertEqual(segs[2], ('Jun 03 11:08' + '  ', _DIM[0], _DIM[1]))
+        self.assertEqual(ctx.calls, ['col_perms', 'col_size', 'col_mtime'])
+
+    def test_mode_3_appends_user_then_group(self):
+        # Mode 3 = perms · size · date · user · group; user/group are
+        # left-justified, dim, sized via max_col_width_global.
+        self.r._DISPLAY_MODE = 3
+        ctx = _FakeCtx(self._widths(perms=10, size=4, mtime=12, user=6, group=7))
+        segs = self.r._fs_gutter_segments(self._item(), ctx)
+        self.assertEqual(len(segs), 5)
+        # First three unchanged from mode 2.
+        self.assertEqual(segs[0], ('-rw-r--r--' + '  ', _DIM[0], _DIM[1]))
+        self.assertEqual(segs[1], (' 12K' + '  ', _DIM[0], _DIM[1]))
+        self.assertEqual(segs[2], ('Jun 03 11:08' + '  ', _DIM[0], _DIM[1]))
+        # user (ljust 6) then group (ljust 7), both dim.
+        self.assertEqual(segs[3], ('alice'.ljust(6) + '  ', _DIM[0], _DIM[1]))
+        self.assertEqual(segs[4], ('staff'.ljust(7) + '  ', _DIM[0], _DIM[1]))
+        # Measured in column order, user before group.
+        self.assertEqual(ctx.calls,
+                         ['col_perms', 'col_size', 'col_mtime',
+                          'col_user', 'col_group'])
+
+    # -- user / group resolution + numeric fallback ------------------------
+
+    def test_set_columns_resolves_user_and_group(self):
+        # _set_columns stores resolved owner / group names from st_uid/st_gid.
+        with tempfile.TemporaryDirectory() as d:
+            fpath = os.path.join(d, 'f.txt')
+            with open(fpath, 'wb') as f:
+                f.write(b'x')
+            st = os.stat(fpath)
+            item = _make_item(self.r, id=fpath, title='f.txt')
+            self.r._set_columns(item, st, is_dir=False)
+            import pwd as _pwd
+            import grp as _grp
+            self.assertEqual(item.col_user, _pwd.getpwuid(st.st_uid).pw_name)
+            self.assertEqual(item.col_group, _grp.getgrgid(st.st_gid).gr_name)
+
+    def test_unresolvable_uid_gid_fall_back_to_numeric(self):
+        # A uid/gid with no passwd/group entry (getpwuid/getgrgid raise
+        # KeyError) falls back to the numeric id rendered as a string.
+        self.r._UID_NAMES.clear()
+        self.r._GID_NAMES.clear()
+        with mock.patch('pwd.getpwuid', side_effect=KeyError), \
+                mock.patch('grp.getgrgid', side_effect=KeyError):
+            self.assertEqual(self.r._uid_name(4242), '4242')
+            self.assertEqual(self.r._gid_name(7777), '7777')
+
+    def test_uid_gid_resolution_is_cached(self):
+        # Per-uid / per-gid caching: a second lookup does NOT re-hit
+        # pwd/grp (so dozens of same-owner rows resolve once each).
+        self.r._UID_NAMES.clear()
+        self.r._GID_NAMES.clear()
+        with mock.patch('pwd.getpwuid',
+                        return_value=types.SimpleNamespace(pw_name='bob')) as pw, \
+                mock.patch('grp.getgrgid',
+                           return_value=types.SimpleNamespace(gr_name='wheel')) as gr:
+            self.assertEqual(self.r._uid_name(1000), 'bob')
+            self.assertEqual(self.r._uid_name(1000), 'bob')
+            self.assertEqual(self.r._gid_name(20), 'wheel')
+            self.assertEqual(self.r._gid_name(20), 'wheel')
+        self.assertEqual(pw.call_count, 1)
+        self.assertEqual(gr.call_count, 1)
+
+    # -- the mode-switch actions -------------------------------------------
+
+    def test_set_display_mode_flips_global_flashes_and_refreshes(self):
+        # Each action sets _DISPLAY_MODE, flashes the mode, and refreshes.
+        for mode in (1, 3, 2):
+            ctx = _ModeCtx()
+            self.r._set_display_mode(ctx, mode)
+            self.assertEqual(self.r._DISPLAY_MODE, mode)
+            self.assertEqual(ctx.refreshed, 1)
+            self.assertEqual(len(ctx.flashes), 1)
+            # The flash names the active mode's column set.
+            self.assertIn(self.r._MODE_LABELS[mode], ctx.flashes[0])
+
+    def test_default_display_mode_is_2(self):
+        # Freshly loaded, the recipe defaults to mode 2 (perms/size/date).
+        fresh = _load_recipe()
+        self.assertEqual(fresh._DISPLAY_MODE, 2)
+
+
+class _FakeDirEntry:
+    """A minimal ``os.DirEntry`` stand-in: name + path, used to drive
+    ``_sort_rows`` (which reads only ``.name`` and ``.path``)."""
+
+    def __init__(self, name):
+        self.name = name
+        self.path = '/d/' + name
+
+
+def _row(name, *, is_dir=False, size=0, mtime=0.0, uid=0):
+    """Build a ``(dirent, stat)`` row for ``_sort_rows``.
+
+    The fake stat carries only the fields the sort keys read — mode (for the
+    dirs-first split), size, mtime, and uid (the user key resolves it via
+    ``_uid_name``)."""
+    mode = (stat.S_IFDIR if is_dir else stat.S_IFREG) | 0o644
+    st = types.SimpleNamespace(st_mode=mode, st_size=size, st_mtime=mtime,
+                              st_uid=uid)
+    return (_FakeDirEntry(name), st)
+
+
+class TestSortModes(unittest.TestCase):
+    """Sort modes (capital keys N/S/T/U + D toggle) order each directory's
+    children in ``get_children`` (ticket #1116).
+
+    ``_FS_SORT_KEY`` / ``_FS_SORT_DIR`` / ``_DIRS_FIRST`` drive ``_sort_rows``;
+    the action handlers (``_set_sort`` / ``_toggle_dirs_first``) mutate that
+    state, flash, and refresh. Tests drive the globals directly and restore
+    them via ``addCleanup`` (they are module globals)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def setUp(self):
+        r = self.r
+        self._saved = (r._FS_SORT_KEY, dict(r._FS_SORT_DIR), r._DIRS_FIRST)
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        r = self.r
+        key, dirmap, dirs_first = self._saved
+        r._FS_SORT_KEY = key
+        r._FS_SORT_DIR.clear()
+        r._FS_SORT_DIR.update(dirmap)
+        r._DIRS_FIRST = dirs_first
+
+    def _names(self, rows):
+        return [d.name for d, _st in rows]
+
+    def _sorted(self, rows):
+        """Return the names after ``_sort_rows`` (which sorts in place)."""
+        rows = list(rows)
+        self.r._sort_rows(rows)
+        return self._names(rows)
+
+    # -- defaults ----------------------------------------------------------
+
+    def test_defaults(self):
+        # Fresh: sort by name ascending, directories first.
+        fresh = _load_recipe()
+        self.assertEqual(fresh._FS_SORT_KEY, 'name')
+        self.assertTrue(fresh._FS_SORT_DIR['name'])
+        self.assertFalse(fresh._FS_SORT_DIR['size'])
+        self.assertFalse(fresh._FS_SORT_DIR['mtime'])
+        self.assertTrue(fresh._FS_SORT_DIR['user'])
+        self.assertTrue(fresh._DIRS_FIRST)
+
+    # -- each key orders correctly -----------------------------------------
+
+    def _mixed(self):
+        # Two dirs + three files with distinct names/sizes/mtimes/uids.
+        return [
+            _row('Bravo', is_dir=True,  size=0,    mtime=300.0, uid=10),
+            _row('alpha', is_dir=True,  size=0,    mtime=100.0, uid=30),
+            _row('big.txt',   size=900, mtime=200.0, uid=20),
+            _row('mid.txt',   size=500, mtime=400.0, uid=10),
+            _row('small.txt', size=100, mtime=150.0, uid=30),
+        ]
+
+    def test_name_ascending_default_case_insensitive(self):
+        # Default state: dirs first (alpha < Bravo, case-insensitive), then
+        # files by name asc.
+        self.assertEqual(
+            self._sorted(self._mixed()),
+            ['alpha', 'Bravo', 'big.txt', 'mid.txt', 'small.txt'])
+
+    def test_size_descending(self):
+        # Size key, default direction descending: files big>mid>small. Dirs
+        # first (size 0, tied) → name tie-break, which follows the primary
+        # direction (descending) so the dirs list Bravo before alpha.
+        self.r._FS_SORT_KEY = 'size'
+        self.r._FS_SORT_DIR['size'] = False
+        self.assertEqual(
+            self._sorted(self._mixed()),
+            ['Bravo', 'alpha', 'big.txt', 'mid.txt', 'small.txt'])
+
+    def test_mtime_descending(self):
+        # mtime desc: files newest-first (mid 400 > big 200 > small 150);
+        # dirs first, ordered among themselves by mtime desc (Bravo 300 >
+        # alpha 100).
+        self.r._FS_SORT_KEY = 'mtime'
+        self.r._FS_SORT_DIR['mtime'] = False
+        self.assertEqual(
+            self._sorted(self._mixed()),
+            ['Bravo', 'alpha', 'mid.txt', 'big.txt', 'small.txt'])
+
+    def test_user_ascending_by_resolved_name(self):
+        # User key sorts by the RESOLVED owner name (not the raw uid). Map
+        # the uids to names whose alpha order differs from the numeric order
+        # to prove the resolution path is used.
+        self.r._FS_SORT_KEY = 'user'
+        self.r._FS_SORT_DIR['user'] = True
+        names = {10: 'carol', 20: 'alice', 30: 'bob'}
+        with mock.patch.object(self.r, '_uid_name', side_effect=lambda u: names[u]):
+            ordered = self._sorted(self._mixed())
+        # Dirs first by user asc: alpha(uid30→bob) vs Bravo(uid10→carol) →
+        # bob < carol → alpha, Bravo. Files by user asc:
+        # big(alice) < small(bob) < mid(carol).
+        self.assertEqual(
+            ordered, ['alpha', 'Bravo', 'big.txt', 'small.txt', 'mid.txt'])
+
+    # -- reverse-on-repeat / remembered direction --------------------------
+
+    def test_name_reverses_within_groups_keeping_dirs_first(self):
+        # Name descending: dirs stay first but reversed among themselves
+        # (Bravo > alpha), files reversed too.
+        self.r._FS_SORT_KEY = 'name'
+        self.r._FS_SORT_DIR['name'] = False
+        self.assertEqual(
+            self._sorted(self._mixed()),
+            ['Bravo', 'alpha', 'small.txt', 'mid.txt', 'big.txt'])
+
+    def test_size_ascending_when_reversed(self):
+        self.r._FS_SORT_KEY = 'size'
+        self.r._FS_SORT_DIR['size'] = True   # ascending
+        self.assertEqual(
+            self._sorted(self._mixed()),
+            ['alpha', 'Bravo', 'small.txt', 'mid.txt', 'big.txt'])
+
+    # -- the D toggle: dirs-first vs in-line -------------------------------
+
+    def test_dirs_inline_sorts_dirs_and_files_together(self):
+        # With _DIRS_FIRST off, dirs and files interleave by the active key.
+        # Name asc, all together: alpha, big.txt, Bravo, mid.txt, small.txt.
+        self.r._DIRS_FIRST = False
+        self.r._FS_SORT_KEY = 'name'
+        self.r._FS_SORT_DIR['name'] = True
+        self.assertEqual(
+            self._sorted(self._mixed()),
+            ['alpha', 'big.txt', 'Bravo', 'mid.txt', 'small.txt'])
+
+    def test_dirs_inline_by_size_desc(self):
+        # In-line + size desc: dirs (size 0) sink below the files; ties among
+        # the dirs broken by name, which follows the descending direction
+        # (Bravo before alpha). big(900) > mid(500) > small(100) > [dirs].
+        self.r._DIRS_FIRST = False
+        self.r._FS_SORT_KEY = 'size'
+        self.r._FS_SORT_DIR['size'] = False
+        self.assertEqual(
+            self._sorted(self._mixed()),
+            ['big.txt', 'mid.txt', 'small.txt', 'Bravo', 'alpha'])
+
+    # -- tie-break stability -----------------------------------------------
+
+    def test_equal_primary_values_tie_break_by_name(self):
+        # Several same-size files sort by name (asc) as the tie-break, even
+        # when the primary key is size; reversing the size direction reverses
+        # the tie-break too (descending name) so the order is fully defined.
+        rows = [_row('c.txt', size=10), _row('a.txt', size=10),
+                _row('b.txt', size=10)]
+        self.r._FS_SORT_KEY = 'size'
+        self.r._FS_SORT_DIR['size'] = True            # asc
+        self.assertEqual(self._sorted(rows), ['a.txt', 'b.txt', 'c.txt'])
+        self.r._FS_SORT_DIR['size'] = False           # desc → name desc too
+        self.assertEqual(self._sorted(rows), ['c.txt', 'b.txt', 'a.txt'])
+
+    # -- the action handlers (state + flash + refresh) ---------------------
+
+    def test_set_sort_switch_uses_remembered_direction(self):
+        # Start on name; switching to size adopts size's REMEMBERED direction
+        # (not name's) — the key is activated without flipping it.
+        self.r._FS_SORT_KEY = 'name'
+        self.r._FS_SORT_DIR.update({'name': True, 'size': False})
+        ctx = _ModeCtx()
+        self.r._set_sort(ctx, 'size')
+        self.assertEqual(self.r._FS_SORT_KEY, 'size')
+        self.assertFalse(self.r._FS_SORT_DIR['size'])   # unchanged (remembered)
+        self.assertTrue(self.r._FS_SORT_DIR['name'])    # untouched
+        self.assertEqual(ctx.refreshed, 1)
+        self.assertEqual(len(ctx.flashes), 1)
+        self.assertIn('size', ctx.flashes[0])
+
+    def test_set_sort_active_key_reverses(self):
+        # Pressing the ACTIVE key flips just that key's direction.
+        self.r._FS_SORT_KEY = 'size'
+        self.r._FS_SORT_DIR['size'] = False
+        ctx = _ModeCtx()
+        self.r._set_sort(ctx, 'size')
+        self.assertEqual(self.r._FS_SORT_KEY, 'size')
+        self.assertTrue(self.r._FS_SORT_DIR['size'])    # reversed
+        # Press again → flips back.
+        self.r._set_sort(_ModeCtx(), 'size')
+        self.assertFalse(self.r._FS_SORT_DIR['size'])
+
+    def test_switch_back_restores_each_keys_own_direction(self):
+        # name asc, size reversed to asc (by pressing it twice), then back to
+        # name → name still asc; size remembered as asc.
+        self.r._FS_SORT_KEY = 'name'
+        self.r._FS_SORT_DIR.update({'name': True, 'size': False})
+        self.r._set_sort(_ModeCtx(), 'size')   # active→size, dir flipped? no, switch
+        # switching to size does NOT flip (remembered desc)
+        self.assertFalse(self.r._FS_SORT_DIR['size'])
+        self.r._set_sort(_ModeCtx(), 'size')   # now active → reverse to asc
+        self.assertTrue(self.r._FS_SORT_DIR['size'])
+        self.r._set_sort(_ModeCtx(), 'name')   # switch back to name
+        self.assertEqual(self.r._FS_SORT_KEY, 'name')
+        self.assertTrue(self.r._FS_SORT_DIR['name'])    # name's own dir intact
+        self.r._set_sort(_ModeCtx(), 'size')   # switch to size again
+        self.assertTrue(self.r._FS_SORT_DIR['size'])    # size remembered asc
+
+    def test_toggle_dirs_first_flips_flashes_and_refreshes(self):
+        self.r._DIRS_FIRST = True
+        ctx = _ModeCtx()
+        self.r._toggle_dirs_first(ctx)
+        self.assertFalse(self.r._DIRS_FIRST)
+        self.assertEqual(ctx.refreshed, 1)
+        self.assertEqual(len(ctx.flashes), 1)
+        self.assertIn('off', ctx.flashes[0])
+        ctx2 = _ModeCtx()
+        self.r._toggle_dirs_first(ctx2)
+        self.assertTrue(self.r._DIRS_FIRST)
+        self.assertIn('on', ctx2.flashes[0])
+
+    # -- integration: get_children honours the active sort -----------------
+
+    def test_get_children_applies_active_sort(self):
+        # Drive get_children on a real fixture dir with distinct sizes, and
+        # confirm size-desc reorders the listing (dirs first).
+        with tempfile.TemporaryDirectory() as d:
+            os.mkdir(os.path.join(d, 'zdir'))
+            for name, body in (('big.txt', b'x' * 100),
+                               ('small.txt', b'x'),
+                               ('mid.txt', b'x' * 50)):
+                with open(os.path.join(d, name), 'wb') as f:
+                    f.write(body)
+            self.r._FS_SORT_KEY = 'size'
+            self.r._FS_SORT_DIR['size'] = False   # descending
+            names = [os.path.basename(it.id) for it in self.r.get_children(d)]
+        # Dir first, then files by size desc.
+        self.assertEqual(names, ['zdir', 'big.txt', 'mid.txt', 'small.txt'])
+
+    def test_stdin_roots_are_never_sorted(self):
+        # The stdin-list mode returns the piped paths in INPUT order — the
+        # configurable sort must NOT touch them, even when an aggressive sort
+        # mode is active. (The mode's contract is verbatim input order.)
+        with tempfile.TemporaryDirectory() as d:
+            for name in ('zzz.txt', 'aaa.txt', 'mmm.txt'):
+                with open(os.path.join(d, name), 'w') as f:
+                    f.write('x')
+            cwd = os.getcwd()
+            os.chdir(d)
+            try:
+                self.r._STDIN_ROOTS = [
+                    ('zzz.txt', os.path.join(d, 'zzz.txt')),
+                    ('aaa.txt', os.path.join(d, 'aaa.txt')),
+                    ('mmm.txt', os.path.join(d, 'mmm.txt')),
+                ]
+                self.addCleanup(setattr, self.r, '_STDIN_ROOTS', None)
+                self.r._FS_SORT_KEY = 'name'
+                self.r._FS_SORT_DIR['name'] = True   # name asc — would reorder
+                titles = [it.title for it in self.r.get_children(None)]
+            finally:
+                os.chdir(cwd)
+        # Verbatim input order, NOT sorted (which would be aaa, mmm, zzz).
+        self.assertEqual(titles, ['zzz.txt', 'aaa.txt', 'mmm.txt'])
 
 
 if __name__ == '__main__':

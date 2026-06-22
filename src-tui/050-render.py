@@ -286,10 +286,14 @@ class RowContext:
     (the ``list_width`` passed in is ``0``), matching the ``preview_width``
     contract; recipes wanting a fallback pick one explicitly.
 
-    Method:
+    Methods:
       * ``max_col_width(field, parent_id=None)`` — the max display-cell width
         of a pre-formatted column string across a sibling group (design
         sec C). Cached per parent on ``State``; lazily filled.
+      * ``max_col_width_global(field)`` — the same, but over ALL loaded items
+        (every cached child list), for gutter columns that must align across
+        the whole list regardless of tree depth (design sec A2). Cached
+        per field on ``State``; lazily filled.
     """
 
     __slots__ = (
@@ -353,6 +357,44 @@ class RowContext:
         width = max(
             (cell_width(str(getattr(child, field, '')))
              for child in state._children.get(parent_id, ())),
+            default=0,
+        )
+        cache[field] = width
+        return width
+
+    def max_col_width_global(self, field):
+        """Max display-cell width of ``str(getattr(item, field, ''))`` over
+        ALL loaded items (design sec A2) — the global analog of per-parent
+        :meth:`max_col_width`.
+
+        "Global" means the union of every cached child list: everything
+        currently loaded (hence showable) in the lazy tree, not just one
+        sibling group and not a per-frame visible-set scan. This is what a
+        *gutter* column needs — a column left of the tree indent that must
+        line up across the whole list regardless of each row's depth. As with
+        the per-parent variant, the recipe pre-stores the *display* string it
+        renders on each Item and passes that field name, so what is measured
+        is what is rendered.
+
+        Result is memoised per ``field`` on ``State._col_width_global_cache``
+        and cleared wholesale whenever any loaded child list is dropped,
+        replaced, or mutated (``_col_width_drop`` / ``cache_invalidate_all`` —
+        the same choke points that drop the per-parent cache), since the
+        global max can shift with any parent's children. A cache hit re-scans
+        nothing; a miss is ``O(loaded items)``.
+
+        An item missing ``field`` contributes ``0`` (``getattr`` default
+        ``''``); no loaded items yields ``0``.
+        """
+        state = self._browser._state
+        cache = state._col_width_global_cache
+        cached = cache.get(field)
+        if cached is not None:
+            return cached
+        width = max(
+            (cell_width(str(getattr(item, field, '')))
+             for children in state._children.values()
+             for item in children),
             default=0,
         )
         cache[field] = width

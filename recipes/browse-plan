@@ -718,7 +718,7 @@ def _action_move_under_selected(ctx):
 
 # ---- context menu --------------------------------------------------------
 #
-# Following the committed recipe convention (browse-procs pilot, browse-git /
+# Following the committed recipe convention (browse-ps pilot, browse-git /
 # browse-claude): a PURE ``context_menu_options(ctx)`` builds the ``(label,
 # token)`` rows (opening no modal, so it is unit-testable), a flat ``{token:
 # handler}`` table (``_MENU_ACTIONS``) dispatches the chosen token, and a thin

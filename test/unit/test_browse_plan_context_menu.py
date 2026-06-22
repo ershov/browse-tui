@@ -2,7 +2,7 @@
 
 A browse-plan row is a ticket (a bare ``int`` id); the synthetic Project sits
 at id=0 and the markdown launcher / umbrella rows carry tuple ids. Following
-the committed convention (browse-procs pilot, browse-git / browse-claude) the
+the committed convention (browse-ps pilot, browse-git / browse-claude) the
 option list is a PURE builder, ``context_menu_options(ctx)``, that inspects
 ``ctx.cursor`` / ``ctx.selected`` and returns ``(label, token)`` rows WITHOUT
 opening a modal; a flat ``{token: handler}`` table (``_MENU_ACTIONS``)

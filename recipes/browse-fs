@@ -3,6 +3,16 @@
 or dirs-first directory listing; actions e:Edit ($EDITOR), o:Open (xdg-open), d:Delete
 (with ctx.confirm); background mtime watcher refreshes changed dirs.
 
+The number keys 1/2/3 pick the display mode — which columns the left gutter
+shows: 1 = name only (empty gutter, like ``ls -1``), 2 = perms · size · date
+(the default), 3 = + user · group (owner / group, resolved via pwd/grp).
+
+The capital keys N/S/T/U sort each directory's children — by name, size,
+date (mtime), or user (resolved owner name). Pressing the active sort key
+reverses its direction; each key remembers its own last direction. ``D``
+toggles whether directories group before files (the default) or sort in-line
+with files by the active key.
+
 A right-click (or the backslash / F1 keys) opens a context menu keyed to the
 cursor row's kind — a directory (run shell here, a ``git`` submenu opening
 browse-git by mode when it is a repo, new file / directory, show full path,
@@ -36,7 +46,9 @@ Usage:  browse-fs [PATH | -]   # no argument ⇒ the current directory
                                # (or stdin, when piped).
 """
 
+import grp
 import os
+import pwd
 import shutil
 import stat
 import subprocess
@@ -45,7 +57,8 @@ import time
 
 from browse_tui import (
     Action, Browser, BrowserConfig, Item,
-    cell_ljust, cell_rjust, default_row_content, recipe_argv, style,
+    cell_ljust, cell_rjust, default_row_expander, default_row_indent,
+    default_row_selection, recipe_argv, style,
 )
 
 # Probe ``delta`` once at load (not per render): the context-menu "Diff" entry
@@ -76,6 +89,36 @@ except Exception:
 # File extensions that get a markdown launcher subtree.
 _MD_EXTS = ('.md', '.MD')
 
+# Display mode (number keys 1/2/3) — selects which column set the LEFT gutter
+# (``fs_chrome`` / ``_fs_gutter_segments``) renders:
+#   1 = name only          → EMPTY gutter (mimics ``ls -1``)
+#   2 = perms · size · date → the default set
+#   3 = perms · size · date · user · group
+# Switched by the ``1`` / ``2`` / ``3`` Actions (``_set_display_mode``), each
+# flashing the mode and refreshing. The column STRINGS are always computed in
+# ``_set_columns`` (incl. col_user / col_group); the mode only gates which are
+# shown, so switching is a pure re-render — no refetch of the listing needed.
+_DISPLAY_MODE = 2
+
+# Sort mode (capital keys N/S/T/U, htop-style) — orders each directory's
+# children in ``get_children``. ``_FS_SORT_KEY`` is the active field;
+# ``_FS_SORT_DIR`` remembers a direction PER KEY (each key's last
+# ascending/descending choice), so switching back to a key restores how it
+# was last sorted, while pressing the ACTIVE key just reverses it. ``True`` =
+# ascending. The defaults match the spec (name asc, size/mtime desc, user
+# asc); name's ascending default also preserves the historical ordering.
+#   N → name (asc, case-insensitive)   S → size (desc)
+#   T → mtime (desc)                   U → user (asc, by resolved owner name)
+# ``_DIRS_FIRST`` (the ``D`` toggle) groups directories before files (the
+# historical behaviour, default on); off sorts dirs and files together
+# in-line by the active key. Switched by ``_set_sort`` / ``_toggle_dirs_first``
+# (flash + refresh); browse-fs is always a tree, so the sort applies WITHIN
+# each directory's children — never to the stdin-list roots, which stay in
+# verbatim input order (the mode's contract).
+_FS_SORT_KEY = 'name'
+_FS_SORT_DIR = {'name': True, 'size': False, 'mtime': False, 'user': True}
+_DIRS_FIRST = True
+
 # Stdin-list mode (the ``browse-fs -`` argument). ``main()`` reads the
 # newline-separated paths from ``sys.stdin`` once, before the UI starts,
 # and stores them here as a list of ``(label, abspath)`` pairs in input
@@ -96,6 +139,39 @@ def human_size(n):
     return f'{n}P'
 
 
+# Per-uid / per-gid name caches. A filesystem listing is dozens of rows (not
+# the thousands of processes browse-ps faces), so resolving every row's owner /
+# group via ``pwd`` / ``grp`` is fine here — and unlike a numeric pid there is
+# no other source for the name. A passwd/group lookup that misses (``KeyError``
+# — e.g. a uid with no entry) falls back to the numeric id as a string.
+_UID_NAMES = {}
+_GID_NAMES = {}
+
+
+def _uid_name(uid):
+    """Resolve ``uid`` to an owner name (cached); numeric string on miss."""
+    name = _UID_NAMES.get(uid)
+    if name is None:
+        try:
+            name = pwd.getpwuid(uid).pw_name
+        except KeyError:
+            name = str(uid)
+        _UID_NAMES[uid] = name
+    return name
+
+
+def _gid_name(gid):
+    """Resolve ``gid`` to a group name (cached); numeric string on miss."""
+    name = _GID_NAMES.get(gid)
+    if name is None:
+        try:
+            name = grp.getgrgid(gid).gr_name
+        except KeyError:
+            name = str(gid)
+        _GID_NAMES[gid] = name
+    return name
+
+
 def _is_dir(dirent):
     try:
         return dirent.is_dir(follow_symlinks=False)
@@ -104,17 +180,25 @@ def _is_dir(dirent):
 
 
 def _set_columns(item, st, is_dir):
-    """Attach the perms / size / mtime display columns from a stat result.
+    """Attach the perms / size / mtime / user / group display columns from a stat.
 
     Shared by the directory-scan rows and the stdin-list roots so both
     render identical metadata columns. ``st`` is a no-follow stat (the
     row describes the entry itself, e.g. a symlink, not its target).
+
+    All five columns are computed here regardless of the active display mode;
+    ``_fs_gutter_segments`` decides which to render (mode 1 = none, mode 2 =
+    perms/size/date, mode 3 = + user/group). user / group resolve ``st``'s
+    numeric ``st_uid`` / ``st_gid`` through the cached ``_uid_name`` /
+    ``_gid_name`` (numeric-string fallback when unresolved).
     """
     # Size moved out of the `tag` chip into the col_size column; rows
-    # carry no tag now (fs_row_content renders the metadata columns).
+    # carry no tag now (fs_chrome renders the metadata columns in the gutter).
     item.col_perms = stat.filemode(st.st_mode)
     item.col_size = '' if is_dir else human_size(st.st_size)
     item.col_mtime = time.strftime('%b %d %H:%M', time.localtime(st.st_mtime))
+    item.col_user = _uid_name(st.st_uid)
+    item.col_group = _gid_name(st.st_gid)
 
 
 def _stdin_root_item(label, path):
@@ -205,6 +289,77 @@ def _md_launcher_children(path):
     return rows
 
 
+# The per-key sort-value extractor: maps each ``_FS_SORT_KEY`` to a function
+# of the no-follow ``stat`` and entry name producing the comparison value.
+# ``name`` is lower-cased (case-insensitive); the others read straight from
+# the stat. ``user`` resolves the numeric uid through the cached ``_uid_name``
+# so it sorts by the displayed owner name (the same string display mode 3
+# shows), not the raw number.
+_FS_SORT_VALUES = {
+    'name':  lambda st, name: name.lower(),
+    'size':  lambda st, name: st.st_size,
+    'mtime': lambda st, name: st.st_mtime,
+    'user':  lambda st, name: _uid_name(st.st_uid).lower(),
+}
+
+
+class _Rev:
+    """Reverse-ordering wrapper: ``sort`` ascends, this descends a sub-key.
+
+    Wraps the (value, name) tuple so a per-key descending direction reverses
+    BOTH the primary value and the name tie-break, while the dirs-first
+    ``not is_dir`` group term (placed outside it) keeps ascending — so dirs
+    stay grouped first regardless of the active key's direction. Avoids
+    ``reverse=True`` (which would also flip the group term and un-group the
+    listing) and the negate-the-value trick (which doesn't work for the
+    string ``name`` / ``user`` keys)."""
+
+    __slots__ = ('v',)
+
+    def __init__(self, v):
+        self.v = v
+
+    def __lt__(self, other):
+        return other.v < self.v
+
+    def __eq__(self, other):
+        return self.v == other.v
+
+
+def _sort_rows(rows):
+    """Sort ``(dirent, stat)`` pairs in place by the active sort mode.
+
+    The configurable replacement for the old fixed ``(not is_dir,
+    name.lower())`` key. The active key (``_FS_SORT_KEY``) picks the
+    comparison value via ``_FS_SORT_VALUES``; ``_FS_SORT_DIR`` gives its
+    direction (ascending when ``True``). Name is always the final tie-break
+    so the order is stable / deterministic even when the primary values are
+    equal (e.g. several same-size or same-mtime files); a descending
+    direction reverses the tie-break too (via ``_Rev``) so the order stays
+    fully defined.
+
+    When ``_DIRS_FIRST`` is on (the default), directories group before files
+    — each group then internally ordered by the active key; off, directories
+    and files are ordered together in-line by the key. The dirs-first split
+    is a leading ``not is_dir`` term that is NOT reversed by the direction
+    flag (only the active-key value and the name tie-break are), so flipping
+    the direction reorders within each group without un-grouping it.
+    """
+    value = _FS_SORT_VALUES[_FS_SORT_KEY]
+    ascending = _FS_SORT_DIR[_FS_SORT_KEY]
+
+    def key(row):
+        d, st = row
+        primary = (value(st, d.name), d.name.lower())
+        if not ascending:
+            primary = _Rev(primary)
+        if _DIRS_FIRST:
+            return (not stat.S_ISDIR(st.st_mode), primary)
+        return (primary,)
+
+    rows.sort(key=key)
+
+
 def get_children(path, *, reload=False):
     # Root level in stdin-list mode (``browse-fs -``): serve the paths
     # read from stdin verbatim, in order, instead of scanning a dir.
@@ -224,13 +379,20 @@ def get_children(path, *, reload=False):
     except OSError as e:
         return [Item(id=('err', path), title=f'[error] {e}',
                      tag='err', tag_style='red')]
-    entries.sort(key=lambda d: (not _is_dir(d), d.name.lower()))
-    items = []
+    # Stat every entry first (an unstattable entry is dropped, as before),
+    # then sort the (dirent, stat) pairs by the active mode — the sort keys
+    # (size / mtime / user) come from the same no-follow stat the columns do,
+    # so they need the stat already taken.
+    rows = []
     for d in entries:
         try:
             st = d.stat(follow_symlinks=False)
         except OSError:
             continue
+        rows.append((d, st))
+    _sort_rows(rows)
+    items = []
+    for d, st in rows:
         is_dir = stat.S_ISDIR(st.st_mode)
         title = d.name + ('/' if is_dir else '')
         item = Item(id=d.path, title=title,
@@ -240,35 +402,67 @@ def get_children(path, *, reload=False):
     return items
 
 
-def fs_row_content(item, ctx):
-    """Columnar content: perms | size | mtime | name (flexible, last).
+def _fs_gutter_segments(item, ctx):
+    """The active display mode's gutter columns for a normal row.
 
-    Each metadata column is left/right-justified to the widest sibling
-    value (``ctx.max_col_width`` over the row's parent group) and rendered
-    dim; the title comes LAST so a narrow pane truncates the name rather
-    than the metadata. Error / synthetic rows (no ``col_perms``) fall back
-    to the framework default content. Only the content region is taken
-    over — chrome (tree indent + ▼/▶) stays framework-owned.
+    Gated by ``_DISPLAY_MODE`` (the ``1`` / ``2`` / ``3`` keys):
+      * mode 1 → ``[]`` (an EMPTY gutter — name only, like ``ls -1``);
+      * mode 2 → perms · size · date;
+      * mode 3 → perms · size · date · user · group.
+
+    Each column is left/right-justified to its GLOBAL width
+    (``ctx.max_col_width_global`` over ALL loaded items, not just the row's
+    siblings) so the gutter lines up across the whole list regardless of
+    tree depth — a deep row's perms align under a shallow row's perms.
+    Rendered dim, with a two-space gap after each column (matching the old
+    content layout). Returns a list so it concatenates with the chrome atoms.
     """
-    if getattr(item, 'col_perms', None) is None:
-        return default_row_content(item, ctx)    # error/synthetic row
-    w = ctx.max_col_width
+    if _DISPLAY_MODE == 1:
+        return []
+    gw = ctx.max_col_width_global
     dfg, dbold = style('dim')
-    return [
-        (cell_ljust(item.col_perms, w('col_perms')) + '  ', dfg, dbold),
-        (cell_rjust(item.col_size,  w('col_size'))  + '  ', dfg, dbold),
-        (cell_ljust(item.col_mtime, w('col_mtime')) + '  ', dfg, dbold),
-        (item.title, None, False),        # flexible column, last
+    segs = [
+        (cell_ljust(item.col_perms, gw('col_perms')) + '  ', dfg, dbold),
+        (cell_rjust(item.col_size,  gw('col_size'))  + '  ', dfg, dbold),
+        (cell_ljust(item.col_mtime, gw('col_mtime')) + '  ', dfg, dbold),
     ]
+    if _DISPLAY_MODE == 3:
+        segs.extend([
+            (cell_ljust(item.col_user,  gw('col_user'))  + '  ', dfg, dbold),
+            (cell_ljust(item.col_group, gw('col_group')) + '  ', dfg, dbold),
+        ])
+    return segs
+
+
+def fs_chrome(item, ctx):
+    """Row chrome with the perms/size/date columns in a LEFT gutter.
+
+    Order: ``selection, <gutter: perms size date>, indent, expander`` — the
+    gutter sits between the selection marker and the tree indent, so the
+    metadata columns stay fixed at the left edge instead of shifting right
+    with tree depth (the default content then renders the name as the
+    flexible last segment, truncating at the pane edge).
+
+    Error / synthetic rows (no ``col_perms``) emit an EMPTY gutter — just the
+    default chrome atoms — so the default content renders the error/tag row
+    normally.
+    """
+    chrome = default_row_selection(item, ctx)
+    if getattr(item, 'col_perms', None) is not None:
+        chrome += _fs_gutter_segments(item, ctx)
+    chrome += default_row_indent(item, ctx)
+    chrome += default_row_expander(item, ctx)
+    return chrome
 
 
 def _dir_listing(path):
-    """Plain-text directory listing matching the children view ordering.
+    """Plain-text directory listing for the preview pane.
 
-    Directories first, then files, sorted case-insensitively by name
-    (the same ``(not _is_dir, name.lower())`` key ``get_children`` uses),
-    with a ``/`` suffix on directory names. Capped at ~200 entries. This
-    is just the preview pane — no perms/size/mtime columns.
+    Directories first, then files, sorted case-insensitively by name — a
+    fixed ordering, independent of the list's active sort mode (the preview
+    is a quick at-a-glance listing, not the columnar children view), with a
+    ``/`` suffix on directory names. Capped at ~200 entries. No
+    perms/size/mtime columns.
     """
     entries = sorted(os.scandir(path),
                      key=lambda d: (not _is_dir(d), d.name.lower()))
@@ -313,6 +507,66 @@ def toggle_md(ctx):
     _MD_COLOR = not _MD_COLOR
     ctx.drop_preview_cache()
     ctx.flash(f'md preview: {"colored" if _MD_COLOR else "raw"}')
+
+
+# One-line labels for each display mode, used in the switch flash.
+_MODE_LABELS = {
+    1: 'name only',
+    2: 'perms · size · date',
+    3: 'perms · size · date · user · group',
+}
+
+
+def _set_display_mode(ctx, mode):
+    """Switch the gutter column set to ``mode`` (1/2/3), flash it, and refresh.
+
+    The mode only changes which columns ``_fs_gutter_segments`` emits (the
+    strings are already on every item), so a refresh is enough to repaint the
+    gutter at the new widths.
+    """
+    global _DISPLAY_MODE
+    _DISPLAY_MODE = mode
+    ctx.flash(f'display: {_MODE_LABELS[mode]}')
+    ctx.refresh()
+
+
+# Human-readable name for each sort key, used in the switch flash.
+_SORT_LABELS = {
+    'name': 'name',
+    'size': 'size',
+    'mtime': 'date',
+    'user': 'user',
+}
+
+
+def _set_sort(ctx, key):
+    """Activate sort ``key`` (one of name/size/mtime/user), flash, and refresh.
+
+    Pressing the ACTIVE key reverses its direction; switching to a different
+    key adopts that key's REMEMBERED direction (``_FS_SORT_DIR``) — so each
+    key keeps its own last ascending/descending choice. The sort happens in
+    ``get_children`` (``_sort_rows``), so a ``ctx.refresh()`` re-lists every
+    cached directory at the new order.
+    """
+    global _FS_SORT_KEY
+    if key == _FS_SORT_KEY:
+        _FS_SORT_DIR[key] = not _FS_SORT_DIR[key]
+    _FS_SORT_KEY = key
+    arrow = '↑' if _FS_SORT_DIR[key] else '↓'
+    ctx.flash(f'sort: {_SORT_LABELS[key]} {arrow}')
+    ctx.refresh()
+
+
+def _toggle_dirs_first(ctx):
+    """Toggle directories-first vs. directories in-line with files; flash + refresh.
+
+    On (the default) groups directories before files, each group sorted by the
+    active key; off sorts directories and files together in-line by the key.
+    """
+    global _DIRS_FIRST
+    _DIRS_FIRST = not _DIRS_FIRST
+    ctx.flash(f'dirs first: {"on" if _DIRS_FIRST else "off"}')
+    ctx.refresh()
 
 
 def edit(ctx):
@@ -370,7 +624,7 @@ def delete(ctx):
 
 # ---- context menu --------------------------------------------------------
 #
-# Following the committed convention (browse-procs / git / claude / md / plan):
+# Following the committed convention (browse-ps / git / claude / md / plan):
 # a PURE ``context_menu_options(ctx)`` builds the ``(label, token)`` rows by the
 # CURSOR ITEM'S KIND (opening no modal, so it is unit-testable), a flat
 # ``{token: handler}`` table (``_MENU_ACTIONS``) dispatches the chosen token,
@@ -870,6 +1124,15 @@ heads or directory listings. The selection / cursor seeds $TUI_IDS_FILE
 for the actions below; mtime changes refresh the affected directory
 automatically. Press Enter (or 'e') to open the cursor row in $EDITOR.
 
+The number keys 1/2/3 select the display mode (which columns the left
+gutter shows): 1 = name only (empty gutter, like 'ls -1'), 2 = perms,
+size, date (the default), 3 = + user and group (owner / group names).
+
+The capital keys N/S/T/U sort each directory's children by name, size,
+date, or user (resolved owner name); pressing the active sort key reverses
+it, and each key remembers its own direction. 'D' toggles whether
+directories group before files (the default) or sort in-line with them.
+
 A markdown file (*.md / *.MD) gets an expansion arrow: open it to list
 '[md ↗]' launcher rows — the document itself and the .md files it links
 to — and press Enter on one to open that file in browse-md.
@@ -948,6 +1211,17 @@ def main():
         Action('e', 'Edit cursor in $EDITOR',     edit,   'cursor'),
         Action('o', 'Open with xdg-open',         open_,  'targets'),
         Action('d', 'Delete (with confirmation)', delete, 'targets'),
+        # Display modes — the gutter column set (see ``_fs_gutter_segments``).
+        Action('1', 'Display: name only',         lambda c: _set_display_mode(c, 1), 'none'),
+        Action('2', 'Display: perms/size/date',   lambda c: _set_display_mode(c, 2), 'none'),
+        Action('3', 'Display: + user/group',      lambda c: _set_display_mode(c, 3), 'none'),
+        # Sort modes (capitals) — reorder each directory's children. Pressing
+        # the active key reverses it; ``D`` toggles directories-first.
+        Action('N', 'Sort by name',  lambda c: _set_sort(c, 'name'),  'none'),
+        Action('S', 'Sort by size',  lambda c: _set_sort(c, 'size'),  'none'),
+        Action('T', 'Sort by date',  lambda c: _set_sort(c, 'mtime'), 'none'),
+        Action('U', 'Sort by user',  lambda c: _set_sort(c, 'user'),  'none'),
+        Action('D', 'Toggle directories-first', _toggle_dirs_first,   'none'),
     ]
     if _md2ansi_fn is not None:
         actions.append(Action('m', 'Toggle markdown coloring', toggle_md, 'none'))
@@ -957,7 +1231,7 @@ def main():
         show_children_pane=False,
         get_children=get_children,
         get_preview=get_preview,
-        format_row_content=fs_row_content,
+        format_row_chrome=fs_chrome,
         root_id=root,
         actions=actions,
         on_enter=_on_enter,

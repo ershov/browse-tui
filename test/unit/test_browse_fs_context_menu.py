@@ -4,7 +4,7 @@ browse-fs items are absolute paths: a ``str`` id is a real file/directory
 (distinguished by ``os.path.isdir``), while a tuple id is a synthetic row —
 ``('missing', label, path)`` / ``('err', path)`` / ``('launch', …)``. The
 context menu branches on that kind. Following the committed convention
-(browse-procs / git / claude / md / plan) the option list is a PURE builder,
+(browse-ps / git / claude / md / plan) the option list is a PURE builder,
 ``context_menu_options(ctx)``, that inspects ``ctx.cursor`` / ``ctx.selected``
 and returns ``(label, token)`` rows WITHOUT opening a modal; a flat
 ``{token: handler}`` table (``_MENU_ACTIONS``) dispatches the chosen token.
@@ -70,7 +70,9 @@ def _stub_browse_tui():
     mod.cell_ljust = lambda s, width, fill=' ': s.ljust(width, fill)
     mod.cell_rjust = lambda s, width, fill=' ': s.rjust(width, fill)
     mod.style = lambda name: (None, False)
-    mod.default_row_content = lambda item, ctx: []
+    mod.default_row_selection = lambda item, ctx: []
+    mod.default_row_indent = lambda item, ctx: []
+    mod.default_row_expander = lambda item, ctx: []
     mod.recipe_argv = lambda: []
     sys.modules['browse_tui'] = mod
 

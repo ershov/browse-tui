@@ -208,6 +208,20 @@ _revs = []       # positional revisions scoping commits mode
 _paths = []      # positional pathspecs scoping commits mode
 _all_branches = False  # --all — span the commits log over every local branch
 
+# Detail-display mode (number keys 1/2/3) — selects which LEADING columns
+# ``git_row_content`` emits before the graph/chips/subject (mirrors
+# browse-fs):
+#   3 = sha · author · date · subject (default, full metadata)
+#   2 = sha · subject               (drop author + date)
+#   1 = subject only                (drop sha + author + date)
+# Switched by the ``1`` / ``2`` / ``3`` Actions (``_set_display_mode``), each
+# flashing the mode and refreshing. The column STRINGS are always stored on
+# every commit Item; the mode only gates which leading columns are shown, so
+# switching is a pure re-render — no refetch of the log needed. The commit
+# graph column (``_tree_mode`` / ``t``) is INDEPENDENT of this mode and still
+# emitted in every display mode when graph mode is on.
+_DISPLAY_MODE = 3
+
 # ``browse-git -`` (stdin) state, set once by ``_ingest_stdin`` before the
 # Browser launches. ``_STDIN_KIND`` doubles as the mode flag: ``None`` is
 # the normal repo mode; 'diff' / 'log' / 'status' select the stdin root
@@ -1731,25 +1745,43 @@ def _commit_graph_items(revs, paths, ns):
     return items
 
 
+# Leading-column field names per display mode (1/2/3), in render order. The
+# SINGLE source of truth shared by ``git_row_content``'s commit-row emission
+# and its filler-row pad, so the two can never drift: the commit row emits a
+# column per field, and the filler row blank-pads the same fields' widths so
+# the graph art lines up under the commit rows' graph column in every mode.
+_LEAD_FIELDS = {
+    3: ('col_sha', 'col_author', 'col_date'),
+    2: ('col_sha',),
+    1: (),
+}
+
+
 def git_row_content(item, ctx):
     """Columnar content for commit rows: sha | author | date | [graph] | subject.
 
-    Each leading column (short sha yellow, author + relative date dim) is
-    left-justified to the widest sibling value (``ctx.max_col_width`` over
-    the row's parent group; commits are flat under one parent, so that is a
-    global alignment) and followed by a two-space gap. In tree mode the
-    commit's ``col_graph`` art follows the date column; then the ``%D``
-    decoration chips, then the subject (the title) LAST so a narrow pane
-    truncates the subject rather than the metadata columns.
+    The LEADING columns (short sha yellow, author + relative date dim) are
+    gated by ``_DISPLAY_MODE`` (the ``1`` / ``2`` / ``3`` keys, see
+    ``_LEAD_FIELDS``): mode 3 emits sha+author+date, mode 2 just sha, mode 1
+    none. Each emitted column is left-justified to the widest sibling value
+    (``ctx.max_col_width`` over the row's parent group; commits are flat
+    under one parent, so that is a global alignment) and followed by a
+    two-space gap. The commit graph column is INDEPENDENT of the display
+    mode: in tree mode the commit's ``col_graph`` art follows the leading
+    columns in EVERY mode; then the ``%D`` decoration chips, then the subject
+    (the title) LAST so a narrow pane truncates the subject rather than the
+    metadata columns.
 
     Commit rows and the synthetic worktree-group rows carry ``col_sha``
     (the groups leave it empty so their label aligns under the commit
     subjects); worktree-group rows have no ``col_graph``, so in tree mode
-    their label simply follows the date column.
+    their label simply follows the leading columns.
 
     A tree-mode FILLER row carries ``col_graph`` but no ``col_sha``: it
-    renders a single blank pad spanning the sha+author+date columns (so its
-    art lines up under the commit rows' graph column) followed by its art.
+    renders a single blank pad spanning the active mode's leading columns
+    (so its art lines up under the commit rows' graph column in every mode)
+    followed by its art. The pad and the commit-row leading columns both
+    derive from ``_LEAD_FIELDS`` so they cannot drift.
 
     Every other row kind (status/stash/ref/file/reflog and the synthetic
     error / "clean" / "no stashes" rows) carries neither and falls back to
@@ -1765,22 +1797,27 @@ def git_row_content(item, ctx):
     are zero-width (``cell_width`` strips them), so the columns stay aligned.
     """
     w = ctx.max_col_width
+    lead = _LEAD_FIELDS[_DISPLAY_MODE]   # active leading columns, in order
     if getattr(item, 'col_sha', None) is None:
         graph = getattr(item, 'col_graph', None)
         if graph is None:
             return default_row_content(item, ctx)   # non-commit / synthetic row
-        # Filler row: blank-pad the sha+author+date span, then the coloured
-        # art (git's own SGR -> fg=None so it shows through).
-        pad = (w('col_sha') + 2 + w('col_author') + 2 + w('col_date') + 2)
+        # Filler row: blank-pad the active mode's leading columns (same fields
+        # the commit rows emit, so the art lines up under their graph column),
+        # then the coloured art (git's own SGR -> fg=None so it shows through).
+        pad = sum(w(field) + 2 for field in lead)
         return [(' ' * pad, None, False), (graph, None, False)]
     yfg, ybold = style('yellow')
     dfg, dbold = style('dim')
+    # Short sha is yellow; author + date are dim. Only the active mode's
+    # leading columns are emitted, padded to their global width + 2-space gap.
+    col_style = {'col_sha': (yfg, ybold)}
     segments = [
-        (cell_ljust(item.col_sha, w('col_sha')) + '  ', yfg, ybold),
-        (cell_ljust(item.col_author, w('col_author')) + '  ', dfg, dbold),
-        (cell_ljust(item.col_date, w('col_date')) + '  ', dfg, dbold),
+        (cell_ljust(getattr(item, field), w(field)) + '  ',
+         *col_style.get(field, (dfg, dbold)))
+        for field in lead
     ]
-    # Commit graph art (tree mode) between the date column and the chips —
+    # Commit graph art (tree mode) between the leading columns and the chips —
     # git's own ANSI colour, so fg=None lets its SGR show through. git
     # closes each coloured connector with a reset, so the appended gap space
     # is uncoloured; rule-3 adds a trailing reset besides.
@@ -2326,6 +2363,27 @@ def toggle_md(ctx):
     ctx.flash(f'message coloring: {"colored" if _MD_COLOR else "raw"}')
 
 
+# One-line labels for each display mode, used in the switch flash.
+_MODE_LABELS = {
+    3: 'sha · author · date · subject',
+    2: 'sha · subject',
+    1: 'subject only',
+}
+
+
+def _set_display_mode(ctx, mode):
+    """Switch the leading-column set to ``mode`` (1/2/3), flash it, and refresh.
+
+    The mode only changes which leading columns ``git_row_content`` emits (the
+    strings are already on every commit Item), so a refresh is enough to
+    repaint the rows at the new widths — no refetch of the log needed.
+    """
+    global _DISPLAY_MODE
+    _DISPLAY_MODE = mode
+    ctx.flash(f'display: {_MODE_LABELS[mode]}')
+    ctx.refresh()
+
+
 def toggle_tree(ctx):
     """``t`` — flip the commit-graph column (``--tree``); re-list the root.
 
@@ -2385,7 +2443,7 @@ def _on_resize(ctx, cols, rows):
 # ---- context menu --------------------------------------------------------
 #
 # A right-click / `` ` ``-F1 menu over the cursor's git object, branching on
-# its KIND (``id[0]``). Following the pilot convention (browse-procs): a PURE
+# its KIND (``id[0]``). Following the pilot convention (browse-ps): a PURE
 # ``context_menu_options(ctx)`` builds the ``(label, token)`` rows by kind
 # (opening no modal, so it is unit-testable), a flat ``{token: handler}`` table
 # (``_MENU_ACTIONS``) dispatches the chosen token, and a thin
@@ -3207,6 +3265,10 @@ def main():
     actions = [
         Action('`', 'Switch view mode', switch_mode, 'none'),
         Action('t', 'Toggle commit graph (--tree)', toggle_tree, 'none'),
+        # Detail-display modes — the leading column set (see ``_LEAD_FIELDS``).
+        Action('1', 'Display: subject only', lambda c: _set_display_mode(c, 1), 'none'),
+        Action('2', 'Display: sha + subject', lambda c: _set_display_mode(c, 2), 'none'),
+        Action('3', 'Display: sha/author/date', lambda c: _set_display_mode(c, 3), 'none'),
         Action('E', 'Edit working-tree file in $EDITOR', edit_file, 'cursor'),
     ]
     if _md2ansi_fn is not None:

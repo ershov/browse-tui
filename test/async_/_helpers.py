@@ -36,6 +36,14 @@ Pending = _state.Pending
 State = _state.State
 Item = _data.Item
 Context = _context.Context
+# Op constructors (+ the KEEP_PARENT sentinel) from the SAME state module the
+# Browser above uses, so ops built with these interoperate with this Browser's
+# ``apply_ops`` (sentinel identity matters — a separate isolated load of
+# 040-state.py has its own distinct ``KEEP_PARENT``).
+mod = _state.mod
+upsert = _state.upsert
+remove = _state.remove
+KEEP_PARENT = _state.KEEP_PARENT
 # Default row-format handlers (design sec A) — tests assert the hooks bind
 # to these in ``Browser.__init__`` when left unset.
 default_row_chrome = _state.default_row_chrome

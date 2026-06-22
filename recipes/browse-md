@@ -1908,7 +1908,7 @@ def _on_expand(ctx, ids):
 #
 # A right-click / `` ` ``-F1 menu over the cursor's row, branching on its KIND
 # (the tagged-tuple tag ``id[0]`` plus arity). Following the committed
-# convention (browse-procs the pilot, browse-git / browse-claude the rich
+# convention (browse-ps the pilot, browse-git / browse-claude the rich
 # multi-kind cases): a PURE ``context_menu_options(ctx)`` builds the
 # ``(label, token)`` rows by kind (opening no modal, so it is unit-testable), a
 # flat ``{token: handler}`` table (``_MENU_ACTIONS``) dispatches the chosen

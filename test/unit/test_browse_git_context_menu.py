@@ -3,7 +3,7 @@
 browse-git is the richest recipe — every row id is a tagged tuple whose
 ``id[0]`` names the KIND (``commit`` / ``file`` / ``ref`` / ``status`` /
 ``stash`` / ``reflog``), and the context menu branches on it. Following the
-pilot convention (browse-procs, ticket #1033) the option list is a PURE
+pilot convention (browse-ps, ticket #1033) the option list is a PURE
 builder, ``context_menu_options(ctx)``, that inspects ``ctx.cursor`` and
 returns ``(label, token)`` rows WITHOUT opening a modal; a flat
 ``{token: handler}`` table (``_MENU_ACTIONS``) dispatches the chosen token.
@@ -22,7 +22,7 @@ can't drift from git's behaviour.
 The recipe is a ``--run-py`` script that imports ``browse_tui`` (only a real
 module when the binary loads it), so we stub ``browse_tui`` in ``sys.modules``
 and load the extension-less recipe via ``SourceFileLoader`` — the same pattern
-as ``test/unit/test_browse_git.py`` / ``test_browse_procs.py``.
+as ``test/unit/test_browse_git.py`` / ``test_browse_ps.py``.
 """
 
 import importlib.util

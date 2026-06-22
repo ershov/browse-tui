@@ -616,7 +616,7 @@ from browse_tui import Browser, Item, Action
 `browse-tui --run-py /path/to/script ARGS…`. Make the file `chmod +x`
 and run it directly. This is how the shipped `recipes/browse-fs`,
 `recipes/browse-plan`, `recipes/browse-claude`, `recipes/browse-git`,
-`recipes/browse-jira`, and `recipes/browse-procs` work.
+`recipes/browse-jira`, and `recipes/browse-ps` work.
 
 In recipe mode the data-source flags (`--children-cmd`, `--root-cmd`,
 `--input`, …) are not accepted on the binary — the recipe is fully in
