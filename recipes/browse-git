@@ -526,6 +526,35 @@ def _repo_root():
     return result.stdout.strip() if result.returncode == 0 else ''
 
 
+def _shell_cwd(item_id):
+    """Directory a "Run shell here" should open in for the cursor row.
+
+    A ``('worktree', abspath, …)`` row (the only "a worktree" kind) opens its
+    own working directory; every other row opens the repo's work-tree root
+    (``'.'`` when outside a repo / gitless, so the shell still launches).
+    """
+    if (isinstance(item_id, tuple) and len(item_id) >= 2
+            and item_id[0] == 'worktree'):
+        return item_id[1]
+    return _repo_root() or '.'
+
+
+def _run_shell(ctx, cwd):
+    """Open an interactive ``$SHELL`` with ``cwd`` as the working directory.
+
+    ``ctx.run_external`` has no ``cwd`` knob, so the directory change rides in a
+    shell-string command (run via ``sh -c``): ``cd <dir> && exec <$SHELL> -l
+    -i``. ``exec`` replaces the wrapping ``sh`` with the user's shell so signals
+    / the exit code pass through; ``-l -i`` makes it a login interactive shell
+    that loads the same startup files (and thus the real prompt) as the user's
+    normal terminal. ``$SHELL`` defaults to ``sh`` and may carry args
+    (``bash --login``), which the shell-string honours verbatim.
+    """
+    import shlex
+    shell = os.environ.get('SHELL') or 'sh'
+    ctx.run_external(f'cd {shlex.quote(cwd)} && exec {shell} -l -i')
+
+
 def _blob_text(rev, path):
     """Contents of ``path`` at ``rev`` (``git show rev:path``), or ``None``.
 
@@ -3154,6 +3183,7 @@ _MENU_ACTIONS = {
     'reflog.show':     lambda c, i: _cm_reflog_show(c, i[2]),
     'reflog.sha':      lambda c, i: c.alert(i[2], title='commit'),
     # anywhere
+    'shell.here':      lambda c, i: _run_shell(c, _shell_cwd(i)),
     'mode.switch':     lambda c, i: switch_mode(c),
 }
 
@@ -3165,11 +3195,12 @@ def context_menu_options(ctx):
     tuple, so this is a flat dispatch with direct field access. A ``.md`` /
     ``.PLAN.md`` row, a worktree-group (``wc``) row, a piped-diff row, and the
     synthetic sentinel / filler / error rows have no per-kind menu; for those
-    (and a cursor on nothing) only the shared "Switch mode" row is offered.
+    (and a cursor on nothing) only the shared trailing rows are offered.
 
-    Every menu ends with a ``Switch mode ▸`` row that reuses the `` ` ``
-    mode-switch action — so its label carries the `` ` `` hotkey hint per the
-    convention. The token half is dispatched by ``_MENU_ACTIONS`` /
+    Every menu ends with a shared "Run shell here" row and a ``Switch mode ▸``
+    row (the latter reuses the `` ` `` mode-switch action, so its label carries
+    the `` ` `` hotkey hint per the convention). The token half is dispatched
+    by ``_MENU_ACTIONS`` /
     ``on_context_menu``; the kind-specific rows come from the
     ``context_menu_<kind>`` builders. A file/status/stash leaf that is also a
     markdown launcher anchor still gets its file/status/stash menu — the menu
@@ -3198,10 +3229,12 @@ def context_menu_options(ctx):
             rows = context_menu_stash(ctx, item_id)
         elif kind == 'reflog' and len(item_id) == 3:
             rows = context_menu_reflog(ctx, item_id)
-    # Switch mode is available anywhere (reuses the ` action; the hint shows
-    # the backtick). Suppressed in stdin mode, where ` itself flashes.
+    # Run shell here + Switch mode are available anywhere (Switch mode reuses
+    # the ` action; the hint shows the backtick). Both are suppressed in stdin
+    # mode, where ` itself flashes and there's no repo to drop a shell into.
     if _STDIN_KIND is None:
-        rows = list(rows) + [('Switch mode ▸ (`)', 'mode.switch')]
+        rows = list(rows) + [('Run shell here', 'shell.here'),
+                             ('Switch mode ▸ (`)', 'mode.switch')]
     return rows
 
 
