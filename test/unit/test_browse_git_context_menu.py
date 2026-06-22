@@ -277,9 +277,9 @@ class TestPerKindMenus(unittest.TestCase):
             empty.stop_workers()
 
     def test_unmenued_kind_yields_only_shared_rows(self):
-        # A worktree-group ('wc', bucket) / sentinel / filler row has no
-        # per-kind menu — only the shared trailing rows.
-        item = Item(id=('wc', 'staged'), title='Staged changes',
+        # A worktree-group ('wc', bucket, wt_path) / sentinel / filler row
+        # has no per-kind menu — only the shared trailing rows.
+        item = Item(id=('wc', 'staged', None), title='Staged changes',
                     has_children=True)
         ctx = self._ctx(item)
         self.assertEqual(_tokens(self.r.context_menu_options(ctx)),

@@ -580,7 +580,8 @@ class TestDispatchRoundTrip(unittest.TestCase):
         self.r._log_items = (
             lambda revs, paths, ns: calls.__setitem__('ref', (revs, ns)))
         self.r._worktree_files = (
-            lambda bucket, paths: calls.__setitem__('wc', bucket))
+            lambda bucket, paths, wt_path=None: calls.__setitem__(
+                'wc', (bucket, wt_path)))
         self.r._stash_files = lambda n: calls.__setitem__('stash', n)
 
         # commit / reflog both drill the file list off a sha (id[1] / id[2]).
@@ -594,9 +595,14 @@ class TestDispatchRoundTrip(unittest.TestCase):
         self.assertEqual(
             calls['ref'], (['origin/feature/x'], ('ref', 'origin/feature/x')))
 
-        # A worktree group routes by bucket; a stash node by its int index.
-        self.r.get_children(('wc', 'staged'))
-        self.assertEqual(calls['wc'], 'staged')
+        # A worktree group routes by bucket + wt_path; a cwd group (wt_path
+        # None) scopes by ``_paths``, a linked one (abspath) skips the filter.
+        self.r.get_children(('wc', 'staged', None))
+        self.assertEqual(calls['wc'], ('staged', None))
+        self.r.get_children(('wc', 'tracked', '/repo/.claude/worktrees/foo'))
+        self.assertEqual(
+            calls['wc'], ('tracked', '/repo/.claude/worktrees/foo'))
+        # A stash node routes by its int index.
         self.r.get_children(('stash', 2))
         self.assertEqual(calls['stash'], 2)
 
@@ -619,7 +625,8 @@ class TestDispatchRoundTrip(unittest.TestCase):
         self.r._status_preview = (
             lambda xy, path: seen.__setitem__('status', (xy, path)))
         self.r._worktree_preview = (
-            lambda bucket, paths: seen.__setitem__('wc', bucket))
+            lambda bucket, paths, wt_path=None: seen.__setitem__(
+                'wc', (bucket, wt_path)))
         self.r._stash_preview = lambda n: seen.__setitem__('stash', n)
         self.r._stash_file_preview = (
             lambda n, path: seen.__setitem__('stashfile', (n, path)))
@@ -632,13 +639,13 @@ class TestDispatchRoundTrip(unittest.TestCase):
 
         self.r.get_preview(('file', 'sha', 'a/b:c.txt'))  # colon-bearing path
         self.r.get_preview(('status', 'M ', 'x:y.py'))
-        self.r.get_preview(('wc', 'tracked'))
+        self.r.get_preview(('wc', 'tracked', None))
         self.r.get_preview(('stash', 1))
         self.r.get_preview(('stash', 1, 'a:b.py'))
         self.assertEqual(seen, {
             'file': ('sha', 'a/b:c.txt'),
             'status': ('M ', 'x:y.py'),
-            'wc': 'tracked',
+            'wc': ('tracked', None),
             'stash': 1,
             'stashfile': (1, 'a:b.py'),
         })
@@ -1877,7 +1884,8 @@ class TestGitRowContent(unittest.TestCase):
         # leading columns to the commit widths — the label then begins at
         # the same offset as a commit subject (no decoration chips).
         ctx = _FakeCtx(self._widths(sha=7, author=5, date=12))
-        item = self.r.Item(id=('wc', 'untracked'), title='Untracked changes',
+        item = self.r.Item(id=('wc', 'untracked', None),
+                           title='Untracked changes',
                            col_sha='', col_author='', col_date='',
                            has_children=True)
         segs = self.r.git_row_content(item, ctx)
@@ -2032,8 +2040,9 @@ class TestWorktreeGroups(unittest.TestCase):
 
     def test_ordering_and_labels(self):
         # All four buckets non-empty: rows follow _WC_GROUPS order, ids are
-        # ('wc', bucket), titles are the group labels, all expandable.
-        self.r._worktree_status = lambda paths: [
+        # ('wc', bucket, None) for the cwd worktree, titles are the group
+        # labels, all expandable.
+        self.r._worktree_status = lambda paths, wt_path=None: [
             ('??', 'new.txt'),
             (' M', 'w.txt'),
             ('M ', 's.txt'),
@@ -2042,33 +2051,50 @@ class TestWorktreeGroups(unittest.TestCase):
         items = self.r._worktree_groups([])
         self.assertEqual(
             [(it.id, it.title) for it in items],
-            [(('wc', 'untracked'), 'Untracked changes'),
-             (('wc', 'tracked'), 'Tracked changes'),
-             (('wc', 'staged'), 'Staged changes'),
-             (('wc', 'conflicts'), 'Conflicts')])
+            [(('wc', 'untracked', None), 'Untracked changes'),
+             (('wc', 'tracked', None), 'Tracked changes'),
+             (('wc', 'staged', None), 'Staged changes'),
+             (('wc', 'conflicts', None), 'Conflicts')])
         self.assertTrue(all(it.has_children for it in items))
 
     def test_rows_carry_empty_alignment_columns(self):
         # Each row leaves col_sha/col_author/col_date empty so
         # git_row_content aligns the label under the commit subjects.
-        self.r._worktree_status = lambda paths: [('??', 'new.txt')]
+        self.r._worktree_status = lambda paths, wt_path=None: [('??', 'new.txt')]
         item, = self.r._worktree_groups([])
         self.assertEqual(
             (item.col_sha, item.col_author, item.col_date), ('', '', ''))
 
     def test_only_non_empty_buckets_appear(self):
         # Only untracked + staged have files → only those two rows, in order.
-        self.r._worktree_status = lambda paths: [
+        self.r._worktree_status = lambda paths, wt_path=None: [
             ('??', 'new.txt'),
             ('M ', 's.txt'),
         ]
         items = self.r._worktree_groups([])
         self.assertEqual([it.id for it in items],
-                         [('wc', 'untracked'), ('wc', 'staged')])
+                         [('wc', 'untracked', None), ('wc', 'staged', None)])
+
+    def test_wt_path_carried_into_ids_and_status(self):
+        # A non-None wt_path rides in every group id AND is forwarded to
+        # _worktree_status (so the drill fetches the right worktree).
+        seen = {}
+
+        def fake_status(paths, wt_path=None):
+            seen['wt_path'] = wt_path
+            return [('M ', 's.txt'), ('??', 'new.txt')]
+
+        self.r._worktree_status = fake_status
+        items = self.r._worktree_groups([], '/repo/.claude/worktrees/foo')
+        self.assertEqual(seen['wt_path'], '/repo/.claude/worktrees/foo')
+        self.assertEqual(
+            [it.id for it in items],
+            [('wc', 'untracked', '/repo/.claude/worktrees/foo'),
+             ('wc', 'staged', '/repo/.claude/worktrees/foo')])
 
     def test_clean_tree_yields_no_rows(self):
         # A clean tree (status → []) produces no synthetic rows at all.
-        self.r._worktree_status = lambda paths: []
+        self.r._worktree_status = lambda paths, wt_path=None: []
         self.assertEqual(self.r._worktree_groups([]), [])
 
     def test_groups_constant_shape(self):
@@ -2098,7 +2124,7 @@ class TestCommitsRootWorktreeScope(unittest.TestCase):
         sentinel = self.r.Item(id=('commit', 'sentinel'), title='s',
                                has_children=True)
         self.r._commit_log_items = lambda revs, paths: [sentinel]
-        self.r._worktree_status = lambda paths: [('M ', 's.txt')]
+        self.r._worktree_status = lambda paths, wt_path=None: [('M ', 's.txt')]
         items = self.r._commits_root()
         ids = [getattr(it, 'id', None) for it in items]
         self.assertIn(('commit', 'sentinel'), ids)
@@ -2106,16 +2132,17 @@ class TestCommitsRootWorktreeScope(unittest.TestCase):
             any(isinstance(i, tuple) and i[0] == 'wc' for i in ids))
 
     def test_no_revs_prepends_worktree_rows(self):
-        # With no rev, the wc rows appear BEFORE the commit rows.
+        # With no rev, the cwd worktree's wc rows (wt_path None) appear
+        # BEFORE the commit rows.
         self.r._revs = []
         self.r._paths = []
         sentinel = self.r.Item(id=('commit', 'sentinel'), title='s',
                                has_children=True)
         self.r._commit_log_items = lambda revs, paths: [sentinel]
-        self.r._worktree_status = lambda paths: [('M ', 's.txt')]
+        self.r._worktree_status = lambda paths, wt_path=None: [('M ', 's.txt')]
         items = self.r._commits_root()
         ids = [getattr(it, 'id', None) for it in items]
-        self.assertEqual(ids, [('wc', 'staged'), ('commit', 'sentinel')])
+        self.assertEqual(ids, [('wc', 'staged', None), ('commit', 'sentinel')])
 
 
 class TestCommitsRootAllBranches(unittest.TestCase):
@@ -2127,27 +2154,39 @@ class TestCommitsRootAllBranches(unittest.TestCase):
         # active builder and the captured revs stay deterministic.
         self.r._tree_mode = False
 
-    def test_appends_branches_rev_and_suppresses_worktree_rows(self):
+    def test_appends_branches_rev_and_injects_groups_at_tip(self):
         # With no positional rev, --all spans the log over all local branches
-        # by passing ``--branches`` to git log — and, like passing branch
-        # names positionally, the live worktree rows are suppressed.
+        # by passing ``--branches`` to git log — and now splices each
+        # worktree's groups ABOVE its tip commit (via _inject_worktree_tips),
+        # rather than suppressing them outright.
         self.r._revs = []
         self.r._paths = []
         self.r._all_branches = True
         captured = {}
-        sentinel = self.r.Item(id=('commit', 'sentinel'), title='s',
-                               has_children=True)
+        head = 'a' * 40
+        tip = self.r.Item(id=('commit', head), title='tip', has_children=True)
 
         def fake_log(revs, paths):
             captured['revs'] = list(revs)
-            return [sentinel]
+            return [tip]
 
         self.r._commit_log_items = fake_log
-        self.r._worktree_status = lambda paths: [('M ', 's.txt')]
+        # One linked worktree whose HEAD is the tip; cwd resolves elsewhere
+        # so its groups use the abspath form.
+        self.r._worktrees = lambda: [
+            self.r._Worktree('/repo/.claude/worktrees/foo', head,
+                             'feature/x', False)]
+        self.r._current_worktree_path = lambda: '/repo'
+        self.r._worktree_status = lambda paths, wt_path=None: [('M ', 's.txt')]
         items = self.r._commits_root()
         self.assertEqual(captured['revs'], ['--branches'])
         ids = [getattr(it, 'id', None) for it in items]
-        self.assertEqual(ids, [('commit', 'sentinel')])
+        # The group is spliced immediately before its tip, scoped to the
+        # linked worktree's abspath.
+        self.assertEqual(
+            ids,
+            [('wc', 'staged', '/repo/.claude/worktrees/foo'),
+             ('commit', head)])
 
     def test_unions_with_positional_revs(self):
         # An explicit rev plus --all → both reach git log (git log <rev>
@@ -2162,6 +2201,7 @@ class TestCommitsRootAllBranches(unittest.TestCase):
             return []
 
         self.r._commit_log_items = fake_log
+        self.r._worktrees = lambda: []        # no tips to inject onto
         self.r._commits_root()
         self.assertEqual(captured['revs'], ['HEAD~3', '--branches'])
 
@@ -2176,9 +2216,298 @@ class TestCommitsRootAllBranches(unittest.TestCase):
             return []
 
         self.r._commit_log_items = fake_log
-        self.r._worktree_status = lambda paths: []
+        self.r._worktree_status = lambda paths, wt_path=None: []
         self.r._commits_root()
         self.assertEqual(captured['revs'], [])
+
+
+class TestCurrentWorktreePath(unittest.TestCase):
+    """``_current_worktree_path`` = the cwd's toplevel, or ``None``."""
+
+    def setUp(self):
+        self.r = _load_recipe()
+
+    def test_returns_toplevel(self):
+        self.r._run_git = lambda *a: subprocess.CompletedProcess(
+            a, 0, '/repo/.claude/worktrees/foo\n', '')
+        self.assertEqual(self.r._current_worktree_path(),
+                         '/repo/.claude/worktrees/foo')
+
+    def test_failure_is_none(self):
+        # git failure -> _repo_root() is '' -> None (so every worktree is
+        # then treated as "not current").
+        self.r._run_git = lambda *a: subprocess.CompletedProcess(
+            a, 128, '', 'not a git repo')
+        self.assertIsNone(self.r._current_worktree_path())
+
+
+class TestInjectWorktreeTips(unittest.TestCase):
+    """``_inject_worktree_tips`` splices groups above each worktree's tip.
+
+    Each ``('commit', sha)`` row whose full sha is a worktree HEAD gets that
+    worktree's ``_worktree_groups`` rows spliced immediately before it; the
+    current worktree uses the cwd convention (``wt_path=None`` + ``paths``),
+    every other uses its abspath with no path filter. Non-matching commits
+    and filler rows pass through untouched.
+    """
+
+    HEAD1 = 'a' * 40
+    HEAD2 = 'b' * 40
+    OTHER = 'c' * 40
+
+    def setUp(self):
+        self.r = _load_recipe()
+
+    def _commit(self, sha, title='x'):
+        return self.r.Item(id=('commit', sha), title=title, has_children=True)
+
+    def _stub_groups(self):
+        # Record (paths, wt_path) per call and emit one identifiable row so
+        # the splice position + scope are observable.
+        self.group_calls = []
+
+        def fake_groups(paths, wt_path=None):
+            self.group_calls.append((list(paths), wt_path))
+            return [self.r.Item(id=('wc', 'staged', wt_path),
+                                title='Staged changes', has_children=True)]
+
+        self.r._worktree_groups = fake_groups
+
+    def test_splices_before_matching_tip_only(self):
+        # Two tips (main HEAD1 = cwd, linked HEAD2) + a non-tip commit. The
+        # groups land right before their own tip; OTHER is untouched.
+        self.r._worktrees = lambda: [
+            self.r._Worktree('/repo', self.HEAD1, 'main', True),
+            self.r._Worktree('/wt2', self.HEAD2, 'feat', False),
+        ]
+        self.r._current_worktree_path = lambda: '/repo'
+        self._stub_groups()
+        items = [self._commit(self.OTHER), self._commit(self.HEAD1),
+                 self._commit(self.HEAD2)]
+        out = self.r._inject_worktree_tips(items, ['src/'])
+        ids = [it.id for it in out]
+        self.assertEqual(ids, [
+            ('commit', self.OTHER),
+            ('wc', 'staged', None),          # main tip: cwd group (None)
+            ('commit', self.HEAD1),
+            ('wc', 'staged', '/wt2'),        # linked tip: abspath group
+            ('commit', self.HEAD2),
+        ])
+        # The cwd group honors paths; the linked group is unfiltered.
+        self.assertIn((['src/'], None), self.group_calls)
+        self.assertIn(([], '/wt2'), self.group_calls)
+
+    def test_worktree_off_log_is_skipped(self):
+        # A worktree HEAD that isn't among the rows simply produces no groups
+        # (nothing to attach to) — the list is returned unchanged.
+        self.r._worktrees = lambda: [
+            self.r._Worktree('/wt2', self.HEAD2, 'feat', False)]
+        self.r._current_worktree_path = lambda: '/repo'
+        self._stub_groups()
+        items = [self._commit(self.OTHER)]
+        out = self.r._inject_worktree_tips(items, [])
+        self.assertEqual([it.id for it in out], [('commit', self.OTHER)])
+        self.assertEqual(self.group_calls, [])
+
+    def test_bare_worktree_head_none_ignored(self):
+        # A bare worktree (head None) never matches a commit row.
+        self.r._worktrees = lambda: [
+            self.r._Worktree('/repo/bare', None, None, False)]
+        self.r._current_worktree_path = lambda: '/repo'
+        self._stub_groups()
+        items = [self._commit(self.HEAD1)]
+        out = self.r._inject_worktree_tips(items, [])
+        self.assertEqual([it.id for it in out], [('commit', self.HEAD1)])
+
+    def test_two_worktrees_sharing_a_head_both_inject(self):
+        # Two worktrees at the same tip → both contribute groups, in order,
+        # before the single commit row.
+        self.r._worktrees = lambda: [
+            self.r._Worktree('/repo', self.HEAD1, 'main', True),
+            self.r._Worktree('/wt2', self.HEAD1, 'feat', False),
+        ]
+        self.r._current_worktree_path = lambda: '/repo'
+        self._stub_groups()
+        out = self.r._inject_worktree_tips([self._commit(self.HEAD1)], [])
+        self.assertEqual([it.id for it in out], [
+            ('wc', 'staged', None),
+            ('wc', 'staged', '/wt2'),
+            ('commit', self.HEAD1),
+        ])
+
+    def test_filler_and_meta_rows_pass_through(self):
+        # A graph filler row (id ('filler', ns, n)) is never a commit, so it
+        # passes through and no groups attach to it.
+        self.r._worktrees = lambda: [
+            self.r._Worktree('/repo', self.HEAD1, 'main', True)]
+        self.r._current_worktree_path = lambda: '/repo'
+        self._stub_groups()
+        filler = self.r.Item(id=('filler', 'root', 0), title='', meta=True)
+        out = self.r._inject_worktree_tips([filler, self._commit(self.HEAD1)],
+                                           [])
+        self.assertEqual([it.id for it in out], [
+            ('filler', 'root', 0),
+            ('wc', 'staged', None),
+            ('commit', self.HEAD1),
+        ])
+
+    def test_no_worktrees_returns_items_unchanged(self):
+        # git worktree list failed -> [] -> the items pass through untouched.
+        self.r._worktrees = lambda: []
+        self._stub_groups()
+        items = [self._commit(self.HEAD1)]
+        out = self.r._inject_worktree_tips(items, [])
+        self.assertIs(out, items)
+
+
+class TestCommitsRootAllInjectsTips(unittest.TestCase):
+    """``--all`` routes the log through ``_inject_worktree_tips``."""
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self.r._tree_mode = False
+
+    def test_all_branches_calls_inject_with_log_and_paths(self):
+        self.r._revs = []
+        self.r._paths = ['src/']
+        self.r._all_branches = True
+        log = [self.r.Item(id=('commit', 'x' * 40), title='t',
+                           has_children=True)]
+        self.r._commit_log_items = lambda revs, paths: list(log)
+        seen = {}
+
+        def fake_inject(items, paths):
+            seen['items'] = [it.id for it in items]
+            seen['paths'] = paths
+            return ['INJECTED']
+
+        self.r._inject_worktree_tips = fake_inject
+        out = self.r._commits_root()
+        self.assertEqual(out, ['INJECTED'])
+        self.assertEqual(seen['items'], [('commit', 'x' * 40)])
+        self.assertEqual(seen['paths'], ['src/'])
+
+
+class TestGetChildrenWorktreeGroupsPrepend(unittest.TestCase):
+    """Worktree / linked-branch drill-downs prepend the worktree groups."""
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self.r._paths = ['ignored/']        # must NOT leak into drill-downs
+        self.group_calls = []
+
+        def fake_groups(paths, wt_path=None):
+            self.group_calls.append((list(paths), wt_path))
+            return [self.r.Item(id=('wc', 'staged', wt_path),
+                                title='Staged changes', has_children=True)]
+
+        self.r._worktree_groups = fake_groups
+        self.r._log_items = lambda revs, paths, ns: [
+            self.r.Item(id=('commit', 'sentinel'), title='s',
+                        has_children=True)]
+
+    def test_worktree_drilldown_prepends_abspath_groups(self):
+        # ('worktree', abspath, label) → groups for THAT worktree (abspath,
+        # no _paths) above its log.
+        item_id = ('worktree', '/repo/.claude/worktrees/foo', 'feature/x')
+        out = self.r.get_children(item_id)
+        self.assertEqual([it.id for it in out],
+                         [('wc', 'staged', '/repo/.claude/worktrees/foo'),
+                          ('commit', 'sentinel')])
+        self.assertEqual(self.group_calls,
+                         [([], '/repo/.claude/worktrees/foo')])
+
+    def test_linked_branch_ref_drilldown_prepends_groups(self):
+        # A branch checked out in a NON-main worktree → groups above its log.
+        self.r._worktrees = lambda: [
+            self.r._Worktree('/repo', 'a' * 40, 'main', True),
+            self.r._Worktree('/repo/.claude/worktrees/foo', 'b' * 40,
+                             'feature/x', False),
+        ]
+        out = self.r.get_children(('ref', 'feature/x'))
+        self.assertEqual([it.id for it in out],
+                         [('wc', 'staged', '/repo/.claude/worktrees/foo'),
+                          ('commit', 'sentinel')])
+        self.assertEqual(self.group_calls,
+                         [([], '/repo/.claude/worktrees/foo')])
+
+    def test_main_worktree_branch_ref_drilldown_has_no_groups(self):
+        # The MAIN worktree's checked-out branch is HEAD here, not elsewhere
+        # — no groups prepended.
+        self.r._worktrees = lambda: [
+            self.r._Worktree('/repo', 'a' * 40, 'main', True),
+            self.r._Worktree('/repo/.claude/worktrees/foo', 'b' * 40,
+                             'feature/x', False),
+        ]
+        out = self.r.get_children(('ref', 'main'))
+        self.assertEqual([it.id for it in out], [('commit', 'sentinel')])
+        self.assertEqual(self.group_calls, [])
+
+    def test_unchecked_branch_ref_drilldown_has_no_groups(self):
+        # A branch not checked out in any worktree → no groups.
+        self.r._worktrees = lambda: [
+            self.r._Worktree('/repo', 'a' * 40, 'main', True)]
+        out = self.r.get_children(('ref', 'idle'))
+        self.assertEqual([it.id for it in out], [('commit', 'sentinel')])
+        self.assertEqual(self.group_calls, [])
+
+    def test_remote_ref_sharing_branch_name_has_no_groups(self):
+        # Only a 'branch'-kind ref matches the linked map; a remote whose
+        # short-name equals a linked branch name must NOT prepend (the
+        # _worktrees branch field is the local short name, but the ref id is
+        # the remote's short name — and even if they collide, only the local
+        # branch is checked out in the worktree).
+        self.r._worktrees = lambda: [
+            self.r._Worktree('/repo', 'a' * 40, 'main', True),
+            self.r._Worktree('/repo/.claude/worktrees/foo', 'b' * 40,
+                             'feature/x', False),
+        ]
+        # 'origin/feature/x' != 'feature/x', so no match — the realistic case.
+        out = self.r.get_children(('ref', 'origin/feature/x'))
+        self.assertEqual([it.id for it in out], [('commit', 'sentinel')])
+        self.assertEqual(self.group_calls, [])
+
+
+class TestGetChildrenWcDrillScope(unittest.TestCase):
+    """Drilling ``('wc', bucket, wt_path)`` scopes status to the worktree."""
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self.r._paths = ['src/']
+
+    def _capture_run_git(self):
+        self.run_calls = []
+
+        def fake_run_git(*args):
+            self.run_calls.append(args)
+            # status --porcelain -z output: one staged file.
+            return subprocess.CompletedProcess(args, 0, 'M  s.txt\x00', '')
+
+        self.r._run_git = fake_run_git
+
+    def test_abspath_drills_via_dash_C_no_path_filter(self):
+        # ('wc', staged, /abs/wt) → git -C /abs/wt status, no -- <paths>.
+        self._capture_run_git()
+        items = self.r.get_children(
+            ('wc', 'staged', '/repo/.claude/worktrees/foo'))
+        self.assertEqual([it.id for it in items], [('status', 'M ', 's.txt')])
+        # The -C <wt_path> reached _run_git; the cwd _paths filter did not.
+        status_args = next(a for a in self.run_calls if 'status' in a)
+        self.assertEqual(status_args[:3],
+                         ('-C', '/repo/.claude/worktrees/foo', 'status'))
+        self.assertNotIn('--', status_args)
+        self.assertNotIn('src/', status_args)
+
+    def test_none_drills_cwd_with_paths(self):
+        # ('wc', staged, None) → cwd status (no -C) scoped by _paths.
+        self._capture_run_git()
+        items = self.r.get_children(('wc', 'staged', None))
+        self.assertEqual([it.id for it in items], [('status', 'M ', 's.txt')])
+        status_args = next(a for a in self.run_calls if 'status' in a)
+        self.assertNotIn('-C', status_args)
+        # The positional _paths reach git after the -- separator.
+        self.assertIn('--', status_args)
+        self.assertIn('src/', status_args)
 
 
 class TestWorktreeFiles(unittest.TestCase):
@@ -2188,7 +2517,7 @@ class TestWorktreeFiles(unittest.TestCase):
         self.r = _load_recipe()
 
     def test_returns_only_that_buckets_files(self):
-        self.r._worktree_status = lambda paths: [
+        self.r._worktree_status = lambda paths, wt_path=None: [
             ('M ', 's.txt'),
             (' M', 'w.txt'),
             ('??', 'new.txt'),
@@ -2201,12 +2530,25 @@ class TestWorktreeFiles(unittest.TestCase):
         self.assertEqual(it.tag_style, 'yellow')
         self.assertFalse(it.has_children)
 
+    def test_wt_path_forwarded_to_status(self):
+        # A non-None wt_path reaches _worktree_status (so the leaves come
+        # from the right worktree).
+        seen = {}
+
+        def fake_status(paths, wt_path=None):
+            seen['wt_path'] = wt_path
+            return [('M ', 's.txt')]
+
+        self.r._worktree_status = fake_status
+        self.r._worktree_files('staged', [], '/repo/.claude/worktrees/foo')
+        self.assertEqual(seen['wt_path'], '/repo/.claude/worktrees/foo')
+
     def test_unknown_bucket_is_empty(self):
-        self.r._worktree_status = lambda paths: [('M ', 's.txt')]
+        self.r._worktree_status = lambda paths, wt_path=None: [('M ', 's.txt')]
         self.assertEqual(self.r._worktree_files('nope', []), [])
 
     def test_empty_bucket_is_empty(self):
-        self.r._worktree_status = lambda paths: [('M ', 's.txt')]
+        self.r._worktree_status = lambda paths, wt_path=None: [('M ', 's.txt')]
         self.assertEqual(self.r._worktree_files('conflicts', []), [])
 
 
@@ -2231,7 +2573,7 @@ class TestWorktreePreviewStat(unittest.TestCase):
         self.r._colorize_diff = lambda raw: 'DELTA(' + raw + ')'
 
     def _set_status(self, rows):
-        self.r._worktree_status = lambda paths: rows
+        self.r._worktree_status = lambda paths, wt_path=None: rows
 
     def test_staged_uses_diff_cached_stat(self):
         self._set_status([('M ', 'a.txt')])
@@ -2252,6 +2594,18 @@ class TestWorktreePreviewStat(unittest.TestCase):
         out = self.r._worktree_preview('conflicts', [])
         self.assertEqual(self.calls, [('diff', '--stat', '--', 'c.txt')])
         self.assertNotIn('DELTA', out)
+
+    def test_wt_path_scopes_stat_via_dash_C(self):
+        # A non-None wt_path prepends ``-C <wt_path>`` to the stat git diff so
+        # the summary comes from THAT worktree.
+        self._set_status([('M ', 'a.txt')])
+        out = self.r._worktree_preview('staged', [],
+                                       '/repo/.claude/worktrees/foo')
+        self.assertEqual(
+            self.calls,
+            [('-C', '/repo/.claude/worktrees/foo', 'diff', '--cached',
+              '--stat', '--', 'a.txt')])
+        self.assertEqual(out, 'STAT\n')
 
     def test_empty_bucket_is_empty(self):
         self._set_status([])
@@ -2281,8 +2635,8 @@ class TestUntrackedStat(unittest.TestCase):
             return per_file[args[-1]]  # last arg is the path
 
         self.r._git_color = fake_git_color
-        self.r._worktree_status = lambda paths: [('??', 'a.txt'),
-                                                 ('??', 'longer.txt')]
+        self.r._worktree_status = lambda paths, wt_path=None: [
+            ('??', 'a.txt'), ('??', 'longer.txt')]
         out = self.r._worktree_preview('untracked', [])
         lines = out.splitlines()
         self.assertNotIn('/dev/null =>', out)            # rename arrow gone
@@ -2344,6 +2698,100 @@ class TestUntrackedStatRealGit(unittest.TestCase):
         self.assertEqual(len(footers), 1)
         self.assertIn('2 files changed', footers[0])
         self.assertIn('4 insertions(+)', footers[0])
+
+
+@unittest.skipUnless(shutil.which('git'), 'git not available')
+class TestWorktreeTipsRealGit(unittest.TestCase):
+    """End-to-end: a real linked worktree's dirty changes surface as groups.
+
+    Creates a repo, adds a linked worktree on its own branch, makes a tracked
+    change there, then — from the MAIN worktree's cwd — checks that
+    ``--all`` / the worktree drill-down expose that linked worktree's groups
+    and that drilling a group fetches the LINKED worktree's file (via the
+    ``wt_path`` in the id, i.e. ``git -C`` against the linked path) rather
+    than the main worktree's clean tree.
+    """
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self._orig_cwd = os.getcwd()
+        self.env = {**os.environ,
+                    'GIT_AUTHOR_NAME': 'T', 'GIT_AUTHOR_EMAIL': 't@t',
+                    'GIT_COMMITTER_NAME': 'T', 'GIT_COMMITTER_EMAIL': 't@t'}
+        self.main = tempfile.mkdtemp()
+        self._git('init', '-q', '-b', 'main')
+        Path(self.main, 'tracked.txt').write_text('one\n')
+        self._git('add', 'tracked.txt')
+        self._git('commit', '-qm', 'init')
+        # A linked worktree on its own branch, then a dirty tracked change
+        # there (NOT in the main worktree, which stays clean).
+        self.linked = os.path.join(self.main, 'wt-feat')
+        self._git('worktree', 'add', '-q', '-b', 'feat', self.linked)
+        Path(self.linked, 'tracked.txt').write_text('one\ntwo\n')
+        # Drive every builder from the MAIN worktree's cwd.
+        os.chdir(self.main)
+
+    def tearDown(self):
+        os.chdir(self._orig_cwd)
+
+    def _git(self, *args):
+        subprocess.run(['git', '-C', self.main, *args], check=True,
+                       capture_output=True, env=self.env)
+
+    def _linked_path(self):
+        # git resolves the worktree path through realpath (macOS /var ->
+        # /private/var); match _current_worktree_path's basis.
+        return os.path.realpath(self.linked)
+
+    def _tracked_group_id(self, items):
+        return next((it.id for it in items
+                     if isinstance(it.id, tuple) and it.id[0] == 'wc'
+                     and it.id[1] == 'tracked'), None)
+
+    def test_all_branches_shows_linked_worktree_group_and_drills_it(self):
+        self.r._mode = 'commits'
+        self.r._all_branches = True
+        self.r._revs = []
+        self.r._paths = []
+        items = self.r._commits_root()
+        gid = self._tracked_group_id(items)
+        # A 'Tracked changes' group exists, scoped to the LINKED worktree.
+        self.assertIsNotNone(gid, 'no tracked-changes group injected')
+        self.assertEqual(gid[2], self._linked_path())
+        # Drilling it lists the linked worktree's dirty file (the main
+        # worktree's tree is clean, so a cwd-scoped status would be empty).
+        files = self.r.get_children(gid)
+        self.assertEqual([it.id for it in files],
+                         [('status', ' M', 'tracked.txt')])
+        # Its preview is a real --stat from the linked worktree.
+        prev = self.r.get_preview(gid)
+        self.assertIn('tracked.txt', re.sub(r'\x1b\[[0-9;]*m', '', prev))
+
+    def test_worktree_drilldown_shows_its_groups_at_top(self):
+        # The worktrees-mode drill-down of the linked worktree row prepends
+        # its groups above the branch log.
+        item_id = ('worktree', self._linked_path(), 'feat')
+        items = self.r.get_children(item_id)
+        gid = self._tracked_group_id(items)
+        self.assertIsNotNone(gid)
+        self.assertEqual(gid[2], self._linked_path())
+        files = self.r.get_children(gid)
+        self.assertEqual([it.id for it in files],
+                         [('status', ' M', 'tracked.txt')])
+
+    def test_linked_branch_ref_drilldown_shows_its_groups(self):
+        # branches-mode: drilling the 'feat' ref (checked out in the linked
+        # worktree) prepends that worktree's groups above the log.
+        items = self.r.get_children(('ref', 'feat'))
+        gid = self._tracked_group_id(items)
+        self.assertIsNotNone(gid)
+        self.assertEqual(gid[2], self._linked_path())
+
+    def test_main_branch_ref_drilldown_has_no_groups(self):
+        # The main worktree's branch is HEAD here, not elsewhere — its ref
+        # drill-down carries no working-change groups.
+        items = self.r.get_children(('ref', 'main'))
+        self.assertIsNone(self._tracked_group_id(items))
 
 
 class TestStashPreviewStat(unittest.TestCase):
