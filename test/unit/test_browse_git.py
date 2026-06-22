@@ -1288,6 +1288,116 @@ class TestWorktrees(unittest.TestCase):
         self.assertEqual(self.r._worktrees(), [])
 
 
+class TestHeadRowBg(unittest.TestCase):
+    """A commit whose full sha is a checked-out worktree HEAD gets ``row_bg``.
+
+    Both log builders (plain ``_commit_log_items`` and graph
+    ``_commit_graph_items``, selected per build by ``_tree_mode``) stamp
+    ``item.row_bg = _HEAD_ROW_BG`` on every commit row whose FULL sha is in
+    the set of worktree HEADs (main tree + each linked worktree), built ONCE
+    per build from ``_worktrees()``. Non-HEAD commits (and graph filler rows)
+    leave it unset. ``_worktrees`` is stubbed to report two known HEAD shas;
+    ``_run_git`` returns a small fixed log in each builder's wire format.
+    """
+
+    # Full 40-char shas: HEAD1/HEAD2 are checked-out tips, OTHER is not.
+    HEAD1 = 'a' * 40
+    HEAD2 = 'b' * 40
+    OTHER = 'c' * 40
+
+    def setUp(self):
+        self.r = _load_recipe()
+        # Two checked-out HEADs: the main tree (HEAD1) and a linked
+        # worktree (HEAD2). A bare worktree (head=None) must be ignored.
+        self.r._worktrees = lambda: [
+            self.r._Worktree('/repo', self.HEAD1, 'main', True),
+            self.r._Worktree('/repo/.claude/worktrees/foo', self.HEAD2,
+                             'feature/x', False),
+            self.r._Worktree('/repo/bare', None, None, False),
+        ]
+
+    def _plain_log(self):
+        # ``%H\x00%D\x00%an\x00%ar\x00%s`` per line; HEAD1 first, then OTHER.
+        return (
+            f'{self.HEAD1}\x00HEAD -> main\x00Ann\x002 hours ago\x00tip subject\n'
+            f'{self.OTHER}\x00\x00Bob\x003 hours ago\x00older subject\n'
+        )
+
+    def _graph_log(self):
+        # ``<art>\x1f%H\x1f%an\x1f%ar\x1f%s\x1f%D`` per commit line; a pure-art
+        # filler line (no separator) sits between the two commits.
+        return (
+            f'* \x1f{self.HEAD1}\x1fAnn\x1f2 hours ago\x1ftip subject\x1fHEAD -> main\n'
+            '|\\\n'
+            f'* \x1f{self.OTHER}\x1fBob\x1f3 hours ago\x1folder subject\x1f\n'
+        )
+
+    def _stub_run_git(self, stdout):
+        self.r._run_git = lambda *a: subprocess.CompletedProcess(a, 0, stdout, '')
+
+    # --- plain builder (_commit_log_items) ---
+
+    def test_plain_head_commit_is_marked(self):
+        self._stub_run_git(self._plain_log())
+        items = self.r._commit_log_items([], [])
+        head = next(it for it in items if it.id == ('commit', self.HEAD1))
+        self.assertEqual(head.row_bg, self.r._HEAD_ROW_BG)
+
+    def test_plain_non_head_commit_is_unmarked(self):
+        self._stub_run_git(self._plain_log())
+        items = self.r._commit_log_items([], [])
+        other = next(it for it in items if it.id == ('commit', self.OTHER))
+        self.assertIsNone(getattr(other, 'row_bg', None))
+
+    # --- graph builder (_commit_graph_items) ---
+
+    def test_graph_head_commit_is_marked(self):
+        self._stub_run_git(self._graph_log())
+        items = self.r._commit_graph_items([], [], 'ns')
+        head = next(it for it in items if it.id == ('commit', self.HEAD1))
+        self.assertEqual(head.row_bg, self.r._HEAD_ROW_BG)
+
+    def test_graph_non_head_commit_is_unmarked(self):
+        self._stub_run_git(self._graph_log())
+        items = self.r._commit_graph_items([], [], 'ns')
+        other = next(it for it in items if it.id == ('commit', self.OTHER))
+        self.assertIsNone(getattr(other, 'row_bg', None))
+
+    def test_graph_filler_row_is_unmarked(self):
+        # The pure-art filler line (meta row) never carries a background.
+        self._stub_run_git(self._graph_log())
+        items = self.r._commit_graph_items([], [], 'ns')
+        fillers = [it for it in items if it.id[0] == 'filler']
+        self.assertTrue(fillers)  # the ``|\`` line produced one
+        for f in fillers:
+            self.assertIsNone(getattr(f, 'row_bg', None))
+
+    # --- multi-worktree (--all / --worktrees drill-down) ---
+
+    def test_every_worktree_head_is_marked(self):
+        # A log spanning multiple branch tips (--all): both HEAD1 and HEAD2
+        # are checked-out worktree HEADs, so both rows are marked; OTHER is not.
+        log = (
+            f'{self.HEAD1}\x00HEAD -> main\x00Ann\x001 hour ago\x00main tip\n'
+            f'{self.HEAD2}\x00feature/x\x00Bob\x002 hours ago\x00feature tip\n'
+            f'{self.OTHER}\x00\x00Cat\x003 hours ago\x00shared base\n'
+        )
+        self._stub_run_git(log)
+        items = self.r._commit_log_items([], [])
+        marked = {it.id[1] for it in items if getattr(it, 'row_bg', None) is not None}
+        self.assertEqual(marked, {self.HEAD1, self.HEAD2})
+
+    def test_heads_built_once_per_build(self):
+        # ``_worktrees`` is consulted once per build, not per row, so a
+        # 3-commit log still calls it exactly once.
+        calls = []
+        wts = [self.r._Worktree('/repo', self.HEAD1, 'main', True)]
+        self.r._worktrees = lambda: (calls.append(1), wts)[1]
+        self._stub_run_git(self._plain_log())
+        self.r._commit_log_items([], [])
+        self.assertEqual(len(calls), 1)
+
+
 class TestWorktreeRelpath(unittest.TestCase):
     """``_worktree_relpath`` is os.path.relpath; main root -> '.'."""
 

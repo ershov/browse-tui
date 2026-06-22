@@ -207,6 +207,13 @@ _GREEN = '\033[32m'
 _RED = '\033[31m'
 _RESET = '\033[m'
 
+# Full-row background (xterm-256 cube) painted on any commit row whose full
+# sha is a checked-out worktree HEAD (the main tree's HEAD and every linked
+# worktree's HEAD). 18 is a distinctly-blue dark cube cell (the 17-19 dark-blue
+# range), readable as blue rather than near-black. Read by the list renderer
+# via ``getattr(item, 'row_bg', None)``; left unset on non-HEAD rows.
+_HEAD_ROW_BG = 18
+
 # Module-level state, all set in main() before the Browser launches.
 _log_limit = _LOG_LIMIT
 _mode = 'commits'
@@ -1801,6 +1808,9 @@ def _commit_log_items(revs, paths):
     result = _run_git(*args)
     if result.returncode != 0:
         return _err_item(f'git log failed: {result.stderr.strip()}')
+    # Checked-out HEAD shas (main tree + every linked worktree), built ONCE per
+    # build — a commit row whose full sha is here gets the dark-blue stripe.
+    heads = {wt.head for wt in _worktrees() if wt.head}
     items = []
     for line in result.stdout.splitlines():
         if not line:
@@ -1815,6 +1825,8 @@ def _commit_log_items(revs, paths):
         item.col_author = author
         item.col_date = reldate
         item.chips = _parse_decorations(deco)
+        if sha in heads:
+            item.row_bg = _HEAD_ROW_BG
         items.append(item)
     return items
 
@@ -1894,6 +1906,9 @@ def _commit_graph_items(revs, paths, ns):
     result = _run_git(*args)
     if result.returncode != 0:
         return _err_item(f'git log failed: {result.stderr.strip()}')
+    # Checked-out HEAD shas (main tree + every linked worktree), built ONCE per
+    # build — a commit row whose full sha is here gets the dark-blue stripe.
+    heads = {wt.head for wt in _worktrees() if wt.head}
     items = []
     filler_n = 0
     for line in result.stdout.splitlines():
@@ -1907,6 +1922,8 @@ def _commit_graph_items(revs, paths, ns):
             item.col_date = reldate
             item.chips = _parse_decorations(deco)
             item.col_graph = _graph_translate(art)
+            if sha in heads:
+                item.row_bg = _HEAD_ROW_BG
             items.append(item)
         else:
             # Filler line: the whole line is graph art (no commit fields).
