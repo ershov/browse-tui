@@ -1,8 +1,9 @@
 #!/usr/bin/env -S browse-tui --run-py
 """browse-git — a tig-like browser over a git repository.
 
-Five view modes, switchable by ``--mode NAME`` at launch, by the
-backtick (`` ` ``) key at runtime, or auto-selected from positional
+Five view modes, switchable by a per-mode flag (``--commits`` /
+``--status`` / ``--reflog`` / ``--branches`` / ``--stash``) at launch, by
+the backtick (`` ` ``) key at runtime, or auto-selected from positional
 arguments:
 
   commits   recent ``git log`` — drill commit -> changed files -> diff
@@ -117,7 +118,7 @@ log's ``--branches``) — equivalent to ``browse-git $(git branch
 --format='%(refname:short)')`` — instead of only HEAD's history.
 
 Usage:
-  browse-git [<dir>] [-n NUMBER] [--mode NAME] [--no-tree] [--all] [<revs>…] [-- <paths>…]
+  browse-git [<dir>] [-n NUMBER] [--commits|--status|--reflog|--branches|--stash] [--no-tree] [--all] [<revs>…] [-- <paths>…]
   git diff | browse-git -      (also git log / log -p / status output)
 """
 
@@ -265,33 +266,33 @@ def _pop_limit_arg(default):
     return default
 
 
-def _pop_mode_arg():
-    """Pop ``--mode NAME`` (or ``--mode=NAME``) out of ``sys.argv``.
+def _pop_mode_flag():
+    """Pop a per-mode flag (``--commits`` / ``--status`` / …) out of ``sys.argv``.
 
-    Returns the chosen mode name, or ``None`` if the flag is absent. An
-    unknown mode name is fatal (stderr + exit 2) — the user asked for a
-    view that doesn't exist.
+    The accepted flags are derived from ``_MODES`` — one ``--{mode}`` per
+    mode — so appending a mode there grows the flag set for free. Every
+    occurrence is removed (so a flag never leaks into the positional
+    classifier), mirroring ``_pop_tree_arg`` / ``_pop_all_arg``'s in-place
+    argv editing. Returns the single chosen mode name, or ``None`` if none
+    appears. Selecting more than one DISTINCT mode is fatal (stderr + exit
+    2) — the modes are mutually exclusive.
     """
+    flag_to_mode = {f'--{m}': m for m in _MODES}
+    chosen = set()
     i = 1
     while i < len(sys.argv):
-        a = sys.argv[i]
-        value = None
-        if a == '--mode' and i + 1 < len(sys.argv):
-            value = sys.argv[i + 1]
-            del sys.argv[i:i + 2]
-        elif a.startswith('--mode='):
-            value = a.split('=', 1)[1]
+        m = flag_to_mode.get(sys.argv[i])
+        if m is not None:
+            chosen.add(m)
             del sys.argv[i]
         else:
             i += 1
-            continue
-        if value not in _MODES:
-            sys.stderr.write(
-                f'browse-git: unknown mode {value!r}; '
-                f'choose one of {", ".join(_MODES)}\n')
-            sys.exit(2)
-        return value
-    return None
+    if len(chosen) > 1:
+        sys.stderr.write(
+            'browse-git: choose at most one mode flag '
+            f'({", ".join("--" + m for m in _MODES)})\n')
+        sys.exit(2)
+    return chosen.pop() if chosen else None
 
 
 def _pop_tree_arg(default):
@@ -300,7 +301,7 @@ def _pop_tree_arg(default):
     Returns ``True`` for ``--tree``, ``False`` for ``--no-tree``, or
     ``default`` when neither appears. Every occurrence is removed (so the
     flag never leaks into the positional classifier) and the LAST one wins,
-    so ``--tree --no-tree`` resolves to off. Mirrors ``_pop_mode_arg``'s
+    so ``--tree --no-tree`` resolves to off. Mirrors ``_pop_mode_flag``'s
     in-place argv editing.
     """
     chosen = default
@@ -3074,7 +3075,7 @@ def on_context_menu(ctx):
 
 
 _HELP_USAGE_TMPL = """\
-Usage: browse-git [<dir>] [-n NUMBER] [--mode NAME] [--no-tree] [--all] [<rev>…] [-- <path>…]
+Usage: browse-git [<dir>] [-n NUMBER] [--commits|--status|--reflog|--branches|--stash] [--no-tree] [--all] [<rev>…] [-- <path>…]
        git diff | browse-git      (also git log / log -p / status output; the '-' is optional when piping)
   <dir>         A leading directory in another git repo browses THAT repo
                 (cwd need not be a repo). A subdir of the current repo
@@ -3099,7 +3100,8 @@ Usage: browse-git [<dir>] [-n NUMBER] [--mode NAME] [--no-tree] [--all] [<rev>�
                 terminal never reads stdin.
   -n NUMBER     Cap the commit / reflog list to this many entries
                 (default: {default}).
-  --mode NAME   Start in one of: {modes}. Default: commits.
+  --MODE        Start in that view: one of {mode_flags}
+                (at most one; default: commits).
   --no-tree     Hide git's commit-graph column in the commit log
   --tree        (default on; toggle at runtime with 't').
   --all         Span the commits log over every local branch, not just
@@ -3112,7 +3114,7 @@ Positional args are auto-classified: a leading directory that is its own
 git work tree (distinct from the cwd's) selects the repo to browse; any
 other arg that names an existing file or directory is a pathspec;
 otherwise an arg git resolves as a commit is a rev; anything else is an
-error. They scope commits mode (an explicit --mode other than commits
+error. They scope commits mode (a mode flag other than --commits
 ignores them).\
 """
 
@@ -3255,7 +3257,7 @@ def main():
             sys.exit(2)
 
     _log_limit = _pop_limit_arg(_LOG_LIMIT)
-    requested_mode = _pop_mode_arg()
+    requested_mode = _pop_mode_flag()
     _tree_mode = _pop_tree_arg(_tree_mode)
     _all_branches = _pop_all_arg()
     _classify_positionals()
@@ -3292,7 +3294,8 @@ def main():
         on_context_menu=on_context_menu,
         show_ids='never',
         help_usage=_HELP_USAGE_TMPL.format(
-            default=_LOG_LIMIT, modes=', '.join(_MODES)),
+            default=_LOG_LIMIT,
+            mode_flags=', '.join('--' + m for m in _MODES)),
         help_intro=_HELP_INTRO,
     ))
     _browser = b

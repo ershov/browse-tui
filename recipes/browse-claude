@@ -6455,11 +6455,11 @@ def _has_plan_md(path):
     return bool(path) and os.path.isfile(os.path.join(path, '.PLAN.md'))
 
 
-# Git-mode submenu rows: ``(submenu_label, browse-git --mode NAME)``. The
-# single Level-1 ``git`` row (shown when ≥1 context dir is a git repo) opens a
-# Level-2 mode submenu built from these; the chosen mode launches ``browse-git
-# <dir> --mode NAME`` on the chosen dir (browse-git's verified ``<dir> --mode``
-# interface).
+# Git-mode submenu rows: ``(submenu_label, mode)`` (mode -> browse-git's
+# ``--<mode>`` flag). The single Level-1 ``git`` row (shown when ≥1 context dir
+# is a git repo) opens a Level-2 mode submenu built from these; the chosen mode
+# launches ``browse-git <dir> --<mode>`` on the chosen dir (browse-git's
+# verified ``<dir> --<mode>`` interface).
 _DIR_GIT_MODES = [
     ('commits',  'commits'),
     ('branches', 'branches'),
@@ -6543,7 +6543,7 @@ def _run_shell(ctx, cwd):
 
 
 def _run_git_mode(ctx, dirs, mode):
-    """Launch ``browse-git <dir> --mode <mode>`` on a chosen repo dir.
+    """Launch ``browse-git <dir> --<mode>`` on a chosen repo dir.
 
     Filters ``dirs`` to the git repos, picks one via ``_choose_dir`` (Level-3
     chooser only when >1 repo dir qualifies), and runs browse-git with
@@ -6556,7 +6556,7 @@ def _run_git_mode(ctx, dirs, mode):
     path = _choose_dir(ctx, applicable)
     if path is None:
         return
-    ctx.run_external(['browse-git', path, '--mode', mode], keep_screen=True)
+    ctx.run_external(['browse-git', path, f'--{mode}'], keep_screen=True)
 
 
 def _run_dir_action(ctx, token, dirs):

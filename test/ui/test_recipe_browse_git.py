@@ -368,7 +368,7 @@ class TestBrowseGit(unittest.TestCase):
                 t.send('q')
 
     def test_mode_reflog_lists_entries(self):
-        """``--mode reflog`` lists reflog entries with selector + action.
+        """``--reflog`` lists reflog entries with selector + action.
 
         The temp repo's two commits each produce a reflog entry, so the
         list shows ``HEAD@{n}`` selectors and ``commit`` action subjects.
@@ -377,14 +377,14 @@ class TestBrowseGit(unittest.TestCase):
             _make_repo(tmp)
             with TmuxFixture(cols=120, rows=30) as t:
                 t.send_line(f'cd {tmp}')
-                t.launch(_BIN, '--run-py', _RECIPE, '--mode', 'reflog')
+                t.launch(_BIN, '--run-py', _RECIPE, '--reflog')
                 # A reflog selector chip and a commit action subject.
                 t.wait_for(re.compile(r'HEAD@\{'), timeout=5.0)
                 t.wait_for('commit', timeout=5.0)
                 t.send('q')
 
     def test_mode_status_shows_modified_file(self):
-        """``--mode status`` lists a modified tracked file with an ``M`` tag.
+        """``--status`` lists a modified tracked file with an ``M`` tag.
 
         After ``_make_repo`` we dirty a tracked file (unstaged), so
         ``git status --porcelain`` reports `` M beta.txt`` → the recipe
@@ -397,7 +397,7 @@ class TestBrowseGit(unittest.TestCase):
                 f.write('beta changed\n')
             with TmuxFixture(cols=120, rows=30) as t:
                 t.send_line(f'cd {tmp}')
-                t.launch(_BIN, '--run-py', _RECIPE, '--mode', 'status')
+                t.launch(_BIN, '--run-py', _RECIPE, '--status')
                 cap = t.wait_for('beta.txt', timeout=5.0)
                 row = next(ln for ln in cap.splitlines() if 'beta.txt' in ln)
                 # The status tag is rendered as ``[M]`` before the path.
@@ -405,7 +405,7 @@ class TestBrowseGit(unittest.TestCase):
                 t.send('q')
 
     def test_mode_stash_lists_stash(self):
-        """``--mode stash`` lists a stash with its ``stash@{0}`` selector.
+        """``--stash`` lists a stash with its ``stash@{0}`` selector.
 
         After ``_make_repo`` we modify a tracked file and ``git stash`` it,
         so ``git stash list`` reports one entry → the recipe renders a row
@@ -425,13 +425,13 @@ class TestBrowseGit(unittest.TestCase):
                            capture_output=True, env=env)
             with TmuxFixture(cols=120, rows=30) as t:
                 t.send_line(f'cd {tmp}')
-                t.launch(_BIN, '--run-py', _RECIPE, '--mode', 'stash')
+                t.launch(_BIN, '--run-py', _RECIPE, '--stash')
                 cap = t.wait_for('stash@{', timeout=5.0)
                 self.assertIn('WIP on', cap)
                 t.send('q')
 
     def test_mode_branches_lists_and_drills(self):
-        """``--mode branches`` lists ``main`` (branch tag); drilling shows commits.
+        """``--branches`` lists ``main`` (branch tag); drilling shows commits.
 
         The temp repo is on branch ``main``, so branches mode renders a
         ``main`` row tagged ``branch``. Right-arrow on it lists that ref's
@@ -441,7 +441,7 @@ class TestBrowseGit(unittest.TestCase):
             _make_repo(tmp)
             with TmuxFixture(cols=120, rows=30) as t:
                 t.send_line(f'cd {tmp}')
-                t.launch(_BIN, '--run-py', _RECIPE, '--mode', 'branches')
+                t.launch(_BIN, '--run-py', _RECIPE, '--branches')
                 cap = t.wait_for('main', timeout=5.0)
                 row = next(ln for ln in cap.splitlines()
                            if re.search(r'\bmain\b', ln))
@@ -1274,7 +1274,7 @@ class TestBrowseGitStdin(unittest.TestCase):
 
     def test_dash_with_other_args_errors_before_ui(self):
         proc = subprocess.run(
-            [_BIN, '--run-py', _RECIPE, '-', '--mode', 'status'],
+            [_BIN, '--run-py', _RECIPE, '-', '--status'],
             input='?? x\n', capture_output=True, text=True, timeout=60)
         self.assertEqual(proc.returncode, 2)
         self.assertIn('cannot be combined', proc.stderr)

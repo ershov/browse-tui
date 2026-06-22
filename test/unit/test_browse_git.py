@@ -69,6 +69,8 @@ Coverage (ticket #701 — tree-mode commit graph):
   column; filler row = blank pad (sha+author+date span) then the art;
   a tree-off commit row (no ``col_graph``) is byte-identical to before
 * ``_pop_tree_arg``        pops ``--tree`` / ``--no-tree`` (last wins)
+* ``_pop_mode_flag``       pops a per-mode flag (``--status`` etc., derived
+  from ``_MODES``); >1 distinct mode is a usage error (exit 2)
 * ``toggle_tree``          flips ``_tree_mode`` and refreshes
 
 Coverage (ticket #862 — ``browse-git -``, git output from stdin):
@@ -2274,6 +2276,63 @@ class TestPopAllArg(unittest.TestCase):
         self.assertEqual(sys.argv, ['browse-git'])
 
 
+class TestPopModeFlag(unittest.TestCase):
+    """``_pop_mode_flag`` picks a mode from a per-mode flag (--status etc.).
+
+    The accepted flags are derived from ``_MODES`` — one ``--{mode}`` each —
+    so the set tracks ``_MODES`` automatically. At most one DISTINCT mode is
+    allowed; two or more is a usage error (stderr + exit 2).
+    """
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self._orig_argv = sys.argv
+
+    def tearDown(self):
+        sys.argv = self._orig_argv
+
+    def test_absent_returns_none_argv_untouched(self):
+        sys.argv = ['browse-git', 'HEAD']
+        self.assertIsNone(self.r._pop_mode_flag())
+        self.assertEqual(sys.argv, ['browse-git', 'HEAD'])
+
+    def test_each_mode_flag_selects_its_mode_and_pops(self):
+        # Every mode in _MODES has a working --{mode} flag, and the flag is
+        # removed so it never leaks into the positional classifier.
+        for mode in self.r._MODES:
+            sys.argv = ['browse-git', f'--{mode}', 'HEAD']
+            self.assertEqual(self.r._pop_mode_flag(), mode, mode)
+            self.assertEqual(sys.argv, ['browse-git', 'HEAD'], mode)
+
+    def test_repeated_same_flag_is_not_an_error_and_all_popped(self):
+        # Only DISTINCT modes conflict; a repeat of one flag is fine and
+        # every occurrence is removed.
+        sys.argv = ['browse-git', '--status', '--status']
+        self.assertEqual(self.r._pop_mode_flag(), 'status')
+        self.assertEqual(sys.argv, ['browse-git'])
+
+    def test_two_distinct_modes_exit_2_with_at_most_one_message(self):
+        sys.argv = ['browse-git', '--status', '--reflog']
+        err = io.StringIO()
+        saved_err = self.r.sys.stderr
+        try:
+            self.r.sys.stderr = err
+            with self.assertRaises(SystemExit) as cm:
+                self.r._pop_mode_flag()
+        finally:
+            self.r.sys.stderr = saved_err
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn('choose at most one mode flag', err.getvalue())
+
+    def test_unknown_mode_like_flag_is_left_alone(self):
+        # ``--mode`` is gone: it is now just an unknown flag, left in argv
+        # for the positional classifier (which skips flag-like tokens) and
+        # selecting no mode (None -> the commits default holds).
+        sys.argv = ['browse-git', '--mode', 'status']
+        self.assertIsNone(self.r._pop_mode_flag())
+        self.assertEqual(sys.argv, ['browse-git', '--mode', 'status'])
+
+
 class TestWindowTitleAll(unittest.TestCase):
     """``_window_title`` surfaces ``--all`` in the commits-mode title."""
 
@@ -3356,7 +3415,7 @@ class TestStdinMain(unittest.TestCase):
     def test_dash_with_other_args_is_a_usage_error_stdin_unread(self):
         for argv in (['browse-git', '-', 'HEAD'],
                      ['browse-git', 'HEAD', '-'],
-                     ['browse-git', '--mode', 'status', '-'],
+                     ['browse-git', '--status', '-'],
                      ['browse-git', '-n', '5', '-'],
                      ['browse-git', '-', '--all']):
             self.r = _load_recipe()

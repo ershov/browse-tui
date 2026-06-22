@@ -605,8 +605,8 @@ class TestGitSubmenu(unittest.TestCase):
     """The single ``git`` row opens a mode submenu that routes to browse-git.
 
     ``_open_git_menu`` re-invokes ``ctx.menu`` over the five modes (the
-    second-level menu); the chosen mode launches ``browse-git <dir> --mode
-    NAME``. In headless mode the real ``ctx.menu`` returns None, so — as
+    second-level menu); the chosen mode launches ``browse-git <dir>
+    --<mode>``. In headless mode the real ``ctx.menu`` returns None, so — as
     browse-git's Reset ▸ test does — we drive the handler with a recording ctx
     that scripts the submenu choice and captures the ``run_external`` argv.
     """
@@ -643,11 +643,11 @@ class TestGitSubmenu(unittest.TestCase):
         self.assertIsNone(ctx.cmd)
 
     def test_chosen_mode_launches_browse_git(self):
-        # Picking 'stashes' (token 'stash') runs browse-git <dir> --mode stash.
+        # Picking 'stashes' (token 'stash') runs browse-git <dir> --stash.
         ctx = self._Ctx('stash')
         self.r._open_git_menu(ctx, '/some/repo')
         self.assertEqual(ctx.cmd,
-                         ['browse-git', '/some/repo', '--mode', 'stash'])
+                         ['browse-git', '/some/repo', '--stash'])
         self.assertTrue(ctx.keep_screen)
 
     def test_dir_git_dispatch_threads_target_dir_for_file_cursor(self):
@@ -660,7 +660,7 @@ class TestGitSubmenu(unittest.TestCase):
             ctx = self._Ctx('commits')
             self.r._MENU_ACTIONS['dir.git'](ctx, p)
             self.assertEqual(ctx.cmd,
-                             ['browse-git', d, '--mode', 'commits'])
+                             ['browse-git', d, '--commits'])
 
 
 class TestDiffHandler(unittest.TestCase):
