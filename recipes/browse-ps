@@ -270,6 +270,13 @@ def _proc_cpu_secs(pid):
         return None
 
 
+# Whether a fine-grained per-process CPU-time source exists (Linux /proc). Where
+# it doesn't — macOS and other systems without /proc — the instantaneous CPU%
+# can't be computed, so the cpu% column is dropped from the gutter rather than
+# show a misleading figure (#1124 tracks real macOS support). Probed once.
+_CPU_AVAILABLE = _proc_cpu_secs(os.getpid()) is not None
+
+
 def _private_mem_bytes(pid):
     """Linux private memory (``Private_Clean + Private_Dirty``) for ``pid``.
 
@@ -713,6 +720,10 @@ def ps_gutter_segments(item, ctx):
       * mode 2 → ``pid`` only;
       * mode 3 → ``pid · user · cpu% · mem`` (the default, full set).
 
+    The cpu% column is dropped on systems without a fine-grained CPU-time
+    source (no ``/proc`` — macOS &c.; see ``_CPU_AVAILABLE`` / #1124), since the
+    instantaneous percent can't be computed there.
+
     A row missing the ``col_*`` fields (no normal process row should) yields an
     empty gutter so the default content still renders.
     """
@@ -722,11 +733,10 @@ def ps_gutter_segments(item, ctx):
     dfg, dbold = style('dim')
     segs = [(cell_rjust(item.col_pid, w('col_pid')) + ' ', dfg, dbold)]
     if _DISPLAY_MODE == 3:
-        segs.extend([
-            (cell_ljust(item.col_user, w('col_user')) + ' ', dfg, dbold),
-            (cell_rjust(item.col_cpu,  w('col_cpu'))  + ' ', dfg, dbold),
-            (cell_rjust(item.col_mem,  w('col_mem'))  + ' ', dfg, dbold),
-        ])
+        segs.append((cell_ljust(item.col_user, w('col_user')) + ' ', dfg, dbold))
+        if _CPU_AVAILABLE:       # dropped where no fine CPU source exists (#1124)
+            segs.append((cell_rjust(item.col_cpu, w('col_cpu')) + ' ', dfg, dbold))
+        segs.append((cell_rjust(item.col_mem, w('col_mem')) + ' ', dfg, dbold))
     return segs
 
 

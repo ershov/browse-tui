@@ -27,7 +27,10 @@ highlighting.
 - **Portable system data:** `ps -eo pid,ppid,user,pcpu,rss,time,args`
   (POSIX keys; works on Linux and macOS), untruncated usernames (widened
   `ps -o user:<w>` on Linux, with a uid + `pwd` fallback), and memory as
-  Linux private RSS (`/proc/<pid>/smaps_rollup`) or RSS elsewhere.
+  Linux private RSS (`/proc/<pid>/smaps_rollup`) or RSS elsewhere. CPU% uses
+  fine-grained cumulative CPU time from `/proc/<pid>/stat` on Linux; on systems
+  without `/proc` (macOS &c.) there is no fine source yet, so the cpu% column
+  is omitted for now.
 - **Soft change highlighting** via `item.row_fg` (muted green for new, muted
   red for finished/tombstone rows), held by a short retention timer so
   changes survive intervening refreshes.

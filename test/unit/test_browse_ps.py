@@ -1035,6 +1035,10 @@ class TestDisplayModes(unittest.TestCase):
     def setUp(self):
         self._saved_mode = self.r._DISPLAY_MODE
         self.addCleanup(setattr, self.r, '_DISPLAY_MODE', self._saved_mode)
+        # _CPU_AVAILABLE is a load-time probe (True on Linux/this box); pin it so
+        # the per-mode assertions are platform-independent.
+        self._saved_cpu = self.r._CPU_AVAILABLE
+        self.addCleanup(setattr, self.r, '_CPU_AVAILABLE', self._saved_cpu)
 
     # -- the per-mode gutter column set ------------------------------------
 
@@ -1061,9 +1065,10 @@ class TestDisplayModes(unittest.TestCase):
         self.assertEqual(ctx.calls, ['col_pid'])
 
     def test_mode_3_is_full_set(self):
-        # Mode 3 = pid · user · cpu% · mem (default): the full four columns,
-        # identical to the historical gutter (pid/cpu/mem rjust, user ljust).
+        # Mode 3 = pid · user · cpu% · mem (default) when a fine CPU source
+        # exists: the full four columns (pid/cpu/mem rjust, user ljust).
         self.r._DISPLAY_MODE = 3
+        self.r._CPU_AVAILABLE = True
         ctx = _FakeCtx(_GW)
         item = _ps_item(self.r, 1, 'root', '10%', '100M')
         segs = self.r.ps_gutter_segments(item, ctx)
@@ -1075,6 +1080,22 @@ class TestDisplayModes(unittest.TestCase):
         self.assertEqual(segs[3], (' 100M' + ' ', dfg, dbold))     # rjust 5
         self.assertEqual(ctx.calls,
                          ['col_pid', 'col_user', 'col_cpu', 'col_mem'])
+
+    def test_mode_3_drops_cpu_when_no_fine_source(self):
+        # No /proc (macOS &c.): the instantaneous cpu% can't be computed, so the
+        # cpu% column is dropped from mode 3 → pid · user · mem (#1124). The
+        # other columns and their order are unchanged.
+        self.r._DISPLAY_MODE = 3
+        self.r._CPU_AVAILABLE = False
+        ctx = _FakeCtx(_GW)
+        item = _ps_item(self.r, 1, 'root', '10%', '100M')
+        segs = self.r.ps_gutter_segments(item, ctx)
+        dfg, dbold = self.dim
+        self.assertEqual(len(segs), 3)
+        self.assertEqual(segs[0], ('    1' + ' ', dfg, dbold))     # pid  rjust 5
+        self.assertEqual(segs[1], ('root    ' + ' ', dfg, dbold))  # user ljust 8
+        self.assertEqual(segs[2], (' 100M' + ' ', dfg, dbold))     # mem  rjust 5
+        self.assertEqual(ctx.calls, ['col_pid', 'col_user', 'col_mem'])  # no cpu
 
     def test_modes_2_and_3_share_the_pid_column(self):
         # Mode 2's gutter is exactly mode 3's leading prefix — same order, a
