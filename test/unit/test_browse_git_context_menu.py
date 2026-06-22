@@ -131,7 +131,7 @@ class TestPerKindMenus(unittest.TestCase):
             b.stop_workers()
 
     def test_commit_menu_rows(self):
-        item = Item(id=('commit', 'abc1234def'), title='subject',
+        item = Item(id=('commit', 'root', 'abc1234def'), title='subject',
                     has_children=True)
         ctx = self._ctx(item)
         rows = self.r.context_menu_options(ctx)
@@ -151,8 +151,8 @@ class TestPerKindMenus(unittest.TestCase):
         # synthetic ellipsis. "Show full path" is always present (the recipe
         # can't reliably detect render-time truncation, so it always offers
         # the pop-up). The Edit row duplicates the ``E`` action → ``(E)`` hint.
-        item = Item(id=('file', 'abc1234def', 'src/app.py'), title='src/app.py',
-                    tag='M', has_children=False)
+        item = Item(id=('file', 'root', 'abc1234def', 'src/app.py'),
+                    title='src/app.py', tag='M', has_children=False)
         ctx = self._ctx(item)
         rows = self.r.context_menu_options(ctx)
         self.assertEqual(_tokens(rows), [
@@ -220,7 +220,7 @@ class TestPerKindMenus(unittest.TestCase):
         # The shared Switch-mode row reuses the ` action, so its label carries
         # the backtick hotkey hint (literal text, the convention for a menu
         # entry that duplicates a keybinding).
-        item = Item(id=('commit', 'abc'), title='x', has_children=True)
+        item = Item(id=('commit', 'root', 'abc'), title='x', has_children=True)
         ctx = self._ctx(item)
         rows = self.r.context_menu_options(ctx)
         mode_label = next(l for l, t in rows if t == 'mode.switch')
@@ -231,7 +231,7 @@ class TestPerKindMenus(unittest.TestCase):
         # rows (Switch mode AND Run shell here); a commit row then carries only
         # its own (non-shared) entries.
         self.r._STDIN_KIND = 'log'
-        item = Item(id=('commit', 'abc'), title='x', has_children=True)
+        item = Item(id=('commit', 'root', 'abc'), title='x', has_children=True)
         ctx = self._ctx(item)
         rows = self.r.context_menu_options(ctx)
         self.assertNotIn('mode.switch', _tokens(rows))
@@ -243,7 +243,7 @@ class TestPerKindMenus(unittest.TestCase):
         # on a normal row and on a --worktrees row alike, just before Switch
         # mode.
         for item in (
-            Item(id=('commit', 'abc1234def'), title='x', has_children=True),
+            Item(id=('commit', 'root', 'abc1234def'), title='x', has_children=True),
             Item(id=('worktree', '/abs/wt', 'br'), title='wt br', tag='linked'),
         ):
             ctx = self._ctx(item)
@@ -256,7 +256,7 @@ class TestPerKindMenus(unittest.TestCase):
     def test_run_shell_here_suppressed_in_stdin_mode(self):
         # Running a shell in the repo is meaningless for piped input → no row.
         self.r._STDIN_KIND = 'diff'
-        item = Item(id=('commit', 'abc'), title='x', has_children=True)
+        item = Item(id=('commit', 'root', 'abc'), title='x', has_children=True)
         ctx = self._ctx(item)
         self.assertNotIn('shell.here',
                          _tokens(self.r.context_menu_options(ctx)))
@@ -288,8 +288,8 @@ class TestPerKindMenus(unittest.TestCase):
     def test_no_clipboard_or_copy_entries(self):
         # Convention (#1028): recipe menus carry no clipboard / Copy rows.
         for item in (
-            Item(id=('commit', 'abc'), title='x', has_children=True),
-            Item(id=('file', 'abc', 'p.py'), title='p.py'),
+            Item(id=('commit', 'root', 'abc'), title='x', has_children=True),
+            Item(id=('file', 'root', 'abc', 'p.py'), title='p.py'),
             Item(id=('ref', 'main'), title='main', has_children=True),
             Item(id=('status', ' M', 'p.py'), title='p.py'),
             Item(id=('stash', 0), title='WIP', has_children=True),
@@ -379,8 +379,8 @@ class TestDispatchTable(unittest.TestCase):
 
         emitted = set()
         cases = [
-            ('commit', 'abc1234def'),
-            ('file', 'abc1234def', 'p.py'),
+            ('commit', 'root', 'abc1234def'),
+            ('file', 'root', 'abc1234def', 'p.py'),
             ('ref', 'main'),
             ('status', ' M', 'p.py'),
             ('stash', 2),
@@ -406,10 +406,19 @@ class TestDispatchTable(unittest.TestCase):
                          f'handlers never emitted by a builder: {orphans}')
 
     def test_file_rev_maps_stash_selector(self):
-        # A committed file's rev is its sha; a stashed file's rev is the
-        # stash@{n} selector (so view/diff/blame target the right object).
-        self.assertEqual(self.r._file_rev(('file', 'abc123', 'p.py')), 'abc123')
+        # A committed file's rev is its sha (at id[2], past the ns); a stashed
+        # file's rev is the stash@{n} selector (so view/diff/blame target the
+        # right object).
+        self.assertEqual(
+            self.r._file_rev(('file', 'root', 'abc123', 'p.py')), 'abc123')
         self.assertEqual(self.r._file_rev(('stash', 3, 'p.py')), 'stash@{3}')
+
+    def test_file_path_maps_per_kind(self):
+        # _file_path mirrors _file_rev: a committed file's path is at id[3]
+        # (past the ns), a stashed file's path stays at id[2].
+        self.assertEqual(
+            self.r._file_path(('file', 'root', 'abc123', 'p.py')), 'p.py')
+        self.assertEqual(self.r._file_path(('stash', 3, 'q.py')), 'q.py')
 
 
 class TestConfirmGating(unittest.TestCase):
@@ -559,7 +568,7 @@ class TestConditionalEntriesRealRepo(unittest.TestCase):
             b.stop_workers()
 
     def _commit_ctx(self, sha, extra=()):
-        item = Item(id=('commit', sha), title='subj', has_children=True)
+        item = Item(id=('commit', 'root', sha), title='subj', has_children=True)
         self.b = _browser_with_item(item, extra=extra)
         return Context(self.b)
 
@@ -585,34 +594,163 @@ class TestConditionalEntriesRealRepo(unittest.TestCase):
         self.b.stop_workers()
 
         # Exactly one OTHER commit selected → the row appears.
-        cursor_item = Item(id=('commit', self.sha_plan), title='subj',
+        cursor_item = Item(id=('commit', 'root', self.sha_plan), title='subj',
                            has_children=True)
-        other = Item(id=('commit', self.sha_no_plan), title='other',
+        other = Item(id=('commit', 'root', self.sha_no_plan), title='other',
                      has_children=True)
         self.b = _browser_with_item(cursor_item, extra=(other,))
-        self.b.select([('commit', self.sha_no_plan)])
+        self.b.select([('commit', 'root', self.sha_no_plan)])
         self.b.run_until_idle()
         ctx2 = Context(self.b)
         self.assertEqual([it.id for it in ctx2.selected],
-                         [('commit', self.sha_no_plan)])
+                         [('commit', 'root', self.sha_no_plan)])
         self.assertIn('commit.diffsel',
                       _tokens(self.r.context_menu_options(ctx2)))
 
     def test_one_other_commit_none_when_two_others_selected(self):
         # Two OTHER commits selected is ambiguous → gate returns None → no row.
-        cursor_item = Item(id=('commit', self.sha_plan), title='subj',
+        cursor_item = Item(id=('commit', 'root', self.sha_plan), title='subj',
                            has_children=True)
-        o1 = Item(id=('commit', self.sha_no_plan), title='o1',
+        o1 = Item(id=('commit', 'root', self.sha_no_plan), title='o1',
                   has_children=True)
-        o2 = Item(id=('commit', 'feedface' * 5), title='o2',
+        o2 = Item(id=('commit', 'root', 'feedface' * 5), title='o2',
                   has_children=True)
         self.b = _browser_with_item(cursor_item, extra=(o1, o2))
-        self.b.select([('commit', self.sha_no_plan), ('commit', 'feedface' * 5)])
+        self.b.select([('commit', 'root', self.sha_no_plan),
+                       ('commit', 'root', 'feedface' * 5)])
         self.b.run_until_idle()
         ctx = Context(self.b)
         self.assertIsNone(self.r._one_other_commit(ctx, self.sha_plan))
         self.assertNotIn('commit.diffsel',
                          _tokens(self.r.context_menu_options(ctx)))
+
+
+class TestSharedCommitExpansionIndependent(unittest.TestCase):
+    """#1144 state-level: the shared commit expands independently per subtree.
+
+    The bug was visible because the framework keys ``state.expanded`` by row id:
+    two branches sharing history produced the SAME ``('commit', sha)`` id, so
+    expanding the commit under one branch revealed/hid its rows under the other.
+    Now the id carries the drill-down root ns (``('commit', ('ref', name),
+    sha)``), so the two copies are distinct ids — expanding one leaves the other
+    collapsed. Asserted through a REAL headless Browser, which owns the
+    expanded-set (a fake ctx wouldn't exercise the real key path).
+    """
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self.r._STDIN_KIND = None
+
+    def tearDown(self):
+        b = getattr(self, 'b', None)
+        if b is not None:
+            b.stop_workers()
+
+    def test_expanding_under_one_ref_leaves_the_twin_collapsed(self):
+        sha = 'a' * 40
+        id_a = ('commit', ('ref', 'feat-a'), sha)
+        id_b = ('commit', ('ref', 'feat-b'), sha)
+        # Each commit owns one inert child so it is genuinely expandable.
+        kids = {
+            id_a: [Item(id=('file', ('ref', 'feat-a'), sha, 'x.py'),
+                        title='x.py')],
+            id_b: [Item(id=('file', ('ref', 'feat-b'), sha, 'x.py'),
+                        title='x.py')],
+        }
+
+        def children(item_id, *, reload=False):
+            if item_id is None:
+                return [Item(id=id_a, title='a', has_children=True),
+                        Item(id=id_b, title='b', has_children=True)]
+            return list(kids.get(item_id, []))
+
+        self.b = make_browser(get_children=children)
+        self.b.refresh()
+        self.b.run_until_idle()
+        ctx = Context(self.b)
+        ctx.expand(id_a)
+        self.b.run_until_idle()
+        # Distinct ids → only feat-a's copy is in the expanded set.
+        self.assertIn(id_a, ctx.state.expanded)
+        self.assertNotIn(id_b, ctx.state.expanded)
+
+
+class TestMMWorktreeLeafExpansionIndependent(unittest.TestCase):
+    """#1144 state-level: a two-sided MM file's staged vs tracked leaves expand
+    independently.
+
+    Commits mode, REAL temp repo, the CURRENT worktree only (no multi-worktree
+    needed): a file that is both staged and further modified (porcelain ``MM``)
+    is classified into BOTH the 'Staged changes' and 'Tracked changes' groups.
+    Before the fix both leaves shared the id ``('status', 'MM', path)``, so
+    expanding the file under one group flipped it under the other; now the
+    ``(bucket, wt_path)`` ns makes them distinct and the framework tracks each
+    separately. The leaves are ``.md`` so they are genuinely expandable (each
+    owns a ``→ browse`` launcher child). Asserted through a real headless
+    Browser, which owns the expanded-set.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._orig_cwd = os.getcwd()
+        cls.repo = tempfile.mkdtemp()
+        cls.addClassCleanup(shutil.rmtree, cls.repo, ignore_errors=True)
+        cls.addClassCleanup(lambda: os.chdir(cls._orig_cwd))
+        env = {**os.environ, 'LC_ALL': 'C',
+               'GIT_AUTHOR_NAME': 'T', 'GIT_AUTHOR_EMAIL': 't@t',
+               'GIT_COMMITTER_NAME': 'T', 'GIT_COMMITTER_EMAIL': 't@t'}
+
+        def git(*args):
+            return subprocess.run(['git', '-C', cls.repo, *args], check=True,
+                                  capture_output=True, text=True, env=env).stdout
+
+        with open(os.path.join(cls.repo, 'doc.md'), 'w') as f:
+            f.write('# v1\n')
+        git('init', '-q', '-b', 'main')
+        git('add', '.')
+        git('commit', '-q', '-m', 'initial')
+        # Stage a change, then modify again on disk → porcelain code 'MM'.
+        with open(os.path.join(cls.repo, 'doc.md'), 'w') as f:
+            f.write('# v2 staged\n')
+        git('add', 'doc.md')
+        with open(os.path.join(cls.repo, 'doc.md'), 'w') as f:
+            f.write('# v3 working\n')
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self.r._STDIN_KIND = None
+        self.r._mode = 'commits'
+        self.r._revs = []
+        self.r._paths = []
+        self.r._all_branches = False
+        self.r._tree_mode = False
+        os.chdir(self.repo)
+
+    def test_expanding_staged_leaf_leaves_tracked_twin_collapsed(self):
+        # Sanity: doc.md is the MM file → it appears in BOTH groups with
+        # distinct, ns-tagged ids.
+        staged = self.r.get_children(('wc', 'staged', None))
+        tracked = self.r.get_children(('wc', 'tracked', None))
+        sid = next(it.id for it in staged if it.id[-1] == 'doc.md')
+        tid = next(it.id for it in tracked if it.id[-1] == 'doc.md')
+        self.assertEqual(sid, ('status', ('staged', None), 'MM', 'doc.md'))
+        self.assertEqual(tid, ('status', ('tracked', None), 'MM', 'doc.md'))
+        self.assertNotEqual(sid, tid)
+
+        # Drive the recipe's REAL get_children through a headless Browser so the
+        # framework's expanded-set is the thing under test.
+        b = make_browser(
+            get_children=lambda _id, *, reload=False: self.r.get_children(_id))
+        try:
+            b.refresh()
+            b.run_until_idle()
+            ctx = Context(b)
+            ctx.expand(sid)
+            b.run_until_idle()
+            self.assertIn(sid, ctx.state.expanded)
+            self.assertNotIn(tid, ctx.state.expanded)
+        finally:
+            b.stop_workers()
 
 
 if __name__ == '__main__':

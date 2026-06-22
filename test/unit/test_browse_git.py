@@ -6,12 +6,14 @@ the diff colorizer and the positional classifier directly we stub
 ``browse_tui`` in ``sys.modules`` and load the extension-less recipe via
 ``SourceFileLoader`` — the same pattern as ``test/unit/test_browse_md.py``.
 
-Row ids are tagged tuples (``('commit', sha)``, ``('file', sha, path)``,
-…) built directly by the construction sites; there is no id-string parser
-to test in isolation, so the id-shape coverage lives in the per-builder
+Row ids are tagged tuples (``('commit', ns, sha)``, ``('file', ns, sha,
+path)``, …) built directly by the construction sites; there is no id-string
+parser to test in isolation, so the id-shape coverage lives in the per-builder
 tests below (each asserts the tuple its rows carry) and the ``id[0]``
 dispatch is covered end-to-end against a real headless Browser in
-``test/ui/test_recipe_browse_git.py``.
+``test/ui/test_recipe_browse_git.py``. The commit-subtree ids are namespaced
+by their drill-down root ``ns`` (#1144) so a sha shared across two open
+subtrees gets distinct ids; ``TestCommitSubtreeIdNamespacing`` locks that.
 
 Coverage (ticket #616 — structural backbone):
 
@@ -570,13 +572,15 @@ class TestDispatchRoundTrip(unittest.TestCase):
 
     def test_get_children_routes_each_tag_to_its_builder(self):
         shas = []
+        ns_seen = []
         calls = {}
-        self.r._commit_files = lambda sha: shas.append(sha) or []
+        self.r._commit_files = (
+            lambda ns, sha: (shas.append(sha), ns_seen.append(ns))[0] or [])
         # The commit branch prepends the md-refs umbrella; that has its own
         # tests (TestMdLauncherCommitMessage) — here stub it inert so this
         # routing check neither shells out for the message nor concatenates a
         # None return from the _commit_files stub above.
-        self.r._commit_md_prefix = lambda sha: []
+        self.r._commit_md_prefix = lambda ns, sha: []
         self.r._log_items = (
             lambda revs, paths, ns: calls.__setitem__('ref', (revs, ns)))
         self.r._worktree_files = (
@@ -584,10 +588,14 @@ class TestDispatchRoundTrip(unittest.TestCase):
                 'wc', (bucket, wt_path)))
         self.r._stash_files = lambda n: calls.__setitem__('stash', n)
 
-        # commit / reflog both drill the file list off a sha (id[1] / id[2]).
-        self.r.get_children(('commit', 'abc123'))
+        # commit / reflog both drill the file list off a sha (id[2] for both);
+        # the file rows are namespaced by the drill-down root — the commit's own
+        # ns, and a synthetic ('reflog', n) for a reflog entry (so two reflog
+        # rows at the same sha don't collide).
+        self.r.get_children(('commit', 'root', 'abc123'))
         self.r.get_children(('reflog', 3, 'deadbeef'))
         self.assertEqual(shas, ['abc123', 'deadbeef'])
+        self.assertEqual(ns_seen, ['root', ('reflog', 3)])
 
         # A ref drills into its commits; the full refname (slashes/colons and
         # all) is the sole rev, and the id itself is threaded as the ns.
@@ -611,7 +619,8 @@ class TestDispatchRoundTrip(unittest.TestCase):
         # below is a leaf / sentinel / filler → empty, no builder reached.
         self.r._root_children = lambda: ['ROOT']
         self.assertEqual(self.r.get_children(None), ['ROOT'])
-        for leaf in (('file', 'sha', 'a/b:c.txt'), ('status', 'M ', 'p.txt'),
+        for leaf in (('file', 'root', 'sha', 'a/b:c.txt'),
+                     ('status', 'M ', 'p.txt'),
                      ('stash', 0, 'p.txt'), ('status_clean',),
                      ('stash_none',), ('err',), ('filler', 'root', 0)):
             self.assertEqual(self.r.get_children(leaf), [], leaf)
@@ -631,13 +640,15 @@ class TestDispatchRoundTrip(unittest.TestCase):
         self.r._stash_file_preview = (
             lambda n, path: seen.__setitem__('stashfile', (n, path)))
 
-        # commit + ref both resolve as a commit-ish → _commit_preview; a
-        # colon-bearing refname reaches it verbatim (no string splitting).
-        self.r.get_preview(('commit', 'abc'))
+        # commit + ref both resolve as a commit-ish → _commit_preview; the
+        # commit's sha rides at id[2] (past the ns), a colon-bearing refname
+        # reaches it verbatim at id[1] (no string splitting).
+        self.r.get_preview(('commit', 'root', 'abc'))
         self.r.get_preview(('ref', 'weird:ref'))
         self.assertEqual(commit_shas, ['abc', 'weird:ref'])
 
-        self.r.get_preview(('file', 'sha', 'a/b:c.txt'))  # colon-bearing path
+        # A file's sha/path ride at id[2]/id[3]; a colon-bearing path is intact.
+        self.r.get_preview(('file', 'root', 'sha', 'a/b:c.txt'))
         self.r.get_preview(('status', 'M ', 'x:y.py'))
         self.r.get_preview(('wc', 'tracked', None))
         self.r.get_preview(('stash', 1))
@@ -666,9 +677,10 @@ class TestDispatchRoundTrip(unittest.TestCase):
                 targets.append(argv)
 
         ctx = Ctx()
-        # file / status both carry the path at id[2]; a colon-bearing path is
-        # handed to $EDITOR verbatim (no repo root resolved here, rc != 0).
-        ctx.cursor = self.r.Item(id=('file', 'sha', 'a/b:c.txt'))
+        # A commit file carries the path at id[3] (past the ns), a status row at
+        # id[2]; a colon-bearing path is handed to $EDITOR verbatim (no repo
+        # root resolved here, rc != 0).
+        ctx.cursor = self.r.Item(id=('file', 'root', 'sha', 'a/b:c.txt'))
         self.r.edit_file(ctx)
         ctx.cursor = self.r.Item(id=('status', 'M ', 'x.py'))
         self.r.edit_file(ctx)
@@ -676,7 +688,8 @@ class TestDispatchRoundTrip(unittest.TestCase):
 
         # A commit / ref / stash row maps to no working-tree path → no-op.
         targets.clear()
-        for nonfile in (('commit', 'sha'), ('ref', 'main'), ('stash', 0)):
+        for nonfile in (('commit', 'root', 'sha'), ('ref', 'main'),
+                        ('stash', 0)):
             ctx.cursor = self.r.Item(id=nonfile)
             self.r.edit_file(ctx)
         self.assertEqual(targets, [])
@@ -1346,14 +1359,14 @@ class TestHeadRowBg(unittest.TestCase):
 
     def test_plain_head_commit_is_marked(self):
         self._stub_run_git(self._plain_log())
-        items = self.r._commit_log_items([], [])
-        head = next(it for it in items if it.id == ('commit', self.HEAD1))
+        items = self.r._commit_log_items([], [], 'root')
+        head = next(it for it in items if it.id == ('commit', 'root', self.HEAD1))
         self.assertEqual(head.row_bg, self.r._HEAD_ROW_BG)
 
     def test_plain_non_head_commit_is_unmarked(self):
         self._stub_run_git(self._plain_log())
-        items = self.r._commit_log_items([], [])
-        other = next(it for it in items if it.id == ('commit', self.OTHER))
+        items = self.r._commit_log_items([], [], 'root')
+        other = next(it for it in items if it.id == ('commit', 'root', self.OTHER))
         self.assertIsNone(getattr(other, 'row_bg', None))
 
     # --- graph builder (_commit_graph_items) ---
@@ -1361,13 +1374,13 @@ class TestHeadRowBg(unittest.TestCase):
     def test_graph_head_commit_is_marked(self):
         self._stub_run_git(self._graph_log())
         items = self.r._commit_graph_items([], [], 'ns')
-        head = next(it for it in items if it.id == ('commit', self.HEAD1))
+        head = next(it for it in items if it.id == ('commit', 'ns', self.HEAD1))
         self.assertEqual(head.row_bg, self.r._HEAD_ROW_BG)
 
     def test_graph_non_head_commit_is_unmarked(self):
         self._stub_run_git(self._graph_log())
         items = self.r._commit_graph_items([], [], 'ns')
-        other = next(it for it in items if it.id == ('commit', self.OTHER))
+        other = next(it for it in items if it.id == ('commit', 'ns', self.OTHER))
         self.assertIsNone(getattr(other, 'row_bg', None))
 
     def test_graph_filler_row_is_unmarked(self):
@@ -1390,8 +1403,8 @@ class TestHeadRowBg(unittest.TestCase):
             f'{self.OTHER}\x00\x00Cat\x003 hours ago\x00shared base\n'
         )
         self._stub_run_git(log)
-        items = self.r._commit_log_items([], [])
-        marked = {it.id[1] for it in items if getattr(it, 'row_bg', None) is not None}
+        items = self.r._commit_log_items([], [], 'root')
+        marked = {it.id[2] for it in items if getattr(it, 'row_bg', None) is not None}
         self.assertEqual(marked, {self.HEAD1, self.HEAD2})
 
     def test_heads_built_once_per_build(self):
@@ -1401,7 +1414,7 @@ class TestHeadRowBg(unittest.TestCase):
         wts = [self.r._Worktree('/repo', self.HEAD1, 'main', True)]
         self.r._worktrees = lambda: (calls.append(1), wts)[1]
         self._stub_run_git(self._plain_log())
-        self.r._commit_log_items([], [])
+        self.r._commit_log_items([], [], 'root')
         self.assertEqual(len(calls), 1)
 
 
@@ -1615,7 +1628,9 @@ class TestInitialCursorId(unittest.TestCase):
         self.r._mode = 'commits'
         full = 'a' * 40
         self._stub_rev_parse(full + '\n')           # rev-parse HEAD -> full sha
-        self.assertEqual(self.r._initial_cursor_id(), ('commit', full))
+        # The commits-mode root log is built with ns='root', so the startup
+        # cursor id carries the same ns.
+        self.assertEqual(self.r._initial_cursor_id(), ('commit', 'root', full))
 
     def test_commits_none_when_rev_parse_fails(self):
         self.r._mode = 'commits'
@@ -1750,11 +1765,12 @@ class TestCommitLogItems(unittest.TestCase):
             ('deadbeefcafe1234567890abcdef000000000000',
              'HEAD -> main', 'Alice', '2 days ago', 'first subject'),
         ])
-        items = self.r._commit_log_items([], [])
+        items = self.r._commit_log_items([], [], 'root')
         self.assertEqual(len(items), 1)
         it = items[0]
-        self.assertEqual(it.id,
-                         ('commit', 'deadbeefcafe1234567890abcdef000000000000'))
+        self.assertEqual(
+            it.id,
+            ('commit', 'root', 'deadbeefcafe1234567890abcdef000000000000'))
         self.assertEqual(it.title, 'first subject')
         self.assertTrue(it.has_children)
 
@@ -1777,7 +1793,7 @@ class TestCommitLogItems(unittest.TestCase):
             ('0123456789abcdef0123456789abcdef01234567',
              '', 'Bob', '5 minutes ago', 'plain subject'),
         ])
-        it = self.r._commit_log_items([], [])[0]
+        it = self.r._commit_log_items([], [], 'root')[0]
         self.assertEqual(it.col_sha, '0123456')
         self.assertEqual(it.col_author, 'Bob')
         self.assertEqual(it.col_date, '5 minutes ago')
@@ -1790,7 +1806,7 @@ class TestCommitLogItems(unittest.TestCase):
             return subprocess.CompletedProcess(args, 1, '', 'boom')
 
         self.r._run_git = fake_run_git
-        items = self.r._commit_log_items([], [])
+        items = self.r._commit_log_items([], [], 'root')
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0].id, ('err',))
         # The error row has no col_sha → git_row_content falls back for it.
@@ -2121,13 +2137,13 @@ class TestCommitsRootWorktreeScope(unittest.TestCase):
         # A positional rev makes the log historical — no live wc rows.
         self.r._revs = ['HEAD~1']
         self.r._paths = []
-        sentinel = self.r.Item(id=('commit', 'sentinel'), title='s',
+        sentinel = self.r.Item(id=('commit', 'root', 'sentinel'), title='s',
                                has_children=True)
-        self.r._commit_log_items = lambda revs, paths: [sentinel]
+        self.r._commit_log_items = lambda revs, paths, ns: [sentinel]
         self.r._worktree_status = lambda paths, wt_path=None: [('M ', 's.txt')]
         items = self.r._commits_root()
         ids = [getattr(it, 'id', None) for it in items]
-        self.assertIn(('commit', 'sentinel'), ids)
+        self.assertIn(('commit', 'root', 'sentinel'), ids)
         self.assertFalse(
             any(isinstance(i, tuple) and i[0] == 'wc' for i in ids))
 
@@ -2136,13 +2152,14 @@ class TestCommitsRootWorktreeScope(unittest.TestCase):
         # BEFORE the commit rows.
         self.r._revs = []
         self.r._paths = []
-        sentinel = self.r.Item(id=('commit', 'sentinel'), title='s',
+        sentinel = self.r.Item(id=('commit', 'root', 'sentinel'), title='s',
                                has_children=True)
-        self.r._commit_log_items = lambda revs, paths: [sentinel]
+        self.r._commit_log_items = lambda revs, paths, ns: [sentinel]
         self.r._worktree_status = lambda paths, wt_path=None: [('M ', 's.txt')]
         items = self.r._commits_root()
         ids = [getattr(it, 'id', None) for it in items]
-        self.assertEqual(ids, [('wc', 'staged', None), ('commit', 'sentinel')])
+        self.assertEqual(ids,
+                         [('wc', 'staged', None), ('commit', 'root', 'sentinel')])
 
 
 class TestCommitsRootAllBranches(unittest.TestCase):
@@ -2164,9 +2181,10 @@ class TestCommitsRootAllBranches(unittest.TestCase):
         self.r._all_branches = True
         captured = {}
         head = 'a' * 40
-        tip = self.r.Item(id=('commit', head), title='tip', has_children=True)
+        tip = self.r.Item(id=('commit', 'root', head), title='tip',
+                          has_children=True)
 
-        def fake_log(revs, paths):
+        def fake_log(revs, paths, ns):
             captured['revs'] = list(revs)
             return [tip]
 
@@ -2186,7 +2204,7 @@ class TestCommitsRootAllBranches(unittest.TestCase):
         self.assertEqual(
             ids,
             [('wc', 'staged', '/repo/.claude/worktrees/foo'),
-             ('commit', head)])
+             ('commit', 'root', head)])
 
     def test_unions_with_positional_revs(self):
         # An explicit rev plus --all → both reach git log (git log <rev>
@@ -2196,7 +2214,7 @@ class TestCommitsRootAllBranches(unittest.TestCase):
         self.r._all_branches = True
         captured = {}
 
-        def fake_log(revs, paths):
+        def fake_log(revs, paths, ns):
             captured['revs'] = list(revs)
             return []
 
@@ -2211,7 +2229,7 @@ class TestCommitsRootAllBranches(unittest.TestCase):
         self.r._paths = []
         captured = {}
 
-        def fake_log(revs, paths):
+        def fake_log(revs, paths, ns):
             captured['revs'] = list(revs)
             return []
 
@@ -2244,11 +2262,12 @@ class TestCurrentWorktreePath(unittest.TestCase):
 class TestInjectWorktreeTips(unittest.TestCase):
     """``_inject_worktree_tips`` splices groups above each worktree's tip.
 
-    Each ``('commit', sha)`` row whose full sha is a worktree HEAD gets that
-    worktree's ``_worktree_groups`` rows spliced immediately before it; the
+    Each ``('commit', ns, sha)`` row whose full sha is a worktree HEAD gets
+    that worktree's ``_worktree_groups`` rows spliced immediately before it; the
     current worktree uses the cwd convention (``wt_path=None`` + ``paths``),
     every other uses its abspath with no path filter. Non-matching commits
-    and filler rows pass through untouched.
+    and filler rows pass through untouched. (In --all commits mode the log is
+    built with ns='root', so the commit rows here carry that ns.)
     """
 
     HEAD1 = 'a' * 40
@@ -2259,7 +2278,8 @@ class TestInjectWorktreeTips(unittest.TestCase):
         self.r = _load_recipe()
 
     def _commit(self, sha, title='x'):
-        return self.r.Item(id=('commit', sha), title=title, has_children=True)
+        return self.r.Item(id=('commit', 'root', sha), title=title,
+                           has_children=True)
 
     def _stub_groups(self):
         # Record (paths, wt_path) per call and emit one identifiable row so
@@ -2287,11 +2307,11 @@ class TestInjectWorktreeTips(unittest.TestCase):
         out = self.r._inject_worktree_tips(items, ['src/'])
         ids = [it.id for it in out]
         self.assertEqual(ids, [
-            ('commit', self.OTHER),
+            ('commit', 'root', self.OTHER),
             ('wc', 'staged', None),          # main tip: cwd group (None)
-            ('commit', self.HEAD1),
+            ('commit', 'root', self.HEAD1),
             ('wc', 'staged', '/wt2'),        # linked tip: abspath group
-            ('commit', self.HEAD2),
+            ('commit', 'root', self.HEAD2),
         ])
         # The cwd group honors paths; the linked group is unfiltered.
         self.assertIn((['src/'], None), self.group_calls)
@@ -2306,7 +2326,7 @@ class TestInjectWorktreeTips(unittest.TestCase):
         self._stub_groups()
         items = [self._commit(self.OTHER)]
         out = self.r._inject_worktree_tips(items, [])
-        self.assertEqual([it.id for it in out], [('commit', self.OTHER)])
+        self.assertEqual([it.id for it in out], [('commit', 'root', self.OTHER)])
         self.assertEqual(self.group_calls, [])
 
     def test_bare_worktree_head_none_ignored(self):
@@ -2317,7 +2337,7 @@ class TestInjectWorktreeTips(unittest.TestCase):
         self._stub_groups()
         items = [self._commit(self.HEAD1)]
         out = self.r._inject_worktree_tips(items, [])
-        self.assertEqual([it.id for it in out], [('commit', self.HEAD1)])
+        self.assertEqual([it.id for it in out], [('commit', 'root', self.HEAD1)])
 
     def test_two_worktrees_sharing_a_head_both_inject(self):
         # Two worktrees at the same tip → both contribute groups, in order,
@@ -2332,7 +2352,7 @@ class TestInjectWorktreeTips(unittest.TestCase):
         self.assertEqual([it.id for it in out], [
             ('wc', 'staged', None),
             ('wc', 'staged', '/wt2'),
-            ('commit', self.HEAD1),
+            ('commit', 'root', self.HEAD1),
         ])
 
     def test_filler_and_meta_rows_pass_through(self):
@@ -2348,7 +2368,7 @@ class TestInjectWorktreeTips(unittest.TestCase):
         self.assertEqual([it.id for it in out], [
             ('filler', 'root', 0),
             ('wc', 'staged', None),
-            ('commit', self.HEAD1),
+            ('commit', 'root', self.HEAD1),
         ])
 
     def test_no_worktrees_returns_items_unchanged(self):
@@ -2371,9 +2391,9 @@ class TestCommitsRootAllInjectsTips(unittest.TestCase):
         self.r._revs = []
         self.r._paths = ['src/']
         self.r._all_branches = True
-        log = [self.r.Item(id=('commit', 'x' * 40), title='t',
+        log = [self.r.Item(id=('commit', 'root', 'x' * 40), title='t',
                            has_children=True)]
-        self.r._commit_log_items = lambda revs, paths: list(log)
+        self.r._commit_log_items = lambda revs, paths, ns: list(log)
         seen = {}
 
         def fake_inject(items, paths):
@@ -2384,8 +2404,107 @@ class TestCommitsRootAllInjectsTips(unittest.TestCase):
         self.r._inject_worktree_tips = fake_inject
         out = self.r._commits_root()
         self.assertEqual(out, ['INJECTED'])
-        self.assertEqual(seen['items'], [('commit', 'x' * 40)])
+        self.assertEqual(seen['items'], [('commit', 'root', 'x' * 40)])
         self.assertEqual(seen['paths'], ['src/'])
+
+
+class TestCommitSubtreeIdNamespacing(unittest.TestCase):
+    """#1144: commit-subtree ids are namespaced by their drill-down root.
+
+    Reproduces the reported bug against a REAL throwaway repo: two branches that
+    share git history (the normal case) are drilled in side-by-side. Before the
+    fix both subtrees emitted the SAME ``('commit', sha)`` id for the shared
+    commit, so the framework — which keys ``state.expanded`` and the child cache
+    by id — toggled the commit under both branches at once. After the fix the
+    drill-down root ``ns`` rides in the id, so the two subtrees' rows are
+    distinct and track expansion independently. The same is checked for the
+    commit's files and ``[md] References`` umbrella, and for two reflog entries
+    pointing at the same sha.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._orig_cwd = os.getcwd()
+        cls.repo = tempfile.mkdtemp()
+        cls.addClassCleanup(shutil.rmtree, cls.repo, ignore_errors=True)
+        cls.addClassCleanup(lambda: os.chdir(cls._orig_cwd))
+        env = {**os.environ, 'LC_ALL': 'C',
+               'GIT_AUTHOR_NAME': 'T', 'GIT_AUTHOR_EMAIL': 't@t',
+               'GIT_COMMITTER_NAME': 'T', 'GIT_COMMITTER_EMAIL': 't@t'}
+
+        def git(*args):
+            return subprocess.run(['git', '-C', cls.repo, *args], check=True,
+                                  capture_output=True, text=True,
+                                  env=env).stdout
+
+        # One shared commit (touching src/x.py and a referenced doc) reachable
+        # from TWO branches — feat-a and feat-b both point at it.
+        os.makedirs(os.path.join(cls.repo, 'src'))
+        with open(os.path.join(cls.repo, 'src', 'x.py'), 'w') as f:
+            f.write('x = 1\n')
+        with open(os.path.join(cls.repo, 'doc.md'), 'w') as f:
+            f.write('# Doc\n')
+        git('init', '-q', '-b', 'main')
+        git('add', '.')
+        git('commit', '-q', '-m', 'shared commit, see doc.md')
+        cls.shared = git('rev-parse', 'HEAD').strip()
+        git('branch', 'feat-a')
+        git('branch', 'feat-b')
+
+    def setUp(self):
+        self.r = _load_recipe()
+        os.chdir(self.repo)
+
+    def test_two_refs_yield_distinct_commit_ids_for_shared_history(self):
+        # Drill both branches; the shared commit appears under each with a
+        # ns-tagged id keyed to the ref it sits under — so the two are distinct.
+        rows_a = self.r.get_children(('ref', 'feat-a'))
+        rows_b = self.r.get_children(('ref', 'feat-b'))
+        id_a = next(it.id for it in rows_a
+                    if it.id[0] == 'commit' and it.id[2] == self.shared)
+        id_b = next(it.id for it in rows_b
+                    if it.id[0] == 'commit' and it.id[2] == self.shared)
+        self.assertEqual(id_a, ('commit', ('ref', 'feat-a'), self.shared))
+        self.assertEqual(id_b, ('commit', ('ref', 'feat-b'), self.shared))
+        self.assertNotEqual(id_a, id_b)
+
+    def test_shared_commit_files_and_md_refs_ids_are_distinct(self):
+        # Expand the shared commit under each ref; its file rows + the [md]
+        # References umbrella carry the parent's ns, so the two subtrees' leaf
+        # ids never collide.
+        kids_a = self.r.get_children(('commit', ('ref', 'feat-a'), self.shared))
+        kids_b = self.r.get_children(('commit', ('ref', 'feat-b'), self.shared))
+        file_a = next(it.id for it in kids_a
+                      if it.id[0] == 'file' and it.id[3] == 'src/x.py')
+        file_b = next(it.id for it in kids_b
+                      if it.id[0] == 'file' and it.id[3] == 'src/x.py')
+        self.assertEqual(
+            file_a, ('file', ('ref', 'feat-a'), self.shared, 'src/x.py'))
+        self.assertEqual(
+            file_b, ('file', ('ref', 'feat-b'), self.shared, 'src/x.py'))
+        self.assertNotEqual(file_a, file_b)
+        # The [md] References umbrella (the commit message names doc.md) is
+        # anchored on (ns, sha) too — distinct per subtree.
+        umb_a = next((it.id for it in kids_a if it.id[0] == 'md-refs'), None)
+        umb_b = next((it.id for it in kids_b if it.id[0] == 'md-refs'), None)
+        self.assertEqual(umb_a, ('md-refs', (('ref', 'feat-a'), self.shared)))
+        self.assertEqual(umb_b, ('md-refs', (('ref', 'feat-b'), self.shared)))
+        self.assertNotEqual(umb_a, umb_b)
+
+    def test_reflog_entries_at_same_sha_get_distinct_file_ids(self):
+        # Two reflog entries pointing at the SAME sha namespace their files by
+        # ('reflog', n), so expanding one entry's files never toggles another's.
+        files_0 = self.r.get_children(('reflog', 0, self.shared))
+        files_1 = self.r.get_children(('reflog', 1, self.shared))
+        fid_0 = next(it.id for it in files_0
+                     if it.id[0] == 'file' and it.id[3] == 'src/x.py')
+        fid_1 = next(it.id for it in files_1
+                     if it.id[0] == 'file' and it.id[3] == 'src/x.py')
+        self.assertEqual(
+            fid_0, ('file', ('reflog', 0), self.shared, 'src/x.py'))
+        self.assertEqual(
+            fid_1, ('file', ('reflog', 1), self.shared, 'src/x.py'))
+        self.assertNotEqual(fid_0, fid_1)
 
 
 class TestGetChildrenWorktreeGroupsPrepend(unittest.TestCase):
@@ -2490,7 +2609,10 @@ class TestGetChildrenWcDrillScope(unittest.TestCase):
         self._capture_run_git()
         items = self.r.get_children(
             ('wc', 'staged', '/repo/.claude/worktrees/foo'))
-        self.assertEqual([it.id for it in items], [('status', 'M ', 's.txt')])
+        self.assertEqual(
+            [it.id for it in items],
+            [('status', ('staged', '/repo/.claude/worktrees/foo'),
+              'M ', 's.txt')])
         # The -C <wt_path> reached _run_git; the cwd _paths filter did not.
         status_args = next(a for a in self.run_calls if 'status' in a)
         self.assertEqual(status_args[:3],
@@ -2502,7 +2624,8 @@ class TestGetChildrenWcDrillScope(unittest.TestCase):
         # ('wc', staged, None) → cwd status (no -C) scoped by _paths.
         self._capture_run_git()
         items = self.r.get_children(('wc', 'staged', None))
-        self.assertEqual([it.id for it in items], [('status', 'M ', 's.txt')])
+        self.assertEqual([it.id for it in items],
+                         [('status', ('staged', None), 'M ', 's.txt')])
         status_args = next(a for a in self.run_calls if 'status' in a)
         self.assertNotIn('-C', status_args)
         # The positional _paths reach git after the -- separator.
@@ -2523,7 +2646,10 @@ class TestWorktreeFiles(unittest.TestCase):
             ('??', 'new.txt'),
         ]
         items = self.r._worktree_files('staged', [])
-        self.assertEqual([it.id for it in items], [('status', 'M ', 's.txt')])
+        # Worktree-group leaves are namespaced by (bucket, wt_path) so the
+        # staged∩tracked (MM) + cross-worktree collisions can't couple them.
+        self.assertEqual([it.id for it in items],
+                         [('status', ('staged', None), 'M ', 's.txt')])
         it = items[0]
         self.assertEqual(it.title, 's.txt')
         self.assertEqual(it.tag, 'M')
@@ -2550,6 +2676,31 @@ class TestWorktreeFiles(unittest.TestCase):
     def test_empty_bucket_is_empty(self):
         self.r._worktree_status = lambda paths, wt_path=None: [('M ', 's.txt')]
         self.assertEqual(self.r._worktree_files('conflicts', []), [])
+
+    def test_two_sided_MM_leaf_distinct_across_staged_and_tracked(self):
+        # #1144: an MM file classifies into BOTH the staged and tracked
+        # buckets. With the (bucket, wt_path) ns the two sibling-group leaves
+        # for the SAME path get distinct ids, so expanding one never toggles
+        # the other (before the fix both were ('status', 'MM', path)).
+        self.r._worktree_status = lambda paths, wt_path=None: [('MM', 'd.py')]
+        staged = self.r._worktree_files('staged', [])
+        tracked = self.r._worktree_files('tracked', [])
+        self.assertEqual([it.id for it in staged],
+                         [('status', ('staged', None), 'MM', 'd.py')])
+        self.assertEqual([it.id for it in tracked],
+                         [('status', ('tracked', None), 'MM', 'd.py')])
+        self.assertNotEqual(staged[0].id, tracked[0].id)
+
+    def test_same_path_distinct_across_worktrees(self):
+        # The same dirty path under two worktrees → distinct leaf ids (the
+        # wt_path half of the ns differs).
+        self.r._worktree_status = lambda paths, wt_path=None: [(' M', 'd.py')]
+        cwd = self.r._worktree_files('tracked', [], None)
+        linked = self.r._worktree_files('tracked', [], '/wt2')
+        self.assertEqual(cwd[0].id, ('status', ('tracked', None), ' M', 'd.py'))
+        self.assertEqual(linked[0].id,
+                         ('status', ('tracked', '/wt2'), ' M', 'd.py'))
+        self.assertNotEqual(cwd[0].id, linked[0].id)
 
 
 class TestWorktreePreviewStat(unittest.TestCase):
@@ -2759,10 +2910,13 @@ class TestWorktreeTipsRealGit(unittest.TestCase):
         self.assertIsNotNone(gid, 'no tracked-changes group injected')
         self.assertEqual(gid[2], self._linked_path())
         # Drilling it lists the linked worktree's dirty file (the main
-        # worktree's tree is clean, so a cwd-scoped status would be empty).
+        # worktree's tree is clean, so a cwd-scoped status would be empty). The
+        # leaf is namespaced by (bucket, wt_path) — distinct from any same-path
+        # leaf under another group/worktree.
         files = self.r.get_children(gid)
-        self.assertEqual([it.id for it in files],
-                         [('status', ' M', 'tracked.txt')])
+        self.assertEqual(
+            [it.id for it in files],
+            [('status', ('tracked', self._linked_path()), ' M', 'tracked.txt')])
         # Its preview is a real --stat from the linked worktree.
         prev = self.r.get_preview(gid)
         self.assertIn('tracked.txt', re.sub(r'\x1b\[[0-9;]*m', '', prev))
@@ -2776,8 +2930,9 @@ class TestWorktreeTipsRealGit(unittest.TestCase):
         self.assertIsNotNone(gid)
         self.assertEqual(gid[2], self._linked_path())
         files = self.r.get_children(gid)
-        self.assertEqual([it.id for it in files],
-                         [('status', ' M', 'tracked.txt')])
+        self.assertEqual(
+            [it.id for it in files],
+            [('status', ('tracked', self._linked_path()), ' M', 'tracked.txt')])
 
     def test_linked_branch_ref_drilldown_shows_its_groups(self):
         # branches-mode: drilling the 'feat' ref (checked out in the linked
@@ -2974,7 +3129,7 @@ class TestCommitGraphItems(unittest.TestCase):
         self.assertEqual(len(items), 1)
         it = items[0]
         # Same columnar commit Item as the plain builder…
-        self.assertEqual(it.id, ('commit', sha))
+        self.assertEqual(it.id, ('commit', 'root', sha))
         self.assertEqual(it.title, 'first subject')
         self.assertTrue(it.has_children)
         self.assertEqual(it.col_sha, 'deadbee')
@@ -3026,8 +3181,8 @@ class TestCommitGraphItems(unittest.TestCase):
         ])
         items = self.r._commit_graph_items([], [], 'root')
         self.assertEqual([it.id for it in items], [
-            ('commit', s1), ('filler', 'root', 0),
-            ('commit', s2), ('filler', 'root', 1),
+            ('commit', 'root', s1), ('filler', 'root', 0),
+            ('commit', 'root', s2), ('filler', 'root', 1),
         ])
         # The second commit's art keeps its leading lane: '| * ' -> '│ •'.
         self.assertEqual(items[2].col_graph, '│ •')
@@ -3076,19 +3231,22 @@ class TestLogItemsRouting(unittest.TestCase):
         self.r = _load_recipe()
 
     def test_routes_to_plain_when_tree_off(self):
-        # Tree off: the plain builder (no namespace) is used; ns is ignored.
+        # Tree off: the plain builder is used and the ns is threaded through (it
+        # rides in every commit id now, so both builders take it).
         self.r._tree_mode = False
-        self.r._commit_log_items = lambda revs, paths: ['PLAIN', revs, paths]
+        self.r._commit_log_items = (
+            lambda revs, paths, ns: ['PLAIN', revs, paths, ns])
         self.r._commit_graph_items = (
             lambda revs, paths, ns: ['GRAPH', revs, paths, ns])
         self.assertEqual(self.r._log_items(['r'], ['p'], ns='root'),
-                         ['PLAIN', ['r'], ['p']])
+                         ['PLAIN', ['r'], ['p'], 'root'])
 
     def test_routes_to_graph_when_tree_on_threading_ns(self):
         # Tree on: the graph builder is used and the ns is threaded through
         # verbatim — a ref drill-down passes its ('ref', refname) id as ns.
         self.r._tree_mode = True
-        self.r._commit_log_items = lambda revs, paths: ['PLAIN', revs, paths]
+        self.r._commit_log_items = (
+            lambda revs, paths, ns: ['PLAIN', revs, paths, ns])
         self.r._commit_graph_items = (
             lambda revs, paths, ns: ['GRAPH', revs, paths, ns])
         self.assertEqual(self.r._log_items(['r'], ['p'], ns=('ref', 'feat')),
@@ -4803,39 +4961,47 @@ class TestMdLauncherCommitMessage(unittest.TestCase):
     def test_no_resolving_refs_yields_no_umbrella(self):
         self._git('plain subject, no markdown links\n')
         self.assertEqual(self.r._commit_md_refs('SHA'), [])
-        self.assertEqual(self.r._commit_md_prefix('SHA'), [])
+        self.assertEqual(self.r._commit_md_prefix('root', 'SHA'), [])
 
     def test_prefix_is_the_references_umbrella(self):
+        # The umbrella anchors on the compound (ns, sha) so two open subtrees
+        # sharing a sha get distinct umbrella ids: ('md-refs', (ns, sha)).
         self._git('see r.md\n', tree=('r.md',))
-        prefix = self.r._commit_md_prefix('SHA')
+        prefix = self.r._commit_md_prefix('root', 'SHA')
         self.assertEqual(len(prefix), 1)
         umb = prefix[0]
-        self.assertEqual(umb.id, ('md-refs', 'SHA'))
+        self.assertEqual(umb.id, ('md-refs', ('root', 'SHA')))
         self.assertEqual(umb.tag, 'md')
         self.assertTrue(umb.has_children)
 
     def test_get_children_commit_prepends_umbrella_before_files(self):
-        # The commit row's children = umbrella FIRST, then its files.
+        # The commit row's children = umbrella FIRST, then its files. The commit
+        # id (('commit', ns, sha)) threads its ns into both the umbrella anchor
+        # and the file rows.
         self._git('refs a.md\n', tree=('a.md',))
-        self.r._commit_files = lambda sha: [
-            self.r.Item(id=('file', sha, 'src/x.py'), title='src/x.py')]
-        rows = self.r.get_children(('commit', 'SHA'))
-        self.assertEqual([r.id for r in rows],
-                         [('md-refs', 'SHA'), ('file', 'SHA', 'src/x.py')])
+        self.r._commit_files = lambda ns, sha: [
+            self.r.Item(id=('file', ns, sha, 'src/x.py'), title='src/x.py')]
+        rows = self.r.get_children(('commit', 'root', 'SHA'))
+        self.assertEqual(
+            [r.id for r in rows],
+            [('md-refs', ('root', 'SHA')), ('file', 'root', 'SHA', 'src/x.py')])
 
     def test_get_children_commit_no_refs_is_files_only(self):
         self._git('no links here\n')
-        self.r._commit_files = lambda sha: ['FILES']
-        self.assertEqual(self.r.get_children(('commit', 'SHA')), ['FILES'])
+        self.r._commit_files = lambda ns, sha: ['FILES']
+        self.assertEqual(self.r.get_children(('commit', 'root', 'SHA')),
+                         ['FILES'])
 
     def test_umbrella_children_are_blob_launcher_rows(self):
-        # Expanding ('md-refs', SHA) yields one [md ↗] row per resolving ref,
-        # each carrying a ('blob', SHA, path) spec for a stdin launch.
+        # Expanding ('md-refs', (ns, SHA)) yields one [md ↗] row per resolving
+        # ref, each anchored on the (ns, SHA) compound (so two open subtrees
+        # don't collide) yet carrying a ('blob', SHA, path) spec — the BARE sha
+        # — for a stdin launch.
         self._git('see a.md and docs/b.md\n', tree=('a.md', 'docs/b.md'))
-        rows = self.r.get_children(('md-refs', 'SHA'))
+        rows = self.r.get_children(('md-refs', ('root', 'SHA')))
         self.assertEqual([r.id for r in rows], [
-            ('launch', 'SHA', 'blob', 'SHA', 'a.md'),
-            ('launch', 'SHA', 'blob', 'SHA', 'docs/b.md'),
+            ('launch', ('root', 'SHA'), 'blob', 'SHA', 'a.md'),
+            ('launch', ('root', 'SHA'), 'blob', 'SHA', 'docs/b.md'),
         ])
         for r in rows:
             self.assertFalse(r.has_children)
@@ -4845,7 +5011,7 @@ class TestMdLauncherCommitMessage(unittest.TestCase):
         self._git('see a.md\n', tree=('a.md',))
         self.r._md_doc = None
         self.assertEqual(self.r._commit_md_refs('SHA'), [])
-        self.assertEqual(self.r._commit_md_prefix('SHA'), [])
+        self.assertEqual(self.r._commit_md_prefix('root', 'SHA'), [])
 
 
 class TestMdLauncherFileRows(unittest.TestCase):
@@ -4870,11 +5036,15 @@ class TestMdLauncherFileRows(unittest.TestCase):
         self.assertFalse(txt_leaf.has_children)
 
     def test_committed_md_file_child_is_blob_spec(self):
-        # ('file', sha, path).md → ('blob', sha, path): extracted from the rev.
-        rows = self.r.get_children(('file', 'SHA', 'docs/g.md'))
+        # ('file', ns, sha, path).md → ('blob', sha, path): extracted from the
+        # rev (the spec carries the BARE sha/path). The launcher anchors on the
+        # full namespaced file id, so it is unique per subtree automatically.
+        rows = self.r.get_children(('file', 'root', 'SHA', 'docs/g.md'))
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0].id,
-                         ('launch', ('file', 'SHA', 'docs/g.md'), 'blob', 'SHA', 'docs/g.md'))
+        self.assertEqual(
+            rows[0].id,
+            ('launch', ('file', 'root', 'SHA', 'docs/g.md'),
+             'blob', 'SHA', 'docs/g.md'))
         self.assertEqual(rows[0].title, '→ browse')
         self.assertEqual(rows[0].tag, 'md ↗')
         self.assertFalse(rows[0].has_children)
@@ -4908,7 +5078,7 @@ class TestMdLauncherFileRows(unittest.TestCase):
 
     def test_non_md_file_rows_stay_leaves(self):
         # A non-.md file/status/stash leaf still routes to no children.
-        for leaf in (('file', 'SHA', 'x.py'), ('status', 'M ', 'y.txt'),
+        for leaf in (('file', 'root', 'SHA', 'x.py'), ('status', 'M ', 'y.txt'),
                      ('stash', 0, 'z.rs')):
             self.assertEqual(self.r.get_children(leaf), [], leaf)
 
@@ -4916,7 +5086,8 @@ class TestMdLauncherFileRows(unittest.TestCase):
         self.r._md_doc = None
         # No arrow on the leaf, and an "expanded" .md leaf falls through to [].
         self.assertFalse(self.r._status_leaf('M ', 'a.md').has_children)
-        self.assertEqual(self.r.get_children(('file', 'SHA', 'a.md')), [])
+        self.assertEqual(self.r.get_children(('file', 'root', 'SHA', 'a.md')),
+                         [])
 
 
 class TestMdLauncherEnterDispatch(unittest.TestCase):
@@ -5049,8 +5220,10 @@ class TestMdLauncherPreview(unittest.TestCase):
         self.assertEqual(pv, '')
 
     def test_preview_md_refs_umbrella_delegates_to_commit(self):
+        # id = ('md-refs', (ns, sha)); the preview unpacks the bare sha.
         self.r._commit_preview = lambda sha: f'COMMIT {sha}'
-        self.assertEqual(self.r.get_preview(('md-refs', 'SHA')), 'COMMIT SHA')
+        self.assertEqual(self.r.get_preview(('md-refs', ('root', 'SHA'))),
+                         'COMMIT SHA')
 
 
 class TestDisplayMode(unittest.TestCase):
