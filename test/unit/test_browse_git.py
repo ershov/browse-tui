@@ -4021,5 +4021,246 @@ class TestMdLauncherPreview(unittest.TestCase):
         self.assertEqual(self.r.get_preview(('md-refs', 'SHA')), 'COMMIT SHA')
 
 
+class TestDisplayMode(unittest.TestCase):
+    """``_DISPLAY_MODE`` (the 1/2/3 keys) gates ``git_row_content``'s LEADING
+    columns; the commit-row emission and the filler-row pad share one notion
+    of which leading columns are active (``_LEAD_FIELDS``) so they cannot
+    drift. The graph column (``_tree_mode``) is INDEPENDENT of the mode.
+    """
+
+    def setUp(self):
+        self.r = _load_recipe()
+        # The mode is a module global flipped by the actions; restore it so a
+        # mutating test never bleeds into another.
+        self.addCleanup(setattr, self.r, '_DISPLAY_MODE', self.r._DISPLAY_MODE)
+
+    def _widths(self, sha=7, author=5, date=12):
+        return {'col_sha': sha, 'col_author': author, 'col_date': date}
+
+    def _commit(self, **kw):
+        defaults = dict(id=('commit', 'deadbee'), title='subj',
+                        col_sha='deadbee', col_author='Al',
+                        col_date='2 days ago', chips=[])
+        defaults.update(kw)
+        return self.r.Item(**defaults)
+
+    def test_default_mode_is_3(self):
+        # A freshly loaded recipe defaults to the full sha/author/date set.
+        self.assertEqual(self.r._DISPLAY_MODE, 3)
+
+    def test_lead_fields_table(self):
+        # The single source of truth: mode 3 = sha+author+date, mode 2 = sha,
+        # mode 1 = none, each in render order.
+        self.assertEqual(self.r._LEAD_FIELDS, {
+            3: ('col_sha', 'col_author', 'col_date'),
+            2: ('col_sha',),
+            1: (),
+        })
+
+    def test_mode3_emits_sha_author_date_then_subject(self):
+        self.r._DISPLAY_MODE = 3
+        ctx = _FakeCtx(self._widths(sha=7, author=5, date=12))
+        segs = self.r.git_row_content(self._commit(title='the subject'), ctx)
+        # sha (yellow), author (dim), date (dim), subject (plain, last).
+        self.assertEqual(segs, [
+            ('deadbee' + '  ', *_YELLOW),
+            ('Al   ' + '  ', *_DIM),
+            ('2 days ago  ' + '  ', *_DIM),
+            ('the subject', None, False),
+        ])
+        # Measured exactly the three leading columns, in order.
+        self.assertEqual(ctx.calls, ['col_sha', 'col_author', 'col_date'])
+
+    def test_mode2_emits_sha_then_subject_only(self):
+        self.r._DISPLAY_MODE = 2
+        ctx = _FakeCtx(self._widths(sha=7, author=5, date=12))
+        segs = self.r.git_row_content(self._commit(title='the subject'), ctx)
+        # Only the sha column (yellow) survives, then the subject — no
+        # author/date columns anywhere.
+        self.assertEqual(segs, [
+            ('deadbee' + '  ', *_YELLOW),
+            ('the subject', None, False),
+        ])
+        # Only the sha width was measured (author/date untouched).
+        self.assertEqual(ctx.calls, ['col_sha'])
+
+    def test_mode1_emits_subject_only(self):
+        self.r._DISPLAY_MODE = 1
+        ctx = _FakeCtx(self._widths(sha=7, author=5, date=12))
+        segs = self.r.git_row_content(self._commit(title='the subject'), ctx)
+        # No leading columns at all — the subject is the sole segment.
+        self.assertEqual(segs, [('the subject', None, False)])
+        # No leading column was measured.
+        self.assertEqual(ctx.calls, [])
+
+    def test_chips_and_subject_order_preserved_each_mode(self):
+        # Across every mode the chips follow the (gated) leading columns and
+        # the subject stays LAST.
+        for mode in (3, 2, 1):
+            self.r._DISPLAY_MODE = mode
+            ctx = _FakeCtx(self._widths())
+            segs = self.r.git_row_content(
+                self._commit(title='subj',
+                             chips=[('HEAD', 'green'), ('main', 'cyan')]), ctx)
+            # Two chips precede the subject regardless of leading-column count.
+            self.assertEqual(segs[-3], ('[HEAD] ', *self.r.style('green')),
+                             f'mode {mode}: HEAD chip slot')
+            self.assertEqual(segs[-2], ('[main] ', *self.r.style('cyan')),
+                             f'mode {mode}: main chip slot')
+            self.assertEqual(segs[-1], ('subj', None, False),
+                             f'mode {mode}: subject not last')
+
+    def test_filler_pad_tracks_active_mode_leading_columns(self):
+        # The filler row's blank pad spans EXACTLY the active mode's leading
+        # columns (each width + 2-space gap): mode 3 = sha+author+date,
+        # mode 2 = sha, mode 1 = 0 — so the graph art aligns under the
+        # commits in every mode.
+        widths = self._widths(sha=7, author=5, date=12)
+        cases = {
+            3: (7 + 2) + (5 + 2) + (12 + 2),
+            2: (7 + 2),
+            1: 0,
+        }
+        measured = {
+            3: ['col_sha', 'col_author', 'col_date'],
+            2: ['col_sha'],
+            1: [],
+        }
+        for mode, expected in cases.items():
+            self.r._DISPLAY_MODE = mode
+            ctx = _FakeCtx(dict(widths))
+            filler = self.r.Item(id=('filler', 'root', 0), title='',
+                                 has_children=False, col_graph='│\\')
+            segs = self.r.git_row_content(filler, ctx)
+            pad_seg, art_seg = segs
+            self.assertEqual(pad_seg, (' ' * expected, None, False),
+                             f'mode {mode}: filler pad width')
+            self.assertEqual(art_seg, ('│\\', None, False),
+                             f'mode {mode}: filler art')
+            self.assertEqual(ctx.calls, measured[mode],
+                             f'mode {mode}: filler measured columns')
+
+    def test_filler_pad_aligns_with_commit_graph_each_mode(self):
+        # Tie it together: in every mode the filler pad equals the commit
+        # row's leading-column prefix width, so the two graph columns line up.
+        widths = self._widths(sha=7, author=7, date=12)
+        for mode in (3, 2, 1):
+            self.r._DISPLAY_MODE = mode
+            commit = self._commit(col_sha='abc1234', col_author='Bernard',
+                                  col_date='3 weeks ago', col_graph='•')
+            filler = self.r.Item(id=('filler', 'root', 0), title='',
+                                 has_children=False, col_graph='│')
+            c_segs = self.r.git_row_content(commit, _FakeCtx(dict(widths)))
+            f_segs = self.r.git_row_content(filler, _FakeCtx(dict(widths)))
+            n_lead = len(self.r._LEAD_FIELDS[mode])
+            prefix = sum(len(c_segs[i][0]) for i in range(n_lead))
+            self.assertEqual(len(f_segs[0][0]), prefix,
+                             f'mode {mode}: filler pad != commit lead prefix')
+
+    def test_graph_emitted_in_every_display_mode(self):
+        # The commit graph column is INDEPENDENT of the display mode: when a
+        # commit carries ``col_graph`` (tree mode on) it is emitted right
+        # after the leading columns in all three modes.
+        for mode in (3, 2, 1):
+            self.r._DISPLAY_MODE = mode
+            ctx = _FakeCtx(self._widths())
+            segs = self.r.git_row_content(
+                self._commit(title='subj', chips=[], col_graph='•'), ctx)
+            n_lead = len(self.r._LEAD_FIELDS[mode])
+            # Graph sits immediately after the (gated) leading columns.
+            self.assertEqual(segs[n_lead], ('• ', None, False),
+                             f'mode {mode}: graph not after leading columns')
+            self.assertEqual(segs[-1], ('subj', None, False),
+                             f'mode {mode}: subject not last')
+
+    def test_non_commit_row_falls_back_every_mode(self):
+        # A row with neither col_sha nor col_graph falls back to
+        # default_row_content (and measures no column) regardless of mode.
+        for mode in (3, 2, 1):
+            self.r._DISPLAY_MODE = mode
+            ctx = _FakeCtx(self._widths())
+            item = self.r.Item(id=('status', 'M ', 'beta.txt'),
+                               title='beta.txt', tag='M', has_children=False)
+            segs = self.r.git_row_content(item, ctx)
+            self.assertEqual(segs, self.r.default_row_content(item, ctx),
+                             f'mode {mode}: not the fallback')
+            self.assertEqual(ctx.calls, [], f'mode {mode}: measured a column')
+
+    def test_set_display_mode_flips_flashes_refreshes(self):
+        # The 1/2/3 actions set _DISPLAY_MODE, flash the mode label, and
+        # refresh (a pure re-render — no refetch).
+        calls = {'refresh': 0, 'flashes': []}
+
+        class Ctx:
+            def flash(self, text, log=False):
+                calls['flashes'].append(text)
+
+            def refresh(self, id=None, on_complete=None):
+                calls['refresh'] += 1
+
+        ctx = Ctx()
+        for mode, label in (
+            (1, 'display: subject only'),
+            (2, 'display: sha · subject'),
+            (3, 'display: sha · author · date · subject'),
+        ):
+            self.r._set_display_mode(ctx, mode)
+            self.assertEqual(self.r._DISPLAY_MODE, mode)
+        self.assertEqual(calls['refresh'], 3)
+        self.assertEqual(calls['flashes'], [
+            'display: subject only',
+            'display: sha · subject',
+            'display: sha · author · date · subject',
+        ])
+
+    def test_actions_register_1_2_3_to_set_display_mode(self):
+        # End-to-end: the recipe registers bare-digit 1/2/3 actions wired to
+        # _set_display_mode (proving the keys are FREE in browse-git — the
+        # framework binds only alt-1..4 — and bound to the handler). Drive
+        # main() in repo mode with git stubbed, capture the config the stub
+        # Browser is built with, then fire each digit handler.
+        captured = {}
+
+        class _Stub:
+            def __init__(self, *a, **kw):
+                self._args = a
+                for k, v in kw.items():
+                    setattr(self, k, v)
+                captured['cfg'] = a[0] if a else None
+
+            def run(self):
+                return 0
+
+        ok = subprocess.CompletedProcess([], 0, '', '')
+        self.r.Browser = _Stub
+        self.r._run_git = lambda *a, **k: ok        # rev-parse → inside work tree
+        self.r.shutil = types.SimpleNamespace(which=lambda _: '/usr/bin/git')
+        saved_argv = list(self.r.sys.argv)
+        try:
+            self.r.sys.argv[:] = ['browse-git']
+            with self.assertRaises(SystemExit):     # main() ends in sys.exit(run())
+                self.r.main()
+        finally:
+            self.r.sys.argv[:] = saved_argv
+
+        # ``Action`` is the inert stub: its positional fields land in _args
+        # (key, label, handler, requires).
+        by_key = {a._args[0]: a for a in captured['cfg'].actions}
+        for key in ('1', '2', '3'):
+            self.assertIn(key, by_key, f'{key!r} not registered')
+
+        class Ctx:
+            def flash(self, text, log=False):
+                pass
+
+            def refresh(self, id=None, on_complete=None):
+                pass
+
+        for key, mode in (('1', 1), ('2', 2), ('3', 3)):
+            by_key[key]._args[2](Ctx())             # the handler
+            self.assertEqual(self.r._DISPLAY_MODE, mode,
+                             f'action {key!r} set mode {self.r._DISPLAY_MODE}')
+
+
 if __name__ == '__main__':
     unittest.main()
