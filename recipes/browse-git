@@ -910,7 +910,32 @@ def _status_tag(xy):
     return ''
 
 
-def _status_diff_plan(xy, path):
+def _status_wt_path(item_id):
+    """The worktree absolute path for a status leaf's per-file ops, or ``None``.
+
+    A worktree-group status leaf carries its worktree in the id
+    (``('status', (bucket, wt_path), xy, path)`` — #1144): return that
+    ``wt_path`` (``item_id[1][1]``), which is ``None`` for the current
+    worktree / cwd and an absolute path for a linked one. A bare status-MODE
+    leaf (``('status', xy, path)``) has no worktree field, so it returns
+    ``None`` — the cwd convention, unchanged. ``None`` always means "run in
+    cwd"; an abspath means "run ``git -C <wt_path>``" (mirrors
+    ``_worktree_status``).
+
+    Only meaningful for ``status`` ids, so it is gated on the ``id[0]``
+    discriminator: any other kind returns ``None``. This matters because
+    ``edit_file`` calls it on EVERY cursor id, and another 4-tuple whose
+    ``id[1]`` is a tuple — e.g. a reflog-drilled commit file
+    ``('file', ('reflog', n), sha, path)`` — would otherwise return the int
+    ``n``, crashing the subsequent ``os.path.join``.
+    """
+    if (isinstance(item_id, tuple) and len(item_id) == 4
+            and item_id[0] == 'status' and isinstance(item_id[1], tuple)):
+        return item_id[1][1]
+    return None
+
+
+def _status_diff_plan(xy, path, wt_path=None):
     """Map a porcelain ``XY`` + path to the diff command(s) to render.
 
     Returns a list of ``(header, argv)`` pairs — the per-file diff(s) whose
@@ -931,17 +956,27 @@ def _status_diff_plan(xy, path):
     ``git`` (color is applied by the caller via ``_git_color``). Note the
     ``--no-index`` diff exits non-zero whenever the files differ — the
     caller must NOT gate on the return code.
+
+    ``wt_path`` selects the worktree: ``None`` (the default) diffs in cwd
+    exactly as before; a non-None absolute path prepends ``['-C', wt_path]``
+    to EACH argv (a git global option before the subcommand, mirroring
+    ``_worktree_status``) so a worktree-group leaf diffs against ITS worktree.
+    This single choke point makes both the preview pane (``_status_preview``)
+    and the menu Diff (``_cm_status_diff``) worktree-correct.
     """
     if _is_conflict(xy):
-        return [('conflict', ['diff', '--', path])]
-    if xy == '??':
-        return [('untracked', ['diff', '--no-index', '--', '/dev/null', path])]
-    x, y = xy[0], xy[1] if len(xy) > 1 else ' '
-    plan = []
-    if x not in (' ', '?'):
-        plan.append(('staged', ['diff', '--cached', '--', path]))
-    if y not in (' ', '?'):
-        plan.append(('unstaged', ['diff', '--', path]))
+        plan = [('conflict', ['diff', '--', path])]
+    elif xy == '??':
+        plan = [('untracked', ['diff', '--no-index', '--', '/dev/null', path])]
+    else:
+        x, y = xy[0], xy[1] if len(xy) > 1 else ' '
+        plan = []
+        if x not in (' ', '?'):
+            plan.append(('staged', ['diff', '--cached', '--', path]))
+        if y not in (' ', '?'):
+            plan.append(('unstaged', ['diff', '--', path]))
+    if wt_path is not None:
+        plan = [(header, ['-C', wt_path, *argv]) for header, argv in plan]
     return plan
 
 
@@ -1535,12 +1570,12 @@ def get_children(item_id, *, reload=False):
         # launcher opening the real on-disk file by PATH (the working copy is
         # the live document). id = ('status', xy, path) in status mode, or
         # ('status', (bucket, wt_path), xy, path) under a worktree group — the
-        # path is the LAST field either way. (The abspath is still resolved
-        # against _repo_root() / cwd; linked-worktree targeting is a separate
-        # gap, see the #1134 follow-up.)
+        # path is the LAST field either way. A worktree-group leaf resolves the
+        # abspath against ITS worktree (``_status_wt_path``); a status-mode leaf
+        # (wt_path None) resolves against _repo_root() / cwd as before.
         path = item_id[-1]
-        root = _repo_root()
-        abspath = os.path.join(root, path) if root else path
+        base = _status_wt_path(item_id) or _repo_root() or ''
+        abspath = os.path.join(base, path) if base else path
         return _md_file_children(item_id, ('wtfile', abspath))
     if kind == 'stash' and len(item_id) == 3 and _md_launchable(item_id[2]):
         # A stashed ``.md`` file leaf expands into a ``→ browse`` launcher
@@ -2463,11 +2498,14 @@ def get_preview(item_id):
     if kind == 'status':
         # id = ('status', xy, path) in status mode, or ('status', (bucket,
         # wt_path), xy, path) under a worktree group — xy/path are the last two
-        # fields either way.
+        # fields either way; a worktree-group leaf also carries its worktree
+        # (``_status_wt_path``), so its preview diffs against THAT worktree.
         if _STDIN_KIND == 'status':
-            # Piped status carries no diff text — show the entry itself.
+            # Piped status carries no diff text (and no worktree) — show the
+            # entry itself.
             return f'{item_id[-2]} {item_id[-1]}'
-        return _status_preview(item_id[-2], item_id[-1])
+        return _status_preview(item_id[-2], item_id[-1],
+                               _status_wt_path(item_id))
     if kind == 'wc':
         # A worktree-status group — a --stat summary of the bucket (the
         # per-file diff lives on its child leaves). id = ('wc', bucket,
@@ -2510,7 +2548,7 @@ def _file_preview(sha, path):
     return _colorize_diff(raw)
 
 
-def _status_preview(xy, path):
+def _status_preview(xy, path, wt_path=None):
     """Status-leaf preview: the staged / worktree / untracked diff(s).
 
     The ``XY`` code selects the diff command(s) via ``_status_diff_plan``;
@@ -2518,8 +2556,12 @@ def _status_preview(xy, path):
     two-sided code (``MM``) shows both sections under ``── staged ──`` /
     ``── unstaged ──`` headers. The ``--no-index`` untracked diff exits
     non-zero by design, so its output is captured regardless of code.
+
+    ``wt_path`` (the leaf's worktree, ``None`` for cwd) is threaded to
+    ``_status_diff_plan`` so a worktree-group leaf previews ITS worktree's
+    diff rather than the current one.
     """
-    plan = _status_diff_plan(xy, path)
+    plan = _status_diff_plan(xy, path, wt_path)
     sections = []
     multi = len(plan) > 1
     for header, argv in plan:
@@ -2729,7 +2771,9 @@ def edit_file(ctx):
     working-tree path; other row kinds (commits, refs, stashes) are a
     no-op. ``('file', …)`` paths are repo-root relative, so resolve them
     against the work-tree root — outside a repo (possible in stdin mode)
-    the rev-parse fails and the path opens cwd-relative.
+    the rev-parse fails and the path opens cwd-relative. A worktree-group
+    status leaf carries its own worktree (``_status_wt_path``), so its file
+    resolves against THAT worktree instead.
     """
     item = ctx.cursor
     if item is None or not isinstance(item.id, tuple):
@@ -2744,8 +2788,16 @@ def edit_file(ctx):
         path = item.id[-1]
     else:
         return
-    root = _run_git('rev-parse', '--show-toplevel')
-    base = root.stdout.strip() if root.returncode == 0 else ''
+    # A worktree-group status leaf carries its worktree — resolve the
+    # working-tree file against THAT worktree so ``E`` edits the right copy;
+    # committed file rows, piped-diff files, and status-mode leaves (wt_path
+    # None) resolve against the cwd repo root as before.
+    wt_path = _status_wt_path(item.id)
+    if wt_path is not None:
+        base = wt_path
+    else:
+        root = _run_git('rev-parse', '--show-toplevel')
+        base = root.stdout.strip() if root.returncode == 0 else ''
     target = os.path.join(base, path) if base else path
     editor = os.environ.get('EDITOR', 'vi')
     ctx.run_external([editor, target])
@@ -3204,37 +3256,47 @@ def context_menu_ref(ctx, item_id):
 
 
 # -- status entry ('status', xy, path) / ('status', (bucket, wt_path), xy, path)
+#
+# Each handler takes the leaf's ``wt_path`` (``_status_wt_path``, threaded by
+# the ``_MENU_ACTIONS`` lambda): ``None`` for a status-mode / current-worktree
+# leaf (act in cwd, unchanged) or an absolute path for a linked worktree, where
+# ``['-C', wt_path]`` is prepended to the git argv so the MUTATING actions
+# (stage/unstage/discard) hit the right worktree.
 
 
-def _cm_status_stage(ctx, xy, path):
-    _git_action(ctx, ['add', '--', path], ok_msg=f'staged {path}')
+def _cm_status_stage(ctx, xy, path, wt_path=None):
+    argv = (['-C', wt_path] if wt_path else []) + ['add', '--', path]
+    _git_action(ctx, argv, ok_msg=f'staged {path}')
 
 
-def _cm_status_unstage(ctx, xy, path):
-    _git_action(ctx, ['restore', '--staged', '--', path],
-                ok_msg=f'unstaged {path}')
+def _cm_status_unstage(ctx, xy, path, wt_path=None):
+    argv = (['-C', wt_path] if wt_path else []) + ['restore', '--staged',
+                                                   '--', path]
+    _git_action(ctx, argv, ok_msg=f'unstaged {path}')
 
 
-def _cm_status_discard(ctx, xy, path):
+def _cm_status_discard(ctx, xy, path, wt_path=None):
     # Irreversible — strong confirm (default No). An untracked file (``??``)
     # has nothing to restore from the index, so it's removed outright; a
     # tracked change is reverted to HEAD's content.
+    pre = ['-C', wt_path] if wt_path else []
     if xy == '??':
-        _git_action(ctx, ['clean', '-f', '--', path],
+        _git_action(ctx, pre + ['clean', '-f', '--', path],
                     ok_msg=f'removed untracked {path}',
                     confirm_msg=f'Delete untracked file {path}? '
                                 'This cannot be undone.', strong=True)
     else:
-        _git_action(ctx, ['checkout', '--', path],
+        _git_action(ctx, pre + ['checkout', '--', path],
                     ok_msg=f'discarded changes in {path}',
                     confirm_msg=f'Discard changes in {path}? '
                                 'This cannot be undone.', strong=True)
 
 
-def _cm_status_diff(ctx, xy, path):
+def _cm_status_diff(ctx, xy, path, wt_path=None):
     # Reuse the recipe's status diff-plan (staged / worktree / untracked) and
-    # page each section, so the menu Diff matches the preview pane.
-    plan = _status_diff_plan(xy, path)
+    # page each section, so the menu Diff matches the preview pane — including
+    # the leaf's worktree (``wt_path``), which the plan injects as ``-C``.
+    plan = _status_diff_plan(xy, path, wt_path)
     multi = len(plan) > 1
     sections = []
     for header, argv in plan:
@@ -3250,14 +3312,16 @@ def _cm_status_diff(ctx, xy, path):
     ctx.page(text, lang='diff')
 
 
-def _cm_status_open_dir(ctx, xy, path):
+def _cm_status_open_dir(ctx, xy, path, wt_path=None):
     """Open the file's containing directory in browse-fs.
 
-    The path is repo-root relative, so resolve it against the work-tree root
-    (matching ``E`` / the launcher path resolve) before taking its dirname; a
-    missing ``browse-fs`` on PATH surfaces via ``run_external``'s own error.
+    The path is worktree-root relative, so resolve it against the leaf's
+    worktree (``wt_path`` for a linked-worktree leaf, else the cwd work-tree
+    root — matching ``E`` / the launcher path resolve) before taking its
+    dirname; a missing ``browse-fs`` on PATH surfaces via ``run_external``'s
+    own error.
     """
-    root = _repo_root()
+    root = wt_path or _repo_root()
     abspath = os.path.join(root, path) if root else path
     ctx.run_external(['browse-fs', os.path.dirname(abspath) or '.'],
                      keep_screen=True)
@@ -3269,7 +3333,8 @@ def context_menu_status(ctx, item_id):
     Serves both the status-mode leaf (``('status', xy, path)``) and the
     worktree-group leaf (``('status', (bucket, wt_path), xy, path)``) — the
     builder emits a fixed row list; ``_MENU_ACTIONS`` reads ``xy`` / ``path``
-    from the id's last two fields, so the namespace is transparent here.
+    from the id's last two fields and the leaf's worktree via
+    ``_status_wt_path``, so the namespace is transparent here.
 
     "Edit in $EDITOR" duplicates the ``E`` action → ``(E)`` hint. Stage /
     Unstage are both always offered (a two-sided ``MM`` entry is both staged
@@ -3395,14 +3460,21 @@ _MENU_ACTIONS = {
     'ref.branch':      lambda c, i: _cm_ref_branch_from(c, i[1]),
     'ref.delete':      lambda c, i: _cm_ref_delete(c, i[1]),
     # status entry
-    # status leaf: ('status', xy, path) or namespaced ('status', ns, xy, path)
-    # — xy/path are the last two fields either way (negative indices).
-    'status.stage':    lambda c, i: _cm_status_stage(c, i[-2], i[-1]),
-    'status.unstage':  lambda c, i: _cm_status_unstage(c, i[-2], i[-1]),
-    'status.discard':  lambda c, i: _cm_status_discard(c, i[-2], i[-1]),
+    # status leaf: ('status', xy, path) or namespaced ('status', (bucket,
+    # wt_path), xy, path) — xy/path are the last two fields either way (negative
+    # indices); a worktree-group leaf also carries its worktree
+    # (``_status_wt_path``), threaded so the actions hit that worktree.
+    'status.stage':    lambda c, i: _cm_status_stage(
+        c, i[-2], i[-1], _status_wt_path(i)),
+    'status.unstage':  lambda c, i: _cm_status_unstage(
+        c, i[-2], i[-1], _status_wt_path(i)),
+    'status.discard':  lambda c, i: _cm_status_discard(
+        c, i[-2], i[-1], _status_wt_path(i)),
     'status.edit':     lambda c, i: edit_file(c),
-    'status.diff':     lambda c, i: _cm_status_diff(c, i[-2], i[-1]),
-    'status.opendir':  lambda c, i: _cm_status_open_dir(c, i[-2], i[-1]),
+    'status.diff':     lambda c, i: _cm_status_diff(
+        c, i[-2], i[-1], _status_wt_path(i)),
+    'status.opendir':  lambda c, i: _cm_status_open_dir(
+        c, i[-2], i[-1], _status_wt_path(i)),
     # stash
     'stash.apply':     lambda c, i: _cm_stash_apply(c, i[1]),
     'stash.pop':       lambda c, i: _cm_stash_pop(c, i[1]),

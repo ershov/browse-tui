@@ -632,7 +632,8 @@ class TestDispatchRoundTrip(unittest.TestCase):
         self.r._file_preview = (
             lambda sha, path: seen.__setitem__('file', (sha, path)))
         self.r._status_preview = (
-            lambda xy, path: seen.__setitem__('status', (xy, path)))
+            lambda xy, path, wt_path=None: seen.__setitem__(
+                'status', (xy, path, wt_path)))
         self.r._worktree_preview = (
             lambda bucket, paths, wt_path=None: seen.__setitem__(
                 'wc', (bucket, wt_path)))
@@ -649,13 +650,16 @@ class TestDispatchRoundTrip(unittest.TestCase):
 
         # A file's sha/path ride at id[2]/id[3]; a colon-bearing path is intact.
         self.r.get_preview(('file', 'root', 'sha', 'a/b:c.txt'))
+        # A status-mode leaf carries no worktree → wt_path None; a
+        # worktree-group leaf threads its wt_path (id[1][1]) to _status_preview.
         self.r.get_preview(('status', 'M ', 'x:y.py'))
+        self.r.get_preview(('status', ('tracked', '/wt/foo'), ' M', 'z.py'))
         self.r.get_preview(('wc', 'tracked', None))
         self.r.get_preview(('stash', 1))
         self.r.get_preview(('stash', 1, 'a:b.py'))
         self.assertEqual(seen, {
             'file': ('sha', 'a/b:c.txt'),
-            'status': ('M ', 'x:y.py'),
+            'status': (' M', 'z.py', '/wt/foo'),
             'wc': ('tracked', None),
             'stash': 1,
             'stashfile': (1, 'a:b.py'),
@@ -693,6 +697,28 @@ class TestDispatchRoundTrip(unittest.TestCase):
             ctx.cursor = self.r.Item(id=nonfile)
             self.r.edit_file(ctx)
         self.assertEqual(targets, [])
+
+    def test_edit_file_reflog_file_row_does_not_crash(self):
+        # Regression: a reflog-drilled commit file is ('file', ('reflog', n),
+        # sha, path) — a 4-tuple whose id[1] is a tuple holding the int n. An
+        # ungated _status_wt_path returned n, so os.path.join(n, path) raised
+        # TypeError when E / file.edit fired on it. The path must resolve
+        # against the repo root (cwd convention, wt_path None), never n.
+        targets = []
+        self.r._run_git = lambda *a: subprocess.CompletedProcess(
+            a, 0, '/repo/root\n', '')
+
+        class Ctx:
+            cursor = None
+
+            def run_external(self, argv):
+                targets.append(argv)
+
+        ctx = Ctx()
+        ctx.cursor = self.r.Item(id=('file', ('reflog', 0), 'deadbeef',
+                                     'README.md'))
+        self.r.edit_file(ctx)  # must NOT raise TypeError
+        self.assertEqual(targets[-1][-1], '/repo/root/README.md')
 
 
 class TestClassifyPositionals(unittest.TestCase):
@@ -1093,6 +1119,58 @@ class TestStatusDiffPlan(unittest.TestCase):
             self.r._status_diff_plan('??', 'f.txt'),
             [('untracked',
               ['diff', '--no-index', '--', '/dev/null', 'f.txt'])])
+
+    def test_wt_path_none_is_unchanged(self):
+        # The explicit None default leaves the argv exactly as the cwd case.
+        self.assertEqual(self.r._status_diff_plan('M ', 'f.txt', None),
+                         self.r._status_diff_plan('M ', 'f.txt'))
+
+    def test_wt_path_prepends_minus_C_to_each_argv(self):
+        # A non-None wt_path injects ``-C <wt_path>`` as a git global option
+        # before EACH subcommand (mirrors _worktree_status), so a two-sided
+        # MM gets both argvs prefixed.
+        wt = '/repo/.claude/worktrees/foo'
+        self.assertEqual(self.r._status_diff_plan('MM', 'f.txt', wt), [
+            ('staged', ['-C', wt, 'diff', '--cached', '--', 'f.txt']),
+            ('unstaged', ['-C', wt, 'diff', '--', 'f.txt']),
+        ])
+        self.assertEqual(self.r._status_diff_plan('??', 'f.txt', wt), [
+            ('untracked',
+             ['-C', wt, 'diff', '--no-index', '--', '/dev/null', 'f.txt'])])
+
+
+class TestStatusWtPath(unittest.TestCase):
+    """``_status_wt_path`` extracts a status leaf's worktree (or None)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_status_mode_leaf_has_no_worktree(self):
+        # A bare 3-tuple status-mode leaf → None (cwd convention).
+        self.assertIsNone(self.r._status_wt_path(('status', 'M ', 'f.txt')))
+
+    def test_worktree_group_leaf_current_is_none(self):
+        # A current-worktree group leaf carries wt_path None.
+        self.assertIsNone(
+            self.r._status_wt_path(('status', ('tracked', None), ' M', 'f.txt')))
+
+    def test_worktree_group_leaf_linked_returns_abspath(self):
+        # A linked-worktree group leaf returns its absolute wt_path (id[1][1]).
+        wt = '/repo/.claude/worktrees/foo'
+        self.assertEqual(
+            self.r._status_wt_path(('status', ('tracked', wt), ' M', 'f.txt')),
+            wt)
+
+    def test_non_status_4tuple_with_tuple_at_1_is_none(self):
+        # A reflog-drilled commit file ('file', ('reflog', n), sha, path) is a
+        # 4-tuple whose id[1] is a tuple (n an int) — the gate on id[0]=='status'
+        # keeps it from returning the int n (which os.path.join would crash on).
+        self.assertIsNone(self.r._status_wt_path(
+            ('file', ('reflog', 0), 'deadbeef', 'README.md')))
+        # And a plain namespaced commit file likewise → None (not a status id).
+        self.assertIsNone(self.r._status_wt_path(
+            ('file', 'root', 'sha', 'a/b.txt')))
 
 
 class TestStashIndex(unittest.TestCase):
@@ -2949,6 +3027,131 @@ class TestWorktreeTipsRealGit(unittest.TestCase):
         self.assertIsNone(self._tracked_group_id(items))
 
 
+@unittest.skipUnless(shutil.which('git'), 'git not available')
+class TestWorktreeStatusActionsRealGit(unittest.TestCase):
+    """End-to-end: a linked-worktree status leaf previews + ACTS on ITS worktree.
+
+    The #1148 fix: a status leaf under another worktree's group carries that
+    worktree (``('status', (bucket, wt_path), xy, path)``), so its per-file
+    diff/preview and the stage/unstage/discard actions must run ``git -C
+    <wt_path>`` rather than in cwd. Both the MAIN and the LINKED worktree have
+    a DISTINCT dirty file, so a wrong-worktree diff (or a wrong-worktree stage)
+    is observable: the linked leaf must show the LINKED file's diff and stage it
+    in the LINKED index, never the current one. Run against the real git binary
+    (no stubbed ``_run_git``) so the actual ``-C`` injection is exercised.
+    """
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self._orig_cwd = os.getcwd()
+        self.env = {**os.environ,
+                    'GIT_AUTHOR_NAME': 'T', 'GIT_AUTHOR_EMAIL': 't@t',
+                    'GIT_COMMITTER_NAME': 'T', 'GIT_COMMITTER_EMAIL': 't@t'}
+        self.main = tempfile.mkdtemp()
+        self._git(self.main, 'init', '-q', '-b', 'main')
+        Path(self.main, 'cwd.txt').write_text('one\n')
+        Path(self.main, 'linked.txt').write_text('one\n')
+        self._git(self.main, 'add', '.')
+        self._git(self.main, 'commit', '-qm', 'init')
+        # A linked worktree on its own branch. Then make a DISTINCT dirty
+        # tracked change in EACH worktree (different files, different content)
+        # so cross-worktree leakage is visible.
+        self.linked = os.path.join(self.main, 'wt-feat')
+        self._git(self.main, 'worktree', 'add', '-q', '-b', 'feat', self.linked)
+        Path(self.main, 'cwd.txt').write_text('one\nCWD-CHANGE\n')
+        Path(self.linked, 'linked.txt').write_text('one\nLINKED-CHANGE\n')
+        os.chdir(self.main)
+
+    def tearDown(self):
+        os.chdir(self._orig_cwd)
+
+    def _git(self, cwd, *args):
+        return subprocess.run(['git', '-C', cwd, *args], check=True,
+                              capture_output=True, text=True, env=self.env)
+
+    def _linked_path(self):
+        # git resolves the worktree path through realpath (macOS /var ->
+        # /private/var); match _current_worktree_path's basis.
+        return os.path.realpath(self.linked)
+
+    @staticmethod
+    def _plain(text):
+        return re.sub(r'\x1b\[[0-9;]*m', '', text)
+
+    def _staged_in(self, cwd):
+        out = self._git(cwd, 'diff', '--cached', '--name-only').stdout
+        return out.split()
+
+    # ---- preview / diff correctness -------------------------------------
+
+    def test_linked_leaf_preview_shows_linked_worktree_diff(self):
+        # The namespaced linked leaf previews the LINKED file's change, NOT the
+        # main worktree's (which would be the cwd-scoped, wrong diff).
+        leaf = ('status', ('tracked', self._linked_path()), ' M', 'linked.txt')
+        prev = self._plain(self.r.get_preview(leaf))
+        self.assertIn('LINKED-CHANGE', prev)
+        self.assertNotIn('CWD-CHANGE', prev)
+        # _status_preview given the wt_path directly is identical.
+        direct = self._plain(self.r._status_preview(
+            ' M', 'linked.txt', self._linked_path()))
+        self.assertIn('LINKED-CHANGE', direct)
+
+    def test_current_worktree_leaf_preview_is_cwd(self):
+        # A current-worktree group leaf (wt_path None) previews the cwd file,
+        # exactly as before the fix.
+        leaf = ('status', ('tracked', None), ' M', 'cwd.txt')
+        prev = self._plain(self.r.get_preview(leaf))
+        self.assertIn('CWD-CHANGE', prev)
+        self.assertNotIn('LINKED-CHANGE', prev)
+
+    def test_status_mode_leaf_preview_is_cwd(self):
+        # A bare status-mode leaf (3-tuple, no worktree) previews cwd, unchanged.
+        prev = self._plain(self.r.get_preview(('status', ' M', 'cwd.txt')))
+        self.assertIn('CWD-CHANGE', prev)
+        self.assertNotIn('LINKED-CHANGE', prev)
+
+    # ---- MUTATING action correctness (data-safety) ----------------------
+
+    def test_stage_via_menu_handler_stages_in_linked_not_cwd(self):
+        # Drive the real menu dispatch for a linked-worktree leaf: the file must
+        # stage in the LINKED index and the cwd index must stay clean. Wrong-
+        # worktree targeting here would stage the wrong repo — the data-safety
+        # bug this fix closes.
+        self.assertEqual(self._staged_in(self.linked), [])
+        self.assertEqual(self._staged_in(self.main), [])
+        leaf = ('status', ('tracked', self._linked_path()), ' M', 'linked.txt')
+        ctx = _StageCtx()
+        self.r._MENU_ACTIONS['status.stage'](ctx, leaf)
+        self.assertTrue(ctx.refreshed, 'stage did not succeed')
+        self.assertEqual(self._staged_in(self.linked), ['linked.txt'])
+        self.assertEqual(self._staged_in(self.main), [])
+
+    def test_stage_direct_handler_with_wt_path_targets_linked(self):
+        # The handler called directly with the wt_path stages in the linked
+        # worktree (the unit-level form of the menu path above).
+        ctx = _StageCtx()
+        self.r._cm_status_stage(ctx, ' M', 'linked.txt', self._linked_path())
+        self.assertEqual(self._staged_in(self.linked), ['linked.txt'])
+        self.assertEqual(self._staged_in(self.main), [])
+
+
+class _StageCtx:
+    """Minimal ctx for the non-confirming stage action (flash/refresh/error)."""
+
+    def __init__(self):
+        self.refreshed = False
+        self.errored = None
+
+    def flash(self, *a, **k):
+        pass
+
+    def refresh(self, *a, **k):
+        self.refreshed = True
+
+    def error(self, msg, *a, **k):
+        self.errored = msg
+
+
 class TestStashPreviewStat(unittest.TestCase):
     """``_stash_preview`` summarises a stash with ``--stat`` (like a commit)."""
 
@@ -4330,13 +4533,15 @@ class TestStdinTreeAndPreviews(unittest.TestCase):
 
     def test_repo_mode_status_preview_still_routes_to_git_builder(self):
         # With no stdin state the status branch routes to _status_preview
-        # exactly as before — the seam changes nothing in repo mode.
+        # exactly as before — the seam changes nothing in repo mode. A
+        # status-mode leaf carries no worktree, so wt_path is None.
         self.assertIsNone(self.r._STDIN_KIND)
         seen = {}
         self.r._status_preview = (
-            lambda xy, path: seen.__setitem__('args', (xy, path)) or 'REPO')
+            lambda xy, path, wt_path=None: seen.__setitem__(
+                'args', (xy, path, wt_path)) or 'REPO')
         self.assertEqual(self.r.get_preview(('status', 'M ', 'x.py')), 'REPO')
-        self.assertEqual(seen['args'], ('M ', 'x.py'))
+        self.assertEqual(seen['args'], ('M ', 'x.py', None))
 
 
 @unittest.skipUnless(shutil.which('git'), 'git not available')
