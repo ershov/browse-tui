@@ -1471,6 +1471,109 @@ class TestWorktreesRoot(unittest.TestCase):
         self.assertEqual([it.id for it in items], [('err',)])
 
 
+class TestInitialCursorId(unittest.TestCase):
+    """``_initial_cursor_id`` targets the checked-out row per mode, else None.
+
+    Stubs ``_run_git`` (rev-parse) / ``_worktrees`` and sets ``_mode`` /
+    ``_STDIN_KIND`` on the freshly loaded module; the returned id must match
+    the row id shape each builder emits (full sha for commits, short name
+    for branches, ``('worktree', path, label)`` for the main worktree).
+    """
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self.r._STDIN_KIND = None
+
+    def _stub_rev_parse(self, out, rc=0):
+        # Stub _run_git so any rev-parse returns ``out`` (rc ``rc``); other
+        # git calls would fail (unused by this helper's path).
+        def fake(*args):
+            if args and args[0] == 'rev-parse':
+                return subprocess.CompletedProcess(args, rc, out, '')
+            return subprocess.CompletedProcess(args, 1, '', '')
+        self.r._run_git = fake
+
+    # ---- commits -------------------------------------------------------
+    def test_commits_returns_full_head_sha_commit_id(self):
+        self.r._mode = 'commits'
+        full = 'a' * 40
+        self._stub_rev_parse(full + '\n')           # rev-parse HEAD -> full sha
+        self.assertEqual(self.r._initial_cursor_id(), ('commit', full))
+
+    def test_commits_none_when_rev_parse_fails(self):
+        self.r._mode = 'commits'
+        self._stub_rev_parse('', rc=128)            # e.g. unborn HEAD / gitless
+        self.assertIsNone(self.r._initial_cursor_id())
+
+    def test_commits_none_when_sha_blank(self):
+        self.r._mode = 'commits'
+        self._stub_rev_parse('   \n')               # rc 0 but empty output
+        self.assertIsNone(self.r._initial_cursor_id())
+
+    # ---- branches ------------------------------------------------------
+    def test_branches_returns_current_branch_ref_id(self):
+        self.r._mode = 'branches'
+        self._stub_rev_parse('main\n')              # --abbrev-ref HEAD
+        self.assertEqual(self.r._initial_cursor_id(), ('ref', 'main'))
+
+    def test_branches_none_when_detached(self):
+        self.r._mode = 'branches'
+        self._stub_rev_parse('HEAD\n')              # detached -> literal 'HEAD'
+        self.assertIsNone(self.r._initial_cursor_id())
+
+    def test_branches_none_when_rev_parse_fails(self):
+        self.r._mode = 'branches'
+        self._stub_rev_parse('', rc=128)
+        self.assertIsNone(self.r._initial_cursor_id())
+
+    # ---- worktrees -----------------------------------------------------
+    def test_worktrees_returns_main_row_id_with_label(self):
+        self.r._mode = 'worktrees'
+        # Reuse the shared porcelain: main is /repo on branch 'main'. The id
+        # must equal _worktrees_root's main row id exactly.
+        wts = self.r._parse_worktree_list(_WT_PORCELAIN)
+        self.r._worktrees = lambda: wts
+        self.assertEqual(self.r._initial_cursor_id(),
+                         ('worktree', '/repo', 'main'))
+        self.assertEqual(self.r._initial_cursor_id(),
+                         self.r._worktrees_root()[0].id)
+
+    def test_worktrees_detached_main_uses_short_head_label(self):
+        # A detached main worktree (no branch) -> the label is head[:7], so
+        # the id carries the short HEAD sha — matching _worktree_label.
+        self.r._mode = 'worktrees'
+        self.r._worktrees = lambda: [
+            self.r._Worktree('/repo', 'e' * 40, None, True)]
+        self.assertEqual(self.r._initial_cursor_id(),
+                         ('worktree', '/repo', 'eeeeeee'))
+
+    def test_worktrees_none_when_empty(self):
+        self.r._mode = 'worktrees'
+        self.r._worktrees = lambda: []              # git worktree list failed
+        self.assertIsNone(self.r._initial_cursor_id())
+
+    # ---- modes with no checked-out concept -----------------------------
+    def test_status_reflog_stash_return_none(self):
+        # No rev-parse / _worktrees should even be consulted for these.
+        self.r._run_git = lambda *a: (_ for _ in ()).throw(
+            AssertionError('_run_git must not be called'))
+        self.r._worktrees = lambda: (_ for _ in ()).throw(
+            AssertionError('_worktrees must not be called'))
+        for mode in ('status', 'reflog', 'stash'):
+            self.r._mode = mode
+            self.assertIsNone(self.r._initial_cursor_id(), mode)
+
+    # ---- stdin mode short-circuits before any mode check ---------------
+    def test_stdin_mode_returns_none_regardless_of_mode(self):
+        self.r._run_git = lambda *a: (_ for _ in ()).throw(
+            AssertionError('_run_git must not be called in stdin mode'))
+        for kind in ('diff', 'log', 'status'):
+            self.r._STDIN_KIND = kind
+            for mode in ('commits', 'branches', 'worktrees'):
+                self.r._mode = mode
+                self.assertIsNone(self.r._initial_cursor_id(), (kind, mode))
+
+
 class TestGetChildrenWorktree(unittest.TestCase):
     """``get_children(('worktree', ...))`` drills the label via ``_log_items``."""
 

@@ -1688,6 +1688,21 @@ def _worktree_relpath(abspath, main_root):
     return os.path.relpath(abspath, main_root)
 
 
+def _worktree_label(wt):
+    """The ``label`` for a ``_Worktree`` row: branch short-name, else short
+    HEAD sha (detached), else ``(bare)`` (no HEAD line in the porcelain).
+
+    Shared by ``_worktrees_root`` (the row title + id) and
+    ``_initial_cursor_id`` (the main-worktree cursor target) so the
+    ``('worktree', path, label)`` id shape can't drift between them.
+    """
+    if wt.branch is not None:
+        return wt.branch
+    if wt.head is not None:
+        return wt.head[:7]          # detached: short HEAD sha
+    return '(bare)'                 # bare worktree: no HEAD to show
+
+
 def _worktrees_root():
     """Worktrees-mode root = one ``('worktree', abspath, label)`` row each.
 
@@ -1709,12 +1724,7 @@ def _worktrees_root():
     main_root = next((wt.path for wt in worktrees if wt.is_main), None)
     items = []
     for wt in worktrees:
-        if wt.branch is not None:
-            label = wt.branch
-        elif wt.head is not None:
-            label = wt.head[:7]          # detached: short HEAD sha
-        else:
-            label = '(bare)'             # bare worktree: no HEAD to show
+        label = _worktree_label(wt)
         relpath = (_worktree_relpath(wt.path, main_root)
                    if main_root is not None else wt.path)
         kind = 'main' if wt.is_main else 'linked'
@@ -3378,6 +3388,49 @@ def _classify_positionals():
         sys.exit(2)
 
 
+def _initial_cursor_id():
+    """The startup-cursor target row id for the active ``_mode``, or ``None``.
+
+    Lands the cursor on the currently checked-out row instead of the top:
+    the HEAD commit in commits mode, the current branch's ref in branches
+    mode, the main worktree in worktrees mode. Modes with no checked-out
+    concept (status / reflog / stash) and stdin mode return ``None`` — the
+    cursor stays at the top. The returned id matches the row id shape its
+    builder emits exactly (``_commit_log_items`` / ``_branches_root`` /
+    ``_worktrees_root``), so ``cursor_to`` can find the row.
+
+    Every git lookup degrades to ``None`` on failure (``_run_git`` folds a
+    missing binary into a failed CompletedProcess), so this never raises.
+    """
+    if _STDIN_KIND is not None:
+        return None
+    if _mode == 'commits':
+        # HEAD commit row — ids carry the FULL sha (git log %H), not the
+        # abbreviated col_sha; resolve the full sha via rev-parse.
+        result = _run_git('rev-parse', 'HEAD')
+        if result.returncode != 0:
+            return None
+        sha = result.stdout.strip()
+        return ('commit', sha) if sha else None
+    if _mode == 'branches':
+        # Current branch's ref row; a detached HEAD (rev-parse yields the
+        # literal 'HEAD') has no current-branch row -> no-op.
+        result = _run_git('rev-parse', '--abbrev-ref', 'HEAD')
+        if result.returncode != 0:
+            return None
+        short = result.stdout.strip()
+        if not short or short == 'HEAD':
+            return None
+        return ('ref', short)
+    if _mode == 'worktrees':
+        # The main worktree row; _worktree_label mirrors _worktrees_root.
+        main = next((wt for wt in _worktrees() if wt.is_main), None)
+        if main is None:
+            return None
+        return ('worktree', main.path, _worktree_label(main))
+    return None
+
+
 def _window_title():
     """Title reflecting the active mode and any positional rev/path filter.
 
@@ -3494,6 +3547,17 @@ def main():
     # kinds / repo modes have no umbrella and start as before.
     if _STDIN_KIND == 'diff':
         b.expand(('sdiff',))
+    # Land the cursor on the currently checked-out row (HEAD commit / current
+    # branch / main worktree, per mode) instead of the top — a posted
+    # ``cursor_to`` (best-effort for these top-level rows, thread-safe, a
+    # no-op if the id isn't present), issued before the run loop like the
+    # expand above. Defensive: ``_initial_cursor_id`` already returns None on
+    # any git failure, but never let a cursor placement take down the launch.
+    try:
+        if (tid := _initial_cursor_id()) is not None:
+            b.cursor_to(tid)
+    except Exception:
+        pass
     sys.exit(b.run())
 
 

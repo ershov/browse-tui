@@ -558,9 +558,10 @@ class TestBrowseGit(unittest.TestCase):
     def test_worktree_group_drills_into_file(self):
         """Right-arrow on the first worktree row reveals its file leaf.
 
-        The cursor starts on the topmost row — the ``Untracked changes``
-        group — so a single Right expands it into its ``untracked.txt``
-        file leaf.
+        Commits mode now lands the startup cursor on the HEAD commit
+        (ticket #1132), so first ``Home`` to the topmost row — the
+        ``Untracked changes`` group — then a single Right expands it into
+        its ``untracked.txt`` file leaf.
         """
         with tempfile.TemporaryDirectory() as tmp:
             _make_repo_with_changes(tmp)
@@ -568,6 +569,7 @@ class TestBrowseGit(unittest.TestCase):
                 t.send_line(f'cd {tmp}')
                 t.launch(_BIN, '--run-py', _RECIPE)
                 t.wait_for('Untracked changes', timeout=5.0)
+                t.send('Home')         # off the HEAD-commit start row
                 t.send('Right')
                 t.wait_for('untracked.txt', timeout=5.0)
                 t.send('q')
@@ -576,10 +578,12 @@ class TestBrowseGit(unittest.TestCase):
         """The ``Conflicts`` row appears mid-merge and drills to its file.
 
         ``_make_repo_with_conflict`` leaves ``conflict.txt`` unmerged, so the
-        commits-mode root carries a ``Conflicts`` group. The cursor starts on
-        the topmost row (``Conflicts`` is the only worktree group here), so a
-        Right expands it into the ``conflict.txt`` leaf. If the harness can't
-        produce a real conflict the test skips rather than asserting falsely.
+        commits-mode root carries a ``Conflicts`` group. Commits mode lands
+        the startup cursor on the HEAD commit (ticket #1132), so first
+        ``Home`` to the topmost row (``Conflicts`` is the only worktree group
+        here), then a Right expands it into the ``conflict.txt`` leaf. If the
+        harness can't produce a real conflict the test skips rather than
+        asserting falsely.
         """
         with tempfile.TemporaryDirectory() as tmp:
             _, conflicted = _make_repo_with_conflict(tmp)
@@ -590,6 +594,7 @@ class TestBrowseGit(unittest.TestCase):
                 t.send_line(f'cd {tmp}')
                 t.launch(_BIN, '--run-py', _RECIPE)
                 t.wait_for('Conflicts', timeout=5.0)
+                t.send('Home')         # off the HEAD-commit start row
                 t.send('Right')
                 t.wait_for('conflict.txt', timeout=5.0)
                 t.send('q')
