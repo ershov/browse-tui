@@ -263,18 +263,25 @@ class _DataLayerBase(unittest.TestCase):
         self.r._PS_USER_WIDTH_OK = None
         self.r._UID_NAMES = {}
 
-    def _snapshot(self, ps_out, *, platform='linux', private=None, reload=True):
-        """Run ``_snapshot`` with mocked ``ps`` / platform / smaps reads.
+    def _snapshot(self, ps_out, *, platform='linux', private=None,
+                  cpu_secs=None, reload=True):
+        """Run ``_snapshot`` with mocked ``ps`` / platform / per-pid /proc reads.
 
-        ``private`` maps pid → private-memory bytes (Linux smaps_rollup result);
-        a pid absent from the map (or ``private=None``) reads as ``None`` so the
-        snapshot falls back to RSS.
+        ``private`` maps pid → private-memory bytes (smaps_rollup result), and
+        ``cpu_secs`` maps pid → fine ``/proc/<pid>/stat`` CPU seconds. A pid
+        absent from a map (or the map omitted) reads as ``None``, so the
+        snapshot falls back to RSS / the coarse ps TIME column respectively.
+        Mocking ``_proc_cpu_secs`` also keeps the suite off real ``/proc`` for
+        the fake pids in the canned output.
         """
         priv = private or {}
+        cpu = cpu_secs or {}
         with mock.patch.object(self.r.subprocess, 'run', _ps_completed(ps_out)), \
              mock.patch.object(self.r.sys, 'platform', platform), \
              mock.patch.object(self.r, '_private_mem_bytes',
-                               lambda pid: priv.get(pid)):
+                               lambda pid: priv.get(pid)), \
+             mock.patch.object(self.r, '_proc_cpu_secs',
+                               lambda pid: cpu.get(pid)):
             return self.r._snapshot(reload=reload)
 
 
@@ -387,30 +394,38 @@ class TestMemorySelection(_DataLayerBase):
 
 
 class TestCpuPercent(_DataLayerBase):
-    """CPU% = cumulative-time delta, with the pcpu lifetime fallback."""
+    """CPU% = cumulative-time delta (per-core), with the pcpu lifetime fallback."""
 
     def test_first_sample_uses_pcpu(self):
         # No prior snapshot → fall back to the ps pcpu lifetime average.
         self._snapshot(_PS_OUT)
         self.assertEqual(self.r._cpu_pct(self.r._CUR_SNAPSHOT[1][100]), 12)
 
-    def test_delta_overrides_pcpu(self):
-        # Two snapshots with a known wall + cpu_secs gap → instantaneous %.
-        self._snapshot(_PS_OUT)
-        # Advance: pid 100 burns +4 cpu_secs over a 1s wall gap on 8 cores
-        # → 100 * 4 / (1 * 8) = 50%.
+    def test_delta_is_per_core_and_subsecond(self):
+        # The fix: fine /proc cpu time gives sub-second deltas, and the formula
+        # is per-core (no ncpu divisor). +0.5 cpu over a 1 s wall gap → 50% —
+        # the old whole-second ps-TIME source would have deltaed to 0 here.
+        self._snapshot(_PS_OUT, cpu_secs={1: 200.0, 100: 30.0})
         prev_wall = self.r._CUR_SNAPSHOT[0]
-        out2 = (
-            '    1     0 root  0.5  9164 00:03:29 /sbin/init\n'
-            '  100     1 alice 12.0 4096 00:00:34 python3\n'   # 30s → 34s = +4
-        )
-        with mock.patch.object(self.r, '_private_mem_bytes', lambda pid: None), \
-             mock.patch.object(self.r.sys, 'platform', 'linux'), \
-             mock.patch.object(self.r.subprocess, 'run', _ps_completed(out2)), \
-             mock.patch.object(self.r.os, 'cpu_count', lambda: 8), \
-             mock.patch.object(self.r.time, 'monotonic', lambda: prev_wall + 1.0):
-            self.r._snapshot(reload=True)
+        with mock.patch.object(self.r.time, 'monotonic', lambda: prev_wall + 1.0):
+            self._snapshot(_PS_OUT, cpu_secs={1: 200.0, 100: 30.5})
         self.assertEqual(self.r._cpu_pct(self.r._CUR_SNAPSHOT[1][100]), 50)
+
+    def test_delta_can_exceed_100_per_core(self):
+        # +2 cpu-seconds per wall-second = 200% (two cores), per-core convention.
+        self._snapshot(_PS_OUT, cpu_secs={1: 200.0, 100: 10.0})
+        prev_wall = self.r._CUR_SNAPSHOT[0]
+        with mock.patch.object(self.r.time, 'monotonic', lambda: prev_wall + 1.0):
+            self._snapshot(_PS_OUT, cpu_secs={1: 200.0, 100: 12.0})
+        self.assertEqual(self.r._cpu_pct(self.r._CUR_SNAPSHOT[1][100]), 200)
+
+    def test_negative_delta_falls_back_to_pcpu(self):
+        # A recycled pid / counter reset (negative delta) → pcpu, not a bogus %.
+        self._snapshot(_PS_OUT, cpu_secs={1: 200.0, 100: 99.0})
+        prev_wall = self.r._CUR_SNAPSHOT[0]
+        with mock.patch.object(self.r.time, 'monotonic', lambda: prev_wall + 1.0):
+            self._snapshot(_PS_OUT, cpu_secs={1: 200.0, 100: 1.0})
+        self.assertEqual(self.r._cpu_pct(self.r._CUR_SNAPSHOT[1][100]), 12)  # pcpu
 
     def test_new_pid_uses_pcpu(self):
         # A pid present only in the current snapshot has no prior → pcpu.
@@ -418,6 +433,33 @@ class TestCpuPercent(_DataLayerBase):
         out2 = _PS_OUT + '  300     1 bob  7.0  100 00:00:05 newproc\n'
         procs = self._snapshot(out2)
         self.assertEqual(self.r._cpu_pct(procs[300]), 7)
+
+    def test_linux_uses_fine_cpu_time_over_ps_time(self):
+        # On Linux the fine /proc cpu time wins over the coarse ps TIME column.
+        procs = self._snapshot(_PS_OUT, cpu_secs={100: 42.5})
+        self.assertEqual(procs[100].cpu_secs, 42.5)        # not 30 (TIME column)
+
+    def test_falls_back_to_ps_time_when_proc_unavailable(self):
+        # /proc read fails (→ None) → the coarse ps TIME column (whole seconds).
+        procs = self._snapshot(_PS_OUT)                    # _proc_cpu_secs → None
+        self.assertEqual(procs[100].cpu_secs, 30)          # 00:00:30
+
+
+class TestProcCpuSecs(_DataLayerBase):
+    """``_proc_cpu_secs`` parses utime+stime from /proc/<pid>/stat."""
+
+    def test_parses_utime_stime_past_parenthesised_comm(self):
+        # comm (field 2) may contain spaces and ')'; we slice past the LAST ')'.
+        # After it: state ppid pgrp session tty tpgid flags minflt cminflt
+        # majflt cmajflt utime stime … → utime index 11, stime index 12.
+        line = '100 (weird )proc) S 1 100 100 0 -1 4194304 100 0 0 0 1234 567 0 0'
+        with mock.patch.object(self.r, '_CLK_TCK', 100), \
+             mock.patch('builtins.open', mock.mock_open(read_data=line)):
+            self.assertAlmostEqual(self.r._proc_cpu_secs(100), (1234 + 567) / 100)
+
+    def test_none_on_unreadable(self):
+        with mock.patch('builtins.open', side_effect=OSError):
+            self.assertIsNone(self.r._proc_cpu_secs(99999999))
 
 
 class TestSnapshotReuse(_DataLayerBase):
@@ -450,7 +492,8 @@ class TestGetChildrenColumns(_DataLayerBase):
     def _children(self, parent, ps_out=_PS_OUT, **kw):
         with mock.patch.object(self.r.subprocess, 'run', _ps_completed(ps_out)), \
              mock.patch.object(self.r.sys, 'platform', 'linux'), \
-             mock.patch.object(self.r, '_private_mem_bytes', lambda pid: None):
+             mock.patch.object(self.r, '_private_mem_bytes', lambda pid: None), \
+             mock.patch.object(self.r, '_proc_cpu_secs', lambda pid: None):
             return self.r.get_children(parent, **kw)
 
     def test_root_is_pid1_with_columns(self):
@@ -505,7 +548,8 @@ class TestTreeFlatDispatch(_DataLayerBase):
         self.r._TREE_MODE = tree
         with mock.patch.object(self.r.subprocess, 'run', _ps_completed(ps_out)), \
              mock.patch.object(self.r.sys, 'platform', 'linux'), \
-             mock.patch.object(self.r, '_private_mem_bytes', lambda pid: None):
+             mock.patch.object(self.r, '_private_mem_bytes', lambda pid: None), \
+             mock.patch.object(self.r, '_proc_cpu_secs', lambda pid: None):
             return self.r.get_children(parent, reload=reload)
 
     def test_tree_root_is_pid1(self):
@@ -707,7 +751,8 @@ class TestSortProcs(_DataLayerBase):
         self.r._TREE_MODE = False
         with mock.patch.object(self.r.subprocess, 'run', _ps_completed(ps_out)), \
              mock.patch.object(self.r.sys, 'platform', 'linux'), \
-             mock.patch.object(self.r, '_private_mem_bytes', lambda pid: None):
+             mock.patch.object(self.r, '_private_mem_bytes', lambda pid: None), \
+             mock.patch.object(self.r, '_proc_cpu_secs', lambda pid: None):
             return [k.id for k in self.r.get_children(None, reload=True)]
 
     def _tree_children(self, ps_out=_PS_SORT):
@@ -715,7 +760,8 @@ class TestSortProcs(_DataLayerBase):
         self.r._TREE_MODE = True
         with mock.patch.object(self.r.subprocess, 'run', _ps_completed(ps_out)), \
              mock.patch.object(self.r.sys, 'platform', 'linux'), \
-             mock.patch.object(self.r, '_private_mem_bytes', lambda pid: None):
+             mock.patch.object(self.r, '_private_mem_bytes', lambda pid: None), \
+             mock.patch.object(self.r, '_proc_cpu_secs', lambda pid: None):
             self.r.get_children(None, reload=True)          # samples the snapshot
             return [k.id for k in self.r.get_children(1, reload=False)]
 
@@ -1418,7 +1464,8 @@ class _HighlightBase(unittest.TestCase):
         """
         with mock.patch.object(self.r.subprocess, 'run', _ps_completed(ps_out)), \
              mock.patch.object(self.r.sys, 'platform', 'linux'), \
-             mock.patch.object(self.r, '_private_mem_bytes', lambda pid: None):
+             mock.patch.object(self.r, '_private_mem_bytes', lambda pid: None), \
+             mock.patch.object(self.r, '_proc_cpu_secs', lambda pid: None):
             return self.r._snapshot(reload=True)
 
 
@@ -1913,16 +1960,15 @@ class TestTickAlive(_TickBase):
     """An alive pid whose cpu%/mem changed emits a ``mod`` carrying the new values."""
 
     def test_alive_changed_emits_mod_with_updated_cols(self):
-        # Prev: pid 100 at 30 cpu_secs / 4 MiB. Cur: +4 cpu_secs over a 1 s wall
-        # gap on 8 cores → 50% (delta path), and memory grew to 8 MiB.
-        prev = self._info(100, 1, cpu_secs=30, mem_kb=4096)
+        # Prev: pid 100 at 30.0 cpu_secs / 4 MiB. Cur: +0.5 cpu_secs over a 1 s
+        # wall gap → 50% (per-core delta path), and memory grew to 8 MiB.
+        prev = self._info(100, 1, cpu_secs=30.0, mem_kb=4096)
         self._seed_prev([self._info(1, 0), prev], wall=self.clock)
         self.clock += 1.0
-        cur_100 = self._info(100, 1, cpu_secs=34, mem_kb=8192)
+        cur_100 = self._info(100, 1, cpu_secs=30.5, mem_kb=8192)
         cur = {1: self._info(1, 0), 100: cur_100}
         b = mock.Mock()
-        with mock.patch.object(self.r.os, 'cpu_count', lambda: 8):
-            self.r._apply_tick(b, cur)
+        self.r._apply_tick(b, cur)
         ops = b.update_data.call_args.args[0]
         mods = {op[1]: op for op in ops if op[0] == 'mod'}
         self.assertIn(100, mods)

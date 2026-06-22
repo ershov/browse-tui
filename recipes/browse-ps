@@ -190,7 +190,8 @@ class ProcInfo:
     tree builder and the column/CPU% logic share one source of truth: ``pid`` /
     ``ppid`` (ints), ``user`` (untruncated name), ``pcpu`` (the ps lifetime-
     average percent, the CPU% fallback), ``rss_bytes`` (resident set), ``cpu_secs``
-    (cumulative CPU time, the delta input + time sort key), ``mem_bytes`` (the
+    (cumulative CPU seconds — fine-grained from /proc/<pid>/stat on Linux, the
+    ps TIME column elsewhere; the CPU%-delta input + time sort key), ``mem_bytes`` (the
     chosen memory figure — private on Linux, RSS elsewhere), and ``args`` (the
     full command line → row title).
     """
@@ -239,6 +240,34 @@ def _parse_time(field):
     for n in nums:                       # left-to-right: …:HH:MM:SS
         secs = secs * 60 + n
     return days * 86400 + secs
+
+
+# Cumulative CPU time on Linux comes from /proc/<pid>/stat (clock-tick
+# resolution, ~10 ms) rather than ps's TIME column (whole seconds): over a
+# few-second refresh a normal process accrues < 1 s, so the coarse column
+# deltas to 0 and CPU% would read a flat zero. SC_CLK_TCK converts ticks → s.
+try:
+    _CLK_TCK = os.sysconf('SC_CLK_TCK')
+except (ValueError, OSError, AttributeError):
+    _CLK_TCK = 100
+
+
+def _proc_cpu_secs(pid):
+    """Cumulative CPU seconds (utime+stime) from ``/proc/<pid>/stat``, or ``None``.
+
+    Fine-grained (clock-tick resolution) so the per-tick delta is meaningful;
+    the caller falls back to the coarse ``ps`` TIME column (whole seconds) when
+    this returns ``None`` (non-Linux, or the read/parse fails). The comm field
+    (field 2) is parenthesised and may itself contain spaces or ``)``, so we
+    slice past the LAST ``)``: the remaining fields then start at field 3
+    (state), putting utime (field 14) at index 11 and stime (field 15) at 12.
+    """
+    try:
+        with open(f'/proc/{pid}/stat') as f:
+            rest = f.read().rpartition(')')[2].split()
+        return (int(rest[11]) + int(rest[12])) / _CLK_TCK
+    except (OSError, ValueError, IndexError):
+        return None
 
 
 def _private_mem_bytes(pid):
@@ -358,6 +387,9 @@ def _fetch_procs():
         info = ProcInfo(pid, ppid, user, pcpu, rss_kb * 1024,
                         _parse_time(parts[5]), parts[6])
         if sys.platform != 'darwin':
+            fine = _proc_cpu_secs(pid)            # fine cpu time (else ps TIME)
+            if fine is not None:
+                info.cpu_secs = fine
             private = _private_mem_bytes(pid)
             if private is not None:
                 info.mem_bytes = private
@@ -450,19 +482,19 @@ def _diff_snapshot(prev, cur):
 def _cpu_pct(info):
     """Instantaneous CPU% for ``info`` from the cumulative-time delta.
 
-    ``100 * Δcpu_secs / (Δwall_secs * ncpu)`` against the same pid in the
-    previous snapshot. With no prior sample (first load or a freshly-appeared
-    pid) — or a non-positive wall gap — fall back to ``ps pcpu`` (lifetime
-    average). Returned as an integer percent.
+    ``100 * Δcpu_secs / Δwall_secs`` against the same pid in the previous
+    snapshot — PER-CORE, so 100% is one core fully used (matching htop / ps and
+    the ``ps pcpu`` lifetime fallback). With no prior sample (first load or a
+    freshly-appeared pid), a non-positive wall gap, or a counter reset (pid
+    recycled → negative delta), fall back to ``ps pcpu``. Integer percent.
     """
     prev = _PREV_SNAPSHOT
     cur = _CUR_SNAPSHOT
     if prev is not None and cur is not None and info.pid in prev[1]:
         dwall = cur[0] - prev[0]
-        ncpu = os.cpu_count() or 1
-        if dwall > 0:
-            dcpu = info.cpu_secs - prev[1][info.pid].cpu_secs
-            return int(round(100 * dcpu / (dwall * ncpu)))
+        dcpu = info.cpu_secs - prev[1][info.pid].cpu_secs
+        if dwall > 0 and dcpu >= 0:
+            return int(round(100 * dcpu / dwall))
     return int(round(info.pcpu))
 
 
