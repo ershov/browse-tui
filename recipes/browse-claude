@@ -5787,7 +5787,7 @@ def _ancestor_ids_for(item_id):
     return []
 
 
-def _seed_scope_root_item(b, target_jsonl, parent_scope):
+def _seed_scope_root_item(b, target_jsonl):
     """Register a REAL session Item for the initial scope_root (#730).
 
     On direct launch (``browse-claude <file.jsonl>`` / ``--file`` / etc.)
@@ -5800,23 +5800,30 @@ def _seed_scope_root_item(b, target_jsonl, parent_scope):
     without the rich session Item the scope-header row has no metadata.
 
     Seed the rich session Item (id, full-path scope_title, msg/sub-count
-    tag, ``boundary=True``, ``kind='session'``) under its parent project
-    scope so ``visible_items`` finds a real Item instead of synthesizing
-    one.
+    tag, ``boundary=True``, ``kind='session'``) into ``_items_by_id`` so
+    ``visible_items`` finds a real Item instead of synthesizing one — its
+    scope-row lookup falls back to ``_items_by_id`` when the Item isn't
+    yet a child of any cached listing, which is exactly the case here.
 
-    Registered by directly placing the Item in the framework's index
-    (``_items_by_id`` + ``_parent_of_id`` + the ``_children[parent_scope]``
-    list) — NOT via ``update_data``. That's deliberate: the
-    ``update_data`` apply path snapshots ``visible_items`` *before*
-    applying its ops, which would fabricate the synthetic stub first and
-    then merely patch it (leaving ``synthetic=True`` on the row). A direct
-    seed before ``run()`` puts the real Item in the index ahead of any
-    ``visible_items`` pass, so no placeholder is ever synthesized. This
-    mirrors the recipe's existing direct ``scope_stack`` manipulation at
-    startup (just below) and the engine's own scope-root indexing. The
-    eventual lazy ``_list_sessions(parent_scope)`` rebuilds the identical
-    Item under the same id, so this is a transient seed the real listing
-    reconciles.
+    Seed ONLY ``_items_by_id`` — deliberately NOT
+    ``_children[parent_scope]``. Pre-populating the parent project's
+    children list with this single session would make the framework treat
+    that listing as already cached, so a later scope-up (``_scope_up`` →
+    ``_ensure_children_fetched``) would skip the real
+    ``_list_sessions(parent_scope)`` fetch and show only this one session
+    instead of all of the project's. Leaving ``_children[parent_scope]``
+    unset lets that lazy fetch run on scope-up (and the per-scope-level
+    re-fetch on refresh), which populates ``_children`` + ``_parent_of_id``
+    and overwrites this by-id seed with the freshly-listed Item.
+
+    Placed directly in the index — NOT via ``update_data``. That's
+    deliberate: the ``update_data`` apply path snapshots ``visible_items``
+    *before* applying its ops, which would fabricate the synthetic stub
+    first and then merely patch it (leaving ``synthetic=True`` on the
+    row). A direct seed before ``run()`` puts the real Item in the index
+    ahead of any ``visible_items`` pass, so no placeholder is ever
+    synthesized. This mirrors the recipe's existing direct ``scope_stack``
+    manipulation at startup (just below).
 
     No-op when the Item can't be built (file vanished, ``--running`` with
     no live process) — the synthetic placeholder then stands and
@@ -5825,12 +5832,7 @@ def _seed_scope_root_item(b, target_jsonl, parent_scope):
     item = _session_item(target_jsonl)
     if item is None:
         return
-    state = b._state
-    children = state._children.setdefault(parent_scope, [])
-    if not any(c.id == item.id for c in children):
-        children.append(item)
-    state._items_by_id[item.id] = item
-    state._parent_of_id[item.id] = parent_scope
+    b._state._items_by_id[item.id] = item
 
 
 def _chain_expand_then_cursor(b, ancestor_ids, target_id):
@@ -7047,7 +7049,7 @@ def main():
     # Synchronous (before ``run()``), so the real Item is in the index
     # ahead of the event loop's first ``visible_items`` pass.
     if target_jsonl and parent_scope:
-        _seed_scope_root_item(b, target_jsonl, parent_scope)
+        _seed_scope_root_item(b, target_jsonl)
 
     # Post-construction cursor positioning:
     #

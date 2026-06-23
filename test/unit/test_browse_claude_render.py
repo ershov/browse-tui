@@ -3159,6 +3159,68 @@ class TestLiveTail(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class TestSeedScopeRootItem(unittest.TestCase):
+    """``_seed_scope_root_item`` seeds the by-id index ONLY.
+
+    The scope-root session Item must land in ``_items_by_id`` so the scope
+    row renders its rich session header on first paint — but it must NOT be
+    pushed into the parent project's ``_children`` listing. Seeding that
+    listing with this single session would make the framework treat it as
+    'already cached', so a later scope-up (``_scope_up`` →
+    ``_ensure_children_fetched``) would skip the real
+    ``_list_sessions(parent)`` fetch and show only this one session instead
+    of all of the project's.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _write_jsonl(self, records):
+        import json as _json
+        import tempfile
+        f = tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False)
+        for rec in records:
+            f.write(_json.dumps(rec) + '\n')
+        f.close()
+        return f.name
+
+    def _fake_browser(self):
+        class FakeState:
+            def __init__(s):
+                s._items_by_id = {}
+                s._children = {}
+        class FakeBrowser:
+            def __init__(s):
+                s._state = FakeState()
+        return FakeBrowser()
+
+    def test_seeds_items_by_id_only(self):
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'hi'}},
+        ])
+        try:
+            b = self._fake_browser()
+            self.r._seed_scope_root_item(b, path)
+            sess_id = ('session', path)
+            # Rich session Item seeded for the scope row.
+            self.assertIn(sess_id, b._state._items_by_id)
+            self.assertEqual(b._state._items_by_id[sess_id].kind, 'session')
+            # Parent project listing left untouched — scope-up still
+            # triggers the real _list_sessions fetch (no pre-cached entry).
+            self.assertEqual(b._state._children, {})
+        finally:
+            os.unlink(path)
+
+    def test_noop_when_item_unbuildable(self):
+        # _session_item returns None for a missing file → no seed at all.
+        b = self._fake_browser()
+        self.r._seed_scope_root_item(b, '/no/such/file-xyz.jsonl')
+        self.assertEqual(b._state._items_by_id, {})
+        self.assertEqual(b._state._children, {})
+
+
 class TestViewEditSource(unittest.TestCase):
     """``V`` / ``E`` extract per-line bytes from ``line_offsets``."""
 

@@ -8248,7 +8248,7 @@ class Browser:
         Posted by ``refresh`` so concurrent callers don't race on the
         cache or the in-flight registry. ``id=None`` means full refresh
         (clear all caches and refetch the root **plus every expanded
-        sub-parent and the current scope root**, so previously-visible
+        sub-parent and every scope-stack level**, so previously-visible
         sub-trees don't strand on a ``⧗ loading…`` placeholder until
         the cursor happens to navigate onto them — #294).
 
@@ -8263,15 +8263,25 @@ class Browser:
         ``_children_pending`` gate is cleared in ``apply_children_results``).
         """
         if id_ is None:
-            # Snapshot expanded set + scope root BEFORE invalidation so
+            # Snapshot expanded set + scope stack BEFORE invalidation so
             # we can re-dispatch fetches for them too. Without this,
             # ``visible_items`` would emit a placeholder for each
             # expanded parent missing from ``_children`` and the only
             # auto-dispatch (``_update_children_for_cursor``) only fires
             # for the cursor item — leaving siblings/ancestors stuck.
+            #
+            # Re-fetch EVERY scope-stack level, not just the current scope
+            # row. The scope row renders an Item that lives in its PARENT
+            # scope's children listing; after ``cache_invalidate_all``
+            # wipes the index, only re-listing those ancestor scopes
+            # rebuilds it — otherwise ``visible_items`` synthesises a
+            # ``str(id)`` placeholder for the scope row (a recipe that
+            # pre-pushes a multi-level ``scope_stack`` has no other source
+            # for the ancestor Items). ``scope_stack`` already includes the
+            # current scope, so this subsumes the old single-add; an empty
+            # stack (root) updates nothing.
             extra = set(self._state.expanded)
-            if self._state.scope_stack:
-                extra.add(current_scope(self._state))
+            extra.update(self._state.scope_stack)
             cache_invalidate_all(self._state)
             id_ = self._state.root_id
             extra.discard(id_)

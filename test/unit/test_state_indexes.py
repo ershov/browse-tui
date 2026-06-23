@@ -366,6 +366,45 @@ class TestDispatchSetsLoading(unittest.TestCase):
         self.assertNotIn('parent', b._state._children_pending)
 
 
+class TestRefreshRedispatchesScopeStack(unittest.TestCase):
+    """Full refresh re-dispatches EVERY scope-stack level, not just the top.
+
+    A recipe that pre-pushes a multi-level ``scope_stack`` (e.g.
+    browse-claude's ``[('project', dir), ('session', jsonl)]``) renders the
+    current scope row from an Item that lives in its PARENT scope's children
+    listing. ``cache_invalidate_all`` wipes that Item, so the refresh must
+    re-list the ancestor scope(s) to rebuild it — otherwise the scope row
+    falls back to a ``str(id)`` placeholder. Pin that the parent ancestor
+    (not only ``current_scope``) is re-dispatched.
+    """
+
+    def _scoped_browser(self):
+        b = Browser(BrowserConfig(_headless=True))
+        # Mirror a recipe's pre-pushed 2-level scope_stack.
+        _state.scope_into(b._state, 'proj')
+        _state.scope_into(b._state, 'sess')
+        self.assertEqual(b._state.scope_stack, ['proj', 'sess'])
+        return b
+
+    def test_parent_scope_level_is_redispatched(self):
+        b = self._scoped_browser()
+        p = _state.Pending()
+        b._do_refresh(None, p)
+        # The current scope row's ancestor must be queued for re-fetch.
+        self.assertIn('proj', b._state._children_pending)
+        # …and the current scope itself stays queued (unchanged behavior).
+        self.assertIn('sess', b._state._children_pending)
+
+    def test_single_level_scope_unchanged(self):
+        # A plain single-level scope (the common scope-down case) must
+        # behave exactly as before: only that one scope id is added.
+        b = Browser(BrowserConfig(_headless=True))
+        _state.scope_into(b._state, 'only')
+        p = _state.Pending()
+        b._do_refresh(None, p)
+        self.assertIn('only', b._state._children_pending)
+
+
 class TestFromFlatTreeIndexes(unittest.TestCase):
     """``Browser.from_flat_tree`` pre-populates indexes for the eager case."""
 

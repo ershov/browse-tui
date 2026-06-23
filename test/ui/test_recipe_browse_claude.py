@@ -320,6 +320,81 @@ class TestBrowseClaude(unittest.TestCase):
                 t.wait_for('SCOPECARD730PROBE', timeout=3.0)
                 t.send('q')
 
+    def test_scope_up_lists_all_project_sessions(self):
+        """Launch into one session, scope UP → ALL the project's sessions
+        list, not just the launched-into one.
+
+        Regression: the scope-root seed pre-populated the parent project's
+        ``_children`` with only the launched session, so the framework
+        treated that listing as cached and scope-up skipped the real
+        ``_list_sessions`` fetch — only the one session showed, and a
+        refresh was needed to reveal the rest.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _make_fake_claude(tmp)
+            proj = os.path.join(root, '-home-test-project')
+            sess1 = os.path.join(proj, 'abcd1234-deadbeef.jsonl')
+            # A SECOND session in the same project — the one that used to go
+            # missing on scope-up.
+            sess2 = os.path.join(proj, 'eeee5678-secondsession.jsonl')
+            with open(sess2, 'w') as f:
+                f.write(json.dumps({
+                    'type': 'user',
+                    'message': {'role': 'user', 'content': 'second hi'},
+                }) + '\n')
+            with TmuxFixture(cols=140, rows=30, env=self._launch_env(tmp)) as t:
+                # Positional .jsonl → scope straight into session 1.
+                t.launch(_BIN, '--run-py', _RECIPE, '--no-tree', sess1)
+                # Sync on rendered conversation content (the launch command
+                # line echoes the session path, so waiting on the basename
+                # would match the shell, not the TUI, and fire M-Up early).
+                t.wait_for('hello world', timeout=3.0)
+                # Scope UP to the project level.
+                t.send('M-Up')
+                # The second session must appear without a manual refresh.
+                cap = t.wait_for('eeee5678-secondsession', timeout=3.0)
+                self.assertIn('abcd1234-deadbeef', cap)
+                t.send('q')
+
+    def test_refresh_keeps_scope_root_rich_title(self):
+        """Ctrl-R while scoped into a session keeps the scope-root row's
+        rich session header — it must not collapse to the ``str()`` of the
+        id tuple.
+
+        Regression: the full refresh wiped the seeded scope-root Item and
+        re-fetched only the session + root (never the parent project, whose
+        listing rebuilds the session Item), so ``visible_items`` synthesised
+        a ``('session', '…')`` placeholder title.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _make_fake_claude(tmp)
+            sess = os.path.join(root, '-home-test-project',
+                                'abcd1234-deadbeef.jsonl')
+            with open(sess) as f:
+                after_count = sum(1 for _ in f) + 1
+            with TmuxFixture(cols=140, rows=30, env=self._launch_env(tmp)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE, '--no-tree', sess)
+                # Sync on rendered content before driving keys.
+                t.wait_for('hello world', timeout=3.0)
+                t.send('g')  # park on the top scope-root row
+                # Rich Item: the scope-root header carries the "N msg …" tag.
+                t.wait_for(' msg', timeout=3.0)
+                # Append a record so the refresh has a visible, deterministic
+                # effect (the scope-root tag's line count ticks up) — this
+                # also lets us synchronise on "refresh finished".
+                with open(sess, 'a') as f:
+                    f.write(json.dumps({
+                        'type': 'user',
+                        'message': {'role': 'user', 'content': 'after-refresh'},
+                    }) + '\n')
+                t.send('C-r')
+                # The scope-root tag reflects the new line count ⇒ the row is
+                # the rebuilt rich session Item; a str(id) placeholder has no
+                # tag at all.
+                cap = t.wait_for('%d msg' % after_count, timeout=3.0)
+                self.assertNotIn("('session',", cap)
+                t.send('q')
+
     def test_J_K_jump_between_voice_rows(self):
         """``J``/``K`` skip over tool_use / tool_result / metadata rows.
 
