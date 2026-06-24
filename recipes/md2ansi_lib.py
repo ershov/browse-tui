@@ -247,10 +247,68 @@ def _m2a_prefix_lines(text, prefix):
 # it consumes.
 _M2A_OPAQUE = "\x00"
 
+# Three more single-char sentinels share the OPAQUE plumbing but carry distinct
+# deferred-layout semantics. A handler emits one when a construct's realization
+# depends on the enclosing block (so it can't be resolved during the inline
+# pass); the layout owner or the final pass (`_m2a_wrap_rendered`) realizes it.
+# None of these ever appear in real input — the input sanitizer in `md2ansi()`
+# maps any stray copy in the SOURCE to U+FFFD before rendering, so an emitted
+# sentinel is unambiguous.
+_M2A_LINEBREAK = "\x01"  # hard line break (`<br>`, LF/CR entity) → real `\n`
+_M2A_RULE = "\x02"       # horizontal rule (`<hr>` as content) → `─`-run, container-sized
+_M2A_NBSP = "\x03"       # non-breaking space (`&nbsp;`, U+00A0 entity) → `" "`
+
+# Input sanitizer kill class: every C0 control codepoint EXCEPT `\t` (09),
+# `\n` (0A), and ESC `\x1b` (1B, kept so pre-colored source survives). `\r` (0D)
+# is absent here because CR is normalized to `\n` first. The matched ranges are
+# 0x00–0x08, 0x0B–0x0C, 0x0E–0x1A, 0x1C–0x1F. Mapping these to U+FFFD also
+# subsumes the old `\x00` strip and neutralizes any stray sentinel (`\x00`–`\x03`)
+# in the source so it can never be confused with one a handler emitted.
+_M2A_C0_KILL = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1A\x1C-\x1F]")
+
 
 def _m2a_opaque(text):
     """Mark every line of `text` as opaque — exempt from post-render wrapping."""
     return "\n".join(_M2A_OPAQUE + ln for ln in text.split("\n"))
+
+
+def _m2a_split_sentinel_lines(text):
+    """Yield `("text", seg)` / `("rule", None)` tokens for the deferred line
+    sentinels — the single source of truth for how `<br>` (`\\x01`) and `<hr>`
+    (`\\x02`) split a string into lines.
+
+    `\\x01` separates text runs (a hard break); `\\x02` becomes a `("rule", None)`
+    token between runs. An empty text run is dropped when it sits ADJACENT to a
+    rule (`len(segments) > 1`), so a leading/trailing/internal `<hr>` adds no
+    blank line; but an empty `\\x01`-piece with NO rule still yields one blank run
+    so a `<br>` at an edge keeps its blank line. Callers decide what each token
+    renders to — a `─`-run of some width, the table's deferred zero-width marker,
+    a wrapped line, etc.
+
+    The leading membership test is the hot-path fast exit: the vast majority of
+    lines/cells carry no sentinel, so two C-level scans beat the two `str.split`
+    allocations (and any regex) — see the benchmark in the refactor that
+    introduced this.
+    """
+    if _M2A_LINEBREAK not in text and _M2A_RULE not in text:
+        yield ("text", text)
+        return
+    for piece in text.split(_M2A_LINEBREAK):
+        segments = piece.split(_M2A_RULE)
+        for s_idx, seg in enumerate(segments):
+            if s_idx > 0:
+                yield ("rule", None)
+            if not seg and len(segments) > 1:
+                continue
+            yield ("text", seg)
+
+
+def _m2a_rule(width):
+    """A horizontal-rule run of `width` columns, floored at 1 so a narrow width
+    or deep nesting can't produce an empty/negative run. Shared by the block HR
+    (`_m2a_fmt_hr`) and every in-container `<hr>` realization; callers compute the
+    container-specific width."""
+    return "─" * max(1, width)
 
 
 def _m2a_inject_color(text, style, reset=None):
@@ -285,7 +343,7 @@ def _m2a_styled(text, current_style, sgr):
 
 
 def _m2a_fmt_hr(m, name, current_style, context, state):
-    bar = "─" * max(1, state.line_width - 1)
+    bar = _m2a_rule(state.line_width - 1)
     return _m2a_opaque(_m2a_inject_color(bar, current_style, current_style))
 
 
@@ -296,6 +354,19 @@ def _m2a_fmt_heading(m, name, current_style, context, state, sgr):
     inner = m.group(f"{name}_inner")
     new_style = f"{current_style};{sgr}"
     inner = _md2ansi(inner, new_style, M2A_CONTEXT_MD_INLINE, state)
+    # Realize the deferred line sentinels into real geometry BEFORE color+opaque:
+    # opaque lines bypass the final-pass sentinel sweep, so any `\x01`/`\x02` left
+    # here would leak as a literal control char (spec §5.2/§5.3 heading branch).
+    # `\x01` → newline (multi-line heading; `_m2a_inject_color` re-emits the color
+    # after each break and `_m2a_opaque` marks each line, so every line stays
+    # colored and exempt from wrapping). `\x02` → a `─ × (line_width − 1)` rule
+    # line on its own, mirroring `_m2a_fmt_hr`'s width. The shared splitter drops
+    # the blank line a rule-adjacent empty segment would otherwise add.
+    rule = _m2a_rule(state.line_width - 1)
+    inner = "\n".join(
+        rule if kind == "rule" else seg
+        for kind, seg in _m2a_split_sentinel_lines(inner)
+    )
     return _m2a_opaque(_m2a_inject_color(inner, new_style, current_style))
 
 
@@ -319,6 +390,102 @@ def _m2a_fmt_escape(m, name, current_style, context, state):
     return m.group(f"{name}_char")
 
 
+def _m2a_fmt_comment(m, name, current_style, context, state):
+    # HTML comment `<!-- … -->` → dropped (no output). recurse=None and re.sub
+    # not rescanning the empty replacement means even a multi-line comment at top
+    # level drops wholesale. (Drop precedent: `_m2a_fmt_footnote_def`.)
+    return ""
+
+
+def _m2a_fmt_br(m, name, current_style, context, state):
+    # `<br>` → the line-break sentinel, NOT a raw `\n`. A raw newline would be
+    # eaten as collapsible whitespace by the wrapper, split on by the post-render
+    # pass, and corrupt a table box (spec §5.2). The enclosing layout owner
+    # (table/list/quote/heading) or the final prose pass realizes `\x01`.
+    return _M2A_LINEBREAK
+
+
+def _m2a_fmt_hr_inline(m, name, current_style, context, state):
+    # `<hr>` used as inline content (inside a cell/list item/heading; the
+    # standalone-line case is won by the `html_hr` block rule) → the rule
+    # sentinel. The layout owner sizes the `─`-run to its container; an
+    # uncontained one in prose becomes a full-width rule in the final pass
+    # (spec §5.3).
+    return _M2A_RULE
+
+
+# Seed set of named HTML entities (~25 common names) → their SINGLE Unicode char
+# (spec §5.4). Numeric entities (`&#dec;` / `&#xHEX;`) cover everything else, so
+# this is intentionally small. Every value is routed through the same codepoint
+# helper as the numeric path (`_m2a_entity_char`), so a named entity and its
+# numeric twin always agree — e.g. `&nbsp;` and `&#160;` both become `\x03`.
+_M2A_HTML_ENTITIES = {
+    "amp": "&", "lt": "<", "gt": ">", "quot": '"', "apos": "'",
+    # ` ` written as an escape (not a literal NBSP, which looks like a plain
+    # space in source) so it can not be "tidied" to U+0020 — its codepoint is what
+    # routes `&nbsp;` to the `\x03` sentinel via `_m2a_entity_char`.
+    "nbsp": "\u00A0", "copy": "©", "reg": "®", "trade": "™",
+    "mdash": "—", "ndash": "–", "hellip": "…", "bull": "•",
+    "middot": "·", "sect": "§", "para": "¶", "deg": "°",
+    "times": "×", "divide": "÷", "laquo": "«", "raquo": "»",
+    "larr": "←", "rarr": "→", "uarr": "↑", "darr": "↓",
+    "pound": "£", "euro": "€", "cent": "¢", "yen": "¥",
+}
+
+
+def _m2a_entity_char(cp):
+    """Map a resolved entity codepoint to its rendered char, applying the same
+    control-codepoint routing for the named and numeric paths (spec §5.4).
+
+    Cases are ordered and mutually exclusive:
+      1. NUL, a surrogate (U+D800–U+DFFF), or out of range (> U+10FFFF) → `�`
+         (U+FFFD). Out-of-range guards `chr()` against `ValueError`.
+      2. LF (U+000A) / CR (U+000D) → the line-break sentinel `\\x01` (a SAFE
+         break: renders as `\\n` in prose and splits cleanly in tables/lists —
+         it must NOT be a raw `\\n`, which the wrapper would eat / which would
+         corrupt a table box).
+      3. U+00A0 → the non-breaking-space sentinel `\\x03`.
+      4. any other control — C0 (< U+0020), DEL (U+007F), or C1 (U+0080–U+009F)
+         → `�`. (We deliberately skip the WHATWG Windows-1252 C1 legacy remap;
+         mapping C1 → `�` keeps the "no raw control survives" property.)
+      5. otherwise → `chr(cp)`.
+    """
+    if cp == 0 or 0xD800 <= cp <= 0xDFFF or cp > 0x10FFFF:
+        return "�"
+    if cp == 0x0A or cp == 0x0D:
+        return _M2A_LINEBREAK
+    if cp == 0xA0:
+        return _M2A_NBSP
+    if cp < 0x20 or cp == 0x7F or 0x80 <= cp <= 0x9F:
+        return "�"
+    return chr(cp)
+
+
+def _m2a_fmt_entity(m, name, current_style, context, state):
+    # HTML entity `&name;` / `&#dec;` / `&#xHEX;`, decoded during the inline pass
+    # (spec §5.4). Timing is automatically correct: every Markdown rule already
+    # matched the RAW source (where the entity was still `&#…;`), so a decoded
+    # `*`/`|`/`#` can never retro-trigger emphasis / a table split / a heading,
+    # and table widths are measured on the expanded text. recurse=None and re.sub
+    # not rescanning the replacement keep `&amp;amp;` → `&amp;` (decoded once).
+    body = m.group(f"{name}_body")
+    if body.startswith("#"):
+        # Numeric: `&#dec;` or `&#xHEX;`. The pattern already constrained the
+        # digits, so int() can't raise; route the codepoint through the shared
+        # helper so numeric and named agree on control handling.
+        digits = body[1:]
+        cp = int(digits[1:], 16) if digits[0] in "xX" else int(digits)
+        return _m2a_entity_char(cp)
+    # Named: a KNOWN name resolves to its char's codepoint via the same helper
+    # (so `&nbsp;` → `\x03`); an UNKNOWN name (matches the shape but not in the
+    # dict) is returned UNCHANGED — literal pass-through, per the WHATWG standard
+    # (browsers substitute nothing for an unknown named entity).
+    ch = _M2A_HTML_ENTITIES.get(body)
+    if ch is None:
+        return m.group(0)
+    return _m2a_entity_char(ord(ch))
+
+
 def _m2a_fmt_image(m, name, current_style, context, state):
     alt = m.group(f"{name}_alt") or ""
     return _m2a_styled(f"[IMG: {alt}]", current_style, f"3;{M2A_COLOR_DIM}")
@@ -334,6 +501,21 @@ def _m2a_fmt_blockquote(m, name, current_style, context, state):
     # literal NUL. The nested heading therefore wraps with the quote, not opaque.
     inner = _md2ansi(stripped, current_style, M2A_CONTEXT_MD_BLOCKLITE, state)
     inner = inner.replace(_M2A_OPAQUE, "")
+    # Realize the deferred line sentinels into real newlines BEFORE the per-line
+    # bar/self-wrap below (the quote marks itself opaque, which bypasses the final
+    # sentinel sweep — spec §5.2/§5.3). `\x01` → a newline, so each resulting line
+    # gets its own `│ ` bar. `\x02` → a `─`-run on its own line at the bar-less
+    # content width (`wrap_width − 2`, falling back to the page width − 2 when
+    # wrapping is off, mirroring `_m2a_fmt_hr`).
+    # Each `\x02` becomes a rule line of its own (the shared splitter drops the
+    # blank line a rule-adjacent empty segment would otherwise add, so the rule
+    # sits flush, not separated by an empty barred line).
+    rule_w = (state.wrap_width if state.wrap_width > 0 else state.line_width) - 2
+    rule = _m2a_rule(rule_w)
+    inner = "\n".join(
+        rule if kind == "rule" else seg
+        for kind, seg in _m2a_split_sentinel_lines(inner)
+    )
     bar = _m2a_styled("│", current_style, M2A_COLOR_DIM) + " "
     # The quote owns its layout, so it wraps itself (visible-width aware) before
     # the bar is prefixed — width less the 2-column bar — then marks the result
@@ -353,6 +535,10 @@ def _m2a_fmt_table(m, name, current_style, context, state):
         s = ln.strip()
         if not s.startswith("|"):
             continue
+        # Drop HTML comments before splitting so a `|` inside `<!-- … -->`
+        # cannot mis-split the row (the inline pass would drop it anyway, but
+        # only after the column count was already taken from the raw `|`s).
+        s = _M2A_HTML_COMMENT_RE.sub("", s)
         raw_rows.append(_m2a_split_table_row(s))
     if len(raw_rows) < 1:
         return m.group(0)
@@ -441,19 +627,40 @@ def _m2a_fmt_table(m, name, current_style, context, state):
     # cell on the same visual row. Tables don't inherit a style — they're
     # always top-level — so plain `\x1b[m` (= `\x1b[0m`) is the right reset.
     def cell_sublines(rendered, w):
-        return _m2a_wrap_ansi_line(rendered, w, "", "\x1b[m") if rendered else [""]
+        # Split the deferred line sentinels into stacked sub-lines BEFORE the
+        # cell is laid out (the table marks itself opaque, which bypasses the
+        # final sentinel sweep — spec §5.2/§5.3). `\x01` starts a new sub-line;
+        # `\x02` becomes a single rule-marker sub-line (the literal `_M2A_RULE`
+        # string), sized to the frozen column width only at render time
+        # (`render_row`) and demanding zero width during measurement
+        # (`_col_actual`), so it fills the column but never forces it wider.
+        if not rendered:
+            return [""]
+        out = []
+        for kind, seg in _m2a_split_sentinel_lines(rendered):
+            if kind == "rule":
+                out.append(_M2A_RULE)
+            else:
+                out.extend(_m2a_wrap_ansi_line(seg, w, "", "\x1b[m") if seg else [""])
+        return out
 
     header_cells = [cell_sublines(rendered_header[i], widths[i]) for i in range(n_cols)]
     body_cells = [[cell_sublines(r[i], widths[i]) for i in range(n_cols)] for r in rendered_body]
 
     def _col_actual(i):
+        # A rule-marker sub-line (`_M2A_RULE`) demands ZERO width: the rule fills
+        # the column at render time but must never force it wider (spec §5.3,
+        # "measured as `\n\n`, zero width"). The column width is decided by the
+        # real text alone.
+        def _sub_w(s):
+            return 0 if s == _M2A_RULE else _m2a_visible_len(s)
         actual = max(
-            (_m2a_visible_len(s) for s in header_cells[i]),
+            (_sub_w(s) for s in header_cells[i]),
             default=0,
         )
         for row in body_cells:
             for s in row[i]:
-                actual = max(actual, _m2a_visible_len(s))
+                actual = max(actual, _sub_w(s))
         return actual
 
     def _rewrap_column(i):
@@ -536,7 +743,12 @@ def _m2a_fmt_table(m, name, current_style, context, state):
             parts = []
             for i, col in enumerate(cells):
                 if k < len(col):
-                    parts.append(f" {_m2a_align_cell(col[k], widths[i], aligns[i])} ")
+                    if col[k] == _M2A_RULE:
+                        # Materialize the rule now that widths are frozen: a `─`
+                        # run spanning the full column-content width (spec §5.3).
+                        parts.append(f" {_m2a_rule(widths[i])} ")
+                    else:
+                        parts.append(f" {_m2a_align_cell(col[k], widths[i], aligns[i])} ")
                 else:
                     # Top-align: pad shorter cells with blank lines at the bottom.
                     parts.append(" " + " " * widths[i] + " ")
@@ -590,16 +802,33 @@ def _m2a_fmt_list(m, name, current_style, context, state):
             # a literal NUL. The nested heading thus wraps with the list item.
             rendered = _md2ansi(content, current_style, M2A_CONTEXT_MD_BLOCKLITE, state)
             rendered = rendered.replace(_M2A_OPAQUE, "")
-            line = f"{'  ' * level}{styled} {rendered}"
-            # The item is fully rendered before wrapping, so inline spans never
-            # straddle a wrap break. Continuations hang-indent two columns past
-            # the list indent (under the content, clear of the one-col bullet).
-            if state.wrap_width > 0:
-                out_lines.extend(
-                    _m2a_wrap_ansi_line(line, state.wrap_width, "  " * level + "  ")
-                )
-            else:
-                out_lines.append(line)
+            # Hang indent for continuations: two columns past the list indent, the
+            # same width as the bullet prefix (`"  "*level` + 1-col bullet + space),
+            # so a continuation sits under the content, clear of the bullet.
+            hang = "  " * level + "  "
+            bullet_prefix = f"{'  ' * level}{styled} "
+            # Realize the deferred line sentinels here, BEFORE the block is marked
+            # opaque (opaque lines bypass the final sentinel sweep — spec
+            # §5.2/§5.3). `\x01` → a hard break onto a new hang-indented line.
+            # `\x02` → a `─`-run on its own hang-indented line, sized to the
+            # item-content width (the wrap width less the bullet/hang columns;
+            # the page-width fallback when wrapping is off mirrors `_m2a_fmt_hr`).
+            # Only the first emitted text line keeps the bullet; every
+            # continuation (break, rule, wrap) hangs. The shared splitter emits a
+            # rule token per `\x02` and drops rule-adjacent empty segments.
+            content_w = state.wrap_width - len(hang) if state.wrap_width > 0 else state.line_width - len(hang)
+            rule = _m2a_rule(content_w)
+            first = True   # the very first emitted text line carries the bullet
+            for kind, seg in _m2a_split_sentinel_lines(rendered):
+                if kind == "rule":
+                    out_lines.append(hang + rule)
+                    continue
+                line = (bullet_prefix if first else hang) + seg
+                first = False
+                if state.wrap_width > 0:
+                    out_lines.extend(_m2a_wrap_ansi_line(line, state.wrap_width, hang))
+                else:
+                    out_lines.append(line)
         else:
             out_lines.append(ln)
     return _m2a_opaque("\n".join(out_lines))
@@ -876,6 +1105,18 @@ _MD_H6 = r"^ \#{6} [ \t]+ (?P<*> [^\n]+ ) $"
 
 _MD_HR = r"^ (?: -{3,} | ={3,} | _{3,} ) [ \t]* $"
 
+# A standalone `<hr>` line (optionally self-closing, any case). Scoped (?i:…)
+# because the engine compiles with re.VERBOSE | MULTILINE | DOTALL but no
+# global IGNORECASE. Reuses _m2a_fmt_hr (full page width) — see spec §5.3.
+_MD_HTML_HR = r"^ [ \t]* (?i: < hr [ \t]* /? > ) [ \t]* $"
+
+# Inline `<br>` / `<hr>` (content, not a standalone line). Same scoped (?i:…)
+# and optional self-close as the block forms. `html_br` emits the line-break
+# sentinel; `html_hr_inline` emits the rule sentinel. Both live in the inline
+# set after `escape` (so `\<br>` stays literal) — see spec §5.2 / §5.3.
+_MD_HTML_BR = r"(?i: < br [ \t]* /? > )"
+_MD_HTML_HR_INLINE = r"(?i: < hr [ \t]* /? > )"
+
 # Frontmatter — anchored to file start via `\A` so it never matches
 # mid-document. Empty `(?P<*indent>)` group so the shared `_m2a_fmt_code`
 # framing (which reads `{name}_indent`) works with no indent. The body is a run
@@ -960,6 +1201,31 @@ _MD_ESCAPE = r"""
     )
 """
 
+# HTML comment `<!-- … -->` — tempered-greedy and multi-line (same shape as the
+# `js_comment_block` / `c_comment_block` code-context rules). No capture group:
+# the handler drops the whole match. Placed after `escape` so `\<!-- … -->`
+# stays literal; an unclosed `<!--` (no `-->`) simply never matches → verbatim.
+_MD_HTML_COMMENT = r" <!-- (?: (?! --> ) [\s\S] )* --> "
+
+# Standalone compiled twin, used by `_m2a_fmt_table` to strip comments from a raw
+# row line BEFORE splitting on `|`, so a comment containing `|` can't mis-split a
+# row into extra columns. DOTALL so a (rare) multi-line comment inside the table
+# match is also removed.
+_M2A_HTML_COMMENT_RE = re.compile(_MD_HTML_COMMENT, re.VERBOSE | re.DOTALL)
+
+# HTML entity `&name;` / `&#dec;` / `&#xHEX;` — the trailing `;` is REQUIRED, so
+# `AT&T`, a bare `&`, and `&amp` (no `;`) never match → literal pass-through. The
+# `body` group is everything between `&` and `;` (`#dec`, `#xHEX`, or a name);
+# `_m2a_fmt_entity` decodes it. Placed in the inline set AFTER `escape` (so
+# `\&amp;` stays literal) and grouped with the other html_* rules. Code spans are
+# already safe: `code_inline*` precede this and consume a span whole; fenced/code
+# contexts carry no entity rule, so a literal `&amp;` survives there (spec §5.4).
+_MD_HTML_ENTITY = r"""
+    & (?P<*body>
+        \# [0-9]+ | \# [xX] [0-9a-fA-F]+ | [a-zA-Z] [a-zA-Z0-9]*
+    ) ;
+"""
+
 _MD_LINK = rf"""
     (?<!!) \[ (?P<*>
         (?: {_MD_IMAGE_INLINE} | {_MD_ESCAPED} | [^\]\n\\] | \n (?! {_BSA} ) )+
@@ -1027,6 +1293,22 @@ _M2A_RULES_INLINE_RAW = (
     # whole (its own pattern/handler resolve any internal escapes), but BEFORE
     # every other delimiter so `\*`, `\~`, `\[` etc. don't trigger emphasis / links.
     ("escape",        _MD_ESCAPE,       _m2a_fmt_escape,       None),
+    # HTML comments — dropped. After `escape` (so `\<!-- …` stays literal) and
+    # before the delimiter rules. Code spans are already safe: `code_inline*`
+    # precede this in the alternation and consume a span whole; fenced/code
+    # contexts carry no comment rule at all, so a literal `<!-- … -->` survives.
+    ("html_comment",  _MD_HTML_COMMENT, _m2a_fmt_comment,      None),
+    # `<br>` / `<hr>` as inline content → deferred line sentinels (`\x01`/`\x02`).
+    # After `html_comment` (so a `<br>` inside a dropped comment never fires) and
+    # before the delimiter rules. Inherited by INLINE / BLOCKLITE / the MD table,
+    # so they reach prose, headings, cells, list items, blockquotes, link text.
+    ("html_br",       _MD_HTML_BR,      _m2a_fmt_br,           None),
+    ("html_hr_inline",_MD_HTML_HR_INLINE, _m2a_fmt_hr_inline,  None),
+    # HTML entities — decoded to their Unicode char (or a sentinel for LF/CR/nbsp,
+    # `�` for forbidden codepoints). After `escape` so `\&amp;` stays literal;
+    # grouped with the other html_* rules. recurse=None — the replacement is not
+    # rescanned, so `&amp;amp;` decodes once to `&amp;` (spec §5.4).
+    ("html_entity",   _MD_HTML_ENTITY,  _m2a_fmt_entity,       None),
     ("image",         _MD_IMAGE,        _m2a_fmt_image,        None),
     ("link",          _MD_LINK,         M2A_COLOR_LINK,        _M2A_RECURSE_SELF),
     ("bolditalic",    _MD_BOLDITALIC,   "1;3",                 _M2A_RECURSE_SELF),
@@ -1054,6 +1336,7 @@ _M2A_RULES_MD = (
     ("h5",            _MD_H5,           _m2a_heading_lambda(M2A_COLOR_H5),            None),
     ("h6",            _MD_H6,           _m2a_heading_lambda(M2A_COLOR_H6),            None),
     ("hr",            _MD_HR,           _m2a_fmt_hr,                                  None),
+    ("html_hr",       _MD_HTML_HR,      _m2a_fmt_hr,                                  None),
     ("code_python",   _MD_CODE_PY,      _m2a_code_lambda(M2A_CONTEXT_CODE_PYTHON,     "python"),     None),
     ("code_bash",     _MD_CODE_BASH,    _m2a_code_lambda(M2A_CONTEXT_CODE_BASH,       "bash"),       None),
     ("code_js",       _MD_CODE_JS,      _m2a_code_lambda(M2A_CONTEXT_CODE_JAVASCRIPT, "javascript"),None),
@@ -1204,17 +1487,39 @@ def _m2a_wrap_rendered(text, line_width):
     lists, blockquotes, footnotes, HR) — they pass through verbatim, with the
     marker stripped. The marker is always stripped here, so this pass also runs
     when wrapping is disabled (`line_width <= 0`) purely to remove markers.
+
+    This is also the single place residual sentinels are realized for uncontained
+    prose (§5.2, §5.3, §6): `\\x01` (line break) splits a line, each piece wrapped
+    independently with its own leading-whitespace continuation; `\\x02` (rule) acts
+    like a block rule, emitting a `─`-run on its own line sized exactly like
+    `_m2a_fmt_hr`; `\\x03` (non-breaking space) becomes a plain `" "` last (so it
+    stays glued — outside the whitespace class — through wrapping). On an opaque
+    line only `\\x03` is realized: that line owns its layout, so its `\\x01`/`\\x02`
+    were already materialized by the block handler that marked it.
     """
+    # Rule run mirrors `_m2a_fmt_hr` (via `_m2a_rule`), with the same 150
+    # fallback `md2ansi()` uses for `state.line_width` when wrapping is off.
+    rule_w = line_width if line_width > 0 else 150
+    rule_line = _m2a_rule(rule_w - 1)
+
     out = []
     for ln in text.split("\n"):
         if ln.startswith(_M2A_OPAQUE):
             out.append(ln[len(_M2A_OPAQUE):])
-        elif line_width > 0:
-            cont = re.match(r"[ \t]*", ln).group(0)
-            out.extend(_m2a_wrap_ansi_line(ln, line_width, cont))
-        else:
-            out.append(ln)
-    return "\n".join(out)
+            continue
+        # `\x01` (<br>) splits the line; `\x02` (<hr>) acts like a block rule,
+        # emitting a full-width `─` line of its own — both via the shared splitter.
+        for kind, seg in _m2a_split_sentinel_lines(ln):
+            if kind == "rule":
+                out.append(rule_line)
+                continue
+            if line_width > 0:
+                cont = re.match(r"[ \t]*", seg).group(0)
+                out.extend(_m2a_wrap_ansi_line(seg, line_width, cont))
+            else:
+                out.append(seg)
+    # `\x03` → " " last, after wrapping, on every output line (opaque included).
+    return "\n".join(out).replace(_M2A_NBSP, " ")
 
 
 def md2ansi(text, current_style="0", line_width=0, cell_min_width=20, row_dividers=None):
@@ -1233,9 +1538,15 @@ def md2ansi(text, current_style="0", line_width=0, cell_min_width=20, row_divide
     `None` (default) emits inter-row dividers only when any body cell wraps;
     `True` always emits them; `False` never emits them.
     """
-    # NUL is the opaque-line marker; strip any stray copy from the source so it
-    # can't be mistaken for one.
-    text = text.replace(_M2A_OPAQUE, "")
+    # Input sanitizer (the single source-side convergence point, §4): normalize
+    # CRLF and lone CR to `\n` first, then map every remaining C0 control char
+    # except `\t`/`\n`/ESC to U+FFFD. This keeps pre-colored source intact,
+    # guarantees no raw control char reaches output, and neutralizes any stray
+    # sentinel (`\x00`–`\x03`) in the source — so it can't be mistaken for one a
+    # handler emits LATER (those are added after this step and survive to the
+    # final pass). Subsumes the former `\x00` strip.
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = _M2A_C0_KILL.sub("�", text)
     state_lw = line_width if line_width > 0 else 150
     state = M2A_DocumentState(
         line_width=state_lw,
@@ -1294,6 +1605,11 @@ _M2A_SPAN_KINDS = {
     "code_generic": ("code", "code"),
     "code_inline2": ("code_inline", "code_inline"),
     "code_inline":  ("code_inline", "code_inline"),
+    "html_comment": ("comment", "comment"),
+    "html_hr":      ("hr", "hr"),
+    "html_hr_inline": ("hr", "hr"),
+    "html_br":      ("br", "br"),
+    "html_entity":  ("entity", "entity"),
     "bolditalic":   ("emphasis", "bolditalic"),
     "bold_under":   ("emphasis", "bolditalic"),
     "under_bold":   ("emphasis", "bolditalic"),
