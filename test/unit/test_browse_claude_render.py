@@ -7291,13 +7291,16 @@ class TestSendMessage(unittest.TestCase):
     # -- ack: _fmt_tur_send_message ---------------------------------------
 
     def test_fmt_tur_send_success_delivered(self):
+        # The success ``message`` ("Message sent to X's inbox" / queued …) is
+        # generic plumbing — the success line is just ``✓ delivered``; real
+        # content (when present) comes from the ``routing`` block instead.
         out = self.r._fmt_tur_send_message(
             {'success': True, 'message': 'queued the message. '
              'Output: /tmp/claude/x/tasks/w.output'})
         self.assertIn('✓ delivered', out)
-        # The long Output: /tmp path is trimmed off.
+        # No plumbing leaks (neither the Output: path nor the generic text).
         self.assertNotIn('/tmp/claude/x/tasks/w.output', out)
-        self.assertIn('queued the message.', out)
+        self.assertNotIn('queued the message', out)
 
     def test_fmt_tur_send_failure(self):
         out = self.r._fmt_tur_send_message(
@@ -7305,6 +7308,45 @@ class TestSendMessage(unittest.TestCase):
         self.assertIn('✗', out)
         self.assertIn('no such agent', out)
         self.assertNotIn('delivered', out)
+
+    def test_fmt_tur_send_failure_trims_output_path(self):
+        # The error message still tails with an Output: /tmp path — trimmed.
+        out = self.r._fmt_tur_send_message(
+            {'success': False, 'message': "No agent named 'x'. "
+             'Output: /tmp/claude/x/tasks/x.output'})
+        self.assertIn("No agent named 'x'.", out)
+        self.assertNotIn('/tmp/claude/x/tasks/x.output', out)
+
+    def test_fmt_tur_send_success_routing_renders_content(self):
+        # Success + routing block: status line, sender→target, summary, and
+        # the delivered content rendered ONCE (never a raw JSON dump).
+        out = self.r._fmt_tur_send_message({
+            'success': True,
+            'message': "Message sent to worker's inbox",
+            'routing': {
+                'sender': 'team-lead', 'target': '@worker',
+                'targetColor': 'red', 'summary': 'do the thing',
+                'content': 'Please do the thing now.',
+            },
+        })
+        self.assertIn('✓ delivered', out)
+        self.assertIn('team-lead → @worker', out)
+        self.assertIn('do the thing', out)
+        self.assertIn('Please do the thing now.', out)
+        # Not a raw JSON dump of the routing block.
+        self.assertNotIn('"routing"', out)
+        self.assertNotIn("'content'", out)
+
+    def test_fmt_tur_send_routing_json_content_colored(self):
+        # When the delivered content is itself JSON, it's JSON-colored
+        # (pretty-printed) rather than markdown-rendered.
+        out = self.r._fmt_tur_send_message({
+            'success': True, 'message': 'sent',
+            'routing': {'sender': 'a', 'target': '@b',
+                        'content': '{"k": 1, "v": "x"}'},
+        })
+        self.assertIn('"k"', out)
+        self.assertIn('"v"', out)
 
     # -- routing through _fmt_tool_use_result ------------------------------
 
@@ -7314,6 +7356,18 @@ class TestSendMessage(unittest.TestCase):
              'Output: /tmp/a/b/tasks/x.output'}, '')
         self.assertIn('✓ delivered', out)
         self.assertNotIn('/tmp/a/b/tasks/x.output', out)
+
+    def test_tool_use_result_routes_success_routing_shape(self):
+        # The 3-key success shape ({success, message, routing}) must route to
+        # the SendMessage formatter, NOT fall through to the raw-JSON default.
+        out = self.r._fmt_tool_use_result({
+            'success': True, 'message': "Message sent to w's inbox",
+            'routing': {'sender': 's', 'target': '@w',
+                        'content': 'hello there'},
+        }, '')
+        self.assertIn('✓ delivered', out)
+        self.assertIn('hello there', out)
+        self.assertNotIn('"routing"', out)
 
     def test_skill_ack_not_shadowed_by_send(self):
         # A skill ack carries commandName alongside success — it must
@@ -9779,8 +9833,55 @@ class TestToolUmbrellaSearchSkillSend(unittest.TestCase):
         self.assertIn('🔧 SendMessage', out)
         self.assertIn('worker-1', out)
         self.assertIn('please do X now', out)
-        # _fmt_tur_send_message renders the delivered marker.
+        # Delivery status surfaced.
         self.assertIn('delivered', out)
+
+    def test_send_message_content_rendered_once_with_routing(self):
+        # The success+routing result echoes the message in routing.content;
+        # the umbrella must render the message exactly ONCE (from request),
+        # never twice.
+        msg = 'UNIQUE-BODY-TOKEN please proceed'
+        out = self.r._fmt_tool_umbrella_send_message(
+            {'recipient': 'w', 'summary': 's', 'message': msg},
+            {'success': True, 'message': "Message sent to w's inbox",
+             'routing': {'sender': 'lead', 'target': '@w', 'summary': 's',
+                         'content': msg}},
+            None, False)
+        self.assertEqual(out.count('UNIQUE-BODY-TOKEN'), 1)
+        # Delivery status + the sender are surfaced from the result.
+        self.assertIn('✓ delivered', out)
+        self.assertIn('(from lead)', out)
+        # Not a raw JSON dump.
+        self.assertNotIn('"routing"', out)
+
+    def test_send_message_in_flight_shows_request_only(self):
+        # No result yet (tur=None): just the request side, no status line.
+        out = self.r._fmt_tool_umbrella_send_message(
+            {'recipient': 'w', 'summary': 's', 'message': 'hi there'},
+            None, None, False)
+        self.assertIn('🔧 SendMessage', out)
+        self.assertIn('→ w', out)
+        self.assertIn('hi there', out)
+        self.assertNotIn('delivered', out)
+        self.assertNotIn('✗', out)
+
+    def test_send_message_error_status(self):
+        out = self.r._fmt_tool_umbrella_send_message(
+            {'recipient': 'ghost', 'message': 'hello'},
+            {'success': False, 'message': "No agent named 'ghost'"},
+            None, False)
+        self.assertIn('✗', out)
+        self.assertIn("No agent named 'ghost'", out)
+        # The request message still renders once.
+        self.assertEqual(out.count('hello'), 1)
+        self.assertNotIn('delivered', out)
+
+    def test_send_message_json_body_colored_once(self):
+        out = self.r._fmt_tool_umbrella_send_message(
+            {'recipient': 'w', 'message': '{"cmd": "run", "n": 2}'},
+            None, None, False)
+        self.assertIn('"cmd"', out)
+        self.assertIn('"n"', out)
 
     def test_send_message_empty_input_degrades(self):
         self.assertIsNone(self.r._fmt_tool_umbrella_send_message(

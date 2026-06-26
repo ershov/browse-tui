@@ -3046,12 +3046,32 @@ _TOOL_UMBRELLA_FORMATTERS['Skill'] = _fmt_tool_umbrella_skill
 
 
 def _fmt_tool_umbrella_send_message(inp, tur, raw_content, is_error):
-    """SendMessage umbrella — recipient + body header then the delivery ack."""
+    """SendMessage umbrella — request header + delivery status, message ONCE.
+
+    The recipient/summary/message come from the REQUEST so they render even
+    when the result is missing or in-flight. The result side only contributes
+    its UNIQUE bits — the delivery status (``✓ delivered`` / ``✗ <error>``)
+    and, when present, ``(from <sender>)`` — never the echoed content, which
+    ``routing`` duplicates; the message is rendered exactly once from the
+    request. Declines (returns ``None``) on an empty request.
+    """
     if not inp:
         return None
-    head = (f'{YELLOW}{BOLD}🔧 SendMessage{RESET}\n'
-            + _fmt_tool_use_send_message(inp))
-    return _um_head_body(head, tur, raw_content)
+    recipient, summary, message = _send_message_fields(inp)
+    head = f'{YELLOW}{BOLD}🔧 SendMessage{RESET}  {BOLD}→ {recipient}{RESET}'
+    if summary:
+        head += f'  {MUTE}·{RESET} {summary}'
+    out = [head]
+    if isinstance(tur, dict):
+        out.append(_send_message_status_line(tur))
+        routing = tur.get('routing')
+        sender = routing.get('sender') if isinstance(routing, dict) else None
+        if sender:
+            out[-1] += f'  {MUTE}(from {sender}){RESET}'
+    if message:
+        out.append('')
+        out.append(_render_message_body(message))
+    return '\n'.join(out)
 
 
 _TOOL_UMBRELLA_FORMATTERS['SendMessage'] = _fmt_tool_umbrella_send_message
@@ -3394,10 +3414,12 @@ def _fmt_tool_use_result(tur, raw_content):
         return _fmt_tur_subagent(tur)
     if 'commandName' in keys and 'success' in keys:
         return _fmt_tur_skill(tur)
-    # SendMessage delivery ack — shape is exactly ``{success, message}``.
-    # Checked after skill (whose ack adds ``commandName``) so the exact
-    # key-set match here doesn't shadow it.
-    if keys == {'success', 'message'}:
+    # SendMessage delivery ack — ``{success, message}`` for the error/ack
+    # shape, plus an optional ``routing`` block on the success shape. Checked
+    # after skill (whose ack adds ``commandName``) so neither match shadows
+    # the other.
+    if {'success', 'message'}.issubset(keys) and \
+            keys <= {'success', 'message', 'routing'}:
         return _fmt_tur_send_message(tur)
     if 'questions' in keys and 'answers' in keys:
         return _fmt_tur_ask_user_question(tur)
@@ -3579,22 +3601,58 @@ def _fmt_tur_skill(tur):
     return f'{MAGENTA}{name}{RESET}  {color}[{"ok" if ok else "fail"}]{RESET}'
 
 
-def _fmt_tur_send_message(tur):
-    """SendMessage delivery ack: compact ``✓ delivered · <message>`` /
-    ``✗ <message>`` with the trailing ``Output: /tmp/…`` path trimmed."""
+def _render_message_body(message):
+    """Render a SendMessage body: JSON-colored when it parses as JSON,
+    else through ``_md_voice`` (the message is markdown otherwise)."""
+    colored = _maybe_json_color(message)
+    return colored if colored is not None else _md_voice(message)
+
+
+def _send_message_status_line(tur):
+    """``✓ delivered`` (GREEN) / ``✗ <error>`` (RED) from a delivery ack.
+
+    ``tur`` is the SendMessage ``toolUseResult``. The error/ack shape's
+    ``message`` tails with an ``Output: /tmp/…`` path that's just plumbing —
+    it's trimmed so the status line stays compact. Shared by the result
+    formatter and the umbrella formatter so both surface delivery identically.
+    """
     ok = bool(tur.get('success'))
+    if ok:
+        return f'{GREEN}✓ delivered{RESET}'
     message = tur.get('message', '') or ''
-    # The ack message tails with an "Output: /tmp/…/tasks/<id>.output"
-    # path that's just plumbing — drop it from this compact view.
     idx = message.find('Output: ')
     if idx != -1:
         message = message[:idx]
     message = message.strip()
-    if ok:
-        head = f'{GREEN}✓ delivered{RESET}'
-        return f'{head}  {MUTE}·{RESET} {message}' if message else head
-    head = f'{RED}✗{RESET}'
-    return f'{head} {message}' if message else head
+    return f'{RED}✗ {message}{RESET}' if message else f'{RED}✗{RESET}'
+
+
+def _fmt_tur_send_message(tur):
+    """SendMessage delivery ack — both shapes, rendered (never raw JSON).
+
+    Error/ack shape ``{success, message}``: just the status line
+    (``✓ delivered`` / ``✗ <error>``). Success shape adds a ``routing`` block
+    (``sender``/``target``/``summary``/``content``, all echoing the request);
+    when present we surface ``<sender> → <target>``, the summary, and the
+    delivered content (``_render_message_body`` — JSON-colored or markdown).
+    """
+    status = _send_message_status_line(tur)
+    routing = tur.get('routing')
+    if not isinstance(routing, dict):
+        return status
+    out = [status]
+    sender = routing.get('sender')
+    target = routing.get('target')
+    if sender or target:
+        out.append(f'{MUTE}{sender or "?"} → {target or "?"}{RESET}')
+    summary = routing.get('summary')
+    if summary:
+        out.append(f'{MUTE}· {summary}{RESET}')
+    content = routing.get('content')
+    if content:
+        out.append('')
+        out.append(_render_message_body(content))
+    return '\n'.join(out)
 
 
 def _fmt_tur_ask_user_question(tur):
