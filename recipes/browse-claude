@@ -1207,29 +1207,110 @@ def _is_voice(obj):
     return False
 
 
+# Framing records that belong to "the conversation as lived" (level 2)
+# even though they aren't user/assistant turns: the per-turn duration
+# stamp and the inline api_error banner. (type, subtype) keys.
+_LIVE_EXTRAS = frozenset([
+    ('system', 'turn_duration'),
+    ('system', 'api_error'),
+])
+
+# Curated allowlist of useful metadata surfaced at level 3. Plain
+# strings match a record ``type`` outright; tuples match (type, subtype)
+# for the finer-grained ``system`` / ``attachment`` families. Anything
+# not listed here (and not caught by an earlier tier) falls through to
+# level 4.
+_L3_USEFUL = frozenset([
+    'summary',
+    'task-summary',
+    'last-prompt',
+    'pr-link',
+    'worktree-state',
+    'custom-title',
+    'tag',
+    'queue-operation',
+    'marble-origami-commit',
+    ('system', 'local_command'),
+    ('attachment', 'file'),
+    ('attachment', 'queued_command'),
+    ('attachment', 'hook_success'),
+    ('attachment', 'diagnostics'),
+])
+
+
+def _record_min_level(rec):
+    """Minimum detail level at which ``rec`` becomes visible (1-4).
+
+    Whitelist semantics: only records we recognise are promoted to a
+    lower (more-visible) tier; anything unmatched falls through to 4 so
+    new/unknown record kinds surface only at level 4 (all) but stay out
+    of the leaner views.
+
+      * ``isMeta`` (injected context; never lived)        → 4
+      * voice (``_is_voice``)                              → 1
+      * user / assistant machinery (tool_use, tool_result,
+        thinking-only)                                     → 2
+      * ``_LIVE_EXTRAS`` framing (system turn_duration /
+        api_error)                                         → 2
+      * ``_L3_USEFUL`` curated metadata                    → 3
+      * otherwise                                          → 4
+    """
+    if not isinstance(rec, dict):
+        return 4
+    # Injected context is never part of the lived conversation — it
+    # outranks even its own type, so check it first.
+    if rec.get('isMeta'):
+        return 4
+    if _is_voice(rec):
+        return 1
+    t = rec.get('type')
+    # The rest of a user/assistant turn as it was lived: tool_use,
+    # tool_result, thinking-only — everything _is_voice() rejected.
+    if t in ('user', 'assistant'):
+        return 2
+    if t == 'system':
+        sub = rec.get('subtype')
+        if (t, sub) in _LIVE_EXTRAS:
+            return 2
+        if (t, sub) in _L3_USEFUL:
+            return 3
+        return 4
+    if t == 'attachment':
+        a = rec.get('attachment')
+        sub = a.get('type') if isinstance(a, dict) else None
+        if (t, sub) in _L3_USEFUL:
+            return 3
+        return 4
+    if t in _L3_USEFUL:
+        return 3
+    return 4
+
+
 def _passes_filter(item_id, td=None):
-    """True iff ``item_id`` should be visible under the current filter.
+    """True iff ``item_id`` should be visible at the current detail level.
 
     Used by every Item builder to derive ``hidden`` and by the live-tail
-    worker to detect when a hidden umbrella has crossed the
-    voice-bearing threshold. Returns True unconditionally when
-    ``_FILTER_VOICE_ONLY`` is off — callers pass through the same
-    predicate in both states.
+    worker to detect when a hidden umbrella has crossed the visibility
+    threshold. A row is shown iff its *minimum* level (the lowest
+    ``_DETAIL_LEVEL`` it becomes visible at) is ``<= _DETAIL_LEVEL``.
 
-    Predicate body when the filter is on:
-      * ``('msg', jsonl, n)``    → ``_is_voice(td.records[n])``
-      * ``('prompt', jsonl, n)`` → True (turns open at a user voice)
-      * ``('tool', jsonl, n)``   → ``_is_voice(td.records[n])`` (the
-                                    mixed text+tool_use case passes)
-      * ``('span', jsonl, n)``   → any voice record in the span
-      * ``('agent', …)``         → True (subagent umbrella; always
-                                    shown — we don't peek into other
-                                    files at filter time)
-      * any other id             → True (be permissive; framework
+    Predicate body, by id tag:
+      * ``('msg', jsonl, n)``    → ``_record_min_level(td.records[n])``
+      * ``('prompt', jsonl, n)`` → always (turns open at a user voice,
+                                    level 1)
+      * ``('tool', jsonl, n)``   → its assistant record's min level
+                                    (a bare tool_use is level 2), but
+                                    promoted to voice (level 1) when the
+                                    umbrella wraps a resolvable subagent
+                                    (same rule as ``_tool_umbrella_item``)
+      * ``('span', jsonl, n)``   → min level over the span's members
+      * ``('agent', …)``         → always (subagent umbrella; we don't
+                                    peek into other files at filter time)
+      * any other id             → always (be permissive; framework
                                     error rows and ``('trunc', …)``
                                     fillers stay visible)
     """
-    if not _FILTER_VOICE_ONLY:
+    if _DETAIL_LEVEL >= 4:
         return True
     if not isinstance(item_id, tuple) or not item_id:
         return True
@@ -1249,26 +1330,27 @@ def _passes_filter(item_id, td=None):
         if 0 <= n < len(td.records):
             rec = td.records[n]
             if isinstance(rec, dict):
-                # Voice if the underlying assistant carries text, OR
-                # the tool_use dispatches a resolvable subagent (same
-                # rule that gives the umbrella its row stripe in
-                # ``_tool_umbrella_item``) — the voice marker
-                # propagates up from the subagent through the
-                # ``<tool:Agent>`` umbrella, and so should the filter.
-                if _is_voice(rec):
+                # A ``<tool:Agent>`` umbrella that dispatches a
+                # resolvable subagent reads as voice (level 1) — the
+                # subagent's voice marker propagates up through the
+                # umbrella, same rule that gives it its row stripe in
+                # ``_tool_umbrella_item``. Otherwise it carries its
+                # assistant record's own min level (a bare tool_use is
+                # level 2).
+                if _tool_umbrella_wraps_subagent(rec, td):
                     return True
-                return _tool_umbrella_wraps_subagent(rec, td)
+                return _record_min_level(rec) <= _DETAIL_LEVEL
         return True
     if tag == 'span':
         for rec in td.span_records.get(n, []):
-            if isinstance(rec, dict) and _is_voice(rec):
+            if isinstance(rec, dict) and _record_min_level(rec) <= _DETAIL_LEVEL:
                 return True
         return False
     # tag == 'msg'
     if 0 <= n < len(td.records):
         rec = td.records[n]
         if isinstance(rec, dict):
-            return _is_voice(rec)
+            return _record_min_level(rec) <= _DETAIL_LEVEL
     return True
 
 
@@ -3283,7 +3365,7 @@ def get_preview(item_id):
     * ``('project', dir)``     : human-readable summary + session list
     * ``('session', jsonl)``   : concatenated child previews (same machinery
                                   as the umbrella previews — uniform body
-                                  cascade, honours the voice-only filter
+                                  cascade, honours the detail filter
                                   transparently via ``hidden`` on children).
     * ``('agent', jsonl, aid)``: same uniform cascade against the subagent's
                                   own .jsonl.
@@ -3459,7 +3541,11 @@ _TREE_CACHE = {}   # path → TreeData
 _SCAN_LOCKS = {}            # path → threading.Lock
 _SCAN_LOCKS_LOCK = threading.Lock()
 _TREE_MODE = True  # default; --no-tree CLI flag or 't' action flips it.
-_FILTER_VOICE_ONLY = True  # default; --show-all flag or '.' flips it.
+# Detail level: a record is visible iff its *minimum* level (see
+# ``_record_min_level``) is <= this. 1=voice, 2=tools, 3=detailed,
+# 4=all. Default 1 (voice-only). Set by the --detail CLI flag or
+# changed live with the '1'-'4' key bindings.
+_DETAIL_LEVEL = 1
 
 
 # Live-tail worker state, keyed by .jsonl path. The worker resumes
@@ -4156,7 +4242,7 @@ def _read_new_records(path):
 
 def _refresh_hidden_in_op(op):
     """Return ``op`` with its ``hidden`` field re-evaluated against the
-    live ``_FILTER_VOICE_ONLY`` global.
+    live ``_DETAIL_LEVEL`` global.
 
     Used by the umbrella generator's flush helper so a filter toggle
     that lands between descent (when an item's ``hidden`` was sampled)
@@ -4207,12 +4293,13 @@ def _push_tail_diffs(b, dirty_parents):
         return
     ops = []
     for parent_id in dirty_parents:
-        # Under voice-only filter, a tail append (e.g., a voice record
-        # joining a previously-machinery-only ``span`` umbrella) can
-        # cross the parent into voice-bearing. Reveal the parent first,
-        # in the same batch as its new children. Skip when the parent
-        # isn't in our index (yet to be upserted) — it'll be built with
-        # the right ``hidden`` from the builder.
+        # At a reduced detail level, a tail append (e.g., a voice
+        # record joining a previously-hidden ``span`` umbrella) can
+        # cross the parent's min level under the current threshold.
+        # Reveal the parent first, in the same batch as its new
+        # children. Skip when the parent isn't in our index (yet to be
+        # upserted) — it'll be built with the right ``hidden`` from the
+        # builder.
         parent_item = b.get_item(parent_id)
         if (
             parent_item is not None
@@ -4809,8 +4896,12 @@ def _span_umbrella_item(jsonl_path, start_line, records):
     if len(type_counts) > 4:
         types_summary += ', …'
 
-    has_voice = any(
-        isinstance(r, dict) and _is_voice(r) for r in records
+    # The span is visible iff any member surfaces at the current level
+    # — the same min-level rule ``_passes_filter`` applies to its
+    # ``('span', …)`` id, computed here off the records in hand.
+    any_visible = any(
+        isinstance(r, dict) and _record_min_level(r) <= _DETAIL_LEVEL
+        for r in records
     )
     item = Item(
         id=('span', jsonl_path, start_line),
@@ -4818,7 +4909,7 @@ def _span_umbrella_item(jsonl_path, start_line, records):
         tag=f'{len(records)} records',
         tag_style='dim',
         has_children=len(records) > 0,
-        hidden=_FILTER_VOICE_ONLY and not has_voice,
+        hidden=not any_visible,
     )
     item.kind = 'span'
     item.span_start = start_line
@@ -5137,8 +5228,8 @@ def _walk_umbrella(item_id, _state, _flush):
         cid = getattr(child, 'id', None)
         if not isinstance(cid, tuple):
             continue
-        # Honour the recipe's voice-only filter: a hidden child (e.g.,
-        # a non-voice-bearing ``tool`` umbrella, or a tool_result
+        # Honour the recipe's detail filter: a hidden child (e.g.,
+        # a ``tool`` umbrella below the current level, or a tool_result
         # leaf) is invisible in the list and shouldn't bleed into the
         # parent's preview either.
         if getattr(child, 'hidden', False):
@@ -5613,7 +5704,7 @@ def _first_visible_child(item_id):
     rows whose children carry no ``row_bg`` voice marker — markdown
     document/heading/file nodes. Single-level (``get_children``, so it is
     mode-agnostic and honours the umbrella structure), first-in-listing
-    order, and it skips children the voice-only filter has marked
+    order, and it skips children the detail filter has marked
     ``hidden`` — mirroring the visibility the voice-jump respects (a
     voice row always passes the filter, so the latest-voice lookup never
     lands on a hidden row). Returns ``None`` when there are no children
@@ -6261,24 +6352,47 @@ def _action_toggle_tree(ctx):
         )
 
 
-def _action_toggle_filter(ctx):
-    """Flip voice-only filter on/off using framework ``hidden`` flags.
+_DETAIL_LEVEL_NAMES = {1: 'voice', 2: 'tools', 3: 'detailed', 4: 'all'}
+# Word aliases for the ``--detail`` CLI flag, derived from the level
+# names so the two never drift (voice=1, tools=2, detailed=3, all=4).
+_DETAIL_LEVEL_ALIASES = {name: level for level, name in _DETAIL_LEVEL_NAMES.items()}
 
-    Iterates every currently-loaded ``Item`` and emits a single
-    ``mod(id, hidden=...)`` batch with one op per row whose target
-    visibility differs from its current one. Items not yet loaded
-    (children of collapsed umbrellas) get their ``hidden`` set on
-    next expansion — the builders consult the live
-    ``_FILTER_VOICE_ONLY`` global.
 
-    Cursor migration on filter-on is handled entirely by the
+def _parse_detail_level(raw):
+    """Convert a ``--detail`` value to a level int (1-4).
+
+    Accepts the digits ``'1'``-``'4'`` and the word aliases
+    (``voice``/``tools``/``detailed``/``all``, case-insensitively).
+    Raises ``ValueError`` on anything else so ``_pop_value`` surfaces
+    the usage error to ``main``.
+    """
+    key = raw.strip().lower()
+    if key in _DETAIL_LEVEL_ALIASES:
+        return _DETAIL_LEVEL_ALIASES[key]
+    if key in ('1', '2', '3', '4'):
+        return int(key)
+    raise ValueError(raw)
+
+
+def _set_detail_level(ctx, level):
+    """Set the detail level absolutely and recompute row visibility.
+
+    Bound to the ``1``-``4`` keys (each an absolute setter, not a
+    toggle). Sets ``_DETAIL_LEVEL``, then iterates every currently-
+    loaded ``Item`` and emits a single ``mod(id, hidden=...)`` batch
+    with one op per row whose target visibility differs from its
+    current one. Items not yet loaded (children of collapsed umbrellas)
+    get their ``hidden`` set on next expansion — the builders consult
+    the live ``_DETAIL_LEVEL`` global.
+
+    Cursor migration when rows hide is handled entirely by the
     framework's post-``apply_ops`` hide-displacement hook (walks back
     to the nearest still-visible row, falls back to the first
     visible). Selection state is preserved as-is; ``ctrl-A``
     (``_select_all_visible``) is already WYSIWYG.
     """
-    global _FILTER_VOICE_ONLY
-    _FILTER_VOICE_ONLY = not _FILTER_VOICE_ONLY
+    global _DETAIL_LEVEL
+    _DETAIL_LEVEL = level
     ops = []
     for item in ctx.all_items():
         want_hidden = not _passes_filter(item.id)
@@ -6287,14 +6401,12 @@ def _action_toggle_filter(ctx):
     if ops:
         ctx.update_data(ops)
     # Umbrella previews compose from non-hidden children, so every
-    # cached preview is potentially stale after a filter flip. Drop
+    # cached preview is potentially stale after a level change. Drop
     # every cached entry; ``drop_preview_cache`` will kick the worker
     # for the current preview cursor and flag a redraw, preserving
     # view state (a user pinned to the tail keeps following).
     ctx.drop_preview_cache()
-    ctx.flash(
-        f"voice-only filter: {'on' if _FILTER_VOICE_ONLY else 'off'}"
-    )
+    ctx.flash(f"detail: {level} - {_DETAIL_LEVEL_NAMES[level]}")
 
 
 # ---- context menu --------------------------------------------------------
@@ -6792,9 +6904,10 @@ Usage: browse-claude [OPTIONS] [PROJECT]
   --tree          Show sessions as a tree, grouped by turn (default).
                   Subagents nest inline under their assistant rows.
   --no-tree       Show sessions as a flat reverse-time list.
-  --show-all      Show every record (tool calls, system records, etc.).
-  --no-show-all   Start in voice-only mode, hiding tool calls / system
-                  records (default; press '.' to toggle).
+  --detail LEVEL  Detail level (default: 1). LEVEL is 1-4 or a word:
+                  1=voice (speech only), 2=tools (the lived turn),
+                  3=detailed (+ useful metadata), 4=all. Change it live
+                  with the '1'-'4' keys.
   PROJECT         Project directory name under ~/.claude/projects/ to
                   drill into on launch. Ignored when --session / --pid /
                   --file is given.\
@@ -6815,7 +6928,7 @@ a transcript with Right/Alt-Down; preview shows the rendered turn.
   M       render the preview via $MDCAT / mdcat (external).
   J / K   jump cursor to next / previous user-or-assistant voice.
   t       toggle flat / tree view.
-  .       toggle voice-only filter (hide tool calls / machinery).
+  1-4     detail level: 1 voice, 2 tools, 3 detailed, 4 all.
 
 Right-click a row (or the backslash / F1 keys) for a menu: message and
 turn / tool / span umbrella rows offer the source actions above
@@ -6831,7 +6944,7 @@ _message_limit = _MESSAGE_LIMIT
 
 
 def main():
-    global _message_limit, _RUNNING_ONLY, _TREE_MODE, _FILTER_VOICE_ONLY, _BROWSER
+    global _message_limit, _RUNNING_ONLY, _TREE_MODE, _DETAIL_LEVEL, _BROWSER
     _init_color()
     _message_limit = _pop_limit_arg(_MESSAGE_LIMIT)
 
@@ -6851,15 +6964,17 @@ def main():
     elif no_tree_flag:
         _TREE_MODE = False
 
-    # Voice-only filter: on by default. --show-all turns it off; the
-    # --no-show-all flag is a redundant no-op kept for explicitness, and
-    # --show-all wins over --no-show-all when both are passed.
-    show_all_flag    = _pop_flag('--show-all')
-    no_show_all_flag = _pop_flag('--no-show-all')
-    if show_all_flag:
-        _FILTER_VOICE_ONLY = False
-    elif no_show_all_flag:
-        _FILTER_VOICE_ONLY = True
+    # Detail level: voice-only (level 1) by default. --detail LEVEL
+    # (or --detail=LEVEL) sets it, accepting the digits 1-4 or the word
+    # aliases voice/tools/detailed/all. An invalid value pops as the
+    # ``False`` sentinel — report it as a usage error.
+    detail_arg = _pop_value('--detail', _parse_detail_level)
+    if detail_arg is False:
+        print('browse-claude: --detail must be 1-4 or one of '
+              'voice/tools/detailed/all', file=sys.stderr)
+        sys.exit(2)
+    if detail_arg is not None:
+        _DETAIL_LEVEL = detail_arg
 
     # --running needs the running index regardless of which target we open;
     # tagging sessions with PIDs also depends on it.
@@ -6964,7 +7079,7 @@ def main():
         show_ids='never',
         # Keep the tree-mode ``--- Subagents: / --- Session:`` meta
         # dividers (emitted in ``_list_tree_roots``) visible even while a
-        # voice-only filter is active, so the section labels persist.
+        # reduced detail level is active, so the section labels persist.
         meta_filter_mode='show',
         get_children=get_children,
         get_preview=get_preview,
@@ -6987,7 +7102,13 @@ def main():
             Action('J',     'Jump to next voice (user/asst)',  _action_next_voice,  'none'),
             Action('K',     'Jump to prev voice (user/asst)',  _action_prev_voice,  'none'),
             Action('t',     'Toggle flat / tree view',         _action_toggle_tree, 'none'),
-            Action('.',     'Toggle voice-only filter',        _action_toggle_filter, 'none'),
+            # Detail level (absolute setters): 1=voice, 2=tools,
+            # 3=detailed, 4=all. Each sets _DETAIL_LEVEL and recomputes
+            # row visibility (see _set_detail_level).
+            Action('1',     'Detail: voice',                   lambda c: _set_detail_level(c, 1), 'none'),
+            Action('2',     'Detail: tools',                   lambda c: _set_detail_level(c, 2), 'none'),
+            Action('3',     'Detail: detailed',                lambda c: _set_detail_level(c, 3), 'none'),
+            Action('4',     'Detail: all',                     lambda c: _set_detail_level(c, 4), 'none'),
             # Right: the framework default expands a collapsed row; the
             # ``on_expand`` / ``on_children_loaded`` hooks then jump the
             # cursor to the latest voice (for every expansion source, not

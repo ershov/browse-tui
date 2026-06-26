@@ -27,9 +27,29 @@ JSON pretty-print preview.
 ```bash
 ./recipes/browse-claude                  # all projects
 ./recipes/browse-claude /home/me/work    # initial-scope
+./recipes/browse-claude --detail tools   # boot at detail level 2
 ```
 
-Keys: `e` / `o` open in `$EDITOR`, `y` show id (debugging).
+**Detail levels.** A transcript carries far more than speech, so rows are
+gated by a detail level — each record has a *minimum* level at or above
+which it shows:
+
+- `1` `voice` — speech only: user prompts and assistant text replies
+  (`AskUserQuestion` / `SendMessage` / task-notifications count as
+  dialog). The default.
+- `2` `tools` — the conversation as lived: voice plus every other
+  user/assistant record (tool calls, tool results, thinking) and the
+  inline turn-duration / api-error framing.
+- `3` `detailed` — adds a curated set of useful metadata (summaries,
+  prompts, PR links, worktree state, tags, local commands, attachments…).
+- `4` `all` — every record, including bookkeeping and unknown kinds.
+
+Set the boot level with `--detail LEVEL` (a number `1`-`4` or the word
+`voice` / `tools` / `detailed` / `all`); change it live with the `1`-`4`
+keys.
+
+Keys: `1`-`4` set the detail level, `e` / `o` open in `$EDITOR`, `y` show
+id (debugging).
 
 **Source:** [`recipes/browse-claude`](../../recipes/browse-claude)
 

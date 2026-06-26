@@ -1115,6 +1115,88 @@ class TestArgPoppers(unittest.TestCase):
             self._restore_argv(saved)
 
 
+class TestDetailLevelArg(unittest.TestCase):
+    """``--detail`` parses numbers + word aliases; rejects bad values.
+
+    ``main()`` touches argv / stdin / Browser, so we can't run it
+    headless — exercise the two pieces it composes instead:
+    ``_parse_detail_level`` (the conv) and its use through
+    ``_pop_value`` (the same primitive ``-n`` / ``--pid`` use).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _with_argv(self, argv):
+        import sys as _sys
+        saved = _sys.argv
+        _sys.argv = ['browse-claude'] + argv
+        return saved
+
+    def _restore_argv(self, saved):
+        import sys as _sys
+        _sys.argv = saved
+
+    def test_parse_numbers(self):
+        for raw, lvl in (('1', 1), ('2', 2), ('3', 3), ('4', 4)):
+            with self.subTest(raw=raw):
+                self.assertEqual(self.r._parse_detail_level(raw), lvl)
+
+    def test_parse_word_aliases(self):
+        for raw, lvl in (('voice', 1), ('tools', 2),
+                         ('detailed', 3), ('all', 4)):
+            with self.subTest(raw=raw):
+                self.assertEqual(self.r._parse_detail_level(raw), lvl)
+
+    def test_parse_aliases_case_insensitive_and_trimmed(self):
+        self.assertEqual(self.r._parse_detail_level('VOICE'), 1)
+        self.assertEqual(self.r._parse_detail_level('  All '), 4)
+
+    def test_parse_rejects_bad_values(self):
+        for bad in ('0', '5', '', 'foo', 'vo', '-1', '3.0'):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    self.r._parse_detail_level(bad)
+
+    def test_pop_value_space_form(self):
+        saved = self._with_argv(['--detail', '3'])
+        try:
+            self.assertEqual(
+                self.r._pop_value('--detail', self.r._parse_detail_level), 3)
+            import sys as _sys
+            self.assertEqual(_sys.argv, ['browse-claude'])
+        finally:
+            self._restore_argv(saved)
+
+    def test_pop_value_equals_form_alias(self):
+        saved = self._with_argv(['--detail=all'])
+        try:
+            self.assertEqual(
+                self.r._pop_value('--detail', self.r._parse_detail_level), 4)
+        finally:
+            self._restore_argv(saved)
+
+    def test_pop_value_invalid_is_false_sentinel(self):
+        # A bad value pops as ``False`` so ``main`` can emit the usage
+        # error (mirrors ``--pid banana``).
+        saved = self._with_argv(['--detail', 'bogus'])
+        try:
+            self.assertIs(
+                self.r._pop_value('--detail', self.r._parse_detail_level),
+                False)
+        finally:
+            self._restore_argv(saved)
+
+    def test_pop_value_absent_is_none(self):
+        saved = self._with_argv(['--other', 'x'])
+        try:
+            self.assertIsNone(
+                self.r._pop_value('--detail', self.r._parse_detail_level))
+        finally:
+            self._restore_argv(saved)
+
+
 class TestDecodeProjectPath(unittest.TestCase):
     """``~`` substitution and edge cases for the project-name decoder."""
 
@@ -1414,11 +1496,11 @@ class TestTreeChildrenPreview(unittest.TestCase):
         # These tests assert the full "show everything" baseline (incl.
         # non-voice tool rows), so pin the voice-only filter OFF — it's
         # on by default and would otherwise hide that content.
-        self._saved_FILTER = self.r._FILTER_VOICE_ONLY
-        self.r._FILTER_VOICE_ONLY = False
+        self._saved_FILTER = self.r._DETAIL_LEVEL
+        self.r._DETAIL_LEVEL = 4
 
     def tearDown(self):
-        self.r._FILTER_VOICE_ONLY = self._saved_FILTER
+        self.r._DETAIL_LEVEL = self._saved_FILTER
 
     def _write_jsonl(self, records):
         import json as _json
@@ -3748,12 +3830,12 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             self.r._scan_tree(sess)
             tool_id = ('tool', sess, 1)
             # With voice-only filter ON, the <tool:Agent> id passes.
-            saved = self.r._FILTER_VOICE_ONLY
-            self.r._FILTER_VOICE_ONLY = True
+            saved = self.r._DETAIL_LEVEL
+            self.r._DETAIL_LEVEL = 1
             try:
                 self.assertTrue(self.r._passes_filter(tool_id))
             finally:
-                self.r._FILTER_VOICE_ONLY = saved
+                self.r._DETAIL_LEVEL = saved
 
     def test_tool_umbrella_for_bash_filtered_out_in_voice_only(self):
         # Non-Agent tool (e.g. Bash) — no voice content, no subagent
@@ -3779,12 +3861,12 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             self.r._TREE_CACHE.clear()
             self.r._scan_tree(sess)
             tool_id = ('tool', sess, 1)
-            saved = self.r._FILTER_VOICE_ONLY
-            self.r._FILTER_VOICE_ONLY = True
+            saved = self.r._DETAIL_LEVEL
+            self.r._DETAIL_LEVEL = 1
             try:
                 self.assertFalse(self.r._passes_filter(tool_id))
             finally:
-                self.r._FILTER_VOICE_ONLY = saved
+                self.r._DETAIL_LEVEL = saved
 
     def test_umbrella_preview_omits_chrome_even_after_direct_leaf_visit(self):
         # Regression: previously, when a leaf had been visited directly
@@ -3868,8 +3950,8 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             self.r._TREE_CACHE.clear()
 
             # With filter OFF, the umbrella body contains both records.
-            saved = self.r._FILTER_VOICE_ONLY
-            self.r._FILTER_VOICE_ONLY = False
+            saved = self.r._DETAIL_LEVEL
+            self.r._DETAIL_LEVEL = 4
             try:
                 with_all = ''.join(self.r._preview_umbrella(('session', sess)))
                 self.assertIn('PROBE_VOICE_USER', with_all)
@@ -3877,7 +3959,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
 
                 # With filter ON, the umbrella body should drop the
                 # non-voice <tool:Bash> umbrella.
-                self.r._FILTER_VOICE_ONLY = True
+                self.r._DETAIL_LEVEL = 1
                 # Clear the recipe-level tree cache so the next
                 # _preview_umbrella reflects the new filter state when
                 # it builds children via get_children (mod ops aren't
@@ -3891,7 +3973,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
                     'tool_use record from the umbrella preview',
                 )
             finally:
-                self.r._FILTER_VOICE_ONLY = saved
+                self.r._DETAIL_LEVEL = saved
 
     def test_focus_latest_voice_when_ready_jumps_after_load(self):
         # _focus_latest_voice_when_ready chains:
@@ -5483,9 +5565,9 @@ class TestSummariseTitles(unittest.TestCase):
 
 
 class TestVoiceOnlyFilter(unittest.TestCase):
-    """``.`` hotkey + ``--show-all`` filter: hide everything that
-    isn't voice or a subagent umbrella. Voice-only is the default;
-    ``--show-all`` is the escape hatch that turns it off.
+    """``1``-``4`` detail levels + ``--detail`` flag: hide everything
+    below the chosen level. Level 1 (voice-only) is the default; raising
+    the level (up to 4 = all) reveals more record kinds.
 
     Predicate lives in ``_passes_filter`` and is consulted by every
     Item builder. Toggle emits a single ``mod`` batch — the framework's
@@ -5503,11 +5585,11 @@ class TestVoiceOnlyFilter(unittest.TestCase):
         # Default state for every test; individual tests flip it
         # explicitly. Restored in tearDown so other suites don't see
         # the filter on.
-        self._saved_filter = self.r._FILTER_VOICE_ONLY
-        self.r._FILTER_VOICE_ONLY = False
+        self._saved_filter = self.r._DETAIL_LEVEL
+        self.r._DETAIL_LEVEL = 4
 
     def tearDown(self):
-        self.r._FILTER_VOICE_ONLY = self._saved_filter
+        self.r._DETAIL_LEVEL = self._saved_filter
 
     def _write_jsonl(self, records):
         import json as _json
@@ -5523,7 +5605,7 @@ class TestVoiceOnlyFilter(unittest.TestCase):
     def test_passes_filter_off_returns_true_always(self):
         # With the filter off, the predicate is always True — callers
         # rely on this so the same code path serves both states.
-        self.r._FILTER_VOICE_ONLY = False
+        self.r._DETAIL_LEVEL = 4
         self.assertTrue(self.r._passes_filter('whatever#0'))
         self.assertTrue(self.r._passes_filter('whatever#prompt:0'))
         self.assertTrue(self.r._passes_filter('whatever#tool:0'))
@@ -5543,7 +5625,7 @@ class TestVoiceOnlyFilter(unittest.TestCase):
         ])
         try:
             self.r._scan_tree(path)
-            self.r._FILTER_VOICE_ONLY = True
+            self.r._DETAIL_LEVEL = 1
             self.assertTrue(self.r._passes_filter(('msg', path, 0)))
             self.assertFalse(self.r._passes_filter(('msg', path, 1)))
         finally:
@@ -5562,7 +5644,7 @@ class TestVoiceOnlyFilter(unittest.TestCase):
                                     'name': 'X', 'input': {}}]}}]
         self.r._TREE_CACHE[path] = td
         try:
-            self.r._FILTER_VOICE_ONLY = True
+            self.r._DETAIL_LEVEL = 1
             self.assertTrue(self.r._passes_filter(('prompt', path, 0)))
         finally:
             self.r._TREE_CACHE.pop(path, None)
@@ -5577,7 +5659,7 @@ class TestVoiceOnlyFilter(unittest.TestCase):
         ])
         try:
             self.r._scan_tree(path)
-            self.r._FILTER_VOICE_ONLY = True
+            self.r._DETAIL_LEVEL = 1
             self.assertFalse(self.r._passes_filter(('tool', path, 0)))
         finally:
             os.unlink(path)
@@ -5593,7 +5675,7 @@ class TestVoiceOnlyFilter(unittest.TestCase):
         ])
         try:
             self.r._scan_tree(path)
-            self.r._FILTER_VOICE_ONLY = True
+            self.r._DETAIL_LEVEL = 1
             self.assertTrue(self.r._passes_filter(('tool', path, 0)))
         finally:
             os.unlink(path)
@@ -5615,7 +5697,7 @@ class TestVoiceOnlyFilter(unittest.TestCase):
         ]
         self.r._TREE_CACHE[path] = td
         try:
-            self.r._FILTER_VOICE_ONLY = True
+            self.r._DETAIL_LEVEL = 1
             self.assertFalse(self.r._passes_filter(('span', path, 0)))
             self.assertTrue(self.r._passes_filter(('span', path, 5)))
         finally:
@@ -5624,12 +5706,12 @@ class TestVoiceOnlyFilter(unittest.TestCase):
     def test_passes_filter_subagent_always_true(self):
         # Subagent umbrellas (``('agent', …)``) are unconditionally
         # visible — the recipe doesn't peek into another file to check.
-        self.r._FILTER_VOICE_ONLY = True
+        self.r._DETAIL_LEVEL = 1
         self.assertTrue(self.r._passes_filter(('agent', 'whatever', 'ABC-DEF')))
 
     def test_passes_filter_unparseable_id_is_permissive(self):
         # Synthetic ids (err rows, ``__truncated__``) must stay visible.
-        self.r._FILTER_VOICE_ONLY = True
+        self.r._DETAIL_LEVEL = 1
         self.assertTrue(self.r._passes_filter('__truncated__'))
         self.assertTrue(self.r._passes_filter('whatever#__truncated__'))
         self.assertTrue(self.r._passes_filter('whatever#not_a_kind:5'))
@@ -5646,7 +5728,7 @@ class TestVoiceOnlyFilter(unittest.TestCase):
              ]}},
         ])
         try:
-            self.r._FILTER_VOICE_ONLY = True
+            self.r._DETAIL_LEVEL = 1
             items = self.r._list_messages(path)
             # Filter out the synthetic truncation row if any.
             by_id = {it.id: it for it in items if it.id[0] != 'trunc'}
@@ -5668,7 +5750,7 @@ class TestVoiceOnlyFilter(unittest.TestCase):
              ]}},
         ])
         try:
-            self.r._FILTER_VOICE_ONLY = False
+            self.r._DETAIL_LEVEL = 4
             items = self.r._list_messages(path)
             for it in items:
                 self.assertFalse(it.hidden,
@@ -5688,7 +5770,7 @@ class TestVoiceOnlyFilter(unittest.TestCase):
         ])
         try:
             td = self.r._scan_tree(path)
-            self.r._FILTER_VOICE_ONLY = True
+            self.r._DETAIL_LEVEL = 1
             voice_item = self.r._tree_item(path, td.records[0], td)
             tool_item = self.r._tree_item(path, td.records[1], td)
             self.assertFalse(voice_item.hidden)
@@ -5703,7 +5785,7 @@ class TestVoiceOnlyFilter(unittest.TestCase):
              'message': {'role': 'user', 'content': 'hi'}},
         ])
         try:
-            self.r._FILTER_VOICE_ONLY = True
+            self.r._DETAIL_LEVEL = 1
             # Use a fake agent path the helper will stat (file doesn't
             # need to exist — _subagent_pseudo_item catches OSError).
             item = self.r._subagent_pseudo_item(
@@ -5756,9 +5838,9 @@ class TestVoiceOnlyFilter(unittest.TestCase):
 
         return FakeCtx(), seen_ops
 
-    def test_toggle_action_emits_mod_batch_for_loaded_items(self):
-        # Toggling ON should mod every non-voice loaded item to
-        # hidden=True; voice items and subagents stay hidden=False.
+    def test_set_level_emits_mod_batch_for_loaded_items(self):
+        # Setting level 1 (voice) should mod every non-voice loaded item
+        # to hidden=True; voice items and subagents stay hidden=False.
         path = self._write_jsonl([
             {'type': 'user', 'uuid': 'u1',
              'message': {'role': 'user', 'content': 'hi'}},
@@ -5779,8 +5861,9 @@ class TestVoiceOnlyFilter(unittest.TestCase):
             ctx, seen = self._fake_browser_with_items({
                 voice.id: voice, tool.id: tool, sub.id: sub,
             })
-            self.r._action_toggle_filter(ctx)
-            self.assertTrue(self.r._FILTER_VOICE_ONLY)
+            # From show-all (level 4, setUp) down to voice (level 1).
+            self.r._set_detail_level(ctx, 1)
+            self.assertEqual(self.r._DETAIL_LEVEL, 1)
             self.assertEqual(len(seen), 1)
             ops = seen[0]
             # Every op is a mod op (no removes / upserts).
@@ -5795,8 +5878,8 @@ class TestVoiceOnlyFilter(unittest.TestCase):
         finally:
             os.unlink(path)
 
-    def test_toggle_action_round_trip_restores_visibility(self):
-        # Toggle ON then OFF: every item ends up with hidden=False.
+    def test_set_level_round_trip_restores_visibility(self):
+        # Level 1 then level 4: a tool row hides then re-shows.
         path = self._write_jsonl([
             {'type': 'assistant', 'uuid': 'a1',
              'message': {'role': 'assistant', 'content': [
@@ -5808,14 +5891,14 @@ class TestVoiceOnlyFilter(unittest.TestCase):
             tool = self.r.Item(id=('msg', path, 0))
             tool.hidden = False
             ctx, seen = self._fake_browser_with_items({tool.id: tool})
-            self.r._action_toggle_filter(ctx)
-            self.assertTrue(self.r._FILTER_VOICE_ONLY)
+            self.r._set_detail_level(ctx, 1)
+            self.assertEqual(self.r._DETAIL_LEVEL, 1)
             # Simulate the framework applying the first batch.
             for op in seen[0]:
                 if op[0] == 'mod' and op[1] == tool.id:
                     tool.hidden = op[3].get('hidden', False)
-            self.r._action_toggle_filter(ctx)
-            self.assertFalse(self.r._FILTER_VOICE_ONLY)
+            self.r._set_detail_level(ctx, 4)
+            self.assertEqual(self.r._DETAIL_LEVEL, 4)
             self.assertEqual(len(seen), 2)
             # Second batch flips the tool back to hidden=False.
             mods = {op[1]: op[3] for op in seen[1] if op[0] == 'mod'}
@@ -5824,9 +5907,9 @@ class TestVoiceOnlyFilter(unittest.TestCase):
         finally:
             os.unlink(path)
 
-    def test_toggle_action_drops_preview_cache(self):
+    def test_set_level_drops_preview_cache(self):
         # Umbrella previews compose from non-hidden children. After a
-        # filter flip, every cached preview is potentially stale —
+        # level change, every cached preview is potentially stale —
         # the recipe drops the whole preview cache via the public
         # ``drop_preview_cache()`` API, which the framework guarantees
         # will also re-kick the cursor preview and signal a redraw.
@@ -5835,13 +5918,14 @@ class TestVoiceOnlyFilter(unittest.TestCase):
         # confirm the recipe called it.
         drops = []
         ctx._browser.drop_preview_cache = lambda id_=None: drops.append(id_)
-        self.r._action_toggle_filter(ctx)
+        self.r._set_detail_level(ctx, 1)
         self.assertEqual(drops, [None],
                          'recipe should drop the whole preview cache '
                          'so the framework re-fetches the cursor view')
 
-    def test_toggle_action_no_remove_ops(self):
-        # Toggle never emits remove ops — visibility is non-destructive.
+    def test_set_level_no_remove_ops(self):
+        # A level change never emits remove ops — visibility is
+        # non-destructive.
         path = self._write_jsonl([
             {'type': 'user', 'uuid': 'u1',
              'message': {'role': 'user', 'content': 'hi'}},
@@ -5858,11 +5942,11 @@ class TestVoiceOnlyFilter(unittest.TestCase):
             ctx, seen = self._fake_browser_with_items({
                 it0.id: it0, it1.id: it1,
             })
-            self.r._action_toggle_filter(ctx)
+            self.r._set_detail_level(ctx, 1)
             ops = seen[0]
             self.assertFalse(
                 any(op[0] in ('remove', 'clear_children') for op in ops),
-                f'destructive op leaked into toggle batch: {ops}',
+                f'destructive op leaked into level-change batch: {ops}',
             )
         finally:
             os.unlink(path)
@@ -5911,7 +5995,7 @@ class TestVoiceOnlyFilter(unittest.TestCase):
                     kids = s._state._children.get(parent_id)
                     return None if kids is None else list(kids)
 
-            self.r._FILTER_VOICE_ONLY = True
+            self.r._DETAIL_LEVEL = 1
             self.r._push_flat_inserts(FakeBrowser(), path, new_records)
             self.assertEqual(len(seen_ops), 1)
             ops = seen_ops[0]
@@ -5962,7 +6046,7 @@ class TestVoiceOnlyFilter(unittest.TestCase):
                     kids = s._state._children.get(parent_id)
                     return None if kids is None else list(kids)
 
-            self.r._FILTER_VOICE_ONLY = True
+            self.r._DETAIL_LEVEL = 1
             self.r._push_tail_diffs(FakeBrowser(), [span_id])
             self.assertEqual(len(seen_ops), 1)
             mods = [op for op in seen_ops[0] if op[0] == 'mod']
@@ -5989,7 +6073,7 @@ class TestVoiceOnlyFilter(unittest.TestCase):
              ]}},
         ])
         try:
-            self.r._FILTER_VOICE_ONLY = False
+            self.r._DETAIL_LEVEL = 4
             # Session-path preview routes through the umbrella
             # generator (#460); drain it for the assertions.
             full = ''.join(self.r.get_preview(('session', path)))
@@ -5998,7 +6082,7 @@ class TestVoiceOnlyFilter(unittest.TestCase):
                           'without filter the tool body should appear')
             # Clear the tree cache so item builders re-read the filter.
             self.r._TREE_CACHE.clear()
-            self.r._FILTER_VOICE_ONLY = True
+            self.r._DETAIL_LEVEL = 1
             filtered = ''.join(self.r.get_preview(('session', path)))
             self.assertIn('PROBE_VOICE_TEXT', filtered)
             self.assertNotIn('PROBE_TOOL_NAME', filtered,
@@ -6030,12 +6114,12 @@ class TestVoiceOnlyFilter(unittest.TestCase):
         ])
         try:
             self.r._scan_tree(path)
-            self.r._FILTER_VOICE_ONLY = True
+            self.r._DETAIL_LEVEL = 1
             preview_filtered = ''.join(
                 self.r._preview_umbrella(('prompt', path, 0)),
             )
             # Without the filter the tool's machinery would appear.
-            self.r._FILTER_VOICE_ONLY = False
+            self.r._DETAIL_LEVEL = 4
             preview_full = ''.join(
                 self.r._preview_umbrella(('prompt', path, 0)),
             )
@@ -6051,39 +6135,50 @@ class TestVoiceOnlyFilter(unittest.TestCase):
 
     # ---- CLI + help -----------------------------------------------------
 
-    def test_help_text_mentions_dot_hotkey(self):
-        # The in-app ``.`` hotkey lives in the intro (shown by ``?``).
-        self.assertIn(' .  ', self.r._HELP_INTRO,
-                      'help intro should list the . hotkey')
-        # The CLI flags live in the usage block (shown only by ``--help``).
-        self.assertIn('--show-all', self.r._HELP_USAGE_TMPL)
-        self.assertIn('--no-show-all', self.r._HELP_USAGE_TMPL)
+    def test_help_text_mentions_detail_level_keys(self):
+        # The in-app ``1``-``4`` detail-level keys live in the intro
+        # (shown by ``?``); the old ``.`` hotkey is gone.
+        self.assertIn('1-4', self.r._HELP_INTRO,
+                      'help intro should list the 1-4 detail-level keys')
+        self.assertNotIn(' .  ', self.r._HELP_INTRO,
+                         'the . hotkey should no longer appear')
+        # The CLI flag lives in the usage block (shown only by ``--help``);
+        # the removed show-all flags are gone. (Build the old flag name at
+        # runtime so it doesn't linger as a literal in the source.)
+        self.assertIn('--detail', self.r._HELP_USAGE_TMPL)
+        self.assertNotIn('--' + 'show-all', self.r._HELP_USAGE_TMPL)
         # The flags block must NOT leak into the in-app intro.
         self.assertNotIn('Usage:', self.r._HELP_INTRO)
         # The old 'h' hotkey is gone from the help intro.
         self.assertNotIn(' h ', self.r._HELP_INTRO,
                          "the 'h' hotkey should no longer appear")
 
-    def test_dot_action_registered(self):
-        # Sanity: the recipe registers a '.' action with the expected
-        # handler (and no longer an 'h' one). We can't run the full
-        # main() under unit test (it touches argv / stdin) — inspect the
-        # source for the binding.
+    def test_detail_level_actions_registered(self):
+        # Sanity: the recipe registers the four '1'-'4' detail-level
+        # actions and no longer a '.' (or 'h') one. We can't run the
+        # full main() under unit test (it touches argv / stdin) —
+        # inspect the source for the bindings.
         with open(_RECIPE) as f:
             source = f.read()
-        self.assertIn("Action('.',", source)
-        self.assertIn('_action_toggle_filter', source)
+        for key in ('1', '2', '3', '4'):
+            self.assertIn(f"Action('{key}',", source,
+                          f"missing detail-level binding for '{key}'")
+        self.assertIn('_set_detail_level', source)
+        self.assertNotIn("Action('.',", source,
+                         "the '.' toggle binding should be gone")
+        self.assertNotIn('_action_toggle_filter', source,
+                         "the old toggle handler should be gone")
         self.assertNotIn(
             "Action('h',", source,
             "the 'h' binding for the voice-only filter should be gone")
 
     def test_filter_voice_only_default_is_on(self):
-        # Voice-only is the default at module load; --show-all is the
-        # escape hatch that turns it off.
+        # Voice-only (detail level 1) is the default at module load;
+        # --detail raises it (up to 4 = all).
         with open(_RECIPE) as f:
             source = f.read()
-        self.assertIn('_FILTER_VOICE_ONLY = True', source)
-        self.assertNotIn('_FILTER_VOICE_ONLY = False  #', source)
+        self.assertIn('_DETAIL_LEVEL = 1', source)
+        self.assertNotIn('_DETAIL_LEVEL = 4  #', source)
 
     def test_on_resize_drops_preview_cache(self):
         # #829: the recipe registers an on_resize handler that drops the
@@ -6117,6 +6212,237 @@ class TestVoiceOnlyFilter(unittest.TestCase):
             drops, [None],
             'on_resize must drop the entire preview cache (id=None) so the '
             'framework re-fetches the cursor preview at the new width')
+
+
+class TestRecordMinLevel(unittest.TestCase):
+    """``_record_min_level`` classifies one record into a detail tier (1-4).
+
+    Whitelist semantics: voice→1, lived machinery→2, curated metadata→3,
+    everything unrecognised (and ``isMeta``) →4.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_voice_user_is_level_1(self):
+        rec = {'type': 'user', 'message': {'role': 'user', 'content': 'hi'}}
+        self.assertEqual(self.r._record_min_level(rec), 1)
+
+    def test_voice_assistant_text_is_level_1(self):
+        rec = {'type': 'assistant', 'message': {'role': 'assistant',
+               'content': [{'type': 'text', 'text': 'done'}]}}
+        self.assertEqual(self.r._record_min_level(rec), 1)
+
+    def test_assistant_tool_use_is_level_2(self):
+        rec = {'type': 'assistant', 'message': {'role': 'assistant',
+               'content': [{'type': 'tool_use', 'id': 't', 'name': 'Bash',
+                            'input': {'command': 'ls'}}]}}
+        self.assertEqual(self.r._record_min_level(rec), 2)
+
+    def test_user_tool_result_is_level_2(self):
+        rec = {'type': 'user', 'message': {'role': 'user',
+               'content': [{'type': 'tool_result', 'tool_use_id': 't',
+                            'content': 'ok'}]}}
+        self.assertEqual(self.r._record_min_level(rec), 2)
+
+    def test_assistant_thinking_only_is_level_2(self):
+        rec = {'type': 'assistant', 'message': {'role': 'assistant',
+               'content': [{'type': 'thinking', 'thinking': 'hmm'}]}}
+        self.assertEqual(self.r._record_min_level(rec), 2)
+
+    def test_system_turn_duration_is_level_2(self):
+        rec = {'type': 'system', 'subtype': 'turn_duration',
+               'durationMs': 1000, 'messageCount': 3}
+        self.assertEqual(self.r._record_min_level(rec), 2)
+
+    def test_system_api_error_is_level_2(self):
+        rec = {'type': 'system', 'subtype': 'api_error'}
+        self.assertEqual(self.r._record_min_level(rec), 2)
+
+    def test_l3_useful_plain_types_are_level_3(self):
+        for t in ('summary', 'task-summary', 'last-prompt', 'pr-link',
+                  'worktree-state', 'custom-title', 'tag', 'queue-operation',
+                  'marble-origami-commit'):
+            with self.subTest(type=t):
+                # ``queue-operation`` with content is voice → seed it empty
+                # so it classifies as plain metadata here.
+                rec = {'type': t}
+                self.assertEqual(self.r._record_min_level(rec), 3)
+
+    def test_l3_useful_system_local_command_is_level_3(self):
+        rec = {'type': 'system', 'subtype': 'local_command', 'content': 'ls'}
+        self.assertEqual(self.r._record_min_level(rec), 3)
+
+    def test_l3_useful_attachments_are_level_3(self):
+        for sub in ('file', 'queued_command', 'hook_success', 'diagnostics'):
+            with self.subTest(attachment=sub):
+                rec = {'type': 'attachment', 'attachment': {'type': sub}}
+                self.assertEqual(self.r._record_min_level(rec), 3)
+
+    def test_unlisted_system_subtype_is_level_4(self):
+        rec = {'type': 'system', 'subtype': 'hook'}
+        self.assertEqual(self.r._record_min_level(rec), 4)
+
+    def test_unlisted_attachment_subtype_is_level_4(self):
+        rec = {'type': 'attachment', 'attachment': {'type': 'skill_listing'}}
+        self.assertEqual(self.r._record_min_level(rec), 4)
+
+    def test_unknown_type_is_level_4(self):
+        self.assertEqual(self.r._record_min_level({'type': 'progress'}), 4)
+        self.assertEqual(self.r._record_min_level({'type': 'totally-new'}), 4)
+
+    def test_ismeta_record_is_level_4(self):
+        # ``isMeta`` outranks even its own (otherwise-voice) type: an
+        # injected-context user record is never part of the lived turn.
+        rec = {'type': 'user', 'isMeta': True,
+               'message': {'role': 'user', 'content': 'injected'}}
+        self.assertEqual(self.r._record_min_level(rec), 4)
+
+    def test_non_dict_record_is_level_4(self):
+        self.assertEqual(self.r._record_min_level(None), 4)
+
+
+class TestPassesFilterByLevel(unittest.TestCase):
+    """``_passes_filter`` gates each row tag against ``_DETAIL_LEVEL``.
+
+    A row shows iff its min level is ``<= _DETAIL_LEVEL``. Verified at all
+    four levels for msg / tool / span / prompt / agent ids.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def setUp(self):
+        self.r._TREE_CACHE.clear()
+        self._saved_level = self.r._DETAIL_LEVEL
+
+    def tearDown(self):
+        self.r._DETAIL_LEVEL = self._saved_level
+        self.r._TREE_CACHE.clear()
+
+    def _write_jsonl(self, records):
+        import json as _json
+        import tempfile
+        f = tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False)
+        for r in records:
+            f.write(_json.dumps(r) + '\n')
+        f.close()
+        return f.name
+
+    def _visible_at(self, item_id, td=None):
+        """Tuple of bools — does ``item_id`` pass at levels 1,2,3,4?"""
+        out = []
+        for lvl in (1, 2, 3, 4):
+            self.r._DETAIL_LEVEL = lvl
+            out.append(self.r._passes_filter(item_id, td))
+        return tuple(out)
+
+    def test_msg_leaf_gating_across_levels(self):
+        # line 0 voice user (1), line 1 assistant tool_use (2), line 2
+        # user tool_result (2). Plus a level-3 metadata leaf and a
+        # level-4 unknown leaf fabricated on a td.
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'hi'}},
+            {'type': 'assistant', 'uuid': 'a1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 't1', 'name': 'X', 'input': {}},
+             ]}},
+            {'type': 'user', 'uuid': 'u2',
+             'message': {'role': 'user', 'content': [
+                 {'type': 'tool_result', 'tool_use_id': 't1', 'content': 'ok'},
+             ]}},
+            {'type': 'tag', 'tag': 'release'},        # level 3
+            {'type': 'progress', 'data': {}},          # level 4 (unknown)
+        ])
+        try:
+            td = self.r._scan_tree(path)
+            self.assertEqual(self._visible_at(('msg', path, 0), td),
+                             (True, True, True, True))   # voice
+            self.assertEqual(self._visible_at(('msg', path, 1), td),
+                             (False, True, True, True))  # tool_use
+            self.assertEqual(self._visible_at(('msg', path, 2), td),
+                             (False, True, True, True))  # tool_result
+            self.assertEqual(self._visible_at(('msg', path, 3), td),
+                             (False, False, True, True)) # tag (L3)
+            self.assertEqual(self._visible_at(('msg', path, 4), td),
+                             (False, False, False, True))# unknown (L4)
+        finally:
+            os.unlink(path)
+
+    def test_tool_umbrella_gating_bare_vs_subagent(self):
+        # A bare Bash tool_use umbrella tracks its assistant min level
+        # (2). An <tool:Agent> umbrella wrapping a resolvable subagent
+        # is voice-promoted to level 1.
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'go'}},
+            {'type': 'assistant', 'uuid': 'a1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 'tb', 'name': 'Bash',
+                  'input': {'command': 'ls'}},
+             ]}},
+        ])
+        try:
+            td = self.r._scan_tree(path)
+            # Bare Bash umbrella: hidden until level 2.
+            self.assertEqual(self._visible_at(('tool', path, 1), td),
+                             (False, True, True, True))
+            # Subagent-wrap promotion: stub the predicate so the same
+            # umbrella id reads as a resolvable-subagent wrap → level 1.
+            saved = self.r._tool_umbrella_wraps_subagent
+            try:
+                self.r._tool_umbrella_wraps_subagent = lambda rec, td_: True
+                self.assertEqual(self._visible_at(('tool', path, 1), td),
+                                 (True, True, True, True))
+            finally:
+                self.r._tool_umbrella_wraps_subagent = saved
+        finally:
+            os.unlink(path)
+
+    def test_span_umbrella_gating_by_min_member(self):
+        # span 0: only an unlisted system + a tag (min level 3).
+        # span 1: includes a voice user (min level 1).
+        path = '/tmp/fake-span-levels.jsonl'
+        td = self.r._TreeData()
+        td.span_records[0] = [
+            {'type': 'system', 'subtype': 'hook'},     # level 4
+            {'type': 'tag', 'tag': 'x'},               # level 3
+        ]
+        td.span_records[1] = [
+            {'type': 'system', 'subtype': 'hook'},     # level 4
+            {'type': 'user', 'message': {'role': 'user', 'content': 'hi'}},
+        ]
+        self.r._TREE_CACHE[path] = td
+        try:
+            self.assertEqual(self._visible_at(('span', path, 0), td),
+                             (False, False, True, True))  # min member = L3
+            self.assertEqual(self._visible_at(('span', path, 1), td),
+                             (True, True, True, True))     # has voice
+        finally:
+            self.r._TREE_CACHE.pop(path, None)
+
+    def test_prompt_umbrella_always_visible(self):
+        # Turn roots open at a user voice → visible at every level, even
+        # when the underlying record is a pure tool_use.
+        path = '/tmp/fake-prompt-levels.jsonl'
+        td = self.r._TreeData()
+        td.records = [{'type': 'assistant', 'message': {'role': 'assistant',
+                       'content': [{'type': 'tool_use', 'id': 't',
+                                    'name': 'X', 'input': {}}]}}]
+        self.r._TREE_CACHE[path] = td
+        try:
+            self.assertEqual(self._visible_at(('prompt', path, 0), td),
+                             (True, True, True, True))
+        finally:
+            self.r._TREE_CACHE.pop(path, None)
+
+    def test_agent_umbrella_always_visible(self):
+        # Subagent umbrellas are unconditionally shown at every level.
+        self.assertEqual(self._visible_at(('agent', 'whatever', 'ABC')),
+                         (True, True, True, True))
 
 
 class TestShowId(unittest.TestCase):
@@ -6320,17 +6646,17 @@ class TestUmbrellaPreviewCacheIntegration(unittest.TestCase):
     def setUp(self):
         self._saved_BROWSER = self.r._BROWSER
         self._saved_TREE_MODE = self.r._TREE_MODE
-        self._saved_FILTER = self.r._FILTER_VOICE_ONLY
+        self._saved_FILTER = self.r._DETAIL_LEVEL
         self.r._TREE_MODE = True
         # These tests assert the full "show everything" baseline (incl.
         # non-voice tool rows), so pin the voice-only filter OFF — it's
         # on by default and would otherwise hide that content.
-        self.r._FILTER_VOICE_ONLY = False
+        self.r._DETAIL_LEVEL = 4
 
     def tearDown(self):
         self.r._BROWSER = self._saved_BROWSER
         self.r._TREE_MODE = self._saved_TREE_MODE
-        self.r._FILTER_VOICE_ONLY = self._saved_FILTER
+        self.r._DETAIL_LEVEL = self._saved_FILTER
         # Drop the recipe-level tree cache so each test gets a fresh
         # scan of its synthetic .jsonl.
         self.r._TREE_CACHE.clear()

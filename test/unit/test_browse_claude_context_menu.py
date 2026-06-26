@@ -957,5 +957,24 @@ class TestDispatchReusesActions(unittest.TestCase):
         self.assertEqual(alerted['text'], 'aid-9')
 
 
+class TestDetailLevelBindings(unittest.TestCase):
+    """The detail filter is driven by the absolute ``1``-``4`` key
+    bindings; the old ``.`` toggle is gone (#1153)."""
+
+    def test_four_detail_level_actions_present_and_dot_gone(self):
+        # The bindings live in the global Action list, not the context
+        # menu — inspect the recipe source for them.
+        with open(_RECIPE) as f:
+            source = f.read()
+        for key in ('1', '2', '3', '4'):
+            self.assertIn(f"Action('{key}',", source,
+                          f"missing detail-level binding for '{key}'")
+        self.assertIn('_set_detail_level', source)
+        self.assertNotIn("Action('.',", source,
+                         "the '.' toggle binding should be gone")
+        self.assertNotIn('_action_toggle_filter', source,
+                         "the old toggle handler should be gone")
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -198,10 +198,10 @@ class TestBrowseClaude(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             _make_fake_claude(tmp)
             with TmuxFixture(cols=120, rows=30, env=self._launch_env(tmp)) as t:
-                # --show-all: the fixture's records (last-prompt,
-                # permission-mode) are machinery the voice-only default
+                # --detail 4 (all): the fixture's records (last-prompt,
+                # permission-mode) are machinery the level-1 default
                 # would hide; this test asserts every per-line record.
-                t.launch(_BIN, '--run-py', _RECIPE, '--show-all')
+                t.launch(_BIN, '--run-py', _RECIPE, '--detail', '4')
                 t.wait_for('/home/test/project')
                 t.send('Right')
                 t.wait_for('abcd1234-deadbeef')
@@ -211,6 +211,75 @@ class TestBrowseClaude(unittest.TestCase):
                 # ``last-prompt`` is the first record so it's the most
                 # reliable wait target.
                 t.wait_for('last-prompt', timeout=3.0)
+                t.send('q')
+
+    def test_detail_level_keys_change_row_visibility(self):
+        """The ``1``-``4`` keys set the detail level; rows appear/vanish.
+
+        Flat mode so each record is its own row and ``_passes_filter``
+        gates it directly (tree mode would wrap them in umbrellas). The
+        session mixes one record per tier:
+
+          * level 1 voice    — user ``DETAILVOICE``
+          * level 2 tools    — assistant tool_use ``DETAILTOOL``
+          * level 3 detailed — ``tag: DETAILTAG``
+          * level 4 all      — ``permission-mode`` (unknown tier → 4)
+
+        Row visibility is the list contents, which IS visible to tmux
+        (unlike reverse-video), so we assert on capture text presence /
+        absence after the screen settles.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, '.claude', 'projects', '-home-x')
+            os.makedirs(proj)
+            sess = os.path.join(proj, 'levels.jsonl')
+            recs = [
+                {'type': 'user', 'uuid': 'u1', 'parentUuid': None,
+                 'message': {'role': 'user', 'content': 'DETAILVOICE'}},
+                {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+                 'message': {'role': 'assistant', 'content': [
+                     {'type': 'tool_use', 'id': 't1', 'name': 'Bash',
+                      'input': {'command': 'DETAILTOOL'}}]}},
+                {'type': 'tag', 'tag': 'DETAILTAG'},
+                {'type': 'permission-mode', 'permissionMode': 'DETAILPERM'},
+            ]
+            with open(sess, 'w') as f:
+                for r in recs:
+                    f.write(json.dumps(r) + '\n')
+            with TmuxFixture(cols=140, rows=30, env=self._launch_env(tmp)) as t:
+                # Flat mode, positional .jsonl → scopes straight in.
+                t.launch(_BIN, '--run-py', _RECIPE, '--no-tree', sess)
+                # Voice loads at the default level 1.
+                t.wait_for('DETAILVOICE', timeout=3.0)
+
+                # Level 4: everything visible.
+                t.send('4')
+                t.wait_for('DETAILPERM', timeout=3.0)
+                cap = t.wait_stable()
+                for probe in ('DETAILVOICE', 'DETAILTOOL', 'DETAILTAG',
+                              'DETAILPERM'):
+                    self.assertIn(probe, cap, f'level 4 should show {probe}')
+
+                # Level 3: drops the level-4-only permission-mode row.
+                t.send('3')
+                cap = t.wait_stable()
+                self.assertIn('DETAILTAG', cap, 'level 3 should show the tag')
+                self.assertNotIn('DETAILPERM', cap,
+                                 'level 3 should hide permission-mode (L4)')
+
+                # Level 2: drops the level-3 tag too; tool still shown.
+                t.send('2')
+                cap = t.wait_stable()
+                self.assertIn('DETAILTOOL', cap, 'level 2 should show the tool')
+                self.assertNotIn('DETAILTAG', cap,
+                                 'level 2 should hide the tag (L3)')
+
+                # Level 1: voice only; the tool row drops.
+                t.send('1')
+                cap = t.wait_stable()
+                self.assertIn('DETAILVOICE', cap, 'level 1 should show voice')
+                self.assertNotIn('DETAILTOOL', cap,
+                                 'level 1 should hide the tool_use (L2)')
                 t.send('q')
 
     def test_lists_subagents_under_session(self):
@@ -1079,10 +1148,10 @@ class TestBrowseClaude(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             _make_fake_claude(tmp, with_subagents=True)
             with TmuxFixture(cols=140, rows=30, env=self._launch_env(tmp)) as t:
-                # --show-all: the navigation below counts on all 3 record
-                # rows being visible; the voice-only default would hide
+                # --detail 4 (all): the navigation below counts on all 3
+                # record rows being visible; the level-1 default would hide
                 # the two machinery records and break the Up-press math.
-                t.launch(_BIN, '--run-py', _RECIPE, '--no-tree', '--show-all')
+                t.launch(_BIN, '--run-py', _RECIPE, '--no-tree', '--detail', '4')
                 t.wait_for('/home/test/project')
                 t.send('Right')
                 t.wait_for('abcd1234-deadbeef')
@@ -1155,10 +1224,10 @@ class TestBrowseClaude(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             _make_fake_claude(tmp, relocated=True)
             with TmuxFixture(cols=140, rows=30, env=self._launch_env(tmp)) as t:
-                # --show-all: the navigation below counts on every record
-                # row being visible; the voice-only default would hide the
-                # machinery rows and break the Up-press math.
-                t.launch(_BIN, '--run-py', _RECIPE, '--no-tree', '--show-all')
+                # --detail 4 (all): the navigation below counts on every
+                # record row being visible; the level-1 default would hide
+                # the machinery rows and break the Up-press math.
+                t.launch(_BIN, '--run-py', _RECIPE, '--no-tree', '--detail', '4')
                 t.wait_for('/home/test/project')
                 t.send('Right')
                 t.wait_for('abcd1234-deadbeef')
@@ -1180,19 +1249,18 @@ class TestBrowseClaude(unittest.TestCase):
                 t.send('q')
 
 
-    def test_dot_toggle_hides_non_voice_rows(self):
-        """Pressing '.' hides non-voice umbrellas and leaves in tree mode.
+    def test_detail_level_1_hides_non_voice_rows(self):
+        """Pressing '1' (voice) hides non-voice umbrellas; stays in tree mode.
 
         Fixture has a user voice (``PROBE_VOICE``) and one assistant
         tool_use (``PROBE_TOOL_CALL``). Under ``--tree``, the tool wraps
         in a ``<tool:Bash>`` umbrella that is **not** voice-bearing
-        (pure tool_use, no text), so after ``.`` the umbrella row and
+        (pure tool_use, min level 2), so after ``1`` the umbrella row and
         its leaf both disappear and the preview composes only from the
         voice content.
 
-        Boots with ``--show-all`` so both rows are visible up front
-        (voice-only is now the default); ``.`` then flips into the
-        filtered view.
+        Boots with ``--detail 4`` (all) so both rows are visible up
+        front (level 1 is the default); ``1`` then drops to voice-only.
         """
         import json as _json
         with tempfile.TemporaryDirectory() as tmp:
@@ -1215,10 +1283,10 @@ class TestBrowseClaude(unittest.TestCase):
                 ) + '\n')
             with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
                 t.launch(_BIN, '--run-py', _RECIPE,
-                         '--tree', '--show-all', '--file', sess)
+                         '--tree', '--detail', '4', '--file', sess)
                 t.wait_for('PROBE_VOICE', timeout=3.0)
                 t.wait_for('PROBE_TOOL_CALL', timeout=3.0)
-                t.send('.')
+                t.send('1')
                 # Synchronise on the observable transition: the tool row
                 # is the only thing that changes, so wait until the
                 # repaint settles, then assert it is gone. PROBE_VOICE is
@@ -1231,16 +1299,16 @@ class TestBrowseClaude(unittest.TestCase):
                 # (preview respects ``hidden`` on children).
                 self.assertNotIn('PROBE_TOOL_CALL', cap,
                                  'tool_use should not appear on screen '
-                                 'after filter is on; got: '
+                                 'at detail level 1; got: '
                                  + cap[-1000:])
                 t.send('q')
 
     def test_h_no_longer_toggles_filter(self):
         """The old 'h' hotkey is unbound: pressing it must NOT filter.
 
-        Boots with ``--show-all`` so the non-voice tool row is visible,
+        Boots with ``--detail 4`` so the non-voice tool row is visible,
         presses 'h', and confirms the tool row is still present (the
-        binding moved to '.').
+        filter is now driven by the '1'-'4' detail-level keys).
         """
         import json as _json
         with tempfile.TemporaryDirectory() as tmp:
@@ -1263,7 +1331,7 @@ class TestBrowseClaude(unittest.TestCase):
                 ) + '\n')
             with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
                 t.launch(_BIN, '--run-py', _RECIPE,
-                         '--tree', '--show-all', '--file', sess)
+                         '--tree', '--detail', '4', '--file', sess)
                 t.wait_for('PROBE_HNOP_VOICE', timeout=3.0)
                 t.wait_for('PROBE_HNOP_TOOL', timeout=3.0)
                 t.send('h')
@@ -1271,13 +1339,13 @@ class TestBrowseClaude(unittest.TestCase):
                 # tool row is STILL there — 'h' is a no-op now.
                 cap = t.wait_stable(timeout=3.0)
                 self.assertIn('PROBE_HNOP_TOOL', cap,
-                              "'h' must not toggle the voice-only filter; "
+                              "'h' must not change the detail level; "
                               'tool row should still be visible. got: '
                               + cap[-1000:])
                 t.send('q')
 
-    def test_dot_toggle_round_trip_restores_view(self):
-        """``. .`` round-trip restores the original visible list."""
+    def test_detail_level_round_trip_restores_view(self):
+        """``1`` then ``4`` round-trip restores the original visible list."""
         import json as _json
         with tempfile.TemporaryDirectory() as tmp:
             proj = os.path.join(tmp, '.claude', 'projects', '-home-test-hrt')
@@ -1299,27 +1367,27 @@ class TestBrowseClaude(unittest.TestCase):
                 ) + '\n')
             with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
                 t.launch(_BIN, '--run-py', _RECIPE,
-                         '--tree', '--show-all', '--file', sess)
+                         '--tree', '--detail', '4', '--file', sess)
                 t.wait_for('PROBE_RT_VOICE', timeout=3.0)
                 t.wait_for('PROBE_RT_TOOL', timeout=3.0)
-                t.send('.')
+                t.send('1')
                 cap_on = t.wait_stable(timeout=3.0)
                 self.assertNotIn('PROBE_RT_TOOL', cap_on,
-                                 'filter on: tool should be hidden')
-                t.send('.')
+                                 'level 1: tool should be hidden')
+                t.send('4')
                 # The tool row reappearing is the deterministic signal
-                # that the second toggle was processed.
+                # that the level-4 change was processed.
                 cap_off = t.wait_for('PROBE_RT_TOOL', timeout=3.0)
                 self.assertIn('PROBE_RT_VOICE', cap_off)
                 self.assertIn('PROBE_RT_TOOL', cap_off,
-                              'filter off: tool should be visible again')
+                              'level 4: tool should be visible again')
                 t.send('q')
 
     def test_default_boot_is_voice_only(self):
-        """Launching with no filter flag boots straight into voice-only.
+        """Launching with no --detail flag boots straight into voice-only.
 
-        Voice-only is now the default (#716): a non-voice tool row is
-        hidden on boot without any ``--no-show-all`` flag.
+        Level 1 (voice) is the default: a non-voice tool row is hidden
+        on boot without any ``--detail`` flag.
         """
         import json as _json
         with tempfile.TemporaryDirectory() as tmp:
@@ -1341,7 +1409,7 @@ class TestBrowseClaude(unittest.TestCase):
                     ]}},
                 ) + '\n')
             with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
-                # No --show-all / --no-show-all: rely on the default.
+                # No --detail flag: rely on the level-1 default.
                 t.launch(_BIN, '--run-py', _RECIPE,
                          '--tree', '--file', sess)
                 t.wait_for('PROBE_DEF_VOICE', timeout=3.0)
@@ -1412,12 +1480,12 @@ class TestBrowseClaude(unittest.TestCase):
                 t.wait_for('PROBE_LAST_VOICE_1499', timeout=10.0)
                 t.send('q')
 
-    def test_no_show_all_starts_in_filtered_mode(self):
-        """``--no-show-all`` boots straight into the voice-only view.
+    def test_detail_1_starts_in_filtered_mode(self):
+        """``--detail 1`` boots straight into the voice-only view.
 
-        Voice-only is the default now (#716), so this flag is a
-        redundant no-op — but it must still resolve to the filtered
-        view rather than accidentally toggling it off.
+        Level 1 is the default, so passing it explicitly is redundant —
+        but it must still resolve to the filtered view rather than
+        accidentally showing the machinery rows.
         """
         import json as _json
         with tempfile.TemporaryDirectory() as tmp:
@@ -1440,12 +1508,12 @@ class TestBrowseClaude(unittest.TestCase):
                 ) + '\n')
             with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
                 t.launch(_BIN, '--run-py', _RECIPE,
-                         '--tree', '--no-show-all', '--file', sess)
+                         '--tree', '--detail', '1', '--file', sess)
                 t.wait_for('PROBE_BOOT_VOICE', timeout=3.0)
                 cap = t.capture()
                 self.assertNotIn('PROBE_BOOT_TOOL', cap,
                                  'tool row should be hidden on boot under '
-                                 '--no-show-all; got: ' + cap[-800:])
+                                 '--detail 1; got: ' + cap[-800:])
                 t.send('q')
 
     # -- SendMessage inter-agent round-trip (#643/#649) --------------------
@@ -1577,11 +1645,11 @@ class TestBrowseClaude(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             sess = self._make_sendmessage_fixture(tmp)
             with TmuxFixture(cols=160, rows=40, env=self._launch_env(tmp)) as t:
-                # --show-all: this test navigates onto the ack tool_result
-                # row, which the voice-only default hides (its hiding is
-                # covered by test_flat_sendmessage_voice_filter_*).
+                # --detail 4 (all): this test navigates onto the ack
+                # tool_result row, which the level-1 default hides (its
+                # hiding is covered by test_flat_sendmessage_voice_filter_*).
                 t.launch(_BIN, '--run-py', _RECIPE,
-                         '--no-tree', '--show-all', '--file', sess,
+                         '--no-tree', '--detail', '4', '--file', sess,
                          '--item', '0')
                 # Inbound reply preview on first paint.
                 cap = t.wait_for('← task-notification', timeout=3.0)
@@ -1601,32 +1669,32 @@ class TestBrowseClaude(unittest.TestCase):
                 t.send('q')
 
     def test_flat_sendmessage_voice_filter_keeps_voice_hides_ack(self):
-        """Flat voice-only: outbound + inbound survive, the ack is hidden.
+        """Flat level 1: outbound + inbound survive, the ack is hidden.
 
-        Boots ``--no-show-all`` (voice-only). The outbound SendMessage and
-        the inbound task-notification both classify as voice, so their
-        rows stay; the ``{success, message}`` ack is a plain tool_result
+        Boots ``--detail 1`` (voice). The outbound SendMessage and the
+        inbound task-notification both classify as voice, so their rows
+        stay; the ``{success, message}`` ack is a plain tool_result
         (machinery) and must be filtered out.
         """
         with tempfile.TemporaryDirectory() as tmp:
             sess = self._make_sendmessage_fixture(tmp)
             with TmuxFixture(cols=160, rows=40, env=self._launch_env(tmp)) as t:
                 t.launch(_BIN, '--run-py', _RECIPE,
-                         '--no-tree', '--no-show-all',
+                         '--no-tree', '--detail', '1',
                          '--file', sess, '--item', '0')
                 t.wait_for('PROBE_REPLY_SUMMARY', timeout=3.0)
                 cap = t.capture()
                 # Both voice halves of the channel remain listed.
                 self.assertIn('agent-send', cap,
-                              'outbound should survive voice-only filter; '
+                              'outbound should survive detail level 1; '
                               'got: ' + cap[-1200:])
                 self.assertIn('agent-reply', cap,
-                              'inbound should survive voice-only filter; '
+                              'inbound should survive detail level 1; '
                               'got: ' + cap[-1200:])
                 # The delivery ack (tool_result machinery) is filtered out
                 # — its one-liner prefix ``↳ tool_result`` must be gone.
                 self.assertNotIn('↳ tool_result', cap,
-                                 'ack should be hidden under voice-only; '
+                                 'ack should be hidden at detail level 1; '
                                  'got: ' + cap[-1200:])
                 t.send('q')
 
@@ -1695,12 +1763,12 @@ class TestBrowseClaude(unittest.TestCase):
                 t.send('q')
 
     def test_tree_sendmessage_voice_filter_keeps_voice_hides_ack(self):
-        """Tree voice-only: outbound + inbound survive, the ack is hidden."""
+        """Tree level 1: outbound + inbound survive, the ack is hidden."""
         with tempfile.TemporaryDirectory() as tmp:
             sess = self._make_sendmessage_fixture(tmp)
             with TmuxFixture(cols=160, rows=40, env=self._launch_env(tmp)) as t:
                 t.launch(_BIN, '--run-py', _RECIPE,
-                         '--tree', '--no-show-all', '--file', sess)
+                         '--tree', '--detail', '1', '--file', sess)
                 # Inbound reply still lands as the latest voice.
                 t.wait_for('← task-notification', timeout=3.0)
                 # Walk up to the human turn and expand it; the
@@ -1713,10 +1781,10 @@ class TestBrowseClaude(unittest.TestCase):
                 t.send('Right')                  # expand human turn
                 cap = t.wait_for('SendMessage', timeout=3.0)
                 self.assertIn('→ PROBE_WORKER_7', cap,
-                              'outbound should survive voice-only filter '
+                              'outbound should survive detail level 1 '
                               'in tree mode; got: ' + cap[-1400:])
                 self.assertNotIn('↳ tool_result', cap,
-                                 'ack should be hidden under voice-only '
+                                 'ack should be hidden at detail level 1 '
                                  'in tree mode; got: ' + cap[-1400:])
                 t.send('q')
 
@@ -1787,7 +1855,7 @@ class TestBrowseClaude(unittest.TestCase):
             sess = self._make_orphan_fixture(tmp)
             with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
                 t.launch(_BIN, '--run-py', _RECIPE,
-                         '--tree', '--show-all', '--file', sess)
+                         '--tree', '--detail', '4', '--file', sess)
                 # The session expands on launch; both dividers render
                 # around the orphan subagent row.
                 t.wait_for('--- Subagents:', timeout=4.0)
@@ -1843,7 +1911,7 @@ class TestBrowseClaude(unittest.TestCase):
             sess = self._make_tree_fixture(tmp)
             with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
                 t.launch(_BIN, '--run-py', _RECIPE,
-                         '--tree', '--show-all', '--file', sess)
+                         '--tree', '--detail', '4', '--file', sess)
                 cap = t.wait_for('PROBE_TURN2_REPLY', timeout=4.0)
                 self.assertNotIn('--- Subagents:', cap,
                                  'no orphan → no Subagents divider; got: '
@@ -1854,27 +1922,27 @@ class TestBrowseClaude(unittest.TestCase):
                 t.send('q')
 
     def test_tree_orphan_dividers_survive_voice_filter(self):
-        """meta_filter_mode='show': dividers persist under the '.' filter."""
+        """meta_filter_mode='show': dividers persist at detail level 1."""
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess = self._make_orphan_fixture(tmp)
             with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
                 t.launch(_BIN, '--run-py', _RECIPE,
-                         '--tree', '--show-all', '--file', sess)
+                         '--tree', '--detail', '4', '--file', sess)
                 t.wait_for('--- Subagents:', timeout=4.0)
                 t.wait_for('--- Session:', timeout=4.0)
-                # Turn on the voice-only filter. The orphan subagent row
+                # Drop to voice-only (level 1). The orphan subagent row
                 # (non-voice) filters away, but the two meta dividers
                 # stay visible because meta_filter_mode='show'.
-                t.send('.')
+                t.send('1')
                 cap = t.wait_stable(timeout=3.0)
                 self.assertIn('--- Subagents:', cap,
                               '--- Subagents: divider should survive the '
-                              'voice-only filter (meta_filter_mode=show); '
+                              'detail filter (meta_filter_mode=show); '
                               'got: ' + cap[-1400:])
                 self.assertIn('--- Session:', cap,
                               '--- Session: divider should survive the '
-                              'voice-only filter; got: ' + cap[-1400:])
+                              'detail filter; got: ' + cap[-1400:])
                 t.send('q')
 
 

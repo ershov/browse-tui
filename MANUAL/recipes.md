@@ -10,7 +10,7 @@ rest each demonstrate a different data-source pattern.
 | Recipe | What it browses |
 | --- | --- |
 | [`browse-git`](recipes/browse-git.md) | A tig-like git browser — commits · status · reflog · branches · stash, a colored commit graph, and `delta`-powered diffs. |
-| [`browse-claude`](recipes/browse-claude.md) | Claude Code history — projects → sessions → messages, with per-message JSON preview. |
+| [`browse-claude`](recipes/browse-claude.md) | Claude Code history — projects → sessions → messages, with per-message JSON preview and a `1`-`4` detail filter (voice / tools / detailed / all). |
 | [`browse-md`](recipes/browse-md.md) | Markdown files as a navigable heading tree, previewed through md2ansi; `FILE.md#section` deep-links. |
 | [`browse-fs`](recipes/browse-fs.md) | Filesystem browser — metadata columns, sort & detail modes, a live mtime watcher, and edit / open / delete actions. |
 | [`browse-plan`](recipes/browse-plan.md) | A project ticket tree over the `plan` CLI — status / edit / create / move flows. |
