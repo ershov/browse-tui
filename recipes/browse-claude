@@ -2477,12 +2477,22 @@ def _render_tool_umbrella(item_id):
     for part in tool_use_parts:
         name = part.get('name')
         formatter = _TOOL_UMBRELLA_FORMATTERS.get(name)
-        if formatter is None:
+        is_mcp = formatter is None and isinstance(name, str) \
+            and name.startswith('mcp__')
+        if formatter is None and not is_mcp:
             return None  # an unregistered tool — defer to the cascade
         inp = part.get('input') or {}
         tur, raw_content, is_error = results.get(part.get('id'), (None, None, False))
         try:
-            block = formatter(inp, tur, raw_content, is_error)
+            # MCP tool names are dynamic (``mcp__<server>__<tool>``) so they
+            # can't be registry keys; route them to the one MCP formatter,
+            # which needs ``name`` for its header. Registered tools keep the
+            # standard ``(inp, tur, raw_content, is_error)`` contract.
+            if is_mcp:
+                block = _fmt_tool_umbrella_mcp(
+                    name, inp, tur, raw_content, is_error)
+            else:
+                block = formatter(inp, tur, raw_content, is_error)
         except Exception:
             return None
         if block is None:
@@ -2789,6 +2799,105 @@ def _fmt_tool_umbrella_notebook_edit(inp, tur, raw_content, is_error):
 _TOOL_UMBRELLA_FORMATTERS['NotebookEdit'] = _fmt_tool_umbrella_notebook_edit
 
 
+def _fmt_tool_umbrella_mcp(name, inp, tur, raw_content, is_error):
+    """MCP-tool umbrella — ``🔧 <server> ▸ <tool>`` + JSON request / result.
+
+    MCP tool names are ``mcp__<server>__<tool>`` (the tool segment may itself
+    contain ``__``). The dispatcher routes any ``mcp__``-prefixed part here —
+    note this formatter takes ``name`` as its first arg (the others receive
+    just ``inp``) since it needs the name for the header. The request is the
+    raw ``input`` JSON (colored); the result is colored when it parses as
+    JSON, else passed through plain. Declines (returns ``None``) on a
+    malformed name with fewer than three ``__`` segments so the cascade
+    handles it.
+    """
+    parts = name.split('__')
+    if len(parts) < 3:
+        return None
+    server = parts[1]
+    tool = '__'.join(parts[2:])
+    out = [f'{YELLOW}{BOLD}🔧 {server} ▸ {tool}{RESET}']
+    if inp:
+        out.append('')
+        out.append(_json_color(json.dumps(inp, indent=2, ensure_ascii=False)))
+    text = tur if isinstance(tur, str) else _fmt_tur_raw_content(raw_content)
+    if text:
+        colored = _maybe_json_color(text)
+        out.append('')
+        out.append(colored if colored is not None else text)
+    return '\n'.join(out)
+
+
+def _fmt_tool_umbrella_task(op, inp, tur, raw_content, is_error):
+    """Background-task family umbrella (Task{Create,Update,Get,List,Output,Stop}).
+
+    The fixed op name is bound by ``_task_um`` so each tool keeps the
+    standard registered-formatter contract. The header is a compact,
+    per-op summary of the request; the result reuses
+    ``_fmt_tool_use_result`` (it already routes the task shapes to
+    ``_fmt_tur_task_update`` / ``_fmt_tur_task_dump``), with a JSON-looking
+    output colored. Declines (returns ``None``) only when neither a header
+    nor a body can be produced.
+
+    Field names span two conventions: the in-tree ``Task*`` CLI uses
+    ``subject`` / ``taskId``; an SDK-style spawn uses
+    ``description`` / ``subagent_type`` / ``task_id`` — both are accepted.
+    """
+    head = f'{YELLOW}{BOLD}🔧 {op}{RESET}'
+    extras = []
+    if op == 'TaskCreate':
+        subagent = inp.get('subagent_type')
+        subject = inp.get('subject') or inp.get('description') or ''
+        if subagent:
+            extras.append(f'{MAGENTA}{subagent}{RESET}')
+        if subject:
+            extras.append(f'{WHITE}{subject}{RESET}')
+    elif op == 'TaskUpdate':
+        tid = inp.get('task_id') or inp.get('taskId')
+        if tid is not None:
+            extras.append(f'{WHITE}#{tid}{RESET}')
+        status = inp.get('status')
+        if status:
+            extras.append(f'{MUTE}status={RESET}{status}')
+    else:
+        # Get / List / Output / Stop — surface whatever key args are set.
+        tid = inp.get('task_id') or inp.get('taskId')
+        if tid is not None:
+            extras.append(f'{WHITE}#{tid}{RESET}')
+        for k in ('status', 'filter', 'limit'):
+            if inp.get(k) is not None:
+                extras.append(f'{MUTE}{k}={RESET}{inp[k]}')
+    if extras:
+        head += '  ' + f'  {MUTE}·{RESET}  '.join(extras)
+    # TaskCreate's first prompt line, when present, hints at the work.
+    prompt = inp.get('prompt') or ''
+    out = [head]
+    if op == 'TaskCreate' and prompt:
+        first = prompt.splitlines()[0].strip()
+        if first:
+            out.append(f'{MUTE}{first[:200]}{RESET}')
+    body = _fmt_tool_use_result(tur, raw_content) if (
+        tur is not None or raw_content) else ''
+    if body:
+        colored = _maybe_json_color(body) if isinstance(tur, str) else None
+        out.append('')
+        out.append(colored if colored is not None else body)
+    return '\n'.join(out)
+
+
+def _task_um(op):
+    """Bind ``op`` so each Task* tool keeps the standard formatter contract."""
+    def _f(inp, tur, raw_content, is_error):
+        return _fmt_tool_umbrella_task(op, inp, tur, raw_content, is_error)
+    return _f
+
+
+for _op in ('TaskCreate', 'TaskUpdate', 'TaskGet', 'TaskList',
+            'TaskOutput', 'TaskStop'):
+    _TOOL_UMBRELLA_FORMATTERS[_op] = _task_um(_op)
+del _op
+
+
 def _fmt_tool_use_grep(inp):
     pattern = inp.get('pattern', '')
     path = inp.get('path') or '.'
@@ -2806,6 +2915,223 @@ def _fmt_tool_use_glob(inp):
     pattern = inp.get('pattern', '')
     path = inp.get('path') or '.'
     return f'{WHITE}{pattern}{RESET}  {MUTE}in{RESET} {CYAN}{path}{RESET}'
+
+
+def _um_head_body(head, tur, raw_content):
+    """Join an umbrella ``head`` with its result body, or ``None``.
+
+    The shared request+result shape for tools whose result side already has
+    a formatter via ``_fmt_tool_use_result``: render the request ``head``
+    (a ``🔧 …`` line) and, when a result is present, append its body below.
+    Returns ``None`` only when there's neither a head nor a body (so an
+    empty request degrades to the cascade); a head with no result yet shows
+    the request alone.
+    """
+    body = _fmt_tool_use_result(tur, raw_content) if (
+        tur is not None or raw_content) else ''
+    if not head and not body:
+        return None
+    return head + (('\n\n' + body) if body else '')
+
+
+def _fmt_tool_umbrella_grep(inp, tur, raw_content, is_error):
+    """Grep umbrella — query header + matches (count / files / content)."""
+    if not inp:
+        return None
+    head = f'{YELLOW}{BOLD}🔧 Grep{RESET}  ' + _fmt_tool_use_grep(inp)
+    return _um_head_body(head, tur, raw_content)
+
+
+_TOOL_UMBRELLA_FORMATTERS['Grep'] = _fmt_tool_umbrella_grep
+
+
+def _fmt_tool_umbrella_glob(inp, tur, raw_content, is_error):
+    """Glob umbrella — pattern header + matched filenames."""
+    if not inp:
+        return None
+    head = f'{YELLOW}{BOLD}🔧 Glob{RESET}  ' + _fmt_tool_use_glob(inp)
+    return _um_head_body(head, tur, raw_content)
+
+
+_TOOL_UMBRELLA_FORMATTERS['Glob'] = _fmt_tool_umbrella_glob
+
+
+# Lightweight markdown sniff: a leading heading / bullet / fence / blockquote
+# on any line, or an inline ``[text](url)`` link. Used to decide whether a
+# fetched body reads better through ``_md_voice`` than as plain text.
+_MD_HINT_RE = re.compile(
+    r'(?m)^(#{1,6}\s|[*\-+]\s|>\s|```|\d+\.\s)|\[[^\]]+\]\([^)]+\)')
+
+
+def _looks_markdown(text):
+    return isinstance(text, str) and bool(_MD_HINT_RE.search(text))
+
+
+def _fmt_tool_umbrella_webfetch(inp, tur, raw_content, is_error):
+    """WebFetch umbrella — ``🔧 WebFetch  <url>`` (+ prompt) then the body.
+
+    There is no structured ``toolUseResult`` for WebFetch; the fetched text
+    arrives as the raw ``tool_result`` content (a model-written markdown
+    summary). The header carries the URL and the question; the body renders
+    through ``_md_voice`` when it looks like markdown, else plain. Declines
+    (returns ``None``) when the request has no ``url``.
+    """
+    url = inp.get('url')
+    if not url:
+        return None
+    prompt = inp.get('prompt', '')
+    head = f'{YELLOW}{BOLD}🔧 WebFetch{RESET}  {CYAN}{url}{RESET}'
+    out = [head]
+    if prompt:
+        out.append(f'{MUTE}{prompt}{RESET}')
+    text = tur if isinstance(tur, str) else _fmt_tur_raw_content(raw_content)
+    if text:
+        out.append('')
+        out.append(_md_voice(text) if _looks_markdown(text) else text)
+    return '\n'.join(out)
+
+
+_TOOL_UMBRELLA_FORMATTERS['WebFetch'] = _fmt_tool_umbrella_webfetch
+
+
+def _fmt_tool_umbrella_websearch(inp, tur, raw_content, is_error):
+    """WebSearch umbrella — ``🔧 WebSearch  <query>`` then the results.
+
+    Like WebFetch the result is unstructured raw content (a text block that
+    leads with ``Web search results for query: …`` and embeds a ``Links:``
+    list). The header shows the query; the body is that results text. Any
+    ``allowed_domains`` restriction is surfaced as a muted chip. Declines
+    (returns ``None``) when the request has no ``query``.
+    """
+    query = inp.get('query')
+    if not query:
+        return None
+    head = f'{YELLOW}{BOLD}🔧 WebSearch{RESET}  {WHITE}{query}{RESET}'
+    out = [head]
+    domains = inp.get('allowed_domains') or inp.get('blocked_domains')
+    if domains:
+        label = 'only' if inp.get('allowed_domains') else 'blocked'
+        out.append(f'{MUTE}{label}: {", ".join(str(d) for d in domains)}{RESET}')
+    text = tur if isinstance(tur, str) else _fmt_tur_raw_content(raw_content)
+    if text:
+        out.append('')
+        out.append(text)
+    return '\n'.join(out)
+
+
+_TOOL_UMBRELLA_FORMATTERS['WebSearch'] = _fmt_tool_umbrella_websearch
+
+
+def _fmt_tool_umbrella_toolsearch(inp, tur, raw_content, is_error):
+    """ToolSearch umbrella — ``🔧 ToolSearch  <query>`` then the matches."""
+    query = inp.get('query')
+    if not query:
+        return None
+    head = f'{YELLOW}{BOLD}🔧 ToolSearch{RESET}  {WHITE}{query}{RESET}'
+    return _um_head_body(head, tur, raw_content)
+
+
+_TOOL_UMBRELLA_FORMATTERS['ToolSearch'] = _fmt_tool_umbrella_toolsearch
+
+
+def _fmt_tool_umbrella_skill(inp, tur, raw_content, is_error):
+    """Skill umbrella — skill name (+ args) header then the ok/fail ack."""
+    if not inp:
+        return None
+    head = f'{YELLOW}{BOLD}🔧 Skill{RESET}  ' + _fmt_tool_use_skill(inp)
+    return _um_head_body(head, tur, raw_content)
+
+
+_TOOL_UMBRELLA_FORMATTERS['Skill'] = _fmt_tool_umbrella_skill
+
+
+def _fmt_tool_umbrella_send_message(inp, tur, raw_content, is_error):
+    """SendMessage umbrella — recipient + body header then the delivery ack."""
+    if not inp:
+        return None
+    head = (f'{YELLOW}{BOLD}🔧 SendMessage{RESET}\n'
+            + _fmt_tool_use_send_message(inp))
+    return _um_head_body(head, tur, raw_content)
+
+
+_TOOL_UMBRELLA_FORMATTERS['SendMessage'] = _fmt_tool_umbrella_send_message
+
+
+# Per-status glyph + color for a TodoWrite checklist line. ``in_progress``
+# is the active item (YELLOW); ``completed`` is done (GREEN); ``pending``
+# stays an unfilled box.
+_TODO_GLYPHS = {
+    'pending':     ('☐', ''),
+    'in_progress': ('▸', YELLOW),
+    'completed':   ('✓', GREEN),
+}
+
+
+def _fmt_tool_umbrella_todowrite(inp, tur, raw_content, is_error):
+    """TodoWrite umbrella — a glyph-prefixed checklist of the todos.
+
+    Input ``todos`` is a list of ``{content, status, activeForm}``; each
+    renders as ``<glyph> <content>`` with the glyph/color keyed on
+    ``status`` (``☐`` pending, ``▸`` in_progress YELLOW, ``✓`` completed
+    GREEN). The result side is only an ack, so the header + checklist is the
+    whole block. Declines (returns ``None``) when there are no usable todos.
+
+    No TodoWrite transcript was available, so this renders from the
+    documented input schema; malformed entries are skipped defensively.
+    """
+    todos = inp.get('todos')
+    if not isinstance(todos, list):
+        return None
+    lines = []
+    for t in todos:
+        if not isinstance(t, dict):
+            continue
+        content = t.get('content') or t.get('activeForm') or ''
+        if not content:
+            continue
+        status = t.get('status', 'pending')
+        glyph, color = _TODO_GLYPHS.get(status, ('☐', ''))
+        if color:
+            lines.append(f'{color}{glyph} {content}{RESET}')
+        else:
+            lines.append(f'{glyph} {content}')
+    if not lines:
+        return None
+    head = f'{YELLOW}{BOLD}🔧 TodoWrite{RESET}'
+    return head + '\n' + '\n'.join(lines)
+
+
+_TOOL_UMBRELLA_FORMATTERS['TodoWrite'] = _fmt_tool_umbrella_todowrite
+
+
+def _fmt_tool_umbrella_exit_plan_mode(inp, tur, raw_content, is_error):
+    """ExitPlanMode umbrella — the proposed plan + an approval status line.
+
+    Input ``plan`` is markdown; it renders through ``_md_voice``. When the
+    result text reads as an approval / rejection, a short colored status
+    line is appended below the header. Declines (returns ``None``) when no
+    ``plan`` was proposed.
+
+    No ExitPlanMode transcript was available to confirm the result shape, so
+    the status line is sniffed from the result TEXT (``approv`` → approved,
+    ``reject`` / ``declin`` → rejected); anything else simply omits it.
+    """
+    plan = inp.get('plan')
+    if not plan:
+        return None
+    out = [f'{YELLOW}{BOLD}🔧 ExitPlanMode{RESET}']
+    text = tur if isinstance(tur, str) else _fmt_tur_raw_content(raw_content)
+    low = text.lower() if isinstance(text, str) else ''
+    if 'approv' in low:
+        out.append(f'{GREEN}✓ plan approved{RESET}')
+    elif 'reject' in low or 'declin' in low:
+        out.append(f'{RED}✗ plan rejected{RESET}')
+    out.append('')
+    out.append(_md_voice(plan))
+    return '\n'.join(out)
+
+
+_TOOL_UMBRELLA_FORMATTERS['ExitPlanMode'] = _fmt_tool_umbrella_exit_plan_mode
 
 
 def _fmt_tool_use_agent(inp):
@@ -5891,7 +6217,6 @@ def _resolve_md_pager():
     pipe works.
     """
     import shlex
-    import shutil
     env_cmd = os.environ.get('MDCAT')
     if env_cmd:
         if '|' in env_cmd or '<' in env_cmd or '>' in env_cmd:

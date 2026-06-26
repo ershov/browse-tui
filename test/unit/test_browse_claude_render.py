@@ -9449,5 +9449,439 @@ class TestToolUmbrellaNotebookEdit(unittest.TestCase):
             None, None, False))
 
 
+class TestToolUmbrellaMcp(unittest.TestCase):
+    """MCP umbrella formatter: ``server ▸ tool`` header + JSON request/result."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_header_splits_server_and_tool(self):
+        out = self.r._fmt_tool_umbrella_mcp(
+            'mcp__slack__post_message', {'channel': '#x'},
+            None, None, False)
+        self.assertIn('🔧 slack ▸ post_message', out)
+
+    def test_tool_segment_keeps_inner_double_underscore(self):
+        # The tool name itself may carry ``__`` — only the first two
+        # segments are server/prefix; the rest re-join as the tool.
+        out = self.r._fmt_tool_umbrella_mcp(
+            'mcp__gh__list__issues', {}, None, None, False)
+        self.assertIn('🔧 gh ▸ list__issues', out)
+
+    def test_json_request_is_colored(self):
+        out = self.r._fmt_tool_umbrella_mcp(
+            'mcp__s__t', {'a': 1, 'b': 'x'}, None, None, False)
+        # The request fields survive (pretty-printed JSON).
+        self.assertIn('"a"', out)
+        self.assertIn('"b"', out)
+
+    def test_json_result_detected_and_colored(self):
+        out = self.r._fmt_tool_umbrella_mcp(
+            'mcp__s__t', {}, '{"rows": 3, "ok": true}', None, False)
+        self.assertIn('"rows"', out)
+        self.assertIn('"ok"', out)
+        # Re-dumped pretty (a newline in the JSON body).
+        self.assertIn('\n', out)
+
+    def test_non_json_result_passes_through(self):
+        out = self.r._fmt_tool_umbrella_mcp(
+            'mcp__s__t', {}, 'plain text result', None, False)
+        self.assertIn('plain text result', out)
+
+    def test_tur_string_used_as_result(self):
+        out = self.r._fmt_tool_umbrella_mcp(
+            'mcp__s__t', {}, 'IGNORED-RAW', None, False)
+        # When toolUseResult is a plain string, prefer it over raw_content.
+        out2 = self.r._fmt_tool_umbrella_mcp(
+            'mcp__s__t', {}, None, [{'type': 'text', 'text': 'from-raw'}],
+            False)
+        self.assertIn('from-raw', out2)
+
+    def test_malformed_name_degrades(self):
+        self.assertIsNone(self.r._fmt_tool_umbrella_mcp(
+            'mcp__only', {}, None, None, False))
+        self.assertIsNone(self.r._fmt_tool_umbrella_mcp(
+            'mcp', {}, None, None, False))
+
+    def test_dispatcher_routes_mcp_prefix(self):
+        # An mcp__-prefixed part with no registry entry still resolves via
+        # the dispatcher's MCP branch (not treated as unregistered).
+        import json as _json
+        import tempfile
+        records = [
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'go'}},
+            {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+             'message': {'role': 'assistant', 'content': [{
+                 'type': 'tool_use', 'id': 'tu_1',
+                 'name': 'mcp__weather__forecast',
+                 'input': {'city': 'NYC'},
+             }]}},
+            {'type': 'user', 'uuid': 'r1', 'parentUuid': 'a1',
+             'message': {'role': 'user', 'content': [{
+                 'type': 'tool_result', 'tool_use_id': 'tu_1',
+                 'content': 'sunny',
+             }]},
+             'toolUseResult': None},
+        ]
+        with tempfile.NamedTemporaryFile('w', suffix='.jsonl',
+                                         delete=False) as f:
+            for rec in records:
+                f.write(_json.dumps(rec) + '\n')
+            path = f.name
+        try:
+            out = self.r._render_tool_umbrella(('tool', path, 1))
+            self.assertIsNotNone(out)
+            self.assertIn('🔧 weather ▸ forecast', out)
+            self.assertIn('sunny', out)
+        finally:
+            os.unlink(path)
+
+
+class TestToolUmbrellaTask(unittest.TestCase):
+    """Background-task family umbrella formatters (compact header + result)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _fmt(self, op, inp, tur=None, raw=None):
+        return self.r._TOOL_UMBRELLA_FORMATTERS[op](inp, tur, raw, False)
+
+    def test_all_ops_registered(self):
+        for op in ('TaskCreate', 'TaskUpdate', 'TaskGet', 'TaskList',
+                   'TaskOutput', 'TaskStop'):
+            self.assertIn(op, self.r._TOOL_UMBRELLA_FORMATTERS)
+
+    def test_create_header_subject(self):
+        # In-tree Task* CLI shape: subject/description/activeForm.
+        out = self._fmt('TaskCreate',
+                        {'subject': 'Analyze evict_struct.h',
+                         'description': 'understand structs',
+                         'activeForm': 'Reading'},
+                        raw='Task #1 created successfully')
+        self.assertIn('🔧 TaskCreate', out)
+        self.assertIn('Analyze evict_struct.h', out)
+        self.assertIn('Task #1 created', out)
+
+    def test_create_header_subagent_and_prompt(self):
+        # SDK-style spawn shape: subagent_type/description/prompt.
+        out = self._fmt('TaskCreate',
+                        {'subagent_type': 'explorer',
+                         'description': 'scan the repo',
+                         'prompt': 'first line of prompt\nsecond line'})
+        self.assertIn('explorer', out)
+        self.assertIn('scan the repo', out)
+        self.assertIn('first line of prompt', out)
+        self.assertNotIn('second line', out)
+
+    def test_update_header_and_result(self):
+        out = self._fmt('TaskUpdate',
+                        {'taskId': '1', 'status': 'completed'},
+                        tur={'success': True, 'taskId': '1',
+                             'updatedFields': ['status'],
+                             'statusChange': {'from': 'pending',
+                                              'to': 'completed'}})
+        self.assertIn('🔧 TaskUpdate', out)
+        self.assertIn('#1', out)
+        # ``status=`` is MUTE then RESET before the value, so it's not
+        # contiguous — assert the label and value separately.
+        self.assertIn('status=', out)
+        # Result reused -> _fmt_tur_task_update renders the transition.
+        self.assertIn('pending', out)
+        self.assertIn('completed', out)
+
+    def test_list_dump_result_reused(self):
+        out = self._fmt('TaskList', {},
+                        tur={'task': {'id': '1', 'subject': 'X'}})
+        self.assertIn('🔧 TaskList', out)
+        # _fmt_tur_task_dump dumps the task body.
+        self.assertIn('subject', out)
+
+    def test_get_header_with_id(self):
+        out = self._fmt('TaskGet', {'task_id': '7'})
+        self.assertIn('🔧 TaskGet', out)
+        self.assertIn('#7', out)
+
+    def test_stop_minimal(self):
+        out = self._fmt('TaskStop', {'taskId': '3'})
+        self.assertIn('🔧 TaskStop', out)
+        self.assertIn('#3', out)
+
+    def test_output_json_result_colored(self):
+        # A JSON-looking string result is colored (str tur path).
+        out = self._fmt('TaskOutput', {'taskId': '2'},
+                        tur='{"lines": 5}')
+        self.assertIn('🔧 TaskOutput', out)
+        self.assertIn('"lines"', out)
+
+
+class TestToolUmbrellaGrepGlob(unittest.TestCase):
+    """Grep / Glob umbrella formatters: request header + results body."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_grep_query_and_count_result(self):
+        out = self.r._fmt_tool_umbrella_grep(
+            {'pattern': 'foo', 'path': 'src'},
+            {'numFiles': 2, 'numMatches': 5}, None, False)
+        self.assertIn('🔧 Grep', out)
+        self.assertIn('/foo/', out)
+        self.assertIn('src', out)
+        self.assertIn('2 files', out)
+        self.assertIn('5 matches', out)
+
+    def test_grep_content_mode_result(self):
+        out = self.r._fmt_tool_umbrella_grep(
+            {'pattern': 'bar', 'output_mode': 'content'},
+            {'filenames': ['a.py'], 'numFiles': 1, 'numLines': 3,
+             'content': 'a.py:1:bar'},
+            None, False)
+        self.assertIn('🔧 Grep', out)
+        self.assertIn('a.py:1:bar', out)
+
+    def test_grep_no_result_shows_request_only(self):
+        out = self.r._fmt_tool_umbrella_grep(
+            {'pattern': 'baz'}, None, None, False)
+        self.assertIn('🔧 Grep', out)
+        self.assertIn('/baz/', out)
+
+    def test_grep_empty_input_degrades(self):
+        self.assertIsNone(self.r._fmt_tool_umbrella_grep(
+            {}, {'numFiles': 1, 'numMatches': 1}, None, False))
+
+    def test_glob_pattern_and_filenames(self):
+        out = self.r._fmt_tool_umbrella_glob(
+            {'pattern': '**/*.py', 'path': 'lib'},
+            {'filenames': ['lib/a.py', 'lib/b.py'], 'numFiles': 2},
+            None, False)
+        self.assertIn('🔧 Glob', out)
+        self.assertIn('**/*.py', out)
+        self.assertIn('lib/a.py', out)
+        self.assertIn('lib/b.py', out)
+        self.assertIn('2 files', out)
+
+    def test_glob_no_result_shows_request_only(self):
+        out = self.r._fmt_tool_umbrella_glob(
+            {'pattern': '*.md'}, None, None, False)
+        self.assertIn('🔧 Glob', out)
+        self.assertIn('*.md', out)
+
+    def test_glob_empty_input_degrades(self):
+        self.assertIsNone(self.r._fmt_tool_umbrella_glob(
+            {}, {'filenames': [], 'numFiles': 0}, None, False))
+
+
+class TestToolUmbrellaWeb(unittest.TestCase):
+    """WebFetch / WebSearch umbrella formatters (result lives in raw content)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_webfetch_header_url_and_prompt(self):
+        out = self.r._fmt_tool_umbrella_webfetch(
+            {'url': 'https://docs.python.org/3/library/bisect.html',
+             'prompt': 'What does bisect_right return?'},
+            None,
+            '# bisect_right\n\nReturns an insertion point **after** entries.',
+            False)
+        self.assertIn('🔧 WebFetch', out)
+        self.assertIn('https://docs.python.org/3/library/bisect.html', out)
+        self.assertIn('What does bisect_right return?', out)
+        # The fetched markdown body is present (heading text survives md2ansi).
+        self.assertIn('bisect_right', out)
+        self.assertIn('insertion point', out)
+
+    def test_webfetch_plain_body_passes_through(self):
+        out = self.r._fmt_tool_umbrella_webfetch(
+            {'url': 'https://x'}, None, 'just a plain sentence.', False)
+        self.assertIn('just a plain sentence.', out)
+
+    def test_webfetch_no_url_degrades(self):
+        self.assertIsNone(self.r._fmt_tool_umbrella_webfetch(
+            {'prompt': 'q'}, None, 'body', False))
+
+    def test_webfetch_no_result_shows_request(self):
+        out = self.r._fmt_tool_umbrella_webfetch(
+            {'url': 'https://y', 'prompt': 'q'}, None, None, False)
+        self.assertIn('🔧 WebFetch', out)
+        self.assertIn('https://y', out)
+
+    def test_websearch_header_query_and_results(self):
+        body = ('Web search results for query: "git diff"\n\n'
+                'Links: [{"title":"Git docs","url":"https://git-scm.com"}]')
+        out = self.r._fmt_tool_umbrella_websearch(
+            {'query': 'git diff'}, None, body, False)
+        self.assertIn('🔧 WebSearch', out)
+        self.assertIn('git diff', out)
+        self.assertIn('Web search results for query', out)
+        self.assertIn('git-scm.com', out)
+
+    def test_websearch_allowed_domains_chip(self):
+        out = self.r._fmt_tool_umbrella_websearch(
+            {'query': 'q', 'allowed_domains': ['git-scm.com']},
+            None, 'No links found.', False)
+        self.assertIn('only: git-scm.com', out)
+
+    def test_websearch_no_query_degrades(self):
+        self.assertIsNone(self.r._fmt_tool_umbrella_websearch(
+            {}, None, 'results', False))
+
+
+class TestToolUmbrellaSearchSkillSend(unittest.TestCase):
+    """ToolSearch / Skill / SendMessage umbrella formatters."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_toolsearch_query_and_matches(self):
+        out = self.r._fmt_tool_umbrella_toolsearch(
+            {'query': 'select:SendMessage', 'max_results': 1},
+            {'matches': [{'name': 'SendMessage', 'description': 'send a msg'}],
+             'query': 'select:SendMessage', 'total_deferred_tools': 27},
+            None, False)
+        self.assertIn('🔧 ToolSearch', out)
+        self.assertIn('select:SendMessage', out)
+        # _fmt_tur_grep_or_search renders the matched tool name.
+        self.assertIn('SendMessage', out)
+        self.assertIn('send a msg', out)
+
+    def test_toolsearch_no_query_degrades(self):
+        self.assertIsNone(self.r._fmt_tool_umbrella_toolsearch(
+            {}, {'matches': [], 'query': '', 'total_deferred_tools': 0},
+            None, False))
+
+    def test_skill_header_and_ack(self):
+        out = self.r._fmt_tool_umbrella_skill(
+            {'skill': 'code-review', 'args': '--high'},
+            {'commandName': 'code-review', 'success': True}, None, False)
+        self.assertIn('🔧 Skill', out)
+        self.assertIn('code-review', out)
+        self.assertIn('--high', out)
+        # _fmt_tur_skill renders the ok marker.
+        self.assertIn('ok', out)
+
+    def test_skill_empty_input_degrades(self):
+        self.assertIsNone(self.r._fmt_tool_umbrella_skill(
+            {}, {'commandName': 'x', 'success': True}, None, False))
+
+    def test_send_message_header_and_ack(self):
+        out = self.r._fmt_tool_umbrella_send_message(
+            {'recipient': 'worker-1', 'summary': 'do X',
+             'message': 'please do X now'},
+            {'success': True, 'message': 'Delivered to worker-1'},
+            None, False)
+        self.assertIn('🔧 SendMessage', out)
+        self.assertIn('worker-1', out)
+        self.assertIn('please do X now', out)
+        # _fmt_tur_send_message renders the delivered marker.
+        self.assertIn('delivered', out)
+
+    def test_send_message_empty_input_degrades(self):
+        self.assertIsNone(self.r._fmt_tool_umbrella_send_message(
+            {}, {'success': True, 'message': 'ok'}, None, False))
+
+
+class TestToolUmbrellaTodoWrite(unittest.TestCase):
+    """TodoWrite umbrella formatter: a per-status glyph checklist."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_each_status_renders_its_glyph(self):
+        out = self.r._fmt_tool_umbrella_todowrite(
+            {'todos': [
+                {'content': 'do A', 'status': 'completed',
+                 'activeForm': 'doing A'},
+                {'content': 'do B', 'status': 'in_progress',
+                 'activeForm': 'doing B'},
+                {'content': 'do C', 'status': 'pending',
+                 'activeForm': 'doing C'},
+            ]}, None, None, False)
+        self.assertIn('🔧 TodoWrite', out)
+        self.assertIn('✓ do A', out)
+        self.assertIn('▸ do B', out)
+        self.assertIn('☐ do C', out)
+
+    def test_in_progress_yellow_completed_green(self):
+        out = self.r._fmt_tool_umbrella_todowrite(
+            {'todos': [
+                {'content': 'wip', 'status': 'in_progress'},
+                {'content': 'done', 'status': 'completed'},
+            ]}, None, None, False)
+        if self.r.YELLOW:
+            self.assertIn(f'{self.r.YELLOW}▸ wip', out)
+        if self.r.GREEN:
+            self.assertIn(f'{self.r.GREEN}✓ done', out)
+
+    def test_empty_todos_degrades(self):
+        self.assertIsNone(self.r._fmt_tool_umbrella_todowrite(
+            {'todos': []}, None, None, False))
+
+    def test_missing_todos_degrades(self):
+        self.assertIsNone(self.r._fmt_tool_umbrella_todowrite(
+            {}, None, None, False))
+
+    def test_malformed_entries_skipped(self):
+        out = self.r._fmt_tool_umbrella_todowrite(
+            {'todos': [
+                'not-a-dict',
+                {'status': 'pending'},          # no content
+                {'content': 'real', 'status': 'pending'},
+            ]}, None, None, False)
+        self.assertIn('☐ real', out)
+        self.assertNotIn('not-a-dict', out)
+
+    def test_unknown_status_falls_back_to_box(self):
+        out = self.r._fmt_tool_umbrella_todowrite(
+            {'todos': [{'content': 'weird', 'status': 'paused'}]},
+            None, None, False)
+        self.assertIn('☐ weird', out)
+
+
+class TestToolUmbrellaExitPlanMode(unittest.TestCase):
+    """ExitPlanMode umbrella formatter: rendered plan + approval status."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_plan_markdown_rendered(self):
+        out = self.r._fmt_tool_umbrella_exit_plan_mode(
+            {'plan': '# My Plan\n\n1. step one\n2. step two'},
+            None, None, False)
+        self.assertIn('🔧 ExitPlanMode', out)
+        self.assertIn('My Plan', out)
+        self.assertIn('step one', out)
+
+    def test_approval_status_line(self):
+        out = self.r._fmt_tool_umbrella_exit_plan_mode(
+            {'plan': '# P'}, 'User has approved your plan.', None, False)
+        self.assertIn('approved', out)
+
+    def test_rejection_status_line(self):
+        out = self.r._fmt_tool_umbrella_exit_plan_mode(
+            {'plan': '# P'}, 'The user rejected the plan.', None, False)
+        self.assertIn('rejected', out)
+
+    def test_unknown_result_omits_status(self):
+        out = self.r._fmt_tool_umbrella_exit_plan_mode(
+            {'plan': '# P'}, 'something else', None, False)
+        self.assertNotIn('approved', out)
+        self.assertNotIn('rejected', out)
+
+    def test_missing_plan_degrades(self):
+        self.assertIsNone(self.r._fmt_tool_umbrella_exit_plan_mode(
+            {}, 'User has approved your plan.', None, False))
+        self.assertIsNone(self.r._fmt_tool_umbrella_exit_plan_mode(
+            {'plan': ''}, None, None, False))
+
+
 if __name__ == '__main__':
     unittest.main()
