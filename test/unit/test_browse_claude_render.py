@@ -8985,5 +8985,469 @@ class TestMainScopeArgv(unittest.TestCase):
             self.assertEqual(cfg.initial_scope, ('session', jsonl))
 
 
+class TestToolUmbrellaInfra(unittest.TestCase):
+    """Shared dispatch + helpers for purpose-built tool umbrella previews.
+
+    Covers the frame-less JSON colorizer, the delta diff helper, and the
+    ``_render_tool_umbrella`` dispatcher's routing contract (registered ->
+    formatter; unregistered / declining formatter / in-flight -> None so the
+    caller falls back to the cascade).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    # ---- helpers ----
+
+    def test_maybe_json_color_parses_object(self):
+        out = self.r._maybe_json_color('{"a": 1, "b": "x"}')
+        self.assertIsNotNone(out)
+        # Pretty-printed (a newline appears) and the keys survive.
+        self.assertIn('"a"', out)
+        self.assertIn('"b"', out)
+        self.assertIn('\n', out)
+
+    def test_maybe_json_color_parses_array(self):
+        self.assertIsNotNone(self.r._maybe_json_color('[1, 2, 3]'))
+
+    def test_maybe_json_color_rejects_non_json(self):
+        self.assertIsNone(self.r._maybe_json_color('hello world'))
+        self.assertIsNone(self.r._maybe_json_color('{not valid'))
+        self.assertIsNone(self.r._maybe_json_color(''))
+        self.assertIsNone(self.r._maybe_json_color(None))
+
+    def test_json_color_falls_back_to_gray_when_unavailable(self):
+        # Force the md2ansi_lib path off and confirm the GRAY wrap.
+        saved = self.r._M2A_JSON
+        try:
+            self.r._M2A_JSON = None
+            out = self.r._json_color('{"a":1}')
+            self.assertIn('{"a":1}', out)
+            if self.r.GRAY:
+                self.assertIn(self.r.GRAY, out)
+        finally:
+            self.r._M2A_JSON = saved
+
+    def test_colorize_diff_no_delta_returns_input(self):
+        raw = '--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n'
+        saved = self.r.HAVE_DELTA
+        try:
+            self.r.HAVE_DELTA = None
+            self.assertEqual(self.r._colorize_diff(raw), raw)
+        finally:
+            self.r.HAVE_DELTA = saved
+
+    def test_cmd_bg_constant(self):
+        self.assertEqual(self.r.CMD_BG, '\x1b[48;5;236m')
+
+    # ---- dispatcher routing ----
+
+    def _umbrella_fixture(self, *, with_result=True, tool_name='Demo',
+                          input_=None, tur=None):
+        """Write a transcript (user turn root + assistant tool_use + result).
+
+        The leading user prompt opens the turn so ``_scan_tree`` pairs the
+        tool_result into ``tool_children``. Returns ``(path, item_id)`` where
+        ``item_id`` is the ``('tool', …)`` umbrella id for the assistant
+        record at line 1.
+        """
+        import json as _json
+        import tempfile
+        records = [
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'go'}},
+            {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+             'message': {'role': 'assistant', 'content': [{
+                 'type': 'tool_use', 'id': 'tu_1', 'name': tool_name,
+                 'input': input_ if input_ is not None else {'k': 'v'},
+             }]}},
+        ]
+        if with_result:
+            records.append({
+                'type': 'user', 'uuid': 'r1', 'parentUuid': 'a1',
+                'message': {'role': 'user', 'content': [{
+                    'type': 'tool_result', 'tool_use_id': 'tu_1',
+                    'content': 'out',
+                }]},
+                'toolUseResult': tur if tur is not None else {'ok': True},
+            })
+        with tempfile.NamedTemporaryFile('w', suffix='.jsonl',
+                                         delete=False) as f:
+            for rec in records:
+                f.write(_json.dumps(rec) + '\n')
+            path = f.name
+        return path, ('tool', path, 1)
+
+    def test_registered_formatter_is_routed(self):
+        path, item_id = self._umbrella_fixture(
+            tool_name='Demo', input_={'k': 'v'}, tur={'ok': True})
+        seen = {}
+
+        def _fmt(inp, tur, raw_content, is_error):
+            seen['inp'] = inp
+            seen['tur'] = tur
+            seen['raw'] = raw_content
+            seen['err'] = is_error
+            return 'CUSTOM-BLOCK'
+
+        self.r._TOOL_UMBRELLA_FORMATTERS['Demo'] = _fmt
+        try:
+            out = self.r._render_tool_umbrella(item_id)
+            self.assertEqual(out, 'CUSTOM-BLOCK')
+            # Formatter received the request input + paired result.
+            self.assertEqual(seen['inp'], {'k': 'v'})
+            self.assertEqual(seen['tur'], {'ok': True})
+            self.assertEqual(seen['raw'], 'out')
+            self.assertFalse(seen['err'])
+        finally:
+            self.r._TOOL_UMBRELLA_FORMATTERS.pop('Demo', None)
+            os.unlink(path)
+
+    def test_unregistered_tool_returns_none(self):
+        # No formatter for 'Demo' -> None so the caller cascades.
+        path, item_id = self._umbrella_fixture(tool_name='Demo')
+        try:
+            self.assertIsNone(self.r._render_tool_umbrella(item_id))
+        finally:
+            os.unlink(path)
+
+    def test_formatter_returning_none_falls_through(self):
+        path, item_id = self._umbrella_fixture(tool_name='Demo')
+        self.r._TOOL_UMBRELLA_FORMATTERS['Demo'] = lambda *a: None
+        try:
+            self.assertIsNone(self.r._render_tool_umbrella(item_id))
+        finally:
+            self.r._TOOL_UMBRELLA_FORMATTERS.pop('Demo', None)
+            os.unlink(path)
+
+    def test_in_flight_passes_none_result(self):
+        # No result record yet: the formatter is still consulted, with
+        # ``tur=None`` / ``raw_content=None`` (lets a tool like Bash render
+        # just its request). Here the formatter declines -> None.
+        path, item_id = self._umbrella_fixture(
+            tool_name='Demo', with_result=False)
+        seen = {}
+
+        def _fmt(inp, tur, raw_content, is_error):
+            seen['tur'] = tur
+            seen['raw'] = raw_content
+            return None
+
+        self.r._TOOL_UMBRELLA_FORMATTERS['Demo'] = _fmt
+        try:
+            self.assertIsNone(self.r._render_tool_umbrella(item_id))
+            self.assertIsNone(seen['tur'])
+            self.assertIsNone(seen['raw'])
+        finally:
+            self.r._TOOL_UMBRELLA_FORMATTERS.pop('Demo', None)
+            os.unlink(path)
+
+    def test_all_parts_must_be_registered(self):
+        # Two tool_use parts, only one registered -> None (the cascade
+        # handles heterogeneous batches).
+        import json as _json
+        import tempfile
+        records = [
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'go'}},
+            {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 'tu_1', 'name': 'Demo',
+                  'input': {}},
+                 {'type': 'tool_use', 'id': 'tu_2', 'name': 'Other',
+                  'input': {}},
+             ]}},
+        ]
+        with tempfile.NamedTemporaryFile('w', suffix='.jsonl',
+                                         delete=False) as f:
+            for rec in records:
+                f.write(_json.dumps(rec) + '\n')
+            path = f.name
+        self.r._TOOL_UMBRELLA_FORMATTERS['Demo'] = lambda *a: 'X'
+        try:
+            self.assertIsNone(self.r._render_tool_umbrella(('tool', path, 1)))
+        finally:
+            self.r._TOOL_UMBRELLA_FORMATTERS.pop('Demo', None)
+            os.unlink(path)
+
+
+class TestToolUmbrellaRead(unittest.TestCase):
+    """Read umbrella formatter: one header line, no file content."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_header_has_path_range_and_count_no_content(self):
+        out = self.r._fmt_tool_umbrella_read(
+            {'file_path': '/etc/hosts', 'offset': 10, 'limit': 50},
+            {'type': 'text', 'file': {
+                'filePath': '/etc/hosts', 'numLines': 42,
+                'content': 'SECRET-FILE-BODY-LINE\nmore\n',
+            }},
+            None, False)
+        self.assertIsNotNone(out)
+        self.assertIn('🔧 Read', out)
+        self.assertIn('/etc/hosts', out)
+        self.assertIn('[10..+50]', out)
+        self.assertIn('42 lines', out)
+        # The file body must NOT be dumped into the umbrella.
+        self.assertNotIn('SECRET-FILE-BODY-LINE', out)
+        # Single line.
+        self.assertNotIn('\n', out)
+
+    def test_range_defaults_when_omitted(self):
+        out = self.r._fmt_tool_umbrella_read(
+            {'file_path': '/x'},
+            {'type': 'text', 'file': {'filePath': '/x', 'numLines': 3}},
+            None, False)
+        self.assertIn('[0..+eof]', out)
+
+    def test_no_file_degrades_to_none(self):
+        # in-flight: no toolUseResult yet
+        self.assertIsNone(self.r._fmt_tool_umbrella_read(
+            {'file_path': '/x'}, None, None, False))
+        # error: toolUseResult present but no 'file'
+        self.assertIsNone(self.r._fmt_tool_umbrella_read(
+            {'file_path': '/x'}, {'type': 'text'}, None, True))
+
+
+class TestToolUmbrellaEdit(unittest.TestCase):
+    """Edit umbrella formatter: only the resulting delta diff."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _tur(self):
+        return {
+            'filePath': '/tmp/x.py',
+            'userModified': False,
+            'structuredPatch': [{
+                'oldStart': 1, 'oldLines': 3, 'newStart': 1, 'newLines': 3,
+                'lines': [' ctx', '-removed line', '+added line', ' tail'],
+            }],
+        }
+
+    def test_unified_reconstruction(self):
+        unified = self.r._structured_patch_to_unified(
+            self._tur()['structuredPatch'], 'tmp/x.py')
+        self.assertIn('--- a/tmp/x.py', unified)
+        self.assertIn('+++ b/tmp/x.py', unified)
+        self.assertIn('@@ -1,3 +1,3 @@', unified)
+        self.assertIn('-removed line', unified)
+        self.assertIn('+added line', unified)
+
+    def test_unified_derives_counts_when_absent(self):
+        unified = self.r._structured_patch_to_unified([{
+            'oldStart': 5, 'newStart': 5,
+            'lines': [' a', '-b', '-c', '+d'],
+        }], '/x')
+        # oldLines = lines not starting with '+' = 3; newLines = not '-' = 2
+        self.assertIn('@@ -5,3 +5,2 @@', unified)
+
+    def test_unified_empty_patch_is_none(self):
+        self.assertIsNone(self.r._structured_patch_to_unified([], '/x'))
+        self.assertIsNone(self.r._structured_patch_to_unified(None, '/x'))
+
+    def test_edit_with_delta_renders_diff(self):
+        if not self.r.HAVE_DELTA:
+            self.skipTest('delta not on PATH')
+        out = self.r._fmt_tool_umbrella_edit({}, self._tur(), None, False)
+        self.assertIsNotNone(out)
+        # Changed content survives delta (delta colors at word granularity,
+        # splicing SGR codes mid-line, so assert on the first word only).
+        self.assertIn('removed', out)
+        self.assertIn('added', out)
+        # delta re-rendered: output differs from the raw unified diff text.
+        raw = self.r._structured_patch_to_unified(
+            self._tur()['structuredPatch'], '/tmp/x.py')
+        self.assertNotEqual(out, raw)
+
+    def test_edit_no_delta_uses_git_style(self):
+        saved = self.r.HAVE_DELTA
+        try:
+            self.r.HAVE_DELTA = None
+            out = self.r._fmt_tool_umbrella_edit({}, self._tur(), None, False)
+            self.assertIsNotNone(out)
+            self.assertIn('removed line', out)
+            self.assertIn('added line', out)
+        finally:
+            self.r.HAVE_DELTA = saved
+
+    def test_no_structured_patch_degrades(self):
+        self.assertIsNone(self.r._fmt_tool_umbrella_edit({}, None, None, True))
+        self.assertIsNone(self.r._fmt_tool_umbrella_edit(
+            {}, {'filePath': '/x'}, None, False))
+
+
+class TestToolUmbrellaBash(unittest.TestCase):
+    """Bash umbrella formatter (terminal-session look) + stderr coloring fix."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _result(self, **kw):
+        base = {'stdout': '', 'stderr': '', 'interrupted': False,
+                'isImage': False, 'noOutputExpected': False}
+        base.update(kw)
+        return base
+
+    def test_command_line_carries_cmd_bg(self):
+        out = self.r._fmt_tool_umbrella_bash(
+            {'command': 'ls -la', 'description': 'list'},
+            self._result(stdout='a\nb\n'), None, False)
+        self.assertIn(self.r.CMD_BG, out)
+        self.assertIn('$ ls -la', out)
+        self.assertIn('# list', out)
+        self.assertIn('a', out)
+
+    def test_multiline_command_each_line_banded(self):
+        out = self.r._fmt_tool_umbrella_bash(
+            {'command': 'echo one\necho two'},
+            self._result(stdout='one\ntwo\n'), None, False)
+        # Both physical command lines carry the band.
+        self.assertEqual(out.count(self.r.CMD_BG), 2)
+        self.assertIn('$ echo one', out)
+
+    def test_in_flight_renders_command_block_only(self):
+        # No result yet (tur is None) -> still render the $ command block,
+        # never declines.
+        out = self.r._fmt_tool_umbrella_bash(
+            {'command': 'sleep 100'}, None, None, False)
+        self.assertIsNotNone(out)
+        self.assertIn('$ sleep 100', out)
+        self.assertIn(self.r.CMD_BG, out)
+
+    def test_raw_content_fallback_when_no_structured_result(self):
+        # No structured toolUseResult, but the raw tool_result content is
+        # present -> the command output is recovered from raw_content.
+        out = self.r._fmt_tool_umbrella_bash(
+            {'command': 'echo hi'}, None, 'RAW_OUTPUT_TEXT', False)
+        self.assertIn('$ echo hi', out)
+        self.assertIn('RAW_OUTPUT_TEXT', out)
+
+    def test_stderr_with_ansi_not_red_wrapped(self):
+        # stderr already carrying ESC -> emitted raw, not wrapped in RED.
+        ansi_stderr = '\x1b[31mlinter error\x1b[0m'
+        out = self.r._fmt_tur_bash(self._result(stdout='ok', stderr=ansi_stderr))
+        self.assertIn(ansi_stderr, out)
+        # The RED tint should not lead the stderr body.
+        if self.r.RED:
+            self.assertNotIn(f'{self.r.RED}{ansi_stderr}', out)
+
+    def test_plain_stderr_is_red_tinted(self):
+        out = self.r._fmt_tur_bash(self._result(stdout='ok', stderr='boom'))
+        self.assertIn('stderr', out)
+        if self.r.RED:
+            self.assertIn(f'{self.r.RED}boom', out)
+
+    def test_stderr_rule_present(self):
+        out = self.r._fmt_tur_bash(self._result(stderr='x'))
+        self.assertIn('stderr', out)
+
+
+class TestToolUmbrellaWrite(unittest.TestCase):
+    """Write umbrella formatter: header + capped raw content."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_short_content_shown_whole_no_footer(self):
+        out = self.r._fmt_tool_umbrella_write(
+            {'file_path': '/tmp/a.txt', 'content': 'line1\nline2\nline3'},
+            None, None, False)
+        self.assertIn('🔧 Write', out)
+        self.assertIn('/tmp/a.txt', out)
+        self.assertIn('3 lines', out)
+        self.assertIn('line1', out)
+        self.assertIn('line3', out)
+        self.assertNotIn('more lines', out)
+
+    def test_long_content_truncated_with_footer(self):
+        body = '\n'.join(f'L{i}' for i in range(25))
+        out = self.r._fmt_tool_umbrella_write(
+            {'file_path': '/tmp/big', 'content': body}, None, None, False)
+        self.assertIn('25 lines', out)
+        # First 10 shown, 11th onward not.
+        self.assertIn('L0', out)
+        self.assertIn('L9', out)
+        self.assertNotIn('L10', out)
+        # Footer with the remaining count + the expand hint.
+        self.assertIn('15 more lines', out)
+        self.assertIn('expand the Write item', out)
+
+    def test_missing_content_degrades(self):
+        self.assertIsNone(self.r._fmt_tool_umbrella_write(
+            {'file_path': '/x'}, None, None, False))
+        self.assertIsNone(self.r._fmt_tool_umbrella_write(
+            {'file_path': '/x', 'content': ''}, None, None, False))
+
+
+class TestToolUmbrellaNotebookEdit(unittest.TestCase):
+    """NotebookEdit umbrella formatter: header + diff or capped source."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_header_reflects_mode_and_cell_type(self):
+        out = self.r._fmt_tool_umbrella_notebook_edit(
+            {'notebook_path': '/n.ipynb', 'cell_id': 'c7',
+             'cell_type': 'code', 'edit_mode': 'replace',
+             'new_source': 'print(1)'},
+            None, None, False)
+        self.assertIn('🔧 NotebookEdit', out)
+        self.assertIn('/n.ipynb', out)
+        self.assertIn('replace', out)
+        self.assertIn('code', out)
+        self.assertIn('cell c7', out)
+
+    def test_replace_with_patch_renders_diff(self):
+        tur = {
+            'filePath': '/n.ipynb',
+            'structuredPatch': [{
+                'oldStart': 1, 'oldLines': 1, 'newStart': 1, 'newLines': 1,
+                'lines': ['-print(1)', '+print(2)'],
+            }],
+        }
+        out = self.r._fmt_tool_umbrella_notebook_edit(
+            {'notebook_path': '/n.ipynb', 'cell_id': 'c1',
+             'cell_type': 'code', 'edit_mode': 'replace',
+             'new_source': 'print(2)'},
+            tur, None, False)
+        self.assertIn('🔧 NotebookEdit', out)
+        # A diff was rendered. delta colors at word granularity, splicing
+        # SGR mid-token, so the literal 'print(1)' may not be contiguous —
+        # assert on the surviving 'print(' stem + both changed digits.
+        self.assertIn('print(', out)
+        self.assertIn('1', out)
+        self.assertIn('2', out)
+
+    def test_no_patch_falls_back_to_capped_source(self):
+        body = '\n'.join(f'cell-line-{i}' for i in range(20))
+        out = self.r._fmt_tool_umbrella_notebook_edit(
+            {'notebook_path': '/n.ipynb', 'cell_id': 'c1',
+             'cell_type': 'markdown', 'edit_mode': 'insert',
+             'new_source': body},
+            None, None, False)
+        self.assertIn('markdown', out)
+        self.assertIn('cell-line-0', out)
+        self.assertIn('cell-line-9', out)
+        self.assertNotIn('cell-line-10', out)
+        self.assertIn('more lines', out)
+        self.assertIn('expand the NotebookEdit item', out)
+
+    def test_no_source_and_no_patch_degrades(self):
+        # delete-mode with no new_source and no structured result.
+        self.assertIsNone(self.r._fmt_tool_umbrella_notebook_edit(
+            {'notebook_path': '/n.ipynb', 'cell_id': 'c1',
+             'edit_mode': 'delete'},
+            None, None, False))
+
+
 if __name__ == '__main__':
     unittest.main()

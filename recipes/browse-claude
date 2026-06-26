@@ -52,6 +52,8 @@ import datetime
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import threading
 
@@ -79,6 +81,22 @@ try:
     import md_doc as _md_doc
 except Exception:
     _md_doc = None
+
+# Optional md2ansi_lib internals — frame-less syntax coloring for a JSON
+# tool input (the ``_json_color`` helper). Guarded exactly like the
+# ``md2ansi`` import above: when md2ansi_lib (or these symbols) aren't
+# importable, ``_M2A_JSON`` is None and ``_json_color`` degrades to a
+# plain GRAY wrap. We colorize JSON via the JavaScript code context —
+# its object/string/number lexer matches JSON closely enough.
+try:
+    from md2ansi_lib import (
+        _md2ansi as _m2a_render,
+        M2A_CONTEXT_CODE_JAVASCRIPT as _M2A_JS,
+        M2A_DocumentState as _M2A_DocumentState,
+    )
+    _M2A_JSON = _m2a_render if callable(_m2a_render) else None
+except Exception:
+    _M2A_JSON = None
 
 _MD_COLOR = _md2ansi_fn is not None  # default on when available
 _BROWSER = None  # set in main() — used for preview-width lookup
@@ -2299,6 +2317,180 @@ def _rule(title='', color=None):
     return f'{color or MUTE}{body}{RESET}'
 
 
+# ---- tool umbrella previews ----------------------------------------------
+#
+# A ``<tool:Name>`` umbrella row's preview defaults to a raw concatenation
+# of its child leaf renders (the assistant ``tool_use`` block, then each
+# ``tool_result`` block — the same machinery as every other umbrella, via
+# ``_collect_umbrella_preview``). For a handful of tools that pair a request
+# with a result we can do better: render ONE purpose-built block that fuses
+# the two (e.g. Bash as a terminal session, Edit as just the resulting diff).
+#
+# ``_TOOL_UMBRELLA_FORMATTERS`` maps a tool name to ``fn(inp, tur,
+# raw_content, is_error) -> str | None``. The dispatcher takes the custom
+# path only when EVERY tool_use part in the umbrella has a registered
+# formatter AND every formatter returns a non-None string; any gap (an
+# unregistered tool, an in-flight part with no result yet, a formatter that
+# declines) falls back to the plain cascade. Formatters live next to their
+# matching ``_fmt_tool_use_*`` request formatter and append themselves to
+# this registry; it starts empty and per-tool tickets fill it in.
+
+_TOOL_UMBRELLA_FORMATTERS = {}
+
+# Dark-grey background for the Bash ``$ command`` line so it reads as a
+# distinct prompt against the command's output below it.
+CMD_BG = '\x1b[48;5;236m'
+
+HAVE_DELTA = shutil.which('delta')
+
+
+def _colorize_diff(raw):
+    """Render a unified-diff string for the preview pane via ``delta``.
+
+    Ported from browse-git. ``raw`` is plain (or git-colored) unified-diff
+    text. When ``delta`` is on PATH (``HAVE_DELTA``) it's piped through for
+    terminal-native rendering; ``delta`` re-emits its own SGR. When ``delta``
+    is absent — or exits non-zero — ``raw`` is returned unchanged, so the
+    caller always gets back displayable text and never generates the diff
+    twice.
+
+    ``--no-gitconfig`` ignores the user's theme and the OSC-8 hyperlinks the
+    preview pane can't render; ``--paging never`` stops delta spawning a
+    pager off-tty; ``--width`` matches the pane (read from the module-level
+    ``_BROWSER`` since ``get_preview`` gets no ``ctx``). At a wide pane
+    (``width >= 160``) delta lays the diff out side-by-side, splitting that
+    one ``--width`` into two columns (``--line-fill-method=spaces`` pads each
+    side so the gutter aligns).
+    """
+    if not HAVE_DELTA:
+        return raw
+    width = (_BROWSER.preview_width if _BROWSER else 0) or 80
+    argv = ['delta', '--no-gitconfig', '--paging', 'never',
+            '--width', str(width)]
+    if width >= 160:
+        # Wide pane: two columns out of the one --width above.
+        argv += ['--side-by-side', '--line-fill-method=spaces']
+    try:
+        proc = subprocess.run(
+            argv, input=raw, capture_output=True, text=True, check=False)
+    except Exception:
+        return raw
+    if proc.returncode == 0:
+        return proc.stdout
+    # delta failed unexpectedly — fall back to the raw diff text.
+    return raw
+
+
+def _json_color(text):
+    """Syntax-color a JSON string FRAME-LESS (no ``--- json`` chrome).
+
+    Routes through md2ansi_lib's JavaScript code context — its object /
+    string / number lexer matches JSON closely enough. Falls back to a flat
+    ``GRAY`` wrap on any failure or when md2ansi_lib wasn't importable.
+    """
+    if _M2A_JSON is None:
+        return f'{GRAY}{text}{RESET}'
+    try:
+        return _M2A_JSON(text, "0", _M2A_JS, _M2A_DocumentState())
+    except Exception:
+        return f'{GRAY}{text}{RESET}'
+
+
+def _maybe_json_color(text):
+    """Pretty-print + color ``text`` when it parses as JSON, else ``None``.
+
+    Cheap prefilter (``re.match`` on the first non-space char) before the
+    full ``json.loads`` so non-JSON text bails immediately. On success the
+    parsed value is re-dumped with a 2-space indent and run through
+    ``_json_color``; otherwise the caller keeps ``text`` as-is.
+    """
+    if not isinstance(text, str) or not re.match(r'^\s*[\[{]', text):
+        return None
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    return _json_color(json.dumps(parsed, indent=2, ensure_ascii=False))
+
+
+def _render_tool_umbrella(item_id):
+    """One purpose-built combined block for a ``('tool', path, line)`` row.
+
+    Resolves the umbrella's assistant record, enumerates its ``tool_use``
+    parts, pairs each with its ``tool_result`` by ``tool_use_id``, and asks
+    the registered formatter for each part to fuse request + result. Returns
+    the joined blocks ONLY when every part is registered and every formatter
+    returns a non-None string; any gap (unregistered tool, in-flight part
+    with no result, a declining formatter) returns ``None`` so the caller
+    falls back to the plain ``_collect_umbrella_preview`` cascade.
+
+    Defensive throughout: any malformed shape / missing key returns ``None``.
+    """
+    try:
+        _tag, jsonl_path, assistant_line = item_id
+    except (ValueError, TypeError):
+        return None
+    try:
+        td = _scan_tree(jsonl_path)
+    except Exception:
+        return None
+    if not (0 <= assistant_line < len(td.records)):
+        return None
+    rec = td.records[assistant_line]
+    if not isinstance(rec, dict):
+        return None
+    msg = rec.get('message') or {}
+    content = msg.get('content') if isinstance(msg, dict) else None
+    if not isinstance(content, list):
+        return None
+    tool_use_parts = [
+        p for p in content
+        if isinstance(p, dict) and p.get('type') == 'tool_use'
+    ]
+    if not tool_use_parts:
+        return None
+
+    # Index this umbrella's tool_result parts by their tool_use_id. Each
+    # result record carries one (occasionally more) tool_result content
+    # part; map id -> (tur, raw_content, is_error) for O(1) pairing.
+    results = {}
+    for child in td.tool_children.get(rec.get('uuid'), []):
+        if not isinstance(child, dict):
+            continue
+        c_msg = child.get('message') or {}
+        c_content = c_msg.get('content') if isinstance(c_msg, dict) else None
+        if not isinstance(c_content, list):
+            continue
+        for part in c_content:
+            if not isinstance(part, dict) or part.get('type') != 'tool_result':
+                continue
+            tu_id = part.get('tool_use_id')
+            if tu_id is None or tu_id in results:
+                continue
+            results[tu_id] = (
+                child.get('toolUseResult'),
+                part.get('content'),
+                bool(part.get('is_error')),
+            )
+
+    blocks = []
+    for part in tool_use_parts:
+        name = part.get('name')
+        formatter = _TOOL_UMBRELLA_FORMATTERS.get(name)
+        if formatter is None:
+            return None  # an unregistered tool — defer to the cascade
+        inp = part.get('input') or {}
+        tur, raw_content, is_error = results.get(part.get('id'), (None, None, False))
+        try:
+            block = formatter(inp, tur, raw_content, is_error)
+        except Exception:
+            return None
+        if block is None:
+            return None
+        blocks.append(block)
+    return '\n\n'.join(blocks)
+
+
 # ---- tool_use rendering --------------------------------------------------
 
 
@@ -2343,6 +2535,54 @@ def _fmt_tool_use_bash(inp):
     return '\n'.join(out)
 
 
+def _fmt_tool_umbrella_bash(inp, tur, raw_content, is_error):
+    """Bash umbrella — a natural terminal session.
+
+    The command flows straight into its output with no
+    ``assistant`` / ``tool_result`` chrome: an optional ``# description``,
+    then the ``$ command`` painted on a dark-grey band (``CMD_BG``) so it
+    reads as a distinct prompt, then the result body. The body comes from
+    the structured ``toolUseResult`` (``_fmt_tur_bash`` — keeps the
+    interrupted / background / persisted lines) when present, else from the
+    raw ``tool_result`` content as a fallback. With no result at all we
+    still render the ``$ command`` block so an in-flight command reads
+    naturally — so this formatter never declines for Bash.
+    """
+    cmd = inp.get('command', '')
+    desc = inp.get('description', '')
+    timeout = inp.get('timeout')
+    bg = inp.get('run_in_background')
+    out = []
+    if desc:
+        out.append(f'{MUTE}# {desc}{RESET}')
+    # Paint each physical line of the command on CMD_BG so a multi-line
+    # command reads as one banded prompt block. ``$ `` leads the first
+    # line; continuations are indented two spaces to align under it.
+    cmd_lines = cmd.split('\n') or ['']
+    for i, line in enumerate(cmd_lines):
+        prefix = '$ ' if i == 0 else '  '
+        out.append(f'{CMD_BG}{WHITE}{prefix}{line}{RESET}')
+    extras = []
+    if timeout: extras.append(f'timeout={timeout}ms')
+    if bg:      extras.append('background')
+    if extras:
+        out.append(f'{MUTE}({" ".join(extras)}){RESET}')
+    if isinstance(tur, dict):
+        result = _fmt_tur_bash(tur)
+        if result:
+            out.append(result)
+    elif raw_content:
+        # No structured toolUseResult but the raw tool_result content is
+        # there — surface it so the command's output still shows.
+        result = _fmt_tur_raw_content(raw_content)
+        if result:
+            out.append(result)
+    return '\n'.join(out)
+
+
+_TOOL_UMBRELLA_FORMATTERS['Bash'] = _fmt_tool_umbrella_bash
+
+
 def _fmt_tool_use_read(inp):
     path = inp.get('file_path', '')
     offset = inp.get('offset')
@@ -2351,6 +2591,31 @@ def _fmt_tool_use_read(inp):
     if offset is not None or limit is not None:
         suffix = f'  {MUTE}[{offset or 0}..+{limit or "eof"}]{RESET}'
     return f'{CYAN}{path}{RESET}{suffix}'
+
+
+def _fmt_tool_umbrella_read(inp, tur, raw_content, is_error):
+    """Read umbrella — ONE header line, NO file content.
+
+    The file body lives on the expanded tool_result leaf; here we just
+    confirm the read happened with its path, range, and line count. Declines
+    (returns ``None``) when there's no resolved file (in-flight / error) so
+    the cascade shows the bare request instead.
+    """
+    if not isinstance(tur, dict):
+        return None
+    f = tur.get('file')
+    if not isinstance(f, dict):
+        return None
+    path = inp.get('file_path', '')
+    offset = inp.get('offset')
+    limit = inp.get('limit')
+    num_lines = f.get('numLines', '?')
+    rng = f'[{offset or 0}..+{limit or "eof"}]'
+    return (f'{YELLOW}{BOLD}🔧 Read{RESET}  {CYAN}{path}{RESET}  '
+            f'{MUTE}{rng}{RESET}  {MUTE}·{RESET}  {MUTE}{num_lines} lines{RESET}')
+
+
+_TOOL_UMBRELLA_FORMATTERS['Read'] = _fmt_tool_umbrella_read
 
 
 def _fmt_tool_use_edit(inp):
@@ -2369,10 +2634,159 @@ def _fmt_tool_use_edit(inp):
     return '\n'.join(out)
 
 
+def _structured_patch_to_unified(patch, file_path):
+    """Reconstruct unified-diff TEXT from a ``structuredPatch`` + path.
+
+    ``patch`` is the ``toolUseResult.structuredPatch`` list (one dict per
+    hunk: ``oldStart``/``newStart``, optional ``oldLines``/``newLines``,
+    and ``lines`` already prefixed ' '/'-'/'+'). Emits a plain (uncolored)
+    diff suitable for ``_colorize_diff``. ``oldLines``/``newLines`` are
+    derived from the hunk lines when absent. Returns ``None`` when there's
+    nothing to render (no hunks).
+    """
+    if not isinstance(patch, list) or not patch:
+        return None
+    fp = file_path or ''
+    out = [f'--- a/{fp}', f'+++ b/{fp}']
+    emitted_hunk = False
+    for hunk in patch:
+        if not isinstance(hunk, dict):
+            continue
+        lines = hunk.get('lines') or []
+        if not isinstance(lines, list):
+            continue
+        old_start = hunk.get('oldStart', 0)
+        new_start = hunk.get('newStart', 0)
+        old_lines = hunk.get('oldLines')
+        new_lines = hunk.get('newLines')
+        if old_lines is None:
+            old_lines = sum(1 for ln in lines if not ln.startswith('+'))
+        if new_lines is None:
+            new_lines = sum(1 for ln in lines if not ln.startswith('-'))
+        out.append(f'@@ -{old_start},{old_lines} +{new_start},{new_lines} @@')
+        out.extend(lines)
+        emitted_hunk = True
+    if not emitted_hunk:
+        return None
+    return '\n'.join(out) + '\n'
+
+
+def _fmt_tool_umbrella_edit(inp, tur, raw_content, is_error):
+    """Edit umbrella — ONLY the resulting diff (the requested old/new is dropped).
+
+    Reconstructs a unified diff from ``toolUseResult.structuredPatch`` and
+    pipes it through ``delta`` (``_colorize_diff``). When ``delta`` is absent
+    we reuse the existing git-style coloring of ``_fmt_tur_edit``. Declines
+    (returns ``None``) when there's no ``structuredPatch`` (e.g. an error
+    result) so the cascade renders the request instead.
+    """
+    if not isinstance(tur, dict):
+        return None
+    patch = tur.get('structuredPatch')
+    if not isinstance(patch, list) or not patch:
+        return None
+    if not HAVE_DELTA:
+        return _fmt_tur_edit(tur)
+    unified = _structured_patch_to_unified(patch, tur.get('filePath'))
+    if unified is None:
+        return None
+    return _colorize_diff(unified)
+
+
+_TOOL_UMBRELLA_FORMATTERS['Edit'] = _fmt_tool_umbrella_edit
+
+
 def _fmt_tool_use_write(inp):
     path = inp.get('file_path', '')
     content = inp.get('content', '')
     return f'{CYAN}{path}{RESET}\n{GRAY}{content}{RESET}'
+
+
+# Cap on the content lines shown inline in a Write / NotebookEdit umbrella
+# preview. The full content stays available on the expanded tool_use leaf.
+_WRITE_PREVIEW_LINES = 10
+
+
+def _cap_content_lines(content, item_label):
+    """GRAY-wrapped content capped at ``_WRITE_PREVIEW_LINES`` + a footer.
+
+    Returns the (possibly truncated) body. When truncated, appends a muted
+    ``… (N more lines — expand the <item_label> item to see the full
+    content)`` line pointing the reader at the expandable leaf.
+    """
+    lines = content.split('\n')
+    head = lines[:_WRITE_PREVIEW_LINES]
+    out = [f'{GRAY}{chr(10).join(head)}{RESET}']
+    rest = len(lines) - _WRITE_PREVIEW_LINES
+    if rest > 0:
+        out.append(f'{MUTE}… ({rest} more lines — expand the {item_label} '
+                   f'item to see the full content){RESET}')
+    return '\n'.join(out)
+
+
+def _fmt_tool_umbrella_write(inp, tur, raw_content, is_error):
+    """Write umbrella — header + a capped raw-content preview.
+
+    One header line (path + line count), then up to ``_WRITE_PREVIEW_LINES``
+    lines of the request content (GRAY, raw — NOT an all-additions diff),
+    then a footer when truncated. Declines (returns ``None``) when the
+    request carries no ``content`` so the cascade renders instead.
+    """
+    content = inp.get('content')
+    if not content:
+        return None
+    path = inp.get('file_path', '')
+    n = len(content.split('\n'))
+    header = (f'{YELLOW}{BOLD}🔧 Write{RESET}  {CYAN}{path}{RESET}  '
+              f'{MUTE}·{RESET}  {MUTE}{n} lines{RESET}')
+    return header + '\n' + _cap_content_lines(content, 'Write')
+
+
+_TOOL_UMBRELLA_FORMATTERS['Write'] = _fmt_tool_umbrella_write
+
+
+def _fmt_tool_umbrella_notebook_edit(inp, tur, raw_content, is_error):
+    """NotebookEdit umbrella — Jupyter cell edit, closest to Edit.
+
+    Header names the notebook + the cell being touched
+    (``[<edit_mode> <cell_type> cell <cell_id>]``). The body renders a diff
+    via the SAME path as Edit when ``toolUseResult`` carries a
+    ``structuredPatch``; otherwise it shows ``new_source`` capped like Write.
+    Declines (returns ``None``) when neither a patch nor ``new_source`` is
+    available (e.g. delete-mode with no structured result) so the cascade
+    renders instead.
+
+    NOTE: no NotebookEdit transcript was available to confirm the
+    ``toolUseResult`` shape, so the patch branch is best-effort — it keys off
+    the same ``structuredPatch`` field every Edit/Write result uses; if a
+    real notebook result names it differently we simply fall back to the
+    ``new_source`` view (and ultimately to the cascade).
+    """
+    notebook_path = inp.get('notebook_path', '')
+    cell_id = inp.get('cell_id', '')
+    cell_type = inp.get('cell_type', '')
+    edit_mode = inp.get('edit_mode', 'replace')
+    new_source = inp.get('new_source')
+
+    chips = ' '.join(s for s in (edit_mode, cell_type) if s)
+    cell_ref = f'cell {cell_id}' if cell_id else 'cell'
+    tag = f'[{chips} {cell_ref}]' if chips else f'[{cell_ref}]'
+    header = (f'{YELLOW}{BOLD}🔧 NotebookEdit{RESET}  '
+              f'{CYAN}{notebook_path}{RESET}  {MUTE}{tag}{RESET}')
+
+    patch = tur.get('structuredPatch') if isinstance(tur, dict) else None
+    if isinstance(patch, list) and patch:
+        unified = _structured_patch_to_unified(
+            patch, tur.get('filePath') or notebook_path)
+        if unified is not None:
+            body = _colorize_diff(unified) if HAVE_DELTA else _fmt_tur_edit(tur)
+            return header + '\n' + body
+    if new_source:
+        return header + '\n' + _cap_content_lines(new_source, 'NotebookEdit')
+    return None
+
+
+_TOOL_UMBRELLA_FORMATTERS['NotebookEdit'] = _fmt_tool_umbrella_notebook_edit
 
 
 def _fmt_tool_use_grep(inp):
@@ -2695,7 +3109,13 @@ def _fmt_tur_bash(tur):
         if stdout:
             out.append('')
         out.append(_rule('stderr'))
-        out.append(f'{RED}{stderr.rstrip()}{RESET}')
+        body = stderr.rstrip()
+        # Red-tint only plain stderr. If the command emitted its own ANSI
+        # (e.g. a colorized compiler / linter), pass it through raw so those
+        # colors survive instead of being clobbered by a blanket RED wrap.
+        if '\x1b' not in body:
+            body = f'{RED}{body}{RESET}'
+        out.append(body)
     return '\n'.join(out)
 
 
@@ -5026,6 +5446,15 @@ def _preview_umbrella(item_id):
             yield _fmt_scope_card(card_path, td) + '\n\n'
         except Exception as e:
             yield _rule(f'error in scope card: {e}', RED) + '\n\n'
+    if item_id[0] == 'tool':
+        # Tool umbrellas with fully-registered parts render one fused
+        # request+result block instead of the raw leaf cascade. Any gap
+        # (unregistered tool, in-flight part, declining formatter) returns
+        # None and we fall through to the cascade below.
+        custom = _render_tool_umbrella(item_id)
+        if custom is not None:
+            yield custom
+            return
     yield from _collect_umbrella_preview(item_id)
 
 
