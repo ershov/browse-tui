@@ -1637,6 +1637,386 @@ class TestTreeChildrenPreview(unittest.TestCase):
             os.unlink(path)
 
 
+class TestComposedToolBlock(unittest.TestCase):
+    """Composed previews fuse a tool umbrella's rich block as one unit.
+
+    A ``prompt`` / ``session`` preview of a turn containing a registered
+    tool emits that tool's ``_render_tool_umbrella`` block (with a
+    compose-time ``─── tool: <Name> ───`` rule) instead of descending to
+    the raw ``tool_use`` / ``tool_result`` leaf bodies. The fallback,
+    chrome, level, boundary, and DRY invariants ride along.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def setUp(self):
+        # Default detail level is voice-only (1); the tool row's min
+        # level is 2, so pin to "all" for the baseline tests and flip it
+        # explicitly in the level-interaction test.
+        self._saved_FILTER = self.r._DETAIL_LEVEL
+        self.r._DETAIL_LEVEL = 4
+        self._saved_TREE = self.r._TREE_MODE
+        self.r._TREE_MODE = True
+
+    def tearDown(self):
+        self.r._DETAIL_LEVEL = self._saved_FILTER
+        self.r._TREE_MODE = self._saved_TREE
+
+    def _write_jsonl(self, records):
+        import json as _json
+        import tempfile
+        f = tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False)
+        for r in records:
+            f.write(_json.dumps(r) + '\n')
+        f.close()
+        self.addCleanup(os.unlink, f.name)
+        return f.name
+
+    # A registered tool (Bash) at line 1, with its paired tool_result at
+    # line 2, under a turn root (user prompt) at line 0.
+    _BASH_TURN = [
+        {'type': 'user', 'uuid': 'u1',
+         'message': {'role': 'user', 'content': 'PROBE_PROMPT'}},
+        {'type': 'assistant', 'uuid': 'a1',
+         'message': {'role': 'assistant', 'content': [
+             {'type': 'tool_use', 'id': 't1', 'name': 'Bash',
+              'input': {'command': 'PROBE_BASH_CMD'}},
+         ]}},
+        {'type': 'user', 'uuid': 'u2',
+         'message': {'role': 'user', 'content': [
+             {'type': 'tool_result', 'tool_use_id': 't1',
+              'content': 'PROBE_BASH_OUTPUT'},
+         ]}},
+    ]
+
+    def test_prompt_compose_uses_fused_block_not_raw_leaves(self):
+        # The turn preview composes the tool child as its fused block:
+        # the rule + command + output all appear, but the raw leaf
+        # markers (the ``🔧 Bash`` tool_use head, the ``↳ tool_result``
+        # leaf) do NOT — the block replaces the leaf cascade.
+        path = self._write_jsonl(self._BASH_TURN)
+        out = ''.join(self.r._preview_umbrella(('prompt', path, 0)))
+        self.assertIn('PROBE_PROMPT', out)
+        self.assertIn('PROBE_BASH_CMD', out)
+        self.assertIn('PROBE_BASH_OUTPUT', out)
+        self.assertIn('tool: Bash', out)          # compose-time rule
+        # Raw leaf bodies are NOT emitted for the tool subtree.
+        self.assertNotIn('🔧 Bash', out)          # raw tool_use head
+        self.assertNotIn('tool_result', out)      # raw tool_result rule
+
+    def test_session_compose_uses_fused_block(self):
+        # A cross-file ``session`` preview composes the same way (it
+        # recurses through the turn to the tool child). Exercises the
+        # ``_collect_umbrella_preview`` recursion from the session root.
+        path = self._write_jsonl(self._BASH_TURN)
+        out = ''.join(self.r._collect_umbrella_preview(('session', path)))
+        self.assertIn('PROBE_BASH_CMD', out)
+        self.assertIn('PROBE_BASH_OUTPUT', out)
+        self.assertIn('tool: Bash', out)
+        self.assertNotIn('🔧 Bash', out)
+
+    def test_fallback_unregistered_tool_descends_to_leaves(self):
+        # An unregistered tool has no umbrella formatter, so
+        # ``_render_tool_umbrella`` returns None and the turn preview
+        # falls back to descending into the raw leaves.
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'PROBE_PROMPT'}},
+            {'type': 'assistant', 'uuid': 'a1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 't1', 'name': 'NoSuchTool',
+                  'input': {'arg': 'PROBE_TOOL_INPUT'}},
+             ]}},
+            {'type': 'user', 'uuid': 'u2',
+             'message': {'role': 'user', 'content': [
+                 {'type': 'tool_result', 'tool_use_id': 't1',
+                  'content': 'PROBE_TOOL_OUTPUT'},
+             ]}},
+        ])
+        # The block declines for an unregistered tool …
+        self.assertIsNone(self.r._render_tool_umbrella(('tool', path, 1)))
+        # … so the composed preview descends to the raw leaves instead.
+        out = ''.join(self.r._preview_umbrella(('prompt', path, 0)))
+        self.assertIn('🔧 NoSuchTool', out)       # raw tool_use head
+        self.assertIn('tool_result', out)         # raw tool_result rule
+        self.assertIn('PROBE_TOOL_OUTPUT', out)
+        self.assertNotIn('tool: NoSuchTool', out)  # no fused-block rule
+
+    def test_fallback_in_flight_result_descends(self):
+        # Bash never declines, so use Edit (which needs a result to form
+        # its diff): an in-flight tool_use with no tool_result yet makes
+        # ``_render_tool_umbrella`` return None → descend to the leaf.
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'PROBE_PROMPT'}},
+            {'type': 'assistant', 'uuid': 'a1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 't1', 'name': 'Edit',
+                  'input': {'file_path': '/tmp/PROBE_EDIT_PATH',
+                            'old_string': 'a', 'new_string': 'b'}},
+             ]}},
+        ])
+        self.assertIsNone(self.r._render_tool_umbrella(('tool', path, 1)))
+        out = ''.join(self.r._preview_umbrella(('prompt', path, 0)))
+        self.assertIn('🔧 Edit', out)             # raw tool_use head
+        self.assertNotIn('tool: Edit', out)        # no fused-block rule
+
+    def test_standalone_tool_pane_has_no_section_rule(self):
+        # The compose-time ``─── tool: <Name> ───`` rule is added only by
+        # ``_node_own_body``. A directly-targeted tool pane goes straight
+        # to the rule-less ``_render_tool_umbrella`` (via
+        # ``_preview_umbrella``), so it shows the block WITHOUT that rule.
+        path = self._write_jsonl(self._BASH_TURN)
+        out = ''.join(self.r._preview_umbrella(('tool', path, 1)))
+        self.assertIn('PROBE_BASH_CMD', out)
+        self.assertIn('PROBE_BASH_OUTPUT', out)
+        # The block's own ``🔧 Bash`` header is present, but NOT the
+        # compose-time section rule.
+        self.assertNotIn('── tool: ', out)
+
+    def test_node_own_body_tool_carries_section_rule(self):
+        # Direct-call: ``_node_own_body`` on the tool id wraps the
+        # rule-less block in the section rule.
+        path = self._write_jsonl(self._BASH_TURN)
+        unit = self.r._node_own_body(('tool', path, 1))
+        self.assertIsNotNone(unit)
+        self.assertIn('── tool: Bash ', unit)
+        # And the wrapped body is exactly the rule-less block.
+        block = self.r._render_tool_umbrella(('tool', path, 1))
+        self.assertIsNotNone(block)
+        self.assertTrue(unit.endswith(block))
+
+    def test_dry_direct_target_equals_composed_block(self):
+        # The block text a directly-targeted tool pane shows is identical
+        # to the block composed inside its turn — modulo the compose-time
+        # section rule the composed path prepends. Strip the rule line
+        # from the composed unit and compare to the standalone block.
+        path = self._write_jsonl(self._BASH_TURN)
+        standalone = ''.join(self.r._preview_umbrella(('tool', path, 1)))
+        unit = self.r._node_own_body(('tool', path, 1))
+        # ``unit`` == rule + '\n' + block; drop the first line (the rule).
+        composed_block = unit.split('\n', 1)[1]
+        self.assertEqual(composed_block, standalone)
+
+    def test_no_chrome_between_composed_blocks(self):
+        # Composed output is body-only: a leaf's uuid/timestamp chrome
+        # footer (present on a standalone leaf preview) must NOT appear in
+        # the turn's composed preview.
+        path = self._write_jsonl(self._BASH_TURN)
+        out = ''.join(self.r._preview_umbrella(('prompt', path, 0)))
+        self.assertNotIn('uuid', out)
+        # But the standalone leaf preview DOES carry chrome.
+        leaf = self.r._preview_message(path, 0)
+        self.assertIn('uuid', leaf)
+
+    def test_level_interaction_block_absent_at_voice_level(self):
+        # At level 1 (voice) the tool row is hidden, so it doesn't
+        # compose into the turn preview at all; at level >= 2 it does.
+        path = self._write_jsonl(self._BASH_TURN)
+        self.r._DETAIL_LEVEL = 1
+        out_lvl1 = ''.join(self.r._preview_umbrella(('prompt', path, 0)))
+        self.assertNotIn('tool: Bash', out_lvl1)
+        self.assertNotIn('PROBE_BASH_CMD', out_lvl1)
+        for level in (2, 3, 4):
+            self.r._DETAIL_LEVEL = level
+            out = ''.join(self.r._preview_umbrella(('prompt', path, 0)))
+            self.assertIn('tool: Bash', out, f'level {level}')
+            self.assertIn('PROBE_BASH_CMD', out, f'level {level}')
+
+
+class TestTurnRootRule(unittest.TestCase):
+    """Turn-opening user prompts get a full-width dark-blue divider.
+
+    A composed preview's ``── user ──`` rule for a turn root spans the
+    full preview width and carries the dark-blue band (``48;5;17``), so
+    successive turns pop. Every OTHER rule (assistant, tool, non-voice
+    user, …) keeps the fixed ~60-wide, fg-only form. Standalone leaf
+    previews carry no rule at all (that's ``_preview_message``).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def setUp(self):
+        self._saved_FILTER = self.r._DETAIL_LEVEL
+        self.r._DETAIL_LEVEL = 4
+        self._saved_TREE = self.r._TREE_MODE
+        self.r._TREE_MODE = True
+        self._saved_BROWSER = self.r._BROWSER
+
+    def tearDown(self):
+        self.r._DETAIL_LEVEL = self._saved_FILTER
+        self.r._TREE_MODE = self._saved_TREE
+        self.r._BROWSER = self._saved_BROWSER
+
+    def _write_jsonl(self, records):
+        import json as _json
+        import tempfile
+        f = tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False)
+        for r in records:
+            f.write(_json.dumps(r) + '\n')
+        f.close()
+        self.addCleanup(os.unlink, f.name)
+        return f.name
+
+    @staticmethod
+    def _visible(line):
+        """Strip SGR codes → the on-screen width of a rendered line."""
+        import re as _re
+        return _re.sub(r'\x1b\[[0-9;]*m', '', line)
+
+    @staticmethod
+    def _fake_browser(width):
+        """Minimal _BROWSER stand-in: a known ``preview_width`` plus the
+        no-op composer surface (``cached_children`` / ``items_by_id`` /
+        ``update_data``) so the eager-push descent doesn't blow up."""
+        class _FB:
+            preview_width = width
+            items_by_id = {}
+            def cached_children(self, _id):
+                return None
+            def update_data(self, _ops):
+                pass
+        return _FB()
+
+    def _divider_line(self, out, label):
+        """The single rendered line containing ``── <label> ``."""
+        for line in out.split('\n'):
+            if f'── {label} ' in line:
+                return line
+        self.fail(f'no "── {label} " divider line in:\n{out!r}')
+
+    # ---- the _rule primitive ----------------------------------------
+
+    def test_rule_no_width_no_bg_is_byte_identical(self):
+        # Existing callers (no width/bg) must be unchanged to the byte.
+        def _old_rule(title='', color=None):
+            bar = '─' * max(0, 60 - len(title) - 4)
+            body = f'── {title} {bar}' if title else '─' * 60
+            return f'{color or self.r.MUTE}{body}{self.r.RESET}'
+        for title in ('', 'user', 'assistant', 'tool_result', 'system'):
+            self.assertEqual(self.r._rule(title, self.r.YELLOW),
+                             _old_rule(title, self.r.YELLOW),
+                             f'titled YELLOW {title!r}')
+            self.assertEqual(self.r._rule(title), _old_rule(title),
+                             f'default {title!r}')
+
+    def test_rule_width_and_bg(self):
+        # width sizes the visible bar; bg prefixes a background SGR
+        # behind the whole bar.
+        out = self.r._rule('user', self.r.BOLD + self.r.WHITE,
+                           width=100, bg=self.r.BLUE_BG)
+        self.assertTrue(out.startswith(self.r.BLUE_BG),
+                        'bg SGR should lead the rule')
+        self.assertEqual(len(self._visible(out)), 100)
+        self.assertIn('── user ', out)
+
+    # ---- composed previews ------------------------------------------
+
+    def test_turn_root_divider_full_width_dark_blue(self):
+        # The turn root's divider carries the dark-blue band and spans
+        # the live preview width.
+        self.r._BROWSER = self._fake_browser(123)
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'PROBE_TURN'}},
+            {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'text', 'text': 'PROBE_REPLY'}]}},
+        ])
+        out = ''.join(self.r._preview_umbrella(('prompt', path, 0)))
+        line = self._divider_line(out, 'user')
+        self.assertIn(self.r.BLUE_BG, line, 'turn-root divider needs the bg')
+        # Visible width tracks the pane width.
+        self.assertEqual(len(self._visible(line)), 123)
+
+    def test_non_turn_root_leaf_keeps_fixed_fg_only_rule(self):
+        # The assistant reply composed under the turn keeps the fixed
+        # ~60-wide YELLOW rule — no dark-blue band, not full-width.
+        self.r._BROWSER = self._fake_browser(123)
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'PROBE_TURN'}},
+            {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'text', 'text': 'PROBE_REPLY'}]}},
+        ])
+        out = ''.join(self.r._preview_umbrella(('prompt', path, 0)))
+        line = self._divider_line(out, 'assistant')
+        self.assertNotIn(self.r.BLUE_BG, line,
+                         'assistant divider must not carry the bg')
+        self.assertIn(self.r.YELLOW, line, 'assistant divider stays YELLOW')
+        self.assertEqual(len(self._visible(line)), 60,
+                         'non-turn-root rule stays fixed 60-wide')
+
+    def test_tool_result_user_is_not_banded(self):
+        # Only *turn-opening* (voice) user prompts get the band; a user
+        # record that's just a tool_result wrapper must not — it composes
+        # via the tool block anyway, but assert the discriminator
+        # directly on _render_record_with_rule for the wrapper line.
+        self.r._BROWSER = self._fake_browser(123)
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u2',
+             'message': {'role': 'user', 'content': [
+                 {'type': 'tool_result', 'tool_use_id': 't1',
+                  'content': 'PROBE_WRAP'}]}},
+        ])
+        rendered = self.r._render_record_with_rule(path, 0)
+        self.assertIsNotNone(rendered)
+        first_line = rendered.split('\n', 1)[0]
+        self.assertNotIn(self.r.BLUE_BG, first_line,
+                         'tool_result-wrapper user is not a turn root')
+        self.assertIn(self.r.YELLOW, first_line)
+        self.assertEqual(len(self._visible(first_line)), 60)
+
+    def test_turn_root_width_falls_back_when_headless(self):
+        # With _BROWSER None (headless), the full-width rule falls back
+        # to the fixed 60 but still carries the dark-blue band.
+        self.r._BROWSER = None
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'PROBE_TURN'}},
+        ])
+        rendered = self.r._render_record_with_rule(path, 0)
+        line = rendered.split('\n', 1)[0]
+        self.assertIn(self.r.BLUE_BG, line)
+        self.assertEqual(len(self._visible(line)), 60)
+
+    def test_only_divider_styled_body_renders_normally(self):
+        # The band styles ONLY the divider line; the prompt body is the
+        # normal voice render below it.
+        self.r._BROWSER = None
+        path = self._write_jsonl([
+            {'type': 'user', 'uuid': 'u1',
+             'message': {'role': 'user', 'content': 'PROBE_BODY_TEXT'}},
+        ])
+        rendered = self.r._render_record_with_rule(path, 0)
+        head, body = rendered.split('\n', 1)
+        self.assertIn(self.r.BLUE_BG, head)
+        self.assertIn('PROBE_BODY_TEXT', body)
+        self.assertNotIn(self.r.BLUE_BG, body)
+
+
+class TestTurnRootRuleNoColor(unittest.TestCase):
+    """Under NO_COLOR the full-width band degrades to plain text."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe(force_color=False)
+
+    def test_no_color_strips_bg(self):
+        self.assertEqual(self.r.BLUE_BG, '')
+        out = self.r._rule('user', self.r.BOLD + self.r.WHITE,
+                           width=100, bg=self.r.BLUE_BG)
+        # No SGR at all — plain '── user ──…' text.
+        self.assertNotIn('\x1b[', out)
+        self.assertIn('── user ', out)
+        self.assertEqual(len(out), 100)
+
+
 class TestAncestorIdsForSubagent(unittest.TestCase):
     """``_ancestor_ids_for`` prepends the outer subagent-group row."""
 
@@ -6717,8 +7097,11 @@ class TestUmbrellaPreviewCacheIntegration(unittest.TestCase):
 
     def test_composer_does_not_double_call_get_children(self):
         # First composition: ``get_children`` is called for the prompt
-        # umbrella and the nested tool umbrella (one each).
-        # Second composition: cache hits for both — no new calls.
+        # umbrella. The nested tool umbrella composes as its fused block
+        # (#1185) — built from ``_scan_tree``, not ``get_children`` —
+        # so the composer never descends into it and never fetches its
+        # children. Second composition: cache hits for the prompt; still
+        # no tool fetch.
         self.r._BROWSER = _FakeBrowser()
         path = self._make_three_record_session()
         counter, restore = self._instrument_get_children()
@@ -6726,9 +7109,10 @@ class TestUmbrellaPreviewCacheIntegration(unittest.TestCase):
             ''.join(self.r._preview_umbrella(('prompt', path, 0)))
             self.r._BROWSER.flush()
             first_pass_calls = list(counter['calls'])
-            # First pass must have fetched both umbrellas.
+            # First pass fetched the prompt umbrella …
             self.assertIn(('prompt', path, 0), first_pass_calls)
-            self.assertIn(('tool', path, 1), first_pass_calls)
+            # … but NOT the tool umbrella (composed as a block, no descent).
+            self.assertNotIn(('tool', path, 1), first_pass_calls)
 
             ''.join(self.r._preview_umbrella(('prompt', path, 0)))
             self.r._BROWSER.flush()
@@ -6752,26 +7136,37 @@ class TestUmbrellaPreviewCacheIntegration(unittest.TestCase):
         # the umbrella OR strip from the leaf depending on visit
         # order. The umbrella no longer writes to the leaf cache; each
         # consumer manages its own.
+        #
+        # Eager-push reaches only leaves the composer actually descends
+        # to: the prompt's own ``msg`` child (line 0). The tool turn
+        # composes as a fused block (#1185), so its leaf children
+        # (lines 1, 2) aren't pre-pushed — they upsert on real
+        # expansion (the design's eager-upsert nuance). Whatever IS
+        # registered must still carry a None preview.
         self.r._BROWSER = _FakeBrowser()
         path = self._make_three_record_session()
         try:
             ''.join(self.r._preview_umbrella(('prompt', path, 0)))
             self.r._BROWSER.flush()
-            # Leaves get *registered* in the index via eager-push
-            # upserts (so the framework's tree expansion is cheap),
-            # but their ``preview`` slot stays None — populated only
-            # by the framework's own worker when a direct cursor
-            # visit calls ``get_preview(leaf_id)``.
-            for n in (0, 1, 2):
-                cid = ('msg', path, n)
-                item = self.r._BROWSER.items_by_id.get(cid)
-                self.assertIsNotNone(item, f'leaf {cid} not in index')
-                self.assertFalse(
-                    item.preview,
-                    f'leaf {cid}.preview should be None — umbrella '
-                    f'must not pollute the leaf cache. Got '
-                    f'{item.preview!r}',
-                )
+            # The descended prompt leaf is registered, preview unset.
+            cid = ('msg', path, 0)
+            item = self.r._BROWSER.items_by_id.get(cid)
+            self.assertIsNotNone(item, f'leaf {cid} not in index')
+            self.assertFalse(
+                item.preview,
+                f'leaf {cid}.preview should be None — umbrella '
+                f'must not pollute the leaf cache. Got '
+                f'{item.preview!r}',
+            )
+            # Any leaf that DID get registered carries no preview.
+            for other in (('msg', path, 1), ('msg', path, 2)):
+                it = self.r._BROWSER.items_by_id.get(other)
+                if it is not None:
+                    self.assertFalse(
+                        it.preview,
+                        f'leaf {other}.preview should be None; got '
+                        f'{it.preview!r}',
+                    )
         finally:
             os.unlink(path)
 
@@ -6802,10 +7197,17 @@ class TestUmbrellaPreviewCacheIntegration(unittest.TestCase):
             os.unlink(path)
 
     def test_tail_tick_re_renders_all_leaves_each_pass(self):
-        # The umbrella deliberately renders each leaf fresh on every
-        # compose — no leaf preview cache. The minor cost (one JSONL
-        # read + body render per leaf per compose) is the price of
+        # The umbrella deliberately renders each composed leaf fresh on
+        # every compose — no leaf preview cache. The minor cost (one
+        # JSONL read + body render per leaf per compose) is the price of
         # keeping the leaf cache uncluttered for direct visits.
+        #
+        # Here the prompt has one ``msg`` leaf it descends to (line 0):
+        # the tool turn composes as a fused block (#1185) via
+        # ``_render_tool_umbrella``, NOT through ``_render_record_with_rule``,
+        # so the per-leaf renderer fires exactly once per pass. The
+        # re-render-each-pass invariant is what matters: the count is
+        # identical across passes (no cache short-circuits it).
         self.r._BROWSER = _FakeBrowser()
         path = self._make_three_record_session()
 
@@ -6822,19 +7224,19 @@ class TestUmbrellaPreviewCacheIntegration(unittest.TestCase):
             self.r._BROWSER.flush()
             calls_after_first = list(render_calls)
             self.assertEqual(
-                len(calls_after_first), 3,
-                f'first pass should render 3 leaves; got '
+                len(calls_after_first), 1,
+                f'first pass should render the prompt leaf once; got '
                 f'{calls_after_first}',
             )
 
             render_calls.clear()
             ''.join(self.r._preview_umbrella(('prompt', path, 0)))
             self.r._BROWSER.flush()
-            # Second pass: every leaf re-renders. There's no leaf
-            # cache to hit.
+            # Second pass: the leaf re-renders. There's no leaf cache
+            # to hit.
             self.assertEqual(
-                len(render_calls), 3,
-                f'second pass should re-render all 3 leaves; got '
+                len(render_calls), 1,
+                f'second pass should re-render the prompt leaf; got '
                 f'{render_calls}',
             )
         finally:
@@ -9675,12 +10077,19 @@ class TestToolUmbrellaBash(unittest.TestCase):
         base.update(kw)
         return base
 
+    @staticmethod
+    def _strip_sgr(text):
+        import re as _re
+        return _re.sub(r'\x1b\[[0-9;]*m', '', text)
+
     def test_command_line_carries_cmd_bg(self):
         out = self.r._fmt_tool_umbrella_bash(
             {'command': 'ls -la', 'description': 'list'},
             self._result(stdout='a\nb\n'), None, False)
         self.assertIn(self.r.CMD_BG, out)
-        self.assertIn('$ ls -la', out)
+        # The command text is now syntax-colored, so an SGR sits between
+        # the ``$ `` prompt and the command — assert on SGR-stripped text.
+        self.assertIn('$ ls -la', self._strip_sgr(out))
         self.assertIn('# list', out)
         self.assertIn('a', out)
 
@@ -9690,7 +10099,7 @@ class TestToolUmbrellaBash(unittest.TestCase):
             self._result(stdout='one\ntwo\n'), None, False)
         # Both physical command lines carry the band.
         self.assertEqual(out.count(self.r.CMD_BG), 2)
-        self.assertIn('$ echo one', out)
+        self.assertIn('$ echo one', self._strip_sgr(out))
 
     def test_in_flight_renders_command_block_only(self):
         # No result yet (tur is None) -> still render the $ command block,
@@ -9698,7 +10107,7 @@ class TestToolUmbrellaBash(unittest.TestCase):
         out = self.r._fmt_tool_umbrella_bash(
             {'command': 'sleep 100'}, None, None, False)
         self.assertIsNotNone(out)
-        self.assertIn('$ sleep 100', out)
+        self.assertIn('$ sleep 100', self._strip_sgr(out))
         self.assertIn(self.r.CMD_BG, out)
 
     def test_raw_content_fallback_when_no_structured_result(self):
@@ -9706,7 +10115,7 @@ class TestToolUmbrellaBash(unittest.TestCase):
         # present -> the command output is recovered from raw_content.
         out = self.r._fmt_tool_umbrella_bash(
             {'command': 'echo hi'}, None, 'RAW_OUTPUT_TEXT', False)
-        self.assertIn('$ echo hi', out)
+        self.assertIn('$ echo hi', self._strip_sgr(out))
         self.assertIn('RAW_OUTPUT_TEXT', out)
 
     def test_stderr_with_ansi_not_red_wrapped(self):
@@ -9727,6 +10136,110 @@ class TestToolUmbrellaBash(unittest.TestCase):
     def test_stderr_rule_present(self):
         out = self.r._fmt_tur_bash(self._result(stderr='x'))
         self.assertIn('stderr', out)
+
+
+class TestBashSyntaxColor(unittest.TestCase):
+    """Frame-less bash syntax coloring on the grey ``CMD_BG`` band.
+
+    The ``$ command`` lexes through md2ansi_lib's bash context with
+    ``current_style=CMD_BG_PARAMS`` so token resets land back on the grey
+    band (no hole), and the band is re-asserted per physical line so it
+    stays gap-free over the ``$ `` / ``  `` prefix. Degrades to a flat
+    WHITE command when the bash context isn't importable.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        # md2ansi live so the bash context resolves (``_M2A_BASH``).
+        cls.r = _load_recipe_with_md_doc()
+
+    @staticmethod
+    def _strip_sgr(text):
+        import re as _re
+        return _re.sub(r'\x1b\[[0-9;]*m', '', text)
+
+    def _cmd_lines(self, out):
+        """Physical command lines of a Bash block (those on the band)."""
+        return [ln for ln in out.split('\n') if ln.startswith(self.r.CMD_BG)]
+
+    def test_library_present_resolves_bash_context(self):
+        # Guards the rest of this class: if md2ansi_lib didn't import,
+        # the colored-path assertions would be vacuous.
+        self.assertIsNotNone(self.r._M2A_BASH,
+                             'md2ansi_lib bash context should be live here')
+
+    def test_bash_color_preserves_band_across_token_resets(self):
+        # Token resets return to the grey band params, NOT a hard reset,
+        # so the band never drops mid-line.
+        colored = self.r._bash_color('echo "hi"')
+        self.assertIn(self.r.CMD_BG_PARAMS, colored)   # band-preserving resets
+        self.assertNotIn('\x1b[0m', colored)           # no hole-punching reset
+
+    def test_command_lines_carry_band_and_bash_sgr(self):
+        out = self.r._fmt_tool_umbrella_bash(
+            {'command': 'echo hi'}, None, 'OUT', False)
+        lines = self._cmd_lines(out)
+        self.assertEqual(len(lines), 1)
+        line = lines[0]
+        self.assertTrue(line.startswith(self.r.CMD_BG))   # on the band
+        # ``echo`` is a bash builtin → carries md2ansi's builtin SGR.
+        self.assertIn('38;5;147', line)
+        # The ``$ `` prompt and the command text both render.
+        self.assertIn('$ echo hi', self._strip_sgr(line))
+
+    def test_multiline_continuation_band_gap_free(self):
+        # A multi-line command: the indented continuation line must also
+        # start with CMD_BG so the band covers the leading ``  `` with no
+        # gap, AND carry bash-token SGR (proves whole-command lexing).
+        out = self.r._fmt_tool_umbrella_bash(
+            {'command': 'if true; then\n  echo "x"\nfi'}, None, 'OUT', False)
+        lines = self._cmd_lines(out)
+        self.assertEqual(len(lines), 3)
+        for ln in lines:
+            self.assertTrue(ln.startswith(self.r.CMD_BG),
+                            f'command line not banded: {ln!r}')
+        # The continuation line (index 1) carries the ``echo`` builtin SGR.
+        self.assertIn('38;5;147', lines[1])
+        # Keywords (if/then/fi) are colored too (whole-command lexing).
+        self.assertIn('38;5;204', out)
+        # The ``$ `` only leads the first line; continuations get the
+        # 2-space prefix (here over the command's own 2-space indent).
+        self.assertIn('$ if true; then', self._strip_sgr(lines[0]))
+        cont = self._strip_sgr(lines[1])
+        self.assertTrue(cont.startswith('  '), f'no 2-space prefix: {cont!r}')
+        self.assertNotIn('$', cont)            # prompt only on line 0
+        self.assertIn('echo "x"', cont)
+
+    def test_fallback_flat_white_when_bash_context_absent(self):
+        # Simulate md2ansi_lib's bash context being unavailable: the
+        # block degrades to a flat WHITE command, still banded, no crash.
+        saved = self.r._M2A_BASH
+        try:
+            self.r._M2A_BASH = None
+            out = self.r._fmt_tool_umbrella_bash(
+                {'command': 'echo hi\n  more'}, None, 'OUT', False)
+            lines = self._cmd_lines(out)
+            self.assertEqual(len(lines), 2)
+            for ln in lines:
+                self.assertTrue(ln.startswith(self.r.CMD_BG),
+                                f'fallback line not banded: {ln!r}')
+            # Flat WHITE fg, no bash-token SGR.
+            self.assertIn(self.r.WHITE, out)
+            self.assertNotIn('38;5;147', out)   # no builtin coloring
+            self.assertNotIn('38;5;204', out)   # no keyword coloring
+            self.assertIn('$ echo hi', self._strip_sgr(lines[0]))
+        finally:
+            self.r._M2A_BASH = saved
+
+    def test_bash_color_fallback_returns_white_wrap(self):
+        # Direct: with the context gone, _bash_color is a plain WHITE wrap.
+        saved = self.r._M2A_BASH
+        try:
+            self.r._M2A_BASH = None
+            self.assertEqual(self.r._bash_color('ls -la'),
+                             f'{self.r.WHITE}ls -la{self.r.RESET}')
+        finally:
+            self.r._M2A_BASH = saved
 
 
 class TestToolUmbrellaWrite(unittest.TestCase):

@@ -282,6 +282,61 @@ class TestBrowseClaude(unittest.TestCase):
                                  'level 1 should hide the tool_use (L2)')
                 t.send('q')
 
+    def test_composed_preview_fuses_tool_block(self):
+        """End-to-end: a session/turn preview composes a registered tool's
+        fused block (not the raw tool_use/tool_result leaf cascade).
+
+        Tree mode, direct launch. Navigate to the TOP scope-root (session)
+        row whose preview is the umbrella cascade, set detail level 4 so
+        the tool row composes in, and assert the preview pane shows the
+        compose-time ``─── tool: Bash ───`` rule and the command/output —
+        proving the fused ``_render_tool_umbrella`` block composed through
+        the real binary. (Per #1185: composed previews use each node's own
+        block as a unit.)
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, '.claude', 'projects', '-home-x')
+            os.makedirs(proj)
+            sess = os.path.join(proj, 'compose.jsonl')
+            recs = [
+                {'type': 'user', 'uuid': 'u1', 'parentUuid': None,
+                 'sessionId': 'COMPOSESESS',
+                 'message': {'role': 'user', 'content': 'PROBE_COMPOSE_Q'}},
+                {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+                 'message': {'role': 'assistant', 'content': [
+                     {'type': 'tool_use', 'id': 't1', 'name': 'Bash',
+                      'input': {'command': 'PROBE_COMPOSE_CMD'}}]}},
+                {'type': 'user', 'uuid': 'u2', 'parentUuid': 'a1',
+                 'message': {'role': 'user', 'content': [
+                     {'type': 'tool_result', 'tool_use_id': 't1',
+                      'content': 'PROBE_COMPOSE_OUT'}]}},
+            ]
+            with open(sess, 'w') as f:
+                for r in recs:
+                    f.write(json.dumps(r) + '\n')
+            with TmuxFixture(cols=140, rows=40, env=self._launch_env(tmp)) as t:
+                t.launch(_BIN, '--run-py', _RECIPE, sess)
+                # Sync on RENDERED content (the prompt body), not the
+                # echoed launch cmdline — ``compose.jsonl`` is in the
+                # command line and would match before the TUI draws,
+                # dropping the keystrokes below.
+                t.wait_for('PROBE_COMPOSE_Q', timeout=3.0)
+                # Level 4 so the tool row is visible and composes in.
+                t.send('4')
+                t.wait_for('<tool:Bash>', timeout=3.0)
+                # Top scope-root (session) row → its preview is the
+                # composed cascade (scope card + leaf + fused tool block).
+                t.send('g')
+                # The composed preview carries the fused tool block: the
+                # compose-time section rule and the command line.
+                t.wait_for('tool: Bash', timeout=3.0)
+                cap = t.wait_stable()
+                self.assertIn('PROBE_COMPOSE_CMD', cap,
+                              'composed preview should show the command')
+                self.assertIn('PROBE_COMPOSE_OUT', cap,
+                              'composed preview should show the output')
+                t.send('q')
+
     def test_lists_subagents_under_session(self):
         """A session with subagents shows them as siblings of its messages.
 

@@ -92,11 +92,13 @@ try:
     from md2ansi_lib import (
         _md2ansi as _m2a_render,
         M2A_CONTEXT_CODE_JAVASCRIPT as _M2A_JS,
+        M2A_CONTEXT_CODE_BASH as _M2A_BASH,
         M2A_DocumentState as _M2A_DocumentState,
     )
     _M2A_JSON = _m2a_render if callable(_m2a_render) else None
 except Exception:
     _M2A_JSON = None
+    _M2A_BASH = None
 
 _MD_COLOR = _md2ansi_fn is not None  # default on when available
 _BROWSER = None  # set in main() — used for preview-width lookup
@@ -151,6 +153,11 @@ GRAY    = '\x1b[38;5;244m'
 MUTE    = '\x1b[38;5;240m'
 WHITE   = '\x1b[38;5;253m'
 
+# Dark-blue background (256-index 17, the recipe's existing dark blue —
+# see ``_ROW_BG_FOR_KIND['subagent']``) for the full-width turn-opening
+# ``── user ──`` divider so successive prompts pop in a composed preview.
+BLUE_BG = '\x1b[48;5;17m'
+
 
 def _init_color():
     """Disable ANSI when ``NO_COLOR`` is set or stdout isn't a tty.
@@ -164,7 +171,7 @@ def _init_color():
         g = globals()
         for n in ('RESET', 'BOLD', 'DIM', 'ITAL',
                   'RED', 'GREEN', 'YELLOW', 'BLUE', 'MAGENTA', 'CYAN',
-                  'GRAY', 'MUTE', 'WHITE'):
+                  'GRAY', 'MUTE', 'WHITE', 'BLUE_BG'):
             g[n] = ''
 
 
@@ -2386,17 +2393,24 @@ def _render_assistant(obj):
     return '\n'.join(out).rstrip() + '\n'
 
 
-def _rule(title='', color=None):
+def _rule(title='', color=None, *, width=None, bg=None):
     """A '── title ──' separator line. Default colour is MUTE.
 
     Pass ``color=YELLOW`` (or any palette constant) to make a rule
     pop — used by the tree-mode preview cascade to clearly mark the
     boundary between the cursor row's content and each of its
     appended children.
+
+    ``width`` overrides the fixed 60-column bar (callers pass the live
+    ``_BROWSER.preview_width`` for a rule that spans the pane). ``bg``
+    is a background SGR painted behind the WHOLE bar — combined with a
+    full ``width`` it reads as a solid band. With neither set the output
+    is byte-identical to the historical fixed-width, fg-only rule.
     """
-    bar = '─' * max(0, 60 - len(title) - 4)
-    body = f'── {title} {bar}' if title else '─' * 60
-    return f'{color or MUTE}{body}{RESET}'
+    w = 60 if width is None else width
+    bar = '─' * max(0, w - len(title) - 4)
+    body = f'── {title} {bar}' if title else '─' * w
+    return f'{bg or ""}{color or MUTE}{body}{RESET}'
 
 
 # ---- tool umbrella previews ----------------------------------------------
@@ -2420,8 +2434,12 @@ def _rule(title='', color=None):
 _TOOL_UMBRELLA_FORMATTERS = {}
 
 # Dark-grey background for the Bash ``$ command`` line so it reads as a
-# distinct prompt against the command's output below it.
-CMD_BG = '\x1b[48;5;236m'
+# distinct prompt against the command's output below it. The SGR params
+# are kept separate so ``_bash_color`` can pass them as md2ansi's
+# ``current_style`` — token resets then land back on the grey band
+# instead of a hard ``\x1b[0m`` that would punch a hole in it.
+CMD_BG_PARAMS = '48;5;236'
+CMD_BG = f'\x1b[{CMD_BG_PARAMS}m'
 
 HAVE_DELTA = shutil.which('delta')
 
@@ -2493,6 +2511,24 @@ def _maybe_json_color(text):
     except (TypeError, ValueError):
         return None
     return _json_color(json.dumps(parsed, indent=2, ensure_ascii=False))
+
+
+def _bash_color(cmd):
+    """Syntax-color a shell command FRAME-LESS, on the grey ``CMD_BG`` band.
+
+    Routes through md2ansi_lib's bash code context. ``current_style`` is
+    ``CMD_BG_PARAMS`` so each token's reset returns to the grey band
+    rather than a hard ``\\x1b[0m`` — the band stays unbroken across the
+    whole (possibly multi-line) command. Falls back to a flat ``WHITE``
+    wrap on any failure or when md2ansi_lib's bash context wasn't
+    importable.
+    """
+    if _M2A_BASH is None or not callable(_m2a_render):
+        return f'{WHITE}{cmd}{RESET}'
+    try:
+        return _m2a_render(cmd, CMD_BG_PARAMS, _M2A_BASH, _M2A_DocumentState())
+    except Exception:
+        return f'{WHITE}{cmd}{RESET}'
 
 
 def _render_tool_umbrella(item_id):
@@ -2647,13 +2683,18 @@ def _fmt_tool_umbrella_bash(inp, tur, raw_content, is_error):
     out = []
     if desc:
         out.append(f'{MUTE}# {desc}{RESET}')
-    # Paint each physical line of the command on CMD_BG so a multi-line
-    # command reads as one banded prompt block. ``$ `` leads the first
-    # line; continuations are indented two spaces to align under it.
-    cmd_lines = cmd.split('\n') or ['']
+    # Syntax-color the WHOLE command once (correct multi-line lexing),
+    # then paint each physical line on CMD_BG so it reads as one banded
+    # prompt block. ``$ `` leads the first line; continuations are
+    # indented two spaces to align under it. Re-asserting CMD_BG per
+    # line keeps the grey band gap-free over the leading prefix, and
+    # ``_bash_color`` already preserves the band across token resets so
+    # there are no holes mid-line either.
+    colored = _bash_color(cmd)
+    cmd_lines = colored.split('\n') or ['']
     for i, line in enumerate(cmd_lines):
         prefix = '$ ' if i == 0 else '  '
-        out.append(f'{CMD_BG}{WHITE}{prefix}{line}{RESET}')
+        out.append(f'{CMD_BG}{prefix}{line}{RESET}')
     extras = []
     if timeout: extras.append(f'timeout={timeout}ms')
     if bg:      extras.append('background')
@@ -6047,59 +6088,111 @@ def _walk_umbrella(item_id, _state, _flush):
         # parent's preview either.
         if getattr(child, 'hidden', False):
             continue
+        # Boundary child — a self-contained foreign subtree (subagent
+        # group, referenced .md file): never drill into another file's
+        # content from a parent's preview cascade. For a subagent the
+        # dispatching Agent / Task tool_use + matching tool_result
+        # already live in the parent file and render through the normal
+        # leaf path under the dispatching turn, so we don't even emit a
+        # stub — would just duplicate that pair. (md docs are never in
+        # this cascade, so this only fires for the ``agent`` rows it
+        # used to match by id shape.)
+        if getattr(child, 'boundary', False):
+            continue
         try:
-            if getattr(child, 'boundary', False):
-                # Boundary child — a self-contained foreign subtree
-                # (subagent group, referenced .md file): never drill
-                # into another file's content from a parent's preview
-                # cascade. For a subagent the dispatching Agent / Task
-                # tool_use + matching tool_result already live in the
-                # parent file and render through the normal leaf path
-                # under the dispatching turn, so we don't even emit a
-                # stub — would just duplicate that pair. (md docs are
-                # never in this cascade, so this only fires for the
-                # ``agent`` rows it used to match by id shape.)
-                continue
-            if cid[0] in ('prompt', 'tool', 'span'):
-                # Same-file umbrella — recurse so the user sees every
-                # underlying line, not just the umbrella's first
-                # leaf. Pass the shared flush state so the whole
-                # descent stays in one batching window.
-                yield from _collect_umbrella_preview(cid, _state)
-                continue
-            if cid[0] != 'msg':
-                continue
-            cpath, n = cid[1], cid[2]
-            # Always render the leaf body fresh for the umbrella cascade.
-            # We deliberately do NOT consult ``get_cached_preview(cid)``
-            # nor write the rendered body back into the leaf's
-            # ``Item.preview`` via set_preview_op. The two consumers
-            # render differently: the umbrella wants body-only (chrome
-            # between leaves is noise) while a direct cursor-visit on
-            # the leaf wants body + chrome. Sharing one cache slot for
-            # both caused chrome to bleed into the umbrella when a
-            # leaf had been visited directly first, and stripped
-            # chrome from the leaf preview when the umbrella had been
-            # viewed first. JSONL line read + body render is cheap
-            # enough that re-rendering on each compose is fine.
-            rendered = _render_record_with_rule(cpath, n)
-            if rendered is not None:
-                yield rendered + '\n\n'
+            # One rule for every child: emit its own composed unit if it
+            # has one (a leaf's body + rule, or a tool umbrella's fused
+            # request+result block + its ``─── tool: <Name> ───`` rule),
+            # else recurse so a same-file ``prompt`` / ``span`` (or a
+            # tool whose formatter declined) still contributes every
+            # underlying line. ``_node_own_body`` owns all type knowledge
+            # and the compose-time rule; the walker stays tool-agnostic.
+            #
+            # Composed units are rendered fresh and body-only: we
+            # deliberately do NOT consult ``get_cached_preview(cid)`` nor
+            # write the rendered body back into a child's ``Item.preview``
+            # via set_preview_op. A direct cursor-visit caches body +
+            # chrome there; the cascade wants body-only (chrome between
+            # blocks is noise), so sharing one slot would bleed chrome
+            # in (or strip it out) depending on visit order. JSONL read +
+            # render is cheap enough to redo per compose.
+            unit = _node_own_body(cid)
+            if unit is not None:
+                yield unit + '\n\n'
                 _state['count'] += 1
                 _flush(_state)
+            else:
+                # Pass the shared flush state so the whole descent stays
+                # in one batching window.
+                yield from _collect_umbrella_preview(cid, _state)
         except Exception as e:
             yield (_rule(f'error rendering child {cid}', RED)
                    + f'\n{type(e).__name__}: {e}\n\n')
 
 
 def _render_record_with_rule(path, n):
-    """Read one record, render its body, prefix with a bright-yellow rule."""
+    """Read one record, render its body, prefix with a section rule.
+
+    Most leaves get the fixed ~60-wide bright-yellow rule. A
+    turn-opening user prompt gets a FULL-WIDTH dark-blue band instead
+    (bold-white title), so successive turns stand out as the visual
+    anchors of a composed multi-turn preview. Only the divider line is
+    styled — the prompt body renders normally.
+    """
     obj = _read_jsonl_line(path, n)
     if obj is None or not isinstance(obj, dict):
         return None
     kind = _classify(obj)
     body = _RENDERERS.get(kind, _render_unknown)(obj)
-    return _rule(kind, YELLOW) + '\n' + body
+    if _is_turn_root(obj):
+        width = getattr(_BROWSER, 'preview_width', 0) or 60
+        rule = _rule(kind, BOLD + WHITE, width=width, bg=BLUE_BG)
+    else:
+        rule = _rule(kind, YELLOW)
+    return rule + '\n' + body
+
+
+def _tool_label(cid):
+    """Tool name for a composed ``('tool', jsonl, line)`` block's section rule.
+
+    Resolves the dispatching assistant record's first ``tool_use`` name from
+    ``td.tool_use_name_of`` — the same source the ``<tool:Name>`` umbrella
+    title prefix uses. Defensive: any malformed id / scan failure / missing
+    entry falls back to ``'tool'`` so the rule still renders.
+    """
+    try:
+        _tag, jsonl_path, assistant_line = cid
+        td = _scan_tree(jsonl_path)
+        rec = td.records[assistant_line]
+        return td.tool_use_name_of.get(rec.get('uuid'), 'tool')
+    except Exception:
+        return 'tool'
+
+
+def _node_own_body(cid):
+    """The node's own composed unit — body WITH its section rule — or ``None``.
+
+    ``None`` means "this node has no self-contained block; compose from its
+    children" and the walker recurses. The ``─── … ───`` rule is a
+    composition-time separator (matching how leaves get theirs only when
+    embedded): standalone previews call the underlying rule-less renderers
+    directly, so a standalone tool/leaf pane shows no redundant top rule.
+
+      * ``msg``  → ``_render_record_with_rule`` (already body + rule).
+      * ``tool`` → the rule-less ``_render_tool_umbrella`` block, prefixed
+        here with a ``─── tool: <Name> ───`` rule; ``None`` (unregistered
+        tool, in-flight part, declining formatter) falls through to recurse.
+      * prompt / span / cross-file / anything else → ``None`` (recurse).
+    """
+    tag = cid[0]
+    if tag == 'msg':
+        return _render_record_with_rule(cid[1], cid[2])
+    if tag == 'tool':
+        block = _render_tool_umbrella(cid)
+        if block is None:
+            return None
+        return _rule(f'tool: {_tool_label(cid)}', YELLOW) + '\n' + block
+    return None
 
 
 # ---- actions -------------------------------------------------------------
