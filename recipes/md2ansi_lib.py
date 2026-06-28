@@ -624,8 +624,13 @@ def _m2a_fmt_table(m, name, current_style, context, state):
     # Reset at the end of every wrapped sub-line so a styled span left open
     # at the break point (e.g. `**bold` ending one sub-line, `bold**` on the
     # next) can't leak into the cell padding, the `│` separator, or the next
-    # cell on the same visual row. Tables don't inherit a style — they're
-    # always top-level — so plain `\x1b[m` (= `\x1b[0m`) is the right reset.
+    # cell on the same visual row. The reset returns to the caller's
+    # `current_style` (not bare `\x1b[m`): the box chrome is emitted as plain
+    # text and so inherits the ambient SGR, which is `current_style` when the
+    # app set a non-default base style before the output. With the default
+    # `current_style="0"` this is exactly `\x1b[0m`.
+    cell_reset = f"\x1b[{current_style}m"
+
     def cell_sublines(rendered, w):
         # Split the deferred line sentinels into stacked sub-lines BEFORE the
         # cell is laid out (the table marks itself opaque, which bypasses the
@@ -641,7 +646,7 @@ def _m2a_fmt_table(m, name, current_style, context, state):
             if kind == "rule":
                 out.append(_M2A_RULE)
             else:
-                out.extend(_m2a_wrap_ansi_line(seg, w, "", "\x1b[m") if seg else [""])
+                out.extend(_m2a_wrap_ansi_line(seg, w, "", cell_reset) if seg else [""])
         return out
 
     header_cells = [cell_sublines(rendered_header[i], widths[i]) for i in range(n_cols)]
