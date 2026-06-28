@@ -2557,6 +2557,136 @@ class TestViewEditDefaults(unittest.TestCase):
         finally:
             b.stop_workers()
 
+    # --- streaming-preview completeness (truncated-pager regression) ------
+
+    @staticmethod
+    def _streaming_setup(captured):
+        """Browser whose ``get_preview`` is a 300-line pull generator.
+
+        Returns ``(browser, ctx, full_text)``. Headless ``_preview_cap_lines``
+        is ``MIN_CAP_LINES`` (50), so draining this generator through the
+        real preview worker pauses at 50 of 300 lines — a partial prefix
+        sits in ``Item.preview`` exactly like browse-claude's big-session
+        scope-root preview.
+        """
+        full = ''.join(f'line {i:04d}\n' for i in range(300))
+
+        def get_preview(item_id):
+            for i in range(300):
+                yield f'line {i:04d}\n'
+
+        b = _make_browser(show_preview=True, get_preview=get_preview)
+        item = Item(id='sess', title='session')
+        b._state._children[None] = [item]
+        b._state._items_by_id['sess'] = item
+        b._state.cursor = 0
+        ctx = _ctx_for(b)
+
+        def stub_run_external(cmd, env=None):
+            import shlex
+            path = shlex.split(cmd)[-1]
+            with open(path, 'rb') as f:
+                captured['bytes'] = f.read()
+            return 0
+
+        ctx.run_external = stub_run_external
+        return b, ctx, full
+
+    def test_v_pages_full_preview_when_stream_paused(self):
+        # The streamed generator preview is cached only up to the buffer
+        # cap while paused. ``v`` must page the WHOLE thing, not the
+        # truncated cache.
+        cap = {}
+        b, ctx, full = self._streaming_setup(cap)
+        b.start_workers()
+        try:
+            b.request_preview('sess')
+            b.run_until_idle(timeout=3.0)
+            # Precondition: worker paused with a partial cache.
+            self.assertIsNotNone(
+                b._preview_paused,
+                'precondition: streamed preview should be paused at the cap',
+            )
+            self.assertEqual(b._preview_paused.get('id'), 'sess')
+            partial = b._state._items_by_id['sess'].preview
+            self.assertLess(
+                len(partial), len(full),
+                'precondition: cache should be a partial prefix',
+            )
+            os.environ['PAGER'] = 'cat'
+            try:
+                _actions._view_in_pager(ctx)
+            finally:
+                del os.environ['PAGER']
+            self.assertEqual(
+                cap.get('bytes', b'').decode(), full,
+                'v must page the FULL streamed preview, not the partial '
+                'paused cache',
+            )
+        finally:
+            b.stop_workers()
+
+    def test_e_edits_full_preview_when_stream_paused(self):
+        cap = {}
+        b, ctx, full = self._streaming_setup(cap)
+        b.start_workers()
+        try:
+            b.request_preview('sess')
+            b.run_until_idle(timeout=3.0)
+            self.assertIsNotNone(b._preview_paused)
+            os.environ['EDITOR'] = 'cat'
+            try:
+                _actions._edit_in_editor(ctx)
+            finally:
+                del os.environ['EDITOR']
+            self.assertEqual(cap.get('bytes', b'').decode(), full)
+        finally:
+            b.stop_workers()
+
+    def test_paused_partial_cache_is_left_intact_for_the_pane(self):
+        # Draining the full preview for the pager must NOT overwrite the
+        # worker's partial cache — the worker still holds a paused
+        # generator whose scroll-resume appends from where it left off.
+        cap = {}
+        b, ctx, full = self._streaming_setup(cap)
+        b.start_workers()
+        try:
+            b.request_preview('sess')
+            b.run_until_idle(timeout=3.0)
+            partial_before = b._state._items_by_id['sess'].preview
+            os.environ['PAGER'] = 'cat'
+            try:
+                _actions._view_in_pager(ctx)
+            finally:
+                del os.environ['PAGER']
+            self.assertEqual(
+                b._state._items_by_id['sess'].preview, partial_before,
+                'the live pane cache must be left untouched by v/e',
+            )
+        finally:
+            b.stop_workers()
+
+    def test_v_drains_generator_on_cold_cache(self):
+        # No cache yet + a generator ``get_preview`` (e.g. preview pane
+        # hidden, nothing streamed): the result must be drained to a
+        # string, not handed to the pager as a generator object.
+        full = ''.join(f'L{i}\n' for i in range(5))
+
+        def get_preview(item_id):
+            for i in range(5):
+                yield f'L{i}\n'
+
+        b, ctx, cap = self._setup(preview_text=None, get_preview=get_preview)
+        try:
+            os.environ['PAGER'] = 'cat'
+            try:
+                _actions._view_in_pager(ctx)
+            finally:
+                del os.environ['PAGER']
+            self.assertEqual(cap['bytes'], full.encode())
+        finally:
+            b.stop_workers()
+
     def test_v_and_e_in_default_actions(self):
         # Sanity: both keys are wired into default_actions() with the
         # expected handlers, in the OTHER section, gated on 'none' so

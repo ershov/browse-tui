@@ -7454,6 +7454,33 @@ class Browser:
         # re-visit refetches instead of painting the truncated cache.
         self._post_clear_abandoned_preview(abandoned_id)
 
+    def preview_cache_is_partial(self, item_id) -> bool:
+        """True iff ``item_id``'s cached ``Item.preview`` is a truncated prefix.
+
+        A streaming (generator) ``get_preview`` is drained only up to the
+        screen-derived buffer cap and then *paused*
+        (``_stream_preview_from_generator``); the partial output stays in
+        ``Item.preview`` until the user scrolls (demand-resume) or pins the
+        tail. While paused, the cache is an incomplete prefix of the real
+        content. ``v``/``e`` (``_run_external_on_preview``) consult this so
+        they re-fetch and fully drain the preview instead of paging the
+        truncated cache. Non-streaming caches — string previews, exhausted
+        generators, push-mode content — are never paused, so this returns
+        ``False`` and the cache is trusted as complete.
+
+        Scope (deliberate): this flags the *paused* state — the steady
+        state the cursor lands on, since a generator races to its first
+        cap in microseconds. It does NOT flag the sub-cap window while a
+        generator is still actively draining (not yet paused); catching
+        that would mean tracking in-flight fetch state cross-thread and
+        risks false positives on settled string previews. The window is
+        negligible for the CPU-bound generators recipes use, and even
+        then v/e are no worse than the pre-fix cache read.
+        """
+        with self._preview_lock:
+            paused = self._preview_paused
+            return paused is not None and paused.get('id') == item_id
+
     def _stream_preview_from_generator(self, item_id, gen):
         """Drain a ``get_preview`` generator into ``append_preview``.
 

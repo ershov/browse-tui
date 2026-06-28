@@ -9153,6 +9153,33 @@ class Browser:
         # re-visit refetches instead of painting the truncated cache.
         self._post_clear_abandoned_preview(abandoned_id)
 
+    def preview_cache_is_partial(self, item_id) -> bool:
+        """True iff ``item_id``'s cached ``Item.preview`` is a truncated prefix.
+
+        A streaming (generator) ``get_preview`` is drained only up to the
+        screen-derived buffer cap and then *paused*
+        (``_stream_preview_from_generator``); the partial output stays in
+        ``Item.preview`` until the user scrolls (demand-resume) or pins the
+        tail. While paused, the cache is an incomplete prefix of the real
+        content. ``v``/``e`` (``_run_external_on_preview``) consult this so
+        they re-fetch and fully drain the preview instead of paging the
+        truncated cache. Non-streaming caches — string previews, exhausted
+        generators, push-mode content — are never paused, so this returns
+        ``False`` and the cache is trusted as complete.
+
+        Scope (deliberate): this flags the *paused* state — the steady
+        state the cursor lands on, since a generator races to its first
+        cap in microseconds. It does NOT flag the sub-cap window while a
+        generator is still actively draining (not yet paused); catching
+        that would mean tracking in-flight fetch state cross-thread and
+        risks false positives on settled string previews. The window is
+        negligible for the CPU-bound generators recipes use, and even
+        then v/e are no worse than the pre-fix cache read.
+        """
+        with self._preview_lock:
+            paused = self._preview_paused
+            return paused is not None and paused.get('id') == item_id
+
     def _stream_preview_from_generator(self, item_id, gen):
         """Drain a ``get_preview`` generator into ``append_preview``.
 
@@ -17673,6 +17700,7 @@ and the pick/insert flows is deferred to phase 2 — phase 1 keeps the
 dispatcher minimal and explicit.
 """
 
+import inspect
 import os
 import shlex
 import signal
@@ -18050,17 +18078,31 @@ def _run_external_on_preview(ctx, *, env_var, default):
     tempfile is deleted in a ``finally`` so a crashed editor still
     cleans up.
 
+    v/e mean "give me the WHOLE thing", so this always resolves the
+    *complete* preview — including for streaming (generator) previews,
+    whose cached ``item.preview`` is only a partial prefix while the
+    worker is paused at the buffer cap (``_stream_preview_from_generator``).
+
     Resolution order for the preview text:
 
-      1. ``item.preview`` — used as-is when present, including the
-         empty string (legitimate empty content).
-      2. Synchronous fetch via ``browser.get_preview(item.id)`` — works
-         even when the preview pane is hidden or the async worker has
-         not delivered yet. The result is cached so a subsequent toggle
-         of the preview pane skips the refetch.
-      3. If neither is available — ``browser.get_preview`` is ``None``
+      1. ``item.preview`` — used as-is when present (including the empty
+         string, legitimate empty content) AND the cache is complete,
+         i.e. ``browser.preview_cache_is_partial(item.id)`` is ``False``.
+         Covers string previews, exhausted generators and push-mode
+         content.
+      2. Otherwise (cache absent, or a paused partial stream) a
+         synchronous fetch via ``browser.get_preview(item.id)``. A
+         generator result is drained to its end — that's the fix for
+         the truncated-pager bug. A drained generator is NOT written
+         back to ``item.preview``: a live worker may still hold a
+         paused generator for this id whose scroll-resume appends from
+         where it left off, so overwriting its cache would desync it.
+         A non-generator string IS cached on a true cache miss (the
+         old pane-toggle optimisation, unchanged).
+      3. If nothing is available — ``browser.get_preview`` is ``None``
          or the fetcher returned ``None``/raised — surface a message
-         and skip the external command.
+         and skip the external command (falling back to a partial cache
+         when one exists rather than showing nothing).
 
     Resolves the active row from ``ctx.visible_items[cursor_index]``
     so the scope row at depth 0 (when scoped) is operable too. Only
@@ -18082,22 +18124,51 @@ def _run_external_on_preview(ctx, *, env_var, default):
     if get_preview is None:
         ctx.flash('No preview available')
         return
-    text = getattr(item, 'preview', None)
-    if text is None:
-        # Cache miss — fetch synchronously. The preview pane may be
-        # hidden, or the async worker may not have run yet; either way
-        # the user pressed v/e meaning "I want this now", so blocking
-        # briefly on the recipe's get_preview is acceptable.
+    cached = getattr(item, 'preview', None)
+    if cached is not None and not ctx._browser.preview_cache_is_partial(item.id):
+        # Complete cache — use it as-is (string preview, exhausted
+        # generator, or push-mode content).
+        text = cached
+    else:
+        # Cache miss OR a paused partial stream — fetch synchronously and
+        # fully materialise. The preview pane may be hidden, the async
+        # worker may not have run yet, or it may have parked a generator
+        # at the buffer cap; either way the user pressed v/e meaning "I
+        # want the whole thing now", so blocking briefly on the recipe's
+        # get_preview is acceptable.
         try:
-            text = get_preview(item.id)
+            result = get_preview(item.id)
         except Exception as e:
             ctx.error(f'preview: {type(e).__name__}: {e}')
             return
-        if text is None:
+        if inspect.isgenerator(result):
+            # Streaming pull source — drain to the end for the complete
+            # text. Coerce chunks like the streaming worker does. Do NOT
+            # cache the drained text: a live worker may still hold a
+            # paused generator for this id and overwriting its partial
+            # cache would desync the scroll-resume path.
+            try:
+                text = ''.join(
+                    chunk if isinstance(chunk, str)
+                    else ('' if chunk is None else str(chunk))
+                    for chunk in result
+                )
+            except Exception as e:
+                ctx.error(f'preview: {type(e).__name__}: {e}')
+                return
+        elif result is not None:
+            text = result
+            # Cache the full string on a true cache miss so a later
+            # preview-pane toggle skips the refetch (unchanged behaviour).
+            if cached is None:
+                item.preview = text
+        elif cached is not None:
+            # Re-fetch yielded nothing usable — fall back to the partial
+            # cache rather than showing nothing.
+            text = cached
+        else:
             ctx.flash('No preview available')
             return
-        # Cache so the preview pane (if shown later) skips the refetch.
-        item.preview = text
     cmd = os.environ.get(env_var) or default
     with tempfile.NamedTemporaryFile(
             mode='wb', prefix='browse-tui-', suffix='.txt', delete=False) as f:
