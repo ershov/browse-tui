@@ -1,7 +1,7 @@
 """Unit tests for the ``recipes/browse-plan`` context menu (ticket #1032).
 
 A browse-plan row is a ticket (a bare ``int`` id); the synthetic Project sits
-at id=0 and the markdown launcher / umbrella rows carry tuple ids. Following
+at id=0 and gets no ticket menu. Following
 the committed convention (browse-ps pilot, browse-git / browse-claude) the
 option list is a PURE builder, ``context_menu_options(ctx)``, that inspects
 ``ctx.cursor`` / ``ctx.selected`` and returns ``(label, token)`` rows WITHOUT
@@ -43,12 +43,12 @@ def _stub_browse_tui():
     """Insert a no-op ``browse_tui`` module so the recipe can import.
 
     The recipe pulls ``Action`` / ``Browser`` / ``BrowserConfig`` / ``Item`` /
-    ``mod`` / ``recipe_argv`` / ``upsert`` from ``browse_tui``. The pure
-    builders under test don't exercise the Browser stub (the cursor item comes
-    from the REAL headless Browser below); ``upsert`` / ``mod`` are only used by
-    the mutation handlers, which the tests drive with a stubbed ``_run_plan``,
-    so simple sentinels are enough. A fresh module each call keeps a stub left
-    by another recipe's test from bleeding in.
+    ``recipe_argv`` / ``upsert`` from ``browse_tui``. The pure builders under
+    test don't exercise the Browser stub (the cursor item comes from the REAL
+    headless Browser below); ``upsert`` is only used by the mutation handlers,
+    which the tests drive with a stubbed ``_run_plan``, so a simple sentinel is
+    enough. A fresh module each call keeps a stub left by another recipe's test
+    from bleeding in.
     """
     mod = types.ModuleType('browse_tui')
 
@@ -62,7 +62,6 @@ def _stub_browse_tui():
     mod.Browser = _Stub
     mod.BrowserConfig = _Stub
     mod.Item = _Stub
-    mod.mod = lambda *a, **kw: ('mod', a, kw)
     mod.upsert = lambda *a, **kw: ('upsert', a, kw)
     mod.recipe_argv = lambda: []
     sys.modules['browse_tui'] = mod
@@ -173,10 +172,10 @@ class TestMenuRows(unittest.TestCase):
         ctx = self._ctx(Item(id=0, title='Project', tag=''))
         self.assertEqual(self.r.context_menu_options(ctx), [])
 
-    def test_no_menu_for_launcher_tuple_id(self):
-        # A markdown launcher / umbrella row carries a tuple id → no ticket
-        # menu (those rows have no ticket mutations).
-        ctx = self._ctx(Item(id=('launch', 5, 'file', '/x.md'), title='↗'))
+    def test_no_menu_for_non_ticket_id(self):
+        # Defensive: only real int ticket ids get the ticket menu; a non-int
+        # id (anything that isn't a ticket row) yields no menu.
+        ctx = self._ctx(Item(id=('not', 'a', 'ticket'), title='x'))
         self.assertEqual(self.r.context_menu_options(ctx), [])
 
     def test_no_menu_without_cursor(self):
