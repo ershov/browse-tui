@@ -191,14 +191,75 @@ def _parse_ticket_line(line):
 
 # ---- data callbacks ------------------------------------------------------
 #
-# ``parent_id`` maps as follows:
+# The whole ticket tree is loaded once (``_load_tree`` — a single ``plan
+# list``) and cached as ``{parent_id: [Item]}``; expansion is then an
+# in-memory lookup rather than a ``plan -r list`` per level (mirroring
+# plan-tui's ``all_tickets`` and browse-ps's ``_snapshot``). ``parent_id``
+# maps as follows:
 #   - ``None`` (Browser root)        -> the synthetic Project + root tickets.
-#   - ``0`` (Project synthetic id)   -> all root-level tickets via plan list.
-#   - any positive int               -> direct children of ticket ``parent_id``.
+#   - any positive int               -> that ticket's direct subtasks.
+#   - ``('md-refs', tid)``           -> the ticket's [md] launcher rows.
+
+
+# Whole-tree cache: ``{parent_id: [Item, ...]}`` from a single ``plan list``,
+# shared by every ``get_children`` until the next reload. ``None`` until the
+# first load. plan emits each ticket's parent column (root tickets carry
+# parent ``0``), so one grouped pass yields the full tree — no per-level fetch.
+_TREE = None
+
+
+def _load_tree(*, reload=False):
+    """Return the whole ticket tree as ``{parent_id: [Item, ...]}``.
+
+    One ``plan list`` returns every ticket with its ``parent`` column; we
+    group those into the per-parent lists expansion indexes into (root
+    tickets, parent ``0``, live under key ``0``). The result is cached in
+    ``_TREE`` and reused until the next reload, so drilling into a subtree
+    is an in-memory lookup, not a ``plan -r list`` per level.
+
+    Resamples (one ``plan list``) when ``reload=True`` OR nothing is cached
+    yet. The framework enqueues only the root with ``reload=True`` on a full
+    refresh — descendant re-fetches and lazy expansions pass ``reload=False``
+    — so exactly one ``plan list`` runs per reload cycle and every
+    ``get_children`` in it shares the result (the same contract browse-ps's
+    ``_snapshot`` relies on). A failed call leaves the previous tree intact
+    (an empty tree on the very first load).
+    """
+    global _TREE
+    if not reload and _TREE is not None:
+        return _TREE
+    result = _run_plan('list', '--format', _LIST_FORMAT)
+    if result.returncode != 0:
+        if _TREE is None:
+            _TREE = {}
+        return _TREE
+    tree = {}
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split('\t', 5)
+        if len(parts) < 6:
+            continue
+        try:
+            parent = int(parts[1])
+        except ValueError:
+            continue
+        it = _parse_ticket_line(line)
+        if it is not None:
+            tree.setdefault(parent, []).append(it)
+    _TREE = tree
+    return _TREE
 
 
 def get_children(parent_id, *, reload=False):
-    """Lazy children fetch via the ``plan`` CLI.
+    """Children of ``parent_id``, served from the whole-tree cache.
+
+    The tree is loaded once by ``_load_tree`` (a single ``plan list``); this
+    callback only indexes into it, so expansion never shells out per level.
+    A full refresh arrives as the root call with ``reload=True`` — we rebuild
+    the cache once here, and the descendant re-fetches that follow (all
+    ``reload=False``) read the fresh copy.
 
     Plan-tui's behaviour for the root scope: synthesize a "Project" entry
     at id=0 above the real root tickets so the user can ``view`` /
@@ -211,6 +272,12 @@ def get_children(parent_id, *, reload=False):
     own id is the tuple ``('md-refs', tid)`` — expanding it yields the
     per-file launcher rows (``_ticket_md_children``).
     """
+    # A full refresh re-runs ``plan list`` once: the framework sends
+    # ``reload=True`` only on the root call, so rebuild the shared cache here
+    # before any branch reads it (descendant calls pass ``reload=False``).
+    if reload:
+        _load_tree(reload=True)
+
     # The ``[md] References`` umbrella under a ticket — its launcher rows.
     # id = ('md-refs', tid). Distinct from the int ticket ids so the two route
     # apart here and in ``get_preview`` / ``on_enter``.
@@ -244,59 +311,21 @@ def get_children(parent_id, *, reload=False):
 def _list_subtasks(parent_id):
     """The direct subtasks of ticket ``parent_id`` as ``Item``s.
 
-    plan-tui uses ``-r list`` and post-filters by depth (the parent always sits
-    at the smallest depth in the result; direct children are at
-    parent_depth + 1).
+    A lookup into the whole-tree cache (``_load_tree``): plan groups every
+    ticket under its parent's id, so a ticket's subtasks are just its entry
+    there — empty when it has none.
     """
-    result = _run_plan(str(parent_id), '-r', 'list', '--format', _LIST_FORMAT)
-    if result.returncode != 0:
-        return []
-    lines = [ln for ln in result.stdout.splitlines() if ln.strip()]
-    if not lines:
-        return []
-    parsed = [(_parse_ticket_line(ln), _depth_of(ln)) for ln in lines]
-    parsed = [(it, d) for (it, d) in parsed if it is not None]
-    if not parsed:
-        return []
-    parent_depth = parsed[0][1]
-    child_depth = parent_depth + 1
-    return [it for (it, d) in parsed if d == child_depth and it.id != parent_id]
-
-
-def _depth_of(line):
-    """Return the depth column from a ``_LIST_FORMAT`` line, or -1."""
-    parts = line.split('\t', 5)
-    if len(parts) < 6:
-        return -1
-    try:
-        return int(parts[4])
-    except ValueError:
-        return -1
+    return _load_tree().get(parent_id, [])
 
 
 def _list_root_tickets():
-    """Return the root-level tickets as ``Item`` objects."""
-    result = _run_plan('list', '--format', _LIST_FORMAT)
-    if result.returncode != 0:
-        return []
-    items = []
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        # Filter to the topmost depth — plan list emits the entire tree
-        # and we only want the roots here. Any deeper rows are reachable
-        # via expansion (which calls get_children with the real id).
-        try:
-            depth = int(line.split('\t', 5)[4])
-        except (ValueError, IndexError):
-            continue
-        if depth != 0:
-            continue
-        it = _parse_ticket_line(line)
-        if it is not None:
-            items.append(it)
-    return items
+    """The root-level tickets (parent ``0``) as ``Item``s.
+
+    Root tickets carry parent ``0`` in ``plan list`` output, so they live
+    under key ``0`` in the whole-tree cache (``_load_tree``); deeper rows are
+    reached by expansion, which indexes the same cache by the real ticket id.
+    """
+    return _load_tree().get(0, [])
 
 
 def get_preview(item_id):
