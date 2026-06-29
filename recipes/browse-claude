@@ -1263,6 +1263,28 @@ _L3_USEFUL = frozenset([
 ])
 
 
+def _is_empty_thinking_only(rec):
+    """True iff this record's only content is empty ``thinking`` parts.
+
+    Signature-only (redacted/encrypted) thinking blocks store a
+    ``signature`` but no readable ``thinking`` text. A turn made up
+    solely of such parts has nothing to render — ``_extract_text`` skips
+    thinking, so it summarises as the bare ``<N parts>`` shape — so
+    ``_record_min_level`` sinks it to the ``all`` (4) tier. A thinking
+    part with actual text, or any other part (tool_use / tool_result /
+    text) alongside, fails the test and keeps the record at level 2.
+    """
+    msg = rec.get('message') if isinstance(rec.get('message'), dict) else {}
+    content = msg.get('content')
+    if not isinstance(content, list) or not content:
+        return False
+    return all(
+        isinstance(p, dict) and p.get('type') == 'thinking'
+        and not (p.get('thinking') or '').strip()
+        for p in content
+    )
+
+
 def _record_min_level(rec):
     """Minimum detail level at which ``rec`` becomes visible (1-4).
 
@@ -1273,8 +1295,9 @@ def _record_min_level(rec):
 
       * ``isMeta`` (injected context; never lived)        → 4
       * voice (``_is_voice``)                              → 1
+      * empty (signature-only) thinking-only assistant     → 4
       * user / assistant machinery (tool_use, tool_result,
-        thinking-only)                                     → 2
+        thinking-only with text)                           → 2
       * ``_LIVE_EXTRAS`` framing (system turn_duration /
         api_error)                                         → 2
       * ``_L3_USEFUL`` curated metadata                    → 3
@@ -1289,8 +1312,15 @@ def _record_min_level(rec):
     if _is_voice(rec):
         return 1
     t = rec.get('type')
+    # An assistant turn whose only content is empty (signature-only /
+    # redacted) thinking carries no readable text — it would render as a
+    # bare ``<N parts>`` row — so it sinks to ``all`` (4) rather than
+    # cluttering the level-2 machinery view.
+    if t == 'assistant' and _is_empty_thinking_only(rec):
+        return 4
     # The rest of a user/assistant turn as it was lived: tool_use,
-    # tool_result, thinking-only — everything _is_voice() rejected.
+    # tool_result, thinking-only (with text) — everything _is_voice()
+    # rejected.
     if t in ('user', 'assistant'):
         return 2
     if t == 'system':

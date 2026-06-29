@@ -6626,9 +6626,28 @@ class TestRecordMinLevel(unittest.TestCase):
                             'content': 'ok'}]}}
         self.assertEqual(self.r._record_min_level(rec), 2)
 
-    def test_assistant_thinking_only_is_level_2(self):
+    def test_assistant_thinking_only_with_text_is_level_2(self):
+        # Thinking *with* readable text is lived machinery — level 2.
         rec = {'type': 'assistant', 'message': {'role': 'assistant',
                'content': [{'type': 'thinking', 'thinking': 'hmm'}]}}
+        self.assertEqual(self.r._record_min_level(rec), 2)
+
+    def test_assistant_empty_thinking_only_is_level_4(self):
+        # Signature-only (redacted) thinking has no readable text — it
+        # renders as a bare ``<N parts>`` row, so it sinks to ``all`` (4).
+        rec = {'type': 'assistant', 'message': {'role': 'assistant',
+               'content': [{'type': 'thinking', 'thinking': '',
+                            'signature': 'ErAIC..='}]}}
+        self.assertEqual(self.r._record_min_level(rec), 4)
+
+    def test_assistant_empty_thinking_with_tool_use_is_level_2(self):
+        # An empty thinking part alongside a real tool_use is still a
+        # lived tool call — not demoted.
+        rec = {'type': 'assistant', 'message': {'role': 'assistant',
+               'content': [{'type': 'thinking', 'thinking': '',
+                            'signature': 'sig'},
+                           {'type': 'tool_use', 'id': 't', 'name': 'Bash',
+                            'input': {'command': 'ls'}}]}}
         self.assertEqual(self.r._record_min_level(rec), 2)
 
     def test_system_turn_duration_is_level_2(self):
