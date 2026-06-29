@@ -958,15 +958,15 @@ class TestDispatchReusesActions(unittest.TestCase):
 
 
 class TestDetailLevelBindings(unittest.TestCase):
-    """The detail filter is driven by the absolute ``1``-``4`` key
+    """The detail filter is driven by the absolute ``1``-``6`` key
     bindings; the old ``.`` toggle is gone (#1153)."""
 
-    def test_four_detail_level_actions_present_and_dot_gone(self):
+    def test_six_detail_level_actions_present_and_dot_gone(self):
         # The bindings live in the global Action list, not the context
         # menu — inspect the recipe source for them.
         with open(_RECIPE) as f:
             source = f.read()
-        for key in ('1', '2', '3', '4'):
+        for key in ('1', '2', '3', '4', '5', '6'):
             self.assertIn(f"Action('{key}',", source,
                           f"missing detail-level binding for '{key}'")
         self.assertIn('_set_detail_level', source)

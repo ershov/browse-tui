@@ -1246,19 +1246,19 @@ def _is_voice(obj):
     return False
 
 
-# Framing records that belong to "the conversation as lived" (level 2)
-# even though they aren't user/assistant turns: the per-turn duration
-# stamp and the inline api_error banner. (type, subtype) keys.
+# Framing records that belong to "the conversation as lived" (level 4,
+# tools) even though they aren't user/assistant turns: the per-turn
+# duration stamp and the inline api_error banner. (type, subtype) keys.
 _LIVE_EXTRAS = frozenset([
     ('system', 'turn_duration'),
     ('system', 'api_error'),
 ])
 
-# Curated allowlist of useful metadata surfaced at level 3. Plain
-# strings match a record ``type`` outright; tuples match (type, subtype)
-# for the finer-grained ``system`` / ``attachment`` families. Anything
-# not listed here (and not caught by an earlier tier) falls through to
-# level 4.
+# Curated allowlist of useful metadata surfaced at level 5 (detailed).
+# Plain strings match a record ``type`` outright; tuples match (type,
+# subtype) for the finer-grained ``system`` / ``attachment`` families.
+# Anything not listed here (and not caught by an earlier tier) falls
+# through to level 6 (all).
 _L3_USEFUL = frozenset([
     'summary',
     'task-summary',
@@ -1284,9 +1284,10 @@ def _is_empty_thinking_only(rec):
     ``signature`` but no readable ``thinking`` text. A turn made up
     solely of such parts has nothing to render — ``_extract_text`` skips
     thinking, so it summarises as the bare ``<N parts>`` shape — so
-    ``_record_min_level`` sinks it to the ``all`` (4) tier. A thinking
+    ``_record_min_level`` sinks it to the ``all`` (6) tier. A thinking
     part with actual text, or any other part (tool_use / tool_result /
-    text) alongside, fails the test and keeps the record at level 2.
+    text) alongside, fails the test and keeps the record at level 4
+    (or 3 for an edit/write tool).
     """
     msg = rec.get('message') if isinstance(rec.get('message'), dict) else {}
     content = msg.get('content')
@@ -1299,60 +1300,106 @@ def _is_empty_thinking_only(rec):
     )
 
 
+# File-mutating tools, surfaced at the "edits" level (3) — below the full
+# "tools" view (4) — so a reviewer sees what changed without the Read /
+# Bash / Grep noise.
+_EDIT_TOOLS = frozenset(['Edit', 'Write', 'NotebookEdit', 'MultiEdit'])
+
+
+def _is_end_turn(rec):
+    """True iff this assistant record concluded its turn.
+
+    ``message.stop_reason == 'end_turn'`` is the agent's final spoken
+    response of a turn (as opposed to a ``tool_use`` stop that pauses to
+    call a tool). Together with the turn-root user prompt it forms the
+    ``summary`` tier.
+    """
+    if not isinstance(rec, dict) or rec.get('type') != 'assistant':
+        return False
+    msg = rec.get('message')
+    return isinstance(msg, dict) and msg.get('stop_reason') == 'end_turn'
+
+
+def _is_edit_tool_record(rec):
+    """True iff this assistant record carries a tool_use for a
+    file-mutating tool (``_EDIT_TOOLS``) — drives the ``edits`` tier."""
+    if not isinstance(rec, dict) or rec.get('type') != 'assistant':
+        return False
+    msg = rec.get('message') if isinstance(rec.get('message'), dict) else {}
+    content = msg.get('content')
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(p, dict) and p.get('type') == 'tool_use'
+        and p.get('name') in _EDIT_TOOLS
+        for p in content
+    )
+
+
 def _record_min_level(rec):
-    """Minimum detail level at which ``rec`` becomes visible (1-4).
+    """Minimum detail level at which ``rec`` becomes visible (1-6).
 
     Whitelist semantics: only records we recognise are promoted to a
-    lower (more-visible) tier; anything unmatched falls through to 4 so
-    new/unknown record kinds surface only at level 4 (all) but stay out
+    lower (more-visible) tier; anything unmatched falls through to 6 so
+    new/unknown record kinds surface only at level 6 (all) but stay out
     of the leaner views.
 
-      * ``isMeta`` (injected context; never lived)        → 4
-      * voice (``_is_voice``)                              → 1
-      * empty (signature-only) thinking-only assistant     → 4
-      * user / assistant machinery (tool_use, tool_result,
-        thinking-only with text)                           → 2
+      * ``isMeta`` (injected context; never lived)        → 6
+      * turn-root user prompt / assistant ``end_turn``     → 1  (summary)
+      * any other voice (``_is_voice``)                    → 2  (voice)
+      * empty (signature-only) thinking-only assistant     → 6
+      * an Edit/Write/NotebookEdit/MultiEdit tool record   → 3  (edits)
+      * other user / assistant machinery (tool_use,
+        tool_result, thinking-only with text)              → 4  (tools)
       * ``_LIVE_EXTRAS`` framing (system turn_duration /
-        api_error)                                         → 2
-      * ``_L3_USEFUL`` curated metadata                    → 3
-      * otherwise                                          → 4
+        api_error)                                         → 4
+      * ``_L3_USEFUL`` curated metadata                    → 5  (detailed)
+      * otherwise                                          → 6  (all)
     """
     if not isinstance(rec, dict):
-        return 4
+        return 6
     # Injected context is never part of the lived conversation — it
     # outranks even its own type, so check it first.
     if rec.get('isMeta'):
-        return 4
+        return 6
     if _is_voice(rec):
-        return 1
+        # The conversation skeleton — the user's prompt and the agent's
+        # final (end_turn) response — is the summary tier; intermediate
+        # voice (running commentary, AskUserQuestion, inter-agent) sits
+        # one level up.
+        if _is_turn_root(rec) or _is_end_turn(rec):
+            return 1
+        return 2
     t = rec.get('type')
     # An assistant turn whose only content is empty (signature-only /
     # redacted) thinking carries no readable text — it would render as a
-    # bare ``<N parts>`` row — so it sinks to ``all`` (4) rather than
-    # cluttering the level-2 machinery view.
+    # bare ``<N parts>`` row — so it sinks to ``all`` (6) rather than
+    # cluttering the leaner machinery views.
     if t == 'assistant' and _is_empty_thinking_only(rec):
-        return 4
-    # The rest of a user/assistant turn as it was lived: tool_use,
-    # tool_result, thinking-only (with text) — everything _is_voice()
-    # rejected.
+        return 6
     if t in ('user', 'assistant'):
-        return 2
+        # File-mutating tool calls get their own "edits" tier; the rest
+        # of a turn's machinery (other tool_use, tool_result,
+        # thinking-only with text) is the tools tier.
+        if _is_edit_tool_record(rec):
+            return 3
+        return 4
     if t == 'system':
         sub = rec.get('subtype')
         if (t, sub) in _LIVE_EXTRAS:
-            return 2
+            return 4
         if (t, sub) in _L3_USEFUL:
-            return 3
-        return 4
+            return 5
+        return 6
     if t == 'attachment':
         a = rec.get('attachment')
         sub = a.get('type') if isinstance(a, dict) else None
         if (t, sub) in _L3_USEFUL:
-            return 3
-        return 4
+            return 5
+        return 6
     if t in _L3_USEFUL:
-        return 3
-    return 4
+        return 5
+    return 6
 
 
 def _passes_filter(item_id, td=None):
@@ -1365,13 +1412,15 @@ def _passes_filter(item_id, td=None):
 
     Predicate body, by id tag:
       * ``('msg', jsonl, n)``    → ``_record_min_level(td.records[n])``
-      * ``('prompt', jsonl, n)`` → always (turns open at a user voice,
-                                    level 1)
+      * ``('prompt', jsonl, n)`` → always (turns open at a turn-root
+                                    user prompt, level 1)
       * ``('tool', jsonl, n)``   → its assistant record's min level
-                                    (a bare tool_use is level 2), but
-                                    promoted to voice (level 1) when the
-                                    umbrella wraps a resolvable subagent
-                                    (same rule as ``_tool_umbrella_item``)
+                                    (a bare tool_use is level 4, an
+                                    edit/write tool level 3), but
+                                    promoted to the voice tier (level 2)
+                                    when the umbrella wraps a resolvable
+                                    subagent (same rule as
+                                    ``_tool_umbrella_item``)
       * ``('span', jsonl, n)``   → min level over the span's members
       * ``('agent', …)``         → always (subagent umbrella; we don't
                                     peek into other files at filter time)
@@ -1379,7 +1428,7 @@ def _passes_filter(item_id, td=None):
                                     error rows and ``('trunc', …)``
                                     fillers stay visible)
     """
-    if _DETAIL_LEVEL >= 4:
+    if _DETAIL_LEVEL >= 6:
         return True
     if not isinstance(item_id, tuple) or not item_id:
         return True
@@ -1400,14 +1449,14 @@ def _passes_filter(item_id, td=None):
             rec = td.records[n]
             if isinstance(rec, dict):
                 # A ``<tool:Agent>`` umbrella that dispatches a
-                # resolvable subagent reads as voice (level 1) — the
+                # resolvable subagent reads as voice-tier (level 2) — the
                 # subagent's voice marker propagates up through the
                 # umbrella, same rule that gives it its row stripe in
                 # ``_tool_umbrella_item``. Otherwise it carries its
                 # assistant record's own min level (a bare tool_use is
-                # level 2).
+                # level 4; an edit/write tool is level 3).
                 if _tool_umbrella_wraps_subagent(rec, td):
-                    return True
+                    return _DETAIL_LEVEL >= 2
                 return _record_min_level(rec) <= _DETAIL_LEVEL
         return True
     if tag == 'span':
@@ -4461,9 +4510,10 @@ _SCAN_LOCKS = {}            # path → threading.Lock
 _SCAN_LOCKS_LOCK = threading.Lock()
 _TREE_MODE = True  # default; --no-tree CLI flag or 't' action flips it.
 # Detail level: a record is visible iff its *minimum* level (see
-# ``_record_min_level``) is <= this. 1=voice, 2=tools, 3=detailed,
-# 4=all. Default 1 (voice-only). Set by the --detail CLI flag or
-# changed live with the '1'-'4' key bindings.
+# ``_record_min_level``) is <= this. 1=summary, 2=voice, 3=edits,
+# 4=tools, 5=detailed, 6=all. Default 1 (summary — user prompts +
+# end_turn responses). Set by the --detail CLI flag or changed live
+# with the '1'-'6' key bindings.
 _DETAIL_LEVEL = 1
 
 
@@ -7338,24 +7388,26 @@ def _action_toggle_tree(ctx):
         )
 
 
-_DETAIL_LEVEL_NAMES = {1: 'voice', 2: 'tools', 3: 'detailed', 4: 'all'}
+_DETAIL_LEVEL_NAMES = {1: 'summary', 2: 'voice', 3: 'edits',
+                       4: 'tools', 5: 'detailed', 6: 'all'}
 # Word aliases for the ``--detail`` CLI flag, derived from the level
-# names so the two never drift (voice=1, tools=2, detailed=3, all=4).
+# names so the two never drift (summary=1, voice=2, edits=3, tools=4,
+# detailed=5, all=6).
 _DETAIL_LEVEL_ALIASES = {name: level for level, name in _DETAIL_LEVEL_NAMES.items()}
 
 
 def _parse_detail_level(raw):
-    """Convert a ``--detail`` value to a level int (1-4).
+    """Convert a ``--detail`` value to a level int (1-6).
 
-    Accepts the digits ``'1'``-``'4'`` and the word aliases
-    (``voice``/``tools``/``detailed``/``all``, case-insensitively).
-    Raises ``ValueError`` on anything else so ``_pop_value`` surfaces
-    the usage error to ``main``.
+    Accepts the digits ``'1'``-``'6'`` and the word aliases
+    (``summary``/``voice``/``edits``/``tools``/``detailed``/``all``,
+    case-insensitively). Raises ``ValueError`` on anything else so
+    ``_pop_value`` surfaces the usage error to ``main``.
     """
     key = raw.strip().lower()
     if key in _DETAIL_LEVEL_ALIASES:
         return _DETAIL_LEVEL_ALIASES[key]
-    if key in ('1', '2', '3', '4'):
+    if key in ('1', '2', '3', '4', '5', '6'):
         return int(key)
     raise ValueError(raw)
 
@@ -7363,7 +7415,7 @@ def _parse_detail_level(raw):
 def _set_detail_level(ctx, level):
     """Set the detail level absolutely and recompute row visibility.
 
-    Bound to the ``1``-``4`` keys (each an absolute setter, not a
+    Bound to the ``1``-``6`` keys (each an absolute setter, not a
     toggle). Sets ``_DETAIL_LEVEL``, then iterates every currently-
     loaded ``Item`` and emits a single ``mod(id, hidden=...)`` batch
     with one op per row whose target visibility differs from its
@@ -7890,10 +7942,11 @@ Usage: browse-claude [OPTIONS] [PROJECT]
   --tree          Show sessions as a tree, grouped by turn (default).
                   Subagents nest inline under their assistant rows.
   --no-tree       Show sessions as a flat reverse-time list.
-  --detail LEVEL  Detail level (default: 1). LEVEL is 1-4 or a word:
-                  1=voice (speech only), 2=tools (the lived turn),
-                  3=detailed (+ useful metadata), 4=all. Change it live
-                  with the '1'-'4' keys.
+  --detail LEVEL  Detail level (default: 1). LEVEL is 1-6 or a word:
+                  1=summary (user prompts + end_turn responses),
+                  2=voice (all speech), 3=edits (+ Edit/Write/NotebookEdit),
+                  4=tools (+ all tool calls), 5=detailed (+ useful
+                  metadata), 6=all. Change it live with the '1'-'6' keys.
   PROJECT         Project directory name under ~/.claude/projects/ to
                   drill into on launch. Ignored when --session / --pid /
                   --file is given.\
@@ -7914,7 +7967,8 @@ a transcript with Right/Alt-Down; preview shows the rendered turn.
   M       render the preview via $MDCAT / mdcat (external).
   J / K   jump cursor to next / previous user-or-assistant voice.
   t       toggle flat / tree view.
-  1-4     detail level: 1 voice, 2 tools, 3 detailed, 4 all.
+  1-6     detail level: 1 summary, 2 voice, 3 edits, 4 tools,
+          5 detailed, 6 all.
 
 Right-click a row (or the backslash / F1 keys) for a menu: message and
 turn / tool / span umbrella rows offer the source actions above
@@ -7950,14 +8004,14 @@ def main():
     elif no_tree_flag:
         _TREE_MODE = False
 
-    # Detail level: voice-only (level 1) by default. --detail LEVEL
-    # (or --detail=LEVEL) sets it, accepting the digits 1-4 or the word
-    # aliases voice/tools/detailed/all. An invalid value pops as the
-    # ``False`` sentinel — report it as a usage error.
+    # Detail level: summary (level 1) by default. --detail LEVEL
+    # (or --detail=LEVEL) sets it, accepting the digits 1-6 or the word
+    # aliases summary/voice/edits/tools/detailed/all. An invalid value
+    # pops as the ``False`` sentinel — report it as a usage error.
     detail_arg = _pop_value('--detail', _parse_detail_level)
     if detail_arg is False:
-        print('browse-claude: --detail must be 1-4 or one of '
-              'voice/tools/detailed/all', file=sys.stderr)
+        print('browse-claude: --detail must be 1-6 or one of '
+              'summary/voice/edits/tools/detailed/all', file=sys.stderr)
         sys.exit(2)
     if detail_arg is not None:
         _DETAIL_LEVEL = detail_arg
@@ -8088,13 +8142,15 @@ def main():
             Action('J',     'Jump to next voice (user/asst)',  _action_next_voice,  'none'),
             Action('K',     'Jump to prev voice (user/asst)',  _action_prev_voice,  'none'),
             Action('t',     'Toggle flat / tree view',         _action_toggle_tree, 'none'),
-            # Detail level (absolute setters): 1=voice, 2=tools,
-            # 3=detailed, 4=all. Each sets _DETAIL_LEVEL and recomputes
-            # row visibility (see _set_detail_level).
-            Action('1',     'Detail: voice',                   lambda c: _set_detail_level(c, 1), 'none'),
-            Action('2',     'Detail: tools',                   lambda c: _set_detail_level(c, 2), 'none'),
-            Action('3',     'Detail: detailed',                lambda c: _set_detail_level(c, 3), 'none'),
-            Action('4',     'Detail: all',                     lambda c: _set_detail_level(c, 4), 'none'),
+            # Detail level (absolute setters): 1=summary, 2=voice,
+            # 3=edits, 4=tools, 5=detailed, 6=all. Each sets _DETAIL_LEVEL
+            # and recomputes row visibility (see _set_detail_level).
+            Action('1',     'Detail: summary',                 lambda c: _set_detail_level(c, 1), 'none'),
+            Action('2',     'Detail: voice',                   lambda c: _set_detail_level(c, 2), 'none'),
+            Action('3',     'Detail: edits',                   lambda c: _set_detail_level(c, 3), 'none'),
+            Action('4',     'Detail: tools',                   lambda c: _set_detail_level(c, 4), 'none'),
+            Action('5',     'Detail: detailed',                lambda c: _set_detail_level(c, 5), 'none'),
+            Action('6',     'Detail: all',                     lambda c: _set_detail_level(c, 6), 'none'),
             # Right: the framework default expands a collapsed row; the
             # ``on_expand`` / ``on_children_loaded`` hooks then jump the
             # cursor to the latest voice (for every expansion source, not

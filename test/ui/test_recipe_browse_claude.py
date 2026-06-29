@@ -198,10 +198,10 @@ class TestBrowseClaude(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             _make_fake_claude(tmp)
             with TmuxFixture(cols=120, rows=30, env=self._launch_env(tmp)) as t:
-                # --detail 4 (all): the fixture's records (last-prompt,
-                # permission-mode) are machinery the level-1 default
+                # --detail all: the fixture's records (last-prompt,
+                # permission-mode) are machinery the summary default
                 # would hide; this test asserts every per-line record.
-                t.launch(_BIN, '--run-py', _RECIPE, '--detail', '4')
+                t.launch(_BIN, '--run-py', _RECIPE, '--detail', 'all')
                 t.wait_for('/home/test/project')
                 t.send('Right')
                 t.wait_for('abcd1234-deadbeef')
@@ -214,16 +214,18 @@ class TestBrowseClaude(unittest.TestCase):
                 t.send('q')
 
     def test_detail_level_keys_change_row_visibility(self):
-        """The ``1``-``4`` keys set the detail level; rows appear/vanish.
+        """The ``1``-``6`` keys set the detail level; rows appear/vanish.
 
         Flat mode so each record is its own row and ``_passes_filter``
         gates it directly (tree mode would wrap them in umbrellas). The
         session mixes one record per tier:
 
-          * level 1 voice    — user ``DETAILVOICE``
-          * level 2 tools    — assistant tool_use ``DETAILTOOL``
-          * level 3 detailed — ``tag: DETAILTAG``
-          * level 4 all      — ``permission-mode`` (unknown tier → 4)
+          * 1 summary  — user prompt ``DETAILPROMPT`` + end_turn ``DETAILEND``
+          * 2 voice    — intermediate assistant text ``DETAILVOICE``
+          * 3 edits    — Edit tool_use ``DETAILEDIT``
+          * 4 tools    — Bash tool_use ``DETAILTOOL``
+          * 5 detailed — ``tag: DETAILTAG``
+          * 6 all      — ``permission-mode`` (unknown tier → 6)
 
         Row visibility is the list contents, which IS visible to tmux
         (unlike reverse-video), so we assert on capture text presence /
@@ -235,8 +237,19 @@ class TestBrowseClaude(unittest.TestCase):
             sess = os.path.join(proj, 'levels.jsonl')
             recs = [
                 {'type': 'user', 'uuid': 'u1', 'parentUuid': None,
-                 'message': {'role': 'user', 'content': 'DETAILVOICE'}},
-                {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'u1',
+                 'message': {'role': 'user', 'content': 'DETAILPROMPT'}},
+                {'type': 'assistant', 'uuid': 'ae', 'parentUuid': 'u1',
+                 'message': {'role': 'assistant', 'stop_reason': 'end_turn',
+                             'content': [{'type': 'text',
+                                          'text': 'DETAILEND'}]}},
+                {'type': 'assistant', 'uuid': 'av', 'parentUuid': 'ae',
+                 'message': {'role': 'assistant', 'content': [
+                     {'type': 'text', 'text': 'DETAILVOICE'}]}},
+                {'type': 'assistant', 'uuid': 'ad', 'parentUuid': 'av',
+                 'message': {'role': 'assistant', 'content': [
+                     {'type': 'tool_use', 'id': 'te', 'name': 'Edit',
+                      'input': {'file_path': 'DETAILEDIT'}}]}},
+                {'type': 'assistant', 'uuid': 'a1', 'parentUuid': 'ad',
                  'message': {'role': 'assistant', 'content': [
                      {'type': 'tool_use', 'id': 't1', 'name': 'Bash',
                       'input': {'command': 'DETAILTOOL'}}]}},
@@ -249,37 +262,49 @@ class TestBrowseClaude(unittest.TestCase):
             with TmuxFixture(cols=140, rows=30, env=self._launch_env(tmp)) as t:
                 # Flat mode, positional .jsonl → scopes straight in.
                 t.launch(_BIN, '--run-py', _RECIPE, '--no-tree', sess)
-                # Voice loads at the default level 1.
-                t.wait_for('DETAILVOICE', timeout=3.0)
+                # Summary (default level 1): prompt + end_turn only.
+                t.wait_for('DETAILPROMPT', timeout=3.0)
+                cap = t.wait_stable()
+                self.assertIn('DETAILEND', cap, 'summary shows end_turn')
+                for hidden in ('DETAILVOICE', 'DETAILEDIT', 'DETAILTOOL',
+                               'DETAILTAG', 'DETAILPERM'):
+                    self.assertNotIn(hidden, cap, f'summary hides {hidden}')
 
-                # Level 4: everything visible.
-                t.send('4')
+                # Level 6: everything visible.
+                t.send('6')
                 t.wait_for('DETAILPERM', timeout=3.0)
                 cap = t.wait_stable()
-                for probe in ('DETAILVOICE', 'DETAILTOOL', 'DETAILTAG',
+                for probe in ('DETAILPROMPT', 'DETAILEND', 'DETAILVOICE',
+                              'DETAILEDIT', 'DETAILTOOL', 'DETAILTAG',
                               'DETAILPERM'):
-                    self.assertIn(probe, cap, f'level 4 should show {probe}')
+                    self.assertIn(probe, cap, f'level 6 should show {probe}')
 
-                # Level 3: drops the level-4-only permission-mode row.
+                # Step down one tier at a time; each drops exactly its tier.
+                t.send('5')
+                cap = t.wait_stable()
+                self.assertIn('DETAILTAG', cap, 'L5 shows the tag')
+                self.assertNotIn('DETAILPERM', cap, 'L5 hides permission-mode')
+
+                t.send('4')
+                cap = t.wait_stable()
+                self.assertIn('DETAILTOOL', cap, 'L4 shows the bash tool')
+                self.assertNotIn('DETAILTAG', cap, 'L4 hides the tag (L5)')
+
                 t.send('3')
                 cap = t.wait_stable()
-                self.assertIn('DETAILTAG', cap, 'level 3 should show the tag')
-                self.assertNotIn('DETAILPERM', cap,
-                                 'level 3 should hide permission-mode (L4)')
+                self.assertIn('DETAILEDIT', cap, 'L3 shows the edit')
+                self.assertNotIn('DETAILTOOL', cap, 'L3 hides the bash (L4)')
 
-                # Level 2: drops the level-3 tag too; tool still shown.
                 t.send('2')
                 cap = t.wait_stable()
-                self.assertIn('DETAILTOOL', cap, 'level 2 should show the tool')
-                self.assertNotIn('DETAILTAG', cap,
-                                 'level 2 should hide the tag (L3)')
+                self.assertIn('DETAILVOICE', cap, 'L2 shows intermediate voice')
+                self.assertNotIn('DETAILEDIT', cap, 'L2 hides the edit (L3)')
 
-                # Level 1: voice only; the tool row drops.
                 t.send('1')
                 cap = t.wait_stable()
-                self.assertIn('DETAILVOICE', cap, 'level 1 should show voice')
-                self.assertNotIn('DETAILTOOL', cap,
-                                 'level 1 should hide the tool_use (L2)')
+                self.assertIn('DETAILEND', cap, 'summary keeps end_turn')
+                self.assertNotIn('DETAILVOICE', cap,
+                                 'summary hides intermediate voice (L2)')
                 t.send('q')
 
     def test_composed_preview_fuses_tool_block(self):
@@ -427,7 +452,7 @@ class TestBrowseClaude(unittest.TestCase):
                     f.write(json.dumps(r) + '\n')
             with TmuxFixture(cols=140, rows=30, env=self._launch_env(tmp)) as t:
                 # Positional .jsonl path — the user's reported launch shape.
-                t.launch(_BIN, '--run-py', _RECIPE, '--no-tree', sess)
+                t.launch(_BIN, '--run-py', _RECIPE, '--detail', 'voice', '--no-tree', sess)
                 # The conversation loads (cursor jumps to the latest voice).
                 t.wait_for('PROBE730_REPLY', timeout=3.0)
                 # Go to the TOP scope-root row.
@@ -558,7 +583,7 @@ class TestBrowseClaude(unittest.TestCase):
                 for r in records:
                     f.write(_json.dumps(r) + '\n')
             with TmuxFixture(cols=140, rows=30, env=self._launch_env(tmp)) as t:
-                t.launch(_BIN, '--run-py', _RECIPE, '--no-tree')
+                t.launch(_BIN, '--run-py', _RECIPE, '--detail', 'voice', '--no-tree')
                 t.wait_for('/home/test/jk')
                 t.send('Right')
                 t.wait_for('jk1234')
@@ -896,7 +921,7 @@ class TestBrowseClaude(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             sess = self._make_tree_fixture(tmp)
             with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
-                t.launch(_BIN, '--run-py', _RECIPE,
+                t.launch(_BIN, '--run-py', _RECIPE, '--detail', 'voice',
                          '--tree', '--file', sess)
                 # Latest voice = PROBE_TURN2_REPLY (the final assistant
                 # text). Preview pane should show its body.
@@ -917,7 +942,7 @@ class TestBrowseClaude(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             sess = self._make_tree_fixture(tmp)
             with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
-                t.launch(_BIN, '--run-py', _RECIPE,
+                t.launch(_BIN, '--run-py', _RECIPE, '--detail', 'voice',
                          '--tree', '--file', sess)
                 t.wait_for('PROBE_TURN2_REPLY', timeout=3.0)
                 # We synchronise on observable state transitions rather
@@ -960,7 +985,7 @@ class TestBrowseClaude(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             sess = self._make_tree_fixture(tmp)
             with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
-                t.launch(_BIN, '--run-py', _RECIPE, '--tree')
+                t.launch(_BIN, '--run-py', _RECIPE, '--detail', 'voice', '--tree')
                 t.wait_for('/home/test/tree', timeout=3.0)
                 t.send('Right')                  # expand project
                 t.wait_for('tree-sess', timeout=3.0)
@@ -992,7 +1017,7 @@ class TestBrowseClaude(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             sess = self._make_tree_fixture(tmp)
             with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
-                t.launch(_BIN, '--run-py', _RECIPE,
+                t.launch(_BIN, '--run-py', _RECIPE, '--detail', 'voice',
                          '--tree', '--file', sess)
                 t.wait_for('PROBE_TURN2_REPLY', timeout=3.0)
                 # K walks UP through visible voices. From PROBE_TURN2_REPLY,
@@ -1035,7 +1060,7 @@ class TestBrowseClaude(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             sess = self._make_tree_fixture(tmp, relocated=True)
             with TmuxFixture(cols=160, rows=30, env=self._launch_env(tmp)) as t:
-                t.launch(_BIN, '--run-py', _RECIPE,
+                t.launch(_BIN, '--run-py', _RECIPE, '--detail', 'voice',
                          '--tree', '--file', sess)
                 t.wait_for('PROBE_TURN2_REPLY', timeout=3.0)
                 # Walk back to turn 1's root umbrella (see the co-located
@@ -1206,7 +1231,7 @@ class TestBrowseClaude(unittest.TestCase):
                 # --detail 4 (all): the navigation below counts on all 3
                 # record rows being visible; the level-1 default would hide
                 # the two machinery records and break the Up-press math.
-                t.launch(_BIN, '--run-py', _RECIPE, '--no-tree', '--detail', '4')
+                t.launch(_BIN, '--run-py', _RECIPE, '--no-tree', '--detail', 'all')
                 t.wait_for('/home/test/project')
                 t.send('Right')
                 t.wait_for('abcd1234-deadbeef')
@@ -1282,7 +1307,7 @@ class TestBrowseClaude(unittest.TestCase):
                 # --detail 4 (all): the navigation below counts on every
                 # record row being visible; the level-1 default would hide
                 # the machinery rows and break the Up-press math.
-                t.launch(_BIN, '--run-py', _RECIPE, '--no-tree', '--detail', '4')
+                t.launch(_BIN, '--run-py', _RECIPE, '--no-tree', '--detail', 'all')
                 t.wait_for('/home/test/project')
                 t.send('Right')
                 t.wait_for('abcd1234-deadbeef')
@@ -1526,7 +1551,7 @@ class TestBrowseClaude(unittest.TestCase):
                              'text': f'PROBE_LAST_VOICE_{turn}'}]},
                     }) + '\n'); prev = a
             with TmuxFixture(cols=160, rows=40, env=self._launch_env(tmp)) as t:
-                t.launch(_BIN, '--run-py', _RECIPE,
+                t.launch(_BIN, '--run-py', _RECIPE, '--detail', 'voice',
                          '--tree', '--file', sess)
                 # The last voice is in turn 1499 — give it long enough
                 # for the scan + initial fetches + cursor snap. Without
@@ -1655,7 +1680,7 @@ class TestBrowseClaude(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             sess = self._make_sendmessage_fixture(tmp)
             with TmuxFixture(cols=160, rows=40, env=self._launch_env(tmp)) as t:
-                t.launch(_BIN, '--run-py', _RECIPE,
+                t.launch(_BIN, '--run-py', _RECIPE, '--detail', 'voice',
                          '--no-tree', '--file', sess, '--item', '0')
                 # Scoped via ``--item 0`` the rows list chronologically;
                 # the inbound reply one-liner (``← <task_id> · <status> ·
@@ -1735,7 +1760,7 @@ class TestBrowseClaude(unittest.TestCase):
             sess = self._make_sendmessage_fixture(tmp)
             with TmuxFixture(cols=160, rows=40, env=self._launch_env(tmp)) as t:
                 t.launch(_BIN, '--run-py', _RECIPE,
-                         '--no-tree', '--detail', '1',
+                         '--no-tree', '--detail', 'voice',
                          '--file', sess, '--item', '0')
                 t.wait_for('PROBE_REPLY_SUMMARY', timeout=3.0)
                 cap = t.capture()
@@ -1796,7 +1821,7 @@ class TestBrowseClaude(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             sess = self._make_sendmessage_fixture(tmp)
             with TmuxFixture(cols=160, rows=40, env=self._launch_env(tmp)) as t:
-                t.launch(_BIN, '--run-py', _RECIPE,
+                t.launch(_BIN, '--run-py', _RECIPE, '--detail', 'voice',
                          '--tree', '--file', sess)
                 # Latest voice = the inbound reply turn; its preview shows
                 # the task-notification render.
@@ -1823,7 +1848,7 @@ class TestBrowseClaude(unittest.TestCase):
             sess = self._make_sendmessage_fixture(tmp)
             with TmuxFixture(cols=160, rows=40, env=self._launch_env(tmp)) as t:
                 t.launch(_BIN, '--run-py', _RECIPE,
-                         '--tree', '--detail', '1', '--file', sess)
+                         '--tree', '--detail', 'voice', '--file', sess)
                 # Inbound reply still lands as the latest voice.
                 t.wait_for('← task-notification', timeout=3.0)
                 # Walk up to the human turn and expand it; the
@@ -2114,7 +2139,7 @@ class TestBrowseClaudePreviewResize(unittest.TestCase):
                              env=self._launch_env(tmp)) as t:
                 # Launch straight into the session; the cursor lands on the
                 # latest voice (the table), so its preview is the table.
-                t.launch(_BIN, '--run-py', _RECIPE, '--no-tree', sess)
+                t.launch(_BIN, '--run-py', _RECIPE, '--detail', 'voice', '--no-tree', sess)
                 t.wait_for('Configuration Column', timeout=5.0)
                 t.wait_stable(timeout=3.0)
 

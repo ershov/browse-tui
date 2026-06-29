@@ -27,28 +27,30 @@ JSON pretty-print preview.
 ```bash
 ./recipes/browse-claude                  # all projects
 ./recipes/browse-claude /home/me/work    # initial-scope
-./recipes/browse-claude --detail tools   # boot at detail level 2
+./recipes/browse-claude --detail edits   # prompts, replies + file edits
 ```
 
 **Detail levels.** A transcript carries far more than speech, so rows are
 gated by a detail level — each record has a *minimum* level at or above
 which it shows:
 
-- `1` `voice` — speech only: user prompts and assistant text replies
-  (`AskUserQuestion` / `SendMessage` / task-notifications count as
-  dialog). The default.
-- `2` `tools` — the conversation as lived: voice plus every other
-  user/assistant record (tool calls, tool results, thinking) and the
+- `1` `summary` — the skeleton: user prompts and the agent's `end_turn`
+  responses. The default — what you asked and what it concluded.
+- `2` `voice` — all speech: adds intermediate assistant text,
+  `AskUserQuestion`, and inter-agent messages.
+- `3` `edits` — adds the file-mutating tool calls (`Edit` / `Write` /
+  `NotebookEdit` / `MultiEdit`): review what changed without the noise.
+- `4` `tools` — adds every other tool call / result, thinking, and the
   inline turn-duration / api-error framing.
-- `3` `detailed` — adds a curated set of useful metadata (summaries,
+- `5` `detailed` — adds a curated set of useful metadata (summaries,
   prompts, PR links, worktree state, tags, local commands, attachments…).
-- `4` `all` — every record, including bookkeeping and unknown kinds.
+- `6` `all` — every record, including bookkeeping and unknown kinds.
 
-Set the boot level with `--detail LEVEL` (a number `1`-`4` or the word
-`voice` / `tools` / `detailed` / `all`); change it live with the `1`-`4`
-keys.
+Set the boot level with `--detail LEVEL` (a number `1`-`6` or the word
+`summary` / `voice` / `edits` / `tools` / `detailed` / `all`); change it
+live with the `1`-`6` keys.
 
-Keys: `1`-`4` set the detail level, `e` / `o` open in `$EDITOR`, `y` show
+Keys: `1`-`6` set the detail level, `e` / `o` open in `$EDITOR`, `y` show
 id (debugging).
 
 **Source:** [`recipes/browse-claude`](../../recipes/browse-claude)

@@ -1139,22 +1139,23 @@ class TestDetailLevelArg(unittest.TestCase):
         _sys.argv = saved
 
     def test_parse_numbers(self):
-        for raw, lvl in (('1', 1), ('2', 2), ('3', 3), ('4', 4)):
+        for raw, lvl in (('1', 1), ('2', 2), ('3', 3),
+                         ('4', 4), ('5', 5), ('6', 6)):
             with self.subTest(raw=raw):
                 self.assertEqual(self.r._parse_detail_level(raw), lvl)
 
     def test_parse_word_aliases(self):
-        for raw, lvl in (('voice', 1), ('tools', 2),
-                         ('detailed', 3), ('all', 4)):
+        for raw, lvl in (('summary', 1), ('voice', 2), ('edits', 3),
+                         ('tools', 4), ('detailed', 5), ('all', 6)):
             with self.subTest(raw=raw):
                 self.assertEqual(self.r._parse_detail_level(raw), lvl)
 
     def test_parse_aliases_case_insensitive_and_trimmed(self):
-        self.assertEqual(self.r._parse_detail_level('VOICE'), 1)
-        self.assertEqual(self.r._parse_detail_level('  All '), 4)
+        self.assertEqual(self.r._parse_detail_level('VOICE'), 2)
+        self.assertEqual(self.r._parse_detail_level('  All '), 6)
 
     def test_parse_rejects_bad_values(self):
-        for bad in ('0', '5', '', 'foo', 'vo', '-1', '3.0'):
+        for bad in ('0', '7', '', 'foo', 'vo', '-1', '3.0'):
             with self.subTest(bad=bad):
                 with self.assertRaises(ValueError):
                     self.r._parse_detail_level(bad)
@@ -1173,7 +1174,7 @@ class TestDetailLevelArg(unittest.TestCase):
         saved = self._with_argv(['--detail=all'])
         try:
             self.assertEqual(
-                self.r._pop_value('--detail', self.r._parse_detail_level), 4)
+                self.r._pop_value('--detail', self.r._parse_detail_level), 6)
         finally:
             self._restore_argv(saved)
 
@@ -1694,6 +1695,52 @@ class TestComposedToolBlock(unittest.TestCase):
          ]}},
     ]
 
+    # A fuller turn spanning every relevant tier, for the per-level
+    # composition tests: prompt(1) + intermediate voice(2) + Edit(3) +
+    # Bash(4) + end_turn(1).
+    _RICH_TURN = [
+        {'type': 'user', 'uuid': 'u1',
+         'message': {'role': 'user', 'content': 'PROBE_PROMPT'}},
+        {'type': 'assistant', 'uuid': 'av',
+         'message': {'role': 'assistant', 'content': [
+             {'type': 'text', 'text': 'PROBE_VOICE'}]}},
+        {'type': 'assistant', 'uuid': 'ae',
+         'message': {'role': 'assistant', 'content': [
+             {'type': 'tool_use', 'id': 'te', 'name': 'Edit',
+              'input': {'file_path': 'PROBE_EDIT'}}]}},
+        {'type': 'assistant', 'uuid': 'ab',
+         'message': {'role': 'assistant', 'content': [
+             {'type': 'tool_use', 'id': 'tb', 'name': 'Bash',
+              'input': {'command': 'PROBE_BASH'}}]}},
+        {'type': 'assistant', 'uuid': 'aend',
+         'message': {'role': 'assistant', 'stop_reason': 'end_turn',
+                     'content': [{'type': 'text', 'text': 'PROBE_END'}]}},
+    ]
+
+    def test_summary_compose_shows_prompt_and_end_turn_only(self):
+        # At summary (1) a composed turn preview is just the user prompt
+        # and the agent's end_turn response — intermediate voice and all
+        # tool blocks are filtered out.
+        path = self._write_jsonl(self._RICH_TURN)
+        self.r._DETAIL_LEVEL = 1
+        out = ''.join(self.r._preview_umbrella(('prompt', path, 0)))
+        self.assertIn('PROBE_PROMPT', out)
+        self.assertIn('PROBE_END', out)
+        self.assertNotIn('PROBE_VOICE', out)   # intermediate voice (L2)
+        self.assertNotIn('PROBE_EDIT', out)    # edit (L3)
+        self.assertNotIn('PROBE_BASH', out)    # bash (L4)
+
+    def test_edits_compose_shows_voice_but_not_other_tools(self):
+        # At edits (3) the voice tier is in (L2 <= 3) but the full tools
+        # tier is not: the Bash block (L4) stays hidden in composition.
+        path = self._write_jsonl(self._RICH_TURN)
+        self.r._DETAIL_LEVEL = 3
+        out = ''.join(self.r._preview_umbrella(('prompt', path, 0)))
+        self.assertIn('PROBE_PROMPT', out)
+        self.assertIn('PROBE_VOICE', out)      # voice (L2) now shown
+        self.assertNotIn('PROBE_BASH', out)    # bash tool (L4) hidden
+        self.assertNotIn('tool: Bash', out)
+
     def test_prompt_compose_uses_fused_block_not_raw_leaves(self):
         # The turn preview composes the tool child as its fused block:
         # the rule + command + output all appear, but the raw leaf
@@ -1814,15 +1861,16 @@ class TestComposedToolBlock(unittest.TestCase):
         leaf = self.r._preview_message(path, 0)
         self.assertIn('uuid', leaf)
 
-    def test_level_interaction_block_absent_at_voice_level(self):
-        # At level 1 (voice) the tool row is hidden, so it doesn't
-        # compose into the turn preview at all; at level >= 2 it does.
+    def test_level_interaction_block_gated_at_tools(self):
+        # Bash is a tool (level 4): its block is hidden at summary (1),
+        # voice (2) and edits (3), and composes only at tools (4)+.
         path = self._write_jsonl(self._BASH_TURN)
-        self.r._DETAIL_LEVEL = 1
-        out_lvl1 = ''.join(self.r._preview_umbrella(('prompt', path, 0)))
-        self.assertNotIn('tool: Bash', out_lvl1)
-        self.assertNotIn('PROBE_BASH_CMD', out_lvl1)
-        for level in (2, 3, 4):
+        for level in (1, 2, 3):
+            self.r._DETAIL_LEVEL = level
+            out = ''.join(self.r._preview_umbrella(('prompt', path, 0)))
+            self.assertNotIn('tool: Bash', out, f'level {level}')
+            self.assertNotIn('PROBE_BASH_CMD', out, f'level {level}')
+        for level in (4, 5, 6):
             self.r._DETAIL_LEVEL = level
             out = ''.join(self.r._preview_umbrella(('prompt', path, 0)))
             self.assertIn('tool: Bash', out, f'level {level}')
@@ -4209,20 +4257,21 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
                              'subagent transcript')
 
     def test_tool_umbrella_for_agent_dispatch_passes_voice_filter(self):
-        # The voice-only filter (`.` key) must keep <tool:Agent> rows
-        # visible when they wrap a resolvable subagent — the umbrella
-        # carries the subagent voice stripe, so filtering them out
-        # would hide the visual cue.
+        # A <tool:Agent> umbrella wrapping a resolvable subagent carries
+        # the subagent voice stripe, so it is promoted to the voice tier
+        # (level 2): hidden at summary (1), visible from voice (2) up —
+        # filtering it out at voice would hide the visual cue.
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             sess = self._build(tmp)
             self.r._TREE_CACHE.clear()
             self.r._scan_tree(sess)
             tool_id = ('tool', sess, 1)
-            # With voice-only filter ON, the <tool:Agent> id passes.
             saved = self.r._DETAIL_LEVEL
-            self.r._DETAIL_LEVEL = 1
             try:
+                self.r._DETAIL_LEVEL = 1   # summary — subagent dispatch hidden
+                self.assertFalse(self.r._passes_filter(tool_id))
+                self.r._DETAIL_LEVEL = 2   # voice — promoted, visible
                 self.assertTrue(self.r._passes_filter(tool_id))
             finally:
                 self.r._DETAIL_LEVEL = saved
@@ -6055,7 +6104,9 @@ class TestVoiceOnlyFilter(unittest.TestCase):
             os.unlink(path)
 
     def test_passes_filter_tool_umbrella_mixed_text(self):
-        # Assistant turn with text + tool_use: voice-bearing.
+        # Assistant turn with text + tool_use: voice-bearing (the text),
+        # so the umbrella tracks the voice tier (level 2) — visible from
+        # voice up, not at summary.
         path = self._write_jsonl([
             {'type': 'assistant', 'uuid': 'a1',
              'message': {'role': 'assistant', 'content': [
@@ -6065,7 +6116,7 @@ class TestVoiceOnlyFilter(unittest.TestCase):
         ])
         try:
             self.r._scan_tree(path)
-            self.r._DETAIL_LEVEL = 1
+            self.r._DETAIL_LEVEL = 2
             self.assertTrue(self.r._passes_filter(('tool', path, 0)))
         finally:
             os.unlink(path)
@@ -6526,10 +6577,10 @@ class TestVoiceOnlyFilter(unittest.TestCase):
     # ---- CLI + help -----------------------------------------------------
 
     def test_help_text_mentions_detail_level_keys(self):
-        # The in-app ``1``-``4`` detail-level keys live in the intro
+        # The in-app ``1``-``6`` detail-level keys live in the intro
         # (shown by ``?``); the old ``.`` hotkey is gone.
-        self.assertIn('1-4', self.r._HELP_INTRO,
-                      'help intro should list the 1-4 detail-level keys')
+        self.assertIn('1-6', self.r._HELP_INTRO,
+                      'help intro should list the 1-6 detail-level keys')
         self.assertNotIn(' .  ', self.r._HELP_INTRO,
                          'the . hotkey should no longer appear')
         # The CLI flag lives in the usage block (shown only by ``--help``);
@@ -6605,71 +6656,89 @@ class TestVoiceOnlyFilter(unittest.TestCase):
 
 
 class TestRecordMinLevel(unittest.TestCase):
-    """``_record_min_level`` classifies one record into a detail tier (1-4).
+    """``_record_min_level`` classifies one record into a detail tier (1-6).
 
-    Whitelist semantics: voice→1, lived machinery→2, curated metadata→3,
-    everything unrecognised (and ``isMeta``) →4.
+    Whitelist semantics: turn-root prompt / end_turn → 1 (summary),
+    other voice → 2, edit/write tool → 3, other machinery → 4,
+    curated metadata → 5, everything unrecognised (and ``isMeta``) → 6.
     """
 
     @classmethod
     def setUpClass(cls):
         cls.r = _load_recipe()
 
-    def test_voice_user_is_level_1(self):
+    def test_turn_root_user_prompt_is_level_1(self):
+        # Any plain user voice record is a turn root → summary tier.
         rec = {'type': 'user', 'message': {'role': 'user', 'content': 'hi'}}
         self.assertEqual(self.r._record_min_level(rec), 1)
 
-    def test_voice_assistant_text_is_level_1(self):
+    def test_assistant_end_turn_is_level_1(self):
+        # The agent's final (end_turn) response is the summary tier.
         rec = {'type': 'assistant', 'message': {'role': 'assistant',
+               'stop_reason': 'end_turn',
                'content': [{'type': 'text', 'text': 'done'}]}}
         self.assertEqual(self.r._record_min_level(rec), 1)
 
-    def test_assistant_tool_use_is_level_2(self):
+    def test_intermediate_assistant_voice_is_level_2(self):
+        # Assistant text WITHOUT end_turn is running commentary → voice (2).
+        rec = {'type': 'assistant', 'message': {'role': 'assistant',
+               'content': [{'type': 'text', 'text': 'on it'}]}}
+        self.assertEqual(self.r._record_min_level(rec), 2)
+
+    def test_edit_tools_are_level_3(self):
+        for name in ('Edit', 'Write', 'NotebookEdit', 'MultiEdit'):
+            with self.subTest(tool=name):
+                rec = {'type': 'assistant', 'message': {'role': 'assistant',
+                       'content': [{'type': 'tool_use', 'id': 't',
+                                    'name': name, 'input': {}}]}}
+                self.assertEqual(self.r._record_min_level(rec), 3)
+
+    def test_assistant_tool_use_is_level_4(self):
         rec = {'type': 'assistant', 'message': {'role': 'assistant',
                'content': [{'type': 'tool_use', 'id': 't', 'name': 'Bash',
                             'input': {'command': 'ls'}}]}}
-        self.assertEqual(self.r._record_min_level(rec), 2)
+        self.assertEqual(self.r._record_min_level(rec), 4)
 
-    def test_user_tool_result_is_level_2(self):
+    def test_user_tool_result_is_level_4(self):
         rec = {'type': 'user', 'message': {'role': 'user',
                'content': [{'type': 'tool_result', 'tool_use_id': 't',
                             'content': 'ok'}]}}
-        self.assertEqual(self.r._record_min_level(rec), 2)
+        self.assertEqual(self.r._record_min_level(rec), 4)
 
-    def test_assistant_thinking_only_with_text_is_level_2(self):
-        # Thinking *with* readable text is lived machinery — level 2.
+    def test_assistant_thinking_only_with_text_is_level_4(self):
+        # Thinking *with* readable text is lived machinery — tools (4).
         rec = {'type': 'assistant', 'message': {'role': 'assistant',
                'content': [{'type': 'thinking', 'thinking': 'hmm'}]}}
-        self.assertEqual(self.r._record_min_level(rec), 2)
+        self.assertEqual(self.r._record_min_level(rec), 4)
 
-    def test_assistant_empty_thinking_only_is_level_4(self):
+    def test_assistant_empty_thinking_only_is_level_6(self):
         # Signature-only (redacted) thinking has no readable text — it
-        # renders as a bare ``<N parts>`` row, so it sinks to ``all`` (4).
+        # renders as a bare ``<N parts>`` row, so it sinks to ``all`` (6).
         rec = {'type': 'assistant', 'message': {'role': 'assistant',
                'content': [{'type': 'thinking', 'thinking': '',
                             'signature': 'ErAIC..='}]}}
-        self.assertEqual(self.r._record_min_level(rec), 4)
+        self.assertEqual(self.r._record_min_level(rec), 6)
 
-    def test_assistant_empty_thinking_with_tool_use_is_level_2(self):
-        # An empty thinking part alongside a real tool_use is still a
-        # lived tool call — not demoted.
+    def test_assistant_empty_thinking_with_tool_use_is_level_4(self):
+        # An empty thinking part alongside a real (non-edit) tool_use is
+        # still a lived tool call — tools (4).
         rec = {'type': 'assistant', 'message': {'role': 'assistant',
                'content': [{'type': 'thinking', 'thinking': '',
                             'signature': 'sig'},
                            {'type': 'tool_use', 'id': 't', 'name': 'Bash',
                             'input': {'command': 'ls'}}]}}
-        self.assertEqual(self.r._record_min_level(rec), 2)
+        self.assertEqual(self.r._record_min_level(rec), 4)
 
-    def test_system_turn_duration_is_level_2(self):
+    def test_system_turn_duration_is_level_4(self):
         rec = {'type': 'system', 'subtype': 'turn_duration',
                'durationMs': 1000, 'messageCount': 3}
-        self.assertEqual(self.r._record_min_level(rec), 2)
+        self.assertEqual(self.r._record_min_level(rec), 4)
 
-    def test_system_api_error_is_level_2(self):
+    def test_system_api_error_is_level_4(self):
         rec = {'type': 'system', 'subtype': 'api_error'}
-        self.assertEqual(self.r._record_min_level(rec), 2)
+        self.assertEqual(self.r._record_min_level(rec), 4)
 
-    def test_l3_useful_plain_types_are_level_3(self):
+    def test_l3_useful_plain_types_are_level_5(self):
         for t in ('summary', 'task-summary', 'last-prompt', 'pr-link',
                   'worktree-state', 'custom-title', 'tag', 'queue-operation',
                   'marble-origami-commit'):
@@ -6677,46 +6746,46 @@ class TestRecordMinLevel(unittest.TestCase):
                 # ``queue-operation`` with content is voice → seed it empty
                 # so it classifies as plain metadata here.
                 rec = {'type': t}
-                self.assertEqual(self.r._record_min_level(rec), 3)
+                self.assertEqual(self.r._record_min_level(rec), 5)
 
-    def test_l3_useful_system_local_command_is_level_3(self):
+    def test_l3_useful_system_local_command_is_level_5(self):
         rec = {'type': 'system', 'subtype': 'local_command', 'content': 'ls'}
-        self.assertEqual(self.r._record_min_level(rec), 3)
+        self.assertEqual(self.r._record_min_level(rec), 5)
 
-    def test_l3_useful_attachments_are_level_3(self):
+    def test_l3_useful_attachments_are_level_5(self):
         for sub in ('file', 'queued_command', 'hook_success', 'diagnostics'):
             with self.subTest(attachment=sub):
                 rec = {'type': 'attachment', 'attachment': {'type': sub}}
-                self.assertEqual(self.r._record_min_level(rec), 3)
+                self.assertEqual(self.r._record_min_level(rec), 5)
 
-    def test_unlisted_system_subtype_is_level_4(self):
+    def test_unlisted_system_subtype_is_level_6(self):
         rec = {'type': 'system', 'subtype': 'hook'}
-        self.assertEqual(self.r._record_min_level(rec), 4)
+        self.assertEqual(self.r._record_min_level(rec), 6)
 
-    def test_unlisted_attachment_subtype_is_level_4(self):
+    def test_unlisted_attachment_subtype_is_level_6(self):
         rec = {'type': 'attachment', 'attachment': {'type': 'skill_listing'}}
-        self.assertEqual(self.r._record_min_level(rec), 4)
+        self.assertEqual(self.r._record_min_level(rec), 6)
 
-    def test_unknown_type_is_level_4(self):
-        self.assertEqual(self.r._record_min_level({'type': 'progress'}), 4)
-        self.assertEqual(self.r._record_min_level({'type': 'totally-new'}), 4)
+    def test_unknown_type_is_level_6(self):
+        self.assertEqual(self.r._record_min_level({'type': 'progress'}), 6)
+        self.assertEqual(self.r._record_min_level({'type': 'totally-new'}), 6)
 
-    def test_ismeta_record_is_level_4(self):
+    def test_ismeta_record_is_level_6(self):
         # ``isMeta`` outranks even its own (otherwise-voice) type: an
         # injected-context user record is never part of the lived turn.
         rec = {'type': 'user', 'isMeta': True,
                'message': {'role': 'user', 'content': 'injected'}}
-        self.assertEqual(self.r._record_min_level(rec), 4)
+        self.assertEqual(self.r._record_min_level(rec), 6)
 
-    def test_non_dict_record_is_level_4(self):
-        self.assertEqual(self.r._record_min_level(None), 4)
+    def test_non_dict_record_is_level_6(self):
+        self.assertEqual(self.r._record_min_level(None), 6)
 
 
 class TestPassesFilterByLevel(unittest.TestCase):
     """``_passes_filter`` gates each row tag against ``_DETAIL_LEVEL``.
 
     A row shows iff its min level is ``<= _DETAIL_LEVEL``. Verified at all
-    four levels for msg / tool / span / prompt / agent ids.
+    six levels for msg / tool / span / prompt / agent ids.
     """
 
     @classmethod
@@ -6741,21 +6810,32 @@ class TestPassesFilterByLevel(unittest.TestCase):
         return f.name
 
     def _visible_at(self, item_id, td=None):
-        """Tuple of bools — does ``item_id`` pass at levels 1,2,3,4?"""
+        """Tuple of bools — does ``item_id`` pass at levels 1,2,3,4,5,6?"""
         out = []
-        for lvl in (1, 2, 3, 4):
+        for lvl in (1, 2, 3, 4, 5, 6):
             self.r._DETAIL_LEVEL = lvl
             out.append(self.r._passes_filter(item_id, td))
         return tuple(out)
 
     def test_msg_leaf_gating_across_levels(self):
-        # line 0 voice user (1), line 1 assistant tool_use (2), line 2
-        # user tool_result (2). Plus a level-3 metadata leaf and a
-        # level-4 unknown leaf fabricated on a td.
+        # One leaf per tier: turn-root prompt (1), end_turn (1),
+        # intermediate assistant voice (2), Edit tool_use (3), bare
+        # tool_use (4), tool_result (4), tag (5), unknown (6).
         path = self._write_jsonl([
             {'type': 'user', 'uuid': 'u1',
              'message': {'role': 'user', 'content': 'hi'}},
+            {'type': 'assistant', 'uuid': 'a0',
+             'message': {'role': 'assistant', 'stop_reason': 'end_turn',
+                         'content': [{'type': 'text', 'text': 'done'}]}},
             {'type': 'assistant', 'uuid': 'a1',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'text', 'text': 'thinking out loud'},
+             ]}},
+            {'type': 'assistant', 'uuid': 'a2',
+             'message': {'role': 'assistant', 'content': [
+                 {'type': 'tool_use', 'id': 'te', 'name': 'Edit', 'input': {}},
+             ]}},
+            {'type': 'assistant', 'uuid': 'a3',
              'message': {'role': 'assistant', 'content': [
                  {'type': 'tool_use', 'id': 't1', 'name': 'X', 'input': {}},
              ]}},
@@ -6763,28 +6843,35 @@ class TestPassesFilterByLevel(unittest.TestCase):
              'message': {'role': 'user', 'content': [
                  {'type': 'tool_result', 'tool_use_id': 't1', 'content': 'ok'},
              ]}},
-            {'type': 'tag', 'tag': 'release'},        # level 3
-            {'type': 'progress', 'data': {}},          # level 4 (unknown)
+            {'type': 'tag', 'tag': 'release'},        # level 5
+            {'type': 'progress', 'data': {}},          # level 6 (unknown)
         ])
         try:
             td = self.r._scan_tree(path)
+            T = True; F = False
             self.assertEqual(self._visible_at(('msg', path, 0), td),
-                             (True, True, True, True))   # voice
+                             (T, T, T, T, T, T))   # turn-root prompt (1)
             self.assertEqual(self._visible_at(('msg', path, 1), td),
-                             (False, True, True, True))  # tool_use
+                             (T, T, T, T, T, T))   # end_turn (1)
             self.assertEqual(self._visible_at(('msg', path, 2), td),
-                             (False, True, True, True))  # tool_result
+                             (F, T, T, T, T, T))   # intermediate voice (2)
             self.assertEqual(self._visible_at(('msg', path, 3), td),
-                             (False, False, True, True)) # tag (L3)
+                             (F, F, T, T, T, T))   # Edit tool_use (3)
             self.assertEqual(self._visible_at(('msg', path, 4), td),
-                             (False, False, False, True))# unknown (L4)
+                             (F, F, F, T, T, T))   # bare tool_use (4)
+            self.assertEqual(self._visible_at(('msg', path, 5), td),
+                             (F, F, F, T, T, T))   # tool_result (4)
+            self.assertEqual(self._visible_at(('msg', path, 6), td),
+                             (F, F, F, F, T, T))   # tag (5)
+            self.assertEqual(self._visible_at(('msg', path, 7), td),
+                             (F, F, F, F, F, T))   # unknown (6)
         finally:
             os.unlink(path)
 
     def test_tool_umbrella_gating_bare_vs_subagent(self):
         # A bare Bash tool_use umbrella tracks its assistant min level
-        # (2). An <tool:Agent> umbrella wrapping a resolvable subagent
-        # is voice-promoted to level 1.
+        # (4). An <tool:Agent> umbrella wrapping a resolvable subagent
+        # is promoted to the voice tier (level 2).
         path = self._write_jsonl([
             {'type': 'user', 'uuid': 'u1',
              'message': {'role': 'user', 'content': 'go'}},
@@ -6796,40 +6883,40 @@ class TestPassesFilterByLevel(unittest.TestCase):
         ])
         try:
             td = self.r._scan_tree(path)
-            # Bare Bash umbrella: hidden until level 2.
+            # Bare Bash umbrella: hidden until level 4 (tools).
             self.assertEqual(self._visible_at(('tool', path, 1), td),
-                             (False, True, True, True))
+                             (False, False, False, True, True, True))
             # Subagent-wrap promotion: stub the predicate so the same
-            # umbrella id reads as a resolvable-subagent wrap → level 1.
+            # umbrella id reads as a resolvable-subagent wrap → voice (2).
             saved = self.r._tool_umbrella_wraps_subagent
             try:
                 self.r._tool_umbrella_wraps_subagent = lambda rec, td_: True
                 self.assertEqual(self._visible_at(('tool', path, 1), td),
-                                 (True, True, True, True))
+                                 (False, True, True, True, True, True))
             finally:
                 self.r._tool_umbrella_wraps_subagent = saved
         finally:
             os.unlink(path)
 
     def test_span_umbrella_gating_by_min_member(self):
-        # span 0: only an unlisted system + a tag (min level 3).
-        # span 1: includes a voice user (min level 1).
+        # span 0: only an unlisted system (6) + a tag (5) → min level 5.
+        # span 1: includes a turn-root user voice (min level 1).
         path = '/tmp/fake-span-levels.jsonl'
         td = self.r._TreeData()
         td.span_records[0] = [
-            {'type': 'system', 'subtype': 'hook'},     # level 4
-            {'type': 'tag', 'tag': 'x'},               # level 3
+            {'type': 'system', 'subtype': 'hook'},     # level 6
+            {'type': 'tag', 'tag': 'x'},               # level 5
         ]
         td.span_records[1] = [
-            {'type': 'system', 'subtype': 'hook'},     # level 4
+            {'type': 'system', 'subtype': 'hook'},     # level 6
             {'type': 'user', 'message': {'role': 'user', 'content': 'hi'}},
         ]
         self.r._TREE_CACHE[path] = td
         try:
             self.assertEqual(self._visible_at(('span', path, 0), td),
-                             (False, False, True, True))  # min member = L3
+                             (False, False, False, False, True, True))  # min L5
             self.assertEqual(self._visible_at(('span', path, 1), td),
-                             (True, True, True, True))     # has voice
+                             (True, True, True, True, True, True))  # has voice
         finally:
             self.r._TREE_CACHE.pop(path, None)
 
@@ -6844,14 +6931,14 @@ class TestPassesFilterByLevel(unittest.TestCase):
         self.r._TREE_CACHE[path] = td
         try:
             self.assertEqual(self._visible_at(('prompt', path, 0), td),
-                             (True, True, True, True))
+                             (True, True, True, True, True, True))
         finally:
             self.r._TREE_CACHE.pop(path, None)
 
     def test_agent_umbrella_always_visible(self):
         # Subagent umbrellas are unconditionally shown at every level.
         self.assertEqual(self._visible_at(('agent', 'whatever', 'ABC')),
-                         (True, True, True, True))
+                         (True, True, True, True, True, True))
 
 
 class TestShowId(unittest.TestCase):
