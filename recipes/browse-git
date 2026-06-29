@@ -241,6 +241,8 @@ _prev_pw = None  # last preview width seen by _on_resize (main-thread only)
 _revs = []       # positional revisions scoping commits mode
 _paths = []      # positional pathspecs scoping commits mode
 _all_branches = False  # --all — span the commits log over every local branch
+_launch_prefix = ''  # launch dir relative to the work-tree root we chdir into
+                     # (git rev-parse --show-prefix), set by _chdir_to_worktree_root
 
 # Detail-display mode (number keys 1/2/3) — selects which LEADING columns
 # ``git_row_content`` emits before the graph/chips/subject (mirrors
@@ -410,6 +412,44 @@ def _pop_repo_dir():
         os.chdir(top.stdout.strip())
         del sys.argv[i]
         return
+
+
+def _chdir_to_worktree_root():
+    """Run every git command from the work-tree root, recording the launch dir.
+
+    git's path-listing commands (``status --porcelain``, ``show
+    --name-status``) emit repo-root-relative paths, but the commands the recipe
+    feeds those paths back to (``git show <sha> -- <path>``, ``git diff --
+    <path>``) resolve a pathspec relative to cwd. Launched from a subdir the
+    two disagree, so every per-file diff/preview came back empty (the untracked
+    ``--no-index`` diff errored outright). Chdir-ing to the work-tree root keeps
+    them aligned — and matches what ``_pop_repo_dir`` already does for a
+    cross-repo target, so cwd is uniformly the root from here on.
+
+    The launch dir's prefix (``git rev-parse --show-prefix``, e.g. ``sub/``) is
+    recorded into ``_launch_prefix`` first so a positional pathspec — typed
+    relative to the launch dir — can be rebased onto the root by
+    ``_classify_positionals`` (``_rebase_path``). A no-op at the root (empty
+    prefix, same cwd); harmless outside a repo (no toplevel, nothing to do).
+    """
+    global _launch_prefix
+    _launch_prefix = _run_git('rev-parse', '--show-prefix').stdout.rstrip('\n')
+    root = _repo_root()
+    if root:
+        os.chdir(root)
+
+
+def _rebase_path(arg):
+    """Rebase a launch-dir-relative pathspec onto the work-tree root.
+
+    ``_chdir_to_worktree_root`` moved cwd to the work-tree root, but a
+    positional pathspec was typed relative to the LAUNCH dir. Prepending the
+    recorded ``_launch_prefix`` rebases it so it resolves from the root exactly
+    as it would have from the launch dir (``..`` segments included — git
+    normalises them). An absolute path passes through untouched. With an empty
+    prefix (launched at the root, or outside a repo) this is the identity.
+    """
+    return arg if os.path.isabs(arg) else _launch_prefix + arg
 
 
 # ---- subprocess + colorization helpers -----------------------------------
@@ -3654,6 +3694,13 @@ def _classify_positionals():
     ``--help``) before the ``--`` are skipped so the framework's help
     auto-detect still fires.
 
+    A pathspec is rebased onto the work-tree root (``_rebase_path``): by now
+    ``_chdir_to_worktree_root`` has moved cwd to the root, so a path typed
+    relative to the launch dir gets the launch prefix prepended — both the
+    existence test and the stored value use the rebased form, so it resolves
+    (and later filters ``git log``) from the root just as it would have from
+    the launch dir. At the root (empty prefix) this is a no-op.
+
     Scans ``recipe_argv()`` so the framework's ``--tty`` flag and its
     value are dropped first — otherwise a ``--tty /dev/pts/N`` device
     path would be misclassified as a pathspec (or fail as an unknown
@@ -3665,14 +3712,15 @@ def _classify_positionals():
     if '--' in args:
         cut = args.index('--')
         head, tail = args[:cut], args[cut + 1:]
-        _paths.extend(tail)
+        _paths.extend(_rebase_path(a) for a in tail)
     else:
         head = args
     for arg in head:
         if arg.startswith('-'):
             continue
-        if os.path.exists(arg):
-            _paths.append(arg)
+        reb = _rebase_path(arg)
+        if os.path.exists(reb):
+            _paths.append(reb)
             continue
         rc = _run_git('rev-parse', '--verify', '--quiet', f'{arg}^{{commit}}')
         if rc.returncode == 0:
@@ -3791,6 +3839,10 @@ def main():
         if _run_git('rev-parse', '--is-inside-work-tree').returncode != 0:
             sys.stderr.write('browse-git: not inside a git work tree\n')
             sys.exit(2)
+        # Launched from a subdir, git's repo-root-relative path output would no
+        # longer line up with the cwd-relative pathspecs we feed back to it, so
+        # every per-file diff came back empty. Run from the work-tree root.
+        _chdir_to_worktree_root()
 
     _log_limit = _pop_limit_arg(_LOG_LIMIT)
     requested_mode = _pop_mode_flag()

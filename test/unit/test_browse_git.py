@@ -883,6 +883,109 @@ class TestPopRepoDir(unittest.TestCase):
         self.assertEqual(os.path.realpath(os.getcwd()), repo)
 
 
+@unittest.skipUnless(shutil.which('git'), 'git not available')
+class TestChdirToWorktreeRoot(unittest.TestCase):
+    """``_chdir_to_worktree_root`` runs the recipe's git from the repo root.
+
+    git's path-listing commands (``status --porcelain`` / ``show
+    --name-status``) emit repo-root-relative paths, but the recipe feeds those
+    paths back to ``git show``/``git diff`` whose pathspecs resolve relative to
+    cwd. Launched from a subdir the two disagree, so every per-file
+    diff/preview came back empty (the untracked ``--no-index`` diff errored).
+    The startup chdir realigns them; the launch-dir prefix is recorded so a
+    positional pathspec — typed relative to the launch dir — is rebased onto
+    the root by ``_classify_positionals``.
+    """
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self._orig_argv = sys.argv
+        self._orig_cwd = os.getcwd()
+
+    def tearDown(self):
+        sys.argv = self._orig_argv
+        os.chdir(self._orig_cwd)
+
+    @staticmethod
+    def _make_repo_with_subdir():
+        """Repo with a committed ``sub/deep/file.txt`` + a worktree mod and an
+        untracked sibling, both under ``sub/`` (so paths carry a prefix)."""
+        d = tempfile.mkdtemp()
+        env = {**os.environ,
+               'GIT_AUTHOR_NAME': 'T', 'GIT_AUTHOR_EMAIL': 't@t',
+               'GIT_COMMITTER_NAME': 'T', 'GIT_COMMITTER_EMAIL': 't@t'}
+
+        def git(*a):
+            subprocess.run(['git', '-C', d, *a], check=True,
+                           capture_output=True, env=env)
+
+        git('init', '-q', '-b', 'main')
+        deep = os.path.join(d, 'sub', 'deep')
+        os.makedirs(deep)
+        with open(os.path.join(deep, 'file.txt'), 'w') as f:
+            f.write('line1\n')
+        git('add', '-A')
+        git('commit', '-q', '-m', 'add sub/deep/file.txt')
+        with open(os.path.join(deep, 'file.txt'), 'a') as f:
+            f.write('line2\n')
+        with open(os.path.join(d, 'sub', 'untracked.txt'), 'w') as f:
+            f.write('newfile\n')
+        return os.path.realpath(d)
+
+    @staticmethod
+    def _strip(s):
+        return re.sub(r'\x1b\[[^@-~]*[@-~]', '', s)
+
+    def test_launched_from_subdir_chdirs_to_root(self):
+        repo = self._make_repo_with_subdir()
+        os.chdir(os.path.join(repo, 'sub', 'deep'))
+        self.r._chdir_to_worktree_root()
+        self.assertEqual(os.path.realpath(os.getcwd()), repo)
+
+    def test_at_root_is_noop_with_empty_prefix(self):
+        repo = self._make_repo_with_subdir()
+        os.chdir(repo)
+        self.r._chdir_to_worktree_root()
+        self.assertEqual(self.r._launch_prefix, '')
+        self.assertEqual(os.path.realpath(os.getcwd()), repo)
+
+    def test_subdir_commit_file_preview_is_not_empty(self):
+        repo = self._make_repo_with_subdir()
+        sha = subprocess.run(['git', '-C', repo, 'rev-parse', 'HEAD'],
+                             capture_output=True, text=True).stdout.strip()
+        os.chdir(os.path.join(repo, 'sub'))
+        self.r._chdir_to_worktree_root()
+        preview = self._strip(self.r._file_preview(sha, 'sub/deep/file.txt'))
+        # Without the chdir this came back empty (root-relative path resolved
+        # against the subdir cwd found nothing).
+        self.assertIn('line1', preview)
+
+    def test_subdir_status_previews_are_not_empty(self):
+        repo = self._make_repo_with_subdir()
+        os.chdir(os.path.join(repo, 'sub'))
+        self.r._chdir_to_worktree_root()
+        mod = self._strip(self.r._status_preview(' M', 'sub/deep/file.txt'))
+        self.assertIn('line2', mod)
+        untracked = self._strip(
+            self.r._status_preview('??', 'sub/untracked.txt'))
+        # Previously surfaced ``error: Could not access 'sub/untracked.txt'``.
+        self.assertNotIn('Could not access', untracked)
+        self.assertIn('newfile', untracked)
+
+    def test_records_launch_prefix_and_rebases_pathspec(self):
+        repo = self._make_repo_with_subdir()
+        os.chdir(os.path.join(repo, 'sub'))
+        self.r._chdir_to_worktree_root()
+        self.assertEqual(self.r._launch_prefix, 'sub/')
+        # A pathspec typed relative to the launch dir is rebased onto the root
+        # so it resolves there exactly as it would have from the launch dir.
+        sys.argv = ['browse-git', '--', 'deep/file.txt']
+        self.r._revs = []
+        self.r._paths = []
+        self.r._classify_positionals()
+        self.assertEqual(self.r._paths, ['sub/deep/file.txt'])
+
+
 class TestParseDecorations(unittest.TestCase):
     """``_parse_decorations`` turns a ``%D`` string into colored chips."""
 

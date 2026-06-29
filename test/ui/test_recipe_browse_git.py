@@ -285,6 +285,44 @@ class TestBrowseGit(unittest.TestCase):
                 t.wait_for('second commit add beta', timeout=5.0)
                 t.send('q')
 
+    def test_launched_from_subdir_renders_file_diff(self):
+        """Launched from a SUBDIR, a commit's per-file diff still paints.
+
+        git lists changed files repo-root-relative (``show --name-status``),
+        so the per-file ``git show -- <path>`` must run from the root or it
+        finds nothing and the preview comes back empty. The recipe chdir's to
+        the work-tree root at startup; here we launch from ``sub/deep`` and
+        assert the diff of a file committed there actually renders.
+        """
+        env = {
+            **os.environ,
+            'GIT_AUTHOR_NAME': 'Test', 'GIT_AUTHOR_EMAIL': 'test@example.com',
+            'GIT_COMMITTER_NAME': 'Test', 'GIT_COMMITTER_EMAIL': 'test@example.com',
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            _make_repo(tmp)
+            deep = os.path.join(tmp, 'sub', 'deep')
+            os.makedirs(deep)
+            with open(os.path.join(deep, 'gamma.txt'), 'w') as f:
+                f.write('gammamarker\n')
+            subprocess.run(['git', '-C', tmp, 'add', '-A'], check=True,
+                           capture_output=True, env=env)
+            subprocess.run(['git', '-C', tmp, 'commit', '-q', '-m',
+                            'third add gamma in subdir'], check=True,
+                           capture_output=True, env=env)
+            with TmuxFixture(cols=120, rows=30) as t:
+                # Launch from the nested subdir, not the repo root.
+                t.send_line(f'cd {shlex.quote(deep)}')
+                t.launch(_BIN, '--run-py', _RECIPE)
+                t.wait_for('third add gamma in subdir', timeout=5.0)
+                t.send('Right')                          # expand HEAD commit
+                t.wait_for('[A] sub/deep/gamma.txt', timeout=5.0)
+                t.send('Down')                           # cursor -> file row
+                # The diff preview must paint the added line; before the fix
+                # this stayed empty (root-relative path resolved against cwd).
+                t.wait_for('gammamarker', timeout=5.0)
+                t.send('q')
+
     def test_drills_into_commit_files(self):
         """Right-arrow on a commit reveals its changed files."""
         with tempfile.TemporaryDirectory() as tmp:
