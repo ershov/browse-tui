@@ -1588,12 +1588,16 @@ class TestTreeChildrenPreview(unittest.TestCase):
         ])
         try:
             saved = self.r._TREE_MODE
-            saved_renderers = dict(self.r._RENDERERS)
+            saved_render_user = self.r._render_user
             try:
                 self.r._TREE_MODE = True
-                def _boom(_obj):
+                # The first child is a turn-root user prompt, which
+                # ``_render_record_with_rule`` renders via ``_render_user``
+                # directly (banded path) — so boom that, accepting the
+                # threaded ``bg`` kwarg.
+                def _boom(_obj, *a, **k):
                     raise RuntimeError('PROBE_BOOM_MSG')
-                self.r._RENDERERS['user'] = _boom
+                self.r._render_user = _boom
                 out = ''.join(self.r._preview_umbrella(('prompt', path, 0)))
                 # The failing child's error appears…
                 self.assertIn('RuntimeError', out)
@@ -1601,8 +1605,7 @@ class TestTreeChildrenPreview(unittest.TestCase):
                 # …and the next child still renders.
                 self.assertIn('PROBE_GOOD_ASST', out)
             finally:
-                self.r._RENDERERS.clear()
-                self.r._RENDERERS.update(saved_renderers)
+                self.r._render_user = saved_render_user
                 self.r._TREE_MODE = saved
         finally:
             os.unlink(path)
@@ -1830,10 +1833,12 @@ class TestTurnRootRule(unittest.TestCase):
     """Turn-opening user prompts get a full-width dark-blue divider.
 
     A composed preview's ``── user ──`` rule for a turn root spans the
-    full preview width and carries the dark-blue band (``48;5;17``), so
-    successive turns pop. Every OTHER rule (assistant, tool, non-voice
-    user, …) keeps the fixed ~60-wide, fg-only form. Standalone leaf
-    previews carry no rule at all (that's ``_preview_message``).
+    full preview width and carries the dark-blue band (``48;5;17``), and
+    the prompt body below it is painted on the same band, so successive
+    turns pop. Every OTHER rule (assistant, tool, non-voice user, …)
+    keeps the fixed ~60-wide, fg-only form and an un-banded body.
+    Standalone leaf previews carry no rule at all (that's
+    ``_preview_message``).
     """
 
     @classmethod
@@ -1985,9 +1990,11 @@ class TestTurnRootRule(unittest.TestCase):
         self.assertIn(self.r.BLUE_BG, line)
         self.assertEqual(len(self._visible(line)), 60)
 
-    def test_only_divider_styled_body_renders_normally(self):
-        # The band styles ONLY the divider line; the prompt body is the
-        # normal voice render below it.
+    def test_turn_root_body_is_banded(self):
+        # The whole turn-root prompt is painted on the dark-blue band:
+        # the divider, the ``▶ user`` header, and the voice body below.
+        # Every logical line re-asserts the bg (the pane drops SGR at
+        # each \n) and the block closes with a final reset.
         self.r._BROWSER = None
         path = self._write_jsonl([
             {'type': 'user', 'uuid': 'u1',
@@ -1997,7 +2004,10 @@ class TestTurnRootRule(unittest.TestCase):
         head, body = rendered.split('\n', 1)
         self.assertIn(self.r.BLUE_BG, head)
         self.assertIn('PROBE_BODY_TEXT', body)
-        self.assertNotIn(self.r.BLUE_BG, body)
+        for line in body.split('\n'):
+            self.assertTrue(line.startswith(self.r.BLUE_BG),
+                            f'body line not banded: {line!r}')
+        self.assertTrue(rendered.endswith(self.r.RESET))
 
 
 class TestTurnRootRuleNoColor(unittest.TestCase):

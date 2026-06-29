@@ -104,13 +104,21 @@ _MD_COLOR = _md2ansi_fn is not None  # default on when available
 _BROWSER = None  # set in main() — used for preview-width lookup
 
 
-def _md_voice(text):
-    """Run voice text through md2ansi when colored mode is on."""
+def _md_voice(text, current_style='0'):
+    """Run voice text through md2ansi when colored mode is on.
+
+    ``current_style`` is md2ansi's reset baseline (raw SGR params, no
+    ``\x1b[``/``m``): a styled span opens as ``current_style;<sgr>`` and
+    resets back to ``current_style`` rather than a hard ``\x1b[0m``. Pass
+    a background (e.g. ``BLUE_BG_PARAMS``) to keep that bg behind styled
+    voice; plain prose still needs a per-line bg prefix from the caller
+    (see ``_band_block``).
+    """
     if not _MD_COLOR or _md2ansi_fn is None or not text:
         return text
     try:
         width = (_BROWSER.preview_width if _BROWSER else 0) or 80
-        return _md2ansi_fn(text, line_width=width)
+        return _md2ansi_fn(text, current_style, line_width=width)
     except Exception:
         return text
 
@@ -155,8 +163,14 @@ WHITE   = '\x1b[38;5;253m'
 
 # Dark-blue background (256-index 17, the recipe's existing dark blue —
 # see ``_ROW_BG_FOR_KIND['subagent']``) for the full-width turn-opening
-# ``── user ──`` divider so successive prompts pop in a composed preview.
-BLUE_BG = '\x1b[48;5;17m'
+# ``── user ──`` divider AND the prompt body banded beneath it, so
+# successive turns pop in a composed preview. ``BLUE_BG_PARAMS`` (the raw
+# SGR params) is kept separate so it can be threaded as md2ansi's
+# ``current_style`` — voice-span resets then land back on the band
+# instead of a hard ``\x1b[0m`` that would punch a hole in it (mirrors
+# ``CMD_BG_PARAMS``).
+BLUE_BG_PARAMS = '48;5;17'
+BLUE_BG = f'\x1b[{BLUE_BG_PARAMS}m'
 
 
 def _init_color():
@@ -2314,8 +2328,14 @@ def _classify(obj):
 # ---- per-record renderers ------------------------------------------------
 
 
-def _render_user(obj):
-    """User turn: plain prompt, tool_result, or synthetic meta entry."""
+def _render_user(obj, bg='0'):
+    """User turn: plain prompt, tool_result, or synthetic meta entry.
+
+    ``bg`` is the md2ansi reset baseline (raw SGR params) for the prompt
+    body — ``'0'`` (plain) for every caller except the composed-preview
+    turn-root path, which passes ``BLUE_BG_PARAMS`` so the prompt's voice
+    markdown stays on the dark-blue band.
+    """
     msg = obj.get('message') if isinstance(obj.get('message'), dict) else {}
     content = msg.get('content', '')
     is_meta = bool(obj.get('isMeta'))
@@ -2340,14 +2360,18 @@ def _render_user(obj):
         chips.append(f'{_PERM_COLOR.get(pmode, MUTE)}[{pmode}]{RESET}')
     out = ['  '.join([head] + chips)]
     out.append('')
-    out.append(_user_body_text(content))
+    out.append(_user_body_text(content, bg))
     return '\n'.join(out)
 
 
-def _user_body_text(content):
-    """Render the textual portion of a user content payload."""
+def _user_body_text(content, bg='0'):
+    """Render the textual portion of a user content payload.
+
+    ``bg`` threads to ``_md_voice`` as md2ansi's ``current_style`` — see
+    ``_render_user``.
+    """
     if isinstance(content, str):
-        return _md_voice(content)
+        return _md_voice(content, bg)
     if isinstance(content, list):
         chunks = []
         for part in content:
@@ -2358,7 +2382,7 @@ def _user_body_text(content):
                 chunks.append(part.get('text', '') or '')
             # tool_result handled in _render_tool_result; tool_use not
             # expected on a user record.
-        return _md_voice('\n\n'.join(c for c in chunks if c))
+        return _md_voice('\n\n'.join(c for c in chunks if c), bg)
     return str(content) if content is not None else ''
 
 
@@ -2441,6 +2465,26 @@ def _rule(title='', color=None, *, width=None, bg=None):
     bar = '─' * max(0, w - len(title) - 4)
     body = f'── {title} {bar}' if title else '─' * w
     return f'{bg or ""}{color or MUTE}{body}{RESET}'
+
+
+def _band_block(text, bg):
+    """Paint a continuous background ``bg`` behind a multi-line block.
+
+    The preview pane re-emits SGR across the wrapped sub-rows of one
+    logical line but drops it at every ``\n`` (each logical line wraps
+    with a fresh SGR state), so a single leading ``bg`` only colors the
+    first line. Re-assert ``bg`` at the start of every logical line, and
+    after any hard reset within a line (chrome ``\x1b[0m`` would
+    otherwise punch a hole), then close with one final reset. Empty
+    ``bg`` (NO_COLOR) is a passthrough. Pair with ``current_style=<bg
+    params>`` on the colorer so md2ansi's own span resets stay on the
+    band too.
+    """
+    if not bg:
+        return text
+    return '\n'.join(
+        bg + line.replace(RESET, RESET + bg) for line in text.split('\n')
+    ) + RESET
 
 
 # ---- tool umbrella previews ----------------------------------------------
@@ -6164,21 +6208,28 @@ def _render_record_with_rule(path, n):
     """Read one record, render its body, prefix with a section rule.
 
     Most leaves get the fixed ~60-wide bright-yellow rule. A
-    turn-opening user prompt gets a FULL-WIDTH dark-blue band instead
-    (bold-white title), so successive turns stand out as the visual
-    anchors of a composed multi-turn preview. Only the divider line is
-    styled — the prompt body renders normally.
+    turn-opening user prompt gets a FULL-WIDTH dark-blue band for its
+    divider (bold-white title) AND has its whole prompt painted on the
+    same dark-blue background — ``current_style`` keeps the band behind
+    the voice markdown's styled spans, ``_band_block`` re-asserts it per
+    logical line — so successive turns stand out as the visual anchors
+    of a composed multi-turn preview.
     """
     obj = _read_jsonl_line(path, n)
     if obj is None or not isinstance(obj, dict):
         return None
     kind = _classify(obj)
-    body = _RENDERERS.get(kind, _render_unknown)(obj)
     if _is_turn_root(obj):
+        # A turn root is always a 'user' record (``_is_turn_root``), so
+        # ``_render_user`` is the right renderer; thread the band's SGR
+        # params as md2ansi's reset baseline, then band every line.
         width = getattr(_BROWSER, 'preview_width', 0) or 60
         rule = _rule(kind, BOLD + WHITE, width=width, bg=BLUE_BG)
-    else:
-        rule = _rule(kind, YELLOW)
+        cs = BLUE_BG_PARAMS if BLUE_BG else '0'
+        body = _band_block(_render_user(obj, bg=cs), BLUE_BG)
+        return rule + '\n' + body
+    body = _RENDERERS.get(kind, _render_unknown)(obj)
+    rule = _rule(kind, YELLOW)
     return rule + '\n' + body
 
 
