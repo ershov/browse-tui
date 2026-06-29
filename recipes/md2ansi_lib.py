@@ -1552,6 +1552,16 @@ def md2ansi(text, current_style="0", line_width=0, cell_min_width=20, row_divide
     # final pass). Subsumes the former `\x00` strip.
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = _M2A_C0_KILL.sub("�", text)
+    # Style sanitizer: enforce the §5.2 invariant that the base style begins with
+    # the reset code `0`. Every span closes by re-emitting `current_style`; that
+    # only CLEARS attributes a span layered on (bold/italic/fg/…) when it starts
+    # with `0` (SGR "reset all"). A caller-supplied ambient like `48;5;236` would
+    # otherwise re-assert just the background and leave bold/italic leaking onto
+    # following text. Prepending `0;` is idempotent (`"0"`/`"0;…"` pass through)
+    # and lossless — the caller's full ambient still follows the reset — so the
+    # close becomes `\x1b[0;{ambient}m`: clear all, then re-apply the ambient.
+    if current_style != "0" and not current_style.startswith("0;"):
+        current_style = "0;" + current_style
     state_lw = line_width if line_width > 0 else 150
     state = M2A_DocumentState(
         line_width=state_lw,
