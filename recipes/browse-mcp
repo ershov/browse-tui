@@ -304,6 +304,7 @@ def main():
         title=title,
         get_children=get_children,
         get_preview=get_preview,
+        on_enter='noop',
         actions=[
             Action('a', 'About server (serverInfo)', show_about, 'none'),
         ],

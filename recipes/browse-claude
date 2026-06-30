@@ -8125,6 +8125,7 @@ def main():
         get_preview=get_preview,
         root_id=None,
         initial_scope=initial_scope,
+        on_enter='noop',
         actions=[
             # v / e are the framework defaults (page / edit the preview text).
             # V / E open the underlying source file instead.

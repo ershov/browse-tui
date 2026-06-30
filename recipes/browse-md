@@ -2567,6 +2567,7 @@ def main():
         get_children=get_children,
         get_preview=get_preview,
         initial_scope=initial_scope,
+        on_enter='noop',
         actions=actions,
         on_expand=_on_expand,
         # Right-click (or the backslash / F1 keys) on a row opens a menu keyed

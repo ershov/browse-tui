@@ -129,6 +129,7 @@ def main():
         title='browse-jira',
         get_children=get_children,
         get_preview=get_preview,
+        on_enter='noop',
         actions=[
             Action('o', 'Open ticket in $BROWSER (or xdg-open)',
                    open_in_browser, 'cursor'),
