@@ -13,11 +13,15 @@ chips on commit rows.
   per-file diff. Scoped by positional revs / paths, or spanned over every
   local branch with `--all` (git log's `--branches`). An unscoped log is
   preceded by up to four synthetic working-change rows — `Untracked
-  changes` / `Tracked changes` / `Staged changes` / `Conflicts` — each
-  shown only when non-empty and drillable into its files. Under `--all`
-  these rows are spliced above each worktree's tip commit and carry that
-  worktree's branch-name chip, so several worktrees stacked at one shared
-  commit stay attributable.
+  changes` / `Unstaged changes` / `Staged changes` / `Conflicts` — each
+  shown only when non-empty and drillable into its files. A file's diff is
+  scoped to the group it sits in: `Staged changes` shows `git diff
+  --cached`, `Unstaged changes` shows the working-tree diff against the
+  index — so a file staged *and* modified (`MM`) shows only its staged half
+  under `Staged changes` and only its unstaged half under `Unstaged
+  changes`. Under `--all` these rows are spliced above each worktree's tip
+  commit and carry that worktree's branch-name chip, so several worktrees
+  stacked at one shared commit stay attributable.
 - **status** — `git status` working-tree entries; the leaf preview is
   the staged and/or worktree diff chosen by the porcelain `XY` code
   (`MM` shows both sections; `??` renders the file as an addition).

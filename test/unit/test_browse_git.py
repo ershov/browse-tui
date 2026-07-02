@@ -607,9 +607,9 @@ class TestDispatchRoundTrip(unittest.TestCase):
         # None) scopes by ``_paths``, a linked one (abspath) skips the filter.
         self.r.get_children(('wc', 'staged', None))
         self.assertEqual(calls['wc'], ('staged', None))
-        self.r.get_children(('wc', 'tracked', '/repo/.claude/worktrees/foo'))
+        self.r.get_children(('wc', 'unstaged', '/repo/.claude/worktrees/foo'))
         self.assertEqual(
-            calls['wc'], ('tracked', '/repo/.claude/worktrees/foo'))
+            calls['wc'], ('unstaged', '/repo/.claude/worktrees/foo'))
         # A stash node routes by its int index.
         self.r.get_children(('stash', 2))
         self.assertEqual(calls['stash'], 2)
@@ -632,8 +632,8 @@ class TestDispatchRoundTrip(unittest.TestCase):
         self.r._file_preview = (
             lambda sha, path: seen.__setitem__('file', (sha, path)))
         self.r._status_preview = (
-            lambda xy, path, wt_path=None: seen.__setitem__(
-                'status', (xy, path, wt_path)))
+            lambda xy, path, wt_path=None, bucket=None: seen.__setitem__(
+                'status', (xy, path, wt_path, bucket)))
         self.r._worktree_preview = (
             lambda bucket, paths, wt_path=None: seen.__setitem__(
                 'wc', (bucket, wt_path)))
@@ -651,16 +651,17 @@ class TestDispatchRoundTrip(unittest.TestCase):
         # A file's sha/path ride at id[2]/id[3]; a colon-bearing path is intact.
         self.r.get_preview(('file', 'root', 'sha', 'a/b:c.txt'))
         # A status-mode leaf carries no worktree → wt_path None; a
-        # worktree-group leaf threads its wt_path (id[1][1]) to _status_preview.
+        # worktree-group leaf threads its wt_path (id[1][1]) and bucket
+        # (id[1][0]) to _status_preview.
         self.r.get_preview(('status', 'M ', 'x:y.py'))
-        self.r.get_preview(('status', ('tracked', '/wt/foo'), ' M', 'z.py'))
-        self.r.get_preview(('wc', 'tracked', None))
+        self.r.get_preview(('status', ('unstaged', '/wt/foo'), ' M', 'z.py'))
+        self.r.get_preview(('wc', 'unstaged', None))
         self.r.get_preview(('stash', 1))
         self.r.get_preview(('stash', 1, 'a:b.py'))
         self.assertEqual(seen, {
             'file': ('sha', 'a/b:c.txt'),
-            'status': (' M', 'z.py', '/wt/foo'),
-            'wc': ('tracked', None),
+            'status': (' M', 'z.py', '/wt/foo', 'unstaged'),
+            'wc': ('unstaged', None),
             'stash': 1,
             'stashfile': (1, 'a:b.py'),
         })
@@ -1241,6 +1242,64 @@ class TestStatusDiffPlan(unittest.TestCase):
             ('untracked',
              ['-C', wt, 'diff', '--no-index', '--', '/dev/null', 'f.txt'])])
 
+    def test_bucket_staged_shows_only_cached(self):
+        # Under the Staged group a two-sided MM shows ONLY --cached.
+        self.assertEqual(
+            self.r._status_diff_plan('MM', 'f.txt', bucket='staged'),
+            [('staged', ['diff', '--cached', '--', 'f.txt'])])
+
+    def test_bucket_unstaged_shows_only_worktree(self):
+        # Under the Unstaged group the SAME MM shows ONLY the worktree diff
+        # (against the index), never the --cached half.
+        self.assertEqual(
+            self.r._status_diff_plan('MM', 'f.txt', bucket='unstaged'),
+            [('unstaged', ['diff', '--', 'f.txt'])])
+
+    def test_bucket_conflicts_shows_combined_diff(self):
+        self.assertEqual(
+            self.r._status_diff_plan('UU', 'f.txt', bucket='conflicts'),
+            [('conflict', ['diff', '--', 'f.txt'])])
+
+    def test_bucket_untracked_uses_no_index(self):
+        self.assertEqual(
+            self.r._status_diff_plan('??', 'f.txt', bucket='untracked'),
+            [('untracked', ['diff', '--no-index', '--', '/dev/null', 'f.txt'])])
+
+    def test_bucket_and_wt_path_combine(self):
+        # bucket scopes the plan; wt_path still prepends -C to the single argv.
+        wt = '/repo/.claude/worktrees/foo'
+        self.assertEqual(
+            self.r._status_diff_plan('MM', 'f.txt', wt, bucket='staged'),
+            [('staged', ['-C', wt, 'diff', '--cached', '--', 'f.txt'])])
+
+
+class TestStatusBucket(unittest.TestCase):
+    """``_status_bucket`` extracts a status leaf's worktree group (or None)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def test_status_mode_leaf_has_no_bucket(self):
+        # A bare 3-tuple status-mode leaf → None (full per-XY diff).
+        self.assertIsNone(self.r._status_bucket(('status', 'M ', 'f.txt')))
+
+    def test_worktree_group_leaf_returns_bucket(self):
+        # A worktree-group leaf returns its bucket (id[1][0]).
+        self.assertEqual(
+            self.r._status_bucket(('status', ('staged', None), 'MM', 'f.txt')),
+            'staged')
+        self.assertEqual(
+            self.r._status_bucket(
+                ('status', ('unstaged', '/wt'), 'MM', 'f.txt')),
+            'unstaged')
+
+    def test_unrelated_4tuple_is_not_misread(self):
+        # A reflog-drilled commit file 4-tuple (id[1] is a tuple too) must NOT
+        # be read as a bucket — gated on id[0] == 'status'.
+        self.assertIsNone(
+            self.r._status_bucket(('file', ('reflog', 0), 'sha', 'f.txt')))
+
 
 class TestStatusWtPath(unittest.TestCase):
     """``_status_wt_path`` extracts a status leaf's worktree (or None)."""
@@ -1256,13 +1315,13 @@ class TestStatusWtPath(unittest.TestCase):
     def test_worktree_group_leaf_current_is_none(self):
         # A current-worktree group leaf carries wt_path None.
         self.assertIsNone(
-            self.r._status_wt_path(('status', ('tracked', None), ' M', 'f.txt')))
+            self.r._status_wt_path(('status', ('unstaged', None), ' M', 'f.txt')))
 
     def test_worktree_group_leaf_linked_returns_abspath(self):
         # A linked-worktree group leaf returns its absolute wt_path (id[1][1]).
         wt = '/repo/.claude/worktrees/foo'
         self.assertEqual(
-            self.r._status_wt_path(('status', ('tracked', wt), ' M', 'f.txt')),
+            self.r._status_wt_path(('status', ('unstaged', wt), ' M', 'f.txt')),
             wt)
 
     def test_non_status_4tuple_with_tuple_at_1_is_none(self):
@@ -2175,13 +2234,13 @@ class TestClassifyWorktree(unittest.TestCase):
             buckets = self.r._classify_worktree([(xy, 'c.txt')])
             self.assertEqual(buckets['conflicts'], [(xy, 'c.txt')], xy)
             self.assertEqual(buckets['staged'], [], xy)
-            self.assertEqual(buckets['tracked'], [], xy)
+            self.assertEqual(buckets['unstaged'], [], xy)
             self.assertEqual(buckets['untracked'], [], xy)
 
     def test_two_sided_code_is_both_staged_and_tracked(self):
         buckets = self.r._classify_worktree([('MM', 'both.txt')])
         self.assertEqual(buckets['staged'], [('MM', 'both.txt')])
-        self.assertEqual(buckets['tracked'], [('MM', 'both.txt')])
+        self.assertEqual(buckets['unstaged'], [('MM', 'both.txt')])
         self.assertEqual(buckets['untracked'], [])
         self.assertEqual(buckets['conflicts'], [])
 
@@ -2189,19 +2248,19 @@ class TestClassifyWorktree(unittest.TestCase):
         buckets = self.r._classify_worktree([('??', 'new.txt')])
         self.assertEqual(buckets['untracked'], [('??', 'new.txt')])
         self.assertEqual(buckets['staged'], [])
-        self.assertEqual(buckets['tracked'], [])
+        self.assertEqual(buckets['unstaged'], [])
         self.assertEqual(buckets['conflicts'], [])
 
     def test_staged_only(self):
         buckets = self.r._classify_worktree([('M ', 's.txt')])
         self.assertEqual(buckets['staged'], [('M ', 's.txt')])
-        self.assertEqual(buckets['tracked'], [])
+        self.assertEqual(buckets['unstaged'], [])
         self.assertEqual(buckets['untracked'], [])
         self.assertEqual(buckets['conflicts'], [])
 
     def test_tracked_only(self):
         buckets = self.r._classify_worktree([(' M', 'w.txt')])
-        self.assertEqual(buckets['tracked'], [(' M', 'w.txt')])
+        self.assertEqual(buckets['unstaged'], [(' M', 'w.txt')])
         self.assertEqual(buckets['staged'], [])
         self.assertEqual(buckets['untracked'], [])
         self.assertEqual(buckets['conflicts'], [])
@@ -2210,7 +2269,7 @@ class TestClassifyWorktree(unittest.TestCase):
         buckets = self.r._classify_worktree([])
         self.assertEqual(buckets, {
             'untracked': [],
-            'tracked': [],
+            'unstaged': [],
             'staged': [],
             'conflicts': [],
         })
@@ -2268,7 +2327,7 @@ class TestWorktreeGroups(unittest.TestCase):
         self.assertEqual(
             [(it.id, it.title) for it in items],
             [(('wc', 'untracked', None), 'Untracked changes'),
-             (('wc', 'tracked', None), 'Tracked changes'),
+             (('wc', 'unstaged', None), 'Unstaged changes'),
              (('wc', 'staged', None), 'Staged changes'),
              (('wc', 'conflicts', None), 'Conflicts')])
         self.assertTrue(all(it.has_children for it in items))
@@ -2348,7 +2407,7 @@ class TestWorktreeGroups(unittest.TestCase):
         # _WC_GROUPS defines BOTH order and labels for the four buckets.
         self.assertEqual(self.r._WC_GROUPS, [
             ('untracked', 'Untracked changes'),
-            ('tracked', 'Tracked changes'),
+            ('unstaged', 'Unstaged changes'),
             ('staged', 'Staged changes'),
             ('conflicts', 'Conflicts'),
         ])
@@ -2936,22 +2995,22 @@ class TestWorktreeFiles(unittest.TestCase):
         # the other (before the fix both were ('status', 'MM', path)).
         self.r._worktree_status = lambda paths, wt_path=None: [('MM', 'd.py')]
         staged = self.r._worktree_files('staged', [])
-        tracked = self.r._worktree_files('tracked', [])
+        tracked = self.r._worktree_files('unstaged', [])
         self.assertEqual([it.id for it in staged],
                          [('status', ('staged', None), 'MM', 'd.py')])
         self.assertEqual([it.id for it in tracked],
-                         [('status', ('tracked', None), 'MM', 'd.py')])
+                         [('status', ('unstaged', None), 'MM', 'd.py')])
         self.assertNotEqual(staged[0].id, tracked[0].id)
 
     def test_same_path_distinct_across_worktrees(self):
         # The same dirty path under two worktrees → distinct leaf ids (the
         # wt_path half of the ns differs).
         self.r._worktree_status = lambda paths, wt_path=None: [(' M', 'd.py')]
-        cwd = self.r._worktree_files('tracked', [], None)
-        linked = self.r._worktree_files('tracked', [], '/wt2')
-        self.assertEqual(cwd[0].id, ('status', ('tracked', None), ' M', 'd.py'))
+        cwd = self.r._worktree_files('unstaged', [], None)
+        linked = self.r._worktree_files('unstaged', [], '/wt2')
+        self.assertEqual(cwd[0].id, ('status', ('unstaged', None), ' M', 'd.py'))
         self.assertEqual(linked[0].id,
-                         ('status', ('tracked', '/wt2'), ' M', 'd.py'))
+                         ('status', ('unstaged', '/wt2'), ' M', 'd.py'))
         self.assertNotEqual(cwd[0].id, linked[0].id)
 
 
@@ -2988,7 +3047,7 @@ class TestWorktreePreviewStat(unittest.TestCase):
 
     def test_tracked_uses_diff_stat(self):
         self._set_status([(' M', 'b.txt')])
-        out = self.r._worktree_preview('tracked', [])
+        out = self.r._worktree_preview('unstaged', [])
         self.assertEqual(self.calls, [('diff', '--stat', '--', 'b.txt')])
         self.assertNotIn('DELTA', out)
 
@@ -3149,7 +3208,7 @@ class TestWorktreeTipsRealGit(unittest.TestCase):
     def _tracked_group_id(self, items):
         return next((it.id for it in items
                      if isinstance(it.id, tuple) and it.id[0] == 'wc'
-                     and it.id[1] == 'tracked'), None)
+                     and it.id[1] == 'unstaged'), None)
 
     def test_all_branches_shows_linked_worktree_group_and_drills_it(self):
         self.r._mode = 'commits'
@@ -3158,7 +3217,7 @@ class TestWorktreeTipsRealGit(unittest.TestCase):
         self.r._paths = []
         items = self.r._commits_root()
         gid = self._tracked_group_id(items)
-        # A 'Tracked changes' group exists, scoped to the LINKED worktree.
+        # A 'Unstaged changes' group exists, scoped to the LINKED worktree.
         self.assertIsNotNone(gid, 'no tracked-changes group injected')
         self.assertEqual(gid[2], self._linked_path())
         # Drilling it lists the linked worktree's dirty file (the main
@@ -3168,7 +3227,7 @@ class TestWorktreeTipsRealGit(unittest.TestCase):
         files = self.r.get_children(gid)
         self.assertEqual(
             [it.id for it in files],
-            [('status', ('tracked', self._linked_path()), ' M', 'tracked.txt')])
+            [('status', ('unstaged', self._linked_path()), ' M', 'tracked.txt')])
         # Its preview is a real --stat from the linked worktree.
         prev = self.r.get_preview(gid)
         self.assertIn('tracked.txt', re.sub(r'\x1b\[[0-9;]*m', '', prev))
@@ -3184,7 +3243,7 @@ class TestWorktreeTipsRealGit(unittest.TestCase):
         files = self.r.get_children(gid)
         self.assertEqual(
             [it.id for it in files],
-            [('status', ('tracked', self._linked_path()), ' M', 'tracked.txt')])
+            [('status', ('unstaged', self._linked_path()), ' M', 'tracked.txt')])
 
     def test_linked_branch_ref_drilldown_shows_its_groups(self):
         # branches-mode: drilling the 'feat' ref (checked out in the linked
@@ -3261,7 +3320,7 @@ class TestWorktreeStatusActionsRealGit(unittest.TestCase):
     def test_linked_leaf_preview_shows_linked_worktree_diff(self):
         # The namespaced linked leaf previews the LINKED file's change, NOT the
         # main worktree's (which would be the cwd-scoped, wrong diff).
-        leaf = ('status', ('tracked', self._linked_path()), ' M', 'linked.txt')
+        leaf = ('status', ('unstaged', self._linked_path()), ' M', 'linked.txt')
         prev = self._plain(self.r.get_preview(leaf))
         self.assertIn('LINKED-CHANGE', prev)
         self.assertNotIn('CWD-CHANGE', prev)
@@ -3273,7 +3332,7 @@ class TestWorktreeStatusActionsRealGit(unittest.TestCase):
     def test_current_worktree_leaf_preview_is_cwd(self):
         # A current-worktree group leaf (wt_path None) previews the cwd file,
         # exactly as before the fix.
-        leaf = ('status', ('tracked', None), ' M', 'cwd.txt')
+        leaf = ('status', ('unstaged', None), ' M', 'cwd.txt')
         prev = self._plain(self.r.get_preview(leaf))
         self.assertIn('CWD-CHANGE', prev)
         self.assertNotIn('LINKED-CHANGE', prev)
@@ -3293,7 +3352,7 @@ class TestWorktreeStatusActionsRealGit(unittest.TestCase):
         # bug this fix closes.
         self.assertEqual(self._staged_in(self.linked), [])
         self.assertEqual(self._staged_in(self.main), [])
-        leaf = ('status', ('tracked', self._linked_path()), ' M', 'linked.txt')
+        leaf = ('status', ('unstaged', self._linked_path()), ' M', 'linked.txt')
         ctx = _StageCtx()
         self.r._MENU_ACTIONS['status.stage'](ctx, leaf)
         self.assertTrue(ctx.refreshed, 'stage did not succeed')
@@ -4712,10 +4771,10 @@ class TestStdinTreeAndPreviews(unittest.TestCase):
         self.assertIsNone(self.r._STDIN_KIND)
         seen = {}
         self.r._status_preview = (
-            lambda xy, path, wt_path=None: seen.__setitem__(
-                'args', (xy, path, wt_path)) or 'REPO')
+            lambda xy, path, wt_path=None, bucket=None: seen.__setitem__(
+                'args', (xy, path, wt_path, bucket)) or 'REPO')
         self.assertEqual(self.r.get_preview(('status', 'M ', 'x.py')), 'REPO')
-        self.assertEqual(seen['args'], ('M ', 'x.py', None))
+        self.assertEqual(seen['args'], ('M ', 'x.py', None, None))
 
 
 @unittest.skipUnless(shutil.which('git'), 'git not available')

@@ -140,7 +140,7 @@ def _make_repo_with_shared_head_worktrees(tmpdir):
     Both branches (``main`` and the linked ``feat``) point at the SAME commit,
     and each work tree carries a tracked modification. In ``--all`` mode the
     log shows that commit once, and ``_inject_worktree_tips`` stacks both
-    worktrees' synthetic ``Tracked changes`` rows above it — the case the
+    worktrees' synthetic ``Unstaged changes`` rows above it — the case the
     branch-name chip disambiguates. The linked worktree lives OUTSIDE
     ``tmpdir`` (sibling ``<tmpdir>_wt``) so it isn't itself an untracked
     entry. Returns ``(main_dir, wt_dir)``.
@@ -637,13 +637,13 @@ class TestBrowseGit(unittest.TestCase):
                 t.send_line(f'cd {tmp}')
                 t.launch(_BIN, '--run-py', _RECIPE)
                 t.wait_for('Untracked changes', timeout=5.0)
-                t.wait_for('Tracked changes', timeout=5.0)
+                t.wait_for('Unstaged changes', timeout=5.0)
                 cap = t.wait_for('Staged changes', timeout=5.0)
                 lines = cap.splitlines()
                 def row_of(label):
                     return next(i for i, ln in enumerate(lines) if label in ln)
                 untracked = row_of('Untracked changes')
-                tracked = row_of('Tracked changes')
+                tracked = row_of('Unstaged changes')
                 staged = row_of('Staged changes')
                 self.assertLess(untracked, tracked)
                 self.assertLess(tracked, staged)
@@ -654,7 +654,7 @@ class TestBrowseGit(unittest.TestCase):
 
         With two branches (``main`` + linked ``feat``) at one shared commit
         and a tracked edit in each work tree, the all-branches log stacks two
-        ``Tracked changes`` rows above the single commit. Each carries its
+        ``Unstaged changes`` rows above the single commit. Each carries its
         worktree's branch short-name chip, so the otherwise-identical rows
         stay attributable — the row text shows ``main`` on one and ``feat``
         on the other. tmux strips SGR but keeps the chip text.
@@ -665,10 +665,10 @@ class TestBrowseGit(unittest.TestCase):
                 with TmuxFixture(cols=120, rows=30) as t:
                     t.send_line(f'cd {main_dir}')
                     t.launch(_BIN, '--run-py', _RECIPE, '--all')
-                    t.wait_for('Tracked changes', timeout=5.0)
+                    t.wait_for('Unstaged changes', timeout=5.0)
                     cap = t.wait_for('feat', timeout=5.0)
                     tracked_rows = [ln for ln in cap.splitlines()
-                                    if 'Tracked changes' in ln]
+                                    if 'Unstaged changes' in ln]
                     self.assertEqual(len(tracked_rows), 2)
                     joined = '\n'.join(tracked_rows)
                     self.assertIn('main', joined)
@@ -697,7 +697,7 @@ class TestBrowseGit(unittest.TestCase):
                 cap = t.wait_for('second commit add beta', timeout=5.0)
                 self.assertNotIn('Untracked changes', cap)
                 self.assertNotIn('Staged changes', cap)
-                self.assertNotIn('Tracked changes', cap)
+                self.assertNotIn('Unstaged changes', cap)
                 t.send('q')
 
     def test_worktree_group_drills_into_file(self):

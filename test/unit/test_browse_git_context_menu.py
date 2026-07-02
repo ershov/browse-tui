@@ -681,7 +681,7 @@ class TestMMWorktreeLeafExpansionIndependent(unittest.TestCase):
 
     Commits mode, REAL temp repo, the CURRENT worktree only (no multi-worktree
     needed): a file that is both staged and further modified (porcelain ``MM``)
-    is classified into BOTH the 'Staged changes' and 'Tracked changes' groups.
+    is classified into BOTH the 'Staged changes' and 'Unstaged changes' groups.
     Before the fix both leaves shared the id ``('status', 'MM', path)``, so
     expanding the file under one group flipped it under the other; now the
     ``(bucket, wt_path)`` ns makes them distinct and the framework tracks each
@@ -730,11 +730,11 @@ class TestMMWorktreeLeafExpansionIndependent(unittest.TestCase):
         # Sanity: doc.md is the MM file → it appears in BOTH groups with
         # distinct, ns-tagged ids.
         staged = self.r.get_children(('wc', 'staged', None))
-        tracked = self.r.get_children(('wc', 'tracked', None))
+        tracked = self.r.get_children(('wc', 'unstaged', None))
         sid = next(it.id for it in staged if it.id[-1] == 'doc.md')
         tid = next(it.id for it in tracked if it.id[-1] == 'doc.md')
         self.assertEqual(sid, ('status', ('staged', None), 'MM', 'doc.md'))
-        self.assertEqual(tid, ('status', ('tracked', None), 'MM', 'doc.md'))
+        self.assertEqual(tid, ('status', ('unstaged', None), 'MM', 'doc.md'))
         self.assertNotEqual(sid, tid)
 
         # Drive the recipe's REAL get_children through a headless Browser so the
