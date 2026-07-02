@@ -123,6 +123,18 @@ def _render_capture(browser):
         _term._tty_writer = orig
 
 
+def _preview_rows(browser):
+    """Content rows of the preview pane as last painted.
+
+    Reads the differential renderer's row cache rather than emitted
+    bytes — a held repaint of identical rows emits nothing, but the
+    cache always holds what is on screen. Row 0 of the 'h'-layout
+    preview rect is the info-bar header; everything below is content.
+    """
+    lines = browser._pane_cache['preview'].lines
+    return [entry[1] if entry is not None else '' for entry in lines[1:]]
+
+
 # --- Defaults --------------------------------------------------------------
 
 
@@ -503,6 +515,192 @@ class TestInvalidatePreviewPreservesViewState(unittest.TestCase):
             b.drain_main_queue()
             self.assertIsNone(b._state._items_by_id['a'].preview)
             self.assertEqual(b._preview_req, 'a')
+        finally:
+            b.stop_workers()
+
+
+# --- Refresh preserves scroll (passive last-shown-id gate) -----------------
+
+
+class TestRefreshPreservesScroll(unittest.TestCase):
+    """A same-item refresh must not reset the preview scroll.
+
+    ``_do_refresh`` nulls ``_preview_cursor_id`` to force a re-fetch.
+    The scroll/help reset is gated on ``_preview_last_shown_id`` (the
+    last *shown* non-None id) rather than the cursor-id slot, so a
+    refresh — which does not move the cursor — leaves the user's scroll
+    untouched. A genuine move to a different item still resets.
+    """
+
+    def test_same_item_refresh_keeps_scroll(self):
+        b = _make_browser('\n'.join(f'l{i}' for i in range(200)))
+        try:
+            b._update_preview_for_cursor()          # land on 'a'
+            self.assertEqual(b._preview_last_shown_id, 'a')
+            b._preview_scroll = 40
+            # Simulate ``_do_refresh``: force a re-fetch by nulling the
+            # cursor-id slot while the cursor stays on 'a'.
+            b._preview_cursor_id = None
+            b._update_preview_for_cursor()
+            self.assertEqual(b._preview_scroll, 40,
+                             'same-item refresh must not reset scroll')
+            self.assertEqual(b._preview_cursor_id, 'a',
+                             'identity slot re-syncs to the cursor id')
+        finally:
+            b.stop_workers()
+
+    def test_refresh_in_help_mode_keeps_help(self):
+        b = _make_browser('a\nb\n')
+        try:
+            b._update_preview_for_cursor()
+            b._help_mode = True
+            b._preview_cursor_id = None              # refresh forces re-fetch
+            b._update_preview_for_cursor()
+            self.assertTrue(b._help_mode,
+                            'a refresh must not dismiss the help overlay')
+        finally:
+            b.stop_workers()
+
+    def test_genuine_move_still_resets_scroll(self):
+        b = _make_browser('a\nb\n')
+        try:
+            ix = _data.to_item(Item(id='x'))
+            iy = _data.to_item(Item(id='y'))
+            b._state._children[None] = [ix, iy]
+            b._state._items_by_id['x'] = ix
+            b._state._items_by_id['y'] = iy
+            _state.mark_visible_dirty(b._state)
+            ix.preview = 'xx\n' * 10
+            iy.preview = 'yy\n' * 10
+            b._state.cursor = 0
+            b._update_preview_for_cursor()           # show x
+            b._preview_scroll = 15
+            b._state.cursor = 1
+            b._update_preview_for_cursor()           # move to y
+            self.assertEqual(b._preview_scroll, 0,
+                             'moving to a different item resets scroll')
+        finally:
+            b.stop_workers()
+
+
+# --- Streaming re-fill shrink-hold -----------------------------------------
+
+
+class TestStreamingShrinkHoldPreservesScroll(unittest.TestCase):
+    """A same-row re-stream must not lose the user's scroll.
+
+    An umbrella generator refill rebuilds the preview from empty. Once
+    the first tiny chunk lands the row is "delivered", so a naive paint
+    would clamp the user's offset down to the partial. The renderer
+    holds the last snapshot (at its scroll) while the delivered text is
+    still shorter than that snapshot AND a fetch is in flight — swapping
+    to fresh content only once it catches up or the fetch settles.
+    """
+
+    def _scrolled_browser(self):
+        b = _make_browser('\n'.join(f'l{i}' for i in range(200)))
+        b._update_preview_for_cursor()          # land on 'a'
+        b._preview_visit_delivered = True        # content delivered
+        b._preview_scroll = 40
+        _render_preview(b)                       # capture snapshot @ 40
+        return b
+
+    def test_restream_from_tiny_holds_and_keeps_scroll(self):
+        b = self._scrolled_browser()
+        try:
+            self.assertEqual(b._preview_snapshot.id, 'a')
+            self.assertEqual(b._preview_scroll, 40)
+            item = b._state._items_by_id['a']
+            # Re-stream: first tiny chunk lands while the fetch is live.
+            b._preview_req = 'a'
+            b._preview_visit_delivered = True
+            item.preview = 'x0\nx1\nx2\n'
+            item.preview_render = None
+            b._needs_redraw.add('preview')
+            _render_preview(b)
+            rows = '\n'.join(_preview_rows(b))
+            self.assertIn('l40', rows, 'held the snapshot, not the partial')
+            self.assertNotIn('x0', rows)
+            self.assertEqual(b._preview_scroll, 40)
+            # Content catches up → swap to fresh content at kept scroll.
+            item.preview = '\n'.join(f'm{i}' for i in range(200)) + '\n'
+            item.preview_render = None
+            b._needs_redraw.add('preview')
+            _render_preview(b)
+            rows = '\n'.join(_preview_rows(b))
+            self.assertIn('m40', rows, 'fresh content at the preserved scroll')
+            self.assertNotIn('l40', rows)
+            self.assertEqual(b._preview_scroll, 40)
+        finally:
+            b.stop_workers()
+
+    def test_hold_nudges_paused_generator_to_resume(self):
+        # Regression: the shrink-hold's early return skips the #274
+        # demand-pull that is a paused generator's ONLY resume path. The
+        # hold must nudge the paused generator directly, or a long
+        # re-stream (which pauses at its cap below the old snapshot
+        # length) freezes on the stale snapshot forever. Here the fetch
+        # is paused below the snapshot: the hold engages (stable, scroll
+        # kept) AND ``_preview_resume_pull`` is set so the worker
+        # resumes and the buffer grows toward catch-up.
+        b = self._scrolled_browser()
+        try:
+            item = b._state._items_by_id['a']
+            b._preview_req = 'a'
+            b._preview_visit_delivered = True
+            b._preview_paused = {'id': 'a', 'gen': None,
+                                 'chars': 9, 'lines': 3}
+            b._preview_resume_pull = False
+            item.preview = 'x0\nx1\nx2\n'
+            item.preview_render = None
+            b._needs_redraw.add('preview')
+            _render_preview(b)
+            rows = '\n'.join(_preview_rows(b))
+            self.assertIn('l40', rows, 'held the snapshot, not the partial')
+            self.assertEqual(b._preview_scroll, 40)
+            self.assertTrue(
+                b._preview_resume_pull,
+                'the hold must resume the paused generator, else a long '
+                're-stream freezes on stale content',
+            )
+        finally:
+            b.stop_workers()
+
+    def test_settled_shorter_content_is_shown_not_held(self):
+        # A permanent shrink (generator exhausts → _preview_req clears)
+        # must show the new, genuinely-shorter content — never freeze on
+        # the old snapshot.
+        b = self._scrolled_browser()
+        try:
+            item = b._state._items_by_id['a']
+            b._preview_req = None                # fetch settled
+            b._preview_visit_delivered = True
+            item.preview = 'short0\nshort1\n'
+            item.preview_render = None
+            b._needs_redraw.add('preview')
+            _render_preview(b)
+            rows = '\n'.join(_preview_rows(b))
+            self.assertIn('short0', rows)
+            self.assertNotIn('l40', rows)
+        finally:
+            b.stop_workers()
+
+    def test_tail_pin_ignores_shrink_hold(self):
+        # A pinned view follows the growing bottom during a re-stream —
+        # the shrink-hold must not engage.
+        b = self._scrolled_browser()
+        try:
+            item = b._state._items_by_id['a']
+            b._preview_at_tail = True
+            b._preview_req = 'a'
+            b._preview_visit_delivered = True
+            item.preview = 'x0\nx1\nx2\n'
+            item.preview_render = None
+            b._needs_redraw.add('preview')
+            _render_preview(b)
+            rows = '\n'.join(_preview_rows(b))
+            self.assertIn('x2', rows, 'tail-follow rides the new tail')
+            self.assertNotIn('l40', rows)
         finally:
             b.stop_workers()
 

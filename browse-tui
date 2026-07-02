@@ -5758,8 +5758,11 @@ class Browser:
         # is active iff this list contains any non-empty entries.
         self._filters: list = []
         # Preview pane scroll offset (lines from top of preview content).
-        # Reset whenever the preview content changes; nudged by the
-        # shift-up/shift-down handlers in the action layer (#12).
+        # Reset to 0 only on a genuine navigation to a *different* item
+        # (see ``_preview_last_shown_id``) and by the explicit scroll
+        # actions (shift-up/down etc., #12) — NOT by a same-item refresh
+        # or re-stream, so the user's place survives Ctrl-R / background
+        # reloads. The renderer clamps the *displayed* offset each paint.
         self._preview_scroll = 0
         # Tail-follow flag: when True, the renderer forces the scroll
         # to ``max_scroll`` every pass so the view sticks to the bottom
@@ -5784,12 +5787,20 @@ class Browser:
         # the flag.
         self._help_mode = False
         # Last cursor item id we drove the preview pane to. Set by
-        # _update_preview_for_cursor; when the cursor lands on a
-        # different (or no) item we treat that as a navigation event
-        # and reset the preview pane: scroll back to the top and
-        # dismiss the help overlay so the user sees the new item's
-        # preview, not stale state from the previous one.
+        # _update_preview_for_cursor; used as the request/identity gate
+        # (skip re-requests when the cursor stays put). ``_do_refresh``
+        # nulls it to force a re-fetch, so it is NOT a reliable
+        # "navigation happened" signal — the scroll/help reset keys off
+        # ``_preview_last_shown_id`` instead.
         self._preview_cursor_id = None
+        # Last *shown* (non-None) preview id. Unlike ``_preview_cursor_id``
+        # this is never nulled by a refresh and never records the
+        # transient ``None`` a reloading row briefly resolves to, so a
+        # change here means a real navigation to a different item — the
+        # only event that resets the preview view (scroll to top, dismiss
+        # help). A same-item refresh/re-stream leaves it unchanged, so
+        # the user's scroll survives.
+        self._preview_last_shown_id = None
         # Per-visit delivery bit (preview-flicker design §B): True once
         # preview content for the current cursor visit has landed.
         # Cleared when ``_update_preview_for_cursor`` observes a cursor
@@ -10344,22 +10355,36 @@ class Browser:
                         new_id, immediate=self._preview_visit_delivered)
             return
 
+        # A genuine navigation is a move to a *different real item*.
+        # ``_do_refresh`` nulls ``_preview_cursor_id`` to force a re-fetch
+        # and a reloading row briefly resolves to ``None`` — neither is a
+        # navigation, so gate the fresh-view reset on the last *shown*
+        # (non-None) id, not the cursor-id slot. Without this a
+        # background/Ctrl-R refresh would route through here and clobber
+        # the user's scroll (and help overlay).
+        moved = new_id is not None and new_id != self._preview_last_shown_id
         self._preview_cursor_id = new_id
         # New visit: nothing delivered for it yet — the renderer holds
         # the stale snapshot over this row (cached previews included)
         # until a delivery or the worker's settle nudge flips the bit.
+        # Fires on every target change (refresh included) so the renderer
+        # re-holds until the fresh content lands.
         self._preview_visit_delivered = False
-        self._preview_scroll = 0
-        # ``_preview_at_tail`` is intentionally NOT cleared here: the
-        # tail pin is a sticky user intent that carries across cursor-
-        # item changes (and over recipe-driven cache invalidation, and
-        # over help-toggle). The renderer's pin override re-derives
-        # ``_preview_scroll = max_scroll`` on every pass, so the
-        # scroll=0 reset above is meaningful only when the pin is
-        # disengaged. Cleared only by explicit upward motion in the
-        # action layer.
-        if self._help_mode:
-            self._help_mode = False
+        if moved:
+            # Fresh view: scroll to the top and dismiss the help overlay
+            # so the user sees the new item's preview, not stale state.
+            # ``_preview_at_tail`` is intentionally NOT cleared here: the
+            # tail pin is a sticky user intent that carries across cursor-
+            # item changes (and over recipe-driven cache invalidation, and
+            # over help-toggle). The renderer's pin override re-derives
+            # ``_preview_scroll = max_scroll`` on every pass, so this reset
+            # is meaningful only when the pin is disengaged. Cleared only
+            # by explicit upward motion in the action layer.
+            self._preview_scroll = 0
+            if self._help_mode:
+                self._help_mode = False
+        if new_id is not None:
+            self._preview_last_shown_id = new_id
         self._needs_redraw.add('preview')
 
         if new_id is None:
@@ -13135,7 +13160,7 @@ def _wrap_preview_line(line, width, *, ansi_on, drop_sgr=False):
 # Captured by reference assignment, never invalidated.
 _PreviewSnapshot = namedtuple(
     '_PreviewSnapshot',
-    ['text', 'scroll', 'wrapped', 'width', 'ansi_on'],
+    ['id', 'text', 'scroll', 'wrapped', 'width', 'ansi_on'],
 )
 
 
@@ -13313,6 +13338,37 @@ def render_preview(browser, rect, *, info=False, has_header=True,
                 elif entry.kind == 'normal':
                     pending = True
 
+    # Streaming re-fill shrink-hold: a same-row re-stream (invalidate →
+    # generator refill) rebuilds the preview from empty. The first tiny
+    # chunk flips the row to "delivered", so without this the scroll
+    # clamp further down would ratchet the user's offset down to the
+    # partial and lose their place as the content regrows. While the
+    # delivered text is still shorter than the snapshot we were painting
+    # for THIS id AND a fetch for it is in flight, keep holding the
+    # snapshot at its scroll; the swap to fresh content happens once it
+    # catches up (>= snapshot length) or the fetch settles (the generator
+    # exhausts and clears ``_preview_req``). Tail-follow is exempt — a
+    # pinned view WANTS to ride the growing bottom. Gated on the
+    # snapshot's own id so a fresh navigation to another streaming row
+    # still opens at the top and streams in visibly rather than freezing
+    # on the previous row's content.
+    if (not pending and item is not None and item.preview is not None
+            and not browser._preview_at_tail):
+        snap = browser._preview_snapshot
+        if (snap is not None
+                and snap.id == item.id
+                and len(item.preview) < len(snap.text)
+                and browser._preview_req == item.id):
+            pending = True
+            # A generator paused at its buffer cap resumes ONLY via the
+            # #274 demand-pull further down — which the ``if pending``
+            # early return below skips. Nudge it here so the buffer grows
+            # toward catch-up (or exhaustion), and the hold releases
+            # instead of freezing on the stale snapshot forever. No-op
+            # unless a generator is paused for this id, and naturally
+            # rate-limited by the pause/resume cycle.
+            browser.signal_preview_demand(item.id)
+
     # Stale-hold (preview-flicker design §B): while the cursor row
     # pends, keep painting the last successfully painted per-item
     # preview — instead of blanking (undelivered row) or swapping
@@ -13458,6 +13514,7 @@ def render_preview(browser, rect, *, info=False, has_header=True,
     if (item is not None and not browser._help_mode
             and item.preview is not None):
         browser._preview_snapshot = _PreviewSnapshot(
+            id=item.id,
             text=item.preview,
             scroll=scroll,
             wrapped=wrapped,

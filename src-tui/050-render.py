@@ -1958,7 +1958,7 @@ def _wrap_preview_line(line, width, *, ansi_on, drop_sgr=False):
 # Captured by reference assignment, never invalidated.
 _PreviewSnapshot = namedtuple(
     '_PreviewSnapshot',
-    ['text', 'scroll', 'wrapped', 'width', 'ansi_on'],
+    ['id', 'text', 'scroll', 'wrapped', 'width', 'ansi_on'],
 )
 
 
@@ -2136,6 +2136,37 @@ def render_preview(browser, rect, *, info=False, has_header=True,
                 elif entry.kind == 'normal':
                     pending = True
 
+    # Streaming re-fill shrink-hold: a same-row re-stream (invalidate →
+    # generator refill) rebuilds the preview from empty. The first tiny
+    # chunk flips the row to "delivered", so without this the scroll
+    # clamp further down would ratchet the user's offset down to the
+    # partial and lose their place as the content regrows. While the
+    # delivered text is still shorter than the snapshot we were painting
+    # for THIS id AND a fetch for it is in flight, keep holding the
+    # snapshot at its scroll; the swap to fresh content happens once it
+    # catches up (>= snapshot length) or the fetch settles (the generator
+    # exhausts and clears ``_preview_req``). Tail-follow is exempt — a
+    # pinned view WANTS to ride the growing bottom. Gated on the
+    # snapshot's own id so a fresh navigation to another streaming row
+    # still opens at the top and streams in visibly rather than freezing
+    # on the previous row's content.
+    if (not pending and item is not None and item.preview is not None
+            and not browser._preview_at_tail):
+        snap = browser._preview_snapshot
+        if (snap is not None
+                and snap.id == item.id
+                and len(item.preview) < len(snap.text)
+                and browser._preview_req == item.id):
+            pending = True
+            # A generator paused at its buffer cap resumes ONLY via the
+            # #274 demand-pull further down — which the ``if pending``
+            # early return below skips. Nudge it here so the buffer grows
+            # toward catch-up (or exhaustion), and the hold releases
+            # instead of freezing on the stale snapshot forever. No-op
+            # unless a generator is paused for this id, and naturally
+            # rate-limited by the pause/resume cycle.
+            browser.signal_preview_demand(item.id)
+
     # Stale-hold (preview-flicker design §B): while the cursor row
     # pends, keep painting the last successfully painted per-item
     # preview — instead of blanking (undelivered row) or swapping
@@ -2281,6 +2312,7 @@ def render_preview(browser, rect, *, info=False, has_header=True,
     if (item is not None and not browser._help_mode
             and item.preview is not None):
         browser._preview_snapshot = _PreviewSnapshot(
+            id=item.id,
             text=item.preview,
             scroll=scroll,
             wrapped=wrapped,
