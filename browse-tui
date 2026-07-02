@@ -8314,6 +8314,19 @@ class Browser:
         # invalidated the underlying data, so the cached preview text
         # is stale and a re-fetch is the correct action.
         self._preview_cursor_id = None
+        # A paused streaming preview generator would otherwise SURVIVE the
+        # refresh: the forced re-fetch above lands as a same-id
+        # ``request_preview``, and a same-id request never abandons a
+        # paused generator — only a cursor-move to a *different* id does
+        # (``_stream_preview_from_generator``'s pause wait). The stale
+        # generator then keeps the ``_preview_req`` slot, the rebuilt item
+        # is never refilled, and the preview freezes until the cursor
+        # moves. Abandon any paused generator now (its buffered stream is
+        # stale after the invalidate anyway) and wake the worker so the
+        # re-fetch actually re-runs ``get_preview``. Mirrors the
+        # ``invalidate_preview`` → ``_kick_after_invalidate`` fix.
+        self._abandon_paused_preview_if_any()
+        self._preview_resume_event.set()
         # Always register the waiter so it resolves with the fetch result.
         self._children_in_flight.setdefault(id_, []).append(pending)
         # Keep ``_loading`` in lockstep with the dispatch tracker so the

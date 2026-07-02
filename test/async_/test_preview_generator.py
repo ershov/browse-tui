@@ -1426,5 +1426,60 @@ class TestStreamingDoesNotHang(unittest.TestCase):
             b.stop_workers()
 
 
+class TestRefreshAbandonsPausedGenerator(unittest.TestCase):
+    """A full refresh must abandon a paused streaming generator on the
+    cursor's id so the forced re-fetch re-runs ``get_preview``.
+
+    Regression: with the cursor on a long umbrella whose ``get_preview``
+    is a generator (streams past the cap and PAUSES), pressing Ctrl-R
+    (``refresh()``) nulled ``_preview_cursor_id`` to force a re-fetch —
+    but the re-request is same-id, which never abandons a paused
+    generator (only a cursor-move to a different id does). The stale
+    generator kept the request slot, the rebuilt item was never
+    refilled, and the preview froze until the cursor moved.
+    """
+
+    def test_full_refresh_refetches_paused_preview(self):
+        version = {'v': 'OLD'}
+
+        def get_children(_id, *, reload=False):
+            return [Item(id='a'), Item(id='b')]
+
+        def get_preview(id_):
+            tag = version['v']
+            for i in range(300):        # > MIN_CAP_LINES → worker pauses
+                yield f'{tag}-{id_}-{i}\n'
+
+        b = make_browser(get_children=get_children, get_preview=get_preview,
+                         root_id='/', show_preview=True)
+        try:
+            b.refresh('/')
+            b.run_until_idle()
+            b._state.cursor = 0                       # cursor on 'a'
+            b._update_preview_for_cursor()
+            b.run_until_idle()
+            # Streamed the OLD content and paused at the cap.
+            self.assertIsNotNone(b._preview_paused)
+            self.assertEqual(b._preview_paused.get('id'), 'a')
+            self.assertTrue((get_preview_text(b, 'a') or '').startswith('OLD'))
+
+            version['v'] = 'NEW'
+            b.refresh()                               # Ctrl-R: full refresh
+            b.run_until_idle()
+            b._update_preview_for_cursor()            # main loop re-requests
+            self.assertTrue(
+                _drain_until(
+                    b,
+                    lambda: (get_preview_text(b, 'a') or '').startswith('NEW'),
+                    timeout=2.0,
+                ),
+                f"preview froze after refresh instead of refetching; got "
+                f"{get_preview_text(b, 'a')!r}, paused={b._preview_paused!r}, "
+                f"_preview_req={b._preview_req!r}",
+            )
+        finally:
+            b.stop_workers()
+
+
 if __name__ == '__main__':
     unittest.main()
