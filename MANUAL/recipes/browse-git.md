@@ -14,7 +14,10 @@ chips on commit rows.
   local branch with `--all` (git log's `--branches`). An unscoped log is
   preceded by up to four synthetic working-change rows — `Untracked
   changes` / `Tracked changes` / `Staged changes` / `Conflicts` — each
-  shown only when non-empty and drillable into its files.
+  shown only when non-empty and drillable into its files. Under `--all`
+  these rows are spliced above each worktree's tip commit and carry that
+  worktree's branch-name chip, so several worktrees stacked at one shared
+  commit stay attributable.
 - **status** — `git status` working-tree entries; the leaf preview is
   the staged and/or worktree diff chosen by the porcelain `XY` code
   (`MM` shows both sections; `??` renders the file as an addition).

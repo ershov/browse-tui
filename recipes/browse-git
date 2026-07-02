@@ -13,7 +13,9 @@ In commits mode the log is preceded by up to four synthetic working-change
 rows — ``Untracked changes`` / ``Tracked changes`` / ``Staged changes`` /
 ``Conflicts`` — each shown only when non-empty and drillable into its
 files. They honor the same path filter and appear only on an unscoped log
-(no positional rev).
+(no positional rev). Under ``--all`` they are spliced above each worktree's
+tip commit and carry that worktree's branch-name chip, so several worktrees
+stacked at one shared commit stay attributable.
   reflog    ``git reflog`` entries
   branches  branches / remotes / tags via ``git for-each-ref``
   stash     ``git stash list``
@@ -1920,7 +1922,7 @@ def _worktrees_root():
     return items
 
 
-def _worktree_groups(paths, wt_path=None):
+def _worktree_groups(paths, wt_path=None, branch=None):
     """Synthetic worktree-group rows for a worktree's working changes.
 
     Classifies ``_worktree_status(paths, wt_path)`` into the four
@@ -1934,6 +1936,13 @@ def _worktree_groups(paths, wt_path=None):
     ``None`` means the current working directory (the path filter applies);
     an absolute path means that specific (linked) worktree (callers pass
     ``paths=[]`` there, since paths are cwd-relative).
+
+    ``branch``, when given, is prepended to every row as a cyan chip (the
+    ``('wc', …)`` id is unchanged, so expand/collapse is unaffected). The
+    ``--all`` splicer passes each worktree's branch short-name here so
+    several worktrees' groups stacked at one shared tip commit stay
+    attributable to their branch (``_inject_worktree_tips``); the
+    unambiguous single-worktree call sites leave it ``None``.
 
     Each row carries empty ``col_sha`` / ``col_author`` / ``col_date``
     strings so ``git_row_content`` aligns its label under the sibling
@@ -1952,6 +1961,8 @@ def _worktree_groups(paths, wt_path=None):
             item.col_sha = ''
             item.col_author = ''
             item.col_date = ''
+            if branch:
+                item.chips = [(branch, 'cyan')]
             items.append(item)
     return items
 
@@ -1991,8 +2002,10 @@ def _inject_worktree_tips(items, paths):
     (``wt_path=None``) and honor ``paths``; every other worktree's groups
     are scoped to its abspath with no path filter (paths are cwd-relative).
     Two worktrees sharing a HEAD each contribute their groups, in worktree
-    order. Filler / meta / non-commit rows pass through untouched; mid-graph
-    insertion may look slightly off (accepted — alignment is refined later).
+    order — each tagged with its branch short-name chip (``_worktree_label``)
+    so the stacked rows stay attributable to their branch. Filler / meta /
+    non-commit rows pass through untouched; mid-graph insertion may look
+    slightly off (accepted — alignment is refined later).
     """
     worktrees = _worktrees()
     if not worktrees:
@@ -2010,7 +2023,8 @@ def _inject_worktree_tips(items, paths):
             for wt in by_head[item_id[2]]:
                 wt_path = None if wt.path == current else wt.path
                 grp_paths = paths if wt_path is None else []
-                out.extend(_worktree_groups(grp_paths, wt_path))
+                out.extend(_worktree_groups(grp_paths, wt_path,
+                                            branch=_worktree_label(wt)))
         out.append(item)
     return out
 

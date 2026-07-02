@@ -2294,6 +2294,23 @@ class TestWorktreeGroups(unittest.TestCase):
         self.r._worktree_status = lambda paths, wt_path=None: []
         self.assertEqual(self.r._worktree_groups([]), [])
 
+    def test_branch_prepends_cyan_chip_to_every_row(self):
+        # A branch label tags every row with a cyan chip (the id is unchanged,
+        # so expand/collapse is unaffected).
+        self.r._worktree_status = lambda paths, wt_path=None: [
+            ('M ', 's.txt'), ('??', 'new.txt')]
+        items = self.r._worktree_groups([], '/wt', branch='feat')
+        self.assertTrue(all(it.chips == [('feat', 'cyan')] for it in items))
+        self.assertEqual([it.id for it in items],
+                         [('wc', 'untracked', '/wt'), ('wc', 'staged', '/wt')])
+
+    def test_no_branch_leaves_rows_chipless(self):
+        # Without a branch label the rows carry no chips (the unambiguous
+        # single-worktree call sites).
+        self.r._worktree_status = lambda paths, wt_path=None: [('??', 'new.txt')]
+        item, = self.r._worktree_groups([])
+        self.assertFalse(getattr(item, 'chips', None))
+
     def test_groups_constant_shape(self):
         # _WC_GROUPS defines BOTH order and labels for the four buckets.
         self.assertEqual(self.r._WC_GROUPS, [
@@ -2463,12 +2480,12 @@ class TestInjectWorktreeTips(unittest.TestCase):
                            has_children=True)
 
     def _stub_groups(self):
-        # Record (paths, wt_path) per call and emit one identifiable row so
-        # the splice position + scope are observable.
+        # Record (paths, wt_path, branch) per call and emit one identifiable
+        # row so the splice position + scope + branch tag are observable.
         self.group_calls = []
 
-        def fake_groups(paths, wt_path=None):
-            self.group_calls.append((list(paths), wt_path))
+        def fake_groups(paths, wt_path=None, branch=None):
+            self.group_calls.append((list(paths), wt_path, branch))
             return [self.r.Item(id=('wc', 'staged', wt_path),
                                 title='Staged changes', has_children=True)]
 
@@ -2494,9 +2511,10 @@ class TestInjectWorktreeTips(unittest.TestCase):
             ('wc', 'staged', '/wt2'),        # linked tip: abspath group
             ('commit', 'root', self.HEAD2),
         ])
-        # The cwd group honors paths; the linked group is unfiltered.
-        self.assertIn((['src/'], None), self.group_calls)
-        self.assertIn(([], '/wt2'), self.group_calls)
+        # The cwd group honors paths; the linked group is unfiltered. Each
+        # group is tagged with its worktree's branch short-name.
+        self.assertIn((['src/'], None, 'main'), self.group_calls)
+        self.assertIn(([], '/wt2', 'feat'), self.group_calls)
 
     def test_worktree_off_log_is_skipped(self):
         # A worktree HEAD that isn't among the rows simply produces no groups
@@ -2535,6 +2553,9 @@ class TestInjectWorktreeTips(unittest.TestCase):
             ('wc', 'staged', '/wt2'),
             ('commit', 'root', self.HEAD1),
         ])
+        # Each worktree's groups are tagged with its own branch, so the
+        # two stacks at the shared tip stay attributable.
+        self.assertEqual([c[2] for c in self.group_calls], ['main', 'feat'])
 
     def test_filler_and_meta_rows_pass_through(self):
         # A graph filler row (id ('filler', ns, n)) is never a commit, so it
