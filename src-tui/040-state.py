@@ -4111,6 +4111,15 @@ class Browser:
         # help). A same-item refresh/re-stream leaves it unchanged, so
         # the user's scroll survives.
         self._preview_last_shown_id = None
+        # Scroll-restore slot for a full/subtree refresh, ``(id, scroll)``
+        # or None. ``_do_refresh`` records the cursor's preview id + scroll
+        # before wiping; ``cache_invalidate_all`` collapses the visible
+        # tree so the cursor transiently clamps to the scope row and back,
+        # which would otherwise read as a navigation and reset the scroll.
+        # ``_update_preview_for_cursor`` restores the scroll when the
+        # cursor re-anchors to ``id`` and drops the slot once the refresh
+        # settles the cursor elsewhere.
+        self._preview_scroll_restore = None
         # Per-visit delivery bit (preview-flicker design §B): True once
         # preview content for the current cursor visit has landed.
         # Cleared when ``_update_preview_for_cursor`` observes a cursor
@@ -6609,6 +6618,14 @@ class Browser:
         else:
             cache_invalidate_subtree(self._state, id_)
             extra = ()
+        # Remember the cursor's preview id + scroll so the reload bounce
+        # doesn't cost the user their place. ``cache_invalidate_*`` above
+        # collapses the visible tree, so the cursor transiently clamps to
+        # the scope row and back; ``_update_preview_for_cursor`` restores
+        # this scroll when the cursor re-anchors to the same id.
+        if self._preview_cursor_id is not None:
+            self._preview_scroll_restore = (
+                self._preview_cursor_id, self._preview_scroll)
         # Force the next ``_update_preview_for_cursor`` to re-fetch.
         # The ``_preview_cursor_id`` gate (#126) skips re-requests when
         # the cursor stays on the same item, but a refresh just
@@ -8686,6 +8703,7 @@ class Browser:
         # background/Ctrl-R refresh would route through here and clobber
         # the user's scroll (and help overlay).
         moved = new_id is not None and new_id != self._preview_last_shown_id
+        restore = self._preview_scroll_restore
         self._preview_cursor_id = new_id
         # New visit: nothing delivered for it yet — the renderer holds
         # the stale snapshot over this row (cached previews included)
@@ -8694,18 +8712,34 @@ class Browser:
         # re-holds until the fresh content lands.
         self._preview_visit_delivered = False
         if moved:
-            # Fresh view: scroll to the top and dismiss the help overlay
-            # so the user sees the new item's preview, not stale state.
-            # ``_preview_at_tail`` is intentionally NOT cleared here: the
-            # tail pin is a sticky user intent that carries across cursor-
-            # item changes (and over recipe-driven cache invalidation, and
-            # over help-toggle). The renderer's pin override re-derives
-            # ``_preview_scroll = max_scroll`` on every pass, so this reset
-            # is meaningful only when the pin is disengaged. Cleared only
-            # by explicit upward motion in the action layer.
-            self._preview_scroll = 0
-            if self._help_mode:
-                self._help_mode = False
+            if restore is not None and new_id == restore[0]:
+                # Reload bounce: the cursor returned to the row a refresh
+                # started on (``cache_invalidate_*`` collapsed the visible
+                # tree, clamping the cursor to the scope row and back).
+                # Restore its scroll rather than treating the bounce as a
+                # fresh-view navigation; ``_help_mode`` is left intact too.
+                self._preview_scroll = restore[1]
+            else:
+                # Fresh view: scroll to the top and dismiss the help
+                # overlay so the user sees the new item's preview, not
+                # stale state. ``_preview_at_tail`` is intentionally NOT
+                # cleared here: the tail pin is a sticky user intent that
+                # carries across cursor-item changes (and over recipe-
+                # driven cache invalidation, and over help-toggle). The
+                # renderer's pin override re-derives ``_preview_scroll =
+                # max_scroll`` on every pass, so this reset is meaningful
+                # only when the pin is disengaged. Cleared only by explicit
+                # upward motion in the action layer.
+                self._preview_scroll = 0
+                if self._help_mode:
+                    self._help_mode = False
+        if restore is not None and (
+                new_id == restore[0] or not self._state._children_pending):
+            # Consume the slot when the cursor returns to its row, or drop
+            # it once the refresh has settled the cursor somewhere else
+            # (the user navigated during the reload, or the anchor did not
+            # come back) so a later manual revisit still opens fresh.
+            self._preview_scroll_restore = None
         if new_id is not None:
             self._preview_last_shown_id = new_id
         self._needs_redraw.add('preview')
