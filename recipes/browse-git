@@ -1648,7 +1648,8 @@ def get_children(item_id, *, reload=False):
         linked = next((wt for wt in _worktrees()
                        if not wt.is_main and wt.branch == item_id[1]), None)
         if linked is not None:
-            return _worktree_groups([], linked.path) + log
+            return _worktree_groups(
+                [], linked.path, col_graph=_head_graph(log)) + log
         return log
     if kind == 'worktree':
         # A worktree row drills into its branch's commits via the same
@@ -1661,8 +1662,9 @@ def get_children(item_id, *, reload=False):
         # working-change groups are prepended above its log (scoped to the
         # worktree abspath, no ``_paths`` — a drill-down is about that
         # worktree, and the positional paths are cwd-relative).
-        return (_worktree_groups([], item_id[1])
-                + _log_items([item_id[2]], [], ns=item_id))
+        log = _log_items([item_id[2]], [], ns=item_id)
+        return _worktree_groups(
+            [], item_id[1], col_graph=_head_graph(log)) + log
     if kind == 'wc':
         # A worktree-status group drills into its files. id = ('wc',
         # bucket, wt_path). wt_path None means the current worktree (scope
@@ -1735,8 +1737,10 @@ def _commits_root():
         # sits in the all-branches log.
         return _inject_worktree_tips(items, _paths)
     if not _revs:
-        # Plain HEAD log: the current worktree's groups on top (unchanged).
-        return _worktree_groups(_paths, None) + items
+        # Plain HEAD log: the current worktree's groups on top, copying
+        # HEAD's graph art (tree mode) so they align under its lane column.
+        return _worktree_groups(
+            _paths, None, col_graph=_head_graph(items)) + items
     # Positional rev scope: the log is historical — no live working changes.
     return items
 
@@ -1928,7 +1932,19 @@ def _worktrees_root():
     return items
 
 
-def _worktree_groups(paths, wt_path=None, branch=None):
+def _head_graph(items):
+    """The commit-graph art of a log's head row (its first commit), or ``None``.
+
+    In tree mode the first row of a ``git log --graph`` build is the newest
+    commit and carries ``col_graph``; the synthetic working-change rows
+    spliced above it copy that art so they sit under the same lane column
+    (see ``_worktree_groups``' ``col_graph``). In non-tree mode — or for an
+    empty / error log — there is no graph to copy, so this yields ``None``.
+    """
+    return getattr(items[0], 'col_graph', None) if items else None
+
+
+def _worktree_groups(paths, wt_path=None, branch=None, col_graph=None):
     """Synthetic worktree-group rows for a worktree's working changes.
 
     Classifies ``_worktree_status(paths, wt_path)`` into the four
@@ -1950,6 +1966,13 @@ def _worktree_groups(paths, wt_path=None, branch=None):
     attributable to their branch (``_inject_worktree_tips``); the
     unambiguous single-worktree call sites leave it ``None``.
 
+    ``col_graph``, when truthy, is copied onto every row so — in tree mode —
+    the synthetic rows carry the graph art of the commit they sit above
+    (the branch's head / tip), lining them up under its lane column.
+    Callers pass the head commit's art (``_head_graph`` / the spliced tip's
+    ``col_graph``); non-tree builds pass ``None`` and the rows stay
+    graph-less as before.
+
     Each row carries empty ``col_sha`` / ``col_author`` / ``col_date``
     strings so ``git_row_content`` aligns its label under the sibling
     commit subjects (empty columns pad to the commit column widths)
@@ -1969,6 +1992,8 @@ def _worktree_groups(paths, wt_path=None, branch=None):
             item.col_date = ''
             if branch:
                 item.chips = [(branch, 'cyan')]
+            if col_graph:
+                item.col_graph = col_graph
             items.append(item)
     return items
 
@@ -2009,9 +2034,10 @@ def _inject_worktree_tips(items, paths):
     are scoped to its abspath with no path filter (paths are cwd-relative).
     Two worktrees sharing a HEAD each contribute their groups, in worktree
     order — each tagged with its branch short-name chip (``_worktree_label``)
-    so the stacked rows stay attributable to their branch. Filler / meta /
-    non-commit rows pass through untouched; mid-graph insertion may look
-    slightly off (accepted — alignment is refined later).
+    so the stacked rows stay attributable to their branch, and (in tree mode)
+    carrying the tip commit's ``col_graph`` art so they line up under its lane
+    column. Filler / meta / non-commit rows pass through untouched; mid-graph
+    insertion may look slightly off (accepted — alignment is refined later).
     """
     worktrees = _worktrees()
     if not worktrees:
@@ -2029,8 +2055,9 @@ def _inject_worktree_tips(items, paths):
             for wt in by_head[item_id[2]]:
                 wt_path = None if wt.path == current else wt.path
                 grp_paths = paths if wt_path is None else []
-                out.extend(_worktree_groups(grp_paths, wt_path,
-                                            branch=_worktree_label(wt)))
+                out.extend(_worktree_groups(
+                    grp_paths, wt_path, branch=_worktree_label(wt),
+                    col_graph=getattr(item, 'col_graph', None)))
         out.append(item)
     return out
 

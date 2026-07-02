@@ -673,6 +673,10 @@ class TestBrowseGit(unittest.TestCase):
                     joined = '\n'.join(tracked_rows)
                     self.assertIn('main', joined)
                     self.assertIn('feat', joined)
+                    # Tree mode is on by default, so each synthetic row copies
+                    # the tip commit's graph node glyph (aligned under its
+                    # lane). tmux strips SGR but keeps the glyph text.
+                    self.assertTrue(all('•' in ln for ln in tracked_rows))
                     t.send('q')
             finally:
                 shutil.rmtree(wt_dir, ignore_errors=True)

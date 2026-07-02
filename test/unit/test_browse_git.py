@@ -2330,6 +2330,20 @@ class TestWorktreeGroups(unittest.TestCase):
         item, = self.r._worktree_groups([])
         self.assertFalse(getattr(item, 'chips', None))
 
+    def test_col_graph_copied_onto_every_row(self):
+        # A col_graph arg (the head commit's art, tree mode) lands on every
+        # row so git_row_content renders it under the tip's lane column.
+        self.r._worktree_status = lambda paths, wt_path=None: [
+            ('M ', 's.txt'), ('??', 'new.txt')]
+        items = self.r._worktree_groups([], col_graph='• ')
+        self.assertTrue(all(it.col_graph == '• ' for it in items))
+
+    def test_no_col_graph_leaves_rows_graphless(self):
+        # Non-tree builds pass col_graph=None → the rows carry no col_graph.
+        self.r._worktree_status = lambda paths, wt_path=None: [('??', 'new.txt')]
+        item, = self.r._worktree_groups([])
+        self.assertIsNone(getattr(item, 'col_graph', None))
+
     def test_groups_constant_shape(self):
         # _WC_GROUPS defines BOTH order and labels for the four buckets.
         self.assertEqual(self.r._WC_GROUPS, [
@@ -2499,12 +2513,13 @@ class TestInjectWorktreeTips(unittest.TestCase):
                            has_children=True)
 
     def _stub_groups(self):
-        # Record (paths, wt_path, branch) per call and emit one identifiable
-        # row so the splice position + scope + branch tag are observable.
+        # Record (paths, wt_path, branch, col_graph) per call and emit one
+        # identifiable row so the splice position + scope + branch tag +
+        # copied graph art are observable.
         self.group_calls = []
 
-        def fake_groups(paths, wt_path=None, branch=None):
-            self.group_calls.append((list(paths), wt_path, branch))
+        def fake_groups(paths, wt_path=None, branch=None, col_graph=None):
+            self.group_calls.append((list(paths), wt_path, branch, col_graph))
             return [self.r.Item(id=('wc', 'staged', wt_path),
                                 title='Staged changes', has_children=True)]
 
@@ -2531,9 +2546,10 @@ class TestInjectWorktreeTips(unittest.TestCase):
             ('commit', 'root', self.HEAD2),
         ])
         # The cwd group honors paths; the linked group is unfiltered. Each
-        # group is tagged with its worktree's branch short-name.
-        self.assertIn((['src/'], None, 'main'), self.group_calls)
-        self.assertIn(([], '/wt2', 'feat'), self.group_calls)
+        # group is tagged with its worktree's branch short-name. These commit
+        # rows carry no col_graph (non-tree), so nothing is copied.
+        self.assertIn((['src/'], None, 'main', None), self.group_calls)
+        self.assertIn(([], '/wt2', 'feat', None), self.group_calls)
 
     def test_worktree_off_log_is_skipped(self):
         # A worktree HEAD that isn't among the rows simply produces no groups
@@ -2575,6 +2591,19 @@ class TestInjectWorktreeTips(unittest.TestCase):
         # Each worktree's groups are tagged with its own branch, so the
         # two stacks at the shared tip stay attributable.
         self.assertEqual([c[2] for c in self.group_calls], ['main', 'feat'])
+
+    def test_tip_commit_graph_art_copied_to_groups(self):
+        # In tree mode the tip commit carries col_graph; the spliced groups
+        # copy it (verbatim) so they align under the tip's lane column.
+        self.r._worktrees = lambda: [
+            self.r._Worktree('/repo', self.HEAD1, 'main', True)]
+        self.r._current_worktree_path = lambda: '/repo'
+        self._stub_groups()
+        commit = self._commit(self.HEAD1)
+        commit.col_graph = '\x1b[31m•\x1b[m'
+        self.r._inject_worktree_tips([commit], [])
+        self.assertEqual([c[3] for c in self.group_calls],
+                         ['\x1b[31m•\x1b[m'])
 
     def test_filler_and_meta_rows_pass_through(self):
         # A graph filler row (id ('filler', ns, n)) is never a commit, so it
@@ -2736,15 +2765,17 @@ class TestGetChildrenWorktreeGroupsPrepend(unittest.TestCase):
         self.r._paths = ['ignored/']        # must NOT leak into drill-downs
         self.group_calls = []
 
-        def fake_groups(paths, wt_path=None):
-            self.group_calls.append((list(paths), wt_path))
+        def fake_groups(paths, wt_path=None, branch=None, col_graph=None):
+            self.group_calls.append((list(paths), wt_path, col_graph))
             return [self.r.Item(id=('wc', 'staged', wt_path),
                                 title='Staged changes', has_children=True)]
 
         self.r._worktree_groups = fake_groups
+        # The sentinel log row carries a col_graph so the prepend sites'
+        # _head_graph(log) copy is observable in group_calls.
         self.r._log_items = lambda revs, paths, ns: [
             self.r.Item(id=('commit', 'sentinel'), title='s',
-                        has_children=True)]
+                        has_children=True, col_graph='• ')]
 
     def test_worktree_drilldown_prepends_abspath_groups(self):
         # ('worktree', abspath, label) → groups for THAT worktree (abspath,
@@ -2755,7 +2786,7 @@ class TestGetChildrenWorktreeGroupsPrepend(unittest.TestCase):
                          [('wc', 'staged', '/repo/.claude/worktrees/foo'),
                           ('commit', 'sentinel')])
         self.assertEqual(self.group_calls,
-                         [([], '/repo/.claude/worktrees/foo')])
+                         [([], '/repo/.claude/worktrees/foo', '• ')])
 
     def test_linked_branch_ref_drilldown_prepends_groups(self):
         # A branch checked out in a NON-main worktree → groups above its log.
@@ -2769,7 +2800,7 @@ class TestGetChildrenWorktreeGroupsPrepend(unittest.TestCase):
                          [('wc', 'staged', '/repo/.claude/worktrees/foo'),
                           ('commit', 'sentinel')])
         self.assertEqual(self.group_calls,
-                         [([], '/repo/.claude/worktrees/foo')])
+                         [([], '/repo/.claude/worktrees/foo', '• ')])
 
     def test_main_worktree_branch_ref_drilldown_has_no_groups(self):
         # The MAIN worktree's checked-out branch is HEAD here, not elsewhere
