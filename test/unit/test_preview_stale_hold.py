@@ -410,12 +410,14 @@ class TestHeldGeometry(_StaleHoldBase):
             _render_full(b)
             self.assertEqual(_preview_rows(b)[0], 'l50')
 
-            # Delivery: the real content paints with the live scroll
-            # (clamped back into its own range).
+            # Delivery: the real content paints with the *displayed*
+            # offset clamped into its own range (bound 0). The desired
+            # ``_preview_scroll`` is left as-is — the renderer no longer
+            # writes the clamp back; a scroll key would reconcile it.
             b._deliver_preview('b', 'bravo')
             _render_full(b)
             self.assertEqual(_preview_rows(b)[0], 'bravo')
-            self.assertEqual(b._preview_scroll, 0)
+            self.assertEqual(b._preview_max_scroll, 0)
         finally:
             b.stop_workers()
 

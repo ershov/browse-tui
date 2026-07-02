@@ -747,10 +747,13 @@ class TestRenderPreviewAnsiIntegration(_RenderCacheBase):
 
 
 class TestPreviewScrollClamp(_RenderCacheBase):
-    """``_preview_scroll`` is clamped at render time so the last content
-    row lands at the bottom of the pane when fully scrolled — the
-    conventional viewport semantics. No matter how many shift-down /
-    page-down presses pile up, the user can never scroll past content."""
+    """The *displayed* preview offset is clamped at render time so the
+    last content row lands at the bottom of the pane when fully scrolled
+    — the user can never scroll past content. ``_preview_scroll`` itself
+    is the user's *desired* offset and is NOT written back by the
+    renderer (a transient streaming shrink must not ratchet it down);
+    only ``_preview_max_scroll`` is stashed each paint for the scroll
+    actions to reconcile against."""
 
     def _make(self, preview_text):
         items = [Item(id='a', title='alpha')]
@@ -759,23 +762,23 @@ class TestPreviewScrollClamp(_RenderCacheBase):
         b._state._items_by_id['a'].preview = preview_text
         return b
 
-    def test_scroll_when_content_fits_clamps_to_zero(self):
-        """If all wrapped rows fit in the pane, no scroll is allowed.
-
-        A 3-line preview in a tall pane should clamp ``_preview_scroll``
-        back to 0 regardless of how far the user pressed shift-down.
-        """
+    def test_content_that_fits_has_zero_max_scroll(self):
+        """If all wrapped rows fit in the pane, the scroll bound is 0 and
+        the display clamps to the top — regardless of the desired offset,
+        which the renderer leaves untouched."""
         self.browser = self._make('one\ntwo\nthree')
         self.browser._preview_scroll = 100
         _render.render_full(self.browser)
-        self.assertEqual(
-            self.browser._preview_scroll, 0,
-            'short content (fits in pane) must clamp scroll to 0',
-        )
+        out = self.cap.drain()
+        self.assertEqual(self.browser._preview_max_scroll, 0,
+                         'short content (fits in pane) → bound 0')
+        self.assertEqual(self.browser._preview_scroll, 100,
+                         'desired offset is not ratcheted by the renderer')
+        self.assertIn('one', out, 'display clamps to the top')
 
-    def test_scroll_past_end_clamps_to_last_line_at_bottom(self):
-        """Long content: clamp leaves the last wrapped row at the
-        bottom of the pane when fully scrolled.
+    def test_scroll_past_end_shows_last_line_at_bottom(self):
+        """Long content: the displayed offset leaves the last wrapped row
+        at the bottom of the pane when fully scrolled.
 
         With pane content_lines = N and wrapped = M (M > N),
         ``max_scroll = M - N`` so the row at index ``M-1`` lands at
@@ -784,43 +787,37 @@ class TestPreviewScrollClamp(_RenderCacheBase):
         # Build content longer than the pane so a real scroll range exists.
         # The headless terminal is 24 rows; in 'v' split with no children
         # pane and the info-bar header, content_lines is around 20.
-        # Generate enough lines to comfortably exceed any reasonable
-        # content_lines value.
         lines = [f'line{i:03d}' for i in range(200)]
         self.browser = self._make('\n'.join(lines))
-        # Pile up an absurd offset.
+        # Pile up an absurd (over-scrolled) desired offset.
         self.browser._preview_scroll = 10_000
         _render.render_full(self.browser)
-        # After the clamp, scroll should be exactly len(wrapped) -
-        # content_lines. We can't easily query content_lines from out
-        # here, but we can assert the upper bound: scroll <= 200 -
-        # content_lines, and scroll >= 0. More usefully: the last line
-        # 'line199' must appear in the rendered bytes.
         out = self.cap.drain()
         self.assertIn(
             'line199', out,
-            'last content line must be visible when fully scrolled '
-            f'(scroll={self.browser._preview_scroll!r})',
+            'last content line must be visible when fully scrolled',
         )
-        # And: the scroll value must be strictly less than the line
-        # count (we never scroll past the content).
-        self.assertLess(self.browser._preview_scroll, 200)
+        # The stashed bound is strictly less than the line count — the
+        # display never scrolls past the content — while the desired
+        # offset is left as-is (the actions reconcile it on the next key).
+        self.assertGreater(self.browser._preview_max_scroll, 0)
+        self.assertLess(self.browser._preview_max_scroll, 200)
 
-    def test_scroll_clamp_does_not_shrink_in_range_offsets(self):
-        """An in-range offset must not be touched by the clamp."""
+    def test_in_range_offset_is_untouched(self):
+        """An in-range offset stays put (renderer never writes it back)."""
         lines = [f'line{i:03d}' for i in range(200)]
         self.browser = self._make('\n'.join(lines))
         self.browser._preview_scroll = 5
         _render.render_full(self.browser)
         self.assertEqual(self.browser._preview_scroll, 5,
-                         'in-range scroll offset must not be clamped')
+                         'in-range scroll offset must not change')
 
-    def test_empty_preview_clamps_scroll_to_zero(self):
-        """No preview text at all → clamp to 0 (no row to show)."""
+    def test_empty_preview_has_zero_max_scroll(self):
+        """No preview text at all → bound 0 (no row to show)."""
         self.browser = self._make('')
         self.browser._preview_scroll = 50
         _render.render_full(self.browser)
-        self.assertEqual(self.browser._preview_scroll, 0)
+        self.assertEqual(self.browser._preview_max_scroll, 0)
 
 
 # --- 12. Vacated-pane clear on visible→hidden transition (#718) -----------

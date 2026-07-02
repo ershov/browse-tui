@@ -879,58 +879,80 @@ def _collapse_recursive(ctx):
         ctx._browser._needs_redraw.add('all')
 
 
+def _clamp_preview_scroll(browser, value):
+    """Clamp a preview offset to the last-rendered range ``[0, max_scroll]``.
+
+    ``render_preview`` stashes ``_preview_max_scroll`` each paint but no
+    longer writes the clamp back into ``_preview_scroll`` — so a transient
+    streaming shrink can't ratchet the user's offset down. The scroll
+    actions call this instead: it bounds an over-scroll and snaps an
+    out-of-range offset back into range at keypress time (the
+    responsiveness the old renderer writeback provided). ``None`` (before
+    the first paint) means the bound is unknown, so only the floor at 0
+    applies and the offset bumps freely until the renderer reports one.
+    """
+    value = max(0, value)
+    m = browser._preview_max_scroll
+    if m is not None:
+        value = min(value, m)
+    return value
+
+
 def _preview_scroll_down(ctx):
     """shift-down — scroll preview by one line.
 
-    The high-end clamp is enforced by ``render_preview`` (it skips any
-    src_idx beyond the wrapped-line count). We just bump the offset and
-    let the renderer ignore it gracefully when off-end.
+    Bumps the desired offset, bounded to the last-rendered ``max_scroll``
+    (``_clamp_preview_scroll``). The renderer clamps the *displayed*
+    offset separately, so an off-end bump before the first paint is still
+    harmless.
     """
-    ctx._browser._preview_scroll += 1
-    ctx._browser._needs_redraw.add('preview')
+    b = ctx._browser
+    b._preview_scroll = _clamp_preview_scroll(b, b._preview_scroll + 1)
+    b._needs_redraw.add('preview')
 
 
 def _preview_scroll_up(ctx):
     """shift-up — scroll preview up by one line (clamped at 0).
 
-    Clears ``_preview_at_tail`` first so an upward step from the
-    tail-follow state lands one row above ``max_scroll`` (the renderer
-    keeps ``_preview_scroll`` synchronised with ``max_scroll`` while
-    the flag is engaged, so the decrement here is meaningful).
+    Clears ``_preview_at_tail`` first, then reconciles the desired offset
+    into range before decrementing — so a step up from the tail pin, or
+    from an offset left above the current content bound by a streaming
+    shrink, moves the view immediately instead of pumping through a
+    phantom count.
     """
     b = ctx._browser
     b._preview_at_tail = False
-    if b._preview_scroll > 0:
-        b._preview_scroll -= 1
+    new_scroll = max(0, _clamp_preview_scroll(b, b._preview_scroll) - 1)
+    if new_scroll != b._preview_scroll:
+        b._preview_scroll = new_scroll
         b._needs_redraw.add('preview')
 
 
 def _preview_page_down(ctx):
     """alt-pgdn — scroll preview down by one preview-pane page.
 
-    Same off-end semantics as ``_preview_scroll_down``: the renderer
-    gracefully ignores out-of-range offsets so we don't need to thread
-    layout geometry through every action.
-
-    Page size = preview-pane height from ``layout_panes`` (so the jump
-    matches the visible viewport). Headless contexts fall back to
-    ``_DEFAULT_PAGE_ROWS``.
+    Bounded to the last-rendered ``max_scroll`` like
+    ``_preview_scroll_down``. Page size = preview-pane height from
+    ``layout_panes`` (so the jump matches the visible viewport). Headless
+    contexts fall back to ``_DEFAULT_PAGE_ROWS``.
     """
-    page = _preview_pane_height(ctx._browser)
-    ctx._browser._preview_scroll += page
-    ctx._browser._needs_redraw.add('preview')
+    b = ctx._browser
+    page = _preview_pane_height(b)
+    b._preview_scroll = _clamp_preview_scroll(b, b._preview_scroll + page)
+    b._needs_redraw.add('preview')
 
 
 def _preview_page_up(ctx):
     """alt-pgup — scroll preview up by one preview-pane page (clamped at 0).
 
     Clears ``_preview_at_tail`` — upward motion is the tail-follow
-    exit signal. See ``_preview_scroll_up``.
+    exit signal. Reconciles into range before the jump. See
+    ``_preview_scroll_up``.
     """
     b = ctx._browser
     b._preview_at_tail = False
     page = _preview_pane_height(b)
-    b._preview_scroll = max(0, b._preview_scroll - page)
+    b._preview_scroll = max(0, _clamp_preview_scroll(b, b._preview_scroll) - page)
     b._needs_redraw.add('preview')
 
 
@@ -1948,11 +1970,15 @@ def _scroll_preview(browser, delta):
 
     Wheel-up (``delta < 0``) clears ``_preview_at_tail`` — the tail
     pin survives downward wheel motion (renderer clamps; pin still
-    engaged) but is broken by any upward gesture.
+    engaged) but is broken by any upward gesture. The offset is
+    reconciled into the last-rendered range before and after the delta
+    (``_clamp_preview_scroll``) so an upward gesture from an over-range
+    offset steps at once and a downward gesture stays bounded.
     """
     if delta < 0:
         browser._preview_at_tail = False
-    new_scroll = max(0, browser._preview_scroll + delta)
+    base = _clamp_preview_scroll(browser, browser._preview_scroll)
+    new_scroll = _clamp_preview_scroll(browser, base + delta)
     if new_scroll != browser._preview_scroll:
         browser._preview_scroll = new_scroll
         browser._needs_redraw.add('preview')

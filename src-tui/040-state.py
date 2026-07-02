@@ -4065,6 +4065,15 @@ class Browser:
         # or re-stream, so the user's place survives Ctrl-R / background
         # reloads. The renderer clamps the *displayed* offset each paint.
         self._preview_scroll = 0
+        # Last ``max_scroll`` the renderer computed for the preview pane
+        # (``len(wrapped) - content_lines``), stashed each paint. The
+        # scroll actions read it to bound an over-scroll and to snap an
+        # out-of-range ``_preview_scroll`` back into range at keypress
+        # time — the renderer itself no longer writes the clamp back (so
+        # a transient streaming shrink can't ratchet the offset down).
+        # ``None`` until the first paint → actions bump freely until a
+        # real bound is known.
+        self._preview_max_scroll = None
         # Tail-follow flag: when True, the renderer forces the scroll
         # to ``max_scroll`` every pass so the view sticks to the bottom
         # as preview content grows (streaming generators,

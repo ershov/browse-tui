@@ -1958,7 +1958,7 @@ def _wrap_preview_line(line, width, *, ansi_on, drop_sgr=False):
 # Captured by reference assignment, never invalidated.
 _PreviewSnapshot = namedtuple(
     '_PreviewSnapshot',
-    ['id', 'text', 'scroll', 'wrapped', 'width', 'ansi_on'],
+    ['text', 'scroll', 'wrapped', 'width', 'ansi_on'],
 )
 
 
@@ -2136,37 +2136,6 @@ def render_preview(browser, rect, *, info=False, has_header=True,
                 elif entry.kind == 'normal':
                     pending = True
 
-    # Streaming re-fill shrink-hold: a same-row re-stream (invalidate →
-    # generator refill) rebuilds the preview from empty. The first tiny
-    # chunk flips the row to "delivered", so without this the scroll
-    # clamp further down would ratchet the user's offset down to the
-    # partial and lose their place as the content regrows. While the
-    # delivered text is still shorter than the snapshot we were painting
-    # for THIS id AND a fetch for it is in flight, keep holding the
-    # snapshot at its scroll; the swap to fresh content happens once it
-    # catches up (>= snapshot length) or the fetch settles (the generator
-    # exhausts and clears ``_preview_req``). Tail-follow is exempt — a
-    # pinned view WANTS to ride the growing bottom. Gated on the
-    # snapshot's own id so a fresh navigation to another streaming row
-    # still opens at the top and streams in visibly rather than freezing
-    # on the previous row's content.
-    if (not pending and item is not None and item.preview is not None
-            and not browser._preview_at_tail):
-        snap = browser._preview_snapshot
-        if (snap is not None
-                and snap.id == item.id
-                and len(item.preview) < len(snap.text)
-                and browser._preview_req == item.id):
-            pending = True
-            # A generator paused at its buffer cap resumes ONLY via the
-            # #274 demand-pull further down — which the ``if pending``
-            # early return below skips. Nudge it here so the buffer grows
-            # toward catch-up (or exhaustion), and the hold releases
-            # instead of freezing on the stale snapshot forever. No-op
-            # unless a generator is paused for this id, and naturally
-            # rate-limited by the pause/resume cycle.
-            browser.signal_preview_demand(item.id)
-
     # Stale-hold (preview-flicker design §B): while the cursor row
     # pends, keep painting the last successfully painted per-item
     # preview — instead of blanking (undelivered row) or swapping
@@ -2241,31 +2210,32 @@ def render_preview(browser, rect, *, info=False, has_header=True,
                 ansi_on=ansi_on,
             )
 
-    # Clamp ``_preview_scroll`` so the last content row lands at the
-    # bottom of the pane when fully scrolled — conventional viewport
-    # semantics. ``_preview_scroll_down`` / ``_preview_page_down``
-    # (070-actions.py) bump the offset without an upper bound (they
-    # don't have wrap geometry in scope), so we clamp here where
-    # ``wrapped`` and ``content_lines`` are both in hand and write the
-    # clamped value back so subsequent shift-up presses don't have to
-    # pump down through a phantom count.
+    # Clamp the *displayed* offset so the last content row lands at the
+    # bottom of the pane when fully scrolled (conventional viewport
+    # semantics). ``_preview_scroll`` is the user's *desired* offset and
+    # is deliberately NOT written back on the non-tail branch: a
+    # streaming re-fill (and a background refresh) can transiently shrink
+    # ``wrapped``, and a down-clamp writeback would ratchet the offset to
+    # the partial and lose the user's place as content regrows. Instead
+    # we clamp a local copy for this paint and stash ``max_scroll`` so the
+    # scroll actions can bound an over-scroll / snap an out-of-range
+    # offset back into range at the moment the user acts (070-actions
+    # ``_clamp_preview_scroll``) — that is where the phantom-count concern
+    # the old writeback guarded now lives.
     #
     # ``_preview_at_tail`` pin: when engaged (Shift/Alt-End or
-    # ``Browser.preview_to_tail``), force ``scroll = max_scroll`` and
-    # write it back. As ``wrapped`` grows from streaming appends or
-    # generator pulls, the next render lands the view at the new
-    # bottom — tail-follow without per-tick user input. The flag is
-    # cleared by upward motions in the action layer; downward motions
-    # are clamped here so the pin survives them naturally.
+    # ``Browser.preview_to_tail``), force ``scroll = max_scroll`` and DO
+    # write it back — the pin legitimately owns the offset and must ride
+    # ``wrapped`` growth (streaming appends, generator pulls) to the new
+    # bottom without per-tick input. Cleared by upward motions in the
+    # action layer.
     max_scroll = max(0, len(wrapped) - content_lines)
+    browser._preview_max_scroll = max_scroll
     if browser._preview_at_tail:
         scroll = max_scroll
-        if browser._preview_scroll != max_scroll:
-            browser._preview_scroll = max_scroll
+        browser._preview_scroll = max_scroll
     else:
         scroll = max(0, min(browser._preview_scroll, max_scroll))
-        if scroll != browser._preview_scroll:
-            browser._preview_scroll = scroll
 
     # #274: demand-pull signal. If the cursored id's preview generator
     # is paused at the cap and the user has scrolled near the buffered
@@ -2312,7 +2282,6 @@ def render_preview(browser, rect, *, info=False, has_header=True,
     if (item is not None and not browser._help_mode
             and item.preview is not None):
         browser._preview_snapshot = _PreviewSnapshot(
-            id=item.id,
             text=item.preview,
             scroll=scroll,
             wrapped=wrapped,

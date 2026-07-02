@@ -583,18 +583,18 @@ class TestRefreshPreservesScroll(unittest.TestCase):
             b.stop_workers()
 
 
-# --- Streaming re-fill shrink-hold -----------------------------------------
+# --- Non-destructive clamp preserves scroll across streaming ---------------
 
 
-class TestStreamingShrinkHoldPreservesScroll(unittest.TestCase):
-    """A same-row re-stream must not lose the user's scroll.
+class TestStreamingClampPreservesScroll(unittest.TestCase):
+    """The renderer clamps only a *display* copy of the scroll offset.
 
-    An umbrella generator refill rebuilds the preview from empty. Once
-    the first tiny chunk lands the row is "delivered", so a naive paint
-    would clamp the user's offset down to the partial. The renderer
-    holds the last snapshot (at its scroll) while the delivered text is
-    still shorter than that snapshot AND a fetch is in flight — swapping
-    to fresh content only once it catches up or the fetch settles.
+    ``_preview_scroll`` is the user's desired offset; the renderer never
+    writes a down-clamp back to it (only the tail pin owns it). So a
+    streaming re-fill that transiently shrinks the content leaves the
+    offset intact and the view snaps back to it as content regrows. The
+    scroll actions reconcile the offset against the last-rendered
+    ``_preview_max_scroll`` at keypress time.
     """
 
     def _scrolled_browser(self):
@@ -605,95 +605,74 @@ class TestStreamingShrinkHoldPreservesScroll(unittest.TestCase):
         _render_preview(b)                       # capture snapshot @ 40
         return b
 
-    def test_restream_from_tiny_holds_and_keeps_scroll(self):
+    def test_transient_shrink_does_not_ratchet_offset(self):
         b = self._scrolled_browser()
         try:
-            self.assertEqual(b._preview_snapshot.id, 'a')
             self.assertEqual(b._preview_scroll, 40)
             item = b._state._items_by_id['a']
-            # Re-stream: first tiny chunk lands while the fetch is live.
-            b._preview_req = 'a'
-            b._preview_visit_delivered = True
+            # Content shrinks (re-stream first chunk) while parked at 40.
             item.preview = 'x0\nx1\nx2\n'
             item.preview_render = None
             b._needs_redraw.add('preview')
             _render_preview(b)
+            # Desired offset untouched; only the display copy clamps.
+            self.assertEqual(b._preview_scroll, 40,
+                             'renderer must not ratchet the desired offset')
+            self.assertEqual(b._preview_max_scroll, 0,
+                             'tiny content fits the pane → bound 0')
             rows = '\n'.join(_preview_rows(b))
-            self.assertIn('l40', rows, 'held the snapshot, not the partial')
-            self.assertNotIn('x0', rows)
+            self.assertIn('x0', rows, 'display shows the (clamped) new content')
+            self.assertNotIn('l40', rows)
+        finally:
+            b.stop_workers()
+
+    def test_regrow_snaps_view_back_to_offset(self):
+        b = self._scrolled_browser()
+        try:
+            item = b._state._items_by_id['a']
+            item.preview = 'x0\nx1\nx2\n'          # transient shrink
+            item.preview_render = None
+            b._needs_redraw.add('preview')
+            _render_preview(b)
             self.assertEqual(b._preview_scroll, 40)
-            # Content catches up → swap to fresh content at kept scroll.
+            # Content regrows past the offset → view returns to line 40.
             item.preview = '\n'.join(f'm{i}' for i in range(200)) + '\n'
             item.preview_render = None
             b._needs_redraw.add('preview')
             _render_preview(b)
-            rows = '\n'.join(_preview_rows(b))
-            self.assertIn('m40', rows, 'fresh content at the preserved scroll')
-            self.assertNotIn('l40', rows)
             self.assertEqual(b._preview_scroll, 40)
+            self.assertIn('m40', '\n'.join(_preview_rows(b)),
+                          'view snaps back to the preserved offset')
         finally:
             b.stop_workers()
 
-    def test_hold_nudges_paused_generator_to_resume(self):
-        # Regression: the shrink-hold's early return skips the #274
-        # demand-pull that is a paused generator's ONLY resume path. The
-        # hold must nudge the paused generator directly, or a long
-        # re-stream (which pauses at its cap below the old snapshot
-        # length) freezes on the stale snapshot forever. Here the fetch
-        # is paused below the snapshot: the hold engages (stable, scroll
-        # kept) AND ``_preview_resume_pull`` is set so the worker
-        # resumes and the buffer grows toward catch-up.
+    def test_scroll_action_reconciles_after_shrink(self):
+        # After content shrinks and stays short, the stored offset is
+        # left high (desired); the next scroll action snaps it into the
+        # current range so shift-up is immediately responsive.
         b = self._scrolled_browser()
         try:
             item = b._state._items_by_id['a']
-            b._preview_req = 'a'
-            b._preview_visit_delivered = True
-            b._preview_paused = {'id': 'a', 'gen': None,
-                                 'chars': 9, 'lines': 3}
-            b._preview_resume_pull = False
-            item.preview = 'x0\nx1\nx2\n'
+            item.preview = 'only\ntwo\n'           # short, and it stays
             item.preview_render = None
             b._needs_redraw.add('preview')
             _render_preview(b)
-            rows = '\n'.join(_preview_rows(b))
-            self.assertIn('l40', rows, 'held the snapshot, not the partial')
-            self.assertEqual(b._preview_scroll, 40)
-            self.assertTrue(
-                b._preview_resume_pull,
-                'the hold must resume the paused generator, else a long '
-                're-stream freezes on stale content',
-            )
+            self.assertEqual(b._preview_scroll, 40)   # desired untouched
+            self.assertEqual(b._preview_max_scroll, 0)
+            ctx = _ctx_for(b)
+            _actions._preview_scroll_up(ctx)
+            self.assertEqual(b._preview_scroll, 0,
+                             'shift-up snaps the stale offset into range')
         finally:
             b.stop_workers()
 
-    def test_settled_shorter_content_is_shown_not_held(self):
-        # A permanent shrink (generator exhausts → _preview_req clears)
-        # must show the new, genuinely-shorter content — never freeze on
-        # the old snapshot.
-        b = self._scrolled_browser()
-        try:
-            item = b._state._items_by_id['a']
-            b._preview_req = None                # fetch settled
-            b._preview_visit_delivered = True
-            item.preview = 'short0\nshort1\n'
-            item.preview_render = None
-            b._needs_redraw.add('preview')
-            _render_preview(b)
-            rows = '\n'.join(_preview_rows(b))
-            self.assertIn('short0', rows)
-            self.assertNotIn('l40', rows)
-        finally:
-            b.stop_workers()
-
-    def test_tail_pin_ignores_shrink_hold(self):
-        # A pinned view follows the growing bottom during a re-stream —
-        # the shrink-hold must not engage.
+    def test_tail_pin_rides_growth_not_offset(self):
+        # A pinned view follows the growing bottom during a re-stream;
+        # the pin owns the offset (writeback kept on the tail branch).
         b = self._scrolled_browser()
         try:
             item = b._state._items_by_id['a']
             b._preview_at_tail = True
-            b._preview_req = 'a'
-            b._preview_visit_delivered = True
             item.preview = 'x0\nx1\nx2\n'
             item.preview_render = None
             b._needs_redraw.add('preview')
