@@ -2092,9 +2092,11 @@ class TestGitRowContent(unittest.TestCase):
         self.assertEqual(segs[0], (' ' * 7 + '  ', _YELLOW[0], _YELLOW[1]))
         self.assertEqual(segs[1], (' ' * 5 + '  ', _DIM[0], _DIM[1]))
         self.assertEqual(segs[2], (' ' * 12 + '  ', _DIM[0], _DIM[1]))
-        # The label is the last (subject) segment, plain — same slot a
-        # commit subject occupies, so they line up vertically.
-        self.assertEqual(segs[-1], ('Untracked changes', None, False))
+        # The label is the last (subject) segment — same slot a commit
+        # subject occupies, so they line up vertically — coloured with the
+        # synthetic-row title fg so it stands out.
+        self.assertEqual(segs[-1],
+                         ('Untracked changes', self.r._WC_TITLE_FG, False))
         # Leading text width matches a commit's three columns exactly.
         commit = self._commit_item(
             col_sha='deadbee', col_author='Al', col_date='2 days ago',
@@ -2103,6 +2105,23 @@ class TestGitRowContent(unittest.TestCase):
             self._widths(sha=7, author=5, date=12)))
         lead = lambda s: sum(len(seg[0]) for seg in s[:3])
         self.assertEqual(lead(segs), lead(csegs))
+
+    def test_wc_title_coloured_commit_title_plain(self):
+        # The synthetic ('wc', …) row's title carries _WC_TITLE_FG; an
+        # ordinary commit subject in the same slot stays plain (fg None).
+        ctx = _FakeCtx(self._widths(sha=7, author=5, date=12))
+        wc = self.r.Item(id=('wc', 'staged', None), title='Staged changes',
+                         col_sha='', col_author='', col_date='',
+                         has_children=True)
+        self.assertEqual(self.r.git_row_content(wc, ctx)[-1],
+                         ('Staged changes', self.r._WC_TITLE_FG, False))
+        commit = self._commit_item(
+            col_sha='deadbee', col_author='Al', col_date='2 days ago',
+            title='subj', chips=[])
+        self.assertEqual(
+            self.r.git_row_content(commit, _FakeCtx(
+                self._widths(sha=7, author=5, date=12)))[-1],
+            ('subj', None, False))
 
     def test_non_commit_row_falls_back(self):
         # A status/stash/ref/file row (no col_sha) must return EXACTLY

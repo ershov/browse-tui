@@ -234,6 +234,12 @@ _RESET = '\033[m'
 # via ``getattr(item, 'row_bg', None)``; left unset on non-HEAD rows.
 _HEAD_ROW_BG = 18
 
+# Title foreground (xterm-256 index) for the synthetic working-change rows
+# (``('wc', …)`` — ``Untracked changes`` / ``Tracked changes`` / …), so they
+# stand out from the ordinary commit subjects around them. Applied to the
+# title segment in ``git_row_content``; commit / filler rows keep the default.
+_WC_TITLE_FG = 33
+
 # Module-level state, all set in main() before the Browser launches.
 _log_limit = _LOG_LIMIT
 _mode = 'commits'
@@ -2272,7 +2278,12 @@ def git_row_content(item, ctx):
     for text, stylename in getattr(item, 'chips', None) or ():
         cfg, cbold = style(stylename)
         segments.append((f'[{text}] ', cfg, cbold))
-    segments.append((item.title, None, False))    # flexible column, last
+    # Synthetic working-change rows ('wc', …) get a distinct title colour so
+    # they stand out from the commit subjects; commit rows keep the default.
+    item_id = getattr(item, 'id', None)
+    tfg = (_WC_TITLE_FG if isinstance(item_id, tuple) and item_id[:1] == ('wc',)
+           else None)
+    segments.append((item.title, tfg, False))    # flexible column, last
     return segments
 
 
