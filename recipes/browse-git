@@ -10,10 +10,12 @@ auto-selected from positional arguments:
   status    ``git status`` working-tree entries
 
 In commits mode the log is preceded by up to four synthetic working-change
-rows — ``Untracked changes`` / ``Tracked changes`` / ``Staged changes`` /
+rows — ``Untracked changes`` / ``Unstaged changes`` / ``Staged changes`` /
 ``Conflicts`` — each shown only when non-empty and drillable into its
 files. They honor the same path filter and appear only on an unscoped log
-(no positional rev).
+(no positional rev). Under ``--all`` they are spliced above each worktree's
+tip commit and carry that worktree's branch-name chip, so several worktrees
+stacked at one shared commit stay attributable.
   reflog    ``git reflog`` entries
   branches  branches / remotes / tags via ``git for-each-ref``
   stash     ``git stash list``
@@ -73,10 +75,11 @@ access — never a hex-vs-word heuristic or substring scan:
   ('status', (bucket, wt_path), xy, path)  the SAME leaf under a worktree group
                              (commits mode): the (bucket, wt_path) ns keeps a
                              two-sided MM file distinct across the staged vs
-                             tracked groups and across worktrees. Consumers read
-                             xy/path from the END (id[-2]/id[-1]) so both shapes
-                             route uniformly
-  ('wc', bucket, wt_path)    a working-change group (untracked/tracked/staged/
+                             unstaged groups and across worktrees, and the
+                             bucket scopes the leaf's diff to that group's side.
+                             Consumers read xy/path from the END (id[-2]/id[-1])
+                             so both shapes route uniformly
+  ('wc', bucket, wt_path)    a working-change group (untracked/unstaged/staged/
                              conflicts); wt_path None = current worktree (cwd),
                              else the abspath of the worktree it sits atop
   ('stash', n[, path])       a stash (n int), or a file in one (.md -> launcher)
@@ -231,6 +234,12 @@ _RESET = '\033[m'
 # range), readable as blue rather than near-black. Read by the list renderer
 # via ``getattr(item, 'row_bg', None)``; left unset on non-HEAD rows.
 _HEAD_ROW_BG = 18
+
+# Title foreground (xterm-256 index) for the synthetic working-change rows
+# (``('wc', …)`` — ``Untracked changes`` / ``Unstaged changes`` / …), so they
+# stand out from the ordinary commit subjects around them. Applied to the
+# title segment in ``git_row_content``; commit / filler rows keep the default.
+_WC_TITLE_FG = 33
 
 # Module-level state, all set in main() before the Browser launches.
 _log_limit = _LOG_LIMIT
@@ -901,20 +910,20 @@ def _classify_worktree(rows):
     that belong to that group:
 
       * ``'conflicts'`` — unmerged codes (``_is_conflict``); a conflict
-        lands here and ONLY here, never in staged / tracked, so a
+        lands here and ONLY here, never in staged / unstaged, so a
         mid-merge path shows up once.
       * ``'untracked'`` — the ``??`` code.
       * ``'staged'``    — a non-conflict code whose ``X`` column is set
         (not a space, not ``?``).
-      * ``'tracked'``   — a non-conflict code whose ``Y`` column is set
+      * ``'unstaged'``  — a non-conflict code whose ``Y`` column is set
         (not a space, not ``?``).
 
-    Staged and tracked are NOT exclusive: a two-sided code such as ``MM``
+    Staged and unstaged are NOT exclusive: a two-sided code such as ``MM``
     (staged + unstaged modification) appears in BOTH lists.
     """
     buckets = {
         'untracked': [],
-        'tracked': [],
+        'unstaged': [],
         'staged': [],
         'conflicts': [],
     }
@@ -929,7 +938,7 @@ def _classify_worktree(rows):
         if x not in (' ', '?'):
             buckets['staged'].append((xy, path))
         if y not in (' ', '?'):
-            buckets['tracked'].append((xy, path))
+            buckets['unstaged'].append((xy, path))
     return buckets
 
 
@@ -975,7 +984,27 @@ def _status_wt_path(item_id):
     return None
 
 
-def _status_diff_plan(xy, path, wt_path=None):
+def _status_bucket(item_id):
+    """The worktree-group bucket a status leaf sits in, or ``None``.
+
+    A worktree-group status leaf carries its bucket in the id
+    (``('status', (bucket, wt_path), xy, path)``): return that ``bucket``
+    (``item_id[1][0]`` — one of ``untracked`` / ``unstaged`` / ``staged`` /
+    ``conflicts``). It scopes the leaf's diff to just that group's side (see
+    ``_status_diff_plan``), so a two-sided ``MM`` file shows only its staged
+    diff under *Staged changes* and only its worktree diff under *Unstaged
+    changes*. A bare status-MODE leaf (``('status', xy, path)``) has no
+    bucket, so it returns ``None`` and the diff falls back to the full
+    per-``XY`` plan (both sections). Gated on ``id[0]`` like
+    ``_status_wt_path`` so an unrelated 4-tuple id never mis-reads a bucket.
+    """
+    if (isinstance(item_id, tuple) and len(item_id) == 4
+            and item_id[0] == 'status' and isinstance(item_id[1], tuple)):
+        return item_id[1][0]
+    return None
+
+
+def _status_diff_plan(xy, path, wt_path=None, bucket=None):
     """Map a porcelain ``XY`` + path to the diff command(s) to render.
 
     Returns a list of ``(header, argv)`` pairs — the per-file diff(s) whose
@@ -986,16 +1015,26 @@ def _status_diff_plan(xy, path, wt_path=None):
       * worktree (``Y`` set and not ``?``) → ``diff -- <path>``
       * untracked (``??``)                 → ``diff --no-index -- /dev/null <path>``
 
-    Unmerged codes (``_is_conflict``) are handled FIRST, ahead of the
-    X/Y split, so a conflicted leaf shows a single ``diff -- <path>`` —
-    which git renders in combined (``--cc``) form for an unmerged path —
-    rather than two empty staged/worktree sections.
+    ``bucket`` — the worktree group the leaf sits in (``_status_bucket``),
+    when set — scopes the plan to just that group's side, so a two-sided
+    ``MM`` file shows ONLY its ``diff --cached`` under *Staged changes* and
+    ONLY its worktree ``diff`` under *Unstaged changes*:
 
-    A two-sided code (``MM``) yields BOTH the staged and worktree diffs,
-    each under its own header. The ``argv`` lists are the args passed to
-    ``git`` (color is applied by the caller via ``_git_color``). Note the
-    ``--no-index`` diff exits non-zero whenever the files differ — the
-    caller must NOT gate on the return code.
+      * ``'staged'``    → ``diff --cached -- <path>``
+      * ``'unstaged'``  → ``diff -- <path>``
+      * ``'conflicts'`` → ``diff -- <path>`` (git's combined ``--cc`` form)
+      * ``'untracked'`` → ``diff --no-index -- /dev/null <path>``
+
+    With no ``bucket`` (status mode's flat list) the plan falls back to the
+    full per-``XY`` split: unmerged codes (``_is_conflict``) FIRST — a single
+    combined ``diff -- <path>`` rather than two empty sections — then a
+    two-sided code (``MM``) yielding BOTH the staged and worktree diffs, each
+    under its own header.
+
+    The ``argv`` lists are the args passed to ``git`` (color is applied by
+    the caller via ``_git_color``). Note the ``--no-index`` diff exits
+    non-zero whenever the files differ — the caller must NOT gate on the
+    return code.
 
     ``wt_path`` selects the worktree: ``None`` (the default) diffs in cwd
     exactly as before; a non-None absolute path prepends ``['-C', wt_path]``
@@ -1004,11 +1043,17 @@ def _status_diff_plan(xy, path, wt_path=None):
     This single choke point makes both the preview pane (``_status_preview``)
     and the menu Diff (``_cm_status_diff``) worktree-correct.
     """
-    if _is_conflict(xy):
+    if bucket == 'staged':
+        plan = [('staged', ['diff', '--cached', '--', path])]
+    elif bucket == 'unstaged':
+        plan = [('unstaged', ['diff', '--', path])]
+    elif bucket == 'conflicts' or (bucket is None and _is_conflict(xy)):
         plan = [('conflict', ['diff', '--', path])]
-    elif xy == '??':
+    elif bucket == 'untracked' or (bucket is None and xy == '??'):
         plan = [('untracked', ['diff', '--no-index', '--', '/dev/null', path])]
     else:
+        # Status mode (no bucket): the full per-XY plan — both sections for a
+        # two-sided code — after the conflict / untracked cases above.
         x, y = xy[0], xy[1] if len(xy) > 1 else ' '
         plan = []
         if x not in (' ', '?'):
@@ -1033,7 +1078,7 @@ def _status_leaf(xy, path, ns=None):
     passes ``None`` for the bare 3-tuple ``('status', xy, path)`` (unchanged),
     while ``_worktree_files`` passes ``(bucket, wt_path)`` for the 4-tuple
     ``('status', ns, xy, path)``. The bucket distinguishes a two-sided ``MM``
-    file that classifies into BOTH the staged and tracked groups (otherwise the
+    file that classifies into BOTH the staged and unstaged groups (otherwise the
     same id under two sibling groups), and ``wt_path`` distinguishes the same
     dirty path under two worktrees — either collision would couple the leaves'
     expansion. Consumers read ``xy`` / ``path`` from the END of the id
@@ -1052,7 +1097,7 @@ def _status_leaf(xy, path, ns=None):
 # titles. Mirrors the four ``_classify_worktree`` buckets.
 _WC_GROUPS = [
     ('untracked', 'Untracked changes'),
-    ('tracked', 'Tracked changes'),
+    ('unstaged', 'Unstaged changes'),
     ('staged', 'Staged changes'),
     ('conflicts', 'Conflicts'),
 ]
@@ -1640,7 +1685,8 @@ def get_children(item_id, *, reload=False):
         linked = next((wt for wt in _worktrees()
                        if not wt.is_main and wt.branch == item_id[1]), None)
         if linked is not None:
-            return _worktree_groups([], linked.path) + log
+            return _worktree_groups(
+                [], linked.path, col_graph=_head_graph(log)) + log
         return log
     if kind == 'worktree':
         # A worktree row drills into its branch's commits via the same
@@ -1653,8 +1699,9 @@ def get_children(item_id, *, reload=False):
         # working-change groups are prepended above its log (scoped to the
         # worktree abspath, no ``_paths`` — a drill-down is about that
         # worktree, and the positional paths are cwd-relative).
-        return (_worktree_groups([], item_id[1])
-                + _log_items([item_id[2]], [], ns=item_id))
+        log = _log_items([item_id[2]], [], ns=item_id)
+        return _worktree_groups(
+            [], item_id[1], col_graph=_head_graph(log)) + log
     if kind == 'wc':
         # A worktree-status group drills into its files. id = ('wc',
         # bucket, wt_path). wt_path None means the current worktree (scope
@@ -1727,8 +1774,10 @@ def _commits_root():
         # sits in the all-branches log.
         return _inject_worktree_tips(items, _paths)
     if not _revs:
-        # Plain HEAD log: the current worktree's groups on top (unchanged).
-        return _worktree_groups(_paths, None) + items
+        # Plain HEAD log: the current worktree's groups on top, copying
+        # HEAD's graph art (tree mode) so they align under its lane column.
+        return _worktree_groups(
+            _paths, None, col_graph=_head_graph(items)) + items
     # Positional rev scope: the log is historical — no live working changes.
     return items
 
@@ -1920,7 +1969,19 @@ def _worktrees_root():
     return items
 
 
-def _worktree_groups(paths, wt_path=None):
+def _head_graph(items):
+    """The commit-graph art of a log's head row (its first commit), or ``None``.
+
+    In tree mode the first row of a ``git log --graph`` build is the newest
+    commit and carries ``col_graph``; the synthetic working-change rows
+    spliced above it copy that art so they sit under the same lane column
+    (see ``_worktree_groups``' ``col_graph``). In non-tree mode — or for an
+    empty / error log — there is no graph to copy, so this yields ``None``.
+    """
+    return getattr(items[0], 'col_graph', None) if items else None
+
+
+def _worktree_groups(paths, wt_path=None, branch=None, col_graph=None):
     """Synthetic worktree-group rows for a worktree's working changes.
 
     Classifies ``_worktree_status(paths, wt_path)`` into the four
@@ -1934,6 +1995,20 @@ def _worktree_groups(paths, wt_path=None):
     ``None`` means the current working directory (the path filter applies);
     an absolute path means that specific (linked) worktree (callers pass
     ``paths=[]`` there, since paths are cwd-relative).
+
+    ``branch``, when given, is prepended to every row as a cyan chip (the
+    ``('wc', …)`` id is unchanged, so expand/collapse is unaffected). The
+    ``--all`` splicer passes each worktree's branch short-name here so
+    several worktrees' groups stacked at one shared tip commit stay
+    attributable to their branch (``_inject_worktree_tips``); the
+    unambiguous single-worktree call sites leave it ``None``.
+
+    ``col_graph``, when truthy, is copied onto every row so — in tree mode —
+    the synthetic rows carry the graph art of the commit they sit above
+    (the branch's head / tip), lining them up under its lane column.
+    Callers pass the head commit's art (``_head_graph`` / the spliced tip's
+    ``col_graph``); non-tree builds pass ``None`` and the rows stay
+    graph-less as before.
 
     Each row carries empty ``col_sha`` / ``col_author`` / ``col_date``
     strings so ``git_row_content`` aligns its label under the sibling
@@ -1952,6 +2027,10 @@ def _worktree_groups(paths, wt_path=None):
             item.col_sha = ''
             item.col_author = ''
             item.col_date = ''
+            if branch:
+                item.chips = [(branch, 'cyan')]
+            if col_graph:
+                item.col_graph = col_graph
             items.append(item)
     return items
 
@@ -1968,7 +2047,7 @@ def _worktree_files(bucket, paths, wt_path=None):
 
     Each leaf is namespaced by ``(bucket, wt_path)`` so two sibling groups can't
     share a leaf id: a two-sided ``MM`` file lands in BOTH the staged and
-    tracked buckets, and the same dirty path can appear under two worktrees —
+    unstaged buckets, and the same dirty path can appear under two worktrees —
     either would couple their expand/collapse without the namespace.
     """
     buckets = _classify_worktree(_worktree_status(paths, wt_path))
@@ -1991,7 +2070,10 @@ def _inject_worktree_tips(items, paths):
     (``wt_path=None``) and honor ``paths``; every other worktree's groups
     are scoped to its abspath with no path filter (paths are cwd-relative).
     Two worktrees sharing a HEAD each contribute their groups, in worktree
-    order. Filler / meta / non-commit rows pass through untouched; mid-graph
+    order — each tagged with its branch short-name chip (``_worktree_label``)
+    so the stacked rows stay attributable to their branch, and (in tree mode)
+    carrying the tip commit's ``col_graph`` art so they line up under its lane
+    column. Filler / meta / non-commit rows pass through untouched; mid-graph
     insertion may look slightly off (accepted — alignment is refined later).
     """
     worktrees = _worktrees()
@@ -2010,7 +2092,9 @@ def _inject_worktree_tips(items, paths):
             for wt in by_head[item_id[2]]:
                 wt_path = None if wt.path == current else wt.path
                 grp_paths = paths if wt_path is None else []
-                out.extend(_worktree_groups(grp_paths, wt_path))
+                out.extend(_worktree_groups(
+                    grp_paths, wt_path, branch=_worktree_label(wt),
+                    col_graph=getattr(item, 'col_graph', None)))
         out.append(item)
     return out
 
@@ -2258,7 +2342,12 @@ def git_row_content(item, ctx):
     for text, stylename in getattr(item, 'chips', None) or ():
         cfg, cbold = style(stylename)
         segments.append((f'[{text}] ', cfg, cbold))
-    segments.append((item.title, None, False))    # flexible column, last
+    # Synthetic working-change rows ('wc', …) get a distinct title colour so
+    # they stand out from the commit subjects; commit rows keep the default.
+    item_id = getattr(item, 'id', None)
+    tfg = (_WC_TITLE_FG if isinstance(item_id, tuple) and item_id[:1] == ('wc',)
+           else None)
+    segments.append((item.title, tfg, False))    # flexible column, last
     return segments
 
 
@@ -2539,13 +2628,14 @@ def get_preview(item_id):
         # id = ('status', xy, path) in status mode, or ('status', (bucket,
         # wt_path), xy, path) under a worktree group — xy/path are the last two
         # fields either way; a worktree-group leaf also carries its worktree
-        # (``_status_wt_path``), so its preview diffs against THAT worktree.
+        # (``_status_wt_path``) and bucket (``_status_bucket``), so its preview
+        # diffs against THAT worktree, scoped to THAT group's side.
         if _STDIN_KIND == 'status':
             # Piped status carries no diff text (and no worktree) — show the
             # entry itself.
             return f'{item_id[-2]} {item_id[-1]}'
         return _status_preview(item_id[-2], item_id[-1],
-                               _status_wt_path(item_id))
+                               _status_wt_path(item_id), _status_bucket(item_id))
     if kind == 'wc':
         # A worktree-status group — a --stat summary of the bucket (the
         # per-file diff lives on its child leaves). id = ('wc', bucket,
@@ -2588,20 +2678,23 @@ def _file_preview(sha, path):
     return _colorize_diff(raw)
 
 
-def _status_preview(xy, path, wt_path=None):
+def _status_preview(xy, path, wt_path=None, bucket=None):
     """Status-leaf preview: the staged / worktree / untracked diff(s).
 
     The ``XY`` code selects the diff command(s) via ``_status_diff_plan``;
-    each is run git-colored and piped through ``_colorize_diff``. A
-    two-sided code (``MM``) shows both sections under ``── staged ──`` /
-    ``── unstaged ──`` headers. The ``--no-index`` untracked diff exits
-    non-zero by design, so its output is captured regardless of code.
+    each is run git-colored and piped through ``_colorize_diff``. In status
+    mode (no ``bucket``) a two-sided code (``MM``) shows both sections under
+    ``── staged ──`` / ``── unstaged ──`` headers; under a worktree group the
+    ``bucket`` scopes it to that group's single side. The ``--no-index``
+    untracked diff exits non-zero by design, so its output is captured
+    regardless of code.
 
-    ``wt_path`` (the leaf's worktree, ``None`` for cwd) is threaded to
+    ``wt_path`` (the leaf's worktree, ``None`` for cwd) and ``bucket`` (the
+    worktree group, ``None`` in status mode) are threaded to
     ``_status_diff_plan`` so a worktree-group leaf previews ITS worktree's
-    diff rather than the current one.
+    diff for ITS group's side rather than the whole per-``XY`` diff.
     """
-    plan = _status_diff_plan(xy, path, wt_path)
+    plan = _status_diff_plan(xy, path, wt_path, bucket)
     sections = []
     multi = len(plan) > 1
     for header, argv in plan:
@@ -2621,11 +2714,11 @@ def _worktree_preview(bucket, paths, wt_path=None):
     summarises its changed files and the per-file diff lives on the child
     ``('status', …)`` leaves (``_status_preview``), so a worktree group
     drills down exactly like a commit. ``_classify_worktree`` scopes each
-    bucket's paths so e.g. the tracked summary never pulls in staged-only
+    bucket's paths so e.g. the unstaged summary never pulls in staged-only
     files. The stat command is chosen by bucket:
 
       * ``staged``    → ``diff --cached --stat -- <bucket paths>``
-      * ``tracked``   → ``diff --stat -- <bucket paths>``
+      * ``unstaged``  → ``diff --stat -- <bucket paths>``
       * ``conflicts`` → ``diff --stat -- <bucket paths>``
       * ``untracked`` → ``_untracked_stat`` (per-file ``diff --no-index
         --stat`` combined, since untracked files have no index entry)
@@ -2648,7 +2741,7 @@ def _worktree_preview(bucket, paths, wt_path=None):
     if bucket == 'staged':
         return _git_color(*scope, 'diff', '--cached', '--stat', '--',
                           *bucket_paths)
-    if bucket in ('tracked', 'conflicts'):
+    if bucket in ('unstaged', 'conflicts'):
         return _git_color(*scope, 'diff', '--stat', '--', *bucket_paths)
     if bucket == 'untracked':
         return _untracked_stat(bucket_paths, wt_path)
@@ -2664,7 +2757,7 @@ def _untracked_stat(paths, wt_path=None):
     => `` rename arrow and prints a per-file ``N file changed`` footer; the
     arrow is stripped and the per-file footers are dropped in favour of one
     combined footer, so the bucket reads as a single cohesive stat like the
-    staged / tracked buckets. Because the per-file calls can't align the
+    staged / unstaged buckets. Because the per-file calls can't align the
     ``|`` column the way a single ``git diff --stat`` would, the path column
     is re-padded here (``cell_ljust`` to the widest path). The ``+`` bars
     stay git-colored; the synthesised footer is plain (git's stat footer is
@@ -3332,11 +3425,12 @@ def _cm_status_discard(ctx, xy, path, wt_path=None):
                                 'This cannot be undone.', strong=True)
 
 
-def _cm_status_diff(ctx, xy, path, wt_path=None):
+def _cm_status_diff(ctx, xy, path, wt_path=None, bucket=None):
     # Reuse the recipe's status diff-plan (staged / worktree / untracked) and
     # page each section, so the menu Diff matches the preview pane — including
-    # the leaf's worktree (``wt_path``), which the plan injects as ``-C``.
-    plan = _status_diff_plan(xy, path, wt_path)
+    # the leaf's worktree (``wt_path``, injected as ``-C``) and its group
+    # (``bucket``, scoping a two-sided file to that group's single side).
+    plan = _status_diff_plan(xy, path, wt_path, bucket)
     multi = len(plan) > 1
     sections = []
     for header, argv in plan:
@@ -3512,7 +3606,7 @@ _MENU_ACTIONS = {
         c, i[-2], i[-1], _status_wt_path(i)),
     'status.edit':     lambda c, i: edit_file(c),
     'status.diff':     lambda c, i: _cm_status_diff(
-        c, i[-2], i[-1], _status_wt_path(i)),
+        c, i[-2], i[-1], _status_wt_path(i), _status_bucket(i)),
     'status.opendir':  lambda c, i: _cm_status_open_dir(
         c, i[-2], i[-1], _status_wt_path(i)),
     # stash
@@ -3655,7 +3749,7 @@ browse-git — a tig-like browser over a git repository.
 The six view modes:
   commits   recent git log; drill commit -> changed files -> per-file diff
             (an unscoped log is preceded by working-change rows — Untracked
-            / Tracked / Staged / Conflicts — each shown only when non-empty,
+            / Unstaged / Staged / Conflicts — each shown only when non-empty,
             drillable into their files, scoped by the same path filter)
   status    working-tree entries; leaf preview = staged / worktree diff
   reflog    reflog entries; same drill-down as commits

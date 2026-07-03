@@ -134,6 +134,43 @@ def _make_repo_with_changes(tmpdir):
     return tmpdir
 
 
+def _make_repo_with_shared_head_worktrees(tmpdir):
+    """Init a repo whose main tree + a linked worktree share one HEAD commit.
+
+    Both branches (``main`` and the linked ``feat``) point at the SAME commit,
+    and each work tree carries a tracked modification. In ``--all`` mode the
+    log shows that commit once, and ``_inject_worktree_tips`` stacks both
+    worktrees' synthetic ``Unstaged changes`` rows above it — the case the
+    branch-name chip disambiguates. The linked worktree lives OUTSIDE
+    ``tmpdir`` (sibling ``<tmpdir>_wt``) so it isn't itself an untracked
+    entry. Returns ``(main_dir, wt_dir)``.
+    """
+    env = {
+        **os.environ,
+        'GIT_AUTHOR_NAME': 'Test', 'GIT_AUTHOR_EMAIL': 'test@example.com',
+        'GIT_COMMITTER_NAME': 'Test', 'GIT_COMMITTER_EMAIL': 'test@example.com',
+    }
+    def git(*args):
+        subprocess.run(['git', '-C', tmpdir, *args], check=True,
+                       capture_output=True, env=env)
+    git('init', '-q', '-b', 'main')
+    git('config', 'user.name', 'Test')
+    git('config', 'user.email', 'test@example.com')
+    with open(os.path.join(tmpdir, 'shared.txt'), 'w') as f:
+        f.write('shared v1\n')
+    git('add', 'shared.txt')
+    git('commit', '-q', '-m', 'shared base commit')
+    # Linked worktree on a new branch 'feat', pointing at the same commit.
+    wt_dir = tmpdir + '_wt'
+    git('worktree', 'add', '-q', '-b', 'feat', wt_dir)
+    # A tracked modification in EACH worktree → each gets a Tracked group.
+    with open(os.path.join(tmpdir, 'shared.txt'), 'w') as f:
+        f.write('main edit\n')
+    with open(os.path.join(wt_dir, 'shared.txt'), 'w') as f:
+        f.write('feat edit\n')
+    return tmpdir, wt_dir
+
+
 def _make_repo_with_conflict(tmpdir):
     """Init a repo and produce a real, unresolved merge conflict.
 
@@ -600,17 +637,49 @@ class TestBrowseGit(unittest.TestCase):
                 t.send_line(f'cd {tmp}')
                 t.launch(_BIN, '--run-py', _RECIPE)
                 t.wait_for('Untracked changes', timeout=5.0)
-                t.wait_for('Tracked changes', timeout=5.0)
+                t.wait_for('Unstaged changes', timeout=5.0)
                 cap = t.wait_for('Staged changes', timeout=5.0)
                 lines = cap.splitlines()
                 def row_of(label):
                     return next(i for i, ln in enumerate(lines) if label in ln)
                 untracked = row_of('Untracked changes')
-                tracked = row_of('Tracked changes')
+                tracked = row_of('Unstaged changes')
                 staged = row_of('Staged changes')
                 self.assertLess(untracked, tracked)
                 self.assertLess(tracked, staged)
                 t.send('q')
+
+    def test_all_mode_tags_shared_head_groups_with_branch_chip(self):
+        """``--all`` tags each worktree's synthetic rows with its branch chip.
+
+        With two branches (``main`` + linked ``feat``) at one shared commit
+        and a tracked edit in each work tree, the all-branches log stacks two
+        ``Unstaged changes`` rows above the single commit. Each carries its
+        worktree's branch short-name chip, so the otherwise-identical rows
+        stay attributable — the row text shows ``main`` on one and ``feat``
+        on the other. tmux strips SGR but keeps the chip text.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            main_dir, wt_dir = _make_repo_with_shared_head_worktrees(tmp)
+            try:
+                with TmuxFixture(cols=120, rows=30) as t:
+                    t.send_line(f'cd {main_dir}')
+                    t.launch(_BIN, '--run-py', _RECIPE, '--all')
+                    t.wait_for('Unstaged changes', timeout=5.0)
+                    cap = t.wait_for('feat', timeout=5.0)
+                    tracked_rows = [ln for ln in cap.splitlines()
+                                    if 'Unstaged changes' in ln]
+                    self.assertEqual(len(tracked_rows), 2)
+                    joined = '\n'.join(tracked_rows)
+                    self.assertIn('main', joined)
+                    self.assertIn('feat', joined)
+                    # Tree mode is on by default, so each synthetic row copies
+                    # the tip commit's graph node glyph (aligned under its
+                    # lane). tmux strips SGR but keeps the glyph text.
+                    self.assertTrue(all('•' in ln for ln in tracked_rows))
+                    t.send('q')
+            finally:
+                shutil.rmtree(wt_dir, ignore_errors=True)
 
     def test_clean_repo_has_no_worktree_groups(self):
         """A clean tree shows none of the synthetic worktree rows.
@@ -628,7 +697,7 @@ class TestBrowseGit(unittest.TestCase):
                 cap = t.wait_for('second commit add beta', timeout=5.0)
                 self.assertNotIn('Untracked changes', cap)
                 self.assertNotIn('Staged changes', cap)
-                self.assertNotIn('Tracked changes', cap)
+                self.assertNotIn('Unstaged changes', cap)
                 t.send('q')
 
     def test_worktree_group_drills_into_file(self):
