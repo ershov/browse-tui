@@ -6685,6 +6685,20 @@ class TestRecordMinLevel(unittest.TestCase):
                'content': [{'type': 'text', 'text': 'on it'}]}}
         self.assertEqual(self.r._record_min_level(rec), 2)
 
+    def test_queued_enqueue_prompt_is_level_1(self):
+        # A queued prompt (enqueue) the user typed while Claude worked is
+        # a user prompt → summary tier.
+        rec = {'type': 'queue-operation', 'operation': 'enqueue',
+               'content': 'do this next'}
+        self.assertEqual(self.r._record_min_level(rec), 1)
+
+    def test_queue_popall_stays_voice_level_2(self):
+        # A non-enqueue queue op that still carries content (popAll, the
+        # consumption echo) is voice but not the user typing → voice (2).
+        rec = {'type': 'queue-operation', 'operation': 'popAll',
+               'content': 'flushed'}
+        self.assertEqual(self.r._record_min_level(rec), 2)
+
     def test_edit_tools_are_level_3(self):
         for name in ('Edit', 'Write', 'NotebookEdit', 'MultiEdit'):
             with self.subTest(tool=name):

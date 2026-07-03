@@ -34,8 +34,9 @@ JSON pretty-print preview.
 gated by a detail level — each record has a *minimum* level at or above
 which it shows:
 
-- `1` `summary` — the skeleton: user prompts and the agent's `end_turn`
-  responses. The default — what you asked and what it concluded.
+- `1` `summary` — the skeleton: user prompts (including ones you queued
+  while it worked) and the agent's `end_turn` responses. The default —
+  what you asked and what it concluded.
 - `2` `voice` — all speech: adds intermediate assistant text,
   `AskUserQuestion`, and inter-agent messages.
 - `3` `edits` — adds the file-mutating tool calls (`Edit` / `Write` /

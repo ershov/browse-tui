@@ -1345,7 +1345,8 @@ def _record_min_level(rec):
     of the leaner views.
 
       * ``isMeta`` (injected context; never lived)        → 6
-      * turn-root user prompt / assistant ``end_turn``     → 1  (summary)
+      * turn-root prompt / queued ``enqueue`` / assistant
+        ``end_turn`` response                              → 1  (summary)
       * any other voice (``_is_voice``)                    → 2  (voice)
       * empty (signature-only) thinking-only assistant     → 6
       * an Edit/Write/NotebookEdit/MultiEdit tool record   → 3  (edits)
@@ -1366,8 +1367,12 @@ def _record_min_level(rec):
         # The conversation skeleton — the user's prompt and the agent's
         # final (end_turn) response — is the summary tier; intermediate
         # voice (running commentary, AskUserQuestion, inter-agent) sits
-        # one level up.
-        if _is_turn_root(rec) or _is_end_turn(rec):
+        # one level up. A queued ``enqueue`` is a prompt the user typed
+        # while Claude was busy, so it belongs with the prompts (its
+        # ``popAll`` consumption echo stays at voice to avoid a dupe).
+        if (_is_turn_root(rec) or _is_end_turn(rec)
+                or (rec.get('type') == 'queue-operation'
+                    and rec.get('operation') == 'enqueue')):
             return 1
         return 2
     t = rec.get('type')
