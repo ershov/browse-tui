@@ -1498,14 +1498,6 @@ def dispatch_key(browser, ctx: 'Context', key: str) -> bool:
         if _gate_passes(action, ctx):
             if action.handler is not None:
                 action.handler(ctx)
-            # An explicit user navigation voids a pending refresh
-            # scroll-restore: ``_do_refresh`` records ``_preview_scroll_restore``
-            # so the reload's cursor bounce doesn't lose the user's place,
-            # but once the user moves the cursor themselves that intent is
-            # gone — otherwise a later revisit of the refresh row would
-            # wrongly reopen at the remembered scroll.
-            if action.section == 'NAVIGATION':
-                browser._preview_scroll_restore = None
             return True
         # Gated out — silently swallow so the caller doesn't double-log.
         return True

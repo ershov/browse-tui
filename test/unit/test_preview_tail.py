@@ -585,9 +585,10 @@ class TestRefreshPreservesScroll(unittest.TestCase):
     def test_full_refresh_bounce_restores_scroll(self):
         # A full refresh collapses the visible tree via
         # ``cache_invalidate_all``, so a deep cursor row bounces to the
-        # scope row and back. Without the restore slot the bounce reads as
-        # a navigation and resets the user's scroll (the "voice umbrella
-        # resets on Ctrl-R" regression).
+        # scope row and back. The cursor's sticky anchor keeps pointing at
+        # the deep row throughout, so the restore slot survives the bounce
+        # and re-applies on return (the "voice umbrella resets on Ctrl-R"
+        # regression).
         b = _make_browser('body')
         try:
             s = _data.to_item(Item(id='S'))       # scope row (index 0)
@@ -601,20 +602,21 @@ class TestRefreshPreservesScroll(unittest.TestCase):
             b._state.cursor = 1
             b._update_preview_for_cursor()         # settle on V
             b._preview_scroll = 6
+            b._cursor_anchor = ['V']               # cursor sticks to V
             self.assertEqual(b._preview_last_shown_id, 'V')
 
             # Simulate ``_do_refresh``: capture the slot, null the cursor
-            # id, mark a reload in flight (children fetches pending).
+            # id. The anchor keeps V as its primary across the reload —
+            # that's what brings the cursor back.
             b._preview_scroll_restore = ('V', b._preview_scroll)
             b._preview_cursor_id = None
-            b._state._children_pending.add('reload')
 
             # Bounce: tree collapsed → cursor clamps to the scope row.
             b._state.cursor = 0
             b._update_preview_for_cursor()
             self.assertEqual(b._preview_scroll, 0, 'transient bounce resets')
             self.assertIsNotNone(b._preview_scroll_restore,
-                                 'slot kept while the reload is in flight')
+                                 'slot kept: the anchor still targets V')
 
             # Return: V re-anchored → cursor back on it.
             b._state.cursor = 1
@@ -626,10 +628,11 @@ class TestRefreshPreservesScroll(unittest.TestCase):
         finally:
             b.stop_workers()
 
-    def test_refresh_restore_dropped_when_settling_elsewhere(self):
-        # If the user navigates away during the reload (cursor settles on
-        # a different row once fetches complete), the slot is dropped so a
-        # later manual revisit of the refresh row still opens fresh.
+    def test_user_retarget_voids_restore(self):
+        # When the user re-targets the cursor (the sticky anchor primary
+        # changes away from the refresh row), the restore slot is dropped
+        # so the new row opens fresh and a later revisit does not reuse the
+        # remembered scroll.
         b = _make_browser('body')
         try:
             for id_ in ('S', 'V', 'W'):
@@ -640,46 +643,44 @@ class TestRefreshPreservesScroll(unittest.TestCase):
                 b._state._items_by_id[i] for i in ('S', 'V', 'W')]
             _state.mark_visible_dirty(b._state)
             b._state.cursor = 1
-            b._update_preview_for_cursor()         # settle on V
+            b._update_preview_for_cursor()
             b._preview_scroll = 6
 
             b._preview_scroll_restore = ('V', 6)   # refresh started on V
             b._preview_cursor_id = None
-            b._state._children_pending.clear()      # reload settled
-            b._state.cursor = 2                     # user ended on W
+            # User navigated to W: the anchor now sticks to W.
+            b._cursor_anchor = ['W']
+            b._state.cursor = 2
             b._update_preview_for_cursor()
+            self.assertIsNone(b._preview_scroll_restore,
+                              'a sticky-id re-target voids the restore slot')
             self.assertEqual(b._preview_scroll, 0, 'fresh view on the new row')
-            self.assertIsNone(b._preview_scroll_restore, 'stale slot dropped')
         finally:
             b.stop_workers()
 
-    def test_user_cursor_move_voids_restore(self):
-        # An explicit user navigation during the reload voids the restore
-        # slot, so a later revisit of the refresh row opens fresh rather
-        # than reusing the remembered scroll.
+    def test_pin_voids_restore(self):
+        # A home/end pin makes the anchor primary a sentinel — a re-target
+        # away from the concrete refresh row, so the slot is dropped.
         b = _make_browser('body')
         try:
-            for id_ in ('S', 'V', 'W'):
+            for id_ in ('S', 'V'):
                 it = _data.to_item(Item(id=id_))
                 it.preview = f'{id_} body\n' * 50
                 b._state._items_by_id[id_] = it
             b._state._children[None] = [
-                b._state._items_by_id[i] for i in ('S', 'V', 'W')]
+                b._state._items_by_id[i] for i in ('S', 'V')]
             _state.mark_visible_dirty(b._state)
             b._state.cursor = 1
             b._update_preview_for_cursor()
             b._preview_scroll = 6
 
-            # Refresh started on V, reload in flight.
-            b._preview_scroll_restore = ('V', 6)
+            b._preview_scroll_restore = ('V', 6)   # refresh started on V
             b._preview_cursor_id = None
-            b._state._children_pending.add('reload')
-
-            # User presses Down (a NAVIGATION-section action).
-            ctx = _ctx_for(b)
-            dispatch_key(b, ctx, 'down')
+            b._cursor_anchor = [_state.PIN_FIRST]  # user pressed Home
+            b._state.cursor = 0
+            b._update_preview_for_cursor()
             self.assertIsNone(b._preview_scroll_restore,
-                              'a user cursor move must void the restore slot')
+                              'a pin anchor voids the restore slot')
         finally:
             b.stop_workers()
 
