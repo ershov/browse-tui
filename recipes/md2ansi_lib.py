@@ -6,7 +6,7 @@ See md2ansi_lib.design.md for architecture, naming conventions, and rule tables.
 """
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 
@@ -51,9 +51,10 @@ class M2A_DocumentState:
     cell_min_width: int = 20
     row_dividers: Any = None
     # The requested wrap width (the caller's `line_width`), or 0 when wrapping
-    # is disabled. Drives table fitting, blockquote/list self-wrapping, and the
-    # post-render prose wrap. Kept distinct from `line_width` so the 150-char
-    # fallback used for HR sizing doesn't accidentally trigger any of those.
+    # is disabled. Drives table fitting, list self-wrapping, the width a
+    # blockquote narrows its recursion to, and the post-render prose wrap. Kept
+    # distinct from `line_width` so the 150-char fallback used for HR sizing
+    # doesn't accidentally trigger any of those.
     wrap_width: int = 0
 
 
@@ -491,41 +492,41 @@ def _m2a_fmt_image(m, name, current_style, context, state):
     return _m2a_styled(f"[IMG: {alt}]", current_style, f"3;{M2A_COLOR_DIM}")
 
 
+# Floor for the width a blockquote narrows its content to. The `│ ` bar costs 2
+# columns per nesting level; without a floor a deep quote (or a very narrow page)
+# would shrink the inner width toward zero and crush tables/prose. Clamping the
+# recursion width here keeps nested content legible at any depth.
+M2A_MIN_NESTED_WIDTH = 20
+
+
 def _m2a_fmt_blockquote(m, name, current_style, context, state):
     text = m.group(0)
     stripped = "\n".join(re.sub(r"^>[ \t]?", "", ln) for ln in text.split("\n"))
-    # Recurse through BLOCKLITE (not INLINE) so a `> ## x` line renders as a
-    # heading. Strip any opaque marker a nested heading added: the quote re-marks
-    # the whole block opaque below, and the post-render pass only consumes a
-    # line-leading marker, so an inner one (now after the bar) would leak as a
-    # literal NUL. The nested heading therefore wraps with the quote, not opaque.
-    inner = _md2ansi(stripped, current_style, M2A_CONTEXT_MD_BLOCKLITE, state)
-    inner = inner.replace(_M2A_OPAQUE, "")
-    # Realize the deferred line sentinels into real newlines BEFORE the per-line
-    # bar/self-wrap below (the quote marks itself opaque, which bypasses the final
-    # sentinel sweep — spec §5.2/§5.3). `\x01` → a newline, so each resulting line
-    # gets its own `│ ` bar. `\x02` → a `─`-run on its own line at the bar-less
-    # content width (`wrap_width − 2`, falling back to the page width − 2 when
-    # wrapping is off, mirroring `_m2a_fmt_hr`).
-    # Each `\x02` becomes a rule line of its own (the shared splitter drops the
-    # blank line a rule-adjacent empty segment would otherwise add, so the rule
-    # sits flush, not separated by an empty barred line).
-    rule_w = (state.wrap_width if state.wrap_width > 0 else state.line_width) - 2
-    rule = _m2a_rule(rule_w)
-    inner = "\n".join(
-        rule if kind == "rule" else seg
-        for kind, seg in _m2a_split_sentinel_lines(inner)
-    )
+    # A blockquote is a mini-document: strip the `>` markers, then recurse the
+    # body through M2A_CONTEXT_MD_NESTED — the full block grammar (tables, lists,
+    # fenced code, nested quotes, `---` rules, headings, inline) minus frontmatter
+    # (its `\A`-anchored pattern would misfire on a `> ---` at quote start) and
+    # footnote_def (a def inside a quote is quoted prose, not a collected note).
+    # The recursion runs at a narrowed width so inner layout owners (tables, HR)
+    # size themselves to the space left after the `│ ` bar; the width is floored
+    # at M2A_MIN_NESTED_WIDTH so deep nesting can't crush it. wrap_width stays 0
+    # when wrapping is disabled (0 means "no wrap"); line_width — which drives the
+    # HR/table fallback sizing when wrapping is off — is always narrowed. The
+    # footnotes dict/list are shared by reference through `replace`, so a ref
+    # inside the quote still resolves against top-level defs.
+    inner_wrap = max(M2A_MIN_NESTED_WIDTH, state.wrap_width - 2) if state.wrap_width > 0 else 0
+    inner_line = max(M2A_MIN_NESTED_WIDTH, state.line_width - 2)
+    nested_state = replace(state, wrap_width=inner_wrap, line_width=inner_line)
+    inner = _md2ansi(stripped, current_style, M2A_CONTEXT_MD_NESTED, nested_state)
+    # Run the standard finishing pass (opaque-aware): opaque lines from inner
+    # layout owners pass through verbatim with their marker stripped, prose lines
+    # get their deferred sentinels realized and are wrapped to the narrowed width.
+    # Passing `inner_wrap` (0 when wrapping is off) means a disabled wrap only
+    # strips markers/realizes sentinels, matching the top-level pass.
+    inner = _m2a_wrap_rendered(inner, inner_wrap)
+    # Prefix the `│ ` bar to every finished line and re-mark the whole block
+    # opaque so the top-level post-render pass never reflows it.
     bar = _m2a_styled("│", current_style, M2A_COLOR_DIM) + " "
-    # The quote owns its layout, so it wraps itself (visible-width aware) before
-    # the bar is prefixed — width less the 2-column bar — then marks the result
-    # opaque so the post-render pass won't reflow it.
-    if state.wrap_width > 0:
-        inner = "\n".join(
-            sub
-            for ln in inner.split("\n")
-            for sub in _m2a_wrap_ansi_line(ln, state.wrap_width - 2)
-        )
     return _m2a_opaque(_m2a_prefix_lines(inner, bar))
 
 
@@ -1168,7 +1169,19 @@ _MD_FOOTNOTE_DEF = r"""
     (?P<*text> [^\n]+ (?: \n [ \t]+ [^\n]+ )* )
 """
 
-_MD_FOOTNOTE_REF = r" \[ \^ (?P<*id> [^\]\n]+ ) \] "
+# A leading guard rejects def-shaped occurrences: a `[^id]` at line start (after
+# `\n`, or at the string start `\A`) immediately followed by `:` is a footnote
+# DEFINITION, not a ref. In contexts that carry this rule but no `footnote_def`
+# (blockquote bodies, list items, table cells) such a line would otherwise be
+# styled and appended to the shared footnote_order, yielding a phantom Footnotes
+# entry. The guard lets the match proceed only when NOT at line start
+# (`(?<=[^\n])`, which also fails at `\A`) OR when the def shape is absent
+# (`(?! … : )`); it rejects solely the conjunction, so a mid-line `[^1]:` after
+# prose still matches as a ref and a rejected line falls through as literal text.
+_MD_FOOTNOTE_REF = r"""
+    (?: (?<= [^\n] ) | (?! \[ \^ [^\]\n]+ \] : ) )
+    \[ \^ (?P<*id> [^\]\n]+ ) \]
+"""
 
 # Backslash-escape token: `\<any char>`. Used as the first alternative in
 # every inline-delimiter rule's inner alternation so that `\*`, `\~`, `\[`,
@@ -1288,9 +1301,10 @@ def _m2a_heading_lambda(sgr):
 # the sentinel to the now-built INLINE context. Block-level matches recurse
 # into INLINE so their text never re-triggers the full block grammar (otherwise
 # "1. Goals" inside `## 1. Goals` would render as a list). The exceptions are
-# list items and blockquotes, which recurse into M2A_CONTEXT_MD_BLOCKLITE
-# (INLINE plus the heading rules) so a heading nested inside them is styled —
-# see that context's definition for what that does and does not cover.
+# list items, which recurse into M2A_CONTEXT_MD_BLOCKLITE (INLINE plus the
+# heading rules) so a nested heading is styled, and blockquotes, which recurse
+# into the fuller M2A_CONTEXT_MD_NESTED (the whole block grammar) so a quote is a
+# mini-document — see each context's definition for what it does and doesn't cover.
 _M2A_RULES_INLINE_RAW = (
     ("code_inline2",  _MD_CODE_INLINE2, _m2a_fmt_inline_code,  None),
     ("code_inline",   _MD_CODE_INLINE,  _m2a_fmt_inline_code,  None),
@@ -1356,30 +1370,28 @@ _M2A_RULES_MD = (
 M2A_CONTEXT_MD = _m2a_build_context(_M2A_RULES_MD)
 
 # "Block-lite" recursion context: the six ATX heading rules plus the inline
-# rules, and nothing else. It is the recursion target for list items and
-# blockquotes (see `_m2a_fmt_list` / `_m2a_fmt_blockquote`) so that a heading
-# written inside one of them is styled instead of leaking its literal `#`s.
+# rules, and nothing else. It is the recursion target for list items (see
+# `_m2a_fmt_list`) so that a heading written inside one is styled instead of
+# leaking its literal `#`s. (Blockquotes recurse into the fuller
+# M2A_CONTEXT_MD_NESTED, defined below.)
 #
-# How it works: the block rule (list/blockquote) claims the whole block first
-# and draws its own chrome (the bullet, or the `│` bar); it then recurses the
-# *leftover* line content through this context, where the `^#{1,6} ` heading
-# rules fire per line (the engine compiles with re.MULTILINE) exactly as they
-# do at top level. Going *through* the block formatter is what preserves the
-# chrome — a sibling top-level heading rule cannot, because the block rules
-# consume their own lines first (a flat heading rule placed beside `list` either
-# no-ops on multi-line lists or eats the bullet on single-line ones).
+# How it works: the `list` rule claims the whole block first and draws its own
+# chrome (the bullet); it then recurses the *leftover* line content through this
+# context, where the `^#{1,6} ` heading rules fire per line (the engine compiles
+# with re.MULTILINE) exactly as they do at top level. Going *through* the block
+# formatter is what preserves the chrome — a sibling top-level heading rule
+# cannot, because the block rules consume their own lines first (a flat heading
+# rule placed beside `list` either no-ops on multi-line lists or eats the bullet
+# on single-line ones).
 #
-# Covered: a heading that is the direct line-content of a list item or a
-# blockquote line — `- ## h`, `1. ## h`, `> ## h`, multi-line quotes, and
-# headings in nested list items (`- a` then `  - ## h`), with inline emphasis
-# in the title still rendered.
+# Covered: a heading that is the direct line-content of a list item — `- ## h`,
+# `1. ## h`, and headings in nested list items (`- a` then `  - ## h`), with
+# inline emphasis in the title still rendered.
 #
-# NOT covered (each would require real recursive block parsing, which this
-# regex engine does not do): a heading on a marker-less list *continuation*
-# line (`- a` then `  ## h` — the `_MD_LIST` grammar never captures that line
-# into the list block), and multi-level block nesting such as a list inside a
-# quote (`> - ## h`, where the blockquote recurses into this context, which has
-# no list rule).
+# NOT covered (would require real recursive block parsing, which this regex
+# engine does not do): a heading on a marker-less list *continuation* line
+# (`- a` then `  ## h` — the `_MD_LIST` grammar never captures that line into the
+# list block).
 #
 # Deliberately distinct from M2A_CONTEXT_MD_INLINE: INLINE stays heading-free
 # because it also renders heading titles and table cells, where a literal
@@ -1388,6 +1400,22 @@ _M2A_RULES_BLOCKLITE = tuple(
     r for r in _M2A_RULES_MD if r[0] in {"h1", "h2", "h3", "h4", "h5", "h6"}
 ) + _M2A_RULES_INLINE_IN_MD
 M2A_CONTEXT_MD_BLOCKLITE = _m2a_build_context(_M2A_RULES_BLOCKLITE)
+
+# "Nested" recursion context: the FULL block grammar (`_M2A_RULES_MD`) minus two
+# rules, used by `_m2a_fmt_blockquote` so a quote body is a mini-document with
+# tables, lists, fenced code, nested quotes, `---` rules and headings — not just
+# the heading+inline subset BLOCKLITE offers (BLOCKLITE stays the list-item
+# recursion target). Two rules are dropped:
+#   • frontmatter — its `\A`-anchored pattern would misfire on a `> ---` (or a
+#     `---`…`---` pair) at the quote's start, framing it as a Frontmatter box.
+#   • footnote_def — a definition inside a quote renders as quoted prose; a ref
+#     with no collected def is already silently dropped (_m2a_render_footnotes),
+#     and footnote REFS keep working against top-level defs because the shared
+#     state (footnotes/footnote_order) survives the blockquote's narrowed copy.
+_M2A_RULES_MD_NESTED = tuple(
+    r for r in _M2A_RULES_MD if r[0] not in {"frontmatter", "footnote_def"}
+)
+M2A_CONTEXT_MD_NESTED = _m2a_build_context(_M2A_RULES_MD_NESTED)
 
 
 # ### Section: Internal _md2ansi() and replace dispatcher ###################
