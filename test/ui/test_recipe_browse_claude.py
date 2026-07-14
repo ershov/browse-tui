@@ -1091,7 +1091,7 @@ class TestBrowseClaude(unittest.TestCase):
         Verifies the recipe's ``_ROW_BG_FOR_KIND`` + the framework's
         ``_write_segments(row_bg=…)`` plumbing end-to-end. Captures
         the tmux pane with ``-e`` (colors) and asserts the 256-color
-        background SGR for user (235) appears in the output.
+        background SGR for user (17) appears in the output.
 
         After the session-row expansion the cursor lands on the
         latest voice (the user row) and the reverse-video selection
@@ -1115,7 +1115,7 @@ class TestBrowseClaude(unittest.TestCase):
                 t.wait_stable()
                 colored = t.capture(colors=True)
                 # The user-voice bg colour code we configured for browse-claude.
-                self.assertIn('48;5;235', colored,
+                self.assertIn('48;5;17m', colored,
                               'expected user-row bg escape in colored capture')
                 t.send('q')
 

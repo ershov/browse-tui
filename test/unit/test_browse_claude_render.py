@@ -2545,7 +2545,7 @@ class TestScanTree(unittest.TestCase):
                              if isinstance(r, dict)
                              and r.get('type') == 'queue-operation')
             item = self.r._tree_item(path, queue_rec, td)
-            self.assertEqual(getattr(item, 'row_bg', None), 235)
+            self.assertEqual(getattr(item, 'row_bg', None), 17)
         finally:
             os.unlink(path)
 
@@ -3103,18 +3103,18 @@ class TestUmbrellaShapes(unittest.TestCase):
         try:
             roots = self.r._list_tree_roots(path)
             prompt = roots[0]
-            self.assertEqual(prompt.row_bg, 235)
+            self.assertEqual(prompt.row_bg, 17)
             kids = self.r._list_prompt_children(path, 0)
             user_leaf = kids[0]
             # The wrapped user leaf keeps the user-voice stripe.
-            self.assertEqual(user_leaf.row_bg, 235)
+            self.assertEqual(user_leaf.row_bg, 17)
             tool = kids[1]
             # Assistant has both text and tool_use → tool umbrella is
             # voice.
-            self.assertEqual(tool.row_bg, 17)
+            self.assertEqual(tool.row_bg, 235)
             tool_kids = self.r._list_tool_children(path, 1)
             asst_leaf = tool_kids[0]
-            self.assertEqual(asst_leaf.row_bg, 17)
+            self.assertEqual(asst_leaf.row_bg, 235)
         finally:
             os.unlink(path)
 
@@ -4204,7 +4204,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             sess = self._build(tmp)
             rows = self.r._list_subagents_for_session(sess)
             self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0].row_bg, 17)  # assistant stripe
+            self.assertEqual(rows[0].row_bg, 235)  # assistant stripe
 
     def test_inline_subagent_pseudo_item_has_voice_bg(self):
         # Tree-mode placement uses _subagent_pseudo_item, not the
@@ -4215,7 +4215,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             sub_dir = self.r._subagents_dir(sess)
             agent_path = os.path.join(sub_dir, 'agent-A1.jsonl')
             item = self.r._subagent_pseudo_item(sess, 'A1', agent_path)
-            self.assertEqual(item.row_bg, 17)
+            self.assertEqual(item.row_bg, 235)
 
     def test_orphan_subagent_row_keeps_voice_bg(self):
         import tempfile
@@ -4225,7 +4225,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             td = self.r._scan_tree(sess)
             orphans = self.r._orphan_subagents_for_session(sess, td)
             self.assertEqual(len(orphans), 1)
-            self.assertEqual(orphans[0].row_bg, 17)
+            self.assertEqual(orphans[0].row_bg, 235)
             self.assertIn('orphan', orphans[0].tag)
 
     def test_parent_preview_does_not_inline_subagent_content(self):
@@ -4251,7 +4251,7 @@ class TestSubagentUmbrellaVoice(unittest.TestCase):
             # Line 1 is the assistant tool_use record dispatching Agent.
             assistant_rec = td.records[1]
             item = self.r._tool_umbrella_item(sess, 1, assistant_rec, td)
-            self.assertEqual(item.row_bg, 17,
+            self.assertEqual(item.row_bg, 235,
                              '<tool:Agent> umbrella should inherit '
                              'subagent stripe when dispatching a resolvable '
                              'subagent transcript')
@@ -5711,7 +5711,7 @@ class TestRowBgForKind(unittest.TestCase):
         ])
         try:
             items = self.r._list_messages(path)
-            self.assertEqual(getattr(items[0], 'row_bg', None), 235)
+            self.assertEqual(getattr(items[0], 'row_bg', None), 17)
         finally:
             os.unlink(path)
 
@@ -5723,7 +5723,7 @@ class TestRowBgForKind(unittest.TestCase):
         ])
         try:
             items = self.r._list_messages(path)
-            self.assertEqual(getattr(items[0], 'row_bg', None), 17)
+            self.assertEqual(getattr(items[0], 'row_bg', None), 235)
         finally:
             os.unlink(path)
 
@@ -5787,7 +5787,7 @@ class TestRowBgForKind(unittest.TestCase):
         ])
         try:
             items = self.r._list_messages(path)
-            self.assertEqual(getattr(items[0], 'row_bg', None), 17)
+            self.assertEqual(getattr(items[0], 'row_bg', None), 235)
         finally:
             os.unlink(path)
 
@@ -8270,7 +8270,7 @@ class TestSendMessage(unittest.TestCase):
     # -- stripe / tag style registration -----------------------------------
 
     def test_agent_send_stripe_and_tag_style_registered(self):
-        self.assertEqual(self.r._ROW_BG_FOR_KIND.get('agent-send'), 17)
+        self.assertEqual(self.r._ROW_BG_FOR_KIND.get('agent-send'), 235)
         self.assertIn('agent-send', self.r._TAG_STYLE_FOR_KIND)
 
 
@@ -8377,14 +8377,14 @@ class TestTaskNotification(unittest.TestCase):
     # -- stripe / tag style registration -----------------------------------
 
     def test_agent_reply_stripe_matches_assistant(self):
-        # Inter-agent voice shares the assistant stripe (17), NOT human's 235.
+        # Inter-agent voice shares the assistant stripe (235), NOT human's 17.
         kind = self.r._kind_of(self._notify_rec())
-        self.assertEqual(self.r._ROW_BG_FOR_KIND.get(kind), 17)
+        self.assertEqual(self.r._ROW_BG_FOR_KIND.get(kind), 235)
         self.assertIn('agent-reply', self.r._TAG_STYLE_FOR_KIND)
 
-    def test_human_user_stripe_still_235(self):
+    def test_human_user_stripe_still_user(self):
         kind = self.r._kind_of(self._human_rec())
-        self.assertEqual(self.r._ROW_BG_FOR_KIND.get(kind), 235)
+        self.assertEqual(self.r._ROW_BG_FOR_KIND.get(kind), 17)
 
     # -- _summarise_message ------------------------------------------------
 
