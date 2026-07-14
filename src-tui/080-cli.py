@@ -6,6 +6,7 @@ import json
 import os
 import re as _re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -959,6 +960,10 @@ def make_cli_action(spec: str, *, bin_path=None,
             return
         target_ids = [t.id for t in ctx.targets]
         targets_label = 'selection' if ctx.selected else 'cursor'
+        # Ctrl-C shield while the action owns the terminal -- same no-op
+        # SIGINT handler bracket as ``Context.run_external``, enclosing
+        # the whole cooked-mode window (suspend through resume).
+        prev_sigint = signal.signal(signal.SIGINT, lambda signum, frame: None)
         child_fds = {}
         if not ctx._browser._headless:
             term_suspend()
@@ -975,6 +980,7 @@ def make_cli_action(spec: str, *, bin_path=None,
             if not ctx._browser._headless:
                 term_resume()
                 ctx._browser._needs_redraw.add('all')
+            signal.signal(signal.SIGINT, prev_sigint)
         ctx.refresh()
         if rc != 0:
             ctx.error(f'action {key!r} exited with code {rc}')

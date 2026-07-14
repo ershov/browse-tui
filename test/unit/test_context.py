@@ -540,6 +540,85 @@ class TestRunExternalStdinText(unittest.TestCase):
         self.assertEqual(got, big)
 
 
+class TestRunExternalSigint(unittest.TestCase):
+    """Ctrl-C while an external command runs must not kill the session.
+
+    While shelled out the terminal is in cooked mode, so Ctrl-C sends
+    SIGINT to the whole foreground process group — the parent included
+    (the child is spawned into the same group). run_external / page must
+    shield the parent for the duration; what SIGINT means for the child
+    is the child's own business, so it must exec with SIG_DFL.
+    """
+
+    def test_parent_survives_sigint_during_wait(self):
+        # The child sends SIGINT to the parent (as the tty driver would)
+        # while the parent is blocked waiting on it, then exits cleanly.
+        b = _make_browser()
+        try:
+            ctx = Context(b)
+            try:
+                rc = ctx.run_external(['sh', '-c', 'kill -INT $PPID; exit 0'])
+            except KeyboardInterrupt:
+                self.fail('KeyboardInterrupt escaped run_external')
+            self.assertEqual(rc, 0)
+        finally:
+            b.stop_workers()
+
+    def test_child_execs_with_default_sigint(self):
+        # An inherited SIG_IGN would make a pager un-interruptible, so
+        # the shield must not leak into the child across exec: a child
+        # that SIGINTs itself must die of it (rc == -SIGINT), not
+        # survive to exit 0.
+        import signal
+        b = _make_browser()
+        try:
+            ctx = Context(b)
+            rc = ctx.run_external(['sh', '-c', 'kill -INT $$; exit 0'])
+            self.assertEqual(rc, -signal.SIGINT)
+        finally:
+            b.stop_workers()
+
+    def test_parent_handler_restored_after_run(self):
+        import signal
+        b = _make_browser()
+        try:
+            ctx = Context(b)
+            before = signal.getsignal(signal.SIGINT)
+            ctx.run_external(['true'])
+            self.assertIs(signal.getsignal(signal.SIGINT), before)
+        finally:
+            b.stop_workers()
+
+    def test_page_survives_sigint_during_wait(self):
+        # Same shield for the pipe-pager path. A stand-in $PAGER sends
+        # SIGINT to the parent, drains stdin, exits 0 (bat/batcat lookup
+        # is disabled so the $PAGER fallback runs).
+        import os
+        import tempfile
+        b = _make_browser()
+        try:
+            ctx = Context(b)
+            with tempfile.TemporaryDirectory() as d:
+                pager = os.path.join(d, 'pager')
+                with open(pager, 'w') as f:
+                    f.write('#!/bin/sh\nkill -INT $PPID\n'
+                            'cat >/dev/null\nexit 0\n')
+                os.chmod(pager, 0o755)
+                with mock.patch.object(_context.shutil, 'which',
+                                       lambda _c: None), \
+                     mock.patch.dict(os.environ, {'PAGER': pager}):
+                    try:
+                        ctx.page('hello\n')
+                    except KeyboardInterrupt:
+                        self.fail('KeyboardInterrupt escaped page')
+            # ctx.error posts to the main queue; drain it so a surfaced
+            # error would actually land in ``_notice`` before we assert.
+            b.drain_main_queue()
+            self.assertIsNone(b._notice)
+        finally:
+            b.stop_workers()
+
+
 class TestRunExternalKeepScreen(unittest.TestCase):
     """run_external threads ``keep_screen`` through to ``term_suspend``."""
 

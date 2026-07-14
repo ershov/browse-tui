@@ -30,6 +30,7 @@ dialog flows).
 
 import os
 import shutil
+import signal
 import subprocess
 import threading
 from typing import Any, Callable, Optional
@@ -757,6 +758,11 @@ class Context:
         Returns the subprocess exit code, or ``-1`` if launching the
         process raised. Errors are also surfaced via ``ctx.error``.
 
+        Ctrl-C while the child runs is the child's business alone: this
+        process shields itself from the process-group SIGINT for the
+        duration, and the child execs with SIGINT at its default
+        disposition.
+
         The child is handed the terminal on its stdin/stdout/stderr (via
         the terminal layer's child-fd accessor) so an interactive editor
         runs on the terminal regardless of how the parent's own fd 0/1
@@ -770,6 +776,15 @@ class Context:
         fds. The ``_needs_redraw`` flag is still set so the next render
         pass repaints over whatever the external process drew.
         """
+        # While shelled out the terminal is in cooked mode, so Ctrl-C sends
+        # SIGINT to the whole foreground process group -- this process
+        # included (the child shares our group). Shield ourselves for the
+        # duration with a no-op *handler* -- not SIG_IGN, which the child
+        # would inherit across exec; a caught handler resets to SIG_DFL in
+        # the child, so what Ctrl-C means stays entirely the child's
+        # business while we survive to resume the UI. The bracket encloses
+        # suspend through resume, covering the whole cooked-mode window.
+        prev_sigint = signal.signal(signal.SIGINT, lambda signum, frame: None)
         child_fds = {}
         if not self._browser._headless:
             term_suspend(keep_screen=keep_screen)
@@ -800,6 +815,7 @@ class Context:
         finally:
             if not self._browser._headless:
                 term_resume()
+            signal.signal(signal.SIGINT, prev_sigint)
             self._browser._needs_redraw.add('all')
 
     def page(self, text: str, lang: str = '') -> None:
@@ -838,6 +854,10 @@ class Context:
         if pager is None:
             pager = [os.environ.get('PAGER') or 'less', '-R']
 
+        # Ctrl-C shield while the pager owns the terminal -- same no-op
+        # SIGINT handler bracket as ``run_external``, enclosing suspend
+        # through resume.
+        prev_sigint = signal.signal(signal.SIGINT, lambda signum, frame: None)
         out_fds = {}
         if non_headless:
             term_suspend()
@@ -856,6 +876,7 @@ class Context:
         finally:
             if non_headless:
                 term_resume()
+            signal.signal(signal.SIGINT, prev_sigint)
             self._browser._needs_redraw.add('all')
 
     def input(self, prompt: str, default: str = '',

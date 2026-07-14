@@ -395,6 +395,48 @@ class TestRunActionCmd(unittest.TestCase):
             os.unlink(path)
 
 
+class TestCliActionSigint(unittest.TestCase):
+    """Ctrl-C during a ``--action`` shell-out must not kill the session.
+
+    Same shield contract as ``Context.run_external`` (see
+    ``TestRunExternalSigint`` in test_context.py): the handler spawns
+    the command into our own process group, so a tty Ctrl-C hits this
+    process too and must not escape as KeyboardInterrupt.
+    """
+
+    def _ctx(self):
+        item = _data.to_item({'id': 'i1', 'title': 't'})
+
+        class _Ctx:
+            cursor = item
+            selected = []
+            targets = [item]
+
+            def __init__(self):
+                self.errors = []
+                self._browser = type(
+                    'B', (), {'_headless': True, '_needs_redraw': set()})()
+
+            def refresh(self):
+                pass
+
+            def error(self, text):
+                self.errors.append(text)
+
+        return _Ctx()
+
+    def test_handler_survives_sigint(self):
+        # The command SIGINTs the parent (as the tty driver would) while
+        # the handler is blocked waiting on it, then exits cleanly.
+        action = _cli.make_cli_action('k:Kick:kill -INT $PPID; exit 0')
+        ctx = self._ctx()
+        try:
+            action.handler(ctx)
+        except KeyboardInterrupt:
+            self.fail('KeyboardInterrupt escaped the --action handler')
+        self.assertEqual(ctx.errors, [])   # rc 0 — no error surfaced
+
+
 class TestInstallDryRun(unittest.TestCase):
     """End-to-end install via tmpdir-scoped paths.
 
