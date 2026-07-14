@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 
-"""md2ansi_lib — single-file, zero-dependency Markdown-to-ANSI library.
+"""md2ansi_lib2 — single-file, zero-dependency Markdown-to-ANSI library (v2).
 
-See md2ansi_lib.design.md for architecture, naming conventions, and rule tables.
+A major-version rewrite of md2ansi_lib.py on a two-phase block/inline engine.
+See md2ansi_lib2.design.md for architecture, naming conventions, and rule tables.
+Lives side by side with v1 until the switchover (§13); the two modules never
+import each other. v2 borrows from v1 deliberately (§9): the alternation engine,
+the inline rule tuple, the code-highlight grammars, and the SGR/width/wrap
+utilities are reused verbatim; the block layer above them is new.
 """
 
 import re
@@ -12,7 +17,8 @@ from typing import Any
 
 # ### Section: SGR color constants ##########################################
 
-# Bare SGR codes — wrapping in `\x1b[...m` is the dispatcher's job.
+# Bare SGR codes — wrapping in `\x1b[...m` is the dispatcher's job. Borrowed
+# verbatim from v1 (design §9, color schema).
 
 # Universal code-token palette.
 M2A_COLOR_COMMENT  = "38;5;245"   # gray
@@ -43,6 +49,13 @@ class M2A_Context:
     rules: tuple
 
 
+# The single lower cap on line width, applied uniformly at every level INCLUDING
+# root (design §6 — v1's nesting-only M2A_MIN_NESTED_WIDTH renamed and promoted):
+# `md2ansi_color(line_width=5)` renders at 20. One constant, one rule, no
+# per-level exceptions.
+M2A_MIN_WIDTH = 20
+
+
 @dataclass(slots=True)
 class M2A_DocumentState:
     line_width: int = 150
@@ -50,19 +63,25 @@ class M2A_DocumentState:
     footnote_order: list = field(default_factory=list)
     cell_min_width: int = 20
     row_dividers: Any = None
-    # The requested wrap width (the caller's `line_width`), or 0 when wrapping
-    # is disabled. Drives table fitting, list self-wrapping, the width a
-    # blockquote narrows its recursion to, and the post-render prose wrap. Kept
-    # distinct from `line_width` so the 150-char fallback used for HR sizing
-    # doesn't accidentally trigger any of those.
+    # The requested wrap width (the caller's `line_width`), or 0 when wrapping is
+    # disabled. Drives table fitting, list self-wrapping, prose wrapping, and the
+    # width a blockquote narrows its recursion to. Kept distinct from
+    # `line_width` so the 150-char fallback used for HR sizing doesn't trigger any
+    # of those.
     wrap_width: int = 0
+    # The ambient SGR the document renders under. Constant across block recursion
+    # (a quote/list prefixes chrome but doesn't change the base style); the inline
+    # pass layers emphasis on top of it locally. In v1 this was a function
+    # parameter threaded through every handler; v2's block renderers take
+    # `(match, state)`, so the base style rides in the state.
+    current_style: str = "0"
 
 
 # ### Section: Shared regex fragments #######################################
 
-# All fragments are designed to be embedded inside
-# re.VERBOSE patterns (whitespace ignored outside character classes; `#` is
-# a comment unless escaped).
+# All fragments are designed to be embedded inside re.VERBOSE patterns
+# (whitespace ignored outside character classes; `#` is a comment unless
+# escaped). Borrowed verbatim from v1 (design §9).
 
 # String literals — linear, no atomic groups needed. Each char has exactly one
 # matching branch: a non-quote non-backslash char OR a backslash + any char.
@@ -76,9 +95,7 @@ _M2A_STR_TSQ = r" ''' (?: (?!''') [\s\S] )* ''' "
 
 # Permissive multiline single/double-quoted strings — same shape as the strict
 # fragments but WITHOUT the `\n` exclusion, so a string may span linebreaks.
-# Used only by the unknown-language context, where over-matching an unbalanced
-# quote across lines is an accepted tradeoff (the language is unknown). The
-# backtick fragment (`_M2A_STR_BT`) is already newline-permissive.
+# Used only by the unknown-language context.
 _M2A_STR_DQ_ML = r' " (?: [^"\\] | \\. )* "  '
 _M2A_STR_SQ_ML = r" ' (?: [^'\\] | \\. )* '  "
 
@@ -94,17 +111,11 @@ _M2A_NUM = r"""
 """
 
 # Punctuation run — a maximal run of operator/bracket/separator chars, dimmed so
-# words read brighter by contrast. Used as the universal trailing rule in every
-# code context (appended LAST, so it never steals a `.` inside a float or a `/`
-# in `//`). Excludes `_` (word char), quotes/backtick (string rules), `\`
-# (escape), and `#` (often a comment/preprocessor marker handled earlier).
-# `-` leads the class so it's literal; `]` is escaped.
+# words read brighter by contrast. Appended LAST in every code context.
 _M2A_PUNCT = r"[-+*/%=<>!&|^~.,;:?@(){}\[\]]+"
 
 # Block-start lookahead — substituted into every cross-line inline rule's
-# soft-newline branch so inline matching stops at block boundaries. The `#`
-# branch requires 1–6 hashes followed by a space, matching a real ATX heading
-# (_MD_H1.._MD_H6); a bare `#word` is not a heading and must not stop a span.
+# soft-newline branch so inline matching stops at block boundaries.
 _M2A_BLOCK_START_AHEAD = r"""
     [ \t]* (?:
         \#{1,6} [ \t]
@@ -121,14 +132,11 @@ _M2A_BLOCK_START_AHEAD = r"""
 
 # ### Section: Context-building utility #####################################
 
-# The placeholder rewrite covers both group definitions (`<`-form)
-# and backreferences (`=`-form); the trailing `>` or `)` is left alone since
-# we only insert the rulename prefix.
+# The placeholder rewrite covers both group definitions (`<`-form) and
+# backreferences (`=`-form); the trailing `>`/`)` is left alone.
 _M2A_PLACEHOLDER_RE = re.compile(r"\(\?P(?P<kind>[<=])\*(?P<suffix>\w*)")
 
-# Sentinel meaning "recurse into the same context the rule fired in" — used so
-# rules can self-recurse without a circular reference at definition time. The
-# dispatcher resolves it to the live context.
+# Sentinel meaning "recurse into the same context the rule fired in".
 _M2A_RECURSE_SELF = object()
 
 
@@ -146,34 +154,19 @@ def _m2a_build_context(rules):
     return M2A_Context(compiled=compiled, rules=rules)
 
 
-# ### Section: Callable formatters ##########################################
+# ### Section: Width, wrap, and styling utilities ###########################
 
-# These reference M2A_CONTEXT_MD and _md2ansi which are defined later in the
-# file. Forward references resolve at call time — fine for function bodies.
+# Borrowed verbatim from v1 (design §9): visible-width measurement, the SGR
+# style/reset model, ANSI-aware wrapping, the shared HR run, the deferred line
+# sentinels, and the input sanitizer.
 
 _M2A_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
 
-# Line-wrap "no-break zone" — within the first N visible chars of a line, an
-# overflowing word is attached rather than triggering a break (there's no
-# useful break point that close to the start). Capped at 20 so a long token
-# in a wide line breaks instead of accumulating leading content past that
-# point; for narrow widths (line_width ≤ 30) the zone shrinks linearly to 0
-# so cramped columns still get aggressive breaks.
+
 def _m2a_no_break_zone(line_width):
     return min(20, max(0, line_width - 30))
 
-# Markdown-table cell-content matcher. Each char is in exactly one branch, tried
-# in order so the longest meaningful unit wins before the catch-all:
-#   \\.                       markdown escape (incl. `\|`, `\``) — kept first so
-#                             an escaped backtick can't open a code span.
-#   `` (?:(?!``)[^\n])* ``    double-backtick code span (may hold lone backticks).
-#   ` (?:\\.|[^`\n\\])* `      single-backtick code span.
-#   [^|\\\n]                   ordinary char (also a lone, unclosed `` ` ``).
-# The code-span branches make an un-escaped `|` inside backticks cell content
-# rather than a column divider; an unbalanced backtick falls through to the
-# catch-all so `|` still splits (the row was malformed anyway). Every branch is
-# tempered-greedy (the closer is excluded from its body), so matching stays
-# linear in input size.
+
 _M2A_TABLE_CELL_RE = re.compile(
     r"""
     (
@@ -191,10 +184,7 @@ _M2A_TABLE_CELL_RE = re.compile(
 
 
 def _m2a_split_table_row(s):
-    """Split a markdown table row on un-escaped `|`. Honours `\\|`.
-    Strips one optional leading `|` and one optional trailing un-escaped `|`,
-    then walks the rest through the linear cell-content regex.
-    """
+    """Split a markdown table row on un-escaped `|`. Honours `\\|`."""
     s = s.strip()
     if s.startswith("|"):
         s = s[1:]
@@ -218,12 +208,7 @@ def _m2a_visible_len(s):
 
 
 def _m2a_align_cell(content, width, align):
-    """Pad `content` to `width` columns according to `align`.
-
-    Width math uses _m2a_visible_len so embedded ANSI escapes don't skew it.
-    Caller is responsible for any surrounding decoration (e.g. the single
-    space of inner padding inside table `│ … │` cells).
-    """
+    """Pad `content` to `width` columns according to `align`."""
     pad_n = width - _m2a_visible_len(content)
     if pad_n <= 0:
         return content
@@ -240,56 +225,25 @@ def _m2a_prefix_lines(text, prefix):
     return "\n".join(prefix + ln for ln in text.split("\n"))
 
 
-# Block formatters that own their own layout (code frames, tables, headings,
-# blockquotes, lists, footnotes, HR) wrap themselves and then mark every output
-# line with this sentinel so the post-render wrap pass leaves their structure
-# untouched. NUL never occurs in real input; `md2ansi` strips any stray copy
-# from the source before rendering, and `_m2a_wrap_rendered` strips the markers
-# it consumes.
-_M2A_OPAQUE = "\x00"
-
-# Three more single-char sentinels share the OPAQUE plumbing but carry distinct
-# deferred-layout semantics. A handler emits one when a construct's realization
-# depends on the enclosing block (so it can't be resolved during the inline
-# pass); the layout owner or the final pass (`_m2a_wrap_rendered`) realizes it.
-# None of these ever appear in real input — the input sanitizer in `md2ansi()`
-# maps any stray copy in the SOURCE to U+FFFD before rendering, so an emitted
-# sentinel is unambiguous.
+# Three single-char sentinels carry deferred-layout semantics between the inline
+# pass and the leaf renderer that realizes them (design §6). Unlike v1 there is
+# NO `\x00` opaque marker and no global post-render pass — every renderer returns
+# final text, so these never survive past the level that emits them. None appear
+# in real input: the sanitizer maps any stray copy in the SOURCE to U+FFFD.
 _M2A_LINEBREAK = "\x01"  # hard line break (`<br>`, LF/CR entity) → real `\n`
 _M2A_RULE = "\x02"       # horizontal rule (`<hr>` as content) → `─`-run, container-sized
 _M2A_NBSP = "\x03"       # non-breaking space (`&nbsp;`, U+00A0 entity) → `" "`
 
-# Input sanitizer kill class: every C0 control codepoint EXCEPT `\t` (09),
-# `\n` (0A), and ESC `\x1b` (1B, kept so pre-colored source survives). `\r` (0D)
-# is absent here because CR is normalized to `\n` first. The matched ranges are
-# 0x00–0x08, 0x0B–0x0C, 0x0E–0x1A, 0x1C–0x1F. Mapping these to U+FFFD also
-# subsumes the old `\x00` strip and neutralizes any stray sentinel (`\x00`–`\x03`)
-# in the source so it can never be confused with one a handler emitted.
+# Input sanitizer kill class: every C0 control codepoint EXCEPT `\t` (09), `\n`
+# (0A), and ESC `\x1b` (1B). `\r` (0D) is absent (CR is normalized to `\n`
+# first). Mapping these to U+FFFD neutralizes any stray sentinel in the source.
 _M2A_C0_KILL = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1A\x1C-\x1F]")
-
-
-def _m2a_opaque(text):
-    """Mark every line of `text` as opaque — exempt from post-render wrapping."""
-    return "\n".join(_M2A_OPAQUE + ln for ln in text.split("\n"))
 
 
 def _m2a_split_sentinel_lines(text):
     """Yield `("text", seg)` / `("rule", None)` tokens for the deferred line
     sentinels — the single source of truth for how `<br>` (`\\x01`) and `<hr>`
     (`\\x02`) split a string into lines.
-
-    `\\x01` separates text runs (a hard break); `\\x02` becomes a `("rule", None)`
-    token between runs. An empty text run is dropped when it sits ADJACENT to a
-    rule (`len(segments) > 1`), so a leading/trailing/internal `<hr>` adds no
-    blank line; but an empty `\\x01`-piece with NO rule still yields one blank run
-    so a `<br>` at an edge keeps its blank line. Callers decide what each token
-    renders to — a `─`-run of some width, the table's deferred zero-width marker,
-    a wrapped line, etc.
-
-    The leading membership test is the hot-path fast exit: the vast majority of
-    lines/cells carry no sentinel, so two C-level scans beat the two `str.split`
-    allocations (and any regex) — see the benchmark in the refactor that
-    introduced this.
     """
     if _M2A_LINEBREAK not in text and _M2A_RULE not in text:
         yield ("text", text)
@@ -305,26 +259,12 @@ def _m2a_split_sentinel_lines(text):
 
 
 def _m2a_rule(width):
-    """A horizontal-rule run of `width` columns, floored at 1 so a narrow width
-    or deep nesting can't produce an empty/negative run. Shared by the block HR
-    (`_m2a_fmt_hr`) and every in-container `<hr>` realization; callers compute the
-    container-specific width."""
+    """A horizontal-rule run of `width` columns, floored at 1."""
     return "─" * max(1, width)
 
 
 def _m2a_inject_color(text, style, reset=None):
-    """Wrap `text` in SGR codes so every line carries its own color setup.
-
-    1. Prepends `\\x1b[{style}m`.
-    2. After every maximal run of `\\n`s that is NOT at end-of-string, re-emits
-       `\\x1b[{style}m` so each line of a multi-line span is self-styled
-       (survives pagers/pipelines that don't carry SGR across newlines).
-    3. If `reset` is not None, appends `\\x1b[{reset}m`.
-
-    Trailing newlines are intentionally skipped — injecting after them would
-    leave a stray SGR sitting on a non-existent next line, and (with reset)
-    produce a no-op open/close pair.
-    """
+    """Wrap `text` in SGR codes so every line carries its own color setup."""
     open_sgr = f"\x1b[{style}m"
     text_len = len(text)
     def _replace(mt):
@@ -343,89 +283,94 @@ def _m2a_styled(text, current_style, sgr):
     return _m2a_inject_color(text, f"{current_style};{sgr}", current_style)
 
 
-def _m2a_fmt_hr(m, name, current_style, context, state):
-    bar = _m2a_rule(state.line_width - 1)
-    return _m2a_opaque(_m2a_inject_color(bar, current_style, current_style))
+def _m2a_wrap_ansi_line(line, line_width, continuation="", reset_sgr=""):
+    """Greedy word-wrap over already-styled text: wraps at visible-character
+    positions (a small no-break zone at the line start), leaves SGR escape
+    sequences intact, and re-emits the last seen SGR at the start of each new
+    line so styling active at the break point survives onto the next line.
+    """
+    if _m2a_visible_len(line) <= line_width:
+        return [line + reset_sgr]
+    threshold = _m2a_no_break_zone(line_width)
+    tokens = re.findall(r"\x1b\[[0-9;]*m|\s+|[^\s\x1b]+", line)
+
+    lines_out = []
+    current = []
+    current_vlen = 0
+    pending = []
+    pending_vlen = 0
+    last_sgr = ""
+
+    for tok in tokens:
+        if tok.startswith("\x1b["):
+            last_sgr = tok
+            pending.append(tok)
+            continue
+        if tok[0].isspace():
+            pending.append(tok)
+            pending_vlen += len(tok)
+            continue
+        attempt_vlen = current_vlen + pending_vlen + len(tok)
+        if attempt_vlen <= line_width or current_vlen < threshold or current_vlen == 0:
+            current.extend(pending)
+            current.append(tok)
+            current_vlen = attempt_vlen
+        else:
+            lines_out.append("".join(current) + reset_sgr)
+            current = [continuation]
+            if last_sgr:
+                current.append(last_sgr)
+            current.append(tok)
+            current_vlen = len(continuation) + len(tok)
+        pending = []
+        pending_vlen = 0
+
+    current.extend(pending)
+    lines_out.append("".join(current) + reset_sgr)
+    return lines_out
 
 
-def _m2a_fmt_heading(m, name, current_style, context, state, sgr):
-    """Render an ATX heading: recurse the title through inline rules under the
-    level's color, then mark the line opaque so it's never wrapped (a heading
-    that overflows the width stays on one line, matching its block intent)."""
-    inner = m.group(f"{name}_inner")
-    new_style = f"{current_style};{sgr}"
-    inner = _md2ansi(inner, new_style, M2A_CONTEXT_MD_INLINE, state)
-    # Realize the deferred line sentinels into real geometry BEFORE color+opaque:
-    # opaque lines bypass the final-pass sentinel sweep, so any `\x01`/`\x02` left
-    # here would leak as a literal control char (spec §5.2/§5.3 heading branch).
-    # `\x01` → newline (multi-line heading; `_m2a_inject_color` re-emits the color
-    # after each break and `_m2a_opaque` marks each line, so every line stays
-    # colored and exempt from wrapping). `\x02` → a `─ × (line_width − 1)` rule
-    # line on its own, mirroring `_m2a_fmt_hr`'s width. The shared splitter drops
-    # the blank line a rule-adjacent empty segment would otherwise add.
-    rule = _m2a_rule(state.line_width - 1)
-    inner = "\n".join(
-        rule if kind == "rule" else seg
-        for kind, seg in _m2a_split_sentinel_lines(inner)
-    )
-    return _m2a_opaque(_m2a_inject_color(inner, new_style, current_style))
+# ### Section: Inline handlers ##############################################
 
+# Borrowed verbatim from v1 (design §9): the inline rule tuple's callable
+# formatters. None emit the opaque marker (only v1's block handlers did), so
+# they carry into v2 unchanged and are safe to run inside the inline dispatcher.
 
-# `\`` → bare backtick. Inside a single-backtick code span `\` escapes ONLY a
-# backtick (so it can't close the span); every other backslash is left verbatim.
+# `\`` → bare backtick inside a single-backtick code span.
 _M2A_INLINE_CODE_UNESCAPE = re.compile(r"\\(`)")
 
 
 def _m2a_fmt_inline_code(m, name, current_style, context, state):
     text = m.group(f"{name}_inner")
     if name == "code_inline":
-        # Single-backtick spans honor `\`` so a backtick can be embedded;
-        # double-backtick spans keep backslashes verbatim per CommonMark.
         text = _M2A_INLINE_CODE_UNESCAPE.sub(r"\1", text)
     return _m2a_styled(text, current_style, M2A_COLOR_STRING)
 
 
 def _m2a_fmt_escape(m, name, current_style, context, state):
-    # `\<punct>` → the punctuation char alone; `\<newline>` → bare newline
-    # (CommonMark hard-line-break).
     return m.group(f"{name}_char")
 
 
 def _m2a_fmt_comment(m, name, current_style, context, state):
-    # HTML comment `<!-- … -->` → dropped (no output). recurse=None and re.sub
-    # not rescanning the empty replacement means even a multi-line comment at top
-    # level drops wholesale. (Drop precedent: `_m2a_fmt_footnote_def`.)
+    # HTML comment `<!-- … -->` → dropped (no output).
     return ""
 
 
 def _m2a_fmt_br(m, name, current_style, context, state):
-    # `<br>` → the line-break sentinel, NOT a raw `\n`. A raw newline would be
-    # eaten as collapsible whitespace by the wrapper, split on by the post-render
-    # pass, and corrupt a table box (spec §5.2). The enclosing layout owner
-    # (table/list/quote/heading) or the final prose pass realizes `\x01`.
+    # `<br>` → the line-break sentinel, realized by the enclosing leaf renderer.
     return _M2A_LINEBREAK
 
 
 def _m2a_fmt_hr_inline(m, name, current_style, context, state):
-    # `<hr>` used as inline content (inside a cell/list item/heading; the
-    # standalone-line case is won by the `html_hr` block rule) → the rule
-    # sentinel. The layout owner sizes the `─`-run to its container; an
-    # uncontained one in prose becomes a full-width rule in the final pass
-    # (spec §5.3).
+    # `<hr>` as inline content → the rule sentinel, sized by the enclosing leaf.
     return _M2A_RULE
 
 
-# Seed set of named HTML entities (~25 common names) → their SINGLE Unicode char
-# (spec §5.4). Numeric entities (`&#dec;` / `&#xHEX;`) cover everything else, so
-# this is intentionally small. Every value is routed through the same codepoint
-# helper as the numeric path (`_m2a_entity_char`), so a named entity and its
-# numeric twin always agree — e.g. `&nbsp;` and `&#160;` both become `\x03`.
+# Seed set of named HTML entities → their SINGLE Unicode char (design §5.1
+# carried from v1). Numeric entities cover everything else.
 _M2A_HTML_ENTITIES = {
     "amp": "&", "lt": "<", "gt": ">", "quot": '"', "apos": "'",
-    # ` ` written as an escape (not a literal NBSP, which looks like a plain
-    # space in source) so it can not be "tidied" to U+0020 — its codepoint is what
-    # routes `&nbsp;` to the `\x03` sentinel via `_m2a_entity_char`.
-    "nbsp": "\u00A0", "copy": "©", "reg": "®", "trade": "™",
+    "nbsp": " ", "copy": "©", "reg": "®", "trade": "™",
     "mdash": "—", "ndash": "–", "hellip": "…", "bull": "•",
     "middot": "·", "sect": "§", "para": "¶", "deg": "°",
     "times": "×", "divide": "÷", "laquo": "«", "raquo": "»",
@@ -436,21 +381,7 @@ _M2A_HTML_ENTITIES = {
 
 def _m2a_entity_char(cp):
     """Map a resolved entity codepoint to its rendered char, applying the same
-    control-codepoint routing for the named and numeric paths (spec §5.4).
-
-    Cases are ordered and mutually exclusive:
-      1. NUL, a surrogate (U+D800–U+DFFF), or out of range (> U+10FFFF) → `�`
-         (U+FFFD). Out-of-range guards `chr()` against `ValueError`.
-      2. LF (U+000A) / CR (U+000D) → the line-break sentinel `\\x01` (a SAFE
-         break: renders as `\\n` in prose and splits cleanly in tables/lists —
-         it must NOT be a raw `\\n`, which the wrapper would eat / which would
-         corrupt a table box).
-      3. U+00A0 → the non-breaking-space sentinel `\\x03`.
-      4. any other control — C0 (< U+0020), DEL (U+007F), or C1 (U+0080–U+009F)
-         → `�`. (We deliberately skip the WHATWG Windows-1252 C1 legacy remap;
-         mapping C1 → `�` keeps the "no raw control survives" property.)
-      5. otherwise → `chr(cp)`.
-    """
+    control-codepoint routing for the named and numeric paths."""
     if cp == 0 or 0xD800 <= cp <= 0xDFFF or cp > 0x10FFFF:
         return "�"
     if cp == 0x0A or cp == 0x0D:
@@ -463,24 +394,11 @@ def _m2a_entity_char(cp):
 
 
 def _m2a_fmt_entity(m, name, current_style, context, state):
-    # HTML entity `&name;` / `&#dec;` / `&#xHEX;`, decoded during the inline pass
-    # (spec §5.4). Timing is automatically correct: every Markdown rule already
-    # matched the RAW source (where the entity was still `&#…;`), so a decoded
-    # `*`/`|`/`#` can never retro-trigger emphasis / a table split / a heading,
-    # and table widths are measured on the expanded text. recurse=None and re.sub
-    # not rescanning the replacement keep `&amp;amp;` → `&amp;` (decoded once).
     body = m.group(f"{name}_body")
     if body.startswith("#"):
-        # Numeric: `&#dec;` or `&#xHEX;`. The pattern already constrained the
-        # digits, so int() can't raise; route the codepoint through the shared
-        # helper so numeric and named agree on control handling.
         digits = body[1:]
         cp = int(digits[1:], 16) if digits[0] in "xX" else int(digits)
         return _m2a_entity_char(cp)
-    # Named: a KNOWN name resolves to its char's codepoint via the same helper
-    # (so `&nbsp;` → `\x03`); an UNKNOWN name (matches the shape but not in the
-    # dict) is returned UNCHANGED — literal pass-through, per the WHATWG standard
-    # (browsers substitute nothing for an unknown named entity).
     ch = _M2A_HTML_ENTITIES.get(body)
     if ch is None:
         return m.group(0)
@@ -492,67 +410,448 @@ def _m2a_fmt_image(m, name, current_style, context, state):
     return _m2a_styled(f"[IMG: {alt}]", current_style, f"3;{M2A_COLOR_DIM}")
 
 
-# Floor for the width a blockquote narrows its content to. The `│ ` bar costs 2
-# columns per nesting level; without a floor a deep quote (or a very narrow page)
-# would shrink the inner width toward zero and crush tables/prose. Clamping the
-# recursion width here keeps nested content legible at any depth.
-M2A_MIN_NESTED_WIDTH = 20
+def _m2a_fmt_footnote_ref(m, name, current_style, context, state):
+    fid = m.group(f"{name}_id")
+    if fid not in state.footnote_order:
+        state.footnote_order.append(fid)
+    return _m2a_styled(f"[^{fid}]", current_style, M2A_COLOR_FOOTNOTE)
 
 
-def _m2a_fmt_blockquote(m, name, current_style, context, state):
+# ### Section: Code-highlight grammars ######################################
+
+# Borrowed verbatim from v1 (design §9): all five code-highlight rule sets and
+# their compiled contexts.
+
+_M2A_RULE_PUNCT = ("punct", _M2A_PUNCT, M2A_COLOR_PUNCT, None)
+
+_M2A_PY_KEYWORDS = (
+    "False|None|True|and|as|assert|async|await|break|case|class|continue|def|del|"
+    "elif|else|except|finally|for|from|global|if|import|in|is|lambda|match|nonlocal|"
+    "not|or|pass|raise|return|try|type|while|with|yield"
+)
+_M2A_PY_BUILTINS = (
+    "abs|aiter|all|anext|any|ascii|bin|bool|breakpoint|bytearray|bytes|callable|"
+    "chr|classmethod|compile|complex|delattr|dict|dir|divmod|enumerate|eval|exec|"
+    "filter|float|format|frozenset|getattr|globals|hasattr|hash|help|hex|id|input|"
+    "int|isinstance|issubclass|iter|len|list|locals|map|max|memoryview|min|next|"
+    "object|oct|open|ord|pow|print|property|range|repr|reversed|round|set|setattr|"
+    "slice|sorted|staticmethod|str|sum|super|tuple|type|vars|zip|__import__"
+)
+
+_M2A_PY_STRING = rf"""
+    (?: \b [rRbBuUfF]{{1,2}} )?
+    (?:
+        (?: {_M2A_STR_TDQ} )
+      | (?: {_M2A_STR_TSQ} )
+      | (?: {_M2A_STR_DQ}  )
+      | (?: {_M2A_STR_SQ}  )
+    )
+"""
+
+_M2A_RULES_CODE_PYTHON = (
+    ("py_comment",    r"\#[^\n]*",                                    M2A_COLOR_COMMENT, None),
+    ("py_string",     _M2A_PY_STRING,                                 M2A_COLOR_STRING,  None),
+    ("py_number",     _M2A_NUM,                                       M2A_COLOR_NUMBER,  None),
+    ("py_keyword",    rf"\b(?:{_M2A_PY_KEYWORDS})\b",                 M2A_COLOR_KEYWORD, None),
+    ("py_builtin",    rf"\b(?:{_M2A_PY_BUILTINS})\b",                 M2A_COLOR_BUILTIN, None),
+    _M2A_RULE_PUNCT,
+)
+
+_M2A_SH_KEYWORDS = (
+    "if|then|else|elif|fi|case|esac|for|while|until|do|done|in|function|time|"
+    "select|break|continue|return|declare|readonly|local|export|set|unset|shift|"
+    "exit|trap"
+)
+_M2A_SH_BUILTINS = (
+    "echo|printf|read|cd|pwd|pushd|popd|mkdir|rmdir|rm|cp|mv|ln|ls|cat|grep|sed|"
+    "awk|find|test|source|eval|exec|ulimit|umask|wait|kill|sleep"
+)
+
+_M2A_RULES_CODE_BASH = (
+    ("sh_comment",   r"(?:^|(?<=\s))\#[^\n]*",                       M2A_COLOR_COMMENT, None),
+    ("sh_string_dq", _M2A_STR_DQ,                                   M2A_COLOR_STRING,  None),
+    ("sh_string_sq", _M2A_STR_SQ,                                   M2A_COLOR_STRING,  None),
+    ("sh_number",    _M2A_NUM,                                      M2A_COLOR_NUMBER,  None),
+    ("sh_keyword",   rf"\b(?:{_M2A_SH_KEYWORDS})\b",                M2A_COLOR_KEYWORD, None),
+    ("sh_builtin",   rf"\b(?:{_M2A_SH_BUILTINS})\b",                M2A_COLOR_BUILTIN, None),
+    _M2A_RULE_PUNCT,
+)
+
+_M2A_JS_KEYWORDS = (
+    "break|case|catch|class|const|continue|debugger|default|delete|do|else|export|"
+    "extends|false|finally|for|function|if|import|in|instanceof|new|null|return|"
+    "super|switch|this|throw|true|try|typeof|var|void|while|with|yield|let|static|"
+    "await|async|of"
+)
+_M2A_JS_BUILTINS = (
+    "Array|Boolean|Date|Error|Function|JSON|Math|Number|Object|RegExp|String|"
+    "Symbol|Map|Set|Promise|console|document|window|fetch|setTimeout|setInterval|"
+    "clearTimeout|clearInterval|globalThis|undefined|NaN|Infinity"
+)
+
+_M2A_RULES_CODE_JAVASCRIPT = (
+    ("js_comment_line",  r"//[^\n]*",                                M2A_COLOR_COMMENT, None),
+    ("js_comment_block", r"/\*(?:(?!\*/)[\s\S])*\*/",                M2A_COLOR_COMMENT, None),
+    ("js_string_dq",     _M2A_STR_DQ,                                M2A_COLOR_STRING,  None),
+    ("js_string_sq",     _M2A_STR_SQ,                                M2A_COLOR_STRING,  None),
+    ("js_string_bt",     _M2A_STR_BT,                                M2A_COLOR_STRING,  None),
+    ("js_number",        _M2A_NUM,                                   M2A_COLOR_NUMBER,  None),
+    ("js_keyword",       rf"\b(?:{_M2A_JS_KEYWORDS})\b",             M2A_COLOR_KEYWORD, None),
+    ("js_builtin",       rf"\b(?:{_M2A_JS_BUILTINS})\b",             M2A_COLOR_BUILTIN, None),
+    _M2A_RULE_PUNCT,
+)
+
+_M2A_C_KEYWORDS = (
+    "alignas|alignof|and|and_eq|asm|auto|bitand|bitor|bool|break|case|catch|char|"
+    "char8_t|char16_t|char32_t|class|compl|concept|const|consteval|constexpr|"
+    "constinit|const_cast|continue|co_await|co_return|co_yield|decltype|default|"
+    "delete|double|do|dynamic_cast|else|enum|explicit|export|extern|false|final|"
+    "float|for|friend|goto|if|inline|int|long|mutable|namespace|new|noexcept|"
+    "not_eq|not|nullptr|operator|or_eq|or|override|private|protected|public|"
+    "register|reinterpret_cast|requires|restrict|return|short|signed|sizeof|"
+    "static_assert|static_cast|static|struct|switch|template|this|thread_local|"
+    "throw|true|try|typedef|typeid|typename|union|unsigned|using|virtual|void|"
+    "volatile|wchar_t|while|xor_eq|xor|"
+    "_Alignas|_Alignof|_Atomic|_Bool|_Complex|_Generic|_Imaginary|_Noreturn|"
+    "_Static_assert|_Thread_local"
+)
+_M2A_C_BUILTINS = (
+    "size_t|ssize_t|ptrdiff_t|intptr_t|uintptr_t|"
+    "int8_t|int16_t|int32_t|int64_t|uint8_t|uint16_t|uint32_t|uint64_t|"
+    "FILE|NULL|EXIT_SUCCESS|EXIT_FAILURE|stdin|stdout|stderr|"
+    "printf|fprintf|snprintf|sprintf|sscanf|scanf|puts|putchar|getchar|fgets|"
+    "fputs|fopen|fclose|fread|fwrite|malloc|calloc|realloc|free|memcpy|memmove|"
+    "memset|strlen|strncmp|strcmp|strncpy|strcpy|strncat|strcat|strchr|strstr|"
+    "exit|abort|assert|"
+    "std|string_view|string|wstring|vector|array|unordered_map|map|unordered_set|"
+    "set|pair|tuple|optional|variant|list|deque|queue|stack|span|"
+    "shared_ptr|unique_ptr|weak_ptr|make_shared|make_unique|move|forward|"
+    "cout|cin|cerr|clog|endl"
+)
+
+_M2A_RULES_CODE_C = (
+    ("c_preproc",       r"^ [ \t]* \# [ \t]* \w+",                  M2A_COLOR_KEYWORD, None),
+    ("c_comment_line",  r"//[^\n]*",                                M2A_COLOR_COMMENT, None),
+    ("c_comment_block", r"/\*(?:(?!\*/)[\s\S])*\*/",                M2A_COLOR_COMMENT, None),
+    ("c_string",        _M2A_STR_DQ,                                M2A_COLOR_STRING,  None),
+    ("c_char",          _M2A_STR_SQ,                                M2A_COLOR_STRING,  None),
+    ("c_number",        _M2A_NUM,                                   M2A_COLOR_NUMBER,  None),
+    ("c_keyword",       rf"\b(?:{_M2A_C_KEYWORDS})\b",              M2A_COLOR_KEYWORD, None),
+    ("c_builtin",       rf"\b(?:{_M2A_C_BUILTINS})\b",              M2A_COLOR_BUILTIN, None),
+    _M2A_RULE_PUNCT,
+)
+
+_M2A_RULES_CODE_UNKNOWN = (
+    ("gen_string_dq", _M2A_STR_DQ_ML, M2A_COLOR_STRING, None),
+    ("gen_string_sq", _M2A_STR_SQ_ML, M2A_COLOR_STRING, None),
+    ("gen_string_bt", _M2A_STR_BT,    M2A_COLOR_STRING, None),
+    ("gen_number",    _M2A_NUM,       M2A_COLOR_NUMBER, None),
+    _M2A_RULE_PUNCT,
+)
+
+# Generic: no rules — passthrough. Reserved for frontmatter (verbatim).
+_M2A_RULES_CODE_GENERIC = ()
+
+M2A_CONTEXT_CODE_PYTHON     = _m2a_build_context(_M2A_RULES_CODE_PYTHON)
+M2A_CONTEXT_CODE_BASH       = _m2a_build_context(_M2A_RULES_CODE_BASH)
+M2A_CONTEXT_CODE_JAVASCRIPT = _m2a_build_context(_M2A_RULES_CODE_JAVASCRIPT)
+M2A_CONTEXT_CODE_C          = _m2a_build_context(_M2A_RULES_CODE_C)
+M2A_CONTEXT_CODE_UNKNOWN    = _m2a_build_context(_M2A_RULES_CODE_UNKNOWN)
+M2A_CONTEXT_CODE_GENERIC    = _m2a_build_context(_M2A_RULES_CODE_GENERIC)
+
+
+# ### Section: Inline rule table ############################################
+
+# Borrowed verbatim from v1 (design §9): the inline pattern fragments and the
+# inline rule tuple. This is the alternation engine that runs inside every leaf
+# (prose lines, heading titles, table cells, list-item content).
+
+_BSA = _M2A_BLOCK_START_AHEAD
+
+_MD_HTML_BR = r"(?i: < br [ \t]* /? > )"
+_MD_HTML_HR_INLINE = r"(?i: < hr [ \t]* /? > )"
+
+_MD_ESCAPED = r"\\."
+
+_MD_CODE_INLINE2 = rf"""
+    `` (?P<*>
+        (?: (?!``) (?: [^\n] | \n (?! {_BSA} ) ) )+
+    ) ``
+"""
+_MD_CODE_INLINE  = rf" ` (?P<*> (?: {_MD_ESCAPED} | [^`\n\\] | \n (?! {_BSA} ) )+ ) ` "
+
+_MD_IMAGE = r" ! \[ (?P<*alt> [^\]\n]* ) \] \( (?P<*url> [^)\n]* ) \) "
+_MD_IMAGE_INLINE = r" ! \[ [^\]\n]* \] \( [^)\n]* \) "
+
+_MD_ESCAPE = r"""
+    \\ (?P<*char>
+        [ !"\#\$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~ \n ]
+    )
+"""
+
+_MD_HTML_COMMENT = r" <!-- (?: (?! --> ) [\s\S] )* --> "
+
+# Standalone compiled twin, used by the table renderer to strip comments from a
+# raw row line BEFORE splitting on `|`.
+_M2A_HTML_COMMENT_RE = re.compile(_MD_HTML_COMMENT, re.VERBOSE | re.DOTALL)
+
+_MD_HTML_ENTITY = r"""
+    & (?P<*body>
+        \# [0-9]+ | \# [xX] [0-9a-fA-F]+ | [a-zA-Z] [a-zA-Z0-9]*
+    ) ;
+"""
+
+_MD_LINK = rf"""
+    (?<!!) \[ (?P<*>
+        (?: {_MD_IMAGE_INLINE} | {_MD_ESCAPED} | [^\]\n\\] | \n (?! {_BSA} ) )+
+    ) \] \( (?P<*url> [^)\n]* ) \)
+"""
+
+_MD_BOLDITALIC = rf"""
+    \*\*\* (?P<*>
+        (?: {_MD_ESCAPED} | [^*\n\\] | \*(?!\*\*) | \n (?! {_BSA} ) )+
+    ) \*\*\*
+"""
+_MD_BOLD_UNDER = rf"""
+    \*\*_ (?P<*>
+        (?: {_MD_ESCAPED} | [^_\n\\] | \n (?! {_BSA} ) )+
+    ) _\*\*
+"""
+_MD_UNDER_BOLD = rf"""
+    _\*\* (?P<*>
+        (?: {_MD_ESCAPED} | [^*\n\\] | \*(?!\*) | \n (?! {_BSA} ) )+
+    ) \*\*_
+"""
+_MD_BOLD = rf"""
+    \*\* (?P<*>
+        (?: {_MD_ESCAPED} | [^*\n\\] | \*(?!\*) | \n (?! {_BSA} ) )+
+    ) \*\*
+"""
+_MD_STRIKE = rf"""
+    ~~ (?P<*>
+        (?: {_MD_ESCAPED} | [^~\n\\] | ~(?!~) | \n (?! {_BSA} ) )+
+    ) ~~
+"""
+_MD_ITALIC = rf"""
+    (?<!\*) \* (?P<*>
+        (?: {_MD_ESCAPED} | [^*\n\\] | \n (?! {_BSA} ) )+
+    ) \* (?!\*)
+"""
+
+# A leading guard rejects def-shaped occurrences of `[^id]:` at line start.
+_MD_FOOTNOTE_REF = r"""
+    (?: (?<= [^\n] ) | (?! \[ \^ [^\]\n]+ \] : ) )
+    \[ \^ (?P<*id> [^\]\n]+ ) \]
+"""
+
+_M2A_RULES_INLINE_RAW = (
+    ("code_inline2",  _MD_CODE_INLINE2, _m2a_fmt_inline_code,  None),
+    ("code_inline",   _MD_CODE_INLINE,  _m2a_fmt_inline_code,  None),
+    ("escape",        _MD_ESCAPE,       _m2a_fmt_escape,       None),
+    ("html_comment",  _MD_HTML_COMMENT, _m2a_fmt_comment,      None),
+    ("html_br",       _MD_HTML_BR,      _m2a_fmt_br,           None),
+    ("html_hr_inline",_MD_HTML_HR_INLINE, _m2a_fmt_hr_inline,  None),
+    ("html_entity",   _MD_HTML_ENTITY,  _m2a_fmt_entity,       None),
+    ("image",         _MD_IMAGE,        _m2a_fmt_image,        None),
+    ("link",          _MD_LINK,         M2A_COLOR_LINK,        _M2A_RECURSE_SELF),
+    ("bolditalic",    _MD_BOLDITALIC,   "1;3",                 _M2A_RECURSE_SELF),
+    ("bold_under",    _MD_BOLD_UNDER,   "1;3",                 _M2A_RECURSE_SELF),
+    ("under_bold",    _MD_UNDER_BOLD,   "1;3",                 _M2A_RECURSE_SELF),
+    ("bold",          _MD_BOLD,         "1",                   _M2A_RECURSE_SELF),
+    ("strike",        _MD_STRIKE,       "9",                   _M2A_RECURSE_SELF),
+    ("italic",        _MD_ITALIC,       "3",                   _M2A_RECURSE_SELF),
+    ("footnote_ref",  _MD_FOOTNOTE_REF, _m2a_fmt_footnote_ref, None),
+)
+M2A_CONTEXT_MD_INLINE = _m2a_build_context(_M2A_RULES_INLINE_RAW)
+
+
+# ### Section: Internal inline dispatcher ###################################
+
+# Borrowed verbatim from v1 (design §9). Runs a compiled context's alternation
+# over a leaf string: string `fmt` codes layer SGR (recursing per _M2A_RECURSE_SELF),
+# callable `fmt`s render themselves. Used only for inline and code contexts — the
+# block layer above dispatches by kind instead (see `_m2a_render`).
+
+
+def _md2ansi(text, current_style, context, state):
+    def _m2a_replace(m):
+        groups = m.groupdict()
+        for name, _pat, fmt, recurse in context.rules:
+            if groups.get(name) is None:
+                continue
+            match fmt:
+                case str() as sgr:
+                    inner = groups.get(f"{name}_inner")
+                    new_style = f"{current_style};{sgr}"
+                    actual_recurse = context if recurse is _M2A_RECURSE_SELF else recurse
+                    if actual_recurse is not None and inner is not None:
+                        inner = _md2ansi(inner, new_style, actual_recurse, state)
+                    elif inner is None:
+                        inner = m.group(0)
+                    return _m2a_inject_color(inner, new_style, current_style)
+                case _ as func:
+                    return func(m, name, current_style, context, state)
+        return m.group(0)
+    return context.compiled.sub(_m2a_replace, text)
+
+
+# ### Section: Block-level pattern fragments ################################
+
+# Block patterns borrowed verbatim from v1 (design §9). In v1 these lived in the
+# single combined grammar; in v2 they populate a block-only alternation (§5.1)
+# that the two-phase engine scans with.
+
+# Every block pattern captures its first line's leading indent as `indent`, so
+# the block dispatcher can apply indentation-as-chrome uniformly (design §5.5).
+# Frontmatter's is empty (`\A`-anchored, root only §5.4); fences carry theirs in
+# `_fenced`; the list rule deliberately owns its `[ \t]*` for the per-line level
+# cosmetic (§7.2) and captures NO `indent`, so the dispatcher skips it.
+_MD_H1 = r"^ (?P<*indent> [ \t]* ) \# [ \t]+ (?P<*> [^\n]+ ) $"
+_MD_H2 = r"^ (?P<*indent> [ \t]* ) \#{2} [ \t]+ (?P<*> [^\n]+ ) $"
+_MD_H3 = r"^ (?P<*indent> [ \t]* ) \#{3} [ \t]+ (?P<*> [^\n]+ ) $"
+_MD_H4 = r"^ (?P<*indent> [ \t]* ) \#{4} [ \t]+ (?P<*> [^\n]+ ) $"
+_MD_H5 = r"^ (?P<*indent> [ \t]* ) \#{5} [ \t]+ (?P<*> [^\n]+ ) $"
+_MD_H6 = r"^ (?P<*indent> [ \t]* ) \#{6} [ \t]+ (?P<*> [^\n]+ ) $"
+
+_MD_HR = r"^ (?P<*indent> [ \t]* ) (?: -{3,} | ={3,} | _{3,} ) [ \t]* $"
+
+_MD_HTML_HR = r"^ (?P<*indent> [ \t]* ) (?i: < hr [ \t]* /? > ) [ \t]* $"
+
+_MD_FRONTMATTER = r"""
+    \A (?P<*indent>) --- [ \t]* \n
+    (?P<*body>
+        (?: ^ (?! --- [ \t]* $ ) (?! [ \t]* \# ) (?! [ \t]* $ ) [^\n]* \n )*
+    )
+    ^ --- [ \t]* $
+"""
+
+
+def _fenced(tag, fence=r"```"):
+    return rf"""
+        ^ (?P<*indent> [ \t]* ) {fence} [ \t]* {tag} [ \t]* \n
+        (?P<*body> (?: (?! ^ [ \t]* {fence} [ \t]* $ ) [\s\S] )* )
+        ^ [ \t]* {fence} [ \t]* $
+    """
+
+
+_MD_CODE_PY   = _fenced("python")
+_MD_CODE_BASH = _fenced(r"(?:bash|sh)")
+_MD_CODE_JS   = _fenced(r"(?:javascript|js)")
+_MD_CODE_C    = _fenced(r"(?:c\+\+|cpp|cxx|cc|hpp|hxx|h|c)")
+_MD_CODE_GEN  = _fenced(r"(?P<*lang> \w* )", fence=r"(?:```|~~~)")
+
+# A blockquote is line-oriented (§5.5): continuation lines must carry the first
+# line's indent EXACTLY (the `(?P=*indent)` backreference), so a differently
+# indented `>` line falls out and forms its own single-bar quote at its own
+# position — honest raggedness, never a spurious nested bar. Col-0 quotes have an
+# empty indent, so the backreference matches nothing and the pattern is v1's.
+_MD_BLOCKQUOTE = r"^ (?P<*indent> [ \t]* ) > [ \t]? [^\n]* (?: \n (?P=*indent) > [ \t]? [^\n]* )*"
+
+_MD_TABLE = r"^ (?P<*indent> [ \t]* ) \| [^\n]* (?: \n [ \t]* \| [^\n]* )*"
+
+_MD_LIST = r"""
+    ^ [ \t]* (?: [-*+] | \d+\. ) [ \t]+ [^\n]*
+    (?: \n [ \t]* (?: [-*+] | \d+\. ) [ \t]+ [^\n]* )*
+"""
+
+_MD_FOOTNOTE_DEF = r"""
+    ^ (?P<*indent> [ \t]* ) \[ \^ (?P<*id> [^\]\n]+ ) \] : [ \t]+
+    (?P<*text> [^\n]+ (?: \n [ \t]+ [^\n]+ )* )
+"""
+
+
+# ### Section: Block renderers ##############################################
+
+# Ported from v1's block formatters (design §7), with two structural changes
+# mandated by §6: the `_m2a_opaque()` wrapper is GONE (there is no post-render
+# pass, so every renderer returns final laid-out text), and any `\x03` (nbsp)
+# realization v1 deferred to that global pass now happens here. Renderers return
+# text WITHOUT a trailing newline; `_m2a_render` appends the newline each block
+# owns under the tiling contract (§5.2).
+
+
+def _m2a_fmt_heading(m, name, current_style, state, sgr):
+    """Render an ATX heading: inline pass on the title under the level color,
+    realize the deferred line sentinels into geometry, then color. Never wrapped
+    (a heading that overflows stays on one line — its block intent)."""
+    inner = m.group(f"{name}_inner")
+    new_style = f"{current_style};{sgr}"
+    inner = _md2ansi(inner, new_style, M2A_CONTEXT_MD_INLINE, state)
+    rule = _m2a_rule(state.line_width - 1)
+    inner = "\n".join(
+        rule if kind == "rule" else seg
+        for kind, seg in _m2a_split_sentinel_lines(inner)
+    )
+    out = _m2a_inject_color(inner, new_style, current_style)
+    return out.replace(_M2A_NBSP, " ")
+
+
+def _m2a_fmt_hr(m, name, current_style, state):
+    bar = _m2a_rule(state.line_width - 1)
+    return _m2a_inject_color(bar, current_style, current_style)
+
+
+def _m2a_fmt_code(m, name, current_style, state, code_context, lang=None, label=None):
+    # Leading indent is handled once, for all block kinds, by the dispatcher
+    # (design §5.5): a match reaching here is already dedented, so the fence body
+    # needs no indent stripping and the frame no re-prefixing.
+    body = m.group(f"{name}_body")
+    if lang is None:
+        lang = (m.groupdict().get(f"{name}_lang") or "").strip()
+    rendered = _md2ansi(body, current_style, code_context, state)
+    body_width = max(
+        (_m2a_visible_len(ln) for ln in rendered.split("\n")),
+        default=0,
+    )
+    if label is None:
+        label = f"Code: {lang}" if lang else "Code"
+    min_inner = len(label) + 6
+    inner = max(body_width, min_inner)
+    right_dashes = inner - 4 - len(label)
+    top_text = f"┌── {label} {'─' * right_dashes}┐"
+    bot_text = f"└{'─' * inner}┘"
+    top = _m2a_styled(top_text, current_style, M2A_COLOR_FRAME)
+    bot = _m2a_styled(bot_text, current_style, M2A_COLOR_FRAME)
+    indented = _m2a_prefix_lines(rendered, " ")
+    if indented.endswith("\n "):
+        indented = indented[:-1]
+    sep = "" if indented.endswith("\n") else "\n"
+    return f"{top}\n{indented}{sep}{bot}"
+
+
+def _m2a_fmt_blockquote(m, name, current_style, state):
     text = m.group(0)
     stripped = "\n".join(re.sub(r"^>[ \t]?", "", ln) for ln in text.split("\n"))
-    # A blockquote is a mini-document: strip the `>` markers, then recurse the
-    # body through M2A_CONTEXT_MD_NESTED — the full block grammar (tables, lists,
-    # fenced code, nested quotes, `---` rules, headings, inline) minus frontmatter
-    # (its `\A`-anchored pattern would misfire on a `> ---` at quote start) and
-    # footnote_def (a def inside a quote is quoted prose, not a collected note).
-    # The recursion runs at a narrowed width so inner layout owners (tables, HR)
-    # size themselves to the space left after the `│ ` bar; the width is floored
-    # at M2A_MIN_NESTED_WIDTH so deep nesting can't crush it. wrap_width stays 0
-    # when wrapping is disabled (0 means "no wrap"); line_width — which drives the
-    # HR/table fallback sizing when wrapping is off — is always narrowed. The
-    # footnotes dict/list are shared by reference through `replace`, so a ref
-    # inside the quote still resolves against top-level defs.
-    inner_wrap = max(M2A_MIN_NESTED_WIDTH, state.wrap_width - 2) if state.wrap_width > 0 else 0
-    inner_line = max(M2A_MIN_NESTED_WIDTH, state.line_width - 2)
-    nested_state = replace(state, wrap_width=inner_wrap, line_width=inner_line)
-    inner = _md2ansi(stripped, current_style, M2A_CONTEXT_MD_NESTED, nested_state)
-    # Run the standard finishing pass (opaque-aware): opaque lines from inner
-    # layout owners pass through verbatim with their marker stripped, prose lines
-    # get their deferred sentinels realized and are wrapped to the narrowed width.
-    # Passing `inner_wrap` (0 when wrapping is off) means a disabled wrap only
-    # strips markers/realizes sentinels, matching the top-level pass.
-    inner = _m2a_wrap_rendered(inner, inner_wrap)
-    # Prefix the `│ ` bar to every finished line and re-mark the whole block
-    # opaque so the top-level post-render pass never reflows it.
+    # A blockquote is a mini-document (design §7.1): strip the `>` markers, then
+    # recurse the body through the quote block context (the full block grammar
+    # minus frontmatter and footnote_def — §5.4) at a width narrowed by the
+    # `│ ` bar (2 columns), floored at M2A_MIN_WIDTH. `_m2a_render` returns final
+    # laid-out text — inner blocks already wrapped, prose already wrapped — so
+    # here we only prefix chrome. No opaque marker, no re-wrap (§6). The footnotes
+    # dict/list are shared by reference through `replace`, so a ref inside the
+    # quote still resolves against top-level defs.
+    inner = _m2a_render(stripped, _m2a_narrow(state, 2), _M2A_BLOCK_CONTEXT_QUOTE)
     bar = _m2a_styled("│", current_style, M2A_COLOR_DIM) + " "
-    return _m2a_opaque(_m2a_prefix_lines(inner, bar))
+    return _m2a_prefix_lines(inner, bar)
 
 
-def _m2a_fmt_table(m, name, current_style, context, state):
+def _m2a_fmt_table(m, name, current_style, state):
     raw_rows = []
     for ln in m.group(0).strip("\n").split("\n"):
         s = ln.strip()
         if not s.startswith("|"):
             continue
-        # Drop HTML comments before splitting so a `|` inside `<!-- … -->`
-        # cannot mis-split the row (the inline pass would drop it anyway, but
-        # only after the column count was already taken from the raw `|`s).
         s = _M2A_HTML_COMMENT_RE.sub("", s)
         raw_rows.append(_m2a_split_table_row(s))
     if len(raw_rows) < 1:
         return m.group(0)
     header = raw_rows[0]
-    # Detect separator row (e.g. `| --- | :--: |`); skip if present.
     body_start = 1
     if len(raw_rows) >= 2 and all(re.fullmatch(r":?-{2,}:?", c) for c in raw_rows[1]):
         body_start = 2
     body = raw_rows[body_start:]
     n_cols = len(header)
 
-    # Per-column alignment from the separator row (`:--` left, `--:` right,
-    # `:--:` center). Default left when no separator row or no marker.
     aligns = ["left"] * n_cols
     if body_start == 2:
         for i, c in enumerate(raw_rows[1][:n_cols]):
@@ -581,14 +880,6 @@ def _m2a_fmt_table(m, name, current_style, context, state):
         for i in range(n_cols)
     ]
 
-    # ── Shrink-to-fit layout ─────────────────────────────────────────────
-    # When the caller set a target line width, reduce wide columns so the
-    # total table width fits. Columns whose natural width is already at or
-    # below cell_min_width are pinned and never wrapped. The loop reassigns
-    # widths proportionally; any column that would drop below cell_min_width
-    # is pinned at cell_min_width and the remaining wide columns are
-    # re-scaled. Per spec, if everything is pinned and the table still
-    # overflows, we accept the overflow.
     target_lw = state.wrap_width
     cell_min = state.cell_min_width
     if target_lw > 0:
@@ -616,30 +907,9 @@ def _m2a_fmt_table(m, name, current_style, context, state):
             if not progressed:
                 break
 
-    # ── Per-cell wrapping ────────────────────────────────────────────────
-    # Cells are already rendered (`rendered_header`, `rendered_body`). Wrap
-    # the styled text with `_m2a_wrap_ansi_line` so inline rules (`**bold**`,
-    # `` `code` ``, links, images) are matched against the FULL cell text
-    # before any wrapping splits it. Width math runs on visible chars; SGR
-    # escapes are preserved verbatim and re-emitted after each break.
-    # Reset at the end of every wrapped sub-line so a styled span left open
-    # at the break point (e.g. `**bold` ending one sub-line, `bold**` on the
-    # next) can't leak into the cell padding, the `│` separator, or the next
-    # cell on the same visual row. The reset returns to the caller's
-    # `current_style` (not bare `\x1b[m`): the box chrome is emitted as plain
-    # text and so inherits the ambient SGR, which is `current_style` when the
-    # app set a non-default base style before the output. With the default
-    # `current_style="0"` this is exactly `\x1b[0m`.
     cell_reset = f"\x1b[{current_style}m"
 
     def cell_sublines(rendered, w):
-        # Split the deferred line sentinels into stacked sub-lines BEFORE the
-        # cell is laid out (the table marks itself opaque, which bypasses the
-        # final sentinel sweep — spec §5.2/§5.3). `\x01` starts a new sub-line;
-        # `\x02` becomes a single rule-marker sub-line (the literal `_M2A_RULE`
-        # string), sized to the frozen column width only at render time
-        # (`render_row`) and demanding zero width during measurement
-        # (`_col_actual`), so it fills the column but never forces it wider.
         if not rendered:
             return [""]
         out = []
@@ -654,10 +924,6 @@ def _m2a_fmt_table(m, name, current_style, context, state):
     body_cells = [[cell_sublines(r[i], widths[i]) for i in range(n_cols)] for r in rendered_body]
 
     def _col_actual(i):
-        # A rule-marker sub-line (`_M2A_RULE`) demands ZERO width: the rule fills
-        # the column at render time but must never force it wider (spec §5.3,
-        # "measured as `\n\n`, zero width"). The column width is decided by the
-        # real text alone.
         def _sub_w(s):
             return 0 if s == _M2A_RULE else _m2a_visible_len(s)
         actual = max(
@@ -675,11 +941,6 @@ def _m2a_fmt_table(m, name, current_style, context, state):
             body_cells[r_idx][i] = cell_sublines(r[i], widths[i])
 
     def _reconcile_column(i):
-        # Grow widths[i] until the column's widest sub-line fits, re-wrapping
-        # in between. The grow step ISN'T idempotent — at a wider width the
-        # no-break zone gives more room, which can let a long word land on a
-        # line that's already past threshold, producing an even wider
-        # sub-line — so iterate until stable.
         for _ in range(n_cols + 8):
             actual = _col_actual(i)
             if actual <= widths[i]:
@@ -688,26 +949,14 @@ def _m2a_fmt_table(m, name, current_style, context, state):
             _rewrap_column(i)
         else:
             widths[i] = max(widths[i], _col_actual(i))
-        # If every sub-line came in below the final width, shrink to fit.
         if actual < widths[i]:
             widths[i] = max(actual, 1)
 
     for i in range(n_cols):
         _reconcile_column(i)
 
-    # ── Extra fitting round ──────────────────────────────────────────────
-    # If some column grew past its layout assignment (oversize) the table
-    # now overflows the budget. Try to recover space by shrinking the
-    # remaining (non-oversize, non-cell-min) columns proportionally into
-    # whatever budget is left. After each shrink+reconcile, if a column
-    # grew back above its new target it joins the oversize set and the
-    # round re-runs over the rest. The loop terminates when the table fits
-    # OR no further columns can be shrunk OR no column changed in the pass.
     if target_lw > 0:
         layout_widths = list(widths)
-        # Anything that grew during the initial reconcile is "oversize". Track
-        # the per-column target the extra-fit pass last tried — used to detect
-        # bounce-back inside the loop.
         for _outer in range(n_cols + 1):
             total = overhead + sum(widths)
             if total <= target_lw:
@@ -732,8 +981,6 @@ def _m2a_fmt_table(m, name, current_style, context, state):
                 if new_w >= widths[i]:
                     continue
                 widths[i] = new_w
-                # The new target becomes the layout baseline for this column;
-                # a re-reconcile that bounces above it marks the column oversize.
                 layout_widths[i] = new_w
                 _rewrap_column(i)
                 _reconcile_column(i)
@@ -742,7 +989,6 @@ def _m2a_fmt_table(m, name, current_style, context, state):
                 break
 
     def render_row(cells):
-        # cells: list of per-column lists of rendered sub-lines.
         height = max((len(c) for c in cells), default=1)
         out = []
         for k in range(height):
@@ -750,13 +996,10 @@ def _m2a_fmt_table(m, name, current_style, context, state):
             for i, col in enumerate(cells):
                 if k < len(col):
                     if col[k] == _M2A_RULE:
-                        # Materialize the rule now that widths are frozen: a `─`
-                        # run spanning the full column-content width (spec §5.3).
                         parts.append(f" {_m2a_rule(widths[i])} ")
                     else:
                         parts.append(f" {_m2a_align_cell(col[k], widths[i], aligns[i])} ")
                 else:
-                    # Top-align: pad shorter cells with blank lines at the bottom.
                     parts.append(" " + " " * widths[i] + " ")
             out.append("│" + "│".join(parts) + "│")
         return out, height
@@ -789,75 +1032,73 @@ def _m2a_fmt_table(m, name, current_style, context, state):
             out_lines.append(border("├", "┼", "┤"))
         out_lines.extend(rl)
     out_lines.append(border("└", "┴", "┘"))
-    return _m2a_opaque("\n".join(out_lines))
+    return "\n".join(out_lines).replace(_M2A_NBSP, " ")
 
 
-def _m2a_fmt_list(m, name, current_style, context, state):
+def _m2a_fmt_list(m, name, current_style, state):
+    """Render a maximal run of marker lines (design §7.2). The list renderer owns
+    exactly the marker-line cosmetics; everything else falls out of what the
+    remainder recurses into. Per marker line: visible indent width // 2 is the
+    cosmetic level (nested markers are just deeper lines of the same span, no
+    parent/child), `-`/`*`/`+` become a bold `·`, ordered markers stay literal
+    (no renumbering, ever). The remainder after the marker then splits two ways:
+
+    - A remainder that IS a block — a heading, rule, one-line quote, one-row
+      table, or a footnote def (the nested alternation; lists are not quotes so
+      a def collects, §5.4) — recurses through `_m2a_render` at a width narrowed
+      by the bullet columns and hangs under the bullet. `- [^1]: note` collects
+      and renders an empty item.
+    - Any other remainder is prose (the overwhelmingly common case): the inline
+      pass, then wrap with the bullet on the first output line and the hang
+      indent on continuations. This path keeps v1's combined bullet+content wrap
+      verbatim — it is byte-identical to v1 (the equivalence corpus enforces it),
+      whereas recursing prose through `_m2a_render` would drop the base-style
+      re-emit v1 puts on list continuation lines.
+    """
     out_lines = []
     for ln in m.group(0).split("\n"):
         match = re.match(r"^([ \t]*)([-*+]|\d+\.)[ \t]+(.*)$", ln)
-        if match:
-            indent, marker, content = match.groups()
-            level = len(indent.expandtabs(4)) // 2
-            bullet = "·" if marker in ("-", "*", "+") else marker
-            styled = _m2a_styled(bullet, current_style, "1")
-            # BLOCKLITE (not INLINE) so a `- ## x` item renders its content as a
-            # heading. Drop any opaque marker the heading added: the list re-marks
-            # the whole block opaque below and the post-render pass only consumes a
-            # line-leading marker, so an inner one (after the bullet) would leak as
-            # a literal NUL. The nested heading thus wraps with the list item.
-            rendered = _md2ansi(content, current_style, M2A_CONTEXT_MD_BLOCKLITE, state)
-            rendered = rendered.replace(_M2A_OPAQUE, "")
-            # Hang indent for continuations: two columns past the list indent, the
-            # same width as the bullet prefix (`"  "*level` + 1-col bullet + space),
-            # so a continuation sits under the content, clear of the bullet.
-            hang = "  " * level + "  "
-            bullet_prefix = f"{'  ' * level}{styled} "
-            # Realize the deferred line sentinels here, BEFORE the block is marked
-            # opaque (opaque lines bypass the final sentinel sweep — spec
-            # §5.2/§5.3). `\x01` → a hard break onto a new hang-indented line.
-            # `\x02` → a `─`-run on its own hang-indented line, sized to the
-            # item-content width (the wrap width less the bullet/hang columns;
-            # the page-width fallback when wrapping is off mirrors `_m2a_fmt_hr`).
-            # Only the first emitted text line keeps the bullet; every
-            # continuation (break, rule, wrap) hangs. The shared splitter emits a
-            # rule token per `\x02` and drops rule-adjacent empty segments.
-            content_w = state.wrap_width - len(hang) if state.wrap_width > 0 else state.line_width - len(hang)
-            rule = _m2a_rule(content_w)
-            first = True   # the very first emitted text line carries the bullet
-            for kind, seg in _m2a_split_sentinel_lines(rendered):
-                if kind == "rule":
-                    out_lines.append(hang + rule)
-                    continue
-                line = (bullet_prefix if first else hang) + seg
-                first = False
-                if state.wrap_width > 0:
-                    out_lines.extend(_m2a_wrap_ansi_line(line, state.wrap_width, hang))
-                else:
-                    out_lines.append(line)
-        else:
+        if not match:
             out_lines.append(ln)
-    return _m2a_opaque("\n".join(out_lines))
+            continue
+        indent, marker, content = match.groups()
+        level = len(indent.expandtabs(4)) // 2
+        bullet = "·" if marker in ("-", "*", "+") else marker
+        styled = _m2a_styled(bullet, current_style, "1")
+        hang = "  " * level + "  "
+        bullet_prefix = f"{'  ' * level}{styled} "
+        if _m2a_leading_block(content, _M2A_BLOCK_CONTEXT_NESTED) is not None:
+            rendered = _m2a_render(content, _m2a_narrow(state, len(hang)), _M2A_BLOCK_CONTEXT_NESTED)
+            out_lines.append(f"{'  ' * level}{styled}")
+            if rendered:
+                out_lines.extend(hang + out_ln for out_ln in rendered.split("\n"))
+            continue
+        rendered = _md2ansi(content, current_style, M2A_CONTEXT_MD_INLINE, state)
+        content_w = (state.wrap_width if state.wrap_width > 0 else state.line_width) - len(hang)
+        rule = _m2a_rule(content_w)
+        first = True
+        for kind, seg in _m2a_split_sentinel_lines(rendered):
+            if kind == "rule":
+                out_lines.append(hang + rule)
+                continue
+            line = (bullet_prefix if first else hang) + seg
+            first = False
+            if state.wrap_width > 0:
+                out_lines.extend(_m2a_wrap_ansi_line(line, state.wrap_width, hang))
+            else:
+                out_lines.append(line)
+    return "\n".join(out_lines).replace(_M2A_NBSP, " ")
 
 
-def _m2a_fmt_footnote_def(m, name, current_style, context, state):
+def _m2a_fmt_footnote_def(m, name, current_style, state):
     fid = m.group(f"{name}_id")
     text = m.group(f"{name}_text")
-    # Collapse continuation lines (per the multi-line pattern).
     text = re.sub(r"\n[ \t]+", " ", text).strip()
     state.footnotes[fid] = text
     return ""
 
 
-def _m2a_fmt_footnote_ref(m, name, current_style, context, state):
-    fid = m.group(f"{name}_id")
-    if fid not in state.footnote_order:
-        state.footnote_order.append(fid)
-    return _m2a_styled(f"[^{fid}]", current_style, M2A_COLOR_FOOTNOTE)
-
-
 def _m2a_render_footnotes(state, current_style):
-    # Refs without a matching definition are silently dropped from the section.
     entries = [(fid, state.footnotes[fid]) for fid in state.footnote_order if fid in state.footnotes]
     if not entries:
         return ""
@@ -865,762 +1106,272 @@ def _m2a_render_footnotes(state, current_style):
     for fid, text in entries:
         ref = _m2a_styled(f"[^{fid}]", current_style, M2A_COLOR_FOOTNOTE)
         out.append(f"  {ref} {text}")
-    return _m2a_opaque("\n".join(out)) + "\n"
+    return "\n".join(out) + "\n"
 
 
-def _m2a_fmt_code(m, name, current_style, context, state, code_context, lang=None, label=None):
-    body = m.group(f"{name}_body")
-    indent = m.group(f"{name}_indent") or ""
-    if lang is None:
-        # Generic block — read the language tag captured by the pattern, if any.
-        lang = (m.groupdict().get(f"{name}_lang") or "").strip()
-    # Strip the fence's leading indent from each body line so width/rendering
-    # are computed against the de-indented content. The indent is re-applied
-    # to every line of the final framed output below.
-    if indent:
-        body = re.sub(rf"(?m)^{re.escape(indent)}", "", body)
-    rendered = _md2ansi(body, current_style, code_context, state)
-    body_width = max(
-        (_m2a_visible_len(ln) for ln in rendered.split("\n")),
-        default=0,
-    )
-    if label is None:
-        label = f"Code: {lang}" if lang else "Code"
-    # Layout: the frame sticks out 1 char past the body on each side, and the
-    # body is indented by 1 space so it sits inside the frame. `inner` is the
-    # dash count between the corners; total visible frame width = inner + 2.
-    min_inner = len(label) + 6   # "── " + label + " ──"
-    inner = max(body_width, min_inner)
-    right_dashes = inner - 4 - len(label)
-    top_text = f"┌── {label} {'─' * right_dashes}┐"
-    bot_text = f"└{'─' * inner}┘"
-    top = _m2a_styled(top_text, current_style, M2A_COLOR_FRAME)
-    bot = _m2a_styled(bot_text, current_style, M2A_COLOR_FRAME)
-    # One-space indent inside the frame (frame's left corner sits at col 0 of
-    # frame-local coordinates).
-    indented = _m2a_prefix_lines(rendered, " ")
-    # `body` capture includes the final content line's terminator, so `indented`
-    # usually ends with " " (a trailing indented empty line) — strip that one
-    # space so the closing rail sits flush below the last content line.
-    if indented.endswith("\n "):
-        indented = indented[:-1]
-    sep = "" if indented.endswith("\n") else "\n"
-    framed = f"{top}\n{indented}{sep}{bot}"
-    # Re-apply the source indent to every output line so a code block nested
-    # inside a list/quote keeps its column.
-    if indent:
-        framed = _m2a_prefix_lines(framed, indent)
-    return _m2a_opaque(framed)
+# ### Section: Block rule table & compiled block contexts ###################
 
+# One block rules table, compiled into (at most) three alternations via placement
+# flags (design §5.1, §5.4). Block rules ONLY — the inline rules are not here;
+# they run in leaves via `_md2ansi`. Order mirrors v1's combined grammar so
+# block-boundary detection is identical (frontmatter before hr, etc.).
+#
+# Placement flags per rule: `root_only` (frontmatter — its `\A` anchor misfires
+# on a recursed body) and `in_quote` (a footnote_def inside a quote is quoted
+# prose, not a collected note — v1 epics #95/#104). Three contexts:
+#   ROOT   = every rule.
+#   NESTED = every rule except root_only (frontmatter). The recursion target for
+#            indent-as-chrome (§5.5) and list marker-line remainders (§7.2).
+#   QUOTE  = NESTED minus footnote_def.
 
-# ### Section: Rule tables ##################################################
-
-# Rules are 4-tuples: `(name, pattern, fmt, recurse)` where:
-# - `name` — str identifier (drives `(?P<name>...)` outer group and `(?P<*...>)` rewrite)
-# - `pattern` — regex source (`re.VERBOSE` mode)
-# - `fmt` — either an SGR-codes string (e.g., `"1;3"`) or a callable `(match, current_style, context, state) → str`
-# - `recurse` — `M2A_Context` to recurse content into, or `None` to leave content as a literal
-
-# Universal trailing rule, appended LAST to every code ruleset: dims any run of
-# punctuation the language-specific rules didn't already claim. Last position is
-# load-bearing — comments/strings/numbers must match first so their internal
-# punctuation isn't grabbed here.
-_M2A_RULE_PUNCT = ("punct", _M2A_PUNCT, M2A_COLOR_PUNCT, None)
-
-# Python keyword & builtin lists. `type` appears in both lists;
-# rule order ensures keyword wins.
-_M2A_PY_KEYWORDS = (
-    "False|None|True|and|as|assert|async|await|break|case|class|continue|def|del|"
-    "elif|else|except|finally|for|from|global|if|import|in|is|lambda|match|nonlocal|"
-    "not|or|pass|raise|return|try|type|while|with|yield"
-)
-_M2A_PY_BUILTINS = (
-    "abs|aiter|all|anext|any|ascii|bin|bool|breakpoint|bytearray|bytes|callable|"
-    "chr|classmethod|compile|complex|delattr|dict|dir|divmod|enumerate|eval|exec|"
-    "filter|float|format|frozenset|getattr|globals|hasattr|hash|help|hex|id|input|"
-    "int|isinstance|issubclass|iter|len|list|locals|map|max|memoryview|min|next|"
-    "object|oct|open|ord|pow|print|property|range|repr|reversed|round|set|setattr|"
-    "slice|sorted|staticmethod|str|sum|super|tuple|type|vars|zip|__import__"
+# (name, pattern, root_only, in_quote)
+_M2A_BLOCK_RULES = (
+    ("frontmatter",  _MD_FRONTMATTER, True,  False),
+    ("h1",           _MD_H1,          False, True),
+    ("h2",           _MD_H2,          False, True),
+    ("h3",           _MD_H3,          False, True),
+    ("h4",           _MD_H4,          False, True),
+    ("h5",           _MD_H5,          False, True),
+    ("h6",           _MD_H6,          False, True),
+    ("hr",           _MD_HR,          False, True),
+    ("html_hr",      _MD_HTML_HR,     False, True),
+    ("code_python",  _MD_CODE_PY,     False, True),
+    ("code_bash",    _MD_CODE_BASH,   False, True),
+    ("code_js",      _MD_CODE_JS,     False, True),
+    ("code_c",       _MD_CODE_C,      False, True),
+    ("code_generic", _MD_CODE_GEN,    False, True),
+    ("blockquote",   _MD_BLOCKQUOTE,  False, True),
+    ("table",        _MD_TABLE,       False, True),
+    ("list",         _MD_LIST,        False, True),
+    ("footnote_def", _MD_FOOTNOTE_DEF, False, False),
 )
 
-# Python string with optional prefix: r/R, b/B, u/U, f/F, plus 2-char combos
-# (rb, br, fr, rf, ...). The prefix is anchored at a word boundary so it can't
-# attach to the tail of an identifier (`foor"x"` keeps `r` as part of `foor`,
-# only `"x"` is matched). Empty prefix is allowed via the outer `?`.
-# Each fragment is wrapped in its own `(?:...)` so its internal alternation
-# (e.g. `[^"\\\n] | \\.`) cannot interact with the outer `|` chain.
-# Triple-quoted alternatives come first so `"""..."""` never matches as `""` + DQ.
-# TODO: highlight {…} interpolation inside f-strings (deferred extension).
-_M2A_PY_STRING = rf"""
-    (?: \b [rRbBuUfF]{{1,2}} )?
-    (?:
-        (?: {_M2A_STR_TDQ} )
-      | (?: {_M2A_STR_TSQ} )
-      | (?: {_M2A_STR_DQ}  )
-      | (?: {_M2A_STR_SQ}  )
-    )
-"""
 
-_M2A_RULES_CODE_PYTHON = (
-    # Use [^\n] not . because re.DOTALL is set globally.
-    ("py_comment",    r"\#[^\n]*",                                    M2A_COLOR_COMMENT, None),
-    ("py_string",     _M2A_PY_STRING,                                 M2A_COLOR_STRING,  None),
-    ("py_number",     _M2A_NUM,                                       M2A_COLOR_NUMBER,  None),
-    ("py_keyword",    rf"\b(?:{_M2A_PY_KEYWORDS})\b",                 M2A_COLOR_KEYWORD, None),
-    ("py_builtin",    rf"\b(?:{_M2A_PY_BUILTINS})\b",                 M2A_COLOR_BUILTIN, None),
-    _M2A_RULE_PUNCT,
-)
-
-# Bash keyword & builtin lists.
-_M2A_SH_KEYWORDS = (
-    "if|then|else|elif|fi|case|esac|for|while|until|do|done|in|function|time|"
-    "select|break|continue|return|declare|readonly|local|export|set|unset|shift|"
-    "exit|trap"
-)
-_M2A_SH_BUILTINS = (
-    "echo|printf|read|cd|pwd|pushd|popd|mkdir|rmdir|rm|cp|mv|ln|ls|cat|grep|sed|"
-    "awk|find|test|source|eval|exec|ulimit|umask|wait|kill|sleep"
-)
-
-# TODO: highlight $VAR / ${...} interpolation inside double-quoted strings.
-_M2A_RULES_CODE_BASH = (
-    # `sh_comment` requires preceding `^` or whitespace so `$#`, `$?`, etc. aren't
-    # misread as comments. The preceding-character check is a non-capturing lookbehind
-    # alternative since `\s` is variable-width.
-    ("sh_comment",   r"(?:^|(?<=\s))\#[^\n]*",                       M2A_COLOR_COMMENT, None),
-    ("sh_string_dq", _M2A_STR_DQ,                                   M2A_COLOR_STRING,  None),
-    ("sh_string_sq", _M2A_STR_SQ,                                   M2A_COLOR_STRING,  None),
-    ("sh_number",    _M2A_NUM,                                      M2A_COLOR_NUMBER,  None),
-    ("sh_keyword",   rf"\b(?:{_M2A_SH_KEYWORDS})\b",                M2A_COLOR_KEYWORD, None),
-    ("sh_builtin",   rf"\b(?:{_M2A_SH_BUILTINS})\b",                M2A_COLOR_BUILTIN, None),
-    _M2A_RULE_PUNCT,
-)
-
-# JavaScript keyword & builtin lists.
-_M2A_JS_KEYWORDS = (
-    "break|case|catch|class|const|continue|debugger|default|delete|do|else|export|"
-    "extends|false|finally|for|function|if|import|in|instanceof|new|null|return|"
-    "super|switch|this|throw|true|try|typeof|var|void|while|with|yield|let|static|"
-    "await|async|of"
-)
-_M2A_JS_BUILTINS = (
-    "Array|Boolean|Date|Error|Function|JSON|Math|Number|Object|RegExp|String|"
-    "Symbol|Map|Set|Promise|console|document|window|fetch|setTimeout|setInterval|"
-    "clearTimeout|clearInterval|globalThis|undefined|NaN|Infinity"
-)
-
-# TODO: highlight ${...} interpolation inside template literals.
-_M2A_RULES_CODE_JAVASCRIPT = (
-    ("js_comment_line",  r"//[^\n]*",                                M2A_COLOR_COMMENT, None),
-    ("js_comment_block", r"/\*(?:(?!\*/)[\s\S])*\*/",                M2A_COLOR_COMMENT, None),
-    ("js_string_dq",     _M2A_STR_DQ,                                M2A_COLOR_STRING,  None),
-    ("js_string_sq",     _M2A_STR_SQ,                                M2A_COLOR_STRING,  None),
-    ("js_string_bt",     _M2A_STR_BT,                                M2A_COLOR_STRING,  None),
-    ("js_number",        _M2A_NUM,                                   M2A_COLOR_NUMBER,  None),
-    ("js_keyword",       rf"\b(?:{_M2A_JS_KEYWORDS})\b",             M2A_COLOR_KEYWORD, None),
-    ("js_builtin",       rf"\b(?:{_M2A_JS_BUILTINS})\b",             M2A_COLOR_BUILTIN, None),
-    _M2A_RULE_PUNCT,
-)
-
-# C / C++ — one shared ruleset for both (simplicity over precision). Keywords
-# fold the C and C++ reserved words together with the fundamental types; the
-# fixed-width <stdint.h> types and common library names live in builtins.
-_M2A_C_KEYWORDS = (
-    "alignas|alignof|and|and_eq|asm|auto|bitand|bitor|bool|break|case|catch|char|"
-    "char8_t|char16_t|char32_t|class|compl|concept|const|consteval|constexpr|"
-    "constinit|const_cast|continue|co_await|co_return|co_yield|decltype|default|"
-    "delete|double|do|dynamic_cast|else|enum|explicit|export|extern|false|final|"
-    "float|for|friend|goto|if|inline|int|long|mutable|namespace|new|noexcept|"
-    "not_eq|not|nullptr|operator|or_eq|or|override|private|protected|public|"
-    "register|reinterpret_cast|requires|restrict|return|short|signed|sizeof|"
-    "static_assert|static_cast|static|struct|switch|template|this|thread_local|"
-    "throw|true|try|typedef|typeid|typename|union|unsigned|using|virtual|void|"
-    "volatile|wchar_t|while|xor_eq|xor|"
-    "_Alignas|_Alignof|_Atomic|_Bool|_Complex|_Generic|_Imaginary|_Noreturn|"
-    "_Static_assert|_Thread_local"
-)
-_M2A_C_BUILTINS = (
-    "size_t|ssize_t|ptrdiff_t|intptr_t|uintptr_t|"
-    "int8_t|int16_t|int32_t|int64_t|uint8_t|uint16_t|uint32_t|uint64_t|"
-    "FILE|NULL|EXIT_SUCCESS|EXIT_FAILURE|stdin|stdout|stderr|"
-    "printf|fprintf|snprintf|sprintf|sscanf|scanf|puts|putchar|getchar|fgets|"
-    "fputs|fopen|fclose|fread|fwrite|malloc|calloc|realloc|free|memcpy|memmove|"
-    "memset|strlen|strncmp|strcmp|strncpy|strcpy|strncat|strcat|strchr|strstr|"
-    "exit|abort|assert|"
-    "std|string_view|string|wstring|vector|array|unordered_map|map|unordered_set|"
-    "set|pair|tuple|optional|variant|list|deque|queue|stack|span|"
-    "shared_ptr|unique_ptr|weak_ptr|make_shared|make_unique|move|forward|"
-    "cout|cin|cerr|clog|endl"
-)
-
-# Order: a `#...` preprocessor directive is its own token and must match first
-# (C has no `#` comment). Comments precede strings/numbers; punct dims the rest.
-# Char literals reuse the single-quote string fragment and share the string color.
-_M2A_RULES_CODE_C = (
-    ("c_preproc",       r"^ [ \t]* \# [ \t]* \w+",                  M2A_COLOR_KEYWORD, None),
-    ("c_comment_line",  r"//[^\n]*",                                M2A_COLOR_COMMENT, None),
-    ("c_comment_block", r"/\*(?:(?!\*/)[\s\S])*\*/",                M2A_COLOR_COMMENT, None),
-    ("c_string",        _M2A_STR_DQ,                                M2A_COLOR_STRING,  None),
-    ("c_char",          _M2A_STR_SQ,                                M2A_COLOR_STRING,  None),
-    ("c_number",        _M2A_NUM,                                   M2A_COLOR_NUMBER,  None),
-    ("c_keyword",       rf"\b(?:{_M2A_C_KEYWORDS})\b",              M2A_COLOR_KEYWORD, None),
-    ("c_builtin",       rf"\b(?:{_M2A_C_BUILTINS})\b",              M2A_COLOR_BUILTIN, None),
-    _M2A_RULE_PUNCT,
-)
-
-# Unknown / unmarked blocks — no language to key off, so just the universal
-# tokens: permissive (newline-spanning) strings, numbers, and dimmed punctuation.
-# No comment rule (comment syntax is unknown). Strings come first so a number or
-# operator inside a quoted span isn't separately colored.
-_M2A_RULES_CODE_UNKNOWN = (
-    ("gen_string_dq", _M2A_STR_DQ_ML, M2A_COLOR_STRING, None),
-    ("gen_string_sq", _M2A_STR_SQ_ML, M2A_COLOR_STRING, None),
-    ("gen_string_bt", _M2A_STR_BT,    M2A_COLOR_STRING, None),
-    ("gen_number",    _M2A_NUM,       M2A_COLOR_NUMBER, None),
-    _M2A_RULE_PUNCT,
-)
-
-# Generic: no rules — fenced block content passes through unchanged. Reserved
-# for frontmatter, which must stay a verbatim passthrough (it is not code).
-_M2A_RULES_CODE_GENERIC = ()
+def _m2a_block_context(rules):
+    return _m2a_build_context(tuple((n, p, None, None) for n, p, *_ in rules))
 
 
-# ### Section: Compiled contexts ############################################
-
-M2A_CONTEXT_CODE_PYTHON     = _m2a_build_context(_M2A_RULES_CODE_PYTHON)
-M2A_CONTEXT_CODE_BASH       = _m2a_build_context(_M2A_RULES_CODE_BASH)
-M2A_CONTEXT_CODE_JAVASCRIPT = _m2a_build_context(_M2A_RULES_CODE_JAVASCRIPT)
-M2A_CONTEXT_CODE_C          = _m2a_build_context(_M2A_RULES_CODE_C)
-M2A_CONTEXT_CODE_UNKNOWN    = _m2a_build_context(_M2A_RULES_CODE_UNKNOWN)
-M2A_CONTEXT_CODE_GENERIC    = _m2a_build_context(_M2A_RULES_CODE_GENERIC)
+_M2A_BLOCK_CONTEXT_ROOT   = _m2a_block_context(_M2A_BLOCK_RULES)
+# Recursion target for indent-as-chrome (§5.5) and list marker-line remainders (§7.2).
+_M2A_BLOCK_CONTEXT_NESTED = _m2a_block_context([r for r in _M2A_BLOCK_RULES if not r[2]])
+_M2A_BLOCK_CONTEXT_QUOTE  = _m2a_block_context([r for r in _M2A_BLOCK_RULES if r[3]])
 
 
-# ### Section: Markdown rule table ##################################
+# Dispatch by block-rule name to a renderer taking `(match, state)`. The v1-shape
+# handlers (which took `current_style` as a parameter) are wrapped here, passing
+# `state.current_style` and binding each block's fixed arguments (color, code
+# context, label).
+_M2A_BLOCK_RENDERERS = {
+    "frontmatter":  lambda m, st: _m2a_fmt_code(m, "frontmatter", st.current_style, st, M2A_CONTEXT_CODE_GENERIC, label="Frontmatter"),
+    "h1":           lambda m, st: _m2a_fmt_heading(m, "h1", st.current_style, st, M2A_COLOR_H1),
+    "h2":           lambda m, st: _m2a_fmt_heading(m, "h2", st.current_style, st, M2A_COLOR_H2),
+    "h3":           lambda m, st: _m2a_fmt_heading(m, "h3", st.current_style, st, M2A_COLOR_H3),
+    "h4":           lambda m, st: _m2a_fmt_heading(m, "h4", st.current_style, st, M2A_COLOR_H4),
+    "h5":           lambda m, st: _m2a_fmt_heading(m, "h5", st.current_style, st, M2A_COLOR_H5),
+    "h6":           lambda m, st: _m2a_fmt_heading(m, "h6", st.current_style, st, M2A_COLOR_H6),
+    "hr":           lambda m, st: _m2a_fmt_hr(m, "hr", st.current_style, st),
+    "html_hr":      lambda m, st: _m2a_fmt_hr(m, "html_hr", st.current_style, st),
+    "code_python":  lambda m, st: _m2a_fmt_code(m, "code_python", st.current_style, st, M2A_CONTEXT_CODE_PYTHON, "python"),
+    "code_bash":    lambda m, st: _m2a_fmt_code(m, "code_bash", st.current_style, st, M2A_CONTEXT_CODE_BASH, "bash"),
+    "code_js":      lambda m, st: _m2a_fmt_code(m, "code_js", st.current_style, st, M2A_CONTEXT_CODE_JAVASCRIPT, "javascript"),
+    "code_c":       lambda m, st: _m2a_fmt_code(m, "code_c", st.current_style, st, M2A_CONTEXT_CODE_C, label="C/C++"),
+    "code_generic": lambda m, st: _m2a_fmt_code(m, "code_generic", st.current_style, st, M2A_CONTEXT_CODE_UNKNOWN),
+    "blockquote":   lambda m, st: _m2a_fmt_blockquote(m, "blockquote", st.current_style, st),
+    "table":        lambda m, st: _m2a_fmt_table(m, "table", st.current_style, st),
+    "list":         lambda m, st: _m2a_fmt_list(m, "list", st.current_style, st),
+    "footnote_def": lambda m, st: _m2a_fmt_footnote_def(m, "footnote_def", st.current_style, st),
+}
 
-# Inline patterns embed _M2A_BLOCK_START_AHEAD via f-string substitution so the
-# soft-newline branch stops at block boundaries.
-_BSA = _M2A_BLOCK_START_AHEAD
 
-# Headings — exact-count `#` followed by space ensures mutual exclusion.
-_MD_H1 = r"^ \# [ \t]+ (?P<*> [^\n]+ ) $"
-_MD_H2 = r"^ \#{2} [ \t]+ (?P<*> [^\n]+ ) $"
-_MD_H3 = r"^ \#{3} [ \t]+ (?P<*> [^\n]+ ) $"
-_MD_H4 = r"^ \#{4} [ \t]+ (?P<*> [^\n]+ ) $"
-_MD_H5 = r"^ \#{5} [ \t]+ (?P<*> [^\n]+ ) $"
-_MD_H6 = r"^ \#{6} [ \t]+ (?P<*> [^\n]+ ) $"
+# ### Section: The two-phase engine #########################################
 
-_MD_HR = r"^ (?: -{3,} | ={3,} | _{3,} ) [ \t]* $"
 
-# A standalone `<hr>` line (optionally self-closing, any case). Scoped (?i:…)
-# because the engine compiles with re.VERBOSE | MULTILINE | DOTALL but no
-# global IGNORECASE. Reuses _m2a_fmt_hr (full page width) — see spec §5.3.
-_MD_HTML_HR = r"^ [ \t]* (?i: < hr [ \t]* /? > ) [ \t]* $"
+def _m2a_first_group(m, context):
+    """The outer rule name that matched — the first outer named group with a
+    non-None value (as `_md2ansi` identifies the rule; NOT `m.lastgroup`)."""
+    groups = m.groupdict()
+    for name, *_ in context.rules:
+        if groups.get(name) is not None:
+            return name
+    return None
 
-# Inline `<br>` / `<hr>` (content, not a standalone line). Same scoped (?i:…)
-# and optional self-close as the block forms. `html_br` emits the line-break
-# sentinel; `html_hr_inline` emits the rule sentinel. Both live in the inline
-# set after `escape` (so `\<br>` stays literal) — see spec §5.2 / §5.3.
-_MD_HTML_BR = r"(?i: < br [ \t]* /? > )"
-_MD_HTML_HR_INLINE = r"(?i: < hr [ \t]* /? > )"
 
-# Frontmatter — anchored to file start via `\A` so it never matches
-# mid-document. Empty `(?P<*indent>)` group so the shared `_m2a_fmt_code`
-# framing (which reads `{name}_indent`) works with no indent. The body is a run
-# of lines that are each non-empty, non-comment (`#…`), and not the closing
-# fence; the first blank line, `#` comment, or `---` ends it. Requiring a tight
-# block keeps real markdown (which has blank lines / `#` headings) from being
-# mistaken for frontmatter when a document opens with a `---` thematic break.
-# The closing `---` ends at `$` (not consuming its trailing newline, like code
-# fences) so the framed box doesn't merge with the following line. MUST precede
-# `hr` in the rule table (both match a leading `---`).
-_MD_FRONTMATTER = r"""
-    \A (?P<*indent>) --- [ \t]* \n
-    (?P<*body>
-        (?: ^ (?! --- [ \t]* $ ) (?! [ \t]* \# ) (?! [ \t]* $ ) [^\n]* \n )*
-    )
-    ^ --- [ \t]* $
-"""
+def _m2a_block_scan(text, block_context):
+    """Yield `(rule_name, match, start, end)` spans that TILE `text` exactly
+    (design §5.2): every byte belongs to exactly one span, in document order,
+    each span owning its trailing `\\n` (the final span may lack one). Block
+    matches are extended through their trailing newline (block patterns don't
+    consume it, keeping them v1-shaped). Interstitial gaps yield as
+    `("prose", None, start, end)` — prose is a first-class block kind (§5.3).
 
-# Fenced code blocks — tempered-greedy body so each char has one matching branch.
-def _fenced(tag, fence=r"```"):
-    return rf"""
-        ^ (?P<*indent> [ \t]* ) {fence} [ \t]* {tag} [ \t]* \n
-        (?P<*body> (?: (?! ^ [ \t]* {fence} [ \t]* $ ) [\s\S] )* )
-        ^ [ \t]* {fence} [ \t]* $
+    One scanner, two consumers (§8): `_m2a_render` and `md2ansi_scan`.
     """
-
-_MD_CODE_PY   = _fenced("python")
-_MD_CODE_BASH = _fenced(r"(?:bash|sh)")
-_MD_CODE_JS   = _fenced(r"(?:javascript|js)")
-_MD_CODE_C    = _fenced(r"(?:c\+\+|cpp|cxx|cc|hpp|hxx|h|c)")
-_MD_CODE_GEN  = _fenced(r"(?P<*lang> \w* )", fence=r"(?:```|~~~)")
-
-_MD_BLOCKQUOTE = r"^ > [ \t]? [^\n]* (?: \n > [ \t]? [^\n]* )*"
-
-_MD_TABLE = r"^ [ \t]* \| [^\n]* (?: \n [ \t]* \| [^\n]* )*"
-
-_MD_LIST = r"""
-    ^ [ \t]* (?: [-*+] | \d+\. ) [ \t]+ [^\n]*
-    (?: \n [ \t]* (?: [-*+] | \d+\. ) [ \t]+ [^\n]* )*
-"""
-
-_MD_FOOTNOTE_DEF = r"""
-    ^ \[ \^ (?P<*id> [^\]\n]+ ) \] : [ \t]+
-    (?P<*text> [^\n]+ (?: \n [ \t]+ [^\n]+ )* )
-"""
-
-# A leading guard rejects def-shaped occurrences: a `[^id]` at line start (after
-# `\n`, or at the string start `\A`) immediately followed by `:` is a footnote
-# DEFINITION, not a ref. In contexts that carry this rule but no `footnote_def`
-# (blockquote bodies, list items, table cells) such a line would otherwise be
-# styled and appended to the shared footnote_order, yielding a phantom Footnotes
-# entry. The guard lets the match proceed only when NOT at line start
-# (`(?<=[^\n])`, which also fails at `\A`) OR when the def shape is absent
-# (`(?! … : )`); it rejects solely the conjunction, so a mid-line `[^1]:` after
-# prose still matches as a ref and a rejected line falls through as literal text.
-_MD_FOOTNOTE_REF = r"""
-    (?: (?<= [^\n] ) | (?! \[ \^ [^\]\n]+ \] : ) )
-    \[ \^ (?P<*id> [^\]\n]+ ) \]
-"""
-
-# Backslash-escape token: `\<any char>`. Used as the first alternative in
-# every inline-delimiter rule's inner alternation so that `\*`, `\~`, `\[`,
-# `\\` etc. survive the wrapper rule as a single 2-char unit and don't
-# accidentally close the span.
-_MD_ESCAPED = r"\\."
-
-# Double-backtick inline code — body may contain single backticks; closes on
-# the first ``. Listed before the single-backtick rule so it wins on `` ``…`` ``.
-_MD_CODE_INLINE2 = rf"""
-    `` (?P<*>
-        (?: (?!``) (?: [^\n] | \n (?! {_BSA} ) ) )+
-    ) ``
-"""
-# Single-backtick inline code — like the emphasis rules, `{_MD_ESCAPED}` is the
-# first alternative (and `\\` is excluded from the negated class) so `\`` is a
-# literal backtick that doesn't close the span. The handler unwraps the escapes.
-_MD_CODE_INLINE  = rf" ` (?P<*> (?: {_MD_ESCAPED} | [^`\n\\] | \n (?! {_BSA} ) )+ ) ` "
-
-_MD_IMAGE = r" ! \[ (?P<*alt> [^\]\n]* ) \] \( (?P<*url> [^)\n]* ) \) "
-
-# Non-capturing twin of _MD_IMAGE, embeddable inside other rules' bodies
-# without colliding on group names. Used in link text (below) so a linked
-# image `[![alt](img)](url)` is consumed whole — otherwise the image's `](…)`
-# is mistaken for the link's own close + URL and the rest leaks as literal text.
-_MD_IMAGE_INLINE = r" ! \[ [^\]\n]* \] \( [^)\n]* \) "
-
-# Standalone escape rule fires in the INLINE context so each `\<punct>`
-# token gets unwrapped to just the punctuation char. The `\n` in the
-# class implements CommonMark's hard-line-break syntax (`\` at end of
-# line emits a newline and drops the backslash).
-_MD_ESCAPE = r"""
-    \\ (?P<*char>
-        [ !"\#\$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~ \n ]
-    )
-"""
-
-# HTML comment `<!-- … -->` — tempered-greedy and multi-line (same shape as the
-# `js_comment_block` / `c_comment_block` code-context rules). No capture group:
-# the handler drops the whole match. Placed after `escape` so `\<!-- … -->`
-# stays literal; an unclosed `<!--` (no `-->`) simply never matches → verbatim.
-_MD_HTML_COMMENT = r" <!-- (?: (?! --> ) [\s\S] )* --> "
-
-# Standalone compiled twin, used by `_m2a_fmt_table` to strip comments from a raw
-# row line BEFORE splitting on `|`, so a comment containing `|` can't mis-split a
-# row into extra columns. DOTALL so a (rare) multi-line comment inside the table
-# match is also removed.
-_M2A_HTML_COMMENT_RE = re.compile(_MD_HTML_COMMENT, re.VERBOSE | re.DOTALL)
-
-# HTML entity `&name;` / `&#dec;` / `&#xHEX;` — the trailing `;` is REQUIRED, so
-# `AT&T`, a bare `&`, and `&amp` (no `;`) never match → literal pass-through. The
-# `body` group is everything between `&` and `;` (`#dec`, `#xHEX`, or a name);
-# `_m2a_fmt_entity` decodes it. Placed in the inline set AFTER `escape` (so
-# `\&amp;` stays literal) and grouped with the other html_* rules. Code spans are
-# already safe: `code_inline*` precede this and consume a span whole; fenced/code
-# contexts carry no entity rule, so a literal `&amp;` survives there (spec §5.4).
-_MD_HTML_ENTITY = r"""
-    & (?P<*body>
-        \# [0-9]+ | \# [xX] [0-9a-fA-F]+ | [a-zA-Z] [a-zA-Z0-9]*
-    ) ;
-"""
-
-_MD_LINK = rf"""
-    (?<!!) \[ (?P<*>
-        (?: {_MD_IMAGE_INLINE} | {_MD_ESCAPED} | [^\]\n\\] | \n (?! {_BSA} ) )+
-    ) \] \( (?P<*url> [^)\n]* ) \)
-"""
-
-_MD_BOLDITALIC = rf"""
-    \*\*\* (?P<*>
-        (?: {_MD_ESCAPED} | [^*\n\\] | \*(?!\*\*) | \n (?! {_BSA} ) )+
-    ) \*\*\*
-"""
-
-_MD_BOLD_UNDER = rf"""
-    \*\*_ (?P<*>
-        (?: {_MD_ESCAPED} | [^_\n\\] | \n (?! {_BSA} ) )+
-    ) _\*\*
-"""
-
-_MD_UNDER_BOLD = rf"""
-    _\*\* (?P<*>
-        (?: {_MD_ESCAPED} | [^*\n\\] | \*(?!\*) | \n (?! {_BSA} ) )+
-    ) \*\*_
-"""
-
-_MD_BOLD = rf"""
-    \*\* (?P<*>
-        (?: {_MD_ESCAPED} | [^*\n\\] | \*(?!\*) | \n (?! {_BSA} ) )+
-    ) \*\*
-"""
-
-_MD_STRIKE = rf"""
-    ~~ (?P<*>
-        (?: {_MD_ESCAPED} | [^~\n\\] | ~(?!~) | \n (?! {_BSA} ) )+
-    ) ~~
-"""
-
-_MD_ITALIC = rf"""
-    (?<!\*) \* (?P<*>
-        (?: {_MD_ESCAPED} | [^*\n\\] | \n (?! {_BSA} ) )+
-    ) \* (?!\*)
-"""
-
-# Lambdas binding the code context (and display language label) for each
-# language-specific code block. The generic block passes lang=None so the
-# handler reads it from the pattern's captured `_lang` group.
-def _m2a_code_lambda(code_ctx, lang=None, label=None):
-    return lambda m, name, cs, ctx, st: _m2a_fmt_code(m, name, cs, ctx, st, code_ctx, lang, label)
-
-# Lambda binding the level color for each heading rule (h1..h6).
-def _m2a_heading_lambda(sgr):
-    return lambda m, name, cs, ctx, st: _m2a_fmt_heading(m, name, cs, ctx, st, sgr)
-
-# Inline rules — used to build M2A_CONTEXT_MD_INLINE (where _M2A_RECURSE_SELF
-# resolves to INLINE itself), and reused inside _M2A_RULES_MD after rebinding
-# the sentinel to the now-built INLINE context. Block-level matches recurse
-# into INLINE so their text never re-triggers the full block grammar (otherwise
-# "1. Goals" inside `## 1. Goals` would render as a list). The exceptions are
-# list items, which recurse into M2A_CONTEXT_MD_BLOCKLITE (INLINE plus the
-# heading rules) so a nested heading is styled, and blockquotes, which recurse
-# into the fuller M2A_CONTEXT_MD_NESTED (the whole block grammar) so a quote is a
-# mini-document — see each context's definition for what it does and doesn't cover.
-_M2A_RULES_INLINE_RAW = (
-    ("code_inline2",  _MD_CODE_INLINE2, _m2a_fmt_inline_code,  None),
-    ("code_inline",   _MD_CODE_INLINE,  _m2a_fmt_inline_code,  None),
-    # Backslash escapes — placed AFTER inline code so a code span is captured
-    # whole (its own pattern/handler resolve any internal escapes), but BEFORE
-    # every other delimiter so `\*`, `\~`, `\[` etc. don't trigger emphasis / links.
-    ("escape",        _MD_ESCAPE,       _m2a_fmt_escape,       None),
-    # HTML comments — dropped. After `escape` (so `\<!-- …` stays literal) and
-    # before the delimiter rules. Code spans are already safe: `code_inline*`
-    # precede this in the alternation and consume a span whole; fenced/code
-    # contexts carry no comment rule at all, so a literal `<!-- … -->` survives.
-    ("html_comment",  _MD_HTML_COMMENT, _m2a_fmt_comment,      None),
-    # `<br>` / `<hr>` as inline content → deferred line sentinels (`\x01`/`\x02`).
-    # After `html_comment` (so a `<br>` inside a dropped comment never fires) and
-    # before the delimiter rules. Inherited by INLINE / BLOCKLITE / the MD table,
-    # so they reach prose, headings, cells, list items, blockquotes, link text.
-    ("html_br",       _MD_HTML_BR,      _m2a_fmt_br,           None),
-    ("html_hr_inline",_MD_HTML_HR_INLINE, _m2a_fmt_hr_inline,  None),
-    # HTML entities — decoded to their Unicode char (or a sentinel for LF/CR/nbsp,
-    # `�` for forbidden codepoints). After `escape` so `\&amp;` stays literal;
-    # grouped with the other html_* rules. recurse=None — the replacement is not
-    # rescanned, so `&amp;amp;` decodes once to `&amp;` (spec §5.4).
-    ("html_entity",   _MD_HTML_ENTITY,  _m2a_fmt_entity,       None),
-    ("image",         _MD_IMAGE,        _m2a_fmt_image,        None),
-    ("link",          _MD_LINK,         M2A_COLOR_LINK,        _M2A_RECURSE_SELF),
-    ("bolditalic",    _MD_BOLDITALIC,   "1;3",                 _M2A_RECURSE_SELF),
-    ("bold_under",    _MD_BOLD_UNDER,   "1;3",                 _M2A_RECURSE_SELF),
-    ("under_bold",    _MD_UNDER_BOLD,   "1;3",                 _M2A_RECURSE_SELF),
-    ("bold",          _MD_BOLD,         "1",                   _M2A_RECURSE_SELF),
-    ("strike",        _MD_STRIKE,       "9",                   _M2A_RECURSE_SELF),
-    ("italic",        _MD_ITALIC,       "3",                   _M2A_RECURSE_SELF),
-    ("footnote_ref",  _MD_FOOTNOTE_REF, _m2a_fmt_footnote_ref, None),
-)
-M2A_CONTEXT_MD_INLINE = _m2a_build_context(_M2A_RULES_INLINE_RAW)
-
-# Rebind sentinel to INLINE for the full MD rule table.
-_M2A_RULES_INLINE_IN_MD = tuple(
-    (name, pat, fmt, M2A_CONTEXT_MD_INLINE if recurse is _M2A_RECURSE_SELF else recurse)
-    for name, pat, fmt, recurse in _M2A_RULES_INLINE_RAW
-)
-
-_M2A_RULES_MD = (
-    ("frontmatter",   _MD_FRONTMATTER,  _m2a_code_lambda(M2A_CONTEXT_CODE_GENERIC, label="Frontmatter"), None),
-    ("h1",            _MD_H1,           _m2a_heading_lambda(M2A_COLOR_H1),            None),
-    ("h2",            _MD_H2,           _m2a_heading_lambda(M2A_COLOR_H2),            None),
-    ("h3",            _MD_H3,           _m2a_heading_lambda(M2A_COLOR_H3),            None),
-    ("h4",            _MD_H4,           _m2a_heading_lambda(M2A_COLOR_H4),            None),
-    ("h5",            _MD_H5,           _m2a_heading_lambda(M2A_COLOR_H5),            None),
-    ("h6",            _MD_H6,           _m2a_heading_lambda(M2A_COLOR_H6),            None),
-    ("hr",            _MD_HR,           _m2a_fmt_hr,                                  None),
-    ("html_hr",       _MD_HTML_HR,      _m2a_fmt_hr,                                  None),
-    ("code_python",   _MD_CODE_PY,      _m2a_code_lambda(M2A_CONTEXT_CODE_PYTHON,     "python"),     None),
-    ("code_bash",     _MD_CODE_BASH,    _m2a_code_lambda(M2A_CONTEXT_CODE_BASH,       "bash"),       None),
-    ("code_js",       _MD_CODE_JS,      _m2a_code_lambda(M2A_CONTEXT_CODE_JAVASCRIPT, "javascript"),None),
-    ("code_c",        _MD_CODE_C,       _m2a_code_lambda(M2A_CONTEXT_CODE_C,          label="C/C++"),None),
-    ("code_generic",  _MD_CODE_GEN,     _m2a_code_lambda(M2A_CONTEXT_CODE_UNKNOWN),   None),
-    ("blockquote",    _MD_BLOCKQUOTE,   _m2a_fmt_blockquote,                          None),
-    ("table",         _MD_TABLE,        _m2a_fmt_table,                               None),
-    ("list",          _MD_LIST,         _m2a_fmt_list,                                None),
-    ("footnote_def",  _MD_FOOTNOTE_DEF, _m2a_fmt_footnote_def,                        None),
-) + _M2A_RULES_INLINE_IN_MD
-
-M2A_CONTEXT_MD = _m2a_build_context(_M2A_RULES_MD)
-
-# "Block-lite" recursion context: the six ATX heading rules plus the inline
-# rules, and nothing else. It is the recursion target for list items (see
-# `_m2a_fmt_list`) so that a heading written inside one is styled instead of
-# leaking its literal `#`s. (Blockquotes recurse into the fuller
-# M2A_CONTEXT_MD_NESTED, defined below.)
-#
-# How it works: the `list` rule claims the whole block first and draws its own
-# chrome (the bullet); it then recurses the *leftover* line content through this
-# context, where the `^#{1,6} ` heading rules fire per line (the engine compiles
-# with re.MULTILINE) exactly as they do at top level. Going *through* the block
-# formatter is what preserves the chrome — a sibling top-level heading rule
-# cannot, because the block rules consume their own lines first (a flat heading
-# rule placed beside `list` either no-ops on multi-line lists or eats the bullet
-# on single-line ones).
-#
-# Covered: a heading that is the direct line-content of a list item — `- ## h`,
-# `1. ## h`, and headings in nested list items (`- a` then `  - ## h`), with
-# inline emphasis in the title still rendered.
-#
-# NOT covered (would require real recursive block parsing, which this regex
-# engine does not do): a heading on a marker-less list *continuation* line
-# (`- a` then `  ## h` — the `_MD_LIST` grammar never captures that line into the
-# list block).
-#
-# Deliberately distinct from M2A_CONTEXT_MD_INLINE: INLINE stays heading-free
-# because it also renders heading titles and table cells, where a literal
-# `## x` must survive untouched.
-_M2A_RULES_BLOCKLITE = tuple(
-    r for r in _M2A_RULES_MD if r[0] in {"h1", "h2", "h3", "h4", "h5", "h6"}
-) + _M2A_RULES_INLINE_IN_MD
-M2A_CONTEXT_MD_BLOCKLITE = _m2a_build_context(_M2A_RULES_BLOCKLITE)
-
-# "Nested" recursion context: the FULL block grammar (`_M2A_RULES_MD`) minus two
-# rules, used by `_m2a_fmt_blockquote` so a quote body is a mini-document with
-# tables, lists, fenced code, nested quotes, `---` rules and headings — not just
-# the heading+inline subset BLOCKLITE offers (BLOCKLITE stays the list-item
-# recursion target). Two rules are dropped:
-#   • frontmatter — its `\A`-anchored pattern would misfire on a `> ---` (or a
-#     `---`…`---` pair) at the quote's start, framing it as a Frontmatter box.
-#   • footnote_def — a definition inside a quote renders as quoted prose; a ref
-#     with no collected def is already silently dropped (_m2a_render_footnotes),
-#     and footnote REFS keep working against top-level defs because the shared
-#     state (footnotes/footnote_order) survives the blockquote's narrowed copy.
-_M2A_RULES_MD_NESTED = tuple(
-    r for r in _M2A_RULES_MD if r[0] not in {"frontmatter", "footnote_def"}
-)
-M2A_CONTEXT_MD_NESTED = _m2a_build_context(_M2A_RULES_MD_NESTED)
+    pos = 0
+    n = len(text)
+    for m in block_context.compiled.finditer(text):
+        start, mend = m.start(), m.end()
+        end = mend + 1 if mend < n and text[mend] == "\n" else mend
+        if start > pos:
+            yield ("prose", None, pos, start)
+        yield (_m2a_first_group(m, block_context), m, start, end)
+        pos = end
+    if pos < n:
+        yield ("prose", None, pos, n)
 
 
-# ### Section: Internal _md2ansi() and replace dispatcher ###################
+def _m2a_render_prose(text, state):
+    """Render a prose span (design §5.3): whole-span inline pass, then per output
+    line realize the deferred sentinels and word-wrap. This reproduces v1's
+    combined inline pass + the non-opaque branch of its post-render wrap, applied
+    to exactly the text between block matches. No paragraph reflow — each source
+    line wraps independently.
 
-def _md2ansi(text, current_style, context, state):
-    def _m2a_replace(m):
-        groups = m.groupdict()
-        for name, _pat, fmt, recurse in context.rules:
-            if groups.get(name) is None:
-                continue
-            match fmt:
-                case str() as sgr:
-                    inner = groups.get(f"{name}_inner")
-                    new_style = f"{current_style};{sgr}"
-                    actual_recurse = context if recurse is _M2A_RECURSE_SELF else recurse
-                    if actual_recurse is not None and inner is not None:
-                        inner = _md2ansi(inner, new_style, actual_recurse, state)
-                    elif inner is None:
-                        inner = m.group(0)
-                    return _m2a_inject_color(inner, new_style, current_style)
-                case _ as func:
-                    return func(m, name, current_style, context, state)
-        return m.group(0)
-    return context.compiled.sub(_m2a_replace, text)
-
-
-# ### Section: Public md2ansi() entry point #################################
-
-# Line wrapping runs as a post-render pass over the already-styled output (see
-# `_m2a_wrap_rendered`). Wrapping after rendering — rather than pre-wrapping the
-# source — means inline spans are fully resolved before any break is inserted,
-# so a `**bold**` / `` `code` `` span can never be split mid-construct, and
-# widths are measured on visible characters rather than raw markdown.
-
-
-def _m2a_wrap_ansi_line(line, line_width, continuation="", reset_sgr=""):
-    """Greedy word-wrap over already-styled text: wraps at visible-character
-    positions (a small no-break zone at the line start, like the source wrapper
-    it replaced), leaves SGR escape sequences intact, and re-emits the last seen
-    SGR at the start of each new line so any styling active at the break
-    point survives onto the next line.
-
-    `reset_sgr` (e.g. `"\\x1b[0m"`) is appended to every output line so a
-    styled span that's still open at the break point cannot leak into
-    whatever follows on the same visual row — table-cell separators, padding,
-    or the next cell on the same line.
+    The `\\x02` rule width and the wrap width both come from `state.wrap_width`
+    (which equals the `line_width` v1 threaded into `_m2a_wrap_rendered` at every
+    level), so rule sizing matches v1's `line_width or 150`.
     """
-    if _m2a_visible_len(line) <= line_width:
-        return [line + reset_sgr]
-    threshold = _m2a_no_break_zone(line_width)
-    # Tokenize: ANSI escapes first (so they're not eaten by the word class),
-    # then whitespace runs, then word runs. The word class explicitly excludes
-    # \x1b so an ESC sequence following a word starts a new token rather than
-    # being swallowed into it.
-    tokens = re.findall(r"\x1b\[[0-9;]*m|\s+|[^\s\x1b]+", line)
-
-    lines_out = []
-    current = []
-    current_vlen = 0
-    pending = []      # whitespace + escapes accumulated since the last word
-    pending_vlen = 0  # visible width contributed by `pending`
-    last_sgr = ""     # most recent SGR seen — re-emitted after a break
-
-    for tok in tokens:
-        if tok.startswith("\x1b["):
-            last_sgr = tok
-            pending.append(tok)
-            continue
-        if tok[0].isspace():
-            pending.append(tok)
-            pending_vlen += len(tok)
-            continue
-        # `tok` is a word.
-        attempt_vlen = current_vlen + pending_vlen + len(tok)
-        if attempt_vlen <= line_width or current_vlen < threshold or current_vlen == 0:
-            current.extend(pending)
-            current.append(tok)
-            current_vlen = attempt_vlen
-        else:
-            lines_out.append("".join(current) + reset_sgr)
-            current = [continuation]
-            if last_sgr:
-                current.append(last_sgr)
-            current.append(tok)
-            current_vlen = len(continuation) + len(tok)
-        pending = []
-        pending_vlen = 0
-
-    # Flush any trailing escapes (e.g. closing reset).
-    current.extend(pending)
-    lines_out.append("".join(current) + reset_sgr)
-    return lines_out
-
-
-def _m2a_wrap_rendered(text, line_width):
-    """Post-render word-wrap over already-styled output.
-
-    Each output line is wrapped to `line_width` measuring visible width and
-    re-emitting active SGR across breaks (`_m2a_wrap_ansi_line`); a prose line's
-    continuation inherits its leading whitespace. Lines a block formatter marked
-    opaque (`_M2A_OPAQUE`) own their own layout (code frames, tables, headings,
-    lists, blockquotes, footnotes, HR) — they pass through verbatim, with the
-    marker stripped. The marker is always stripped here, so this pass also runs
-    when wrapping is disabled (`line_width <= 0`) purely to remove markers.
-
-    This is also the single place residual sentinels are realized for uncontained
-    prose (§5.2, §5.3, §6): `\\x01` (line break) splits a line, each piece wrapped
-    independently with its own leading-whitespace continuation; `\\x02` (rule) acts
-    like a block rule, emitting a `─`-run on its own line sized exactly like
-    `_m2a_fmt_hr`; `\\x03` (non-breaking space) becomes a plain `" "` last (so it
-    stays glued — outside the whitespace class — through wrapping). On an opaque
-    line only `\\x03` is realized: that line owns its layout, so its `\\x01`/`\\x02`
-    were already materialized by the block handler that marked it.
-    """
-    # Rule run mirrors `_m2a_fmt_hr` (via `_m2a_rule`), with the same 150
-    # fallback `md2ansi()` uses for `state.line_width` when wrapping is off.
-    rule_w = line_width if line_width > 0 else 150
+    styled = _md2ansi(text, state.current_style, M2A_CONTEXT_MD_INLINE, state)
+    wrap_width = state.wrap_width
+    rule_w = wrap_width if wrap_width > 0 else 150
     rule_line = _m2a_rule(rule_w - 1)
-
     out = []
-    for ln in text.split("\n"):
-        if ln.startswith(_M2A_OPAQUE):
-            out.append(ln[len(_M2A_OPAQUE):])
-            continue
-        # `\x01` (<br>) splits the line; `\x02` (<hr>) acts like a block rule,
-        # emitting a full-width `─` line of its own — both via the shared splitter.
+    for ln in styled.split("\n"):
         for kind, seg in _m2a_split_sentinel_lines(ln):
             if kind == "rule":
                 out.append(rule_line)
                 continue
-            if line_width > 0:
+            if wrap_width > 0:
                 cont = re.match(r"[ \t]*", seg).group(0)
-                out.extend(_m2a_wrap_ansi_line(seg, line_width, cont))
+                out.extend(_m2a_wrap_ansi_line(seg, wrap_width, cont))
             else:
                 out.append(seg)
-    # `\x03` → " " last, after wrapping, on every output line (opaque included).
     return "\n".join(out).replace(_M2A_NBSP, " ")
 
 
-def md2ansi(text, current_style="0", line_width=0, cell_min_width=20, row_dividers=None):
-    """Convert Markdown text to ANSI-colored output.
+def _m2a_narrow(state, cols):
+    """A stack-local state with both widths narrowed by `cols` visible columns,
+    floored at M2A_MIN_WIDTH (design §6); `wrap_width` stays 0 when it is 0. The
+    single narrowing primitive for every kind of chrome — the blockquote bar, the
+    list bullet columns, and the indent prefix (§5.5)."""
+    wrap = max(M2A_MIN_WIDTH, state.wrap_width - cols) if state.wrap_width > 0 else 0
+    line = max(M2A_MIN_WIDTH, state.line_width - cols)
+    return replace(state, wrap_width=wrap, line_width=line)
 
-    `line_width` > 0 enables word wrapping for paragraphs, lists, and
-    blockquotes. Wrapping runs as a post-render pass over the styled output
-    (`_m2a_wrap_rendered`), so inline spans are never split mid-construct and
-    widths count visible characters, not raw markdown. It's also the width used
-    by `_m2a_fmt_hr`. When 0 (the default) no wrapping happens and HR falls back
-    to a 150-char bar.
 
-    `cell_min_width` is the minimum width a table column can be shrunk to when
-    fitting the table into `line_width`; columns whose natural width is at or
-    below this are never shrunk or wrapped. `row_dividers` is a tristate:
-    `None` (default) emits inter-row dividers only when any body cell wraps;
-    `True` always emits them; `False` never emits them.
+def _m2a_leading_block(text, block_context):
+    """The block-rule name `text` BEGINS with, or None if it is plain prose. Used
+    by the list renderer to route a marker-line remainder to block recursion
+    (§7.2) versus the v1-parity prose path."""
+    m = block_context.compiled.match(text)
+    if m is None:
+        return None
+    return _m2a_first_group(m, block_context)
+
+
+def _m2a_render_indented(m, indent, state, block_context):
+    """Indentation as chrome (design §5.5), applied once for every block kind.
+    Strip the literal first-line `indent` from each line of the match that starts
+    with it (a line with more indentation keeps the excess as inner structure; a
+    line with less is left untouched and comes out more indented than written —
+    permissive, §5.5 PROVISIONAL), render the dedented block normally at a width
+    narrowed by the indent's visible width (`expandtabs(4)`), then re-prefix the
+    literal `indent` onto every output line. Identical mechanism to the blockquote
+    bar, with spaces; a blockquote at indent > 0 composes the two chromes."""
+    dedented = "\n".join(
+        ln[len(indent):] if ln.startswith(indent) else ln
+        for ln in m.group(0).split("\n")
+    )
+    inner = _m2a_render(dedented, _m2a_narrow(state, len(indent.expandtabs(4))), block_context)
+    return _m2a_prefix_lines(inner, indent)
+
+
+def _m2a_render(text, state, block_context):
+    """THE recursive entry (design §4). Scan with block rules only; render each
+    span with its renderer and reassemble by plain concatenation (the tiling
+    contract removes any need for a joiner or global spacing). Each block owns the
+    trailing newline the scanner attached; prose owns its own newlines.
+
+    Indentation is chrome (§5.5): a block whose first line carries a non-empty
+    `indent` capture is dedented, rendered narrowed, and re-prefixed — once here,
+    for every kind. The list rule owns its own `[ \\t]*` (no `indent` group) so it
+    is skipped; frontmatter's `indent` is always empty (§5.4).
     """
-    # Input sanitizer (the single source-side convergence point, §4): normalize
-    # CRLF and lone CR to `\n` first, then map every remaining C0 control char
-    # except `\t`/`\n`/ESC to U+FFFD. This keeps pre-colored source intact,
-    # guarantees no raw control char reaches output, and neutralizes any stray
-    # sentinel (`\x00`–`\x03`) in the source — so it can't be mistaken for one a
-    # handler emits LATER (those are added after this step and survive to the
-    # final pass). Subsumes the former `\x00` strip.
+    parts = []
+    for rule, m, start, end in _m2a_block_scan(text, block_context):
+        if rule == "prose":
+            parts.append(_m2a_render_prose(text[start:end], state))
+            continue
+        trailer = text[m.end():end]   # the "\n" the scanner attached, or ""
+        indent = m.groupdict().get(f"{rule}_indent") or ""
+        if indent:
+            rendered = _m2a_render_indented(m, indent, state, block_context)
+        else:
+            rendered = _M2A_BLOCK_RENDERERS[rule](m, state)
+        parts.append(rendered + trailer)
+    return "".join(parts)
+
+
+# ### Section: Public API ###################################################
+
+
+def md2ansi_color(text, current_style="0", line_width=0, cell_min_width=20, row_dividers=None):
+    """Convert Markdown text to ANSI-colored output. Canonical renderer name
+    (design §3); `md2ansi` is a v1-compatible alias.
+
+    `line_width` > 0 enables word wrapping for prose, lists, and blockquotes, and
+    is the width HR/tables size to; below M2A_MIN_WIDTH it clamps to 20 (§6). When
+    0 (default) no wrapping happens and HR falls back to a 150-char bar.
+    `cell_min_width` is the minimum a table column shrinks to; `row_dividers` is a
+    tristate (None: dividers only when a body cell wraps; True/False: always/never).
+    """
+    # Input sanitizer (design §6, carried from v1): normalize CRLF/CR to `\n`,
+    # then map every remaining C0 control char except `\t`/`\n`/ESC to U+FFFD —
+    # neutralizing any stray sentinel in the source.
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = _M2A_C0_KILL.sub("�", text)
-    # Style sanitizer: enforce the §5.2 invariant that the base style begins with
-    # the reset code `0`. Every span closes by re-emitting `current_style`; that
-    # only CLEARS attributes a span layered on (bold/italic/fg/…) when it starts
-    # with `0` (SGR "reset all"). A caller-supplied ambient like `48;5;236` would
-    # otherwise re-assert just the background and leave bold/italic leaking onto
-    # following text. Prepending `0;` is idempotent (`"0"`/`"0;…"` pass through)
-    # and lossless — the caller's full ambient still follows the reset — so the
-    # close becomes `\x1b[0;{ambient}m`: clear all, then re-apply the ambient.
+    # Style sanitizer: the base style must begin with reset `0` so every span's
+    # close (which re-emits current_style) actually clears layered attributes.
     if current_style != "0" and not current_style.startswith("0;"):
         current_style = "0;" + current_style
+    # §6: one width floor at every level INCLUDING root — `line_width=5` renders
+    # at 20. This diverges from v1 (which floored only container narrowing) at
+    # sub-20 root widths; the equivalence allowlist covers it, and it is dormant
+    # under the standard 0/30/60/100/150 sweep.
+    if line_width > 0:
+        line_width = max(M2A_MIN_WIDTH, line_width)
     state_lw = line_width if line_width > 0 else 150
     state = M2A_DocumentState(
         line_width=state_lw,
         cell_min_width=cell_min_width,
         row_dividers=row_dividers,
         wrap_width=line_width,
+        current_style=current_style,
     )
-    out = _md2ansi(text, current_style, M2A_CONTEXT_MD, state)
+    out = _m2a_render(text, state, _M2A_BLOCK_CONTEXT_ROOT)
     if state.footnote_order:
         out += _m2a_render_footnotes(state, current_style)
-    return _m2a_wrap_rendered(out, line_width)
+    return out
 
 
-# ### Section: Structural scan API #########################################
+md2ansi = md2ansi_color  # v1-compatible alias
 
-# A non-rendering view of the matches the engine already produces. `md2ansi_scan`
-# runs the same compiled MD grammar over the RAW (unwrapped) source and yields
-# one `M2A_Span` per top-level match, so consumers (e.g. a markdown TOC browser)
-# get heading/list/code offsets without re-implementing the grammar. The scan is
-# non-recursive: it sees every block span plus any inline match at top level, but
-# not inline markup nested inside a block (that stays masked in the block's span).
+
+# ### Section: Structural scan API ##########################################
+
+# `md2ansi_scan` consumes the SAME `_m2a_block_scan` the renderer uses (design
+# §8) — one scanner, two consumers, so the APIs cannot drift. Block spans tile
+# the raw source (§5.2). Inline-kind scanning keeps v1 behavior: top-level inline
+# matches, which occur exactly in the prose gaps (block rules win at every
+# line-start, so the inline grammar only ever fires in the gaps), found by
+# running the inline alternation over each prose span.
 
 
 @dataclass(frozen=True, slots=True)
 class M2A_Span:
-    """One top-level match from `md2ansi_scan`.
+    """One span from `md2ansi_scan`.
 
-    `kind` is the broad category ('heading', 'code', 'list', 'emphasis', …);
-    `subtype` is the narrow refinement, always populated — it falls back to
-    `kind` when there's no finer detail — so callers can match on it alone
-    ('h1'..'h6', 'code-python'/'code-<tag>', 'bold'/'italic'/…). `is_block`
+    `kind` is the broad category ('heading', 'code', 'list', 'emphasis', 'prose',
+    …); `subtype` is the narrow refinement, always populated. `is_block`
     separates block constructs from inline. `start`/`end` are character offsets
     into the scanned text (`text[start:end] == text`).
     """
@@ -1633,11 +1384,7 @@ class M2A_Span:
 
 
 # Outer-rule-name -> (kind, subtype) for rules whose classification differs from
-# the fallback (kind == subtype == rule name). Headings collapse to 'heading'
-# with the level as subtype; the code_* rules collapse to 'code' with a `code-`
-# prefixed language subtype (namespaced so a fence tag can never collide with
-# another construct's subtype); the emphasis variants collapse to 'emphasis'.
-# `code_generic`'s subtype is replaced by its fence tag at scan time when present.
+# the fallback (kind == subtype == rule name). Carried from v1.
 _M2A_SPAN_KINDS = {
     "h1": ("heading", "h1"), "h2": ("heading", "h2"), "h3": ("heading", "h3"),
     "h4": ("heading", "h4"), "h5": ("heading", "h5"), "h6": ("heading", "h6"),
@@ -1670,15 +1417,14 @@ def _m2a_span_kind(rule_name):
 # Names of the inline rules — drives `is_block` and the inline kind set.
 _M2A_INLINE_RULE_NAMES = frozenset(name for name, *_ in _M2A_RULES_INLINE_RAW)
 
-# Broad-kind sets, derived from the rule tables (nothing hand-maintained).
-# `md2ansi_scan(kinds=…)` takes any set of these; compose with `|` / `-` / `&`.
+# Broad-kind sets, derived from the rule tables (nothing hand-maintained). The
+# block set comes from the block rule table; prose is deliberately NOT in it, so
+# a default scan returns exactly what v1 returned (§8) and prose is opt-in.
 M2A_SPANS_INLINE = frozenset(
     _m2a_span_kind(name)[0] for name in _M2A_INLINE_RULE_NAMES
 )
 M2A_SPANS_BLOCK = frozenset(
-    _m2a_span_kind(name)[0]
-    for name, *_ in _M2A_RULES_MD
-    if name not in _M2A_INLINE_RULE_NAMES
+    _m2a_span_kind(name)[0] for name, *_ in _M2A_BLOCK_RULES
 )
 M2A_SPANS_ALL = M2A_SPANS_BLOCK | M2A_SPANS_INLINE
 
@@ -1686,19 +1432,35 @@ M2A_SPANS_ALL = M2A_SPANS_BLOCK | M2A_SPANS_INLINE
 def _m2a_scan(text, kinds):
     """Generator workhorse for `md2ansi_scan` (no validation).
 
-    One `finditer` pass over the combined MD grammar — the same regex, engine,
-    and order the renderer uses — so the scan can't drift from what gets
-    rendered. The outer rule is identified the same way as `_m2a_replace`: the
-    first outer named group with a non-None match (NOT `m.lastgroup`, which
-    would pick an inner capture).
+    Block spans (and prose gaps) come from `_m2a_block_scan`; each prose gap is
+    re-scanned with the inline alternation to surface top-level inline matches,
+    offset back into the source. Document order is preserved because block and
+    prose spans already interleave in order and inline matches within a gap are
+    in order.
     """
-    rule_names = [name for name, *_ in M2A_CONTEXT_MD.rules]
-    for m in M2A_CONTEXT_MD.compiled.finditer(text):
-        groups = m.groupdict()
-        rule = next(name for name in rule_names if groups.get(name) is not None)
+    for rule, m, start, end in _m2a_block_scan(text, _M2A_BLOCK_CONTEXT_ROOT):
+        if rule == "prose":
+            if "prose" in kinds:
+                yield M2A_Span("prose", "prose", False, start, end, text[start:end])
+            if kinds & M2A_SPANS_INLINE:
+                gap = text[start:end]
+                for im in M2A_CONTEXT_MD_INLINE.compiled.finditer(gap):
+                    iname = _m2a_first_group(im, M2A_CONTEXT_MD_INLINE)
+                    kind, subtype = _m2a_span_kind(iname)
+                    if kind not in kinds:
+                        continue
+                    yield M2A_Span(
+                        kind=kind,
+                        subtype=subtype,
+                        is_block=False,
+                        start=start + im.start(),
+                        end=start + im.end(),
+                        text=im.group(0),
+                    )
+            continue
         kind, subtype = _m2a_span_kind(rule)
         if rule == "code_generic":
-            tag = (groups.get("code_generic_lang") or "").strip()
+            tag = (m.groupdict().get("code_generic_lang") or "").strip()
             if tag:
                 subtype = f"code-{tag}"
         if kind not in kinds:
@@ -1706,32 +1468,30 @@ def _m2a_scan(text, kinds):
         yield M2A_Span(
             kind=kind,
             subtype=subtype,
-            is_block=rule not in _M2A_INLINE_RULE_NAMES,
-            start=m.start(),
-            end=m.end(),
-            text=m.group(0),
+            is_block=True,
+            start=start,
+            end=end,
+            text=text[start:end],
         )
 
 
 def md2ansi_scan(text, kinds=M2A_SPANS_BLOCK):
-    """Yield `M2A_Span` for top-level matches whose `kind` is in `kinds`.
+    """Yield `M2A_Span` per top-level construct whose `kind` is in `kinds`, in
+    document order, over the RAW source (`text[span.start:span.end] == span.text`).
 
-    Spans come in document order. The scan runs over the RAW text (no
-    line-wrapping), so `text[span.start:span.end] == span.text`. It is
-    non-recursive: every block span is reported, plus any inline match at top
-    level, but inline markup nested inside a block stays masked in that block's
-    span (use `recursive=` — not yet implemented — for that).
-
-    `kinds` is any set of broad kinds; compose with set arithmetic, e.g.
-    `M2A_SPANS_BLOCK - {'frontmatter'}` or `{'heading', 'list'}`. Defaults to
-    `M2A_SPANS_BLOCK`. Validated eagerly: passing a name not in `M2A_SPANS_ALL`
-    raises `ValueError` at the call, before iteration.
+    Block spans tile the source (§5.2, §8): each owns its trailing newline, gaps
+    surface as `kind="prose"` spans. `prose` is NOT in `M2A_SPANS_BLOCK`, so a
+    default scan returns exactly the block spans v1 returned; opt in with
+    `M2A_SPANS_BLOCK | {"prose"}` for a full tiling. Inline scanning
+    (`M2A_SPANS_INLINE`) keeps v1's top-level-match behavior. The scan is flat
+    (non-recursive). `kinds` is validated eagerly: a name not in `M2A_SPANS_ALL`
+    (or "prose") raises `ValueError` at the call, before iteration.
     """
-    unknown = set(kinds) - M2A_SPANS_ALL
+    unknown = set(kinds) - M2A_SPANS_ALL - {"prose"}
     if unknown:
         raise ValueError(
             f"md2ansi_scan: unknown span kind(s) {sorted(unknown)}; "
-            f"valid kinds are {sorted(M2A_SPANS_ALL)}"
+            f"valid kinds are {sorted(M2A_SPANS_ALL)} (plus 'prose')"
         )
     return _m2a_scan(text, frozenset(kinds))
 
@@ -1749,6 +1509,7 @@ try:
 except ImportError:
     pass
 
+
 # ### Section: main #########################################################
 
 if __name__ == "__main__":
@@ -1759,7 +1520,6 @@ if __name__ == "__main__":
     if paths:
         for path in paths:
             with open(path) as f:
-                sys.stdout.write(md2ansi(f.read(), line_width=line_width))
+                sys.stdout.write(md2ansi_color(f.read(), line_width=line_width))
     else:
-        sys.stdout.write(md2ansi(sys.stdin.read(), line_width=line_width))
-
+        sys.stdout.write(md2ansi_color(sys.stdin.read(), line_width=line_width))
