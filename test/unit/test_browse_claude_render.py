@@ -8422,6 +8422,121 @@ class TestTaskNotification(unittest.TestCase):
         self.assertIn('Just a normal prompt.', out)
 
 
+class TestAgentPeerMessage(unittest.TestCase):
+    """Inbound peer message (another session's SendMessage → this one):
+    a ``user`` record stamped ``origin.kind == 'peer'`` (legacy fallback:
+    the injected ``<agent-message>`` text wrapper). Must render as
+    agent-to-agent voice with its own stripe, not be mis-attributed to
+    the human, and stay visible despite arriving ``isMeta``."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    _BODY = 'Review finished.\n\n## Findings\n\nNone — **ship it**.'
+    _WRAPPED = (
+        'Another Claude session sent a message:\n'
+        '<agent-message from="md-menu-reviewer">\n'
+        + _BODY + '\n'
+        '</agent-message>'
+    )
+
+    def _peer_rec(self, origin=True, wrapped=True):
+        rec = {
+            'type': 'user',
+            'isMeta': True,
+            'message': {'role': 'user',
+                        'content': self._WRAPPED if wrapped
+                        else 'A plain injected line.'},
+        }
+        if origin:
+            rec['origin'] = {'kind': 'peer', 'from': 'md-menu-reviewer',
+                             'senderTaskId': 'amd-menu-reviewer-cfa01d62'}
+        return rec
+
+    def _human_rec(self):
+        return {
+            'type': 'user',
+            'message': {'role': 'user', 'content': 'Just a normal prompt.'},
+        }
+
+    # -- _is_agent_message ---------------------------------------------------
+
+    def test_detect_by_origin(self):
+        # The structured origin field alone is enough — no wrapper needed.
+        self.assertTrue(
+            self.r._is_agent_message(self._peer_rec(wrapped=False)))
+
+    def test_detect_by_wrapper_legacy(self):
+        # LEGACY pre-``origin`` records: text-shape detection.
+        self.assertTrue(
+            self.r._is_agent_message(self._peer_rec(origin=False)))
+
+    def test_human_false(self):
+        self.assertFalse(self.r._is_agent_message(self._human_rec()))
+
+    def test_plain_meta_false(self):
+        # An isMeta record with neither origin nor wrapper is NOT a peer
+        # message (e.g. injected skill content).
+        self.assertFalse(
+            self.r._is_agent_message(
+                self._peer_rec(origin=False, wrapped=False)))
+
+    # -- _parse_agent_message --------------------------------------------------
+
+    def test_parse_sender_and_body(self):
+        sender, body = self.r._parse_agent_message(self._peer_rec())
+        self.assertEqual(sender, 'md-menu-reviewer')
+        self.assertIn('## Findings', body)
+        self.assertNotIn('<agent-message', body)
+        self.assertNotIn('Another Claude session', body)
+
+    def test_parse_sender_from_wrapper_legacy(self):
+        sender, body = self.r._parse_agent_message(
+            self._peer_rec(origin=False))
+        self.assertEqual(sender, 'md-menu-reviewer')
+        self.assertIn('Review finished.', body)
+
+    # -- _kind_of / stripe / tag style ---------------------------------------
+
+    def test_kind_of_agent_peer(self):
+        self.assertEqual(self.r._kind_of(self._peer_rec()), 'agent-peer')
+
+    def test_stripe_and_tag_style_registered(self):
+        # Dark green (22) — distinct from human (17) and assistant (235).
+        self.assertEqual(self.r._ROW_BG_FOR_KIND.get('agent-peer'), 22)
+        self.assertIn('agent-peer', self.r._TAG_STYLE_FOR_KIND)
+
+    # -- detail level ---------------------------------------------------------
+
+    def test_min_level_voice_despite_is_meta(self):
+        self.assertEqual(self.r._record_min_level(self._peer_rec()), 2)
+
+    def test_plain_meta_still_buried(self):
+        rec = self._peer_rec(origin=False, wrapped=False)
+        self.assertEqual(self.r._record_min_level(rec), 6)
+
+    # -- _summarise_message ---------------------------------------------------
+
+    def test_summarise_one_liner(self):
+        out = self.r._summarise_message(self._peer_rec())
+        self.assertIn('←', out)
+        self.assertIn('md-menu-reviewer', out)
+        self.assertIn('Review finished.', out)
+        self.assertNotIn('<agent-message', out)
+        self.assertNotIn('Another Claude session', out)
+
+    # -- full preview (_render_user) ------------------------------------------
+
+    def test_full_preview_header_and_markdown(self):
+        out = self.r._render_user(self._peer_rec())
+        self.assertIn('← agent-message', out)
+        self.assertIn('md-menu-reviewer', out)
+        # body rendered (md2ansi unavailable in tests → raw md).
+        self.assertIn('## Findings', out)
+        self.assertNotIn('<agent-message', out)
+
+
 def _load_recipe_with_md_doc():
     """Reload the recipe with ``recipes/`` on ``sys.path`` so ``md_doc`` resolves.
 

@@ -1135,10 +1135,12 @@ _TAG_STYLE_FOR_KIND = {
     'system':              'gray',
     'tool_use':            'yellow',
     'tool_result':         'yellow',
-    # Inter-agent voice: leader → worker SendMessage (send) and the
-    # worker → leader task-notification reply (reply).
+    # Inter-agent voice: leader → worker SendMessage (send), the
+    # worker → leader task-notification reply (reply), and an inbound
+    # peer message from another session (peer).
     'agent-send':          'green',
     'agent-reply':         'cyan',
+    'agent-peer':          'green',
     # Bookmarks / state changes
     'last-prompt':         'magenta',
     'permission-mode':     'yellow',
@@ -1194,6 +1196,10 @@ _ROW_BG_FOR_KIND = {
     # Inbound worker→leader task-notification reply — same reasoning as
     # the send half: redirect the reply off the human stripe.
     'agent-reply':     235,
+    # Inbound peer message (another session's SendMessage) — the darkest
+    # green in the 256 cube (22, #005f00): agent-to-agent voice, distinct
+    # from both the human stripe (17) and the assistant stripe (235).
+    'agent-peer':       22,
 }
 
 
@@ -1342,6 +1348,7 @@ def _record_min_level(rec):
     of the leaner views.
 
       * ``isMeta`` (injected context; never lived)        → 6
+        …except an inbound peer message (agent voice)     → 2
       * turn-root prompt / queued ``enqueue`` / assistant
         ``end_turn`` response                              → 1  (summary)
       * any other voice (``_is_voice``)                    → 2  (voice)
@@ -1356,6 +1363,11 @@ def _record_min_level(rec):
     """
     if not isinstance(rec, dict):
         return 6
+    # Inbound peer messages arrive stamped ``isMeta`` but ARE lived
+    # conversation (another agent talking to this one) — promote them
+    # to the voice tier before the isMeta gate buries them.
+    if _is_agent_message(rec):
+        return 2
     # Injected context is never part of the lived conversation — it
     # outranks even its own type, so check it first.
     if rec.get('isMeta'):
@@ -1489,6 +1501,8 @@ def _kind_of(obj):
         return 'agent-send'
     if _is_task_notification(obj):
         return 'agent-reply'
+    if _is_agent_message(obj):
+        return 'agent-peer'
     t = obj.get('type')
     if t:
         return t
@@ -1664,6 +1678,13 @@ def _summarise_message(obj):
         d = _parse_task_notification(_extract_text(content))
         bits = [b for b in (d['task_id'], d['status'], d['summary']) if b]
         return '← ' + ' · '.join(bits) if bits else '← task-notification'
+
+    # Inbound peer message — sender + body instead of the injected
+    # preamble + raw ``<agent-message>`` wrapper.
+    if role == 'user' and _is_agent_message(obj):
+        sender, body = _parse_agent_message(obj)
+        body = _trim(body, 5000)
+        return f'← {sender}: {body}' if sender else f'← {body}'
 
     text = _extract_text(content)
     text = _trim(text, 5000)
@@ -2402,6 +2423,10 @@ def _render_user(obj, bg='0'):
     if _is_task_notification(obj):
         return _render_task_notification(_extract_text(content))
 
+    # Inbound peer message — sender header + the wrapped markdown body.
+    if _is_agent_message(obj):
+        return _render_agent_message(obj)
+
     head = f'{WHITE}{BOLD}▶ user{RESET}'
     chips = []
     if is_meta:
@@ -2454,6 +2479,20 @@ def _render_task_notification(text):
     if d['result']:
         out.append('')
         out.append(_md_voice(d['result']))
+    return '\n'.join(out)
+
+
+def _render_agent_message(obj):
+    """Inbound peer message (another session's SendMessage): a sender
+    header, then the wrapped body rendered as markdown."""
+    sender, body = _parse_agent_message(obj)
+    head = f'{GREEN}{BOLD}← agent-message{RESET}'
+    if sender:
+        head += f'  {MUTE}from{RESET} {sender}'
+    out = [head]
+    if body:
+        out.append('')
+        out.append(_md_voice(body))
     return '\n'.join(out)
 
 
@@ -3576,6 +3615,64 @@ def _is_task_notification(rec):
         return False
     text = _extract_text(msg.get('content', ''))
     return text.lstrip().startswith(_TASK_NOTIFY_PREFIX)
+
+
+# Injected preamble + wrapper of an inbound peer message (another
+# session's SendMessage delivered into this one as a ``user`` record).
+_AGENT_MSG_PREAMBLE = 'Another Claude session sent a message:'
+_AGENT_MSG_RE = re.compile(
+    r'<agent-message\b([^>]*)>\n?(.*?)\n?</agent-message>', re.DOTALL)
+_AGENT_MSG_FROM_RE = re.compile(r'\bfrom="([^"]*)"')
+
+
+def _is_agent_message(rec):
+    """True iff ``rec`` is a ``user`` record carrying an inbound peer
+    message (another session's SendMessage → this one).
+
+    Primary signal: the structured ``origin`` field —
+    ``{"kind": "peer", "from": <sender>, ...}``. LEGACY fallback for
+    transcripts written before ``origin`` existed: the injected text
+    starts with the fixed preamble / ``<agent-message>`` wrapper —
+    remove the text-shape branch once pre-``origin`` transcripts stop
+    mattering.
+    """
+    if not isinstance(rec, dict):
+        return False
+    msg = rec.get('message') if isinstance(rec.get('message'), dict) else {}
+    if (rec.get('type') or msg.get('role')) != 'user':
+        return False
+    origin = rec.get('origin')
+    if isinstance(origin, dict) and origin.get('kind') == 'peer':
+        return True
+    # LEGACY text-shape detection (pre-``origin`` records).
+    text = _extract_text(msg.get('content', '')).lstrip()
+    return (text.startswith(_AGENT_MSG_PREAMBLE)
+            or text.startswith('<agent-message'))
+
+
+def _parse_agent_message(rec):
+    """Peel an inbound peer message into ``(sender, body)``.
+
+    Sender comes from ``origin.from`` when present, else from the
+    wrapper's ``from="…"`` attribute. Body is the markdown inside the
+    ``<agent-message>`` wrapper; a record with neither wrapper nor
+    preamble falls back to its whole text.
+    """
+    msg = rec.get('message') if isinstance(rec.get('message'), dict) else {}
+    text = _extract_text(msg.get('content', ''))
+    origin = rec.get('origin')
+    sender = origin.get('from', '') if isinstance(origin, dict) else ''
+    m = _AGENT_MSG_RE.search(text)
+    if m:
+        if not sender:
+            fm = _AGENT_MSG_FROM_RE.search(m.group(1))
+            sender = fm.group(1) if fm else ''
+        body = m.group(2).strip()
+    else:
+        body = text.strip()
+        if body.startswith(_AGENT_MSG_PREAMBLE):
+            body = body[len(_AGENT_MSG_PREAMBLE):].strip()
+    return sender, body
 
 
 def _fmt_tool_use_send_message(inp):
@@ -5741,13 +5838,13 @@ def _prompt_umbrella_item(jsonl_path, turn_root_line, rec, td):
     # itself + each member (tool-using members collapse into one row).
     n_replies = len(members)
     item_id = ('prompt', jsonl_path, turn_root_line)
-    # A turn opened by a worker→leader task-notification is agent voice,
-    # not a human prompt — relabel its umbrella so the row doesn't
-    # masquerade as one (a SendMessage-only assistant turn can't be a
-    # turn root; only user voice opens turns, so the human-vs-reply
-    # split is the only distinction needed here).
+    # A turn opened by a worker→leader task-notification or an inbound
+    # peer message is agent voice, not a human prompt — relabel its
+    # umbrella so the row doesn't masquerade as one (a SendMessage-only
+    # assistant turn can't be a turn root; only user voice opens turns).
     kind = _kind_of(rec)
-    prefix = '<reply>' if kind == 'agent-reply' else '<prompt>'
+    prefix = {'agent-reply': '<reply>',
+              'agent-peer': '<peer>'}.get(kind, '<prompt>')
     item = Item(
         id=item_id,
         title=f'{prefix}  {summary}',
