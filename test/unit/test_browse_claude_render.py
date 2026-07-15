@@ -4130,6 +4130,27 @@ class TestAttributionAgentTag(unittest.TestCase):
         tag = self.r._row_tag('assistant', rec)
         self.assertEqual(tag, 'assistant')
 
+    def test_row_tag_end_turn_suffix(self):
+        rec = {'type': 'assistant',
+               'message': {'role': 'assistant', 'stop_reason': 'end_turn',
+                           'content': [{'type': 'text', 'text': 'done.'}]}}
+        tag = self.r._row_tag('assistant', rec)
+        self.assertEqual(tag, 'assistant · end_turn')
+
+    def test_row_tag_attribution_and_end_turn(self):
+        rec = {'type': 'assistant', 'attributionAgent': 'general-purpose',
+               'message': {'role': 'assistant', 'stop_reason': 'end_turn',
+                           'content': [{'type': 'text', 'text': 'done.'}]}}
+        tag = self.r._row_tag('assistant', rec)
+        self.assertEqual(tag, 'assistant · general-purpose · end_turn')
+
+    def test_row_tag_tool_use_stop_unaffected(self):
+        rec = {'type': 'assistant',
+               'message': {'role': 'assistant', 'stop_reason': 'tool_use',
+                           'content': [{'type': 'text', 'text': 'hi'}]}}
+        tag = self.r._row_tag('assistant', rec)
+        self.assertEqual(tag, 'assistant')
+
     def test_list_messages_row_carries_attribution_tag(self):
         import json as _json
         import tempfile

@@ -1517,13 +1517,18 @@ def _row_tag(kind, rec):
 
     Adds ``· <attributionAgent>`` to assistant rows inside subagent
     transcripts so the user can see which sub-type produced the turn
-    (e.g. ``assistant · general-purpose``). Other record kinds get the
-    bare kind label.
+    (e.g. ``assistant · general-purpose``), and ``· end_turn`` to the
+    turn-concluding responses so the final word(s) of a turn stand out
+    in the row list. Other record kinds get the bare kind label.
     """
-    attr = rec.get('attributionAgent') if isinstance(rec, dict) else None
-    if attr and kind == 'assistant':
-        return f'{kind} · {attr}'
-    return kind
+    tag = kind
+    if kind == 'assistant' and isinstance(rec, dict):
+        attr = rec.get('attributionAgent')
+        if attr:
+            tag = f'{tag} · {attr}'
+        if _is_end_turn(rec):
+            tag = f'{tag} · end_turn'
+    return tag
 
 
 def _summarise_message(obj):
