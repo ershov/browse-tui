@@ -4334,19 +4334,21 @@ def _render_tool_result(obj, part):
 def _fmt_tool_use_result(tur, raw_content):
     """Pick a shape-specific formatter for ``toolUseResult``.
 
-    The raw-text shapes — a bare string ``tur``, or the fallback to the
+    The raw-text shapes — a bare string ``tur``, a LIST of text parts
+    (MCP tools mirror the content parts there), or the fallback to the
     part's content — frequently carry JSON (MCP tools like Jira), so
-    they run through ``_maybe_json_color`` here; every consumer (the
-    leaf tool_result renderer, the generic and Task umbrellas) gets the
-    colored + nested-decoded form at once.
+    they run through ``_maybe_json_color`` here / in
+    ``_fmt_tur_raw_content``; every consumer (the leaf tool_result
+    renderer, the generic and Task umbrellas) gets the colored +
+    nested-decoded form at once.
     """
     if tur is None:
-        text = _fmt_tur_raw_content(raw_content)
-        colored = _maybe_json_color(text)
-        return colored if colored is not None else text
+        return _fmt_tur_raw_content(raw_content)
     if isinstance(tur, str):
         colored = _maybe_json_color(tur)
         return colored if colored is not None else tur
+    if isinstance(tur, list):
+        return _fmt_tur_raw_content(tur)
     if not isinstance(tur, dict):
         return str(tur)
     keys = set(tur.keys())
@@ -4383,13 +4385,23 @@ def _fmt_tool_use_result(tur, raw_content):
 
 
 def _fmt_tur_raw_content(content):
+    """Raw tool_result content → display text.
+
+    Each text part colors independently when it parses as JSON — MCP
+    results often lead with a JSON payload part followed by prose parts
+    (resource notes), so a check on the JOINED text would fail the
+    parse and leave the JSON part plain.
+    """
     if isinstance(content, str):
-        return content
+        colored = _maybe_json_color(content)
+        return colored if colored is not None else content
     if isinstance(content, list):
         chunks = []
         for p in content:
             if isinstance(p, dict) and p.get('type') == 'text':
-                chunks.append(p.get('text', '') or '')
+                text = p.get('text', '') or ''
+                colored = _maybe_json_color(text)
+                chunks.append(colored if colored is not None else text)
         return '\n'.join(chunks)
     return ''
 

@@ -8916,6 +8916,26 @@ class TestJsonPreviews(unittest.TestCase):
         ])
         self.assertIn('  "a": 1', out)
 
+    def test_multipart_content_colors_json_part_only(self):
+        # MCP results often lead with a JSON payload part followed by
+        # prose parts — each part is checked independently, so the JSON
+        # part pretty-prints while the prose stays raw.
+        out = self.r._fmt_tur_raw_content([
+            {'type': 'text', 'text': '{"success": true, "total": 2}'},
+            {'type': 'text', 'text': '[Resource from jira] saved to x'},
+        ])
+        self.assertIn('  "success": true', out)
+        self.assertIn('[Resource from jira] saved to x', out)
+
+    def test_list_tool_use_result_colors_json_part(self):
+        # A list toolUseResult mirrors the content parts (MCP tools).
+        out = self.r._fmt_tool_use_result([
+            {'type': 'text', 'text': '{"success": true}'},
+            {'type': 'text', 'text': 'note'},
+        ], None)
+        self.assertIn('  "success": true', out)
+        self.assertIn('note', out)
+
 
 class TestQueuedAgentVoice(unittest.TestCase):
     """Inbound agent voice queued while the session was busy lands as a
