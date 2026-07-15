@@ -8880,6 +8880,42 @@ class TestJsonPreviews(unittest.TestCase):
              'message': self._IDLE})
         self.assertIn('  "type": "idle_notification"', out)
 
+    # -- JSON in raw tool_result bodies (leaf + umbrellas) ---------------------
+
+    def test_tool_result_leaf_colors_str_json(self):
+        import json as _json
+        inner = _json.dumps({'key': 'WT-18068', 'id': '3629906'})
+        tur = _json.dumps({'result': inner})
+        rec = {'type': 'user', 'toolUseResult': tur,
+               'message': {'role': 'user', 'content': [
+                   {'type': 'tool_result', 'tool_use_id': 'tu1',
+                    'content': tur},
+               ]}}
+        out = self.r._render_tool_result(
+            rec, rec['message']['content'][0])
+        # Pretty-printed (json path) + the nested string decoded.
+        self.assertIn('  "result":', out)
+        self.assertIn('.result =', out)
+        self.assertIn('"key": "WT-18068"', out)
+
+    def test_tool_result_leaf_plain_text_unchanged(self):
+        rec = {'type': 'user', 'toolUseResult': 'ordinary output',
+               'message': {'role': 'user', 'content': [
+                   {'type': 'tool_result', 'tool_use_id': 'tu1',
+                    'content': 'ordinary output'},
+               ]}}
+        out = self.r._render_tool_result(
+            rec, rec['message']['content'][0])
+        self.assertIn('ordinary output', out)
+
+    def test_raw_content_text_part_colors_json(self):
+        # tur is None → the part's content text is the body; JSON there
+        # colors too.
+        out = self.r._fmt_tool_use_result(None, [
+            {'type': 'text', 'text': '{"a": 1}'},
+        ])
+        self.assertIn('  "a": 1', out)
+
 
 class TestQueuedAgentVoice(unittest.TestCase):
     """Inbound agent voice queued while the session was busy lands as a

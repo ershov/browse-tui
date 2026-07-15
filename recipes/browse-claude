@@ -3749,9 +3749,9 @@ def _fmt_tool_umbrella_task(op, inp, tur, raw_content, is_error):
     body = _fmt_tool_use_result(tur, raw_content) if (
         tur is not None or raw_content) else ''
     if body:
-        colored = _maybe_json_color(body) if isinstance(tur, str) else None
+        # A str tur arrives JSON-colored from _fmt_tool_use_result.
         out.append('')
-        out.append(colored if colored is not None else body)
+        out.append(body)
     return '\n'.join(out)
 
 
@@ -4332,11 +4332,21 @@ def _render_tool_result(obj, part):
 
 
 def _fmt_tool_use_result(tur, raw_content):
-    """Pick a shape-specific formatter for ``toolUseResult``."""
+    """Pick a shape-specific formatter for ``toolUseResult``.
+
+    The raw-text shapes — a bare string ``tur``, or the fallback to the
+    part's content — frequently carry JSON (MCP tools like Jira), so
+    they run through ``_maybe_json_color`` here; every consumer (the
+    leaf tool_result renderer, the generic and Task umbrellas) gets the
+    colored + nested-decoded form at once.
+    """
     if tur is None:
-        return _fmt_tur_raw_content(raw_content)
+        text = _fmt_tur_raw_content(raw_content)
+        colored = _maybe_json_color(text)
+        return colored if colored is not None else text
     if isinstance(tur, str):
-        return tur
+        colored = _maybe_json_color(tur)
+        return colored if colored is not None else tur
     if not isinstance(tur, dict):
         return str(tur)
     keys = set(tur.keys())
