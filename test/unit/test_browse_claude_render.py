@@ -8791,6 +8791,96 @@ class TestAgentPeerMessage(unittest.TestCase):
         self.assertNotIn('<agent-message', out)
 
 
+class TestJsonPreviews(unittest.TestCase):
+    """Agent-exchanged bodies that ARE JSON render JSON-colored (never
+    through markdown), and string fields that themselves parse as JSON
+    unwrap into appended ``<path> =`` sections."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    # -- nested JSON-in-string decode ----------------------------------------
+
+    def test_nested_json_string_appended(self):
+        import json as _json
+        inner = {'id': '3484914', 'key': 'WT-17254'}
+        text = _json.dumps({'result': _json.dumps(inner)})
+        out = self.r._maybe_json_color(text)
+        self.assertIn('.result =', out)
+        self.assertIn('"key": "WT-17254"', out)
+
+    def test_doubly_encoded_json_unwraps(self):
+        import json as _json
+        text = _json.dumps(
+            {'a': _json.dumps({'b': _json.dumps({'c': 1})})})
+        out = self.r._maybe_json_color(text)
+        self.assertIn('.a =', out)
+        self.assertIn('.a.b =', out)
+        self.assertIn('"c": 1', out)
+
+    def test_list_paths_and_empty_containers(self):
+        import json as _json
+        text = _json.dumps(['{"k": 1}', '{}', 'plain'])
+        out = self.r._maybe_json_color(text)
+        self.assertIn('[0] =', out)
+        self.assertIn('"k": 1', out)
+        # Empty decode ({}) and non-JSON strings add no section.
+        self.assertNotIn('[1] =', out)
+        self.assertNotIn('[2] =', out)
+
+    def test_section_cap(self):
+        import json as _json
+        text = _json.dumps({f'k{i:02d}': '{"v": 1}' for i in range(12)})
+        out = self.r._maybe_json_color(text)
+        self.assertEqual(out.count(' ='), self.r._NESTED_JSON_MAX)
+
+    def test_plain_json_has_no_sections(self):
+        out = self.r._maybe_json_color('{"a": 1, "b": [2, 3]}')
+        self.assertNotIn(' =', out)
+
+    def test_non_json_returns_none(self):
+        self.assertIsNone(self.r._maybe_json_color('## markdown'))
+        self.assertIsNone(self.r._maybe_json_color('{not: json'))
+
+    # -- JSON detection in agent-message previews ------------------------------
+
+    _IDLE = ('{"type":"idle_notification","from":"rev",'
+             '"idleReason":"available"}')
+
+    def test_peer_message_json_body(self):
+        rec = {'type': 'user', 'isMeta': True,
+               'origin': {'kind': 'peer', 'from': 'rev'},
+               'message': {'role': 'user', 'content': (
+                   'Another Claude session sent a message:\n'
+                   '<agent-message from="rev">\n'
+                   + self._IDLE + '\n</agent-message>')}}
+        out = self.r._render_agent_message(rec)
+        # 2-space indentation proves the JSON path (raw body is compact).
+        self.assertIn('  "type": "idle_notification"', out)
+
+    def test_peer_message_markdown_body_unchanged(self):
+        rec = {'type': 'user', 'isMeta': True,
+               'origin': {'kind': 'peer', 'from': 'rev'},
+               'message': {'role': 'user', 'content': (
+                   '<agent-message from="rev">\n## Review\nfine\n'
+                   '</agent-message>')}}
+        out = self.r._render_agent_message(rec)
+        self.assertIn('## Review', out)
+
+    def test_task_notification_json_result(self):
+        text = ('<task-notification><status>completed</status>'
+                '<result>' + self._IDLE + '</result></task-notification>')
+        out = self.r._render_task_notification(text)
+        self.assertIn('  "type": "idle_notification"', out)
+
+    def test_outbound_send_message_json_body(self):
+        out = self.r._fmt_tool_use_send_message(
+            {'recipient': 'worker', 'summary': 's',
+             'message': self._IDLE})
+        self.assertIn('  "type": "idle_notification"', out)
+
+
 class TestQueuedAgentVoice(unittest.TestCase):
     """Inbound agent voice queued while the session was busy lands as a
     ``queue-operation`` enqueue whose ``content`` is the raw wrapper

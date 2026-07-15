@@ -3010,13 +3010,14 @@ def _render_task_notification(text):
         out.append(f'{MUTE}output:{RESET} {d["output_file"]}')
     if d['result']:
         out.append('')
-        out.append(_md_voice(d['result']))
+        out.append(_render_message_body(d['result']))
     return '\n'.join(out)
 
 
 def _render_agent_message(obj):
     """Inbound peer message (another session's SendMessage): a sender
-    header, then the wrapped body rendered as markdown."""
+    header, then the wrapped body — JSON-colored when the body IS JSON
+    (idle notifications, protocol messages), markdown otherwise."""
     sender, body = _parse_agent_message(obj)
     head = f'{GREEN}{BOLD}← agent-message{RESET}'
     if sender:
@@ -3024,7 +3025,7 @@ def _render_agent_message(obj):
     out = [head]
     if body:
         out.append('')
-        out.append(_md_voice(body))
+        out.append(_render_message_body(body))
     return '\n'.join(out)
 
 
@@ -3192,6 +3193,44 @@ def _json_color(text):
         return f'{GRAY}{text}{RESET}'
 
 
+# Bounds for the nested JSON-in-string decode: how many decoded
+# sections a preview may append, and how many decode levels deep the
+# walk follows (a decoded value can itself contain JSON strings —
+# Jira-style results nest twice).
+_NESTED_JSON_MAX = 8
+_NESTED_JSON_DEPTH = 3
+
+
+def _nested_json_strings(value, path='', out=None, depth=0):
+    """Collect ``(path, parsed)`` for string leaves that parse as JSON.
+
+    Walks dicts/lists; a string leaf that parses to a NON-EMPTY dict or
+    list is recorded under its dotted path (``.result``, ``.a[0].b``)
+    and the walk recurses into the decoded value at ``depth + 1`` so
+    doubly-encoded payloads unwrap too. Bounded by ``_NESTED_JSON_MAX``
+    sections and ``_NESTED_JSON_DEPTH`` decode levels.
+    """
+    if out is None:
+        out = []
+    if depth > _NESTED_JSON_DEPTH or len(out) >= _NESTED_JSON_MAX:
+        return out
+    if isinstance(value, dict):
+        for k, v in value.items():
+            _nested_json_strings(v, f'{path}.{k}', out, depth)
+    elif isinstance(value, list):
+        for i, v in enumerate(value):
+            _nested_json_strings(v, f'{path}[{i}]', out, depth)
+    elif isinstance(value, str) and re.match(r'^\s*[\[{]', value):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return out
+        if isinstance(parsed, (dict, list)) and parsed:
+            out.append((path, parsed))
+            _nested_json_strings(parsed, path, out, depth + 1)
+    return out
+
+
 def _maybe_json_color(text):
     """Pretty-print + color ``text`` when it parses as JSON, else ``None``.
 
@@ -3199,6 +3238,10 @@ def _maybe_json_color(text):
     full ``json.loads`` so non-JSON text bails immediately. On success the
     parsed value is re-dumped with a 2-space indent and run through
     ``_json_color``; otherwise the caller keeps ``text`` as-is.
+
+    String fields that THEMSELVES parse as JSON (tools like Jira return
+    JSON-encoded strings inside JSON) are appended decoded after the main
+    block, each under a small ``<path> =`` header.
     """
     if not isinstance(text, str) or not re.match(r'^\s*[\[{]', text):
         return None
@@ -3206,7 +3249,12 @@ def _maybe_json_color(text):
         parsed = json.loads(text)
     except (TypeError, ValueError):
         return None
-    return _json_color(json.dumps(parsed, indent=2, ensure_ascii=False))
+    out = [_json_color(json.dumps(parsed, indent=2, ensure_ascii=False))]
+    for path, sub in _nested_json_strings(parsed):
+        out.append(f'\n{MUTE}{path} ={RESET}')
+        out.append(_json_color(json.dumps(sub, indent=2,
+                                          ensure_ascii=False)))
+    return '\n'.join(out)
 
 
 def _bash_color(cmd):
@@ -4226,7 +4274,7 @@ def _parse_agent_message(rec):
 
 
 def _fmt_tool_use_send_message(inp):
-    """Outbound leader→worker message: header line + markdown body."""
+    """Outbound leader→worker message: header line + JSON/markdown body."""
     recipient, summary, message = _send_message_fields(inp)
     head = f'{BOLD}→ {recipient}{RESET}'
     if summary:
@@ -4234,7 +4282,7 @@ def _fmt_tool_use_send_message(inp):
     out = [head]
     if message:
         out.append('')
-        out.append(_md_voice(message))
+        out.append(_render_message_body(message))
     return '\n'.join(out)
 
 
@@ -4497,8 +4545,10 @@ def _fmt_tur_skill(tur):
 
 
 def _render_message_body(message):
-    """Render a SendMessage body: JSON-colored when it parses as JSON,
-    else through ``_md_voice`` (the message is markdown otherwise)."""
+    """Render an agent-exchanged body: JSON-colored when it parses as
+    JSON (nested JSON-strings decoded too), else through ``_md_voice``
+    (the body is markdown otherwise). Shared by SendMessage in both
+    directions, task-notification results and peer messages."""
     colored = _maybe_json_color(message)
     return colored if colored is not None else _md_voice(message)
 
