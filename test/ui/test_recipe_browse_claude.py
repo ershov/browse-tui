@@ -1778,35 +1778,31 @@ class TestBrowseClaude(unittest.TestCase):
                                  'got: ' + cap[-1200:])
                 t.send('q')
 
-    def test_tree_sendmessage_reply_umbrella_not_prompt(self):
-        """Tree mode: the task-notification turn umbrella reads ``<reply>``.
+    def test_tree_sendmessage_reply_packs_under_prompt(self):
+        """Tree mode: the inbound task-notification does NOT root a turn.
 
-        The inbound task-notification opens its own turn (so the leader's
-        follow-up nests under it), but its umbrella must NOT masquerade as
-        a human ``<prompt>`` — it carries the ``<reply>`` prefix and the
-        ``agent-reply`` kind. The genuine human turn keeps ``<prompt>``.
+        The reply belongs to the human request that spawned it, so the
+        session's only root umbrella is the human ``<prompt>``; the
+        ``agent-reply`` row with its ``←`` one-liner sits under it as a
+        turn member (no ``<reply>`` root umbrella).
         """
         with tempfile.TemporaryDirectory() as tmp:
             sess = self._make_sendmessage_fixture(tmp)
             with TmuxFixture(cols=160, rows=40, env=self._launch_env(tmp)) as t:
-                t.launch(_BIN, '--run-py', _RECIPE, '--tree')
-                t.wait_for('/home/test/sendmsg', timeout=3.0)
-                t.send('Right')                  # expand project
-                t.wait_for('sendmsg-sess', timeout=3.0)
-                t.send('Down')                   # cursor → session row
-                t.send('Right')                  # expand session — one level
-                # The session's direct children are the two turn roots:
-                # the human ``<prompt>`` and the task-notification turn.
-                cap = t.wait_for('<reply>', timeout=3.0)
-                # The agent-reply turn umbrella reads ``<reply>``, not
-                # ``<prompt>``, and surfaces its ``←`` one-liner.
-                self.assertIn('<reply>', cap,
-                              'task-notification turn should use the '
-                              '<reply> prefix; got: ' + cap[-1400:])
-                self.assertIn('PROBE_REPLY_SUMMARY', cap)
-                # The genuine human turn keeps the ``<prompt>`` prefix.
+                t.launch(_BIN, '--run-py', _RECIPE, '--detail', 'voice',
+                         '--tree', '--file', sess)
+                # Latest-voice landing reveals the reply row (and thereby
+                # its ancestor chain — the human <prompt> umbrella).
+                cap = t.wait_for('PROBE_REPLY_SUMMARY', timeout=3.0)
                 self.assertIn('<prompt>', cap,
-                              'human turn should keep <prompt>; '
+                              'human turn should root as <prompt>; '
+                              'got: ' + cap[-1400:])
+                self.assertNotIn('<reply>', cap,
+                                 'task-notification must not root its own '
+                                 'turn; got: ' + cap[-1400:])
+                # The reply row carries the agent-reply kind tag.
+                self.assertIn('agent-reply', cap,
+                              'reply row should tag as agent-reply; '
                               'got: ' + cap[-1400:])
                 t.send('q')
 
@@ -1816,7 +1812,8 @@ class TestBrowseClaude(unittest.TestCase):
         Drilling into the human turn reveals the ``<tool:SendMessage>``
         umbrella; its kind is ``agent-send`` and the outbound header
         renders in its preview. The inbound reply, an ``agent-reply`` row,
-        is NOT re-parented under that umbrella — it stays a sibling turn.
+        is NOT re-parented under that umbrella — it is a direct member of
+        the human turn.
         """
         with tempfile.TemporaryDirectory() as tmp:
             sess = self._make_sendmessage_fixture(tmp)

@@ -2712,6 +2712,180 @@ class TestScanTree(unittest.TestCase):
             os.unlink(path)
 
 
+class TestAgentVoicePacking(unittest.TestCase):
+    """Inbound agent voice (task-notification / peer message) arriving
+    after a turn closed must NOT root a new turn — it re-opens the last
+    human turn, so the reply and the leader's handling of it (up to and
+    including the next end_turn) fold under the request that spawned
+    them."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _write_jsonl(self, records):
+        import json as _json
+        import tempfile
+        f = tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False,
+                                        prefix='abcd1234-')
+        for r in records:
+            f.write(_json.dumps(r) + '\n')
+        f.close()
+        return f.name
+
+    _NOTIFY = (
+        '<task-notification>\n'
+        '<task-id>a123</task-id>\n'
+        '<status>completed</status>\n'
+        '<summary>worker done</summary>\n'
+        '<result>All findings addressed.</result>\n'
+        '</task-notification>'
+    )
+
+    _PEER = (
+        'Another Claude session sent a message:\n'
+        '<teammate-message teammate_id="fix-worker">\n'
+        'Fix landed on main.\n'
+        '</teammate-message>'
+    )
+
+    def _human(self, uuid, text):
+        return {'type': 'user', 'uuid': uuid,
+                'message': {'role': 'user', 'content': text}}
+
+    def _end_turn(self, uuid, text):
+        return {'type': 'assistant', 'uuid': uuid,
+                'message': {'role': 'assistant', 'stop_reason': 'end_turn',
+                            'content': [{'type': 'text', 'text': text}]}}
+
+    def _turn_close(self):
+        return {'type': 'system', 'subtype': 'turn_duration',
+                'durationMs': 1, 'messageCount': 1}
+
+    def _agent_voice(self, uuid, text):
+        return {'type': 'user', 'uuid': uuid,
+                'message': {'role': 'user', 'content': text}}
+
+    def test_notification_reopens_last_human_turn(self):
+        # Mirrors the two-final-responses shape: prompt → end_turn →
+        # turn closes → notification arrives → second end_turn. All of
+        # it belongs to the one human turn.
+        path = self._write_jsonl([
+            self._human('u1', 'check the switchover'),
+            self._end_turn('a1', 'Ticket #153 dispatched.'),
+            self._turn_close(),
+            self._agent_voice('n1', self._NOTIFY),
+            self._end_turn('a2', 'All good now.'),
+        ])
+        try:
+            td = self.r._scan_tree(path)
+            self.assertEqual(len(td.roots_in_order), 1)
+            self.assertEqual(td.roots_in_order[0]['rec']['uuid'], 'u1')
+            self.assertEqual(
+                [r['uuid'] for r in td.turn_direct['u1']
+                 if r.get('uuid')],
+                ['a1', 'n1', 'a2'],
+            )
+            # The reply + follow-up hang off the <prompt> umbrella.
+            self.assertEqual(td.parent_id_of[3], ('prompt', path, 0))
+            self.assertEqual(td.parent_id_of[4], ('prompt', path, 0))
+        finally:
+            os.unlink(path)
+
+    def test_peer_message_reopens_last_human_turn(self):
+        path = self._write_jsonl([
+            self._human('u1', 'check the switchover'),
+            self._end_turn('a1', 'Ticket #153 dispatched.'),
+            self._turn_close(),
+            self._agent_voice('p1', self._PEER),
+            self._end_turn('a2', 'All good now.'),
+        ])
+        try:
+            td = self.r._scan_tree(path)
+            self.assertEqual(len(td.roots_in_order), 1)
+            self.assertEqual(
+                [r['uuid'] for r in td.turn_direct['u1']
+                 if r.get('uuid')],
+                ['a1', 'p1', 'a2'],
+            )
+        finally:
+            os.unlink(path)
+
+    def test_leading_agent_voice_falls_back_to_rooting(self):
+        # No prior human turn (resumed/truncated transcript): the reply
+        # keeps today's behaviour and roots its own turn.
+        path = self._write_jsonl([
+            self._agent_voice('n1', self._NOTIFY),
+            self._end_turn('a1', 'Handled.'),
+        ])
+        try:
+            td = self.r._scan_tree(path)
+            self.assertEqual(len(td.roots_in_order), 1)
+            self.assertEqual(td.roots_in_order[0]['rec']['uuid'], 'n1')
+            roots = self.r._list_tree_roots(path)
+            self.assertTrue(roots[0].title.startswith('<reply>'))
+        finally:
+            os.unlink(path)
+
+    def test_mid_turn_notification_folds_into_open_turn(self):
+        # No turn_duration yet — the notification arrives mid-turn and
+        # folds in like any other member (no re-open needed).
+        path = self._write_jsonl([
+            self._human('u1', 'do the thing'),
+            self._agent_voice('n1', self._NOTIFY),
+            self._end_turn('a1', 'Done.'),
+        ])
+        try:
+            td = self.r._scan_tree(path)
+            self.assertEqual(len(td.roots_in_order), 1)
+            self.assertEqual(
+                [r['uuid'] for r in td.turn_direct['u1']],
+                ['n1', 'a1'],
+            )
+        finally:
+            os.unlink(path)
+
+    def test_next_human_prompt_still_roots_a_new_turn(self):
+        # The re-opened turn ends like any other: a fresh human prompt
+        # opens its own root.
+        path = self._write_jsonl([
+            self._human('u1', 'first'),
+            self._turn_close(),
+            self._agent_voice('n1', self._NOTIFY),
+            self._end_turn('a1', 'Handled.'),
+            self._turn_close(),
+            self._human('u2', 'second'),
+        ])
+        try:
+            td = self.r._scan_tree(path)
+            self.assertEqual(
+                [e['rec']['uuid'] for e in td.roots_in_order],
+                ['u1', 'u2'],
+            )
+        finally:
+            os.unlink(path)
+
+    def test_is_turn_root_excludes_agent_voice(self):
+        notify = self._agent_voice('n1', self._NOTIFY)
+        peer = self._agent_voice('p1', self._PEER)
+        human = self._human('u1', 'hello')
+        self.assertFalse(self.r._is_turn_root(notify))
+        self.assertFalse(self.r._is_turn_root(peer))
+        self.assertTrue(self.r._is_turn_root(human))
+
+    def test_levels_summary_shows_request_and_final_responses(self):
+        # Level 1 = the human request + every end_turn response; the
+        # cross-agent record itself is voice tier (2).
+        notify = self._agent_voice('n1', self._NOTIFY)
+        self.assertEqual(self.r._record_min_level(notify), 2)
+        peer = self._agent_voice('p1', self._PEER)
+        self.assertEqual(self.r._record_min_level(peer), 2)
+        self.assertEqual(
+            self.r._record_min_level(self._end_turn('a1', 'All good.')), 1)
+        self.assertEqual(
+            self.r._record_min_level(self._human('u1', 'hello')), 1)
+
+
 class TestTreeListings(unittest.TestCase):
     """Tree-mode listings: _list_tree_roots / _list_prompt_children /
     _list_tool_children / _list_span_records / get_children dispatch."""

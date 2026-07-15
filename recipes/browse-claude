@@ -4828,15 +4828,29 @@ class _TreeData:
         self.latest_voice_line = None
 
 
+def _is_inbound_agent_voice(rec):
+    """True iff ``rec`` is inbound agent voice — a worker's
+    ``<task-notification>`` reply or a peer session's message. Both are
+    ``user``-shaped records that nobody typed."""
+    return _is_task_notification(rec) or _is_agent_message(rec)
+
+
 def _is_turn_root(rec):
-    """A turn root is a fresh user prompt — text content, not synthetic."""
+    """A turn root is a fresh user prompt — text content, not synthetic.
+
+    Inbound agent voice is excluded even though it is user-shaped voice:
+    a worker's reply or a peer's message belongs to the human request
+    that spawned it, so ``_fold_record`` re-opens the last human turn
+    for it instead of letting it masquerade as a new prompt (falling
+    back to rooting only when the file has no prior turn).
+    """
     if not isinstance(rec, dict):
         return False
     if rec.get('type') != 'user':
         return False
     if rec.get('isMeta'):
         return False
-    return _is_voice(rec)
+    return _is_voice(rec) and not _is_inbound_agent_voice(rec)
 
 
 def _is_turn_close(rec):
@@ -4857,7 +4871,8 @@ class _ScanCursor:
     or tick 1 was building.
     """
 
-    __slots__ = ('turn_open_uuid', 'tool_owner', 'span_start')
+    __slots__ = ('turn_open_uuid', 'tool_owner', 'span_start',
+                 'last_turn_uuid')
 
     def __init__(self):
         self.turn_open_uuid = None
@@ -4867,6 +4882,9 @@ class _ScanCursor:
         # Line number of the first record of the currently-open span,
         # or None when not inside a span.
         self.span_start = None
+        # uuid of the most recent turn root — survives turn close so
+        # inbound agent voice arriving between turns can re-open it.
+        self.last_turn_uuid = None
 
 
 def _fold_record(td, cur, rec, n, path):
@@ -4891,14 +4909,32 @@ def _fold_record(td, cur, rec, n, path):
     if rec.get('forkedFrom'):
         rec['_tree_forked_from'] = rec['forkedFrom']
 
+    is_root = _is_turn_root(rec)
+
+    # --- inbound agent voice with no open turn: the reply belongs to
+    # the human request that spawned it, so re-open the last turn — the
+    # reply AND the leader's handling of it (until the next
+    # turn_duration) fold under that prompt. A file with no prior turn
+    # (resumed/truncated transcript) falls back to rooting it, keeping
+    # the <reply>/<peer> umbrella.
+    if (not is_root and cur.turn_open_uuid is None
+            and _is_inbound_agent_voice(rec)):
+        if (cur.last_turn_uuid is not None
+                and cur.last_turn_uuid in td.turn_direct):
+            cur.turn_open_uuid = cur.last_turn_uuid
+            cur.tool_owner = {}
+        else:
+            is_root = True
+
     # --- turn root: opens a new <prompt> umbrella, closes any open span.
-    if _is_turn_root(rec):
+    if is_root:
         if cur.span_start is not None:
             # Span closed by this turn root; the records list stored
             # in td.span_records is live-shared with td.roots_in_order
             # so no copy needed here.
             cur.span_start = None
         cur.turn_open_uuid = uuid
+        cur.last_turn_uuid = uuid
         cur.tool_owner = {}
         if uuid is not None:
             td.turn_direct[uuid] = []
