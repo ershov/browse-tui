@@ -8454,6 +8454,22 @@ class TestAgentPeerMessage(unittest.TestCase):
                              'senderTaskId': 'amd-menu-reviewer-cfa01d62'}
         return rec
 
+    # The older wrapper spelling, as written by pre-``origin`` Claude
+    # Code versions: no origin field, no isMeta stamp, tag is
+    # ``teammate-message`` and the sender attribute is ``teammate_id``.
+    _TEAMMATE_WRAPPED = (
+        'Another Claude session sent a message:\n'
+        '<teammate-message teammate_id="switchover-fix-worker" color="blue">\n'
+        + _BODY + '\n'
+        '</teammate-message>'
+    )
+
+    def _teammate_rec(self):
+        return {
+            'type': 'user',
+            'message': {'role': 'user', 'content': self._TEAMMATE_WRAPPED},
+        }
+
     def _human_rec(self):
         return {
             'type': 'user',
@@ -8496,6 +8512,18 @@ class TestAgentPeerMessage(unittest.TestCase):
             self._peer_rec(origin=False))
         self.assertEqual(sender, 'md-menu-reviewer')
         self.assertIn('Review finished.', body)
+
+    def test_detect_teammate_wrapper_legacy(self):
+        # LEGACY <teammate-message> spelling: no origin, no isMeta.
+        self.assertTrue(self.r._is_agent_message(self._teammate_rec()))
+        self.assertEqual(self.r._kind_of(self._teammate_rec()), 'agent-peer')
+
+    def test_parse_teammate_wrapper_legacy(self):
+        sender, body = self.r._parse_agent_message(self._teammate_rec())
+        self.assertEqual(sender, 'switchover-fix-worker')
+        self.assertIn('Review finished.', body)
+        self.assertNotIn('<teammate-message', body)
+        self.assertNotIn('Another Claude session', body)
 
     # -- _kind_of / stripe / tag style ---------------------------------------
 

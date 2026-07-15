@@ -3619,10 +3619,13 @@ def _is_task_notification(rec):
 
 # Injected preamble + wrapper of an inbound peer message (another
 # session's SendMessage delivered into this one as a ``user`` record).
+# The wrapper tag has two known spellings: ``<agent-message from="…">``
+# and the older ``<teammate-message teammate_id="…">``.
 _AGENT_MSG_PREAMBLE = 'Another Claude session sent a message:'
 _AGENT_MSG_RE = re.compile(
-    r'<agent-message\b([^>]*)>\n?(.*?)\n?</agent-message>', re.DOTALL)
-_AGENT_MSG_FROM_RE = re.compile(r'\bfrom="([^"]*)"')
+    r'<(agent-message|teammate-message)\b([^>]*)>\n?(.*?)\n?</\1>',
+    re.DOTALL)
+_AGENT_MSG_FROM_RE = re.compile(r'\b(?:from|teammate_id)="([^"]*)"')
 
 
 def _is_agent_message(rec):
@@ -3632,9 +3635,9 @@ def _is_agent_message(rec):
     Primary signal: the structured ``origin`` field —
     ``{"kind": "peer", "from": <sender>, ...}``. LEGACY fallback for
     transcripts written before ``origin`` existed: the injected text
-    starts with the fixed preamble / ``<agent-message>`` wrapper —
-    remove the text-shape branch once pre-``origin`` transcripts stop
-    mattering.
+    starts with the fixed preamble / an ``<agent-message>`` or
+    ``<teammate-message>`` wrapper — remove the text-shape branch once
+    pre-``origin`` transcripts stop mattering.
     """
     if not isinstance(rec, dict):
         return False
@@ -3647,15 +3650,16 @@ def _is_agent_message(rec):
     # LEGACY text-shape detection (pre-``origin`` records).
     text = _extract_text(msg.get('content', '')).lstrip()
     return (text.startswith(_AGENT_MSG_PREAMBLE)
-            or text.startswith('<agent-message'))
+            or text.startswith('<agent-message')
+            or text.startswith('<teammate-message'))
 
 
 def _parse_agent_message(rec):
     """Peel an inbound peer message into ``(sender, body)``.
 
     Sender comes from ``origin.from`` when present, else from the
-    wrapper's ``from="…"`` attribute. Body is the markdown inside the
-    ``<agent-message>`` wrapper; a record with neither wrapper nor
+    wrapper's ``from="…"`` / ``teammate_id="…"`` attribute. Body is the
+    markdown inside the wrapper; a record with neither wrapper nor
     preamble falls back to its whole text.
     """
     msg = rec.get('message') if isinstance(rec.get('message'), dict) else {}
@@ -3665,9 +3669,9 @@ def _parse_agent_message(rec):
     m = _AGENT_MSG_RE.search(text)
     if m:
         if not sender:
-            fm = _AGENT_MSG_FROM_RE.search(m.group(1))
+            fm = _AGENT_MSG_FROM_RE.search(m.group(2))
             sender = fm.group(1) if fm else ''
-        body = m.group(2).strip()
+        body = m.group(3).strip()
     else:
         body = text.strip()
         if body.startswith(_AGENT_MSG_PREAMBLE):
