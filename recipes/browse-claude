@@ -432,6 +432,210 @@ def _find_session_by_pid(pid):
     return _find_session_by_id(data.get('sessionId'))
 
 
+# ---- agent teams -----------------------------------------------------------
+#
+# A session that spawns *named* agents via the Agent tool (team workers)
+# gets a team: ``~/.claude/teams/<teamName>/config.json`` holds the roster
+# — ``leadSessionId`` plus one member entry per agent ({name, agentType,
+# isActive, …}). Each worker runs as its own plain session .jsonl in the
+# same project dir; the only linkage on its records is the
+# ``teamName`` / ``agentName`` stamped a few lines into the file. Workers
+# never write ``~/.claude/sessions/<pid>.json``, so team membership is
+# also the only liveness signal for them.
+
+_TEAMS_INDEX = {}   # teamName → {'lead': leadSessionId, 'members': {name: m}}
+
+
+def _claude_teams_dir():
+    """Sibling of CLAUDE_ROOT that holds per-team rosters."""
+    return os.path.join(
+        os.environ.get('HOME', os.path.expanduser('~')),
+        '.claude', 'teams',
+    )
+
+
+def _scan_teams():
+    """Refresh ``_TEAMS_INDEX`` from ``~/.claude/teams/*/config.json``."""
+    _TEAMS_INDEX.clear()
+    tdir = _claude_teams_dir()
+    if not os.path.isdir(tdir):
+        return
+    try:
+        names = os.listdir(tdir)
+    except OSError:
+        return
+    for name in names:
+        cfg_path = os.path.join(tdir, name, 'config.json')
+        try:
+            with open(cfg_path, 'r', encoding='utf-8', errors='replace') as f:
+                cfg = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(cfg, dict):
+            continue
+        members = {}
+        for m in cfg.get('members') or []:
+            if isinstance(m, dict) and m.get('name'):
+                members[m['name']] = m
+        _TEAMS_INDEX[cfg.get('name') or name] = {
+            'lead': cfg.get('leadSessionId') or '',
+            'members': members,
+        }
+
+
+# Byte-regex head peek for the team fields — no JSON parse, mirrors
+# ``_session_cwds``. The fields appear within the first few records, so
+# one bounded read is enough.
+_TEAM_NAME_RE = re.compile(rb'"teamName"\s*:\s*"([^"]*)"')
+_AGENT_NAME_RE = re.compile(rb'"agentName"\s*:\s*"([^"]*)"')
+_WORKER_HEAD_BYTES = 65536
+_WORKER_META_CACHE = {}  # path → ((size, mtime), (team, agent) | None)
+
+
+def _worker_meta(session_jsonl_path):
+    """``(teamName, agentName)`` stamped in the transcript head, or None.
+
+    A positive hit is immutable (the head never changes once written);
+    a negative one is re-checked whenever the file's size/mtime moves
+    (a freshly-created worker file grows its head in the first ticks).
+    """
+    try:
+        st = os.stat(session_jsonl_path)
+    except OSError:
+        return None
+    key = (st.st_size, st.st_mtime)
+    cached = _WORKER_META_CACHE.get(session_jsonl_path)
+    if cached is not None and (cached[1] is not None or cached[0] == key):
+        return cached[1]
+    meta = None
+    try:
+        with open(session_jsonl_path, 'rb') as f:
+            head = f.read(_WORKER_HEAD_BYTES)
+    except OSError:
+        head = b''
+    tm = _TEAM_NAME_RE.search(head)
+    am = _AGENT_NAME_RE.search(head)
+    if tm and am:
+        try:
+            meta = (tm.group(1).decode('utf-8'),
+                    am.group(1).decode('utf-8'))
+        except UnicodeDecodeError:
+            meta = None
+    _WORKER_META_CACHE[session_jsonl_path] = (key, meta)
+    return meta
+
+
+def _worker_lead_jsonl(session_jsonl_path):
+    """For a team-worker transcript, its lead session's sibling .jsonl.
+
+    Lead resolution: the team's ``leadSessionId`` from the roster when
+    present, else the ``session-<8-hex>`` naming convention the
+    auto-generated team names carry (prefix-match against the sibling
+    session files). Returns None when this session isn't a worker, IS
+    its own team's lead, or the lead's .jsonl isn't in the same project
+    dir.
+    """
+    meta = _worker_meta(session_jsonl_path)
+    if not meta:
+        return None
+    team, _agent = meta
+    own_sid = os.path.basename(session_jsonl_path)[:-len('.jsonl')]
+    proj_dir = os.path.dirname(session_jsonl_path)
+    entry = _TEAMS_INDEX.get(team)
+    lead = (entry or {}).get('lead') or ''
+    if not lead and team.startswith('session-'):
+        prefix = team[len('session-'):]
+        if prefix:
+            try:
+                names = os.listdir(proj_dir)
+            except OSError:
+                names = []
+            for n in sorted(names):
+                if (n.endswith('.jsonl') and n.startswith(prefix)
+                        and n[:-len('.jsonl')] != own_sid):
+                    lead = n[:-len('.jsonl')]
+                    break
+    if not lead or lead == own_sid:
+        return None
+    p = os.path.join(proj_dir, lead + '.jsonl')
+    return p if os.path.isfile(p) else None
+
+
+def _worker_running_member(session_jsonl_path):
+    """The live roster entry for a team-worker transcript, or None.
+
+    A worker counts as live iff its roster entry says ``isActive`` AND
+    the team's lead session process is alive — roster files linger
+    after teardown/crash, so the leader's own liveness is the
+    staleness gate.
+    """
+    meta = _worker_meta(session_jsonl_path)
+    if not meta:
+        return None
+    team, agent = meta
+    entry = _TEAMS_INDEX.get(team)
+    if not entry:
+        return None
+    member = entry['members'].get(agent)
+    if not (isinstance(member, dict) and member.get('isActive')):
+        return None
+    if entry['lead'] not in _RUNNING_INDEX:
+        return None
+    return member
+
+
+def _team_name_of_lead(lead_sid):
+    """The team a lead session owns: roster first, then the
+    ``session-<8-hex>`` naming convention auto-created teams use."""
+    for team, entry in _TEAMS_INDEX.items():
+        if entry.get('lead') == lead_sid:
+            return team
+    return f'session-{lead_sid[:8]}'
+
+
+def _team_workers_for_session(session_jsonl_path):
+    """``[(agent_name, worker_jsonl)]`` for the team this session leads.
+
+    Scans the sibling session files' head stamps — the roster carries
+    no session ids, so the worker transcripts themselves are the only
+    mapping. When a name was reused (a respawn under the same name
+    starts a fresh transcript) the newest file wins; older ones stay
+    plain top-level sessions.
+    """
+    lead_sid = os.path.basename(session_jsonl_path)[:-len('.jsonl')]
+    proj_dir = os.path.dirname(session_jsonl_path)
+    team = _team_name_of_lead(lead_sid)
+    try:
+        names = os.listdir(proj_dir)
+    except OSError:
+        return []
+    best = {}   # agent_name → (mtime, path)
+    for n in names:
+        if not n.endswith('.jsonl') or n[:-len('.jsonl')] == lead_sid:
+            continue
+        p = os.path.join(proj_dir, n)
+        meta = _worker_meta(p)
+        if not meta or meta[0] != team:
+            continue
+        try:
+            m = os.stat(p).st_mtime
+        except OSError:
+            continue
+        prev = best.get(meta[1])
+        if prev is None or m > prev[0]:
+            best[meta[1]] = (m, p)
+    return sorted((name, mp[1]) for name, mp in best.items())
+
+
+def _find_worker_jsonl(session_jsonl_path, worker_name):
+    """The newest worker transcript named ``worker_name`` in the team
+    led by this session, or None."""
+    for name, p in _team_workers_for_session(session_jsonl_path):
+        if name == worker_name:
+            return p
+    return None
+
+
 # ---- get_children: dispatches by id tag ----------------------------------
 #
 # The Browser passes the raw item id back into ``get_children``. Every id is a
@@ -628,8 +832,12 @@ def _session_item(full, st=None):
         count = 0
     sid = os.path.basename(full)[:-len('.jsonl')]
     running_meta = _RUNNING_INDEX.get(sid)
+    # Team workers never write a ``sessions/<pid>.json`` — their
+    # liveness comes from the team roster instead.
+    worker_meta = _worker_meta(full)
+    worker_member = _worker_running_member(full) if worker_meta else None
     # --running: hide sessions whose claude process isn't alive.
-    if _RUNNING_ONLY and not running_meta:
+    if _RUNNING_ONLY and not running_meta and worker_member is None:
         return None
     n_subs = _count_subagents(full)
     tag = f'{count} msg'
@@ -638,6 +846,9 @@ def _session_item(full, st=None):
     tag += f' · {_human_time(st.st_mtime)}'
     if running_meta:
         tag = f'pid {running_meta["pid"]} · ' + tag
+    elif worker_meta:
+        live = 'live · ' if worker_member is not None else ''
+        tag = f'{worker_meta[1]} · {live}' + tag
     item = Item(
         id=('session', full),
         title=sid,
@@ -648,7 +859,8 @@ def _session_item(full, st=None):
         # directly from the command line.
         scope_title=full,
         tag=tag,
-        tag_style=('green' if running_meta else 'dim'),
+        tag_style=('green' if (running_meta or worker_member is not None)
+                   else 'dim'),
         has_children=count > 0 or n_subs > 0,
         # A bare session row anchors a whole other file — a
         # self-contained foreign subtree. ``boundary`` is what the
@@ -664,6 +876,9 @@ def _session_item(full, st=None):
     item.mtime = st.st_mtime
     item.pid = running_meta['pid'] if running_meta else None
     item.status = running_meta.get('status') if running_meta else None
+    item.team_name = worker_meta[0] if worker_meta else None
+    item.agent_name = worker_meta[1] if worker_meta else None
+    item.worker_live = worker_member is not None
     return item
 
 
@@ -680,6 +895,28 @@ def _list_sessions(project_dir):
         item = _session_item(full)
         if item is not None:
             out.append(item)
+    # Fold team workers under their lead session: a linked worker
+    # renders inside the lead's subtree (its rows are keyed by the same
+    # ids), so its top-level row must go — double placement would
+    # couple expansion state across the two subtrees. Workers whose
+    # lead .jsonl isn't in this dir, or older transcripts from a reused
+    # name, stay visible as plain sessions.
+    linked = set()
+    by_lead = {}
+    for it in out:
+        if getattr(it, 'agent_name', None):
+            lead = _worker_lead_jsonl(it.id[1])
+            if lead:
+                by_lead.setdefault(lead, []).append(it)
+    for workers in by_lead.values():
+        newest = {}
+        for it in workers:
+            prev = newest.get(it.agent_name)
+            if prev is None or it.mtime > prev.mtime:
+                newest[it.agent_name] = it
+        linked.update(it.id[1] for it in newest.values())
+    if linked:
+        out = [it for it in out if it.id[1] not in linked]
     out.sort(key=lambda it: -it.mtime)
     return out
 
@@ -892,6 +1129,11 @@ def _resolve_agent_jsonl(session_jsonl_path, agent_id):
         p = os.path.join(d, name)
         if os.path.isfile(p):
             return p
+    # Team worker: ``agent_id`` is the worker's name, its transcript a
+    # sibling session .jsonl.
+    p = _find_worker_jsonl(session_jsonl_path, agent_id)
+    if p:
+        return p
     return os.path.join(_subagents_dir(session_jsonl_path), name)
 
 
@@ -913,13 +1155,14 @@ def _count_subagents(session_jsonl_path):
         except OSError:
             return set()
 
+    n_workers = len(_team_workers_for_session(session_jsonl_path))
     colocated = _agent_ids(_subagents_dir(session_jsonl_path))
     if colocated:
-        return len(colocated)
+        return len(colocated) + n_workers
     ids = set()
     for sub_dir in _candidate_subagents_dirs(session_jsonl_path):
         ids |= _agent_ids(sub_dir)
-    return len(ids)
+    return len(ids) + n_workers
 
 
 def _read_subagent_meta(meta_path):
@@ -1007,6 +1250,51 @@ def _list_subagents_for_session(session_jsonl_path):
             if bg is not None:
                 item.row_bg = bg
             out.append(item)
+    # Team workers: named agents spawned via the Agent tool run as
+    # sibling *sessions*, not agent-*.jsonl files. Same row shape, so
+    # every downstream consumer (orphan filter, previews, drill-in)
+    # treats them like any other subagent group.
+    for agent_name, agent_path in _team_workers_for_session(
+            session_jsonl_path):
+        if agent_name in seen_ids:
+            continue
+        try:
+            st = os.stat(agent_path)
+        except OSError:
+            continue
+        seen_ids.add(agent_name)
+        try:
+            with open(agent_path, 'rb') as f:
+                count = sum(1 for _ in f)
+        except OSError:
+            count = 0
+        member = _worker_running_member(agent_path)
+        wmeta = _worker_meta(agent_path)
+        roster = (_TEAMS_INDEX.get(wmeta[0]) or {}) if wmeta else {}
+        m = roster.get('members', {}).get(agent_name) or {}
+        agent_type = m.get('agentType') or 'agent'
+        live = 'live · ' if member is not None else ''
+        item = Item(
+            id=('agent', session_jsonl_path, agent_name),
+            title=agent_name,
+            tag=f'{agent_type} · {live}{count} msg · '
+                f'{_human_time(st.st_mtime)}',
+            tag_style=('green' if member is not None else 'magenta'),
+            has_children=count > 0,
+            boundary=True,
+        )
+        item.kind = 'subagent'
+        item.agent_id = agent_name
+        item.agent_type = agent_type
+        item.agent_description = agent_name
+        item.session_path = session_jsonl_path
+        item.subagent_path = agent_path
+        item.line_count = count
+        item.mtime = st.st_mtime
+        bg = _ROW_BG_FOR_KIND.get('subagent')
+        if bg is not None:
+            item.row_bg = bg
+        out.append(item)
     # Newest-first ordering matches the rest of the recipe.
     out.sort(key=lambda it: -it.mtime)
     return out
@@ -5120,10 +5408,23 @@ def _maybe_link_subagent(td, rec, owner_uuid, path):
             tur = rec.get('toolUseResult')
             agent_id = (tur.get('agentId')
                         if isinstance(tur, dict) else None)
-            if not agent_id:
-                continue
-            agent_path = _resolve_agent_jsonl(path, agent_id)
-            if not os.path.isfile(agent_path):
+            if agent_id:
+                agent_path = _resolve_agent_jsonl(path, agent_id)
+                if not os.path.isfile(agent_path):
+                    continue
+            elif (isinstance(tur, dict)
+                    and tur.get('status') == 'teammate_spawned'):
+                # Team worker: the spawn result carries no agentId —
+                # the worker runs as its own sibling session, joined
+                # via the Agent call's ``name`` and the team roster /
+                # head stamps.
+                agent_id = (ap.get('input') or {}).get('name')
+                if not agent_id:
+                    continue
+                agent_path = _find_worker_jsonl(path, agent_id)
+                if not agent_path:
+                    continue
+            else:
                 continue
             td.agent_link[tu_id] = {
                 'agent_id': agent_id,
@@ -6073,6 +6374,16 @@ def _subagent_pseudo_item(parent_jsonl, agent_id, agent_path):
     )
     agent_type = meta.get('agentType') or 'agent'
     description = meta.get('description') or ''
+    live = ''
+    if not meta:
+        # Team worker (no meta file): type + liveness from the roster.
+        wmeta = _worker_meta(agent_path)
+        if wmeta:
+            roster = _TEAMS_INDEX.get(wmeta[0]) or {}
+            m = roster.get('members', {}).get(wmeta[1]) or {}
+            agent_type = m.get('agentType') or agent_type
+            if _worker_running_member(agent_path) is not None:
+                live = 'live · '
     body = description or f'agent {agent_id}'
     title = f'<subagent>  {body}'
     try:
@@ -6088,8 +6399,8 @@ def _subagent_pseudo_item(parent_jsonl, agent_id, agent_path):
     item = Item(
         id=('agent', parent_jsonl, agent_id),
         title=title,
-        tag=f'{agent_type} · {count} msg · {_human_time(mtime)}',
-        tag_style='magenta',
+        tag=f'{agent_type} · {live}{count} msg · {_human_time(mtime)}',
+        tag_style=('green' if live else 'magenta'),
         has_children=count > 0,
         hidden=False,   # subagent umbrellas are always visible
         # Foreign subtree (the agent's own .jsonl): same boundary
@@ -8190,8 +8501,10 @@ def main():
         _DETAIL_LEVEL = detail_arg
 
     # --running needs the running index regardless of which target we open;
-    # tagging sessions with PIDs also depends on it.
+    # tagging sessions with PIDs also depends on it. The teams roster
+    # joins worker transcripts to their lead session + liveness.
     _scan_running_sessions()
+    _scan_teams()
 
     # The recipe's own positionals: everything left after the flag pops
     # above, minus the framework's ``--tty`` flag (and its value).

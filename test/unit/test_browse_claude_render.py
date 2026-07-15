@@ -8873,6 +8873,231 @@ class TestQueuedAgentVoice(unittest.TestCase):
         self.assertNotIn('<task-notification>', out)
 
 
+class TestTeamWorkers(unittest.TestCase):
+    """Team workers (named agents spawned via the Agent tool) run as
+    sibling *sessions*: linkage comes from the teamName/agentName head
+    stamps + the ``teams/<name>/config.json`` roster, and liveness from
+    the roster's ``isActive`` gated on the lead process being alive."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self._saved_home = os.environ.get('HOME')
+        self._saved_root = self.r.CLAUDE_ROOT
+        os.environ['HOME'] = self._tmp.name
+        self.r.CLAUDE_ROOT = os.path.join(
+            self._tmp.name, '.claude', 'projects')
+        self.proj = os.path.join(self.r.CLAUDE_ROOT, '-home-test-team')
+        os.makedirs(self.proj)
+        self.r._RUNNING_INDEX.clear()
+        self.r._TEAMS_INDEX.clear()
+        self.r._WORKER_META_CACHE.clear()
+        self.r._TREE_CACHE.clear()
+
+    def tearDown(self):
+        if self._saved_home is None:
+            os.environ.pop('HOME', None)
+        else:
+            os.environ['HOME'] = self._saved_home
+        self.r.CLAUDE_ROOT = self._saved_root
+        self.r._RUNNING_INDEX.clear()
+        self.r._TEAMS_INDEX.clear()
+        self.r._WORKER_META_CACHE.clear()
+        self._tmp.cleanup()
+
+    LEAD_SID = 'aaaa1111-2222-3333-4444-555566667777'
+    TEAM = 'session-aaaa1111'
+
+    def _write_session(self, sid, records):
+        import json as _json
+        path = os.path.join(self.proj, f'{sid}.jsonl')
+        with open(path, 'w') as f:
+            for rec in records:
+                f.write(_json.dumps(rec) + '\n')
+        return path
+
+    def _write_lead(self, with_spawn=True):
+        recs = [
+            {'type': 'user', 'uuid': 'u1', 'sessionId': self.LEAD_SID,
+             'message': {'role': 'user', 'content': 'dispatch the worker'}},
+        ]
+        if with_spawn:
+            recs += [
+                {'type': 'assistant', 'uuid': 'a1',
+                 'message': {'role': 'assistant', 'content': [
+                     {'type': 'tool_use', 'id': 't1', 'name': 'Agent',
+                      'input': {'name': 'w-worker',
+                                'subagent_type': 'general-purpose',
+                                'prompt': 'do the thing'}},
+                 ]}},
+                {'type': 'user', 'uuid': 'u2',
+                 'message': {'role': 'user', 'content': [
+                     {'type': 'tool_result', 'tool_use_id': 't1',
+                      'content': 'Spawned successfully.'},
+                 ]},
+                 'toolUseResult': {'status': 'teammate_spawned',
+                                   'prompt': 'do the thing'}},
+            ]
+        return self._write_session(self.LEAD_SID, recs)
+
+    def _write_worker(self, sid, name, team=None):
+        return self._write_session(sid, [
+            {'type': 'agent-setting', 'agentSetting': 'general-purpose',
+             'sessionId': sid},
+            {'type': 'user', 'sessionId': sid, 'teamName': team or self.TEAM,
+             'agentName': name, 'userType': 'external',
+             'message': {'role': 'user', 'content': 'work work'}},
+        ])
+
+    def _write_team_config(self, is_active=True):
+        tdir = os.path.join(self._tmp.name, '.claude', 'teams', self.TEAM)
+        os.makedirs(tdir)
+        import json as _json
+        with open(os.path.join(tdir, 'config.json'), 'w') as f:
+            _json.dump({
+                'name': self.TEAM,
+                'leadSessionId': self.LEAD_SID,
+                'members': [
+                    {'agentId': f'team-lead@{self.TEAM}',
+                     'name': 'team-lead', 'agentType': 'team-lead'},
+                    {'agentId': f'w-worker@{self.TEAM}', 'name': 'w-worker',
+                     'agentType': 'general-purpose', 'isActive': is_active},
+                ],
+            }, f)
+        self.r._scan_teams()
+
+    # -- head peek + lead resolution -----------------------------------------
+
+    def test_worker_meta_from_head(self):
+        p = self._write_worker('bbbb2222-0000-0000-0000-000000000000',
+                               'w-worker')
+        self.assertEqual(self.r._worker_meta(p), (self.TEAM, 'w-worker'))
+
+    def test_lead_session_is_not_a_worker(self):
+        lead = self._write_lead()
+        self.assertIsNone(self.r._worker_meta(lead))
+        self.assertIsNone(self.r._worker_lead_jsonl(lead))
+
+    def test_worker_lead_via_roster(self):
+        lead = self._write_lead()
+        self._write_team_config()
+        p = self._write_worker('bbbb2222-0000-0000-0000-000000000000',
+                               'w-worker')
+        self.assertEqual(self.r._worker_lead_jsonl(p), lead)
+
+    def test_worker_lead_via_naming_convention(self):
+        # No teams config (torn down): the ``session-<8-hex>`` teamName
+        # prefix still finds the sibling lead session.
+        lead = self._write_lead()
+        p = self._write_worker('bbbb2222-0000-0000-0000-000000000000',
+                               'w-worker')
+        self.assertEqual(self.r._worker_lead_jsonl(p), lead)
+
+    def test_workers_enumerated_for_lead(self):
+        lead = self._write_lead()
+        p = self._write_worker('bbbb2222-0000-0000-0000-000000000000',
+                               'w-worker')
+        self.assertEqual(self.r._team_workers_for_session(lead),
+                         [('w-worker', p)])
+        self.assertEqual(self.r._find_worker_jsonl(lead, 'w-worker'), p)
+        self.assertEqual(self.r._count_subagents(lead), 1)
+
+    # -- liveness --------------------------------------------------------------
+
+    def test_worker_live_iff_active_and_lead_alive(self):
+        self._write_lead()
+        self._write_team_config(is_active=True)
+        p = self._write_worker('bbbb2222-0000-0000-0000-000000000000',
+                               'w-worker')
+        # Lead not running → not live (stale roster guard).
+        self.assertIsNone(self.r._worker_running_member(p))
+        self.r._RUNNING_INDEX[self.LEAD_SID] = {'pid': 1, 'status': 'busy'}
+        member = self.r._worker_running_member(p)
+        self.assertIsNotNone(member)
+        self.assertEqual(member['name'], 'w-worker')
+
+    def test_worker_not_live_when_inactive(self):
+        self._write_lead()
+        self._write_team_config(is_active=False)
+        p = self._write_worker('bbbb2222-0000-0000-0000-000000000000',
+                               'w-worker')
+        self.r._RUNNING_INDEX[self.LEAD_SID] = {'pid': 1, 'status': 'busy'}
+        self.assertIsNone(self.r._worker_running_member(p))
+
+    def test_session_row_tags_live_worker(self):
+        self._write_lead()
+        self._write_team_config(is_active=True)
+        p = self._write_worker('bbbb2222-0000-0000-0000-000000000000',
+                               'w-worker')
+        self.r._RUNNING_INDEX[self.LEAD_SID] = {'pid': 1, 'status': 'busy'}
+        item = self.r._session_item(p)
+        self.assertIn('w-worker · live ·', item.tag)
+        self.assertEqual(item.tag_style, 'green')
+        self.assertTrue(item.worker_live)
+
+    # -- project listing folds workers under the lead -------------------------
+
+    def test_list_sessions_hides_linked_workers(self):
+        lead = self._write_lead()
+        self._write_worker('bbbb2222-0000-0000-0000-000000000000',
+                           'w-worker')
+        rows = self.r._list_sessions(self.proj)
+        self.assertEqual([it.id[1] for it in rows], [lead])
+
+    def test_orphan_worker_stays_top_level(self):
+        # No lead session file in this dir → the worker keeps its row.
+        p = self._write_worker('bbbb2222-0000-0000-0000-000000000000',
+                               'w-worker')
+        rows = self.r._list_sessions(self.proj)
+        self.assertEqual([it.id[1] for it in rows], [p])
+        self.assertIn('w-worker ·', rows[0].tag)
+
+    def test_worker_rows_under_lead_session(self):
+        lead = self._write_lead()
+        p = self._write_worker('bbbb2222-0000-0000-0000-000000000000',
+                               'w-worker')
+        subs = self.r._list_subagents_for_session(lead)
+        self.assertEqual([(it.id, it.subagent_path) for it in subs],
+                         [(('agent', lead, 'w-worker'), p)])
+        self.assertEqual(subs[0].kind, 'subagent')
+
+    def test_reused_name_newest_wins(self):
+        lead = self._write_lead()
+        old = self._write_worker('bbbb2222-0000-0000-0000-000000000000',
+                                 'w-worker')
+        new = self._write_worker('cccc3333-0000-0000-0000-000000000000',
+                                 'w-worker')
+        past = os.stat(old).st_mtime - 100
+        os.utime(old, (past, past))
+        self.r._WORKER_META_CACHE.clear()
+        self.assertEqual(self.r._find_worker_jsonl(lead, 'w-worker'), new)
+        rows = self.r._list_sessions(self.proj)
+        # Lead + the OLD worker transcript stay; the linked (new) one folds.
+        self.assertEqual(sorted(it.id[1] for it in rows),
+                         sorted([lead, old]))
+
+    # -- tree wiring -----------------------------------------------------------
+
+    def test_teammate_spawn_wires_agent_link(self):
+        lead = self._write_lead(with_spawn=True)
+        p = self._write_worker('bbbb2222-0000-0000-0000-000000000000',
+                               'w-worker')
+        td = self.r._scan_tree(lead)
+        self.assertIn('t1', td.agent_link)
+        self.assertEqual(td.agent_link['t1']['agent_id'], 'w-worker')
+        self.assertEqual(td.agent_link['t1']['agent_path'], p)
+
+    def test_resolve_agent_jsonl_falls_back_to_worker(self):
+        lead = self._write_lead()
+        p = self._write_worker('bbbb2222-0000-0000-0000-000000000000',
+                               'w-worker')
+        self.assertEqual(self.r._resolve_agent_jsonl(lead, 'w-worker'), p)
+
+
 def _load_recipe_with_md_doc():
     """Reload the recipe with ``recipes/`` on ``sys.path`` so ``md_doc`` resolves.
 
