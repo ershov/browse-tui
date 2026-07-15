@@ -3208,7 +3208,10 @@ def _nested_json_strings(value, path='', out=None, depth=0):
     list is recorded under its dotted path (``.result``, ``.a[0].b``)
     and the walk recurses into the decoded value at ``depth + 1`` so
     doubly-encoded payloads unwrap too. Bounded by ``_NESTED_JSON_MAX``
-    sections and ``_NESTED_JSON_DEPTH`` decode levels.
+    sections and ``_NESTED_JSON_DEPTH`` decode levels. Container
+    descent recurses one frame per structural level unbounded by
+    ``depth`` — safe because ``json.loads`` rejects deeper nesting than
+    Python's recursion limit before this walker ever sees it.
     """
     if out is None:
         out = []
