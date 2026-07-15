@@ -2845,6 +2845,37 @@ class TestAgentVoicePacking(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_reopen_closes_open_between_turns_span(self):
+        # A record between the turn close and the inbound agent voice
+        # opens a <system> span; the re-open must close it (like a turn
+        # root does), or it leaks across the re-opened turn and merges
+        # with later between-turns records into one umbrella.
+        def _sys(name):
+            return {'type': 'system', 'subtype': name}
+        path = self._write_jsonl([
+            self._human('u1', 'first'),           # 0
+            self._end_turn('a1', 'Dispatched.'),  # 1
+            self._turn_close(),                   # 2
+            _sys('x1'),                           # 3 — opens a span
+            self._agent_voice('n1', self._NOTIFY),  # 4 — re-opens u1
+            self._end_turn('a2', 'All good.'),    # 5
+            self._turn_close(),                   # 6
+            _sys('y1'),                           # 7 — a NEW span
+        ])
+        try:
+            td = self.r._scan_tree(path)
+            spans = sorted(td.span_records)
+            self.assertEqual(spans, [3, 7])
+            self.assertEqual(
+                [r['subtype'] for r in td.span_records[3]], ['x1'])
+            self.assertEqual(
+                [r['subtype'] for r in td.span_records[7]], ['y1'])
+            # The reply + follow-up still folded under the human turn.
+            self.assertIn(
+                'n1', [r.get('uuid') for r in td.turn_direct['u1']])
+        finally:
+            os.unlink(path)
+
     def test_next_human_prompt_still_roots_a_new_turn(self):
         # The re-opened turn ends like any other: a fresh human prompt
         # opens its own root.

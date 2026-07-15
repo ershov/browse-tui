@@ -4921,6 +4921,10 @@ def _fold_record(td, cur, rec, n, path):
             and _is_inbound_agent_voice(rec)):
         if (cur.last_turn_uuid is not None
                 and cur.last_turn_uuid in td.turn_direct):
+            # Close any open between-turns span (mirrors the turn-root
+            # branch) — otherwise it would leak across the re-opened
+            # turn and swallow post-turn records into one umbrella.
+            cur.span_start = None
             cur.turn_open_uuid = cur.last_turn_uuid
             cur.tool_owner = {}
         else:
