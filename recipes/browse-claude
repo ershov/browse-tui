@@ -593,37 +593,66 @@ def _team_name_of_lead(lead_sid):
     return f'session-{lead_sid[:8]}'
 
 
-def _team_workers_for_session(session_jsonl_path):
-    """``[(agent_name, worker_jsonl)]`` for the team this session leads.
+# One worker scan per project dir, not per session: listing a dir of N
+# sessions calls ``_team_workers_for_session`` (via ``_count_subagents``)
+# for every row, and an uncached scan would stat every sibling each time
+# — O(N²) for dirs that accumulate hundreds of sessions. Keyed by the
+# dir's mtime: it moves on every file create/delete/rename (the events
+# that change the worker set) though not on appends — a worker whose
+# head records land in a later tick than its file-create is picked up
+# by the next create/delete in the dir or a root refresh.
+_DIR_WORKERS_CACHE = {}   # proj_dir → (dir_mtime, {team: [(name, mtime, path)]})
 
-    Scans the sibling session files' head stamps — the roster carries
-    no session ids, so the worker transcripts themselves are the only
-    mapping. When a name was reused (a respawn under the same name
-    starts a fresh transcript) the newest file wins; older ones stay
-    plain top-level sessions.
-    """
-    lead_sid = os.path.basename(session_jsonl_path)[:-len('.jsonl')]
-    proj_dir = os.path.dirname(session_jsonl_path)
-    team = _team_name_of_lead(lead_sid)
+
+def _team_workers_map(proj_dir):
+    """``{teamName: [(agent_name, mtime, worker_jsonl)]}`` for one dir."""
+    try:
+        dir_mtime = os.stat(proj_dir).st_mtime
+    except OSError:
+        return {}
+    cached = _DIR_WORKERS_CACHE.get(proj_dir)
+    if cached is not None and cached[0] == dir_mtime:
+        return cached[1]
+    mapping = {}
     try:
         names = os.listdir(proj_dir)
     except OSError:
-        return []
-    best = {}   # agent_name → (mtime, path)
+        names = []
     for n in names:
-        if not n.endswith('.jsonl') or n[:-len('.jsonl')] == lead_sid:
+        if not n.endswith('.jsonl'):
             continue
         p = os.path.join(proj_dir, n)
         meta = _worker_meta(p)
-        if not meta or meta[0] != team:
+        if not meta:
             continue
         try:
             m = os.stat(p).st_mtime
         except OSError:
             continue
-        prev = best.get(meta[1])
+        mapping.setdefault(meta[0], []).append((meta[1], m, p))
+    _DIR_WORKERS_CACHE[proj_dir] = (dir_mtime, mapping)
+    return mapping
+
+
+def _team_workers_for_session(session_jsonl_path):
+    """``[(agent_name, worker_jsonl)]`` for the team this session leads.
+
+    Reads the per-dir worker scan — the roster carries no session ids,
+    so the worker transcripts' head stamps are the only mapping. When a
+    name was reused (a respawn under the same name starts a fresh
+    transcript) the newest file wins; older ones stay plain top-level
+    sessions.
+    """
+    lead_sid = os.path.basename(session_jsonl_path)[:-len('.jsonl')]
+    proj_dir = os.path.dirname(session_jsonl_path)
+    team = _team_name_of_lead(lead_sid)
+    best = {}   # agent_name → (mtime, path)
+    for name, m, p in _team_workers_map(proj_dir).get(team, ()):
+        if os.path.basename(p)[:-len('.jsonl')] == lead_sid:
+            continue
+        prev = best.get(name)
         if prev is None or m > prev[0]:
-            best[meta[1]] = (m, p)
+            best[name] = (m, p)
     return sorted((name, mp[1]) for name, mp in best.items())
 
 
@@ -673,6 +702,12 @@ def get_children(item_id, *, reload=False):
         if reload:
             _TREE_CACHE.clear()
             _TAIL_STATE.clear()
+            # Re-peek worker transcripts + rosters on an explicit
+            # refresh — a worker whose head landed after its file
+            # was scanned, or a roster flip, is picked up here.
+            _WORKER_META_CACHE.clear()
+            _DIR_WORKERS_CACHE.clear()
+            _scan_teams()
             # Drop the shared markdown parse cache too, so a root Ctrl-R
             # re-reads any referenced ``.md`` files edited on disk. (A
             # per-file ``_bust_caches_for`` can't reach these — they live

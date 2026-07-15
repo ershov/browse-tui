@@ -8896,6 +8896,7 @@ class TestTeamWorkers(unittest.TestCase):
         self.r._RUNNING_INDEX.clear()
         self.r._TEAMS_INDEX.clear()
         self.r._WORKER_META_CACHE.clear()
+        self.r._DIR_WORKERS_CACHE.clear()
         self.r._TREE_CACHE.clear()
 
     def tearDown(self):
@@ -8907,6 +8908,7 @@ class TestTeamWorkers(unittest.TestCase):
         self.r._RUNNING_INDEX.clear()
         self.r._TEAMS_INDEX.clear()
         self.r._WORKER_META_CACHE.clear()
+        self.r._DIR_WORKERS_CACHE.clear()
         self._tmp.cleanup()
 
     LEAD_SID = 'aaaa1111-2222-3333-4444-555566667777'
@@ -9074,11 +9076,37 @@ class TestTeamWorkers(unittest.TestCase):
         past = os.stat(old).st_mtime - 100
         os.utime(old, (past, past))
         self.r._WORKER_META_CACHE.clear()
+        self.r._DIR_WORKERS_CACHE.clear()
         self.assertEqual(self.r._find_worker_jsonl(lead, 'w-worker'), new)
         rows = self.r._list_sessions(self.proj)
         # Lead + the OLD worker transcript stay; the linked (new) one folds.
         self.assertEqual(sorted(it.id[1] for it in rows),
                          sorted([lead, old]))
+
+    # -- per-dir scan cache ----------------------------------------------------
+
+    def test_worker_scan_cached_per_dir(self):
+        # Listing a project dir must not rescan siblings per session —
+        # repeated calls with an unchanged dir return the cached map.
+        lead = self._write_lead()
+        self._write_worker('bbbb2222-0000-0000-0000-000000000000',
+                           'w-worker')
+        first = self.r._team_workers_map(self.proj)
+        self.assertIs(self.r._team_workers_map(self.proj), first)
+        self.assertEqual(self.r._team_workers_for_session(lead),
+                         self.r._team_workers_for_session(lead))
+
+    def test_worker_scan_cache_busts_on_new_file(self):
+        lead = self._write_lead()
+        self.assertEqual(self.r._team_workers_for_session(lead), [])
+        p = self._write_worker('bbbb2222-0000-0000-0000-000000000000',
+                               'w-worker')
+        # File create moves the dir mtime; nudge it to dodge coarse
+        # filesystem timestamp granularity in the test.
+        future = os.stat(self.proj).st_mtime + 1
+        os.utime(self.proj, (future, future))
+        self.assertEqual(self.r._team_workers_for_session(lead),
+                         [('w-worker', p)])
 
     # -- tree wiring -----------------------------------------------------------
 
