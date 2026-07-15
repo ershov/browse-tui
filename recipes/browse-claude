@@ -673,27 +673,32 @@ def _find_worker_jsonl(session_jsonl_path, worker_name):
 # title). Both sit near the END of the file, so the extraction reads
 # backwards in growing windows instead of scanning the whole file.
 
-_AI_TITLE_RE = re.compile(rb'"aiTitle"\s*:\s*"((?:[^"\\]|\\.)*)"')
-_CUSTOM_TITLE_RE = re.compile(rb'"customTitle"\s*:\s*"((?:[^"\\]|\\.)*)"')
+# Cheap line filter for the tail windows — candidate lines are then
+# json-parsed and their top-level ``type`` verified, so a title-shaped
+# string EMBEDDED in some other record's payload can't false-match.
+_TITLE_LINE_RE = re.compile(rb'"type"\s*:\s*"(?:ai-title|custom-title)"')
 _NAME_WINDOW = 65536
 _SESSION_NAME_CACHE = {}   # path → ((size, mtime), name-or-None)
 
+# Titles render into one-line tags and the aligned scope card — squash
+# control chars (newlines, ESC sequences a custom rename could carry).
+_CTRL_CHARS_RE = re.compile(r'[\x00-\x1f\x7f]+')
 
-def _decode_json_str(raw):
-    """Decode one JSON string body (regex-captured bytes, no quotes)."""
-    try:
-        return json.loads('"' + raw.decode('utf-8', 'replace') + '"')
-    except (ValueError, UnicodeDecodeError):
-        return raw.decode('utf-8', 'replace')
+
+def _clean_title(s):
+    """One safe display line out of a recorded title (or '')."""
+    return _CTRL_CHARS_RE.sub(' ', s).strip() if s else ''
 
 
 def _session_name_from_file(path):
     """Last recorded title of a session, reading the file tail only.
 
-    Windows grow 4× until a title (or the file start) is hit. A
-    ``custom-title`` found in the window outranks any ``ai-title``;
-    an empty ``customTitle`` (rename cleared) falls back to the AI
-    title. Cached by (size, mtime) — titles change as the file grows.
+    Windows grow 4× until a title record (or the file start) is hit. A
+    ``custom-title`` outranks any ``ai-title`` *within the window that
+    ends the walk* — a rename older than every window read is
+    approximated away (the full-scan tree path has the exact rule); an
+    empty ``customTitle`` (rename cleared) falls back to the AI title.
+    Cached by (size, mtime) — titles change as the file grows.
     """
     try:
         st = os.stat(path)
@@ -712,21 +717,29 @@ def _session_name_from_file(path):
                 f.seek(off)
                 chunk = f.read()
                 if off > 0:
-                    # Drop the partial first line so a value split
-                    # across the window boundary can't match truncated.
+                    # Drop the partial first line so a record split
+                    # across the window boundary can't half-parse.
                     nl = chunk.find(b'\n')
                     chunk = chunk[nl + 1:] if nl >= 0 else b''
-                custom = None
-                for m in _CUSTOM_TITLE_RE.finditer(chunk):
-                    custom = m
-                ai = None
-                for m in _AI_TITLE_RE.finditer(chunk):
-                    ai = m
-                if custom is not None and _decode_json_str(custom.group(1)):
-                    name = _decode_json_str(custom.group(1))
+                custom = ai = None
+                for line in chunk.splitlines():
+                    if not _TITLE_LINE_RE.search(line):
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(rec, dict):
+                        continue
+                    if rec.get('type') == 'custom-title':
+                        custom = _clean_title(rec.get('customTitle'))
+                    elif rec.get('type') == 'ai-title':
+                        ai = _clean_title(rec.get('aiTitle'))
+                if custom:
+                    name = custom
                     break
-                if ai is not None:
-                    name = _decode_json_str(ai.group(1)) or None
+                if ai:
+                    name = ai
                     break
                 if off == 0:
                     break
@@ -737,25 +750,31 @@ def _session_name_from_file(path):
     return name
 
 
-def _session_name(path):
-    """Best known display name for a session, without touching the file.
+def _session_name_lookup(path):
+    """``(known, name)`` for a session, without touching the file.
 
-    The scanned tree (already read in full, kept current by the tail
-    worker) wins; else a fresh tail-scan cache hit. Returns None when
-    the name simply isn't known yet — the async filler back-fills it.
+    ``known`` is False only when the name was never determined (no
+    scanned tree, no fresh tail-scan cache entry) — the async filler's
+    cue. A scanned/cached session with no title is ``(True, None)`` so
+    it isn't re-scanned on every listing.
     """
     td = _TREE_CACHE.get(path)
     if td is not None:
-        return td.custom_title or td.ai_title
+        return True, _clean_title(td.custom_title or td.ai_title) or None
     cached = _SESSION_NAME_CACHE.get(path)
     if cached is not None:
         try:
             st = os.stat(path)
         except OSError:
-            return None
+            return True, None
         if cached[0] == (st.st_size, st.st_mtime):
-            return cached[1]
-    return None
+            return True, cached[1]
+    return False, None
+
+
+def _session_name(path):
+    """Best known display name for a session, without touching the file."""
+    return _session_name_lookup(path)[1]
 
 
 # ---- get_children: dispatches by id tag ----------------------------------
@@ -980,14 +999,11 @@ def _session_item(full, st=None):
     # Session display name — when the transcript title is already known
     # (scanned tree or a fresh tail-scan cache hit) it shows right away;
     # otherwise the running metadata's derived name stands in and the
-    # async filler upgrades the row to the transcript title later
-    # (``session_name`` stays None so the row is picked up as pending —
-    # its baseline tag is the un-prefixed one built above).
-    base_tag = tag
-    name = _session_name(full)
+    # async filler upgrades the row to the transcript title later.
+    known, name = _session_name_lookup(full)
     display = name
     if display is None and running_meta:
-        display = running_meta.get('name')
+        display = _clean_title(running_meta.get('name')) or None
     if display:
         tag = f'{_trim(display, 48)} · ' + tag
     item = Item(
@@ -1021,7 +1037,7 @@ def _session_item(full, st=None):
     item.agent_name = worker_meta[1] if worker_meta else None
     item.worker_live = worker_member is not None
     item.session_name = name or None
-    item.base_tag = base_tag
+    item.session_name_known = known
     return item
 
 
@@ -1061,13 +1077,13 @@ def _list_sessions(project_dir):
     if linked:
         out = [it for it in out if it.id[1] not in linked]
     out.sort(key=lambda it: -it.mtime)
-    # Names not known synchronously get back-filled off-thread: the
+    # Names never determined yet get back-filled off-thread: the
     # tail-scan reads real bytes per file, too slow for a big dir on
-    # the listing path. The baseline tag (no name prefix) is what the
-    # filler prepends to — a running row showing the derived stand-in
-    # name still upgrades to its transcript title.
-    pending = [(it.id[1], getattr(it, 'base_tag', it.tag)) for it in out
-               if getattr(it, 'session_name', None) is None]
+    # the listing path. (A running row showing the derived stand-in
+    # name still upgrades to its transcript title — its name is
+    # unknown, so it stays pending.)
+    pending = [it.id[1] for it in out
+               if not getattr(it, 'session_name_known', True)]
     if pending:
         _spawn_session_name_filler(project_dir, pending)
     return out
@@ -1452,23 +1468,31 @@ def _list_subagents_for_session(session_jsonl_path):
     return out
 
 
-_NAME_FILL_INFLIGHT = set()
+_NAME_FILL_LOCK = threading.Lock()
+# dir → queued batch of paths (replaced by newer listings, latest wins)
+# or None while the dir's thread is running with nothing queued. A dir
+# key present at all means a thread is alive for it.
+_NAME_FILL_PENDING = {}
 
 
-def _fill_session_names(entries):
-    """Tail-scan each entry and patch its row tag with the found name.
+def _fill_session_names(paths):
+    """Tail-scan each pending session and patch its row tag.
 
-    ``entries`` is ``[(jsonl_path, tag_without_name)]``. Pushes ``mod``
-    ops in small batches — ``mod`` never inserts, so rows that vanished
-    meanwhile (refresh, filter) are silent no-ops.
+    The tag is rebuilt from a fresh ``_session_item`` (the tail-scan
+    primes the name cache first), not from text captured at listing
+    time — so a row whose counts/liveness moved while the scan ran
+    isn't clobbered with stale text. Ops go out in small batches;
+    ``mod`` never inserts, so rows that vanished meanwhile (refresh,
+    filter) are silent no-ops.
     """
     ops = []
-    for path, old_tag in entries:
-        name = _session_name_from_file(path)
-        if not name:
+    for path in paths:
+        if not _session_name_from_file(path):
             continue
-        ops.append(mod(('session', path),
-                       tag=f'{_trim(name, 48)} · {old_tag}'))
+        item = _session_item(path)
+        if item is None:
+            continue
+        ops.append(mod(('session', path), tag=item.tag))
         if len(ops) >= 25 and _BROWSER is not None:
             _BROWSER.update_data(ops)
             ops = []
@@ -1476,22 +1500,36 @@ def _fill_session_names(entries):
         _BROWSER.update_data(ops)
 
 
-def _spawn_session_name_filler(project_dir, entries):
+def _spawn_session_name_filler(project_dir, paths):
     """Back-fill session names for a just-listed project dir.
 
-    One daemon thread per dir at a time: it runs ``_fill_session_names``
-    and exits. Headless runs (no Browser) skip — there's nothing to
-    patch.
+    One daemon thread per dir at a time; a listing that lands while
+    the thread is busy replaces the dir's queued batch (latest wins)
+    and the same thread drains it before exiting — no listing's rows
+    are silently dropped. Headless runs (no Browser) skip — there's
+    nothing to patch.
     """
-    if _BROWSER is None or project_dir in _NAME_FILL_INFLIGHT:
+    if _BROWSER is None:
         return
-    _NAME_FILL_INFLIGHT.add(project_dir)
+    with _NAME_FILL_LOCK:
+        if project_dir in _NAME_FILL_PENDING:
+            _NAME_FILL_PENDING[project_dir] = paths
+            return
+        _NAME_FILL_PENDING[project_dir] = None
 
     def run():
-        try:
-            _fill_session_names(entries)
-        finally:
-            _NAME_FILL_INFLIGHT.discard(project_dir)
+        batch = paths
+        while True:
+            try:
+                _fill_session_names(batch)
+            except Exception:
+                pass    # a bad file must not kill the drain loop
+            with _NAME_FILL_LOCK:
+                batch = _NAME_FILL_PENDING.get(project_dir)
+                if batch is None:
+                    _NAME_FILL_PENDING.pop(project_dir, None)
+                    return
+                _NAME_FILL_PENDING[project_dir] = None
 
     threading.Thread(target=run, name='claude-name-fill',
                      daemon=True).start()
@@ -6678,9 +6716,10 @@ def _fmt_scope_card(path, td):
 
     Pulls sessionId / entrypoint / cwd / gitBranch / slug from the
     first record that has them (every Claude record carries the
-    stamps). Subagent variant additionally lists agentId, agentType
-    and description from the sibling meta.json. Returns a string
-    ready to prepend to the cascade body.
+    stamps), plus the session name captured during the scan
+    (custom-title outranks ai-title). Subagent variant additionally
+    lists agentId, agentType and description from the sibling
+    meta.json. Returns a string ready to prepend to the cascade body.
     """
     rec = next((r for r in td.records if isinstance(r, dict)), None) or {}
     is_sub = False
@@ -6694,7 +6733,7 @@ def _fmt_scope_card(path, td):
                 is_sub = True
     rows = []
     rows.append(('path', path))
-    name = td.custom_title or td.ai_title
+    name = _clean_title(td.custom_title or td.ai_title)
     if name:
         rows.append(('name', name))
     if is_sub:

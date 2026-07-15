@@ -9193,7 +9193,27 @@ class TestTeamWorkers(unittest.TestCase):
         self.assertTrue(item.tag.startswith('Row title · '), item.tag)
         self.assertEqual(item.session_name, 'Row title')
 
-    def test_fill_session_names_pushes_mod_ops(self):
+    def test_session_name_ignores_embedded_title_text(self):
+        # A record whose PAYLOAD contains title-record-shaped JSON (a
+        # session discussing this very feature) must not false-match —
+        # candidate lines are parsed and their top-level type checked.
+        sid = 'dddd4444-0000-0000-0000-000000000000'
+        p = self._write_session(sid, [
+            {'type': 'user', 'sessionId': sid,
+             'toolUseResult': {'type': 'ai-title', 'aiTitle': 'Fake'},
+             'message': {'role': 'user', 'content': 'embedded record'}},
+        ])
+        self.assertIsNone(self.r._session_name_from_file(p))
+
+    def test_session_name_sanitises_control_chars(self):
+        p = self._write_named('dddd4444-0000-0000-0000-000000000000', [
+            {'type': 'ai-title',
+             'aiTitle': 'Red\x1b[31m title\nsecond line'},
+        ])
+        self.assertEqual(self.r._session_name_from_file(p),
+                         'Red [31m title second line')
+
+    def test_fill_session_names_pushes_fresh_tag(self):
         p = self._write_named('dddd4444-0000-0000-0000-000000000000', [
             {'type': 'ai-title', 'aiTitle': 'Async title'},
         ])
@@ -9206,14 +9226,17 @@ class TestTeamWorkers(unittest.TestCase):
         saved = self.r._BROWSER
         self.r._BROWSER = _Stub()
         try:
-            self.r._fill_session_names([(p, '3 msg · just now')])
+            self.r._fill_session_names([p])
         finally:
             self.r._BROWSER = saved
         self.assertEqual(len(captured), 1)
         op = captured[0]
         self.assertEqual(op[0], 'mod')
         self.assertEqual(op[1], ('session', p))
-        self.assertEqual(op[3]['tag'], 'Async title · 3 msg · just now')
+        # The tag is rebuilt fresh (name cache primed by the scan), so
+        # it matches what _session_item produces right now.
+        self.assertTrue(op[3]['tag'].startswith('Async title · '))
+        self.assertEqual(op[3]['tag'], self.r._session_item(p).tag)
 
     def test_list_sessions_skips_filler_when_names_known(self):
         p = self._write_named('dddd4444-0000-0000-0000-000000000000', [
@@ -9230,6 +9253,44 @@ class TestTeamWorkers(unittest.TestCase):
             self.r._spawn_session_name_filler = saved
         self.assertEqual(len(rows), 1)
         self.assertEqual(spawned, [])
+
+    def test_titleless_session_not_rescanned_every_listing(self):
+        # A session already determined to have NO title is (True, None)
+        # — it must not re-enter the pending batch on later listings.
+        sid = 'dddd4444-0000-0000-0000-000000000000'
+        p = self._write_session(sid, [
+            {'type': 'user', 'sessionId': sid,
+             'message': {'role': 'user', 'content': 'no title here'}},
+        ])
+        self.assertIsNone(self.r._session_name_from_file(p))   # primes cache
+        self.assertEqual(self.r._session_name_lookup(p), (True, None))
+        spawned = []
+        saved = self.r._spawn_session_name_filler
+        self.r._spawn_session_name_filler = (
+            lambda d, e: spawned.append((d, e)))
+        try:
+            self.r._list_sessions(self.proj)
+        finally:
+            self.r._spawn_session_name_filler = saved
+        self.assertEqual(spawned, [])
+
+    def test_name_filler_queues_batch_while_running(self):
+        # A listing that lands while the dir's thread is busy replaces
+        # the queued batch instead of being dropped.
+        with self.r._NAME_FILL_LOCK:
+            self.r._NAME_FILL_PENDING[self.proj] = None   # thread "running"
+        try:
+            saved = self.r._BROWSER
+            self.r._BROWSER = object()   # non-None: spawn path active
+            try:
+                self.r._spawn_session_name_filler(self.proj, ['/a.jsonl'])
+            finally:
+                self.r._BROWSER = saved
+            self.assertEqual(self.r._NAME_FILL_PENDING[self.proj],
+                             ['/a.jsonl'])
+        finally:
+            with self.r._NAME_FILL_LOCK:
+                self.r._NAME_FILL_PENDING.pop(self.proj, None)
 
     # -- tree wiring -----------------------------------------------------------
 
