@@ -8791,6 +8791,88 @@ class TestAgentPeerMessage(unittest.TestCase):
         self.assertNotIn('<agent-message', out)
 
 
+class TestQueuedAgentVoice(unittest.TestCase):
+    """Inbound agent voice queued while the session was busy lands as a
+    ``queue-operation`` enqueue whose ``content`` is the raw wrapper
+    (no ``origin``, no ``message``). It must classify as agent voice —
+    not as the human's queued prompt."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    _PEER = ('<agent-message from="peer-pack-reviewer">\n'
+             'Review of c963794..HEAD: **no issues**.\n'
+             '</agent-message>')
+
+    _NOTIFY = ('<task-notification>\n'
+               '<task-id>a123</task-id>\n'
+               '<status>completed</status>\n'
+               '<summary>worker done</summary>\n'
+               '<result>All findings addressed.</result>\n'
+               '</task-notification>')
+
+    def _queue_rec(self, content, op='enqueue'):
+        return {'type': 'queue-operation', 'operation': op,
+                'content': content, 'sessionId': 'abcd1234'}
+
+    def test_queued_peer_classifies_agent_peer(self):
+        rec = self._queue_rec(self._PEER)
+        self.assertTrue(self.r._is_agent_message(rec))
+        self.assertEqual(self.r._kind_of(rec), 'agent-peer')
+
+    def test_queued_notification_classifies_agent_reply(self):
+        rec = self._queue_rec(self._NOTIFY)
+        self.assertTrue(self.r._is_task_notification(rec))
+        self.assertEqual(self.r._kind_of(rec), 'agent-reply')
+
+    def test_queued_agent_voice_is_voice_tier_not_prompt(self):
+        # The human-enqueue promotion (level 1) must not apply.
+        self.assertEqual(
+            self.r._record_min_level(self._queue_rec(self._PEER)), 2)
+        self.assertEqual(
+            self.r._record_min_level(self._queue_rec(self._NOTIFY)), 2)
+
+    def test_plain_queued_prompt_unchanged(self):
+        rec = self._queue_rec('please also fix the docs')
+        self.assertEqual(self.r._kind_of(rec), 'queue-operation')
+        self.assertEqual(self.r._record_min_level(rec), 1)
+        self.assertIn('queue enqueue: please also fix the docs',
+                      self.r._summarise_message(rec))
+
+    def test_dequeue_without_content_unchanged(self):
+        rec = self._queue_rec('', op='dequeue')
+        self.assertEqual(self.r._kind_of(rec), 'queue-operation')
+        self.assertFalse(self.r._is_agent_message(rec))
+
+    def test_queued_peer_summary_parses_wrapper(self):
+        out = self.r._summarise_message(self._queue_rec(self._PEER))
+        self.assertIn('← peer-pack-reviewer:', out)
+        self.assertIn('Review of c963794..HEAD', out)
+        self.assertNotIn('<agent-message', out)
+        self.assertNotIn('queue enqueue', out)
+
+    def test_queued_notification_summary_parses_wrapper(self):
+        out = self.r._summarise_message(self._queue_rec(self._NOTIFY))
+        self.assertIn('←', out)
+        self.assertIn('a123', out)
+        self.assertIn('worker done', out)
+        self.assertNotIn('<task-notification', out)
+
+    def test_queued_peer_preview_renders_sender_header(self):
+        out = self.r._render_metadata(self._queue_rec(self._PEER))
+        self.assertIn('enqueue', out)
+        self.assertIn('← agent-message', out)
+        self.assertIn('peer-pack-reviewer', out)
+        self.assertNotIn('<agent-message', out)
+
+    def test_queued_notification_preview_renders_fields(self):
+        out = self.r._render_metadata(self._queue_rec(self._NOTIFY))
+        self.assertIn('← task-notification', out)
+        self.assertIn('worker done', out)
+        self.assertNotIn('<task-notification>', out)
+
+
 def _load_recipe_with_md_doc():
     """Reload the recipe with ``recipes/`` on ``sys.path`` so ``md_doc`` resolves.
 

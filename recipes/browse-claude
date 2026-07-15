@@ -1347,8 +1347,9 @@ def _record_min_level(rec):
     new/unknown record kinds surface only at level 6 (all) but stay out
     of the leaner views.
 
+      * inbound agent voice (worker reply / peer message,
+        delivered or queued)                              → 2
       * ``isMeta`` (injected context; never lived)        → 6
-        …except an inbound peer message (agent voice)     → 2
       * turn-root prompt / queued ``enqueue`` / assistant
         ``end_turn`` response                              → 1  (summary)
       * any other voice (``_is_voice``)                    → 2  (voice)
@@ -1363,10 +1364,12 @@ def _record_min_level(rec):
     """
     if not isinstance(rec, dict):
         return 6
-    # Inbound peer messages arrive stamped ``isMeta`` but ARE lived
-    # conversation (another agent talking to this one) — promote them
-    # to the voice tier before the isMeta gate buries them.
-    if _is_agent_message(rec):
+    # Inbound agent voice IS lived conversation (another agent talking
+    # to this one) — voice tier, checked first: peer messages arrive
+    # stamped ``isMeta`` (the gate below would bury them) and queued
+    # deliveries are ``queue-operation`` records (the enqueue rule
+    # below would promote them to the human prompt tier).
+    if _is_inbound_agent_voice(rec):
         return 2
     # Injected context is never part of the lived conversation — it
     # outranks even its own type, so check it first.
@@ -1489,13 +1492,15 @@ def _passes_filter(item_id, td=None):
 def _kind_of(obj):
     """Best-effort classifier for one JSONL record.
 
-    Most records map to their raw ``type`` / message role. Two
+    Most records map to their raw ``type`` / message role. Three
     refinements for the inter-agent voice channel: an assistant record
     whose salient content is a ``SendMessage`` tool_use is the leader
-    voicing a worker (``agent-send``); a ``user`` record that is a
-    ``<task-notification>`` is the worker's reply back (``agent-reply``).
-    Both drive their own stripe + tag style — without this, the reply
-    would inherit the human stripe and be mis-attributed.
+    voicing a worker (``agent-send``); a ``<task-notification>`` is the
+    worker's reply back (``agent-reply``); a peer session's message is
+    ``agent-peer``. The inbound two match both the delivered ``user``
+    record and its queued ``queue-operation`` echo. Each drives its own
+    stripe + tag style — without this, inbound agent voice would
+    inherit the human stripe and be mis-attributed.
     """
     if _is_send_message(obj):
         return 'agent-send'
@@ -1539,6 +1544,19 @@ def _summarise_message(obj):
     stays O(line) inside ``_list_messages``.
     """
     t = obj.get('type', '')
+
+    # Inbound agent voice — delivered (``user`` record) or queued
+    # (``queue-operation``) — summarises off the parsed wrapper fields,
+    # not the raw XML. Checked ahead of the per-type formatters so the
+    # queued echo reads like the delivered record.
+    if _is_task_notification(obj):
+        d = _parse_task_notification(_inbound_voice_text(obj) or '')
+        bits = [b for b in (d['task_id'], d['status'], d['summary']) if b]
+        return '← ' + ' · '.join(bits) if bits else '← task-notification'
+    if _is_agent_message(obj):
+        sender, body = _parse_agent_message(obj)
+        body = _trim(body, 5000)
+        return f'← {sender}: {body}' if sender else f'← {body}'
 
     # Metadata records — surface the salient field.
     if t == 'last-prompt':
@@ -1676,20 +1694,6 @@ def _summarise_message(obj):
         for p in content:
             if isinstance(p, dict) and p.get('type') == 'tool_result':
                 return f'↳ tool_result: {_tool_result_one_line(obj, p)}'
-
-    # Inbound worker→leader reply — a one-liner off the parsed fields
-    # rather than dumping the raw ``<task-notification>`` XML wrapper.
-    if role == 'user' and _is_task_notification(obj):
-        d = _parse_task_notification(_extract_text(content))
-        bits = [b for b in (d['task_id'], d['status'], d['summary']) if b]
-        return '← ' + ' · '.join(bits) if bits else '← task-notification'
-
-    # Inbound peer message — sender + body instead of the injected
-    # preamble + raw ``<agent-message>`` wrapper.
-    if role == 'user' and _is_agent_message(obj):
-        sender, body = _parse_agent_message(obj)
-        body = _trim(body, 5000)
-        return f'← {sender}: {body}' if sender else f'← {body}'
 
     text = _extract_text(content)
     text = _trim(text, 5000)
@@ -3605,21 +3609,36 @@ def _parse_task_notification(text):
     return out
 
 
+def _inbound_voice_text(rec):
+    """Text payload used for inbound-agent-voice detection, or None.
+
+    Two record shapes can carry an inbound agent message: a ``user``
+    record (the delivered turn — text in ``message.content``) and a
+    ``queue-operation`` record (the same payload queued while the
+    session was busy — raw text in ``content``; queue records never
+    carry an ``origin`` field, so detection there is text-shape only).
+    """
+    if not isinstance(rec, dict):
+        return None
+    if rec.get('type') == 'queue-operation':
+        return rec.get('content') or ''
+    msg = rec.get('message') if isinstance(rec.get('message'), dict) else {}
+    if (rec.get('type') or msg.get('role')) != 'user':
+        return None
+    return _extract_text(msg.get('content', ''))
+
+
 def _is_task_notification(rec):
-    """True iff ``rec`` is a ``user`` record whose text content is a
-    ``<task-notification>`` wrapper (the worker→leader inbound reply).
+    """True iff ``rec`` carries a ``<task-notification>`` wrapper (the
+    worker→leader inbound reply) — as a delivered ``user`` record or a
+    queued ``queue-operation`` echo.
 
     Mirrors ``_is_send_message`` for the outbound half: detection is by
     the wrapper prefix on the record's text content, tolerant of the
     bare-string and single-text-part content shapes.
     """
-    if not isinstance(rec, dict):
-        return False
-    msg = rec.get('message') if isinstance(rec.get('message'), dict) else {}
-    if (rec.get('type') or msg.get('role')) != 'user':
-        return False
-    text = _extract_text(msg.get('content', ''))
-    return text.lstrip().startswith(_TASK_NOTIFY_PREFIX)
+    text = _inbound_voice_text(rec)
+    return text is not None and text.lstrip().startswith(_TASK_NOTIFY_PREFIX)
 
 
 # Injected preamble + wrapper of an inbound peer message (another
@@ -3634,26 +3653,26 @@ _AGENT_MSG_FROM_RE = re.compile(r'\b(?:from|teammate_id)="([^"]*)"')
 
 
 def _is_agent_message(rec):
-    """True iff ``rec`` is a ``user`` record carrying an inbound peer
-    message (another session's SendMessage → this one).
+    """True iff ``rec`` carries an inbound peer message (another
+    session's SendMessage → this one) — as a delivered ``user`` record
+    or a queued ``queue-operation`` echo.
 
-    Primary signal: the structured ``origin`` field —
-    ``{"kind": "peer", "from": <sender>, ...}``. LEGACY fallback for
-    transcripts written before ``origin`` existed: the injected text
-    starts with the fixed preamble / an ``<agent-message>`` or
-    ``<teammate-message>`` wrapper — remove the text-shape branch once
+    Primary signal for delivered records: the structured ``origin``
+    field — ``{"kind": "peer", "from": <sender>, ...}``. The text-shape
+    check (fixed preamble / ``<agent-message>`` / ``<teammate-message>``
+    wrapper) is the only signal for queue records (they never carry
+    ``origin``) and the LEGACY fallback for ``user`` records written
+    before ``origin`` existed — narrow it back to queue records once
     pre-``origin`` transcripts stop mattering.
     """
-    if not isinstance(rec, dict):
+    if isinstance(rec, dict):
+        origin = rec.get('origin')
+        if isinstance(origin, dict) and origin.get('kind') == 'peer':
+            return True
+    text = _inbound_voice_text(rec)
+    if text is None:
         return False
-    msg = rec.get('message') if isinstance(rec.get('message'), dict) else {}
-    if (rec.get('type') or msg.get('role')) != 'user':
-        return False
-    origin = rec.get('origin')
-    if isinstance(origin, dict) and origin.get('kind') == 'peer':
-        return True
-    # LEGACY text-shape detection (pre-``origin`` records).
-    text = _extract_text(msg.get('content', '')).lstrip()
+    text = text.lstrip()
     return (text.startswith(_AGENT_MSG_PREAMBLE)
             or text.startswith('<agent-message')
             or text.startswith('<teammate-message'))
@@ -3667,8 +3686,7 @@ def _parse_agent_message(rec):
     markdown inside the wrapper; a record with neither wrapper nor
     preamble falls back to its whole text.
     """
-    msg = rec.get('message') if isinstance(rec.get('message'), dict) else {}
-    text = _extract_text(msg.get('content', ''))
+    text = _inbound_voice_text(rec) or ''
     origin = rec.get('origin')
     sender = origin.get('from', '') if isinstance(origin, dict) else ''
     m = _AGENT_MSG_RE.search(text)
@@ -4279,8 +4297,15 @@ def _render_metadata(obj):
         return f'{head}  {GREEN}+{ms/1000:.1f}s saved{RESET}'
     if t == 'queue-operation':
         op = obj.get('operation', '?')
-        return (f'{head}  {WHITE}{op}{RESET}\n\n'
-                f'{obj.get("content", "")}')
+        # A queued inbound agent message renders like the delivered
+        # record (sender header + markdown), under the queue header.
+        if _is_task_notification(obj):
+            body = _render_task_notification(obj.get('content', ''))
+        elif _is_agent_message(obj):
+            body = _render_agent_message(obj)
+        else:
+            body = obj.get('content', '')
+        return f'{head}  {WHITE}{op}{RESET}\n\n{body}'
     if t == 'marble-origami-commit':
         return (f'{head}  {MUTE}id={obj.get("collapseId", "")}{RESET}\n\n'
                 f'{obj.get("summary", "")}')
