@@ -8936,6 +8936,21 @@ class TestJsonPreviews(unittest.TestCase):
         self.assertIn('  "success": true', out)
         self.assertIn('note', out)
 
+    def test_unknown_dict_result_colors_and_decodes(self):
+        # An unknown-shape dict toolUseResult (e.g. teammate_spawned)
+        # goes through the colored dump + nested decode, not the flat
+        # grey blob.
+        out = self.r._fmt_tool_use_result(
+            {'status': 'teammate_spawned',
+             'payload': '{"agent": "w1"}'}, None)
+        self.assertIn('"status": "teammate_spawned"', out)
+        self.assertIn('.payload =', out)
+        self.assertIn('"agent": "w1"', out)
+
+    def test_unserialisable_dict_result_falls_back(self):
+        out = self.r._fmt_tool_use_result({'x': {1, 2}}, None)
+        self.assertIn('x', out)   # grey str() fallback, no crash
+
 
 class TestQueuedAgentVoice(unittest.TestCase):
     """Inbound agent voice queued while the session was busy lands as a

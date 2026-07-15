@@ -3252,6 +3252,14 @@ def _maybe_json_color(text):
         parsed = json.loads(text)
     except (TypeError, ValueError):
         return None
+    return _json_color_value(parsed)
+
+
+def _json_color_value(parsed):
+    """Colored pretty-print of an already-parsed JSON value, nested
+    JSON-strings appended decoded — the shared tail of
+    ``_maybe_json_color``, also used for dict-shaped ``toolUseResult``
+    payloads that skip the string round-trip."""
     out = [_json_color(json.dumps(parsed, indent=2, ensure_ascii=False))]
     for path, sub in _nested_json_strings(parsed):
         out.append(f'\n{MUTE}{path} ={RESET}')
@@ -4631,8 +4639,10 @@ def _fmt_tur_ask_user_question(tur):
 
 
 def _fmt_tur_default(tur):
+    """Unknown-shape ``toolUseResult``: syntax-colored JSON dump (with
+    nested JSON-strings decoded), not a flat grey blob."""
     try:
-        return f'{GRAY}{json.dumps(tur, indent=2, ensure_ascii=False)}{RESET}'
+        return _json_color_value(tur)
     except (TypeError, ValueError):
         return f'{GRAY}{tur}{RESET}'
 
