@@ -9108,6 +9108,129 @@ class TestTeamWorkers(unittest.TestCase):
         self.assertEqual(self.r._team_workers_for_session(lead),
                          [('w-worker', p)])
 
+    # -- session names ---------------------------------------------------------
+
+    def _write_named(self, sid, titles, pad_records=0):
+        """A session with the given title records appended at the end."""
+        recs = [{'type': 'user', 'sessionId': sid,
+                 'message': {'role': 'user', 'content': 'hello'}}]
+        recs += [{'type': 'user', 'sessionId': sid,
+                  'message': {'role': 'user', 'content': 'x' * 400}}
+                 for _ in range(pad_records)]
+        recs += titles
+        return self._write_session(sid, recs)
+
+    def test_session_name_last_ai_title_wins(self):
+        p = self._write_named('dddd4444-0000-0000-0000-000000000000', [
+            {'type': 'ai-title', 'aiTitle': 'Old title'},
+            {'type': 'ai-title', 'aiTitle': 'New title'},
+        ])
+        self.assertEqual(self.r._session_name_from_file(p), 'New title')
+
+    def test_session_name_custom_outranks_ai(self):
+        p = self._write_named('dddd4444-0000-0000-0000-000000000000', [
+            {'type': 'custom-title', 'customTitle': 'my-name'},
+            {'type': 'ai-title', 'aiTitle': 'Generated later'},
+        ])
+        self.assertEqual(self.r._session_name_from_file(p), 'my-name')
+
+    def test_session_name_empty_custom_falls_back(self):
+        p = self._write_named('dddd4444-0000-0000-0000-000000000000', [
+            {'type': 'ai-title', 'aiTitle': 'Generated'},
+            {'type': 'custom-title', 'customTitle': ''},
+        ])
+        self.assertEqual(self.r._session_name_from_file(p), 'Generated')
+
+    def test_session_name_decodes_escapes(self):
+        p = self._write_named('dddd4444-0000-0000-0000-000000000000', [
+            {'type': 'ai-title', 'aiTitle': 'Fix "quoted" — ünicode'},
+        ])
+        self.assertEqual(self.r._session_name_from_file(p),
+                         'Fix "quoted" — ünicode')
+
+    def test_session_name_beyond_first_window(self):
+        # Title record sits at the START of a file larger than the
+        # initial 64KB tail window — the doubling walk must reach it.
+        sid = 'dddd4444-0000-0000-0000-000000000000'
+        recs = ([{'type': 'ai-title', 'aiTitle': 'Buried title'}]
+                + [{'type': 'user', 'sessionId': sid,
+                    'message': {'role': 'user', 'content': 'y' * 400}}
+                   for _ in range(400)])
+        p = self._write_session(sid, recs)
+        self.assertGreater(os.stat(p).st_size, self.r._NAME_WINDOW)
+        self.assertEqual(self.r._session_name_from_file(p), 'Buried title')
+
+    def test_session_name_cache_invalidates_on_append(self):
+        p = self._write_named('dddd4444-0000-0000-0000-000000000000', [
+            {'type': 'ai-title', 'aiTitle': 'First'},
+        ])
+        self.assertEqual(self.r._session_name_from_file(p), 'First')
+        import json as _json
+        with open(p, 'a') as f:
+            f.write(_json.dumps(
+                {'type': 'ai-title', 'aiTitle': 'Second'}) + '\n')
+        self.assertEqual(self.r._session_name_from_file(p), 'Second')
+
+    def test_scan_tree_captures_titles_and_scope_card(self):
+        p = self._write_named('dddd4444-0000-0000-0000-000000000000', [
+            {'type': 'ai-title', 'aiTitle': 'Tree title'},
+        ])
+        td = self.r._scan_tree(p)
+        self.assertEqual(td.ai_title, 'Tree title')
+        self.assertIsNone(td.custom_title)
+        card = self.r._fmt_scope_card(p, td)
+        self.assertIn('name', card)
+        self.assertIn('Tree title', card)
+        # _session_name serves it from the scanned tree, no file read.
+        self.assertEqual(self.r._session_name(p), 'Tree title')
+
+    def test_session_row_tag_carries_known_name(self):
+        p = self._write_named('dddd4444-0000-0000-0000-000000000000', [
+            {'type': 'ai-title', 'aiTitle': 'Row title'},
+        ])
+        self.r._scan_tree(p)
+        item = self.r._session_item(p)
+        self.assertTrue(item.tag.startswith('Row title · '), item.tag)
+        self.assertEqual(item.session_name, 'Row title')
+
+    def test_fill_session_names_pushes_mod_ops(self):
+        p = self._write_named('dddd4444-0000-0000-0000-000000000000', [
+            {'type': 'ai-title', 'aiTitle': 'Async title'},
+        ])
+        captured = []
+
+        class _Stub:
+            def update_data(self, ops):
+                captured.extend(ops)
+
+        saved = self.r._BROWSER
+        self.r._BROWSER = _Stub()
+        try:
+            self.r._fill_session_names([(p, '3 msg · just now')])
+        finally:
+            self.r._BROWSER = saved
+        self.assertEqual(len(captured), 1)
+        op = captured[0]
+        self.assertEqual(op[0], 'mod')
+        self.assertEqual(op[1], ('session', p))
+        self.assertEqual(op[3]['tag'], 'Async title · 3 msg · just now')
+
+    def test_list_sessions_skips_filler_when_names_known(self):
+        p = self._write_named('dddd4444-0000-0000-0000-000000000000', [
+            {'type': 'ai-title', 'aiTitle': 'Known'},
+        ])
+        self.r._scan_tree(p)
+        spawned = []
+        saved = self.r._spawn_session_name_filler
+        self.r._spawn_session_name_filler = (
+            lambda d, e: spawned.append((d, e)))
+        try:
+            rows = self.r._list_sessions(self.proj)
+        finally:
+            self.r._spawn_session_name_filler = saved
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(spawned, [])
+
     # -- tree wiring -----------------------------------------------------------
 
     def test_teammate_spawn_wires_agent_link(self):

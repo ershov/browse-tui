@@ -665,6 +665,99 @@ def _find_worker_jsonl(session_jsonl_path, worker_name):
     return None
 
 
+# ---- session names ---------------------------------------------------------
+#
+# A session's display name lives in its own transcript: ``ai-title``
+# records (re-generated as the session grows — the LAST one wins) and
+# ``custom-title`` (the user's explicit rename, which outranks the AI
+# title). Both sit near the END of the file, so the extraction reads
+# backwards in growing windows instead of scanning the whole file.
+
+_AI_TITLE_RE = re.compile(rb'"aiTitle"\s*:\s*"((?:[^"\\]|\\.)*)"')
+_CUSTOM_TITLE_RE = re.compile(rb'"customTitle"\s*:\s*"((?:[^"\\]|\\.)*)"')
+_NAME_WINDOW = 65536
+_SESSION_NAME_CACHE = {}   # path → ((size, mtime), name-or-None)
+
+
+def _decode_json_str(raw):
+    """Decode one JSON string body (regex-captured bytes, no quotes)."""
+    try:
+        return json.loads('"' + raw.decode('utf-8', 'replace') + '"')
+    except (ValueError, UnicodeDecodeError):
+        return raw.decode('utf-8', 'replace')
+
+
+def _session_name_from_file(path):
+    """Last recorded title of a session, reading the file tail only.
+
+    Windows grow 4× until a title (or the file start) is hit. A
+    ``custom-title`` found in the window outranks any ``ai-title``;
+    an empty ``customTitle`` (rename cleared) falls back to the AI
+    title. Cached by (size, mtime) — titles change as the file grows.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = (st.st_size, st.st_mtime)
+    cached = _SESSION_NAME_CACHE.get(path)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    name = None
+    try:
+        with open(path, 'rb') as f:
+            win = _NAME_WINDOW
+            while True:
+                off = max(0, st.st_size - win)
+                f.seek(off)
+                chunk = f.read()
+                if off > 0:
+                    # Drop the partial first line so a value split
+                    # across the window boundary can't match truncated.
+                    nl = chunk.find(b'\n')
+                    chunk = chunk[nl + 1:] if nl >= 0 else b''
+                custom = None
+                for m in _CUSTOM_TITLE_RE.finditer(chunk):
+                    custom = m
+                ai = None
+                for m in _AI_TITLE_RE.finditer(chunk):
+                    ai = m
+                if custom is not None and _decode_json_str(custom.group(1)):
+                    name = _decode_json_str(custom.group(1))
+                    break
+                if ai is not None:
+                    name = _decode_json_str(ai.group(1)) or None
+                    break
+                if off == 0:
+                    break
+                win *= 4
+    except OSError:
+        pass
+    _SESSION_NAME_CACHE[path] = (key, name)
+    return name
+
+
+def _session_name(path):
+    """Best known display name for a session, without touching the file.
+
+    The scanned tree (already read in full, kept current by the tail
+    worker) wins; else a fresh tail-scan cache hit. Returns None when
+    the name simply isn't known yet — the async filler back-fills it.
+    """
+    td = _TREE_CACHE.get(path)
+    if td is not None:
+        return td.custom_title or td.ai_title
+    cached = _SESSION_NAME_CACHE.get(path)
+    if cached is not None:
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        if cached[0] == (st.st_size, st.st_mtime):
+            return cached[1]
+    return None
+
+
 # ---- get_children: dispatches by id tag ----------------------------------
 #
 # The Browser passes the raw item id back into ``get_children``. Every id is a
@@ -884,6 +977,19 @@ def _session_item(full, st=None):
     elif worker_meta:
         live = 'live · ' if worker_member is not None else ''
         tag = f'{worker_meta[1]} · {live}' + tag
+    # Session display name — when the transcript title is already known
+    # (scanned tree or a fresh tail-scan cache hit) it shows right away;
+    # otherwise the running metadata's derived name stands in and the
+    # async filler upgrades the row to the transcript title later
+    # (``session_name`` stays None so the row is picked up as pending —
+    # its baseline tag is the un-prefixed one built above).
+    base_tag = tag
+    name = _session_name(full)
+    display = name
+    if display is None and running_meta:
+        display = running_meta.get('name')
+    if display:
+        tag = f'{_trim(display, 48)} · ' + tag
     item = Item(
         id=('session', full),
         title=sid,
@@ -914,6 +1020,8 @@ def _session_item(full, st=None):
     item.team_name = worker_meta[0] if worker_meta else None
     item.agent_name = worker_meta[1] if worker_meta else None
     item.worker_live = worker_member is not None
+    item.session_name = name or None
+    item.base_tag = base_tag
     return item
 
 
@@ -953,6 +1061,15 @@ def _list_sessions(project_dir):
     if linked:
         out = [it for it in out if it.id[1] not in linked]
     out.sort(key=lambda it: -it.mtime)
+    # Names not known synchronously get back-filled off-thread: the
+    # tail-scan reads real bytes per file, too slow for a big dir on
+    # the listing path. The baseline tag (no name prefix) is what the
+    # filler prepends to — a running row showing the derived stand-in
+    # name still upgrades to its transcript title.
+    pending = [(it.id[1], getattr(it, 'base_tag', it.tag)) for it in out
+               if getattr(it, 'session_name', None) is None]
+    if pending:
+        _spawn_session_name_filler(project_dir, pending)
     return out
 
 
@@ -1333,6 +1450,51 @@ def _list_subagents_for_session(session_jsonl_path):
     # Newest-first ordering matches the rest of the recipe.
     out.sort(key=lambda it: -it.mtime)
     return out
+
+
+_NAME_FILL_INFLIGHT = set()
+
+
+def _fill_session_names(entries):
+    """Tail-scan each entry and patch its row tag with the found name.
+
+    ``entries`` is ``[(jsonl_path, tag_without_name)]``. Pushes ``mod``
+    ops in small batches — ``mod`` never inserts, so rows that vanished
+    meanwhile (refresh, filter) are silent no-ops.
+    """
+    ops = []
+    for path, old_tag in entries:
+        name = _session_name_from_file(path)
+        if not name:
+            continue
+        ops.append(mod(('session', path),
+                       tag=f'{_trim(name, 48)} · {old_tag}'))
+        if len(ops) >= 25 and _BROWSER is not None:
+            _BROWSER.update_data(ops)
+            ops = []
+    if ops and _BROWSER is not None:
+        _BROWSER.update_data(ops)
+
+
+def _spawn_session_name_filler(project_dir, entries):
+    """Back-fill session names for a just-listed project dir.
+
+    One daemon thread per dir at a time: it runs ``_fill_session_names``
+    and exits. Headless runs (no Browser) skip — there's nothing to
+    patch.
+    """
+    if _BROWSER is None or project_dir in _NAME_FILL_INFLIGHT:
+        return
+    _NAME_FILL_INFLIGHT.add(project_dir)
+
+    def run():
+        try:
+            _fill_session_names(entries)
+        finally:
+            _NAME_FILL_INFLIGHT.discard(project_dir)
+
+    threading.Thread(target=run, name='claude-name-fill',
+                     daemon=True).start()
 
 
 def _list_session_children(jsonl_path):
@@ -5126,7 +5288,8 @@ class _TreeData:
                  'agent_link', 'records_line', 'parent_id_of',
                  'assistant_has_tool_use', 'tool_to_turn_root_line',
                  'agent_to_assistant_line', 'tool_use_name_of',
-                 'line_offsets', 'voice_count', 'latest_voice_line')
+                 'line_offsets', 'voice_count', 'latest_voice_line',
+                 'ai_title', 'custom_title')
 
     def __init__(self):
         self.records = []
@@ -5174,6 +5337,12 @@ class _TreeData:
         # without an upfront synchronous full-file pass on the main
         # thread.
         self.latest_voice_line = None
+        # Session titles, captured during the fold (ai-title records
+        # are re-generated as the session grows — the last one wins;
+        # custom-title is the user's explicit rename). Tail appends
+        # keep them current.
+        self.ai_title = None
+        self.custom_title = None
 
 
 def _is_inbound_agent_voice(rec):
@@ -5256,6 +5425,11 @@ def _fold_record(td, cur, rec, n, path):
         td.line_of[uuid] = n
     if rec.get('forkedFrom'):
         rec['_tree_forked_from'] = rec['forkedFrom']
+    # Session titles — fold order is file order, so the last one wins.
+    if rec.get('type') == 'ai-title':
+        td.ai_title = rec.get('aiTitle')
+    elif rec.get('type') == 'custom-title':
+        td.custom_title = rec.get('customTitle')
 
     is_root = _is_turn_root(rec)
 
@@ -6520,6 +6694,9 @@ def _fmt_scope_card(path, td):
                 is_sub = True
     rows = []
     rows.append(('path', path))
+    name = td.custom_title or td.ai_title
+    if name:
+        rows.append(('name', name))
     if is_sub:
         agent_id = os.path.basename(path)[len('agent-'):-len('.jsonl')]
         meta = _read_subagent_meta(os.path.join(
