@@ -1046,8 +1046,10 @@ def _m2a_fmt_list(m, name, current_style, state):
     - A remainder that IS a block — a heading, rule, one-line quote, one-row
       table, or a footnote def (the nested alternation; lists are not quotes so
       a def collects, §5.4) — recurses through `_m2a_render` at a width narrowed
-      by the bullet columns and hangs under the bullet. `- [^1]: note` collects
-      and renders an empty item.
+      by the bullet columns; its first rendered line joins the bullet line and
+      any further lines hang (bullet-prefix width == hang width, so a multi-line
+      block stays aligned). An empty remainder (`- [^1]: note` collects the def)
+      renders a lone bullet.
     - Any other remainder is prose (the overwhelmingly common case): the inline
       pass, then wrap with the bullet on the first output line and the hang
       indent on continuations. This path keeps v1's combined bullet+content wrap
@@ -1069,9 +1071,12 @@ def _m2a_fmt_list(m, name, current_style, state):
         bullet_prefix = f"{'  ' * level}{styled} "
         if _m2a_leading_block(content, _M2A_BLOCK_CONTEXT_NESTED) is not None:
             rendered = _m2a_render(content, _m2a_narrow(state, len(hang)), _M2A_BLOCK_CONTEXT_NESTED)
-            out_lines.append(f"{'  ' * level}{styled}")
             if rendered:
-                out_lines.extend(hang + out_ln for out_ln in rendered.split("\n"))
+                block_lines = rendered.split("\n")
+                out_lines.append(bullet_prefix + block_lines[0])
+                out_lines.extend(hang + out_ln for out_ln in block_lines[1:])
+            else:
+                out_lines.append(f"{'  ' * level}{styled}")
             continue
         rendered = _md2ansi(content, current_style, M2A_CONTEXT_MD_INLINE, state)
         content_w = (state.wrap_width if state.wrap_width > 0 else state.line_width) - len(hang)
@@ -1494,20 +1499,6 @@ def md2ansi_scan(text, kinds=M2A_SPANS_BLOCK):
             f"valid kinds are {sorted(M2A_SPANS_ALL)} (plus 'prose')"
         )
     return _m2a_scan(text, frozenset(kinds))
-
-
-# ### Section: Plugin registration ##########################################
-
-# Make this file double as a browse-tui plugin: when imported under a
-# browse-tui interpreter (recipe / --plugin), self-register so the
-# framework knows we're loaded. The import is guarded so the file still
-# works as a standalone library / CLI when browse_tui isn't on the path.
-
-try:
-    from browse_tui import register_plugin, PluginConfig
-    register_plugin(PluginConfig(name='md2ansi_lib'))
-except ImportError:
-    pass
 
 
 # ### Section: main #########################################################
