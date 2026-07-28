@@ -22,7 +22,7 @@ USAGE
 3. **`--install`/`--uninstall`** — copy the binary in/out of standard paths;
    never enters TUI mode.
 
-`--version`, `-h`/`--help`, `--command-log` are orthogonal in TUI mode. In
+`--version` and `-h`/`--help` are orthogonal in TUI mode. In
 recipe mode most browse-tui flags are not accepted, but a set of
 **framework-owned "tier-2 global" flags** — `--tty`, the display toggles
 (`--preview`/`--no-preview`, `--preview-ansi`/`--no-preview-ansi`,
@@ -785,7 +785,6 @@ overlay listed above.
 
 | Flag             | Effect                                                                 |
 | ---------------- | ---------------------------------------------------------------------- |
-| `--command-log`  | Show command log on quit (informational; no behavioural change).       |
 | `--version`      | Print version (`0.1.0`) and exit 0.                                    |
 | `-h`/`--help`    | Print the argparse help summary and exit 0.                            |
 

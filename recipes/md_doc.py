@@ -197,7 +197,9 @@ def _scan_events(text, line_starts, include_lists):
             events.append((span.subtype, {     # subtype is 'h1'..'h6'
                 'byte_offset': byte_offset,
                 'line_offset': _line_of(byte_offset, line_starts),
-                'source': span.text,
+                # A heading span is one line; drop its terminator so ``source``
+                # is the bare heading line, matching the list-item path.
+                'source': span.text.rstrip('\n'),
             }))
         else:
             # ``'list'`` — only present when include_lists is on.

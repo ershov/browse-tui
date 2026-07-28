@@ -20505,8 +20505,6 @@ def build_argparser() -> argparse.ArgumentParser:
                         'with --run-cli or --run resolving to a non-Python '
                         'recipe.')
     # Debug / ops
-    p.add_argument('--command-log', action='store_true',
-                   help='Show command log on quit.')
     p.add_argument('--version', action='store_true', help='Print version and exit.')
     p.add_argument('-h', '--help', action='store_true', help='Show help and exit.')
     return p
