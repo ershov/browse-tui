@@ -3126,84 +3126,115 @@ def default_row(item, ctx):
     return chrome + default_row_content(item, ctx)
 
 
+# Framework-owned flags, auto-detected by ``Browser.run`` from
+# ``sys.argv[1:]`` and stripped from a recipe's view of argv by
+# ``recipe_argv``. Both sites derive their token sets from these two
+# tables so they cannot drift. Bool pairs take the ``--NAME`` /
+# ``--no-NAME`` forms (mirroring argparse's ``BooleanOptionalAction``);
+# value flags take ``--NAME VALUE`` and ``--NAME=VALUE``. In every case
+# the config value is the baseline and the last CLI occurrence wins.
+_FRAMEWORK_BOOL_FLAGS = (
+    'alt-screen',
+    'quit-on-scope-up',
+    'preview',
+    'preview-ansi',
+    'children-pane',
+    'scope-crumb',
+)
+_FRAMEWORK_VALUE_FLAGS = (
+    'tty',
+    'list-size',
+    'split-type',
+    'show-ids',
+)
+
+
 def recipe_argv(argv=None):
     """Return ``argv`` (default ``sys.argv[1:]``) with framework-owned flags stripped.
 
     A recipe that scans its own positionals / options should read from
     this instead of ``sys.argv[1:]`` directly. :meth:`Browser.run`
-    auto-detects the terminal-device flag — ``--tty VALUE`` /
-    ``--tty=VALUE`` — but does NOT remove it from ``sys.argv``, so a
-    recipe's own argv scan would otherwise misread the flag (or its
-    value, e.g. ``-`` or a ``/dev/pts/N`` path) as a positional. This
-    drops exactly those framework-owned tokens — the ``--tty`` flag and
-    its value, and the bare ``--alt-screen`` / ``--no-alt-screen`` and
-    ``--quit-on-scope-up`` / ``--no-quit-on-scope-up`` flags — leaving the
-    recipe's own arguments in order.
+    auto-detects the framework-owned flags but does NOT remove them
+    from ``sys.argv``, so a recipe's own argv scan would otherwise
+    misread a flag (or its value, e.g. ``-`` or a ``/dev/pts/N`` path
+    after ``--tty``) as a positional. This drops exactly those tokens,
+    leaving the recipe's own arguments in order:
 
-    Strips the same forms ``run`` recognises: ``--tty VALUE`` (the value is
-    the following token, consumed too), ``--tty=VALUE`` (one token), and the
-    bare ``--alt-screen`` / ``--no-alt-screen`` and ``--quit-on-scope-up`` /
-    ``--no-quit-on-scope-up`` flags. A trailing bare ``--tty`` with no
-    following token is dropped on its own. Returns a fresh list; ``sys.argv``
-    is left untouched on purpose — ``run`` still needs these flags there to
-    resolve the device / alt-screen / scope-up modes.
+      * the bool pairs ``--NAME`` / ``--no-NAME`` for ``alt-screen``,
+        ``quit-on-scope-up``, ``preview``, ``preview-ansi``,
+        ``children-pane`` and ``scope-crumb``;
+      * the value flags ``--tty``, ``--list-size``, ``--split-type``
+        and ``--show-ids``, in the same forms ``run`` recognises:
+        ``--flag VALUE`` (the value is the following token, consumed
+        too) and ``--flag=VALUE`` (one token). A trailing bare value
+        flag with no following token is dropped on its own.
+
+    Returns a fresh list; ``sys.argv`` is left untouched on purpose —
+    ``run`` still needs these flags there to resolve its settings.
     """
     if argv is None:
         argv = sys.argv[1:]
+    bool_tokens = frozenset(
+        form
+        for name in _FRAMEWORK_BOOL_FLAGS
+        for form in (f'--{name}', f'--no-{name}')
+    )
+    value_tokens = frozenset(f'--{name}' for name in _FRAMEWORK_VALUE_FLAGS)
+    value_prefixes = tuple(f'--{name}=' for name in _FRAMEWORK_VALUE_FLAGS)
     out = []
     skip_next = False
     for arg in argv:
         if skip_next:
             skip_next = False
             continue
-        if arg == '--tty':
+        if arg in value_tokens:
             skip_next = True  # consume the following VALUE token too
             continue
-        if arg.startswith('--tty='):
-            continue
-        if arg in ('--alt-screen', '--no-alt-screen'):
-            continue  # framework-owned, auto-detected by run() — not a positional
-        if arg in ('--quit-on-scope-up', '--no-quit-on-scope-up'):
+        if arg in bool_tokens or arg.startswith(value_prefixes):
             continue  # framework-owned, auto-detected by run() — not a positional
         out.append(arg)
     return out
 
 
-def _resolve_alt_screen(default, argv):
-    """Effective alt-screen setting from the config default + CLI flags.
+def _resolve_bool_flag(name, default, argv):
+    """Effective bool setting for framework flag pair ``--NAME``/``--no-NAME``.
 
-    ``default`` is the ``BrowserConfig.alt_screen`` value (or a recipe's
-    explicit setting); a ``--alt-screen`` / ``--no-alt-screen`` token on the
-    command line overrides it, last occurrence winning — mirroring argparse's
-    ``BooleanOptionalAction`` so recipes (which don't argparse) honour the
-    flag pair the same way the ``browse-tui`` CLI does. ``run`` calls this.
+    ``default`` is the config value (or a recipe's explicit setting); a
+    ``--NAME`` / ``--no-NAME`` token on the command line overrides it, last
+    occurrence winning — mirroring argparse's ``BooleanOptionalAction`` so
+    recipes (which don't argparse) honour the flag pair the same way the
+    ``browse-tui`` CLI does. ``run`` calls this for every entry in
+    ``_FRAMEWORK_BOOL_FLAGS``.
     """
+    on, off = f'--{name}', f'--no-{name}'
     result = default
     for arg in argv:
-        if arg == '--alt-screen':
+        if arg == on:
             result = True
-        elif arg == '--no-alt-screen':
+        elif arg == off:
             result = False
     return result
 
 
-def _resolve_quit_on_scope_up(default, argv):
-    """Effective quit-on-scope-up setting from the config default + CLI flags.
+def _scan_value_flag(name, argv):
+    """Last value of framework flag ``--NAME VALUE`` / ``--NAME=VALUE``, or None.
 
-    ``default`` is the ``BrowserConfig.quit_on_scope_up`` value (or a recipe's
-    explicit setting); a ``--quit-on-scope-up`` / ``--no-quit-on-scope-up``
-    token on the command line overrides it, last occurrence winning —
-    mirroring argparse's ``BooleanOptionalAction`` so recipes (which don't
-    argparse) honour the flag pair the same way the ``browse-tui`` CLI does.
-    ``run`` calls this.
+    Returns ``None`` when the flag is absent — the caller then leaves the
+    config value untouched. Both spellings are honoured, the value token is
+    taken verbatim, and the last occurrence wins, mirroring argparse. A
+    trailing bare ``--NAME`` with no following token is ignored (left to
+    the earlier occurrence / config default) rather than crashing.
     """
-    result = default
-    for arg in argv:
-        if arg == '--quit-on-scope-up':
-            result = True
-        elif arg == '--no-quit-on-scope-up':
-            result = False
-    return result
+    flag = f'--{name}'
+    prefix = f'{flag}='
+    value = None
+    for i, arg in enumerate(argv):
+        if arg == flag:
+            if i + 1 < len(argv):
+                value = argv[i + 1]
+        elif arg.startswith(prefix):
+            value = arg[len(prefix):]
+    return value
 
 
 # Default info-bar hint line. Shared between ``BrowserConfig.hint``
@@ -7828,6 +7859,66 @@ class Browser:
 
     # ---- main loop ------------------------------------------------------
 
+    def _apply_argv_flags(self, args, tty_path):
+        """Apply framework-owned CLI flag overrides from ``args`` to ``self``.
+
+        ``args`` is ``sys.argv[1:]``; ``tty_path`` is the already-resolved
+        ``--tty`` value (the ``--split-type=auto`` width probe targets the
+        same device the UI will paint to). The attribute values set from
+        config in ``__init__`` are the baseline; a CLI occurrence
+        overrides, last one winning. Value flags apply only when present —
+        an absent flag never re-assigns the attribute. Invalid
+        ``--list-size`` / ``--split-type`` / ``--show-ids`` values write a
+        warning to stderr and keep the configured value rather than
+        crashing the recipe.
+
+        Returns the effective alt-screen setting rather than storing it:
+        ``run`` passes it straight to ``term_init``. ``quit_on_scope_up``
+        IS stored back because ``_scope_up`` reads it off the Browser at
+        keypress time.
+        """
+        self.quit_on_scope_up = _resolve_bool_flag(
+            'quit-on-scope-up', self.quit_on_scope_up, args)
+        # ``show_preview``'s None-means-auto tri-state was already
+        # resolved to a bool in ``__init__``; the flag overrides that
+        # resolved value.
+        self.show_preview = _resolve_bool_flag(
+            'preview', self.show_preview, args)
+        self.preview_ansi = _resolve_bool_flag(
+            'preview-ansi', self.preview_ansi, args)
+        self.show_children_pane = _resolve_bool_flag(
+            'children-pane', self.show_children_pane, args)
+        self.show_scope_crumb = _resolve_bool_flag(
+            'scope-crumb', self.show_scope_crumb, args)
+
+        spec = _scan_value_flag('list-size', args)
+        if spec is not None:
+            # ``_resolve_list_size`` warns and returns the default on bad
+            # input; passing the current ratio as that default makes
+            # "invalid keeps the configured value" fall out for free.
+            self.list_ratio = _clamp_list_ratio(
+                _resolve_list_size(spec, default=self.list_ratio))
+
+        spec = _scan_value_flag('split-type', args)
+        if spec is not None:
+            try:
+                self.split = _clamp_split(_resolve_split_type(
+                    spec, _terminal_cols_for_auto(tty_path)))
+            except ValueError as e:
+                sys.stderr.write(
+                    f'warning: {e}; keeping configured split type\n')
+
+        spec = _scan_value_flag('show-ids', args)
+        if spec is not None:
+            if spec in ('always', 'auto', 'never'):
+                self.show_ids = spec
+            else:
+                sys.stderr.write(
+                    f'warning: --show-ids {spec!r}: expected '
+                    f'always | auto | never; keeping configured value\n')
+
+        return _resolve_bool_flag('alt-screen', self.alt_screen, args)
+
     def run(self) -> int:
         """Run the TUI main loop until quit. Returns exit code.
 
@@ -7853,26 +7944,40 @@ class Browser:
         ``--help`` themselves before calling ``run()`` are unaffected
         (their argparse strips the flag from sys.argv first).
 
-        Also auto-detects ``--tty TTY_PATH`` / ``--tty=TTY_PATH`` in
-        ``sys.argv[1:]`` and passes the value to ``term_init`` as the
-        terminal device, so ``./recipe --tty -`` drives the session
-        over the std streams without the recipe wiring its own
-        argparse (and ``--tty /dev/pts/N`` targets that device).
-        Absent ``--tty``, the device defaults to ``/dev/tty``. This is
-        the same mechanism the CLI relies on: argparse does not strip
-        ``--tty`` from ``sys.argv``, so the resolved value reaches
-        ``term_init`` here, keeping it in agreement with the CLI's
-        ``--split-type=auto`` width probe. Recipes that argparse
-        ``--tty`` themselves are unaffected (they strip it first).
+        Also auto-detects the rest of the framework-owned flag set in
+        ``sys.argv[1:]`` (the tokens ``recipe_argv`` strips), so a
+        recipe honours the shared flags without wiring its own
+        argparse. The config value is the baseline and the last CLI
+        occurrence wins; value flags take both the ``--flag VALUE``
+        and ``--flag=VALUE`` spellings:
+
+          * ``--tty TTY_PATH`` — passed to ``term_init`` as the
+            terminal device (``./recipe --tty -`` drives the session
+            over the std streams; ``--tty /dev/pts/N`` targets that
+            device; absent, the device defaults to ``/dev/tty``). This
+            is the same mechanism the CLI relies on: argparse does not
+            strip ``--tty`` from ``sys.argv``, so the resolved value
+            reaches ``term_init`` here, keeping it in agreement with
+            the ``--split-type=auto`` width probe.
+          * the bool pairs ``--alt-screen``, ``--quit-on-scope-up``,
+            ``--preview``, ``--preview-ansi``, ``--children-pane`` and
+            ``--scope-crumb`` (each with its ``--no-`` form).
+          * the value flags ``--list-size``, ``--split-type`` and
+            ``--show-ids``. Invalid values warn on stderr and keep the
+            configured value (see ``_apply_argv_flags``).
+
+        Recipes that argparse any of these flags themselves are
+        unaffected (they strip them from ``sys.argv`` first).
 
         Cross-module symbols (``term_init``/``term_restore``/
         ``term_stdout_was_tty``/``term_result_fd``/
         ``term_release_result_fd``/``read_key``/
         ``g_resize_flag``/``Context``/``dispatch_key``/``render_full``/
-        ``render_partial``/``compose_help_text``) are resolved as bare
-        globals — in the concatenated production build that's the
-        unified namespace; in tests the loader injects them onto this
-        module.
+        ``render_partial``/``compose_help_text``/``_resolve_list_size``/
+        ``_resolve_split_type``/``_terminal_cols_for_auto``) are
+        resolved as bare globals — in the concatenated production build
+        that's the unified namespace; in tests the loader injects them
+        onto this module.
         """
         # Help flag short-circuit: print composed help (usage + intro +
         # sections + CUSTOM ACTIONS + outro) and exit without entering
@@ -7886,36 +7991,17 @@ class Browser:
             sys.stdout.write(compose_help_text(self, include_usage=True))
             return 0
 
-        # Terminal-device auto-detect: scan sys.argv[1:] for ``--tty``
-        # the same way as the help flag above, so a recipe gets the
-        # device behaviour without its own argparse. Both spellings are
-        # honoured: ``--tty VALUE`` (value is the next token) and
-        # ``--tty=VALUE``. The value is passed verbatim to ``term_init``
-        # (``-`` -> std streams, a path -> that device, None -> the
-        # /dev/tty default). A trailing ``--tty`` with no following
-        # value is ignored (left to default) rather than crashing. The
-        # last occurrence wins, mirroring argparse.
-        tty_path = None
+        # Framework-owned flag auto-detect: scan sys.argv[1:] the same
+        # way as the help flag above, so a recipe gets the shared flag
+        # set without its own argparse (``recipe_argv`` strips the same
+        # tokens from a recipe's view of argv). ``--tty`` is handled
+        # here — its value is passed verbatim to ``term_init`` (``-``
+        # -> std streams, a path -> that device, None -> the /dev/tty
+        # default) — the rest via ``_apply_argv_flags``, which also
+        # returns the effective alt-screen setting for ``term_init``.
         args = sys.argv[1:]
-        for i, arg in enumerate(args):
-            if arg == '--tty':
-                if i + 1 < len(args):
-                    tty_path = args[i + 1]
-            elif arg.startswith('--tty='):
-                tty_path = arg[len('--tty='):]
-
-        # ``--alt-screen`` / ``--no-alt-screen`` auto-detect (mirrors the
-        # ``--tty`` scan above): a recipe gets the flag pair without its own
-        # argparse, and ``recipe_argv`` strips both forms. Config default is
-        # the baseline; a CLI flag overrides it (see ``_resolve_alt_screen``).
-        alt_screen = _resolve_alt_screen(self.alt_screen, args)
-
-        # ``--quit-on-scope-up`` / ``--no-quit-on-scope-up`` auto-detect, same
-        # as above: config default is the baseline, a CLI flag overrides it
-        # (see ``_resolve_quit_on_scope_up``). Stored back on ``self`` because
-        # ``_scope_up`` reads it off the Browser at keypress time.
-        self.quit_on_scope_up = _resolve_quit_on_scope_up(
-            self.quit_on_scope_up, args)
+        tty_path = _scan_value_flag('tty', args)
+        alt_screen = self._apply_argv_flags(args, tty_path)
 
         self.start_workers()
         if not self._headless:

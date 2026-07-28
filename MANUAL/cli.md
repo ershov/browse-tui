@@ -22,8 +22,20 @@ USAGE
 3. **`--install`/`--uninstall`** — copy the binary in/out of standard paths;
    never enters TUI mode.
 
-`--version`, `-h`/`--help`, `--command-log` are orthogonal — but only in TUI
-mode. In recipe mode, no other browse-tui flags are accepted.
+`--version`, `-h`/`--help`, `--command-log` are orthogonal in TUI mode. In
+recipe mode most browse-tui flags are not accepted, but a set of
+**framework-owned "tier-2 global" flags** — `--tty`, the display toggles
+(`--preview`/`--no-preview`, `--preview-ansi`/`--no-preview-ansi`,
+`--children-pane`/`--no-children-pane`, `--scope-crumb`/`--no-scope-crumb`,
+`--alt-screen`/`--no-alt-screen`, `--quit-on-scope-up`/`--no-quit-on-scope-up`)
+and the value flags (`--list-size`, `--split-type`, `--show-ids`) — work
+**after** the recipe name too (`browse-tui my-recipe --no-preview`), because
+`Browser.run()` detects and applies them wherever they appear in `sys.argv`.
+See [api.md](api.md#framework-owned-flags-tier-2-globals) for the full set and
+the config-baseline / CLI-override rules. Every argument after `SCRIPT` is
+forwarded to the recipe as its `sys.argv` (tier-2 flags included — `run()`
+detects them in place; `recipe_argv()` is what hides them from a recipe's own
+scan).
 
 ---
 
@@ -348,8 +360,8 @@ When a placeholder doesn't resolve, `browse-tui` falls back to the bare id.
 
 | Flag                  | Effect                                                       |
 | --------------------- | ------------------------------------------------------------ |
-| `--no-preview`        | Start with the preview pane hidden. Toggle live with Ctrl-P. |
-| `--no-children-pane`  | Start with the children-grid pane hidden.                    |
+| `--preview` / `--no-preview` | Start with the preview pane shown / hidden. Default is auto: shown iff a preview source exists (`--preview-cmd`, or a recipe that supplies one) — plain TUI mode without `--preview-cmd` starts hidden. Toggle live with Ctrl-P; pass `--preview` to force it on, `--no-preview` to force it off. |
+| `--children-pane` / `--no-children-pane` | Start with the children-grid pane shown / hidden (default shown). Pass `--children-pane` to force it on when a recipe defaults it off. |
 | `--preview-ansi` / `--no-preview-ansi` | Honour ANSI SGR colour codes in the preview pane (default on). Other escape sequences are stripped either way. Toggle live with capital `R`. |
 | `--no-multi-select`   | Disable the selection set (Space/Alt-Space/Ctrl-A become no-ops). |
 | `--list-size N\|N%`    | Initial list pane size. `N` is a line count (proportional to startup terminal — scales on resize); `N%` locks the proportion. Default `30%`. Adjust live with `-`/`_` (shrink) and `=`/`+` (grow); the ratio is preserved across terminal resizes. |
@@ -357,7 +369,18 @@ When a placeholder doesn't resolve, `browse-tui` falls back to the bare id.
 | `--show-ids MODE`     | Whether to render the id segment in front of each row's title: `always` / `auto` (default) / `never`. In `auto` mode the id is shown only when it is a scalar (`str`/`int`) differing from the title — for line-based CLI sources (filenames, `seq`, `xargs`) an id equal to the title would just be duplication and is suppressed; a `--python` recipe's structured ids (tuples/objects) are routing state and are never shown. |
 | `--title TITLE`       | Window title shown in the info bar.                          |
 | `--initial-scope ID`  | Start scoped to this id (Alt-Up to leave).                   |
-| `--scope-crumb`       | Show the scope drill-down crumb (`▸ a ▸ b …`) in the info bar. Off by default — ids can be long (file paths, jsonl paths) and the crumb eats horizontal space. |
+| `--scope-crumb` / `--no-scope-crumb` | Show / hide the scope drill-down crumb (`▸ a ▸ b …`) in the info bar. Off by default — ids can be long (file paths, jsonl paths) and the crumb eats horizontal space; pass `--no-scope-crumb` to force it off when a recipe defaults it on. |
+
+Most of these display flags are **tier-2 global** — `--preview` /
+`--no-preview`, `--preview-ansi` / `--no-preview-ansi`, `--children-pane` /
+`--no-children-pane`, `--scope-crumb` / `--no-scope-crumb`, `--list-size`,
+`--split-type`, and `--show-ids` are recognised by `Browser.run()` wherever
+they appear in `sys.argv`, so they also take effect **after** a recipe name
+(`browse-tui my-recipe --split-type v --no-children-pane`). The recipe's own
+configured value is the baseline; the CLI flag overrides it (last occurrence
+wins), and a bad value for a value flag warns on `stderr` and keeps the
+configured value. See
+[api.md](api.md#framework-owned-flags-tier-2-globals) for the complete set.
 
 ### Layouts
 
@@ -420,7 +443,9 @@ free: `Browser.run()` auto-detects `--tty TTY_PATH` / `--tty=TTY_PATH` in
 `sys.argv` and forwards the value to the terminal layer, so
 `./my-recipe --tty -` works without the recipe wiring its own argparse. A
 recipe that does argparse `--tty` itself (stripping it before `run()`) is
-unaffected.
+unaffected. `--tty` is one of the framework-owned *tier-2 global* flags that
+`run()` detects wherever they appear — see
+[api.md](api.md#framework-owned-flags-tier-2-globals) for the full set.
 
 ### Capturable result
 

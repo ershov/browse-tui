@@ -1329,18 +1329,68 @@ until `ctx.quit()` (or `q`/`Ctrl-C`). Returns the exit code stashed via `quit`
 
 #### `recipe_argv(argv=None) -> list`
 
-Return `argv` (default `sys.argv[1:]`) with the framework-owned terminal-device
-flag removed — `--tty VALUE` (value is the following token, consumed too) and
-`--tty=VALUE`. `run()` auto-detects that flag but leaves it in `sys.argv`, so a
-recipe scanning its own positionals should read from this instead, or it would
-misread `--tty` / its value (`-` or a `/dev/pts/N` path) as one of its own
-arguments. Returns a fresh list; `sys.argv` is left untouched on purpose — `run()`
-still reads `--tty` from it to resolve the device.
+Return `argv` (default `sys.argv[1:]`) with every **framework-owned flag**
+removed, so a recipe scanning its own positionals never trips over one.
+`Browser.run()` auto-detects these flags in `sys.argv[1:]` and applies them
+itself, but leaves them in place — a recipe reading `sys.argv` directly would
+otherwise misread a framework flag (or its value, e.g. `-` or a `/dev/pts/N`
+path) as one of its own arguments.
+
+##### Framework-owned flags (tier-2 globals)
+
+These are the *tier-2 global* flags — so called because they apply even
+**after** the recipe name (`browse-tui my-recipe --tty -` — in recipe mode a
+flag cannot precede the recipe path at all). Each mirrors a `BrowserConfig`
+field (except `--tty`, which is argv-only — it has no config field, and absent
+it defaults to `/dev/tty`), and `run()` honours it whether the recipe is
+invoked from the CLI or run in-process:
+
+| Flag | Effect |
+| ---- | ------ |
+| `--tty VALUE` / `--tty=VALUE` | terminal device (see [cli.md](cli.md#--tty-tty_path)) |
+| `--alt-screen` / `--no-alt-screen` | alternate-screen buffer on/off |
+| `--quit-on-scope-up` / `--no-quit-on-scope-up` | quit when scoping out past the root |
+| `--preview` / `--no-preview` | preview-pane visibility |
+| `--preview-ansi` / `--no-preview-ansi` | honour SGR colour codes in the preview |
+| `--children-pane` / `--no-children-pane` | children-grid pane visibility |
+| `--scope-crumb` / `--no-scope-crumb` | scope drill-down crumb in the info bar |
+| `--list-size N` / `--list-size=N` | initial list-pane size (`N` lines or `N%`) |
+| `--split-type TYPE` / `--split-type=TYPE` | initial layout (`h`/`v`/`m`/`pc`/`a`, long forms too) |
+| `--show-ids MODE` / `--show-ids=MODE` | id-segment rendering (`always`/`auto`/`never`) |
+
+`-h` / `--help` is auto-detected the same way (it prints help and exits).
+
+##### Resolution: config baseline, CLI override
+
+For every flag the recipe's own `BrowserConfig` value is the **baseline**; a
+matching flag on the command line **overrides** it. When a flag appears more
+than once the **last occurrence wins**, so a wrapper script can prepend a
+default that a user's trailing flag still overrides. A bad value for one of
+the value flags (`--split-type zzz`, `--show-ids sometimes`,
+`--list-size huge`) prints a warning to `stderr` and keeps the recipe's
+configured value — the recipe never crashes on it.
+
+##### A recipe that parses the flag itself wins
+
+Auto-detection is a fallback for recipes that *don't* handle a flag. If a
+recipe argparses (and strips) one of these before calling `run()`, its own
+parse consumes the flag first and the framework never re-applies it — the
+recipe stays fully in control.
+
+##### What `recipe_argv()` strips
+
+`recipe_argv()` drops the **whole table above**: a value flag consumes its
+following-token value (`--tty -` drops both tokens), and the `--flag=VALUE`
+form drops the single token. A trailing bare value flag with no following
+token is dropped on its own. `-h` / `--help` is auto-detected but is **not**
+stripped — handle it (or tolerate it) if your recipe consumes positionals
+before `run()`. `recipe_argv()` returns a fresh list; `sys.argv` is left
+untouched on purpose, since `run()` still reads it to resolve the flags.
 
 ```python
 from browse_tui import recipe_argv
 
-args = recipe_argv()            # this recipe's own positionals, --tty dropped
+args = recipe_argv()            # this recipe's own positionals, framework flags dropped
 root = args[0] if args else '.'
 ```
 

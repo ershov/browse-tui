@@ -34,6 +34,12 @@ _cli.Item = _data.Item
 # Headless tests don't have a real terminal; stub the suspend/resume hooks.
 _cli.term_suspend = lambda: None
 _cli.term_resume = lambda: None
+# ``Browser._apply_argv_flags`` resolves these as bare globals (unified
+# namespace in the concatenated build). The width probe is stubbed —
+# headless tests must not depend on the launching terminal's geometry.
+_state._resolve_list_size = _cli._resolve_list_size
+_state._resolve_split_type = _cli._resolve_split_type
+_state._terminal_cols_for_auto = lambda tty_path=None, default=80: 100
 
 
 class TestArgParser(unittest.TestCase):
@@ -77,6 +83,15 @@ class TestArgParser(unittest.TestCase):
         # #245: default is ANSI-on so existing behaviour is preserved.
         args, _ = _cli.parse_args([])
         self.assertTrue(args.preview_ansi)
+
+    def test_scope_crumb_flag_pair(self):
+        # BooleanOptionalAction: both forms accepted, off by default.
+        args, _ = _cli.parse_args([])
+        self.assertFalse(args.show_scope_crumb)
+        args, _ = _cli.parse_args(['--scope-crumb'])
+        self.assertTrue(args.show_scope_crumb)
+        args, _ = _cli.parse_args(['--scope-crumb', '--no-scope-crumb'])
+        self.assertFalse(args.show_scope_crumb)
 
     def test_no_preview_ansi_flag_sets_false(self):
         args, _ = _cli.parse_args(['--no-preview-ansi'])
@@ -1084,6 +1099,104 @@ class TestSplitTypeArgparse(unittest.TestCase):
         self.assertEqual(args.split_type, 'bogus')
         with self.assertRaises(ValueError):
             _cli._resolve_split_type(args.split_type, 100)
+
+
+class TestApplyArgvFlags(unittest.TestCase):
+    """``Browser._apply_argv_flags``: run()'s framework-flag application.
+
+    Config values (set on the Browser in ``__init__``) are the baseline;
+    flags present in argv override them, invalid values warn on stderr
+    and keep the configured value, and absent flags touch nothing.
+    """
+
+    def _apply(self, argv, **config_kw):
+        config_kw.setdefault('_headless', True)
+        b = _state.Browser(_state.BrowserConfig(**config_kw))
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                alt_screen = b._apply_argv_flags(argv, None)
+        finally:
+            b.stop_workers()
+        return b, alt_screen, buf.getvalue()
+
+    def test_absent_flags_keep_config_values(self):
+        b, alt_screen, err = self._apply(
+            [], show_preview=True, preview_ansi=False,
+            show_children_pane=False, show_scope_crumb=True,
+            quit_on_scope_up=True, alt_screen=False,
+            list_ratio=0.42, split='pc', show_ids='never')
+        self.assertTrue(b.show_preview)
+        self.assertFalse(b.preview_ansi)
+        self.assertFalse(b.show_children_pane)
+        self.assertTrue(b.show_scope_crumb)
+        self.assertTrue(b.quit_on_scope_up)
+        self.assertFalse(alt_screen)
+        self.assertAlmostEqual(b.list_ratio, 0.42)
+        self.assertEqual(b.split, 'pc')
+        self.assertEqual(b.show_ids, 'never')
+        self.assertEqual(err, '')
+
+    def test_bool_pairs_override_config(self):
+        b, alt_screen, err = self._apply(
+            ['--no-preview', '--no-preview-ansi', '--no-children-pane',
+             '--scope-crumb', '--quit-on-scope-up', '--no-alt-screen'],
+            show_preview=True)
+        self.assertFalse(b.show_preview)
+        self.assertFalse(b.preview_ansi)
+        self.assertFalse(b.show_children_pane)
+        self.assertTrue(b.show_scope_crumb)
+        self.assertTrue(b.quit_on_scope_up)
+        self.assertFalse(alt_screen)
+        # alt-screen is returned for term_init, not stored back.
+        self.assertTrue(b.alt_screen)
+        self.assertEqual(err, '')
+
+    def test_preview_flag_overrides_auto_resolution(self):
+        # No get_preview → __init__ resolves the None tri-state to
+        # hidden; --preview forces the pane on anyway.
+        b, _, _ = self._apply(['--preview'])
+        self.assertTrue(b.show_preview)
+
+    def test_bool_last_occurrence_wins(self):
+        b, _, _ = self._apply(
+            ['--no-children-pane', '--children-pane'],
+            show_children_pane=False)
+        self.assertTrue(b.show_children_pane)
+
+    def test_list_size_applied(self):
+        b, _, err = self._apply(['--list-size', '50%'], list_ratio=0.30)
+        self.assertAlmostEqual(b.list_ratio, 0.50)
+        self.assertEqual(err, '')
+
+    def test_list_size_invalid_warns_and_keeps_config(self):
+        b, _, err = self._apply(['--list-size=garbage'], list_ratio=0.42)
+        self.assertAlmostEqual(b.list_ratio, 0.42)
+        self.assertIn('warning', err.lower())
+
+    def test_split_type_applied(self):
+        b, _, err = self._apply(['--split-type=v'], split='h')
+        self.assertEqual(b.split, 'v')
+        self.assertEqual(err, '')
+
+    def test_split_type_invalid_warns_and_keeps_config(self):
+        b, _, err = self._apply(['--split-type', 'bogus'], split='pc')
+        self.assertEqual(b.split, 'pc')
+        self.assertIn('warning', err.lower())
+
+    def test_show_ids_applied(self):
+        b, _, err = self._apply(['--show-ids', 'always'], show_ids='auto')
+        self.assertEqual(b.show_ids, 'always')
+        self.assertEqual(err, '')
+
+    def test_show_ids_invalid_warns_and_keeps_config(self):
+        b, _, err = self._apply(['--show-ids=sometimes'], show_ids='never')
+        self.assertEqual(b.show_ids, 'never')
+        self.assertIn('warning', err.lower())
+
+    def test_value_flag_last_occurrence_wins(self):
+        b, _, _ = self._apply(['--show-ids', 'always', '--show-ids=never'])
+        self.assertEqual(b.show_ids, 'never')
 
 
 class TestSplitTypeWiring(unittest.TestCase):

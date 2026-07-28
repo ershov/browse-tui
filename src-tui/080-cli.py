@@ -535,11 +535,12 @@ def build_argparser() -> argparse.ArgumentParser:
                         'title: always | auto (default; suppress id '
                         'when it equals the title) | never.')
     p.add_argument('--scope-crumb', dest='show_scope_crumb',
-                   action='store_true', default=False,
+                   action=argparse.BooleanOptionalAction, default=False,
                    help='Show the scope drill-down crumb (▸ a ▸ b …) '
                         'in the info bar. Off by default — ids can be '
-                        'long. Recipes that scope into short, '
-                        'meaningful ids can pin this on at construction.')
+                        'long; --no-scope-crumb turns it back off. '
+                        'Recipes that scope into short, meaningful ids '
+                        'can pin this on at construction.')
     p.add_argument('--title', metavar='TITLE', default='browse-tui')
     p.add_argument('--initial-scope', metavar='ID', default=None,
                    help='Start scoped to this id.')

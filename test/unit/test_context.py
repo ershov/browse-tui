@@ -651,56 +651,101 @@ class TestRunExternalKeepScreen(unittest.TestCase):
         self.assertFalse(self._suspend_kwarg())
 
 
-class TestAltScreenFlag(unittest.TestCase):
-    """The --alt-screen / --no-alt-screen flag pair: strip + resolution."""
+class TestFrameworkBoolFlags(unittest.TestCase):
+    """Framework-owned --NAME/--no-NAME pairs: strip + resolution.
+
+    The pairs are table-driven (``_FRAMEWORK_BOOL_FLAGS``), so every
+    entry gets identical last-occurrence-wins semantics through
+    ``_resolve_bool_flag`` and identical stripping in ``recipe_argv``.
+    """
+
+    def test_table_lists_expected_pairs(self):
+        self.assertEqual(
+            set(_state._FRAMEWORK_BOOL_FLAGS),
+            {'alt-screen', 'quit-on-scope-up', 'preview', 'preview-ansi',
+             'children-pane', 'scope-crumb'})
 
     def test_recipe_argv_strips_both_forms(self):
-        argv = ['--no-alt-screen', 'a.md', '--tty', '/dev/tty',
-                '--alt-screen', 'b.md']
-        # Framework flags (both alt-screen forms + --tty VALUE) dropped;
-        # the recipe's own positionals are left in order.
-        self.assertEqual(_state.recipe_argv(argv), ['a.md', 'b.md'])
+        for name in _state._FRAMEWORK_BOOL_FLAGS:
+            argv = [f'--no-{name}', 'a.md', '--tty', '/dev/tty',
+                    f'--{name}', 'b.md']
+            # Framework flags (both bool forms + --tty VALUE) dropped;
+            # the recipe's own positionals are left in order.
+            self.assertEqual(
+                _state.recipe_argv(argv), ['a.md', 'b.md'], name)
 
     def test_resolve_defaults_to_config(self):
-        self.assertTrue(_state._resolve_alt_screen(True, []))
-        self.assertFalse(_state._resolve_alt_screen(False, []))
+        for name in _state._FRAMEWORK_BOOL_FLAGS:
+            self.assertTrue(_state._resolve_bool_flag(name, True, []), name)
+            self.assertFalse(_state._resolve_bool_flag(name, False, []), name)
 
     def test_resolve_flag_overrides_config(self):
-        self.assertFalse(_state._resolve_alt_screen(True, ['--no-alt-screen']))
-        self.assertTrue(_state._resolve_alt_screen(False, ['--alt-screen']))
+        for name in _state._FRAMEWORK_BOOL_FLAGS:
+            self.assertFalse(_state._resolve_bool_flag(
+                name, True, [f'--no-{name}']), name)
+            self.assertTrue(_state._resolve_bool_flag(
+                name, False, [f'--{name}']), name)
 
     def test_resolve_last_occurrence_wins(self):
-        self.assertTrue(_state._resolve_alt_screen(
-            True, ['--no-alt-screen', '--alt-screen']))
-        self.assertFalse(_state._resolve_alt_screen(
-            False, ['--alt-screen', '--no-alt-screen']))
+        for name in _state._FRAMEWORK_BOOL_FLAGS:
+            self.assertTrue(_state._resolve_bool_flag(
+                name, True, [f'--no-{name}', f'--{name}']), name)
+            self.assertFalse(_state._resolve_bool_flag(
+                name, False, [f'--{name}', f'--no-{name}']), name)
 
 
-class TestQuitOnScopeUpFlag(unittest.TestCase):
-    """--quit-on-scope-up / --no-quit-on-scope-up flag pair: strip + resolution."""
+class TestFrameworkValueFlags(unittest.TestCase):
+    """Framework-owned value flags: strip + last-wins scan.
 
-    def test_recipe_argv_strips_both_forms(self):
-        argv = ['--no-quit-on-scope-up', 'a.md', '--tty', '/dev/tty',
-                '--quit-on-scope-up', 'b.md']
-        # Framework flags (both quit-on-scope-up forms + --tty VALUE) dropped;
-        # the recipe's own positionals are left in order.
-        self.assertEqual(_state.recipe_argv(argv), ['a.md', 'b.md'])
+    ``--tty`` / ``--list-size`` / ``--split-type`` / ``--show-ids`` are
+    table-driven (``_FRAMEWORK_VALUE_FLAGS``); ``_scan_value_flag``
+    honours both spellings and ``recipe_argv`` strips the same forms.
+    """
 
-    def test_resolve_defaults_to_config(self):
-        self.assertTrue(_state._resolve_quit_on_scope_up(True, []))
-        self.assertFalse(_state._resolve_quit_on_scope_up(False, []))
+    def test_table_lists_expected_flags(self):
+        self.assertEqual(
+            set(_state._FRAMEWORK_VALUE_FLAGS),
+            {'tty', 'list-size', 'split-type', 'show-ids'})
 
-    def test_resolve_flag_overrides_config(self):
-        self.assertFalse(_state._resolve_quit_on_scope_up(
-            True, ['--no-quit-on-scope-up']))
-        self.assertTrue(_state._resolve_quit_on_scope_up(
-            False, ['--quit-on-scope-up']))
+    def test_scan_absent_returns_none(self):
+        for name in _state._FRAMEWORK_VALUE_FLAGS:
+            self.assertIsNone(_state._scan_value_flag(name, []), name)
+            self.assertIsNone(
+                _state._scan_value_flag(name, ['a.md', '--other=x']), name)
 
-    def test_resolve_last_occurrence_wins(self):
-        self.assertTrue(_state._resolve_quit_on_scope_up(
-            True, ['--no-quit-on-scope-up', '--quit-on-scope-up']))
-        self.assertFalse(_state._resolve_quit_on_scope_up(
-            False, ['--quit-on-scope-up', '--no-quit-on-scope-up']))
+    def test_scan_both_spellings(self):
+        for name in _state._FRAMEWORK_VALUE_FLAGS:
+            self.assertEqual(
+                _state._scan_value_flag(name, [f'--{name}', 'X']), 'X', name)
+            self.assertEqual(
+                _state._scan_value_flag(name, [f'--{name}=Y']), 'Y', name)
+
+    def test_scan_last_occurrence_wins(self):
+        argv = ['--show-ids', 'always', '--show-ids=never']
+        self.assertEqual(_state._scan_value_flag('show-ids', argv), 'never')
+        argv = ['--list-size=10', '--list-size', '50%']
+        self.assertEqual(_state._scan_value_flag('list-size', argv), '50%')
+
+    def test_scan_trailing_bare_flag_ignored(self):
+        # No following token: absent-with-no-value, not a crash; an
+        # earlier occurrence survives a trailing bare repeat.
+        self.assertIsNone(
+            _state._scan_value_flag('split-type', ['--split-type']))
+        self.assertEqual(
+            _state._scan_value_flag(
+                'split-type', ['--split-type=v', '--split-type']),
+            'v')
+
+    def test_recipe_argv_strips_both_spellings(self):
+        for name in _state._FRAMEWORK_VALUE_FLAGS:
+            argv = ['a.md', f'--{name}', 'V', f'--{name}=W', 'b.md']
+            self.assertEqual(
+                _state.recipe_argv(argv), ['a.md', 'b.md'], name)
+
+    def test_recipe_argv_trailing_bare_flag_dropped_alone(self):
+        for name in _state._FRAMEWORK_VALUE_FLAGS:
+            self.assertEqual(
+                _state.recipe_argv(['a.md', f'--{name}']), ['a.md'], name)
 
 
 # --- input (headless) -----------------------------------------------------
