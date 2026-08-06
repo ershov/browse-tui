@@ -9,10 +9,7 @@ the parser / tree-builder helpers directly we stub ``browse_tui`` in
 
 Coverage focuses on the helpers exported at module scope:
 
-* ``_line_starts`` / ``_line_of``    (TestLineIndex)
-* ``_parse``                          (TestParse)
-* ``_walk_list``                      (TestWalkList)
-* ``_build_nodes``                    (TestBuildNodes)
+* ``_build_nodes``                    (TestBuildNodes / TestTextNodes)
 * ``get_children``                    (TestGetChildren)
 * ``_node_at_line``                   (TestNodeAtLine)
 * ``_display_title``                  (TestDisplayTitle)
@@ -21,9 +18,9 @@ Coverage focuses on the helpers exported at module scope:
 * ``_action_toggle_md``               (TestToggleMd)
 * ``_resolve_md_pager``               (TestResolveMdPager)
 
-These are the work of tickets #519 (parser), #520 (list walker +
-tree linking + Item construction), #521 (line lookup + anchor
-resolution), and #522 (preview pipeline + ``m`` / ``M`` toggles).
+The tree is built from ``md2ansi_lib.md2ansi_doc`` (``M2A_Doc`` /
+``M2A_Node``) — headings only, plus the ``#text`` row-set rule for
+loose body runs; titles are the library's stripped display form.
 """
 
 import contextlib
@@ -139,7 +136,7 @@ def _stub_browse_tui():
     sys.modules['browse_tui'] = mod
 
 
-def _load_recipe(include_lists=True):
+def _load_recipe():
     """Load (or reload) the browse-md recipe; returns the module.
 
     ``recipes/browse-md`` has no ``.py`` extension; importlib's
@@ -148,18 +145,11 @@ def _load_recipe(include_lists=True):
     every call so tests that mutate module-level state (notably
     ``_BY_ID`` for ``get_children``) don't bleed into each other.
 
-    The recipe defaults ``_INCLUDE_LISTS`` to ``False`` (production
-    behaviour: headings only unless ``-l`` is passed). The majority of
-    parser-level tests assume list items show up as tree rows, so
-    this loader flips the flag back to ``True`` after module
-    execution. Tests that need to exercise the lists-off path pass
-    ``include_lists=False``.
-
     ``recipes/`` is put on ``sys.path`` (idempotently) so the recipe's
     now-hard ``from md2ansi_lib import ...`` resolves to the real
     library — the same thing ``--run-py`` does at runtime by prepending
     the recipe's directory. Without this the import would silently fail
-    under test and ``_parse`` would have no scanner to call.
+    under test and ``_build_nodes`` would have no document model to map.
     """
     recipes_dir = str(_REPO / 'recipes')
     if recipes_dir not in sys.path:
@@ -170,245 +160,92 @@ def _load_recipe(include_lists=True):
     spec = importlib.util.spec_from_loader(name, loader)
     mod = importlib.util.module_from_spec(spec)
     loader.exec_module(mod)
-    mod._INCLUDE_LISTS = include_lists
     return mod
 
 
-class TestLineIndex(unittest.TestCase):
-    """``_line_starts`` + ``_line_of`` — byte → line conversion."""
+def _build_tree(r, text, path):
+    """Run the recipe's build pipeline on ``text``: ``(root, by_id)``.
+
+    The same two steps ``_reparse`` performs per file — the library
+    document model, then the recipe's Item mapping.
+    """
+    return r._build_nodes(r._md2ansi_doc(text), path)
+
+
+class TestHeadingMasking(unittest.TestCase):
+    """Grammar-level masking flows through ``md2ansi_doc`` into the tree.
+
+    The document model runs the library's full block grammar, so a
+    ``#``-led line inside a fence / blockquote / table never becomes a
+    heading row, and frontmatter is consumed silently. Asserted on the
+    built Item tree — the recipe consumes the model, not raw spans.
+    """
 
     @classmethod
     def setUpClass(cls):
         cls.r = _load_recipe()
 
-    def test_empty_string(self):
-        self.assertEqual(self.r._line_starts(''), [0])
+    def _heading_rows(self, text):
+        """``(tag, title)`` for every HEADING row, in source order.
 
-    def test_no_trailing_newline(self):
-        self.assertEqual(self.r._line_starts('abc'), [0])
+        Text rows are skipped — a masked block (fence / quote / table)
+        legitimately surfaces as a preamble ``[text]`` row; what these
+        tests pin is that it never surfaces as a *heading*.
+        """
+        root, _ = _build_tree(self.r, text, '/tmp/mask.md')
+        out = []
 
-    def test_trailing_newline(self):
-        self.assertEqual(self.r._line_starts('abc\n'), [0, 4])
+        def walk(node):
+            for kid in node._children:
+                if kid.kind == 'heading':
+                    out.append((kid.tag, kid.title))
+                walk(kid)
 
-    def test_two_lines_no_trailing(self):
-        self.assertEqual(self.r._line_starts('abc\ndef'), [0, 4])
-
-    def test_two_lines_trailing(self):
-        self.assertEqual(self.r._line_starts('abc\ndef\n'), [0, 4, 8])
-
-    def test_only_newlines(self):
-        self.assertEqual(self.r._line_starts('\n\n\n'), [0, 1, 2, 3])
-
-    def test_line_of_basic(self):
-        # 'abc\ndef\n' — offsets 0..3 are line 0, 4..7 are line 1.
-        starts = self.r._line_starts('abc\ndef\n')
-        self.assertEqual(self.r._line_of(0, starts), 0)
-        self.assertEqual(self.r._line_of(3, starts), 0)
-        self.assertEqual(self.r._line_of(4, starts), 1)
-        self.assertEqual(self.r._line_of(7, starts), 1)
-        # Past EOF still resolves to the last line index.
-        self.assertEqual(self.r._line_of(8, starts), 2)
-
-    def test_line_of_only_newlines(self):
-        starts = self.r._line_starts('\n\n\n')  # [0, 1, 2, 3]
-        self.assertEqual(self.r._line_of(0, starts), 0)
-        self.assertEqual(self.r._line_of(1, starts), 1)
-        self.assertEqual(self.r._line_of(2, starts), 2)
-        self.assertEqual(self.r._line_of(3, starts), 3)
-
-    def test_line_of_empty(self):
-        starts = self.r._line_starts('')  # [0]
-        self.assertEqual(self.r._line_of(0, starts), 0)
-
-
-class TestParse(unittest.TestCase):
-    """``_parse`` emits ordered ``(kind, payload)`` events."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.r = _load_recipe()
-
-    def _kinds(self, events):
-        return [k for k, _ in events]
+        walk(root)
+        return out
 
     def test_each_heading_level(self):
         text = '# H1\n## H2\n### H3\n#### H4\n##### H5\n###### H6\n'
-        events = self.r._parse(text)
-        self.assertEqual(self._kinds(events),
-                         ['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
-        # Each heading carries a payload with the contract fields.
-        for kind, payload in events:
-            self.assertIn('byte_offset', payload)
-            self.assertIn('line_offset', payload)
-            self.assertIn('source', payload)
-        # H1 starts at byte 0 / line 0.
-        self.assertEqual(events[0][1]['byte_offset'], 0)
-        self.assertEqual(events[0][1]['line_offset'], 0)
-        self.assertEqual(events[0][1]['source'], '# H1')
-        # H2 is on line 1 (after '# H1\n').
-        self.assertEqual(events[1][1]['line_offset'], 1)
-        self.assertEqual(events[1][1]['byte_offset'], 5)
+        self.assertEqual(
+            self._heading_rows(text),
+            [(f'h{n}', f'H{n}') for n in range(1, 7)])
 
     def test_frontmatter_consumed_silently(self):
         text = '---\ntitle: foo\n---\n# H1\n'
-        events = self.r._parse(text)
-        self.assertEqual(self._kinds(events), ['h1'])
-        # The trailing H1 carries the correct post-frontmatter offsets.
-        bo = events[0][1]['byte_offset']
-        self.assertEqual(text[bo:bo + 4], '# H1')
+        self.assertEqual(self._heading_rows(text), [('h1', 'H1')])
 
     def test_hr_mid_document_not_frontmatter(self):
-        # ``---`` not at offset 0 is an HR (no event), NOT frontmatter
-        # (frontmatter has \A anchor). The H1s on either side emit.
+        # ``---`` not at offset 0 is an HR (no heading row), NOT
+        # frontmatter (frontmatter has \A anchor). The headings on
+        # either side show.
         text = '# H1\n\n---\n\n## H2\n'
-        events = self.r._parse(text)
-        self.assertEqual(self._kinds(events), ['h1', 'h2'])
+        self.assertEqual(self._heading_rows(text),
+                         [('h1', 'H1'), ('h2', 'H2')])
 
     def test_heading_inside_fenced_code_block_masked(self):
         text = '```\n# fake heading\n```\n# real heading\n'
-        events = self.r._parse(text)
-        # Only the real heading emits.
-        self.assertEqual(self._kinds(events), ['h1'])
-        self.assertEqual(events[0][1]['source'], '# real heading')
+        self.assertEqual(self._heading_rows(text), [('h1', 'real heading')])
 
     def test_heading_inside_blockquote_masked(self):
         # The blockquote rule starts with ``>`` so the ``> # fake``
         # line is consumed by the blockquote rule rather than emitting.
         text = '> # fake heading\n> still in quote\n\n# real heading\n'
-        events = self.r._parse(text)
-        # Only the real heading should emit; the quoted one is masked.
-        kinds = self._kinds(events)
-        self.assertEqual(kinds.count('h1'), 1)
-        self.assertEqual(events[-1][1]['source'], '# real heading')
+        self.assertEqual(self._heading_rows(text), [('h1', 'real heading')])
 
     def test_heading_inside_table_masked(self):
         # Lines starting with ``|`` are absorbed by the table rule.
         text = '| col |\n| # fake heading |\n\n# real heading\n'
-        events = self.r._parse(text)
-        kinds = self._kinds(events)
-        # The pipe-bordered ``# fake heading`` line is INSIDE the table
-        # block and never emits a heading event.
-        self.assertEqual(kinds.count('h1'), 1)
-        self.assertEqual(events[-1][1]['source'], '# real heading')
-
-    def test_ul_list(self):
-        text = '- foo\n- bar\n'
-        events = self.r._parse(text)
-        self.assertEqual(self._kinds(events), ['ul', 'ul'])
-        # Levels for unindented markers are 0.
-        self.assertEqual(events[0][1]['level'], 0)
-        self.assertEqual(events[1][1]['level'], 0)
-
-    def test_ol_list(self):
-        text = '1. one\n2. two\n'
-        events = self.r._parse(text)
-        self.assertEqual(self._kinds(events), ['ol', 'ol'])
-
-    def test_list_with_continuation_strict(self):
-        # md2ansi_lib's ``_MD_LIST`` is strict: every line of the block
-        # MUST be a marker line. A continuation line breaks the match,
-        # which produces TWO separate list matches (one per side of
-        # the continuation). We don't get a continuation event — only
-        # the marker-lines emit.
-        text = '- foo\n  more text\n- bar\n'
-        events = self.r._parse(text)
-        kinds = self._kinds(events)
-        # Two ``ul`` events total.
-        self.assertEqual(kinds, ['ul', 'ul'])
-        # Both list items recover their original ``source`` line.
-        self.assertEqual(events[0][1]['source'], '- foo')
-        self.assertEqual(events[1][1]['source'], '- bar')
-
-    def test_mixed_ul_ol_markers_brittle(self):
-        # ``_MD_LIST`` requires uniform leading-marker lines: a single
-        # ``_MD_LIST`` match accepts mixed ``-`` and ``\d+.`` lines
-        # because the alternation is per-line. So this whole block is
-        # one match and the walker fans it into two events: one ``ul``
-        # and one ``ol``. (If md2ansi_lib's rule ever tightens, this is the
-        # observed-behavior canary — feel free to update.)
-        text = '- foo\n1. bar\n'
-        events = self.r._parse(text)
-        kinds = self._kinds(events)
-        # Two events — one for each marker line, with their respective
-        # kinds (``ul`` for ``-``, ``ol`` for ``1.``).
-        self.assertEqual(kinds, ['ul', 'ol'])
-
-    def test_heading_events_identical_lists_off_vs_on(self):
-        # The kind set ``_parse`` requests from ``md2ansi_scan`` is
-        # picked by ``_INCLUDE_LISTS``, but the full grammar runs either
-        # way — so heading events must be byte-for-byte identical whether
-        # or not list spans are also yielded. Guards the flag-driven
-        # ``_SCAN_KINDS`` selection.
-        text = (
-            '# H1\n'
-            '- a\n'
-            '- b\n'
-            '## H2\n'
-            '1. one\n'
-            '### H3\n'
-        )
-        try:
-            self.r._INCLUDE_LISTS = True
-            with_lists = self.r._parse(text)
-            self.r._INCLUDE_LISTS = False
-            without_lists = self.r._parse(text)
-        finally:
-            # ``_load_recipe`` left the flag True for this class; restore.
-            self.r._INCLUDE_LISTS = True
-        headings_on = [e for e in with_lists if e[0] in self.r._HEADING_KINDS]
-        # With lists off, every event is a heading already.
-        self.assertEqual(without_lists, headings_on)
-        # And the flag really did change list emission (sanity).
-        self.assertNotEqual(with_lists, without_lists)
-
-
-class TestWalkList(unittest.TestCase):
-    """``_walk_list`` fans one list match out into per-line events."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.r = _load_recipe()
-
-    def _events_for(self, text):
-        # ``_walk_list`` now takes ``(base, text, line_starts)`` fed from
-        # an ``md2ansi_scan`` list span. The span text is the list block
-        # WITHOUT its trailing newline (matching what the scanner yields,
-        # and what the old ``_MD_LIST`` match also excluded), so strip it
-        # here; the per-line assertions stay valid.
-        line_starts = self.r._line_starts(text)
-        span_text = text.rstrip('\n')
-        return self.r._walk_list(0, span_text, line_starts)
-
-    def test_single_level_indent_zero(self):
-        events = self._events_for('- a\n- b\n- c\n')
-        self.assertEqual([e[0] for e in events], ['ul', 'ul', 'ul'])
-        self.assertEqual([e[1]['level'] for e in events], [0, 0, 0])
-
-    def test_nested_two_space_indent(self):
-        # ``- a / 2-space ``  - b`` / 2-space ``  - c``. Two spaces of
-        # indent → ``len(indent)//2 = 1``.
-        events = self._events_for('- a\n  - b\n  - c\n')
-        self.assertEqual([e[1]['level'] for e in events], [0, 1, 1])
-
-    def test_tab_indent_expanded_to_four_spaces(self):
-        # A leading tab expands to 4 spaces; 4 // 2 == 2.
-        events = self._events_for('\t- foo\n')
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0][0], 'ul')
-        self.assertEqual(events[0][1]['level'], 2)
-
-    def test_marker_kinds(self):
-        # ``-``, ``*``, ``+`` → ``ul``; trailing ``.`` (digit + dot) → ``ol``.
-        for marker, kind in (('-', 'ul'), ('*', 'ul'), ('+', 'ul'),
-                             ('1.', 'ol')):
-            text = f'{marker} foo\n'
-            events = self._events_for(text)
-            self.assertEqual(len(events), 1, f'{marker!r}: {events}')
-            self.assertEqual(events[0][0], kind, f'{marker!r}')
+        self.assertEqual(self._heading_rows(text), [('h1', 'real heading')])
 
 
 class TestBuildNodes(unittest.TestCase):
-    """``_build_nodes`` materialises events into a tree of Items."""
+    """``_build_nodes`` maps the ``M2A_Doc`` model onto a tree of Items.
+
+    Headings only — the fixture's list lines are leaf-section body text
+    (they end up inside their heading's byte span, not as rows; the
+    zero-width / leaf-chapter ``#text`` runs are filtered by the row-set
+    rule, see ``TestTextNodes`` for the text-row cases).
+    """
 
     FIXTURE = (
         '# H1\n'        # line 0
@@ -426,11 +263,8 @@ class TestBuildNodes(unittest.TestCase):
     def setUpClass(cls):
         cls.r = _load_recipe()
         cls.path = '/tmp/fake.md'
-        cls.line_starts = cls.r._line_starts(cls.FIXTURE)
-        cls.events = cls.r._parse(cls.FIXTURE)
-        cls.root, cls.by_id = cls.r._build_nodes(
-            cls.events, cls.FIXTURE, cls.line_starts, cls.path,
-        )
+        cls.doc = cls.r._md2ansi_doc(cls.FIXTURE)
+        cls.root, cls.by_id = cls.r._build_nodes(cls.doc, cls.path)
 
     def test_root_id_and_kind(self):
         self.assertEqual(self.root.id, ('file', self.path))
@@ -442,8 +276,8 @@ class TestBuildNodes(unittest.TestCase):
         kids = self.root._children
         self.assertEqual(len(kids), 2)
         self.assertEqual([k.tag for k in kids], ['h1', 'h1'])
-        # Titles are pre-stripped of the leading ``#``s and whitespace;
-        # the kind is already conveyed by the ``[h1]`` tag.
+        # Titles are the library's stripped display form; the kind is
+        # already conveyed by the ``[h1]`` tag.
         self.assertEqual(kids[0].title, 'H1')
         self.assertEqual(kids[1].title, 'H1b')
 
@@ -455,33 +289,34 @@ class TestBuildNodes(unittest.TestCase):
         self.assertEqual(kids[0].title, 'H2a')
         self.assertEqual(kids[1].title, 'H2b')
 
-    def test_h2a_has_two_list_items(self):
-        h2a = self.root._children[0]._children[0]
-        kids = h2a._children
-        self.assertEqual(len(kids), 2)
-        self.assertEqual([k.tag for k in kids], ['ul', 'ul'])
-        # List-item titles are pre-stripped of the marker + whitespace.
-        self.assertEqual(kids[0].title, 'a')
-        self.assertEqual(kids[1].title, 'b')
+    def test_no_list_items_anywhere(self):
+        # List lines are section body, never rows: no ``ul`` / ``ol``
+        # tag exists in the tree or in ``by_id``.
+        seen_tags = []
 
-    def test_a_has_one_nested_child(self):
-        h2a = self.root._children[0]._children[0]
-        a = h2a._children[0]
-        self.assertEqual(len(a._children), 1)
-        self.assertEqual(a._children[0].title, 'a1')
-        self.assertTrue(a.has_children)
+        def walk(node):
+            for kid in node._children:
+                seen_tags.append(kid.tag)
+                walk(kid)
 
-    def test_h2b_has_one_ol_child(self):
-        h2b = self.root._children[0]._children[1]
-        self.assertEqual(len(h2b._children), 1)
-        self.assertEqual(h2b._children[0].tag, 'ol')
-        # ``1. one`` → ``one`` after marker stripping.
-        self.assertEqual(h2b._children[0].title, 'one')
+        walk(self.root)
+        self.assertNotIn('ul', seen_tags)
+        self.assertNotIn('ol', seen_tags)
+        for item in self.by_id.values():
+            self.assertIn(item.kind, ('root', 'heading', 'text'))
 
-    def test_second_h1_has_one_list_child(self):
+    def test_leaf_headings_have_no_children(self):
+        # H2a's body is list lines only — a leaf-chapter body, filtered
+        # by the row-set rule. Same for H2b and H1b.
+        h1 = self.root._children[0]
+        h2a, h2b = h1._children
+        self.assertEqual(h2a._children, [])
+        self.assertFalse(h2a.has_children)
+        self.assertEqual(h2b._children, [])
+        self.assertFalse(h2b.has_children)
         h1b = self.root._children[1]
-        self.assertEqual(len(h1b._children), 1)
-        self.assertEqual(h1b._children[0].title, 'top')
+        self.assertEqual(h1b._children, [])
+        self.assertFalse(h1b.has_children)
 
     def test_byte_size_spans_to_next_sibling_or_shallower(self):
         # First H1 covers lines 0..6 (up to '# H1b' on line 7).
@@ -496,28 +331,24 @@ class TestBuildNodes(unittest.TestCase):
         self.assertNotIn('# H1b', sliced)
 
     def test_last_nodes_byte_size_runs_to_eof(self):
-        # The second H1's section extends to len(file_text).
+        # The second H1's section extends through ``- top`` to EOF.
         h1b = self.root._children[1]
         self.assertEqual(h1b.byte_offset + h1b.byte_size, len(self.FIXTURE))
         self.assertEqual(h1b.line_offset + h1b.line_size,
-                         len(self.line_starts))
-        # And so does its sole child (the ``- top`` list item).
-        top = h1b._children[0]
-        self.assertEqual(top.byte_offset + top.byte_size, len(self.FIXTURE))
+                         len(self.doc.line_starts))
+        sliced = self.FIXTURE[h1b.byte_offset:h1b.byte_offset + h1b.byte_size]
+        self.assertIn('- top', sliced)
 
     def test_h2a_byte_span_stops_at_h2b(self):
-        # ``## H2a`` ends where ``## H2b`` begins (sibling-or-shallower).
+        # ``## H2a`` ends where ``## H2b`` begins (sibling-or-shallower);
+        # the list lines in between belong to H2a's section slice.
         h1 = self.root._children[0]
         h2a, h2b = h1._children
         self.assertEqual(h2a.byte_offset + h2a.byte_size, h2b.byte_offset)
-
-    def test_list_scope_resets_on_heading_boundary(self):
-        # The ``- a`` item's scope ends at ``## H2b`` (next heading),
-        # not at ``- top`` later in the file.
-        h2a = self.root._children[0]._children[0]
-        a = h2a._children[0]  # ``- a``
-        h2b = self.root._children[0]._children[1]
-        self.assertEqual(a.byte_offset + a.byte_size <= h2b.byte_offset, True)
+        sliced = self.FIXTURE[h2a.byte_offset:h2a.byte_offset + h2a.byte_size]
+        self.assertIn('- a', sliced)
+        self.assertIn('  - a1', sliced)
+        self.assertIn('- b', sliced)
 
     def test_ids_for_non_root(self):
         # Non-root ids: ``('content', path, line_offset)``.
@@ -530,75 +361,44 @@ class TestBuildNodes(unittest.TestCase):
         h1b = self.root._children[1]
         self.assertEqual(h1b.id, ('content', self.path, 7))
 
+    def test_byte_offsets_are_source_positions(self):
+        # Heading byte offsets are the literal positions of the ``#``
+        # in the source.
+        h1 = self.root._children[0]
+        h2a, h2b = h1._children
+        h1b = self.root._children[1]
+        self.assertEqual(h1.byte_offset, self.FIXTURE.index('# H1\n'))
+        self.assertEqual(h2a.byte_offset, self.FIXTURE.index('## H2a'))
+        self.assertEqual(h2b.byte_offset, self.FIXTURE.index('## H2b'))
+        self.assertEqual(h1b.byte_offset, self.FIXTURE.index('# H1b'))
+
     def test_kind_field(self):
-        # Every Item has a ``kind`` of root | heading | list-item.
+        # Every Item has a ``kind`` of root | heading (| text, absent
+        # in this fixture).
         self.assertEqual(self.root.kind, 'root')
         for h1 in self.root._children:
             self.assertEqual(h1.kind, 'heading')
         h2a = self.root._children[0]._children[0]
         self.assertEqual(h2a.kind, 'heading')
-        a = h2a._children[0]
-        self.assertEqual(a.kind, 'list-item')
 
     def test_level_field(self):
-        # Headings: 1..6. Lists: indent level. Root: 0.
+        # Headings: 1..6. Root: 0.
         self.assertEqual(self.root.level, 0)
         h1 = self.root._children[0]
         self.assertEqual(h1.level, 1)
         h2a = h1._children[0]
         self.assertEqual(h2a.level, 2)
-        # ``- a`` is at indent 0.
-        a = h2a._children[0]
-        self.assertEqual(a.level, 0)
-        # ``- a1`` is at indent 1 (2 spaces → 2//2 = 1).
-        a1 = a._children[0]
-        self.assertEqual(a1.level, 1)
 
     def test_tag_style_per_heading_level(self):
         h1 = self.root._children[0]
         self.assertEqual(h1.tag_style, 'red')
         h2a = h1._children[0]
         self.assertEqual(h2a.tag_style, 'yellow')
-        # Lists carry ``dim`` regardless of level.
-        a = h2a._children[0]
-        self.assertEqual(a.tag_style, 'dim')
 
-    def test_tag_field(self):
-        h1 = self.root._children[0]
-        self.assertEqual(h1.tag, 'h1')
-        h2a = h1._children[0]
-        self.assertEqual(h2a.tag, 'h2')
-        a = h2a._children[0]
-        self.assertEqual(a.tag, 'ul')
-        h2b = h1._children[1]
-        self.assertEqual(h2b._children[0].tag, 'ol')
-
-    def test_title_strips_marker_prefix(self):
-        # Headings drop leading ``#``s + whitespace; the source line
-        # ``## H2a`` becomes the title ``H2a``. The kind is already
-        # conveyed by the ``[h2]`` tag, so storing the sigil again
-        # would be redundant.
-        h2a = self.root._children[0]._children[0]
-        self.assertEqual(h2a.title, 'H2a')
-
-    def test_has_children_matches_tree_shape(self):
-        # Root, h1, h2a, ``- a`` all have children; leaves don't.
-        self.assertTrue(self.root.has_children)
-        h1 = self.root._children[0]
-        self.assertTrue(h1.has_children)
-        h2a = h1._children[0]
-        self.assertTrue(h2a.has_children)
-        a = h2a._children[0]
-        self.assertTrue(a.has_children)
-        a1 = a._children[0]
-        self.assertFalse(a1.has_children)
-        # ``- b`` (sibling of ``- a``) is a leaf.
-        b = h2a._children[1]
-        self.assertFalse(b.has_children)
-
-    def test_by_id_contains_root_and_every_node(self):
-        # Root + 9 events (2 H1 + 2 H2 + 4 list items + 1 ol).
-        self.assertEqual(len(self.by_id), 1 + len(self.events))
+    def test_by_id_contains_root_and_every_row(self):
+        # Root + 4 headings (2 H1 + 2 H2); the filtered text runs and
+        # the list lines never enter the index.
+        self.assertEqual(len(self.by_id), 5)
         self.assertIn(('file', self.path), self.by_id)
         # Each non-root id resolves to an Item.
         h1 = self.root._children[0]
@@ -606,28 +406,22 @@ class TestBuildNodes(unittest.TestCase):
 
 
 class TestTitleStripping(unittest.TestCase):
-    """Title construction in ``_build_nodes`` — marker prefix removal.
+    """Row titles are the library's display form (``M2A_Node.title``).
 
-    The kind/tag of a tree row is already conveyed by the ``[h1]`` /
-    ``[ul]`` / ... tag (with colour), so the title text drops the
-    redundant ``#`` sigil or list marker. Only the leading prefix +
-    its immediate whitespace is stripped — inline formatting and any
-    trailing decoration stay intact.
+    The heading sigil is stripped (the ``[h1]`` tag already conveys the
+    kind) AND inline markup is stripped via the renderer's own inline
+    grammar, with whitespace collapsed — ``## My **bold** heading``
+    shows as ``My bold heading``.
     """
 
     @classmethod
     def setUpClass(cls):
         cls.r = _load_recipe()
 
-    def _build(self, text, path='/tmp/strip.md'):
-        ls = self.r._line_starts(text)
-        events = self.r._parse(text)
-        return self.r._build_nodes(events, text, ls, path)
-
     def _titles_in_source_order(self, text):
         # Walk the tree depth-first in source order so we get every
-        # parsed node's title regardless of nesting.
-        root, _ = self._build(text)
+        # row's title regardless of nesting.
+        root, _ = _build_tree(self.r, text, '/tmp/strip.md')
         out = []
 
         def walk(node):
@@ -638,61 +432,38 @@ class TestTitleStripping(unittest.TestCase):
         walk(root)
         return out
 
-    def test_heading_inline_formatting_preserved(self):
-        # ``## My **bold** heading`` → ``My **bold** heading``. The
-        # ``**`` markers are part of the title text, not the sigil
-        # prefix, so they survive.
+    def test_heading_inline_formatting_stripped(self):
+        # ``## My **bold** heading`` → ``My bold heading``: the ``**``
+        # markers are inline markup, stripped from the display title
+        # (the rendered preview still shows the bold, of course).
         titles = self._titles_in_source_order('## My **bold** heading\n')
-        self.assertEqual(titles, ['My **bold** heading'])
+        self.assertEqual(titles, ['My bold heading'])
+
+    def test_heading_backticks_stripped(self):
+        # Inline code markers go the same way: ``## `code` span`` →
+        # ``code span``.
+        titles = self._titles_in_source_order('## `code` span\n')
+        self.assertEqual(titles, ['code span'])
 
     def test_heading_trailing_hash_preserved(self):
-        # md2ansi_lib's heading patterns don't special-case a trailing
-        # ``#``, so it stays in the source line — and therefore in
-        # the stored title — after we strip only the *leading*
-        # ``#``s + whitespace.
+        # md2ansi_lib's heading grammar doesn't special-case a trailing
+        # ``#`` — only the *leading* sigil is a sigil — so it stays in
+        # the display title.
         titles = self._titles_in_source_order(
             '### Heading with trailing #\n')
         self.assertEqual(titles, ['Heading with trailing #'])
 
-    def test_list_item_dash_stripped(self):
-        # ``- foo bar`` → ``foo bar``.
-        titles = self._titles_in_source_order('- foo bar\n')
-        self.assertEqual(titles, ['foo bar'])
-
-    def test_list_item_asterisk_stripped(self):
-        # ``* item`` → ``item``.
-        titles = self._titles_in_source_order('* item\n')
-        self.assertEqual(titles, ['item'])
-
-    def test_list_item_plus_stripped(self):
-        # ``+ item`` → ``item``.
-        titles = self._titles_in_source_order('+ item\n')
-        self.assertEqual(titles, ['item'])
-
-    def test_list_item_ordered_single_digit(self):
-        # ``1. item one`` → ``item one``.
-        titles = self._titles_in_source_order('1. item one\n')
-        self.assertEqual(titles, ['item one'])
-
-    def test_list_item_ordered_multi_digit(self):
-        # ``42. wat`` → ``wat``.
-        titles = self._titles_in_source_order('42. wat\n')
-        self.assertEqual(titles, ['wat'])
-
-    def test_heading_with_bold_italic_leading_asterisks(self):
-        # ``## *** bold-italic ***`` — the leading ``##`` matches the
-        # heading rule before the list rule gets a chance, so the
-        # title still gets the heading-prefix treatment and the
-        # ``***`` markers (which are inline formatting, not a list
-        # marker) survive. This is a parser-precedence sanity check.
+    def test_heading_with_bold_italic_asterisks_stripped(self):
+        # ``## *** bold-italic ***`` — the ``***`` runs are inline
+        # emphasis markers, stripped along with the sigil.
         titles = self._titles_in_source_order('## *** bold-italic ***\n')
-        self.assertEqual(titles, ['*** bold-italic ***'])
+        self.assertEqual(titles, ['bold-italic'])
 
-    def test_heading_extra_internal_whitespace_preserved(self):
-        # Only the *immediate* whitespace after the ``#`` run is
-        # consumed by the strip — internal double-spaces survive.
+    def test_heading_internal_whitespace_collapsed(self):
+        # Display titles are whitespace-collapsed: internal double
+        # spaces fold to one.
         titles = self._titles_in_source_order('## Foo  bar\n')
-        self.assertEqual(titles, ['Foo  bar'])
+        self.assertEqual(titles, ['Foo bar'])
 
 
 class TestGetChildren(unittest.TestCase):
@@ -704,15 +475,10 @@ class TestGetChildren(unittest.TestCase):
         fixture = (
             '# H1\n'
             '## H2\n'
-            '- a\n'
-            '- b\n'
+            'body\n'
         )
         self.path = '/tmp/getchildren.md'
-        line_starts = self.r._line_starts(fixture)
-        events = self.r._parse(fixture)
-        self.root, by_id = self.r._build_nodes(
-            events, fixture, line_starts, self.path,
-        )
+        self.root, by_id = _build_tree(self.r, fixture, self.path)
         # Populate the module-level index ``get_children`` reads from.
         self.r._BY_ID = by_id
 
@@ -758,75 +524,65 @@ class TestGetChildren(unittest.TestCase):
 
 
 class TestEdgeCases(unittest.TestCase):
-    """Empty / paragraph-only / leading-list / no-trailing-newline."""
+    """Empty / paragraph-only / leading-body / no-trailing-newline."""
 
     @classmethod
     def setUpClass(cls):
         cls.r = _load_recipe()
 
     def _build(self, text, path='/tmp/edge.md'):
-        line_starts = self.r._line_starts(text)
-        events = self.r._parse(text)
-        root, by_id = self.r._build_nodes(events, text, line_starts, path)
-        return root, by_id, line_starts
+        return _build_tree(self.r, text, path)
 
     def test_empty_file(self):
-        root, by_id, line_starts = self._build('')
+        root, by_id = self._build('')
         self.assertEqual(root._children, [])
         self.assertFalse(root.has_children)
         # ``by_id`` still carries the root.
         self.assertIn(root.id, by_id)
 
     def test_paragraphs_only_no_children(self):
+        # A non-empty preamble with NO heading sibling is filtered by
+        # the row-set rule — the whole body reads through the root's
+        # preview instead.
         text = 'Just a paragraph.\n\nAnd another one.\n'
-        root, _, _ = self._build(text)
+        root, _ = self._build(text)
         self.assertEqual(root._children, [])
         self.assertFalse(root.has_children)
 
-    def test_list_before_any_heading_attaches_to_root(self):
+    def test_body_before_any_heading_attaches_to_root(self):
+        # A body run ahead of the first heading (here list lines — just
+        # text to the headings-only tree) becomes ONE dim ``[text]`` row
+        # before the heading it precedes.
         text = '- top1\n- top2\n# After\n'
-        root, _, _ = self._build(text)
-        # ``- top1`` and ``- top2`` attach to root (no open heading
-        # when they're emitted); ``# After`` also attaches to root.
-        kids = root._children
-        tags = [k.tag for k in kids]
-        self.assertIn('ul', tags)
-        self.assertIn('h1', tags)
-        # Both ``ul`` items appear before the ``h1``.
-        ul_indices = [i for i, k in enumerate(kids) if k.tag == 'ul']
-        h1_index = next(i for i, k in enumerate(kids) if k.tag == 'h1')
-        for ui in ul_indices:
-            self.assertLess(ui, h1_index)
-        # And there are two list items at root.
-        self.assertEqual(len(ul_indices), 2)
+        root, _ = self._build(text)
+        self.assertEqual([k.tag for k in root._children], ['text', 'h1'])
+        text_row = root._children[0]
+        self.assertEqual(text_row.kind, 'text')
+        # The run spans both list lines, up to ``# After``.
+        self.assertEqual(text_row.byte_offset, 0)
+        self.assertEqual(text_row.byte_size, len('- top1\n- top2\n'))
 
     def test_file_without_trailing_newline(self):
-        text = '# Only\n- last'  # no trailing newline
-        root, _, _ = self._build(text)
+        text = '# Only\nlast body'  # no trailing newline
+        root, _ = self._build(text)
         kids = root._children
         self.assertEqual(len(kids), 1)
         h1 = kids[0]
         # ``# Only`` spans through to len(file_text).
         self.assertEqual(h1.byte_offset + h1.byte_size, len(text))
-        # The list item's section also runs to EOF.
-        li = h1._children[0]
-        self.assertEqual(li.byte_offset + li.byte_size, len(text))
+        # Leaf-chapter body → no child rows.
+        self.assertEqual(h1._children, [])
 
 
 class TestNodeAtLine(unittest.TestCase):
     """``_node_at_line`` — line → deepest containing Item lookup."""
 
-    # Same fixture as ``TestBuildNodes`` so we can predict offsets.
     FIXTURE = (
-        '# H1\n'        # line 0
-        '## H2a\n'      # line 1
-        '- a\n'         # line 2
-        '  - a1\n'      # line 3
-        '- b\n'         # line 4
-        '## H2b\n'      # line 5
-        '1. one\n'      # line 6
-        '# H1b\n'       # line 7
-        '- top\n'       # line 8
+        '# H1\n'            # line 0
+        'intro for H1\n'    # line 1 — a [text] row (heading sibling below)
+        '## H2\n'           # line 2
+        'body of H2\n'      # line 3 — leaf-chapter body, NOT a row
+        '# H1b\n'           # line 4
     )
 
     def setUp(self):
@@ -835,11 +591,10 @@ class TestNodeAtLine(unittest.TestCase):
         # to mirror that wiring here.
         self.r = _load_recipe()
         self.path = '/tmp/lookup.md'
-        line_starts = self.r._line_starts(self.FIXTURE)
-        events = self.r._parse(self.FIXTURE)
-        self.root, by_id = self.r._build_nodes(
-            events, self.FIXTURE, line_starts, self.path,
-        )
+        self._index(self.FIXTURE, self.path)
+
+    def _index(self, text, path):
+        self.root, by_id = _build_tree(self.r, text, path)
         self.r._BY_ID = by_id
         self.r._BY_LINE, self.r._LINES_SORTED = self.r._build_line_index(by_id)
 
@@ -850,73 +605,41 @@ class TestNodeAtLine(unittest.TestCase):
         self.assertIsNotNone(node)
         self.assertEqual(node.title, 'H1')
 
-    def test_exact_match_on_list_item_line(self):
-        # Line 2 is the ``- a`` list item; the stored title drops the
-        # leading marker + whitespace.
-        node = self.r._node_at_line(2)
-        self.assertEqual(node.title, 'a')
-        # Line 3 is its nested ``- a1`` child.
-        node = self.r._node_at_line(3)
-        self.assertEqual(node.title, 'a1')
+    def test_exact_match_on_text_run_line(self):
+        # Line 1 is the [text] run preceding ``## H2``.
+        node = self.r._node_at_line(1)
+        self.assertEqual(node.kind, 'text')
+        self.assertEqual(node.title, 'intro for H1')
 
     def test_inexact_falls_back_to_previous_node(self):
-        # If we had blank/paragraph lines in this fixture the lookup
-        # would land on the most recent parsed node. The fixture is
-        # dense (every line is a node), so swap to a fixture with a
-        # gap to exercise this.
-        text = (
-            '# H1\n'        # line 0
-            'paragraph\n'   # line 1 — no node
-            'more text\n'   # line 2 — no node
-            '## H2\n'       # line 3
-        )
-        line_starts = self.r._line_starts(text)
-        events = self.r._parse(text)
-        _root, by_id = self.r._build_nodes(events, text, line_starts, '/x.md')
-        self.r._BY_ID = by_id
-        self.r._BY_LINE, self.r._LINES_SORTED = (
-            self.r._build_line_index(by_id))
-        # Lines 1 and 2 sit between ``# H1`` (line 0) and ``## H2``
-        # (line 3); they should fall back to ``# H1`` (stored as
-        # ``H1`` after marker stripping).
-        self.assertEqual(self.r._node_at_line(1).title, 'H1')
-        self.assertEqual(self.r._node_at_line(2).title, 'H1')
+        # Line 3 (H2's leaf body — not a row) falls back to the most
+        # recent node, ``## H2`` at line 2.
+        self.assertEqual(self.r._node_at_line(3).title, 'H2')
 
     def test_line_before_any_node_returns_none(self):
-        # Build a fixture with a leading preamble so line 0 has no
-        # parsed node.
+        # A blank first line has no node (the preamble run starts at
+        # the first NON-blank line), so line 0 precedes every node.
         text = (
-            'preamble line\n'   # line 0 — no node
+            '\n'                # line 0 — blank, no node
             '# H1\n'            # line 1
         )
-        line_starts = self.r._line_starts(text)
-        events = self.r._parse(text)
-        _root, by_id = self.r._build_nodes(events, text, line_starts, '/y.md')
-        self.r._BY_ID = by_id
-        self.r._BY_LINE, self.r._LINES_SORTED = (
-            self.r._build_line_index(by_id))
+        self._index(text, '/y.md')
         self.assertIsNone(self.r._node_at_line(0))
 
     def test_exact_match_on_last_node(self):
-        # Line 8 is the last node (``- top`` under ``# H1b``); stored
-        # title drops the marker.
-        node = self.r._node_at_line(8)
-        self.assertEqual(node.title, 'top')
+        # Line 4 is the last node (``# H1b``).
+        node = self.r._node_at_line(4)
+        self.assertEqual(node.title, 'H1b')
 
     def test_line_past_last_node_returns_last_containing(self):
-        # Past EOF — should fall back to the last node (``- top``
+        # Past EOF — should fall back to the last node (``# H1b``
         # subsumes any imaginary later lines under it).
         node = self.r._node_at_line(99999)
-        self.assertEqual(node.title, 'top')
+        self.assertEqual(node.title, 'H1b')
 
     def test_empty_file_returns_none(self):
         # No parsed nodes → every lookup is ``None``.
-        line_starts = self.r._line_starts('')
-        events = self.r._parse('')
-        _root, by_id = self.r._build_nodes(events, '', line_starts, '/e.md')
-        self.r._BY_ID = by_id
-        self.r._BY_LINE, self.r._LINES_SORTED = (
-            self.r._build_line_index(by_id))
+        self._index('', '/e.md')
         self.assertIsNone(self.r._node_at_line(0))
         self.assertIsNone(self.r._node_at_line(42))
 
@@ -924,11 +647,11 @@ class TestNodeAtLine(unittest.TestCase):
 class TestDisplayTitle(unittest.TestCase):
     """``_display_title`` — strip surrounding whitespace for matching.
 
-    Stored titles are pre-stripped of ``#`` / list markers at
-    ``_build_nodes`` time, so this helper has collapsed to a thin
-    ``title.strip()`` wrapper. We keep a couple of sanity checks
-    here; the substantive marker-stripping coverage lives in
-    ``TestBuildNodes`` and ``TestTitleStripping``.
+    Stored titles are the library's display form (sigil + inline markup
+    already stripped at build time), so this helper has collapsed to a
+    thin ``title.strip()`` wrapper. We keep a couple of sanity checks
+    here; the substantive stripping coverage lives in
+    ``TestTitleStripping``.
     """
 
     @classmethod
@@ -942,8 +665,8 @@ class TestDisplayTitle(unittest.TestCase):
         return it
 
     def test_returns_title_unchanged_when_clean(self):
-        # The post-#542 contract: stored titles are already free of
-        # ``#`` sigils, so a clean ``Foo`` round-trips verbatim.
+        # Stored titles are already the stripped display form, so a
+        # clean ``Foo`` round-trips verbatim.
         self.assertEqual(self.r._display_title(self._heading('Foo')), 'Foo')
 
     def test_strips_surrounding_whitespace(self):
@@ -954,11 +677,13 @@ class TestDisplayTitle(unittest.TestCase):
             'Foo Bar',
         )
 
-    def test_inline_markers_preserved(self):
-        # ``**bold**`` markers are NOT stripped — they're part of the
-        # title text. Only surrounding whitespace is trimmed.
+    def test_passes_stored_title_through_verbatim(self):
+        # The helper does no stripping of its own beyond whitespace —
+        # whatever is stored (the library already removed markup at
+        # build time) is the matching key.
         self.assertEqual(
-            self.r._display_title(self._heading('**bold**')), '**bold**')
+            self.r._display_title(self._heading('My bold heading')),
+            'My bold heading')
 
 
 class TestResolveAnchor(unittest.TestCase):
@@ -967,7 +692,7 @@ class TestResolveAnchor(unittest.TestCase):
     FIXTURE = (
         '# Intro\n'             # line 0
         '## Overview\n'         # line 1
-        '- bullet\n'            # line 2
+        '- bullet\n'            # line 2 — leaf body of Overview, not a row
         '## Details\n'          # line 3
         '# Conclusion\n'        # line 4
     )
@@ -975,11 +700,10 @@ class TestResolveAnchor(unittest.TestCase):
     def setUp(self):
         self.r = _load_recipe()
         self.path = '/tmp/anchor.md'
-        line_starts = self.r._line_starts(self.FIXTURE)
-        events = self.r._parse(self.FIXTURE)
-        self.root, by_id = self.r._build_nodes(
-            events, self.FIXTURE, line_starts, self.path,
-        )
+        self._index(self.FIXTURE, self.path)
+
+    def _index(self, text, path):
+        self.root, by_id = _build_tree(self.r, text, path)
         self.r._BY_ID = by_id
         self.r._BY_LINE, self.r._LINES_SORTED = (
             self.r._build_line_index(by_id))
@@ -1012,15 +736,10 @@ class TestResolveAnchor(unittest.TestCase):
         self.assertEqual(buf.getvalue(), '')
 
     def test_digit_anchor_before_any_node(self):
-        # Build a fixture where line 0 has no node; the digit anchor
-        # ``0`` lands in preamble territory and falls back to root.
-        text = 'preamble line\n# After\n'
-        line_starts = self.r._line_starts(text)
-        events = self.r._parse(text)
-        root, by_id = self.r._build_nodes(events, text, line_starts, '/p.md')
-        self.r._BY_ID = by_id
-        self.r._BY_LINE, self.r._LINES_SORTED = (
-            self.r._build_line_index(by_id))
+        # Build a fixture where line 0 has no node (a blank line — the
+        # preamble run starts at the first NON-blank line); the digit
+        # anchor ``0`` lands ahead of every node and falls back to root.
+        self._index('\n# After\n', '/p.md')
         # ``_node_at_line(0)`` is None → fall back to root.
         self.assertEqual(self.r._resolve_anchor('0', '/p.md'), ('file', '/p.md'))
 
@@ -1057,12 +776,7 @@ class TestResolveAnchor(unittest.TestCase):
             '# Foobar\n'    # line 0 — prefix-only match
             '# Foo\n'       # line 1 — exact match
         )
-        line_starts = self.r._line_starts(text)
-        events = self.r._parse(text)
-        root, by_id = self.r._build_nodes(events, text, line_starts, '/t.md')
-        self.r._BY_ID = by_id
-        self.r._BY_LINE, self.r._LINES_SORTED = (
-            self.r._build_line_index(by_id))
+        self._index(text, '/t.md')
         # Exact match on line 1 wins over prefix match on line 0.
         self.assertEqual(
             self.r._resolve_anchor('Foo', '/t.md'), ('content', '/t.md', 1))
@@ -1074,19 +788,14 @@ class TestResolveAnchor(unittest.TestCase):
             '# Dup\n'   # line 0
             '# Dup\n'   # line 1
         )
-        line_starts = self.r._line_starts(text)
-        events = self.r._parse(text)
-        root, by_id = self.r._build_nodes(events, text, line_starts, '/d.md')
-        self.r._BY_ID = by_id
-        self.r._BY_LINE, self.r._LINES_SORTED = (
-            self.r._build_line_index(by_id))
+        self._index(text, '/d.md')
         self.assertEqual(
             self.r._resolve_anchor('Dup', '/d.md'), ('content', '/d.md', 0))
 
-    def test_anchor_skips_list_items(self):
-        # ``bullet`` matches the list-item ``- bullet`` text but
-        # ``_resolve_anchor`` only scans headings; no match → warning
-        # + root fall-through.
+    def test_anchor_scans_headings_only(self):
+        # ``bullet`` matches only body text (``- bullet`` — not even a
+        # row here) and ``_resolve_anchor`` only scans headings; no
+        # match → warning + root fall-through.
         from io import StringIO
         from contextlib import redirect_stderr
         buf = StringIO()
@@ -1097,16 +806,10 @@ class TestResolveAnchor(unittest.TestCase):
 
     def _build_goals_fixture(self):
         # Single ``## Goals`` heading at line 0 so the three tiers can
-        # be exercised independently — stored title for ``## Goals`` is
-        # ``'Goals'`` after #542 stripped the marker.
-        text = '## Goals\n'
-        line_starts = self.r._line_starts(text)
-        events = self.r._parse(text)
-        root, by_id = self.r._build_nodes(events, text, line_starts, '/g.md')
-        self.r._BY_ID = by_id
-        self.r._BY_LINE, self.r._LINES_SORTED = (
-            self.r._build_line_index(by_id))
-        return root
+        # be exercised independently — the stored display title for
+        # ``## Goals`` is ``'Goals'``.
+        self._index('## Goals\n', '/g.md')
+        return self.root
 
     def test_case_insensitive_exact_match(self):
         # Lower-case anchor ``goals`` matches stored title ``Goals``
@@ -1154,14 +857,14 @@ class TestResolveAnchor(unittest.TestCase):
 class TestGetPreview(unittest.TestCase):
     """``get_preview`` — slice ``_FILE_TEXT`` per node, optionally md2ansi-render."""
 
-    # Fixture chosen so headings, list items, and root all resolve to
+    # Fixture chosen so headings, the text run, and root all resolve to
     # different byte windows. Trailing newline so byte_size on the
     # final node ends cleanly at len(text).
     FIXTURE = (
         '# H1\n'        # line 0, bytes 0..5
-        'preamble\n'    # line 1, bytes 5..14
+        'preamble\n'    # line 1, bytes 5..14 — [text] row (sibling ## H2)
         '## H2\n'       # line 2, bytes 14..20
-        '- a\n'         # line 3, bytes 20..24
+        '- a\n'         # line 3, bytes 20..24 — leaf body of H2
         '- b\n'         # line 4, bytes 24..28
         '# H1b\n'       # line 5, bytes 28..34
     )
@@ -1172,11 +875,7 @@ class TestGetPreview(unittest.TestCase):
         # ``_md2ansi_fn``, ``_BROWSER``) mustn't bleed across tests.
         self.r = _load_recipe()
         self.path = '/tmp/preview.md'
-        line_starts = self.r._line_starts(self.FIXTURE)
-        events = self.r._parse(self.FIXTURE)
-        self.root, by_id = self.r._build_nodes(
-            events, self.FIXTURE, line_starts, self.path,
-        )
+        self.root, by_id = _build_tree(self.r, self.FIXTURE, self.path)
         # Wire the module-level state ``get_preview`` reads from. This
         # mirrors what ``main()`` does at startup; we skip the actual
         # Browser construction.
@@ -1208,11 +907,12 @@ class TestGetPreview(unittest.TestCase):
         self.assertNotIn('# H1b', out)
 
     def test_nested_heading_slice(self):
-        # ``## H2`` is a child of ``# H1``; its section runs from its
-        # own offset to the next sibling-or-shallower boundary (here
-        # the next ``# H1b`` since no other ``## H*`` follows).
+        # ``## H2`` is a child of ``# H1`` (after the [text] run); its
+        # section runs from its own offset to the next
+        # sibling-or-shallower boundary (here the next ``# H1b`` since
+        # no other ``## H*`` follows).
         h1 = self.root._children[0]
-        h2 = h1._children[0]
+        h2 = h1._children[1]
         self.assertEqual(h2.tag, 'h2')
         out = self.r.get_preview(h2.id)
         self.assertEqual(out,
@@ -1220,15 +920,14 @@ class TestGetPreview(unittest.TestCase):
                                       h2.byte_offset + h2.byte_size])
         self.assertTrue(out.startswith('## H2\n'))
 
-    def test_list_item_returns_leaf_slice(self):
-        # ``- a`` at line 3 — leaf list item; its byte_size spans only
-        # its own line (next sibling is ``- b`` at line 4).
+    def test_text_run_returns_its_slice(self):
+        # The [text] run at line 1 — its byte window is just the run
+        # (up to the ``## H2`` it precedes).
         h1 = self.root._children[0]
-        h2 = h1._children[0]
-        li_a = h2._children[0]
-        self.assertIn(li_a.tag, ('ul', 'ol'))
-        out = self.r.get_preview(li_a.id)
-        self.assertEqual(out, '- a\n')
+        text_run = h1._children[0]
+        self.assertEqual(text_run.tag, 'text')
+        out = self.r.get_preview(text_run.id)
+        self.assertEqual(out, 'preamble\n')
 
     def test_unknown_id_returns_empty(self):
         # An id that classifies as neither file-root nor content (here a
@@ -2063,22 +1762,26 @@ class TestHelpIntro(unittest.TestCase):
         self.assertTrue(self.r._HELP_USAGE.strip())
 
     def test_contains_usage_form(self):
-        # The usage line documents the optional ``-l`` flag, the repeatable
-        # ``--root DIR`` flag, and the file/dir positionals (with the anchor
-        # syntax detailed below). It belongs to ``_HELP_USAGE`` (the
-        # ``--help`` flags block), not the in-app intro.
+        # The usage line documents the repeatable ``--root DIR`` flag and
+        # the file/dir positionals (with the anchor syntax detailed
+        # below). It belongs to ``_HELP_USAGE`` (the ``--help`` flags
+        # block), not the in-app intro.
         self.assertIn(
-            'browse-md [-l] [--root DIR ...] [FILE.md', self.r._HELP_USAGE)
+            'browse-md [--root DIR ...] [FILE.md', self.r._HELP_USAGE)
         # The flags block must NOT leak into the in-app help intro.
         self.assertNotIn('Usage:', self.r._HELP_INTRO)
 
-    def test_mentions_lists_flag(self):
-        # The ``-l`` / ``--list`` / ``--lists`` flag toggles list-item
-        # emission; all three aliases should be discoverable from the
-        # usage block alongside a brief description.
-        self.assertIn('-l', self.r._HELP_USAGE)
-        self.assertIn('--list', self.r._HELP_USAGE)
-        self.assertIn('--lists', self.r._HELP_USAGE)
+    def test_mentions_help_flag(self):
+        # ``-h`` / ``--help`` is a real flag now — discoverable from the
+        # usage block.
+        self.assertIn('-h, --help', self.r._HELP_USAGE)
+
+    def test_no_lists_flag_leftovers(self):
+        # The dropped ``-l`` / ``--list`` / ``--lists`` flag must not
+        # linger in either help block.
+        for block in (self.r._HELP_USAGE, self.r._HELP_INTRO):
+            self.assertNotIn('--list', block)
+            self.assertNotIn('list item', block)
 
     def test_mentions_root_flag(self):
         # The repeatable ``--root DIR`` reference-resolution flag should be
@@ -2111,20 +1814,18 @@ class TestHelpIntro(unittest.TestCase):
 
 
 class TestArgvFlag(unittest.TestCase):
-    """``_pop_flag`` — extract ``-l`` / ``--list`` / ``--lists`` from argv.
+    """``_pop_flag`` — extract ``-h`` / ``--help`` from argv.
 
-    The flag is parsed before the positional in ``main()`` so order
-    in argv is flexible; the helper is verified directly by patching
-    ``sys.argv`` on the recipe module. ``setUp`` reloads the recipe
-    with lists off (the production default) so the flag's effect on
-    the global is observable.
+    The flag is popped before the leftover-option scan in ``main()`` so
+    order in argv is flexible; the helper is verified directly by
+    patching ``sys.argv`` on the recipe module.
     """
 
     def setUp(self):
         # Fresh module per test — ``sys.argv`` is patched on the
         # recipe's own ``sys`` reference, so we restore the original
         # argv in ``tearDown`` to keep test isolation tight.
-        self.r = _load_recipe(include_lists=False)
+        self.r = _load_recipe()
         self._saved_argv = list(self.r.sys.argv)
 
     def tearDown(self):
@@ -2138,50 +1839,92 @@ class TestArgvFlag(unittest.TestCase):
 
     def test_flag_absent_returns_false(self):
         self._set_argv(['browse-md', 'FILE.md'])
-        self.assertFalse(self.r._pop_flag('-l', alts=('--list', '--lists')))
+        self.assertFalse(self.r._pop_flag('-h', alts=('--help',)))
         # The positional survives the pop pass.
         self.assertEqual(self.r.sys.argv, ['browse-md', 'FILE.md'])
 
     def test_short_flag_before_positional(self):
-        self._set_argv(['browse-md', '-l', 'FILE.md'])
-        self.assertTrue(self.r._pop_flag('-l', alts=('--list', '--lists')))
+        self._set_argv(['browse-md', '-h', 'FILE.md'])
+        self.assertTrue(self.r._pop_flag('-h', alts=('--help',)))
         self.assertEqual(self.r.sys.argv, ['browse-md', 'FILE.md'])
 
     def test_short_flag_after_positional(self):
-        self._set_argv(['browse-md', 'FILE.md', '-l'])
-        self.assertTrue(self.r._pop_flag('-l', alts=('--list', '--lists')))
+        self._set_argv(['browse-md', 'FILE.md', '-h'])
+        self.assertTrue(self.r._pop_flag('-h', alts=('--help',)))
         self.assertEqual(self.r.sys.argv, ['browse-md', 'FILE.md'])
 
-    def test_long_list_alias(self):
-        self._set_argv(['browse-md', '--list', 'FILE.md'])
-        self.assertTrue(self.r._pop_flag('-l', alts=('--list', '--lists')))
-        self.assertEqual(self.r.sys.argv, ['browse-md', 'FILE.md'])
-
-    def test_long_lists_alias(self):
-        self._set_argv(['browse-md', '--lists', 'FILE.md'])
-        self.assertTrue(self.r._pop_flag('-l', alts=('--list', '--lists')))
+    def test_long_alias(self):
+        self._set_argv(['browse-md', '--help', 'FILE.md'])
+        self.assertTrue(self.r._pop_flag('-h', alts=('--help',)))
         self.assertEqual(self.r.sys.argv, ['browse-md', 'FILE.md'])
 
     def test_repeated_flags_all_removed(self):
         # Multiple instances of the flag (mixing aliases) should ALL
         # be removed so the positional remains at ``sys.argv[1]``.
-        self._set_argv(['browse-md', '-l', '--list', 'FILE.md'])
-        self.assertTrue(self.r._pop_flag('-l', alts=('--list', '--lists')))
+        self._set_argv(['browse-md', '-h', '--help', 'FILE.md'])
+        self.assertTrue(self.r._pop_flag('-h', alts=('--help',)))
         self.assertEqual(self.r.sys.argv, ['browse-md', 'FILE.md'])
 
     def test_pop_flag_does_not_consume_unrelated_args(self):
         # Unknown args are left alone — they'll surface downstream if
         # bogus, but ``_pop_flag`` itself only touches its own keys.
         self._set_argv(['browse-md', '--frobnicate', 'FILE.md'])
-        self.assertFalse(self.r._pop_flag('-l', alts=('--list', '--lists')))
+        self.assertFalse(self.r._pop_flag('-h', alts=('--help',)))
         self.assertEqual(
             self.r.sys.argv, ['browse-md', '--frobnicate', 'FILE.md'])
+
+
+class TestHelpFlag(unittest.TestCase):
+    """``main()`` with ``-h`` / ``--help`` — full help to stdout, exit 0.
+
+    The flag is popped BEFORE the leftover-option scan (which would
+    otherwise die ``unrecognised option: -h``) and before any file is
+    read, so it works with or without positionals.
+    """
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self._saved_argv = list(self.r.sys.argv)
+
+    def tearDown(self):
+        self.r.sys.argv[:] = self._saved_argv
+
+    def _run_help(self, argv):
+        import contextlib
+        import io
+        self.r.sys.argv[:] = argv
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            with self.assertRaises(SystemExit) as cm:
+                self.r.main()
+        return cm.exception.code, out.getvalue()
+
+    def test_short_flag_prints_help_and_exits_zero(self):
+        code, out = self._run_help(['browse-md', '-h'])
+        self.assertEqual(code, 0)
+        # Both blocks land on STDOUT: the usage/flags block and the
+        # keys intro.
+        self.assertIn(self.r._HELP_USAGE, out)
+        self.assertIn(self.r._HELP_INTRO, out)
+
+    def test_long_flag_prints_help_and_exits_zero(self):
+        code, out = self._run_help(['browse-md', '--help'])
+        self.assertEqual(code, 0)
+        self.assertIn('Usage: browse-md', out)
+
+    def test_help_wins_over_positionals(self):
+        # ``browse-md --help FILE`` prints help without touching the
+        # (non-existent) file — no "no such file" death.
+        code, out = self._run_help(
+            ['browse-md', '--help', '/no/such/file.md'])
+        self.assertEqual(code, 0)
+        self.assertIn('Usage: browse-md', out)
 
 
 class TestArgvValueFlag(unittest.TestCase):
     """``_pop_value_flag`` — extract the value-taking ``--root DIR`` from argv.
 
-    The value-taking sibling of ``_pop_flag``: like the ``-l`` extraction it
+    The value-taking sibling of ``_pop_flag``: like the ``-h`` extraction it
     runs before the positionals are read and mutates ``sys.argv`` in place,
     but each occurrence consumes a VALUE — either the following token
     (``--root DIR``) or an inline ``--root=DIR`` — and the values are returned
@@ -2361,7 +2104,7 @@ class TestArgvErrors(unittest.TestCase):
         # (``_pop_flag`` mutates ``sys.argv`` in place — restoring isn't
         # enough since other globals also get touched on the success
         # path; we never hit the success path here anyway).
-        self.r = _load_recipe(include_lists=False)
+        self.r = _load_recipe()
         self._saved_argv = list(self.r.sys.argv)
 
     def tearDown(self):
@@ -2443,6 +2186,26 @@ class TestArgvErrors(unittest.TestCase):
             import os as _os
             _os.unlink(tmp_path)
 
+    def test_dropped_lists_flag_is_unrecognised(self):
+        # The ``-l`` / ``--list`` / ``--lists`` flag was removed with
+        # list-item support — it now dies like any other unknown option.
+        import tempfile
+        with tempfile.NamedTemporaryFile(
+                'w', suffix='.md', delete=False) as tmp:
+            tmp.write('# H\n')
+            tmp_path = tmp.name
+        try:
+            for flag in ('-l', '--list', '--lists'):
+                with self.subTest(flag=flag):
+                    self.r = _load_recipe()
+                    self._set_argv(['browse-md', flag, tmp_path])
+                    code, err = self._run_main_capture()
+                    self.assertEqual(code, 2)
+                    self.assertIn(f'unrecognised option: {flag}', err)
+        finally:
+            import os as _os
+            _os.unlink(tmp_path)
+
     def test_extra_positional_nonexistent_file(self):
         # After #553 the recipe accepts multiple file positionals, so
         # an "extra" token is treated as another file. A non-existent
@@ -2488,13 +2251,13 @@ class TestArgvErrors(unittest.TestCase):
 class TestMissingDependencyGate(unittest.TestCase):
     """``main()`` fails fast when a hard dependency couldn't be imported.
 
-    The tree is built by ``md_doc.build_doc_tree``, which in turn derives
-    structure from ``md2ansi_scan`` — so both ``md2ansi_lib`` and
-    ``md_doc`` are hard dependencies. ``main()`` checks ``_md2ansi_scan``
-    and then ``md_doc`` before any parsing and exits 2 via ``_die`` when
-    either is ``None`` — simulating an environment where the import
-    failed. The stub ``browse_tui`` is already installed by the loader,
-    and the gate fires before the Browser is ever constructed.
+    The tree is built from ``md2ansi_lib.md2ansi_doc`` and the reference
+    subtrees ride on ``md_doc`` — so both are hard dependencies.
+    ``main()`` checks ``_md2ansi_doc`` and then ``md_doc`` before any
+    parsing and exits 2 via ``_die`` when either is ``None`` — simulating
+    an environment where the import failed. The stub ``browse_tui`` is
+    already installed by the loader, and the gate fires before the
+    Browser is ever constructed.
     """
 
     def setUp(self):
@@ -2523,14 +2286,14 @@ class TestMissingDependencyGate(unittest.TestCase):
                 self.r.main()
         return cm.exception.code, buf.getvalue()
 
-    def test_missing_scanner_exits_two_with_message(self):
+    def test_missing_doc_model_exits_two_with_message(self):
         import os
         # A real .md file so the gate is exercised, not the argv checks
         # (the gate runs first regardless, but a valid file ensures the
         # only reason main() can exit is the missing-dependency gate).
         tmp_path = self._real_md_file()
         try:
-            self.r._md2ansi_scan = None
+            self.r._md2ansi_doc = None
             code, err = self._run_main_capture(tmp_path)
             self.assertEqual(code, 2)
             self.assertIn('requires the md2ansi_lib module', err)
@@ -2543,8 +2306,8 @@ class TestMissingDependencyGate(unittest.TestCase):
 
     def test_missing_md_doc_exits_two_with_message(self):
         import os
-        # Mirror the scanner gate for the ``md_doc`` hard dependency.
-        # Leave ``_md2ansi_scan`` intact so the FIRST gate passes and we
+        # Mirror the doc-model gate for the ``md_doc`` hard dependency.
+        # Leave ``_md2ansi_doc`` intact so the FIRST gate passes and we
         # exercise the ``md_doc is None`` branch specifically.
         tmp_path = self._real_md_file()
         try:
@@ -2560,151 +2323,27 @@ class TestMissingDependencyGate(unittest.TestCase):
             os.unlink(tmp_path)
 
 
-class TestBuildNodesNoLists(unittest.TestCase):
-    """``_build_nodes`` with ``_INCLUDE_LISTS = False`` — headings only.
-
-    Same fixture as ``TestBuildNodes`` (so we can compare against its
-    "lists on" expectations), but the recipe is loaded with the flag
-    off. Heading shape MUST be unchanged — same ids, same byte/line
-    offsets — and list items MUST be absent from the tree and from
-    ``_BY_ID``. The section ``byte_size`` widens to include the list
-    bytes (since lists no longer act as sub-section boundaries).
-    """
-
-    FIXTURE = (
-        '# H1\n'        # line 0
-        '## H2a\n'      # line 1
-        '- a\n'         # line 2
-        '  - a1\n'      # line 3
-        '- b\n'         # line 4
-        '## H2b\n'      # line 5
-        '1. one\n'      # line 6
-        '# H1b\n'       # line 7
-        '- top\n'       # line 8
-    )
-
-    @classmethod
-    def setUpClass(cls):
-        cls.r = _load_recipe(include_lists=False)
-        cls.path = '/tmp/nolists.md'
-        cls.line_starts = cls.r._line_starts(cls.FIXTURE)
-        cls.events = cls.r._parse(cls.FIXTURE)
-        cls.root, cls.by_id = cls.r._build_nodes(
-            cls.events, cls.FIXTURE, cls.line_starts, cls.path,
-        )
-
-    def test_events_contain_only_headings(self):
-        # Parser-level gate: ``_parse`` skipped list emission entirely.
-        kinds = {kind for kind, _ in self.events}
-        self.assertEqual(kinds, {'h1', 'h2'})
-
-    def test_root_has_two_h1_children(self):
-        # Shape at root is unchanged — two H1s, no list items.
-        kids = self.root._children
-        self.assertEqual([k.tag for k in kids], ['h1', 'h1'])
-        self.assertEqual([k.title for k in kids], ['H1', 'H1b'])
-
-    def test_no_list_items_in_tree(self):
-        # Walk every node in the tree; no ``ul`` or ``ol`` shows up.
-        seen_tags = []
-
-        def walk(node):
-            for kid in node._children:
-                seen_tags.append(kid.tag)
-                walk(kid)
-
-        walk(self.root)
-        for tag in seen_tags:
-            self.assertNotIn(tag, ('ul', 'ol'))
-
-    def test_no_list_items_in_by_id(self):
-        # ``_BY_ID`` is the flat index — every entry must be a heading
-        # or the root.
-        for item in self.by_id.values():
-            self.assertIn(item.kind, ('root', 'heading'))
-
-    def test_heading_ids_unchanged(self):
-        # Heading ids are ``('content', path, line_offset)`` — they depend on
-        # the source line numbers, which the flag doesn't affect.
-        h1 = self.root._children[0]
-        h2a, h2b = h1._children
-        h1b = self.root._children[1]
-        self.assertEqual(h1.id, ('content', self.path, 0))
-        self.assertEqual(h2a.id, ('content', self.path, 1))
-        self.assertEqual(h2b.id, ('content', self.path, 5))
-        self.assertEqual(h1b.id, ('content', self.path, 7))
-
-    def test_heading_byte_offsets_unchanged(self):
-        # Heading byte offsets are the literal positions of the ``#``
-        # in the source — independent of list emission.
-        h1 = self.root._children[0]
-        h2a, h2b = h1._children
-        h1b = self.root._children[1]
-        self.assertEqual(h1.byte_offset, self.FIXTURE.index('# H1\n'))
-        self.assertEqual(h2a.byte_offset, self.FIXTURE.index('## H2a'))
-        self.assertEqual(h2b.byte_offset, self.FIXTURE.index('## H2b'))
-        self.assertEqual(h1b.byte_offset, self.FIXTURE.index('# H1b'))
-
-    def test_h2a_section_subsumes_list_bytes(self):
-        # With lists off, the H2a section's byte_size extends to the
-        # next heading (H2b) instead of stopping at the first list
-        # item. The actual byte boundary is the same as with lists
-        # on (boundary rule is heading-driven for headings), but with
-        # no list items in the tree, those bytes are now ONLY part of
-        # the section — they're not separately enumerated.
-        h1 = self.root._children[0]
-        h2a, h2b = h1._children
-        self.assertEqual(h2a.byte_offset + h2a.byte_size, h2b.byte_offset)
-        # And the section text actually contains the list lines.
-        sliced = self.FIXTURE[h2a.byte_offset:h2a.byte_offset + h2a.byte_size]
-        self.assertIn('- a', sliced)
-        self.assertIn('  - a1', sliced)
-        self.assertIn('- b', sliced)
-
-    def test_last_section_runs_to_eof(self):
-        # The last heading (H1b) extends through ``- top`` to EOF.
-        h1b = self.root._children[1]
-        self.assertEqual(
-            h1b.byte_offset + h1b.byte_size, len(self.FIXTURE))
-        # And ``- top`` text appears inside the section slice.
-        sliced = self.FIXTURE[h1b.byte_offset:h1b.byte_offset + h1b.byte_size]
-        self.assertIn('- top', sliced)
-
-    def test_heading_has_children_reflects_no_list_kids(self):
-        # H2a previously had two list-item children; with lists off
-        # it's a leaf. H1 (which has H2 children) still reports
-        # ``has_children``.
-        h1 = self.root._children[0]
-        self.assertTrue(h1.has_children)
-        h2a = h1._children[0]
-        self.assertFalse(h2a.has_children)
-        h2b = h1._children[1]
-        self.assertFalse(h2b.has_children)
-        # Second H1 had only a list item under it — also a leaf now.
-        h1b = self.root._children[1]
-        self.assertFalse(h1b.has_children)
-
-
 class TestTextNodes(unittest.TestCase):
-    """Loose body-text ``[text]`` leaves in the headings-only eager tree.
+    """Loose body-text ``[text]`` leaves and the ``#text`` row-set rule.
 
-    ``build_doc_tree`` (lists OFF — browse-md's default ``_INCLUDE_LISTS``)
-    synthesises a dim ``[text]`` leaf for the body run preceding a scope's
-    first heading, inserted as that scope's FIRST child. ``_build_nodes`` /
-    ``_to_item`` must map it onto a leaf ``Item`` (``[text]`` tag, ``dim``
-    style, no children), its preview must slice to just that run, and the
-    anchor flow must keep treating it correctly (title scan skips it; a
-    line anchor resolves to it). The same run surfaces in the lazy ``#md:``
-    ref subtree via ``_md_node_item``.
+    ``md2ansi_doc`` gives EVERY heading a ``#text`` first child
+    (zero-width when the body is blank) plus a preamble node at
+    ``tree[0]``; ``_build_nodes`` shows a text run only when it is
+    non-empty AND has at least one heading sibling. The visible run maps
+    onto a leaf ``Item`` (``[text]`` tag, ``dim`` style, no children),
+    its preview slices to just that run, and the anchor flow keeps
+    treating it correctly (title scan skips it; a line anchor resolves
+    to it).
 
     Fixture has a loose run before BOTH the root's first heading and a
-    nested heading, so the root-level and nested cases are both exercised::
+    nested heading, plus a leaf-chapter body that must NOT become a
+    row::
 
         intro paragraph   <- line 0  (before the root's first heading)
         # Top             <- line 1
         body before sub   <- line 2  (before ``# Top``'s first sub-heading)
         ## Sub            <- line 3
-        sub body          <- line 4
+        sub body          <- line 4  (leaf-chapter body — filtered)
     """
 
     FIXTURE = (
@@ -2715,21 +2354,19 @@ class TestTextNodes(unittest.TestCase):
         'sub body\n'          # line 4
     )
 
-    def _build(self, include_lists):
-        r = _load_recipe(include_lists=include_lists)
+    def _build(self, text=None):
+        r = _load_recipe()
         path = '/tmp/text-nodes.md'
-        line_starts = r._line_starts(self.FIXTURE)
-        events = r._parse(self.FIXTURE)
-        root, by_id = r._build_nodes(events, self.FIXTURE, line_starts, path)
+        root, by_id = _build_tree(r, text or self.FIXTURE, path)
         return r, path, root, by_id
 
     # --- eager primary-file tree -----------------------------------------
 
     def test_root_first_child_is_dim_text_leaf(self):
-        # Headings-only: the loose run before ``# Top`` is the root's FIRST
-        # child — a leaf tagged ``[text]`` with the dim style, sitting ahead
-        # of the heading it precedes.
-        _r, path, root, _by_id = self._build(include_lists=False)
+        # The loose run before ``# Top`` is the root's FIRST child — a
+        # leaf tagged ``[text]`` with the dim style, sitting ahead of
+        # the heading it precedes.
+        _r, path, root, _by_id = self._build()
         kids = root._children
         self.assertEqual([(k.tag, k.title) for k in kids],
                          [('text', 'intro paragraph'), ('h1', 'Top')])
@@ -2743,34 +2380,35 @@ class TestTextNodes(unittest.TestCase):
     def test_nested_scope_also_gets_text_leaf(self):
         # The run before ``# Top``'s first sub-heading is ``# Top``'s first
         # child, ahead of ``## Sub``.
-        _r, _path, root, _by_id = self._build(include_lists=False)
+        _r, _path, root, _by_id = self._build()
         top = root._children[1]
         self.assertEqual([(k.tag, k.title) for k in top._children],
                          [('text', 'body before sub'), ('h2', 'Sub')])
         self.assertEqual(top._children[0].kind, 'text')
 
-    def test_lists_mode_has_no_text_leaves(self):
-        # With ``-l`` (lists on) ``build_doc_tree`` synthesises NO text
-        # nodes, so the tree is heading-only at the top and nothing carries
-        # the ``[text]`` tag anywhere.
-        _r, _path, root, _by_id = self._build(include_lists=True)
-        self.assertEqual([(k.tag, k.title) for k in root._children],
-                         [('h1', 'Top')])
-        seen = []
+    def test_leaf_chapter_body_is_not_a_row(self):
+        # ``sub body`` under ``## Sub`` has no heading sibling — the
+        # row-set rule filters it, so a leaf heading stays a leaf.
+        _r, _path, root, _by_id = self._build()
+        sub = root._children[1]._children[1]
+        self.assertEqual(sub.title, 'Sub')
+        self.assertEqual(sub._children, [])
+        self.assertFalse(sub.has_children)
 
-        def walk(node):
-            for kid in node._children:
-                seen.append(kid.tag)
-                walk(kid)
-
-        walk(root)
-        self.assertNotIn('text', seen)
+    def test_zero_width_run_is_not_a_row(self):
+        # A heading with a blank body followed directly by a sub-heading
+        # gets a ZERO-WIDTH text child from the library — filtered even
+        # though it has a heading sibling.
+        _r, _path, root, _by_id = self._build('# A\n## B\nbody\n')
+        a = root._children[0]
+        self.assertEqual([(k.tag, k.title) for k in a._children],
+                         [('h2', 'B')])
 
     def test_text_leaf_carries_contract_fields(self):
         # ``_to_item`` stamps the hidden contract fields on a text node just
-        # like a heading: byte_offset/byte_size verbatim from the MdNode, the
-        # boundary-rule line_size, and the file back-reference.
-        _r, path, root, _by_id = self._build(include_lists=False)
+        # like a heading: byte_offset/byte_size verbatim from the M2A_Node,
+        # the boundary-rule line_size, and the file back-reference.
+        _r, path, root, _by_id = self._build()
         text_leaf = root._children[0]
         self.assertEqual(text_leaf.byte_offset, 0)
         # The run is just its own line ``intro paragraph\n`` (16 chars).
@@ -2781,14 +2419,11 @@ class TestTextNodes(unittest.TestCase):
         self.assertEqual(text_leaf.file_path, path)
 
     def test_by_id_indexes_text_leaves(self):
-        # ``flat`` (and thus ``by_id``) carries the text nodes even though
-        # ``events`` does not — root + 2 headings + 2 text runs = 5 entries,
-        # while only 2 heading events exist. (Confirms ``event_kinds`` is not
-        # indexed with a shifted position — headings still tag correctly.)
-        _r, _path, root, by_id = self._build(include_lists=False)
+        # ``by_id`` carries the visible text rows alongside the headings:
+        # root + 2 headings + 2 visible text runs = 5 entries (the
+        # filtered leaf-chapter run never enters the index).
+        _r, _path, root, by_id = self._build()
         self.assertEqual(len(by_id), 5)
-        # Both heading rows kept their correct level tags despite the offset
-        # between ``flat`` and ``events``.
         self.assertEqual(root._children[1].tag, 'h1')
         self.assertEqual(root._children[1]._children[1].tag, 'h2')
 
@@ -2797,7 +2432,7 @@ class TestTextNodes(unittest.TestCase):
     def test_text_leaf_preview_is_the_run(self):
         # ``get_preview`` slices the text node's own byte window — exactly
         # the loose run, nothing more.
-        r, path, root, by_id = self._build(include_lists=False)
+        r, path, root, by_id = self._build()
         r._FILE_TEXT = self.FIXTURE
         r._BY_ID = by_id
         r._BY_LINE, r._LINES_SORTED = r._build_line_index(by_id)
@@ -2812,7 +2447,7 @@ class TestTextNodes(unittest.TestCase):
         # A non-digit anchor scans HEADINGS only. ``intro`` is a substring of
         # the text leaf's title but matches no heading, so the lookup falls
         # through to the file root (not the text node).
-        r, path, root, by_id = self._build(include_lists=False)
+        r, path, root, by_id = self._build()
         r._BY_ID = by_id
         r._BY_LINE, r._LINES_SORTED = r._build_line_index(by_id)
         self.assertEqual(r._resolve_anchor('intro', path), ('file', path))
@@ -2824,7 +2459,7 @@ class TestTextNodes(unittest.TestCase):
         # DOES include text nodes. Line 0 is the text run, so the anchor
         # resolves to it (a valid id whose preview is the run) rather than
         # falling back to root.
-        r, path, root, by_id = self._build(include_lists=False)
+        r, path, root, by_id = self._build()
         r._BY_ID = by_id
         r._BY_LINE, r._LINES_SORTED = r._build_line_index(by_id)
         self.assertEqual(r._resolve_anchor('0', path), ('content', path, 0))
@@ -2834,10 +2469,10 @@ class TestTextNodes(unittest.TestCase):
         # ``_lone_heading_child_id`` only cascades a sole HEADING child, so a
         # file-root whose only child is a text leaf never auto-expands. (Real
         # markdown can't actually produce a heading/root with a SOLE text
-        # child — a text run only exists ahead of a sibling heading — so the
+        # child — a text run only shows ahead of a sibling heading — so the
         # ``kind == 'heading'`` guard is the safety net; assert it directly on
         # a synthetic single-text-child root.)
-        r, path, root, _by_id = self._build(include_lists=False)
+        r, path, root, _by_id = self._build()
         text_leaf = root._children[0]
         self.assertEqual(text_leaf.kind, 'text')
         fake_root = type('FR', (), {'_children': [text_leaf]})()
@@ -2965,10 +2600,9 @@ class TestArgvMulti(_MultiCaseBase):
         # path; the stubbed ``Browser`` from ``_stub_browse_tui`` has
         # no ``run`` method, which raises ``AttributeError``. That's
         # fine — by that point all the argv-parsing side effects we
-        # want to assert on (``_INPUT_FILES``, ``_ANCHOR``,
-        # ``_INCLUDE_LISTS``) have already landed. Catch both
-        # ``SystemExit`` (error paths) and ``AttributeError`` (success
-        # path past Browser construction).
+        # want to assert on (``_INPUT_FILES``, ``_ANCHOR``) have
+        # already landed. Catch both ``SystemExit`` (error paths) and
+        # ``AttributeError`` (success path past Browser construction).
         with contextlib.redirect_stderr(buf):
             try:
                 self.r.main()
@@ -3000,29 +2634,6 @@ class TestArgvMulti(_MultiCaseBase):
             )
         finally:
             os.unlink(fc.name)
-
-    def test_lists_flag_before_files(self):
-        self._run_main_capture(
-            ['browse-md', '-l', self.path_a, self.path_b])
-        self.assertTrue(self.r._INCLUDE_LISTS)
-        self.assertEqual(len(self.r._INPUT_FILES), 2)
-
-    def test_lists_flag_after_files(self):
-        self._run_main_capture(
-            ['browse-md', self.path_a, self.path_b, '-l'])
-        self.assertTrue(self.r._INCLUDE_LISTS)
-        self.assertEqual(len(self.r._INPUT_FILES), 2)
-
-    def test_lists_flag_between_files(self):
-        # ``_pop_flag`` removes ``-l`` from anywhere in argv; the
-        # remaining positionals are processed in left-to-right order.
-        self._run_main_capture(
-            ['browse-md', self.path_a, '-l', self.path_b])
-        self.assertTrue(self.r._INCLUDE_LISTS)
-        self.assertEqual(
-            [p for p, _ in self.r._INPUT_FILES],
-            [self.path_a, self.path_b],
-        )
 
     def test_anchor_on_first_file_only(self):
         # First positional has an anchor, second doesn't. Both files
@@ -3707,12 +3318,13 @@ class TestLoneHeadingChildId(_SingleFileBase):
         path = self._load('# A\n# B\n')
         self.assertIsNone(self.r._lone_heading_child_id(('file', path)))
 
-    def test_single_list_item_child_returns_none(self):
-        # A lone non-heading child (list item) does not qualify.
-        path = self._load('- only item\n')
+    def test_intro_text_plus_heading_returns_none(self):
+        # A file with a [text] intro row AND one heading has TWO
+        # children — no lone heading, no cascade.
+        path = self._load('intro run\n# Only\n## Sub\n')
         root = self.r._FILES[path].file_root
-        self.assertEqual(len(root._children), 1)
-        self.assertEqual(root._children[0].kind, 'list-item')
+        self.assertEqual([k.kind for k in root._children],
+                         ['text', 'heading'])
         self.assertIsNone(self.r._lone_heading_child_id(('file', path)))
 
     def test_no_children_returns_none(self):
@@ -4072,7 +3684,7 @@ class TestMdRefFollowing(unittest.TestCase):
         import tempfile
         # Fresh module per test — module-level state (``_FILES`` / ``_BY_ID`` /
         # ``_INPUT_FILES`` / the md_doc parse cache) mustn't bleed across tests.
-        self.r = _load_recipe(include_lists=False)
+        self.r = _load_recipe()
         # Drop any cached referenced docs left over from a sibling test (the
         # md_doc cache is process-wide, not per recipe-module instance).
         self.r.md_doc.clear_cache()
@@ -4436,7 +4048,7 @@ class TestMdRefFollowingWithRoot(unittest.TestCase):
     def setUp(self):
         import os
         import tempfile
-        self.r = _load_recipe(include_lists=False)
+        self.r = _load_recipe()
         self.r.md_doc.clear_cache()
         self.r._MD_COLOR = False
         self.r._BROWSER = None
@@ -5276,11 +4888,11 @@ class TestStdinDocument(unittest.TestCase):
             self.assertEqual([(k.tag, k.title) for k in sub],
                              [('h1', 'Target heading')])
 
-    def test_auto_detected_stdin_composes_with_root_and_lists(self):
-        # ``cmd | browse-md --root DIR -l`` (no explicit ``-``): the
-        # behavior flags are popped first, fd 0 is non-tty, so ``-`` is
-        # synthesized and the piped doc is browsed with the root + lists
-        # flags still in effect.
+    def test_auto_detected_stdin_composes_with_root(self):
+        # ``cmd | browse-md --root DIR`` (no explicit ``-``): the
+        # behavior flag is popped first, fd 0 is non-tty, so ``-`` is
+        # synthesized and the piped doc is browsed with the root flag
+        # still in effect.
         import os
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
@@ -5292,11 +4904,10 @@ class TestStdinDocument(unittest.TestCase):
             with _piped_stdin():
                 self._run_main(
                     '# Piped\nsee target.md\n',
-                    argv=('browse-md', '--root', root, '-l'))
-            # Auto-detected stdin mode AND the flags composed.
+                    argv=('browse-md', '--root', root))
+            # Auto-detected stdin mode AND the flag composed.
             self.assertEqual(self.r._INPUT_FILES, [(self.r._STDIN_PATH, '')])
             self.assertEqual(self.r._ROOTS, [root])
-            self.assertTrue(self.r._INCLUDE_LISTS)
             # The root resolved the piped doc's ref (umbrella present).
             kids = self.r.get_children(('file', self.r._STDIN_PATH))
             self.assertTrue(any(k.tag == 'links' for k in kids),

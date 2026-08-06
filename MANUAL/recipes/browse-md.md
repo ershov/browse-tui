@@ -10,10 +10,12 @@ files or directories; `FILE.md#section` deep-links straight to a heading.
 **Demonstrates:**
 
 - A file format parsed into a lazy tree via a shared library —
-  `md_doc.build_doc_tree` derives the structure from md2ansi's own
-  scanner, so the tree and the colored render share one grammar.
+  `md2ansi_lib.md2ansi_doc` builds the document model from md2ansi's own
+  scanner, so the tree and the colored render share one grammar. Row
+  titles use the library's display form: heading sigil and inline
+  markup stripped.
 - Structured tuple ids — `('file', abspath)` for the per-file roots and
-  `('content', abspath, line)` for every heading / list row; hashable,
+  `('content', abspath, line)` for every heading / text row; hashable,
   no string parsing.
 - Multi-file roots with no synthetic parent — `get_children(None)`
   returns the per-file roots in argv order, each labelled relative to the
@@ -24,8 +26,8 @@ files or directories; `FILE.md#section` deep-links straight to a heading.
 - A preview that re-renders to the pane width — md2ansi word-wraps to
   `preview_width`, refetched via `on_resize` → `drop_preview_cache` when
   the layout changes.
-- Optional list-item rows (`-l` / `--list` / `--lists`) plus dim `[text]`
-  nodes synthesised for loose body text between headings.
+- Dim `[text]` rows synthesised for a non-empty body run that precedes a
+  scope's first sub-heading (a leaf section's body stays in its preview).
 - Cross-file multi-select actions — `V` / `E` group selected rows by
   file, merge their byte ranges, and concatenate the slices with a
   per-file separator.
@@ -42,8 +44,8 @@ files or directories; `FILE.md#section` deep-links straight to a heading.
 ./recipes/browse-md                      # every .md in the current directory
 ./recipes/browse-md README.md            # one file (opens scoped into its headings)
 ./recipes/browse-md docs/                # every .md directly inside docs/
-./recipes/browse-md -l NOTES.md          # also surface list items as rows
 ./recipes/browse-md README.md#install    # deep-link straight to a section
+./recipes/browse-md --help               # print usage + keys and exit
 cat NOTES.md | ./recipes/browse-md -     # one document from stdin (row titled '-')
 git show HEAD:README.md | ./recipes/browse-md - --root "$(git rev-parse --show-toplevel)"
 ```

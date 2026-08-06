@@ -14,10 +14,9 @@ mode auto-engages — the ``-`` is optional, so ``cmd | browse-md`` works
 too. ``-`` stays the explicit form, needed only to read stdin when
 stdin is a tty (type/paste the document, end with ^D).
 
-Parses each resulting markdown file into a tree of headings (h1..h6);
-list items under each section can optionally be surfaced as tree
-rows via the ``-l`` / ``--list`` / ``--lists`` flag (default:
-headings only). Per-file roots ARE the top-level entries: with a
+Parses each resulting markdown file into a tree of headings (h1..h6),
+plus a dim ``[text]`` row for a non-empty body run that precedes a
+scope's first sub-heading. Per-file roots ARE the top-level entries: with a
 single file the browser opens scoped into that file's headings;
 with multiple files each file shows as a top-level row and the
 framework's ``get_children(None)`` returns the per-file roots in
@@ -56,7 +55,7 @@ Custom actions on top of the framework defaults:
       sections in one keystroke. The same cascade runs on the
       single-file startup auto-expand.
 
-Usage:  browse-md [-l] [FILE.md[#anchor] | DIR ... | -]
+Usage:  browse-md [FILE.md[#anchor] | DIR ... | -]
 """
 
 import bisect
@@ -65,22 +64,23 @@ import sys
 
 from browse_tui import Action, Browser, BrowserConfig, Item, recipe_argv
 
-# md2ansi_lib + md_doc — both HARD dependencies. ``md_doc.build_doc_tree``
-# derives the heading / list structure from ``md2ansi_scan`` (one source of
-# truth with the library grammar), so the recipe cannot build its tree
-# without either. ``_md2ansi_fn`` is retained as the colored-preview render
-# seam that ``get_preview`` calls and the render-path tests monkeypatch.
-# The imports stay wrapped in try/except so the module is still importable
-# for unit tests that exercise individual helpers; the absence is enforced
-# at runtime by the ``main()`` gate below (which calls ``_die`` when
-# ``_md2ansi_scan`` or ``md_doc`` is ``None``), not at import time. All
-# names resolve because ``--run-py`` prepends the recipe's directory
-# (``recipes/``) to ``sys.path`` and both ``md2ansi_lib.py`` and
-# ``md_doc.py`` live there.
+# md2ansi_lib + md_doc — both HARD dependencies. ``md2ansi_doc`` is the
+# library's document model (``M2A_Doc`` / ``M2A_Node``) from which the
+# primary-file heading tree is built (one source of truth with the library
+# grammar); ``md_doc`` powers the cross-file reference subtrees (ref
+# capture/resolution + the ``get_doc`` parse cache). ``_md2ansi_fn`` is
+# retained as the colored-preview render seam that ``get_preview`` calls
+# and the render-path tests monkeypatch. The imports stay wrapped in
+# try/except so the module is still importable for unit tests that exercise
+# individual helpers; the absence is enforced at runtime by the ``main()``
+# gate below (which calls ``_die`` when ``_md2ansi_doc`` or ``md_doc`` is
+# ``None``), not at import time. All names resolve because ``--run-py``
+# prepends the recipe's directory (``recipes/``) to ``sys.path`` and both
+# ``md2ansi_lib.py`` and ``md_doc.py`` live there.
 try:
-    from md2ansi_lib import md2ansi as _md2ansi_fn, md2ansi_scan as _md2ansi_scan
+    from md2ansi_lib import md2ansi as _md2ansi_fn, md2ansi_doc as _md2ansi_doc
 except ImportError:
-    _md2ansi_fn = _md2ansi_scan = None
+    _md2ansi_fn = _md2ansi_doc = None
 try:
     import md_doc
 except ImportError:
@@ -126,7 +126,7 @@ _STDIN_PATH = os.path.join(os.getcwd(), '<stdin>')
 _STDIN_TEXT = None
 
 # Aggregate id-to-Item index — per-file roots ``('file', abspath)`` +
-# every in-file heading / list-item ``('content', abspath, line)``
+# every in-file heading / text run ``('content', abspath, line)``
 # across every file. Read by ``get_children`` to materialise tree rows
 # on demand and by ``get_preview`` to look up an id's owning file via
 # ``item.file_path``. There is no synthetic multi-root:
@@ -170,16 +170,6 @@ _HEADING_STYLES = {
     6: 'gray',
 }
 
-# Gate for emitting list-item events from ``_parse``. Default off:
-# the tree shows headings only, which is the common "table of
-# contents" view. ``main()`` flips this to ``True`` when ``-l`` /
-# ``--list`` / ``--lists`` appears in argv. The flag picks which kind
-# set ``_parse`` requests from ``md2ansi_scan`` — list spans are only
-# yielded when it is on. The full grammar runs internally either way,
-# so code-fence-vs-list-line precedence (and heading detection) is
-# unchanged regardless of the flag.
-_INCLUDE_LISTS = False
-
 # Extra candidate base directories for resolving a document's relative
 # cross-file ``.md`` references, in priority order — the repeatable
 # ``--root DIR`` flag. ``main()`` fills this with the absolute, existing
@@ -197,7 +187,7 @@ _INCLUDE_LISTS = False
 _ROOTS = []
 
 
-_USAGE = 'usage: browse-md [-l] [--root DIR ...] [FILE.md[#anchor] | DIR ... | -]'
+_USAGE = 'usage: browse-md [--root DIR ...] [FILE.md[#anchor] | DIR ... | -]'
 
 # Markdown file extensions recognised when a positional names a directory.
 # A directory argument expands to every direct child with one of these
@@ -221,10 +211,6 @@ class _FileState:
       * ``text``         — full file body. ``get_preview`` slices
                           this for non-root rows; the root preview
                           is the whole buffer.
-      * ``line_starts``  — byte offset of the start of each line.
-                          Its length is the file's EOF line count
-                          (fed to ``_build_nodes`` as the boundary
-                          rule's last-line sentinel).
       * ``by_id``        — id-to-Item index for THIS file (no
                           other files). Useful when a helper needs
                           to walk only one file's nodes (e.g.
@@ -242,189 +228,53 @@ class _FileState:
                           single-file mode it's the only one.
     """
 
-    __slots__ = ('path', 'text', 'line_starts',
+    __slots__ = ('path', 'text',
                  'by_id', 'by_line', 'lines_sorted', 'file_root')
 
-    def __init__(self, path, text, line_starts,
+    def __init__(self, path, text,
                  by_id, by_line, lines_sorted, file_root):
         self.path = path
         self.text = text
-        self.line_starts = line_starts
         self.by_id = by_id
         self.by_line = by_line
         self.lines_sorted = lines_sorted
         self.file_root = file_root
 
 
-def _line_starts(text):
-    """Byte offset of the start of each line in ``text`` (0-based).
+def _build_nodes(doc, path):
+    """Build a tree of ``Item`` instances from the library document model.
 
-    Thin delegation to ``md_doc._line_starts`` — the same offset→line
-    index ``build_doc_tree`` stamps nodes with — so there is a single
-    source of truth. ``_reparse`` stores the result on each
-    ``_FileState`` (and feeds it to ``_build_nodes`` as the EOF line
-    count); ``_node_at_line`` reads its sorted derivative.
+    Returns ``(root, by_id)``. The structural source of truth is the
+    ``M2A_Doc`` from ``md2ansi_lib.md2ansi_doc(text)`` — the caller
+    passes it in as ``doc`` — whose ``M2A_Node``s already carry ``kind`` /
+    ``level`` / display ``title`` (sigil + inline markup stripped) /
+    ``line_offset`` / ``byte_offset`` / ``byte_size`` / ``children``. This
+    function maps each visible node onto a ``browse-md`` ``Item`` (id
+    ``('content', path, line_offset)``, the ``[h1]``..``[h6]`` / ``[text]``
+    tag + style, the recipe's hidden contract fields), wires
+    ``item._children``, and hangs the top-level nodes under a per-file root
+    ``Item`` (id ``('file', path)``).
+
+    Visibility — the ``#text`` row-set rule: ``md2ansi_doc`` gives EVERY
+    heading a ``#text`` first child (zero-width when the body is blank)
+    plus a preamble node at ``tree[0]``, but a text run becomes a row only
+    when it is non-empty AND has at least one heading sibling (i.e. it is
+    the intro run of a scope that also has sub-headings). Zero-width runs
+    and leaf-chapter bodies are filtered out, so a leaf heading stays a
+    leaf and its whole body reads through its own preview.
+
+    ``by_id`` is the flat id-to-Item index for THIS file (no other files),
+    covering visible rows only. Every Item carries ``file_path = path`` so
+    multi-file ``get_preview`` can find its owning file's text from the id
+    alone — including the root (files ARE the top-level entries, so
+    there's no synthetic root above them).
+
+    ``M2A_Node.byte_size`` is the boundary-rule section length and is used
+    verbatim. ``line_size`` (the line-count analogue, which ``M2A_Node``
+    doesn't carry) is derived from the same boundary: the section's end
+    offset converted back to a line via ``doc.line_of``, an end-at-EOF
+    section running through the last line (``len(doc.line_starts)``).
     """
-    return md_doc._line_starts(text)
-
-
-def _line_of(byte_offset, line_starts):
-    """0-based line number for ``byte_offset`` (delegates to ``md_doc``)."""
-    return md_doc._line_of(byte_offset, line_starts)
-
-
-# Heading event-kind tags (``h1``..``h6``) — the heading half of the
-# ``(kind, payload)`` vocabulary ``_parse`` emits, distinct from the
-# list-item tags ``ul`` / ``ol``. Documents that vocabulary as the
-# parser's contract; the recipe's parser tests use it to partition
-# ``_parse`` output into headings vs list items.
-_HEADING_KINDS = frozenset(('h1', 'h2', 'h3', 'h4', 'h5', 'h6'))
-
-
-def _walk_list(base, text, line_starts):
-    """Fan one ``md2ansi_scan`` list span into one event per marker line.
-
-    Thin delegation to ``md_doc._walk_list`` (the lifted shared
-    implementation): each event is ``('ul'|'ol', {'byte_offset',
-    'line_offset', 'level', 'source'})``. Kept as a named seam because
-    the recipe's parser tests exercise it directly.
-    """
-    return md_doc._walk_list(base, text, line_starts)
-
-
-def _parse(text):
-    """Flat ordered list of ``(kind, payload)`` parser events for ``text``.
-
-    Each event is a ``(kind, payload)`` tuple:
-      * heading:   ``('h1'..'h6', {'byte_offset', 'line_offset', 'source'})``
-      * list item: ``('ul'|'ol', {'byte_offset', 'line_offset', 'level', 'source'})``
-
-    Thin delegation to ``md_doc._scan_events`` — one structural-scan
-    pass over the same combined grammar the renderer uses (single source
-    of truth with the library). ``_INCLUDE_LISTS`` chooses whether list
-    spans are yielded; heading events are byte-for-byte identical either
-    way because the full grammar runs internally and only filters at
-    yield time. ``_build_nodes`` consumes these events alongside the
-    structural ``build_doc_tree`` to recover each list item's ``ul`` /
-    ``ol`` tag.
-    """
-    return md_doc._scan_events(text, md_doc._line_starts(text), _INCLUDE_LISTS)
-
-
-def _build_nodes(events, file_text, line_starts, path):
-    """Build a tree of ``Item`` instances from the shared structural tree.
-
-    Returns ``(root, by_id)``. The structural source of truth is
-    ``md_doc.build_doc_tree(file_text, include_lists=_INCLUDE_LISTS)`` —
-    the same heading/list builder ``browse-claude`` uses — which yields
-    nested ``MdNode``s already carrying ``kind`` / ``level`` /
-    pre-stripped ``title`` / ``line_offset`` / ``byte_offset`` /
-    ``byte_size`` / ``children``. This function maps each ``MdNode`` onto
-    a ``browse-md`` ``Item`` (id ``('content', path, line_offset)``, the
-    ``[h1]`` / ``[ul]`` / ``[ol]`` tag + style, the recipe's hidden
-    contract fields), wires ``item._children`` from ``MdNode.children``,
-    and hangs the top-level nodes under a per-file root ``Item`` (id
-    ``('file', path)``).
-
-    ``events`` is the parallel ``_parse(file_text)`` event stream, in the
-    same document order as a pre-order walk of the structural tree and 1:1
-    with that walk's heading/list-item nodes by ``byte_offset`` (the
-    synthetic ``'text'`` nodes the lists-off walk also carries have no
-    event, so the full-walk 1:1 holds exactly in lists-on mode — the only
-    place ``events`` is consumed, via ``event_kinds`` for the ``ul``/``ol``
-    tag). It supplies the one bit ``MdNode`` doesn't carry: a list item's
-    ``ul`` vs ``ol`` tag (the marker kind). It must be consistent with
-    ``file_text`` — every caller derives it via ``_parse`` under the same
-    ``_INCLUDE_LISTS``.
-
-    The per-file root owns every top-level heading and every
-    pre-first-heading list item; ``by_id`` is the flat id-to-Item index
-    for THIS file (no other files). Every Item carries ``file_path =
-    path`` so multi-file ``get_preview`` can find its owning file's text
-    from the id alone — including the root (files ARE the top-level
-    entries, so there's no synthetic root above them).
-
-    ``MdNode.byte_size`` is the boundary-rule section length and is used
-    verbatim. ``line_size`` (the line-count analogue, which ``MdNode``
-    doesn't carry) is recomputed here by the same boundary rule over the
-    pre-order node list: for a heading, the next heading at level ≤ L;
-    for a list item, the next heading OR list item at indent ≤ L; EOF →
-    ``len(line_starts)``.
-    """
-    file_bytes_eof = len(file_text)
-    file_lines_eof = len(line_starts)
-
-    doc_roots = md_doc.build_doc_tree(file_text, include_lists=_INCLUDE_LISTS)
-
-    # Pre-order flatten of the structural tree — document order, which
-    # is exactly the order of ``events`` (both come from the same
-    # ``md2ansi_scan`` spans). Used to recompute ``line_size`` by the
-    # boundary rule and to align each node with its event tag.
-    flat = []
-
-    def _flatten(node):
-        flat.append(node)
-        for child in node.children:
-            _flatten(child)
-
-    for r in doc_roots:
-        _flatten(r)
-
-    # Per-node ``line_size`` via the boundary rule (mirrors the
-    # ``byte_size`` rule ``build_doc_tree`` already applied, but on
-    # ``line_offset``). For node i find the next sibling-or-shallower
-    # node j; ``line_size = flat[j].line_offset - flat[i].line_offset``,
-    # EOF → ``file_lines_eof``.
-    n = len(flat)
-    line_size = [0] * n
-    for i in range(n):
-        cur = flat[i]
-        cur_level = cur.level
-        if cur.kind == 'text':
-            # A ``'text'`` run (headings-only view) is the body before a
-            # scope's first heading, so its section ends at that very
-            # heading — always its immediately-following pre-order sibling.
-            # ``i + 1`` is therefore in range and is the heading it precedes.
-            line_size[i] = flat[i + 1].line_offset - cur.line_offset
-            continue
-        cur_is_heading = cur.kind == 'heading'
-        j_lo = file_lines_eof
-        for j in range(i + 1, n):
-            nxt = flat[j]
-            if cur_is_heading:
-                if nxt.kind == 'heading' and nxt.level <= cur_level:
-                    j_lo = nxt.line_offset
-                    break
-            else:
-                # list-item — any heading closes the list scope, plus
-                # any list item at indent ≤ cur_level.
-                if nxt.kind == 'heading':
-                    j_lo = nxt.line_offset
-                    break
-                if nxt.kind == 'list-item' and nxt.level <= cur_level:
-                    j_lo = nxt.line_offset
-                    break
-        line_size[i] = j_lo - cur.line_offset
-
-    # Pre-order index of each structural node, so the recursive mapper
-    # can look up its own ``line_size`` and event tag without a running
-    # counter. ``id(node)`` keys are stable for the lifetime of this
-    # build.
-    index_of = {id(node): i for i, node in enumerate(flat)}
-
-    # Per-node tag, indexed by pre-order position. ``MdNode`` only
-    # records ``kind`` ('heading' / 'list-item' / 'text'), so the ``ul``
-    # vs ``ol`` distinction comes from the matching event's kind. This
-    # index is consulted ONLY for list-item nodes (the ``else`` arm of
-    # ``_to_item``), and list items exist only with lists ON — where
-    # ``build_doc_tree`` synthesises NO ``'text'`` nodes, so ``flat`` is
-    # 1:1 with ``events`` (heading/list spans) by construction. With lists
-    # off ``flat`` additionally carries synthetic ``'text'`` nodes (no
-    # event), so it is longer than ``events`` — but those rows return from
-    # ``_to_item`` before the ``else`` arm, so ``event_kinds`` is never
-    # indexed with a shifted position.
-    event_kinds = [k for k, _ in events]
-
     # Per-file root. Files ARE the top-level entries, so there's no
     # synthetic root above them; this one owns the file's top-level
     # nodes. Its id is the tagged tuple ``('file', path)`` — distinct
@@ -435,36 +285,30 @@ def _build_nodes(events, file_text, line_starts, path):
     root = Item(
         id=('file', path),
         title=os.path.basename(path),
-        has_children=bool(flat),
     )
     root.kind = 'root'
     root.level = 0
     root.byte_offset = 0
-    root.byte_size = file_bytes_eof
+    root.byte_size = doc.size
     root.line_offset = 0
-    root.line_size = file_lines_eof
+    root.line_size = len(doc.line_starts)
     root.file_path = path
     by_id = {root.id: root}
 
+    def _visible(nodes):
+        # The ``#text`` row-set rule over one children list. A list holds
+        # at most one text run (always first), so the probe is cheap.
+        has_heading = any(n.kind == 'heading' for n in nodes)
+        return [n for n in nodes
+                if n.kind == 'heading' or (n.byte_size > 0 and has_heading)]
+
     def _to_item(node):
-        index = index_of[id(node)]
         if node.kind == 'text':
-            # A dim ``[text]`` leaf for a loose body run preceding a scope's
-            # first heading (headings-only view). Decide its tag here and
-            # fall through to the shared field-stamping — but BEFORE the
-            # list-item ``else`` arm, so we never index ``event_kinds`` with
-            # this node's ``flat`` position (text nodes have no event, so
-            # that index belongs to the next list/heading span).
-            tag = 'text'
-            tag_style = 'dim'
-        elif node.kind == 'heading':
-            tag = f'h{node.level}'
-            tag_style = _HEADING_STYLES[node.level]
+            # A dim ``[text]`` leaf for the loose body run preceding a
+            # scope's first sub-heading (already filtered by ``_visible``).
+            tag, tag_style = 'text', 'dim'
         else:
-            # ``ul`` / ``ol`` — the marker kind, taken from the matching
-            # event (``MdNode`` doesn't carry it).
-            tag = event_kinds[index]
-            tag_style = 'dim'
+            tag, tag_style = f'h{node.level}', _HEADING_STYLES[node.level]
         item = Item(
             id=('content', path, node.line_offset),
             title=node.title,
@@ -476,20 +320,23 @@ def _build_nodes(events, file_text, line_starts, path):
         item.byte_offset = node.byte_offset
         item.byte_size = node.byte_size
         item.line_offset = node.line_offset
-        item.line_size = line_size[index]
+        end = node.byte_offset + node.byte_size
+        item.line_size = (
+            len(doc.line_starts) if end >= doc.size else doc.line_of(end)
+        ) - node.line_offset
         item.file_path = path
         # Insert BEFORE recursing so the index fills in document
-        # (pre-order) order — parent then descendants — exactly as the
-        # previous event-stream walk did. Last-writer wins on duplicate
-        # ids (distinct byte offsets make a line_offset clash possible
-        # only in pathological ``\r\n`` inputs); pre-order insertion
-        # keeps which node wins deterministic.
+        # (pre-order) order — parent then descendants. Last-writer wins
+        # on duplicate ids (distinct byte offsets make a line_offset
+        # clash possible only in pathological ``\r\n`` inputs);
+        # pre-order insertion keeps which node wins deterministic.
         by_id[item.id] = item
-        item._children = [_to_item(c) for c in node.children]
+        item._children = [_to_item(c) for c in _visible(node.children)]
         item.has_children = bool(item._children)
         return item
 
-    root._children = [_to_item(r) for r in doc_roots]
+    root._children = [_to_item(n) for n in _visible(doc.tree)]
+    root.has_children = bool(root._children)
     return root, by_id
 
 
@@ -501,7 +348,7 @@ def _build_line_index(by_id):
     swallow every "line precedes any parsed node" anchor lookup).
 
     Multiple Items at the same ``line_offset`` resolve to the last
-    one inserted; parser events sit at distinct ``byte_offset``\\ s,
+    one inserted; visible nodes sit at distinct ``byte_offset``\\ s,
     so collisions only happen in pathological inputs (e.g. ``\\r\\n``
     line endings folded onto the same logical line). Whichever wins
     is deterministic given ``by_id`` iteration order.
@@ -523,7 +370,7 @@ def _classify_id(node_id):
       * ``('file-root', path)``    — a per-file root ``('file', path)``;
                                      ``path`` is the file abs path
                                      (a key in ``_FILES``).
-      * ``('content', path)``      — a per-file heading / list-item
+      * ``('content', path)``      — a per-file heading / text run
                                      ``('content', path, line)``;
                                      ``path`` is the file abs path.
       * ``('unknown', None)``      — anything else (including the
@@ -556,7 +403,8 @@ def _lone_heading_child_id(file_root_id):
 
     Returns ``None`` for every other shape: an id that isn't a file
     root, a root with zero or multiple children, or a sole child that
-    isn't a heading (e.g. a list item surfaced under ``-l``).
+    isn't a heading (defensive — a ``[text]`` run only ever shows
+    alongside a heading sibling, so a sole text child shouldn't arise).
     """
     if not (isinstance(file_root_id, tuple) and file_root_id
             and file_root_id[0] == 'file'):
@@ -607,15 +455,12 @@ def _node_at_line(n, file_state=None):
 def _display_title(item):
     """Return ``item.title`` normalised for anchor matching.
 
-    Stored titles are already pre-stripped at ``_build_nodes`` time —
-    headings have their leading ``#``s + whitespace removed, list
-    items have their marker + whitespace removed. This helper now
-    just trims surrounding whitespace so callers in the anchor-match
-    flow get a stable key regardless of any future title-construction
-    quirks.
-
-    Example: a heading stored as ``'My **bold** heading'`` returns
-    itself unchanged; inline formatting markers are preserved.
+    Stored titles are the library's display form (``M2A_Node.title``):
+    the heading sigil AND inline markup are already stripped, whitespace
+    collapsed — ``## My **bold** heading`` is stored as ``'My bold
+    heading'``. This helper just trims surrounding whitespace so callers
+    in the anchor-match flow get a stable key regardless of any future
+    title-construction quirks.
     """
     return item.title.strip()
 
@@ -638,7 +483,10 @@ def _resolve_anchor(anchor, path):
         source order: exact ``_display_title`` match, then prefix,
         then substring. First hit in any tier wins (its
         ``('content', path, line)`` id). No match in any tier emits a
-        stderr warning and falls through to the file root.
+        stderr warning and falls through to the file root. Matching
+        runs against the STRIPPED display titles — an anchor typed
+        with inline markers (``**bold**``) won't hit them; type the
+        plain words instead.
 
     The tier loop runs each predicate as a separate pass over the
     heading list so a substring hit on heading A can't pre-empt an
@@ -666,7 +514,7 @@ def _resolve_anchor(anchor, path):
     # Non-digit: scan headings in source order. ``_BY_ID`` (per-file
     # in multi-file mode via ``file_state.by_id``, or the module-level
     # aggregate in legacy mode) is built in insertion order (root +
-    # parser-event order from ``_build_nodes``), so filtering to
+    # pre-order document order from ``_build_nodes``), so filtering to
     # headings and sorting by ``line_offset`` yields source order
     # without depending on dict iteration semantics.
     if file_state is not None:
@@ -1198,7 +1046,7 @@ def _reparse():
     single-file shims (``_FILE_TEXT`` / ``_BY_LINE`` / ``_LINES_SORTED``
     / ``_ROOT_PATH``), then rebuilds them in place from the on-disk
     files listed in ``_INPUT_FILES``. Each file is parsed independently
-    with the same ``_parse`` + ``_build_nodes`` pipeline used in
+    with the same ``md2ansi_doc`` + ``_build_nodes`` pipeline used in
     single-file mode.
 
     Files ARE the top-level entries: the Browser's ``root_id`` is
@@ -1244,9 +1092,7 @@ def _reparse():
         else:
             with open(path, 'r', encoding='utf-8', errors='replace') as f:
                 text = f.read()
-        ls = _line_starts(text)
-        events = _parse(text)
-        file_root, by_id = _build_nodes(events, text, ls, path)
+        file_root, by_id = _build_nodes(_md2ansi_doc(text), path)
         # Override ``_build_nodes``'s basename default with the resolved
         # per-root label (always project-root-relative; a file sitting
         # directly in the root collapses to its bare basename). The
@@ -1269,7 +1115,6 @@ def _reparse():
         fs = _FileState(
             path=path,
             text=text,
-            line_starts=ls,
             by_id=by_id,
             by_line=by_line,
             lines_sorted=lines_sorted,
@@ -1304,7 +1149,7 @@ def get_children(node_id, *, reload=False):
     """Return children for ``node_id``.
 
     The in-file heading tree is built once in ``main()`` (``_build_nodes`` walks
-    each file's flat event stream and pre-populates ``item._children``;
+    each file's ``M2A_Doc`` and pre-populates ``item._children``;
     ``_reparse`` collects the per-file roots into ``_FILES`` in argv order), so
     the in-file paths are a dict lookup — no per-call parsing. Markdown reference
     children are built LAZILY here (referenced files are read/parsed only on
@@ -1328,7 +1173,7 @@ def get_children(node_id, *, reload=False):
         single ``[links]`` References umbrella (appended AFTER the headings) when
         the file references ≥1 existing ``.md``.
       * ``('content', path, line)`` — any other in-file id: the cached
-        ``_children`` off ``_BY_ID`` (headings have only sub-heading / list
+        ``_children`` off ``_BY_ID`` (headings have only sub-heading / text
         children — refs attach at the document level, never under a heading).
 
     ``reload=True`` is honoured at the top-level probe (``node_id is None``) — the
@@ -1384,8 +1229,8 @@ def get_children(node_id, *, reload=False):
         if md_doc is not None and _file_has_existing_ref(fs.text, path):
             out.append(_md_refs_umbrella_item(node_id, ()))
         return out
-    # ``('content', path, line)`` — an in-file heading / list-item: its cached
-    # sub-headings / list children (refs attach at the document level, never
+    # ``('content', path, line)`` — an in-file heading / text run: its cached
+    # sub-heading / text children (refs attach at the document level, never
     # under a heading).
     item = _BY_ID.get(node_id)
     if item is None:
@@ -1925,7 +1770,7 @@ def _on_expand(ctx, ids):
 # Cursor kinds and the menu each gets:
 #   * ``('file', path)``            — a per-file root: file-level source actions
 #                                     + open-containing-dir + show-path + rescan.
-#   * ``('content', path, line)``   — a heading / list-item: section source
+#   * ``('content', path, line)``   — a heading / text run: section source
 #                                     actions + show-anchor + expand/collapse.
 #   * ``('md', anchor, chain, *)``  — a cross-file reference node (a referenced
 #                                     ``.md`` doc root, or a heading inside one):
@@ -1941,9 +1786,10 @@ def _slug(text):
     Mirrors GitHub's algorithm closely enough for a human-readable anchor
     pop-up: lower-case, drop everything that isn't a word char / space / hyphen,
     then turn runs of whitespace into single hyphens. (GitHub also strips inline
-    markdown formatting; the stored heading title already has its leading ``#``s
-    removed, and residual ``*``/`` ` `` emphasis markers are dropped by the
-    non-word-char filter, so ``## My **bold** title`` → ``my-bold-title``.)
+    markdown formatting; the stored heading title already has its sigil AND
+    inline markup stripped by the library, so ``## My **bold** title`` is
+    stored as ``My bold title`` → ``my-bold-title`` — the non-word-char filter
+    only mops up residual punctuation.)
     """
     import re
     text = text.strip().lower()
@@ -2006,14 +1852,14 @@ def context_menu_file(ctx, item_id):
     ]
 
 
-# -- heading / list-item ('content', path, line) ----------------------------
+# -- heading / text run ('content', path, line) -----------------------------
 
 
 def _cm_content_anchor(ctx, item_id):
     """Pop up the heading anchor ``basename.md#slug`` for a content row.
 
     The slug is derived GitHub-style (``_slug``) from the row's stored title; the
-    file part is the owning file's basename (``item_id[1]``). A list-item row has
+    file part is the owning file's basename (``item_id[1]``). A text-run row has
     no meaningful heading anchor, so the gate in ``context_menu_options`` only
     offers this entry for a heading — but if it is reached for any content row we
     still build a best-effort anchor from the title.
@@ -2035,7 +1881,7 @@ def _cm_content_collapse(ctx, item_id):
 
 
 def _content_is_heading(item_id):
-    """True iff the ``('content', path, line)`` row is a heading (not a list item).
+    """True iff the ``('content', path, line)`` row is a heading (not a text run).
 
     Reads the row's ``kind`` off ``_BY_ID`` (stamped by ``_build_nodes``); the
     "Show heading anchor" entry is heading-only. A row missing from the index
@@ -2049,10 +1895,10 @@ def _content_is_heading(item_id):
 def context_menu_content(ctx, item_id):
     """``(label, token)`` rows for a ``('content', path, line)`` row.
 
-    A heading or a list item. Edit / View / Render duplicate the ``E`` / ``V`` /
+    A heading or a text run. Edit / View / Render duplicate the ``E`` / ``V`` /
     ``M`` actions (which act on the section's byte range), so their rows carry
     the hotkey hint. "Show heading anchor" is offered only for a heading
-    (``_content_is_heading``) — a list item has no anchor. Expand / Collapse
+    (``_content_is_heading``) — a text run has no anchor. Expand / Collapse
     reuse the framework's subtree-expand / collapse on the cursor row.
     """
     rows = [
@@ -2120,7 +1966,7 @@ _MENU_ACTIONS = {
     'file.opendir':  lambda c, i: _cm_file_open_dir(c, i[1]),
     'file.path':     lambda c, i: c.alert(i[1], title='path'),
     'file.rescan':   lambda c, i: c.refresh(),
-    # heading / list-item — reuse E / V / M, anchor pop-up, expand / collapse.
+    # heading / text run — reuse E / V / M, anchor pop-up, expand / collapse.
     'content.edit':     lambda c, i: _action_edit_source(c),
     'content.view':     lambda c, i: _action_view_source(c),
     'content.mdcat':    lambda c, i: _action_md_preview(c),
@@ -2191,8 +2037,8 @@ def on_context_menu(ctx):
 
 
 _HELP_USAGE = """\
-Usage: browse-md [-l] [--root DIR ...] [FILE.md[#anchor] | DIR ... | -]
-  -l, --list, --lists  Also surface list items (default: headings).
+Usage: browse-md [--root DIR ...] [FILE.md[#anchor] | DIR ... | -]
+  -h, --help  Print this help and exit.
   --root DIR  Extra base for resolving a doc's relative ``.md`` refs.
             Repeatable; tried in order AFTER the doc's own directory (so
             a doc — including one piped via ``-`` — resolves refs against
@@ -2230,7 +2076,7 @@ browse-md — markdown browser for one or more files.
 
 Right-click a row (or the backslash / F1 keys) for a menu keyed to its
 kind: a file row edits / views / renders the file, opens its dir in
-browse-fs, shows its path, or re-scans; a heading / list item acts on the
+browse-fs, shows its path, or re-scans; a heading / text row acts on the
 section, shows the heading anchor, and expands / collapses; a cross-file
 reference opens / edits the referenced file and shows its resolved path.\
 """
@@ -2333,12 +2179,12 @@ def _pop_flag(name, alts=()):
 
     Walks ``sys.argv`` from index 1; the first literal match (against
     ``name`` or any entry in ``alts``) is deleted in place. Continues
-    scanning so repeated occurrences (e.g. ``-l --list``) are all
+    scanning so repeated occurrences (e.g. ``-h --help``) are all
     removed. Returns ``True`` if at least one match was found.
 
     Patterned after ``_pop_flag`` in browse-claude — small enough to
     duplicate rather than share. Used by ``main()`` to extract
-    ``-l`` / ``--list`` / ``--lists`` before the positional is read.
+    ``-h`` / ``--help`` before the leftover-option scan runs.
     """
     found = False
     i = 1
@@ -2368,7 +2214,7 @@ def _pop_value_flag(name):
     Like ``_pop_flag`` it mutates ``sys.argv`` in place and keeps scanning, so
     a repeated flag (``--root A --root B``) returns ``['A', 'B']``. Used by
     ``main()`` to extract the repeatable ``--root DIR`` before the positionals
-    are read, alongside the ``-l`` extraction.
+    are read, alongside the ``-h`` extraction.
     """
     prefix = name + '='
     values = []
@@ -2419,24 +2265,31 @@ def _resolve_roots(raw_values):
 
 
 def main():
-    global _ANCHOR, _BROWSER, _INCLUDE_LISTS, _INPUT_FILES, _ROOTS, _STDIN_TEXT
-    # Hard-dependency gate. ``md_doc.build_doc_tree`` derives the whole
-    # tree from ``md2ansi_scan``; without either there is nothing to
-    # build, so fail fast with a clear message rather than running
-    # degraded. Checked here (not at import time) so the module stays
-    # importable for unit tests that exercise individual helpers.
-    if _md2ansi_scan is None:
+    global _ANCHOR, _BROWSER, _INPUT_FILES, _ROOTS, _STDIN_TEXT
+    # ``-h`` / ``--help``: popped BEFORE the leftover-option scan below
+    # (which dies "unrecognised option" on any unknown ``-`` token) and
+    # BEFORE the dependency gates, so help works even in a degraded
+    # environment. Print the recipe's usage + keys blocks to stdout and
+    # exit 0. (``Browser.run()`` has its own ``--help`` auto-detect that
+    # additionally appends the default keymap sections, but this recipe
+    # never gets there — the argv validation would die first.)
+    if _pop_flag('-h', alts=('--help',)):
+        print(_HELP_USAGE)
+        print()
+        print(_HELP_INTRO)
+        sys.exit(0)
+    # Hard-dependency gate. ``md2ansi_doc`` builds the whole primary-file
+    # tree and ``md_doc`` powers the reference subtrees; without either
+    # there is nothing to build, so fail fast with a clear message rather
+    # than running degraded. Checked here (not at import time) so the
+    # module stays importable for unit tests that exercise individual
+    # helpers.
+    if _md2ansi_doc is None:
         _die('requires the md2ansi_lib module (expected alongside the recipe)',
              with_usage=False)
     if md_doc is None:
         _die('requires the md_doc module (expected alongside the recipe)',
              with_usage=False)
-    # Pop the lists-on flag BEFORE reading the positionals so order in
-    # argv is flexible: ``browse-md -l FILE.md`` and
-    # ``browse-md FILE.md -l`` both work. The aliases are accepted
-    # interchangeably (``--list`` / ``--lists``); the flag has no
-    # arguments — its mere presence flips emission on.
-    _INCLUDE_LISTS = _pop_flag('-l', alts=('--list', '--lists'))
     # Pop the repeatable, value-taking ``--root DIR`` (and ``--root=DIR``) the
     # same way and BEFORE the positionals/leftover scan, so its value is never
     # mistaken for a FILE positional. Each value is resolved to an absolute
@@ -2469,8 +2322,8 @@ def main():
     # (bare/FILE mode). The synthesized ``-`` then flows through the same
     # logic below: a lone ``-`` reads the doc; ``- FILE`` (a piped run that
     # still names a file) falls into the file branch where ``-`` fails to
-    # resolve and errors. Inject into the positional list only — ``-l`` /
-    # ``--root`` were already popped above and still compose.
+    # resolve and errors. Inject into the positional list only —
+    # ``--root`` was already popped above and still composes.
     if '-' not in positionals and not os.isatty(0):
         positionals.append('-')
 
@@ -2572,7 +2425,7 @@ def main():
         on_expand=_on_expand,
         # Right-click (or the backslash / F1 keys) on a row opens a menu keyed
         # to the cursor's kind: file roots offer file-level source actions +
-        # open-dir + show-path + rescan; headings / list items offer section
+        # open-dir + show-path + rescan; heading / text rows offer section
         # source actions + show-anchor + expand/collapse; a cross-file reference
         # opens / edits the referenced file + shows its resolved path. See
         # ``on_context_menu``.

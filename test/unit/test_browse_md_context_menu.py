@@ -1,7 +1,7 @@
 """Unit tests for the ``recipes/browse-md`` context menu (ticket #1031).
 
 browse-md surfaces a markdown tree whose row ids are tagged tuples — a per-file
-root ``('file', path)``, an in-file heading / list item ``('content', path,
+root ``('file', path)``, an in-file heading / text run ``('content', path,
 line)``, and the cross-file reference nodes ``('md', anchor, chain, line)`` /
 the ``('refs', anchor, chain)`` References umbrella. The context menu branches
 on that KIND. Following the committed convention (browse-ps the pilot,
@@ -187,12 +187,12 @@ class TestPerKindMenus(unittest.TestCase):
         self.assertEqual(labels['content.view'], 'View section in $PAGER (V)')
         self.assertEqual(labels['content.mdcat'], 'Render section via mdcat (M)')
 
-    def test_list_item_menu_omits_heading_anchor(self):
-        # A list-item row (kind == 'list-item') has no heading anchor, so the
+    def test_text_run_menu_omits_heading_anchor(self):
+        # A text-run row (kind == 'text') has no heading anchor, so the
         # Show-heading-anchor row is omitted; expand/collapse stay.
-        item = Item(id=('content', '/proj/doc.md', 5), title='a bullet',
-                    tag='ul', has_children=False)
-        item.kind = 'list-item'
+        item = Item(id=('content', '/proj/doc.md', 5), title='a body run',
+                    tag='text', has_children=False)
+        item.kind = 'text'
         self.r._BY_ID = {item.id: item}
         rows = self.r.context_menu_options(self._ctx(item))
         self.assertEqual(_tokens(rows), [
@@ -385,7 +385,7 @@ class TestDispatchTable(unittest.TestCase):
         cases = [
             ('file', '/d.md'),
             heading_id,
-            ('content', '/d.md', 5),                       # list item
+            ('content', '/d.md', 5),                       # text run
             ('md', ('file', '/d.md'), ('/o.md',), None),   # ref doc
             ('md', ('file', '/d.md'), ('/o.md',), 3),      # ref heading
             ('refs', ('file', '/d.md'), ()),               # umbrella
