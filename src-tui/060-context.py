@@ -966,8 +966,10 @@ class Context:
           * ``left``: outdent — collapse a sibling-above-with-children,
                      or move marker before the parent ancestor
           * ``enter``: confirm — invokes ``on_confirm(relation, dest_id)``
-                       where ``relation`` is one of ``'before'``,
-                       ``'after'``, ``'first'``
+                       where ``relation`` is ``'after'`` or ``'first'``
+                       (``resolve_insert`` expresses every marker gap
+                       relative to the row above, so a ``'before'`` never
+                       reaches the callback)
           * ``esc/ctrl-c/q``: cancel — does *not* invoke the callback
 
         ``label`` is shown on the marker row (``-- {label} --``) so the
