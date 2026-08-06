@@ -41,8 +41,13 @@ files or directories; `FILE.md#section` deep-links straight to a heading.
   placement marker; the confirmed `(relation, dest_id)` (before / after /
   first) maps 1:1 onto the splice position, and `$EDITOR` opens a small
   new-section template. Same conflict-safe apply and retry dialog as `E`.
-- Stdin documents stay editable — `E` / `a` apply to the in-memory copy
-  (flagged "not saved to disk"), so a piped document can still be
+- Section move — `x` highlights the cursor section (via the selection)
+  and re-enters the same placement marker (`move here`); on confirm the
+  section's bytes are physically cut and re-inserted at the marker, with
+  both endpoints re-addressed by `E`'s hash-verified chain (no releveling,
+  same file only; a destination inside the moved section is a no-op).
+- Stdin documents stay editable — `E` / `a` / `x` apply to the in-memory
+  copy (flagged "not saved to disk"), so a piped document can still be
   restructured or used to export a section through the editor.
 - Repeatable `--root DIR` — extra base directories for resolving a
   document's relative cross-file references (tried after the file's own
@@ -66,7 +71,8 @@ git show HEAD:README.md | ./recipes/browse-md - --root "$(git rev-parse --show-t
 Keys: `m` toggle md2ansi coloring, `M` page the preview through
 `$MDCAT` / `mdcat`, `V` page the source in `$PAGER`, `E` edit the
 section under the cursor in `$EDITOR` (conflict-safe splice on save),
-`a` / `i` insert a new section at a marker-chosen position, `→` expand
+`a` / `i` insert a new section at a marker-chosen position, `x` move
+the cursor section to a marker-chosen position, `→` expand
 (auto-expands a single-heading file), `Ctrl-R` re-slurp every file
 from disk.
 

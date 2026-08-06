@@ -1797,7 +1797,7 @@ class TestHelpIntro(unittest.TestCase):
         # intro (the keys are bound on the action rows below it, but
         # the intro gives the one-liner). ``a`` covers the ``a / i``
         # insert pair (one shared line).
-        for key in ('m', 'M', 'V', 'E', 'a'):
+        for key in ('m', 'M', 'V', 'E', 'a', 'x'):
             with self.subTest(key=key):
                 # Bound as a word in the format ``  m`` / ``  M`` etc.
                 # at start of an indented line — search for "  KEY ".
@@ -5163,7 +5163,8 @@ class _EditCtx:
     invoking ``on_complete`` synchronously, as the real Pending would
     once the reload lands), plus ``flash`` / ``log`` recorders.
     ``selected`` exists (and must stay ignored by ``E``) so the
-    selection-ignored test can populate it.
+    selection-ignored test can populate it. ``select`` /
+    ``clear_selection`` record the move flow's row highlight.
     """
 
     def __init__(self, cursor=None, editor=None, confirms=()):
@@ -5179,6 +5180,8 @@ class _EditCtx:
         self.cursor_tos = []
         self.insert_labels = []
         self.on_confirm = None       # stashed by ``insert``
+        self.selects = []            # (ids, replace) from ``select``
+        self.clear_selections = 0
 
     def run_external(self, cmd):
         self.calls.append(list(cmd))
@@ -5193,6 +5196,12 @@ class _EditCtx:
     def insert(self, label, on_confirm):
         self.insert_labels.append(label)
         self.on_confirm = on_confirm
+
+    def select(self, ids, replace=False):
+        self.selects.append((list(ids), replace))
+
+    def clear_selection(self):
+        self.clear_selections += 1
 
     def flash(self, text, log=False):
         self.flashes.append(text)
@@ -5697,6 +5706,229 @@ class TestInsertSectionStdin(unittest.TestCase):
         self.r._insert_section_at(ctx, 'after', ('content', path, 2))
         self.assertEqual(self.r._STDIN_TEXT,
                          self._DOC + '## Added\nadded body\n')
+        self.assertIn('applied to in-memory copy - not saved to disk',
+                      ctx.flashes)
+        self.assertFalse(os.path.exists(path))
+
+
+class TestMoveSectionAction(unittest.TestCase):
+    """``x`` (``_action_move_section`` / ``_move_section_to``) — the
+    cut + re-insert move flow.
+
+    Same fixture + recorder-ctx approach as the edit / insert tests; the
+    marker confirm is driven through the stashed ``on_confirm`` (headless
+    marker mode never fires it), so every test exercises the real capture
+    → re-address → surgery pipeline against the on-disk fixture.
+    """
+
+    _DOC = ('# Alpha\nalpha body\n'    # lines 0-1; extent spans Sub too
+            '## Sub\nsub body\n'       # lines 2-3
+            '# Beta\nbeta body\n')     # lines 4-5
+
+    def setUp(self):
+        import tempfile
+        self.r = _load_recipe()
+        fd, self.path = tempfile.mkstemp(suffix='.md')
+        os.close(fd)
+        _rewrite(self.path, self._DOC)
+        self.r._INPUT_FILES = [(self.path, '')]
+        self.r._reparse()
+
+    def tearDown(self):
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+    def _item(self, line):
+        return self.r._FILES[self.path].by_id[('content', self.path, line)]
+
+    def _move(self, src_line, relation, dest_id):
+        """Run the whole flow: action on ``src_line``, confirm at dest."""
+        ctx = _EditCtx(cursor=self._item(src_line))
+        self.r._action_move_section(ctx)
+        if ctx.on_confirm is not None:
+            ctx.on_confirm(relation, dest_id)
+        return ctx
+
+    def test_action_highlights_row_and_enters_marker_mode(self):
+        ctx = _EditCtx(cursor=self._item(4))
+        self.r._action_move_section(ctx)
+        # The cursor row became the one-row selection highlight…
+        self.assertEqual(ctx.selects,
+                         [([('content', self.path, 4)], True)])
+        # …and marker mode opened with the move label, nothing written.
+        self.assertEqual(ctx.insert_labels, ['move here'])
+        self.assertEqual(_read(self.path), self._DOC)
+
+    def test_move_forward_after_heading(self):
+        ctx = self._move(2, 'after', ('content', self.path, 4))
+        self.assertEqual(
+            _read(self.path),
+            '# Alpha\nalpha body\n'
+            '# Beta\nbeta body\n'
+            '## Sub\nsub body\n')
+        # Highlight cleared on confirm; mutation logged; cursor lands on
+        # the section's new row.
+        self.assertEqual(ctx.clear_selections, 1)
+        self.assertTrue(any('moved section (after)' in line
+                            for line in ctx.logs), msg=f'logs: {ctx.logs}')
+        self.assertEqual(ctx.cursor_tos, [('content', self.path, 4)])
+
+    def test_move_backward_before_heading(self):
+        # 'before' is synthetic here — the live marker only emits 'after'
+        # / 'first' (see ctx.insert) — but the handler supports all three
+        # and this drives the backward-surgery branch directly.
+        ctx = self._move(4, 'before', ('content', self.path, 0))
+        self.assertEqual(
+            _read(self.path),
+            '# Beta\nbeta body\n'
+            '# Alpha\nalpha body\n'
+            '## Sub\nsub body\n')
+        self.assertEqual(ctx.cursor_tos, [('content', self.path, 0)])
+
+    def test_move_first_under_heading(self):
+        # 'first' = child position: right after Alpha's text run, before
+        # its first sub-heading.
+        ctx = self._move(4, 'first', ('content', self.path, 0))
+        self.assertEqual(
+            _read(self.path),
+            '# Alpha\nalpha body\n'
+            '# Beta\nbeta body\n'
+            '## Sub\nsub body\n')
+        self.assertEqual(ctx.cursor_tos, [('content', self.path, 2)])
+
+    def test_move_after_file_root_is_document_bottom(self):
+        ctx = self._move(2, 'after', ('file', self.path))
+        self.assertEqual(
+            _read(self.path),
+            '# Alpha\nalpha body\n'
+            '# Beta\nbeta body\n'
+            '## Sub\nsub body\n')
+        self.assertEqual(ctx.cursor_tos, [('content', self.path, 4)])
+
+    def test_move_into_itself_is_noop(self):
+        # STRICTLY INSIDE: Alpha's extent contains Sub — 'before' Sub is
+        # an offset in the extent's interior. A no-op, not an error.
+        ctx = self._move(0, 'before', ('content', self.path, 2))
+        self.assertIn('nothing moved — the destination is within the '
+                      'section', ctx.flashes)
+        self.assertEqual(_read(self.path), self._DOC)
+
+    def test_move_to_own_boundary_is_noop(self):
+        # EXACT START and EXACT END: dest == source row — 'before' is the
+        # extent's own start offset, 'after' its own end offset. Both are
+        # boundary-inclusive no-ops (re-inserting there reproduces the
+        # document byte-for-byte).
+        for relation in ('before', 'after'):
+            with self.subTest(relation=relation):
+                ctx = self._move(4, relation, ('content', self.path, 4))
+                self.assertIn('nothing moved — the destination is within '
+                              'the section', ctx.flashes)
+                self.assertEqual(_read(self.path), self._DOC)
+                self.assertEqual(ctx.refreshes, 0)
+
+    def test_move_to_descendant_end_boundary_is_noop(self):
+        # EXACT END via a descendant: 'after' Sub — Alpha's last child —
+        # is exactly Alpha's own extent end.
+        ctx = self._move(0, 'after', ('content', self.path, 2))
+        self.assertIn('nothing moved — the destination is within the '
+                      'section', ctx.flashes)
+        self.assertEqual(_read(self.path), self._DOC)
+
+    def test_shifted_file_still_moves_by_hash(self):
+        # The document grows a new first section AFTER the marker went up
+        # (captures taken) — both endpoints re-address by content hash and
+        # the move lands correctly in the shifted document.
+        ctx = _EditCtx(cursor=self._item(4))
+        self.r._action_move_section(ctx)
+        _rewrite(self.path, '# Zero\nzero body\n' + self._DOC)
+        ctx.on_confirm('first', ('content', self.path, 0))
+        self.assertEqual(
+            _read(self.path),
+            '# Zero\nzero body\n'
+            '# Alpha\nalpha body\n'
+            '# Beta\nbeta body\n'
+            '## Sub\nsub body\n')
+
+    def test_lost_target_flashes_and_leaves_file_alone(self):
+        # The moved section vanished underneath the marker — no endpoint
+        # can be re-addressed: flash, and the changed file stays intact.
+        ctx = _EditCtx(cursor=self._item(4))
+        self.r._action_move_section(ctx)
+        changed = '# Alpha\nalpha body\n## Sub\nsub body\n# Gamma\nnew\n'
+        _rewrite(self.path, changed)
+        ctx.on_confirm('after', ('content', self.path, 0))
+        self.assertTrue(any('could not move' in f for f in ctx.flashes),
+                        msg=f'flashes: {ctx.flashes}')
+        self.assertEqual(_read(self.path), changed)
+
+    def test_cross_file_destination_rejected(self):
+        ctx = self._move(4, 'after', ('content', '/elsewhere.md', 0))
+        self.assertIn('cannot move a section to a different file',
+                      ctx.flashes)
+        self.assertEqual(_read(self.path), self._DOC)
+
+    def test_reference_row_destination_rejected(self):
+        ctx = self._move(4, 'after', ('md', 'anchor', ('x',), 0))
+        self.assertTrue(any('move works on the primary document' in f
+                            for f in ctx.flashes),
+                        msg=f'flashes: {ctx.flashes}')
+        self.assertEqual(_read(self.path), self._DOC)
+
+    def test_non_content_cursor_rejected(self):
+        # A file root is not movable — flash, and marker mode never opens.
+        fs = self.r._FILES[self.path]
+        ctx = _EditCtx(cursor=fs.file_root)
+        self.r._action_move_section(ctx)
+        self.assertTrue(any('put the cursor on a heading' in f
+                            for f in ctx.flashes),
+                        msg=f'flashes: {ctx.flashes}')
+        self.assertEqual(ctx.insert_labels, [])
+        self.assertEqual(ctx.selects, [])
+
+    def test_first_under_text_run_rejected(self):
+        # Alpha's text run (line 1) is a leaf — no child position.
+        ctx = self._move(4, 'first', ('content', self.path, 1))
+        self.assertIn('cannot insert a child under a [text] run',
+                      ctx.flashes)
+        self.assertEqual(_read(self.path), self._DOC)
+
+    def test_text_run_is_movable(self):
+        # Alpha's intro run relocates after Beta — bytes verbatim.
+        ctx = self._move(1, 'after', ('content', self.path, 4))
+        self.assertEqual(
+            _read(self.path),
+            '# Alpha\n'
+            '## Sub\nsub body\n'
+            '# Beta\nbeta body\n'
+            'alpha body\n')
+        self.assertEqual(ctx.cursor_tos, [('content', self.path, 5)])
+
+
+class TestMoveSectionStdin(unittest.TestCase):
+    """``x`` on the stdin document — in-memory move."""
+
+    _DOC = '# Piped\nintro body\n## Inner\ninner body\n## Outer\nouter\n'
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self.r._STDIN_TEXT = self._DOC
+        self.r._INPUT_FILES = [(self.r._STDIN_PATH, '')]
+        self.r._reparse()
+
+    def test_move_applies_in_memory(self):
+        path = self.r._STDIN_PATH
+        fs = self.r._FILES[path]
+        ctx = _EditCtx(cursor=fs.by_id[('content', path, 4)])
+        self.r._action_move_section(ctx)
+        # 'before' is synthetic (the live marker emits 'after'/'first');
+        # it drives the backward branch through the stdin pipeline.
+        ctx.on_confirm('before', ('content', path, 2))
+        self.assertEqual(self.r._STDIN_TEXT,
+                         '# Piped\nintro body\n'
+                         '## Outer\nouter\n'
+                         '## Inner\ninner body\n')
         self.assertIn('applied to in-memory copy - not saved to disk',
                       ctx.flashes)
         self.assertFalse(os.path.exists(path))

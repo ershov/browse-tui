@@ -61,6 +61,14 @@ Custom actions on top of the framework defaults:
       small template, and the saved content goes through the same
       conflict-safe apply chain as ``E``. Anchors are primary-file
       rows only (v1) — reference-subtree rows are rejected.
+  x   move the section under the cursor: the row highlights (the
+      selection is re-pointed at it), the placement marker picks the
+      destination, and the extent's bytes are cut + re-inserted
+      verbatim — a PHYSICAL move, no releveling. Both endpoints are
+      re-addressed in the current document by the same hash-verified
+      chain as ``E``, so a document that changed underneath the
+      marker flashes instead of corrupting. Same v1 anchor surface
+      as ``a``, same file only; stdin moves stay in-memory.
   →   expand the cursor row (overrides the framework default); when
       the row is a file whose only child is a heading, that heading
       is auto-expanded too, so a single-heading document reveals its
@@ -1733,7 +1741,7 @@ def _action_view_source(ctx):
     _run_source_command(ctx)
 
 
-# ---- section editing (E) + section insert (a / i) --------------------------
+# ---- section editing (E), insert (a / i), move (x) -------------------------
 #
 # ``E`` edits the section under the CURSOR through ``$EDITOR``; ``a`` / ``i``
 # insert a NEW section at a marker-chosen position. Both re-apply the editor's
@@ -1747,7 +1755,10 @@ def _action_view_source(ctx):
 # operation is refused with a retry dialog — never spliced into the wrong
 # place. Edit and insert share one editor loop (``_editor_splice_loop``): the
 # only differences are the temp file's seed (extent vs template) and the
-# splice's ``where`` (``'replace'`` vs the marker relation).
+# splice's ``where`` (``'replace'`` vs the marker relation). ``x`` moves a
+# section without an editor: both endpoints are re-addressed by the same
+# chain (``_resolve_capture``) and the extent is physically cut and
+# re-inserted in one string operation (``_apply_section_move``).
 
 
 # The at-action-time address of a section extent, consumed by
@@ -2056,6 +2067,175 @@ def _insert_section_at(ctx, relation, dest_id):
     _editor_splice_loop(ctx, path, cap, _INSERT_TEMPLATE, relation)
 
 
+def _resolve_capture(text, cap, doc):
+    """Re-address ``cap`` in the CURRENT ``text`` → ``M2A_Target`` or ``None``.
+
+    The resolution half of the ``_apply_splice`` chain — same steps, same
+    order, same failure meaning — for the move operation, which must see
+    BOTH endpoints' offsets before touching anything (a cut + re-insert is
+    one string operation, not a splice per endpoint). ``doc`` is the
+    ``md2ansi_doc(text)`` both resolutions of a move share. On the range
+    fallback a heading trades the bare range target for the node-bearing
+    heading target at the (now hash-proven) same lines, so a ``'first'``
+    destination can reach its ``#text`` run.
+    """
+    if cap.kind == 'root':
+        return _md2ansi_resolve(text, '/', doc=doc)
+    if cap.kind == 'heading':
+        try:
+            return _md2ansi_resolve(text, f'#hash:{cap.hash}', doc=doc)
+        except ValueError:
+            pass
+    try:
+        t = _md2ansi_resolve(text, f'#{cap.a}-{cap.b}', doc=doc)
+        if t.hash != cap.hash[:12]:
+            return None
+        if cap.kind == 'heading':
+            return _md2ansi_resolve(text, f'#h{cap.level}:{cap.a}', doc=doc)
+        return t
+    except ValueError:
+        return None
+
+
+def _insert_offset(t, relation, doc):
+    """The character offset where ``relation`` lands relative to target ``t``.
+
+    ``'first'`` is the child position: after the target's ``#text`` run —
+    the preamble for the root target, else the heading node's first child
+    (zero-width when the body is blank, degenerating to just after the
+    heading line) — mirroring the library's own ``where='first'`` rule.
+    """
+    if relation == 'first':
+        run = doc.tree[0] if t.kind == 'root' else t.node.children[0]
+        return run.byte_offset + run.byte_size
+    return t.start if relation == 'before' else t.end
+
+
+def _move_surgery(text, src_t, ins):
+    """Physically move ``text[src_t.start:src_t.end]`` to offset ``ins``.
+
+    Returns ``(new_text, new_start)`` — the moved block's start offset in
+    the new text. ``ins`` must lie outside the block (the caller guards).
+    The block gets the library's trailing-newline guarantee, so an extent
+    cut from an EOF-without-newline never glues onto its new right-hand
+    neighbour.
+    """
+    block = text[src_t.start:src_t.end]
+    if block and not block.endswith('\n'):
+        block += '\n'
+    if ins >= src_t.end:
+        return (text[:src_t.start] + text[src_t.end:ins]
+                + block + text[ins:]), src_t.start + (ins - src_t.end)
+    return (text[:ins] + block + text[ins:src_t.start]
+            + text[src_t.end:]), ins
+
+
+def _apply_section_move(path, src_cap, dest_cap, relation):
+    """Re-address both ends of a move in the CURRENT document, cut + paste.
+
+    Returns ``(status, new_text, line)``. Status ``'ok'`` carries the new
+    document text and the moved section's new 0-based start line (the
+    cursor-landing row id); the non-moves carry ``(None, 0)``:
+
+      * ``'lost'`` — an endpoint could not be re-addressed (the document
+                     changed underneath the marker);
+      * ``'noop'`` — the insert point lies within the moved extent
+                     (boundaries included): relocating a section relative
+                     to its own interior — a descendant row, its own row,
+                     or an adjacent boundary — changes nothing, so it is
+                     a no-op rather than an error.
+    """
+    text = _read_document(path)
+    doc = _md2ansi_doc(text)
+    src_t = _resolve_capture(text, src_cap, doc)
+    dest_t = _resolve_capture(text, dest_cap, doc)
+    if src_t is None or dest_t is None:
+        return 'lost', None, 0
+    ins = _insert_offset(dest_t, relation, doc)
+    if src_t.start <= ins <= src_t.end:
+        return 'noop', None, 0
+    new_text, new_start = _move_surgery(text, src_t, ins)
+    return 'ok', new_text, new_text.count('\n', 0, new_start)
+
+
+def _action_move_section(ctx):
+    """``x`` — move (cut + re-insert) the section under the cursor.
+
+    The cursor row is highlighted by re-pointing the SELECTION at it (any
+    existing selection is replaced — the selection doubles as the "this is
+    what moves" highlight), then the framework's marker mode picks the
+    destination (``'move here'``); the cut happens on confirm. Esc cancels
+    without a callback, which leaves the highlight in place — harmless (it
+    still shows what was about to move) and replaced by the next move /
+    selection gesture. Movable rows are the primary document's heading /
+    text runs; file roots and reference rows flash. The move is PHYSICAL:
+    the extent's bytes relocate verbatim, heading levels are not adjusted
+    to the new surroundings.
+    """
+    item = ctx.cursor
+    if item is None:
+        return
+    nid = item.id
+    if not (isinstance(nid, tuple) and nid and nid[0] == 'content'):
+        ctx.flash('move works on a section of the primary document — '
+                  'put the cursor on a heading / text row')
+        return
+    path = nid[1]
+    fs = _FILES.get(path)
+    node = fs.by_id.get(nid) if fs is not None else None
+    if node is None:
+        return
+    src_cap = _capture_extent(fs.text, node)
+    ctx.select([nid], replace=True)
+    ctx.insert('move here', lambda relation, dest_id:
+               _move_section_to(ctx, path, src_cap, relation, dest_id))
+
+
+def _move_section_to(ctx, path, src_cap, relation, dest_id):
+    """Marker-confirm body of a move: validate the anchor, cut + re-insert.
+
+    Same v1 anchor surface as insert (primary-file root / heading / text
+    rows; ``'first'`` never under a text run) plus move's own rules: the
+    destination must live in the SAME document, and a destination within
+    the moved extent is a no-op. No editor is involved, so an endpoint
+    that changed underneath the marker just flashes — nothing to
+    preserve, re-check and repeat. On success the cursor lands on the
+    section's new row.
+    """
+    ctx.clear_selection()   # the moved-row highlight served its purpose
+    if not (isinstance(dest_id, tuple) and dest_id
+            and dest_id[0] in ('file', 'content')):
+        ctx.flash('move works on the primary document only — pick a '
+                  'file / heading / text row')
+        return
+    if dest_id[1] != path:
+        ctx.flash('cannot move a section to a different file')
+        return
+    fs = _FILES.get(path)
+    if fs is None:
+        return
+    node = fs.file_root if dest_id[0] == 'file' else fs.by_id.get(dest_id)
+    if node is None:
+        return
+    if relation == 'first' and node.kind == 'text':
+        ctx.flash('cannot insert a child under a [text] run')
+        return
+    dest_cap = _capture_extent(fs.text, node)
+    status, new_text, line = _apply_section_move(
+        path, src_cap, dest_cap, relation)
+    if status == 'noop':
+        ctx.flash('nothing moved — the destination is within the section')
+        return
+    if status == 'lost':
+        ctx.flash('could not move: the document changed underneath — '
+                  'Ctrl-R and retry')
+        return
+    _persist_document(ctx, path, new_text)
+    ctx.log(f'browse-md: moved section ({relation}) in '
+            f'{os.path.basename(path)}')
+    ctx.refresh(on_complete=lambda: ctx.cursor_to(('content', path, line)))
+
+
 def _on_expand(ctx, ids):
     """Auto-expand a file whose only child is a heading.
 
@@ -2230,16 +2410,17 @@ def _content_is_heading(item_id):
 def context_menu_content(ctx, item_id):
     """``(label, token)`` rows for a ``('content', path, line)`` row.
 
-    A heading or a text run. Edit / Insert / View / Render duplicate the
-    ``E`` / ``a`` / ``V`` / ``M`` actions (edit / view act on the section's
-    byte range; insert enters marker mode), so their rows carry the hotkey
-    hint. "Show heading anchor" is offered only for a heading
+    A heading or a text run. Edit / Insert / Move / View / Render duplicate
+    the ``E`` / ``a`` / ``x`` / ``V`` / ``M`` actions (edit / view act on the
+    section's byte range; insert and move enter marker mode), so their rows
+    carry the hotkey hint. "Show heading anchor" is offered only for a heading
     (``_content_is_heading``) — a text run has no anchor. Expand / Collapse
     reuse the framework's subtree-expand / collapse on the cursor row.
     """
     rows = [
         ('Edit section (E)',             'content.edit'),
         ('Insert here (a)',              'content.insert'),
+        ('Move section (x)',             'content.move'),
         ('View section in $PAGER (V)',   'content.view'),
         ('Render section via mdcat (M)', 'content.mdcat'),
     ]
@@ -2307,6 +2488,7 @@ _MENU_ACTIONS = {
     # heading / text run — reuse E / a / V / M, anchor pop-up, expand / collapse.
     'content.edit':     lambda c, i: _action_edit_section(c),
     'content.insert':   lambda c, i: _action_insert_section(c),
+    'content.move':     lambda c, i: _action_move_section(c),
     'content.view':     lambda c, i: _action_view_source(c),
     'content.mdcat':    lambda c, i: _action_md_preview(c),
     'content.anchor':   lambda c, i: _cm_content_anchor(c, i),
@@ -2420,14 +2602,18 @@ browse-md — markdown browser for one or more files.
           confirms, esc cancels), then ``$EDITOR`` opens a template —
           save it to splice the section in at the marker (same
           conflict-safe apply as E; stdin stays in-memory).
+  x       Move the section under the cursor: the row highlights, the
+          marker picks the new position, and the section's bytes are
+          cut + re-inserted verbatim (no releveling; same conflict-
+          safe re-addressing as E; stdin stays in-memory).
   Ctrl-R  Re-slurp every input file and rebuild the tree.
 
 Right-click a row (or the backslash / F1 keys) for a menu keyed to its
 kind: a file row edits / inserts / views / renders, opens its dir in
-browse-fs, shows its path, or re-scans; a heading / text row acts on the
-section, inserts, shows the heading anchor, and expands / collapses; a
-cross-file reference opens / edits the referenced file and shows its
-resolved path.\
+browse-fs, shows its path, or re-scans; a heading / text row acts on
+the section, inserts, moves, shows the heading anchor, and expands or
+collapses; a cross-file reference opens / edits the referenced file
+and shows its resolved path.\
 """
 
 
@@ -2765,6 +2951,12 @@ def main():
     actions.append(Action('a', 'Insert new section at marker',
                           _action_insert_section, 'none'))
     actions.append(Action('i', '', _action_insert_section, 'none'))
+    # ``x`` cuts the section under the cursor and re-inserts it at a
+    # marker-chosen position (browse-plan's move keys ``m``/``M`` are both
+    # taken here — the coloring toggle and the $MDCAT view). The cursor row
+    # stays highlighted via the selection while the marker is up.
+    actions.append(Action('x', 'Move section to marker (cut + re-insert)',
+                          _action_move_section, 'none'))
     # The built-in Right-arrow (``_nav_right``) handles expand and
     # step-into-first-child; the lone-heading auto-expand rides the
     # ``on_expand`` hook below so it fires for every expansion source,

@@ -172,20 +172,21 @@ class TestPerKindMenus(unittest.TestCase):
 
     def test_heading_menu_rows_and_hints(self):
         # A heading row (kind == 'heading') gets the section actions + the
-        # heading-anchor row + expand/collapse. E / a / V / M carry hints.
+        # heading-anchor row + expand/collapse. E / a / x / V / M carry hints.
         item = Item(id=('content', '/proj/doc.md', 0), title='Intro',
                     tag='h1', has_children=True)
         item.kind = 'heading'
         self.r._BY_ID = {item.id: item}
         rows = self.r.context_menu_options(self._ctx(item))
         self.assertEqual(_tokens(rows), [
-            'content.edit', 'content.insert', 'content.view', 'content.mdcat',
-            'content.anchor', 'content.expand', 'content.collapse',
-            'toggle_md',
+            'content.edit', 'content.insert', 'content.move', 'content.view',
+            'content.mdcat', 'content.anchor', 'content.expand',
+            'content.collapse', 'toggle_md',
         ])
         labels = dict((t, l) for l, t in rows)
         self.assertEqual(labels['content.edit'], 'Edit section (E)')
         self.assertEqual(labels['content.insert'], 'Insert here (a)')
+        self.assertEqual(labels['content.move'], 'Move section (x)')
         self.assertEqual(labels['content.view'], 'View section in $PAGER (V)')
         self.assertEqual(labels['content.mdcat'], 'Render section via mdcat (M)')
 
@@ -198,8 +199,9 @@ class TestPerKindMenus(unittest.TestCase):
         self.r._BY_ID = {item.id: item}
         rows = self.r.context_menu_options(self._ctx(item))
         self.assertEqual(_tokens(rows), [
-            'content.edit', 'content.insert', 'content.view', 'content.mdcat',
-            'content.expand', 'content.collapse', 'toggle_md',
+            'content.edit', 'content.insert', 'content.move', 'content.view',
+            'content.mdcat', 'content.expand', 'content.collapse',
+            'toggle_md',
         ])
         self.assertNotIn('content.anchor', _tokens(rows))
 
@@ -440,15 +442,17 @@ class TestDispatchReusesActions(unittest.TestCase):
         calls = []
         self.r._action_edit_section = lambda c: calls.append('edit')
         self.r._action_insert_section = lambda c: calls.append('insert')
+        self.r._action_move_section = lambda c: calls.append('move')
         self.r._action_view_source = lambda c: calls.append('view')
         self.r._action_md_preview = lambda c: calls.append('mdcat')
         ctx = object()
         cid = ('content', '/d.md', 0)
         self.r._MENU_ACTIONS['content.edit'](ctx, cid)
         self.r._MENU_ACTIONS['content.insert'](ctx, cid)
+        self.r._MENU_ACTIONS['content.move'](ctx, cid)
         self.r._MENU_ACTIONS['content.view'](ctx, cid)
         self.r._MENU_ACTIONS['content.mdcat'](ctx, cid)
-        self.assertEqual(calls, ['edit', 'insert', 'view', 'mdcat'])
+        self.assertEqual(calls, ['edit', 'insert', 'move', 'view', 'mdcat'])
 
     def test_toggle_md_reuses_handler(self):
         calls = []

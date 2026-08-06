@@ -566,5 +566,84 @@ class TestBrowseMdInsertSection(unittest.TestCase):
                 t.send('q')
 
 
+class TestBrowseMdMoveSection(unittest.TestCase):
+    """``x`` moves the cursor section to the marker — no editor involved.
+
+    End-to-end against the shipped binary: pressing ``x`` on a heading
+    row enters marker mode with the ``-- move here --`` marker, moving
+    the marker below the next section and confirming cuts the section's
+    bytes and re-inserts them there. Asserted on the re-rendered pane
+    AND the exact bytes on disk (a forward move — the direction whose
+    surgery re-bases the block past the cut).
+    """
+
+    _DOC = (
+        '# Doc\n'
+        '\n'
+        '## First\n'
+        '\n'
+        'FIRST BODY LINE\n'
+        '\n'
+        '## Second\n'
+        '\n'
+        'second body\n'
+    )
+    _MOVED = (
+        '# Doc\n'
+        '\n'
+        '## Second\n'
+        '\n'
+        'second body\n'
+        '## First\n'
+        '\n'
+        'FIRST BODY LINE\n'
+        '\n'
+    )
+
+    def test_move_forward_via_marker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = os.path.join(tmp, 'doc.md')
+            with open(doc, 'w') as f:
+                f.write(self._DOC)
+            with TmuxFixture(cols=100, rows=40) as t:
+                line = '{bin} --run-py {recipe} {doc}'.format(
+                    bin=shlex.quote(_BIN),
+                    recipe=shlex.quote(_RECIPE),
+                    doc=shlex.quote(doc),
+                )
+                t.send_line(line)
+                t.wait_for('Second', timeout=6.0)
+                t.send('Down')   # file root -> [h1] Doc
+                t.send('Down')   # -> [h2] First
+                t.send('x')
+                # Marker mode is on: the labelled marker row renders.
+                t.wait_for('move here', timeout=4.0)
+                # Default gap is right below First; one step down lands
+                # past Second → relation 'after' on Second.
+                t.send('Down')
+                t.send('Enter')
+                # Both titles render before AND after the move, so the
+                # screen offers no unique needle — poll the ground truth
+                # instead: the file's moved bytes, then the re-rendered
+                # tree listing Second above First. The ``[h2]``-tagged
+                # forms are the TREE rows (preview text carries no tag
+                # chip), so the order check can't trip on the preview.
+                deadline = time.time() + 6.0
+                final = pane = None
+                while time.time() < deadline:
+                    with open(doc) as f:
+                        final = f.read()
+                    pane = t.capture()
+                    if (final == self._MOVED and '[h2] Second' in pane
+                            and (pane.index('[h2] Second')
+                                 < pane.index('[h2] First'))):
+                        break
+                    time.sleep(0.05)
+                self.assertEqual(final, self._MOVED)
+                self.assertLess(pane.index('[h2] Second'),
+                                pane.index('[h2] First'))
+                t.send('q')
+
+
 if __name__ == '__main__':
     unittest.main()
