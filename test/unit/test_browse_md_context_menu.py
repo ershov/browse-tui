@@ -422,7 +422,7 @@ class TestDispatchReusesActions(unittest.TestCase):
 
     def test_file_source_tokens_reuse_handlers(self):
         calls = []
-        self.r._action_edit_source = lambda c: calls.append('edit')
+        self.r._action_edit_section = lambda c: calls.append('edit')
         self.r._action_view_source = lambda c: calls.append('view')
         self.r._action_md_preview = lambda c: calls.append('mdcat')
         ctx = object()
@@ -434,7 +434,7 @@ class TestDispatchReusesActions(unittest.TestCase):
 
     def test_content_source_tokens_reuse_handlers(self):
         calls = []
-        self.r._action_edit_source = lambda c: calls.append('edit')
+        self.r._action_edit_section = lambda c: calls.append('edit')
         self.r._action_view_source = lambda c: calls.append('view')
         self.r._action_md_preview = lambda c: calls.append('mdcat')
         ctx = object()

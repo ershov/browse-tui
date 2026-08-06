@@ -434,5 +434,71 @@ class TestBrowseMdRoot(unittest.TestCase):
                 t.send('q')
 
 
+class TestBrowseMdEditSection(unittest.TestCase):
+    """``E`` edits the section under the cursor through ``$EDITOR``.
+
+    End-to-end against the shipped binary: ``$EDITOR`` is a non-interactive
+    script that overwrites its file argument with a fixed replacement
+    section, so pressing ``E`` on a heading row exercises the whole
+    pipeline — extent capture → temp file → editor → hash-addressed splice
+    → file write-back → reparse — without a real interactive editor.
+    Asserted on the re-rendered preview AND the exact bytes written back
+    to disk (an edit landing on the wrong row would splice a different
+    final document).
+    """
+
+    _DOC = (
+        '# Alpha\n'
+        '\n'
+        'alpha body\n'
+        '\n'
+        '## Section Two\n'
+        '\n'
+        'section two body\n'
+    )
+    _EDITED = '## Section Two\n\nEDITED BODY LINE\n'
+
+    def test_edit_heading_section_via_editor_script(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = os.path.join(tmp, 'doc.md')
+            with open(doc, 'w') as f:
+                f.write(self._DOC)
+            ed = os.path.join(tmp, 'fake-editor')
+            with open(ed, 'w') as f:
+                f.write('#!/bin/sh\n'
+                        'cat > "$1" <<\'EOF\'\n'
+                        '## Section Two\n'
+                        '\n'
+                        'EDITED BODY LINE\n'
+                        'EOF\n')
+            os.chmod(ed, 0o755)
+            with TmuxFixture(cols=100, rows=40) as t:
+                line = 'EDITOR={ed} {bin} --run-py {recipe} {doc}'.format(
+                    ed=shlex.quote(ed),
+                    bin=shlex.quote(_BIN),
+                    recipe=shlex.quote(_RECIPE),
+                    doc=shlex.quote(doc),
+                )
+                t.send_line(line)
+                # Single-file startup auto-expands the file row, and the
+                # lone-h1 cascade expands Alpha too — so the [text] run and
+                # the h2 are already rows. Sync on rendered content before
+                # sending keys.
+                t.wait_for('Section Two', timeout=6.0)
+                t.send('Down')   # file root -> [h1] Alpha
+                t.send('Down')   # -> [text] alpha body
+                t.send('Down')   # -> [h2] Section Two
+                t.send('E')
+                # The editor script returns immediately; the apply chain
+                # splices, writes back, and the refreshed preview shows the
+                # new section body under the (unmoved) cursor.
+                t.wait_for('EDITED BODY LINE', timeout=6.0)
+                with open(doc) as f:
+                    final = f.read()
+                self.assertEqual(
+                    final, '# Alpha\n\nalpha body\n\n' + self._EDITED)
+                t.send('q')
+
+
 if __name__ == '__main__':
     unittest.main()

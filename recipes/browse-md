@@ -7,9 +7,10 @@ name). With no positionals at all the recipe browses the current
 directory (equivalent to ``browse-md .``). The lone argument ``-``
 reads ONE document from ``sys.stdin`` (slurped to EOF before the UI
 starts) and browses it like a file — its top-level row is titled
-``-`` (matching the invocation). Editing/paging the on-disk source (``V`` / ``E``) is
-unavailable for that document (it has no file); the actions flash a
-message instead. When stdin is a pipe or redirect (not a tty), this
+``-`` (matching the invocation). Paging the on-disk source (``V``) is
+unavailable for that document (it has no file) and flashes a message;
+``E`` edits apply to the in-memory copy instead (never saved to disk).
+When stdin is a pipe or redirect (not a tty), this
 mode auto-engages — the ``-`` is optional, so ``cmd | browse-md`` works
 too. ``-`` stays the explicit form, needed only to read stdin when
 stdin is a tty (type/paste the document, end with ^D).
@@ -47,8 +48,13 @@ Custom actions on top of the framework defaults:
       multi-select groups targets by file, merges byte ranges per
       file, and concatenates the resulting slices with a
       ``\\n===== <filename> =====\\n`` separator between groups.
-  E   edit the source for cursor/selection in ``$EDITOR``. Same
-      per-file-root / cross-file rules as V.
+  E   edit the section under the cursor in ``$EDITOR``. A per-file
+      root edits the file in place; a heading / text row edits the
+      section's extent in a temp .md and re-applies it via a
+      hash-verified splice, so a file that changed underneath the
+      editor is re-addressed rather than corrupted. The stdin
+      document applies to the in-memory copy. Cursor only —
+      selection is ignored.
   →   expand the cursor row (overrides the framework default); when
       the row is a file whose only child is a heading, that heading
       is auto-expanded too, so a single-heading document reveals its
@@ -59,6 +65,8 @@ Usage:  browse-md [FILE.md[#anchor] | DIR ... | -]
 """
 
 import bisect
+import collections
+import hashlib
 import os
 import sys
 
@@ -68,8 +76,9 @@ from browse_tui import Action, Browser, BrowserConfig, Item, recipe_argv
 # library's document model (``M2A_Doc`` / ``M2A_Node``) from which the
 # primary-file heading tree is built (one source of truth with the library
 # grammar); ``md_doc`` powers the cross-file reference subtrees (ref
-# capture/resolution + the ``get_doc`` parse cache). ``_md2ansi_fn`` is
-# retained as the colored-preview render seam that ``get_preview`` calls
+# capture/resolution + the ``get_doc`` parse cache); ``md2ansi_resolve`` /
+# ``md2ansi_splice`` power the ``E`` section-edit apply chain. ``_md2ansi_fn``
+# is retained as the colored-preview render seam that ``get_preview`` calls
 # and the render-path tests monkeypatch. The imports stay wrapped in
 # try/except so the module is still importable for unit tests that exercise
 # individual helpers; the absence is enforced at runtime by the ``main()``
@@ -78,9 +87,14 @@ from browse_tui import Action, Browser, BrowserConfig, Item, recipe_argv
 # prepends the recipe's directory (``recipes/``) to ``sys.path`` and both
 # ``md2ansi_lib.py`` and ``md_doc.py`` live there.
 try:
-    from md2ansi_lib import md2ansi as _md2ansi_fn, md2ansi_doc as _md2ansi_doc
+    from md2ansi_lib import (
+        md2ansi as _md2ansi_fn,
+        md2ansi_doc as _md2ansi_doc,
+        md2ansi_resolve as _md2ansi_resolve,
+        md2ansi_splice as _md2ansi_splice,
+    )
 except ImportError:
-    _md2ansi_fn = _md2ansi_doc = None
+    _md2ansi_fn = _md2ansi_doc = _md2ansi_resolve = _md2ansi_splice = None
 try:
     import md_doc
 except ImportError:
@@ -1552,15 +1566,15 @@ def _write_range_excerpts_grouped(groups):
 
 
 def _run_source_command(ctx, env_var, default):
-    """Shared body of ``V`` / ``E``: resolve targets, dispatch external tool.
+    """Body of ``V``: resolve targets, dispatch the external pager.
 
     Strategy:
 
       * ``ctx.targets`` handles "selection-or-cursor".
       * **Exactly one target, and it is a file-root** → open the
-        original file directly (no tempfile). Edits via ``E``
-        persist naturally. Covers both "cursor on a file row, no
-        selection" and "one file row space-marked, nothing else".
+        original file directly (no tempfile). Covers both "cursor on
+        a file row, no selection" and "one file row space-marked,
+        nothing else".
       * **Anything else** (any multi-target situation, including
         roots mixed with content) → produce a temp file. Every
         target contributes a byte range to be sliced out of its
@@ -1572,14 +1586,14 @@ def _run_source_command(ctx, env_var, default):
         Ranges are grouped by file in argv order, merged per file
         (so a whole-file range naturally absorbs any sub-ranges
         from the same file), then concatenated into one temp ``.md``
-        passed to ``$PAGER`` / ``$EDITOR``. When more than one file
-        contributes, every group is prefixed with a
-        ``===== <basename> =====`` header — including the first —
-        so the reader can spot file boundaries.
+        passed to ``$PAGER``. When more than one file contributes,
+        every group is prefixed with a ``===== <basename> =====``
+        header — including the first — so the reader can spot file
+        boundaries.
 
     Empty ``targets`` (no cursor, no selection) is a no-op. The stdin
-    document has no on-disk source, so both ``V`` and ``E`` flash a
-    message and return rather than fabricating a temp file.
+    document has no on-disk source, so ``V`` flashes a message and
+    returns rather than fabricating a temp file.
 
     Root detection — there are two "open the file directly" shapes, both
     carrying a ``('file', path)`` id:
@@ -1593,15 +1607,15 @@ def _run_source_command(ctx, env_var, default):
     if not targets:
         return
 
-    # The stdin document has no on-disk source to page/edit. ``V`` / ``E``
-    # are about the file on disk; there is none, and we add no temp-file
-    # machinery for it. Degrade gracefully with a flash — the framework's
-    # built-in ``v`` / ``e`` (which act on the rendered preview text, not
-    # the source) still work for the piped document. Stdin mode is always
-    # a single document, so its presence in ``_FILES`` means every target
-    # belongs to it.
+    # The stdin document has no on-disk source to page. ``V`` is about the
+    # file on disk; there is none, and we add no temp-file machinery for
+    # it. Degrade gracefully with a flash — the framework's built-in ``v``
+    # (which pages the rendered preview text, not the source) still works
+    # for the piped document, and ``E`` edits its in-memory copy. Stdin
+    # mode is always a single document, so its presence in ``_FILES``
+    # means every target belongs to it.
     if _STDIN_PATH in _FILES:
-        ctx.flash('no source file for the stdin document — use v/e for '
+        ctx.flash('no source file for the stdin document — use v for '
                   'the preview text')
         return
 
@@ -1712,17 +1726,236 @@ def _action_view_source(ctx):
     _run_source_command(ctx, 'PAGER', 'less -R')
 
 
-def _action_edit_source(ctx):
-    """``E`` — open the source for the cursor row (or selection) in $EDITOR.
+# ---- section editing (E) ---------------------------------------------------
+#
+# ``E`` edits the section under the CURSOR through ``$EDITOR`` and re-applies
+# the result via the md2ansi_lib document-ops layer (``md2ansi_resolve`` /
+# ``md2ansi_splice``). The section's addressable identity — extent slice, full
+# sha256, 1-based line range, kind/level — is captured when the action fires
+# (``_capture_extent``); after the editor saves, the document is RE-READ and
+# the capture is re-addressed in the current text by the apply chain
+# (``_apply_splice``), so a file that changed underneath the editor is either
+# transparently re-found (by hash, or by hash-verified range) or the edit is
+# refused with a retry dialog — never spliced into the wrong place. The chain
+# helper is shared with the insert flow (``where='before'/'after'/'first'``),
+# which anchors on the same capture shape.
 
-    On a per-file root row this edits the original file in place; on
-    non-root rows it opens a throwaway temp .md file with the merged
-    slice contents (cross-file selections use the same per-file
-    grouping + separator as ``V``). Separate from the framework's
-    built-in ``e`` (which opens the *preview text* in $EDITOR with
-    edits discarded).
+
+# The at-action-time address of a section extent, consumed by
+# ``_apply_splice``: the exact extent slice (the editor payload), its FULL
+# sha256 hex digest, the 1-based inclusive line range ``a..b``, and the node
+# ``kind`` (``'heading'`` / ``'text'`` / ``'root'``) + heading ``level``.
+_EditCapture = collections.namedtuple(
+    '_EditCapture', ('kind', 'level', 'extent', 'hash', 'a', 'b'))
+
+
+def _capture_extent(text, node):
+    """Capture the addressable identity of ``node``'s extent in ``text``.
+
+    ``node`` is a recipe Item (any carrier of ``kind`` / ``level`` /
+    ``byte_offset`` / ``byte_size`` / ``line_offset``). ``a``/``b`` are the
+    extent's 1-based inclusive line range: ``b`` counts the newlines up to
+    the extent's LAST character — sections end at line boundaries, so the
+    library's ``#a-b`` range query covers exactly the same slice (including
+    an extent that runs to an EOF without a trailing newline).
     """
-    _run_source_command(ctx, 'EDITOR', 'vim')
+    bo, bs = node.byte_offset, node.byte_size
+    extent = text[bo:bo + bs]
+    return _EditCapture(
+        kind=node.kind,
+        level=node.level,
+        extent=extent,
+        hash=hashlib.sha256(extent.encode('utf-8')).hexdigest(),
+        a=node.line_offset + 1,
+        b=text.count('\n', 0, max(bo + bs - 1, 0)) + 1,
+    )
+
+
+def _apply_splice(text, cap, content, where='replace'):
+    """The shared apply chain: splice ``content`` into ``text`` at ``cap``.
+
+    ``cap`` is the ``_EditCapture`` taken when the action fired; ``text`` is
+    the document as it is NOW (re-read on editor save — possibly changed
+    underneath the editor). Tries, in order — each step a ``try/except
+    ValueError`` around public ``md2ansi_lib`` calls, no error-message
+    parsing:
+
+      1. **Root anchor** (``cap.kind == 'root'``): the root query ``/`` is
+         positionally unambiguous — one splice, no fallback. Used by the
+         stdin document's whole-body edit (and by insert anchored on a
+         file root, where ``where='first'`` lands after the preamble).
+      2. **Hash-primary** (heading extents only — a text run has no hash
+         address): query ``#hash:<full sha256>``. Transparently survives
+         OTHER regions of the file changing underneath the editor; with
+         the full 64-hex digest, ambiguity means true byte-identical
+         duplicate sections (→ fall through).
+      3. **Range fallback** (the primary for ``text`` runs): resolve
+         ``#a-b`` and require its display hash to match the capture's —
+         proving the extent still sits, byte-identical, at its original
+         lines (duplicate sections in an otherwise-unshifted file). Then
+         splice on that range; ``where='first'`` (a child insert — heading
+         anchors only) instead splices on the now-provably-unique
+         ``#h<level>:<a>`` query, since ``'first'`` needs a chapter target.
+
+    Every ``where='replace'`` splice carries ``hash_prefix=<full hash>``
+    (the library's replace-only safeguard); the insert relations are
+    anchor-verified by the query itself. Returns the new document text, or
+    ``None`` when no step could re-address the extent — duplicates AND a
+    shift is genuinely ambiguous (the caller's retry dialog).
+    """
+    guard = {'hash_prefix': cap.hash} if where == 'replace' else {}
+    if cap.kind == 'root':
+        try:
+            return _md2ansi_splice(text, '/', content, where=where, **guard)
+        except ValueError:
+            return None
+    if cap.kind == 'heading':
+        try:
+            return _md2ansi_splice(text, f'#hash:{cap.hash}', content,
+                                   where=where, **guard)
+        except ValueError:
+            pass
+    try:
+        range_q = f'#{cap.a}-{cap.b}'
+        if _md2ansi_resolve(text, range_q).hash != cap.hash[:12]:
+            return None
+        if where == 'first':
+            return _md2ansi_splice(text, f'#h{cap.level}:{cap.a}', content,
+                                   where='first')
+        return _md2ansi_splice(text, range_q, content, where=where, **guard)
+    except ValueError:
+        return None
+
+
+def _apply_section_edit(ctx, path, cap, content):
+    """Re-read ``path``'s document, apply ``content`` over ``cap``, persist.
+
+    The document is re-read from disk (from the in-memory ``_STDIN_TEXT``
+    copy for the stdin document) so changes that landed underneath the
+    editor are honoured; ``_apply_splice`` then re-addresses the captured
+    extent in that current text. On success the new text is written back
+    (stored in-memory for stdin, with a flash saying so), the mutation is
+    logged, and ``ctx.refresh()`` re-parses everything — the framework's
+    full-reload path clears the ``md_doc`` cache, rebuilds the per-file
+    state, and preserves cursor / expansion where the ids allow. Returns
+    ``True`` on success, ``False`` when the extent could not be
+    re-addressed (the caller offers the retry dialog).
+    """
+    global _STDIN_TEXT
+    if path == _STDIN_PATH:
+        src = _STDIN_TEXT
+    else:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            src = f.read()
+    new_text = _apply_splice(src, cap, content, where='replace')
+    if new_text is None:
+        return False
+    if path == _STDIN_PATH:
+        _STDIN_TEXT = new_text
+        ctx.flash('applied to in-memory copy - not saved to disk', log=True)
+    else:
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(new_text)
+    ctx.log(f'browse-md: edited {os.path.basename(path)} '
+            f'lines {cap.a}-{cap.b}')
+    ctx.refresh()
+    return True
+
+
+def _edit_node_in_editor(ctx, path, node):
+    """Section edit body: extent → temp ``.md`` → ``$EDITOR`` → apply chain.
+
+    Serves heading / text-run rows and the stdin document's root (whose
+    "section" is the whole in-memory body). The temp file persists across
+    retry-loop iterations — "Return to editor" re-opens the SAME file, so
+    the user's work is never lost (they can save it elsewhere from inside
+    the editor). An editor exiting non-zero, or content coming back
+    unchanged or empty, cancels without writing.
+    """
+    import tempfile
+    fs = _FILES[path]
+    cap = _capture_extent(fs.text, node)
+    cmd = _split_cmd(os.environ.get('EDITOR') or 'vim')
+    tmp = tempfile.NamedTemporaryFile(
+        'w', suffix='.md', delete=False, encoding='utf-8')
+    try:
+        tmp.write(cap.extent)
+        tmp.close()
+        while True:
+            if ctx.run_external(cmd + [tmp.name]) != 0:
+                ctx.flash('edit cancelled (editor exited non-zero)')
+                return
+            with open(tmp.name, 'r', encoding='utf-8',
+                      errors='replace') as f:
+                content = f.read()
+            if content == cap.extent:
+                ctx.flash('edit cancelled (content unchanged)')
+                return
+            if not content.strip():
+                ctx.flash('edit cancelled (empty content)')
+                return
+            if _apply_section_edit(ctx, path, cap, content):
+                return
+            # Both addressing steps failed — the section changed or moved
+            # underneath the editor. Loop back into the same temp file on
+            # "Return"; esc / "Cancel edit" both land in the falsy arm.
+            if not ctx.confirm(
+                    'could not apply: the section changed or moved '
+                    'underneath the edit',
+                    [('&Cancel edit', False), ('&Return to editor', True)],
+                    title='edit conflict'):
+                ctx.flash('edit cancelled')
+                return
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
+def _action_edit_section(ctx):
+    """``E`` — edit the section under the CURSOR in ``$EDITOR``.
+
+    Cursor node only — the selection is ignored (``V`` keeps the
+    multi-select grouping behavior). Dispatch on the cursor id:
+
+      * per-file root ``('file', path)`` — the original file, edited in
+        place, then a full reparse. The STDIN document's root instead goes
+        through the temp-file pipeline (there is no file): its whole
+        in-memory body is the edited extent.
+      * heading / text run ``('content', path, line)`` — the section's
+        extent through the temp-file + apply-chain pipeline
+        (``_edit_node_in_editor``).
+      * anything else (the ``('md', …)`` / ``('refs', …)`` reference
+        subtree, a stale id) — rejected with a flash; cross-file editing
+        is a future ticket (the context menu's "Edit referenced file"
+        covers the file-level need meanwhile).
+
+    Separate from the framework's built-in ``e`` (which opens the *preview
+    text* in $EDITOR with edits discarded).
+    """
+    item = ctx.cursor
+    if item is None:
+        return
+    nid = item.id
+    if not (isinstance(nid, tuple) and nid and nid[0] in ('file', 'content')):
+        ctx.flash('E edits the primary document only — not reference rows')
+        return
+    path = nid[1]
+    if nid[0] == 'file' and path != _STDIN_PATH:
+        # Per-file root: edit the original file in place (edits persist
+        # naturally), then reparse so the tree reflects them.
+        cmd = _split_cmd(os.environ.get('EDITOR') or 'vim')
+        ctx.run_external(cmd + [path])
+        ctx.refresh()
+        return
+    fs = _FILES.get(path)
+    if fs is None:
+        return
+    node = fs.file_root if nid[0] == 'file' else fs.by_id.get(nid)
+    if node is None:
+        return
+    _edit_node_in_editor(ctx, path, node)
 
 
 def _on_expand(ctx, ids):
@@ -1950,7 +2183,7 @@ def context_menu_ref(ctx, item_id):
 # ``_MENU_ACTIONS`` maps every token a ``context_menu_*`` builder can emit to
 # its handler ``(ctx, item_id)`` — a single uniform signature; each handler
 # pulls the fields it needs from the id tuple. The per-row source actions reuse
-# the recipe's existing action handlers (``_action_edit_source`` /
+# the recipe's existing action handlers (``_action_edit_section`` /
 # ``_action_view_source`` / ``_action_md_preview`` / ``_action_toggle_md``),
 # which read ``ctx.cursor`` / ``ctx.targets`` themselves, so the menu rows stay
 # single-sourced with the E / V / M / m keybindings. "Re-scan all files" reuses
@@ -1961,14 +2194,14 @@ def context_menu_ref(ctx, item_id):
 
 _MENU_ACTIONS = {
     # file root — reuse E / V / M, then open-dir / show-path / Ctrl-R reload.
-    'file.edit':     lambda c, i: _action_edit_source(c),
+    'file.edit':     lambda c, i: _action_edit_section(c),
     'file.view':     lambda c, i: _action_view_source(c),
     'file.mdcat':    lambda c, i: _action_md_preview(c),
     'file.opendir':  lambda c, i: _cm_file_open_dir(c, i[1]),
     'file.path':     lambda c, i: c.alert(i[1], title='path'),
     'file.rescan':   lambda c, i: c.refresh(),
     # heading / text run — reuse E / V / M, anchor pop-up, expand / collapse.
-    'content.edit':     lambda c, i: _action_edit_source(c),
+    'content.edit':     lambda c, i: _action_edit_section(c),
     'content.view':     lambda c, i: _action_view_source(c),
     'content.mdcat':    lambda c, i: _action_md_preview(c),
     'content.anchor':   lambda c, i: _cm_content_anchor(c, i),
@@ -2052,7 +2285,8 @@ Usage: browse-md [--root DIR ...] [FILE.md[#anchor] | DIR ... | -]
   DIR       Expands to the ``.md`` / ``.MD`` files directly inside it
             (non-recursive). No args ⇒ browse ``.``.
   -         Read ONE document from stdin and browse it like a file
-            (row titled ``-``; V/E have no source — they flash). A pipe
+            (row titled ``-``; V has no source and flashes, E edits
+            the in-memory copy — never saved to disk). A pipe
             auto-engages this, so ``-`` is optional when piping; type it
             to read a tty stdin (paste, then ^D).
   #anchor   Deep-link target — 0-based line number or heading name
@@ -2071,8 +2305,12 @@ browse-md — markdown browser for one or more files.
           per-file root opens that file directly; on non-root rows
           pages a temp file with the merged byte-range slices
           (cross-file selections group by file with a per-file header).
-  E       Edit source for cursor/selection in ``$EDITOR`` (same
-          per-file / cross-file rules as V).
+  E       Edit the section under the cursor in ``$EDITOR`` (cursor
+          only — selection ignored). A file row edits the file in
+          place; a heading / text row edits the section in a temp
+          file and re-applies it via a hash-verified splice, so a
+          file that changed underneath the editor is never corrupted.
+          The stdin document applies to its in-memory copy.
   Ctrl-R  Re-slurp every input file and rebuild the tree.
 
 Right-click a row (or the backslash / F1 keys) for a menu keyed to its
@@ -2401,14 +2639,14 @@ def main():
                       _action_toggle_md, 'none'),
                Action('M', 'View preview via $MDCAT / mdcat',
                       _action_md_preview, 'cursor')]
-    # ``V`` / ``E`` operate on ``ctx.targets`` (selection-or-cursor),
-    # including the synthetic root row where ``ctx.cursor`` is None
-    # but a scope_root target is still resolvable — hence the
-    # ``'none'`` gate.
+    # ``V`` operates on ``ctx.targets`` (selection-or-cursor), including
+    # the synthetic root row of a scoped session — hence the ``'none'``
+    # gate. ``E`` is cursor-only (the scope row is a normal cursor row,
+    # so the same gate serves it).
     actions.append(Action('V', 'View source for cursor/selection in $PAGER',
                           _action_view_source, 'none'))
-    actions.append(Action('E', 'Edit source for cursor/selection in $EDITOR',
-                          _action_edit_source, 'none'))
+    actions.append(Action('E', 'Edit section under cursor in $EDITOR',
+                          _action_edit_section, 'none'))
     # The built-in Right-arrow (``_nav_right``) handles expand and
     # step-into-first-child; the lone-heading auto-expand rides the
     # ``on_expand`` hook below so it fires for every expansion source,

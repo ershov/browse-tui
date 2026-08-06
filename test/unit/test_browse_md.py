@@ -4806,22 +4806,21 @@ class TestStdinDocument(unittest.TestCase):
         self.assertEqual(self.r._INPUT_FILES, [(self.r._STDIN_PATH, '')])
         self.assertEqual(self.r._STDIN_TEXT, '# Piped\n## S\n')
 
-    # -- V / E degrade gracefully on the stdin document ---------------
+    # -- V degrades gracefully on the stdin document -------------------
 
-    def test_view_edit_source_flash_on_stdin_document(self):
-        # With the stdin doc active, ``V`` / ``E`` (on-disk source) have
-        # no file to act on: they flash and run nothing. Built-in v/e
-        # (preview text) are unaffected and not exercised here.
+    def test_view_source_flashes_on_stdin_document(self):
+        # With the stdin doc active, ``V`` (on-disk source) has no file
+        # to page: it flashes and runs nothing. Built-in v/e (preview
+        # text) are unaffected, and ``E`` edits the in-memory copy
+        # through its own pipeline (TestEditSectionStdin).
         self._run_main('# Title\n## Section\nbody\n')
         root = _SrcItem(id=('file', self.r._STDIN_PATH), kind='root')
-        for env_var, default in (('PAGER', 'less -R'), ('EDITOR', 'vim')):
-            with self.subTest(env_var=env_var):
-                ctx = _SrcCmdCtx(targets=[root])
-                self.r._run_source_command(ctx, env_var, default)
-                self.assertEqual(ctx.calls, [],
-                                 'no external tool should run for stdin')
-                self.assertEqual(len(ctx.flashes), 1)
-                self.assertIn('stdin', ctx.flashes[0])
+        ctx = _SrcCmdCtx(targets=[root])
+        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.assertEqual(ctx.calls, [],
+                         'no external tool should run for stdin')
+        self.assertEqual(len(ctx.flashes), 1)
+        self.assertIn('stdin', ctx.flashes[0])
 
     # -- stdin doc reference suppression: on without --root, off with it --
 
@@ -4977,6 +4976,508 @@ class _RaiseOnRead:
 
     def read(self):  # pragma: no cover - only hit on a regression
         raise AssertionError('sys.stdin.read() called outside stdin mode')
+
+
+# ---- section editing (E): capture + apply chain + action flow --------------
+
+
+class TestCaptureExtent(unittest.TestCase):
+    """``_capture_extent`` — the at-action-time address of a node's extent."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _capture(self, text, line):
+        _root, by_id = _build_tree(self.r, text, '/x.md')
+        return self.r._capture_extent(text, by_id[('content', '/x.md', line)])
+
+    def test_heading_fields(self):
+        import hashlib
+        text = '# A\nbody\n# B\nmore\n'
+        cap = self._capture(text, 0)
+        self.assertEqual(cap.kind, 'heading')
+        self.assertEqual(cap.level, 1)
+        self.assertEqual(cap.extent, '# A\nbody\n')
+        self.assertEqual((cap.a, cap.b), (1, 2))
+        self.assertEqual(cap.hash,
+                         hashlib.sha256(b'# A\nbody\n').hexdigest())
+
+    def test_range_matches_library_slice(self):
+        # The captured 1-based ``a..b`` names EXACTLY the extent slice
+        # under the library's ``#a-b`` range query — the invariant the
+        # apply chain's range fallback rests on.
+        text = '# A\nbody\n## S\nnested\n# B\nmore\n'
+        cap = self._capture(text, 0)
+        t = self.r._md2ansi_resolve(text, f'#{cap.a}-{cap.b}')
+        self.assertEqual(text[t.start:t.end], cap.extent)
+
+    def test_extent_to_eof_without_trailing_newline(self):
+        text = '# A\nbody\n# B\nmore'    # no trailing newline
+        cap = self._capture(text, 2)
+        self.assertEqual(cap.extent, '# B\nmore')
+        self.assertEqual((cap.a, cap.b), (3, 4))
+        t = self.r._md2ansi_resolve(text, f'#{cap.a}-{cap.b}')
+        self.assertEqual(text[t.start:t.end], cap.extent)
+
+    def test_text_run(self):
+        text = '# T\nintro\n\n## S\nbody\n'
+        cap = self._capture(text, 1)
+        self.assertEqual(cap.kind, 'text')
+        self.assertEqual(cap.extent, 'intro\n\n')
+        self.assertEqual((cap.a, cap.b), (2, 3))
+
+    def test_root_kind_covers_whole_document(self):
+        text = 'preamble\n# A\nbody\n'
+        _root, by_id = _build_tree(self.r, text, '/x.md')
+        cap = self.r._capture_extent(text, by_id[('file', '/x.md')])
+        self.assertEqual(cap.kind, 'root')
+        self.assertEqual(cap.extent, text)
+
+
+class TestApplySplice(unittest.TestCase):
+    """``_apply_splice`` — the hash→range apply chain (the spec's matrix)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = _load_recipe()
+
+    def _cap(self, text, line):
+        _root, by_id = _build_tree(self.r, text, '/x.md')
+        return self.r._capture_extent(text, by_id[('content', '/x.md', line)])
+
+    def _root_cap(self, text):
+        _root, by_id = _build_tree(self.r, text, '/x.md')
+        return self.r._capture_extent(text, by_id[('file', '/x.md')])
+
+    # -- edit (where='replace') ---------------------------------------
+
+    def test_hash_hit_unchanged_document(self):
+        text = '# A\nbody\n# B\nmore\n'
+        cap = self._cap(text, 0)
+        self.assertEqual(self.r._apply_splice(text, cap, '# A\nnew\n'),
+                         '# A\nnew\n# B\nmore\n')
+
+    def test_other_region_shift_then_hash_hit(self):
+        # OTHER regions changed underneath the editor — the section moved
+        # down; the full-hash query still re-addresses it transparently.
+        text = '# A\nbody\n# B\nmore\n'
+        cap = self._cap(text, 2)                 # capture '# B\nmore\n'
+        shifted = '# Z\nzzz zzz\n' + text        # B no longer at lines 3-4
+        self.assertEqual(
+            self.r._apply_splice(shifted, cap, '# B\nnew\n'),
+            '# Z\nzzz zzz\n# A\nbody\n# B\nnew\n')
+
+    def test_duplicate_sections_range_fallback(self):
+        # Two byte-identical sections: the hash query is ambiguous, but
+        # the range fallback proves the ORIGINAL position still holds the
+        # captured bytes and edits exactly that occurrence.
+        text = '# A\nbody\n# A\nbody\n'
+        cap = self._cap(text, 2)                 # the SECOND duplicate
+        self.assertEqual(
+            self.r._apply_splice(text, cap, '# A2\nnew\n'),
+            '# A\nbody\n# A2\nnew\n')
+
+    def test_duplicate_plus_shift_returns_none(self):
+        # Duplicates AND a shift: hash ambiguous, range holds different
+        # bytes — genuinely unresolvable, the caller's retry dialog.
+        text = '# A\nbody\n# A\nbody\n'
+        cap = self._cap(text, 0)
+        self.assertIsNone(
+            self.r._apply_splice('# P\npre\n' + text, cap, '# A2\nX\n'))
+
+    def test_target_edited_underneath_returns_none(self):
+        # The captured section ITSELF changed: hash misses, and the range's
+        # current bytes hash differently → refuse rather than overwrite.
+        text = '# A\nbody\n# B\nmore\n'
+        cap = self._cap(text, 0)
+        self.assertIsNone(self.r._apply_splice(
+            '# A\nCHANGED\n# B\nmore\n', cap, '# A\nnew\n'))
+
+    def test_text_run_range_primary(self):
+        # A text run has no hash address — the range check IS its primary.
+        text = '# T\nintro\n## S\nbody\n'
+        cap = self._cap(text, 1)
+        self.assertEqual(cap.kind, 'text')
+        self.assertEqual(self.r._apply_splice(text, cap, 'INTRO\n'),
+                         '# T\nINTRO\n## S\nbody\n')
+
+    def test_text_run_shifted_returns_none(self):
+        text = '# T\nintro\n## S\nbody\n'
+        cap = self._cap(text, 1)
+        self.assertIsNone(
+            self.r._apply_splice('# P\npre\n' + text, cap, 'INTRO\n'))
+
+    def test_root_replace_whole_document(self):
+        text = '# A\nbody\n'
+        cap = self._root_cap(text)
+        self.assertEqual(self.r._apply_splice(text, cap, '# N\nnew\n'),
+                         '# N\nnew\n')
+
+    # -- insert relations (the shared surface the insert flow reuses) --
+
+    def test_insert_after_via_hash(self):
+        text = '# A\nbody\n# B\nmore\n'
+        cap = self._cap(text, 0)
+        self.assertEqual(
+            self.r._apply_splice(text, cap, '# N\nnew\n', where='after'),
+            '# A\nbody\n# N\nnew\n# B\nmore\n')
+
+    def test_insert_before_via_hash_survives_shift(self):
+        text = '# A\nbody\n# B\nmore\n'
+        cap = self._cap(text, 2)
+        self.assertEqual(
+            self.r._apply_splice('# Z\nzzz\n' + text, cap, '# N\nnew\n',
+                                 where='before'),
+            '# Z\nzzz\n# A\nbody\n# N\nnew\n# B\nmore\n')
+
+    def test_insert_first_on_duplicates_uses_hlevel_query(self):
+        # Duplicate sections force the range fallback; a child insert can't
+        # splice 'first' on a range target, so the chain switches to the
+        # (range-verified) unique ``#h<level>:<line>`` query.
+        text = '# A\nbody\n# A\nbody\n'
+        cap = self._cap(text, 2)                 # the SECOND duplicate
+        self.assertEqual(
+            self.r._apply_splice(text, cap, '## C\nchild\n', where='first'),
+            '# A\nbody\n# A\nbody\n## C\nchild\n')
+
+    def test_insert_first_on_root_lands_after_preamble(self):
+        text = 'preamble\n# A\nbody\n'
+        cap = self._root_cap(text)
+        self.assertEqual(
+            self.r._apply_splice(text, cap, '# N\nnew\n', where='first'),
+            'preamble\n# N\nnew\n# A\nbody\n')
+
+
+class _EditCtx:
+    """Recorder ctx for the ``_action_edit_section`` flow tests.
+
+    Mirrors the Context surface the action touches — ``cursor``,
+    ``run_external`` (the ``$EDITOR`` seam: ``editor(path, call_no)``
+    plays the user's edit by rewriting the temp file, returning the
+    editor's exit code, ``None`` meaning 0), ``confirm`` (scripted
+    answers, ``None`` when the script runs out — the headless default),
+    plus ``flash`` / ``log`` / ``refresh`` recorders. ``selected`` exists
+    (and must stay ignored by ``E``) so the selection-ignored test can
+    populate it.
+    """
+
+    def __init__(self, cursor=None, editor=None, confirms=()):
+        self.cursor = cursor
+        self.selected = []
+        self.editor = editor or (lambda path, call_no: None)
+        self.confirms = list(confirms)
+        self.calls = []              # run_external argv snapshots
+        self.flashes = []
+        self.logs = []
+        self.refreshes = 0
+        self.confirm_prompts = []
+
+    def run_external(self, cmd):
+        self.calls.append(list(cmd))
+        rc = self.editor(cmd[-1], len(self.calls))
+        return 0 if rc is None else rc
+
+    def confirm(self, message, buttons=('&Yes', '&No'), *, title=None,
+                delay_interaction=False):
+        self.confirm_prompts.append(message)
+        return self.confirms.pop(0) if self.confirms else None
+
+    def flash(self, text, log=False):
+        self.flashes.append(text)
+        if log:
+            self.logs.append(text)
+
+    def log(self, text):
+        self.logs.append(text)
+
+    def refresh(self, id=None, on_complete=None):
+        self.refreshes += 1
+
+
+def _rewrite(path, text):
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(text)
+
+
+def _read(path):
+    with open(path, 'r', encoding='utf-8') as f:
+        return f.read()
+
+
+class TestEditSectionAction(unittest.TestCase):
+    """``E`` (``_action_edit_section``) — the editor + apply-chain flow.
+
+    Real per-file state (an on-disk fixture parsed via ``_reparse``), a
+    recorder ctx whose ``run_external`` plays the editor by rewriting the
+    temp file. Asserts on the resulting FILE bytes plus the recipe-log /
+    flash outcomes.
+    """
+
+    _DOC = ('# Alpha\nalpha body\n'
+            '## Sub\nsub body\n'
+            '# Beta\nbeta body\n')
+    # Beta sits at 0-based line 4 → capture lines 5-6.
+    _BETA = '# Beta\nbeta body\n'
+
+    def setUp(self):
+        import tempfile
+        self.r = _load_recipe()
+        fd, self.path = tempfile.mkstemp(suffix='.md')
+        os.close(fd)
+        _rewrite(self.path, self._DOC)
+        self.r._INPUT_FILES = [(self.path, '')]
+        self.r._reparse()
+        self._editor_saved = os.environ.get('EDITOR')
+        os.environ['EDITOR'] = 'fake-ed'
+
+    def tearDown(self):
+        if self._editor_saved is None:
+            os.environ.pop('EDITOR', None)
+        else:
+            os.environ['EDITOR'] = self._editor_saved
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+    def _item(self, line):
+        return self.r._FILES[self.path].by_id[('content', self.path, line)]
+
+    def test_heading_edit_rewrites_file(self):
+        payloads = []
+
+        def ed(tmp, n):
+            payloads.append(_read(tmp))
+            _rewrite(tmp, '# Beta\nEDITED\n')
+
+        ctx = _EditCtx(cursor=self._item(4), editor=ed)
+        self.r._action_edit_section(ctx)
+        # The editor received exactly the section's extent…
+        self.assertEqual(payloads, [self._BETA])
+        # …the splice landed on disk, everything else byte-identical…
+        self.assertEqual(_read(self.path),
+                         '# Alpha\nalpha body\n## Sub\nsub body\n'
+                         '# Beta\nEDITED\n')
+        # …the editor ran on a temp .md (not the source file), since
+        # unlinked; the mutation was logged and the tree refreshed.
+        tmp_arg = ctx.calls[0][-1]
+        self.assertNotEqual(tmp_arg, self.path)
+        self.assertFalse(os.path.exists(tmp_arg))
+        self.assertEqual(ctx.calls[0][0], 'fake-ed')
+        self.assertEqual(ctx.refreshes, 1)
+        self.assertTrue(any('lines 5-6' in line for line in ctx.logs),
+                        msg=f'logs: {ctx.logs}')
+
+    def test_unchanged_content_cancels(self):
+        ctx = _EditCtx(cursor=self._item(4))     # editor leaves temp as-is
+        self.r._action_edit_section(ctx)
+        self.assertEqual(_read(self.path), self._DOC)
+        self.assertEqual(ctx.refreshes, 0)
+        self.assertEqual(ctx.logs, [])
+        self.assertIn('edit cancelled (content unchanged)', ctx.flashes)
+
+    def test_empty_content_cancels(self):
+        ctx = _EditCtx(cursor=self._item(4),
+                       editor=lambda tmp, n: _rewrite(tmp, ' \n'))
+        self.r._action_edit_section(ctx)
+        self.assertEqual(_read(self.path), self._DOC)
+        self.assertIn('edit cancelled (empty content)', ctx.flashes)
+
+    def test_editor_nonzero_exit_cancels(self):
+        def ed(tmp, n):
+            _rewrite(tmp, '# Beta\nEDITED\n')
+            return 1
+        ctx = _EditCtx(cursor=self._item(4), editor=ed)
+        self.r._action_edit_section(ctx)
+        self.assertEqual(_read(self.path), self._DOC)
+        self.assertIn('edit cancelled (editor exited non-zero)', ctx.flashes)
+
+    def test_selection_is_ignored(self):
+        # A populated multi-select must not widen the edit: only the
+        # CURSOR node's extent goes to the editor, only it is replaced.
+        payloads = []
+
+        def ed(tmp, n):
+            payloads.append(_read(tmp))
+            _rewrite(tmp, '# Beta\nEDITED\n')
+
+        ctx = _EditCtx(cursor=self._item(4), editor=ed)
+        ctx.selected = [self._item(0), self._item(2), self._item(4)]
+        self.r._action_edit_section(ctx)
+        self.assertEqual(payloads, [self._BETA])
+        self.assertEqual(len(ctx.calls), 1)
+        self.assertEqual(_read(self.path),
+                         '# Alpha\nalpha body\n## Sub\nsub body\n'
+                         '# Beta\nEDITED\n')
+
+    def test_shift_underneath_applies_by_hash(self):
+        # While the editor is open, OTHER regions of the file change on
+        # disk (a new section prepended). The apply chain re-reads the
+        # file and hash-addresses the section at its new position.
+        def ed(tmp, n):
+            _rewrite(self.path, '# Zero\nzero body\n' + self._DOC)
+            _rewrite(tmp, '# Beta\nEDITED\n')
+
+        ctx = _EditCtx(cursor=self._item(4), editor=ed)
+        self.r._action_edit_section(ctx)
+        self.assertEqual(_read(self.path),
+                         '# Zero\nzero body\n'
+                         '# Alpha\nalpha body\n## Sub\nsub body\n'
+                         '# Beta\nEDITED\n')
+        self.assertEqual(ctx.refreshes, 1)
+
+    def test_conflict_cancel_leaves_file_alone(self):
+        # The target section ITSELF changed on disk underneath the editor
+        # → both addressing steps fail → dialog; "Cancel edit" (falsy)
+        # discards without splicing.
+        conflicted = ('# Alpha\nalpha body\n## Sub\nsub body\n'
+                      '# Beta\nDIVERGED\n')
+
+        def ed(tmp, n):
+            _rewrite(self.path, conflicted)
+            _rewrite(tmp, '# Beta\nEDITED\n')
+
+        ctx = _EditCtx(cursor=self._item(4), editor=ed, confirms=[False])
+        self.r._action_edit_section(ctx)
+        self.assertEqual(_read(self.path), conflicted)
+        self.assertEqual(len(ctx.confirm_prompts), 1)
+        self.assertEqual(ctx.refreshes, 0)
+        self.assertIn('edit cancelled', ctx.flashes)
+
+    def test_conflict_return_to_editor_reopens_same_temp(self):
+        # "Return to editor" loops back into the SAME temp file (the
+        # user's work is preserved); once the conflict clears, the retry
+        # applies.
+        conflicted = ('# Alpha\nalpha body\n## Sub\nsub body\n'
+                      '# Beta\nDIVERGED\n')
+        seen = []
+
+        def ed(tmp, n):
+            seen.append(_read(tmp))
+            if n == 1:
+                _rewrite(self.path, conflicted)   # conflict under editor
+                _rewrite(tmp, '# Beta\nEDITED\n')
+            else:
+                _rewrite(self.path, self._DOC)    # conflict resolved
+
+        ctx = _EditCtx(cursor=self._item(4), editor=ed, confirms=[True])
+        self.r._action_edit_section(ctx)
+        self.assertEqual(len(ctx.calls), 2)
+        # Same temp path both times; the second visit still holds the
+        # user's edited content from the first.
+        self.assertEqual(ctx.calls[0][-1], ctx.calls[1][-1])
+        self.assertEqual(seen, [self._BETA, '# Beta\nEDITED\n'])
+        self.assertEqual(_read(self.path),
+                         '# Alpha\nalpha body\n## Sub\nsub body\n'
+                         '# Beta\nEDITED\n')
+        self.assertEqual(ctx.refreshes, 1)
+
+    def test_file_root_edits_in_place(self):
+        fs = self.r._FILES[self.path]
+        ctx = _EditCtx(cursor=fs.file_root)
+        self.r._action_edit_section(ctx)
+        self.assertEqual(ctx.calls, [['fake-ed', self.path]])
+        self.assertEqual(ctx.refreshes, 1)
+
+    def test_scope_root_pseudo_item_edits_file_in_place(self):
+        # A scoped session's synthetic scope-root row carries only the id
+        # (#552) — the file branch must not touch recipe-added attrs.
+        ctx = _EditCtx(cursor=_ScopeRootPseudoItem(id=('file', self.path)))
+        self.r._action_edit_section(ctx)
+        self.assertEqual(ctx.calls, [['fake-ed', self.path]])
+
+    def test_scoped_content_pseudo_item_resolves_via_index(self):
+        # Scoped INTO a heading: the scope row is a pseudo-Item with the
+        # content id but no byte offsets — the handler resolves the real
+        # node through the per-file index.
+        def ed(tmp, n):
+            _rewrite(tmp, '# Beta\nEDITED\n')
+        pseudo = _ScopeRootPseudoItem(id=('content', self.path, 4))
+        ctx = _EditCtx(cursor=pseudo, editor=ed)
+        self.r._action_edit_section(ctx)
+        self.assertEqual(_read(self.path),
+                         '# Alpha\nalpha body\n## Sub\nsub body\n'
+                         '# Beta\nEDITED\n')
+
+    def test_reference_rows_rejected(self):
+        anchor = ('file', self.path)
+        for rid in (('md', anchor, ('/other.md',), 0),
+                    ('md', anchor, ('/other.md',), None),
+                    ('refs', anchor, ())):
+            ctx = _EditCtx(cursor=_SrcItem(id=rid, kind='md-doc'))
+            self.r._action_edit_section(ctx)
+            self.assertEqual(ctx.calls, [])
+            self.assertTrue(ctx.flashes and
+                            ctx.flashes[0].startswith('E edits the primary'),
+                            msg=f'flashes: {ctx.flashes}')
+
+    def test_no_cursor_is_noop(self):
+        ctx = _EditCtx(cursor=None)
+        self.r._action_edit_section(ctx)
+        self.assertEqual(ctx.calls, [])
+        self.assertEqual(ctx.flashes, [])
+
+    def test_stale_content_id_is_noop(self):
+        ctx = _EditCtx(cursor=_SrcItem(id=('content', '/nope.md', 0),
+                                       kind='heading'))
+        self.r._action_edit_section(ctx)
+        self.assertEqual(ctx.calls, [])
+
+
+class TestEditSectionStdin(unittest.TestCase):
+    """``E`` on the stdin document — the in-memory apply pipeline."""
+
+    _DOC = '# Piped\nintro body\n## Inner\ninner body\n'
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self.r._STDIN_TEXT = self._DOC
+        self.r._INPUT_FILES = [(self.r._STDIN_PATH, '')]
+        self.r._reparse()
+        self._editor_saved = os.environ.get('EDITOR')
+        os.environ['EDITOR'] = 'fake-ed'
+
+    def tearDown(self):
+        if self._editor_saved is None:
+            os.environ.pop('EDITOR', None)
+        else:
+            os.environ['EDITOR'] = self._editor_saved
+
+    def _item(self, line):
+        path = self.r._STDIN_PATH
+        return self.r._FILES[path].by_id[('content', path, line)]
+
+    def test_section_edit_applies_in_memory(self):
+        def ed(tmp, n):
+            _rewrite(tmp, '## Inner\nEDITED\n')
+        ctx = _EditCtx(cursor=self._item(2), editor=ed)
+        self.r._action_edit_section(ctx)
+        self.assertEqual(self.r._STDIN_TEXT,
+                         '# Piped\nintro body\n## Inner\nEDITED\n')
+        self.assertIn('applied to in-memory copy - not saved to disk',
+                      ctx.flashes)
+        self.assertEqual(ctx.refreshes, 1)
+        # Nothing materialised at the sentinel path.
+        self.assertFalse(os.path.exists(self.r._STDIN_PATH))
+
+    def test_root_edit_replaces_whole_in_memory_body(self):
+        payloads = []
+
+        def ed(tmp, n):
+            payloads.append(_read(tmp))
+            _rewrite(tmp, '# Rewritten\nnew body\n')
+
+        fs = self.r._FILES[self.r._STDIN_PATH]
+        ctx = _EditCtx(cursor=fs.file_root, editor=ed)
+        self.r._action_edit_section(ctx)
+        # The stdin root goes through the TEMP pipeline (no file to edit
+        # in place): the payload is the whole in-memory body.
+        self.assertEqual(payloads, [self._DOC])
+        self.assertNotEqual(ctx.calls[0][-1], self.r._STDIN_PATH)
+        self.assertEqual(self.r._STDIN_TEXT, '# Rewritten\nnew body\n')
+        self.assertIn('applied to in-memory copy - not saved to disk',
+                      ctx.flashes)
 
 
 if __name__ == '__main__':
