@@ -1,22 +1,23 @@
-"""Unit tests for ``recipes/md_doc`` — the shared markdown-structure module.
+"""Unit tests for ``recipes/md_doc`` — the shared markdown-plumbing module.
 
-``md_doc``'s STRUCTURAL half imports no ``browse_tui`` (it is the
-framework-agnostic part of the markdown work): we just put ``recipes/`` on
+Document structure comes from ``md2ansi_lib``'s own model (``md2ansi_doc`` →
+``M2A_Doc`` / ``M2A_Node``); ``md_doc`` keeps the plumbing around it. Its
+framework-agnostic half imports no ``browse_tui``: we just put ``recipes/`` on
 ``sys.path`` — which also resolves ``md_doc``'s own ``from md2ansi_lib import
-md2ansi_scan`` to the real library, the same thing ``--run-py`` does at runtime
+md2ansi_doc`` to the real library, the same thing ``--run-py`` does at runtime
 — and import it. Its framework-AWARE launcher block is guarded behind
 ``from browse_tui import Item`` (like a recipe), so to cover that API we import
 ``md_doc`` under a temporary ``browse_tui`` stub and then restore ``sys.modules``
-(see ``_import_md_doc_with_launcher``); the structural tests below use the same
-real module.
+(see ``_import_md_doc_with_launcher``); the other tests use the same real
+module.
 
-Coverage mirrors the design spec's ``md_doc`` testing strategy:
+Coverage:
 
-* ``build_doc_tree``  — heading nesting + boundary byte-range slicing on
-                        fixtures, incl. a fenced ``#`` that is NOT a heading,
-                        and the ``include_lists`` flag (TestBuildDocTree).
-* ``node_at_line``    — exact line-offset lookup over a built tree: top-level
-                        + deeply-nested match, no-match → ``None``
+* ``visible_children`` — the ``#text`` row-set rule over one children list
+                        (TestVisibleChildren).
+* ``node_at_line``    — exact line-offset lookup over the VISIBLE nodes of a
+                        built ``M2A_Doc.tree``: top-level + deeply-nested
+                        match, zero-width-run skip, no-match → ``None``
                         (TestNodeAtLine).
 * ``find_git_root``   — nearest ``.git`` (dir or file) walk-up, none → ``None``,
                         terminates at the filesystem root (TestFindGitRoot).
@@ -24,7 +25,8 @@ Coverage mirrors the design spec's ``md_doc`` testing strategy:
                         regex exclusions (TestTriggersAndRefs).
 * ``resolve_md_ref``  — base precedence, first-existing, ``None``
                         (TestResolveMdRef).
-* ``get_doc`` / ``clear_cache`` — cache hit + clear (TestCache).
+* ``get_doc`` / ``clear_cache`` — cache hit + clear, ``M2A_Doc`` shape
+                        (TestCache).
 * launcher API       — ``ref_label`` anchoring; ``resolve_refs`` dedup / sort /
                         drop-nonexistent; the ``Item`` builders' id + tag shape;
                         and ``launch`` path-arg vs stdin-content invocation with
@@ -103,336 +105,138 @@ def _import_md_doc_with_launcher():
 
 md_doc = _import_md_doc_with_launcher()  # noqa: E402 (path insert precedes import)
 
-
-def _headings(nodes):
-    """The heading children of a node list, dropping synthesised 'text' nodes.
-
-    ``build_doc_tree`` (headings-only) now prepends a dim ``'text'`` node to any
-    scope that has body text before its first heading. The heading-structure
-    tests below assert nesting/boundaries over the HEADINGS, so they filter the
-    text nodes out here; the text nodes themselves are covered by
-    ``TestBuildDocTreeTextNodes``.
-    """
-    return [n for n in nodes if n.kind == 'heading']
+from md2ansi_lib import md2ansi_doc  # noqa: E402 (path insert precedes import)
 
 
-class TestBuildDocTree(unittest.TestCase):
-    """``build_doc_tree`` — nesting, boundary byte-ranges, fences, lists."""
+class TestVisibleChildren(unittest.TestCase):
+    """``visible_children`` — the ``#text`` row-set rule over one list.
 
-    def test_empty(self):
-        self.assertEqual(md_doc.build_doc_tree(''), [])
-
-    def test_no_headings(self):
-        self.assertEqual(md_doc.build_doc_tree('just prose\nmore prose\n'), [])
-
-    def test_nesting(self):
-        text = (
-            '# Top\n'        # line 0, offset 0
-            'intro\n'        # line 1
-            '## A\n'         # line 2
-            'aaa\n'          # line 3
-            '### A1\n'       # line 4
-            'deep\n'         # line 5
-            '## B\n'         # line 6
-            'bbb\n'          # line 7
-        )
-        roots = md_doc.build_doc_tree(text)
-        # ``# Top`` sits on line 0 so the root scope has no leading run; the
-        # only top-level node is the heading itself.
-        self.assertEqual(len(roots), 1)
-        top = roots[0]
-        self.assertEqual((top.kind, top.level, top.title), ('heading', 1, 'Top'))
-        self.assertEqual([c.title for c in _headings(top.children)], ['A', 'B'])
-        a, b = _headings(top.children)
-        self.assertEqual([c.title for c in _headings(a.children)], ['A1'])
-        self.assertEqual(_headings(b.children), [])
-        # line offsets are 0-based document lines.
-        self.assertEqual(top.line_offset, 0)
-        self.assertEqual(a.line_offset, 2)
-        self.assertEqual(_headings(a.children)[0].line_offset, 4)
-        self.assertEqual(b.line_offset, 6)
-
-    def test_title_strips_sigil_keeps_inline(self):
-        roots = md_doc.build_doc_tree('## My **bold** heading\n')
-        self.assertEqual(roots[0].title, 'My **bold** heading')
-
-    def test_byte_range_slicing(self):
-        # The boundary rule: a heading's [byte_offset : +byte_size] section
-        # runs from its own start to the start of the next sibling-or-shallower
-        # heading (or EOF), and INCLUDES its descendant subheadings.
-        text = (
-            '# Top\n'
-            'intro\n'
-            '## A\n'
-            'aaa\n'
-            '## B\n'
-            'bbb\n'
-        )
-        roots = md_doc.build_doc_tree(text)
-        top = roots[0]
-        a, b = _headings(top.children)  # skip the 'intro' text node
-        # Top spans the whole document (only h1, no shallower-or-equal after).
-        self.assertEqual(text[top.byte_offset:top.byte_offset + top.byte_size], text)
-        # A runs from '## A' up to (not including) '## B'.
-        self.assertEqual(
-            text[a.byte_offset:a.byte_offset + a.byte_size],
-            '## A\naaa\n',
-        )
-        # B runs from '## B' to EOF.
-        self.assertEqual(
-            text[b.byte_offset:b.byte_offset + b.byte_size],
-            '## B\nbbb\n',
-        )
-        # Slicing offsets agree with md2ansi_scan: the slice starts with the
-        # literal heading line.
-        self.assertTrue(text[a.byte_offset:].startswith('## A'))
-
-    def test_fenced_hash_is_not_a_heading(self):
-        # A '#' inside a fenced code block is NOT a heading — md2ansi_scan
-        # masks the fence body, so build_doc_tree must not surface it.
-        text = (
-            '# Real\n'
-            'text\n'
-            '```\n'
-            '# fake heading inside fence\n'
-            '## also fake\n'
-            '```\n'
-            '## Real2\n'
-        )
-        roots = md_doc.build_doc_tree(text)
-        self.assertEqual([r.title for r in roots], ['Real'])
-        # 'Real2' is Real's only heading child (the 'text' run before it becomes
-        # a text node; the fenced '#'/'##' lines are still not headings).
-        self.assertEqual([c.title for c in _headings(roots[0].children)], ['Real2'])
-        # Real's section spans through the fence to EOF (h1, nothing shallower
-        # after), so the fence text lives inside Real's byte-range.
-        top = roots[0]
-        self.assertIn('# fake heading inside fence',
-                      text[top.byte_offset:top.byte_offset + top.byte_size])
-
-    def test_include_lists_off_by_default(self):
-        text = '# H\n- one\n- two\n'
-        roots = md_doc.build_doc_tree(text)  # default: headings only
-        self.assertEqual(roots[0].children, [])
-
-    def test_include_lists_on(self):
-        text = (
-            '# H\n'
-            '- one\n'
-            '  - nested\n'
-            '- two\n'
-        )
-        roots = md_doc.build_doc_tree(text, include_lists=True)
-        h = roots[0]
-        self.assertEqual([c.title for c in h.children], ['one', 'two'])
-        one, two = h.children
-        self.assertEqual(one.kind, 'list-item')
-        self.assertEqual([c.title for c in one.children], ['nested'])
-        self.assertEqual(two.children, [])
-
-    def test_list_before_first_heading_is_top_level(self):
-        # An orphan list item with no heading above it becomes a top-level
-        # node (no synthetic root in the structural model).
-        roots = md_doc.build_doc_tree('- alpha\n- beta\n', include_lists=True)
-        self.assertEqual([r.title for r in roots], ['alpha', 'beta'])
-        self.assertTrue(all(r.kind == 'list-item' for r in roots))
-
-
-class TestBuildDocTreeTextNodes(unittest.TestCase):
-    """``build_doc_tree`` pass 4 — leading ``'text'`` nodes (headings-only).
-
-    A scope with >=1 heading child gets a dim ``'text'`` node for the body run
-    preceding its first heading, inserted as the scope's first child. Gated on
-    ``include_lists=False`` (with lists the tree is byte-for-byte unchanged).
+    ``md2ansi_doc`` gives every heading a ``#text`` first child (zero-width
+    when the body is blank) plus a preamble node at ``tree[0]``; a text run
+    is a row only when it is non-empty AND has a heading sibling.
     """
 
     # Three nested scopes exercise every branch in one fixture:
     #   * the root scope has a leading run (``intro one``) before ``# H1``;
     #   * ``# H1``'s scope has a leading run (``h1 intro``) before ``## H2``;
-    #   * ``## H2`` is a leaf (no heading child), so its body gets NO text node.
+    #   * ``## H2`` is a leaf, so its body run is filtered out.
     _TEXT = (
-        'intro one\n'    # line 0  -> text1 (root scope)
-        '\n'             # line 1  (blank gap line, skipped)
+        'intro one\n'    # line 0  -> visible text row (root scope)
+        '\n'             # line 1
         '# H1\n'         # line 2  H1
-        'h1 intro\n'     # line 3  -> text2 (H1 scope)
+        'h1 intro\n'     # line 3  -> visible text row (H1 scope)
         '## H2\n'        # line 4  H2 (leaf)
-        'h2 body\n'      # line 5  (leaf scope -> no text3)
+        'h2 body\n'      # line 5  (leaf-chapter body -> filtered)
     )
 
-    def test_text1_top_level_before_first_heading(self):
-        roots = md_doc.build_doc_tree(self._TEXT)
-        # text1 is prepended before H1 at the top level.
-        self.assertEqual([(r.kind, r.title) for r in roots],
+    def test_intro_runs_visible_alongside_headings(self):
+        doc = md2ansi_doc(self._TEXT)
+        top = md_doc.visible_children(doc.tree)
+        self.assertEqual([(n.kind, n.title) for n in top],
                          [('text', 'intro one'), ('heading', 'H1')])
-        text1 = roots[0]
-        self.assertEqual(text1.level, 1)        # borrows H1's level
-        self.assertEqual(text1.line_offset, 0)
-        self.assertEqual(text1.children, [])
+        h1 = top[1]
+        self.assertEqual(
+            [(n.kind, n.title) for n in md_doc.visible_children(h1.children)],
+            [('text', 'h1 intro'), ('heading', 'H2')])
 
-    def test_text2_first_child_of_h1_before_h2(self):
-        roots = md_doc.build_doc_tree(self._TEXT)
-        h1 = roots[1]
-        # text2 is H1's first child, before H2.
-        self.assertEqual([(c.kind, c.title) for c in h1.children],
-                         [('text', 'h1 intro'), ('heading', 'H2')])
-        text2 = h1.children[0]
-        self.assertEqual(text2.level, 2)        # borrows H2's level
-        self.assertEqual(text2.line_offset, 3)
-
-    def test_text3_under_leaf_h2_no_node(self):
-        roots = md_doc.build_doc_tree(self._TEXT)
-        h2 = roots[1].children[1]
+    def test_leaf_chapter_body_filtered(self):
+        # ``h2 body`` has no heading sibling → not a row; the leaf heading
+        # stays a leaf.
+        doc = md2ansi_doc(self._TEXT)
+        h2 = md_doc.visible_children(doc.tree)[1].children[-1]
         self.assertEqual((h2.kind, h2.title), ('heading', 'H2'))
-        # H2 is a leaf heading: its body run yields NO text node.
-        self.assertEqual(h2.children, [])
+        self.assertEqual(md_doc.visible_children(h2.children), [])
 
-    def test_run_slices_back_to_text(self):
-        # ``text[byte_offset : byte_offset + byte_size]`` is the body run, from
-        # the first non-blank line up to (not including) the heading it precedes.
-        roots = md_doc.build_doc_tree(self._TEXT)
-        text1 = roots[0]
+    def test_zero_width_runs_filtered(self):
+        # A blank-bodied heading followed directly by a sub-heading carries a
+        # ZERO-WIDTH text child — filtered even though a heading sibling
+        # exists. Same for the empty preamble ahead of a line-0 heading.
+        doc = md2ansi_doc('# A\n## B\nbody\n')
+        top = md_doc.visible_children(doc.tree)
+        self.assertEqual([(n.kind, n.title) for n in top], [('heading', 'A')])
         self.assertEqual(
-            self._TEXT[text1.byte_offset:text1.byte_offset + text1.byte_size],
-            'intro one\n\n')        # run includes the trailing blank gap line
-        text2 = roots[1].children[0]
+            [(n.kind, n.title)
+             for n in md_doc.visible_children(top[0].children)],
+            [('heading', 'B')])
+
+    def test_prose_only_yields_no_rows(self):
+        # A heading-less document's non-empty preamble has no heading sibling
+        # → no rows at all (the recipes' "does this text have markdown
+        # structure" gate rides on this).
+        doc = md2ansi_doc('just prose\nmore prose\n')
+        self.assertEqual(md_doc.visible_children(doc.tree), [])
+
+    def test_empty_document_yields_no_rows(self):
+        doc = md2ansi_doc('')
+        self.assertEqual(md_doc.visible_children(doc.tree), [])
+
+    def test_headings_always_pass_through(self):
+        doc = md2ansi_doc('# A\n# B\n# C\n')
         self.assertEqual(
-            self._TEXT[text2.byte_offset:text2.byte_offset + text2.byte_size],
-            'h1 intro\n')
-
-    def test_node_at_line_finds_text_node(self):
-        # The text node is reachable by its own line_offset (the codec selector).
-        tree = md_doc.build_doc_tree(self._TEXT)
-        self.assertEqual(md_doc.node_at_line(tree, 0).title, 'intro one')
-        found = md_doc.node_at_line(tree, 3)
-        self.assertEqual((found.kind, found.title), ('text', 'h1 intro'))
-
-    def test_prose_only_stays_empty(self):
-        # A heading-less document has no heading scope, so no text node — the
-        # tree stays ``[]`` (browse-claude's markdown-node gate is preserved).
-        self.assertEqual(md_doc.build_doc_tree('just prose\nmore prose\n'), [])
-
-    def test_all_blank_gap_no_node(self):
-        # ``# h1\n\n## h2`` — the only gap line before ## h2 is blank, so no
-        # text node is synthesised for H1's scope.
-        roots = md_doc.build_doc_tree('# h1\n\n## h2\n')
-        h1 = roots[0]
-        self.assertEqual([c.kind for c in h1.children], ['heading'])
-        self.assertEqual(h1.children[0].title, 'h2')
-
-    def test_multiline_run_title_is_first_nonblank_line(self):
-        # The run can span several lines; the title is just the FIRST non-blank
-        # line, and the run slice covers every line up to the heading.
-        text = (
-            '\n'             # line 0  (blank, skipped)
-            'first line\n'   # line 1  -> title
-            'second line\n'  # line 2  (part of the run, not the title)
-            '# H\n'          # line 3  H
-            'body\n'         # line 4
-        )
-        node = md_doc.build_doc_tree(text)[0]
-        self.assertEqual((node.kind, node.title), ('text', 'first line'))
-        self.assertEqual(node.line_offset, 1)
-        self.assertEqual(
-            text[node.byte_offset:node.byte_offset + node.byte_size],
-            'first line\nsecond line\n')
-
-    def test_title_strips_outer_whitespace_keeps_markup(self):
-        # The title is ``.strip()``-ed (leading indent gone) but inline markup
-        # is preserved — it is body text, with no sigil to remove.
-        node = md_doc.build_doc_tree('   **bold** intro\n# H\n')[0]
-        self.assertEqual(node.title, '**bold** intro')
-
-    def test_include_lists_true_leaves_list_trees_unchanged(self):
-        # With lists on, pass 4 is skipped: no text nodes appear and the tree is
-        # byte-for-byte the headings+lists structure.
-        text = (
-            'intro one\n'
-            '# H1\n'
-            'h1 intro\n'
-            '- one\n'
-            '- two\n'
-        )
-        roots = md_doc.build_doc_tree(text, include_lists=True)
-        # No top-level text node: H1 is still the only root.
-        self.assertEqual([r.kind for r in roots], ['heading'])
-        h1 = roots[0]
-        # H1's children are the two list items — no synthesised 'text' node.
-        self.assertEqual([(c.kind, c.title) for c in h1.children],
-                         [('list-item', 'one'), ('list-item', 'two')])
-
-    def test_include_lists_true_unchanged_vs_baseline_fixture(self):
-        # The pre-existing nested-list fixture must produce an identical tree
-        # with the pass-4 code present (no 'text' kinds anywhere).
-        text = (
-            '# H\n'
-            '- one\n'
-            '  - nested\n'
-            '- two\n'
-        )
-        roots = md_doc.build_doc_tree(text, include_lists=True)
-        h = roots[0]
-        self.assertEqual([c.title for c in h.children], ['one', 'two'])
-        one, two = h.children
-        self.assertEqual([c.title for c in one.children], ['nested'])
-        self.assertEqual(two.children, [])
-        # Assert no 'text' node leaked anywhere in the tree.
-        self._assert_no_text_kind(roots)
-
-    def _assert_no_text_kind(self, nodes):
-        for n in nodes:
-            self.assertNotEqual(n.kind, 'text')
-            self._assert_no_text_kind(n.children)
+            [n.title for n in md_doc.visible_children(doc.tree)],
+            ['A', 'B', 'C'])
 
 
 class TestNodeAtLine(unittest.TestCase):
-    """``node_at_line`` — exact line-offset lookup over a built tree."""
+    """``node_at_line`` — exact line lookup over a tree's VISIBLE nodes."""
 
-    # A tree with a deeply nested heading so the DFS recursion is exercised.
+    # A tree with a deeply nested heading so the DFS recursion is exercised,
+    # plus visible text runs and a leaf-chapter body.
     _TEXT = (
         '# Top\n'        # line 0
-        'intro\n'        # line 1
+        'intro\n'        # line 1  -> visible text row (before ## A)
         '## A\n'         # line 2
-        'aaa\n'          # line 3
+        'aaa\n'          # line 3  -> visible text row (before ### A1)
         '### A1\n'       # line 4
-        'deep\n'         # line 5
+        'deep\n'         # line 5  (leaf-chapter body -> not a row)
         '## B\n'         # line 6
-        'bbb\n'          # line 7
+        'bbb\n'          # line 7  (leaf-chapter body -> not a row)
     )
 
+    def _tree(self, text=None):
+        return md2ansi_doc(text or self._TEXT).tree
+
     def test_top_level_match(self):
-        tree = md_doc.build_doc_tree(self._TEXT)
-        node = md_doc.node_at_line(tree, 0)
+        # Line 0 finds the heading — NOT the zero-width preamble that shares
+        # line 0 with it (the visible-only walk skips it).
+        node = md_doc.node_at_line(self._tree(), 0)
         self.assertIsNotNone(node)
-        self.assertEqual(node.title, 'Top')
+        self.assertEqual((node.kind, node.title), ('heading', 'Top'))
 
     def test_deeply_nested_match(self):
         # The DFS reaches a node nested two levels down by its exact offset.
-        tree = md_doc.build_doc_tree(self._TEXT)
-        node = md_doc.node_at_line(tree, 4)
+        node = md_doc.node_at_line(self._tree(), 4)
         self.assertIsNotNone(node)
         self.assertEqual((node.title, node.level), ('A1', 3))
 
     def test_mid_level_match(self):
-        tree = md_doc.build_doc_tree(self._TEXT)
-        self.assertEqual(md_doc.node_at_line(tree, 6).title, 'B')
+        self.assertEqual(md_doc.node_at_line(self._tree(), 6).title, 'B')
 
-    def test_no_match_between_nodes_returns_none(self):
-        # A line offset that is NOT a node's own line matches nothing — the
-        # lookup is exact, not a containing-range search. Line 5 ('deep') is
-        # body under the LEAF heading A1, so it gets no synthesised text node
-        # (text nodes only precede a scope's first heading), hence no match.
-        tree = md_doc.build_doc_tree(self._TEXT)
-        self.assertIsNone(md_doc.node_at_line(tree, 5))
+    def test_visible_text_run_found(self):
+        # A visible text row is reachable by its own line (the id selector).
+        node = md_doc.node_at_line(self._tree(), 1)
+        self.assertEqual((node.kind, node.title), ('text', 'intro'))
+
+    def test_filtered_text_run_not_found(self):
+        # Line 5 ('deep') is body under the LEAF heading A1 — its text run is
+        # not a row, so the lookup is None (exact, rows-only; no
+        # containing-range fallback).
+        self.assertIsNone(md_doc.node_at_line(self._tree(), 5))
+
+    def test_zero_width_run_never_shadows_a_heading(self):
+        # ``## Sub`` sits on line 1 — the same line the parent's zero-width
+        # text child claims as its virtual insert point. The lookup must find
+        # the heading.
+        node = md_doc.node_at_line(self._tree('# Top\n## Sub\n'), 1)
+        self.assertEqual((node.kind, node.title), ('heading', 'Sub'))
 
     def test_before_first_node_returns_none(self):
         # An offset before the first node's line yields None (no synthetic
         # root, no containing fallback).
-        tree = md_doc.build_doc_tree('## Only\nbody\n')  # first node at line 0
-        self.assertIsNone(md_doc.node_at_line(tree, -1))
+        self.assertIsNone(md_doc.node_at_line(self._tree('## Only\nbody\n'), -1))
 
     def test_offset_past_end_returns_none(self):
-        tree = md_doc.build_doc_tree(self._TEXT)
-        self.assertIsNone(md_doc.node_at_line(tree, 999))
+        self.assertIsNone(md_doc.node_at_line(self._tree(), 999))
 
     def test_empty_tree_returns_none(self):
         self.assertIsNone(md_doc.node_at_line([], 0))
@@ -488,7 +292,8 @@ class TestTriggersAndRefs(unittest.TestCase):
 
     def test_trigger_code_fence_only(self):
         # Optimistic: a '#' that lives only inside a fenced block still
-        # triggers (only build_doc_tree can tell it's not a real heading).
+        # triggers (only the real md2ansi_doc parse can tell it's not a
+        # heading).
         self.assertTrue(md_doc.md_heading_trigger('```\n# x\n```'))
 
     def test_trigger_none(self):
@@ -792,18 +597,21 @@ class TestCache(unittest.TestCase):
     def tearDown(self):
         md_doc.clear_cache()
 
-    def test_cache_hit_same_tree_object(self):
+    def test_cache_hit_same_doc_object(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, 'f.md')
             with open(p, 'w') as f:
                 f.write('# H\nbody\n')
-            text1, tree1 = md_doc.get_doc(p)
-            self.assertEqual(tree1[0].title, 'H')
+            text1, doc1 = md_doc.get_doc(p)
+            # The cached tree is the M2A_Doc model; its visible row is the
+            # heading.
+            self.assertEqual(
+                [n.title for n in md_doc.visible_children(doc1.tree)], ['H'])
             # Mutate the file on disk; a cache hit must NOT re-read it.
             with open(p, 'w') as f:
                 f.write('# DIFFERENT\n')
-            text2, tree2 = md_doc.get_doc(p)
-            self.assertIs(tree1, tree2)
+            text2, doc2 = md_doc.get_doc(p)
+            self.assertIs(doc1, doc2)
             self.assertEqual(text2, text1)  # still the original contents
 
     def test_clear_cache_forces_reread(self):
@@ -811,13 +619,14 @@ class TestCache(unittest.TestCase):
             p = os.path.join(d, 'f.md')
             with open(p, 'w') as f:
                 f.write('# H\n')
-            _, tree1 = md_doc.get_doc(p)
+            _, doc1 = md_doc.get_doc(p)
             md_doc.clear_cache()
             with open(p, 'w') as f:
                 f.write('# H2\n')
-            _, tree2 = md_doc.get_doc(p)
-            self.assertIsNot(tree1, tree2)
-            self.assertEqual(tree2[0].title, 'H2')
+            _, doc2 = md_doc.get_doc(p)
+            self.assertIsNot(doc1, doc2)
+            self.assertEqual(
+                [n.title for n in md_doc.visible_children(doc2.tree)], ['H2'])
 
     def test_invalid_utf8_byte_still_parses_headings(self):
         # A referenced .md with a stray non-UTF-8 byte must not raise
@@ -827,9 +636,12 @@ class TestCache(unittest.TestCase):
             p = os.path.join(d, 'bad.md')
             with open(p, 'wb') as f:
                 f.write(b'# Heading\n\nbody with a bad byte \xff here\n## Sub\n')
-            text, tree = md_doc.get_doc(p)
-            self.assertEqual([n.title for n in tree], ['Heading'])
-            self.assertEqual([c.title for c in _headings(tree[0].children)], ['Sub'])
+            text, doc = md_doc.get_doc(p)
+            top = md_doc.visible_children(doc.tree)
+            self.assertEqual([n.title for n in top], ['Heading'])
+            headings = [c.title for c in top[0].children
+                        if c.kind == 'heading']
+            self.assertEqual(headings, ['Sub'])
             self.assertIn('�', text)  # the bad byte was replaced
 
 

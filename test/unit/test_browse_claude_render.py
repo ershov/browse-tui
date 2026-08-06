@@ -10189,8 +10189,8 @@ class TestMarkdownSubtrees(unittest.TestCase):
             self.assertNotIn('Second', out)  # later sibling is NOT included
             self.assertNotIn('gamma', out)
             # The slice is exactly the section's byte range (raw == slice).
-            _, tree = self.r._md_doc.get_doc(path)
-            node = self.r._md_doc.node_at_line(tree, 0)
+            _, doc = self.r._md_doc.get_doc(path)
+            node = self.r._md_doc.node_at_line(doc.tree, 0)
             self.assertEqual(
                 out, text[node.byte_offset:node.byte_offset + node.byte_size])
             # The sibling ``# Second`` (line 8) renders its own section.

@@ -1,418 +1,86 @@
 #!/usr/bin/env python3
 
-"""md_doc — shared, framework-agnostic markdown-structure logic.
+"""md_doc — shared markdown cross-document plumbing for the recipes.
 
-This module is the single source of truth for turning markdown text into a
-navigable *document structure* — a tree of heading (and optionally list-item)
-nodes — plus the cross-document plumbing both ``browse-md`` and
-``browse-claude`` need: reference detection/resolution between ``.md`` files,
-the cheap heading-detection gate, and a process-wide parse cache.
+Document STRUCTURE now comes from ``md2ansi_lib``'s own document model
+(``md2ansi_doc`` → ``M2A_Doc`` / ``M2A_Node``); this module no longer builds
+trees of its own. What it still owns is the plumbing both ``browse-md`` and
+``browse-claude`` need AROUND those trees:
 
-Its STRUCTURAL half deliberately knows nothing about ``browse_tui`` / ``Item``:
-it returns plain ``MdNode`` dataclasses, and each recipe maps those onto its own
-``Item``/id space, tags, and styling. That keeps the markdown logic unit-testable
-in isolation and decoupled from the TUI framework. ``browse-md`` and
-``browse-claude`` import THIS module; it never imports them.
+  * reference detection/resolution between ``.md`` files (``find_md_refs`` /
+    ``resolve_md_ref`` / ``find_git_root``), the cheap heading-detection gate
+    (``md_heading_trigger``), and a process-wide parse cache (``get_doc`` /
+    ``clear_cache`` — the cached tree is an ``M2A_Doc``);
+  * the two tree helpers the recipes share: ``visible_children`` (the ``#text``
+    row-set rule deciding which ``M2A_Node``s become rows) and ``node_at_line``
+    (row-id line lookup over a built tree).
 
-A second, ``browse_tui``-AWARE section at the end of the file (after the
-structural logic, guarded by the same optional ``from browse_tui import …`` the
-plugin-registration block uses) is the single home for the *markdown launcher
-rows* shared between recipes: it resolves a document's ``.md`` references to
-labelled targets (``resolve_refs`` / ``ref_label``), builds the ``[md]
-References`` umbrella + ``[md ↗]`` launcher-row ``Item``s, and owns the one
-``launch`` helper that shells out to ``browse-md`` (the embedding flags + the
-stdin-vs-file delivery policy live there and nowhere else). The launch *target*
-inside a launcher-row id is opaque to ``md_doc`` — the hosting recipe interprets
-it at activate time. With ``browse_tui`` absent these helpers are simply not
-defined; the structural half above stays importable standalone regardless.
+This half deliberately knows nothing about ``browse_tui`` / ``Item``: each
+recipe maps ``M2A_Node``s onto its own ``Item``/id space, tags, and styling.
+``browse-md`` and ``browse-claude`` import THIS module; it never imports them.
 
-The heading/list tree builder is ``browse-md``'s ``_build_nodes`` generalised
-and lifted out: same ``md2ansi_scan`` source-of-truth scan, same line/byte
-indexing, same boundary rule, same two-stack nesting — minus the ``Item``
-construction and id/anchor bookkeeping, which now live in the recipes.
-
-A note on "byte": the offsets here (``byte_offset`` / ``byte_size``) are
-character offsets into the decoded ``str`` text — exactly what
-``md2ansi_scan`` reports and what callers slice with
-(``text[byte_offset : byte_offset + byte_size]``). The name is kept for
-continuity with ``browse-md``'s field names and the design spec; for pure-ASCII
-markdown (the common case) chars and bytes coincide.
+A second, ``browse_tui``-AWARE section at the end of the file (guarded by the
+same optional ``from browse_tui import …`` the plugin-registration block uses)
+is the single home for the *markdown launcher rows* shared between recipes: it
+resolves a document's ``.md`` references to labelled targets (``resolve_refs``
+/ ``ref_label``), builds the ``[md] References`` umbrella + ``[md ↗]``
+launcher-row ``Item``s, and owns the one ``launch`` helper that shells out to
+``browse-md`` (the embedding flags + the stdin-vs-file delivery policy live
+there and nowhere else). The launch *target* inside a launcher-row id is opaque
+to ``md_doc`` — the hosting recipe interprets it at activate time. With
+``browse_tui`` absent these helpers are simply not defined; the half above
+stays importable standalone regardless.
 """
 
-import bisect
 import os
 import re
-from dataclasses import dataclass, field
-from typing import Optional
 
-# Heading-tree building is delegated to the shared markdown grammar in
+# Document parsing is delegated to the shared markdown grammar in
 # ``md2ansi_lib`` — the same scanner the renderer uses, so the structure we
-# expose can never drift from what gets rendered. ``md_doc`` is a sibling
+# cache can never drift from what gets rendered. ``md_doc`` is a sibling
 # recipe file, so the import resolves once ``recipes/`` is on ``sys.path``
 # (the recipes prepend their own directory at runtime; tests do the same).
-from md2ansi_lib import md2ansi_scan
+from md2ansi_lib import md2ansi_doc
 
 
-# ### Section: Structural node model #######################################
+# ### Section: Tree helpers over the M2A document model ####################
 
-@dataclass(slots=True)
-class MdNode:
-    """One node in a document's heading/list structure.
+def visible_children(nodes):
+    """The nodes of one children list that a recipe shows as rows.
 
-    Plain data, no ``Item`` coupling — recipes map these onto their own row
-    types. Fields:
+    The ``#text`` row-set rule, shared by every tree-mapping call site:
+    ``md2ansi_doc`` gives EVERY heading a ``#text`` first child (zero-width
+    when the body is blank) plus a preamble node at ``tree[0]``, but a text
+    run is a row only when it is non-empty AND has at least one heading
+    sibling (i.e. it is the intro run of a scope that also has sub-headings).
+    Zero-width runs and leaf-chapter bodies are filtered out, so a leaf
+    heading stays a leaf and its whole body reads through its own preview.
 
-      * ``kind``        — ``'heading'``, ``'list-item'``, or ``'text'`` (a dim
-                          run of body text preceding a scope's first heading,
-                          synthesised by ``build_doc_tree`` when lists are off).
-      * ``level``       — heading level (1..6) or list indent level (0-based).
-                          A ``'text'`` node borrows the level of the first
-                          heading it precedes (so it renders alongside it).
-      * ``title``       — the row label: for headings/list-items the source
-                          line with the leading sigil stripped (``##``/``-``/
-                          ``1.`` + following whitespace) but inline markup
-                          (``**bold**``) preserved, matching ``browse-md``'s
-                          tree-row titles. For a ``'text'`` node it is the run's
-                          first non-blank line, ``.strip()``-ed (markup kept).
-      * ``line_offset`` — 0-based line number of the node within the document.
-      * ``byte_offset`` — character offset of the node's start in the text.
-      * ``byte_size``   — character length of the node's section, per the
-                          boundary rule (start of this node to the start of the
-                          next sibling-or-shallower node, or EOF). Slicing
-                          ``text[byte_offset : byte_offset + byte_size]`` yields
-                          the node's full section including descendants. For a
-                          ``'text'`` node the section is the body run itself —
-                          from its first non-blank line to the start of the
-                          heading it precedes.
-      * ``children``    — nested ``MdNode``s (sub-headings; list children).
-                          Always empty for a ``'text'`` node.
+    ``nodes`` is one children list — ``M2A_Doc.tree`` or an ``M2A_Node``'s
+    ``children`` (it holds at most one text run, always first). Returns a new
+    list; headings always pass through.
     """
-    kind: str
-    level: int
-    title: str
-    line_offset: int
-    byte_offset: int
-    byte_size: int
-    children: list = field(default_factory=list)
-
-
-# ### Section: Line / byte indexing ########################################
-
-# Lifted verbatim from ``browse-md`` (``_line_starts`` / ``_line_of``): the
-# offset→line conversion that ``build_doc_tree`` uses to stamp each node with a
-# stable ``line_offset`` (callers select a heading by it).
-
-def _line_starts(text):
-    """Character offset of the start of each line in ``text``.
-
-    Index ``i`` holds the offset of line ``i`` (0-based). Uses ``re.finditer``
-    so the scan runs in the C-level regex engine rather than a Python loop.
-    """
-    return [0] + [m.end() for m in re.finditer(r'\n', text)]
-
-
-def _line_of(byte_offset, line_starts):
-    """0-based line number for ``byte_offset`` given precomputed line starts."""
-    # ``bisect_right - 1`` lands on the line whose start is <= offset.
-    return bisect.bisect_right(line_starts, byte_offset) - 1
-
-
-# ### Section: Title stripping #############################################
-
-# Drop the leading sigil from a row label — the kind/tag (``[h1]``/``[ul]``)
-# already conveys it visually, so the title text shouldn't repeat the marker.
-# Inline formatting markers (``**bold**`` etc.) are preserved: these only touch
-# the prefix. Lifted from ``browse-md`` (``_HEADING_PREFIX_RE`` /
-# ``_LIST_PREFIX_RE``).
-_HEADING_PREFIX_RE = re.compile(r'^#+\s*')
-_LIST_PREFIX_RE = re.compile(r'^([-*+]|\d+\.)\s+')
-
-# Per-line list-item regex — lifted from ``md2ansi_lib`` (``_m2a_fmt_list``)
-# and ``browse-md`` (``_LIST_ITEM_RE``). Used to fan one list span into one
-# node per marker line and to read each item's indent level.
-_LIST_ITEM_RE = re.compile(r'^([ \t]*)([-*+]|\d+\.)[ \t]+(.*)$')
-
-
-# ### Section: Heading-tree building #######################################
-
-# Internal event kinds. Headings carry their level in the kind (``'h3'``);
-# list items are ``'ul'`` / ``'ol'``. These mirror ``browse-md``'s parser
-# events so the lifted boundary/nesting passes read unchanged.
-_HEADING_EVENT_KINDS = frozenset(('h1', 'h2', 'h3', 'h4', 'h5', 'h6'))
-
-# Scan-kind sets requested from ``md2ansi_scan``. The full grammar runs
-# internally either way (code / blockquote / table / frontmatter / hr stay
-# masked, so a ``#`` inside a fenced block is NOT a heading); the only
-# difference is whether ``'list'`` spans are yielded. So headings-only and
-# with-lists agree byte-for-byte on the headings.
-_SCAN_KINDS_HEADINGS = frozenset(('heading',))
-_SCAN_KINDS_WITH_LISTS = frozenset(('heading', 'list'))
-
-
-def _walk_list(base, text, line_starts):
-    """Fan one ``md2ansi_scan`` list span into one event per marker line.
-
-    ``md2ansi_scan`` reports a whole top-level list block as a single span,
-    and guarantees every line of that span starts with a list marker. So we
-    split on ``\\n`` and run the per-line regex with no further validity
-    checks. ``base`` is the span's start offset (``span.start``); ``text`` is
-    the span body. Each event's ``byte_offset`` is ``base`` plus the line's
-    relative offset; ``line_offset`` is derived against the file-wide
-    ``line_starts``. Lifted from ``browse-md`` (``_walk_list``).
-    """
-    events = []
-    offset = 0
-    for line in text.split('\n'):
-        m = _LIST_ITEM_RE.match(line)
-        if m is not None:
-            indent = m.group(1)
-            marker = m.group(2)
-            byte_offset = base + offset
-            kind = 'ol' if marker[-1] == '.' else 'ul'
-            events.append((kind, {
-                'byte_offset': byte_offset,
-                'line_offset': _line_of(byte_offset, line_starts),
-                'level': len(indent.expandtabs(4)) // 2,
-                'source': line,
-            }))
-        offset += len(line) + 1
-    return events
-
-
-def _scan_events(text, line_starts, include_lists):
-    """Flat ordered list of ``(kind, payload)`` parser events for ``text``.
-
-    A thin adapter over ``md2ansi_scan`` — one structural-scan pass over the
-    same combined grammar the renderer uses (single source of truth). Heading
-    spans become ``('h1'..'h6', {...})`` events; a ``'list'`` span is fanned
-    by ``_walk_list`` into per-marker-line ``('ul'|'ol', {...})`` events, and
-    only requested when ``include_lists`` is set. Lifted from ``browse-md``'s
-    ``_parse``.
-    """
-    kinds = _SCAN_KINDS_WITH_LISTS if include_lists else _SCAN_KINDS_HEADINGS
-    events = []
-    for span in md2ansi_scan(text, kinds=kinds):
-        if span.kind == 'heading':
-            byte_offset = span.start
-            events.append((span.subtype, {     # subtype is 'h1'..'h6'
-                'byte_offset': byte_offset,
-                'line_offset': _line_of(byte_offset, line_starts),
-                # A heading span is one line; drop its terminator so ``source``
-                # is the bare heading line, matching the list-item path.
-                'source': span.text.rstrip('\n'),
-            }))
-        else:
-            # ``'list'`` — only present when include_lists is on.
-            events.extend(_walk_list(span.start, span.text, line_starts))
-    return events
-
-
-def _is_blank_line(text, line_starts, line):
-    """True if ``line`` (0-based) holds only whitespace (or is empty).
-
-    The line body is ``text[line_starts[line] : line_starts[line + 1]]`` (a
-    trailing line with no terminating ``\\n`` slices to EOF). A blank gap line
-    contributes no body run, so it is skipped when hunting the first content
-    line before a scope's opening heading.
-    """
-    start = line_starts[line]
-    end = line_starts[line + 1] if line + 1 < len(line_starts) else len(text)
-    return not text[start:end].strip()
-
-
-def _add_text_nodes(scope_children, content_start_line, text, line_starts):
-    """Synthesise leading ``'text'`` nodes into a built heading scope (in place).
-
-    ``scope_children`` is a scope's child list — at call time still ALL heading
-    nodes — and ``content_start_line`` is the scope's first body line (0 for the
-    root scope, ``scope_heading.line_offset + 1`` for a heading scope). For each
-    scope with >=1 heading child we look at the gap before the first heading:
-    the FIRST non-blank line there becomes a dim ``'text'`` node inserted as the
-    scope's new first child. We recurse into each heading child FIRST (so its
-    own children list is still heading-only, and the just-inserted text node is
-    never re-descended) and only then insert at index 0.
-    """
-    # Recurse into the real heading children before we mutate this list, so
-    # each nested scope is processed with its heading-only children.
-    for child in scope_children:
-        _add_text_nodes(child.children, child.line_offset + 1, text, line_starts)
-    if not scope_children:
-        return
-    first_child = scope_children[0]
-    for line in range(content_start_line, first_child.line_offset):
-        if _is_blank_line(text, line_starts, line):
-            continue
-        byte_offset = line_starts[line]
-        # The title is just this first non-blank line (sigil-free already, since
-        # it is body text); inline markup is kept, matching heading titles.
-        line_body = text[byte_offset:line_starts[line + 1]]
-        scope_children.insert(0, MdNode(
-            kind='text',
-            level=first_child.level,
-            title=line_body.rstrip('\n').strip(),
-            line_offset=line,
-            byte_offset=byte_offset,
-            byte_size=first_child.byte_offset - byte_offset,
-        ))
-        break  # only the first non-blank line of the gap
-
-
-def build_doc_tree(text, *, include_lists=False):
-    """Build the heading (and optionally list) structure of ``text``.
-
-    Returns a list of top-level ``MdNode``s in document order, each with its
-    nested children populated. There is NO synthetic file root — that wrapper
-    belongs to each recipe's id/Item space, not to the shared structure. A
-    document with no headings (and, when ``include_lists`` is off, regardless
-    of its list content) yields ``[]``.
-
-    ``include_lists=False`` (the default) scans headings only — the
-    table-of-contents view ``browse-claude`` always wants. ``True`` adds
-    list-item nodes (``browse-md``'s ``-l`` flag); the heading nodes are
-    byte-for-byte identical either way because ``md2ansi_scan`` runs the full
-    grammar internally and only filters at yield time.
-
-    This is ``browse-md``'s ``_build_nodes`` generalised and lifted out, minus
-    its ``Item`` construction and ``by_id``/``by_line`` indexing. Passes:
-
-      1. Per-event ``MdNode`` construction (heading kinds → ``'heading'``
-         nodes, ``ul``/``ol`` → ``'list-item'`` nodes), with the title sigil
-         stripped. ``byte_size`` is filled by pass 2.
-      2. Boundary rule (single linear pass): for node ``i``, find the next
-         node ``j`` that is sibling-or-shallower and set ``byte_size =
-         nodes[j].byte_offset - nodes[i].byte_offset`` (EOF → ``len(text)``).
-         For a heading, ``j`` is the next heading at level ≤ L (lists never
-         close a heading scope). For a list item, ``j`` is the next list item
-         at indent ≤ L, OR any heading (a heading boundary always resets list
-         scope).
-      3. Tree linking via two stacks. The heading stack pops on level-≥
-         comparisons (so an h3 attaches under the nearest open h1/h2). The
-         list stack mirrors that on indent and resets on every heading
-         boundary; an orphan list item (no shallower list ancestor) attaches
-         to the surrounding heading, else becomes a top-level node.
-      4. Leading body-text nodes (only when ``include_lists`` is off): for each
-         scope with >=1 heading child, the body run before its first heading
-         becomes a dim ``'text'`` node inserted as the scope's first child (see
-         ``_add_text_nodes``). With lists on this pass is skipped, so the
-         with-lists tree is byte-for-byte unchanged.
-    """
-    line_starts = _line_starts(text)
-    events = _scan_events(text, line_starts, include_lists)
-    bytes_eof = len(text)
-
-    # --- Pass 1: per-event MdNode construction ---
-    nodes = []  # parallel to events; same indexing
-    for kind, payload in events:
-        source = payload['source']
-        # Drop leading ``#``s / list marker + immediate whitespace; the tag
-        # conveys the kind, so the title shouldn't repeat the sigil. Inline
-        # markup is preserved (the regex only touches the prefix).
-        line = source.rstrip('\n').lstrip()
-        if kind in _HEADING_EVENT_KINDS:
-            level = int(kind[1])  # 'h3' -> 3
-            node = MdNode(
-                kind='heading',
-                level=level,
-                title=_HEADING_PREFIX_RE.sub('', line),
-                line_offset=payload['line_offset'],
-                byte_offset=payload['byte_offset'],
-                byte_size=0,  # set by pass 2
-            )
-        else:
-            node = MdNode(
-                kind='list-item',
-                level=payload['level'],
-                title=_LIST_PREFIX_RE.sub('', line),
-                line_offset=payload['line_offset'],
-                byte_offset=payload['byte_offset'],
-                byte_size=0,  # set by pass 2
-            )
-        nodes.append(node)
-
-    # --- Pass 2: boundary rule (byte_size) ---
-    n = len(nodes)
-    for i in range(n):
-        cur = nodes[i]
-        cur_is_heading = cur.kind == 'heading'
-        cur_level = cur.level
-        j_bo = bytes_eof
-        for j in range(i + 1, n):
-            nxt = nodes[j]
-            if cur_is_heading:
-                if nxt.kind == 'heading' and nxt.level <= cur_level:
-                    j_bo = nxt.byte_offset
-                    break
-            else:
-                # list-item — any heading closes the list scope, plus any
-                # list item at indent ≤ cur_level.
-                if nxt.kind == 'heading':
-                    j_bo = nxt.byte_offset
-                    break
-                if nxt.kind == 'list-item' and nxt.level <= cur_level:
-                    j_bo = nxt.byte_offset
-                    break
-        cur.byte_size = j_bo - cur.byte_offset
-
-    # --- Pass 3: tree linking via heading + list stacks ---
-    roots = []  # top-level nodes, in document order
-    # Heading stack: each entry is ``(level, node)``; top is the innermost
-    # open heading, empty means "top level".
-    heading_stack = []
-    # List stack: each entry is ``(indent_level, node)``; reset on every
-    # heading boundary so a section's list items can't nest under a prior
-    # section's list.
-    list_stack = []
-
-    for node in nodes:
-        if node.kind == 'heading':
-            list_stack = []
-            L = node.level
-            while heading_stack and heading_stack[-1][0] >= L:
-                heading_stack.pop()
-            if heading_stack:
-                heading_stack[-1][1].children.append(node)
-            else:
-                roots.append(node)
-            heading_stack.append((L, node))
-        else:
-            L = node.level
-            while list_stack and list_stack[-1][0] >= L:
-                list_stack.pop()
-            if list_stack:
-                list_stack[-1][1].children.append(node)
-            elif heading_stack:
-                heading_stack[-1][1].children.append(node)
-            else:
-                roots.append(node)
-            list_stack.append((L, node))
-
-    # --- Pass 4: leading body-text nodes (headings-only view) ---
-    # When lists are off, prepend a dim ``'text'`` node for the body run that
-    # precedes each scope's first heading, so the table-of-contents shows the
-    # intro paragraph. Gated on ``not include_lists`` so the with-lists tree is
-    # byte-for-byte unchanged.
-    if not include_lists:
-        _add_text_nodes(roots, 0, text, line_starts)
-
-    return roots
+    has_heading = any(n.kind == 'heading' for n in nodes)
+    return [n for n in nodes
+            if n.kind == 'heading' or (n.byte_size > 0 and has_heading)]
 
 
 def node_at_line(tree, line_offset):
-    """Find the ``MdNode`` at ``line_offset`` in a doc tree, or ``None``.
+    """Find the visible ``M2A_Node`` at ``line_offset``, or ``None``.
 
-    Depth-first walk of an (already-built) ``MdNode`` tree — the list of
-    top-level nodes from ``build_doc_tree`` and, recursively, each node's
-    ``children``. Returns the first node whose ``line_offset`` *exactly*
-    equals the target (so a heading selector is an O(nodes) lookup
-    that needs no by-line index stashed on the structural nodes); a
-    ``line_offset`` that matches no node — including one before the first
-    node — yields ``None``. The tree is one document's structure, so a linear
-    search is plenty.
-
-    Lifted verbatim from the recipes' ``_md_node_at_line`` (both
-    ``browse-claude`` and ``browse-md`` carried an identical copy).
+    Depth-first walk of a built tree — ``M2A_Doc.tree`` and, recursively,
+    each node's ``children`` — over the VISIBLE nodes only (the same
+    ``visible_children`` row set the recipes materialise), returning the
+    first one whose ``line_offset`` *exactly* equals the target. Row ids
+    carry a visible node's line, so restricting the walk both matches the
+    lookup's purpose and sidesteps the zero-width text runs, whose virtual
+    line can coincide with a real row's (e.g. the empty preamble shares
+    line 0 with a document's opening heading). A ``line_offset`` that
+    matches no visible node — including one before the first node — yields
+    ``None``. The tree is one document's structure, so a linear search is
+    plenty.
     """
-    for node in tree:
+    for node in visible_children(tree):
         if node.line_offset == line_offset:
             return node
         found = node_at_line(node.children, line_offset)
@@ -453,11 +121,11 @@ _MD_REF_RE = re.compile(r'(?<![^\s"`\\$*()\[\]<>])[^\s"`\\$*()\[\]<>]+\.(?:md|MD
 # Cheap heading-detection gate: a run of ``#`` at the start of a line (after
 # optional indent) FOLLOWED by a mandatory space/tab — matching the authoritative
 # grammar (``_MD_H1``..``_MD_H6`` all require ``[ \t]+``), so ``#foo`` is not a
-# heading but ``# foo`` is. Pure regex — NO ``md2ansi_scan`` — so it is fast
+# heading but ``# foo`` is. Pure regex — NO full grammar scan — so it is fast
 # enough to run on every item at delivery time. It is intentionally *optimistic*:
 # it also fires on a ``#`` that lives only inside a fenced code block, which the
-# authoritative ``build_doc_tree`` later rejects (the recipe self-heals the stale
-# arrow).
+# authoritative ``md2ansi_doc`` parse later rejects (the recipe self-heals the
+# stale arrow).
 _MD_HEADING_TRIGGER_RE = re.compile(r'(?:^|\n)[ \t]*#+[ \t]')
 
 
@@ -478,9 +146,9 @@ def md_heading_trigger(text):
 
     A pure-regex pre-filter for the detection path — matches a ``#`` at the
     start of any line. Optimistic by design: a ``#`` inside a fenced code
-    block also matches here (only ``build_doc_tree`` can tell them apart), so a
-    ``True`` result means "worth building the real tree", not "definitely has a
-    heading".
+    block also matches here (only the real ``md2ansi_doc`` parse can tell them
+    apart), so a ``True`` result means "worth building the real tree", not
+    "definitely has a heading".
     """
     return _MD_HEADING_TRIGGER_RE.search(text) is not None
 
@@ -557,23 +225,21 @@ def find_git_root(start):
 
 # A referenced file is read and scanned once regardless of how many places (or
 # how many times along a reference cycle) reach it: ``get_doc`` memoises
-# ``abspath -> (text, doc_tree)``. The recipes clear this on their reload paths
-# (``Ctrl-R`` / ``_bust_caches_for``) via ``clear_cache``. Headings-only is the
-# cached shape — it is what both recipes' reference-following uses; a caller
-# that needs lists (``browse-md``'s ``-l`` over its primary files) builds those
-# trees itself rather than polluting this shared cache with a second variant.
+# ``abspath -> (text, M2A_Doc)``. The recipes clear this on their reload paths
+# (``Ctrl-R`` / ``_bust_caches_for``) via ``clear_cache``.
 
 _DOC_CACHE = {}
 
 
 def get_doc(abspath):
-    """Return ``(text, doc_tree)`` for ``abspath``, reading + parsing once.
+    """Return ``(text, doc)`` for ``abspath``, reading + parsing once.
 
-    ``text`` is the file's full decoded contents; ``doc_tree`` is
-    ``build_doc_tree(text)`` (headings only). Subsequent calls for the same
-    path return the cached pair without re-reading or re-parsing. The path is
-    used as the cache key verbatim — callers pass the canonical abspath from
-    ``resolve_md_ref`` so two routes to one file share an entry.
+    ``text`` is the file's full decoded contents; ``doc`` is the ``M2A_Doc``
+    document model from ``md2ansi_doc(text)`` (its ``.tree`` holds the
+    ``M2A_Node`` roots). Subsequent calls for the same path return the cached
+    pair without re-reading or re-parsing. The path is used as the cache key
+    verbatim — callers pass the canonical abspath from ``resolve_md_ref`` so
+    two routes to one file share an entry.
 
     I/O errors are not swallowed here: a caller resolves the ref to an existing
     path before calling, and a genuine read failure (permission, race) is worth
@@ -588,8 +254,7 @@ def get_doc(abspath):
         return cached
     with open(abspath, encoding='utf-8', errors='replace') as f:
         text = f.read()
-    doc_tree = build_doc_tree(text)
-    pair = (text, doc_tree)
+    pair = (text, md2ansi_doc(text))
     _DOC_CACHE[abspath] = pair
     return pair
 

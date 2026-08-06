@@ -295,12 +295,10 @@ def _build_nodes(doc, path):
     root.file_path = path
     by_id = {root.id: root}
 
-    def _visible(nodes):
-        # The ``#text`` row-set rule over one children list. A list holds
-        # at most one text run (always first), so the probe is cheap.
-        has_heading = any(n.kind == 'heading' for n in nodes)
-        return [n for n in nodes
-                if n.kind == 'heading' or (n.byte_size > 0 and has_heading)]
+    # The ``#text`` row-set rule over one children list — shared with the
+    # reference-subtree builders (and browse-claude) via ``md_doc``. A hard
+    # dependency past the ``main()`` gate, like ``md2ansi_doc`` itself.
+    _visible = md_doc.visible_children
 
     def _to_item(node):
         if node.kind == 'text':
@@ -742,21 +740,22 @@ def _file_has_existing_ref(text, file_path):
 
 
 def _md_heading_item(anchor, chain, node):
-    """Map an ``md_doc`` heading ``MdNode`` to a tree-row ``Item``.
+    """Map a heading ``M2A_Node`` to a tree-row ``Item``.
 
     Id = ``('md', anchor, chain, node.line_offset)`` — selecting the heading by
     its line within the chain's last document. ``has_children`` is authoritative
-    (the node is already parsed), so heading rows never need a self-heal.
-    ``boundary`` stays ``False`` — a heading is same-document structure, not a
-    foreign subtree. The ``[h1]``..``[h6]`` tag + style match the in-file heading
-    rows. Mirrors browse-claude's ``_md_heading_item``.
+    (the node is already parsed; counted over the VISIBLE children, since every
+    heading carries a filtered-out ``#text`` first child), so heading rows never
+    need a self-heal. ``boundary`` stays ``False`` — a heading is same-document
+    structure, not a foreign subtree. The ``[h1]``..``[h6]`` tag + style match
+    the in-file heading rows. Mirrors browse-claude's ``_md_heading_item``.
     """
     item = Item(
         id=('md', anchor, chain, node.line_offset),
         title=node.title,
         tag=f'h{node.level}',
         tag_style=_MD_HEADING_STYLE.get(node.level, ''),
-        has_children=bool(node.children),
+        has_children=bool(md_doc.visible_children(node.children)),
     )
     item.kind = 'md-heading'
     item.md_level = node.level
@@ -764,7 +763,7 @@ def _md_heading_item(anchor, chain, node):
 
 
 def _md_text_item(anchor, chain, node):
-    """Map an ``md_doc`` ``'text'`` ``MdNode`` to a dim-leaf tree-row ``Item``.
+    """Map a ``'text'`` ``M2A_Node`` to a dim-leaf tree-row ``Item``.
 
     The dim-leaf sibling of :func:`_md_heading_item`: a loose body run that
     precedes a scope's first heading. Id = ``('md', anchor, chain,
@@ -786,14 +785,14 @@ def _md_text_item(anchor, chain, node):
 
 
 def _md_node_item(anchor, chain, node):
-    """Map an ``md_doc`` child ``MdNode`` to its tree-row ``Item`` by kind.
+    """Map a visible child ``M2A_Node`` to its tree-row ``Item`` by kind.
 
     The single dispatch ``_md_subtree_children`` uses for both its heading-
     children and top-level-doc loops: a ``'text'`` run becomes a dim leaf
     (:func:`_md_text_item`), anything else (a heading) becomes a heading row
-    (:func:`_md_heading_item`). The headings-only doc tree only ever holds
-    ``'heading'`` and ``'text'`` nodes (lists are off in ``get_doc``), so no
-    list-item arm is needed. Mirrors browse-claude's ``_md_node_item``.
+    (:func:`_md_heading_item`). The document model only holds ``'heading'``
+    and ``'text'`` nodes, so no other arm is needed. Mirrors browse-claude's
+    ``_md_node_item``.
     """
     if node.kind == 'text':
         return _md_text_item(anchor, chain, node)
@@ -882,8 +881,8 @@ def _md_refs_umbrella_children(item_id):
     if md_doc is None:
         return []
     _, anchor, chain = item_id
-    text, doc_tree = _md_chain_doc(anchor, chain)
-    if doc_tree is None:
+    text, doc = _md_chain_doc(anchor, chain)
+    if doc is None:
         return []
     doc_dir, cwd, project_root = _md_resolution_context(
         chain[-1] if chain else anchor[1])
@@ -912,10 +911,10 @@ def _preview_md_refs_umbrella(item_id):
 
 
 def _md_chain_doc(anchor, chain):
-    """Resolve a markdown ``chain``'s *last* document to ``(text, doc_tree)``.
+    """Resolve a markdown ``chain``'s *last* document to ``(text, doc)``.
 
-    The chain's terminal document is what both the subtree build and the preview
-    route operate on:
+    ``doc`` is the ``M2A_Doc`` document model. The chain's terminal document
+    is what both the subtree build and the preview route operate on:
 
       * a non-empty ``chain`` ends in a referenced file — read + parsed once via
         ``md_doc.get_doc``'s process-wide cache;
@@ -924,8 +923,8 @@ def _md_chain_doc(anchor, chain):
         browse-md's anchor is itself a file, so the empty-chain document is that
         file read from disk via ``get_doc`` — EXCEPT the stdin sentinel
         (``_STDIN_PATH``), whose text was pre-slurped into ``_STDIN_TEXT`` and
-        has no on-disk file: it is served from that buffer (same headings-only
-        tree shape ``get_doc`` builds) so the stdin document's own References
+        has no on-disk file: it is served from that buffer (same ``M2A_Doc``
+        shape ``get_doc`` builds) so the stdin document's own References
         umbrella can resolve its refs against the ``--root`` bases. In
         practice only the empty chain names the sentinel — a referenced file
         is an existing on-disk path.
@@ -935,7 +934,7 @@ def _md_chain_doc(anchor, chain):
     """
     target = chain[-1] if chain else anchor[1]
     if target == _STDIN_PATH and _STDIN_TEXT is not None:
-        return _STDIN_TEXT, md_doc.build_doc_tree(_STDIN_TEXT)
+        return _STDIN_TEXT, _md2ansi_doc(_STDIN_TEXT)
     try:
         return md_doc.get_doc(target)
     except OSError:
@@ -970,23 +969,25 @@ def _md_subtree_children(item_id):
     its inline-document branch (browse-md has no inline segment).
     """
     _, anchor, chain, line = item_id
-    text, doc_tree = _md_chain_doc(anchor, chain)
-    if doc_tree is None:
+    text, doc = _md_chain_doc(anchor, chain)
+    if doc is None:
         return []
 
     # Heading node → its nested sub-headings (no ref children).
     if line is not None:
-        node = md_doc.node_at_line(doc_tree, line)
+        node = md_doc.node_at_line(doc.tree, line)
         if node is None:
             return []
-        return [_md_node_item(anchor, chain, ch) for ch in node.children]
+        return [_md_node_item(anchor, chain, ch)
+                for ch in md_doc.visible_children(node.children)]
 
     # File-document node → top-level rows (headings + any leading text run),
     # then (when the file references at least one existing ``.md``) a single
     # References umbrella grouping the file's own refs. The full resolve is
     # deferred to the umbrella's expand; here we just short-circuit on the
     # first one.
-    out = [_md_node_item(anchor, chain, node) for node in doc_tree]
+    out = [_md_node_item(anchor, chain, node)
+           for node in md_doc.visible_children(doc.tree)]
     if _file_has_existing_ref(text, chain[-1]):
         out.append(_md_refs_umbrella_item(anchor, chain))
     return out
@@ -1019,7 +1020,7 @@ def _preview_md_node(item_id):
         text (``md_doc.get_doc`` cache).
       * **heading node** (``line`` set) → just that heading's section, sliced
         ``text[byte_offset : byte_offset + byte_size]`` from the cached
-        ``doc_tree`` (the boundary rule includes the heading's own sub-sections
+        ``M2A_Doc`` (the boundary rule includes the heading's own sub-sections
         and stops at the next sibling-or-shallower heading).
 
     Both render through ``_md_render`` (md2ansi when ``_MD_COLOR`` is on, raw
@@ -1028,12 +1029,12 @@ def _preview_md_node(item_id):
     inline-document case (browse-md has no inline segment).
     """
     _, anchor, chain, line = item_id
-    text, doc_tree = _md_chain_doc(anchor, chain)
+    text, doc = _md_chain_doc(anchor, chain)
     if text is None:
         return ''
     if line is None:
         return _md_render(text)
-    node = md_doc.node_at_line(doc_tree, line)
+    node = md_doc.node_at_line(doc.tree, line)
     if node is None:
         return ''
     return _md_render(text[node.byte_offset:node.byte_offset + node.byte_size])

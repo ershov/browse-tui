@@ -62,13 +62,16 @@ from browse_tui import (
     upsert, visible_items,
 )
 
-# Optional md2ansi_lib plugin — colors user/assistant voice content inline.
+# Optional md2ansi_lib plugin — colors user/assistant voice content inline;
+# ``md2ansi_doc`` parses a message's inline markdown for the document subtree
+# (whose feature gate is ``_md_doc`` below — md_doc hard-imports md2ansi_lib,
+# so ``_md_doc`` being set implies ``_md2ansi_doc`` is too).
 try:
-    from md2ansi_lib import md2ansi as _md2ansi_fn
+    from md2ansi_lib import md2ansi as _md2ansi_fn, md2ansi_doc as _md2ansi_doc
     if not callable(_md2ansi_fn):
         _md2ansi_fn = None
 except Exception:
-    _md2ansi_fn = None
+    _md2ansi_fn = _md2ansi_doc = None
 
 # Optional md_doc plugin — turns a message's markdown (its inline content and
 # the ``.md`` files it references) into a navigable document subtree. The
@@ -2325,8 +2328,8 @@ def _extract_text(content):
 # A markdown node id is the recipe-owned tuple ``('md', anchor, chain, line)``
 # (``('refs', anchor, chain)`` for the References umbrella), built/destructured
 # inline here — ``md_doc`` is codec-free and only contributes single-document
-# operations (``get_doc`` / ``node_at_line`` / ``find_md_refs`` /
-# ``resolve_md_ref`` / ``build_doc_tree``). ``anchor`` is the host message
+# operations (``get_doc`` / ``node_at_line`` / ``visible_children`` /
+# ``find_md_refs`` / ``resolve_md_ref``). ``anchor`` is the host message
 # ``('msg', jsonl, n)``; ``chain`` is a TUPLE of referenced-file abspaths
 # followed from the anchor (``()`` = the message's own inline doc); ``line`` is
 # a heading ``line_offset`` (int) or ``None`` for the doc root. Routing is
@@ -2338,7 +2341,7 @@ def _message_md_text(rec):
     """The message's markdown text: every ``text`` part + any ``tool_result``
     text, joined with blank lines.
 
-    This is the inline document's source — what ``md_doc.build_doc_tree`` /
+    This is the inline document's source — what ``md2ansi_doc`` /
     ``md_heading_trigger`` scan for headings. Unlike ``_extract_text`` (which
     returns the *first* useful fragment for a one-line summary), this collects
     ALL prose: every ``type=='text'`` content part, plus the textual body of
@@ -2452,20 +2455,21 @@ _MD_HEADING_STYLE = {
 
 
 def _md_heading_item(anchor, chain, node):
-    """Map an ``md_doc`` heading ``MdNode`` to a tree-row ``Item``.
+    """Map a heading ``M2A_Node`` to a tree-row ``Item``.
 
     Id = ``('md', anchor, chain, node.line_offset)`` — selecting the heading by
     its line within the chain's last document. ``has_children`` is
-    authoritative (we already have the parsed node), so heading rows never need
-    self-heal. ``boundary`` is left ``False`` — a heading is same-document
-    structure, not a foreign subtree.
+    authoritative (we already have the parsed node; counted over the VISIBLE
+    children, since every heading carries a filtered-out ``#text`` first
+    child), so heading rows never need self-heal. ``boundary`` is left
+    ``False`` — a heading is same-document structure, not a foreign subtree.
     """
     item = Item(
         id=('md', anchor, chain, node.line_offset),
         title=node.title,
         tag=f'h{node.level}',
         tag_style=_MD_HEADING_STYLE.get(node.level, ''),
-        has_children=bool(node.children),
+        has_children=bool(_md_doc.visible_children(node.children)),
     )
     item.kind = 'md-heading'
     item.md_level = node.level
@@ -2473,7 +2477,7 @@ def _md_heading_item(anchor, chain, node):
 
 
 def _md_text_item(anchor, chain, node):
-    """Map an ``md_doc`` ``'text'`` ``MdNode`` to a dim-leaf tree-row ``Item``.
+    """Map a ``'text'`` ``M2A_Node`` to a dim-leaf tree-row ``Item``.
 
     The dim-leaf sibling of :func:`_md_heading_item`: a loose body run that
     precedes a scope's first heading. Id = ``('md', anchor, chain,
@@ -2494,14 +2498,13 @@ def _md_text_item(anchor, chain, node):
 
 
 def _md_node_item(anchor, chain, node):
-    """Map an ``md_doc`` child ``MdNode`` to its tree-row ``Item`` by kind.
+    """Map a visible child ``M2A_Node`` to its tree-row ``Item`` by kind.
 
     The single dispatch ``_md_subtree_children`` uses for both its heading-
     children and top-level-doc loops: a ``'text'`` run becomes a dim leaf
     (:func:`_md_text_item`), anything else (a heading) becomes a heading row
-    (:func:`_md_heading_item`). The headings-only doc tree only ever holds
-    ``'heading'`` and ``'text'`` nodes (lists are off), so no list-item arm is
-    needed.
+    (:func:`_md_heading_item`). The document model only holds ``'heading'``
+    and ``'text'`` nodes, so no other arm is needed.
     """
     if node.kind == 'text':
         return _md_text_item(anchor, chain, node)
@@ -2632,8 +2635,8 @@ def _md_refs_umbrella_children(item_id):
     cwd, project_root = _session_cwd_and_root(jsonl_path)
     if chain:
         # File-doc umbrella: resolve the file's own refs, nested onto its chain.
-        text, doc_tree = _md_chain_doc(anchor, chain)
-        if doc_tree is None:
+        text, doc = _md_chain_doc(anchor, chain)
+        if doc is None:
             return []
         doc_dir = os.path.dirname(chain[-1])
         return [
@@ -2675,9 +2678,11 @@ def _md_message_children(anchor):
         return []
 
     out = []
-    # Inline document node — only when the message's own text has a heading.
+    # Inline document node — only when the message's own text has a heading
+    # (the visible row set is non-empty iff ≥1 heading exists: a text run
+    # only qualifies as a row alongside a heading sibling).
     text = _message_md_text(rec)
-    if _md_doc.build_doc_tree(text):
+    if _md_doc.visible_children(_md2ansi_doc(text).tree):
         inline = Item(
             id=('md', anchor, (), None),
             title='markdown',
@@ -2703,15 +2708,15 @@ def _md_message_children(anchor):
 
 
 def _md_chain_doc(anchor, chain):
-    """Resolve a markdown ``chain``'s *last* document to ``(text, doc_tree)``.
+    """Resolve a markdown ``chain``'s *last* document to ``(text, doc)``.
 
-    The chain's terminal document is what both the subtree build and the
-    preview route operate on: a non-empty ``chain`` ends in a referenced file
-    (read + parsed once via ``md_doc.get_doc``'s process-wide cache); an empty
-    chain is the message's own inline content (``_message_md_text`` of the
-    ``anchor`` record, parsed with ``build_doc_tree``). Returns ``(None, None)``
-    when the document is unreadable — the callers treat that as "no children /
-    empty preview".
+    ``doc`` is the ``M2A_Doc`` document model. The chain's terminal document
+    is what both the subtree build and the preview route operate on: a
+    non-empty ``chain`` ends in a referenced file (read + parsed once via
+    ``md_doc.get_doc``'s process-wide cache); an empty chain is the message's
+    own inline content (``_message_md_text`` of the ``anchor`` record, parsed
+    with ``md2ansi_doc``). Returns ``(None, None)`` when the document is
+    unreadable — the callers treat that as "no children / empty preview".
     """
     if chain:
         try:
@@ -2722,7 +2727,7 @@ def _md_chain_doc(anchor, chain):
     if rec is None:
         return None, None
     text = _message_md_text(rec)
-    return text, _md_doc.build_doc_tree(text)
+    return text, _md2ansi_doc(text)
 
 
 def _md_subtree_children(item_id):
@@ -2753,22 +2758,24 @@ def _md_subtree_children(item_id):
     """
     _, anchor, chain, line = item_id
 
-    text, doc_tree = _md_chain_doc(anchor, chain)
-    if doc_tree is None:
+    text, doc = _md_chain_doc(anchor, chain)
+    if doc is None:
         return []
 
     # Heading node → its nested sub-headings (no ref children).
     if line is not None:
-        node = _md_doc.node_at_line(doc_tree, line)
+        node = _md_doc.node_at_line(doc.tree, line)
         if node is None:
             return []
-        return [_md_node_item(anchor, chain, ch) for ch in node.children]
+        return [_md_node_item(anchor, chain, ch)
+                for ch in _md_doc.visible_children(node.children)]
 
     # Document node → top-level rows (headings + any leading text run), then
     # (file docs only) a References umbrella grouping the file's own refs. The
     # full resolve is deferred to the umbrella's expand; here we just
     # short-circuit on the first one.
-    out = [_md_node_item(anchor, chain, node) for node in doc_tree]
+    out = [_md_node_item(anchor, chain, node)
+           for node in _md_doc.visible_children(doc.tree)]
     if chain:
         cwd, project_root = _session_cwd_and_root(anchor[1])
         doc_dir = os.path.dirname(chain[-1])
@@ -2787,7 +2794,7 @@ def _preview_md_node(item_id):
         (``md_doc.get_doc`` cache).
       * **heading node** (``line`` set) → just that heading's section, sliced
         ``text[byte_offset : byte_offset + byte_size]`` from the cached
-        ``doc_tree`` (the boundary rule includes the heading's own sub-sections
+        ``M2A_Doc`` (the boundary rule includes the heading's own sub-sections
         and stops at the next sibling-or-shallower heading).
 
     Both are rendered through ``_md_voice`` — md2ansi when the ``_MD_COLOR``
@@ -2796,12 +2803,12 @@ def _preview_md_node(item_id):
     line offset that matches no heading.
     """
     _, anchor, chain, line = item_id
-    text, doc_tree = _md_chain_doc(anchor, chain)
+    text, doc = _md_chain_doc(anchor, chain)
     if text is None:
         return ''
     if line is None:
         return _md_voice(text)
-    node = _md_doc.node_at_line(doc_tree, line)
+    node = _md_doc.node_at_line(doc.tree, line)
     if node is None:
         return ''
     return _md_voice(text[node.byte_offset:node.byte_offset + node.byte_size])
