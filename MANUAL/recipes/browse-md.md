@@ -28,9 +28,22 @@ files or directories; `FILE.md#section` deep-links straight to a heading.
   the layout changes.
 - Dim `[text]` rows synthesised for a non-empty body run that precedes a
   scope's first sub-heading (a leaf section's body stays in its preview).
-- Cross-file multi-select actions — `V` / `E` group selected rows by
-  file, merge their byte ranges, and concatenate the slices with a
-  per-file separator.
+- Cross-file multi-select viewing — `V` groups selected rows by file,
+  merges their byte ranges, and concatenates the slices with a per-file
+  separator.
+- Conflict-safe section editing — `E` opens the cursor row's section in
+  `$EDITOR` (a file row edits the file in place) and re-applies the
+  result through `md2ansi_lib`'s hash-addressed splice: the section is
+  re-found by content hash (or a hash-verified line range) even if the
+  file changed underneath the editor, and a genuinely ambiguous apply
+  offers a Cancel / Return-to-editor retry dialog instead of guessing.
+- Section insert via marker mode — `a` / `i` enter the framework's
+  placement marker; the confirmed `(relation, dest_id)` (before / after /
+  first) maps 1:1 onto the splice position, and `$EDITOR` opens a small
+  new-section template. Same conflict-safe apply and retry dialog as `E`.
+- Stdin documents stay editable — `E` / `a` apply to the in-memory copy
+  (flagged "not saved to disk"), so a piped document can still be
+  restructured or used to export a section through the editor.
 - Repeatable `--root DIR` — extra base directories for resolving a
   document's relative cross-file references (tried after the file's own
   directory), and the only way references resolve for a stdin (`-`)
@@ -52,8 +65,10 @@ git show HEAD:README.md | ./recipes/browse-md - --root "$(git rev-parse --show-t
 
 Keys: `m` toggle md2ansi coloring, `M` page the preview through
 `$MDCAT` / `mdcat`, `V` page the source in `$PAGER`, `E` edit the
-source in `$EDITOR`, `→` expand (auto-expands a single-heading file),
-`Ctrl-R` re-slurp every file from disk.
+section under the cursor in `$EDITOR` (conflict-safe splice on save),
+`a` / `i` insert a new section at a marker-chosen position, `→` expand
+(auto-expands a single-heading file), `Ctrl-R` re-slurp every file
+from disk.
 
 **Source:** [`recipes/browse-md`](../../recipes/browse-md)
 

@@ -55,6 +55,12 @@ Custom actions on top of the framework defaults:
       editor is re-addressed rather than corrupted. The stdin
       document applies to the in-memory copy. Cursor only —
       selection is ignored.
+  a/i insert a new section via the framework's placement marker:
+      confirm yields ``(relation, dest_id)`` (before / after / first)
+      which maps 1:1 onto the splice position; ``$EDITOR`` opens a
+      small template, and the saved content goes through the same
+      conflict-safe apply chain as ``E``. Anchors are primary-file
+      rows only (v1) — reference-subtree rows are rejected.
   →   expand the cursor row (overrides the framework default); when
       the row is a file whose only child is a heading, that heading
       is auto-expanded too, so a single-heading document reveals its
@@ -1565,8 +1571,9 @@ def _write_range_excerpts_grouped(groups):
     return tmp.name
 
 
-def _run_source_command(ctx, env_var, default):
-    """Body of ``V``: resolve targets, dispatch the external pager.
+def _run_source_command(ctx):
+    """Body of ``V``: resolve targets, dispatch ``$PAGER`` (default
+    ``less -R``).
 
     Strategy:
 
@@ -1641,7 +1648,7 @@ def _run_source_command(ctx, env_var, default):
         # pseudo-Item (both carry a ``('file', path)`` id).
         return _id_file_path(it) or _ROOT_PATH
 
-    cmd = _split_cmd(os.environ.get(env_var) or default)
+    cmd = _split_cmd(os.environ.get('PAGER') or 'less -R')
 
     # Single-target shortcut: cursor or sole-selection on a file row
     # → open the file directly. Edits via E persist. This is the ONLY
@@ -1723,22 +1730,24 @@ def _action_view_source(ctx):
     framework's built-in ``v`` (which pages the *preview* text, not
     the on-disk source).
     """
-    _run_source_command(ctx, 'PAGER', 'less -R')
+    _run_source_command(ctx)
 
 
-# ---- section editing (E) ---------------------------------------------------
+# ---- section editing (E) + section insert (a / i) --------------------------
 #
-# ``E`` edits the section under the CURSOR through ``$EDITOR`` and re-applies
-# the result via the md2ansi_lib document-ops layer (``md2ansi_resolve`` /
-# ``md2ansi_splice``). The section's addressable identity — extent slice, full
-# sha256, 1-based line range, kind/level — is captured when the action fires
-# (``_capture_extent``); after the editor saves, the document is RE-READ and
-# the capture is re-addressed in the current text by the apply chain
-# (``_apply_splice``), so a file that changed underneath the editor is either
-# transparently re-found (by hash, or by hash-verified range) or the edit is
-# refused with a retry dialog — never spliced into the wrong place. The chain
-# helper is shared with the insert flow (``where='before'/'after'/'first'``),
-# which anchors on the same capture shape.
+# ``E`` edits the section under the CURSOR through ``$EDITOR``; ``a`` / ``i``
+# insert a NEW section at a marker-chosen position. Both re-apply the editor's
+# result via the md2ansi_lib document-ops layer (``md2ansi_resolve`` /
+# ``md2ansi_splice``). The anchor section's addressable identity — extent
+# slice, full sha256, 1-based line range, kind/level — is captured when the
+# action fires (``_capture_extent``); after the editor saves, the document is
+# RE-READ and the capture is re-addressed in the current text by the apply
+# chain (``_apply_splice``), so a file that changed underneath the editor is
+# either transparently re-found (by hash, or by hash-verified range) or the
+# operation is refused with a retry dialog — never spliced into the wrong
+# place. Edit and insert share one editor loop (``_editor_splice_loop``): the
+# only differences are the temp file's seed (extent vs template) and the
+# splice's ``where`` (``'replace'`` vs the marker relation).
 
 
 # The at-action-time address of a section extent, consumed by
@@ -1827,84 +1836,116 @@ def _apply_splice(text, cap, content, where='replace'):
         return None
 
 
-def _apply_section_edit(ctx, path, cap, content):
-    """Re-read ``path``'s document, apply ``content`` over ``cap``, persist.
+def _read_document(path):
+    """The CURRENT document text for ``path`` — the apply chain's input.
 
-    The document is re-read from disk (from the in-memory ``_STDIN_TEXT``
-    copy for the stdin document) so changes that landed underneath the
-    editor are honoured; ``_apply_splice`` then re-addresses the captured
-    extent in that current text. On success the new text is written back
-    (stored in-memory for stdin, with a flash saying so), the mutation is
-    logged, and ``ctx.refresh()`` re-parses everything — the framework's
-    full-reload path clears the ``md_doc`` cache, rebuilds the per-file
-    state, and preserves cursor / expansion where the ids allow. Returns
-    ``True`` on success, ``False`` when the extent could not be
-    re-addressed (the caller offers the retry dialog).
+    Re-read from disk on every call (not from the parse-time ``_FILES``
+    snapshot) so changes that landed underneath the editor are honoured;
+    ``errors='replace'`` matches ``_reparse``, keeping capture-time and
+    apply-time hashes consistent on non-UTF-8 bytes. The stdin document
+    serves its in-memory ``_STDIN_TEXT`` copy instead.
+    """
+    if path == _STDIN_PATH:
+        return _STDIN_TEXT
+    with open(path, 'r', encoding='utf-8', errors='replace') as f:
+        return f.read()
+
+
+def _persist_document(ctx, path, new_text):
+    """Write a spliced document back: to disk, or in-memory for stdin.
+
+    The stdin document has no file — the new text replaces ``_STDIN_TEXT``
+    and a flash makes the in-memory-only nature explicit (logged, so tests
+    and the message log carry it too).
     """
     global _STDIN_TEXT
-    if path == _STDIN_PATH:
-        src = _STDIN_TEXT
-    else:
-        with open(path, 'r', encoding='utf-8', errors='replace') as f:
-            src = f.read()
-    new_text = _apply_splice(src, cap, content, where='replace')
-    if new_text is None:
-        return False
     if path == _STDIN_PATH:
         _STDIN_TEXT = new_text
         ctx.flash('applied to in-memory copy - not saved to disk', log=True)
     else:
         with open(path, 'w', encoding='utf-8') as f:
             f.write(new_text)
-    ctx.log(f'browse-md: edited {os.path.basename(path)} '
-            f'lines {cap.a}-{cap.b}')
-    ctx.refresh()
+
+
+def _apply_section_change(ctx, path, cap, content, where):
+    """Re-read ``path``'s document, splice ``content`` at ``cap``, persist.
+
+    The shared success half of edit AND insert: ``_read_document`` gives
+    the document as it is NOW, ``_apply_splice`` re-addresses the captured
+    extent in it, and on success the new text is persisted, the mutation
+    logged, and ``ctx.refresh()`` re-parses everything (the framework's
+    full-reload path clears the ``md_doc`` cache, rebuilds the per-file
+    state, and preserves cursor / expansion where the ids allow). An
+    insert (``where != 'replace'``) additionally lands the cursor on the
+    new section once the refresh completes: the section starts at the
+    first line where old and new text diverge, and its row id is exactly
+    ``('content', path, line)`` — best-effort (``cursor_to`` leaves the
+    cursor alone when the row isn't visible). Returns ``True`` on
+    success, ``False`` when the extent could not be re-addressed (the
+    caller offers the retry dialog).
+    """
+    src = _read_document(path)
+    new_text = _apply_splice(src, cap, content, where=where)
+    if new_text is None:
+        return False
+    _persist_document(ctx, path, new_text)
+    if where == 'replace':
+        ctx.log(f'browse-md: edited {os.path.basename(path)} '
+                f'lines {cap.a}-{cap.b}')
+        ctx.refresh()
+    else:
+        ctx.log(f'browse-md: inserted section ({where}) in '
+                f'{os.path.basename(path)}')
+        prefix = len(os.path.commonprefix((src, new_text)))
+        line = new_text.count('\n', 0, prefix)
+        ctx.refresh(
+            on_complete=lambda: ctx.cursor_to(('content', path, line)))
     return True
 
 
-def _edit_node_in_editor(ctx, path, node):
-    """Section edit body: extent → temp ``.md`` → ``$EDITOR`` → apply chain.
+def _editor_splice_loop(ctx, path, cap, seed, where):
+    """Shared body of edit and insert: temp ``.md`` → ``$EDITOR`` → apply.
 
-    Serves heading / text-run rows and the stdin document's root (whose
-    "section" is the whole in-memory body). The temp file persists across
-    retry-loop iterations — "Return to editor" re-opens the SAME file, so
-    the user's work is never lost (they can save it elsewhere from inside
-    the editor). An editor exiting non-zero, or content coming back
-    unchanged or empty, cancels without writing.
+    ``seed`` is the temp file's initial content — the captured extent for
+    an edit, the new-section template for an insert; content coming back
+    byte-equal to it (or empty), or an editor exiting non-zero, cancels
+    without writing. The temp file persists across retry-loop iterations —
+    "Return to editor" re-opens the SAME file, so the user's work is never
+    lost (they can save it elsewhere from inside the editor).
     """
+    verb = 'edit' if where == 'replace' else 'insert'
     import tempfile
-    fs = _FILES[path]
-    cap = _capture_extent(fs.text, node)
     cmd = _split_cmd(os.environ.get('EDITOR') or 'vim')
     tmp = tempfile.NamedTemporaryFile(
         'w', suffix='.md', delete=False, encoding='utf-8')
     try:
-        tmp.write(cap.extent)
+        tmp.write(seed)
         tmp.close()
         while True:
             if ctx.run_external(cmd + [tmp.name]) != 0:
-                ctx.flash('edit cancelled (editor exited non-zero)')
+                ctx.flash(f'{verb} cancelled (editor exited non-zero)')
                 return
             with open(tmp.name, 'r', encoding='utf-8',
                       errors='replace') as f:
                 content = f.read()
-            if content == cap.extent:
-                ctx.flash('edit cancelled (content unchanged)')
+            if content == seed:
+                ctx.flash(f'{verb} cancelled (content unchanged)')
                 return
             if not content.strip():
-                ctx.flash('edit cancelled (empty content)')
+                ctx.flash(f'{verb} cancelled (empty content)')
                 return
-            if _apply_section_edit(ctx, path, cap, content):
+            if _apply_section_change(ctx, path, cap, content, where):
                 return
-            # Both addressing steps failed — the section changed or moved
-            # underneath the editor. Loop back into the same temp file on
-            # "Return"; esc / "Cancel edit" both land in the falsy arm.
+            # Both addressing steps failed — the target section changed or
+            # moved underneath the editor. Loop back into the same temp
+            # file on "Return"; esc / "Cancel" both land in the falsy arm.
             if not ctx.confirm(
-                    'could not apply: the section changed or moved '
-                    'underneath the edit',
-                    [('&Cancel edit', False), ('&Return to editor', True)],
-                    title='edit conflict'):
-                ctx.flash('edit cancelled')
+                    'could not apply: the target section changed or moved '
+                    f'underneath the {verb}',
+                    [(f'&Cancel {verb}', False),
+                     ('&Return to editor', True)],
+                    title=f'{verb} conflict'):
+                ctx.flash(f'{verb} cancelled')
                 return
     finally:
         try:
@@ -1925,7 +1966,7 @@ def _action_edit_section(ctx):
         in-memory body is the edited extent.
       * heading / text run ``('content', path, line)`` — the section's
         extent through the temp-file + apply-chain pipeline
-        (``_edit_node_in_editor``).
+        (``_editor_splice_loop`` seeded with the extent).
       * anything else (the ``('md', …)`` / ``('refs', …)`` reference
         subtree, a stale id) — rejected with a flash; cross-file editing
         is a future ticket (the context menu's "Edit referenced file"
@@ -1955,7 +1996,64 @@ def _action_edit_section(ctx):
     node = fs.file_root if nid[0] == 'file' else fs.by_id.get(nid)
     if node is None:
         return
-    _edit_node_in_editor(ctx, path, node)
+    cap = _capture_extent(fs.text, node)
+    _editor_splice_loop(ctx, path, cap, cap.extent, 'replace')
+
+
+_INSERT_TEMPLATE = '## New section\n'
+
+
+def _action_insert_section(ctx):
+    """``a`` / ``i`` — insert a new section at a marker-chosen position.
+
+    Enters the framework's insert (marker) mode: the user places the
+    marker through the visible tree and confirms with enter, upon which
+    ``on_confirm(relation, dest_id)`` fires with ``relation`` ∈
+    ``'before'`` | ``'after'`` | ``'first'`` — mapping 1:1 onto
+    ``md2ansi_splice``'s ``where``. Esc cancels without a callback.
+    The body lives in ``_insert_section_at`` so the confirm path is
+    directly unit-testable.
+    """
+    ctx.insert('insert section', lambda relation, dest_id:
+               _insert_section_at(ctx, relation, dest_id))
+
+
+def _insert_section_at(ctx, relation, dest_id):
+    """Marker-confirm body: validate the anchor, then editor → apply chain.
+
+    Valid anchors (v1) are primary-file rows only: the per-file root
+    (``('file', path)`` — the root query ``/``, where ``'first'`` lands
+    after the preamble, ``'before'``/``'after'`` at the document's very
+    top/bottom) and its heading / text-run rows (``('content', path,
+    line)``). Reference-subtree rows (``('md', …)``), the References
+    umbrella (``('refs', …)``) and any stale id are rejected with a
+    flash. A ``'first'`` relation on a text run is rejected too — a text
+    run is a leaf with no child position.
+
+    ``$EDITOR`` opens a temp ``.md`` seeded with ``_INSERT_TEMPLATE``;
+    an unchanged template or empty content cancels, anything else goes
+    through the same capture + apply chain as ``E`` — anchored on
+    ``dest_id``'s node with ``where=relation`` — including the retry
+    dialog when the anchor changed underneath the editor. The stdin
+    document inserts into its in-memory copy.
+    """
+    if not (isinstance(dest_id, tuple) and dest_id
+            and dest_id[0] in ('file', 'content')):
+        ctx.flash('insert works on the primary document only — pick a '
+                  'file / heading / text row')
+        return
+    path = dest_id[1]
+    fs = _FILES.get(path)
+    if fs is None:
+        return
+    node = fs.file_root if dest_id[0] == 'file' else fs.by_id.get(dest_id)
+    if node is None:
+        return
+    if relation == 'first' and node.kind == 'text':
+        ctx.flash('cannot insert a child under a [text] run')
+        return
+    cap = _capture_extent(fs.text, node)
+    _editor_splice_loop(ctx, path, cap, _INSERT_TEMPLATE, relation)
 
 
 def _on_expand(ctx, ids):
@@ -1994,7 +2092,7 @@ def _on_expand(ctx, ids):
 # token, and a thin ``on_context_menu(ctx)`` ties the two together. Hotkey hints
 # are LITERAL text — menus don't parse ``&`` — so an entry duplicating a global
 # keybinding shows it in parens (``Edit at this line (E)``). The existing per-row
-# actions (E / V / M / m / Ctrl-R) are reused directly so the menu rows stay
+# actions (E / a / V / M / m / Ctrl-R) are reused directly so the menu rows stay
 # single-sourced with the keybindings. No clipboard rows (the values aren't
 # visible — paths / anchors surface via ``ctx.alert``). The menu is
 # read-only-friendly: a missing external tool flashes via ``run_external``'s own
@@ -2066,8 +2164,10 @@ def _cm_file_open_dir(ctx, path):
 def context_menu_file(ctx, item_id):
     """``(label, token)`` rows for a ``('file', path)`` per-file root.
 
-    Edit / View / Render duplicate the ``E`` / ``V`` / ``M`` actions, so their
-    rows carry the literal hotkey hint. "Re-scan all files" duplicates the
+    Edit / Insert / View / Render duplicate the ``E`` / ``a`` / ``V`` / ``M``
+    actions, so their rows carry the literal hotkey hint ("Insert here" enters
+    the same marker mode the keybinding does — the marker starts just below
+    the cursor row). "Re-scan all files" duplicates the
     framework's Ctrl-R reload, hinted likewise. "Show full path" is ALWAYS
     offered for a path-bearing row: the row title is the (relative) file label
     but the list renderer cell-cuts a long row WITHOUT inserting an ellipsis, so
@@ -2078,6 +2178,7 @@ def context_menu_file(ctx, item_id):
     """
     return [
         ('Edit file in $EDITOR (E)',          'file.edit'),
+        ('Insert here (a)',                   'file.insert'),
         ('View file in $PAGER (V)',           'file.view'),
         ('Render with mdcat (M)',             'file.mdcat'),
         ('Open containing dir in browse-fs',  'file.opendir'),
@@ -2129,14 +2230,16 @@ def _content_is_heading(item_id):
 def context_menu_content(ctx, item_id):
     """``(label, token)`` rows for a ``('content', path, line)`` row.
 
-    A heading or a text run. Edit / View / Render duplicate the ``E`` / ``V`` /
-    ``M`` actions (which act on the section's byte range), so their rows carry
-    the hotkey hint. "Show heading anchor" is offered only for a heading
+    A heading or a text run. Edit / Insert / View / Render duplicate the
+    ``E`` / ``a`` / ``V`` / ``M`` actions (edit / view act on the section's
+    byte range; insert enters marker mode), so their rows carry the hotkey
+    hint. "Show heading anchor" is offered only for a heading
     (``_content_is_heading``) — a text run has no anchor. Expand / Collapse
     reuse the framework's subtree-expand / collapse on the cursor row.
     """
     rows = [
-        ('Edit at this line (E)',        'content.edit'),
+        ('Edit section (E)',             'content.edit'),
+        ('Insert here (a)',              'content.insert'),
         ('View section in $PAGER (V)',   'content.view'),
         ('Render section via mdcat (M)', 'content.mdcat'),
     ]
@@ -2186,22 +2289,24 @@ def context_menu_ref(ctx, item_id):
 # the recipe's existing action handlers (``_action_edit_section`` /
 # ``_action_view_source`` / ``_action_md_preview`` / ``_action_toggle_md``),
 # which read ``ctx.cursor`` / ``ctx.targets`` themselves, so the menu rows stay
-# single-sourced with the E / V / M / m keybindings. "Re-scan all files" reuses
-# the framework's reload via ``ctx.refresh()`` — the same call the Ctrl-R action
+# single-sourced with the E / a / V / M / m keybindings. "Re-scan all files"
+# reuses the framework's reload via ``ctx.refresh()`` — the same call the Ctrl-R action
 # makes (a root refresh enqueues with ``reload=True`` → ``get_children(None,
 # reload=True)`` → ``_reparse`` + ``md_doc.clear_cache()``).
 
 
 _MENU_ACTIONS = {
-    # file root — reuse E / V / M, then open-dir / show-path / Ctrl-R reload.
+    # file root — reuse E / a / V / M, then open-dir / show-path / Ctrl-R reload.
     'file.edit':     lambda c, i: _action_edit_section(c),
+    'file.insert':   lambda c, i: _action_insert_section(c),
     'file.view':     lambda c, i: _action_view_source(c),
     'file.mdcat':    lambda c, i: _action_md_preview(c),
     'file.opendir':  lambda c, i: _cm_file_open_dir(c, i[1]),
     'file.path':     lambda c, i: c.alert(i[1], title='path'),
     'file.rescan':   lambda c, i: c.refresh(),
-    # heading / text run — reuse E / V / M, anchor pop-up, expand / collapse.
+    # heading / text run — reuse E / a / V / M, anchor pop-up, expand / collapse.
     'content.edit':     lambda c, i: _action_edit_section(c),
+    'content.insert':   lambda c, i: _action_insert_section(c),
     'content.view':     lambda c, i: _action_view_source(c),
     'content.mdcat':    lambda c, i: _action_md_preview(c),
     'content.anchor':   lambda c, i: _cm_content_anchor(c, i),
@@ -2311,13 +2416,18 @@ browse-md — markdown browser for one or more files.
           file and re-applies it via a hash-verified splice, so a
           file that changed underneath the editor is never corrupted.
           The stdin document applies to its in-memory copy.
+  a / i   Insert a new section: place the marker (arrows; enter
+          confirms, esc cancels), then ``$EDITOR`` opens a template —
+          save it to splice the section in at the marker (same
+          conflict-safe apply as E; stdin stays in-memory).
   Ctrl-R  Re-slurp every input file and rebuild the tree.
 
 Right-click a row (or the backslash / F1 keys) for a menu keyed to its
-kind: a file row edits / views / renders the file, opens its dir in
+kind: a file row edits / inserts / views / renders, opens its dir in
 browse-fs, shows its path, or re-scans; a heading / text row acts on the
-section, shows the heading anchor, and expands / collapses; a cross-file
-reference opens / edits the referenced file and shows its resolved path.\
+section, inserts, shows the heading anchor, and expands / collapses; a
+cross-file reference opens / edits the referenced file and shows its
+resolved path.\
 """
 
 
@@ -2647,6 +2757,14 @@ def main():
                           _action_view_source, 'none'))
     actions.append(Action('E', 'Edit section under cursor in $EDITOR',
                           _action_edit_section, 'none'))
+    # ``a`` and ``i`` are the same insert action (vim's two spellings of
+    # "add here") — both enter the framework's marker mode; the splice
+    # happens on marker confirm. Help shows one row (the ``i`` alias's
+    # description is blank, matching how the framework collapses paired
+    # default keys).
+    actions.append(Action('a', 'Insert new section at marker',
+                          _action_insert_section, 'none'))
+    actions.append(Action('i', '', _action_insert_section, 'none'))
     # The built-in Right-arrow (``_nav_right``) handles expand and
     # step-into-first-child; the lone-heading auto-expand rides the
     # ``on_expand`` hook below so it fires for every expansion source,

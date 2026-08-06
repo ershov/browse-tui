@@ -500,5 +500,71 @@ class TestBrowseMdEditSection(unittest.TestCase):
                 t.send('q')
 
 
+class TestBrowseMdInsertSection(unittest.TestCase):
+    """``a`` inserts a new section at the marker through ``$EDITOR``.
+
+    End-to-end against the shipped binary: pressing ``a`` on a heading
+    row enters marker mode (the ``-- insert section --`` marker row
+    renders below the cursor), Enter confirms the default gap (sibling
+    after the cursor row), and the scripted ``$EDITOR`` replaces the
+    template with a fixed new section — exercising marker mode, the
+    template seed, the splice, the write-back and the cursor landing on
+    the new row. Asserted on the re-rendered pane AND the exact bytes on
+    disk.
+    """
+
+    _DOC = (
+        '# Alpha\n'
+        '\n'
+        'alpha body\n'
+        '\n'
+        '## Section Two\n'
+        '\n'
+        'section two body\n'
+    )
+    _NEW = '## Section Three\n\nINSERTED BODY LINE\n'
+
+    def test_insert_after_heading_via_marker_and_editor_script(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = os.path.join(tmp, 'doc.md')
+            with open(doc, 'w') as f:
+                f.write(self._DOC)
+            ed = os.path.join(tmp, 'fake-editor')
+            with open(ed, 'w') as f:
+                f.write('#!/bin/sh\n'
+                        'cat > "$1" <<\'EOF\'\n'
+                        '## Section Three\n'
+                        '\n'
+                        'INSERTED BODY LINE\n'
+                        'EOF\n')
+            os.chmod(ed, 0o755)
+            with TmuxFixture(cols=100, rows=40) as t:
+                line = 'EDITOR={ed} {bin} --run-py {recipe} {doc}'.format(
+                    ed=shlex.quote(ed),
+                    bin=shlex.quote(_BIN),
+                    recipe=shlex.quote(_RECIPE),
+                    doc=shlex.quote(doc),
+                )
+                t.send_line(line)
+                t.wait_for('Section Two', timeout=6.0)
+                t.send('Down')   # file root -> [h1] Alpha
+                t.send('Down')   # -> [text] alpha body
+                t.send('Down')   # -> [h2] Section Two
+                t.send('a')
+                # Marker mode is on: the labelled marker row renders.
+                t.wait_for('insert section', timeout=4.0)
+                # Confirm the default gap — sibling right after the
+                # cursor row → relation 'after' on Section Two.
+                t.send('Enter')
+                # Editor script runs, the splice lands, the tree
+                # refreshes and the cursor lands on the new section.
+                t.wait_for('Section Three', timeout=6.0)
+                t.wait_for('INSERTED BODY LINE', timeout=6.0)
+                with open(doc) as f:
+                    final = f.read()
+                self.assertEqual(final, self._DOC + self._NEW)
+                t.send('q')
+
+
 if __name__ == '__main__':
     unittest.main()

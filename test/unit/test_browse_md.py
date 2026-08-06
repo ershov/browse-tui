@@ -1427,7 +1427,7 @@ class TestRunSourceCommand(unittest.TestCase):
 
     def test_empty_targets_noop(self):
         ctx = _SrcCmdCtx(targets=[])
-        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.r._run_source_command(ctx)
         self.assertEqual(ctx.calls, [])
 
     def test_root_only_opens_original_path(self):
@@ -1435,7 +1435,7 @@ class TestRunSourceCommand(unittest.TestCase):
         # default split + that path. No tempfile.
         root = _SrcItem(id=('file', self.path), kind='root')
         ctx = _SrcCmdCtx(targets=[root])
-        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.r._run_source_command(ctx)
         self.assertEqual(ctx.calls, [['less', '-R', self.path]])
 
     def test_single_root_cursor_only_opens_file(self):
@@ -1447,7 +1447,7 @@ class TestRunSourceCommand(unittest.TestCase):
         import os
         root = _SrcItem(id=('file', self.path), kind='root')
         ctx = _SrcCmdCtx(targets=[root])
-        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.r._run_source_command(ctx)
         self.assertEqual(ctx.calls, [['less', '-R', self.path]])
         # No tempfile was produced — last argv is the original path.
         argv = ctx.calls[0]
@@ -1462,7 +1462,7 @@ class TestRunSourceCommand(unittest.TestCase):
         # cursor.
         root = _SrcItem(id=('file', self.path), kind='root')
         ctx = _SrcCmdCtx(targets=[root])
-        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.r._run_source_command(ctx)
         self.assertEqual(ctx.calls, [['less', '-R', self.path]])
 
     def test_root_mixed_with_non_root_combines_into_tempfile(self):
@@ -1474,7 +1474,7 @@ class TestRunSourceCommand(unittest.TestCase):
         leaf = _SrcItem(id=('content', self.path, 3), kind='heading',
                         byte_offset=0, byte_size=5)
         ctx = _SrcCmdCtx(targets=[leaf, root])
-        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.r._run_source_command(ctx)
         # Exactly one call; last argv is the tempfile path with .md.
         self.assertEqual(len(ctx.calls), 1)
         argv = ctx.calls[0]
@@ -1488,7 +1488,7 @@ class TestRunSourceCommand(unittest.TestCase):
         leaf = _SrcItem(id=('content', self.path, 2), kind='heading',
                         byte_offset=10, byte_size=5)
         ctx = _SrcCmdCtx(targets=[leaf])
-        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.r._run_source_command(ctx)
         # Exactly one call; last argv is the tempfile path with .md.
         self.assertEqual(len(ctx.calls), 1)
         argv = ctx.calls[0]
@@ -1510,7 +1510,7 @@ class TestRunSourceCommand(unittest.TestCase):
                      byte_offset=20, byte_size=5)  # 'EEEE\n'
         # Out of file order.
         ctx = _SrcCmdCtx(targets=[c, a, b])
-        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.r._run_source_command(ctx)
         self.assertEqual(len(ctx.calls), 1)
         # Expected: file order, no duplication.
         self.assertEqual(ctx.last_tmp_contents, 'AAAA\nCCCC\nEEEE\n')
@@ -1523,7 +1523,7 @@ class TestRunSourceCommand(unittest.TestCase):
         b = _SrcItem(id=('content', self.path, 1), kind='heading',
                      byte_offset=5, byte_size=10)   # 'BBBB\nCCCC\n'
         ctx = _SrcCmdCtx(targets=[a, b])
-        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.r._run_source_command(ctx)
         # Merged range covers bytes 0..15 — one contiguous slice.
         self.assertEqual(ctx.last_tmp_contents, 'AAAA\nBBBB\nCCCC\n')
 
@@ -1535,7 +1535,7 @@ class TestRunSourceCommand(unittest.TestCase):
         leaf = _SrcItem(id=('content', self.path, 0), kind='heading',
                         byte_offset=0, byte_size=5)
         ctx = _SrcCmdCtx(targets=[leaf])
-        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.r._run_source_command(ctx)
         argv = ctx.calls[0]
         self.assertFalse(os.path.exists(argv[2]))
 
@@ -1548,7 +1548,7 @@ class TestRunSourceCommand(unittest.TestCase):
             leaf = _SrcItem(id=('content', self.path, 0), kind='heading',
                             byte_offset=0, byte_size=5)
             ctx = _SrcCmdCtx(targets=[leaf])
-            self.r._run_source_command(ctx, 'PAGER', 'less -R')
+            self.r._run_source_command(ctx)
             argv = ctx.calls[0]
             self.assertEqual(argv[:2], ['bat', '--paging=always'])
         finally:
@@ -1570,7 +1570,7 @@ class TestRunSourceCommand(unittest.TestCase):
         b = _SrcItem(id=('content', self.path, 2), kind='heading',
                      byte_offset=10, byte_size=5)   # 'CCCC\n'
         ctx = _SrcCmdCtx(targets=[a, b])
-        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.r._run_source_command(ctx)
         # Exactly one PAGER invocation on a tempfile (last argv).
         self.assertEqual(len(ctx.calls), 1)
         argv = ctx.calls[0]
@@ -1588,7 +1588,7 @@ class TestRunSourceCommand(unittest.TestCase):
         # original file directly — no tempfile, no AttributeError.
         pseudo = _ScopeRootPseudoItem(id=('file', self.path))
         ctx = _SrcCmdCtx(targets=[pseudo])
-        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.r._run_source_command(ctx)
         self.assertEqual(ctx.calls, [['less', '-R', self.path]])
 
     def test_scope_root_pseudo_item_mixed_with_non_root_combines(self):
@@ -1600,7 +1600,7 @@ class TestRunSourceCommand(unittest.TestCase):
         leaf = _SrcItem(id=('content', self.path, 3), kind='heading',
                         byte_offset=0, byte_size=5)
         ctx = _SrcCmdCtx(targets=[leaf, pseudo])
-        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.r._run_source_command(ctx)
         self.assertEqual(len(ctx.calls), 1)
         argv = ctx.calls[0]
         self.assertEqual(argv[:2], ['less', '-R'])
@@ -1793,10 +1793,11 @@ class TestHelpIntro(unittest.TestCase):
         self.assertIn('#anchor', self.r._HELP_USAGE)
 
     def test_mentions_each_custom_action(self):
-        # All four custom action keys should be discoverable from the
+        # Every custom action key should be discoverable from the
         # intro (the keys are bound on the action rows below it, but
-        # the intro gives the one-liner).
-        for key in ('m', 'M', 'V', 'E'):
+        # the intro gives the one-liner). ``a`` covers the ``a / i``
+        # insert pair (one shared line).
+        for key in ('m', 'M', 'V', 'E', 'a'):
             with self.subTest(key=key):
                 # Bound as a word in the format ``  m`` / ``  M`` etc.
                 # at start of an indented line — search for "  KEY ".
@@ -3015,7 +3016,7 @@ class TestRunSourceCommandMulti(_MultiCaseBase):
         self._load_multi(self.path_a, self.path_b)
         b_root = self.r._FILES[self.path_b].file_root
         ctx = _SrcCmdCtx(targets=[b_root])
-        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.r._run_source_command(ctx)
         self.assertEqual(ctx.calls, [['less', '-R', self.path_b]])
 
     def test_two_roots_combines_with_headers(self):
@@ -3030,7 +3031,7 @@ class TestRunSourceCommandMulti(_MultiCaseBase):
         b_root = self.r._FILES[self.path_b].file_root
         # Selection order reversed — argv order is what matters.
         ctx = _SrcCmdCtx(targets=[b_root, a_root])
-        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.r._run_source_command(ctx)
         self.assertEqual(len(ctx.calls), 1)
         argv = ctx.calls[0]
         self.assertEqual(argv[:2], ['less', '-R'])
@@ -3056,7 +3057,7 @@ class TestRunSourceCommandMulti(_MultiCaseBase):
         a_h1 = self.r._BY_ID[('content', self.path_a, 0)]
         a_h1b = self.r._BY_ID[('content', self.path_a, 3)]
         ctx = _SrcCmdCtx(targets=[a_h1b, a_h1])
-        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.r._run_source_command(ctx)
         self.assertEqual(len(ctx.calls), 1)
         # File-order: A1 slice first, then A1b slice. Together they
         # cover the whole A file (A1 spans to A1b, A1b spans to EOF).
@@ -3073,7 +3074,7 @@ class TestRunSourceCommandMulti(_MultiCaseBase):
         a_h1 = self.r._BY_ID[('content', self.path_a, 0)]
         b_h1 = self.r._BY_ID[('content', self.path_b, 0)]
         ctx = _SrcCmdCtx(targets=[b_h1, a_h1])
-        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.r._run_source_command(ctx)
         self.assertEqual(len(ctx.calls), 1)
         out = ctx.last_tmp_contents
         # Both files' headings are present.
@@ -3101,7 +3102,7 @@ class TestRunSourceCommandMulti(_MultiCaseBase):
         a_h1 = self.r._BY_ID[('content', self.path_a, 0)]
         b_h1 = self.r._BY_ID[('content', self.path_b, 0)]
         ctx = _SrcCmdCtx(targets=[b_h1, a_h1])
-        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.r._run_source_command(ctx)
         out = ctx.last_tmp_contents
         # A's content comes first.
         self.assertLess(out.find('# A1'), out.find('# B1'))
@@ -3115,7 +3116,7 @@ class TestRunSourceCommandMulti(_MultiCaseBase):
         a_root = self.r._FILES[self.path_a].file_root
         a_h1 = self.r._BY_ID[('content', self.path_a, 0)]
         ctx = _SrcCmdCtx(targets=[a_root, a_h1])
-        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.r._run_source_command(ctx)
         self.assertEqual(len(ctx.calls), 1)
         argv = ctx.calls[0]
         self.assertTrue(argv[-1].endswith('.md'))
@@ -3137,7 +3138,7 @@ class TestRunSourceCommandMulti(_MultiCaseBase):
         a_root = self.r._FILES[self.path_a].file_root
         b_h1 = self.r._BY_ID[('content', self.path_b, 0)]
         ctx = _SrcCmdCtx(targets=[a_root, b_h1])
-        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.r._run_source_command(ctx)
         self.assertEqual(len(ctx.calls), 1)
         argv = ctx.calls[0]
         self.assertTrue(argv[-1].endswith('.md'))
@@ -4816,7 +4817,7 @@ class TestStdinDocument(unittest.TestCase):
         self._run_main('# Title\n## Section\nbody\n')
         root = _SrcItem(id=('file', self.r._STDIN_PATH), kind='root')
         ctx = _SrcCmdCtx(targets=[root])
-        self.r._run_source_command(ctx, 'PAGER', 'less -R')
+        self.r._run_source_command(ctx)
         self.assertEqual(ctx.calls, [],
                          'no external tool should run for stdin')
         self.assertEqual(len(ctx.flashes), 1)
@@ -5150,16 +5151,19 @@ class TestApplySplice(unittest.TestCase):
 
 
 class _EditCtx:
-    """Recorder ctx for the ``_action_edit_section`` flow tests.
+    """Recorder ctx for the ``E`` / ``a`` (edit / insert) flow tests.
 
-    Mirrors the Context surface the action touches — ``cursor``,
+    Mirrors the Context surface the actions touch — ``cursor``,
     ``run_external`` (the ``$EDITOR`` seam: ``editor(path, call_no)``
     plays the user's edit by rewriting the temp file, returning the
     editor's exit code, ``None`` meaning 0), ``confirm`` (scripted
     answers, ``None`` when the script runs out — the headless default),
-    plus ``flash`` / ``log`` / ``refresh`` recorders. ``selected`` exists
-    (and must stay ignored by ``E``) so the selection-ignored test can
-    populate it.
+    ``insert`` (records the marker-mode entry and stashes ``on_confirm``
+    for the test to fire), ``cursor_to`` and ``refresh`` (the latter
+    invoking ``on_complete`` synchronously, as the real Pending would
+    once the reload lands), plus ``flash`` / ``log`` recorders.
+    ``selected`` exists (and must stay ignored by ``E``) so the
+    selection-ignored test can populate it.
     """
 
     def __init__(self, cursor=None, editor=None, confirms=()):
@@ -5172,6 +5176,9 @@ class _EditCtx:
         self.logs = []
         self.refreshes = 0
         self.confirm_prompts = []
+        self.cursor_tos = []
+        self.insert_labels = []
+        self.on_confirm = None       # stashed by ``insert``
 
     def run_external(self, cmd):
         self.calls.append(list(cmd))
@@ -5183,6 +5190,10 @@ class _EditCtx:
         self.confirm_prompts.append(message)
         return self.confirms.pop(0) if self.confirms else None
 
+    def insert(self, label, on_confirm):
+        self.insert_labels.append(label)
+        self.on_confirm = on_confirm
+
     def flash(self, text, log=False):
         self.flashes.append(text)
         if log:
@@ -5193,6 +5204,11 @@ class _EditCtx:
 
     def refresh(self, id=None, on_complete=None):
         self.refreshes += 1
+        if on_complete is not None:
+            on_complete()
+
+    def cursor_to(self, id, on_complete=None):
+        self.cursor_tos.append(id)
 
 
 def _rewrite(path, text):
@@ -5478,6 +5494,212 @@ class TestEditSectionStdin(unittest.TestCase):
         self.assertEqual(self.r._STDIN_TEXT, '# Rewritten\nnew body\n')
         self.assertIn('applied to in-memory copy - not saved to disk',
                       ctx.flashes)
+
+
+class TestInsertSectionAction(unittest.TestCase):
+    """``a`` / ``i`` (``_insert_section_at``) — marker insert flow.
+
+    Same fixture + recorder-ctx approach as TestEditSectionAction; the
+    marker confirm is driven directly (``_insert_section_at``) or through
+    the stashed ``on_confirm`` (``_action_insert_section``), since
+    headless marker mode never fires the callback itself.
+    """
+
+    _DOC = ('# Alpha\nalpha body\n'
+            '## Sub\nsub body\n'
+            '# Beta\nbeta body\n')
+    _NEW = '## Added\nadded body\n'
+
+    def setUp(self):
+        import tempfile
+        self.r = _load_recipe()
+        fd, self.path = tempfile.mkstemp(suffix='.md')
+        os.close(fd)
+        _rewrite(self.path, self._DOC)
+        self.r._INPUT_FILES = [(self.path, '')]
+        self.r._reparse()
+        self._editor_saved = os.environ.get('EDITOR')
+        os.environ['EDITOR'] = 'fake-ed'
+
+    def tearDown(self):
+        if self._editor_saved is None:
+            os.environ.pop('EDITOR', None)
+        else:
+            os.environ['EDITOR'] = self._editor_saved
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+    def _write_new(self, tmp, n):
+        _rewrite(tmp, self._NEW)
+
+    def test_action_enters_marker_mode_and_routes_confirm(self):
+        # The keybinding half: ``_action_insert_section`` enters marker
+        # mode; firing the stashed on_confirm runs the whole pipeline.
+        ctx = _EditCtx(editor=self._write_new)
+        self.r._action_insert_section(ctx)
+        self.assertEqual(ctx.insert_labels, ['insert section'])
+        self.assertEqual(ctx.calls, [])          # nothing until confirm
+        ctx.on_confirm('after', ('content', self.path, 4))
+        self.assertEqual(_read(self.path), self._DOC + self._NEW)
+
+    def test_insert_after_heading(self):
+        payloads = []
+
+        def ed(tmp, n):
+            payloads.append(_read(tmp))
+            _rewrite(tmp, self._NEW)
+
+        ctx = _EditCtx(editor=ed)
+        self.r._insert_section_at(ctx, 'after', ('content', self.path, 4))
+        # The editor was seeded with the template, not an extent…
+        self.assertEqual(payloads, [self.r._INSERT_TEMPLATE])
+        # …the new section landed after Beta (EOF), the mutation was
+        # logged with its relation, and the cursor lands on the new row.
+        self.assertEqual(_read(self.path), self._DOC + self._NEW)
+        self.assertTrue(any('inserted section (after)' in line
+                            for line in ctx.logs), msg=f'logs: {ctx.logs}')
+        self.assertEqual(ctx.refreshes, 1)
+        self.assertEqual(ctx.cursor_tos, [('content', self.path, 6)])
+
+    def test_insert_before_heading(self):
+        ctx = _EditCtx(editor=self._write_new)
+        self.r._insert_section_at(ctx, 'before', ('content', self.path, 4))
+        self.assertEqual(
+            _read(self.path),
+            '# Alpha\nalpha body\n## Sub\nsub body\n'
+            '## Added\nadded body\n'
+            '# Beta\nbeta body\n')
+        self.assertEqual(ctx.cursor_tos, [('content', self.path, 4)])
+
+    def test_insert_first_under_heading(self):
+        # 'first' = child position: right after Alpha's text run, before
+        # its first sub-heading.
+        ctx = _EditCtx(editor=self._write_new)
+        self.r._insert_section_at(ctx, 'first', ('content', self.path, 0))
+        self.assertEqual(
+            _read(self.path),
+            '# Alpha\nalpha body\n'
+            '## Added\nadded body\n'
+            '## Sub\nsub body\n'
+            '# Beta\nbeta body\n')
+        self.assertEqual(ctx.cursor_tos, [('content', self.path, 2)])
+
+    def test_insert_first_on_file_root_lands_after_preamble(self):
+        # The file root maps onto the root query '/'; this doc has a
+        # zero-width preamble, so 'first' inserts at the very top.
+        ctx = _EditCtx(editor=self._write_new)
+        self.r._insert_section_at(ctx, 'first', ('file', self.path))
+        self.assertEqual(_read(self.path), self._NEW + self._DOC)
+        self.assertEqual(ctx.cursor_tos, [('content', self.path, 0)])
+
+    def test_template_unchanged_cancels(self):
+        ctx = _EditCtx()                         # editor leaves temp as-is
+        self.r._insert_section_at(ctx, 'after', ('content', self.path, 4))
+        self.assertEqual(_read(self.path), self._DOC)
+        self.assertEqual(ctx.refreshes, 0)
+        self.assertIn('insert cancelled (content unchanged)', ctx.flashes)
+
+    def test_empty_content_cancels(self):
+        ctx = _EditCtx(editor=lambda tmp, n: _rewrite(tmp, '\n \n'))
+        self.r._insert_section_at(ctx, 'after', ('content', self.path, 4))
+        self.assertEqual(_read(self.path), self._DOC)
+        self.assertIn('insert cancelled (empty content)', ctx.flashes)
+
+    def test_reference_anchors_rejected(self):
+        anchor = ('file', self.path)
+        for rid in (('md', anchor, ('/other.md',), 0),
+                    ('md', anchor, ('/other.md',), None),
+                    ('refs', anchor, ()),
+                    None):
+            ctx = _EditCtx(editor=self._write_new)
+            self.r._insert_section_at(ctx, 'after', rid)
+            self.assertEqual(ctx.calls, [], msg=f'rid: {rid}')
+            self.assertTrue(
+                ctx.flashes and
+                ctx.flashes[0].startswith('insert works on the primary'),
+                msg=f'rid: {rid}, flashes: {ctx.flashes}')
+        self.assertEqual(_read(self.path), self._DOC)
+
+    def test_first_on_text_run_rejected(self):
+        # A text run is a leaf — no child position exists under it.
+        ctx = _EditCtx(editor=self._write_new)
+        self.r._insert_section_at(ctx, 'first', ('content', self.path, 1))
+        self.assertEqual(ctx.calls, [])
+        self.assertIn('cannot insert a child under a [text] run',
+                      ctx.flashes)
+        self.assertEqual(_read(self.path), self._DOC)
+
+    def test_text_run_before_after_still_valid(self):
+        # before/after ARE valid on a text run (its range addresses it).
+        ctx = _EditCtx(editor=self._write_new)
+        self.r._insert_section_at(ctx, 'after', ('content', self.path, 1))
+        self.assertEqual(
+            _read(self.path),
+            '# Alpha\nalpha body\n'
+            '## Added\nadded body\n'
+            '## Sub\nsub body\n'
+            '# Beta\nbeta body\n')
+
+    def test_anchor_shifted_underneath_applies_by_hash(self):
+        # OTHER regions change while the editor is open — the anchor is
+        # re-found by hash and the insert still lands after it.
+        def ed(tmp, n):
+            _rewrite(self.path, '# Zero\nzero body\n' + self._DOC)
+            _rewrite(tmp, self._NEW)
+
+        ctx = _EditCtx(editor=ed)
+        self.r._insert_section_at(ctx, 'after', ('content', self.path, 4))
+        self.assertEqual(_read(self.path),
+                         '# Zero\nzero body\n' + self._DOC + self._NEW)
+
+    def test_conflict_cancel_leaves_file_alone(self):
+        # The ANCHOR section itself diverged underneath the editor →
+        # dialog; "Cancel insert" discards.
+        conflicted = ('# Alpha\nalpha body\n## Sub\nsub body\n'
+                      '# Beta\nDIVERGED\n')
+
+        def ed(tmp, n):
+            _rewrite(self.path, conflicted)
+            _rewrite(tmp, self._NEW)
+
+        ctx = _EditCtx(editor=ed, confirms=[False])
+        self.r._insert_section_at(ctx, 'after', ('content', self.path, 4))
+        self.assertEqual(_read(self.path), conflicted)
+        self.assertEqual(len(ctx.confirm_prompts), 1)
+        self.assertIn('insert cancelled', ctx.flashes)
+
+
+class TestInsertSectionStdin(unittest.TestCase):
+    """``a`` / ``i`` on the stdin document — in-memory insert."""
+
+    _DOC = '# Piped\nintro body\n## Inner\ninner body\n'
+
+    def setUp(self):
+        self.r = _load_recipe()
+        self.r._STDIN_TEXT = self._DOC
+        self.r._INPUT_FILES = [(self.r._STDIN_PATH, '')]
+        self.r._reparse()
+        self._editor_saved = os.environ.get('EDITOR')
+        os.environ['EDITOR'] = 'fake-ed'
+
+    def tearDown(self):
+        if self._editor_saved is None:
+            os.environ.pop('EDITOR', None)
+        else:
+            os.environ['EDITOR'] = self._editor_saved
+
+    def test_insert_applies_in_memory(self):
+        path = self.r._STDIN_PATH
+        ctx = _EditCtx(editor=lambda tmp, n: _rewrite(
+            tmp, '## Added\nadded body\n'))
+        self.r._insert_section_at(ctx, 'after', ('content', path, 2))
+        self.assertEqual(self.r._STDIN_TEXT,
+                         self._DOC + '## Added\nadded body\n')
+        self.assertIn('applied to in-memory copy - not saved to disk',
+                      ctx.flashes)
+        self.assertFalse(os.path.exists(path))
 
 
 if __name__ == '__main__':
