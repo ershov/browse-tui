@@ -1579,6 +1579,16 @@ def _handle_insert_key(browser, ctx: 'Context', key: str) -> bool:
                 if (above.item.has_children
                         and above.item.id not in state.expanded):
                     state.expanded.add(above.item.id)
+                    # Queue the children fetch exactly like ``_do_expand``
+                    # would (no-op when cached / already in flight). A raw
+                    # ``expanded.add`` renders the loading placeholder but
+                    # requests nothing, stranding the subtree on it forever
+                    # — the ``_notify`` drain below applies deliveries
+                    # fine, there just would be none. We run on the main
+                    # thread (key dispatch), which is the helper's
+                    # contract; the single-id caller wakes the worker.
+                    browser._ensure_children_fetched(above.item.id)
+                    browser._children_event.set()
                     mark_visible_dirty(state)
                     # Refresh the visible list and find above's new index;
                     # position the marker right after it so it lands at

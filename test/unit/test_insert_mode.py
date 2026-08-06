@@ -234,6 +234,59 @@ class TestInsertKeyIndentOutdent(unittest.TestCase):
         self.assertEqual(self.b._insert_pos, 3)
 
 
+class TestInsertKeyIndentFetch(unittest.TestCase):
+    """Right-indent auto-expand must QUEUE the children fetch.
+
+    Indenting under a collapsed node whose children are NOT cached
+    auto-expands it — and must request the fetch exactly like
+    ``_do_expand`` does (pending + loading + queue entry). A raw
+    ``expanded.add`` renders the ``⧗ loading…`` placeholder but
+    requests nothing, stranding the subtree on it forever: the
+    ``_notify`` drain applies deliveries fine, there just are none.
+    """
+
+    def setUp(self):
+        self.b = Browser(BrowserConfig(
+            _headless=False,
+            get_children=lambda nid: [],
+        ))
+        st = self.b._state
+        # 'p' advertises children but has none cached — the async-fetch
+        # shape (from_flat_tree pre-caches, which would mask the bug).
+        st._children[st.root_id] = [
+            _data.to_item({'id': 'p', 'has_children': True}),
+            _data.to_item({'id': 'q'}),
+        ]
+        _state.mark_visible_dirty(st)
+        st.cursor = 0
+        ctx = Context(self.b)
+        ctx.insert('create', lambda r, d: None)
+        self.ctx = ctx
+
+    def tearDown(self):
+        self.b.stop_workers()
+
+    def test_indent_expand_queues_children_fetch(self):
+        st = self.b._state
+        # Marker starts at gap 1 — directly below the collapsed 'p'.
+        _handle_insert_key(self.b, self.ctx, 'right')
+        self.assertIn('p', st.expanded)
+        # The workers aren't running in this fixture, so a correctly
+        # queued fetch is observable and deterministic.
+        self.assertIn('p', st._children_pending)
+        self.assertTrue(st._loading.get('p'))
+        self.assertIn(('p', False), self.b._children_queue)
+
+    def test_indent_expand_with_cached_children_queues_nothing(self):
+        st = self.b._state
+        st._children['p'] = [_data.to_item({'id': 'p1'})]
+        _handle_insert_key(self.b, self.ctx, 'right')
+        self.assertIn('p', st.expanded)
+        # Cached — no fetch, and the marker dove into the subtree.
+        self.assertNotIn('p', st._children_pending)
+        self.assertEqual(self.b._insert_depth, 1)
+
+
 class TestInsertKeyConfirmCancel(unittest.TestCase):
 
     def setUp(self):
