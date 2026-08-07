@@ -1,6 +1,7 @@
 # browse-md edit/insert + md_doc reduction — design
 
-Date: 2026-08-06. Status: agreed, ready to implement.
+Date: 2026-08-06. Status: implemented (v1); cross-document addendum of
+2026-08-07 in progress — see the final section.
 
 ## Motivation
 
@@ -184,3 +185,58 @@ the existing convention): `Edit section (E)`, `Insert here (a)`.
   (the open-by-key path is not pty-triggerable).
 * Full `./run-tests-parallel.sh` before merge (UI tests spawn the real
   binary; scoped runs hide rendering regressions).
+
+## Addendum (2026-08-07): cross-document edit / insert / move
+
+v1 scoped `E` / `a` / `x` (the `x` move landed post-v1, same machinery) to
+primary-file rows. This addendum extends all three to the `[md]`
+reference-subtree rows — and, for move, across documents. The apply chain
+is UNCHANGED; what changes is row routing and, for move only, a two-file
+transaction.
+
+### Row → document resolution (one helper)
+
+A single helper maps any file-backed row id to `(path, text, node)`:
+
+* `('file', path)` → the primary file's root (`fs.file_root`, `fs.text`).
+* `('content', path, line)` → `fs.by_id`, as today.
+* `('md', anchor, chain, None)` → the referenced doc's root:
+  `path = chain[-1]`, `(text, doc) = _md_chain_doc(anchor, chain)`.
+* `('md', anchor, chain, line)` → the heading / text run:
+  `md_doc.node_at_line(doc.tree, line)` over the same `_md_chain_doc`.
+
+The References umbrella (`('refs', …)`), launcher rows and stale ids stay
+rejected. Capture text for md rows comes from the `get_doc` cache —
+staleness is SAFE because the apply chain re-reads the file fresh and
+hash-verifies before any write (that is the chain's whole purpose).
+
+### Edit / insert on reference rows
+
+* `E` on an md heading / text row: the same temp-file pipeline, persisted
+  to `chain[-1]`. `E` on the md-doc ROOT row: in-place `$EDITOR` on the
+  referenced file + refresh (parity with primary file roots; aliases the
+  context menu's "Edit referenced file").
+* `a` anchored on md rows: same pipeline, `where=relation`; the md-doc
+  root row takes the root-`/` arm. Cursor landing constructs the
+  `('md', anchor, chain, line)` id (best-effort, as today).
+* The md context menu gains the section rows (`Edit section (E)` /
+  `Insert here (a)` / `Move section (x)`) for heading / text rows,
+  single-sourced with the keybindings.
+
+### Cross-document move
+
+`x`'s source and destination may now be rows of DIFFERENT documents
+(primary or referenced, stdin included via the path-sentinel
+read/persist):
+
+* Same document → the existing single-surgery path, no-op rule intact.
+* Different documents → resolve BOTH endpoints against fresh reads of the
+  two documents FIRST (any failure → flash, nothing written); then write
+  the DESTINATION insert, then the SOURCE cut. An interruption between
+  the two writes leaves a duplicate, never a loss. The block keeps the
+  trailing-newline guarantee; the within-extent no-op rule cannot apply
+  across documents by construction.
+
+### Non-goals (unchanged)
+
+Releveling; frontmatter rows; any `md2ansi_lib.py` change.
