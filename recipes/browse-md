@@ -67,11 +67,14 @@ Custom actions on top of the framework defaults:
   x   move the section under the cursor: the row highlights (the
       selection is re-pointed at it), the placement marker picks the
       destination, and the extent's bytes are cut + re-inserted
-      verbatim — a PHYSICAL move, no releveling. Both endpoints are
-      re-addressed in the current document by the same hash-verified
-      chain as ``E``, so a document that changed underneath the
-      marker flashes instead of corrupting. Anchors are primary-
-      document rows only, same file only; stdin moves stay in-memory.
+      verbatim — a PHYSICAL move, no releveling. Sections move within
+      OR across documents (any file-backed row anchors the marker,
+      reference rows included); endpoints are re-addressed against
+      fresh reads by the same hash-verified chain as ``E``, so a
+      document that changed underneath the marker flashes instead of
+      corrupting. A cross-document move writes the destination insert
+      before the source cut (an interruption leaves a duplicate,
+      never a loss); stdin moves stay in-memory.
   →   expand the cursor row (overrides the framework default); when
       the row is a file whose only child is a heading, that heading
       is auto-expanded too, so a single-heading document reveals its
@@ -1762,10 +1765,11 @@ def _action_view_source(ctx):
 # acted-on row through ONE row→document mapping (``_row_document``), so they
 # serve primary-file rows and ``[md]`` reference-subtree rows alike — a
 # reference row's section edit / insert persists to the referenced file
-# itself. ``x`` moves a section without an editor: both endpoints are
-# re-addressed by the same chain (``_resolve_capture``) and the extent is
-# physically cut and re-inserted in one string operation
-# (``_apply_section_move``); its anchors are still primary-document rows.
+# itself. ``x`` moves a section without an editor, within or across
+# documents: both endpoints are re-addressed by the same chain
+# (``_resolve_capture``); a same-document move is one string surgery
+# (``_apply_section_move``), a cross-document one persists the destination
+# insert before the source cut (``_apply_cross_document_move``).
 
 
 # The at-action-time address of a section extent, consumed by
@@ -2223,6 +2227,8 @@ def _move_surgery(text, src_t, ins):
 def _apply_section_move(path, src_cap, dest_cap, relation):
     """Re-address both ends of a move in the CURRENT document, cut + paste.
 
+    The SAME-document arm — both captures live in ``path``'s document
+    (``_apply_cross_document_move`` is the two-document sibling).
     Returns ``(status, new_text, line)``. Status ``'ok'`` carries the new
     document text and the moved section's new 0-based start line (the
     cursor-landing row id); the non-moves carry ``(None, 0)``:
@@ -2257,74 +2263,145 @@ def _action_move_section(ctx):
     destination (``'move here'``); the cut happens on confirm. Esc cancels
     without a callback, which leaves the highlight in place — harmless (it
     still shows what was about to move) and replaced by the next move /
-    selection gesture. Movable rows are the primary document's heading /
-    text runs; file roots and reference rows flash. The move is PHYSICAL:
-    the extent's bytes relocate verbatim, heading levels are not adjusted
-    to the new surroundings.
+    selection gesture. Movable rows are the heading / text runs of any
+    file-backed document — primary (``('content', …)``) or inside a
+    referenced file (``('md', …, line)``); document roots and the
+    References umbrella flash. The move is PHYSICAL: the extent's bytes
+    relocate verbatim, heading levels are not adjusted to the new
+    surroundings.
     """
     item = ctx.cursor
     if item is None:
         return
     nid = item.id
-    if not (isinstance(nid, tuple) and nid and nid[0] == 'content'):
-        ctx.flash('move works on a section of the primary document — '
-                  'put the cursor on a heading / text row')
+    is_section = (isinstance(nid, tuple) and nid
+                  and (nid[0] == 'content'
+                       or (nid[0] == 'md' and len(nid) == 4
+                           and nid[3] is not None)))
+    if not is_section:
+        ctx.flash('move works on a section — put the cursor on a '
+                  'heading / text row')
         return
-    path = nid[1]
-    fs = _FILES.get(path)
-    node = fs.by_id.get(nid) if fs is not None else None
-    if node is None:
+    resolved = _row_document(nid)
+    if resolved is None:
         return
-    src_cap = _capture_extent(fs.text, node)
+    src_path, text, node = resolved
+    src_cap = _capture_extent(text, node)
     ctx.select([nid], replace=True)
     ctx.insert('move here', lambda relation, dest_id:
-               _move_section_to(ctx, path, src_cap, relation, dest_id))
+               _move_section_to(ctx, src_path, src_cap, relation, dest_id))
 
 
-def _move_section_to(ctx, path, src_cap, relation, dest_id):
+def _apply_cross_document_move(src_path, src_cap, dest_path, dest_cap,
+                               relation):
+    """Re-address a move whose endpoints live in DIFFERENT documents.
+
+    Returns ``(status, new_src, new_dest, line)``. Status ``'ok'`` carries
+    the source document with the extent cut out, the destination document
+    with it inserted, and the moved block's new 0-based start line in the
+    destination (the cursor-landing row); ``'lost'`` — an endpoint could
+    not be re-addressed — carries ``(None, None, 0)``. Both endpoints
+    resolve against fresh reads of their OWN documents before anything is
+    computed, so a lost endpoint costs nothing; the caller then writes the
+    destination insert before the source cut, so the worst interruption
+    case is a duplicate, never a loss. The block keeps the
+    trailing-newline guarantee (``_move_surgery``'s rule); the
+    within-extent no-op rule cannot apply across documents by
+    construction (the insert point lies in the other file).
+    """
+    src_text = _read_document(src_path)
+    src_t = _resolve_capture(src_text, src_cap, _md2ansi_doc(src_text))
+    dest_text = _read_document(dest_path)
+    dest_doc = _md2ansi_doc(dest_text)
+    dest_t = _resolve_capture(dest_text, dest_cap, dest_doc)
+    if src_t is None or dest_t is None:
+        return 'lost', None, None, 0
+    block = src_text[src_t.start:src_t.end]
+    if block and not block.endswith('\n'):
+        block += '\n'
+    ins = _insert_offset(dest_t, relation, dest_doc)
+    new_src = src_text[:src_t.start] + src_text[src_t.end:]
+    new_dest = dest_text[:ins] + block + dest_text[ins:]
+    return 'ok', new_src, new_dest, dest_text.count('\n', 0, ins)
+
+
+def _move_section_to(ctx, src_path, src_cap, relation, dest_id):
     """Marker-confirm body of a move: validate the anchor, cut + re-insert.
 
-    Anchors are primary-document rows only (the per-file root / heading /
-    text rows — reference rows are rejected, unlike edit / insert;
-    ``'first'`` never under a text run) plus move's own rules: the
-    destination must live in the SAME document, and a destination within
-    the moved extent is a no-op. No editor is involved, so an endpoint
-    that changed underneath the marker just flashes — nothing to
-    preserve, re-check and repeat. On success the cursor lands on the
-    section's new row.
+    Anchors are any file-backed row (``_row_document`` — a document root,
+    or a primary / ``[md]``-referenced heading / text row; ``'first'``
+    never under a text run); the References umbrella and stale ids are
+    rejected with a flash / a silent no-op. Two arms on the resolved
+    destination document:
+
+      * SAME document — the existing single-surgery path
+        (``_apply_section_move``), including the boundary-inclusive
+        within-extent no-op rule.
+      * DIFFERENT documents — ``_apply_cross_document_move``: both
+        endpoints re-addressed against fresh reads FIRST (any failure
+        flashes, nothing written), then the destination insert is
+        persisted before the source cut.
+
+    No editor is involved, so an endpoint that changed underneath the
+    marker just flashes — nothing to preserve, re-check and repeat. On
+    success the cursor lands on the section's new row, its id following
+    the DESTINATION's shape (``('md', …)`` vs ``('content', …)``).
     """
     ctx.clear_selection()   # the moved-row highlight served its purpose
     if not (isinstance(dest_id, tuple) and dest_id
-            and dest_id[0] in ('file', 'content')):
-        ctx.flash('move works on the primary document only — pick a '
-                  'file / heading / text row')
+            and dest_id[0] in ('file', 'content', 'md')):
+        ctx.flash('move lands on a file / heading / text row — not the '
+                  'References umbrella')
         return
-    if dest_id[1] != path:
-        ctx.flash('cannot move a section to a different file')
+    resolved = _row_document(dest_id)
+    if resolved is None:
         return
-    fs = _FILES.get(path)
-    if fs is None:
-        return
-    node = fs.file_root if dest_id[0] == 'file' else fs.by_id.get(dest_id)
-    if node is None:
-        return
+    dest_path, dest_text, node = resolved
     if relation == 'first' and node.kind == 'text':
         ctx.flash('cannot insert a child under a [text] run')
         return
-    dest_cap = _capture_extent(fs.text, node)
-    status, new_text, line = _apply_section_move(
-        path, src_cap, dest_cap, relation)
-    if status == 'noop':
-        ctx.flash('nothing moved — the destination is within the section')
-        return
-    if status == 'lost':
-        ctx.flash('could not move: the document changed underneath — '
-                  'Ctrl-R and retry')
-        return
-    _persist_document(ctx, path, new_text)
-    ctx.log(f'browse-md: moved section ({relation}) in '
-            f'{os.path.basename(path)}')
-    ctx.refresh(on_complete=lambda: ctx.cursor_to(('content', path, line)))
+    dest_cap = _capture_extent(dest_text, node)
+    # Same-document detection is by REALPATH: the two id families spell
+    # one physical file differently (primary argv paths are abspath'd,
+    # md chain paths realpath'd by ``resolve_md_ref``), so a raw string
+    # compare routes an aliased pair (symlinked dir; a doc referencing a
+    # session's own primary file) into the cross-document arm — whose
+    # second write would clobber the first, deleting the section. The
+    # stdin sentinel is safe here: both sides use the identical sentinel
+    # string, and it can never realpath-collide with a real file's path.
+    if os.path.realpath(dest_path) == os.path.realpath(src_path):
+        status, new_text, line = _apply_section_move(
+            src_path, src_cap, dest_cap, relation)
+        if status == 'noop':
+            ctx.flash('nothing moved — the destination is within the '
+                      'section')
+            return
+        if status == 'lost':
+            ctx.flash('could not move: the document changed underneath — '
+                      'Ctrl-R and retry')
+            return
+        _persist_document(ctx, src_path, new_text)
+        ctx.log(f'browse-md: moved section ({relation}) in '
+                f'{os.path.basename(src_path)}')
+    else:
+        status, new_src, new_dest, line = _apply_cross_document_move(
+            src_path, src_cap, dest_path, dest_cap, relation)
+        if status == 'lost':
+            ctx.flash('could not move: a document changed underneath — '
+                      'Ctrl-R and retry')
+            return
+        # Destination insert first, source cut second — an interruption
+        # between the two writes leaves a duplicate, never a loss.
+        _persist_document(ctx, dest_path, new_dest)
+        _persist_document(ctx, src_path, new_src)
+        ctx.log(f'browse-md: moved section ({relation}) from '
+                f'{os.path.basename(src_path)} to '
+                f'{os.path.basename(dest_path)}')
+    if dest_id[0] == 'md':
+        row_id = ('md', dest_id[1], dest_id[2], line)
+    else:
+        row_id = ('content', dest_path, line)
+    ctx.refresh(on_complete=lambda: ctx.cursor_to(row_id))
 
 
 def _on_expand(ctx, ids):
@@ -2377,10 +2454,11 @@ def _on_expand(ctx, ids):
 #                                     actions + show-anchor + expand/collapse.
 #   * ``('md', anchor, chain, *)``  — a cross-file reference node (a referenced
 #                                     ``.md`` doc root, or a heading inside one):
-#                                     edit / insert on the row (the section-level
-#                                     E / a, in-place on the doc root), open /
-#                                     edit the referenced file + show its
-#                                     resolved path. ``chain[-1]`` is that file.
+#                                     edit / insert / move on the row (the
+#                                     section-level E / a / x, in-place edit on
+#                                     the doc root), open / edit the referenced
+#                                     file + show its resolved path.
+#                                     ``chain[-1]`` is that file.
 #   * everything else (the ``('refs', …)`` umbrella, a stale / synthetic id, no
 #     cursor) — only the shared "Toggle markdown coloring" row (when bound).
 
@@ -2552,11 +2630,11 @@ def context_menu_ref(ctx, item_id):
     (``item_id[3]``): the DOC ROOT row's "Edit referenced file" IS the ``E``
     action on that row (in-place $EDITOR + refresh — one behavior, hinted),
     while a heading / text row inside the file gets the section-level
-    "Edit section (E)" plus the plain whole-file "Edit referenced file"
-    (which is NOT what ``E`` does there, so no hint). "Insert here (a)"
-    enters the same marker mode the keybinding does; the section lands in
-    the referenced file. "Show link target" pops up the resolved absolute
-    path the reference points at.
+    "Edit section (E)" / "Move section (x)" plus the plain whole-file
+    "Edit referenced file" (which is NOT what ``E`` does there, so no
+    hint). "Insert here (a)" enters the same marker mode the keybinding
+    does; the section lands in the referenced file. "Show link target"
+    pops up the resolved absolute path the reference points at.
     """
     rows = [('Open referenced doc in browse-md', 'ref.open')]
     if item_id[3] is None:
@@ -2566,6 +2644,7 @@ def context_menu_ref(ctx, item_id):
         # Section-level actions adjacent, the whole-file arm after them.
         rows.append(('Edit section (E)',     'md.edit'))
         rows.append(('Insert here (a)',      'md.insert'))
+        rows.append(('Move section (x)',     'md.move'))
         rows.append(('Edit referenced file', 'ref.edit'))
     rows.append(('Show link target', 'ref.target'))
     return rows
@@ -2603,10 +2682,11 @@ _MENU_ACTIONS = {
     'content.anchor':   lambda c, i: _cm_content_anchor(c, i),
     'content.expand':   lambda c, i: _cm_content_expand(c, i),
     'content.collapse': lambda c, i: _cm_content_collapse(c, i),
-    # cross-file reference — E / a on the row (section-level, or in-place on
-    # the doc root), open / edit the referenced file, show its path.
+    # cross-file reference — E / a / x on the row (section-level, or in-place
+    # on the doc root), open / edit the referenced file, show its path.
     'md.edit':     lambda c, i: _action_edit_section(c),
     'md.insert':   lambda c, i: _action_insert_section(c),
+    'md.move':     lambda c, i: _action_move_section(c),
     'ref.open':    lambda c, i: _cm_ref_open(c, _md_ref_target(i)),
     'ref.edit':    lambda c, i: _cm_ref_edit(c, _md_ref_target(i)),
     'ref.target':  lambda c, i: c.alert(_md_ref_target(i), title='link target'),
@@ -2717,17 +2797,18 @@ browse-md — markdown browser for one or more files.
           opens a template; save it to splice the section in at the
           marker (same conflict-safe apply as E; stdin stays in-memory).
   x       Move the section under the cursor: the row highlights, the
-          marker picks the new position, and the section's bytes are
-          cut + re-inserted verbatim (no releveling; same conflict-
-          safe re-addressing as E; stdin stays in-memory).
+          marker picks the new position — in the same document or a
+          different one (reference rows included) — and the section's
+          bytes are cut + re-inserted verbatim (no releveling; same
+          conflict-safe re-addressing as E; stdin stays in-memory).
   Ctrl-R  Re-slurp every input file and rebuild the tree.
 
 Right-click a row (or the backslash / F1 keys) for a menu keyed to its
 kind: a file row edits / inserts / views / renders, opens its dir in
 browse-fs, shows its path, or re-scans; a heading / text row acts on
 the section, inserts, moves, shows the heading anchor, and expands or
-collapses; a cross-file reference edits / inserts on the row, opens or
-edits the referenced file, and shows its resolved path.\
+collapses; a cross-file reference edits / inserts / moves on the row,
+opens or edits the referenced file, and shows its resolved path.\
 """
 
 
@@ -3090,8 +3171,8 @@ def main():
         # to the cursor's kind: file roots offer file-level source actions +
         # open-dir + show-path + rescan; heading / text rows offer section
         # source actions + show-anchor + expand/collapse; a cross-file reference
-        # edits / inserts on the row, opens / edits the referenced file +
-        # shows its resolved path. See ``on_context_menu``.
+        # edits / inserts / moves on the row, opens / edits the referenced
+        # file + shows its resolved path. See ``on_context_menu``.
         on_context_menu=on_context_menu,
         # Preview content is width-dependent: ``get_preview`` (and
         # ``_md_render``) lay markdown out — prose wrap AND table column

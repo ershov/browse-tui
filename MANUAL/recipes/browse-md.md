@@ -43,16 +43,20 @@ files or directories; `FILE.md#section` deep-links straight to a heading.
   first) maps 1:1 onto the splice position, and `$EDITOR` opens a small
   new-section template. Same conflict-safe apply and retry dialog as `E`.
 - Cross-document editing on reference rows — one row→document resolution
-  maps every file-backed row to its own document, so `E` / `a` work on
-  the `[md]` reference-subtree rows too: a section edit or insert lands
-  in the *referenced* file (its parse cache is invalidated on the
-  refresh, so the subtree rebuilds with the new content). Only the
-  References umbrella is rejected.
+  maps every file-backed row to its own document, so `E` / `a` / `x`
+  work on the `[md]` reference-subtree rows too: a section edit, insert
+  or move lands in the *referenced* file (its parse cache is invalidated
+  on the refresh, so the subtree rebuilds with the new content). Only
+  the References umbrella is rejected.
 - Section move — `x` highlights the cursor section (via the selection)
   and re-enters the same placement marker (`move here`); on confirm the
   section's bytes are physically cut and re-inserted at the marker, with
-  both endpoints re-addressed by `E`'s hash-verified chain (no releveling,
-  same file only; a destination inside the moved section is a no-op).
+  both endpoints re-addressed by `E`'s hash-verified chain (no
+  releveling; a same-document destination inside the moved section is a
+  no-op). Moves work across documents too: both endpoints resolve
+  against fresh reads first — nothing is written on a failure — then the
+  destination insert is written before the source cut, so an
+  interruption leaves a duplicate, never a loss.
 - Stdin documents stay editable — `E` / `a` / `x` apply to the in-memory
   copy (flagged "not saved to disk"), so a piped document can still be
   restructured or used to export a section through the editor.
@@ -80,8 +84,8 @@ Keys: `m` toggle md2ansi coloring, `M` page the preview through
 section under the cursor in `$EDITOR` (conflict-safe splice on save;
 reference rows edit the referenced file), `a` / `i` insert a new
 section at a marker-chosen position (primary or referenced document),
-`x` move the cursor section to a marker-chosen position (primary
-document, same file only), `→` expand (auto-expands a single-heading
+`x` move the cursor section to a marker-chosen position (within or
+across documents), `→` expand (auto-expands a single-heading
 file), `Ctrl-R` re-slurp every file from disk.
 
 **Source:** [`recipes/browse-md`](../../recipes/browse-md)

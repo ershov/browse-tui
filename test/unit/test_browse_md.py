@@ -6152,29 +6152,40 @@ class TestMoveSectionAction(unittest.TestCase):
                         msg=f'flashes: {ctx.flashes}')
         self.assertEqual(_read(self.path), changed)
 
-    def test_cross_file_destination_rejected(self):
-        ctx = self._move(4, 'after', ('content', '/elsewhere.md', 0))
-        self.assertIn('cannot move a section to a different file',
-                      ctx.flashes)
-        self.assertEqual(_read(self.path), self._DOC)
+    def test_stale_destination_is_silent_noop(self):
+        # A destination in no known document (an unloaded file / an
+        # unreadable reference chain) resolves to nothing — silent no-op,
+        # same convention as a stale content id elsewhere.
+        for dest in (('content', '/elsewhere.md', 0),
+                     ('md', ('file', self.path), ('/nope.md',), 0)):
+            ctx = self._move(4, 'after', dest)
+            self.assertEqual(ctx.flashes, [], msg=f'dest: {dest}')
+            self.assertEqual(_read(self.path), self._DOC)
 
-    def test_reference_row_destination_rejected(self):
-        ctx = self._move(4, 'after', ('md', 'anchor', ('x',), 0))
-        self.assertTrue(any('move works on the primary document' in f
-                            for f in ctx.flashes),
+    def test_umbrella_destination_rejected(self):
+        # Cross-document destinations are ROUTED now
+        # (TestMoveSectionCrossDocument); the References umbrella is the
+        # remaining foreign kind — flashed.
+        ctx = self._move(4, 'after', ('refs', ('file', self.path), ()))
+        self.assertTrue(any('move lands on a file / heading / text row'
+                            in f for f in ctx.flashes),
                         msg=f'flashes: {ctx.flashes}')
         self.assertEqual(_read(self.path), self._DOC)
 
-    def test_non_content_cursor_rejected(self):
-        # A file root is not movable — flash, and marker mode never opens.
+    def test_root_cursor_rejected(self):
+        # Document roots are not movable — flash, marker mode never opens.
+        # Both root shapes: the per-file root and an md doc root.
         fs = self.r._FILES[self.path]
-        ctx = _EditCtx(cursor=fs.file_root)
-        self.r._action_move_section(ctx)
-        self.assertTrue(any('put the cursor on a heading' in f
-                            for f in ctx.flashes),
-                        msg=f'flashes: {ctx.flashes}')
-        self.assertEqual(ctx.insert_labels, [])
-        self.assertEqual(ctx.selects, [])
+        md_root = _SrcItem(id=('md', ('file', self.path), ('/o.md',), None),
+                           kind='md-doc')
+        for cursor in (fs.file_root, md_root):
+            ctx = _EditCtx(cursor=cursor)
+            self.r._action_move_section(ctx)
+            self.assertTrue(any('put the cursor on a heading' in f
+                                for f in ctx.flashes),
+                            msg=f'flashes: {ctx.flashes}')
+            self.assertEqual(ctx.insert_labels, [])
+            self.assertEqual(ctx.selects, [])
 
     def test_first_under_text_run_rejected(self):
         # Alpha's text run (line 1) is a leaf — no child position.
@@ -6221,6 +6232,303 @@ class TestMoveSectionStdin(unittest.TestCase):
         self.assertIn('applied to in-memory copy - not saved to disk',
                       ctx.flashes)
         self.assertFalse(os.path.exists(path))
+
+
+class TestMoveSectionCrossDocument(_RefRowBase):
+    """``x`` across documents — every pairing of primary and referenced.
+
+    Same two-file fixture as the reference-row E / a tests, with the
+    primary doc given a movable ``## Movable`` section of its own. The
+    marker confirm is driven through the stashed ``on_confirm``, so every
+    test runs the real capture → fresh-read re-address → two-write
+    pipeline against the on-disk files.
+    """
+
+    _MAIN = ('# Main\nSee [other](other.md) for more.\n'
+             '## Movable\nmovable body\n')
+
+    def _move(self, src_id, relation, dest_id):
+        """Run the whole flow: action on ``src_id``, confirm at dest."""
+        ctx = _EditCtx(cursor=_SrcItem(id=src_id, kind='heading'))
+        self.r._action_move_section(ctx)
+        if ctx.on_confirm is not None:
+            ctx.on_confirm(relation, dest_id)
+        return ctx
+
+    def test_primary_to_referenced_after_heading(self):
+        # Forward into the referenced doc: '## Movable' leaves main.md and
+        # lands after other.md's '## Inner'.
+        src = ('content', self.main, 2)
+        ctx = self._move(src, 'after', self._md_id(2))
+        self.assertEqual(_read(self.other),
+                         '# Other\nother body\n'
+                         '## Inner\ninner body\n'
+                         '## Movable\nmovable body\n'
+                         '## Last\nlast body\n')
+        self.assertEqual(_read(self.main),
+                         '# Main\nSee [other](other.md) for more.\n')
+        # Highlight applied + cleared; the move is logged with both file
+        # names; the cursor lands on the destination-shaped md row.
+        self.assertEqual(ctx.selects, [([src], True)])
+        self.assertEqual(ctx.clear_selections, 1)
+        self.assertTrue(any('moved section (after) from main.md to other.md'
+                            in line for line in ctx.logs),
+                        msg=f'logs: {ctx.logs}')
+        self.assertEqual(ctx.cursor_tos, [self._md_id(4)])
+        self.assertEqual(ctx.refreshes, 1)
+
+    def test_primary_to_referenced_before_heading(self):
+        # Backward relation on the same pairing.
+        ctx = self._move(('content', self.main, 2), 'before',
+                         self._md_id(2))
+        self.assertEqual(_read(self.other),
+                         '# Other\nother body\n'
+                         '## Movable\nmovable body\n'
+                         '## Inner\ninner body\n'
+                         '## Last\nlast body\n')
+        self.assertEqual(ctx.cursor_tos, [self._md_id(2)])
+
+    def test_primary_to_md_root_first(self):
+        # The md doc root anchors through the root-'/' arm; a zero-width
+        # preamble puts 'first' at the very top of the referenced file.
+        ctx = self._move(('content', self.main, 2), 'first',
+                         self._md_id(None))
+        self.assertEqual(_read(self.other),
+                         '## Movable\nmovable body\n' + self._OTHER)
+        self.assertEqual(ctx.cursor_tos, [self._md_id(0)])
+
+    def test_referenced_to_primary_before_heading(self):
+        # '## Inner' leaves other.md and lands before main.md's Movable.
+        src = self._md_id(2)
+        ctx = self._move(src, 'before', ('content', self.main, 2))
+        self.assertEqual(_read(self.main),
+                         '# Main\nSee [other](other.md) for more.\n'
+                         '## Inner\ninner body\n'
+                         '## Movable\nmovable body\n')
+        self.assertEqual(_read(self.other),
+                         '# Other\nother body\n'
+                         '## Last\nlast body\n')
+        # The source-row highlight applies to md-row sources too.
+        self.assertEqual(ctx.selects, [([src], True)])
+        self.assertEqual(ctx.cursor_tos, [('content', self.main, 2)])
+
+    def test_referenced_to_primary_file_root_after(self):
+        # A file-root destination = document bottom; the landing id is
+        # content-shaped (the destination's shape).
+        ctx = self._move(self._md_id(4), 'after', ('file', self.main))
+        self.assertEqual(_read(self.main),
+                         self._MAIN + '## Last\nlast body\n')
+        self.assertEqual(_read(self.other),
+                         '# Other\nother body\n'
+                         '## Inner\ninner body\n')
+        self.assertEqual(ctx.cursor_tos, [('content', self.main, 4)])
+
+    def test_referenced_to_referenced(self):
+        # Between two referenced docs — neither endpoint is the primary.
+        third = os.path.join(self.tmp, 'third.md')
+        _rewrite(third, '# Third\nthird body\n')
+        ctx = self._move(self._md_id(2), 'after',
+                         ('md', self.anchor, (third,), 0))
+        self.assertEqual(_read(third),
+                         '# Third\nthird body\n## Inner\ninner body\n')
+        self.assertEqual(_read(self.other),
+                         '# Other\nother body\n'
+                         '## Last\nlast body\n')
+        self.assertEqual(_read(self.main), self._MAIN)
+        self.assertEqual(ctx.cursor_tos,
+                         [('md', self.anchor, (third,), 2)])
+
+    def test_source_lost_writes_nothing(self):
+        # The SOURCE section diverges on disk after the marker went up —
+        # re-addressing fails over the fresh reads, so NEITHER file is
+        # written (no partial state: the dest insert must not land alone).
+        diverged = ('# Main\nSee [other](other.md) for more.\n'
+                    '## Movable\nDIVERGED\n')
+        ctx = _EditCtx(cursor=_SrcItem(id=('content', self.main, 2),
+                                       kind='heading'))
+        self.r._action_move_section(ctx)
+        _rewrite(self.main, diverged)
+        ctx.on_confirm('after', self._md_id(2))
+        self.assertTrue(any('could not move' in f for f in ctx.flashes),
+                        msg=f'flashes: {ctx.flashes}')
+        self.assertEqual(_read(self.other), self._OTHER)
+        self.assertEqual(_read(self.main), diverged)
+        self.assertEqual(ctx.refreshes, 0)
+
+    def test_dest_lost_writes_nothing(self):
+        # The DESTINATION anchor diverges on disk (its capture came from
+        # the stale get_doc cache) — same outcome: flash, nothing written.
+        self.r.get_children(self._md_id(None))     # prime the parse cache
+        diverged = ('# Other\nother body\n'
+                    '## Inner\nDIVERGED\n'
+                    '## Last\nlast body\n')
+        ctx = _EditCtx(cursor=_SrcItem(id=('content', self.main, 2),
+                                       kind='heading'))
+        self.r._action_move_section(ctx)
+        _rewrite(self.other, diverged)
+        ctx.on_confirm('after', self._md_id(2))
+        self.assertTrue(any('could not move' in f for f in ctx.flashes),
+                        msg=f'flashes: {ctx.flashes}')
+        self.assertEqual(_read(self.main), self._MAIN)
+        self.assertEqual(_read(self.other), diverged)
+        self.assertEqual(ctx.refreshes, 0)
+
+    def test_md_same_document_move_lands_md_row(self):
+        # Both endpoints inside ONE referenced doc — the same-document
+        # single-surgery arm, with the md-shaped cursor landing.
+        ctx = self._move(self._md_id(2), 'after', self._md_id(4))
+        self.assertEqual(_read(self.other),
+                         '# Other\nother body\n'
+                         '## Last\nlast body\n'
+                         '## Inner\ninner body\n')
+        self.assertTrue(any('moved section (after) in other.md' in line
+                            for line in ctx.logs), msg=f'logs: {ctx.logs}')
+        self.assertEqual(ctx.cursor_tos, [self._md_id(4)])
+
+    def test_md_same_document_noop_rule_intact(self):
+        # The within-extent no-op rule still applies inside a referenced
+        # doc (same-document arm).
+        ctx = self._move(self._md_id(2), 'before', self._md_id(2))
+        self.assertIn('nothing moved — the destination is within the '
+                      'section', ctx.flashes)
+        self.assertEqual(_read(self.other), self._OTHER)
+
+
+class TestMoveSectionCrossDocumentStdin(unittest.TestCase):
+    """Cross-document ``x`` with the stdin document on one side.
+
+    The stdin side goes through the path-sentinel read / persist —
+    ``_read_document`` serves ``_STDIN_TEXT``, ``_persist_document``
+    stores back in memory with the not-saved-to-disk flash — while the
+    other side is a real on-disk file.
+    """
+
+    _DOC = '# Piped\nintro body\n## Inner\ninner body\n'
+    _OTHER = '# Other\nother body\n## Extra\nextra body\n'
+
+    def setUp(self):
+        import shutil
+        import tempfile
+        self.r = _load_recipe()
+        self.r.md_doc.clear_cache()
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.other = os.path.join(self.tmp, 'other.md')
+        _rewrite(self.other, self._OTHER)
+        self.r._STDIN_TEXT = self._DOC
+        self.r._INPUT_FILES = [(self.r._STDIN_PATH, '')]
+        self.r._reparse()
+        self.anchor = ('file', self.r._STDIN_PATH)
+        self.chain = (self.other,)
+
+    def _move(self, src_id, relation, dest_id):
+        ctx = _EditCtx(cursor=_SrcItem(id=src_id, kind='heading'))
+        self.r._action_move_section(ctx)
+        if ctx.on_confirm is not None:
+            ctx.on_confirm(relation, dest_id)
+        return ctx
+
+    def test_stdin_to_file(self):
+        # '## Inner' leaves the in-memory document and lands on disk; the
+        # in-memory (source-cut) half carries the not-saved flash.
+        path = self.r._STDIN_PATH
+        ctx = self._move(('content', path, 2), 'after',
+                         ('md', self.anchor, self.chain, 2))
+        self.assertEqual(_read(self.other),
+                         self._OTHER + '## Inner\ninner body\n')
+        self.assertEqual(self.r._STDIN_TEXT, '# Piped\nintro body\n')
+        self.assertIn('applied to in-memory copy - not saved to disk',
+                      ctx.flashes)
+        self.assertEqual(ctx.cursor_tos,
+                         [('md', self.anchor, self.chain, 4)])
+        self.assertFalse(os.path.exists(path))
+
+    def test_file_to_stdin(self):
+        # '## Extra' leaves the on-disk file and lands in memory.
+        path = self.r._STDIN_PATH
+        ctx = self._move(('md', self.anchor, self.chain, 2), 'before',
+                         ('content', path, 2))
+        self.assertEqual(self.r._STDIN_TEXT,
+                         '# Piped\nintro body\n'
+                         '## Extra\nextra body\n'
+                         '## Inner\ninner body\n')
+        self.assertEqual(_read(self.other), '# Other\nother body\n')
+        self.assertIn('applied to in-memory copy - not saved to disk',
+                      ctx.flashes)
+        self.assertEqual(ctx.cursor_tos, [('content', path, 2)])
+
+
+class TestMoveSectionAliasedPaths(unittest.TestCase):
+    """One physical file spelled two ways must take the SAME-document arm.
+
+    Primary argv paths are abspath'd (``_collect_input_files``) while md
+    chain paths are realpath'd (``resolve_md_ref``), so a symlinked
+    spelling of one file differs as a string. A raw string compare at the
+    same-doc/cross-doc branch would route such a pair into the
+    cross-document arm — whose second (source-cut) write clobbers the
+    first (destination-insert) write, silently DELETING the section. The
+    realpath compare routes it into the single-surgery arm, where the
+    within-extent no-op rule applies again.
+    """
+
+    _MAIN = '# Main\nSee [other](other.md) for more.\n'
+    _OTHER = ('# Other\nother body\n'
+              '## Inner\ninner body\n'
+              '## Last\nlast body\n')
+
+    def setUp(self):
+        import shutil
+        import tempfile
+        self.r = _load_recipe()
+        self.r.md_doc.clear_cache()
+        base = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, base, ignore_errors=True)
+        real = os.path.join(base, 'real')
+        os.mkdir(real)
+        link = os.path.join(base, 'link')
+        os.symlink(real, link)
+        self.other_real = os.path.join(real, 'other.md')
+        _rewrite(os.path.join(real, 'main.md'), self._MAIN)
+        _rewrite(self.other_real, self._OTHER)
+        # Primary inputs spelled through the SYMLINK (what argv abspath
+        # preserves); the md chain carries the realpath spelling
+        # (``resolve_md_ref`` canonicalises).
+        self.main_link = os.path.join(link, 'main.md')
+        self.other_link = os.path.join(link, 'other.md')
+        self.r._INPUT_FILES = [(self.main_link, ''), (self.other_link, '')]
+        self.r._reparse()
+        self.anchor = ('file', self.main_link)
+        self.chain = (self.other_real,)
+
+    def _move(self, src_id, relation, dest_id):
+        ctx = _EditCtx(cursor=_SrcItem(id=src_id, kind='heading'))
+        self.r._action_move_section(ctx)
+        if ctx.on_confirm is not None:
+            ctx.on_confirm(relation, dest_id)
+        return ctx
+
+    def test_aliased_pair_is_a_same_document_move(self):
+        # A primary '## Inner' row moved 'after ## Last' on the md row of
+        # the SAME physical file: one surgery, one same-doc log line, and
+        # never a deletion.
+        ctx = self._move(('content', self.other_link, 2), 'after',
+                         ('md', self.anchor, self.chain, 4))
+        self.assertEqual(_read(self.other_real),
+                         '# Other\nother body\n'
+                         '## Last\nlast body\n'
+                         '## Inner\ninner body\n')
+        self.assertTrue(any('moved section (after) in other.md' in line
+                            for line in ctx.logs), msg=f'logs: {ctx.logs}')
+
+    def test_aliased_pair_within_extent_is_noop(self):
+        # Once the pair is recognised as one document, the boundary-
+        # inclusive no-op rule applies again ('before' the section
+        # itself) — the file must stay byte-identical.
+        ctx = self._move(('content', self.other_link, 2), 'before',
+                         ('md', self.anchor, self.chain, 2))
+        self.assertIn('nothing moved — the destination is within the '
+                      'section', ctx.flashes)
+        self.assertEqual(_read(self.other_real), self._OTHER)
 
 
 if __name__ == '__main__':

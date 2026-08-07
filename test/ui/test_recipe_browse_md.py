@@ -645,5 +645,88 @@ class TestBrowseMdMoveSection(unittest.TestCase):
                 t.send('q')
 
 
+class TestBrowseMdMoveSectionCrossDocument(unittest.TestCase):
+    """``x`` moves a section into a DIFFERENT document via the marker.
+
+    End-to-end against the shipped binary: the primary doc references a
+    second ``.md`` file; expanding the References umbrella reveals the
+    ``[md]`` row, and confirming the marker in the gap below that
+    (collapsed) row resolves to 'after' the referenced doc's ROOT — the
+    file's bottom. The destination insert and the source cut are
+    asserted on BOTH files' final bytes (ground truth), plus the
+    tag-anchored tree no longer listing the moved ``[h2]`` row.
+    """
+
+    _MAIN = ('# Main\n'
+             '\n'
+             'See other.md for details.\n'
+             '\n'
+             '## Movable\n'
+             '\n'
+             'MOVABLE BODY LINE\n')
+    _OTHER = ('# Other\n'
+              '\n'
+              'OTHER BODY LINE\n')
+    _MOVED = '## Movable\n\nMOVABLE BODY LINE\n'
+    _MAIN_AFTER = '# Main\n\nSee other.md for details.\n\n'
+
+    def test_move_into_referenced_doc_via_marker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            main = os.path.join(tmp, 'main.md')
+            other = os.path.join(tmp, 'other.md')
+            with open(main, 'w') as f:
+                f.write(self._MAIN)
+            with open(other, 'w') as f:
+                f.write(self._OTHER)
+            with TmuxFixture(cols=100, rows=40) as t:
+                t.launch(_BIN, '--run-py', _RECIPE, main)
+                # Startup auto-expand + lone-h1 cascade: the [text] run,
+                # [h2] Movable and the [links] References umbrella are
+                # all rows. Sync on rendered content before sending keys.
+                t.wait_for('Movable', timeout=6.0)
+                t.wait_for('References', timeout=4.0)
+                # Reveal the [md] other.md row (it stays collapsed), then
+                # park the cursor back on Movable. The [md]-tagged form is
+                # the TREE row — the preview also contains 'other.md' (the
+                # doc's own prose), so the tag anchors the wait.
+                t.send('Down')   # main.md -> [h1] Main
+                t.send('Down')   # -> [text] See other.md...
+                t.send('Down')   # -> [h2] Movable
+                t.send('Down')   # -> [links] References
+                t.send('Right')  # expand the umbrella
+                t.wait_for('[md] other.md', timeout=4.0)
+                t.send('Up')     # back to [h2] Movable
+                t.send('x')
+                t.wait_for('move here', timeout=4.0)
+                # Default gap sits right below Movable; two steps down
+                # walk past the umbrella's child gap ('first' References)
+                # to the gap below the collapsed [md] row — 'after' the
+                # referenced doc's ROOT, i.e. that file's bottom.
+                t.send('Down')
+                t.send('Down')
+                t.send('Enter')
+                # Ground truth first: the destination gained the section
+                # and the source lost it; then the refreshed tree no
+                # longer lists the [h2] Movable row (the tag chip is
+                # tree-only, so the check can't trip on preview text).
+                deadline = time.time() + 6.0
+                final_main = final_other = pane = None
+                while time.time() < deadline:
+                    with open(main) as f:
+                        final_main = f.read()
+                    with open(other) as f:
+                        final_other = f.read()
+                    pane = t.capture()
+                    if (final_other == self._OTHER + self._MOVED
+                            and final_main == self._MAIN_AFTER
+                            and '[h2] Movable' not in pane):
+                        break
+                    time.sleep(0.05)
+                self.assertEqual(final_other, self._OTHER + self._MOVED)
+                self.assertEqual(final_main, self._MAIN_AFTER)
+                self.assertNotIn('[h2] Movable', pane)
+                t.send('q')
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -225,21 +225,22 @@ class TestPerKindMenus(unittest.TestCase):
 
     def test_cross_file_ref_heading_node_gets_section_rows(self):
         # A heading INSIDE a referenced file (line set) gets the
-        # section-level Edit/Insert adjacent (single-sourced with the
-        # E / a keybindings), THEN the plain whole-file "Edit referenced
-        # file" (no hint — E means the section edit there).
+        # section-level Edit/Insert/Move adjacent (single-sourced with the
+        # E / a / x keybindings), THEN the plain whole-file "Edit
+        # referenced file" (no hint — E means the section edit there).
         item = Item(
             id=('md', ('file', '/proj/doc.md'), ('/proj/other.md',), 3),
             title='Section', tag='h2', has_children=True)
         rows = self.r.context_menu_options(self._ctx(item))
         self.assertEqual(_tokens(rows), [
-            'ref.open', 'md.edit', 'md.insert', 'ref.edit', 'ref.target',
-            'toggle_md',
+            'ref.open', 'md.edit', 'md.insert', 'md.move', 'ref.edit',
+            'ref.target', 'toggle_md',
         ])
         labels = dict((t, l) for l, t in rows)
         self.assertEqual(labels['md.edit'], 'Edit section (E)')
-        self.assertEqual(labels['ref.edit'], 'Edit referenced file')
         self.assertEqual(labels['md.insert'], 'Insert here (a)')
+        self.assertEqual(labels['md.move'], 'Move section (x)')
+        self.assertEqual(labels['ref.edit'], 'Edit referenced file')
 
     def test_refs_umbrella_yields_only_toggle(self):
         # The References umbrella groups refs but is not itself a single ref —
@@ -464,17 +465,20 @@ class TestDispatchReusesActions(unittest.TestCase):
         self.r._MENU_ACTIONS['content.mdcat'](ctx, cid)
         self.assertEqual(calls, ['edit', 'insert', 'move', 'view', 'mdcat'])
 
-    def test_md_row_tokens_reuse_edit_insert_actions(self):
-        # The reference-row Edit/Insert entries are single-sourced with the
-        # E / a keybindings — same handlers, dispatch reads ctx.cursor.
+    def test_md_row_tokens_reuse_edit_insert_move_actions(self):
+        # The reference-row Edit/Insert/Move entries are single-sourced
+        # with the E / a / x keybindings — same handlers, dispatch reads
+        # ctx.cursor.
         calls = []
         self.r._action_edit_section = lambda c: calls.append('edit')
         self.r._action_insert_section = lambda c: calls.append('insert')
+        self.r._action_move_section = lambda c: calls.append('move')
         ctx = object()
         mid = ('md', ('file', '/d.md'), ('/o.md',), 3)
         self.r._MENU_ACTIONS['md.edit'](ctx, mid)
         self.r._MENU_ACTIONS['md.insert'](ctx, mid)
-        self.assertEqual(calls, ['edit', 'insert'])
+        self.r._MENU_ACTIONS['md.move'](ctx, mid)
+        self.assertEqual(calls, ['edit', 'insert', 'move'])
 
     def test_toggle_md_reuses_handler(self):
         calls = []
