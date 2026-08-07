@@ -32,15 +32,22 @@ files or directories; `FILE.md#section` deep-links straight to a heading.
   merges their byte ranges, and concatenates the slices with a per-file
   separator.
 - Conflict-safe section editing — `E` opens the cursor row's section in
-  `$EDITOR` (a file row edits the file in place) and re-applies the
-  result through `md2ansi_lib`'s hash-addressed splice: the section is
-  re-found by content hash (or a hash-verified line range) even if the
-  file changed underneath the editor, and a genuinely ambiguous apply
-  offers a Cancel / Return-to-editor retry dialog instead of guessing.
+  `$EDITOR` (a file or referenced-doc root row edits its file in place)
+  and re-applies the result through `md2ansi_lib`'s hash-addressed
+  splice: the section is re-found by content hash (or a hash-verified
+  line range) even if the file changed underneath the editor, and a
+  genuinely ambiguous apply offers a Cancel / Return-to-editor retry
+  dialog instead of guessing.
 - Section insert via marker mode — `a` / `i` enter the framework's
   placement marker; the confirmed `(relation, dest_id)` (before / after /
   first) maps 1:1 onto the splice position, and `$EDITOR` opens a small
   new-section template. Same conflict-safe apply and retry dialog as `E`.
+- Cross-document editing on reference rows — one row→document resolution
+  maps every file-backed row to its own document, so `E` / `a` work on
+  the `[md]` reference-subtree rows too: a section edit or insert lands
+  in the *referenced* file (its parse cache is invalidated on the
+  refresh, so the subtree rebuilds with the new content). Only the
+  References umbrella is rejected.
 - Section move — `x` highlights the cursor section (via the selection)
   and re-enters the same placement marker (`move here`); on confirm the
   section's bytes are physically cut and re-inserted at the marker, with
@@ -70,11 +77,12 @@ git show HEAD:README.md | ./recipes/browse-md - --root "$(git rev-parse --show-t
 
 Keys: `m` toggle md2ansi coloring, `M` page the preview through
 `$MDCAT` / `mdcat`, `V` page the source in `$PAGER`, `E` edit the
-section under the cursor in `$EDITOR` (conflict-safe splice on save),
-`a` / `i` insert a new section at a marker-chosen position, `x` move
-the cursor section to a marker-chosen position, `→` expand
-(auto-expands a single-heading file), `Ctrl-R` re-slurp every file
-from disk.
+section under the cursor in `$EDITOR` (conflict-safe splice on save;
+reference rows edit the referenced file), `a` / `i` insert a new
+section at a marker-chosen position (primary or referenced document),
+`x` move the cursor section to a marker-chosen position (primary
+document, same file only), `→` expand (auto-expands a single-heading
+file), `Ctrl-R` re-slurp every file from disk.
 
 **Source:** [`recipes/browse-md`](../../recipes/browse-md)
 

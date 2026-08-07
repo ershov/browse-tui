@@ -206,30 +206,40 @@ class TestPerKindMenus(unittest.TestCase):
         self.assertNotIn('content.anchor', _tokens(rows))
 
     def test_cross_file_ref_menu_rows(self):
-        # A cross-file reference node (a referenced-doc root) gets open / edit /
-        # show-target. No E hint on Edit (E edits the PRIMARY file, not this one).
+        # A cross-file reference node (a referenced-doc root) gets open /
+        # edit / insert / show-target. On the ROOT row "Edit referenced
+        # file" IS the E action (in-place $EDITOR + refresh), so it
+        # carries the E hint and routes through the reused action.
         item = Item(
             id=('md', ('file', '/proj/doc.md'), ('/proj/other.md',), None),
             title='other.md', tag='md', has_children=True)
         rows = self.r.context_menu_options(self._ctx(item))
         self.assertEqual(_tokens(rows), [
-            'ref.open', 'ref.edit', 'ref.target', 'toggle_md',
+            'ref.open', 'md.edit', 'md.insert', 'ref.target', 'toggle_md',
         ])
         labels = dict((t, l) for l, t in rows)
         self.assertEqual(labels['ref.open'], 'Open referenced doc in browse-md')
-        self.assertEqual(labels['ref.edit'], 'Edit referenced file')
+        self.assertEqual(labels['md.edit'], 'Edit referenced file (E)')
+        self.assertEqual(labels['md.insert'], 'Insert here (a)')
         self.assertEqual(labels['ref.target'], 'Show link target')
 
-    def test_cross_file_ref_heading_node_also_gets_ref_menu(self):
-        # A heading INSIDE a referenced file (line set) is still a cross-file
-        # reference node — same ref menu, targeting the same referenced file.
+    def test_cross_file_ref_heading_node_gets_section_rows(self):
+        # A heading INSIDE a referenced file (line set) gets the
+        # section-level Edit/Insert adjacent (single-sourced with the
+        # E / a keybindings), THEN the plain whole-file "Edit referenced
+        # file" (no hint — E means the section edit there).
         item = Item(
             id=('md', ('file', '/proj/doc.md'), ('/proj/other.md',), 3),
             title='Section', tag='h2', has_children=True)
         rows = self.r.context_menu_options(self._ctx(item))
         self.assertEqual(_tokens(rows), [
-            'ref.open', 'ref.edit', 'ref.target', 'toggle_md',
+            'ref.open', 'md.edit', 'md.insert', 'ref.edit', 'ref.target',
+            'toggle_md',
         ])
+        labels = dict((t, l) for l, t in rows)
+        self.assertEqual(labels['md.edit'], 'Edit section (E)')
+        self.assertEqual(labels['ref.edit'], 'Edit referenced file')
+        self.assertEqual(labels['md.insert'], 'Insert here (a)')
 
     def test_refs_umbrella_yields_only_toggle(self):
         # The References umbrella groups refs but is not itself a single ref —
@@ -454,6 +464,18 @@ class TestDispatchReusesActions(unittest.TestCase):
         self.r._MENU_ACTIONS['content.mdcat'](ctx, cid)
         self.assertEqual(calls, ['edit', 'insert', 'move', 'view', 'mdcat'])
 
+    def test_md_row_tokens_reuse_edit_insert_actions(self):
+        # The reference-row Edit/Insert entries are single-sourced with the
+        # E / a keybindings — same handlers, dispatch reads ctx.cursor.
+        calls = []
+        self.r._action_edit_section = lambda c: calls.append('edit')
+        self.r._action_insert_section = lambda c: calls.append('insert')
+        ctx = object()
+        mid = ('md', ('file', '/d.md'), ('/o.md',), 3)
+        self.r._MENU_ACTIONS['md.edit'](ctx, mid)
+        self.r._MENU_ACTIONS['md.insert'](ctx, mid)
+        self.assertEqual(calls, ['edit', 'insert'])
+
     def test_toggle_md_reuses_handler(self):
         calls = []
         self.r._action_toggle_md = lambda c: calls.append('toggle')
@@ -633,7 +655,8 @@ class TestCrossFileRefRealFixture(unittest.TestCase):
         ctx = Context(self.b)
         rows = self.r.context_menu_options(ctx)
         self.assertEqual(_tokens(rows),
-                         ['ref.open', 'ref.edit', 'ref.target', 'toggle_md'])
+                         ['ref.open', 'md.edit', 'md.insert', 'ref.target',
+                          'toggle_md'])
 
         alerted = {}
 

@@ -5425,17 +5425,17 @@ class TestEditSectionAction(unittest.TestCase):
                          '# Alpha\nalpha body\n## Sub\nsub body\n'
                          '# Beta\nEDITED\n')
 
-    def test_reference_rows_rejected(self):
-        anchor = ('file', self.path)
-        for rid in (('md', anchor, ('/other.md',), 0),
-                    ('md', anchor, ('/other.md',), None),
-                    ('refs', anchor, ())):
-            ctx = _EditCtx(cursor=_SrcItem(id=rid, kind='md-doc'))
-            self.r._action_edit_section(ctx)
-            self.assertEqual(ctx.calls, [])
-            self.assertTrue(ctx.flashes and
-                            ctx.flashes[0].startswith('E edits the primary'),
-                            msg=f'flashes: {ctx.flashes}')
+    def test_refs_umbrella_rejected(self):
+        # md reference rows are ROUTED now (TestEditSectionReferenceRows);
+        # the References umbrella is the remaining foreign kind — flashed.
+        ctx = _EditCtx(cursor=_SrcItem(id=('refs', ('file', self.path), ()),
+                                       kind='md-refs'))
+        self.r._action_edit_section(ctx)
+        self.assertEqual(ctx.calls, [])
+        self.assertTrue(ctx.flashes and
+                        ctx.flashes[0].startswith(
+                            'E edits a file / heading / text row'),
+                        msg=f'flashes: {ctx.flashes}')
 
     def test_no_cursor_is_noop(self):
         ctx = _EditCtx(cursor=None)
@@ -5616,18 +5616,17 @@ class TestInsertSectionAction(unittest.TestCase):
         self.assertEqual(_read(self.path), self._DOC)
         self.assertIn('insert cancelled (empty content)', ctx.flashes)
 
-    def test_reference_anchors_rejected(self):
+    def test_umbrella_and_stale_anchors_rejected(self):
+        # md reference anchors are ROUTED now (TestInsertSectionReferenceRows);
+        # the References umbrella and a no-id confirm stay flashed.
         anchor = ('file', self.path)
-        for rid in (('md', anchor, ('/other.md',), 0),
-                    ('md', anchor, ('/other.md',), None),
-                    ('refs', anchor, ()),
-                    None):
+        for rid in (('refs', anchor, ()), None):
             ctx = _EditCtx(editor=self._write_new)
             self.r._insert_section_at(ctx, 'after', rid)
             self.assertEqual(ctx.calls, [], msg=f'rid: {rid}')
             self.assertTrue(
                 ctx.flashes and
-                ctx.flashes[0].startswith('insert works on the primary'),
+                ctx.flashes[0].startswith('insert anchors on'),
                 msg=f'rid: {rid}, flashes: {ctx.flashes}')
         self.assertEqual(_read(self.path), self._DOC)
 
@@ -5709,6 +5708,296 @@ class TestInsertSectionStdin(unittest.TestCase):
         self.assertIn('applied to in-memory copy - not saved to disk',
                       ctx.flashes)
         self.assertFalse(os.path.exists(path))
+
+
+class _RefRowBase(unittest.TestCase):
+    """Shared fixture for the reference-row (``('md', …)``) E / a tests.
+
+    A primary ``main.md`` referencing ``other.md``, both REAL files on
+    disk, parsed through the recipe's genuine ``_reparse`` pipeline. The
+    md row ids are driven directly — ``('md', anchor, chain, line)`` with
+    ``anchor = ('file', main)`` / ``chain = (other,)`` — and
+    ``test_md_ids_match_real_umbrella_expansion`` proves once that these
+    are byte-identical to what the References umbrella's real expansion
+    builds. ``other.md`` has a leading text run under its h1 plus two h2
+    sections, so heading, text-run and doc-root rows all exist.
+    """
+
+    _MAIN = '# Main\nSee [other](other.md) for more.\n'
+    _OTHER = ('# Other\nother body\n'
+              '## Inner\ninner body\n'
+              '## Last\nlast body\n')
+
+    def setUp(self):
+        import shutil
+        import tempfile
+        self.r = _load_recipe()
+        # The md_doc parse cache is process-wide (the module is shared
+        # across recipe loads) — start each test from a cold cache.
+        self.r.md_doc.clear_cache()
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.main = os.path.join(self.tmp, 'main.md')
+        self.other = os.path.join(self.tmp, 'other.md')
+        _rewrite(self.main, self._MAIN)
+        _rewrite(self.other, self._OTHER)
+        self.r._INPUT_FILES = [(self.main, '')]
+        self.r._reparse()
+        self.anchor = ('file', self.main)
+        self.chain = (self.other,)
+        self._editor_saved = os.environ.get('EDITOR')
+        os.environ['EDITOR'] = 'fake-ed'
+
+    def tearDown(self):
+        if self._editor_saved is None:
+            os.environ.pop('EDITOR', None)
+        else:
+            os.environ['EDITOR'] = self._editor_saved
+
+    def _md_id(self, line):
+        # other.md rows: doc root (None), '# Other' (0), the 'other body'
+        # text run (1), '## Inner' (2), '## Last' (4).
+        return ('md', self.anchor, self.chain, line)
+
+
+class TestRowDocument(_RefRowBase):
+    """``_row_document`` — the single row→document resolution helper."""
+
+    def test_file_root(self):
+        path, text, node = self.r._row_document(('file', self.main))
+        self.assertEqual((path, text), (self.main, self._MAIN))
+        self.assertEqual(node.kind, 'root')
+
+    def test_content_row_resolves_via_per_file_index(self):
+        path, text, node = self.r._row_document(('content', self.main, 0))
+        self.assertEqual((path, text), (self.main, self._MAIN))
+        self.assertEqual((node.kind, node.line_offset), ('heading', 0))
+
+    def test_md_root_is_whole_document_root_capture(self):
+        # The referenced doc's root maps onto a kind='root' carrier over
+        # the WHOLE document — the apply chain's unambiguous '/' arm.
+        path, text, node = self.r._row_document(self._md_id(None))
+        self.assertEqual((path, text), (self.other, self._OTHER))
+        self.assertEqual(node.kind, 'root')
+        self.assertEqual((node.byte_offset, node.byte_size),
+                         (0, len(self._OTHER)))
+        self.assertEqual(node.line_offset, 0)
+
+    def test_md_heading_and_text_rows(self):
+        path, _text, node = self.r._row_document(self._md_id(2))
+        self.assertEqual(path, self.other)
+        self.assertEqual((node.kind, node.level, node.line_offset),
+                         ('heading', 2, 2))
+        _path, _text, run = self.r._row_document(self._md_id(1))
+        self.assertEqual((run.kind, run.line_offset), ('text', 1))
+
+    def test_rejected_shapes_yield_none(self):
+        # Umbrella, malformed / stale ids, unreadable referenced docs and
+        # non-tuples all yield None — the callers' reject/no-op signal.
+        for rid in (('refs', self.anchor, ()),          # umbrella
+                    ('md', self.anchor, (), None),       # empty chain
+                    ('md', self.anchor, ('/nope.md',), 0),  # unreadable doc
+                    self._md_id(99),                     # no node at line
+                    ('content', '/nope.md', 0),          # stale content id
+                    ('file', '/nope.md'),                # stale file id
+                    None, 'stale', ()):
+            self.assertIsNone(self.r._row_document(rid), msg=repr(rid))
+
+
+class TestEditSectionReferenceRows(_RefRowBase):
+    """``E`` on ``('md', …)`` reference rows — cross-document editing."""
+
+    def test_md_ids_match_real_umbrella_expansion(self):
+        # The directly-driven ids equal what the real References-umbrella
+        # expansion builds — anchor, chain and line shape alike.
+        kids = self.r.get_children(('file', self.main))
+        umbrella = next(k for k in kids if k.id[0] == 'refs')
+        ref = self.r.get_children(umbrella.id)[0]
+        self.assertEqual(ref.id, self._md_id(None))
+        heads = self.r.get_children(ref.id)
+        self.assertEqual([k.id for k in heads], [self._md_id(0)])
+        inner_ids = [k.id for k in self.r.get_children(self._md_id(0))]
+        self.assertEqual(inner_ids,
+                         [self._md_id(1), self._md_id(2), self._md_id(4)])
+
+    def test_heading_edit_persists_to_referenced_file(self):
+        payloads = []
+
+        def ed(tmp, n):
+            payloads.append(_read(tmp))
+            _rewrite(tmp, '## Inner\nEDITED\n')
+
+        ctx = _EditCtx(cursor=_SrcItem(id=self._md_id(2), kind='md-heading'),
+                       editor=ed)
+        self.r._action_edit_section(ctx)
+        # The editor received the section's extent, the splice landed in
+        # other.md (the primary file untouched), through a temp file.
+        self.assertEqual(payloads, ['## Inner\ninner body\n'])
+        self.assertEqual(_read(self.other),
+                         '# Other\nother body\n'
+                         '## Inner\nEDITED\n'
+                         '## Last\nlast body\n')
+        self.assertEqual(_read(self.main), self._MAIN)
+        self.assertNotEqual(ctx.calls[0][-1], self.other)
+        self.assertEqual(ctx.refreshes, 1)
+        self.assertTrue(any('edited other.md' in line for line in ctx.logs),
+                        msg=f'logs: {ctx.logs}')
+
+    def test_text_run_edit_persists(self):
+        # The dim [text] run has no hash address — range-fallback applies.
+        ctx = _EditCtx(cursor=_SrcItem(id=self._md_id(1), kind='md-text'),
+                       editor=lambda tmp, n: _rewrite(tmp, 'REWRITTEN\n'))
+        self.r._action_edit_section(ctx)
+        self.assertEqual(_read(self.other),
+                         '# Other\nREWRITTEN\n'
+                         '## Inner\ninner body\n'
+                         '## Last\nlast body\n')
+
+    def test_md_root_edits_referenced_file_in_place(self):
+        # Parity with primary file roots (and with the context menu's
+        # "Edit referenced file"): $EDITOR on the file itself + refresh.
+        ctx = _EditCtx(cursor=_SrcItem(id=self._md_id(None), kind='md-doc'))
+        self.r._action_edit_section(ctx)
+        self.assertEqual(ctx.calls, [['fake-ed', self.other]])
+        self.assertEqual(ctx.refreshes, 1)
+
+    def test_shift_underneath_reapplies_by_hash(self):
+        # other.md gains a prepended section while the editor is open —
+        # the apply chain re-reads fresh and re-addresses by hash.
+        def ed(tmp, n):
+            _rewrite(self.other, '# Zero\nzero body\n' + self._OTHER)
+            _rewrite(tmp, '## Inner\nEDITED\n')
+
+        ctx = _EditCtx(cursor=_SrcItem(id=self._md_id(2), kind='md-heading'),
+                       editor=ed)
+        self.r._action_edit_section(ctx)
+        self.assertEqual(_read(self.other),
+                         '# Zero\nzero body\n'
+                         '# Other\nother body\n'
+                         '## Inner\nEDITED\n'
+                         '## Last\nlast body\n')
+
+    def test_stale_get_doc_cache_capture_still_applies(self):
+        # The capture text comes from the get_doc cache; the file shifting
+        # BEFORE the action fires (cache not yet busted) is safe — the
+        # chain hash-verifies against a fresh read before any write.
+        self.r.get_children(self._md_id(None))     # prime the parse cache
+        _rewrite(self.other, '# Zero\nzero body\n' + self._OTHER)
+        ctx = _EditCtx(cursor=_SrcItem(id=self._md_id(2), kind='md-heading'),
+                       editor=lambda tmp, n: _rewrite(
+                           tmp, '## Inner\nEDITED\n'))
+        self.r._action_edit_section(ctx)
+        self.assertEqual(_read(self.other),
+                         '# Zero\nzero body\n'
+                         '# Other\nother body\n'
+                         '## Inner\nEDITED\n'
+                         '## Last\nlast body\n')
+
+    def test_refresh_invalidates_doc_cache_and_rebuilds_subtree(self):
+        # End-to-end cache invalidation: the subtree is expanded (priming
+        # the get_doc cache), E edits a section, and the ctx.refresh —
+        # replayed here as the framework's root reload — clears the cache
+        # so the re-expanded subtree shows the edit.
+        titles = [k.title for k in self.r.get_children(self._md_id(0))]
+        self.assertIn('Inner', titles)
+        recipe = self.r
+
+        class _ReloadCtx(_EditCtx):
+            def refresh(self, id=None, on_complete=None):
+                # What the framework's root reload does downstream.
+                recipe.get_children(None, reload=True)
+                _EditCtx.refresh(self, id, on_complete)
+
+        ctx = _ReloadCtx(cursor=_SrcItem(id=self._md_id(2),
+                                         kind='md-heading'),
+                         editor=lambda tmp, n: _rewrite(
+                             tmp, '## Renamed\nnew body\n'))
+        self.r._action_edit_section(ctx)
+        self.assertEqual(ctx.refreshes, 1)
+        titles = [k.title for k in self.r.get_children(self._md_id(0))]
+        self.assertIn('Renamed', titles)
+        self.assertNotIn('Inner', titles)
+
+    def test_unreadable_referenced_doc_is_silent_noop(self):
+        # A chain whose file vanished resolves to nothing — same silent
+        # no-op as a stale content id.
+        ctx = _EditCtx(cursor=_SrcItem(id=('md', self.anchor,
+                                           ('/nope.md',), 2),
+                                       kind='md-heading'))
+        self.r._action_edit_section(ctx)
+        self.assertEqual(ctx.calls, [])
+        self.assertEqual(ctx.flashes, [])
+
+
+class TestInsertSectionReferenceRows(_RefRowBase):
+    """``a`` / ``i`` anchored on ``('md', …)`` rows — cross-document insert."""
+
+    _NEW = '## Added\nadded body\n'
+
+    def _write_new(self, tmp, n):
+        _rewrite(tmp, self._NEW)
+
+    def test_insert_after_md_heading(self):
+        ctx = _EditCtx(editor=self._write_new)
+        self.r._insert_section_at(ctx, 'after', self._md_id(2))
+        self.assertEqual(_read(self.other),
+                         '# Other\nother body\n'
+                         '## Inner\ninner body\n'
+                         + self._NEW +
+                         '## Last\nlast body\n')
+        self.assertEqual(_read(self.main), self._MAIN)
+        self.assertTrue(any('inserted section (after) in other.md' in line
+                            for line in ctx.logs), msg=f'logs: {ctx.logs}')
+        # The cursor lands on the new section's md row id (best-effort).
+        self.assertEqual(ctx.cursor_tos, [self._md_id(4)])
+
+    def test_insert_first_on_md_root_lands_after_preamble(self):
+        # The md doc root takes the root-'/' arm; a zero-width preamble
+        # puts 'first' at the very top of the referenced file.
+        ctx = _EditCtx(editor=self._write_new)
+        self.r._insert_section_at(ctx, 'first', self._md_id(None))
+        self.assertEqual(_read(self.other), self._NEW + self._OTHER)
+        self.assertEqual(ctx.cursor_tos, [self._md_id(0)])
+
+    def test_insert_before_md_text_run(self):
+        ctx = _EditCtx(editor=self._write_new)
+        self.r._insert_section_at(ctx, 'before', self._md_id(1))
+        self.assertEqual(_read(self.other),
+                         '# Other\n'
+                         + self._NEW +
+                         'other body\n'
+                         '## Inner\ninner body\n'
+                         '## Last\nlast body\n')
+
+    def test_first_on_md_text_run_rejected(self):
+        ctx = _EditCtx(editor=self._write_new)
+        self.r._insert_section_at(ctx, 'first', self._md_id(1))
+        self.assertEqual(ctx.calls, [])
+        self.assertIn('cannot insert a child under a [text] run',
+                      ctx.flashes)
+        self.assertEqual(_read(self.other), self._OTHER)
+
+    def test_anchor_shift_underneath_applies_by_hash(self):
+        def ed(tmp, n):
+            _rewrite(self.other, '# Zero\nzero body\n' + self._OTHER)
+            _rewrite(tmp, self._NEW)
+
+        ctx = _EditCtx(editor=ed)
+        self.r._insert_section_at(ctx, 'after', self._md_id(2))
+        self.assertEqual(_read(self.other),
+                         '# Zero\nzero body\n'
+                         '# Other\nother body\n'
+                         '## Inner\ninner body\n'
+                         + self._NEW +
+                         '## Last\nlast body\n')
+
+    def test_unreadable_referenced_anchor_is_silent_noop(self):
+        ctx = _EditCtx(editor=self._write_new)
+        self.r._insert_section_at(ctx, 'after',
+                                  ('md', self.anchor, ('/nope.md',), 0))
+        self.assertEqual(ctx.calls, [])
+        self.assertEqual(ctx.flashes, [])
+        self.assertEqual(_read(self.other), self._OTHER)
 
 
 class TestMoveSectionAction(unittest.TestCase):
