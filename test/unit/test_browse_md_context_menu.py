@@ -172,21 +172,24 @@ class TestPerKindMenus(unittest.TestCase):
 
     def test_heading_menu_rows_and_hints(self):
         # A heading row (kind == 'heading') gets the section actions + the
-        # heading-anchor row + expand/collapse. E / a / x / V / M carry hints.
+        # heading-anchor row + expand/collapse. E / a / x / d / V / M carry
+        # hints.
         item = Item(id=('content', '/proj/doc.md', 0), title='Intro',
                     tag='h1', has_children=True)
         item.kind = 'heading'
         self.r._BY_ID = {item.id: item}
         rows = self.r.context_menu_options(self._ctx(item))
         self.assertEqual(_tokens(rows), [
-            'content.edit', 'content.insert', 'content.move', 'content.view',
-            'content.mdcat', 'content.anchor', 'content.expand',
-            'content.collapse', 'toggle_md',
+            'content.edit', 'content.insert', 'content.move',
+            'content.delete', 'content.view', 'content.mdcat',
+            'content.anchor', 'content.expand', 'content.collapse',
+            'toggle_md',
         ])
         labels = dict((t, l) for l, t in rows)
         self.assertEqual(labels['content.edit'], 'Edit section (E)')
         self.assertEqual(labels['content.insert'], 'Insert here (a)')
         self.assertEqual(labels['content.move'], 'Move section (x)')
+        self.assertEqual(labels['content.delete'], 'Delete section (d)')
         self.assertEqual(labels['content.view'], 'View section in $PAGER (V)')
         self.assertEqual(labels['content.mdcat'], 'Render section via mdcat (M)')
 
@@ -199,9 +202,9 @@ class TestPerKindMenus(unittest.TestCase):
         self.r._BY_ID = {item.id: item}
         rows = self.r.context_menu_options(self._ctx(item))
         self.assertEqual(_tokens(rows), [
-            'content.edit', 'content.insert', 'content.move', 'content.view',
-            'content.mdcat', 'content.expand', 'content.collapse',
-            'toggle_md',
+            'content.edit', 'content.insert', 'content.move',
+            'content.delete', 'content.view', 'content.mdcat',
+            'content.expand', 'content.collapse', 'toggle_md',
         ])
         self.assertNotIn('content.anchor', _tokens(rows))
 
@@ -229,22 +232,23 @@ class TestPerKindMenus(unittest.TestCase):
 
     def test_cross_file_ref_heading_node_gets_section_rows(self):
         # A heading INSIDE a referenced file (line set) gets the
-        # section-level Edit/Insert/Move/View adjacent (single-sourced
-        # with the E / a / x / V keybindings, in the content-menu order),
-        # THEN the plain whole-file "Edit referenced file" (no hint — E
-        # means the section edit there).
+        # section-level Edit/Insert/Move/Delete/View adjacent
+        # (single-sourced with the E / a / x / d / V keybindings, in the
+        # content-menu order), THEN the plain whole-file "Edit referenced
+        # file" (no hint — E means the section edit there).
         item = Item(
             id=('md', ('file', '/proj/doc.md'), ('/proj/other.md',), 3),
             title='Section', tag='h2', has_children=True)
         rows = self.r.context_menu_options(self._ctx(item))
         self.assertEqual(_tokens(rows), [
-            'ref.open', 'md.edit', 'md.insert', 'md.move', 'md.view',
-            'ref.edit', 'ref.target', 'toggle_md',
+            'ref.open', 'md.edit', 'md.insert', 'md.move', 'md.delete',
+            'md.view', 'ref.edit', 'ref.target', 'toggle_md',
         ])
         labels = dict((t, l) for l, t in rows)
         self.assertEqual(labels['md.edit'], 'Edit section (E)')
         self.assertEqual(labels['md.insert'], 'Insert here (a)')
         self.assertEqual(labels['md.move'], 'Move section (x)')
+        self.assertEqual(labels['md.delete'], 'Delete section (d)')
         self.assertEqual(labels['md.view'], 'View section in $PAGER (V)')
         self.assertEqual(labels['ref.edit'], 'Edit referenced file')
 
@@ -460,6 +464,7 @@ class TestDispatchReusesActions(unittest.TestCase):
         self.r._action_edit_section = lambda c: calls.append('edit')
         self.r._action_insert_section = lambda c: calls.append('insert')
         self.r._action_move_section = lambda c: calls.append('move')
+        self.r._action_delete_section = lambda c: calls.append('delete')
         self.r._action_view_source = lambda c: calls.append('view')
         self.r._action_md_preview = lambda c: calls.append('mdcat')
         ctx = object()
@@ -467,26 +472,30 @@ class TestDispatchReusesActions(unittest.TestCase):
         self.r._MENU_ACTIONS['content.edit'](ctx, cid)
         self.r._MENU_ACTIONS['content.insert'](ctx, cid)
         self.r._MENU_ACTIONS['content.move'](ctx, cid)
+        self.r._MENU_ACTIONS['content.delete'](ctx, cid)
         self.r._MENU_ACTIONS['content.view'](ctx, cid)
         self.r._MENU_ACTIONS['content.mdcat'](ctx, cid)
-        self.assertEqual(calls, ['edit', 'insert', 'move', 'view', 'mdcat'])
+        self.assertEqual(calls,
+                         ['edit', 'insert', 'move', 'delete', 'view', 'mdcat'])
 
     def test_md_row_tokens_reuse_edit_insert_move_view_actions(self):
-        # The reference-row Edit/Insert/Move/View entries are
-        # single-sourced with the E / a / x / V keybindings — same
+        # The reference-row Edit/Insert/Move/Delete/View entries are
+        # single-sourced with the E / a / x / d / V keybindings — same
         # handlers, dispatch reads ctx.cursor.
         calls = []
         self.r._action_edit_section = lambda c: calls.append('edit')
         self.r._action_insert_section = lambda c: calls.append('insert')
         self.r._action_move_section = lambda c: calls.append('move')
+        self.r._action_delete_section = lambda c: calls.append('delete')
         self.r._action_view_source = lambda c: calls.append('view')
         ctx = object()
         mid = ('md', ('file', '/d.md'), ('/o.md',), 3)
         self.r._MENU_ACTIONS['md.edit'](ctx, mid)
         self.r._MENU_ACTIONS['md.insert'](ctx, mid)
         self.r._MENU_ACTIONS['md.move'](ctx, mid)
+        self.r._MENU_ACTIONS['md.delete'](ctx, mid)
         self.r._MENU_ACTIONS['md.view'](ctx, mid)
-        self.assertEqual(calls, ['edit', 'insert', 'move', 'view'])
+        self.assertEqual(calls, ['edit', 'insert', 'move', 'delete', 'view'])
 
     def test_toggle_md_reuses_handler(self):
         calls = []

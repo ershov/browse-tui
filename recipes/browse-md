@@ -74,6 +74,13 @@ Custom actions on top of the framework defaults:
       corrupting. A cross-document move writes the destination insert
       before the source cut (an interruption leaves a duplicate,
       never a loss); stdin moves stay in-memory.
+  d   delete the section under the cursor after a confirm dialog
+      quoting the section's title and line range. The removal is the
+      same hash-verified apply chain as ``E`` with empty content, so
+      a document that changed underneath the dialog flashes instead
+      of deleting the wrong bytes (no retry — nothing to preserve);
+      stdin deletions stay in-memory. An ``E`` edit saved back EMPTY
+      offers the same deletion instead of just cancelling.
   →   expand the cursor row (overrides the framework default); when
       the row is a file whose only child is a heading, that heading
       is auto-expanded too, so a single-heading document reveals its
@@ -1757,7 +1764,9 @@ def _row_document(node_id):
 def _apply_section_change(ctx, path, cap, content, where, anchor_id=None):
     """Re-read ``path``'s document, splice ``content`` at ``cap``, persist.
 
-    The shared success half of edit AND insert: ``_read_document`` gives
+    The shared success half of edit, insert AND delete (a delete is a
+    ``where='replace'`` with empty ``content`` — the library removes the
+    extent outright, no trailing-LF massage): ``_read_document`` gives
     the document as it is NOW, ``_apply_splice`` re-addresses the captured
     extent in it, and on success the new text is persisted, the mutation
     logged, and ``ctx.refresh()`` re-parses everything (the framework's
@@ -1780,7 +1789,10 @@ def _apply_section_change(ctx, path, cap, content, where, anchor_id=None):
         return False
     _persist_document(ctx, path, new_text)
     if where == 'replace':
-        ctx.log(f'browse-md: edited {os.path.basename(path)} '
+        # Empty content is the delete flow (``d`` / an ``E`` edit saved
+        # back empty) — log it as a deletion, not an edit.
+        verb = 'edited' if content else 'deleted section in'
+        ctx.log(f'browse-md: {verb} {os.path.basename(path)} '
                 f'lines {cap.a}-{cap.b}')
         ctx.refresh()
     else:
@@ -1801,8 +1813,12 @@ def _editor_splice_loop(ctx, path, cap, seed, where, anchor_id=None):
 
     ``seed`` is the temp file's initial content — the captured extent for
     an edit, the new-section template for an insert; content coming back
-    byte-equal to it (or empty), or an editor exiting non-zero, cancels
-    without writing. ``anchor_id`` is the insert anchor's row id, passed
+    byte-equal to it, or an editor exiting non-zero, cancels without
+    writing. Content coming back EMPTY cancels too for an insert or a
+    root capture (the stdin whole-document edit), but a section edit
+    saved back empty instead offers the delete flow — see the
+    empty-content arm below. ``anchor_id`` is the insert anchor's row
+    id, passed
     through for the cursor landing's id shape. The temp file persists
     across retry-loop iterations — "Return to editor" re-opens the SAME
     file, so the user's work is never lost (they can save it elsewhere
@@ -1827,6 +1843,21 @@ def _editor_splice_loop(ctx, path, cap, seed, where, anchor_id=None):
                 ctx.flash(f'{verb} cancelled (content unchanged)')
                 return
             if not content.strip():
+                # An EDIT of a real section saved back empty reads as
+                # "I want this gone" — offer the delete flow (the same
+                # replace-with-empty ``d`` applies). Root captures (the
+                # stdin whole-document edit) have no section to delete,
+                # and an empty NEW section (insert) just cancels.
+                if where == 'replace' and cap.kind != 'root':
+                    if ctx.confirm(
+                            'the edited section came back empty',
+                            [('&Cancel edit', False),
+                             ('&Delete section', True)],
+                            title='empty edit'):
+                        _delete_extent(ctx, path, cap)
+                    else:
+                        ctx.flash('edit cancelled (empty content)')
+                    return
                 ctx.flash(f'{verb} cancelled (empty content)')
                 return
             if _apply_section_change(ctx, path, cap, content, where,
@@ -2205,6 +2236,58 @@ def _move_section_to(ctx, src_path, src_cap, relation, dest_id):
     ctx.refresh(on_complete=lambda: ctx.cursor_to(row_id))
 
 
+def _delete_extent(ctx, path, cap):
+    """Apply a CONFIRMED section deletion: replace-with-empty at ``cap``.
+
+    The shared tail of ``d`` and the E-saved-back-empty dialog — the same
+    hash-verified ``_apply_section_change`` chain as an edit, with empty
+    content (which the library treats as pure extent removal, no
+    trailing-LF massage). On success that logs the deletion and
+    refreshes; a document that changed underneath just flashes — no
+    retry dialog, a delete carries nothing to preserve (Ctrl-R and
+    repeat). Stdin deletions land on the in-memory copy with its usual
+    not-saved flash.
+    """
+    if not _apply_section_change(ctx, path, cap, '', 'replace'):
+        ctx.flash('could not delete: the document changed underneath — '
+                  'Ctrl-R and retry')
+
+
+def _action_delete_section(ctx):
+    """``d`` — delete the section under the CURSOR after a confirm.
+
+    Deletable rows are the heading / text runs of any file-backed
+    document — primary (``('content', path, line)``) or inside a
+    referenced file (``('md', anchor, chain, line)``); document roots
+    and the References umbrella flash, a stale id is a silent no-op.
+    The extent is captured up front and the confirm dialog quotes the
+    section's title and 1-based line range (Cancel first; esc backs
+    out); on confirm the removal runs through ``_delete_extent``.
+    """
+    item = ctx.cursor
+    if item is None:
+        return
+    nid = item.id
+    is_section = (isinstance(nid, tuple) and nid
+                  and (nid[0] == 'content'
+                       or (nid[0] == 'md' and len(nid) == 4
+                           and nid[3] is not None)))
+    if not is_section:
+        ctx.flash('delete works on a heading / text row')
+        return
+    resolved = _row_document(nid)
+    if resolved is None:
+        return
+    path, text, node = resolved
+    cap = _capture_extent(text, node)
+    if not ctx.confirm(
+            f'delete section {node.title!r} (lines {cap.a}-{cap.b})?',
+            [('&Cancel', False), ('&Delete section', True)],
+            title='delete section'):
+        return
+    _delete_extent(ctx, path, cap)
+
+
 def _on_expand(ctx, ids):
     """Auto-expand a file whose only child is a heading.
 
@@ -2382,10 +2465,11 @@ def _content_is_heading(item_id):
 def context_menu_content(ctx, item_id):
     """``(label, token)`` rows for a ``('content', path, line)`` row.
 
-    A heading or a text run. Edit / Insert / Move / View / Render duplicate
-    the ``E`` / ``a`` / ``x`` / ``V`` / ``M`` actions (edit / view act on the
-    section's byte range; insert and move enter marker mode), so their rows
-    carry the hotkey hint. "Show heading anchor" is offered only for a heading
+    A heading or a text run. Edit / Insert / Move / Delete / View / Render
+    duplicate the ``E`` / ``a`` / ``x`` / ``d`` / ``V`` / ``M`` actions
+    (edit / delete / view act on the section's byte range — delete behind
+    its confirm; insert and move enter marker mode), so their rows carry
+    the hotkey hint. "Show heading anchor" is offered only for a heading
     (``_content_is_heading``) — a text run has no anchor. Expand / Collapse
     reuse the framework's subtree-expand / collapse on the cursor row.
     """
@@ -2393,6 +2477,7 @@ def context_menu_content(ctx, item_id):
         ('Edit section (E)',             'content.edit'),
         ('Insert here (a)',              'content.insert'),
         ('Move section (x)',             'content.move'),
+        ('Delete section (d)',           'content.delete'),
         ('View section in $PAGER (V)',   'content.view'),
         ('Render section via mdcat (M)', 'content.mdcat'),
     ]
@@ -2431,9 +2516,9 @@ def context_menu_ref(ctx, item_id):
     (``item_id[3]``): the DOC ROOT row's "Edit referenced file" IS the ``E``
     action on that row (in-place $EDITOR + refresh — one behavior, hinted),
     while a heading / text row inside the file gets the section-level
-    "Edit section (E)" / "Move section (x)" / "View section in $PAGER
-    (V)" plus the plain whole-file "Edit referenced file" (which is NOT
-    what ``E`` does there, so no hint). "Insert here (a)" enters the
+    "Edit section (E)" / "Move section (x)" / "Delete section (d)" /
+    "View section in $PAGER (V)" plus the plain whole-file "Edit
+    referenced file" (which is NOT what ``E`` does there, so no hint). "Insert here (a)" enters the
     same marker mode the keybinding does; the section lands in the
     referenced file. The View rows duplicate the ``V`` action (the doc
     ROOT pages the referenced file itself; a section row pages its byte
@@ -2450,6 +2535,7 @@ def context_menu_ref(ctx, item_id):
         rows.append(('Edit section (E)',           'md.edit'))
         rows.append(('Insert here (a)',            'md.insert'))
         rows.append(('Move section (x)',           'md.move'))
+        rows.append(('Delete section (d)',         'md.delete'))
         rows.append(('View section in $PAGER (V)', 'md.view'))
         rows.append(('Edit referenced file',       'ref.edit'))
     rows.append(('Show link target', 'ref.target'))
@@ -2464,7 +2550,7 @@ def context_menu_ref(ctx, item_id):
 # the recipe's existing action handlers (``_action_edit_section`` /
 # ``_action_view_source`` / ``_action_md_preview`` / ``_action_toggle_md``),
 # which read ``ctx.cursor`` themselves, so the menu rows stay
-# single-sourced with the E / a / V / M / m keybindings. "Re-scan all files"
+# single-sourced with the E / a / x / d / V / M / m keybindings. "Re-scan all files"
 # reuses the framework's reload via ``ctx.refresh()`` — the same call the Ctrl-R action
 # makes (a root refresh enqueues with ``reload=True`` → ``get_children(None,
 # reload=True)`` → ``_reparse`` + ``md_doc.clear_cache()``).
@@ -2479,20 +2565,23 @@ _MENU_ACTIONS = {
     'file.opendir':  lambda c, i: _cm_file_open_dir(c, i[1]),
     'file.path':     lambda c, i: c.alert(i[1], title='path'),
     'file.rescan':   lambda c, i: c.refresh(),
-    # heading / text run — reuse E / a / V / M, anchor pop-up, expand / collapse.
+    # heading / text run — reuse E / a / x / d / V / M, anchor pop-up,
+    # expand / collapse.
     'content.edit':     lambda c, i: _action_edit_section(c),
     'content.insert':   lambda c, i: _action_insert_section(c),
     'content.move':     lambda c, i: _action_move_section(c),
+    'content.delete':   lambda c, i: _action_delete_section(c),
     'content.view':     lambda c, i: _action_view_source(c),
     'content.mdcat':    lambda c, i: _action_md_preview(c),
     'content.anchor':   lambda c, i: _cm_content_anchor(c, i),
     'content.expand':   lambda c, i: _cm_content_expand(c, i),
     'content.collapse': lambda c, i: _cm_content_collapse(c, i),
-    # cross-file reference — E / a / x / V on the row (section-level, or
+    # cross-file reference — E / a / x / d / V on the row (section-level, or
     # in-place on the doc root), open / edit the referenced file, show its path.
     'md.edit':     lambda c, i: _action_edit_section(c),
     'md.insert':   lambda c, i: _action_insert_section(c),
     'md.move':     lambda c, i: _action_move_section(c),
+    'md.delete':   lambda c, i: _action_delete_section(c),
     'md.view':     lambda c, i: _action_view_source(c),
     'ref.open':    lambda c, i: _cm_ref_open(c, _md_ref_target(i)),
     'ref.edit':    lambda c, i: _cm_ref_edit(c, _md_ref_target(i)),
@@ -2607,6 +2696,8 @@ browse-md — markdown browser for one or more files.
           different one (reference rows included) — and the section's
           bytes are cut + re-inserted verbatim (no releveling; same
           conflict-safe re-addressing as E; stdin stays in-memory).
+  d       Delete the section under the cursor (confirm dialog; same
+          conflict-safe chain as E — an E edit saved empty offers it).
   Ctrl-R  Re-slurp every input file and rebuild the tree.
 
 Multi-select is disabled — every action is cursor-only, and the
@@ -2615,10 +2706,10 @@ framework's selection keys (space and friends) flash instead.
 Right-click a row (or the backslash / F1 keys) for a menu keyed to its
 kind: a file row edits / inserts / views / renders, opens its dir in
 browse-fs, shows its path, or re-scans; a heading / text row acts on
-the section, inserts, moves, shows the heading anchor, and expands or
-collapses; a cross-file reference edits / inserts / moves / views on
-the row, opens or edits the referenced file, and shows its resolved
-path.\
+the section (edit / insert / move / delete / view / render), shows the
+heading anchor, and expands or collapses; a cross-file reference has
+the same section actions, opens or edits the referenced file, and
+shows its resolved path.\
 """
 
 
@@ -2832,6 +2923,8 @@ def _build_actions():
       both taken here — the coloring toggle and the $MDCAT view). The
       cursor row stays highlighted via the selection while the marker
       is up.
+    * ``d`` deletes the section under the cursor behind a confirm
+      dialog (see ``_action_delete_section``).
     * The framework's multi-select keys (``_SELECTION_KEYS``) are
       overridden to a "selection is disabled" flash — nothing in this
       recipe reads a user selection. Blank labels keep them out of the
@@ -2853,6 +2946,8 @@ def _build_actions():
         Action('i', '', _action_insert_section, 'none'),
         Action('x', 'Move section to marker (cut + re-insert)',
                _action_move_section, 'none'),
+        Action('d', 'Delete section under cursor (with confirm)',
+               _action_delete_section, 'none'),
     ]
     actions.extend(
         Action(key, '', _action_selection_disabled, 'none')

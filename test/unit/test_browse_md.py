@@ -5063,12 +5063,61 @@ class TestEditSectionAction(unittest.TestCase):
         self.assertEqual(ctx.logs, [])
         self.assertIn('edit cancelled (content unchanged)', ctx.flashes)
 
-    def test_empty_content_cancels(self):
+    def test_empty_content_offers_delete_esc_cancels(self):
+        # An edit saved back empty opens the empty-edit dialog; esc (the
+        # scripted-answers list running out returns None) backs out with
+        # the cancel flash and no write.
         ctx = _EditCtx(cursor=self._item(4),
                        editor=lambda tmp, n: _rewrite(tmp, ' \n'))
         self.r._action_edit_section(ctx)
+        self.assertEqual(len(ctx.confirm_prompts), 1)
+        self.assertIn('came back empty', ctx.confirm_prompts[0])
         self.assertEqual(_read(self.path), self._DOC)
+        self.assertEqual(ctx.refreshes, 0)
         self.assertIn('edit cancelled (empty content)', ctx.flashes)
+
+    def test_empty_content_cancel_button_writes_nothing(self):
+        ctx = _EditCtx(cursor=self._item(4),
+                       editor=lambda tmp, n: _rewrite(tmp, ''),
+                       confirms=[False])
+        self.r._action_edit_section(ctx)
+        self.assertEqual(_read(self.path), self._DOC)
+        self.assertEqual(ctx.refreshes, 0)
+        self.assertIn('edit cancelled (empty content)', ctx.flashes)
+
+    def test_empty_content_delete_button_removes_extent(self):
+        # "Delete section" routes into the same replace-with-empty chain
+        # as ``d`` — the extent vanishes from disk, hash-verified.
+        ctx = _EditCtx(cursor=self._item(4),
+                       editor=lambda tmp, n: _rewrite(tmp, ''),
+                       confirms=[True])
+        self.r._action_edit_section(ctx)
+        self.assertEqual(_read(self.path),
+                         '# Alpha\nalpha body\n## Sub\nsub body\n')
+        self.assertEqual(ctx.refreshes, 1)
+        self.assertTrue(any('deleted section in' in line and 'lines 5-6'
+                            in line for line in ctx.logs),
+                        msg=f'logs: {ctx.logs}')
+
+    def test_empty_content_delete_conflict_flashes_no_retry(self):
+        # The user picks Delete but the section changed on disk while the
+        # editor was open: the delete flow flashes and ENDS — no
+        # return-to-editor loop (there is nothing to preserve).
+        conflicted = ('# Alpha\nalpha body\n## Sub\nsub body\n'
+                      '# Beta\nDIVERGED\n')
+
+        def ed(tmp, n):
+            _rewrite(self.path, conflicted)
+            _rewrite(tmp, '')
+
+        ctx = _EditCtx(cursor=self._item(4), editor=ed, confirms=[True])
+        self.r._action_edit_section(ctx)
+        self.assertEqual(_read(self.path), conflicted)
+        # ONE dialog (the empty-edit offer) — no conflict retry dialog.
+        self.assertEqual(len(ctx.confirm_prompts), 1)
+        self.assertEqual(len(ctx.calls), 1)   # the editor never re-opens
+        self.assertTrue(any('could not delete' in f for f in ctx.flashes),
+                        msg=f'flashes: {ctx.flashes}')
 
     def test_editor_nonzero_exit_cancels(self):
         def ed(tmp, n):
@@ -5213,6 +5262,135 @@ class TestEditSectionAction(unittest.TestCase):
         self.assertEqual(ctx.calls, [])
 
 
+class TestDeleteSectionAction(unittest.TestCase):
+    """``d`` (``_action_delete_section``) — confirm + replace-with-empty.
+
+    Same real-file fixture as TestEditSectionAction; asserts on the
+    resulting FILE bytes for every dialog outcome plus the reject /
+    no-op arms.
+    """
+
+    _DOC = ('# Alpha\nalpha body\n'
+            '## Sub\nsub body\n'
+            '# Beta\nbeta body\n')
+
+    def setUp(self):
+        import tempfile
+        self.r = _load_recipe()
+        fd, self.path = tempfile.mkstemp(suffix='.md')
+        os.close(fd)
+        _rewrite(self.path, self._DOC)
+        self.r._INPUT_FILES = [(self.path, '')]
+        self.r._reparse()
+
+    def tearDown(self):
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+    def _item(self, line):
+        return self.r._FILES[self.path].by_id[('content', self.path, line)]
+
+    def test_confirm_deletes_heading_extent(self):
+        # Beta (0-based line 4, capture lines 5-6) vanishes; everything
+        # else survives byte-for-byte. Logged as a deletion + refresh.
+        ctx = _EditCtx(cursor=self._item(4), confirms=[True])
+        self.r._action_delete_section(ctx)
+        self.assertEqual(_read(self.path),
+                         '# Alpha\nalpha body\n## Sub\nsub body\n')
+        self.assertEqual(ctx.refreshes, 1)
+        self.assertTrue(any('deleted section in' in line and 'lines 5-6'
+                            in line for line in ctx.logs),
+                        msg=f'logs: {ctx.logs}')
+
+    def test_confirm_prompt_quotes_title_and_line_range(self):
+        ctx = _EditCtx(cursor=self._item(4), confirms=[True])
+        self.r._action_delete_section(ctx)
+        self.assertEqual(len(ctx.confirm_prompts), 1)
+        self.assertIn("'Beta'", ctx.confirm_prompts[0])
+        self.assertIn('lines 5-6', ctx.confirm_prompts[0])
+
+    def test_cancel_button_leaves_file_untouched(self):
+        ctx = _EditCtx(cursor=self._item(4), confirms=[False])
+        self.r._action_delete_section(ctx)
+        self.assertEqual(_read(self.path), self._DOC)
+        self.assertEqual(ctx.refreshes, 0)
+        self.assertEqual(ctx.logs, [])
+
+    def test_esc_leaves_file_untouched(self):
+        # The scripted-answers list running out returns None — the
+        # headless / esc outcome.
+        ctx = _EditCtx(cursor=self._item(4))
+        self.r._action_delete_section(ctx)
+        self.assertEqual(len(ctx.confirm_prompts), 1)
+        self.assertEqual(_read(self.path), self._DOC)
+        self.assertEqual(ctx.refreshes, 0)
+
+    def test_text_run_delete_uses_range_fallback(self):
+        # The dim [text] run (0-based line 1) has no hash address — the
+        # range-fallback arm of the apply chain removes it.
+        ctx = _EditCtx(cursor=self._item(1), confirms=[True])
+        self.r._action_delete_section(ctx)
+        self.assertEqual(_read(self.path),
+                         '# Alpha\n## Sub\nsub body\n# Beta\nbeta body\n')
+
+    def test_file_root_flashes(self):
+        ctx = _EditCtx(cursor=self.r._FILES[self.path].file_root,
+                       confirms=[True])
+        self.r._action_delete_section(ctx)
+        self.assertIn('delete works on a heading / text row', ctx.flashes)
+        self.assertEqual(ctx.confirm_prompts, [])
+        self.assertEqual(_read(self.path), self._DOC)
+
+    def test_md_doc_root_flashes(self):
+        root = _SrcItem(id=('md', ('file', self.path), ('/o.md',), None),
+                        kind='md-doc')
+        ctx = _EditCtx(cursor=root, confirms=[True])
+        self.r._action_delete_section(ctx)
+        self.assertIn('delete works on a heading / text row', ctx.flashes)
+        self.assertEqual(_read(self.path), self._DOC)
+
+    def test_refs_umbrella_flashes(self):
+        umbrella = _SrcItem(id=('refs', ('file', self.path), ()),
+                            kind='md-refs')
+        ctx = _EditCtx(cursor=umbrella, confirms=[True])
+        self.r._action_delete_section(ctx)
+        self.assertIn('delete works on a heading / text row', ctx.flashes)
+        self.assertEqual(_read(self.path), self._DOC)
+
+    def test_stale_id_silent_noop(self):
+        ghost = _SrcItem(id=('content', self.path, 99), kind='heading')
+        ctx = _EditCtx(cursor=ghost, confirms=[True])
+        self.r._action_delete_section(ctx)
+        self.assertEqual(ctx.flashes, [])
+        self.assertEqual(ctx.confirm_prompts, [])
+        self.assertEqual(_read(self.path), self._DOC)
+
+    def test_lost_target_flashes_file_untouched(self):
+        # The section changes on disk while the confirm dialog is up —
+        # the apply chain re-reads fresh, fails to re-address, and the
+        # flow flashes without writing (the conflicted bytes survive).
+        conflicted = ('# Alpha\nalpha body\n## Sub\nsub body\n'
+                      '# Beta\nDIVERGED\n')
+        test = self
+
+        class _ConflictCtx(_EditCtx):
+            def confirm(self, message, buttons=('&Yes', '&No'), *,
+                        title=None, delay_interaction=False):
+                _rewrite(test.path, conflicted)
+                return super().confirm(
+                    message, buttons, title=title,
+                    delay_interaction=delay_interaction)
+
+        ctx = _ConflictCtx(cursor=self._item(4), confirms=[True])
+        self.r._action_delete_section(ctx)
+        self.assertEqual(_read(self.path), conflicted)
+        self.assertEqual(ctx.refreshes, 0)
+        self.assertTrue(any('could not delete' in f for f in ctx.flashes),
+                        msg=f'flashes: {ctx.flashes}')
+
+
 class TestEditSectionStdin(unittest.TestCase):
     """``E`` on the stdin document — the in-memory apply pipeline."""
 
@@ -5266,6 +5444,27 @@ class TestEditSectionStdin(unittest.TestCase):
         self.assertEqual(self.r._STDIN_TEXT, '# Rewritten\nnew body\n')
         self.assertIn('applied to in-memory copy - not saved to disk',
                       ctx.flashes)
+
+    def test_root_edit_empty_keeps_plain_cancel(self):
+        # The stdin ROOT edit is a kind='root' capture — "delete the
+        # section" has no referent for the whole document, so an empty
+        # save keeps the plain cancel flash (no empty-edit dialog).
+        fs = self.r._FILES[self.r._STDIN_PATH]
+        ctx = _EditCtx(cursor=fs.file_root,
+                       editor=lambda tmp, n: _rewrite(tmp, ''))
+        self.r._action_edit_section(ctx)
+        self.assertEqual(ctx.confirm_prompts, [])
+        self.assertEqual(self.r._STDIN_TEXT, self._DOC)
+        self.assertIn('edit cancelled (empty content)', ctx.flashes)
+
+    def test_section_delete_applies_in_memory(self):
+        ctx = _EditCtx(cursor=self._item(2), confirms=[True])
+        self.r._action_delete_section(ctx)
+        self.assertEqual(self.r._STDIN_TEXT, '# Piped\nintro body\n')
+        self.assertIn('applied to in-memory copy - not saved to disk',
+                      ctx.flashes)
+        self.assertEqual(ctx.refreshes, 1)
+        self.assertFalse(os.path.exists(self.r._STDIN_PATH))
 
 
 class TestInsertSectionAction(unittest.TestCase):
@@ -5690,6 +5889,32 @@ class TestEditSectionReferenceRows(_RefRowBase):
         self.r._action_edit_section(ctx)
         self.assertEqual(ctx.calls, [])
         self.assertEqual(ctx.flashes, [])
+
+
+class TestDeleteSectionReferenceRows(_RefRowBase):
+    """``d`` on ``('md', …)`` reference rows — cross-document deletion."""
+
+    def test_heading_delete_persists_to_referenced_file(self):
+        # '## Inner' (other.md line 2) vanishes from the REFERENCED file;
+        # the primary file is untouched.
+        ctx = _EditCtx(cursor=_SrcItem(id=self._md_id(2), kind='md-heading'),
+                       confirms=[True])
+        self.r._action_delete_section(ctx)
+        self.assertEqual(_read(self.other),
+                         '# Other\nother body\n'
+                         '## Last\nlast body\n')
+        self.assertEqual(_read(self.main), self._MAIN)
+        self.assertEqual(ctx.refreshes, 1)
+        self.assertTrue(any('deleted section in other.md' in line
+                            for line in ctx.logs),
+                        msg=f'logs: {ctx.logs}')
+
+    def test_cancel_leaves_referenced_file_untouched(self):
+        ctx = _EditCtx(cursor=_SrcItem(id=self._md_id(2), kind='md-heading'),
+                       confirms=[False])
+        self.r._action_delete_section(ctx)
+        self.assertEqual(_read(self.other), self._OTHER)
+        self.assertEqual(ctx.refreshes, 0)
 
 
 class TestInsertSectionReferenceRows(_RefRowBase):

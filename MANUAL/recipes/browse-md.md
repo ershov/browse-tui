@@ -58,9 +58,14 @@ files or directories; `FILE.md#section` deep-links straight to a heading.
   against fresh reads first — nothing is written on a failure — then the
   destination insert is written before the source cut, so an
   interruption leaves a duplicate, never a loss.
-- Stdin documents stay editable — `E` / `a` / `x` apply to the in-memory
-  copy (flagged "not saved to disk"), so a piped document can still be
-  restructured or used to export a section through the editor.
+- Section delete behind a confirm — `d` quotes the section's title and
+  line range, then removes the extent through the same hash-verified
+  chain (empty content is pure removal); a document that changed
+  underneath flashes instead of deleting the wrong bytes. An `E` edit
+  saved back empty offers the same deletion instead of just cancelling.
+- Stdin documents stay editable — `E` / `a` / `x` / `d` apply to the
+  in-memory copy (flagged "not saved to disk"), so a piped document can
+  still be restructured or used to export a section through the editor.
 - Repeatable `--root DIR` — extra base directories for resolving a
   document's relative cross-file references (tried after the file's own
   directory), and the only way references resolve for a stdin (`-`)
@@ -88,8 +93,9 @@ section under the cursor in `$EDITOR` (conflict-safe splice on save;
 reference rows edit the referenced file), `a` / `i` insert a new
 section at a marker-chosen position (primary or referenced document),
 `x` move the cursor section to a marker-chosen position (within or
-across documents), `→` expand (auto-expands a single-heading
-file), `Ctrl-R` re-slurp every file from disk.
+across documents), `d` delete the cursor section after a confirm,
+`→` expand (auto-expands a single-heading file), `Ctrl-R` re-slurp
+every file from disk.
 
 **Source:** [`recipes/browse-md`](../../recipes/browse-md)
 

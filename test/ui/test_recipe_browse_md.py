@@ -500,6 +500,72 @@ class TestBrowseMdEditSection(unittest.TestCase):
                 t.send('q')
 
 
+class TestBrowseMdDeleteSection(unittest.TestCase):
+    """``d`` deletes the section under the cursor behind a confirm.
+
+    End-to-end against the shipped binary: ``d`` opens the confirm
+    dialog (its message quotes the section title + line range), esc
+    backs out leaving the file untouched, and the ``&Delete section``
+    hotkey applies the replace-with-empty — asserted on the exact bytes
+    on disk plus the ``deleted section in`` recipe-log line (dialog
+    button highlights are reverse-video, invisible to tmux capture, so
+    the log is the rendered witness for the outcome).
+    """
+
+    _DOC = (
+        '# Alpha\n'
+        '\n'
+        'alpha body\n'
+        '\n'
+        '## Section Two\n'
+        '\n'
+        'section two body\n'
+    )
+
+    def test_delete_heading_section_esc_then_confirm(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = os.path.join(tmp, 'doc.md')
+            with open(doc, 'w') as f:
+                f.write(self._DOC)
+            with TmuxFixture(cols=100, rows=40) as t:
+                line = '{bin} --run-py {recipe} {doc}'.format(
+                    bin=shlex.quote(_BIN),
+                    recipe=shlex.quote(_RECIPE),
+                    doc=shlex.quote(doc),
+                )
+                t.send_line(line)
+                t.wait_for('Section Two', timeout=6.0)
+                t.send('Down')   # file root -> [h1] Alpha
+                t.send('Down')   # -> [text] alpha body
+                t.send('Down')   # -> [h2] Section Two
+                # Open the dialog; its message quotes the title and the
+                # capture's 1-based line range. Esc cancels — no write.
+                t.send('d')
+                t.wait_for('lines 5-7', timeout=4.0)
+                t.send('Escape')
+                t.wait_stable()
+                with open(doc) as f:
+                    self.assertEqual(f.read(), self._DOC)
+                # Re-open and take the '&Delete section' hotkey.
+                t.send('d')
+                t.wait_for('lines 5-7', timeout=4.0)
+                t.send('d')
+                # The rendered witness: the deletion's recipe-log line
+                # lands in the message log.
+                t.send('~')
+                t.wait_for('deleted section in', timeout=6.0)
+                deadline = time.time() + 6.0
+                expected = '# Alpha\n\nalpha body\n\n'
+                while time.time() < deadline:
+                    with open(doc) as f:
+                        if f.read() == expected:
+                            break
+                    time.sleep(0.05)
+                with open(doc) as f:
+                    self.assertEqual(f.read(), expected)
+                t.send('q')
+
+
 class TestBrowseMdInsertSection(unittest.TestCase):
     """``a`` inserts a new section at the marker through ``$EDITOR``.
 
